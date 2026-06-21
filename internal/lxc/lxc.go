@@ -21,7 +21,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -91,9 +93,14 @@ type Runtime interface {
 // CreateOpts collects parameters for Runtime.Create.
 type CreateOpts struct {
 	Name string
-	// Template is either "download" (use lxc-download), a path to a
-	// pre-extracted rootfs, or "rootfs:<path>" to bind-mount an
-	// already-prepared directory (used after umoci extraction in 1.4.B).
+	// Template selects how the rootfs is populated:
+	//   - "download": lxc-create's download template (uses Distro/Release/Arch).
+	//   - a rootfs path ("rootfs:<path>", an absolute path, or "./relative"):
+	//     an already-extracted rootfs (e.g. from `lv ct pull` / umoci). We
+	//     synthesise an LXC config that points at it — lxc-create has no way to
+	//     adopt a pre-existing rootfs. A directory holding an OCI/umoci bundle
+	//     (a "rootfs/" subdir) is descended into automatically.
+	//   - any other bare name (e.g. "busybox"): passed to `lxc-create -t`.
 	Template string
 	// Distro / Release / Arch are forwarded to the lxc-download template
 	// when Template == "download". Ignored otherwise.
@@ -162,10 +169,34 @@ func (r *LxcRunner) run(ctx context.Context, bin string, args ...string) ([]byte
 	return out, []byte(stderr.String()), err
 }
 
-// Create implements Runtime.Create via lxc-create.
+// defaultLxcpath is LXC's standard container store, used when Lxcpath is unset.
+const defaultLxcpath = "/var/lib/lxc"
+
+func (r *LxcRunner) lxcpath() string {
+	if r.Lxcpath != "" {
+		return r.Lxcpath
+	}
+	return defaultLxcpath
+}
+
+// Create implements Runtime.Create. See CreateOpts.Template for the modes.
+//
+// For a rootfs path we write the container config directly instead of shelling
+// out: lxc-create's -t flag expects a template *script*, so handing it a rootfs
+// directory just fails ("exit status 1"). This is the path used by `lv ct pull`
+// → `lv ct create` for OCI images.
 func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, error) {
 	if err := opts.Validate(); err != nil {
 		return nil, err
+	}
+	if opts.Template != "download" {
+		rootfs, ok, err := resolveRootfs(opts.Template)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return r.createFromRootfs(opts, rootfs)
+		}
 	}
 	args := []string{"-n", opts.Name, "-t", opts.Template}
 	if opts.Template == "download" {
@@ -175,8 +206,8 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 			"-a", opts.Arch,
 		)
 	}
-	if _, _, err := r.run(ctx, "lxc-create", args...); err != nil {
-		return nil, fmt.Errorf("lxc-create %s: %w", opts.Name, err)
+	if _, stderr, err := r.run(ctx, "lxc-create", args...); err != nil {
+		return nil, cmdErr("lxc-create", opts.Name, stderr, err)
 	}
 	return &Container{
 		Name:      opts.Name,
@@ -189,10 +220,39 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	}, nil
 }
 
+// createFromRootfs materialises a container around an already-extracted rootfs
+// by writing <lxcpath>/<name>/config — no lxc-create. The config mirrors what
+// the download template produces (common.conf + apparmor + a veth NIC) so the
+// container starts identically.
+func (r *LxcRunner) createFromRootfs(opts CreateOpts, rootfs string) (*Container, error) {
+	containerDir := filepath.Join(r.lxcpath(), opts.Name)
+	configPath := filepath.Join(containerDir, "config")
+	if _, err := os.Stat(configPath); err == nil {
+		return nil, fmt.Errorf("container %q already exists at %s", opts.Name, containerDir)
+	}
+	if err := os.MkdirAll(containerDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create container dir %s: %w", containerDir, err)
+	}
+	if err := os.WriteFile(configPath, []byte(renderRootfsConfig(opts.Name, rootfs, opts.Network)), 0o644); err != nil {
+		return nil, fmt.Errorf("write lxc config %s: %w", configPath, err)
+	}
+	return &Container{
+		Name:      opts.Name,
+		State:     StateStopped,
+		RootFS:    rootfs,
+		CPULimit:  opts.CPULimit,
+		MemoryMiB: opts.MemoryMiB,
+		Network:   opts.Network,
+		Labels:    opts.Labels,
+		// Image is left to the gRPC layer, which records the originating OCI
+		// reference (req.Image) — Create can't infer it from a rootfs path.
+	}, nil
+}
+
 // Start runs lxc-start in daemon mode.
 func (r *LxcRunner) Start(ctx context.Context, name string) error {
-	if _, _, err := r.run(ctx, "lxc-start", "-n", name, "-d"); err != nil {
-		return fmt.Errorf("lxc-start %s: %w", name, err)
+	if _, stderr, err := r.run(ctx, "lxc-start", "-n", name, "-d"); err != nil {
+		return cmdErr("lxc-start", name, stderr, err)
 	}
 	return nil
 }
@@ -203,16 +263,16 @@ func (r *LxcRunner) Stop(ctx context.Context, name string, timeoutSec int) error
 	if timeoutSec > 0 {
 		args = append(args, "-t", fmt.Sprintf("%d", timeoutSec))
 	}
-	if _, _, err := r.run(ctx, "lxc-stop", args...); err != nil {
-		return fmt.Errorf("lxc-stop %s: %w", name, err)
+	if _, stderr, err := r.run(ctx, "lxc-stop", args...); err != nil {
+		return cmdErr("lxc-stop", name, stderr, err)
 	}
 	return nil
 }
 
 // Delete runs lxc-destroy. Caller must have stopped the container first.
 func (r *LxcRunner) Delete(ctx context.Context, name string) error {
-	if _, _, err := r.run(ctx, "lxc-destroy", "-n", name); err != nil {
-		return fmt.Errorf("lxc-destroy %s: %w", name, err)
+	if _, stderr, err := r.run(ctx, "lxc-destroy", "-n", name); err != nil {
+		return cmdErr("lxc-destroy", name, stderr, err)
 	}
 	return nil
 }
@@ -280,6 +340,113 @@ func parseLxcInfoState(s string) State {
 		return StateRunning
 	}
 	return StateUnknown
+}
+
+// cmdErr formats a failed lxc-* invocation, folding in the captured stderr so
+// the real cause (e.g. "Couldn't find a matching image") surfaces instead of a
+// bare "exit status 1".
+func cmdErr(bin, name string, stderr []byte, err error) error {
+	if s := strings.TrimSpace(string(stderr)); s != "" {
+		return fmt.Errorf("%s %s: %w: %s", bin, name, err, s)
+	}
+	return fmt.Errorf("%s %s: %w", bin, name, err)
+}
+
+// resolveRootfs decides whether template names a pre-extracted rootfs and, if
+// so, returns the absolute path to the actual root filesystem. It returns
+// ok=false for a bare template name (e.g. "busybox"), which the caller hands to
+// lxc-create unchanged. A directory holding an OCI/umoci bundle (a "rootfs/"
+// subdir) is descended into.
+func resolveRootfs(template string) (path string, ok bool, err error) {
+	p := template
+	explicit := false
+	if strings.HasPrefix(p, "rootfs:") {
+		p, explicit = strings.TrimPrefix(p, "rootfs:"), true
+	}
+	// Only a path-shaped value is a rootfs candidate; a bare name is a
+	// template name for lxc-create.
+	if !explicit && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "./") && !strings.HasPrefix(p, "../") {
+		return "", false, nil
+	}
+	abs, aerr := filepath.Abs(p)
+	if aerr != nil {
+		return "", false, fmt.Errorf("resolve rootfs path %q: %w", p, aerr)
+	}
+	if !isDir(abs) {
+		return "", false, fmt.Errorf("rootfs template %q is not an existing directory", template)
+	}
+	// OCI/umoci bundle: the flattened fs is in rootfs/. Only descend when abs
+	// isn't itself a rootfs, so a real rootfs that happens to contain /rootfs
+	// is left alone.
+	if !looksLikeRootfs(abs) && isDir(filepath.Join(abs, "rootfs")) {
+		abs = filepath.Join(abs, "rootfs")
+	}
+	if !looksLikeRootfs(abs) {
+		return "", false, fmt.Errorf("rootfs template %q does not look like a root filesystem (no bin//etc//usr/…)", template)
+	}
+	return abs, true, nil
+}
+
+// renderRootfsConfig builds an LXC config for a container backed by an existing
+// rootfs, mirroring the structure lxc-create's download template emits.
+func renderRootfsConfig(name, rootfs string, nics []NetworkAttach) string {
+	var b strings.Builder
+	b.WriteString("# Managed by litevirt — container created from a pre-extracted rootfs.\n")
+	// common.conf carries the baseline mounts/capabilities lxc-create would
+	// otherwise include; reference it only if present on this host.
+	if fileExists("/usr/share/lxc/config/common.conf") {
+		b.WriteString("lxc.include = /usr/share/lxc/config/common.conf\n")
+	}
+	b.WriteString("lxc.apparmor.profile = generated\n")
+	b.WriteString("lxc.apparmor.allow_nesting = 1\n")
+	fmt.Fprintf(&b, "lxc.rootfs.path = dir:%s\n", rootfs)
+	fmt.Fprintf(&b, "lxc.uts.name = %s\n", name)
+	b.WriteString(renderNetwork(nics))
+	return b.String()
+}
+
+// renderNetwork emits lxc.net.N.* keys. With no explicit NICs it falls back to a
+// single veth on the default lxcbr0 bridge (matching the host default), so the
+// container has working networking like a download-template container.
+func renderNetwork(nics []NetworkAttach) string {
+	var b strings.Builder
+	if len(nics) == 0 {
+		b.WriteString("lxc.net.0.type = veth\n")
+		b.WriteString("lxc.net.0.link = lxcbr0\n")
+		b.WriteString("lxc.net.0.flags = up\n")
+		return b.String()
+	}
+	for i, n := range nics {
+		fmt.Fprintf(&b, "lxc.net.%d.type = veth\n", i)
+		fmt.Fprintf(&b, "lxc.net.%d.link = %s\n", i, n.Bridge)
+		fmt.Fprintf(&b, "lxc.net.%d.flags = up\n", i)
+		if n.Name != "" {
+			fmt.Fprintf(&b, "lxc.net.%d.name = %s\n", i, n.Name)
+		}
+		if n.MAC != "" {
+			fmt.Fprintf(&b, "lxc.net.%d.hwaddr = %s\n", i, n.MAC)
+		}
+		if n.IP != "" {
+			fmt.Fprintf(&b, "lxc.net.%d.ipv4.address = %s\n", i, n.IP)
+		}
+	}
+	return b.String()
+}
+
+func isDir(p string) bool { fi, err := os.Stat(p); return err == nil && fi.IsDir() }
+
+func fileExists(p string) bool { fi, err := os.Stat(p); return err == nil && !fi.IsDir() }
+
+// looksLikeRootfs reports whether dir resembles a Linux root filesystem, used
+// to tell an extracted rootfs from an arbitrary directory and to decide whether
+// to descend into a bundle's rootfs/ subdir.
+func looksLikeRootfs(dir string) bool {
+	for _, d := range []string{"bin", "etc", "usr", "sbin", "lib"} {
+		if isDir(filepath.Join(dir, d)) {
+			return true
+		}
+	}
+	return false
 }
 
 // stringWriter adapts a strings.Builder to io.Writer so cmd.Stderr

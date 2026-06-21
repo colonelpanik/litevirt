@@ -192,6 +192,58 @@ func TestCreateFromRootfs_AppliesResourceLimits(t *testing.T) {
 	}
 }
 
+func TestSplitCIDR(t *testing.T) {
+	if a, m := splitCIDR("10.0.3.78/24"); a != "10.0.3.78" || m != "255.255.255.0" {
+		t.Errorf("CIDR: got %q %q", a, m)
+	}
+	if a, m := splitCIDR("10.0.3.78"); a != "10.0.3.78" || m != "" {
+		t.Errorf("bare IP: got %q %q", a, m)
+	}
+}
+
+// A static --network IP must also configure the guest's /etc/network/interfaces,
+// or the image's boot-time DHCP client flushes the address LXC assigned.
+func TestCreateFromRootfs_WritesGuestStaticIP(t *testing.T) {
+	tmp := t.TempDir()
+	lxcpath := filepath.Join(tmp, "lxc")
+	rootfs := mkRootfs(t, filepath.Join(tmp, "rfs"))
+
+	r := &LxcRunner{Lxcpath: lxcpath}
+	if _, err := r.Create(context.Background(), CreateOpts{
+		Name: "sip", Template: "rootfs:" + rootfs,
+		Network: []NetworkAttach{{Name: "eth0", Bridge: "lxcbr0", IP: "10.0.3.78/24"}},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(rootfs, "etc", "network", "interfaces"))
+	if err != nil {
+		t.Fatalf("guest interfaces not written: %v", err)
+	}
+	s := string(raw)
+	for _, want := range []string{"iface eth0 inet static", "address 10.0.3.78", "netmask 255.255.255.0"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("interfaces missing %q\n%s", want, s)
+		}
+	}
+}
+
+func TestCreateFromRootfs_NoStaticIP_NoGuestConfig(t *testing.T) {
+	tmp := t.TempDir()
+	lxcpath := filepath.Join(tmp, "lxc")
+	rootfs := mkRootfs(t, filepath.Join(tmp, "rfs"))
+
+	r := &LxcRunner{Lxcpath: lxcpath}
+	if _, err := r.Create(context.Background(), CreateOpts{
+		Name: "nosip", Template: "rootfs:" + rootfs,
+		Network: []NetworkAttach{{Name: "eth0", Bridge: "lxcbr0"}}, // no IP
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootfs, "etc", "network", "interfaces")); err == nil {
+		t.Error("guest interfaces must NOT be written when no static IP is requested")
+	}
+}
+
 // finalizeContainerConfig is the shared step the download path also uses: it
 // must strip the template's default lxcbr0 NIC and apply the requested network
 // + limits, without duplicating NICs or clobbering the base config.

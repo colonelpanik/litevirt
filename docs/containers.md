@@ -151,8 +151,10 @@ lv ct create web --distro alpine --release 3.21 \
 ```
 
 With no `--network`, the container gets a single veth on the host's default
-`lxcbr0` bridge (NAT to the outside). `internal/lxc/network.go` renders the
-config snippet:
+`lxcbr0` bridge (NAT to the outside). When `ip=` is given, litevirt also writes
+the guest's `/etc/network/interfaces` (ifupdown) so the static address survives
+boot — otherwise the stock image's DHCP client would flush the address LXC
+assigned. `internal/lxc/network.go` renders the config snippet:
 
 ```
 lxc.net.0.type = veth

@@ -37,6 +37,12 @@ const (
 	// recentFenceWindow gates re-fencing of a host for which the fencing_log
 	// already shows a successful fence in the recent past.
 	recentFenceWindow = 5 * time.Minute
+	// upgradingTimeout bounds how long a host may sit in the 'upgrading' state
+	// (set by `lv host upgrade` or by a daemon on graceful SIGTERM restart)
+	// before the coordinator treats it as a genuine failure. Long enough for a
+	// binary stream + restart, short enough that a host that died mid-upgrade
+	// still fails over instead of stranding its VMs forever.
+	upgradingTimeout = 2 * time.Minute
 )
 
 // Fencer abstracts fence.Execute so tests can inject a stub. Production code
@@ -189,13 +195,23 @@ func (c *Coordinator) run(ctx context.Context) {
 			c.fenced[target] = true
 			continue
 		}
-		// Skip hosts that are intentionally restarting for a self-upgrade.
-		// `upgrading` hosts will be unreachable for tens of seconds; quorum
-		// agreeing they're "down" is normal — fencing them turns a routine
-		// upgrade into a destructive false-positive failover.
+		// Skip hosts that are intentionally restarting (a self-upgrade, or a
+		// graceful daemon restart that marked itself 'upgrading' on SIGTERM).
+		// They're unreachable for tens of seconds; quorum agreeing they're
+		// "down" is normal — fencing them turns a routine restart into a
+		// destructive false-positive failover. BUT a host that entered
+		// 'upgrading' and never returned must still fail over, or its VMs are
+		// stranded — so we only skip while it's within upgradingTimeout. On a
+		// timestamp parse error we err on the safe side and keep skipping.
 		if h.State == "upgrading" {
-			slog.Info("failover: target is upgrading, skipping fence", "host", target)
-			continue
+			upd, perr := time.Parse(time.RFC3339, h.UpdatedAt)
+			if perr != nil || c.now().Sub(upd) < upgradingTimeout {
+				slog.Info("failover: target is upgrading, skipping fence", "host", target)
+				continue
+			}
+			slog.Warn("failover: host stuck 'upgrading' past timeout — treating as failed",
+				"host", target, "upgrading_since", h.UpdatedAt)
+			// fall through to fence
 		}
 
 		// Skip if fencing_log shows a recent successful fence — no double-fencing

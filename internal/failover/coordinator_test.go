@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -166,6 +167,80 @@ func TestCoordinator_FencedHostNotAutoRecovered(t *testing.T) {
 	h, _ := corrosion.GetHost(ctx, db, "fenced-host")
 	if h == nil || h.State != "fenced" {
 		t.Errorf("fenced host must stay fenced (manual recovery), got %+v", h)
+	}
+}
+
+// A host that is briefly 'upgrading' (a graceful restart in progress) must NOT
+// be fenced even though quorum sees it down — that's the guard that stops a
+// routine restart from triggering a destructive failover.
+func TestCoordinator_RecentUpgradingHostNotFenced(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "upg", Address: "10.0.0.51", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "upgrading", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	downObservers(t, db, "upg", "h1", "h2", "h3")
+
+	newTestCoordinator("coordinator", db).run(ctx)
+
+	h, _ := corrosion.GetHost(ctx, db, "upg")
+	if h == nil || h.State != "upgrading" {
+		t.Errorf("recently-upgrading host must be skipped, got %+v", h)
+	}
+}
+
+// A host stuck 'upgrading' past the timeout (entered the state and never came
+// back) must still fail over, or its VMs are stranded.
+func TestCoordinator_StuckUpgradingHostFencedAfterTimeout(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "stuck", Address: "10.0.0.50", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Move to 'upgrading' with an updated_at well past upgradingTimeout.
+	old := time.Now().UTC().Add(-3 * time.Minute).Format(time.RFC3339)
+	if err := db.Execute(ctx,
+		`UPDATE hosts SET state='upgrading', updated_at=? WHERE name='stuck'`, old); err != nil {
+		t.Fatalf("set stale upgrading: %v", err)
+	}
+	downObservers(t, db, "stuck", "h1", "h2", "h3")
+
+	newTestCoordinator("coordinator", db).run(ctx)
+
+	h, _ := corrosion.GetHost(ctx, db, "stuck")
+	if h == nil || h.State == "upgrading" {
+		t.Errorf("host stuck upgrading past timeout must fail over, still %+v", h)
+	}
+}
+
+// downObservers inserts fresh host_health rows where each observer reports the
+// target as failed (consecutive_failures >= threshold), enough to satisfy quorum.
+func downObservers(t *testing.T, db *corrosion.Client, target string, observers ...string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, o := range observers {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: o, Address: "10.0.4." + o[len(o)-1:], SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", o, err)
+		}
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health
+			 (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
+			o, target, offlineThreshold,
+		); err != nil {
+			t.Fatalf("insert health: %v", err)
+		}
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -431,23 +432,95 @@ func (r *LxcRunner) finalizeContainerConfig(opts CreateOpts) error {
 		return fmt.Errorf("read container config %s: %w", path, err)
 	}
 	var b strings.Builder
+	var rootfs string
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "lxc.net.") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "lxc.net.") {
 			continue // drop the existing network stanza; we re-render it below
+		}
+		if rest, ok := strings.CutPrefix(t, "lxc.rootfs.path"); ok {
+			if _, v, found := strings.Cut(rest, "="); found {
+				rootfs = strings.TrimPrefix(strings.TrimSpace(v), "dir:")
+			}
 		}
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
 	cfg := strings.TrimRight(b.String(), "\n") + "\n"
 
-	net := NetworkConfig(opts.Network)
-	if net == "" {
-		net = defaultNetConfig()
+	netCfg := NetworkConfig(opts.Network)
+	if netCfg == "" {
+		netCfg = defaultNetConfig()
 	}
-	cfg += net
+	cfg += netCfg
 	cfg += ResourceConfig(opts.CPULimit, opts.MemoryMiB)
 
-	return os.WriteFile(path, []byte(cfg), 0o644)
+	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
+		return err
+	}
+	// When a static IP is requested, configure the guest's own networking too —
+	// otherwise the stock image's boot-time DHCP client flushes the address LXC
+	// assigned via lxc.net.*.ipv4.address.
+	if rootfs != "" {
+		if err := configureGuestStaticIP(rootfs, opts.Network); err != nil {
+			return fmt.Errorf("configure guest static networking: %w", err)
+		}
+	}
+	return nil
+}
+
+// configureGuestStaticIP writes the guest's /etc/network/interfaces (ifupdown,
+// as used by the Alpine/Debian LXC images) when any NIC requests a static IP,
+// so the guest brings the interface up static at boot instead of running a DHCP
+// client that clobbers the address. No-op when no static IP is requested — the
+// image's default (usually DHCP) is left untouched. Guests with no ifupdown
+// (e.g. minimal OCI images) ignore the file and simply keep the address LXC
+// assigned, which isn't fought by any in-guest DHCP.
+func configureGuestStaticIP(rootfs string, nics []NetworkAttach) error {
+	anyStatic := false
+	for _, n := range nics {
+		if n.IP != "" {
+			anyStatic = true
+		}
+	}
+	if !anyStatic {
+		return nil
+	}
+	netDir := filepath.Join(rootfs, "etc", "network")
+	if err := os.MkdirAll(netDir, 0o755); err != nil {
+		return err
+	}
+	var b strings.Builder
+	b.WriteString("# Managed by litevirt — static addressing from `lv ct create --network`.\n")
+	b.WriteString("auto lo\niface lo inet loopback\n\n")
+	for i, n := range nics {
+		name := n.Name
+		if name == "" {
+			name = fmt.Sprintf("eth%d", i)
+		}
+		fmt.Fprintf(&b, "auto %s\n", name)
+		if n.IP == "" {
+			fmt.Fprintf(&b, "iface %s inet dhcp\n\n", name)
+			continue
+		}
+		addr, netmask := splitCIDR(n.IP)
+		fmt.Fprintf(&b, "iface %s inet static\n    address %s\n", name, addr)
+		if netmask != "" {
+			fmt.Fprintf(&b, "    netmask %s\n", netmask)
+		}
+		b.WriteString("\n")
+	}
+	return os.WriteFile(filepath.Join(netDir, "interfaces"), []byte(b.String()), 0o644)
+}
+
+// splitCIDR turns "10.0.3.5/24" into ("10.0.3.5", "255.255.255.0") for
+// busybox/ifupdown, which wants address and netmask separately. A bare IP
+// (no prefix) returns an empty netmask.
+func splitCIDR(s string) (addr, netmask string) {
+	if ip, ipnet, err := net.ParseCIDR(s); err == nil {
+		return ip.String(), net.IP(ipnet.Mask).String()
+	}
+	return s, ""
 }
 
 // defaultNetConfig is the fallback NIC (a veth on the host's lxcbr0) used when

@@ -111,6 +111,23 @@ func New(cfg *Config) (*Daemon, error) {
 }
 
 // Run starts all daemon services and blocks until context is cancelled.
+// markRestarting flags this host 'upgrading' during a graceful shutdown so
+// peers skip fence candidacy for the restart window, then waits briefly so the
+// state replicates before the gRPC server stops serving. Best-effort and
+// bounded — it must never block shutdown for long. The caller's ctx is already
+// cancelled (SIGTERM), so this uses a fresh, short-lived context.
+func (d *Daemon) markRestarting() {
+	mctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if err := corrosion.UpdateHostState(mctx, d.db, d.cfg.HostName, "upgrading"); err != nil {
+		slog.Warn("shutdown: failed to mark host upgrading", "error", err)
+		return
+	}
+	// Peers fence only after several accumulated health failures (~10s+), so a
+	// short grace is enough for the 'upgrading' state to reach them first.
+	time.Sleep(2 * time.Second)
+}
+
 func (d *Daemon) Run(ctx context.Context) error {
 	// Pre-flight: refuse to start under a systemd unit that would kill
 	// child QEMU processes on stop. See preflight.go for the rationale.
@@ -544,6 +561,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			slog.Info("shutting down")
+			// A graceful stop (SIGTERM from `systemctl restart/stop`) must not
+			// look like a host failure: flag ourselves 'upgrading' so peers skip
+			// fence candidacy during the brief downtime. We set 'active' again on
+			// healthy startup; the failover coordinator still fences a host stuck
+			// 'upgrading' past its timeout, so a host that never returns fails
+			// over. (Re-exec already runs under 'upgrading'; uninstall is removing
+			// the host, so neither needs this.)
+			d.markRestarting()
 		case <-svc.ReExecCh:
 			slog.Info("re-exec requested after upgrade")
 			reexecRequested = true

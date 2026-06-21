@@ -34,9 +34,14 @@ Six guarantees the upgrade pipeline enforces:
    that would cgroup-kill its children.
 
 2. **No false-positive fence during the restart window.** The host marks
-   itself `upgrading` in the cluster state before re-exec. Failover
-   coordinators on peer hosts skip fence candidacy for `upgrading` hosts.
-   The new daemon transitions back to `active` on healthy startup.
+   itself `upgrading` in the cluster state before re-exec — and also on any
+   graceful shutdown (SIGTERM from `systemctl restart/stop`), so a plain daemon
+   restart isn't mistaken for a failure either. Failover coordinators on peer
+   hosts skip fence candidacy for `upgrading` hosts, but only up to a timeout
+   (2 min): a host that entered `upgrading` and never came back is still fenced,
+   so its VMs aren't stranded. The new daemon transitions back to `active` on
+   healthy startup, and a host left `offline` by a transient blip is
+   auto-recovered to `active` once a fresh quorum sees it healthy.
 
 3. **Auto-rollback on a panicking binary.** If the new daemon panics
    past systemd's `StartLimitBurst=3` within 10 minutes, the

@@ -38,6 +38,30 @@ jobs:
       - name: Test
         run: go test ./internal/... ./cmd/... ./tests/fleet/
 
+  # Schema-versioning guard: a CREATE TABLE / ALTER / index added to
+  # internal/corrosion/schema.go must come with a CurrentSchemaVersion bump, or
+  # the mixed-version replication skew check can't tell a peer is out of date.
+  # The History↔version lockstep and the claim-vs-code (docs↔CLI/metrics)
+  # triangulation are enforced by `go test` above; this job adds the part that
+  # needs the diff — detecting array growth between the base and head revisions.
+  schema-guard:
+    name: Schema version guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need base history to detect schema growth
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Schema growth requires a version bump
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: ./scripts/ci/check-schema-bump.sh
+
   release:
     name: Release
     needs: test

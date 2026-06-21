@@ -42,7 +42,7 @@ lv region status --region eu-west
 
 A region is purely a host label (`hosts.region`) plus the anycast-DNS
 concept below. The placement engine does **not** filter on region:
-there is no `--region` flag on `lv run` / `lv create` and no
+there is no `--region` flag on `lv run` and no
 `placement.region:` compose key. To pin a VM to hosts in a region, use
 the existing placement controls keyed off labels — `placement.host`,
 `placement.require`/`prefer` against host labels you set with

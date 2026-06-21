@@ -421,6 +421,34 @@ migrate_tool_test.go`) that every entry in `schemaDDL` / `schemaMigrations`
 must be parseable by the same DDL parser the tool uses — so a future
 schema change can't silently make the migration tool lie.
 
+### CI guardrails
+
+Three checks run on every push and pull request (`.github/workflows/ci.yml`)
+to keep the invariants above from rotting. Run them locally with
+`make ci-guards`.
+
+1. **Schema growth requires a version bump.** If a CREATE TABLE / ALTER /
+   index is added to `internal/corrosion/schema.go` without bumping
+   `CurrentSchemaVersion`, the forward-skew guard above goes blind to it and
+   peers silently drop the new rows. The `schema-guard` job diffs the schema
+   arrays between the base and head revisions with an AST-based tool
+   (`scripts/ci/schemacheck`, driven by `scripts/ci/check-schema-bump.sh`) and
+   fails on growth-without-bump. Counting is by AST element, so reformatting or
+   reordering an array never trips it.
+
+2. **History stays in lockstep with the version.** A unit test
+   (`TestSchemaHistoryDocumentsCurrentVersion`) asserts the `History:` comment
+   block documents every version `v1..CurrentSchemaVersion` — the audit trail
+   operators read before a staged rollout.
+
+3. **Docs don't reference commands or metrics that don't exist.** A
+   claim-vs-code triangulation test (`cmd/litevirt/docs_triangulation_test.go`)
+   walks every `lv`/`litevirt` invocation and every `` `litevirt_*` `` metric
+   in `README.md` + `docs/*.md` and fails if one doesn't resolve in the cobra
+   tree or appear as a string literal in the code. Intentional exceptions use
+   a `ci:skip-cmd` / `ci:skip-metric` line marker or the `knownAbsentIdentifiers`
+   allowlist (for documented-but-roadmap metrics).
+
 ## See also
 
 - [installation.md](installation.md) — base upgrade scenarios + apt

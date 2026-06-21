@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -41,16 +42,21 @@ func newCTCreateCmd() *cobra.Command {
 	var template, host string
 	var cpu, memMiB int
 	var useLocal bool
+	var networks []string
 	cmd := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a new container (does not start it)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			nics, err := parseCTNetworks(networks)
+			if err != nil {
+				return err
+			}
 			if useLocal {
 				r := lxc.NewLxcRunner()
 				c, err := r.Create(cmd.Context(), lxc.CreateOpts{
 					Name: args[0], Template: template, Distro: distro, Release: release, Arch: arch,
-					CPULimit: cpu, MemoryMiB: memMiB,
+					CPULimit: cpu, MemoryMiB: memMiB, Network: toLxcNICs(nics),
 				})
 				if err != nil {
 					return err
@@ -63,7 +69,7 @@ func newCTCreateCmd() *cobra.Command {
 					HostName: host,
 					Name:     args[0], Template: template,
 					Distro: distro, Release: release, Arch: arch,
-					Cpu: int32(cpu), MemoryMib: int32(memMiB),
+					Cpu: int32(cpu), MemoryMib: int32(memMiB), Networks: nics,
 				})
 				if err != nil {
 					return err
@@ -79,9 +85,54 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&arch, "arch", "amd64", "Architecture for download template")
 	cmd.Flags().IntVar(&cpu, "cpu", 0, "CPU shares (0 = unlimited)")
 	cmd.Flags().IntVar(&memMiB, "memory", 0, "Memory cap MiB (0 = unlimited)")
+	cmd.Flags().StringArrayVar(&networks, "network", nil, "Attach a NIC: bridge=<br>[,name=eth0][,ip=10.0.0.5/24][,mac=AA:BB:..] (repeatable; default: lxcbr0)")
 	cmd.Flags().StringVar(&host, "host", "", "Target host (default: the daemon you're connected to)")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local lxc-* runtime instead of gRPC")
 	return cmd
+}
+
+// parseCTNetworks turns repeated `--network key=val,..` specs into the proto
+// ContainerNetwork list. bridge is required; name/ip/mac are optional.
+func parseCTNetworks(specs []string) ([]*pb.ContainerNetwork, error) {
+	var out []*pb.ContainerNetwork
+	for _, spec := range specs {
+		n := &pb.ContainerNetwork{}
+		for _, kv := range strings.Split(spec, ",") {
+			kv = strings.TrimSpace(kv)
+			if kv == "" {
+				continue
+			}
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok {
+				return nil, fmt.Errorf("invalid --network %q: want comma-separated key=value pairs (bridge=,name=,ip=,mac=)", spec)
+			}
+			switch key := strings.TrimSpace(k); key {
+			case "bridge", "br":
+				n.Bridge = strings.TrimSpace(v)
+			case "name", "nic":
+				n.Name = strings.TrimSpace(v)
+			case "ip":
+				n.Ip = strings.TrimSpace(v)
+			case "mac":
+				n.Mac = strings.TrimSpace(v)
+			default:
+				return nil, fmt.Errorf("invalid --network key %q (want bridge|name|ip|mac)", key)
+			}
+		}
+		if n.Bridge == "" {
+			return nil, fmt.Errorf("--network %q: bridge is required", spec)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func toLxcNICs(nics []*pb.ContainerNetwork) []lxc.NetworkAttach {
+	var out []lxc.NetworkAttach
+	for _, n := range nics {
+		out = append(out, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac})
+	}
+	return out
 }
 
 func newCTStartCmd() *cobra.Command {

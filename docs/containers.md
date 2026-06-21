@@ -139,7 +139,19 @@ applied implicitly so existing stacks need no changes.
 LXC's native `veth` driver attaches into an existing bridge. Containers
 inherit the same network primitives the VM side uses (bridge, vxlan,
 isolated), so a container can sit on a VXLAN-overlaid VNet alongside
-VMs without any extra plumbing. `internal/lxc/network.go` renders the
+VMs without any extra plumbing.
+
+Attach NICs from the CLI with `--network` (repeat it for multiple NICs).
+`bridge=` is required; `name=`, `ip=`, and `mac=` are optional:
+
+```
+lv ct create web --distro alpine --release 3.21 \
+    --network bridge=br0,name=eth0,ip=10.0.0.6/24 \
+    --cpu 2 --memory 512
+```
+
+With no `--network`, the container gets a single veth on the host's default
+`lxcbr0` bridge (NAT to the outside). `internal/lxc/network.go` renders the
 config snippet:
 
 ```
@@ -152,9 +164,10 @@ lxc.net.0.ipv4.address = 10.0.0.6/24
 
 ## Resource limits
 
-Compose `cpu:` and `memory:` translate to cgroup limits. We emit both
-v1 and v2 keys so the same config works on either kernel — irrelevant
-keys are simply ignored:
+`lv ct create --cpu <shares> --memory <MiB>` (and compose `cpu:`/`memory:`)
+translate to cgroup limits written into the container's config at create time.
+We emit both v1 and v2 keys so the same config works on either kernel —
+irrelevant keys are simply ignored:
 
 ```
 lxc.cgroup2.cpu.max = 2000 100000

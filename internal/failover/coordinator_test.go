@@ -101,6 +101,74 @@ func TestCoordinator_FailedHost_MarkedOffline(t *testing.T) {
 	}
 }
 
+// healthyObservers inserts fresh host_health rows where each observer sees the
+// target as healthy (consecutive_failures = 0).
+func healthyObservers(t *testing.T, db *corrosion.Client, target string, observers ...string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, o := range observers {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: o, Address: "10.0.1." + o[len(o)-1:], SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", o, err)
+		}
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health
+			 (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, 'healthy', 0, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
+			o, target,
+		); err != nil {
+			t.Fatalf("insert health: %v", err)
+		}
+	}
+}
+
+// A host stuck in 'offline' after a transient drop must return to 'active'
+// once a fresh quorum sees it healthy again — without operator intervention.
+func TestCoordinator_OfflineHostRecoversWhenHealthy(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "recovered", Address: "10.0.0.9", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "offline", FenceStrategy: "manual",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	healthyObservers(t, db, "recovered", "h1", "h2", "h3", "h4")
+
+	newTestCoordinator("coordinator", db).run(ctx)
+
+	h, _ := corrosion.GetHost(ctx, db, "recovered")
+	if h == nil || h.State != "active" {
+		t.Errorf("offline host should auto-recover to active once healthy, got %+v", h)
+	}
+}
+
+// A 'fenced' host must NOT auto-recover: a successful fence may have rescheduled
+// its VMs, so resurrecting it automatically risks split-brain. Recovery here is
+// operator-driven (`lv host undrain`).
+func TestCoordinator_FencedHostNotAutoRecovered(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "fenced-host", Address: "10.0.0.9", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "fenced", FenceStrategy: "manual",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	healthyObservers(t, db, "fenced-host", "h1", "h2", "h3", "h4")
+
+	newTestCoordinator("coordinator", db).run(ctx)
+
+	h, _ := corrosion.GetHost(ctx, db, "fenced-host")
+	if h == nil || h.State != "fenced" {
+		t.Errorf("fenced host must stay fenced (manual recovery), got %+v", h)
+	}
+}
+
 func TestCoordinator_VMsRescheduled(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()

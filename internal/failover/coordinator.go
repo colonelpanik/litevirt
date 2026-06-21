@@ -211,6 +211,64 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		c.failover(ctx, h)
 	}
+
+	// Recovery pass: bring hosts that were marked 'offline' back to 'active'
+	// once a fresh quorum agrees they're healthy again. A transient drop (a
+	// daemon restart, a brief network blip) must self-heal — otherwise health
+	// reconverges in seconds but the authoritative hosts.state stays stuck.
+	c.recoverOfflineHosts(ctx, quorum)
+}
+
+// recoverOfflineHosts promotes hosts stuck in 'offline' back to 'active' once a
+// fresh quorum of observers reports them healthy (consecutive_failures = 0).
+//
+// Why this is needed: the coordinator only ever writes "down" states, and a
+// host's own startup self-active write (daemon.go) can lose a last-writer-wins
+// race with a slightly-later offline write from this coordinator. With no
+// recovery path, a briefly-dropped-then-healthy host stays 'offline' forever
+// until an operator runs `lv host undrain`.
+//
+// Only 'offline' is auto-recovered. 'fenced' is left manual on purpose: a
+// SUCCESSFUL fence may have rescheduled the host's VMs, so resurrecting it
+// without operator confirmation risks split-brain. 'maintenance'/'draining'
+// reflect operator intent and must not be cleared automatically either. As a
+// belt-and-suspenders guard we also skip any host with a recent successful
+// fence in the fencing_log.
+func (c *Coordinator) recoverOfflineHosts(ctx context.Context, quorum int) {
+	hosts, err := corrosion.ListHosts(ctx, c.db)
+	if err != nil {
+		slog.Error("failover: list hosts for recovery", "error", err)
+		return
+	}
+	freshCutoff := c.now().Add(-healthFreshness).UTC().Format(time.RFC3339)
+	for _, h := range hosts {
+		if h.State != "offline" {
+			continue
+		}
+		if c.recentlyFenced(ctx, h.Name) {
+			continue
+		}
+		rows, err := c.db.Query(ctx,
+			`SELECT COUNT(DISTINCT observer) AS n
+			 FROM host_health
+			 WHERE target = ?
+			   AND consecutive_failures = 0
+			   AND updated_at > ?`,
+			h.Name, freshCutoff)
+		if err != nil || len(rows) == 0 {
+			continue
+		}
+		if rows[0].Int("n") < quorum {
+			continue
+		}
+		if err := corrosion.UpdateHostState(ctx, c.db, h.Name, "active"); err != nil {
+			slog.Error("failover: recover offline host", "host", h.Name, "error", err)
+			continue
+		}
+		slog.Info("failover: offline host healthy again, marking active",
+			"host", h.Name, "healthy_observers", rows[0].Int("n"), "quorum", quorum)
+		delete(c.fenced, h.Name)
+	}
 }
 
 // clearRecoveredFromFenced drops hosts that are back to "active" from the

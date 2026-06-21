@@ -162,3 +162,77 @@ func TestCmdErrIncludesStderr(t *testing.T) {
 		t.Errorf("trailing separator with empty stderr: %q", got2.Error())
 	}
 }
+
+func TestCreateFromRootfs_AppliesResourceLimits(t *testing.T) {
+	tmp := t.TempDir()
+	lxcpath := filepath.Join(tmp, "lxc")
+	rootfs := mkRootfs(t, filepath.Join(tmp, "rfs"))
+
+	r := &LxcRunner{Lxcpath: lxcpath}
+	if _, err := r.Create(context.Background(), CreateOpts{
+		Name: "lim", Template: rootfs, CPULimit: 2, MemoryMiB: 512,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(lxcpath, "lim", "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := string(raw)
+	// cgroup limits must reach the live config — the bug was that they never did.
+	for _, want := range []string{
+		"lxc.cgroup2.cpu.max = 2000 100000",
+		"lxc.cgroup.cpu.shares = 2048",
+		"lxc.cgroup2.memory.max = 512M",
+		"lxc.cgroup.memory.limit_in_bytes = 512M",
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("config missing %q\n--- config ---\n%s", want, cfg)
+		}
+	}
+}
+
+// finalizeContainerConfig is the shared step the download path also uses: it
+// must strip the template's default lxcbr0 NIC and apply the requested network
+// + limits, without duplicating NICs or clobbering the base config.
+func TestFinalizeContainerConfig_ReplacesDefaultNet(t *testing.T) {
+	tmp := t.TempDir()
+	lxcpath := filepath.Join(tmp, "lxc")
+	cdir := filepath.Join(lxcpath, "dl")
+	if err := os.MkdirAll(cdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := "lxc.include = /usr/share/lxc/config/common.conf\n" +
+		"lxc.uts.name = dl\n" +
+		"lxc.net.0.type = veth\nlxc.net.0.link = lxcbr0\nlxc.net.0.flags = up\n"
+	if err := os.WriteFile(filepath.Join(cdir, "config"), []byte(base), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &LxcRunner{Lxcpath: lxcpath}
+	if err := r.finalizeContainerConfig(CreateOpts{
+		Name:      "dl",
+		Network:   []NetworkAttach{{Name: "eth0", Bridge: "br-prod", IP: "10.9.9.9/24"}},
+		MemoryMiB: 256,
+	}); err != nil {
+		t.Fatalf("finalizeContainerConfig: %v", err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(cdir, "config"))
+	cfg := string(raw)
+	if strings.Contains(cfg, "lxcbr0") {
+		t.Errorf("default lxcbr0 NIC was not stripped:\n%s", cfg)
+	}
+	if strings.Count(cfg, "lxc.net.0.link") != 1 {
+		t.Errorf("expected exactly one NIC link line:\n%s", cfg)
+	}
+	for _, want := range []string{
+		"lxc.net.0.link = br-prod",
+		"lxc.net.0.ipv4.address = 10.9.9.9/24",
+		"lxc.cgroup2.memory.max = 256M",
+		"lxc.uts.name = dl", // base preserved
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("config missing %q\n%s", want, cfg)
+		}
+	}
+}

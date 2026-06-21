@@ -1332,7 +1332,20 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 
 	// Check images exist on at least one host.
 	seenImages := map[string]bool{}
-	for _, vmDef := range f.VMs {
+	for name, vmDef := range f.VMs {
+		// Container workloads (kind: lxc | oci) don't deploy through the VM
+		// path yet. Reject them up front with a clear pointer to `lv ct`,
+		// rather than letting the VM image check below fire the misleading
+		// "pull it first with 'lv image pull'" (the value is an OCI image
+		// reference, not a registered VM image). Matches the deploy-time
+		// guard in applyVMAction.
+		if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
+			errs = append(errs, fmt.Sprintf(
+				"workload %q has kind=%s; compose deploy doesn't route containers yet — "+
+					"create it with `lv ct pull` + `lv ct create %s` (see docs/containers.md)",
+				name, vmDef.Kind, name))
+			continue
+		}
 		img := vmDef.Image
 		if img == "" || seenImages[img] {
 			continue

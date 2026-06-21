@@ -209,6 +209,12 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	if _, stderr, err := r.run(ctx, "lxc-create", args...); err != nil {
 		return nil, cmdErr("lxc-create", opts.Name, stderr, err)
 	}
+	// lxc-create wrote the base config (with a default NIC from
+	// /etc/lxc/default.conf). Re-render the network from opts (so an explicit
+	// --network wins) and apply cgroup limits.
+	if err := r.finalizeContainerConfig(opts); err != nil {
+		return nil, fmt.Errorf("apply container network/resource config for %q: %w", opts.Name, err)
+	}
 	return &Container{
 		Name:      opts.Name,
 		State:     StateStopped,
@@ -233,8 +239,12 @@ func (r *LxcRunner) createFromRootfs(opts CreateOpts, rootfs string) (*Container
 	if err := os.MkdirAll(containerDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create container dir %s: %w", containerDir, err)
 	}
-	if err := os.WriteFile(configPath, []byte(renderRootfsConfig(opts.Name, rootfs, opts.Network)), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte(renderBaseRootfsConfig(opts.Name, rootfs)), 0o644); err != nil {
 		return nil, fmt.Errorf("write lxc config %s: %w", configPath, err)
+	}
+	// Apply network (explicit --network or the lxcbr0 default) and cgroup limits.
+	if err := r.finalizeContainerConfig(opts); err != nil {
+		return nil, fmt.Errorf("apply container network/resource config for %q: %w", opts.Name, err)
 	}
 	return &Container{
 		Name:      opts.Name,
@@ -387,9 +397,12 @@ func resolveRootfs(template string) (path string, ok bool, err error) {
 	return abs, true, nil
 }
 
-// renderRootfsConfig builds an LXC config for a container backed by an existing
-// rootfs, mirroring the structure lxc-create's download template emits.
-func renderRootfsConfig(name, rootfs string, nics []NetworkAttach) string {
+// renderBaseRootfsConfig builds the non-network/non-cgroup portion of an LXC
+// config for a container backed by an existing rootfs, mirroring the structure
+// lxc-create's download template emits. The network and resource stanzas are
+// layered on afterwards by finalizeContainerConfig (shared with the download
+// path) so both creation paths apply --network and --cpu/--memory identically.
+func renderBaseRootfsConfig(name, rootfs string) string {
 	var b strings.Builder
 	b.WriteString("# Managed by litevirt — container created from a pre-extracted rootfs.\n")
 	// common.conf carries the baseline mounts/capabilities lxc-create would
@@ -401,36 +414,47 @@ func renderRootfsConfig(name, rootfs string, nics []NetworkAttach) string {
 	b.WriteString("lxc.apparmor.allow_nesting = 1\n")
 	fmt.Fprintf(&b, "lxc.rootfs.path = dir:%s\n", rootfs)
 	fmt.Fprintf(&b, "lxc.uts.name = %s\n", name)
-	b.WriteString(renderNetwork(nics))
 	return b.String()
 }
 
-// renderNetwork emits lxc.net.N.* keys. With no explicit NICs it falls back to a
-// single veth on the default lxcbr0 bridge (matching the host default), so the
-// container has working networking like a download-template container.
-func renderNetwork(nics []NetworkAttach) string {
+// finalizeContainerConfig rewrites <lxcpath>/<name>/config so its network and
+// cgroup stanzas reflect CreateOpts, for BOTH the download and rootfs paths.
+// It strips any pre-existing `lxc.net.*` lines (the download template injects a
+// default lxcbr0 NIC from /etc/lxc/default.conf) and re-renders the network from
+// opts.Network — falling back to a single lxcbr0 veth when none is given — then
+// appends the cgroup limits from opts.CPULimit/MemoryMiB. This is what wires
+// `lv ct create --network` and `--cpu/--memory` through to the live container.
+func (r *LxcRunner) finalizeContainerConfig(opts CreateOpts) error {
+	path := filepath.Join(r.lxcpath(), opts.Name, "config")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read container config %s: %w", path, err)
+	}
 	var b strings.Builder
-	if len(nics) == 0 {
-		b.WriteString("lxc.net.0.type = veth\n")
-		b.WriteString("lxc.net.0.link = lxcbr0\n")
-		b.WriteString("lxc.net.0.flags = up\n")
-		return b.String()
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "lxc.net.") {
+			continue // drop the existing network stanza; we re-render it below
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
 	}
-	for i, n := range nics {
-		fmt.Fprintf(&b, "lxc.net.%d.type = veth\n", i)
-		fmt.Fprintf(&b, "lxc.net.%d.link = %s\n", i, n.Bridge)
-		fmt.Fprintf(&b, "lxc.net.%d.flags = up\n", i)
-		if n.Name != "" {
-			fmt.Fprintf(&b, "lxc.net.%d.name = %s\n", i, n.Name)
-		}
-		if n.MAC != "" {
-			fmt.Fprintf(&b, "lxc.net.%d.hwaddr = %s\n", i, n.MAC)
-		}
-		if n.IP != "" {
-			fmt.Fprintf(&b, "lxc.net.%d.ipv4.address = %s\n", i, n.IP)
-		}
+	cfg := strings.TrimRight(b.String(), "\n") + "\n"
+
+	net := NetworkConfig(opts.Network)
+	if net == "" {
+		net = defaultNetConfig()
 	}
-	return b.String()
+	cfg += net
+	cfg += ResourceConfig(opts.CPULimit, opts.MemoryMiB)
+
+	return os.WriteFile(path, []byte(cfg), 0o644)
+}
+
+// defaultNetConfig is the fallback NIC (a veth on the host's lxcbr0) used when
+// no explicit network is requested — matching what the download template's
+// default.conf provides, so a plain container still gets connectivity.
+func defaultNetConfig() string {
+	return "lxc.net.0.type = veth\nlxc.net.0.link = lxcbr0\nlxc.net.0.flags = up\n"
 }
 
 func isDir(p string) bool { fi, err := os.Stat(p); return err == nil && fi.IsDir() }

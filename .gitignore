@@ -61,3 +61,6 @@ testdata/tmp/
 .air.toml
 tmp/
 /litevirt
+
+# Private working notes — consolidated roadmap/TODO, never published
+/TODO.md

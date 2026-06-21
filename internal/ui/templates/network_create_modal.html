@@ -1,0 +1,55 @@
+<div class="modal-overlay" id="network-create-modal">
+  <div class="modal">
+    <h3>Create Network</h3>
+    <form hx-post="/ui/networks" hx-swap="none" hx-on::after-request="document.getElementById('network-create-modal').remove()">
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" placeholder="my-network" required>
+      </div>
+      <div class="form-row">
+        <label>Type</label>
+        <select name="type" id="net-type" onchange="updateNetFields()">
+          <option value="bridge">bridge</option>
+          <option value="vxlan">vxlan</option>
+          <option value="isolated">isolated</option>
+          <option value="sriov">sriov</option>
+        </select>
+      </div>
+      <div class="form-row" id="net-iface-row">
+        <label>Interface</label>
+        <input type="text" name="iface" placeholder="br0">
+      </div>
+      <div class="form-row" id="net-subnet-row">
+        <label>Subnet</label>
+        <input type="text" name="subnet" placeholder="10.0.0.0/24">
+      </div>
+      <div class="form-row" id="net-dhcp-row">
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" name="dhcp" style="width:auto"> Enable DHCP
+        </label>
+      </div>
+      <div class="form-row" id="net-vni-row" style="display:none">
+        <label>VNI</label>
+        <input type="number" name="vni" placeholder="100">
+      </div>
+      <div class="form-row" id="net-pf-row" style="display:none">
+        <label>Physical Function</label>
+        <input type="text" name="pf" placeholder="ens1f0">
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('network-create-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+function updateNetFields() {
+  var t = document.getElementById('net-type').value;
+  document.getElementById('net-iface-row').style.display = (t === 'bridge' || t === 'vxlan') ? '' : 'none';
+  document.getElementById('net-subnet-row').style.display = (t !== 'sriov') ? '' : 'none';
+  document.getElementById('net-dhcp-row').style.display = (t !== 'sriov') ? '' : 'none';
+  document.getElementById('net-vni-row').style.display = (t === 'vxlan') ? '' : 'none';
+  document.getElementById('net-pf-row').style.display = (t === 'sriov') ? '' : 'none';
+}
+</script>

@@ -1,0 +1,27 @@
+<div class="modal-overlay" id="spice-modal" onclick="if(event.target===this)this.remove()">
+  <div class="modal" style="max-width:520px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">SPICE console — {{.Name}}</h3>
+      <button class="btn" onclick="document.getElementById('spice-modal').remove()">Close</button>
+    </div>
+    {{if .Error}}
+    <div class="error">{{.Error}}</div>
+    <p class="muted" style="font-size:12px;margin-top:8px">SPICE is available only while the VM is running and was created with SPICE enabled.</p>
+    {{else}}
+    <p class="muted" style="font-size:13px;margin-bottom:12px">
+      Open with <code>virt-viewer</code> / <code>remote-viewer</code>: download the connection file, or copy the URI below.
+    </p>
+    <div class="form-row">
+      <label>Connection URI</label>
+      <input type="text" readonly value="{{.Uri}}" onclick="this.select()" style="width:100%;font-family:monospace">
+    </div>
+    <div style="display:flex;gap:20px;font-size:13px;margin-bottom:8px">
+      <span><span class="muted">Host</span> <span class="mono">{{.Host}}</span></span>
+      <span><span class="muted">Port</span> <span class="mono">{{.Port}}</span></span>
+    </div>
+    <div class="form-actions">
+      <a class="btn btn-primary" href="/ui/vms/{{.Name}}/spice.vv">Download .vv</a>
+    </div>
+    {{end}}
+  </div>
+</div>

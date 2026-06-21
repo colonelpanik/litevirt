@@ -1,0 +1,50 @@
+<div class="modal-overlay" id="lb-edit-modal" onclick="this.remove()">
+  <div class="modal" style="max-width:700px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Edit Load Balancer: {{.LB.Name}}</h3>
+      <button class="btn" onclick="document.getElementById('lb-edit-modal').remove()">Close</button>
+    </div>
+    <form hx-post="/ui/lb/{{.LB.Name}}/update" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('lb-edit-modal').remove()}">
+
+      <div class="form-row">
+        <label>VIP</label>
+        <input type="text" name="vip" value="{{.LB.Vip}}" placeholder="Leave empty for no change">
+      </div>
+      <div class="form-row">
+        <label>Algorithm</label>
+        <select name="algorithm">
+          <option value="roundrobin" {{if eq .LB.Algorithm "roundrobin"}}selected{{end}}>Round Robin</option>
+          <option value="leastconn" {{if eq .LB.Algorithm "leastconn"}}selected{{end}}>Least Connections</option>
+          <option value="source" {{if eq .LB.Algorithm "source"}}selected{{end}}>Source Hash</option>
+        </select>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+
+      <!-- Current Backends -->
+      <h4 style="margin:0 0 8px">Current Backends</h4>
+      {{range .LB.Backends}}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;font-size:13px">
+        <span>{{.Name}}</span>
+        <span style="color:var(--muted)">{{.Address}}</span>
+      </div>
+      {{else}}
+      <p style="color:var(--muted);font-size:13px">No backends</p>
+      {{end}}
+
+      <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+
+      <!-- Add Backends -->
+      <h4 style="margin:0 0 8px">Add Backend</h4>
+      <div style="display:flex;gap:8px;margin-bottom:12px">
+        <input type="text" name="backend_name" placeholder="Name" style="width:120px">
+        <input type="text" name="backend_address" placeholder="IP:port" style="width:160px">
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Update</button>
+      </div>
+    </form>
+  </div>
+</div>

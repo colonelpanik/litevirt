@@ -1,0 +1,20 @@
+<div class="modal-overlay" id="sg-create-modal">
+  <div class="modal" style="max-width:460px">
+    <h3>Create security group</h3>
+    <form hx-post="/ui/security-groups" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('sg-create-modal').remove()">
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" required placeholder="web">
+      </div>
+      <div class="form-row">
+        <label>Stack (optional — blank = cluster-wide)</label>
+        <input type="text" name="stack" placeholder="">
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('sg-create-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>

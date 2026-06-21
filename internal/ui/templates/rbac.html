@@ -1,0 +1,41 @@
+{{define "rbac-tree"}}
+<ul class="rbac-tree">
+  <li>
+    <span class="mono">{{.Path}}</span>
+    <button class="btn btn-sm btn-ghost" title="Add binding here"
+            hx-get="/ui/rbac/binding-modal?path={{.Path}}" hx-target="body" hx-swap="beforeend">{{icon "add"}}</button>
+    {{if .Bindings}}
+    <ul class="rbac-bindings">
+      {{range .Bindings}}
+      <li>
+        <span class="badge {{if eq .Role "admin"}}badge-red{{else if eq .Role "operator"}}badge-yellow{{else}}badge-blue{{end}}">{{.Role}}</span>
+        <span class="mono">{{.Principal}}</span>
+        {{if .Propagate}}<span class="muted">(propagate)</span>{{end}}
+        <button class="btn btn-sm btn-ghost" title="Revoke"
+                hx-delete="/ui/rbac/bindings/{{.ID}}" hx-confirm="Revoke {{.Role}} for {{.Principal}} on {{.Path}}?">{{icon "delete"}}</button>
+      </li>
+      {{end}}
+    </ul>
+    {{end}}
+    {{if .Children}}
+      {{range .Children}}{{template "rbac-tree" .}}{{end}}
+    {{end}}
+  </li>
+</ul>
+{{end}}
+
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>RBAC tree</h2>
+      <p class="muted">Path-rooted role bindings ({{.BindingCount}} total). Bindings propagate down the path tree when marked.</p>
+    </div>
+    <button class="btn btn-primary" hx-get="/ui/rbac/binding-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Add binding</button>
+  </div>
+  {{template "alert_error" .Error}}
+  {{if .Tree}}
+    {{template "rbac-tree" .Tree}}
+  {{end}}
+</div>
+{{end}}

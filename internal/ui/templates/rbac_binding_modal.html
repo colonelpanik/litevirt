@@ -1,0 +1,29 @@
+<div class="modal-overlay" id="rbac-binding-modal">
+  <div class="modal" style="max-width:480px">
+    <h3>Add role binding</h3>
+    <form hx-post="/ui/rbac/bindings" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('rbac-binding-modal').remove()">
+      <div class="form-row">
+        <label>Path</label>
+        <input type="text" name="path" required value="{{.Path}}" placeholder="/projects/_default/vms" style="font-family:monospace">
+      </div>
+      <div class="form-row">
+        <label>Role</label>
+        <select name="role" required>
+          {{range .Roles}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Principal (user or token)</label>
+        <input type="text" name="principal" required placeholder="alice">
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="propagate" checked> Propagate to sub-paths</label>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('rbac-binding-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Grant</button>
+      </div>
+    </form>
+  </div>
+</div>

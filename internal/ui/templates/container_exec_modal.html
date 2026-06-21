@@ -1,0 +1,16 @@
+<div class="modal-overlay" id="ct-exec-modal" onclick="if(event.target===this)this.remove()">
+  <div class="modal" style="max-width:700px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Execute Command — {{.Name}} <span class="muted" style="font-size:13px">on {{.Host}}</span></h3>
+      <button class="btn" onclick="document.getElementById('ct-exec-modal').remove()">Close</button>
+    </div>
+    <form hx-post="/ui/containers/{{.Host}}/{{.Name}}/exec" hx-target="#ct-exec-output" hx-swap="innerHTML">
+      <div style="display:flex;gap:8px">
+        <input type="text" name="command" placeholder="cat /etc/os-release" autofocus
+               style="flex:1;font-family:monospace">
+        <button type="submit" class="btn btn-primary">Run</button>
+      </div>
+    </form>
+    <div id="ct-exec-output" style="margin-top:12px"></div>
+  </div>
+</div>

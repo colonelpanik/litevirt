@@ -1,0 +1,20 @@
+<div class="modal-overlay" id="mapping-create-modal">
+  <div class="modal" style="max-width:460px">
+    <h3>Create resource mapping</h3>
+    <form hx-post="/ui/resource-mappings" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('mapping-create-modal').remove()">
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" required placeholder="gpu-a100">
+      </div>
+      <div class="form-row">
+        <label>Description (optional)</label>
+        <input type="text" name="description" placeholder="NVIDIA A100 pool">
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('mapping-create-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>

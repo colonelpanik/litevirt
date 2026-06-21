@@ -1,0 +1,19 @@
+<div class="bulk-result-dialog" style="border:1px solid var(--border);border-radius:6px;padding:1em;margin-top:1em;background:var(--bg-elev)">
+  <h3 style="margin-top:0">{{if .DryRun}}Planned migration{{else}}Migration result{{end}} — {{.Stack}}</h3>
+  <table class="lv-table" style="width:100%;font-size:13px">
+    <thead>
+      <tr><th style="width:1%">·</th><th>VM</th><th>Disk</th><th>Stage</th><th>Detail</th></tr>
+    </thead>
+    <tbody>
+      {{range .Rows}}
+        <tr>
+          <td>{{if .OK}}<span style="color:var(--ok)">✓</span>{{else}}<span style="color:var(--err)">✗</span>{{end}}</td>
+          <td>{{.VM}}</td>
+          <td>{{.Disk}}</td>
+          <td>{{.Stage}}</td>
+          <td>{{if .Error}}<code style="color:var(--err);word-break:break-all">{{.Error}}</code>{{else}}{{.Status}}{{end}}</td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>

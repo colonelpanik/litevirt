@@ -1,0 +1,40 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <h1>Networks</h1>
+  <button class="btn btn-primary" hx-get="/ui/networks/create-modal" hx-target="body" hx-swap="beforeend">+ Create Network</button>
+</div>
+
+<div class="section">
+  <div class="section-header"><h2>All Networks ({{len .Networks}})</h2></div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>Type</th><th>Interface</th><th>Subnet</th><th>Gateway</th><th>DHCP</th><th>VNI</th><th>Stack</th><th>VMs</th><th></th>
+    </tr></thead>
+    <tbody>
+    {{range .Networks}}
+    <tr>
+      <td><strong>{{.Name}}</strong></td>
+      <td><span class="badge badge-blue">{{.Type}}</span></td>
+      <td>{{if .Iface}}{{.Iface}}{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if .Subnet}}<code>{{.Subnet}}</code>{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if .Gateway}}<code>{{.Gateway}}</code>{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if .Dhcp}}<span class="badge badge-green">yes</span>{{else}}<span style="color:var(--muted)">no</span>{{end}}</td>
+      <td>{{if .Vni}}{{.Vni}}{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if .StackName}}<a href="/stacks/{{.StackName}}"><span class="badge badge-blue">{{.StackName}}</span></a>{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{.VmCount}}</td>
+      <td class="actions">
+        {{if .StackName}}
+        <span style="color:var(--muted);font-size:11px" title="Managed by stack">stack</span>
+        {{else}}
+        <button class="btn btn-sm btn-danger"
+                hx-delete="/ui/networks/{{.Name}}{{if .VmCount}}?force=true{{end}}"
+                hx-confirm="Delete network '{{.Name}}'?{{if .VmCount}} {{.VmCount}} VMs are still attached — this will force-delete.{{end}}">Delete</button>
+        {{end}}
+      </td>
+    </tr>
+    {{else}}<tr><td colspan="10" class="empty">No networks</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

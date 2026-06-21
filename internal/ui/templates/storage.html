@@ -1,0 +1,69 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between">
+  <h1>Storage Pools</h1>
+  <button class="btn btn-primary" hx-get="/ui/storage/create-modal" hx-target="body" hx-swap="beforeend">+ Create Pool</button>
+</div>
+
+<div id="storage-table" hx-get="/ui/storage-table" hx-trigger="every 10s" hx-swap="outerHTML">
+  {{template "storage-table" .}}
+</div>
+
+<div style="margin-top:16px;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:13px;color:var(--muted)">
+  Pools can also be defined in each host's daemon config (<code>/etc/litevirt/config.yaml</code>).
+  Local pools use the host's filesystem; network pools (NFS, Ceph, iSCSI) connect to external storage.
+  The same actions are available via <code>lv pool create/ls/inspect/delete</code>.
+</div>
+{{end}}
+
+{{define "storage-table"}}
+<div id="storage-table" hx-get="/ui/storage-table" hx-trigger="every 10s" hx-swap="outerHTML">
+{{if .Error}}
+<div style="color:var(--red);padding:16px">Error: {{.Error}}</div>
+{{else}}
+<div class="section">
+  <div class="section-header"><h2>All Pools ({{len .Pools}})</h2></div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>Driver</th><th>Source</th><th>Target</th><th>Host</th><th>Capacity</th><th></th><th>State</th><th></th>
+    </tr></thead>
+    <tbody>
+    {{range .Pools}}
+    <tr>
+      <td style="font-weight:600">{{.Pool.Name}}</td>
+      <td>{{driverBadge .Pool.Driver}}</td>
+      <td style="font-family:monospace;font-size:12px">{{if .Pool.Source}}{{.Pool.Source}}{{else}}—{{end}}</td>
+      <td style="font-family:monospace;font-size:12px">{{if .Pool.Target}}{{.Pool.Target}}{{else}}—{{end}}</td>
+      <td><a href="/hosts/{{.Pool.Host}}">{{.Pool.Host}}</a></td>
+      <td style="min-width:180px">
+        {{if gt .Pool.TotalBytes 0}}
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="progress-bar" style="flex:1">
+            <div class="progress-bar-fill" style="width:{{.UsePct}}%;background:{{if gt .UsePct 89}}var(--red){{else if gt .UsePct 69}}var(--yellow){{else}}var(--green){{end}}"></div>
+          </div>
+          <span style="font-size:12px;color:var(--muted);white-space:nowrap">{{formatBytes .Pool.UsedBytes}} / {{formatBytes .Pool.TotalBytes}}</span>
+        </div>
+        {{else}}
+        <span style="color:var(--muted);font-size:12px">—</span>
+        {{end}}
+      </td>
+      <td></td>
+      <td>
+        {{if eq .Pool.State "active"}}<span class="badge badge-green">active</span>
+        {{else if eq .Pool.State "error"}}<span class="badge badge-red">error</span>
+        {{else}}<span class="badge badge-gray">{{.Pool.State}}</span>
+        {{end}}
+      </td>
+      <td>
+        <button class="btn btn-sm btn-danger"
+                hx-delete="/ui/storage/{{.Pool.Name}}?host={{.Pool.Host}}"
+                hx-confirm="Delete pool '{{.Pool.Name}}' on {{.Pool.Host}}? VMs already using it keep their disks; the pool just leaves the inventory.">Delete</button>
+      </td>
+    </tr>
+    {{else}}<tr><td colspan="9" class="empty">No storage pools configured</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}
+</div>
+{{end}}

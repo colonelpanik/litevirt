@@ -1,0 +1,16 @@
+<div class="modal-overlay" id="exec-modal" onclick="this.remove()">
+  <div class="modal" style="max-width:700px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Execute Command — {{.VMName}}</h3>
+      <button class="btn" onclick="document.getElementById('exec-modal').remove()">Close</button>
+    </div>
+    <form hx-post="/ui/vms/{{.VMName}}/exec" hx-target="#exec-output" hx-swap="innerHTML">
+      <div style="display:flex;gap:8px">
+        <input type="text" name="command" placeholder="ls -la /tmp" autofocus
+               style="flex:1;font-family:monospace">
+        <button type="submit" class="btn btn-primary">Run</button>
+      </div>
+    </form>
+    <div id="exec-output" style="margin-top:12px"></div>
+  </div>
+</div>

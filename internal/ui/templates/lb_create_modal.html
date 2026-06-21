@@ -1,0 +1,74 @@
+<div class="modal-overlay" id="lb-create-modal" onclick="this.remove()">
+  <div class="modal" style="max-width:700px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Create Load Balancer</h3>
+      <button class="btn" onclick="document.getElementById('lb-create-modal').remove()">Close</button>
+    </div>
+    <form hx-post="/ui/lb" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('lb-create-modal').remove()}">
+
+      <!-- Basic Settings -->
+      <h4 style="margin:0 0 8px">Basic</h4>
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" placeholder="my-lb" required>
+      </div>
+      <div class="form-row">
+        <label>VIP (CIDR)</label>
+        <input type="text" name="vip" placeholder="10.0.100.50/24" required>
+      </div>
+      <div class="form-row">
+        <label>Algorithm</label>
+        <select name="algorithm">
+          <option value="roundrobin">Round Robin</option>
+          <option value="leastconn">Least Connections</option>
+          <option value="source">Source Hash</option>
+        </select>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+
+      <!-- Ports -->
+      <h4 style="margin:0 0 8px">Ports</h4>
+      <div id="lb-ports">
+        <div style="display:flex;gap:8px;margin-bottom:4px">
+          <input type="number" name="listen" placeholder="Listen" style="width:100px" required>
+          <input type="number" name="target" placeholder="Target" style="width:100px" required>
+          <select name="protocol" style="width:80px">
+            <option value="tcp">TCP</option>
+            <option value="http">HTTP</option>
+          </select>
+        </div>
+      </div>
+      <button type="button" class="btn btn-sm" style="margin-bottom:12px" onclick="var d=document.createElement('div');d.style='display:flex;gap:8px;margin-bottom:4px';d.innerHTML='<input type=number name=listen placeholder=Listen style=width:100px><input type=number name=target placeholder=Target style=width:100px><select name=protocol style=width:80px><option value=tcp>TCP</option><option value=http>HTTP</option></select><button type=button class=btn style=font-size:11px;padding:1px_6px onclick=this.parentElement.remove()>×</button>';document.getElementById('lb-ports').appendChild(d)">+ Add Port</button>
+
+      <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+
+      <!-- Backends -->
+      <h4 style="margin:0 0 8px">Backends</h4>
+      <div id="lb-backends">
+        <div style="display:flex;gap:8px;margin-bottom:4px">
+          <input type="text" name="backend_name" placeholder="Name" style="width:120px">
+          <input type="text" name="backend_address" placeholder="IP:port" style="width:160px">
+        </div>
+      </div>
+      <button type="button" class="btn btn-sm" style="margin-bottom:12px" onclick="var d=document.createElement('div');d.style='display:flex;gap:8px;margin-bottom:4px';d.innerHTML='<input type=text name=backend_name placeholder=Name style=width:120px><input type=text name=backend_address placeholder=IP:port style=width:160px><button type=button class=btn style=font-size:11px;padding:1px_6px onclick=this.parentElement.remove()>×</button>';document.getElementById('lb-backends').appendChild(d)">+ Add Backend</button>
+
+      <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+
+      <!-- Hosts -->
+      <h4 style="margin:0 0 8px">LB Hosts (HAProxy+Keepalived)</h4>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+        {{range .Hosts}}
+        <label style="display:flex;align-items:center;gap:4px;font-size:13px">
+          <input type="checkbox" name="lb_hosts" value="{{.Name}}"> {{.Name}}
+        </label>
+        {{end}}
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Create Load Balancer</button>
+      </div>
+    </form>
+  </div>
+</div>

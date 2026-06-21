@@ -1,0 +1,40 @@
+<div class="modal-overlay" id="backup-create-modal">
+  <div class="modal" style="max-width:520px">
+    <h3>Back up {{.VMName}}</h3>
+    <p class="muted" style="font-size:13px;margin-top:0">
+      Creates a deduplicated, content-addressed snapshot in a backup repo (PBS-style).
+      Distinct from the libvirt snapshots on the VM's host.
+    </p>
+    {{if not .Repos}}
+    <div class="alert alert-warn">No backup repos are configured. Add a <code>backup_repos:</code> block to the daemon config first.</div>
+    {{end}}
+    <form hx-post="/ui/vms/{{.VMName}}/backup-snapshot" hx-target="#backup-progress" hx-swap="outerHTML">
+      <div class="form-row">
+        <label>Repo</label>
+        <select name="repo" required>
+          <option value="">Select a repo…</option>
+          {{range .Repos}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Disk (blank = root disk)</label>
+        <select name="disk">
+          <option value="">root disk</option>
+          {{range .Disks}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="incremental"> Incremental (dirty-bitmap delta against the latest snapshot)</label>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="no_quiesce"> Skip in-guest fs-freeze (faster, crash-consistent)</label>
+        <small class="muted">By default a VM with a guest agent is frozen briefly for an application-consistent backup.</small>
+      </div>
+      <div id="backup-progress"></div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('backup-create-modal').remove()">Close</button>
+        <button type="submit" class="btn btn-primary">{{icon "backup"}} Start backup</button>
+      </div>
+    </form>
+  </div>
+</div>

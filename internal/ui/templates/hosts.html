@@ -1,0 +1,41 @@
+{{define "content"}}
+<h1>Hosts</h1>
+
+<div id="host-bulk-bar" data-bulk-toolbar="host-table"
+     style="display:none; padding:8px; margin-bottom:8px; border:1px solid var(--border); border-radius:4px; background:var(--bg-elev);">
+  <span data-bulk-count>0</span> selected.
+  <button class="btn" hx-post="/ui/hosts/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"drain"}'   hx-target="#host-bulk-result" hx-swap="innerHTML"
+          hx-confirm="Drain the selected hosts? Running VMs will be live-migrated away.">Drain</button>
+  <button class="btn" hx-post="/ui/hosts/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"undrain"}' hx-target="#host-bulk-result" hx-swap="innerHTML">Undrain</button>
+  <input type="hidden" name="bulk_names" data-bulk-names>
+</div>
+<div id="host-bulk-result"></div>
+
+<div class="section">
+  <div class="section-header"><h2>All Hosts ({{len .Hosts}})</h2></div>
+  <table id="host-table" data-bulk-table>
+    <thead><tr>
+      <th style="width:1%"><input type="checkbox" data-bulk-master title="Select all"></th>
+      <th>Name</th><th>Address</th><th>State</th><th>vCPU</th><th>Memory</th><th>Disk</th><th>VMs</th>
+    </tr></thead>
+    <tbody>
+    {{range .Hosts}}
+    <tr>
+      <td><input type="checkbox" class="bulk-check" data-bulk-name="{{.Name}}"></td>
+      <td><a href="/hosts/{{.Name}}">{{.Name}}</a></td>
+      <td>{{.Address}}</td>
+      <td>{{hostStateBadge .State}}</td>
+      <td>{{.CpuUsed}}/{{.CpuTotal}}</td>
+      <td>{{memGiB .MemUsedMib}}G / {{memGiB .MemTotalMib}}G</td>
+      <td>
+        {{- with index $.DiskActual .Name}}{{formatBytes .UsedBytes}} / {{formatBytes .TotalBytes}}{{end}}
+        <span style="color:var(--muted);font-size:11px">· {{.DiskUsedGib}}G alloc</span>
+      </td>
+      <td>{{.VmCount}}</td>
+    </tr>
+    {{else}}<tr><td colspan="8" class="empty">No hosts registered</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

@@ -1,0 +1,81 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div>
+    <h1>Containers</h1>
+    <p class="muted" style="margin:0">LXC + OCI workloads</p>
+  </div>
+  <button class="btn btn-primary" hx-get="/ui/containers/new-modal" hx-target="body" hx-swap="beforeend">+ Create Container</button>
+</div>
+{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+
+<div class="section" id="ct-list" hx-get="/ui/containers-table" hx-trigger="every 5s" hx-swap="innerHTML">
+  {{template "containers-table" .}}
+</div>
+{{end}}
+
+{{define "containers-table"}}
+<div class="section-header">
+  <h2>All Containers ({{len .Containers}})</h2>
+  <div style="display:flex;gap:8px">
+    <input type="text" class="search-input" placeholder="Filter containers..." data-table-filter="ct-table">
+    <select style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-family:inherit;font-size:12px"
+            hx-get="/ui/containers-table" hx-target="#ct-list" hx-trigger="change" name="host">
+      <option value="">All hosts</option>
+      {{range .Hosts}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+    </select>
+  </div>
+</div>
+
+{{if not .Containers}}
+  <div class="empty-state">
+    <h3>No containers yet</h3>
+    <p>Create one above, or with the CLI:</p>
+    <pre><code>lv ct create alpine-1 --distro alpine --release 3.19
+lv ct start alpine-1</code></pre>
+  </div>
+{{else}}
+<div id="ct-bulk-bar" data-bulk-toolbar="ct-table"
+     style="display:none; padding:8px; margin-bottom:8px; border:1px solid var(--border); border-radius:4px; background:var(--bg);">
+  <span data-bulk-count>0</span> selected.
+  <button class="btn btn-sm" hx-post="/ui/containers/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"start"}' hx-target="#ct-bulk-result" hx-swap="innerHTML">Start</button>
+  <button class="btn btn-sm" hx-post="/ui/containers/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"stop"}'  hx-target="#ct-bulk-result" hx-swap="innerHTML">Stop</button>
+  <button class="btn btn-sm btn-danger"
+          hx-post="/ui/containers/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"delete"}'
+          hx-target="#ct-bulk-result" hx-swap="innerHTML"
+          hx-confirm="Delete the selected containers? This cannot be undone.">Delete</button>
+  <input type="hidden" name="bulk_names" data-bulk-names>
+</div>
+<div id="ct-bulk-result"></div>
+<table id="ct-table" data-bulk-table>
+  <thead><tr>
+    <th style="width:1%"><input type="checkbox" data-bulk-master title="Select all"></th>
+    <th>Name</th><th>Host</th><th>State</th><th>Image</th><th>CPU</th><th>Memory</th><th>Actions</th>
+  </tr></thead>
+  <tbody>
+  {{range .Containers}}
+  <tr>
+    <td><input type="checkbox" class="bulk-check" data-bulk-name="{{.HostName}}/{{.Name}}"></td>
+    <td>{{.Name}}</td>
+    <td>{{.HostName}}</td>
+    <td><span class="state state-{{.State}}">{{.State}}</span></td>
+    <td>{{if .Image}}{{.Image}}{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+    <td>{{if gt .CpuLimit 0}}{{.CpuLimit}}{{else}}<span style="color:var(--muted)">∞</span>{{end}}</td>
+    <td>{{if gt .MemoryMib 0}}{{.MemoryMib}}MiB{{else}}<span style="color:var(--muted)">∞</span>{{end}}</td>
+    <td class="actions">
+      {{if eq .State "running"}}
+        <button class="btn btn-sm" hx-post="/ui/containers/{{.HostName}}/{{.Name}}/stop" hx-target="#ct-list" hx-swap="innerHTML" title="Stop">Stop</button>
+        <button class="btn btn-sm" hx-get="/ui/containers/{{.HostName}}/{{.Name}}/exec-modal" hx-target="body" hx-swap="beforeend" title="Run a command">Exec</button>
+      {{else}}
+        <button class="btn btn-sm btn-primary" hx-post="/ui/containers/{{.HostName}}/{{.Name}}/start" hx-target="#ct-list" hx-swap="innerHTML" title="Start">Start</button>
+      {{end}}
+      <button class="btn btn-sm btn-danger"
+              hx-delete="/ui/containers/{{.HostName}}/{{.Name}}" hx-target="#ct-list" hx-swap="innerHTML"
+              hx-confirm="Delete container '{{.Name}}' on {{.HostName}}? This cannot be undone."
+              title="Delete">Delete</button>
+    </td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}

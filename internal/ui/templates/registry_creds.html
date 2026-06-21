@@ -1,0 +1,72 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <h2>Account · Registry credentials</h2>
+    <p class="muted">
+      Store registry logins used to authenticate private OCI image pulls
+      (<code>lv ct pull</code>). Your credentials apply only to your own pulls;
+      global credentials apply cluster-wide. When you pull, your credential for
+      the image's registry wins, otherwise the global one is used. Secrets are
+      never displayed after they're saved.
+    </p>
+  </div>
+
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+
+  <div class="actions" style="margin-bottom:12px">
+    <button class="btn btn-primary" hx-get="/ui/registry-creds/add-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Add credential</button>
+  </div>
+
+  <h3>My credentials</h3>
+  {{if .Mine}}
+  <table class="table">
+    <thead>
+      <tr><th>Registry</th><th>Username</th><th>Updated</th><th></th></tr>
+    </thead>
+    <tbody>
+    {{range .Mine}}
+      <tr>
+        <td class="mono">{{.Registry}}</td>
+        <td>{{.Username}}</td>
+        <td class="muted">{{.UpdatedAt}}</td>
+        <td style="text-align:right">
+          <button class="btn btn-sm btn-danger"
+                  hx-delete="/ui/registry-creds?registry={{.Registry}}&global=false"
+                  hx-confirm="Remove your credential for {{.Registry}}?">{{icon "delete"}}</button>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">No personal registry credentials. Add one above, or run <code>lv registry add &lt;registry&gt; -u &lt;user&gt; --password-stdin</code>.</div>
+  {{end}}
+
+  <h3 style="margin-top:28px">Global credentials <span class="badge badge-blue">cluster-wide</span></h3>
+  {{if .Global}}
+  <table class="table">
+    <thead>
+      <tr><th>Registry</th><th>Username</th><th>Updated</th>{{if .IsOperator}}<th></th>{{end}}</tr>
+    </thead>
+    <tbody>
+    {{range .Global}}
+      <tr>
+        <td class="mono">{{.Registry}}</td>
+        <td>{{.Username}}</td>
+        <td class="muted">{{.UpdatedAt}}</td>
+        {{if $.IsOperator}}
+        <td style="text-align:right">
+          <button class="btn btn-sm btn-danger"
+                  hx-delete="/ui/registry-creds?registry={{.Registry}}&global=true"
+                  hx-confirm="Remove the GLOBAL credential for {{.Registry}}?">{{icon "delete"}}</button>
+        </td>
+        {{end}}
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">No global registry credentials.{{if .IsOperator}} Add one above and tick “Global”.{{end}}</div>
+  {{end}}
+</div>
+{{end}}

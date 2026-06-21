@@ -1,0 +1,11 @@
+<div class="bulk-result-dialog" style="border:1px solid var(--border);border-radius:6px;padding:1em;margin-top:1em;background:var(--bg-elev)">
+  {{if .Error}}
+    <h3 style="margin-top:0;color:var(--err)">Replication failed</h3>
+    <code style="word-break:break-all;font-size:12px">{{.Error}}</code>
+  {{else}}
+    <h3 style="margin-top:0;color:var(--ok)">Disk replicated ✓</h3>
+    <p>{{.VMName}} / {{.DiskName}} → pool <b>{{.Pool}}</b>{{if .Status}} — {{.Status}}{{end}}</p>
+    {{if .TargetPath}}<p style="font-size:12px;color:var(--muted)">Copy at <code style="word-break:break-all">{{.TargetPath}}</code></p>{{end}}
+    <button class="btn" onclick="document.getElementById('replicate-volume-modal').remove()">Close</button>
+  {{end}}
+</div>

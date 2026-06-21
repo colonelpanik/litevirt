@@ -1,0 +1,27 @@
+<div class="modal-overlay" id="repo-sync-modal">
+  <div class="modal" style="max-width:480px">
+    <h3>Sync repo {{.Src}}</h3>
+    <p class="muted" style="font-size:13px;margin-top:0">
+      Copies snapshots missing from the destination plus the chunks they reference.
+      Content-addressed, so already-present chunks are skipped.
+    </p>
+    {{if not .Dests}}
+    <div class="alert alert-warn">No other repos are configured to sync to.</div>
+    {{else}}
+    <form hx-post="/ui/backups/sync?repo={{.Src}}" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('repo-sync-modal').remove()">
+      <div class="form-row">
+        <label>Destination repo</label>
+        <select name="dest" required>
+          <option value="">Select a destination…</option>
+          {{range .Dests}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('repo-sync-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Sync</button>
+      </div>
+    </form>
+    {{end}}
+  </div>
+</div>

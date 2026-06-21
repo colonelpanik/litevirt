@@ -1,0 +1,183 @@
+{{define "content"}}
+<div class="detail-header">
+  <a href="/hosts" class="back">← Hosts</a>
+  <h1>{{.Host.Name}}</h1>
+  {{hostStateBadge .Host.State}}
+  {{if .Host.Version}}<span class="badge" style="font-size:11px;margin-left:8px">{{.Host.Version}}</span>{{end}}
+  <div style="flex:1"></div>
+  <div class="actions">
+    {{if eq .Host.State.String "HOST_ACTIVE"}}
+    <button class="btn" hx-post="/ui/hosts/{{.Host.Name}}/drain" hx-confirm="Drain {{.Host.Name}}? Running VMs will be migrated.">Drain</button>
+    {{end}}
+    <button class="btn" hx-get="/ui/hosts/{{.Host.Name}}/upgrade-modal" hx-target="body" hx-swap="beforeend">Upgrade</button>
+  </div>
+</div>
+
+<div class="card-grid">
+  <div class="card">
+    <div class="card-title">Address</div>
+    <div class="card-value card-value-sm mono">{{.Host.Address}}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">vCPU</div>
+    <div class="card-value">{{.Host.CpuUsed}}/{{.Host.CpuTotal}}</div>
+    <div class="progress-bar"><div class="progress-bar-fill" style="width:{{printf "%.0f" .CPUPct}}%;background:var(--accent)"></div></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Memory</div>
+    <div class="card-value">{{memGiB .Host.MemUsedMib}}G / {{memGiB .Host.MemTotalMib}}G</div>
+    <div class="progress-bar"><div class="progress-bar-fill" style="width:{{printf "%.0f" .MemPct}}%;background:var(--blue)"></div></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Disk (actual)</div>
+    <div class="card-value">{{formatBytes .DiskActualUsed}} / {{formatBytes .DiskActualTotal}}</div>
+    <div class="progress-bar"><div class="progress-bar-fill" style="width:{{printf "%.0f" .DiskActualPct}}%;background:var(--green)"></div></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Disk (allocated)</div>
+    <div class="card-value">{{.Host.DiskUsedGib}}G committed</div>
+  </div>
+  <div class="card">
+    <div class="card-title">VMs</div>
+    <div class="card-value">{{len .VMs}}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Networks</div>
+    <div class="card-value">{{len .Networks}}</div>
+  </div>
+</div>
+
+{{if .Host.StoragePools}}
+<div class="section" style="margin-bottom:16px">
+  <div class="section-header"><h2>Storage Pools ({{len .Host.StoragePools}})</h2></div>
+  <table>
+    <thead><tr><th>Name</th><th>Driver</th><th>Target</th><th>Capacity</th><th style="width:200px">Usage</th><th>State</th></tr></thead>
+    <tbody>
+    {{range .Host.StoragePools}}
+    <tr>
+      <td>{{.Name}}</td>
+      <td>{{driverBadge .Driver}}</td>
+      <td style="font-family:monospace;font-size:12px">{{.Target}}</td>
+      <td>{{formatBytes .UsedBytes}} / {{formatBytes .TotalBytes}}</td>
+      <td>
+        <div class="progress-bar"><div class="progress-bar-fill" style="width:{{poolPct .UsedBytes .TotalBytes}}%;background:var(--green)"></div></div>
+      </td>
+      <td>{{if eq .State "active"}}<span class="badge badge-green">active</span>{{else}}<span class="badge badge-red">{{.State}}</span>{{end}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}
+
+{{if .Networks}}
+<div class="section" style="margin-bottom:16px">
+  <div class="section-header"><h2>Networks ({{len .Networks}})</h2></div>
+  <table>
+    <thead><tr><th>Name</th><th>Type</th><th>Interface</th><th>Subnet</th><th>Gateway</th><th>DHCP</th><th>VNI</th><th>Stack</th><th>VMs</th></tr></thead>
+    <tbody>
+    {{range .Networks}}
+    <tr>
+      <td><strong>{{.Name}}</strong></td>
+      <td><span class="badge badge-blue">{{.Type}}</span></td>
+      <td>{{if .Iface}}{{.Iface}}{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if .Subnet}}<code>{{.Subnet}}</code>{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if .Gateway}}<code>{{.Gateway}}</code>{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if .Dhcp}}<span class="badge badge-green">yes</span>{{else}}<span style="color:var(--muted)">no</span>{{end}}</td>
+      <td>{{if .Vni}}{{.Vni}}{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if .StackName}}<a href="/stacks/{{.StackName}}"><span class="badge badge-blue">{{.StackName}}</span></a>{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{.VmCount}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}
+
+{{if .Host.Labels}}
+<div class="section" style="margin-bottom:16px">
+  <div class="section-header"><h2>Labels</h2></div>
+  <div style="display:flex;flex-wrap:wrap;gap:6px;padding:12px">
+    {{range $k, $v := .Host.Labels}}
+    <span class="badge" style="font-size:12px"><strong>{{$k}}</strong>=<span style="color:var(--muted)">{{$v}}</span></span>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
+{{if .Host.FenceStrategy}}
+<div class="section" style="margin-bottom:16px">
+  <div class="section-header"><h2>Fencing Configuration</h2></div>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:12px">
+    <div>
+      <div class="card-title">Strategy</div>
+      <span class="badge badge-blue">{{.Host.FenceStrategy}}</span>
+    </div>
+    {{if .Host.IpmiAddress}}
+    <div>
+      <div class="card-title">IPMI Address</div>
+      <code style="font-size:12px">{{.Host.IpmiAddress}}</code>
+    </div>
+    {{end}}
+    {{if .Host.WatchdogDev}}
+    <div>
+      <div class="card-title">Watchdog Device</div>
+      <code style="font-size:12px">{{.Host.WatchdogDev}}</code>
+    </div>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
+<!-- Live resource utilization (auto-refreshes every 3s) -->
+<div hx-get="/ui/hosts/{{.Host.Name}}/stats" hx-trigger="load" hx-swap="innerHTML" id="host-stats-container"></div>
+
+<div data-stats-chart="/ui/hosts/{{.Host.Name}}/stats-history" class="stats-charts">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">
+    <div class="chart-cpu"></div>
+    <div class="chart-mem"></div>
+    <div class="chart-io"></div>
+    <div class="chart-net"></div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div class="section">
+    <div class="section-header"><h2>VMs on this Host</h2></div>
+    <table>
+      <thead><tr><th>Name</th><th>State</th><th>CPU</th><th>Memory</th><th>IP</th></tr></thead>
+      <tbody>
+      {{range .VMs}}
+      <tr>
+        <td><a href="/vms/{{.Name}}">{{.Name}}</a></td>
+        <td>{{vmStateBadge .State}}</td>
+        <td>{{.CpuActual}}</td>
+        <td>{{.MemActualMib}}MiB</td>
+        <td>{{firstIP .Interfaces}}</td>
+      </tr>
+      {{else}}<tr><td colspan="5" class="empty">No VMs on this host</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h2>PCI Devices ({{len .Devices}})</h2></div>
+    <table>
+      <thead><tr><th>Address</th><th>Type</th><th>Vendor</th><th>VM</th><th>NUMA</th></tr></thead>
+      <tbody>
+      {{range .Devices}}
+      <tr>
+        <td style="font-family:monospace;font-size:11px">{{.Address}}</td>
+        <td>{{.Type}}</td>
+        <td>{{.VendorName}}</td>
+        <td>{{if .VmName}}<a href="/vms/{{.VmName}}">{{.VmName}}</a>{{else}}<span style="color:var(--muted)">free</span>{{end}}</td>
+        <td>{{if ge .NumaNode 0}}{{.NumaNode}}{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      </tr>
+      {{else}}<tr><td colspan="5" class="empty">No PCI devices</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{end}}

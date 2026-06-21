@@ -1,0 +1,19 @@
+<div class="modal-overlay" id="pull-image-modal">
+  <div class="modal">
+    <h3>Pull Image</h3>
+    <form hx-post="/ui/images/pull" hx-swap="none" hx-on::after-request="document.getElementById('pull-image-modal').remove()">
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" placeholder="ubuntu-jammy" required>
+      </div>
+      <div class="form-row">
+        <label>Source URL</label>
+        <input type="url" name="source_url" placeholder="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img" required>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('pull-image-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Pull</button>
+      </div>
+    </form>
+  </div>
+</div>

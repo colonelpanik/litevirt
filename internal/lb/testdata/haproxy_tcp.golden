@@ -1,0 +1,27 @@
+
+global
+    log /dev/log local0
+    maxconn 4096
+    user haproxy
+    group haproxy
+    daemon
+    stats socket /run/litevirt/lb/app-haproxy.sock mode 660 level admin
+    stats timeout 30s
+
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    retries 3
+    timeout connect 5s
+    timeout client  30s
+    timeout server  30s
+frontend app-80
+    bind 10.0.100.100:80
+    default_backend app-80-be
+
+backend app-80-be
+    balance roundrobin
+    option tcp-check
+    server vm-a 10.0.100.10:8080 check inter 2s rise 2 fall 3
+    server vm-b 10.0.100.11:8080 check inter 2s rise 2 fall 3

@@ -1,0 +1,34 @@
+<div class="modal-overlay" id="replicate-volume-modal">
+  <div class="modal" style="max-width:520px">
+    <h3>Replicate disk to another pool</h3>
+    <p style="color:var(--muted);font-size:13px;margin-top:0">
+      VM <b>{{.VMName}}</b>, disk <b>{{.DiskName}}</b>{{if .CurrentPool}} (currently on <b>{{.CurrentPool}}</b>){{end}}.
+      Creates a crash-consistent point-in-time copy in the target pool; the VM keeps
+      using its source disk (suitable for DR / off-site). File-based pools only.
+    </p>
+    {{if .Pools}}
+    <form hx-post="/ui/vms/{{.VMName}}/replicate-volume" hx-target="#replicate-volume-result" hx-swap="innerHTML">
+      <input type="hidden" name="disk" value="{{.DiskName}}">
+      <div class="form-row">
+        <label>Target pool</label>
+        <select name="target_pool" required>
+          <option value="">Select a pool…</option>
+          {{range .Pools}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Target path</label>
+        <input type="text" name="target_path" placeholder="optional — defaults to {{.VMName}}-{{.DiskName}}.qcow2">
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('replicate-volume-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Replicate</button>
+      </div>
+    </form>
+    {{else}}
+    <p style="color:var(--err)">No other file-based pools on this host to replicate to. Create one under Storage → Pools.</p>
+    <div class="form-actions"><button type="button" class="btn" onclick="document.getElementById('replicate-volume-modal').remove()">Close</button></div>
+    {{end}}
+    <div id="replicate-volume-result" style="margin-top:1em"></div>
+  </div>
+</div>

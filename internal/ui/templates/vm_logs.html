@@ -1,0 +1,30 @@
+{{define "content"}}
+<div class="detail-header">
+  <a href="/vms/{{.VMName}}" class="back">← {{.VMName}}</a>
+  <h1>{{.VMName}} — Logs</h1>
+  <div style="flex:1"></div>
+  <label style="font-size:13px;display:flex;align-items:center;gap:4px">
+    <input type="checkbox" id="log-follow" checked> Follow
+  </label>
+  <button class="btn" onclick="document.getElementById('log-output').textContent=''" style="font-size:12px">Clear</button>
+</div>
+
+<div class="section">
+  <pre id="log-output" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:12px;font-size:12px;max-height:70vh;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></pre>
+</div>
+
+<script>
+(function() {
+  var output = document.getElementById('log-output');
+  var followCb = document.getElementById('log-follow');
+  var es = new EventSource('/ui/vms/' + encodeURIComponent('{{.VMName}}') + '/logs/stream?lines=200');
+  es.addEventListener('log', function(e) {
+    output.textContent += e.data + '\n';
+    if (followCb.checked) output.scrollTop = output.scrollHeight;
+  });
+  es.addEventListener('done', function() { es.close(); });
+  es.addEventListener('error', function() { es.close(); });
+  window.addEventListener('beforeunload', function() { es.close(); });
+})();
+</script>
+{{end}}

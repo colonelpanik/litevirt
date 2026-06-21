@@ -1,0 +1,40 @@
+<div class="modal-overlay" id="project-quota-modal">
+  <div class="modal" style="max-width:520px">
+    <h3>Quota — {{.Name}}</h3>
+    <p style="color:var(--muted);font-size:13px;margin-top:0">
+      Each limit is a ceiling; <b>0 = unbounded</b>. Same as
+      <code>lv project quota {{.Name}} --vcpu …</code>.
+    </p>
+    <form hx-post="/ui/projects/quota?name={{.Name}}" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('project-quota-modal').remove()">
+      <div class="form-row">
+        <label>vCPU limit</label>
+        <input type="number" name="vcpu" min="0" value="{{.Quota.VcpuLimit}}">
+      </div>
+      <div class="form-row">
+        <label>Memory MiB limit</label>
+        <input type="number" name="mem" min="0" value="{{.Quota.MemMibLimit}}">
+      </div>
+      <div class="form-row">
+        <label>Disk GiB limit</label>
+        <input type="number" name="disk" min="0" value="{{.Quota.DiskGibLimit}}">
+      </div>
+      <div class="form-row">
+        <label>NIC limit</label>
+        <input type="number" name="nics" min="0" value="{{.Quota.NicLimit}}">
+      </div>
+      <div class="form-row">
+        <label>Public IP limit</label>
+        <input type="number" name="ips" min="0" value="{{.Quota.PublicIpLimit}}">
+      </div>
+      <div class="form-row">
+        <label>Backup GiB limit</label>
+        <input type="number" name="backup" min="0" value="{{.Quota.BackupGibLimit}}">
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('project-quota-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save quota</button>
+      </div>
+    </form>
+  </div>
+</div>

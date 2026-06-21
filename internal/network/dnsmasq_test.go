@@ -1,0 +1,62 @@
+package network
+
+import (
+	"strings"
+	"testing"
+)
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestDnsmasqArgs_ExcludesLoopback is the regression for the multi-bridge DHCP
+// collision: without --except-interface=lo, dnsmasq binds 127.0.0.1:53 and only
+// the first per-bridge instance on a host can start (the rest exit 2). litevirt
+// serves guest DNS via the bridge gateway IP, so loopback must be excluded.
+func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
+	args := dnsmasqArgs("br-test", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
+		"/var/run/litevirt-dnsmasq-br-test.pid", []string{"8.8.8.8"})
+
+	for _, want := range []string{
+		"--interface=br-test",
+		"--except-interface=lo",
+		"--bind-dynamic",
+		"--pid-file=/var/run/litevirt-dnsmasq-br-test.pid",
+		// Lease file must live in the dir the IP scanner reads, or lease-based
+		// IP discovery silently never fires (ARP-only fallback).
+		"--dhcp-leasefile=/var/lib/libvirt/dnsmasq/litevirt-br-test.leases",
+		"--dhcp-range=10.0.0.2,10.0.0.254,255.255.255.0,12h",
+		"--server=8.8.8.8",
+		"--no-resolv",
+	} {
+		if !hasArg(args, want) {
+			t.Errorf("dnsmasq args missing %q\ngot: %s", want, strings.Join(args, " "))
+		}
+	}
+	// IPv4 gateway must NOT enable RA.
+	if hasArg(args, "--enable-ra") {
+		t.Error("--enable-ra should not be set for an IPv4 gateway")
+	}
+}
+
+// TestDnsmasqArgs_V6EnablesRA confirms an IPv6 gateway turns on router
+// advertisements (and still excludes loopback).
+func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {
+	args := dnsmasqArgs("br-v6", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64",
+		"/var/run/litevirt-dnsmasq-br-v6.pid", nil)
+	if !hasArg(args, "--enable-ra") {
+		t.Error("--enable-ra not set for IPv6 gateway")
+	}
+	if !hasArg(args, "--except-interface=lo") {
+		t.Error("--except-interface=lo missing for IPv6 case")
+	}
+	// No upstream DNS supplied → must NOT force --no-resolv (fall back to resolv.conf).
+	if hasArg(args, "--no-resolv") {
+		t.Error("--no-resolv should not be set when no upstream DNS was resolved")
+	}
+}

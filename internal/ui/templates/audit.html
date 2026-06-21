@@ -1,0 +1,48 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Audit Log</h2>
+      <p class="muted">SHA-256 hash chain. Verify walks it and flags the first tampered row; Export downloads a WORM-ready JSON blob.</p>
+    </div>
+    <div class="actions">
+      <button class="btn" hx-post="/ui/audit/verify" hx-swap="none">Verify chain</button>
+      <a class="btn" href="/ui/audit/export">Export JSON</a>
+    </div>
+  </div>
+
+  {{if or .FilterTarget .FilterAction}}
+  <div class="alert alert-info">
+    Filtered by
+    {{if .FilterTarget}}<code>target={{.FilterTarget}}</code>{{end}}
+    {{if .FilterAction}}<code>action={{.FilterAction}}</code>{{end}}
+    · <a href="/audit">clear</a>
+  </div>
+  {{end}}
+
+  <div class="section">
+    <div class="section-header"><h2>Recent activity</h2></div>
+    <table>
+      <thead><tr>
+        <th>Time</th><th>User</th><th>Host</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th>
+      </tr></thead>
+      <tbody>
+      {{if .AuditEntries}}
+      {{range .AuditEntries}}
+      <tr>
+        <td style="white-space:nowrap">{{relTime .Timestamp}}</td>
+        <td>{{if .Username}}{{.Username}}{{else}}<span class="muted">system</span>{{end}}</td>
+        <td class="muted" style="font-size:11px">{{.HostName}}</td>
+        <td><a href="/audit?action={{.Action}}"><span class="badge badge-blue">{{.Action}}</span></a></td>
+        <td>{{if .Target}}<a href="/audit?target={{.Target}}">{{.Target}}</a>{{end}}</td>
+        <td>{{if or (eq .Result "ok") (eq .Result "success")}}<span class="badge badge-green">{{.Result}}</span>{{else}}<span class="badge badge-red">{{.Result}}</span>{{end}}</td>
+        <td class="muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px" title="{{.Detail}}">{{.Detail}}</td>
+      </tr>
+      {{end}}
+      {{else}}<tr><td colspan="7" class="empty">No audit entries</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{end}}

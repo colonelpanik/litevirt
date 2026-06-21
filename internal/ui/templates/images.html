@@ -1,0 +1,51 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <h1>Images</h1>
+  <div style="display:flex;gap:8px">
+    <button class="btn btn-primary" hx-get="/ui/images/pull-modal" hx-target="body" hx-swap="beforeend">+ Pull Image</button>
+    <button class="btn" hx-get="/ui/images/build-modal" hx-target="body" hx-swap="beforeend">Build from VM</button>
+    <button class="btn" hx-get="/ui/images/push-modal" hx-target="body" hx-swap="beforeend">Push to Host</button>
+  </div>
+</div>
+
+<div class="section" id="image-list" {{if .HasPulling}}hx-get="/ui/images-table" hx-trigger="every 3s" hx-swap="outerHTML"{{end}}>
+  <div class="section-header"><h2>All Images ({{len .Images}})</h2></div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>Format</th><th>Size</th><th>Status</th><th>Source</th><th>Checksum</th><th></th>
+    </tr></thead>
+    <tbody>
+    {{range .Images}}
+    <tr>
+      <td>{{.Name}}</td>
+      <td>{{.Format}}</td>
+      <td>{{if eq .Status "pulling"}}&mdash;{{else}}{{formatBytes .SizeBytes}}{{end}}</td>
+      <td>
+        {{if eq .Status "pulling"}}
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="flex:1;background:var(--bg);border-radius:4px;height:16px;overflow:hidden;min-width:100px">
+              <div style="width:{{printf "%.0f" .ProgressPct}}%;height:100%;background:var(--accent);border-radius:4px;transition:width 0.3s"></div>
+            </div>
+            <span style="font-size:12px;color:var(--muted);white-space:nowrap">{{printf "%.0f" .ProgressPct}}%</span>
+          </div>
+        {{else if eq .Status "error"}}
+          <span class="badge badge-error">error</span>
+        {{else}}
+          <span class="badge badge-success">ready</span>
+        {{end}}
+      </td>
+      <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{.SourceUrl}}</td>
+      <td style="font-family:monospace;font-size:11px;color:var(--muted)">{{truncate .Checksum 16}}</td>
+      <td class="actions">
+        {{if ne .Status "pulling"}}
+        <button class="btn btn-sm btn-danger"
+                hx-delete="/ui/images/{{.Name}}" hx-confirm="Delete image '{{.Name}}'?">Delete</button>
+        {{end}}
+      </td>
+    </tr>
+    {{else}}<tr><td colspan="7" class="empty">No images — pull one to get started</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

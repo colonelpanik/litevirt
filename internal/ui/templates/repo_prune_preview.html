@@ -1,0 +1,30 @@
+<div class="alert alert-info">Prune preview for <b>{{.Repo}}</b>: keep {{len .Keep}}, delete {{len .Delete}} snapshots.</div>
+{{if .Delete}}
+<table class="table" style="margin-bottom:12px">
+  <thead><tr><th>Snapshot</th><th>VM</th><th>Disk</th><th>Size</th></tr></thead>
+  <tbody>
+  {{range .Delete}}
+    <tr>
+      <td class="mono" style="font-size:11px">{{.Timestamp}}</td>
+      <td>{{.VMName}}</td>
+      <td>{{if .DiskName}}{{.DiskName}}{{else}}root{{end}}</td>
+      <td>{{formatBytes .TotalSize}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+<form hx-post="/ui/backups/prune?repo={{.Repo}}" hx-swap="none"
+      hx-on::after-request="if(event.detail.successful)document.getElementById('repo-prune-modal').remove()">
+  <input type="hidden" name="apply" value="1">
+  <input type="hidden" name="keep_last" value="{{.Policy.Get "keep_last"}}">
+  <input type="hidden" name="keep_daily" value="{{.Policy.Get "keep_daily"}}">
+  <input type="hidden" name="keep_weekly" value="{{.Policy.Get "keep_weekly"}}">
+  <input type="hidden" name="keep_monthly" value="{{.Policy.Get "keep_monthly"}}">
+  <input type="hidden" name="keep_yearly" value="{{.Policy.Get "keep_yearly"}}">
+  <div class="form-actions">
+    <button type="submit" class="btn btn-danger" hx-confirm="Delete {{len .Delete}} snapshots from {{.Repo}}? Chunks are reclaimed on the next GC.">Confirm delete</button>
+  </div>
+</form>
+{{else}}
+<p class="muted">Nothing to prune under this policy.</p>
+{{end}}

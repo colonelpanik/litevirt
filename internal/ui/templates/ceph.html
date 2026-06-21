@@ -1,0 +1,65 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <h2>Ceph</h2>
+    <p class="muted">Hyperconverged storage cluster</p>
+  </div>
+
+  {{if not .Available}}
+  <div class="empty-state">
+    <h3>Ceph is not running on this host</h3>
+    <p>Bring up the first MON and MGR with cephadm:</p>
+    <pre><code>lv host ceph init --mon-ip &lt;storage-net-ip&gt; --network &lt;cidr&gt;
+lv host ceph add-mon &lt;host&gt;
+lv host ceph add-mgr &lt;host&gt;
+lv host ceph add-osd &lt;host&gt; /dev/sdb</code></pre>
+    {{if .Error}}<p class="error">Last error: <code>{{.Error}}</code></p>{{end}}
+  </div>
+  {{else}}
+  <div class="cluster-stats">
+    <div class="stat-card">
+      <h4>Health</h4>
+      <p class="big {{if eq .Status.Health "HEALTH_OK"}}good{{else if eq .Status.Health "HEALTH_WARN"}}warn{{else}}bad{{end}}">{{.Status.Health}}</p>
+      {{if .Status.HealthDetail}}<p class="muted">{{.Status.HealthDetail}}</p>{{end}}
+    </div>
+    <div class="stat-card">
+      <h4>FSID</h4>
+      <p class="mono">{{.Status.FSID}}</p>
+    </div>
+    <div class="stat-card">
+      <h4>MONs</h4>
+      <p class="big">{{.Status.MonsTotal}}</p>
+    </div>
+    <div class="stat-card">
+      <h4>OSDs</h4>
+      <p class="big">{{.Status.OSDsUp}} / {{.Status.OSDsTotal}}</p>
+      <p class="muted">in: {{.Status.OSDsIn}}</p>
+    </div>
+    <div class="stat-card">
+      <h4>PGs</h4>
+      <p class="big">{{.Status.PGsTotal}}</p>
+    </div>
+    <div class="stat-card">
+      <h4>Capacity</h4>
+      <p>used {{.Status.BytesUsed}} / avail {{.Status.BytesAvail}}</p>
+    </div>
+  </div>
+
+  <h3>OSD tree</h3>
+  <table class="table">
+    <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th>Reweight</th></tr></thead>
+    <tbody>
+    {{range .Tree.Nodes}}
+      <tr>
+        <td>{{.ID}}</td>
+        <td>{{.Name}}</td>
+        <td>{{.Type}}</td>
+        <td>{{.Status}}</td>
+        <td>{{printf "%.2f" .Reweight}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{end}}
+</div>
+{{end}}

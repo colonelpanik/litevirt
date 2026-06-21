@@ -1,0 +1,51 @@
+<div class="modal-overlay" id="migrate-volumes-modal">
+  <div class="modal" style="max-width:640px">
+    <h3>Migrate volumes — {{.Stack}}</h3>
+    <p style="color:var(--muted);font-size:13px;margin-top:0">
+      Running VMs migrate online (no downtime); the rollout proceeds one VM at a
+      time. File-based pools only.
+    </p>
+    <form hx-post="/ui/stacks/{{.Stack}}/migrate-volumes"
+          hx-target="#migrate-volumes-result" hx-swap="innerHTML">
+      <div class="form-row">
+        <label>Default target pool</label>
+        <select name="default_pool">
+          <option value="">(none — set per-VM below)</option>
+          {{range .Pools}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      {{if .VMs}}
+      <div class="form-row">
+        <label>Per-VM overrides</label>
+        <table class="lv-table" style="width:100%;font-size:13px">
+          <thead><tr><th>VM</th><th>Target pool</th></tr></thead>
+          <tbody>
+          {{range .VMs}}
+            <tr>
+              <td>{{.Name}}</td>
+              <td>
+                <select name="pool_{{.Name}}">
+                  <option value="">(use default)</option>
+                  {{range $.Pools}}<option value="{{.}}">{{.}}</option>{{end}}
+                </select>
+              </td>
+            </tr>
+          {{end}}
+          </tbody>
+        </table>
+      </div>
+      {{end}}
+      <div class="form-row">
+        <label><input type="checkbox" name="delete_source"> Delete source disks after cutover</label>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="dry_run" checked> Dry run (preview the plan only)</label>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('migrate-volumes-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Run</button>
+      </div>
+    </form>
+    <div id="migrate-volumes-result" style="margin-top:1em"></div>
+  </div>
+</div>

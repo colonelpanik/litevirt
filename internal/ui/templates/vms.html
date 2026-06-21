@@ -1,0 +1,64 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <h1>Virtual Machines</h1>
+  <div style="display:flex;gap:8px">
+    <button class="btn" hx-get="/ui/restore-modal" hx-target="body" hx-swap="beforeend">Restore VM</button>
+    <button class="btn btn-primary" hx-get="/ui/vms/new-modal" hx-target="body" hx-swap="beforeend">+ Create VM</button>
+  </div>
+</div>
+
+<div class="section" id="vm-list" hx-get="/ui/vms-table" hx-trigger="every 5s" hx-swap="innerHTML">
+  {{template "vms-table" .}}
+</div>
+{{end}}
+
+{{define "vms-table"}}
+<div class="section-header">
+  <h2>All VMs ({{len .VMs}})</h2>
+  <div style="display:flex;gap:8px">
+    <input type="text" class="search-input" placeholder="Filter VMs..." data-table-filter="vm-table">
+    <select style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-family:inherit;font-size:12px"
+            hx-get="/ui/vms-table" hx-target="#vm-list" hx-trigger="change" name="host">
+      <option value="">All hosts</option>
+      {{range .Hosts}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+    </select>
+  </div>
+</div>
+
+<div id="vm-bulk-bar" data-bulk-toolbar="vm-table"
+     style="display:none; padding:8px; margin-bottom:8px; border:1px solid var(--border); border-radius:4px; background:var(--bg-elev);">
+  <span data-bulk-count>0</span> selected.
+  <button class="btn" hx-post="/ui/vms/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"start"}'   hx-target="#vm-bulk-result" hx-swap="innerHTML">Start</button>
+  <button class="btn" hx-post="/ui/vms/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"stop"}'    hx-target="#vm-bulk-result" hx-swap="innerHTML">Stop</button>
+  <button class="btn" hx-post="/ui/vms/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"restart"}' hx-target="#vm-bulk-result" hx-swap="innerHTML">Restart</button>
+  <button class="btn btn-danger"
+          hx-post="/ui/vms/bulk" hx-include="[name=bulk_names]" hx-vals='{"action":"delete"}'
+          hx-target="#vm-bulk-result" hx-swap="innerHTML"
+          hx-confirm="Delete the selected VMs? This cannot be undone.">Delete</button>
+  <input type="hidden" name="bulk_names" data-bulk-names>
+</div>
+<div id="vm-bulk-result"></div>
+
+<table id="vm-table" data-bulk-table>
+  <thead><tr>
+    <th style="width:1%"><input type="checkbox" data-bulk-master title="Select all"></th>
+    <th>Name</th><th>Host</th><th>Stack</th><th>State</th><th>CPU</th><th>Memory</th><th>IP</th><th>Actions</th>
+  </tr></thead>
+  <tbody>
+  {{range .VMs}}
+  <tr id="vm-{{.Name}}">
+    <td><input type="checkbox" class="bulk-check" data-bulk-name="{{.Name}}"></td>
+    <td><a href="/vms/{{.Name}}">{{.Name}}</a>{{if .Spec}}{{template "label_chips" .Spec.Labels}}{{end}}</td>
+    <td>{{.HostName}}</td>
+    <td>{{if .StackName}}<span class="badge badge-blue">{{.StackName}}</span>{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+    <td>{{if .IsTemplate}}<span class="badge badge-blue">template</span>{{else}}{{vmStateBadge .State}}{{end}}</td>
+    <td>{{.CpuActual}}</td>
+    <td>{{.MemActualMib}}MiB</td>
+    <td>{{firstIP .Interfaces}}</td>
+    <td class="actions">{{vmActions .Name .State}}</td>
+  </tr>
+  {{else}}<tr><td colspan="9" style="color:var(--muted);text-align:center;padding:24px">No VMs</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}

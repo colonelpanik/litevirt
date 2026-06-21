@@ -1,0 +1,32 @@
+<div class="modal-overlay" id="clone-modal">
+  <div class="modal" id="clone-modal-body">
+    <h3>Clone {{if .IsTemplate}}template{{end}} {{.Source}}</h3>
+    <form hx-post="/ui/vms/{{.Source}}/clone" hx-target="#clone-modal-body" hx-swap="innerHTML">
+      <div class="form-row">
+        <label>New VM name</label>
+        <input type="text" name="target" value="{{.Suggested}}" required autofocus
+               pattern="[a-zA-Z0-9_.\-]+" title="letters, digits, _ . - only" style="width:100%">
+      </div>
+      <div class="form-row">
+        <label>Mode</label>
+        <select name="mode" style="width:100%">
+          <option value="">Auto (recommended)</option>
+          <option value="linked">Linked — instant, thin overlay (shared storage)</option>
+          <option value="full">Full — independent copy</option>
+        </select>
+        <small style="color:#888">Auto picks linked on shared storage, full on local (so the clone isn't pinned to one host).</small>
+      </div>
+      <div class="form-row">
+        <label>Static IP <span style="color:#888">(optional)</span></label>
+        <input type="text" name="ip" placeholder="DHCP if blank" style="width:100%">
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="start"> Start the clone after creation</label>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('clone-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Clone</button>
+      </div>
+    </form>
+  </div>
+</div>

@@ -1,0 +1,111 @@
+<div class="modal-overlay" id="schedule-create-modal">
+  <div class="modal" style="max-width:560px">
+    <h3>Add backup schedule</h3>
+    <p class="muted" style="font-size:13px;margin-top:0">
+      Cron-driven, per host. Choose what to back up — a single VM, every VM on a
+      storage pool, every VM in a project, or the whole cluster. Retention buckets
+      are kept-counts (0 = keep all).
+    </p>
+    <form hx-post="/ui/schedules" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('schedule-create-modal').remove()">
+      <div class="form-row">
+        <label>Scope</label>
+        <select name="scope" id="sched-scope" onchange="schedScope(this.value)">
+          <option value="vm">A single VM</option>
+          <option value="pool">All VMs on a storage pool</option>
+          <option value="project">All VMs in a project</option>
+          <option value="cluster">All VMs (whole cluster)</option>
+        </select>
+      </div>
+
+      <div class="form-row sched-target" data-scope="vm">
+        <label>VM</label>
+        <select name="vm_name">
+          <option value="">Select a VM…</option>
+          {{range .VMs}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row sched-target" data-scope="pool" style="display:none">
+        <label>Storage pool</label>
+        <select name="pool_name">
+          <option value="">Select a pool…</option>
+          {{range .Pools}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row sched-target" data-scope="project" style="display:none">
+        <label>Project</label>
+        <select name="project_name">
+          <option value="">Select a project…</option>
+          {{range .Projects}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row sched-target" data-scope="cluster" style="display:none">
+        <p class="muted" style="font-size:12px;margin:0">Backs up every VM in the cluster, fanned out per host at run time.</p>
+      </div>
+
+      <div class="form-row">
+        <label>Repo</label>
+        {{if .Repos}}
+        <select name="repo" required>
+          <option value="">Select a repo…</option>
+          {{range .Repos}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+        {{else}}
+        <input type="text" name="repo" placeholder="logical repo name (daemon backup_repos)" required>
+        {{end}}
+      </div>
+      <div class="form-row">
+        <label>Cron</label>
+        <input type="text" name="cron" id="sched-cron" placeholder="0 2 * * *" required
+               style="font-family:monospace" oninput="schedCronPreview(this.value)">
+        <div class="muted" id="sched-cron-preview" style="font-size:11px;margin-top:3px"></div>
+      </div>
+      <div class="form-row">
+        <label>Retention (kept counts)</label>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <input type="number" name="keep_last" min="0" placeholder="last" title="keep-last" style="width:72px">
+          <input type="number" name="keep_daily" min="0" placeholder="daily" title="keep-daily" style="width:72px">
+          <input type="number" name="keep_weekly" min="0" placeholder="weekly" title="keep-weekly" style="width:72px">
+          <input type="number" name="keep_monthly" min="0" placeholder="monthly" title="keep-monthly" style="width:72px">
+          <input type="number" name="keep_yearly" min="0" placeholder="yearly" title="keep-yearly" style="width:72px">
+        </div>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="enabled" checked> Enabled</label>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('schedule-create-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add schedule</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+  function schedScope(v) {
+    document.querySelectorAll('#schedule-create-modal .sched-target').forEach(function(el) {
+      var on = el.dataset.scope === v;
+      el.style.display = on ? '' : 'none';
+      el.querySelectorAll('select,input').forEach(function(f) { f.disabled = !on; });
+    });
+  }
+  // Best-effort client-side cron summary (mirrors the server's humanCron).
+  function schedCronPreview(expr) {
+    var out = document.getElementById('sched-cron-preview');
+    var f = expr.trim().split(/\s+/);
+    if (f.length !== 5) { out.textContent = ''; return; }
+    var days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    var min = f[0], hr = f[1], dom = f[2], mon = f[3], dow = f[4], msg = '';
+    var pad = function(n){ return ('0'+n).slice(-2); };
+    if (min === '*' && hr === '*' && dom === '*' && mon === '*' && dow === '*') msg = 'Every minute';
+    else if (/^\*\/\d+$/.test(min) && hr === '*') msg = 'Every ' + min.slice(2) + ' minutes';
+    else if (hr === '*' && dom === '*' && mon === '*' && dow === '*') msg = (min === '0' ? 'Hourly' : 'Hourly at :' + pad(min));
+    else if (/^\d+$/.test(min) && /^\d+$/.test(hr)) {
+      var at = pad(hr) + ':' + pad(min);
+      if (dom === '*' && mon === '*' && dow === '*') msg = 'Daily at ' + at;
+      else if (dom === '*' && /^[0-6]$/.test(dow)) msg = 'Weekly on ' + days[+dow] + ' at ' + at;
+      else if (/^\d+$/.test(dom) && dow === '*') msg = 'Monthly on day ' + dom + ' at ' + at;
+    }
+    out.textContent = msg;
+  }
+  schedScope('vm');
+</script>

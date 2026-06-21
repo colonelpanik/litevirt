@@ -1,0 +1,70 @@
+<div class="modal-overlay" id="vnc-modal">
+  <div class="modal" style="max-width:1000px;min-height:560px;display:flex;flex-direction:column">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">Console (VNC): {{.VMName}}</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="vnc-status" class="badge badge-yellow">connecting…</span>
+        <button class="btn btn-sm" onclick="window._vncSendCAD&&window._vncSendCAD()">Ctrl+Alt+Del</button>
+        <button class="btn btn-sm" id="vnc-retry" style="display:none" onclick="window._vncConnect&&window._vncConnect()">Retry</button>
+        <a class="btn btn-sm" href="/vms/{{.VMName}}/vnc" target="_blank" title="Open full screen in a new tab">Full screen</a>
+        <button class="btn btn-sm" onclick="window._vncCleanup&&window._vncCleanup();document.getElementById('vnc-modal').remove()">Close</button>
+      </div>
+    </div>
+    <div id="vnc-banner" style="display:none" class="alert alert-error"></div>
+    <div id="vnc-container" style="flex:1;min-height:480px;background:#000;border-radius:6px;overflow:hidden"></div>
+  </div>
+</div>
+<script>
+(function() {
+  var statusEl = document.getElementById('vnc-status');
+  var bannerEl = document.getElementById('vnc-banner');
+  var retryEl = document.getElementById('vnc-retry');
+  var container = document.getElementById('vnc-container');
+  var rfb = null;
+
+  function setStatus(t, cls) { statusEl.textContent = t; statusEl.className = 'badge ' + cls; }
+  function cleanup() { try { if (rfb) rfb.disconnect(); } catch (e) {} rfb = null; }
+  window._vncCleanup = cleanup;
+  window._vncSendCAD = function() { if (rfb) rfb.sendCtrlAltDel(); };
+
+  function connect() {
+    cleanup();
+    bannerEl.style.display = 'none';
+    retryEl.style.display = 'none';
+    container.innerHTML = '';
+    setStatus('connecting…', 'badge-yellow');
+    var url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/vms/{{.VMName}}/vnc';
+    // Load noVNC lazily (it's an ES module; dynamic import works in htmx-injected scripts).
+    import('/static/novnc/rfb.js').then(function(mod) {
+      var RFB = mod.default;
+      // Create the socket ourselves so we can capture the server's close reason
+      // (noVNC's 'disconnect' event doesn't carry it). RFB attaches to a pre-made
+      // WebSocket when the 2nd arg isn't a URL string.
+      var ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      var closeReason = '';
+      ws.addEventListener('close', function(e) { if (e.reason) closeReason = e.reason; });
+      rfb = new RFB(container, ws);
+      rfb.scaleViewport = true;
+      rfb.resizeSession = true;
+      window.rfb = rfb;
+      rfb.addEventListener('connect', function() { setStatus('connected', 'badge-green'); });
+      rfb.addEventListener('disconnect', function(e) {
+        var clean = e && e.detail && e.detail.clean;
+        if (clean && !closeReason) { setStatus('closed', 'badge-gray'); return; }
+        setStatus('disconnected', 'badge-red');
+        bannerEl.textContent = closeReason || 'Disconnected from the VM console.';
+        bannerEl.style.display = 'block';
+        retryEl.style.display = '';
+      });
+    }).catch(function(err) {
+      setStatus('error', 'badge-red');
+      bannerEl.textContent = 'Failed to load the VNC client: ' + err;
+      bannerEl.style.display = 'block';
+      retryEl.style.display = '';
+    });
+  }
+  window._vncConnect = connect;
+  connect();
+})();
+</script>

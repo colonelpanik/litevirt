@@ -1,0 +1,73 @@
+<div class="modal-overlay" id="upgrade-modal" onclick="this.remove()">
+  <div class="modal" style="max-width:500px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Upgrade Host: {{.HostName}}</h3>
+      <button class="btn" onclick="document.getElementById('upgrade-modal').remove()">Close</button>
+    </div>
+    <form id="upgrade-form" enctype="multipart/form-data">
+      <div class="form-row">
+        <label>litevirtd Binary</label>
+        <input type="file" name="binary" required>
+      </div>
+      <p style="font-size:12px;color:var(--muted);margin:8px 0">Upload the new litevirtd binary. The host daemon will be restarted after upgrade.</p>
+      <div id="upgrade-progress" style="display:none;margin-bottom:12px">
+        <div style="background:var(--border);border-radius:4px;height:6px;overflow:hidden">
+          <div id="upgrade-bar" style="height:100%;background:var(--blue);width:0%;transition:width 0.3s"></div>
+        </div>
+        <span id="upgrade-pct" style="font-size:12px;color:var(--muted)">Uploading... 0%</span>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Upgrade</button>
+      </div>
+    </form>
+    <script>
+    document.getElementById('upgrade-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var form = e.target;
+      var data = new FormData(form);
+      var btn = form.querySelector('button[type=submit]');
+      btn.disabled = true;
+      btn.textContent = 'Upgrading\u2026';
+      var prog = document.getElementById('upgrade-progress');
+      prog.style.display = 'block';
+      var xhr = new XMLHttpRequest();
+      xhr.upload.addEventListener('progress', function(ev) {
+        if (ev.lengthComputable) {
+          var pct = Math.round(ev.loaded / ev.total * 100);
+          document.getElementById('upgrade-bar').style.width = pct + '%';
+          document.getElementById('upgrade-pct').textContent = 'Uploading... ' + pct + '%';
+        }
+      });
+      xhr.addEventListener('load', function() {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          var trigger = xhr.getResponseHeader('HX-Trigger');
+          if (trigger) {
+            try {
+              var parsed = JSON.parse(trigger);
+              if (parsed.showToast) {
+                document.body.dispatchEvent(new CustomEvent('showToast', {detail: parsed.showToast}));
+              }
+            } catch(e) {}
+          }
+          var redir = xhr.getResponseHeader('HX-Redirect');
+          if (redir) window.location.href = redir;
+          else document.getElementById('upgrade-modal').remove();
+        } else {
+          alert('Upgrade failed: ' + xhr.responseText);
+          btn.disabled = false;
+          btn.textContent = 'Upgrade';
+          prog.style.display = 'none';
+        }
+      });
+      xhr.addEventListener('error', function() {
+        alert('Upgrade request failed');
+        btn.disabled = false;
+        btn.textContent = 'Upgrade';
+        prog.style.display = 'none';
+      });
+      xhr.open('POST', '/ui/hosts/{{.HostName}}/upgrade');
+      xhr.send(data);
+    });
+    </script>
+  </div>
+</div>

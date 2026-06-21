@@ -1,0 +1,63 @@
+{{define "content"}}
+<div class="detail-header">
+  <a href="/stacks" class="back">← Stacks</a>
+  <h1>{{.Stack.Name}}</h1>
+  {{if eq .Stack.State "active"}}<span class="badge badge-green">active</span>{{else}}<span class="badge badge-yellow">{{.Stack.State}}</span>{{end}}
+  <div style="flex:1"></div>
+  <div class="actions">
+    <a href="/stacks/{{.Stack.Name}}/logs" class="btn">Logs</a>
+    <a href="/ui/stacks/{{.Stack.Name}}/export" class="btn">Export YAML</a>
+    <button class="btn" hx-get="/ui/stacks/{{.Stack.Name}}/migrate-volumes-modal" hx-target="body" hx-swap="beforeend">Migrate volumes</button>
+    <button class="btn btn-danger" hx-delete="/ui/stacks/{{.Stack.Name}}" hx-confirm="Destroy stack {{.Stack.Name}}? All VMs will be deleted.">Destroy</button>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header"><h2>VMs ({{len .VMs}})</h2></div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>Host</th><th>State</th><th>CPU</th><th>Memory</th><th>IP</th>
+    </tr></thead>
+    <tbody>
+    {{range .VMs}}
+    <tr>
+      <td><a href="/vms/{{.Name}}">{{.Name}}</a></td>
+      <td>{{.HostName}}</td>
+      <td>{{vmStateBadge .State}}</td>
+      <td>{{.CpuActual}}</td>
+      <td>{{.MemActualMib}}MiB</td>
+      <td>{{firstIP .Interfaces}}</td>
+    </tr>
+    {{else}}<tr><td colspan="6" class="empty">No VMs in this stack</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+
+{{if .LB}}
+<div class="section">
+  <div class="section-header"><h2>Load Balancer</h2></div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>VIP</th><th>Algorithm</th>
+    </tr></thead>
+    <tbody>
+    <tr>
+      <td>{{.LB.Name}}</td>
+      <td>{{.LB.Vip}}</td>
+      <td>{{.LB.Algorithm}}</td>
+    </tr>
+    </tbody>
+  </table>
+</div>
+{{end}}
+
+{{if .ComposeYAML}}
+<div class="section">
+  <div class="section-header"><h2>Compose YAML</h2></div>
+  <div style="padding:16px">
+    <div class="code-block">{{.ComposeYAML}}</div>
+  </div>
+</div>
+{{end}}
+{{end}}

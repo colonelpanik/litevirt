@@ -1,0 +1,27 @@
+<div class="modal-overlay" id="migrate-modal">
+  <div class="modal" id="migrate-modal-body">
+    <h3>Migrate VM</h3>
+    <form hx-post="/ui/vms/{{.VMName}}/migrate" hx-target="#migrate-modal-body" hx-swap="innerHTML">
+      <div class="form-row">
+        <label>VM</label>
+        <input type="text" value="{{.VMName}}" disabled>
+      </div>
+      <div class="form-row">
+        <label>Target Host</label>
+        <input type="text" name="target_host" required list="migrate-host-list"
+               placeholder="Type to search hosts..." autocomplete="off"
+               style="width:100%">
+        <datalist id="migrate-host-list">
+          {{range .Hosts}}<option value="{{.Name}}">{{.Name}} ({{.Address}})</option>{{end}}
+        </datalist>
+      </div>
+      <div style="margin:8px 0" hx-get="/ui/vms/{{.VMName}}/compatible-hosts" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
+        <span style="color:#888;font-size:13px">Checking host compatibility...</span>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('migrate-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Migrate</button>
+      </div>
+    </form>
+  </div>
+</div>

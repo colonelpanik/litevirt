@@ -1,0 +1,50 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Notifications</h2>
+      <p class="muted">Operator alerts (webhook / Slack) for backup failures, host fences, replication failures, and quota breaches. Add a target, then route event patterns to it.</p>
+    </div>
+    <div class="actions">
+      <button class="btn" hx-get="/ui/notifications/target-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Target</button>
+      <button class="btn btn-primary" hx-get="/ui/notifications/route-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Route</button>
+    </div>
+  </div>
+  {{template "alert_error" .Error}}
+
+  <div class="section">
+    <div class="section-header"><h2>Targets</h2></div>
+    <div style="padding:8px 16px">
+      {{if not .Targets}}<span class="muted">No targets. Add a webhook or Slack target.</span>{{end}}
+      {{range .Targets}}
+        <div class="rule-line">
+          <span class="badge {{if .Enabled}}badge-green{{else}}badge-gray{{end}}">{{if .Enabled}}enabled{{else}}disabled{{end}}</span>
+          <strong>{{.Name}}</strong>
+          <span class="badge badge-blue">{{.Type}}</span>
+          <span class="mono muted" style="font-size:11px">{{.Config}}</span>
+          <span style="margin-left:auto"></span>
+          <button class="btn btn-sm" hx-post="/ui/notifications/targets/{{.ID}}/test" hx-swap="none" title="Send a test notification">Test</button>
+          <button class="btn btn-sm btn-danger" hx-delete="/ui/notifications/targets/{{.ID}}" hx-confirm="Delete target {{.Name}}?">{{icon "delete"}}</button>
+        </div>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h2>Routes</h2></div>
+    <div style="padding:8px 16px">
+      {{if not .Routes}}<span class="muted">No routes. A target receives nothing until a route points an event pattern at it.</span>{{end}}
+      {{range .Routes}}
+        <div class="rule-line">
+          <span class="badge {{if .Enabled}}badge-green{{else}}badge-gray{{end}}">{{if .Enabled}}on{{else}}off{{end}}</span>
+          <span class="mono">{{.EventPattern}}</span>
+          <span>→</span>
+          <span class="mono muted">{{.TargetID}}</span>
+          <span class="badge badge-purple">≥ {{.MinSeverity}}</span>
+          <button class="btn btn-sm btn-ghost" style="margin-left:auto" hx-delete="/ui/notifications/routes/{{.ID}}" hx-confirm="Delete this route?">{{icon "delete"}}</button>
+        </div>
+      {{end}}
+    </div>
+  </div>
+</div>
+{{end}}

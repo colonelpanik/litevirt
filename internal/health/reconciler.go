@@ -1,0 +1,521 @@
+package health
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/image"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/network"
+)
+
+const reconcileInterval = 15 * time.Second
+
+// Reconciler watches for VMs in "pending" state on the local host
+// and starts them. It also detects split-brain conditions where a VM
+// is running locally in libvirt but corrosion says it belongs to another host.
+type Reconciler struct {
+	hostName         string
+	dataDir          string
+	db               *corrosion.Client
+	virt             *lv.Client
+	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
+	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
+	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
+}
+
+// NewReconciler creates a VM reconciler for the local host.
+func NewReconciler(hostName, dataDir string, db *corrosion.Client, virt *lv.Client) *Reconciler {
+	return &Reconciler{
+		hostName: hostName,
+		dataDir:  dataDir,
+		db:       db,
+		virt:     virt,
+	}
+}
+
+// SetOnVMStarted registers a callback invoked after a pending VM is started.
+// Used to trigger LB refresh after failover.
+func (r *Reconciler) SetOnVMStarted(fn func(ctx context.Context, stackName string)) {
+	r.onVMStarted = fn
+}
+
+// SetAutoPullImage registers a callback to pull images from peers when missing locally.
+func (r *Reconciler) SetAutoPullImage(fn func(ctx context.Context, imageName string) error) {
+	r.autoPullImage = fn
+}
+
+// SetBackupInProgress registers a predicate reporting whether a backup is
+// actively running locally for a VM. The reconciler uses it to avoid clearing
+// the "backing-up" state of a genuinely in-flight backup. When nil, the
+// reconciler treats any "backing-up" row as stuck (no live backup tracked).
+func (r *Reconciler) SetBackupInProgress(fn func(vmName string) bool) {
+	r.backupInProgress = fn
+}
+
+// Start begins the reconcile loop. Blocks until ctx is cancelled.
+func (r *Reconciler) Start(ctx context.Context) {
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.reconcile(ctx)
+			r.selfFence(ctx)
+		}
+	}
+}
+
+// StartOnbootVMs starts every local VM marked onboot that is NOT currently
+// running in libvirt, in ascending startup_order, pausing start_delay_sec
+// between each (#10). Run ONCE at daemon startup, not on the periodic tick.
+//
+// Keying on "not running in libvirt" distinguishes a host reboot from a plain
+// daemon restart for free: KillMode=process keeps qemu alive across a daemon
+// restart (domains still running → skipped), whereas a host reboot leaves the
+// domains shut off (→ started here). So deliberately-stopped VMs are only
+// (re)started when the host actually boots.
+func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
+	// Defensive: this runs in a startup goroutine — a panic here must never take
+	// the daemon down (which would strand the host).
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.Error("onboot: recovered from panic", "panic", rec)
+		}
+	}()
+	if r.virt == nil {
+		return
+	}
+	vms, err := corrosion.ListVMs(ctx, r.db, "", r.hostName)
+	if err != nil {
+		slog.Error("onboot: list VMs", "error", err)
+		return
+	}
+	type onbootVM struct {
+		vm    corrosion.VMRecord
+		order int
+		delay int
+	}
+	var list []onbootVM
+	for _, vm := range vms {
+		if vm.Spec == "" {
+			continue
+		}
+		spec := &pb.VMSpec{}
+		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil || !spec.Onboot {
+			continue
+		}
+		// Already running (e.g. survived a daemon restart) → leave it.
+		if r.virt.DomainExists(vm.Name) {
+			if st, sErr := r.virt.DomainState(vm.Name); sErr == nil && st == "running" {
+				continue
+			}
+		}
+		list = append(list, onbootVM{vm: vm, order: int(spec.StartupOrder), delay: int(spec.StartDelaySec)})
+	}
+	if len(list) == 0 {
+		return
+	}
+	sort.SliceStable(list, func(i, j int) bool { return list[i].order < list[j].order })
+	slog.Info("onboot: starting VMs in order", "count", len(list))
+	for i, e := range list {
+		slog.Info("onboot: starting VM", "vm", e.vm.Name, "order", e.order)
+		r.startPendingVM(ctx, e.vm)
+		if e.delay > 0 && i < len(list)-1 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(e.delay) * time.Second):
+			}
+		}
+	}
+}
+
+func (r *Reconciler) reconcile(ctx context.Context) {
+	vms, err := corrosion.ListVMs(ctx, r.db, "", r.hostName)
+	if err != nil {
+		slog.Error("reconciler: list VMs", "error", err)
+		return
+	}
+
+	for _, vm := range vms {
+		switch vm.State {
+		case "pending":
+			r.startPendingVM(ctx, vm)
+
+		case "running":
+			// After daemon restart or libvirt reconnect, verify VMs that
+			// corrosion says are "running" are actually alive in libvirt (#43/#53).
+			if r.virt != nil && !r.virt.DomainExists(vm.Name) {
+				slog.Warn("reconciler: VM marked running but not in libvirt — attempting restart",
+					"vm", vm.Name)
+				r.startPendingVM(ctx, vm)
+			}
+
+		case "error":
+			// Check if an errored VM is actually running in libvirt (e.g. after
+			// daemon crash mid-operation). If so, update state to running.
+			if r.virt != nil && r.virt.DomainExists(vm.Name) {
+				if state, err := r.virt.DomainState(vm.Name); err == nil && state == "running" {
+					slog.Info("reconciler: VM in error state but running in libvirt — updating state",
+						"vm", vm.Name)
+					corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "reconciler: domain is alive")
+				}
+			}
+
+		case "backing-up":
+			// Self-heal a stuck "backing-up" flag. A crashed/restarted daemon or
+			// an interrupted backup stream can strand a VM in "backing-up"
+			// forever, which blocks console/VNC, delete, and drain even though
+			// the VM is running fine. If no backup is actually running here,
+			// reconcile the state from libvirt reality.
+			if r.backupInProgress != nil && r.backupInProgress(vm.Name) {
+				continue // genuine backup in flight — leave it alone
+			}
+			if r.virt == nil {
+				continue
+			}
+			live := "stopped"
+			if r.virt.DomainExists(vm.Name) {
+				st, err := r.virt.DomainState(vm.Name)
+				if err != nil {
+					continue // can't determine — retry next tick
+				}
+				live = st
+			}
+			slog.Info("reconciler: clearing stuck backing-up state", "vm", vm.Name, "live", live)
+			corrosion.UpdateVMState(ctx, r.db, vm.Name, live, "reconciler: stale backing-up cleared")
+		}
+	}
+}
+
+// selfFence detects split-brain: VMs running locally in libvirt that corrosion
+// says belong to another host. This happens when a network partition heals and
+// the VM was rescheduled during the partition (#5).
+func (r *Reconciler) selfFence(ctx context.Context) {
+	if r.virt == nil {
+		return
+	}
+
+	localDomains, err := r.virt.ListDomains()
+	if err != nil {
+		slog.Error("reconciler: list local domains", "error", err)
+		return
+	}
+
+	for _, domName := range localDomains {
+		vm, err := corrosion.GetVM(ctx, r.db, domName)
+		if err != nil || vm == nil {
+			// Domain exists locally but not in corrosion — might be external/manual.
+			continue
+		}
+
+		// If the VM is mid-migration, a transient domain will appear on the
+		// target host before corrosion is updated — don't destroy it.
+		if vm.State == "migrating" {
+			continue
+		}
+
+		// If corrosion says this VM belongs to a different host, we no longer own it.
+		if vm.HostName != r.hostName {
+			slog.Warn("reconciler: split-brain detected — destroying local domain that moved to another host",
+				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName)
+			if err := r.virt.DestroyDomain(domName); err != nil {
+				slog.Warn("reconciler: destroy stale domain failed", "vm", domName, "error", err)
+			}
+			if err := r.virt.UndefineDomain(domName, false); err != nil {
+				slog.Warn("reconciler: undefine stale domain failed", "vm", domName, "error", err)
+			}
+		}
+	}
+}
+
+func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {
+	// Take a per-VM startup lease before doing anything destructive.
+	// Without this, two reconcilers on different hosts that both briefly
+	// see vm.HostName=self in CRDT-stale state would both call libvirt.Start
+	// on the same VM UUID — the same physical disk gets two QEMU writers
+	// → guaranteed corruption.
+	if !r.acquireVMLock(ctx, vm.Name) {
+		slog.Info("reconciler: VM lock held by another host, skipping",
+			"vm", vm.Name)
+		return
+	}
+	// Re-read the VM row after acquiring the lock — if CRDT replication
+	// between the lock-acquire and now has reassigned the VM elsewhere,
+	// abort so the legitimate host can pick it up.
+	fresh, err := corrosion.GetVM(ctx, r.db, vm.Name)
+	if err != nil || fresh == nil || fresh.HostName != vm.HostName {
+		slog.Info("reconciler: VM no longer assigned to this host after lock, releasing",
+			"vm", vm.Name)
+		r.releaseVMLock(ctx, vm.Name)
+		return
+	}
+	defer r.releaseVMLock(ctx, vm.Name)
+
+	slog.Info("reconciler: starting pending VM", "vm", vm.Name)
+
+	// Check if a domain already exists locally from a partial migration (#14).
+	if r.virt != nil && r.virt.DomainExists(vm.Name) {
+		state, err := r.virt.DomainState(vm.Name)
+		if err == nil && state == "running" {
+			slog.Warn("reconciler: domain already running locally, updating state", "vm", vm.Name)
+			corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "domain already present")
+			return
+		}
+		// Domain exists but not running — destroy and redefine cleanly.
+		r.virt.DestroyDomain(vm.Name)
+		r.virt.UndefineDomain(vm.Name, false)
+	}
+
+	corrosion.UpdateVMState(ctx, r.db, vm.Name, "starting", "reconciler")
+
+	// Parse the stored spec to rebuild the domain XML.
+	spec := &pb.VMSpec{}
+	if vm.Spec != "" {
+		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+			slog.Error("reconciler: parse VM spec", "vm", vm.Name, "error", err)
+			corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", "invalid spec JSON")
+			return
+		}
+	}
+
+	// Retrieve stored disk records to build disk config.
+	diskRecords, err := corrosion.ListDisks(ctx, r.db, vm.Name)
+	if err != nil {
+		slog.Error("reconciler: list disks", "vm", vm.Name, "error", err)
+		corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", fmt.Sprintf("list disks: %v", err))
+		return
+	}
+
+	var diskConfigs []lv.DiskConfig
+	for _, d := range diskRecords {
+		// Verify disk file exists on this host.
+		if _, err := os.Stat(d.Path); err != nil {
+			// If disk has a backing image, try auto-pulling it and recreating the overlay.
+			if d.BackingImage != "" && r.autoPullImage != nil {
+				slog.Info("reconciler: disk missing, attempting auto-pull of backing image",
+					"vm", vm.Name, "disk", d.DiskName, "image", d.BackingImage)
+				if pullErr := r.autoPullImage(ctx, d.BackingImage); pullErr != nil {
+					slog.Error("reconciler: auto-pull failed", "vm", vm.Name, "image", d.BackingImage, "error", pullErr)
+					corrosion.UpdateVMState(ctx, r.db, vm.Name, "error",
+						fmt.Sprintf("disk %s not found and image auto-pull failed: %v", d.DiskName, pullErr))
+					return
+				}
+				// Recreate overlay disk from pulled image.
+				imgStore := image.NewStore(r.dataDir)
+				newPath, createErr := imgStore.CreateOverlayDisk(vm.Name, d.DiskName, d.BackingImage, "")
+				if createErr != nil {
+					slog.Error("reconciler: recreate overlay failed", "vm", vm.Name, "error", createErr)
+					corrosion.UpdateVMState(ctx, r.db, vm.Name, "error",
+						fmt.Sprintf("recreate disk %s: %v", d.DiskName, createErr))
+					return
+				}
+				d.Path = newPath
+				slog.Info("reconciler: recreated overlay disk", "vm", vm.Name, "disk", d.DiskName, "path", newPath)
+			} else {
+				slog.Error("reconciler: disk not found", "vm", vm.Name, "disk", d.DiskName, "path", d.Path)
+				corrosion.UpdateVMState(ctx, r.db, vm.Name, "error",
+					fmt.Sprintf("disk %s not found at %s (no backing image for auto-pull)", d.DiskName, d.Path))
+				return
+			}
+		}
+		bus := "virtio"
+		if len(spec.Disks) > 0 {
+			for _, sd := range spec.Disks {
+				if sd.Name == d.DiskName && sd.Bus != "" {
+					bus = sd.Bus
+					break
+				}
+			}
+		}
+		diskConfigs = append(diskConfigs, lv.DiskConfig{
+			Name: d.DiskName,
+			Path: d.Path,
+			Bus:  bus,
+		})
+	}
+
+	// Check for cloud-init ISO.
+	cloudInitISO := ""
+	isoPath := lv.CloudInitISOPath(r.dataDir, vm.Name)
+	if _, err := os.Stat(isoPath); err == nil {
+		cloudInitISO = isoPath
+	} else if spec.CloudInit != nil {
+		// Regenerate cloud-init ISO from spec.
+		userData := spec.CloudInit.Userdata
+		if userData == "" {
+			userData = "#cloud-config\n{}\n"
+		}
+		if genErr := cloudinit.GenerateISO(cloudinit.Config{
+			InstanceID:    vm.Name,
+			LocalHostname: vm.Name,
+			UserData:      userData,
+			NetworkConfig: spec.CloudInit.Networkconfig,
+		}, isoPath); genErr != nil {
+			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
+		} else {
+			cloudInitISO = isoPath
+		}
+	}
+
+	// Provision networks and build network configs from stored interfaces.
+	// A query failure must NOT be swallowed: starting the VM with zero NICs
+	// brings it up headless (no network) after a failover. Fail it instead,
+	// matching the ListDisks error handling above.
+	ifaces, err := corrosion.GetVMInterfaces(ctx, r.db, vm.Name)
+	if err != nil {
+		slog.Error("reconciler: get VM interfaces", "vm", vm.Name, "error", err)
+		corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", fmt.Sprintf("get interfaces: %v", err))
+		return
+	}
+	var netConfigs []lv.NetworkConfig
+	for _, iface := range ifaces {
+		bridge := iface.NetworkName
+		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
+		// This is critical after failover — the new host may not have the network set up.
+		if provBridge, err := network.ProvisionForVM(ctx, r.db, iface.NetworkName, r.hostName); err != nil {
+			slog.Warn("reconciler: network provision failed, using raw name",
+				"vm", vm.Name, "network", iface.NetworkName, "error", err)
+		} else if provBridge != "" {
+			bridge = provBridge
+		}
+		if strings.HasPrefix(bridge, "direct:") {
+			netConfigs = append(netConfigs, lv.NetworkConfig{
+				Direct: strings.TrimPrefix(bridge, "direct:"),
+				Model:  "virtio",
+				MAC:    iface.MAC,
+			})
+		} else {
+			netConfigs = append(netConfigs, lv.NetworkConfig{
+				Bridge: bridge,
+				MAC:    iface.MAC,
+			})
+		}
+	}
+
+	// Build libvirt domain config.
+	vmCfg := lv.VMConfig{
+		Name:         vm.Name,
+		CPU:          vm.CPUActual,
+		MemoryMiB:    vm.MemActual,
+		Machine:      spec.Machine,
+		Firmware:     spec.Firmware,
+		GuestAgent:   spec.GuestAgent,
+		Disks:        diskConfigs,
+		Networks:     netConfigs,
+		CloudInitISO: cloudInitISO,
+		Boot:         spec.Boot,
+	}
+	if vmCfg.Machine == "" {
+		vmCfg.Machine = "q35"
+	}
+	if vmCfg.Firmware == "" {
+		vmCfg.Firmware = "uefi"
+	}
+	if r := spec.Resources; r != nil {
+		vmCfg.HugePages = r.Hugepages
+		vmCfg.IOThreads = int(r.IoThreads)
+		for _, pin := range r.CpuPinning {
+			vmCfg.CPUPinning = append(vmCfg.CPUPinning, int(pin))
+		}
+		if np := r.NumaPolicy; np != nil {
+			vmCfg.NUMAPolicy = &lv.NUMAPolicy{
+				PreferredNode: int(np.PreferredNode),
+				Strict:        np.Strict,
+			}
+		}
+	}
+
+	domXML, err := lv.GenerateDomainXML(vmCfg)
+	if err != nil {
+		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)
+		corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", fmt.Sprintf("XML gen: %v", err))
+		return
+	}
+
+	// Define and start the domain.
+	if err := r.virt.DefineDomain(domXML); err != nil {
+		slog.Error("reconciler: define domain", "vm", vm.Name, "error", err)
+		corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", fmt.Sprintf("define: %v", err))
+		return
+	}
+
+	if err := r.virt.StartDomain(vm.Name); err != nil {
+		slog.Error("reconciler: start domain", "vm", vm.Name, "error", err)
+		corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", fmt.Sprintf("start: %v", err))
+		return
+	}
+
+	corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover")
+	slog.Info("reconciler: VM started successfully", "vm", vm.Name)
+
+	// Notify LB to refresh backends now that this VM is running.
+	if r.onVMStarted != nil && vm.StackName != "" {
+		go r.onVMStarted(context.Background(), vm.StackName)
+	}
+}
+
+// vmLockTTL is the lease duration for vm_locks entries. It must comfortably
+// exceed the worst-case startPendingVM duration (image pull + disk recreate
+// + libvirt start). Longer is safer; in pathological cases a stuck reconciler
+// will hold the lock until expiry.
+const vmLockTTL = 10 * time.Minute
+
+// acquireVMLock takes the per-VM startup lease. Returns true if this host
+// holds the lock. CRDT-tolerant via the same INSERT-OR-UPDATE-WHERE-expired
+// pattern as failover leader election.
+//
+// NOT linearizable across partitions — but combined with the "re-read VM
+// row after lock" check in startPendingVM, the failure mode is "we held a
+// lock then discovered the VM moved, and we release without acting", not
+// "two hosts both started the VM."
+func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
+	now := time.Now().UTC().Format(time.RFC3339)
+	expires := time.Now().Add(vmLockTTL).UTC().Format(time.RFC3339)
+	// expired-check compares RFC3339-vs-RFC3339 (bound now), not datetime('now'):
+	// expires_at is RFC3339, so a string compare to datetime('now')'s space text
+	// breaks on a date match ('T' > ' ') and a same-day lock NEVER looks expired —
+	// a crashed holder's vm_lock would then block another host from reconciling
+	// that VM until the UTC date rolls.
+	if err := r.db.Execute(ctx,
+		`INSERT INTO vm_locks (vm_name, holder, expires_at, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(vm_name) DO UPDATE
+		   SET holder = excluded.holder,
+		       expires_at = excluded.expires_at,
+		       updated_at = excluded.updated_at
+		   WHERE vm_locks.expires_at < ?
+		      OR vm_locks.holder = excluded.holder`,
+		vmName, r.hostName, expires, now, now); err != nil {
+		slog.Warn("reconciler: vm_lock write failed", "vm", vmName, "error", err)
+		return false
+	}
+	rows, err := r.db.Query(ctx,
+		`SELECT holder FROM vm_locks WHERE vm_name = ?`, vmName)
+	if err != nil || len(rows) == 0 {
+		return false
+	}
+	return rows[0].String("holder") == r.hostName
+}
+
+// releaseVMLock clears the per-VM lock. Best-effort; leaving a stale lock
+// is recoverable (next acquire after vmLockTTL succeeds).
+func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
+	if err := r.db.Execute(ctx,
+		`DELETE FROM vm_locks WHERE vm_name = ? AND holder = ?`,
+		vmName, r.hostName); err != nil {
+		slog.Debug("reconciler: vm_lock release failed", "vm", vmName, "error", err)
+	}
+}

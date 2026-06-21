@@ -1,0 +1,27 @@
+<div class="modal-overlay" id="build-image-modal" onclick="this.remove()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Build Image from VM</h3>
+      <button class="btn" onclick="document.getElementById('build-image-modal').remove()">Close</button>
+    </div>
+    <form hx-post="/ui/images/build" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('build-image-modal').remove()}">
+      <div class="form-row">
+        <label>Source VM</label>
+        <select name="vm_name" required>
+          <option value="" disabled selected>Select VM...</option>
+          {{range .VMs}}
+          <option value="{{.Name}}">{{.Name}} ({{.State}})</option>
+          {{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Image Name</label>
+        <input type="text" name="image_name" placeholder="my-golden-image" required>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Build Image</button>
+      </div>
+    </form>
+  </div>
+</div>

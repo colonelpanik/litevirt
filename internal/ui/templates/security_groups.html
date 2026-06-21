@@ -1,0 +1,51 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Security Groups</h2>
+      <p class="muted">Distributed firewall. Changes propagate cluster-wide; each host reloads within ~30s.</p>
+    </div>
+    <button class="btn btn-primary" hx-get="/ui/security-groups/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create group</button>
+  </div>
+  {{template "alert_error" .Error}}
+  {{if not .Groups}}
+    <div class="empty-state">
+      <h3>No security groups defined</h3>
+      <p>Create a group, then add ingress/egress rules and bind it to VM NICs.</p>
+      <button class="btn btn-primary" hx-get="/ui/security-groups/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create group</button>
+    </div>
+  {{else}}
+  <div class="grid-2">
+    {{range .Groups}}
+    <div class="section">
+      <div class="section-header">
+        <div>
+          <h2 style="text-transform:none;color:var(--text);font-size:14px">{{.Name}}</h2>
+          <span class="muted mono" style="font-size:11px">{{.ID}}{{if .Stack}} · stack {{.Stack}}{{end}}</span>
+        </div>
+        <div class="actions">
+          <button class="btn btn-sm" hx-get="/ui/security-groups/{{.ID}}/rule-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Rule</button>
+          <button class="btn btn-sm btn-danger" hx-delete="/ui/security-groups/{{.ID}}" hx-confirm="Delete security group {{.Name}} and all its rules?">{{icon "delete"}}</button>
+        </div>
+      </div>
+      <div style="padding:8px 16px">
+        {{if not .Rules}}<span class="muted">No rules — this group allows nothing until you add one.</span>{{end}}
+        {{range .Rules}}
+          <div class="rule-line">
+            <span class="badge {{if eq .Direction "ingress"}}badge-blue{{else}}badge-purple{{end}}">{{.Direction}}</span>
+            <span class="badge badge-gray">{{.Proto}}</span>
+            {{if .PortRange}}<span class="mono">:{{.PortRange}}</span>{{end}}
+            <span class="mono muted">{{if .CIDR}}{{.CIDR}}{{else}}any{{end}}</span>
+            <span>→</span>
+            <span class="badge {{if eq .Action "accept"}}badge-green{{else}}badge-red{{end}}">{{.Action}}</span>
+            <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove rule"
+                    hx-delete="/ui/security-groups/rules/{{.ID}}" hx-confirm="Remove this rule?">{{icon "delete"}}</button>
+          </div>
+        {{end}}
+      </div>
+    </div>
+    {{end}}
+  </div>
+  {{end}}
+</div>
+{{end}}

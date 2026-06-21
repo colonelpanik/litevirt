@@ -1,0 +1,28 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <h1>Stacks</h1>
+  <button class="btn btn-primary" hx-get="/ui/stacks/deploy-modal" hx-target="body" hx-swap="beforeend">+ Deploy Stack</button>
+</div>
+
+<div class="section">
+  <div class="section-header"><h2>All Stacks ({{len .Stacks}})</h2></div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>State</th><th>VMs</th><th>Running</th><th>Stopped</th><th>Error</th>
+    </tr></thead>
+    <tbody>
+    {{range .Stacks}}
+    <tr>
+      <td><a href="/stacks/{{.Name}}">{{.Name}}</a></td>
+      <td>{{if eq .State "active"}}<span class="badge badge-green">active</span>{{else}}<span class="badge badge-yellow">{{.State}}</span>{{end}}</td>
+      <td>{{.VmCount}}</td>
+      <td>{{.Running}}</td>
+      <td>{{.Stopped}}</td>
+      <td>{{if .Error}}<span class="badge badge-red">{{.Error}}</span>{{else}}0{{end}}</td>
+    </tr>
+    {{else}}<tr><td colspan="6" class="empty">No stacks — deploy one with a compose file</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

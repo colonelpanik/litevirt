@@ -1,0 +1,51 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Resource Mappings</h2>
+      <p class="muted">Cluster-wide aliases for equivalent passthrough devices. A VM that requests a device by mapping name can run on — or migrate to — any host registered here.</p>
+    </div>
+    <button class="btn btn-primary" hx-get="/ui/resource-mappings/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create mapping</button>
+  </div>
+  {{template "alert_error" .Error}}
+  {{if not .Mappings}}
+    <div class="empty-state">
+      <h3>No resource mappings defined</h3>
+      <p>Create a mapping, then register the equivalent device on each host. VMs reference it by name (CLI: <span class="mono">--mapping</span>, compose: <span class="mono">devices[].mapping</span>).</p>
+      <button class="btn btn-primary" hx-get="/ui/resource-mappings/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create mapping</button>
+    </div>
+  {{else}}
+  <div class="grid-2">
+    {{range .Mappings}}
+    {{$mname := .Name}}
+    <div class="section">
+      <div class="section-header">
+        <div>
+          <h2 style="text-transform:none;color:var(--text);font-size:14px">{{.Name}}</h2>
+          {{if .Description}}<span class="muted" style="font-size:11px">{{.Description}}</span>{{end}}
+        </div>
+        <div class="actions">
+          <button class="btn btn-sm" hx-get="/ui/resource-mappings/{{.Name}}/device-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Device</button>
+          <button class="btn btn-sm btn-danger" hx-delete="/ui/resource-mappings/{{.Name}}" hx-confirm="Delete mapping {{.Name}}?">{{icon "delete"}}</button>
+        </div>
+      </div>
+      <div style="padding:8px 16px">
+        {{if not .Devices}}<span class="muted">No devices yet — add one per host.</span>{{end}}
+        {{range .Devices}}
+          <div class="rule-line">
+            <span class="badge badge-blue">{{.HostName}}</span>
+            <span class="mono">{{.Address}}</span>
+            {{if .Vendor}}<span class="badge badge-gray">{{.Vendor}}</span>{{end}}
+            {{if .Device}}<span class="muted">{{.Device}}</span>{{end}}
+            <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove device"
+                    hx-delete="/ui/resource-mappings/{{$mname}}/devices?host={{.HostName}}&address={{.Address}}"
+                    hx-confirm="Remove {{.Address}} on {{.HostName}}?">{{icon "delete"}}</button>
+          </div>
+        {{end}}
+      </div>
+    </div>
+    {{end}}
+  </div>
+  {{end}}
+</div>
+{{end}}

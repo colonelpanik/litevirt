@@ -1,0 +1,100 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Backup schedules</h2>
+      <p class="muted">Cron-driven, per host. Same actions as <code>lv backup schedule add/ls/rm</code>.</p>
+    </div>
+    <button class="btn btn-primary" hx-get="/ui/schedules/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Add schedule</button>
+  </div>
+  {{template "alert_error" .Error}}
+  {{if .Schedules}}
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Scope</th><th>Repo</th><th>Schedule</th><th>Enabled</th>
+        <th>Retention (last/day/wk/mo/yr)</th>
+        <th>Last run</th><th>Last error</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+    {{range .Schedules}}
+      <tr>
+        <td>
+          {{if eq .Scope "pool"}}<span class="badge badge-purple">pool</span> {{.PoolName}}
+          {{else if eq .Scope "project"}}<span class="badge badge-blue">project</span> {{.ProjectName}}
+          {{else if eq .Scope "cluster"}}<span class="badge badge-cyan">cluster</span> all VMs
+          {{else}}<span class="badge badge-gray">vm</span> {{.VmName}}{{end}}
+        </td>
+        <td>{{.Repo}}</td>
+        <td>{{humanCron .Cron}}<br><span class="muted mono" style="font-size:11px">{{.Cron}}</span></td>
+        <td>{{if .Enabled}}<span class="ok">yes</span>{{else}}<span class="muted">no</span>{{end}}</td>
+        <td class="mono">{{.KeepLast}}/{{.KeepDaily}}/{{.KeepWeekly}}/{{.KeepMonthly}}/{{.KeepYearly}}</td>
+        <td>{{relTime .LastRunAt}}</td>
+        <td>{{if .LastRunErr}}<span class="error">{{.LastRunErr}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>
+          <button class="btn btn-sm btn-danger"
+                  hx-delete="/ui/schedules/{{if .VmName}}{{.VmName}}{{else}}_{{end}}?scope={{.Scope}}&pool={{.PoolName}}&project={{.ProjectName}}&repo={{.Repo}}"
+                  hx-confirm="Delete this backup schedule?">Delete</button>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">
+    <h3>No backup schedules</h3>
+    <p>Schedule recurring backups for a VM, a storage pool, a project, or the whole cluster.</p>
+    <button class="btn btn-primary" hx-get="/ui/schedules/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Add schedule</button>
+  </div>
+  {{end}}
+
+  <div class="page-header" style="margin-top:28px">
+    <div>
+      <h2>Replication schedules</h2>
+      <p class="muted">Cron-driven disk replication to a target pool (crash-consistent; a fast-recovery layer, not a backup). Use shared storage or set a target host for cross-host DR.</p>
+    </div>
+    <button class="btn btn-primary" hx-get="/ui/schedules/repl-create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Add replication</button>
+  </div>
+  {{if .ReplSchedules}}
+  <table class="table">
+    <thead>
+      <tr><th>Scope</th><th>Target pool</th><th>Target host</th><th>Mode</th><th>Schedule</th><th>Enabled</th><th>Keep</th><th>Last run</th><th>Last error</th><th></th></tr>
+    </thead>
+    <tbody>
+    {{range .ReplSchedules}}
+      <tr>
+        <td>
+          {{if eq .Scope "pool"}}<span class="badge badge-purple">pool</span> {{.PoolName}}
+          {{else if eq .Scope "project"}}<span class="badge badge-blue">project</span> {{.ProjectName}}
+          {{else if eq .Scope "cluster"}}<span class="badge badge-cyan">cluster</span> all VMs
+          {{else}}<span class="badge badge-gray">vm</span> {{.VmName}}{{end}}
+        </td>
+        <td>{{.TargetPool}}</td>
+        <td>{{if .TargetHost}}{{.TargetHost}}{{else}}<span class="muted">auto/shared</span>{{end}}</td>
+        <td>
+          {{if .Incremental}}<span class="badge badge-green">incremental</span>{{else}}<span class="badge badge-gray">full</span>{{end}}
+          {{if .AutoPromote}}<span class="badge badge-cyan" title="Failover promotes the freshest replica">auto-promote</span>{{end}}
+        </td>
+        <td>{{humanCron .Cron}}<br><span class="muted mono" style="font-size:11px">{{.Cron}}</span></td>
+        <td>{{if .Enabled}}<span class="ok">yes</span>{{else}}<span class="muted">no</span>{{end}}</td>
+        <td class="mono">{{if .KeepReplicas}}{{.KeepReplicas}}{{else}}∞{{end}}</td>
+        <td>{{relTime .LastRunAt}}</td>
+        <td>{{if .LastRunErr}}<span class="error">{{.LastRunErr}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>
+          <button class="btn btn-sm btn-danger"
+                  hx-delete="/ui/schedules/repl/{{if .VmName}}{{.VmName}}{{else}}_{{end}}?scope={{.Scope}}&pool={{.PoolName}}&project={{.ProjectName}}&target={{.TargetPool}}"
+                  hx-confirm="Delete this replication schedule?">Delete</button>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">
+    <h3>No replication schedules</h3>
+    <p>Replicate a VM's disk to a target pool on a cron for fast recovery.</p>
+  </div>
+  {{end}}
+</div>
+{{end}}

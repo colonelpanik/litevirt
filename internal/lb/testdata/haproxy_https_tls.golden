@@ -1,0 +1,27 @@
+
+global
+    log /dev/log local0
+    maxconn 4096
+    user haproxy
+    group haproxy
+    daemon
+    stats socket /run/litevirt/lb/https-haproxy.sock mode 660 level admin
+    stats timeout 30s
+
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    retries 3
+    timeout connect 5s
+    timeout client  30s
+    timeout server  30s
+frontend https-443
+    bind 10.0.100.101:443 ssl crt /etc/litevirt/lb/https-443.pem
+    default_backend https-443-be
+
+backend https-443-be
+    balance leastconn
+    option httpchk GET /healthz
+    http-check expect status 200
+    server web1 10.0.100.20:8443 check inter 1500ms rise 2 fall 3

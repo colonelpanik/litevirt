@@ -1,0 +1,8 @@
+version: 1
+config:
+  - type: physical
+    name: eth0
+    mac_address: "aa:bb:cc:dd:ee:04"
+    subnets:
+      - type: static6
+        address: 2001:db8::20/64

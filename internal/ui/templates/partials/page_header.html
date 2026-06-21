@@ -1,0 +1,9 @@
+{{define "page_header"}}
+<div class="page-header">
+  <div>
+    <h2>{{.Title}}</h2>
+    {{if .Subtitle}}<p class="muted">{{.Subtitle}}</p>{{end}}
+  </div>
+  {{if .Action}}<div class="actions">{{.Action}}</div>{{end}}
+</div>
+{{end}}

@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>litevirt{{if .Title}} — {{.Title}}{{end}}</title>
+  <script src="https://unpkg.com/htmx.org@2.0.0/dist/htmx.min.js"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/xterm.css">
+  <script src="/static/xterm.js"></script>
+  <script src="/static/addon-fit.js"></script>
+  <link rel="stylesheet" href="/static/vendor/uplot/uPlot.min.css">
+  <script src="/static/vendor/uplot/uPlot.iife.min.js"></script>
+  <script src="/static/stats-charts.js"></script>
+  <script src="/static/bulk-select.js"></script>
+  <script src="/static/command-palette.js"></script>
+  <script src="/static/confirm-dialog.js"></script>
+  <script src="/static/move-volume.js"></script>
+  <script>
+    // Apply saved theme before render to avoid flash.
+    (function() {
+      var t = localStorage.getItem('theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+</head>
+<body>
+  <!-- Inline SVG icon sprite. Referenced via {{icon "name"}} → <use href="#i-name">.
+       Keep ids in sync with knownIcons in helpers.go. currentColor = theme-aware. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-play" viewBox="0 0 16 16"><path d="M4 3l9 5-9 5z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1"/></symbol>
+    <symbol id="i-restart" viewBox="0 0 16 16"><path d="M12.5 8a4.5 4.5 0 1 1-1.3-3.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12.8 2.2v3h-3" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+    <symbol id="i-console" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 7l2 1.6L5 10.2M8.5 10.2h3" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-vnc" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M6 13.2h4M8 11.2v2" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-backup" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="3" rx=".5"/><path d="M3 6v7h10V6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M6.5 9h3" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-restore" viewBox="0 0 16 16"><path d="M3.5 8a4.5 4.5 0 1 0 1.3-3.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.2 2.2v3h3" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+    <symbol id="i-delete" viewBox="0 0 16 16"><path d="M4 5h8M6 5V3.5h4V5M5 5l.5 8h5l.5-8" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 16 16"><path d="M10.5 3l2.5 2.5-7 7L3 13l.5-3z" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-snapshot" viewBox="0 0 16 16"><rect x="2" y="5" width="12" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="9" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M6 5l1-1.5h2L10 5" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-migrate" viewBox="0 0 16 16"><path d="M2 8h9M8 5l3 3-3 3" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+    <symbol id="i-add" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10 10l3 3" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+    <symbol id="i-host" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="4" rx="1" fill="none" stroke="currentColor" stroke-width="1.2"/><rect x="2" y="9" width="12" height="4" rx="1" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M4.5 5h.01M4.5 11h.01" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+    <symbol id="i-vm" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="5" y="6" width="6" height="4" rx=".5"/></symbol>
+    <symbol id="i-network" viewBox="0 0 16 16"><circle cx="3" cy="8" r="1.6"/><circle cx="13" cy="4" r="1.6"/><circle cx="13" cy="12" r="1.6"/><path d="M4.3 7.3L11.7 4.6M4.3 8.7L11.7 11.4" fill="none" stroke="currentColor" stroke-width="1.2"/></symbol>
+    <symbol id="i-storage" viewBox="0 0 16 16"><ellipse cx="8" cy="4" rx="5" ry="2" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4" fill="none" stroke="currentColor" stroke-width="1.2"/></symbol>
+    <symbol id="i-disk" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.2"/><circle cx="8" cy="8" r="1.3"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 16 16"><path d="M8 2.5l6 10.5H2z" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 6.5v3M8 11h.01" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+    <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5l3.5 3.5L13 5" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  </svg>
+  <nav>
+    <span class="logo">⬡ litevirt</span>
+    <a href="/" {{if eq .Page "cluster"}}class="active"{{end}}>Dashboard</a>
+    <div class="nav-group">
+      <span class="nav-top {{if or (eq .Page "vms") (eq .Page "stacks") (eq .Page "containers") (eq .Page "hosts") (eq .Page "rebalance")}}active{{end}}" tabindex="0">Compute {{icon "chevron"}}</span>
+      <div class="nav-menu">
+        <a href="/vms" {{if eq .Page "vms"}}class="active"{{end}}>VMs</a>
+        <a href="/stacks" {{if eq .Page "stacks"}}class="active"{{end}}>Stacks</a>
+        <a href="/containers" {{if eq .Page "containers"}}class="active"{{end}}>Containers</a>
+        <a href="/hosts" {{if eq .Page "hosts"}}class="active"{{end}}>Hosts</a>
+        <a href="/rebalance" {{if eq .Page "rebalance"}}class="active"{{end}}>Rebalance</a>
+      </div>
+    </div>
+    <div class="nav-group">
+      <span class="nav-top {{if or (eq .Page "networks") (eq .Page "lb") (eq .Page "security-groups") (eq .Page "firewall") (eq .Page "topology")}}active{{end}}" tabindex="0">Network {{icon "chevron"}}</span>
+      <div class="nav-menu">
+        <a href="/networks" {{if eq .Page "networks"}}class="active"{{end}}>Networks</a>
+        <a href="/lb" {{if eq .Page "lb"}}class="active"{{end}}>Load Balancers</a>
+        <a href="/security-groups" {{if eq .Page "security-groups"}}class="active"{{end}}>Security Groups</a>
+        <a href="/firewall" {{if eq .Page "firewall"}}class="active"{{end}}>Firewall</a>
+        <a href="/topology" {{if eq .Page "topology"}}class="active"{{end}}>Topology</a>
+      </div>
+    </div>
+    <div class="nav-group">
+      <span class="nav-top {{if or (eq .Page "storage") (eq .Page "images") (eq .Page "backups") (eq .Page "schedules")}}active{{end}}" tabindex="0">Storage {{icon "chevron"}}</span>
+      <div class="nav-menu">
+        <a href="/storage" {{if eq .Page "storage"}}class="active"{{end}}>Pools</a>
+        <a href="/images" {{if eq .Page "images"}}class="active"{{end}}>Images</a>
+        <a href="/backups" {{if eq .Page "backups"}}class="active"{{end}}>Backups</a>
+        <a href="/schedules" {{if eq .Page "schedules"}}class="active"{{end}}>Schedules</a>
+      </div>
+    </div>
+    <div class="nav-group">
+      <span class="nav-top {{if or (eq .Page "events") (eq .Page "health") (eq .Page "metrics-viewer") (eq .Page "dashboards")}}active{{end}}" tabindex="0">Observe {{icon "chevron"}}</span>
+      <div class="nav-menu">
+        <a href="/events" {{if eq .Page "events"}}class="active"{{end}}>Events</a>
+        <a href="/notifications" {{if eq .Page "notifications"}}class="active"{{end}}>Notifications</a>
+        <a href="/health" {{if eq .Page "health"}}class="active"{{end}}>Health</a>
+        <a href="/metrics-viewer" {{if eq .Page "metrics-viewer"}}class="active"{{end}}>Metrics</a>
+        <a href="/dashboards" {{if eq .Page "dashboards"}}class="active"{{end}}>Dashboards</a>
+      </div>
+    </div>
+    <div class="nav-group">
+      <span class="nav-top {{if or (eq .Page "rbac") (eq .Page "users") (eq .Page "projects") (eq .Page "audit") (eq .Page "diagnostics") (eq .Page "pci") (eq .Page "account") (eq .Page "registry")}}active{{end}}" tabindex="0">Admin {{icon "chevron"}}</span>
+      <div class="nav-menu">
+        <a href="/rbac" {{if eq .Page "rbac"}}class="active"{{end}}>RBAC</a>
+        <a href="/users" {{if eq .Page "users"}}class="active"{{end}}>Users</a>
+        <a href="/projects" {{if eq .Page "projects"}}class="active"{{end}}>Projects</a>
+        <a href="/audit" {{if eq .Page "audit"}}class="active"{{end}}>Audit</a>
+        <a href="/pci" {{if eq .Page "pci"}}class="active"{{end}}>PCI Devices</a>
+        <a href="/resource-mappings" {{if eq .Page "resource-mappings"}}class="active"{{end}}>Resource Mappings</a>
+        <a href="/diagnostics" {{if eq .Page "diagnostics"}}class="active"{{end}}>Diagnostics</a>
+        <a href="/account/2fa" {{if eq .Page "account"}}class="active"{{end}}>2FA / Account</a>
+        <a href="/account/registry" {{if eq .Page "registry"}}class="active"{{end}}>Registry Credentials</a>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div style="position:relative">
+      <input type="search" id="global-search" placeholder="Search…  ⌘K" autocomplete="off"
+             hx-get="/ui/search" hx-trigger="keyup changed delay:300ms" hx-target="#search-results"
+             hx-swap="innerHTML" name="q"
+             style="padding:4px 8px;font-size:12px;width:160px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text)">
+      <div id="search-results" style="position:absolute;top:100%;right:0;min-width:300px;max-height:400px;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:1000;display:none"></div>
+    </div>
+    <button class="btn btn-sm" id="theme-toggle" onclick="toggleTheme()" title="Toggle theme">&#x25D1;</button>
+    <span class="cluster-badge">{{.ClusterName}}</span>
+    <form method="POST" action="/logout" style="margin:0"><button type="submit" class="btn btn-sm" title="Sign out">Sign out</button></form>
+  </nav>
+  <main>
+    {{template "content" .}}
+  </main>
+  <!-- Command palette (⌘K). Hidden until invoked — see command-palette.js. -->
+  <div class="cp-overlay" id="command-palette" style="display:none">
+    <div class="cp-box">
+      <input id="cp-input" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Jump to a page or resource…">
+      <div id="cp-results" class="cp-results"></div>
+      <div class="cp-hint"><kbd>↑↓</kbd> navigate&nbsp;&nbsp;<kbd>↵</kbd> open&nbsp;&nbsp;<kbd>esc</kbd> close&nbsp;&nbsp;<kbd>g</kbd>+key jump</div>
+    </div>
+  </div>
+  <!-- Themed confirmation dialog. Hidden until htmx:confirm fires — see confirm-dialog.js. -->
+  <div class="modal-overlay cd-overlay" id="confirm-dialog" style="display:none">
+    <div class="modal" style="min-width:340px;max-width:460px">
+      <h3>Please confirm</h3>
+      <p id="cd-message" style="color:var(--text);font-size:13px;line-height:1.5;margin-bottom:4px"></p>
+      <div class="form-actions">
+        <button type="button" class="btn" id="cd-cancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="cd-confirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+  <div class="toast-container" id="toast-container"></div>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      htmx.config.defaultSwapStyle = 'outerHTML';
+
+      // Search dropdown show/hide
+      var searchInput = document.getElementById('global-search');
+      var searchResults = document.getElementById('search-results');
+      if (searchInput && searchResults) {
+        searchInput.addEventListener('focus', function() { if (searchResults.innerHTML.trim()) searchResults.style.display = 'block'; });
+        searchInput.addEventListener('blur', function() { setTimeout(function() { searchResults.style.display = 'none'; }, 200); });
+        document.body.addEventListener('htmx:afterSwap', function(e) {
+          if (e.detail.target === searchResults) {
+            searchResults.style.display = searchResults.innerHTML.trim() ? 'block' : 'none';
+          }
+        });
+      }
+    });
+
+    // Loading indicator: disable + spinner the action button during HTMX
+    // requests. The triggering element (e.detail.elt) is the <button> for
+    // button-driven requests, but the <form> for hx-post forms — so resolve
+    // the form's submit button too. Without this, form submits (e.g. Move
+    // disk) stay clickable for the whole request and double-submit.
+    function loadingBtn(el) {
+      if (el.tagName === 'BUTTON') return el;
+      if (el.tagName === 'FORM') return el.querySelector('button[type="submit"], button:not([type])');
+      return null;
+    }
+    document.body.addEventListener('htmx:beforeRequest', function(e) {
+      var btn = loadingBtn(e.detail.elt);
+      if (btn && !btn.classList.contains('no-loading') && btn.dataset.origText === undefined) {
+        btn.dataset.origText = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> ' + btn.textContent.trim();
+      }
+    });
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+      var btn = loadingBtn(e.detail.elt);
+      if (btn && btn.dataset.origText !== undefined) {
+        btn.disabled = false;
+        btn.innerHTML = btn.dataset.origText;
+        delete btn.dataset.origText;
+      }
+      // Show error toast on non-2xx responses (if server didn't already send one).
+      if (!e.detail.successful && e.detail.xhr && e.detail.xhr.status >= 400) {
+        var hdr = e.detail.xhr.getResponseHeader('HX-Trigger');
+        if (!hdr || hdr.indexOf('showToast') === -1) {
+          var msg = e.detail.xhr.responseText || 'Request failed';
+          if (msg.length > 200) msg = msg.substring(0, 200) + '...';
+          document.body.dispatchEvent(new CustomEvent('showToast', {detail:{message:msg,type:'error'}}));
+        }
+      }
+    });
+
+    // Client-side table filter: wire up any input with data-table-filter attribute.
+    document.addEventListener('input', function(e) {
+      if (!e.target.dataset.tableFilter) return;
+      var table = document.getElementById(e.target.dataset.tableFilter);
+      if (!table) return;
+      var q = e.target.value.toLowerCase();
+      var rows = table.querySelectorAll('tbody tr');
+      rows.forEach(function(row) {
+        if (row.querySelector('.empty')) return;
+        row.style.display = row.textContent.toLowerCase().indexOf(q) !== -1 ? '' : 'none';
+      });
+    });
+
+    // Toast notifications via HX-Trigger header.
+    document.body.addEventListener('showToast', function(e) {
+      var d = e.detail || {};
+      var t = document.createElement('div');
+      t.className = 'toast toast-' + (d.type || 'info');
+      t.textContent = d.message || 'Done';
+      document.getElementById('toast-container').appendChild(t);
+      setTimeout(function() { t.remove(); }, 4000);
+    });
+
+    // Theme toggle.
+    function toggleTheme() {
+      var html = document.documentElement;
+      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+    }
+
+    // Deploy stack — defined here (not in modal) so it's always in global scope.
+    function previewPlan(btn) {
+      var el = document.getElementById('deploy-compose-yaml');
+      if (!el) { alert('Cannot find compose textarea'); return; }
+      var y = el.value.trim();
+      if (!y) { alert('Compose YAML is required'); return; }
+      btn.disabled = true;
+      btn.textContent = 'Planning\u2026';
+      fetch('/ui/stacks/plan', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'compose_yaml=' + encodeURIComponent(y)
+      }).then(function(r) {
+        if (r.ok) {
+          return r.text().then(function(html) {
+            document.getElementById('deploy-step-yaml').style.display = 'none';
+            var planDiv = document.getElementById('deploy-step-plan');
+            planDiv.innerHTML = html;
+            planDiv.style.display = 'block';
+          });
+        } else {
+          return r.text().then(function(t) { alert('Plan failed: ' + t); });
+        }
+      }).catch(function(e) {
+        alert('Plan error: ' + e);
+      }).finally(function() {
+        btn.disabled = false;
+        btn.textContent = 'Preview Plan';
+      });
+    }
+
+    function backToYaml() {
+      document.getElementById('deploy-step-plan').style.display = 'none';
+      document.getElementById('deploy-step-yaml').style.display = 'block';
+    }
+
+    function confirmDeploy(btn) {
+      var el = document.getElementById('deploy-compose-yaml');
+      if (!el) { alert('Cannot find compose textarea'); return; }
+      var y = el.value.trim();
+      if (!y) { alert('Compose YAML is required'); return; }
+      btn.disabled = true;
+      btn.textContent = 'Deploying\u2026';
+      fetch('/ui/stacks', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'compose_yaml=' + encodeURIComponent(y)
+      }).then(function(r) {
+        if (r.ok) {
+          window.location.href = '/stacks';
+        } else {
+          return r.text().then(function(t) { alert('Deploy failed: ' + t); });
+        }
+      }).catch(function(e) {
+        alert('Deploy error: ' + e);
+      }).finally(function() {
+        btn.disabled = false;
+        btn.textContent = 'Confirm & Deploy';
+      });
+    }
+
+    // Nav dropdown menus: click heading to toggle; click-outside or Escape closes.
+    document.addEventListener('click', function(e) {
+      var top = e.target.closest('.nav-top');
+      if (top) {
+        var grp = top.closest('.nav-group');
+        var wasOpen = grp.classList.contains('open');
+        document.querySelectorAll('.nav-group.open').forEach(function(g) { g.classList.remove('open'); });
+        if (!wasOpen) grp.classList.add('open');
+        return;
+      }
+      if (!e.target.closest('.nav-menu')) {
+        document.querySelectorAll('.nav-group.open').forEach(function(g) { g.classList.remove('open'); });
+      }
+    });
+    document.addEventListener('keydown', function(e) {
+      var a = document.activeElement;
+      if ((e.key === 'Enter' || e.key === ' ') && a && a.classList && a.classList.contains('nav-top')) {
+        a.click();
+        e.preventDefault();
+        return;
+      }
+      if (e.key === 'Escape') {
+        document.querySelectorAll('.nav-group.open').forEach(function(g) { g.classList.remove('open'); });
+      }
+    });
+
+    // Keyboard shortcuts: g+h=hosts, g+v=vms, g+s=stacks, g+d=dashboard, ?=help.
+    var gPressed = false;
+    document.addEventListener('keydown', function(e) {
+      // Skip if inside input/textarea/select.
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+      if (e.key === 'g') { gPressed = true; setTimeout(function() { gPressed = false; }, 500); return; }
+      if (gPressed) {
+        gPressed = false;
+        var routes = { d: '/', h: '/hosts', v: '/vms', s: '/stacks', n: '/networks', l: '/lb', i: '/images', e: '/events', a: '/audit' };
+        if (routes[e.key]) { window.location.href = routes[e.key]; e.preventDefault(); }
+      }
+      if (e.key === '?' && !e.ctrlKey && !e.metaKey) {
+        alert('Keyboard shortcuts:\\n\\ng d - Dashboard\\ng h - Hosts\\ng v - VMs\\ng s - Stacks\\ng n - Networks\\ng l - LBs\\ng i - Images\\ng e - Events\\ng a - Audit\\n? - This help');
+        e.preventDefault();
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<div class="modal-overlay" id="pool-create-modal">
+  <div class="modal" style="max-width:560px">
+    <h3>Create storage pool</h3>
+    <p style="color:var(--muted);font-size:13px;margin-top:0">
+      The daemon runs the driver's <code>Prepare()</code> hook (mount NFS, log into
+      iSCSI, …) before saving, so a mount failure is reported here rather than at
+      first VM create. Same as <code>lv pool create</code>.
+    </p>
+    <form hx-post="/ui/storage" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('pool-create-modal').remove()">
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" placeholder="nvme-2t" required>
+      </div>
+      <div class="form-row">
+        <label>Driver</label>
+        <select name="driver" required>
+          {{range .Drivers}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Host</label>
+        <select name="host">
+          <option value="">(this host)</option>
+          {{range .Hosts}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Source</label>
+        <input type="text" name="source" placeholder="server:/export, ceph pool name, …">
+      </div>
+      <div class="form-row">
+        <label>Target</label>
+        <input type="text" name="target" placeholder="local mount/path override (required for dir)">
+      </div>
+      <div class="form-row">
+        <label>Options</label>
+        <textarea name="options" rows="3" placeholder="key=value (one per line)" style="font-family:monospace;font-size:12px"></textarea>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('pool-create-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>

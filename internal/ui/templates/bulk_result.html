@@ -1,0 +1,23 @@
+<div class="bulk-result-dialog" style="border:1px solid var(--border); border-radius:6px; padding:1em; margin:1em 0; background:var(--bg-elev);">
+  <h3 style="margin-top:0">Bulk {{.Action}}: partial failure</h3>
+  <p>Some operations did not complete. Click an entry to see the error.</p>
+  <table class="lv-table" style="width:100%; font-size:13px;">
+    <thead>
+      <tr><th style="width:1%">·</th><th>Name</th><th>Result</th></tr>
+    </thead>
+    <tbody>
+      {{range .Results}}
+        <tr>
+          <td>{{if .Success}}<span style="color:var(--ok)">✓</span>{{else}}<span style="color:var(--err)">✗</span>{{end}}</td>
+          <td>{{.Name}}</td>
+          <td>
+            {{if .Success}}ok{{else}}<code style="font-size:12px; word-break:break-all">{{.Error}}</code>{{end}}
+          </td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+  <div style="text-align:right; margin-top:0.5em">
+    <button class="btn" onclick="this.closest('.bulk-result-dialog').remove(); htmx.trigger('body','refresh')">Dismiss</button>
+  </div>
+</div>

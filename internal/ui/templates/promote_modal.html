@@ -1,0 +1,40 @@
+<div class="modal-overlay" id="promote-modal">
+  <div class="modal">
+    <h3>Promote replica</h3>
+    <p class="muted" style="margin-top:0">Bring up <strong>{{.VMName}}</strong> from its newest replica — for disaster recovery after losing the VM's host.</p>
+    {{if .Targets}}
+    <div class="form-row">
+      <label>Replication targets</label>
+      <div class="muted" style="font-size:12px">
+        {{range .Targets}}{{.TargetPool}}{{if .TargetHost}} @ {{.TargetHost}}{{end}}{{if .Incremental}} (incremental){{end}}<br>{{end}}
+      </div>
+    </div>
+    {{else}}
+    <div class="form-row"><div class="muted" style="font-size:12px">No replication schedule found — set <em>pool</em>/<em>host</em> below if a replica exists.</div></div>
+    {{end}}
+    <form hx-post="/ui/vms/{{.VMName}}/promote" hx-swap="none" hx-on::after-request="document.getElementById('promote-modal').remove()">
+      <div class="form-row">
+        <label>New name <span class="muted">(optional)</span></label>
+        <input type="text" name="new_name" placeholder="leave blank to take over {{.VMName}}">
+      </div>
+      <div class="form-row">
+        <label>Pool <span class="muted">(optional)</span></label>
+        <input type="text" name="pool" placeholder="default: from the replication schedule">
+      </div>
+      <div class="form-row">
+        <label>Host <span class="muted">(optional)</span></label>
+        <input type="text" name="host" placeholder="default: auto-resolved">
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="force"> Force <span class="muted">(override split-brain guard)</span></label>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="no_localize"> Fast overlay <span class="muted">(boot off the replica; pins it until localized)</span></label>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('promote-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Promote</button>
+      </div>
+    </form>
+  </div>
+</div>

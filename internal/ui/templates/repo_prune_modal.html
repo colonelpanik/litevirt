@@ -1,0 +1,27 @@
+<div class="modal-overlay" id="repo-prune-modal">
+  <div class="modal" style="max-width:520px">
+    <h3>Prune repo {{.Repo}}</h3>
+    <p class="muted" style="font-size:13px;margin-top:0">
+      Proxmox-style retention applied per VM+disk. 0 = keep all of that bucket.
+      Preview first; nothing is deleted until you confirm. Reclaim space with GC afterwards.
+    </p>
+    <form hx-post="/ui/backups/prune?repo={{.Repo}}" hx-target="#prune-preview" hx-swap="innerHTML">
+      <div class="form-row">
+        <label>Retention (kept counts)</label>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <input type="number" name="keep_last" min="0" placeholder="last" title="keep-last" style="width:72px">
+          <input type="number" name="keep_daily" min="0" placeholder="daily" title="keep-daily" style="width:72px">
+          <input type="number" name="keep_weekly" min="0" placeholder="weekly" title="keep-weekly" style="width:72px">
+          <input type="number" name="keep_monthly" min="0" placeholder="monthly" title="keep-monthly" style="width:72px">
+          <input type="number" name="keep_yearly" min="0" placeholder="yearly" title="keep-yearly" style="width:72px">
+        </div>
+      </div>
+      <input type="hidden" name="apply" value="0">
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('repo-prune-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Preview</button>
+      </div>
+    </form>
+    <div id="prune-preview" style="margin-top:12px"></div>
+  </div>
+</div>

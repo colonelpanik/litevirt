@@ -1,0 +1,27 @@
+{{if .Error}}
+<div class="error" style="margin:8px">{{.Error}}</div>
+{{else}}
+{{if .Pool}}
+{{if .UploadErr}}<div class="error" style="margin:8px">{{.UploadErr}}</div>{{end}}
+<form hx-post="/ui/storage/upload" hx-encoding="multipart/form-data" hx-target="#iso-contents" hx-swap="innerHTML"
+      style="display:flex;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--border)">
+  <input type="hidden" name="host" value="{{.Host}}">
+  <input type="hidden" name="pool" value="{{.Pool}}">
+  <input type="hidden" name="field" value="{{.Field}}">
+  <input type="file" name="file" required style="flex:1;font-size:12px">
+  <button type="submit" class="btn btn-sm btn-primary">Upload</button>
+  <span class="htmx-indicator spinner"></span>
+</form>
+{{end}}
+{{if not .Contents}}
+<div class="muted" style="padding:14px;font-size:13px">No files in this pool.</div>
+{{else}}
+{{range .Contents}}
+<button type="button" class="search-result" style="width:100%;text-align:left;border:none;background:transparent;cursor:pointer"
+        onclick="window.pickStorageFile(this.dataset.path)" data-path="{{.Path}}">
+  <span>{{if .IsIso}}{{icon "disk"}} {{end}}{{.Name}}</span>
+  <span class="muted" style="float:right;font-size:11px">{{formatBytes .SizeBytes}}</span>
+</button>
+{{end}}
+{{end}}
+{{end}}

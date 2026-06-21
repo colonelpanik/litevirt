@@ -1,0 +1,34 @@
+<div class="modal-overlay" id="push-image-modal" onclick="this.remove()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Push Image to Host</h3>
+      <button class="btn" onclick="document.getElementById('push-image-modal').remove()">Close</button>
+    </div>
+    <form hx-post="/ui/images/push" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('push-image-modal').remove()}">
+      <div class="form-row">
+        <label>Image</label>
+        <select name="image_name" required>
+          <option value="" disabled selected>Select image...</option>
+          {{range .Images}}
+          {{if ne .Status "pulling"}}
+          <option value="{{.Name}}">{{.Name}} ({{formatBytes .SizeBytes}})</option>
+          {{end}}
+          {{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Target Host</label>
+        <select name="target_host" required>
+          <option value="" disabled selected>Select host...</option>
+          {{range .Hosts}}
+          <option value="{{.Name}}">{{.Name}}</option>
+          {{end}}
+        </select>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Push Image</button>
+      </div>
+    </form>
+  </div>
+</div>

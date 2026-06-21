@@ -1,0 +1,62 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Projects</h2>
+      <p class="muted">Tenancy buckets with per-project quotas. The implicit <code>_default</code> project is unbounded.</p>
+    </div>
+    <button class="btn btn-primary" hx-get="/ui/projects/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create project</button>
+  </div>
+  {{template "alert_error" .Error}}
+
+  {{if .Projects}}
+  <div class="grid-2">
+    {{range .Projects}}
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:start;gap:8px">
+        <div>
+          <div style="font-size:15px;font-weight:600">{{.Project.Name}}</div>
+          <div class="muted" style="font-size:11px">
+            {{if .Project.Display}}{{.Project.Display}} · {{end}}
+            {{if .Project.ParentName}}parent {{.Project.ParentName}} · {{end}}
+            {{.Usage.VmCount}} VM{{if ne .Usage.VmCount 1}}s{{end}}
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-sm" hx-get="/ui/projects/quota-modal?name={{.Project.Name}}" hx-target="body" hx-swap="beforeend">Quota</button>
+          {{if ne .Project.Name "_default"}}
+          <button class="btn btn-sm btn-danger" hx-delete="/ui/projects?name={{.Project.Name}}"
+                  hx-confirm="Delete project '{{.Project.Name}}'? It must have no VMs.">{{icon "delete"}}</button>
+          {{end}}
+        </div>
+      </div>
+      <div style="margin-top:12px;display:flex;flex-direction:column;gap:8px">
+        {{template "quota_meter" (dict "Label" "vCPU" "Used" .Usage.VcpuUsed "Limit" .Quota.VcpuLimit)}}
+        {{template "quota_meter" (dict "Label" "Memory MiB" "Used" .Usage.MemMibUsed "Limit" .Quota.MemMibLimit)}}
+        {{template "quota_meter" (dict "Label" "Disk GiB" "Used" .Usage.DiskGibUsed "Limit" .Quota.DiskGibLimit)}}
+        {{template "quota_meter" (dict "Label" "NICs" "Used" .Usage.NicUsed "Limit" .Quota.NicLimit)}}
+      </div>
+      <div class="kv" style="margin-top:10px">
+        <dt>Public IPs</dt><dd>{{if .Quota.PublicIpLimit}}limit {{.Quota.PublicIpLimit}}{{else}}unbounded{{end}}</dd>
+        <dt>Backup GiB</dt><dd>{{if .Quota.BackupGibLimit}}limit {{.Quota.BackupGibLimit}}{{else}}unbounded{{end}}</dd>
+      </div>
+    </div>
+    {{end}}
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <h3>No projects defined</h3>
+    <p>Only the implicit <code>_default</code> project exists. Create a project to apply per-tenant quotas.</p>
+    <button class="btn btn-primary" hx-get="/ui/projects/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create project</button>
+  </div>
+  {{end}}
+</div>
+{{end}}
+
+{{define "quota_meter"}}
+<div class="meter">
+  <span class="muted" style="min-width:84px;font-size:11px">{{.Label}}</span>
+  <div class="meter-track"><div class="meter-fill {{meterClass (pct .Used .Limit)}}" style="width:{{printf "%.0f" (pct .Used .Limit)}}%"></div></div>
+  <span class="meter-label">{{.Used}} / {{if .Limit}}{{.Limit}}{{else}}∞{{end}}</span>
+</div>
+{{end}}

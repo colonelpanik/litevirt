@@ -1,0 +1,592 @@
+syntax = "proto3";
+package litevirt.v1;
+
+option go_package = "github.com/litevirt/litevirt/gen/litevirt/v1;litevirtv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ═══════════ Enums ═══════════
+
+enum VMState {
+    VM_CREATING  = 0;
+    VM_STARTING  = 1;
+    VM_RUNNING   = 2;
+    VM_STOPPING  = 3;
+    VM_STOPPED   = 4;
+    VM_MIGRATING = 5;
+    VM_ERROR     = 6;
+    VM_UNKNOWN   = 7;
+}
+
+enum HostState {
+    HOST_ACTIVE      = 0;
+    HOST_DRAINING    = 1;
+    HOST_MAINTENANCE = 2;
+    HOST_SUSPECT     = 3;
+    HOST_OFFLINE     = 4;
+}
+
+enum MigrateStrategy {
+    MIGRATE_LIVE = 0;
+    MIGRATE_COLD = 1;
+    MIGRATE_NONE = 2;
+}
+
+enum HostFailurePolicy {
+    RESTART_ANY  = 0;
+    RESTART_SAME = 1;
+    FAILURE_NONE = 2;
+}
+
+enum DiffOp {
+    DIFF_UNCHANGED = 0;
+    DIFF_CREATE    = 1;
+    DIFF_UPDATE    = 2;
+    DIFF_DELETE    = 3;
+}
+
+enum MigratePhase {
+    MIGRATE_VALIDATING  = 0;
+    MIGRATE_PREPARING   = 1;
+    MIGRATE_COPYING     = 2;
+    MIGRATE_CONVERGING  = 3;
+    MIGRATE_CUTOVER     = 4;
+    MIGRATE_COMPLETING  = 5;
+    MIGRATE_DONE        = 6;
+    MIGRATE_FAILED      = 7;
+}
+
+// ═══════════ Spec Types ═══════════
+
+message VMSpec {
+    string name        = 1;
+    string stack_name  = 2;
+    string image       = 3;
+    int32  cpu         = 4;
+    int32  memory_mib  = 5;
+    string machine     = 6;
+    string firmware    = 7;
+    bool   guest_agent = 8;
+    string ip_hint     = 9;
+
+    repeated DiskSpec          disks         = 10;
+    repeated NetworkAttachment network       = 11;
+    CloudInitSpec              cloud_init    = 12;
+    PlacementSpec              placement     = 13;
+    MigrationPolicy            migrate       = 14;
+    UpdatePolicy               update        = 15;
+    ResourceTuning             resources     = 16;
+    HealthCheckSpec            healthcheck   = 17;
+    HooksSpec                  hooks         = 18;
+    LBSpec                     loadbalancer  = 19;
+    map<string, string>        labels        = 20;
+
+    string iso  = 21;
+    string boot = 22;
+    int32  replicas = 23;
+    repeated DeviceSpec    devices = 24;
+    int32 stop_timeout_sec = 25;   // ACPI shutdown timeout before force-kill (0 = default 30s)
+    RestartPolicy restart  = 26;   // auto-restart policy for stopped/crashed VMs
+    bool  disable_vnc      = 27;   // true = headless (no VNC graphics device)
+    string cpu_mode         = 28;   // host-passthrough | host-model | custom (default: QEMU default)
+    bool  enable_spice     = 29;   // true = add a SPICE graphics device alongside VNC
+    string project          = 30;  // tenancy bucket; "" → "_default"
+
+    // Memory ballooning (#4). When max_memory_mib > memory_mib the domain gets a
+    // virtio-balloon and a hot-pluggable maxMemory region; min_memory_mib (>0)
+    // sets the floor the host may reclaim to. 0 = classic fixed memory_mib.
+    int32 min_memory_mib = 31;
+    int32 max_memory_mib = 32;
+
+    // Boot ordering (#10). onboot starts the VM when its host daemon boots;
+    // startup_order sequences onboot VMs (lower first); start_delay_sec waits
+    // after this VM before starting the next; stop_delay_sec waits after asking
+    // this VM to stop during an ordered shutdown.
+    bool  onboot          = 33;
+    int32 startup_order   = 34;
+    int32 start_delay_sec = 35;
+    int32 stop_delay_sec  = 36;
+}
+
+message DiskSpec {
+    string name    = 1;
+    string size    = 2;
+    string bus     = 3;
+    string cache   = 4;
+    string image   = 5;
+    string storage = 6;
+}
+
+message NetworkAttachment {
+    string          name            = 1;
+    string          model           = 2;
+    string          ip              = 3;
+    string          gateway         = 4;
+    string          mac             = 5;
+    repeated int32  trunk           = 6;
+    string          ipv6            = 7;
+    string          ipv6_gateway    = 8;
+    repeated string security_groups = 9;  // SG names bound to this NIC (distributed firewall)
+}
+
+message CloudInitSpec {
+    string userdata      = 1;
+    string metadata      = 2;
+    string networkconfig = 3;
+}
+
+message PlacementSpec {
+    string                 host          = 1;
+    repeated string        anti_affinity = 2;
+    repeated string        affinity      = 3;
+    map<string, string>    require       = 4;
+    map<string, string>    prefer        = 5;
+    bool                   spread        = 6;       // legacy; prefer policy
+    int32                  max_per_node  = 7;       // 0 = unlimited
+    string                 policy        = 8;       // balance | bin-pack | spread-strict | cost-aware
+    RebalanceSpec          rebalance     = 9;       // day-2 reconciliation; nil inherits cluster default
+    bool                   no_migrate    = 10;      // VM opts out of all live migration
+}
+
+// RebalanceSpec: day-2 reconciliation policy. See docs/placement.md.
+message RebalanceSpec {
+    string         mode      = 1;     // off | dry-run | on-demand | auto
+    int32          threshold = 2;     // min imbalance % to trigger a proposal (default 15)
+    string         cooldown  = 3;     // "5m" — min interval per VM
+    RebalanceBudget budget   = 4;
+}
+
+message RebalanceBudget {
+    int32  max_concurrent = 1;
+    int32  max_per_hour   = 2;
+    string window         = 3;        // named cluster time window (e.g. "off-hours")
+}
+
+message MigrationPolicy {
+    MigrateStrategy    strategy          = 1;
+    string             max_downtime      = 2;
+    bool               auto_converge     = 3;
+    bool               with_storage      = 4;
+    HostFailurePolicy  on_host_failure   = 5;
+    int32              priority          = 6;
+    string             fence_strategy    = 7;
+    int32              bandwidth_mib_sec = 8;
+    int32              timeout_sec       = 9;
+}
+
+message UpdatePolicy {
+    string strategy            = 1;
+    int32  max_unavailable     = 2;
+    int32  max_surge           = 3;
+    string order               = 4;
+    string health_wait         = 5;
+    bool   rollback_on_failure = 6;
+    string pause_between       = 7;
+}
+
+message ResourceTuning {
+    bool           hugepages     = 1;
+    repeated int32 cpu_pinning   = 2;
+    string         numa_topology = 3;  // deprecated: use numa_policy
+    int32          io_threads    = 4;
+    NUMAPolicy     numa_policy   = 5;
+}
+
+message NUMAPolicy {
+    int32  preferred_node = 1;  // -1 = auto-detect from device topology
+    bool   strict         = 2;  // fail if preferred node unavailable
+    string clique_hint    = 3;  // prefer devices in this NVLink/xGMI clique
+}
+
+message HealthCheckSpec {
+    string type     = 1;
+    string target   = 2;
+    string interval = 3;
+    string timeout  = 4;
+    int32  retries  = 5;
+    string action   = 6;
+}
+
+message HooksSpec {
+    string pre_start    = 1;
+    string post_start   = 2;
+    string pre_stop     = 3;
+    string post_stop    = 4;
+    string pre_migrate  = 5;
+    string post_migrate = 6;
+}
+
+message LBSpec {
+    bool            enabled         = 1;
+    string          vip             = 2;
+    repeated LBPort ports           = 3;
+    string          algorithm       = 4;
+    LBHealthSpec    health          = 5;
+    bool            sticky_sessions = 6;
+    repeated string hosts           = 7;
+    bool            snat            = 8;
+}
+
+message LBPort {
+    int32     listen         = 1;
+    int32     target         = 2;
+    string    protocol       = 3;
+    LBTlsSpec tls            = 4;
+    bool      redirect_https = 5;
+}
+
+message LBTlsSpec {
+    string cert = 1;
+    string key  = 2;
+}
+
+message LBHealthSpec {
+    bool   use_vm_healthcheck = 1;
+    string path               = 2;
+    string interval           = 3;
+    string type               = 4; // "tcp" | "http" (default: tcp)
+}
+
+message RestartPolicy {
+    string condition    = 1; // "none" | "on-failure" | "always"
+    string delay        = 2; // delay before restart e.g. "5s", "1m"
+    int32  max_attempts = 3; // 0 = unlimited
+    string window       = 4; // reset attempt counter after this duration e.g. "1h"
+}
+
+// ═══════════ PCI Device Types ═══════════
+
+message DeviceSpec {
+    string type        = 1;  // gpu | network | nvme | infiniband | pci
+    string vendor      = 2;  // PCI vendor ID e.g. "10de"
+    string model       = 3;  // optional model string match
+    int32  count       = 4;  // number of devices requested (default 1)
+    string address     = 5;  // exact PCI address e.g. "0000:41:00.0"
+    bool   sriov       = 6;  // request an SR-IOV VF instead of PF
+    string parent      = 7;  // SR-IOV: allocate from this PF
+    string mig_profile = 8;  // GPU MIG profile e.g. "1g.5gb", "3g.20gb"
+    int32  namespace   = 9;  // NVMe namespace ID (0 = whole controller)
+    string mapping     = 10; // cluster-wide resource-mapping name (#14): resolve to a
+                             // concrete PCI address on the target host at allocation
+                             // time, so a passthrough VM can land on any equivalent host
+}
+
+// ═══════════ Resource Mappings (#14) ═══════════
+
+// ResourceMappingDevice is one host's concrete device under a named mapping.
+message ResourceMappingDevice {
+    string host_name = 1;
+    string address   = 2;  // PCI address on that host, e.g. "0000:41:00.0"
+    string vendor    = 3;  // optional vendor ID for display/validation
+    string device    = 4;  // optional device ID / human name
+}
+
+// ResourceMapping is a cluster-wide alias for an equivalent device available on
+// one or more hosts. A VM requesting devices by mapping name can be placed on or
+// migrated to any host that has an entry here.
+message ResourceMapping {
+    string name        = 1;
+    string description = 2;
+    repeated ResourceMappingDevice devices = 3;
+}
+
+// ═══════════ Notifications (#5) ═══════════
+
+// NotificationTarget is a configured delivery destination.
+message NotificationTarget {
+    string id      = 1;
+    string name    = 2;
+    string type    = 3;  // webhook | slack
+    string config  = 4;  // JSON (url, …)
+    bool   enabled = 5;
+}
+
+// NotificationRoute selects which event patterns (at which min severity) go to a target.
+message NotificationRoute {
+    string id            = 1;
+    string event_pattern = 2;  // glob: "backup.*", "host.fenced", "*"
+    string target_id     = 3;
+    string min_severity  = 4;  // info | warn | error
+    bool   enabled       = 5;
+}
+
+// FirewallRule is a cluster- or host-tier rule (the non-NIC firewall planes).
+// host_name is set only on host-tier rules.
+message FirewallRule {
+    string id         = 1;
+    string host_name  = 2;  // host-tier only; empty for cluster-tier
+    string direction  = 3;  // ingress | egress
+    string proto      = 4;  // tcp | udp | icmp | all
+    string port       = 5;  // "80" | "8000-9000" | ""
+    string cidr       = 6;  // CIDR or "@<ipset>"
+    string action     = 7;  // accept | drop | reject
+    int32  priority   = 8;
+    string comment    = 9;
+    string stack_name = 10; // set when created from a compose file
+}
+
+// IpSet is a named CIDR list, referenced by rules as cidr = "@<name>".
+message IpSet {
+    string          id         = 1;
+    string          name       = 2;
+    repeated string cidrs      = 3;
+    string          stack_name = 4;
+}
+
+// FirewallDefault is the default-deny policy for one scope ('cluster' or a host name).
+message FirewallDefault {
+    string scope        = 1;  // 'cluster' | <host name>
+    bool   default_deny = 2;
+    string stack_name   = 3;
+}
+
+message PCIDevice {
+    string host_name       = 1;
+    string address         = 2;  // "0000:41:00.0"
+    string vendor_id       = 3;  // "10de"
+    string device_id       = 4;  // "2236"
+    string vendor_name     = 5;  // "NVIDIA Corporation"
+    string device_name     = 6;  // "A100 PCIe 40GB"
+    string type            = 7;  // gpu | network | nvme | infiniband | other
+    int32  iommu_group     = 8;
+    bool   sriov_capable   = 9;
+    int32  sriov_vfs_total = 10;
+    int32  sriov_vfs_free  = 11;
+    string driver          = 12; // current driver: "vfio-pci" | "nvidia" etc
+    string vm_name         = 13; // assigned VM, empty if free
+    int32  numa_node       = 14;
+    string pcie_root_port  = 15; // PCIe root port ancestor
+    string pcie_bridge     = 16; // immediate parent bridge
+    string link_clique     = 17; // NVLink/xGMI peer group ID
+    repeated string link_peers = 18; // peer GPU addresses in clique
+}
+
+// ═══════════ Hot-plug Types ═══════════
+
+message AttachDeviceRequest {
+    string vm_name = 1;
+    DiskSpec          disk       = 2;
+    NetworkAttachment nic        = 3;
+    DeviceSpec        pci_device = 4;
+}
+
+message DetachDeviceRequest {
+    string vm_name     = 1;
+    string disk_name   = 2;
+    string nic_mac     = 3;
+    string pci_address = 4;
+}
+
+// ═══════════ Runtime / Response Types ═══════════
+
+message VM {
+    string                         name         = 1;
+    string                         stack_name   = 2;
+    string                         host_name    = 3;
+    VMSpec                         spec         = 4;
+    VMState                        state        = 5;
+    string                         state_detail = 6;
+    int32                          cpu_actual   = 7;
+    int32                          mem_actual_mib = 8;
+    repeated VMInterface           interfaces   = 9;
+    repeated VMDisk                disks        = 10;
+    google.protobuf.Timestamp      created_at   = 11;
+    google.protobuf.Timestamp      updated_at   = 12;
+    string                         vnc_address  = 13;
+    bool                           is_template  = 14;  // a template: can't start; clone source
+}
+
+message VMInterface {
+    string network_name = 1;
+    int32  ordinal      = 2;
+    string mac          = 3;
+    string ip           = 4;
+    string tap_device   = 5;
+}
+
+message VMDisk {
+    string name           = 1;
+    string host_name      = 2;
+    string path           = 3;
+    int64  size_bytes     = 4;
+    string backing_image  = 5;
+    string storage_type   = 6;
+    string storage_volume = 7;
+}
+
+message Host {
+    string                         name          = 1;
+    string                         address       = 2;
+    HostState                      state         = 3;
+    int32                          cpu_total     = 4;
+    int32                          mem_total_mib = 5;
+    int64                          disk_total_gib = 6;
+    int32                          cpu_used      = 7;
+    int32                          mem_used_mib  = 8;
+    int64                          disk_used_gib = 9;
+    int32                          vm_count      = 10;
+    map<string, string>            labels        = 11;
+    google.protobuf.Timestamp      created_at    = 12;
+    google.protobuf.Timestamp      updated_at    = 13;
+    repeated PCIDevice             pci_devices   = 14;
+    string                         version       = 15;
+    repeated StoragePool           storage_pools = 16;
+    string                         fence_strategy = 17;
+    string                         ipmi_address   = 18;
+    string                         watchdog_dev   = 19;
+    string                         region         = 20;  // federation: failure-domain label
+}
+
+message Image {
+    string                         name         = 1;
+    string                         format       = 2;
+    string                         source_url   = 3;
+    string                         checksum     = 4;
+    int64                          size_bytes   = 5;
+    repeated string                hosts        = 6;
+    google.protobuf.Timestamp      created_at   = 7;
+    string                         status       = 8;  // "pulling", "ready", "error"
+    float                          progress_pct = 9;
+}
+
+message Snapshot {
+    string                         id         = 1;
+    string                         vm_name    = 2;
+    string                         host_name  = 3;
+    string                         name       = 4;
+    string                         state      = 5;
+    int64                          size_bytes = 6;
+    google.protobuf.Timestamp      created_at = 7;
+    string                         type          = 8;  // "disk" | "memory" (#3)
+    int64                          vmstate_bytes = 9;  // size of the saved RAM image (memory snapshots)
+}
+
+message User {
+    string                         username   = 1;
+    string                         role       = 2;
+    google.protobuf.Timestamp      created_at = 3;
+}
+
+message Token {
+    string                         id         = 1;
+    string                         username   = 2;
+    string                         name       = 3;
+    string                         token      = 4;
+    google.protobuf.Timestamp      expires_at = 5;
+    google.protobuf.Timestamp      created_at = 6;
+}
+
+message LoadBalancer {
+    string            name        = 1;
+    string            vip         = 2;
+    string            algorithm   = 3;
+    string            active_host = 4;
+    repeated string   lb_hosts    = 5;
+    repeated LBBackend backends   = 6;
+    string            state       = 7;
+    string            stack_name  = 8;  // empty for standalone LBs
+    repeated LBPort   ports       = 9;  // port mappings
+}
+
+message LBBackend {
+    string vm_name     = 1;
+    string address     = 2;
+    string status      = 3;
+    int32  response_ms = 4;
+    string last_error  = 5;
+}
+
+// LBBackendAddress is an explicit backend for standalone LBs.
+message LBBackendAddress {
+    string name    = 1;  // user-friendly name
+    string address = 2;  // IP or IP:port
+}
+
+// LBBackendStats holds per-backend metrics from HAProxy stats socket.
+message LBBackendStats {
+    string name              = 1;  // server name in HAProxy
+    string address           = 2;  // IP:port
+    string status            = 3;  // UP, DOWN, DRAIN, MAINT
+    int64  current_sessions  = 4;  // scur
+    int64  total_sessions    = 5;  // stot
+    int64  bytes_in          = 6;  // bin
+    int64  bytes_out         = 7;  // bout
+    int64  request_rate      = 8;  // rate
+    int64  error_conn        = 9;  // econ
+    int64  error_resp        = 10; // eresp
+    int32  response_2xx      = 11; // hrsp_2xx
+    int32  response_4xx      = 12; // hrsp_4xx
+    int32  response_5xx      = 13; // hrsp_5xx
+    int64  avg_response_ms   = 14; // rtime
+    int64  avg_queue_ms      = 15; // qtime
+}
+
+// LBFrontendStats holds per-frontend metrics.
+message LBFrontendStats {
+    int32  listen_port       = 1;
+    int64  current_sessions  = 2;
+    int64  total_sessions    = 3;
+    int64  bytes_in          = 4;
+    int64  bytes_out         = 5;
+    int64  request_rate      = 6;
+}
+
+// LBStatsResponse wraps per-frontend and per-backend stats.
+message LBStatsResponse {
+    string                     name      = 1;
+    repeated LBFrontendStats   frontends = 2;
+    repeated LBBackendStats    backends  = 3;
+}
+
+// VMStats holds live resource utilization for a single VM.
+message VMStats {
+    string name             = 1;
+    double cpu_pct          = 2;  // CPU usage percentage (0-100 * nVCPU)
+    int64  mem_rss_bytes    = 3;  // actual memory usage (RSS)
+    int64  mem_total_bytes  = 4;  // allocated memory
+    int64  disk_rd_bytes    = 5;  // cumulative disk read bytes
+    int64  disk_wr_bytes    = 6;  // cumulative disk write bytes
+    int64  disk_rd_reqs     = 7;  // cumulative disk read ops
+    int64  disk_wr_reqs     = 8;  // cumulative disk write ops
+    int64  net_rx_bytes     = 9;
+    int64  net_tx_bytes     = 10;
+}
+
+// HostResourceStats holds aggregated live resource utilization for a host.
+message HostResourceStats {
+    string           host_name      = 1;
+    double           cpu_pct        = 2;  // aggregate CPU usage across all VMs
+    int64            mem_used_bytes = 3;  // aggregate memory usage
+    int64            mem_total_bytes = 4;
+    int64            disk_rd_bytes  = 5;
+    int64            disk_wr_bytes  = 6;
+    repeated VMStats vm_stats       = 7;  // per-VM breakdown
+}
+
+message Alert {
+    string                         level     = 1;
+    string                         message   = 2;
+    google.protobuf.Timestamp      timestamp = 3;
+}
+
+message ClusterEvent {
+    string                         action    = 1;
+    string                         target    = 2;
+    string                         detail    = 3;
+    string                         username  = 4;
+    google.protobuf.Timestamp      timestamp = 5;
+}
+
+message StoragePool {
+    string name        = 1;
+    string driver      = 2; // "local" | "nfs" | "ceph" | "iscsi"
+    string source      = 3; // driver-specific (NFS: "server:/path", Ceph: pool name, iSCSI: IQN)
+    string target      = 4; // local mount/directory path
+    string host        = 5; // host this pool is on
+    int64  total_gib   = 6;
+    int64  used_gib    = 7;
+    string state       = 8; // "active" | "error" | "unmounted"
+    int64  total_bytes = 9;
+    int64  used_bytes  = 10;
+}

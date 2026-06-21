@@ -1,0 +1,31 @@
+<div class="modal-overlay" id="project-create-modal">
+  <div class="modal" style="max-width:520px">
+    <h3>Create project</h3>
+    <p style="color:var(--muted);font-size:13px;margin-top:0">
+      Names are hierarchical paths, e.g. <code>/acme/team-foo</code>. Pick a parent to
+      nest. Same as <code>lv project create</code>.
+    </p>
+    <form hx-post="/ui/projects" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('project-create-modal').remove()">
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" placeholder="/acme/team-foo" required>
+      </div>
+      <div class="form-row">
+        <label>Display</label>
+        <input type="text" name="display" placeholder="human-readable label (optional)">
+      </div>
+      <div class="form-row">
+        <label>Parent</label>
+        <select name="parent">
+          <option value="">(none)</option>
+          {{range .Parents}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('project-create-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>

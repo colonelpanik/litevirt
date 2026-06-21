@@ -1,0 +1,24 @@
+Sync {
+    Mode FTFW {}
+    UDP {
+        IPv4_address 10.0.100.2
+        IPv4_Destination_Address 10.0.100.3
+        Port 3780
+        Interface eth0
+    }
+}
+
+General {
+    Nice -20
+    HashSize 32768
+    HashLimit 131072
+    Syslog on
+    LockFile /var/lock/conntrack-egress.lock
+    UNIX { Path /var/run/conntrackd-egress.ctl }
+    NetlinkBufferSize 2097152
+    NetlinkBufferSizeMaxGrowth 8388608
+    Filter From Userspace {
+        Protocol Accept { TCP UDP }
+        Address Accept { IPv4_address 10.99.0.0/24 }
+    }
+}

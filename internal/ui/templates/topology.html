@@ -1,0 +1,36 @@
+{{define "content"}}
+<h1>Network Topology</h1>
+
+{{if .Networks}}
+{{range .Networks}}
+<div class="section" style="margin-bottom:16px">
+  <div class="section-header" style="display:flex;align-items:center;gap:8px">
+    <h2 style="margin:0">{{.Name}}</h2>
+    {{if eq .Type "bridge"}}<span class="badge badge-blue">bridge</span>
+    {{else if eq .Type "vxlan"}}<span class="badge" style="background:var(--purple,#8b5cf6);color:#fff">vxlan</span>
+    {{else if eq .Type "isolated"}}<span class="badge badge-green">isolated</span>
+    {{else if eq .Type "sriov"}}<span class="badge" style="background:var(--orange,#f97316);color:#fff">sriov</span>
+    {{else}}<span class="badge badge-gray">{{.Type}}</span>
+    {{end}}
+    {{if .Subnet}}<span style="font-size:12px;color:var(--muted)">{{.Subnet}}</span>{{end}}
+    {{if .Gateway}}<span style="font-size:12px;color:var(--muted)">gw: {{.Gateway}}</span>{{end}}
+    {{if .VNI}}<span style="font-size:12px;color:var(--muted)">VNI: {{.VNI}}</span>{{end}}
+  </div>
+  {{if .VMs}}
+  <div style="display:flex;flex-wrap:wrap;gap:8px;padding:12px">
+    {{range .VMs}}
+    <a href="/vms/{{.Name}}" style="display:flex;flex-direction:column;align-items:center;padding:8px 12px;border:1px solid var(--border);border-radius:6px;text-decoration:none;color:var(--text);font-size:13px;min-width:100px">
+      <span style="font-weight:600">{{.Name}}</span>
+      {{if .IP}}<span style="font-size:11px;color:var(--muted)">{{.IP}}</span>{{end}}
+    </a>
+    {{end}}
+  </div>
+  {{else}}
+  <p style="padding:12px;color:var(--muted);font-size:13px">No VMs connected</p>
+  {{end}}
+</div>
+{{end}}
+{{else}}
+<p style="color:var(--muted);padding:12px">No networks configured</p>
+{{end}}
+{{end}}

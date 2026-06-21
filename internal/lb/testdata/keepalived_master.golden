@@ -1,0 +1,34 @@
+
+global_defs {
+    enable_script_security
+    script_user root
+}
+
+vrrp_script chk_haproxy {
+    script "/usr/bin/pgrep -f app-haproxy.cfg"
+    interval 2
+    weight 2
+    rise 2
+    fall 3
+}
+
+vrrp_instance app {
+    state MASTER
+    interface eth0
+    virtual_router_id 42
+    priority 100
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass a98f49f2
+    }
+
+    virtual_ipaddress {
+        10.0.100.100/24
+    }
+
+    track_script {
+        chk_haproxy
+    }
+}

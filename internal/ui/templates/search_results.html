@@ -1,0 +1,64 @@
+{{if eq .Total 0}}
+<div style="padding:12px;color:var(--muted);font-size:13px">No results for "{{.Query}}"</div>
+{{else}}
+<div style="padding:8px 0">
+{{if .VMs}}
+<div style="padding:4px 12px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px">VMs</div>
+{{range .VMs}}
+<a href="/vms/{{.Name}}" class="search-result">
+  <span>{{.Name}}</span>
+  <span class="badge {{if eq .State.String "VM_RUNNING"}}badge-success{{else}}badge-gray{{end}}" style="font-size:10px">{{.State}}</span>
+  <span style="color:var(--muted);font-size:12px;margin-left:auto">{{.HostName}}</span>
+</a>
+{{end}}
+{{end}}
+
+{{if .Hosts}}
+<div style="padding:4px 12px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Hosts</div>
+{{range .Hosts}}
+<a href="/hosts/{{.Name}}" class="search-result">
+  <span>{{.Name}}</span>
+  <span style="color:var(--muted);font-size:12px;margin-left:auto">{{.Address}}</span>
+</a>
+{{end}}
+{{end}}
+
+{{if .Networks}}
+<div style="padding:4px 12px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Networks</div>
+{{range .Networks}}
+<a href="/networks" class="search-result">
+  <span>{{.Name}}</span>
+  <span class="badge" style="font-size:10px">{{.Type}}</span>
+</a>
+{{end}}
+{{end}}
+
+{{if .Stacks}}
+<div style="padding:4px 12px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Stacks</div>
+{{range .Stacks}}
+<a href="/stacks/{{.Name}}" class="search-result">
+  <span>{{.Name}}</span>
+  <span style="color:var(--muted);font-size:12px;margin-left:auto">{{.VmCount}} VMs</span>
+</a>
+{{end}}
+{{end}}
+
+{{if .Images}}
+<div style="padding:4px 12px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Images</div>
+{{range .Images}}
+<a href="/images" class="search-result">
+  <span>{{.Name}}</span>
+</a>
+{{end}}
+{{end}}
+
+{{if .LBs}}
+<div style="padding:4px 12px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Load Balancers</div>
+{{range .LBs}}
+<a href="/lb/{{.Name}}" class="search-result">
+  <span>{{.Name}}</span>
+</a>
+{{end}}
+{{end}}
+</div>
+{{end}}

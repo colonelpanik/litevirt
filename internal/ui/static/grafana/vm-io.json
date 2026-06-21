@@ -1,0 +1,50 @@
+{
+  "description": "Per-VM disk and network IO. Plan §2.4 bundled dashboard.",
+  "editable": true,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Disk read bytes/s",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "rate(litevirt_vm_disk_read_bytes_total[1m])", "legendFormat": "{{vm}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Disk write bytes/s",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "rate(litevirt_vm_disk_write_bytes_total[1m])", "legendFormat": "{{vm}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Disk read IOPS",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "rate(litevirt_vm_disk_read_ops_total[1m])", "legendFormat": "{{vm}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Disk write IOPS",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"expr": "rate(litevirt_vm_disk_write_ops_total[1m])", "legendFormat": "{{vm}}"}
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["litevirt", "vm", "io"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "litevirt — VM Disk IO",
+  "uid": "litevirt-vm-io",
+  "version": 1
+}

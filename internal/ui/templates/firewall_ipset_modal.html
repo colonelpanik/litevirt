@@ -1,0 +1,20 @@
+<div class="modal-overlay" id="fw-ipset-modal">
+  <div class="modal" style="max-width:520px">
+    <h3>Create ip set</h3>
+    <form hx-post="/ui/firewall/ipsets" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('fw-ipset-modal').remove()">
+      <div class="form-row">
+        <label>Name (referenced as @name)</label>
+        <input type="text" name="name" placeholder="trusted-admins" required>
+      </div>
+      <div class="form-row">
+        <label>CIDRs (comma- or newline-separated)</label>
+        <textarea name="cidrs" rows="4" placeholder="10.0.0.0/24, 192.168.1.0/24"></textarea>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('fw-ipset-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>

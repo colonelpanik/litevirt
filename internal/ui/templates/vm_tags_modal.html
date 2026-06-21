@@ -1,0 +1,15 @@
+<div class="modal-overlay" id="tags-modal" onclick="if(event.target===this)this.remove()">
+  <div class="modal" style="max-width:480px">
+    <h3>Edit tags — {{.Name}}</h3>
+    <form hx-post="/ui/vms/{{.Name}}/tags" hx-swap="none">
+      <div class="form-row">
+        <label>Tags <span style="color:var(--muted)">(comma-separated; <code>key=value</code> or bare <code>key</code>)</span></label>
+        <input type="text" name="tags" value="{{.Tags}}" autofocus placeholder="env=prod, team=infra, gpu" style="width:100%">
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('tags-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save tags</button>
+      </div>
+    </form>
+  </div>
+</div>

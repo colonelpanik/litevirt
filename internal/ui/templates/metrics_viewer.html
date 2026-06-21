@@ -1,0 +1,38 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <h2>Metrics viewer</h2>
+    <p class="muted">
+      Live scrape of the local Prometheus exporter
+      <code>:7444/metrics</code> — embedded dashboard so
+      Prometheus + Grafana are optional, not required.
+      Scraped at <span class="mono">{{.ScrapedAt}}</span>.
+    </p>
+  </div>
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+  {{range .Families}}
+  <details class="metric-family">
+    <summary>
+      <code>{{.Name}}</code>
+      {{if .Type}}<span class="badge">{{.Type}}</span>{{end}}
+      <span class="muted" style="margin-left:8px">{{.Help}}</span>
+    </summary>
+    {{if .Samples}}
+    <table class="table">
+      <thead><tr><th style="width:70%">Labels</th><th>Value</th></tr></thead>
+      <tbody>
+      {{range .Samples}}
+        <tr>
+          <td class="mono">{{if .Labels}}{{.Labels}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="mono">{{.Value}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <p class="muted">No samples.</p>
+    {{end}}
+  </details>
+  {{end}}
+</div>
+{{end}}

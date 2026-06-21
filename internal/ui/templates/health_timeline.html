@@ -1,0 +1,86 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <h1>Cluster Health</h1>
+  <span style="color:var(--muted);font-size:13px">Auto-refresh every 5s</span>
+</div>
+
+<div id="health-matrix" hx-get="/ui/health-partial" hx-trigger="every 5s" hx-swap="outerHTML">
+  {{template "health-matrix" .}}
+</div>
+
+<!-- Timeline -->
+<div class="section" style="margin-top:20px">
+  <div class="section-header"><h2>Recent Events</h2></div>
+  {{range .Events}}
+  <div style="padding:6px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px;align-items:center">
+    <span style="font-family:monospace;font-size:11px;color:var(--muted);min-width:140px">{{.Timestamp}}</span>
+    <span class="badge" style="font-size:10px">{{.Action}}</span>
+    <span>{{.Target}}</span>
+    <span style="color:var(--muted);font-size:12px;margin-left:auto">{{.Detail}}</span>
+    {{if .Username}}<span style="font-size:11px;color:var(--muted)">by {{.Username}}</span>{{end}}
+  </div>
+  {{else}}
+  <p style="padding:12px;color:var(--muted);font-size:13px">No recent events</p>
+  {{end}}
+</div>
+{{end}}
+
+{{define "health-matrix"}}
+<div id="health-matrix" hx-get="/ui/health-partial" hx-trigger="every 5s" hx-swap="outerHTML">
+<!-- Health Matrix -->
+<div class="section" style="margin-bottom:20px">
+  <div class="section-header"><h2>Host Health Matrix</h2></div>
+  {{if .HostNames}}
+  <div style="overflow-x:auto">
+    <table style="font-size:13px">
+      <thead>
+        <tr>
+          <th>Observer ↓ / Target →</th>
+          {{range .HostNames}}<th>{{.}}</th>{{end}}
+        </tr>
+      </thead>
+      <tbody>
+        {{$matrix := .Matrix}}
+        {{range $obs := $.HostNames}}
+        <tr>
+          <td><strong>{{$obs}}</strong></td>
+          {{range $tgt := $.HostNames}}
+          <td style="text-align:center">
+            {{if eq $obs $tgt}}
+            <span style="color:var(--muted)">—</span>
+            {{else}}
+            {{$status := index (index $matrix $obs) $tgt}}
+            {{if eq $status "healthy"}}
+            <span style="color:var(--green)">●</span>
+            {{else if eq $status "suspect"}}
+            <span style="color:var(--yellow)">●</span>
+            {{else}}
+            <span style="color:var(--red)">●</span>
+            {{end}}
+            {{end}}
+          </td>
+          {{end}}
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <p style="padding:12px;color:var(--muted);font-size:13px">No health data available</p>
+  {{end}}
+</div>
+
+<!-- Alerts -->
+<div class="section">
+  <div class="section-header"><h2>Active Alerts</h2></div>
+  {{range .Alerts}}
+  <div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px;align-items:center">
+    <span class="badge {{if eq .Level "critical"}}badge-error{{else if eq .Level "warning"}}badge-warning{{else}}badge-info{{end}}" style="font-size:10px">{{.Level}}</span>
+    <span>{{.Message}}</span>
+  </div>
+  {{else}}
+  <p style="padding:12px;color:var(--muted);font-size:13px">No active alerts</p>
+  {{end}}
+</div>
+</div>
+{{end}}

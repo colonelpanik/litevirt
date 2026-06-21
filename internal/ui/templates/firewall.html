@@ -1,0 +1,111 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Firewall</h2>
+      <p class="muted">Cluster &amp; host rule tiers, ip sets, and the default policy. Per-NIC rules live under <a href="/security-groups">Security Groups</a>. Changes propagate cluster-wide; each host reloads within ~30s.</p>
+    </div>
+  </div>
+  {{template "alert_error" .Error}}
+
+  <div class="section">
+    <div class="section-header">
+      <div>
+        <h2 style="text-transform:none;color:var(--text);font-size:14px">Default policy (cluster)</h2>
+        <span class="muted" style="font-size:11px">Applies to new connections on every NIC. Reply traffic is always allowed.</span>
+      </div>
+      <div class="actions">
+        {{if .DefaultDeny}}
+          <span class="badge badge-red">default-deny</span>
+          <form hx-post="/ui/firewall/default-deny" style="display:inline">
+            <input type="hidden" name="deny" value="off">
+            <button class="btn btn-sm" hx-confirm="Switch the cluster default to ACCEPT? Anything not explicitly dropped will be allowed.">Set to accept</button>
+          </form>
+        {{else}}
+          <span class="badge badge-green">default-accept</span>
+          <form hx-post="/ui/firewall/default-deny" style="display:inline">
+            <input type="hidden" name="deny" value="on">
+            <button class="btn btn-sm btn-danger" hx-confirm="Switch the cluster default to DENY? Anything not explicitly accepted (by a cluster/host/SG rule) will be dropped. Make sure your accept rules are in place first.">Set to deny</button>
+          </form>
+        {{end}}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <div>
+        <h2 style="text-transform:none;color:var(--text);font-size:14px">Cluster rules</h2>
+        <span class="muted" style="font-size:11px">Apply to every NIC on every host (cluster_default chain).</span>
+      </div>
+      <button class="btn btn-sm" hx-get="/ui/firewall/cluster-rule-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Rule</button>
+    </div>
+    <div style="padding:8px 16px">
+      {{if not .ClusterRules}}<span class="muted">No cluster rules.</span>{{end}}
+      {{range .ClusterRules}}
+        <div class="rule-line">
+          <span class="badge {{if eq .Direction "ingress"}}badge-blue{{else}}badge-purple{{end}}">{{.Direction}}</span>
+          <span class="badge badge-gray">{{.Proto}}</span>
+          {{if .PortRange}}<span class="mono">:{{.PortRange}}</span>{{end}}
+          <span class="mono muted">{{if .CIDR}}{{.CIDR}}{{else}}any{{end}}</span>
+          <span>→</span>
+          <span class="badge {{if eq .Action "accept"}}badge-green{{else}}badge-red{{end}}">{{.Action}}</span>
+          {{if .Comment}}<span class="muted" style="font-size:11px">{{.Comment}}</span>{{end}}
+          {{if .StackName}}<span class="badge badge-gray" title="from compose stack">stack {{.StackName}}</span>{{end}}
+          <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove rule"
+                  hx-delete="/ui/firewall/cluster-rules/{{.ID}}" hx-confirm="Remove this cluster rule?">{{icon "delete"}}</button>
+        </div>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <div>
+        <h2 style="text-transform:none;color:var(--text);font-size:14px">Host rules</h2>
+        <span class="muted" style="font-size:11px">Apply to every NIC on one host (host_overrides chain).</span>
+      </div>
+      <button class="btn btn-sm" hx-get="/ui/firewall/host-rule-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Rule</button>
+    </div>
+    <div style="padding:8px 16px">
+      {{if not .HostRules}}<span class="muted">No host rules.</span>{{end}}
+      {{range .HostRules}}
+        <div class="rule-line">
+          <span class="badge badge-gray" title="host">{{.HostName}}</span>
+          <span class="badge {{if eq .Direction "ingress"}}badge-blue{{else}}badge-purple{{end}}">{{.Direction}}</span>
+          <span class="badge badge-gray">{{.Proto}}</span>
+          {{if .PortRange}}<span class="mono">:{{.PortRange}}</span>{{end}}
+          <span class="mono muted">{{if .CIDR}}{{.CIDR}}{{else}}any{{end}}</span>
+          <span>→</span>
+          <span class="badge {{if eq .Action "accept"}}badge-green{{else}}badge-red{{end}}">{{.Action}}</span>
+          {{if .Comment}}<span class="muted" style="font-size:11px">{{.Comment}}</span>{{end}}
+          <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove rule"
+                  hx-delete="/ui/firewall/host-rules/{{.ID}}" hx-confirm="Remove this host rule?">{{icon "delete"}}</button>
+        </div>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <div>
+        <h2 style="text-transform:none;color:var(--text);font-size:14px">IP sets</h2>
+        <span class="muted" style="font-size:11px">Named CIDR lists. Reference one in any rule with <span class="mono">cidr = @name</span>.</span>
+      </div>
+      <button class="btn btn-sm" hx-get="/ui/firewall/ipset-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} IP set</button>
+    </div>
+    <div style="padding:8px 16px">
+      {{if not .IPSets}}<span class="muted">No ip sets.</span>{{end}}
+      {{range .IPSets}}
+        <div class="rule-line">
+          <span class="mono">@{{.Name}}</span>
+          <span class="mono muted">{{range $i, $c := .CIDRs}}{{if $i}}, {{end}}{{$c}}{{end}}</span>
+          {{if .StackName}}<span class="badge badge-gray" title="from compose stack">stack {{.StackName}}</span>{{end}}
+          <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove ip set"
+                  hx-delete="/ui/firewall/ipsets/{{.ID}}" hx-confirm="Remove ip set {{.Name}}?">{{icon "delete"}}</button>
+        </div>
+      {{end}}
+    </div>
+  </div>
+</div>
+{{end}}

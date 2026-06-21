@@ -1,0 +1,150 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <h2>Account · Two-factor authentication</h2>
+    <p class="muted">
+      Manage the second factors used to authenticate this session.
+      TOTP (authenticator app) and WebAuthn (hardware security key /
+      platform authenticator) are supported.
+    </p>
+  </div>
+
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+
+  <h3>Enrolled factors</h3>
+  {{if .Factors}}
+  <table class="table">
+    <thead>
+      <tr><th>Method</th><th>Label</th><th>Enrolled</th><th>Last used</th></tr>
+    </thead>
+    <tbody>
+    {{range .Factors}}
+      <tr>
+        <td>{{.Method}}</td>
+        <td class="mono">{{if .Label}}{{.Label}}{{else}}<span class="muted">(no label)</span>{{end}}</td>
+        <td class="muted">{{.EnrolledAt}}</td>
+        <td class="muted">{{if .LastUsedAt}}{{.LastUsedAt}}{{else}}—{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">No second factors enrolled. WebAuthn registration below; for TOTP run <code>lv 2fa enroll</code>.</div>
+  {{end}}
+
+  <h3 style="margin-top:24px">Register a WebAuthn security key</h3>
+  <p class="muted">
+    Touch your security key when prompted, or use your platform
+    authenticator (Touch ID / Windows Hello / etc.) if the daemon's
+    RP configuration permits it.
+  </p>
+  <button class="btn no-loading" id="webauthn-register-btn"
+          onclick="registerWebAuthn()">Register security key</button>
+  <p id="webauthn-status" class="muted" style="margin-top:12px"></p>
+
+  {{if .CanChangePassword}}
+  <h3 style="margin-top:32px">Change password</h3>
+  {{if .PwSuccess}}<div class="ok">{{.PwSuccess}}</div>{{end}}
+  {{if .PwError}}<div class="error">{{.PwError}}</div>{{end}}
+  <form method="POST" action="/account/password" style="max-width:380px">
+    <div class="form-group">
+      <label for="old_password">Current password</label>
+      <input type="password" id="old_password" name="old_password" required autocomplete="current-password">
+    </div>
+    <div class="form-group">
+      <label for="new_password">New password</label>
+      <input type="password" id="new_password" name="new_password" required autocomplete="new-password" minlength="8">
+    </div>
+    <div class="form-group">
+      <label for="confirm_password">Confirm new password</label>
+      <input type="password" id="confirm_password" name="confirm_password" required autocomplete="new-password" minlength="8">
+    </div>
+    <div class="form-actions">
+      <button class="btn" type="submit">Change password</button>
+    </div>
+  </form>
+  {{else}}
+  <h3 style="margin-top:32px">Change password</h3>
+  <p class="muted">
+    Your account is managed by an external realm{{if .Realm}} (<code>{{.Realm}}</code>){{end}}.
+    Change your password at your identity provider.
+  </p>
+  {{end}}
+</div>
+
+<script>
+// WebAuthn registration dance. All option/attestation
+// blobs round-trip through the daemon as opaque bytes so go-webauthn
+// is the single point of conformance.
+async function registerWebAuthn() {
+  const btn = document.getElementById('webauthn-register-btn');
+  const out = document.getElementById('webauthn-status');
+  btn.disabled = true;
+  out.textContent = 'Asking the daemon for a challenge…';
+  try {
+    const beginRes = await fetch('/account/2fa/webauthn/begin', {method: 'POST'});
+    if (!beginRes.ok) {
+      const err = await beginRes.json().catch(() => ({error: beginRes.statusText}));
+      throw new Error('begin: ' + (err.error || beginRes.statusText));
+    }
+    const opts = await beginRes.json();
+
+    // go-webauthn returns the challenge already base64-encoded. The
+    // browser API needs ArrayBuffer for challenge + user.id +
+    // excludeCredentials.id, so we hop through the standard decoder.
+    opts.publicKey.challenge = b64urlToBuf(opts.publicKey.challenge);
+    opts.publicKey.user.id = b64urlToBuf(opts.publicKey.user.id);
+    if (opts.publicKey.excludeCredentials) {
+      for (const c of opts.publicKey.excludeCredentials) {
+        c.id = b64urlToBuf(c.id);
+      }
+    }
+
+    out.textContent = 'Touch your security key…';
+    const cred = await navigator.credentials.create({publicKey: opts.publicKey});
+    if (!cred) throw new Error('navigator.credentials.create returned null');
+
+    const attestation = {
+      id: cred.id,
+      rawId: bufToB64url(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+        attestationObject: bufToB64url(cred.response.attestationObject),
+      },
+    };
+
+    const finishRes = await fetch('/account/2fa/webauthn/finish', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(attestation),
+    });
+    const finishBody = await finishRes.json().catch(() => ({}));
+    if (!finishRes.ok || !finishBody.ok) {
+      throw new Error('finish: ' + (finishBody.error || finishRes.statusText));
+    }
+    out.textContent = '✅ Security key registered (' + finishBody.credential_label + '). Reload to see it in the list.';
+    setTimeout(() => location.reload(), 1500);
+  } catch (e) {
+    out.textContent = '❌ ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+function b64urlToBuf(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = s.length % 4 ? '='.repeat(4 - (s.length % 4)) : '';
+  const raw = atob(s + pad);
+  const buf = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+  return buf.buffer;
+}
+
+function bufToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+</script>
+{{end}}

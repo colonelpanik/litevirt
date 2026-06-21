@@ -1,0 +1,63 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build outputs
+dist/
+*.tar.gz
+*.zip
+
+# Go
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Vendor (if used)
+vendor/
+
+# Generated protobuf — tracked but excluded from dirty-check accidents
+# gen/ is tracked; uncomment below if you want to ignore it:
+# gen/
+
+# Litevirt runtime files
+/var/lib/litevirt/
+state.db
+state.db-wal
+state.db-shm
+
+# PKI / secrets — never commit private keys
+*.key
+*.pem
+*.p12
+
+# Config with potential secrets
+/etc/litevirt/
+config.local.yaml
+
+# Downloaded JS vendor libs (fetched by `make vendor-js`)
+internal/ui/static/vendor/uplot/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+testdata/tmp/
+
+# golangci-lint cache
+.golangci-lint-cache/
+
+# Air (live reload)
+.air.toml
+tmp/
+/litevirt

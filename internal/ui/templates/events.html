@@ -1,0 +1,102 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div>
+    <h1>Events</h1>
+    <p class="muted" style="margin:0">Cluster-wide operation history — newest first, live</p>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <span class="badge badge-green" id="evt-live">{{icon "check"}} live</span>
+    <a class="btn btn-sm" href="/audit">Audit log →</a>
+  </div>
+</div>
+{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+
+<div class="section">
+  <div class="section-header">
+    <h2>Events (<span id="evt-count">{{len .Events}}</span>)</h2>
+    <input type="text" class="search-input" placeholder="Filter…" data-table-filter="events-table">
+  </div>
+  <table id="events-table">
+    <thead><tr>
+      <th>When</th><th>Event</th><th>VM</th><th>Host</th><th>Result</th><th>User</th><th>Detail</th>
+    </tr></thead>
+    <tbody id="events-body">
+    {{range .Events}}
+    <tr>
+      <td style="white-space:nowrap" title="{{.Ts}}">{{relTime .Ts}}</td>
+      <td>
+        {{if eq .Result "error"}}{{icon "alert"}}{{else if hasPrefix .Type "backup"}}{{icon "backup"}}{{else if hasPrefix .Type "snapshot"}}{{icon "snapshot"}}{{else if hasPrefix .Type "migrate"}}{{icon "migrate"}}{{else}}{{icon "vm"}}{{end}}
+        <span class="mono">{{.Type}}</span>
+      </td>
+      <td>{{if .VmName}}<a href="/vms/{{.VmName}}">{{.VmName}}</a>{{else}}<span class="muted">—</span>{{end}}</td>
+      <td class="muted" style="font-size:11px">{{.HostName}}</td>
+      <td>{{if eq .Result "error"}}<span class="badge badge-red">error</span>{{else}}<span class="badge badge-green">ok</span>{{end}}</td>
+      <td class="muted" style="font-size:11px">{{if .Username}}{{.Username}}{{else}}—{{end}}</td>
+      <td class="muted" style="font-size:11px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{.Detail}}">{{.Detail}}</td>
+    </tr>
+    {{else}}<tr id="events-empty"><td colspan="7" class="empty">No events recorded yet.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+
+<script>
+(function() {
+  // Live tail: prepend new events streamed over SSE into the same table the
+  // server seeded with recent history. The stream's watermark starts at
+  // connection time, so live rows are newer than the seed — no duplicates.
+  var TYPES = ['vm.created','vm.started','vm.stopped','vm.restarted','vm.deleted','vm.migrated','vm.error',
+               'backup.completed','backup.failed','snapshot.created','disk.replicated',
+               'host.joined','host.fenced','host.suspect','stack.deployed','stack.deleted'];
+  function relTime(iso) {
+    var t = Date.parse(iso); if (isNaN(t)) return iso || '';
+    var s = Math.max(0, (Date.now() - t) / 1000);
+    if (s < 45) return 'just now';
+    if (s < 5400) return Math.round(s/60) + 'm ago';
+    if (s < 86400) return Math.round(s/3600) + 'h ago';
+    return Math.round(s/86400) + 'd ago';
+  }
+  function isErr(type) { return /error|fail|fenced|suspect/.test(type); }
+  function evtIcon(type) {
+    if (isErr(type)) return 'alert';
+    if (type.indexOf('backup') === 0) return 'backup';
+    if (type.indexOf('snapshot') === 0) return 'snapshot';
+    if (type.indexOf('migrate') === 0 || type === 'vm.migrated') return 'migrate';
+    return 'vm';
+  }
+  function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+
+  var countEl = document.getElementById('evt-count');
+  function add(data, type) {
+    var body = document.getElementById('events-body');
+    if (!body) return;
+    var empty = document.getElementById('events-empty'); if (empty) empty.remove();
+    var t = data.type || type;
+    var ts = data.timestamp || new Date().toISOString();
+    var err = isErr(t);
+    var tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td style="white-space:nowrap" title="' + esc(ts) + '">' + esc(relTime(ts)) + '</td>' +
+      '<td><svg class="icon" aria-hidden="true"><use href="#i-' + evtIcon(t) + '"></use></svg> ' +
+        '<span class="mono">' + esc(t) + '</span></td>' +
+      '<td>' + (data.target ? '<a href="/vms/' + esc(data.target) + '">' + esc(data.target) + '</a>' : '<span class="muted">—</span>') + '</td>' +
+      '<td class="muted" style="font-size:11px">' + esc(data.host || '') + '</td>' +
+      '<td>' + (err ? '<span class="badge badge-red">error</span>' : '<span class="badge badge-green">ok</span>') + '</td>' +
+      '<td class="muted" style="font-size:11px">' + esc(data.username || '—') + '</td>' +
+      '<td class="muted" style="font-size:11px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(data.detail || '') + '">' + esc(data.detail || '') + '</td>';
+    body.insertBefore(tr, body.firstChild);
+    if (countEl) countEl.textContent = body.querySelectorAll('tr').length;
+    while (body.children.length > 400) body.removeChild(body.lastChild);
+  }
+
+  var evtSource = new EventSource('/ui/events/stream');
+  evtSource.onerror = function() { var b = document.getElementById('evt-live'); if (b) { b.className = 'badge badge-red'; b.textContent = 'disconnected'; } };
+  TYPES.forEach(function(type) {
+    evtSource.addEventListener(type, function(e) {
+      var data; try { data = JSON.parse(e.data); } catch (_) { return; }
+      add(data, type);
+    });
+  });
+})();
+</script>
+{{end}}

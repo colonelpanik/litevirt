@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<domain type="kvm">
+  <name>vm-bios</name>
+  <memory unit="KiB">4194304</memory>
+  <vcpu>4</vcpu>
+  <os>
+    <type arch="x86_64" machine="q35">hvm</type>
+    <boot dev="disk"></boot>
+  </os>
+  <features>
+    <acpi></acpi>
+    <apic></apic>
+  </features>
+  <clock offset="utc"></clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" cache="none"></driver>
+      <source file="/data/vm-bios/root.qcow2"></source>
+      <target dev="vda" bus="virtio"></target>
+    </disk>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" cache="writeback"></driver>
+      <source file="/data/vm-bios/data.qcow2"></source>
+      <target dev="sdb" bus="scsi"></target>
+    </disk>
+    <interface type="bridge">
+      <mac address="52:54:00:aa:bb:cc"></mac>
+      <source bridge="br-prod"></source>
+      <model type="virtio"></model>
+    </interface>
+    <serial type="pty">
+      <target type="isa-serial" port="0"></target>
+    </serial>
+    <console type="pty">
+      <target type="serial" port="0"></target>
+    </console>
+    <graphics type="vnc" port="-1" autoport="yes">
+      <listen type="address" address="127.0.0.1"></listen>
+    </graphics>
+    <video>
+      <model type="virtio"></model>
+    </video>
+    <memballoon model="virtio"></memballoon>
+  </devices>
+</domain>

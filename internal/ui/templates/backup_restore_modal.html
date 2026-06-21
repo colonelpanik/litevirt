@@ -1,0 +1,82 @@
+<div class="modal-overlay" id="restore-modal" onclick="this.remove()">
+  <div class="modal" style="max-width:500px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Restore VM from Backup</h3>
+      <button class="btn" onclick="document.getElementById('restore-modal').remove()">Close</button>
+    </div>
+    <form id="restore-form" enctype="multipart/form-data">
+      <div class="form-row">
+        <label>VM Name</label>
+        <input type="text" name="name" placeholder="restored-vm" required>
+      </div>
+      <div class="form-row">
+        <label>CPU</label>
+        <input type="number" name="cpu" value="1" min="1" style="width:80px">
+      </div>
+      <div class="form-row">
+        <label>Memory (MiB)</label>
+        <input type="number" name="memory_mib" value="512" min="128" step="128" style="width:120px">
+      </div>
+      <div class="form-row">
+        <label>Network</label>
+        <select name="network">
+          <option value="">None</option>
+          {{range .Networks}}
+          <option value="{{.Name}}">{{.Name}} ({{.Type}}{{if .Subnet}} — {{.Subnet}}{{end}})</option>
+          {{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Backup File</label>
+        <input type="file" name="backup_file" required>
+      </div>
+      <div id="restore-progress" style="display:none;margin-bottom:12px">
+        <div style="background:var(--border);border-radius:4px;height:6px;overflow:hidden">
+          <div id="restore-bar" style="height:100%;background:var(--blue);width:0%;transition:width 0.3s"></div>
+        </div>
+        <span id="restore-pct" style="font-size:12px;color:var(--muted)">0%</span>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Restore</button>
+      </div>
+    </form>
+    <script>
+    document.getElementById('restore-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var form = e.target;
+      var data = new FormData(form);
+      var btn = form.querySelector('button[type=submit]');
+      btn.disabled = true;
+      btn.textContent = 'Restoring\u2026';
+      var prog = document.getElementById('restore-progress');
+      prog.style.display = 'block';
+      var xhr = new XMLHttpRequest();
+      xhr.upload.addEventListener('progress', function(ev) {
+        if (ev.lengthComputable) {
+          var pct = Math.round(ev.loaded / ev.total * 100);
+          document.getElementById('restore-bar').style.width = pct + '%';
+          document.getElementById('restore-pct').textContent = pct + '%';
+        }
+      });
+      xhr.addEventListener('load', function() {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          var redir = xhr.getResponseHeader('HX-Redirect');
+          if (redir) window.location.href = redir;
+          else document.getElementById('restore-modal').remove();
+        } else {
+          alert('Restore failed: ' + xhr.responseText);
+          btn.disabled = false;
+          btn.textContent = 'Restore';
+        }
+      });
+      xhr.addEventListener('error', function() {
+        alert('Restore request failed');
+        btn.disabled = false;
+        btn.textContent = 'Restore';
+      });
+      xhr.open('POST', '/ui/vms/restore');
+      xhr.send(data);
+    });
+    </script>
+  </div>
+</div>

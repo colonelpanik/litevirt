@@ -1,0 +1,72 @@
+<div class="modal-overlay" id="repl-modal" onclick="if(event.target===this)this.remove()">
+  <div class="modal" style="max-width:520px">
+    <h3>Add replication schedule</h3>
+    <form hx-post="/ui/schedules/repl" hx-swap="none">
+      <div class="form-row">
+        <label>Scope</label>
+        <select name="scope" onchange="replScope(this.value)" style="width:100%">
+          <option value="vm">Single VM</option>
+          <option value="pool">Storage pool</option>
+          <option value="project">Project</option>
+          <option value="cluster">All VMs (cluster)</option>
+        </select>
+      </div>
+      <div class="form-row" id="repl-vm">
+        <label>VM</label>
+        <select name="vm_name" style="width:100%">{{range .VMs}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+      </div>
+      <div class="form-row" id="repl-pool" style="display:none">
+        <label>Source pool</label>
+        <select name="pool_name" style="width:100%">{{range .Pools}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+      </div>
+      <div class="form-row" id="repl-project" style="display:none">
+        <label>Project</label>
+        <select name="project_name" style="width:100%">{{range .Projects}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+      </div>
+      <div class="grid-2" style="gap:12px">
+        <div class="form-row">
+          <label>Target pool</label>
+          <select name="target_pool" style="width:100%" required>
+            <option value="">Select…</option>
+            {{range .Pools}}<option value="{{.}}">{{.}}</option>{{end}}
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Target host <span style="color:var(--muted)">(optional)</span></label>
+          <input type="text" name="target_host" placeholder="auto / shared">
+        </div>
+      </div>
+      <div class="grid-2" style="gap:12px">
+        <div class="form-row">
+          <label>Cron <span style="color:var(--muted)">(min hr dom mon dow)</span></label>
+          <input type="text" name="cron" value="0 * * * *" required>
+        </div>
+        <div class="form-row">
+          <label>Keep replicas <span style="color:var(--muted)">(0 = all)</span></label>
+          <input type="number" name="keep_replicas" value="3" min="0">
+        </div>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="enabled" checked> Enabled</label>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="incremental"> Incremental <span style="color:var(--muted)">(transfer only changed extents; raw replicas)</span></label>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="auto_promote"> Auto-promote on host failure <span style="color:var(--muted)">(failover brings up the freshest replica)</span></label>
+      </div>
+      <p class="muted" style="font-size:12px">Replication is crash-consistent — a fast-recovery layer, not a backup. For cross-host DR use a shared target pool (nfs/ceph) or set a target host.</p>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('repl-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+function replScope(v){
+  document.getElementById('repl-vm').style.display = v==='vm' ? '' : 'none';
+  document.getElementById('repl-pool').style.display = v==='pool' ? '' : 'none';
+  document.getElementById('repl-project').style.display = v==='project' ? '' : 'none';
+}
+</script>

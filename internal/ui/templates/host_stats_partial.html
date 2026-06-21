@@ -1,0 +1,45 @@
+<div id="host-stats" hx-get="/ui/hosts/{{.HostName}}/stats" hx-trigger="every 3s" hx-swap="outerHTML">
+  <div class="section">
+    <div class="section-header"><h2>Live Resource Usage</h2></div>
+    <div style="padding:16px">
+      <div class="grid-3">
+        <div class="card">
+          <div class="card-title">CPU Usage (all VMs)</div>
+          <div class="card-value">{{formatPct .CpuPct}}%</div>
+          <div class="progress-bar"><div class="progress-bar-fill" style="width:{{formatPct .CpuPct}}%;background:var(--accent)"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Memory Usage (all VMs)</div>
+          <div class="card-value">{{bytesToMiB .MemUsedBytes}}MiB</div>
+          {{if .MemTotalBytes}}<div class="card-sub">of {{bytesToMiB .MemTotalBytes}}MiB total</div>
+          <div class="progress-bar"><div class="progress-bar-fill" style="width:{{formatPct (memPctOf .MemUsedBytes .MemTotalBytes)}}%;background:var(--blue)"></div></div>{{end}}
+        </div>
+        <div class="card">
+          <div class="card-title">Disk I/O (all VMs)</div>
+          <div class="card-value" style="font-size:14px">R: {{formatBytes .DiskRdBytes}}<br>W: {{formatBytes .DiskWrBytes}}</div>
+        </div>
+      </div>
+
+      {{if .VmStats}}
+      <table style="margin-top:16px">
+        <thead><tr>
+          <th>VM</th><th>CPU %</th><th>Memory RSS</th><th>Disk Read</th><th>Disk Write</th><th>Net RX</th><th>Net TX</th>
+        </tr></thead>
+        <tbody>
+        {{range .VmStats}}
+        <tr>
+          <td><a href="/vms/{{.Name}}">{{.Name}}</a></td>
+          <td>{{formatPct .CpuPct}}%</td>
+          <td>{{bytesToMiB .MemRssBytes}}MiB</td>
+          <td>{{formatBytes .DiskRdBytes}}</td>
+          <td>{{formatBytes .DiskWrBytes}}</td>
+          <td>{{formatBytes .NetRxBytes}}</td>
+          <td>{{formatBytes .NetTxBytes}}</td>
+        </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{end}}
+    </div>
+  </div>
+</div>

@@ -1,0 +1,30 @@
+<div class="modal-overlay" id="resize-disk-modal">
+  <div class="modal">
+    <h3>Resize Disk</h3>
+    <form hx-post="/ui/vms/{{.VMName}}/resize-disk" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){location.reload()}else{document.getElementById('resize-disk-modal').remove()}">
+      <input type="hidden" name="disk_name" value="{{.DiskName}}">
+      <div class="form-row">
+        <label>VM</label>
+        <input type="text" value="{{.VMName}}" disabled>
+      </div>
+      <div class="form-row">
+        <label>Disk</label>
+        <input type="text" value="{{.DiskName}}" disabled>
+      </div>
+      <div class="form-row">
+        <label>Current Size</label>
+        <input type="text" value="{{.CurrentSize}}" disabled>
+      </div>
+      <div class="form-row">
+        <label>New Size (GiB)</label>
+        <input type="number" name="size_gib" min="1" placeholder="e.g. 40" required autofocus>
+      </div>
+      <p style="color:var(--muted);font-size:12px;margin:8px 0">Disk can only be expanded, not shrunk. Works on running VMs.</p>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('resize-disk-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Resize</button>
+      </div>
+    </form>
+  </div>
+</div>

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>litevirt — Login</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script>
+    (function() {
+      var t = localStorage.getItem('theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+  <style>
+    .login-container { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .login-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 32px; width: 360px; }
+    .login-box h1 { text-align: center; margin-bottom: 24px; font-size: 20px; }
+    .login-box .logo { text-align: center; font-size: 24px; margin-bottom: 8px; }
+    .login-error { background: rgba(239,68,68,0.15); border: 1px solid var(--red); color: var(--red); padding: 8px 12px; border-radius: 4px; font-size: 12px; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <div class="login-box">
+      <div class="logo">&#x2B21; litevirt</div>
+      <h1>Sign in</h1>
+      {{if .Error}}<div class="login-error">{{.Error}}</div>{{end}}
+      <form method="POST" action="/login">
+        <div class="form-row">
+          <label>Username</label>
+          <input type="text" name="username" required autofocus value="{{.Username}}">
+        </div>
+        <div class="form-row">
+          <label>Password</label>
+          <input type="password" name="password" required>
+        </div>
+        {{if .Realms}}
+        <div class="form-row">
+          <label>Realm</label>
+          <select name="realm">
+            {{range .Realms}}<option value="{{.}}"{{if eq . $.Realm}} selected{{end}}>{{.}}</option>{{end}}
+          </select>
+        </div>
+        {{end}}
+        {{if .Requires2FA}}
+        <div class="form-row">
+          <label>Authenticator code</label>
+          <input type="text" name="totp_code" inputmode="numeric" autocomplete="one-time-code" autofocus pattern="[0-9a-zA-Z\-]{6,9}" required>
+        </div>
+        {{end}}
+        <div class="form-actions" style="justify-content:stretch">
+          <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">{{if .Requires2FA}}Verify{{else}}Sign in{{end}}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

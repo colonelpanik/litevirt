@@ -1,0 +1,107 @@
+{{define "content"}}
+<div class="detail-header">
+  <a href="/lb" class="back">&larr; Load Balancers</a>
+  <h1>{{.LB.Name}}</h1>
+  {{if eq .LB.State "active"}}<span class="badge badge-green">active</span>{{else}}<span class="badge badge-yellow">{{.LB.State}}</span>{{end}}
+  {{if .LB.StackName}}<span class="badge" style="margin-left:8px">stack: {{.LB.StackName}}</span>{{end}}
+  <button class="btn" style="margin-left:auto" hx-get="/ui/lb/{{.LB.Name}}/edit-modal" hx-target="body" hx-swap="beforeend">Edit</button>
+</div>
+
+<div class="card-grid">
+  <div class="card">
+    <div class="card-title">VIP</div>
+    <div class="card-value card-value-sm mono">{{.LB.Vip}}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Algorithm</div>
+    <div class="card-value card-value-sm">{{.LB.Algorithm}}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Hosts</div>
+    <div class="card-value card-value-sm">{{range $i, $h := .LB.LbHosts}}{{if $i}}, {{end}}{{$h}}{{end}}</div>
+  </div>
+</div>
+
+{{if .LB.Ports}}
+<div class="section">
+  <div class="section-header"><h2>Ports</h2></div>
+  <table>
+    <thead><tr><th>Listen</th><th>Target</th><th>Protocol</th></tr></thead>
+    <tbody>
+    {{range .LB.Ports}}
+    <tr>
+      <td>{{.Listen}}</td>
+      <td>{{.Target}}</td>
+      <td>{{if .Protocol}}{{.Protocol}}{{else}}tcp{{end}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}
+
+<div class="section">
+  <div class="section-header"><h2>Backends ({{len .LB.Backends}})</h2></div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>Address</th><th>Status</th><th></th>
+    </tr></thead>
+    <tbody>
+    {{range .LB.Backends}}
+    <tr>
+      <td>{{if .VmName}}<a href="/vms/{{.VmName}}">{{.VmName}}</a>{{else}}{{.Address}}{{end}}</td>
+      <td>{{.Address}}</td>
+      <td>{{if eq .Status "active"}}<span class="badge badge-green">active</span>{{else if eq .Status "disabled"}}<span class="badge badge-yellow">disabled</span>{{else}}<span class="badge badge-red">{{.Status}}</span>{{end}}</td>
+      <td style="display:flex;gap:4px">
+        <button class="btn btn-sm" hx-post="/lb/{{$.LB.Name}}/drain"
+                hx-vals='{"backend": "{{if .VmName}}{{.VmName}}{{else}}{{.Address}}{{end}}"}'
+                hx-confirm="Drain backend {{if .VmName}}{{.VmName}}{{else}}{{.Address}}{{end}}? It stops accepting new connections.">Drain</button>
+        {{$bid := .VmName}}{{if not $bid}}{{$bid = .Address}}{{end}}
+        {{if eq .Status "disabled"}}
+        <button class="btn btn-sm" hx-post="/ui/lb/{{$.LB.Name}}/backend/{{$bid}}/enable">Enable</button>
+        {{else}}
+        <button class="btn btn-sm" hx-post="/ui/lb/{{$.LB.Name}}/backend/{{$bid}}/disable">Disable</button>
+        {{end}}
+      </td>
+    </tr>
+    {{else}}<tr><td colspan="4" class="empty">No backends</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+
+{{if .Stats}}
+<div class="section">
+  <div class="section-header"><h2>Stats</h2></div>
+  {{if .Stats.Backends}}
+  <table>
+    <thead><tr>
+      <th>Backend</th><th>Status</th><th>Sessions</th><th>Total</th><th>Rate</th><th>Bytes In</th><th>Bytes Out</th><th>Errors</th><th>Resp (ms)</th>
+    </tr></thead>
+    <tbody>
+    {{range .Stats.Backends}}
+    <tr>
+      <td>{{.Name}}</td>
+      <td>{{if eq .Status "UP"}}<span class="badge badge-green">UP</span>{{else if eq .Status "DRAIN"}}<span class="badge badge-yellow">DRAIN</span>{{else}}<span class="badge badge-red">{{.Status}}</span>{{end}}</td>
+      <td>{{.CurrentSessions}}</td>
+      <td>{{.TotalSessions}}</td>
+      <td>{{.RequestRate}}/s</td>
+      <td>{{.BytesIn}}</td>
+      <td>{{.BytesOut}}</td>
+      <td>{{.ErrorConn}}</td>
+      <td>{{.AvgResponseMs}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p style="color:var(--muted);padding:12px">No backend stats available (HAProxy may not be running on this host)</p>
+  {{end}}
+</div>
+{{end}}
+
+<div class="section" style="margin-top:24px">
+  <button class="btn btn-danger" hx-post="/lb/{{.LB.Name}}/delete"
+          hx-confirm="Delete load balancer {{.LB.Name}}? This stops HAProxy and Keepalived on all hosts.">Delete Load Balancer</button>
+</div>
+{{end}}

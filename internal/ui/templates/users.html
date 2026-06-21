@@ -1,0 +1,97 @@
+{{define "content"}}
+<div class="page-header">
+    <h1>Users</h1>
+    <button class="btn btn-primary" onclick="document.getElementById('create-user-modal').showModal()">Create User</button>
+</div>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>Username</th>
+            <th>Role</th>
+            <th>Created</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range .Users}}
+        <tr>
+            <td>{{.Username}}</td>
+            <td><span class="badge">{{.Role}}</span></td>
+            <td>{{.CreatedAt}}</td>
+            <td>
+                <button class="btn btn-sm btn-danger"
+                    hx-delete="/ui/users/{{.Username}}"
+                    hx-confirm="Delete user {{.Username}}?">Delete</button>
+                <button class="btn btn-sm" type="button"
+                    onclick="openTokenModal('{{.Username}}')">New Token</button>
+            </td>
+        </tr>
+        {{else}}
+        <tr><td colspan="4">No users found.</td></tr>
+        {{end}}
+    </tbody>
+</table>
+
+<dialog id="create-token-modal" class="modal">
+    <form method="dialog" id="create-token-form">
+        <h3>New API token</h3>
+        <input type="hidden" name="username" id="tk-username">
+        <div class="form-group">
+            <label for="tk-label">Label</label>
+            <input type="text" id="tk-label" name="label" placeholder="ci-deploy-bot" required>
+        </div>
+        <div class="form-group">
+            <label for="tk-scope">Scope paths <span class="muted">(optional)</span></label>
+            <textarea id="tk-scope" name="scope_paths" rows="4" placeholder="/projects/_default/vms&#10;/projects/_default/lbs"></textarea>
+            <p class="muted" style="font-size:12px;margin:4px 0 0">
+              One path prefix per line. Empty = inherit the user's full permissions.
+              The auth engine intersects token scopes with role bindings.
+            </p>
+        </div>
+        <div class="form-actions">
+            <button type="button" class="btn" onclick="this.closest('dialog').close()">Cancel</button>
+            <button type="button" class="btn btn-primary"
+                hx-post="/ui/users/_/token"
+                hx-include="#create-token-form">Create</button>
+        </div>
+    </form>
+</dialog>
+
+<script>
+function openTokenModal(username) {
+    document.getElementById('tk-username').value = username;
+    document.getElementById('tk-label').value = '';
+    document.getElementById('tk-scope').value = '';
+    document.getElementById('create-token-modal').showModal();
+}
+</script>
+
+<dialog id="create-user-modal" class="modal">
+    <form method="dialog">
+        <h3>Create User</h3>
+        <div class="form-group">
+            <label for="username">Username</label>
+            <input type="text" id="username" name="username" required>
+        </div>
+        <div class="form-group">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required>
+        </div>
+        <div class="form-group">
+            <label for="role">Role</label>
+            <select id="role" name="role">
+                <option value="viewer">Viewer</option>
+                <option value="operator">Operator</option>
+                <option value="admin">Admin</option>
+            </select>
+        </div>
+        <div class="form-actions">
+            <button type="button" class="btn" onclick="this.closest('dialog').close()">Cancel</button>
+            <button type="button" class="btn btn-primary"
+                hx-post="/ui/users"
+                hx-include="closest form">Create</button>
+        </div>
+    </form>
+</dialog>
+{{end}}

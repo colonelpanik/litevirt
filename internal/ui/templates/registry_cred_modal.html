@@ -1,0 +1,29 @@
+<div class="modal-overlay" id="registry-cred-modal">
+  <div class="modal" style="max-width:480px">
+    <h3>Add registry credential</h3>
+    <form hx-post="/ui/registry-creds" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('registry-cred-modal').remove()">
+      <div class="form-row">
+        <label>Registry</label>
+        <input type="text" name="registry" required placeholder="ghcr.io">
+      </div>
+      <div class="form-row">
+        <label>Username</label>
+        <input type="text" name="username" required autocomplete="off" placeholder="myuser">
+      </div>
+      <div class="form-row">
+        <label>Password / token</label>
+        <input type="password" name="password" required autocomplete="off">
+      </div>
+      {{if .IsOperator}}
+      <div class="form-row">
+        <label><input type="checkbox" name="global"> Global (cluster-wide, applies to all users)</label>
+      </div>
+      {{end}}
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('registry-cred-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+</div>

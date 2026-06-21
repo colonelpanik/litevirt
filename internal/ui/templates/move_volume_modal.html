@@ -1,0 +1,39 @@
+<div class="modal-overlay" id="move-volume-modal">
+  <div class="modal" style="max-width:520px">
+    <h3>Move disk to another pool</h3>
+    <p style="color:var(--muted);font-size:13px;margin-top:0">
+      VM <b>{{.VMName}}</b>, disk <b>{{.DiskName}}</b>{{if .CurrentPool}} (currently on <b>{{.CurrentPool}}</b>){{end}}.
+      Running VMs move online (libvirt blockdev-mirror, no downtime); stopped VMs use an
+      offline copy. File-based pools only. If this VM is in a stack, its compose YAML is
+      updated to match.
+    </p>
+    {{if .Pools}}
+    <form data-vm="{{.VMName}}" onsubmit="return false">
+      <input type="hidden" name="disk" value="{{.DiskName}}">
+      <div class="form-row">
+        <label>Target pool</label>
+        <select name="target_pool" required>
+          <option value="">Select a pool…</option>
+          {{range .Pools}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="delete_source"> Delete source disk after cutover</label>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('move-volume-modal').remove()">Cancel</button>
+        <button type="button" class="btn btn-primary" onclick="startMoveVolume(this)">Move</button>
+      </div>
+    </form>
+    <div id="move-volume-progress" style="margin-top:1em;display:none">
+      <div class="muted" id="move-volume-phase" style="font-size:12px;margin-bottom:4px"></div>
+      <progress id="move-volume-bar" max="100" style="width:100%;height:14px"></progress>
+      <div class="muted" id="move-volume-bytes" style="font-size:11px;margin-top:4px"></div>
+    </div>
+    {{else}}
+    <p style="color:var(--err)">No other file-based pools on this host to move to. Create one under Storage → Pools.</p>
+    <div class="form-actions"><button type="button" class="btn" onclick="document.getElementById('move-volume-modal').remove()">Close</button></div>
+    {{end}}
+    <div id="move-volume-result" style="margin-top:1em"></div>
+  </div>
+</div>

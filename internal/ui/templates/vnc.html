@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VNC — {{.VMName}}</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #111; overflow: hidden; font-family: monospace; }
+    #toolbar { position: fixed; top: 0; left: 0; right: 0; height: 32px; background: #222; display: flex; align-items: center; padding: 0 12px; z-index: 10; color: #ccc; font-size: 13px; gap: 12px; }
+    #toolbar button { background: #333; color: #ccc; border: 1px solid #555; padding: 2px 10px; cursor: pointer; font-family: monospace; font-size: 12px; }
+    #toolbar button:hover { background: #444; }
+    #vnc-container { position: fixed; top: 32px; left: 0; right: 0; bottom: 0; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <span>VNC: {{.VMName}}</span>
+    <button onclick="if(rfb)rfb.disconnect()">Disconnect</button>
+    <button onclick="if(rfb)rfb.sendCtrlAltDel()">Ctrl+Alt+Del</button>
+    <a href="/vms/{{.VMName}}" style="color:#888;margin-left:auto;text-decoration:none">← Back</a>
+  </div>
+  <div id="vnc-container"></div>
+  <script type="module">
+    import RFB from '/static/novnc/rfb.js';
+    const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/vms/{{.VMName}}/vnc';
+    // Make the socket ourselves so we can read the server's close reason; RFB
+    // attaches to a pre-made WebSocket when the 2nd arg isn't a URL string.
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    let closeReason = '';
+    ws.addEventListener('close', (e) => { if (e.reason) closeReason = e.reason; });
+    const rfb = new RFB(document.getElementById('vnc-container'), ws);
+    rfb.scaleViewport = true;
+    rfb.resizeSession = true;
+    window.rfb = rfb;
+    rfb.addEventListener('disconnect', () => {
+      const msg = closeReason || 'Disconnected.';
+      document.getElementById('vnc-container').innerHTML =
+        '<div style="color:#ccc;padding:48px;text-align:center;font-size:14px">' + msg +
+        '<br><br><a href="" style="color:#6af">Reconnect</a></div>';
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,1703 @@
+syntax = "proto3";
+package litevirt.v1;
+
+option go_package = "github.com/litevirt/litevirt/gen/litevirt/v1;litevirtv1";
+
+import "litevirt/v1/types.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// ═══════════ Request / Response Messages ═══════════
+
+// ── Hosts ──
+message ListHostsRequest   { map<string, string> label_filter = 1; }
+message ListHostsResponse  { repeated Host hosts = 1; }
+message InspectHostRequest { string name = 1; }
+message DrainHostRequest   { string name = 1; int32 parallel = 2; }
+message DrainProgress      { string vm_name = 1; string target_host = 2;
+    MigrateStrategy strategy = 3; float progress_pct = 4;
+    string status = 5; string error = 6; }
+message UndrainHostRequest { string name = 1; }
+message SetHostLabelsRequest { string name = 1;
+    map<string, string> labels = 2; repeated string remove = 3; }
+message FenceHostRequest   {
+    string name = 1;
+    bool confirmed = 2;
+    // confirm_manual_only: do NOT execute a fence; only record a
+    // 'manual-confirmed' row in fencing_log and mark the host fenced.
+    // Used by `lv host fence-confirm` after the operator has powered the
+    // host off externally. Required by the failover coordinator's split-brain
+    // guard before VMs are rescheduled when fence_strategy = "manual".
+    bool confirm_manual_only = 3;
+}
+message RemoveHostRequest  { string name = 1; bool force = 2; }
+message FenceResult        { string host_name = 1; string method = 2;
+    string result = 3; string detail = 4; }
+message HostHealthMatrix   { repeated HostHealthEntry entries = 1; }
+message HostHealthEntry    { string observer = 1; string target = 2;
+    string status = 3; int32 consecutive_failures = 4;
+    google.protobuf.Timestamp last_seen = 5; }
+message RescanHostRequest  { string name = 1; }
+message RescanHostResponse { int32 added = 1; int32 removed = 2;
+    int32 total = 3; repeated PCIDevice devices = 4; }
+message ListHostDevicesRequest  { string name = 1; string type_filter = 2; }
+message ListHostDevicesResponse { repeated PCIDevice devices = 1; }
+message ConfigureHostRequest {
+    string name = 1;
+    string fence_strategy = 2;  // ssh | ipmi | watchdog
+    string ipmi_address = 3;
+    string ipmi_user = 4;
+    string ipmi_pass = 5;
+    string watchdog_dev = 6;
+    // Role: "worker" (default) runs VMs and votes; "witness" votes only.
+    // Witnesses are tiebreakers for even-N clusters; placement excludes them
+    // and VM creation against a witness is rejected. See operating-model.md.
+    string role = 7;
+    // Region: failure-domain label (DC/rack/AZ). federation.
+    // Default "default"; explicitly setting to "" is normalized to default.
+    string region = 8;
+}
+
+// ── VMs ──
+message CreateVMRequest  { VMSpec spec = 1; }
+message ListVMsRequest   { string stack_name = 1; string host_name = 2;
+    map<string, string> label_filter = 3; }
+message ListVMsResponse  { repeated VM vms = 1; }
+message InspectVMRequest { string name = 1; }
+message StartVMRequest   { string name = 1; }
+message StopVMRequest    { string name = 1; bool force = 2; int32 timeout = 3; }
+message RestartVMRequest { string name = 1; }
+message DeleteVMRequest    { string name = 1; bool keep_disks = 2; }
+
+// CloneVM creates a new VM from a template or an existing VM (optionally a
+// snapshot of it). mode "" → storage-aware auto (linked on shared storage,
+// full on local); "linked" / "full" force a mode. The clone gets a fresh
+// identity (new MACs + regenerated cloud-init instance-id/hostname/SSH keys).
+message CloneVMRequest {
+    string source       = 1;  // template or VM name to clone from
+    string target       = 2;  // new VM name
+    string mode         = 3;  // "" (auto) | "linked" | "full"
+    string snapshot     = 4;  // optional: clone from this snapshot of the source
+    string project      = 5;  // tenancy bucket for the clone ("" → source's)
+    string target_host  = 6;  // optional placement pin (else placement engine / host-pin)
+    string ip           = 7;  // optional static IP for the clone's first NIC
+    bool   start        = 8;  // start the clone after creation
+}
+message ConvertToTemplateRequest { string name = 1; bool revert = 2; }
+message ExecVMRequest      { string name = 1; repeated string command = 2; }
+message ExecVMResponse     { int32 exit_code = 1; bytes stdout = 2; bytes stderr = 3; }
+message ConsoleInput       { bytes data = 1; }
+message ConsoleOutput      { bytes data = 1; }
+message SetVMIPRequest     { string name = 1; string ip = 2; string network_name = 3; }
+message SetBootOrderRequest { string name = 1; string boot_order = 2; }
+                             // boot_order: "disk" | "cdrom" | "network"
+message RebuildVMRequest   { string name = 1; }
+message CutoverVMRequest   { string vm_name = 1; }
+message UpdateVMRequest    { string name = 1; int32 cpu = 2;
+    int32 memory_mib = 3; bool disable_vnc = 4; string cpu_mode = 5; }
+// SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
+// must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
+// ballooned via virtio without a redefine.
+message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2; }
+// SetVMLabelsRequest replaces the full label set (the request is authoritative —
+// an empty map clears all tags).
+message SetVMLabelsRequest  { string name = 1; map<string, string> labels = 2; }
+message ResizeDiskRequest  { string vm_name = 1; string disk_name = 2;
+    string size = 3; }  // size: new total size e.g. "40G"
+
+// ── VNC Proxy ──
+message VNCData { bytes data = 1; }
+
+// ── Stacks ──
+message DeployStackRequest { string compose_yaml = 1; string target_vm = 2;
+    int32 scale_override = 3; string scale_vm = 4; bool dry_run = 5;
+    string expected_hash = 6; }
+message DeployProgress     { string phase = 1; string vm_name = 2;
+    string host_name = 3; float progress_pct = 4;
+    string detail = 5; string error = 6; }
+message DeleteStackRequest { string name = 1; bool keep_disks = 2; }
+message DeleteProgress     { string vm_name = 1; string status = 2; string error = 3; }
+message ListStacksResponse { repeated StackSummary stacks = 1; }
+message StackSummary       { string name = 1; string state = 2; int32 vm_count = 3;
+    int32 running = 4; int32 stopped = 5; int32 error = 6;
+    google.protobuf.Timestamp created_at = 7; }
+message DiffStackRequest    { string compose_yaml = 1; }
+message DiffStackResponse   { repeated DiffEntry entries = 1; }
+message DiffEntry           { string vm_name = 1; DiffOp operation = 2; string detail = 3; }
+message ExportStackRequest  { string name = 1; }
+message ExportStackResponse { string name = 1; string compose_yaml = 2; string compose_hash = 3; }
+
+// ── Migration ──
+message MigrateVMRequest { string vm_name = 1; string target_host = 2;
+    MigrateStrategy strategy = 3; bool with_storage = 4; }
+message MigrateProgress  { MigratePhase phase = 1; float memory_pct = 2;
+    float disk_pct = 3; int64 memory_remaining = 4; int64 disk_remaining = 5;
+    string status = 6; int64 downtime_ms = 7; string error = 8;
+    int64 duration_ms = 9; int64 setup_ms = 10; int64 transfer_ms = 11; }
+
+// ── Storage motion ──
+//
+// MoveVolume copies a VM's disk from one storage pool to another and
+// hot-swaps the libvirt source so the VM keeps running. Cross-host
+// moves are NOT in scope here — use MigrateVM(with_storage=true) for
+// that. MoveVolume is same-host, pool-to-pool.
+message MoveVolumeRequest {
+    string vm_name      = 1;
+    // disk_name targets one logical disk on the VM (e.g. "root", "data").
+    string disk_name    = 2;
+    // target_pool is the destination pool name as it appears in the
+    // host config / compose volumes block.
+    string target_pool  = 3;
+    // delete_source removes the original after a successful cutover.
+    // Default false so an operator can manually verify before reaping.
+    bool   delete_source = 4;
+}
+message MoveVolumeProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        COPY          = 1;  // streaming bytes from old to new path
+        MIRROR        = 2;  // libvirt blockdev-mirror in flight
+        CUTOVER       = 3;  // brief pivot to the new disk
+        CLEANUP       = 4;  // optional source delete
+        DONE          = 5;
+    }
+    Phase  phase            = 1;
+    float  copy_pct         = 2;  // 0..100
+    int64  bytes_copied     = 3;
+    int64  bytes_total      = 4;
+    string status           = 5;  // human-readable
+    string error            = 6;
+}
+
+// ReplicateVolume copies a VM disk into a target pool WITHOUT cutting
+// over the VM. The VM keeps using its source pool; the target receives
+// a point-in-time snapshot suitable for DR / off-site replication.
+//
+// Semantically:
+//   1. Quiesce / snapshot the source disk (best-effort for file-based
+//      pools, atomic for ZFS/RBD when those backends land).
+//   2. Stream the snapshot bytes to the target pool.
+//   3. Optionally schedule periodic incremental syncs.
+//
+// First cut: full-copy only, file-based pools, VM may be running but
+// the snapshot consistency depends on whether the guest agent flushes.
+message ReplicateVolumeRequest {
+    string vm_name      = 1;
+    string disk_name    = 2;
+    string target_pool  = 3;
+    // target_path overrides the auto-derived "<vm>-<disk>.qcow2" filename.
+    string target_path  = 4;
+}
+message ReplicateVolumeProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        SNAPSHOT      = 1;
+        COPY          = 2;
+        DONE          = 3;
+    }
+    Phase  phase        = 1;
+    float  copy_pct     = 2;
+    int64  bytes_copied = 3;
+    int64  bytes_total  = 4;
+    string status       = 5;
+    string error        = 6;
+    string target_path  = 7;  // populated when DONE
+}
+
+// MigrateStackVolumes moves every disk of every VM in a stack to a
+// different storage pool. It is an orchestration layer over MoveVolume:
+// it enumerates the stack's VMs, resolves a per-disk target pool, runs a
+// preflight, then rolls the moves out one VM at a time (default) so a
+// stateful service (e.g. a postgres cluster) keeps serving. Each per-disk
+// move uses the same online (running VM → blockdev-mirror) / offline
+// (stopped VM → qemu-img convert) machinery as MoveVolume, dispatched to
+// the VM's owning host. File-based pools only (local/dir/nfs/btrfs).
+message MigrateStackVolumesRequest {
+    string stack_name   = 1;
+    // default_pool applies to any disk not matched by a placement rule.
+    string default_pool = 2;
+    // placements override default_pool. Resolution is most-specific-wins:
+    // a (vm_name, disk_name) rule beats a (vm_name) rule beats default_pool.
+    repeated VolumePlacement placements = 3;
+    // delete_source removes each original after its successful cutover.
+    bool   delete_source = 4;
+    // parallel bounds how many VMs migrate at once. 0 or 1 => rolling,
+    // one VM at a time (preserves availability + bounds pool I/O).
+    int32  parallel      = 5;
+    // order optionally fixes the VM processing sequence (e.g. replicas
+    // before primary). Must be a subset of the stack's VMs; unlisted VMs
+    // run after, in default order.
+    repeated string order = 6;
+    // dry_run resolves + preflights the plan and streams it back without
+    // moving any data.
+    bool   dry_run       = 7;
+    // health_wait_seconds caps the inter-VM health gate. 0 => default.
+    uint32 health_wait_seconds = 8;
+}
+message VolumePlacement {
+    string vm_name     = 1;  // required
+    string disk_name   = 2;  // empty => all disks of vm_name
+    string target_pool = 3;  // required
+}
+message StackVolumeProgress {
+    string vm_name   = 1;
+    string disk_name = 2;
+    string host_name = 3;
+    enum Stage {
+        PLANNING    = 0;  // dry-run / preflight plan line
+        PER_DISK    = 1;  // a disk move is in flight (see phase/copy_pct)
+        HEALTH_GATE = 2;  // waiting for the VM to be healthy before next
+        VM_DONE     = 3;  // all of this VM's disks migrated
+        COMPLETE    = 4;  // whole stack finished (terminal summary)
+        SKIPPED     = 5;  // disk already on target / nothing to do
+        ERROR       = 6;
+    }
+    Stage  stage        = 4;
+    // phase mirrors the inner MoveVolumeProgress.Phase as a string
+    // (COPY|MIRROR|CUTOVER|CLEANUP|DONE) while stage == PER_DISK.
+    string phase        = 5;
+    float  copy_pct     = 6;
+    int64  bytes_copied = 7;
+    int64  bytes_total  = 8;
+    // rollout-level counters for an aggregate progress bar.
+    int32  vms_total    = 9;
+    int32  vms_done     = 10;
+    string status       = 11;  // human-readable
+    string error        = 12;
+}
+
+// ── Images ──
+message PullImageRequest   { string name = 1; string source_url = 2;
+    string format = 3; string checksum = 4; string target_host = 5; }
+message PullProgress       { string host_name = 1; float progress_pct = 2;
+    string status = 3; string error = 4; }
+message ListImagesResponse { repeated Image images = 1; }
+message DeleteImageRequest { string name = 1; string host_name = 2; }
+message ImportImageRequest { string name = 1; string format = 2;
+    bytes chunk = 3; bool final = 4; string checksum = 5; }
+message ImportImageResponse { string name = 1; int64 size_bytes = 2;
+    string checksum = 3; }
+message PushImageRequest   { string name = 1; string target_host = 2; }
+message PushImageProgress  { string status = 1; float progress_pct = 2;
+    string error = 3; }
+message BuildImageRequest  { string vm_name = 1; string image_name = 2; }
+message BuildImageResponse { string name = 1; int64 size_bytes = 2; }
+
+// ── Backup ──
+message BackupVMRequest    { string vm_name = 1; }
+message BackupChunk        { bytes data = 1; int64 total_bytes = 2;
+    string checksum = 3; }
+message RestoreVMRequest   { string name = 1; bytes chunk = 2;
+    bool final = 3; int32 cpu = 4; int32 memory_mib = 5;
+    string network = 6; }
+
+// ── Snapshots ──
+// with_memory (#3): also capture guest RAM/CPU state so a revert lands the
+// running VM at the exact snapshot instant. Falls back to disk-only for a
+// stopped VM.
+message CreateSnapshotRequest  { string vm_name = 1; string name = 2; bool with_memory = 3; }
+message ListSnapshotsRequest   { string vm_name = 1; }
+message ListSnapshotsResponse  { repeated Snapshot snapshots = 1; }
+message RestoreSnapshotRequest { string vm_name = 1; string snapshot_name = 2; }
+message DeleteSnapshotRequest  { string vm_name = 1; string snapshot_name = 2; }
+
+// ── Networks ──
+message CreateNetworkRequest {
+    string name       = 1;
+    string type       = 2;  // bridge | vxlan | isolated | sriov
+    string iface      = 3;  // bridge/interface name on host
+    int32  vlan       = 4;
+    int32  vni        = 5;
+    string underlay   = 6;
+    bool   learning   = 7;
+    int32  port       = 8;
+    string subnet     = 9;
+    bool   dhcp       = 10;
+    string pf         = 11; // SR-IOV physical function
+    bool   spoof_check = 12;
+}
+message GetNetworkRequest      { string name = 1; }
+message DeleteNetworkRequest   { string name = 1; bool force = 2; }
+message ListNetworksResponse   { repeated NetworkInfo networks = 1; }
+message NetworkInfo {
+    string name       = 1;
+    string stack_name = 2;
+    string type       = 3;
+    string iface      = 4;
+    string subnet     = 5;
+    string gateway    = 6;
+    bool   dhcp       = 7;
+    int32  vni        = 8;
+    int32  vm_count   = 9;
+}
+
+// ── Load Balancers ──
+
+message ListLBResponse        { repeated LoadBalancer lbs = 1; }
+message InspectLBRequest      { string name = 1; }
+message DisableBackendRequest { string lb_name = 1; string backend = 2; }
+message EnableBackendRequest  { string lb_name = 1; string backend = 2; }
+
+// ApplyLBRequest tells a host to configure HAProxy + keepalived locally.
+// Used for multi-host LB: the orchestrating host sends this to each LB peer.
+message ApplyLBRequest {
+    string lb_name     = 1;
+    string vip         = 2; // e.g. "10.0.100.50/24"
+    string algorithm   = 3;
+    repeated LBBackend backends = 4; // resolved backend IPs
+    repeated LBPort    ports    = 5;
+    repeated string    hosts    = 6; // all designated LB hosts (for VRRP priority)
+}
+
+// RemoveLBRequest tells a host to tear down a local LB instance.
+message RemoveLBRequest {
+    string lb_name = 1;
+}
+
+message CreateLBRequest {
+    string                      name         = 1;
+    string                      vip          = 2;  // "10.0.100.50/24"
+    string                      algorithm    = 3;  // roundrobin | leastconn | source
+    repeated LBPort             ports        = 4;
+    repeated string             hosts        = 5;  // hosts to run HAProxy+keepalived on
+    repeated LBBackendAddress   backends     = 6;  // explicit backend addresses
+    repeated string             vm_backends  = 7;  // VM names to resolve to IPs
+}
+
+message UpdateLBRequest {
+    string                      name              = 1;
+    string                      vip               = 2;  // empty = no change
+    string                      algorithm         = 3;  // empty = no change
+    repeated LBPort             ports             = 4;  // empty = no change
+    repeated string             hosts             = 5;  // empty = no change
+    repeated LBBackendAddress   add_backends      = 6;
+    repeated string             remove_backends   = 7;  // by name
+    repeated string             add_vm_backends   = 8;
+    repeated string             remove_vm_backends = 9;
+}
+
+message DeleteLBRequest {
+    string name = 1;
+}
+
+message LBStatsRequest {
+    string name = 1;
+}
+
+message DrainBackendRequest {
+    string lb_name = 1;
+    string backend = 2;  // server name
+}
+
+message DrainBackendResponse {
+    string status             = 1;  // "draining"
+    int64  active_connections = 2;
+}
+
+// ── Users & Auth ──
+message LoginRequest       {
+    string username  = 1;
+    string password  = 2;
+    string realm     = 3;  // optional; defaults to "local"
+    string totp_code = 4;  // optional second-factor; required if user has 2FA enrolled
+    string user_agent= 5;  // captured for ListSessions display
+
+    // OIDC code-flow callback fields. When `realm` names an OIDC realm,
+    // the UI/CLI redirects the browser to AuthURL(state), receives a
+    // `code` on the configured RedirectURL, and re-calls Login with
+    // these fields set. Username/Password are unused for OIDC.
+    string oidc_code         = 6;
+    string oidc_state        = 7;
+    string oidc_redirect_uri = 8;  // optional override of the configured RedirectURL
+}
+message LoginResponse      {
+    string token         = 1;  // bearer; opaque session id (prefix "lvs_") on success
+    string username      = 2;
+    string role          = 3;
+    string expires_at    = 4;  // RFC3339; hard expiry of the session
+    bool   requires_2fa  = 5;  // if true, token is empty; client must re-call Login with totp_code
+}
+message ListRealmsResponse { repeated string realms = 1; }
+message CreateUserRequest  { string username = 1; string password = 2; string role = 3; }
+message ListUsersResponse  { repeated User users = 1; }
+message DeleteUserRequest  { string username = 1; }
+message WhoamiResponse     { string username = 1; string role = 2; string realm = 3; string expires_at = 4; }
+// ChangePasswordRequest: username empty = the caller themselves; a non-empty
+// username requires admin. old_password is verified for self-service changes.
+message ChangePasswordRequest { string username = 1; string old_password = 2; string new_password = 3; }
+message CreateTokenRequest {
+    string username = 1;
+    string name     = 2;
+    string expires  = 3;
+    // Optional path prefixes the token may operate under. Empty list = no
+    // scoping (token inherits the user's full permissions). The path-based
+    // RBAC engine then enforces verb permissions normally.
+    repeated string scope_paths = 4;
+}
+message RevokeTokenRequest { string id = 1; }
+
+// BindSecurityGroupsRequest replaces the SG names attached to one VM
+// NIC. — runtime mutation without VM redeploy. The next
+// reconciler tick on the owning host re-renders the firewall ruleset
+// to match.
+
+// ── Backup snapshots ──
+//
+// Repo location model: the daemon you call owns the repo. If the
+// named VM doesn't live on this daemon's host, the RPC returns
+// FailedPrecondition with the host-name to retry against.
+
+message BackupSnapshotRequest {
+    string vm_name   = 1;
+    string disk_name = 2;  // empty = root disk
+    string repo_path = 3;  // host-local directory (must be initialised)
+    string timestamp = 4;  // RFC3339; empty = now
+    // incremental requests a dirty-bitmap-driven push relative to the
+    // most-recent manifest for (vm_name, disk_name) in repo_path. The
+    // daemon resolves the parent manifest itself; callers don't pin it
+    // explicitly so the chain can grow without operator bookkeeping.
+    // When no parent exists OR when libvirt reports the bitmap is
+    // unusable (e.g. lost across a daemon restart that wasn't paired
+    // with a persisted bitmap), the daemon falls back to a full push
+    // and surfaces the reason via BackupSnapshotProgress.status.
+    bool   incremental = 5;
+    // quiesce (#2) controls in-guest filesystem freeze for an application-
+    // consistent backup: "auto" (default/empty) freezes via the guest agent
+    // when the VM advertises one, else proceeds crash-consistent; "off" forces
+    // crash-consistent. A freeze failure never fails an otherwise-good backup.
+    string quiesce = 6;
+}
+message BackupSnapshotProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        SNAPSHOT      = 1;
+        COPY          = 2;
+        DONE          = 3;
+    }
+    Phase  phase           = 1;
+    int64  bytes_processed = 2;
+    int64  bytes_new       = 3;
+    int32  chunks_total    = 4;
+    int32  chunks_deduped  = 5;
+    string status          = 6;
+    string manifest_ts     = 7;  // populated on DONE
+    string error           = 8;
+    // bytes_read is the bytes actually read off the source disk. For an
+    // incremental (or a sparse full) this is ≪ bytes_processed; the gap is
+    // the read-I/O the dirty bitmap / allocation map saved.
+    int64  bytes_read      = 9;
+}
+
+message RestoreFromBackupRequest {
+    string repo_path     = 1;
+    string vm_name       = 2;  // manifest selector
+    string disk_name     = 3;
+    string timestamp     = 4;  // exact RFC3339 of manifest
+    string target_path   = 5;  // where to write the restored disk
+}
+message RestoreFromBackupProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        RESTORE       = 1;
+        DONE          = 2;
+    }
+    Phase  phase         = 1;
+    int64  bytes_written = 2;
+    int32  chunks_done   = 3;
+    int32  chunks_total  = 4;
+    string status        = 5;
+    string error         = 6;
+}
+
+// ── Containers ──
+
+message Container {
+    string host_name   = 1;
+    string name        = 2;
+    string state       = 3;  // stopped | starting | running | stopping | error | unknown
+    string image       = 4;  // origin reference (oci://… or alpine:3.19)
+    int32  cpu_limit   = 5;
+    int32  memory_mib  = 6;
+    string created_at  = 7;
+    string updated_at  = 8;
+}
+
+message ContainerNetwork {
+    string name   = 1;  // unique within container (eth0, eth1, …)
+    string bridge = 2;  // host bridge to attach to
+    string ip     = 3;  // optional static IP
+    string mac    = 4;  // optional fixed MAC
+}
+
+message CreateContainerRequest {
+    string host_name = 1;
+    string name      = 2;
+    string template  = 3;  // "download" | path-to-rootfs
+    string distro    = 4;  // for download template
+    string release   = 5;
+    string arch      = 6;
+    int32  cpu       = 7;
+    int32  memory_mib= 8;
+    repeated ContainerNetwork networks = 9;
+    map<string, string> labels = 10;
+    string image     = 11;
+}
+
+message StartContainerRequest  { string host_name = 1; string name = 2; }
+message StopContainerRequest   { string host_name = 1; string name = 2; int32 timeout_sec = 3; }
+message DeleteContainerRequest { string host_name = 1; string name = 2; }
+
+message ExecContainerRequest {
+    string host_name = 1;
+    string name      = 2;
+    repeated string argv = 3;
+}
+message ExecContainerResponse {
+    bytes stdout    = 1;
+    bytes stderr    = 2;
+    int32 exit_code = 3;
+}
+
+message ListContainersRequest  { string host_name = 1; } // empty = every host
+message ListContainersResponse { repeated Container containers = 1; }
+
+message PullOCIImageRequest {
+    string host_name = 1;
+    string image     = 2;  // OCI reference
+    string dest      = 3;  // rootfs directory to extract into
+    string tag       = 4;  // optional tag override
+    // Inline registry credentials. Two uses: (a) the entry node writes the
+    // RESOLVED credential here before forwarding so the running host can
+    // authenticate (a forwarded peer runs under the daemon identity and cannot
+    // resolve per-user creds itself); (b) ad-hoc `lv ct pull --username`. When
+    // empty, the entry node resolves from stored credentials (per-user, then
+    // global).
+    string username = 5;
+    string password = 6;
+}
+
+// FirewallStatus is the post-Reconcile snapshot the daemon hands back
+// from ReloadFirewall.
+message FirewallStatus {
+    string host_name      = 1;
+    int32  rules_total    = 2;  // every rule across cluster + host + sg + nic-extra tiers
+    int32  nics_bound     = 3;  // count of NICs with at least one SG attached
+    int32  security_groups= 4;  // count of distinct SGs visible to this host
+    string last_error     = 5;  // empty when the last apply succeeded
+    string last_applied_at= 6;  // RFC3339; empty if never
+}
+
+message BindSecurityGroupsRequest {
+    string vm_name        = 1;
+    string network_name   = 2;  // matches vm_interfaces.network_name
+    repeated string security_groups = 3;
+}
+
+message Session {
+    string id           = 1;  // opaque session id (the bearer wire token)
+    string username     = 2;
+    string realm        = 3;
+    string ip           = 4;
+    string user_agent   = 5;
+    string created_at   = 6;
+    string last_used_at = 7;
+    string expires_at   = 8;
+}
+message ListSessionsRequest  { string username = 1; }  // empty = caller's own
+message ListSessionsResponse { repeated Session sessions = 1; }
+message RevokeSessionRequest { string id = 1; }
+
+// 2FA enrollment & management.
+message TwoFactor {
+    string method       = 1;  // "totp" | "webauthn"
+    string label        = 2;
+    string enrolled_at  = 3;
+    string last_used_at = 4;
+}
+message ListTwoFactorsRequest  { string username = 1; }  // empty = caller's own
+message ListTwoFactorsResponse { repeated TwoFactor factors = 1; }
+message EnrollTOTPRequest      { string username = 1; string label = 2; }
+message EnrollTOTPResponse {
+    string otpauth_url    = 1;  // for QR code rendering
+    string secret_base32  = 2;  // for manual entry
+    repeated string recovery_codes = 3; // shown once; user must save them
+}
+message DisableTwoFactorRequest { string username = 1; string method = 2; string label = 3; }
+
+// Role binding management. The path-based RBAC engine
+// (`internal/auth/permissions.go`) reads role_bindings to decide what
+// every authenticated caller can do. Principals are `user:<name>` or
+// `group:<group>@<realm>`. Paths are RBAC scopes like `/` (cluster
+// root), `/projects/acme`, `/projects/acme/vms/web-1`. Propagate=true
+// means the binding applies to the path AND every descendant scope.
+message RoleBinding {
+    string id         = 1;
+    string path       = 2;
+    string role       = 3;
+    string principal  = 4;
+    bool   propagate  = 5;
+    string updated_at = 6;
+}
+message GrantRoleRequest {
+    string path       = 1;
+    string role       = 2;
+    string principal  = 3;
+    bool   propagate  = 4;
+}
+message GrantRoleResponse { RoleBinding binding = 1; }
+
+message RevokeRoleRequest { string id = 1; }
+message RevokeRoleResponse {}
+
+message ListRoleBindingsRequest  { string principal = 1; } // empty = all
+message ListRoleBindingsResponse { repeated RoleBinding bindings = 1; }
+
+// Live restore from backup. The handler:
+//
+//   1. Opens the manifest's chunk reader.
+//   2. Spawns a localhost NBD server backed by the reader.
+//   3. Creates target_path as a qcow2 with backing_file pointing at the
+//      NBD URL.
+//   4. Streams STARTING_NBD → READY frames and keeps the NBD server
+//      alive until the operator's stream closes.
+//
+// The operator (or a higher-level orchestrator) then runs the existing
+// CreateVM / StartVM path against target_path. Reads that can't be
+// satisfied from target_path fall through to the NBD source, so the
+// VM boots in seconds and data migrates on-demand. Once the operator
+// runs `virsh blockpull` (or its `lv` wrapper) the disk is fully
+// local and the stream can be closed.
+//
+// Auto-define-and-start (opt-in via auto_start): when set, the daemon
+// reconstructs the domain and boots it against the overlay so the operator
+// needn't run virsh by hand. This is now safe because BackupSnapshot
+// embeds the source VM's VMSpec in the root-disk manifest (vm_spec_json);
+// the operator can also supply/override a spec. Without auto_start the
+// behavior is unchanged (NBD + overlay only).
+message RestoreLiveRequest {
+    string repo_path  = 1;
+    string vm_name    = 2;
+    string disk_name  = 3;
+    string timestamp  = 4;
+    string target_path = 5;
+    // bind_addr controls the address the NBD server listens on.
+    // Empty defaults to "127.0.0.1:0" — localhost-only, ephemeral
+    // port. Set to "0.0.0.0:0" for a cluster-internal listener if
+    // the operator runs qemu on a different node from the daemon.
+    string bind_addr = 6;
+
+    // auto_start: define the domain (pointing at the overlay) and start it.
+    bool   auto_start = 7;
+    // new_name: rename the restored VM (collision-avoidance). Empty = the
+    // manifest/vm_name.
+    string new_name   = 8;
+    // spec: operator-supplied/override VMSpec. nil = use the manifest's
+    // embedded vm_spec_json.
+    VMSpec spec       = 9;
+    // from_existing: last-resort, pull the spec from an existing vms record
+    // when neither spec nor manifest metadata is available.
+    bool   from_existing = 10;
+    // blockpull: after start, drive blockpull to localize the disk, then
+    // tear the NBD server down (self-terminating). Without it the stream
+    // stays open until the operator closes it (operator-driven localize).
+    bool   blockpull  = 11;
+}
+message RestoreLiveProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        STARTING_NBD  = 1;
+        READY         = 2; // qcow2 created + NBD listening; operator may boot a VM
+        DONE          = 3; // stream is shutting down; NBD server stopping
+        DEFINING      = 4; // domain XML generated + DefineDomain issued
+        STARTED       = 5; // StartDomain succeeded; VM booting off the overlay
+        BLOCKPULL     = 6; // blockpull in progress (auto_start + blockpull)
+        LOCALIZED     = 7; // blockpull complete; disk self-contained; NBD stopping
+    }
+    Phase  phase   = 1;
+    string nbd_url = 2; // populated on STARTING_NBD + READY
+    string target_path = 3;
+    string status  = 4;
+    string vm_name = 5; // populated once the domain is defined/started
+}
+
+// WebAuthn second-factor enrolment + login dance. Each
+// pair returns/accepts the raw JSON the browser exchanges with
+// navigator.credentials.create /.get. The daemon holds the in-flight
+// session between Begin and Finish in memory; a Begin without a
+// matching Finish within 60s is garbage-collected.
+message BeginWebAuthnRegistrationRequest  { string username = 1; }
+message BeginWebAuthnRegistrationResponse { bytes options_json = 1; }
+message FinishWebAuthnRegistrationRequest {
+    string username        = 1;
+    bytes  attestation_json = 2;
+}
+message FinishWebAuthnRegistrationResponse { string credential_label = 1; }
+
+message BeginWebAuthnLoginRequest  { string username = 1; }
+message BeginWebAuthnLoginResponse { bytes options_json = 1; }
+message FinishWebAuthnLoginRequest {
+    string username       = 1;
+    bytes  assertion_json = 2;
+}
+message FinishWebAuthnLoginResponse {
+    string token      = 1;  // session bearer ("lvs_<id>") minted on a valid assertion
+    string username   = 2;
+    string role       = 3;
+    string expires_at = 4;  // RFC3339 hard expiry
+}
+
+// ── Stats ──
+message GetVMStatsRequest    { string name = 1; }
+message GetHostStatsRequest  { string name = 1; }
+
+// ── Monitoring ──
+message ClusterStatus { string cluster_name = 1; int32 hosts_total = 2;
+    int32 hosts_active = 3; int32 vms_total = 4; int32 vms_running = 5;
+    int32 vms_error = 6; repeated Host hosts = 7; repeated Alert alerts = 8;
+    repeated ClusterEvent recent_events = 9; }
+message StreamEventsRequest { repeated string event_types = 1; }
+
+// ── Audit ──
+message ListAuditLogRequest {
+    int32  limit  = 1;
+    string target = 2;   // filter: exact target path (empty = any)
+    string action = 3;   // filter: exact, or trailing-* prefix glob e.g. "sg.*" (empty = any)
+    string user   = 4;   // filter: exact username (empty = any)
+    string since  = 5;   // filter: timestamp >= since, RFC3339 (empty = open)
+    string until  = 6;   // filter: timestamp <= until, RFC3339 (empty = open)
+}
+message AuditEntry {
+    string timestamp = 1;
+    string username  = 2;
+    string host_name = 3;
+    string action    = 4;
+    string target    = 5;
+    string detail    = 6;
+    string result    = 7;
+}
+message ListAuditLogResponse { repeated AuditEntry entries = 1; }
+
+// Per-VM operational event store (vm_events) — durable, replicated, prunable
+// activity history (lifecycle + backup outcomes). Distinct from the audit log.
+message ListVMEventsRequest {
+    string vm_name = 1;
+    int32  limit   = 2;  // default 100, max 1000
+    string since   = 3;  // RFC3339; empty = no lower bound
+}
+message VMEvent {
+    string id        = 1;
+    string vm_name   = 2;
+    string host_name = 3;
+    string type      = 4;   // e.g. "backup.failed", "vm.started"
+    string result    = 5;   // "ok" | "error"
+    string severity  = 6;   // "info" | "warn" | "error"
+    string detail    = 7;
+    string username  = 8;
+    string ts        = 9;   // RFC3339Nano
+}
+message ListVMEventsResponse { repeated VMEvent events = 1; }
+
+// ── Resource Mappings (#14) ──
+message CreateResourceMappingRequest { string name = 1; string description = 2; }
+message ListResourceMappingsRequest  {}
+message ListResourceMappingsResponse { repeated ResourceMapping mappings = 1; }
+message DeleteResourceMappingRequest { string name = 1; }
+// AddMappingDevice registers one host's concrete device under a mapping.
+// host empty = caller's host. address is the PCI address on that host.
+message AddMappingDeviceRequest {
+    string mapping = 1;
+    string host    = 2;
+    string address = 3;
+    string vendor  = 4;
+    string device  = 5;
+}
+message RemoveMappingDeviceRequest {
+    string mapping = 1;
+    string host    = 2;
+    string address = 3;
+}
+
+// ── Notifications (#5) ──
+message CreateNotificationTargetRequest { string name = 1; string type = 2; string config = 3; bool enabled = 4; }
+message ListNotificationTargetsRequest  {}
+message ListNotificationTargetsResponse { repeated NotificationTarget targets = 1; }
+message DeleteNotificationTargetRequest { string id = 1; }
+message TestNotificationTargetRequest   { string id = 1; }
+message CreateNotificationRouteRequest  { string event_pattern = 1; string target_id = 2; string min_severity = 3; bool enabled = 4; }
+message ListNotificationRoutesRequest   {}
+message ListNotificationRoutesResponse  { repeated NotificationRoute routes = 1; }
+message DeleteNotificationRouteRequest  { string id = 1; }
+
+// ── Registry credentials (v23) ──
+// OCI/Docker registry logins for private image pulls. Per-user (owned by the
+// authenticated caller) or global (operator-managed, cluster-wide).
+message RegistryCredential {
+    string scope      = 1;  // "user" | "global"
+    string owner      = 2;  // username for user scope; "" for global
+    string registry   = 3;  // normalized host: docker.io | ghcr.io | registry:5000
+    string username   = 4;
+    // NOTE: the secret is intentionally absent — List never returns it.
+    string created_at = 5;
+    string updated_at = 6;
+}
+// owner is NOT a field: the server uses callerUsername(ctx) for user scope, so a
+// caller can never write another user's credential.
+message SetRegistryCredentialRequest    { bool global = 1; string registry = 2; string username = 3; string password = 4; }
+message ListRegistryCredentialsRequest  { bool all = 1; bool global = 2; }
+message ListRegistryCredentialsResponse { repeated RegistryCredential credentials = 1; }
+message DeleteRegistryCredentialRequest { bool global = 1; string registry = 2; }
+
+// ── Distributed firewall: cluster/host tiers, ipsets, default-deny (v21) ──
+// The per-NIC tier is managed via security_groups + BindSecurityGroups; these
+// cover the cluster_default / host_overrides chains, named ipsets, and the
+// default-deny policy. The reconciler applies changes within its poll interval
+// (or immediately via ReloadFirewall).
+message CreateClusterFirewallRuleRequest { FirewallRule rule = 1; }
+message ListClusterFirewallRulesRequest  {}
+message ListClusterFirewallRulesResponse { repeated FirewallRule rules = 1; }
+message DeleteClusterFirewallRuleRequest { string id = 1; }
+message CreateHostFirewallRuleRequest    { FirewallRule rule = 1; }
+message ListHostFirewallRulesRequest     { string host_name = 1; }  // empty = all hosts
+message ListHostFirewallRulesResponse    { repeated FirewallRule rules = 1; }
+message DeleteHostFirewallRuleRequest    { string id = 1; }
+message CreateIpSetRequest               { string name = 1; repeated string cidrs = 2; }
+message ListIpSetsRequest                {}
+message ListIpSetsResponse               { repeated IpSet ipsets = 1; }
+message DeleteIpSetRequest               { string id = 1; }
+message SetFirewallDefaultRequest        { string scope = 1; bool default_deny = 2; }  // scope empty = cluster
+message ListFirewallDefaultsRequest      {}
+message ListFirewallDefaultsResponse     { repeated FirewallDefault defaults = 1; }
+
+// ── Storage ──
+message ListStoragePoolsRequest {}
+message ListStoragePoolsResponse { repeated StoragePool pools = 1; }
+
+// CreateStoragePoolRequest registers a new pool on the daemon's host
+// and runs the driver's Prepare() hook (mount NFS, log into iSCSI, etc.).
+// On success a row lands in `storage_pools`, replicated to the cluster
+// via Corrosion. `lv pool create`.
+message CreateStoragePoolRequest {
+    string name       = 1; // pool name (unique per host)
+    string driver     = 2; // local|dir|nfs|iscsi|ceph|zfs|btrfs|lvm-thin
+    string source     = 3; // driver-specific (NFS export, Ceph pool, ZFS dataset)
+    string target     = 4; // local mount/path override
+    map<string,string> options = 5; // driver-specific key/value flags
+    string host       = 6; // optional — defaults to caller's host
+}
+message CreateStoragePoolResponse { StoragePool pool = 1; }
+
+message DeleteStoragePoolRequest {
+    string name = 1;
+    string host = 2; // optional — defaults to caller's host
+}
+message DeleteStoragePoolResponse {}
+
+message GetStoragePoolRequest {
+    string name = 1;
+    string host = 2; // optional — defaults to caller's host
+}
+message GetStoragePoolResponse { StoragePool pool = 1; }
+
+// A file in a (file-based) storage pool — used by the content browser.
+message StoragePoolContent {
+    string name        = 1; // file name
+    string path        = 2; // absolute path on the host (usable as VMSpec.iso)
+    int64  size_bytes  = 3;
+    string modified_at = 4; // RFC3339
+    bool   is_iso      = 5; // .iso extension
+}
+message ListStoragePoolContentsRequest {
+    string pool_name = 1;
+    string host      = 2; // optional — defaults to caller's host
+}
+message ListStoragePoolContentsResponse { repeated StoragePoolContent contents = 1; }
+
+// Client-streaming upload of a file (e.g. an ISO) into a file-based pool. The
+// first message carries pool_name/host/filename; later messages carry chunks.
+message UploadStoragePoolContentRequest {
+    string pool_name = 1;
+    string host      = 2; // optional — defaults to caller's host
+    string filename  = 3; // base name only (no path separators)
+    bytes  chunk     = 4;
+}
+message UploadStoragePoolContentResponse {
+    string path       = 1;
+    int64  size_bytes = 2;
+}
+// Delete one file from a file-based pool (used by cross-host replication to
+// prune old replicas on a peer). filename is a base name.
+message DeleteStoragePoolContentRequest {
+    string pool_name = 1;
+    string host      = 2; // optional — defaults to caller's host
+    string filename  = 3;
+}
+
+// Client-streaming incremental replica push. The first message is the header
+// (pool/host/filename/base/total_size); subsequent messages each carry one
+// dirty extent (offset,data) written into a new RAW replica. When base is set
+// the peer forks the new file from that previous replica (server-side sparse
+// copy) and only the dirty extents are streamed over the wire; base="" makes
+// it a full push (every allocated extent). The target is a sparse raw file so
+// extents apply with a plain WriteAt — no qcow2 writer needed.
+message PushReplicaIncrementRequest {
+    string pool_name  = 1; // header
+    string host       = 2; // header — optional, defaults to caller
+    string filename   = 3; // header — new replica base name
+    string base       = 4; // header — previous replica to fork from; "" = full
+    int64  total_size = 5; // header — raw file virtual size
+    int64  offset      = 6; // extent
+    bytes  data        = 7; // extent
+}
+message PushReplicaIncrementResponse {
+    string path          = 1;
+    int64  bytes_written = 2;
+}
+
+// ── Failover promotion (recover a VM from a replica) ──
+message PromoteReplicaRequest {
+    string vm_name     = 1; // VM whose replica to promote
+    string target_pool = 2; // optional — pool holding the replica; defaults to the VM's replication schedule
+    string target_host = 3; // optional — host holding the replica; defaults to the schedule's resolved host
+    string replica     = 4; // optional — exact replica filename; "" = newest
+    string new_name    = 5; // optional — promote under a new name (alongside the original)
+    bool   force       = 6; // promote even if a VM by that name is still on a healthy host
+    bool   no_localize  = 7; // skip blockpull (leaves the live disk backed by the replica — pins it)
+}
+message PromoteReplicaProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        RESOLVING     = 1; // locating the replica + host
+        DEFINING      = 2; // overlay created, domain defined
+        STARTED       = 3; // VM started off the overlay
+        LOCALIZING    = 4; // blockpull localizing the disk
+        DONE          = 5;
+    }
+    Phase  phase     = 1;
+    string vm_name   = 2;
+    string host      = 3;
+    string replica   = 4; // replica filename chosen
+    string disk_path = 5; // live overlay path
+    string status    = 6;
+}
+
+// ── Internal ──
+message PingRequest  {}
+message PingResponse { string host_name = 1; string version = 2; int32 schema_version = 3; }
+
+// FetchBinary: pull this daemon's binary for peer self-upgrade.
+message FetchBinaryRequest {}
+message FetchBinaryChunk {
+    bytes  chunk          = 1;
+    string checksum       = 2; // SHA-256 of the whole binary; set on first chunk
+    string version        = 3; // serving daemon's binary version; first chunk
+    int32  schema_version = 4; // serving daemon's CurrentSchemaVersion; first chunk
+}
+
+// ── Internal: Network Sync ──
+message ProvisionNetworkRequest {
+    string name       = 1;  // scoped network name (stack_net)
+    string config     = 2;  // JSON-serialized compose.NetworkDef
+    string net_type   = 3;  // bridge | vxlan | isolated | sriov
+    string stack_name = 4;  // owning stack (for DB persistence on remote hosts)
+}
+
+// ── Internal: Migration helpers ──
+message EnsureCloudInitRequest {
+    string vm_name       = 1;
+    string userdata      = 2;
+    string networkconfig = 3;
+}
+
+message EnsureDisksRequest {
+    string vm_name       = 1;
+    repeated DiskStub disks = 2;
+}
+
+message DiskStub {
+    string path       = 1;  // absolute path on target (e.g. /var/lib/litevirt/disks/web-1-root.qcow2)
+    int64  size_bytes  = 2;  // size hint for pre-creation (0 = create empty sparse file)
+}
+
+// CleanupMigrationArtifactsRequest removes the stub disks + cloud-init ISO that
+// EnsureDisks/EnsureCloudInit pre-created on a migration target, after the
+// migration failed (the VM never got defined there, so they are orphaned).
+message CleanupMigrationArtifactsRequest {
+    string vm_name              = 1;
+    repeated string disk_paths  = 2;  // stub disk files to remove on this (target) host
+    bool   remove_cloud_init    = 3;  // also remove the cloud-init ISO for vm_name
+}
+
+message SyncVTEPRequest {
+    string network_name = 1;
+    string vtep_ip      = 2;
+    int32  vni          = 3;
+}
+
+message GetVMIPRequest {
+    string mac          = 1;
+    string network_name = 2;
+}
+message GetVMIPResponse {
+    string ip = 1;
+}
+
+message RefreshLBRequest {
+    string stack_name = 1;
+}
+
+message UpdateFDBRequest {
+    int32  vni         = 1;
+    string mac         = 2;
+    string old_vtep_ip = 3;  // empty = no old entry to remove
+    string new_vtep_ip = 4;  // empty = just remove
+}
+
+// ── State Sync ──
+
+message TableDigest {
+    string name  = 1;
+    int32  count = 2;
+    string hash  = 3;
+}
+
+message StateDigestResponse {
+    string host_name                = 1;
+    repeated TableDigest tables     = 2;
+}
+
+message StateDumpResponse {
+    bytes data = 1; // gzipped JSON full-state dump
+}
+
+// ── WAL Replication ──
+
+message MutationEntry {
+    int64  seq    = 1;
+    string hlc    = 2;
+    string origin = 3;
+    string stmts  = 4; // JSON-encoded []Statement
+}
+
+message ReplicateRequest {
+    string sender                  = 1;
+    int64  after_seq               = 2;
+    repeated MutationEntry entries = 3; // mutations to push to the receiver
+    string sender_version          = 4; // sender's binary version, e.g. "0.5.2"
+    int32  sender_schema_version   = 5; // sender's CurrentSchemaVersion
+}
+
+message ReplicateResponse {
+    int64  applied_up_to = 1; // highest seq the receiver applied
+}
+
+message AckRequest {
+    string sender    = 1;
+    int64  acked_seq = 2;
+}
+
+// ── VM Logs ──
+message GetVMLogsRequest {
+    string name   = 1;
+    bool   follow = 2;
+    int32  lines  = 3;
+}
+message VMLogChunk { bytes data = 1; }
+
+// ── Host Upgrade ──
+message UpgradeHostRequest {
+    bytes  chunk       = 1;
+    string checksum    = 2;  // SHA-256, set on first message
+    string target_host = 3;  // set on first message; empty = self
+    bool   force       = 4;  // skip pre-flight blocks (warns still logged)
+}
+message UpgradeHostResponse {
+    string host_name      = 1;
+    string old_version    = 2;
+    string new_version    = 3;
+    string status         = 4;
+    string error          = 5;
+    int32  schema_version = 6;  // schema version staged/now-present (PreStageUpgrade)
+}
+
+// ── Host Uninstall ──
+message UninstallHostRequest {
+    bool   keep_data   = 1;
+    string target_host = 2;
+}
+message UninstallHostResponse {
+    string host_name = 1;
+    string status    = 2;
+}
+
+// ═══════════ Service ═══════════
+
+service LiteVirt {
+    // ── Hosts ──
+    rpc ListHosts(ListHostsRequest)           returns (ListHostsResponse);
+    rpc InspectHost(InspectHostRequest)        returns (Host);
+    rpc DrainHost(DrainHostRequest)            returns (stream DrainProgress);
+    rpc UndrainHost(UndrainHostRequest)        returns (Host);
+    rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
+    rpc FenceHost(FenceHostRequest)            returns (FenceResult);
+    rpc GetHostHealth(google.protobuf.Empty)   returns (HostHealthMatrix);
+    rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
+    rpc RescanHost(RescanHostRequest)          returns (RescanHostResponse);
+    rpc ListHostDevices(ListHostDevicesRequest) returns (ListHostDevicesResponse);
+    rpc UpgradeHost(stream UpgradeHostRequest) returns (UpgradeHostResponse);
+    // PreStageUpgrade stages the new binary and forward-migrates the local
+    // state.db schema WITHOUT swapping/re-execing. Run on every node before the
+    // rolling UpgradeHost pass so no peer is ever missing schema. Older daemons
+    // that lack this RPC return Unimplemented; the CLI then falls back to the
+    // single-phase rolling upgrade.
+    rpc PreStageUpgrade(stream UpgradeHostRequest) returns (UpgradeHostResponse);
+    // FetchBinary streams this daemon's own binary back to the caller so a
+    // lagging peer can pull-and-self-upgrade. First chunk carries the SHA-256
+    // checksum + version + schema_version.
+    rpc FetchBinary(FetchBinaryRequest) returns (stream FetchBinaryChunk);
+    rpc UninstallHost(UninstallHostRequest)    returns (UninstallHostResponse);
+    rpc ConfigureHost(ConfigureHostRequest)    returns (Host);
+
+    // ── VMs ──
+    rpc CreateVM(CreateVMRequest)     returns (VM);
+    rpc ListVMs(ListVMsRequest)       returns (ListVMsResponse);
+    rpc InspectVM(InspectVMRequest)   returns (VM);
+    rpc StartVM(StartVMRequest)       returns (VM);
+    rpc StopVM(StopVMRequest)         returns (VM);
+    rpc RestartVM(RestartVMRequest)   returns (VM);
+    rpc DeleteVM(DeleteVMRequest)        returns (google.protobuf.Empty);
+    rpc CloneVM(CloneVMRequest)          returns (VM);
+    rpc ConvertToTemplate(ConvertToTemplateRequest) returns (VM);
+    rpc ExecVM(ExecVMRequest)            returns (ExecVMResponse);
+    rpc ConsoleVM(stream ConsoleInput)   returns (stream ConsoleOutput);
+    rpc SetVMIP(SetVMIPRequest)          returns (VM);
+    rpc SetBootOrder(SetBootOrderRequest) returns (VM);
+    rpc RebuildVM(RebuildVMRequest)      returns (VM);
+    rpc CutoverVM(CutoverVMRequest)      returns (VM);
+    rpc UpdateVM(UpdateVMRequest)         returns (VM);
+    // SetVMMemory sets the running balloon target (#4); live for a running VM.
+    rpc SetVMMemory(SetVMMemoryRequest)   returns (VM);
+    // SetVMLabels replaces a VM's labels/tags. Metadata-only (not in the domain
+    // XML), so it applies to running VMs without a redefine.
+    rpc SetVMLabels(SetVMLabelsRequest)  returns (VM);
+    rpc AttachDevice(AttachDeviceRequest) returns (VM);
+    rpc DetachDevice(DetachDeviceRequest) returns (VM);
+    rpc ResizeDisk(ResizeDiskRequest)    returns (VM);
+    rpc ProxyVNC(stream VNCData)         returns (stream VNCData);
+    rpc GetVMLogs(GetVMLogsRequest)      returns (stream VMLogChunk);
+
+    // ── Stacks ──
+    rpc DeployStack(DeployStackRequest)       returns (stream DeployProgress);
+    rpc DeleteStack(DeleteStackRequest)        returns (stream DeleteProgress);
+    rpc ListStacks(google.protobuf.Empty)      returns (ListStacksResponse);
+    rpc DiffStack(DiffStackRequest)            returns (DiffStackResponse);
+    rpc ExportStack(ExportStackRequest)        returns (ExportStackResponse);
+
+    // ── Migration ──
+    rpc MigrateVM(MigrateVMRequest) returns (stream MigrateProgress);
+    rpc MoveVolume(MoveVolumeRequest) returns (stream MoveVolumeProgress);
+    rpc ReplicateVolume(ReplicateVolumeRequest) returns (stream ReplicateVolumeProgress);
+    rpc MigrateStackVolumes(MigrateStackVolumesRequest) returns (stream StackVolumeProgress);
+
+    // ── Images ──
+    rpc PullImage(PullImageRequest)            returns (stream PullProgress);
+    rpc ListImages(google.protobuf.Empty)      returns (ListImagesResponse);
+    rpc DeleteImage(DeleteImageRequest)         returns (google.protobuf.Empty);
+    rpc ImportImage(stream ImportImageRequest)  returns (ImportImageResponse);
+    rpc PushImage(PushImageRequest)            returns (stream PushImageProgress);
+    rpc BuildImage(BuildImageRequest)          returns (BuildImageResponse);
+
+    // ── Backup ──
+    rpc BackupVM(BackupVMRequest)              returns (stream BackupChunk);
+    rpc RestoreVM(stream RestoreVMRequest)     returns (VM);
+
+    // ── Snapshots ──
+    rpc CreateSnapshot(CreateSnapshotRequest)   returns (Snapshot);
+    rpc ListSnapshots(ListSnapshotsRequest)     returns (ListSnapshotsResponse);
+    rpc RestoreSnapshot(RestoreSnapshotRequest) returns (VM);
+    rpc DeleteSnapshot(DeleteSnapshotRequest)   returns (google.protobuf.Empty);
+
+    // ── Networks ──
+    rpc CreateNetwork(CreateNetworkRequest)   returns (NetworkInfo);
+    rpc GetNetwork(GetNetworkRequest)         returns (NetworkInfo);
+    rpc DeleteNetwork(DeleteNetworkRequest)   returns (google.protobuf.Empty);
+    rpc ListNetworks(google.protobuf.Empty)   returns (ListNetworksResponse);
+
+    // ── Load Balancers ──
+    rpc ListLoadBalancers(google.protobuf.Empty) returns (ListLBResponse);
+    rpc InspectLoadBalancer(InspectLBRequest)     returns (LoadBalancer);
+    rpc CreateLoadBalancer(CreateLBRequest)       returns (LoadBalancer);
+    rpc UpdateLoadBalancer(UpdateLBRequest)       returns (LoadBalancer);
+    rpc DeleteLoadBalancer(DeleteLBRequest)       returns (google.protobuf.Empty);
+    rpc LBStats(LBStatsRequest)                  returns (LBStatsResponse);
+    rpc DrainBackend(DrainBackendRequest)         returns (DrainBackendResponse);
+    rpc DisableBackend(DisableBackendRequest)     returns (LoadBalancer);
+    rpc EnableBackend(EnableBackendRequest)        returns (LoadBalancer);
+    rpc ApplyLB(ApplyLBRequest)                   returns (google.protobuf.Empty);
+    rpc RemoveLB(RemoveLBRequest)                 returns (google.protobuf.Empty);
+
+    // ── Users & Auth ──
+    rpc Login(LoginRequest)              returns (LoginResponse);
+    rpc ListRealms(google.protobuf.Empty) returns (ListRealmsResponse);
+    rpc Logout(google.protobuf.Empty)    returns (google.protobuf.Empty);
+    rpc ListSessions(ListSessionsRequest)   returns (ListSessionsResponse);
+    rpc RevokeSession(RevokeSessionRequest) returns (google.protobuf.Empty);
+    rpc CreateUser(CreateUserRequest)   returns (User);
+    rpc ListUsers(google.protobuf.Empty) returns (ListUsersResponse);
+    rpc DeleteUser(DeleteUserRequest)    returns (google.protobuf.Empty);
+    rpc CreateToken(CreateTokenRequest)  returns (Token);
+    rpc RevokeToken(RevokeTokenRequest)  returns (google.protobuf.Empty);
+    // Whoami returns the authenticated caller's identity. Authenticated (NOT in
+    // skipAuth), so a stale/expired/revoked session bearer yields Unauthenticated
+    // — the UI uses it to validate the session cookie and redirect to /login.
+    rpc Whoami(google.protobuf.Empty)    returns (WhoamiResponse);
+    // ChangePassword updates the caller's (or, for admins, a target's) local-realm
+    // password after verifying the old one.
+    rpc ChangePassword(ChangePasswordRequest) returns (google.protobuf.Empty);
+    rpc ListTwoFactors(ListTwoFactorsRequest) returns (ListTwoFactorsResponse);
+    rpc EnrollTOTP(EnrollTOTPRequest)         returns (EnrollTOTPResponse);
+    rpc DisableTwoFactor(DisableTwoFactorRequest) returns (google.protobuf.Empty);
+    rpc GrantRole(GrantRoleRequest)               returns (GrantRoleResponse);
+    rpc RevokeRole(RevokeRoleRequest)             returns (RevokeRoleResponse);
+    rpc ListRoleBindings(ListRoleBindingsRequest) returns (ListRoleBindingsResponse);
+    rpc BeginWebAuthnRegistration(BeginWebAuthnRegistrationRequest)   returns (BeginWebAuthnRegistrationResponse);
+    rpc FinishWebAuthnRegistration(FinishWebAuthnRegistrationRequest) returns (FinishWebAuthnRegistrationResponse);
+    rpc BeginWebAuthnLogin(BeginWebAuthnLoginRequest)                 returns (BeginWebAuthnLoginResponse);
+    rpc FinishWebAuthnLogin(FinishWebAuthnLoginRequest)               returns (FinishWebAuthnLoginResponse);
+    rpc RestoreLive(RestoreLiveRequest) returns (stream RestoreLiveProgress);
+    rpc BindSecurityGroups(BindSecurityGroupsRequest) returns (google.protobuf.Empty);
+    rpc ReloadFirewall(google.protobuf.Empty) returns (FirewallStatus);
+
+    // ── Backup snapshots ──
+    rpc BackupSnapshot(BackupSnapshotRequest)       returns (stream BackupSnapshotProgress);
+    rpc RestoreFromBackup(RestoreFromBackupRequest) returns (stream RestoreFromBackupProgress);
+
+    // ── Containers ──
+    rpc CreateContainer(CreateContainerRequest) returns (Container);
+    rpc StartContainer(StartContainerRequest)   returns (google.protobuf.Empty);
+    rpc StopContainer(StopContainerRequest)     returns (google.protobuf.Empty);
+    rpc DeleteContainer(DeleteContainerRequest) returns (google.protobuf.Empty);
+    rpc ExecContainer(ExecContainerRequest)     returns (ExecContainerResponse);
+    rpc ListContainers(ListContainersRequest)   returns (ListContainersResponse);
+    rpc PullOCIImage(PullOCIImageRequest)       returns (google.protobuf.Empty);
+
+    // ── Stats ──
+    rpc GetVMStats(GetVMStatsRequest)       returns (VMStats);
+    rpc GetHostStats(GetHostStatsRequest)   returns (HostResourceStats);
+
+    // ── Monitoring ──
+    rpc GetClusterStatus(google.protobuf.Empty) returns (ClusterStatus);
+    rpc StreamEvents(StreamEventsRequest)        returns (stream ClusterEvent);
+
+    // ── Audit ──
+    rpc ListAuditLog(ListAuditLogRequest)       returns (ListAuditLogResponse);
+    rpc ListVMEvents(ListVMEventsRequest)       returns (ListVMEventsResponse);
+
+    // ── Storage ──
+    rpc ListStoragePools(ListStoragePoolsRequest) returns (ListStoragePoolsResponse);
+    rpc CreateStoragePool(CreateStoragePoolRequest) returns (CreateStoragePoolResponse);
+    rpc DeleteStoragePool(DeleteStoragePoolRequest) returns (DeleteStoragePoolResponse);
+    rpc GetStoragePool(GetStoragePoolRequest)       returns (GetStoragePoolResponse);
+    rpc ListStoragePoolContents(ListStoragePoolContentsRequest) returns (ListStoragePoolContentsResponse);
+    rpc UploadStoragePoolContent(stream UploadStoragePoolContentRequest) returns (UploadStoragePoolContentResponse);
+
+    // ── Resource Mappings (#14) ──
+    rpc CreateResourceMapping(CreateResourceMappingRequest) returns (ResourceMapping);
+    rpc ListResourceMappings(ListResourceMappingsRequest)   returns (ListResourceMappingsResponse);
+    rpc DeleteResourceMapping(DeleteResourceMappingRequest)  returns (google.protobuf.Empty);
+    rpc AddMappingDevice(AddMappingDeviceRequest)            returns (ResourceMapping);
+    rpc RemoveMappingDevice(RemoveMappingDeviceRequest)      returns (ResourceMapping);
+
+    // ── Notifications (#5) ──
+    rpc CreateNotificationTarget(CreateNotificationTargetRequest) returns (NotificationTarget);
+    rpc ListNotificationTargets(ListNotificationTargetsRequest)   returns (ListNotificationTargetsResponse);
+    rpc DeleteNotificationTarget(DeleteNotificationTargetRequest)  returns (google.protobuf.Empty);
+    rpc TestNotificationTarget(TestNotificationTargetRequest)      returns (google.protobuf.Empty);
+    rpc CreateNotificationRoute(CreateNotificationRouteRequest)    returns (NotificationRoute);
+    rpc ListNotificationRoutes(ListNotificationRoutesRequest)      returns (ListNotificationRoutesResponse);
+    rpc DeleteNotificationRoute(DeleteNotificationRouteRequest)     returns (google.protobuf.Empty);
+
+    // ── Registry credentials (v23) ──
+    rpc SetRegistryCredential(SetRegistryCredentialRequest)         returns (RegistryCredential);
+    rpc ListRegistryCredentials(ListRegistryCredentialsRequest)     returns (ListRegistryCredentialsResponse);
+    rpc DeleteRegistryCredential(DeleteRegistryCredentialRequest)   returns (google.protobuf.Empty);
+
+    // ── Distributed firewall: cluster/host tiers, ipsets, default-deny (v21) ──
+    rpc CreateClusterFirewallRule(CreateClusterFirewallRuleRequest) returns (FirewallRule);
+    rpc ListClusterFirewallRules(ListClusterFirewallRulesRequest)   returns (ListClusterFirewallRulesResponse);
+    rpc DeleteClusterFirewallRule(DeleteClusterFirewallRuleRequest) returns (google.protobuf.Empty);
+    rpc CreateHostFirewallRule(CreateHostFirewallRuleRequest)       returns (FirewallRule);
+    rpc ListHostFirewallRules(ListHostFirewallRulesRequest)         returns (ListHostFirewallRulesResponse);
+    rpc DeleteHostFirewallRule(DeleteHostFirewallRuleRequest)       returns (google.protobuf.Empty);
+    rpc CreateIpSet(CreateIpSetRequest)                             returns (IpSet);
+    rpc ListIpSets(ListIpSetsRequest)                               returns (ListIpSetsResponse);
+    rpc DeleteIpSet(DeleteIpSetRequest)                             returns (google.protobuf.Empty);
+    rpc SetFirewallDefault(SetFirewallDefaultRequest)               returns (google.protobuf.Empty);
+    rpc ListFirewallDefaults(ListFirewallDefaultsRequest)           returns (ListFirewallDefaultsResponse);
+    rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
+    // Incremental replica push (dirty extents into a raw replica on a peer pool).
+    rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);
+
+    // ── Internal ──
+    rpc Ping(PingRequest) returns (PingResponse);
+
+    // ── Internal: Network Sync ──
+    rpc ProvisionNetwork(ProvisionNetworkRequest)  returns (google.protobuf.Empty);
+    rpc SyncVTEP(SyncVTEPRequest)                  returns (google.protobuf.Empty);
+    rpc GetVMIPRemote(GetVMIPRequest)              returns (GetVMIPResponse);
+    rpc RefreshLB(RefreshLBRequest)                returns (google.protobuf.Empty);
+    rpc UpdateFDB(UpdateFDBRequest)                returns (google.protobuf.Empty);
+
+    // ── Internal: Migration helpers ──
+    rpc EnsureCloudInit(EnsureCloudInitRequest)    returns (google.protobuf.Empty);
+    rpc EnsureDisks(EnsureDisksRequest)            returns (google.protobuf.Empty);
+    rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
+
+    // ── Internal: State Sync ──
+    rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);
+    rpc GetStateDump(google.protobuf.Empty)         returns (StateDumpResponse);
+
+    // ── Internal: WAL Replication ──
+    rpc PushMutations(ReplicateRequest)             returns (ReplicateResponse);
+    rpc AckMutations(AckRequest)                   returns (google.protobuf.Empty);
+
+    // ──: Rebalancer (placement engine v2) ──
+    rpc ListRebalanceProposals(ListRebalanceProposalsRequest) returns (ListRebalanceProposalsResponse);
+    rpc RunRebalance(RunRebalanceRequest)                     returns (RunRebalanceResponse);
+    rpc ApproveRebalanceProposal(ApproveRebalanceProposalRequest) returns (RebalanceProposal);
+    rpc RejectRebalanceProposal(RejectRebalanceProposalRequest)   returns (RebalanceProposal);
+
+    // ──: SPICE console info ──
+    rpc GetSpiceInfo(GetSpiceInfoRequest) returns (GetSpiceInfoResponse);
+
+    // ── Upgrade safety: pre-flight ──
+    rpc PreflightUpgrade(PreflightUpgradeRequest) returns (PreflightUpgradeResponse);
+
+    // ── federation ──
+    // ListRegions returns the distinct region labels in use across hosts.
+    // RegionStatus rolls up host + VM counts per region.
+    // CrossRegionMigrate is a thin wrapper around MigrateVM that refuses
+    // when source/target hosts are in the same region; when
+    // include_disks=true, it drives ReplicateVolume per disk to the
+    // target host before starting the live migration.
+    rpc ListRegions(ListRegionsRequest)                returns (ListRegionsResponse);
+    rpc RegionStatus(RegionStatusRequest)              returns (RegionStatusResponse);
+    rpc CrossRegionMigrate(CrossRegionMigrateRequest)  returns (stream MigrateProgress);
+
+    // ── anycast services ──
+    // service_endpoints map a logical name (e.g. "api.litevirt.local")
+    // to N (ip, region) pairs. The embedded DNS server round-robins
+    // among them so a multi-region frontend surfaces under one name
+    // without external anycast routing.
+    rpc UpsertServiceEndpoint(UpsertServiceEndpointRequest) returns (ServiceEndpoint);
+    rpc ListServiceEndpoints(ListServiceEndpointsRequest)   returns (ListServiceEndpointsResponse);
+    rpc DeleteServiceEndpoint(DeleteServiceEndpointRequest) returns (google.protobuf.Empty);
+
+    // ── snapshot scheduler ──
+    // BackupSchedule rows live in the `backup_schedules` Corrosion
+    // table; the leader-gated minute-tick scheduler dispatches each
+    // matching row through BackupSnapshot.
+    rpc CreateBackupSchedule(CreateBackupScheduleRequest) returns (BackupSchedule);
+    rpc ListBackupSchedules(ListBackupSchedulesRequest)   returns (ListBackupSchedulesResponse);
+    rpc DeleteBackupSchedule(DeleteBackupScheduleRequest) returns (google.protobuf.Empty);
+
+    // Replication schedules share the backup_schedules table (type='replication')
+    // and the same minute-tick scheduler; each matching row replicates the VM's
+    // disk to target_pool. See ReplicationSchedule.
+    rpc CreateReplicationSchedule(CreateReplicationScheduleRequest) returns (ReplicationSchedule);
+    rpc ListReplicationSchedules(ListReplicationSchedulesRequest)   returns (ListReplicationSchedulesResponse);
+    rpc DeleteReplicationSchedule(DeleteReplicationScheduleRequest) returns (google.protobuf.Empty);
+    // PromoteReplica brings an inert replica online: defines+starts the VM
+    // against an overlay backed by the chosen replica on the host that holds
+    // it, then localizes via blockpull. Disaster recovery after host loss.
+    rpc PromoteReplica(PromoteReplicaRequest) returns (stream PromoteReplicaProgress);
+
+    // ── tamper-evident audit log ──
+    // VerifyAuditChain walks every audit_log row from the oldest
+    // forward and confirms each content_hash matches the
+    // SHA-256(prev_hash || canonical(row)) recomputation. Returns
+    // the first ID that fails (or "" for a clean run).
+    // ExportAuditChain emits a JSON blob containing the rows in a
+    // time-range — suitable for WORM offload to S3 Object Lock /
+    // an immutable tape vault.
+    rpc VerifyAuditChain(google.protobuf.Empty)         returns (VerifyAuditChainResponse);
+    rpc ExportAuditChain(ExportAuditChainRequest)       returns (ExportAuditChainResponse);
+
+    // ── tenancy ──
+    // Projects are hierarchical buckets for VMs / volumes / etc.
+    // Quotas gate VM admission against (vcpu, mem, disk, nics).
+    // The "_default" project is implicit — operators only touch
+    // these RPCs when they're carving multi-tenancy.
+    rpc CreateProject(CreateProjectRequest)         returns (Project);
+    rpc ListProjects(google.protobuf.Empty)         returns (ListProjectsResponse);
+    rpc GetProject(GetProjectRequest)               returns (Project);
+    rpc DeleteProject(DeleteProjectRequest)         returns (google.protobuf.Empty);
+    rpc SetProjectQuota(SetProjectQuotaRequest)     returns (ProjectQuota);
+    rpc GetProjectQuota(GetProjectQuotaRequest)     returns (ProjectQuota);
+    rpc GetProjectUsage(GetProjectUsageRequest)     returns (ProjectUsage);
+}
+
+// Pre-flight check before `lv host upgrade`. Surfaces in-flight work,
+// lease holdings, and other conditions that would make a daemon restart
+// unsafe. Always advisory — operators can pass --force to ignore.
+message PreflightUpgradeRequest  {
+    string target_host = 1;   // empty = local host
+}
+message PreflightUpgradeResponse {
+    bool   ok       = 1;       // true if no blocking conditions found
+    string host     = 2;
+    repeated PreflightFinding findings = 3;
+}
+message PreflightFinding {
+    string severity = 1;       // "block" | "warn"
+    string code     = 2;       // machine-readable category
+    string message  = 3;       // human-readable detail
+}
+
+message GetSpiceInfoRequest  { string vm_name = 1; }
+message GetSpiceInfoResponse {
+    string host = 1;       // host the VM runs on
+    int32  port = 2;       // SPICE TCP port (libvirt-assigned)
+    string uri  = 3;       // convenience: "spice://<host>:<port>"
+}
+
+// ── Rebalancer messages ──
+
+message RebalanceProposal {
+    string id            = 1;
+    string vm_name       = 2;
+    string src_host      = 3;
+    string dst_host      = 4;
+    string policy        = 5;
+    double expected_gain = 6;     // % score improvement
+    string status        = 7;     // pending | approved | applied | rejected | expired
+    string proposed_at   = 8;
+    string applied_at    = 9;
+    string expires_at    = 10;
+    string detail        = 11;
+}
+
+message ListRebalanceProposalsRequest {
+    string status_filter = 1;     // empty = all
+}
+message ListRebalanceProposalsResponse {
+    repeated RebalanceProposal proposals = 1;
+}
+
+message RunRebalanceRequest {
+    bool dry_run = 1;             // dry_run=true forces DryRun mode regardless of per-VM config
+}
+message RunRebalanceResponse {
+    int32 proposals_emitted = 1;
+}
+
+message ApproveRebalanceProposalRequest { string id = 1; }
+message RejectRebalanceProposalRequest  {
+    string id     = 1;
+    string reason = 2;
+}
+
+// ── federation messages ──
+
+message ListRegionsRequest  {}
+message ListRegionsResponse { repeated string regions = 1; }
+
+message RegionStatusRequest  { string region = 1; } // empty = all regions
+message RegionStatusResponse { repeated RegionStatus statuses = 1; }
+message RegionStatus {
+    string name           = 1;
+    int32  host_count     = 2;
+    int32  active_hosts   = 3;
+    int32  vm_count       = 4;
+    string last_updated   = 5;  // RFC3339, max(updated_at) across hosts in the region
+}
+
+// CrossRegionMigrate refuses when source/target hosts are in the
+// same region; otherwise it forwards to MigrateVM. The stream surface
+// matches MigrateVM's so existing UI code can be reused.
+//
+// When include_disks=true, the server drives ReplicateVolume per
+// disk to the target host's local storage before starting the
+// migration. The streamed progress carries MigratePhase=COPY during
+// the replication step.
+message CrossRegionMigrateRequest {
+    string vm_name      = 1;
+    string target_host  = 2;   // host in the destination region
+    bool   live         = 3;   // mirror MigrateVM.live
+    bool   include_disks = 4;  // mirror MigrateVM.include_disks
+    // target_pool, when set, names the storage pool on target_host to
+    // place replicated disks into. Empty = the default pool.
+    string target_pool   = 5;
+}
+
+// anycast services.
+message ServiceEndpoint {
+    string service_name = 1;
+    string ip           = 2;
+    string region       = 3;
+    int32  weight       = 4;
+}
+message UpsertServiceEndpointRequest {
+    string service_name = 1;
+    string ip           = 2;
+    string region       = 3;
+    int32  weight       = 4;
+}
+message ListServiceEndpointsRequest {
+    string service_name = 1;   // empty = list all services
+}
+message ListServiceEndpointsResponse {
+    repeated ServiceEndpoint endpoints = 1;
+}
+message DeleteServiceEndpointRequest {
+    string service_name = 1;
+    string ip           = 2;
+}
+
+// ── snapshot scheduler messages ──
+
+message BackupSchedule {
+    string vm_name        = 1;   // identity key; sentinel for non-vm scopes (@pool:X / @project:Y / @cluster)
+    string repo           = 2;   // logical repo name resolved via daemon backup_repos config
+    string cron           = 3;   // 5-field standard cron, e.g. "0 2 * * *"
+    int32  keep_last      = 4;
+    int32  keep_daily     = 5;
+    int32  keep_weekly    = 6;
+    int32  keep_monthly   = 7;
+    int32  keep_yearly    = 8;
+    bool   enabled        = 9;
+    string last_run_at    = 10;  // RFC3339; "" = never run
+    string last_run_err   = 11;  // "" = success
+    string scope          = 12;  // "vm" | "pool" | "cluster" | "project" (default "vm")
+    string pool_name      = 13;  // set when scope = "pool"
+    string project_name   = 14;  // set when scope = "project"
+}
+
+message CreateBackupScheduleRequest {
+    string vm_name        = 1;   // set when scope = "vm" (or empty + scope)
+    string repo           = 2;
+    string cron           = 3;
+    int32  keep_last      = 4;
+    int32  keep_daily     = 5;
+    int32  keep_weekly    = 6;
+    int32  keep_monthly   = 7;
+    int32  keep_yearly    = 8;
+    bool   enabled        = 9;
+    string scope          = 10;  // "vm" (default) | "pool" | "cluster" | "project"
+    string pool_name      = 11;  // required when scope = "pool"
+    string project_name   = 12;  // required when scope = "project"
+}
+message ListBackupSchedulesRequest  {}
+message ListBackupSchedulesResponse {
+    repeated BackupSchedule schedules = 1;
+}
+message DeleteBackupScheduleRequest {
+    string vm_name      = 1;
+    string repo         = 2;
+    string scope        = 3;   // "vm" (default) | "pool" | "cluster" | "project"
+    string pool_name    = 4;
+    string project_name = 5;
+}
+
+// ── replication schedule messages ──
+message ReplicationSchedule {
+    string vm_name       = 1;   // identity key; sentinel for non-vm scopes
+    string cron          = 2;
+    string target_pool   = 3;   // destination pool (also the row's repo key)
+    string target_host   = 4;   // "" = shared-pool/auto healthy-peer selection
+    int32  keep_replicas = 5;   // 0 = keep all
+    bool   enabled       = 6;
+    string scope         = 7;   // "vm" (default) | "pool" | "cluster" | "project"
+    string pool_name     = 8;   // set when scope = "pool"
+    string project_name  = 9;   // set when scope = "project"
+    string last_run_at   = 10;  // RFC3339; "" = never run
+    string last_run_err  = 11;  // "" = success
+    bool   incremental   = 12;  // transfer only dirty extents (raw replicas); full-copy fallback
+    bool   auto_promote  = 13;  // failover may promote the freshest replica on host loss
+}
+message CreateReplicationScheduleRequest {
+    string vm_name       = 1;
+    string cron          = 2;
+    string target_pool   = 3;
+    string target_host   = 4;   // optional — explicit target host
+    int32  keep_replicas = 5;
+    bool   enabled       = 6;
+    string scope         = 7;
+    string pool_name     = 8;
+    string project_name  = 9;
+    bool   incremental   = 10;
+    bool   auto_promote  = 11;
+}
+message ListReplicationSchedulesRequest  {}
+message ListReplicationSchedulesResponse { repeated ReplicationSchedule schedules = 1; }
+message DeleteReplicationScheduleRequest {
+    string vm_name     = 1;
+    string target_pool = 2;   // the row's repo key
+    string scope       = 3;
+    string pool_name   = 4;
+    string project_name = 5;
+}
+
+// ── audit chain messages ──
+
+message VerifyAuditChainResponse {
+    int32  rows_checked = 1;
+    string broken_at_id = 2;   // empty if chain intact
+    string error        = 3;   // non-empty if the verify itself failed
+}
+
+message ExportAuditChainRequest {
+    // ISO-8601 / RFC3339 timestamps (UTC). Empty since/until means
+    // "from the beginning" / "to the end".
+    string since = 1;
+    string until = 2;
+}
+message ExportAuditChainResponse {
+    // JSON blob — caller writes this to a WORM destination
+    // (S3 Object Lock, immutable filesystem, etc.). Format:
+    // {"rows": [{"id":..,"timestamp":..,..,"content_hash":..},...]}
+    string json     = 1;
+    int32  row_count = 2;
+}
+
+// ── tenancy messages ──
+
+message Project {
+    string name        = 1;
+    string display     = 2;
+    string parent_name = 3;
+    string created_at  = 4;
+    string updated_at  = 5;
+}
+
+message CreateProjectRequest {
+    string name        = 1;
+    string display     = 2;
+    string parent_name = 3;
+}
+message ListProjectsResponse  { repeated Project projects = 1; }
+message GetProjectRequest     { string name = 1; }
+message DeleteProjectRequest  { string name = 1; }
+
+message ProjectQuota {
+    string project_name    = 1;
+    int32  vcpu_limit       = 2;
+    int32  mem_mib_limit    = 3;
+    int32  disk_gib_limit   = 4;
+    int32  nic_limit        = 5;
+    int32  public_ip_limit  = 6;
+    int32  backup_gib_limit = 7;
+}
+message SetProjectQuotaRequest { ProjectQuota quota = 1; }
+message GetProjectQuotaRequest { string project_name = 1; }
+
+message ProjectUsage {
+    string project_name = 1;
+    int32  vcpu_used    = 2;
+    int32  mem_mib_used = 3;
+    int32  disk_gib_used = 4;
+    int32  nic_used     = 5;
+    int32  vm_count     = 6;
+    int32  public_ips_used = 7; // NICs with a non-private address
+    int32  backup_gib_used = 8; // summed manifest size across the project's VMs
+}
+message GetProjectUsageRequest { string project_name = 1; }

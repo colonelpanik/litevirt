@@ -1,0 +1,73 @@
+{{if .Warnings}}
+<div style="margin-bottom:12px">
+  {{range .Warnings}}
+  <div style="background:rgba(245,158,11,0.1);border:1px solid var(--yellow);border-radius:4px;padding:6px 10px;margin-bottom:4px;font-size:13px">{{.Detail}}</div>
+  {{end}}
+</div>
+{{end}}
+
+{{if .Networks}}
+<h4 style="margin:8px 0 4px">Networks</h4>
+<table>
+  <thead><tr><th>Action</th><th>Detail</th></tr></thead>
+  <tbody>
+  {{range .Networks}}
+  <tr>
+    <td>{{if eq .Kind "DIFF_CREATE"}}<span class="badge badge-green">create</span>{{else if eq .Kind "DIFF_DELETE"}}<span class="badge badge-red">delete</span>{{else}}<span class="badge badge-gray">no change</span>{{end}}</td>
+    <td>{{.Detail}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{if .VMs}}
+<h4 style="margin:8px 0 4px">VMs</h4>
+<table>
+  <thead><tr><th>Action</th><th>Name</th><th>Detail</th></tr></thead>
+  <tbody>
+  {{range .VMs}}
+  <tr>
+    <td>{{if eq .Kind "DIFF_CREATE"}}<span class="badge badge-green">create</span>{{else if eq .Kind "DIFF_UPDATE"}}<span class="badge badge-blue">update</span>{{else if eq .Kind "DIFF_DELETE"}}<span class="badge badge-red">delete</span>{{else}}<span class="badge badge-gray">no change</span>{{end}}</td>
+    <td>{{.Name}}</td>
+    <td>{{.Detail}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{if .LBs}}
+<h4 style="margin:8px 0 4px">Load Balancers</h4>
+<table>
+  <thead><tr><th>Action</th><th>Detail</th></tr></thead>
+  <tbody>
+  {{range .LBs}}
+  <tr>
+    <td>{{if eq .Kind "DIFF_CREATE"}}<span class="badge badge-green">create</span>{{else if eq .Kind "DIFF_UPDATE"}}<span class="badge badge-blue">update</span>{{else}}<span class="badge badge-gray">no change</span>{{end}}</td>
+    <td>{{.Detail}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{if .DNS}}
+<h4 style="margin:8px 0 4px">DNS Records</h4>
+<table>
+  <thead><tr><th>VM</th><th>Detail</th></tr></thead>
+  <tbody>
+  {{range .DNS}}
+  <tr>
+    <td>{{.Name}}</td>
+    <td>{{.Detail}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+<div class="form-actions" style="margin-top:12px">
+  <button type="button" class="btn" onclick="backToYaml()">Back</button>
+  <button type="button" class="btn btn-primary" onclick="confirmDeploy(this)">Confirm &amp; Deploy</button>
+</div>

@@ -1,0 +1,41 @@
+{
+  "description": "Quorum + peer health + clock-skew + HLC rejection metrics. Plan §2.4 bundled dashboard.",
+  "editable": true,
+  "panels": [
+    {
+      "type": "table",
+      "title": "Peer health matrix",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "litevirt_peer_healthy", "legendFormat": "{{observer}} → {{target}}"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "HLC remote-skew rejections",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "rate(litevirt_hlc_rejected_total[5m])"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cluster clock skew",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {"expr": "litevirt_cluster_clock_skew_seconds", "legendFormat": "{{observer}} → {{target}}"}
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["litevirt", "clustering"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "litevirt — Clustering Health",
+  "uid": "litevirt-clustering-health",
+  "version": 1
+}

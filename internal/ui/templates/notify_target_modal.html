@@ -1,0 +1,27 @@
+<div class="modal-overlay" id="notify-target-modal">
+  <div class="modal" style="max-width:480px">
+    <h3>Add notification target</h3>
+    <form hx-post="/ui/notifications/targets" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('notify-target-modal').remove()">
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" required placeholder="ops-slack">
+      </div>
+      <div class="form-row">
+        <label>Type</label>
+        <select name="type">
+          <option value="webhook">Webhook (generic JSON POST)</option>
+          <option value="slack">Slack (incoming webhook)</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>URL</label>
+        <input type="text" name="url" required placeholder="https://hooks.slack.com/services/…">
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('notify-target-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>

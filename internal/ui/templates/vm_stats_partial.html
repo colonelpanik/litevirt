@@ -1,0 +1,29 @@
+<div id="vm-stats" hx-get="/ui/vms/{{.Name}}/stats" hx-trigger="every 3s" hx-swap="outerHTML">
+  <div class="section">
+    <div class="section-header"><h2>Live Resource Usage</h2></div>
+    <div style="padding:16px">
+      <div class="grid-4">
+        <div class="card">
+          <div class="card-title">CPU Usage</div>
+          <div class="card-value">{{formatPct .CpuPct}}%</div>
+          <div class="progress-bar"><div class="progress-bar-fill" style="width:{{formatPct .CpuPct}}%;background:var(--accent)"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Memory (RSS)</div>
+          <div class="card-value">{{bytesToMiB .MemRssBytes}}MiB</div>
+          {{if .MemTotalBytes}}<div class="card-sub">of {{bytesToMiB .MemTotalBytes}}MiB allocated</div>
+          <div class="progress-bar"><div class="progress-bar-fill" style="width:{{formatPct (memPctOf .MemRssBytes .MemTotalBytes)}}%;background:var(--blue)"></div></div>{{end}}
+        </div>
+        <div class="card">
+          <div class="card-title">Disk I/O</div>
+          <div class="card-value" style="font-size:14px">R: {{formatBytes .DiskRdBytes}}<br>W: {{formatBytes .DiskWrBytes}}</div>
+          <div class="card-sub">{{.DiskRdReqs}} rd / {{.DiskWrReqs}} wr ops</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Network I/O</div>
+          <div class="card-value" style="font-size:14px">RX: {{formatBytes .NetRxBytes}}<br>TX: {{formatBytes .NetTxBytes}}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,48 @@
+{{define "content"}}
+<div class="detail-header">
+  <a href="/stacks/{{.StackName}}" class="back">← {{.StackName}}</a>
+  <h1>{{.StackName}} — Logs</h1>
+</div>
+
+{{if .VMNames}}
+<div style="display:flex;gap:8px;margin-bottom:12px">
+  {{range $i, $vm := .VMNames}}
+  <button class="btn {{if eq $i 0}}btn-primary{{end}}" onclick="switchTab('{{$vm}}', this)">{{$vm}}</button>
+  {{end}}
+</div>
+
+{{range $i, $vm := .VMNames}}
+<div class="log-tab" id="tab-{{$vm}}" style="{{if ne $i 0}}display:none{{end}}">
+  <pre class="log-output" id="log-{{$vm}}" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:12px;font-size:12px;max-height:60vh;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></pre>
+</div>
+{{end}}
+
+<script>
+(function() {
+  var vms = [{{range $i, $vm := .VMNames}}{{if $i}},{{end}}'{{$vm}}'{{end}}];
+  vms.forEach(function(vm) {
+    var output = document.getElementById('log-' + vm);
+    var es = new EventSource('/ui/vms/' + encodeURIComponent(vm) + '/logs/stream?lines=100');
+    es.addEventListener('log', function(e) {
+      output.textContent += e.data + '\n';
+      if (output.parentElement.style.display !== 'none') output.scrollTop = output.scrollHeight;
+    });
+    es.addEventListener('done', function() { es.close(); });
+    es.addEventListener('error', function() { es.close(); });
+    window.addEventListener('beforeunload', function() { es.close(); });
+  });
+})();
+
+function switchTab(vm, btn) {
+  document.querySelectorAll('.log-tab').forEach(function(t) { t.style.display = 'none'; });
+  document.getElementById('tab-' + vm).style.display = 'block';
+  btn.parentElement.querySelectorAll('.btn').forEach(function(b) { b.classList.remove('btn-primary'); });
+  btn.classList.add('btn-primary');
+  var output = document.getElementById('log-' + vm);
+  output.scrollTop = output.scrollHeight;
+}
+</script>
+{{else}}
+<p style="color:var(--muted);padding:12px">No VMs in this stack</p>
+{{end}}
+{{end}}

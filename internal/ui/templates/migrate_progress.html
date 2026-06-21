@@ -1,0 +1,47 @@
+<div id="migrate-progress"
+  {{- if not .Done}} hx-get="/ui/vms/{{.VMName}}/migrate-progress" hx-trigger="every 1s" hx-swap="outerHTML"{{end}}>
+  <h3 style="margin:0 0 12px">Migrating {{.VMName}}</h3>
+  <p style="color:var(--muted);font-size:13px;margin:0 0 16px">{{.VMName}} &rarr; {{.TargetHost}}</p>
+
+  {{if .Error}}
+    <div style="padding:10px 12px;background:rgba(239,68,68,0.1);border:1px solid var(--red);border-radius:6px;color:var(--red);font-size:13px;margin-bottom:12px">
+      {{.Error}}
+    </div>
+  {{end}}
+
+  {{if not .Error}}
+  <div style="margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px">
+      <span>{{.Status}}</span>
+      {{if gt .DiskPct 0.0}}<span>Disk {{printf "%.0f" .DiskPct}}%</span>{{end}}
+    </div>
+    <div class="progress-bar" style="height:6px">
+      <div class="progress-bar-fill" style="width:{{printf "%.0f" .OverallPct}}%;background:var(--blue)"></div>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+    {{range .Phases}}
+    <span class="badge {{.BadgeClass}}">{{.Label}}</span>
+    {{end}}
+  </div>
+
+  {{if gt .MemoryPct 0.0}}
+  <div style="font-size:12px;color:var(--muted)">Memory: {{printf "%.0f" .MemoryPct}}%</div>
+  {{end}}
+  {{end}}
+
+  <div class="form-actions">
+    {{if .Done}}
+      {{if .Error}}
+      <button type="button" class="btn" onclick="document.getElementById('migrate-modal').remove()">Close</button>
+      {{else}}
+      <button type="button" class="btn btn-primary" onclick="window.location.href='/vms/{{.VMName}}'">Done</button>
+      {{end}}
+    {{else}}
+      <button type="button" class="btn no-loading" disabled>
+        <span class="spinner"></span> Migrating...
+      </button>
+    {{end}}
+  </div>
+</div>

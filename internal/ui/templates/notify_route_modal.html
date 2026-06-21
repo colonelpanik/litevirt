@@ -1,0 +1,31 @@
+<div class="modal-overlay" id="notify-route-modal">
+  <div class="modal" style="max-width:480px">
+    <h3>Add notification route</h3>
+    <form hx-post="/ui/notifications/routes" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('notify-route-modal').remove()">
+      <div class="form-row">
+        <label>Event pattern</label>
+        <input type="text" name="event_pattern" value="*" placeholder="* | backup.* | host.fenced">
+        <small class="muted">Events: backup.failed, host.fenced, replication.failed, quota.exceeded</small>
+      </div>
+      <div class="form-row">
+        <label>Target</label>
+        <select name="target_id" required>
+          {{range .Targets}}<option value="{{.ID}}">{{.Name}} ({{.Type}})</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Minimum severity</label>
+        <select name="min_severity">
+          <option value="info">info</option>
+          <option value="warn" selected>warn</option>
+          <option value="error">error</option>
+        </select>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('notify-route-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>

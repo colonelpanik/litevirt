@@ -1,0 +1,246 @@
+package grpcapi
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+// fakeCTRuntime captures every call so handler tests can assert
+// behaviour without standing up real LXC.
+type fakeCTRuntime struct {
+	mu sync.Mutex
+	createCalls []CreateContainerOpts
+	startCalls  []string
+	stopCalls   []struct {
+		Name    string
+		Timeout int
+	}
+	deleteCalls []string
+	execCalls   []struct {
+		Name string
+		Argv []string
+	}
+	pullCalls []struct{ Image, Dest, Tag, Username, Password string }
+
+	createErr error
+	createOut *ContainerInfo
+}
+
+func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createCalls = append(f.createCalls, opts)
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	if f.createOut != nil {
+		return f.createOut, nil
+	}
+	return &ContainerInfo{Name: opts.Name, State: "stopped"}, nil
+}
+func (f *fakeCTRuntime) StartContainer(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.startCalls = append(f.startCalls, name)
+	return nil
+}
+func (f *fakeCTRuntime) StopContainer(_ context.Context, name string, timeoutSec int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls = append(f.stopCalls, struct {
+		Name    string
+		Timeout int
+	}{name, timeoutSec})
+	return nil
+}
+func (f *fakeCTRuntime) DeleteContainer(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteCalls = append(f.deleteCalls, name)
+	return nil
+}
+func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []string) (ContainerExecResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.execCalls = append(f.execCalls, struct {
+		Name string
+		Argv []string
+	}{name, argv})
+	return ContainerExecResult{Stdout: []byte("ok"), ExitCode: 0}, nil
+}
+func (f *fakeCTRuntime) StateContainer(_ context.Context, _ string) (string, error) { return "running", nil }
+func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error)         { return nil, nil }
+func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pullCalls = append(f.pullCalls, struct{ Image, Dest, Tag, Username, Password string }{image, dest, tag, username, password})
+	return nil
+}
+
+// TestCreateContainer_LocalHost_PersistsRow verifies the happy path:
+// runtime.Create is invoked, and a containers row exists for the new
+// name on this host.
+func TestCreateContainer_LocalHost_PersistsRow(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	rt := &fakeCTRuntime{}
+	s.SetContainerRuntime(rt)
+
+	ct, err := s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{
+		Name: "alpine-1", Template: "download", Distro: "alpine", Release: "3.19", Arch: "amd64",
+		Cpu: 2, MemoryMib: 256,
+	})
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	if ct.HostName != "host-a" || ct.Name != "alpine-1" {
+		t.Errorf("response = %+v", ct)
+	}
+	if len(rt.createCalls) != 1 {
+		t.Errorf("runtime.Create called %d times, want 1", len(rt.createCalls))
+	}
+	row, err := corrosion.GetContainer(context.Background(), s.db, "host-a", "alpine-1")
+	if err != nil || row == nil {
+		t.Fatalf("expected containers row, got %v / %v", row, err)
+	}
+}
+
+// TestCreateContainer_NoRuntime_Unavailable handles the "lxc-* not on
+// this host" case with a clear error.
+func TestCreateContainer_NoRuntime_Unavailable(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	// no runtime set
+	_, err := s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{Name: "x"})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable, got %v", err)
+	}
+}
+
+// TestCreateContainer_RuntimeError_Internal surfaces a runtime failure
+// as Internal so operators see the lxc-create stderr.
+func TestCreateContainer_RuntimeError_Internal(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.SetContainerRuntime(&fakeCTRuntime{createErr: errors.New("disk full")})
+
+	_, err := s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{Name: "x"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal, got %v", err)
+	}
+}
+
+// TestStartStopDeleteContainer_LocalHost_StateTransitions verifies
+// each lifecycle RPC drives both the runtime and the cluster row.
+func TestStartStopDeleteContainer_LocalHost_StateTransitions(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	rt := &fakeCTRuntime{}
+	s.SetContainerRuntime(rt)
+	if _, err := s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{Name: "ct1", Template: "download", Distro: "alpine"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := s.StartContainer(adminCtx(), &pb.StartContainerRequest{Name: "ct1"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	row, _ := corrosion.GetContainer(context.Background(), s.db, "host-a", "ct1")
+	if row.State != "running" {
+		t.Errorf("after Start state = %q, want running", row.State)
+	}
+
+	if _, err := s.StopContainer(adminCtx(), &pb.StopContainerRequest{Name: "ct1", TimeoutSec: 5}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	row, _ = corrosion.GetContainer(context.Background(), s.db, "host-a", "ct1")
+	if row.State != "stopped" {
+		t.Errorf("after Stop state = %q, want stopped", row.State)
+	}
+	if rt.stopCalls[0].Timeout != 5 {
+		t.Errorf("Stop timeout = %d, want 5", rt.stopCalls[0].Timeout)
+	}
+
+	if _, err := s.DeleteContainer(adminCtx(), &pb.DeleteContainerRequest{Name: "ct1"}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	row, _ = corrosion.GetContainer(context.Background(), s.db, "host-a", "ct1")
+	if row != nil {
+		t.Errorf("expected soft-deleted row to disappear from GetContainer, got %+v", row)
+	}
+}
+
+// TestExecContainer_PassesThroughResult — the unstructured stdout/
+// exit_code passes back to the caller verbatim.
+func TestExecContainer_PassesThroughResult(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.SetContainerRuntime(&fakeCTRuntime{})
+
+	res, err := s.ExecContainer(adminCtx(), &pb.ExecContainerRequest{
+		Name: "ct1", Argv: []string{"echo", "hi"},
+	})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if string(res.Stdout) != "ok" {
+		t.Errorf("stdout = %q", res.Stdout)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("exit = %d", res.ExitCode)
+	}
+}
+
+// TestListContainers_AggregatesAcrossHosts verifies the cluster-wide
+// query returns rows owned by other hosts even though this server
+// only has the local runtime.
+func TestListContainers_AggregatesAcrossHosts(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	ctx := context.Background()
+	_ = corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running",
+	})
+	_ = corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-b", Name: "ct2", State: "stopped",
+	})
+	resp, err := s.ListContainers(adminCtx(), &pb.ListContainersRequest{})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(resp.Containers) != 2 {
+		t.Errorf("got %d containers cluster-wide, want 2: %+v", len(resp.Containers), resp.Containers)
+	}
+	// And filter-by-host returns only the host's rows.
+	resp, _ = s.ListContainers(adminCtx(), &pb.ListContainersRequest{HostName: "host-b"})
+	if len(resp.Containers) != 1 || resp.Containers[0].HostName != "host-b" {
+		t.Errorf("filtered by host-b, got %+v", resp.Containers)
+	}
+}
+
+// TestPullOCIImage_ForwardsToRuntime calls through and asserts the
+// runtime sees the image arguments.
+func TestPullOCIImage_ForwardsToRuntime(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	rt := &fakeCTRuntime{}
+	s.SetContainerRuntime(rt)
+	if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{
+		Image: "alpine:3.19", Dest: "/tmp/r",
+	}); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if len(rt.pullCalls) != 1 {
+		t.Fatalf("pull calls = %d, want 1", len(rt.pullCalls))
+	}
+	if rt.pullCalls[0].Image != "alpine:3.19" || rt.pullCalls[0].Dest != "/tmp/r" {
+		t.Errorf("pull args wrong: %+v", rt.pullCalls[0])
+	}
+}

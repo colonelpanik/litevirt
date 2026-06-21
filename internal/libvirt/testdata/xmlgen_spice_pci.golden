@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<domain type="kvm">
+  <name>vm-gpu</name>
+  <memory unit="KiB">16777216</memory>
+  <vcpu>8</vcpu>
+  <iothreads>2</iothreads>
+  <cpu mode="host-passthrough"></cpu>
+  <cputune>
+    <vcpupin vcpu="0" cpuset="0"></vcpupin>
+    <vcpupin vcpu="1" cpuset="1"></vcpupin>
+    <vcpupin vcpu="2" cpuset="2"></vcpupin>
+    <vcpupin vcpu="3" cpuset="3"></vcpupin>
+  </cputune>
+  <numatune>
+    <memory mode="strict" nodeset="0"></memory>
+  </numatune>
+  <memoryBacking>
+    <hugepages></hugepages>
+  </memoryBacking>
+  <os>
+    <type arch="x86_64" machine="q35">hvm</type>
+    <loader readonly="yes" type="pflash">/usr/share/OVMF/OVMF_CODE_4M.fd</loader>
+    <nvram template="/usr/share/OVMF/OVMF_VARS_4M.fd"></nvram>
+  </os>
+  <features>
+    <acpi></acpi>
+    <apic></apic>
+  </features>
+  <clock offset="utc"></clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" cache="none"></driver>
+      <source file="/data/vm-gpu/root.qcow2"></source>
+      <target dev="vda" bus="virtio"></target>
+      <boot order="1"></boot>
+    </disk>
+    <interface type="bridge">
+      <mac address="52:54:00:de:ad:be"></mac>
+      <source bridge="br0"></source>
+      <model type="virtio"></model>
+    </interface>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source>
+        <address domain="0x0000" bus="0x41" slot="0x00" function="0x0"></address>
+      </source>
+    </hostdev>
+    <serial type="pty">
+      <target type="isa-serial" port="0"></target>
+    </serial>
+    <console type="pty">
+      <target type="serial" port="0"></target>
+    </console>
+    <graphics type="vnc" port="-1" autoport="yes">
+      <listen type="address" address="127.0.0.1"></listen>
+    </graphics>
+    <graphics type="spice" port="-1" autoport="yes">
+      <listen type="address" address="127.0.0.1"></listen>
+    </graphics>
+    <video>
+      <model type="virtio"></model>
+    </video>
+    <memballoon model="virtio"></memballoon>
+  </devices>
+</domain>

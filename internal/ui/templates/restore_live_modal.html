@@ -1,0 +1,39 @@
+<div class="modal-overlay" id="restore-live-modal">
+  <div class="modal" style="max-width:560px">
+    <h3>Live restore (NBD overlay)</h3>
+    <p class="muted" style="font-size:13px;margin-top:0">
+      Spins up an NBD server backed by the snapshot and creates a qcow2 overlay so a VM
+      can boot immediately while data streams in the background.
+    </p>
+    <div class="kv" style="margin-bottom:12px">
+      <dt>VM</dt><dd>{{.VMName}}</dd>
+      <dt>Disk</dt><dd>{{if .DiskName}}{{.DiskName}}{{else}}root{{end}}</dd>
+      <dt>Snapshot</dt><dd class="mono">{{.Timestamp}}</dd>
+    </div>
+    <form hx-post="/ui/backups/restore-live" hx-target="#backup-progress" hx-swap="outerHTML">
+      <input type="hidden" name="repo_path" value="{{.RepoPath}}">
+      <input type="hidden" name="vm_name" value="{{.VMName}}">
+      <input type="hidden" name="disk_name" value="{{.DiskName}}">
+      <input type="hidden" name="timestamp" value="{{.Timestamp}}">
+      <div class="form-row">
+        <label>Overlay path (on the host)</label>
+        <input type="text" name="target_path" required placeholder="/var/lib/litevirt/disks/{{.VMName}}-live.qcow2" style="font-family:monospace">
+      </div>
+      <div class="form-row">
+        <label>New VM name (blank = keep original)</label>
+        <input type="text" name="new_name" placeholder="{{.VMName}}-restored">
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="auto_start" checked> Define &amp; start the VM off the overlay</label>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="blockpull" checked> Block-pull to localize the disk, then tear down NBD (recommended)</label>
+      </div>
+      <div id="backup-progress"></div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('restore-live-modal').remove()">Close</button>
+        <button type="submit" class="btn btn-primary">{{icon "restore"}} Live restore</button>
+      </div>
+    </form>
+  </div>
+</div>

@@ -1,0 +1,60 @@
+<div class="modal-overlay" id="ct-modal" onclick="if(event.target===this)this.remove()">
+  <div class="modal">
+    <h3>Create Container</h3>
+    <p class="muted" style="margin-top:-4px">LXC from a download template (e.g. Alpine, Debian, Ubuntu). For OCI images use <code>lv ct pull</code>.</p>
+    <form hx-post="/ui/containers" hx-swap="none">
+      <div class="form-row">
+        <label>Host</label>
+        <select name="host" style="width:100%" required>
+          {{range .Hosts}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" name="name" required autofocus pattern="[a-zA-Z0-9_.\-]+"
+               title="letters, digits, _ . - only" placeholder="alpine-1" style="width:100%">
+      </div>
+      <div style="display:flex;gap:12px">
+        <div class="form-row" style="flex:1">
+          <label>Distro</label>
+          <input type="text" name="distro" value="alpine" required style="width:100%">
+        </div>
+        <div class="form-row" style="flex:1">
+          <label>Release</label>
+          <input type="text" name="release" value="3.19" required style="width:100%">
+        </div>
+        <div class="form-row" style="width:120px">
+          <label>Arch</label>
+          <select name="arch" style="width:100%">
+            <option value="amd64">amd64</option>
+            <option value="arm64">arm64</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:flex;gap:12px">
+        <div class="form-row" style="flex:1">
+          <label>CPU shares <span style="color:#888">(0 = unlimited)</span></label>
+          <input type="number" name="cpu" value="0" min="0" style="width:100%">
+        </div>
+        <div class="form-row" style="flex:1">
+          <label>Memory MiB <span style="color:#888">(0 = unlimited)</span></label>
+          <input type="number" name="memory" value="0" min="0" style="width:100%">
+        </div>
+      </div>
+      <div style="display:flex;gap:12px">
+        <div class="form-row" style="flex:1">
+          <label>Bridge <span style="color:#888">(optional)</span></label>
+          <input type="text" name="bridge" placeholder="e.g. br0" style="width:100%">
+        </div>
+        <div class="form-row" style="flex:1">
+          <label>Static IP <span style="color:#888">(optional)</span></label>
+          <input type="text" name="ip" placeholder="DHCP if blank" style="width:100%">
+        </div>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('ct-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>

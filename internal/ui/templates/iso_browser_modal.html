@@ -1,0 +1,32 @@
+<div class="modal-overlay" id="iso-browser" onclick="if(event.target===this)this.remove()">
+  <div class="modal" style="max-width:600px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0">Browse storage</h3>
+      <button class="btn" onclick="document.getElementById('iso-browser').remove()">Close</button>
+    </div>
+    {{if not .Pools}}
+      <p class="muted" style="font-size:13px">No file-based storage pools found. Create one under Storage, or place files under a pool's directory on the host.</p>
+    {{else}}
+    <div class="form-row">
+      <label>Pool</label>
+      <select name="poolref" hx-get="/ui/storage/contents" hx-target="#iso-contents" hx-trigger="change"
+              hx-vals='{"field":"{{.Field}}"}' style="width:100%">
+        <option value="">Select a pool…</option>
+        {{range .Pools}}<option value="{{.Host}}::{{.Name}}">{{.Name}} <span>@ {{.Host}}</span> ({{.Driver}})</option>{{end}}
+      </select>
+    </div>
+    <div id="iso-contents" class="cp-results" style="max-height:46vh;overflow-y:auto;border:1px solid var(--border);border-radius:6px;margin-top:8px">
+      <div class="muted" style="padding:14px;font-size:13px">Choose a pool to list its files.</div>
+    </div>
+    {{end}}
+  </div>
+</div>
+<script>
+window.pickStorageFile = function (p) {
+  var inp = document.querySelector('#new-vm-modal [name="' + (window.__isoField || 'iso') + '"]');
+  if (inp) inp.value = p;
+  var m = document.getElementById('iso-browser');
+  if (m) m.remove();
+};
+window.__isoField = "{{.Field}}";
+</script>

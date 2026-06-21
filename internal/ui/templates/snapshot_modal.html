@@ -1,0 +1,23 @@
+<div class="modal-overlay" id="snapshot-modal">
+  <div class="modal">
+    <h3>Create Snapshot</h3>
+    <form hx-post="/ui/vms/{{.VMName}}/snapshot" hx-swap="none" hx-on::after-request="document.getElementById('snapshot-modal').remove()">
+      <div class="form-row">
+        <label>VM</label>
+        <input type="text" value="{{.VMName}}" disabled>
+      </div>
+      <div class="form-row">
+        <label>Snapshot Name</label>
+        <input type="text" name="snapshot_name" placeholder="my-snapshot" required>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="with_memory" value="true"> Include memory (live snapshot)</label>
+        <small class="muted">Captures guest RAM so a restore resumes the running VM at this instant. Disk-only if the VM is stopped.</small>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('snapshot-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create Snapshot</button>
+      </div>
+    </form>
+  </div>
+</div>

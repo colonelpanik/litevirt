@@ -1,0 +1,39 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <h1>Cluster Diagnostics</h1>
+  <form hx-post="/ui/diagnostics/sync" hx-swap="none">
+    <button type="submit" class="btn btn-primary" hx-confirm="Force full state sync?">Force Sync</button>
+  </form>
+</div>
+
+<div class="section" id="diagnostics-data"
+     hx-get="/ui/diagnostics-partial" hx-trigger="every 10s" hx-swap="outerHTML">
+  {{template "diagnostics-table" .}}
+</div>
+{{end}}
+
+{{define "diagnostics-table"}}
+<div class="section" id="diagnostics-data"
+     hx-get="/ui/diagnostics-partial" hx-trigger="every 10s" hx-swap="outerHTML">
+  {{if .Error}}
+  <div style="color:var(--red);padding:16px">Error fetching digest: {{.Error}}</div>
+  {{else}}
+  <table>
+    <thead><tr>
+      <th>Table</th><th>Row Count</th><th>Hash</th><th>Status</th>
+    </tr></thead>
+    <tbody>
+    {{range .Tables}}
+    <tr>
+      <td><strong>{{.Name}}</strong></td>
+      <td>{{.Count}}</td>
+      <td style="font-family:monospace;font-size:11px;color:var(--muted)">{{truncate .Hash 16}}</td>
+      <td><span class="badge badge-success">OK</span></td>
+    </tr>
+    {{else}}<tr><td colspan="4" class="empty">No state tables</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{end}}
+</div>
+{{end}}

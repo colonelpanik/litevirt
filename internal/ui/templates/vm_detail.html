@@ -1,0 +1,264 @@
+{{define "content"}}
+{{template "vm_page" .}}
+{{end}}
+
+{{define "vm_page"}}
+<div id="vm-page">
+  <div class="detail-header">
+    <a href="/vms" class="back">← VMs</a>
+    <h1>{{.VM.Name}}</h1>
+    {{if .VM.IsTemplate}}<span class="badge badge-blue">template</span>{{else}}{{vmStateBadge .VM.State}}{{end}}
+    {{if .VM.Spec}}<span class="tags-inline">{{template "label_chips" .VM.Spec.Labels}}</span>{{end}}
+    <button class="btn btn-sm" title="Edit tags" hx-get="/ui/vms/{{.VM.Name}}/tags-modal" hx-target="body" hx-swap="beforeend">{{icon "edit"}} Tags</button>
+    <div class="spacer" style="flex:1"></div>
+    <div class="actions">
+      {{/* Primary, state-relevant actions */}}
+      {{if and (eq .VM.State.String "VM_STOPPED") (not .VM.IsTemplate)}}
+      <button class="btn btn-primary" hx-post="/ui/vms/{{.VM.Name}}/start" hx-target="#vm-page" hx-swap="outerHTML">{{icon "play"}} Start</button>
+      {{end}}
+      {{if .VM.IsTemplate}}
+      <button class="btn btn-primary" hx-get="/ui/vms/{{.VM.Name}}/clone-modal" hx-target="body" hx-swap="beforeend">Clone</button>
+      {{end}}
+      {{if eq .VM.State.String "VM_RUNNING"}}
+      <button class="btn" hx-post="/ui/vms/{{.VM.Name}}/stop" hx-target="#vm-page" hx-swap="outerHTML" hx-confirm="Stop {{.VM.Name}}?">{{icon "stop"}} Stop</button>
+      <button class="btn" hx-post="/ui/vms/{{.VM.Name}}/restart" hx-target="#vm-page" hx-swap="outerHTML">{{icon "restart"}} Restart</button>
+      <span class="action-sep"></span>
+      {{if not .VM.Spec.DisableVnc}}
+      <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/vnc-modal" hx-target="body" hx-swap="beforeend">{{icon "vnc"}} VNC</button>
+      {{end}}
+      <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/console-modal" hx-target="body" hx-swap="beforeend">{{icon "console"}} Terminal</button>
+      {{if .VM.Spec.EnableSpice}}
+      <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/spice-modal" hx-target="body" hx-swap="beforeend">SPICE</button>
+      {{end}}
+      {{end}}
+
+      {{/* Everything else folds into an overflow menu (no-JS, opens on focus) */}}
+      <span class="action-sep"></span>
+      <div class="menu">
+        <button type="button" class="btn">More {{icon "chevron"}}</button>
+        <div class="menu-list">
+          <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/edit-modal" hx-target="body" hx-swap="beforeend">{{icon "edit"}} Edit</button>
+          {{if eq .VM.State.String "VM_RUNNING"}}
+          <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/exec-modal" hx-target="body" hx-swap="beforeend">{{icon "console"}} Exec command</button>
+          <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/snapshot-modal" hx-target="body" hx-swap="beforeend">{{icon "snapshot"}} Snapshot</button>
+          <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/migrate-modal" hx-target="body" hx-swap="beforeend">{{icon "migrate"}} Migrate</button>
+          {{end}}
+          <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/backup-modal" hx-target="body" hx-swap="beforeend">{{icon "backup"}} Backup</button>
+          <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/promote-modal" hx-target="body" hx-swap="beforeend" title="Recover this VM from its replica">Promote replica</button>
+          {{if and (eq .VM.State.String "VM_STOPPED") (not .VM.IsTemplate)}}
+          <button class="btn" hx-get="/ui/vms/{{.VM.Name}}/clone-modal" hx-target="body" hx-swap="beforeend">Clone</button>
+          <button class="btn" hx-post="/ui/vms/{{.VM.Name}}/template" hx-confirm="Convert {{.VM.Name}} to a template? It can no longer be started, only cloned.">Convert to template</button>
+          {{end}}
+          {{if .VM.IsTemplate}}
+          <button class="btn" hx-post="/ui/vms/{{.VM.Name}}/template" hx-vals='{"revert":"on"}' hx-confirm="Revert {{.VM.Name}} to a normal (startable) VM?">Revert to VM</button>
+          {{end}}
+          <a class="btn" href="/vms/{{.VM.Name}}/logs">Logs</a>
+          <a class="btn" href="/ui/vms/{{.VM.Name}}/export-disk" title="Download the raw disk image">Export disk</a>
+          <div class="menu-sep"></div>
+          <button class="btn btn-danger" hx-delete="/ui/vms/{{.VM.Name}}" hx-confirm="Delete {{.VM.Name}}? This cannot be undone." hx-push-url="/vms">{{icon "delete"}} Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {{if eq .VM.State.String "VM_RUNNING"}}
+  <!-- Live resource usage + charts. Kept OUTSIDE #vm-detail and self-refreshing
+       (stats every 3s via its own #vm-stats poll; charts via stats-charts.js).
+       This is the ONLY part that updates on a timer, so the static structure
+       below never re-renders on the stats cadence (no whole-page flicker). -->
+  <div hx-get="/ui/vms/{{.VM.Name}}/stats" hx-trigger="load" hx-swap="innerHTML" id="vm-stats-container"></div>
+  <div data-stats-chart="/ui/vms/{{.VM.Name}}/stats-history" class="stats-charts">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">
+      <div class="chart-cpu"></div>
+      <div class="chart-mem"></div>
+      <div class="chart-io"></div>
+      <div class="chart-net"></div>
+    </div>
+  </div>
+  {{end}}
+
+  {{template "vm_detail_inner" .}}
+</div>
+{{end}}
+
+{{define "vm_detail_inner"}}
+<div id="vm-detail">
+  <div class="card-grid">
+    <div class="card">
+      <div class="card-title">Host</div>
+      <div class="card-value card-value-sm"><a href="/hosts/{{.VM.HostName}}">{{.VM.HostName}}</a></div>
+    </div>
+    <div class="card">
+      <div class="card-title">vCPU</div>
+      <div class="card-value">{{.VM.CpuActual}}</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Memory</div>
+      <div class="card-value">{{.VM.MemActualMib}}<span class="card-unit">MiB</span></div>
+      {{if .VM.Spec}}{{if gt .VM.Spec.MaxMemoryMib 0}}
+      <form class="balloon-form" style="display:flex;gap:4px;margin-top:6px" hx-post="/ui/vms/{{.VM.Name}}/set-memory" hx-swap="none">
+        <input type="number" name="target_mib" value="{{.VM.Spec.MemoryMib}}"
+               min="{{if gt .VM.Spec.MinMemoryMib 0}}{{.VM.Spec.MinMemoryMib}}{{else}}1{{end}}"
+               max="{{.VM.Spec.MaxMemoryMib}}" step="256" style="width:90px;font-size:12px">
+        <button type="submit" class="btn btn-sm" title="Set balloon target (MiB)">Set</button>
+      </form>
+      <small class="muted" style="font-size:10px">balloon {{if gt .VM.Spec.MinMemoryMib 0}}{{.VM.Spec.MinMemoryMib}}{{else}}—{{end}}…{{.VM.Spec.MaxMemoryMib}} MiB</small>
+      {{end}}{{end}}
+    </div>
+    <div class="card">
+      <div class="card-title">IP Address</div>
+      <div class="card-value card-value-sm mono">{{$ip := firstIP .VM.Interfaces}}{{if $ip}}{{$ip}}{{else}}<span class="muted">—</span>{{end}}</div>
+    </div>
+    {{if .VM.Spec}}{{if .VM.Spec.Image}}
+    <div class="card">
+      <div class="card-title">Image</div>
+      <div class="card-value card-value-sm">{{.VM.Spec.Image}}</div>
+    </div>
+    {{end}}{{end}}
+    {{if .VM.StackName}}
+    <div class="card">
+      <div class="card-title">Stack</div>
+      <div class="card-value card-value-sm"><a href="/stacks/{{.VM.StackName}}">{{.VM.StackName}}</a></div>
+    </div>
+    {{end}}
+  </div>
+
+  <div class="grid-2">
+    <div class="section">
+      <div class="section-header"><h2>Network</h2></div>
+      <table>
+        <thead><tr><th>Network</th><th>MAC</th><th>IP</th></tr></thead>
+        <tbody>
+        {{range .VM.Interfaces}}
+        <tr>
+          <td>{{.NetworkName}}</td>
+          <td style="font-family:monospace;color:var(--muted)">{{.Mac}}</td>
+          <td>{{if .Ip}}{{.Ip}}{{else}}<span style="color:var(--muted)">discovering...</span>{{end}}</td>
+        </tr>
+        {{else}}<tr><td colspan="3" class="empty">No interfaces</td></tr>
+        {{end}}
+        </tbody>
+      </table>
+    </div>
+    <div class="section">
+      <div class="section-header"><h2>Disks</h2></div>
+      <table>
+        <thead><tr><th>Name</th><th>Size</th><th>Type</th><th></th></tr></thead>
+        <tbody>
+        {{range .VM.Disks}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td>{{formatBytes .SizeBytes}}</td>
+          <td>{{.StorageType}}</td>
+          <td class="actions">
+            <button class="btn btn-sm" hx-get="/ui/vms/{{$.VM.Name}}/resize-disk-modal?disk={{.Name}}&current={{.SizeBytes}}" hx-target="body" hx-swap="beforeend">Resize</button>
+            <button class="btn btn-sm" hx-get="/ui/vms/{{$.VM.Name}}/move-volume-modal?disk={{.Name}}" hx-target="body" hx-swap="beforeend">Move</button>
+            <button class="btn btn-sm" hx-get="/ui/vms/{{$.VM.Name}}/replicate-volume-modal?disk={{.Name}}" hx-target="body" hx-swap="beforeend">Replicate</button>
+          </td>
+        </tr>
+        {{else}}<tr><td colspan="4" class="empty">No disks</td></tr>
+        {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {{if .Snapshots}}
+  <div class="section">
+    <div class="section-header"><h2>Snapshots ({{len .Snapshots}})</h2></div>
+    <table>
+      <thead><tr><th>Name</th><th>Type</th><th>State</th><th>Size</th><th>Created</th><th>Actions</th></tr></thead>
+      <tbody>
+      {{range .Snapshots}}
+      <tr>
+        <td><strong>{{.Name}}</strong></td>
+        <td><span class="badge {{if eq .Type "memory"}}badge-purple{{else}}badge-gray{{end}}">{{if .Type}}{{.Type}}{{else}}disk{{end}}</span></td>
+        <td><span class="badge badge-{{if eq .State "active"}}green{{else}}gray{{end}}">{{.State}}</span></td>
+        <td>{{if gt .SizeBytes 0}}{{formatBytes .SizeBytes}}{{if gt .VmstateBytes 0}} + {{formatBytes .VmstateBytes}} RAM{{end}}{{else}}—{{end}}</td>
+        <td style="color:var(--muted);font-size:11px">{{if .CreatedAt}}{{.CreatedAt.AsTime.Format "2006-01-02 15:04"}}{{end}}</td>
+        <td class="actions">
+          <button class="btn" hx-post="/ui/vms/{{.VmName}}/snapshot/{{.Name}}/restore" hx-target="#vm-page" hx-swap="outerHTML"
+                  hx-confirm="Restore snapshot '{{.Name}}'? The VM will revert to this state.">Restore</button>
+          <button class="btn btn-danger" hx-delete="/ui/vms/{{.VmName}}/snapshot/{{.Name}}" hx-target="closest tr" hx-swap="outerHTML swap:200ms"
+                  hx-confirm="Delete snapshot '{{.Name}}'?">Delete</button>
+        </td>
+      </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{end}}
+
+  <div class="section">
+    <div class="section-header">
+      <h2>Backups{{if .Backups}} ({{len .Backups}}){{end}}</h2>
+      <button class="btn btn-sm btn-primary" hx-get="/ui/vms/{{.VM.Name}}/backup-modal" hx-target="body" hx-swap="beforeend">{{icon "backup"}} Create backup</button>
+    </div>
+    {{if .Backups}}
+    <table>
+      <thead><tr><th>Snapshot</th><th>Repo</th><th>Disk</th><th>Size</th><th>Type</th><th>Actions</th></tr></thead>
+      <tbody>
+      {{range .Backups}}
+      <tr>
+        <td class="mono" style="font-size:11px">{{.Timestamp}}</td>
+        <td>{{.RepoName}}</td>
+        <td>{{if .DiskName}}{{.DiskName}}{{else}}root{{end}}</td>
+        <td>{{formatBytes .TotalSize}}</td>
+        <td>{{if .Incremental}}<span class="badge badge-blue">incremental</span>{{else}}<span class="badge badge-gray">full</span>{{end}}</td>
+        <td class="actions">
+          <button class="btn btn-sm" hx-get="/ui/backups/restore-from-modal?repo={{.RepoPath}}&vm={{$.VM.Name}}&disk={{.DiskName}}&ts={{.Timestamp}}" hx-target="body" hx-swap="beforeend">{{icon "restore"}} Restore</button>
+          <button class="btn btn-sm" hx-get="/ui/backups/restore-live-modal?repo={{.RepoPath}}&vm={{$.VM.Name}}&disk={{.DiskName}}&ts={{.Timestamp}}" hx-target="body" hx-swap="beforeend">Live restore</button>
+        </td>
+      </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div style="padding:16px"><span class="muted">No repo backups for this VM. Use <b>Create backup</b> to make a deduplicated snapshot in a repo (distinct from the libvirt snapshots above).</span></div>
+    {{end}}
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h2>Activity{{if .Activity}} ({{len .Activity}}){{end}}</h2></div>
+    {{if .Activity}}
+    <table>
+      <thead><tr><th>When</th><th>Event</th><th>Result</th><th>Host</th><th>Detail</th></tr></thead>
+      <tbody>
+      {{range .Activity}}
+      <tr>
+        <td style="white-space:nowrap">{{relTime .Ts}}</td>
+        <td>
+          {{if eq .Result "error"}}{{icon "alert"}}{{else if hasPrefix .Type "backup"}}{{icon "backup"}}{{else if hasPrefix .Type "snapshot"}}{{icon "snapshot"}}{{else}}{{icon "vm"}}{{end}}
+          <span class="mono">{{.Type}}</span>
+        </td>
+        <td>{{if eq .Result "error"}}<span class="badge badge-red">error</span>{{else}}<span class="badge badge-green">ok</span>{{end}}</td>
+        <td class="muted" style="font-size:11px">{{.HostName}}</td>
+        <td class="muted" style="font-size:11px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{.Detail}}">{{.Detail}}</td>
+      </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div style="padding:16px"><span class="muted">No recorded activity yet. Lifecycle events and backup outcomes (including failures) appear here.</span></div>
+    {{end}}
+  </div>
+
+  {{if .VM.Spec}}{{if .VM.Spec.Devices}}
+  <div class="section">
+    <div class="section-header"><h2>PCI Devices</h2></div>
+    <table>
+      <thead><tr><th>Type</th><th>Vendor</th><th>Count</th></tr></thead>
+      <tbody>
+      {{range .VM.Spec.Devices}}
+      <tr>
+        <td>{{.Type}}</td>
+        <td>{{.Vendor}}</td>
+        <td>{{.Count}}</td>
+      </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{end}}{{end}}
+</div>
+{{end}}

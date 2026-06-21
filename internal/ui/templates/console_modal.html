@@ -1,0 +1,63 @@
+<div class="modal-overlay" id="console-modal">
+  <div class="modal" style="max-width:900px;min-height:500px;display:flex;flex-direction:column">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">Terminal: {{.VMName}}</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="console-status" class="badge badge-yellow">connecting…</span>
+        <button class="btn btn-sm" id="console-retry" style="display:none" onclick="window._consoleConnect&&window._consoleConnect()">Retry</button>
+        <button class="btn btn-sm" onclick="if(window._consolews)window._consolews.close();document.getElementById('console-modal').remove()">Close</button>
+      </div>
+    </div>
+    <div id="console-banner" style="display:none" class="alert alert-error"></div>
+    <div id="terminal-container" style="flex:1;min-height:400px"></div>
+    <p class="muted" style="font-size:11px;margin-top:6px">Blank screen on a running VM? Press Enter — the guest may need a login getty on ttyS0.</p>
+  </div>
+</div>
+<script>
+// xterm.js and addon-fit are pre-loaded in base.html.
+(function() {
+  var term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: 'SF Mono, Fira Code, monospace' });
+  var fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal-container'));
+  setTimeout(function() { fitAddon.fit(); }, 50);
+
+  var statusEl = document.getElementById('console-status');
+  var bannerEl = document.getElementById('console-banner');
+  var retryEl = document.getElementById('console-retry');
+  var encoder = new TextEncoder();
+  var ws = null, sendBuf = [], sendTimer = null;
+
+  function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = 'badge ' + cls; }
+
+  function flushInput() {
+    sendTimer = null;
+    if (sendBuf.length === 0 || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(encoder.encode(sendBuf.join(''))); sendBuf = [];
+  }
+  // Registered once so a Retry doesn't stack duplicate input handlers.
+  term.onData(function(data) { sendBuf.push(data); if (!sendTimer) sendTimer = setTimeout(flushInput, 4); });
+
+  function connect() {
+    bannerEl.style.display = 'none';
+    retryEl.style.display = 'none';
+    setStatus('connecting…', 'badge-yellow');
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/vms/{{.VMName}}/console');
+    ws.binaryType = 'arraybuffer';
+    window._consolews = ws;
+    ws.onopen = function() { setStatus('connected', 'badge-green'); term.focus(); };
+    ws.onmessage = function(e) { term.write(new Uint8Array(e.data)); };
+    ws.onclose = function(e) {
+      if (e.code === 1000) { setStatus('closed', 'badge-gray'); return; }
+      setStatus('disconnected', 'badge-red');
+      bannerEl.textContent = e.reason || 'Connection closed unexpectedly.';
+      bannerEl.style.display = 'block';
+      retryEl.style.display = '';
+    };
+    ws.onerror = function() { /* onclose carries the reason */ };
+  }
+  window._consoleConnect = connect;
+  connect();
+  window.addEventListener('resize', function() { fitAddon.fit(); });
+})();
+</script>

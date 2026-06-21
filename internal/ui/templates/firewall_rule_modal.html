@@ -1,0 +1,58 @@
+<div class="modal-overlay" id="fw-rule-modal">
+  <div class="modal" style="max-width:520px">
+    <h3>Add {{.Tier}} rule</h3>
+    <form hx-post="/ui/firewall/{{.Tier}}-rules" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('fw-rule-modal').remove()">
+      {{if eq .Tier "host"}}
+      <div class="form-row">
+        <label>Host (required)</label>
+        <input type="text" name="host_name" placeholder="host-01" required>
+      </div>
+      {{end}}
+      <div class="form-row">
+        <label>Direction</label>
+        <select name="direction">
+          <option value="ingress">ingress</option>
+          <option value="egress">egress</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Protocol</label>
+        <select name="proto">
+          <option value="all">all</option>
+          <option value="tcp">tcp</option>
+          <option value="udp">udp</option>
+          <option value="icmp">icmp</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Port / range (blank = any)</label>
+        <input type="text" name="port_range" placeholder="80 or 8000-9000">
+      </div>
+      <div class="form-row">
+        <label>CIDR (blank = any; @name for an ipset)</label>
+        <input type="text" name="cidr" placeholder="0.0.0.0/0">
+      </div>
+      <div class="form-row">
+        <label>Action</label>
+        <select name="action">
+          <option value="accept">accept</option>
+          <option value="drop">drop</option>
+          <option value="reject">reject</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Comment (optional)</label>
+        <input type="text" name="comment" placeholder="why this rule exists">
+      </div>
+      <div class="form-row">
+        <label>Priority (lower runs first)</label>
+        <input type="number" name="priority" value="100" min="0">
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('fw-rule-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add rule</button>
+      </div>
+    </form>
+  </div>
+</div>

@@ -1,0 +1,139 @@
+package image
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/litevirt/litevirt/internal/qcow2"
+)
+
+// Store manages local image storage.
+type Store struct {
+	imageDir string
+	diskDir  string
+}
+
+// NewStore creates an image store rooted at the given data directory.
+func NewStore(dataDir string) *Store {
+	return &Store{
+		imageDir: filepath.Join(dataDir, "images"),
+		diskDir:  filepath.Join(dataDir, "disks"),
+	}
+}
+
+// Init creates required directories.
+func (s *Store) Init() error {
+	for _, d := range []string{s.imageDir, s.diskDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return fmt.Errorf("create dir %s: %w", d, err)
+		}
+	}
+	return nil
+}
+
+// ImagePath returns the path to a base image.
+func (s *Store) ImagePath(imageName string) string {
+	return filepath.Join(s.imageDir, imageName+".qcow2")
+}
+
+// ImageExists checks if a base image exists locally.
+func (s *Store) ImageExists(imageName string) bool {
+	_, err := os.Stat(s.ImagePath(imageName))
+	return err == nil
+}
+
+// DiskDir returns the directory for a VM's disks.
+// DiskDir returns the directory containing VM disks (flat — all VMs share the same dir).
+func (s *Store) DiskDir(vmName string) string {
+	return s.diskDir
+}
+
+// DiskPath returns the path to a specific VM disk.
+// Uses flat naming ({vmName}-{diskName}.qcow2) so all disks live directly
+// in the pool target directory, which libvirt requires for storage migration.
+func (s *Store) DiskPath(vmName, diskName string) string {
+	return filepath.Join(s.diskDir, vmName+"-"+diskName+".qcow2")
+}
+
+// CreateOverlayDisk creates a qcow2 disk backed by a base image (COW).
+func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (string, error) {
+	diskDir := s.DiskDir(vmName)
+	if err := os.MkdirAll(diskDir, 0755); err != nil {
+		return "", fmt.Errorf("create disk dir: %w", err)
+	}
+
+	diskPath := s.DiskPath(vmName, diskName)
+	backingPath := s.ImagePath(backingImage)
+
+	var sizeBytes uint64
+	if size != "" {
+		var err error
+		sizeBytes, err = qcow2.ParseSize(size)
+		if err != nil {
+			return "", fmt.Errorf("parse size %q: %w", size, err)
+		}
+	}
+	if err := qcow2.CreateWithBacking(diskPath, backingPath, sizeBytes, nil); err != nil {
+		return "", fmt.Errorf("create overlay disk: %w", err)
+	}
+
+	return diskPath, nil
+}
+
+// CreateEmptyDisk creates an empty qcow2 disk.
+func (s *Store) CreateEmptyDisk(vmName, diskName, size string) (string, error) {
+	diskDir := s.DiskDir(vmName)
+	if err := os.MkdirAll(diskDir, 0755); err != nil {
+		return "", fmt.Errorf("create disk dir: %w", err)
+	}
+
+	diskPath := s.DiskPath(vmName, diskName)
+	sizeBytes, err := qcow2.ParseSize(size)
+	if err != nil {
+		return "", fmt.Errorf("parse size %q: %w", size, err)
+	}
+	if err := qcow2.Create(diskPath, sizeBytes, nil); err != nil {
+		return "", fmt.Errorf("create empty disk: %w", err)
+	}
+
+	return diskPath, nil
+}
+
+// DeleteVMDisks removes all disks for a VM using the flat naming convention.
+func (s *Store) DeleteVMDisks(vmName string) error {
+	pattern := filepath.Join(s.diskDir, vmName+"-*.qcow2")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	for _, m := range matches {
+		os.Remove(m)
+	}
+	// Also clean up legacy VM subdirectory if it exists.
+	legacyDir := filepath.Join(s.diskDir, vmName)
+	if info, err := os.Stat(legacyDir); err == nil && info.IsDir() {
+		os.RemoveAll(legacyDir)
+	}
+	return nil
+}
+
+// DiskInfo returns size info for a disk file.
+func (s *Store) DiskInfo(path string) (virtualSize int64, actualSize int64, err error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	actualSize = info.Size()
+
+	// Get virtual size from qcow2 header.
+	qInfo, qErr := qcow2.Info(path)
+	if qErr == nil && qInfo.VirtualSize > 0 {
+		virtualSize = int64(qInfo.VirtualSize)
+		return virtualSize, actualSize, nil
+	}
+
+	// Fallback: use actual size if not a valid qcow2 file.
+	virtualSize = actualSize
+	return virtualSize, actualSize, nil
+}

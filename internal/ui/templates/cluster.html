@@ -1,0 +1,142 @@
+{{define "content"}}
+<h1>Dashboard</h1>
+
+<div id="cluster-live" hx-get="/ui/cluster-stats" hx-trigger="every 5s" hx-swap="outerHTML">
+  {{template "cluster-live" .}}
+</div>
+{{end}}
+
+{{define "cluster-live"}}
+<div id="cluster-live" hx-get="/ui/cluster-stats" hx-trigger="every 5s" hx-swap="outerHTML">
+{{if .Error}}
+<div style="color:var(--red);padding:16px">Error: {{.Error}}</div>
+{{else}}
+<!-- Summary Cards -->
+<div class="grid-4" style="margin-bottom:20px">
+  <div class="card">
+    <div class="card-title">Hosts</div>
+    <div class="card-value">{{.Stats.ActiveHosts}} / {{.Stats.TotalHosts}}</div>
+    <div class="card-sub">active</div>
+  </div>
+  <div class="card">
+    <div class="card-title">VMs</div>
+    <div class="card-value">{{.Stats.RunningVMs}} / {{.Stats.TotalVMs}}</div>
+    <div class="card-sub">{{.Stats.ErrorVMs}} error · {{.Stats.StoppedVMs}} stopped</div>
+  </div>
+  <div class="card">
+    <div class="card-title">CPU Allocated</div>
+    <div class="card-value">{{.Stats.CPUUsed}} / {{.Stats.CPUTotal}}</div>
+    <div class="progress-bar"><div class="progress-bar-fill" style="width:{{formatPct .Stats.CPUPct}}%;background:var(--accent)"></div></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Memory</div>
+    <div class="card-value">{{.Stats.MemUsedGiB}}G / {{.Stats.MemTotalGiB}}G</div>
+    <div class="progress-bar"><div class="progress-bar-fill" style="width:{{formatPct .Stats.MemPct}}%;background:var(--blue)"></div></div>
+  </div>
+</div>
+
+<!-- Disk summary bar -->
+<div style="margin-bottom:20px">
+  <div class="card" style="display:flex;align-items:center;gap:16px;padding:12px 16px">
+    <span style="font-weight:600;font-size:13px;min-width:100px">Local Disk</span>
+    <div class="progress-bar" style="flex:1"><div class="progress-bar-fill" style="width:{{formatPct .Stats.DiskPct}}%;background:var(--green)"></div></div>
+    <span style="font-size:13px;color:var(--muted);white-space:nowrap">{{.Stats.DiskUsedGiB}}G / {{.Stats.DiskTotalGiB}}G ({{formatPct .Stats.DiskPct}}%)</span>
+  </div>
+</div>
+
+<!-- Host Resources Table -->
+<div class="section" style="margin-bottom:20px">
+  <div class="section-header"><h2>Host Resources</h2></div>
+  <table>
+    <thead><tr>
+      <th>Host</th><th>State</th><th>CPU</th><th></th><th>Memory</th><th></th><th>Disk</th><th></th><th>VMs</th><th>Address</th>
+    </tr></thead>
+    <tbody>
+    {{range .HostRows}}
+    <tr>
+      <td><a href="/hosts/{{.Host.Name}}">{{.Host.Name}}</a></td>
+      <td>{{hostStateBadge .Host.State}}</td>
+      <td style="width:100px">
+        <div style="background:var(--bg);border-radius:4px;height:14px;overflow:hidden">
+          <div style="width:{{.CPUPct}}%;height:100%;background:{{if gt .CPUPct 89}}var(--red){{else if gt .CPUPct 69}}var(--yellow){{else}}var(--green){{end}};border-radius:4px;transition:width 0.3s"></div>
+        </div>
+      </td>
+      <td style="font-size:12px;color:var(--muted);white-space:nowrap">{{.Host.CpuUsed}}/{{.Host.CpuTotal}} ({{.CPUPct}}%)</td>
+      <td style="width:100px">
+        <div style="background:var(--bg);border-radius:4px;height:14px;overflow:hidden">
+          <div style="width:{{.MemPct}}%;height:100%;background:{{if gt .MemPct 89}}var(--red){{else if gt .MemPct 69}}var(--yellow){{else}}var(--green){{end}};border-radius:4px;transition:width 0.3s"></div>
+        </div>
+      </td>
+      <td style="font-size:12px;color:var(--muted);white-space:nowrap">{{memGiB .Host.MemUsedMib}}/{{memGiB .Host.MemTotalMib}}GiB ({{.MemPct}}%)</td>
+      <td style="width:100px">
+        <div style="background:var(--bg);border-radius:4px;height:14px;overflow:hidden">
+          <div style="width:{{.DiskPct}}%;height:100%;background:{{if gt .DiskPct 89}}var(--red){{else if gt .DiskPct 69}}var(--yellow){{else}}var(--green){{end}};border-radius:4px;transition:width 0.3s"></div>
+        </div>
+      </td>
+      <td style="font-size:12px;color:var(--muted);white-space:nowrap">{{.DiskUsedGiB}}/{{.DiskTotalGiB}}GiB ({{.DiskPct}}%)</td>
+      <td>{{.Host.VmCount}}</td>
+      <td style="font-family:monospace;font-size:12px">{{.Host.Address}}</td>
+    </tr>
+    {{else}}<tr><td colspan="10" class="empty">No hosts</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+
+<!-- Bottom: Recent VMs + Events & Alerts -->
+<div class="grid-2">
+  <div class="section">
+    <div class="section-header">
+      <h2>Recent VMs</h2>
+      <a href="/vms" class="btn">View all</a>
+    </div>
+    <table>
+      <thead><tr>
+        <th>Name</th><th>Host</th><th>State</th><th>IP</th>
+      </tr></thead>
+      <tbody>
+      {{range .RecentVMs}}
+      <tr>
+        <td><a href="/vms/{{.Name}}">{{.Name}}</a></td>
+        <td>{{.HostName}}</td>
+        <td>{{vmStateBadge .State}}</td>
+        <td>{{firstIP .Interfaces}}</td>
+      </tr>
+      {{else}}<tr><td colspan="4" class="empty">No VMs yet</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div>
+    <!-- Recent Events -->
+    <div class="section" style="margin-bottom:16px">
+      <div class="section-header"><h2>Recent Events</h2></div>
+      {{range .Events}}
+      <div style="padding:6px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px;align-items:center">
+        <span class="badge" style="font-size:10px">{{.Action}}</span>
+        <span>{{.Target}}</span>
+        <span style="color:var(--muted);font-size:12px;margin-left:auto">{{.Detail}}</span>
+      </div>
+      {{else}}
+      <p style="padding:12px;color:var(--muted);font-size:13px">No recent events</p>
+      {{end}}
+    </div>
+
+    <!-- Active Alerts -->
+    <div class="section">
+      <div class="section-header"><h2>Active Alerts</h2></div>
+      {{range .Alerts}}
+      <div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px;align-items:center">
+        <span class="badge {{if eq .Level "critical"}}badge-error{{else if eq .Level "warning"}}badge-warning{{else}}badge-info{{end}}" style="font-size:10px">{{.Level}}</span>
+        <span>{{.Message}}</span>
+      </div>
+      {{else}}
+      <p style="padding:12px;color:var(--muted);font-size:13px">No active alerts</p>
+      {{end}}
+    </div>
+  </div>
+</div>
+{{end}}
+</div>
+{{end}}

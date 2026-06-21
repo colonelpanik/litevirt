@@ -1,0 +1,26 @@
+<div class="modal-overlay" id="restore-from-modal">
+  <div class="modal" style="max-width:560px">
+    <h3>Restore from backup</h3>
+    <div class="kv" style="margin-bottom:12px">
+      <dt>VM</dt><dd>{{.VMName}}</dd>
+      <dt>Disk</dt><dd>{{if .DiskName}}{{.DiskName}}{{else}}root{{end}}</dd>
+      <dt>Snapshot</dt><dd class="mono">{{.Timestamp}}</dd>
+    </div>
+    <form hx-post="/ui/backups/restore-from" hx-target="#backup-progress" hx-swap="outerHTML">
+      <input type="hidden" name="repo_path" value="{{.RepoPath}}">
+      <input type="hidden" name="vm_name" value="{{.VMName}}">
+      <input type="hidden" name="disk_name" value="{{.DiskName}}">
+      <input type="hidden" name="timestamp" value="{{.Timestamp}}">
+      <div class="form-row">
+        <label>Target path (on the host)</label>
+        <input type="text" name="target_path" required placeholder="/var/lib/litevirt/disks/{{.VMName}}-restored.qcow2" style="font-family:monospace">
+      </div>
+      <div class="alert alert-warn" style="font-size:11px">Restoring over a disk in use will corrupt it. Restore to a fresh path, then attach.</div>
+      <div id="backup-progress"></div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('restore-from-modal').remove()">Close</button>
+        <button type="submit" class="btn btn-primary">{{icon "restore"}} Restore</button>
+      </div>
+    </form>
+  </div>
+</div>

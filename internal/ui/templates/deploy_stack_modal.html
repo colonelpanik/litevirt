@@ -1,0 +1,30 @@
+<div class="modal-overlay" id="deploy-stack-modal">
+  <div class="modal" style="max-width:720px">
+    <h3>Deploy Stack</h3>
+    <div id="deploy-step-yaml">
+      <div class="form-row">
+        <label>Compose YAML</label>
+        <textarea id="deploy-compose-yaml" rows="16"
+          style="width:100%;font-family:monospace;font-size:13px;resize:vertical"
+          placeholder="name: my-stack
+
+images:
+  ubuntu:
+    source: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+
+vms:
+  web:
+    image: ubuntu
+    cpu: 2
+    memory: 4G
+    disks:
+      root: 20G"></textarea>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('deploy-stack-modal').remove()">Cancel</button>
+        <button type="button" class="btn btn-primary" onclick="previewPlan(this)">Preview Plan</button>
+      </div>
+    </div>
+    <div id="deploy-step-plan" style="display:none"></div>
+  </div>
+</div>

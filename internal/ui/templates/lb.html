@@ -1,0 +1,32 @@
+{{define "content"}}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <h1>Load Balancers</h1>
+  <button class="btn btn-primary" hx-get="/ui/lb/create-modal" hx-target="body" hx-swap="beforeend">Create LB</button>
+</div>
+
+<div class="section">
+  <div class="section-header"><h2>Active LBs ({{len .LBs}})</h2></div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>VIP</th><th>Algorithm</th><th>Stack</th><th>Backends</th><th>State</th><th></th>
+    </tr></thead>
+    <tbody>
+    {{range .LBs}}
+    <tr>
+      <td><a href="/lb/{{.Name}}">{{.Name}}</a></td>
+      <td>{{.Vip}}</td>
+      <td>{{.Algorithm}}</td>
+      <td>{{if .StackName}}<a href="/stacks/{{.StackName}}">{{.StackName}}</a>{{else}}<span style="color:var(--muted)">standalone</span>{{end}}</td>
+      <td>{{len .Backends}}</td>
+      <td>{{if eq .State "active"}}<span class="badge badge-green">active</span>{{else}}<span class="badge badge-yellow">{{.State}}</span>{{end}}</td>
+      <td>
+        <button class="btn btn-sm btn-danger" hx-post="/lb/{{.Name}}/delete"
+                hx-confirm="Delete load balancer {{.Name}}? This stops HAProxy + Keepalived on all hosts.">Delete</button>
+      </td>
+    </tr>
+    {{else}}<tr><td colspan="7" style="color:var(--muted);text-align:center;padding:24px">No load balancers — create one with <code>lv lb create</code> or define one in a compose file with <code>loadbalancer.enabled: true</code></td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

@@ -1,0 +1,7 @@
+{{define "empty_state"}}
+<div class="empty-state">
+  {{if .Title}}<h3>{{.Title}}</h3>{{end}}
+  {{if .Body}}<p>{{.Body}}</p>{{end}}
+  {{if .CTA}}{{.CTA}}{{end}}
+</div>
+{{end}}

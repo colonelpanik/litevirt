@@ -1,0 +1,90 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <div>
+      <h2>Backups</h2>
+      <p class="muted">PBS-equivalent deduplicated, content-addressed chunk store</p>
+    </div>
+  </div>
+  {{if .Hint}}<div class="alert alert-info">{{.Hint}}</div>{{end}}
+  {{template "alert_error" .Error}}
+
+  {{if .Repos}}
+  <div class="grid-3">
+    {{range .Repos}}
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:start;gap:8px">
+        <div>
+          <div class="card-title">Repo</div>
+          <div style="font-size:15px;font-weight:600">{{.Name}}</div>
+        </div>
+        {{if .Encryption}}<span class="badge badge-purple">{{.Encryption}}</span>{{else}}<span class="badge badge-gray">unencrypted</span>{{end}}
+      </div>
+      <div class="kv" style="margin-top:10px">
+        <dt>Path</dt><dd class="mono" style="font-size:11px">{{.Path}}</dd>
+        <dt>Snapshots</dt><dd>{{.Count}}</dd>
+        <dt>Size</dt><dd>{{formatBytes .TotalBytes}}</dd>
+      </div>
+      {{if .Error}}
+        <div class="alert alert-error" style="margin-top:10px">{{.Error}}</div>
+      {{else}}
+        <div class="actions" style="margin-top:12px;flex-wrap:wrap">
+          <a class="btn btn-sm" href="/backups?repo={{.Path}}">Browse</a>
+          <button class="btn btn-sm" hx-post="/ui/backups/verify?repo={{.Name}}">Verify</button>
+          <button class="btn btn-sm" hx-post="/ui/backups/gc?repo={{.Name}}" hx-confirm="Garbage-collect unreferenced chunks in {{.Name}}?">GC</button>
+          <button class="btn btn-sm" hx-get="/ui/backups/prune-modal?repo={{.Name}}" hx-target="body" hx-swap="beforeend">Prune</button>
+          <button class="btn btn-sm" hx-get="/ui/backups/sync-modal?repo={{.Name}}" hx-target="body" hx-swap="beforeend">Sync</button>
+        </div>
+      {{end}}
+    </div>
+    {{end}}
+  </div>
+  {{end}}
+
+  {{if .Manifests}}
+  <div class="section">
+    <div class="section-header">
+      <h2>Snapshots — {{.RepoPath}}{{if .Encryption}} · {{.Encryption}}{{end}}</h2>
+      <a class="btn btn-sm" href="/backups">← All repos</a>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Snapshot</th><th>VM</th><th>Disk</th><th>Size</th><th>Chunks</th><th>Type</th><th>Actions</th></tr>
+      </thead>
+      <tbody>
+      {{range .Manifests}}
+        <tr>
+          <td class="mono" style="font-size:11px">{{.Timestamp}}</td>
+          <td>{{.VMName}}</td>
+          <td>{{if .DiskName}}{{.DiskName}}{{else}}root{{end}}</td>
+          <td>{{formatBytes .TotalSize}}</td>
+          <td>{{len .Chunks}}</td>
+          <td>{{if .BasedOn}}<span class="badge badge-blue">incremental</span>{{else}}<span class="badge badge-gray">full</span>{{end}}</td>
+          <td class="actions">
+            <button class="btn btn-sm" hx-get="/ui/backups/restore-from-modal?repo={{$.RepoPath}}&vm={{.VMName}}&disk={{.DiskName}}&ts={{.Timestamp}}" hx-target="body" hx-swap="beforeend">{{icon "restore"}} Restore</button>
+            <button class="btn btn-sm" hx-get="/ui/backups/restore-live-modal?repo={{$.RepoPath}}&vm={{.VMName}}&disk={{.DiskName}}&ts={{.Timestamp}}" hx-target="body" hx-swap="beforeend">Live</button>
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else if .RepoPath}}{{if not .Error}}
+    <div class="empty-state">
+      <h3>No snapshots yet</h3>
+      <p>Create a backup from a VM's detail page, or run <code>lv backup snapshot &lt;vm&gt; --repo {{.RepoPath}}</code>.</p>
+    </div>
+  {{end}}{{end}}
+
+  {{if and (not .Repos) (not .RepoPath)}}
+  <div class="empty-state">
+    <h3>No backup repos configured</h3>
+    <p>Add a <code>backup_repos:</code> block to the daemon config, or browse a repo by path:</p>
+    <form method="GET" action="/backups" style="margin-top:10px">
+      <input type="text" name="repo" placeholder="/srv/backup/main" style="width:280px">
+      <button class="btn" type="submit">Browse</button>
+    </form>
+  </div>
+  {{end}}
+</div>
+{{end}}

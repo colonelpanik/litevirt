@@ -1,0 +1,792 @@
+package grpcapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/hooks"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/vfio"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
+)
+
+// MigrateVM performs a live migration of a VM to a target host.
+// It streams MigrateProgress messages back to the caller.
+func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreamingServer[pb.MigrateProgress]) error {
+	ctx := stream.Context()
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return err
+	}
+
+	// Per-VM lock prevents concurrent snapshot/migrate/delete (#27).
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
+	send := func(phase pb.MigratePhase, memPct, diskPct float32) error {
+		return stream.Send(&pb.MigrateProgress{
+			Phase:     phase,
+			MemoryPct: memPct,
+			DiskPct:   diskPct,
+		})
+	}
+
+	// Validate
+	if err := send(pb.MigratePhase_MIGRATE_VALIDATING, 0, 0); err != nil {
+		return err
+	}
+
+	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
+	if err != nil || vm == nil {
+		return status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
+	}
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.migrate", "operator"); err != nil {
+		s.audit(ctx, "vm.migrate", req.VmName, "permission denied: → "+req.TargetHost, "denied")
+		return err
+	}
+	if vm.HostName != s.hostName {
+		client, conn, err := s.peerClient(ctx, vm.HostName)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
+		}
+		defer conn.Close()
+		remote, err := client.MigrateVM(ctx, req)
+		if err != nil {
+			return err
+		}
+		for {
+			msg, err := remote.Recv()
+			if err != nil {
+				if err == io.EOF {
+					return nil
+				}
+				return err
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		}
+	}
+	if vm.State != "running" {
+		return status.Errorf(codes.FailedPrecondition, "VM %q must be running to migrate (state: %s)", req.VmName, vm.State)
+	}
+	// Resolve target host
+	targetHost, err := corrosion.GetHost(ctx, s.db, req.TargetHost)
+	if err != nil || targetHost == nil {
+		return status.Errorf(codes.NotFound, "target host %q not found", req.TargetHost)
+	}
+	if targetHost.State != "active" {
+		return status.Errorf(codes.FailedPrecondition, "target host %q is not active", req.TargetHost)
+	}
+
+	// Warn if VM has snapshots on the source host — they won't follow the migration.
+	if snaps, err := corrosion.ListSnapshots(ctx, s.db, req.VmName); err == nil && len(snaps) > 0 {
+		stream.Send(&pb.MigrateProgress{
+			Phase:  pb.MigratePhase_MIGRATE_VALIDATING,
+			Status: fmt.Sprintf("warning: VM has %d snapshot(s) on source host %s — they will not be migrated", len(snaps), s.hostName),
+		})
+		slog.Warn("migration: VM has snapshots that won't follow",
+			"vm", req.VmName, "snapshots", len(snaps), "source", s.hostName)
+	}
+
+	// Check for local disks — live migration requires --with-storage for these.
+	withStorage := req.WithStorage
+	if req.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
+		disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
+		if err != nil {
+			return status.Errorf(codes.Internal, "query VM disks: %v", err)
+		}
+		for _, d := range disks {
+			if d.StorageType == "local" {
+				if !withStorage {
+					return status.Errorf(codes.FailedPrecondition,
+						"VM %q has local disk %q — use --with-storage for live migration or --strategy=cold",
+						req.VmName, d.DiskName)
+				}
+				break
+			}
+		}
+	}
+
+	// NUMA topology pre-flight: warn if source and target have different NUMA
+	// layouts when the VM has CPU pinning configured (#55).
+	if vm.Spec != "" {
+		var specCheck struct {
+			Resources *struct {
+				CpuPinning []int32 `json:"cpu_pinning"`
+			} `json:"resources"`
+		}
+		if json.Unmarshal([]byte(vm.Spec), &specCheck) == nil &&
+			specCheck.Resources != nil && len(specCheck.Resources.CpuPinning) > 0 {
+			// Log a warning — the target host may have different NUMA topology.
+			slog.Warn("migration pre-flight: VM has CPU pinning — verify NUMA topology on target host",
+				"vm", vm.Name, "target", req.TargetHost,
+				"pinning", specCheck.Resources.CpuPinning)
+			if err := send(pb.MigratePhase_MIGRATE_VALIDATING, 0, 0); err != nil {
+				return err
+			}
+		}
+	}
+
+	// PCI passthrough guard: classify assigned devices as VFs (hot-unplug OK) vs PFs (block live).
+	assignedDevices, _ := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	var detachedVFs []corrosion.PCIDeviceRecord
+	for _, d := range assignedDevices {
+		if d.VMName != req.VmName {
+			continue
+		}
+		if vfio.IsVF(d.Address) {
+			// SR-IOV VFs can be hot-unplugged before migration.
+			detachedVFs = append(detachedVFs, d)
+		} else if req.Strategy == pb.MigrateStrategy_MIGRATE_LIVE {
+			return status.Errorf(codes.FailedPrecondition,
+				"VM %q has PCI passthrough device %s (%s) — live migration is not possible; use --strategy=cold",
+				req.VmName, d.Address, d.Type)
+		}
+	}
+
+	// PCI pre-flight: verify target host has compatible devices for any PCI
+	// devices the VM spec requires (covers both VF reattach and cold migration).
+	if vm.Spec != "" {
+		var specDevices struct {
+			Devices []struct {
+				Type   string `json:"type"`
+				Vendor string `json:"vendor"`
+				Count  int32  `json:"count"`
+			} `json:"devices"`
+		}
+		if json.Unmarshal([]byte(vm.Spec), &specDevices) == nil && len(specDevices.Devices) > 0 {
+			for _, ds := range specDevices.Devices {
+				if ds.Count == 0 {
+					continue
+				}
+				targetDevices, err := corrosion.ListPCIDevices(ctx, s.db, req.TargetHost, ds.Type)
+				if err != nil {
+					return status.Errorf(codes.Internal, "query target host PCI devices: %v", err)
+				}
+				freeCount := int32(0)
+				for _, d := range targetDevices {
+					if d.VMName == "" {
+						freeCount++
+					}
+				}
+				if freeCount < ds.Count {
+					return status.Errorf(codes.FailedPrecondition,
+						"target host %q has %d free %s devices but VM %q requires %d",
+						req.TargetHost, freeCount, ds.Type, req.VmName, ds.Count)
+				}
+			}
+		}
+	}
+
+	// Pre-provision networks on target host. This ensures bridges, DHCP, NAT,
+	// VXLAN tunnels, and IRB gateways exist before the VM arrives — critical for
+	// both live and cold migrations (#38).
+	{
+		preIfaces, _ := corrosion.GetVMInterfaces(ctx, s.db, req.VmName)
+		for _, iface := range preIfaces {
+			if iface.NetworkName == "" {
+				continue
+			}
+			s.provisionNetworkOnRemote(ctx, req.TargetHost, iface.NetworkName)
+		}
+	}
+
+	// Ensure cloud-init ISO exists on target before migration — libvirt will
+	// reject the domain if the CDROM file path doesn't exist (#62).
+	s.ensureCloudInitOnTarget(ctx, req.TargetHost, vm)
+
+	// Ensure disk files exist on target before --with-storage migration.
+	// libvirt validates all file paths in the domain XML before block copy starts.
+	if withStorage {
+		s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name)
+	}
+
+	// Hot-detach SR-IOV VFs before migration.
+	for _, vf := range detachedVFs {
+		if err := s.virt.DetachHostdev(req.VmName, vf.Address); err != nil {
+			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
+		}
+		if err := vfio.Unbind(vf.Address, ""); err != nil {
+			slog.Warn("VFIO unbind failed during migration", "address", vf.Address, "error", err)
+		}
+		corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, vf.Address)
+		slog.Info("VF detached for migration", "vm", req.VmName, "address", vf.Address)
+	}
+
+	// pre_migrate hook
+	hspec := vmHooks(vm)
+	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_RUNNING}
+	hooks.Run(ctx, hooks.PreMigrate, pbVM, hspec)
+
+	// Preparing
+	if err := send(pb.MigratePhase_MIGRATE_PREPARING, 0, 0); err != nil {
+		return err
+	}
+
+	// Default (zero value) and MIGRATE_LIVE both mean live migration.
+	live := req.Strategy != pb.MigrateStrategy_MIGRATE_COLD
+	strategyLabel := "live"
+	if !live {
+		strategyLabel = "cold"
+	}
+
+	// Read migration policy from stored VM spec for tuning parameters.
+	// Keep it as a pointer (nil = no policy) and use the nil-safe generated
+	// getters — copying the proto message by value would drag its embedded
+	// mutex/MessageState along (go vet: "copies lock value").
+	var migratePolicy *pb.MigrationPolicy
+	if vm.Spec != "" {
+		var storedSpec pb.VMSpec
+		if json.Unmarshal([]byte(vm.Spec), &storedSpec) == nil {
+			migratePolicy = storedSpec.Migrate
+		}
+	}
+
+	bandwidthMiB := int(migratePolicy.GetBandwidthMibSec())
+	autoConverge := migratePolicy.GetAutoConverge()
+	// Default auto-converge to true for live migrations when no policy is set,
+	// preserving previous behaviour.
+	if migratePolicy == nil || migratePolicy.GetBandwidthMibSec() == 0 && !migratePolicy.GetAutoConverge() && migratePolicy.GetStrategy() == 0 {
+		autoConverge = live
+	}
+	var maxDowntimeMS int64
+	if migratePolicy.GetMaxDowntime() != "" {
+		if d, err := time.ParseDuration(migratePolicy.GetMaxDowntime()); err == nil {
+			maxDowntimeMS = d.Milliseconds()
+		}
+	}
+
+	// Build destination URI: use TLS transport with our existing PKI certs.
+	// Combined with MigrateTunnelled, all data flows over the single libvirt
+	// TLS port (16514) — no SSH or extra ports required.
+	dconnuri := fmt.Sprintf("qemu+tls://%s/system", targetHost.Address)
+
+	// Mark as migrating in state store
+	corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", fmt.Sprintf("→ %s", req.TargetHost))
+	migrationStart := time.Now()
+
+	if err := send(pb.MigratePhase_MIGRATE_COPYING, 0, 0); err != nil {
+		return err
+	}
+
+	if s.virt == nil {
+		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
+	}
+
+	// Apply migration timeout if configured.
+	migrateCtx := ctx
+	if migratePolicy.GetTimeoutSec() > 0 {
+		var cancel context.CancelFunc
+		migrateCtx, cancel = context.WithTimeout(ctx, time.Duration(migratePolicy.GetTimeoutSec())*time.Second)
+		defer cancel()
+	}
+
+	// Build the list of writable disk targets to migrate (exclude CDROMs).
+	var diskTargets []string
+	if withStorage {
+		disks, _ := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+		for _, d := range disks {
+			if d.TargetDev != "" {
+				diskTargets = append(diskTargets, d.TargetDev)
+			}
+		}
+	}
+
+	// Run migration in background; poll progress.
+	type result struct{ err error }
+	done := make(chan result, 1)
+	go func() {
+		done <- result{s.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{
+			Live:          live,
+			WithStorage:   withStorage,
+			BandwidthMiB:  bandwidthMiB,
+			AutoConverge:  autoConverge,
+			MaxDowntimeMS: maxDowntimeMS,
+			TargetAddress: targetHost.Address,
+			DiskTargets:   diskTargets,
+		})}
+	}()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+poll:
+	for {
+		select {
+		case <-migrateCtx.Done():
+			return migrateCtx.Err()
+		case res := <-done:
+			if res.err != nil {
+				// Migration failed — VM is still on the source host.
+				// Check if the domain is still alive; if so, restore to "running"
+				// instead of leaving it in "error" (#21).
+				if state, sErr := s.virt.DomainState(vm.Name); sErr == nil && state == "running" {
+					corrosion.UpdateVMState(ctx, s.db, vm.Name, "running",
+						fmt.Sprintf("migration to %s failed: %v", req.TargetHost, res.err))
+					slog.Warn("migration failed but VM still running on source",
+						"vm", vm.Name, "target", req.TargetHost, "error", res.err)
+				} else {
+					corrosion.UpdateVMState(ctx, s.db, vm.Name, "error", res.err.Error())
+				}
+				// Remove the disk stubs + cloud-init ISO we pre-created on the
+				// target — the VM never got defined there, so they're orphaned
+				// and would otherwise leak space and shadow a retry. Detached
+				// context: the request ctx may itself be the cause of failure.
+				var stubPaths []string
+				if withStorage {
+					if ds, derr := corrosion.GetVMDisks(ctx, s.db, vm.Name); derr == nil {
+						for _, d := range ds {
+							if d.Path != "" {
+								stubPaths = append(stubPaths, d.Path)
+							}
+						}
+					}
+				}
+				cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 15*time.Second)
+				s.cleanupMigrationArtifactsOnTarget(cleanupCtx, req.TargetHost, vm.Name, stubPaths)
+				cancelCleanup()
+
+				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
+				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
+				return status.Errorf(codes.Internal, "migration failed: %v", res.err)
+			}
+			break poll
+		case <-ticker.C:
+			memPct, diskPct := s.virt.DomainJobProgress(vm.Name)
+			if memPct >= 0 {
+				send(pb.MigratePhase_MIGRATE_CONVERGING, memPct, diskPct) //nolint:errcheck
+			}
+		}
+	}
+
+	// Cutover / completing
+	cutoverStart := time.Now()
+	send(pb.MigratePhase_MIGRATE_CUTOVER, 100, 0)    //nolint:errcheck
+	send(pb.MigratePhase_MIGRATE_COMPLETING, 100, 0) //nolint:errcheck
+
+	downtimeMs := float64(time.Since(cutoverStart).Milliseconds())
+	s.recordMigrationMetrics(strategyLabel, "success", time.Since(migrationStart), downtimeMs, 0)
+
+	// Update state: VM now lives on target host
+	corrosion.UpdateVMHost(ctx, s.db, vm.Name, req.TargetHost, "running")
+	slog.Info("migration complete", "vm", vm.Name, "from", s.hostName, "to", req.TargetHost)
+	s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok", "from="+s.hostName+" to="+req.TargetHost)
+	s.audit(ctx, "vm.migrate", vm.Name, "from="+s.hostName+" to="+req.TargetHost, "ok")
+
+	// Update disk path records to reflect the target host.
+	// For cold migration with --with-storage, libvirt copies files to the same
+	// relative path on the target. Update host_name so queries work correctly.
+	if disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name); err == nil {
+		for _, d := range disks {
+			corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, d.DiskName, req.TargetHost, d.Path)
+			// A --with-storage migration COPIES the disk to the target's own
+			// filesystem, leaving the source's local copy orphaned. Remove it
+			// (we run on the source host). Host-local drivers ONLY: for shared
+			// pools (nfs/ceph/iscsi) the source path is the same file the target
+			// now uses, so deleting it would destroy the live disk.
+			if withStorage && isHostLocalDiskDriver(d.StorageType) && d.Path != "" {
+				// Never delete a source disk that still backs a linked clone or
+				// is referenced by another VM — doing so corrupts the clone's
+				// backing chain / destroys a live disk (bug-sweep #1). Mirrors
+				// the guard MoveVolume/DeleteVM already enforce.
+				if referenced, reason, _ := s.pathStillReferenced(ctx, d.Path, vm.Name, d.DiskName); referenced {
+					slog.Warn("post-migration: source disk still referenced — NOT deleting",
+						"vm", vm.Name, "path", d.Path, "referenced_by", reason)
+				} else if rmErr := os.Remove(d.Path); rmErr != nil && !os.IsNotExist(rmErr) {
+					slog.Warn("post-migration: could not remove orphaned source disk",
+						"vm", vm.Name, "path", d.Path, "error", rmErr)
+				} else if rmErr == nil {
+					slog.Info("post-migration: removed orphaned source disk",
+						"vm", vm.Name, "path", d.Path)
+				}
+			}
+		}
+	}
+
+	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
+	if len(detachedVFs) > 0 {
+		s.reattachVFsOnTarget(ctx, req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name, detachedVFs)
+	}
+
+	// Send gratuitous ARP for each VM interface to update switch MAC tables.
+	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
+	for _, iface := range ifaces {
+		if iface.IP != "" {
+			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
+		}
+	}
+
+	// Update DNS records so VM names resolve correctly after migration.
+	if s.dnsDomain != "" {
+		for _, iface := range ifaces {
+			if iface.IP != "" {
+				dnsName := dns.VMRecordName(vm.Name, vm.StackName, s.dnsDomain)
+				if err := dns.UpsertRecord(ctx, s.db, dnsName, iface.IP); err != nil {
+					slog.Warn("post-migration DNS update failed", "vm", vm.Name, "name", dnsName, "error", err)
+				}
+				break // one A record per VM
+			}
+		}
+	}
+
+	// Refresh LB backends so traffic routes to the new host.
+	go s.refreshLBForStack(context.Background(), vm.StackName)
+
+	// Update FDB entries: VM MACs now live on target host's VTEP.
+	for _, iface := range ifaces {
+		s.updateFDBForMigration(ctx, iface, s.hostName, req.TargetHost)
+	}
+
+	// post_migrate hook (notify with new host)
+	pbVM.HostName = req.TargetHost
+	pbVM.State = pb.VMState_VM_RUNNING
+	hooks.Run(ctx, hooks.PostMigrate, pbVM, hspec)
+
+	// Dial target host to re-establish gRPC so it can load TLS creds.
+	go s.notifyTargetHostOfVM(req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name)
+
+	// Clean up orphaned files on the source host (cloud-init ISO, and disk
+	// files for --with-storage migrations where copies now live on target).
+	go s.cleanupPostMigration(vm.Name)
+
+	return send(pb.MigratePhase_MIGRATE_DONE, 100, 0)
+}
+
+// cleanupPostMigration removes the source host's cloud-init ISO after migration.
+//
+// It deliberately does NOT touch disk files: for --with-storage migrations the
+// orphaned source disks are already removed, per-disk and storage-type-aware,
+// at the migration site above (only for host-local local/dir drivers, at each
+// disk's RECORDED path). The previous os.RemoveAll(<dataDir>/disks/<vm>) here
+// assumed a per-VM subdirectory that the flat <vm>-<disk>.qcow2 naming never
+// uses — at best a no-op, at worst a path-wrong removal — so it's gone.
+func (s *Server) cleanupPostMigration(vmName string) {
+	// Always clean up cloud-init ISO — target regenerates from stored spec if needed.
+	isoPath := filepath.Join(s.dataDir, "cloudinit", vmName+".iso")
+	if err := os.Remove(isoPath); err == nil {
+		slog.Info("post-migration: removed cloud-init ISO", "vm", vmName, "path", isoPath)
+	}
+}
+
+// MigrateVMForHealthCheck is an exported wrapper for use by the health checker.
+// It calls the full MigrateVM path (with all post-migration steps) using a
+// discard stream that drops progress updates. Injects admin auth context.
+func (s *Server) MigrateVMForHealthCheck(ctx context.Context, vmName, targetHost string) error {
+	req := &pb.MigrateVMRequest{
+		VmName:     vmName,
+		TargetHost: targetHost,
+		Strategy:   pb.MigrateStrategy_MIGRATE_LIVE,
+	}
+	// Inject an admin principal so RequirePerm/RequireRole pass for this
+	// internal (health-checker-driven) call. Both username and role must
+	// be present — RequirePerm rejects an empty principal before reaching
+	// the role fallback.
+	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
+	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:healthcheck")
+	return s.MigrateVM(req, &discardMigrateStream{ctx: authCtx})
+}
+
+// discardMigrateStream implements grpc.ServerStreamingServer[pb.MigrateProgress]
+// by discarding all progress messages. Used for internal migration calls.
+type discardMigrateStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (d *discardMigrateStream) Send(*pb.MigrateProgress) error { return nil }
+func (d *discardMigrateStream) Context() context.Context       { return d.ctx }
+
+// recordMigrationMetrics records duration, downtime, and transfer metrics if available.
+func (s *Server) recordMigrationMetrics(strategy, result string, duration time.Duration, downtimeMs, transferBytes float64) {
+	if s.migrationMetrics == nil {
+		return
+	}
+	s.migrationMetrics.Duration.WithLabelValues(strategy, result).Observe(duration.Seconds())
+	if downtimeMs > 0 {
+		s.migrationMetrics.Downtime.WithLabelValues(strategy).Observe(downtimeMs)
+	}
+	if transferBytes > 0 {
+		s.migrationMetrics.Transfer.WithLabelValues(strategy).Observe(transferBytes)
+	}
+}
+
+// reattachVFsOnTarget sends AttachDevice RPCs to the target host for each VF
+// that was detached before migration. The target allocates equivalent VFs from its own pool.
+func (s *Server) reattachVFsOnTarget(ctx context.Context, targetHostName, addr string, grpcPort int, vmName string, vfs []corrosion.PCIDeviceRecord) {
+	tlsCfg, err := pki.PeerTLSConfig(s.pkiDir)
+	if err != nil {
+		slog.Warn("reattach VFs: TLS config", "error", err)
+		return
+	}
+	conn, err := grpc.NewClient(
+		fmt.Sprintf("%s:%d", addr, grpcPort),
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+	)
+	if err != nil {
+		slog.Warn("reattach VFs: dial target", "host", targetHostName, "error", err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewLiteVirtClient(conn)
+	for _, vf := range vfs {
+		_, err := client.AttachDevice(ctx, &pb.AttachDeviceRequest{
+			VmName: vmName,
+			PciDevice: &pb.DeviceSpec{
+				Type:   vf.Type,
+				Vendor: vf.VendorID,
+				Count:  1,
+				Sriov:  true,
+			},
+		})
+		if err != nil {
+			slog.Warn("reattach VF on target failed", "vm", vmName, "type", vf.Type,
+				"vendor", vf.VendorID, "target", targetHostName, "error", err)
+		} else {
+			slog.Info("VF reattached on target", "vm", vmName, "type", vf.Type, "target", targetHostName)
+		}
+	}
+}
+
+// EnsureCloudInit generates a cloud-init ISO on this host if it doesn't already exist.
+// Called by the source host before migration so the target has the ISO ready.
+func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
+	isoPath := lv.CloudInitISOPath(s.dataDir, req.VmName)
+	if _, err := os.Stat(isoPath); err == nil {
+		return &emptypb.Empty{}, nil // already exists
+	}
+
+	userData := req.Userdata
+	if userData == "" {
+		userData = "#cloud-config\n{}\n"
+	}
+	if err := cloudinit.GenerateISO(cloudinit.Config{
+		InstanceID:    req.VmName,
+		LocalHostname: req.VmName,
+		UserData:      userData,
+		NetworkConfig: req.Networkconfig,
+	}, isoPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
+	}
+	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath)
+	return &emptypb.Empty{}, nil
+}
+
+// EnsureDisks creates empty qcow2 images at the requested paths so that
+// libvirt's domain XML validation passes before block copy starts.
+// Called by the source host before --with-storage migration.
+func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*emptypb.Empty, error) {
+	for _, stub := range req.Disks {
+		if _, err := os.Stat(stub.Path); err == nil {
+			continue // already exists
+		}
+		dir := filepath.Dir(stub.Path)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", dir, err)
+		}
+		// Create a valid qcow2 image — QEMU validates the format header
+		// before block copy starts. Use a minimal size; migration overwrites it.
+		sizeBytes := uint64(1024 * 1024 * 1024) // 1G default
+		if stub.SizeBytes > 0 {
+			sizeBytes = uint64(stub.SizeBytes)
+		}
+		if err := qcow2.Create(stub.Path, sizeBytes, nil); err != nil {
+			return nil, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
+		}
+		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// CleanupMigrationArtifacts removes the stub disks + cloud-init ISO that this
+// host pre-created as a migration target, after the migration failed. The VM
+// was never defined here (PersistDest only persists on success), so the files
+// are orphaned; leaving them leaks space and shadows a later retry. Best-effort
+// per file — a missing file is not an error.
+func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
+	for _, p := range req.DiskPaths {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			slog.Warn("cleanup migration artifacts: remove disk stub", "vm", req.VmName, "path", p, "error", err)
+		}
+	}
+	if req.RemoveCloudInit {
+		iso := lv.CloudInitISOPath(s.dataDir, req.VmName)
+		if err := os.Remove(iso); err != nil && !os.IsNotExist(err) {
+			slog.Warn("cleanup migration artifacts: remove cloud-init iso", "vm", req.VmName, "path", iso, "error", err)
+		}
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// cleanupMigrationArtifactsOnTarget best-effort removes the stubs + ISO the
+// target pre-created, after a failed migration. Never blocks/fails the caller.
+func (s *Server) cleanupMigrationArtifactsOnTarget(ctx context.Context, targetHost, vmName string, diskPaths []string) {
+	client, conn, err := s.peerClient(ctx, targetHost)
+	if err != nil {
+		slog.Warn("cleanupMigrationArtifactsOnTarget: cannot reach host", "host", targetHost, "error", err)
+		return
+	}
+	defer conn.Close()
+	if _, err := client.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{
+		VmName:          vmName,
+		DiskPaths:       diskPaths,
+		RemoveCloudInit: true,
+	}); err != nil {
+		slog.Warn("cleanupMigrationArtifactsOnTarget: cleanup failed", "host", targetHost, "vm", vmName, "error", err)
+	}
+}
+
+// isHostLocalDiskDriver reports whether a disk's storage driver keeps the disk
+// as a host-local file, so the same path on two hosts is two distinct files.
+// Deliberately conservative: only the plain-file local/dir drivers qualify, so
+// the post-migration source-disk cleanup never touches shared (nfs/ceph/iscsi)
+// or volume-manager (zfs/lvm/btrfs) backends, where deleting "the source" could
+// destroy the live disk.
+func isHostLocalDiskDriver(t string) bool {
+	return t == "local" || t == "dir"
+}
+
+// diskVirtualSize returns the virtual size of a qcow2 image.
+func diskVirtualSize(_ context.Context, path string) (int64, error) {
+	info, err := qcow2.Info(path)
+	if err != nil {
+		return 0, err
+	}
+	return int64(info.VirtualSize), nil
+}
+
+// ensureDisksOnTarget creates empty stub files on the target host for each
+// local disk so libvirt accepts the domain XML before block copy starts.
+// Reads actual virtual size from source disk files to ensure exact match.
+func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string) {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
+	if err != nil || len(disks) == 0 {
+		return
+	}
+
+	req := &pb.EnsureDisksRequest{VmName: vmName}
+	for _, d := range disks {
+		if d.Path == "" {
+			continue
+		}
+		// Get the actual virtual size from the source disk file,
+		// not the DB — they can differ (e.g. backing image size).
+		size, err := diskVirtualSize(ctx, d.Path)
+		if err != nil {
+			slog.Warn("ensureDisksOnTarget: cannot read virtual size, using DB value",
+				"path", d.Path, "db_size", d.SizeBytes, "error", err)
+			size = d.SizeBytes
+		} else {
+			slog.Info("ensureDisksOnTarget: read virtual size from source",
+				"path", d.Path, "virtual_size", size, "db_size", d.SizeBytes)
+		}
+		req.Disks = append(req.Disks, &pb.DiskStub{
+			Path:      d.Path,
+			SizeBytes: size,
+		})
+	}
+	if len(req.Disks) == 0 {
+		return
+	}
+
+	client, conn, err := s.peerClient(ctx, targetHost)
+	if err != nil {
+		slog.Warn("ensureDisksOnTarget: cannot reach host", "host", targetHost, "error", err)
+		return
+	}
+	defer conn.Close()
+
+	if _, err := client.EnsureDisks(ctx, req); err != nil {
+		slog.Warn("ensureDisksOnTarget: failed", "host", targetHost, "vm", vmName, "error", err)
+	}
+}
+
+// ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
+// before migration starts, so libvirt can find the file when the domain arrives.
+func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string, vm *corrosion.VMRecord) {
+	// Parse spec to extract cloud-init data.
+	var spec pb.VMSpec
+	if vm.Spec == "" {
+		return
+	}
+	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
+		slog.Warn("ensureCloudInitOnTarget: parse spec", "vm", vm.Name, "error", err)
+		return
+	}
+
+	// Build the request — send cloud-init data if present, otherwise send
+	// minimal data so the target generates a basic ISO.
+	req := &pb.EnsureCloudInitRequest{VmName: vm.Name}
+	if spec.CloudInit != nil {
+		req.Userdata = spec.CloudInit.Userdata
+		req.Networkconfig = spec.CloudInit.Networkconfig
+	}
+
+	// Check if the cloud-init ISO exists locally — if not, the VM was created
+	// without one (e.g. non-cloud image) and we don't need it on the target.
+	isoPath := lv.CloudInitISOPath(s.dataDir, vm.Name)
+	if _, err := os.Stat(isoPath); err != nil {
+		return // no ISO on source, skip
+	}
+
+	client, conn, err := s.peerClient(ctx, targetHost)
+	if err != nil {
+		slog.Warn("ensureCloudInitOnTarget: cannot reach host", "host", targetHost, "error", err)
+		return
+	}
+	defer conn.Close()
+
+	if _, err := client.EnsureCloudInit(ctx, req); err != nil {
+		slog.Warn("ensureCloudInitOnTarget: failed", "host", targetHost, "vm", vm.Name, "error", err)
+	}
+}
+
+// notifyTargetHostOfVM pings the target daemon so it picks up the migrated VM.
+func (s *Server) notifyTargetHostOfVM(targetHostName, addr string, grpcPort int, vmName string) {
+	tlsCfg, err := pki.PeerTLSConfig(s.pkiDir)
+	if err != nil {
+		slog.Warn("migrate notify: TLS config", "error", err)
+		return
+	}
+	conn, err := grpc.NewClient(
+		fmt.Sprintf("%s:%d", addr, grpcPort),
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+	)
+	if err != nil {
+		slog.Warn("migrate notify: dial target", "host", targetHostName, "error", err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewLiteVirtClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err = client.InspectVM(ctx, &pb.InspectVMRequest{Name: vmName})
+	if err != nil {
+		slog.Warn("migrate notify: InspectVM on target failed", "host", targetHostName, "vm", vmName, "error", err)
+		return
+	}
+	slog.Info("migrate: target acknowledged VM", "host", targetHostName, "vm", vmName)
+}

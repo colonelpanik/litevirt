@@ -1,0 +1,30 @@
+<div class="modal-overlay" id="mapping-device-modal">
+  <div class="modal" style="max-width:460px">
+    <h3>Add device to {{.Mapping}}</h3>
+    <form hx-post="/ui/resource-mappings/{{.Mapping}}/devices" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful)document.getElementById('mapping-device-modal').remove()">
+      <div class="form-row">
+        <label>Host</label>
+        <input type="text" name="host" required placeholder="kvm-01">
+      </div>
+      <div class="form-row">
+        <label>PCI address</label>
+        <input type="text" name="address" required placeholder="0000:41:00.0">
+      </div>
+      <div class="grid-2" style="gap:12px">
+        <div class="form-row">
+          <label>Vendor (optional)</label>
+          <input type="text" name="vendor" placeholder="10de">
+        </div>
+        <div class="form-row">
+          <label>Device (optional)</label>
+          <input type="text" name="device" placeholder="A100">
+        </div>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn" onclick="document.getElementById('mapping-device-modal').remove()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add device</button>
+      </div>
+    </form>
+  </div>
+</div>

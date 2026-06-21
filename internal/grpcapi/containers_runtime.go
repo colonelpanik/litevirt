@@ -1,0 +1,71 @@
+package grpcapi
+
+import (
+	"context"
+
+	"github.com/litevirt/litevirt/internal/lxc"
+)
+
+// LXCRuntimeAdapter wraps an internal/lxc.Runtime to satisfy
+// grpcapi.ContainerRuntime. Kept here (rather than in internal/lxc)
+// so internal/lxc has no dependency on internal/grpcapi.
+type LXCRuntimeAdapter struct {
+	Inner lxc.Runtime
+}
+
+// NewLXCRuntimeAdapter wraps a production LxcRunner.
+func NewLXCRuntimeAdapter(inner lxc.Runtime) *LXCRuntimeAdapter {
+	return &LXCRuntimeAdapter{Inner: inner}
+}
+
+func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
+	nics := make([]lxc.NetworkAttach, 0, len(opts.Networks))
+	for _, n := range opts.Networks {
+		nics = append(nics, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC})
+	}
+	c, err := a.Inner.Create(ctx, lxc.CreateOpts{
+		Name: opts.Name, Template: opts.Template,
+		Distro: opts.Distro, Release: opts.Release, Arch: opts.Arch,
+		CPULimit: opts.CPULimit, MemoryMiB: opts.MemoryMiB,
+		Network: nics, Labels: opts.Labels,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ContainerInfo{Name: c.Name, State: string(c.State), Image: c.Image}, nil
+}
+
+func (a *LXCRuntimeAdapter) StartContainer(ctx context.Context, name string) error {
+	return a.Inner.Start(ctx, name)
+}
+
+func (a *LXCRuntimeAdapter) StopContainer(ctx context.Context, name string, timeoutSec int) error {
+	return a.Inner.Stop(ctx, name, timeoutSec)
+}
+
+func (a *LXCRuntimeAdapter) DeleteContainer(ctx context.Context, name string) error {
+	return a.Inner.Delete(ctx, name)
+}
+
+func (a *LXCRuntimeAdapter) ExecContainer(ctx context.Context, name string, argv []string) (ContainerExecResult, error) {
+	r, err := a.Inner.Exec(ctx, name, argv)
+	if err != nil {
+		return ContainerExecResult{}, err
+	}
+	return ContainerExecResult{Stdout: r.Stdout, Stderr: r.Stderr, ExitCode: r.ExitCode}, nil
+}
+
+func (a *LXCRuntimeAdapter) StateContainer(ctx context.Context, name string) (string, error) {
+	st, err := a.Inner.State(ctx, name)
+	return string(st), err
+}
+
+func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error) {
+	return a.Inner.List(ctx)
+}
+
+func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error {
+	return lxc.PullOCI(ctx, lxc.PullOCIOptions{
+		Image: image, Dest: dest, Tag: tag, Username: username, Password: password,
+	})
+}

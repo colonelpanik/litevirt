@@ -1,0 +1,34 @@
+<div id="backup-progress"
+     {{if not .Done}}hx-get="{{.PollURL}}" hx-trigger="every 1s" hx-swap="outerHTML"{{end}}>
+  {{if .Error}}
+    <div class="alert alert-error">{{.Status}}: {{.Error}}</div>
+  {{else if .Done}}
+    <div class="alert alert-info" style="border-color:rgba(34,197,94,0.3);background:rgba(34,197,94,0.08);color:var(--green)">
+      {{.Status}}
+      {{if .ManifestTS}}<br>Snapshot <span class="mono">{{.ManifestTS}}</span>{{end}}
+    </div>
+  {{else}}
+    <div class="alert alert-info">
+      <span class="spinner"></span> {{.Status}} <span class="badge badge-gray">{{.Phase}}</span>
+    </div>
+  {{end}}
+
+  {{if eq .Kind "backup"}}
+    <div class="kv" style="margin-top:8px">
+      {{if .BytesProcessed}}<dt>Processed</dt><dd>{{formatBytes .BytesProcessed}}</dd>{{end}}
+      {{if .BytesRead}}<dt>Read from disk</dt><dd>{{formatBytes .BytesRead}}</dd>{{end}}
+      {{if .ChunksTotal}}<dt>Chunks</dt><dd>{{.ChunksTotal}} ({{.ChunksDeduped}} deduped)</dd>{{end}}
+    </div>
+  {{else if eq .Kind "restore"}}
+    <div class="kv" style="margin-top:8px">
+      {{if .BytesWritten}}<dt>Written</dt><dd>{{formatBytes .BytesWritten}}</dd>{{end}}
+      {{if .ChunksTotal}}<dt>Chunks</dt><dd>{{.ChunksDone}} / {{.ChunksTotal}}</dd>{{end}}
+      {{if .TargetPath}}<dt>Target</dt><dd class="mono">{{.TargetPath}}</dd>{{end}}
+    </div>
+  {{else if eq .Kind "restore-live"}}
+    <div class="kv" style="margin-top:8px">
+      {{if .NBDURL}}<dt>NBD URL</dt><dd class="mono">{{.NBDURL}}</dd>{{end}}
+      {{if .TargetPath}}<dt>Overlay</dt><dd class="mono">{{.TargetPath}}</dd>{{end}}
+    </div>
+  {{end}}
+</div>

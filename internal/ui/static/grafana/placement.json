@@ -1,0 +1,41 @@
+{
+  "description": "Placement + rebalancer health. Plan §2.4 bundled dashboard.",
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Placement decisions (per policy)",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "sum by (policy) (rate(litevirt_placement_decisions_total[5m]))", "legendFormat": "{{policy}}"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Pending rebalance proposals",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "litevirt_rebalance_proposals_pending"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rebalance proposals over time (status)",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 4},
+      "targets": [
+        {"expr": "rate(litevirt_rebalance_proposals_total[5m])", "legendFormat": "{{status}}"}
+      ]
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "tags": ["litevirt", "placement"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "title": "litevirt — Placement & Rebalancer",
+  "uid": "litevirt-placement",
+  "version": 1
+}

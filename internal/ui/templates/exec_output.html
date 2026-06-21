@@ -1,0 +1,18 @@
+{{if .Error}}
+<div style="padding:8px;border-radius:4px;background:rgba(239,68,68,0.1);color:var(--red);font-size:13px">
+  Error: {{.Error}}
+</div>
+{{else}}
+<div style="margin-bottom:8px">
+  <span class="badge {{if eq .ExitCode 0}}badge-success{{else}}badge-error{{end}}">exit: {{.ExitCode}}</span>
+</div>
+{{if .Stdout}}
+<pre style="background:var(--bg);padding:12px;border-radius:4px;overflow-x:auto;font-size:12px;max-height:400px;overflow-y:auto">{{.Stdout}}</pre>
+{{end}}
+{{if .Stderr}}
+<pre style="background:rgba(239,68,68,0.05);padding:12px;border-radius:4px;overflow-x:auto;font-size:12px;max-height:200px;overflow-y:auto;color:var(--red)">{{.Stderr}}</pre>
+{{end}}
+{{if and (not .Stdout) (not .Stderr)}}
+<p style="color:var(--muted);font-size:13px">(no output)</p>
+{{end}}
+{{end}}

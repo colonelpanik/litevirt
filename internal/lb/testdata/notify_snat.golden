@@ -1,0 +1,11 @@
+#!/bin/bash
+CTL="/var/run/conntrackd-egress.ctl"
+case "$1" in
+    MASTER)
+        conntrackd -C "$CTL" -c -C commit
+        conntrackd -C "$CTL" -c -f internal
+        ;;
+    BACKUP|FAULT)
+        conntrackd -C "$CTL" -c -f external
+        ;;
+esac

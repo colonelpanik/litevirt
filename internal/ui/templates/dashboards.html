@@ -1,0 +1,37 @@
+{{define "content"}}
+<div class="page">
+  <div class="page-header">
+    <h2>Grafana dashboards</h2>
+    <p class="muted">
+      Bundled dashboards. Each one is a self-contained Grafana
+      JSON model — import via <em>Dashboards → New → Import → Upload JSON file</em>.
+      Datasource name must match the Prometheus datasource that scrapes
+      this cluster's <code>:7444/metrics</code> exporter.
+    </p>
+  </div>
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+  {{if .Dashboards}}
+  <table class="table">
+    <thead>
+      <tr><th>Title</th><th>UID</th><th>Description</th><th>Download</th></tr>
+    </thead>
+    <tbody>
+    {{range .Dashboards}}
+      <tr>
+        <td><strong>{{.Title}}</strong></td>
+        <td class="mono">{{.UID}}</td>
+        <td class="muted">{{.Description}}</td>
+        <td><a href="/static/grafana/{{.Filename}}" download class="mono">{{.Filename}}</a></td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">No dashboards bundled with this build.</div>
+  {{end}}
+  <p class="muted" style="margin-top:24px;font-size:12px">
+    Running without Grafana? See <a href="/metrics-viewer">/metrics-viewer</a> —
+    no-dependencies live view of the same metrics.
+  </p>
+</div>
+{{end}}

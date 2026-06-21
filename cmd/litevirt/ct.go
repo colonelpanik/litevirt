@@ -75,7 +75,7 @@ func newCTCreateCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&template, "template", "download", "lxc-create template name (or rootfs path)")
 	cmd.Flags().StringVar(&distro, "distro", "alpine", "Distribution for download template")
-	cmd.Flags().StringVar(&release, "release", "3.19", "Release for download template")
+	cmd.Flags().StringVar(&release, "release", "3.21", "Release for download template (must be currently published on the LXC image server)")
 	cmd.Flags().StringVar(&arch, "arch", "amd64", "Architecture for download template")
 	cmd.Flags().IntVar(&cpu, "cpu", 0, "CPU shares (0 = unlimited)")
 	cmd.Flags().IntVar(&memMiB, "memory", 0, "Memory cap MiB (0 = unlimited)")

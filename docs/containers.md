@@ -28,13 +28,14 @@ Three reasons:
 ## CLI quickstart
 
 ```
-# Pull an image (add --local to unpack on the host you're on, without the daemon)
-mkdir -p /var/lib/lxc/web/rootfs
-lv ct pull docker.io/library/nginx:1.27 \
-    --dest /var/lib/lxc/web/rootfs
+# Pull an image into the container's directory. umoci unpacks the flattened
+# rootfs to <dest>/rootfs, so point --dest at /var/lib/lxc/<name>.
+# (add --local to unpack on the host you're on, without the daemon)
+lv ct pull docker.io/library/nginx:1.27 --dest /var/lib/lxc/web
 
-# Create the container (template = path to the rootfs we just unpacked)
-lv ct create web --template /var/lib/lxc/web/rootfs
+# Create the container from the unpacked rootfs. --template accepts the bundle
+# dir (descends into rootfs/) or a rootfs path; the LXC config is generated.
+lv ct create web --template /var/lib/lxc/web
 
 # Start, exec, stop, delete
 lv ct start web
@@ -46,7 +47,7 @@ lv ct rm web
 For a download-template container (no OCI image required):
 
 ```
-lv ct create alpine-1 --distro alpine --release 3.19
+lv ct create alpine-1 --distro alpine --release 3.21
 lv ct start alpine-1
 ```
 
@@ -82,7 +83,7 @@ lv registry ls
 lv registry rm ghcr.io
 
 # Pull a private image — credentials are resolved automatically
-lv ct pull ghcr.io/acme/api:1.4 --dest /var/lib/lxc/api/rootfs
+lv ct pull ghcr.io/acme/api:1.4 --dest /var/lib/lxc/api
 ```
 
 The registry argument is a host (`docker.io`, `ghcr.io`,
@@ -95,7 +96,7 @@ is no daemon to resolve a stored credential:
 
 ```
 echo "$TOKEN" | lv ct pull ghcr.io/acme/api:1.4 \
-    --dest /var/lib/lxc/api/rootfs --username me --password-stdin
+    --dest /var/lib/lxc/api --username me --password-stdin
 ```
 
 Credentials can also be managed from the web UI at **Account → Registry

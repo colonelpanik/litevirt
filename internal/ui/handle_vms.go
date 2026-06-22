@@ -610,19 +610,82 @@ func (s *Server) handleUpdateVMSpec(w http.ResponseWriter, r *http.Request) {
 	cpuMode := r.FormValue("cpu_mode")
 	disableVNC := r.FormValue("disable_vnc") == "true"
 
-	_, err := s.grpc.UpdateVM(s.uiBearerCtx(r), &pb.UpdateVMRequest{
+	req := &pb.UpdateVMRequest{
 		Name:       name,
 		Cpu:        int32(cpu),
 		MemoryMib:  int32(mem),
 		CpuMode:    cpuMode,
 		DisableVnc: disableVNC,
-	})
+		Machine:    r.FormValue("machine"),
+		Firmware:   r.FormValue("firmware"),
+	}
+	// Optional redefine-class fields: only send when the form supplied them.
+	if v := r.FormValue("min_memory_mib"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			n32 := int32(n)
+			req.MinMemoryMib = &n32
+		}
+	}
+	if v := r.FormValue("max_memory_mib"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			n32 := int32(n)
+			req.MaxMemoryMib = &n32
+		}
+	}
+	if v := r.FormValue("guest_agent"); v != "" {
+		b := v == "true"
+		req.GuestAgent = &b
+	}
+
+	_, err := s.grpc.UpdateVM(s.uiBearerCtx(r), req)
 	if err != nil {
 		sendToast(w, "Update failed: "+err.Error(), "error")
 		w.WriteHeader(500)
 		return
 	}
 	sendToast(w, "VM '"+name+"' updated", "success")
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleUpdateVMLifecycle applies the LIVE-metadata fields (restart policy,
+// onboot, startup ordering) — these take effect without stopping the VM, so this
+// is a dedicated endpoint separate from the stopped-only resources form. A
+// dedicated handler also avoids checkbox-presence ambiguity (an unchecked onboot
+// box submits nothing; here we always set it from this form's control).
+func (s *Server) handleUpdateVMLifecycle(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", 400)
+		return
+	}
+	onboot := r.FormValue("onboot") == "true"
+	startupOrder, _ := strconv.Atoi(r.FormValue("startup_order"))
+	startDelay, _ := strconv.Atoi(r.FormValue("start_delay_sec"))
+	stopDelay, _ := strconv.Atoi(r.FormValue("stop_delay_sec"))
+	so, sd, td := int32(startupOrder), int32(startDelay), int32(stopDelay)
+
+	req := &pb.UpdateVMRequest{
+		Name:          name,
+		Onboot:        &onboot,
+		StartupOrder:  &so,
+		StartDelaySec: &sd,
+		StopDelaySec:  &td,
+	}
+	// Restart policy: condition "none"/"" clears it server-side.
+	cond := r.FormValue("restart_condition")
+	maxAtt, _ := strconv.Atoi(r.FormValue("restart_max_attempts"))
+	req.Restart = &pb.RestartPolicy{
+		Condition:   cond,
+		MaxAttempts: int32(maxAtt),
+		Delay:       r.FormValue("restart_delay"),
+	}
+
+	if _, err := s.grpc.UpdateVM(s.uiBearerCtx(r), req); err != nil {
+		sendToast(w, "Update failed: "+err.Error(), "error")
+		w.WriteHeader(500)
+		return
+	}
+	sendToast(w, "VM '"+name+"' lifecycle updated", "success")
 	w.WriteHeader(http.StatusOK)
 }
 

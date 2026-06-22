@@ -37,9 +37,90 @@
                {{if .VM.Spec.DisableVnc}}checked{{end}}
                {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
       </div>
+      <div class="grid-2" style="gap:12px">
+        <div class="form-row">
+          <label>Min memory (MiB) <span style="color:var(--muted)">balloon floor; 0 = none</span></label>
+          <input type="number" name="min_memory_mib" value="{{.VM.Spec.MinMemoryMib}}" min="0" step="128"
+                 {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+        </div>
+        <div class="form-row">
+          <label>Max memory (MiB) <span style="color:var(--muted)">balloon ceiling; 0 = fixed</span></label>
+          <input type="number" name="max_memory_mib" value="{{.VM.Spec.MaxMemoryMib}}" min="0" step="128"
+                 {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+        </div>
+      </div>
+      <div class="grid-2" style="gap:12px">
+        <div class="form-row">
+          <label>Machine</label>
+          <input type="text" name="machine" value="{{.VM.Spec.Machine}}" placeholder="q35"
+                 {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+        </div>
+        <div class="form-row">
+          <label>Firmware</label>
+          <select name="firmware" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+            <option value="" {{if eq .VM.Spec.Firmware ""}}selected{{end}}>(unchanged)</option>
+            <option value="uefi" {{if eq .VM.Spec.Firmware "uefi"}}selected{{end}}>UEFI</option>
+            <option value="bios" {{if eq .VM.Spec.Firmware "bios"}}selected{{end}}>BIOS</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Guest agent</label>
+        <input type="checkbox" name="guest_agent" value="true"
+               {{if .VM.Spec.GuestAgent}}checked{{end}}
+               {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+      </div>
       <div class="form-row">
         <button type="submit" class="btn"
                 {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>Save Resources</button>
+      </div>
+    </form>
+
+    <!-- Lifecycle & restart policy (applies live — no stop needed) -->
+    <h4 style="margin:16px 0 8px">Lifecycle &amp; restart policy</h4>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:8px">Applies live — the VM does not need to be stopped.</p>
+    <form hx-post="/ui/vms/{{.VM.Name}}/update-lifecycle" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){location.reload()}">
+      <div class="form-row">
+        <label>Auto-restart policy</label>
+        <select name="restart_condition">
+          <option value="none" {{if not .VM.Spec.Restart}}selected{{end}}>None (never auto-restart)</option>
+          <option value="on-failure" {{if and .VM.Spec.Restart (eq .VM.Spec.Restart.Condition "on-failure")}}selected{{end}}>On failure (crash/fence; clean shutdown sticks)</option>
+          <option value="always" {{if and .VM.Spec.Restart (eq .VM.Spec.Restart.Condition "always")}}selected{{end}}>Always (any unexpected stop)</option>
+        </select>
+        <span style="color:var(--muted);font-size:0.85em">A clean guest shutdown or a manual stop is never auto-restarted.</span>
+      </div>
+      <div class="grid-2" style="gap:12px">
+        <div class="form-row">
+          <label>Max attempts <span style="color:var(--muted)">0 = ∞</span></label>
+          <input type="number" name="restart_max_attempts" min="0"
+                 value="{{if .VM.Spec.Restart}}{{.VM.Spec.Restart.MaxAttempts}}{{else}}0{{end}}">
+        </div>
+        <div class="form-row">
+          <label>Restart delay <span style="color:var(--muted)">e.g. 5s</span></label>
+          <input type="text" name="restart_delay" placeholder="5s"
+                 value="{{if .VM.Spec.Restart}}{{.VM.Spec.Restart.Delay}}{{end}}">
+        </div>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" name="onboot" value="true" {{if .VM.Spec.Onboot}}checked{{end}}> Start automatically when the host boots</label>
+      </div>
+      <div class="grid-2" style="gap:12px">
+        <div class="form-row">
+          <label>Startup order <span style="color:var(--muted)">lower first</span></label>
+          <input type="number" name="startup_order" value="{{.VM.Spec.StartupOrder}}" min="0">
+        </div>
+        <div class="form-row">
+          <label>Start delay (s)</label>
+          <input type="number" name="start_delay_sec" value="{{.VM.Spec.StartDelaySec}}" min="0">
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Stop delay (s) <span style="color:var(--muted)">ordered shutdown</span></label>
+        <input type="number" name="stop_delay_sec" value="{{.VM.Spec.StopDelaySec}}" min="0">
+      </div>
+      <div class="form-row">
+        <button type="submit" class="btn btn-primary">Save Lifecycle</button>
       </div>
     </form>
 

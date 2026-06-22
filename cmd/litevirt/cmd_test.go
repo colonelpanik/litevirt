@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -574,10 +575,38 @@ func TestRmFlags(t *testing.T) {
 func TestUpdateFlags(t *testing.T) {
 	cmd := newUpdateCmd()
 	checkFlags(t, cmd, map[string]string{
-		"cpu":         "0",
-		"memory":      "0",
-		"disable-vnc": "false",
+		"cpu":                  "0",
+		"memory":               "0",
+		"disable-vnc":          "false",
+		"restart":              "",
+		"restart-max-attempts": "0",
+		"restart-delay":        "",
+		"restart-window":       "",
+		"onboot":               "false",
+		"startup-order":        "0",
+		"start-delay":          "0",
+		"stop-delay":           "0",
+		"machine":              "",
+		"firmware":             "",
+		"guest-agent":          "false",
+		"min-mem":              "0",
+		"max-mem":              "0",
 	})
+}
+
+// `lv update <vm>` with no field flags must error before contacting the daemon.
+func TestUpdate_NoFlagsErrors(t *testing.T) {
+	cmd := newUpdateCmd()
+	cmd.SetArgs([]string{"some-vm"})
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected an error when no field flags are specified")
+	}
+	if !strings.Contains(err.Error(), "at least one") {
+		t.Errorf("error = %q, want it to mention specifying at least one field", err.Error())
+	}
 }
 
 func TestMigrateFlags(t *testing.T) {

@@ -1851,9 +1851,6 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		defer conn.Close()
 		return client.UpdateVM(ctx, req)
 	}
-	if vm.State != "stopped" {
-		return nil, status.Errorf(codes.FailedPrecondition, "VM %q must be stopped to update spec (current: %s)", req.Name, vm.State)
-	}
 
 	// Deserialize stored spec.
 	spec := &pb.VMSpec{}
@@ -1863,20 +1860,83 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 	}
 
-	// Apply changes.
-	if req.Cpu > 0 {
-		spec.Cpu = req.Cpu
+	// LIVE metadata fields — applied whether the VM is running or stopped. The
+	// reconciler/vmcheck read these fresh from the spec each sweep, so no redefine
+	// is needed. A nil restart means "unchanged"; restart.condition=="none"|""
+	// CLEARS the policy. The optional scalars are nil when unchanged.
+	if req.Restart != nil {
+		if c := req.Restart.Condition; c == "" || c == "none" {
+			spec.Restart = nil
+		} else {
+			spec.Restart = req.Restart
+		}
 	}
-	if req.MemoryMib > 0 {
-		spec.MemoryMib = req.MemoryMib
+	if req.Onboot != nil {
+		spec.Onboot = *req.Onboot
 	}
-	if req.CpuMode != "" {
-		spec.CpuMode = req.CpuMode
+	if req.StartupOrder != nil {
+		spec.StartupOrder = *req.StartupOrder
 	}
-	spec.DisableVnc = req.DisableVnc
+	if req.StartDelaySec != nil {
+		spec.StartDelaySec = *req.StartDelaySec
+	}
+	if req.StopDelaySec != nil {
+		spec.StopDelaySec = *req.StopDelaySec
+	}
+
+	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
+	// Only require stopped (and redefine) when one of them is actually changing —
+	// a metadata-only update applies live above.
+	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" ||
+		req.Machine != "" || req.Firmware != "" ||
+		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil
+	if redefine {
+		if vm.State != "stopped" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"VM %q must be stopped to change cpu/memory/machine/firmware/mem-bounds (current: %s); restart policy, onboot and startup ordering can be changed live",
+				req.Name, vm.State)
+		}
+		if req.Cpu > 0 {
+			spec.Cpu = req.Cpu
+		}
+		if req.MemoryMib > 0 {
+			spec.MemoryMib = req.MemoryMib
+		}
+		if req.CpuMode != "" {
+			spec.CpuMode = req.CpuMode
+		}
+		if req.Machine != "" {
+			spec.Machine = req.Machine
+		}
+		if req.Firmware != "" {
+			spec.Firmware = req.Firmware
+		}
+		if req.GuestAgent != nil {
+			spec.GuestAgent = *req.GuestAgent
+		}
+		if req.MinMemoryMib != nil {
+			spec.MinMemoryMib = *req.MinMemoryMib
+		}
+		if req.MaxMemoryMib != nil {
+			spec.MaxMemoryMib = *req.MaxMemoryMib
+		}
+		spec.DisableVnc = req.DisableVnc
+	}
 
 	// Re-serialize spec.
 	specJSON, _ := json.Marshal(spec)
+
+	// Metadata-only update: persist the spec and return — no domain redefine, so a
+	// running VM keeps running untouched.
+	if !redefine {
+		if err := corrosion.UpdateVMSpec(ctx, s.db, req.Name, string(specJSON), int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+			return nil, status.Errorf(codes.Internal, "update VM spec: %v", err)
+		}
+		slog.Info("VM metadata updated (live)", "vm", req.Name,
+			"restart", spec.Restart.GetCondition(), "onboot", spec.Onboot, "startup_order", spec.StartupOrder)
+		s.recordVMEvent(ctx, req.Name, "vm.updated", "ok", "live metadata update")
+		return s.vmToProto(ctx, req.Name)
+	}
 
 	// Build disk configs from stored disks.
 	disks, _ := corrosion.GetVMDisks(ctx, s.db, req.Name)

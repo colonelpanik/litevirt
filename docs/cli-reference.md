@@ -114,9 +114,17 @@ lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 ```bash
 lv config <vm> --ip <ip> --network <net>     # Set VM IP address
 lv config <vm> --boot disk|cdrom|network     # Set boot order
-lv update <vm> [--cpu N] [--memory N]        # Update a stopped VM's resources
-  [--cpu-mode host-passthrough|host-model|custom]
-  [--disable-vnc]
+
+# lv update reconfigures an existing VM. Restart policy, autostart and startup
+# ordering apply LIVE (no stop needed); the resource fields require the VM stopped.
+lv update <vm> --restart on-failure          # set/clear restart policy (live)
+  [--restart-max-attempts N --restart-delay 5s --restart-window 1h]
+  [--restart none]                           # clear the policy
+lv update <vm> [--onboot] [--startup-order N] [--start-delay N] [--stop-delay N]   # autostart/ordering (live)
+lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
+  [--cpu-mode host-passthrough|host-model|custom] [--disable-vnc]
+  [--machine q35] [--firmware uefi|bios] [--guest-agent]
+  [--min-mem N] [--max-mem N]
 lv rebuild <vm>                              # Recreate from stored spec
 lv cutover <vm>                              # Snapshot-and-replace update
 lv resize-disk <vm> --disk <name> --size <size>   # Grow a disk

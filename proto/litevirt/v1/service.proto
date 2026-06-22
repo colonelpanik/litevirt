@@ -93,8 +93,30 @@ message SetBootOrderRequest { string name = 1; string boot_order = 2; }
                              // boot_order: "disk" | "cdrom" | "network"
 message RebuildVMRequest   { string name = 1; }
 message CutoverVMRequest   { string vm_name = 1; }
+// UpdateVMRequest reconfigures an existing VM. Fields split by apply-semantics:
+//   - LIVE metadata (applied while running, no redefine): restart, onboot,
+//     startup_order, start_delay_sec, stop_delay_sec. The reconciler/vmcheck read
+//     these fresh each sweep.
+//   - REDEFINE (require the VM stopped — they regenerate the domain XML):
+//     cpu, memory_mib, cpu_mode, disable_vnc, machine, firmware, guest_agent,
+//     min_memory_mib, max_memory_mib.
+// Presence: int32/string scalars use 0/"" = unchanged; `optional` fields use
+// nil = unchanged (so a real 0/false can be set); restart nil = unchanged and
+// restart.condition=="none" clears the policy. Optional fields are additive and
+// ignored by older daemons (forward-compatible in a mixed-version cluster).
 message UpdateVMRequest    { string name = 1; int32 cpu = 2;
-    int32 memory_mib = 3; bool disable_vnc = 4; string cpu_mode = 5; }
+    int32 memory_mib = 3; bool disable_vnc = 4; string cpu_mode = 5;
+    RestartPolicy restart = 6;
+    optional bool  onboot          = 7;
+    optional int32 startup_order   = 8;
+    optional int32 start_delay_sec = 9;
+    optional int32 stop_delay_sec  = 10;
+    string         machine         = 11;
+    string         firmware        = 12;
+    optional bool  guest_agent     = 13;
+    optional int32 min_memory_mib  = 14;
+    optional int32 max_memory_mib  = 15;
+}
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
 // ballooned via virtio without a redefine.

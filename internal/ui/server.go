@@ -422,6 +422,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/backups/prune", s.requireAuthFunc(s.handleRepoPrune))
 	mux.HandleFunc("POST /ui/vms/restore", s.requireAuthFunc(s.handleRestoreVM))
 	mux.HandleFunc("POST /ui/vms/{name}/update-spec", s.requireAuthFunc(s.handleUpdateVMSpec))
+	mux.HandleFunc("POST /ui/vms/{name}/update-lifecycle", s.requireAuthFunc(s.handleUpdateVMLifecycle))
 	mux.HandleFunc("POST /ui/vms/{name}/boot-order", s.requireAuthFunc(s.handleSetBootOrder))
 	mux.HandleFunc("GET /ui/vms/{name}/resize-disk-modal", s.requireAuthFunc(s.handleResizeDiskModal))
 	mux.HandleFunc("GET /ui/vms/{name}/move-volume-modal", s.requireAuthFunc(s.handleMoveVolumeModal))

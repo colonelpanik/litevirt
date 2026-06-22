@@ -62,6 +62,47 @@ func preflightUnitCheck() error {
 	return nil
 }
 
+// preflightWatchdog refuses to start when watchdog self-fencing is configured
+// (cfg.WatchdogDev set) but the device isn't usable. Without this check a
+// missing or misconfigured device is only discovered at fence time — when the
+// node is already trying to self-fence — so the fence silently fails to reboot
+// and the cluster risks split-brain. We validate at startup instead.
+//
+// The device is only Stat'd, never opened: opening a watchdog device arms the
+// hardware timer on most drivers, and the heartbeat goroutine is what should
+// own that lifecycle. A configured-but-unusable device is fatal; operators can
+// override with LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1 (mirrors the KillMode
+// override). An empty devPath means watchdog fencing is disabled — nothing to
+// check.
+func preflightWatchdog(devPath string) error {
+	if devPath == "" {
+		return nil
+	}
+	if os.Getenv("LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK") == "1" {
+		slog.Warn("preflight: skipping watchdog device check "+
+			"(LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1); self-fencing may silently fail",
+			"dev", devPath)
+		return nil
+	}
+	fi, err := os.Stat(devPath)
+	if err != nil {
+		return fmt.Errorf(
+			"watchdog device %q is configured but unavailable: %v; the node could not "+
+				"self-fence on failure (split-brain risk). Load the watchdog kernel module, "+
+				"unset watchdog_dev to disable watchdog fencing, or override with "+
+				"LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1 if you understand the risk.",
+			devPath, err)
+	}
+	if fi.Mode()&os.ModeCharDevice == 0 {
+		return fmt.Errorf(
+			"watchdog device %q is not a character device (mode %s); refusing to start. "+
+				"Set watchdog_dev to a real watchdog (e.g. /dev/watchdog) or unset it to "+
+				"disable watchdog fencing.",
+			devPath, fi.Mode())
+	}
+	return nil
+}
+
 // parseSystemctlProps parses `systemctl show --property` output (KEY=VALUE
 // per line) into a map.
 func parseSystemctlProps(s string) map[string]string {

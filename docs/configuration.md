@@ -52,6 +52,10 @@ dns_port: 5354
 dns_domain: "litevirt.local"
 
 # Kernel watchdog device for self-fencing. Empty string disables.
+# When set, the daemon validates the device exists (and is a character device)
+# at startup and REFUSES TO START if it's missing — otherwise a broken watchdog
+# would only be discovered at fence time, when the node can no longer self-fence
+# (split-brain risk). Override with LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1.
 watchdog_dev: ""
 
 # Peers to join on startup. At least one existing host.

@@ -134,6 +134,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := preflightUnitCheck(); err != nil {
 		return fmt.Errorf("preflight: %w", err)
 	}
+	// Pre-flight: if watchdog self-fencing is configured, refuse to start with a
+	// missing/unusable device so we don't discover it only at fence time.
+	if err := preflightWatchdog(d.cfg.WatchdogDev); err != nil {
+		return fmt.Errorf("preflight: %w", err)
+	}
 
 	// Initialize corrosion schema
 	if err := corrosion.InitSchema(ctx, d.db); err != nil {

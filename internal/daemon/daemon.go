@@ -44,6 +44,12 @@ import (
 	"github.com/litevirt/litevirt/internal/watchdog"
 )
 
+// grpcMaxMsgSize raises the gRPC max message size above the 4 MiB default for
+// the internal cluster RPCs (full-state dump fallback, replication batches).
+// StreamStateDump chunks well below this; it's a backstop for the non-chunked
+// paths that share the connection.
+const grpcMaxMsgSize = 64 << 20 // 64 MiB
+
 // Daemon is the main litevirtd process.
 type Daemon struct {
 	cfg     *Config
@@ -429,7 +435,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
 	// replica promoter (auto_promote recovery) and start the coordinator.
-	fc.Promoter = svc // *grpcapi.Server implements failover.ReplicaPromoter
+	fc.Promoter = svc                 // *grpcapi.Server implements failover.ReplicaPromoter
 	fc.OnFence = svc.NotifyHostFenced // operator notification on fence (#5)
 	go fc.Start(ctx)
 
@@ -490,6 +496,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
 		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
 		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
+		// Defense-in-depth for the legacy unary state-dump/replication paths: the
+		// 4 MiB gRPC default silently failed a large full-state dump (the bug
+		// StreamStateDump fixes), and a big PushMutations batch could trip it too.
+		// StreamStateDump itself stays well under this; this only backstops the
+		// non-chunked paths during/after a mixed-version rollout.
+		grpc.MaxRecvMsgSize(grpcMaxMsgSize),
+		grpc.MaxSendMsgSize(grpcMaxMsgSize),
 	)
 
 	pb.RegisterLiteVirtServer(d.grpcSrv, svc)

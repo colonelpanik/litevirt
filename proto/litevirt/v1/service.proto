@@ -1094,6 +1094,15 @@ message StateDumpResponse {
     bytes data = 1; // gzipped JSON full-state dump
 }
 
+// StateDumpChunk is one slice of the gzipped full-state dump, streamed by
+// StreamStateDump so a large dump can't exceed the gRPC max-message size (the
+// unary GetStateDump silently failed above ~4 MiB). Reassemble the chunks in
+// order to recover the same blob GetStateDump would have returned.
+message StateDumpChunk {
+    bytes data  = 1; // a contiguous slice of the gzipped dump
+    bool  final = 2; // true on the last chunk
+}
+
 // ── WAL Replication ──
 
 message MutationEntry {
@@ -1380,6 +1389,11 @@ service LiteVirt {
     // ── Internal: State Sync ──
     rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);
     rpc GetStateDump(google.protobuf.Empty)         returns (StateDumpResponse);
+    // StreamStateDump is the chunked replacement for GetStateDump: it streams
+    // the gzipped dump in bounded slices so it survives at scale. GetStateDump
+    // is retained for mixed-version clusters — a new client falls back to it
+    // when a peer doesn't implement the stream.
+    rpc StreamStateDump(google.protobuf.Empty)      returns (stream StateDumpChunk);
 
     // ── Internal: WAL Replication ──
     rpc PushMutations(ReplicateRequest)             returns (ReplicateResponse);

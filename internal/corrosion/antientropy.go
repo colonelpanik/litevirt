@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -114,14 +117,50 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap 
 
 	// Fetch full state dump and merge with LWW.
 	slog.Info("anti-entropy: syncing from peer", "peer", peerName)
-	dump, err := client.GetStateDump(ctx, &emptypb.Empty{})
+	data, err := fetchStateDump(ctx, client)
 	if err != nil {
 		slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
 		return
 	}
 
-	ae.client.MergeStateBytesLWW(dump.Data)
-	slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(dump.Data))
+	ae.client.MergeStateBytesLWW(data)
+	slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
+}
+
+// fetchStateDump pulls a peer's full state dump, preferring the chunked
+// StreamStateDump RPC (which can't hit the gRPC max-message size) and falling
+// back to the legacy unary GetStateDump when the peer is an older build that
+// doesn't implement the stream. This keeps anti-entropy working in a
+// mixed-version cluster in both directions.
+func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, error) {
+	stream, err := client.StreamStateDump(ctx, &emptypb.Empty{})
+	if err == nil {
+		var buf []byte
+		for {
+			chunk, rerr := stream.Recv()
+			if rerr == io.EOF {
+				return buf, nil
+			}
+			if rerr != nil {
+				// An old peer reports Unimplemented (usually on the first Recv,
+				// so buf is still empty) — fall back to the unary RPC.
+				if status.Code(rerr) == codes.Unimplemented {
+					break
+				}
+				return nil, rerr
+			}
+			buf = append(buf, chunk.Data...)
+		}
+	} else if status.Code(err) != codes.Unimplemented {
+		return nil, err
+	}
+
+	// Fallback: legacy unary full-state dump.
+	dump, derr := client.GetStateDump(ctx, &emptypb.Empty{})
+	if derr != nil {
+		return nil, derr
+	}
+	return dump.Data, nil
 }
 
 func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
@@ -163,12 +202,20 @@ func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.Lite
 	conn, err := grpc.NewClient(
 		fmt.Sprintf("%s:%d", addr, port),
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		// Raise the receive limit so the legacy unary GetStateDump fallback can
+		// pull a large full-state dump from an old peer. StreamStateDump chunks
+		// stay well under the 4 MiB default and don't need this.
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(antiEntropyMaxMsgSize)),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial: %w", err)
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
+
+// antiEntropyMaxMsgSize bounds the legacy unary state-dump fallback's receive
+// size; matches the server's grpcMaxMsgSize backstop.
+const antiEntropyMaxMsgSize = 64 << 20 // 64 MiB
 
 // MergeStateBytesLWW merges a full state dump with HLC-aware LWW conflict resolution.
 func (c *Client) MergeStateBytesLWW(buf []byte) {

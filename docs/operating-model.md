@@ -27,7 +27,11 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **No data loss for committed local writes** as long as one healthy peer
   remains reachable before the host dies.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
-  and is the safety net for any divergence the WAL replicator missed.
+  and is the safety net for any divergence the WAL replicator missed. When it
+  detects drift it pulls the peer's full state over a **chunked** streaming RPC
+  (`StreamStateDump`), so convergence works regardless of total state size; the
+  older unary `GetStateDump` is retained as a fallback for mixed-version
+  clusters and is the path `lv cluster sync` still uses.
 
 ### HA / Failover
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh

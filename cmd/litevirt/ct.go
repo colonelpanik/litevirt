@@ -43,6 +43,8 @@ func newCTCreateCmd() *cobra.Command {
 	var cpu, memMiB int
 	var useLocal bool
 	var networks []string
+	var restart, restartDelay, restartWin string
+	var restartMax int32
 	cmd := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a new container (does not start it)",
@@ -65,12 +67,21 @@ func newCTCreateCmd() *cobra.Command {
 				return nil
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				ct, err := c.CreateContainer(ctx, &pb.CreateContainerRequest{
+				req := &pb.CreateContainerRequest{
 					HostName: host,
 					Name:     args[0], Template: template,
 					Distro: distro, Release: release, Arch: arch,
 					Cpu: int32(cpu), MemoryMib: int32(memMiB), Networks: nics,
-				})
+				}
+				if restart != "" && restart != "none" {
+					req.Restart = &pb.RestartPolicy{
+						Condition:   restart,
+						MaxAttempts: restartMax,
+						Delay:       restartDelay,
+						Window:      restartWin,
+					}
+				}
+				ct, err := c.CreateContainer(ctx, req)
 				if err != nil {
 					return err
 				}
@@ -88,6 +99,10 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().StringArrayVar(&networks, "network", nil, "Attach a NIC: bridge=<br>[,name=eth0][,ip=10.0.0.5/24][,mac=AA:BB:..] (repeatable; default: lxcbr0)")
 	cmd.Flags().StringVar(&host, "host", "", "Target host (default: the daemon you're connected to)")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local lxc-* runtime instead of gRPC")
+	cmd.Flags().StringVar(&restart, "restart", "", "Auto-restart policy: none | on-failure | always (default none). An operator `lv ct stop` is never auto-restarted; any other stop is treated as unexpected (containers have no stop reason).")
+	cmd.Flags().Int32Var(&restartMax, "restart-max-attempts", 0, "Max restart attempts within the window (0 = unlimited)")
+	cmd.Flags().StringVar(&restartDelay, "restart-delay", "", "Delay between restart attempts (e.g. 5s; default 5s)")
+	cmd.Flags().StringVar(&restartWin, "restart-window", "", "Attempt-count window (e.g. 1h; default 1h)")
 	return cmd
 }
 

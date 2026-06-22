@@ -500,13 +500,30 @@ Auto-restart VMs that crash or stop unexpectedly. This is distinct from healthch
       window: "1h"                # Reset attempt counter after this duration
 ```
 
-Conditions:
+litevirt decides whether to restart from *why* the workload stopped (the libvirt
+shutoff reason), not merely that it is stopped:
 
 - `none` — never auto-restart (default).
-- `on-failure` — restart only if the VM is in "error" state (crash). Clean shutdowns are not restarted.
-- `always` — restart on both error and stopped states, unless the VM was explicitly stopped by an operator (`lv stop`).
+- `on-failure` — restart on an **unexpected** stop: a crash, a failed start, or a
+  fence/external `destroy`. A clean guest-initiated shutdown (ACPI poweroff from
+  inside the guest) or an operator `lv stop` is **never** restarted.
+- `always` — same triggers as `on-failure` in litevirt: a clean guest shutdown
+  and an operator stop always "stick". This is the **guest-stick** rule — unlike
+  literal Docker `always`, litevirt will not fight a guest that asked to power off.
+  Only an unexpected stop is restarted.
 
-The attempt counter tracks restarts within the sliding `window`. Once `max-attempts` is reached, the VM stays stopped until the window elapses (resetting the counter) or an operator intervenes.
+A suspended VM (managed-save / RAM snapshot) or a paused VM is never cold-booted
+by the restart engine — it would discard saved RAM; resume it instead.
+
+The attempt counter tracks restarts within the sliding `window`. Once `max-attempts`
+is reached, the VM stays stopped until the window elapses (resetting the counter)
+or an operator intervenes.
+
+The same policy applies to **containers** (`lv ct create --restart …`), with one
+caveat: LXC reports no stop *reason*, so a container cannot distinguish a clean
+in-guest shutdown from a crash. Only an operator `lv ct stop` is guaranteed-stick;
+any other stop is treated as unexpected and restarted per policy. A frozen
+(paused) container is treated as running and never restarted.
 
 ## Update strategy
 

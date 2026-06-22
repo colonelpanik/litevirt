@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -59,7 +60,8 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		HostName: s.hostName, Name: info.Name,
 		State: info.State, Image: chooseImage(req.Image, info.Image),
 		CPULimit: int(req.Cpu), MemMiB: int(req.MemoryMib),
-		Labels: req.Labels, CreatedAt: now,
+		Labels: req.Labels, RestartPolicy: encodeRestartPolicy(req.Restart),
+		CreatedAt: now,
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
 		// Container exists in LXC but not in cluster state — log; the
@@ -86,7 +88,9 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
-	_ = corrosion.SetContainerState(ctx, s.db, s.hostName, req.Name, "running")
+	// Clear any prior stop intent (e.g. 'operator-stop') so a subsequent
+	// unexpected stop is correctly treated as unexpected by the reconciler.
+	_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "running", "")
 	return &emptypb.Empty{}, nil
 }
 
@@ -105,7 +109,9 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	if err := s.containerRuntime.StopContainer(ctx, req.Name, int(req.TimeoutSec)); err != nil {
 		return nil, status.Errorf(codes.Internal, "stop: %v", err)
 	}
-	_ = corrosion.SetContainerState(ctx, s.db, s.hostName, req.Name, "stopped")
+	// Record operator intent so the container reconciler leaves it stopped
+	// (the container analogue of StopVM writing vms.state_detail='operator-stop').
+	_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "stopped", "operator-stop")
 	return &emptypb.Empty{}, nil
 }
 
@@ -125,6 +131,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	_ = corrosion.DeleteContainer(ctx, s.db, s.hostName, req.Name)
+	_ = corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name)
 	slog.Info("container deleted", "name", req.Name, "host", s.hostName)
 	return &emptypb.Empty{}, nil
 }
@@ -244,6 +251,7 @@ func toPbContainer(r corrosion.ContainerRecord) *pb.Container {
 	return &pb.Container{
 		HostName: r.HostName, Name: r.Name, State: r.State,
 		Image: r.Image, CpuLimit: int32(r.CPULimit), MemoryMib: int32(r.MemMiB),
+		Restart: decodeRestartPolicy(r.RestartPolicy), StateDetail: r.StateDetail,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 	}
 }
@@ -253,6 +261,34 @@ func chooseImage(req, info string) string {
 		return req
 	}
 	return info
+}
+
+// encodeRestartPolicy serializes a container's restart policy for the
+// containers.restart_policy column. A nil or none-condition policy stores an
+// empty string so the common (opt-out) case carries no JSON. Round-trips via
+// decodeRestartPolicy.
+func encodeRestartPolicy(rp *pb.RestartPolicy) string {
+	if rp == nil || rp.Condition == "" || rp.Condition == "none" {
+		return ""
+	}
+	b, err := json.Marshal(rp)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// decodeRestartPolicy parses the stored restart_policy JSON; an empty string (or
+// garbage) yields nil (treated as "none").
+func decodeRestartPolicy(s string) *pb.RestartPolicy {
+	if s == "" {
+		return nil
+	}
+	rp := &pb.RestartPolicy{}
+	if err := json.Unmarshal([]byte(s), rp); err != nil {
+		return nil
+	}
+	return rp
 }
 
 // keep errors imported in case we add typed-error returns later

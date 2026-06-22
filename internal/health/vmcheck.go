@@ -464,15 +464,27 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	}
 	rp := spec.Restart
 
-	// condition: "none" → never restart
-	if rp.Condition == "none" || rp.Condition == "" {
+	// Decide whether to restart based on WHY the VM stopped — not merely that it
+	// is "stopped" (a crash also lands there). Prefer the live libvirt shutoff
+	// reason (authoritative); fall back to the persisted state_detail when
+	// libvirt is unreachable. A suspended VM (managed-save) is never cold-booted.
+	// restartDecision holds the full matrix; "guest-stick" means a clean guest
+	// shutdown / operator stop never restarts under any condition.
+	cause := ""
+	hasManagedSave := false
+	if v.virt != nil {
+		if st, err := v.virt.DomainStateReason(vm.Name); err == nil {
+			cause = st.Reason
+		}
+		if ms, err := v.virt.HasManagedSaveImage(vm.Name); err == nil {
+			hasManagedSave = ms
+		}
+	}
+	ok, decision := restartDecision(cause, vm.StateDetail, hasManagedSave, rp.Condition)
+	if !ok {
+		slog.Debug("vmcheck: not restarting per policy", "vm", vm.Name, "decision", decision)
 		return
 	}
-	// condition: "on-failure" → only restart on error, not clean shutdown
-	if rp.Condition == "on-failure" && vm.State == "stopped" {
-		return
-	}
-	// condition: "always" → restart both stopped and error
 
 	// Check restart state from DB.
 	rs, err := corrosion.GetRestartState(ctx, v.db, vm.Name)
@@ -521,9 +533,9 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 			fmt.Sprintf("restart policy start failed: %v", err))
 		return
 	}
-	corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", "restarted by restart policy")
+	corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", "restart policy: "+decision)
 	v.publish("vm.restart.policy", vm.Name,
-		fmt.Sprintf("condition=%s attempt=%d", rp.Condition, safeAttemptCount(rs)+1))
+		fmt.Sprintf("condition=%s attempt=%d (%s)", rp.Condition, safeAttemptCount(rs)+1, decision))
 }
 
 func safeAttemptCount(rs *corrosion.RestartState) int {

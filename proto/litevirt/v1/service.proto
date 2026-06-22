@@ -512,14 +512,16 @@ message RestoreFromBackupProgress {
 // ── Containers ──
 
 message Container {
-    string host_name   = 1;
-    string name        = 2;
-    string state       = 3;  // stopped | starting | running | stopping | error | unknown
-    string image       = 4;  // origin reference (oci://… or alpine:3.19)
-    int32  cpu_limit   = 5;
-    int32  memory_mib  = 6;
-    string created_at  = 7;
-    string updated_at  = 8;
+    string host_name    = 1;
+    string name         = 2;
+    string state        = 3;  // stopped | starting | running | stopping | error | unknown
+    string image        = 4;  // origin reference (oci://… or alpine:3.19)
+    int32  cpu_limit    = 5;
+    int32  memory_mib   = 6;
+    string created_at   = 7;
+    string updated_at   = 8;
+    RestartPolicy restart = 9;   // auto-restart policy (nil/condition="none" = never)
+    string state_detail = 10;    // stop cause / intent, e.g. "operator-stop"
 }
 
 message ContainerNetwork {
@@ -541,6 +543,7 @@ message CreateContainerRequest {
     repeated ContainerNetwork networks = 9;
     map<string, string> labels = 10;
     string image     = 11;
+    RestartPolicy restart = 12;  // auto-restart policy (nil/condition="none" = never)
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }

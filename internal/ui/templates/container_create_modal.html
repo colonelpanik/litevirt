@@ -51,6 +51,21 @@
           <input type="text" name="ip" placeholder="DHCP if blank" style="width:100%">
         </div>
       </div>
+      <div style="display:flex;gap:12px">
+        <div class="form-row" style="flex:1">
+          <label>Auto-restart policy</label>
+          <select name="restart_condition" style="width:100%">
+            <option value="none">None (never auto-restart)</option>
+            <option value="on-failure">On failure (restart unless operator-stopped)</option>
+            <option value="always">Always (restart on any unexpected stop)</option>
+          </select>
+        </div>
+        <div class="form-row" style="width:140px">
+          <label>Max attempts <span style="color:#888">(0=∞)</span></label>
+          <input type="number" name="restart_max_attempts" value="0" min="0" style="width:100%">
+        </div>
+      </div>
+      <p class="muted" style="margin-top:-4px;font-size:0.85em">A manual <code>lv ct stop</code> is never auto-restarted. Containers have no stop reason, so any other stop is treated as unexpected.</p>
       <div class="form-actions">
         <button type="button" class="btn" onclick="document.getElementById('ct-modal').remove()">Cancel</button>
         <button type="submit" class="btn btn-primary">Create</button>

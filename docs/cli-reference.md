@@ -129,6 +129,7 @@ lv stats <vm>                                # VM resource statistics
 lv ct pull <oci-image> --dest <rootfs>       # Pull an OCI image (skopeo + umoci)
 lv ct pull <oci-image> --dest <rootfs> --username <u> --password-stdin   # ad-hoc auth pull
 lv ct create <name> [--image <oci>] [--distro alpine --release 3.19] [--local]
+lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-delay 5s]  # auto-restart on unexpected stop
 lv ct start <name>
 lv ct stop <name>
 lv ct rm <name>
@@ -294,6 +295,16 @@ lv mapping rm <name>
 ```bash
 lv run … --onboot --startup-order 10 --start-delay 5 --stop-delay 0
 # onboot VMs start in startup-order on host boot (not on a plain daemon restart).
+```
+
+## Restart policy
+
+```bash
+lv run … --restart on-failure --restart-max-attempts 5 --restart-delay 5s --restart-window 1h
+# Auto-restart a VM that stops UNEXPECTEDLY (crash, fence/external destroy).
+# A clean guest shutdown or an `lv stop` always sticks — under `on-failure` AND
+# `always` (the guest-stick rule). Default is `none` (opt-in). See docs/compose.md
+# "Restart policy" for the full reason→action matrix and the container caveat.
 ```
 
 ## Notifications

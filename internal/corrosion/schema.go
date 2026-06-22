@@ -110,7 +110,16 @@ import (
 //	     PLAINTEXT (matching the current user_2fa TOTP convention) and replicates
 //	     cluster-wide via Corrosion; AES-GCM sealing is future work, gated on
 //	     cluster-master-key infrastructure that does not yet exist.
-const CurrentSchemaVersion = 23
+//	v24: container restart policy — containers gains restart_policy (JSON:
+//	     condition/delay/max_attempts/window) + state_detail (the stop-cause /
+//	     intent channel, mirroring vms.state_detail: 'operator-stop' etc.) so the
+//	     new container reconciler can auto-restart a container that stopped
+//	     unexpectedly while leaving an operator-stopped one alone. New
+//	     container_restarts table (mirrors vm_restarts) tracks attempts within a
+//	     sliding window. Additive: the two columns get ALTERs in schemaMigrations
+//	     and CREATE-TABLE columns; old rows default restart_policy='' (treated as
+//	     'none') and state_detail=''. gap-1 from v23, auto-prestaged.
+const CurrentSchemaVersion = 24
 
 // InitSchema creates all required tables in the local SQLite database.
 // DDL is not broadcast — each node creates its own tables on startup.
@@ -790,16 +799,31 @@ var schemaDDL = []string{
 	// container; aggregated by `lv ct ls` cluster-wide. Lifecycle
 	// transitions are written by the daemon owning the container.
 	`CREATE TABLE IF NOT EXISTS containers (
-		host_name   TEXT NOT NULL,
-		name        TEXT NOT NULL,
-		state       TEXT NOT NULL DEFAULT 'stopped',
-		image       TEXT,
-		cpu_limit   INTEGER NOT NULL DEFAULT 0,
-		memory_mib  INTEGER NOT NULL DEFAULT 0,
-		labels      TEXT,                  -- JSON {key:value}
-		created_at  TEXT NOT NULL,
-		updated_at  TEXT NOT NULL,
-		deleted_at  TEXT,
+		host_name      TEXT NOT NULL,
+		name           TEXT NOT NULL,
+		state          TEXT NOT NULL DEFAULT 'stopped',
+		image          TEXT,
+		cpu_limit      INTEGER NOT NULL DEFAULT 0,
+		memory_mib     INTEGER NOT NULL DEFAULT 0,
+		labels         TEXT,                  -- JSON {key:value}
+		restart_policy TEXT,                  -- JSON {condition,delay,max_attempts,window}; '' = none (v24)
+		state_detail   TEXT,                  -- stop cause / intent, e.g. 'operator-stop' (v24)
+		created_at     TEXT NOT NULL,
+		updated_at     TEXT NOT NULL,
+		deleted_at     TEXT,
+		PRIMARY KEY (host_name, name)
+	)`,
+
+	// container_restarts mirrors vm_restarts: per-container attempt counter within
+	// a sliding window, used by the container reconciler to enforce
+	// max_attempts/window/delay (v24).
+	`CREATE TABLE IF NOT EXISTS container_restarts (
+		host_name     TEXT NOT NULL,
+		name          TEXT NOT NULL,
+		attempt_count INTEGER DEFAULT 0,
+		window_start  TEXT NOT NULL,
+		last_restart  TEXT,
+		updated_at    TEXT NOT NULL,
 		PRIMARY KEY (host_name, name)
 	)`,
 
@@ -1269,4 +1293,12 @@ var schemaMigrations = []string{
 	`ALTER TABLE snapshots ADD COLUMN type TEXT NOT NULL DEFAULT 'disk'`,
 	`ALTER TABLE snapshots ADD COLUMN vmstate_path TEXT`,
 	`ALTER TABLE snapshots ADD COLUMN vmstate_size_bytes INTEGER NOT NULL DEFAULT 0`,
+
+	// Container restart policy (v24). restart_policy holds the JSON RestartPolicy
+	// (condition/delay/max_attempts/window); state_detail carries the stop cause /
+	// intent ('operator-stop' etc.), the container analogue of vms.state_detail.
+	// Additive; existing rows default to NULL (treated as 'none' / no recorded
+	// intent). container_restarts is a new table in schemaDDL — no ALTER needed.
+	`ALTER TABLE containers ADD COLUMN restart_policy TEXT`,
+	`ALTER TABLE containers ADD COLUMN state_detail TEXT`,
 }

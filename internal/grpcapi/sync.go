@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -46,6 +47,43 @@ func (s *Server) GetStateDump(ctx context.Context, _ *emptypb.Empty) (*pb.StateD
 
 	data := s.db.DumpStateBytes()
 	return &pb.StateDumpResponse{Data: data}, nil
+}
+
+// stateDumpChunkSize bounds each StreamStateDump message well under the gRPC
+// 4 MiB default, so the full dump streams regardless of total state size. A var
+// (not const) so tests can shrink it to force multi-chunk behavior on small
+// fixtures.
+var stateDumpChunkSize = 1 << 20 // 1 MiB
+
+// StreamStateDump streams the same gzipped state dump as GetStateDump, but in
+// bounded chunks so a large cluster's dump can't exceed the gRPC max-message
+// size and silently fail (the unary GetStateDump did, stalling anti-entropy
+// convergence at scale). The chunks are contiguous slices of the exact blob
+// GetStateDump returns, so the client reassembles and merges them identically.
+// GetStateDump is kept for old peers; see the StreamStateDump RPC comment.
+func (s *Server) StreamStateDump(_ *emptypb.Empty, stream grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
+	if err := RequireRole(stream.Context(), "operator"); err != nil {
+		return err
+	}
+	data := s.db.DumpStateBytes()
+	if len(data) == 0 {
+		// Send a single final empty chunk so the client gets a clean,
+		// unambiguous end-of-stream rather than a bare EOF.
+		return stream.Send(&pb.StateDumpChunk{Final: true})
+	}
+	for off := 0; off < len(data); off += stateDumpChunkSize {
+		end := off + stateDumpChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		if err := stream.Send(&pb.StateDumpChunk{
+			Data:  data[off:end],
+			Final: end == len(data),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // PushMutations receives mutation entries from a peer and applies them locally

@@ -60,7 +60,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// CAS check: if caller supplies expected_hash, verify it matches
 	// the current stored hash to prevent concurrent deploy races.
 	if req.ExpectedHash != "" {
-		existing, _ := corrosion.GetStack(ctx, s.db, f.Name)
+		// A DB error must abort the CAS check (F9): treating a failed lookup as
+		// "no existing stack" would skip the concurrent-modify guard and risk
+		// clobbering a racing deploy. (GetStack returns nil,nil for not-found.)
+		existing, err := corrosion.GetStack(ctx, s.db, f.Name)
+		if err != nil {
+			return status.Errorf(codes.Internal, "load stack %q for CAS check: %v", f.Name, err)
+		}
 		if existing != nil && existing.ComposeHash != req.ExpectedHash {
 			return status.Errorf(codes.Aborted,
 				"stack %q was modified concurrently (expected hash %s, got %s) — re-fetch and retry",

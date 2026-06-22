@@ -1465,9 +1465,14 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 	}
 
 	// Verify VIP is not already claimed by another load balancer (#40).
-	existing, _ := s.db.Query(ctx,
+	// A DB error here must fail the operation (F9): swallowing it would treat a
+	// failed lookup as "no conflict" and let a duplicate VIP through.
+	existing, err := s.db.Query(ctx,
 		`SELECT name FROM lb_configs WHERE vip = ? AND name != ? AND enabled = 1`,
 		vip, lbName)
+	if err != nil {
+		return fmt.Errorf("check VIP %s uniqueness: %w", vip, err)
+	}
 	if len(existing) > 0 {
 		return fmt.Errorf("VIP %s is already in use by load balancer %q", vip, existing[0].String("name"))
 	}

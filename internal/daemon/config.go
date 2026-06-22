@@ -30,6 +30,12 @@ type Config struct {
 	WatchdogDev      string   `yaml:"watchdog_dev"`       // e.g. "/dev/watchdog"; empty = disabled
 	RESTPort         int      `yaml:"rest_port"`          // HTTP REST gateway port (default 7446; 0 = disabled)
 
+	// AntiEntropyIntervalSec is how often the anti-entropy loop compares state
+	// digests with peers and full-syncs on drift. 0 = default (60s). Lower it
+	// (e.g. 10) on backup-critical clusters where faster drift detection is
+	// worth the extra digest traffic. (P2-2)
+	AntiEntropyIntervalSec int `yaml:"anti_entropy_interval_sec"`
+
 	// PCI device management
 	PCI PCIConfig `yaml:"pci"`
 

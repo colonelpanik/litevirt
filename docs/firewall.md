@@ -187,7 +187,10 @@ missing. Recommended order:
 ## What's still in flight
 
 - IPv6 is staged behind the IPv4-first matchers. Render emits
-  `ip protocol`; an `ip6` parallel pass is mechanical.
+  `ip protocol`; an `ip6` parallel pass is mechanical. Until then, an IPv6
+  CIDR in a rule or ipset is **rejected at validation** (rather than silently
+  mis-rendered into an invalid rule that would poison the whole ruleset) — so
+  security-group rules are IPv4-only for now.
 - ICMPv6 + IGMP support.
 - Application-aware logging (`log prefix`, `log group`) for
   rejected packets — useful in deny-by-default audits.

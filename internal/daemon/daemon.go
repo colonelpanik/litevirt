@@ -237,7 +237,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
-	ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, 60*time.Second)
+	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
+	// default inside NewAntiEntropy. (P2-2)
+	ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, time.Duration(d.cfg.AntiEntropyIntervalSec)*time.Second)
 	go ae.Start(ctx)
 
 	// Start metrics server

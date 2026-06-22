@@ -77,6 +77,41 @@ rest_port: 8080
 	}
 }
 
+// P2-2: the anti-entropy interval is operator-configurable.
+func TestLoadConfig_AntiEntropyInterval(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	yaml := `host_name: "ae-host"
+anti_entropy_interval_sec: 10
+`
+	if err := os.WriteFile(configPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITEVIRT_CONFIG", configPath)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.AntiEntropyIntervalSec != 10 {
+		t.Errorf("AntiEntropyIntervalSec = %d, want 10", cfg.AntiEntropyIntervalSec)
+	}
+	// Unset stays 0 (NewAntiEntropy maps 0 → 60s default).
+	dir2 := t.TempDir()
+	p2 := filepath.Join(dir2, "config.yaml")
+	if err := os.WriteFile(p2, []byte(`host_name: "ae-default"`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITEVIRT_CONFIG", p2)
+	cfg2, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg2.AntiEntropyIntervalSec != 0 {
+		t.Errorf("default AntiEntropyIntervalSec = %d, want 0", cfg2.AntiEntropyIntervalSec)
+	}
+}
+
 func TestLoadConfig_RESTPortDefault(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

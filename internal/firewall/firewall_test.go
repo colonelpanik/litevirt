@@ -73,6 +73,43 @@ func TestRender_SecurityGroup_Expansion(t *testing.T) {
 	)
 }
 
+// TestRender_RejectsIPv6 (F10): the renderer is IPv4-only, so an IPv6 CIDR or
+// ipset element must be rejected at validation — emitting `ip saddr <v6>` would
+// poison the whole atomic ruleset at apply time. Set references ("@name") and
+// IPv4 CIDRs must NOT be falsely rejected.
+func TestRender_RejectsIPv6(t *testing.T) {
+	if _, err := Render(Plan{
+		SecurityGroups: []SecurityGroup{{
+			Name:  "web",
+			Rules: []Rule{{Direction: Ingress, Proto: "tcp", PortRange: "443", CIDR: "2001:db8::/32", Action: Accept}},
+		}},
+		NICs: []NICBinding{{NICDev: "tap0", VMName: "web-1", SecurityGroups: []string{"web"}}},
+	}); err == nil {
+		t.Error("IPv6 CIDR in an SG rule should be rejected, got nil")
+	}
+
+	if _, err := Render(Plan{
+		IPSets: []IPSet{{Name: "blocked", CIDRs: []string{"10.0.0.0/8", "2001:db8::/32"}}},
+	}); err == nil {
+		t.Error("IPv6 ipset element should be rejected, got nil")
+	}
+
+	// IPv4 CIDR + a set reference must pass cleanly.
+	if _, err := Render(Plan{
+		IPSets: []IPSet{{Name: "allow", CIDRs: []string{"10.0.0.0/8"}}},
+		SecurityGroups: []SecurityGroup{{
+			Name: "web",
+			Rules: []Rule{
+				{Direction: Ingress, Proto: "tcp", PortRange: "443", CIDR: "192.168.0.0/16", Action: Accept},
+				{Direction: Ingress, Proto: "tcp", PortRange: "80", CIDR: "@allow", Action: Accept},
+			},
+		}},
+		NICs: []NICBinding{{NICDev: "tap0", VMName: "web-1", SecurityGroups: []string{"web"}}},
+	}); err != nil {
+		t.Errorf("IPv4 CIDR + set-reference should pass, got %v", err)
+	}
+}
+
 // TestRender_EgressMatchesViaIifname_DPort ensures egress rules match
 // traffic FROM the VM (iifname=tap0) and use dport (the destination
 // port at the remote endpoint, which is what users mean).

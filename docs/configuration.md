@@ -36,6 +36,11 @@ ui_allowed_origins: []
 # REST API gateway port. Set to 0 to disable.
 rest_port: 7446
 
+# How often anti-entropy compares state digests with peers and full-syncs on
+# drift. 0 = default (60s). Lower it (e.g. 10) on backup-critical clusters where
+# faster drift detection is worth the extra digest traffic.
+anti_entropy_interval_sec: 0
+
 # Cluster membership port (used for peer discovery).
 gossip_port: 7946
 

@@ -371,6 +371,14 @@ func validate(p Plan) error {
 		default:
 			return fmt.Errorf("rule %d: action %q not supported (accept|drop|reject)", i, r.Action)
 		}
+		// F10: the renderer is IPv4-only (ip saddr/daddr + ipv4_addr sets). A
+		// literal IPv6 CIDR would emit an invalid `ip saddr <v6>` line and poison
+		// the whole atomic ruleset at apply time — so reject it here rather than
+		// silently mis-rendering. (Set references "@name" carry no ":"; their
+		// elements are checked via the IPSet loop below.)
+		if r.CIDR != "" && !strings.HasPrefix(r.CIDR, "@") && strings.Contains(r.CIDR, ":") {
+			return fmt.Errorf("rule %d: IPv6 CIDR %q is not supported by security-group rules yet (IPv4-only renderer)", i, r.CIDR)
+		}
 	}
 	for _, sg := range p.SecurityGroups {
 		if sg.Name == "" {
@@ -380,6 +388,12 @@ func validate(p Plan) error {
 	for _, ipset := range p.IPSets {
 		if ipset.Name == "" {
 			return errors.New("ipset with empty name")
+		}
+		// F10: sets render as ipv4_addr, so an IPv6 element can't be expressed.
+		for _, cidr := range ipset.CIDRs {
+			if strings.Contains(cidr, ":") {
+				return fmt.Errorf("ipset %q: IPv6 element %q not supported yet (sets render as ipv4_addr)", ipset.Name, cidr)
+			}
 		}
 	}
 	return nil

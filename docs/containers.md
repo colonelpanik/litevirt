@@ -124,15 +124,22 @@ workloads:
     network: [{ name: prod, ip: 10.0.0.5 }]
 
   web-ct:
-    kind: oci
-    image: docker.io/library/nginx:1.27
+    kind: lxc
+    image: alpine:3.21          # download template (distro:release) or a rootfs path
     cpu: 2
     memory: 512
     network: [{ name: prod, ip: 10.0.0.6 }]
 ```
 
-The legacy `vms:` map still parses — every entry there gets `kind: vm`
+`lv compose up` creates **and starts** each container on the planner-resolved
+host. The legacy `vms:` map still parses — every entry there gets `kind: vm`
 applied implicitly so existing stacks need no changes.
+
+Current limits: an OCI **registry ref** (`kind: oci`, `image:
+docker.io/library/nginx:1.27`) isn't auto-pulled by compose yet — pre-pull it
+(`lv ct pull <ref> --dest <dir>`) and set `image:` to that rootfs path. Full
+network/IPAM/security-group provisioning for container NICs is also a follow-up;
+a container sharing a stack network with a VM rides the bridge the VM provisions.
 
 ## Networking
 
@@ -227,9 +234,9 @@ A `FROZEN` (paused) container maps to running and is never restarted.
 - OCI image cache reuse — each `lv ct pull` re-fetches from the
   registry; the backup chunk store will eventually absorb image
   layers.
-- Full compose `workloads:` → Containers RPC dispatch. The parser
-  reads the `workloads:` map and `kind:` discriminator today
-  (`compose.File.Workloads`); deploy/redeploy currently rejects
-  `kind: lxc` and `kind: oci` with a pointer to `lv ct create`. The
-  follow-up wires the dispatcher to call into the `Containers`
-  service so a single compose stack can mix VMs and containers.
+- Compose `workloads:` → Containers RPC dispatch **(shipped)**: `lv compose up`
+  now routes `kind: lxc` (download template or rootfs path) workloads through
+  CreateContainer + StartContainer on the planner-resolved host, so a stack can
+  mix VMs and containers. Remaining: auto-pull of OCI **registry** refs (pre-pull
+  required today), and full network/IPAM/security-group provisioning for
+  container NICs.

@@ -150,8 +150,15 @@ workloads:
 ```
 
 `kind: lxc` and `kind: oci` route to the container runtime (see
-[`docs/containers.md`](containers.md)); `kind: oci` pulls the named OCI image
-(via skopeo + umoci) and runs it as an LXC container.
+[`docs/containers.md`](containers.md)). `lv compose up` deploys them through the
+Containers RPCs — created **and started** on the planner-resolved host, alongside
+any VMs in the stack. Image forms: `kind: lxc` takes a download template
+(`image: "alpine:3.21"`) or a rootfs path; an OCI **registry ref** must be
+pre-pulled today (`lv ct pull <ref> --dest <rootfs-dir>`, then set `image:` to
+that rootfs path). Compose auto-pull of OCI registry refs, and full
+network/IPAM/security-group provisioning for container NICs, are follow-ups —
+until then a container sharing a stack network with a VM uses the bridge the VM
+path provisions.
 
 ## Service inheritance
 

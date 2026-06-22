@@ -370,21 +370,28 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 		}
 	}
 
-	// workloads dispatcher: containers (kind: lxc | oci) can
-	// be declared in compose but the deploy path through CreateVM is
-	// VM-only. Surface a clear error pointing at `lv ct` so the
-	// operator isn't left wondering why their alpine container ends
-	// up as a libvirt domain. Wiring container deploys through
-	// `Containers` RPCs is a follow-up — until then, deploy stacks
-	// containing kind=lxc / kind=oci workloads via `lv ct create` per
-	// container rather than `lv compose up`.
+	// workloads dispatcher: containers (kind: lxc | oci) route through the
+	// Containers RPCs (CreateContainer + StartContainer) instead of CreateVM,
+	// on the planner-resolved host. (Compose can't auto-pull OCI registry refs
+	// yet — buildContainerRequest returns a clear error for that case.)
 	if vmDef, _ := compose.FindVMDef(f, action.VMName); vmDef != nil {
 		switch vmDef.Kind {
 		case compose.WorkloadKindLXC, compose.WorkloadKindOCI:
-			return fmt.Errorf(
-				"workload %q has kind=%s; compose deploy doesn't yet route containers — "+
-					"create with `lv ct create %s` (or use the Containers gRPC service)",
-				action.VMName, vmDef.Kind, action.VMName)
+			ctReq, err := s.buildContainerRequest(ctx, action.VMName, vmDef, f, action.TargetHost)
+			if err != nil {
+				return err
+			}
+			if _, err := s.CreateContainer(ctx, ctReq); err != nil {
+				return fmt.Errorf("create container %q: %w", action.VMName, err)
+			}
+			// compose `up` brings workloads to running, matching CreateVM
+			// (which defines + starts the domain).
+			if _, err := s.StartContainer(ctx, &pb.StartContainerRequest{
+				HostName: action.TargetHost, Name: action.VMName,
+			}); err != nil {
+				return fmt.Errorf("start container %q: %w", action.VMName, err)
+			}
+			return nil
 		}
 	}
 
@@ -1339,17 +1346,17 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 	// Check images exist on at least one host.
 	seenImages := map[string]bool{}
 	for name, vmDef := range f.VMs {
-		// Container workloads (kind: lxc | oci) don't deploy through the VM
-		// path yet. Reject them up front with a clear pointer to `lv ct`,
-		// rather than letting the VM image check below fire the misleading
-		// "pull it first with 'lv image pull'" (the value is an OCI image
-		// reference, not a registered VM image). Matches the deploy-time
-		// guard in applyVMAction.
+		// Container workloads (kind: lxc | oci) route through CreateContainer at
+		// deploy time, not the VM image path below. The only unsupported case is
+		// an OCI registry ref (compose can't auto-pull yet) — catch it here so a
+		// mixed stack fails preflight cleanly instead of half-deploying.
 		if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
-			errs = append(errs, fmt.Sprintf(
-				"workload %q has kind=%s; compose deploy doesn't route containers yet — "+
-					"create it with `lv ct pull` + `lv ct create %s` (see docs/containers.md)",
-				name, vmDef.Kind, name))
+			if vmDef.Kind == compose.WorkloadKindOCI && !isRootfsTemplate(vmDef.Image) {
+				errs = append(errs, fmt.Sprintf(
+					"workload %q (kind=oci): compose can't auto-pull OCI image %q yet — "+
+						"pre-pull it (`lv ct pull %s --dest <rootfs-dir>`) and set image: to that rootfs path",
+					name, vmDef.Image, vmDef.Image))
+			}
 			continue
 		}
 		img := vmDef.Image

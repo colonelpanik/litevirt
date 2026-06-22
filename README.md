@@ -4,6 +4,13 @@
 
 # litevirt
 
+<p align="center">
+  <a href="https://github.com/colonelpanik/litevirt/actions/workflows/ci.yml"><img src="https://github.com/colonelpanik/litevirt/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/colonelpanik/litevirt/releases/latest"><img src="https://img.shields.io/github/v/release/colonelpanik/litevirt?sort=semver&label=release" alt="Latest release"></a>
+  <a href="https://github.com/colonelpanik/litevirt/releases/latest"><img src="https://img.shields.io/github/release-date/colonelpanik/litevirt?label=released" alt="Release date"></a>
+  <img src="https://img.shields.io/github/go-mod/go-version/colonelpanik/litevirt" alt="Go version">
+</p>
+
 Lightweight KVM/QEMU orchestrator. Single static binary, decentralized replication.
 
 ## Features

@@ -97,11 +97,12 @@ type collector struct {
 	snapshotDepth  *prometheus.Desc // #45: snapshot chain depth
 
 	// cluster-correctness metrics.
-	leaderHolder      *prometheus.Desc // who holds the failover lease
-	fenceFailures     *prometheus.Desc // count of fencing_log rows with non-success result
-	hlcRejected       *prometheus.Desc // remote HLC timestamps rejected for skew
-	mutationLogSize   *prometheus.Desc // mutation_log row count (replication backlog)
-	replicationMinSeq *prometheus.Desc // MIN(last_seq) across replication_watermarks
+	leaderHolder       *prometheus.Desc // who holds the failover lease
+	fenceFailures      *prometheus.Desc // count of fencing_log rows with non-success result
+	hlcRejected        *prometheus.Desc // remote HLC timestamps rejected for skew
+	mutationLogSize    *prometheus.Desc // mutation_log row count (replication backlog)
+	replicationMinSeq  *prometheus.Desc // MIN(last_seq) across replication_watermarks
+	replicationPeerLag *prometheus.Desc // per-peer backlog: MAX(seq) - peer last_seq
 
 	// placement / rebalancer metrics.
 	placementDecisions *prometheus.Desc // counter labeled by policy + result
@@ -218,6 +219,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, hostName string) *
 			"MIN(last_seq) across replication_watermarks; gates mutation_log compaction",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		replicationPeerLag: prometheus.NewDesc(
+			"litevirt_replication_peer_pending_entries",
+			"Per-peer replication backlog: local mutation_log tail (MAX(seq)) minus the peer's acknowledged last_seq. One series per live peer; a single climbing series identifies the lagging peer",
+			[]string{"peer"}, prometheus.Labels{"host": hostName},
+		),
 		placementDecisions: prometheus.NewDesc(
 			"litevirt_placement_decisions_total",
 			"Cumulative placement decisions emitted by the engine",
@@ -263,6 +269,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hlcRejected
 	ch <- c.mutationLogSize
 	ch <- c.replicationMinSeq
+	ch <- c.replicationPeerLag
 	ch <- c.placementDecisions
 	ch <- c.hostPressure
 	ch <- c.rebalanceProposals
@@ -397,6 +404,28 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		`SELECT COALESCE(MIN(last_seq), 0) AS m FROM replication_watermarks`); rerr == nil && len(rows) > 0 {
 		ch <- prometheus.MustNewConstMetric(c.replicationMinSeq,
 			prometheus.GaugeValue, float64(rows[0].Int("m")))
+	}
+
+	// Per-peer replication backlog: how far each LIVE peer is behind the local
+	// mutation_log tail. Restricted to watermarks updated within
+	// LiveWatermarkWindow so a departed peer doesn't leave a stuck series
+	// behind forever; the lag is clamped at 0 (a peer can momentarily report a
+	// watermark past our local MAX after applying our own filtered entries).
+	maxSeq := 0
+	if mx, merr := c.db.Query(ctx, `SELECT COALESCE(MAX(seq),0) AS m FROM mutation_log`); merr == nil && len(mx) > 0 {
+		maxSeq = mx[0].Int("m")
+	}
+	peerCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
+	if pr, perr := c.db.Query(ctx,
+		`SELECT peer_name, last_seq FROM replication_watermarks WHERE updated_at > ?`, peerCutoff); perr == nil {
+		for _, row := range pr {
+			lag := maxSeq - row.Int("last_seq")
+			if lag < 0 {
+				lag = 0
+			}
+			ch <- prometheus.MustNewConstMetric(c.replicationPeerLag,
+				prometheus.GaugeValue, float64(lag), row.String("peer_name"))
+		}
 	}
 
 	// Per-host CPU + RAM pressure. Cheap: uses the same data the

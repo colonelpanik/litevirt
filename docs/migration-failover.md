@@ -193,6 +193,7 @@ Scrape `http://<host>:7444/metrics` for:
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across all peers; a stalled value means replication is backing up
 - `litevirt_mutation_log_rows` — total rows in `mutation_log`; coupled with the watermark above this gives backlog visibility
+- `litevirt_replication_peer_pending_entries` — per-peer backlog (`MAX(seq) − peer last_seq`), one series per live peer; a single series climbing while the others stay flat pinpoints the lagging peer. The daemon also logs a warning when a peer stays maxed-out for several rounds
 
 ### Event stream
 

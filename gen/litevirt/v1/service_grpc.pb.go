@@ -179,6 +179,7 @@ const (
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
+	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
 	LiteVirt_PushMutations_FullMethodName              = "/litevirt.v1.LiteVirt/PushMutations"
 	LiteVirt_AckMutations_FullMethodName               = "/litevirt.v1.LiteVirt/AckMutations"
 	LiteVirt_ListRebalanceProposals_FullMethodName     = "/litevirt.v1.LiteVirt/ListRebalanceProposals"
@@ -415,6 +416,11 @@ type LiteVirtClient interface {
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	GetStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDumpResponse, error)
+	// StreamStateDump is the chunked replacement for GetStateDump: it streams
+	// the gzipped dump in bounded slices so it survives at scale. GetStateDump
+	// is retained for mixed-version clusters — a new client falls back to it
+	// when a peer doesn't implement the stream.
+	StreamStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error)
 	// ── Internal: WAL Replication ──
 	PushMutations(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error)
 	AckMutations(ctx context.Context, in *AckRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2252,6 +2258,25 @@ func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, op
 	return out, nil
 }
 
+func (c *liteVirtClient) StreamStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[24], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[emptypb.Empty, StateDumpChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_StreamStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
+
 func (c *liteVirtClient) PushMutations(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReplicateResponse)
@@ -2354,7 +2379,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[24], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[25], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2463,7 +2488,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[25], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[26], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2774,6 +2799,11 @@ type LiteVirtServer interface {
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
 	GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error)
+	// StreamStateDump is the chunked replacement for GetStateDump: it streams
+	// the gzipped dump in bounded slices so it survives at scale. GetStateDump
+	// is retained for mixed-version clusters — a new client falls back to it
+	// when a peer doesn't implement the stream.
+	StreamStateDump(*emptypb.Empty, grpc.ServerStreamingServer[StateDumpChunk]) error
 	// ── Internal: WAL Replication ──
 	PushMutations(context.Context, *ReplicateRequest) (*ReplicateResponse, error)
 	AckMutations(context.Context, *AckRequest) (*emptypb.Empty, error)
@@ -3329,6 +3359,9 @@ func (UnimplementedLiteVirtServer) GetStateDigest(context.Context, *emptypb.Empt
 }
 func (UnimplementedLiteVirtServer) GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDump not implemented")
+}
+func (UnimplementedLiteVirtServer) StreamStateDump(*emptypb.Empty, grpc.ServerStreamingServer[StateDumpChunk]) error {
+	return status.Error(codes.Unimplemented, "method StreamStateDump not implemented")
 }
 func (UnimplementedLiteVirtServer) PushMutations(context.Context, *ReplicateRequest) (*ReplicateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PushMutations not implemented")
@@ -6103,6 +6136,17 @@ func _LiteVirt_GetStateDump_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_StreamStateDump_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(emptypb.Empty)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).StreamStateDump(m, &grpc.GenericServerStream[emptypb.Empty, StateDumpChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_StreamStateDumpServer = grpc.ServerStreamingServer[StateDumpChunk]
+
 func _LiteVirt_PushMutations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReplicateRequest)
 	if err := dec(in); err != nil {
@@ -7411,6 +7455,11 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "PushReplicaIncrement",
 			Handler:       _LiteVirt_PushReplicaIncrement_Handler,
 			ClientStreams: true,
+		},
+		{
+			StreamName:    "StreamStateDump",
+			Handler:       _LiteVirt_StreamStateDump_Handler,
+			ServerStreams: true,
 		},
 		{
 			StreamName:    "CrossRegionMigrate",

@@ -153,6 +153,82 @@ func TestPruneMutationLog_RetentionCeiling(t *testing.T) {
 	}
 }
 
+func insertClockSkew(t *testing.T, c *Client, observer, target, updatedAt string) {
+	t.Helper()
+	if _, err := c.db.ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES (?, ?, ?, ?)`,
+		observer, target, 1.5, updatedAt); err != nil {
+		t.Fatalf("insert clock_skew: %v", err)
+	}
+}
+
+func insertHostRow(t *testing.T, c *Client, name string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := c.db.ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO hosts (name, address, ssh_user, cert_serial, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		name, "10.0.0.1", "root", "00", now, now); err != nil {
+		t.Fatalf("insert host: %v", err)
+	}
+}
+
+func countClockSkew(t *testing.T, c *Client) int {
+	t.Helper()
+	var n int
+	if err := c.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM clock_skew`).Scan(&n); err != nil {
+		t.Fatalf("count clock_skew: %v", err)
+	}
+	return n
+}
+
+// pruneClockSkew drops stale rows (older than ClockSkewRetention) and rows whose
+// target is no longer a known host, but keeps fresh rows for live hosts.
+func TestPruneClockSkew(t *testing.T) {
+	defer func(orig time.Duration) { ClockSkewRetention = orig }(ClockSkewRetention)
+	ClockSkewRetention = 1 * time.Hour
+
+	c := newPruneTestClient(t)
+	insertHostRow(t, c, "self")
+	insertHostRow(t, c, "live-peer")
+
+	insertClockSkew(t, c, "self", "live-peer", tsAgo(30*time.Second)) // fresh + known → keep
+	insertClockSkew(t, c, "self", "old-peer", tsAgo(2*time.Hour))     // stale → drop on age
+	insertClockSkew(t, c, "self", "departed", tsAgo(10*time.Second))  // fresh but unknown → drop
+
+	NewReplicator(c, "", RelayConfig{}).pruneClockSkew(context.Background())
+
+	if got := countClockSkew(t, c); got != 1 {
+		t.Fatalf("after prune: %d rows remain, want 1 (only the fresh known-host row)", got)
+	}
+	var target string
+	if err := c.db.QueryRowContext(context.Background(),
+		`SELECT target FROM clock_skew`).Scan(&target); err != nil {
+		t.Fatal(err)
+	}
+	if target != "live-peer" {
+		t.Fatalf("survivor target = %q, want live-peer", target)
+	}
+}
+
+// With an empty hosts table the departed-host clause is suppressed (guarded by
+// EXISTS(hosts)), so a fresh row survives and only age-based deletion applies —
+// a transiently empty hosts table at startup must not wipe live observations.
+func TestPruneClockSkew_EmptyHostsKeepsFresh(t *testing.T) {
+	defer func(orig time.Duration) { ClockSkewRetention = orig }(ClockSkewRetention)
+	ClockSkewRetention = 1 * time.Hour
+
+	c := newPruneTestClient(t)
+	insertClockSkew(t, c, "self", "peer", tsAgo(30*time.Second)) // fresh, no hosts rows at all
+
+	NewReplicator(c, "", RelayConfig{}).pruneClockSkew(context.Background())
+
+	if got := countClockSkew(t, c); got != 1 {
+		t.Fatalf("after prune with empty hosts: %d rows remain, want 1 (fresh row must survive)", got)
+	}
+}
+
 // The production DSN enables incremental auto_vacuum so freed pages can be
 // returned to the OS by PRAGMA incremental_vacuum.
 func TestSqliteDSN_EnablesIncrementalAutoVacuum(t *testing.T) {

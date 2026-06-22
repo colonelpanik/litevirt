@@ -151,7 +151,15 @@ func (r *Replicator) PeerLeft(name string) {
 
 // watermarkCleanupGrace is how long PeerLeft waits before reclaiming a departed
 // peer's replication watermark. A var so tests can drive the cleanup directly.
-var watermarkCleanupGrace = 1 * time.Hour
+//
+// pruneMutationLog already excludes watermarks not advanced within
+// LiveWatermarkWindow (30m), so a departed peer stops pinning the log well
+// before this fires — this grace only governs when the stale row itself is
+// deleted (and thus when a returning peer is forced into a full anti-entropy
+// resync instead of log replay). Kept comfortably above a brief network flap
+// so a momentary blip doesn't trigger a needless re-sync, but far below the
+// old 1h so a genuinely departed peer's row is reclaimed promptly.
+var watermarkCleanupGrace = 10 * time.Minute
 
 // cleanupDepartedWatermark deletes a peer's replication watermark — but only if
 // the peer is still absent. If it rejoined (back in r.peers) the watermark is
@@ -537,6 +545,7 @@ func (r *Replicator) pruneLoop(ctx context.Context) {
 		case <-ticker.C:
 			r.pruneMutationLog(ctx)
 			r.pruneMutationSeen(ctx)
+			r.pruneClockSkew(ctx)
 		}
 	}
 }
@@ -567,6 +576,12 @@ var (
 	// under the client lock. No-op unless the DB was created with
 	// auto_vacuum=incremental (see sqliteDSN).
 	IncrementalVacuumPages = 2000
+
+	// ClockSkewRetention bounds how long a clock_skew observation is kept. The
+	// metrics collector only reports rows younger than 10 min, so anything past
+	// this is dead weight; without a prune the table grows without bound under
+	// host churn (one row per observer×target, never deleted on its own).
+	ClockSkewRetention = 1 * time.Hour
 )
 
 // pruneMutationLog trims the replication log in three steps: (1) prune up to
@@ -635,6 +650,36 @@ func (r *Replicator) pruneMutationSeen(ctx context.Context) {
 	}
 	if n, _ := result.RowsAffected(); n > 0 {
 		slog.Info("replicator: pruned mutation_seen", "deleted", n)
+	}
+}
+
+// pruneClockSkew deletes clock_skew observations that are stale (older than
+// ClockSkewRetention) or that target a host no longer in the cluster. The
+// metrics collector only reads rows younger than 10 min, so without this the
+// table accumulates one dead row per observer×target forever under host churn.
+//
+// Like the other prune helpers this is a LOCAL delete (raw ExecContext, not
+// the mutation_log path), so it isn't replicated; every node prunes its own
+// copy on the same age threshold, which converges. The departed-host clause is
+// guarded by EXISTS(hosts) so a transiently empty hosts table (e.g. early
+// startup) can't wipe every row — age-based deletion still applies then.
+func (r *Replicator) pruneClockSkew(ctx context.Context) {
+	cutoff := time.Now().Add(-ClockSkewRetention).UTC().Format(time.RFC3339)
+
+	r.client.mu.Lock()
+	defer r.client.mu.Unlock()
+
+	result, err := r.client.db.ExecContext(ctx,
+		`DELETE FROM clock_skew
+		 WHERE updated_at < ?
+		    OR (target NOT IN (SELECT name FROM hosts)
+		        AND EXISTS (SELECT 1 FROM hosts))`, cutoff)
+	if err != nil {
+		slog.Warn("replicator: prune clock_skew error", "error", err)
+		return
+	}
+	if n, _ := result.RowsAffected(); n > 0 {
+		slog.Info("replicator: pruned clock_skew", "deleted", n)
 	}
 }
 

@@ -27,6 +27,11 @@ const (
 // It blocks until ctx is cancelled, at which point it writes the magic close
 // byte ('V') to disarm the watchdog gracefully before returning.
 func Heartbeat(ctx context.Context, devPath string, interval time.Duration) {
+	// A non-empty devPath means the operator explicitly enabled watchdog
+	// fencing (and preflightWatchdog already validated the device exists). An
+	// empty path is the auto/optional case — fall back to the default device
+	// but stay quiet if it's absent.
+	configured := devPath != ""
 	if devPath == "" {
 		devPath = defaultDev
 	}
@@ -36,8 +41,16 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration) {
 
 	f, err := os.OpenFile(devPath, os.O_WRONLY, 0)
 	if err != nil {
-		// Watchdog device not present or no permission — not fatal.
-		slog.Debug("watchdog device unavailable, heartbeat disabled", "dev", devPath, "error", err)
+		if configured {
+			// Startup preflight passed, so a failure to open the configured
+			// device now (e.g. permissions, device yanked) means self-fencing
+			// is silently dead — make it loud, not a Debug line.
+			slog.Error("watchdog device configured but cannot be opened; self-fencing is DISABLED",
+				"dev", devPath, "error", err)
+		} else {
+			// No device configured — optional, stay quiet.
+			slog.Debug("watchdog device unavailable, heartbeat disabled", "dev", devPath, "error", err)
+		}
 		return
 	}
 	defer func() {

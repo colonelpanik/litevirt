@@ -97,11 +97,12 @@ type collector struct {
 	snapshotDepth  *prometheus.Desc // #45: snapshot chain depth
 
 	// cluster-correctness metrics.
-	leaderHolder      *prometheus.Desc // who holds the failover lease
-	fenceFailures     *prometheus.Desc // count of fencing_log rows with non-success result
-	hlcRejected       *prometheus.Desc // remote HLC timestamps rejected for skew
-	mutationLogSize   *prometheus.Desc // mutation_log row count (replication backlog)
-	replicationMinSeq *prometheus.Desc // MIN(last_seq) across replication_watermarks
+	leaderHolder       *prometheus.Desc // who holds the failover lease
+	fenceFailures      *prometheus.Desc // count of fencing_log rows with non-success result
+	hlcRejected        *prometheus.Desc // remote HLC timestamps rejected for skew
+	mutationLogSize    *prometheus.Desc // mutation_log row count (replication backlog)
+	replicationMinSeq  *prometheus.Desc // MIN(last_seq) across replication_watermarks
+	replicationPending *prometheus.Desc // entries ahead of the slowest LIVE peer
 
 	// placement / rebalancer metrics.
 	placementDecisions *prometheus.Desc // counter labeled by policy + result
@@ -218,6 +219,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, hostName string) *
 			"MIN(last_seq) across replication_watermarks; gates mutation_log compaction",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		replicationPending: prometheus.NewDesc(
+			"litevirt_replication_pending_entries",
+			"mutation_log entries written but not yet acked by the slowest LIVE peer (MAX(seq) - MIN(live last_seq)); 0 when there are no live peers",
+			nil, prometheus.Labels{"host": hostName},
+		),
 		placementDecisions: prometheus.NewDesc(
 			"litevirt_placement_decisions_total",
 			"Cumulative placement decisions emitted by the engine",
@@ -263,6 +269,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hlcRejected
 	ch <- c.mutationLogSize
 	ch <- c.replicationMinSeq
+	ch <- c.replicationPending
 	ch <- c.placementDecisions
 	ch <- c.hostPressure
 	ch <- c.rebalanceProposals
@@ -398,6 +405,28 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.replicationMinSeq,
 			prometheus.GaugeValue, float64(rows[0].Int("m")))
 	}
+
+	// Replication backlog ahead of the slowest LIVE peer: entries written but
+	// not yet acked by the peer that's furthest behind. Complements
+	// mutation_log_rows (total, incl. already-replicated-but-unpruned) and
+	// replication_min_watermark_seq. Reported as 0 when there are no live peers
+	// so a single node (or a fully-partitioned one) doesn't report its whole
+	// log as "pending". The live cutoff matches the replicator's prune logic.
+	liveCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
+	pending := 0.0
+	if wm, werr := c.db.Query(ctx,
+		`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq
+		 FROM replication_watermarks WHERE updated_at > ?`, liveCutoff); werr == nil && len(wm) > 0 {
+		if wm[0].Int("live") > 0 {
+			if mx, merr := c.db.Query(ctx,
+				`SELECT COALESCE(MAX(seq), 0) AS m FROM mutation_log`); merr == nil && len(mx) > 0 {
+				if lag := mx[0].Int("m") - wm[0].Int("minseq"); lag > 0 {
+					pending = float64(lag)
+				}
+			}
+		}
+	}
+	ch <- prometheus.MustNewConstMetric(c.replicationPending, prometheus.GaugeValue, pending)
 
 	// Per-host CPU + RAM pressure. Cheap: uses the same data the
 	// host_vm_count above is derived from.

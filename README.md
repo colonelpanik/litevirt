@@ -26,6 +26,10 @@ post-Broadcom Proxmox alternative for homelabs, SMBs, and service providers.
 </sub></p>
 
 <p align="center">
+  <img src="docs/img/demo.gif" alt="litevirt CLI: list the cluster, run a VM, live-migrate it across hosts" width="820">
+</p>
+
+<p align="center">
   <img src="docs/img/ui-dashboard.png" alt="litevirt web UI — cluster dashboard" width="100%">
 </p>
 

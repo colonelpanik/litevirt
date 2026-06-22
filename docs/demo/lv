@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Demo shim for the README terminal cast (docs/demo/demo.tape). It prints
+# realistic, GENERIC litevirt output — no real cluster is contacted and no
+# internal infrastructure appears. Not shipped or installed; recording-only.
+set -euo pipefail
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  host)
+    # `lv host ls`
+    cat <<'EOF'
+NAME    ADDRESS      STATE        CPU    MEMORY            VMs  VERSION
+node-1  10.0.50.11   HOST_ACTIVE  6/64   24576/262144 MiB  2    v1.0.10
+node-2  10.0.50.12   HOST_ACTIVE  4/64   16384/262144 MiB  1    v1.0.10
+node-3  10.0.50.13   HOST_ACTIVE  0/32   0/131072 MiB      0    v1.0.10
+EOF
+    ;;
+  run)
+    echo "VM web-01 created on node-2 (state: VM_RUNNING)"
+    ;;
+  migrate)
+    echo "  live-migrating web-01: node-2 → node-3"
+    sleep 0.5
+    echo "  transferring memory (2048 MiB) ▕████████████████████▏ 100%"
+    sleep 0.4
+    echo "  ✓ migrated — 1 switchover, 74ms downtime · web-01 now on node-3"
+    touch /tmp/.lvdemo-migrated
+    ;;
+  ls)
+    # show web-01's host depending on whether a migrate has happened
+    host=node-2
+    [ -f /tmp/.lvdemo-migrated ] && host=node-3
+    printf 'NAME    HOST    STATE       CPU  MEMORY    IP\n'
+    printf 'web-01  %s  VM_RUNNING  2    2048 MiB  10.0.50.51\n' "$host"
+    ;;
+  *)
+    echo "lv: $cmd" ;;
+esac

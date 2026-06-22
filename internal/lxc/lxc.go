@@ -280,9 +280,11 @@ func (r *LxcRunner) Stop(ctx context.Context, name string, timeoutSec int) error
 	return nil
 }
 
-// Delete runs lxc-destroy. Caller must have stopped the container first.
+// Delete runs lxc-destroy with -f, which stops the container first if it's
+// running. Without -f, lxc-destroy refuses a running container ("<name> is
+// running"), so `lv ct rm` and `compose down` of a running container would fail.
 func (r *LxcRunner) Delete(ctx context.Context, name string) error {
-	if _, stderr, err := r.run(ctx, "lxc-destroy", "-n", name); err != nil {
+	if _, stderr, err := r.run(ctx, "lxc-destroy", "-f", "-n", name); err != nil {
 		return cmdErr("lxc-destroy", name, stderr, err)
 	}
 	return nil

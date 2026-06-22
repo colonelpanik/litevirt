@@ -701,6 +701,12 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	if st, err := corrosion.GetStack(ctx, s.db, req.Name); err == nil && st != nil && st.ComposeYAML != "" {
 		if f, err := compose.ParseBytes([]byte(st.ComposeYAML)); err == nil {
 			for baseName, vmDef := range f.VMs {
+				// Container workloads are torn down separately via
+				// ListContainersByStack below — don't add them to the VM
+				// delete list (DeleteVM would just NotFound them).
+				if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
+					continue
+				}
 				for r := 0; r < vmDef.EffectiveReplicas(); r++ {
 					instName := vmDef.InstanceName(baseName, r)
 					if !vmNames[instName] {

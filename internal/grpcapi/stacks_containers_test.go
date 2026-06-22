@@ -79,6 +79,18 @@ func TestDeleteStack_RemovesContainers(t *testing.T) {
 	rt := &fakeCTRuntime{}
 	s.SetContainerRuntime(rt)
 
+	// Store the stack with a compose YAML that declares the container, so
+	// DeleteStack's "merge compose-YAML workloads into the VM delete list" path
+	// runs — it must SKIP the container (not DeleteVM it), or the stack would be
+	// left "deleting" (hadFailures) instead of tombstoned.
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name:  "ct-stack",
+		State: "active",
+		ComposeYAML: "name: ct-stack\nworkloads:\n  web:\n    kind: lxc\n" +
+			"    image: alpine:3.21\n    cpu: 1\n    memory: 256\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
 		HostName: "test-host", Name: "web", State: "running",
 		Image: "alpine:3.21", CPULimit: 1, MemMiB: 256,
@@ -107,6 +119,11 @@ func TestDeleteStack_RemovesContainers(t *testing.T) {
 	}
 	if len(cts) != 0 {
 		t.Errorf("container still present after down: %d", len(cts))
+	}
+	// Tombstoned cleanly — proves the container wasn't mis-handled as a failed
+	// VM delete (which would leave the stack in "deleting").
+	if st, _ := corrosion.GetStack(ctx, s.db, "ct-stack"); st != nil {
+		t.Errorf("stack not tombstoned after down (state=%q) — container likely mis-counted as a VM", st.State)
 	}
 }
 

@@ -131,15 +131,20 @@ workloads:
     network: [{ name: prod, ip: 10.0.0.6 }]
 ```
 
-`lv compose up` creates **and starts** each container on the planner-resolved
-host. The legacy `vms:` map still parses — every entry there gets `kind: vm`
-applied implicitly so existing stacks need no changes.
+Containers are full compose citizens: `lv compose up` creates **and starts** each
+container on an LXC-capable host (placement is capability-aware, so a container
+never lands on a node without the runtime); re-apply is idempotent (unchanged
+containers are left alone, a changed spec recreates); and `lv compose down`
+removes them. The legacy `vms:` map still parses — every entry there gets `kind:
+vm` applied implicitly so existing stacks need no changes.
 
 Current limits: an OCI **registry ref** (`kind: oci`, `image:
 docker.io/library/nginx:1.27`) isn't auto-pulled by compose yet — pre-pull it
-(`lv ct pull <ref> --dest <dir>`) and set `image:` to that rootfs path. Full
-network/IPAM/security-group provisioning for container NICs is also a follow-up;
-a container sharing a stack network with a VM rides the bridge the VM provisions.
+(`lv ct pull <ref> --dest <dir>`) and set `image:` to that rootfs path. A cpu/mem
+change recreates the container (no in-place reconfigure). `lv compose ps` lists
+VMs only. Full network/IPAM/security-group provisioning for container NICs is a
+follow-up; a container sharing a stack network with a VM rides the bridge the VM
+provisions.
 
 ## Networking
 

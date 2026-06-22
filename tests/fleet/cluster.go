@@ -13,10 +13,10 @@
 // mutation_log → replicator → peer.PushMutations → applyStatementLWW
 // → scheduler — actually runs end-to-end.
 //
-// What the fleet harness does NOT cover: libvirt / qemu / nftables
-// / dnsmasq. Those need a real host. Scenarios that touch VM boot
-// either inject a libvirt fake (TODO: follow-up) or operate at the
-// Corrosion / replicator layer and observe behaviour through DB
+// What the fleet harness does NOT cover: real qemu / nftables / dnsmasq —
+// those need a real host. An in-process libvirt fake (internal/libvirtfake)
+// IS injected per node, so VM-lifecycle RPCs run against it; deeper scenarios
+// operate at the Corrosion / replicator layer and observe behaviour through DB
 // state changes.
 package fleet
 
@@ -321,10 +321,9 @@ func (c *Cluster) buildServer(n *Node) {
 	if err := mkdirAll(dataDir); err != nil {
 		c.t.Fatalf("mkdir data for %s: %v", n.Name, err)
 	}
-	// NewServer demands a *libvirt.Client; for the fleet harness we
-	// construct the Server directly so virt stays nil. Scenarios
-	// that need VM lifecycle inject a fake or skip the libvirt-
-	// touching RPCs.
+	// NewServer demands a *libvirt.Client; for the fleet harness we construct
+	// the Server directly and inject an in-process libvirt fake (n.Virt) so
+	// VM-lifecycle RPCs run without a real libvirtd.
 	n.Virt = libvirtfake.New()
 	n.Server = grpcapi.NewServerForTests(grpcapi.TestServerOpts{
 		HostName: n.Name,

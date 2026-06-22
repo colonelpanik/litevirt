@@ -32,10 +32,9 @@ import (
 // copy primitives — they return Unimplemented until the corresponding
 // driver Mover lands.
 //
-// Live (running-VM) cutover requires libvirt blockdev-mirror, which is
-// not yet wired here; today we require the VM to be stopped. The error
-// message tells the operator to stop the VM and retry. Future work
-// (still 1.2.E) lifts that restriction.
+// Live (running-VM) cutover is wired: a running VM routes to liveMoveVolume
+// (libvirt block-copy → pivot, see move_live.go); a stopped VM does an offline
+// copy. Only the block-backend gap above remains.
 func (s *Server) MoveVolume(req *pb.MoveVolumeRequest, stream grpc.ServerStreamingServer[pb.MoveVolumeProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

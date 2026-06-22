@@ -14,7 +14,7 @@ import (
 //     Used by the legacy URL form and by any non-configured browse.
 //   - Without ?repo=: enumerate the daemon's configured `backup_repos:`
 //     map (set via SetBackupRepos at startup) and render each repo's
-//     manifest count + total size. follow-up.
+//     manifest count + total size.
 //
 // Pre-flight failures (open / list) are surfaced per-repo so a single
 // broken repo doesn't blank the whole page.

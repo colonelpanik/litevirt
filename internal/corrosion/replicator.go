@@ -269,10 +269,35 @@ func (r *Replicator) pickRandomLeaves(rs *RelaySet, n int) []string {
 	return leaves
 }
 
+const (
+	// replicateBatchSize caps how many mutation_log entries are pushed to a
+	// peer per round. The precise per-peer backlog depth is exported as the
+	// litevirt_replication_peer_pending_entries metric.
+	replicateBatchSize = 100
+
+	// replicateDegradedRounds is how many consecutive full batches mark a peer
+	// as "falling behind" — a steady stream of maxed-out pushes means it isn't
+	// draining its backlog. Logged once on entry and once on recovery.
+	replicateDegradedRounds = 5
+)
+
+// degradedStep advances the consecutive-full-batch counter for a peer and
+// reports whether it just entered (warn) or left (recovered) the degraded
+// state. Pure so the threshold logic is unit-testable without driving the
+// replication loop.
+func degradedStep(behindRounds, sent int) (rounds int, enteredDegraded, recovered bool) {
+	if sent >= replicateBatchSize {
+		rounds = behindRounds + 1
+		return rounds, rounds == replicateDegradedRounds, false
+	}
+	return 0, false, behindRounds >= replicateDegradedRounds
+}
+
 // replicateToPeer is the per-peer replication loop with adaptive intervals.
 func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
+	behindRounds := 0 // consecutive full batches; drives the degraded-peer log
 
 	for {
 		select {
@@ -309,6 +334,19 @@ func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 		r.mu.Unlock()
 		if isRelayPeer {
 			r.lastRelayPush.Store(time.Now().UnixMilli())
+		}
+
+		// Degraded-peer signal: a sustained run of maxed-out batches means this
+		// peer is behind and not catching up. The exact backlog is exported per
+		// peer as litevirt_replication_peer_pending_entries; here we just log the
+		// transition so it's visible without a metrics stack.
+		var enteredDegraded, recovered bool
+		behindRounds, enteredDegraded, recovered = degradedStep(behindRounds, sent)
+		if enteredDegraded {
+			slog.Warn("replicator: peer is falling behind (sustained full replication batches)",
+				"peer", peerName, "rounds", behindRounds, "batch", replicateBatchSize)
+		} else if recovered {
+			slog.Info("replicator: peer caught up on replication backlog", "peer", peerName)
 		}
 
 		// Success — reset backoff. Adaptive interval: burst if we sent
@@ -349,7 +387,7 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 	}
 
 	// Read pending mutations, excluding entries that originated from this peer.
-	entries, maxSeqSeen, err := r.readMutationLog(ctx, lastSeq, 100, peerName)
+	entries, maxSeqSeen, err := r.readMutationLog(ctx, lastSeq, replicateBatchSize, peerName)
 	if err != nil {
 		return 0, fmt.Errorf("read mutation_log: %w", err)
 	}

@@ -153,6 +153,43 @@ func TestPruneMutationLog_RetentionCeiling(t *testing.T) {
 	}
 }
 
+// degradedStep marks a peer degraded only after replicateDegradedRounds
+// consecutive full batches, and signals recovery exactly once when a
+// previously-degraded peer drains below a full batch.
+func TestDegradedStep(t *testing.T) {
+	// Ramp up: full batches accumulate; degraded fires once at the threshold.
+	rounds := 0
+	for i := 1; i < replicateDegradedRounds; i++ {
+		var entered, recovered bool
+		rounds, entered, recovered = degradedStep(rounds, replicateBatchSize)
+		if entered || recovered {
+			t.Fatalf("round %d: entered=%v recovered=%v, want both false before threshold", i, entered, recovered)
+		}
+		if rounds != i {
+			t.Fatalf("round %d: rounds=%d, want %d", i, rounds, i)
+		}
+	}
+	rounds, entered, recovered := degradedStep(rounds, replicateBatchSize)
+	if !entered || recovered {
+		t.Fatalf("at threshold: entered=%v recovered=%v, want entered only", entered, recovered)
+	}
+	// Staying degraded doesn't re-fire entered.
+	rounds, entered, _ = degradedStep(rounds, replicateBatchSize)
+	if entered {
+		t.Fatalf("past threshold: entered re-fired, want false (rounds=%d)", rounds)
+	}
+	// A short batch drains the counter and signals recovery once.
+	rounds, entered, recovered = degradedStep(rounds, replicateBatchSize-1)
+	if entered || !recovered || rounds != 0 {
+		t.Fatalf("recovery: entered=%v recovered=%v rounds=%d, want recovered only + reset", entered, recovered, rounds)
+	}
+	// A non-degraded short batch is silent.
+	_, entered, recovered = degradedStep(0, 0)
+	if entered || recovered {
+		t.Fatalf("idle: entered=%v recovered=%v, want both false", entered, recovered)
+	}
+}
+
 func insertClockSkew(t *testing.T, c *Client, observer, target, updatedAt string) {
 	t.Helper()
 	if _, err := c.db.ExecContext(context.Background(),

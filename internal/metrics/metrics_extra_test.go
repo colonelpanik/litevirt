@@ -13,6 +13,30 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// peerGaugeValues drains ch and returns the value of each gauge whose
+// descriptor mentions name, keyed by its "peer" label.
+func peerGaugeValues(t *testing.T, ch <-chan prometheus.Metric, name string) map[string]float64 {
+	t.Helper()
+	out := map[string]float64{}
+	for m := range ch {
+		if !containsStr(m.Desc().String(), name) {
+			continue
+		}
+		var dm dto.Metric
+		if err := m.Write(&dm); err != nil {
+			t.Fatalf("write metric %s: %v", name, err)
+		}
+		peer := ""
+		for _, lp := range dm.GetLabel() {
+			if lp.GetName() == "peer" {
+				peer = lp.GetValue()
+			}
+		}
+		out[peer] = dm.GetGauge().GetValue()
+	}
+	return out
+}
+
 // gaugeValue drains ch, returning the value of the first metric whose
 // descriptor mentions name (and whether one was found).
 func gaugeValue(t *testing.T, ch <-chan prometheus.Metric, name string) (float64, bool) {
@@ -38,6 +62,62 @@ func insertLogRows(t *testing.T, db *corrosion.Client, n int) {
 			`INSERT INTO mutation_log (hlc, origin, stmts, created_at) VALUES ('0','n','x', datetime('now'))`); err != nil {
 			t.Fatalf("insert mutation_log: %v", err)
 		}
+	}
+}
+
+// Per-peer replication backlog: one series per LIVE peer, value MAX(seq) -
+// last_seq; a stale watermark (outside LiveWatermarkWindow) is excluded.
+func TestCollect_ReplicationPeerLag(t *testing.T) {
+	db := initTestDB(t)
+	ctx := context.Background()
+
+	insertLogRows(t, db, 10)
+	now := time.Now().UTC().Format(time.RFC3339)
+	rows, _ := db.Query(ctx, `SELECT COALESCE(MAX(seq),0) AS m FROM mutation_log`)
+	maxSeq := rows[0].Int("m")
+	mustExec := func(peer string, seq int, updated string) {
+		if err := db.Execute(ctx,
+			`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)`,
+			peer, seq, updated); err != nil {
+			t.Fatalf("insert watermark %s: %v", peer, err)
+		}
+	}
+	mustExec("fast", maxSeq, now)   // nearly caught up
+	mustExec("slow", maxSeq-8, now) // well behind
+	mustExec("stale", 0, time.Now().Add(-2*corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339))
+
+	// Compute the truth the collector will see (no writes happen after this).
+	mxRows, _ := db.Query(ctx, `SELECT COALESCE(MAX(seq),0) AS m FROM mutation_log`)
+	curMax := mxRows[0].Int("m")
+	wmRows, _ := db.Query(ctx, `SELECT peer_name, last_seq FROM replication_watermarks`)
+	want := map[string]float64{}
+	for _, r := range wmRows {
+		if r.String("peer_name") == "stale" {
+			continue // excluded by the live cutoff
+		}
+		lag := curMax - r.Int("last_seq")
+		if lag < 0 {
+			lag = 0
+		}
+		want[r.String("peer_name")] = float64(lag)
+	}
+
+	c := newCollector(db, nil, "host-a")
+	ch := make(chan prometheus.Metric, 100)
+	c.Collect(ch)
+	close(ch)
+
+	got := peerGaugeValues(t, ch, "litevirt_replication_peer_pending_entries")
+	if len(got) != 2 {
+		t.Fatalf("got %d peer series, want 2 (stale peer must be excluded): %v", len(got), got)
+	}
+	for peer, w := range want {
+		if got[peer] != w {
+			t.Errorf("peer %q lag = %v, want %v", peer, got[peer], w)
+		}
+	}
+	if got["slow"] <= got["fast"] {
+		t.Errorf("slow peer (%v) should lag more than fast (%v)", got["slow"], got["fast"])
 	}
 }
 

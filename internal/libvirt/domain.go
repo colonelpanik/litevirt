@@ -77,37 +77,119 @@ func (c *Client) UndefineDomain(name string, removeStorage bool) error {
 	return nil
 }
 
-// DomainState returns the current state of a domain.
+// DomainState returns the current coarse lifecycle state of a domain
+// (running | stopping | stopped | error | unknown). Paused, shut-off and
+// pm-suspended all collapse to "stopped" here — callers that need to tell those
+// apart (e.g. the restart engine) use DomainStateReason instead.
 func (c *Client) DomainState(name string) (string, error) {
 	dom, err := c.virt.DomainLookupByName(name)
 	if err != nil {
 		return "unknown", fmt.Errorf("lookup domain %s: %w", name, err)
 	}
-
 	state, _, err := c.virt.DomainGetState(dom, 0)
 	if err != nil {
 		return "unknown", fmt.Errorf("get domain state %s: %w", name, err)
 	}
+	return coarseDomainState(golibvirt.DomainState(state)), nil
+}
 
-	switch golibvirt.DomainState(state) {
-	case golibvirt.DomainNostate:
-		return "unknown", nil
-	case golibvirt.DomainRunning:
-		return "running", nil
-	case golibvirt.DomainBlocked:
-		return "running", nil
-	case golibvirt.DomainPaused:
-		return "stopped", nil
+// DomainStatus is the coarse lifecycle State plus the normalized Reason — why
+// the domain is in that state. The Reason is what lets the restart engine tell a
+// clean guest shutdown from a crash, a fence-destroy, a suspend-to-disk (saved),
+// or a migration; DomainState's coarse string collapses all of those to
+// "stopped".
+type DomainStatus struct {
+	// State uses the same vocabulary as DomainState.
+	State string
+	// Reason: guest-shutdown | crashed | failed | destroyed | saved | migrated |
+	// from-snapshot | daemon | paused | pmsuspended | running | shutting-down | unknown
+	Reason string
+}
+
+// DomainStateReason returns the domain's coarse State together with the
+// normalized Reason from libvirt's virDomainGetState — the reason int that
+// DomainState discards.
+func (c *Client) DomainStateReason(name string) (DomainStatus, error) {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return DomainStatus{State: "unknown", Reason: "unknown"}, fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	state, reason, err := c.virt.DomainGetState(dom, 0)
+	if err != nil {
+		return DomainStatus{State: "unknown", Reason: "unknown"}, fmt.Errorf("get domain state %s: %w", name, err)
+	}
+	s := golibvirt.DomainState(state)
+	return DomainStatus{State: coarseDomainState(s), Reason: normalizeDomainReason(s, reason)}, nil
+}
+
+// HasManagedSaveImage reports whether a (shut-off) domain has a managed-save /
+// suspend-to-disk image. The restart engine must never cold-boot such a domain —
+// a fresh start would discard its saved RAM.
+func (c *Client) HasManagedSaveImage(name string) (bool, error) {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return false, fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	r, err := c.virt.DomainHasManagedSaveImage(dom, 0)
+	if err != nil {
+		return false, fmt.Errorf("has managed save %s: %w", name, err)
+	}
+	return r != 0, nil
+}
+
+// coarseDomainState maps a libvirt DomainState to litevirt's coarse vocabulary.
+// Kept identical to the original DomainState switch (13 callers depend on it).
+func coarseDomainState(s golibvirt.DomainState) string {
+	switch s {
+	case golibvirt.DomainRunning, golibvirt.DomainBlocked:
+		return "running"
 	case golibvirt.DomainShutdown:
-		return "stopping", nil
-	case golibvirt.DomainShutoff:
-		return "stopped", nil
+		return "stopping"
+	case golibvirt.DomainPaused, golibvirt.DomainShutoff, golibvirt.DomainPmsuspended:
+		return "stopped"
 	case golibvirt.DomainCrashed:
-		return "error", nil
-	case golibvirt.DomainPmsuspended:
-		return "stopped", nil
+		return "error"
 	default:
-		return "unknown", nil
+		return "unknown"
+	}
+}
+
+// normalizeDomainReason maps libvirt's per-state reason int to a stable string.
+func normalizeDomainReason(s golibvirt.DomainState, reason int32) string {
+	switch s {
+	case golibvirt.DomainRunning, golibvirt.DomainBlocked:
+		return "running"
+	case golibvirt.DomainPaused:
+		return "paused"
+	case golibvirt.DomainPmsuspended:
+		return "pmsuspended"
+	case golibvirt.DomainShutdown:
+		return "shutting-down"
+	case golibvirt.DomainCrashed:
+		return "crashed"
+	case golibvirt.DomainShutoff:
+		switch golibvirt.DomainShutoffReason(reason) {
+		case golibvirt.DomainShutoffShutdown:
+			return "guest-shutdown"
+		case golibvirt.DomainShutoffDestroyed:
+			return "destroyed"
+		case golibvirt.DomainShutoffCrashed:
+			return "crashed"
+		case golibvirt.DomainShutoffMigrated:
+			return "migrated"
+		case golibvirt.DomainShutoffSaved:
+			return "saved"
+		case golibvirt.DomainShutoffFailed:
+			return "failed"
+		case golibvirt.DomainShutoffFromSnapshot:
+			return "from-snapshot"
+		case golibvirt.DomainShutoffDaemon:
+			return "daemon"
+		default:
+			return "unknown"
+		}
+	default:
+		return "unknown"
 	}
 }
 

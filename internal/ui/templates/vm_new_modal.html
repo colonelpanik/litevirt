@@ -83,6 +83,25 @@
           <label>Stop delay (s) <span style="color:var(--muted)">ordered shutdown</span></label>
           <input type="number" name="stop_delay" value="0" min="0">
         </div>
+        <div class="form-row">
+          <label>Auto-restart policy</label>
+          <select name="restart_condition">
+            <option value="none">None (never auto-restart)</option>
+            <option value="on-failure">On failure (restart on crash/fence; clean shutdown sticks)</option>
+            <option value="always">Always (restart on any unexpected stop)</option>
+          </select>
+          <span style="color:var(--muted);font-size:0.85em">A clean guest shutdown or a manual stop is never auto-restarted.</span>
+        </div>
+        <div class="grid-2" style="gap:12px">
+          <div class="form-row">
+            <label>Max attempts <span style="color:var(--muted)">0 = unlimited</span></label>
+            <input type="number" name="restart_max_attempts" value="0" min="0">
+          </div>
+          <div class="form-row">
+            <label>Restart delay <span style="color:var(--muted)">e.g. 5s</span></label>
+            <input type="text" name="restart_delay" placeholder="5s">
+          </div>
+        </div>
       </details>
 
       <!-- Optimization Profile -->

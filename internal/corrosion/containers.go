@@ -10,15 +10,20 @@ import (
 // populated by the daemon owning the container; the
 // `lv ct ls` query reads across the whole cluster.
 type ContainerRecord struct {
-	HostName  string
-	Name      string
-	State     string
-	Image     string
-	CPULimit  int
-	MemMiB    int
-	Labels    map[string]string
-	CreatedAt string
-	UpdatedAt string
+	HostName string
+	Name     string
+	State    string
+	Image    string
+	CPULimit int
+	MemMiB   int
+	Labels   map[string]string
+	// RestartPolicy is the JSON-encoded pb.RestartPolicy ('' = none). StateDetail
+	// carries the stop cause / intent ('operator-stop' etc.), the container
+	// analogue of vms.state_detail; both added in schema v24.
+	RestartPolicy string
+	StateDetail   string
+	CreatedAt     string
+	UpdatedAt     string
 }
 
 // UpsertContainer creates or updates the cluster row for a container.
@@ -40,18 +45,20 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
 	return c.Execute(ctx,
-		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
 		   image = excluded.image,
 		   cpu_limit = excluded.cpu_limit,
 		   memory_mib = excluded.memory_mib,
 		   labels = excluded.labels,
+		   restart_policy = excluded.restart_policy,
+		   state_detail = excluded.state_detail,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
-		labelsJSON, r.CreatedAt, now,
+		labelsJSON, r.RestartPolicy, r.StateDetail, r.CreatedAt, now,
 	)
 }
 
@@ -63,6 +70,19 @@ func SetContainerState(ctx context.Context, c *Client, hostName, name, state str
 		`UPDATE containers SET state = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		state, now, hostName, name)
+}
+
+// SetContainerStateDetail updates state + state_detail together (leaving
+// restart_policy untouched). Used by StopContainer to record operator intent
+// ('operator-stop') and by the container reconciler to sync the cluster row to
+// the runtime's reality with a stop-cause hint. The detail is the channel the
+// restart engine reads to decide whether a stop was intentional.
+func SetContainerStateDetail(ctx context.Context, c *Client, hostName, name, state, detail string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return c.Execute(ctx,
+		`UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		state, detail, now, hostName, name)
 }
 
 // DeleteContainer soft-deletes the row. We don't physically delete so
@@ -82,6 +102,8 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 	rows, err := c.Query(ctx,
 		`SELECT host_name, name, state, COALESCE(image, '') AS image,
 		        cpu_limit, memory_mib, COALESCE(labels, '') AS labels,
+		        COALESCE(restart_policy, '') AS restart_policy,
+		        COALESCE(state_detail, '') AS state_detail,
 		        created_at, updated_at
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		hostName, name)
@@ -96,7 +118,8 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 		HostName: r.String("host_name"), Name: r.String("name"),
 		State: r.String("state"), Image: r.String("image"),
 		CPULimit: r.Int("cpu_limit"), MemMiB: r.Int("memory_mib"),
-		Labels:    decodeContainerLabels(r.String("labels")),
+		Labels:        decodeContainerLabels(r.String("labels")),
+		RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
 		CreatedAt: r.String("created_at"), UpdatedAt: r.String("updated_at"),
 	}, nil
 }
@@ -106,6 +129,8 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 func ListContainers(ctx context.Context, c *Client, hostName string) ([]ContainerRecord, error) {
 	sql := `SELECT host_name, name, state, COALESCE(image, '') AS image,
 		   cpu_limit, memory_mib, COALESCE(labels, '') AS labels,
+		   COALESCE(restart_policy, '') AS restart_policy,
+		   COALESCE(state_detail, '') AS state_detail,
 		   created_at, updated_at
 		FROM containers WHERE deleted_at IS NULL`
 	var params []interface{}
@@ -124,7 +149,8 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 			HostName: r.String("host_name"), Name: r.String("name"),
 			State: r.String("state"), Image: r.String("image"),
 			CPULimit: r.Int("cpu_limit"), MemMiB: r.Int("memory_mib"),
-			Labels:    decodeContainerLabels(r.String("labels")),
+			Labels:        decodeContainerLabels(r.String("labels")),
+			RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
 			CreatedAt: r.String("created_at"), UpdatedAt: r.String("updated_at"),
 		}
 	}

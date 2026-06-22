@@ -370,7 +370,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// We always wire it — when lxc-* binaries aren't installed, the
 	// individual RPCs surface the error from the binary lookup, which
 	// is more useful than a blanket "container runtime not wired".
-	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxc.NewLxcRunner()))
+	lxcRunner := lxc.NewLxcRunner()
+	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
+
+	// Container reconciler + restart engine: every cycle, sync each locally-owned
+	// container's cluster row to the LXC runtime's reality and auto-restart one
+	// that stopped unexpectedly per its restart policy. Shares the runtime wired
+	// above; operator-stopped containers are left alone (state_detail).
+	ctChecker := health.NewContainerChecker(d.cfg.HostName, d.db, lxcRunner)
+	ctChecker.SetEventBus(svc.EventBus())
+	go ctChecker.Start(ctx)
 
 	// wire the libvirt blockdev-mirror driver so MoveVolume
 	// supports running VMs without stopping them.

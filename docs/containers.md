@@ -178,6 +178,30 @@ lxc.cgroup2.memory.max = 512M
 lxc.cgroup.memory.limit_in_bytes = 512M
 ```
 
+## Restart policy
+
+`lv ct create --restart {none|on-failure|always}` (and compose `restart:`) makes a
+container auto-restart when it stops **unexpectedly**:
+
+```
+lv ct create web --distro alpine --release 3.21 \
+    --restart on-failure --restart-max-attempts 5 --restart-delay 5s
+```
+
+A per-host reconciler reconciles each container's cluster-state row against the LXC
+runtime every ~15s and restarts a down container per its policy, honouring
+`max-attempts`/`window`/`delay`. The cluster row is also synced to the runtime's
+reality, so `lv ct ls` and the detail view never disagree.
+
+**Caveat (coarser than VMs):** LXC reports only `RUNNING`/`STOPPED`/`FROZEN` — no
+stop *reason*. A container therefore cannot distinguish a clean in-guest shutdown
+from a crash. Only an operator `lv ct stop` is guaranteed-stick (it records
+`operator-stop`); any other stop is treated as unexpected and restarted per policy.
+A `FROZEN` (paused) container maps to running and is never restarted.
+
+> Host-loss relocation for containers is a follow-up — the reconciler currently
+> restarts a container only on the host that owns it, not on a surviving peer.
+
 ## gRPC + WebUI
 
 - **gRPC `Containers` service** — `Create / Start / Stop / Delete /
@@ -187,9 +211,9 @@ lxc.cgroup.memory.limit_in_bytes = 512M
   debug. The `containers` cluster-state table backs cluster-wide
   `lv ct ls`.
 - **WebUI `/containers`** — full lifecycle: a create modal (download-template
-  distro/release/arch, CPU/memory, bridge), per-row Start/Stop/Delete + Exec
-  (one-shot command modal), a host filter, and a bulk toolbar
-  (start/stop/delete) with select-all.
+  distro/release/arch, CPU/memory, bridge, auto-restart policy), per-row
+  Start/Stop/Delete + Exec (one-shot command modal), a host filter, and a bulk
+  toolbar (start/stop/delete) with select-all.
 
 ## What's still in flight
 

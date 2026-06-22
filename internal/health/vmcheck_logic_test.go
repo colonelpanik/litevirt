@@ -510,7 +510,9 @@ func TestMaybeRestartVM_OnFailure_ErrorVM(t *testing.T) {
 	}
 
 	v := NewVMChecker("node1", db, nil)
-	vm := corrosion.VMRecord{Name: "vm-onfail-err", HostName: "node1", State: "error"}
+	// state_detail=crashed is the failure evidence the reconciler persists; with
+	// libvirt unreachable (nil virt) the decision falls back to it.
+	vm := corrosion.VMRecord{Name: "vm-onfail-err", HostName: "node1", State: "error", StateDetail: crashedDetail}
 	v.maybeRestartVM(ctx, vm, time.Now())
 
 	// With nil virt, the restart path calls IncrementRestart then returns early.
@@ -544,7 +546,7 @@ func TestMaybeRestartVM_MaxAttempts(t *testing.T) {
 	}
 
 	v := NewVMChecker("node1", db, nil)
-	vm := corrosion.VMRecord{Name: "vm-maxatt", HostName: "node1", State: "error"}
+	vm := corrosion.VMRecord{Name: "vm-maxatt", HostName: "node1", State: "error", StateDetail: crashedDetail}
 
 	// Restart twice (hitting max_attempts=2).
 	v.maybeRestartVM(ctx, vm, time.Now())
@@ -579,7 +581,7 @@ func TestMaybeRestartVM_WindowReset(t *testing.T) {
 	}
 
 	v := NewVMChecker("node1", db, nil)
-	vm := corrosion.VMRecord{Name: "vm-winreset", HostName: "node1", State: "error"}
+	vm := corrosion.VMRecord{Name: "vm-winreset", HostName: "node1", State: "error", StateDetail: crashedDetail}
 
 	// First restart.
 	v.maybeRestartVM(ctx, vm, time.Now())
@@ -615,7 +617,7 @@ func TestMaybeRestartVM_DelayEnforced(t *testing.T) {
 	}
 
 	v := NewVMChecker("node1", db, nil)
-	vm := corrosion.VMRecord{Name: "vm-delay", HostName: "node1", State: "error"}
+	vm := corrosion.VMRecord{Name: "vm-delay", HostName: "node1", State: "error", StateDetail: crashedDetail}
 
 	// First restart happens.
 	v.maybeRestartVM(ctx, vm, time.Now())
@@ -731,7 +733,7 @@ func TestSweep_SecondPass_RestartsErrorVM(t *testing.T) {
 
 	err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
 		Name: "vm-sweep-err", HostName: "node1", Spec: string(specJSON),
-		State: "error", StateDetail: "crash",
+		State: "error", StateDetail: crashedDetail,
 	}, nil, nil)
 	if err != nil {
 		t.Fatalf("InsertVM: %v", err)

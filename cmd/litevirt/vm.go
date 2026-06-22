@@ -26,6 +26,10 @@ func newRunCmd() *cobra.Command {
 		startupOrder int32
 		startDelay   int32
 		stopDelay    int32
+		restart      string
+		restartMax   int32
+		restartDelay string
+		restartWin   string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -53,6 +57,14 @@ func newRunCmd() *cobra.Command {
 				if host != "" {
 					spec.Placement = &pb.PlacementSpec{Host: host}
 				}
+				if restart != "" && restart != "none" {
+					spec.Restart = &pb.RestartPolicy{
+						Condition:   restart,
+						MaxAttempts: restartMax,
+						Delay:       restartDelay,
+						Window:      restartWin,
+					}
+				}
 
 				vm, err := c.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
 				if err != nil {
@@ -76,6 +88,10 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().Int32Var(&startupOrder, "startup-order", 0, "Autostart order (lower starts first)")
 	cmd.Flags().Int32Var(&startDelay, "start-delay", 0, "Seconds to wait after starting this VM before the next")
 	cmd.Flags().Int32Var(&stopDelay, "stop-delay", 0, "Seconds to wait after stopping this VM during ordered shutdown")
+	cmd.Flags().StringVar(&restart, "restart", "", "Auto-restart policy: none | on-failure | always (default none). A clean guest shutdown or `lv stop` is never auto-restarted; only unexpected stops (crash/fence) are.")
+	cmd.Flags().Int32Var(&restartMax, "restart-max-attempts", 0, "Max restart attempts within the window (0 = unlimited)")
+	cmd.Flags().StringVar(&restartDelay, "restart-delay", "", "Delay between restart attempts (e.g. 5s; default 5s)")
+	cmd.Flags().StringVar(&restartWin, "restart-window", "", "Attempt-count window (e.g. 1h; default 1h)")
 	cmd.MarkFlagRequired("name")
 	return cmd
 }

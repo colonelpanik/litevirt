@@ -72,6 +72,14 @@ func (s *Server) handleCreateContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Networks = []*pb.ContainerNetwork{nic}
 	}
+	if cond := strings.TrimSpace(r.FormValue("restart_condition")); cond != "" && cond != "none" {
+		maxAtt, _ := strconv.Atoi(r.FormValue("restart_max_attempts"))
+		req.Restart = &pb.RestartPolicy{
+			Condition:   cond,
+			MaxAttempts: int32(maxAtt),
+			Delay:       strings.TrimSpace(r.FormValue("restart_delay")),
+		}
+	}
 	slog.Info("UI: creating container", "name", req.Name, "host", req.HostName, "distro", req.Distro, "release", req.Release)
 	if _, err := s.grpc.CreateContainer(s.uiBearerCtx(r), req); err != nil {
 		slog.Error("UI: create container failed", "name", req.Name, "error", err)

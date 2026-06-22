@@ -156,6 +156,17 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	if host := r.FormValue("host"); host != "" {
 		spec.Placement = &pb.PlacementSpec{Host: host}
 	}
+	// Auto-restart policy (none | on-failure | always). Only set when chosen, so
+	// the default stays "no policy" (never auto-restart).
+	if rc := r.FormValue("restart_condition"); rc != "" && rc != "none" {
+		max, _ := strconv.Atoi(r.FormValue("restart_max_attempts"))
+		spec.Restart = &pb.RestartPolicy{
+			Condition:   rc,
+			MaxAttempts: int32(max),
+			Delay:       r.FormValue("restart_delay"),
+			Window:      r.FormValue("restart_window"),
+		}
+	}
 
 	// Cloud-init: friendly fields (user/password/SSH keys/packages) assembled
 	// into a #cloud-config doc, or a raw override. Nil if nothing was supplied.

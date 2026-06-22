@@ -111,12 +111,12 @@
   <div>
     <!-- Recent Events -->
     <div class="section" style="margin-bottom:16px">
-      <div class="section-header"><h2>Recent Events</h2></div>
+      <div class="section-header" style="display:flex;align-items:center"><h2>Recent Events</h2><a href="/events" style="font-size:12px;margin-left:auto">View all</a></div>
       {{range .Events}}
       <div style="padding:6px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px;align-items:center">
-        <span class="badge" style="font-size:10px">{{.Action}}</span>
-        <span>{{.Target}}</span>
-        <span style="color:var(--muted);font-size:12px;margin-left:auto">{{.Detail}}</span>
+        <span class="badge {{if eq .Result "error"}}badge-error{{end}}" style="font-size:10px">{{.Type}}</span>
+        {{if .VmName}}<a href="/vms/{{.VmName}}">{{.VmName}}</a>{{else}}<span class="muted">—</span>{{end}}
+        <span style="color:var(--muted);font-size:12px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px" title="{{.Detail}}">{{relTime .Ts}}</span>
       </div>
       {{else}}
       <p style="padding:12px;color:var(--muted);font-size:13px">No recent events</p>

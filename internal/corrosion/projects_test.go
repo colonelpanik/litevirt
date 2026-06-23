@@ -50,6 +50,33 @@ func TestProject_RejectsOrphanedChild(t *testing.T) {
 	}
 }
 
+// TestDeleteProject_RefusesWhenContainersExist guards the gap found in the
+// v1.0.18 regression: DeleteProject refused non-empty projects for VMs but not
+// containers, so a project owning only containers could be deleted, orphaning
+// their project association (quota/RBAC). It must refuse for containers too.
+func TestDeleteProject_RefusesWhenContainersExist(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatalf("InsertProject: %v", err)
+	}
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName: "h1", Name: "ct-1", State: "running", Project: "/acme",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	if err := DeleteProject(ctx, c, "/acme"); err == nil {
+		t.Fatal("DeleteProject should refuse a project that still owns containers")
+	}
+	// Once the container is gone, deletion succeeds.
+	if err := DeleteContainer(ctx, c, "h1", "ct-1"); err != nil {
+		t.Fatalf("DeleteContainer: %v", err)
+	}
+	if err := DeleteProject(ctx, c, "/acme"); err != nil {
+		t.Errorf("DeleteProject should succeed once empty: %v", err)
+	}
+}
+
 func TestProjectQuota_AdmissionPassesUnderLimit(t *testing.T) {
 	ctx := context.Background()
 	c := newProjectTestClient(t)

@@ -217,6 +217,7 @@ func newCTCreateCmd() *cobra.Command {
 	var networks []string
 	var restart, restartDelay, restartWin string
 	var restartMax int32
+	var onHostFailure string
 	cmd := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a new container (does not start it)",
@@ -244,7 +245,7 @@ func newCTCreateCmd() *cobra.Command {
 					Name:     args[0], Template: template,
 					Distro: distro, Release: release, Arch: arch,
 					Cpu: int32(cpu), MemoryMib: int32(memMiB), Networks: nics,
-					Project: project,
+					Project: project, OnHostFailure: onHostFailure,
 				}
 				if restart != "" && restart != "none" {
 					req.Restart = &pb.RestartPolicy{
@@ -271,6 +272,7 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().IntVar(&memMiB, "memory", 0, "Memory cap MiB (0 = unlimited)")
 	cmd.Flags().StringArrayVar(&networks, "network", nil, "Attach a NIC: bridge=<br>[,name=eth0][,ip=10.0.0.5/24][,mac=AA:BB:..] (repeatable; default: lxcbr0)")
 	cmd.Flags().StringVar(&host, "host", "", "Target host (default: the daemon you're connected to)")
+	cmd.Flags().StringVar(&onHostFailure, "on-host-failure", "", "Host-loss relocation policy: none (default) | image-recreate (rebuild on a surviving host if this one is fenced)")
 	cmd.Flags().StringVar(&project, "project", "", "Tenancy project (default: _default)")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local lxc-* runtime instead of gRPC")
 	cmd.Flags().StringVar(&restart, "restart", "", "Auto-restart policy: none | on-failure | always (default none). An operator `lv ct stop` is never auto-restarted; any other stop is treated as unexpected (containers have no stop reason).")

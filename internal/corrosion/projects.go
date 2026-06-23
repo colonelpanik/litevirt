@@ -130,6 +130,17 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	if len(vmRows) > 0 {
 		return fmt.Errorf("project %q still owns VMs; reassign or delete them first", name)
 	}
+	// Refuse if containers still carry the project — deleting the project would
+	// orphan their project association (quota accounting + RBAC paths). Mirrors
+	// the VM guard above; added when containers gained a project column (v25).
+	ctRows, err := c.Query(ctx,
+		`SELECT 1 FROM containers WHERE project = ? AND deleted_at IS NULL LIMIT 1`, name)
+	if err != nil {
+		return err
+	}
+	if len(ctRows) > 0 {
+		return fmt.Errorf("project %q still owns containers; reassign or delete them first", name)
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,

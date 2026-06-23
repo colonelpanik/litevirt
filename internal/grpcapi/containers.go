@@ -94,8 +94,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		State: info.State, Image: chooseImage(req.Image, info.Image),
 		CPULimit: int(req.Cpu), MemMiB: int(req.MemoryMib),
 		Labels: req.Labels, RestartPolicy: encodeRestartPolicy(req.Restart),
-		Project:   req.Project, // UpsertContainer normalizes "" → "_default"
-		CreatedAt: now,
+		Project:       req.Project, // UpsertContainer normalizes "" → "_default"
+		OnHostFailure: req.OnHostFailure,
+		CreatedAt:     now,
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
 		// Container exists in LXC but not in cluster state — log; the

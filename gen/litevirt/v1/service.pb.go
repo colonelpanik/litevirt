@@ -7745,8 +7745,9 @@ type CreateContainerRequest struct {
 	Networks      []*ContainerNetwork    `protobuf:"bytes,9,rep,name=networks,proto3" json:"networks,omitempty"`
 	Labels        map[string]string      `protobuf:"bytes,10,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	Image         string                 `protobuf:"bytes,11,opt,name=image,proto3" json:"image,omitempty"`
-	Restart       *RestartPolicy         `protobuf:"bytes,12,opt,name=restart,proto3" json:"restart,omitempty"` // auto-restart policy (nil/condition="none" = never)
-	Project       string                 `protobuf:"bytes,13,opt,name=project,proto3" json:"project,omitempty"` // tenancy bucket (default "_default")
+	Restart       *RestartPolicy         `protobuf:"bytes,12,opt,name=restart,proto3" json:"restart,omitempty"`                                    // auto-restart policy (nil/condition="none" = never)
+	Project       string                 `protobuf:"bytes,13,opt,name=project,proto3" json:"project,omitempty"`                                    // tenancy bucket (default "_default")
+	OnHostFailure string                 `protobuf:"bytes,14,opt,name=on_host_failure,json=onHostFailure,proto3" json:"on_host_failure,omitempty"` // host-loss relocation policy: ''/'none' | 'image-recreate'
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7868,6 +7869,13 @@ func (x *CreateContainerRequest) GetRestart() *RestartPolicy {
 func (x *CreateContainerRequest) GetProject() string {
 	if x != nil {
 		return x.Project
+	}
+	return ""
+}
+
+func (x *CreateContainerRequest) GetOnHostFailure() string {
+	if x != nil {
+		return x.OnHostFailure
 	}
 	return ""
 }
@@ -19578,7 +19586,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06bridge\x18\x02 \x01(\tR\x06bridge\x12\x0e\n" +
 	"\x02ip\x18\x03 \x01(\tR\x02ip\x12\x10\n" +
-	"\x03mac\x18\x04 \x01(\tR\x03mac\"\x81\x04\n" +
+	"\x03mac\x18\x04 \x01(\tR\x03mac\"\xa9\x04\n" +
 	"\x16CreateContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1a\n" +
@@ -19594,7 +19602,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" \x03(\v2/.litevirt.v1.CreateContainerRequest.LabelsEntryR\x06labels\x12\x14\n" +
 	"\x05image\x18\v \x01(\tR\x05image\x124\n" +
 	"\arestart\x18\f \x01(\v2\x1a.litevirt.v1.RestartPolicyR\arestart\x12\x18\n" +
-	"\aproject\x18\r \x01(\tR\aproject\x1a9\n" +
+	"\aproject\x18\r \x01(\tR\aproject\x12&\n" +
+	"\x0fon_host_failure\x18\x0e \x01(\tR\ronHostFailure\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"H\n" +

@@ -139,7 +139,7 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		HostName: s.hostName, Name: req.Target, State: "stopped",
 		Image: src.Image, CPULimit: src.CPULimit, MemMiB: src.MemMiB,
 		Labels: src.Labels, RestartPolicy: src.RestartPolicy,
-		Project: project, CreatedAt: now,
+		Project: project, OnHostFailure: src.OnHostFailure, CreatedAt: now,
 		// A clone is a normal container, never a template.
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {

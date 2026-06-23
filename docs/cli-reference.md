@@ -138,6 +138,7 @@ lv ct pull <oci-image> --dest <rootfs>       # Pull an OCI image (skopeo + umoci
 lv ct pull <oci-image> --dest <rootfs> --username <u> --password-stdin   # ad-hoc auth pull
 lv ct create <name> [--image <oci>] [--distro alpine --release 3.19] [--local]
 lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-delay 5s]  # auto-restart on unexpected stop
+lv ct create <name> --on-host-failure image-recreate   # rebuild on a surviving host if this one is fenced
 lv ct start <name>
 lv ct stop <name>
 lv ct rm <name>

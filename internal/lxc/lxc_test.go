@@ -1,13 +1,88 @@
 package lxc
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// TestExportImportContainer_RoundTrip tars a container dir out of one lxcpath
+// and back into a *different* one, proving the archive is self-contained and the
+// imported config's rootfs path is rewritten to the new host's layout.
+func TestExportImportContainer_RoundTrip(t *testing.T) {
+	srcPath := t.TempDir()
+	src := &LxcRunner{Lxcpath: srcPath}
+
+	// Lay down a container dir: config (with the source rootfs path) + a rootfs
+	// holding a sentinel file.
+	ctDir := filepath.Join(srcPath, "web")
+	if err := os.MkdirAll(filepath.Join(ctDir, "rootfs", "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(ctDir, "rootfs", "etc", "hostname")
+	if err := os.WriteFile(sentinel, []byte("web-ct\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "lxc.uts.name = web\nlxc.rootfs.path = dir:" + filepath.Join(ctDir, "rootfs") + "\nlxc.net.0.type = veth\n"
+	if err := os.WriteFile(filepath.Join(ctDir, "config"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := src.ExportContainer(context.Background(), "web", &buf); err != nil {
+		t.Fatalf("ExportContainer: %v", err)
+	}
+	if buf.Len() == 0 {
+		t.Fatal("export produced no bytes")
+	}
+
+	// Import into a fresh lxcpath (simulating restore on another host).
+	dstPath := t.TempDir()
+	dst := &LxcRunner{Lxcpath: dstPath}
+	if err := dst.ImportContainer(context.Background(), "web", &buf); err != nil {
+		t.Fatalf("ImportContainer: %v", err)
+	}
+
+	// Rootfs sentinel survived.
+	got, err := os.ReadFile(filepath.Join(dstPath, "web", "rootfs", "etc", "hostname"))
+	if err != nil || string(got) != "web-ct\n" {
+		t.Errorf("restored sentinel = %q err=%v", got, err)
+	}
+	// Config's rootfs path was rewritten to the new lxcpath, net config preserved.
+	rewritten, err := os.ReadFile(filepath.Join(dstPath, "web", "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := "lxc.rootfs.path = dir:" + filepath.Join(dstPath, "web", "rootfs")
+	if !strings.Contains(string(rewritten), wantPath) {
+		t.Errorf("config not rewritten to new path:\n%s\nwant line: %s", rewritten, wantPath)
+	}
+	if !strings.Contains(string(rewritten), "lxc.net.0.type = veth") {
+		t.Errorf("network config lost on import:\n%s", rewritten)
+	}
+	// RootFSPath now resolves to the rewritten location.
+	if p, _ := dst.RootFSPath("web"); p != filepath.Join(dstPath, "web", "rootfs") {
+		t.Errorf("RootFSPath after import = %q", p)
+	}
+}
+
+// TestImportContainer_RefusesClobber guards against overwriting a live container.
+func TestImportContainer_RefusesClobber(t *testing.T) {
+	dstPath := t.TempDir()
+	dst := &LxcRunner{Lxcpath: dstPath}
+	if err := os.MkdirAll(filepath.Join(dstPath, "web"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := dst.ImportContainer(context.Background(), "web", strings.NewReader("ignored"))
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected already-exists refusal, got %v", err)
+	}
+}
 
 // RootFSPath parses lxc.rootfs.path from the container config (stripping "dir:"),
 // falls back to the standard <lxcpath>/<name>/rootfs layout, and errors on a
@@ -107,7 +182,20 @@ func (f *fakeRuntime) State(_ context.Context, name string) (State, error) {
 	return StateUnknown, nil
 }
 
-func (f *fakeRuntime) List(_ context.Context) ([]string, error) { return f.listOut, nil }
+func (f *fakeRuntime) List(_ context.Context) ([]string, error)   { return f.listOut, nil }
+func (f *fakeRuntime) Freeze(_ context.Context, _ string) error   { return nil }
+func (f *fakeRuntime) Unfreeze(_ context.Context, _ string) error { return nil }
+func (f *fakeRuntime) RootFSPath(name string) (string, error) {
+	return "/var/lib/lxc/" + name + "/rootfs", nil
+}
+func (f *fakeRuntime) ExportContainer(_ context.Context, _ string, w io.Writer) error {
+	_, err := w.Write([]byte("fake-tar"))
+	return err
+}
+func (f *fakeRuntime) ImportContainer(_ context.Context, _ string, r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
+}
 
 // TestCreateOpts_Validate covers every documented invariant.
 func TestCreateOpts_Validate(t *testing.T) {
@@ -161,12 +249,12 @@ func TestParseLxcInfoState(t *testing.T) {
 
 func TestParseLxcInfoIP(t *testing.T) {
 	cases := map[string]string{
-		"10.0.0.20\n":            "10.0.0.20",    // single IPv4
-		"127.0.0.1\n10.0.0.20\n": "10.0.0.20",    // skip loopback, take the real one
-		"fe80::1\n10.0.0.21\n":   "10.0.0.21",    // skip IPv6, take IPv4
-		"  10.0.0.22 \n":         "10.0.0.22",    // trims whitespace
-		"":                       "",             // none assigned yet
-		"not-an-ip\n":            "",             // garbage
+		"10.0.0.20\n":            "10.0.0.20", // single IPv4
+		"127.0.0.1\n10.0.0.20\n": "10.0.0.20", // skip loopback, take the real one
+		"fe80::1\n10.0.0.21\n":   "10.0.0.21", // skip IPv6, take IPv4
+		"  10.0.0.22 \n":         "10.0.0.22", // trims whitespace
+		"":                       "",          // none assigned yet
+		"not-an-ip\n":            "",          // garbage
 	}
 	for in, want := range cases {
 		if got := parseLxcInfoIP(in); got != want {

@@ -91,8 +91,13 @@ type Manifest struct {
 	VMSpecJSON string `json:"vm_spec_json,omitempty"`
 	// DomainXML embeds the live domain XML at backup time (best-effort,
 	// for fidelity/debugging). Restore prefers VMSpecJSON.
-	DomainXML     string `json:"domain_xml,omitempty"`
-	SchemaVersion int    `json:"schema_version"`
+	DomainXML string `json:"domain_xml,omitempty"`
+	// ContainerSpecJSON embeds a serialized container spec (cpu/mem/labels/
+	// restart/project/image) for a container backup, so a restore can recreate
+	// the cluster row without the source cluster. The archived rootfs+config
+	// carries everything else. Empty on VM-disk manifests.
+	ContainerSpecJSON string `json:"container_spec_json,omitempty"`
+	SchemaVersion     int    `json:"schema_version"`
 }
 
 // Repo is an open backup repository. Multiple goroutines may use one

@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 
@@ -16,7 +17,7 @@ import (
 // fakeCTRuntime captures every call so handler tests can assert
 // behaviour without standing up real LXC.
 type fakeCTRuntime struct {
-	mu sync.Mutex
+	mu          sync.Mutex
 	createCalls []CreateContainerOpts
 	startCalls  []string
 	stopCalls   []struct {
@@ -42,6 +43,15 @@ type fakeCTRuntime struct {
 	rootfs        string
 	freezeCalls   []string
 	unfreezeCalls []string
+
+	// B1 backup/restore: exportPayload is what ExportContainer writes (the fake
+	// "rootfs tar"); imported captures bytes handed to ImportContainer keyed by
+	// name; exportErr/importErr inject failures.
+	exportPayload []byte
+	exported      []string
+	imported      map[string][]byte
+	exportErr     error
+	importErr     error
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -86,7 +96,9 @@ func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []str
 	}{name, argv})
 	return ContainerExecResult{Stdout: []byte("ok"), ExitCode: 0}, nil
 }
-func (f *fakeCTRuntime) StateContainer(_ context.Context, _ string) (string, error) { return "running", nil }
+func (f *fakeCTRuntime) StateContainer(_ context.Context, _ string) (string, error) {
+	return "running", nil
+}
 func (f *fakeCTRuntime) IPContainer(_ context.Context, name string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -111,6 +123,34 @@ func (f *fakeCTRuntime) ContainerRootFSPath(name string) (string, error) {
 		return f.rootfs, nil
 	}
 	return "/var/lib/lxc/" + name + "/rootfs", nil
+}
+func (f *fakeCTRuntime) ExportContainer(_ context.Context, name string, w io.Writer) error {
+	f.mu.Lock()
+	f.exported = append(f.exported, name)
+	payload := f.exportPayload
+	err := f.exportErr
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if payload == nil {
+		payload = []byte("fake-rootfs-tar:" + name)
+	}
+	_, werr := w.Write(payload)
+	return werr
+}
+func (f *fakeCTRuntime) ImportContainer(_ context.Context, name string, r io.Reader) error {
+	data, _ := io.ReadAll(r)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.importErr != nil {
+		return f.importErr
+	}
+	if f.imported == nil {
+		f.imported = map[string][]byte{}
+	}
+	f.imported[name] = data
+	return nil
 }
 func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return nil, nil }
 func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -33,6 +34,8 @@ func newCTCmd() *cobra.Command {
 		newCTLsCmd(),
 		newCTExecCmd(),
 		newCTPullCmd(),
+		newCTBackupCmd(),
+		newCTRestoreCmd(),
 	)
 	return cmd
 }
@@ -346,6 +349,115 @@ func newCTPullCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&username, "username", "u", "", "registry username for an ad-hoc authenticated pull")
 	cmd.Flags().StringVar(&password, "password", "", "registry password/token (prefer --password-stdin)")
 	cmd.Flags().BoolVar(&passwordStdin, "password-stdin", false, "read the registry password from stdin")
+	return cmd
+}
+
+// newCTBackupCmd pushes a container's rootfs+config into a backup repo as a
+// full, content-addressed manifest (dedup against earlier backups is automatic).
+func newCTBackupCmd() *cobra.Command {
+	var host, repo, ts string
+	cmd := &cobra.Command{
+		Use:   "backup <name>",
+		Short: "Back up a container's rootfs into a repo (full, dedup chunks)",
+		Long: `Freeze the container, archive its rootfs + LXC config, and push it
+into a host-local backup repo as a content-addressed manifest. The
+manifest is self-contained: restore needs only the repo, not the
+source cluster or image. Re-running dedups against earlier backups.
+
+Containers are host-local — run this against the owning host (the
+daemon names it if you don't).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if repo == "" {
+				return fmt.Errorf("--repo is required")
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				stream, err := c.BackupContainer(ctx, &pb.BackupContainerRequest{
+					Name: args[0], HostName: host, RepoPath: repo, Timestamp: ts,
+				})
+				if err != nil {
+					return err
+				}
+				for {
+					p, err := stream.Recv()
+					if err == io.EOF {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					if p.Phase == pb.BackupContainerProgress_DONE {
+						fmt.Printf("[done] manifest=%s chunks=%d bytes=%s\n",
+							p.ManifestTs, p.ChunksTotal, formatBytes(p.BytesProcessed))
+						return nil
+					}
+					if p.Status != "" {
+						fmt.Printf("[%s] %s\n", p.Phase, p.Status)
+					} else {
+						fmt.Printf("[%s] chunks=%d (deduped=%d) bytes=%s\n",
+							p.Phase, p.ChunksTotal, p.ChunksDeduped, formatBytes(p.BytesProcessed))
+					}
+				}
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
+	cmd.Flags().StringVar(&repo, "repo", "", "Backup repo path (host-local)")
+	cmd.Flags().StringVar(&ts, "timestamp", "", "Override snapshot timestamp (RFC3339)")
+	return cmd
+}
+
+// newCTRestoreCmd rebuilds a container from a backup manifest on the target host.
+func newCTRestoreCmd() *cobra.Command {
+	var host, repo, ts string
+	var start bool
+	cmd := &cobra.Command{
+		Use:   "restore <name>",
+		Short: "Restore a container from a backup repo onto a host",
+		Long: `Rebuild a container from a backup manifest: materialise the archived
+rootfs, lay down the container + config, and recreate its cluster row.
+Self-contained — works even after the original container and its image
+are gone. Runs on the target host; pass --start to bring it up.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			for name, val := range map[string]string{"--repo": repo, "--timestamp": ts} {
+				if val == "" {
+					return fmt.Errorf("%s is required", name)
+				}
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				stream, err := c.RestoreContainer(ctx, &pb.RestoreContainerRequest{
+					Name: args[0], HostName: host, RepoPath: repo, Timestamp: ts, Start: start,
+				})
+				if err != nil {
+					return err
+				}
+				for {
+					p, err := stream.Recv()
+					if err == io.EOF {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					if p.Phase == pb.RestoreContainerProgress_DONE {
+						fmt.Printf("[done] %d chunks, %s restored → %s\n",
+							p.ChunksDone, formatBytes(p.BytesWritten), args[0])
+						return nil
+					}
+					if p.Status != "" {
+						fmt.Printf("[%s] %s\n", p.Phase, p.Status)
+					} else {
+						fmt.Printf("[restore] %d/%d chunks (%s)\n", p.ChunksDone, p.ChunksTotal, formatBytes(p.BytesWritten))
+					}
+				}
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Target host (default: this daemon)")
+	cmd.Flags().StringVar(&repo, "repo", "", "Backup repo path")
+	cmd.Flags().StringVar(&ts, "timestamp", "", "Manifest timestamp (exact RFC3339)")
+	cmd.Flags().BoolVar(&start, "start", false, "Start the container after restore")
 	return cmd
 }
 

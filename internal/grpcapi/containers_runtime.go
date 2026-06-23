@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"io"
 
 	"github.com/litevirt/litevirt/internal/lxc"
 )
@@ -74,6 +75,14 @@ func (a *LXCRuntimeAdapter) UnfreezeContainer(ctx context.Context, name string) 
 
 func (a *LXCRuntimeAdapter) ContainerRootFSPath(name string) (string, error) {
 	return a.Inner.RootFSPath(name)
+}
+
+func (a *LXCRuntimeAdapter) ExportContainer(ctx context.Context, name string, w io.Writer) error {
+	return a.Inner.ExportContainer(ctx, name, w)
+}
+
+func (a *LXCRuntimeAdapter) ImportContainer(ctx context.Context, name string, r io.Reader) error {
+	return a.Inner.ImportContainer(ctx, name, r)
 }
 
 func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error) {

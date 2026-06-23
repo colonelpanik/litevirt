@@ -143,10 +143,17 @@ lv ct stop <name>
 lv ct rm <name>
 lv ct ls
 lv ct exec <name> -- <cmd> [args...]
+lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
+lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
 ```
 
 `--local` runs against the local lxc-* binaries instead of the gRPC service
 (used during bootstrap and debugging).
+
+`lv ct backup` freezes a running container, archives its rootfs + LXC config,
+and pushes a self-contained manifest into a PBS-equivalent repo (dedup against
+earlier backups is automatic). `lv ct restore` rebuilds it from the repo alone
+— even after `lv ct rm` — refusing to clobber a live container of the same name.
 
 ## Registry credentials
 

@@ -129,6 +129,8 @@ const (
 	LiteVirt_ExecContainer_FullMethodName              = "/litevirt.v1.LiteVirt/ExecContainer"
 	LiteVirt_ListContainers_FullMethodName             = "/litevirt.v1.LiteVirt/ListContainers"
 	LiteVirt_PullOCIImage_FullMethodName               = "/litevirt.v1.LiteVirt/PullOCIImage"
+	LiteVirt_BackupContainer_FullMethodName            = "/litevirt.v1.LiteVirt/BackupContainer"
+	LiteVirt_RestoreContainer_FullMethodName           = "/litevirt.v1.LiteVirt/RestoreContainer"
 	LiteVirt_GetVMStats_FullMethodName                 = "/litevirt.v1.LiteVirt/GetVMStats"
 	LiteVirt_GetHostStats_FullMethodName               = "/litevirt.v1.LiteVirt/GetHostStats"
 	LiteVirt_GetClusterStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterStatus"
@@ -357,6 +359,8 @@ type LiteVirtClient interface {
 	ExecContainer(ctx context.Context, in *ExecContainerRequest, opts ...grpc.CallOption) (*ExecContainerResponse, error)
 	ListContainers(ctx context.Context, in *ListContainersRequest, opts ...grpc.CallOption) (*ListContainersResponse, error)
 	PullOCIImage(ctx context.Context, in *PullOCIImageRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	BackupContainer(ctx context.Context, in *BackupContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupContainerProgress], error)
+	RestoreContainer(ctx context.Context, in *RestoreContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreContainerProgress], error)
 	// ── Stats ──
 	GetVMStats(ctx context.Context, in *GetVMStatsRequest, opts ...grpc.CallOption) (*VMStats, error)
 	GetHostStats(ctx context.Context, in *GetHostStatsRequest, opts ...grpc.CallOption) (*HostResourceStats, error)
@@ -1748,6 +1752,44 @@ func (c *liteVirtClient) PullOCIImage(ctx context.Context, in *PullOCIImageReque
 	return out, nil
 }
 
+func (c *liteVirtClient) BackupContainer(ctx context.Context, in *BackupContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupContainerProgress], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[21], LiteVirt_BackupContainer_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[BackupContainerRequest, BackupContainerProgress]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_BackupContainerClient = grpc.ServerStreamingClient[BackupContainerProgress]
+
+func (c *liteVirtClient) RestoreContainer(ctx context.Context, in *RestoreContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreContainerProgress], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[22], LiteVirt_RestoreContainer_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[RestoreContainerRequest, RestoreContainerProgress]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_RestoreContainerClient = grpc.ServerStreamingClient[RestoreContainerProgress]
+
 func (c *liteVirtClient) GetVMStats(ctx context.Context, in *GetVMStatsRequest, opts ...grpc.CallOption) (*VMStats, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VMStats)
@@ -1780,7 +1822,7 @@ func (c *liteVirtClient) GetClusterStatus(ctx context.Context, in *emptypb.Empty
 
 func (c *liteVirtClient) StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ClusterEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[21], LiteVirt_StreamEvents_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[23], LiteVirt_StreamEvents_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1869,7 +1911,7 @@ func (c *liteVirtClient) ListStoragePoolContents(ctx context.Context, in *ListSt
 
 func (c *liteVirtClient) UploadStoragePoolContent(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadStoragePoolContentRequest, UploadStoragePoolContentResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[22], LiteVirt_UploadStoragePoolContent_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[24], LiteVirt_UploadStoragePoolContent_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2152,7 +2194,7 @@ func (c *liteVirtClient) DeleteStoragePoolContent(ctx context.Context, in *Delet
 
 func (c *liteVirtClient) PushReplicaIncrement(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[23], LiteVirt_PushReplicaIncrement_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[25], LiteVirt_PushReplicaIncrement_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2275,7 +2317,7 @@ func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, op
 
 func (c *liteVirtClient) StreamStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[24], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[26], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2394,7 +2436,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[25], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[27], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2503,7 +2545,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[26], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[28], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2754,6 +2796,8 @@ type LiteVirtServer interface {
 	ExecContainer(context.Context, *ExecContainerRequest) (*ExecContainerResponse, error)
 	ListContainers(context.Context, *ListContainersRequest) (*ListContainersResponse, error)
 	PullOCIImage(context.Context, *PullOCIImageRequest) (*emptypb.Empty, error)
+	BackupContainer(*BackupContainerRequest, grpc.ServerStreamingServer[BackupContainerProgress]) error
+	RestoreContainer(*RestoreContainerRequest, grpc.ServerStreamingServer[RestoreContainerProgress]) error
 	// ── Stats ──
 	GetVMStats(context.Context, *GetVMStatsRequest) (*VMStats, error)
 	GetHostStats(context.Context, *GetHostStatsRequest) (*HostResourceStats, error)
@@ -3228,6 +3272,12 @@ func (UnimplementedLiteVirtServer) ListContainers(context.Context, *ListContaine
 }
 func (UnimplementedLiteVirtServer) PullOCIImage(context.Context, *PullOCIImageRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method PullOCIImage not implemented")
+}
+func (UnimplementedLiteVirtServer) BackupContainer(*BackupContainerRequest, grpc.ServerStreamingServer[BackupContainerProgress]) error {
+	return status.Error(codes.Unimplemented, "method BackupContainer not implemented")
+}
+func (UnimplementedLiteVirtServer) RestoreContainer(*RestoreContainerRequest, grpc.ServerStreamingServer[RestoreContainerProgress]) error {
+	return status.Error(codes.Unimplemented, "method RestoreContainer not implemented")
 }
 func (UnimplementedLiteVirtServer) GetVMStats(context.Context, *GetVMStatsRequest) (*VMStats, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVMStats not implemented")
@@ -5286,6 +5336,28 @@ func _LiteVirt_PullOCIImage_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _LiteVirt_BackupContainer_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(BackupContainerRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).BackupContainer(m, &grpc.GenericServerStream[BackupContainerRequest, BackupContainerProgress]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_BackupContainerServer = grpc.ServerStreamingServer[BackupContainerProgress]
+
+func _LiteVirt_RestoreContainer_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(RestoreContainerRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).RestoreContainer(m, &grpc.GenericServerStream[RestoreContainerRequest, RestoreContainerProgress]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_RestoreContainerServer = grpc.ServerStreamingServer[RestoreContainerProgress]
 
 func _LiteVirt_GetVMStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetVMStatsRequest)
@@ -7483,6 +7555,16 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "RestoreFromBackup",
 			Handler:       _LiteVirt_RestoreFromBackup_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "BackupContainer",
+			Handler:       _LiteVirt_BackupContainer_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "RestoreContainer",
+			Handler:       _LiteVirt_RestoreContainer_Handler,
 			ServerStreams: true,
 		},
 		{

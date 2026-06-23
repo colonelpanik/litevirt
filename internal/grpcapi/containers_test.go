@@ -219,6 +219,27 @@ func TestCreateContainer_LocalHost_PersistsRow(t *testing.T) {
 	}
 }
 
+// TestCreateContainer_PersistsOnHostFailure guards the v1.0.18 gap: the B5
+// on_host_failure relocation policy must be settable at create time and persist
+// to the cluster row (else no container can ever be relocated on host loss).
+func TestCreateContainer_PersistsOnHostFailure(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	if _, err := s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{
+		Name: "ct1", Template: "download", Distro: "alpine", OnHostFailure: "image-recreate",
+	}); err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	row, err := corrosion.GetContainer(context.Background(), s.db, "host-a", "ct1")
+	if err != nil || row == nil {
+		t.Fatalf("GetContainer: %v / nil=%v", err, row == nil)
+	}
+	if row.OnHostFailure != "image-recreate" {
+		t.Errorf("on_host_failure = %q, want image-recreate", row.OnHostFailure)
+	}
+}
+
 // TestCreateContainer_NoRuntime_Unavailable handles the "lxc-* not on
 // this host" case with a clear error.
 func TestCreateContainer_NoRuntime_Unavailable(t *testing.T) {

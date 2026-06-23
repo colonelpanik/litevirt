@@ -50,6 +50,9 @@ func (f *fakeCtRuntime) State(ctx context.Context, name string) (lxc.State, erro
 	return lxc.StateUnknown, nil
 }
 func (f *fakeCtRuntime) IP(ctx context.Context, name string) (string, error) { return "", nil }
+func (f *fakeCtRuntime) Freeze(ctx context.Context, name string) error       { return nil }
+func (f *fakeCtRuntime) Unfreeze(ctx context.Context, name string) error     { return nil }
+func (f *fakeCtRuntime) RootFSPath(name string) (string, error)              { return "/var/lib/lxc/" + name + "/rootfs", nil }
 func (f *fakeCtRuntime) List(ctx context.Context) ([]string, error) {
 	out := make([]string, 0, len(f.states))
 	for n := range f.states {

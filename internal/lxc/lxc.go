@@ -93,6 +93,16 @@ type Runtime interface {
 	IP(ctx context.Context, name string) (string, error)
 	// List enumerates every container known to LXC on this host.
 	List(ctx context.Context) ([]string, error)
+	// Freeze suspends every process in a running container (lxc-freeze) so its
+	// rootfs can be read consistently (backup/snapshot quiesce). Pair with
+	// Unfreeze; a no-op-ish error on an already-frozen/stopped container is fine.
+	Freeze(ctx context.Context, name string) error
+	// Unfreeze resumes a frozen container (lxc-unfreeze). Always call it (defer)
+	// after Freeze so a failed backup never leaves the container suspended.
+	Unfreeze(ctx context.Context, name string) error
+	// RootFSPath returns the host filesystem path of the container's root
+	// (lxc.rootfs.path), the directory tree backup/snapshot/clone operate on.
+	RootFSPath(name string) (string, error)
 }
 
 // CreateOpts collects parameters for Runtime.Create.
@@ -360,6 +370,45 @@ func (r *LxcRunner) List(ctx context.Context) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// Freeze suspends a running container's processes (lxc-freeze).
+func (r *LxcRunner) Freeze(ctx context.Context, name string) error {
+	if _, stderr, err := r.run(ctx, "lxc-freeze", "-n", name); err != nil {
+		return fmt.Errorf("lxc-freeze %s: %w: %s", name, err, stderr)
+	}
+	return nil
+}
+
+// Unfreeze resumes a frozen container (lxc-unfreeze).
+func (r *LxcRunner) Unfreeze(ctx context.Context, name string) error {
+	if _, stderr, err := r.run(ctx, "lxc-unfreeze", "-n", name); err != nil {
+		return fmt.Errorf("lxc-unfreeze %s: %w: %s", name, err, stderr)
+	}
+	return nil
+}
+
+// RootFSPath returns the host path of the container's root from its config's
+// lxc.rootfs.path (stripping the "dir:" prefix the download template writes),
+// falling back to the standard <lxcpath>/<name>/rootfs layout.
+func (r *LxcRunner) RootFSPath(name string) (string, error) {
+	cfg := filepath.Join(r.lxcpath(), name, "config")
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		return "", fmt.Errorf("read container config %s: %w", cfg, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		t := strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(t, "lxc.rootfs.path"); ok {
+			if _, v, found := strings.Cut(rest, "="); found {
+				p := strings.TrimPrefix(strings.TrimSpace(v), "dir:")
+				if p != "" {
+					return p, nil
+				}
+			}
+		}
+	}
+	return filepath.Join(r.lxcpath(), name, "rootfs"), nil
 }
 
 // parseLxcInfoState normalises lxc-info -s -H output ("RUNNING\n",

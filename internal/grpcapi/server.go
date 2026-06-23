@@ -163,6 +163,12 @@ type ContainerRuntime interface {
 	StateContainer(ctx context.Context, name string) (string, error)
 	IPContainer(ctx context.Context, name string) (string, error)
 	ListContainers(ctx context.Context) ([]string, error)
+	// FreezeContainer/UnfreezeContainer quiesce a container for a consistent
+	// rootfs read (backup/snapshot); ContainerRootFSPath returns the host path of
+	// its root tree. Added in B0 (container day-2 primitives).
+	FreezeContainer(ctx context.Context, name string) error
+	UnfreezeContainer(ctx context.Context, name string) error
+	ContainerRootFSPath(name string) (string, error)
 	PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error
 }
 

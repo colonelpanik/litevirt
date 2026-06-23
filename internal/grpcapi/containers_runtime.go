@@ -64,6 +64,18 @@ func (a *LXCRuntimeAdapter) IPContainer(ctx context.Context, name string) (strin
 	return a.Inner.IP(ctx, name)
 }
 
+func (a *LXCRuntimeAdapter) FreezeContainer(ctx context.Context, name string) error {
+	return a.Inner.Freeze(ctx, name)
+}
+
+func (a *LXCRuntimeAdapter) UnfreezeContainer(ctx context.Context, name string) error {
+	return a.Inner.Unfreeze(ctx, name)
+}
+
+func (a *LXCRuntimeAdapter) ContainerRootFSPath(name string) (string, error) {
+	return a.Inner.RootFSPath(name)
+}
+
 func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error) {
 	return a.Inner.List(ctx)
 }

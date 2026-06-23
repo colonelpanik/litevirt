@@ -3,9 +3,42 @@ package lxc
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// RootFSPath parses lxc.rootfs.path from the container config (stripping "dir:"),
+// falls back to the standard <lxcpath>/<name>/rootfs layout, and errors on a
+// missing config.
+func TestRootFSPath(t *testing.T) {
+	dir := t.TempDir()
+	r := &LxcRunner{Lxcpath: dir}
+
+	mkcfg := func(name, body string) {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name, "config"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mkcfg("web", "lxc.uts.name = web\nlxc.rootfs.path = dir:/custom/web/rootfs\n")
+	if p, err := r.RootFSPath("web"); err != nil || p != "/custom/web/rootfs" {
+		t.Errorf("explicit rootfs.path = %q, err=%v; want /custom/web/rootfs", p, err)
+	}
+
+	mkcfg("bare", "lxc.uts.name = bare\n") // no rootfs.path → standard layout
+	if p, _ := r.RootFSPath("bare"); p != filepath.Join(dir, "bare", "rootfs") {
+		t.Errorf("fallback rootfs = %q, want %s", p, filepath.Join(dir, "bare", "rootfs"))
+	}
+
+	if _, err := r.RootFSPath("nope"); err == nil {
+		t.Error("missing config should error")
+	}
+}
 
 // fakeRuntime records calls and returns scripted responses. Used for
 // gRPC-handler tests that need a Runtime but mustn't shell out.

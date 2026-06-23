@@ -36,6 +36,12 @@ type fakeCTRuntime struct {
 	// ipByName lets a test simulate a locally-discovered (e.g. DHCP) container
 	// IP — what IPContainer (lxc-info -iH) would return on the LB host.
 	ipByName map[string]string
+
+	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
+	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
+	rootfs        string
+	freezeCalls   []string
+	unfreezeCalls []string
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -85,6 +91,26 @@ func (f *fakeCTRuntime) IPContainer(_ context.Context, name string) (string, err
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.ipByName[name], nil
+}
+func (f *fakeCTRuntime) FreezeContainer(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.freezeCalls = append(f.freezeCalls, name)
+	return nil
+}
+func (f *fakeCTRuntime) UnfreezeContainer(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unfreezeCalls = append(f.unfreezeCalls, name)
+	return nil
+}
+func (f *fakeCTRuntime) ContainerRootFSPath(name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rootfs != "" {
+		return f.rootfs, nil
+	}
+	return "/var/lib/lxc/" + name + "/rootfs", nil
 }
 func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return nil, nil }
 func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {

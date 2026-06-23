@@ -17,6 +17,55 @@ func testManager(t *testing.T) *Manager {
 	}
 }
 
+// configChanged drives the skip-if-unchanged optimization: identical bytes →
+// no reload; any difference or a missing file → reload.
+func TestConfigChanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.cfg")
+	if !configChanged(path, "anything") {
+		t.Error("missing file should count as changed")
+	}
+	if err := os.WriteFile(path, []byte("A\nB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if configChanged(path, "A\nB\n") {
+		t.Error("identical content should be unchanged")
+	}
+	if !configChanged(path, "A\nB\nC\n") {
+		t.Error("different content should be changed")
+	}
+}
+
+// Apply must (re)write the config files every time even when it skips the
+// reload, so the on-disk config stays canonical for Remove / stats discovery.
+func TestApply_WritesConfigEvenWhenUnchanged(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	cfg := Config{
+		Name: "web-lb", VIP: "10.0.1.100", VIPPrefix: 24, Interface: "eth0",
+		VRID: 10, Priority: 100, Algorithm: "roundrobin",
+		Backends: []Backend{{Name: "b1", IP: "10.0.1.10", Port: 8080}},
+		Ports:    []Port{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+	}
+	haproxyPath := filepath.Join(m.configDir, "web-lb-haproxy.cfg")
+
+	m.Apply(ctx, cfg) //nolint:errcheck — haproxy -c fails in CI; we test file writes
+	first, err := os.ReadFile(haproxyPath)
+	if err != nil {
+		t.Fatalf("first apply didn't write config: %v", err)
+	}
+	// Second apply with identical config: file still present and byte-identical
+	// (the reload is skipped, but the write is not).
+	m.Apply(ctx, cfg) //nolint:errcheck
+	second, err := os.ReadFile(haproxyPath)
+	if err != nil {
+		t.Fatalf("second apply removed config: %v", err)
+	}
+	if string(first) != string(second) {
+		t.Errorf("config changed across identical applies:\n%s\n---\n%s", first, second)
+	}
+}
+
 // ── Apply ───────────────────────────────────────────────────────────────────
 
 func TestApply_WritesAllConfigs(t *testing.T) {

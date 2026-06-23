@@ -189,6 +189,61 @@ func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend 
 	return backends
 }
 
+// mapHAProxyStatus maps a raw HAProxy server status ("UP 2/3", "DOWN (agent)",
+// "MAINT (via x/y)", "DRAIN", "NOLB") to litevirt's backend-status vocabulary,
+// falling back to the workload-derived status on anything unexpected.
+func mapHAProxyStatus(raw, fallback string) string {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return fallback
+	}
+	switch {
+	case fields[0] == "UP":
+		return "active"
+	case fields[0] == "DOWN":
+		return "down"
+	case strings.HasPrefix(fields[0], "MAINT"):
+		return "maint"
+	case fields[0] == "DRAIN":
+		return "draining"
+	case fields[0] == "NOLB":
+		return "nolb"
+	default:
+		return fallback
+	}
+}
+
+// lbHealthByServer returns the real HAProxy backend health (server name → raw
+// status) for an LB, querying the local stats socket or forwarding to the LB
+// host when haproxy isn't local. Used to overlay true health on the run-state
+// status in InspectLoadBalancer.
+func (s *Server) lbHealthByServer(ctx context.Context, lbName string) (map[string]string, error) {
+	if s.lbHealthOverride != nil {
+		return s.lbHealthOverride(ctx, lbName)
+	}
+	mgr := lb.NewManager()
+	stats, err := mgr.GetStats(ctx, lbName)
+	if err != nil {
+		// HAProxy not running locally — forward to an LB host that has it.
+		resp := s.forwardLBStats(ctx, &pb.LBStatsRequest{Name: lbName})
+		if resp == nil {
+			return nil, err
+		}
+		out := make(map[string]string, len(resp.Backends))
+		for _, b := range resp.Backends {
+			out[b.Name] = b.Status
+		}
+		return out, nil
+	}
+	out := map[string]string{}
+	for _, e := range stats.Entries {
+		if e.Type == 2 { // server row
+			out[e.ServerName] = e.Status
+		}
+	}
+	return out, nil
+}
+
 func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBRequest) (*pb.LoadBalancer, error) {
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
@@ -241,6 +296,22 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 		StackName:  r.String("stack_name"),
 		Ports:      ports,
 		Backends:   s.lbBackends(ctx, r.String("name")),
+	}
+
+	// Overlay REAL HAProxy health onto the run-state-derived backend status, so
+	// inspect reflects whether a backend is actually serving (not just whether
+	// its workload is running). Inspect-only: listing every LB would fan out a
+	// stats query per LB. On failure, keep run-state status + flag it.
+	if health, herr := s.lbHealthByServer(ctx, result.Name); herr == nil {
+		for _, b := range result.Backends {
+			if hs, ok := health[b.VmName]; ok {
+				b.Status = mapHAProxyStatus(hs, b.Status)
+			}
+		}
+	} else if state == "active" {
+		for _, b := range result.Backends {
+			b.LastError = "haproxy health unavailable"
+		}
 	}
 	return result, nil
 }

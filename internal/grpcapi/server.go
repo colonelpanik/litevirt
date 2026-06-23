@@ -48,6 +48,11 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// lbHealthOverride is a test seam for InspectLoadBalancer's HAProxy health
+	// overlay (unit tests have no running haproxy): when non-nil it returns the
+	// server-name→raw-status map instead of querying the stats socket.
+	lbHealthOverride func(context.Context, string) (map[string]string, error)
+
 	// loginThrottle rate-limits failed Login attempts per (username, IP) to
 	// blunt password / second-factor brute force. In-memory + per-node; nil
 	// in bare test servers (no throttling) and set by NewServer in production.

@@ -8,6 +8,74 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+func TestMapHAProxyStatus(t *testing.T) {
+	cases := map[string]string{
+		"UP 2/3":          "active",
+		"UP":              "active",
+		"DOWN (agent)":    "down",
+		"DOWN":            "down",
+		"MAINT (via a/b)": "maint",
+		"MAINT":           "maint",
+		"DRAIN":           "draining",
+		"NOLB":            "nolb",
+		"something-weird": "run-state", // unexpected → fallback
+		"":                "run-state", // empty → fallback
+	}
+	for raw, want := range cases {
+		if got := mapHAProxyStatus(raw, "run-state"); got != want {
+			t.Errorf("mapHAProxyStatus(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+// InspectLoadBalancer overlays REAL HAProxy health onto the run-state status:
+// a backend whose workload is running but whose HAProxy check is DOWN must show
+// "down", not "active". On a stats-fetch failure it keeps run-state + flags it.
+func TestInspectLB_HealthOverlay(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "app-lb", StackName: "app", VIP: "10.0.0.9/24", Algorithm: "roundrobin", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "web-1", StackName: "app", HostName: "other-host", Spec: "{}", State: "running",
+	}, []corrosion.InterfaceRecord{
+		{VMName: "web-1", NetworkName: "default", Ordinal: 0, MAC: "52:54:00:00:00:01", IP: "10.0.0.10"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// HAProxy says the running VM's backend is DOWN → inspect must reflect it.
+	s.lbHealthOverride = func(context.Context, string) (map[string]string, error) {
+		return map[string]string{"web-1": "DOWN (L4 timeout)"}, nil
+	}
+	lbResp, err := s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: "app-lb"})
+	if err != nil {
+		t.Fatalf("InspectLoadBalancer: %v", err)
+	}
+	if len(lbResp.Backends) != 1 || lbResp.Backends[0].Status != "down" {
+		t.Fatalf("backend status = %+v, want real health 'down' (not run-state 'active')", lbResp.Backends)
+	}
+
+	// Stats unavailable → keep run-state 'active' but flag it.
+	s.lbHealthOverride = func(context.Context, string) (map[string]string, error) {
+		return nil, errStatsUnavailableForTest
+	}
+	lbResp, _ = s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: "app-lb"})
+	if lbResp.Backends[0].Status != "active" || lbResp.Backends[0].LastError == "" {
+		t.Errorf("fallback wrong: status=%q lastErr=%q, want active + a 'health unavailable' note",
+			lbResp.Backends[0].Status, lbResp.Backends[0].LastError)
+	}
+}
+
+var errStatsUnavailableForTest = &lbTestErr{"haproxy not running"}
+
+type lbTestErr struct{ s string }
+
+func (e *lbTestErr) Error() string { return e.s }
+
 // resolveStackBackends is the single resolver behind both the status and render
 // paths: it returns every VM (running or not, with its stored/discovered IP) and
 // every stack container. The list path (allowRemote=false) must not attempt a

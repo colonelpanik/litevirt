@@ -133,7 +133,12 @@ import (
 //	     of the container dir under {dataDir}/ct-snapshots), the container analogue
 //	     of the snapshots table. New table in schemaDDL only (no ALTER). Unblocks
 //	     `lv ct snapshot create|ls|revert|rm`. gap-1 from v26.
-const CurrentSchemaVersion = 27
+//	v28: containers.is_template + containers.on_host_failure — clone-source
+//	     template flag (mirrors vms.is_template) and host-loss relocation policy.
+//	     Two ADD COLUMNs in schemaMigrations + CREATE-TABLE columns; old rows
+//	     default is_template=0, on_host_failure=NULL (treated as 'none'). Unblocks
+//	     container templates/clones (B4) + failover relocation (B5). gap-1 from v27.
+const CurrentSchemaVersion = 28
 
 // InitSchema creates all required tables in the local SQLite database.
 // DDL is not broadcast — each node creates its own tables on startup.
@@ -854,6 +859,8 @@ var schemaDDL = []string{
 		restart_policy TEXT,                  -- JSON {condition,delay,max_attempts,window}; '' = none (v24)
 		state_detail   TEXT,                  -- stop cause / intent, e.g. 'operator-stop' (v24)
 		project        TEXT NOT NULL DEFAULT '_default', -- tenancy bucket, mirrors vms.project (v25)
+		is_template     INTEGER NOT NULL DEFAULT 0,       -- clone-source template, mirrors vms.is_template (v28)
+		on_host_failure TEXT,                             -- host-loss policy: ''/'none' | 'image-recreate' (v28)
 		created_at     TEXT NOT NULL,
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT,
@@ -1350,4 +1357,11 @@ var schemaMigrations = []string{
 
 	// containers.project — tenancy bucket (v25), mirrors vms.project.
 	`ALTER TABLE containers ADD COLUMN project TEXT NOT NULL DEFAULT '_default'`,
+
+	// Container templates/clones + host-loss relocation (v28). is_template
+	// mirrors vms.is_template (a clone-source that can't start); on_host_failure
+	// is the relocation policy the failover coordinator reads when a host is
+	// fenced. Both additive; old rows default is_template=0, on_host_failure=NULL.
+	`ALTER TABLE containers ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE containers ADD COLUMN on_host_failure TEXT`,
 }

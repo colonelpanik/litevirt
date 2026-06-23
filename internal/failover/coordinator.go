@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -695,6 +696,83 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			Result:   "ok",
 		})
 	}
+
+	// Step 6: Relocate containers on the fenced host (B5). Unlike VMs, a
+	// container's rootfs lived on the (now dead) host, so relocation re-creates
+	// it from a re-pullable image origin on the target. This is state-only here
+	// — re-key the row to the target as pending+relocate-recreate; the target's
+	// container reconciler does the actual recreate. Stateful / non-re-pullable
+	// containers are skipped and loudly audited (their data can't be recovered
+	// without a backup — the backup-restore tier is a follow-up).
+	c.relocateContainers(ctx, h, candidates, &fallbackIdx)
+}
+
+// relocateContainers re-homes the fenced host's relocatable containers onto
+// healthy hosts (state-only; the target reconciler recreates them). Shares the
+// round-robin fallbackIdx with the VM loop so placement-failure fallbacks stay
+// spread across candidates.
+func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostRecord, candidates []corrosion.HostRecord, fallbackIdx *int) {
+	cts, err := corrosion.ListContainers(ctx, c.db, h.Name)
+	if err != nil {
+		slog.Error("failover: list containers", "host", h.Name, "error", err)
+		return
+	}
+	for _, ct := range cts {
+		policy := ct.OnHostFailure
+		if policy == "" || policy == "none" {
+			continue
+		}
+		// Tier-1 relocation re-creates from a re-pullable image; a container with
+		// no such origin can't be brought back here (its rootfs died with the
+		// host) — skip and loudly audit so the operator knows it needs a restore.
+		if !containerImageRepullable(ct.Image) {
+			slog.Warn("failover: container not relocatable (no re-pullable image) — skipping",
+				"container", ct.Name, "image", ct.Image, "host", h.Name)
+			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+				ID: newID(), Username: "failover-coordinator", HostName: c.hostName,
+				Action: "ct.relocate.skipped", Target: ct.Name,
+				Detail: "no re-pullable image origin after fencing " + h.Name + " (restore from backup to recover)",
+				Result: "skipped",
+			})
+			continue
+		}
+
+		target, err := placement.Select(ctx, c.db, placement.Request{
+			VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
+		})
+		if err != nil {
+			if len(candidates) == 0 {
+				slog.Warn("failover: no target for container relocation", "container", ct.Name)
+				continue
+			}
+			target = candidates[*fallbackIdx%len(candidates)].Name
+			*fallbackIdx++
+		}
+
+		if err := corrosion.RelocateContainer(ctx, c.db, h.Name, ct.Name, target); err != nil {
+			slog.Error("failover: relocate container", "container", ct.Name, "error", err)
+			continue
+		}
+		c.fenceRelocated[h.Name] = true
+		slog.Info("failover: relocating container", "container", ct.Name, "from", h.Name, "to", target, "policy", policy)
+		_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+			ID: newID(), Username: "failover-coordinator", HostName: c.hostName,
+			Action: "ct.relocate", Target: ct.Name,
+			Detail: "relocated from " + h.Name + " to " + target + " (recreate from image)", Result: "ok",
+		})
+	}
+}
+
+// containerImageRepullable reports whether a container's image origin can be
+// re-pulled to rebuild its rootfs on another host (an OCI/registry ref or a
+// download-template ref). An empty image (e.g. a hand-built rootfs) can't.
+func containerImageRepullable(image string) bool {
+	if image == "" {
+		return false
+	}
+	// oci://… , docker.io/…:tag , alpine:3.19 — anything with a registry scheme
+	// or a name:tag form is re-pullable. A bare path / empty is not.
+	return strings.Contains(image, "://") || strings.Contains(image, ":") || strings.Contains(image, "/")
 }
 
 // healthyHosts returns active hosts excluding the failed host.

@@ -68,6 +68,7 @@ func (f *fakeCtRuntime) RevertContainer(ctx context.Context, name string, r io.R
 	_, err := io.Copy(io.Discard, r)
 	return err
 }
+func (f *fakeCtRuntime) CloneContainer(ctx context.Context, src, dst string) error { return nil }
 func (f *fakeCtRuntime) List(ctx context.Context) ([]string, error) {
 	out := make([]string, 0, len(f.states))
 	for n := range f.states {
@@ -286,6 +287,32 @@ func TestContainerCheck_WindowReset(t *testing.T) {
 	rs, _ := corrosion.GetContainerRestartState(ctx, db, "node1", "ct1")
 	if rs == nil || rs.AttemptCount != 1 {
 		t.Errorf("attempts = %v, want 1 after window reset", rs)
+	}
+}
+
+// TestContainerCheck_RelocateRecreate: a container re-homed here by failover
+// (pending + relocate-recreate) is recreated from its image and started.
+func TestContainerCheck_RelocateRecreate(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime() // State() returns Unknown for an uncreated container
+
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "alpine:3.19", CPULimit: 1, MemMiB: 128,
+	})
+
+	c := NewContainerChecker("node1", db, rt)
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	// Recreated + started from its image.
+	if rt.startCount("ct1") != 1 {
+		t.Errorf("relocated container should be started once, got %d", rt.startCount("ct1"))
+	}
+	fresh := mustGetCt(t, db, "ct1")
+	if fresh.State != "running" || fresh.StateDetail != "" {
+		t.Errorf("after recreate state=%q detail=%q, want running/'' (marker cleared)", fresh.State, fresh.StateDetail)
 	}
 }
 

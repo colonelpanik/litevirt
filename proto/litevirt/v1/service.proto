@@ -708,6 +708,16 @@ message ListContainerSnapshotsResponse { repeated ContainerSnapshot snapshots = 
 message RevertContainerSnapshotRequest { string name = 1; string host_name = 2; string snapshot = 3; }
 message DeleteContainerSnapshotRequest { string name = 1; string host_name = 2; string snapshot = 3; }
 
+// ── Container templates + clones (B4) ──
+message ConvertContainerToTemplateRequest { string name = 1; string host_name = 2; bool revert = 3; }
+message CloneContainerRequest {
+    string source    = 1;
+    string target    = 2;
+    string host_name = 3;  // source's host; empty = resolve by name
+    string project   = 4;  // clone's tenancy project; empty = source's
+    bool   start     = 5;  // start the clone after creation
+}
+
 // FirewallStatus is the post-Reconcile snapshot the daemon hands back
 // from ReloadFirewall.
 message FirewallStatus {
@@ -1431,6 +1441,8 @@ service LiteVirt {
     rpc ListContainerSnapshots(ListContainerSnapshotsRequest)   returns (ListContainerSnapshotsResponse);
     rpc RevertContainerSnapshot(RevertContainerSnapshotRequest) returns (google.protobuf.Empty);
     rpc DeleteContainerSnapshot(DeleteContainerSnapshotRequest) returns (google.protobuf.Empty);
+    rpc ConvertContainerToTemplate(ConvertContainerToTemplateRequest) returns (Container);
+    rpc CloneContainer(CloneContainerRequest)                         returns (Container);
 
     // ── Stats ──
     rpc GetVMStats(GetVMStatsRequest)       returns (VMStats);

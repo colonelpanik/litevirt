@@ -80,9 +80,57 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 	}
 }
 
+// recreateRelocated rebuilds a container the failover coordinator re-homed here
+// after a host loss (B5), from its re-pullable image. Best-effort tier-1: the
+// recreated container is a fresh instance of the image (networks/advanced config
+// from the original aren't preserved — the faithful path is restore-from-backup,
+// a follow-up). On failure it leaves the row pending so the next sweep retries.
+func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.ContainerRecord) {
+	// Already materialized by a prior tick? Clear the relocate marker and let
+	// normal reconciliation take over.
+	if live, err := c.runtime.State(ctx, ct.Name); err == nil &&
+		(live == lxc.StateRunning || live == lxc.StateStopped) {
+		state := "stopped"
+		if live == lxc.StateRunning {
+			state = "running"
+		}
+		_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, state, "")
+		return
+	}
+	slog.Info("containercheck: recreating relocated container from image",
+		"container", ct.Name, "image", ct.Image)
+	if _, err := c.runtime.Create(ctx, lxc.CreateOpts{
+		Name: ct.Name, Template: ct.Image,
+		CPULimit: ct.CPULimit, MemoryMiB: ct.MemMiB, Labels: ct.Labels,
+	}); err != nil {
+		slog.Error("containercheck: relocate-recreate failed (will retry)",
+			"container", ct.Name, "image", ct.Image, "error", err)
+		c.publish("ct.relocate.failed", ct.Name, err.Error())
+		return // leave pending → retried next sweep
+	}
+	if err := c.runtime.Start(ctx, ct.Name); err != nil {
+		slog.Error("containercheck: relocate-recreate start failed", "container", ct.Name, "error", err)
+		_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", "")
+		return
+	}
+	_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "running", "")
+	c.publish("ct.relocated", ct.Name, "recreated from image after host loss")
+	slog.Info("containercheck: relocated container recreated", "container", ct.Name)
+}
+
 // checkContainer reconciles one container's cluster row to the runtime's reality
 // and applies the restart policy when it stopped unexpectedly.
 func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.ContainerRecord, now time.Time) {
+	// B5 host-loss relocation: the failover coordinator re-homed this container
+	// to us (state=pending, detail=relocate-recreate) after its host was fenced.
+	// Its rootfs died with that host, so recreate it from its image here. This
+	// runs before the normal state read because a not-yet-created container has
+	// no LXC instance (lxc-info would error).
+	if ct.State == "pending" && ct.StateDetail == corrosion.ContainerRelocateRecreateDetail {
+		c.recreateRelocated(ctx, ct)
+		return
+	}
+
 	live, err := c.runtime.State(ctx, ct.Name)
 	if err != nil {
 		// lxc-info failed (container being deleted, runtime hiccup) — can't

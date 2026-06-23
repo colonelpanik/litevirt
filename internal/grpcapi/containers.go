@@ -121,6 +121,10 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// A template is a frozen clone source — refuse to start it (mirrors VMs).
+	if rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); rec != nil && rec.IsTemplate {
+		return nil, status.Errorf(codes.FailedPrecondition, "%q is a template and cannot be started; clone it instead", req.Name)
+	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "start: %v", err)

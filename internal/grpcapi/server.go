@@ -183,6 +183,9 @@ type ContainerRuntime interface {
 	// RevertContainer replaces a stopped container's on-disk dir from a snapshot
 	// tar in place (B2 snapshot revert — clobbers).
 	RevertContainer(ctx context.Context, name string, r io.Reader) error
+	// CloneContainer full-copies src's on-disk dir as dst with a fresh identity
+	// (B4 templates/clones).
+	CloneContainer(ctx context.Context, src, dst string) error
 	PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error
 }
 

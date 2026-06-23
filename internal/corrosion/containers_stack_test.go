@@ -134,6 +134,72 @@ func TestContainerSnapshots_CRUD(t *testing.T) {
 	}
 }
 
+// is_template + on_host_failure (v28) round-trip through Upsert/Get;
+// SetContainerTemplate flips the flag.
+func TestContainerTemplateAndPolicyColumns(t *testing.T) {
+	c := newCtTestClient(t)
+	ctx := context.Background()
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName: "h1", Name: "tmpl", State: "stopped", Project: "p1",
+		IsTemplate: true, OnHostFailure: "image-recreate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := GetContainer(ctx, c, "h1", "tmpl")
+	if got == nil || !got.IsTemplate || got.OnHostFailure != "image-recreate" {
+		t.Fatalf("round-trip = %+v, want is_template=true on_host_failure=image-recreate", got)
+	}
+	if err := SetContainerTemplate(ctx, c, "h1", "tmpl", false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = GetContainer(ctx, c, "h1", "tmpl")
+	if got.IsTemplate {
+		t.Error("SetContainerTemplate(false) did not clear is_template")
+	}
+}
+
+// RelocateContainer (B5 re-key) soft-deletes the source row and inserts a fresh
+// pending/relocate-recreate row on the target, preserving spec fields.
+func TestRelocateContainer(t *testing.T) {
+	c := newCtTestClient(t)
+	ctx := context.Background()
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName: "dead", Name: "web", State: "running", Image: "alpine:3.19",
+		CPULimit: 2, MemMiB: 256, Project: "p1", OnHostFailure: "image-recreate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RelocateContainer(ctx, c, "dead", "web", "live"); err != nil {
+		t.Fatalf("RelocateContainer: %v", err)
+	}
+	// Source row gone.
+	if g, _ := GetContainer(ctx, c, "dead", "web"); g != nil {
+		t.Errorf("source row still present: %+v", g)
+	}
+	// Target row present, pending+relocate, spec preserved.
+	g, _ := GetContainer(ctx, c, "live", "web")
+	if g == nil {
+		t.Fatal("target row missing")
+	}
+	if g.State != "pending" || g.StateDetail != ContainerRelocateRecreateDetail {
+		t.Errorf("target state/detail = %q/%q, want pending/%s", g.State, g.StateDetail, ContainerRelocateRecreateDetail)
+	}
+	if g.Image != "alpine:3.19" || g.CPULimit != 2 || g.MemMiB != 256 || g.Project != "p1" || g.OnHostFailure != "image-recreate" {
+		t.Errorf("target spec not preserved: %+v", g)
+	}
+	// Exactly one live "web" cluster-wide.
+	all, _ := ListContainers(ctx, c, "")
+	n := 0
+	for _, ct := range all {
+		if ct.Name == "web" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("live web rows = %d, want 1", n)
+	}
+}
+
 // A container's project (v25) round-trips through Upsert/Get/List, and an empty
 // project normalizes to "_default" (so old rows / unset callers land in the
 // default tenancy bucket).

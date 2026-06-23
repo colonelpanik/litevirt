@@ -19,6 +19,7 @@ package lxc
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -117,6 +118,10 @@ type Runtime interface {
 	// snapshot tar (in-place snapshot revert — clobbers). The container must be
 	// stopped first.
 	RevertContainer(ctx context.Context, name string, r io.Reader) error
+	// CloneContainer makes a full copy of src's on-disk dir as dst and gives it
+	// a fresh identity (new hostname/uts.name, regenerated NIC MAC(s), reset
+	// machine-id). The src should be stopped/frozen for a consistent copy.
+	CloneContainer(ctx context.Context, src, dst string) error
 }
 
 // CreateOpts collects parameters for Runtime.Create.
@@ -509,6 +514,89 @@ func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Rea
 		_ = os.RemoveAll(backup) // success — drop the old copy
 	}
 	return nil
+}
+
+// CloneContainer makes a full copy of src's on-disk dir as dst (`cp -a`), then
+// rewrites the clone's config + rootfs for a fresh identity: new lxc.uts.name,
+// a regenerated MAC on every NIC, a rootfs.path pointing at the clone, and a
+// reset machine-id + hostname inside the rootfs (so the guest first-boots
+// clean). The caller should freeze/stop src first for a consistent copy.
+// Container clones are always full copies (no qcow2 backing), so there's no
+// linked-clone dependency to track.
+func (r *LxcRunner) CloneContainer(ctx context.Context, src, dst string) error {
+	srcDir := filepath.Join(r.lxcpath(), src)
+	dstDir := filepath.Join(r.lxcpath(), dst)
+	if _, err := os.Stat(srcDir); err != nil {
+		return fmt.Errorf("source container dir %s: %w", srcDir, err)
+	}
+	if _, err := os.Stat(dstDir); err == nil {
+		return fmt.Errorf("container dir %s already exists; refusing to overwrite", dstDir)
+	}
+	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
+		return fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err)
+	}
+	// `cp -a` preserves perms/owners/symlinks/timestamps — an archive copy.
+	cmd := exec.CommandContext(ctx, "cp", "-a", srcDir, dstDir)
+	stderr := strings.Builder{}
+	cmd.Stderr = stringWriter{&stderr}
+	if err := cmd.Run(); err != nil {
+		_ = os.RemoveAll(dstDir)
+		return fmt.Errorf("cp -a %s %s: %w: %s", srcDir, dstDir, err, stderr.String())
+	}
+	if err := r.cloneFreshIdentity(dst); err != nil {
+		_ = os.RemoveAll(dstDir)
+		return err
+	}
+	return nil
+}
+
+// cloneFreshIdentity rewrites a freshly-copied clone's config (rootfs.path,
+// uts.name, regenerated NIC MACs) and resets in-rootfs identity files so the
+// clone doesn't collide with its source.
+func (r *LxcRunner) cloneFreshIdentity(name string) error {
+	cfg := filepath.Join(r.lxcpath(), name, "config")
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		return fmt.Errorf("read clone config %s: %w", cfg, err)
+	}
+	rootfsLine := "lxc.rootfs.path = dir:" + filepath.Join(r.lxcpath(), name, "rootfs")
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "lxc.rootfs.path"):
+			lines[i] = rootfsLine
+		case strings.HasPrefix(t, "lxc.uts.name"):
+			lines[i] = "lxc.uts.name = " + name
+		case strings.HasPrefix(t, "lxc.net.") && strings.Contains(t, ".hwaddr"):
+			// Preserve the key (lxc.net.N.hwaddr), assign a fresh MAC.
+			if key, _, ok := strings.Cut(t, "="); ok {
+				lines[i] = strings.TrimSpace(key) + " = " + randomMAC()
+			}
+		}
+	}
+	if err := os.WriteFile(cfg, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		return fmt.Errorf("rewrite clone config %s: %w", cfg, err)
+	}
+	// Best-effort in-guest identity reset (so systemd regenerates machine-id and
+	// the hostname matches the clone). Missing files are fine.
+	rootfs := filepath.Join(r.lxcpath(), name, "rootfs")
+	_ = os.WriteFile(filepath.Join(rootfs, "etc", "hostname"), []byte(name+"\n"), 0o644)
+	for _, mid := range []string{"etc/machine-id", "var/lib/dbus/machine-id"} {
+		p := filepath.Join(rootfs, mid)
+		if _, err := os.Stat(p); err == nil {
+			_ = os.WriteFile(p, nil, 0o644) // truncate → regenerated on first boot
+		}
+	}
+	return nil
+}
+
+// randomMAC returns a fresh locally-administered MAC under the QEMU OUI
+// (52:54:00) — mirrors libvirt.GenerateMAC without importing that package.
+func randomMAC() string {
+	buf := make([]byte, 3)
+	_, _ = rand.Read(buf)
+	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", buf[0], buf[1], buf[2])
 }
 
 // rewriteRootFSPath pins the container config's lxc.rootfs.path to this host's

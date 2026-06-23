@@ -222,8 +222,9 @@ from a crash. Only an operator `lv ct stop` is guaranteed-stick (it records
 `operator-stop`); any other stop is treated as unexpected and restarted per policy.
 A `FROZEN` (paused) container maps to running and is never restarted.
 
-> Host-loss relocation for containers is a follow-up — the reconciler currently
-> restarts a container only on the host that owns it, not on a surviving peer.
+> On-host restart-policy handles a container that stops while its host is alive.
+> If the whole host is fenced, **host-loss relocation** (see below) rebuilds the
+> container on a surviving peer when it carries an `on_host_failure` policy.
 
 ## Tenancy, audit & metrics
 
@@ -304,6 +305,36 @@ its on-disk dir, and stores it **host-local** under `{dataDir}/ct-snapshots`.
 - Snapshots are full copies today (no dedup); **COW acceleration** on
   btrfs/zfs/lvm-thin rootfs is a planned follow-up. For space-efficient,
   off-host point-in-time copies use `lv ct backup` (dedup chunk store).
+
+## Templates & clones
+
+```bash
+lv ct template ubuntu-base            # mark a stopped container a clone template
+lv ct clone ubuntu-base web-01        # full-copy clone with a fresh identity
+lv ct clone ubuntu-base web-02 --start
+lv ct template ubuntu-base --revert   # back to a normal container
+```
+
+A **template** is a stopped container that can't start — a golden clone source.
+A **clone** is a full copy (`cp -a`) of a template or stopped container with a
+**fresh identity**: new `lxc.uts.name`, a regenerated NIC MAC, and a reset
+`/etc/machine-id` + `/etc/hostname`, so it boots clean and doesn't collide with
+its source. Clones are created on the source's host (its rootfs lives there) and
+admitted against the project quota; they inherit the source's project unless
+`--project` overrides. Unlike VMs there are no linked clones (no qcow2 backing) —
+every container clone is independent, so reverting a template is always safe.
+
+## Host-loss relocation
+
+If a host is fenced, the failover coordinator relocates its containers that
+carry an `on_host_failure: image-recreate` policy: it picks a healthy host via
+the placement engine, re-keys the container there, and the target's reconciler
+**recreates it from its image**. A container with no re-pullable image (a
+hand-built rootfs with no origin) can't be rebuilt this way — it's **skipped and
+loudly audited** (`ct.relocate.skipped`) so an operator knows to restore it from
+a backup. This is best-effort tier-1: the recreated container is a fresh instance
+of the image (networks/advanced config aren't preserved); the faithful path
+(restore the latest `lv ct backup`) is a planned tier-2.
 
 ## Cold migration
 

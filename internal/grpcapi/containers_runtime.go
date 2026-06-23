@@ -89,6 +89,10 @@ func (a *LXCRuntimeAdapter) RevertContainer(ctx context.Context, name string, r 
 	return a.Inner.RevertContainer(ctx, name, r)
 }
 
+func (a *LXCRuntimeAdapter) CloneContainer(ctx context.Context, src, dst string) error {
+	return a.Inner.CloneContainer(ctx, src, dst)
+}
+
 func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error) {
 	return a.Inner.List(ctx)
 }

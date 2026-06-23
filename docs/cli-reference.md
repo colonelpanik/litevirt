@@ -150,6 +150,8 @@ lv ct snapshot create <name> <snapshot>                # freeze+tar point-in-tim
 lv ct snapshot ls <name>                               # list a container's snapshots
 lv ct snapshot revert <name> <snapshot>                # roll back (stop → restore → restart)
 lv ct snapshot rm <name> <snapshot>                    # delete a snapshot
+lv ct template <name> [--revert]                       # convert a stopped ct to a clone template
+lv ct clone <source> <new-name> [--project p] [--start] # full-copy clone with a fresh identity
 ```
 
 `--local` runs against the local lxc-* binaries instead of the gRPC service

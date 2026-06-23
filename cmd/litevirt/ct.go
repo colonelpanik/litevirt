@@ -38,7 +38,67 @@ func newCTCmd() *cobra.Command {
 		newCTRestoreCmd(),
 		newCTMigrateCmd(),
 		newCTSnapshotCmd(),
+		newCTTemplateCmd(),
+		newCTCloneCmd(),
 	)
+	return cmd
+}
+
+// newCTTemplateCmd converts a stopped container into a clone template (or
+// --revert back to a normal container).
+func newCTTemplateCmd() *cobra.Command {
+	var host string
+	var revert bool
+	cmd := &cobra.Command{
+		Use:   "template <name>",
+		Short: "Convert a stopped container into a clone template (or --revert)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				ct, err := c.ConvertContainerToTemplate(ctx, &pb.ConvertContainerToTemplateRequest{
+					Name: args[0], HostName: host, Revert: revert,
+				})
+				if err != nil {
+					return err
+				}
+				if revert {
+					fmt.Printf("%s reverted to a normal container\n", ct.Name)
+				} else {
+					fmt.Printf("%s is now a template (clone it: lv ct clone %s <new-name>)\n", ct.Name, ct.Name)
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
+	cmd.Flags().BoolVar(&revert, "revert", false, "Turn a template back into a normal container")
+	return cmd
+}
+
+// newCTCloneCmd clones a template or stopped container into a new container.
+func newCTCloneCmd() *cobra.Command {
+	var host, project string
+	var start bool
+	cmd := &cobra.Command{
+		Use:   "clone <source> <new-name>",
+		Short: "Clone a template or stopped container (fresh identity: new hostname/MAC)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				ct, err := c.CloneContainer(ctx, &pb.CloneContainerRequest{
+					Source: args[0], Target: args[1], HostName: host, Project: project, Start: start,
+				})
+				if err != nil {
+					return err
+				}
+				fmt.Printf("cloned %s → %s (state: %s)\n", args[0], ct.Name, ct.State)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Source host (default: resolve by name)")
+	cmd.Flags().StringVar(&project, "project", "", "Tenancy project for the clone (default: source's)")
+	cmd.Flags().BoolVar(&start, "start", false, "Start the clone after creation")
 	return cmd
 }
 

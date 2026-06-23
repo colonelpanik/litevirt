@@ -121,6 +121,70 @@ func TestRevertContainer_RoundTripAndCrashSafety(t *testing.T) {
 	}
 }
 
+// TestCloneContainer_FreshIdentity clones a container dir and verifies the clone
+// is an independent copy with a fresh identity: new uts.name, regenerated NIC
+// MAC, rootfs.path repointed, hostname file updated — and mutating the clone
+// doesn't touch the source.
+func TestCloneContainer_FreshIdentity(t *testing.T) {
+	path := t.TempDir()
+	r := &LxcRunner{Lxcpath: path}
+	srcRoot := filepath.Join(path, "base", "rootfs")
+	if err := os.MkdirAll(filepath.Join(srcRoot, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcRoot, "etc", "hostname"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcRoot, "data.txt"), []byte("payload\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srcCfg := "lxc.uts.name = base\n" +
+		"lxc.rootfs.path = dir:" + srcRoot + "\n" +
+		"lxc.net.0.type = veth\nlxc.net.0.link = lxcbr0\nlxc.net.0.hwaddr = 52:54:00:aa:bb:cc\n"
+	if err := os.WriteFile(filepath.Join(path, "base", "config"), []byte(srcCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.CloneContainer(context.Background(), "base", "clone1"); err != nil {
+		t.Fatalf("CloneContainer: %v", err)
+	}
+
+	// Clone has the data (independent copy).
+	if got, _ := os.ReadFile(filepath.Join(path, "clone1", "rootfs", "data.txt")); string(got) != "payload\n" {
+		t.Errorf("clone data = %q, want payload", got)
+	}
+	cfg, _ := os.ReadFile(filepath.Join(path, "clone1", "config"))
+	cfgStr := string(cfg)
+	if !strings.Contains(cfgStr, "lxc.uts.name = clone1") {
+		t.Errorf("clone uts.name not rewritten:\n%s", cfgStr)
+	}
+	if !strings.Contains(cfgStr, "lxc.rootfs.path = dir:"+filepath.Join(path, "clone1", "rootfs")) {
+		t.Errorf("clone rootfs.path not repointed:\n%s", cfgStr)
+	}
+	if strings.Contains(cfgStr, "52:54:00:aa:bb:cc") {
+		t.Errorf("clone kept the source MAC — should be regenerated:\n%s", cfgStr)
+	}
+	if !strings.Contains(cfgStr, "lxc.net.0.hwaddr = 52:54:00:") {
+		t.Errorf("clone has no regenerated MAC:\n%s", cfgStr)
+	}
+	if got, _ := os.ReadFile(filepath.Join(path, "clone1", "rootfs", "etc", "hostname")); string(got) != "clone1\n" {
+		t.Errorf("clone /etc/hostname = %q, want clone1", got)
+	}
+
+	// Independence: mutating the clone leaves the source untouched.
+	if err := os.WriteFile(filepath.Join(path, "clone1", "rootfs", "data.txt"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(srcRoot, "data.txt")); string(got) != "payload\n" {
+		t.Errorf("source data mutated by clone change: %q", got)
+	}
+
+	// Refuses to clobber an existing target.
+	if err := r.CloneContainer(context.Background(), "base", "clone1"); err == nil {
+		t.Error("expected clone to refuse an existing target dir")
+	}
+}
+
 // TestImportContainer_RefusesClobber guards against overwriting a live container.
 func TestImportContainer_RefusesClobber(t *testing.T) {
 	dstPath := t.TempDir()
@@ -250,6 +314,7 @@ func (f *fakeRuntime) RevertContainer(_ context.Context, _ string, r io.Reader) 
 	_, err := io.Copy(io.Discard, r)
 	return err
 }
+func (f *fakeRuntime) CloneContainer(_ context.Context, _, _ string) error { return nil }
 
 // TestCreateOpts_Validate covers every documented invariant.
 func TestCreateOpts_Validate(t *testing.T) {

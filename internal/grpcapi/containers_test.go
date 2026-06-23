@@ -57,6 +57,10 @@ type fakeCTRuntime struct {
 	// revertErr injects a failure.
 	reverted  map[string][]byte
 	revertErr error
+
+	// B4 clone: records (src,dst) clone calls; cloneErr injects a failure.
+	cloneCalls []struct{ Src, Dst string }
+	cloneErr   error
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -168,6 +172,15 @@ func (f *fakeCTRuntime) RevertContainer(_ context.Context, name string, r io.Rea
 		f.reverted = map[string][]byte{}
 	}
 	f.reverted[name] = data
+	return nil
+}
+func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cloneErr != nil {
+		return f.cloneErr
+	}
+	f.cloneCalls = append(f.cloneCalls, struct{ Src, Dst string }{src, dst})
 	return nil
 }
 func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return nil, nil }

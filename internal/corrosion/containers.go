@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -43,9 +44,15 @@ type ContainerRecord struct {
 	StateDetail   string
 	// Project is the tenancy bucket (mirrors vms.project); '' is normalized to
 	// '_default' on write. Added in schema v25.
-	Project   string
-	CreatedAt string
-	UpdatedAt string
+	Project string
+	// IsTemplate marks a clone-source container that can't start (mirrors
+	// vms.is_template). OnHostFailure is the host-loss relocation policy the
+	// failover coordinator reads ('' / 'none' = leave; 'image-recreate' =
+	// recreate from a re-pullable origin on another host). Both added in v28.
+	IsTemplate    bool
+	OnHostFailure string
+	CreatedAt     string
+	UpdatedAt     string
 }
 
 // UpsertContainer creates or updates the cluster row for a container.
@@ -70,8 +77,8 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
 	return c.Execute(ctx,
-		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
 		   image = excluded.image,
@@ -81,11 +88,23 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 		   restart_policy = excluded.restart_policy,
 		   state_detail = excluded.state_detail,
 		   project = excluded.project,
+		   is_template = excluded.is_template,
+		   on_host_failure = excluded.on_host_failure,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
-		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, r.CreatedAt, now,
+		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreatedAt, now,
 	)
+}
+
+// SetContainerTemplate flips a container's is_template flag (ConvertContainer-
+// ToTemplate + its revert), mirroring SetVMTemplate.
+func SetContainerTemplate(ctx context.Context, c *Client, hostName, name string, isTemplate bool) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return c.Execute(ctx,
+		`UPDATE containers SET is_template = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		boolToInt(isTemplate), now, hostName, name)
 }
 
 // SetContainerState updates only the state + updated_at — used after
@@ -111,6 +130,37 @@ func SetContainerStateDetail(ctx context.Context, c *Client, hostName, name, sta
 		state, detail, now, hostName, name)
 }
 
+// ContainerRelocateRecreateDetail is the state_detail the failover coordinator
+// stamps on a container it re-homes after a host loss. The target host's
+// container reconciler reads it to recreate the container from its image (B5).
+const ContainerRelocateRecreateDetail = "relocate-recreate"
+
+// RelocateContainer re-homes a container from oldHost to newHost after a host
+// loss: it soft-deletes the old (oldHost,name) row and inserts a fresh row on
+// newHost in state 'pending' with detail 'relocate-recreate', preserving the
+// container's spec fields. The container's PK is (host_name,name), so a move is
+// a delete-old + insert-new (mirrors the migration re-key). The target's
+// reconciler recreates the rootfs from the image. Only relocatable fields are
+// carried; runtime state resets to pending.
+func RelocateContainer(ctx context.Context, c *Client, oldHost, name, newHost string) error {
+	old, err := GetContainer(ctx, c, oldHost, name)
+	if err != nil {
+		return err
+	}
+	if old == nil {
+		return fmt.Errorf("container %q not found on host %q", name, oldHost)
+	}
+	if err := DeleteContainer(ctx, c, oldHost, name); err != nil {
+		return err
+	}
+	rec := *old
+	rec.HostName = newHost
+	rec.State = "pending"
+	rec.StateDetail = ContainerRelocateRecreateDetail
+	rec.CreatedAt = "" // fresh row on the target
+	return UpsertContainer(ctx, c, rec)
+}
+
 // DeleteContainer soft-deletes the row. We don't physically delete so
 // "container vanished from gossip" can be distinguished from "host
 // crashed and we just haven't heard yet" in audit views.
@@ -131,6 +181,8 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 		        COALESCE(restart_policy, '') AS restart_policy,
 		        COALESCE(state_detail, '') AS state_detail,
 		        COALESCE(project, '_default') AS project,
+		        COALESCE(is_template, 0) AS is_template,
+		        COALESCE(on_host_failure, '') AS on_host_failure,
 		        created_at, updated_at
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		hostName, name)
@@ -140,16 +192,8 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	r := rows[0]
-	return &ContainerRecord{
-		HostName: r.String("host_name"), Name: r.String("name"),
-		State: r.String("state"), Image: r.String("image"),
-		CPULimit: r.Int("cpu_limit"), MemMiB: r.Int("memory_mib"),
-		Labels:        decodeContainerLabels(r.String("labels")),
-		RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
-		Project:   r.String("project"),
-		CreatedAt: r.String("created_at"), UpdatedAt: r.String("updated_at"),
-	}, nil
+	rec := scanContainer(rows[0])
+	return &rec, nil
 }
 
 // ListContainers returns every active container, optionally scoped to
@@ -160,6 +204,8 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 		   COALESCE(restart_policy, '') AS restart_policy,
 		   COALESCE(state_detail, '') AS state_detail,
 		   COALESCE(project, '_default') AS project,
+		   COALESCE(is_template, 0) AS is_template,
+		   COALESCE(on_host_failure, '') AS on_host_failure,
 		   created_at, updated_at
 		FROM containers WHERE deleted_at IS NULL`
 	var params []interface{}
@@ -174,17 +220,25 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 	}
 	out := make([]ContainerRecord, len(rows))
 	for i, r := range rows {
-		out[i] = ContainerRecord{
-			HostName: r.String("host_name"), Name: r.String("name"),
-			State: r.String("state"), Image: r.String("image"),
-			CPULimit: r.Int("cpu_limit"), MemMiB: r.Int("memory_mib"),
-			Labels:        decodeContainerLabels(r.String("labels")),
-			RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
-			Project:   r.String("project"),
-			CreatedAt: r.String("created_at"), UpdatedAt: r.String("updated_at"),
-		}
+		out[i] = scanContainer(r)
 	}
 	return out, nil
+}
+
+// scanContainer builds a ContainerRecord from a row carrying the full
+// container column set (used by GetContainer + ListContainers).
+func scanContainer(r Row) ContainerRecord {
+	return ContainerRecord{
+		HostName: r.String("host_name"), Name: r.String("name"),
+		State: r.String("state"), Image: r.String("image"),
+		CPULimit: r.Int("cpu_limit"), MemMiB: r.Int("memory_mib"),
+		Labels:        decodeContainerLabels(r.String("labels")),
+		RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
+		Project:       r.String("project"),
+		IsTemplate:    r.Int("is_template") == 1,
+		OnHostFailure: r.String("on_host_failure"),
+		CreatedAt:     r.String("created_at"), UpdatedAt: r.String("updated_at"),
+	}
 }
 
 // ListContainersByStack returns active containers tagged with the given compose

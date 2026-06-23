@@ -129,7 +129,11 @@ import (
 //	     container footprints alongside VMs. New table in schemaDDL only (no
 //	     ALTER — CREATE TABLE IF NOT EXISTS covers fresh + existing DBs). Unblocks
 //	     container backup/restore (full tar → pbsstore). gap-1 from v25.
-const CurrentSchemaVersion = 26
+//	v27: container_snapshots — per-container point-in-time snapshots (freeze+tar
+//	     of the container dir under {dataDir}/ct-snapshots), the container analogue
+//	     of the snapshots table. New table in schemaDDL only (no ALTER). Unblocks
+//	     `lv ct snapshot create|ls|revert|rm`. gap-1 from v26.
+const CurrentSchemaVersion = 27
 
 // InitSchema creates all required tables in the local SQLite database.
 // DDL is not broadcast — each node creates its own tables on startup.
@@ -766,6 +770,25 @@ var schemaDDL = []string{
 		total_bytes INTEGER NOT NULL DEFAULT 0,
 		updated_at  TEXT NOT NULL,
 		PRIMARY KEY (ct_name, repo)
+	)`,
+
+	// container_snapshots is the container analogue of the snapshots table
+	// (v27): per-container point-in-time snapshots. A snapshot is a freeze+tar
+	// of the container's on-disk dir stored host-local at `path` (type='tar';
+	// COW variants may be added later). host-local like the container itself.
+	`CREATE TABLE IF NOT EXISTS container_snapshots (
+		id          TEXT PRIMARY KEY,
+		ct_name     TEXT NOT NULL,
+		host_name   TEXT NOT NULL,
+		name        TEXT NOT NULL,
+		state       TEXT NOT NULL,
+		size_bytes  INTEGER NOT NULL DEFAULT 0,
+		type        TEXT NOT NULL DEFAULT 'tar',
+		path        TEXT,
+		created_at  TEXT NOT NULL,
+		updated_at  TEXT NOT NULL,
+		deleted_at  TEXT,
+		UNIQUE(host_name, ct_name, name)
 	)`,
 
 	// ═══════════ OVERLAY NETWORKING ═══════════

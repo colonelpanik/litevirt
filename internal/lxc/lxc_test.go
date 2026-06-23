@@ -71,6 +71,56 @@ func TestExportImportContainer_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestRevertContainer_RoundTripAndCrashSafety: a snapshot tar from
+// ExportContainer reverts a modified container back to the captured state
+// in place; and a corrupt snapshot stream never loses the live container.
+func TestRevertContainer_RoundTripAndCrashSafety(t *testing.T) {
+	path := t.TempDir()
+	r := &LxcRunner{Lxcpath: path}
+	hn := filepath.Join(path, "web", "rootfs", "etc", "hostname")
+	if err := os.MkdirAll(filepath.Dir(hn), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hn, []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "web", "config"),
+		[]byte("lxc.uts.name = web\nlxc.rootfs.path = dir:"+filepath.Join(path, "web", "rootfs")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot the current ("v1") state.
+	var snap bytes.Buffer
+	if err := r.ExportContainer(context.Background(), "web", &snap); err != nil {
+		t.Fatalf("ExportContainer: %v", err)
+	}
+	snapBytes := snap.Bytes()
+
+	// Mutate the rootfs to "v2".
+	if err := os.WriteFile(hn, []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revert from the snapshot → back to "v1".
+	if err := r.RevertContainer(context.Background(), "web", bytes.NewReader(snapBytes)); err != nil {
+		t.Fatalf("RevertContainer: %v", err)
+	}
+	if got, _ := os.ReadFile(hn); string(got) != "v1\n" {
+		t.Errorf("after revert hostname = %q, want v1", got)
+	}
+
+	// Crash safety: a corrupt snapshot stream must leave the live container intact.
+	if err := os.WriteFile(hn, []byte("v3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RevertContainer(context.Background(), "web", strings.NewReader("not-a-valid-tar")); err == nil {
+		t.Error("expected error reverting from a corrupt snapshot")
+	}
+	if got, _ := os.ReadFile(hn); string(got) != "v3\n" {
+		t.Errorf("corrupt revert lost data: hostname = %q, want v3 (rolled back)", got)
+	}
+}
+
 // TestImportContainer_RefusesClobber guards against overwriting a live container.
 func TestImportContainer_RefusesClobber(t *testing.T) {
 	dstPath := t.TempDir()
@@ -193,6 +243,10 @@ func (f *fakeRuntime) ExportContainer(_ context.Context, _ string, w io.Writer) 
 	return err
 }
 func (f *fakeRuntime) ImportContainer(_ context.Context, _ string, r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
+}
+func (f *fakeRuntime) RevertContainer(_ context.Context, _ string, r io.Reader) error {
 	_, err := io.Copy(io.Discard, r)
 	return err
 }

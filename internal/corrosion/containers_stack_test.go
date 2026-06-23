@@ -88,6 +88,52 @@ func TestUpsertContainerBackup_AndProjectFootprint(t *testing.T) {
 	}
 }
 
+// Container snapshots (v27) round-trip through Insert/List/Get/Delete, scoped
+// per (host, container), and tombstone on delete.
+func TestContainerSnapshots_CRUD(t *testing.T) {
+	c := newCtTestClient(t)
+	ctx := context.Background()
+
+	mk := func(ct, name string, size int64) {
+		if err := InsertContainerSnapshot(ctx, c, ContainerSnapshotRecord{
+			CtName: ct, HostName: "h1", Name: name, State: "ok", SizeBytes: size,
+			Type: "tar", Path: "/var/lib/litevirt/ct-snapshots/" + ct + "/" + name + ".tar",
+		}); err != nil {
+			t.Fatalf("InsertContainerSnapshot: %v", err)
+		}
+	}
+	mk("web", "s1", 100)
+	mk("web", "s2", 200)
+	mk("db", "s1", 300) // different container — must not leak into web's list
+
+	snaps, err := ListContainerSnapshots(ctx, c, "h1", "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 2 {
+		t.Fatalf("web has %d snapshots, want 2", len(snaps))
+	}
+
+	got, err := GetContainerSnapshot(ctx, c, "h1", "web", "s2")
+	if err != nil || got == nil {
+		t.Fatalf("GetContainerSnapshot: %v / nil=%v", err, got == nil)
+	}
+	if got.SizeBytes != 200 || got.Type != "tar" {
+		t.Errorf("snapshot s2 = %+v, want size 200 type tar", got)
+	}
+
+	if err := DeleteContainerSnapshot(ctx, c, "h1", "web", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := GetContainerSnapshot(ctx, c, "h1", "web", "s1"); g != nil {
+		t.Errorf("s1 should be tombstoned, got %+v", g)
+	}
+	snaps, _ = ListContainerSnapshots(ctx, c, "h1", "web")
+	if len(snaps) != 1 || snaps[0].Name != "s2" {
+		t.Errorf("after delete web has %+v, want just s2", snaps)
+	}
+}
+
 // A container's project (v25) round-trips through Upsert/Get/List, and an empty
 // project normalizes to "_default" (so old rows / unset callers land in the
 // default tenancy bucket).

@@ -688,6 +688,26 @@ message MigrateContainerProgress {
     string error           = 4;
 }
 
+// ── Container snapshots ──
+// A point-in-time snapshot of a container (freeze+tar of its on-disk dir,
+// stored host-local). The container analogue of Snapshot.
+message ContainerSnapshot {
+    string id         = 1;
+    string ct_name    = 2;
+    string host_name  = 3;
+    string name       = 4;
+    string state      = 5;
+    int64  size_bytes = 6;
+    string type       = 7;  // "tar" (COW variants later)
+    string created_at = 8;
+}
+
+message SnapshotContainerRequest       { string name = 1; string host_name = 2; string snapshot = 3; }
+message ListContainerSnapshotsRequest  { string name = 1; string host_name = 2; }
+message ListContainerSnapshotsResponse { repeated ContainerSnapshot snapshots = 1; }
+message RevertContainerSnapshotRequest { string name = 1; string host_name = 2; string snapshot = 3; }
+message DeleteContainerSnapshotRequest { string name = 1; string host_name = 2; string snapshot = 3; }
+
 // FirewallStatus is the post-Reconcile snapshot the daemon hands back
 // from ReloadFirewall.
 message FirewallStatus {
@@ -1407,6 +1427,10 @@ service LiteVirt {
     rpc BackupContainer(BackupContainerRequest)   returns (stream BackupContainerProgress);
     rpc RestoreContainer(RestoreContainerRequest) returns (stream RestoreContainerProgress);
     rpc MigrateContainer(MigrateContainerRequest) returns (stream MigrateContainerProgress);
+    rpc SnapshotContainer(SnapshotContainerRequest)             returns (ContainerSnapshot);
+    rpc ListContainerSnapshots(ListContainerSnapshotsRequest)   returns (ListContainerSnapshotsResponse);
+    rpc RevertContainerSnapshot(RevertContainerSnapshotRequest) returns (google.protobuf.Empty);
+    rpc DeleteContainerSnapshot(DeleteContainerSnapshotRequest) returns (google.protobuf.Empty);
 
     // ── Stats ──
     rpc GetVMStats(GetVMStatsRequest)       returns (VMStats);

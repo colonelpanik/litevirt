@@ -180,6 +180,9 @@ type ContainerRuntime interface {
 	// FreezeContainer before exporting.
 	ExportContainer(ctx context.Context, name string, w io.Writer) error
 	ImportContainer(ctx context.Context, name string, r io.Reader) error
+	// RevertContainer replaces a stopped container's on-disk dir from a snapshot
+	// tar in place (B2 snapshot revert — clobbers).
+	RevertContainer(ctx context.Context, name string, r io.Reader) error
 	PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error
 }
 

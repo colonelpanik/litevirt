@@ -132,6 +132,10 @@ const (
 	LiteVirt_BackupContainer_FullMethodName            = "/litevirt.v1.LiteVirt/BackupContainer"
 	LiteVirt_RestoreContainer_FullMethodName           = "/litevirt.v1.LiteVirt/RestoreContainer"
 	LiteVirt_MigrateContainer_FullMethodName           = "/litevirt.v1.LiteVirt/MigrateContainer"
+	LiteVirt_SnapshotContainer_FullMethodName          = "/litevirt.v1.LiteVirt/SnapshotContainer"
+	LiteVirt_ListContainerSnapshots_FullMethodName     = "/litevirt.v1.LiteVirt/ListContainerSnapshots"
+	LiteVirt_RevertContainerSnapshot_FullMethodName    = "/litevirt.v1.LiteVirt/RevertContainerSnapshot"
+	LiteVirt_DeleteContainerSnapshot_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteContainerSnapshot"
 	LiteVirt_GetVMStats_FullMethodName                 = "/litevirt.v1.LiteVirt/GetVMStats"
 	LiteVirt_GetHostStats_FullMethodName               = "/litevirt.v1.LiteVirt/GetHostStats"
 	LiteVirt_GetClusterStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterStatus"
@@ -363,6 +367,10 @@ type LiteVirtClient interface {
 	BackupContainer(ctx context.Context, in *BackupContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupContainerProgress], error)
 	RestoreContainer(ctx context.Context, in *RestoreContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreContainerProgress], error)
 	MigrateContainer(ctx context.Context, in *MigrateContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateContainerProgress], error)
+	SnapshotContainer(ctx context.Context, in *SnapshotContainerRequest, opts ...grpc.CallOption) (*ContainerSnapshot, error)
+	ListContainerSnapshots(ctx context.Context, in *ListContainerSnapshotsRequest, opts ...grpc.CallOption) (*ListContainerSnapshotsResponse, error)
+	RevertContainerSnapshot(ctx context.Context, in *RevertContainerSnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	DeleteContainerSnapshot(ctx context.Context, in *DeleteContainerSnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Stats ──
 	GetVMStats(ctx context.Context, in *GetVMStatsRequest, opts ...grpc.CallOption) (*VMStats, error)
 	GetHostStats(ctx context.Context, in *GetHostStatsRequest, opts ...grpc.CallOption) (*HostResourceStats, error)
@@ -1811,6 +1819,46 @@ func (c *liteVirtClient) MigrateContainer(ctx context.Context, in *MigrateContai
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_MigrateContainerClient = grpc.ServerStreamingClient[MigrateContainerProgress]
 
+func (c *liteVirtClient) SnapshotContainer(ctx context.Context, in *SnapshotContainerRequest, opts ...grpc.CallOption) (*ContainerSnapshot, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ContainerSnapshot)
+	err := c.cc.Invoke(ctx, LiteVirt_SnapshotContainer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListContainerSnapshots(ctx context.Context, in *ListContainerSnapshotsRequest, opts ...grpc.CallOption) (*ListContainerSnapshotsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListContainerSnapshotsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListContainerSnapshots_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RevertContainerSnapshot(ctx context.Context, in *RevertContainerSnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_RevertContainerSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) DeleteContainerSnapshot(ctx context.Context, in *DeleteContainerSnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_DeleteContainerSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetVMStats(ctx context.Context, in *GetVMStatsRequest, opts ...grpc.CallOption) (*VMStats, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VMStats)
@@ -2820,6 +2868,10 @@ type LiteVirtServer interface {
 	BackupContainer(*BackupContainerRequest, grpc.ServerStreamingServer[BackupContainerProgress]) error
 	RestoreContainer(*RestoreContainerRequest, grpc.ServerStreamingServer[RestoreContainerProgress]) error
 	MigrateContainer(*MigrateContainerRequest, grpc.ServerStreamingServer[MigrateContainerProgress]) error
+	SnapshotContainer(context.Context, *SnapshotContainerRequest) (*ContainerSnapshot, error)
+	ListContainerSnapshots(context.Context, *ListContainerSnapshotsRequest) (*ListContainerSnapshotsResponse, error)
+	RevertContainerSnapshot(context.Context, *RevertContainerSnapshotRequest) (*emptypb.Empty, error)
+	DeleteContainerSnapshot(context.Context, *DeleteContainerSnapshotRequest) (*emptypb.Empty, error)
 	// ── Stats ──
 	GetVMStats(context.Context, *GetVMStatsRequest) (*VMStats, error)
 	GetHostStats(context.Context, *GetHostStatsRequest) (*HostResourceStats, error)
@@ -3303,6 +3355,18 @@ func (UnimplementedLiteVirtServer) RestoreContainer(*RestoreContainerRequest, gr
 }
 func (UnimplementedLiteVirtServer) MigrateContainer(*MigrateContainerRequest, grpc.ServerStreamingServer[MigrateContainerProgress]) error {
 	return status.Error(codes.Unimplemented, "method MigrateContainer not implemented")
+}
+func (UnimplementedLiteVirtServer) SnapshotContainer(context.Context, *SnapshotContainerRequest) (*ContainerSnapshot, error) {
+	return nil, status.Error(codes.Unimplemented, "method SnapshotContainer not implemented")
+}
+func (UnimplementedLiteVirtServer) ListContainerSnapshots(context.Context, *ListContainerSnapshotsRequest) (*ListContainerSnapshotsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListContainerSnapshots not implemented")
+}
+func (UnimplementedLiteVirtServer) RevertContainerSnapshot(context.Context, *RevertContainerSnapshotRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RevertContainerSnapshot not implemented")
+}
+func (UnimplementedLiteVirtServer) DeleteContainerSnapshot(context.Context, *DeleteContainerSnapshotRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteContainerSnapshot not implemented")
 }
 func (UnimplementedLiteVirtServer) GetVMStats(context.Context, *GetVMStatsRequest) (*VMStats, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVMStats not implemented")
@@ -5395,6 +5459,78 @@ func _LiteVirt_MigrateContainer_Handler(srv interface{}, stream grpc.ServerStrea
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_MigrateContainerServer = grpc.ServerStreamingServer[MigrateContainerProgress]
 
+func _LiteVirt_SnapshotContainer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SnapshotContainerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SnapshotContainer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SnapshotContainer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SnapshotContainer(ctx, req.(*SnapshotContainerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListContainerSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListContainerSnapshotsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListContainerSnapshots(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListContainerSnapshots_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListContainerSnapshots(ctx, req.(*ListContainerSnapshotsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RevertContainerSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RevertContainerSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RevertContainerSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RevertContainerSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RevertContainerSnapshot(ctx, req.(*RevertContainerSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_DeleteContainerSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteContainerSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).DeleteContainerSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_DeleteContainerSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).DeleteContainerSnapshot(ctx, req.(*DeleteContainerSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetVMStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetVMStatsRequest)
 	if err := dec(in); err != nil {
@@ -7179,6 +7315,22 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PullOCIImage",
 			Handler:    _LiteVirt_PullOCIImage_Handler,
+		},
+		{
+			MethodName: "SnapshotContainer",
+			Handler:    _LiteVirt_SnapshotContainer_Handler,
+		},
+		{
+			MethodName: "ListContainerSnapshots",
+			Handler:    _LiteVirt_ListContainerSnapshots_Handler,
+		},
+		{
+			MethodName: "RevertContainerSnapshot",
+			Handler:    _LiteVirt_RevertContainerSnapshot_Handler,
+		},
+		{
+			MethodName: "DeleteContainerSnapshot",
+			Handler:    _LiteVirt_DeleteContainerSnapshot_Handler,
 		},
 		{
 			MethodName: "GetVMStats",

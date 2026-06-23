@@ -52,6 +52,11 @@ type fakeCTRuntime struct {
 	imported      map[string][]byte
 	exportErr     error
 	importErr     error
+
+	// B2 snapshot revert: captures bytes handed to RevertContainer keyed by name;
+	// revertErr injects a failure.
+	reverted  map[string][]byte
+	revertErr error
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -150,6 +155,19 @@ func (f *fakeCTRuntime) ImportContainer(_ context.Context, name string, r io.Rea
 		f.imported = map[string][]byte{}
 	}
 	f.imported[name] = data
+	return nil
+}
+func (f *fakeCTRuntime) RevertContainer(_ context.Context, name string, r io.Reader) error {
+	data, _ := io.ReadAll(r)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.revertErr != nil {
+		return f.revertErr
+	}
+	if f.reverted == nil {
+		f.reverted = map[string][]byte{}
+	}
+	f.reverted[name] = data
 	return nil
 }
 func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return nil, nil }

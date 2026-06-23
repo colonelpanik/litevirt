@@ -113,6 +113,10 @@ type Runtime interface {
 	// produced by ExportContainer, then rewrites the config's rootfs path so it
 	// is valid at this host's lxcpath. The container is left stopped.
 	ImportContainer(ctx context.Context, name string, r io.Reader) error
+	// RevertContainer replaces an EXISTING container's on-disk dir from a
+	// snapshot tar (in-place snapshot revert — clobbers). The container must be
+	// stopped first.
+	RevertContainer(ctx context.Context, name string, r io.Reader) error
 }
 
 // CreateOpts collects parameters for Runtime.Create.
@@ -448,26 +452,61 @@ func (r *LxcRunner) ExportContainer(ctx context.Context, name string, w io.Write
 // this host's layout (the archived config may carry the source host's path).
 // It refuses to clobber an existing container directory.
 func (r *LxcRunner) ImportContainer(ctx context.Context, name string, src io.Reader) error {
+	return r.importContainer(ctx, name, src, false)
+}
+
+// RevertContainer replaces an EXISTING container's on-disk dir from a snapshot
+// tar (produced by ExportContainer): it removes <lxcpath>/<name> and extracts
+// the tar in its place, then rewrites lxc.rootfs.path. Unlike ImportContainer it
+// clobbers — it's the in-place snapshot-revert path. The container MUST be
+// stopped first (the caller stops it); replacing the rootfs of a running
+// container is unsafe.
+func (r *LxcRunner) RevertContainer(ctx context.Context, name string, src io.Reader) error {
+	return r.importContainer(ctx, name, src, true)
+}
+
+// importContainer is the shared extract path. replace=false refuses to clobber
+// (fresh import/restore); replace=true renames any existing dir aside first and
+// restores it on failure (crash-safe snapshot revert — a corrupt snapshot tar
+// can never lose the live container).
+func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Reader, replace bool) error {
 	dir := filepath.Join(r.lxcpath(), name)
+	var backup string
 	if _, err := os.Stat(dir); err == nil {
-		return fmt.Errorf("container dir %s already exists; refusing to overwrite", dir)
+		if !replace {
+			return fmt.Errorf("container dir %s already exists; refusing to overwrite", dir)
+		}
+		// Move the current dir aside rather than deleting it, so we can roll
+		// back if the extract fails.
+		backup = dir + ".revert-old"
+		_ = os.RemoveAll(backup) // clear any stale backup from a prior crash
+		if err := os.Rename(dir, backup); err != nil {
+			return fmt.Errorf("set aside existing dir %s for revert: %w", dir, err)
+		}
+	}
+	// rollback restores the set-aside dir on any failure past this point.
+	rollback := func(cause error) error {
+		_ = os.RemoveAll(dir)
+		if backup != "" {
+			_ = os.Rename(backup, dir)
+		}
+		return cause
 	}
 	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
-		return fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err)
+		return rollback(fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err))
 	}
 	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner", "-xf", "-")
 	stderr := strings.Builder{}
 	cmd.Stderr = stringWriter{&stderr}
 	cmd.Stdin = src
 	if err := cmd.Run(); err != nil {
-		// Clean up a partial extraction so a retry isn't blocked by the
-		// "already exists" guard above.
-		_ = os.RemoveAll(dir)
-		return fmt.Errorf("tar import %s: %w: %s", name, err, stderr.String())
+		return rollback(fmt.Errorf("tar import %s: %w: %s", name, err, stderr.String()))
 	}
 	if err := r.rewriteRootFSPath(name); err != nil {
-		_ = os.RemoveAll(dir)
-		return err
+		return rollback(err)
+	}
+	if backup != "" {
+		_ = os.RemoveAll(backup) // success — drop the old copy
 	}
 	return nil
 }

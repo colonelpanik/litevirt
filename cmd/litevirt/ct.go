@@ -37,7 +37,115 @@ func newCTCmd() *cobra.Command {
 		newCTBackupCmd(),
 		newCTRestoreCmd(),
 		newCTMigrateCmd(),
+		newCTSnapshotCmd(),
 	)
+	return cmd
+}
+
+// newCTSnapshotCmd groups container snapshot subcommands.
+func newCTSnapshotCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "snapshot",
+		Short: "Manage container snapshots (freeze+tar point-in-time copies)",
+	}
+	cmd.AddCommand(
+		newCTSnapshotCreateCmd(),
+		newCTSnapshotLsCmd(),
+		newCTSnapshotRevertCmd(),
+		newCTSnapshotRmCmd(),
+	)
+	return cmd
+}
+
+func newCTSnapshotCreateCmd() *cobra.Command {
+	var host string
+	cmd := &cobra.Command{
+		Use:   "create <name> <snapshot>",
+		Short: "Snapshot a container",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				snap, err := c.SnapshotContainer(ctx, &pb.SnapshotContainerRequest{
+					Name: args[0], HostName: host, Snapshot: args[1],
+				})
+				if err != nil {
+					return err
+				}
+				fmt.Printf("snapshot %q created for %s (%s)\n", snap.Name, snap.CtName, formatBytes(snap.SizeBytes))
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
+	return cmd
+}
+
+func newCTSnapshotLsCmd() *cobra.Command {
+	var host string
+	cmd := &cobra.Command{
+		Use:   "ls <name>",
+		Short: "List a container's snapshots",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.ListContainerSnapshots(ctx, &pb.ListContainerSnapshotsRequest{Name: args[0], HostName: host})
+				if err != nil {
+					return err
+				}
+				w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+				fmt.Fprintln(w, "NAME\tTYPE\tSIZE\tCREATED")
+				for _, s := range resp.Snapshots {
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.Name, s.Type, formatBytes(s.SizeBytes), s.CreatedAt)
+				}
+				return w.Flush()
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
+	return cmd
+}
+
+func newCTSnapshotRevertCmd() *cobra.Command {
+	var host string
+	cmd := &cobra.Command{
+		Use:   "revert <name> <snapshot>",
+		Short: "Revert a container to a snapshot (stops, restores, restarts if it was running)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.RevertContainerSnapshot(ctx, &pb.RevertContainerSnapshotRequest{
+					Name: args[0], HostName: host, Snapshot: args[1],
+				}); err != nil {
+					return err
+				}
+				fmt.Printf("%s reverted to snapshot %q\n", args[0], args[1])
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
+	return cmd
+}
+
+func newCTSnapshotRmCmd() *cobra.Command {
+	var host string
+	cmd := &cobra.Command{
+		Use:   "rm <name> <snapshot>",
+		Short: "Delete a container snapshot",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.DeleteContainerSnapshot(ctx, &pb.DeleteContainerSnapshotRequest{
+					Name: args[0], HostName: host, Snapshot: args[1],
+				}); err != nil {
+					return err
+				}
+				fmt.Printf("snapshot %q deleted\n", args[1])
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
 	return cmd
 }
 

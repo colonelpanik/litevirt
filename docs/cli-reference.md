@@ -146,6 +146,10 @@ lv ct exec <name> -- <cmd> [args...]
 lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
 lv ct migrate <name> <target-host> --repo <shared-dir> # cold-migrate (stop → transfer → start)
+lv ct snapshot create <name> <snapshot>                # freeze+tar point-in-time snapshot
+lv ct snapshot ls <name>                               # list a container's snapshots
+lv ct snapshot revert <name> <snapshot>                # roll back (stop → restore → restart)
+lv ct snapshot rm <name> <snapshot>                    # delete a snapshot
 ```
 
 `--local` runs against the local lxc-* binaries instead of the gRPC service

@@ -283,6 +283,28 @@ How it works and what to expect:
 - **Quota.** A container's backup footprint draws down the **same `backup_gib`
   project budget** as VM backups.
 
+## Snapshots
+
+```bash
+lv ct snapshot create web before-upgrade   # point-in-time snapshot
+lv ct snapshot ls web
+lv ct snapshot revert web before-upgrade    # roll back to it
+lv ct snapshot rm web before-upgrade
+```
+
+A snapshot freezes a running container (for a consistent point-in-time), tars
+its on-disk dir, and stores it **host-local** under `{dataDir}/ct-snapshots`.
+
+- **Revert** stops the container (replacing the rootfs requires it stopped),
+  restores the snapshot in place, and restarts it if it had been running. The
+  restore is **crash-safe** — the live dir is set aside and rolled back if the
+  snapshot extract fails, so a corrupt snapshot can never lose the container.
+- **Host-local**, like the container itself; snapshot ops run on the owning host
+  (the daemon forwards there automatically).
+- Snapshots are full copies today (no dedup); **COW acceleration** on
+  btrfs/zfs/lvm-thin rootfs is a planned follow-up. For space-efficient,
+  off-host point-in-time copies use `lv ct backup` (dedup chunk store).
+
 ## Cold migration
 
 ```bash
@@ -321,9 +343,10 @@ was running it's restarted on the target.
 
 ## What's still in flight
 
-- Per-container snapshots (LXC has native snapshot support, but
-  litevirt's snapshot RPC is VM-only today). Backup/restore has shipped
-  (see above); snapshots are the next day-2 feature.
+- COW snapshot acceleration — snapshots have shipped (freeze+tar, see above);
+  instant copy-on-write snapshots on a btrfs/zfs/lvm-thin rootfs are a follow-up
+  (containers have no pool association today, so the rootfs filesystem would be
+  detected at snapshot time).
 - Cross-host container backup/restore streaming — today, like VM backup,
   a container is archived on its owning host (run against `LV_HOST`); a
   relay so any entry node can drive it is a follow-up.

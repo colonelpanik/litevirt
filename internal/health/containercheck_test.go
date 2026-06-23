@@ -64,6 +64,10 @@ func (f *fakeCtRuntime) ImportContainer(ctx context.Context, name string, r io.R
 	_, err := io.Copy(io.Discard, r)
 	return err
 }
+func (f *fakeCtRuntime) RevertContainer(ctx context.Context, name string, r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
+}
 func (f *fakeCtRuntime) List(ctx context.Context) ([]string, error) {
 	out := make([]string, 0, len(f.states))
 	for n := range f.states {

@@ -109,3 +109,94 @@ func TestAuditChain_NullHashIsResetPoint(t *testing.T) {
 		t.Errorf("expected at least 2 rows checked, got %d", checked)
 	}
 }
+
+// ins is a test helper that appends one audit row for the named host,
+// at an explicit timestamp, through the real chain code.
+func ins(t *testing.T, c *Client, id, host, ts string) {
+	t.Helper()
+	if err := InsertAuditLog(context.Background(), c, AuditRecord{
+		ID: id, Username: "u", HostName: host,
+		Action: "vm.start", Target: "x", Result: "ok", Timestamp: ts,
+	}); err != nil {
+		t.Fatalf("InsertAuditLog %s: %v", id, err)
+	}
+}
+
+// TestAuditChain_MultiHost_InterleavedTimestamps_Clean is the core
+// regression: two daemons (two processes) append concurrently, so their
+// rows interleave by global timestamp (a1,b1,a2,b2). A single global
+// chain would break at the first cross-host row; per-host sub-chains must
+// verify clean. ResetChainStateForTests() between the two stands in for
+// the second daemon's separate process.
+func TestAuditChain_MultiHost_InterleavedTimestamps_Clean(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	// Host A's daemon writes a1@:01, a2@:03.
+	ResetChainStateForTests()
+	ins(t, c, "a1", "hostA", "2026-06-23T10:00:01Z")
+	ins(t, c, "a2", "hostA", "2026-06-23T10:00:03Z")
+	// Host B's daemon (separate process) writes b1@:02, b2@:04 — interleaved.
+	ResetChainStateForTests()
+	ins(t, c, "b1", "hostB", "2026-06-23T10:00:02Z")
+	ins(t, c, "b2", "hostB", "2026-06-23T10:00:04Z")
+
+	checked, broken, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if broken != "" {
+		t.Errorf("interleaved multi-host chain should verify per-host; broke at %q", broken)
+	}
+	if checked != 4 {
+		t.Errorf("checked %d rows, want 4", checked)
+	}
+}
+
+// TestAuditChain_ResealFixesLegacyGlobalChain simulates the old global
+// model (one process chains host B's row off host A's tail) and proves
+// VerifyAuditChain flags it, then ResealAuditChain re-bases host B's
+// sub-chain so the verify passes.
+func TestAuditChain_ResealFixesLegacyGlobalChain(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	// Old bug: NO reset between hosts, so b1 chains off a1's hash.
+	ResetChainStateForTests()
+	ins(t, c, "a1", "hostA", "2026-06-23T10:00:01Z")
+	ins(t, c, "b1", "hostB", "2026-06-23T10:00:02Z") // global-chained off a1
+
+	if _, broken, _ := VerifyAuditChain(ctx, c); broken != "b1" {
+		t.Fatalf("expected per-host verify to break at b1 (legacy global link), got %q", broken)
+	}
+
+	n, err := ResealAuditChain(ctx, c, "hostB")
+	if err != nil {
+		t.Fatalf("ResealAuditChain: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("resealed %d rows, want 1 (b1 re-based to genesis)", n)
+	}
+	if _, broken, _ := VerifyAuditChain(ctx, c); broken != "" {
+		t.Errorf("after reseal the chain should be clean; broke at %q", broken)
+	}
+}
+
+// TestResealAuditChain_Idempotent: re-sealing an already-consistent
+// per-host chain rewrites nothing.
+func TestResealAuditChain_Idempotent(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+	ResetChainStateForTests()
+	ins(t, c, "a1", "hostA", "2026-06-23T10:00:01Z")
+	ins(t, c, "a2", "hostA", "2026-06-23T10:00:02Z")
+	ins(t, c, "a3", "hostA", "2026-06-23T10:00:03Z")
+
+	n, err := ResealAuditChain(ctx, c, "hostA")
+	if err != nil {
+		t.Fatalf("ResealAuditChain: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("reseal of an already-consistent chain rewrote %d rows, want 0", n)
+	}
+}

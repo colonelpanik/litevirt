@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -27,13 +28,16 @@ type AuditRecord struct {
 	ContentHash string
 }
 
-// chainState tracks the in-flight tail hash per Corrosion client.
-// We can't read-then-write the last row atomically across replicators
-// (mutation_log is the source of truth) so each daemon hashes against
-// its own local view. Cross-host gaps (a row arrives via Crescent
-// after a local row was hashed) show up as chain breaks at verify
-// time — the operator sees the chain reset and knows which row
-// arrived out-of-band.
+// chainState tracks the in-flight tail hash for THIS host's audit
+// sub-chain. The audit_log is a multi-writer table — every daemon
+// appends its own rows and they all replicate via Crescent — so a
+// single global hash-chain can never stay linear (two hosts writing
+// concurrently interleave by timestamp and fork the chain). Instead
+// each host maintains its OWN per-host sub-chain: a row's prev_hash
+// links to the previous row written by the SAME host. A daemon only
+// ever authors rows for its own host, so this sub-chain is fully local
+// and unaffected by cross-host interleaving or replication ordering.
+// VerifyAuditChain validates each host's sub-chain independently.
 type chainState struct {
 	mu       sync.Mutex
 	tailHash string
@@ -59,15 +63,18 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	defer auditChainState.mu.Unlock()
 
 	if !auditChainState.known {
-		// First insert in this process — bootstrap from the most-
-		// recent row already in the DB.
-		rows, err := c.Query(ctx,
-			`SELECT content_hash FROM audit_log
-			 WHERE content_hash IS NOT NULL
-			 ORDER BY timestamp DESC, id DESC
-			 LIMIT 1`)
-		if err == nil && len(rows) > 0 {
-			auditChainState.tailHash = rows[0].String("content_hash")
+		// First insert in this process — bootstrap THIS host's sub-chain.
+		// re-base any legacy rows that were written under the old global
+		// chain (prev_hash linking across hosts) into a clean per-host
+		// chain, returning the resealed tail. Idempotent: once a host's
+		// rows are consistent, this makes no writes and just reads the tail.
+		tail, resealed, err := resealHostChainLocked(ctx, c, r.HostName)
+		if err == nil {
+			auditChainState.tailHash = tail
+			if resealed > 0 {
+				slog.Info("audit: re-based legacy rows into per-host chain",
+					"host", r.HostName, "rows", resealed)
+			}
 		}
 		auditChainState.known = true
 	}
@@ -117,35 +124,104 @@ func HashAuditRow(r AuditRecord) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// VerifyAuditChain replays every row in the audit_log (oldest first)
-// and confirms each content_hash matches HashAuditRow(row, prev_hash).
+// VerifyAuditChain validates every host's audit sub-chain independently
+// and confirms each content_hash matches HashAuditRow(row, prev_hash)
+// where prev_hash links to the previous row written by the SAME host.
+// Ordering rows by (host, timestamp, id) makes each host's sub-chain
+// contiguous; a per-host running tail tracks the expected prev_hash.
 // Rows with a NULL content_hash are treated as chain-reset points
-// (rows predating the audit hash-chain, or rows that arrived via
-// Crescent before upgrade). The first verification failure
-// short-circuits and is
-// returned to the caller.
+// (rows predating the audit hash-chain). The first verification failure
+// short-circuits and is returned to the caller.
+//
+// This is the multi-writer-correct verification: a single global chain
+// can't stay linear when N daemons append concurrently, but each host's
+// own sub-chain is linear and tamper-evident.
 //
 // Returns (rowsChecked, brokenAt, err). brokenAt is the ID of the
-// first row whose hash does not match; "" when the chain is intact.
+// first row whose hash does not match; "" when every chain is intact.
 func VerifyAuditChain(ctx context.Context, c *Client) (int, string, error) {
 	rows, err := c.Query(ctx,
 		`SELECT id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash
 		 FROM audit_log
-		 ORDER BY timestamp ASC, id ASC`)
+		 ORDER BY host_name ASC, timestamp ASC, id ASC`)
 	if err != nil {
 		return 0, "", fmt.Errorf("list audit_log: %w", err)
 	}
-	prev := ""
+	prevByHost := map[string]string{} // per-host running tail
 	checked := 0
 	for _, r := range rows {
+		host := r.String("host_name")
 		stored := r.String("content_hash")
 		if stored == "" {
-			// Chain-reset point — accept and continue. Reset prev
-			// so we don't poison subsequent rows.
-			prev = ""
+			// Chain-reset point — accept and reset this host's tail so we
+			// don't poison subsequent rows of the same host.
+			prevByHost[host] = ""
 			checked++
 			continue
 		}
+		rec := AuditRecord{
+			ID:        r.String("id"),
+			Timestamp: r.String("timestamp"),
+			Username:  r.String("username"),
+			HostName:  host,
+			Action:    r.String("action"),
+			Target:    r.String("target"),
+			Detail:    r.String("detail"),
+			Result:    r.String("result"),
+			PrevHash:  prevByHost[host],
+		}
+		expect := HashAuditRow(rec)
+		if !strings.EqualFold(expect, stored) {
+			return checked, rec.ID, nil
+		}
+		prevByHost[host] = stored
+		checked++
+	}
+	return checked, "", nil
+}
+
+// ResealAuditChain re-bases one host's audit rows into a clean per-host
+// hash-chain and returns the number of rows rewritten. It's the recovery
+// path for rows written under the old global-chain model (whose prev_hash
+// linked across hosts and so can't verify per-host). Idempotent: once a
+// host's sub-chain is consistent it rewrites nothing. A daemon only
+// reseals its OWN host's rows, so cluster-wide healing needs no
+// coordination — each node fixes the sub-chain it authored.
+//
+// Re-sealing rewrites tamper-evidence hashes, so it re-bases trust to the
+// current state. That's sound here because the global chain it replaces is
+// already unverifiable; the per-host chain it produces is tamper-evident
+// for every write from this point forward.
+func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, error) {
+	auditChainState.mu.Lock()
+	defer auditChainState.mu.Unlock()
+	tail, resealed, err := resealHostChainLocked(ctx, c, hostName)
+	if err != nil {
+		return 0, err
+	}
+	auditChainState.tailHash = tail
+	auditChainState.known = true
+	return resealed, nil
+}
+
+// resealHostChainLocked walks hostName's rows oldest-first, recomputes the
+// per-host prev_hash/content_hash chain, and UPDATEs any row whose stored
+// content_hash differs. Returns the resealed tail hash + rows rewritten.
+// Caller must hold auditChainState.mu. A host authors all its own rows
+// locally, so the local DB has the complete sub-chain even right after a
+// restart (replication only brings OTHER hosts' rows).
+func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (string, int, error) {
+	rows, err := c.Query(ctx,
+		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash
+		 FROM audit_log
+		 WHERE host_name = ?
+		 ORDER BY timestamp ASC, id ASC`, hostName)
+	if err != nil {
+		return "", 0, fmt.Errorf("list host audit rows: %w", err)
+	}
+	prev := ""
+	resealed := 0
+	for _, r := range rows {
 		rec := AuditRecord{
 			ID:        r.String("id"),
 			Timestamp: r.String("timestamp"),
@@ -157,14 +233,18 @@ func VerifyAuditChain(ctx context.Context, c *Client) (int, string, error) {
 			Result:    r.String("result"),
 			PrevHash:  prev,
 		}
-		expect := HashAuditRow(rec)
-		if !strings.EqualFold(expect, stored) {
-			return checked, rec.ID, nil
+		newHash := HashAuditRow(rec)
+		if !strings.EqualFold(newHash, r.String("content_hash")) {
+			if err := c.Execute(ctx,
+				`UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`,
+				prev, newHash, rec.ID); err != nil {
+				return "", resealed, fmt.Errorf("reseal row %s: %w", rec.ID, err)
+			}
+			resealed++
 		}
-		prev = stored
-		checked++
+		prev = newHash
 	}
-	return checked, "", nil
+	return prev, resealed, nil
 }
 
 // ResetChainStateForTests forgets the cached tail so a test can

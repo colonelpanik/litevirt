@@ -86,17 +86,35 @@ func (s *Server) buildContainerRequest(ctx context.Context, instanceName string,
 	}
 
 	for _, n := range d.Network {
+		// Resolve against the SCOPED network name. Compose registers each network
+		// as "<stack>_<name>", and an isolated network's host bridge is derived
+		// from that scoped name (br-iso-<hash>). Resolving the bare name misses
+		// the lookup and returns an invalid bridge, so the container's veth can't
+		// attach and lxc-start aborts (the VM path scopes it the same way).
+		scoped := compose.ScopedNetworkName(f.Name, n.Name)
+		ipCIDR, bareIP := n.IP, n.IP
+		if n.IP != "" {
+			if addr, _, hasPrefix := strings.Cut(n.IP, "/"); hasPrefix {
+				bareIP = addr // caller already supplied a CIDR
+			} else if def := lookupNetworkDef(ctx, s.db, scoped); def != nil {
+				// lxc.net.*.ipv4.address needs addr/prefix; compose NICs carry a
+				// bare IP, so borrow the prefix from the network's subnet.
+				if _, bits, ok := strings.Cut(def.Subnet, "/"); ok && bits != "" {
+					ipCIDR = n.IP + "/" + bits
+				}
+			}
+		}
 		req.Networks = append(req.Networks, &pb.ContainerNetwork{
 			Name:   n.Name,
-			Bridge: resolveBridge(ctx, s.db, n.Name),
-			Ip:     n.IP,
+			Bridge: resolveBridge(ctx, s.db, scoped),
+			Ip:     ipCIDR,
 			Mac:    n.MAC,
 		})
-		// Record the first static address so the container can be discovered as
-		// an LB backend cluster-wide (see corrosion.LabelIP). DHCP NICs (no IP)
-		// are resolved locally on the LB host at apply time instead.
-		if n.IP != "" && labels[corrosion.LabelIP] == "" {
-			labels[corrosion.LabelIP] = n.IP
+		// Record the bare address so the container can be discovered as an LB
+		// backend cluster-wide (see corrosion.LabelIP). DHCP NICs (no IP) are
+		// resolved locally on the LB host at apply time instead.
+		if bareIP != "" && labels[corrosion.LabelIP] == "" {
+			labels[corrosion.LabelIP] = bareIP
 		}
 	}
 	return req, nil

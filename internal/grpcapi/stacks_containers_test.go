@@ -7,7 +7,43 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/network"
 )
+
+// A container NIC on a stack's isolated network must resolve to the real host
+// bridge (br-iso-<hash> derived from the SCOPED network name) and carry a CIDR
+// address — not the bare logical name / bare IP, which made lxc-start abort
+// ("bridge interface doesn't exist") in the live test.
+func TestBuildContainerRequest_ScopedBridgeAndCIDR(t *testing.T) {
+	s := testServerR2(t)
+	ctx := context.Background()
+	f := &compose.File{Name: "lbmix"}
+
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
+		Name: "lbmix_lbnet", Type: "isolated", Config: `{"subnet":"10.77.0.0/24"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := s.buildContainerRequest(ctx, "web", &compose.VMDef{
+		Kind: compose.WorkloadKindLXC, Image: "alpine:3.21",
+		Network: []compose.NetworkAttachment{{Name: "lbnet", IP: "10.77.0.20"}},
+	}, f, "h")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	wantBridge := network.IsolatedBridgeName("lbmix_lbnet")
+	if req.Networks[0].Bridge != wantBridge {
+		t.Errorf("bridge = %q, want %q (scoped isolated bridge, not the logical name)", req.Networks[0].Bridge, wantBridge)
+	}
+	if req.Networks[0].Ip != "10.77.0.20/24" {
+		t.Errorf("nic IP = %q, want 10.77.0.20/24 (CIDR from subnet prefix)", req.Networks[0].Ip)
+	}
+	// The LB-backend label keeps the bare address (HAProxy needs host:port).
+	if req.Labels[corrosion.LabelIP] != "10.77.0.20" {
+		t.Errorf("LabelIP = %q, want bare 10.77.0.20", req.Labels[corrosion.LabelIP])
+	}
+}
 
 // buildContainerRequest maps a compose container workload to a
 // CreateContainerRequest: download templates, rootfs paths, restart, networks;

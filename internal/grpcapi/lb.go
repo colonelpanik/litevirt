@@ -316,24 +316,64 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 	}
 
 	// VIP health: an enabled LB is "degraded" when its VIP isn't actually
-	// assigned. The reliable signal is keepalived NOT running on a host that is
-	// supposed to run this LB — HAProxy binds the VIP non-locally, so without
-	// this check a down-VIP LB would still look "active". We only assert this
-	// when inspecting ON an LB host (runsHere); a precise remote keepalived
-	// check would need an additive RPC and is a documented follow-up. (Stats
-	// being unreachable is NOT treated as degraded — that conflates "can't ask"
-	// with "VIP down".)
-	if state == "active" {
-		for _, h := range lbHosts {
-			if h == s.hostName {
-				if !s.lbKeepalivedRunning(result.Name) {
-					result.State = "degraded"
-				}
-				break
+	// assigned anywhere. HAProxy binds the VIP non-locally, so without this a
+	// down-VIP LB would still look "active". Checks keepalived across all target
+	// hosts (local directly, remote via RPC).
+	if state == "active" && s.lbVIPDegraded(ctx, result.Name, lbHosts) {
+		result.State = "degraded"
+	}
+	return result, nil
+}
+
+// lbVIPDegraded reports whether an LB's VIP looks unassigned: across its target
+// hosts, at least one answered the keepalived check AND none reported running
+// (for a multi-host LB, one live keepalived can hold the VIP via VRRP, so any-up
+// = healthy). Local hosts use the direct check; remote hosts use the RPC. An
+// old peer that doesn't implement the RPC (or is unreachable) isn't counted as
+// an answer — so we never falsely mark degraded in a mixed-version cluster.
+func (s *Server) lbVIPDegraded(ctx context.Context, name string, lbHosts []string) bool {
+	anyUp, anyAnswered := false, false
+	for _, h := range lbHosts {
+		if h == s.hostName {
+			anyAnswered = true
+			if s.lbKeepalivedRunning(name) {
+				anyUp = true
+			}
+			continue
+		}
+		if running, ok := s.remoteLBKeepalived(ctx, h, name); ok {
+			anyAnswered = true
+			if running {
+				anyUp = true
 			}
 		}
 	}
-	return result, nil
+	return anyAnswered && !anyUp
+}
+
+// remoteLBKeepalived asks a peer whether its keepalived for the LB is running.
+// ok=false when the peer is unreachable or runs a version without the RPC
+// (Unimplemented) — the caller then doesn't treat it as a definitive answer.
+func (s *Server) remoteLBKeepalived(ctx context.Context, host, name string) (running, ok bool) {
+	client, conn, err := s.peerClient(ctx, host)
+	if err != nil {
+		return false, false
+	}
+	defer conn.Close()
+	resp, err := client.LBKeepalivedRunning(ctx, &pb.LBKeepalivedRequest{Name: name})
+	if err != nil {
+		return false, false
+	}
+	return resp.Running, true
+}
+
+// LBKeepalivedRunning reports whether THIS host's keepalived for the LB is alive
+// (VIP assignable). Peers call it for InspectLoadBalancer's remote VIP-health.
+func (s *Server) LBKeepalivedRunning(ctx context.Context, req *pb.LBKeepalivedRequest) (*pb.LBKeepalivedResponse, error) {
+	if err := RequireRole(ctx, "viewer"); err != nil {
+		return nil, err
+	}
+	return &pb.LBKeepalivedResponse{Running: s.lbKeepalivedRunning(req.Name)}, nil
 }
 
 // lbKeepalivedRunning reports whether this host's keepalived for an LB is alive

@@ -1268,6 +1268,10 @@ service LiteVirt {
     rpc EnableBackend(EnableBackendRequest)        returns (LoadBalancer);
     rpc ApplyLB(ApplyLBRequest)                   returns (google.protobuf.Empty);
     rpc RemoveLB(RemoveLBRequest)                 returns (google.protobuf.Empty);
+    // LBKeepalivedRunning reports whether THIS host's keepalived for an LB is
+    // running (VIP assignable). Used by InspectLoadBalancer to assess a remote
+    // LB host's VIP health. Additive: old peers return Unimplemented.
+    rpc LBKeepalivedRunning(LBKeepalivedRequest)  returns (LBKeepalivedResponse);
 
     // ── Users & Auth ──
     rpc Login(LoginRequest)              returns (LoginResponse);

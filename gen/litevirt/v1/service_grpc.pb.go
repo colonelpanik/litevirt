@@ -94,6 +94,7 @@ const (
 	LiteVirt_EnableBackend_FullMethodName              = "/litevirt.v1.LiteVirt/EnableBackend"
 	LiteVirt_ApplyLB_FullMethodName                    = "/litevirt.v1.LiteVirt/ApplyLB"
 	LiteVirt_RemoveLB_FullMethodName                   = "/litevirt.v1.LiteVirt/RemoveLB"
+	LiteVirt_LBKeepalivedRunning_FullMethodName        = "/litevirt.v1.LiteVirt/LBKeepalivedRunning"
 	LiteVirt_Login_FullMethodName                      = "/litevirt.v1.LiteVirt/Login"
 	LiteVirt_ListRealms_FullMethodName                 = "/litevirt.v1.LiteVirt/ListRealms"
 	LiteVirt_Logout_FullMethodName                     = "/litevirt.v1.LiteVirt/Logout"
@@ -310,6 +311,10 @@ type LiteVirtClient interface {
 	EnableBackend(ctx context.Context, in *EnableBackendRequest, opts ...grpc.CallOption) (*LoadBalancer, error)
 	ApplyLB(ctx context.Context, in *ApplyLBRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RemoveLB(ctx context.Context, in *RemoveLBRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// LBKeepalivedRunning reports whether THIS host's keepalived for an LB is
+	// running (VIP assignable). Used by InspectLoadBalancer to assess a remote
+	// LB host's VIP health. Additive: old peers return Unimplemented.
+	LBKeepalivedRunning(ctx context.Context, in *LBKeepalivedRequest, opts ...grpc.CallOption) (*LBKeepalivedResponse, error)
 	// ── Users & Auth ──
 	Login(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*LoginResponse, error)
 	ListRealms(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListRealmsResponse, error)
@@ -1360,6 +1365,16 @@ func (c *liteVirtClient) RemoveLB(ctx context.Context, in *RemoveLBRequest, opts
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_RemoveLB_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) LBKeepalivedRunning(ctx context.Context, in *LBKeepalivedRequest, opts ...grpc.CallOption) (*LBKeepalivedResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LBKeepalivedResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_LBKeepalivedRunning_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2693,6 +2708,10 @@ type LiteVirtServer interface {
 	EnableBackend(context.Context, *EnableBackendRequest) (*LoadBalancer, error)
 	ApplyLB(context.Context, *ApplyLBRequest) (*emptypb.Empty, error)
 	RemoveLB(context.Context, *RemoveLBRequest) (*emptypb.Empty, error)
+	// LBKeepalivedRunning reports whether THIS host's keepalived for an LB is
+	// running (VIP assignable). Used by InspectLoadBalancer to assess a remote
+	// LB host's VIP health. Additive: old peers return Unimplemented.
+	LBKeepalivedRunning(context.Context, *LBKeepalivedRequest) (*LBKeepalivedResponse, error)
 	// ── Users & Auth ──
 	Login(context.Context, *LoginRequest) (*LoginResponse, error)
 	ListRealms(context.Context, *emptypb.Empty) (*ListRealmsResponse, error)
@@ -3104,6 +3123,9 @@ func (UnimplementedLiteVirtServer) ApplyLB(context.Context, *ApplyLBRequest) (*e
 }
 func (UnimplementedLiteVirtServer) RemoveLB(context.Context, *RemoveLBRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveLB not implemented")
+}
+func (UnimplementedLiteVirtServer) LBKeepalivedRunning(context.Context, *LBKeepalivedRequest) (*LBKeepalivedResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method LBKeepalivedRunning not implemented")
 }
 func (UnimplementedLiteVirtServer) Login(context.Context, *LoginRequest) (*LoginResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Login not implemented")
@@ -4652,6 +4674,24 @@ func _LiteVirt_RemoveLB_Handler(srv interface{}, ctx context.Context, dec func(i
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RemoveLB(ctx, req.(*RemoveLBRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_LBKeepalivedRunning_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LBKeepalivedRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).LBKeepalivedRunning(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_LBKeepalivedRunning_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).LBKeepalivedRunning(ctx, req.(*LBKeepalivedRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -6903,6 +6943,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveLB",
 			Handler:    _LiteVirt_RemoveLB_Handler,
+		},
+		{
+			MethodName: "LBKeepalivedRunning",
+			Handler:    _LiteVirt_LBKeepalivedRunning_Handler,
 		},
 		{
 			MethodName: "Login",

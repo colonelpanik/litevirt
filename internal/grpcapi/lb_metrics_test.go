@@ -6,6 +6,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/metrics"
 )
@@ -66,6 +67,47 @@ func TestRefreshLBMetrics(t *testing.T) {
 	s.refreshLBMetrics(ctx)
 	if v, _ := lbGauge(t, reg, "mine-lb"); v != 0 {
 		t.Errorf("mine-lb gauge = %v, want 0 after keepalived down", v)
+	}
+}
+
+// The LBKeepalivedRunning RPC returns THIS host's keepalived state for an LB.
+func TestLBKeepalivedRunningRPC(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	s.lbKeepalivedOverride = func(string) bool { return true }
+	if resp, err := s.LBKeepalivedRunning(ctx, &pb.LBKeepalivedRequest{Name: "x-lb"}); err != nil || !resp.Running {
+		t.Fatalf("running=true expected, got %v err=%v", resp, err)
+	}
+	s.lbKeepalivedOverride = func(string) bool { return false }
+	if resp, _ := s.LBKeepalivedRunning(ctx, &pb.LBKeepalivedRequest{Name: "x-lb"}); resp.Running {
+		t.Error("running=false expected")
+	}
+}
+
+// lbVIPDegraded: degraded only when a host answered AND none report keepalived
+// up. A remote that's unreachable / on an old version (RPC Unimplemented) is
+// not a definitive answer, so it must never produce a false degraded.
+func TestLBVIPDegraded(t *testing.T) {
+	s := testServer(t) // hostName = "test-host"
+	ctx := adminCtx()
+
+	s.lbKeepalivedOverride = func(string) bool { return true }
+	if s.lbVIPDegraded(ctx, "lb", []string{"test-host"}) {
+		t.Error("local keepalived up → not degraded")
+	}
+	s.lbKeepalivedOverride = func(string) bool { return false }
+	if !s.lbVIPDegraded(ctx, "lb", []string{"test-host"}) {
+		t.Error("local keepalived down → degraded")
+	}
+	// any-up across hosts → healthy (a backup keepalived can hold the VIP).
+	s.lbKeepalivedOverride = func(string) bool { return true }
+	if s.lbVIPDegraded(ctx, "lb", []string{"test-host", "other-host"}) {
+		t.Error("at least one keepalived up → not degraded")
+	}
+	// Only an unreachable/old-version remote → no definitive answer → NOT
+	// degraded (mixed-version safety).
+	if s.lbVIPDegraded(ctx, "lb", []string{"other-host"}) {
+		t.Error("unreachable/old remote → no answer → must not be degraded")
 	}
 }
 

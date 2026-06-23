@@ -448,6 +448,15 @@ the LB's own host, a DHCP address is resolved locally.
 new connections but finishes existing ones. `lv lb disable` immediately removes the
 backend from rotation. Use drain for graceful maintenance.
 
+**Health & observability**: `lv lb inspect <name>` reports each backend's **real
+HAProxy health** (`active`/`down`/`maint`/`draining`), not merely whether the
+workload is running — a started VM with nothing listening on the target port shows
+`down`. An LB whose VIP isn't actually assigned (keepalived not running on a host
+that should run it) is reported as `state: degraded` instead of `active`; this is
+checked across the LB's hosts, so `lv lb inspect` is accurate from any node. The
+`litevirt_lb_keepalived_up{lb}` gauge (1 = VIP assignable on this host, 0 = not)
+exposes the same signal for alerting — see [operating model](operating-model.md).
+
 ### SNAT via VIP
 
 On host-isolated networks, VMs have no outbound internet access by default (no MASQUERADE rule). Setting `snat: true` on the load balancer enables outbound NAT: VM traffic destined for external IPs is source-NATted to the VIP address.

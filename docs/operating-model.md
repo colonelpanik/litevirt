@@ -170,6 +170,7 @@ Operators should monitor these Prometheus metrics:
 | `litevirt_mutation_log_rows` | rapidly growing (replication backlog) |
 | `litevirt_replication_min_watermark_seq` | not advancing for > 5 min |
 | `litevirt_daemon_open_fds` | > 5000 (FD leak) |
+| `litevirt_lb_keepalived_up{lb}` | `== 0` sustained (a load balancer's VIP is not assigned — see [compose.md](compose.md#load-balancer)) |
 
 The web UI at port 7445 surfaces the most critical of these on the
 **Cluster** page; full dashboards are on the roadmap.

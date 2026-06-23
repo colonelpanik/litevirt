@@ -428,7 +428,7 @@ See `docs/gitops.md` for the controller model.
 
 ```bash
 lv lb ls                                          # List load balancers
-lv lb inspect <name>                              # LB details + backends
+lv lb inspect <name>                              # LB details + backends (real HAProxy health; state=degraded if VIP unassigned)
 lv lb create <name> --vip <cidr> --port <l:t/proto> --backend <name=addr>
   --algorithm roundrobin     # roundrobin | leastconn | source
   --host <name>              # Hosts to run LB on (repeatable)

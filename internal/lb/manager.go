@@ -137,43 +137,45 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// cmdlineIsHAProxyForConfig reports whether a /proc cmdline (NUL-separated
-// argv) is a haproxy process launched with the given config path as one of its
+// cmdlineMatchesBinaryConfig reports whether a /proc cmdline (NUL-separated
+// argv) is a `binary` process launched with the given config path as one of its
 // arguments. Matching the exact cfgPath field keeps the sweep scoped to one LB.
-func cmdlineIsHAProxyForConfig(cmdline, cfgPath string) bool {
+func cmdlineMatchesBinaryConfig(cmdline, binary, cfgPath string) bool {
 	if cfgPath == "" {
 		return false
 	}
-	hasHAProxy, hasCfg := false, false
+	hasBin, hasCfg := false, false
 	for _, f := range strings.Split(cmdline, "\x00") {
 		switch {
-		case filepath.Base(f) == "haproxy":
-			hasHAProxy = true
+		case filepath.Base(f) == binary:
+			hasBin = true
 		case f == cfgPath:
 			hasCfg = true
 		}
 	}
-	return hasHAProxy && hasCfg
+	return hasBin && hasCfg
 }
 
-// killHAProxyByConfig SIGTERMs (then SIGKILLs) every haproxy process bound to
-// cfgPath. Used at teardown to catch reload siblings the pidfile no longer
-// tracks. No-op when /proc is unavailable.
-func killHAProxyByConfig(cfgPath string) {
+// killProcByConfig SIGTERMs (then SIGKILLs) every `binary` process bound to
+// cfgPath. Used at teardown to catch reload/restart siblings the pidfile no
+// longer tracks (haproxy `-sf` reloads, racing keepalived restarts). Killing a
+// keepalived parent also reaps its vrrp/checkers children. No-op when /proc is
+// unavailable.
+func killProcByConfig(binary, cfgPath string) {
 	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
 	for _, cf := range matches {
 		data, err := os.ReadFile(cf)
 		if err != nil {
 			continue // process exited between glob and read
 		}
-		if !cmdlineIsHAProxyForConfig(string(data), cfgPath) {
+		if !cmdlineMatchesBinaryConfig(string(data), binary, cfgPath) {
 			continue
 		}
 		pid, err := strconv.Atoi(filepath.Base(filepath.Dir(cf)))
 		if err != nil || pid <= 0 {
 			continue
 		}
-		slog.Info("sweeping stray haproxy", "pid", pid, "config", cfgPath)
+		slog.Info("sweeping stray process", "binary", binary, "pid", pid, "config", cfgPath)
 		syscall.Kill(pid, syscall.SIGTERM)
 		for i := 0; i < 20 && processAlive(pid); i++ {
 			time.Sleep(100 * time.Millisecond)
@@ -186,19 +188,24 @@ func killHAProxyByConfig(cfgPath string) {
 
 // Remove stops and removes LB instances for the given name.
 func (m *Manager) Remove(ctx context.Context, name string) error {
-	for _, pidFile := range []string{
+	keepalivedPid := filepath.Join(m.runDir, name+"-keepalived.pid")
+	pidFiles := []string{
 		filepath.Join(m.runDir, name+"-haproxy.pid"),
-		filepath.Join(m.runDir, name+"-keepalived.pid"),
+		keepalivedPid,
 		filepath.Join(m.runDir, name+"-conntrackd.pid"),
-	} {
+	}
+	// keepalived's vrrp/checkers children have their own per-LB pidfiles now.
+	pidFiles = append(pidFiles, keepalivedChildPidFiles(keepalivedPid)...)
+	for _, pidFile := range pidFiles {
 		killByPidFile(pidFile)
 	}
 
-	// Sweep any haproxy still bound to this LB's config file. A burst of reloads
-	// (`haproxy -sf <old>`) only updates the pidfile to the newest master, so
-	// stale reload siblings can linger after killByPidFile — this catches them
-	// so teardown leaves no orphaned process.
-	killHAProxyByConfig(filepath.Join(m.configDir, name+"-haproxy.cfg"))
+	// Sweep any haproxy/keepalived still bound to this LB's config file. Reloads
+	// and racing restarts (haproxy `-sf`, repeated applyLBFromSpec) can leave a
+	// sibling the pidfile no longer tracks; this catches them so teardown leaves
+	// no orphaned process (killing a keepalived parent reaps its children too).
+	killProcByConfig("haproxy", filepath.Join(m.configDir, name+"-haproxy.cfg"))
+	killProcByConfig("keepalived", filepath.Join(m.configDir, name+"-keepalived.conf"))
 
 	// Remove config files.
 	for _, f := range []string{
@@ -503,6 +510,30 @@ func (m *Manager) killOrphanedHAProxy(cfgPath string) {
 	}
 }
 
+// keepalivedArgs builds the keepalived command line for one LB instance.
+//
+// Each LB gets its own vrrp (-r) and checkers (-c) child pidfiles, derived from
+// the parent pidfile. keepalived's child processes otherwise default to shared
+// paths (/var/run/keepalived_vrrp.pid, /var/run/keepalived_checkers.pid), so a
+// second stack LB on the same host hits "daemon is already running" and never
+// assigns its VIP.
+func keepalivedArgs(cfgPath, pidFile string) []string {
+	base := strings.TrimSuffix(pidFile, ".pid")
+	return []string{
+		"-f", cfgPath,
+		"-p", pidFile,
+		"-r", base + "_vrrp.pid",
+		"-c", base + "_checkers.pid",
+	}
+}
+
+// keepalivedChildPidFiles returns the vrrp + checkers child pidfiles for a
+// parent keepalived pidfile (see keepalivedArgs), so teardown can reap them.
+func keepalivedChildPidFiles(pidFile string) []string {
+	base := strings.TrimSuffix(pidFile, ".pid")
+	return []string{base + "_vrrp.pid", base + "_checkers.pid"}
+}
+
 // startOrReloadKeepalived starts or restarts keepalived.
 func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	// Kill existing and wait for it to fully exit (release PID file lock).
@@ -526,10 +557,7 @@ func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	// Let keepalived daemonize (default behavior). It double-forks internally,
 	// writes its own PID file, and the initial process exits. cmd.Run() waits
 	// for that initial exit, then the actual daemon is reparented to init.
-	cmd := exec.Command("keepalived",
-		"-f", cfgPath,
-		"-p", pidFile,
-	)
+	cmd := exec.Command("keepalived", keepalivedArgs(cfgPath, pidFile)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("keepalived start: %w: %s", err, out)

@@ -333,7 +333,7 @@ func (s *Server) recordLBKeepalived(lbName string) {
 		return
 	}
 	up := 0.0
-	if lb.NewManager().KeepalivedRunning(lbName) {
+	if s.lbKeepalivedRunning(lbName) {
 		up = 1.0
 	}
 	s.lbMetrics.KeepalivedUp.WithLabelValues(lbName).Set(up)

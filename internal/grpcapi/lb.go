@@ -1446,34 +1446,70 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 		return
 	}
 	for _, cfg := range configs {
-		if !cfg.Enabled {
-			continue
-		}
-		// Check if this host should run this LB.
-		var hosts []string
-		if cfg.Hosts != "" && cfg.Hosts != "[]" {
-			json.Unmarshal([]byte(cfg.Hosts), &hosts)
-		}
-		isMyLB := false
-		if len(hosts) == 0 {
-			// Empty hosts = runs on hosts with stack VMs; check if we have any.
-			vms, _ := corrosion.ListVMs(ctx, s.db, cfg.StackName, s.hostName)
-			isMyLB = len(vms) > 0
-		} else {
-			for _, h := range hosts {
-				if h == s.hostName {
-					isMyLB = true
-					break
-				}
-			}
-		}
-		if !isMyLB {
+		if !cfg.Enabled || !s.lbRunsOnHost(ctx, cfg) {
 			continue
 		}
 		// Use refreshLBLocal which reads the full spec and re-applies.
 		if cfg.StackName != "" {
 			s.refreshLBLocal(ctx, cfg.StackName)
 			slog.Info("LB reconciled on startup", "lb", cfg.Name, "stack", cfg.StackName)
+		}
+	}
+}
+
+// lbRunsOnHost reports whether this host should run the given LB — an explicit
+// host in cfg.Hosts, or (when Hosts is empty) a host that has VMs in the LB's
+// stack.
+func (s *Server) lbRunsOnHost(ctx context.Context, cfg corrosion.LBConfigRecord) bool {
+	var hosts []string
+	if cfg.Hosts != "" && cfg.Hosts != "[]" {
+		json.Unmarshal([]byte(cfg.Hosts), &hosts)
+	}
+	if len(hosts) == 0 {
+		vms, _ := corrosion.ListVMs(ctx, s.db, cfg.StackName, s.hostName)
+		return len(vms) > 0
+	}
+	for _, h := range hosts {
+		if h == s.hostName {
+			return true
+		}
+	}
+	return false
+}
+
+// RunLBMetricsRefresher periodically republishes litevirt_lb_keepalived_up for
+// the LBs this host runs, so the gauge tracks live keepalived state rather than
+// only the last apply. Cheap — a pidfile check per local LB. Does an immediate
+// refresh, then ticks.
+func (s *Server) RunLBMetricsRefresher(ctx context.Context, interval time.Duration) {
+	s.refreshLBMetrics(ctx)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.refreshLBMetrics(ctx)
+		}
+	}
+}
+
+// refreshLBMetrics sets the keepalived-up gauge for every enabled LB this host
+// runs (1/0 from the live check) and drops the series for LBs it no longer runs.
+func (s *Server) refreshLBMetrics(ctx context.Context) {
+	if s.lbMetrics == nil {
+		return
+	}
+	configs, err := corrosion.ListLBConfigs(ctx, s.db)
+	if err != nil {
+		return
+	}
+	for _, cfg := range configs {
+		if cfg.Enabled && s.lbRunsOnHost(ctx, cfg) {
+			s.recordLBKeepalived(cfg.Name)
+		} else {
+			s.clearLBKeepalived(cfg.Name)
 		}
 	}
 }

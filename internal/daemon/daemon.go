@@ -357,6 +357,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Re-apply LB configs (haproxy + keepalived) that should run on this host.
 	// These are child processes that die when the daemon restarts.
 	svc.ReconcileLBs(ctx)
+	// Keep litevirt_lb_keepalived_up tracking live keepalived state, not just
+	// the last apply.
+	go svc.RunLBMetricsRefresher(ctx, 30*time.Second)
 
 	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
 	ipScanner := grpcapi.NewIPScanner(svc)

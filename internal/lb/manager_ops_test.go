@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -14,6 +15,39 @@ func testManager(t *testing.T) *Manager {
 	return &Manager{
 		configDir: filepath.Join(dir, "config"),
 		runDir:    filepath.Join(dir, "run"),
+	}
+}
+
+// lbLock is keyed by LB name: same name → same mutex (serializes), different
+// names → different mutexes (no cross-LB stalling).
+func TestLBLock_KeyedByName(t *testing.T) {
+	if lbLock("a") != lbLock("a") {
+		t.Error("same name should return the same mutex")
+	}
+	if lbLock("a") == lbLock("b") {
+		t.Error("different names should return different mutexes")
+	}
+}
+
+// Concurrent Apply of the SAME LB must be serialized (no data race, no corrupted
+// config). Run under -race; the per-LB mutex is what makes this safe.
+func TestApply_ConcurrentSameLB_NoRace(t *testing.T) {
+	m := testManager(t)
+	cfg := Config{
+		Name: "race-lb", VIP: "10.0.1.100", VIPPrefix: 24, Interface: "eth0",
+		VRID: 10, Priority: 100, Algorithm: "roundrobin",
+		Backends: []Backend{{Name: "b1", IP: "10.0.1.10", Port: 8080}},
+		Ports:    []Port{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); m.Apply(context.Background(), cfg) }() //nolint:errcheck
+	}
+	wg.Wait()
+	data, err := os.ReadFile(filepath.Join(m.configDir, "race-lb-haproxy.cfg"))
+	if err != nil || !strings.Contains(string(data), "frontend race-lb-80") {
+		t.Fatalf("config corrupted/missing after concurrent applies: err=%v", err)
 	}
 }
 

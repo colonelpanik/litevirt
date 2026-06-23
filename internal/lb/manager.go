@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,29 @@ import (
 type Manager struct {
 	configDir string // base dir for generated configs
 	runDir    string // PID files
+}
+
+// applyLocks serializes Apply/Remove per LB name. NewManager() is constructed
+// fresh per call (so a per-instance lock would serialize nothing), and peers run
+// Apply via forwardLBApply, so the lock must be process-global here in the lb
+// package — the one place every apply/teardown on a host funnels through.
+// Holding it across exec is intended: it collapses the deploy/migration apply
+// storm and stops an apply from racing a teardown (the orphan-spawning race).
+var (
+	applyLocksMu sync.Mutex
+	applyLocks   = map[string]*sync.Mutex{}
+)
+
+// lbLock returns the per-LB mutex for name, creating it on first use.
+func lbLock(name string) *sync.Mutex {
+	applyLocksMu.Lock()
+	defer applyLocksMu.Unlock()
+	m := applyLocks[name]
+	if m == nil {
+		m = &sync.Mutex{}
+		applyLocks[name] = m
+	}
+	return m
 }
 
 // NewManager returns a Manager.
@@ -31,6 +55,10 @@ func NewManager() *Manager {
 // Apply writes HAProxy + keepalived configs and starts/reloads processes.
 // It is idempotent: calling Apply twice with the same config is safe.
 func (m *Manager) Apply(ctx context.Context, cfg Config) error {
+	lk := lbLock(cfg.Name)
+	lk.Lock()
+	defer lk.Unlock()
+
 	if err := os.MkdirAll(m.configDir, 0750); err != nil {
 		return fmt.Errorf("create lb config dir: %w", err)
 	}
@@ -217,6 +245,12 @@ func killProcByConfig(binary, cfgPath string) {
 
 // Remove stops and removes LB instances for the given name.
 func (m *Manager) Remove(ctx context.Context, name string) error {
+	// Same key as Apply so teardown can't interleave with an in-flight apply
+	// (which would resurrect what we're tearing down / orphan a process).
+	lk := lbLock(name)
+	lk.Lock()
+	defer lk.Unlock()
+
 	keepalivedPid := filepath.Join(m.runDir, name+"-keepalived.pid")
 	pidFiles := []string{
 		filepath.Join(m.runDir, name+"-haproxy.pid"),

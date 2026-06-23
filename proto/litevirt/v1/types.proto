@@ -539,6 +539,14 @@ message LBStatsResponse {
     repeated LBBackendStats    backends  = 3;
 }
 
+message LBKeepalivedRequest {
+    string name = 1;  // LB name
+}
+
+message LBKeepalivedResponse {
+    bool running = 1;  // keepalived for this LB is running on the responding host
+}
+
 // VMStats holds live resource utilization for a single VM.
 message VMStats {
     string name             = 1;

@@ -316,24 +316,64 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 	}
 
 	// VIP health: an enabled LB is "degraded" when its VIP isn't actually
-	// assigned. The reliable signal is keepalived NOT running on a host that is
-	// supposed to run this LB — HAProxy binds the VIP non-locally, so without
-	// this check a down-VIP LB would still look "active". We only assert this
-	// when inspecting ON an LB host (runsHere); a precise remote keepalived
-	// check would need an additive RPC and is a documented follow-up. (Stats
-	// being unreachable is NOT treated as degraded — that conflates "can't ask"
-	// with "VIP down".)
-	if state == "active" {
-		for _, h := range lbHosts {
-			if h == s.hostName {
-				if !s.lbKeepalivedRunning(result.Name) {
-					result.State = "degraded"
-				}
-				break
+	// assigned anywhere. HAProxy binds the VIP non-locally, so without this a
+	// down-VIP LB would still look "active". Checks keepalived across all target
+	// hosts (local directly, remote via RPC).
+	if state == "active" && s.lbVIPDegraded(ctx, result.Name, lbHosts) {
+		result.State = "degraded"
+	}
+	return result, nil
+}
+
+// lbVIPDegraded reports whether an LB's VIP looks unassigned: across its target
+// hosts, at least one answered the keepalived check AND none reported running
+// (for a multi-host LB, one live keepalived can hold the VIP via VRRP, so any-up
+// = healthy). Local hosts use the direct check; remote hosts use the RPC. An
+// old peer that doesn't implement the RPC (or is unreachable) isn't counted as
+// an answer — so we never falsely mark degraded in a mixed-version cluster.
+func (s *Server) lbVIPDegraded(ctx context.Context, name string, lbHosts []string) bool {
+	anyUp, anyAnswered := false, false
+	for _, h := range lbHosts {
+		if h == s.hostName {
+			anyAnswered = true
+			if s.lbKeepalivedRunning(name) {
+				anyUp = true
+			}
+			continue
+		}
+		if running, ok := s.remoteLBKeepalived(ctx, h, name); ok {
+			anyAnswered = true
+			if running {
+				anyUp = true
 			}
 		}
 	}
-	return result, nil
+	return anyAnswered && !anyUp
+}
+
+// remoteLBKeepalived asks a peer whether its keepalived for the LB is running.
+// ok=false when the peer is unreachable or runs a version without the RPC
+// (Unimplemented) — the caller then doesn't treat it as a definitive answer.
+func (s *Server) remoteLBKeepalived(ctx context.Context, host, name string) (running, ok bool) {
+	client, conn, err := s.peerClient(ctx, host)
+	if err != nil {
+		return false, false
+	}
+	defer conn.Close()
+	resp, err := client.LBKeepalivedRunning(ctx, &pb.LBKeepalivedRequest{Name: name})
+	if err != nil {
+		return false, false
+	}
+	return resp.Running, true
+}
+
+// LBKeepalivedRunning reports whether THIS host's keepalived for the LB is alive
+// (VIP assignable). Peers call it for InspectLoadBalancer's remote VIP-health.
+func (s *Server) LBKeepalivedRunning(ctx context.Context, req *pb.LBKeepalivedRequest) (*pb.LBKeepalivedResponse, error) {
+	if err := RequireRole(ctx, "viewer"); err != nil {
+		return nil, err
+	}
+	return &pb.LBKeepalivedResponse{Running: s.lbKeepalivedRunning(req.Name)}, nil
 }
 
 // lbKeepalivedRunning reports whether this host's keepalived for an LB is alive
@@ -1446,34 +1486,70 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 		return
 	}
 	for _, cfg := range configs {
-		if !cfg.Enabled {
-			continue
-		}
-		// Check if this host should run this LB.
-		var hosts []string
-		if cfg.Hosts != "" && cfg.Hosts != "[]" {
-			json.Unmarshal([]byte(cfg.Hosts), &hosts)
-		}
-		isMyLB := false
-		if len(hosts) == 0 {
-			// Empty hosts = runs on hosts with stack VMs; check if we have any.
-			vms, _ := corrosion.ListVMs(ctx, s.db, cfg.StackName, s.hostName)
-			isMyLB = len(vms) > 0
-		} else {
-			for _, h := range hosts {
-				if h == s.hostName {
-					isMyLB = true
-					break
-				}
-			}
-		}
-		if !isMyLB {
+		if !cfg.Enabled || !s.lbRunsOnHost(ctx, cfg) {
 			continue
 		}
 		// Use refreshLBLocal which reads the full spec and re-applies.
 		if cfg.StackName != "" {
 			s.refreshLBLocal(ctx, cfg.StackName)
 			slog.Info("LB reconciled on startup", "lb", cfg.Name, "stack", cfg.StackName)
+		}
+	}
+}
+
+// lbRunsOnHost reports whether this host should run the given LB — an explicit
+// host in cfg.Hosts, or (when Hosts is empty) a host that has VMs in the LB's
+// stack.
+func (s *Server) lbRunsOnHost(ctx context.Context, cfg corrosion.LBConfigRecord) bool {
+	var hosts []string
+	if cfg.Hosts != "" && cfg.Hosts != "[]" {
+		json.Unmarshal([]byte(cfg.Hosts), &hosts)
+	}
+	if len(hosts) == 0 {
+		vms, _ := corrosion.ListVMs(ctx, s.db, cfg.StackName, s.hostName)
+		return len(vms) > 0
+	}
+	for _, h := range hosts {
+		if h == s.hostName {
+			return true
+		}
+	}
+	return false
+}
+
+// RunLBMetricsRefresher periodically republishes litevirt_lb_keepalived_up for
+// the LBs this host runs, so the gauge tracks live keepalived state rather than
+// only the last apply. Cheap — a pidfile check per local LB. Does an immediate
+// refresh, then ticks.
+func (s *Server) RunLBMetricsRefresher(ctx context.Context, interval time.Duration) {
+	s.refreshLBMetrics(ctx)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.refreshLBMetrics(ctx)
+		}
+	}
+}
+
+// refreshLBMetrics sets the keepalived-up gauge for every enabled LB this host
+// runs (1/0 from the live check) and drops the series for LBs it no longer runs.
+func (s *Server) refreshLBMetrics(ctx context.Context) {
+	if s.lbMetrics == nil {
+		return
+	}
+	configs, err := corrosion.ListLBConfigs(ctx, s.db)
+	if err != nil {
+		return
+	}
+	for _, cfg := range configs {
+		if cfg.Enabled && s.lbRunsOnHost(ctx, cfg) {
+			s.recordLBKeepalived(cfg.Name)
+		} else {
+			s.clearLBKeepalived(cfg.Name)
 		}
 	}
 }

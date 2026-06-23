@@ -495,12 +495,7 @@ func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, 
 				ntype = "bridge"
 			}
 			scopedName := compose.ScopedNetworkName(f.Name, name)
-			if _, err := client.ProvisionNetwork(ctx, &pb.ProvisionNetworkRequest{
-				Name:      scopedName,
-				Config:    string(cfgJSON),
-				NetType:   ntype,
-				StackName: f.Name,
-			}); err != nil {
+			if _, err := client.ProvisionNetwork(ctx, provisionNetworkRequest(scopedName, string(cfgJSON), ntype, f.Name)); err != nil {
 				provErrs = append(provErrs, fmt.Sprintf("%s/%s: %v", host, scopedName, err))
 			}
 		}
@@ -1488,12 +1483,7 @@ func (s *Server) forwardProvisionNetworks(ctx context.Context, f *compose.File) 
 				ntype = "bridge"
 			}
 			scopedName := compose.ScopedNetworkName(f.Name, name)
-			if _, err := client.ProvisionNetwork(ctx, &pb.ProvisionNetworkRequest{
-				Name:      scopedName,
-				Config:    string(cfgJSON),
-				NetType:   ntype,
-				StackName: f.Name,
-			}); err != nil {
+			if _, err := client.ProvisionNetwork(ctx, provisionNetworkRequest(scopedName, string(cfgJSON), ntype, f.Name)); err != nil {
 				slog.Warn("forwardProvisionNetworks: provision failed", "host", h.Name, "network", scopedName, "error", err)
 			}
 			conn.Close()

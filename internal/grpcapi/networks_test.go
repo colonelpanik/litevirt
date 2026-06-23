@@ -800,3 +800,29 @@ func TestGetNetwork_StackName(t *testing.T) {
 		t.Errorf("StackName = %q, want my-app", ni.StackName)
 	}
 }
+
+// Every ProvisionNetwork request must carry stack_name and default a blank type
+// to "bridge" — the single constructor makes the omission that orphaned networks
+// at teardown impossible to reintroduce.
+func TestProvisionNetworkRequest_AlwaysSetsStackName(t *testing.T) {
+	cases := []struct {
+		name, cfg, netType, stack string
+		wantType                  string
+	}{
+		{"lbmix_lbnet", `{"subnet":"10.77.0.0/24"}`, "isolated", "lbmix", "isolated"},
+		{"app_lan", "", "", "app", "bridge"}, // blank type defaults to bridge
+	}
+	for _, c := range cases {
+		req := provisionNetworkRequest(c.name, c.cfg, c.netType, c.stack)
+		if req.Name != c.name || req.Config != c.cfg || req.NetType != c.wantType || req.StackName != c.stack {
+			t.Errorf("provisionNetworkRequest(%q,…,%q,%q) = %+v, want type=%q stack=%q",
+				c.name, c.netType, c.stack, req, c.wantType, c.stack)
+		}
+	}
+
+	// remoteProvisionRequest (migration path) preserves the record's stack_name.
+	nr := &corrosion.NetworkRecord{Name: "lbmix_lbnet", StackName: "lbmix", Type: "isolated", Config: `{"x":1}`}
+	if got := remoteProvisionRequest(nr.Name, nr); got.StackName != "lbmix" || got.NetType != "isolated" {
+		t.Errorf("remoteProvisionRequest dropped fields: %+v", got)
+	}
+}

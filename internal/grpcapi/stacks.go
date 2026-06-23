@@ -787,10 +787,14 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	}
 
 	// Deprovision networks associated with this stack (skip external networks).
+	// Match on the stack_name column OR the scoped-name convention
+	// ("<stack>_<net>"): a migration re-provisions the network on the target via
+	// ProvisionNetwork and can land a row with an empty stack_name, which would
+	// otherwise orphan the bridge + dnsmasq + row at teardown.
 	externalNets := s.externalNetworkNames(ctx, req.Name)
 	nets, _ := corrosion.ListNetworks(ctx, s.db)
 	for _, nr := range nets {
-		if nr.StackName == req.Name && !externalNets[nr.Name] {
+		if networkBelongsToStack(nr, req.Name) && !externalNets[nr.Name] {
 			if err := s.deprovisionNetworkByName(ctx, nr.Name); err != nil {
 				hadFailures = true
 				slog.Warn("stack network deprovision failed", "network", nr.Name, "error", err)
@@ -1211,6 +1215,18 @@ func opKindToDiffOp(k compose.OpKind) pb.DiffOp {
 	default:
 		return pb.DiffOp_DIFF_UNCHANGED
 	}
+}
+
+// networkBelongsToStack reports whether a network row was created by the named
+// stack — by its stack_name column OR the scoped-name convention
+// "<stack>_<net>". The name fallback matters because a migration re-provisions
+// the network on the target via ProvisionNetwork and can land a row with an
+// empty stack_name; without it, teardown orphans the bridge + dnsmasq + row.
+func networkBelongsToStack(nr corrosion.NetworkRecord, stackName string) bool {
+	if stackName == "" {
+		return false
+	}
+	return nr.StackName == stackName || strings.HasPrefix(nr.Name, stackName+"_")
 }
 
 // externalNetworkNames returns a set of network names marked as external in the

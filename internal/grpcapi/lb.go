@@ -1401,6 +1401,15 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 
 // removeLBForStack removes all LB instances associated with a stack on all hosts.
 // It checks VM specs for LB configuration and tears down haproxy + keepalived.
+// stackHasLBConfig reports whether an lb_config row exists for the LB, including
+// soft-deleted rows. DeleteStack soft-deletes the row before tearing the LB
+// down, so a `deleted_at IS NULL` filter would miss it and the haproxy /
+// keepalived processes would be orphaned.
+func (s *Server) stackHasLBConfig(ctx context.Context, lbName string) bool {
+	rows, _ := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE name = ?`, lbName)
+	return len(rows) > 0
+}
+
 func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []corrosion.VMRecord) {
 	if stackName == "" {
 		return
@@ -1408,9 +1417,11 @@ func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []c
 
 	lbName := stackName + "-lb"
 
-	// Check if an LB record exists in corrosion for this stack.
-	rows, _ := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, lbName)
-	hasLB := len(rows) > 0
+	// Whether an LB record EVER existed for this stack — including soft-deleted
+	// rows. The VM-spec fallback below is unreliable after a migration, which may
+	// re-store the spec without the LB block, so the row is the authoritative
+	// teardown signal.
+	hasLB := s.stackHasLBConfig(ctx, lbName)
 
 	// Determine which hosts ran the LB so we can remove from all of them.
 	var lbHosts []string

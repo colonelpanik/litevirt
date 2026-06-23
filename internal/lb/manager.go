@@ -137,6 +137,53 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+// cmdlineIsHAProxyForConfig reports whether a /proc cmdline (NUL-separated
+// argv) is a haproxy process launched with the given config path as one of its
+// arguments. Matching the exact cfgPath field keeps the sweep scoped to one LB.
+func cmdlineIsHAProxyForConfig(cmdline, cfgPath string) bool {
+	if cfgPath == "" {
+		return false
+	}
+	hasHAProxy, hasCfg := false, false
+	for _, f := range strings.Split(cmdline, "\x00") {
+		switch {
+		case filepath.Base(f) == "haproxy":
+			hasHAProxy = true
+		case f == cfgPath:
+			hasCfg = true
+		}
+	}
+	return hasHAProxy && hasCfg
+}
+
+// killHAProxyByConfig SIGTERMs (then SIGKILLs) every haproxy process bound to
+// cfgPath. Used at teardown to catch reload siblings the pidfile no longer
+// tracks. No-op when /proc is unavailable.
+func killHAProxyByConfig(cfgPath string) {
+	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	for _, cf := range matches {
+		data, err := os.ReadFile(cf)
+		if err != nil {
+			continue // process exited between glob and read
+		}
+		if !cmdlineIsHAProxyForConfig(string(data), cfgPath) {
+			continue
+		}
+		pid, err := strconv.Atoi(filepath.Base(filepath.Dir(cf)))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		slog.Info("sweeping stray haproxy", "pid", pid, "config", cfgPath)
+		syscall.Kill(pid, syscall.SIGTERM)
+		for i := 0; i < 20 && processAlive(pid); i++ {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if processAlive(pid) {
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+}
+
 // Remove stops and removes LB instances for the given name.
 func (m *Manager) Remove(ctx context.Context, name string) error {
 	for _, pidFile := range []string{
@@ -146,6 +193,12 @@ func (m *Manager) Remove(ctx context.Context, name string) error {
 	} {
 		killByPidFile(pidFile)
 	}
+
+	// Sweep any haproxy still bound to this LB's config file. A burst of reloads
+	// (`haproxy -sf <old>`) only updates the pidfile to the newest master, so
+	// stale reload siblings can linger after killByPidFile — this catches them
+	// so teardown leaves no orphaned process.
+	killHAProxyByConfig(filepath.Join(m.configDir, name+"-haproxy.cfg"))
 
 	// Remove config files.
 	for _, f := range []string{

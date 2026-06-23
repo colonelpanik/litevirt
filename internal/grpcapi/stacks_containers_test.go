@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -9,6 +10,80 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
 )
+
+// Container lifecycle ops write tamper-evident audit entries (ct.* actions) with
+// the project + result, and the hash-chain stays intact.
+func TestContainerAudit(t *testing.T) {
+	s := testServerR2(t) // hostName = test-host; tenancy nil (no quota interference)
+	ctx := adminContext(context.Background())
+	s.SetContainerRuntime(&fakeCTRuntime{})
+
+	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "web", Template: "download", Distro: "alpine", Project: "acme",
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: "web", HostName: "test-host"}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	rows, err := s.db.Query(ctx, `SELECT action, result, detail FROM audit_log WHERE target = ? ORDER BY timestamp`, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{} // action -> result
+	for _, r := range rows {
+		got[r.String("action")] = r.String("result")
+	}
+	if got["ct.create"] != "ok" || got["ct.delete"] != "ok" {
+		t.Errorf("audit actions = %+v, want ct.create=ok + ct.delete=ok", got)
+	}
+	// The create entry records the project.
+	var sawProject bool
+	for _, r := range rows {
+		if r.String("action") == "ct.create" && strings.Contains(r.String("detail"), "project=acme") {
+			sawProject = true
+		}
+	}
+	if !sawProject {
+		t.Error("ct.create audit detail should record project=acme")
+	}
+	// Hash-chain intact.
+	if _, _, err := corrosion.VerifyAuditChain(ctx, s.db); err != nil {
+		t.Errorf("audit chain broken: %v", err)
+	}
+}
+
+// ctRBACPathFor builds /projects/<project>/containers/<name> and containerProject
+// resolves a container's project (default _default), so per-container RBAC honors
+// tenancy instead of the old hardcoded _default path.
+func TestContainerRBACPathAndProject(t *testing.T) {
+	if got := ctRBACPathFor("acme", "web"); got != "/projects/acme/containers/web" {
+		t.Errorf("ctRBACPathFor = %q", got)
+	}
+	if got := ctRBACPathFor("", "web"); got != "/projects/_default/containers/web" {
+		t.Errorf("empty project path = %q, want _default", got)
+	}
+
+	s := testServerR2(t)
+	ctx := context.Background()
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "h1", Name: "web", State: "running", Project: "acme",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if p := s.containerProject(ctx, "h1", "web"); p != "acme" {
+		t.Errorf("containerProject(h1,web) = %q, want acme", p)
+	}
+	// Unknown container → _default (so the RBAC check is well-defined pre-create).
+	if p := s.containerProject(ctx, "h1", "nope"); p != "_default" {
+		t.Errorf("containerProject(unknown) = %q, want _default", p)
+	}
+	// Host-less lookup scans by name.
+	if p := s.containerProject(ctx, "", "web"); p != "acme" {
+		t.Errorf("containerProject(\"\",web) = %q, want acme", p)
+	}
+}
 
 // A container NIC on a stack's isolated network must resolve to the real host
 // bridge (br-iso-<hash> derived from the SCOPED network name) and carry a CIDR

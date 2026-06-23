@@ -84,6 +84,10 @@ type collector struct {
 	vmState        *prometheus.Desc
 	vmCPU          *prometheus.Desc
 	vmMemory       *prometheus.Desc
+	hostCtCount    *prometheus.Desc
+	ctState        *prometheus.Desc
+	ctCPULimit     *prometheus.Desc
+	ctMemLimit     *prometheus.Desc
 	vmDiskRead     *prometheus.Desc
 	vmDiskWrite    *prometheus.Desc
 	vmDiskReadOps  *prometheus.Desc
@@ -140,6 +144,22 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, hostName string) *
 		vmMemory: prometheus.NewDesc(
 			"litevirt_vm_memory_mib", "VM memory in MiB",
 			[]string{"vm"}, nil,
+		),
+		hostCtCount: prometheus.NewDesc(
+			"litevirt_host_container_count", "Number of containers on this host",
+			nil, nil,
+		),
+		ctState: prometheus.NewDesc(
+			"litevirt_container_state", "Container state (1=running, 0=other)",
+			[]string{"container", "state"}, nil,
+		),
+		ctCPULimit: prometheus.NewDesc(
+			"litevirt_container_cpu_limit", "Container CPU-shares limit (0=unlimited)",
+			[]string{"container"}, nil,
+		),
+		ctMemLimit: prometheus.NewDesc(
+			"litevirt_container_memory_limit_mib", "Container memory limit in MiB (0=unlimited)",
+			[]string{"container"}, nil,
 		),
 		// Per-VM I/O counters sourced from libvirt.GetAllDomainStats.
 		// libvirt resets these to zero on guest reboot, so prometheus
@@ -260,6 +280,10 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.vmState
 	ch <- c.vmCPU
 	ch <- c.vmMemory
+	ch <- c.hostCtCount
+	ch <- c.ctState
+	ch <- c.ctCPULimit
+	ch <- c.ctMemLimit
 	ch <- c.vmDiskRead
 	ch <- c.vmDiskWrite
 	ch <- c.vmDiskReadOps
@@ -305,6 +329,21 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.vmState, prometheus.GaugeValue, running, vm.Name, vm.State)
 			ch <- prometheus.MustNewConstMetric(c.vmCPU, prometheus.GaugeValue, float64(vm.CPUActual), vm.Name)
 			ch <- prometheus.MustNewConstMetric(c.vmMemory, prometheus.GaugeValue, float64(vm.MemActual), vm.Name)
+		}
+	}
+
+	// Container metrics. State + declared limits from the containers table (no
+	// new runtime primitive); actual cgroup cpu/mem usage is a follow-up (A3b).
+	if cts, err := corrosion.ListContainers(ctx, c.db, c.hostName); err == nil {
+		ch <- prometheus.MustNewConstMetric(c.hostCtCount, prometheus.GaugeValue, float64(len(cts)))
+		for _, ct := range cts {
+			running := 0.0
+			if ct.State == "running" {
+				running = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(c.ctState, prometheus.GaugeValue, running, ct.Name, ct.State)
+			ch <- prometheus.MustNewConstMetric(c.ctCPULimit, prometheus.GaugeValue, float64(ct.CPULimit), ct.Name)
+			ch <- prometheus.MustNewConstMetric(c.ctMemLimit, prometheus.GaugeValue, float64(ct.MemMiB), ct.Name)
 		}
 	}
 
@@ -471,6 +510,17 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 				if vm.State == "running" || vm.State == "creating" || vm.State == "starting" {
 					usedCPU += vm.CPUActual
 					usedMem += vm.MemActual
+				}
+			}
+		}
+		// Fold running containers into host pressure (declared limits — a
+		// cgroup-actual reading is the A3b follow-up; an unlimited container
+		// contributes 0 to that dimension).
+		if hostCts, err := corrosion.ListContainers(ctx, c.db, h.Name); err == nil {
+			for _, ct := range hostCts {
+				if ct.State == "running" {
+					usedCPU += ct.CPULimit
+					usedMem += ct.MemMiB
 				}
 			}
 		}

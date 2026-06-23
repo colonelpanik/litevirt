@@ -544,6 +544,7 @@ message Container {
     string updated_at   = 8;
     RestartPolicy restart = 9;   // auto-restart policy (nil/condition="none" = never)
     string state_detail = 10;    // stop cause / intent, e.g. "operator-stop"
+    string project      = 11;    // tenancy bucket (default "_default")
 }
 
 message ContainerNetwork {
@@ -566,6 +567,7 @@ message CreateContainerRequest {
     map<string, string> labels = 10;
     string image     = 11;
     RestartPolicy restart = 12;  // auto-restart policy (nil/condition="none" = never)
+    string project   = 13;       // tenancy bucket (default "_default")
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }

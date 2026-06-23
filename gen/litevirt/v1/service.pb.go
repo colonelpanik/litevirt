@@ -7384,6 +7384,7 @@ type Container struct {
 	UpdatedAt     string                 `protobuf:"bytes,8,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	Restart       *RestartPolicy         `protobuf:"bytes,9,opt,name=restart,proto3" json:"restart,omitempty"`                             // auto-restart policy (nil/condition="none" = never)
 	StateDetail   string                 `protobuf:"bytes,10,opt,name=state_detail,json=stateDetail,proto3" json:"state_detail,omitempty"` // stop cause / intent, e.g. "operator-stop"
+	Project       string                 `protobuf:"bytes,11,opt,name=project,proto3" json:"project,omitempty"`                            // tenancy bucket (default "_default")
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7488,6 +7489,13 @@ func (x *Container) GetStateDetail() string {
 	return ""
 }
 
+func (x *Container) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
+}
+
 type ContainerNetwork struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`     // unique within container (eth0, eth1, …)
@@ -7570,6 +7578,7 @@ type CreateContainerRequest struct {
 	Labels        map[string]string      `protobuf:"bytes,10,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	Image         string                 `protobuf:"bytes,11,opt,name=image,proto3" json:"image,omitempty"`
 	Restart       *RestartPolicy         `protobuf:"bytes,12,opt,name=restart,proto3" json:"restart,omitempty"` // auto-restart policy (nil/condition="none" = never)
+	Project       string                 `protobuf:"bytes,13,opt,name=project,proto3" json:"project,omitempty"` // tenancy bucket (default "_default")
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7686,6 +7695,13 @@ func (x *CreateContainerRequest) GetRestart() *RestartPolicy {
 		return x.Restart
 	}
 	return nil
+}
+
+func (x *CreateContainerRequest) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
 }
 
 type StartContainerRequest struct {
@@ -18379,7 +18395,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05Phase\x12\x11\n" +
 	"\rPHASE_UNKNOWN\x10\x00\x12\v\n" +
 	"\aRESTORE\x10\x01\x12\b\n" +
-	"\x04DONE\x10\x02\"\xbb\x02\n" +
+	"\x04DONE\x10\x02\"\xd5\x02\n" +
 	"\tContainer\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -18394,12 +18410,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"updated_at\x18\b \x01(\tR\tupdatedAt\x124\n" +
 	"\arestart\x18\t \x01(\v2\x1a.litevirt.v1.RestartPolicyR\arestart\x12!\n" +
 	"\fstate_detail\x18\n" +
-	" \x01(\tR\vstateDetail\"`\n" +
+	" \x01(\tR\vstateDetail\x12\x18\n" +
+	"\aproject\x18\v \x01(\tR\aproject\"`\n" +
 	"\x10ContainerNetwork\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06bridge\x18\x02 \x01(\tR\x06bridge\x12\x0e\n" +
 	"\x02ip\x18\x03 \x01(\tR\x02ip\x12\x10\n" +
-	"\x03mac\x18\x04 \x01(\tR\x03mac\"\xe7\x03\n" +
+	"\x03mac\x18\x04 \x01(\tR\x03mac\"\x81\x04\n" +
 	"\x16CreateContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1a\n" +
@@ -18414,7 +18431,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06labels\x18\n" +
 	" \x03(\v2/.litevirt.v1.CreateContainerRequest.LabelsEntryR\x06labels\x12\x14\n" +
 	"\x05image\x18\v \x01(\tR\x05image\x124\n" +
-	"\arestart\x18\f \x01(\v2\x1a.litevirt.v1.RestartPolicyR\arestart\x1a9\n" +
+	"\arestart\x18\f \x01(\v2\x1a.litevirt.v1.RestartPolicyR\arestart\x12\x18\n" +
+	"\aproject\x18\r \x01(\tR\aproject\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"H\n" +

@@ -1,12 +1,71 @@
 package metrics
 
 import (
+	"context"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// Container metrics are emitted by the collector: state (1=running, 0=other),
+// declared cpu/mem limits, and a per-host count — none existed before A3.
+func TestCollect_ContainerMetrics(t *testing.T) {
+	db := testCollectorDB(t)
+	ctx := context.Background()
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "web", State: "running", CPULimit: 2, MemMiB: 512,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "dbct", State: "stopped", CPULimit: 1, MemMiB: 256,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newCollector(db, nil, "host-a")
+	ch := make(chan prometheus.Metric, 200)
+	c.Collect(ch)
+	close(ch)
+
+	names := map[string]bool{}
+	stateByName := map[string]float64{}
+	want := []string{"litevirt_container_state", "litevirt_container_cpu_limit", "litevirt_container_memory_limit_mib", "litevirt_host_container_count"}
+	for m := range ch {
+		d := m.Desc().String()
+		for _, n := range want {
+			if containsStr(d, n) {
+				names[n] = true
+			}
+		}
+		if containsStr(d, "litevirt_container_state") {
+			var dm dto.Metric
+			if m.Write(&dm) == nil {
+				ctName := ""
+				for _, l := range dm.GetLabel() {
+					if l.GetName() == "container" {
+						ctName = l.GetValue()
+					}
+				}
+				stateByName[ctName] = dm.GetGauge().GetValue()
+			}
+		}
+	}
+	for _, n := range want {
+		if !names[n] {
+			t.Errorf("collector did not emit %s", n)
+		}
+	}
+	if stateByName["web"] != 1 || stateByName["dbct"] != 0 {
+		t.Errorf("container_state = %+v, want web=1 (running) dbct=0 (stopped)", stateByName)
+	}
+}
 
 func testCollectorDB(t *testing.T) *corrosion.Client {
 	t.Helper()

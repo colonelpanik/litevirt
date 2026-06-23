@@ -39,7 +39,7 @@ func newCTCmd() *cobra.Command {
 
 func newCTCreateCmd() *cobra.Command {
 	var distro, release, arch string
-	var template, host string
+	var template, host, project string
 	var cpu, memMiB int
 	var useLocal bool
 	var networks []string
@@ -72,6 +72,7 @@ func newCTCreateCmd() *cobra.Command {
 					Name:     args[0], Template: template,
 					Distro: distro, Release: release, Arch: arch,
 					Cpu: int32(cpu), MemoryMib: int32(memMiB), Networks: nics,
+					Project: project,
 				}
 				if restart != "" && restart != "none" {
 					req.Restart = &pb.RestartPolicy{
@@ -98,6 +99,7 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().IntVar(&memMiB, "memory", 0, "Memory cap MiB (0 = unlimited)")
 	cmd.Flags().StringArrayVar(&networks, "network", nil, "Attach a NIC: bridge=<br>[,name=eth0][,ip=10.0.0.5/24][,mac=AA:BB:..] (repeatable; default: lxcbr0)")
 	cmd.Flags().StringVar(&host, "host", "", "Target host (default: the daemon you're connected to)")
+	cmd.Flags().StringVar(&project, "project", "", "Tenancy project (default: _default)")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local lxc-* runtime instead of gRPC")
 	cmd.Flags().StringVar(&restart, "restart", "", "Auto-restart policy: none | on-failure | always (default none). An operator `lv ct stop` is never auto-restarted; any other stop is treated as unexpected (containers have no stop reason).")
 	cmd.Flags().Int32Var(&restartMax, "restart-max-attempts", 0, "Max restart attempts within the window (0 = unlimited)")

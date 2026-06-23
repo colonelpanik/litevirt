@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -14,6 +15,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // Containers gRPC service.
@@ -27,8 +29,28 @@ import (
 //     the host that performed the action so the row reflects truth.
 
 // CreateContainer creates an LXC/OCI container on the named host.
+// containerProject resolves a container's tenancy project for RBAC/audit,
+// defaulting to "_default" when the row isn't found yet. When host is empty it
+// scans by name (lifecycle RPCs usually carry the owning host).
+func (s *Server) containerProject(ctx context.Context, host, name string) string {
+	if host != "" {
+		if ct, _ := corrosion.GetContainer(ctx, s.db, host, name); ct != nil && ct.Project != "" {
+			return ct.Project
+		}
+		return "_default"
+	}
+	cts, _ := corrosion.ListContainers(ctx, s.db, "")
+	for _, ct := range cts {
+		if ct.Name == name && ct.Project != "" {
+			return ct.Project
+		}
+	}
+	return "_default"
+}
+
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*pb.Container, error) {
-	if err := s.RequirePerm(ctx, "/projects/_default/containers/"+req.Name, "ct.create", "operator"); err != nil {
+	if err := s.RequirePerm(ctx, ctRBACPathFor(req.Project, req.Name), "ct.create", "operator"); err != nil {
+		s.audit(ctx, "ct.create", req.Name, "project="+tenancy.NormalizeProject(req.Project), "denied")
 		return nil, err
 	}
 	if req.Name == "" {
@@ -39,6 +61,16 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
+	}
+
+	// Tenancy admission — containers draw down the SAME project vCPU/Mem budget
+	// as VMs (mirrors CreateVM). Runs on the owning host (post-forward) so the
+	// check happens once against the cluster-wide usage view.
+	if s.tenancy != nil {
+		if err := s.tenancy.Admit(ctx, tenancy.NormalizeProject(req.Project),
+			tenancy.QuotaRequest{VCPU: int(req.Cpu), MemMiB: int(req.MemoryMib)}); err != nil {
+			return nil, status.Errorf(codes.ResourceExhausted, "%v", err)
+		}
 	}
 
 	nics := make([]ContainerNICOpt, 0, len(req.Networks))
@@ -52,6 +84,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: nics, Labels: req.Labels,
 	})
 	if err != nil {
+		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: %v", err)
 	}
 
@@ -61,6 +94,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		State: info.State, Image: chooseImage(req.Image, info.Image),
 		CPULimit: int(req.Cpu), MemMiB: int(req.MemoryMib),
 		Labels: req.Labels, RestartPolicy: encodeRestartPolicy(req.Restart),
+		Project:   req.Project, // UpsertContainer normalizes "" → "_default"
 		CreatedAt: now,
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
@@ -69,12 +103,14 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		slog.Warn("container created but cluster row write failed",
 			"name", info.Name, "error", err)
 	}
+	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
 	return toPbContainer(rec), nil
 }
 
 func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (*emptypb.Empty, error) {
-	if err := s.RequirePerm(ctx, "/projects/_default/containers/"+req.Name, "ct.start", "operator"); err != nil {
+	project := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.start", "operator"); err != nil {
 		return nil, err
 	}
 	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
@@ -86,16 +122,19 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
+		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
 	// Clear any prior stop intent (e.g. 'operator-stop') so a subsequent
 	// unexpected stop is correctly treated as unexpected by the reconciler.
 	_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "running", "")
+	s.audit(ctx, "ct.start", req.Name, "project="+project, "ok")
 	return &emptypb.Empty{}, nil
 }
 
 func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest) (*emptypb.Empty, error) {
-	if err := s.RequirePerm(ctx, "/projects/_default/containers/"+req.Name, "ct.stop", "operator"); err != nil {
+	project := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.stop", "operator"); err != nil {
 		return nil, err
 	}
 	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
@@ -107,16 +146,20 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
 	if err := s.containerRuntime.StopContainer(ctx, req.Name, int(req.TimeoutSec)); err != nil {
+		s.audit(ctx, "ct.stop", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "stop: %v", err)
 	}
 	// Record operator intent so the container reconciler leaves it stopped
 	// (the container analogue of StopVM writing vms.state_detail='operator-stop').
 	_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "stopped", "operator-stop")
+	s.audit(ctx, "ct.stop", req.Name, "project="+project, "ok")
 	return &emptypb.Empty{}, nil
 }
 
 func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
-	if err := s.RequirePerm(ctx, "/projects/_default/containers/"+req.Name, "ct.delete", "operator"); err != nil {
+	project := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.delete", "operator"); err != nil {
+		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}
 	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
@@ -128,16 +171,20 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
 	if err := s.containerRuntime.DeleteContainer(ctx, req.Name); err != nil {
+		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	_ = corrosion.DeleteContainer(ctx, s.db, s.hostName, req.Name)
 	_ = corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name)
+	s.audit(ctx, "ct.delete", req.Name, "project="+project, "ok")
 	slog.Info("container deleted", "name", req.Name, "host", s.hostName)
 	return &emptypb.Empty{}, nil
 }
 
 func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest) (*pb.ExecContainerResponse, error) {
-	if err := s.RequirePerm(ctx, "/projects/_default/containers/"+req.Name, "ct.exec", "operator"); err != nil {
+	project := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.exec", "operator"); err != nil {
+		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
 		return nil, err
 	}
 	if req.HostName != "" && req.HostName != s.hostName {
@@ -153,8 +200,10 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 	}
 	res, err := s.containerRuntime.ExecContainer(ctx, req.Name, req.Argv)
 	if err != nil {
+		s.audit(ctx, "ct.exec", req.Name, strings.Join(req.Argv, " "), "error")
 		return nil, status.Errorf(codes.Internal, "exec: %v", err)
 	}
+	s.audit(ctx, "ct.exec", req.Name, strings.Join(req.Argv, " "), "ok")
 	return &pb.ExecContainerResponse{
 		Stdout: res.Stdout, Stderr: res.Stderr, ExitCode: int32(res.ExitCode),
 	}, nil
@@ -252,6 +301,7 @@ func toPbContainer(r corrosion.ContainerRecord) *pb.Container {
 		HostName: r.HostName, Name: r.Name, State: r.State,
 		Image: r.Image, CpuLimit: int32(r.CPULimit), MemoryMib: int32(r.MemMiB),
 		Restart: decodeRestartPolicy(r.RestartPolicy), StateDetail: r.StateDetail,
+		Project:   r.Project,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 	}
 }

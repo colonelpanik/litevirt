@@ -18,3 +18,11 @@ func vmRBACPath(vm *corrosion.VMRecord) string {
 func vmRBACPathFor(project, name string) string {
 	return "/projects/" + tenancy.NormalizeProject(project) + "/vms/" + name
 }
+
+// ctRBACPathFor builds the canonical RBAC path for a container from an explicit
+// project + name — the container analogue of vmRBACPathFor. Used by every
+// container RPC so the permission check honors the container's tenancy project
+// rather than assuming "_default".
+func ctRBACPathFor(project, name string) string {
+	return "/projects/" + tenancy.NormalizeProject(project) + "/containers/" + name
+}

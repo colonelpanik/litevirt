@@ -41,8 +41,11 @@ type ContainerRecord struct {
 	// analogue of vms.state_detail; both added in schema v24.
 	RestartPolicy string
 	StateDetail   string
-	CreatedAt     string
-	UpdatedAt     string
+	// Project is the tenancy bucket (mirrors vms.project); '' is normalized to
+	// '_default' on write. Added in schema v25.
+	Project   string
+	CreatedAt string
+	UpdatedAt string
 }
 
 // UpsertContainer creates or updates the cluster row for a container.
@@ -52,6 +55,9 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	if r.CreatedAt == "" {
 		r.CreatedAt = now
+	}
+	if r.Project == "" {
+		r.Project = "_default"
 	}
 	labelsJSON := ""
 	if len(r.Labels) > 0 {
@@ -64,8 +70,8 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
 	return c.Execute(ctx,
-		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
 		   image = excluded.image,
@@ -74,10 +80,11 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 		   labels = excluded.labels,
 		   restart_policy = excluded.restart_policy,
 		   state_detail = excluded.state_detail,
+		   project = excluded.project,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
-		labelsJSON, r.RestartPolicy, r.StateDetail, r.CreatedAt, now,
+		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, r.CreatedAt, now,
 	)
 }
 
@@ -123,6 +130,7 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 		        cpu_limit, memory_mib, COALESCE(labels, '') AS labels,
 		        COALESCE(restart_policy, '') AS restart_policy,
 		        COALESCE(state_detail, '') AS state_detail,
+		        COALESCE(project, '_default') AS project,
 		        created_at, updated_at
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		hostName, name)
@@ -139,6 +147,7 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 		CPULimit: r.Int("cpu_limit"), MemMiB: r.Int("memory_mib"),
 		Labels:        decodeContainerLabels(r.String("labels")),
 		RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
+		Project:   r.String("project"),
 		CreatedAt: r.String("created_at"), UpdatedAt: r.String("updated_at"),
 	}, nil
 }
@@ -150,6 +159,7 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 		   cpu_limit, memory_mib, COALESCE(labels, '') AS labels,
 		   COALESCE(restart_policy, '') AS restart_policy,
 		   COALESCE(state_detail, '') AS state_detail,
+		   COALESCE(project, '_default') AS project,
 		   created_at, updated_at
 		FROM containers WHERE deleted_at IS NULL`
 	var params []interface{}
@@ -170,6 +180,7 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 			CPULimit: r.Int("cpu_limit"), MemMiB: r.Int("memory_mib"),
 			Labels:        decodeContainerLabels(r.String("labels")),
 			RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
+			Project:   r.String("project"),
 			CreatedAt: r.String("created_at"), UpdatedAt: r.String("updated_at"),
 		}
 	}

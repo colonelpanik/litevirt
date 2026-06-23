@@ -223,6 +223,23 @@ func SumProjectUsage(ctx context.Context, c *Client, name string) (*ProjectUsage
 		u.MemMiBUsed = rows[0].Int("mem")
 	}
 
+	// Containers share the project's vCPU/Mem budget (one joint tenant limit).
+	// They carry plain cpu_limit/memory_mib columns; an allocation counts whether
+	// running or stopped (matching VMs). A container created with no explicit
+	// --cpu/--memory (limit 0 = unbounded) contributes 0 to that dimension —
+	// only declared limits are quota-accounted.
+	ctRows, err := c.Query(ctx,
+		`SELECT COALESCE(SUM(cpu_limit),0)  AS cpu,
+		        COALESCE(SUM(memory_mib),0) AS mem
+		 FROM containers WHERE project = ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return nil, err
+	}
+	if len(ctRows) > 0 {
+		u.VCPUUsed += ctRows[0].Int("cpu")
+		u.MemMiBUsed += ctRows[0].Int("mem")
+	}
+
 	diskRows, err := c.Query(ctx,
 		`SELECT COALESCE(SUM(vm_disks.size_bytes), 0) AS bytes
 		 FROM vm_disks

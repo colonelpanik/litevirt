@@ -119,7 +119,12 @@ import (
 //	     sliding window. Additive: the two columns get ALTERs in schemaMigrations
 //	     and CREATE-TABLE columns; old rows default restart_policy='' (treated as
 //	     'none') and state_detail=''. gap-1 from v23, auto-prestaged.
-const CurrentSchemaVersion = 24
+//	v25: containers.project — a tenancy project bucket on the containers table,
+//	     mirroring vms.project. ADD COLUMN in schemaMigrations + CREATE-TABLE
+//	     column; old rows default project='_default'. Unblocks container quota
+//	     admission, audit-actor, and per-project RBAC (paths were hardcoded to
+//	     /projects/_default/containers/). gap-1 from v24, auto-prestaged.
+const CurrentSchemaVersion = 25
 
 // InitSchema creates all required tables in the local SQLite database.
 // DDL is not broadcast — each node creates its own tables on startup.
@@ -808,6 +813,7 @@ var schemaDDL = []string{
 		labels         TEXT,                  -- JSON {key:value}
 		restart_policy TEXT,                  -- JSON {condition,delay,max_attempts,window}; '' = none (v24)
 		state_detail   TEXT,                  -- stop cause / intent, e.g. 'operator-stop' (v24)
+		project        TEXT NOT NULL DEFAULT '_default', -- tenancy bucket, mirrors vms.project (v25)
 		created_at     TEXT NOT NULL,
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT,
@@ -1301,4 +1307,7 @@ var schemaMigrations = []string{
 	// intent). container_restarts is a new table in schemaDDL — no ALTER needed.
 	`ALTER TABLE containers ADD COLUMN restart_policy TEXT`,
 	`ALTER TABLE containers ADD COLUMN state_detail TEXT`,
+
+	// containers.project — tenancy bucket (v25), mirrors vms.project.
+	`ALTER TABLE containers ADD COLUMN project TEXT NOT NULL DEFAULT '_default'`,
 }

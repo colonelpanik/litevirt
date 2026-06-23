@@ -225,6 +225,27 @@ A `FROZEN` (paused) container maps to running and is never restarted.
 > Host-loss relocation for containers is a follow-up — the reconciler currently
 > restarts a container only on the host that owns it, not on a surviving peer.
 
+## Tenancy, audit & metrics
+
+Containers are first-class tenancy citizens, at parity with VMs:
+
+- **Project** — `lv ct create --project <name>` places a container in a tenancy
+  project (default `_default`); per-container RBAC and quota use it. Set once at
+  create; shown in `lv ct ls`.
+- **Quota** — container creation is admitted against the project's quota and
+  **shares the same vCPU/memory budget as VMs** (one joint tenant limit). A
+  container created with `--cpu`/`--memory` counts toward the budget whether
+  running or stopped; an unlimited container (no `--cpu`/`--memory`) contributes
+  nothing to that dimension. Exceeding the budget fails with `ResourceExhausted`.
+- **Audit** — `create / start / stop / delete / exec` are written to the
+  tamper-evident audit hash-chain (`ct.*` actions, with the project and result);
+  permission-denied attempts are recorded too. View with `lv audit`.
+- **Metrics** — the Prometheus exporter emits `litevirt_container_state` (1=running),
+  `litevirt_container_cpu_limit`, `litevirt_container_memory_limit_mib`, and
+  `litevirt_host_container_count`; running containers also count toward
+  `litevirt_host_pressure`. (Actual cgroup cpu/mem *usage* metrics are a follow-up;
+  today the limit/allocation is reported.)
+
 ## gRPC + WebUI
 
 - **gRPC `Containers` service** — `Create / Start / Stop / Delete /

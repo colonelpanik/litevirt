@@ -283,11 +283,33 @@ How it works and what to expect:
 - **Quota.** A container's backup footprint draws down the **same `backup_gib`
   project budget** as VM backups.
 
+## Cold migration
+
+```bash
+# Move a container to another host. The repo must be reachable from BOTH hosts.
+lv ct migrate web docker-02 --repo /srv/shared/backups
+```
+
+Migration **reuses the backup→restore data path** (one tested transport): the
+source stops the container, archives its rootfs+config into the staging repo,
+the target rebuilds from it, and the source copy is removed. If the container
+was running it's restarted on the target.
+
+- **Cold only** — the container is stopped for the transfer (no CRIU / live
+  migration). This is the same model as VM cold migration.
+- **Atomic re-key.** The owner moves to the target only after the restore
+  succeeds; exactly one live row survives the window. **A failure before cutover
+  leaves the container intact on the source** (restarted if it had been running).
+- **Shared repo required.** `--repo` must be reachable from both hosts (e.g. an
+  NFS-mounted backup repo) — that's the transfer medium. Run against the source
+  host (`LV_HOST`).
+- Refuses to migrate onto a host that already has a container of that name.
+
 ## gRPC + WebUI
 
 - **gRPC `Containers` service** — `Create / Start / Stop / Delete /
-  Exec / List / PullOCIImage / BackupContainer / RestoreContainer` RPCs.
-  `lv ct …` defaults to gRPC;
+  Exec / List / PullOCIImage / BackupContainer / RestoreContainer /
+  MigrateContainer` RPCs. `lv ct …` defaults to gRPC;
   cross-host requests forward via `peerClient` to the named host.
   `--local` flag forces the host-local lxc-* path for bootstrap /
   debug. The `containers` cluster-state table backs cluster-wide
@@ -305,11 +327,12 @@ How it works and what to expect:
 - Cross-host container backup/restore streaming — today, like VM backup,
   a container is archived on its owning host (run against `LV_HOST`); a
   relay so any entry node can drive it is a follow-up.
-- Migration + load-balancing for containers — migration is VM-only today; a
-  planned follow-up (cold migration reuses the backup→restore transport).
-  Container-name LB backends have shipped.
-- Live migration (CRIU). Cold migration is a copy + start at the
-  destination — no different from VM cold migration.
+- Live migration (CRIU). **Cold** migration has shipped (`lv ct migrate`, see
+  above — stop → transfer → start, reusing the backup transport); live migration
+  with in-flight process state (CRIU) is a follow-up.
+- Cross-host backup/restore/migrate today require a repo reachable from the
+  hosts involved (run against `LV_HOST`); a peer-streaming relay so any entry
+  node can drive them without shared storage is a follow-up.
 - OCI image cache reuse — each `lv ct pull` re-fetches from the
   registry; the backup chunk store will eventually absorb image
   layers.

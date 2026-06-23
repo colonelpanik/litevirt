@@ -145,6 +145,7 @@ lv ct ls
 lv ct exec <name> -- <cmd> [args...]
 lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
+lv ct migrate <name> <target-host> --repo <shared-dir> # cold-migrate (stop → transfer → start)
 ```
 
 `--local` runs against the local lxc-* binaries instead of the gRPC service
@@ -154,6 +155,12 @@ lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a b
 and pushes a self-contained manifest into a PBS-equivalent repo (dedup against
 earlier backups is automatic). `lv ct restore` rebuilds it from the repo alone
 — even after `lv ct rm` — refusing to clobber a live container of the same name.
+
+`lv ct migrate` cold-migrates a container to another host by reusing that
+backup→restore transport: stop → archive → restore on target → restart (if it
+was running). `--repo` must be reachable from **both** hosts (e.g. an
+NFS-mounted repo). A failure before cutover leaves the container intact on the
+source. No live migration / CRIU.
 
 ## Registry credentials
 

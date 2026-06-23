@@ -658,6 +658,36 @@ message RestoreContainerProgress {
     string error         = 6;
 }
 
+// MigrateContainerRequest cold-migrates a container to another host by reusing
+// the backup→restore data path: the source archives the (stopped) container into
+// a staging repo, the target restores from it. repo_path must therefore be
+// reachable from BOTH hosts (e.g. an NFS-mounted backup repo). No CRIU / live
+// migration — the container is stopped for the transfer and restarted on the
+// target if it was running.
+message MigrateContainerRequest {
+    string name        = 1;
+    string source_host = 2;  // empty = resolve by name
+    string target_host = 3;
+    string repo_path   = 4;  // staging repo reachable from both hosts
+}
+
+message MigrateContainerProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        VALIDATING    = 1;
+        STOPPING      = 2;  // cold: stop the container before transfer
+        ARCHIVING     = 3;  // push rootfs+config into the staging repo
+        RESTORING     = 4;  // target rebuilds from the repo
+        FINALIZING    = 5;  // re-key owner, remove source copy
+        DONE          = 6;
+        FAILED        = 7;
+    }
+    Phase  phase           = 1;
+    int64  bytes_processed = 2;
+    string status          = 3;
+    string error           = 4;
+}
+
 // FirewallStatus is the post-Reconcile snapshot the daemon hands back
 // from ReloadFirewall.
 message FirewallStatus {
@@ -1376,6 +1406,7 @@ service LiteVirt {
     rpc PullOCIImage(PullOCIImageRequest)       returns (google.protobuf.Empty);
     rpc BackupContainer(BackupContainerRequest)   returns (stream BackupContainerProgress);
     rpc RestoreContainer(RestoreContainerRequest) returns (stream RestoreContainerProgress);
+    rpc MigrateContainer(MigrateContainerRequest) returns (stream MigrateContainerProgress);
 
     // ── Stats ──
     rpc GetVMStats(GetVMStatsRequest)       returns (VMStats);

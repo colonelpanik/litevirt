@@ -110,32 +110,15 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		}()
 	}
 
-	specJSON, _ := json.Marshal(containerBackupSpec{
-		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
-		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
-	})
-
 	s.audit(ctx, "ct.backup", req.Name, "project="+project+" → "+req.RepoPath, "started")
 
-	// Pipe the export tar straight into the chunk store so we never buffer the
-	// whole rootfs. If PushDisk returns early (error), CloseWithError unblocks
-	// the export goroutine's pending Write.
-	pr, pw := io.Pipe()
-	go func() {
-		pw.CloseWithError(s.containerRuntime.ExportContainer(ctx, req.Name, pw))
-	}()
-	manifest, perr := pbsstore.PushDisk(ctx, repo, pr, pbsstore.PushOptions{
-		VMName: req.Name, DiskName: containerBackupDisk, Timestamp: timestamp,
-		ContainerSpecJSON: string(specJSON),
-		Progress: func(p pbsstore.PushProgress) {
-			_ = send(&pb.BackupContainerProgress{
-				Phase:          pb.BackupContainerProgress_COPY,
-				BytesProcessed: p.BytesProcessed, BytesNew: p.BytesNew,
-				ChunksTotal: int32(p.ChunksTotal), ChunksDeduped: int32(p.ChunksDeduped),
-			})
-		},
+	manifest, perr := s.archiveContainer(ctx, repo, rec, timestamp, func(p pbsstore.PushProgress) {
+		_ = send(&pb.BackupContainerProgress{
+			Phase:          pb.BackupContainerProgress_COPY,
+			BytesProcessed: p.BytesProcessed, BytesNew: p.BytesNew,
+			ChunksTotal: int32(p.ChunksTotal), ChunksDeduped: int32(p.ChunksDeduped),
+		})
 	})
-	_ = pr.CloseWithError(perr)
 	if perr != nil {
 		s.audit(ctx, "ct.backup", req.Name, "project="+project, "error")
 		return status.Errorf(codes.Internal, "backup push: %v", perr)
@@ -153,6 +136,31 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		BytesProcessed: manifest.TotalSize,
 		Status:         fmt.Sprintf("backup stored at %s", manifest.Timestamp),
 	})
+}
+
+// archiveContainer streams a container's whole on-disk directory (rootfs + LXC
+// config) into repo as a full, content-addressed manifest, embedding its spec
+// so a restore is self-contained. The caller holds the ct lock and has already
+// quiesced the container (frozen for a live backup, or stopped for migration).
+// Shared by BackupContainer and MigrateContainer — one tested data path.
+func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
+	specJSON, _ := json.Marshal(containerBackupSpec{
+		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
+		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
+	})
+	// Pipe the export tar straight into the chunk store so we never buffer the
+	// whole rootfs. If PushDisk returns early (error), CloseWithError unblocks
+	// the export goroutine's pending Write.
+	pr, pw := io.Pipe()
+	go func() {
+		pw.CloseWithError(s.containerRuntime.ExportContainer(ctx, rec.Name, pw))
+	}()
+	m, perr := pbsstore.PushDisk(ctx, repo, pr, pbsstore.PushOptions{
+		VMName: rec.Name, DiskName: containerBackupDisk, Timestamp: timestamp,
+		ContainerSpecJSON: string(specJSON), Progress: progress,
+	})
+	_ = pr.CloseWithError(perr)
+	return m, perr
 }
 
 // RestoreContainer rebuilds a container from a manifest alone: materialise the

@@ -36,6 +36,7 @@ func newCTCmd() *cobra.Command {
 		newCTPullCmd(),
 		newCTBackupCmd(),
 		newCTRestoreCmd(),
+		newCTMigrateCmd(),
 	)
 	return cmd
 }
@@ -458,6 +459,61 @@ are gone. Runs on the target host; pass --start to bring it up.`,
 	cmd.Flags().StringVar(&repo, "repo", "", "Backup repo path")
 	cmd.Flags().StringVar(&ts, "timestamp", "", "Manifest timestamp (exact RFC3339)")
 	cmd.Flags().BoolVar(&start, "start", false, "Start the container after restore")
+	return cmd
+}
+
+// newCTMigrateCmd cold-migrates a container to another host via the backup→
+// restore transport. The repo must be reachable from both hosts.
+func newCTMigrateCmd() *cobra.Command {
+	var source, repo string
+	cmd := &cobra.Command{
+		Use:   "migrate <name> <target-host>",
+		Short: "Cold-migrate a container to another host (stop → transfer → start)",
+		Long: `Cold-migrate a container to another host, reusing the backup→restore
+data path: the source stops the container, archives its rootfs + config
+into a staging repo, and the target rebuilds from it. If it was running
+it's restarted on the target. A failure before cutover leaves the
+container intact on the source.
+
+--repo must point at a staging repo reachable from BOTH hosts (e.g. an
+NFS-mounted backup repo). Run against the owning host (set LV_HOST).`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if repo == "" {
+				return fmt.Errorf("--repo is required (must be reachable from both hosts)")
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				stream, err := c.MigrateContainer(ctx, &pb.MigrateContainerRequest{
+					Name: args[0], SourceHost: source, TargetHost: args[1], RepoPath: repo,
+				})
+				if err != nil {
+					return err
+				}
+				for {
+					p, err := stream.Recv()
+					if err == io.EOF {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					switch p.Phase {
+					case pb.MigrateContainerProgress_DONE:
+						fmt.Printf("[done] %s migrated to %s\n", args[0], args[1])
+						return nil
+					case pb.MigrateContainerProgress_FAILED:
+						return fmt.Errorf("migration failed: %s", p.Error)
+					default:
+						if p.Status != "" {
+							fmt.Printf("[%s] %s\n", p.Phase, p.Status)
+						}
+					}
+				}
+			})
+		},
+	}
+	cmd.Flags().StringVar(&source, "source", "", "Source host (default: resolve by name)")
+	cmd.Flags().StringVar(&repo, "repo", "", "Staging repo path reachable from both hosts")
 	return cmd
 }
 

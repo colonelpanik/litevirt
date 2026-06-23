@@ -58,6 +58,11 @@ type Server struct {
 	// when non-nil it reports whether this host's keepalived for an LB is running.
 	lbKeepalivedOverride func(name string) bool
 
+	// migrateRestoreOverride is a test seam for container cold migration: when
+	// non-nil it replaces the real "dial the target peer + drive RestoreContainer"
+	// step (unit tests have no second daemon). Production leaves it nil.
+	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) error
+
 	// loginThrottle rate-limits failed Login attempts per (username, IP) to
 	// blunt password / second-factor brute force. In-memory + per-node; nil
 	// in bare test servers (no throttling) and set by NewServer in production.

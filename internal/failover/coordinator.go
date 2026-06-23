@@ -604,7 +604,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				slog.Info("failover: VM recovered via replica promotion", "vm", vm.Name)
 				c.fenceRelocated[h.Name] = true
 				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-					ID: newID(), Username: "failover-coordinator", Action: "failover.promote",
+					ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.promote",
 					Target: vm.Name, Detail: "promoted replica after fencing " + h.Name, Result: "ok",
 				})
 				continue
@@ -688,6 +688,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 			ID:       newID(),
 			Username: "failover-coordinator",
+			HostName: c.hostName,
 			Action:   "failover",
 			Target:   vm.Name,
 			Detail:   "rescheduled from " + h.Name + " to " + targetName,

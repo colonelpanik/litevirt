@@ -182,6 +182,39 @@ func TestAuditChain_ResealFixesLegacyGlobalChain(t *testing.T) {
 	}
 }
 
+// TestAuditChain_EmptyHostRowIsResetPoint reproduces the live v1.0.15 failure:
+// a background-context audit row with no host_name (e.g. failover.promote) sorts
+// first under per-host verify and carries a global-model hash, so a naive
+// per-host verify breaks at row 0. Such rows belong to no host's sub-chain and
+// must be treated as reset points, not chain links.
+func TestAuditChain_EmptyHostRowIsResetPoint(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	// An orphan row with empty host_name and a non-NULL, arbitrary content_hash
+	// (as the old global chain would have produced) — bypass InsertAuditLog.
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, result, prev_hash, content_hash)
+		 VALUES ('orphan', '2026-06-08T14:10:41Z', 'failover-coordinator', '', 'failover.promote', 'vm1', 'ok', 'deadbeef', 'cafebabe')`); err != nil {
+		t.Fatalf("seed orphan row: %v", err)
+	}
+	// A normal per-host chain alongside it.
+	ResetChainStateForTests()
+	ins(t, c, "a1", "hostA", "2026-06-23T10:00:01Z")
+	ins(t, c, "a2", "hostA", "2026-06-23T10:00:02Z")
+
+	checked, broken, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if broken != "" {
+		t.Errorf("empty-host orphan should be a reset point, not a break; broke at %q", broken)
+	}
+	if checked != 3 {
+		t.Errorf("checked %d, want 3 (orphan + a1 + a2)", checked)
+	}
+}
+
 // TestResealAuditChain_Idempotent: re-sealing an already-consistent
 // per-host chain rewrites nothing.
 func TestResealAuditChain_Idempotent(t *testing.T) {

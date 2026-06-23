@@ -157,6 +157,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("failed to migrate legacy network names", "error", err)
 	}
 
+	// Re-base THIS host's audit sub-chain at startup. Rows written under the
+	// old global-chain model can't verify per-host, so this heals them eagerly
+	// (idempotent — a consistent chain rewrites nothing) and seeds the
+	// in-process tail. Doing it here, not lazily on the first audit write, means
+	// the chain is verifiable right after a rolling upgrade even on a node that
+	// performs no audited action for a while. Each daemon heals only the
+	// sub-chain it authored, so the cluster self-heals with no coordination.
+	if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Warn("audit chain reseal at startup failed", "error", err)
+	} else if n > 0 {
+		slog.Info("audit: re-based own-host chain at startup", "host", d.cfg.HostName, "rows", n)
+	}
+
 	// Set up libvirt TLS symlinks so qemu+tls:// migration works
 	// using our existing PKI certs. Best-effort — log warning if it fails.
 	if err := pki.SetupLibvirtTLS(d.cfg.PKIDir); err != nil {

@@ -152,9 +152,12 @@ func VerifyAuditChain(ctx context.Context, c *Client) (int, string, error) {
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
-		if stored == "" {
-			// Chain-reset point — accept and reset this host's tail so we
-			// don't poison subsequent rows of the same host.
+		if stored == "" || host == "" {
+			// Reset point: a NULL content_hash (rows predating the chain) OR a
+			// row with no host identity (audit writes from a background context
+			// that has no host — e.g. the failover coordinator). Such rows
+			// belong to no host's authored sub-chain, so they're accepted
+			// without a linkage check rather than breaking a host's chain.
 			prevByHost[host] = ""
 			checked++
 			continue

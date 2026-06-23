@@ -246,10 +246,48 @@ Containers are first-class tenancy citizens, at parity with VMs:
   `litevirt_host_pressure`. (Actual cgroup cpu/mem *usage* metrics are a follow-up;
   today the limit/allocation is reported.)
 
+## Backup & restore
+
+Containers back up to the same PBS-equivalent chunk store as VMs (BLAKE3
+content-addressed dedup), so re-running a backup only writes what changed.
+
+```bash
+# Freeze the container, archive its rootfs + LXC config, and push to a repo.
+lv ct backup web --repo /srv/backups
+
+# Rebuild it later from the repo alone — even after `lv ct rm web` and even
+# if the original image/template is gone. --start brings it up.
+lv ct restore web --repo /srv/backups --timestamp 2026-06-23T10:00:00Z --start
+```
+
+How it works and what to expect:
+
+- **Full, crash-/app-consistent.** A *running* container is frozen
+  (`lxc-freeze`) for the duration of the read so the archive is a consistent
+  point-in-time, then unfrozen — always, even if the backup fails midway. A
+  stopped container is archived as-is. There is no dirty-bitmap incremental
+  (containers are full-only); the chunk store's dedup gives storage-side
+  incrementality, so the second backup of an unchanged rootfs writes almost
+  nothing.
+- **Self-contained manifest.** The manifest embeds the container's spec
+  (cpu/memory/labels/restart-policy/project/image) alongside the archived
+  rootfs **and** its LXC config, so restore needs only the repo — not the source
+  cluster, and not the original OCI image or download template.
+- **Restore is non-destructive.** It refuses to overwrite a live container of
+  the same name (`AlreadyExists`) — `lv ct rm` it first, or restore onto a host
+  that doesn't have it. The restored container comes up `stopped` unless you
+  pass `--start`.
+- **Host-local, like VM backup.** A container is archived on its owning host;
+  run `lv ct backup`/`restore` against that host (`LV_HOST`). Restore runs on
+  the **target** host (where the container will live).
+- **Quota.** A container's backup footprint draws down the **same `backup_gib`
+  project budget** as VM backups.
+
 ## gRPC + WebUI
 
 - **gRPC `Containers` service** — `Create / Start / Stop / Delete /
-  Exec / List / PullOCIImage` RPCs. `lv ct …` defaults to gRPC;
+  Exec / List / PullOCIImage / BackupContainer / RestoreContainer` RPCs.
+  `lv ct …` defaults to gRPC;
   cross-host requests forward via `peerClient` to the named host.
   `--local` flag forces the host-local lxc-* path for bootstrap /
   debug. The `containers` cluster-state table backs cluster-wide
@@ -262,10 +300,14 @@ Containers are first-class tenancy citizens, at parity with VMs:
 ## What's still in flight
 
 - Per-container snapshots (LXC has native snapshot support, but
-  litevirt's snapshot RPC is VM-only today).
-- Migration + load-balancing for containers — VM-only today; a planned
-  follow-up (cold migration via stop→stream rootfs→start; container-name
-  LB backends).
+  litevirt's snapshot RPC is VM-only today). Backup/restore has shipped
+  (see above); snapshots are the next day-2 feature.
+- Cross-host container backup/restore streaming — today, like VM backup,
+  a container is archived on its owning host (run against `LV_HOST`); a
+  relay so any entry node can drive it is a follow-up.
+- Migration + load-balancing for containers — migration is VM-only today; a
+  planned follow-up (cold migration reuses the backup→restore transport).
+  Container-name LB backends have shipped.
 - Live migration (CRIU). Cold migration is a copy + start at the
   destination — no different from VM cold migration.
 - OCI image cache reuse — each `lv ct pull` re-fetches from the

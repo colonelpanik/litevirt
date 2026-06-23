@@ -31,7 +31,7 @@ func TestSumProjectUsage_IncludesContainers(t *testing.T) {
 		}
 	}
 	mk("a", "p1", "running", 2, 512)
-	mk("b", "p1", "stopped", 1, 256) // stopped still counts
+	mk("b", "p1", "stopped", 1, 256)  // stopped still counts
 	mk("c", "p2", "running", 4, 4096) // other project — must not leak
 
 	u, err := SumProjectUsage(ctx, c, "p1")
@@ -40,6 +40,51 @@ func TestSumProjectUsage_IncludesContainers(t *testing.T) {
 	}
 	if u.VCPUUsed != 3 || u.MemMiBUsed != 768 {
 		t.Errorf("p1 usage = %d vCPU / %d MiB, want 3 / 768 (a+b, stopped included, p2 excluded)", u.VCPUUsed, u.MemMiBUsed)
+	}
+}
+
+// Container backups (v26) draw down the SAME backup_gib budget as VMs: the
+// per-(container,repo) index round-trips, sums into BackupGiBUsed for the
+// container's project, and re-pushing the same (container,repo) overwrites
+// rather than double-counts.
+func TestUpsertContainerBackup_AndProjectFootprint(t *testing.T) {
+	c := newCtTestClient(t)
+	ctx := context.Background()
+
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName: "h1", Name: "ct1", State: "running", Project: "p1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName: "h1", Name: "other", State: "running", Project: "p2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const giB = int64(1) << 30
+	if err := UpsertContainerBackup(ctx, c, "ct1", "/repo", 3*giB); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertContainerBackup(ctx, c, "other", "/repo", 9*giB); err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := SumProjectUsage(ctx, c, "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.BackupGiBUsed != 3 {
+		t.Errorf("p1 BackupGiBUsed = %d, want 3 (ct1 only; p2's container excluded)", u.BackupGiBUsed)
+	}
+
+	// Re-push the same (container, repo) with a new size → overwrite, not add.
+	if err := UpsertContainerBackup(ctx, c, "ct1", "/repo", 5*giB); err != nil {
+		t.Fatal(err)
+	}
+	u, _ = SumProjectUsage(ctx, c, "p1")
+	if u.BackupGiBUsed != 5 {
+		t.Errorf("after re-push BackupGiBUsed = %d, want 5 (overwrite)", u.BackupGiBUsed)
 	}
 }
 

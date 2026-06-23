@@ -124,7 +124,12 @@ import (
 //	     column; old rows default project='_default'. Unblocks container quota
 //	     admission, audit-actor, and per-project RBAC (paths were hardcoded to
 //	     /projects/_default/containers/). gap-1 from v24, auto-prestaged.
-const CurrentSchemaVersion = 25
+//	v26: container_backups — indexes the latest full-backup size per (container,
+//	     repo), mirroring vm_backups, so the tenancy backup_gib quota sums
+//	     container footprints alongside VMs. New table in schemaDDL only (no
+//	     ALTER — CREATE TABLE IF NOT EXISTS covers fresh + existing DBs). Unblocks
+//	     container backup/restore (full tar → pbsstore). gap-1 from v25.
+const CurrentSchemaVersion = 26
 
 // InitSchema creates all required tables in the local SQLite database.
 // DDL is not broadcast — each node creates its own tables on startup.
@@ -749,6 +754,18 @@ var schemaDDL = []string{
 		total_bytes INTEGER NOT NULL DEFAULT 0,
 		updated_at  TEXT NOT NULL,
 		PRIMARY KEY (vm_name, disk_name, repo)
+	)`,
+
+	// container_backups is the container analogue of vm_backups (v26): the
+	// latest full-backup size per (container, repo), so the tenancy backup_gib
+	// quota can sum container footprints alongside VMs. A container has one
+	// logical "disk" (its rootfs), so there's no disk_name dimension.
+	`CREATE TABLE IF NOT EXISTS container_backups (
+		ct_name     TEXT NOT NULL,
+		repo        TEXT NOT NULL,
+		total_bytes INTEGER NOT NULL DEFAULT 0,
+		updated_at  TEXT NOT NULL,
+		PRIMARY KEY (ct_name, repo)
 	)`,
 
 	// ═══════════ OVERLAY NETWORKING ═══════════

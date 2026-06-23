@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -103,6 +104,15 @@ type Runtime interface {
 	// RootFSPath returns the host filesystem path of the container's root
 	// (lxc.rootfs.path), the directory tree backup/snapshot/clone operate on.
 	RootFSPath(name string) (string, error)
+	// ExportContainer writes a tar stream of the container's on-disk directory
+	// (its config + rootfs) to w. Quiesce with Freeze first for a consistent
+	// read. The stream is self-contained: ImportContainer rebuilds the container
+	// from it alone, even on a different host.
+	ExportContainer(ctx context.Context, name string, w io.Writer) error
+	// ImportContainer rebuilds a container's on-disk directory from a tar stream
+	// produced by ExportContainer, then rewrites the config's rootfs path so it
+	// is valid at this host's lxcpath. The container is left stopped.
+	ImportContainer(ctx context.Context, name string, r io.Reader) error
 }
 
 // CreateOpts collects parameters for Runtime.Create.
@@ -409,6 +419,84 @@ func (r *LxcRunner) RootFSPath(name string) (string, error) {
 		}
 	}
 	return filepath.Join(r.lxcpath(), name, "rootfs"), nil
+}
+
+// ExportContainer tars the container's whole on-disk directory (config + rootfs)
+// from <lxcpath> to w. Tarring the directory — not just the rootfs — keeps the
+// LXC config (network, limits, mounts) in the archive so a restore is faithful
+// without a source cluster. Freeze the container first for a consistent read.
+func (r *LxcRunner) ExportContainer(ctx context.Context, name string, w io.Writer) error {
+	dir := filepath.Join(r.lxcpath(), name)
+	if _, err := os.Stat(dir); err != nil {
+		return fmt.Errorf("container dir %s: %w", dir, err)
+	}
+	// -C <lxcpath> <name> stores paths relative to the container name, so a
+	// restore can extract under a different lxcpath. --numeric-owner keeps uid/gid
+	// stable across hosts that may not share /etc/passwd.
+	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner", "-cf", "-", name)
+	stderr := strings.Builder{}
+	cmd.Stderr = stringWriter{&stderr}
+	cmd.Stdout = w
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("tar export %s: %w: %s", name, err, stderr.String())
+	}
+	return nil
+}
+
+// ImportContainer extracts a tar stream from ExportContainer into <lxcpath>,
+// recreating <lxcpath>/<name>/{config,rootfs}, then rewrites lxc.rootfs.path to
+// this host's layout (the archived config may carry the source host's path).
+// It refuses to clobber an existing container directory.
+func (r *LxcRunner) ImportContainer(ctx context.Context, name string, src io.Reader) error {
+	dir := filepath.Join(r.lxcpath(), name)
+	if _, err := os.Stat(dir); err == nil {
+		return fmt.Errorf("container dir %s already exists; refusing to overwrite", dir)
+	}
+	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
+		return fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err)
+	}
+	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner", "-xf", "-")
+	stderr := strings.Builder{}
+	cmd.Stderr = stringWriter{&stderr}
+	cmd.Stdin = src
+	if err := cmd.Run(); err != nil {
+		// Clean up a partial extraction so a retry isn't blocked by the
+		// "already exists" guard above.
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("tar import %s: %w: %s", name, err, stderr.String())
+	}
+	if err := r.rewriteRootFSPath(name); err != nil {
+		_ = os.RemoveAll(dir)
+		return err
+	}
+	return nil
+}
+
+// rewriteRootFSPath pins the container config's lxc.rootfs.path to this host's
+// <lxcpath>/<name>/rootfs after an import, so a container restored under a
+// different lxcpath (or from another host) boots against the real rootfs.
+func (r *LxcRunner) rewriteRootFSPath(name string) error {
+	cfg := filepath.Join(r.lxcpath(), name, "config")
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		return fmt.Errorf("read imported config %s: %w", cfg, err)
+	}
+	want := "lxc.rootfs.path = dir:" + filepath.Join(r.lxcpath(), name, "rootfs")
+	lines := strings.Split(string(data), "\n")
+	replaced := false
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "lxc.rootfs.path") {
+			lines[i] = want
+			replaced = true
+		}
+	}
+	if !replaced {
+		lines = append([]string{want}, lines...)
+	}
+	if err := os.WriteFile(cfg, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		return fmt.Errorf("rewrite imported config %s: %w", cfg, err)
+	}
+	return nil
 }
 
 // parseLxcInfoState normalises lxc-info -s -H output ("RUNNING\n",

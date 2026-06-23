@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -169,6 +170,11 @@ type ContainerRuntime interface {
 	FreezeContainer(ctx context.Context, name string) error
 	UnfreezeContainer(ctx context.Context, name string) error
 	ContainerRootFSPath(name string) (string, error)
+	// ExportContainer/ImportContainer stream a container's on-disk directory
+	// (config + rootfs) as a tar for backup/restore (B1). Quiesce with
+	// FreezeContainer before exporting.
+	ExportContainer(ctx context.Context, name string, w io.Writer) error
+	ImportContainer(ctx context.Context, name string, r io.Reader) error
 	PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error
 }
 
@@ -219,12 +225,12 @@ type StoragePoolRef struct {
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
 	return &Server{
-		hostName:   hostName,
-		dataDir:    dataDir,
-		pkiDir:     pkiDir,
-		db:         db,
-		virt:       virt,
-		images:     images,
+		hostName:      hostName,
+		dataDir:       dataDir,
+		pkiDir:        pkiDir,
+		db:            db,
+		virt:          virt,
+		images:        images,
 		events:        events.NewBus(),
 		vmLocks:       make(map[string]*sync.Mutex),
 		loginThrottle: newLoginThrottle(),

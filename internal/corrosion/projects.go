@@ -25,13 +25,13 @@ type ProjectRecord struct {
 
 // ProjectQuotaRecord caps one project's resource usage. Zero = unbounded.
 type ProjectQuotaRecord struct {
-	ProjectName     string
-	VCPULimit       int
-	MemMiBLimit     int
-	DiskGiBLimit    int
-	NICLimit        int
-	PublicIPLimit   int
-	BackupGiBLimit  int
+	ProjectName    string
+	VCPULimit      int
+	MemMiBLimit    int
+	DiskGiBLimit   int
+	NICLimit       int
+	PublicIPLimit  int
+	BackupGiBLimit int
 }
 
 // InsertProject creates a new project. Parent must already exist
@@ -269,8 +269,11 @@ func SumProjectUsage(ctx context.Context, c *Client, name string) (*ProjectUsage
 		}
 	}
 
-	// Backup footprint: sum the latest backup size per (vm, disk, repo) from
-	// the vm_backups index (populated by UpsertVMBackup on each push).
+	// Backup footprint: VMs and containers draw down the SAME backup_gib budget.
+	// Sum the latest backup size per (vm, disk, repo) from vm_backups and per
+	// (container, repo) from container_backups (both populated on each push;
+	// manifests themselves live on-disk in pbsstore repos, not in Corrosion).
+	var backupBytes int64
 	bkRows, err := c.Query(ctx,
 		`SELECT COALESCE(SUM(vm_backups.total_bytes), 0) AS bytes
 		 FROM vm_backups
@@ -278,8 +281,18 @@ func SumProjectUsage(ctx context.Context, c *Client, name string) (*ProjectUsage
 		 WHERE vms.project = ? AND vms.deleted_at IS NULL`,
 		name)
 	if err == nil && len(bkRows) > 0 {
-		u.BackupGiBUsed = int(bkRows[0].Int64("bytes") / (1 << 30))
+		backupBytes += bkRows[0].Int64("bytes")
 	}
+	ctBkRows, err := c.Query(ctx,
+		`SELECT COALESCE(SUM(container_backups.total_bytes), 0) AS bytes
+		 FROM container_backups
+		 JOIN containers ON container_backups.ct_name = containers.name
+		 WHERE containers.project = ? AND containers.deleted_at IS NULL`,
+		name)
+	if err == nil && len(ctBkRows) > 0 {
+		backupBytes += ctBkRows[0].Int64("bytes")
+	}
+	u.BackupGiBUsed = int(backupBytes / (1 << 30))
 
 	return u, nil
 }
@@ -299,6 +312,20 @@ func UpsertVMBackup(ctx context.Context, c *Client, vmName, diskName, repo strin
 		   total_bytes = excluded.total_bytes,
 		   updated_at  = excluded.updated_at`,
 		vmName, diskName, repo, totalBytes, now)
+}
+
+// UpsertContainerBackup records the latest backup size for one (container, repo)
+// into the container_backups index — the container analogue of UpsertVMBackup,
+// so the tenancy backup_gib quota sums container footprints alongside VMs.
+func UpsertContainerBackup(ctx context.Context, c *Client, ctName, repo string, totalBytes int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return c.Execute(ctx,
+		`INSERT INTO container_backups (ct_name, repo, total_bytes, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(ct_name, repo) DO UPDATE SET
+		   total_bytes = excluded.total_bytes,
+		   updated_at  = excluded.updated_at`,
+		ctName, repo, totalBytes, now)
 }
 
 // QuotaCheck describes a proposed resource request. The admission

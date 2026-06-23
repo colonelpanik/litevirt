@@ -603,6 +603,61 @@ message PullOCIImageRequest {
     string password = 6;
 }
 
+// BackupContainerRequest pushes a container's rootfs (and its LXC config) into a
+// host-local backup repo as a full, content-addressed manifest. Containers are
+// host-local, so this runs on the owning host; an empty host_name is resolved by
+// name and, if the owner is a different daemon, FailedPrecondition names it.
+message BackupContainerRequest {
+    string name      = 1;
+    string host_name = 2;  // empty = resolve by name
+    string repo_path = 3;  // host-local directory (must be initialised)
+    string timestamp = 4;  // RFC3339; empty = now
+}
+
+message BackupContainerProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        FREEZE        = 1;  // quiescing the container for a consistent read
+        COPY          = 2;  // streaming rootfs chunks into the repo
+        DONE          = 3;
+    }
+    Phase  phase           = 1;
+    int64  bytes_processed = 2;
+    int64  bytes_new       = 3;
+    int32  chunks_total    = 4;
+    int32  chunks_deduped  = 5;
+    string status          = 6;
+    string manifest_ts     = 7;  // populated on DONE
+    string error           = 8;
+}
+
+// RestoreContainerRequest rebuilds a container from a manifest alone (the embedded
+// spec + the archived rootfs/config), so it works even after the source is gone.
+// Runs on the target host (where the container will live); host_name empty = the
+// daemon you call. start brings it up after restore.
+message RestoreContainerRequest {
+    string repo_path = 1;
+    string name      = 2;  // manifest selector
+    string timestamp = 3;  // exact RFC3339 of manifest
+    string host_name = 4;  // target host; empty = this daemon
+    bool   start     = 5;  // start the container after restore
+}
+
+message RestoreContainerProgress {
+    enum Phase {
+        PHASE_UNKNOWN = 0;
+        RESTORE       = 1;  // materialising rootfs from chunks
+        IMPORT        = 2;  // laying down the container + config
+        DONE          = 3;
+    }
+    Phase  phase         = 1;
+    int64  bytes_written = 2;
+    int32  chunks_done   = 3;
+    int32  chunks_total  = 4;
+    string status        = 5;
+    string error         = 6;
+}
+
 // FirewallStatus is the post-Reconcile snapshot the daemon hands back
 // from ReloadFirewall.
 message FirewallStatus {
@@ -1319,6 +1374,8 @@ service LiteVirt {
     rpc ExecContainer(ExecContainerRequest)     returns (ExecContainerResponse);
     rpc ListContainers(ListContainersRequest)   returns (ListContainersResponse);
     rpc PullOCIImage(PullOCIImageRequest)       returns (google.protobuf.Empty);
+    rpc BackupContainer(BackupContainerRequest)   returns (stream BackupContainerProgress);
+    rpc RestoreContainer(RestoreContainerRequest) returns (stream RestoreContainerProgress);
 
     // ── Stats ──
     rpc GetVMStats(GetVMStatsRequest)       returns (VMStats);

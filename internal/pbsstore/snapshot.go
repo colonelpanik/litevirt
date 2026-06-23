@@ -32,6 +32,10 @@ type PushOptions struct {
 	// fidelity/debugging. Best-effort; restore prefers VMSpecJSON.
 	DomainXML string
 
+	// ContainerSpecJSON, when set, embeds a serialized container spec so a
+	// container restore can recreate the cluster row from the manifest alone.
+	ContainerSpecJSON string
+
 	// Progress, if non-nil, is called once per chunk after the chunk
 	// has been written or deduped against the repo. Use it to drive
 	// gRPC stream progress.
@@ -62,13 +66,14 @@ func PushDisk(ctx context.Context, repo *Repo, src io.Reader, opts PushOptions) 
 		return nil, fmt.Errorf("vm name and disk name required")
 	}
 	m := &Manifest{
-		VMName:     opts.VMName,
-		DiskName:   opts.DiskName,
-		Timestamp:  opts.Timestamp,
-		BasedOn:    opts.BasedOn,
-		BitmapName: opts.BitmapName,
-		VMSpecJSON: opts.VMSpecJSON,
-		DomainXML:  opts.DomainXML,
+		VMName:            opts.VMName,
+		DiskName:          opts.DiskName,
+		Timestamp:         opts.Timestamp,
+		BasedOn:           opts.BasedOn,
+		BitmapName:        opts.BitmapName,
+		VMSpecJSON:        opts.VMSpecJSON,
+		DomainXML:         opts.DomainXML,
+		ContainerSpecJSON: opts.ContainerSpecJSON,
 	}
 
 	buf := make([]byte, ChunkSize)

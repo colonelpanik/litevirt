@@ -322,6 +322,25 @@ The NBD server is read-only and rejects writes with `EPERM` — guests
 that try to write straight to the backing source get a clear error
 rather than silent corruption. All writes land in the qcow2 overlay.
 
+## Containers
+
+Containers back up to the same chunk store as VM disks:
+
+```bash
+lv ct backup web --repo /srv/backup/main          # freeze + archive rootfs+config
+lv ct restore web --repo /srv/backup/main --timestamp <ts> [--start]
+```
+
+`lv ct backup` freezes a running container (consistent point-in-time), tars its
+rootfs **and** LXC config, and pushes a content-addressed, **dedup'd** manifest
+that embeds the container spec — so `lv ct restore` rebuilds it from the repo
+alone, even after `lv ct rm` or if the original image is gone. Full-only (no
+dirty-bitmap incremental); the chunk store's dedup gives storage-side
+incrementality. Host-local like VM backup (run against the owning host); a
+container's footprint counts toward the project's `backup_gib` quota. See
+[containers.md](containers.md#backup--restore). (Local point-in-time snapshots
+without a repo are `lv ct snapshot` — see that doc.)
+
 ## Compose integration
 
 Per-VM scheduled backup, configured directly in the stack:

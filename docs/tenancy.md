@@ -38,12 +38,19 @@ Each project can carry quota rows. Six dimensions are enforced today:
 
 | Dimension | Unit | Counts |
 |---|---|---|
-| `vcpu` | virtual CPUs | sum of vCPU across active VMs |
-| `memory_mib` | MiB | sum of memory across active VMs |
+| `vcpu` | virtual CPUs | sum of vCPU across active VMs **+ containers** |
+| `memory_mib` | MiB | sum of memory across active VMs **+ containers** |
 | `disk_gib` | GiB | sum of all attached disks across active VMs |
 | `nic` | count | sum of network interfaces across active VMs |
 | `public_ips` | count | NICs whose address parses as non-private per `net.ParseIP.IsPrivate()` |
-| `backup_gib` | GiB | sum of `TotalSize` across manifests for the project's VMs |
+| `backup_gib` | GiB | sum of `TotalSize` across manifests for the project's VMs **+ containers** |
+
+**Containers share the same budget as VMs** — `CreateContainer` and
+`CloneContainer` are admitted against the project's `vcpu`/`memory_mib` quota
+just like `CreateVM`, and a container's `lv ct backup` footprint counts toward
+`backup_gib`. A stopped container still counts (allocation, not live usage), and
+deleting it frees the budget. A project that still owns containers can't be
+deleted (`lv project rm` refuses until they're reassigned/removed).
 
 Set:
 

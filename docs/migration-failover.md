@@ -176,6 +176,23 @@ Set in compose `migrate` section:
 | `restart-same` | Wait for original host to recover |
 | `none` | Do not reschedule |
 
+## Containers
+
+**Cold migration** — `lv ct migrate <name> <target> --repo <shared-dir>` moves a
+container to another host by reusing the backup→restore transport (stop →
+archive → restore on target → restart if it was running). `--repo` must be
+reachable from both hosts. No live/CRIU migration.
+
+**Host-loss relocation** — when a host is fenced, the failover coordinator
+relocates its containers that carry an `on_host_failure: image-recreate` policy
+(set with `lv ct create --on-host-failure image-recreate`): it picks a healthy
+host via the placement engine, re-keys the container there, and the target's
+reconciler **recreates it from its image**. A container with no re-pullable image
+is **skipped and loudly audited** (`ct.relocate.skipped`) — recover it from a
+backup. Tier-1 recreate is best-effort (networks/advanced config not preserved);
+restore-from-backup relocation is a planned follow-up. See
+[containers.md](containers.md#host-loss-relocation).
+
 ## Monitoring
 
 ### Prometheus metrics

@@ -85,80 +85,163 @@ func (s *Server) containerBackendIP(ctx context.Context, ct corrosion.ContainerR
 	return ""
 }
 
-func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend {
-	// Try explicit backends first (standalone LBs).
-	explicitBackends, _ := corrosion.ListLBBackends(ctx, s.db, lbName)
-	if len(explicitBackends) > 0 {
-		var backends []*pb.LBBackend
-		for _, b := range explicitBackends {
-			st := "active"
-			if !b.Enabled {
-				st = "disabled"
-			}
-			backends = append(backends, &pb.LBBackend{
-				VmName:  b.VMName,
-				Address: b.Address,
-				Status:  st,
-			})
-		}
-		return backends
-	}
+// resolvedBackend is one LB backend (VM or container) with its discovered
+// address and run-state, independent of the caller's output shape.
+type resolvedBackend struct {
+	Name    string
+	IP      string
+	Running bool
+}
 
-	// Derive stack name from LB name (strip "-lb" suffix).
-	stackName := strings.TrimSuffix(lbName, "-lb")
-	if stackName == lbName {
-		return nil
+// remoteVMIP asks a peer for a VM interface's live IP (best-effort, "" on any error).
+func (s *Server) remoteVMIP(ctx context.Context, host, mac, networkName string) string {
+	client, conn, err := s.peerClient(ctx, host)
+	if err != nil {
+		return ""
 	}
+	defer conn.Close()
+	resp, err := client.GetVMIPRemote(ctx, &pb.GetVMIPRequest{Mac: mac, NetworkName: networkName})
+	if err != nil {
+		return ""
+	}
+	return resp.Ip
+}
 
+// resolveStackBackends resolves the LB backends for a stack — its VMs (address
+// from the vm_interfaces row, then local ARP/DHCP for running VMs on this host,
+// then a peer GetVMIPRemote lookup when allowRemote) and its containers
+// (containerBackendIP). When persist is set, a freshly-discovered VM IP is
+// written back to vm_interfaces. The status path uses allowRemote=false /
+// persist=false (fast, read-only — keeps `lv lb ls` cheap); the render path
+// uses allowRemote=true / persist=true (full discovery). This is the single
+// source of truth for "which backends does this stack's LB have."
+func (s *Server) resolveStackBackends(ctx context.Context, stackName string, allowRemote, persist bool) []resolvedBackend {
 	vms, err := corrosion.ListVMs(ctx, s.db, stackName, "")
 	if err != nil {
+		slog.Warn("resolveStackBackends: list VMs", "stack", stackName, "error", err)
 		return nil
 	}
-
-	var backends []*pb.LBBackend
+	var out []resolvedBackend
 	for _, vm := range vms {
+		running := vm.State == "running"
 		ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
 		ip := ""
 		for _, iface := range ifaces {
 			ip = iface.IP
-			if ip == "" && vm.HostName == s.hostName {
+			// Live discovery only makes sense for a running VM.
+			if ip == "" && running && vm.HostName == s.hostName {
 				ip = lv.GetIPFromARP(iface.MAC)
 			}
-			if ip == "" && vm.HostName == s.hostName {
+			if ip == "" && running && vm.HostName == s.hostName {
 				ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
 			}
-			if ip != "" && ip != iface.IP {
+			if ip == "" && running && allowRemote && vm.HostName != s.hostName {
+				ip = s.remoteVMIP(ctx, vm.HostName, iface.MAC, iface.NetworkName)
+			}
+			if persist && running && ip != "" && ip != iface.IP {
 				corrosion.UpdateVMInterfaceIP(ctx, s.db, vm.Name, iface.NetworkName, ip)
 			}
 			if ip != "" {
 				break
 			}
 		}
-		st := "active"
-		if vm.State != "running" {
-			st = "down"
-		}
-		backends = append(backends, &pb.LBBackend{
-			VmName:  vm.Name,
-			Address: ip,
-			Status:  st,
-		})
+		out = append(out, resolvedBackend{Name: vm.Name, IP: ip, Running: running})
 	}
-
-	// Container backends in the same stack (found via the reserved stack label).
+	// Containers in the stack (found via the reserved stack label).
 	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
 	for _, ct := range cts {
+		out = append(out, resolvedBackend{Name: ct.Name, IP: s.containerBackendIP(ctx, ct), Running: ct.State == "running"})
+	}
+	return out
+}
+
+// lbBackends returns the backend list for the LB status views. Run-state derived
+// (a backend is "active" when its workload is running); InspectLoadBalancer
+// overlays real HAProxy health on top. Read-only and no peer RPCs so `lv lb ls`
+// stays fast.
+func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend {
+	// Explicit backends first (standalone LBs).
+	if explicit, _ := corrosion.ListLBBackends(ctx, s.db, lbName); len(explicit) > 0 {
+		var backends []*pb.LBBackend
+		for _, b := range explicit {
+			st := "active"
+			if !b.Enabled {
+				st = "disabled"
+			}
+			backends = append(backends, &pb.LBBackend{VmName: b.VMName, Address: b.Address, Status: st})
+		}
+		return backends
+	}
+
+	stackName := strings.TrimSuffix(lbName, "-lb")
+	if stackName == lbName {
+		return nil
+	}
+
+	var backends []*pb.LBBackend
+	for _, rb := range s.resolveStackBackends(ctx, stackName, false, false) {
 		st := "active"
-		if ct.State != "running" {
+		if !rb.Running {
 			st = "down"
 		}
-		backends = append(backends, &pb.LBBackend{
-			VmName:  ct.Name,
-			Address: s.containerBackendIP(ctx, ct),
-			Status:  st,
-		})
+		backends = append(backends, &pb.LBBackend{VmName: rb.Name, Address: rb.IP, Status: st})
 	}
 	return backends
+}
+
+// mapHAProxyStatus maps a raw HAProxy server status ("UP 2/3", "DOWN (agent)",
+// "MAINT (via x/y)", "DRAIN", "NOLB") to litevirt's backend-status vocabulary,
+// falling back to the workload-derived status on anything unexpected.
+func mapHAProxyStatus(raw, fallback string) string {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return fallback
+	}
+	switch {
+	case fields[0] == "UP":
+		return "active"
+	case fields[0] == "DOWN":
+		return "down"
+	case strings.HasPrefix(fields[0], "MAINT"):
+		return "maint"
+	case fields[0] == "DRAIN":
+		return "draining"
+	case fields[0] == "NOLB":
+		return "nolb"
+	default:
+		return fallback
+	}
+}
+
+// lbHealthByServer returns the real HAProxy backend health (server name → raw
+// status) for an LB, querying the local stats socket or forwarding to the LB
+// host when haproxy isn't local. Used to overlay true health on the run-state
+// status in InspectLoadBalancer.
+func (s *Server) lbHealthByServer(ctx context.Context, lbName string) (map[string]string, error) {
+	if s.lbHealthOverride != nil {
+		return s.lbHealthOverride(ctx, lbName)
+	}
+	mgr := lb.NewManager()
+	stats, err := mgr.GetStats(ctx, lbName)
+	if err != nil {
+		// HAProxy not running locally — forward to an LB host that has it.
+		resp := s.forwardLBStats(ctx, &pb.LBStatsRequest{Name: lbName})
+		if resp == nil {
+			return nil, err
+		}
+		out := make(map[string]string, len(resp.Backends))
+		for _, b := range resp.Backends {
+			out[b.Name] = b.Status
+		}
+		return out, nil
+	}
+	out := map[string]string{}
+	for _, e := range stats.Entries {
+		if e.Type == 2 { // server row
+			out[e.ServerName] = e.Status
+		}
+	}
+	return out, nil
 }
 
 func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBRequest) (*pb.LoadBalancer, error) {
@@ -214,7 +297,52 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 		Ports:      ports,
 		Backends:   s.lbBackends(ctx, r.String("name")),
 	}
+
+	// Overlay REAL HAProxy health onto the run-state-derived backend status, so
+	// inspect reflects whether a backend is actually serving (not just whether
+	// its workload is running). Inspect-only: listing every LB would fan out a
+	// stats query per LB. On failure, keep run-state status + flag it.
+	health, herr := s.lbHealthByServer(ctx, result.Name)
+	if herr == nil {
+		for _, b := range result.Backends {
+			if hs, ok := health[b.VmName]; ok {
+				b.Status = mapHAProxyStatus(hs, b.Status)
+			}
+		}
+	} else if state == "active" {
+		for _, b := range result.Backends {
+			b.LastError = "haproxy health unavailable"
+		}
+	}
+
+	// VIP health: an enabled LB is "degraded" when its VIP isn't actually
+	// assigned. The reliable signal is keepalived NOT running on a host that is
+	// supposed to run this LB — HAProxy binds the VIP non-locally, so without
+	// this check a down-VIP LB would still look "active". We only assert this
+	// when inspecting ON an LB host (runsHere); a precise remote keepalived
+	// check would need an additive RPC and is a documented follow-up. (Stats
+	// being unreachable is NOT treated as degraded — that conflates "can't ask"
+	// with "VIP down".)
+	if state == "active" {
+		for _, h := range lbHosts {
+			if h == s.hostName {
+				if !s.lbKeepalivedRunning(result.Name) {
+					result.State = "degraded"
+				}
+				break
+			}
+		}
+	}
 	return result, nil
+}
+
+// lbKeepalivedRunning reports whether this host's keepalived for an LB is alive
+// (VIP assigned). Test seam: lbKeepalivedOverride replaces the real check.
+func (s *Server) lbKeepalivedRunning(name string) bool {
+	if s.lbKeepalivedOverride != nil {
+		return s.lbKeepalivedOverride(name)
+	}
+	return lb.NewManager().KeepalivedRunning(name)
 }
 
 func (s *Server) DisableBackend(ctx context.Context, req *pb.DisableBackendRequest) (*pb.LoadBalancer, error) {
@@ -482,10 +610,24 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 // lbApplyDisabled test seam lets unit tests exercise CreateLoadBalancer's
 // persistence + rollback logic without root privileges or a haproxy binary.
 func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config) error {
+	var err error
 	if s.lbApplyOverride != nil {
-		return s.lbApplyOverride(ctx, cfg)
+		err = s.lbApplyOverride(ctx, cfg)
+	} else {
+		err = lb.NewManager().Apply(ctx, cfg)
 	}
-	return lb.NewManager().Apply(ctx, cfg)
+	if err == nil {
+		s.recordLBKeepalived(cfg.Name) // publish whether the VIP came up
+	}
+	return err
+}
+
+// removeLBLocal stops this host's haproxy/keepalived for an LB and clears its
+// health gauge. Single chokepoint so teardown always drops the metric.
+func (s *Server) removeLBLocal(ctx context.Context, name string) error {
+	err := lb.NewManager().Remove(ctx, name)
+	s.clearLBKeepalived(name)
+	return err
 }
 
 func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest) (*pb.LoadBalancer, error) {
@@ -643,8 +785,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 				Interface: lb.DetectInterfaceForIP(vipIP), VRID: s.allocVRID(ctx, req.Name),
 				Priority: priority, Backends: lbBackends, Ports: ports, Algorithm: algorithm,
 			}
-			mgr := lb.NewManager()
-			if err := mgr.Apply(ctx, cfg); err != nil {
+			if err := s.applyLBLocal(ctx, cfg); err != nil {
 				slog.Warn("UpdateLoadBalancer: local apply failed", "error", err)
 			}
 			break
@@ -708,8 +849,7 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 	}
 
 	// Stop locally.
-	mgr := lb.NewManager()
-	if err := mgr.Remove(ctx, req.Name); err != nil {
+	if err := s.removeLBLocal(ctx, req.Name); err != nil {
 		slog.Warn("DeleteLoadBalancer: local remove failed", "error", err)
 	}
 
@@ -982,8 +1122,7 @@ func (s *Server) removeLBFromStaleHosts(ctx context.Context, lbName string, oldH
 		}
 		if h == s.hostName {
 			// Remove locally.
-			mgr := lb.NewManager()
-			if err := mgr.Remove(ctx, lbName); err != nil {
+			if err := s.removeLBLocal(ctx, lbName); err != nil {
 				slog.Warn("removeLBFromStaleHosts: local remove failed", "lb", lbName, "error", err)
 			} else {
 				slog.Info("removeLBFromStaleHosts: removed locally", "lb", lbName)
@@ -1119,8 +1258,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		Algorithm: algorithm,
 	}
 
-	mgr := lb.NewManager()
-	if err := mgr.Apply(ctx, cfg); err != nil {
+	if err := s.applyLBLocal(ctx, cfg); err != nil {
 		return nil, status.Errorf(codes.Internal, "apply LB: %v", err)
 	}
 
@@ -1147,8 +1285,7 @@ func (s *Server) RemoveLB(ctx context.Context, req *pb.RemoveLBRequest) (*emptyp
 		lbVIP = rows[0].String("vip")
 	}
 
-	mgr := lb.NewManager()
-	if err := mgr.Remove(ctx, req.LbName); err != nil {
+	if err := s.removeLBLocal(ctx, req.LbName); err != nil {
 		return nil, status.Errorf(codes.Internal, "remove LB: %v", err)
 	}
 
@@ -1205,78 +1342,20 @@ func (s *Server) applyLBFromSpecWithRetry(ctx context.Context, spec *pb.VMSpec) 
 
 // collectLBBackends gathers IPs for all running VMs in a stack, using ARP/DHCP
 // fallback for IPs not yet stored in corrosion.
+// collectLBBackends builds the HAProxy server list for the render/apply path:
+// running backends with a resolved IP, at the LB's target port. Uses full
+// discovery (peer lookups + IP persistence) so a freshly-migrated VM resolves.
 func (s *Server) collectLBBackends(ctx context.Context, stackName string, lbSpec *pb.LBSpec) []lb.Backend {
-	vms, err := corrosion.ListVMs(ctx, s.db, stackName, "")
-	if err != nil {
-		slog.Warn("collectLBBackends: list VMs", "stack", stackName, "error", err)
-		return nil
-	}
-
-	var backends []lb.Backend
-	for _, vm := range vms {
-		if vm.State != "running" {
-			continue
-		}
-		ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-		for _, iface := range ifaces {
-			ip := iface.IP
-			// ARP/DHCP fallback for freshly booted VMs on this host.
-			if ip == "" && vm.HostName == s.hostName {
-				ip = lv.GetIPFromARP(iface.MAC)
-			}
-			if ip == "" && vm.HostName == s.hostName {
-				ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
-			}
-			// Remote host IP discovery fallback.
-			if ip == "" && vm.HostName != s.hostName {
-				client, conn, err := s.peerClient(ctx, vm.HostName)
-				if err == nil {
-					resp, err := client.GetVMIPRemote(ctx, &pb.GetVMIPRequest{
-						Mac:         iface.MAC,
-						NetworkName: iface.NetworkName,
-					})
-					conn.Close()
-					if err == nil && resp.Ip != "" {
-						ip = resp.Ip
-					}
-				}
-			}
-			// Persist discovered IP for future lookups.
-			if ip != "" && ip != iface.IP {
-				corrosion.UpdateVMInterfaceIP(ctx, s.db, vm.Name, iface.NetworkName, ip)
-			}
-			if ip != "" {
-				targetPort := 80
-				if len(lbSpec.Ports) > 0 {
-					targetPort = int(lbSpec.Ports[0].Target)
-				}
-				backends = append(backends, lb.Backend{
-					Name: vm.Name,
-					IP:   ip,
-					Port: targetPort,
-				})
-				break
-			}
-		}
-	}
-
-	// Container backends in the same stack (found via the reserved stack label).
-	// Containers have no vm_interfaces row; their address is the recorded static
-	// IP or a local lxc-info lookup (see containerBackendIP).
 	targetPort := 80
 	if len(lbSpec.Ports) > 0 {
 		targetPort = int(lbSpec.Ports[0].Target)
 	}
-	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
-	for _, ct := range cts {
-		if ct.State != "running" {
+	var backends []lb.Backend
+	for _, rb := range s.resolveStackBackends(ctx, stackName, true, true) {
+		if !rb.Running || rb.IP == "" {
 			continue
 		}
-		ip := s.containerBackendIP(ctx, ct)
-		if ip == "" {
-			continue
-		}
-		backends = append(backends, lb.Backend{Name: ct.Name, IP: ip, Port: targetPort})
+		backends = append(backends, lb.Backend{Name: rb.Name, IP: rb.IP, Port: targetPort})
 	}
 	return backends
 }
@@ -1445,8 +1524,7 @@ func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []c
 
 	// Stop haproxy + keepalived locally.
 	slog.Info("removeLBForStack: removing LB", "stack", stackName, "lb", lbName)
-	mgr := lb.NewManager()
-	if err := mgr.Remove(ctx, lbName); err != nil {
+	if err := s.removeLBLocal(ctx, lbName); err != nil {
 		slog.Warn("removeLBForStack: local remove failed", "lb", lbName, "error", err)
 	} else {
 		slog.Info("removeLBForStack: local processes stopped", "lb", lbName)
@@ -1563,8 +1641,7 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 		Health:    health,
 	}
 
-	mgr := lb.NewManager()
-	if err := mgr.Apply(ctx, cfg); err != nil {
+	if err := s.applyLBLocal(ctx, cfg); err != nil {
 		return err
 	}
 

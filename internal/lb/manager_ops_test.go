@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -14,6 +16,108 @@ func testManager(t *testing.T) *Manager {
 	return &Manager{
 		configDir: filepath.Join(dir, "config"),
 		runDir:    filepath.Join(dir, "run"),
+	}
+}
+
+// KeepalivedRunning is the VIP-assigned signal: true only when the pidfile
+// names a live process. A missing pidfile → false (VIP not assigned).
+func TestKeepalivedRunning(t *testing.T) {
+	m := testManager(t)
+	if err := os.MkdirAll(m.runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if m.KeepalivedRunning("nope-lb") {
+		t.Error("no pidfile → should be false")
+	}
+	// A pidfile pointing at this test process (definitely alive) → true.
+	pidPath := filepath.Join(m.runDir, "live-lb-keepalived.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !m.KeepalivedRunning("live-lb") {
+		t.Error("pidfile of a live process → should be true")
+	}
+}
+
+// lbLock is keyed by LB name: same name → same mutex (serializes), different
+// names → different mutexes (no cross-LB stalling).
+func TestLBLock_KeyedByName(t *testing.T) {
+	if lbLock("a") != lbLock("a") {
+		t.Error("same name should return the same mutex")
+	}
+	if lbLock("a") == lbLock("b") {
+		t.Error("different names should return different mutexes")
+	}
+}
+
+// Concurrent Apply of the SAME LB must be serialized (no data race, no corrupted
+// config). Run under -race; the per-LB mutex is what makes this safe.
+func TestApply_ConcurrentSameLB_NoRace(t *testing.T) {
+	m := testManager(t)
+	cfg := Config{
+		Name: "race-lb", VIP: "10.0.1.100", VIPPrefix: 24, Interface: "eth0",
+		VRID: 10, Priority: 100, Algorithm: "roundrobin",
+		Backends: []Backend{{Name: "b1", IP: "10.0.1.10", Port: 8080}},
+		Ports:    []Port{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); m.Apply(context.Background(), cfg) }() //nolint:errcheck
+	}
+	wg.Wait()
+	data, err := os.ReadFile(filepath.Join(m.configDir, "race-lb-haproxy.cfg"))
+	if err != nil || !strings.Contains(string(data), "frontend race-lb-80") {
+		t.Fatalf("config corrupted/missing after concurrent applies: err=%v", err)
+	}
+}
+
+// configChanged drives the skip-if-unchanged optimization: identical bytes →
+// no reload; any difference or a missing file → reload.
+func TestConfigChanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.cfg")
+	if !configChanged(path, "anything") {
+		t.Error("missing file should count as changed")
+	}
+	if err := os.WriteFile(path, []byte("A\nB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if configChanged(path, "A\nB\n") {
+		t.Error("identical content should be unchanged")
+	}
+	if !configChanged(path, "A\nB\nC\n") {
+		t.Error("different content should be changed")
+	}
+}
+
+// Apply must (re)write the config files every time even when it skips the
+// reload, so the on-disk config stays canonical for Remove / stats discovery.
+func TestApply_WritesConfigEvenWhenUnchanged(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	cfg := Config{
+		Name: "web-lb", VIP: "10.0.1.100", VIPPrefix: 24, Interface: "eth0",
+		VRID: 10, Priority: 100, Algorithm: "roundrobin",
+		Backends: []Backend{{Name: "b1", IP: "10.0.1.10", Port: 8080}},
+		Ports:    []Port{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+	}
+	haproxyPath := filepath.Join(m.configDir, "web-lb-haproxy.cfg")
+
+	m.Apply(ctx, cfg) //nolint:errcheck — haproxy -c fails in CI; we test file writes
+	first, err := os.ReadFile(haproxyPath)
+	if err != nil {
+		t.Fatalf("first apply didn't write config: %v", err)
+	}
+	// Second apply with identical config: file still present and byte-identical
+	// (the reload is skipped, but the write is not).
+	m.Apply(ctx, cfg) //nolint:errcheck
+	second, err := os.ReadFile(haproxyPath)
+	if err != nil {
+		t.Fatalf("second apply removed config: %v", err)
+	}
+	if string(first) != string(second) {
+		t.Errorf("config changed across identical applies:\n%s\n---\n%s", first, second)
 	}
 }
 

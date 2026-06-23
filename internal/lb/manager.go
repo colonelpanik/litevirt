@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,29 @@ import (
 type Manager struct {
 	configDir string // base dir for generated configs
 	runDir    string // PID files
+}
+
+// applyLocks serializes Apply/Remove per LB name. NewManager() is constructed
+// fresh per call (so a per-instance lock would serialize nothing), and peers run
+// Apply via forwardLBApply, so the lock must be process-global here in the lb
+// package — the one place every apply/teardown on a host funnels through.
+// Holding it across exec is intended: it collapses the deploy/migration apply
+// storm and stops an apply from racing a teardown (the orphan-spawning race).
+var (
+	applyLocksMu sync.Mutex
+	applyLocks   = map[string]*sync.Mutex{}
+)
+
+// lbLock returns the per-LB mutex for name, creating it on first use.
+func lbLock(name string) *sync.Mutex {
+	applyLocksMu.Lock()
+	defer applyLocksMu.Unlock()
+	m := applyLocks[name]
+	if m == nil {
+		m = &sync.Mutex{}
+		applyLocks[name] = m
+	}
+	return m
 }
 
 // NewManager returns a Manager.
@@ -31,6 +55,10 @@ func NewManager() *Manager {
 // Apply writes HAProxy + keepalived configs and starts/reloads processes.
 // It is idempotent: calling Apply twice with the same config is safe.
 func (m *Manager) Apply(ctx context.Context, cfg Config) error {
+	lk := lbLock(cfg.Name)
+	lk.Lock()
+	defer lk.Unlock()
+
 	if err := os.MkdirAll(m.configDir, 0750); err != nil {
 		return fmt.Errorf("create lb config dir: %w", err)
 	}
@@ -38,22 +66,27 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("create lb run dir: %w", err)
 	}
 
-	// Write haproxy config.
+	// Write haproxy config. Detect change BEFORE writing so we only reload the
+	// running process when the rendered config actually differs (a burst of
+	// identical re-applies during deploy/migration must not churn — that churn
+	// is what spawned reload-race orphan processes).
 	haproxyCfg, err := RenderHAProxy(cfg)
 	if err != nil {
 		return err
 	}
 	haproxyPath := filepath.Join(m.configDir, cfg.Name+"-haproxy.cfg")
+	haproxyChanged := configChanged(haproxyPath, haproxyCfg)
 	if err := os.WriteFile(haproxyPath, []byte(haproxyCfg), 0640); err != nil {
 		return fmt.Errorf("write haproxy config: %w", err)
 	}
 
-	// Write keepalived config.
+	// Write keepalived config (same change-detection).
 	keepalivedCfg, err := RenderKeepalived(cfg)
 	if err != nil {
 		return err
 	}
 	keepalivedPath := filepath.Join(m.configDir, cfg.Name+"-keepalived.conf")
+	keepalivedChanged := configChanged(keepalivedPath, keepalivedCfg)
 	if err := os.WriteFile(keepalivedPath, []byte(keepalivedCfg), 0640); err != nil {
 		return fmt.Errorf("write keepalived config: %w", err)
 	}
@@ -119,22 +152,46 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	// Start keepalived first to assign the VIP, then start HAProxy
-	// which binds to it. Even if HAProxy fails (e.g. port conflict),
-	// keepalived runs so the VIP can fail back to a working host.
+	// Start keepalived first to assign the VIP, then start HAProxy which binds to
+	// it. Even if HAProxy fails (e.g. port conflict), keepalived runs so the VIP
+	// can fail back to a working host. Restart keepalived only when its config
+	// changed OR it isn't running — never skip a dead keepalived (that's exactly
+	// the unassigned-VIP case). (Trade-off: a healthy LB with unchanged config
+	// won't pick up a future keepalivedArgs code change until its config changes
+	// or the process restarts; ReconcileLBs is the catch-up.)
 	keepalivedPid := filepath.Join(m.runDir, cfg.Name+"-keepalived.pid")
-	if err := m.startOrReloadKeepalived(keepalivedPath, keepalivedPid); err != nil {
-		slog.Warn("keepalived start failed (VIP may not be assigned)", "lb", cfg.Name, "error", err)
+	if keepalivedChanged || !pidAlive(keepalivedPid) {
+		if err := m.startOrReloadKeepalived(keepalivedPath, keepalivedPid); err != nil {
+			slog.Error("keepalived start failed — VIP NOT assigned, LB unreachable", "lb", cfg.Name, "error", err)
+		}
 	}
 
-	// Start or reload haproxy.
+	// Start or reload haproxy only when its config changed or it isn't running.
 	haproxyPid := filepath.Join(m.runDir, cfg.Name+"-haproxy.pid")
-	if err := m.startOrReloadHAProxy(haproxyPath, haproxyPid); err != nil {
-		return fmt.Errorf("haproxy start/reload: %w", err)
+	if haproxyChanged || !pidAlive(haproxyPid) {
+		if err := m.startOrReloadHAProxy(haproxyPath, haproxyPid); err != nil {
+			return fmt.Errorf("haproxy start/reload: %w", err)
+		}
 	}
 
 	slog.Info("LB applied", "name", cfg.Name, "vip", cfg.VIP, "backends", len(cfg.Backends), "snat", cfg.SNATEnabled)
 	return nil
+}
+
+// configChanged reports whether rendered differs from what's already on disk at
+// path (a missing/unreadable file counts as changed).
+func configChanged(path, rendered string) bool {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return true
+	}
+	return string(existing) != rendered
+}
+
+// pidAlive reports whether the PID recorded in pidFile names a live process.
+func pidAlive(pidFile string) bool {
+	pid := readPid(pidFile)
+	return pid > 0 && processAlive(pid)
 }
 
 // cmdlineMatchesBinaryConfig reports whether a /proc cmdline (NUL-separated
@@ -188,6 +245,12 @@ func killProcByConfig(binary, cfgPath string) {
 
 // Remove stops and removes LB instances for the given name.
 func (m *Manager) Remove(ctx context.Context, name string) error {
+	// Same key as Apply so teardown can't interleave with an in-flight apply
+	// (which would resurrect what we're tearing down / orphan a process).
+	lk := lbLock(name)
+	lk.Lock()
+	defer lk.Unlock()
+
 	keepalivedPid := filepath.Join(m.runDir, name+"-keepalived.pid")
 	pidFiles := []string{
 		filepath.Join(m.runDir, name+"-haproxy.pid"),
@@ -569,9 +632,16 @@ func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	if pid > 0 && processAlive(pid) {
 		slog.Info("keepalived started", "config", cfgPath, "pid", pid)
 	} else {
-		slog.Warn("keepalived may have failed to start", "config", cfgPath, "pid", pid, "output", string(out))
+		slog.Error("keepalived did not start — VIP will NOT be assigned", "config", cfgPath, "pid", pid, "output", string(out))
 	}
 	return nil
+}
+
+// KeepalivedRunning reports whether this LB's keepalived process is alive — the
+// real signal that its VIP is assigned. HAProxy binds the VIP non-locally even
+// when keepalived is down, so "haproxy is up" is NOT evidence the VIP works.
+func (m *Manager) KeepalivedRunning(name string) bool {
+	return pidAlive(filepath.Join(m.runDir, name+"-keepalived.pid"))
 }
 
 // startConntrackd starts conntrackd for SNAT conntrack replication.

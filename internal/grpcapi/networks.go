@@ -374,19 +374,25 @@ func (s *Server) provisionNetworkOnRemote(ctx context.Context, targetHost, netwo
 	}
 }
 
-// remoteProvisionRequest builds the ProvisionNetwork request sent to a peer when
-// a network must exist on another host (e.g. during migration).
-func remoteProvisionRequest(networkName string, nr *corrosion.NetworkRecord) *pb.ProvisionNetworkRequest {
-	ntype := nr.Type
-	if ntype == "" {
-		ntype = "bridge"
+// provisionNetworkRequest is the single builder for a ProvisionNetwork request.
+// Every call site MUST go through it so a field (notably stack_name, whose
+// omission orphaned networks at teardown) can never be silently dropped again.
+func provisionNetworkRequest(name, cfgJSON, netType, stackName string) *pb.ProvisionNetworkRequest {
+	if netType == "" {
+		netType = "bridge"
 	}
 	return &pb.ProvisionNetworkRequest{
-		Name:      networkName,
-		Config:    nr.Config,
-		NetType:   ntype,
-		StackName: nr.StackName, // preserve stack association across migration
+		Name:      name,
+		Config:    cfgJSON,
+		NetType:   netType,
+		StackName: stackName,
 	}
+}
+
+// remoteProvisionRequest builds the ProvisionNetwork request sent to a peer when
+// a network must exist on another host (e.g. during migration), from its record.
+func remoteProvisionRequest(networkName string, nr *corrosion.NetworkRecord) *pb.ProvisionNetworkRequest {
+	return provisionNetworkRequest(networkName, nr.Config, nr.Type, nr.StackName)
 }
 
 // notifyVTEPPeersForNetwork looks up the network record, and if it's VXLAN,

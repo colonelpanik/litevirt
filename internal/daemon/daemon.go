@@ -336,6 +336,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetDNSDomain(d.cfg.DNSDomain)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
+	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	svc.SetReplicator(repl)
 	svc.SetAuthEngine(d.authEngine)

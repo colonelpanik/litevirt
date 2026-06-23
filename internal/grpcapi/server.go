@@ -48,12 +48,22 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// lbHealthOverride is a test seam for InspectLoadBalancer's HAProxy health
+	// overlay (unit tests have no running haproxy): when non-nil it returns the
+	// server-name→raw-status map instead of querying the stats socket.
+	lbHealthOverride func(context.Context, string) (map[string]string, error)
+
+	// lbKeepalivedOverride is a test seam for the VIP-health (degraded) check:
+	// when non-nil it reports whether this host's keepalived for an LB is running.
+	lbKeepalivedOverride func(name string) bool
+
 	// loginThrottle rate-limits failed Login attempts per (username, IP) to
 	// blunt password / second-factor brute force. In-memory + per-node; nil
 	// in bare test servers (no throttling) and set by NewServer in production.
 	loginThrottle *loginThrottle
 
 	migrationMetrics *metrics.MigrationMetrics
+	lbMetrics        *metrics.LBMetrics
 
 	// storagePools holds host-level pool refs (name → ref) used to resolve
 	// move/replicate/compose volume targets. Seeded from daemon config at
@@ -308,6 +318,33 @@ func (s *Server) SetVersion(v string) {
 // SetMigrationMetrics attaches Prometheus migration histograms.
 func (s *Server) SetMigrationMetrics(m *metrics.MigrationMetrics) {
 	s.migrationMetrics = m
+}
+
+// SetLBMetrics attaches Prometheus load-balancer gauges.
+func (s *Server) SetLBMetrics(m *metrics.LBMetrics) {
+	s.lbMetrics = m
+}
+
+// recordLBKeepalived publishes whether this host's keepalived for lbName is
+// running (VIP assignable). No-op when metrics aren't wired (tests). Call after
+// a local LB apply; pair with clearLBKeepalived on teardown.
+func (s *Server) recordLBKeepalived(lbName string) {
+	if s.lbMetrics == nil {
+		return
+	}
+	up := 0.0
+	if lb.NewManager().KeepalivedRunning(lbName) {
+		up = 1.0
+	}
+	s.lbMetrics.KeepalivedUp.WithLabelValues(lbName).Set(up)
+}
+
+// clearLBKeepalived drops the gauge for a torn-down LB so it stops reporting.
+func (s *Server) clearLBKeepalived(lbName string) {
+	if s.lbMetrics == nil {
+		return
+	}
+	s.lbMetrics.KeepalivedUp.DeleteLabelValues(lbName)
 }
 
 // SetDNSDomain sets the base DNS domain for VM record names.

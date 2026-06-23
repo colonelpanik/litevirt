@@ -369,16 +369,23 @@ func (s *Server) provisionNetworkOnRemote(ctx context.Context, targetHost, netwo
 		return
 	}
 	defer conn.Close()
+	if _, err := client.ProvisionNetwork(ctx, remoteProvisionRequest(networkName, nr)); err != nil {
+		slog.Warn("provisionNetworkOnRemote: provision failed", "host", targetHost, "network", networkName, "error", err)
+	}
+}
+
+// remoteProvisionRequest builds the ProvisionNetwork request sent to a peer when
+// a network must exist on another host (e.g. during migration).
+func remoteProvisionRequest(networkName string, nr *corrosion.NetworkRecord) *pb.ProvisionNetworkRequest {
 	ntype := nr.Type
 	if ntype == "" {
 		ntype = "bridge"
 	}
-	if _, err := client.ProvisionNetwork(ctx, &pb.ProvisionNetworkRequest{
-		Name:    networkName,
-		Config:  nr.Config,
-		NetType: ntype,
-	}); err != nil {
-		slog.Warn("provisionNetworkOnRemote: provision failed", "host", targetHost, "network", networkName, "error", err)
+	return &pb.ProvisionNetworkRequest{
+		Name:      networkName,
+		Config:    nr.Config,
+		NetType:   ntype,
+		StackName: nr.StackName, // preserve stack association across migration
 	}
 }
 

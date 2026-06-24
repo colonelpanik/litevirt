@@ -159,6 +159,74 @@ func TestMigrateVM_LocalDiskBlocksLive(t *testing.T) {
 	}
 }
 
+// A VM with a snapshot on local storage must be blocked from migration with a
+// clear precondition error — migrating its local disk would leave the snapshot
+// overlay's backing chain behind and fail mid-copy (R2). Even --with-storage
+// (which otherwise satisfies the local-disk check) must be refused.
+func TestMigrateVM_SnapshotOnLocalDiskBlocked(t *testing.T) {
+	s := testServerWithLocks(t)
+	ctx := adminCtx()
+	stream := &mockMigrateStream{ctx: ctx}
+
+	insertTestVM(t, ctx, s.db, "snap-vm", "test-host", "running")
+	insertTestHost(t, ctx, s.db, "target-host", "active")
+	corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "snap-vm", DiskName: "root", HostName: "test-host",
+		Path: "/tmp/snap-vm.qcow2", StorageType: "local",
+	})
+	if err := corrosion.InsertSnapshot(ctx, s.db, corrosion.SnapshotRecord{
+		ID: "snap-1", VMName: "snap-vm", HostName: "test-host",
+		Name: "s1", State: "ok", Type: "disk",
+	}); err != nil {
+		t.Fatalf("InsertSnapshot: %v", err)
+	}
+
+	err := s.MigrateVM(&pb.MigrateVMRequest{
+		VmName:      "snap-vm",
+		TargetHost:  "target-host",
+		Strategy:    pb.MigrateStrategy_MIGRATE_LIVE,
+		WithStorage: true, // even with storage copy requested, snapshots block it
+	}, stream)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "snapshot") {
+		t.Errorf("error should mention snapshots: %v", err)
+	}
+}
+
+// A snapshot on SHARED storage does NOT block migration (the backing chain
+// stays in place and reachable from the target).
+func TestMigrateVM_SnapshotOnSharedDiskAllowed(t *testing.T) {
+	s := testServerWithLocks(t)
+	ctx := adminCtx()
+	stream := &mockMigrateStream{ctx: ctx}
+
+	insertTestVM(t, ctx, s.db, "shared-vm", "test-host", "running")
+	insertTestHost(t, ctx, s.db, "target-host", "active")
+	corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "shared-vm", DiskName: "root", HostName: "test-host",
+		Path: "/mnt/nfs/shared-vm.qcow2", StorageType: "nfs",
+	})
+	if err := corrosion.InsertSnapshot(ctx, s.db, corrosion.SnapshotRecord{
+		ID: "snap-2", VMName: "shared-vm", HostName: "test-host",
+		Name: "s1", State: "ok", Type: "disk",
+	}); err != nil {
+		t.Fatalf("InsertSnapshot: %v", err)
+	}
+
+	err := s.MigrateVM(&pb.MigrateVMRequest{
+		VmName: "shared-vm", TargetHost: "target-host",
+		Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
+	}, stream)
+	// Shared storage + snapshot must NOT be rejected by the snapshot precondition.
+	// (The migration proceeds past preconditions into libvirt and fails there in
+	// the unit env — but never with the snapshot FailedPrecondition message.)
+	if err != nil && status.Code(err) == codes.FailedPrecondition && strings.Contains(err.Error(), "snapshot") {
+		t.Errorf("shared-storage snapshot must not block migration: %v", err)
+	}
+}
+
 func TestRecordMigrationMetrics_NilMetrics(t *testing.T) {
 	s := testServer(t)
 	// Should not panic when migrationMetrics is nil.
@@ -340,28 +408,19 @@ func TestMigrateVM_SnapshotWarning(t *testing.T) {
 
 	stream := &mockMigrateStream{ctx: ctx}
 
-	// MigrateVM will fail at local-disk validation (FailedPrecondition),
-	// but the snapshot warning should have been sent before that point.
-	_ = s.MigrateVM(&pb.MigrateVMRequest{
+	// A VM with snapshots on local storage is now BLOCKED (FailedPrecondition):
+	// previously migration only warned then failed mid-copy because the snapshot
+	// overlay's backing chain is left behind (R2). The error names the count and
+	// tells the operator to remove snapshots first.
+	err = s.MigrateVM(&pb.MigrateVMRequest{
 		VmName:     "snap-vm",
 		TargetHost: "target-host",
 		Strategy:   pb.MigrateStrategy_MIGRATE_LIVE,
 	}, stream)
-
-	found := false
-	for _, msg := range stream.sent {
-		if msg.Status != "" && strings.Contains(msg.Status, "snapshot") && strings.Contains(msg.Status, "2 snapshot(s)") {
-			found = true
-			break
-		}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition", status.Code(err))
 	}
-	if !found {
-		var statuses []string
-		for _, msg := range stream.sent {
-			if msg.Status != "" {
-				statuses = append(statuses, msg.Status)
-			}
-		}
-		t.Errorf("expected snapshot warning with '2 snapshot(s)', got statuses: %v", statuses)
+	if err == nil || !strings.Contains(err.Error(), "2 snapshot(s)") || !strings.Contains(err.Error(), "snapshot rm") {
+		t.Errorf("expected error naming '2 snapshot(s)' and the remediation, got: %v", err)
 	}
 }

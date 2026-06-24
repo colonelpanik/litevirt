@@ -234,14 +234,35 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// Fetch the record first so we know whether to clean up a vmstate file.
 	snap, _ := corrosion.GetSnapshot(ctx, s.db, req.VmName, req.SnapshotName)
 
+	// Flatten when removing the LAST snapshot of a running, disk-type VM: a plain
+	// metadata-only delete leaves the VM on its overlay (the backing chain
+	// persists), which both blocks migration and lets the chain grow on every
+	// snapshot+delete cycle. FlattenSnapshot block-commits the overlay down into
+	// its base so the disk collapses to a single standalone file. Memory
+	// snapshots (own revert/RAM mechanism) and multi-snapshot chains keep the
+	// metadata-only delete; a flatten failure falls back to it too, so the
+	// snapshot is always removable.
+	existing, _ := corrosion.ListSnapshots(ctx, s.db, req.VmName)
+	flatten := vm.State == "running" && len(existing) <= 1 && (snap == nil || snap.Type != "memory")
+
+	var delErr error
+	if flatten {
+		if delErr = s.virt.FlattenSnapshot(req.VmName, req.SnapshotName); delErr != nil {
+			slog.Warn("delete snapshot: flatten failed, falling back to metadata-only",
+				"vm", req.VmName, "snap", req.SnapshotName, "error", delErr)
+			delErr = s.virt.DeleteSnapshot(req.VmName, req.SnapshotName)
+		}
+	} else {
+		delErr = s.virt.DeleteSnapshot(req.VmName, req.SnapshotName)
+	}
 	// A revert consumes the libvirt snapshot metadata, so it may already be gone
 	// here — that must NOT block cleanup of the corrosion record + vmstate file
 	// (otherwise they leak). Treat a missing libvirt snapshot as already-deleted.
-	if err := s.virt.DeleteSnapshot(req.VmName, req.SnapshotName); err != nil {
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no domain snapshot") {
+	if delErr != nil {
+		if strings.Contains(delErr.Error(), "not found") || strings.Contains(delErr.Error(), "no domain snapshot") {
 			slog.Info("delete snapshot: libvirt metadata already gone — cleaning up record", "vm", req.VmName, "snap", req.SnapshotName)
 		} else {
-			return nil, status.Errorf(codes.Internal, "delete snapshot: %v", err)
+			return nil, status.Errorf(codes.Internal, "delete snapshot: %v", delErr)
 		}
 	}
 

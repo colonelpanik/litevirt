@@ -371,6 +371,16 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 	f.record("snapshot-delete", domainName, snapshotName)
 	return nil
 }
+func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
+		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
+	}
+	delete(f.snapshots[domainName], snapshotName)
+	f.record("snapshot-flatten", domainName, snapshotName)
+	return nil
+}
 
 func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string) (diskBytes, vmstateBytes int64, err error) {
 	f.mu.Lock()

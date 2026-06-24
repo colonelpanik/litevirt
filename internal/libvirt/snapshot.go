@@ -58,16 +58,17 @@ func (c *Client) ListSnapshots(domainName string) ([]string, error) {
 	return names, nil
 }
 
-// RevertToSnapshot reverts a domain to the named snapshot.
+// RevertToSnapshot reverts a domain to the named external disk-only snapshot.
 //
 // Libvirt does not support DomainRevertToSnapshot for external disk-only
-// snapshots (state "disk-snapshot"). Instead we revert manually:
-//  1. Read the snapshot XML to discover the original (pre-snapshot) disk paths.
-//  2. Read the current domain XML to find the overlay paths.
-//  3. Destroy the running domain and wait for full shutdown.
-//  4. Delete snapshot metadata, undefine domain (releases virtlockd locks).
-//  5. Wait for lock manager to fully release file locks.
-//  6. Remove overlay files, define domain with original disks, start.
+// snapshots, so we revert manually. The disk revert RESETS the live overlay to
+// a fresh empty qcow2 over its (frozen) base — it does NOT swap the domain back
+// onto the base path. Swapping makes the restarted domain open the base file
+// read-WRITE, which races the just-destroyed domain's read lock on that same
+// base (held while the base was the overlay's backing) and fails with "Failed
+// to get write lock". Keeping the domain on the overlay leaves the base opened
+// read-only exactly as before — no lock conflict. (Same technique as
+// RevertToLiveSnapshot, which fixed the identical class of bug.)
 func (c *Client) RevertToSnapshot(domainName, snapshotName string) error {
 	dom, err := c.virt.DomainLookupByName(domainName)
 	if err != nil {
@@ -79,107 +80,194 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string) error {
 		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
 
-	// The snapshot XML embeds the full <domain> element as it was at snapshot
-	// time — its <disk><source file="..."/> entries are the original paths.
+	// The snapshot XML embeds the <domain> as it was at snapshot time — its disk
+	// <source file/> entries are the (frozen) base paths.
 	snapXML, err := c.virt.DomainSnapshotGetXMLDesc(snap, 0)
 	if err != nil {
 		return fmt.Errorf("get snapshot XML: %w", err)
 	}
-	origDisks := parseSnapshotDomainDisks(snapXML)
+	origDisks := parseSnapshotDomainDisks(snapXML) // dev → base (frozen)
 	if len(origDisks) == 0 {
 		return fmt.Errorf("snapshot %q: no disk sources found in snapshot XML", snapshotName)
 	}
 
-	// Current (live) domain XML has the overlay paths created by the snapshot.
+	// Current (live) domain XML has the overlay paths the snapshot cut over to.
 	domXML, err := c.virt.DomainGetXMLDesc(dom, 0)
 	if err != nil {
 		return fmt.Errorf("get domain XML: %w", err)
 	}
-	currentDisks := parseDomainDiskSources(domXML)
+	currentDisks := parseDomainDiskSources(domXML) // dev → overlay (live)
 
-	// Destroy the running domain.
-	if err := c.virt.DomainDestroy(dom); err != nil {
-		return fmt.Errorf("destroy domain before revert: %w", err)
+	// Each changed disk: reset overlay (live) → empty over base (frozen).
+	type overlayReset struct{ overlay, base string }
+	var resets []overlayReset
+	for dev, base := range origDisks {
+		overlay, ok := currentDisks[dev]
+		if !ok || overlay == base {
+			continue
+		}
+		resets = append(resets, overlayReset{overlay: overlay, base: base})
 	}
 
-	// Wait for the domain to reach shutoff state.
-	for i := 0; i < 30; i++ {
-		dom2, lookupErr := c.virt.DomainLookupByName(domainName)
-		if lookupErr != nil {
-			break
-		}
-		state, _, _ := c.virt.DomainGetState(dom2, 0)
-		if state == int32(golibvirt.DomainShutoff) {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	// Delete snapshot metadata (not the overlay files — we handle those below).
-	_ = c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
-
-	// Build new domain XML with original disk paths.
-	dom, _ = c.virt.DomainLookupByName(domainName)
+	// Inactive XML still references the overlay paths — redefine with it
+	// unchanged after the overlays are reset (no path swap).
 	inactiveXML, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
 	if err != nil {
 		inactiveXML = domXML
 	}
 
-	newXML := inactiveXML
-	var overlayPaths []string
-	for dev, origPath := range origDisks {
-		overlayPath, ok := currentDisks[dev]
-		if !ok || overlayPath == origPath {
-			continue
+	// Destroy the running domain — but skip if it's already shut off, so
+	// reverting a STOPPED VM works instead of erroring "domain is not running".
+	if st, _, sErr := c.virt.DomainGetState(dom, 0); sErr == nil && st != int32(golibvirt.DomainShutoff) {
+		if err := c.virt.DomainDestroy(dom); err != nil {
+			return fmt.Errorf("destroy domain before revert: %w", err)
 		}
-		newXML = strings.Replace(newXML, overlayPath, origPath, 1)
-		overlayPaths = append(overlayPaths, overlayPath)
+		for i := 0; i < 30; i++ {
+			dom2, lookupErr := c.virt.DomainLookupByName(domainName)
+			if lookupErr != nil {
+				break
+			}
+			state, _, _ := c.virt.DomainGetState(dom2, 0)
+			if state == int32(golibvirt.DomainShutoff) {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 
-	// Undefine the domain completely — this tells virtlockd to release all
-	// file locks held on behalf of this domain. Without this, the lock manager
-	// keeps locks on the disk files even after QEMU exits, preventing the
-	// restarted domain from acquiring write locks.
-	_ = c.virt.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(
-		golibvirt.DomainUndefineNvram,
-	))
-
-	// Wait for virtlockd to process the lock release. The lock manager
-	// communicates with libvirtd asynchronously — without this pause the
-	// new DomainCreate races against the old lock release.
+	// Delete snapshot metadata (we manage overlay files ourselves) and undefine
+	// to release virtlockd locks.
+	_ = c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	if d, e := c.virt.DomainLookupByName(domainName); e == nil {
+		_ = c.virt.DomainUndefineFlags(d, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineNvram))
+	}
 	for i := 0; i < 20; i++ {
 		time.Sleep(250 * time.Millisecond)
-		// Verify domain is truly gone (undefine completed).
 		if !c.DomainExists(domainName) {
 			break
 		}
 	}
-	// The domain disappearing from libvirt does not mean virtlockd has
-	// released its file locks — give the lock manager time to catch up.
 	time.Sleep(time.Second)
 
-	// Remove overlay files now that all locks are released.
-	for _, p := range overlayPaths {
-		os.Remove(p)
+	// Disk revert: reset each overlay to an empty qcow2 over its frozen base.
+	// All post-snapshot writes (in the old overlay) are discarded.
+	for _, r := range resets {
+		if err := resetOverlay(r.overlay, r.base); err != nil {
+			return fmt.Errorf("reset overlay %q: %w", r.overlay, err)
+		}
 	}
 
-	// Define the domain with original disk paths and start it.
-	if _, err := c.virt.DomainDefineXML(newXML); err != nil {
+	// Redefine with the original (overlay-pointing) XML.
+	if _, err := c.virt.DomainDefineXML(inactiveXML); err != nil {
 		return fmt.Errorf("redefine domain after revert: %w", err)
 	}
 
-	// Retry start in case virtlockd is still releasing the disk lock.
+	// Re-register the snapshot metadata the undefine dropped. Without this the
+	// snapshot is GONE from libvirt while still recorded in the cluster DB, so a
+	// later "lv snapshot restore" fails with "no domain snapshot with matching
+	// name" — permanently unrevertable. Doing it here (before the start) means
+	// the snapshot survives even if the start below fails and the operator
+	// retries. The overlay is freshly reset over the same base, so the recorded
+	// point still holds. Best-effort.
+	if redom, lerr := c.virt.DomainLookupByName(domainName); lerr == nil {
+		_, _ = c.virt.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine))
+	}
+
+	// Start, retrying on any residual lock-release race (the base stays
+	// read-only now, so this should not normally trigger).
 	var startErr error
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 10; i++ {
 		if startErr = c.StartDomain(domainName); startErr == nil {
 			return nil
 		}
 		if !strings.Contains(startErr.Error(), "lock") {
-			return fmt.Errorf("start domain %s: %w", domainName, startErr)
+			return fmt.Errorf("start domain %s after revert: %w", domainName, startErr)
 		}
-		time.Sleep(time.Second)
+		if d, e := c.virt.DomainLookupByName(domainName); e == nil {
+			_ = c.virt.DomainDestroy(d) // drop any partial lock; keeps the definition
+		}
+		time.Sleep(2 * time.Second)
 	}
-	return fmt.Errorf("start domain %s: %w", domainName, startErr)
+	return fmt.Errorf("start domain %s after revert (disk lock not released after retries): %w", domainName, startErr)
+}
+
+// FlattenSnapshot live-merges (block-commit) each disk's active overlay down
+// into the named snapshot's base, then deletes the snapshot metadata. After
+// this the running VM is on a single standalone disk (the snapshot's base, now
+// holding all current data) — no backing chain — so it can be migrated and the
+// chain stops growing across snapshot+delete cycles.
+//
+// We commit only down to THIS snapshot's base (not to the bottom of the chain),
+// so a shared/lower base image (e.g. the OS image other VMs share) is never
+// touched. RUNNING domains only.
+func (c *Client) FlattenSnapshot(domainName, snapshotName string) error {
+	dom, err := c.virt.DomainLookupByName(domainName)
+	if err != nil {
+		return fmt.Errorf("lookup domain %q: %w", domainName, err)
+	}
+	if st, _, sErr := c.virt.DomainGetState(dom, 0); sErr != nil || st != int32(golibvirt.DomainRunning) {
+		return fmt.Errorf("flatten requires a running domain")
+	}
+	snap, err := c.virt.DomainSnapshotLookupByName(dom, snapshotName, 0)
+	if err != nil {
+		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
+	}
+	snapXML, err := c.virt.DomainSnapshotGetXMLDesc(snap, 0)
+	if err != nil {
+		return fmt.Errorf("get snapshot XML: %w", err)
+	}
+	base := parseSnapshotDomainDisks(snapXML) // dev → base (commit target)
+	domXML, err := c.virt.DomainGetXMLDesc(dom, 0)
+	if err != nil {
+		return fmt.Errorf("get domain XML: %w", err)
+	}
+	cur := parseDomainDiskSources(domXML) // dev → overlay (active)
+
+	for dev, basePath := range base {
+		overlay, ok := cur[dev]
+		if !ok || overlay == basePath {
+			continue // disk has no overlay to merge
+		}
+		// Active-layer commit: merge the active overlay DOWN into basePath. base
+		// is set so the commit stops at this snapshot's base (lower layers, e.g.
+		// a shared OS image, are untouched); empty top = the active layer.
+		if err := c.virt.DomainBlockCommit(dom, dev,
+			golibvirt.OptString{basePath}, golibvirt.OptString{}, 0,
+			golibvirt.DomainBlockCommitActive); err != nil {
+			return fmt.Errorf("block-commit %s: %w", dev, err)
+		}
+		if err := c.waitBlockJobReady(dom, dev); err != nil {
+			return fmt.Errorf("block-commit %s sync: %w", dev, err)
+		}
+		// Pivot the active layer onto base, ending the job.
+		if err := c.virt.DomainBlockJobAbort(dom, dev, golibvirt.DomainBlockJobAbortPivot); err != nil {
+			return fmt.Errorf("pivot %s onto base: %w", dev, err)
+		}
+		os.Remove(overlay) // committed overlay is no longer referenced
+	}
+
+	_ = c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	return nil
+}
+
+// waitBlockJobReady polls a disk's block job until it has synced (cur >= end),
+// the point at which an active-layer commit is ready to pivot. Returns when the
+// job is ready or gone; errors only on a query failure or timeout.
+func (c *Client) waitBlockJobReady(dom golibvirt.Domain, dev string) error {
+	for i := 0; i < 1200; i++ { // ~10 min ceiling for large disks
+		found, _, _, curr, end, err := c.virt.DomainGetBlockJobInfo(dom, dev, 0)
+		if err != nil {
+			return err
+		}
+		if found == 0 {
+			return nil // no active job (already complete)
+		}
+		if end > 0 && curr >= end {
+			return nil // synced — ready to pivot
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("block job on %s did not reach ready state in time", dev)
 }
 
 // DeleteSnapshot removes a named snapshot from a domain.

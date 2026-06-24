@@ -96,33 +96,38 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition, "target host %q is not active", req.TargetHost)
 	}
 
-	// Warn if VM has snapshots on the source host — they won't follow the migration.
-	if snaps, err := corrosion.ListSnapshots(ctx, s.db, req.VmName); err == nil && len(snaps) > 0 {
-		stream.Send(&pb.MigrateProgress{
-			Phase:  pb.MigratePhase_MIGRATE_VALIDATING,
-			Status: fmt.Sprintf("warning: VM has %d snapshot(s) on source host %s — they will not be migrated", len(snaps), s.hostName),
-		})
-		slog.Warn("migration: VM has snapshots that won't follow",
-			"vm", req.VmName, "snapshots", len(snaps), "source", s.hostName)
+	// Snapshot + local-disk preconditions. A VM running on a snapshot overlay
+	// keeps its data in a qcow2 whose backing (base) file is NOT part of a
+	// storage copy, so migrating its local storage leaves the backing chain
+	// behind and qemu on the target cannot open the disk — the migration fails
+	// mid-copy. Block it up-front with a clear, actionable error instead of that
+	// confusing late failure. Shared storage (nfs/ceph/iscsi/...) is unaffected
+	// because the whole chain stays in place and reachable from the target.
+	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "query VM disks: %v", err)
+	}
+	hasLocal := false
+	for _, d := range disks {
+		if d.StorageType == "local" {
+			hasLocal = true
+			break
+		}
+	}
+	snaps, _ := corrosion.ListSnapshots(ctx, s.db, req.VmName)
+	if hasLocal && len(snaps) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"VM %q has %d snapshot(s) on local storage — a snapshotted VM cannot be migrated "+
+				"(its disk overlay's backing chain would be left behind). Remove them first: "+
+				"`lv snapshot rm %s <name>` for each, then migrate.",
+			req.VmName, len(snaps), req.VmName)
 	}
 
-	// Check for local disks — live migration requires --with-storage for these.
+	// Local disks require --with-storage for live migration.
 	withStorage := req.WithStorage
-	if req.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
-		disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
-		if err != nil {
-			return status.Errorf(codes.Internal, "query VM disks: %v", err)
-		}
-		for _, d := range disks {
-			if d.StorageType == "local" {
-				if !withStorage {
-					return status.Errorf(codes.FailedPrecondition,
-						"VM %q has local disk %q — use --with-storage for live migration or --strategy=cold",
-						req.VmName, d.DiskName)
-				}
-				break
-			}
-		}
+	if req.Strategy != pb.MigrateStrategy_MIGRATE_COLD && hasLocal && !withStorage {
+		return status.Errorf(codes.FailedPrecondition,
+			"VM %q has a local disk — use --with-storage for live migration or --strategy=cold", req.VmName)
 	}
 
 	// NUMA topology pre-flight: warn if source and target have different NUMA

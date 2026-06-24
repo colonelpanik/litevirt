@@ -62,6 +62,12 @@ type LibvirtBackend interface {
 	CreateSnapshot(domainName, snapshotName string) (int64, error)
 	RevertToSnapshot(domainName, snapshotName string) error
 	DeleteSnapshot(domainName, snapshotName string) error
+	// FlattenSnapshot live-merges each disk's active overlay down into the named
+	// snapshot's base (block-commit + pivot), then drops the snapshot metadata —
+	// leaving the running VM on a single standalone disk (no backing chain). Used
+	// when deleting the last snapshot so the disk stops growing a chain and stays
+	// migratable. Running domains only.
+	FlattenSnapshot(domainName, snapshotName string) error
 	// Live/RAM snapshots (#3): capture guest RAM into vmstatePath alongside the
 	// external disk snapshot, and revert both to the snapshot instant.
 	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string) (diskBytes, vmstateBytes int64, err error)

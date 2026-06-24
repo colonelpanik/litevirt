@@ -454,6 +454,21 @@ func validBackendAddress(addr string) bool {
 	return err == nil && p > 0 && p <= 65535
 }
 
+func lbBackendName(b *pb.LBBackendAddress) string {
+	if b.Name != "" {
+		return b.Name
+	}
+	return b.Address
+}
+
+func reserveLBBackendName(seen map[string]struct{}, name string) error {
+	if _, ok := seen[name]; ok {
+		return status.Errorf(codes.InvalidArgument, "duplicate backend name %q", name)
+	}
+	seen[name] = struct{}{}
+	return nil
+}
+
 func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest) (*pb.LoadBalancer, error) {
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
@@ -485,6 +500,17 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	}
 	if len(req.Backends) == 0 && len(req.VmBackends) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "at least one backend required")
+	}
+	backendNames := map[string]struct{}{}
+	for _, b := range req.Backends {
+		if err := reserveLBBackendName(backendNames, lbBackendName(b)); err != nil {
+			return nil, err
+		}
+	}
+	for _, vmName := range req.VmBackends {
+		if err := reserveLBBackendName(backendNames, vmName); err != nil {
+			return nil, err
+		}
 	}
 
 	vipIP, vipPrefix, err := lb.ParseVIP(req.Vip)
@@ -730,7 +756,41 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		portsStr = string(p)
 	}
 
+	existingBackends, err := corrosion.ListLBBackends(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list LB backends: %v", err)
+	}
+	removedNames := map[string]struct{}{}
+	for _, name := range req.RemoveBackends {
+		removedNames[name] = struct{}{}
+	}
+	for _, vmName := range req.RemoveVmBackends {
+		removedNames[vmName] = struct{}{}
+	}
+	backendNames := map[string]struct{}{}
+	for _, b := range existingBackends {
+		if _, removing := removedNames[b.Name]; !removing {
+			backendNames[b.Name] = struct{}{}
+		}
+	}
+	for _, b := range req.AddBackends {
+		if err := reserveLBBackendName(backendNames, lbBackendName(b)); err != nil {
+			return nil, err
+		}
+	}
+	for _, vmName := range req.AddVmBackends {
+		if err := reserveLBBackendName(backendNames, vmName); err != nil {
+			return nil, err
+		}
+	}
+
 	// Handle backend changes.
+	for _, name := range req.RemoveBackends {
+		corrosion.DeleteLBBackend(ctx, s.db, req.Name, name)
+	}
+	for _, vmName := range req.RemoveVmBackends {
+		corrosion.DeleteLBBackend(ctx, s.db, req.Name, vmName)
+	}
 	for _, b := range req.AddBackends {
 		name := b.Name
 		if name == "" {
@@ -750,12 +810,6 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 				break
 			}
 		}
-	}
-	for _, name := range req.RemoveBackends {
-		corrosion.DeleteLBBackend(ctx, s.db, req.Name, name)
-	}
-	for _, vmName := range req.RemoveVmBackends {
-		corrosion.DeleteLBBackend(ctx, s.db, req.Name, vmName)
 	}
 
 	// Persist updated config.

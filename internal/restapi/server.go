@@ -240,9 +240,14 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request) {
 		jsonProto(w, resp)
 
 	case action == "" && r.Method == http.MethodDelete:
+		force, err := boolQuery(r, "force")
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if _, err := s.grpc.RemoveHost(ctx, &pb.RemoveHostRequest{
 			Name:  name,
-			Force: r.URL.Query().Get("force") == "true",
+			Force: force,
 		}); err != nil {
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
@@ -425,7 +430,15 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		jsonProto(w, resp)
 
 	case action == "" && r.Method == http.MethodDelete:
-		if _, err := s.grpc.DeleteVM(ctx, &pb.DeleteVMRequest{Name: name}); err != nil {
+		keepDisks, err := boolQuery(r, "keep_disks")
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if _, err := s.grpc.DeleteVM(ctx, &pb.DeleteVMRequest{
+			Name:      name,
+			KeepDisks: keepDisks,
+		}); err != nil {
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -439,11 +452,19 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		jsonWrite(w, map[string]string{"status": "started", "vm": name})
 
 	case action == "stop" && r.Method == http.MethodPost:
-		stopReq := &pb.StopVMRequest{Name: name, Force: r.URL.Query().Get("force") == "true"}
+		force, err := boolQuery(r, "force")
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		stopReq := &pb.StopVMRequest{Name: name, Force: force}
 		if v := r.URL.Query().Get("timeout"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-				stopReq.Timeout = int32(n)
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				jsonError(w, http.StatusBadRequest, "timeout must be a non-negative integer")
+				return
 			}
+			stopReq.Timeout = int32(n)
 		}
 		if _, err := s.grpc.StopVM(ctx, stopReq); err != nil {
 			grpcHTTPError(w, http.StatusInternalServerError, err)
@@ -696,21 +717,37 @@ func (s *Server) handleStack(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case action == "migrate-volumes" && r.Method == http.MethodPost:
 		q := r.URL.Query()
+		deleteSource, err := boolQuery(r, "delete_source")
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		dryRun, err := boolQuery(r, "dry_run")
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		req := &pb.MigrateStackVolumesRequest{
 			StackName:    name,
 			DefaultPool:  q.Get("to"),
-			DeleteSource: q.Get("delete_source") == "true",
-			DryRun:       q.Get("dry_run") == "true",
+			DeleteSource: deleteSource,
+			DryRun:       dryRun,
 		}
 		if v := q.Get("parallel"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				req.Parallel = int32(n)
+			n, err := strconv.ParseInt(v, 10, 32)
+			if err != nil || n < 0 {
+				jsonError(w, http.StatusBadRequest, "parallel must be a non-negative integer")
+				return
 			}
+			req.Parallel = int32(n)
 		}
 		if v := q.Get("health_wait"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-				req.HealthWaitSeconds = uint32(n)
+			n, err := strconv.ParseUint(v, 10, 32)
+			if err != nil {
+				jsonError(w, http.StatusBadRequest, "health_wait must be a non-negative integer")
+				return
 			}
+			req.HealthWaitSeconds = uint32(n)
 		}
 		if v := q.Get("order"); v != "" {
 			req.Order = strings.Split(v, ",")
@@ -932,7 +969,11 @@ func (s *Server) handleNetwork(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonProto(w, resp)
 	case http.MethodDelete:
-		force := r.URL.Query().Get("force") == "true"
+		force, err := boolQuery(r, "force")
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if _, err := s.grpc.DeleteNetwork(ctx, &pb.DeleteNetworkRequest{Name: name, Force: force}); err != nil {
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
@@ -1098,9 +1139,12 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := int32(100)
 	if ls := r.URL.Query().Get("limit"); ls != "" {
-		if n, err := strconv.Atoi(ls); err == nil && n > 0 {
-			limit = int32(n)
+		n, err := strconv.ParseInt(ls, 10, 32)
+		if err != nil || n <= 0 {
+			jsonError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
 		}
+		limit = int32(n)
 	}
 	resp, err := s.grpc.ListAuditLog(s.grpcCtx(r), &pb.ListAuditLogRequest{Limit: limit})
 	if err != nil {
@@ -1111,6 +1155,18 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+func boolQuery(r *http.Request, key string) (bool, error) {
+	raw := r.URL.Query().Get(key)
+	if raw == "" {
+		return false, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+	return v, nil
+}
 
 func protoFromJSON(r *http.Request, msg proto.Message) error {
 	body, err := io.ReadAll(r.Body)

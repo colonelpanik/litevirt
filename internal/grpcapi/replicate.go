@@ -68,7 +68,7 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		return status.Errorf(codes.NotFound, "vm %q has no disk %q", req.VmName, req.DiskName)
 	}
 
-	dstPool, ok := s.lookupStoragePool(req.TargetPool)
+	dstPool, ok := s.resolvePool(ctx, req.TargetPool)
 	if !ok {
 		return status.Errorf(codes.NotFound, "target pool %q not configured on this host", req.TargetPool)
 	}

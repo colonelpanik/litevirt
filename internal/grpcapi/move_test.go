@@ -257,3 +257,35 @@ func TestMoveVolume_UnknownTargetPoolRejected(t *testing.T) {
 		t.Fatalf("expected NotFound, got %v", err)
 	}
 }
+
+func TestMoveVolume_BlockDriverSourceUnimplemented(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "test-host"
+	s.dataDir = t.TempDir()
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{
+		"warm": {Driver: "local", Target: t.TempDir()},
+	})
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm-ceph", HostName: "test-host", State: "stopped"},
+		nil,
+		[]corrosion.DiskRecord{{
+			VMName: "vm-ceph", DiskName: "root", HostName: "test-host",
+			Path: "rbd:pool/vm-ceph-root", SizeBytes: 1,
+			StorageType: "ceph", StorageVolume: "ceph-hot",
+		}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{
+		VmName: "vm-ceph", DiskName: "root", TargetPool: "warm",
+	}, rec)
+	if status.Code(err) != codes.Unimplemented {
+		t.Fatalf("expected Unimplemented for block-driver source, got %v", err)
+	}
+	if len(rec.Sent) != 0 {
+		t.Fatalf("block-driver rejection should fail before progress frames, got %+v", rec.Sent)
+	}
+}

@@ -75,6 +75,7 @@ type mockGRPC struct {
 	lastRemoveHostReq    *pb.RemoveHostRequest
 	lastRestartVMName    string
 	lastDeleteVMName     string
+	lastDeleteVMReq      *pb.DeleteVMRequest
 	deleteVMCalled       bool
 	lastInspectLBName    string
 	lastUpdateLBReq      *pb.UpdateLBRequest
@@ -89,6 +90,7 @@ type mockGRPC struct {
 	deleteNetworkCalled  bool
 	lastCreateNetworkReq *pb.CreateNetworkRequest
 	lastCreateLBReq      *pb.CreateLBRequest
+	lastMigrateStackReq  *pb.MigrateStackVolumesRequest
 
 	// Host action tracking
 	lastDrainHostName    string
@@ -174,6 +176,7 @@ func (m *mockGRPC) RestartVM(ctx context.Context, in *pb.RestartVMRequest, opts 
 }
 func (m *mockGRPC) DeleteVM(ctx context.Context, in *pb.DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	m.lastDeleteVMName = in.Name
+	m.lastDeleteVMReq = in
 	m.deleteVMCalled = true
 	return &emptypb.Empty{}, nil
 }
@@ -395,7 +398,8 @@ func (m *mockGRPC) MoveVolume(context.Context, *pb.MoveVolumeRequest, ...grpc.Ca
 func (m *mockGRPC) ReplicateVolume(context.Context, *pb.ReplicateVolumeRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[pb.ReplicateVolumeProgress], error) {
 	return nil, nil
 }
-func (m *mockGRPC) MigrateStackVolumes(context.Context, *pb.MigrateStackVolumesRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[pb.StackVolumeProgress], error) {
+func (m *mockGRPC) MigrateStackVolumes(_ context.Context, in *pb.MigrateStackVolumesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.StackVolumeProgress], error) {
+	m.lastMigrateStackReq = in
 	return nil, nil
 }
 func (m *mockGRPC) GetClusterStatus(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.ClusterStatus, error) {
@@ -900,6 +904,24 @@ func TestDeleteVM_Success(t *testing.T) {
 	}
 }
 
+func TestDeleteVM_ForwardsKeepDisks(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/vms/vm1?keep_disks=true", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", rec.Code)
+	}
+	if mock.lastDeleteVMReq == nil {
+		t.Fatal("DeleteVM was not called")
+	}
+	if mock.lastDeleteVMReq.Name != "vm1" || !mock.lastDeleteVMReq.KeepDisks {
+		t.Errorf("DeleteVM request = %+v, want vm1 with keep_disks", mock.lastDeleteVMReq)
+	}
+}
+
 func TestListStacks_Success(t *testing.T) {
 	s, _ := newMockServer("test-token")
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/stacks", nil)
@@ -921,6 +943,64 @@ func TestListStacks_MethodNotAllowed(t *testing.T) {
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405, got %d", rec.Code)
+	}
+}
+
+func TestMigrateStackVolumes_ForwardsCombinedQueryOptions(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stacks/app/migrate-volumes?to=warm&map=web/root=fast&map=db=bulk&parallel=3&order=web,db&delete_source=true&dry_run=true&health_wait=45", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	got := mock.lastMigrateStackReq
+	if got == nil {
+		t.Fatal("MigrateStackVolumes was not called")
+	}
+	if got.StackName != "app" || got.DefaultPool != "warm" || got.Parallel != 3 || got.HealthWaitSeconds != 45 || !got.DeleteSource || !got.DryRun {
+		t.Fatalf("MigrateStackVolumes request scalars = %+v", got)
+	}
+	if len(got.Order) != 2 || got.Order[0] != "web" || got.Order[1] != "db" {
+		t.Fatalf("order = %+v, want [web db]", got.Order)
+	}
+	if len(got.Placements) != 2 {
+		t.Fatalf("placements = %+v, want two entries", got.Placements)
+	}
+	if got.Placements[0].VmName != "web" || got.Placements[0].DiskName != "root" || got.Placements[0].TargetPool != "fast" {
+		t.Errorf("placement[0] = %+v, want web/root=fast", got.Placements[0])
+	}
+	if got.Placements[1].VmName != "db" || got.Placements[1].DiskName != "" || got.Placements[1].TargetPool != "bulk" {
+		t.Errorf("placement[1] = %+v, want db=bulk", got.Placements[1])
+	}
+}
+
+func TestMigrateStackVolumes_InvalidNumericQueryRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"parallel_non_numeric", "/api/v1/stacks/app/migrate-volumes?to=warm&parallel=abc"},
+		{"parallel_negative", "/api/v1/stacks/app/migrate-volumes?to=warm&parallel=-1"},
+		{"health_wait_non_numeric", "/api/v1/stacks/app/migrate-volumes?to=warm&health_wait=abc"},
+		{"health_wait_negative", "/api/v1/stacks/app/migrate-volumes?to=warm&health_wait=-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, mock := newMockServer("test-token")
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer test-token")
+			rec := httptest.NewRecorder()
+			s.mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", rec.Code)
+			}
+			if mock.lastMigrateStackReq != nil {
+				t.Errorf("MigrateStackVolumes was called for invalid query: %+v", mock.lastMigrateStackReq)
+			}
+		})
 	}
 }
 
@@ -1445,6 +1525,87 @@ func TestStopVM_ForwardsForceAndTimeout(t *testing.T) {
 	}
 }
 
+func TestStopVM_InvalidTimeoutRejected(t *testing.T) {
+	for _, timeout := range []string{"abc", "-1"} {
+		t.Run(timeout, func(t *testing.T) {
+			s, mock := newMockServer("test-token")
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/vms/web-1/stop?timeout="+timeout, nil)
+			req.Header.Set("Authorization", "Bearer test-token")
+			rec := httptest.NewRecorder()
+			s.mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", rec.Code)
+			}
+			if mock.lastStopVMReq != nil {
+				t.Errorf("StopVM was called for invalid timeout: %+v", mock.lastStopVMReq)
+			}
+		})
+	}
+}
+
+func TestInvalidBooleanQueryRejected(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		called func(*mockGRPC) bool
+	}{
+		{
+			name:   "remove_host_force",
+			method: http.MethodDelete,
+			path:   "/api/v1/hosts/node1?force=maybe",
+			called: func(m *mockGRPC) bool { return m.removeHostCalled },
+		},
+		{
+			name:   "delete_vm_keep_disks",
+			method: http.MethodDelete,
+			path:   "/api/v1/vms/vm1?keep_disks=maybe",
+			called: func(m *mockGRPC) bool { return m.deleteVMCalled },
+		},
+		{
+			name:   "stop_vm_force",
+			method: http.MethodPost,
+			path:   "/api/v1/vms/vm1/stop?force=maybe",
+			called: func(m *mockGRPC) bool { return m.lastStopVMReq != nil },
+		},
+		{
+			name:   "migrate_stack_delete_source",
+			method: http.MethodPost,
+			path:   "/api/v1/stacks/app/migrate-volumes?to=warm&delete_source=maybe",
+			called: func(m *mockGRPC) bool { return m.lastMigrateStackReq != nil },
+		},
+		{
+			name:   "migrate_stack_dry_run",
+			method: http.MethodPost,
+			path:   "/api/v1/stacks/app/migrate-volumes?to=warm&dry_run=maybe",
+			called: func(m *mockGRPC) bool { return m.lastMigrateStackReq != nil },
+		},
+		{
+			name:   "delete_network_force",
+			method: http.MethodDelete,
+			path:   "/api/v1/networks/net1?force=maybe",
+			called: func(m *mockGRPC) bool { return m.deleteNetworkCalled },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, mock := newMockServer("test-token")
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer test-token")
+			rec := httptest.NewRecorder()
+			s.mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", rec.Code)
+			}
+			if tc.called(mock) {
+				t.Fatalf("gRPC mock was called despite invalid boolean query")
+			}
+		})
+	}
+}
+
 // TestMigrateBody_UnmarshalsStrategyAndWithStorage validates the documented
 // migrate JSON (rest-api.md) maps onto MigrateVMRequest — there is no `cold` field.
 func TestMigrateBody_UnmarshalsStrategyAndWithStorage(t *testing.T) {
@@ -1638,6 +1799,25 @@ func TestAudit(t *testing.T) {
 	}
 	if mock.lastAuditLimit != 10 {
 		t.Errorf("audit limit = %d, want 10", mock.lastAuditLimit)
+	}
+}
+
+func TestAudit_InvalidLimitRejected(t *testing.T) {
+	for _, limit := range []string{"abc", "0", "-1"} {
+		t.Run(limit, func(t *testing.T) {
+			s, mock := newMockServer("test-token")
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/audit?limit="+limit, nil)
+			req.Header.Set("Authorization", "Bearer test-token")
+			rec := httptest.NewRecorder()
+			s.mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", rec.Code)
+			}
+			if mock.lastAuditLimit != 0 {
+				t.Errorf("ListAuditLog was called with limit %d", mock.lastAuditLimit)
+			}
+		})
 	}
 }
 

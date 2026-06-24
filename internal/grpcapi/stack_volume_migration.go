@@ -172,18 +172,31 @@ func orderStackVMs(vms []corrosion.VMRecord, order []string) ([]corrosion.VMReco
 // vm-level placement > default_pool) and marking disks already on target
 // as skips.
 func (s *Server) resolveStackPlan(ctx context.Context, vms []corrosion.VMRecord, req *pb.MigrateStackVolumesRequest) ([]vmPlan, error) {
+	knownVMs := map[string]struct{}{}
+	for _, vm := range vms {
+		knownVMs[vm.Name] = struct{}{}
+	}
 	diskLevel := map[string]map[string]string{} // vm -> disk -> pool
 	vmLevel := map[string]string{}              // vm -> pool
 	for _, pl := range req.Placements {
 		if pl.VmName == "" || pl.TargetPool == "" {
 			return nil, status.Error(codes.InvalidArgument, "each placement needs vm_name and target_pool")
 		}
+		if _, ok := knownVMs[pl.VmName]; !ok {
+			return nil, status.Errorf(codes.InvalidArgument, "placement references unknown vm %q", pl.VmName)
+		}
 		if pl.DiskName == "" {
+			if _, exists := vmLevel[pl.VmName]; exists {
+				return nil, status.Errorf(codes.InvalidArgument, "duplicate placement for vm %q", pl.VmName)
+			}
 			vmLevel[pl.VmName] = pl.TargetPool
 			continue
 		}
 		if diskLevel[pl.VmName] == nil {
 			diskLevel[pl.VmName] = map[string]string{}
+		}
+		if _, exists := diskLevel[pl.VmName][pl.DiskName]; exists {
+			return nil, status.Errorf(codes.InvalidArgument, "duplicate placement for disk %q on vm %q", pl.DiskName, pl.VmName)
 		}
 		diskLevel[pl.VmName][pl.DiskName] = pl.TargetPool
 	}
@@ -204,6 +217,17 @@ func (s *Server) resolveStackPlan(ctx context.Context, vms []corrosion.VMRecord,
 		disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "list disks for %q: %v", vm.Name, err)
+		}
+		if targets := diskLevel[vm.Name]; len(targets) > 0 {
+			knownDisks := map[string]struct{}{}
+			for _, d := range disks {
+				knownDisks[d.DiskName] = struct{}{}
+			}
+			for disk := range targets {
+				if _, ok := knownDisks[disk]; !ok {
+					return nil, status.Errorf(codes.InvalidArgument, "placement references unknown disk %q on vm %q", disk, vm.Name)
+				}
+			}
 		}
 		vp := vmPlan{vm: vm}
 		for _, d := range disks {

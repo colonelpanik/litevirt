@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -254,6 +255,111 @@ func TestMigrateStackVolumes_PreflightBlockDriver(t *testing.T) {
 	}, rec)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for block-driver source, got %v", err)
+	}
+}
+
+func TestMigrateStackVolumes_RejectsUnknownPlacementTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		place   *pb.VolumePlacement
+		wantErr string
+	}{
+		{
+			name:    "unknown_vm",
+			place:   &pb.VolumePlacement{VmName: "ghost", DiskName: "root", TargetPool: "warm"},
+			wantErr: "unknown vm",
+		},
+		{
+			name:    "unknown_disk",
+			place:   &pb.VolumePlacement{VmName: "pg-1", DiskName: "data", TargetPool: "warm"},
+			wantErr: "unknown disk",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServer(t)
+			s.dataDir = t.TempDir()
+			ctx := context.Background()
+			seedPool(t, s, ctx, "warm", "local", t.TempDir())
+			s.SetStoragePoolsByName(map[string]StoragePoolRef{"warm": {Driver: "local", Target: t.TempDir()}})
+			seedStackVM(t, s, ctx, "pg", "pg-1", "stopped", "hot", filepath.Join(s.dataDir, "pg-1.qcow2"), 1)
+
+			rec := &streamRecorder[pb.StackVolumeProgress]{ctx: adminCtx()}
+			err := s.MigrateStackVolumes(&pb.MigrateStackVolumesRequest{
+				StackName: "pg", Placements: []*pb.VolumePlacement{tc.place},
+			}, rec)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("expected InvalidArgument, got %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want %q", err, tc.wantErr)
+			}
+			if len(rec.Sent) != 0 {
+				t.Fatalf("invalid placement should fail before streaming progress: %+v", rec.Sent)
+			}
+		})
+	}
+}
+
+func TestMigrateStackVolumes_RejectsDuplicatePlacement(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	seedPool(t, s, ctx, "warm", "local", t.TempDir())
+	seedPool(t, s, ctx, "archive", "local", t.TempDir())
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{
+		"warm":    {Driver: "local", Target: t.TempDir()},
+		"archive": {Driver: "local", Target: t.TempDir()},
+	})
+	seedStackVM(t, s, ctx, "pg", "pg-1", "stopped", "hot", filepath.Join(s.dataDir, "pg-1.qcow2"), 1)
+
+	rec := &streamRecorder[pb.StackVolumeProgress]{ctx: adminCtx()}
+	err := s.MigrateStackVolumes(&pb.MigrateStackVolumesRequest{
+		StackName: "pg",
+		Placements: []*pb.VolumePlacement{
+			{VmName: "pg-1", DiskName: "root", TargetPool: "warm"},
+			{VmName: "pg-1", DiskName: "root", TargetPool: "archive"},
+		},
+	}, rec)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "duplicate placement") {
+		t.Fatalf("error = %v, want duplicate placement", err)
+	}
+}
+
+func TestMigrateStackVolumes_CapacityWarningDoesNotAbortDryRun(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{
+		HostName:   s.hostName,
+		Name:       "warm",
+		Driver:     "local",
+		Target:     t.TempDir(),
+		TotalBytes: 100,
+		UsedBytes:  95,
+		State:      "active",
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+	seedStackVM(t, s, ctx, "pg", "pg-1", "stopped", "hot", filepath.Join(s.dataDir, "pg-1.qcow2"), 10)
+
+	rec := &streamRecorder[pb.StackVolumeProgress]{ctx: adminCtx()}
+	if err := s.MigrateStackVolumes(&pb.MigrateStackVolumesRequest{
+		StackName: "pg", DefaultPool: "warm", DryRun: true,
+	}, rec); err != nil {
+		t.Fatalf("MigrateStackVolumes dry-run with capacity warning: %v", err)
+	}
+	if len(rec.Sent) == 0 {
+		t.Fatal("expected progress frames")
+	}
+	if rec.Sent[0].Stage != pb.StackVolumeProgress_PLANNING || !strings.Contains(rec.Sent[0].Status, "warning:") {
+		t.Fatalf("first frame = %+v, want planning warning", rec.Sent[0])
+	}
+	last := rec.Sent[len(rec.Sent)-1]
+	if last.Stage != pb.StackVolumeProgress_COMPLETE {
+		t.Fatalf("final stage = %v, want COMPLETE", last.Stage)
 	}
 }
 

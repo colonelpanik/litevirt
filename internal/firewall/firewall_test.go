@@ -157,6 +157,26 @@ func TestRender_IPSet(t *testing.T) {
 	)
 }
 
+// TestRender_UnknownIPSetRejected catches misspelled @set references before
+// they render into an nftables ruleset that fails only at apply time.
+func TestRender_UnknownIPSetRejected(t *testing.T) {
+	_, err := Render(Plan{
+		NICs: []NICBinding{{
+			NICDev: "tap0",
+			ExtraRules: []Rule{{
+				Direction: Ingress,
+				Proto:     "tcp",
+				PortRange: "22",
+				CIDR:      "@missing_admins",
+				Action:    Accept,
+			}},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing_admins") {
+		t.Fatalf("expected unknown ipset error mentioning missing_admins, got %v", err)
+	}
+}
+
 // TestRender_UnknownSGRejected protects against typos in compose.
 func TestRender_UnknownSGRejected(t *testing.T) {
 	_, err := Render(Plan{

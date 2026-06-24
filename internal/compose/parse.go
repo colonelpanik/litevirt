@@ -299,6 +299,12 @@ func validate(f *File) error {
 	for baseName, vm := range f.VMs {
 		for r := 0; r < vm.EffectiveReplicas(); r++ {
 			iname := vm.InstanceName(baseName, r)
+			if owner, ok := allInstanceNames[iname]; ok && owner != baseName {
+				errs = append(errs, fmt.Sprintf(
+					"workload %q instance name %q conflicts with workload %q — choose a different name or replica count",
+					baseName, iname, owner))
+				continue
+			}
 			allInstanceNames[iname] = baseName
 		}
 	}

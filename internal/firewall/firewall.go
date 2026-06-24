@@ -360,6 +360,20 @@ func sanitiseChain(nicDev string) string {
 // validate catches the classes of misconfigurations the renderer can't
 // safely round-trip.
 func validate(p Plan) error {
+	ipsets := map[string]bool{}
+	for _, ipset := range p.IPSets {
+		if ipset.Name == "" {
+			return errors.New("ipset with empty name")
+		}
+		ipsets[ipset.Name] = true
+		// F10: sets render as ipv4_addr, so an IPv6 element can't be expressed.
+		for _, cidr := range ipset.CIDRs {
+			if strings.Contains(cidr, ":") {
+				return fmt.Errorf("ipset %q: IPv6 element %q not supported yet (sets render as ipv4_addr)", ipset.Name, cidr)
+			}
+		}
+	}
+
 	for i, r := range allRules(p) {
 		switch r.Direction {
 		case Ingress, Egress:
@@ -379,21 +393,16 @@ func validate(p Plan) error {
 		if r.CIDR != "" && !strings.HasPrefix(r.CIDR, "@") && strings.Contains(r.CIDR, ":") {
 			return fmt.Errorf("rule %d: IPv6 CIDR %q is not supported by security-group rules yet (IPv4-only renderer)", i, r.CIDR)
 		}
+		if strings.HasPrefix(r.CIDR, "@") {
+			name := strings.TrimPrefix(r.CIDR, "@")
+			if name == "" || !ipsets[name] {
+				return fmt.Errorf("rule %d: unknown ipset reference %q", i, r.CIDR)
+			}
+		}
 	}
 	for _, sg := range p.SecurityGroups {
 		if sg.Name == "" {
 			return errors.New("security group with empty name")
-		}
-	}
-	for _, ipset := range p.IPSets {
-		if ipset.Name == "" {
-			return errors.New("ipset with empty name")
-		}
-		// F10: sets render as ipv4_addr, so an IPv6 element can't be expressed.
-		for _, cidr := range ipset.CIDRs {
-			if strings.Contains(cidr, ":") {
-				return fmt.Errorf("ipset %q: IPv6 element %q not supported yet (sets render as ipv4_addr)", ipset.Name, cidr)
-			}
 		}
 	}
 	return nil

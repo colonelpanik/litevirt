@@ -141,14 +141,19 @@ func TestRebalancer_RespectsMaxPerNode(t *testing.T) {
 	}
 }
 
-// A pinned VM is never proposed for migration.
-func TestRebalancer_PinnedNeverMoves(t *testing.T) {
+// A VM with placement.host set is STILL eligible for rebalancing. The daemon
+// auto-populates placement.host with the planner-resolved host for every
+// compose VM (grpcapi/stacks.go), so it is not a "never move" signal — treating
+// it as one (as an earlier cut of this fix did) silently disables rebalancing
+// for essentially the whole cluster. This is the regression guard.
+func TestRebalancer_PlacementHostStillRebalances(t *testing.T) {
 	db := newRebalancerTestDB(t)
 	insertHost(t, db, "loaded", 64, 256*1024)
 	insertHost(t, db, "empty", 64, 256*1024)
 
+	// placement.host=loaded (as compose would auto-set), mode=dry-run.
 	spec := `{"placement":{"policy":"balance","host":"loaded","rebalance":{"mode":"dry-run","threshold":1,"cooldown":"5m"}}}`
-	insertVM(t, db, "pinned-1", "loaded", 4, 8192, spec)
+	insertVM(t, db, "stacked-1", "loaded", 4, 8192, spec)
 	for i := 0; i < 4; i++ {
 		insertVM(t, db, fName(i), "loaded", 4, 8192, modeOffSpec)
 	}
@@ -157,8 +162,30 @@ func TestRebalancer_PinnedNeverMoves(t *testing.T) {
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	if d := dstFor(listProposals(t, db), "pinned-1"); d != "" {
-		t.Errorf("pinned-1 proposed to move to %q; pinned VMs must never move", d)
+	if d := dstFor(listProposals(t, db), "stacked-1"); d != "empty" {
+		t.Errorf("stacked-1 proposed dst=%q; a placement.host VM must still be rebalanceable (want empty)", d)
+	}
+}
+
+// no_migrate is the real opt-out — such a VM is never proposed even when an
+// obvious better placement exists.
+func TestRebalancer_NoMigrateOptsOut(t *testing.T) {
+	db := newRebalancerTestDB(t)
+	insertHost(t, db, "loaded", 64, 256*1024)
+	insertHost(t, db, "empty", 64, 256*1024)
+
+	spec := `{"placement":{"policy":"balance","host":"loaded","no_migrate":true,"rebalance":{"mode":"dry-run","threshold":1,"cooldown":"5m"}}}`
+	insertVM(t, db, "fixed-1", "loaded", 4, 8192, spec)
+	for i := 0; i < 4; i++ {
+		insertVM(t, db, fName(i), "loaded", 4, 8192, modeOffSpec)
+	}
+
+	r := NewRebalancer("loaded", db)
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if d := dstFor(listProposals(t, db), "fixed-1"); d != "" {
+		t.Errorf("fixed-1 (no_migrate) proposed to move to %q; must never move", d)
 	}
 }
 

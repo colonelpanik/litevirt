@@ -249,7 +249,17 @@ func (r *Rebalancer) evaluateAll(ctx context.Context, snap *placement.ClusterSna
 // required labels, max-per-node, devices, witness exclusion, spread-strict
 // pressure cap), so a proposed move can never violate a constraint that
 // admission would have rejected. Returns nil if no move improves the score by
-// at least the threshold, or if the VM is pinned / unmovable.
+// at least the threshold.
+//
+// NOTE on pinning: we deliberately do NOT skip VMs that have placement.host
+// set. The daemon auto-populates placement.host with the planner-resolved host
+// for EVERY compose-deployed VM (grpcapi/stacks.go "pin placement to the
+// planner-resolved host"), so it is not a reliable "never move" signal —
+// treating it as one would disable rebalancing for essentially the whole
+// cluster. The true opt-outs are no_migrate / migrate.strategy=none (honored in
+// evaluateAll via pol.NoMigrate) and rebalance.mode=off. Destination scoring
+// still applies every hard placement filter, so a move never violates a
+// constraint.
 func (r *Rebalancer) bestMove(snap *placement.ClusterSnapshot, vm corrosion.VMRecord, spec *pb.VMSpec, pol vmPolicy) *Proposal {
 	src := vm.HostName
 	if src == "" {
@@ -263,11 +273,6 @@ func (r *Rebalancer) bestMove(snap *placement.ClusterSnapshot, vm corrosion.VMRe
 	// Build the FULL placement request from the VM's stored spec — not just
 	// CPU/Mem — so destination eligibility honors every hard constraint.
 	req := buildPlacementRequest(vm, spec, pol)
-
-	// A pinned VM can only ever live on its pinned host → never propose a move.
-	if req.PinHost != "" {
-		return nil
-	}
 
 	// Score against a snapshot with THIS VM removed from its source: the source
 	// is then scored as "VM placed here as a newcomer" on identical footing with
@@ -353,7 +358,10 @@ func buildPlacementRequest(vm corrosion.VMRecord, spec *pb.VMSpec, pol vmPolicy)
 		return req
 	}
 	if p := spec.Placement; p != nil {
-		req.PinHost = p.Host
+		// Deliberately NOT setting req.PinHost from p.Host: it's auto-populated
+		// with the planner-resolved host for every compose VM, so it's not a
+		// rebalancer opt-out (see bestMove). It is also ignored by the snapshot
+		// scorer anyway — only Select() honors PinHost.
 		req.AntiAffinity = p.AntiAffinity
 		req.Affinity = p.Affinity
 		req.RequireLabels = p.Require

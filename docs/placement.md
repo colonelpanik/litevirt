@@ -109,8 +109,13 @@ The day-2 loop runs every 60 s on the leader-only coordinator (gated by the `lea
 Proposals score destinations with the **same hard-constraint pipeline as initial
 placement** — anti-affinity, required labels, max-per-node, device fit, witness
 exclusion, and the spread-strict pressure cap — so a proposed move can never land
-a VM somewhere admission would have refused. A pinned VM (`placement.host`) and
-a `no_migrate` / `migrate.strategy: none` VM are never proposed.
+a VM somewhere admission would have refused.
+
+To opt a VM out of rebalancing, set `no_migrate: true` (or `migrate.strategy:
+none`, or `rebalance.mode: off`). Note that `placement.host` does **not** opt a
+VM out: the daemon auto-populates it with the planner-resolved host for every
+compose VM, so it is not a "never move" signal — only the explicit flags above
+are.
 
 ### Execution
 

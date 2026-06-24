@@ -292,6 +292,30 @@ func (c *Client) execLocal(ctx context.Context, sqlStr string, params ...interfa
 	return err
 }
 
+// execBatchLocal runs multiple statements in ONE transaction locally, WITHOUT
+// writing a mutation_log row or notifying the replicator. It is the
+// non-replicating sibling of executeBatchInternal, for DDL/schema work that
+// must be atomic (e.g. a healing ALTER + its applied_migrations ledger insert)
+// but must stay local to this host (schema is per-host, never broadcast).
+func (c *Client) execBatchLocal(ctx context.Context, stmts []Statement) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	for _, s := range stmts {
+		if _, err := tx.ExecContext(ctx, s.SQL, s.Params...); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("exec batch local: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 // notifyReplicator sends a non-blocking signal to the replicator.
 func (c *Client) notifyReplicator() {
 	select {

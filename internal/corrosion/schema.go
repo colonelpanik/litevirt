@@ -2,8 +2,11 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 // CurrentSchemaVersion is the schema version this binary expects. Bump this
@@ -140,36 +143,94 @@ import (
 //	     container templates/clones (B4) + failover relocation (B5). gap-1 from v27.
 const CurrentSchemaVersion = 28
 
-// InitSchema creates all required tables in the local SQLite database.
-// DDL is not broadcast — each node creates its own tables on startup.
+// appliedMigrationsDDL is the per-migration ledger. It is created by the
+// framework itself (not part of schemaDDL) so it doesn't trip the CI growth
+// guard and there's no chicken-and-egg (we read it right after creating it).
+// It is LOCAL-ONLY: every write goes through execLocal/execBatchLocal (no
+// mutation_log row) and the table is deliberately absent from the full-state
+// sync list (sync.go tableNames), so peers never replicate it.
+const appliedMigrationsDDL = `CREATE TABLE IF NOT EXISTS applied_migrations (
+	id         TEXT PRIMARY KEY,
+	applied_at TEXT NOT NULL,
+	checksum   TEXT NOT NULL
+)`
+
+// InitSchema brings the local SQLite DB up to this binary's schema. DDL is not
+// broadcast — each node migrates its own DB on startup.
 //
-// Schema migrations: ALTER TABLE statements run idempotently against
-// already-initialized databases. The "duplicate column" / "already exists"
-// classes of error are expected (every daemon ran the migration once);
-// any OTHER error is treated as a real problem and aborts startup. The
-// earlier behavior of silently swallowing all migration errors hid
-// real schema corruption (a partial ALTER on a constraint violation could
-// leave the table in a state that the new daemon expected but reads against
-// silently misbehaved).
+// Authoritative per-migration ledger: instead of replaying every ALTER and
+// swallowing "already exists" errors (which hid real corruption and made
+// "DB is at vN" an assertion, not a fact), we track each migration UNIT by a
+// stable ID in applied_migrations. For each unit not yet recorded we run its
+// PRESENCE PREDICATE against the live DB (PRAGMA table_info / sqlite_master):
+//   - present  → record it (mark-only; the ALTER/CREATE already happened)
+//   - missing  → apply its SQL + record it in ONE local transaction (heal)
+// A real apply error aborts LOUDLY (no benign swallowing). Mark-applied is
+// gated on the presence predicate, NEVER on the version number, so a silent
+// gap from the old swallow-benign loop is healed rather than falsely claimed.
 func InitSchema(ctx context.Context, c *Client) error {
 	slog.Info("initializing schema")
 
+	// Tables first (CREATE TABLE IF NOT EXISTS — genuinely idempotent, and it
+	// guarantees every table exists before the ledger's presence checks run).
 	for _, ddl := range schemaDDL {
 		if err := c.execLocal(ctx, ddl); err != nil {
 			return fmt.Errorf("schema init: %w", err)
 		}
 	}
 
-	// Migrations stay one-by-one because each can fail for a benign
-	// reason (column already added) and we need per-statement error
-	// classification.
-	for _, alter := range schemaMigrations {
-		if err := c.execLocal(ctx, alter); err != nil {
-			if isBenignMigrationError(err) {
-				continue
+	// The ledger meta-table itself.
+	if err := c.execLocal(ctx, appliedMigrationsDDL); err != nil {
+		return fmt.Errorf("create applied_migrations: %w", err)
+	}
+	applied, err := loadAppliedMigrations(ctx, c)
+	if err != nil {
+		return fmt.Errorf("load applied_migrations: %w", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	healed := 0
+	for _, m := range schemaMigrationLedger {
+		sum := sha256hex(m.SQL)
+		if stored, ok := applied[m.ID]; ok {
+			// Already applied — a changed checksum means the migration's SQL was
+			// edited after it shipped, which would silently diverge DBs across the
+			// fleet. Refuse loudly.
+			if stored != sum {
+				return fmt.Errorf("schema ledger: migration %q checksum drift "+
+					"(stored %s, code %s) — never edit an applied migration's SQL; add a new one",
+					m.ID, stored, sum)
 			}
-			return fmt.Errorf("schema migration %q: %w", alter, err)
+			continue
 		}
+		present, err := m.present(ctx, c)
+		if err != nil {
+			return fmt.Errorf("schema ledger: presence check for %q: %w", m.ID, err)
+		}
+		if present {
+			if err := c.execLocal(ctx,
+				`INSERT OR IGNORE INTO applied_migrations (id, applied_at, checksum) VALUES (?, ?, ?)`,
+				m.ID, now, sum); err != nil {
+				return fmt.Errorf("schema ledger: record %q: %w", m.ID, err)
+			}
+			continue
+		}
+		// Missing: heal. Only addColumn units carry heal SQL — createTable units
+		// are always present here (schemaDDL ran above), so this is unreachable
+		// for them; guard anyway.
+		if m.SQL == "" {
+			return fmt.Errorf("schema ledger: %q (%s) reported missing but has no heal SQL", m.ID, m.Target)
+		}
+		if err := c.execBatchLocal(ctx, []Statement{
+			{SQL: m.SQL},
+			{SQL: `INSERT INTO applied_migrations (id, applied_at, checksum) VALUES (?, ?, ?)`,
+				Params: []interface{}{m.ID, now, sum}},
+		}); err != nil {
+			return fmt.Errorf("schema migration %q: %w", m.ID, err)
+		}
+		slog.Warn("schema ledger: healed a missing migration (silent gap from a prior daemon)",
+			"id", m.ID, "target", m.Target)
+		healed++
 	}
 
 	for _, idx := range schemaIndexes {
@@ -178,30 +239,31 @@ func InitSchema(ctx context.Context, c *Client) error {
 		}
 	}
 
-	// Schema-version pin: refuse to start if the local DB has been
-	// forward-migrated by a newer binary. This catches the
-	// "operator restored an old binary onto a new DB" mistake before the
-	// daemon scribbles inconsistent rows.
-	if err := checkSchemaVersion(ctx, c); err != nil {
+	if err := reconcileSchemaVersion(ctx, c); err != nil {
 		return err
 	}
 
-	slog.Info("schema initialized", "version", CurrentSchemaVersion)
+	slog.Info("schema initialized",
+		"version", derivedSchemaVersion(ctx, c),
+		"ledger", len(schemaMigrationLedger), "healed", healed)
 	return nil
 }
 
-// checkSchemaVersion compares the binary's CurrentSchemaVersion against the
-// version persisted in schema_state. Higher persisted version = downgrade
-// attempt = abort. Equal = ok. Lower or missing = bump and continue.
-func checkSchemaVersion(ctx context.Context, c *Client) error {
+// reconcileSchemaVersion keeps the legacy schema_state.version row in sync with
+// the ledger-DERIVED version (max Version over applied migration IDs). The
+// number is now produced from verified reality, not asserted. The downgrade
+// guard is unchanged for this PR: a DB forward-migrated past this binary
+// (stored > CurrentSchemaVersion) still refuses to start — relaxing that to
+// allow an old binary on a newer additive DB is the multi-version follow-up,
+// gated on the CI non-additive guard.
+func reconcileSchemaVersion(ctx context.Context, c *Client) error {
+	derived := derivedSchemaVersion(ctx, c)
+
 	rows, err := c.Query(ctx, `SELECT version FROM schema_state WHERE id = 1`)
-	if err != nil {
-		// schema_state table doesn't exist on a brand-new DB; we'll create
-		// the row below.
-		return seedSchemaVersion(ctx, c)
-	}
-	if len(rows) == 0 {
-		return seedSchemaVersion(ctx, c)
+	if err != nil || len(rows) == 0 {
+		return c.execLocal(ctx,
+			`INSERT OR IGNORE INTO schema_state (id, version, updated_at) VALUES (1, ?, ?)`,
+			derived, time.Now().UTC().Format(time.RFC3339))
 	}
 	stored := rows[0].Int("version")
 	if stored > CurrentSchemaVersion {
@@ -212,39 +274,63 @@ func checkSchemaVersion(ctx context.Context, c *Client) error {
 				"or restore an older DB snapshot.",
 			stored, CurrentSchemaVersion)
 	}
-	if stored < CurrentSchemaVersion {
-		return c.execLocal(ctx,
-			fmt.Sprintf(`UPDATE schema_state SET version = %d, updated_at = datetime('now') WHERE id = 1`,
-				CurrentSchemaVersion))
-	}
-	return nil
-}
-
-func seedSchemaVersion(ctx context.Context, c *Client) error {
 	return c.execLocal(ctx,
-		fmt.Sprintf(`INSERT OR IGNORE INTO schema_state (id, version, updated_at) VALUES (1, %d, datetime('now'))`,
-			CurrentSchemaVersion))
+		`UPDATE schema_state SET version = ?, updated_at = ? WHERE id = 1`,
+		derived, time.Now().UTC().Format(time.RFC3339))
 }
 
-// isBenignMigrationError returns true if err corresponds to "the migration
-// already ran on a previous start" rather than a real failure. SQLite's
-// modernc driver surfaces these as messages containing "duplicate column"
-// or "already exists" or "no such column" (for migrations that drop columns,
-// not currently used).
-func isBenignMigrationError(err error) bool {
-	if err == nil {
-		return true
+// loadAppliedMigrations returns id→checksum for every recorded migration.
+func loadAppliedMigrations(ctx context.Context, c *Client) (map[string]string, error) {
+	rows, err := c.Query(ctx, `SELECT id, checksum FROM applied_migrations`)
+	if err != nil {
+		return nil, err
 	}
-	msg := err.Error()
-	for _, frag := range []string{
-		"duplicate column",
-		"already exists",
-	} {
-		if containsFold(msg, frag) {
-			return true
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		out[r.String("id")] = r.String("checksum")
+	}
+	return out, nil
+}
+
+// derivedSchemaVersion is the highest schema Version among ledger migrations
+// recorded as applied — the DB's schema level derived from verified reality.
+// Only IDs this binary knows contribute (an older binary on a newer DB will
+// under-report; the multi-version follow-up reconciles that against the stored
+// forward version).
+func derivedSchemaVersion(ctx context.Context, c *Client) int {
+	applied, err := loadAppliedMigrations(ctx, c)
+	if err != nil {
+		return 1
+	}
+	byID := make(map[string]int, len(schemaMigrationLedger))
+	for _, m := range schemaMigrationLedger {
+		byID[m.ID] = m.Version
+	}
+	max := 1
+	for id := range applied {
+		if v, ok := byID[id]; ok && v > max {
+			max = v
 		}
 	}
-	return false
+	return max
+}
+
+// sha256hex is the checksum of a migration's SQL (catches an applied migration
+// being edited in place).
+func sha256hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// tableExists reports whether a table is present (createTable presence check).
+func tableExists(ctx context.Context, c *Client, name string) (bool, error) {
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, name)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	return rows.Next(), nil
 }
 
 // containsFold is a tiny case-insensitive substring helper — kept local so
@@ -1364,4 +1450,117 @@ var schemaMigrations = []string{
 	// fenced. Both additive; old rows default is_template=0, on_host_failure=NULL.
 	`ALTER TABLE containers ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE containers ADD COLUMN on_host_failure TEXT`,
+}
+
+// ───────────────────────── per-migration ledger ─────────────────────────
+//
+// The ledger gives every schema change a stable ID so applied_migrations can
+// record, by verified reality, exactly what each DB has. It must cover EVERY
+// schema version 1..CurrentSchemaVersion (enforced by a test) so the derived
+// version advances even for table-only versions that add no ALTER.
+
+type migKind int
+
+const (
+	kindAddColumn   migKind = iota // ALTER TABLE … ADD COLUMN; presence = column exists
+	kindCreateTable                // new table; presence = table exists (created by schemaDDL)
+)
+
+// migration is one ledgered schema unit.
+type migration struct {
+	ID      string  // stable, frozen once shipped; never reorder/edit
+	Version int     // schema version this unit belongs to (feeds derivedSchemaVersion)
+	Kind    migKind
+	Target  string // "table.col" (addColumn) or "table" (createTable) — for the presence check
+	SQL     string // heal statement (the ALTER for addColumn; "" for createTable — schemaDDL creates it)
+}
+
+// present runs the unit's presence predicate against the live DB.
+func (m migration) present(ctx context.Context, c *Client) (bool, error) {
+	switch m.Kind {
+	case kindAddColumn:
+		table, col := parseAddColumn(m.SQL)
+		if table == "" || col == "" {
+			return false, fmt.Errorf("addColumn migration %q: unparseable SQL %q", m.ID, m.SQL)
+		}
+		return columnExists(ctx, c.db, table, col)
+	case kindCreateTable:
+		return tableExists(ctx, c, m.Target)
+	default:
+		return false, fmt.Errorf("migration %q: unknown kind %d", m.ID, m.Kind)
+	}
+}
+
+// alterVersions maps schemaMigrations[i] → its schema version (authored from the
+// History block). MUST stay the same length as schemaMigrations (test-enforced).
+var alterVersions = []int{
+	1, 1, 1, 1, // host_pci_devices pcie_*/link_*
+	1,    // vm_disks.target_dev
+	1,    // image_hosts.progress_pct
+	1,    // hosts.version
+	1, 1, // lb_configs.ports/stack_name
+	1,          // hosts.role
+	2, 2, 2, 2, // users.realm/display_name/email, tokens.scope_paths
+	4,    // vm_interfaces.security_groups
+	6,    // hosts.region
+	8, 8, // audit_log.prev_hash/content_hash
+	9,    // vms.project
+	10,   // backup_schedules.pool_name
+	11,   // storage_pools.options
+	12, 12, // backup_schedules.scope/project_name
+	15,     // user_2fa.last_step
+	16, 16, // vms.is_template, vm_disks.backing_disk
+	17, 17, 17, 17, // backup_schedules type/target_pool/target_host/keep_replicas
+	18, 18, 18, // backup_schedules incremental/auto_promote/last_checkpoint
+	19, 19, 19, // snapshots type/vmstate_path/vmstate_size_bytes
+	24, 24, // containers.restart_policy/state_detail
+	25,     // containers.project
+	28, 28, // containers.is_template/on_host_failure
+}
+
+// createTableUnits cover the table-only versions (no ALTER) so every schema
+// version has ≥1 ledger entry. The representative table is one introduced at
+// that version; schemaDDL actually creates it, so these are presence/version
+// markers (their heal path is unreachable).
+var createTableUnits = []struct {
+	version int
+	table   string
+}{
+	{3, "security_groups"}, {5, "containers"}, {7, "backup_schedules"},
+	{13, "vm_events"}, {14, "vm_backups"}, {20, "notification_targets"},
+	{21, "ip_sets"}, {22, "replication_checkpoints"}, {23, "registry_credentials"},
+	{26, "container_backups"}, {27, "container_snapshots"},
+}
+
+// schemaMigrationLedger is built once at init from schemaMigrations (addColumn
+// units, 1:1) + createTableUnits. Built rather than hand-written so the SQL
+// stays DRY with schemaMigrations and can't drift.
+var schemaMigrationLedger []migration
+
+func init() {
+	if len(alterVersions) != len(schemaMigrations) {
+		panic(fmt.Sprintf("alterVersions (%d) must match schemaMigrations (%d) — update the version map",
+			len(alterVersions), len(schemaMigrations)))
+	}
+	for i, sql := range schemaMigrations {
+		table, col := parseAddColumn(sql)
+		if table == "" || col == "" {
+			panic(fmt.Sprintf("schemaMigrations[%d] is not a parseable ADD COLUMN: %q", i, sql))
+		}
+		schemaMigrationLedger = append(schemaMigrationLedger, migration{
+			ID:      fmt.Sprintf("a%03d_%s_%s", i, table, col),
+			Version: alterVersions[i],
+			Kind:    kindAddColumn,
+			Target:  table + "." + col,
+			SQL:     sql,
+		})
+	}
+	for _, ct := range createTableUnits {
+		schemaMigrationLedger = append(schemaMigrationLedger, migration{
+			ID:      "t_" + ct.table,
+			Version: ct.version,
+			Kind:    kindCreateTable,
+			Target:  ct.table,
+		})
+	}
 }

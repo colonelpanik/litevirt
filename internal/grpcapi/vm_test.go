@@ -11,6 +11,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // testServerWithLocks returns a Server that has vmLocks and a dataDir, needed
@@ -125,6 +126,81 @@ func TestCreateVM_AlreadyExists(t *testing.T) {
 	}
 	if c := status.Code(err); c != codes.AlreadyExists {
 		t.Errorf("code = %v, want AlreadyExists", c)
+	}
+}
+
+func TestCreateVM_QuotaThenPlacementLabelsAndAntiAffinity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "/acme", Display: "Acme"}); err != nil {
+		t.Fatalf("InsertProject: %v", err)
+	}
+	if err := corrosion.UpsertProjectQuota(ctx, s.db, corrosion.ProjectQuotaRecord{
+		ProjectName: "/acme", VCPULimit: 4, MemMiBLimit: 4096,
+	}); err != nil {
+		t.Fatalf("UpsertProjectQuota: %v", err)
+	}
+	for _, h := range []corrosion.HostRecord{
+		{Name: "test-host", Address: "10.0.0.1", State: "active", CPUTotal: 8, MemTotal: 16384},
+		{Name: "anti-host", Address: "10.0.0.2", State: "active", CPUTotal: 8, MemTotal: 16384},
+		{Name: "wrong-label", Address: "10.0.0.3", State: "active", CPUTotal: 8, MemTotal: 16384},
+	} {
+		if err := corrosion.InsertHost(ctx, s.db, h); err != nil {
+			t.Fatalf("InsertHost %s: %v", h.Name, err)
+		}
+	}
+	for host, tier := range map[string]string{"test-host": "gold", "anti-host": "gold", "wrong-label": "silver"} {
+		if err := corrosion.SetHostLabel(ctx, s.db, host, "tier", tier); err != nil {
+			t.Fatalf("SetHostLabel %s: %v", host, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "db", HostName: "anti-host", State: "running", CPUActual: 1, MemActual: 1024,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM db: %v", err)
+	}
+
+	resp, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name:      "api",
+		Project:   "/acme",
+		Cpu:       2,
+		MemoryMib: 1024,
+		Placement: &pb.PlacementSpec{
+			Require:      map[string]string{"tier": "gold"},
+			AntiAffinity: []string{"db"},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if resp.HostName != "test-host" {
+		t.Errorf("CreateVM host = %q, want test-host", resp.HostName)
+	}
+	rec, err := corrosion.GetVM(ctx, s.db, "api")
+	if err != nil || rec == nil {
+		t.Fatalf("GetVM api: %v %v", err, rec)
+	}
+	if rec.Project != "/acme" || rec.HostName != "test-host" {
+		t.Errorf("persisted api = %+v, want project /acme on test-host", rec)
+	}
+
+	_, err = s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name:      "api-over-quota",
+		Project:   "/acme",
+		Cpu:       3,
+		MemoryMib: 1024,
+		Placement: &pb.PlacementSpec{
+			Require:      map[string]string{"tier": "gold"},
+			AntiAffinity: []string{"db"},
+		},
+	}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("over-quota CreateVM: got %v, want ResourceExhausted", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, s.db, "api-over-quota"); rec != nil {
+		t.Errorf("over-quota VM should not be persisted: %+v", rec)
 	}
 }
 

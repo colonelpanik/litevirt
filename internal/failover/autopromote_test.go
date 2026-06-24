@@ -109,6 +109,49 @@ func TestCoordinator_AutoPromote_FiresWithNonePolicy(t *testing.T) {
 	}
 }
 
+func TestCoordinator_AutoPromote_FiresForBackingUpVM(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	for _, h := range []string{"bad", "good"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: h, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	// backing-up blocks ordinary destructive operations while the host is
+	// healthy, but once the host is fenced the in-flight backup is no longer a
+	// reason to strand the workload. DR promotion is an explicit recovery path.
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: "backing-up",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
+		VMName: "vm1", Repo: "dr", Scope: "vm", Cron: "* * * * *", Enabled: true,
+		Type: "replication", TargetPool: "dr", TargetHost: "good", AutoPromote: true,
+	}); err != nil {
+		t.Fatalf("UpsertBackupSchedule: %v", err)
+	}
+
+	fenceQuorum(t, ctx, db, []string{"coordinator", "good"}, "bad")
+
+	prom := &dbPromoter{db: db, target: "promoted-host"}
+	c := newTestCoordinator("coordinator", db)
+	c.Promoter = prom
+	c.run(ctx)
+
+	if len(prom.promoted) != 1 || prom.promoted[0] != "vm1" {
+		t.Fatalf("backing-up VM should still be promoted after fencing, got %v", prom.promoted)
+	}
+	vm, _ := corrosion.GetVM(ctx, db, "vm1")
+	if vm == nil || vm.HostName != "promoted-host" {
+		t.Errorf("expected backing-up VM promoted to 'promoted-host', got %+v", vm)
+	}
+}
+
 func TestCoordinator_AutoPromote_FallsBackOnError(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()

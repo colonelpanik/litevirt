@@ -555,6 +555,86 @@ func TestCoordinator_PlacementSelectsLargerHost(t *testing.T) {
 	}
 }
 
+func TestCoordinator_MixedVMContainerPoliciesWithPlacementConstraints(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	for _, h := range []corrosion.HostRecord{
+		{Name: "bad", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 16, MemTotal: 65536},
+		{Name: "node-a", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 16, MemTotal: 65536},
+		{Name: "node-b", Address: "10.0.0.3", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 16, MemTotal: 65536},
+		{Name: "wrong-zone", Address: "10.0.0.4", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 16, MemTotal: 65536},
+	} {
+		if err := corrosion.InsertHost(ctx, db, h); err != nil {
+			t.Fatalf("InsertHost %s: %v", h.Name, err)
+		}
+	}
+	for host, zone := range map[string]string{"node-a": "blue", "node-b": "blue", "wrong-zone": "red"} {
+		if err := corrosion.SetHostLabel(ctx, db, host, "zone", zone); err != nil {
+			t.Fatalf("SetHostLabel %s: %v", host, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "db", HostName: "node-a", State: "running", CPUActual: 1, MemActual: 1024,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM db: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name:      "api",
+		HostName:  "bad",
+		State:     "running",
+		CPUActual: 2,
+		MemActual: 2048,
+		Spec:      `{"on_host_failure":"restart-any","placement":{"host":"bad","require":{"zone":"blue"},"anti_affinity":["db"]}}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM api: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name:      "sticky",
+		HostName:  "bad",
+		State:     "running",
+		CPUActual: 1,
+		MemActual: 1024,
+		Spec:      `{"on_host_failure":"none","placement":{"no_migrate":true}}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM sticky: %v", err)
+	}
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "bad", Name: "sidecar", State: "running", Image: "alpine:3.21",
+		CPULimit: 1, MemMiB: 128, OnHostFailure: "image-recreate",
+	}); err != nil {
+		t.Fatalf("UpsertContainer sidecar: %v", err)
+	}
+
+	downObservers(t, db, "bad", "node-a", "node-b", "wrong-zone")
+	c := newTestCoordinator("coordinator", db)
+	c.run(ctx)
+
+	api, err := corrosion.GetVM(ctx, db, "api")
+	if err != nil || api == nil {
+		t.Fatalf("GetVM api: %v %v", err, api)
+	}
+	if api.HostName != "node-b" || api.State != "pending" {
+		t.Errorf("api placement = host %q state %q, want node-b pending", api.HostName, api.State)
+	}
+	sticky, _ := corrosion.GetVM(ctx, db, "sticky")
+	if sticky == nil || sticky.HostName != "bad" || sticky.State != "running" {
+		t.Errorf("sticky VM with none/no_migrate policy should stay untouched, got %+v", sticky)
+	}
+	if src, _ := corrosion.GetContainer(ctx, db, "bad", "sidecar"); src != nil {
+		t.Errorf("sidecar source row still present after relocation: %+v", src)
+	}
+	var relocated *corrosion.ContainerRecord
+	for _, host := range []string{"node-a", "node-b"} {
+		if ct, _ := corrosion.GetContainer(ctx, db, host, "sidecar"); ct != nil {
+			relocated = ct
+		}
+	}
+	if relocated == nil || relocated.State != "pending" || relocated.StateDetail != corrosion.ContainerRelocateRecreateDetail {
+		t.Errorf("sidecar relocation = %+v", relocated)
+	}
+}
+
 func TestCoordinator_FallbackToRoundRobin(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()

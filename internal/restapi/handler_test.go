@@ -3,12 +3,14 @@ package restapi
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -109,6 +111,7 @@ type mockGRPC struct {
 	lastVMStatsName string
 	lastExecVMReq   *pb.ExecVMRequest
 	lastSetVMIPReq  *pb.SetVMIPRequest
+	migrateVMStream grpc.ServerStreamingClient[pb.MigrateProgress]
 
 	// Image/User/Auth tracking
 	lastDeleteImageName string
@@ -141,6 +144,38 @@ type mockGRPC struct {
 
 	// Rescan tracking
 	lastRescanHostName string
+}
+
+type mockServerStreamingClient[T any] struct {
+	ctx  context.Context
+	msgs []*T
+	err  error
+	idx  int
+}
+
+func (m *mockServerStreamingClient[T]) Header() (metadata.MD, error) { return nil, nil }
+func (m *mockServerStreamingClient[T]) Trailer() metadata.MD         { return nil }
+func (m *mockServerStreamingClient[T]) CloseSend() error             { return nil }
+func (m *mockServerStreamingClient[T]) Context() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
+}
+func (m *mockServerStreamingClient[T]) SendMsg(any) error { return nil }
+func (m *mockServerStreamingClient[T]) RecvMsg(any) error { return nil }
+func (m *mockServerStreamingClient[T]) Recv() (*T, error) {
+	if m.idx < len(m.msgs) {
+		msg := m.msgs[m.idx]
+		m.idx++
+		return msg, nil
+	}
+	if m.err != nil {
+		err := m.err
+		m.err = nil
+		return nil, err
+	}
+	return nil, io.EOF
 }
 
 func (m *mockGRPC) Ping(ctx context.Context, in *pb.PingRequest, opts ...grpc.CallOption) (*pb.PingResponse, error) {
@@ -283,7 +318,7 @@ func (m *mockGRPC) DeleteImage(_ context.Context, in *pb.DeleteImageRequest, _ .
 	return &emptypb.Empty{}, nil
 }
 func (m *mockGRPC) MigrateVM(context.Context, *pb.MigrateVMRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[pb.MigrateProgress], error) {
-	return nil, nil
+	return m.migrateVMStream, nil
 }
 func (m *mockGRPC) CreateSnapshot(_ context.Context, in *pb.CreateSnapshotRequest, _ ...grpc.CallOption) (*pb.Snapshot, error) {
 	m.lastCreateSnapshotReq = in
@@ -919,6 +954,84 @@ func TestDeleteVM_ForwardsKeepDisks(t *testing.T) {
 	}
 	if mock.lastDeleteVMReq.Name != "vm1" || !mock.lastDeleteVMReq.KeepDisks {
 		t.Errorf("DeleteVM request = %+v, want vm1 with keep_disks", mock.lastDeleteVMReq)
+	}
+}
+
+func TestMigrateVM_FirstFrameFallbackReturnsFirstProgress(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.migrateVMStream = &mockServerStreamingClient[pb.MigrateProgress]{
+		msgs: []*pb.MigrateProgress{{Status: "validating", MemoryPct: 12.5}},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/vms/vm1/migrate", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "validating") || !strings.Contains(body, "12.5") {
+		t.Errorf("first-frame fallback body = %s, want serialized progress", body)
+	}
+}
+
+func TestMigrateVM_FirstFrameEOFReturnsError(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.migrateVMStream = &mockServerStreamingClient[pb.MigrateProgress]{}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/vms/vm1/migrate", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for EOF before first progress frame, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "EOF") {
+		t.Errorf("EOF response body = %s", rec.Body.String())
+	}
+}
+
+func TestMigrateVM_SSECompletesOnEOF(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.migrateVMStream = &mockServerStreamingClient[pb.MigrateProgress]{
+		msgs: []*pb.MigrateProgress{{Status: "copying"}},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/vms/vm1/migrate?stream=sse", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Result().Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"event: progress", "copying", "event: complete"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("SSE body missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestMigrateVM_SSEErrorFrame(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.migrateVMStream = &mockServerStreamingClient[pb.MigrateProgress]{
+		err: context.DeadlineExceeded,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/vms/vm1/migrate?stream=sse", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 SSE response, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "context deadline exceeded") {
+		t.Errorf("SSE error body = %s", body)
 	}
 }
 

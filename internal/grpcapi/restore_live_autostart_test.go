@@ -94,6 +94,70 @@ func testSpecJSON(t *testing.T, name string) string {
 	return string(b)
 }
 
+func TestResolveRestoreSpec_Precedence(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "host-a", State: "running", Spec: testSpecJSON(t, "existing")},
+		nil, nil,
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	spec, err := s.resolveRestoreSpec(ctx,
+		&pb.RestoreLiveRequest{
+			VmName:       "vm1",
+			FromExisting: true,
+			Spec:         &pb.VMSpec{Name: "explicit", Cpu: 8, MemoryMib: 8192},
+		},
+		&pbsstore.Manifest{VMSpecJSON: testSpecJSON(t, "manifest")},
+	)
+	if err != nil {
+		t.Fatalf("explicit spec: %v", err)
+	}
+	if spec.Name != "explicit" || spec.Cpu != 8 {
+		t.Errorf("explicit spec precedence = %+v", spec)
+	}
+
+	spec, err = s.resolveRestoreSpec(ctx,
+		&pb.RestoreLiveRequest{VmName: "vm1", FromExisting: true},
+		&pbsstore.Manifest{VMSpecJSON: testSpecJSON(t, "manifest")},
+	)
+	if err != nil {
+		t.Fatalf("manifest spec: %v", err)
+	}
+	if spec.Name != "manifest" {
+		t.Errorf("manifest should beat existing spec, got %+v", spec)
+	}
+
+	spec, err = s.resolveRestoreSpec(ctx,
+		&pb.RestoreLiveRequest{VmName: "vm1", FromExisting: true},
+		&pbsstore.Manifest{},
+	)
+	if err != nil {
+		t.Fatalf("existing spec: %v", err)
+	}
+	if spec.Name != "existing" {
+		t.Errorf("existing fallback spec = %+v", spec)
+	}
+
+	_, err = s.resolveRestoreSpec(ctx,
+		&pb.RestoreLiveRequest{VmName: "vm1", FromExisting: true},
+		&pbsstore.Manifest{VMSpecJSON: `{"name":`},
+	)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("bad manifest should fail instead of falling back to existing spec, got %v", err)
+	}
+
+	_, err = s.resolveRestoreSpec(ctx,
+		&pb.RestoreLiveRequest{VmName: "vm1"},
+		&pbsstore.Manifest{},
+	)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("missing metadata without from_existing: got %v", err)
+	}
+}
+
 func TestRestoreLive_AutoStart_FromManifestMetadata(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"

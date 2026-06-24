@@ -145,7 +145,8 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 // ListVMs returns VMs with optional filters.
 func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRecord, error) {
 	sql := `SELECT name, stack_name, host_name, spec, state, state_detail,
-		cpu_actual, mem_actual, COALESCE(is_template, 0) AS is_template, created_at, updated_at
+		cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
+		COALESCE(is_template, 0) AS is_template, created_at, updated_at
 		FROM vms WHERE deleted_at IS NULL`
 	var params []interface{}
 
@@ -174,6 +175,7 @@ func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRe
 			StateDetail: r.String("state_detail"),
 			CPUActual:   r.Int("cpu_actual"),
 			MemActual:   r.Int("mem_actual"),
+			Project:     r.String("project"),
 			IsTemplate:  r.Int("is_template") == 1,
 			CreatedAt:   r.String("created_at"),
 			UpdatedAt:   r.String("updated_at"),
@@ -186,7 +188,8 @@ func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRe
 func GetVM(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT name, stack_name, host_name, spec, state, state_detail,
-			cpu_actual, mem_actual, COALESCE(is_template, 0) AS is_template, created_at, updated_at
+			cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
+			COALESCE(is_template, 0) AS is_template, created_at, updated_at
 		 FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
@@ -205,6 +208,7 @@ func GetVM(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 		StateDetail: r.String("state_detail"),
 		CPUActual:   r.Int("cpu_actual"),
 		MemActual:   r.Int("mem_actual"),
+		Project:     r.String("project"),
 		IsTemplate:  r.Int("is_template") == 1,
 		CreatedAt:   r.String("created_at"),
 		UpdatedAt:   r.String("updated_at"),

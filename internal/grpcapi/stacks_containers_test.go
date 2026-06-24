@@ -2,12 +2,15 @@ package grpcapi
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/network"
 )
 
@@ -240,6 +243,106 @@ func TestDeleteStack_RemovesContainers(t *testing.T) {
 	// VM delete (which would leave the stack in "deleting").
 	if st, _ := corrosion.GetStack(ctx, s.db, "ct-stack"); st != nil {
 		t.Errorf("stack not tombstoned after down (state=%q) — container likely mis-counted as a VM", st.State)
+	}
+}
+
+func TestDeleteStack_MixedVMContainerExternalNetworkKeepDisks(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminContext(context.Background())
+	rt := &fakeCTRuntime{}
+	s.SetContainerRuntime(rt)
+
+	composeYAML := `name: mix
+networks:
+  uplink:
+    external: true
+workloads:
+  web:
+    image: tiny
+    cpu: 1
+    memory: 256
+  sidecar:
+    kind: lxc
+    image: alpine:3.21
+    cpu: 1
+    memory: 128
+`
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name: "mix", State: "active", ComposeYAML: composeYAML,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	diskPath := filepath.Join(t.TempDir(), "web-root.qcow2")
+	if err := os.WriteFile(diskPath, []byte("disk"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{
+			Name: "web", StackName: "mix", HostName: "test-host", State: "stopped",
+			CPUActual: 1, MemActual: 256,
+		},
+		nil,
+		[]corrosion.DiskRecord{{
+			VMName: "web", DiskName: "root", HostName: "test-host",
+			Path: diskPath, StorageType: "local", TargetDev: "vda",
+		}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "test-host", Name: "sidecar", State: "running",
+		Image: "alpine:3.21", CPULimit: 1, MemMiB: 128,
+		Labels: map[string]string{corrosion.LabelStack: "mix"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, nr := range []corrosion.NetworkRecord{
+		{Name: "mix_uplink", StackName: "mix", Type: "sriov", Config: `{"pf":"ens1f0"}`},
+		{Name: "mix_internal", StackName: "mix", Type: "sriov", Config: `{"pf":"ens2f0"}`},
+	} {
+		if err := corrosion.UpsertNetwork(ctx, s.db, nr); err != nil {
+			t.Fatalf("UpsertNetwork %s: %v", nr.Name, err)
+		}
+	}
+
+	stream := &mockDeleteStreamR2{ctx: ctx}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "mix", KeepDisks: true}, stream); err != nil {
+		t.Fatalf("DeleteStack: %v", err)
+	}
+
+	if _, err := os.Stat(diskPath); err != nil {
+		t.Fatalf("keep_disks through stack delete should preserve disk file: %v", err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, s.db, "web"); vm != nil {
+		t.Errorf("VM row still present after stack delete: %+v", vm)
+	}
+	if ct, _ := corrosion.GetContainer(ctx, s.db, "test-host", "sidecar"); ct != nil {
+		t.Errorf("container row still present after stack delete: %+v", ct)
+	}
+	if nr, _ := corrosion.GetNetwork(ctx, s.db, "mix_uplink"); nr == nil {
+		t.Fatal("external scoped network was deleted; stack delete must preserve external networks")
+	}
+	if nr, _ := corrosion.GetNetwork(ctx, s.db, "mix_internal"); nr != nil {
+		t.Errorf("internal stack network still present after stack delete: %+v", nr)
+	}
+	if st, _ := corrosion.GetStack(ctx, s.db, "mix"); st != nil {
+		t.Errorf("stack not tombstoned after clean mixed delete: %+v", st)
+	}
+
+	var sawVMDeleted, sawContainerDeleted bool
+	for _, p := range stream.sent {
+		if p.VmName == "web" && p.Status == "deleted" {
+			sawVMDeleted = true
+		}
+		if p.VmName == "sidecar" && p.Status == "deleted" {
+			sawContainerDeleted = true
+		}
+	}
+	if !sawVMDeleted || !sawContainerDeleted {
+		t.Errorf("progress missing VM/container deletion: %+v", stream.sent)
 	}
 }
 

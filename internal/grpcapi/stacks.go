@@ -1239,6 +1239,9 @@ func (s *Server) externalNetworkNames(ctx context.Context, stackName string) map
 	for name, netDef := range f.Networks {
 		if netDef.External {
 			ext[name] = true
+			if stackName != "" {
+				ext[compose.ScopedNetworkName(stackName, name)] = true
+			}
 		}
 	}
 	return ext

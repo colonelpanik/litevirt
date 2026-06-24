@@ -57,6 +57,7 @@ lv host ls                                # List hosts
 lv host ls --names                        # Print only host names, one per line (for scripts)
 lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
+lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host>                    # Return host to scheduling
 lv host rm <host> [--force]               # Remove host (--force with running VMs)
 lv host fence <host> --confirmed          # Manually fence a host (real fence)
@@ -201,14 +202,16 @@ lv migrate <vm> <target-host> --with-storage   # Copy disks to the target during
 ## Rebalance
 
 ```bash
-lv rebalance list [--status pending]                    # List proposals
+lv rebalance list [--status pending]                    # List proposals (pending|approved|applying|applied|failed|rejected|expired)
 lv rebalance run [--dry-run]                            # Force one evaluation cycle
-lv rebalance approve <proposal-id>                      # Approve a pending proposal
+lv rebalance approve <proposal-id>                      # Approve → leader's executor live-migrates it
 lv rebalance reject  <proposal-id> [--reason "text"]    # Reject a pending proposal
 ```
 
-The rebalancer also runs automatically every 60 s on the leader.
-See `docs/placement.md` for policies and modes.
+The rebalancer runs automatically every 60 s on the leader (proposing moves);
+the leader's executor applies approved proposals (`approved → applying →
+applied/failed`), bounded by the cluster rebalance budget.
+See `docs/placement.md` for policies, modes, and execution.
 
 ## Regions (federation)
 
@@ -324,6 +327,13 @@ lv mapping rm <name>
 ```bash
 lv run … --onboot --startup-order 10 --start-delay 5 --stop-delay 0
 # onboot VMs start in startup-order on host boot (not on a plain daemon restart).
+
+lv host shutdown-workloads <host>
+# Gracefully stop every running VM on a host in REVERSE startup-order (highest
+# startup-order first), honoring each VM's ACPI stop-grace-period and waiting its
+# --stop-delay before moving to the next VM. This is the ONLY thing that consumes
+# --stop-delay. It is an explicit operator action for an orderly host shutdown —
+# a normal daemon restart/upgrade leaves VMs running and does NOT trigger it.
 ```
 
 ## Restart policy

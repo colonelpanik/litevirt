@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -70,6 +71,8 @@ type mockGRPC struct {
 	lastInspectHostName  string
 	lastStartVMName      string
 	lastStopVMName       string
+	lastStopVMReq        *pb.StopVMRequest
+	lastRemoveHostReq    *pb.RemoveHostRequest
 	lastRestartVMName    string
 	lastDeleteVMName     string
 	deleteVMCalled       bool
@@ -162,6 +165,7 @@ func (m *mockGRPC) StartVM(ctx context.Context, in *pb.StartVMRequest, opts ...g
 }
 func (m *mockGRPC) StopVM(ctx context.Context, in *pb.StopVMRequest, opts ...grpc.CallOption) (*pb.VM, error) {
 	m.lastStopVMName = in.Name
+	m.lastStopVMReq = in
 	return m.stopVMResp, nil
 }
 func (m *mockGRPC) RestartVM(ctx context.Context, in *pb.RestartVMRequest, opts ...grpc.CallOption) (*pb.VM, error) {
@@ -213,6 +217,7 @@ func (m *mockGRPC) GetHostHealth(context.Context, *emptypb.Empty, ...grpc.CallOp
 }
 func (m *mockGRPC) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	m.lastRemoveHostName = in.Name
+	m.lastRemoveHostReq = in
 	m.removeHostCalled = true
 	return &emptypb.Empty{}, nil
 }
@@ -1397,6 +1402,59 @@ func TestHostConfig(t *testing.T) {
 	}
 	if mock.lastConfigureHostReq.Name != "node1" {
 		t.Errorf("configured host = %q, want node1", mock.lastConfigureHostReq.Name)
+	}
+}
+
+// TestHostConfig_AcceptsPutAndPost — docs advertise PUT; POST is preserved.
+func TestHostConfig_AcceptsPutAndPost(t *testing.T) {
+	for _, method := range []string{http.MethodPut, http.MethodPost} {
+		s, mock := newMockServer("test-token")
+		req := httptest.NewRequest(method, "/api/v1/hosts/node1/config",
+			strings.NewReader(`{"fence_strategy":"ipmi"}`))
+		req.Header.Set("Authorization", "Bearer test-token")
+		rec := httptest.NewRecorder()
+		s.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s /config: status %d, want 200", method, rec.Code)
+		}
+		if mock.lastConfigureHostReq == nil || mock.lastConfigureHostReq.Name != "node1" {
+			t.Errorf("%s /config: ConfigureHost not called with node1 (%+v)", method, mock.lastConfigureHostReq)
+		}
+	}
+}
+
+// TestRemoveHost_ForwardsForce — DELETE …?force=true wires RemoveHostRequest.Force.
+func TestRemoveHost_ForwardsForce(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/hosts/node1?force=true", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	s.mux.ServeHTTP(httptest.NewRecorder(), req)
+	if mock.lastRemoveHostReq == nil || !mock.lastRemoveHostReq.Force {
+		t.Errorf("force not forwarded to RemoveHost: %+v", mock.lastRemoveHostReq)
+	}
+}
+
+// TestStopVM_ForwardsForceAndTimeout — POST …/stop?force=true&timeout=30 wires both.
+func TestStopVM_ForwardsForceAndTimeout(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/vms/web-1/stop?force=true&timeout=30", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	s.mux.ServeHTTP(httptest.NewRecorder(), req)
+	if mock.lastStopVMReq == nil || !mock.lastStopVMReq.Force || mock.lastStopVMReq.Timeout != 30 {
+		t.Errorf("force/timeout not forwarded to StopVM: %+v", mock.lastStopVMReq)
+	}
+}
+
+// TestMigrateBody_UnmarshalsStrategyAndWithStorage validates the documented
+// migrate JSON (rest-api.md) maps onto MigrateVMRequest — there is no `cold` field.
+func TestMigrateBody_UnmarshalsStrategyAndWithStorage(t *testing.T) {
+	var req pb.MigrateVMRequest
+	body := `{"target_host":"host-b","strategy":"MIGRATE_COLD","with_storage":true}`
+	if err := protojson.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("unmarshal documented migrate body: %v", err)
+	}
+	if req.TargetHost != "host-b" || req.Strategy != pb.MigrateStrategy_MIGRATE_COLD || !req.WithStorage {
+		t.Errorf("migrate body decoded as %+v, want host-b / MIGRATE_COLD / withStorage=true", &req)
 	}
 }
 

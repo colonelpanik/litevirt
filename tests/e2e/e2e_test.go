@@ -68,6 +68,18 @@ func envOr(key, fallback string) string {
 // ─── Test harness ───────────────────────────────────────────────────────────
 
 func TestMain(m *testing.M) {
+	// Live e2e is OPT-IN. It mutates a real cluster and runs the CLI against
+	// whatever `lv` resolves, so a plain `go test ./...` must never accidentally
+	// touch a stale system `lv`. Require an explicit LITEVIRT_E2E=1, and once
+	// enabled require LV_BIN so we test a known binary, not whatever's on PATH.
+	if os.Getenv("LITEVIRT_E2E") != "1" {
+		fmt.Fprintln(os.Stderr, "E2E: set LITEVIRT_E2E=1 to run live e2e tests; skipping")
+		os.Exit(0)
+	}
+	if os.Getenv("LV_BIN") == "" {
+		fmt.Fprintln(os.Stderr, "E2E: LITEVIRT_E2E=1 but LV_BIN is not set — point LV_BIN at the binary under test (e.g. ./bin/litevirt) so e2e never runs a stale system lv")
+		os.Exit(1)
+	}
 	// Ensure the lv binary is available.
 	if _, err := exec.LookPath(lvBin); err != nil {
 		fmt.Fprintf(os.Stderr, "E2E: %s binary not found in PATH, skipping e2e tests\n", lvBin)
@@ -1071,7 +1083,7 @@ func TestUser_RBACEnforcement(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 func TestAudit_Log(t *testing.T) {
-	out := lv(t, "audit", "--limit", "10")
+	out := lv(t, "audit", "ls", "--limit", "10")
 	if out == "" {
 		t.Log("warning: audit log is empty")
 	}

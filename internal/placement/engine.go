@@ -313,6 +313,40 @@ func pickBest(c []hostCandidate) string {
 	return c[0].host.Name
 }
 
+// Candidate is one eligible host with its computed placement score, returned by
+// RankFromSnapshot. Higher Score is better (the sign is already policy-adjusted:
+// balance/spread prefer headroom, bin-pack prefers fill).
+type Candidate struct {
+	Host  string
+	Score float64
+}
+
+// RankFromSnapshot runs the full hard-filter + scoring pipeline for req against
+// a caller-supplied snapshot and returns every eligible host ranked best-first.
+//
+// Unlike Select, it neither builds a snapshot nor touches the DB: the caller
+// (e.g. the rebalancer) passes a snapshot it already holds and has adjusted —
+// typically with the VM-under-consideration removed from its source so the VM
+// neither blocks itself on resources/replicas nor anchors its own anti-affinity.
+// This is what makes rebalance destination scoring honor the SAME hard
+// constraints (anti-affinity, required labels, max-per-node, devices, witness,
+// spread-strict pressure cap) as initial placement. Devices, when required,
+// must already be present in snap.Devices.
+func RankFromSnapshot(snap *ClusterSnapshot, req *Request) ([]Candidate, error) {
+	if req.MaxPerNode > 0 {
+		snap.SeedReplicasForBase(req.VMBaseName)
+	}
+	cands, err := scoreCandidates(snap, req, true)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Candidate, len(cands))
+	for i, c := range cands {
+		out[i] = Candidate{Host: c.host.Name, Score: c.score}
+	}
+	return out, nil
+}
+
 // BatchResult holds the resolved host and device assignments for a VM.
 type BatchResult struct {
 	Host    string

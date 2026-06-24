@@ -56,7 +56,7 @@ func newRebalanceListCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&statusFilter, "status", "",
-		"Filter by status (pending, approved, applied, rejected, expired)")
+		"Filter by status (pending, approved, applying, applied, failed, rejected, expired)")
 	return cmd
 }
 
@@ -88,8 +88,12 @@ recorded as pending regardless of mode.`,
 func newRebalanceApproveCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "approve <proposal-id>",
-		Short: "Approve a pending proposal so the migration controller may apply it",
-		Args:  cobra.ExactArgs(1),
+		Short: "Approve a proposal; the leader's executor then live-migrates it",
+		Long: `Approve a rebalance proposal. The leader node's rebalance executor
+then claims it (approved → applying), live-migrates the VM, and records the
+result (applied / failed) — subject to the cluster rebalance budget. Track
+progress with 'lv rebalance list'.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(context.Background(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				p, err := c.ApproveRebalanceProposal(ctx,
@@ -97,7 +101,7 @@ func newRebalanceApproveCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("approve: %w", err)
 				}
-				fmt.Printf("Proposal %s approved (%s → %s for %s).\n",
+				fmt.Printf("Proposal %s approved (%s → %s for %s); executor will apply it shortly.\n",
 					p.Id, p.SrcHost, p.DstHost, p.VmName)
 				return nil
 			})

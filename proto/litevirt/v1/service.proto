@@ -18,6 +18,11 @@ message DrainProgress      { string vm_name = 1; string target_host = 2;
     MigrateStrategy strategy = 3; float progress_pct = 4;
     string status = 5; string error = 6; }
 message UndrainHostRequest { string name = 1; }
+// Ordered shutdown of a host's running VMs (honors startup_order desc +
+// stop_delay_sec between VMs). Explicit operator action — NOT run on daemon
+// SIGTERM / restart. This is the consumer of vms.stop_delay_sec.
+message ShutdownHostWorkloadsRequest { string name = 1; }
+message ShutdownProgress { string vm_name = 1; string status = 2; string error = 3; }
 message SetHostLabelsRequest { string name = 1;
     map<string, string> labels = 2; repeated string remove = 3; }
 message FenceHostRequest   {
@@ -1288,6 +1293,7 @@ service LiteVirt {
     rpc ListHosts(ListHostsRequest)           returns (ListHostsResponse);
     rpc InspectHost(InspectHostRequest)        returns (Host);
     rpc DrainHost(DrainHostRequest)            returns (stream DrainProgress);
+    rpc ShutdownHostWorkloads(ShutdownHostWorkloadsRequest) returns (stream ShutdownProgress);
     rpc UndrainHost(UndrainHostRequest)        returns (Host);
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);

@@ -24,6 +24,7 @@ func newHostCmd() *cobra.Command {
 		newHostLsCmd(),
 		newHostInspectCmd(),
 		newHostDrainCmd(),
+		newHostShutdownWorkloadsCmd(),
 		newHostUndrainCmd(),
 		newHostRmCmd(),
 		newHostLabelCmd(),
@@ -190,6 +191,42 @@ func newHostDrainCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&parallel, "parallel", 2, "Number of parallel migrations")
+	return cmd
+}
+
+func newHostShutdownWorkloadsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "shutdown-workloads <host>",
+		Short: "Gracefully stop a host's VMs in reverse startup order (honors stop-delay)",
+		Long: `Stop every running VM on a host in REVERSE startup order (highest
+startup_order first), pausing each VM's stop_delay_sec before the next.
+
+This is an explicit operator action for ordered host shutdown — it is NOT run on
+a normal daemon restart/upgrade (those keep VMs running). Each VM's ACPI
+stop_timeout_sec is honored.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				stream, err := c.ShutdownHostWorkloads(ctx, &pb.ShutdownHostWorkloadsRequest{Name: args[0]})
+				if err != nil {
+					return fmt.Errorf("shutdown-workloads: %w", err)
+				}
+				for {
+					p, err := stream.Recv()
+					if err != nil {
+						break
+					}
+					if p.Error != "" {
+						fmt.Fprintf(os.Stderr, "  %s [%s] ERROR: %s\n", p.VmName, p.Status, p.Error)
+					} else {
+						fmt.Printf("  %s [%s]\n", p.VmName, p.Status)
+					}
+				}
+				fmt.Printf("Host %s workloads shut down.\n", args[0])
+				return nil
+			})
+		},
+	}
 	return cmd
 }
 

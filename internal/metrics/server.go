@@ -267,7 +267,7 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, hostName string) *
 		),
 		rebalanceApplied: prometheus.NewDesc(
 			"litevirt_rebalance_proposals_total",
-			"Cumulative rebalance proposals by terminal status",
+			"Rebalance proposals by status (applied/failed/rejected/expired terminal; approved/applying in-flight)",
 			[]string{"status"}, nil,
 		),
 	}
@@ -543,10 +543,11 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 				prometheus.GaugeValue, float64(r.Int("cnt")), r.String("policy"))
 		}
 	}
-	// Cumulative count by terminal status.
+	// Count by status — terminal (applied/rejected/expired/failed) plus the
+	// transient in-flight states the executor uses (approved/applying).
 	if statusRows, perr := c.db.Query(ctx,
 		`SELECT status, COUNT(*) AS cnt FROM rebalance_proposals
-		 WHERE status IN ('applied','approved','rejected','expired') GROUP BY status`); perr == nil {
+		 WHERE status IN ('applied','approved','applying','rejected','expired','failed') GROUP BY status`); perr == nil {
 		for _, r := range statusRows {
 			ch <- prometheus.MustNewConstMetric(c.rebalanceApplied,
 				prometheus.CounterValue, float64(r.Int("cnt")), r.String("status"))

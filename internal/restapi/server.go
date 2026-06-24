@@ -240,7 +240,10 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request) {
 		jsonProto(w, resp)
 
 	case action == "" && r.Method == http.MethodDelete:
-		if _, err := s.grpc.RemoveHost(ctx, &pb.RemoveHostRequest{Name: name}); err != nil {
+		if _, err := s.grpc.RemoveHost(ctx, &pb.RemoveHostRequest{
+			Name:  name,
+			Force: r.URL.Query().Get("force") == "true",
+		}); err != nil {
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -335,7 +338,8 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonProto(w, resp)
 
-	case action == "config" && r.Method == http.MethodPost:
+	case action == "config" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
+		// Docs advertise PUT; POST is preserved for backward compatibility.
 		var req pb.ConfigureHostRequest
 		if err := protoFromJSON(r, &req); err != nil {
 			jsonError(w, http.StatusBadRequest, err.Error())
@@ -435,7 +439,13 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		jsonWrite(w, map[string]string{"status": "started", "vm": name})
 
 	case action == "stop" && r.Method == http.MethodPost:
-		if _, err := s.grpc.StopVM(ctx, &pb.StopVMRequest{Name: name}); err != nil {
+		stopReq := &pb.StopVMRequest{Name: name, Force: r.URL.Query().Get("force") == "true"}
+		if v := r.URL.Query().Get("timeout"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				stopReq.Timeout = int32(n)
+			}
+		}
+		if _, err := s.grpc.StopVM(ctx, stopReq); err != nil {
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
 		}

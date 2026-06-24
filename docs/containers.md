@@ -6,7 +6,7 @@ LXC family of tools. OCI images (Docker registries, etc.) are pulled via
 host bootstrap dependencies.
 
 The runtime API mirrors the VM lifecycle (Create / Start / Stop / Delete
-/ Console / Exec / List) so a single scheduler hosts both kinds of
+/ Exec / List) so a single scheduler hosts both kinds of
 workload — that's the structural advantage compared to running
 Kubernetes alongside a VM platform.
 
@@ -154,8 +154,9 @@ Current limits: an OCI **registry ref** (`kind: oci`, `image:
 docker.io/library/nginx:1.27`) isn't auto-pulled by compose yet — pre-pull it
 (`lv ct pull <ref> --dest <dir>`) and set `image:` to that rootfs path. A cpu/mem
 change recreates the container (no in-place reconfigure). `lv compose ps` lists
-VMs only. Containers cannot be **migrated** (no CRIU); use re-create. Per-NIC
-security-group provisioning for containers is a follow-up.
+VMs only. Containers have no **live/CRIU** migration; **cold migration**
+(`lv ct migrate`, stop → transfer → start) exists — see the Cold migration
+section below. Per-NIC security-group provisioning for containers is a follow-up.
 
 ## Networking
 

@@ -9,8 +9,8 @@
 </div>
 <p class="muted" style="margin:0 0 12px;font-size:12px">
   The placement rebalancer proposes migrations to improve cluster balance. Approve a
-  proposal to let the migration controller apply it. Same as
-  <code>lv rebalance list/run/approve/reject</code>.
+  proposal and the leader's rebalance executor live-migrates it (subject to the
+  cluster budget). Same as <code>lv rebalance list/run/approve/reject</code>.
 </p>
 
 <div style="margin-bottom:12px;font-size:13px">
@@ -18,7 +18,9 @@
   <a href="/rebalance" {{if not .StatusFilter}}style="font-weight:600"{{end}}>all</a> ·
   <a href="/rebalance?status=pending" {{if eq .StatusFilter "pending"}}style="font-weight:600"{{end}}>pending</a> ·
   <a href="/rebalance?status=approved" {{if eq .StatusFilter "approved"}}style="font-weight:600"{{end}}>approved</a> ·
+  <a href="/rebalance?status=applying" {{if eq .StatusFilter "applying"}}style="font-weight:600"{{end}}>applying</a> ·
   <a href="/rebalance?status=applied" {{if eq .StatusFilter "applied"}}style="font-weight:600"{{end}}>applied</a> ·
+  <a href="/rebalance?status=failed" {{if eq .StatusFilter "failed"}}style="font-weight:600"{{end}}>failed</a> ·
   <a href="/rebalance?status=rejected" {{if eq .StatusFilter "rejected"}}style="font-weight:600"{{end}}>rejected</a> ·
   <a href="/rebalance?status=expired" {{if eq .StatusFilter "expired"}}style="font-weight:600"{{end}}>expired</a>
 </div>
@@ -41,7 +43,9 @@
       <td>
         {{if eq .Status "pending"}}<span class="badge badge-yellow">pending</span>
         {{else if eq .Status "approved"}}<span class="badge badge-blue">approved</span>
+        {{else if eq .Status "applying"}}<span class="badge badge-blue">applying</span>
         {{else if eq .Status "applied"}}<span class="badge badge-green">applied</span>
+        {{else if eq .Status "failed"}}<span class="badge badge-red">failed</span>
         {{else if eq .Status "rejected"}}<span class="badge badge-red">rejected</span>
         {{else}}<span class="badge badge-gray">{{.Status}}</span>{{end}}
       </td>

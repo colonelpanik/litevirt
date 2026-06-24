@@ -62,8 +62,11 @@ testdata/tmp/
 tmp/
 /litevirt
 
-# Private working notes — consolidated roadmap/TODO, never published
+# Private working notes — internal roadmap/specs/bug-plans, never published to the mirror
 /TODO.md
+/BUGS.md
+/Plan.md
+/Specification.md
 
 # Claude Code local config / agents / skills / settings — never published
 .claude/

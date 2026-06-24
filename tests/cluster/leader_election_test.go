@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
@@ -61,12 +62,13 @@ func TestLeaderElection_OnlyOneFences(t *testing.T) {
 	}
 
 	// Quorum-of-2 observers (node-a and node-b) report victim failing.
+	nowRFC := time.Now().UTC().Format(time.RFC3339)
 	for _, observer := range []string{"node-a", "node-b"} {
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, 'victim', 'suspect', 5, NULL, datetime('now'))`,
-			observer,
+			 VALUES (?, 'victim', 'suspect', 5, NULL, ?)`,
+			observer, nowRFC,
 		); err != nil {
 			t.Fatalf("insert health %s: %v", observer, err)
 		}
@@ -122,13 +124,16 @@ func TestQuorumIgnoresStaleHealth(t *testing.T) {
 		}
 	}
 
-	// Two observers report failure, but both rows are 10 minutes old.
+	// Two observers report failure, but both rows are 10 minutes old. Use an
+	// RFC3339 timestamp (matching production) so the row is rejected for genuine
+	// AGE, not a datetime('now') format quirk — exercising the freshness gate.
+	staleRFC := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
 	for _, observer := range []string{"watcher", "coordinator"} {
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, 'victim', 'suspect', 5, NULL, datetime('now', '-10 minutes'))`,
-			observer,
+			 VALUES (?, 'victim', 'suspect', 5, NULL, ?)`,
+			observer, staleRFC,
 		); err != nil {
 			t.Fatalf("insert stale: %v", err)
 		}

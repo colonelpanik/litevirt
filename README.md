@@ -78,7 +78,7 @@ Full walkthrough in [docs/installation.md](docs/installation.md).
 | 🔁 **Resilience** | Live + cold + storage migration · quorum auto-failover with IPMI/watchdog fencing · per-VM **restart policy** · witness host for even-N clusters · safe self-upgrade with auto-rollback |
 | 💾 **Data** | Disk + live/RAM snapshots · PBS-style deduplicated backups with guest fs-freeze · incremental volume replication + promote-on-fence (DR) · 8 storage drivers (local/dir/NFS/iSCSI/Ceph/ZFS/btrfs/LVM-thin) |
 | 🧩 **Orchestration** | Docker-Compose-style multi-VM stacks · placement policies + anti-affinity · live rebalancer · HAProxy + keepalived L4 load balancing · GitOps reconcile loop · VM templates & clones |
-| 📦 **Containers** | LXC/OCI containers at **VM-parity day-2** — lifecycle + Compose · dedup backup/restore · snapshots · cold migration · templates & clones · host-loss relocation · shared tenancy quota, audit-chain & metrics |
+| 📦 **Containers** | LXC/OCI containers — lifecycle + Compose · dedup backup/restore · snapshots · cold migration · templates & clones · host-loss relocation · shared tenancy quota, audit-chain & metrics |
 | 🔐 **Security** | mTLS everywhere (auto ECDSA P-256 PKI) · path-based RBAC · Local/OIDC/LDAP realms · TOTP + WebAuthn 2FA · scoped API tokens · tamper-evident audit hash-chain |
 
 Decentralized by design: every host is equal, state replicates via the **Crescent** protocol

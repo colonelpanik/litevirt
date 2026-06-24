@@ -63,6 +63,12 @@ type Server struct {
 	// step (unit tests have no second daemon). Production leaves it nil.
 	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) error
 
+	// stopVMOverride is a test seam for ShutdownHostWorkloads: when non-nil it
+	// replaces the in-process StopVM call (unit tests have no libvirt/peer), so
+	// the test can observe the reverse-startup-order sequence and stop_delay
+	// pacing. Production leaves it nil → real StopVM forwards to the owning host.
+	stopVMOverride func(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, error)
+
 	// loginThrottle rate-limits failed Login attempts per (username, IP) to
 	// blunt password / second-factor brute force. In-memory + per-node; nil
 	// in bare test servers (no throttling) and set by NewServer in production.

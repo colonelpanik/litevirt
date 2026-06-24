@@ -120,6 +120,12 @@ inflated/deflated at runtime (`lv set-memory <vm> <MiB>`); `min-memory` is the f
 `onboot` VMs are started in `startup-order` when their host boots — a plain daemon
 restart is a no-op (running VMs are left alone), only an actual host reboot triggers it.
 
+`stop-delay` is the mirror of `start-delay` for an **orderly host shutdown**: running
+`lv host shutdown-workloads <host>` stops that host's VMs in *reverse* `startup-order`
+(highest first), waiting each VM's `stop-delay` before the next. It is an explicit
+operator action — a normal daemon restart/upgrade leaves VMs running, so `stop-delay`
+is consumed only by that command, never by routine daemon lifecycle.
+
 `cpu-mode` controls how the guest CPU is exposed: `host-passthrough` (expose the host
 CPU verbatim — fastest, but pins live migration to identical hardware), `host-model`
 (a portable model close to the host), or `custom`.

@@ -362,6 +362,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 
+	// Rebalance executor: leader-gated loop that applies operator-approved
+	// migration proposals (rc above only *proposes*). Reuses the rebalancer's
+	// leader lease so exactly one node executes; honors the cluster rebalance
+	// budget. Needs svc for the in-process live-migration call.
+	go grpcapi.NewRebalanceExecutor(svc, d.cfg.HostName, d.db).Start(ctx)
+
 	// Start stack deletion reconciler — retries cleanup for stacks stuck in "deleting" state.
 	stackReconciler := health.NewStackReconciler(d.cfg.HostName, d.db)
 	stackReconciler.SetCleaner(svc)

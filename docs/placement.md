@@ -102,15 +102,35 @@ The day-2 loop runs every 60 s on the leader-only coordinator (gated by the `lea
 | Mode | Behavior |
 |---|---|
 | `off` | No proposals emitted. |
-| `dry-run` (recommended default) | Proposals written to `rebalance_proposals` table; never applied. Operator reviews via `lv rebalance list`. |
-| `on-demand` | Proposals written; require explicit `lv rebalance approve <id>` before the migration controller picks them up. |
-| `auto` | Proposals written and immediately approved (subject to budget). Migration controller executes them. |
+| `dry-run` (recommended default) | Proposals written to `rebalance_proposals` table; never applied automatically. Operator reviews via `lv rebalance list` and may `approve` one to execute it. |
+| `on-demand` | Proposals written; require explicit `lv rebalance approve <id>` before the executor applies them. |
+| `auto` | Proposals written and immediately approved (subject to budget); the executor applies them automatically. |
+
+Proposals score destinations with the **same hard-constraint pipeline as initial
+placement** — anti-affinity, required labels, max-per-node, device fit, witness
+exclusion, and the spread-strict pressure cap — so a proposed move can never land
+a VM somewhere admission would have refused. A pinned VM (`placement.host`) and
+a `no_migrate` / `migrate.strategy: none` VM are never proposed.
+
+### Execution
+
+Approved proposals are applied by the **rebalance executor**, a leader-gated loop
+(sharing the rebalancer's `leader_election` lease, so exactly one node executes).
+Each cycle it atomically claims approved rows (`approved` → `applying`),
+re-validates them against live state (VM still exists, still running, still on the
+proposed source, still migratable; destination still active), runs the live
+migration, and records the terminal status (`applied` with `applied_at`, or
+`failed` with the error in `detail`). A claim whose migration never completes
+(daemon killed mid-flight) is reaped back to `failed` after a stale timeout.
+Track progress with `lv rebalance list` / `--status applying|applied|failed`.
 
 ### Per-VM cooldown and per-cluster budget
 
 - **Cooldown**: same VM is not re-proposed within `placement.rebalance.cooldown` (default 5 min).
-- **Per-cycle cap**: at most `MaxConcurrent` proposals per cycle (default 2).
-- **Hourly cap**: rebalancer skips a cycle if `MaxPerHour` proposals have been applied in the last 60 minutes (default 10).
+- **Per-cycle cap**: at most `MaxConcurrent` proposals generated per cycle (default 2).
+- **Concurrency cap**: the executor keeps at most `MaxConcurrent` migrations in flight (`applying`) at once.
+- **Hourly cap**: no more than `MaxPerHour` migrations are applied per rolling 60 minutes (default 10) — enforced by both the proposer and the executor.
+- **Budget resolution**: the cluster budget is the element-wise maximum of the per-VM `placement.rebalance.budget` values across migratable VMs (defaults when none declare one); proposer and executor share it.
 - **Cycle commits**: each chosen move updates a working snapshot in-memory so subsequent VMs in the same cycle see the new pressure layout — prevents "every VM wants the same destination" cascades.
 
 ---
@@ -188,8 +208,10 @@ lv rebalance run
 # Force evaluation in dry-run regardless of per-VM mode
 lv rebalance run --dry-run
 
-# Approve / reject a pending proposal
+# Approve a proposal — the leader's executor then live-migrates it
 lv rebalance approve <proposal-id>
+# Watch it execute
+lv rebalance list --status applying
 lv rebalance reject  <proposal-id> --reason "operator: not now"
 ```
 
@@ -204,7 +226,7 @@ The placement engine exports:
 | `litevirt_placement_decisions_total` | counter | `policy`, `result` |
 | `litevirt_host_pressure` | gauge | `host`, `dim` |
 | `litevirt_rebalance_proposals_pending` | gauge | `policy` |
-| `litevirt_rebalance_proposals_total` | counter | `status` (applied / approved / rejected / expired) |
+| `litevirt_rebalance_proposals_total` | counter | `status` (applied / failed / rejected / expired terminal; approved / applying in-flight) |
 
 Recommended alerts:
 
@@ -294,10 +316,16 @@ Placement engine (internal/placement/):
 
 Rebalancer (internal/scheduler/):
    periodic 60s ──→ resolveVMPolicy(vm)
-                ──→ for each VM: find bestMove via dimensional gain
+                ──→ for each VM: bestMove = RankFromSnapshot (full hard filters)
                 ──→ commit-in-snapshot → next VM's scoring sees update
                 ──→ write rebalance_proposals row
                 ──→ if mode=auto: mark approved
+
+Rebalance executor (internal/grpcapi/, leader-gated):
+   periodic 30s ──→ claim approved rows (approved → applying)
+                ──→ re-validate against live state
+                ──→ MigrateVM (live)  → applied | failed
+                ──→ honor concurrency + hourly budget; reap stale applying rows
 ```
 
 ---
@@ -308,7 +336,8 @@ Rebalancer (internal/scheduler/):
 |---|---|---|
 | VM creation fails with "no eligible host found … strict-spread pressure cap" | `spread-strict` would put all candidates above 50% on a wired dimension | Add hosts, or relax to `policy: balance` |
 | Rebalancer proposes nothing despite obvious imbalance | All VMs in `mode: off` | Set `mode: dry-run` cluster-wide |
-| Same VM proposed every cycle | Check it's NOT actually being applied; cooldown only suppresses the *same* VM after a successful proposal write | Apply or reject the proposal; cooldown will then take effect |
+| Same VM proposed every cycle | Cooldown only suppresses the *same* VM after a successful proposal write | Approve (the executor applies it) or reject the proposal; cooldown then takes effect |
+| Approved proposal never applies | Not the leader, or cluster budget exhausted (`applying` ≥ MaxConcurrent / `applied` ≥ MaxPerHour this hour), or it failed re-validation | `lv rebalance list --status applying\|failed`; check `detail`; confirm a leader holds the `rebalancer` lease |
 | Bin-pack doesn't concentrate | Hosts have unequal capacity → balance-style spread emerges naturally even under bin-pack scoring | Use placement labels to tier hosts |
 | Cost-aware ignores `cost.hourly` label | Label format must be parseable as a positive float | `cost.hourly: "0.10"` not `cost.hourly: cheap` |
 

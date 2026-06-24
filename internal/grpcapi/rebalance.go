@@ -96,8 +96,10 @@ func (s *Server) RunRebalance(ctx context.Context, req *pb.RunRebalanceRequest) 
 	return &pb.RunRebalanceResponse{ProposalsEmitted: emitted}, nil
 }
 
-// ApproveRebalanceProposal transitions a pending proposal to "approved",
-// signaling the migration controller (when wired) to execute it.
+// ApproveRebalanceProposal transitions a pending proposal to "approved". The
+// leader's rebalance executor (internal/grpcapi/rebalance_executor.go) then
+// claims it (approved→applying), runs the live migration, and records the
+// terminal status (applied/failed), subject to the cluster rebalance budget.
 func (s *Server) ApproveRebalanceProposal(ctx context.Context, req *pb.ApproveRebalanceProposalRequest) (*pb.RebalanceProposal, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err

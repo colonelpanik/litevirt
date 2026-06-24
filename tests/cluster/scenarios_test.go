@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
@@ -33,12 +34,17 @@ func TestThreeCoordinators_AtMostOneFences(t *testing.T) {
 
 	// Quorum: three observers all report victim suspect. Without the
 	// lease, naive logic would fence three times.
+	// updated_at MUST be RFC3339 to match production (internal/health/checker.go)
+	// and the coordinator's freshness gate; SQLite datetime('now') is space-
+	// separated and sorts before any 'T'-separated cutoff, so it reads as
+	// permanently stale and the row never reaches quorum (the freshness bug).
+	nowRFC := time.Now().UTC().Format(time.RFC3339)
 	for _, observer := range []string{"node-a", "node-b", "node-c"} {
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, 'victim', 'suspect', 5, NULL, datetime('now'))`,
-			observer,
+			 VALUES (?, 'victim', 'suspect', 5, NULL, ?)`,
+			observer, nowRFC,
 		); err != nil {
 			t.Fatalf("insert health %s: %v", observer, err)
 		}
@@ -108,12 +114,13 @@ func TestPartitionMinorityCannotFence(t *testing.T) {
 
 	// Only node-c (this side of the partition) reports its peers
 	// unhealthy. Quorum-of-2 cannot be satisfied.
+	nowRFC := time.Now().UTC().Format(time.RFC3339)
 	for _, target := range []string{"node-a", "node-b"} {
 		if err := minority.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES ('node-c', ?, 'suspect', 5, NULL, datetime('now'))`,
-			target,
+			 VALUES ('node-c', ?, 'suspect', 5, NULL, ?)`,
+			target, nowRFC,
 		); err != nil {
 			t.Fatalf("insert health %s: %v", target, err)
 		}

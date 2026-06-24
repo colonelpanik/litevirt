@@ -37,8 +37,10 @@ curl -N -H "Accept: text/event-stream" -H "Authorization: Bearer $TOKEN" \
 ```
 
 Without the SSE opt-in, streaming endpoints return the first message + an
-ack (legacy compatibility). Widening SSE coverage to every streaming RPC
-is on the roadmap; today only migrate and drain are wired.
+ack (legacy compatibility). SSE is wired for many streaming RPCs today —
+VM migrate, host drain, backup snapshot/restore, stack deploy, region
+migrate, and volume move/replicate (see the streaming routes listed below);
+widening it to every remaining streaming RPC is on the roadmap.
 
 ## Endpoints
 
@@ -109,14 +111,19 @@ POST   /api/v1/vms/{name}/disks/{disk}/resize   # Resize a disk
 GET    /api/v1/vms/{name}/stats                 # VM resource statistics
 ```
 
-Migrate request body:
+Migrate request body (protobuf-JSON for `MigrateVMRequest`):
 
 ```json
 {
   "target_host": "host-b",
-  "cold": false
+  "strategy": "MIGRATE_LIVE",
+  "with_storage": false
 }
 ```
+
+`strategy` is `MIGRATE_LIVE` (default) | `MIGRATE_COLD` | `MIGRATE_NONE`; set
+`with_storage: true` to copy local disks during migration. (There is no `cold`
+field — the CLI `lv migrate --cold` maps to `strategy: MIGRATE_COLD`.)
 
 ### Snapshots
 
@@ -311,8 +318,9 @@ A handful of RPCs remain gRPC-only because they're bidirectional
 streams that don't map cleanly onto SSE / chunked HTTP. These will
 move to WebSocket in a later iteration:
 
-- `StreamEvents`, `GetVMLogs`, `ConsoleVM`, `ProxyVNC`,
-  `ExecContainer` — bidirectional or WebSocket-shaped.
+- `StreamEvents`, `GetVMLogs`, `ConsoleVM`, `ProxyVNC` — bidirectional or
+  WebSocket-shaped. (`ExecContainer` IS wired in REST — `POST
+  /api/v1/containers/{name}/exec`.)
 - `RestoreLive` — keeps an NBD server alive for the duration of the
   stream; modelling that over HTTP is awkward.
 - `GetSpiceInfo` — short-lived URL handoff, but tied to a

@@ -43,7 +43,7 @@ An edit modal is accessible from the VM detail page. It has four tabs:
 
 ## VNC Console
 
-An in-browser VNC viewer is available using noVNC (loaded from CDN). It opens in a new tab at `/vms/{name}/vnc` and is only available for running VMs that have VNC enabled (not headless).
+An in-browser VNC viewer is available using noVNC (vendored as a static asset under `internal/ui/static/`, served by the daemon — no external CDN). It opens in a new tab at `/vms/{name}/vnc` and is only available for running VMs that have VNC enabled (not headless).
 
 Cross-host routing path:
 
@@ -89,7 +89,7 @@ source; **Revert to VM** undoes it). Templates clone with a fresh identity.
 
 ## Text Console
 
-An in-browser terminal is available using xterm.js (loaded from CDN). It opens as a modal overlay on the VM detail page and is available for any running VM.
+An in-browser terminal is available using xterm.js (vendored as a static asset under `internal/ui/static/`, served by the daemon — no external CDN). It opens as a modal overlay on the VM detail page and is available for any running VM.
 
 Cross-host routing path:
 

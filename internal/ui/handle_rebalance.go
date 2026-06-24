@@ -38,8 +38,8 @@ func (s *Server) handleRebalanceRun(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleRebalanceApprove approves a pending proposal so the migration controller
-// may apply it. Mirrors `lv rebalance approve <id>`.
+// handleRebalanceApprove approves a pending proposal; the leader's rebalance
+// executor then live-migrates it. Mirrors `lv rebalance approve <id>`.
 func (s *Server) handleRebalanceApprove(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p, err := s.grpc.ApproveRebalanceProposal(s.uiBearerCtx(r), &pb.ApproveRebalanceProposalRequest{Id: id})

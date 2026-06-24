@@ -234,6 +234,52 @@ func TestPolicy_CostAwarePreferCheapHosts(t *testing.T) {
 	}
 }
 
+func TestPolicy_CostAwareInvalidCostLabelsAreNeutral(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+	}{
+		{name: "missing", labels: nil},
+		{name: "empty", labels: map[string]string{"cost.hourly": ""}},
+		{name: "zero", labels: map[string]string{"cost.hourly": "0"}},
+		{name: "negative", labels: map[string]string{"cost.hourly": "-1"}},
+		{name: "malformed", labels: map[string]string{"cost.hourly": "cheap"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := corrosion.HostRecord{Labels: tt.labels}
+			if got := hostCostMultiplier(h); got != 1.0 {
+				t.Fatalf("hostCostMultiplier(%v) = %v, want neutral 1.0", tt.labels, got)
+			}
+		})
+	}
+}
+
+func TestPolicy_RequireLabelBeatsContradictoryPreference(t *testing.T) {
+	hosts := []corrosion.HostRecord{
+		{Name: "required", Address: "10.0.0.1", State: "active",
+			CPUTotal: 16, MemTotal: 64 * 1024,
+			Labels: map[string]string{"zone": "east", "disk": "slow"}},
+		{Name: "preferred-only", Address: "10.0.0.2", State: "active",
+			CPUTotal: 16, MemTotal: 64 * 1024,
+			Labels: map[string]string{"zone": "west", "disk": "fast"}},
+	}
+	results, err := SelectBatch(hosts, nil, nil, []Request{{
+		VMName:        "vm1",
+		CPUNeeded:     1,
+		MemMiBNeeded:  1024,
+		Policy:        PolicyBalance,
+		RequireLabels: map[string]string{"zone": "east"},
+		PreferLabels:  map[string]string{"disk": "fast"},
+	}})
+	if err != nil {
+		t.Fatalf("SelectBatch: %v", err)
+	}
+	if results["vm1"].Host != "required" {
+		t.Errorf("hard required labels must beat soft preferences; got %q", results["vm1"].Host)
+	}
+}
+
 // TestPolicy_DefaultIsBalance verifies an unset Policy resolves to balance.
 func TestPolicy_DefaultIsBalance(t *testing.T) {
 	r := Request{}

@@ -132,6 +132,28 @@ workloads:
 	}
 }
 
+func TestFoldWorkloads_GeneratedInstanceNameCollisionRejected(t *testing.T) {
+	in := `
+version: "1"
+name: test-stack
+vms:
+  web:
+    image: nginx
+    replicas: 2
+workloads:
+  web-1:
+    kind: lxc
+    image: alpine
+`
+	_, err := ParseBytes([]byte(in))
+	if err == nil {
+		t.Fatal("expected generated instance-name collision")
+	}
+	if !strings.Contains(err.Error(), "instance name") || !strings.Contains(err.Error(), "web-1") {
+		t.Fatalf("expected collision error mentioning web-1, got %v", err)
+	}
+}
+
 // TestFoldWorkloads_UnknownKindRejected — typo guard.
 func TestFoldWorkloads_UnknownKindRejected(t *testing.T) {
 	in := `

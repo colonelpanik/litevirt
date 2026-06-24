@@ -110,7 +110,7 @@ func TestParseMemoryString_Invalid(t *testing.T) {
 func TestValidateAffinityRules_NoConflict(t *testing.T) {
 	f := &File{
 		VMs: map[string]VMDef{
-			"web": {Image: "nginx", Placement: &PlacementDef{Affinity: []string{"cache"}}},
+			"web":   {Image: "nginx", Placement: &PlacementDef{Affinity: []string{"cache"}}},
 			"cache": {Image: "redis"},
 			"db":    {Image: "postgres", Placement: &PlacementDef{AntiAffinity: []string{"web"}}},
 		},
@@ -174,7 +174,7 @@ func TestValidate_TempNameCollision(t *testing.T) {
 	f := &File{
 		Name: "test",
 		VMs: map[string]VMDef{
-			"web":      {Image: "nginx", Replicas: &n},
+			"web":        {Image: "nginx", Replicas: &n},
 			"web-1-next": {Image: "nginx"},
 		},
 	}
@@ -184,6 +184,26 @@ func TestValidate_TempNameCollision(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "rolling update temporary name") {
 		t.Errorf("error should mention rolling update temp name, got: %v", err)
+	}
+}
+
+func TestValidate_InstanceNameCollision(t *testing.T) {
+	// VM "web" with two replicas generates "web-1", colliding with an
+	// explicitly named workload. This must fail before deploy planning.
+	n := 2
+	f := &File{
+		Name: "test",
+		VMs: map[string]VMDef{
+			"web":   {Image: "nginx", Replicas: &n},
+			"web-1": {Image: "nginx"},
+		},
+	}
+	err := validate(f)
+	if err == nil {
+		t.Fatal("expected validation error for duplicate instance name")
+	}
+	if !strings.Contains(err.Error(), "instance name") || !strings.Contains(err.Error(), "web-1") {
+		t.Errorf("error should mention duplicate instance name web-1, got: %v", err)
 	}
 }
 
@@ -584,6 +604,35 @@ vms:
 	}
 	if labels["tier"] != "frontend" {
 		t.Errorf("tier label = %q, want frontend", labels["tier"])
+	}
+}
+
+func TestExtends_NetworkSliceReplacesParent(t *testing.T) {
+	yml := `
+name: test
+vms:
+  base:
+    image: ubuntu
+    network:
+      - name: backend
+        ip: 10.0.1.10
+      - name: metrics
+  web:
+    extends: base
+    network:
+      - name: frontend
+        ip: 10.0.2.10
+`
+	f, err := ParseBytes([]byte(yml))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	nics := f.VMs["web"].Network
+	if len(nics) != 1 {
+		t.Fatalf("child network slice should replace parent, got %+v", nics)
+	}
+	if nics[0].Name != "frontend" || nics[0].IP != "10.0.2.10" {
+		t.Fatalf("child network not preserved after replacement: %+v", nics[0])
 	}
 }
 

@@ -345,6 +345,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	d.svc = svc
+	// Target the upgrade swap at the binary we're actually running (re-exec uses
+	// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
+	if exe, err := os.Executable(); err == nil {
+		svc.SetBinaryPath(exe)
+	}
 	svc.SetVersion(d.cfg.Version)
 	svc.SetDNSDomain(d.cfg.DNSDomain)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))

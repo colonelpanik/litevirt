@@ -130,11 +130,11 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 	for _, disk := range disks {
 		stmts = append(stmts, Statement{
 			SQL: `INSERT INTO vm_disks (vm_name, disk_name, host_name, path, size_bytes,
-				backing_image, storage_type, storage_volume, backing_disk, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				backing_image, storage_type, storage_volume, target_dev, backing_disk, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			Params: []interface{}{
 				disk.VMName, disk.DiskName, disk.HostName, disk.Path, disk.SizeBytes,
-				disk.BackingImage, disk.StorageType, disk.StorageVolume, nullIfEmpty(disk.BackingDisk), now,
+				disk.BackingImage, disk.StorageType, disk.StorageVolume, disk.TargetDev, nullIfEmpty(disk.BackingDisk), now,
 			},
 		})
 	}

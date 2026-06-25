@@ -291,6 +291,25 @@ lv image ls
 lv image rm <image>
 ```
 
+## Import (migrate VMs in)
+
+Import an existing VM from VMware (OVA/OVF) or Proxmox (qemu-server `.conf` or a
+`vzdump` `.vma`). Disks are converted to qcow2 and the VM is defined **stopped**
+(use `--start` to boot it). The source bus, SCSI controller model, firmware and
+VLAN are preserved; Secure Boot / vTPM are imported degraded with a warning.
+
+```bash
+lv import <file> --name <name> [--from auto|ova|ovf|proxmox|vma]
+lv import win2022.ova --name win2022 --network br0 --start
+lv import --from proxmox --server-path /srv/stage/100.conf --name app \
+          --disk-map scsi0=/srv/stage/vm-100-disk-0.qcow2 --network br0
+lv import dump.vma.zst --from vma --server-path /srv/stage/dump.vma.zst --name app --inspect
+#   --net-map <foreign>=<bridge>   map a specific source network to a bridge
+#   --preserve-mac                 keep source MACs (default: regenerate)
+#   --server-path <path>           use a file/dir already staged on the target host
+#   --inspect                      print the mapping + warnings, import nothing
+```
+
 ## Snapshots
 
 ```bash

@@ -96,44 +96,35 @@ Pick a small, non-critical VM. Note its qcow2 path
 Cold migration is the safest first move. The pilot VM has at most one
 restart window during the cut.
 
+`lv import` parses the qemu-server config and converts the disks for you,
+preserving CPU/memory, disk bus + SCSI controller model, firmware, and NIC VLANs.
+The VM is defined **stopped** so you can inspect it before booting.
+
 ```bash
-# On the PVE side:
+# On the PVE side: stop the VM and stage its config + disk(s) where a litevirt
+# host can read them (scp to the host, or an NFS share).
 qm shutdown <vmid>
+scp /etc/pve/qemu-server/<vmid>.conf \
+    /var/lib/vz/images/<vmid>/vm-<vmid>-disk-0.qcow2 \
+    pilot-1:/srv/stage/
 
-# Copy the disk image to the litevirt host (or NFS share).
-scp /var/lib/vz/images/<vmid>/vm-<vmid>-disk-0.qcow2 \
-    pilot-1:/var/lib/litevirt/disks/pilot-vm-root.qcow2
+# On the litevirt side: preview the mapping, then import.
+lv import --from proxmox --server-path /srv/stage/<vmid>.conf --name pilot-vm \
+          --disk-map scsi0=/srv/stage/vm-<vmid>-disk-0.qcow2 \
+          --net-map vmbr0=br0 --inspect
+
+lv import --from proxmox --server-path /srv/stage/<vmid>.conf --name pilot-vm \
+          --disk-map scsi0=/srv/stage/vm-<vmid>-disk-0.qcow2 \
+          --net-map vmbr0=br0 --start
+lv ls            # confirm pilot-vm running
 ```
 
-Write a tiny compose file:
-
-```yaml
-# /etc/litevirt/stacks/pilot.yaml
-volumes:
-  local:
-    driver: local
-
-networks:
-  prod:
-    type: bridge
-    interface: vmbr0       # the PVE bridge name still works
-
-vms:
-  pilot-vm:
-    image: ""              # disk pre-staged
-    cpu: 2
-    memory: 4G
-    disks:
-      root: { volume: local, source: /var/lib/litevirt/disks/pilot-vm-root.qcow2 }
-    network:
-      - { name: prod, ip: <vm-ip> }
-```
-
-Deploy:
+Have a `vzdump` backup instead of a live config + disk? Import the archive
+directly — `lv import` reads the embedded config and reconstructs the disks:
 
 ```bash
-lv compose up /etc/litevirt/stacks/pilot.yaml
-lv ls            # confirm pilot-vm running
+lv import --from vma --server-path /srv/stage/vzdump-qemu-<vmid>-*.vma.zst \
+          --name pilot-vm --net-map vmbr0=br0 --start
 ```
 
 ## Step 4 — Migrate one container

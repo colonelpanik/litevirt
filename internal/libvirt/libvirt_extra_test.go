@@ -147,9 +147,9 @@ func TestDiskDevName_Exhaustive(t *testing.T) {
 		{"banana", 0, "vda"}, // unknown = default
 	}
 	for _, tt := range tests {
-		got := diskDevName(tt.bus, tt.index)
+		got := DiskDevName(tt.bus, tt.index)
 		if got != tt.want {
-			t.Errorf("diskDevName(%q, %d) = %q, want %q", tt.bus, tt.index, got, tt.want)
+			t.Errorf("DiskDevName(%q, %d) = %q, want %q", tt.bus, tt.index, got, tt.want)
 		}
 	}
 }

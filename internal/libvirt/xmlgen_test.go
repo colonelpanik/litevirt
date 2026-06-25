@@ -429,14 +429,16 @@ func TestDiskDevName(t *testing.T) {
 		{"scsi", 2, "sdc"},
 		{"sata", 0, "sda"},
 		{"sata", 1, "sdb"},
+		{"ide", 0, "hda"},
+		{"ide", 1, "hdb"},
 		{"unknown", 0, "vda"}, // default to virtio naming
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.bus+"_"+tt.want, func(t *testing.T) {
-			got := diskDevName(tt.bus, tt.index)
+			got := DiskDevName(tt.bus, tt.index)
 			if got != tt.want {
-				t.Errorf("diskDevName(%s, %d) = %s, want %s", tt.bus, tt.index, got, tt.want)
+				t.Errorf("DiskDevName(%s, %d) = %s, want %s", tt.bus, tt.index, got, tt.want)
 			}
 		})
 	}

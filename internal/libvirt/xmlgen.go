@@ -64,9 +64,14 @@ type HostdevConfig struct {
 type DiskConfig struct {
 	Name   string
 	Path   string
-	Bus    string // virtio | scsi | sata
+	Bus    string // virtio | scsi | sata | ide
 	Cache  string // none | writeback | writethrough
 	IsISO  bool   // true for ISO/CDROM
+	// ControllerModel is the SCSI controller model for bus=="scsi" disks
+	// (virtio-scsi | lsisas1068 | lsilogic | vmpvscsi | buslogic). Empty =
+	// virtio-scsi. Imported guests bind their boot driver to this model, so it
+	// must be preserved; ignored for non-SCSI buses.
+	ControllerModel string
 }
 
 // NetworkConfig describes a VM network interface.
@@ -207,7 +212,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			Device: "disk",
 			Driver: diskDriver{Name: "qemu", Type: "qcow2", Cache: d.Cache},
 			Source: diskSource{File: d.Path},
-			Target: diskTarget{Dev: diskDevName(d.Bus, i), Bus: d.Bus},
+			Target: diskTarget{Dev: DiskDevName(d.Bus, i), Bus: d.Bus},
 		}
 		if d.Cache == "" {
 			disk.Driver.Cache = "writeback"
@@ -244,6 +249,30 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			Source:   diskSource{File: cfg.CloudInitISO},
 			Target:   diskTarget{Dev: fmt.Sprintf("sd%c", 'a'+len(cfg.Disks)), Bus: "sata"},
 			Readonly: &struct{}{},
+		})
+	}
+
+	// SCSI controller: when any disk is on the scsi bus, declare one explicit
+	// controller so its MODEL can be set (libvirt would otherwise auto-add a
+	// default-model controller). Imported guests bind their boot storage driver
+	// to this model, so it must be preserved. v1 supports a single SCSI
+	// controller model per VM — take the first non-empty model (disks[0] is the
+	// boot disk for imports); default virtio-scsi.
+	scsiModel := ""
+	for _, d := range cfg.Disks {
+		if d.Bus == "scsi" {
+			if d.ControllerModel != "" {
+				scsiModel = d.ControllerModel
+				break
+			}
+			scsiModel = "virtio-scsi"
+		}
+	}
+	if scsiModel != "" {
+		dev.Controllers = append(dev.Controllers, controllerDevice{
+			Type:  "scsi",
+			Index: 0,
+			Model: scsiModel,
 		})
 	}
 
@@ -352,15 +381,18 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	return xml.Header + string(output), nil
 }
 
-func diskDevName(bus string, index int) string {
+// DiskDevName derives the libvirt target device name for a disk bus + index.
+// Exported so the import path and UpdateVM rebuild compute target devs with the
+// same rule rather than duplicating it.
+func DiskDevName(bus string, index int) string {
 	letter := 'a' + index
 	switch bus {
 	case "virtio":
 		return fmt.Sprintf("vd%c", letter)
-	case "scsi":
+	case "scsi", "sata":
 		return fmt.Sprintf("sd%c", letter)
-	case "sata":
-		return fmt.Sprintf("sd%c", letter)
+	case "ide":
+		return fmt.Sprintf("hd%c", letter)
 	default:
 		return fmt.Sprintf("vd%c", letter)
 	}
@@ -496,9 +528,10 @@ type clock struct {
 }
 
 type devices struct {
-	Emulator   string            `xml:"emulator"`
-	Disks      []diskDevice      `xml:"disk"`
-	Interfaces []interfaceDevice `xml:"interface"`
+	Emulator    string             `xml:"emulator"`
+	Controllers []controllerDevice `xml:"controller"`
+	Disks       []diskDevice       `xml:"disk"`
+	Interfaces  []interfaceDevice  `xml:"interface"`
 	Hostdevs   []hostdevDevice   `xml:"hostdev"`
 	Serials    []serialDevice    `xml:"serial"`
 	Consoles   []consoleDevice   `xml:"console"`
@@ -512,6 +545,13 @@ type devices struct {
 // guest memory down to currentMemory and re-inflate up to <memory>.
 type memballoon struct {
 	Model string `xml:"model,attr"`
+}
+
+type controllerDevice struct {
+	XMLName xml.Name `xml:"controller"`
+	Type    string   `xml:"type,attr"`
+	Index   int      `xml:"index,attr"`
+	Model   string   `xml:"model,attr,omitempty"`
 }
 
 type diskDevice struct {

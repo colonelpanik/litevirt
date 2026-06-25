@@ -688,15 +688,19 @@ func (x *VMSpec) GetStopDelaySec() int32 {
 }
 
 type DiskSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Size          string                 `protobuf:"bytes,2,opt,name=size,proto3" json:"size,omitempty"`
-	Bus           string                 `protobuf:"bytes,3,opt,name=bus,proto3" json:"bus,omitempty"`
-	Cache         string                 `protobuf:"bytes,4,opt,name=cache,proto3" json:"cache,omitempty"`
-	Image         string                 `protobuf:"bytes,5,opt,name=image,proto3" json:"image,omitempty"`
-	Storage       string                 `protobuf:"bytes,6,opt,name=storage,proto3" json:"storage,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Name    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Size    string                 `protobuf:"bytes,2,opt,name=size,proto3" json:"size,omitempty"`
+	Bus     string                 `protobuf:"bytes,3,opt,name=bus,proto3" json:"bus,omitempty"`
+	Cache   string                 `protobuf:"bytes,4,opt,name=cache,proto3" json:"cache,omitempty"`
+	Image   string                 `protobuf:"bytes,5,opt,name=image,proto3" json:"image,omitempty"`
+	Storage string                 `protobuf:"bytes,6,opt,name=storage,proto3" json:"storage,omitempty"`
+	// SCSI controller model for bus=="scsi" (virtio-scsi | lsisas1068 | lsilogic
+	// | vmpvscsi | buslogic). Set by VM import to preserve guest bootability;
+	// empty = virtio-scsi. Ignored for non-SCSI buses.
+	ControllerModel string `protobuf:"bytes,7,opt,name=controller_model,json=controllerModel,proto3" json:"controller_model,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *DiskSpec) Reset() {
@@ -767,6 +771,13 @@ func (x *DiskSpec) GetImage() string {
 func (x *DiskSpec) GetStorage() string {
 	if x != nil {
 		return x.Storage
+	}
+	return ""
+}
+
+func (x *DiskSpec) GetControllerModel() string {
+	if x != nil {
+		return x.ControllerModel
 	}
 	return ""
 }
@@ -5030,14 +5041,15 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x0estop_delay_sec\x18$ \x01(\x05R\fstopDelaySec\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8a\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb5\x01\n" +
 	"\bDiskSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\tR\x04size\x12\x10\n" +
 	"\x03bus\x18\x03 \x01(\tR\x03bus\x12\x14\n" +
 	"\x05cache\x18\x04 \x01(\tR\x05cache\x12\x14\n" +
 	"\x05image\x18\x05 \x01(\tR\x05image\x12\x18\n" +
-	"\astorage\x18\x06 \x01(\tR\astorage\"\xef\x01\n" +
+	"\astorage\x18\x06 \x01(\tR\astorage\x12)\n" +
+	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\"\xef\x01\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +

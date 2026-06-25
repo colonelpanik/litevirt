@@ -10,6 +10,7 @@ require (
 	github.com/go-webauthn/webauthn v0.17.3
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
+	github.com/klauspost/compress v1.18.0
 	github.com/miekg/dns v1.1.68
 	github.com/pquerna/otp v1.5.0
 	github.com/prometheus/client_golang v1.23.2

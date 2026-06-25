@@ -459,6 +459,14 @@ func (s *Server) removeStoragePoolRef(name string) {
 	delete(s.storagePools, name)
 }
 
+// SetBinaryPath sets the path the upgrade swap targets. The daemon sets this to
+// its own os.Executable() at startup so `lv host upgrade` replaces the binary
+// this process is ACTUALLY running (which is what the re-exec then runs) —
+// rather than a hardcoded path. For a systemd install that's /usr/local/bin/
+// litevirt (no change); for any other install path (or an ephemeral test
+// daemon) it self-locates correctly instead of swapping the wrong file.
+func (s *Server) SetBinaryPath(p string) { s.binaryPath = p }
+
 // daemonBinary returns the path to the daemon binary.
 func (s *Server) daemonBinary() string {
 	if s.binaryPath != "" {

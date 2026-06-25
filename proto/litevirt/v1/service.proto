@@ -318,6 +318,36 @@ message RestoreVMRequest   { string name = 1; bytes chunk = 2;
     bool final = 3; int32 cpu = 4; int32 memory_mib = 5;
     string network = 6; }
 
+// ── Import ──
+// Client-streams a source artifact (OVA / OVF-dir tar / .vma / Proxmox bundle)
+// in chunks (first frame carries the metadata fields); the server streams back
+// unpack/convert/define progress. source_path/disk_map refer to files already
+// staged on the DESTINATION host (skip upload); both are confined to a staging
+// root unless the caller is admin.
+message ImportVMRequest {
+    string source_format = 1;            // auto|ova|ovf|proxmox|vma
+    string name = 2;
+    string target_host = 3;
+    string target_pool = 4;
+    string project = 5;
+    map<string, string> net_map = 6;     // foreign-network -> bridge
+    bool preserve_mac = 7;
+    bool start = 8;
+    bool inspect = 9;
+    string source_path = 10;             // destination-host staged file/dir; else use chunk
+    bytes chunk = 11;
+    bool final = 12;
+    map<string, string> disk_map = 13;   // e.g. scsi0=/staged/disk.qcow2 (Proxmox .conf)
+}
+message ImportVMProgress {
+    string phase = 1;                    // unpack|parse|convert|define|done
+    float convert_pct = 2;
+    string current_disk = 3;
+    string mapped_spec_json = 4;         // populated on inspect + final
+    repeated string warnings = 5;
+    string error = 6;
+}
+
 // ── Snapshots ──
 // with_memory (#3): also capture guest RAM/CPU state so a revert lands the
 // running VM at the exact snapshot instant. Falls back to disk-only for a
@@ -1367,6 +1397,9 @@ service LiteVirt {
     // ── Backup ──
     rpc BackupVM(BackupVMRequest)              returns (stream BackupChunk);
     rpc RestoreVM(stream RestoreVMRequest)     returns (VM);
+
+    // ── Import (migrate VMs in from VMware OVA/OVF or Proxmox .conf/vzdump) ──
+    rpc ImportVM(stream ImportVMRequest)        returns (stream ImportVMProgress);
 
     // ── Snapshots ──
     rpc CreateSnapshot(CreateSnapshotRequest)   returns (Snapshot);

@@ -116,6 +116,10 @@ message DiskSpec {
     string cache   = 4;
     string image   = 5;
     string storage = 6;
+    // SCSI controller model for bus=="scsi" (virtio-scsi | lsisas1068 | lsilogic
+    // | vmpvscsi | buslogic). Set by VM import to preserve guest bootability;
+    // empty = virtio-scsi. Ignored for non-SCSI buses.
+    string controller_model = 7;
 }
 
 message NetworkAttachment {

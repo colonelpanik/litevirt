@@ -209,7 +209,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 		}
 	}
 
-	for _, d := range spec.Disks {
+	for i, d := range spec.Disks {
 		if d.Name == "" {
 			d.Name = "root"
 		}
@@ -280,6 +280,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 			BackingImage:  backingImage,
 			StorageType:   storageType,
 			StorageVolume: d.Storage,
+			TargetDev:     lv.DiskDevName(d.Bus, i),
 		})
 	}
 
@@ -304,6 +305,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 			SizeBytes:    parseDiskSizeBytes("20G"),
 			BackingImage: spec.Image,
 			StorageType:  "local",
+			TargetDev:    lv.DiskDevName("virtio", 0),
 		})
 	}
 
@@ -797,6 +799,13 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	corrosion.UpdateVMState(ctx, s.db, req.Name, "running", "")
 	s.recordVMEvent(ctx, req.Name, "vm.started", "ok", "")
 
+	// Reapply VLAN tap config: VLAN tagging lives on the host tap (libvirt assigns
+	// a fresh vnetN at each start), not the domain XML — so a VM defined-then-
+	// started later (an import) or any stopped→started VM would otherwise lose its
+	// VLAN. Best-effort, mirroring CreateVM (vm.go ~579): a tap failure warns,
+	// never fails an already-running domain.
+	s.reapplyVLANTaps(ctx, vm)
+
 	pbVM.State = pb.VMState_VM_RUNNING
 	hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
 
@@ -1263,6 +1272,51 @@ func vmHooks(vm *corrosion.VMRecord) *pb.HooksSpec {
 		return nil
 	}
 	return spec.Hooks
+}
+
+// reapplyVLANTaps re-applies host-tap VLAN config for a VM that has just been
+// started, from its stored spec's network[].trunk. VLAN tagging is a property of
+// the host tap device (libvirt re-creates vnetN on every start), not the domain
+// XML, so it must be re-driven at start — otherwise a VM that was defined while
+// stopped (e.g. an import) and started later loses its VLAN. Best-effort: a tap
+// failure is logged, never fatal (the domain is already running).
+func (s *Server) reapplyVLANTaps(ctx context.Context, vm *corrosion.VMRecord) {
+	if vm == nil || vm.Spec == "" {
+		return
+	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+		return
+	}
+	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
+	macByOrdinal := make(map[int]string, len(ifaces))
+	for _, ir := range ifaces {
+		macByOrdinal[ir.Ordinal] = ir.MAC
+	}
+	for i, n := range spec.Network {
+		if len(n.Trunk) == 0 {
+			continue
+		}
+		mac := n.Mac
+		if mac == "" {
+			mac = macByOrdinal[i]
+		}
+		bridge := resolveBridge(ctx, s.db, n.Name)
+		if mac == "" || bridge == "" {
+			continue
+		}
+		if len(n.Trunk) > 1 {
+			vlanIDs := make([]int, len(n.Trunk))
+			for j, v := range n.Trunk {
+				vlanIDs[j] = int(v)
+			}
+			if err := s.virt.ConfigureTrunkTap(vm.Name, bridge, mac, vlanIDs); err != nil {
+				slog.Warn("VLAN trunk tap reapply failed", "vm", vm.Name, "vlans", vlanIDs, "error", err)
+			}
+		} else if err := s.virt.ConfigureVLANTap(vm.Name, bridge, mac, int(n.Trunk[0])); err != nil {
+			slog.Warn("VLAN tap reapply failed", "vm", vm.Name, "vlan", n.Trunk[0], "error", err)
+		}
+	}
 }
 
 // hooksDefined reports whether any lifecycle hook command is set. Defining one
@@ -1938,19 +1992,49 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		return s.vmToProto(ctx, req.Name)
 	}
 
-	// Build disk configs from stored disks.
-	disks, _ := corrosion.GetVMDisks(ctx, s.db, req.Name)
+	// Build disk configs from the AUTHORITATIVE stored spec (preserves order +
+	// bus + SCSI controller model), joining to vm_disks by name only for the
+	// on-host path. The legacy fallback below rebuilds from DB records with a
+	// target_dev[0]=='s' heuristic that is lossy — it conflates sata/scsi, can't
+	// represent ide, and loses ordering — so a redefine (e.g. an imported Windows
+	// VM after `lv update`) would silently flip the boot disk to virtio. Only use
+	// it for old VMs whose spec carries no disk list.
+	dbDisks, _ := corrosion.GetVMDisks(ctx, s.db, req.Name)
+	pathByName := make(map[string]string, len(dbDisks))
+	for _, d := range dbDisks {
+		pathByName[d.DiskName] = d.Path
+	}
 	var diskConfigs []lv.DiskConfig
-	for _, d := range disks {
-		bus := "virtio"
-		if d.TargetDev != "" && d.TargetDev[0] == 's' {
-			bus = "scsi"
+	if len(spec.Disks) > 0 {
+		for _, d := range spec.Disks {
+			name := d.Name
+			if name == "" {
+				name = "root"
+			}
+			bus := d.Bus
+			if bus == "" {
+				bus = "virtio"
+			}
+			diskConfigs = append(diskConfigs, lv.DiskConfig{
+				Name:            name,
+				Path:            pathByName[name],
+				Bus:             bus,
+				Cache:           d.Cache,
+				ControllerModel: d.ControllerModel,
+			})
 		}
-		diskConfigs = append(diskConfigs, lv.DiskConfig{
-			Name: d.DiskName,
-			Path: d.Path,
-			Bus:  bus,
-		})
+	} else {
+		for _, d := range dbDisks {
+			bus := "virtio"
+			if d.TargetDev != "" && d.TargetDev[0] == 's' {
+				bus = "scsi"
+			}
+			diskConfigs = append(diskConfigs, lv.DiskConfig{
+				Name: d.DiskName,
+				Path: d.Path,
+				Bus:  bus,
+			})
+		}
 	}
 
 	// Build network configs from stored interfaces.

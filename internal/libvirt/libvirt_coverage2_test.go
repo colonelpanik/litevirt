@@ -551,13 +551,13 @@ func TestGenerateDomainXML_ISODisk_Properties(t *testing.T) {
 	}
 }
 
-// ── diskDevName for higher indices ──
+// ── DiskDevName for higher indices ──
 
 func TestDiskDevName_HighIndex(t *testing.T) {
 	// Index 25 -> 'z'.
-	got := diskDevName("virtio", 25)
+	got := DiskDevName("virtio", 25)
 	if got != "vdz" {
-		t.Errorf("diskDevName(virtio, 25) = %q, want vdz", got)
+		t.Errorf("DiskDevName(virtio, 25) = %q, want vdz", got)
 	}
 }
 

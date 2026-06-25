@@ -71,6 +71,14 @@ func (s *Server) PreStageUpgrade(stream grpc.ClientStreamingServer[pb.UpgradeHos
 	staged := parseStagedSchemaVersion(out)
 	slog.Info("prestage: schema forward-migrated", "host", s.hostName, "staged_schema", staged)
 
+	// The child process migrated the DB; THIS still-running daemon must refresh
+	// its cached effective schema so its replication handshake immediately
+	// advertises/accepts the freshly-staged version (otherwise it stays stale-low
+	// and false-refuses peers during the rolling-binary window).
+	if eff := s.db.RefreshDBSchemaVersion(stream.Context()); eff != int(staged) {
+		slog.Info("prestage: refreshed effective DB schema", "host", s.hostName, "effective", eff)
+	}
+
 	return stream.SendAndClose(&pb.UpgradeHostResponse{
 		HostName:      s.hostName,
 		OldVersion:    s.version,

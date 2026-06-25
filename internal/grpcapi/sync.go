@@ -12,7 +12,6 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // GetStateDigest returns a lightweight fingerprint of each replicated table
@@ -97,29 +96,35 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 		return nil, status.Error(codes.InvalidArgument, "sender required")
 	}
 
-	// Schema-version skew check. Sender < receiver is normal during a
-	// rolling upgrade; we warn but accept (the new schema's columns are
-	// supersets of the old). Sender > receiver by more than 1 version
-	// means the receiver is missing migrations the sender's writes assume —
-	// reject so corrupt rows don't land. The receiver-out-of-date side
-	// (operator) sees it via the metric and refuses-to-replicate logs.
+	// Schema-version skew check, keyed off DB-APPLIED schema (the columns each
+	// DB actually has), not the binary const. Both sides advertise/compare their
+	// effective DB schema, so after the pre-stage pass equalizes every node's DB
+	// the gap is 0 throughout the rolling-binary window regardless of binary skew
+	// — which is what makes a multi-version (N-step) rolling upgrade safe.
+	//
+	// Asymmetric: refuse ONLY when the sender's DB schema is strictly AHEAD of
+	// ours (its writes may reference columns we genuinely lack). sender <= local
+	// is accepted — under the additive-only invariant the sender touches a subset
+	// of our columns. The runtime back-pressure net (replicator.ApplyRemoteMutations
+	// + isSchemaMissingError) is the final guard if anything slips past this.
 	if req.SenderSchemaVersion != 0 {
-		gap := int(req.SenderSchemaVersion) - corrosion.CurrentSchemaVersion
-		if gap > 1 {
-			slog.Warn("pushMutations: schema skew too large; refusing",
+		localDB := s.db.EffectiveDBSchema()
+		gap := int(req.SenderSchemaVersion) - localDB
+		if gap > 0 {
+			slog.Warn("pushMutations: sender DB schema ahead of ours; refusing",
 				"sender", req.Sender,
-				"sender_schema", req.SenderSchemaVersion,
-				"local_schema", corrosion.CurrentSchemaVersion,
+				"sender_db_schema", req.SenderSchemaVersion,
+				"local_db_schema", localDB,
 				"sender_version", req.SenderVersion)
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"sender schema version %d, local %d (skew exceeds tolerance; upgrade local daemon)",
-				req.SenderSchemaVersion, corrosion.CurrentSchemaVersion)
+				"sender DB schema version %d, local %d (receiver is missing migrations; pre-stage/upgrade this node)",
+				req.SenderSchemaVersion, localDB)
 		}
 		if gap != 0 {
-			slog.Info("pushMutations: schema skew (within tolerance)",
+			slog.Info("pushMutations: schema skew (sender behind — accepted)",
 				"sender", req.Sender,
-				"sender_schema", req.SenderSchemaVersion,
-				"local_schema", corrosion.CurrentSchemaVersion)
+				"sender_db_schema", req.SenderSchemaVersion,
+				"local_db_schema", localDB)
 		}
 	}
 

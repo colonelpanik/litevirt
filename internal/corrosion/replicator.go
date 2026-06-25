@@ -422,11 +422,15 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 	defer conn.Close()
 
 	resp, err := client.PushMutations(ctx, &pb.ReplicateRequest{
-		Sender:              r.client.HostName(),
-		AfterSeq:            lastSeq,
-		Entries:             pbEntries,
-		SenderVersion:       r.client.LocalVersion(),
-		SenderSchemaVersion: int32(CurrentSchemaVersion),
+		Sender:        r.client.HostName(),
+		AfterSeq:      lastSeq,
+		Entries:       pbEntries,
+		SenderVersion: r.client.LocalVersion(),
+		// Advertise the DB-APPLIED schema (what columns this node's DB actually
+		// has), not the binary const — so during a multi-version rolling upgrade
+		// a node whose DB was pre-staged forward but whose binary hasn't swapped
+		// yet still reports the real (forward) schema and replication keeps flowing.
+		SenderSchemaVersion: int32(r.client.EffectiveDBSchema()),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("push mutations: %w", err)

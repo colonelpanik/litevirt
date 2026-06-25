@@ -129,6 +129,12 @@ func (s *Server) GetHostHealth(ctx context.Context, _ *emptypb.Empty) (*pb.HostH
 }
 
 func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
+	// SchemaVersion here is the BINARY const, deliberately — self-upgrade reads
+	// it to decide "which binary to adopt" (a binary question), not "do my
+	// columns exist" (the DB-applied question the replication handshake uses).
+	// Sourcing it from the DB-applied schema would make every node report the
+	// pre-staged forward version before any binary swap and wrongly think it's
+	// behind, defeating pre-stage. See corrosion.EffectiveDBSchema.
 	return &pb.PingResponse{HostName: s.hostName, Version: s.version, SchemaVersion: int32(corrosion.CurrentSchemaVersion)}, nil
 }
 

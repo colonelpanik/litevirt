@@ -228,10 +228,12 @@ func TestInitSchema_IdempotentOnSecondCall(t *testing.T) {
 	}
 }
 
-// TestInitSchema_RefusesDowngrade: the daemon refuses to start when the DB's
-// persisted schema_version is higher than the binary expects (the "old binary
-// onto forward-migrated DB" footgun). PR A keeps this guard unchanged.
-func TestInitSchema_RefusesDowngrade(t *testing.T) {
+// TestInitSchema_AllowsForwardDB: a DB forward-migrated past this binary
+// (an old binary on a newer additive DB — the steady mid-rolling-upgrade state)
+// now STARTS instead of refusing (PR B). The stored forward version is NOT
+// regressed, and EffectiveDBSchema reports the DB's real (forward) level via
+// max(derived, stored) — so this node still advertises the true schema to peers.
+func TestInitSchema_AllowsForwardDB(t *testing.T) {
 	c, err := NewTestClient()
 	if err != nil {
 		t.Fatalf("NewTestClient: %v", err)
@@ -240,16 +242,19 @@ func TestInitSchema_RefusesDowngrade(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("first InitSchema: %v", err)
 	}
+	forward := CurrentSchemaVersion + 5
 	if err := c.execLocal(ctx,
 		`UPDATE schema_state SET version = ?, updated_at = datetime('now') WHERE id = 1`,
-		CurrentSchemaVersion+5); err != nil {
+		forward); err != nil {
 		t.Fatalf("simulate forward-migrate: %v", err)
 	}
-	err = InitSchema(ctx, c)
-	if err == nil {
-		t.Fatal("InitSchema should refuse to run against a forward-migrated DB")
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema must start on a forward (additive) DB, got: %v", err)
 	}
-	if !containsFold(err.Error(), "downgrade") {
-		t.Errorf("error should mention downgrade; got: %v", err)
+	if v := storedVersion(t, c); v != forward {
+		t.Errorf("stored version regressed to %d; must stay %d", v, forward)
+	}
+	if e := c.EffectiveDBSchema(); e != forward {
+		t.Errorf("EffectiveDBSchema = %d, want forward %d (max of derived, stored)", e, forward)
 	}
 }

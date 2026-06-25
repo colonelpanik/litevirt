@@ -68,6 +68,7 @@ func newRootCmd() *cobra.Command {
 		newReplicationCmd(),
 		newStackCmd(),
 		newImageCmd(),
+		newImportCmd(),
 		newBackupCmd(),
 		newCTCmd(),
 		newSGCmd(),

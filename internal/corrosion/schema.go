@@ -243,19 +243,21 @@ func InitSchema(ctx context.Context, c *Client) error {
 		return err
 	}
 
+	// Seed the effective DB-applied schema cache (handshake source of truth).
+	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
-		"version", derivedSchemaVersion(ctx, c),
-		"ledger", len(schemaMigrationLedger), "healed", healed)
+		"version", eff, "ledger", len(schemaMigrationLedger), "healed", healed)
 	return nil
 }
 
 // reconcileSchemaVersion keeps the legacy schema_state.version row in sync with
-// the ledger-DERIVED version (max Version over applied migration IDs). The
-// number is now produced from verified reality, not asserted. The downgrade
-// guard is unchanged for this PR: a DB forward-migrated past this binary
-// (stored > CurrentSchemaVersion) still refuses to start — relaxing that to
-// allow an old binary on a newer additive DB is the multi-version follow-up,
-// gated on the CI non-additive guard.
+// the ledger-DERIVED version (max Version over applied migration IDs) — produced
+// from verified reality, not asserted.
+//
+// A DB forward-migrated past this binary (stored > CurrentSchemaVersion) is now
+// ALLOWED (it used to refuse): the schema is additive-only (CI-enforced), so an
+// old binary tolerates a newer DB's extra columns. This is the steady mid-
+// rolling-upgrade state and makes a bump reversible. See EffectiveDBSchema.
 func reconcileSchemaVersion(ctx context.Context, c *Client) error {
 	derived := derivedSchemaVersion(ctx, c)
 
@@ -267,17 +269,52 @@ func reconcileSchemaVersion(ctx context.Context, c *Client) error {
 	}
 	stored := rows[0].Int("version")
 	if stored > CurrentSchemaVersion {
-		return fmt.Errorf(
-			"schema downgrade refused: DB schema version is %d, binary expects %d. "+
-				"This usually means an older litevirtd binary is being started on a "+
-				"DB that was forward-migrated by a newer one. Use the matching binary "+
-				"or restore an older DB snapshot.",
-			stored, CurrentSchemaVersion)
+		// Forward-migrated DB + older binary: warn, do NOT regress the stored
+		// version (the newer binary recorded the true level), keep running.
+		// EffectiveDBSchema() = max(derived, stored) so we still advertise the
+		// DB's real schema to peers.
+		slog.Warn("schema: DB is forward of this binary (additive — starting anyway)",
+			"db_version", stored, "binary_version", CurrentSchemaVersion)
+		return nil
 	}
 	return c.execLocal(ctx,
 		`UPDATE schema_state SET version = ?, updated_at = ? WHERE id = 1`,
 		derived, time.Now().UTC().Format(time.RFC3339))
 }
+
+// RefreshDBSchemaVersion recomputes and caches this node's effective DB-applied
+// schema version: max(ledger-derived, stored schema_state.version). The stored
+// term covers the "old binary on a newer DB" case — an old binary can't
+// enumerate ledger IDs it doesn't know (derived under-reports), but the newer
+// binary that forward-migrated the DB recorded the true level in schema_state,
+// and additive-only makes trusting it safe. Call at the end of InitSchema and
+// after a pre-stage migrate (the still-running old daemon must see its DB's
+// freshly-staged schema). Returns the new effective value.
+func (c *Client) RefreshDBSchemaVersion(ctx context.Context) int {
+	eff := derivedSchemaVersion(ctx, c)
+	if rows, err := c.Query(ctx, `SELECT version FROM schema_state WHERE id = 1`); err == nil && len(rows) > 0 {
+		if stored := rows[0].Int("version"); stored > eff {
+			eff = stored
+		}
+	}
+	c.effectiveDBSchema.Store(int32(eff))
+	return eff
+}
+
+// EffectiveDBSchema returns the cached effective DB-applied schema version (the
+// single source for the replication handshake). Falls back to the binary const
+// if not yet seeded (e.g. before InitSchema), preserving pre-ledger behavior.
+func (c *Client) EffectiveDBSchema() int {
+	if v := c.effectiveDBSchema.Load(); v > 0 {
+		return int(v)
+	}
+	return CurrentSchemaVersion
+}
+
+// SetEffectiveDBSchemaForTest overrides the cached effective schema version.
+// Test seam only: the binary const can't vary within one test binary, so
+// fleet/unit tests use this to model per-node schema during a rolling window.
+func (c *Client) SetEffectiveDBSchemaForTest(n int) { c.effectiveDBSchema.Store(int32(n)) }
 
 // loadAppliedMigrations returns id→checksum for every recorded migration.
 func loadAppliedMigrations(ctx context.Context, c *Client) (map[string]string, error) {

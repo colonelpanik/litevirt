@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/memberlist"
@@ -37,6 +38,16 @@ type Client struct {
 	// replicator is notified when new mutations are written to mutation_log.
 	// Set via SetReplicator after construction.
 	replicatorNotify chan struct{}
+
+	// effectiveDBSchema caches this node's effective DB-applied schema version =
+	// max(ledger-derived, stored schema_state.version). It is the single source
+	// for the replication handshake (both the version this node advertises as a
+	// sender and the version it compares against as a receiver), so a multi-
+	// version rolling upgrade keys off what the DB ACTUALLY has (equalized by the
+	// pre-stage pass) rather than the lagging binary const. Seeded at the end of
+	// InitSchema and refreshed by RefreshDBSchemaVersion after a pre-stage
+	// migrate. 0 = not yet seeded → EffectiveDBSchema() falls back to the const.
+	effectiveDBSchema atomic.Int32
 }
 
 // LocalVersion returns the binary version this Client was created with.

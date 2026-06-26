@@ -19,7 +19,7 @@ import (
 // The VM name is passed via incoming metadata key "x-vm-name".
 // If the VM is on a remote host, this handler forwards to the remote daemon.
 func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]) error {
-	if err := RequireRole(stream.Context(), "operator"); err != nil {
+	if err := s.requirePermPrecheck(stream.Context(), "operator"); err != nil {
 		return err
 	}
 	md, _ := metadataFromStream(stream)
@@ -36,6 +36,14 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return status.Errorf(codes.NotFound, "VM %q not found", vmName)
+	}
+	// Path-scoped check on the VM's tenancy project — a console is interactive
+	// root access to the guest, so a broad operator role isn't enough; the
+	// caller must hold vm.console on THIS VM. Enforced on the entry host where
+	// the caller's identity is present (a forwarded peer call carries the
+	// daemon's identity, not the user's).
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.console", "operator"); err != nil {
+		return err
 	}
 	// "backing-up" is an online state — the VM keeps running during a backup —
 	// so VNC must stay reachable (and a stuck backing-up flag must not lock the

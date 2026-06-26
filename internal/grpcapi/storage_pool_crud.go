@@ -31,7 +31,10 @@ import (
 // re-runs Prepare — operators expect `lv pool create` to be safe to
 // retry after a transient mount failure.
 func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoolRequest) (*pb.CreateStoragePoolResponse, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	// Cluster-global infra authority (configures a host mount/source); checked
+	// at the root path so a project-scoped token can't reach it, with the same
+	// operator floor for legacy role-based callers.
+	if err := s.RequirePerm(ctx, "/", "storage.pool.write", "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
@@ -116,7 +119,7 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 // the pool gone from the inventory even if cleanup is incomplete, and
 // can always re-mount manually. The error is logged so it's not silent.
 func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoolRequest) (*pb.DeleteStoragePoolResponse, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "storage.pool.write", "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
@@ -159,7 +162,7 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 
 // GetStoragePool returns one pool's full details. Used by `lv pool inspect`.
 func (s *Server) GetStoragePool(ctx context.Context, req *pb.GetStoragePoolRequest) (*pb.GetStoragePoolResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "storage.pool.read", "viewer"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {

@@ -2,21 +2,40 @@ package grpcapi
 
 import (
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
+
+// projectRBACBase returns the RBAC path root for a (possibly hierarchical)
+// project, e.g. "/projects/acme/team". It is the single place RBAC paths are
+// built from a project, so callers never hand-concatenate "/projects/"+name
+// (which produced double slashes and "acme" vs "/acme" drift).
+//
+// A malformed project (a '..'/slash-bearing name, e.g. from a polluted or
+// peer-replicated row) must NOT silently map onto another tenant's path, so it
+// canonicalizes to a sentinel that matches no normal grant — only a cluster-root
+// "/" grant (full admin) can then act on it. Project names are validated at
+// ingress (CreateVM/CreateProject/container create), so this is defense in depth.
+func projectRBACBase(project string) string {
+	canon, err := safename.CanonicalProjectName(tenancy.NormalizeProject(project))
+	if err != nil {
+		return "/projects/\x00invalid"
+	}
+	return safename.ProjectRBACPath(canon)
+}
 
 // vmRBACPath builds the canonical RBAC path for a VM from its record,
 // honoring the VM's tenancy project rather than assuming "_default".
 // This is the path used for RequirePerm checks on per-VM operations.
 func vmRBACPath(vm *corrosion.VMRecord) string {
-	return "/projects/" + tenancy.NormalizeProject(vm.Project) + "/vms/" + vm.Name
+	return projectRBACBase(vm.Project) + "/vms/" + vm.Name
 }
 
 // vmRBACPathFor builds the canonical RBAC path for a VM from an explicit
 // project + name. Used at sites (e.g. CreateVM) where no VMRecord exists
 // yet because the VM is being created from a spec.
 func vmRBACPathFor(project, name string) string {
-	return "/projects/" + tenancy.NormalizeProject(project) + "/vms/" + name
+	return projectRBACBase(project) + "/vms/" + name
 }
 
 // ctRBACPathFor builds the canonical RBAC path for a container from an explicit
@@ -24,5 +43,5 @@ func vmRBACPathFor(project, name string) string {
 // container RPC so the permission check honors the container's tenancy project
 // rather than assuming "_default".
 func ctRBACPathFor(project, name string) string {
-	return "/projects/" + tenancy.NormalizeProject(project) + "/containers/" + name
+	return projectRBACBase(project) + "/containers/" + name
 }

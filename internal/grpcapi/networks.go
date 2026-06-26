@@ -19,7 +19,9 @@ import (
 
 // CreateNetwork provisions a standalone network on this host and persists it.
 func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest) (*pb.NetworkInfo, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	// Networks are cluster-global; scope the check to the root path so a
+	// project-scoped token can't define one, keeping the operator floor.
+	if err := s.RequirePerm(ctx, "/", "network.create", "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
@@ -95,7 +97,7 @@ func (s *Server) GetNetwork(ctx context.Context, req *pb.GetNetworkRequest) (*pb
 
 // DeleteNetwork tears down a network and removes it from the database.
 func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest) (*emptypb.Empty, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "network.delete", "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {

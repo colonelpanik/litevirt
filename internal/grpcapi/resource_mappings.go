@@ -28,7 +28,7 @@ func toPbResourceMapping(m corrosion.ResourceMappingRecord) *pb.ResourceMapping 
 }
 
 func (s *Server) CreateResourceMapping(ctx context.Context, req *pb.CreateResourceMappingRequest) (*pb.ResourceMapping, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "resourcemap.write", "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
@@ -46,7 +46,7 @@ func (s *Server) CreateResourceMapping(ctx context.Context, req *pb.CreateResour
 }
 
 func (s *Server) ListResourceMappings(ctx context.Context, _ *pb.ListResourceMappingsRequest) (*pb.ListResourceMappingsResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "resourcemap.read", "viewer"); err != nil {
 		return nil, err
 	}
 	mappings, err := corrosion.ListResourceMappings(ctx, s.db)
@@ -61,7 +61,7 @@ func (s *Server) ListResourceMappings(ctx context.Context, _ *pb.ListResourceMap
 }
 
 func (s *Server) DeleteResourceMapping(ctx context.Context, req *pb.DeleteResourceMappingRequest) (*emptypb.Empty, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "resourcemap.write", "operator"); err != nil {
 		return nil, err
 	}
 	if err := corrosion.DeleteResourceMapping(ctx, s.db, req.Name); err != nil {
@@ -72,7 +72,7 @@ func (s *Server) DeleteResourceMapping(ctx context.Context, req *pb.DeleteResour
 }
 
 func (s *Server) AddMappingDevice(ctx context.Context, req *pb.AddMappingDeviceRequest) (*pb.ResourceMapping, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "resourcemap.write", "operator"); err != nil {
 		return nil, err
 	}
 	if req.Mapping == "" || req.Address == "" {
@@ -94,7 +94,7 @@ func (s *Server) AddMappingDevice(ctx context.Context, req *pb.AddMappingDeviceR
 }
 
 func (s *Server) RemoveMappingDevice(ctx context.Context, req *pb.RemoveMappingDeviceRequest) (*pb.ResourceMapping, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "resourcemap.write", "operator"); err != nil {
 		return nil, err
 	}
 	host := req.Host

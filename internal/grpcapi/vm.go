@@ -44,6 +44,11 @@ func validateSpecNames(spec *pb.VMSpec) error {
 	if err := safename.ValidateVMName(spec.Name); err != nil {
 		return err
 	}
+	if spec.Project != "" {
+		if _, err := safename.CanonicalProjectName(spec.Project); err != nil {
+			return err
+		}
+	}
 	if spec.Image != "" {
 		if err := safename.ValidateImageName(spec.Image); err != nil {
 			return err

@@ -21,7 +21,7 @@ import (
 // browser-based SPICE client (spice-html5) is a future enhancement; this
 // RPC is the minimum viable surface to make SPICE usable today.
 func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) (*pb.GetSpiceInfoResponse, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
 	if req.VmName == "" {
@@ -31,6 +31,12 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
+	}
+	// SPICE is interactive console/graphics access to the guest; require
+	// vm.console on the VM's tenancy project, checked on the entry host where
+	// the caller identity is present (before any forward to the owning host).
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.console", "operator"); err != nil {
+		return nil, err
 	}
 	if vm.State != "running" {
 		return nil, status.Errorf(codes.FailedPrecondition,

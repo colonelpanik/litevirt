@@ -20,7 +20,7 @@ import (
 // It opens the PTY device that libvirt/QEMU allocates for the serial console
 // and bridges it to the gRPC bidirectional stream for web UI terminal access.
 func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.ConsoleOutput]) error {
-	if err := RequireRole(stream.Context(), "operator"); err != nil {
+	if err := s.requirePermPrecheck(stream.Context(), "operator"); err != nil {
 		return err
 	}
 	md, _ := metadataFromStream(stream)
@@ -38,6 +38,12 @@ func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.C
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return status.Errorf(codes.NotFound, "VM %q not found", vmName)
+	}
+	// Path-scoped check on the VM's tenancy project (serial console = root
+	// access to the guest). Enforced on the entry host where the caller's
+	// identity is present, before any forward to the owning host.
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.console", "operator"); err != nil {
+		return err
 	}
 	// "backing-up" is an online state — the VM keeps running during a backup —
 	// so the console must stay reachable (and a stuck backing-up flag must not

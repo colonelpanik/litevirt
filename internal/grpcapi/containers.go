@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -55,6 +57,16 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
+	}
+	// Validate the name + project before they reach the LXC runtime (which
+	// builds <lxcpath>/<name>) or get stored on the row used for future RBAC.
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.Project != "" {
+		if _, err := safename.CanonicalProjectName(req.Project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
 	}
 	if forwarded, err := s.forwardCreateContainer(ctx, req); err != nil || forwarded != nil {
 		return forwarded, err
@@ -235,6 +247,30 @@ func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersReque
 func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) (*emptypb.Empty, error) {
 	if err := s.RequirePerm(ctx, "/", "image.pull", "operator"); err != nil {
 		return nil, err
+	}
+	// Dest is where umoci unpacks the (untrusted) image rootfs as root, and a
+	// local oci: source is read as root — both are host-path primitives. A bare
+	// Dest name is contained under the daemon OCI staging dir; an absolute Dest
+	// or a local oci: source requires admin (remote docker:// registry pulls
+	// stay operator). The check binds the real caller on the entry node; a
+	// forwarded peer call runs as admin (daemon mTLS) so it isn't re-denied.
+	if lxc.RegistryHost(req.Image) == "" {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			return nil, status.Error(codes.PermissionDenied,
+				"pulling from a local OCI source path requires the admin role")
+		}
+	}
+	if filepath.IsAbs(req.Dest) {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			return nil, status.Error(codes.PermissionDenied,
+				"an absolute --dest requires the admin role; use a bare name to stage under the daemon OCI directory")
+		}
+	} else if req.Dest != "" {
+		resolved, err := safename.SafeJoin(filepath.Join(s.dataDir, "oci"), req.Dest)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid --dest: %v", err)
+		}
+		req.Dest = resolved
 	}
 	// Resolve registry credentials on the ENTRY node — only here is
 	// callerUsername(ctx) meaningful (a forwarded peer runs under the daemon's

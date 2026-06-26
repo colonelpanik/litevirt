@@ -57,7 +57,7 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 | Role | Verbs |
 |---|---|
 | Admin | `*` |
-| Operator | `vm.*`, `ct.*`, `network.{read,create}`, `lb.*`, `image.{read,pull}`, `backup.*`, `snapshot.*`, `sg.read`, `audit.read`, `host.read` |
+| Operator | `vm.*`, `ct.*`, `network.{read,create,delete}`, `lb.*`, `image.{read,pull,import,push,build}`, `backup.*`, `snapshot.*`, `sg.read`, `audit.read`, `host.read`, `storage.pool.{read,write}`, `storage.content.{read,write}`, `resourcemap.{read,write}` |
 | VMOperator | `vm.{start,stop,restart,console,read,exec}` |
 | Viewer | `*.read` |
 | Auditor | `*.read`, `audit.export` |
@@ -69,6 +69,26 @@ A *binding* attaches a role to a principal at a path. With
 `--propagate` the binding applies to that path and all descendants —
 this is how the `Admin` role on `/` grants cluster-wide superuser
 access.
+
+### Cluster-global vs project-scoped verbs
+
+Some resources are cluster-global, not project-scoped, and their RPCs are
+checked at the root path `/` — so a token whose scope is limited to a project
+(e.g. `/projects/acme`) cannot reach them, while an operator with a `/`-rooted
+binding can:
+
+- **Images** are a shared base-image library: `image.{pull,import,push,build}`
+  are checked at `/`. (Override with project-scoped image namespaces if needed.)
+- **Storage pools** (`storage.pool.*`) configure host mounts/sources — real infra
+  authority; create/delete/update are checked at `/`. **Pool contents**
+  (`storage.content.*`, file upload/list/delete) are checked at the pool path
+  `/storage/pools/<name>`.
+- **Networks** (`network.create`, `network.delete`) and **resource mappings**
+  (`resourcemap.*`, PCI/device pools) are cluster-global, checked at `/`.
+
+Interactive guest access — **console, VNC, and SPICE** — requires `vm.console`
+on the specific VM's project path (`/projects/<project>/vms/<name>`), not just a
+broad operator role.
 
 ```bash
 lv role grant Admin    group:admin@local        --path /                --propagate

@@ -148,7 +148,9 @@ func TestPullOCIImage_ResolvesStoredCredential(t *testing.T) {
 	mustUpsert(t, s.db, corrosion.RegistryCredential{
 		ID: "1", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "au", Secret: "as",
 	})
-	alice := userCtx("alice", "operator")
+	// admin: an absolute --dest and a local oci: source both require it; this
+	// test threads username-based credential resolution, which is role-agnostic.
+	alice := userCtx("alice", "admin")
 
 	// (a) stored credential resolved.
 	if _, err := s.PullOCIImage(alice, &pb.PullOCIImageRequest{Image: "ghcr.io/org/x:v1", Dest: "/tmp/r"}); err != nil {

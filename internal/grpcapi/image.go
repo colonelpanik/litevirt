@@ -16,7 +16,9 @@ import (
 )
 
 func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImageServer) error {
-	if err := RequireRole(stream.Context(), "operator"); err != nil {
+	// Images are a cluster-global library (matching PullOCIImage), so the check
+	// is rooted; a project-scoped token can't pull into the shared store.
+	if err := s.RequirePerm(stream.Context(), "/", "image.pull", "operator"); err != nil {
 		return err
 	}
 	if err := safename.ValidateImageName(req.Name); err != nil {

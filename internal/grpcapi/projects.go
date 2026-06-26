@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 func (s *Server) CreateProject(ctx context.Context, req *pb.CreateProjectRequest) (*pb.Project, error) {
@@ -21,6 +22,14 @@ func (s *Server) CreateProject(ctx context.Context, req *pb.CreateProjectRequest
 	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
+	}
+	if _, err := safename.CanonicalProjectName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.ParentName != "" {
+		if _, err := safename.CanonicalProjectName(req.ParentName); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "parent: %v", err)
+		}
 	}
 	rec := corrosion.ProjectRecord{
 		Name:       req.Name,
@@ -84,6 +93,9 @@ func (s *Server) SetProjectQuota(ctx context.Context, req *pb.SetProjectQuotaReq
 	}
 	if req.Quota == nil || req.Quota.ProjectName == "" {
 		return nil, status.Error(codes.InvalidArgument, "quota.project_name required")
+	}
+	if _, err := safename.CanonicalProjectName(req.Quota.ProjectName); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	q := corrosion.ProjectQuotaRecord{
 		ProjectName:    req.Quota.ProjectName,

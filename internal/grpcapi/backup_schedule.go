@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/scheduler"
 )
 
@@ -82,9 +83,14 @@ func (s *Server) CreateBackupSchedule(ctx context.Context, req *pb.CreateBackupS
 func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName, projectName string) string {
 	switch scope {
 	case "pool":
+		// A malformed pool name must not map onto another pool's grant; an
+		// invalid one yields a sentinel that matches no normal grant.
+		if err := safename.ValidatePoolName(poolName); err != nil {
+			return "/storage/pools/\x00invalid"
+		}
 		return "/storage/pools/" + poolName
 	case "project":
-		return "/projects/" + projectName
+		return projectRBACBase(projectName)
 	case "cluster":
 		return "/"
 	default:

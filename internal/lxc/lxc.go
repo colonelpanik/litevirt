@@ -28,6 +28,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // State is the libvirt-style lifecycle state, mirrored for parity with
@@ -475,6 +477,10 @@ func (r *LxcRunner) RevertContainer(ctx context.Context, name string, src io.Rea
 // restores it on failure (crash-safe snapshot revert — a corrupt snapshot tar
 // can never lose the live container).
 func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Reader, replace bool) error {
+	// The name becomes <lxcpath>/<name>; validate it before it composes a path.
+	if err := safename.ValidateContainerName(name); err != nil {
+		return err
+	}
 	dir := filepath.Join(r.lxcpath(), name)
 	var backup string
 	if _, err := os.Stat(dir); err == nil {
@@ -500,12 +506,12 @@ func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Rea
 	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
 		return rollback(fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err))
 	}
-	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner", "-xf", "-")
-	stderr := strings.Builder{}
-	cmd.Stderr = stringWriter{&stderr}
-	cmd.Stdin = src
-	if err := cmd.Run(); err != nil {
-		return rollback(fmt.Errorf("tar import %s: %w: %s", name, err, stderr.String()))
+	// Slip-safe extraction: the archive is untrusted backup-repo data, so we
+	// contain every member under <lxcpath>, never write through a symlink, and
+	// require the single top-level dir to be the container name (a tampered
+	// archive can't clobber a sibling container). Replaces a bare `tar -xf`.
+	if err := safename.ExtractRootfsTar(src, r.lxcpath(), name); err != nil {
+		return rollback(fmt.Errorf("extract container %s: %w", name, err))
 	}
 	if err := r.rewriteRootFSPath(name); err != nil {
 		return rollback(err)

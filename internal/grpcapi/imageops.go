@@ -23,7 +23,7 @@ import (
 // ImportImage receives a client-streamed image file and writes it to the local store.
 func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 	ctx := stream.Context()
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "image.import", "operator"); err != nil {
 		return err
 	}
 
@@ -133,7 +133,7 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 // This uses the existing mTLS peer connection — no SSH/rsync required.
 func (s *Server) PushImage(req *pb.PushImageRequest, stream pb.LiteVirt_PushImageServer) error {
 	ctx := stream.Context()
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "image.push", "operator"); err != nil {
 		return err
 	}
 
@@ -290,7 +290,7 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 
 // BuildImage snapshots a running VM's root disk to create a golden image.
 func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb.BuildImageResponse, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "image.build", "operator"); err != nil {
 		return nil, err
 	}
 	if req.VmName == "" || req.ImageName == "" {

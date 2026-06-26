@@ -60,11 +60,16 @@ func (s *Server) resolveRestoreTarget(ctx context.Context, targetPath, defaultDi
 		}
 		return targetPath, nil
 	}
-	// Relative: a single safe filename component contained under defaultDir.
-	if err := safename.ValidateName(filepath.Base(targetPath)); err != nil {
+	// Relative: must be a BARE filename (no separators) — don't silently turn
+	// "subdir/disk.qcow2" into "disk.qcow2"; reject it so the contract is clear.
+	if targetPath != filepath.Base(targetPath) {
+		return "", status.Error(codes.InvalidArgument,
+			"target_path must be a bare filename (no path separators), or an absolute path (admin only)")
+	}
+	if err := safename.ValidateName(targetPath); err != nil {
 		return "", status.Errorf(codes.InvalidArgument, "target_path: %v", err)
 	}
-	return safename.SafeJoin(defaultDir, filepath.Base(targetPath))
+	return safename.SafeJoin(defaultDir, targetPath)
 }
 
 // finalizeRestoreFile refuses to write through a symlink already at dst (an

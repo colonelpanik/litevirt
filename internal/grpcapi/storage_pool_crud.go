@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -39,6 +40,9 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name is required")
+	}
+	if err := safename.ValidatePoolName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if req.Driver == "" {
 		return nil, status.Error(codes.InvalidArgument, "driver is required")

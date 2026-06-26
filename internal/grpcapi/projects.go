@@ -23,27 +23,38 @@ func (s *Server) CreateProject(ctx context.Context, req *pb.CreateProjectRequest
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
-	if _, err := safename.CanonicalProjectName(req.Name); err != nil {
+	// Store the CANONICAL bare form ("/acme" and "acme" → "acme") so the stored
+	// name matches how projects are referenced elsewhere (VM/ct rows, quota) and
+	// can't diverge by a leading slash.
+	canon, err := safename.CanonicalProjectName(req.Name)
+	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if req.ParentName != "" {
-		if _, err := safename.CanonicalProjectName(req.ParentName); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "parent: %v", err)
+	name := strings.TrimPrefix(canon, "/")
+	if name == "" {
+		return nil, status.Error(codes.InvalidArgument, "name must not be the cluster root")
+	}
+	parent := req.ParentName
+	if parent != "" {
+		pc, perr := safename.CanonicalProjectName(parent)
+		if perr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "parent: %v", perr)
 		}
+		parent = strings.TrimPrefix(pc, "/")
 	}
 	rec := corrosion.ProjectRecord{
-		Name:       req.Name,
+		Name:       name,
 		Display:    req.Display,
-		ParentName: req.ParentName,
+		ParentName: parent,
 	}
 	if err := corrosion.InsertProject(ctx, s.db, rec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "create project: %v", err)
 	}
-	got, err := corrosion.GetProject(ctx, s.db, req.Name)
+	got, err := corrosion.GetProject(ctx, s.db, name)
 	if err != nil || got == nil {
 		return nil, status.Errorf(codes.Internal, "read back project: %v", err)
 	}
-	s.audit(ctx, "project.create", req.Name, "", "ok")
+	s.audit(ctx, "project.create", name, "", "ok")
 	return projectToPB(got), nil
 }
 

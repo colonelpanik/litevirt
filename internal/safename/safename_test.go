@@ -246,6 +246,14 @@ func TestExtractRootfsTar_Rejections(t *testing.T) {
 		{"symlink-escapes-root", []tarEnt{
 			{name: "ct/evil", typeflag: tar.TypeSymlink, linkname: "../../../../etc/shadow"},
 		}},
+		{"symlink-escapes-subtree", []tarEnt{
+			// Stays under dest but leaves the "ct" subtree → still rejected.
+			{name: "ct/rootfs/x", typeflag: tar.TypeSymlink, linkname: "../../other/secret"},
+		}},
+		{"hardlink-escapes-subtree", []tarEnt{
+			// Hardlink target resolves under dest but outside the "ct" subtree.
+			{name: "ct/link", typeflag: tar.TypeLink, linkname: "other/secret"},
+		}},
 		{"hardlink-to-missing", []tarEnt{
 			{name: "ct/a", typeflag: tar.TypeLink, linkname: "ct/later"},
 		}},

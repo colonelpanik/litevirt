@@ -2,6 +2,7 @@ package pbsstore
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -68,6 +69,10 @@ func validateChunkList(chunks []ChunkRef, bounded bool, maxExtent int64) error {
 		}
 		if !first && c.Offset < prevEnd {
 			return fmt.Errorf("chunk %d: offset %d overlaps/regresses previous extent ending at %d", i, c.Offset, prevEnd)
+		}
+		// Guard against int64 overflow before computing the extent.
+		if c.Offset > math.MaxInt64-c.Size {
+			return fmt.Errorf("chunk %d: offset %d + size %d overflows", i, c.Offset, c.Size)
 		}
 		end := c.Offset + c.Size
 		if bounded && end > maxExtent {

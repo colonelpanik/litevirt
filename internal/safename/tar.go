@@ -96,6 +96,13 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 		if err != nil {
 			return err
 		}
+		// Link targets are contained under the SUBTREE root (the expected
+		// top-level dir, e.g. the container dir), not just dest — so a link inside
+		// ct/… can't point at a sibling under dest but outside ct/.
+		linkRoot := dest
+		if expectedTop != "" {
+			linkRoot = filepath.Join(dest, expectedTop)
+		}
 		mode := os.FileMode(hdr.Mode).Perm() // drops setuid/setgid/sticky, keeps rwx
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -120,11 +127,11 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 			// verbatim (never followed during extraction).
 			var resolved string
 			if filepath.IsAbs(hdr.Linkname) {
-				resolved = filepath.Join(dest, filepath.Clean(hdr.Linkname))
+				resolved = filepath.Join(linkRoot, filepath.Clean(hdr.Linkname))
 			} else {
 				resolved = filepath.Join(filepath.Dir(target), hdr.Linkname)
 			}
-			if !Contains(dest, resolved) {
+			if !Contains(linkRoot, resolved) {
 				return fmt.Errorf("rootfs tar: symlink %q target %q escapes root", hdr.Name, hdr.Linkname)
 			}
 			if err := mkdirAllNoFollow(dest, filepath.Dir(target), 0o755); err != nil {
@@ -142,9 +149,14 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 			if err := mkdirAllNoFollow(dest, filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
+			// A hardlink's Linkname is an archive-root-relative member name; resolve
+			// it under dest, then require it to stay within the subtree root.
 			linkTarget, err := SafeJoin(dest, filepath.Clean(hdr.Linkname))
 			if err != nil {
 				return fmt.Errorf("rootfs tar: hardlink %q target escapes root: %w", hdr.Name, err)
+			}
+			if !Contains(linkRoot, linkTarget) {
+				return fmt.Errorf("rootfs tar: hardlink %q target %q escapes subtree", hdr.Name, hdr.Linkname)
 			}
 			fi, err := os.Lstat(linkTarget)
 			if err != nil {

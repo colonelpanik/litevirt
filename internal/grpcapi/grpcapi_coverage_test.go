@@ -1846,21 +1846,6 @@ func TestListSnapshots_MultipleVMs(t *testing.T) {
 
 // ─── Backup edge cases ──────────────────────────────────────────────────────
 
-func TestBackupVM_NoDisks(t *testing.T) {
-	s := testServerCov(t)
-	ctx := adminCtx()
-	stream := &mockBackupStream{ctx: ctx}
-
-	insertTestVM(t, ctx, s.db, "nodisk-backup", "test-host", "running")
-
-	err := s.BackupVM(&pb.BackupVMRequest{VmName: "nodisk-backup"}, stream)
-	if err == nil {
-		t.Fatal("expected error for VM with no disks")
-	}
-	if c := status.Code(err); c != codes.Internal {
-		t.Errorf("code = %v, want Internal", c)
-	}
-}
 
 // ─── Deploy stack dry run ───────────────────────────────────────────────────
 
@@ -2102,79 +2087,6 @@ func TestUndrainHost_FromMaintenance(t *testing.T) {
 }
 
 // ─── BackupVM with real disk ────────────────────────────────────────────────
-
-func TestBackupVM_WithDisk(t *testing.T) {
-	s := testServerCov(t)
-	ctx := adminCtx()
-	stream := &mockBackupStream{ctx: ctx}
-
-	// Create a small test disk file.
-	diskPath := s.dataDir + "/disks/backup-vm/root.qcow2"
-	os.MkdirAll(s.dataDir+"/disks/backup-vm", 0755)
-	os.WriteFile(diskPath, []byte("fake qcow2 data for backup test"), 0644)
-
-	corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
-		Name:     "backup-vm",
-		HostName: "test-host",
-		State:    "running",
-	}, nil, nil)
-	corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
-		VMName:   "backup-vm",
-		DiskName: "root",
-		HostName: "test-host",
-		Path:     diskPath,
-	})
-
-	err := s.BackupVM(&pb.BackupVMRequest{VmName: "backup-vm"}, stream)
-	if err != nil {
-		t.Fatalf("BackupVM: %v", err)
-	}
-	if len(stream.sent) == 0 {
-		t.Error("expected at least one chunk")
-	}
-	// Last chunk should have checksum.
-	last := stream.sent[len(stream.sent)-1]
-	if last.Checksum == "" {
-		t.Error("expected checksum in final chunk")
-	}
-
-	// Verify VM state was restored (not left in backing-up).
-	vm, _ := corrosion.GetVM(ctx, s.db, "backup-vm")
-	if vm.State != "running" {
-		t.Errorf("VM state after backup = %q, want running", vm.State)
-	}
-}
-
-func TestBackupVM_NonRootDisk(t *testing.T) {
-	s := testServerCov(t)
-	ctx := adminCtx()
-	stream := &mockBackupStream{ctx: ctx}
-
-	// Create a disk that is not named "root".
-	diskPath := s.dataDir + "/disks/backup-vm2/data.qcow2"
-	os.MkdirAll(s.dataDir+"/disks/backup-vm2", 0755)
-	os.WriteFile(diskPath, []byte("data disk contents"), 0644)
-
-	corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
-		Name:     "backup-vm2",
-		HostName: "test-host",
-		State:    "stopped",
-	}, nil, nil)
-	corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
-		VMName:   "backup-vm2",
-		DiskName: "data",
-		HostName: "test-host",
-		Path:     diskPath,
-	})
-
-	err := s.BackupVM(&pb.BackupVMRequest{VmName: "backup-vm2"}, stream)
-	if err != nil {
-		t.Fatalf("BackupVM: %v", err)
-	}
-	if len(stream.sent) == 0 {
-		t.Error("expected at least one chunk")
-	}
-}
 
 // ─── DeployStack dry-run with image present ─────────────────────────────────
 
@@ -3560,19 +3472,6 @@ func TestBuildImage_MissingFields(t *testing.T) {
 	}
 }
 
-// ─── BackupVM more validation paths ────────────────────────────────────────────
-
-func TestBackupVM_MissingName(t *testing.T) {
-	s := testServerCov(t)
-	stream := &mockBackupStream{ctx: adminCtx()}
-	err := s.BackupVM(&pb.BackupVMRequest{}, stream)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if c := status.Code(err); c != codes.InvalidArgument {
-		t.Errorf("code = %v, want InvalidArgument", c)
-	}
-}
 
 // mockBackupStream methods already declared in backup_test.go
 

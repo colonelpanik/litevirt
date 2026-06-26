@@ -1435,67 +1435,6 @@ func TestR3_BuildImage_WrongHostR3(t *testing.T) {
 	}
 }
 
-// ── BackupVM: validation paths ──────────────────────────────────────────────
-
-type mockBackupStreamR3 struct {
-	ctx  context.Context
-	sent []*pb.BackupChunk
-}
-
-func (m *mockBackupStreamR3) Send(c *pb.BackupChunk) error {
-	m.sent = append(m.sent, c)
-	return nil
-}
-func (m *mockBackupStreamR3) Context() context.Context       { return m.ctx }
-func (m *mockBackupStreamR3) SetHeader(_ metadata.MD) error  { return nil }
-func (m *mockBackupStreamR3) SendHeader(_ metadata.MD) error { return nil }
-func (m *mockBackupStreamR3) SetTrailer(_ metadata.MD)       {}
-func (m *mockBackupStreamR3) SendMsg(_ any) error            { return nil }
-func (m *mockBackupStreamR3) RecvMsg(_ any) error            { return nil }
-
-func TestR3_BackupVM_EmptyNameR3(t *testing.T) {
-	s := testServerR2(t)
-	stream := &mockBackupStreamR3{ctx: adminCtx()}
-
-	err := s.BackupVM(&pb.BackupVMRequest{VmName: ""}, stream)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if c := status.Code(err); c != codes.InvalidArgument {
-		t.Errorf("code = %v, want InvalidArgument", c)
-	}
-}
-
-func TestR3_BackupVM_VMNotFoundR3(t *testing.T) {
-	s := testServerR2(t)
-	stream := &mockBackupStreamR3{ctx: adminCtx()}
-
-	err := s.BackupVM(&pb.BackupVMRequest{VmName: "ghost"}, stream)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if c := status.Code(err); c != codes.NotFound {
-		t.Errorf("code = %v, want NotFound", c)
-	}
-}
-
-func TestR3_BackupVM_WrongHostR3(t *testing.T) {
-	s := testServerR2(t)
-	ctx := adminCtx()
-	stream := &mockBackupStreamR3{ctx: ctx}
-
-	insertTestVMR2(t, ctx, s.db, "backup-remote", "other-host", "running")
-
-	err := s.BackupVM(&pb.BackupVMRequest{VmName: "backup-remote"}, stream)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	c := status.Code(err)
-	if c != codes.Unavailable && c != codes.FailedPrecondition {
-		t.Errorf("code = %v, want Unavailable or FailedPrecondition", c)
-	}
-}
-
 // ── DiffStack: validation paths ─────────────────────────────────────────────
 
 func TestR3_DiffStack_EmptyYAML(t *testing.T) {

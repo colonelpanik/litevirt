@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -46,7 +48,19 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		return err
 	}
 
-	repo, err := pbsstore.Open(req.RepoPath)
+	// repo_path: registered repo name (any operator) or admin-only absolute path.
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	// target_path: a bare filename is contained under the disks dir; a custom
+	// absolute path is admin-only. The overlay path becomes the VM's disk path.
+	target, err := s.resolveRestoreTarget(ctx, req.TargetPath, filepath.Join(s.dataDir, "disks"))
+	if err != nil {
+		return err
+	}
+
+	repo, err := pbsstore.Open(repoPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "open repo: %v", err)
 	}
@@ -89,22 +103,34 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 	if err := stream.Send(&pb.RestoreLiveProgress{
 		Phase:      pb.RestoreLiveProgress_STARTING_NBD,
 		NbdUrl:     nbdURL,
-		TargetPath: req.TargetPath,
+		TargetPath: target,
 		Status:     fmt.Sprintf("NBD server listening on %s (export=%s, size=%d bytes)", addr.String(), exportName, manifest.TotalSize),
 	}); err != nil {
 		return err
 	}
 
-	if err := qcow2.CreateWithBackingURI(req.TargetPath, nbdURL, uint64(manifest.TotalSize), nil); err != nil {
+	// Create the overlay at a temp path and rename it into place BEFORE the
+	// domain is defined/started against it — never write through a symlink at
+	// the final path, and never rename a disk a VM is already running on.
+	if err := refuseSymlinkTarget(target); err != nil {
+		return err
+	}
+	tmpOverlay := target + ".restore.tmp"
+	_ = os.Remove(tmpOverlay)
+	if err := qcow2.CreateWithBackingURI(tmpOverlay, nbdURL, uint64(manifest.TotalSize), nil); err != nil {
 		return status.Errorf(codes.Internal, "create overlay qcow2: %v", err)
+	}
+	if err := os.Rename(tmpOverlay, target); err != nil {
+		_ = os.Remove(tmpOverlay)
+		return status.Errorf(codes.Internal, "finalize overlay: %v", err)
 	}
 
 	if err := stream.Send(&pb.RestoreLiveProgress{
 		Phase:      pb.RestoreLiveProgress_READY,
 		NbdUrl:     nbdURL,
-		TargetPath: req.TargetPath,
+		TargetPath: target,
 		Status: fmt.Sprintf("qcow2 overlay at %s — point qemu/libvirt at it; "+
-			"`virsh blockpull` will migrate data off the NBD source", req.TargetPath),
+			"`virsh blockpull` will migrate data off the NBD source", target),
 	}); err != nil {
 		return err
 	}
@@ -113,7 +139,7 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 	// resolved spec and boot it against the overlay so the operator
 	// needn't run virsh by hand.
 	if req.AutoStart {
-		name, rootDev, err := s.autoDefineRestoredVM(ctx, req, repo, manifest, req.TargetPath, stream.Send)
+		name, rootDev, err := s.autoDefineRestoredVM(ctx, req, repo, manifest, target, stream.Send)
 		if err != nil {
 			return err
 		}

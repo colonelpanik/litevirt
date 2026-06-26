@@ -735,25 +735,6 @@ func TestDetachDisk_DiskNotFound(t *testing.T) {
 	}
 }
 
-// ── BackupVM validation paths ───────────────────────────────────────────────
-
-// mockBackupStream implements pb.LiteVirt_BackupVMServer.
-type mockBackupStreamR2 struct {
-	ctx  context.Context
-	sent []*pb.BackupChunk
-}
-
-func (m *mockBackupStreamR2) Send(c *pb.BackupChunk) error {
-	m.sent = append(m.sent, c)
-	return nil
-}
-func (m *mockBackupStreamR2) Context() context.Context       { return m.ctx }
-func (m *mockBackupStreamR2) SetHeader(_ metadata.MD) error  { return nil }
-func (m *mockBackupStreamR2) SendHeader(_ metadata.MD) error { return nil }
-func (m *mockBackupStreamR2) SetTrailer(_ metadata.MD)       {}
-func (m *mockBackupStreamR2) SendMsg(_ interface{}) error    { return nil }
-func (m *mockBackupStreamR2) RecvMsg(_ interface{}) error    { return nil }
-
 // ── BuildImage validation paths ─────────────────────────────────────────────
 
 // ── PushImage validation ────────────────────────────────────────────────────
@@ -1818,34 +1799,6 @@ func TestCreateVM_DuplicateNameR2(t *testing.T) {
 		t.Errorf("code = %v, want AlreadyExists", c)
 	}
 }
-
-// ── BackupVM: VM with disk file not found (exercises deeper path) ────────────
-
-func TestBackupVM_DiskFileNotFound(t *testing.T) {
-	s := testServerR2(t)
-	ctx := adminCtx()
-
-	insertTestVMR2(t, ctx, s.db, "backup-disk-vm", "test-host", "running")
-
-	// Insert a disk record pointing to a nonexistent file.
-	corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
-		VMName:   "backup-disk-vm",
-		DiskName: "root",
-		HostName: "test-host",
-		Path:     "/nonexistent/path/root.qcow2",
-	})
-
-	stream := &mockBackupStreamR2{ctx: ctx}
-	err := s.BackupVM(&pb.BackupVMRequest{VmName: "backup-disk-vm"}, stream)
-	if err == nil {
-		t.Fatal("expected error for missing disk file")
-	}
-	if c := status.Code(err); c != codes.Internal {
-		t.Errorf("code = %v, want Internal", c)
-	}
-}
-
-// mockBackupStreamR2 duplicate removed — defined above at line ~735
 
 // ── BuildImage: VM with disk, exercises deeper path ─────────────────────────
 

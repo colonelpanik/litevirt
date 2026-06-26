@@ -74,7 +74,11 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
-	repo, err := pbsstore.Open(req.RepoPath)
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	repo, err := pbsstore.Open(repoPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
 	}
@@ -205,7 +209,11 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			req.Name, s.hostName)
 	}
 
-	repo, err := pbsstore.Open(req.RepoPath)
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	repo, err := pbsstore.Open(repoPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "open repo: %v", err)
 	}
@@ -256,7 +264,12 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Errorf(codes.Internal, "import container: %v", importErr)
 	}
 
-	// Recreate the cluster row from the embedded spec.
+	// Recreate the cluster row from the embedded spec. The spec is UNTRUSTED
+	// manifest data, so it supplies only descriptive fields (image/cpu/mem/
+	// labels/restart) — never the project: a tampered manifest must not move the
+	// restored container into a project the caller wasn't authorized for. The
+	// row uses the project the permission check was made against; a cross-project
+	// restore is a separate, explicitly-authorized operation.
 	spec := containerBackupSpec{Name: req.Name, Project: project}
 	if manifest.ContainerSpecJSON != "" {
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
@@ -265,7 +278,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		HostName: s.hostName, Name: req.Name, State: "stopped",
 		Image: spec.Image, CPULimit: spec.CPULimit, MemMiB: spec.MemMiB,
 		Labels: spec.Labels, RestartPolicy: spec.RestartPolicy,
-		Project: tenancy.NormalizeProject(spec.Project),
+		Project: tenancy.NormalizeProject(project),
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
 		slog.Warn("container restore: cluster row write failed", "name", req.Name, "error", err)
@@ -279,7 +292,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "running", "")
 	}
 
-	s.audit(ctx, "ct.restore", req.Name, fmt.Sprintf("project=%s from %s @ %s", spec.Project, req.RepoPath, req.Timestamp), "ok")
+	s.audit(ctx, "ct.restore", req.Name, fmt.Sprintf("project=%s from %s @ %s", project, req.RepoPath, req.Timestamp), "ok")
 	return send(&pb.RestoreContainerProgress{
 		Phase:        pb.RestoreContainerProgress_DONE,
 		BytesWritten: manifest.TotalSize,

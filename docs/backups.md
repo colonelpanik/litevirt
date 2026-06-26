@@ -372,6 +372,20 @@ vms:
 `backup:` block on every deploy. Removing the block soft-deletes the
 schedule.
 
+## Deprecated: raw full-disk backup/restore
+
+The legacy raw-stream RPCs `BackupVM`/`RestoreVM` (streaming a whole disk
+to/from the client) are **deprecated** and now return `Unimplemented`. Use the
+snapshot path instead — it is incremental, deduplicated, repo-backed, scoped to
+the VM's project via path RBAC, and quota-aware:
+
+- back up with **`lv backup snapshot`** (→ `BackupSnapshot`);
+- restore with **`lv backup restore-from`** (→ `RestoreFromBackup`) or
+  **`lv backup restore-live`** (→ `RestoreLive`).
+
+Restore destinations are a pool-relative filename by default; a custom absolute
+`target_path` (and a custom absolute `repo_path`) require the **admin** role.
+
 ## gRPC + WebUI
 
 - **gRPC `BackupSnapshot` + `RestoreFromBackup` + `RestoreLive`** —

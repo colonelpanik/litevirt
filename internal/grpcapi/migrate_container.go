@@ -65,7 +65,13 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
-	repo, err := pbsstore.Open(req.RepoPath)
+	// Resolve+authorize the repo on the source; forward the ORIGINAL req.RepoPath
+	// to the target so a registered name resolves in the target's own config.
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	repo, err := pbsstore.Open(repoPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "open staging repo %q (must be reachable from both hosts): %v", req.RepoPath, err)
 	}

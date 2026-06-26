@@ -136,12 +136,23 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	if err != nil {
 		return status.Errorf(codes.Internal, "resolve target dir: %v", err)
 	}
-	dstPath := req.TargetPath
-	if dstPath == "" {
+	// target_path: empty → the auto-derived "<vm>-<disk>.qcow2" under the pool
+	// dir; a bare filename is contained under the pool dir; a custom absolute
+	// path is admin-only (same policy as restore destinations).
+	var dstPath string
+	if req.TargetPath == "" {
 		dstPath = filepath.Join(dstDir, fmt.Sprintf("%s-%s.qcow2", req.VmName, req.DiskName))
+	} else {
+		dstPath, err = s.resolveRestoreTarget(ctx, req.TargetPath, dstDir)
+		if err != nil {
+			return err
+		}
 	}
 	if dstPath == src.Path {
 		return status.Error(codes.FailedPrecondition, "source and destination resolve to the same path")
+	}
+	if err := refuseSymlinkTarget(dstPath); err != nil {
+		return err
 	}
 
 	send := func(p *pb.ReplicateVolumeProgress) error {

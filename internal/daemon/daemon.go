@@ -497,7 +497,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// effectively (every schedule errors with ErrNoRepoConfigured until
 	// the operator adds a repo).
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
-	d.snapScheduler.ReplRunner = svc // *grpcapi.Server implements RunReplication
+	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
+	d.snapScheduler.ReplRunner = svc      // *grpcapi.Server implements RunReplication
 	go d.snapScheduler.Run(ctx)
 
 	// Sweep staging temp files leaked by a prior hard crash (SIGKILL skips the

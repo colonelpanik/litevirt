@@ -51,8 +51,10 @@ func SyncRepo(ctx context.Context, src, dst *Repo) (SyncStats, error) {
 		if _, err := dst.GetManifest(m.VMName, m.Timestamp, m.DiskName); err == nil {
 			continue
 		}
-		// Push every chunk this manifest references that's missing at dst.
-		for _, c := range m.Chunks {
+		// Push every chunk this manifest references that's missing at dst —
+		// including the firmware-state bundle, or a synced vTPM backup would
+		// restore without its NVRAM/swtpm state.
+		for _, c := range m.AllChunks() {
 			if dst.HasChunk(c.ID) {
 				stats.ChunksSkipped++
 				continue

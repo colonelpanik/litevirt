@@ -154,6 +154,11 @@ func RestoreToFile(ctx context.Context, repo *Repo, m *Manifest, dst string, opt
 	if m == nil {
 		return fmt.Errorf("nil manifest")
 	}
+	// The manifest is untrusted repo data; validate its structure before any
+	// chunk is read or written (defense in depth over GetManifest).
+	if err := ValidateManifest(m); err != nil {
+		return fmt.Errorf("invalid manifest: %w", err)
+	}
 	// Restore into a sibling temp file and atomic-rename only after the full
 	// disk is materialized, so a missing/corrupt chunk mid-stream (GC bug,
 	// bit rot, name-present-but-corrupt off-site sync) can NEVER truncate or
@@ -188,6 +193,11 @@ func RestoreToFile(ctx context.Context, repo *Repo, m *Manifest, dst string, opt
 		data, err := repo.GetChunk(ref.ID)
 		if err != nil {
 			return fmt.Errorf("get chunk %s at offset %d: %w", ref.ID, ref.Offset, err)
+		}
+		// The chunk's real content must match the size the manifest declared —
+		// a valid-but-larger chunk must not write past the ref's declared extent.
+		if int64(len(data)) != ref.Size {
+			return fmt.Errorf("chunk %s is %d bytes but manifest declares %d", ref.ID, len(data), ref.Size)
 		}
 		if _, err := f.WriteAt(data, ref.Offset); err != nil {
 			return fmt.Errorf("write at offset %d: %w", ref.Offset, err)

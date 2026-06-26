@@ -216,6 +216,9 @@ func (r *Repo) PutChunk(data []byte) (id string, created bool, err error) {
 
 // HasChunk reports whether a chunk with the given id exists in the repo.
 func (r *Repo) HasChunk(id string) bool {
+	if safename.ValidateChunkID(id) != nil {
+		return false
+	}
 	_, err := os.Stat(r.chunkPath(id))
 	return err == nil
 }
@@ -225,6 +228,9 @@ func (r *Repo) HasChunk(id string) bool {
 // ErrChunkMismatch on plaintext corruption and wraps ErrKeyMismatch
 // when AES-GCM authentication fails.
 func (r *Repo) GetChunk(id string) ([]byte, error) {
+	if err := safename.ValidateChunkID(id); err != nil {
+		return nil, err
+	}
 	storage, err := os.ReadFile(r.chunkPath(id))
 	if err != nil {
 		return nil, fmt.Errorf("read chunk %s: %w", id, err)
@@ -243,6 +249,9 @@ func (r *Repo) GetChunk(id string) ([]byte, error) {
 // directly because manifest-aware reference tracking is the only safe
 // way to drop chunks.
 func (r *Repo) DeleteChunk(id string) error {
+	if err := safename.ValidateChunkID(id); err != nil {
+		return err
+	}
 	if err := os.Remove(r.chunkPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -362,6 +371,20 @@ func (r *Repo) ListManifests() ([]Manifest, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp < out[j].Timestamp })
 	return out, nil
+}
+
+// AllChunks returns every chunk a manifest references — the disk chunks plus
+// the firmware-state bundle (nvram+swtpm). Repo maintenance (GC reachability,
+// Verify, Sync) MUST iterate this, not just Chunks, or it would treat a valid
+// backup's firmware bundle as garbage / miss it on verify / drop it on sync.
+func (m *Manifest) AllChunks() []ChunkRef {
+	if len(m.FirmwareChunks) == 0 {
+		return m.Chunks
+	}
+	out := make([]ChunkRef, 0, len(m.Chunks)+len(m.FirmwareChunks))
+	out = append(out, m.Chunks...)
+	out = append(out, m.FirmwareChunks...)
+	return out
 }
 
 // chunkPath returns the on-disk path for a chunk id. Splits into

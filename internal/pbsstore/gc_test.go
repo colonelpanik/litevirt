@@ -40,6 +40,38 @@ func TestGC_RemovesUnreferencedChunks(t *testing.T) {
 	}
 }
 
+// TestGC_KeepsFirmwareChunks ensures GC treats a manifest's FirmwareChunks as
+// reachable — a vTPM backup's NVRAM/swtpm bundle must not be swept as garbage.
+func TestGC_KeepsFirmwareChunks(t *testing.T) {
+	r := newTestRepo(t)
+	src := randomBytes(t, ChunkSize)
+	m, err := PushDisk(context.Background(), r, bytes.NewReader(src), PushOptions{
+		VMName: "fwvm", DiskName: "root", Timestamp: "2026-06-26T01:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	// Store a firmware bundle as separate content-addressed chunks and attach
+	// the refs to the manifest, then re-write it.
+	fwRefs, err := r.PutBytes(randomBytes(t, 4096))
+	if err != nil {
+		t.Fatalf("PutBytes firmware: %v", err)
+	}
+	m.FirmwareChunks = fwRefs
+	if err := r.PutManifest(m); err != nil {
+		t.Fatalf("PutManifest: %v", err)
+	}
+
+	if _, err := GC(context.Background(), r); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	for _, c := range fwRefs {
+		if !r.HasChunk(c.ID) {
+			t.Errorf("firmware chunk %s swept by GC; should be reachable", c.ID)
+		}
+	}
+}
+
 // TestGC_KeepsLiveChunks ensures GC never deletes chunks that any
 // surviving manifest still points at.
 func TestGC_KeepsLiveChunks(t *testing.T) {

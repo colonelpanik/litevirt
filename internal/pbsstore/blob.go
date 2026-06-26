@@ -3,6 +3,8 @@ package pbsstore
 import (
 	"fmt"
 	"io"
+
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // PutBytes content-addresses an arbitrary in-memory blob (e.g. a VM
@@ -34,9 +36,17 @@ func (r *Repo) PutBytes(b []byte) ([]ChunkRef, error) {
 // before it's materialized onto a host.
 func (r *Repo) ReadBytesTo(refs []ChunkRef, w io.Writer) error {
 	for _, ref := range refs {
+		if err := safename.ValidateChunkID(ref.ID); err != nil {
+			return err
+		}
 		data, err := r.GetChunk(ref.ID)
 		if err != nil {
 			return fmt.Errorf("read blob chunk %s: %w", ref.ID, err)
+		}
+		// Enforce the declared size so a valid-but-larger chunk can't inflate the
+		// materialized blob (e.g. a firmware bundle) beyond its manifest extent.
+		if int64(len(data)) != ref.Size {
+			return fmt.Errorf("blob chunk %s is %d bytes but ref declares %d", ref.ID, len(data), ref.Size)
 		}
 		if _, err := w.Write(data); err != nil {
 			return err

@@ -39,7 +39,7 @@ func GC(ctx context.Context, r *Repo) (GCStats, error) {
 	live := make(map[string]struct{})
 	for _, m := range manifests {
 		stats.ManifestsScanned++
-		for _, c := range m.Chunks {
+		for _, c := range m.AllChunks() {
 			live[c.ID] = struct{}{}
 		}
 	}
@@ -106,7 +106,7 @@ func Verify(ctx context.Context, r *Repo) (VerifyStats, error) {
 	}
 	seen := make(map[string]struct{})
 	for _, m := range manifests {
-		for _, c := range m.Chunks {
+		for _, c := range m.AllChunks() {
 			if _, ok := seen[c.ID]; ok {
 				continue
 			}

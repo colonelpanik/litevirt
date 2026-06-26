@@ -30,7 +30,10 @@ func TestManifestReader_RoundTrip(t *testing.T) {
 		t.Fatalf("PushDisk: %v", err)
 	}
 
-	r := NewManifestReader(repo, m)
+	r, nerr := NewManifestReader(repo, m)
+	if nerr != nil {
+		t.Fatalf("NewManifestReader: %v", nerr)
+	}
 	defer r.Close()
 
 	if r.Size() != int64(len(src)) {
@@ -79,7 +82,10 @@ func TestManifestReader_CrossChunkRead(t *testing.T) {
 		t.Fatalf("PushDisk: %v", err)
 	}
 
-	r := NewManifestReader(repo, m)
+	r, nerr := NewManifestReader(repo, m)
+	if nerr != nil {
+		t.Fatalf("NewManifestReader: %v", nerr)
+	}
 	defer r.Close()
 
 	// Straddle chunks 0/1 by 1 MiB on each side.
@@ -111,7 +117,10 @@ func TestManifestReader_PastEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PushDisk: %v", err)
 	}
-	r := NewManifestReader(repo, m)
+	r, nerr := NewManifestReader(repo, m)
+	if nerr != nil {
+		t.Fatalf("NewManifestReader: %v", nerr)
+	}
 	got := make([]byte, 1024)
 	_, err = r.ReadAt(got, 4096)
 	if err != io.EOF {

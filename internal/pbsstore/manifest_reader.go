@@ -34,14 +34,22 @@ type ManifestReader struct {
 // NOT walked here — incremental manifests with BasedOn set rely on
 // their chunk refs pointing into a parent's chunks via the shared
 // content-addressed store. Repo.GetChunk handles that transparently.
-func NewManifestReader(repo *Repo, m *Manifest) *ManifestReader {
+func NewManifestReader(repo *Repo, m *Manifest) (*ManifestReader, error) {
+	if m == nil {
+		return nil, fmt.Errorf("nil manifest")
+	}
+	// The manifest is untrusted; validate its structure at the boundary so a
+	// hand-edited/tampered manifest can't drive ReadAt with bad offsets/sizes.
+	if err := ValidateManifest(m); err != nil {
+		return nil, fmt.Errorf("invalid manifest: %w", err)
+	}
 	chunks := make([]ChunkRef, len(m.Chunks))
 	copy(chunks, m.Chunks)
 	sort.Slice(chunks, func(i, j int) bool { return chunks[i].Offset < chunks[j].Offset })
 	return &ManifestReader{
 		repo: repo, manifest: m, chunks: chunks,
 		cache: map[string][]byte{},
-	}
+	}, nil
 }
 
 // Size returns the manifest's logical disk size.

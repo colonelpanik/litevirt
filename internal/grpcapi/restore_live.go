@@ -69,7 +69,10 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		return status.Errorf(codes.NotFound, "manifest: %v", err)
 	}
 
-	reader := pbsstore.NewManifestReader(repo, manifest)
+	reader, err := pbsstore.NewManifestReader(repo, manifest)
+	if err != nil {
+		return status.Errorf(codes.Internal, "manifest reader: %v", err)
+	}
 	defer reader.Close()
 
 	exportName := fmt.Sprintf("%s-%s", req.VmName, req.DiskName)

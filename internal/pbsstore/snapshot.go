@@ -36,6 +36,11 @@ type PushOptions struct {
 	// container restore can recreate the cluster row from the manifest alone.
 	ContainerSpecJSON string
 
+	// FirmwareChunks, when set, references the content-addressed firmware-state
+	// bundle (UEFI NVRAM + swtpm) for a Secure-Boot/vTPM VM, captured on the
+	// root disk so a restore materializes BitLocker-binding firmware (G1).
+	FirmwareChunks []ChunkRef
+
 	// Progress, if non-nil, is called once per chunk after the chunk
 	// has been written or deduped against the repo. Use it to drive
 	// gRPC stream progress.
@@ -74,6 +79,7 @@ func PushDisk(ctx context.Context, repo *Repo, src io.Reader, opts PushOptions) 
 		VMSpecJSON:        opts.VMSpecJSON,
 		DomainXML:         opts.DomainXML,
 		ContainerSpecJSON: opts.ContainerSpecJSON,
+		FirmwareChunks:    opts.FirmwareChunks,
 	}
 
 	buf := make([]byte, ChunkSize)

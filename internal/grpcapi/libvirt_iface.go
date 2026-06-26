@@ -28,6 +28,7 @@ type LibvirtBackend interface {
 	ShutdownDomain(name string) error
 	DestroyDomain(name string) error
 	UndefineDomain(name string, removeStorage bool) error
+	UndefineDomainPreservingState(name string) error // undefine keeping NVRAM/vTPM (redefine-class, G1)
 	DomainState(name string) (string, error)
 	DomainExists(name string) bool
 	ListDomains() ([]string, error)
@@ -60,7 +61,7 @@ type LibvirtBackend interface {
 
 	// Snapshots.
 	CreateSnapshot(domainName, snapshotName string) (int64, error)
-	RevertToSnapshot(domainName, snapshotName string) error
+	RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error
 	DeleteSnapshot(domainName, snapshotName string) error
 	// FlattenSnapshot live-merges each disk's active overlay down into the named
 	// snapshot's base (block-commit + pivot), then drops the snapshot metadata —
@@ -70,8 +71,8 @@ type LibvirtBackend interface {
 	FlattenSnapshot(domainName, snapshotName string) error
 	// Live/RAM snapshots (#3): capture guest RAM into vmstatePath alongside the
 	// external disk snapshot, and revert both to the snapshot instant.
-	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string) (diskBytes, vmstateBytes int64, err error)
-	RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string) error
+	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error)
+	RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error) error
 	// DomainDiskSources returns target-dev → live source-file. Used to reconcile
 	// vm_disks.path after a snapshot op moves the domain onto an overlay
 	// (<disk>.<snapname>), so backup/migration/restart use the real active disk.

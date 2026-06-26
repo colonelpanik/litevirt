@@ -47,6 +47,27 @@ type VMConfig struct {
 
 	// PCI passthrough devices
 	Hostdevs []HostdevConfig
+
+	// Secure Boot + vTPM (G1). SecureBoot uses the secboot/MS OVMF pair + SMM
+	// (q35-only); TPM adds an emulated TPM 2.0 device. LoaderPath/NvramTemplate
+	// are daemon-resolved firmware paths (required when SecureBoot; else fall back
+	// to the standard OVMF pair). NvramPath name-pins the per-VM UEFI vars file
+	// under dataDir so it travels deterministically; vTPM state is NOT pinned here
+	// (see UUID below) — TPMStateDir is a test-only escape hatch.
+	// UUID is the stable domain identity. Setting it makes libvirt's default
+	// swtpm state path (/var/lib/libvirt/swtpm/<uuid>/) deterministic, so vTPM
+	// state can be located + carried across hosts without an explicit <source>
+	// (which the stock swtpm AppArmor profile forbids outside /var/lib/libvirt).
+	UUID          string
+	SecureBoot    bool
+	TPM           bool
+	LoaderPath    string
+	NvramTemplate string
+	NvramPath     string
+	// TPMStateDir, when set, emits an explicit swtpm <source> dir. PRODUCTION
+	// leaves it empty (libvirt uses /var/lib/libvirt/swtpm/<uuid>/, AppArmor-OK);
+	// it's an optional test escape hatch only.
+	TPMStateDir string
 }
 
 // NUMAPolicy controls guest memory/CPU NUMA binding.
@@ -103,6 +124,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	}
 
 	dom := domain{
+		UUID: cfg.UUID,
 		Type: "kvm",
 		Name: cfg.Name,
 		Memory: memory{
@@ -178,16 +200,39 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		dom.OS.Boot = &osBoot{Dev: cfg.Boot}
 	}
 
-	// UEFI firmware
+	// Secure Boot requires UEFI + q35 + SMM (G1).
+	if cfg.SecureBoot {
+		if !isUEFI {
+			return "", fmt.Errorf("secure boot requires uefi firmware (got %q)", cfg.Firmware)
+		}
+		if cfg.Machine == "pc" {
+			return "", fmt.Errorf("secure boot requires the q35 machine type, not pc")
+		}
+		if cfg.LoaderPath == "" || cfg.NvramTemplate == "" {
+			return "", fmt.Errorf("secure boot requires resolved firmware paths (LoaderPath/NvramTemplate) — the daemon must supply them")
+		}
+		dom.Features.SMM = &smmFeature{State: "on"}
+	}
+
+	// UEFI firmware. Paths are daemon-resolved (cfg.LoaderPath/NvramTemplate);
+	// fall back to the standard non-secure OVMF pair for callers that don't set
+	// them (backward compat). NvramPath, when set, pins the per-VM vars file under
+	// dataDir so it travels deterministically across lifecycle ops; empty lets
+	// libvirt auto-place it.
 	if isUEFI {
-		dom.OS.Loader = &osLoader{
-			Readonly: "yes",
-			Type:     "pflash",
-			Value:    "/usr/share/OVMF/OVMF_CODE_4M.fd",
+		loader := cfg.LoaderPath
+		if loader == "" {
+			loader = "/usr/share/OVMF/OVMF_CODE_4M.fd"
 		}
-		dom.OS.Nvram = &osNvram{
-			Template: "/usr/share/OVMF/OVMF_VARS_4M.fd",
+		varsTemplate := cfg.NvramTemplate
+		if varsTemplate == "" {
+			varsTemplate = "/usr/share/OVMF/OVMF_VARS_4M.fd"
 		}
+		dom.OS.Loader = &osLoader{Readonly: "yes", Type: "pflash", Value: loader}
+		if cfg.SecureBoot {
+			dom.OS.Loader.Secure = "yes"
+		}
+		dom.OS.Nvram = &osNvram{Template: varsTemplate, Value: cfg.NvramPath}
 	}
 
 	// Devices
@@ -371,6 +416,17 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		})
 	}
 
+	// Emulated TPM 2.0 (G1). State is pinned at TPMStateDir (when set) so it
+	// travels with the VM; persistent_state keeps it across power cycles. tpm-crb
+	// is the Windows-11-friendly model on q35.
+	if cfg.TPM {
+		backend := tpmBackend{Type: "emulator", Version: "2.0", PersistentState: "yes"}
+		if cfg.TPMStateDir != "" {
+			backend.Source = &tpmSource{Type: "dir", Path: cfg.TPMStateDir}
+		}
+		dev.TPM = &tpmDevice{Model: "tpm-crb", Backend: backend}
+	}
+
 	dom.Devices = dev
 
 	output, err := xml.MarshalIndent(dom, "", "  ")
@@ -412,6 +468,13 @@ func DiskPath(dataDir, vmName, diskName string) string {
 	return filepath.Join(dataDir, "disks", vmName+"-"+diskName+".qcow2")
 }
 
+// NvramPath returns the per-VM UEFI vars file, pinned under dataDir so it can be
+// located/copied deterministically across the VM lifecycle (G1).
+func NvramPath(dataDir, vmName string) string {
+	return filepath.Join(dataDir, "nvram", vmName+"_VARS.fd")
+}
+
+
 // CloudInitISOPath returns the standard path for a cloud-init ISO.
 func CloudInitISOPath(dataDir, vmName string) string {
 	return filepath.Join(dataDir, "cloudinit", vmName+".iso")
@@ -438,6 +501,7 @@ type domain struct {
 	XMLName       xml.Name       `xml:"domain"`
 	Type          string         `xml:"type,attr"`
 	Name          string         `xml:"name"`
+	UUID          string         `xml:"uuid,omitempty"` // stable VM identity; makes the libvirt-default swtpm path deterministic (G1)
 	Memory        memory         `xml:"memory"`
 	CurrentMemory *memory        `xml:"currentMemory,omitempty"`
 	VCPU          vcpu           `xml:"vcpu"`
@@ -505,6 +569,7 @@ type osType struct {
 
 type osLoader struct {
 	Readonly string `xml:"readonly,attr"`
+	Secure   string `xml:"secure,attr,omitempty"`
 	Type     string `xml:"type,attr"`
 	Value    string `xml:",chardata"`
 }
@@ -512,6 +577,7 @@ type osLoader struct {
 type osNvram struct {
 	Template string `xml:"template,attr,omitempty"`
 	Type     string `xml:"type,attr,omitempty"`
+	Value    string `xml:",chardata"` // explicit per-VM vars path; empty = libvirt auto
 }
 
 type osBoot struct {
@@ -519,8 +585,13 @@ type osBoot struct {
 }
 
 type features struct {
-	ACPI *struct{} `xml:"acpi,omitempty"`
-	APIC *struct{} `xml:"apic,omitempty"`
+	ACPI *struct{}   `xml:"acpi,omitempty"`
+	APIC *struct{}   `xml:"apic,omitempty"`
+	SMM  *smmFeature `xml:"smm,omitempty"` // required for Secure Boot
+}
+
+type smmFeature struct {
+	State string `xml:"state,attr"` // "on"
 }
 
 type clock struct {
@@ -539,6 +610,27 @@ type devices struct {
 	Graphics   []graphicsDevice  `xml:"graphics"`
 	Videos     []videoDevice     `xml:"video"`
 	MemBalloon *memballoon       `xml:"memballoon,omitempty"`
+	TPM        *tpmDevice        `xml:"tpm,omitempty"`
+}
+
+// tpmDevice is an emulated TPM 2.0 (G1). State lives at Backend.Source.Path
+// (pinned under dataDir) so it travels with the VM.
+type tpmDevice struct {
+	XMLName xml.Name   `xml:"tpm"`
+	Model   string     `xml:"model,attr"` // tpm-crb on q35
+	Backend tpmBackend `xml:"backend"`
+}
+
+type tpmBackend struct {
+	Type            string     `xml:"type,attr"`                        // "emulator"
+	Version         string     `xml:"version,attr,omitempty"`           // "2.0"
+	PersistentState string     `xml:"persistent_state,attr,omitempty"`  // "yes"
+	Source          *tpmSource `xml:"source,omitempty"`
+}
+
+type tpmSource struct {
+	Type string `xml:"type,attr"` // "dir"
+	Path string `xml:"path,attr"`
 }
 
 // memballoon is the virtio memory-balloon device (#4): lets the host reclaim

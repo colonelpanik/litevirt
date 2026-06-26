@@ -19,6 +19,11 @@ const (
 	// container (LXC) runtime is available. Compose requires it when placing
 	// container workloads so they never land on a non-LXC host.
 	LabelLXCCapable = "litevirt.lxc"
+	// LabelTPMCapable / LabelSecureBootCapable are HOST labels advertising vTPM
+	// (swtpm) and Secure Boot (secboot/MS OVMF) support (G1). Independent because
+	// their host dependencies differ. Placement requires whichever a VM spec needs.
+	LabelTPMCapable        = "litevirt.tpm"
+	LabelSecureBootCapable = "litevirt.secureboot"
 	// LabelIP records a container's primary IPv4 so it can serve as a load
 	// balancer backend cluster-wide (containers have no vm_interfaces table).
 	// Set from a static compose NIC address at create; the LB host re-discovers

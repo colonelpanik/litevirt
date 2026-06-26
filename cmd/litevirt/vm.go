@@ -30,6 +30,8 @@ func newRunCmd() *cobra.Command {
 		restartMax   int32
 		restartDelay string
 		restartWin   string
+		secureBoot   bool
+		tpm          bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -50,6 +52,8 @@ func newRunCmd() *cobra.Command {
 					StartupOrder:  startupOrder,
 					StartDelaySec: startDelay,
 					StopDelaySec:  stopDelay,
+					SecureBoot:    secureBoot,
+					Tpm:           tpm,
 				}
 				if disk != "" {
 					spec.Disks = []*pb.DiskSpec{{Name: "root", Size: disk, Bus: "virtio"}}
@@ -92,6 +96,8 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().Int32Var(&restartMax, "restart-max-attempts", 0, "Max restart attempts within the window (0 = unlimited)")
 	cmd.Flags().StringVar(&restartDelay, "restart-delay", "", "Delay between restart attempts (e.g. 5s; default 5s)")
 	cmd.Flags().StringVar(&restartWin, "restart-window", "", "Attempt-count window (e.g. 1h; default 1h)")
+	cmd.Flags().BoolVar(&secureBoot, "secure-boot", false, "Enable UEFI Secure Boot (q35; Windows 11 / signed-boot guests)")
+	cmd.Flags().BoolVar(&tpm, "tpm", false, "Attach an emulated TPM 2.0 device (Windows 11 / BitLocker)")
 	cmd.MarkFlagRequired("name")
 	return cmd
 }

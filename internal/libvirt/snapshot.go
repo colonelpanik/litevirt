@@ -69,7 +69,10 @@ func (c *Client) ListSnapshots(domainName string) ([]string, error) {
 // to get write lock". Keeping the domain on the overlay leaves the base opened
 // read-only exactly as before — no lock conflict. (Same technique as
 // RevertToLiveSnapshot, which fixed the identical class of bug.)
-func (c *Client) RevertToSnapshot(domainName, snapshotName string) error {
+// restorePreDefine, when non-nil, restores firmware state (NVRAM + swtpm) from
+// the snapshot's sidecar right before the domain is redefined, so reverted disks
+// and firmware are a consistent set (G1).
+func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error {
 	dom, err := c.virt.DomainLookupByName(domainName)
 	if err != nil {
 		return fmt.Errorf("lookup domain %q: %w", domainName, err)
@@ -139,7 +142,7 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string) error {
 	// to release virtlockd locks.
 	_ = c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
 	if d, e := c.virt.DomainLookupByName(domainName); e == nil {
-		_ = c.virt.DomainUndefineFlags(d, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineNvram))
+		_ = c.virt.DomainUndefineFlags(d, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
 	}
 	for i := 0; i < 20; i++ {
 		time.Sleep(250 * time.Millisecond)
@@ -154,6 +157,14 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string) error {
 	for _, r := range resets {
 		if err := resetOverlay(r.overlay, r.base); err != nil {
 			return fmt.Errorf("reset overlay %q: %w", r.overlay, err)
+		}
+	}
+
+	// Restore firmware state (NVRAM + swtpm) BEFORE redefine, so libvirt reuses
+	// the snapshot-instant firmware (G1).
+	if restorePreDefine != nil {
+		if err := restorePreDefine(); err != nil {
+			return fmt.Errorf("restore firmware state on revert: %w", err)
 		}
 	}
 
@@ -301,7 +312,10 @@ func (c *Client) DeleteSnapshot(domainName, snapshotName string) error {
 // The VM is unavailable only for the suspend→save→restore window (seconds for
 // small guests); it does NOT reboot. Memory snapshots are not compatible with a
 // stopped VM — callers must fall back to CreateSnapshot for that case.
-func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string) (diskBytes, vmstateBytes int64, err error) {
+// captureSuspended, when non-nil, is invoked while the guest is frozen (disks
+// snapshotted, guest paused) so firmware state (NVRAM + swtpm) is captured at the
+// SAME instant as the disk+RAM snapshot — see CreateLiveSnapshot (G1).
+func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
 	dom, err := c.virt.DomainLookupByName(domainName)
 	if err != nil {
 		return 0, 0, fmt.Errorf("lookup domain %q: %w", domainName, err)
@@ -330,6 +344,14 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 		return 0, 0, fmt.Errorf("disk snapshot: %w", err)
 	}
 	allocation, _, _, _ := c.virt.DomainGetBlockInfo(dom, "vda", 0)
+
+	// 2b. Capture firmware (NVRAM + swtpm) at this frozen instant — consistent
+	// with the disk+RAM snapshot. Must be here (guest paused), not after resume.
+	if captureSuspended != nil {
+		if err := captureSuspended(); err != nil {
+			return 0, 0, fmt.Errorf("capture firmware state: %w", err)
+		}
+	}
 
 	// 3. Save RAM. This stops the (already-paused) domain and writes the full
 	// domain XML (referencing the new overlay paths) into the image.
@@ -362,7 +384,7 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 // earlier attempt that swapped overlay→base made qemu open the base file both
 // read-write as the disk AND read-only as its own backing → write-lock
 // self-deadlock).
-func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string) error {
+func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error) error {
 	// Pre-flight: never start tearing the VM down if the RAM image is gone.
 	if _, err := os.Stat(vmstatePath); err != nil {
 		return fmt.Errorf("vmstate image %q missing — cannot restore memory snapshot: %w", vmstatePath, err)
@@ -430,7 +452,7 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 
 	// Undefine to release virtlockd locks (mirrors the disk-only revert).
 	dom, _ = c.virt.DomainLookupByName(domainName)
-	_ = c.virt.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineNvram))
+	_ = c.virt.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
 	for i := 0; i < 20; i++ {
 		time.Sleep(250 * time.Millisecond)
 		if !c.DomainExists(domainName) {
@@ -444,6 +466,14 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	for _, r := range resets {
 		if err := resetOverlay(r.overlay, r.base); err != nil {
 			return fmt.Errorf("reset overlay %q: %w", r.overlay, err)
+		}
+	}
+
+	// Restore firmware (NVRAM + swtpm) to the snapshot instant BEFORE bringing the
+	// guest back, so it resumes against the consistent firmware (G1).
+	if restorePreDefine != nil {
+		if err := restorePreDefine(); err != nil {
+			return fmt.Errorf("restore firmware state on revert: %w", err)
 		}
 	}
 
@@ -542,7 +572,7 @@ func (c *Client) forceRemoveDomain(domainName string) {
 	}
 	_ = c.virt.DomainDestroy(d) // no-op/err if already shut off
 	if d2, e2 := c.virt.DomainLookupByName(domainName); e2 == nil {
-		_ = c.virt.DomainUndefineFlags(d2, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineNvram))
+		_ = c.virt.DomainUndefineFlags(d2, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
 	}
 }
 

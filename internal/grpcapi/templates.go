@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -88,6 +89,14 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 
 	mode := cloneMode(req.Mode, allDisksShared(srcDisks))
 
+	// Preserve disk bus + SCSI controller model from the source spec (a Windows
+	// scsi/lsisas guest cloned as virtio wouldn't boot — and would falsify
+	// "BitLocker survives clone"). Cross-cutting G1 fix.
+	diskSpecByName := map[string]*pb.DiskSpec{}
+	for _, ds := range srcSpec.Disks {
+		diskSpecByName[ds.Name] = ds
+	}
+
 	// ── Clone the disks ──────────────────────────────────────────────────
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
@@ -123,10 +132,18 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			}
 		}
 		created = append(created, clonePath)
-		diskConfigs = append(diskConfigs, lv.DiskConfig{Name: d.DiskName, Path: clonePath, Bus: "virtio"})
+		bus, controller := "virtio", ""
+		if ds := diskSpecByName[d.DiskName]; ds != nil {
+			if ds.Bus != "" {
+				bus = ds.Bus
+			}
+			controller = ds.ControllerModel
+		}
+		diskConfigs = append(diskConfigs, lv.DiskConfig{Name: d.DiskName, Path: clonePath, Bus: bus, ControllerModel: controller})
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
 			VMName: req.Target, DiskName: d.DiskName, HostName: s.hostName, Path: clonePath,
 			SizeBytes: d.SizeBytes, StorageType: d.StorageType, BackingDisk: backing,
+			TargetDev: lv.DiskDevName(bus, len(diskRecords)),
 		})
 	}
 
@@ -186,7 +203,8 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	mem := int(srcSpec.MemoryMib)
 	srcSpec.Name = req.Target
 	srcSpec.Project = project
-	srcSpec.Devices = nil // v1: don't clone PCI passthrough (device may be in use)
+	srcSpec.Devices = nil          // v1: don't clone PCI passthrough (device may be in use)
+	srcSpec.Uuid = uuid.NewString() // fresh identity ⇒ fresh vTPM (never copy the source TPM secret) (G1)
 	for i := range srcSpec.Network {
 		if i < len(ifaceRecords) {
 			srcSpec.Network[i].Mac = ifaceRecords[i].MAC
@@ -203,12 +221,19 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if firmware == "" {
 		firmware = "uefi"
 	}
-	domXML, err := lv.GenerateDomainXML(lv.VMConfig{
-		Name: req.Target, CPU: cpu, CPUMode: srcSpec.CpuMode, MemoryMiB: mem,
+	vmCfg := lv.VMConfig{
+		Name: req.Target, UUID: srcSpec.Uuid, CPU: cpu, CPUMode: srcSpec.CpuMode, MemoryMiB: mem,
 		Machine: machine, Firmware: firmware, GuestAgent: srcSpec.GuestAgent,
 		EnableVNC: !srcSpec.DisableVnc, EnableSPICE: srcSpec.EnableSpice,
 		Disks: diskConfigs, Networks: netConfigs, CloudInitISO: cloudInitISO, Boot: srcSpec.Boot,
-	})
+	}
+	// Thread Secure Boot + vTPM (fresh vTPM at the new UUID; fresh NVRAM from
+	// template) into the clone domain (G1).
+	if err := s.applyFirmwareConfig(&vmCfg, &srcSpec); err != nil {
+		cleanup()
+		return nil, err
+	}
+	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
@@ -218,11 +243,22 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.Internal, "define clone domain: %v", err)
 	}
 
+	// Roll back everything the clone built until the DB row lands — including the
+	// fresh UUID-keyed swtpm + name-keyed NVRAM, so a failed clone strands nothing (G1).
+	rollbackClone := func(running bool) {
+		if running {
+			s.virt.DestroyDomain(req.Target)
+		}
+		s.virt.UndefineDomain(req.Target, false)
+		cleanup()
+		os.Remove(cloudInitISO)
+		lv.WipeFirmwareState(s.dataDir, req.Target, srcSpec.Uuid)
+	}
+
 	state := "stopped"
 	if req.Start {
 		if err := s.virt.StartDomain(req.Target); err != nil {
-			s.virt.UndefineDomain(req.Target, false)
-			cleanup()
+			rollbackClone(false)
 			return nil, status.Errorf(codes.Internal, "start clone: %v", err)
 		}
 		state = "running"
@@ -232,6 +268,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		Name: req.Target, StackName: src.StackName, HostName: s.hostName, Spec: string(specJSON),
 		State: state, CPUActual: cpu, MemActual: mem, Project: project,
 	}, ifaceRecords, diskRecords); err != nil {
+		rollbackClone(state == "running")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
 	}
 

@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -245,8 +246,10 @@ func TestRenameVM(t *testing.T) {
 	if got == nil {
 		t.Fatal("GetVM(new-name) returned nil")
 	}
-	if got.Spec != `{"cpu":2}` {
-		t.Errorf("Spec = %q after rename", got.Spec)
+	// RenameVM now propagates the new name into the stored spec JSON (so later
+	// XML/firmware-path derivation targets the right VM); cpu is preserved.
+	if !strings.Contains(got.Spec, `"name":"new-name"`) || !strings.Contains(got.Spec, `"cpu":2`) {
+		t.Errorf("Spec = %q after rename, want it to carry name=new-name + cpu=2", got.Spec)
 	}
 
 	// Interfaces should be renamed

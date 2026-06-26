@@ -206,6 +206,13 @@ func (r *Rebalancer) evaluateAll(ctx context.Context, snap *placement.ClusterSna
 			continue
 		}
 		spec := parseSpec(vm)
+		// Skip Secure-Boot/vTPM VMs: they migrate COLD only (live firmware carry
+		// isn't a validated path), but the executor live-migrates approved
+		// proposals — so a proposal here would always be rejected at apply. Don't
+		// propose them until live carry is validated (G1).
+		if spec != nil && (spec.SecureBoot || spec.Tpm) {
+			continue
+		}
 		pol := resolveVMPolicyFromSpec(spec)
 		if pol.Mode == ModeOff {
 			continue
@@ -379,6 +386,20 @@ func buildPlacementRequest(vm corrosion.VMRecord, spec *pb.VMSpec, pol vmPolicy)
 			Count:  count,
 			Vendor: d.Vendor,
 		})
+	}
+	// A Secure-Boot/vTPM VM may only be rebalanced onto a capable host (G1) — its
+	// migration would otherwise be refused at execution. Require the matching
+	// host-capability labels so proposals only target hosts that can run it.
+	if spec.SecureBoot || spec.Tpm {
+		if req.RequireLabels == nil {
+			req.RequireLabels = map[string]string{}
+		}
+		if spec.Tpm {
+			req.RequireLabels[corrosion.LabelTPMCapable] = "true"
+		}
+		if spec.SecureBoot {
+			req.RequireLabels[corrosion.LabelSecureBootCapable] = "true"
+		}
 	}
 	// Networks are intentionally omitted: the only network effect on scoring is
 	// a host-independent SR-IOV soft penalty, which is constant across all

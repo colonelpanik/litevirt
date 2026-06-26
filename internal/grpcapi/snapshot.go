@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -29,6 +30,12 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "snapshot.create", "operator"); err != nil {
 		return nil, err
+	}
+	// Snapshot names now feed a filesystem sidecar path (firmware state), so
+	// validate for ALL snapshots (not just memory) to prevent a `../` escape (G1).
+	if !validRestoreName(req.Name) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid snapshot name %q: allowed [A-Za-z0-9_.-], not '.' or '..'", req.Name)
 	}
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
@@ -69,20 +76,92 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			"hint", "consolidate with 'lv snapshot flatten "+req.VmName+"'")
 	}
 
+	// Firmware-state capture (G1): a Secure-Boot/vTPM VM's NVRAM + swtpm must be
+	// captured at the SAME instant as disk+RAM, or a revert pairs reverted disks
+	// with current firmware (BitLocker desync). A running disk-only snapshot has no
+	// consistent capture point — require --with-memory there.
+	fwSpec := parseFirmwareSpec(vm.Spec)
+	fwUUID := fwSpec.UUID
+	hasFW := fwSpec.SecureBoot || fwSpec.Tpm
+	if hasFW {
+		// A running disk-only snapshot has no consistent firmware-capture point.
+		if !withMemory {
+			if st, _ := s.virt.DomainState(req.VmName); st == "running" {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"a running Secure Boot / vTPM VM must be snapshotted with --with-memory (its firmware state can't be captured from a live disk-only snapshot)")
+			}
+		}
+		// Preflight: the firmware state must be present locally to capture it —
+		// fail BEFORE touching libvirt so we never create an overlay we can't back.
+		// NVRAM only exists for UEFI (a BIOS+vTPM VM has swtpm but no NVRAM).
+		if (fwSpec.hasNvram() && !lv.HasNvram(s.dataDir, req.VmName)) || (fwSpec.Tpm && !lv.HasTPMState(fwUUID)) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"firmware state for %q is not present on this host; cannot snapshot it consistently", req.VmName)
+		}
+	}
+	captureFW := func() error {
+		if !hasFW {
+			return nil
+		}
+		bundle := lv.SnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.Name)
+		if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
+			return err
+		}
+		f, err := os.Create(bundle)
+		if err != nil {
+			return err
+		}
+		has, werr := lv.WriteFirmwareBundle(s.dataDir, req.VmName, fwUUID, f)
+		f.Close()
+		if werr != nil {
+			return werr
+		}
+		if !has {
+			return fmt.Errorf("no firmware state captured for %q", req.VmName)
+		}
+		return nil
+	}
+
 	snapType := "disk"
 	var sizeBytes, vmstateBytes int64
 	var vmstatePath string
+	snapCreated := false
 	if withMemory {
 		vmstatePath = lv.VMStatePath(s.dataDir, req.VmName, req.Name)
 		if mkErr := os.MkdirAll(filepath.Dir(vmstatePath), 0o755); mkErr != nil {
 			return nil, status.Errorf(codes.Internal, "prepare vmstate dir: %v", mkErr)
 		}
-		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath)
+		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath, captureFW)
 		snapType = "memory"
+		// CreateLiveSnapshot cuts the disk overlay over before capturing/saving, so
+		// on failure the overlay may already exist — treat as created for cleanup.
+		snapCreated = true
 	} else {
-		sizeBytes, err = s.virt.CreateSnapshot(req.VmName, req.Name)
+		if sizeBytes, err = s.virt.CreateSnapshot(req.VmName, req.Name); err == nil {
+			snapCreated = true
+			// VM is stopped here (running+firmware was refused above), so capturing
+			// after the disk snapshot is race-free.
+			err = captureFW()
+		}
 	}
 	if err != nil {
+		// The disk overlay may already have cut over (a live snapshot always cuts
+		// the overlay before the RAM save; a disk snapshot cuts on success) while
+		// capture/RAM-save failed. A bare metadata delete would strand the VM on an
+		// untracked overlay, so reconcile the active disk path and record the
+		// snapshot ERRORED — visible + deletable, and DeleteSnapshot flattens an
+		// error record even when it's memory-typed. Drop any partial firmware
+		// sidecar (G1).
+		if snapCreated {
+			s.reconcileDiskPaths(ctx, req.VmName)
+			if hasFW {
+				_ = os.Remove(lv.SnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.Name))
+			}
+			_ = corrosion.InsertSnapshot(ctx, s.db, corrosion.SnapshotRecord{
+				VMName: req.VmName, HostName: s.hostName, Name: req.Name, State: "error",
+				Type: snapType, VMStatePath: vmstatePath, SizeBytes: sizeBytes,
+			})
+		}
 		return nil, status.Errorf(codes.Internal, "create snapshot: %v", err)
 	}
 
@@ -168,6 +247,9 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "snapshot.restore", "operator"); err != nil {
 		return nil, err
 	}
+	if !validRestoreName(req.SnapshotName) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid snapshot name %q", req.SnapshotName)
+	}
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -187,16 +269,49 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	// Branch on snapshot type: a memory snapshot restores RAM too, and its
 	// vmstate file is host-local — refuse if the VM has since moved hosts.
 	snap, _ := corrosion.GetSnapshot(ctx, s.db, req.VmName, req.SnapshotName)
+	// An errored snapshot is a failed/partial capture (no consistent disk+RAM+
+	// firmware point) — refuse to restore it rather than booting an inconsistent
+	// state; the operator should delete it (which flattens its overlay).
+	if snap != nil && snap.State == "error" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"snapshot %q is in error state (a failed capture) and cannot be restored — delete it instead", req.SnapshotName)
+	}
+	// Restore firmware state (NVRAM + swtpm) from the snapshot sidecar before the
+	// domain is redefined, so reverted disks/RAM + firmware are a consistent set
+	// (G1). No-op when the snapshot captured none (non-firmware VM).
+	fwUUID := parseFirmwareSpec(vm.Spec).UUID
+	hasFW := usesFirmwareState(vm.Spec)
+	restoreFW := func() error {
+		bundle := lv.SnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.SnapshotName)
+		f, err := os.Open(bundle)
+		if os.IsNotExist(err) {
+			if hasFW {
+				// A Secure-Boot/vTPM VM whose snapshot captured no firmware (taken
+				// before vTPM support, or the sidecar was lost) cannot be reverted
+				// safely — reverting disk/RAM while keeping current/missing TPM
+				// would desync BitLocker. Refuse rather than silently corrupt.
+				return status.Errorf(codes.FailedPrecondition,
+					"snapshot %q has no captured firmware state; cannot safely revert Secure Boot / vTPM VM %q", req.SnapshotName, req.VmName)
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return lv.ReadFirmwareBundle(f, s.dataDir, req.VmName, fwUUID)
+	}
+
 	if snap != nil && snap.Type == "memory" && snap.VMStatePath != "" {
 		if snap.HostName != s.hostName {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"memory snapshot %q was taken on host %q; the VM is now on %q and its RAM image is not available here — use a disk-only snapshot or take a new one",
 				req.SnapshotName, snap.HostName, s.hostName)
 		}
-		if err := s.virt.RevertToLiveSnapshot(req.VmName, req.SnapshotName, snap.VMStatePath); err != nil {
+		if err := s.virt.RevertToLiveSnapshot(req.VmName, req.SnapshotName, snap.VMStatePath, restoreFW); err != nil {
 			return nil, status.Errorf(codes.Internal, "revert to memory snapshot: %v", err)
 		}
-	} else if err := s.virt.RevertToSnapshot(req.VmName, req.SnapshotName); err != nil {
+	} else if err := s.virt.RevertToSnapshot(req.VmName, req.SnapshotName, restoreFW); err != nil {
 		return nil, status.Errorf(codes.Internal, "revert to snapshot: %v", err)
 	}
 
@@ -222,6 +337,9 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "snapshot.delete", "operator"); err != nil {
 		return nil, err
 	}
+	if !validRestoreName(req.SnapshotName) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid snapshot name %q", req.SnapshotName)
+	}
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -243,7 +361,12 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// metadata-only delete; a flatten failure falls back to it too, so the
 	// snapshot is always removable.
 	existing, _ := corrosion.ListSnapshots(ctx, s.db, req.VmName)
-	flatten := vm.State == "running" && len(existing) <= 1 && (snap == nil || snap.Type != "memory")
+	// An errored snapshot (e.g. a failed --with-memory capture that still cut the
+	// disk overlay over) has no usable RAM image — its only residue is the disk
+	// overlay, so it must be flattened on delete even though Type=="memory";
+	// otherwise the VM is left stranded on an untracked overlay chain (G1).
+	flattenable := snap == nil || snap.Type != "memory" || snap.State == "error"
+	flatten := vm.State == "running" && len(existing) <= 1 && flattenable
 
 	var delErr error
 	if flatten {
@@ -275,6 +398,10 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 		if rmErr := os.Remove(snap.VMStatePath); rmErr != nil && !os.IsNotExist(rmErr) {
 			slog.Warn("snapshot delete: remove vmstate file", "path", snap.VMStatePath, "error", rmErr)
 		}
+	}
+	// Remove the firmware-state sidecar (G1), if any (best-effort).
+	if rmErr := os.Remove(lv.SnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.SnapshotName)); rmErr != nil && !os.IsNotExist(rmErr) {
+		slog.Warn("snapshot delete: remove firmware sidecar", "vm", req.VmName, "snap", req.SnapshotName, "error", rmErr)
 	}
 
 	// Deleting an external snapshot makes libvirt consolidate the chain, often

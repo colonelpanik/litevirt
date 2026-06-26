@@ -113,7 +113,7 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 	// resolved spec and boot it against the overlay so the operator
 	// needn't run virsh by hand.
 	if req.AutoStart {
-		name, err := s.autoDefineRestoredVM(ctx, req, manifest, req.TargetPath, stream.Send)
+		name, rootDev, err := s.autoDefineRestoredVM(ctx, req, repo, manifest, req.TargetPath, stream.Send)
 		if err != nil {
 			return err
 		}
@@ -122,7 +122,7 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 			// deferred Stop tears the NBD server down. A failed/partial
 			// pull falls through to the operator-driven keep-open path
 			// rather than bricking a half-pulled disk.
-			if s.driveBlockpull(ctx, name, stream.Send) {
+			if s.driveBlockpull(ctx, name, rootDev, stream.Send) {
 				return nil
 			}
 		}

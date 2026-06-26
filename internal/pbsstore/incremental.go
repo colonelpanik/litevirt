@@ -73,9 +73,10 @@ func PushIncremental(
 		DiskName:   opts.DiskName,
 		Timestamp:  opts.Timestamp,
 		BasedOn:    parent.Timestamp,
-		BitmapName: opts.BitmapName,
-		VMSpecJSON: opts.VMSpecJSON,
-		DomainXML:  opts.DomainXML,
+		BitmapName:     opts.BitmapName,
+		VMSpecJSON:     opts.VMSpecJSON,
+		DomainXML:      opts.DomainXML,
+		FirmwareChunks: opts.FirmwareChunks,
 	}
 	buf := make([]byte, ChunkSize)
 	var prog PushProgress
@@ -165,9 +166,10 @@ func pushIncrementalSeek(
 		DiskName:   opts.DiskName,
 		Timestamp:  opts.Timestamp,
 		BasedOn:    parent.Timestamp,
-		BitmapName: opts.BitmapName,
-		VMSpecJSON: opts.VMSpecJSON,
-		DomainXML:  opts.DomainXML,
+		BitmapName:     opts.BitmapName,
+		VMSpecJSON:     opts.VMSpecJSON,
+		DomainXML:      opts.DomainXML,
+		FirmwareChunks: opts.FirmwareChunks,
 	}
 	buf := make([]byte, ChunkSize)
 	var prog PushProgress

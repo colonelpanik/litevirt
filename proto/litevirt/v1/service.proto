@@ -121,6 +121,9 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     optional bool  guest_agent     = 13;
     optional int32 min_memory_mib  = 14;
     optional int32 max_memory_mib  = 15;
+    optional bool  secure_boot     = 16;
+    optional bool  tpm             = 17;
+    bool           force           = 18;  // allow toggling secure_boot/tpm even when firmware state exists
 }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
@@ -1196,6 +1199,17 @@ message DiskStub {
     int64  size_bytes  = 2;  // size hint for pre-creation (0 = create empty sparse file)
 }
 
+// EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
+// (UEFI NVRAM + swtpm tar) to a cold-migration target so libvirt can define the
+// domain there with its BitLocker-binding state intact (G1).
+message EnsureFirmwareStateRequest {
+    string vm_name    = 1;
+    string uuid       = 2;  // stable domain UUID → target swtpm dir
+    bytes  bundle     = 3;  // firmware-state bundle (same format as the backup/snapshot sidecar)
+    string domain_xml = 4;  // if set, DEFINE (shut off) the domain on the target after materializing firmware, so it's startable (G1)
+    string source_firmware_fingerprint = 5;  // source's dataDir + OVMF path layout; the verbatim domain_xml is only portable if it matches the target's (G1)
+}
+
 // CleanupMigrationArtifactsRequest removes the stub disks + cloud-init ISO that
 // EnsureDisks/EnsureCloudInit pre-created on a migration target, after the
 // migration failed (the VM never got defined there, so they are orphaned).
@@ -1203,6 +1217,8 @@ message CleanupMigrationArtifactsRequest {
     string vm_name              = 1;
     repeated string disk_paths  = 2;  // stub disk files to remove on this (target) host
     bool   remove_cloud_init    = 3;  // also remove the cloud-init ISO for vm_name
+    string firmware_uuid        = 4;  // if set, wipe the pushed firmware state (NVRAM+swtpm) for vm_name (G1)
+    bool   undefine_domain      = 5;  // if set, undefine a domain this host pre-defined for a failed firmware migration (G1)
 }
 
 message SyncVTEPRequest {
@@ -1554,6 +1570,7 @@ service LiteVirt {
     // ── Internal: Migration helpers ──
     rpc EnsureCloudInit(EnsureCloudInitRequest)    returns (google.protobuf.Empty);
     rpc EnsureDisks(EnsureDisksRequest)            returns (google.protobuf.Empty);
+    rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (google.protobuf.Empty);
     rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
 
     // ── Internal: State Sync ──

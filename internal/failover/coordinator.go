@@ -590,6 +590,21 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// Step 5: Reschedule VMs using placement engine for proper resource-aware scheduling.
 	fallbackIdx := 0
 	for _, vm := range vms {
+		// A Secure-Boot/vTPM VM's firmware state (UEFI NVRAM + swtpm) is host-local,
+		// so it died with the fenced host — neither a reschedule (would boot a fresh
+		// TPM) nor a disk-only replica promotion can recover it. Skip automatic
+		// failover and surface it; recovery is an explicit restore from a backup
+		// that carried the firmware (G1).
+		if vmUsesFirmwareState(vm) {
+			slog.Warn("failover: skipping Secure Boot / vTPM VM — firmware state was host-local and died with the host; restore from backup",
+				"vm", vm.Name, "host", h.Name)
+			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+				ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+				Target: vm.Name, Detail: "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with " + h.Name + ")", Result: "skipped",
+			})
+			continue
+		}
+
 		// Auto-promotion is an explicit per-schedule DR opt-in, so it takes
 		// precedence over the VM's on_host_failure policy (which defaults to
 		// "none" for `lv run` VMs). A VM on the fenced host's local storage has
@@ -799,6 +814,19 @@ func vmFailurePolicy(vm corrosion.VMRecord) string {
 		_ = json.Unmarshal([]byte(vm.Spec), &spec)
 	}
 	return spec.OnHostFailure
+}
+
+// vmUsesFirmwareState reports whether a VM uses Secure Boot or a vTPM — i.e. has
+// host-local firmware state (NVRAM + swtpm) that can't survive its host dying (G1).
+func vmUsesFirmwareState(vm corrosion.VMRecord) bool {
+	var spec struct {
+		SecureBoot bool `json:"secure_boot"`
+		Tpm        bool `json:"tpm"`
+	}
+	if vm.Spec != "" {
+		_ = json.Unmarshal([]byte(vm.Spec), &spec)
+	}
+	return spec.SecureBoot || spec.Tpm
 }
 
 // newID generates a short random hex ID.

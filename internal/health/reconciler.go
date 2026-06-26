@@ -31,7 +31,12 @@ type Reconciler struct {
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
+	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
 }
+
+// SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1) so the
+// reconciler renders the same firmware as CreateVM when it rebuilds a domain.
+func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 
 // NewReconciler creates a VM reconciler for the local host.
 func NewReconciler(hostName, dataDir string, db *corrosion.Client, virt *lv.Client) *Reconciler {
@@ -260,6 +265,8 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			if err := r.virt.DestroyDomain(domName); err != nil {
 				slog.Warn("reconciler: destroy stale domain failed", "vm", domName, "error", err)
 			}
+			// wipe by design: the VM now lives on another host; this is a dead
+			// local copy (the authoritative firmware state travels with it).
 			if err := r.virt.UndefineDomain(domName, false); err != nil {
 				slog.Warn("reconciler: undefine stale domain failed", "vm", domName, "error", err)
 			}
@@ -300,9 +307,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "domain already present")
 			return
 		}
-		// Domain exists but not running — destroy and redefine cleanly.
+		// Domain exists but not running — destroy and redefine the SAME VM cleanly.
+		// KEEP firmware state: the redefine below reuses the NVRAM/swtpm; wiping
+		// here would break an SB/vTPM guest on the next start (G1).
 		r.virt.DestroyDomain(vm.Name)
-		r.virt.UndefineDomain(vm.Name, false)
+		r.virt.UndefineDomainPreservingState(vm.Name)
 	}
 
 	corrosion.UpdateVMState(ctx, r.db, vm.Name, "starting", "reconciler")
@@ -449,6 +458,27 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	}
 	if vmCfg.Firmware == "" {
 		vmCfg.Firmware = "uefi"
+	}
+	// Secure Boot + vTPM (G1): stable UUID makes the swtpm state path
+	// (/var/lib/libvirt/swtpm/<uuid>/) deterministic; render the same firmware
+	// CreateVM did. A vTPM VM whose state isn't present on this host can't be
+	// rebuilt faithfully — fail clearly (state=error) rather than booting with a
+	// fresh TPM and silently breaking BitLocker.
+	vmCfg.UUID = spec.Uuid
+	r.firmware.ApplyTo(&vmCfg, r.dataDir, vm.Name, spec.SecureBoot, spec.Tpm)
+	if spec.Tpm && !lv.HasTPMState(spec.Uuid) {
+		slog.Error("reconciler: vTPM VM has no local TPM state; refusing to start with a fresh TPM", "vm", vm.Name)
+		corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", "vTPM state missing on this host (would break BitLocker)")
+		return
+	}
+	// Same rule for NVRAM (Secure Boot keys / boot entries): a UEFI firmware VM
+	// whose vars aren't present here can't be rebuilt faithfully — refuse rather
+	// than redefine with fresh vars from the template (would lose enrolled keys).
+	uefiFW := spec.Firmware == "uefi" || spec.Firmware == ""
+	if (spec.SecureBoot || spec.Tpm) && uefiFW && !lv.HasNvram(r.dataDir, vm.Name) {
+		slog.Error("reconciler: firmware VM has no local UEFI NVRAM; refusing to start with fresh vars", "vm", vm.Name)
+		corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", "UEFI NVRAM missing on this host (would lose Secure Boot keys)")
+		return
 	}
 	if r := spec.Resources; r != nil {
 		vmCfg.HugePages = r.Hugepages

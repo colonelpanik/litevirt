@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -84,7 +85,25 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			}
 		}
 	}
-	if vm.State != "running" {
+	// Secure Boot / vTPM firmware-state travel (G1). A firmware VM's NVRAM + swtpm
+	// are host-local and bind BitLocker, so they need a CONSISTENT capture:
+	//   - LIVE is refused: libvirt's native swtpm/NVRAM carry is not yet validated
+	//     on this build, and we must not wipe the source copy on an unverified
+	//     carry (a fresh-TPM target would brick BitLocker). Use cold migration.
+	//   - COLD requires the VM STOPPED: its firmware can't be captured at a single
+	//     instant while the guest keeps mutating TPM state, so we copy it quiescent.
+	fwSpec := parseFirmwareSpec(vm.Spec)
+	fwVM := fwSpec.SecureBoot || fwSpec.Tpm
+	if fwVM {
+		if req.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
+			return status.Errorf(codes.FailedPrecondition,
+				"Secure Boot / vTPM VM %q must be migrated cold (--strategy=cold); live firmware carry is not yet a validated path", req.VmName)
+		}
+		if vm.State != "stopped" {
+			return status.Errorf(codes.FailedPrecondition,
+				"stop Secure Boot / vTPM VM %q before migrating it — its firmware state can't be captured consistently while running", req.VmName)
+		}
+	} else if vm.State != "running" {
 		return status.Errorf(codes.FailedPrecondition, "VM %q must be running to migrate (state: %s)", req.VmName, vm.State)
 	}
 	// Resolve target host
@@ -94,6 +113,20 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	}
 	if targetHost.State != "active" {
 		return status.Errorf(codes.FailedPrecondition, "target host %q is not active", req.TargetHost)
+	}
+
+	// Gate the explicit target on the matching host capability (mirrors what
+	// placement does for auto placement) — a firmware VM that lands on a
+	// non-capable host can't define.
+	if fwVM {
+		if fwSpec.Tpm && targetHost.Labels[corrosion.LabelTPMCapable] != "true" {
+			return status.Errorf(codes.FailedPrecondition,
+				"target host %q is not vTPM-capable (no swtpm); cannot migrate vTPM VM %q there", req.TargetHost, req.VmName)
+		}
+		if fwSpec.SecureBoot && targetHost.Labels[corrosion.LabelSecureBootCapable] != "true" {
+			return status.Errorf(codes.FailedPrecondition,
+				"target host %q is not Secure-Boot-capable (no secboot OVMF); cannot migrate VM %q there", req.TargetHost, req.VmName)
+		}
 	}
 
 	// Snapshot + local-disk preconditions. A VM running on a snapshot overlay
@@ -109,7 +142,11 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	}
 	hasLocal := false
 	for _, d := range disks {
-		if d.StorageType == "local" {
+		// Both local and dir keep the disk as a host-local file (same path = two
+		// distinct files on two hosts) — match the source-cleanup predicate so a
+		// dir-pool VM isn't mistaken for shared storage and migrated without its
+		// disk (G1 #3 / pre-existing for dir pools).
+		if isHostLocalDiskDriver(d.StorageType) {
 			hasLocal = true
 			break
 		}
@@ -222,6 +259,17 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// libvirt validates all file paths in the domain XML before block copy starts.
 	if withStorage {
 		s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name)
+	}
+
+	// Firmware-state travel (G1): a Secure-Boot/vTPM VM is migrated cold from a
+	// STOPPED state WITHOUT libvirt runtime migration — that path can't carry the
+	// host-local NVRAM/swtpm and would need a running (or OFFLINE-flagged) domain.
+	// Instead push the quiescent firmware to the target, hand the VM over with its
+	// state preserved (the target defines+starts it on demand with firmware
+	// present), and clean up the source. Returns early — the runtime-migration
+	// machinery below is for running VMs only.
+	if fwVM {
+		return s.coldMigrateFirmwareVM(ctx, vm, targetHost, fwSpec, send)
 	}
 
 	// Hot-detach SR-IOV VFs before migration.
@@ -365,8 +413,11 @@ poll:
 						}
 					}
 				}
+				// (Firmware VMs never reach this runtime-migration path — they take
+				// the stopped cold-move in coldMigrateFirmwareVM — so no firmware
+				// cleanup is needed here.)
 				cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 15*time.Second)
-				s.cleanupMigrationArtifactsOnTarget(cleanupCtx, req.TargetHost, vm.Name, stubPaths)
+				s.cleanupMigrationArtifactsOnTarget(cleanupCtx, req.TargetHost, vm.Name, stubPaths, "")
 				cancelCleanup()
 
 				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
@@ -425,6 +476,9 @@ poll:
 			}
 		}
 	}
+
+	// (Firmware-state cleanup is handled in coldMigrateFirmwareVM, which firmware
+	// VMs take instead of this runtime-migration path — see the early return above.)
 
 	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
 	if len(detachedVFs) > 0 {
@@ -621,14 +675,233 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	return &emptypb.Empty{}, nil
 }
 
+// EnsureFirmwareState materializes a Secure-Boot/vTPM VM's firmware-state bundle
+// (NVRAM + swtpm) pushed by a cold-migration source, so libvirt can define the
+// domain here with its BitLocker-binding state intact (G1). Mirrors EnsureDisks.
+func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmwareStateRequest) (*emptypb.Empty, error) {
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return nil, err
+	}
+	if req.VmName == "" || len(req.Bundle) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "vm_name and a non-empty firmware bundle are required")
+	}
+	// vm_name + uuid index into on-disk firmware paths, so validate them to a safe
+	// charset (no path traversal). And refuse to materialize state under a domain
+	// that already exists here — this RPC is for a migration TARGET that hasn't
+	// defined the VM yet; clobbering a live VM's firmware would be destructive (G1).
+	if !validRestoreName(req.VmName) || (req.Uuid != "" && !validRestoreName(req.Uuid)) {
+		return nil, status.Error(codes.InvalidArgument, "invalid vm_name or uuid")
+	}
+	if s.virt != nil && s.virt.DomainExists(req.VmName) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"refusing to materialize firmware over already-defined domain %q", req.VmName)
+	}
+	if err := lv.ReadFirmwareBundle(bytes.NewReader(req.Bundle), s.dataDir, req.VmName, req.Uuid); err != nil {
+		return nil, status.Errorf(codes.Internal, "materialize firmware state for %q: %v", req.VmName, err)
+	}
+	// Define (shut off) the domain from the source's own XML now that its firmware
+	// is materialized, so the migrated VM is immediately startable here (a plain
+	// reassigned-stopped VM is otherwise undefined on this host, and StartDomain /
+	// the reconciler won't rebuild it). DefineDomain does NOT start it — the VM
+	// stays stopped as intended (G1).
+	if req.DomainXml != "" && s.virt != nil {
+		// The XML embeds the SOURCE's absolute firmware paths (loader / VARS
+		// template / NVRAM). It's only portable to a host with an identical layout,
+		// so refuse a fingerprint mismatch rather than define a domain pointing at
+		// the source host's paths.
+		if req.SourceFirmwareFingerprint != "" && req.SourceFirmwareFingerprint != s.firmwareLayoutFingerprint() {
+			lv.WipeFirmwareState(s.dataDir, req.VmName, req.Uuid)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"firmware path layout differs between source and target (dataDir/OVMF paths); cold firmware migration requires an identical layout on both hosts")
+		}
+		// Validate the XML identity matches the request — never define a mismatched
+		// or unrelated domain via this RPC.
+		if xn, xu := domainIdentity(req.DomainXml); xn != req.VmName || (req.Uuid != "" && xu != req.Uuid) {
+			lv.WipeFirmwareState(s.dataDir, req.VmName, req.Uuid)
+			return nil, status.Errorf(codes.InvalidArgument,
+				"domain XML identity (name=%q uuid=%q) does not match request (name=%q uuid=%q)", xn, xu, req.VmName, req.Uuid)
+		}
+		if err := s.virt.DefineDomain(req.DomainXml); err != nil {
+			// Roll back the firmware we just materialized so a retry is clean.
+			lv.WipeFirmwareState(s.dataDir, req.VmName, req.Uuid)
+			return nil, status.Errorf(codes.Internal, "define migrated domain %q: %v", req.VmName, err)
+		}
+	}
+	slog.Info("firmware state received for migration", "vm", req.VmName, "bytes", len(req.Bundle), "defined", req.DomainXml != "")
+	return &emptypb.Empty{}, nil
+}
+
+// ensureFirmwareStateOnTarget captures this host's firmware-state bundle for a
+// Secure-Boot/vTPM VM and pushes it to the cold-migration target before the
+// libvirt migrate, so the target defines the domain with the BitLocker-binding
+// state present. Unlike disks, this is NOT best-effort — a firmware VM that
+// migrates without its state would boot a fresh TPM, so a failure aborts (G1).
+func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML string) error {
+	// Per-component preflight: never push a PARTIAL bundle (WriteFirmwareBundle
+	// alone would accept NVRAM-only or swtpm-only) — that restores a fresh TPM.
+	if err := s.firmwarePresent(vmName, fs); err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	has, err := lv.WriteFirmwareBundle(s.dataDir, vmName, fs.UUID, &buf)
+	if err != nil {
+		return status.Errorf(codes.Internal, "capture firmware state for %q: %v", vmName, err)
+	}
+	if !has {
+		return status.Errorf(codes.FailedPrecondition,
+			"firmware state for %q is not present on this host; cannot migrate it consistently", vmName)
+	}
+	client, conn, err := s.peerClient(ctx, targetHost)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "cannot reach target host %s to push firmware: %v", targetHost, err)
+	}
+	defer conn.Close()
+	if _, err := client.EnsureFirmwareState(ctx, &pb.EnsureFirmwareStateRequest{
+		VmName: vmName, Uuid: fs.UUID, Bundle: buf.Bytes(), DomainXml: domainXML,
+		SourceFirmwareFingerprint: s.firmwareLayoutFingerprint(),
+	}); err != nil {
+		return status.Errorf(codes.Internal, "push firmware state to %s: %v", targetHost, err)
+	}
+	return nil
+}
+
+// coldMigrateFirmwareVM moves a STOPPED Secure-Boot/vTPM VM to targetHost WITHOUT
+// libvirt runtime migration: it pushes the quiescent firmware bundle, hands the
+// VM over with its stopped state preserved (the target defines+starts it on
+// demand with firmware present), and cleans up the source. Requires shared
+// storage — a stopped VM's host-local disk can't be block-copied here (G1).
+func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMRecord, targetHost *corrosion.HostRecord, fwSpec firmwareSpec, send func(pb.MigratePhase, float32, float32) error) error {
+	start := time.Now()
+	if s.virt == nil {
+		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
+	}
+	// Must read disks successfully — proceeding on an error would skip the
+	// host-local refusal AND the disk-ownership updates, diverging VM/disk records.
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "query disks for %q: %v", vm.Name, err)
+	}
+	for _, d := range disks {
+		if isHostLocalDiskDriver(d.StorageType) {
+			return status.Errorf(codes.FailedPrecondition,
+				"Secure Boot / vTPM VM %q has a host-local disk (%s) and can't be migrated while stopped — move it to shared storage first (host-local firmware-VM migration is a follow-up)", vm.Name, d.StorageType)
+		}
+	}
+	// PCI/hostdev passthrough isn't carried by this path — the source XML embeds
+	// source host PCI addresses that won't be valid (or assigned) on the target.
+	// Refuse for now rather than define a domain with stale hostdevs (G1).
+	if assigned, _ := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); len(assigned) > 0 {
+		for _, d := range assigned {
+			if d.VMName == vm.Name {
+				return status.Errorf(codes.FailedPrecondition,
+					"Secure Boot / vTPM VM %q has PCI passthrough device %s — migrating firmware VMs with hostdevs is not supported yet", vm.Name, d.Address)
+			}
+		}
+	}
+	// Dump the source's (shut-off) domain XML so the target can DEFINE the same
+	// domain — a plain reassigned-stopped VM would otherwise be undefined on the
+	// target and unstartable. Shared-storage disk paths + dataDir-relative NVRAM +
+	// the UUID-keyed swtpm dir are identical across hosts, so the XML is portable.
+	domXML, err := s.virt.DumpXML(vm.Name)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot dump domain XML for %q (it must be defined to migrate its firmware): %v", vm.Name, err)
+	}
+	_ = send(pb.MigratePhase_MIGRATE_COPYING, 0, 0)
+
+	// Push the quiescent firmware to the target AND define the domain there (the
+	// handler materializes firmware then DefineDomain — shut off, not started).
+	// Per-component preflight is inside. Source is untouched on failure.
+	if err := s.ensureFirmwareStateOnTarget(ctx, targetHost.Name, vm.Name, fwSpec, domXML); err != nil {
+		return err
+	}
+
+	// Repoint the (shared-storage) disk records at the target — same path. Treat
+	// these as part of the handoff: on ANY failure (mid-loop or the VM-host flip),
+	// roll back EVERY disk we already moved and the target firmware, and abort, so
+	// VM/disk records never diverge and nothing on the source is lost.
+	rollbackDisks := func() {
+		for _, d := range disks {
+			_ = corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, d.DiskName, s.hostName, d.Path)
+		}
+	}
+	for _, d := range disks {
+		if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, d.DiskName, targetHost.Name, d.Path); err != nil {
+			rollbackDisks() // includes the ones updated so far (idempotent re-point to source)
+			s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
+			return status.Errorf(codes.Internal, "repoint disk %q to %s: %v", d.DiskName, targetHost.Name, err)
+		}
+	}
+
+	// Hand the VM to the target, PRESERVING its (stopped) state. On failure, roll
+	// the disks AND target back and abort (source still owns it + is intact).
+	if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
+		rollbackDisks()
+		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
+		return status.Errorf(codes.Internal, "reassign VM %q to %s: %v", vm.Name, targetHost.Name, err)
+	}
+
+	// Clean up the source ONLY after a fully successful handoff: undefine the
+	// shut-off domain, then wipe the now-orphaned firmware. Do NOT wipe firmware
+	// if the undefine fails — keep the source copy as a recoverable fallback and
+	// surface the leftover (the VM is already correctly running on the target).
+	if s.virt.DomainExists(vm.Name) {
+		if err := s.virt.UndefineDomainPreservingState(vm.Name); err != nil {
+			slog.Error("cold firmware migration: source domain undefine failed — leaving source firmware as a fallback; clean up manually",
+				"vm", vm.Name, "host", s.hostName, "error", err)
+			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "warn", "migrated to "+targetHost.Name+" but source domain undefine failed (firmware retained on source)")
+		} else {
+			lv.WipeFirmwareState(s.dataDir, vm.Name, fwSpec.UUID)
+		}
+	} else {
+		lv.WipeFirmwareState(s.dataDir, vm.Name, fwSpec.UUID)
+	}
+
+	_ = send(pb.MigratePhase_MIGRATE_CUTOVER, 100, 0)
+	_ = send(pb.MigratePhase_MIGRATE_COMPLETING, 100, 0)
+	s.recordMigrationMetrics("cold", "success", time.Since(start), 0, 0)
+	slog.Info("cold firmware migration complete", "vm", vm.Name, "from", s.hostName, "to", targetHost.Name, "state", vm.State)
+	s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok", "from="+s.hostName+" to="+targetHost.Name+" (cold firmware, "+vm.State+")")
+	s.audit(ctx, "vm.migrate", vm.Name, "from="+s.hostName+" to="+targetHost.Name+" (cold firmware)", "ok")
+	return nil
+}
+
+// rollbackFirmwareTarget best-effort tears down the firmware + defined domain a
+// failed cold firmware migration left on the target (undefine + wipe), so the
+// target isn't left with an orphan and a retry is clean (G1).
+func (s *Server) rollbackFirmwareTarget(targetHost, vmName, uuid string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	client, conn, err := s.peerClient(ctx, targetHost)
+	if err != nil {
+		slog.Warn("rollbackFirmwareTarget: cannot reach target", "host", targetHost, "vm", vmName, "error", err)
+		return
+	}
+	defer conn.Close()
+	if _, err := client.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{
+		VmName: vmName, FirmwareUuid: uuid, UndefineDomain: true,
+	}); err != nil {
+		slog.Warn("rollbackFirmwareTarget: cleanup failed", "host", targetHost, "vm", vmName, "error", err)
+	}
+}
+
 // CleanupMigrationArtifacts removes the stub disks + cloud-init ISO that this
 // host pre-created as a migration target, after the migration failed. The VM
 // was never defined here (PersistDest only persists on success), so the files
 // are orphaned; leaving them leaks space and shadows a later retry. Best-effort
 // per file — a missing file is not an error.
 func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return nil, err
+	}
 	for _, p := range req.DiskPaths {
 		if p == "" {
+			continue
+		}
+		// Only ever remove paths under our data dir — never an arbitrary path a
+		// caller hands us (this RPC would otherwise delete any file the daemon can).
+		if !withinDir(s.dataDir, p) {
+			slog.Warn("cleanup migration artifacts: refusing to remove path outside dataDir", "vm", req.VmName, "path", p)
 			continue
 		}
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
@@ -641,12 +914,29 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 			slog.Warn("cleanup migration artifacts: remove cloud-init iso", "vm", req.VmName, "path", iso, "error", err)
 		}
 	}
+	// Undefine a domain this host pre-defined for a failed firmware migration,
+	// BEFORE wiping its firmware (so we never wipe firmware out from under a still-
+	// defined domain). If the undefine FAILS, keep the firmware as a recoverable
+	// fallback and surface the error rather than stranding a defined domain whose
+	// firmware we erased (G1).
+	if req.UndefineDomain && req.VmName != "" && s.virt != nil && s.virt.DomainExists(req.VmName) {
+		if err := s.virt.UndefineDomainPreservingState(req.VmName); err != nil {
+			slog.Warn("cleanup migration artifacts: undefine pre-defined domain", "vm", req.VmName, "error", err)
+			return nil, status.Errorf(codes.Internal,
+				"undefine domain %q failed; left firmware in place (recoverable): %v", req.VmName, err)
+		}
+	}
+	// Wipe firmware state we pushed to this (failed) target so it can't be
+	// adopted by a retry / orphan the swtpm tree (G1).
+	if req.FirmwareUuid != "" {
+		lv.WipeFirmwareState(s.dataDir, req.VmName, req.FirmwareUuid)
+	}
 	return &emptypb.Empty{}, nil
 }
 
 // cleanupMigrationArtifactsOnTarget best-effort removes the stubs + ISO the
 // target pre-created, after a failed migration. Never blocks/fails the caller.
-func (s *Server) cleanupMigrationArtifactsOnTarget(ctx context.Context, targetHost, vmName string, diskPaths []string) {
+func (s *Server) cleanupMigrationArtifactsOnTarget(ctx context.Context, targetHost, vmName string, diskPaths []string, firmwareUUID string) {
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
 		slog.Warn("cleanupMigrationArtifactsOnTarget: cannot reach host", "host", targetHost, "error", err)
@@ -657,6 +947,7 @@ func (s *Server) cleanupMigrationArtifactsOnTarget(ctx context.Context, targetHo
 		VmName:          vmName,
 		DiskPaths:       diskPaths,
 		RemoveCloudInit: true,
+		FirmwareUuid:    firmwareUUID,
 	}); err != nil {
 		slog.Warn("cleanupMigrationArtifactsOnTarget: cleanup failed", "host", targetHost, "vm", vmName, "error", err)
 	}

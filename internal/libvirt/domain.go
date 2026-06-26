@@ -77,6 +77,26 @@ func (c *Client) UndefineDomain(name string, removeStorage bool) error {
 	return nil
 }
 
+// UndefineDomainPreservingState undefines a domain WITHOUT deleting its NVRAM or
+// vTPM state (G1). Use for redefine-class operations that tear the domain down
+// only to immediately redefine the SAME VM (snapshot revert, UpdateVM redefine,
+// cutover rename) — the default UndefineDomain passes DomainUndefineNvram, which
+// would delete the per-VM UEFI vars and break a Secure-Boot/vTPM guest on the
+// next start. (libvirt requires either Nvram or KeepNvram to undefine a UEFI
+// domain; KeepTpm is belt-and-suspenders — swtpm state is never touched unless
+// DomainUndefineTpm is set.)
+func (c *Client) UndefineDomainPreservingState(name string) error {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	flags := golibvirt.DomainUndefineKeepNvram | golibvirt.DomainUndefineKeepTpm
+	if err := c.virt.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(flags)); err != nil {
+		return fmt.Errorf("undefine (keep state) domain %s: %w", name, err)
+	}
+	return nil
+}
+
 // DomainState returns the current coarse lifecycle state of a domain
 // (running | stopping | stopped | error | unknown). Paused, shut-off and
 // pm-suspended all collapse to "stopped" here — callers that need to tell those

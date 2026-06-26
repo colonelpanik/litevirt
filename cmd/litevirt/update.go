@@ -30,6 +30,9 @@ func newUpdateCmd() *cobra.Command {
 		guestAgent bool
 		minMem     int32
 		maxMem     int32
+		secureBoot bool
+		tpm        bool
+		force      bool
 	)
 	cmd := &cobra.Command{
 		Use:   "update <vm>",
@@ -47,7 +50,8 @@ VM must be stopped for those.`,
 			for _, n := range []string{"cpu", "memory", "cpu-mode", "disable-vnc",
 				"restart", "restart-max-attempts", "restart-delay", "restart-window",
 				"onboot", "startup-order", "start-delay", "stop-delay",
-				"machine", "firmware", "guest-agent", "min-mem", "max-mem"} {
+				"machine", "firmware", "guest-agent", "min-mem", "max-mem",
+				"secure-boot", "tpm"} {
 				if f.Changed(n) {
 					any = true
 					break
@@ -84,6 +88,13 @@ VM must be stopped for those.`,
 			if f.Changed("max-mem") {
 				req.MaxMemoryMib = &maxMem
 			}
+			if f.Changed("secure-boot") {
+				req.SecureBoot = &secureBoot
+			}
+			if f.Changed("tpm") {
+				req.Tpm = &tpm
+			}
+			req.Force = force
 			// Live metadata: only send what changed (presence-detected).
 			if f.Changed("restart") || f.Changed("restart-max-attempts") ||
 				f.Changed("restart-delay") || f.Changed("restart-window") {
@@ -136,5 +147,8 @@ VM must be stopped for those.`,
 	cmd.Flags().BoolVar(&guestAgent, "guest-agent", false, "Enable the QEMU guest agent (VM must be stopped)")
 	cmd.Flags().Int32Var(&minMem, "min-mem", 0, "Minimum balloon memory in MiB (VM must be stopped)")
 	cmd.Flags().Int32Var(&maxMem, "max-mem", 0, "Maximum balloon memory in MiB (VM must be stopped)")
+	cmd.Flags().BoolVar(&secureBoot, "secure-boot", false, "Enable/disable UEFI Secure Boot (VM must be stopped; --force if firmware state exists)")
+	cmd.Flags().BoolVar(&tpm, "tpm", false, "Enable/disable the emulated TPM 2.0 (VM must be stopped; --force if TPM state exists)")
+	cmd.Flags().BoolVar(&force, "force", false, "Allow toggling secure-boot/tpm even when firmware state exists")
 	return cmd
 }

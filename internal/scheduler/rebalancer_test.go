@@ -146,6 +146,27 @@ func TestRebalancer_RespectsNoMigrate(t *testing.T) {
 	}
 }
 
+// TestRebalancer_SkipsFirmwareVMs verifies a Secure-Boot/vTPM VM is never
+// proposed for a move (it migrates cold only; the executor live-migrates, so a
+// proposal would be rejected at apply) — even on an overloaded cluster (G1).
+func TestRebalancer_SkipsFirmwareVMs(t *testing.T) {
+	db := newRebalancerTestDB(t)
+
+	insertHost(t, db, "loaded", 16, 65536)
+	insertHost(t, db, "empty", 16, 65536)
+	for i := 0; i < 4; i++ {
+		insertVM(t, db, fmt.Sprintf("fw-%d", i), "loaded", 4, 8192, firmwareAutoSpec)
+	}
+
+	r := NewRebalancer("loaded", db)
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if n := proposalCount(t, db); n != 0 {
+		t.Errorf("firmware VMs produced %d proposals; want 0", n)
+	}
+}
+
 // TestRebalancer_AutoMarksApproved verifies that mode=auto proposals are
 // transitioned to "approved" in the same cycle.
 func TestRebalancer_AutoMarksApproved(t *testing.T) {
@@ -251,6 +272,7 @@ const (
 	balanceAutoSpec   = `{"placement":{"policy":"balance","rebalance":{"mode":"auto","threshold":5,"cooldown":"5m"}}}`
 	modeOffSpec       = `{"placement":{"policy":"balance","rebalance":{"mode":"off"}}}`
 	noMigrateSpec     = `{"placement":{"policy":"balance","no_migrate":true,"rebalance":{"mode":"dry-run"}}}`
+	firmwareAutoSpec  = `{"tpm":true,"placement":{"policy":"balance","rebalance":{"mode":"auto","threshold":5,"cooldown":"5m"}}}`
 )
 
 type proposalRow struct {

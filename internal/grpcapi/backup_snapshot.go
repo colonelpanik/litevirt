@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
@@ -135,6 +137,18 @@ func (s *Server) pushBackup(
 			ChunksDeduped:  int32(p.ChunksDeduped),
 		})
 	}
+	// A multi-disk Secure-Boot/vTPM VM can't be backed up as a consistent set
+	// (firmware is VM-global but only the root manifest carries it). Refuse for
+	// ANY disk — not just root — so it can't be bypassed by targeting a data disk
+	// (G1). This applies to both the interactive RPC and the scheduler.
+	if usesFirmwareState(vmSpecJSON) {
+		var full pb.VMSpec
+		if json.Unmarshal([]byte(vmSpecJSON), &full) == nil && len(full.Disks) > 1 {
+			return nil, status.Errorf(codes.Unimplemented,
+				"VM %q is a multi-disk Secure Boot / vTPM VM; snapshot backup of multi-disk firmware VMs is not supported yet", req.VmName)
+		}
+	}
+
 	opts := pbsstore.PushOptions{
 		VMName: req.VmName, DiskName: disk.DiskName,
 		Timestamp: timestamp, Progress: progress,
@@ -149,6 +163,19 @@ func (s *Server) pushBackup(
 				opts.DomainXML = xml
 			}
 		}
+		// Firmware-state travel (G1): a Secure-Boot/vTPM VM's NVRAM + swtpm bind
+		// BitLocker, so capture them into the backup (content-addressed, dedups
+		// across incrementals) for a restore to materialize before define.
+		// captureFirmwareBundle REFUSES a running firmware VM — swtpm/NVRAM can't
+		// be captured at the disk snapshot's point-in-time without a pause window,
+		// so the VM must be stopped (its firmware files are then quiescent). Do NOT
+		// "optimize" this into an online capture: a skewed firmware/disk pair
+		// silently corrupts BitLocker.
+		fwRefs, err := s.captureFirmwareBundle(repo, req.VmName, vmSpecJSON)
+		if err != nil {
+			return nil, err
+		}
+		opts.FirmwareChunks = fwRefs
 	}
 
 	// Legacy fallback: no guest-content backup engine wired (e.g. no
@@ -276,6 +303,84 @@ func (s *Server) pushBackup(
 		})
 	}
 	return m, nil
+}
+
+// captureFirmwareBundle archives a Secure-Boot/vTPM VM's firmware state (UEFI
+// NVRAM + swtpm) into the repo as a content-addressed blob, returning the refs
+// to embed on the root-disk manifest (G1). Returns nil for a non-firmware VM.
+// Refuses (rather than silently producing an un-restorable-as-firmware backup)
+// if a firmware VM's state is missing on this host.
+func (s *Server) captureFirmwareBundle(repo *pbsstore.Repo, vmName, specJSON string) ([]pbsstore.ChunkRef, error) {
+	fs := parseFirmwareSpec(specJSON)
+	if !fs.SecureBoot && !fs.Tpm {
+		return nil, nil
+	}
+	// Firmware state is VM-global but backup is per-disk and only the root
+	// manifest carries it, so a multi-disk SB/vTPM VM is not a consistent
+	// single-archive set. Refuse in v1 (root-disk-only firmware VMs supported).
+	var full pb.VMSpec
+	if json.Unmarshal([]byte(specJSON), &full) == nil && len(full.Disks) > 1 {
+		return nil, status.Errorf(codes.Unimplemented,
+			"VM %q is a multi-disk Secure Boot / vTPM VM; consistent firmware backup of multi-disk firmware VMs is not supported yet", vmName)
+	}
+	// A RUNNING SB/vTPM VM can't have its firmware captured at the disk
+	// snapshot's point-in-time without pausing the guest — the swtpm/NVRAM and
+	// the disk point would be from different instants. Refuse; back it up
+	// stopped, where the firmware files are quiescent (a paused-window online
+	// capture is a follow-up). Fail CLOSED on an unknown state — never fall
+	// through to a backup that might silently capture a running VM's firmware.
+	if s.virt != nil {
+		st, derr := s.virt.DomainState(vmName)
+		if derr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot determine the state of Secure Boot / vTPM VM %q (%v); refusing backup rather than risk an inconsistent firmware capture", vmName, derr)
+		}
+		if st == "running" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"stop Secure Boot / vTPM VM %q before backing it up — its firmware state can't be captured consistently while running", vmName)
+		}
+	}
+	// Per-component preflight: WriteFirmwareBundle reports success for a PARTIAL
+	// bundle (NVRAM-only or swtpm-only), which would restore a VM with a fresh
+	// TPM and brick BitLocker. Require every component the spec declares.
+	if fs.hasNvram() && !lv.HasNvram(s.dataDir, vmName) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"Secure Boot / vTPM VM %q has no UEFI NVRAM on this host; cannot back it up consistently", vmName)
+	}
+	if fs.Tpm && !lv.HasTPMState(fs.UUID) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"vTPM VM %q has no swtpm state on this host; cannot back it up consistently", vmName)
+	}
+	var buf bytes.Buffer
+	has, err := lv.WriteFirmwareBundle(s.dataDir, vmName, fs.UUID, &buf)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "capture firmware state for %q: %v", vmName, err)
+	}
+	if !has {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"Secure Boot / vTPM VM %q has no firmware state on this host; cannot back it up consistently", vmName)
+	}
+	refs, err := repo.PutBytes(buf.Bytes())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "store firmware state for %q: %v", vmName, err)
+	}
+	return refs, nil
+}
+
+// materializeFirmwareBundle reads the firmware-state bundle referenced by a
+// manifest out of the repo and writes it onto this host before the restored
+// domain is defined — NVRAM keyed by vmName under dataDir, swtpm under the
+// UUID-keyed default dir — so BitLocker survives the restore (G1). Each chunk is
+// hash-verified on read; ReadFirmwareBundle installs the pair atomically.
+func (s *Server) materializeFirmwareBundle(repo *pbsstore.Repo, manifest *pbsstore.Manifest, vmName, uuid string) error {
+	var buf bytes.Buffer
+	if err := repo.ReadBytesTo(manifest.FirmwareChunks, &buf); err != nil {
+		return status.Errorf(codes.Internal, "read firmware bundle for %q: %v", vmName, err)
+	}
+	if err := lv.ReadFirmwareBundle(&buf, s.dataDir, vmName, uuid); err != nil {
+		return status.Errorf(codes.Internal, "materialize firmware state for %q: %v", vmName, err)
+	}
+	return nil
 }
 
 // backupQuiesceWanted reports whether to attempt an in-guest filesystem freeze

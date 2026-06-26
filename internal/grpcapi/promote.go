@@ -63,6 +63,15 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName string) error {
 // promoteResolved is the shared promotion core (no RBAC): resolve the replica's
 // pool + host, then run locally or relay to the holding host.
 func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, send func(*pb.PromoteReplicaProgress) error) error {
+	// A replica carries only disk data — not the VM's UEFI NVRAM or swtpm state.
+	// Promoting a Secure-Boot/vTPM VM from one would boot it with a fresh TPM and
+	// silently brick BitLocker, so refuse rather than recover it half-formed.
+	// Recovery of such a VM is an explicit restore from a backup that captured the
+	// firmware (G1).
+	if usesFirmwareState(vm.Spec) {
+		return status.Errorf(codes.FailedPrecondition,
+			"vm %q uses Secure Boot / vTPM; its firmware state isn't in the disk replica, so promotion can't recover it — restore from a backup that captured firmware", req.VmName)
+	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
 	if err != nil {
 		return status.Errorf(codes.Internal, "list disks: %v", err)
@@ -388,11 +397,24 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		multiDiskNote = fmt.Sprintf(" (only root disk promoted; %d data disk(s) not recovered)", len(spec.Disks)-1)
 	}
 
-	diskCfg := []lv.DiskConfig{{Name: src.DiskName, Path: livePath, Bus: "virtio"}}
+	// Rebuild the promoted disk's bus/controller from the stored spec (not
+	// hardcoded virtio) so an imported scsi/sata guest boots after promotion
+	// instead of stalling on a missing controller (G1 cross-cutting fix).
+	promBus, promCtrl := "virtio", ""
+	for _, ds := range spec.Disks {
+		if ds.Name == src.DiskName {
+			if ds.Bus != "" {
+				promBus = ds.Bus
+			}
+			promCtrl = ds.ControllerModel
+			break
+		}
+	}
+	diskCfg := []lv.DiskConfig{{Name: src.DiskName, Path: livePath, Bus: promBus, ControllerModel: promCtrl}}
 	diskRecords := []corrosion.DiskRecord{{
 		VMName: targetName, DiskName: src.DiskName, HostName: s.hostName,
 		Path: livePath, SizeBytes: src.SizeBytes, StorageType: poolRef.Driver,
-		StorageVolume: pool, TargetDev: "vda",
+		StorageVolume: pool, TargetDev: lv.DiskDevName(promBus, 0),
 	}}
 
 	var netCfg []lv.NetworkConfig
@@ -435,7 +457,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 	if err := s.virt.StartDomain(targetName); err != nil {
-		_ = s.virt.UndefineDomain(targetName, false)
+		_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
 		os.Remove(livePath)
 		return status.Errorf(codes.Internal, "start domain: %v", err)
 	}

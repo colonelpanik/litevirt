@@ -95,6 +95,8 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
   --host <name>         # Target host (auto-placed if omitted)
+  --secure-boot         # UEFI Secure Boot (MS keys; q35 + UEFI). Windows 11 ready
+  --tpm                 # Attach a TPM 2.0 emulator (vTPM) — required for Win11/BitLocker
 
 lv ls [--stack <name>] [--host <name>]    # List VMs
 lv inspect <vm>                           # VM details
@@ -126,11 +128,54 @@ lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--disable-vnc]
   [--machine q35] [--firmware uefi|bios] [--guest-agent]
   [--min-mem N] [--max-mem N]
+  [--secure-boot] [--tpm] [--force]          # toggle Secure Boot / vTPM (stopped).
+                                             # Once firmware state exists, --force is
+                                             # required to change them (enabling SB can
+                                             # brick an unsigned guest; dropping the TPM
+                                             # orphans BitLocker).
 lv rebuild <vm>                              # Recreate from stored spec
 lv cutover <vm>                              # Snapshot-and-replace update
 lv resize-disk <vm> --disk <name> --size <size>   # Grow a disk
 lv stats <vm>                                # VM resource statistics
 ```
+
+## Secure Boot + vTPM (Windows 11)
+
+```bash
+lv run --name win11 --image win11.qcow2 --secure-boot --tpm   # Windows 11-ready VM
+lv update win11 --tpm --force                # toggle on a stopped VM (--force if state exists)
+lv inspect win11                             # shows secure_boot / tpm
+```
+
+Secure Boot uses the Microsoft-keyed OVMF firmware (`OVMF_CODE_4M.secboot.fd` +
+`OVMF_VARS_4M.ms.fd`) on a q35 machine; `--tpm` attaches a TPM 2.0 emulator
+(swtpm). Together they satisfy the Windows 11 / BitLocker / measured-boot
+requirements.
+
+**Host capability.** A VM only lands on a host that advertises the matching
+capability: `litevirt.tpm` (host has `swtpm` + `swtpm_setup`) and
+`litevirt.secureboot` (host has the secboot + MS-keys OVMF firmware). Placement,
+migration, drain and rebalancing all honor these — a Secure-Boot/vTPM VM is never
+scheduled onto a host that can't run it.
+
+**Firmware state travels with the VM.** Its UEFI NVRAM (Secure Boot keys) and
+swtpm state (the BitLocker-binding secret) are carried through snapshot+revert,
+backup+restore, and cold migration — or the operation **refuses clearly** rather
+than silently breaking BitLocker. The explicit refusals:
+
+| Operation | Behavior for a Secure-Boot/vTPM VM |
+|---|---|
+| snapshot (running, disk-only) | refused — use `--memory` (no consistent firmware capture otherwise) |
+| snapshot (stopped, or running `--memory`) | firmware captured alongside the snapshot |
+| revert with no captured firmware | refused (a pre-firmware/older snapshot can't be reverted safely) |
+| backup | snapshot backup only; the legacy raw stream backup is refused. Running VMs are refused — **stop the VM** to back up its firmware consistently. Multi-disk firmware VMs are not supported yet |
+| clone | gets a **fresh** vTPM + fresh NVRAM (the secret is never copied) — a cloned BitLocker guest needs its recovery key |
+| live migration | refused — use cold migration |
+| cold migration | supported for a **stopped** VM on **shared storage**; firmware is captured quiescent and carried to the target. Host-local-disk and PCI-passthrough firmware VMs are not supported yet |
+| host drain | refused — migrate the VM explicitly (`lv migrate … --strategy=cold`) |
+| automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
+| replica promotion | refused — a disk replica carries no firmware |
+| `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
 
 ## Containers (LXC / OCI)
 
@@ -296,7 +341,11 @@ lv image rm <image>
 Import an existing VM from VMware (OVA/OVF) or Proxmox (qemu-server `.conf` or a
 `vzdump` `.vma`). Disks are converted to qcow2 and the VM is defined **stopped**
 (use `--start` to boot it). The source bus, SCSI controller model, firmware and
-VLAN are preserved; Secure Boot / vTPM are imported degraded with a warning.
+VLAN are preserved. A source with **Secure Boot** is imported with Secure Boot,
+and a source with a **vTPM** gets a **fresh** vTPM — the source TPM secret is not
+carried, so a BitLocker guest needs its recovery key on first boot (the new TPM
+can't unseal the old volume). The import host must be Secure-Boot/vTPM capable
+(see below).
 
 ```bash
 lv import <file> --name <name> [--from auto|ova|ovf|proxmox|vma]

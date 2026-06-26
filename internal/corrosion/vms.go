@@ -563,12 +563,26 @@ func DeleteVM(ctx context.Context, c *Client, name string) error {
 	})
 }
 
-// RenameVM changes a VM's name across all tables.
+// RenameVM changes a VM's name across all tables, including the name embedded in
+// the stored spec JSON — otherwise spec.name keeps the old name and later XML +
+// firmware-path derivation (which use spec.Name) target the wrong VM (G1).
 func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
+	// Patch the spec JSON's "name" via a generic map (keeps this layer pb-free).
+	vmsUpdate := Statement{SQL: `UPDATE vms SET name = ?, updated_at = ? WHERE name = ?`,
+		Params: []interface{}{newName, now, oldName}}
+	if vm, err := GetVM(ctx, c, oldName); err == nil && vm != nil && vm.Spec != "" {
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(vm.Spec), &m) == nil {
+			m["name"] = newName
+			if b, mErr := json.Marshal(m); mErr == nil {
+				vmsUpdate = Statement{SQL: `UPDATE vms SET name = ?, spec = ?, updated_at = ? WHERE name = ?`,
+					Params: []interface{}{newName, string(b), now, oldName}}
+			}
+		}
+	}
 	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE vms SET name = ?, updated_at = ? WHERE name = ?`,
-			Params: []interface{}{newName, now, oldName}},
+		vmsUpdate,
 		{SQL: `UPDATE vm_interfaces SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,
 			Params: []interface{}{newName, now, oldName}},
 		{SQL: `UPDATE vm_disks SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,

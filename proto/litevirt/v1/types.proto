@@ -107,6 +107,9 @@ message VMSpec {
     int32 startup_order   = 34;
     int32 start_delay_sec = 35;
     int32 stop_delay_sec  = 36;
+    bool  secure_boot     = 37;  // UEFI Secure Boot (q35 + SMM + secboot/MS OVMF)
+    bool  tpm             = 38;  // emulated TPM 2.0 device (Windows 11 / BitLocker)
+    string uuid           = 39;  // stable domain identity; makes the libvirt swtpm path deterministic
 }
 
 message DiskSpec {

@@ -90,6 +90,14 @@ func (s *Server) BackupVM(req *pb.BackupVMRequest, stream pb.LiteVirt_BackupVMSe
 		}
 	}
 
+	// The raw-stream backup carries only the disk bytes — it can't carry a
+	// Secure-Boot/vTPM VM's NVRAM + swtpm, so a restore would boot a fresh-TPM VM
+	// and silently brick BitLocker. Refuse; snapshot backup carries firmware (G1).
+	if usesFirmwareState(vm.Spec) {
+		return status.Errorf(codes.Unimplemented,
+			"VM %q uses Secure Boot / vTPM; the raw stream backup can't carry firmware state — use snapshot backup instead", req.VmName)
+	}
+
 	// Mark VM as backing-up to prevent deletion mid-stream. Track it in memory
 	// so the reconciler can tell this live backup apart from a stuck row.
 	prevState := vm.State

@@ -208,6 +208,8 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 						Vendor: dev.Vendor,
 					})
 				}
+				// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
+				addCapabilityLabels(&placementReq, spec)
 			}
 		}
 
@@ -322,6 +324,19 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		if d.StorageType == "local" {
 			hasLocalOnly = true
 			break
+		}
+	}
+
+	// Drain moves a VM by either a raw libvirt live-migrate (shared storage) or a
+	// stop-and-reassign (cold) — NEITHER carries the host-local NVRAM + swtpm of a
+	// Secure-Boot/vTPM VM (and a stale live carry would race the TPM). Refuse such
+	// VMs REGARDLESS of storage type (NVRAM is host-local even on shared disks) and
+	// point the operator at explicit migration, which captures firmware quiescently
+	// and transfers it (G1).
+	if usesFirmwareState(vm.Spec) {
+		return &pb.DrainProgress{
+			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			Error: "Secure Boot / vTPM VM can't be drained automatically (its firmware state isn't transferred) — stop it and migrate it explicitly (`lv migrate " + vm.Name + " --strategy=cold`), which carries the firmware",
 		}
 	}
 

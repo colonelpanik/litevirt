@@ -172,6 +172,23 @@ func parseOVF(data []byte, baseDir string) (*ForeignVM, error) {
 				fv.SecureBoot = true
 			}
 		}
+		// A vTPM may also surface as a vmw:Config key (e.g. vtpm.present=true).
+		if strings.Contains(strings.ToLower(c.Key), "tpm") && !strings.EqualFold(c.Value, "false") {
+			fv.HasTPM = true
+		}
+	}
+	// VMware exports a virtual TPM as a hardware item (ResourceSubType
+	// "vmware.vtpm" / ElementName "Virtual TPM"). Detect it so the import comes in
+	// WITH a vTPM (fresh) rather than silently dropping it (G1).
+	for _, it := range env.VirtualSystem.HW.Items {
+		if strings.Contains(strings.ToLower(it.ResourceSubType), "tpm") ||
+			strings.Contains(strings.ToLower(it.ElementName), "tpm") {
+			fv.HasTPM = true
+			break
+		}
+	}
+	if fv.HasTPM {
+		fv.Warnf("source has a vTPM — imported with a fresh vTPM (the source TPM state is not carried; a BitLocker guest needs its recovery key) (G1)")
 	}
 
 	// First pass: controllers by InstanceID.
@@ -252,7 +269,7 @@ func parseOVF(data []byte, baseDir string) (*ForeignVM, error) {
 	}
 
 	if fv.SecureBoot {
-		fv.Warnf("source has Secure Boot enabled — imported as plain UEFI (Secure Boot not yet supported; tracked as G1); a guest bound to SecureBoot-signed boot may fail to boot")
+		fv.Warnf("source has Secure Boot enabled — imported with Secure Boot (G1)")
 	}
 	fv.Normalize()
 	if di == 0 {

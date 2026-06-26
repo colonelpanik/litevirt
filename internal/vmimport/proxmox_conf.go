@@ -140,7 +140,7 @@ func parseProxmoxConfBytes(data []byte) (*ForeignVM, error) {
 	}
 	if _, ok := pc.keys["tpmstate0"]; ok {
 		fv.HasTPM = true
-		fv.Warnf("source has a vTPM (tpmstate0) — not yet supported (tracked as G1); imported without a TPM, which may block BitLocker/measured-boot guests")
+		fv.Warnf("source has a vTPM (tpmstate0) — imported with a fresh vTPM (the source TPM state is not carried; a BitLocker guest needs its recovery key) (G1)")
 	}
 
 	// NICs.
@@ -181,7 +181,7 @@ func parseProxmoxConfBytes(data []byte) (*ForeignVM, error) {
 	}
 
 	if fv.SecureBoot {
-		fv.Warnf("source has Secure Boot enabled — imported as plain UEFI (Secure Boot not yet supported; tracked as G1); a guest bound to SecureBoot-signed boot may fail to boot")
+		fv.Warnf("source has Secure Boot enabled — imported with Secure Boot (G1)")
 	}
 
 	fv.Normalize()

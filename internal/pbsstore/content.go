@@ -51,8 +51,9 @@ func PushFromSource(
 		Timestamp:  opts.Timestamp,
 		BasedOn:    basedOn,
 		BitmapName: opts.BitmapName,
-		VMSpecJSON: opts.VMSpecJSON,
-		DomainXML:  opts.DomainXML,
+		VMSpecJSON:     opts.VMSpecJSON,
+		DomainXML:      opts.DomainXML,
+		FirmwareChunks: opts.FirmwareChunks,
 	}
 	buf := make([]byte, ChunkSize)
 	var prog PushProgress

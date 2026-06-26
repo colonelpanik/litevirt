@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/google/uuid"
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -156,6 +157,26 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 
 	// ── Define → persist stopped → optional start, with full rollback ──
 	cfg := fv.ToVMConfig()
+	spec := fv.ToVMSpec(project)
+
+	// Firmware (G1): a source that had Secure Boot / a vTPM is imported WITH them,
+	// but under a FRESH identity — the source's TPM secret is NOT carried, so a
+	// BitLocker guest will need its recovery key (the new TPM can't unseal the old
+	// volume). applyFirmwareConfig resolves the host OVMF paths, mints the NVRAM
+	// location, and preflights host capability (fails clearly on a non-capable host).
+	fwImport := spec.SecureBoot || spec.Tpm
+	if fwImport {
+		spec.Uuid = uuid.NewString()
+		if err := s.applyFirmwareConfig(&cfg, spec); err != nil {
+			cleanupDisks()
+			return err
+		}
+		cfg.UUID = spec.Uuid
+		if spec.Tpm {
+			fv.Warnf("imported with a FRESH vTPM — the source's TPM secret was not carried, so a BitLocker guest needs its recovery key (the new TPM cannot unseal the old volume)")
+		}
+	}
+
 	domXML, err := lv.GenerateDomainXML(cfg)
 	if err != nil {
 		cleanupDisks()
@@ -174,10 +195,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanupDisks()
+		if fwImport {
+			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+		}
 		return status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 
-	spec := fv.ToVMSpec(project)
 	specJSON, _ := json.Marshal(spec)
 	diskRecords, ifaceRecords := importRecords(fv, name, s.hostName)
 
@@ -191,6 +214,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		Project:   project,
 	}, ifaceRecords, diskRecords); err != nil {
 		_ = s.virt.UndefineDomain(name, false)
+		if fwImport {
+			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+		}
 		cleanupDisks()
 		return status.Errorf(codes.Internal, "record imported VM: %v", err)
 	}
@@ -201,6 +227,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			// Roll back fully: remove DB row, undefine, delete disks.
 			_ = corrosion.DeleteVM(ctx, s.db, name)
 			_ = s.virt.UndefineDomain(name, false)
+			if fwImport {
+				lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+			}
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "imported but failed to start: %v", err)
 		}

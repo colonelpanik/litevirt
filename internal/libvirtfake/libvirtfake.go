@@ -65,6 +65,11 @@ type Fake struct {
 	FailStartDomain     func(name string) error
 	FailShutdownDomain  func(name string) error
 	FailUndefineDomain  func(name string, removeStorage bool) error
+	FailUndefinePreserv func(name string) error
+	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
+	// RAM-save/capture failure that leaves the VM on an overlay.
+	FailCreateLiveSnapshot func(domain, snap string) error
+	FailDomainState        func(name string) error
 	FailMigrateToTarget func(name, dconnuri string) error
 	FailBlockPull       func(domain, disk string) error
 	// BlockJobStatusFn lets a scenario script block-job progress. Nil =
@@ -215,7 +220,30 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	return nil
 }
 
+// UndefineDomainPreservingState mirrors UndefineDomain for the fake but records
+// that NVRAM/vTPM state is kept (the fake has no real firmware state).
+func (f *Fake) UndefineDomainPreservingState(name string) error {
+	if f.FailUndefinePreserv != nil {
+		if err := f.FailUndefinePreserv(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.domains, name)
+	delete(f.xml, name)
+	delete(f.snapshots, name)
+	delete(f.stats, name)
+	f.record("undefine", name, "keep_state=true")
+	return nil
+}
+
 func (f *Fake) DomainState(name string) (string, error) {
+	if f.FailDomainState != nil {
+		if err := f.FailDomainState(name); err != nil {
+			return "", err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s, ok := f.domains[name]
@@ -355,13 +383,17 @@ func (f *Fake) CreateSnapshot(domainName, snapshotName string) (int64, error) {
 	f.record("snapshot", domainName, snapshotName)
 	return time.Now().UnixNano(), nil
 }
-func (f *Fake) RevertToSnapshot(domainName, snapshotName string) error {
+func (f *Fake) RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
+		f.mu.Unlock()
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	f.record("revert", domainName, snapshotName)
+	f.mu.Unlock()
+	if restorePreDefine != nil {
+		return restorePreDefine()
+	}
 	return nil
 }
 func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
@@ -382,15 +414,25 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
 	return nil
 }
 
-func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string) (diskBytes, vmstateBytes int64, err error) {
+func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.snapshots[domainName] == nil {
 		f.snapshots[domainName] = map[string]struct{}{}
 	}
 	f.snapshots[domainName][snapshotName] = struct{}{}
 	f.cutoverDisks(domainName, snapshotName)
 	f.record("snapshot-live", domainName, snapshotName)
+	f.mu.Unlock()
+	if f.FailCreateLiveSnapshot != nil {
+		if err := f.FailCreateLiveSnapshot(domainName, snapshotName); err != nil {
+			return 0, 0, err
+		}
+	}
+	if captureSuspended != nil {
+		if err := captureSuspended(); err != nil {
+			return 0, 0, err
+		}
+	}
 	return time.Now().UnixNano(), 4096, nil
 }
 
@@ -430,13 +472,17 @@ func (f *Fake) cutoverDisks(domain, snapname string) {
 	}
 }
 
-func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string) error {
+func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
+		f.mu.Unlock()
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	f.record("revert-live", domainName, snapshotName)
+	f.mu.Unlock()
+	if restorePreDefine != nil {
+		return restorePreDefine()
+	}
 	return nil
 }
 

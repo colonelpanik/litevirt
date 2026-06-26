@@ -16,6 +16,7 @@ import (
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
@@ -43,6 +44,11 @@ type Server struct {
 	// cluster stays coherent (only the idle window can differ by node).
 	sessionIdleTimeout time.Duration
 	sessionHardExpiry  time.Duration
+
+	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
+	// at daemon startup so CreateVM/restore render the same files the capability
+	// label was derived from.
+	firmware lv.FirmwarePaths
 
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
@@ -277,6 +283,9 @@ func (s *Server) RealmRegistry() *auth.Registry { return s.realmRegistry }
 // SetFirewallReconciler wires the daemon's firewall reconciler so the
 // ReloadFirewall RPC can drive a synchronous Reconcile.
 func (s *Server) SetFirewallReconciler(r FirewallReconciler) { s.fwReconciler = r }
+
+// SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).
+func (s *Server) SetFirmwarePaths(fp lv.FirmwarePaths) { s.firmware = fp }
 
 // SetTenancyEngine wires the admission + billing engine.
 // nil = unbounded admission, no billing. Daemon constructs the

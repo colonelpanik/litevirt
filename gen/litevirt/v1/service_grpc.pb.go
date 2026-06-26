@@ -188,6 +188,7 @@ const (
 	LiteVirt_UpdateFDB_FullMethodName                  = "/litevirt.v1.LiteVirt/UpdateFDB"
 	LiteVirt_EnsureCloudInit_FullMethodName            = "/litevirt.v1.LiteVirt/EnsureCloudInit"
 	LiteVirt_EnsureDisks_FullMethodName                = "/litevirt.v1.LiteVirt/EnsureDisks"
+	LiteVirt_EnsureFirmwareState_FullMethodName        = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
@@ -440,6 +441,7 @@ type LiteVirtClient interface {
 	// ── Internal: Migration helpers ──
 	EnsureCloudInit(ctx context.Context, in *EnsureCloudInitRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	EnsureDisks(ctx context.Context, in *EnsureDisksRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
@@ -2415,6 +2417,16 @@ func (c *liteVirtClient) EnsureDisks(ctx context.Context, in *EnsureDisksRequest
 	return out, nil
 }
 
+func (c *liteVirtClient) EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_EnsureFirmwareState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -2998,6 +3010,7 @@ type LiteVirtServer interface {
 	// ── Internal: Migration helpers ──
 	EnsureCloudInit(context.Context, *EnsureCloudInitRequest) (*emptypb.Empty, error)
 	EnsureDisks(context.Context, *EnsureDisksRequest) (*emptypb.Empty, error)
+	EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*emptypb.Empty, error)
 	CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
@@ -3589,6 +3602,9 @@ func (UnimplementedLiteVirtServer) EnsureCloudInit(context.Context, *EnsureCloud
 }
 func (UnimplementedLiteVirtServer) EnsureDisks(context.Context, *EnsureDisksRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnsureDisks not implemented")
+}
+func (UnimplementedLiteVirtServer) EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureFirmwareState not implemented")
 }
 func (UnimplementedLiteVirtServer) CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CleanupMigrationArtifacts not implemented")
@@ -6498,6 +6514,24 @@ func _LiteVirt_EnsureDisks_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_EnsureFirmwareState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureFirmwareStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).EnsureFirmwareState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_EnsureFirmwareState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).EnsureFirmwareState(ctx, req.(*EnsureFirmwareStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_CleanupMigrationArtifacts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CleanupMigrationArtifactsRequest)
 	if err := dec(in); err != nil {
@@ -7651,6 +7685,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "EnsureDisks",
 			Handler:    _LiteVirt_EnsureDisks_Handler,
+		},
+		{
+			MethodName: "EnsureFirmwareState",
+			Handler:    _LiteVirt_EnsureFirmwareState_Handler,
 		},
 		{
 			MethodName: "CleanupMigrationArtifacts",

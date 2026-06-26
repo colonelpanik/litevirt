@@ -20,8 +20,8 @@ type ForeignVM struct {
 	GuestOS    string // informational hint (e.g. "windows", "linux")
 	Machine    string // "q35" | "pc"
 	Firmware   string // "uefi" | "bios"
-	SecureBoot bool   // source had Secure Boot enabled (not yet supported → warn)
-	HasTPM     bool   // source had a vTPM (not yet supported → warn)
+	SecureBoot bool   // source had Secure Boot enabled → imported with Secure Boot (G1)
+	HasTPM     bool   // source had a vTPM → imported with a FRESH vTPM (secret not carried; G1)
 	CPUs       int
 	MemoryMiB  int
 	Disks      []ForeignDisk
@@ -114,6 +114,8 @@ func (fv *ForeignVM) ToVMConfig() lv.VMConfig {
 		MemoryMiB:  fv.MemoryMiB,
 		Machine:    fv.Machine,
 		Firmware:   fv.Firmware,
+		SecureBoot: fv.SecureBoot,
+		TPM:        fv.HasTPM,
 		GuestAgent: false,
 		EnableVNC:  true, // imported guests have a real console; expose it
 		Boot:       "disk",
@@ -147,6 +149,8 @@ func (fv *ForeignVM) ToVMSpec(project string) *pb.VMSpec {
 		MemoryMib:  int32(fv.MemoryMiB),
 		Machine:    fv.Machine,
 		Firmware:   fv.Firmware,
+		SecureBoot: fv.SecureBoot,
+		Tpm:        fv.HasTPM,
 		GuestAgent: false,
 		Boot:       "disk",
 		Project:    project,

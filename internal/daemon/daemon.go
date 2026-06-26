@@ -352,6 +352,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	svc.SetVersion(d.cfg.Version)
 	svc.SetDNSDomain(d.cfg.DNSDomain)
+	// Resolve OVMF firmware paths once (G1) and share with the server + reconciler
+	// so every domain-builder renders the same files the capability label reflects.
+	firmwarePaths := libvirt.ResolveFirmwarePaths()
+	svc.SetFirmwarePaths(firmwarePaths)
+	reconciler.SetFirmwarePaths(firmwarePaths)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
@@ -426,6 +431,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelLXCCapable, lxcCapable); err != nil {
 		slog.Warn("set LXC capability host label failed", "capable", lxcCapable, "error", err)
+	}
+
+	// Advertise vTPM + Secure Boot capability (G1) so placement only lands such VMs
+	// on hosts that can run them. TPM needs swtpm; Secure Boot needs the secboot/MS
+	// OVMF pair (resolved above). Independent capabilities → two labels.
+	// Both binaries are needed to actually START a vTPM VM — libvirt runs
+	// swtpm_setup to initialize state, then swtpm. (The first G1 drill failed in
+	// swtpm_setup with swtpm alone present.)
+	tpmCapable := "false"
+	_, errSwtpm := exec.LookPath("swtpm")
+	_, errSetup := exec.LookPath("swtpm_setup")
+	if errSwtpm == nil && errSetup == nil {
+		tpmCapable = "true"
+	}
+	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelTPMCapable, tpmCapable); err != nil {
+		slog.Warn("set TPM capability host label failed", "capable", tpmCapable, "error", err)
+	}
+	sbCapable := "false"
+	if firmwarePaths.SecureBootAvailable() {
+		sbCapable = "true"
+	}
+	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelSecureBootCapable, sbCapable); err != nil {
+		slog.Warn("set Secure Boot capability host label failed", "capable", sbCapable, "error", err)
 	}
 
 	// Container reconciler + restart engine: every cycle, sync each locally-owned

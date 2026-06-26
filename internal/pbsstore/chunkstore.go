@@ -92,6 +92,11 @@ type Manifest struct {
 	// DomainXML embeds the live domain XML at backup time (best-effort,
 	// for fidelity/debugging). Restore prefers VMSpecJSON.
 	DomainXML string `json:"domain_xml,omitempty"`
+	// FirmwareChunks references the content-addressed firmware-state bundle
+	// (UEFI NVRAM + swtpm state, tar) for a Secure-Boot/vTPM VM, so a restore
+	// materializes BitLocker-binding firmware before defining the domain (G1).
+	// Captured on the root-disk manifest only; empty for non-firmware VMs.
+	FirmwareChunks []ChunkRef `json:"firmware_chunks,omitempty"`
 	// ContainerSpecJSON embeds a serialized container spec (cpu/mem/labels/
 	// restart/project/image) for a container backup, so a restore can recreate
 	// the cluster row without the source cluster. The archived rootfs+config

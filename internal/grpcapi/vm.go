@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -109,6 +110,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 			placementReq.VMBaseName = vmBaseName(spec.Name)
 		}
 	}
+	addCapabilityLabels(&placementReq, spec) // vTPM/Secure Boot → capable hosts only (G1)
 	for _, dev := range spec.Devices {
 		placementReq.Devices = append(placementReq.Devices, placement.DeviceRequest{
 			Type:   dev.Type,
@@ -161,6 +163,13 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 	if spec.Firmware == "" {
 		spec.Firmware = "uefi"
 	}
+	// Stable domain identity (G1): persisted in the spec so libvirt's default
+	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
+	// life — letting vTPM state be located + carried without an explicit <source>.
+	// UUID is SERVER-OWNED on create: always mint fresh, ignoring any caller-
+	// supplied value, so a client can't bind a new VM to existing swtpm state.
+	// Restore/migrate set the preserved UUID via their own record-building paths.
+	spec.Uuid = uuid.NewString()
 	if spec.Cpu == 0 {
 		spec.Cpu = 2
 	}
@@ -513,6 +522,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 	// Generate libvirt domain XML
 	vmCfg := lv.VMConfig{
 		Name:         spec.Name,
+		UUID:         spec.Uuid,
 		CPU:          int(spec.Cpu),
 		CPUMode:      spec.CpuMode,
 		MemoryMiB:    int(spec.MemoryMib),
@@ -527,6 +537,13 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 		Networks:     netConfigs,
 		CloudInitISO: cloudInitISO,
 		Boot:         spec.Boot,
+	}
+	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
+	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
+	// to silently adopt firmware state left by a prior `delete --keep-disks`.
+	if err := s.applyFirmwareConfig(&vmCfg, spec); err != nil {
+		cleanupDisks()
+		return nil, err
 	}
 	if r := spec.Resources; r != nil {
 		vmCfg.HugePages = r.Hugepages
@@ -567,12 +584,14 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanupDisks()
+		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		s.virt.UndefineDomain(spec.Name, false)
 		cleanupDisks()
+		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // failed first boot must not strand TPM/NVRAM (G1)
 		return nil, status.Errorf(codes.Internal, "start domain: %v", err)
 	}
 
@@ -1018,8 +1037,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Release PCI passthrough devices and unbind from vfio-pci.
 	s.releaseDevices(ctx, req.Name)
 
-	// Undefine from libvirt (with snapshot metadata cleanup).
-	if err := s.virt.UndefineDomain(req.Name, true); err != nil {
+	// Undefine from libvirt. With --keep-disks, KEEP firmware state too (NVRAM is
+	// name-keyed and DomainUndefineNvram would delete it — bricking the retained
+	// BitLocker disk); the explicit WipeFirmwareState in the !KeepDisks branch
+	// below handles true delete (G1).
+	if req.KeepDisks {
+		if err := s.virt.UndefineDomainPreservingState(req.Name); err != nil {
+			slog.Warn("failed to undefine domain (keep-disks)", "vm", req.Name, "error", err)
+		}
+	} else if err := s.virt.UndefineDomain(req.Name, true); err != nil {
 		slog.Warn("failed to undefine domain", "vm", req.Name, "error", err)
 		// Retry without flags in case the domain has no managed save/snapshots.
 		if err2 := s.virt.UndefineDomain(req.Name, false); err2 != nil {
@@ -1035,6 +1061,20 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.images.DeleteVMDisks(req.Name)
 		// Remove cloud-init ISO
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
+		// --keep-disks we deliberately KEEP it too — else a retained BitLocker disk
+		// would be unbootable (the swtpm tree at the stable uuid stays for restore).
+		var sp struct {
+			Uuid string `json:"uuid"`
+		}
+		_ = json.Unmarshal([]byte(vm.Spec), &sp)
+		lv.WipeFirmwareState(s.dataDir, req.Name, sp.Uuid)
+	} else if usesFirmwareState(vm.Spec) {
+		// --keep-disks keeps firmware state too; record name→uuid so the retained
+		// (UUID-keyed) swtpm tree is locatable for an explicit restore later (G1).
+		if err := lv.WriteRetainedFirmwareMarker(s.dataDir, req.Name, parseFirmwareSpec(vm.Spec).UUID); err != nil {
+			slog.Warn("failed to write retained-firmware marker", "vm", req.Name, "error", err)
+		}
 	}
 
 	// Remove the VM's DNS A-record UNCONDITIONALLY — not gated on a live
@@ -1593,6 +1633,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// then glob the default dir. Must run before the tombstone below.
 	s.deleteRecordedVMDiskVolumes(ctx, req.Name)
 	s.images.DeleteVMDisks(req.Name)
+	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
+	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
+	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
 	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 
 	// Tombstone old records (they'll be replaced by CreateVM).
@@ -1623,6 +1666,21 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	if nextVM.State != "running" && nextVM.State != "stopped" {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"VM %q is in state %q, expected running or stopped", nextName, nextVM.State)
+	}
+
+	// The cutover must run on the host that owns the -next domain — its libvirt
+	// domain and name-keyed NVRAM live there. Forward if we're not that host;
+	// otherwise the libvirt rename below is skipped and a firmware VM's NVRAM is
+	// never renamed on the real host, so it would come up with mismatched
+	// firmware (G1). The forwarded call runs locally on the owning host.
+	if nextVM.HostName != s.hostName {
+		client, conn, err := s.peerClient(ctx, nextVM.HostName)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable,
+				"cannot reach host %s that owns %q for cutover: %v", nextVM.HostName, nextName, err)
+		}
+		defer conn.Close()
+		return client.CutoverVM(ctx, req)
 	}
 
 	// Resource pre-check: during the cutover overlap window, both the old and
@@ -1660,6 +1718,9 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		// dispatched) before the tombstone, then glob the default dir.
 		if oldVM.HostName == s.hostName {
 			s.deleteRecordedVMDiskVolumes(ctx, req.VmName)
+			// Wipe the replaced VM's firmware state (its old UUID-keyed swtpm +
+			// name-keyed NVRAM) so cutover doesn't orphan it (G1).
+			lv.WipeFirmwareState(s.dataDir, req.VmName, parseFirmwareSpec(oldVM.Spec).UUID)
 		}
 		s.images.DeleteVMDisks(req.VmName)
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.VmName))
@@ -1671,17 +1732,58 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		return nil, status.Errorf(codes.Internal, "rename VM: %v", err)
 	}
 
-	// Rename in libvirt if on this host.
+	// Rename in libvirt if on this host. For a Secure-Boot/vTPM VM, a failure here
+	// (NVRAM rename, redefine, start) is HARD — the reconciler can't reliably heal
+	// a firmware VM (a fresh redefine would mint new firmware) — so mark it errored
+	// and return rather than reporting a successful cutover. For a plain VM the
+	// reconciler rebuilds, so log + continue (G1).
+	fwVM := usesFirmwareState(nextVM.Spec)
 	if nextVM.HostName == s.hostName {
-		// Libvirt doesn't support rename directly — dump XML, undefine, redefine with new name.
-		xml, err := s.virt.DumpXML(nextName)
-		if err == nil {
-			s.virt.UndefineDomain(nextName, false)
-			// Replace the name in the XML.
+		cutoverFail := func(step string, e error) error {
+			slog.Error("cutover: "+step+" failed", "vm", req.VmName, "error", e, "firmware_vm", fwVM)
+			s.recordVMEvent(ctx, req.VmName, "vm.cutover", "error", step+" failed: "+e.Error())
+			if fwVM {
+				corrosion.UpdateVMState(ctx, s.db, req.VmName, "error", "cutover "+step+" failed: "+e.Error())
+				return status.Errorf(codes.Internal, "cutover %s for %q: %v", step, req.VmName, e)
+			}
+			return nil // plain VM — reconciler will rebuild
+		}
+		// Libvirt doesn't support rename directly — dump XML, undefine, redefine.
+		xml, derr := s.virt.DumpXML(nextName)
+		if derr != nil {
+			if e := cutoverFail("dump XML", derr); e != nil {
+				return nil, e
+			}
+		} else {
+			// KEEP NVRAM/vTPM — the dumped XML retains the stable <uuid> so the
+			// UUID-keyed swtpm follows it automatically; only the name-keyed NVRAM
+			// file needs renaming. Undefine MUST succeed before we rename NVRAM —
+			// renaming the vars file out from under a still-defined -next domain
+			// would leave a dangling <nvram> path (G1), so treat failure as hard.
+			if e := s.virt.UndefineDomainPreservingState(nextName); e != nil {
+				if e := cutoverFail("undefine -next", e); e != nil {
+					return nil, e
+				}
+			}
 			xml = replaceDomainName(xml, nextName, req.VmName)
-			s.virt.DefineDomain(xml)
-			if nextVM.State == "running" {
-				s.virt.StartDomain(req.VmName)
+			oldNvram, newNvram := lv.NvramPath(s.dataDir, nextName), lv.NvramPath(s.dataDir, req.VmName)
+			if _, e := os.Stat(oldNvram); e == nil {
+				if e := os.Rename(oldNvram, newNvram); e == nil {
+					xml = strings.ReplaceAll(xml, oldNvram, newNvram)
+				} else if e := cutoverFail("nvram rename", e); e != nil {
+					return nil, e
+				}
+			}
+			if e := s.virt.DefineDomain(xml); e != nil {
+				if e := cutoverFail("redefine", e); e != nil {
+					return nil, e
+				}
+			} else if nextVM.State == "running" {
+				if e := s.virt.StartDomain(req.VmName); e != nil {
+					if e := cutoverFail("start", e); e != nil {
+						return nil, e
+					}
+				}
 			}
 		}
 	}
@@ -1943,7 +2045,8 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// a metadata-only update applies live above.
 	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" ||
 		req.Machine != "" || req.Firmware != "" ||
-		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil
+		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
+		req.SecureBoot != nil || req.Tpm != nil
 	if redefine {
 		if vm.State != "stopped" {
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -1973,6 +2076,29 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		if req.MaxMemoryMib != nil {
 			spec.MaxMemoryMib = *req.MaxMemoryMib
+		}
+		// Toggling secure_boot/tpm once firmware state exists can brick an
+		// unsigned guest (SB) or orphan BitLocker (TPM) — refuse without --force.
+		if req.SecureBoot != nil && *req.SecureBoot != spec.SecureBoot {
+			if !req.Force && (lv.HasNvram(s.dataDir, spec.Name) || lv.HasTPMState(spec.Uuid)) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"changing secure_boot on %q with existing firmware state may render it unbootable; pass --force to override", req.Name)
+			}
+			spec.SecureBoot = *req.SecureBoot
+		}
+		if req.Tpm != nil && *req.Tpm != spec.Tpm {
+			if !req.Force && lv.HasTPMState(spec.Uuid) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"changing tpm on %q with existing TPM state may orphan BitLocker; pass --force to override", req.Name)
+			}
+			spec.Tpm = *req.Tpm
+		}
+		// Backfill a stable UUID for a pre-G1 VM being redefined (it had none in
+		// its stored spec). Without this, enabling --tpm would let libvirt assign
+		// its own UUID while the spec stays empty — making the swtpm tree
+		// unlocatable for state travel. Persisted via the specJSON marshal below (G1).
+		if spec.Uuid == "" {
+			spec.Uuid = uuid.NewString()
 		}
 		spec.DisableVnc = req.DisableVnc
 	}
@@ -2060,6 +2186,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// Regenerate domain XML.
 	vmCfg := lv.VMConfig{
 		Name:        spec.Name,
+		UUID:        spec.Uuid,
 		CPU:         int(spec.Cpu),
 		CPUMode:     spec.CpuMode,
 		MemoryMiB:   int(spec.MemoryMib),
@@ -2072,6 +2199,21 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		Networks:    netConfigs,
 		Boot:        spec.Boot,
 	}
+	// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
+	// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
+	// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no
+	// create-time guard), so existing nvram is reused. A SB toggle was capability-
+	// checked above; verify the host can still satisfy it.
+	if spec.SecureBoot && !s.firmware.SecureBootAvailable() {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"host %s has no Secure Boot OVMF firmware; cannot redefine %q with Secure Boot", s.hostName, req.Name)
+	}
+	if spec.Tpm {
+		if err := s.checkTPMHostSupport(); err != nil {
+			return nil, err
+		}
+	}
+	s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
 	if r := spec.Resources; r != nil {
 		vmCfg.HugePages = r.Hugepages
 		vmCfg.IOThreads = int(r.IoThreads)
@@ -2093,8 +2235,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 
 	// Undefine the existing domain first — DefineDomain (DomainDefineXML)
 	// can fail with "already exists with uuid" when the generated XML has no
-	// UUID and libvirt tries to assign a new one that collides.
-	_ = s.virt.UndefineDomain(req.Name, false)
+	// UUID and libvirt tries to assign a new one that collides. KEEP NVRAM/vTPM
+	// — this is a same-VM redefine; deleting them would break a SB/vTPM guest (G1).
+	_ = s.virt.UndefineDomainPreservingState(req.Name)
 
 	// Redefine the domain with the updated XML.
 	if err := s.virt.DefineDomain(domXML); err != nil {

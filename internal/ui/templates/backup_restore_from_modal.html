@@ -12,10 +12,10 @@
       <input type="hidden" name="disk_name" value="{{.DiskName}}">
       <input type="hidden" name="timestamp" value="{{.Timestamp}}">
       <div class="form-row">
-        <label>Target path (on the host)</label>
-        <input type="text" name="target_path" required placeholder="/var/lib/litevirt/disks/{{.VMName}}-restored.qcow2" style="font-family:monospace">
+        <label>Target filename</label>
+        <input type="text" name="target_path" required placeholder="{{.VMName}}-restored.qcow2" style="font-family:monospace">
       </div>
-      <div class="alert alert-warn" style="font-size:11px">Restoring over a disk in use will corrupt it. Restore to a fresh path, then attach.</div>
+      <div class="alert alert-warn" style="font-size:11px">A bare filename lands in the pool's disk directory. An absolute host path requires the admin role. Restoring over a disk in use will corrupt it — restore to a fresh name, then attach.</div>
       <div id="backup-progress"></div>
       <div class="form-actions">
         <button type="button" class="btn" onclick="document.getElementById('restore-from-modal').remove()">Close</button>

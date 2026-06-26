@@ -382,9 +382,16 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		})
 	}
 
-	// Check for cloud-init ISO.
+	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
+	// peer-replicated) row, so build the ISO path through the validated builder
+	// — a malformed vm.Name must not escape the cloudinit dir.
 	cloudInitISO := ""
-	isoPath := lv.CloudInitISOPath(r.dataDir, vm.Name)
+	isoPath, isoErr := lv.SafeCloudInitISOPath(r.dataDir, vm.Name)
+	if isoErr != nil {
+		slog.Error("reconciler: invalid vm name for cloud-init path", "vm", vm.Name, "error", isoErr)
+		corrosion.UpdateVMState(ctx, r.db, vm.Name, "error", fmt.Sprintf("invalid name: %v", isoErr))
+		return
+	}
 	if _, err := os.Stat(isoPath); err == nil {
 		cloudInitISO = isoPath
 	} else if spec.CloudInit != nil {

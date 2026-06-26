@@ -112,6 +112,21 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 			}
 			_ = os.Lchown(target, hdr.Uid, hdr.Gid)
 		case tar.TypeSymlink:
+			// Validate the link TARGET stays within the extraction root: an
+			// absolute target is interpreted root-relative (so "/usr/bin" works
+			// and resolves inside the rootfs at runtime), a relative target is
+			// resolved from the link's own directory; either way a target that
+			// escapes the root ("../../host") is rejected. The link is then stored
+			// verbatim (never followed during extraction).
+			var resolved string
+			if filepath.IsAbs(hdr.Linkname) {
+				resolved = filepath.Join(dest, filepath.Clean(hdr.Linkname))
+			} else {
+				resolved = filepath.Join(filepath.Dir(target), hdr.Linkname)
+			}
+			if !Contains(dest, resolved) {
+				return fmt.Errorf("rootfs tar: symlink %q target %q escapes root", hdr.Name, hdr.Linkname)
+			}
 			if err := mkdirAllNoFollow(dest, filepath.Dir(target), 0o755); err != nil {
 				return err
 			}

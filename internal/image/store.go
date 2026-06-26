@@ -66,6 +66,18 @@ func (s *Store) DiskPath(vmName, diskName string) string {
 	return filepath.Join(s.diskDir, vmName+"-"+diskName+".qcow2")
 }
 
+// SafeDiskPath is DiskPath with the name components validated, so a name like
+// "../../x" can't escape the disk dir. Use on write paths (clone/restore).
+func (s *Store) SafeDiskPath(vmName, diskName string) (string, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", err
+	}
+	if err := safename.ValidateDiskName(diskName); err != nil {
+		return "", err
+	}
+	return s.DiskPath(vmName, diskName), nil
+}
+
 // CreateOverlayDisk creates a qcow2 disk backed by a base image (COW).
 func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (string, error) {
 	// Validate names at the write layer so neither an operator-supplied nor a

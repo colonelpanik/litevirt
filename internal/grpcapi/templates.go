@@ -109,7 +109,11 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		}
 	}
 	for _, d := range srcDisks {
-		clonePath := s.images.DiskPath(req.Target, d.DiskName)
+		clonePath, err := s.images.SafeDiskPath(req.Target, d.DiskName)
+		if err != nil {
+			cleanup()
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
 		if err := os.MkdirAll(filepath.Dir(clonePath), 0755); err != nil {
 			cleanup()
 			return nil, status.Errorf(codes.Internal, "prepare disk dir: %v", err)
@@ -183,7 +187,11 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		if srcSpec.CloudInit != nil && srcSpec.CloudInit.Userdata != "" {
 			userData = srcSpec.CloudInit.Userdata
 		}
-		isoPath := lv.CloudInitISOPath(s.dataDir, req.Target)
+		isoPath, perr := lv.SafeCloudInitISOPath(s.dataDir, req.Target)
+		if perr != nil {
+			cleanup()
+			return nil, status.Errorf(codes.InvalidArgument, "%v", perr)
+		}
 		if err := cloudinit.GenerateISO(cloudinit.Config{
 			InstanceID:    req.Target, // NEW id forces first-boot (regen SSH host keys, machine-id)
 			LocalHostname: req.Target,

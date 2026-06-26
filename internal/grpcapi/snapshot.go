@@ -103,7 +103,10 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if !hasFW {
 			return nil
 		}
-		bundle := lv.SnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.Name)
+		bundle, err := lv.SafeSnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.Name)
+		if err != nil {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
 			return err
 		}

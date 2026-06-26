@@ -16,8 +16,9 @@
       <input type="hidden" name="disk_name" value="{{.DiskName}}">
       <input type="hidden" name="timestamp" value="{{.Timestamp}}">
       <div class="form-row">
-        <label>Overlay path (on the host)</label>
-        <input type="text" name="target_path" required placeholder="/var/lib/litevirt/disks/{{.VMName}}-live.qcow2" style="font-family:monospace">
+        <label>Overlay filename</label>
+        <input type="text" name="target_path" required placeholder="{{.VMName}}-live.qcow2" style="font-family:monospace">
+        <small class="muted">A bare filename lands in the pool's disk directory; an absolute host path requires admin.</small>
       </div>
       <div class="form-row">
         <label>New VM name (blank = keep original)</label>

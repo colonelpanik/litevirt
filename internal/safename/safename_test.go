@@ -243,6 +243,9 @@ func TestExtractRootfsTar_Rejections(t *testing.T) {
 			{name: "ct/etc", typeflag: tar.TypeSymlink, linkname: "/etc"},
 			{name: "ct/etc/passwd", typeflag: tar.TypeReg, body: "pwned"},
 		}},
+		{"symlink-escapes-root", []tarEnt{
+			{name: "ct/evil", typeflag: tar.TypeSymlink, linkname: "../../../../etc/shadow"},
+		}},
 		{"hardlink-to-missing", []tarEnt{
 			{name: "ct/a", typeflag: tar.TypeLink, linkname: "ct/later"},
 		}},

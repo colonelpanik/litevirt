@@ -198,6 +198,45 @@ func TestMoveVolume_OfflineFileToFile(t *testing.T) {
 	}
 }
 
+// TestMoveVolume_SnapshottedDiskRejected verifies a disk with a snapshot overlay
+// is refused (its backing chain can't survive a pool move) — closing the
+// move-volume → cross-host-migration backing-chain gap (G1 drill finding).
+func TestMoveVolume_SnapshottedDiskRejected(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "test-host"
+	s.dataDir = t.TempDir()
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{
+		"warm": {Driver: "local", Target: t.TempDir()},
+	})
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm-snap", HostName: "test-host", State: "stopped"},
+		nil,
+		[]corrosion.DiskRecord{{
+			VMName: "vm-snap", DiskName: "root", HostName: "test-host",
+			Path: filepath.Join(t.TempDir(), "x.qcow2"), SizeBytes: 1,
+			StorageType: "local", StorageVolume: "hot",
+		}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.InsertSnapshot(ctx, s.db, corrosion.SnapshotRecord{
+		VMName: "vm-snap", HostName: "test-host", Name: "snap1", State: "ok", Type: "disk",
+	}); err != nil {
+		t.Fatalf("InsertSnapshot: %v", err)
+	}
+	rec := &streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}
+	err := s.MoveVolume(&pb.MoveVolumeRequest{
+		VmName: "vm-snap", DiskName: "root", TargetPool: "warm",
+	}, rec)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for a snapshotted disk, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "snapshot") {
+		t.Errorf("error should explain the snapshot backing-chain reason, got: %v", err)
+	}
+}
+
 // TestMoveVolume_RunningVMRejected verifies that MoveVolume on a
 // running VM requires a wired LiveMover. Without one,
 // the call returns Unimplemented — same status code as,

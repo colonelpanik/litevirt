@@ -127,6 +127,18 @@ func (s *Server) moveOneVolume(
 	deleteSource bool,
 	send func(*pb.MoveVolumeProgress) error,
 ) error {
+	// A VM snapshot makes the disk an overlay over a (possibly host-local) backing
+	// base. qemu-img convert flattens the DATA, but the snapshot metadata and the
+	// backing reference don't survive a pool move — the moved overlay can end up
+	// pointing at a base that isn't on the target pool/host, which then breaks a
+	// later cross-host migration ("Cannot access storage file …"). Refuse rather
+	// than silently produce that state; the operator flattens by removing the
+	// snapshots first (G1 drill finding).
+	if snaps, serr := corrosion.ListSnapshots(ctx, s.db, vm.Name); serr == nil && len(snaps) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"VM %q has %d snapshot(s); a disk with a snapshot overlay can't be moved between pools (its backing chain would be orphaned) — remove them first (`lv snapshot rm %s <name>`), then move", vm.Name, len(snaps), vm.Name)
+	}
+
 	dstPool, ok := s.lookupStoragePool(targetPool)
 	if !ok {
 		return status.Errorf(codes.NotFound, "target pool %q not configured on host %q", targetPool, s.hostName)

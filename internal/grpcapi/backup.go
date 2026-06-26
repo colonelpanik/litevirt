@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -19,6 +18,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 const backupChunkSize = 256 * 1024 // 256 KiB per gRPC message
@@ -27,14 +27,11 @@ const backupChunkSize = 256 * 1024 // 256 KiB per gRPC message
 // can't write until the disk fills. Generous for real disks; raise if needed.
 const maxRestoreBytes int64 = 2 << 40 // 2 TiB
 
-// safeNameRe constrains a restore VM name to characters that can't escape the
-// disks directory. Slashes are excluded by the charset; "." / ".." are rejected
-// separately by validRestoreName since they pass the charset but traverse.
-var safeNameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
-
 // validRestoreName rejects names that would let filepath.Join escape dataDir.
+// It delegates to internal/safename, the single source of truth for the safe
+// name charset (letters, digits, '_', '.', '-'; no '/', no '.'/'..').
 func validRestoreName(name string) bool {
-	return name != "." && name != ".." && safeNameRe.MatchString(name)
+	return safename.ValidateName(name) == nil
 }
 
 // validResourceName enforces the same safe charset on user-supplied resource

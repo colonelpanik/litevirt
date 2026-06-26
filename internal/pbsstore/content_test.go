@@ -25,7 +25,7 @@ func TestPushFromSource_FullSparse(t *testing.T) {
 	alloc := [][2]int64{{0, ChunkSize}, {2 * ChunkSize, ChunkSize}} // chunk 1 is a hole
 
 	m, err := PushFromSource(context.Background(), r, bytes.NewReader(data), size, alloc, nil,
-		PushOptions{VMName: "vm", DiskName: "root", Timestamp: "t1"})
+		PushOptions{VMName: "vm", DiskName: "root", Timestamp: "2026-01-01T00:00:00Z"})
 	if err != nil {
 		t.Fatalf("PushFromSource: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestPushFromSource_Incremental(t *testing.T) {
 	alloc := [][2]int64{{0, ChunkSize}, {2 * ChunkSize, ChunkSize}}
 
 	parent, err := PushFromSource(context.Background(), r, bytes.NewReader(data), size, alloc, nil,
-		PushOptions{VMName: "vm", DiskName: "root", Timestamp: "t1"})
+		PushOptions{VMName: "vm", DiskName: "root", Timestamp: "2026-01-01T00:00:00Z"})
 	if err != nil {
 		t.Fatalf("full: %v", err)
 	}
@@ -78,12 +78,12 @@ func TestPushFromSource_Incremental(t *testing.T) {
 	dirty := [][2]int64{{2 * ChunkSize, ChunkSize}}
 
 	inc, err := PushFromSource(context.Background(), r, bytes.NewReader(data2), size, dirty, parent,
-		PushOptions{VMName: "vm", DiskName: "root", Timestamp: "t2"})
+		PushOptions{VMName: "vm", DiskName: "root", Timestamp: "2026-01-02T00:00:00Z"})
 	if err != nil {
 		t.Fatalf("incremental: %v", err)
 	}
-	if inc.BasedOn != "t1" {
-		t.Errorf("BasedOn = %q, want t1", inc.BasedOn)
+	if inc.BasedOn != "2026-01-01T00:00:00Z" {
+		t.Errorf("BasedOn = %q, want 2026-01-01T00:00:00Z", inc.BasedOn)
 	}
 	if len(inc.Chunks) != 2 {
 		t.Fatalf("expected 2 chunks, got %d", len(inc.Chunks))

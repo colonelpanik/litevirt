@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // Store manages local image storage.
@@ -37,6 +38,15 @@ func (s *Store) ImagePath(imageName string) string {
 	return filepath.Join(s.imageDir, imageName+".qcow2")
 }
 
+// SafeImagePath is ImagePath with the image name validated, so a name like
+// "../../x" can't escape the image dir. Use this on write/import paths.
+func (s *Store) SafeImagePath(imageName string) (string, error) {
+	if err := safename.ValidateImageName(imageName); err != nil {
+		return "", err
+	}
+	return s.ImagePath(imageName), nil
+}
+
 // ImageExists checks if a base image exists locally.
 func (s *Store) ImageExists(imageName string) bool {
 	_, err := os.Stat(s.ImagePath(imageName))
@@ -58,6 +68,18 @@ func (s *Store) DiskPath(vmName, diskName string) string {
 
 // CreateOverlayDisk creates a qcow2 disk backed by a base image (COW).
 func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (string, error) {
+	// Validate names at the write layer so neither an operator-supplied nor a
+	// peer-replicated name can place the disk (or read a backing file) outside
+	// the pool directory.
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", err
+	}
+	if err := safename.ValidateDiskName(diskName); err != nil {
+		return "", err
+	}
+	if err := safename.ValidateImageName(backingImage); err != nil {
+		return "", err
+	}
 	diskDir := s.DiskDir(vmName)
 	if err := os.MkdirAll(diskDir, 0755); err != nil {
 		return "", fmt.Errorf("create disk dir: %w", err)
@@ -83,6 +105,12 @@ func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (
 
 // CreateEmptyDisk creates an empty qcow2 disk.
 func (s *Store) CreateEmptyDisk(vmName, diskName, size string) (string, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", err
+	}
+	if err := safename.ValidateDiskName(diskName); err != nil {
+		return "", err
+	}
 	diskDir := s.DiskDir(vmName)
 	if err := os.MkdirAll(diskDir, 0755); err != nil {
 		return "", fmt.Errorf("create disk dir: %w", err)

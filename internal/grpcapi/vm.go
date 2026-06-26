@@ -28,9 +28,34 @@ import (
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
+
+// validateSpecNames validates every name in a VM spec that lands in a
+// filesystem path — the VM name, each disk name, and the base image reference —
+// so a traversal can't enter the system at CreateVM/UpdateVM (defense-in-depth
+// over the Safe* builders + the image store's write-layer checks).
+func validateSpecNames(spec *pb.VMSpec) error {
+	if spec == nil {
+		return nil
+	}
+	if err := safename.ValidateVMName(spec.Name); err != nil {
+		return err
+	}
+	if spec.Image != "" {
+		if err := safename.ValidateImageName(spec.Image); err != nil {
+			return err
+		}
+	}
+	for _, d := range spec.Disks {
+		if err := safename.ValidateDiskName(d.Name); err != nil {
+			return fmt.Errorf("disk %q: %w", d.Name, err)
+		}
+	}
+	return nil
+}
 
 func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM, error) {
 	spec := req.Spec
@@ -39,6 +64,9 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 	}
 	if spec.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "VM name required")
+	}
+	if err := validateSpecNames(spec); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err

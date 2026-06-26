@@ -17,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // ImportImage receives a client-streamed image file and writes it to the local store.
@@ -51,6 +52,9 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 			checksum = req.Checksum
 			if name == "" {
 				return status.Error(codes.InvalidArgument, "image name required")
+			}
+			if err := safename.ValidateImageName(name); err != nil {
+				return status.Errorf(codes.InvalidArgument, "%v", err)
 			}
 			if format == "" {
 				format = "qcow2"
@@ -291,6 +295,9 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 	}
 	if req.VmName == "" || req.ImageName == "" {
 		return nil, status.Error(codes.InvalidArgument, "vm_name and image_name required")
+	}
+	if err := safename.ValidateImageName(req.ImageName); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)

@@ -12,11 +12,15 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImageServer) error {
 	if err := RequireRole(stream.Context(), "operator"); err != nil {
 		return err
+	}
+	if err := safename.ValidateImageName(req.Name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	slog.Info("pulling image", "name", req.Name, "url", req.SourceUrl)
 

@@ -134,8 +134,12 @@ func (s *Server) attachDisk(ctx context.Context, vmName string, spec *pb.DiskSpe
 		bus = "virtio"
 	}
 
-	// Create disk file.
-	diskPath := libvirt.DiskPath(s.dataDir, vmName, spec.Name)
+	// Create disk file. Validate the names before they reach the path so a
+	// hotplugged disk can't escape the disks directory.
+	diskPath, err := libvirt.SafeDiskPath(s.dataDir, vmName, spec.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	sizeGB, err := parseDiskSize(spec.Size)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid disk size: %v", err)

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // Firmware-state travel (G1). A VM's portable firmware state is its name-keyed
@@ -37,6 +39,19 @@ func LibvirtSwtpmDir(uuid string) string {
 // (callers must still validate names — this just guarantees containment).
 func SnapshotFirmwareBundlePath(dataDir, vmName, snapName string) string {
 	return filepath.Join(dataDir, "snapfw", filepath.Base(vmName), filepath.Base(snapName)+".tar")
+}
+
+// SafeSnapshotFirmwareBundlePath is SnapshotFirmwareBundlePath with the names
+// validated up front (the filepath.Base in the raw builder is containment-only;
+// this rejects a bad name outright so callers fail loudly).
+func SafeSnapshotFirmwareBundlePath(dataDir, vmName, snapName string) (string, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", err
+	}
+	if err := safename.ValidateSnapshotName(snapName); err != nil {
+		return "", err
+	}
+	return SnapshotFirmwareBundlePath(dataDir, vmName, snapName), nil
 }
 
 // HasTPMState reports whether the (UUID-keyed) swtpm state exists.

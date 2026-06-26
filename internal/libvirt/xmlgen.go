@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // VMConfig holds all parameters needed to generate a libvirt domain XML.
@@ -468,10 +470,31 @@ func DiskPath(dataDir, vmName, diskName string) string {
 	return filepath.Join(dataDir, "disks", vmName+"-"+diskName+".qcow2")
 }
 
+// SafeDiskPath is DiskPath with the name components validated, so a name like
+// "../../x" can't escape the disks dir. Callers acting on attacker-influenced or
+// replicated names should use this instead of DiskPath.
+func SafeDiskPath(dataDir, vmName, diskName string) (string, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", err
+	}
+	if err := safename.ValidateDiskName(diskName); err != nil {
+		return "", err
+	}
+	return DiskPath(dataDir, vmName, diskName), nil
+}
+
 // NvramPath returns the per-VM UEFI vars file, pinned under dataDir so it can be
 // located/copied deterministically across the VM lifecycle (G1).
 func NvramPath(dataDir, vmName string) string {
 	return filepath.Join(dataDir, "nvram", vmName+"_VARS.fd")
+}
+
+// SafeNvramPath is NvramPath with the VM name validated.
+func SafeNvramPath(dataDir, vmName string) (string, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", err
+	}
+	return NvramPath(dataDir, vmName), nil
 }
 
 
@@ -480,10 +503,29 @@ func CloudInitISOPath(dataDir, vmName string) string {
 	return filepath.Join(dataDir, "cloudinit", vmName+".iso")
 }
 
+// SafeCloudInitISOPath is CloudInitISOPath with the VM name validated.
+func SafeCloudInitISOPath(dataDir, vmName string) (string, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", err
+	}
+	return CloudInitISOPath(dataDir, vmName), nil
+}
+
 // VMStatePath returns the standard path for a memory snapshot's saved RAM image
 // (#3). snapName must already be path-safe (validated by the caller).
 func VMStatePath(dataDir, vmName, snapName string) string {
 	return filepath.Join(dataDir, "vmstate", vmName+"-"+snapName+".save")
+}
+
+// SafeVMStatePath is VMStatePath with the VM and snapshot names validated.
+func SafeVMStatePath(dataDir, vmName, snapName string) (string, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", err
+	}
+	if err := safename.ValidateSnapshotName(snapName); err != nil {
+		return "", err
+	}
+	return VMStatePath(dataDir, vmName, snapName), nil
 }
 
 // ImagePath returns the standard path for a base image.
@@ -493,6 +535,14 @@ func ImagePath(dataDir, imageName string) string {
 		ext = ""
 	}
 	return filepath.Join(dataDir, "images", imageName+ext)
+}
+
+// SafeImagePath is ImagePath with the image name validated.
+func SafeImagePath(dataDir, imageName string) (string, error) {
+	if err := safename.ValidateImageName(imageName); err != nil {
+		return "", err
+	}
+	return ImagePath(dataDir, imageName), nil
 }
 
 // ═══════════ XML Structs ═══════════

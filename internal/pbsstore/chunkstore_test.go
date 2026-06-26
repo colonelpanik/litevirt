@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -166,8 +167,8 @@ func TestPutManifest_RoundTrip(t *testing.T) {
 		VMName: "vm1", DiskName: "root", Timestamp: "2026-05-09T12:34:56Z",
 		TotalSize: 8192,
 		Chunks: []ChunkRef{
-			{ID: "aaaa", Size: 4096, Offset: 0},
-			{ID: "bbbb", Size: 4096, Offset: 4096},
+			{ID: strings.Repeat("a", 64), Size: 4096, Offset: 0},
+			{ID: strings.Repeat("b", 64), Size: 4096, Offset: 4096},
 		},
 	}
 	if err := r.PutManifest(m); err != nil {

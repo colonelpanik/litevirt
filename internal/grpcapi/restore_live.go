@@ -10,7 +10,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/nbd"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -37,17 +36,6 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		return status.Error(codes.InvalidArgument,
 			"repo_path, vm_name, disk_name, timestamp, target_path all required")
 	}
-	// Live restore may target a VM that no longer exists (disaster
-	// recovery), so fall back to the default-project path when the
-	// record is gone.
-	rbacPath := vmRBACPathFor("", req.VmName)
-	if vm, gerr := corrosion.GetVM(ctx, s.db, req.VmName); gerr == nil && vm != nil {
-		rbacPath = vmRBACPath(vm)
-	}
-	if err := s.RequirePerm(ctx, rbacPath, "backup.restore", "operator"); err != nil {
-		return err
-	}
-
 	// repo_path: registered repo name (any operator) or admin-only absolute path.
 	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
 	if err != nil {
@@ -67,6 +55,13 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 	manifest, err := repo.GetManifest(req.VmName, req.Timestamp, req.DiskName)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "manifest: %v", err)
+	}
+	// Authorize against the project the backup actually belongs to (live row if
+	// it still exists, else the manifest's embedded VM spec) — NOT a _default
+	// fallback, which would let a default-scoped operator restore/read another
+	// project's backup by name. If neither yields a project, require admin.
+	if err := s.authorizeVMRestore(ctx, req.VmName, manifest); err != nil {
+		return err
 	}
 
 	reader, err := pbsstore.NewManifestReader(repo, manifest)

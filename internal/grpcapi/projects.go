@@ -23,38 +23,31 @@ func (s *Server) CreateProject(ctx context.Context, req *pb.CreateProjectRequest
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
-	// Store the CANONICAL bare form ("/acme" and "acme" → "acme") so the stored
-	// name matches how projects are referenced elsewhere (VM/ct rows, quota) and
-	// can't diverge by a leading slash.
-	canon, err := safename.CanonicalProjectName(req.Name)
-	if err != nil {
+	// Validate the (hierarchical) name + parent reject a traversal/bad segment.
+	// The name is stored as given (the project identity used by VM/ct rows and
+	// quota lookups is the raw string); RBAC paths are canonicalized separately
+	// by projectRBACBase, so "/acme" and "acme" resolve to the same auth path.
+	if _, err := safename.CanonicalProjectName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	name := strings.TrimPrefix(canon, "/")
-	if name == "" {
-		return nil, status.Error(codes.InvalidArgument, "name must not be the cluster root")
-	}
-	parent := req.ParentName
-	if parent != "" {
-		pc, perr := safename.CanonicalProjectName(parent)
-		if perr != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "parent: %v", perr)
+	if req.ParentName != "" {
+		if _, err := safename.CanonicalProjectName(req.ParentName); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "parent: %v", err)
 		}
-		parent = strings.TrimPrefix(pc, "/")
 	}
 	rec := corrosion.ProjectRecord{
-		Name:       name,
+		Name:       req.Name,
 		Display:    req.Display,
-		ParentName: parent,
+		ParentName: req.ParentName,
 	}
 	if err := corrosion.InsertProject(ctx, s.db, rec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "create project: %v", err)
 	}
-	got, err := corrosion.GetProject(ctx, s.db, name)
+	got, err := corrosion.GetProject(ctx, s.db, req.Name)
 	if err != nil || got == nil {
 		return nil, status.Errorf(codes.Internal, "read back project: %v", err)
 	}
-	s.audit(ctx, "project.create", name, "", "ok")
+	s.audit(ctx, "project.create", req.Name, "", "ok")
 	return projectToPB(got), nil
 }
 

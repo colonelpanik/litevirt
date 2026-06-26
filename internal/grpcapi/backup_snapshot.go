@@ -459,15 +459,6 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 		return status.Error(codes.InvalidArgument,
 			"repo_path, vm_name, disk_name, timestamp, target_path all required")
 	}
-	// Restore may target a VM that no longer exists (disaster recovery),
-	// so fall back to the default-project path when the record is gone.
-	rbacPath := vmRBACPathFor("", req.VmName)
-	if vm, gerr := corrosion.GetVM(ctx, s.db, req.VmName); gerr == nil && vm != nil {
-		rbacPath = vmRBACPath(vm)
-	}
-	if err := s.RequirePerm(ctx, rbacPath, "backup.restore", "operator"); err != nil {
-		return err
-	}
 	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
 	if err != nil {
 		return err
@@ -486,6 +477,11 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	manifest, err := repo.GetManifest(req.VmName, req.Timestamp, req.DiskName)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "manifest: %v", err)
+	}
+	// Authorize against the backup's actual project (live row, else the manifest
+	// spec; admin when undeterminable) — not a _default fallback.
+	if err := s.authorizeVMRestore(ctx, req.VmName, manifest); err != nil {
+		return err
 	}
 
 	send := func(p *pb.RestoreFromBackupProgress) error { return stream.Send(p) }

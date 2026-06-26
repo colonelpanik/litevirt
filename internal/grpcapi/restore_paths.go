@@ -2,15 +2,83 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
+
+// authorizeVMRestore enforces backup.restore on the project a VM backup belongs
+// to: the live row's project if the VM still exists, else the project embedded
+// in the manifest's VM spec. A restore must NEVER silently authorize against the
+// default project — that would let a default-scoped operator restore/read
+// another project's backup by name. When the project can't be determined (no
+// live row and no embedded spec project), restore requires the admin role.
+func (s *Server) authorizeVMRestore(ctx context.Context, vmName string, m *pbsstore.Manifest) error {
+	project, ok := s.deriveVMProject(ctx, vmName, m)
+	if !ok {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			return status.Error(codes.PermissionDenied,
+				"cannot determine the backup's project (no live VM, no embedded spec); restore requires the admin role")
+		}
+		project = tenancy.Default
+	}
+	return s.RequirePerm(ctx, vmRBACPathFor(project, vmName), "backup.restore", "operator")
+}
+
+func (s *Server) deriveVMProject(ctx context.Context, vmName string, m *pbsstore.Manifest) (string, bool) {
+	if vm, _ := corrosion.GetVM(ctx, s.db, vmName); vm != nil {
+		return vm.Project, true
+	}
+	if m != nil && m.VMSpecJSON != "" {
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(m.VMSpecJSON), &spec) == nil && spec.Project != "" {
+			return spec.Project, true
+		}
+	}
+	return "", false
+}
+
+// authorizeContainerRestore is the container analogue: it enforces
+// backup.restore on the project the backup belongs to (live row, else the
+// manifest's embedded container spec; admin when undeterminable) and returns
+// that project so the restored row lands in it (never the manifest-claimed
+// project the caller wasn't authorized for).
+func (s *Server) authorizeContainerRestore(ctx context.Context, name string, m *pbsstore.Manifest) (string, error) {
+	project, ok := s.deriveContainerProject(ctx, name, m)
+	if !ok {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			return "", status.Error(codes.PermissionDenied,
+				"cannot determine the backup's project (no live container, no embedded spec); restore requires the admin role")
+		}
+		project = tenancy.Default
+	}
+	if err := s.RequirePerm(ctx, ctRBACPathFor(project, name), "backup.restore", "operator"); err != nil {
+		return "", err
+	}
+	return project, nil
+}
+
+func (s *Server) deriveContainerProject(ctx context.Context, name string, m *pbsstore.Manifest) (string, bool) {
+	if rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, name); rec != nil {
+		return rec.Project, true
+	}
+	if m != nil && m.ContainerSpecJSON != "" {
+		var spec containerBackupSpec
+		if json.Unmarshal([]byte(m.ContainerSpecJSON), &spec) == nil && spec.Project != "" {
+			return spec.Project, true
+		}
+	}
+	return "", false
+}
 
 // SetBackupRepos records the daemon's configured repo-name → path map so the
 // RPC handlers can resolve a request's repo_path the same way the scheduler

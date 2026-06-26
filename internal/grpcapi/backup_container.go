@@ -188,13 +188,6 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	// Restore may target a name that no longer exists (disaster recovery); the
-	// project comes from the existing row if present, else from the manifest.
-	project := s.containerProject(ctx, "", req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "backup.restore", "operator"); err != nil {
-		s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
-		return err
-	}
 
 	target := req.HostName
 	if target == "" {
@@ -208,16 +201,6 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
-	unlock := s.lockVM("ct/" + req.Name)
-	defer unlock()
-
-	// Refuse to clobber a live container of the same name on this host.
-	if existing, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); existing != nil {
-		return status.Errorf(codes.AlreadyExists,
-			"container %q already exists on host %q; delete it first or restore under a different name",
-			req.Name, s.hostName)
-	}
-
 	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
 	if err != nil {
 		return err
@@ -229,6 +212,25 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	manifest, err := repo.GetManifest(req.Name, req.Timestamp, containerBackupDisk)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "manifest: %v", err)
+	}
+	// Authorize against the backup's actual project (live row, else the manifest
+	// spec; admin when undeterminable) and use that project for the restored row
+	// — never a _default fallback (cross-project read) nor the unauthenticated
+	// manifest-claimed project.
+	project, err := s.authorizeContainerRestore(ctx, req.Name, manifest)
+	if err != nil {
+		s.audit(ctx, "ct.restore", req.Name, "denied", "denied")
+		return err
+	}
+
+	unlock := s.lockVM("ct/" + req.Name)
+	defer unlock()
+
+	// Refuse to clobber a live container of the same name on this host.
+	if existing, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); existing != nil {
+		return status.Errorf(codes.AlreadyExists,
+			"container %q already exists on host %q; delete it first or restore under a different name",
+			req.Name, s.hostName)
 	}
 
 	send := func(p *pb.RestoreContainerProgress) error { return stream.Send(p) }

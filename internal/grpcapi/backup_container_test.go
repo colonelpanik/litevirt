@@ -85,15 +85,17 @@ func TestBackupContainer_RoundTrip(t *testing.T) {
 	if err != nil || row == nil {
 		t.Fatalf("restored row missing: %v", err)
 	}
-	// The descriptive fields (cpu/mem/image) come from the manifest spec, but the
-	// PROJECT does not: the manifest is untrusted, so the restored row lands in
-	// the project the permission check was made against (here the default, since
-	// the row was deleted), never a project the caller wasn't authorized for.
+	// The restored row uses the project the permission check was made against:
+	// with the live row deleted, that project is derived from the manifest's
+	// embedded spec ("acme") and the (admin) caller is authorized for it, so the
+	// container is restored back into its original project. A caller NOT
+	// authorized for "acme" would be denied rather than silently landing it in
+	// the default project.
 	if row.State != "stopped" || row.CPULimit != 2 || row.MemMiB != 256 || row.Image != "alpine:3.19" {
 		t.Errorf("restored row = %+v, want cpu=2 mem=256 image=alpine:3.19 stopped", row)
 	}
-	if row.Project != "_default" {
-		t.Errorf("restored project = %q, want _default (authorized project, not the manifest's)", row.Project)
+	if row.Project != "acme" {
+		t.Errorf("restored project = %q, want acme (manifest-derived, caller authorized)", row.Project)
 	}
 }
 

@@ -25,9 +25,57 @@ import (
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/vfio"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
+
+// authorizeMigrationHelper is the REAL authorization for the target-side
+// migration helper RPCs (EnsureCloudInit/EnsureDisks/EnsureFirmwareState/
+// CleanupMigrationArtifacts). requirePermPrecheck is NOT an auth grant (any
+// binding-holder passes it), so these helpers — which create/remove host files
+// and can define a domain — must additionally require vm.migrate on the VM
+// being migrated. The VM record is replicated cluster-wide during migration, so
+// it resolves on the target even though the source still owns it.
+func (s *Server) authorizeMigrationHelper(ctx context.Context, vmName string) (*corrosion.VMRecord, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", vmName)
+	}
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.migrate", "operator"); err != nil {
+		return nil, err
+	}
+	return vm, nil
+}
+
+// withinDiskArtifactRoot reports whether p is inside a directory where VM disk
+// artifacts legitimately live — the default disks dir or a file-backed storage
+// pool's directory. The migration helpers bound their create/remove to these
+// roots so they can never touch e.g. {dataDir}/state.db just because it's under
+// the data dir.
+func (s *Server) withinDiskArtifactRoot(p string) bool {
+	if withinDir(filepath.Join(s.dataDir, "disks"), p) {
+		return true
+	}
+	s.storagePoolsMu.RLock()
+	pools := make([]StoragePoolRef, 0, len(s.storagePools))
+	for _, pr := range s.storagePools {
+		pools = append(pools, pr)
+	}
+	s.storagePoolsMu.RUnlock()
+	for _, pr := range pools {
+		if !isFileBasedDriver(pr.Driver) {
+			continue
+		}
+		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && withinDir(dir, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // MigrateVM performs a live migration of a VM to a target host.
 // It streams MigrateProgress messages back to the caller.
@@ -628,7 +676,7 @@ func (s *Server) reattachVFsOnTarget(ctx context.Context, targetHostName, addr s
 // EnsureCloudInit generates a cloud-init ISO on this host if it doesn't already exist.
 // Called by the source host before migration so the target has the ISO ready.
 func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
-	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
 	isoPath, err := lv.SafeCloudInitISOPath(s.dataDir, req.VmName)
@@ -659,15 +707,15 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 // libvirt's domain XML validation passes before block copy starts.
 // Called by the source host before --with-storage migration.
 func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*emptypb.Empty, error) {
-	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
 	for _, stub := range req.Disks {
-		// Only ever create stubs under our data dir — never an arbitrary path a
-		// caller hands us (matches CleanupMigrationArtifacts' constraint, so a
-		// stub created here is also the one cleanup can remove).
-		if !withinDir(s.dataDir, stub.Path) {
-			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is outside the data dir", stub.Path)
+		// Only ever create stubs in a real disk-artifact root (the disks dir or a
+		// file-backed pool dir) — never an arbitrary path under the data dir such
+		// as state.db.
+		if !s.withinDiskArtifactRoot(stub.Path) {
+			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is not in a disk-artifact root", stub.Path)
 		}
 		if _, err := os.Stat(stub.Path); err == nil {
 			continue // already exists
@@ -694,11 +742,11 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 // (NVRAM + swtpm) pushed by a cold-migration source, so libvirt can define the
 // domain here with its BitLocker-binding state intact (G1). Mirrors EnsureDisks.
 func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmwareStateRequest) (*emptypb.Empty, error) {
-	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
-		return nil, err
-	}
 	if req.VmName == "" || len(req.Bundle) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "vm_name and a non-empty firmware bundle are required")
+	}
+	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
+		return nil, err
 	}
 	// vm_name + uuid index into on-disk firmware paths, so validate them to a safe
 	// charset (no path traversal). And refuse to materialize state under a domain
@@ -906,17 +954,30 @@ func (s *Server) rollbackFirmwareTarget(targetHost, vmName, uuid string) {
 // are orphaned; leaving them leaks space and shadows a later retry. Best-effort
 // per file — a missing file is not an error.
 func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
-	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
-		return nil, err
+	if err := safename.ValidateVMName(req.VmName); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Require vm.migrate on the VM being cleaned up. A failed migration leaves the
+	// VM record intact (the source still owns it); only when the VM has truly
+	// vanished do we fall back to admin (orphan cleanup), so a binding-holder
+	// can't drive this RPC against a VM they don't control.
+	if vm, _ := corrosion.GetVM(ctx, s.db, req.VmName); vm != nil {
+		if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.migrate", "operator"); err != nil {
+			return nil, err
+		}
+	} else if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, status.Error(codes.PermissionDenied,
+			"cleaning up artifacts of a vanished VM requires the admin role")
 	}
 	for _, p := range req.DiskPaths {
 		if p == "" {
 			continue
 		}
-		// Only ever remove paths under our data dir — never an arbitrary path a
-		// caller hands us (this RPC would otherwise delete any file the daemon can).
-		if !withinDir(s.dataDir, p) {
-			slog.Warn("cleanup migration artifacts: refusing to remove path outside dataDir", "vm", req.VmName, "path", p)
+		// Only ever remove paths in a real disk-artifact root (disks dir or a
+		// file-backed pool dir) — never an arbitrary file under the data dir such
+		// as state.db.
+		if !s.withinDiskArtifactRoot(p) {
+			slog.Warn("cleanup migration artifacts: refusing to remove path outside a disk-artifact root", "vm", req.VmName, "path", p)
 			continue
 		}
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {

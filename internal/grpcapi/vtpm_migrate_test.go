@@ -79,6 +79,9 @@ func TestEnsureFirmwareState_MaterializesNvram(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	ctx := adminCtx()
+	// The migrating VM's record is replicated to the target during migration;
+	// EnsureFirmwareState authorizes vm.migrate against it.
+	insertTestVM(t, ctx, s.db, "win", s.hostName, "stopped")
 
 	// Build an NVRAM-only bundle (uuid "" → no swtpm member, so no root-owned path).
 	src := lv.NvramPath(s.dataDir, "src")
@@ -128,6 +131,7 @@ func TestEnsureFirmwareState_DefinesDomain(t *testing.T) {
 	fake := libvirtfake.New()
 	s.virt = fake
 	s.dataDir = t.TempDir()
+	insertTestVM(t, adminCtx(), s.db, "win", s.hostName, "stopped")
 	if _, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{
 		VmName: "win", Bundle: nvramBundle(t, s.dataDir),
 		DomainXml: `<domain type='kvm'><name>win</name></domain>`,
@@ -146,6 +150,7 @@ func TestEnsureFirmwareState_DefineFailureWipesFirmware(t *testing.T) {
 	fake.FailDefineDomain = func(string) error { return errors.New("define boom") }
 	s.virt = fake
 	s.dataDir = t.TempDir()
+	insertTestVM(t, adminCtx(), s.db, "win", s.hostName, "stopped")
 	_, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{
 		VmName: "win", Bundle: nvramBundle(t, s.dataDir),
 		DomainXml: `<domain type='kvm'><name>win</name></domain>`,
@@ -165,6 +170,7 @@ func TestEnsureFirmwareState_FingerprintMismatchRefused(t *testing.T) {
 	fake := libvirtfake.New()
 	s.virt = fake
 	s.dataDir = t.TempDir()
+	insertTestVM(t, adminCtx(), s.db, "win", s.hostName, "stopped")
 	_, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{
 		VmName: "win", Bundle: nvramBundle(t, s.dataDir),
 		DomainXml:                 `<domain type='kvm'><name>win</name></domain>`,
@@ -188,6 +194,7 @@ func TestEnsureFirmwareState_XMLIdentityMismatchRejected(t *testing.T) {
 	fake := libvirtfake.New()
 	s.virt = fake
 	s.dataDir = t.TempDir()
+	insertTestVM(t, adminCtx(), s.db, "win", s.hostName, "stopped")
 	_, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{
 		VmName: "win", Bundle: nvramBundle(t, s.dataDir),
 		DomainXml: `<domain type='kvm'><name>evil</name></domain>`, // name != win
@@ -246,6 +253,7 @@ func TestEnsureFirmwareState_RefusesExistingDomain(t *testing.T) {
 	if err := fake.DefineDomain(`<domain type='kvm'><name>win</name></domain>`); err != nil {
 		t.Fatalf("DefineDomain: %v", err)
 	}
+	insertTestVM(t, adminCtx(), s.db, "win", s.hostName, "stopped")
 	_, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{VmName: "win", Bundle: []byte("x")})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition materializing over an existing domain, got %v", err)

@@ -1338,7 +1338,7 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		progressCh := make(chan image.PullProgress, 10)
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- image.Pull(s.images, img, def.Source, def.Checksum, progressCh)
+			errCh <- image.Pull(s.images, img, def.Source, def.Checksum, s.imagePullOptions(), progressCh)
 		}()
 
 		// Drain progress, forwarding to deploy stream.

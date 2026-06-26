@@ -2,9 +2,7 @@ package ui
 
 import (
 	"context"
-	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -162,37 +160,12 @@ func (s *Server) handleBackupProgress(w http.ResponseWriter, r *http.Request) {
 	s.renderFragment(w, "backup_progress.html", val.(*backupOpState))
 }
 
-// handleExportDisk streams a VM's raw disk as a file download. This is the old
-// "Backup" behavior, now relabeled "Export disk image" — a clearly-secondary
-// action distinct from a real repo backup.
+// handleExportDisk is DEPRECATED. The raw full-disk stream (BackupVM) is retired
+// in favor of repo-backed snapshot backups, so this surfaces a clear message
+// rather than calling the dead RPC.
 func (s *Server) handleExportDisk(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	stream, err := s.grpc.BackupVM(s.uiBearerCtx(r), &pb.BackupVMRequest{VmName: name})
-	if err != nil {
-		http.Error(w, "Export failed: "+err.Error(), 500)
-		return
-	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.img", name))
-	// A disk export streams multi-GB for longer than 30s; without clearing the
-	// server WriteTimeout the download is silently truncated mid-stream.
-	disableStreamWriteTimeout(w)
-	for {
-		chunk, err := stream.Recv()
-		if isEOF(err) {
-			return
-		}
-		if err != nil {
-			slog.Error("export disk stream error", "vm", name, "error", err)
-			return
-		}
-		if _, err := w.Write(chunk.Data); err != nil {
-			return
-		}
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	}
+	sendToast(w, "Raw disk export is deprecated; create a backup snapshot to a repo instead.", "error")
+	w.WriteHeader(http.StatusGone)
 }
 
 // ── C3: restore (RestoreFromBackup) and live restore (RestoreLive) ────────────

@@ -55,6 +55,13 @@ type Config struct {
 	// skips any VM whose backup.repo cannot be resolved locally.
 	BackupRepos map[string]string `yaml:"backup_repos,omitempty"`
 
+	// MaxImageBytes caps a single image pull/import (disk-fill guard);
+	// ImagePullTimeoutSec bounds a pull's total wall time (SSRF/slowloris
+	// guard). Zero on either falls back to the image package's defaults
+	// (64 GiB / 30 min).
+	MaxImageBytes       int64 `yaml:"max_image_bytes,omitempty"`
+	ImagePullTimeoutSec int   `yaml:"image_pull_timeout_sec,omitempty"`
+
 	// BillingWebhookURL receives JSON-formatted metered events from
 	// internal/billing on every VM lifecycle transition. Empty
 	// disables the emitter (NopEmitter).

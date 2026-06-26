@@ -133,7 +133,7 @@ func TestHandleBackups_RealRepo(t *testing.T) {
 	}
 	m := &pbsstore.Manifest{
 		VMName: "vm1", DiskName: "root", Timestamp: "2026-05-10T01:23:45Z",
-		TotalSize: 4096, Chunks: []pbsstore.ChunkRef{{ID: "abcd", Size: 4096, Offset: 0}},
+		TotalSize: 4096, Chunks: []pbsstore.ChunkRef{{ID: strings.Repeat("a", 64), Size: 4096, Offset: 0}},
 	}
 	if err := repo.PutManifest(m); err != nil {
 		t.Fatalf("PutManifest: %v", err)

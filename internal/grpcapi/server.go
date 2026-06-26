@@ -44,6 +44,12 @@ type Server struct {
 	// unregistered path is admin-only (resolveBackupRepoPath).
 	backupRepos map[string]string
 
+	// imageMaxBytes / imagePullTimeout bound image pull+import (disk-fill /
+	// SSRF guards), set from daemon config via SetImageLimits. Zero → the image
+	// package defaults apply.
+	imageMaxBytes    int64
+	imagePullTimeout time.Duration
+
 	// Session lifetimes. Zero means "use the package default" (see
 	// idleTimeout/hardExpiry); set from daemon config via SetSessionTimeouts.
 	// Per-node — sessions store an absolute ExpiresAt at login, so a mixed

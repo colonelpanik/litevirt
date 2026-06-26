@@ -78,6 +78,10 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 			}
 			hasher.Write(req.Chunk)
 			total += int64(n)
+			if total > s.maxImageBytes() {
+				return status.Errorf(codes.InvalidArgument,
+					"image import exceeds the %d-byte ceiling", s.maxImageBytes())
+			}
 		}
 	}
 
@@ -140,12 +144,21 @@ func (s *Server) PushImage(req *pb.PushImageRequest, stream pb.LiteVirt_PushImag
 	if req.Name == "" || req.TargetHost == "" {
 		return status.Error(codes.InvalidArgument, "name and target_host required")
 	}
+	if err := safename.ValidateImageName(req.Name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 
 	// Verify image exists locally.
 	srcPath := s.images.ImagePath(req.Name)
 	info, err := os.Stat(srcPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "image %q not found locally", req.Name)
+	}
+	// Fail source-side before streaming if the local file already exceeds the
+	// ceiling (the target enforces it again as defense-in-depth).
+	if info.Size() > s.maxImageBytes() {
+		return status.Errorf(codes.InvalidArgument,
+			"image %q is %d bytes, over the %d-byte ceiling", req.Name, info.Size(), s.maxImageBytes())
 	}
 
 	// Look up image metadata for checksum.

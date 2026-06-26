@@ -498,6 +498,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// the operator adds a repo).
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
 	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
+	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second)
 	d.snapScheduler.ReplRunner = svc      // *grpcapi.Server implements RunReplication
 	go d.snapScheduler.Run(ctx)
 

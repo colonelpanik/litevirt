@@ -222,7 +222,7 @@ func TestPull_Success(t *testing.T) {
 	s.Init()
 
 	ch := make(chan PullProgress, 100)
-	err := Pull(s, "test-img", srv.URL+"/image.qcow2", "", ch)
+	err := Pull(s, "test-img", srv.URL+"/image.qcow2", "", PullOptions{}, ch)
 	if err != nil {
 		t.Fatalf("Pull: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestPull_WithChecksum(t *testing.T) {
 	s.Init()
 
 	ch := make(chan PullProgress, 100)
-	err := Pull(s, "verified-img", srv.URL+"/image.qcow2", checksum, ch)
+	err := Pull(s, "verified-img", srv.URL+"/image.qcow2", checksum, PullOptions{}, ch)
 	if err != nil {
 		t.Fatalf("Pull with valid checksum: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestPull_ChecksumMismatch(t *testing.T) {
 	s.Init()
 
 	ch := make(chan PullProgress, 100)
-	err := Pull(s, "bad-checksum", srv.URL+"/image.qcow2", badChecksum, ch)
+	err := Pull(s, "bad-checksum", srv.URL+"/image.qcow2", badChecksum, PullOptions{}, ch)
 	if err == nil {
 		t.Fatal("expected checksum mismatch error")
 	}
@@ -317,7 +317,7 @@ func TestPull_HTTPError(t *testing.T) {
 	s.Init()
 
 	ch := make(chan PullProgress, 100)
-	err := Pull(s, "missing", srv.URL+"/notfound", "", ch)
+	err := Pull(s, "missing", srv.URL+"/notfound", "", PullOptions{}, ch)
 	if err == nil {
 		t.Fatal("expected error for HTTP 404")
 	}
@@ -342,7 +342,7 @@ func TestPull_ChecksumWithoutPrefix(t *testing.T) {
 	s.Init()
 
 	ch := make(chan PullProgress, 100)
-	err := Pull(s, "no-prefix", srv.URL+"/img", checksum, ch)
+	err := Pull(s, "no-prefix", srv.URL+"/img", checksum, PullOptions{}, ch)
 	if err != nil {
 		t.Fatalf("Pull with unprefixed checksum: %v", err)
 	}
@@ -371,7 +371,7 @@ func TestPull_ProgressReporting(t *testing.T) {
 	s.Init()
 
 	ch := make(chan PullProgress, 1000)
-	err := Pull(s, "progress-test", srv.URL+"/img", "", ch)
+	err := Pull(s, "progress-test", srv.URL+"/img", "", PullOptions{}, ch)
 	if err != nil {
 		t.Fatalf("Pull: %v", err)
 	}

@@ -64,6 +64,7 @@ func (s *Server) autoDefineRestoredVM(
 	repo *pbsstore.Repo,
 	manifest *pbsstore.Manifest,
 	overlayPath string,
+	project string,
 	send func(*pb.RestoreLiveProgress) error,
 ) (string, string, error) {
 	if s.virt == nil {
@@ -85,6 +86,11 @@ func (s *Server) autoDefineRestoredVM(
 	if !validRestoreName(targetName) {
 		return "", "", status.Errorf(codes.InvalidArgument, "invalid restore name %q", targetName)
 	}
+	// This path creates a RUNNING managed VM, so beyond backup.restore the caller
+	// must hold vm.create on the target name in the (authorized) restore project.
+	if err := s.RequirePerm(ctx, vmRBACPathFor(project, targetName), "vm.create", "operator"); err != nil {
+		return "", "", err
+	}
 
 	// Collision guard: never clobber a live VM. The operator passes
 	// --name to restore alongside the original.
@@ -99,6 +105,9 @@ func (s *Server) autoDefineRestoredVM(
 
 	renamed := targetName != originalName
 	spec.Name = targetName
+	// Force the restored VM into the authorized restore project — never let it
+	// fall through to the default project (InsertVM's "" → _default).
+	spec.Project = project
 
 	// Firmware-state travel (G1): a Secure-Boot/vTPM VM's NVRAM + swtpm bind
 	// BitLocker. Re-home them onto this host under a FRESH identity (so a
@@ -241,6 +250,7 @@ func (s *Server) autoDefineRestoredVM(
 	vmRecord := corrosion.VMRecord{
 		Name: targetName, HostName: s.hostName, Spec: string(specJSON),
 		State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
+		Project: project,
 	}
 	if err := corrosion.InsertVM(ctx, s.db, vmRecord, ifaceRecords, diskRecords); err != nil {
 		if fwVM {

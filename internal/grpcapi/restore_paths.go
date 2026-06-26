@@ -16,50 +16,70 @@ import (
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
-// authorizeVMRestore enforces backup.restore on the project a VM backup belongs
-// to: the live row's project if the VM still exists, else the project embedded
-// in the manifest's VM spec. A restore must NEVER silently authorize against the
-// default project — that would let a default-scoped operator restore/read
-// another project's backup by name. When the project can't be determined (no
-// live row and no embedded spec project), restore requires the admin role.
-func (s *Server) authorizeVMRestore(ctx context.Context, vmName string, m *pbsstore.Manifest) error {
-	project, ok := s.deriveVMProject(ctx, vmName, m)
-	if !ok {
-		if err := RequireRole(ctx, "admin"); err != nil {
-			return status.Error(codes.PermissionDenied,
-				"cannot determine the backup's project (no live VM, no embedded spec); restore requires the admin role")
+// restoreAuthDecision resolves which project a restore is authorized against
+// and returns it for downstream use (e.g. forcing it onto the restored record).
+//
+// The manifest's embedded project is AUTHORITATIVE — it is the project the
+// backup belongs to. The live row (if the name currently exists) is only a
+// fallback for legacy manifests that carry no project. Crucially, if the
+// manifest's project differs from a current same-named resource's project
+// (project A reused a name from project B), the restore would let one tenant
+// read/write across the boundary, so it requires admin. When neither the
+// manifest nor a live row yields a project, it also requires admin.
+func (s *Server) restoreAuthDecision(ctx context.Context, manifestProject, liveProject string, liveExists bool) (string, error) {
+	switch {
+	case manifestProject != "":
+		// Backup's own project wins. A mismatch with a current same-named
+		// resource is a name-reuse cross-tenant hazard → admin only.
+		if liveExists && tenancy.NormalizeProject(manifestProject) != tenancy.NormalizeProject(liveProject) {
+			if err := RequireRole(ctx, "admin"); err != nil {
+				return "", status.Error(codes.PermissionDenied,
+					"the backup's project differs from the current resource's project (name reuse); restore requires the admin role")
+			}
 		}
-		project = tenancy.Default
-	}
-	return s.RequirePerm(ctx, vmRBACPathFor(project, vmName), "backup.restore", "operator")
-}
-
-func (s *Server) deriveVMProject(ctx context.Context, vmName string, m *pbsstore.Manifest) (string, bool) {
-	if vm, _ := corrosion.GetVM(ctx, s.db, vmName); vm != nil {
-		return vm.Project, true
-	}
-	if m != nil && m.VMSpecJSON != "" {
-		var spec pb.VMSpec
-		if json.Unmarshal([]byte(m.VMSpecJSON), &spec) == nil && spec.Project != "" {
-			return spec.Project, true
-		}
-	}
-	return "", false
-}
-
-// authorizeContainerRestore is the container analogue: it enforces
-// backup.restore on the project the backup belongs to (live row, else the
-// manifest's embedded container spec; admin when undeterminable) and returns
-// that project so the restored row lands in it (never the manifest-claimed
-// project the caller wasn't authorized for).
-func (s *Server) authorizeContainerRestore(ctx context.Context, name string, m *pbsstore.Manifest) (string, error) {
-	project, ok := s.deriveContainerProject(ctx, name, m)
-	if !ok {
+		return manifestProject, nil
+	case liveExists:
+		// Legacy manifest with no embedded project: scope to the live row.
+		return liveProject, nil
+	default:
+		// No manifest project and no live row → can't scope; require admin.
 		if err := RequireRole(ctx, "admin"); err != nil {
 			return "", status.Error(codes.PermissionDenied,
-				"cannot determine the backup's project (no live container, no embedded spec); restore requires the admin role")
+				"cannot determine the backup's project (no embedded spec, no live resource); restore requires the admin role")
 		}
-		project = tenancy.Default
+		return tenancy.Default, nil
+	}
+}
+
+// authorizeVMRestore enforces backup.restore on the project a VM backup belongs
+// to (manifest-derived, with the name-reuse / undeterminable cases gated on
+// admin — see restoreAuthDecision).
+func (s *Server) authorizeVMRestore(ctx context.Context, vmName string, m *pbsstore.Manifest) (string, error) {
+	liveProject, liveExists := "", false
+	if vm, _ := corrosion.GetVM(ctx, s.db, vmName); vm != nil {
+		liveProject, liveExists = vm.Project, true
+	}
+	project, err := s.restoreAuthDecision(ctx, manifestVMProject(m), liveProject, liveExists)
+	if err != nil {
+		return "", err
+	}
+	if err := s.RequirePerm(ctx, vmRBACPathFor(project, vmName), "backup.restore", "operator"); err != nil {
+		return "", err
+	}
+	return project, nil
+}
+
+// authorizeContainerRestore is the container analogue; it returns the resolved
+// project so the rebuilt row lands in the backup's project (when authorized),
+// never the unauthenticated manifest-claimed project blindly.
+func (s *Server) authorizeContainerRestore(ctx context.Context, name string, m *pbsstore.Manifest) (string, error) {
+	liveProject, liveExists := "", false
+	if rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, name); rec != nil {
+		liveProject, liveExists = rec.Project, true
+	}
+	project, err := s.restoreAuthDecision(ctx, manifestContainerProject(m), liveProject, liveExists)
+	if err != nil {
+		return "", err
 	}
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, name), "backup.restore", "operator"); err != nil {
 		return "", err
@@ -67,17 +87,26 @@ func (s *Server) authorizeContainerRestore(ctx context.Context, name string, m *
 	return project, nil
 }
 
-func (s *Server) deriveContainerProject(ctx context.Context, name string, m *pbsstore.Manifest) (string, bool) {
-	if rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, name); rec != nil {
-		return rec.Project, true
-	}
-	if m != nil && m.ContainerSpecJSON != "" {
-		var spec containerBackupSpec
-		if json.Unmarshal([]byte(m.ContainerSpecJSON), &spec) == nil && spec.Project != "" {
-			return spec.Project, true
+// manifestVMProject returns the project embedded in a VM backup manifest's spec
+// ("" when absent — a legacy manifest).
+func manifestVMProject(m *pbsstore.Manifest) string {
+	if m != nil && m.VMSpecJSON != "" {
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(m.VMSpecJSON), &spec) == nil {
+			return spec.Project
 		}
 	}
-	return "", false
+	return ""
+}
+
+func manifestContainerProject(m *pbsstore.Manifest) string {
+	if m != nil && m.ContainerSpecJSON != "" {
+		var spec containerBackupSpec
+		if json.Unmarshal([]byte(m.ContainerSpecJSON), &spec) == nil {
+			return spec.Project
+		}
+	}
+	return ""
 }
 
 // SetBackupRepos records the daemon's configured repo-name → path map so the

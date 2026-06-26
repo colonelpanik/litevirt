@@ -270,7 +270,7 @@ func TestRestore_FirmwareVMWithoutCapturedStateRefused(t *testing.T) {
 		VmName: "win",
 		Spec:   &pb.VMSpec{Name: "win", Cpu: 2, MemoryMib: 2048, Machine: "q35", Firmware: "uefi", SecureBoot: true},
 	}
-	_, _, err = s.autoDefineRestoredVM(ctx, req, repo, manifest, "/tmp/overlay.qcow2", func(*pb.RestoreLiveProgress) error { return nil })
+	_, _, err = s.autoDefineRestoredVM(ctx, req, repo, manifest, "/tmp/overlay.qcow2", "_default", func(*pb.RestoreLiveProgress) error { return nil })
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition restoring an SB VM with no captured firmware, got %v", err)
 	}
@@ -418,7 +418,7 @@ func TestRestore_FirmwareMaterializeRollbackOnDefineFailure(t *testing.T) {
 		VmName: "win",
 		Spec:   &pb.VMSpec{Name: "win", Cpu: 2, MemoryMib: 2048, Machine: "q35", Firmware: "uefi", SecureBoot: true},
 	}
-	_, _, err = s.autoDefineRestoredVM(context.Background(), req, repo, manifest, "/tmp/o.qcow2", func(*pb.RestoreLiveProgress) error { return nil })
+	_, _, err = s.autoDefineRestoredVM(adminCtx(), req, repo, manifest, "/tmp/o.qcow2", "_default", func(*pb.RestoreLiveProgress) error { return nil })
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("expected Internal (define failed), got %v", err)
 	}

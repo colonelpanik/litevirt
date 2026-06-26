@@ -56,11 +56,12 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 	if err != nil {
 		return status.Errorf(codes.NotFound, "manifest: %v", err)
 	}
-	// Authorize against the project the backup actually belongs to (live row if
-	// it still exists, else the manifest's embedded VM spec) — NOT a _default
-	// fallback, which would let a default-scoped operator restore/read another
-	// project's backup by name. If neither yields a project, require admin.
-	if err := s.authorizeVMRestore(ctx, req.VmName, manifest); err != nil {
+	// Authorize against the project the backup belongs to (its manifest spec,
+	// authoritative; a name-reuse mismatch with a live row, or an undeterminable
+	// project, requires admin) — never a _default fallback that would let a
+	// default-scoped operator restore/read another project's backup by name.
+	authProject, err := s.authorizeVMRestore(ctx, req.VmName, manifest)
+	if err != nil {
 		return err
 	}
 
@@ -137,7 +138,7 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 	// resolved spec and boot it against the overlay so the operator
 	// needn't run virsh by hand.
 	if req.AutoStart {
-		name, rootDev, err := s.autoDefineRestoredVM(ctx, req, repo, manifest, target, stream.Send)
+		name, rootDev, err := s.autoDefineRestoredVM(ctx, req, repo, manifest, target, authProject, stream.Send)
 		if err != nil {
 			return err
 		}

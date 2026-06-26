@@ -478,9 +478,9 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	if err != nil {
 		return status.Errorf(codes.NotFound, "manifest: %v", err)
 	}
-	// Authorize against the backup's actual project (live row, else the manifest
-	// spec; admin when undeterminable) — not a _default fallback.
-	if err := s.authorizeVMRestore(ctx, req.VmName, manifest); err != nil {
+	// Authorize against the backup's actual project (manifest spec authoritative;
+	// name-reuse mismatch or undeterminable → admin) — not a _default fallback.
+	if _, err := s.authorizeVMRestore(ctx, req.VmName, manifest); err != nil {
 		return err
 	}
 

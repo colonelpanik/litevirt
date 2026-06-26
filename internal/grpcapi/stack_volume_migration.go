@@ -16,6 +16,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // defaultStackHealthWait caps the inter-VM health gate when the request
@@ -50,10 +51,13 @@ func (s *Server) MigrateStackVolumes(req *pb.MigrateStackVolumesRequest, stream 
 	if req.StackName == "" {
 		return status.Error(codes.InvalidArgument, "stack_name required")
 	}
+	if err := safename.ValidateStackName(req.StackName); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	if req.DefaultPool == "" && len(req.Placements) == 0 {
 		return status.Error(codes.InvalidArgument, "default_pool or at least one placement required")
 	}
-	if err := s.RequirePerm(ctx, "/projects/_default/stacks/"+req.StackName, "stack.move-volumes", "operator"); err != nil {
+	if err := s.RequirePerm(ctx, stackRBACPath(req.StackName), "stack.move-volumes", "operator"); err != nil {
 		return err
 	}
 

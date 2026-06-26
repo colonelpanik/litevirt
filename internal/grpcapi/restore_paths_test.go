@@ -8,30 +8,53 @@ import (
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
-// TestDeriveVMProject_FromManifestWhenRowGone verifies a restore for a VM whose
-// row is gone derives the project from the manifest's embedded spec — NOT a
-// default fallback — so authorization can't be made against the wrong project.
-func TestDeriveVMProject_FromManifestWhenRowGone(t *testing.T) {
-	s := testServer(t)
-	ctx := adminCtx()
-	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "gone", Project: "acme"})
-	if got, ok := s.deriveVMProject(ctx, "gone", &pbsstore.Manifest{VMSpecJSON: string(specJSON)}); !ok || got != "acme" {
-		t.Fatalf("deriveVMProject = %q,%v want acme,true", got, ok)
+// TestManifestProjectExtraction verifies the project is read from the manifest's
+// embedded spec (the backup's authoritative project), and "" for a legacy
+// manifest with no spec.
+func TestManifestProjectExtraction(t *testing.T) {
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm", Project: "acme"})
+	if got := manifestVMProject(&pbsstore.Manifest{VMSpecJSON: string(specJSON)}); got != "acme" {
+		t.Errorf("manifestVMProject = %q, want acme", got)
 	}
-	// No row and no embedded project → undeterminable (the handler then requires admin).
-	if _, ok := s.deriveVMProject(ctx, "gone", &pbsstore.Manifest{}); ok {
-		t.Error("deriveVMProject should be false with no row + no spec project")
+	if got := manifestVMProject(&pbsstore.Manifest{}); got != "" {
+		t.Errorf("manifestVMProject(legacy) = %q, want empty", got)
+	}
+	ctJSON, _ := json.Marshal(containerBackupSpec{Name: "ct", Project: "acme"})
+	if got := manifestContainerProject(&pbsstore.Manifest{ContainerSpecJSON: string(ctJSON)}); got != "acme" {
+		t.Errorf("manifestContainerProject = %q, want acme", got)
 	}
 }
 
-func TestDeriveContainerProject_FromManifestWhenRowGone(t *testing.T) {
+// TestRestoreAuthDecision verifies the manifest project wins, a name-reuse
+// mismatch with a live row requires admin (denied for a non-admin), and an
+// undeterminable project requires admin.
+func TestRestoreAuthDecision(t *testing.T) {
 	s := testServer(t)
-	ctx := adminCtx()
-	specJSON, _ := json.Marshal(containerBackupSpec{Name: "gone", Project: "acme"})
-	if got, ok := s.deriveContainerProject(ctx, "gone", &pbsstore.Manifest{ContainerSpecJSON: string(specJSON)}); !ok || got != "acme" {
-		t.Fatalf("deriveContainerProject = %q,%v want acme,true", got, ok)
+	op := userCtx("op", "operator")
+	adm := adminCtx()
+
+	// Manifest project present, no live row → use it (operator allowed to proceed
+	// to the per-path check, i.e. no admin gate here).
+	if proj, err := s.restoreAuthDecision(op, "acme", "", false); err != nil || proj != "acme" {
+		t.Errorf("manifest-only = %q,%v want acme,nil", proj, err)
 	}
-	if _, ok := s.deriveContainerProject(ctx, "gone", &pbsstore.Manifest{}); ok {
-		t.Error("deriveContainerProject should be false with no row + no spec project")
+	// Manifest project matches live row → use it, no admin gate.
+	if proj, err := s.restoreAuthDecision(op, "acme", "acme", true); err != nil || proj != "acme" {
+		t.Errorf("matching = %q,%v want acme,nil", proj, err)
+	}
+	// Manifest project differs from a live row (name reuse) → admin required.
+	if _, err := s.restoreAuthDecision(op, "acme", "other", true); err == nil {
+		t.Error("mismatch as operator should be denied (admin required)")
+	}
+	if proj, err := s.restoreAuthDecision(adm, "acme", "other", true); err != nil || proj != "acme" {
+		t.Errorf("mismatch as admin = %q,%v want acme,nil", proj, err)
+	}
+	// Legacy manifest (no project) with a live row → fall back to the row.
+	if proj, err := s.restoreAuthDecision(op, "", "team-x", true); err != nil || proj != "team-x" {
+		t.Errorf("legacy+row = %q,%v want team-x,nil", proj, err)
+	}
+	// No project anywhere → admin required.
+	if _, err := s.restoreAuthDecision(op, "", "", false); err == nil {
+		t.Error("undeterminable project as operator should be denied")
 	}
 }

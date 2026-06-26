@@ -56,3 +56,9 @@ func vmRBACPathFor(project, name string) string {
 func ctRBACPathFor(project, name string) string {
 	return projectRBACBase(project) + "/containers/" + safeRBACSegment(name)
 }
+
+// stackRBACPath builds the RBAC path for a stack under the default project,
+// validating the stack-name segment (a path-like name yields a sentinel).
+func stackRBACPath(stack string) string {
+	return projectRBACBase(tenancy.Default) + "/stacks/" + safeRBACSegment(stack)
+}

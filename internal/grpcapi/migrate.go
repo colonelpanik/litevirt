@@ -628,7 +628,13 @@ func (s *Server) reattachVFsOnTarget(ctx context.Context, targetHostName, addr s
 // EnsureCloudInit generates a cloud-init ISO on this host if it doesn't already exist.
 // Called by the source host before migration so the target has the ISO ready.
 func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
-	isoPath := lv.CloudInitISOPath(s.dataDir, req.VmName)
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return nil, err
+	}
+	isoPath, err := lv.SafeCloudInitISOPath(s.dataDir, req.VmName)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	if _, err := os.Stat(isoPath); err == nil {
 		return &emptypb.Empty{}, nil // already exists
 	}
@@ -653,7 +659,16 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 // libvirt's domain XML validation passes before block copy starts.
 // Called by the source host before --with-storage migration.
 func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*emptypb.Empty, error) {
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return nil, err
+	}
 	for _, stub := range req.Disks {
+		// Only ever create stubs under our data dir — never an arbitrary path a
+		// caller hands us (matches CleanupMigrationArtifacts' constraint, so a
+		// stub created here is also the one cleanup can remove).
+		if !withinDir(s.dataDir, stub.Path) {
+			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is outside the data dir", stub.Path)
+		}
 		if _, err := os.Stat(stub.Path); err == nil {
 			continue // already exists
 		}
@@ -909,8 +924,9 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		}
 	}
 	if req.RemoveCloudInit {
-		iso := lv.CloudInitISOPath(s.dataDir, req.VmName)
-		if err := os.Remove(iso); err != nil && !os.IsNotExist(err) {
+		if iso, perr := lv.SafeCloudInitISOPath(s.dataDir, req.VmName); perr != nil {
+			slog.Warn("cleanup migration artifacts: invalid vm name for cloud-init path", "vm", req.VmName, "error", perr)
+		} else if err := os.Remove(iso); err != nil && !os.IsNotExist(err) {
 			slog.Warn("cleanup migration artifacts: remove cloud-init iso", "vm", req.VmName, "path", iso, "error", err)
 		}
 	}

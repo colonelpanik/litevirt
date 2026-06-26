@@ -317,6 +317,12 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
 	}
+	// Building an image reads the source VM's root disk into a (global) image —
+	// a cross-project data-exposure surface — so also require backup-level
+	// access to the SOURCE VM, not just the global image.build perm.
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "backup.create", "operator"); err != nil {
+		return nil, err
+	}
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {

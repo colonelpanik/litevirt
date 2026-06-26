@@ -33,9 +33,16 @@ func TestRBACPathBuilders(t *testing.T) {
 
 	// A traversal project must NOT map onto another tenant's path — it gets the
 	// deny-safe sentinel (matches only a cluster-root "/" grant).
-	bad := vmRBACPathFor("../../etc", "web")
-	if bad != "/projects/\x00invalid/vms/web" {
+	if bad := vmRBACPathFor("../../etc", "web"); bad != "/projects/\x00invalid/vms/web" {
 		t.Errorf("malformed project = %q, want sentinel path", bad)
+	}
+	// A path-like resource NAME is likewise replaced with a sentinel segment, so
+	// it can't widen or escape the authorization path.
+	if bad := vmRBACPathFor("acme", "../../etc"); bad != "/projects/acme/vms/\x00invalid" {
+		t.Errorf("malformed vm name = %q, want sentinel segment", bad)
+	}
+	if bad := ctRBACPathFor("acme", "a/b"); bad != "/projects/acme/containers/\x00invalid" {
+		t.Errorf("malformed ct name = %q, want sentinel segment", bad)
 	}
 }
 

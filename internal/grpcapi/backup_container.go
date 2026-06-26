@@ -17,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -50,6 +51,9 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	}
 	if req.Name == "" || req.RepoPath == "" {
 		return status.Error(codes.InvalidArgument, "name and repo_path required")
+	}
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "backup.create", "operator"); err != nil {
@@ -178,6 +182,11 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	}
 	if req.RepoPath == "" || req.Name == "" || req.Timestamp == "" {
 		return status.Error(codes.InvalidArgument, "repo_path, name and timestamp required")
+	}
+	// Validate the name before it composes the permission path, the staging
+	// tar path (dataDir/ct-restore), or the container dir.
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	// Restore may target a name that no longer exists (disaster recovery); the
 	// project comes from the existing row if present, else from the manifest.

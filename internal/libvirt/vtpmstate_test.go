@@ -196,6 +196,15 @@ func TestReadFirmwareBundle_RejectsSlip(t *testing.T) {
 			tw.WriteHeader(&tar.Header{Name: "swtpm/../../etc/evil", Mode: 0o600, Size: 1, Typeflag: tar.TypeReg})
 			tw.Write([]byte("x"))
 		}),
+		"dotdot-prefixed nvram": mk(func(tw *tar.Writer) {
+			// Must be rejected, NOT silently re-rooted to "nvram".
+			tw.WriteHeader(&tar.Header{Name: "../nvram", Mode: 0o600, Size: 1, Typeflag: tar.TypeReg})
+			tw.Write([]byte("x"))
+		}),
+		"absolute nvram": mk(func(tw *tar.Writer) {
+			tw.WriteHeader(&tar.Header{Name: "/nvram", Mode: 0o600, Size: 1, Typeflag: tar.TypeReg})
+			tw.Write([]byte("x"))
+		}),
 		"symlink member": mk(func(tw *tar.Writer) {
 			tw.WriteHeader(&tar.Header{Name: "nvram", Linkname: "/etc/passwd", Typeflag: tar.TypeSymlink})
 		}),

@@ -106,7 +106,16 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA && hdr.Typeflag != tar.TypeDir {
 			return fmt.Errorf("firmware bundle: disallowed member type %d for %q", hdr.Typeflag, hdr.Name)
 		}
-		name := strings.TrimPrefix(filepath.Clean("/"+hdr.Name), "/") // force-relative, strip ../
+		// Reject (don't silently re-root) absolute paths and any member that
+		// escapes the tree — a backup-repo bundle is untrusted. `../nvram` and
+		// `/nvram` must be rejected, not normalized to `nvram`.
+		if filepath.IsAbs(hdr.Name) {
+			return fmt.Errorf("firmware bundle: rejected absolute member path %q", hdr.Name)
+		}
+		name := filepath.Clean(hdr.Name)
+		if name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("firmware bundle: rejected path-escaping member %q", hdr.Name)
+		}
 		switch {
 		case name == fwBundleNvram:
 			if hdr.Size > 64<<20 {

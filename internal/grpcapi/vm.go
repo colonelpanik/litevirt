@@ -2233,6 +2233,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
 	}
 
+	// Capture the current domain XML so a failure below can restore it: libvirt
+	// running the new (e.g. Secure Boot/vTPM) XML while the durable spec still
+	// describes the old flags/UUID would desync backup/migrate/delete/reconciler
+	// logic — they'd preserve or wipe the wrong firmware state (G1).
+	oldXML, _ := s.virt.DumpXML(req.Name)
+
 	// Undefine the existing domain first — DefineDomain (DomainDefineXML)
 	// can fail with "already exists with uuid" when the generated XML has no
 	// UUID and libvirt tries to assign a new one that collides. KEEP NVRAM/vTPM
@@ -2241,12 +2247,22 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 
 	// Redefine the domain with the updated XML.
 	if err := s.virt.DefineDomain(domXML); err != nil {
+		if oldXML != "" { // restore the prior definition (state preserved)
+			_ = s.virt.DefineDomain(oldXML)
+		}
 		return nil, status.Errorf(codes.Internal, "redefine domain: %v", err)
 	}
 
-	// Update corrosion.
+	// The durable spec MUST match the live domain. If the write fails, roll the
+	// domain back to its old XML rather than return success with libvirt and the
+	// stored spec desynced (fatal — never report a half-applied firmware update).
 	if err := corrosion.UpdateVMSpec(ctx, s.db, req.Name, string(specJSON), int(spec.Cpu), int(spec.MemoryMib)); err != nil {
-		slog.Warn("failed to update VM spec in DB", "vm", req.Name, "error", err)
+		if oldXML != "" {
+			_ = s.virt.UndefineDomainPreservingState(req.Name)
+			_ = s.virt.DefineDomain(oldXML)
+		}
+		return nil, status.Errorf(codes.Internal,
+			"persist updated spec for %q failed; rolled the domain back to its previous definition: %v", req.Name, err)
 	}
 
 	slog.Info("VM spec updated", "vm", req.Name, "cpu", spec.Cpu, "memory_mib", spec.MemoryMib, "disable_vnc", spec.DisableVnc)

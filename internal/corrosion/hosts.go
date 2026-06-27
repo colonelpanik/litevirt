@@ -27,6 +27,12 @@ type HostRecord struct {
 	WatchdogDev string
 	Labels      map[string]string // decoded from JSON column
 	Version     string
+	// SchemaVersion is the host's running-binary supported schema version (the
+	// value its Ping returns — that binary's CurrentSchemaVersion, NOT its
+	// DB-applied EffectiveDBSchema). Persisted so the self-upgrade watcher can
+	// read peer (version, schema) locally instead of pinging every peer. 0 =
+	// unknown (a host that hasn't written it yet) → never an upgrade source.
+	SchemaVersion int
 	// Role distinguishes "worker" hosts (run VMs, vote in quorum) from
 	// "witness" hosts (vote only, never host workloads). Default "worker".
 	// See docs/operating-model.md for guidance on even-N deployments.
@@ -66,7 +72,7 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 		`SELECT name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
 			cpu_total, mem_total, disk_total, fence_strategy,
 			ipmi_address, ipmi_user, ipmi_pass, watchdog_dev,
-			labels, version, role, region, created_at, updated_at
+			labels, version, schema_version, role, region, created_at, updated_at
 		 FROM hosts WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
@@ -85,7 +91,7 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 		`SELECT name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
 			cpu_total, mem_total, disk_total, fence_strategy,
 			ipmi_address, ipmi_user, ipmi_pass, watchdog_dev,
-			labels, version, role, region, created_at, updated_at
+			labels, version, schema_version, role, region, created_at, updated_at
 		 FROM hosts WHERE name = ? AND deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
@@ -116,6 +122,7 @@ func scanHost(r Row) HostRecord {
 		WatchdogDev:   r.String("watchdog_dev"),
 		Labels:        decodeLabels(r.String("labels")),
 		Version:       r.String("version"),
+		SchemaVersion: r.Int("schema_version"),
 		Role:          roleOrDefault(r.String("role")),
 		Region:        regionOrDefault(r.String("region")),
 		CreatedAt:     r.String("created_at"),
@@ -242,16 +249,19 @@ func UpdateHostStartup(ctx context.Context, c *Client, name, state, version stri
 	uts := c.NowTS()
 	// COALESCE(NULLIF(?, ''), version) keeps the existing version when the daemon
 	// reports an empty one (dev builds), so a blank version can't clobber a good one.
+	// schema_version is this running binary's supported schema (CurrentSchemaVersion),
+	// matching what Ping advertises — the self-upgrade watcher reads it from here.
+	sv := CurrentSchemaVersion
 	if hasResources {
 		return c.Execute(ctx,
-			`UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version),
+			`UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?,
 				cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ? WHERE name = ?`,
-			state, version, cpu, mem, disk, uts, name,
+			state, version, sv, cpu, mem, disk, uts, name,
 		)
 	}
 	return c.Execute(ctx,
-		`UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), updated_at = ? WHERE name = ?`,
-		state, version, uts, name,
+		`UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?, updated_at = ? WHERE name = ?`,
+		state, version, sv, uts, name,
 	)
 }
 

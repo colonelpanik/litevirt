@@ -56,7 +56,7 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 			cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		h.Name, h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial,
-		h.CPUTotal, h.MemTotal, h.DiskTotal, h.FenceStrategy, h.Version, role, now, now,
+		h.CPUTotal, h.MemTotal, h.DiskTotal, h.FenceStrategy, h.Version, role, now, c.NowTS(),
 	)
 }
 
@@ -163,7 +163,7 @@ func SetHostLabel(ctx context.Context, c *Client, host, key, value string) error
 	}
 	return c.Execute(ctx,
 		`UPDATE hosts SET labels = ?, updated_at = ? WHERE name = ?`,
-		string(b), time.Now().UTC().Format(time.RFC3339), host)
+		string(b), c.NowTS(), host)
 }
 
 func decodeLabels(raw string) map[string]string {
@@ -176,10 +176,9 @@ func decodeLabels(raw string) map[string]string {
 
 // UpdateHostState changes a host's state.
 func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`,
-		state, now, name,
+		state, c.NowTS(), name,
 	)
 }
 
@@ -190,10 +189,9 @@ func UpdateHostRole(ctx context.Context, c *Client, name, role string) error {
 	if role != "worker" && role != "witness" {
 		return fmt.Errorf("invalid host role %q (want worker|witness)", role)
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE hosts SET role = ?, updated_at = ? WHERE name = ?`,
-		role, now, name,
+		role, c.NowTS(), name,
 	)
 }
 
@@ -206,41 +204,62 @@ func UpdateHostRegion(ctx context.Context, c *Client, name, region string) error
 	if region == "" {
 		region = "default"
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE hosts SET region = ?, updated_at = ? WHERE name = ?`,
-		region, now, name,
+		region, c.NowTS(), name,
 	)
 }
 
 // DeleteHost soft-deletes a host and cleans up related records.
 func DeleteHost(ctx context.Context, c *Client, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339) // deleted_at marker (bare)
 	return c.ExecuteBatch(ctx, []Statement{
 		{SQL: `UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-			Params: []interface{}{now, now, name}},
+			Params: []interface{}{now, c.NowTS(), name}},
 		{SQL: `UPDATE host_health SET deleted_at = ?, updated_at = ? WHERE observer = ? OR target = ?`,
-			Params: []interface{}{now, now, name, name}},
+			Params: []interface{}{now, c.NowTS(), name, name}},
 		{SQL: `UPDATE network_vteps SET deleted_at = ?, updated_at = ? WHERE host_name = ?`,
-			Params: []interface{}{now, now, name}},
+			Params: []interface{}{now, c.NowTS(), name}},
 	})
 }
 
 // UpdateHostVersion updates a host's reported version.
 func UpdateHostVersion(ctx context.Context, c *Client, name, version string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE hosts SET version = ?, updated_at = ? WHERE name = ?`,
-		version, now, name,
+		version, c.NowTS(), name,
+	)
+}
+
+// UpdateHostStartup writes a host's boot-time state in a SINGLE batched mutation:
+// always state + version + updated_at (one HLC, one NowTS), and the resource
+// counts only when hasResources is true (a failed NodeInfo() probe must not split
+// the write into separate same-second mutations — that is exactly the race that
+// strands the version on peers). version is written from the running daemon
+// whenever available, including the fresh-insert case, so startup state is
+// single-source rather than relying on a later write.
+func UpdateHostStartup(ctx context.Context, c *Client, name, state, version string, cpu, mem, disk int, hasResources bool) error {
+	uts := c.NowTS()
+	// COALESCE(NULLIF(?, ''), version) keeps the existing version when the daemon
+	// reports an empty one (dev builds), so a blank version can't clobber a good one.
+	if hasResources {
+		return c.Execute(ctx,
+			`UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version),
+				cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ? WHERE name = ?`,
+			state, version, cpu, mem, disk, uts, name,
+		)
+	}
+	return c.Execute(ctx,
+		`UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), updated_at = ? WHERE name = ?`,
+		state, version, uts, name,
 	)
 }
 
 // UpdateHostResources updates a host's resource counts.
 func UpdateHostResources(ctx context.Context, c *Client, name string, cpu, mem, disk int) error {
-	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE hosts SET cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ?
 		 WHERE name = ?`,
-		cpu, mem, disk, now, name,
+		cpu, mem, disk, c.NowTS(), name,
 	)
 }

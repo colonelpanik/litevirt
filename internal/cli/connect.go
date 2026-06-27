@@ -47,8 +47,8 @@ type localDaemonConfig struct {
 var daemonConfigPath = "/etc/litevirt/config.yaml"
 
 // LoadClusterConfig reads the cluster config.
-// Priority: 1) LV_HOST env var → remote SSH mode
-//           2) local daemon config at /etc/litevirt/config.yaml → local mode
+// Priority: 1) LV_HOST env var → remote gRPC/mTLS mode
+//  2. local daemon config at /etc/litevirt/config.yaml → local mode
 func LoadClusterConfig() (*ClusterConfig, error) {
 	// Explicit remote target always wins.
 	if host := os.Getenv("LV_HOST"); host != "" {
@@ -71,6 +71,9 @@ func LoadClusterConfig() (*ClusterConfig, error) {
 			if pkiDir == "" {
 				pkiDir = "/etc/litevirt/pki"
 			}
+			if cliPKIBundleExists(PKIDir()) {
+				pkiDir = PKIDir()
+			}
 			return &ClusterConfig{
 				GRPCPort: port,
 				PKIDir:   pkiDir,
@@ -84,7 +87,7 @@ func LoadClusterConfig() (*ClusterConfig, error) {
 
 // Connect establishes a gRPC connection to a litevirtd instance.
 // In local mode, connects directly to localhost with mTLS.
-// In remote mode, opens an SSH tunnel first.
+// In remote mode, connects directly to the configured gRPC endpoint with mTLS.
 // Variable for testing — tests can override to inject a mock client.
 var Connect = connectDefault
 
@@ -143,7 +146,7 @@ func withTokenOption(opts []grpc.DialOption) []grpc.DialOption {
 func connectLocal(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {
 	tlsCfg, err := pki.ClientTLSConfig(cfg.PKIDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load TLS config from %s: %w", cfg.PKIDir, err)
+		return nil, nil, fmt.Errorf("load local TLS config from %s: %w (expected a CLI client cert bundle in %s, or a readable daemon PKI dir)", cfg.PKIDir, err, PKIDir())
 	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.GRPCPort)
@@ -158,6 +161,22 @@ func connectLocal(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {
 	client := pb.NewLiteVirtClient(conn)
 	closer := func() { conn.Close() }
 	return client, closer, nil
+}
+
+func cliPKIBundleExists(dir string) bool {
+	if !regularFile(filepath.Join(dir, "ca.crt")) {
+		return false
+	}
+	return certKeyPairExists(dir, "client") || certKeyPairExists(dir, "host")
+}
+
+func certKeyPairExists(dir, name string) bool {
+	return regularFile(filepath.Join(dir, name+".crt")) && regularFile(filepath.Join(dir, name+".key"))
+}
+
+func regularFile(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }
 
 func connectRemote(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {

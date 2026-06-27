@@ -2,6 +2,8 @@ package cli
 
 import (
 	"os"
+	osuser "os/user"
+	"path/filepath"
 	"testing"
 )
 
@@ -64,6 +66,72 @@ func TestPKIDir(t *testing.T) {
 	dir := PKIDir()
 	if dir != "/test/config/pki" {
 		t.Errorf("PKIDir() = %s, want /test/config/pki", dir)
+	}
+}
+
+func TestLocalCLIClientPKITargets_SudoUser(t *testing.T) {
+	dir := t.TempDir()
+	userHome := filepath.Join(dir, "alice")
+	t.Setenv("LV_CONFIG_DIR", filepath.Join(dir, "root-config"))
+	t.Setenv("SUDO_USER", "alice")
+
+	oldLookup := lookupUserByName
+	lookupUserByName = func(name string) (*osuser.User, error) {
+		if name != "alice" {
+			t.Fatalf("lookup user = %q, want alice", name)
+		}
+		return &osuser.User{Uid: "1000", Gid: "1001", HomeDir: userHome}, nil
+	}
+	t.Cleanup(func() { lookupUserByName = oldLookup })
+
+	targets, err := localCLIClientPKITargets()
+	if err != nil {
+		t.Fatalf("localCLIClientPKITargets: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("len(targets) = %d, want 2", len(targets))
+	}
+	if targets[0].dir != filepath.Join(dir, "root-config", "pki") || !targets[0].chown {
+		t.Errorf("first target = %+v, want custom LV_CONFIG_DIR target chowned to sudo user", targets[0])
+	}
+	if targets[1].dir != filepath.Join(userHome, ".config", "litevirt", "pki") || !targets[1].chown {
+		t.Errorf("second target = %+v, want sudo user's default config dir", targets[1])
+	}
+	if targets[1].uid != 1000 || targets[1].gid != 1001 {
+		t.Errorf("sudo target uid/gid = %d/%d, want 1000/1001", targets[1].uid, targets[1].gid)
+	}
+}
+
+func TestInstallCLIClientBundle_CopiesOnlyClientBundle(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(src, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"ca.crt", "client.crt", "client.key", "host.crt", "host.key"} {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := installCLIClientBundle(src, cliPKITarget{dir: dst}); err != nil {
+		t.Fatalf("installCLIClientBundle: %v", err)
+	}
+	for _, name := range []string{"ca.crt", "client.crt", "client.key"} {
+		if _, err := os.Stat(filepath.Join(dst, name)); err != nil {
+			t.Errorf("expected %s to be installed: %v", name, err)
+		}
+	}
+	for _, name := range []string{"host.crt", "host.key"} {
+		if _, err := os.Stat(filepath.Join(dst, name)); !os.IsNotExist(err) {
+			t.Errorf("%s should not be installed in CLI bundle", name)
+		}
+	}
+	if st, err := os.Stat(filepath.Join(dst, "client.key")); err != nil {
+		t.Fatal(err)
+	} else if st.Mode().Perm() != 0600 {
+		t.Errorf("client.key mode = %o, want 0600", st.Mode().Perm())
 	}
 }
 

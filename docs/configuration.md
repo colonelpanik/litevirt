@@ -223,6 +223,6 @@ Multiple peers can be listed for redundancy. The membership protocol discovers t
 |----------|---------|
 | `LITEVIRT_CONFIG` | Override config file path |
 | `LV_CONFIG_DIR` | CLI: override the per-user config directory (default `~/.config/litevirt`; holds the CLI cert and stored login credential) |
-| `LV_HOST` | CLI: default SSH target (`user@host`) |
+| `LV_HOST` | CLI: default remote gRPC/mTLS target (`host` or `host:port`; a legacy `user@host` prefix is ignored) |
 | `LV_TOKEN` | CLI: bearer token to authenticate gRPC calls. Overrides the credential stored by `lv login`. |
 | `LITEVIRT_UNSAFE_NO_KILLMODE_CHECK` | Skip startup `KillMode=process` self-check (development / non-systemd hosts only). Default check protects against unit-file regressions that would kill child QEMU processes on daemon stop. |

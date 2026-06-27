@@ -96,6 +96,7 @@ func TestLoadClusterConfig_Empty(t *testing.T) {
 func TestLoadClusterConfig_LocalMode(t *testing.T) {
 	// Write a minimal daemon config to a temp file.
 	dir := t.TempDir()
+	t.Setenv("LV_CONFIG_DIR", filepath.Join(dir, "user-config"))
 	cfgPath := filepath.Join(dir, "config.yaml")
 	os.WriteFile(cfgPath, []byte("host_name: node1\ngrpc_port: 9443\npki_dir: /custom/pki\n"), 0644)
 
@@ -121,9 +122,70 @@ func TestLoadClusterConfig_LocalMode(t *testing.T) {
 	}
 }
 
+func TestLoadClusterConfig_LocalModePrefersUserPKI(t *testing.T) {
+	dir := t.TempDir()
+	userConfig := filepath.Join(dir, "user-config")
+	t.Setenv("LV_CONFIG_DIR", userConfig)
+
+	userPKI := filepath.Join(userConfig, "pki")
+	if err := os.MkdirAll(userPKI, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"ca.crt", "client.crt", "client.key"} {
+		if err := os.WriteFile(filepath.Join(userPKI, name), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgPath, []byte("host_name: node1\ngrpc_port: 9443\npki_dir: /daemon/pki\n"), 0644)
+
+	old := daemonConfigPath
+	daemonConfigPath = cfgPath
+	t.Cleanup(func() { daemonConfigPath = old })
+
+	cfg, err := LoadClusterConfig()
+	if err != nil {
+		t.Fatalf("LoadClusterConfig: %v", err)
+	}
+	if cfg.PKIDir != userPKI {
+		t.Errorf("PKIDir = %q, want user PKI %q", cfg.PKIDir, userPKI)
+	}
+}
+
+func TestLoadClusterConfig_LocalModeIgnoresIncompleteUserPKI(t *testing.T) {
+	dir := t.TempDir()
+	userConfig := filepath.Join(dir, "user-config")
+	t.Setenv("LV_CONFIG_DIR", userConfig)
+
+	userPKI := filepath.Join(userConfig, "pki")
+	if err := os.MkdirAll(userPKI, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userPKI, "ca.crt"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgPath, []byte("host_name: node1\ngrpc_port: 9443\npki_dir: /daemon/pki\n"), 0644)
+
+	old := daemonConfigPath
+	daemonConfigPath = cfgPath
+	t.Cleanup(func() { daemonConfigPath = old })
+
+	cfg, err := LoadClusterConfig()
+	if err != nil {
+		t.Fatalf("LoadClusterConfig: %v", err)
+	}
+	if cfg.PKIDir != "/daemon/pki" {
+		t.Errorf("PKIDir = %q, want daemon PKI fallback", cfg.PKIDir)
+	}
+}
+
 func TestLoadClusterConfig_LocalModeDefaults(t *testing.T) {
 	// Config without grpc_port/pki_dir should use defaults.
 	dir := t.TempDir()
+	t.Setenv("LV_CONFIG_DIR", filepath.Join(dir, "user-config"))
 	cfgPath := filepath.Join(dir, "config.yaml")
 	os.WriteFile(cfgPath, []byte("host_name: node1\n"), 0644)
 

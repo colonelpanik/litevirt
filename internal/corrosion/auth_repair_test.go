@@ -259,6 +259,37 @@ func TestV32Backfill_DeletedUserNotRevived(t *testing.T) {
 	}
 }
 
+// TestTouchUser2FA_RejectsDisabledOrStaleEpoch: the WebAuthn confirm-and-consume
+// gate. Touching a live factor succeeds; once it's disabled (and its set
+// deactivated) the touch changes zero rows, so a login can be rejected instead of
+// authenticating against a stale loaded credential.
+func TestTouchUser2FA_RejectsDisabledOrStaleEpoch(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "webauthn", Secret: "blob", Label: "key"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := TouchUser2FA(ctx, c, "alice", "webauthn", "key"); err != nil || !ok {
+		t.Fatalf("touch live credential: ok=%v err=%v (want true)", ok, err)
+	}
+	// Disable it (last factor → pointer tombstoned too).
+	if err := DeleteUser2FA(ctx, c, "alice", "webauthn", "key"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := TouchUser2FA(ctx, c, "alice", "webauthn", "key"); ok {
+		t.Error("touch succeeded for a disabled credential — stale assertion would authenticate")
+	}
+	// A peer resurrects the credential row LIVE, but its set is no longer active.
+	c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{{
+		Name:    "user_2fa",
+		Columns: []string{"username", "method", "secret", "label", "enrolled_at", "last_used_at", "updated_at", "last_step", "deleted_at", "epoch"},
+		Rows:    [][]interface{}{{"alice", "webauthn", "blob", "key", "2099-01-01T00:00:00Z", nil, "2099-01-01T00:00:00Z", 0, nil, "stale-epoch"}},
+	}}}))
+	if ok, _ := TouchUser2FA(ctx, c, "alice", "webauthn", "key"); ok {
+		t.Error("touch succeeded for a resurrected credential under a stale epoch")
+	}
+}
+
 // TestUser2FA_MultipleFactorsShareEpoch: enrolling a second factor reuses the
 // live epoch (doesn't orphan the first) — both render.
 func TestUser2FA_MultipleFactorsShareEpoch(t *testing.T) {

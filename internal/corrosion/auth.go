@@ -370,13 +370,25 @@ func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FAReco
 	return out, nil
 }
 
-// TouchUser2FA bumps last_used_at after a successful verification.
-func TouchUser2FA(ctx context.Context, c *Client, username, method, label string) error {
+// TouchUser2FA bumps last_used_at on a SPECIFIC live factor in the active set and
+// reports whether it actually touched a row. It returns false when the factor was
+// disabled (tombstoned) or its set deactivated (active epoch changed) since the
+// caller loaded it — so a credential-based assertion (WebAuthn) validated against
+// a stale loaded copy can be rejected at consume time, the same zero-row guard as
+// RecordTOTPStep / MarkRecoveryCodeUsed. Scoped by (username, method, label) so it
+// confirms exactly the asserted credential.
+func TouchUser2FA(ctx context.Context, c *Client, username, method, label string) (bool, error) {
 	now := c.NowTS()
-	return c.Execute(ctx,
+	n, err := c.ExecuteRows(ctx,
 		`UPDATE user_2fa SET last_used_at = ?, updated_at = ?
-		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND deleted_at IS NULL`,
-		nowRFC3339(), now, username, method, label)
+		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND deleted_at IS NULL
+		   AND epoch = (SELECT active_epoch FROM user_2fa_sets
+		                WHERE username = ? AND deleted_at IS NULL)`,
+		nowRFC3339(), now, username, method, label, username)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // RecordTOTPStep ratchets last_step forward (and bumps last_used_at) after a

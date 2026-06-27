@@ -6,17 +6,17 @@ import (
 )
 
 // antiEntropyExcluded documents every CREATE-TABLE in schemaDDL that is
-// deliberately NOT in tableNames — i.e. not carried by the full-state dump /
-// anti-entropy repair path:
+// deliberately NOT in tableNames or sensitiveTableNames — i.e. not carried by
+// either anti-entropy repair path:
 //
 //   - coordination / local / transient state that MUST NOT be full-state-merged
 //     (leases, replication progress, per-node bookkeeping, schema version), and
-//   - secret stores kept out of the operator-readable state dump (GetStateDump /
-//     StreamStateDump) — they still replicate via push.
+//   - secret stores that are not yet safe for the peer-only sensitive
+//     anti-entropy lane, and therefore still rely on push replication.
 //
 // TestTableNamesCoverage forces every schemaDDL table into exactly one bucket
-// (tableNames or here) so coverage can't silently drift and tests can't overstate
-// what anti-entropy actually repairs.
+// (tableNames, sensitiveTableNames, or here) so coverage can't silently drift
+// and tests can't overstate what anti-entropy actually repairs.
 var antiEntropyExcluded = map[string]string{
 	// Coordination / local / transient — must not be full-state-merged.
 	"clock_skew":             "per-node clock observations, GC'd locally",
@@ -33,12 +33,9 @@ var antiEntropyExcluded = map[string]string{
 	"replication_watermarks": "per-node replication progress",
 	"mutation_seen":          "per-node relay-dedup table",
 
-	// Secret stores — excluded from the operator-readable state dump.
-	"registry_credentials": "plaintext registry secrets — must not enter GetStateDump/StreamStateDump",
-	"notification_targets": "target config may carry webhook tokens/URLs — kept out of the state dump",
-	"notification_routes":  "companion to notification_targets; the notification subsystem stays push-only",
-	"user_2fa":             "2FA enrollment secrets; push-replicated, excluded from the bulk dump",
-	"recovery_codes":       "single-use 2FA secrets (no updated_at → not LWW-safe); push-only",
+	// Secret stores not yet safe for the peer-only sensitive repair lane.
+	"user_2fa":       "2FA enrollment secrets; DeleteUser2FA is still a hard delete, so full-state repair could resurrect",
+	"recovery_codes": "single-use 2FA secrets; no updated_at and re-enrollment is set-regeneration, so not LWW-safe",
 }
 
 // localOnly are schemaDDL tables that are NOT CRDT-replicated (written via direct
@@ -78,6 +75,10 @@ func TestTableNamesCoverage(t *testing.T) {
 	for _, n := range tableNames {
 		inTableNames[n] = true
 	}
+	inSensitiveNames := make(map[string]bool, len(sensitiveTableNames))
+	for _, n := range sensitiveTableNames {
+		inSensitiveNames[n] = true
+	}
 
 	c := mustTestClient(t)
 	tx, err := c.db.Begin()
@@ -89,11 +90,13 @@ func TestTableNamesCoverage(t *testing.T) {
 	for _, tbl := range tables {
 		_, excluded := antiEntropyExcluded[tbl]
 		switch {
-		case inTableNames[tbl] && excluded:
-			t.Errorf("table %q is in BOTH tableNames and antiEntropyExcluded — pick one", tbl)
-		case !inTableNames[tbl] && !excluded:
+		case inTableNames[tbl] && inSensitiveNames[tbl]:
+			t.Errorf("table %q is in BOTH tableNames and sensitiveTableNames — public dumps must stay redacted", tbl)
+		case (inTableNames[tbl] || inSensitiveNames[tbl]) && excluded:
+			t.Errorf("table %q is repaired and antiEntropyExcluded — pick one", tbl)
+		case !inTableNames[tbl] && !inSensitiveNames[tbl] && !excluded:
 			t.Errorf("schemaDDL table %q is neither in tableNames nor antiEntropyExcluded — "+
-				"add it to tableNames (anti-entropy coverage) or to antiEntropyExcluded with a reason", tbl)
+				"add it to tableNames/sensitiveTableNames (anti-entropy coverage) or to antiEntropyExcluded with a reason", tbl)
 		}
 
 		// Replicated table with updated_at MUST have a primary key, else LWW is
@@ -120,12 +123,28 @@ func TestTableNamesCoverage(t *testing.T) {
 			t.Errorf("table %q is full-state synced with deleted_at but no updated_at — "+
 				"a tombstone can't win LWW, so a stale live row resurrects it", tbl)
 		}
+		if inSensitiveNames[tbl] {
+			if _, ok := tablePrimaryKeys[tbl]; !ok {
+				t.Errorf("sensitive table %q has no tablePrimaryKeys entry — sensitive merge would blind-replace rows", tbl)
+			}
+			if !cols["updated_at"] {
+				t.Errorf("sensitive table %q has no updated_at — sensitive merge cannot arbitrate LWW", tbl)
+			}
+			if !cols["deleted_at"] {
+				t.Errorf("sensitive table %q has no deleted_at — delete/revoke tombstones cannot be repaired", tbl)
+			}
+		}
 	}
 
 	// No phantom entries: every name in our maps/lists must be a real schemaDDL table.
 	for _, n := range tableNames {
 		if !schemaSet[n] {
 			t.Errorf("tableNames contains %q which is not a schemaDDL table", n)
+		}
+	}
+	for _, n := range sensitiveTableNames {
+		if !schemaSet[n] {
+			t.Errorf("sensitiveTableNames contains %q which is not a schemaDDL table", n)
 		}
 	}
 	for n := range antiEntropyExcluded {

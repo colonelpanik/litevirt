@@ -5,12 +5,10 @@ configurable targets. It mirrors `internal/billing` in spirit — fire-and-log
 delivery that never blocks or fails the operation that triggered it — but fans
 out to multiple typed targets selected by **routes** (event-pattern + minimum
 severity). The implementation is `internal/notify`; targets/routes are stored in
-the `notification_targets` / `notification_routes` tables and **push-replicated**
-to peers, so every daemon that received the mutation notifies consistently. These
-tables are intentionally **excluded from full-state anti-entropy** (their config
-can carry webhook tokens/URLs), so a host that missed the push — e.g. across a
-partition or restart — is **not** auto-repaired; re-save the target/route on a
-healthy host to re-replicate it.
+the `notification_targets` / `notification_routes` tables and replicated to
+peers. Because their config can carry webhook tokens/URLs, they are excluded
+from the operator-readable `GetStateDump` / `lv cluster sync` path, but daemon
+peers repair missed pushes through a peer-mTLS-only sensitive anti-entropy lane.
 
 ## Model
 

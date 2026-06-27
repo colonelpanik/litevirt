@@ -158,6 +158,40 @@ func TestStreamStateDump_RequiresOperator(t *testing.T) {
 	}
 }
 
+func TestSensitiveStateRPCsRequirePeerMTLS(t *testing.T) {
+	s := testServer(t)
+	req := &pb.SensitiveStateRequest{Sender: "node-a"}
+
+	if _, err := s.GetSensitiveStateDigest(context.Background(), req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("GetSensitiveStateDigest unauthenticated code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+	if _, err := s.GetSensitiveStateDigest(adminCtx(), req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("GetSensitiveStateDigest operator code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+	if _, err := s.GetSensitiveStateDigest(replicationPeerCtx("node-b"), req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("GetSensitiveStateDigest mismatched CN code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+	if _, err := s.GetSensitiveStateDigest(replicationPeerCtx("node-a"), req); err != nil {
+		t.Fatalf("GetSensitiveStateDigest matching peer: %v", err)
+	}
+
+	stream := &fakeDumpStream{ctx: adminCtx()}
+	if err := s.StreamSensitiveStateDump(req, stream); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("StreamSensitiveStateDump operator code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+	stream = &fakeDumpStream{ctx: replicationPeerCtx("node-b")}
+	if err := s.StreamSensitiveStateDump(req, stream); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("StreamSensitiveStateDump mismatched CN code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+	stream = &fakeDumpStream{ctx: replicationPeerCtx("node-a")}
+	if err := s.StreamSensitiveStateDump(req, stream); err != nil {
+		t.Fatalf("StreamSensitiveStateDump matching peer: %v", err)
+	}
+	if len(stream.chunks) == 0 {
+		t.Fatal("StreamSensitiveStateDump should send at least a final chunk")
+	}
+}
+
 func replicationPeerCtx(name string) context.Context {
 	ctx := context.WithValue(adminCtx(), ctxKeyAuthMethod, authMethodMTLS)
 	return context.WithValue(ctx, ctxKeyMTLSCommonName, name)

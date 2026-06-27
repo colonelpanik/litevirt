@@ -49,8 +49,9 @@ type syncTable struct {
 	Rows    [][]interface{} `json:"rows"`
 }
 
-// tableNames are the tables we replicate during full-state sync.
-// Extracted from schemaDDL by parsing the CREATE TABLE statements.
+// tableNames are the operator-safe tables carried by the public full-state
+// dump. Secret-bearing tables intentionally stay out of this list because
+// GetStateDump/StreamStateDump are operator-callable.
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
 	"images", "image_hosts", "networks", "volumes", "stacks",
@@ -72,13 +73,35 @@ var tableNames = []string{
 	"vm_backups", "container_backups", "container_snapshots",
 }
 
-// dumpState serializes all tables as gzipped JSON for push/pull sync.
-func (c *Client) dumpState() []byte {
+// sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS
+// anti-entropy lane. They must never enter the operator-readable state dump.
+var sensitiveTableNames = []string{
+	"registry_credentials",
+	"notification_targets",
+	"notification_routes",
+}
+
+func tableSet(tables []string) map[string]bool {
+	m := make(map[string]bool, len(tables))
+	for _, n := range tables {
+		m[n] = true
+	}
+	return m
+}
+
+var (
+	replicatedTableSet = tableSet(tableNames)
+	sensitiveTableSet  = tableSet(sensitiveTableNames)
+)
+
+// dumpStateForTables serializes the selected allowlist as gzipped JSON for
+// push/pull sync.
+func (c *Client) dumpStateForTables(tables []string) []byte {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	var payload syncPayload
-	for _, table := range tableNames {
+	for _, table := range tables {
 		st := syncTable{Name: table}
 
 		rows, err := c.db.Query("SELECT * FROM " + table)
@@ -134,9 +157,21 @@ func (c *Client) dumpState() []byte {
 	return buf.Bytes()
 }
 
+// dumpState serializes all operator-safe replicated tables.
+func (c *Client) dumpState() []byte {
+	return c.dumpStateForTables(tableNames)
+}
+
 // DumpStateBytes is the public wrapper for dumpState, used by the gRPC sync RPC.
 func (c *Client) DumpStateBytes() []byte {
 	return c.dumpState()
+}
+
+// DumpSensitiveStateBytes is the peer-only counterpart to DumpStateBytes. It
+// contains secret-bearing replicated tables and must never be exposed through
+// operator-facing RPCs or REST handlers.
+func (c *Client) DumpSensitiveStateBytes() []byte {
+	return c.dumpStateForTables(sensitiveTableNames)
 }
 
 // MergeStateBytesLWW merges a full-state dump from a peer with last-writer-wins
@@ -154,6 +189,21 @@ func (c *Client) MergeStateBytesLWW(buf []byte) {
 		return
 	}
 	c.mergeStatePayloadLWW(payload)
+}
+
+// MergeSensitiveStateBytesLWW merges a peer-only sensitive state dump. It uses
+// the same LWW engine as the public merge but with a disjoint allowlist so a
+// sensitive dump cannot mutate public tables.
+func (c *Client) MergeSensitiveStateBytesLWW(buf []byte) {
+	if len(buf) == 0 {
+		return
+	}
+	payload, err := decompressPayload(buf)
+	if err != nil {
+		slog.Error("sync: decompress sensitive", "error", err)
+		return
+	}
+	c.mergeStatePayloadLWWWithAllowlist(payload, sensitiveTableSet)
 }
 
 // decompressPayload decompresses and unmarshals a gzipped sync payload.
@@ -174,16 +224,6 @@ func decompressPayload(buf []byte) (*syncPayload, error) {
 	return &payload, nil
 }
 
-// replicatedTableSet is tableNames as a set for O(1) allowlist checks during
-// merge — table names in a peer's dump feed dynamic SQL and must be validated.
-var replicatedTableSet = func() map[string]bool {
-	m := make(map[string]bool, len(tableNames))
-	for _, n := range tableNames {
-		m[n] = true
-	}
-	return m
-}()
-
 // mergeStatePayloadLWW applies a decoded full-state dump with last-writer-wins on
 // each row's updated_at (RFC3339 wall-clock; see MergeStateBytesLWW).
 // It is the single merge engine behind MergeStateBytesLWW.
@@ -193,6 +233,10 @@ var replicatedTableSet = func() map[string]bool {
 // existing rows' updated_at keyed by primary key, and (3) keeps the local row
 // when localWinsLWW says so, otherwise INSERT OR REPLACEs the incoming row.
 func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
+	c.mergeStatePayloadLWWWithAllowlist(payload, replicatedTableSet)
+}
+
+func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowedTables map[string]bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -206,7 +250,7 @@ func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
 	for _, table := range payload.Tables {
 		// Defense-in-depth: table.Name and table.Columns come from a peer and
 		// are interpolated into SQL. Only touch known tables/columns.
-		if !replicatedTableSet[table.Name] {
+		if !allowedTables[table.Name] {
 			slog.Warn("sync: skipping unknown table in dump", "table", table.Name)
 			continue
 		}
@@ -472,17 +516,17 @@ func repeatPlaceholders(n int) []string {
 type TableDigest struct {
 	Name  string `json:"name"`
 	Count int    `json:"count"`
-	Hash  string `json:"hash"` // truncated SHA-256 of sorted rowids
+	Hash  string `json:"hash"` // truncated SHA-256 of sorted row values
 }
 
 // StateDigest returns a lightweight fingerprint of each replicated table.
 // Two nodes with identical digests are in sync; mismatched tables indicate drift.
-func (c *Client) StateDigest(ctx context.Context) ([]TableDigest, error) {
+func (c *Client) stateDigestForTables(ctx context.Context, tables []string) ([]TableDigest, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	var digests []TableDigest
-	for _, table := range tableNames {
+	for _, table := range tables {
 		// Content digest: hash the table's row VALUES (the declared columns —
 		// SELECT * never returns the rowid), sorted so insertion order can't
 		// change the result. The old digest hashed GROUP_CONCAT(rowid), which is
@@ -541,4 +585,17 @@ func (c *Client) StateDigest(ctx context.Context) ([]TableDigest, error) {
 		})
 	}
 	return digests, nil
+}
+
+// StateDigest returns a lightweight fingerprint of each operator-safe
+// replicated table. Two nodes with identical digests are in sync; mismatched
+// tables indicate drift.
+func (c *Client) StateDigest(ctx context.Context) ([]TableDigest, error) {
+	return c.stateDigestForTables(ctx, tableNames)
+}
+
+// SensitiveStateDigest returns fingerprints for the peer-only sensitive repair
+// lane.
+func (c *Client) SensitiveStateDigest(ctx context.Context) ([]TableDigest, error) {
+	return c.stateDigestForTables(ctx, sensitiveTableNames)
 }

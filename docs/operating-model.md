@@ -29,13 +29,12 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **No data loss for committed local writes** as long as one healthy peer
   remains reachable before the host dies.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
-  and is the safety net for divergence the WAL replicator missed in the
-  full-state-replicated tables (a few push-only tables are deliberately
-  excluded — see "Push-only tables are not self-healed" below). When it
-  detects drift it pulls the peer's full state over a **chunked** streaming RPC
-  (`StreamStateDump`), so convergence works regardless of total state size; the
-  older unary `GetStateDump` is retained as a fallback for mixed-version
-  clusters and is the path `lv cluster sync` still uses.
+  and is the safety net for divergence the WAL replicator missed. Public,
+  operator-readable state uses `StreamStateDump`; eligible secret-bearing config
+  uses a separate peer-mTLS-only sensitive dump. The older unary `GetStateDump`
+  is retained as a fallback for mixed-version clusters and is the path
+  `lv cluster sync` still uses, so manual operator sync intentionally remains
+  redacted.
 
 ### HA / Failover
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh
@@ -104,19 +103,17 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   visible everywhere before I act" should use a confirmation read on the
   target peer, not assume convergence.
 
-### Push-only tables are not self-healed by anti-entropy
-- A few replicated tables are **excluded from the full-state anti-entropy
-  dump**: the secret-bearing ones — `registry_credentials` and the
-  notification config (`notification_targets`, `notification_routes`, whose
-  config can carry webhook tokens/URLs) — and the 2FA tables (`user_2fa`
-  enrollment secrets, single-use `recovery_codes`). They are kept out of the
-  operator-readable bulk dump on purpose.
-- These propagate by **mutation push only**. If a host misses the push (a
-  partition or restart at the wrong moment), anti-entropy will **not** repair
-  it — unlike every other replicated table. To re-replicate, re-apply the
-  change on a healthy host (re-save the credential / notification target,
-  re-enroll 2FA). Recovery codes are single-use and per-host divergence there
-  is self-correcting on next enrollment.
+### Secret-bearing repair is peer-only
+- Secret-bearing config is **excluded from the operator-readable full-state
+  dump**. `lv cluster sync` and `GetStateDump` do not export registry passwords,
+  notification webhook URLs, or 2FA material.
+- Eligible secret-bearing config (`registry_credentials`,
+  `notification_targets`, `notification_routes`) is repaired by a separate
+  peer-mTLS-only anti-entropy lane. Peers already receive these rows through WAL
+  replication; the peer-only pull is a repair path when a push was missed.
+- 2FA tables are still push-only: `user_2fa` needs tombstone delete semantics,
+  and `recovery_codes` need set/generation semantics before either can be safely
+  full-state repaired. If those diverge, re-enroll/regenerate on a healthy host.
 
 ### Disk-full is not auto-recovered
 - The Corrosion store is a SQLite file. If the disk fills, the daemon stops

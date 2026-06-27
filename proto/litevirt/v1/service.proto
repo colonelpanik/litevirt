@@ -1272,6 +1272,12 @@ message StateDumpChunk {
     bool  final = 2; // true on the last chunk
 }
 
+// SensitiveStateRequest identifies the peer requesting the secret-bearing
+// anti-entropy lane. The server verifies sender against the peer certificate CN.
+message SensitiveStateRequest {
+    string sender = 1;
+}
+
 // ── WAL Replication ──
 
 message MutationEntry {
@@ -1581,6 +1587,11 @@ service LiteVirt {
     // is retained for mixed-version clusters — a new client falls back to it
     // when a peer doesn't implement the stream.
     rpc StreamStateDump(google.protobuf.Empty)      returns (stream StateDumpChunk);
+    // Sensitive state sync is peer-mTLS only. It carries secret-bearing tables
+    // intentionally excluded from GetStateDump/StreamStateDump and is not an
+    // operator or REST surface.
+    rpc GetSensitiveStateDigest(SensitiveStateRequest) returns (StateDigestResponse);
+    rpc StreamSensitiveStateDump(SensitiveStateRequest) returns (stream StateDumpChunk);
 
     // ── Internal: WAL Replication ──
     rpc PushMutations(ReplicateRequest)             returns (ReplicateResponse);

@@ -1321,6 +1321,7 @@ var tablePrimaryKeys = map[string][]string{
 	"vm_disks":               {"vm_name", "disk_name"},
 	"snapshots":              {"id"},
 	"lb_configs":             {"name"},
+	"lb_backends":            {"lb_name", "name"},
 	"users":                  {"username"},
 	"tokens":                 {"id"},
 	"roles":                  {"name"},

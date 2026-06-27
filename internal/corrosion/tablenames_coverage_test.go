@@ -82,4 +82,28 @@ func TestTableNamesCoverage(t *testing.T) {
 			t.Errorf("antiEntropyExcluded names %q which is not in tablePrimaryKeys (stale entry?)", tbl)
 		}
 	}
+
+	// Reverse: any table that is dumped/merged (in tableNames) and has an
+	// updated_at column MUST have a tablePrimaryKeys entry. Without one,
+	// mergeStatePayloadLWW and the replicator apply path see pkCols == nil and
+	// fall back to blind INSERT OR REPLACE — so an older full-state dump or a
+	// stale mutation can overwrite a newer local row (no LWW).
+	c := mustTestClient(t)
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback()
+	for _, tbl := range tableNames {
+		cols, err := tableColumns(tx, tbl)
+		if err != nil {
+			t.Fatalf("tableColumns(%s): %v", tbl, err)
+		}
+		if cols["updated_at"] {
+			if _, ok := tablePrimaryKeys[tbl]; !ok {
+				t.Errorf("table %q is in tableNames with an updated_at column but has no "+
+					"tablePrimaryKeys entry — LWW is silently skipped (older write can clobber newer)", tbl)
+			}
+		}
+	}
 }

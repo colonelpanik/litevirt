@@ -120,17 +120,20 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 		scope = string(b)
 	}
 	return c.Execute(ctx,
-		`INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, now,
+		`INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, now, now,
 	)
 }
 
-// RevokeToken tombstones a token.
+// RevokeToken tombstones a token. updated_at is bumped alongside deleted_at so the
+// revocation wins LWW over a stale peer's still-live copy under anti-entropy.
+// (last_used_at bumps in ValidateToken deliberately do NOT touch updated_at, so a
+// high-frequency token use can't out-timestamp a revoke.)
 func RevokeToken(ctx context.Context, c *Client, id string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
-		`UPDATE tokens SET deleted_at = ? WHERE id = ?`,
-		now, id,
+		`UPDATE tokens SET deleted_at = ?, updated_at = ? WHERE id = ?`,
+		now, now, id,
 	)
 }
 

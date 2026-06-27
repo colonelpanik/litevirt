@@ -141,7 +141,13 @@ import (
 //	     Two ADD COLUMNs in schemaMigrations + CREATE-TABLE columns; old rows
 //	     default is_template=0, on_host_failure=NULL (treated as 'none'). Unblocks
 //	     container templates/clones (B4) + failover relocation (B5). gap-1 from v27.
-const CurrentSchemaVersion = 28
+//	v29: delete-safety — tokens.updated_at + lb_backends.deleted_at. Anti-entropy is
+//	     a union merge that can't propagate hard deletes, so full-state tables must
+//	     soft-delete (deleted_at) and arbitrate by updated_at. tokens had deleted_at
+//	     but no updated_at, so a stale peer's live row blind-replaced a revocation;
+//	     lb_backends had neither and was hard-deleted. Two ADD COLUMNs; old tokens
+//	     rows default updated_at='' (a revoke's timestamp then wins LWW). gap-1 from v28.
+const CurrentSchemaVersion = 29
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -715,6 +721,7 @@ var schemaDDL = []string{
 		vm_name      TEXT,
 		enabled      INTEGER NOT NULL DEFAULT 1,
 		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT,
 		PRIMARY KEY (lb_name, name)
 	)`,
 
@@ -740,6 +747,7 @@ var schemaDDL = []string{
 		last_used_at TEXT,
 		scope_paths  TEXT,                -- JSON []string of allowed path prefixes; empty/NULL = inherit user's full perms
 		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL DEFAULT '', -- bumped on create + revoke (not on last_used_at) so a revoke wins LWW
 		deleted_at   TEXT
 	)`,
 
@@ -1500,6 +1508,11 @@ var schemaMigrations = []string{
 	// fenced. Both additive; old rows default is_template=0, on_host_failure=NULL.
 	`ALTER TABLE containers ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE containers ADD COLUMN on_host_failure TEXT`,
+
+	// v29: delete-safety — tombstone-arbitration timestamp on tokens + tombstone
+	// column on lb_backends (see History v29).
+	`ALTER TABLE tokens ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE lb_backends ADD COLUMN deleted_at TEXT`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -1566,6 +1579,7 @@ var alterVersions = []int{
 	24, 24, // containers.restart_policy/state_detail
 	25,     // containers.project
 	28, 28, // containers.is_template/on_host_failure
+	29, 29, // tokens.updated_at, lb_backends.deleted_at
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

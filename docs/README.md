@@ -4,7 +4,7 @@
 
 litevirt is a lightweight KVM/QEMU orchestrator built for teams that want the simplicity of a single binary with the power of a full virtualization platform. There are no external databases, no container runtimes, no sidecars — just one static Go binary (`litevirt`) that you `scp` onto a Linux host and start.
 
-Every host in a litevirt cluster is equal. There is no master node, no leader election, and no single point of failure. State is stored in an embedded SQLite database on each host and replicated across the cluster using the Crescent protocol — a relay-quorum replication topology with HLC-based last-writer-wins conflict resolution. If a host goes down, the others continue operating with a consistent view of the cluster.
+Every host in a litevirt cluster is equal. There is no master node, no leader election, and no single point of failure. State is stored in an embedded SQLite database on each host and replicated across the cluster using the Crescent protocol — a relay-quorum replication topology. Conflicts resolve last-writer-wins by each row's wall-clock `updated_at` (so all hosts must run NTP); Hybrid Logical Clocks order the replication log and de-duplicate mutations, but do not arbitrate conflicts. If a host goes down, the others continue operating with a consistent view of the cluster.
 
 ### Why litevirt?
 

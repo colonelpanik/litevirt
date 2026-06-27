@@ -98,9 +98,13 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 
 	stmts := []Statement{
 		// Purge any soft-deleted record with the same name so the INSERT succeeds.
-		{SQL: `DELETE FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}},
-		{SQL: `DELETE FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}},
-		{SQL: `DELETE FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}},
+		// full-state-delete-ok: these only drop an ALREADY-tombstoned row right
+		// before re-inserting a fresh one — the new row's newer updated_at wins LWW,
+		// so there is no cross-node resurrection window. (See the hard-delete guard
+		// test; full-state tables must otherwise soft-delete.)
+		{SQL: `DELETE FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}},      // full-state-delete-ok
+		{SQL: `DELETE FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}}, // full-state-delete-ok
+		{SQL: `DELETE FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}},              // full-state-delete-ok
 		{
 			SQL: `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
 				cpu_actual, mem_actual, project, is_template, created_at, updated_at)

@@ -9,9 +9,11 @@
 
 Every host runs `litevirt`. There is **no master node**. State (hosts, VMs,
 networks, etc.) is replicated as a CRDT via the embedded Corrosion store using
-the Crescent relay-quorum protocol over mTLS gRPC. Each host generates its
-own Hybrid Logical Clock timestamps; conflicts resolve via last-writer-wins
-with HLC ordering. Health is observed peer-to-peer (TLS probes every 2 s).
+the Crescent relay-quorum protocol over mTLS gRPC. Each host's Hybrid Logical
+Clock orders the replication log and de-duplicates mutations; row **conflict
+resolution is last-writer-wins by the row's wall-clock `updated_at` (RFC3339)**,
+so all hosts must run NTP (HLC does not arbitrate conflicts). Health is observed
+peer-to-peer (TLS probes every 2 s).
 Failover is decided by quorum among observers, gated by a CRDT-stored leader
 lease. Fencing has multiple strategies; safety guards refuse to reschedule
 VMs after a fence failure so that the same VM never runs on two hosts at once.
@@ -67,9 +69,11 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   - Fencing primitives are designed to be idempotent (IPMI on an already-off
     host is a no-op; SSH poweroff likewise). Ensure your fence method has
     this property.
-- VM placement and other state writes use HLC-LWW. **The most recent writer
-  wins**; there is no two-phase commit. If two operators concurrently modify
-  the same VM, one set of changes is silently lost.
+- VM placement and other state writes use last-writer-wins on the row's
+  wall-clock `updated_at`. **The most recent writer (by wall clock) wins**; there
+  is no two-phase commit. If two operators concurrently modify the same VM, one
+  set of changes is silently lost — and under clock skew the host with the faster
+  clock wins, so NTP is required.
 
 ### Even-N clusters cannot fence in a 2/2 partition
 - A 4-node cluster split exactly 2/2 has no majority. Both sides compute

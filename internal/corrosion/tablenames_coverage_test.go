@@ -111,6 +111,15 @@ func TestTableNamesCoverage(t *testing.T) {
 					"skipped (older write/dump can clobber newer)", tbl)
 			}
 		}
+
+		// A full-state table that soft-deletes (has deleted_at) MUST also have
+		// updated_at: a tombstone needs a timestamp to win LWW, otherwise a stale
+		// live row from a peer blind-replaces (resurrects) it via INSERT OR REPLACE
+		// — e.g. an un-revoked token.
+		if inTableNames[tbl] && cols["deleted_at"] && !cols["updated_at"] {
+			t.Errorf("table %q is full-state synced with deleted_at but no updated_at — "+
+				"a tombstone can't win LWW, so a stale live row resurrects it", tbl)
+		}
 	}
 
 	// No phantom entries: every name in our maps/lists must be a real schemaDDL table.

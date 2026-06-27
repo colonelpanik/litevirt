@@ -139,9 +139,11 @@ func (c *Client) DumpStateBytes() []byte {
 	return c.dumpState()
 }
 
-// MergeStateBytesLWW merges a full-state dump from a peer with HLC-aware
-// last-writer-wins conflict resolution. It is the live anti-entropy merge path
-// (AntiEntropy.checkPeer → fetchStateDump → here).
+// MergeStateBytesLWW merges a full-state dump from a peer with last-writer-wins
+// conflict resolution. LWW compares each row's updated_at (RFC3339 wall-clock in
+// production — so convergence relies on NTP); HLC only orders the mutation log +
+// dedup and is honored defensively when an updated_at value happens to be HLC.
+// It is the live anti-entropy merge path (AntiEntropy.checkPeer → fetchStateDump → here).
 func (c *Client) MergeStateBytesLWW(buf []byte) {
 	if len(buf) == 0 {
 		return
@@ -182,7 +184,8 @@ var replicatedTableSet = func() map[string]bool {
 	return m
 }()
 
-// mergeStatePayloadLWW applies a decoded full-state dump with HLC-aware LWW.
+// mergeStatePayloadLWW applies a decoded full-state dump with last-writer-wins on
+// each row's updated_at (RFC3339 wall-clock; see MergeStateBytesLWW).
 // It is the single merge engine behind MergeStateBytesLWW.
 //
 // Per table it (1) validates the peer-supplied table name and columns against

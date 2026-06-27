@@ -119,19 +119,25 @@ Repeat for each additional host.
 
 ## CLI setup
 
-The `lv` binary connects to hosts via SSH. Set the target host:
+The `lv` binary connects to litevirtd over gRPC/mTLS. On a node with
+`/etc/litevirt/config.yaml`, it connects to the local daemon automatically. For a
+remote entry point, set the target host:
 
 ```bash
-export LV_HOST=root@10.0.50.10
+export LV_HOST=10.0.50.10
 ```
 
 Or specify per-command:
 
 ```bash
-lv --host root@10.0.50.10 status
+lv --host 10.0.50.10 status
 ```
 
-The CLI tunnels gRPC traffic over SSH — no VPN, firewall rules, or special network config needed. Any host in the cluster can serve as the entry point since state is replicated.
+Any host in the cluster can serve as the entry point since state is replicated.
+The CLI uses the client certificate bundle in `~/.config/litevirt/pki` by
+default. `lv host init --local` creates this bundle for the installing user so a
+single-node install does not require copying daemon certificates out of
+`/etc/litevirt/pki`.
 
 ## Directory layout on hosts
 
@@ -143,6 +149,10 @@ The CLI tunnels gRPC traffic over SSH — no VPN, firewall rules, or special net
   ca.key                        # cluster CA private key (first host only)
   host.crt                      # this host's certificate
   host.key                      # this host's private key
+~/.config/litevirt/pki/         # per-user CLI client bundle
+  ca.crt
+  client.crt
+  client.key
 /var/lib/litevirt/              # data directory
   images/                       # base VM images
   disks/                        # VM disk images

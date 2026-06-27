@@ -7,12 +7,19 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	osuser "os/user"
 	"path/filepath"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/ssh"
+)
+
+var (
+	lookupUserByName = osuser.Lookup
+	chownPath        = os.Chown
 )
 
 // HostInit bootstraps the first host in the cluster.
@@ -327,7 +334,17 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 		}
 	}
 
-	// 2. Generate host certificate with 127.0.0.1 + outbound IP as SANs
+	// 2. Generate CLI client certificate if it doesn't exist.
+	clientCertPath := filepath.Join(pkiDir, "client.crt")
+	clientKeyPath := filepath.Join(pkiDir, "client.key")
+	if _, err := os.Stat(clientCertPath); os.IsNotExist(err) {
+		slog.Info("generating CLI client certificate")
+		if err := pki.GenerateClientCert(caPath, caKeyPath, clientCertPath, clientKeyPath, "lv-cli"); err != nil {
+			return fmt.Errorf("generate client cert: %w", err)
+		}
+	}
+
+	// 3. Generate host certificate with 127.0.0.1 + outbound IP as SANs
 	slog.Info("generating host certificate", "host", hostName)
 	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
 	hostKeyPath := filepath.Join(pkiDir, hostName+".key")
@@ -336,7 +353,8 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 		return fmt.Errorf("generate host cert: %w", err)
 	}
 
-	// 3. Copy certs to system PKI dir
+	// 4. Copy daemon certs to system PKI dir. The daemon host key stays
+	// root-owned; the user CLI gets a separate client certificate below.
 	remotePKIDir := "/etc/litevirt/pki"
 	if err := os.MkdirAll(remotePKIDir, 0700); err != nil {
 		return fmt.Errorf("create system PKI dir: %w", err)
@@ -355,7 +373,11 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 		}
 	}
 
-	// 4. Run setup script locally
+	if err := installLocalCLIClientBundle(pkiDir); err != nil {
+		return err
+	}
+
+	// 5. Run setup script locally
 	slog.Info("running local host setup")
 	setupScript, err := getSetupScript()
 	if err != nil {
@@ -385,6 +407,102 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 	fmt.Printf("Host %s initialized locally\n", hostName)
 	fmt.Println("  Start the daemon: systemctl enable --now litevirt.service")
 	fmt.Println("  Or run directly:  litevirt daemon")
+	return nil
+}
+
+type cliPKITarget struct {
+	dir   string
+	uid   int
+	gid   int
+	chown bool
+}
+
+func installLocalCLIClientBundle(srcPKIDir string) error {
+	targets, err := localCLIClientPKITargets()
+	if err != nil {
+		return err
+	}
+	for _, target := range targets {
+		if err := installCLIClientBundle(srcPKIDir, target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func localCLIClientPKITargets() ([]cliPKITarget, error) {
+	targets := []cliPKITarget{{dir: PKIDir()}}
+
+	sudoUser := os.Getenv("SUDO_USER")
+	if sudoUser == "" || sudoUser == "root" {
+		return targets, nil
+	}
+
+	u, err := lookupUserByName(sudoUser)
+	if err != nil {
+		return nil, fmt.Errorf("resolve sudo user %q for CLI cert install: %w", sudoUser, err)
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return nil, fmt.Errorf("parse uid for sudo user %q: %w", sudoUser, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return nil, fmt.Errorf("parse gid for sudo user %q: %w", sudoUser, err)
+	}
+
+	sudoTarget := cliPKITarget{
+		dir:   filepath.Join(u.HomeDir, ".config", "litevirt", "pki"),
+		uid:   uid,
+		gid:   gid,
+		chown: true,
+	}
+
+	if os.Getenv("LV_CONFIG_DIR") != "" {
+		targets[0].uid = uid
+		targets[0].gid = gid
+		targets[0].chown = true
+	}
+	if filepath.Clean(sudoTarget.dir) != filepath.Clean(targets[0].dir) {
+		targets = append(targets, sudoTarget)
+	}
+
+	return targets, nil
+}
+
+func installCLIClientBundle(srcPKIDir string, target cliPKITarget) error {
+	if err := os.MkdirAll(target.dir, 0700); err != nil {
+		return fmt.Errorf("create CLI PKI dir %s: %w", target.dir, err)
+	}
+	files := []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "ca.crt", mode: 0644},
+		{name: "client.crt", mode: 0644},
+		{name: "client.key", mode: 0600},
+	}
+	for _, file := range files {
+		src := filepath.Join(srcPKIDir, file.name)
+		dst := filepath.Join(target.dir, file.name)
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("read CLI %s: %w", file.name, err)
+		}
+		if err := os.WriteFile(dst, data, file.mode); err != nil {
+			return fmt.Errorf("write CLI %s: %w", file.name, err)
+		}
+		if target.chown {
+			if err := chownPath(dst, target.uid, target.gid); err != nil {
+				return fmt.Errorf("chown CLI %s: %w", file.name, err)
+			}
+		}
+	}
+	if target.chown {
+		if err := chownPath(target.dir, target.uid, target.gid); err != nil {
+			return fmt.Errorf("chown CLI PKI dir %s: %w", target.dir, err)
+		}
+	}
 	return nil
 }
 

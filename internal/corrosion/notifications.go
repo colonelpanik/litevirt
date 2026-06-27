@@ -32,7 +32,7 @@ func InsertNotificationTarget(ctx context.Context, c *Client, t NotificationTarg
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO notification_targets (id, name, type, config, enabled, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
-		t.ID, t.Name, t.Type, t.Config, en, now, now,
+		t.ID, t.Name, t.Type, t.Config, en, nowRFC3339(), now,
 	)
 }
 
@@ -55,7 +55,7 @@ func ListNotificationTargets(ctx context.Context, c *Client) ([]NotificationTarg
 func DeleteNotificationTarget(ctx context.Context, c *Client, id string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
-		`UPDATE notification_targets SET deleted_at = ?, updated_at = ? WHERE id = ?`, now, now, id)
+		`UPDATE notification_targets SET deleted_at = ?, updated_at = ? WHERE id = ?`, nowRFC3339(), now, id)
 }
 
 func InsertNotificationRoute(ctx context.Context, c *Client, r NotificationRoute) error {
@@ -70,7 +70,7 @@ func InsertNotificationRoute(ctx context.Context, c *Client, r NotificationRoute
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO notification_routes (id, event_pattern, target_id, min_severity, enabled, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
-		r.ID, r.EventPattern, r.TargetID, r.MinSeverity, en, now, now,
+		r.ID, r.EventPattern, r.TargetID, r.MinSeverity, en, nowRFC3339(), now,
 	)
 }
 
@@ -93,5 +93,5 @@ func ListNotificationRoutes(ctx context.Context, c *Client) ([]NotificationRoute
 func DeleteNotificationRoute(ctx context.Context, c *Client, id string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
-		`UPDATE notification_routes SET deleted_at = ?, updated_at = ? WHERE id = ?`, now, now, id)
+		`UPDATE notification_routes SET deleted_at = ?, updated_at = ? WHERE id = ?`, nowRFC3339(), now, id)
 }

@@ -26,7 +26,7 @@ func UpsertStack(ctx context.Context, c *Client, s StackRecord) error {
 		   state        = excluded.state,
 		   updated_at   = excluded.updated_at,
 		   deleted_at   = NULL`,
-		s.Name, s.ComposeHash, s.ComposeYAML, s.State, now, now,
+		s.Name, s.ComposeHash, s.ComposeYAML, s.State, nowRFC3339(), now,
 	)
 }
 
@@ -110,6 +110,6 @@ func DeleteStackRecord(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE stacks SET deleted_at = ?, updated_at = ?, state = 'deleted' WHERE name = ?`,
-		now, now, name,
+		nowRFC3339(), now, name,
 	)
 }

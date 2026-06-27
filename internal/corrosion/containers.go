@@ -173,7 +173,7 @@ func DeleteContainer(ctx context.Context, c *Client, hostName, name string) erro
 	return c.Execute(ctx,
 		`UPDATE containers SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ?`,
-		now, now, hostName, name)
+		nowRFC3339(), now, hostName, name)
 }
 
 // GetContainer returns one container row (including soft-deleted, so

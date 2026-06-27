@@ -213,11 +213,14 @@ func UpsertRecord(ctx context.Context, db *corrosion.Client, name, ip string) er
 	)
 }
 
-// DeleteRecord tombstones a dns_record entry.
+// DeleteRecord tombstones a dns_record entry. dns_records is full-state
+// anti-entropy with a deleted_at column, so the tombstone MUST bump updated_at
+// (the LWW key) — otherwise a peer's stale live row out-times it and resurrects
+// the record. deleted_at is the bare marker; updated_at is the monotonic key.
 func DeleteRecord(ctx context.Context, db *corrosion.Client, name string) error {
-	now := db.NowTS()
 	return db.Execute(ctx,
-		`UPDATE dns_records SET deleted_at = ? WHERE name = ?`, now, name,
+		`UPDATE dns_records SET deleted_at = ?, updated_at = ? WHERE name = ?`,
+		time.Now().UTC().Format(time.RFC3339), db.NowTS(), name,
 	)
 }
 

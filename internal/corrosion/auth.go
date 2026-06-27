@@ -91,7 +91,7 @@ func DeleteRole(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE roles SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-		now, now, name)
+		nowRFC3339(), now, name)
 }
 
 func scanRole(r Row) *RoleRecord {
@@ -139,7 +139,7 @@ func DeleteRoleBinding(ctx context.Context, c *Client, id string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		now, now, id)
+		nowRFC3339(), now, id)
 }
 
 // ListRoleBindings returns all active bindings. Used by the permission
@@ -295,7 +295,7 @@ func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
 		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(username, method, label) DO UPDATE
 		   SET secret = excluded.secret, updated_at = excluded.updated_at`,
-		r.Username, r.Method, r.Secret, r.Label, now, now)
+		r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now)
 }
 
 // ListUser2FA returns the user's enrolled factors. Empty slice = no 2FA.
@@ -326,7 +326,7 @@ func TouchUser2FA(ctx context.Context, c *Client, username, method, label string
 	return c.Execute(ctx,
 		`UPDATE user_2fa SET last_used_at = ?, updated_at = ?
 		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
-		now, now, username, method, label)
+		nowRFC3339(), now, username, method, label)
 }
 
 // RecordTOTPStep ratchets last_step forward (and bumps last_used_at) after a
@@ -340,7 +340,7 @@ func RecordTOTPStep(ctx context.Context, c *Client, username, method, label stri
 	return c.Execute(ctx,
 		`UPDATE user_2fa SET last_step = ?, last_used_at = ?, updated_at = ?
 		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND last_step < ?`,
-		step, now, now, username, method, label, step)
+		step, nowRFC3339(), now, username, method, label, step)
 }
 
 // DeleteUser2FA un-enrolls a single factor.

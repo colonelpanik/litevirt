@@ -53,7 +53,7 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 	return c.Execute(ctx,
 		`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
-		p.Name, p.Display, p.ParentName, now, now)
+		p.Name, p.Display, p.ParentName, nowRFC3339(), now)
 }
 
 // GetProject returns the project by name (canonical path) or nil if
@@ -143,7 +143,7 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-		now, now, name)
+		nowRFC3339(), now, name)
 }
 
 // UpsertProjectQuota writes a quota row for the project. Zero in

@@ -611,7 +611,7 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	}
 
 	sets = append(sets, "updated_at = ?")
-	args = append(args, time.Now().UTC().Format(time.RFC3339))
+	args = append(args, s.db.NowTS()) // monotonic LWW key (hosts is replicated)
 	args = append(args, req.Name)
 
 	query := fmt.Sprintf("UPDATE hosts SET %s WHERE name = ?",

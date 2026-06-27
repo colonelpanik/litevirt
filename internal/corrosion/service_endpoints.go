@@ -37,7 +37,7 @@ func UpsertServiceEndpoint(ctx context.Context, c *Client, e ServiceEndpoint) er
 		   weight     = excluded.weight,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		e.ServiceName, e.IP, e.Region, e.Weight, now, now)
+		e.ServiceName, e.IP, e.Region, e.Weight, nowRFC3339(), now)
 }
 
 // ListServiceEndpoints returns all non-deleted endpoints. If serviceName
@@ -78,5 +78,5 @@ func DeleteServiceEndpoint(ctx context.Context, c *Client, serviceName, ip strin
 	return c.Execute(ctx,
 		`UPDATE service_endpoints SET deleted_at = ?, updated_at = ?
 		 WHERE service_name = ? AND ip = ?`,
-		now, now, serviceName, ip)
+		nowRFC3339(), now, serviceName, ip)
 }

@@ -8,41 +8,66 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// sqlLiteralRe extracts backtick-delimited string literals (this codebase writes
-// SQL as raw `…` literals).
-var sqlLiteralRe = regexp.MustCompile("`[^`]*`")
-
-// writeTargetRe pulls the table name out of an UPDATE/INSERT statement.
+// writeTargetRe pulls the table name out of an UPDATE/INSERT statement. It also
+// matches a dynamically-built fragment like `UPDATE hosts SET %s` (fmt.Sprintf),
+// so a guard scanning a function's string literals catches dynamic SQL too.
 var writeTargetRe = regexp.MustCompile(`(?is)(?:UPDATE|INTO)\s+([a-z_0-9]+)`)
 
-// TestReplicatedUpdatedAtUsesNowTS is a tripwire (not a parser): a function that
-// writes `updated_at` to a CRDT-replicated or push-replicated table — where
-// updated_at is the last-writer-wins key — must generate that value with
-// Client.NowTS() (monotonic sub-second), never bare second-resolution
-// time.RFC3339, which can tie two same-second writes and strand the loser on a
-// peer. It is intentionally function-scoped + regex-based: it catches a wholly
-// unconverted writer, not every per-statement mistake. Append-only / non-LWW
-// timestamp columns (audit_log, vm_events, mutation_log, created_at, deleted_at,
-// expiry, retention cutoffs) are deliberately out of scope.
-func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
-	// LWW-keyed replicated tables: the public anti-entropy set minus the
-	// append-only audit_log, plus the push-replicated secret-bearing tables.
-	replicated := map[string]bool{
+// replicatedLWWTables is the set whose updated_at is a last-writer-wins key: the
+// public anti-entropy set minus append-only audit_log, plus the push-replicated
+// secret-bearing tables. Restart tables (vm_restarts/container_restarts) are
+// host-local and not in tableNames, so they're excluded.
+func replicatedLWWTables() map[string]bool {
+	m := map[string]bool{
 		"registry_credentials": true,
 		"notification_targets": true,
 		"notification_routes":  true,
 	}
 	for _, n := range tableNames {
-		if n == "audit_log" {
-			continue // append-only, RFC3339Nano timestamp, not LWW-merged
+		if n == "audit_log" { // append-only, RFC3339Nano timestamp, not LWW-merged
+			continue
 		}
-		replicated[n] = true
+		m[n] = true
 	}
+	return m
+}
 
+// writesReplicatedUpdatedAt reports whether a function's collected string
+// literals write updated_at to a replicated/sensitive table. It is deliberately
+// literal-based (not param-aware) so it catches BOTH a single SQL literal and a
+// dynamically-assembled statement (one literal names the table, another carries
+// `updated_at = ?`), e.g. ConfigureHost's `fmt.Sprintf("UPDATE hosts SET %s …")`
+// + `"updated_at = ?"`.
+func writesReplicatedUpdatedAt(literals []string, replicated map[string]bool) bool {
+	writesReplicated, mentionsUpdatedAt := false, false
+	for _, lit := range literals {
+		if strings.Contains(lit, "updated_at") {
+			mentionsUpdatedAt = true
+		}
+		if m := writeTargetRe.FindStringSubmatch(lit); m != nil && replicated[m[1]] {
+			writesReplicated = true
+		}
+	}
+	return writesReplicated && mentionsUpdatedAt
+}
+
+// TestReplicatedUpdatedAtUsesNowTS is a tripwire (not a parser): a function that
+// writes updated_at to a replicated/sensitive table — where updated_at is the
+// LWW key — must generate that value with Client.NowTS() (monotonic sub-second),
+// never bare second-resolution time.RFC3339, which ties two same-second writes
+// and strands the loser on a peer. It scans string literals via the AST, so it
+// also catches dynamically-built SQL (the class the old backtick-only scan
+// missed). It is function-scoped: it ensures a writer references NowTS at all,
+// not that every statement does — append-only / non-LWW columns (created_at,
+// deleted_at markers, expiry, retention cutoffs, audit_log, vm_events) are out
+// of scope by design.
+func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
+	replicated := replicatedLWWTables()
 	root, err := filepath.Abs("..") // internal/
 	if err != nil {
 		t.Fatal(err)
@@ -66,13 +91,14 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 		rel, _ := filepath.Rel(root, path)
 		for _, decl := range f.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok {
+			if !ok || fn.Body == nil {
+				continue
+			}
+			lits := funcStringLiterals(fn)
+			if !writesReplicatedUpdatedAt(lits, replicated) {
 				continue
 			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])
-			if !writesReplicatedUpdatedAt(body, replicated) {
-				continue
-			}
 			if !strings.Contains(body, "NowTS(") {
 				t.Errorf("internal/%s: %s writes updated_at to a replicated table but never calls "+
 					"NowTS() — replicated updated_at must use Client.NowTS() (monotonic), not bare time.RFC3339",
@@ -86,17 +112,42 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 	}
 }
 
-// writesReplicatedUpdatedAt reports whether the function source contains a SQL
-// literal that writes `updated_at` to one of the replicated tables.
-func writesReplicatedUpdatedAt(funcSrc string, replicated map[string]bool) bool {
-	for _, lit := range sqlLiteralRe.FindAllString(funcSrc, -1) {
-		if !strings.Contains(lit, "updated_at") {
-			continue
+// funcStringLiterals returns the unquoted value of every string literal (backtick
+// or double-quoted) inside a function — comments are excluded by construction.
+func funcStringLiterals(fn *ast.FuncDecl) []string {
+	var out []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		if bl, ok := n.(*ast.BasicLit); ok && bl.Kind == token.STRING {
+			if v, err := strconv.Unquote(bl.Value); err == nil {
+				out = append(out, v)
+			}
 		}
-		m := writeTargetRe.FindStringSubmatch(lit)
-		if m != nil && replicated[m[1]] {
-			return true
+		return true
+	})
+	return out
+}
+
+// TestWritesReplicatedUpdatedAt_Detection gives the tripwire teeth on the cases
+// the old version missed: a dynamic SQL builder, a tombstone writer, and the
+// non-flag cases (read-only, host-local restart table).
+func TestWritesReplicatedUpdatedAt_Detection(t *testing.T) {
+	repl := replicatedLWWTables()
+	cases := []struct {
+		name     string
+		literals []string
+		want     bool
+	}{
+		{"dynamic builder (ConfigureHost shape)", []string{`UPDATE hosts SET %s WHERE name = ?`, `updated_at = ?`}, true},
+		{"tombstone writer (dns DeleteRecord)", []string{`UPDATE dns_records SET deleted_at = ?, updated_at = ? WHERE name = ?`}, true},
+		{"plain insert", []string{`INSERT INTO vms (name, created_at, updated_at) VALUES (?, ?, ?)`}, true},
+		{"insert or replace", []string{`INSERT OR REPLACE INTO notification_targets (id, updated_at) VALUES (?, ?)`}, true},
+		{"read-only select (no write)", []string{`SELECT updated_at FROM hosts WHERE name = ?`}, false},
+		{"host-local restart table (not replicated)", []string{`UPDATE vm_restarts SET updated_at = ?`}, false},
+		{"write without updated_at", []string{`UPDATE hosts SET state = ? WHERE name = ?`}, false},
+	}
+	for _, c := range cases {
+		if got := writesReplicatedUpdatedAt(c.literals, repl); got != c.want {
+			t.Errorf("%s: writesReplicatedUpdatedAt = %v, want %v", c.name, got, c.want)
 		}
 	}
-	return false
 }

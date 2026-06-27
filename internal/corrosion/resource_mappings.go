@@ -32,7 +32,7 @@ func CreateResourceMapping(ctx context.Context, c *Client, name, description str
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO resource_mappings (name, host_name, address, description, created_at, updated_at, deleted_at)
 		 VALUES (?, '', '', ?, ?, ?, NULL)`,
-		name, description, now, now,
+		name, description, nowRFC3339(), now,
 	)
 }
 
@@ -43,7 +43,7 @@ func AddMappingDevice(ctx context.Context, c *Client, name, host, address, vendo
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO resource_mappings (name, host_name, address, vendor, device, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
-		name, host, address, vendor, device, now, now,
+		name, host, address, vendor, device, nowRFC3339(), now,
 	)
 }
 
@@ -52,7 +52,7 @@ func RemoveMappingDevice(ctx context.Context, c *Client, name, host, address str
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE resource_mappings SET deleted_at = ?, updated_at = ? WHERE name = ? AND host_name = ? AND address = ?`,
-		now, now, name, host, address,
+		nowRFC3339(), now, name, host, address,
 	)
 }
 
@@ -61,7 +61,7 @@ func DeleteResourceMapping(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE resource_mappings SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-		now, now, name,
+		nowRFC3339(), now, name,
 	)
 }
 

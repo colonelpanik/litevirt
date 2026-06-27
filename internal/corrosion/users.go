@@ -47,7 +47,7 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 	}
 	return c.Execute(ctx,
 		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		username, role, passwordHash, now, now,
+		username, role, passwordHash, nowRFC3339(), now,
 	)
 }
 
@@ -103,7 +103,7 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
-		now, now, username,
+		nowRFC3339(), now, username,
 	)
 }
 
@@ -121,7 +121,7 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 	}
 	return c.Execute(ctx,
 		`INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, now, now,
+		t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now,
 	)
 }
 
@@ -133,7 +133,7 @@ func RevokeToken(ctx context.Context, c *Client, id string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE tokens SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		now, now, id,
+		nowRFC3339(), now, id,
 	)
 }
 

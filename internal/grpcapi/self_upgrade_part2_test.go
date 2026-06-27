@@ -93,6 +93,55 @@ func TestFetchBinary_PeerOnlyAndSemaphore(t *testing.T) {
 	}
 }
 
+// TestCandidateConfirmed: the confirm-Ping must match the (eventually-consistent)
+// hosts-table candidate exactly, or the pull aborts (stale row / rollback).
+func TestCandidateConfirmed(t *testing.T) {
+	cand := peerVersionInfo{host: "p1", version: "v2", schema: 30}
+	cases := []struct {
+		name      string
+		live      peerVersionInfo
+		reachable bool
+		want      bool
+	}{
+		{"match", peerVersionInfo{host: "p1", version: "v2", schema: 30}, true, true},
+		{"unreachable", peerVersionInfo{}, false, false},
+		{"version drifted (row stale)", peerVersionInfo{host: "p1", version: "v1", schema: 30}, true, false},
+		{"schema drifted (row stale)", peerVersionInfo{host: "p1", version: "v2", schema: 29}, true, false},
+	}
+	for _, c := range cases {
+		if got := candidateConfirmed(cand, c.live, c.reachable); got != c.want {
+			t.Errorf("%s: candidateConfirmed = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestVerifyPulledBinary: the streamed binary's header must match the confirmed
+// (version, schema), never be a schema downgrade, never a no-op equal-version.
+func TestVerifyPulledBinary(t *testing.T) {
+	const localSchema, localVer = 30, "v1"
+	cases := []struct {
+		name         string
+		peerVer      string
+		peerSchema   int
+		expectVer    string
+		expectSchema int
+		wantErr      bool
+	}{
+		{"valid upgrade", "v2", 30, "v2", 30, false},
+		{"valid higher schema", "v2", 31, "v2", 31, false},
+		{"header version mismatch", "v3", 30, "v2", 30, true},
+		{"header schema mismatch", "v2", 31, "v2", 30, true},
+		{"schema downgrade", "v0", 29, "v0", 29, true},
+		{"no-op equal version", "v1", 30, "v1", 30, true},
+	}
+	for _, c := range cases {
+		err := verifyPulledBinary(c.peerVer, c.peerSchema, c.expectVer, c.expectSchema, localSchema, localVer)
+		if (err != nil) != c.wantErr {
+			t.Errorf("%s: verifyPulledBinary err = %v, wantErr = %v", c.name, err, c.wantErr)
+		}
+	}
+}
+
 // TestPreferRelaySource_Fallback: with no gossip members (no relays elected),
 // preferRelaySource returns a candidate matching the target without panicking.
 func TestPreferRelaySource_Fallback(t *testing.T) {

@@ -66,6 +66,13 @@ type Client struct {
 // NowTS outputs). time.Parse(time.RFC3339, …) still accepts it.
 const nowTSLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
+// nowRFC3339 is the bare second-resolution UTC timestamp for NON-LWW columns
+// (created_at, deleted_at markers, enrolled_at, allocated_at, last_*). These are
+// displayed or ordered by value, so they must stay bare — a fixed-width
+// fractional value sorts lexically BEFORE a bare same-second one, which would
+// mis-order mixed old/new rows. Only updated_at (the LWW key) uses NowTS.
+func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
+
 // NowTS returns a strictly-monotonic, fixed-width RFC3339Nano UTC timestamp for
 // this Client. It is the timestamp source for replicated rows' updated_at (the
 // LWW conflict key): two writes from the same node in the same wall-clock

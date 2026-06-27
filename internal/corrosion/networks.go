@@ -30,7 +30,7 @@ func UpsertNetwork(ctx context.Context, c *Client, r NetworkRecord) error {
 		   config = excluded.config,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		r.Name, r.StackName, r.Type, r.Config, now, now,
+		r.Name, r.StackName, r.Type, r.Config, nowRFC3339(), now,
 	)
 }
 
@@ -84,7 +84,7 @@ func DeleteNetwork(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE networks SET deleted_at = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
-		now, now, name,
+		nowRFC3339(), now, name,
 	)
 }
 

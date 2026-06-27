@@ -22,7 +22,7 @@ func UpsertBackupRepo(ctx context.Context, c *Client, r BackupRepo) error {
 		 VALUES (?, ?, ?, ?, ?, NULL)
 		 ON CONFLICT(name) DO UPDATE SET path = excluded.path,
 		   stack_name = excluded.stack_name, updated_at = excluded.updated_at, deleted_at = NULL`,
-		r.Name, r.Path, r.StackName, now, now,
+		r.Name, r.Path, r.StackName, nowRFC3339(), now,
 	)
 }
 
@@ -61,5 +61,5 @@ func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string) error 
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE backup_repos SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL`,
-		now, now, stack)
+		nowRFC3339(), now, stack)
 }

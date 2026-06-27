@@ -36,7 +36,7 @@ func InsertContainerSnapshot(ctx context.Context, c *Client, s ContainerSnapshot
 		`INSERT OR REPLACE INTO container_snapshots
 		   (id, ct_name, host_name, name, state, size_bytes, type, path, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.ID, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, now, now,
+		s.ID, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, nowRFC3339(), now,
 	)
 }
 
@@ -81,7 +81,7 @@ func DeleteContainerSnapshot(ctx context.Context, c *Client, hostName, ctName, n
 	return c.Execute(ctx,
 		`UPDATE container_snapshots SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND ct_name = ? AND name = ?`,
-		now, now, hostName, ctName, name)
+		nowRFC3339(), now, hostName, ctName, name)
 }
 
 func scanContainerSnapshot(r Row) ContainerSnapshotRecord {

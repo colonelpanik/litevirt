@@ -196,13 +196,21 @@ func (s *Server) selfUpgradeTarget(ctx context.Context) (peer, version string, s
 	// reimaged) must not drive a pull. Mismatch or unreachable → abort this tick;
 	// re-discover next tick. This is ONE Ping, not a fan-out.
 	live, lok := s.pingPeerVersion(ctx, t.host)
-	if !lok || live.version != t.version || live.schema != t.schema {
+	if !candidateConfirmed(t, live, lok) {
 		slog.Info("self-upgrade: candidate stale vs confirm-ping — aborting tick",
 			"peer", t.host, "rowVersion", t.version, "rowSchema", t.schema,
 			"liveVersion", live.version, "liveSchema", live.schema, "reachable", lok)
 		return "", "", 0, false
 	}
 	return t.host, t.version, t.schema, true
+}
+
+// candidateConfirmed reports whether a live Ping confirms the candidate chosen
+// from the (eventually-consistent) hosts table: it must be reachable and report
+// the exact (version, schema) the table row claimed. A mismatch means the row
+// was stale (peer rolled back / reimaged) and the pull must be aborted.
+func candidateConfirmed(candidate, live peerVersionInfo, reachable bool) bool {
+	return reachable && live.version == candidate.version && live.schema == candidate.schema
 }
 
 // preferRelaySource returns an elected relay among the peers that match the
@@ -280,6 +288,24 @@ func (s *Server) pingPeerVersion(ctx context.Context, host string) (peerVersionI
 	return peerVersionInfo{host: host, version: resp.GetVersion(), schema: int(resp.GetSchemaVersion())}, true
 }
 
+// verifyPulledBinary gates a streamed binary's advertised (version, schema)
+// before it is swapped in: it must MATCH what the confirm-Ping promised (it
+// changed under us otherwise), must NOT be a schema downgrade (the daemon
+// refuses to start against a forward-migrated DB — refuse before the crash
+// loop), and must NOT equal our own version (a no-op swap).
+func verifyPulledBinary(peerVer string, peerSchema int, expectVer string, expectSchema, localSchema int, localVer string) error {
+	if peerVer != expectVer || peerSchema != expectSchema {
+		return fmt.Errorf("binary (%s/schema %d) != confirmed (%s/schema %d)", peerVer, peerSchema, expectVer, expectSchema)
+	}
+	if peerSchema < localSchema {
+		return fmt.Errorf("refusing schema downgrade: peer schema %d < local %d", peerSchema, localSchema)
+	}
+	if peerVer == localVer {
+		return fmt.Errorf("peer version equals ours (%s); nothing to do", peerVer)
+	}
+	return nil
+}
+
 // pullAndApply fetches peer's binary, verifies it, and stages + swaps it in
 // (without re-execing — the caller signals that). The FetchBinary header must
 // match the (version, schema) we confirmed for this peer; it also guards against
@@ -333,21 +359,10 @@ func (s *Server) pullAndApply(ctx context.Context, peer, expectVer string, expec
 		os.Remove(stagingPath)
 		return fmt.Errorf("checksum mismatch from %s", peer)
 	}
-	// The streamed binary's advertised (version, schema) must match what we
-	// confirmed for this peer; a mismatch means it changed under us — abort.
-	if peerVer != expectVer || int(peerSchema) != expectSchema {
+	if err := verifyPulledBinary(peerVer, int(peerSchema), expectVer, expectSchema,
+		corrosion.CurrentSchemaVersion, s.version); err != nil {
 		os.Remove(stagingPath)
-		return fmt.Errorf("peer %s binary (%s/schema %d) != confirmed (%s/schema %d)",
-			peer, peerVer, peerSchema, expectVer, expectSchema)
-	}
-	// Downgrade / no-op guards.
-	if int(peerSchema) < corrosion.CurrentSchemaVersion {
-		os.Remove(stagingPath)
-		return fmt.Errorf("refusing schema downgrade: peer schema %d < local %d", peerSchema, corrosion.CurrentSchemaVersion)
-	}
-	if peerVer == s.version {
-		os.Remove(stagingPath)
-		return fmt.Errorf("peer version equals ours (%s); nothing to do", peerVer)
+		return fmt.Errorf("peer %s: %w", peer, err)
 	}
 
 	if err := s.applyStagedBinary(ctx, stagingPath); err != nil {

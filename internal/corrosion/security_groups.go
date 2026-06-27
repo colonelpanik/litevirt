@@ -98,7 +98,7 @@ func DeleteSecurityGroup(ctx context.Context, c *Client, id string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE security_groups SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		now, now, id,
+		nowRFC3339(), now, id,
 	)
 }
 
@@ -127,7 +127,7 @@ func InsertSGRule(ctx context.Context, c *Client, rule SGRule) error {
 		`INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rule.ID, rule.SGID, rule.Direction, proto, rule.PortRange, rule.CIDR,
-		action, priority, now, now,
+		action, priority, nowRFC3339(), now,
 	)
 }
 
@@ -178,7 +178,7 @@ func DeleteSGRules(ctx context.Context, c *Client, sgID string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE sg_id = ?`,
-		now, now, sgID,
+		nowRFC3339(), now, sgID,
 	)
 }
 
@@ -187,6 +187,6 @@ func DeleteSGRule(ctx context.Context, c *Client, ruleID string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		now, now, ruleID,
+		nowRFC3339(), now, ruleID,
 	)
 }

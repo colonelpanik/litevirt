@@ -36,7 +36,7 @@ func InsertSnapshot(ctx context.Context, c *Client, s SnapshotRecord) error {
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO snapshots (id, vm_name, host_name, name, state, size_bytes, type, vmstate_path, vmstate_size_bytes, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.ID, s.VMName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.VMStatePath, s.VMStateBytes, now, now,
+		s.ID, s.VMName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.VMStatePath, s.VMStateBytes, nowRFC3339(), now,
 	)
 }
 
@@ -99,6 +99,6 @@ func DeleteSnapshot(ctx context.Context, c *Client, vmName, snapshotName string)
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE snapshots SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND name = ?`,
-		now, now, vmName, snapshotName,
+		nowRFC3339(), now, vmName, snapshotName,
 	)
 }

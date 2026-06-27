@@ -93,7 +93,8 @@ func projectOrDefault(p string) string {
 
 // InsertVM creates a new VM record with its interfaces and disks.
 func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord) error {
-	now := c.NowTS()
+	now := nowRFC3339() // created_at (bare)
+	uts := c.NowTS()    // updated_at (monotonic LWW key)
 
 	stmts := []Statement{
 		// Purge any soft-deleted record with the same name so the INSERT succeeds.
@@ -110,7 +111,7 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			Params: []interface{}{
 				vm.Name, vm.StackName, vm.HostName, vm.Spec, vm.State, vm.StateDetail,
-				vm.CPUActual, vm.MemActual, projectOrDefault(vm.Project), boolToInt(vm.IsTemplate), now, now,
+				vm.CPUActual, vm.MemActual, projectOrDefault(vm.Project), boolToInt(vm.IsTemplate), now, uts,
 			},
 		},
 	}
@@ -125,7 +126,7 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			Params: []interface{}{
 				iface.VMName, iface.NetworkName, iface.Ordinal, iface.MAC,
-				iface.IP, iface.TapDevice, sgsJSON, now,
+				iface.IP, iface.TapDevice, sgsJSON, uts,
 			},
 		})
 	}
@@ -137,7 +138,7 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			Params: []interface{}{
 				disk.VMName, disk.DiskName, disk.HostName, disk.Path, disk.SizeBytes,
-				disk.BackingImage, disk.StorageType, disk.StorageVolume, disk.TargetDev, nullIfEmpty(disk.BackingDisk), now,
+				disk.BackingImage, disk.StorageType, disk.StorageVolume, disk.TargetDev, nullIfEmpty(disk.BackingDisk), uts,
 			},
 		})
 	}

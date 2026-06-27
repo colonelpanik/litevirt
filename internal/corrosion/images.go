@@ -31,7 +31,7 @@ func InsertImage(ctx context.Context, c *Client, img ImageRecord) error {
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, now, now,
+		img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), now,
 	)
 }
 
@@ -139,7 +139,7 @@ func GetImageHosts(ctx context.Context, c *Client, imageName string) ([]ImageHos
 func DeleteImage(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()
 	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE images SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{now, now, name}},
-		{SQL: `UPDATE image_hosts SET deleted_at = ?, updated_at = ? WHERE image_name = ?`, Params: []interface{}{now, now, name}},
+		{SQL: `UPDATE images SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{nowRFC3339(), now, name}},
+		{SQL: `UPDATE image_hosts SET deleted_at = ?, updated_at = ? WHERE image_name = ?`, Params: []interface{}{nowRFC3339(), now, name}},
 	})
 }

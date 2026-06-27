@@ -40,7 +40,7 @@ func UpsertRegistryCredential(ctx context.Context, c *Client, rc RegistryCredent
 			SQL: `INSERT INTO registry_credentials
 			       (id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at)
 			       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-			Params: []interface{}{rc.ID, rc.Scope, rc.Owner, rc.Registry, rc.Username, rc.Secret, now, now},
+			Params: []interface{}{rc.ID, rc.Scope, rc.Owner, rc.Registry, rc.Username, rc.Secret, nowRFC3339(), now},
 		},
 	})
 }

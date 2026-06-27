@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -134,11 +135,10 @@ func AllocateIP(ctx context.Context, db *corrosion.Client, network, subnet, mac,
 			return "", err
 		}
 
-		now := db.NowTS()
 		err = db.Execute(ctx,
 			`INSERT INTO ip_allocations (network, ip, mac, vm_name, allocated_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
-			network, ip, mac, vmName, now, now)
+			network, ip, mac, vmName, time.Now().UTC().Format(time.RFC3339), db.NowTS())
 		if err == nil {
 			return ip, nil
 		}

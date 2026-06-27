@@ -1068,6 +1068,49 @@ func TestLB_DeleteHidesAndAllowsReuse(t *testing.T) {
 	}
 }
 
+// TestLB_RecreateAfterDeleteThroughAPI locks down the reader-audit contract on the
+// PUBLIC create path (the existing reuse test re-creates via a raw UpsertLBConfig,
+// which bypasses CreateLoadBalancer's uniqueness checks). After DeleteLoadBalancer
+// soft-deletes an LB, CreateLoadBalancer must reuse the same name AND VIP — both the
+// name-uniqueness and VIP-uniqueness queries must skip the tombstone — and the
+// recreate's backend set must be exactly the requested one (the old backend is not
+// resurrected, via SoftDeleteLBBackends-on-create).
+func TestLB_RecreateAfterDeleteThroughAPI(t *testing.T) {
+	s := testServerCov(t)
+	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil } // no root/haproxy in unit tests
+	ctx := adminCtx()
+	createLBTable(t, ctx, s.db)
+
+	create := func(backend string) error {
+		_, err := s.CreateLoadBalancer(ctx, &pb.CreateLBRequest{
+			Name:      "api-reuse-lb",
+			Vip:       "10.0.100.80/24",
+			Algorithm: "roundrobin",
+			Ports:     []*pb.LBPort{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+			Backends:  []*pb.LBBackendAddress{{Name: backend, Address: "10.0.1.10:8080"}},
+			Hosts:     []string{"test-host"},
+		})
+		return err
+	}
+
+	if err := create("web1"); err != nil {
+		t.Fatalf("initial CreateLoadBalancer: %v", err)
+	}
+	if _, err := s.DeleteLoadBalancer(ctx, &pb.DeleteLBRequest{Name: "api-reuse-lb"}); err != nil {
+		t.Fatalf("DeleteLoadBalancer: %v", err)
+	}
+	// Re-create through the API with the SAME name and SAME VIP: passes only if both
+	// uniqueness checks filter out the tombstone (AlreadyExists before the fix).
+	if err := create("web2"); err != nil {
+		t.Fatalf("recreate through CreateLoadBalancer must reuse name+VIP, got: %v", err)
+	}
+	// The recreate's backends are exactly {web2}; the old web1 is not resurrected.
+	backends, _ := corrosion.ListLBBackends(ctx, s.db, "api-reuse-lb")
+	if len(backends) != 1 || backends[0].Name != "web2" {
+		t.Errorf("recreated LB backends = %+v, want exactly [web2]", backends)
+	}
+}
+
 func TestDeleteLoadBalancer_NotFound(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()

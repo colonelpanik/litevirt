@@ -17,6 +17,12 @@ var hardDeleteRe = regexp.MustCompile(`DELETE\s+FROM\s+([a-z_0-9]+)`)
 // so a peer that missed it resurrects the row. The only sanctioned exception is a
 // purge of an ALREADY-tombstoned row immediately before re-insert, tagged with a
 // `full-state-delete-ok` marker on the statement line (see InsertVM).
+//
+// This is a TRIPWIRE, not complete enforcement: it is regex/line-based, so it only
+// catches a single-line `DELETE FROM <table>` written in the canonical casing. It
+// will miss lowercase keywords, multi-line statements, and SQL built from string
+// fragments. It exists to catch the easy regression; correctness still rests on the
+// behavioral merge/resurrection tests, not on this scan being exhaustive.
 func TestNoHardDeleteOfFullStateTables(t *testing.T) {
 	fullState := make(map[string]bool, len(tableNames))
 	for _, n := range tableNames {

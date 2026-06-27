@@ -1351,6 +1351,18 @@ var tablePrimaryKeys = map[string][]string{
 	"notification_targets":   {"id"},
 	"notification_routes":    {"id"},
 	"registry_credentials":   {"id"},
+	// Replicated tables with updated_at that previously lacked an entry, so LWW
+	// was silently skipped in both the merge and the Crescent apply path.
+	"vm_backups":              {"vm_name", "disk_name", "repo"},
+	"container_backups":       {"ct_name", "repo"},
+	"container_snapshots":     {"id"},
+	"container_restarts":      {"host_name", "name"},
+	"ip_sets":                 {"id"},
+	"cluster_firewall_rules":  {"id"},
+	"host_firewall_rules":     {"id"},
+	"firewall_defaults":       {"scope"},
+	"backup_repos":            {"name"},
+	"replication_checkpoints": {"vm_name", "repo"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.

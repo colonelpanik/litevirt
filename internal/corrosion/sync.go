@@ -59,13 +59,17 @@ var tableNames = []string{
 	"fencing_log", "audit_log",
 	"network_vteps", "bgp_peers", "ip_allocations", "security_groups", "sg_rules",
 	"containers",
-	// Cluster-global config — full-state anti-entropy coverage (all LWW-safe:
-	// composite/single PK + updated_at). Previously push-replicated only, so a
-	// node that missed a push (partition/restart) wasn't repaired by anti-entropy.
-	"storage_pools", "backup_schedules", "host_pci_devices",
-	"roles", "role_bindings", "projects", "project_quotas",
-	"notification_targets", "notification_routes",
-	"registry_credentials", "resource_mappings", "service_endpoints",
+	// Cluster-global config + state — full-state anti-entropy coverage. All
+	// LWW-safe (PK + updated_at) and free of plaintext secrets. Previously
+	// push-replicated only, so a node that missed a push (partition/restart)
+	// wasn't repaired by anti-entropy. Secret-bearing tables (registry_credentials,
+	// notification_targets) and per-node/coordination state are intentionally
+	// excluded — see antiEntropyExcluded in tablenames_coverage_test.go.
+	"storage_pools", "backup_schedules", "backup_repos", "replication_checkpoints",
+	"host_pci_devices", "roles", "role_bindings", "projects", "project_quotas",
+	"resource_mappings", "service_endpoints",
+	"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults",
+	"vm_backups", "container_backups", "container_snapshots",
 }
 
 // dumpState serializes all tables as gzipped JSON for push/pull sync.

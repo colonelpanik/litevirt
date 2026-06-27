@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // GetStateDigest returns a lightweight fingerprint of each replicated table
@@ -35,6 +36,18 @@ func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.Stat
 		})
 	}
 	return resp, nil
+}
+
+func stateDigestResponse(hostName string, digests []corrosion.TableDigest) *pb.StateDigestResponse {
+	resp := &pb.StateDigestResponse{HostName: hostName}
+	for _, d := range digests {
+		resp.Tables = append(resp.Tables, &pb.TableDigest{
+			Name:  d.Name,
+			Count: int32(d.Count),
+			Hash:  d.Hash,
+		})
+	}
+	return resp
 }
 
 // GetStateDump returns a full gzipped state dump that can be merged into
@@ -64,18 +77,21 @@ func (s *Server) StreamStateDump(_ *emptypb.Empty, stream grpc.ServerStreamingSe
 	if err := RequireRole(stream.Context(), "operator"); err != nil {
 		return err
 	}
-	data := s.db.DumpStateBytes()
+	return streamStateDump(s.db.DumpStateBytes(), stream.Send)
+}
+
+func streamStateDump(data []byte, send func(*pb.StateDumpChunk) error) error {
 	if len(data) == 0 {
 		// Send a single final empty chunk so the client gets a clean,
 		// unambiguous end-of-stream rather than a bare EOF.
-		return stream.Send(&pb.StateDumpChunk{Final: true})
+		return send(&pb.StateDumpChunk{Final: true})
 	}
 	for off := 0; off < len(data); off += stateDumpChunkSize {
 		end := off + stateDumpChunkSize
 		if end > len(data) {
 			end = len(data)
 		}
-		if err := stream.Send(&pb.StateDumpChunk{
+		if err := send(&pb.StateDumpChunk{
 			Data:  data[off:end],
 			Final: end == len(data),
 		}); err != nil {
@@ -83,6 +99,36 @@ func (s *Server) StreamStateDump(_ *emptypb.Empty, stream grpc.ServerStreamingSe
 		}
 	}
 	return nil
+}
+
+// GetSensitiveStateDigest returns fingerprints for secret-bearing tables. It
+// is peer-mTLS only; operator-facing state dumps intentionally exclude these
+// tables.
+func (s *Server) GetSensitiveStateDigest(ctx context.Context, req *pb.SensitiveStateRequest) (*pb.StateDigestResponse, error) {
+	if req.GetSender() == "" {
+		return nil, status.Error(codes.InvalidArgument, "sender required")
+	}
+	if err := requireReplicationPeer(ctx, req.GetSender()); err != nil {
+		return nil, err
+	}
+
+	digests, err := s.db.SensitiveStateDigest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return stateDigestResponse(s.hostName, digests), nil
+}
+
+// StreamSensitiveStateDump streams the peer-only sensitive repair dump. It must
+// not be exposed through operator or REST surfaces.
+func (s *Server) StreamSensitiveStateDump(req *pb.SensitiveStateRequest, stream grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
+	if req.GetSender() == "" {
+		return status.Error(codes.InvalidArgument, "sender required")
+	}
+	if err := requireReplicationPeer(stream.Context(), req.GetSender()); err != nil {
+		return err
+	}
+	return streamStateDump(s.db.DumpSensitiveStateBytes(), stream.Send)
 }
 
 // PushMutations receives mutation entries from a peer and applies them locally

@@ -68,13 +68,21 @@ func (ae *AntiEntropy) checkPeers(ctx context.Context) {
 	for _, d := range localDigests {
 		localMap[d.Name] = d
 	}
+	sensitiveDigests, err := ae.client.SensitiveStateDigest(ctx)
+	if err != nil {
+		slog.Warn("anti-entropy: local sensitive digest error", "error", err)
+	}
+	sensitiveMap := make(map[string]TableDigest, len(sensitiveDigests))
+	for _, d := range sensitiveDigests {
+		sensitiveMap[d.Name] = d
+	}
 
 	for _, peer := range peers {
-		ae.checkPeer(ctx, peer.Name, localMap)
+		ae.checkPeer(ctx, peer.Name, localMap, sensitiveMap)
 	}
 }
 
-func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap map[string]TableDigest) {
+func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap, sensitiveMap map[string]TableDigest) {
 	client, conn, err := ae.peerClient(ctx, peerName)
 	if err != nil {
 		slog.Debug("anti-entropy: cannot reach peer", "peer", peerName, "error", err)
@@ -106,20 +114,69 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap 
 		}
 	}
 
+	if mismatch {
+		// Fetch full state dump and merge with LWW.
+		slog.Info("anti-entropy: syncing from peer", "peer", peerName)
+		data, err := fetchStateDump(ctx, client)
+		if err != nil {
+			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
+			return
+		}
+
+		ae.client.MergeStateBytesLWW(data)
+		slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
+	}
+
+	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap)
+}
+
+func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest) {
+	if len(localMap) == 0 {
+		return
+	}
+	req := &pb.SensitiveStateRequest{Sender: ae.client.HostName()}
+	resp, err := client.GetSensitiveStateDigest(ctx, req)
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			slog.Debug("anti-entropy: peer has no sensitive state digest RPC", "peer", peerName)
+			return
+		}
+		slog.Debug("anti-entropy: sensitive digest RPC error", "peer", peerName, "error", err)
+		return
+	}
+
+	mismatch := false
+	for _, remote := range resp.Tables {
+		local, exists := localMap[remote.Name]
+		if !exists {
+			mismatch = true
+			break
+		}
+		if local.Count != int(remote.Count) || local.Hash != remote.Hash {
+			slog.Info("anti-entropy: sensitive drift detected",
+				"peer", peerName, "table", remote.Name,
+				"local_count", local.Count, "remote_count", remote.Count,
+				"local_hash", local.Hash, "remote_hash", remote.Hash)
+			mismatch = true
+			break
+		}
+	}
 	if !mismatch {
 		return
 	}
 
-	// Fetch full state dump and merge with LWW.
-	slog.Info("anti-entropy: syncing from peer", "peer", peerName)
-	data, err := fetchStateDump(ctx, client)
+	slog.Info("anti-entropy: syncing sensitive state from peer", "peer", peerName)
+	data, err := fetchSensitiveStateDump(ctx, client, req)
 	if err != nil {
-		slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
+		if status.Code(err) == codes.Unimplemented {
+			slog.Debug("anti-entropy: peer has no sensitive state dump RPC", "peer", peerName)
+			return
+		}
+		slog.Warn("anti-entropy: sensitive dump RPC error", "peer", peerName, "error", err)
 		return
 	}
-
-	ae.client.MergeStateBytesLWW(data)
-	slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
+	ae.client.MergeSensitiveStateBytesLWW(data)
+	slog.Info("anti-entropy: sensitive merge complete", "peer", peerName, "bytes", len(data))
 }
 
 // fetchStateDump pulls a peer's full state dump, preferring the chunked
@@ -156,6 +213,24 @@ func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, erro
 		return nil, derr
 	}
 	return dump.Data, nil
+}
+
+func fetchSensitiveStateDump(ctx context.Context, client pb.LiteVirtClient, req *pb.SensitiveStateRequest) ([]byte, error) {
+	stream, err := client.StreamSensitiveStateDump(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	var buf []byte
+	for {
+		chunk, rerr := stream.Recv()
+		if rerr == io.EOF {
+			return buf, nil
+		}
+		if rerr != nil {
+			return nil, rerr
+		}
+		buf = append(buf, chunk.Data...)
+	}
 }
 
 func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {

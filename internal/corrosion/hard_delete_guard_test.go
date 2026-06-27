@@ -28,6 +28,9 @@ func TestNoHardDeleteOfFullStateTables(t *testing.T) {
 	for _, n := range tableNames {
 		fullState[n] = true
 	}
+	for _, n := range sensitiveTableNames {
+		fullState[n] = true
+	}
 
 	// CWD during `go test` is internal/corrosion; scan all of internal/.
 	root, err := filepath.Abs("..")

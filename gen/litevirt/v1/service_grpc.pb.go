@@ -193,6 +193,8 @@ const (
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
 	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
+	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
+	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
 	LiteVirt_PushMutations_FullMethodName              = "/litevirt.v1.LiteVirt/PushMutations"
 	LiteVirt_AckMutations_FullMethodName               = "/litevirt.v1.LiteVirt/AckMutations"
 	LiteVirt_ListRebalanceProposals_FullMethodName     = "/litevirt.v1.LiteVirt/ListRebalanceProposals"
@@ -451,6 +453,11 @@ type LiteVirtClient interface {
 	// is retained for mixed-version clusters — a new client falls back to it
 	// when a peer doesn't implement the stream.
 	StreamStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error)
+	// Sensitive state sync is peer-mTLS only. It carries secret-bearing tables
+	// intentionally excluded from GetStateDump/StreamStateDump and is not an
+	// operator or REST surface.
+	GetSensitiveStateDigest(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (*StateDigestResponse, error)
+	StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error)
 	// ── Internal: WAL Replication ──
 	PushMutations(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error)
 	AckMutations(ctx context.Context, in *AckRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2476,6 +2483,35 @@ func (c *liteVirtClient) StreamStateDump(ctx context.Context, in *emptypb.Empty,
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
+func (c *liteVirtClient) GetSensitiveStateDigest(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (*StateDigestResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StateDigestResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetSensitiveStateDigest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SensitiveStateRequest, StateDumpChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_StreamSensitiveStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
+
 func (c *liteVirtClient) PushMutations(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReplicateResponse)
@@ -2578,7 +2614,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2687,7 +2723,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3020,6 +3056,11 @@ type LiteVirtServer interface {
 	// is retained for mixed-version clusters — a new client falls back to it
 	// when a peer doesn't implement the stream.
 	StreamStateDump(*emptypb.Empty, grpc.ServerStreamingServer[StateDumpChunk]) error
+	// Sensitive state sync is peer-mTLS only. It carries secret-bearing tables
+	// intentionally excluded from GetStateDump/StreamStateDump and is not an
+	// operator or REST surface.
+	GetSensitiveStateDigest(context.Context, *SensitiveStateRequest) (*StateDigestResponse, error)
+	StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error
 	// ── Internal: WAL Replication ──
 	PushMutations(context.Context, *ReplicateRequest) (*ReplicateResponse, error)
 	AckMutations(context.Context, *AckRequest) (*emptypb.Empty, error)
@@ -3617,6 +3658,12 @@ func (UnimplementedLiteVirtServer) GetStateDump(context.Context, *emptypb.Empty)
 }
 func (UnimplementedLiteVirtServer) StreamStateDump(*emptypb.Empty, grpc.ServerStreamingServer[StateDumpChunk]) error {
 	return status.Error(codes.Unimplemented, "method StreamStateDump not implemented")
+}
+func (UnimplementedLiteVirtServer) GetSensitiveStateDigest(context.Context, *SensitiveStateRequest) (*StateDigestResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSensitiveStateDigest not implemented")
+}
+func (UnimplementedLiteVirtServer) StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error {
+	return status.Error(codes.Unimplemented, "method StreamSensitiveStateDump not implemented")
 }
 func (UnimplementedLiteVirtServer) PushMutations(context.Context, *ReplicateRequest) (*ReplicateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PushMutations not implemented")
@@ -6597,6 +6644,35 @@ func _LiteVirt_StreamStateDump_Handler(srv interface{}, stream grpc.ServerStream
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamStateDumpServer = grpc.ServerStreamingServer[StateDumpChunk]
 
+func _LiteVirt_GetSensitiveStateDigest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SensitiveStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetSensitiveStateDigest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetSensitiveStateDigest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetSensitiveStateDigest(ctx, req.(*SensitiveStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_StreamSensitiveStateDump_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SensitiveStateRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).StreamSensitiveStateDump(m, &grpc.GenericServerStream[SensitiveStateRequest, StateDumpChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_StreamSensitiveStateDumpServer = grpc.ServerStreamingServer[StateDumpChunk]
+
 func _LiteVirt_PushMutations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReplicateRequest)
 	if err := dec(in); err != nil {
@@ -7703,6 +7779,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_GetStateDump_Handler,
 		},
 		{
+			MethodName: "GetSensitiveStateDigest",
+			Handler:    _LiteVirt_GetSensitiveStateDigest_Handler,
+		},
+		{
 			MethodName: "PushMutations",
 			Handler:    _LiteVirt_PushMutations_Handler,
 		},
@@ -7967,6 +8047,11 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamStateDump",
 			Handler:       _LiteVirt_StreamStateDump_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamSensitiveStateDump",
+			Handler:       _LiteVirt_StreamSensitiveStateDump_Handler,
 			ServerStreams: true,
 		},
 		{

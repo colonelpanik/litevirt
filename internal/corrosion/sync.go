@@ -204,13 +204,20 @@ func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
 			continue
 		}
 
-		updatedAtIdx := indexOf(table.Columns, "updated_at")
 		pkCols := tablePrimaryKeys[table.Name]
 		pkIdx := columnIndexes(table.Columns, pkCols)
+		// A dump for a table with a known PK that omits a PK column can't be
+		// LWW-merged (we couldn't identify the row); refuse it rather than blindly
+		// inserting PK-less rows. Normal dumps always carry every column.
+		if len(pkCols) > 0 && len(pkIdx) != len(pkCols) {
+			slog.Warn("sync: skipping dump table missing primary-key column(s)", "table", table.Name)
+			continue
+		}
+		updatedAtIdx := indexOf(table.Columns, "updated_at")
 
 		// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
 		var existing map[string]string
-		if updatedAtIdx >= 0 && len(pkCols) > 0 && len(pkIdx) == len(pkCols) {
+		if updatedAtIdx >= 0 && len(pkCols) > 0 {
 			existing = c.prefetchUpdatedAt(tx, table.Name, pkCols, table.Rows, pkIdx)
 		}
 
@@ -241,6 +248,11 @@ func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
 	}
 	slog.Info("sync: merged remote state (LWW)", "tables", len(payload.Tables), "merged", merged, "skipped", skipped)
 }
+
+// mergePrefetchMaxParams caps bind variables per prefetch query, kept under
+// SQLite's limit; per-tuple cost is len(pkCols). A var so tests can shrink it to
+// force multi-chunk prefetches.
+var mergePrefetchMaxParams = 900
 
 // prefetchUpdatedAt batch-loads the existing updated_at for the dump's rows,
 // keyed by canonical PK, using row-value IN queries chunked under SQLite's
@@ -277,8 +289,7 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 		return out
 	}
 
-	const maxParams = 900
-	chunkSize := maxParams / len(pkCols)
+	chunkSize := mergePrefetchMaxParams / len(pkCols)
 	if chunkSize < 1 {
 		chunkSize = 1
 	}

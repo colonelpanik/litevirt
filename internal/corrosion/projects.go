@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 )
 
 // DefaultProject is the implicit bucket every VM lands in when no
@@ -50,7 +49,7 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 			return fmt.Errorf("parent project %q does not exist", p.ParentName)
 		}
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
@@ -141,7 +140,7 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	if len(ctRows) > 0 {
 		return fmt.Errorf("project %q still owns containers; reassign or delete them first", name)
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
 		now, now, name)
@@ -154,7 +153,7 @@ func UpsertProjectQuota(ctx context.Context, c *Client, q ProjectQuotaRecord) er
 	if q.ProjectName == "" {
 		return fmt.Errorf("project_name required")
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO project_quotas
 		   (project_name, vcpu_limit, mem_mib_limit, disk_gib_limit,
@@ -315,7 +314,7 @@ func SumProjectUsage(ctx context.Context, c *Client, name string) (*ProjectUsage
 // Replicated via the mutation log like other writes, so the footprint is
 // visible cluster-wide for project-quota admission on any host.
 func UpsertVMBackup(ctx context.Context, c *Client, vmName, diskName, repo string, totalBytes int64) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO vm_backups (vm_name, disk_name, repo, total_bytes, updated_at)
 		 VALUES (?, ?, ?, ?, ?)
@@ -329,7 +328,7 @@ func UpsertVMBackup(ctx context.Context, c *Client, vmName, diskName, repo strin
 // into the container_backups index — the container analogue of UpsertVMBackup,
 // so the tenancy backup_gib quota sums container footprints alongside VMs.
 func UpsertContainerBackup(ctx context.Context, c *Client, ctName, repo string, totalBytes int64) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO container_backups (ct_name, repo, total_bytes, updated_at)
 		 VALUES (?, ?, ?, ?)

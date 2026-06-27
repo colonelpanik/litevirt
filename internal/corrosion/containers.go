@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 )
 
 // Reserved labels litevirt uses to manage compose-deployed containers. They
@@ -64,7 +63,7 @@ type ContainerRecord struct {
 // Atomic: the (host_name, name) primary key plus a soft-delete-aware
 // UPDATE keeps us from racing with concurrent List queries.
 func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	if r.CreatedAt == "" {
 		r.CreatedAt = now
 	}
@@ -105,7 +104,7 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 // SetContainerTemplate flips a container's is_template flag (ConvertContainer-
 // ToTemplate + its revert), mirroring SetVMTemplate.
 func SetContainerTemplate(ctx context.Context, c *Client, hostName, name string, isTemplate bool) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE containers SET is_template = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
@@ -115,7 +114,7 @@ func SetContainerTemplate(ctx context.Context, c *Client, hostName, name string,
 // SetContainerState updates only the state + updated_at — used after
 // Start/Stop calls so we don't have to round-trip the full record.
 func SetContainerState(ctx context.Context, c *Client, hostName, name, state string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE containers SET state = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
@@ -128,7 +127,7 @@ func SetContainerState(ctx context.Context, c *Client, hostName, name, state str
 // the runtime's reality with a stop-cause hint. The detail is the channel the
 // restart engine reads to decide whether a stop was intentional.
 func SetContainerStateDetail(ctx context.Context, c *Client, hostName, name, state, detail string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
@@ -170,7 +169,7 @@ func RelocateContainer(ctx context.Context, c *Client, oldHost, name, newHost st
 // "container vanished from gossip" can be distinguished from "host
 // crashed and we just haven't heard yet" in audit views.
 func DeleteContainer(ctx context.Context, c *Client, hostName, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE containers SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ?`,

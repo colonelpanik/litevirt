@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
-	"time"
 )
 
 // encodeSGs turns a list of security-group names into JSON (or empty
@@ -94,7 +93,7 @@ func projectOrDefault(p string) string {
 
 // InsertVM creates a new VM record with its interfaces and disks.
 func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 
 	stmts := []Statement{
 		// Purge any soft-deleted record with the same name so the INSERT succeeds.
@@ -296,7 +295,7 @@ func ListVMInterfacesByHost(ctx context.Context, c *Client, hostName string) ([]
 // keyed by (vm_name, network_name). Used by the BindSecurityGroups
 // RPC for runtime mutations without redeploying the VM.
 func SetInterfaceSecurityGroups(ctx context.Context, c *Client, vmName, networkName string, sgs []string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	sgsJSON, err := encodeSGs(sgs)
 	if err != nil {
 		return err
@@ -339,7 +338,7 @@ func GetVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, er
 // SetVMTemplate flips a VM's is_template flag (used by ConvertToTemplate and
 // its revert).
 func SetVMTemplate(ctx context.Context, c *Client, name string, isTemplate bool) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vms SET is_template = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
 		boolToInt(isTemplate), now, name)
@@ -541,7 +540,7 @@ func CountVMsByNetwork(ctx context.Context, c *Client) (map[string]int, error) {
 
 // UpdateVMState changes a VM's state.
 func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
 		state, detail, now, name,
@@ -550,7 +549,7 @@ func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) e
 
 // UpdateVMHost moves a VM's host assignment and state after migration.
 func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
 		hostName, state, now, name,
@@ -559,7 +558,7 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 
 // DeleteVM tombstones a VM and its interfaces/disks.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.ExecuteBatch(ctx, []Statement{
 		{SQL: `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{now, now, name}},
 		{SQL: `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{now, now, name}},
@@ -571,7 +570,7 @@ func DeleteVM(ctx context.Context, c *Client, name string) error {
 // the stored spec JSON — otherwise spec.name keeps the old name and later XML +
 // firmware-path derivation (which use spec.Name) target the wrong VM (G1).
 func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	// Patch the spec JSON's "name" via a generic map (keeps this layer pb-free).
 	vmsUpdate := Statement{SQL: `UPDATE vms SET name = ?, updated_at = ? WHERE name = ?`,
 		Params: []interface{}{newName, now, oldName}}
@@ -598,7 +597,7 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 
 // UpdateVMInterfaceIP sets the IP of a VM interface.
 func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_interfaces SET ip = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?`,
 		ip, now, vmName, networkName,
@@ -607,7 +606,7 @@ func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip
 
 // InsertDisk adds a single disk record (used by hot-plug attach).
 func InsertDisk(ctx context.Context, c *Client, d DiskRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO vm_disks
 		 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
@@ -619,7 +618,7 @@ func InsertDisk(ctx context.Context, c *Client, d DiskRecord) error {
 
 // UpdateDiskHostAndPath updates the host and path for a disk after migration.
 func UpdateDiskHostAndPath(ctx context.Context, c *Client, vmName, diskName, hostName, path string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_disks SET host_name = ?, path = ?, updated_at = ?
 		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
@@ -630,7 +629,7 @@ func UpdateDiskHostAndPath(ctx context.Context, c *Client, vmName, diskName, hos
 // MoveVolume operation. The path is updated separately via
 // UpdateDiskHostAndPath since motion can land within the same host.
 func UpdateDiskStorage(ctx context.Context, c *Client, vmName, diskName, storageType, storageVolume string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_disks SET storage_type = ?, storage_volume = ?, updated_at = ?
 		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
@@ -639,7 +638,7 @@ func UpdateDiskStorage(ctx context.Context, c *Client, vmName, diskName, storage
 
 // UpdateDiskSize updates the size_bytes for a disk.
 func UpdateDiskSize(ctx context.Context, c *Client, vmName, diskName string, sizeBytes int64) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_disks SET size_bytes = ?, updated_at = ?
 		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
@@ -650,7 +649,7 @@ func UpdateDiskSize(ctx context.Context, c *Client, vmName, diskName string, siz
 // reconcile the recorded path to the live domain's active disk source after a
 // snapshot operation moves the domain onto an overlay (e.g. <disk>.<snapname>).
 func UpdateVMDiskPath(ctx context.Context, c *Client, vmName, diskName, path string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_disks SET path = ?, updated_at = ?
 		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
@@ -659,7 +658,7 @@ func UpdateVMDiskPath(ctx context.Context, c *Client, vmName, diskName, path str
 
 // SoftDeleteDisk marks a disk as deleted.
 func SoftDeleteDisk(ctx context.Context, c *Client, vmName, diskName string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND disk_name = ?`,
 		now, now, vmName, diskName)
@@ -672,7 +671,7 @@ func ListDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, err
 
 // InsertInterface adds a single interface record (used by hot-plug attach).
 func InsertInterface(ctx context.Context, c *Client, i InterfaceRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO vm_interfaces
 		 (vm_name, network_name, ordinal, mac, ip, tap_device, updated_at, deleted_at)
@@ -682,7 +681,7 @@ func InsertInterface(ctx context.Context, c *Client, i InterfaceRecord) error {
 
 // UpdateVMSpec updates the spec JSON and actual CPU/memory for a stopped VM.
 func UpdateVMSpec(ctx context.Context, c *Client, name, specJSON string, cpu, mem int) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vms SET spec = ?, cpu_actual = ?, mem_actual = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
 		specJSON, cpu, mem, now, name,
@@ -691,7 +690,7 @@ func UpdateVMSpec(ctx context.Context, c *Client, name, specJSON string, cpu, me
 
 // SoftDeleteInterfaceByMAC marks an interface as deleted by MAC address.
 func SoftDeleteInterfaceByMAC(ctx context.Context, c *Client, vmName, mac string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND mac = ?`,
 		now, now, vmName, mac)

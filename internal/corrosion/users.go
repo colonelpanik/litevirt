@@ -35,7 +35,7 @@ type TokenRecord struct {
 // InsertUser creates a new user. If the username was previously soft-deleted,
 // it reactivates the row with the new role and password.
 func InsertUser(ctx context.Context, c *Client, username, role, passwordHash string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	// Try reactivating a soft-deleted user first.
 	rows, err := c.Query(ctx,
 		`SELECT username FROM users WHERE username = ? AND deleted_at IS NOT NULL`, username)
@@ -91,7 +91,7 @@ func ListUsers(ctx context.Context, c *Client) ([]UserRecord, error) {
 
 // UpdateUserPassword updates the password hash for a user.
 func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
 		passwordHash, now, username,
@@ -100,7 +100,7 @@ func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash s
 
 // DeleteUser tombstones a user.
 func DeleteUser(ctx context.Context, c *Client, username string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
 		now, now, username,
@@ -110,7 +110,7 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 // InsertToken stores a new API token. scope_paths, when non-empty, is
 // JSON-encoded and stored verbatim.
 func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	var scope string
 	if len(t.ScopePaths) > 0 {
 		b, err := json.Marshal(t.ScopePaths)
@@ -130,7 +130,7 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 // (last_used_at bumps in ValidateToken deliberately do NOT touch updated_at, so a
 // high-frequency token use can't out-timestamp a revoke.)
 func RevokeToken(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE tokens SET deleted_at = ?, updated_at = ? WHERE id = ?`,
 		now, now, id,
@@ -152,7 +152,7 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 	if !looksLikeAPIToken(rawToken) {
 		return nil, nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	rows, err := c.Query(ctx,
 		`SELECT t.id, t.username, t.token_hash, t.scope_paths, u.role
 		 FROM tokens t

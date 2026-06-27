@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 )
 
 // StoragePoolRecord represents a storage pool on a host.
@@ -24,7 +23,7 @@ type StoragePoolRecord struct {
 // serialised as JSON; nil/empty maps round-trip as a JSON "{}" (sqlite
 // treats NULL and "{}" the same after scanStoragePool decodes them).
 func UpsertStoragePool(ctx context.Context, c *Client, p StoragePoolRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	optsJSON := "{}"
 	if len(p.Options) > 0 {
 		b, err := json.Marshal(p.Options)
@@ -116,7 +115,7 @@ func HostsWithPool(ctx context.Context, c *Client, poolName, excludeHost string)
 // caller may want to keep the underlying mount around for a manual
 // recovery. Schedule a real driver cleanup in the gRPC handler instead.
 func MarkStoragePoolDeleted(ctx context.Context, c *Client, hostName, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE storage_pools SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,

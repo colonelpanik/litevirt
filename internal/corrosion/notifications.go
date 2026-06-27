@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"time"
 )
 
 // NotificationTarget is a configured delivery destination (#5).
@@ -25,7 +24,7 @@ type NotificationRoute struct {
 }
 
 func InsertNotificationTarget(ctx context.Context, c *Client, t NotificationTarget) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	en := 0
 	if t.Enabled {
 		en = 1
@@ -54,13 +53,13 @@ func ListNotificationTargets(ctx context.Context, c *Client) ([]NotificationTarg
 }
 
 func DeleteNotificationTarget(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE notification_targets SET deleted_at = ?, updated_at = ? WHERE id = ?`, now, now, id)
 }
 
 func InsertNotificationRoute(ctx context.Context, c *Client, r NotificationRoute) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	en := 0
 	if r.Enabled {
 		en = 1
@@ -92,7 +91,7 @@ func ListNotificationRoutes(ctx context.Context, c *Client) ([]NotificationRoute
 }
 
 func DeleteNotificationRoute(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE notification_routes SET deleted_at = ?, updated_at = ? WHERE id = ?`, now, now, id)
 }

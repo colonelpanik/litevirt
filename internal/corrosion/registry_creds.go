@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"time"
 )
 
 // RegistryCredential is one stored OCI/Docker registry login (schema v23).
@@ -30,7 +29,7 @@ const (
 // a fresh id, both in one batch so the partial unique index never collides.
 // The caller supplies a pre-generated ID.
 func UpsertRegistryCredential(ctx context.Context, c *Client, rc RegistryCredential) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.ExecuteBatch(ctx, []Statement{
 		{
 			SQL: `UPDATE registry_credentials SET deleted_at = ?, updated_at = ?
@@ -102,7 +101,7 @@ func DeleteRegistryCredential(ctx context.Context, c *Client, scope, owner, regi
 	if len(existing) == 0 {
 		return false, nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	if err := c.Execute(ctx,
 		`UPDATE registry_credentials SET deleted_at = ?, updated_at = ?
 		 WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL`,

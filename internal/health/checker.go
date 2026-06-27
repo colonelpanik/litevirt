@@ -202,7 +202,7 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		return
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.db.NowTS()
 	if healthy {
 		c.db.ExecuteDeferred(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)

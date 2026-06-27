@@ -204,7 +204,7 @@ func (s *Server) handleForward(w dns.ResponseWriter, r *dns.Msg) {
 // UpsertRecord writes a name→IP mapping into dns_records.
 // Called by the VM lifecycle when an interface gets an IP assigned.
 func UpsertRecord(ctx context.Context, db *corrosion.Client, name, ip string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := db.NowTS()
 	return db.Execute(ctx,
 		`INSERT INTO dns_records (name, type, value, source, updated_at)
 		 VALUES (?, 'A', ?, 'auto', ?)
@@ -215,7 +215,7 @@ func UpsertRecord(ctx context.Context, db *corrosion.Client, name, ip string) er
 
 // DeleteRecord tombstones a dns_record entry.
 func DeleteRecord(ctx context.Context, db *corrosion.Client, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := db.NowTS()
 	return db.Execute(ctx,
 		`UPDATE dns_records SET deleted_at = ? WHERE name = ?`, now, name,
 	)

@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"time"
 )
 
 // BackupRepo is a logical backup-repo name → on-disk path mapping, registered
@@ -17,7 +16,7 @@ type BackupRepo struct {
 
 // UpsertBackupRepo registers (or updates) a named repo path.
 func UpsertBackupRepo(ctx context.Context, c *Client, r BackupRepo) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO backup_repos (name, path, stack_name, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, NULL)
@@ -59,7 +58,7 @@ func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string) error 
 	if stack == "" {
 		return nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE backup_repos SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL`,
 		now, now, stack)

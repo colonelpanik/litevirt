@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"time"
 )
 
 // StackRecord represents a deployed compose stack.
@@ -17,7 +16,7 @@ type StackRecord struct {
 
 // UpsertStack creates or updates a stack record.
 func UpsertStack(ctx context.Context, c *Client, s StackRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO stacks (name, compose_hash, compose_yaml, state, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
@@ -77,7 +76,7 @@ func ListStacks(ctx context.Context, c *Client) ([]StackRecord, error) {
 
 // SetStackState updates the state column of a stack (e.g. "active" → "deleting").
 func SetStackState(ctx context.Context, c *Client, name, state string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE stacks SET state = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
 		state, now, name,
@@ -108,7 +107,7 @@ func ListDeletingStacks(ctx context.Context, c *Client) ([]StackRecord, error) {
 
 // DeleteStackRecord tombstones a stack.
 func DeleteStackRecord(ctx context.Context, c *Client, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE stacks SET deleted_at = ?, updated_at = ?, state = 'deleted' WHERE name = ?`,
 		now, now, name,

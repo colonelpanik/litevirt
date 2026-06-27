@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -27,7 +26,7 @@ type SnapshotRecord struct {
 
 // InsertSnapshot records a new snapshot.
 func InsertSnapshot(ctx context.Context, c *Client, s SnapshotRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	if s.ID == "" {
 		s.ID = uuid.New().String()
 	}
@@ -97,7 +96,7 @@ func scanSnapshot(r Row) SnapshotRecord {
 
 // DeleteSnapshot tombstones a snapshot record.
 func DeleteSnapshot(ctx context.Context, c *Client, vmName, snapshotName string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE snapshots SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND name = ?`,
 		now, now, vmName, snapshotName,

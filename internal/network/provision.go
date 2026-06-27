@@ -333,7 +333,7 @@ func isNoSuchDevice(out []byte) bool {
 
 // UpsertVTEP writes this host's VTEP into network_vteps.
 func UpsertVTEP(ctx context.Context, db *corrosion.Client, networkName, hostName, vtepIP string, vni int) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := db.NowTS()
 	return db.Execute(ctx,
 		`INSERT INTO network_vteps (network_name, host_name, vtep_ip, vni, updated_at)
 		 VALUES (?, ?, ?, ?, ?)

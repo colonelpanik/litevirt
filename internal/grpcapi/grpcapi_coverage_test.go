@@ -758,6 +758,7 @@ func createLBTable(t *testing.T, ctx context.Context, db *corrosion.Client) {
 		vm_name    TEXT,
 		enabled    INTEGER NOT NULL DEFAULT 1,
 		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
 		PRIMARY KEY (lb_name, name)
 	)`)
 }
@@ -1012,16 +1013,58 @@ func TestDeleteLoadBalancer(t *testing.T) {
 		t.Fatalf("DeleteLoadBalancer: %v", err)
 	}
 
-	// Verify config removed.
-	rows, _ := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE name = 'del-lb'`)
-	if len(rows) != 0 {
-		t.Errorf("expected lb_configs to be empty, got %d rows", len(rows))
+	// Verify config soft-deleted: a tombstone row persists (so the delete survives
+	// anti-entropy) but deleted_at is set (gone from active listings).
+	rows, _ := s.db.Query(ctx, `SELECT deleted_at FROM lb_configs WHERE name = 'del-lb'`)
+	if len(rows) != 1 || rows[0].String("deleted_at") == "" {
+		t.Errorf("expected del-lb tombstoned (deleted_at set), got %+v", rows)
 	}
 
 	// Verify backends removed.
 	backends, _ := corrosion.ListLBBackends(ctx, s.db, "del-lb")
 	if len(backends) != 0 {
 		t.Errorf("expected backends to be empty, got %d", len(backends))
+	}
+}
+
+// TestLB_DeleteHidesAndAllowsReuse covers the reader-audit contract: after a soft
+// delete the LB is gone from List/Inspect/Update, and its name + VIP are reusable.
+func TestLB_DeleteHidesAndAllowsReuse(t *testing.T) {
+	s := testServerCov(t)
+	ctx := adminCtx()
+	createLBTable(t, ctx, s.db)
+
+	corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "reuse-lb", VIP: "10.0.0.7", Algorithm: "roundrobin", Enabled: true,
+	})
+	if _, err := s.DeleteLoadBalancer(ctx, &pb.DeleteLBRequest{Name: "reuse-lb"}); err != nil {
+		t.Fatalf("DeleteLoadBalancer: %v", err)
+	}
+
+	// Gone from List.
+	if resp, err := s.ListLoadBalancers(ctx, &emptypb.Empty{}); err != nil {
+		t.Fatalf("ListLoadBalancers: %v", err)
+	} else {
+		for _, lb := range resp.Lbs {
+			if lb.Name == "reuse-lb" {
+				t.Error("deleted LB still listed")
+			}
+		}
+	}
+	// Inspect → NotFound.
+	if _, err := s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: "reuse-lb"}); status.Code(err) != codes.NotFound {
+		t.Errorf("Inspect on deleted LB: code = %v, want NotFound", status.Code(err))
+	}
+	// Update → NotFound.
+	if _, err := s.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "reuse-lb"}); status.Code(err) != codes.NotFound {
+		t.Errorf("Update on deleted LB: code = %v, want NotFound", status.Code(err))
+	}
+	// Name + VIP reusable: re-create clears the tombstone.
+	corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "reuse-lb", VIP: "10.0.0.7", Algorithm: "roundrobin", Enabled: true,
+	})
+	if _, err := s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: "reuse-lb"}); err != nil {
+		t.Errorf("re-created LB should be inspectable, got %v", err)
 	}
 }
 

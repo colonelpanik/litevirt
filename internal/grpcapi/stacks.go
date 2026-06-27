@@ -725,7 +725,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// Soft-delete the LB config so that VM deletion's refreshLBForStack
 	// goroutines see the record as gone and don't re-apply the LB mid-teardown.
 	lbName := req.Name + "-lb"
-	corrosion.DeleteLBBackends(ctx, s.db, lbName)
+	corrosion.SoftDeleteLBBackends(ctx, s.db, lbName)
 	_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
 
 	hadFailures := false
@@ -809,7 +809,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		s.publish("stack.deleting", req.Name, fmt.Sprintf("%d VMs remaining", len(remaining)))
 	} else {
 		// Hard-delete the soft-deleted LB config now that processes are stopped.
-		_ = corrosion.DeleteLBConfig(ctx, s.db, lbName)
+		_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
 
 		// Tombstone the stack's distributed-firewall config (SGs, ipsets,
 		// cluster rules, default-deny). The reconciler then drops the rules.

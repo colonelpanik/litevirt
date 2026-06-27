@@ -760,13 +760,14 @@ func TestRemoveLBForStack_WithLBRecord(t *testing.T) {
 	}
 	s.removeLBForStack(ctx, "myapp", vms)
 
-	// Verify the LB record was deleted.
-	rows, err := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE name = 'myapp-lb'`)
+	// Verify the LB record was soft-deleted: the tombstone row persists (so the
+	// delete survives anti-entropy) with deleted_at set (gone from active listings).
+	rows, err := s.db.Query(ctx, `SELECT deleted_at FROM lb_configs WHERE name = 'myapp-lb'`)
 	if err != nil {
 		t.Fatalf("query lb_configs: %v", err)
 	}
-	if len(rows) != 0 {
-		t.Errorf("expected LB record to be deleted, but found %d rows", len(rows))
+	if len(rows) != 1 || rows[0].String("deleted_at") == "" {
+		t.Errorf("expected myapp-lb tombstoned (deleted_at set), got %+v", rows)
 	}
 }
 

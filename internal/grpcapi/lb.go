@@ -27,7 +27,7 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(ctx, `SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs`)
+	rows, err := s.db.Query(ctx, `SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query lb_configs: %v", err)
 	}
@@ -249,7 +249,7 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 		return nil, err
 	}
 	rows, err := s.db.Query(ctx,
-		`SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs WHERE name = ?`, req.Name)
+		`SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.Name)
 	if err != nil || len(rows) == 0 {
 		return nil, status.Errorf(codes.NotFound, "load balancer %q not found", req.Name)
 	}
@@ -520,7 +520,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 
 	// Check name not already in use. A DB error must NOT be read as "free" —
 	// that would bypass the uniqueness guard (F9).
-	existing, err := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE name = ?`, req.Name)
+	existing, err := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "check name uniqueness: %v", err)
 	}
@@ -529,7 +529,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	}
 
 	// Check VIP not already in use.
-	existingVIP, err := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE vip = ? AND enabled = 1`, req.Vip)
+	existingVIP, err := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE vip = ? AND enabled = 1 AND deleted_at IS NULL`, req.Vip)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "check VIP uniqueness: %v", err)
 	}
@@ -545,6 +545,14 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	// Build backends.
 	var lbBackends []lb.Backend
 	backendPort := int(req.Ports[0].Target)
+
+	// Recreate (same name) clears any locally-known stale backend tombstones for
+	// this LB before inserting the requested set, so an old backend can't linger.
+	// (Does not cover backend rows a peer has but this node never saw — that needs
+	// a generation/epoch design; tracked as a follow-up.)
+	if err := corrosion.SoftDeleteLBBackends(ctx, s.db, req.Name); err != nil {
+		slog.Warn("CreateLoadBalancer: clear prior backends", "error", err)
+	}
 
 	// Explicit backends.
 	for _, b := range req.Backends {
@@ -635,8 +643,8 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 				// `lv lb ls` doesn't show a phantom "active" LB that isn't
 				// actually serving, and surface the failure to the caller instead
 				// of silently logging it.
-				corrosion.DeleteLBBackends(ctx, s.db, req.Name)
-				corrosion.DeleteLBConfig(ctx, s.db, req.Name)
+				corrosion.SoftDeleteLBBackends(ctx, s.db, req.Name)
+				corrosion.SoftDeleteLBConfig(ctx, s.db, req.Name)
 				s.audit(ctx, "lb.create", req.Name, req.Vip, "error: "+err.Error())
 				return nil, status.Errorf(codes.Internal,
 					"load balancer %q provisioning failed on %s: %v", req.Name, s.hostName, err)
@@ -718,7 +726,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 
 	// Look up existing config.
 	rows, err := s.db.Query(ctx,
-		`SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs WHERE name = ?`, req.Name)
+		`SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.Name)
 	if err != nil || len(rows) == 0 {
 		return nil, status.Errorf(codes.NotFound, "load balancer %q not found", req.Name)
 	}
@@ -728,7 +736,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	vip := r.String("vip")
 	if req.Vip != "" {
 		// Check VIP uniqueness. A DB error must not bypass the guard (F9).
-		existingVIP, err := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE vip = ? AND name != ? AND enabled = 1`, req.Vip, req.Name)
+		existingVIP, err := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE vip = ? AND name != ? AND enabled = 1 AND deleted_at IS NULL`, req.Vip, req.Name)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "check VIP uniqueness: %v", err)
 		}
@@ -786,10 +794,10 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 
 	// Handle backend changes.
 	for _, name := range req.RemoveBackends {
-		corrosion.DeleteLBBackend(ctx, s.db, req.Name, name)
+		corrosion.TombstoneLBBackend(ctx, s.db, req.Name, name)
 	}
 	for _, vmName := range req.RemoveVmBackends {
-		corrosion.DeleteLBBackend(ctx, s.db, req.Name, vmName)
+		corrosion.TombstoneLBBackend(ctx, s.db, req.Name, vmName)
 	}
 	for _, b := range req.AddBackends {
 		name := b.Name
@@ -928,12 +936,19 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
 
-	// Look up LB to find hosts.
-	rows, err := s.db.Query(ctx, `SELECT hosts FROM lb_configs WHERE name = ?`, req.Name)
+	// Look up LB to find hosts. Read deleted_at too (unfiltered) so we can tell a
+	// truly-absent LB from an already-tombstoned one: the latter is still NotFound
+	// to the user, but we refresh its tombstone first so it wins LWW against a
+	// stale-clock peer that may have resurrected it.
+	rows, err := s.db.Query(ctx, `SELECT hosts, deleted_at FROM lb_configs WHERE name = ?`, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "lookup load balancer %q: %v", req.Name, err)
 	}
 	if len(rows) == 0 {
+		return nil, status.Errorf(codes.NotFound, "load balancer %q not found", req.Name)
+	}
+	if rows[0].String("deleted_at") != "" {
+		_ = corrosion.SoftDeleteLBConfig(ctx, s.db, req.Name) // refresh the tombstone
 		return nil, status.Errorf(codes.NotFound, "load balancer %q not found", req.Name)
 	}
 
@@ -970,8 +985,8 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 	}
 
 	// Delete from DB.
-	corrosion.DeleteLBBackends(ctx, s.db, req.Name)
-	corrosion.DeleteLBConfig(ctx, s.db, req.Name)
+	corrosion.SoftDeleteLBBackends(ctx, s.db, req.Name)
+	corrosion.SoftDeleteLBConfig(ctx, s.db, req.Name)
 
 	s.publish("lb.deleted", req.Name, "")
 	s.audit(ctx, "lb.delete", req.Name, "", "ok")
@@ -1700,8 +1715,8 @@ func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []c
 
 	// Remove LB records from corrosion (replicated to all hosts via gossip).
 	// Only delete after remote hosts have had a chance to clean up.
-	corrosion.DeleteLBBackends(ctx, s.db, lbName)
-	if err := corrosion.DeleteLBConfig(ctx, s.db, lbName); err != nil {
+	corrosion.SoftDeleteLBBackends(ctx, s.db, lbName)
+	if err := corrosion.SoftDeleteLBConfig(ctx, s.db, lbName); err != nil {
 		slog.Warn("removeLBForStack: delete LB record failed", "lb", lbName, "error", err)
 	}
 
@@ -1738,7 +1753,7 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 	// A DB error here must fail the operation (F9): swallowing it would treat a
 	// failed lookup as "no conflict" and let a duplicate VIP through.
 	existing, err := s.db.Query(ctx,
-		`SELECT name FROM lb_configs WHERE vip = ? AND name != ? AND enabled = 1`,
+		`SELECT name FROM lb_configs WHERE vip = ? AND name != ? AND enabled = 1 AND deleted_at IS NULL`,
 		vip, lbName)
 	if err != nil {
 		return fmt.Errorf("check VIP %s uniqueness: %w", vip, err)

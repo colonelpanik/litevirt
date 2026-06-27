@@ -116,8 +116,8 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	}
 
 	// Hard-delete the LB config now that everything is cleaned up.
-	_ = corrosion.DeleteLBConfig(ctx, r.db, lbName)
-	corrosion.DeleteLBBackends(ctx, r.db, lbName)
+	_ = corrosion.SoftDeleteLBConfig(ctx, r.db, lbName)
+	corrosion.SoftDeleteLBBackends(ctx, r.db, lbName)
 
 	if err := corrosion.DeleteStackRecord(ctx, r.db, stack.Name); err != nil {
 		slog.Error("stack-reconciler: tombstone stack failed", "stack", stack.Name, "error", err)

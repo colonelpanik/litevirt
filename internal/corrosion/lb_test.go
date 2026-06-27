@@ -29,6 +29,7 @@ func setupLBSchema(t *testing.T, c *Client) {
 		vm_name    TEXT,
 		enabled    INTEGER NOT NULL DEFAULT 1,
 		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
 		PRIMARY KEY (lb_name, name)
 	)`)
 }
@@ -101,7 +102,7 @@ func TestLBStore_SQLMetacharactersRoundTrip(t *testing.T) {
 	}
 
 	// Delete by evil name leaves the decoy untouched.
-	if err := DeleteLBConfig(ctx, c, evil); err != nil {
+	if err := SoftDeleteLBConfig(ctx, c, evil); err != nil {
 		t.Fatalf("DeleteLBConfig: %v", err)
 	}
 	after, _ := ListLBConfigs(ctx, c)
@@ -230,22 +231,34 @@ func TestDeleteLBConfig(t *testing.T) {
 		t.Fatalf("UpsertLBConfig: %v", err)
 	}
 
-	if err := DeleteLBConfig(ctx, c, "web-lb"); err != nil {
-		t.Fatalf("DeleteLBConfig: %v", err)
+	if err := SoftDeleteLBConfig(ctx, c, "web-lb"); err != nil {
+		t.Fatalf("SoftDeleteLBConfig: %v", err)
 	}
 
-	rows, _ := c.Query(ctx, `SELECT name FROM lb_configs WHERE name = ?`, "web-lb")
-	if rows != nil {
-		t.Errorf("expected no rows after delete, got %d", len(rows))
+	// Soft-delete keeps a tombstone row (so the delete survives anti-entropy) but
+	// the LB is gone from the active listing.
+	if cfgs, _ := ListLBConfigs(ctx, c); len(cfgs) != 0 {
+		t.Errorf("expected web-lb absent from ListLBConfigs after delete, got %+v", cfgs)
+	}
+	rows, _ := c.Query(ctx, `SELECT deleted_at FROM lb_configs WHERE name = ?`, "web-lb")
+	if len(rows) != 1 || rows[0].String("deleted_at") == "" {
+		t.Errorf("expected a tombstone row with deleted_at set, got %+v", rows)
 	}
 }
 
-func TestDeleteLBConfig_NonExistent(t *testing.T) {
+// SoftDeleteLBConfig on a nonexistent LB is a no-op (UPDATE 0 rows) — it must NOT
+// manufacture a tombstone for an LB that never existed (the cleanup-path case).
+func TestSoftDeleteLBConfig_NonExistentNoTombstone(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
+	setupLBSchema(t, c)
 
-	if err := DeleteLBConfig(ctx, c, "nonexistent"); err != nil {
-		t.Fatalf("DeleteLBConfig for nonexistent: %v", err)
+	if err := SoftDeleteLBConfig(ctx, c, "nonexistent"); err != nil {
+		t.Fatalf("SoftDeleteLBConfig for nonexistent: %v", err)
+	}
+	rows, _ := c.Query(ctx, `SELECT name FROM lb_configs WHERE name = ?`, "nonexistent")
+	if len(rows) != 0 {
+		t.Errorf("soft-delete of a nonexistent LB manufactured a tombstone: %+v", rows)
 	}
 }
 
@@ -365,7 +378,7 @@ func TestDeleteLBBackend(t *testing.T) {
 	_ = UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b1", Address: "10.0.0.1", Enabled: true})
 	_ = UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b2", Address: "10.0.0.2", Enabled: true})
 
-	if err := DeleteLBBackend(ctx, c, "lb1", "b1"); err != nil {
+	if err := TombstoneLBBackend(ctx, c, "lb1", "b1"); err != nil {
 		t.Fatalf("DeleteLBBackend: %v", err)
 	}
 
@@ -387,7 +400,7 @@ func TestDeleteLBBackends(t *testing.T) {
 	_ = UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b2", Address: "10.0.0.2", Enabled: true})
 	_ = UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb2", Name: "b3", Address: "10.0.0.3", Enabled: true})
 
-	if err := DeleteLBBackends(ctx, c, "lb1"); err != nil {
+	if err := SoftDeleteLBBackends(ctx, c, "lb1"); err != nil {
 		t.Fatalf("DeleteLBBackends: %v", err)
 	}
 

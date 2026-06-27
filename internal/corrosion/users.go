@@ -99,10 +99,11 @@ func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash s
 }
 
 // DeleteUser tombstones a user and CASCADES the tombstone to its 2FA factors,
-// recovery codes, and active-set pointer — all in one batch sharing a single
-// updated_at, so the whole set converges coherently under LWW. Without the
-// cascade, those rows are now durable + self-repairing (sensitive lane) and a
-// stale auth factor could linger or resurrect across a delete→recreate.
+// recovery codes, and both active-set pointers — all in one batch sharing a
+// single updated_at, so the whole set converges coherently under LWW. Tombstoning
+// the pointers is what makes the delete resurrection-proof: a factor or code a
+// partitioned peer still holds (one this node never saw, hence couldn't tombstone
+// individually) lands on a now-inactive epoch/set and can never validate.
 func DeleteUser(ctx context.Context, c *Client, username string) error {
 	now := c.NowTS()
 	marker := nowRFC3339()
@@ -110,6 +111,8 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 		{SQL: `UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
 			Params: []interface{}{marker, now, username}},
 		{SQL: `UPDATE user_2fa SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
+			Params: []interface{}{marker, now, username}},
+		{SQL: `UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
 			Params: []interface{}{marker, now, username}},
 		{SQL: `UPDATE recovery_codes SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
 			Params: []interface{}{marker, now, username}},

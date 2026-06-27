@@ -69,6 +69,76 @@ func TestUser2FA_SoftDeleteSurvivesStaleMerge(t *testing.T) {
 	}
 }
 
+// TestUser2FA_UnseenPeerFactorDoesNotResurrect is the finding-1 regression: a
+// soft-delete tombstone can't cover a factor a partitioned peer holds that this
+// node never saw. The active-factor epoch closes it — DeleteUser tombstones the
+// pointer, so a resurrected old-epoch factor never validates, and a re-enroll
+// after recreate mints a fresh epoch. RED with only the deleted_at filter.
+func TestUser2FA_UnseenPeerFactorDoesNotResurrect(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "totp", Secret: "s0", Label: ""}); err != nil {
+		t.Fatal(err)
+	}
+	epoch0, _, err := activeUser2FAEpoch(ctx, c, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteUser(ctx, c, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A partitioned peer resurrects a factor this node NEVER SAW (a different
+	// label, so a different PK we couldn't have tombstoned), LIVE, under the OLD
+	// epoch, with a future updated_at so LWW keeps it live.
+	c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{{
+		Name:    "user_2fa",
+		Columns: []string{"username", "method", "secret", "label", "enrolled_at", "last_used_at", "updated_at", "last_step", "deleted_at", "epoch"},
+		Rows:    [][]interface{}{{"alice", "totp", "ghost-secret", "ghost", "2099-01-01T00:00:00Z", nil, "2099-01-01T00:00:00Z", 0, nil, epoch0}},
+	}}}))
+
+	// No live pointer after delete → nothing validates, including the ghost.
+	if fs, _ := ListUser2FA(ctx, c, "alice"); len(fs) != 0 {
+		t.Errorf("2FA visible after DeleteUser despite tombstoned pointer: %+v", fs)
+	}
+
+	// Recreate + re-enroll mints a fresh epoch; the old-epoch ghost stays hidden.
+	if err := InsertUser(ctx, c, "alice", "operator", "ph"); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "totp", Secret: "s1", Label: ""}); err != nil {
+		t.Fatal(err)
+	}
+	fs, _ := ListUser2FA(ctx, c, "alice")
+	for _, f := range fs {
+		if f.Secret == "ghost-secret" || f.Label == "ghost" {
+			t.Errorf("resurrected old-epoch factor came back after delete->recreate: %+v", f)
+		}
+	}
+	if len(fs) != 1 || fs[0].Secret != "s1" {
+		t.Errorf("expected only the re-enrolled factor, got %+v", fs)
+	}
+}
+
+// TestUser2FA_MultipleFactorsShareEpoch: enrolling a second factor reuses the
+// live epoch (doesn't orphan the first) — both render.
+func TestUser2FA_MultipleFactorsShareEpoch(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "totp", Secret: "s", Label: "phone"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "webauthn", Secret: "blob", Label: "key"}); err != nil {
+		t.Fatal(err)
+	}
+	fs, _ := ListUser2FA(ctx, c, "alice")
+	if len(fs) != 2 {
+		t.Errorf("expected both factors to share the active epoch and render, got %d: %+v", len(fs), fs)
+	}
+}
+
 // TestUser2FA_WritePathsNeverNullLabel pins the normalization contract: no write
 // path leaves a NULL label (the composite-PK NULL trap). The column stays
 // physically nullable, so this guards the writers, not the storage.
@@ -159,8 +229,8 @@ func TestRecoveryCodes_UsedBeatsUnusedLWW(t *testing.T) {
 		t.Fatal(err)
 	}
 	setID := activeSetID(t, c, "alice")
-	if err := MarkRecoveryCodeUsed(ctx, c, "alice", "$2a$hashA"); err != nil {
-		t.Fatal(err)
+	if consumed, err := MarkRecoveryCodeUsed(ctx, c, "alice", "$2a$hashA"); err != nil || !consumed {
+		t.Fatalf("MarkRecoveryCodeUsed: consumed=%v err=%v (want consumed)", consumed, err)
 	}
 
 	// Peer pushes the SAME code (current set) UNUSED with an OLDER updated_at.
@@ -173,6 +243,51 @@ func TestRecoveryCodes_UsedBeatsUnusedLWW(t *testing.T) {
 	got, _ := ListUnusedRecoveryCodes(ctx, c, "alice")
 	if slices.Contains(got, "$2a$hashA") {
 		t.Errorf("a used code reverted to unused via a stale peer merge: %v", got)
+	}
+}
+
+// TestRecoveryCodes_ConsumeIsSingleUse: consuming a code reports true exactly
+// once; a second consume of the same code reports false — the caller must not
+// authenticate a double-spend even if both racers listed it unused.
+func TestRecoveryCodes_ConsumeIsSingleUse(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$hashA"}); err != nil {
+		t.Fatal(err)
+	}
+	if consumed, err := MarkRecoveryCodeUsed(ctx, c, "alice", "$2a$hashA"); err != nil || !consumed {
+		t.Fatalf("first consume: consumed=%v err=%v (want true)", consumed, err)
+	}
+	consumed, err := MarkRecoveryCodeUsed(ctx, c, "alice", "$2a$hashA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed {
+		t.Error("a used code was consumed a second time — single-use violated")
+	}
+}
+
+// TestRecoveryCodes_ConsumeFailsAfterReEnroll: a re-enroll landing between
+// list-and-mark invalidates the old set, so consuming an old-set code reports
+// false (zero rows) — the verifier must then NOT authenticate. This is the gap
+// the active-set WHERE + RowsAffected check closes.
+func TestRecoveryCodes_ConsumeFailsAfterReEnroll(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$hashOLD"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$hashNEW"}); err != nil {
+		t.Fatal(err) // re-enroll: old set superseded
+	}
+	consumed, err := MarkRecoveryCodeUsed(ctx, c, "alice", "$2a$hashOLD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed {
+		t.Error("a superseded old-set code was consumable after re-enroll")
 	}
 }
 

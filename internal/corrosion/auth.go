@@ -287,28 +287,74 @@ type User2FARecord struct {
 	LastStep   int64 // highest consumed TOTP time-step (replay guard); 0 = none yet
 }
 
-// InsertUser2FA records an enrolled factor. Re-enrolling a previously
-// soft-deleted (username, method, label) reactivates it: deleted_at is cleared
-// and the TOTP replay ratchet is reset (mirrors UpsertLBConfig/InsertUser).
-// label is a Go string (never NULL), so the composite PK never carries a NULL.
-func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(username, method, label) DO UPDATE
-		   SET secret = excluded.secret, updated_at = excluded.updated_at,
-		       deleted_at = NULL, last_step = 0`,
-		r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now)
+// activeUser2FAEpoch returns the user's current active-factor epoch and whether a
+// live pointer exists. exists=false means no live pointer (never enrolled, or
+// tombstoned by DeleteUser) — the caller then mints a fresh epoch so a factor a
+// peer resurrects under an old epoch can't validate.
+func activeUser2FAEpoch(ctx context.Context, c *Client, username string) (string, bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT active_epoch FROM user_2fa_sets WHERE username = ? AND deleted_at IS NULL`, username)
+	if err != nil {
+		return "", false, err
+	}
+	if len(rows) == 0 {
+		return "", false, nil
+	}
+	return rows[0].String("active_epoch"), true, nil
 }
 
-// ListUser2FA returns the user's enrolled (non-deleted) factors. Empty slice = no 2FA.
+// InsertUser2FA records an enrolled factor under the user's active-factor set.
+// It reuses the live epoch when one exists (so accumulating factors all stay
+// valid) and mints a fresh epoch + pointer otherwise — including after a
+// DeleteUser tombstoned the pointer, so a factor a partitioned peer resurrects
+// (one this node never saw, hence could not tombstone) lands on a stale epoch
+// and never validates. Re-enrolling a previously soft-deleted (username, method,
+// label) also reactivates it: deleted_at cleared, replay ratchet reset. label is
+// a Go string (never NULL), so the composite PK never carries a NULL.
+func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
+	epoch, exists, err := activeUser2FAEpoch(ctx, c, r.Username)
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()
+	stmts := make([]Statement, 0, 2)
+	if !exists {
+		epoch, err = randomSetID()
+		if err != nil {
+			return err
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT INTO user_2fa_sets (username, active_epoch, updated_at)
+				 VALUES (?, ?, ?)
+				 ON CONFLICT(username) DO UPDATE SET
+				   active_epoch = excluded.active_epoch,
+				   updated_at = excluded.updated_at,
+				   deleted_at = NULL`,
+			Params: []interface{}{r.Username, epoch, now},
+		})
+	}
+	stmts = append(stmts, Statement{
+		SQL: `INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at, epoch)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(username, method, label) DO UPDATE
+			   SET secret = excluded.secret, updated_at = excluded.updated_at,
+			       deleted_at = NULL, last_step = 0, epoch = excluded.epoch`,
+		Params: []interface{}{r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now, epoch},
+	})
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+// ListUser2FA returns the user's enrolled (non-deleted) factors in the CURRENT
+// active set. The epoch join means a factor a peer resurrected under a stale
+// epoch (e.g. after delete→recreate) never appears. Empty slice = no 2FA.
 func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FARecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT username, method, secret, COALESCE(label, '') AS label,
 		        enrolled_at, COALESCE(last_used_at, '') AS last_used_at,
 		        COALESCE(last_step, 0) AS last_step
-		 FROM user_2fa WHERE username = ? AND deleted_at IS NULL`, username)
+		 FROM user_2fa WHERE username = ? AND deleted_at IS NULL
+		   AND epoch = (SELECT active_epoch FROM user_2fa_sets
+		                WHERE username = ? AND deleted_at IS NULL)`, username, username)
 	if err != nil {
 		return nil, err
 	}
@@ -444,16 +490,23 @@ func ListUnusedRecoveryCodes(ctx context.Context, c *Client, username string) ([
 	return out, nil
 }
 
-// MarkRecoveryCodeUsed sets used_at on a hash so it can't be reused, and bumps
-// updated_at so "used" beats a peer's stale "unused" under LWW. The defensive
-// WHERE (active-set match, unused, not tombstoned) means a re-enroll landing
-// between list-and-mark can't flip an old-set row.
-func MarkRecoveryCodeUsed(ctx context.Context, c *Client, username, codeHash string) error {
+// MarkRecoveryCodeUsed atomically consumes a single-use recovery code and
+// reports whether it actually did. It returns true ONLY when the guarded UPDATE
+// changed a row: the code must still be unused, not tombstoned, and in the user's
+// CURRENT active set. So a concurrent second use (used_at already set) or a
+// re-enroll landing between list-and-mark (set_id no longer active) consumes
+// nothing and returns false — the caller must NOT authenticate on a false. The
+// updated_at bump lets "used" beat a peer's stale "unused" under LWW.
+func MarkRecoveryCodeUsed(ctx context.Context, c *Client, username, codeHash string) (bool, error) {
 	now := c.NowTS()
-	return c.Execute(ctx,
+	n, err := c.ExecuteRows(ctx,
 		`UPDATE recovery_codes SET used_at = ?, updated_at = ?
 		 WHERE username = ? AND code_hash = ? AND used_at IS NULL AND deleted_at IS NULL
 		   AND set_id = (SELECT active_set_id FROM recovery_code_sets
 		                 WHERE username = ? AND deleted_at IS NULL)`,
 		nowRFC3339(), now, username, codeHash, username)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }

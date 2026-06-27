@@ -186,10 +186,16 @@ func verifyRecoveryCode(ctx context.Context, db *corrosion.Client, username, cod
 	}
 	for _, h := range hashes {
 		if bcrypt.CompareHashAndPassword([]byte(h), []byte(normalized)) == nil {
-			if err := corrosion.MarkRecoveryCodeUsed(ctx, db, username, h); err != nil {
+			// Authenticate ONLY if we actually consumed the code. A zero-row
+			// consume means it was used concurrently, or invalidated by a re-enroll
+			// between list and mark — treat as not authenticated (no double-spend,
+			// no accepting a superseded code). No other stored hash matches the same
+			// presented code, so returning here is correct.
+			consumed, err := corrosion.MarkRecoveryCodeUsed(ctx, db, username, h)
+			if err != nil {
 				return false, err
 			}
-			return true, nil
+			return consumed, nil
 		}
 	}
 	return false, nil

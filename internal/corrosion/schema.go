@@ -161,16 +161,21 @@ import (
 //	     but never renders — closing the LB OR-set edge. Additive TEXT DEFAULT '';
 //	     pre-migration rows match '' = '' and keep rendering. gap-1 from v30.
 //	v32: make 2FA/recovery peer-repairable so they can join the sensitive
-//	     anti-entropy lane. user_2fa.deleted_at (soft-delete, was a hard delete);
-//	     recovery_codes.set_id + updated_at + deleted_at; and a new
-//	     recovery_code_sets(username PK, active_set_id, updated_at, deleted_at)
-//	     per-user pointer. A recovery code is valid only when its set_id equals the
-//	     pointer's active_set_id, so a stale old-set code a peer resurrects can't
-//	     validate. The pointer converges by ordinary updated_at LWW (no numeric/MAX
+//	     anti-entropy lane, each gated by a per-user active-set pointer so a stale
+//	     row a partitioned peer resurrects can never validate (the soft-delete
+//	     tombstone alone can't cover a factor/code this node never saw):
+//	       - user_2fa.deleted_at + user_2fa.epoch, with a new
+//	         user_2fa_sets(username PK, active_epoch, updated_at, deleted_at). A
+//	         factor renders only when its epoch == the pointer's active_epoch;
+//	         DeleteUser tombstones the pointer, so delete→recreate can't resurrect.
+//	       - recovery_codes.set_id + updated_at + deleted_at, with a new
+//	         recovery_code_sets(username PK, active_set_id, updated_at, deleted_at).
+//	         A code is valid only when its set_id == active_set_id.
+//	     Both pointers converge by ordinary updated_at LWW (no numeric/MAX
 //	     generation ordering, which per-node-monotonic NowTS would make unsafe).
-//	     Four ADD COLUMNs + one CREATE TABLE; gap-1 from v31. InitSchema runs two
+//	     Five ADD COLUMNs + two CREATE TABLEs; gap-1 from v31. InitSchema runs
 //	     idempotent post-migration data fixes (user_2fa NULL→'' label; legacy
-//	     recovery_codes set/pointer backfill) via raw SQL, not replicated mutations.
+//	     2FA/recovery pointer backfill) via raw SQL, not replicated mutations.
 const CurrentSchemaVersion = 32
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -311,6 +316,10 @@ func applyV32DataFixes(ctx context.Context, c *Client, now string) error {
 	}
 	for _, s := range []stmt{
 		{`UPDATE user_2fa SET label = '' WHERE label IS NULL`, nil},
+		{`INSERT INTO user_2fa_sets (username, active_epoch, updated_at, deleted_at)
+		  SELECT username, '', COALESCE(MAX(updated_at), ?), NULL
+		  FROM user_2fa GROUP BY username
+		  ON CONFLICT(username) DO NOTHING`, []interface{}{now}},
 		{`INSERT INTO recovery_code_sets (username, active_set_id, updated_at, deleted_at)
 		  SELECT username, '', COALESCE(MAX(created_at), ?), NULL
 		  FROM recovery_codes GROUP BY username
@@ -882,7 +891,19 @@ var schemaDDL = []string{
 		updated_at    TEXT NOT NULL,
 		last_step     INTEGER NOT NULL DEFAULT 0, -- highest consumed TOTP time-step (replay guard)
 		deleted_at    TEXT,                 -- soft-delete tombstone (sensitive anti-entropy lane)
+		epoch         TEXT NOT NULL DEFAULT '', -- active-factor-set this row belongs to; valid only if == user_2fa_sets.active_epoch
 		PRIMARY KEY (username, method, label)
+	)`,
+	// user_2fa_sets is the per-user active-factor-set pointer. A factor renders
+	// only when its epoch matches active_epoch; DeleteUser tombstones the pointer,
+	// so a factor a partitioned peer resurrects (one this node never saw, hence
+	// could not tombstone) still cannot validate. Re-enroll after a delete mints a
+	// fresh epoch. Converges by ordinary updated_at LWW.
+	`CREATE TABLE IF NOT EXISTS user_2fa_sets (
+		username     TEXT PRIMARY KEY,
+		active_epoch TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT
 	)`,
 
 	// Recovery codes (single-use). Used codes have used_at set
@@ -1426,6 +1447,7 @@ var tablePrimaryKeys = map[string][]string{
 	"role_bindings":          {"id"},
 	"sessions":               {"id"},
 	"user_2fa":               {"username", "method", "label"},
+	"user_2fa_sets":          {"username"},
 	"recovery_codes":         {"username", "code_hash"},
 	"recovery_code_sets":     {"username"},
 	"dns_records":            {"name"},
@@ -1614,6 +1636,7 @@ var schemaMigrations = []string{
 
 	// v32: make 2FA/recovery peer-repairable (sensitive anti-entropy lane).
 	`ALTER TABLE user_2fa ADD COLUMN deleted_at TEXT`,
+	`ALTER TABLE user_2fa ADD COLUMN epoch TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE recovery_codes ADD COLUMN set_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE recovery_codes ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE recovery_codes ADD COLUMN deleted_at TEXT`,
@@ -1686,7 +1709,7 @@ var alterVersions = []int{
 	29, 29, // tokens.updated_at, lb_backends.deleted_at
 	30,     // hosts.schema_version
 	31, 31, // lb_configs.generation, lb_backends.generation
-	32, 32, 32, 32, // user_2fa.deleted_at; recovery_codes.set_id/updated_at/deleted_at
+	32, 32, 32, 32, 32, // user_2fa.deleted_at/epoch; recovery_codes.set_id/updated_at/deleted_at
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -1701,7 +1724,7 @@ var createTableUnits = []struct {
 	{13, "vm_events"}, {14, "vm_backups"}, {20, "notification_targets"},
 	{21, "ip_sets"}, {22, "replication_checkpoints"}, {23, "registry_credentials"},
 	{26, "container_backups"}, {27, "container_snapshots"},
-	{32, "recovery_code_sets"},
+	{32, "recovery_code_sets"}, {32, "user_2fa_sets"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

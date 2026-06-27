@@ -276,6 +276,15 @@ func (c *Client) Query(ctx context.Context, sqlStr string, params ...interface{}
 // Execute runs a mutation, logs it to mutation_log, and immediately notifies
 // the replicator to push it to peers.
 func (c *Client) Execute(ctx context.Context, sqlStr string, params ...interface{}) error {
+	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true)
+	return err
+}
+
+// ExecuteRows is Execute that also reports how many rows the application
+// statement changed. Use it when a no-op UPDATE must be distinguished from a
+// real one — e.g. consuming a single-use token, where a guarded WHERE matching
+// zero rows means "not consumed" and the caller must NOT treat it as success.
+func (c *Client) ExecuteRows(ctx context.Context, sqlStr string, params ...interface{}) (int64, error) {
 	return c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true)
 }
 
@@ -284,28 +293,35 @@ func (c *Client) Execute(ctx context.Context, sqlStr string, params ...interface
 // periodic replication tick (~10s). Use this for high-frequency, low-priority
 // writes like health checks that don't need instant replication.
 func (c *Client) ExecuteDeferred(ctx context.Context, sqlStr string, params ...interface{}) error {
-	return c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, false)
+	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, false)
+	return err
 }
 
 // ExecuteBatch runs multiple mutations in a transaction, atomically writing
 // them to the mutation_log for replication to peers.
 func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
-	return c.executeBatchInternal(ctx, stmts, true)
+	_, err := c.executeBatchInternal(ctx, stmts, true)
+	return err
 }
 
-func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify bool) error {
+func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify bool) (int64, error) {
 	c.mu.Lock()
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		c.mu.Unlock()
-		return fmt.Errorf("begin tx: %w", err)
+		return 0, fmt.Errorf("begin tx: %w", err)
 	}
 
+	var affected int64
 	for _, s := range stmts {
-		if _, err := tx.ExecContext(ctx, s.SQL, s.Params...); err != nil {
+		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
-			return fmt.Errorf("exec batch: %w", err)
+			return 0, fmt.Errorf("exec batch: %w", err)
+		}
+		if n, e := res.RowsAffected(); e == nil {
+			affected += n
 		}
 	}
 
@@ -316,7 +332,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
-			return fmt.Errorf("marshal stmts: %w", err)
+			return 0, fmt.Errorf("marshal stmts: %w", err)
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		if _, err := tx.ExecContext(ctx,
@@ -325,20 +341,20 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		); err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
-			return fmt.Errorf("write mutation_log: %w", err)
+			return 0, fmt.Errorf("write mutation_log: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		c.mu.Unlock()
-		return fmt.Errorf("commit: %w", err)
+		return 0, fmt.Errorf("commit: %w", err)
 	}
 	c.mu.Unlock()
 
 	if notify {
 		c.notifyReplicator()
 	}
-	return nil
+	return affected, nil
 }
 
 // execLocal runs a statement locally without logging to mutation_log (used for DDL, replication).

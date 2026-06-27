@@ -84,6 +84,9 @@ type Coordinator struct {
 	// OnFence, when set, is invoked after a fence is recorded so the daemon can
 	// emit an operator notification (#5). Best-effort; must not block.
 	OnFence func(host, method, result, detail string)
+	// Metrics, when set, counts failover decisions/outcomes/errors by
+	// phase+result+error_class (U9). Optional + nil-safe (see metrics.go).
+	Metrics Metrics
 }
 
 // NewCoordinator creates a new failover coordinator with the real fencer.
@@ -143,9 +146,11 @@ func (c *Coordinator) run(ctx context.Context) {
 	liveHosts, err := c.countLiveHosts(ctx)
 	if err != nil {
 		slog.Error("failover: count live hosts", "error", err)
+		c.mAttempt(PhaseQuorum, ResultError, ErrDBError)
 		return
 	}
 	if liveHosts < 1 {
+		c.mAttempt(PhaseQuorum, ResultSkipped, ErrNoQuorum)
 		return
 	}
 	quorum := liveHosts/2 + 1
@@ -179,6 +184,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		c.hostName, offlineThreshold, freshCutoff, quorum)
 	if err != nil {
 		slog.Error("failover: query host_health", "error", err)
+		c.mAttempt(PhaseHealth, ResultError, ErrDBError)
 		return
 	}
 
@@ -187,6 +193,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		// (IPMI verify up to 15 s) can outlast the lease without renewal.
 		if !c.holdLease(ctx) {
 			slog.Warn("failover: lease lost mid-cycle, aborting", "host", c.hostName)
+			c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
 			return
 		}
 
@@ -202,6 +209,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		}
 		if h.State == "offline" || h.State == "maintenance" || h.State == "fenced" {
 			c.fenced[target] = true
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrTerminalState)
 			continue
 		}
 		// Skip hosts that are intentionally restarting (a self-upgrade, or a
@@ -216,6 +224,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			upd, perr := time.Parse(time.RFC3339, h.UpdatedAt)
 			if perr != nil || c.now().Sub(upd) < upgradingTimeout {
 				slog.Info("failover: target is upgrading, skipping fence", "host", target)
+				c.mAttempt(PhaseSkip, ResultSkipped, ErrUpgrading)
 				continue
 			}
 			slog.Warn("failover: host stuck 'upgrading' past timeout — treating as failed",
@@ -228,6 +237,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		if c.recentlyFenced(ctx, target) {
 			slog.Info("failover: host has recent fence record, skipping", "host", target)
 			c.fenced[target] = true
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrRecentlyFenced)
 			continue
 		}
 
@@ -262,6 +272,7 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {
 		slog.Error("failover: list hosts for recovery", "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 		return
 	}
 	freshCutoff := c.now().Add(-healthFreshness).UTC().Format(time.RFC3339)
@@ -292,10 +303,12 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 		}
 		if err := corrosion.UpdateHostState(ctx, c.db, h.Name, "active"); err != nil {
 			slog.Error("failover: recover host", "host", h.Name, "state", h.State, "error", err)
+			c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 			continue
 		}
 		slog.Info("failover: host healthy again, marking active",
 			"host", h.Name, "from", h.State, "healthy_observers", rows[0].Int("n"), "quorum", quorum)
+		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
 		delete(c.fenced, h.Name)
 		delete(c.fenceRelocated, h.Name)
 	}
@@ -515,6 +528,9 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	logResult := "fenced"
 	if !fr.Success {
 		logResult = "partial"
+		c.mAttempt(PhaseFence, ResultPartial, ErrFenceFailed)
+	} else {
+		c.mAttempt(PhaseFence, ResultSuccess, errClassNone)
 	}
 
 	// Record fence event. Failure to log is a real problem — we are about to
@@ -527,6 +543,9 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		Detail:   fr.Detail,
 	}); err != nil {
 		slog.Error("failover: write fence_log", "host", h.Name, "error", err)
+		// Observable but intentionally non-blocking: the fence physically
+		// happened; a lost audit row must not strand the VMs (no return here).
+		c.mAttempt(PhaseFence, ResultError, ErrFenceLogWrite)
 	}
 
 	if c.OnFence != nil {
@@ -543,6 +562,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	}
 	if err := corrosion.UpdateHostState(ctx, c.db, h.Name, newState); err != nil {
 		slog.Error("failover: mark host state", "host", h.Name, "state", newState, "error", err)
+		c.mAttempt(PhaseFence, ResultError, ErrDBError)
 	}
 
 	// Split-brain guard. Reschedule only if:
@@ -557,18 +577,22 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		case "best-effort":
 			slog.Warn("failover: best-effort fence did not fully succeed, proceeding anyway",
 				"host", h.Name, "detail", fr.Detail)
+			c.mAttempt(PhaseSplitBrain, ResultOK, ErrBestEffort)
 		case "manual":
 			if !c.manualFenceConfirmed(ctx, h.Name) {
 				slog.Error("failover: manual fence not confirmed by operator, NOT rescheduling",
 					"host", h.Name, "detail", fr.Detail,
 					"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off")
+				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
 				return
 			}
 			slog.Info("failover: operator confirmed manual fence, proceeding",
 				"host", h.Name)
+			c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
 		default:
 			slog.Error("failover: CRITICAL — fencing failed, NOT rescheduling VMs to prevent split-brain",
 				"host", h.Name, "strategy", h.FenceStrategy, "detail", fr.Detail)
+			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
 			return
 		}
 	}
@@ -577,6 +601,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	vms, err := corrosion.ListVMs(ctx, c.db, "", h.Name)
 	if err != nil {
 		slog.Error("failover: list VMs", "host", h.Name, "error", err)
+		c.mAttempt(PhaseFence, ResultError, ErrDBError)
 		return
 	}
 
@@ -584,6 +609,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	candidates, err := c.healthyHosts(ctx, h.Name)
 	if err != nil || len(candidates) == 0 {
 		slog.Warn("failover: no healthy hosts available for VM rescheduling", "host", h.Name)
+		c.mAttempt(PhaseFence, ResultRefused, ErrNoCandidates)
 		return
 	}
 
@@ -602,6 +628,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
 				Target: vm.Name, Detail: "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with " + h.Name + ")", Result: "skipped",
 			})
+			c.mVM(ActionReschedule, ResultSkipped, ErrFirmwareState)
 			continue
 		}
 
@@ -616,9 +643,11 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name); err != nil {
 				slog.Warn("failover: auto-promote failed, falling back to reschedule",
 					"vm", vm.Name, "error", err)
+				c.mVM(ActionPromote, ResultError, ErrPromoteFailed)
 			} else {
 				slog.Info("failover: VM recovered via replica promotion", "vm", vm.Name)
 				c.fenceRelocated[h.Name] = true
+				c.mVM(ActionPromote, ResultSuccess, errClassNone)
 				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 					ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.promote",
 					Target: vm.Name, Detail: "promoted replica after fencing " + h.Name, Result: "ok",
@@ -630,6 +659,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		policy := vmFailurePolicy(vm)
 		if policy == "none" || policy == "" {
 			slog.Info("failover: VM skipped (on_host_failure=none)", "vm", vm.Name)
+			c.mVM(ActionReschedule, ResultSkipped, ErrPolicyNone)
 			continue
 		}
 
@@ -685,6 +715,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				// Fallback to round-robin if placement fails (degraded mode).
 				slog.Warn("failover: placement failed, using round-robin fallback",
 					"vm", vm.Name, "error", err)
+				c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
 				targetName = candidates[fallbackIdx%len(candidates)].Name
 				fallbackIdx++
 			} else {
@@ -697,9 +728,11 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 
 		if err := corrosion.UpdateVMHost(ctx, c.db, vm.Name, targetName, "pending"); err != nil {
 			slog.Error("failover: update VM host", "vm", vm.Name, "error", err)
+			c.mVM(ActionReschedule, ResultError, ErrDBError)
 			continue
 		}
 		c.fenceRelocated[h.Name] = true
+		c.mVM(ActionReschedule, ResultSuccess, errClassNone)
 
 		_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 			ID:       newID(),
@@ -730,6 +763,7 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 	cts, err := corrosion.ListContainers(ctx, c.db, h.Name)
 	if err != nil {
 		slog.Error("failover: list containers", "host", h.Name, "error", err)
+		c.mCt(ActionRelocate, ResultError, ErrDBError)
 		return
 	}
 	for _, ct := range cts {
@@ -749,6 +783,7 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 				Detail: "no re-pullable image origin after fencing " + h.Name + " (restore from backup to recover)",
 				Result: "skipped",
 			})
+			c.mCt(ActionRelocate, ResultSkipped, ErrNonRepullable)
 			continue
 		}
 
@@ -766,9 +801,11 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 
 		if err := corrosion.RelocateContainer(ctx, c.db, h.Name, ct.Name, target); err != nil {
 			slog.Error("failover: relocate container", "container", ct.Name, "error", err)
+			c.mCt(ActionRelocate, ResultError, ErrRelocateFailed)
 			continue
 		}
 		c.fenceRelocated[h.Name] = true
+		c.mCt(ActionRelocate, ResultSuccess, errClassNone)
 		slog.Info("failover: relocating container", "container", ct.Name, "from", h.Name, "to", target, "policy", policy)
 		_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 			ID: newID(), Username: "failover-coordinator", HostName: c.hostName,

@@ -167,7 +167,13 @@ func (r *Replicator) reconcileDepartedWatermarks(ctx context.Context) {
 	if len(members) == 0 {
 		return
 	}
+	r.reconcileDepartedWatermarksAgainst(ctx, members)
+}
 
+// reconcileDepartedWatermarksAgainst schedules cleanup for watermark rows whose
+// peer is absent from the given live-member set. Split from the Members()-driven
+// caller so tests can supply membership without a running gossip layer.
+func (r *Replicator) reconcileDepartedWatermarksAgainst(ctx context.Context, members map[string]bool) {
 	rows, err := r.client.Query(ctx, `SELECT DISTINCT peer_name FROM replication_watermarks`)
 	if err != nil {
 		slog.Warn("replicator: list watermarks for reconcile", "error", err)

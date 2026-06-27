@@ -83,3 +83,32 @@ func TestReconcileDepartedWatermarks_NoMembersNoReap(t *testing.T) {
 		t.Error("reconcile must not reap watermarks when no members are visible")
 	}
 }
+
+// Reconcile reclaims a watermark for a peer that is gone from membership even
+// when it was never in r.peers (the relay-reshuffle-then-leave case), while a
+// peer still in membership keeps its watermark.
+func TestReconcileDepartedWatermarks_SchedulesNonMembers(t *testing.T) {
+	old := watermarkCleanupGrace
+	watermarkCleanupGrace = 10 * time.Millisecond
+	defer func() { watermarkCleanupGrace = old }()
+
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	seedWatermark(t, c, "departed") // absent from membership, never in r.peers
+	seedWatermark(t, c, "alive")    // still a member
+
+	r.reconcileDepartedWatermarksAgainst(context.Background(), map[string]bool{"alive": true})
+
+	deadline := time.After(2 * time.Second)
+	for watermarkExists(t, c, "departed") {
+		select {
+		case <-deadline:
+			t.Fatal("departed peer's watermark was not reclaimed")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	r.wg.Wait()
+	if !watermarkExists(t, c, "alive") {
+		t.Error("a still-live member's watermark must be kept")
+	}
+}

@@ -808,7 +808,8 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			"stack", req.Name, "remaining_vms", len(remaining))
 		s.publish("stack.deleting", req.Name, fmt.Sprintf("%d VMs remaining", len(remaining)))
 	} else {
-		// Hard-delete the soft-deleted LB config now that processes are stopped.
+		// Soft-delete (tombstone) the LB config now that processes are stopped, so
+		// the deletion survives anti-entropy instead of resurrecting from a peer.
 		_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
 
 		// Tombstone the stack's distributed-firewall config (SGs, ipsets,

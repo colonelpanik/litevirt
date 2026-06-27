@@ -82,8 +82,8 @@ Full walkthrough in [docs/installation.md](docs/installation.md).
 | 🔐 **Security** | mTLS everywhere (auto ECDSA P-256 PKI) · path-based RBAC · Local/OIDC/LDAP realms · TOTP + WebAuthn 2FA · scoped API tokens · tamper-evident audit hash-chain |
 
 Decentralized by design: every host is equal, state replicates via the **Crescent** protocol
-(relay-quorum topology, HLC last-writer-wins, anti-entropy drift detection) — scaling to hundreds
-of nodes with no master to lose.
+(relay-quorum topology, wall-clock last-writer-wins on each row's `updated_at`, anti-entropy drift
+detection) — scaling to hundreds of nodes with no master to lose.
 
 <details>
 <summary><b>More screenshots</b></summary>

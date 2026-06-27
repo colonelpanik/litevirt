@@ -29,7 +29,9 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **No data loss for committed local writes** as long as one healthy peer
   remains reachable before the host dies.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
-  and is the safety net for any divergence the WAL replicator missed. When it
+  and is the safety net for divergence the WAL replicator missed in the
+  full-state-replicated tables (a few push-only tables are deliberately
+  excluded — see "Push-only tables are not self-healed" below). When it
   detects drift it pulls the peer's full state over a **chunked** streaming RPC
   (`StreamStateDump`), so convergence works regardless of total state size; the
   older unary `GetStateDump` is retained as a fallback for mixed-version
@@ -101,6 +103,20 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   a healthy LAN cluster, longer over WAN. Code that needs "this write is
   visible everywhere before I act" should use a confirmation read on the
   target peer, not assume convergence.
+
+### Push-only tables are not self-healed by anti-entropy
+- A few replicated tables are **excluded from the full-state anti-entropy
+  dump**: the secret-bearing ones — `registry_credentials` and the
+  notification config (`notification_targets`, `notification_routes`, whose
+  config can carry webhook tokens/URLs) — and the 2FA tables (`user_2fa`
+  enrollment secrets, single-use `recovery_codes`). They are kept out of the
+  operator-readable bulk dump on purpose.
+- These propagate by **mutation push only**. If a host misses the push (a
+  partition or restart at the wrong moment), anti-entropy will **not** repair
+  it — unlike every other replicated table. To re-replicate, re-apply the
+  change on a healthy host (re-save the credential / notification target,
+  re-enroll 2FA). Recovery codes are single-use and per-host divergence there
+  is self-correcting on next enrollment.
 
 ### Disk-full is not auto-recovered
 - The Corrosion store is a SQLite file. If the disk fills, the daemon stops

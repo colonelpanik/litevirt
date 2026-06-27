@@ -389,8 +389,8 @@ batches that reference missing tables / columns (forward-skew guard).
 
 **Schema changes are additive-only.** CRDT-replicated tables (everything in
 `internal/corrosion/schema.go`) may only **grow**: a new `CREATE TABLE`, or an
-`ALTER TABLE … ADD COLUMN` **with a `DEFAULT`** so a row written by an older
-peer stays valid. **Never rename a column, drop a column, change a column's
+`ALTER TABLE … ADD COLUMN` that is **nullable (implicit `NULL`) or has an
+explicit `DEFAULT`**, so a row written by an older peer stays valid. **Never rename a column, drop a column, change a column's
 type, or change a primary key** on a replicated table. Crescent's
 last-writer-wins apply path addresses columns *by name*, so in a mixed-version
 cluster a renamed or dropped column is simply *missing* on the not-yet-upgraded

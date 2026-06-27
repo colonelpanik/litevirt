@@ -33,6 +33,7 @@ func NewTestClient() (*Client, error) {
 		hostName:         "test-node",
 		clock:            hlc.NewClock("test-node"),
 		replicatorNotify: make(chan struct{}, 1),
+		membershipNotify: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -59,5 +60,6 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 		hostName:         hostName,
 		clock:            hlc.NewClock(hostName),
 		replicatorNotify: make(chan struct{}, 1),
+		membershipNotify: make(chan struct{}, 1),
 	}, nil
 }

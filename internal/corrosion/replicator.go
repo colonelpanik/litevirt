@@ -29,11 +29,12 @@ type Replicator struct {
 	pkiDir   string
 	relayCfg RelayConfig
 
-	mu       sync.Mutex
-	peers    map[string]context.CancelFunc // peer name → cancel for its goroutine
-	relaySet *RelaySet                     // current relay election result
-	isRelay  bool                          // cached: is this node a relay?
-	wg       sync.WaitGroup
+	mu             sync.Mutex
+	peers          map[string]context.CancelFunc // peer name → cancel for its goroutine
+	relaySet       *RelaySet                     // current relay election result
+	isRelay        bool                          // cached: is this node a relay?
+	cleanupPending map[string]bool               // departed peers with a watermark-cleanup timer in flight
+	wg             sync.WaitGroup
 
 	// Fallback tracking for leaves: when was the last successful push to any relay?
 	lastRelayPush  atomic.Int64 // unix millis
@@ -47,11 +48,12 @@ type Replicator struct {
 func NewReplicator(client *Client, pkiDir string, cfg RelayConfig) *Replicator {
 	cfg = cfg.withDefaults()
 	r := &Replicator{
-		client:   client,
-		pkiDir:   pkiDir,
-		relayCfg: cfg,
-		peers:    make(map[string]context.CancelFunc),
-		stopCh:   make(chan struct{}),
+		client:         client,
+		pkiDir:         pkiDir,
+		relayCfg:       cfg,
+		peers:          make(map[string]context.CancelFunc),
+		cleanupPending: make(map[string]bool),
+		stopCh:         make(chan struct{}),
 	}
 	r.lastRelayPush.Store(time.Now().UnixMilli())
 	return r
@@ -100,57 +102,9 @@ func (r *Replicator) Stop() {
 	})
 }
 
-// PeerJoined starts a replicator goroutine for the named peer.
-func (r *Replicator) PeerJoined(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if _, exists := r.peers[name]; exists {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	r.peers[name] = cancel
-
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
-		r.replicateToPeer(ctx, name)
-	}()
-
-	slog.Info("replicator: started peer goroutine", "peer", name)
-}
-
-// PeerLeft stops the replicator goroutine for the named peer and schedules
-// watermark cleanup after a grace period to prevent blocking log compaction.
-func (r *Replicator) PeerLeft(name string) {
-	r.mu.Lock()
-	cancel, exists := r.peers[name]
-	if exists {
-		cancel()
-		delete(r.peers, name)
-	}
-	r.mu.Unlock()
-
-	if exists {
-		slog.Info("replicator: stopped peer goroutine", "peer", name)
-		// Schedule watermark cleanup after a grace period. The cleanup
-		// re-checks membership before deleting, so a peer that rejoins within
-		// the window (PeerJoined re-adds it) keeps its watermark instead of
-		// being forced into a full re-sync by a stale timer.
-		go func() {
-			select {
-			case <-r.stopCh:
-				return
-			case <-time.After(watermarkCleanupGrace):
-			}
-			r.cleanupDepartedWatermark(name)
-		}()
-	}
-}
-
-// watermarkCleanupGrace is how long PeerLeft waits before reclaiming a departed
-// peer's replication watermark. A var so tests can drive the cleanup directly.
+// watermarkCleanupGrace is how long the discovery loop waits before reclaiming
+// a departed peer's replication watermark. A var so tests can drive the cleanup
+// directly.
 //
 // pruneMutationLog already excludes watermarks not advanced within
 // LiveWatermarkWindow (30m), so a departed peer stops pinning the log well
@@ -161,31 +115,26 @@ func (r *Replicator) PeerLeft(name string) {
 // old 1h so a genuinely departed peer's row is reclaimed promptly.
 var watermarkCleanupGrace = 10 * time.Minute
 
-// cleanupDepartedWatermark deletes a peer's replication watermark — but only if
-// the peer is still absent. If it rejoined (back in r.peers) the watermark is
-// kept; deleting an active peer's watermark would trigger a needless full re-sync.
-func (r *Replicator) cleanupDepartedWatermark(name string) {
-	r.mu.Lock()
-	_, live := r.peers[name]
-	r.mu.Unlock()
-	if live {
-		slog.Info("replicator: peer rejoined before cleanup, keeping watermark", "peer", name)
-		return
-	}
-	r.client.mu.Lock()
-	r.client.db.ExecContext(context.Background(),
-		`DELETE FROM replication_watermarks WHERE peer_name = ?`, name)
-	r.client.mu.Unlock()
-	slog.Info("replicator: cleaned watermark for departed peer", "peer", name)
-}
-
-// peerDiscoveryLoop periodically checks memberlist for new/departed peers.
+// peerDiscoveryLoop keeps the per-peer replication goroutines and the
+// replication-watermark table in sync with cluster membership. It reconverges
+// on every gossip membership change (event-driven, via MembershipChanged) and
+// on a slow backstop ticker that guarantees convergence even if an event is
+// ever missed.
 func (r *Replicator) peerDiscoveryLoop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	// Backstop poll — a safety net behind the membership events, not the
+	// primary trigger; far slower than the old 5s busy-poll.
+	const backstopInterval = 30 * time.Second
+	ticker := time.NewTicker(backstopInterval)
 	defer ticker.Stop()
 
-	// Initial discovery.
-	r.syncPeers()
+	membership := r.client.MembershipChanged()
+
+	reconverge := func() {
+		r.syncPeers()
+		r.reconcileDepartedWatermarks(ctx)
+	}
+
+	reconverge() // initial discovery
 
 	for {
 		select {
@@ -193,10 +142,100 @@ func (r *Replicator) peerDiscoveryLoop(ctx context.Context) {
 			return
 		case <-r.stopCh:
 			return
+		case <-membership:
+			reconverge()
 		case <-ticker.C:
-			r.syncPeers()
+			reconverge()
 		}
 	}
+}
+
+// reconcileDepartedWatermarks schedules cleanup of replication_watermarks rows
+// whose peer is no longer in cluster membership. This catches peers that leave
+// after a relay reshuffle already dropped them from this node's target set (so
+// they were never in r.peers to trigger a stop-time cleanup). The cleanup is
+// delayed by watermarkCleanupGrace and re-checks membership, so a brief flap or
+// a quick rejoin keeps the watermark.
+func (r *Replicator) reconcileDepartedWatermarks(ctx context.Context) {
+	members := map[string]bool{}
+	for _, m := range r.client.Members() {
+		members[m.Name] = true
+	}
+	// If we can't see any peers, don't reap — this is more likely a local
+	// gossip outage than the whole cluster departing, and reaping would force
+	// needless full re-syncs when peers reappear.
+	if len(members) == 0 {
+		return
+	}
+
+	rows, err := r.client.Query(ctx, `SELECT DISTINCT peer_name FROM replication_watermarks`)
+	if err != nil {
+		slog.Warn("replicator: list watermarks for reconcile", "error", err)
+		return
+	}
+	for _, row := range rows {
+		name := row.String("peer_name")
+		if name != "" && name != r.client.HostName() && !members[name] {
+			r.scheduleWatermarkCleanup(name)
+		}
+	}
+}
+
+// scheduleWatermarkCleanup reclaims a departed peer's watermark after a grace
+// period, deduping so at most one timer per peer is in flight (the discovery
+// loop may observe the same departed peer many times during the grace window).
+func (r *Replicator) scheduleWatermarkCleanup(name string) {
+	r.mu.Lock()
+	if r.cleanupPending[name] {
+		r.mu.Unlock()
+		return
+	}
+	r.cleanupPending[name] = true
+	r.mu.Unlock()
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		defer func() {
+			r.mu.Lock()
+			delete(r.cleanupPending, name)
+			r.mu.Unlock()
+		}()
+		select {
+		case <-r.stopCh:
+			return
+		case <-time.After(watermarkCleanupGrace):
+		}
+		r.cleanupDepartedWatermark(name)
+	}()
+}
+
+// cleanupDepartedWatermark deletes a peer's replication watermark — but only if
+// the peer is gone for good. It is kept when the peer is still in cluster
+// membership (rejoined during the grace) or is still one of our replication
+// targets; deleting an active peer's watermark would trigger a needless full
+// re-sync. Membership is authoritative for liveness (a live peer always shows
+// in gossip); the target-set check is extra belt-and-suspenders.
+func (r *Replicator) cleanupDepartedWatermark(name string) {
+	for _, m := range r.client.Members() {
+		if m.Name == name {
+			slog.Info("replicator: peer back in membership before cleanup, keeping watermark", "peer", name)
+			return
+		}
+	}
+	r.mu.Lock()
+	_, targeted := r.peers[name]
+	r.mu.Unlock()
+	if targeted {
+		slog.Info("replicator: peer still a replication target, keeping watermark", "peer", name)
+		return
+	}
+
+	r.client.mu.Lock()
+	r.client.db.ExecContext(context.Background(),
+		`DELETE FROM replication_watermarks WHERE peer_name = ?`, name)
+	r.client.mu.Unlock()
+	slog.Info("replicator: cleaned watermark for departed peer", "peer", name)
 }
 
 func (r *Replicator) syncPeers() {

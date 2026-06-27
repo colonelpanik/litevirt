@@ -2,7 +2,22 @@ package corrosion
 
 import (
 	"log/slog"
+
+	"github.com/hashicorp/memberlist"
 )
+
+// membershipEvents implements memberlist.EventDelegate. It wakes the
+// replicator's peer-discovery loop the instant a peer joins, leaves, or
+// updates, instead of waiting for the periodic backstop poll. Callbacks fire on
+// memberlist's own goroutines, so they must be cheap and non-blocking — they
+// only signal a coalescing channel.
+type membershipEvents struct {
+	client *Client
+}
+
+func (e *membershipEvents) NotifyJoin(*memberlist.Node)   { e.client.kickMembership() }
+func (e *membershipEvents) NotifyLeave(*memberlist.Node)  { e.client.kickMembership() }
+func (e *membershipEvents) NotifyUpdate(*memberlist.Node) { e.client.kickMembership() }
 
 // delegate implements memberlist.Delegate for the Client.
 // Memberlist is used for membership detection only — no application data

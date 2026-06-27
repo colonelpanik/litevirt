@@ -39,6 +39,11 @@ type Client struct {
 	// Set via SetReplicator after construction.
 	replicatorNotify chan struct{}
 
+	// membershipNotify is a coalescing wake (cap 1) for the replicator's
+	// peer-discovery loop, fired by the memberlist EventDelegate on peer
+	// join/leave/update. Never fires for a local client (no gossip).
+	membershipNotify chan struct{}
+
 	// effectiveDBSchema caches this node's effective DB-applied schema version =
 	// max(ledger-derived, stored schema_state.version). It is the single source
 	// for the replication handshake (both the version this node advertises as a
@@ -103,6 +108,7 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 		hostName:         cfg.HostName,
 		clock:            clock,
 		replicatorNotify: make(chan struct{}, 1),
+		membershipNotify: make(chan struct{}, 1),
 	}
 
 	// Set up memberlist (used for membership detection only — no data replication)
@@ -115,6 +121,9 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 
 	del := &delegate{client: c}
 	mlCfg.Delegate = del
+	// EventDelegate wakes the replicator's discovery loop on membership changes
+	// (separate from Delegate, which carries gossip metadata) — set before Create.
+	mlCfg.Events = &membershipEvents{client: c}
 
 	list, err := memberlist.Create(mlCfg)
 	if err != nil {
@@ -153,6 +162,7 @@ func NewLocalClient(dataDir string, hostName ...string) (*Client, error) {
 	c := &Client{
 		db:               db,
 		replicatorNotify: make(chan struct{}, 1),
+		membershipNotify: make(chan struct{}, 1),
 	}
 	if len(hostName) > 0 && hostName[0] != "" {
 		c.hostName = hostName[0]
@@ -351,6 +361,23 @@ func (c *Client) HostName() string {
 }
 
 // Members returns the current memberlist members (for peer discovery).
+// kickMembership wakes the replicator's peer-discovery loop after a gossip
+// membership change. Non-blocking and coalescing: a kick already pending covers
+// this one, so it's safe to call from memberlist's event goroutines.
+func (c *Client) kickMembership() {
+	select {
+	case c.membershipNotify <- struct{}{}:
+	default:
+	}
+}
+
+// MembershipChanged returns a channel that receives a coalesced signal whenever
+// the gossip layer reports a peer join/leave/update. For a local client (no
+// gossip) the channel never fires, so selecting on it is always safe.
+func (c *Client) MembershipChanged() <-chan struct{} {
+	return c.membershipNotify
+}
+
 func (c *Client) Members() []PeerInfo {
 	if c.list == nil {
 		return nil

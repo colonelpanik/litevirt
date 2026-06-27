@@ -70,11 +70,11 @@ func TestComputeRelays_Scaling(t *testing.T) {
 		nodes     int
 		wantRelay int
 	}{
-		{10, 4},   // 3 + ceil(10/50) = 4
-		{50, 4},   // 3 + ceil(50/50) = 4
-		{51, 5},   // 3 + ceil(51/50) = 5
-		{100, 5},  // 3 + ceil(100/50) = 5
-		{200, 7},  // 3 + ceil(200/50) = 7
+		{10, 4},  // 3 + ceil(10/50) = 4
+		{50, 4},  // 3 + ceil(50/50) = 4
+		{51, 5},  // 3 + ceil(51/50) = 5
+		{100, 5}, // 3 + ceil(100/50) = 5
+		{200, 7}, // 3 + ceil(200/50) = 7
 	}
 
 	for _, tt := range tests {
@@ -236,6 +236,47 @@ func TestDedup_MutationSeen(t *testing.T) {
 	c.mu.RUnlock()
 	if count != 1 {
 		t.Errorf("mutation_seen count = %d, want 1", count)
+	}
+}
+
+func TestApplyRemoteMutations_AdvancesPastTrailingDuplicates(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+	clock := hlc.NewClock("origin-node")
+	tsNew := clock.Now().String()
+	tsSeen := clock.Now().String()
+
+	entries := []*pb.MutationEntry{
+		{
+			Seq:    1,
+			Hlc:    tsNew,
+			Origin: "origin-node",
+			Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["dedup-new","10.0.0.1","root","serial1","active","2025-01-01T00:00:00Z","` + tsNew + `"]}]`,
+		},
+		{
+			Seq:    2,
+			Hlc:    tsSeen,
+			Origin: "origin-node",
+			Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["dedup-seen","10.0.0.2","root","serial2","active","2025-01-01T00:00:00Z","` + tsSeen + `"]}]`,
+		},
+	}
+
+	c.mu.Lock()
+	if _, err := c.db.ExecContext(ctx,
+		`INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)`,
+		"origin-node", tsSeen); err != nil {
+		c.mu.Unlock()
+		t.Fatalf("seed mutation_seen: %v", err)
+	}
+	c.mu.Unlock()
+
+	got, err := r.ApplyRemoteMutations(ctx, entries)
+	if err != nil {
+		t.Fatalf("ApplyRemoteMutations: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("acked seq = %d, want 2 (must advance past trailing duplicates)", got)
 	}
 }
 
@@ -440,6 +481,41 @@ func TestLWW_ConcurrentWrites(t *testing.T) {
 	}
 	if addr := rows[0].String("address"); addr != "10.0.0.2" {
 		t.Errorf("after old write: address = %s, want 10.0.0.2", addr)
+	}
+}
+
+func TestLWW_PrimaryReplicationUsesStatementUpdatedAt(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+
+	localTS := "2026-01-02T00:00:00Z"
+	incomingRowTS := "2026-01-01T00:00:00Z"
+	incomingMutationHLC := "9999999999999-0000-remote"
+
+	if err := c.Execute(ctx,
+		`INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"rfc-conflict", "10.0.0.1", "root", "serial-local", "active", localTS, localTS); err != nil {
+		t.Fatalf("seed local host: %v", err)
+	}
+
+	entries := []*pb.MutationEntry{{
+		Seq:    1,
+		Hlc:    incomingMutationHLC,
+		Origin: "remote-node",
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["rfc-conflict","10.0.0.2","root","serial-remote","active","` + incomingRowTS + `","` + incomingRowTS + `"]}]`,
+	}}
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
+		t.Fatalf("apply older row with newer mutation HLC: %v", err)
+	}
+
+	rows, err := c.Query(ctx, "SELECT address FROM hosts WHERE name = 'rfc-conflict'")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("lookup rfc-conflict: err=%v rows=%d", err, len(rows))
+	}
+	if addr := rows[0].String("address"); addr != "10.0.0.1" {
+		t.Errorf("address = %s, want 10.0.0.1 (row updated_at, not mutation HLC, should decide)", addr)
 	}
 }
 

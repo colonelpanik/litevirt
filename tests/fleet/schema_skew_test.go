@@ -40,9 +40,10 @@ func TestFleet_SchemaSkewBackPressure(t *testing.T) {
 
 	// Establish a baseline replication watermark. The receiver's
 	// PushMutations is the public entry point; we call it directly
-	// over loopback gRPC so the test follows the production path
-	// (real TLS, real protobuf, real handler dispatch).
-	client := c.SelfClient(receiver)
+	// over loopback gRPC while presenting the sender's host certificate so the
+	// test follows the production path (real TLS peer identity, real protobuf,
+	// real handler dispatch).
+	client := c.PeerClient(sender, receiver)
 
 	// Build one mutation entry targeting the missing table.
 	clock := sender.HLCClock()

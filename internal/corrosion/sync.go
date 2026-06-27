@@ -227,6 +227,10 @@ func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
 			continue
 		}
 		updatedAtIdx := indexOf(table.Columns, "updated_at")
+		if localCols["updated_at"] && len(pkCols) > 0 && updatedAtIdx < 0 {
+			slog.Warn("sync: skipping dump table missing updated_at column", "table", table.Name)
+			continue
+		}
 
 		// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
 		var existing map[string]string
@@ -404,11 +408,11 @@ func tableColumns(tx *sql.Tx, tableName string) (map[string]bool, error) {
 	cols := map[string]bool{}
 	for rows.Next() {
 		var (
-			cid        int
-			name, typ  string
-			notnull    int
-			dfltValue  interface{}
-			pk         int
+			cid       int
+			name, typ string
+			notnull   int
+			dfltValue interface{}
+			pk        int
 		)
 		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
 			return nil, err

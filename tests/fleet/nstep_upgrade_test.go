@@ -28,7 +28,7 @@ func TestFleet_NStepRollingUpgrade(t *testing.T) {
 	c := New(t, Options{Nodes: 2})
 	ctx := context.Background()
 	sender, receiver := c.Nodes[0], c.Nodes[1]
-	client := c.SelfClient(receiver)
+	client := c.PeerClient(sender, receiver)
 
 	// One valid INSERT into an existing replicated table (service_endpoints),
 	// keyed by a distinct service_name + seq per push so dedup doesn't interfere.
@@ -37,7 +37,7 @@ func TestFleet_NStepRollingUpgrade(t *testing.T) {
 			Seq:    seq,
 			Hlc:    sender.HLCClock().Now().String(),
 			Origin: sender.Name,
-			Stmts: fmt.Sprintf(`[{"SQL":"INSERT INTO service_endpoints (service_name, ip, region, weight, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)","Params":[%q,"10.0.0.1","ny",1,"2026-05-11T00:00:00Z","2026-05-11T00:00:00Z"]}]`, svc),
+			Stmts:  fmt.Sprintf(`[{"SQL":"INSERT INTO service_endpoints (service_name, ip, region, weight, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)","Params":[%q,"10.0.0.1","ny",1,"2026-05-11T00:00:00Z","2026-05-11T00:00:00Z"]}]`, svc),
 		}
 		_, err := client.PushMutations(ctx, &pb.ReplicateRequest{
 			Sender:              sender.Name,

@@ -160,6 +160,28 @@ func TestMergeLWW_RejectsMissingPKColumn(t *testing.T) {
 	}
 }
 
+func TestMergeLWW_RejectsMissingUpdatedAtColumn(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := c.Execute(ctx,
+		`INSERT INTO hosts (name, address, ssh_user, cert_serial, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		"h1", "10.0.0.1", "root", "s1", "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"); err != nil {
+		t.Fatalf("seed host: %v", err)
+	}
+
+	c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
+		Name:    "hosts",
+		Columns: []string{"name", "address", "ssh_user", "cert_serial", "created_at"},
+		Rows:    [][]interface{}{{"h1", "10.9.9.9", "root", "s1", "2026-01-01T00:00:00Z"}},
+	}}})
+
+	if got := hostAddr(t, c, "h1"); got != "10.0.0.1" {
+		t.Errorf("address = %q, want 10.0.0.1 (dump missing updated_at must not blind-replace)", got)
+	}
+}
+
 // TestMergeLWW_MultipleChunks forces the prefetch to span several row-value IN
 // chunks (shrinking the param budget), proving correctness across chunk
 // boundaries and no bind-variable overflow. host_labels has a 2-column PK.
@@ -362,7 +384,7 @@ func TestMergeLWW_RejectsMalformedRowLength(t *testing.T) {
 		Name:    "host_labels",
 		Columns: []string{"host_name", "key", "value", "updated_at"},
 		Rows: [][]interface{}{
-			{"h1", "k1"},                      // malformed (too short) — must be skipped, not panic
+			{"h1", "k1"},                       // malformed (too short) — must be skipped, not panic
 			{"h1", "k2", "good", "100-0000-n"}, // well-formed — should still apply
 		},
 	}}})

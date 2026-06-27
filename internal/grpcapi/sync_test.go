@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -153,5 +155,33 @@ func TestStreamStateDump_RequiresOperator(t *testing.T) {
 	stream := &fakeDumpStream{ctx: context.Background()} // no principal
 	if err := s.StreamStateDump(&emptypb.Empty{}, stream); err == nil {
 		t.Fatal("expected an auth error for an unauthenticated caller")
+	}
+}
+
+func replicationPeerCtx(name string) context.Context {
+	ctx := context.WithValue(adminCtx(), ctxKeyAuthMethod, authMethodMTLS)
+	return context.WithValue(ctx, ctxKeyMTLSCommonName, name)
+}
+
+func TestReplicationRPCsRequirePeerMTLS(t *testing.T) {
+	s := testServer(t)
+	s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
+
+	if _, err := s.PushMutations(adminCtx(), &pb.ReplicateRequest{Sender: "node-a"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("PushMutations with non-mTLS auth code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+	if _, err := s.AckMutations(adminCtx(), &pb.AckRequest{Sender: "node-a"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("AckMutations with non-mTLS auth code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+
+	if _, err := s.PushMutations(replicationPeerCtx("node-b"), &pb.ReplicateRequest{Sender: "node-a"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("PushMutations with mismatched peer CN code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+
+	if _, err := s.PushMutations(replicationPeerCtx("node-a"), &pb.ReplicateRequest{Sender: "node-a", AfterSeq: 7}); err != nil {
+		t.Fatalf("PushMutations with matching peer CN: %v", err)
+	}
+	if _, err := s.AckMutations(replicationPeerCtx("node-a"), &pb.AckRequest{Sender: "node-a", AckedSeq: 7}); err != nil {
+		t.Fatalf("AckMutations with matching peer CN: %v", err)
 	}
 }

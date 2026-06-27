@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -795,9 +796,12 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 	}
 
 	// Filter out entries we've already processed (dedup).
-	unseen := r.filterUnseen(ctx, tx, entries)
+	unseen, err := r.filterUnseen(ctx, tx, entries)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
 
-	var lastSeq int64
 	for _, entry := range unseen {
 		// Advance local HLC.
 		if remoteTS, ok := hlc.Parse(entry.Hlc); ok {
@@ -833,7 +837,6 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 			}
 		}
 
-		lastSeq = entry.Seq
 	}
 
 	// Record all unseen entries in mutation_seen for future dedup. On failure,
@@ -868,29 +871,30 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 	}
 
 	// Use the last seq from the original entries (not just unseen) so the
-	// sender's watermark advances past duplicates too.
-	if lastSeq == 0 && len(entries) > 0 {
-		lastSeq = entries[len(entries)-1].Seq
-	}
-
-	return lastSeq, nil
+	// sender's watermark advances past duplicates too. Otherwise a batch with
+	// new entries followed by already-seen entries would replay the trailing
+	// duplicates forever.
+	return entries[len(entries)-1].Seq, nil
 }
 
 // filterUnseen returns entries not yet in the mutation_seen dedup table.
-func (r *Replicator) filterUnseen(ctx context.Context, tx *sql.Tx, entries []*pb.MutationEntry) []*pb.MutationEntry {
+func (r *Replicator) filterUnseen(ctx context.Context, tx *sql.Tx, entries []*pb.MutationEntry) ([]*pb.MutationEntry, error) {
 	var unseen []*pb.MutationEntry
 	for _, e := range entries {
 		var exists int
 		err := tx.QueryRowContext(ctx,
 			`SELECT 1 FROM mutation_seen WHERE origin = ? AND hlc = ?`,
 			e.Origin, e.Hlc).Scan(&exists)
-		if err != nil {
-			// sql.ErrNoRows means not seen yet — include it.
+		if errors.Is(err, sql.ErrNoRows) {
 			unseen = append(unseen, e)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("query mutation_seen (origin=%s hlc=%s): %w", e.Origin, e.Hlc, err)
 		}
 		// If exists == 1, skip (already applied).
 	}
-	return unseen
+	return unseen, nil
 }
 
 // recordSeen inserts entries into mutation_seen for future dedup. Returns an
@@ -995,15 +999,17 @@ func shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName string, pkCols []s
 		return false
 	}
 
-	// Compare HLC timestamps. If local is an old RFC3339, incoming HLC always wins.
-	localTS, localOK := hlc.Parse(localUpdatedAt.String)
-	incomingTS, incomingOK := hlc.Parse(incomingHLC)
-	if !localOK || !incomingOK {
-		return false // can't compare, don't skip
+	// Prefer the row's own updated_at when the statement carries it. Most real
+	// tables still store RFC3339 in updated_at; comparing that local RFC3339
+	// against the mutation-log HLC would make every remote mutation win by
+	// format rather than by row timestamp. Fall back to the entry HLC only for
+	// statements whose timestamp cannot be extracted.
+	incomingTS, ok := extractUpdatedAtValue(s)
+	if !ok || incomingTS == "" {
+		incomingTS = incomingHLC
 	}
 
-	// Skip if local is strictly newer.
-	return localTS.After(incomingTS)
+	return localWinsLWW(localUpdatedAt.String, incomingTS)
 }
 
 // extractPKValues attempts to extract primary key values from a Statement.

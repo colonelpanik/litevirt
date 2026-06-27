@@ -264,6 +264,42 @@ func TestExtractPKFromInsert_CaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestExtractUpdatedAtValue(t *testing.T) {
+	tests := []struct {
+		name string
+		stmt Statement
+		want string
+	}{
+		{
+			name: "insert",
+			stmt: Statement{
+				SQL:    "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?)",
+				Params: []interface{}{"h1", "10.0.0.1", "2026-01-01T00:00:00Z"},
+			},
+			want: "2026-01-01T00:00:00Z",
+		},
+		{
+			name: "update",
+			stmt: Statement{
+				SQL:    "UPDATE hosts SET address = ?, updated_at = ? WHERE name = ?",
+				Params: []interface{}{"10.0.0.2", "2026-01-02T00:00:00Z", "h1"},
+			},
+			want: "2026-01-02T00:00:00Z",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := extractUpdatedAtValue(tt.stmt)
+			if !ok {
+				t.Fatal("extractUpdatedAtValue returned ok=false")
+			}
+			if got != tt.want {
+				t.Fatalf("updated_at = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // ── extractPKFromUpdate ─────────────────────────────────────────────────────
 
 func TestExtractPKFromUpdate_SinglePK(t *testing.T) {

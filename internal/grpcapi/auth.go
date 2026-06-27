@@ -7,7 +7,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -21,6 +23,14 @@ const (
 	ctxKeyRealm
 	ctxKeySessionID
 	ctxKeyScopePaths
+	ctxKeyAuthMethod
+	ctxKeyMTLSCommonName
+)
+
+const (
+	authMethodSession = "session"
+	authMethodToken   = "token"
+	authMethodMTLS    = "mtls"
 )
 
 // SessionTokenPrefix marks bearer strings that resolve via the sessions
@@ -143,6 +153,7 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 			ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
 			ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
 			ctx = context.WithValue(ctx, ctxKeyRealm, "local")
+			ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodToken)
 			if len(user.ScopePaths) > 0 {
 				ctx = context.WithValue(ctx, ctxKeyScopePaths, user.ScopePaths)
 			}
@@ -153,6 +164,10 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 	ctx = context.WithValue(ctx, ctxKeyUsername, "admin")
 	ctx = context.WithValue(ctx, ctxKeyRole, "admin")
 	ctx = context.WithValue(ctx, ctxKeyRealm, "local")
+	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodMTLS)
+	if cn := peerCommonName(ctx); cn != "" {
+		ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, cn)
+	}
 	return ctx, nil
 }
 
@@ -198,6 +213,7 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 	ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
 	ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
 	ctx = context.WithValue(ctx, ctxKeySessionID, sid)
+	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
 	return ctx, nil
 }
 
@@ -216,6 +232,32 @@ func callerRealm(ctx context.Context) string {
 		return v
 	}
 	return "local"
+}
+
+func callerAuthMethod(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKeyAuthMethod).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func callerMTLSCommonName(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKeyMTLSCommonName).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func peerCommonName(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.AuthInfo == nil {
+		return ""
+	}
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok || len(tlsInfo.State.PeerCertificates) == 0 {
+		return ""
+	}
+	return tlsInfo.State.PeerCertificates[0].Subject.CommonName
 }
 
 // RequireRole returns an error if the caller's role is insufficient.

@@ -189,6 +189,26 @@ func (c *Cluster) SelfClient(n *Node) pb.LiteVirtClient {
 	return pb.NewLiteVirtClient(n.selfConn)
 }
 
+// PeerClient returns a gRPC client dialed at target while presenting source's
+// host certificate. Use this for node-to-node RPC tests whose request sender
+// must match the mTLS peer identity.
+func (c *Cluster) PeerClient(source, target *Node) pb.LiteVirtClient {
+	c.t.Helper()
+	tlsCfg, err := pki.PeerTLSConfig(source.PKIDir)
+	if err != nil {
+		c.t.Fatalf("peer client TLS for %s: %v", source.Name, err)
+	}
+	cc, err := grpc.NewClient(
+		fmt.Sprintf("%s:%d", target.Address, target.Port),
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+	)
+	if err != nil {
+		c.t.Fatalf("dial %s from %s: %v", target.Name, source.Name, err)
+	}
+	c.t.Cleanup(func() { _ = cc.Close() })
+	return pb.NewLiteVirtClient(cc)
+}
+
 // bearerClient dials node n's gRPC server with a bearer-token
 // unary/stream interceptor so scoped-token scenarios can exercise
 // the permission engine end-to-end.

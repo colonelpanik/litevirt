@@ -95,6 +95,9 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	if req.Sender == "" {
 		return nil, status.Error(codes.InvalidArgument, "sender required")
 	}
+	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
+		return nil, err
+	}
 
 	// Schema-version skew check, keyed off DB-APPLIED schema (the columns each
 	// DB actually has), not the binary const. Both sides advertise/compare their
@@ -150,6 +153,9 @@ func (s *Server) AckMutations(ctx context.Context, req *pb.AckRequest) (*emptypb
 	if req.Sender == "" {
 		return nil, status.Error(codes.InvalidArgument, "sender required")
 	}
+	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	db := s.db.DB()
@@ -167,4 +173,19 @@ func (s *Server) AckMutations(ctx context.Context, req *pb.AckRequest) (*emptypb
 
 	slog.Debug("ackMutations", "sender", req.Sender, "acked_seq", req.AckedSeq)
 	return &emptypb.Empty{}, nil
+}
+
+func requireReplicationPeer(ctx context.Context, sender string) error {
+	if callerAuthMethod(ctx) != authMethodMTLS {
+		return status.Error(codes.PermissionDenied, "replication RPC requires peer mTLS")
+	}
+	cn := callerMTLSCommonName(ctx)
+	if cn == "" {
+		return status.Error(codes.PermissionDenied, "replication RPC requires a peer certificate common name")
+	}
+	if cn != sender {
+		return status.Errorf(codes.PermissionDenied,
+			"replication sender %q does not match peer certificate %q", sender, cn)
+	}
+	return nil
 }

@@ -113,6 +113,75 @@ func extractPKFromInsert(s Statement, pkCols []string) []interface{} {
 	return result
 }
 
+func extractUpdatedAtValue(s Statement) (string, bool) {
+	if isInsertStatement(s.SQL) {
+		return extractColumnValueFromInsert(s, "updated_at")
+	}
+	if isUpdateStatement(s.SQL) {
+		return extractColumnValueFromUpdateSet(s, "updated_at")
+	}
+	return "", false
+}
+
+func extractColumnValueFromInsert(s Statement, want string) (string, bool) {
+	sql := s.SQL
+	openParen := strings.Index(sql, "(")
+	if openParen < 0 {
+		return "", false
+	}
+	closeParen := strings.Index(sql[openParen:], ")")
+	if closeParen < 0 {
+		return "", false
+	}
+	colStr := sql[openParen+1 : openParen+closeParen]
+	cols := strings.Split(colStr, ",")
+	for i, col := range cols {
+		if strings.EqualFold(cleanColumnName(col), want) && i < len(s.Params) {
+			return coerceString(s.Params[i]), true
+		}
+	}
+	return "", false
+}
+
+func extractColumnValueFromUpdateSet(s Statement, want string) (string, bool) {
+	upper := strings.ToUpper(s.SQL)
+	setIdx := strings.Index(upper, " SET ")
+	if setIdx < 0 {
+		return "", false
+	}
+	setStart := setIdx + len(" SET ")
+	whereIdx := strings.LastIndex(upper, " WHERE ")
+	if whereIdx < 0 || whereIdx < setStart {
+		whereIdx = len(s.SQL)
+	}
+
+	paramIdx := 0
+	for _, assignment := range strings.Split(s.SQL[setStart:whereIdx], ",") {
+		parts := strings.SplitN(assignment, "=", 2)
+		if len(parts) != 2 {
+			paramIdx += strings.Count(assignment, "?")
+			continue
+		}
+		valuePlaceholders := strings.Count(parts[1], "?")
+		if strings.EqualFold(cleanColumnName(parts[0]), want) && valuePlaceholders > 0 {
+			if paramIdx < len(s.Params) {
+				return coerceString(s.Params[paramIdx]), true
+			}
+			return "", false
+		}
+		paramIdx += valuePlaceholders
+	}
+	return "", false
+}
+
+func cleanColumnName(s string) string {
+	s = strings.TrimSpace(s)
+	if dot := strings.LastIndex(s, "."); dot >= 0 {
+		s = s[dot+1:]
+	}
+	return strings.Trim(strings.TrimSpace(s), "`\"[]")
+}
+
 // extractPKFromUpdate extracts PK values from an UPDATE... WHERE pk1 = ? AND pk2 = ?
 // The PK params are typically the last N params in an UPDATE statement.
 func extractPKFromUpdate(s Statement, pkCols []string) []interface{} {

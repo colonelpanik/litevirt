@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/hlc"
@@ -454,26 +455,55 @@ func (c *Client) StateDigest(ctx context.Context) ([]TableDigest, error) {
 
 	var digests []TableDigest
 	for _, table := range tableNames {
-		var count int
-		err := c.db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM "+table).Scan(&count)
+		// Content digest: hash the table's row VALUES (the declared columns —
+		// SELECT * never returns the rowid), sorted so insertion order can't
+		// change the result. The old digest hashed GROUP_CONCAT(rowid), which is
+		// node-local: identical content inserted in a different order (or after
+		// INSERT-OR-REPLACE churn) produced different digests — so anti-entropy
+		// re-synced already-converged peers forever — while two nodes with equal
+		// row counts but contiguous rowids hashed identically regardless of
+		// content, hiding real drift. Hashing content fixes both.
+		rows, err := c.db.QueryContext(ctx, "SELECT * FROM "+table)
 		if err != nil {
+			continue // table may not exist yet
+		}
+		cols, err := rows.Columns()
+		if err != nil {
+			rows.Close()
 			continue
 		}
-
-		// Deterministic hash of rowids for cheap comparison.
-		var concat *string
-		_ = c.db.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT GROUP_CONCAT(rowid, ',') FROM (SELECT rowid FROM %s ORDER BY rowid)", table)).Scan(&concat)
+		var rowKeys []string
+		for rows.Next() {
+			vals := make([]interface{}, len(cols))
+			ptrs := make([]interface{}, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				continue
+			}
+			var sb strings.Builder
+			for _, v := range vals {
+				if v == nil {
+					sb.WriteByte(0x00) // distinguish NULL from an empty string
+				} else {
+					sb.WriteString(coerceString(v))
+				}
+				sb.WriteByte(0x1f) // unit separator between columns
+			}
+			rowKeys = append(rowKeys, sb.String())
+		}
+		rows.Close()
+		sort.Strings(rowKeys)
 
 		h := sha256.New()
-		if concat != nil {
-			h.Write([]byte(*concat))
+		for _, rk := range rowKeys {
+			h.Write([]byte(rk))
+			h.Write([]byte{0x1e}) // record separator between rows
 		}
-
 		digests = append(digests, TableDigest{
 			Name:  table,
-			Count: count,
+			Count: len(rowKeys),
 			Hash:  fmt.Sprintf("%x", h.Sum(nil))[:16],
 		})
 	}

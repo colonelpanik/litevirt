@@ -7,13 +7,12 @@ import (
 
 // antiEntropyExcluded documents every CRDT-replicated table (one with an entry
 // in tablePrimaryKeys) that is deliberately NOT in tableNames — i.e. not carried
-// by the full-state dump / anti-entropy repair path. Two buckets:
+// by the full-state dump / anti-entropy repair path:
 //
 //   - coordination / local / transient state that MUST NOT be full-state-merged
 //     (merging it would corrupt leases, replication progress, etc.), and
-//   - push-replicated config that anti-entropy does not YET cover — a known gap
-//     (these have PKs and could be added to tableNames in a deliberate follow-up;
-//     today they rely on the push replicator only and are not full-state-repaired).
+//   - a couple of secret stores excluded from the bulk dump (one lacks updated_at
+//     so it isn't LWW-safe; both still replicate via push).
 //
 // TestTableNamesCoverage forces every replicated table into exactly one bucket
 // (tableNames or here) so coverage can't silently drift and tests can't overstate
@@ -30,23 +29,8 @@ var antiEntropyExcluded = map[string]string{
 	"rebalance_proposals":    "transient, leader-gated proposals",
 	"sessions":               "ephemeral auth sessions",
 	"vm_events":              "high-volume append-only event log; best-effort, not full-state-repaired",
-	"recovery_codes":         "single-use 2FA secrets; push-replicated, excluded from the bulk dump",
+	"recovery_codes":         "single-use 2FA secrets (no updated_at → not LWW-safe); push-replicated, excluded from the bulk dump",
 	"user_2fa":               "2FA enrollment secrets; push-replicated, excluded from the bulk dump",
-
-	// Push-replicated config NOT yet covered by anti-entropy (known gap;
-	// deliberate candidates to add to tableNames later).
-	"backup_schedules":     "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"host_pci_devices":     "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"notification_routes":  "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"notification_targets": "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"project_quotas":       "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"projects":             "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"registry_credentials": "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"resource_mappings":    "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"role_bindings":        "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"roles":                "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"service_endpoints":    "push-only; anti-entropy coverage gap (candidate for tableNames)",
-	"storage_pools":        "push-only; anti-entropy coverage gap (candidate for tableNames)",
 }
 
 // TestTableNamesCoverage asserts every CRDT-replicated table is explicitly

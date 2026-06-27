@@ -59,6 +59,13 @@ var tableNames = []string{
 	"fencing_log", "audit_log",
 	"network_vteps", "bgp_peers", "ip_allocations", "security_groups", "sg_rules",
 	"containers",
+	// Cluster-global config — full-state anti-entropy coverage (all LWW-safe:
+	// composite/single PK + updated_at). Previously push-replicated only, so a
+	// node that missed a push (partition/restart) wasn't repaired by anti-entropy.
+	"storage_pools", "backup_schedules", "host_pci_devices",
+	"roles", "role_bindings", "projects", "project_quotas",
+	"notification_targets", "notification_routes",
+	"registry_credentials", "resource_mappings", "service_endpoints",
 }
 
 // dumpState serializes all tables as gzipped JSON for push/pull sync.

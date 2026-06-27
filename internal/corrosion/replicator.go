@@ -7,13 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/hlc"
@@ -525,50 +523,13 @@ func (r *Replicator) setWatermark(ctx context.Context, peerName string, seq int6
 }
 
 func (r *Replicator) peerGRPCClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
-	var addr string
-	var port int
-
-	host, err := GetHost(ctx, r.client, peerName)
+	target, err := resolvePeerTarget(ctx, r.client, peerName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("look up host %q: %w", peerName, err)
+		return nil, nil, err
 	}
-	if host != nil {
-		addr = host.Address
-		port = host.GRPCPort
-	} else {
-		// Host not yet in DB — fall back to gossip memberlist address.
-		// This handles bootstrap when a new node joins and hasn't
-		// received the hosts table via replication yet.
-		for _, m := range r.client.Members() {
-			if m.Name == peerName {
-				host, _, _ := net.SplitHostPort(m.Addr)
-				if host != "" {
-					addr = host
-				} else {
-					addr = m.Addr
-				}
-				break
-			}
-		}
-		if addr == "" {
-			return nil, nil, fmt.Errorf("look up host %q: not found in cluster state or gossip", peerName)
-		}
-		slog.Debug("replicator: using gossip address for peer", "peer", peerName, "addr", addr)
-	}
-	if port == 0 {
-		port = 7443
-	}
-
-	tlsCfg, err := pki.PeerTLSConfig(r.pkiDir)
+	conn, err := pki.PeerDial(r.pkiDir, target)
 	if err != nil {
-		return nil, nil, fmt.Errorf("peer TLS config: %w", err)
-	}
-	conn, err := grpc.NewClient(
-		fmt.Sprintf("%s:%d", addr, port),
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dial host %s: %w", peerName, err)
+		return nil, nil, err
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }

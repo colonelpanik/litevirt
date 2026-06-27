@@ -13,7 +13,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -638,15 +637,7 @@ func (s *Server) recordMigrationMetrics(strategy, result string, duration time.D
 // reattachVFsOnTarget sends AttachDevice RPCs to the target host for each VF
 // that was detached before migration. The target allocates equivalent VFs from its own pool.
 func (s *Server) reattachVFsOnTarget(ctx context.Context, targetHostName, addr string, grpcPort int, vmName string, vfs []corrosion.PCIDeviceRecord) {
-	tlsCfg, err := pki.PeerTLSConfig(s.pkiDir)
-	if err != nil {
-		slog.Warn("reattach VFs: TLS config", "error", err)
-		return
-	}
-	conn, err := grpc.NewClient(
-		fmt.Sprintf("%s:%d", addr, grpcPort),
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-	)
+	conn, err := pki.PeerDial(s.pkiDir, peerTarget(addr, grpcPort))
 	if err != nil {
 		slog.Warn("reattach VFs: dial target", "host", targetHostName, "error", err)
 		return
@@ -1137,15 +1128,7 @@ func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string,
 
 // notifyTargetHostOfVM pings the target daemon so it picks up the migrated VM.
 func (s *Server) notifyTargetHostOfVM(targetHostName, addr string, grpcPort int, vmName string) {
-	tlsCfg, err := pki.PeerTLSConfig(s.pkiDir)
-	if err != nil {
-		slog.Warn("migrate notify: TLS config", "error", err)
-		return
-	}
-	conn, err := grpc.NewClient(
-		fmt.Sprintf("%s:%d", addr, grpcPort),
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-	)
+	conn, err := pki.PeerDial(s.pkiDir, peerTarget(addr, grpcPort))
 	if err != nil {
 		slog.Warn("migrate notify: dial target", "host", targetHostName, "error", err)
 		return

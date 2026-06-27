@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -164,51 +162,17 @@ func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, erro
 }
 
 func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
-	var addr string
-	var port int
-
-	host, err := GetHost(ctx, ae.client, peerName)
+	target, err := resolvePeerTarget(ctx, ae.client, peerName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("look up host %q: %w", peerName, err)
+		return nil, nil, err
 	}
-	if host != nil {
-		addr = host.Address
-		port = host.GRPCPort
-	} else {
-		for _, m := range ae.client.Members() {
-			if m.Name == peerName {
-				host, _, _ := net.SplitHostPort(m.Addr)
-				if host != "" {
-					addr = host
-				} else {
-					addr = m.Addr
-				}
-				break
-			}
-		}
-		if addr == "" {
-			return nil, nil, fmt.Errorf("look up host %q: not found in cluster state or gossip", peerName)
-		}
-		slog.Debug("antientropy: using gossip address for peer", "peer", peerName, "addr", addr)
-	}
-	if port == 0 {
-		port = 7443
-	}
-
-	tlsCfg, err := pki.PeerTLSConfig(ae.pkiDir)
+	// Raise the receive limit so the legacy unary GetStateDump fallback can
+	// pull a large full-state dump from an old peer. StreamStateDump chunks
+	// stay well under the 4 MiB default and don't need this.
+	conn, err := pki.PeerDial(ae.pkiDir, target,
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(antiEntropyMaxMsgSize)))
 	if err != nil {
-		return nil, nil, fmt.Errorf("peer TLS config: %w", err)
-	}
-	conn, err := grpc.NewClient(
-		fmt.Sprintf("%s:%d", addr, port),
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-		// Raise the receive limit so the legacy unary GetStateDump fallback can
-		// pull a large full-state dump from an old peer. StreamStateDump chunks
-		// stay well under the 4 MiB default and don't need this.
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(antiEntropyMaxMsgSize)),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dial: %w", err)
+		return nil, nil, err
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }

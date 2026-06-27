@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"strconv"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
@@ -504,6 +505,15 @@ func (s *Server) vmLogDir() string {
 	return "/var/log/libvirt/qemu"
 }
 
+// peerTarget builds a dialable "host:port" target, defaulting the port to 7443
+// and bracketing IPv6 addresses via net.JoinHostPort.
+func peerTarget(addr string, port int) string {
+	if port == 0 {
+		port = 7443
+	}
+	return net.JoinHostPort(addr, strconv.Itoa(port))
+}
+
 // peerClient creates a gRPC client connection to a remote host's daemon.
 // The caller must close the returned connection when done.
 func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
@@ -519,18 +529,7 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 		// clear reason so console/VNC forwarders can report it to the user.
 		return nil, nil, fmt.Errorf("host %q has no address in cluster state", hostName)
 	}
-	tlsCfg, err := pki.PeerTLSConfig(s.pkiDir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("peer TLS config: %w", err)
-	}
-	port := host.GRPCPort
-	if port == 0 {
-		port = 7443
-	}
-	conn, err := grpc.NewClient(
-		fmt.Sprintf("%s:%d", host.Address, port),
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-	)
+	conn, err := pki.PeerDial(s.pkiDir, peerTarget(host.Address, host.GRPCPort))
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial host %s: %w", hostName, err)
 	}

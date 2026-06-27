@@ -159,8 +159,16 @@ func VerifyTOTP(ctx context.Context, db *corrosion.Client, username, code string
 		if step <= f.LastStep {
 			return false, nil
 		}
-		if err := corrosion.RecordTOTPStep(ctx, db, username, f.Method, f.Label, step); err != nil {
+		recorded, err := corrosion.RecordTOTPStep(ctx, db, username, f.Method, f.Label, f.Secret, step)
+		if err != nil {
 			return false, fmt.Errorf("record totp step: %w", err)
+		}
+		if !recorded {
+			// Lost the replay-ratchet race, or the factor was disabled/re-enrolled
+			// (secret or active epoch changed) between list and mark — do not
+			// authenticate on a zero-row update, and don't fall through to recovery
+			// codes (a replayed/stale TOTP is not a recovery code).
+			return false, nil
 		}
 		return true, nil
 	}
@@ -186,10 +194,16 @@ func verifyRecoveryCode(ctx context.Context, db *corrosion.Client, username, cod
 	}
 	for _, h := range hashes {
 		if bcrypt.CompareHashAndPassword([]byte(h), []byte(normalized)) == nil {
-			if err := corrosion.MarkRecoveryCodeUsed(ctx, db, username, h); err != nil {
+			// Authenticate ONLY if we actually consumed the code. A zero-row
+			// consume means it was used concurrently, or invalidated by a re-enroll
+			// between list and mark — treat as not authenticated (no double-spend,
+			// no accepting a superseded code). No other stored hash matches the same
+			// presented code, so returning here is correct.
+			consumed, err := corrosion.MarkRecoveryCodeUsed(ctx, db, username, h)
+			if err != nil {
 				return false, err
 			}
-			return true, nil
+			return consumed, nil
 		}
 	}
 	return false, nil

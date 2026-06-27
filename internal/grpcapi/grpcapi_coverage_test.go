@@ -747,7 +747,8 @@ func createLBTable(t *testing.T, ctx context.Context, db *corrosion.Client) {
 		ports TEXT NOT NULL DEFAULT '[]',
 		enabled INTEGER NOT NULL DEFAULT 1,
 		updated_at TEXT NOT NULL DEFAULT '',
-		deleted_at TEXT
+		deleted_at TEXT,
+		generation TEXT NOT NULL DEFAULT ''
 	)`)
 	db.Execute(ctx, `DROP TABLE IF EXISTS lb_backends`)
 	db.Execute(ctx, `CREATE TABLE lb_backends (
@@ -759,6 +760,7 @@ func createLBTable(t *testing.T, ctx context.Context, db *corrosion.Client) {
 		enabled    INTEGER NOT NULL DEFAULT 1,
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT,
+		generation TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (lb_name, name)
 	)`)
 }
@@ -1222,6 +1224,12 @@ func TestLBBackends_Standalone(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 	createLBTable(t, ctx, s.db)
+
+	// A live config is required for backends to render (the generation join);
+	// both default to generation '' here, so they match.
+	corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "standalone-lb", VIP: "10.0.100.50", Algorithm: "roundrobin", Enabled: true,
+	})
 
 	// Insert explicit backends (not stack-based).
 	corrosion.UpsertLBBackend(ctx, s.db, corrosion.LBBackendRecord{
@@ -1931,7 +1939,6 @@ func TestListSnapshots_MultipleVMs(t *testing.T) {
 }
 
 // ─── Backup edge cases ──────────────────────────────────────────────────────
-
 
 // ─── Deploy stack dry run ───────────────────────────────────────────────────
 
@@ -3557,7 +3564,6 @@ func TestBuildImage_MissingFields(t *testing.T) {
 		t.Errorf("code = %v, want InvalidArgument", c)
 	}
 }
-
 
 // mockBackupStream methods already declared in backup_test.go
 

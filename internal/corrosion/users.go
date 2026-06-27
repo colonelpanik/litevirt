@@ -98,13 +98,27 @@ func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash s
 	)
 }
 
-// DeleteUser tombstones a user.
+// DeleteUser tombstones a user and CASCADES the tombstone to its 2FA factors,
+// recovery codes, and both active-set pointers — all in one batch sharing a
+// single updated_at, so the whole set converges coherently under LWW. Tombstoning
+// the pointers is what makes the delete resurrection-proof: a factor or code a
+// partitioned peer still holds (one this node never saw, hence couldn't tombstone
+// individually) lands on a now-inactive epoch/set and can never validate.
 func DeleteUser(ctx context.Context, c *Client, username string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
-		nowRFC3339(), now, username,
-	)
+	marker := nowRFC3339()
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: `UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
+			Params: []interface{}{marker, now, username}},
+		{SQL: `UPDATE user_2fa SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
+			Params: []interface{}{marker, now, username}},
+		{SQL: `UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
+			Params: []interface{}{marker, now, username}},
+		{SQL: `UPDATE recovery_codes SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
+			Params: []interface{}{marker, now, username}},
+		{SQL: `UPDATE recovery_code_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
+			Params: []interface{}{marker, now, username}},
+	})
 }
 
 // InsertToken stores a new API token. scope_paths, when non-empty, is

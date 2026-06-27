@@ -108,12 +108,17 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   dump**. `lv cluster sync` and `GetStateDump` do not export registry passwords,
   notification webhook URLs, or 2FA material.
 - Eligible secret-bearing config (`registry_credentials`,
-  `notification_targets`, `notification_routes`) is repaired by a separate
-  peer-mTLS-only anti-entropy lane. Peers already receive these rows through WAL
-  replication; the peer-only pull is a repair path when a push was missed.
-- 2FA tables are still push-only: `user_2fa` needs tombstone delete semantics,
-  and `recovery_codes` need set/generation semantics before either can be safely
-  full-state repaired. If those diverge, re-enroll/regenerate on a healthy host.
+  `notification_targets`, `notification_routes`, `user_2fa`, `user_2fa_sets`,
+  `recovery_codes`, `recovery_code_sets`) is repaired by a separate peer-mTLS-only
+  anti-entropy lane. Peers already receive these rows through WAL replication; the
+  peer-only pull is a repair path when a push was missed.
+- 2FA/recovery are LWW-repairable: `user_2fa` soft-deletes, and each of 2FA and
+  recovery codes is gated by a per-user active-set pointer (`user_2fa_sets`,
+  `recovery_code_sets`). A factor/code is valid only when its epoch/set_id matches
+  the pointer, so a row a partitioned peer resurrects (one a node never saw) can
+  merge but never validate, and `DeleteUser` tombstones the pointers so a
+  delete→recreate can't bring old auth state back. Safety holds once all
+  auth-mutating nodes run ≥ schema v32.
 
 ### Disk-full is not auto-recovered
 - The Corrosion store is a SQLite file. If the disk fills, the daemon stops

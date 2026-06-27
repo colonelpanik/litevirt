@@ -7,6 +7,8 @@ package corrosion
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 )
@@ -285,24 +287,74 @@ type User2FARecord struct {
 	LastStep   int64 // highest consumed TOTP time-step (replay guard); 0 = none yet
 }
 
-// InsertUser2FA records an enrolled factor.
-func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(username, method, label) DO UPDATE
-		   SET secret = excluded.secret, updated_at = excluded.updated_at`,
-		r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now)
+// activeUser2FAEpoch returns the user's current active-factor epoch and whether a
+// live pointer exists. exists=false means no live pointer (never enrolled, or
+// tombstoned by DeleteUser) — the caller then mints a fresh epoch so a factor a
+// peer resurrects under an old epoch can't validate.
+func activeUser2FAEpoch(ctx context.Context, c *Client, username string) (string, bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT active_epoch FROM user_2fa_sets WHERE username = ? AND deleted_at IS NULL`, username)
+	if err != nil {
+		return "", false, err
+	}
+	if len(rows) == 0 {
+		return "", false, nil
+	}
+	return rows[0].String("active_epoch"), true, nil
 }
 
-// ListUser2FA returns the user's enrolled factors. Empty slice = no 2FA.
+// InsertUser2FA records an enrolled factor under the user's active-factor set.
+// It reuses the live epoch when one exists (so accumulating factors all stay
+// valid) and mints a fresh epoch + pointer otherwise — including after a
+// DeleteUser tombstoned the pointer, so a factor a partitioned peer resurrects
+// (one this node never saw, hence could not tombstone) lands on a stale epoch
+// and never validates. Re-enrolling a previously soft-deleted (username, method,
+// label) also reactivates it: deleted_at cleared, replay ratchet reset. label is
+// a Go string (never NULL), so the composite PK never carries a NULL.
+func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
+	epoch, exists, err := activeUser2FAEpoch(ctx, c, r.Username)
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()
+	stmts := make([]Statement, 0, 2)
+	if !exists {
+		epoch, err = randomSetID()
+		if err != nil {
+			return err
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT INTO user_2fa_sets (username, active_epoch, updated_at)
+				 VALUES (?, ?, ?)
+				 ON CONFLICT(username) DO UPDATE SET
+				   active_epoch = excluded.active_epoch,
+				   updated_at = excluded.updated_at,
+				   deleted_at = NULL`,
+			Params: []interface{}{r.Username, epoch, now},
+		})
+	}
+	stmts = append(stmts, Statement{
+		SQL: `INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at, epoch)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(username, method, label) DO UPDATE
+			   SET secret = excluded.secret, updated_at = excluded.updated_at,
+			       deleted_at = NULL, last_step = 0, epoch = excluded.epoch`,
+		Params: []interface{}{r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now, epoch},
+	})
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+// ListUser2FA returns the user's enrolled (non-deleted) factors in the CURRENT
+// active set. The epoch join means a factor a peer resurrected under a stale
+// epoch (e.g. after delete→recreate) never appears. Empty slice = no 2FA.
 func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FARecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT username, method, secret, COALESCE(label, '') AS label,
 		        enrolled_at, COALESCE(last_used_at, '') AS last_used_at,
 		        COALESCE(last_step, 0) AS last_step
-		 FROM user_2fa WHERE username = ?`, username)
+		 FROM user_2fa WHERE username = ? AND deleted_at IS NULL
+		   AND epoch = (SELECT active_epoch FROM user_2fa_sets
+		                WHERE username = ? AND deleted_at IS NULL)`, username, username)
 	if err != nil {
 		return nil, err
 	}
@@ -318,64 +370,152 @@ func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FAReco
 	return out, nil
 }
 
-// TouchUser2FA bumps last_used_at after a successful verification.
-func TouchUser2FA(ctx context.Context, c *Client, username, method, label string) error {
+// TouchUser2FA bumps last_used_at on a SPECIFIC live factor in the active set and
+// reports whether it actually touched a row. It returns false when the factor was
+// disabled (tombstoned) or its set deactivated (active epoch changed) since the
+// caller loaded it — so a credential-based assertion (WebAuthn) validated against
+// a stale loaded copy can be rejected at consume time, the same zero-row guard as
+// RecordTOTPStep / MarkRecoveryCodeUsed. Scoped by (username, method, label) so it
+// confirms exactly the asserted credential.
+func TouchUser2FA(ctx context.Context, c *Client, username, method, label string) (bool, error) {
 	now := c.NowTS()
-	return c.Execute(ctx,
+	n, err := c.ExecuteRows(ctx,
 		`UPDATE user_2fa SET last_used_at = ?, updated_at = ?
-		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
-		nowRFC3339(), now, username, method, label)
+		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND deleted_at IS NULL
+		   AND epoch = (SELECT active_epoch FROM user_2fa_sets
+		                WHERE username = ? AND deleted_at IS NULL)`,
+		nowRFC3339(), now, username, method, label, username)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // RecordTOTPStep ratchets last_step forward (and bumps last_used_at) after a
-// successful TOTP verification. The `last_step < ?` guard means a concurrent
-// double-submit of the same code on this node can't move the ratchet twice,
-// and replicates the new high-water step to peers so the same code can't be
-// replayed on a different node either. The caller still performs a Go-level
-// `step <= LastStep` pre-check; this is the persistence + concurrency backstop.
-func RecordTOTPStep(ctx context.Context, c *Client, username, method, label string, step int64) error {
+// successful TOTP verification, and reports whether it actually did. It returns
+// true ONLY when the guarded UPDATE changed a row: the step must advance the
+// ratchet (`last_step < ?`), the factor must still be live, in the active set
+// (epoch match), and carry the SAME secret the caller verified against. So a
+// concurrent double-submit of the same step, or a disable/re-enroll landing
+// between list-and-mark (secret or epoch changed), changes zero rows and returns
+// false — the caller must NOT authenticate on a false. The ratchet replicates
+// the new high-water step so the code can't be replayed on another node either.
+func RecordTOTPStep(ctx context.Context, c *Client, username, method, label, secret string, step int64) (bool, error) {
 	now := c.NowTS()
-	return c.Execute(ctx,
+	n, err := c.ExecuteRows(ctx,
 		`UPDATE user_2fa SET last_step = ?, last_used_at = ?, updated_at = ?
-		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND last_step < ?`,
-		step, nowRFC3339(), now, username, method, label, step)
+		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND secret = ?
+		   AND last_step < ? AND deleted_at IS NULL
+		   AND epoch = (SELECT active_epoch FROM user_2fa_sets
+		                WHERE username = ? AND deleted_at IS NULL)`,
+		step, nowRFC3339(), now, username, method, label, secret, step, username)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
-// DeleteUser2FA un-enrolls a single factor.
+// DeleteUser2FA un-enrolls a single factor. It SOFT-deletes (sets deleted_at +
+// bumps updated_at) rather than hard-deleting: anti-entropy is a union merge that
+// can't propagate a hard delete, so a peer that missed it would resurrect the
+// factor. The newer updated_at carries the tombstone under the sensitive lane.
+//
+// If that was the LAST live factor in the active set, it also tombstones the
+// user_2fa_sets pointer in the same batch — otherwise the epoch stays live and a
+// peer's unseen factor under it would silently re-enable 2FA (the API treats
+// "no factors" as "no 2FA"). A later enroll mints a fresh epoch.
 func DeleteUser2FA(ctx context.Context, c *Client, username, method, label string) error {
-	return c.Execute(ctx,
-		`DELETE FROM user_2fa WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
-		username, method, label)
+	now := c.NowTS()
+	marker := nowRFC3339()
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: `UPDATE user_2fa SET deleted_at = ?, updated_at = ?
+			 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
+			Params: []interface{}{marker, now, username, method, label}},
+		{SQL: `UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ?
+			 WHERE username = ? AND deleted_at IS NULL
+			   AND NOT EXISTS (SELECT 1 FROM user_2fa f
+			                   WHERE f.username = user_2fa_sets.username
+			                     AND f.deleted_at IS NULL
+			                     AND f.epoch = user_2fa_sets.active_epoch)`,
+			Params: []interface{}{marker, now, username}},
+	})
 }
 
 // ────────────────────────────── RECOVERY CODES ──────────────────────────────
 
-// InsertRecoveryCodes stores N bcrypt-hashed single-use codes.
+// randomSetID mints an opaque 16-byte hex token naming a recovery-code
+// enrollment set. It is an identity match only (no ordering), so per-node clock
+// skew is irrelevant — unlike a numeric/MAX generation, which NowTS()'s per-node
+// (not cluster) monotonicity would make unsafe for selecting the active set.
+func randomSetID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("recovery set id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// InsertRecoveryCodes stores N bcrypt-hashed single-use codes as a new
+// enrollment set and points the user at it. Validity comes from the active-set
+// pointer (recovery_code_sets), NOT from deletion: a code is accepted only when
+// its set_id equals the pointer's active_set_id, so a stale old-set code a peer
+// resurrects can never validate even if its tombstone was missed. One atomic
+// batch (a single NowTS for the LWW keys):
+//
+//	(a) LWW-upsert the pointer to a freshly-minted random set_id;
+//	(b) best-effort soft-delete locally-known old unused codes (cleanup only —
+//	    validity already comes from the pointer);
+//	(c) insert the new set's codes carrying that set_id.
 func InsertRecoveryCodes(ctx context.Context, c *Client, username string, codeHashes []string) error {
-	now := nowRFC3339() // recovery_codes.created_at — bare marker (no updated_at on this table)
-	stmts := make([]Statement, 0, len(codeHashes)+1)
-	// Wipe any prior unused codes — re-enrollment invalidates old ones.
+	setID, err := randomSetID()
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()       // LWW key for the pointer + code rows
+	marker := nowRFC3339() // bare created_at/deleted_at markers (non-LWW)
+	stmts := make([]Statement, 0, len(codeHashes)+2)
+	// (a) Point the user at the new set (LWW on updated_at).
 	stmts = append(stmts, Statement{
-		SQL:    `DELETE FROM recovery_codes WHERE username = ? AND used_at IS NULL`,
-		Params: []interface{}{username},
+		SQL: `INSERT INTO recovery_code_sets (username, active_set_id, updated_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(username) DO UPDATE SET
+			   active_set_id = excluded.active_set_id,
+			   updated_at = excluded.updated_at,
+			   deleted_at = NULL`,
+		Params: []interface{}{username, setID, now},
 	})
+	// (b) Cleanup: soft-delete this node's old unused codes from prior sets.
+	stmts = append(stmts, Statement{
+		SQL: `UPDATE recovery_codes SET deleted_at = ?, updated_at = ?
+			 WHERE username = ? AND used_at IS NULL AND set_id != ?`,
+		Params: []interface{}{marker, now, username, setID},
+	})
+	// (c) Insert the new codes. ON CONFLICT re-homes a recurring hash into the new
+	//     set (bcrypt salting makes recurrence practically impossible; defensive).
 	for _, h := range codeHashes {
 		stmts = append(stmts, Statement{
-			SQL: `INSERT INTO recovery_codes (username, code_hash, created_at)
-			 VALUES (?, ?, ?)
-			 ON CONFLICT(username, code_hash) DO NOTHING`,
-			Params: []interface{}{username, h, now},
+			SQL: `INSERT INTO recovery_codes (username, code_hash, created_at, set_id, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(username, code_hash) DO UPDATE SET
+			   set_id = excluded.set_id, used_at = NULL,
+			   deleted_at = NULL, updated_at = excluded.updated_at`,
+			Params: []interface{}{username, h, marker, setID, now},
 		})
 	}
 	return c.ExecuteBatch(ctx, stmts)
 }
 
-// ListUnusedRecoveryCodes returns the bcrypt hashes the verifier should
-// try against a presented code.
+// ListUnusedRecoveryCodes returns the bcrypt hashes the verifier should try
+// against a presented code: unused, not tombstoned, and belonging to the user's
+// CURRENT active set. An old-set code (a resurrected peer row) is excluded even
+// if its tombstone was missed, because its set_id no longer matches the pointer.
 func ListUnusedRecoveryCodes(ctx context.Context, c *Client, username string) ([]string, error) {
 	rows, err := c.Query(ctx,
-		`SELECT code_hash FROM recovery_codes WHERE username = ? AND used_at IS NULL`,
-		username)
+		`SELECT code_hash FROM recovery_codes
+		 WHERE username = ? AND used_at IS NULL AND deleted_at IS NULL
+		   AND set_id = (SELECT active_set_id FROM recovery_code_sets
+		                 WHERE username = ? AND deleted_at IS NULL)`,
+		username, username)
 	if err != nil {
 		return nil, err
 	}
@@ -386,9 +526,23 @@ func ListUnusedRecoveryCodes(ctx context.Context, c *Client, username string) ([
 	return out, nil
 }
 
-// MarkRecoveryCodeUsed sets used_at on a hash so it can't be reused.
-func MarkRecoveryCodeUsed(ctx context.Context, c *Client, username, codeHash string) error {
-	return c.Execute(ctx,
-		`UPDATE recovery_codes SET used_at = ? WHERE username = ? AND code_hash = ?`,
-		nowRFC3339(), username, codeHash) // bare marker (no updated_at on this table)
+// MarkRecoveryCodeUsed atomically consumes a single-use recovery code and
+// reports whether it actually did. It returns true ONLY when the guarded UPDATE
+// changed a row: the code must still be unused, not tombstoned, and in the user's
+// CURRENT active set. So a concurrent second use (used_at already set) or a
+// re-enroll landing between list-and-mark (set_id no longer active) consumes
+// nothing and returns false — the caller must NOT authenticate on a false. The
+// updated_at bump lets "used" beat a peer's stale "unused" under LWW.
+func MarkRecoveryCodeUsed(ctx context.Context, c *Client, username, codeHash string) (bool, error) {
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE recovery_codes SET used_at = ?, updated_at = ?
+		 WHERE username = ? AND code_hash = ? AND used_at IS NULL AND deleted_at IS NULL
+		   AND set_id = (SELECT active_set_id FROM recovery_code_sets
+		                 WHERE username = ? AND deleted_at IS NULL)`,
+		nowRFC3339(), now, username, codeHash, username)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }

@@ -94,6 +94,13 @@ var sensitiveTableNames = []string{
 	"registry_credentials",
 	"notification_targets",
 	"notification_routes",
+	// 2FA/recovery: secret-bearing and now LWW-repairable (schema v32 —
+	// soft-delete + per-user active-set pointers). Each factor/code table travels
+	// with its pointer so the pointer self-heals alongside the secrets.
+	"user_2fa",
+	"user_2fa_sets",
+	"recovery_codes",
+	"recovery_code_sets",
 }
 
 func tableSet(tables []string) map[string]bool {

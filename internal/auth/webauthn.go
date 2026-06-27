@@ -159,14 +159,22 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, username string, asse
 	if err != nil {
 		return fmt.Errorf("parse assertion: %w", err)
 	}
-	if _, err := s.engine.ValidateLogin(user, *sess, parsed); err != nil {
+	cred, err := s.engine.ValidateLogin(user, *sess, parsed)
+	if err != nil {
 		return fmt.Errorf("validate assertion: %w", err)
 	}
-	// Touch every WebAuthn factor on the user — we don't have a
-	// per-credential pointer back to the row, but the security
-	// invariant is "this user authenticated", which is enough.
-	for _, c := range user.creds {
-		_ = corrosion.TouchUser2FA(ctx, s.db, username, "webauthn", credLabel(c.ID))
+	// Confirm-and-consume the SPECIFIC asserted credential, scoped to the active
+	// set. ValidateLogin runs against the credentials loaded at the top of this
+	// call; if that credential was disabled (tombstoned) or its 2FA set
+	// deactivated (active epoch changed — e.g. a delete→re-enroll) in the
+	// meantime, the gated touch changes zero rows and we reject the login rather
+	// than authenticate against a stale credential.
+	touched, err := corrosion.TouchUser2FA(ctx, s.db, username, "webauthn", credLabel(cred.ID))
+	if err != nil {
+		return fmt.Errorf("confirm credential: %w", err)
+	}
+	if !touched {
+		return errors.New("authenticating credential is no longer active")
 	}
 	return nil
 }

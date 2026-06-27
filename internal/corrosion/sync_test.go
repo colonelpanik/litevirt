@@ -42,7 +42,7 @@ func TestDumpAndMergeState(t *testing.T) {
 	// Create a destination client and merge
 	dst := testClient(t)
 
-	dst.mergeState(data)
+	dst.MergeStateBytesLWW(data)
 
 	// Verify data was merged
 	host, err := GetHost(ctx, dst, "node1")
@@ -83,8 +83,8 @@ func TestMergeState_EmptyPayload(t *testing.T) {
 	c := testClient(t)
 
 	// Should not panic with empty buffer
-	c.mergeState(nil)
-	c.mergeState([]byte{})
+	c.MergeStateBytesLWW(nil)
+	c.MergeStateBytesLWW([]byte{})
 }
 
 func TestDumpState_WithMultipleTables(t *testing.T) {
@@ -120,7 +120,7 @@ func TestDumpState_WithMultipleTables(t *testing.T) {
 
 	// Merge into a new client and verify all data is present
 	dst := testClient(t)
-	dst.mergeState(data)
+	dst.MergeStateBytesLWW(data)
 
 	hosts, _ := ListHosts(ctx, dst)
 	if len(hosts) != 2 {
@@ -152,7 +152,7 @@ func TestMergeState_InvalidGzip(t *testing.T) {
 	c := testClient(t)
 
 	// Should not panic with invalid gzip data
-	c.mergeState([]byte("not gzipped data"))
+	c.MergeStateBytesLWW([]byte("not gzipped data"))
 }
 
 func TestDumpState_RoundTrip(t *testing.T) {
@@ -166,7 +166,7 @@ func TestDumpState_RoundTrip(t *testing.T) {
 
 	// Dump, then merge back into the same client (idempotent)
 	data := c.dumpState()
-	c.mergeState(data)
+	c.MergeStateBytesLWW(data)
 
 	hosts, _ := ListHosts(ctx, c)
 	if len(hosts) != 1 {

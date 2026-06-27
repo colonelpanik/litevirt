@@ -119,6 +119,11 @@ type Server struct {
 	// replicator handles WAL-based state replication to peers.
 	replicator *corrosion.Replicator
 
+	// fetchBinarySem bounds concurrent FetchBinary streams this node serves, so a
+	// fleet-wide version flip can't make one source a thundering-herd target.
+	// nil → unbounded (defensive; constructors initialize it).
+	fetchBinarySem chan struct{}
+
 	// authEngine is the path-based RBAC engine. transitional:
 	// when nil OR when no role-bindings exist for the caller, RequirePerm
 	// falls back to the legacy admin/operator/viewer roleLevel comparison.
@@ -261,17 +266,18 @@ type StoragePoolRef struct {
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
 	return &Server{
-		hostName:      hostName,
-		dataDir:       dataDir,
-		pkiDir:        pkiDir,
-		db:            db,
-		virt:          virt,
-		images:        images,
-		events:        events.NewBus(),
-		vmLocks:       make(map[string]*sync.Mutex),
-		loginThrottle: newLoginThrottle(),
-		ReExecCh:      make(chan struct{}, 1),
-		ShutdownCh:    make(chan struct{}, 1),
+		hostName:       hostName,
+		dataDir:        dataDir,
+		pkiDir:         pkiDir,
+		db:             db,
+		virt:           virt,
+		images:         images,
+		events:         events.NewBus(),
+		vmLocks:        make(map[string]*sync.Mutex),
+		loginThrottle:  newLoginThrottle(),
+		ReExecCh:       make(chan struct{}, 1),
+		ShutdownCh:     make(chan struct{}, 1),
+		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 	}
 }
 

@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"time"
 )
 
 // pciSelectCols is the common column list for PCI device queries.
@@ -46,7 +45,7 @@ func UpsertPCIDevice(ctx context.Context, c *Client, d PCIDeviceRecord) error {
 		d.HostName, d.Address, d.VendorID, d.DeviceID, d.VendorName, d.DeviceName,
 		d.Type, d.IOMMUGroup, d.SRIOVCapable, d.SRIOVVFsTotal, d.SRIOVVFsFree,
 		d.Driver, d.VMName, d.NUMANode, d.PCIeRootPort, d.PCIeBridge, d.LinkClique,
-		d.LinkPeers, time.Now().UTC().Format(time.RFC3339))
+		d.LinkPeers, c.NowTS())
 }
 
 func scanPCIDevice(r Row) PCIDeviceRecord {
@@ -99,7 +98,7 @@ func AssignPCIDevice(ctx context.Context, c *Client, hostName, address, vmName s
 	return c.Execute(ctx,
 		`UPDATE host_pci_devices SET vm_name = ?, updated_at = ?
 		 WHERE host_name = ? AND address = ?`,
-		vmName, time.Now().UTC().Format(time.RFC3339), hostName, address)
+		vmName, c.NowTS(), hostName, address)
 }
 
 // ReleasePCIDevicesByVM clears all device assignments for a given VM.
@@ -107,7 +106,7 @@ func ReleasePCIDevicesByVM(ctx context.Context, c *Client, vmName string) error 
 	return c.Execute(ctx,
 		`UPDATE host_pci_devices SET vm_name = NULL, updated_at = ?
 		 WHERE vm_name = ?`,
-		time.Now().UTC().Format(time.RFC3339), vmName)
+		c.NowTS(), vmName)
 }
 
 // ReleasePCIDevice clears the VM assignment for a single PCI device.
@@ -115,12 +114,12 @@ func ReleasePCIDevice(ctx context.Context, c *Client, hostName, address string) 
 	return c.Execute(ctx,
 		`UPDATE host_pci_devices SET vm_name = NULL, updated_at = ?
 		 WHERE host_name = ? AND address = ?`,
-		time.Now().UTC().Format(time.RFC3339), hostName, address)
+		c.NowTS(), hostName, address)
 }
 
 // SoftDeletePCIDevice marks a device as deleted (disappeared from host).
 func SoftDeletePCIDevice(ctx context.Context, c *Client, hostName, address string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE host_pci_devices SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND address = ?`,

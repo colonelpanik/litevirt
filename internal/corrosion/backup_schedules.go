@@ -72,7 +72,7 @@ func ScheduleKey(scope, vmName, poolName, projectName string) string {
 // an empty vm_name + non-empty pool_name maps to a single pool row
 // per repo.
 func UpsertBackupSchedule(ctx context.Context, c *Client, s BackupScheduleRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	scope := s.Scope
 	if scope == "" {
 		scope = "vm"
@@ -229,7 +229,7 @@ func VMsInProject(ctx context.Context, c *Client, hostName, project string) ([]s
 
 // DeleteBackupSchedule marks the (vm_name, repo) schedule deleted.
 func DeleteBackupSchedule(ctx context.Context, c *Client, vmName, repo string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE backup_schedules
 		 SET deleted_at = ?, updated_at = ?
@@ -242,12 +242,12 @@ func DeleteBackupSchedule(ctx context.Context, c *Client, vmName, repo string) e
 // callers driving virtual time pass their injected clock here so the
 // "already ran this minute" guard in the scheduler is reproducible.
 func MarkBackupScheduleRun(ctx context.Context, c *Client, vmName, repo, runErr string, runAt time.Time) error {
-	ts := runAt.UTC().Format(time.RFC3339)
+	ts := runAt.UTC().Format(time.RFC3339) // last_run_at = the actual run time
 	return c.Execute(ctx,
 		`UPDATE backup_schedules
 		 SET last_run_at = ?, last_run_err = ?, updated_at = ?
 		 WHERE vm_name = ? AND repo = ?`,
-		ts, runErr, ts, vmName, repo)
+		ts, runErr, c.NowTS(), vmName, repo)
 }
 
 // SetReplicationCheckpoint advances the per-schedule dirty-bitmap chain anchor
@@ -259,7 +259,7 @@ func MarkBackupScheduleRun(ctx context.Context, c *Client, vmName, repo, runErr 
 // fan-out scopes — writing there missed every fanned-out VM). An empty
 // checkpoint resets the chain. Upsert so per-VM and fan-out both persist.
 func SetReplicationCheckpoint(ctx context.Context, c *Client, vmName, repo, checkpoint string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	if checkpoint == "" {
 		// Reset: tombstone the row so the next run re-bases (parent = "").
 		return c.Execute(ctx,

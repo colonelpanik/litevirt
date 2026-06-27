@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // ServiceEndpoint is one (service_name, ip, region) triple. The DNS
@@ -29,7 +28,7 @@ func UpsertServiceEndpoint(ctx context.Context, c *Client, e ServiceEndpoint) er
 	if e.Weight <= 0 {
 		e.Weight = 1
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO service_endpoints (service_name, ip, region, weight, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, NULL)
@@ -38,7 +37,7 @@ func UpsertServiceEndpoint(ctx context.Context, c *Client, e ServiceEndpoint) er
 		   weight     = excluded.weight,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		e.ServiceName, e.IP, e.Region, e.Weight, now, now)
+		e.ServiceName, e.IP, e.Region, e.Weight, nowRFC3339(), now)
 }
 
 // ListServiceEndpoints returns all non-deleted endpoints. If serviceName
@@ -75,9 +74,9 @@ func ListServiceEndpoints(ctx context.Context, c *Client, serviceName string) ([
 
 // DeleteServiceEndpoint soft-deletes a (service_name, ip) row.
 func DeleteServiceEndpoint(ctx context.Context, c *Client, serviceName, ip string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE service_endpoints SET deleted_at = ?, updated_at = ?
 		 WHERE service_name = ? AND ip = ?`,
-		now, now, serviceName, ip)
+		nowRFC3339(), now, serviceName, ip)
 }

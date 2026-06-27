@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // FirewallRule is a cluster- or host-tier firewall rule — the two policy
@@ -67,11 +66,11 @@ func InsertIPSet(ctx context.Context, c *Client, s IPSet) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
-		s.ID, s.Name, cidrs, s.StackName, now, now,
+		s.ID, s.Name, cidrs, s.StackName, nowRFC3339(), now,
 	)
 }
 
@@ -98,9 +97,9 @@ func ListIPSets(ctx context.Context, c *Client) ([]IPSet, error) {
 
 // DeleteIPSet tombstones an ip set by id.
 func DeleteIPSet(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
-		`UPDATE ip_sets SET deleted_at = ?, updated_at = ? WHERE id = ?`, now, now, id)
+		`UPDATE ip_sets SET deleted_at = ?, updated_at = ? WHERE id = ?`, nowRFC3339(), now, id)
 }
 
 // ── Cluster-tier rules ─────────────────────────────────────────────────────
@@ -110,12 +109,12 @@ func InsertClusterFirewallRule(ctx context.Context, c *Client, r FirewallRule) e
 	if err := normRule(&r); err != nil {
 		return err
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO cluster_firewall_rules
 		   (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Priority, r.Comment, r.StackName, now, now,
+		r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Priority, r.Comment, r.StackName, nowRFC3339(), now,
 	)
 }
 
@@ -133,9 +132,9 @@ func ListClusterFirewallRules(ctx context.Context, c *Client) ([]FirewallRule, e
 
 // DeleteClusterFirewallRule tombstones a cluster-tier rule by id.
 func DeleteClusterFirewallRule(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
-		`UPDATE cluster_firewall_rules SET deleted_at = ?, updated_at = ? WHERE id = ?`, now, now, id)
+		`UPDATE cluster_firewall_rules SET deleted_at = ?, updated_at = ? WHERE id = ?`, nowRFC3339(), now, id)
 }
 
 // ── Host-tier rules ─────────────────────────────────────────────────────────
@@ -148,12 +147,12 @@ func InsertHostFirewallRule(ctx context.Context, c *Client, r FirewallRule) erro
 	if err := normRule(&r); err != nil {
 		return err
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO host_firewall_rules
 		   (id, host_name, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.HostName, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Priority, r.Comment, r.StackName, now, now,
+		r.ID, r.HostName, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Priority, r.Comment, r.StackName, nowRFC3339(), now,
 	)
 }
 
@@ -192,9 +191,9 @@ func ListHostFirewallRules(ctx context.Context, c *Client, host string) ([]Firew
 
 // DeleteHostFirewallRule tombstones a host-tier rule by id.
 func DeleteHostFirewallRule(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
-		`UPDATE host_firewall_rules SET deleted_at = ?, updated_at = ? WHERE id = ?`, now, now, id)
+		`UPDATE host_firewall_rules SET deleted_at = ?, updated_at = ? WHERE id = ?`, nowRFC3339(), now, id)
 }
 
 // scanRules maps cluster-rule rows (no host_name column) into FirewallRule.
@@ -222,7 +221,7 @@ func scanRules(rows []Row, host string) []FirewallRule {
 // SetFirewallDefault upserts the default-deny policy for a scope ('cluster' or
 // a host name). stack is recorded when the policy came from a compose file.
 func SetFirewallDefault(ctx context.Context, c *Client, scope string, deny bool, stack string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	denyInt := 0
 	if deny {
 		denyInt = 1
@@ -233,7 +232,7 @@ func SetFirewallDefault(ctx context.Context, c *Client, scope string, deny bool,
 		 VALUES (?, ?, ?, ?, ?, NULL)
 		 ON CONFLICT(scope) DO UPDATE SET default_deny = excluded.default_deny,
 		   stack_name = excluded.stack_name, updated_at = excluded.updated_at, deleted_at = NULL`,
-		scope, denyInt, stack, now, now,
+		scope, denyInt, stack, nowRFC3339(), now,
 	)
 }
 
@@ -298,9 +297,9 @@ func ResolveDefaultDeny(ctx context.Context, c *Client, host string) (bool, erro
 
 // DeleteFirewallDefault tombstones a scope's policy (reverts to inherit/accept).
 func DeleteFirewallDefault(ctx context.Context, c *Client, scope string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
-		`UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ?`, now, now, scope)
+		`UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ?`, nowRFC3339(), now, scope)
 }
 
 // ── Stack teardown ───────────────────────────────────────────────────────────
@@ -325,11 +324,11 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 			return err
 		}
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	for _, tbl := range []string{"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
 		if err := c.Execute(ctx,
 			fmt.Sprintf(`UPDATE %s SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL`, tbl),
-			now, now, stack); err != nil {
+			nowRFC3339(), now, stack); err != nil {
 			return err
 		}
 	}

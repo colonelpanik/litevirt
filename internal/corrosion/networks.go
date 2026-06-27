@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/litevirt/litevirt/internal/compose"
 )
@@ -21,7 +20,7 @@ type NetworkRecord struct {
 
 // UpsertNetwork inserts or updates a network record.
 func UpsertNetwork(ctx context.Context, c *Client, r NetworkRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO networks (name, stack_name, type, config, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
@@ -31,7 +30,7 @@ func UpsertNetwork(ctx context.Context, c *Client, r NetworkRecord) error {
 		   config = excluded.config,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		r.Name, r.StackName, r.Type, r.Config, now, now,
+		r.Name, r.StackName, r.Type, r.Config, nowRFC3339(), now,
 	)
 }
 
@@ -82,10 +81,10 @@ func GetNetwork(ctx context.Context, c *Client, name string) (*NetworkRecord, er
 
 // DeleteNetwork soft-deletes a network record.
 func DeleteNetwork(ctx context.Context, c *Client, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE networks SET deleted_at = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
-		now, now, name,
+		nowRFC3339(), now, name,
 	)
 }
 
@@ -143,7 +142,7 @@ func MigrateLegacyNetworkNames(ctx context.Context, c *Client) error {
 		return err
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 
 	for _, nr := range nets {
 		if nr.StackName == "" {
@@ -185,7 +184,7 @@ func MigrateLegacyNetworkNames(ctx context.Context, c *Client) error {
 	}
 
 	// Migrate network names inside VM spec JSON.
-	if err := migrateVMSpecNetworkNames(ctx, c, now); err != nil {
+	if err := migrateVMSpecNetworkNames(ctx, c); err != nil {
 		slog.Warn("failed to migrate VM spec network names", "error", err)
 	}
 
@@ -211,7 +210,7 @@ func inferNetworkStack(ctx context.Context, c *Client, networkName string) ([]st
 
 // migrateVMSpecNetworkNames updates network attachment names inside the
 // stored VM spec JSON so they use scoped names.
-func migrateVMSpecNetworkNames(ctx context.Context, c *Client, now string) error {
+func migrateVMSpecNetworkNames(ctx context.Context, c *Client) error {
 	rows, err := c.Query(ctx,
 		`SELECT name, stack_name, spec FROM vms
 		 WHERE stack_name != '' AND deleted_at IS NULL`)
@@ -232,7 +231,7 @@ func migrateVMSpecNetworkNames(ctx context.Context, c *Client, now string) error
 		slog.Info("migrating VM spec network names", "vm", vmName)
 		_ = c.Execute(ctx,
 			`UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
-			updated, now, vmName)
+			updated, c.NowTS(), vmName)
 	}
 	return nil
 }

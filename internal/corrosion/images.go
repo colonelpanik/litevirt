@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"time"
 )
 
 // ImageRecord represents a VM base image.
@@ -28,17 +27,17 @@ type ImageHostRecord struct {
 
 // InsertImage creates a new image record.
 func InsertImage(ctx context.Context, c *Client, img ImageRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, now, now,
+		img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), now,
 	)
 }
 
 // InsertImageHost records that a host has a copy of an image.
 func InsertImageHost(ctx context.Context, c *Client, ih ImageHostRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO image_hosts (image_name, host_name, path, status, pulled_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -48,7 +47,7 @@ func InsertImageHost(ctx context.Context, c *Client, ih ImageHostRecord) error {
 
 // UpdateImageHostProgress updates the download progress for a pulling image.
 func UpdateImageHostProgress(ctx context.Context, c *Client, imageName, hostName string, pct float32) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE image_hosts SET progress_pct = ?, updated_at = ? WHERE image_name = ? AND host_name = ?`,
 		pct, now, imageName, hostName,
@@ -57,7 +56,7 @@ func UpdateImageHostProgress(ctx context.Context, c *Client, imageName, hostName
 
 // UpdateImageHostStatus sets the status of an image on a host.
 func UpdateImageHostStatus(ctx context.Context, c *Client, imageName, hostName, status string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE image_hosts SET status = ?, updated_at = ? WHERE image_name = ? AND host_name = ?`,
 		status, now, imageName, hostName,
@@ -138,9 +137,9 @@ func GetImageHosts(ctx context.Context, c *Client, imageName string) ([]ImageHos
 
 // DeleteImage tombstones an image.
 func DeleteImage(ctx context.Context, c *Client, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE images SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{now, now, name}},
-		{SQL: `UPDATE image_hosts SET deleted_at = ?, updated_at = ? WHERE image_name = ?`, Params: []interface{}{now, now, name}},
+		{SQL: `UPDATE images SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{nowRFC3339(), now, name}},
+		{SQL: `UPDATE image_hosts SET deleted_at = ?, updated_at = ? WHERE image_name = ?`, Params: []interface{}{nowRFC3339(), now, name}},
 	})
 }

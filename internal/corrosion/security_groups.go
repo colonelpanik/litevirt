@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 )
 
 // SecurityGroup represents a security group.
@@ -31,7 +30,7 @@ type SGRule struct {
 
 // InsertSecurityGroup creates a new security group.
 func InsertSecurityGroup(ctx context.Context, c *Client, sg SecurityGroup) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	if sg.CreatedAt == "" {
 		sg.CreatedAt = now
 	}
@@ -96,10 +95,10 @@ func ListSecurityGroups(ctx context.Context, c *Client, stackName string) ([]Sec
 
 // DeleteSecurityGroup tombstones a security group.
 func DeleteSecurityGroup(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE security_groups SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		now, now, id,
+		nowRFC3339(), now, id,
 	)
 }
 
@@ -111,7 +110,7 @@ func InsertSGRule(ctx context.Context, c *Client, rule SGRule) error {
 	if isIPv6CIDR(rule.CIDR) {
 		return fmt.Errorf("IPv6 CIDR %q is not supported in security-group rules yet (only IPv4 is enforced); specify an IPv4 CIDR", rule.CIDR)
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	proto := rule.Proto
 	if proto == "" {
 		proto = "all"
@@ -128,7 +127,7 @@ func InsertSGRule(ctx context.Context, c *Client, rule SGRule) error {
 		`INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rule.ID, rule.SGID, rule.Direction, proto, rule.PortRange, rule.CIDR,
-		action, priority, now, now,
+		action, priority, nowRFC3339(), now,
 	)
 }
 
@@ -176,18 +175,18 @@ func ListSGRules(ctx context.Context, c *Client, sgID string) ([]SGRule, error) 
 
 // DeleteSGRules tombstones all rules for a security group.
 func DeleteSGRules(ctx context.Context, c *Client, sgID string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE sg_id = ?`,
-		now, now, sgID,
+		nowRFC3339(), now, sgID,
 	)
 }
 
 // DeleteSGRule tombstones a single rule by its id.
 func DeleteSGRule(ctx context.Context, c *Client, ruleID string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		now, now, ruleID,
+		nowRFC3339(), now, ruleID,
 	)
 }

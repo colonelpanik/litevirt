@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	mrand "math/rand"
 	"os"
 	"time"
 
@@ -18,13 +19,28 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// fetchBinaryMaxConcurrent caps simultaneous FetchBinary streams a node serves.
+const fetchBinaryMaxConcurrent = 4
+
 // FetchBinary streams this daemon's own binary back to a peer so the peer can
 // pull-and-self-upgrade. The first chunk carries the SHA-256 checksum, the
-// binary version, and the schema version. Read-only; the caller authenticates
-// with its host cert over mTLS (same trust boundary as the push UpgradeHost).
+// binary version, and the schema version.
+//
+// Peer-only: the caller must present a cluster host certificate over mTLS
+// (requirePeerCert) — an operator's user/bearer credential cannot stream the
+// daemon binary. A serving-side semaphore bounds concurrent streams so a
+// fleet-wide version flip can't turn one source into a thundering-herd target.
 func (s *Server) FetchBinary(_ *pb.FetchBinaryRequest, stream grpc.ServerStreamingServer[pb.FetchBinaryChunk]) error {
-	if err := RequireRole(stream.Context(), "operator"); err != nil {
+	if err := s.requirePeerCert(stream.Context()); err != nil {
 		return err
+	}
+	if s.fetchBinarySem != nil {
+		select {
+		case s.fetchBinarySem <- struct{}{}:
+			defer func() { <-s.fetchBinarySem }()
+		default:
+			return status.Error(codes.ResourceExhausted, "binary fetch capacity reached; retry shortly")
+		}
 	}
 	data, err := os.ReadFile(s.daemonBinary())
 	if err != nil {
@@ -56,31 +72,59 @@ func (s *Server) FetchBinary(_ *pb.FetchBinaryRequest, stream grpc.ServerStreami
 	return nil
 }
 
+// requirePeerCert authorizes an internal peer-only RPC: the caller must present
+// a cluster host certificate over mTLS (CN = a known host). This is stricter
+// than RequireRole("operator") — an operator's user cert (CN = username) does
+// NOT pass — so a binary/secret-bearing peer RPC isn't reachable by an operator
+// bearer/user credential.
+func (s *Server) requirePeerCert(ctx context.Context) error {
+	if callerAuthMethod(ctx) != authMethodMTLS {
+		return status.Error(codes.PermissionDenied, "peer mTLS required")
+	}
+	cn := callerMTLSCommonName(ctx)
+	if cn == "" {
+		return status.Error(codes.PermissionDenied, "peer certificate common name required")
+	}
+	if h, _ := corrosion.GetHost(ctx, s.db, cn); h == nil {
+		return status.Errorf(codes.PermissionDenied, "peer %q is not a known cluster host", cn)
+	}
+	return nil
+}
+
+// jitterDuration returns d randomized within [d/2, 3d/2) so a fleet that ticks
+// or reboots together doesn't fan out in lockstep (the herd hazard at scale).
+func jitterDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d/2 + time.Duration(mrand.Int63n(int64(d)))
+}
+
 // RunSelfUpgradeWatcher periodically checks whether this daemon is behind the
 // cluster and, if so, pulls a newer binary from a peer and self-upgrades. It is
 // the auto-catch-up for a host that was down during a cluster upgrade and came
 // back on its old binary. Enabled via daemon config; see
 // docs/self-upgrade-from-peer.md.
+//
+// Both the initial settle delay and every tick are jittered: a synchronized
+// fleet reboot would otherwise herd on the first check and on each interval.
 func (s *Server) RunSelfUpgradeWatcher(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 5 * time.Minute
 	}
-	// Let the cluster handshake / health settle after our own start before the
-	// first evaluation, so a normal rolling-upgrade window isn't mistaken for a
-	// persistent lag.
+	// Jittered settle delay (~45s base) lets the cluster handshake / health
+	// settle and desynchronizes a fleet that all started together.
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(45 * time.Second):
+	case <-time.After(jitterDuration(45 * time.Second)):
 	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
 	for {
 		s.maybeSelfUpgrade(ctx)
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-time.After(jitterDuration(interval)):
 		}
 	}
 }
@@ -99,7 +143,7 @@ func (s *Server) maybeSelfUpgrade(ctx context.Context) {
 	slog.Info("self-upgrade: behind cluster — pulling from peer",
 		"peer", peer, "peerVersion", ver, "peerSchema", schema,
 		"myVersion", s.version, "mySchema", corrosion.CurrentSchemaVersion)
-	if err := s.pullAndApply(ctx, peer); err != nil {
+	if err := s.pullAndApply(ctx, peer, ver, schema); err != nil {
 		slog.Warn("self-upgrade: pull/apply failed", "peer", peer, "error", err)
 		return
 	}
@@ -117,10 +161,14 @@ type peerVersionInfo struct {
 // selfUpgradeTarget decides whether this host is behind and, if so, which peer
 // to pull from. Two downgrade-safe signals (see docs/self-upgrade-from-peer.md):
 //  1. a reachable peer at a strictly HIGHER schema_version (definitive), or
-//  2. same schema, but a strict MAJORITY of {self + reachable peers} run a
+//  2. same schema, but a strict MAJORITY of {self + active peers} run a
 //     single version that differs from ours.
 //
-// It never selects a peer whose schema is below ours.
+// Peer (version, schema) is read from the replicated hosts table — one local
+// query — instead of dialing every peer each tick (that was O(N^2) cluster-wide
+// mTLS Pings). A single live Ping then CONFIRMS the chosen candidate before we
+// pull, since the table is eventually consistent. It never selects a peer whose
+// schema is below ours.
 func (s *Server) selfUpgradeTarget(ctx context.Context) (peer, version string, schema int, ok bool) {
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil {
@@ -129,17 +177,57 @@ func (s *Server) selfUpgradeTarget(ctx context.Context) (peer, version string, s
 	mySchema := corrosion.CurrentSchemaVersion
 	var peers []peerVersionInfo
 	for _, h := range hosts {
-		if h.Name == s.hostName || h.State != "active" {
+		// Skip self, non-active peers, and rows with no reported version/schema
+		// (an old peer that hasn't written schema_version yet → 0 → never a source).
+		if h.Name == s.hostName || h.State != "active" || h.Version == "" {
 			continue
 		}
-		info, ok := s.pingPeerVersion(ctx, h.Name)
-		if !ok {
-			continue
-		}
-		peers = append(peers, info)
+		peers = append(peers, peerVersionInfo{host: h.Name, version: h.Version, schema: h.SchemaVersion})
 	}
 	t, ok := chooseSelfUpgradeTarget(s.version, mySchema, peers)
-	return t.host, t.version, t.schema, ok
+	if !ok {
+		return "", "", 0, false
+	}
+	// Spread binary-pull load: prefer an elected relay among equally-good sources.
+	t = s.preferRelaySource(t, peers)
+
+	// Confirm the candidate still reports the same (version, schema) RIGHT NOW —
+	// the hosts table is eventually consistent, so a stale row (peer rolled back /
+	// reimaged) must not drive a pull. Mismatch or unreachable → abort this tick;
+	// re-discover next tick. This is ONE Ping, not a fan-out.
+	live, lok := s.pingPeerVersion(ctx, t.host)
+	if !candidateConfirmed(t, live, lok) {
+		slog.Info("self-upgrade: candidate stale vs confirm-ping — aborting tick",
+			"peer", t.host, "rowVersion", t.version, "rowSchema", t.schema,
+			"liveVersion", live.version, "liveSchema", live.schema, "reachable", lok)
+		return "", "", 0, false
+	}
+	return t.host, t.version, t.schema, true
+}
+
+// candidateConfirmed reports whether a live Ping confirms the candidate chosen
+// from the (eventually-consistent) hosts table: it must be reachable and report
+// the exact (version, schema) the table row claimed. A mismatch means the row
+// was stale (peer rolled back / reimaged) and the pull must be aborted.
+func candidateConfirmed(candidate, live peerVersionInfo, reachable bool) bool {
+	return reachable && live.version == candidate.version && live.schema == candidate.schema
+}
+
+// preferRelaySource returns an elected relay among the peers that match the
+// target's (version, schema), so a fleet-wide flip spreads binary pulls across
+// the ~R relays instead of all hammering the first-sorted peer. Falls back to
+// the original target when it's already a relay or none of the matches is one.
+func (s *Server) preferRelaySource(target peerVersionInfo, peers []peerVersionInfo) peerVersionInfo {
+	rs := corrosion.ComputeRelays(s.db.Members(), s.hostName, corrosion.RelayConfig{})
+	if rs == nil || rs.IsRelay(target.host) {
+		return target
+	}
+	for _, p := range peers {
+		if p.version == target.version && p.schema == target.schema && rs.IsRelay(p.host) {
+			return p
+		}
+	}
+	return target
 }
 
 // chooseSelfUpgradeTarget is the pure decision: given our (version, schema) and
@@ -200,10 +288,29 @@ func (s *Server) pingPeerVersion(ctx context.Context, host string) (peerVersionI
 	return peerVersionInfo{host: host, version: resp.GetVersion(), schema: int(resp.GetSchemaVersion())}, true
 }
 
+// verifyPulledBinary gates a streamed binary's advertised (version, schema)
+// before it is swapped in: it must MATCH what the confirm-Ping promised (it
+// changed under us otherwise), must NOT be a schema downgrade (the daemon
+// refuses to start against a forward-migrated DB — refuse before the crash
+// loop), and must NOT equal our own version (a no-op swap).
+func verifyPulledBinary(peerVer string, peerSchema int, expectVer string, expectSchema, localSchema int, localVer string) error {
+	if peerVer != expectVer || peerSchema != expectSchema {
+		return fmt.Errorf("binary (%s/schema %d) != confirmed (%s/schema %d)", peerVer, peerSchema, expectVer, expectSchema)
+	}
+	if peerSchema < localSchema {
+		return fmt.Errorf("refusing schema downgrade: peer schema %d < local %d", peerSchema, localSchema)
+	}
+	if peerVer == localVer {
+		return fmt.Errorf("peer version equals ours (%s); nothing to do", peerVer)
+	}
+	return nil
+}
+
 // pullAndApply fetches peer's binary, verifies it, and stages + swaps it in
-// (without re-execing — the caller signals that). Guards against a schema
-// downgrade and a no-op (identical version) swap.
-func (s *Server) pullAndApply(ctx context.Context, peer string) error {
+// (without re-execing — the caller signals that). The FetchBinary header must
+// match the (version, schema) we confirmed for this peer; it also guards against
+// a schema downgrade and a no-op (identical version) swap.
+func (s *Server) pullAndApply(ctx context.Context, peer, expectVer string, expectSchema int) error {
 	client, conn, err := s.peerClient(ctx, peer)
 	if err != nil {
 		return fmt.Errorf("reach peer: %w", err)
@@ -252,14 +359,10 @@ func (s *Server) pullAndApply(ctx context.Context, peer string) error {
 		os.Remove(stagingPath)
 		return fmt.Errorf("checksum mismatch from %s", peer)
 	}
-	// Downgrade / no-op guards.
-	if int(peerSchema) < corrosion.CurrentSchemaVersion {
+	if err := verifyPulledBinary(peerVer, int(peerSchema), expectVer, expectSchema,
+		corrosion.CurrentSchemaVersion, s.version); err != nil {
 		os.Remove(stagingPath)
-		return fmt.Errorf("refusing schema downgrade: peer schema %d < local %d", peerSchema, corrosion.CurrentSchemaVersion)
-	}
-	if peerVer == s.version {
-		os.Remove(stagingPath)
-		return fmt.Errorf("peer version equals ours (%s); nothing to do", peerVer)
+		return fmt.Errorf("peer %s: %w", peer, err)
 	}
 
 	if err := s.applyStagedBinary(ctx, stagingPath); err != nil {

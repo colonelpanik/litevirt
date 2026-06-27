@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -26,7 +25,7 @@ type ContainerSnapshotRecord struct {
 // InsertContainerSnapshot records a new container snapshot. Idempotent on the
 // (host,container,name) unique key via INSERT OR REPLACE.
 func InsertContainerSnapshot(ctx context.Context, c *Client, s ContainerSnapshotRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	if s.ID == "" {
 		s.ID = uuid.New().String()
 	}
@@ -37,7 +36,7 @@ func InsertContainerSnapshot(ctx context.Context, c *Client, s ContainerSnapshot
 		`INSERT OR REPLACE INTO container_snapshots
 		   (id, ct_name, host_name, name, state, size_bytes, type, path, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.ID, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, now, now,
+		s.ID, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, nowRFC3339(), now,
 	)
 }
 
@@ -78,11 +77,11 @@ func GetContainerSnapshot(ctx context.Context, c *Client, hostName, ctName, name
 
 // DeleteContainerSnapshot tombstones a snapshot record.
 func DeleteContainerSnapshot(ctx context.Context, c *Client, hostName, ctName, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE container_snapshots SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND ct_name = ? AND name = ?`,
-		now, now, hostName, ctName, name)
+		nowRFC3339(), now, hostName, ctName, name)
 }
 
 func scanContainerSnapshot(r Row) ContainerSnapshotRecord {

@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // LBConfigRecord mirrors the lb_configs table.
@@ -19,7 +18,7 @@ type LBConfigRecord struct {
 
 // UpsertLBConfig inserts or replaces an LB config record.
 func UpsertLBConfig(ctx context.Context, c *Client, r LBConfigRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	enabled := 0
 	if r.Enabled {
 		enabled = 1
@@ -73,7 +72,7 @@ func ListLBConfigs(ctx context.Context, c *Client) ([]LBConfigRecord, error) {
 // missed it. enabled=0 belt-and-suspenders so any `enabled = 1` reader skips it.
 // This is the only delete primitive for lb_configs — there is no hard delete.
 func SoftDeleteLBConfig(ctx context.Context, c *Client, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE lb_configs SET deleted_at = ?, updated_at = ?, enabled = 0 WHERE name = ?`,
 		now, now, name)
@@ -93,7 +92,7 @@ type LBBackendRecord struct {
 
 // UpsertLBBackend inserts or replaces an LB backend record.
 func UpsertLBBackend(ctx context.Context, c *Client, r LBBackendRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	isVM := 0
 	if r.IsVM {
 		isVM = 1
@@ -122,7 +121,7 @@ func UpsertLBBackend(ctx context.Context, c *Client, r LBBackendRecord) error {
 // reintroduce it under anti-entropy. The blank address is only the INSERT-branch
 // placeholder for the NOT NULL column; readers filter deleted_at IS NULL.
 func TombstoneLBBackend(ctx context.Context, c *Client, lbName, backendName string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO lb_backends (lb_name, name, address, enabled, updated_at, deleted_at)
 		 VALUES (?, ?, '', 0, ?, ?)
@@ -136,7 +135,7 @@ func TombstoneLBBackend(ctx context.Context, c *Client, lbName, backendName stri
 // SoftDeleteLBBackends tombstones all locally-known backends for an LB (bulk
 // UPDATE-only — see TombstoneLBBackend for the single-backend, missed-create case).
 func SoftDeleteLBBackends(ctx context.Context, c *Client, lbName string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE lb_backends SET deleted_at = ?, updated_at = ?, enabled = 0 WHERE lb_name = ?`,
 		now, now, lbName)

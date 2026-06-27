@@ -216,26 +216,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.registerHost(ctx); err != nil {
 		slog.Warn("failed to register host", "error", err)
 	}
-	// Always mark ourselves active on startup — InsertHost is a no-op if the
-	// record already exists, so a host that was marked offline (e.g. during an
-	// upgrade) would stay offline without this explicit state transition.
-	if err := corrosion.UpdateHostState(ctx, d.db, d.cfg.HostName, "active"); err != nil {
-		slog.Warn("failed to set host active on startup", "error", err)
+	// Write boot state in ONE batched mutation: state + version (+ resources if the
+	// probe succeeded) share a single updated_at. Doing these as separate writes in
+	// the same wall-clock second produced equal updated_at values, and on a peer the
+	// later writes lost the LWW tie and were stranded (a re-exec upgrade's new
+	// version never propagated). InsertHost is a no-op if the row already exists, so
+	// this explicit write is what carries the new state/version after a re-exec.
+	cpus, memMiB, niErr := d.virt.NodeInfo()
+	diskGiB := 0
+	if niErr == nil {
+		diskGiB = d.sumPoolDiskTotalGiB()
+	} else {
+		slog.Warn("NodeInfo failed at startup; writing host state without resources", "error", niErr)
 	}
-	// Always update version on startup (InsertHost may no-op if host already exists).
-	if d.cfg.Version != "" {
-		_ = corrosion.UpdateHostVersion(ctx, d.db, d.cfg.HostName, d.cfg.Version)
+	if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, "active", d.cfg.Version, cpus, memMiB, diskGiB, niErr == nil); err != nil {
+		slog.Warn("failed to write host startup state", "error", err)
 	}
 	// Record version on the corrosion client so it goes into Crescent
 	// peer handshakes (used by skew detection).
 	d.db.SetLocalVersion(d.cfg.Version)
-	// Always refresh host resources (CPU, memory, disk) on startup so existing
-	// hosts pick up hardware changes and disk_total is always populated.
-	// disk_total is the sum of all configured storage pool capacities.
-	if cpus, memMiB, err := d.virt.NodeInfo(); err == nil {
-		diskGiB := d.sumPoolDiskTotalGiB()
-		_ = corrosion.UpdateHostResources(ctx, d.db, d.cfg.HostName, cpus, memMiB, diskGiB)
-	}
 
 	// Register storage pools in the cluster DB and start periodic refresh.
 	d.registerStoragePools(ctx)
@@ -499,7 +498,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
 	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
 	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second)
-	d.snapScheduler.ReplRunner = svc      // *grpcapi.Server implements RunReplication
+	d.snapScheduler.ReplRunner = svc // *grpcapi.Server implements RunReplication
 	go d.snapScheduler.Run(ctx)
 
 	// Sweep staging temp files leaked by a prior hard crash (SIGKILL skips the

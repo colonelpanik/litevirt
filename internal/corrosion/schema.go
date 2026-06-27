@@ -147,7 +147,14 @@ import (
 //	     but no updated_at, so a stale peer's live row blind-replaced a revocation;
 //	     lb_backends had neither and was hard-deleted. Two ADD COLUMNs; old tokens
 //	     rows default updated_at='' (a revoke's timestamp then wins LWW). gap-1 from v28.
-const CurrentSchemaVersion = 29
+//	v30: hosts.schema_version — each host's running-binary supported schema (the
+//	     value Ping returns, i.e. that binary's CurrentSchemaVersion; NOT the
+//	     DB-applied EffectiveDBSchema). Persisted so the self-upgrade watcher reads
+//	     peer (version, schema) from the replicated hosts table instead of an
+//	     O(N^2) live-Ping fan-out. Additive INTEGER DEFAULT 0; old rows read 0
+//	     (unknown → never an upgrade source) until the peer writes its own at boot.
+//	     gap-1 from v29.
+const CurrentSchemaVersion = 30
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -171,6 +178,7 @@ const appliedMigrationsDDL = `CREATE TABLE IF NOT EXISTS applied_migrations (
 // PRESENCE PREDICATE against the live DB (PRAGMA table_info / sqlite_master):
 //   - present  → record it (mark-only; the ALTER/CREATE already happened)
 //   - missing  → apply its SQL + record it in ONE local transaction (heal)
+//
 // A real apply error aborts LOUDLY (no benign swallowing). Mark-applied is
 // gated on the presence predicate, NEVER on the version number, so a silent
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
@@ -434,6 +442,7 @@ var schemaDDL = []string{
 		fence_strategy TEXT DEFAULT 'best-effort',
 		labels       TEXT,
 		role         TEXT NOT NULL DEFAULT 'worker',
+		schema_version INTEGER NOT NULL DEFAULT 0,
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT
@@ -1513,6 +1522,9 @@ var schemaMigrations = []string{
 	// column on lb_backends (see History v29).
 	`ALTER TABLE tokens ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE lb_backends ADD COLUMN deleted_at TEXT`,
+
+	// v30: persist each host's running-binary schema for the self-upgrade watcher.
+	`ALTER TABLE hosts ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -1531,8 +1543,8 @@ const (
 
 // migration is one ledgered schema unit.
 type migration struct {
-	ID      string  // stable, frozen once shipped; never reorder/edit
-	Version int     // schema version this unit belongs to (feeds derivedSchemaVersion)
+	ID      string // stable, frozen once shipped; never reorder/edit
+	Version int    // schema version this unit belongs to (feeds derivedSchemaVersion)
 	Kind    migKind
 	Target  string // "table.col" (addColumn) or "table" (createTable) — for the presence check
 	SQL     string // heal statement (the ALTER for addColumn; "" for createTable — schemaDDL creates it)
@@ -1567,9 +1579,9 @@ var alterVersions = []int{
 	4,    // vm_interfaces.security_groups
 	6,    // hosts.region
 	8, 8, // audit_log.prev_hash/content_hash
-	9,    // vms.project
-	10,   // backup_schedules.pool_name
-	11,   // storage_pools.options
+	9,      // vms.project
+	10,     // backup_schedules.pool_name
+	11,     // storage_pools.options
 	12, 12, // backup_schedules.scope/project_name
 	15,     // user_2fa.last_step
 	16, 16, // vms.is_template, vm_disks.backing_disk
@@ -1580,6 +1592,7 @@ var alterVersions = []int{
 	25,     // containers.project
 	28, 28, // containers.is_template/on_host_failure
 	29, 29, // tokens.updated_at, lb_backends.deleted_at
+	30, // hosts.schema_version
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

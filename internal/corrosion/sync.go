@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/hlc"
 )
@@ -26,6 +27,12 @@ import (
 // ("2026-…") sorts lexically GREATER than any HLC value ("17…"), so a stale
 // pre-migration row would wrongly win and suppress newer HLC writes. HLC values
 // are newer by construction, so when only one side is HLC, the HLC side wins.
+//
+// Two RFC3339 values are compared as parsed times, not lexically: a fixed-width
+// fractional timestamp ("…01.000000000Z") would otherwise sort BEFORE a bare
+// one ("…01Z") because '.'(0x2E) < 'Z'(0x5A), so a newer sub-second write could
+// wrongly lose to an older bare-second value during the RFC3339→nano rollout.
+// An exact-equal instant keeps local (anti-entropy stability).
 func localWinsLWW(localTS, incomingTS string) bool {
 	localHLC, incomingHLC := hlc.IsHLC(localTS), hlc.IsHLC(incomingTS)
 	switch {
@@ -33,8 +40,16 @@ func localWinsLWW(localTS, incomingTS string) bool {
 		return true // local HLC beats a legacy RFC3339 incoming
 	case !localHLC && incomingHLC:
 		return false // incoming HLC beats a legacy RFC3339 local
+	case localHLC && incomingHLC:
+		return localTS >= incomingTS // both HLC → lexical == chronological
 	default:
-		return localTS >= incomingTS // same format → lexical (==chronological for HLC)
+		// Both RFC3339 (bare second or fixed-width fractional).
+		lt, lerr := time.Parse(time.RFC3339, localTS)
+		it, ierr := time.Parse(time.RFC3339, incomingTS)
+		if lerr == nil && ierr == nil {
+			return !lt.Before(it) // local newer-or-equal → keep local
+		}
+		return localTS >= incomingTS // unparseable → lexical fallback
 	}
 }
 

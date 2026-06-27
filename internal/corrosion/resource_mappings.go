@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"sort"
-	"time"
 )
 
 // MappingDevice is one host's concrete device under a named resource mapping.
@@ -29,40 +28,40 @@ type ResourceMappingRecord struct {
 // CreateResourceMapping inserts (or refreshes) the header row carrying the
 // mapping's description. Idempotent.
 func CreateResourceMapping(ctx context.Context, c *Client, name, description string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO resource_mappings (name, host_name, address, description, created_at, updated_at, deleted_at)
 		 VALUES (?, '', '', ?, ?, ?, NULL)`,
-		name, description, now, now,
+		name, description, nowRFC3339(), now,
 	)
 }
 
 // AddMappingDevice registers one host's device under a mapping. Re-adding the
 // same (name, host, address) updates the vendor/device fields.
 func AddMappingDevice(ctx context.Context, c *Client, name, host, address, vendor, device string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO resource_mappings (name, host_name, address, vendor, device, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
-		name, host, address, vendor, device, now, now,
+		name, host, address, vendor, device, nowRFC3339(), now,
 	)
 }
 
 // RemoveMappingDevice tombstones one device row from a mapping.
 func RemoveMappingDevice(ctx context.Context, c *Client, name, host, address string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE resource_mappings SET deleted_at = ?, updated_at = ? WHERE name = ? AND host_name = ? AND address = ?`,
-		now, now, name, host, address,
+		nowRFC3339(), now, name, host, address,
 	)
 }
 
 // DeleteResourceMapping tombstones every row (header + devices) for a mapping.
 func DeleteResourceMapping(ctx context.Context, c *Client, name string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE resource_mappings SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-		now, now, name,
+		nowRFC3339(), now, name,
 	)
 }
 

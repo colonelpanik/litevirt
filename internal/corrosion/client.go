@@ -53,6 +53,42 @@ type Client struct {
 	// InitSchema and refreshed by RefreshDBSchemaVersion after a pre-stage
 	// migrate. 0 = not yet seeded → EffectiveDBSchema() falls back to the const.
 	effectiveDBSchema atomic.Int32
+
+	// tsMu guards lastTS, the monotonic source behind NowTS(). Kept separate from
+	// mu so timestamp generation (called before a write acquires mu) never
+	// contends with or re-enters the main lock.
+	tsMu   sync.Mutex
+	lastTS time.Time
+}
+
+// nowTSLayout is fixed-width RFC3339 with 9 fractional digits so values sort
+// lexically == chronologically (no bare-second vs fractional ambiguity among
+// NowTS outputs). time.Parse(time.RFC3339, …) still accepts it.
+const nowTSLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// nowRFC3339 is the bare second-resolution UTC timestamp for NON-LWW columns
+// (created_at, deleted_at markers, enrolled_at, allocated_at, last_*). These are
+// displayed or ordered by value, so they must stay bare — a fixed-width
+// fractional value sorts lexically BEFORE a bare same-second one, which would
+// mis-order mixed old/new rows. Only updated_at (the LWW key) uses NowTS.
+func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// NowTS returns a strictly-monotonic, fixed-width RFC3339Nano UTC timestamp for
+// this Client. It is the timestamp source for replicated rows' updated_at (the
+// LWW conflict key): two writes from the same node in the same wall-clock
+// nanosecond still get distinct, ordered values, so a same-second burst (e.g. the
+// host boot sequence) can't produce a last-writer-wins tie that strands the later
+// write on a peer. Per-Client (not a package global) so independent in-process
+// test nodes keep independent clocks. NOT used for HLC physical time.
+func (c *Client) NowTS() string {
+	c.tsMu.Lock()
+	defer c.tsMu.Unlock()
+	t := time.Now().UTC()
+	if !t.After(c.lastTS) {
+		t = c.lastTS.Add(time.Nanosecond)
+	}
+	c.lastTS = t
+	return t.Format(nowTSLayout)
 }
 
 // LocalVersion returns the binary version this Client was created with.

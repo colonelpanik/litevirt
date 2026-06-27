@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 )
 
 // ────────────────────────────── ROLES ──────────────────────────────
@@ -27,7 +26,7 @@ type RoleRecord struct {
 // InsertRole stores a role. Built-in roles set BuiltIn=true so RPC handlers
 // can refuse to modify or delete them.
 func InsertRole(ctx context.Context, c *Client, r RoleRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	verbsJSON, err := json.Marshal(r.Verbs)
 	if err != nil {
 		return fmt.Errorf("marshal verbs: %w", err)
@@ -89,10 +88,10 @@ func DeleteRole(ctx context.Context, c *Client, name string) error {
 	if role.BuiltIn {
 		return fmt.Errorf("role %q is built-in and cannot be deleted", name)
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE roles SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-		now, now, name)
+		nowRFC3339(), now, name)
 }
 
 func scanRole(r Row) *RoleRecord {
@@ -124,7 +123,7 @@ type RoleBindingRecord struct {
 
 // InsertRoleBinding creates a (path, role, principal) binding.
 func InsertRoleBinding(ctx context.Context, c *Client, b RoleBindingRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	prop := 1
 	if !b.Propagate {
 		prop = 0
@@ -137,10 +136,10 @@ func InsertRoleBinding(ctx context.Context, c *Client, b RoleBindingRecord) erro
 
 // DeleteRoleBinding soft-deletes a binding by id.
 func DeleteRoleBinding(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		now, now, id)
+		nowRFC3339(), now, id)
 }
 
 // ListRoleBindings returns all active bindings. Used by the permission
@@ -240,18 +239,16 @@ func GetSession(ctx context.Context, c *Client, id string) (*SessionRecord, erro
 // TouchSession bumps last_used_at on every authenticated request so
 // idle-timeout calculations are accurate.
 func TouchSession(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE sessions SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`,
-		now, id)
+		nowRFC3339(), id) // bare marker (parsed for idle checks; not an LWW key)
 }
 
 // RevokeSession marks a session as terminated immediately.
 func RevokeSession(ctx context.Context, c *Client, id string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
-		now, id)
+		nowRFC3339(), id) // bare marker
 }
 
 // ListSessionsForUser returns active sessions for a username.
@@ -290,13 +287,13 @@ type User2FARecord struct {
 
 // InsertUser2FA records an enrolled factor.
 func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(username, method, label) DO UPDATE
 		   SET secret = excluded.secret, updated_at = excluded.updated_at`,
-		r.Username, r.Method, r.Secret, r.Label, now, now)
+		r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now)
 }
 
 // ListUser2FA returns the user's enrolled factors. Empty slice = no 2FA.
@@ -323,11 +320,11 @@ func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FAReco
 
 // TouchUser2FA bumps last_used_at after a successful verification.
 func TouchUser2FA(ctx context.Context, c *Client, username, method, label string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE user_2fa SET last_used_at = ?, updated_at = ?
 		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
-		now, now, username, method, label)
+		nowRFC3339(), now, username, method, label)
 }
 
 // RecordTOTPStep ratchets last_step forward (and bumps last_used_at) after a
@@ -337,11 +334,11 @@ func TouchUser2FA(ctx context.Context, c *Client, username, method, label string
 // replayed on a different node either. The caller still performs a Go-level
 // `step <= LastStep` pre-check; this is the persistence + concurrency backstop.
 func RecordTOTPStep(ctx context.Context, c *Client, username, method, label string, step int64) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE user_2fa SET last_step = ?, last_used_at = ?, updated_at = ?
 		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND last_step < ?`,
-		step, now, now, username, method, label, step)
+		step, nowRFC3339(), now, username, method, label, step)
 }
 
 // DeleteUser2FA un-enrolls a single factor.
@@ -355,7 +352,7 @@ func DeleteUser2FA(ctx context.Context, c *Client, username, method, label strin
 
 // InsertRecoveryCodes stores N bcrypt-hashed single-use codes.
 func InsertRecoveryCodes(ctx context.Context, c *Client, username string, codeHashes []string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := nowRFC3339() // recovery_codes.created_at — bare marker (no updated_at on this table)
 	stmts := make([]Statement, 0, len(codeHashes)+1)
 	// Wipe any prior unused codes — re-enrollment invalidates old ones.
 	stmts = append(stmts, Statement{
@@ -391,8 +388,7 @@ func ListUnusedRecoveryCodes(ctx context.Context, c *Client, username string) ([
 
 // MarkRecoveryCodeUsed sets used_at on a hash so it can't be reused.
 func MarkRecoveryCodeUsed(ctx context.Context, c *Client, username, codeHash string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
 		`UPDATE recovery_codes SET used_at = ? WHERE username = ? AND code_hash = ?`,
-		now, username, codeHash)
+		nowRFC3339(), username, codeHash) // bare marker (no updated_at on this table)
 }

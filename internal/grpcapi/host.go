@@ -117,11 +117,11 @@ func (s *Server) GetHostHealth(ctx context.Context, _ *emptypb.Empty) (*pb.HostH
 	resp := &pb.HostHealthMatrix{}
 	for _, r := range rows {
 		resp.Entries = append(resp.Entries, &pb.HostHealthEntry{
-			Observer:             r.String("observer"),
-			Target:               r.String("target"),
-			Status:               r.String("status"),
-			ConsecutiveFailures:  int32(r.Int("consecutive_failures")),
-			LastSeen:             parseTimestamp(r.String("last_seen")),
+			Observer:            r.String("observer"),
+			Target:              r.String("target"),
+			Status:              r.String("status"),
+			ConsecutiveFailures: int32(r.Int("consecutive_failures")),
+			LastSeen:            parseTimestamp(r.String("last_seen")),
 		})
 	}
 
@@ -433,7 +433,7 @@ func (s *Server) SetHostLabels(ctx context.Context, req *pb.SetHostLabelsRequest
 
 	if err := s.db.Execute(ctx,
 		`UPDATE hosts SET labels = ?, updated_at = ? WHERE name = ?`,
-		string(labelsJSON), time.Now().UTC().Format(time.RFC3339), req.Name,
+		string(labelsJSON), s.db.NowTS(), req.Name,
 	); err != nil {
 		return nil, status.Errorf(codes.Internal, "update labels: %v", err)
 	}
@@ -537,7 +537,6 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	}, nil
 }
 
-
 // ConfigureHost updates host fencing and IPMI configuration.
 func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest) (*pb.Host, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
@@ -612,7 +611,7 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	}
 
 	sets = append(sets, "updated_at = ?")
-	args = append(args, time.Now().UTC().Format(time.RFC3339))
+	args = append(args, s.db.NowTS()) // monotonic LWW key (hosts is replicated)
 	args = append(args, req.Name)
 
 	query := fmt.Sprintf("UPDATE hosts SET %s WHERE name = ?",

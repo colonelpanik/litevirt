@@ -43,6 +43,7 @@ const (
 
 	ErrNoQuorum          = "no_quorum"
 	ErrLeaseLost         = "lease_lost"
+	ErrNotLeader         = "not_leader"
 	ErrTerminalState     = "terminal_state"
 	ErrAlreadyFenced     = "already_fenced"
 	ErrUpgrading         = "upgrading"

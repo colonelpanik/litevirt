@@ -361,6 +361,7 @@ func (c *Coordinator) acquireLease(ctx context.Context) bool {
 		      OR leader_election.holder = excluded.holder`,
 		c.hostName, expiresAt, nowRFC, nowRFC); err != nil {
 		slog.Error("failover: lease write", "error", err)
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		return false
 	}
 
@@ -368,18 +369,22 @@ func (c *Coordinator) acquireLease(ctx context.Context) bool {
 		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
 	if err != nil {
 		slog.Error("failover: lease read", "error", err)
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		return false
 	}
 	if len(rows) == 0 {
 		// Write succeeded but read returned nothing — abort cycle.
 		slog.Warn("failover: lease row missing after write")
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		return false
 	}
 	holder := rows[0].String("holder")
 	if holder != c.hostName {
-		// Another coordinator holds it.
+		// Another coordinator holds it — the normal non-leader case.
+		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
 		return false
 	}
+	c.mAttempt(PhaseLease, ResultOK, errClassNone)
 	return true
 }
 
@@ -509,6 +514,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// not begin fencing the same host concurrently.
 	if !c.holdLease(ctx) {
 		slog.Warn("failover: lease lost before fence, aborting", "host", h.Name)
+		c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
 		return
 	}
 
@@ -607,7 +613,12 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 
 	// Step 4: Verify healthy hosts exist before attempting rescheduling.
 	candidates, err := c.healthyHosts(ctx, h.Name)
-	if err != nil || len(candidates) == 0 {
+	if err != nil {
+		slog.Error("failover: list healthy hosts", "host", h.Name, "error", err)
+		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+		return
+	}
+	if len(candidates) == 0 {
 		slog.Warn("failover: no healthy hosts available for VM rescheduling", "host", h.Name)
 		c.mAttempt(PhaseFence, ResultRefused, ErrNoCandidates)
 		return

@@ -350,3 +350,31 @@ func TestMergeLWW_FullDumpParity(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeLWW_RejectsMalformedRowLength: a peer dump whose row is shorter than
+// its declared columns must not panic (reading row[updatedAtIdx] out of range) —
+// the malformed row is skipped.
+func TestMergeLWW_RejectsMalformedRowLength(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	// Columns declares 4 (updated_at at index 3) but the row carries only 2.
+	c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
+		Name:    "host_labels",
+		Columns: []string{"host_name", "key", "value", "updated_at"},
+		Rows: [][]interface{}{
+			{"h1", "k1"},                      // malformed (too short) — must be skipped, not panic
+			{"h1", "k2", "good", "100-0000-n"}, // well-formed — should still apply
+		},
+	}}})
+
+	if v := labelVal(t, c, "h1", "k2"); v != "good" {
+		t.Errorf("well-formed row should apply alongside a skipped malformed one, got %q", v)
+	}
+	rows, err := c.Query(ctx, "SELECT count(*) AS n FROM host_labels")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := rows[0].Int("n"); n != 1 {
+		t.Errorf("expected only the well-formed row, got %d", n)
+	}
+}

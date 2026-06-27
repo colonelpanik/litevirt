@@ -82,3 +82,32 @@ func TestStateDigest_ContentStableAndSensitive(t *testing.T) {
 		}
 	})
 }
+
+// TestStateDigest_NoSeparatorCollision: row/column encoding must be unambiguous.
+// A naive separator-join (column sep 0x1f) collides when a value contains the
+// separator byte and the boundary falls differently — two genuinely different
+// tables would hash identically (false "in sync").
+func TestStateDigest_NoSeparatorCollision(t *testing.T) {
+	ctx := context.Background()
+	a := mustTestClient(t)
+	b := mustTestClient(t)
+	// Same column count; the 0x1f lands at a different column boundary, so a
+	// separator-join produces the same byte stream for different content.
+	if err := a.Execute(ctx,
+		`INSERT INTO host_labels (host_name, key, value, updated_at) VALUES (?, ?, ?, ?)`,
+		"h1", "k1\x1fx", "y", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Execute(ctx,
+		`INSERT INTO host_labels (host_name, key, value, updated_at) VALUES (?, ?, ?, ?)`,
+		"h1", "k1", "x\x1fy", "t"); err != nil {
+		t.Fatal(err)
+	}
+	da, db := tableDigest(t, a, "host_labels"), tableDigest(t, b, "host_labels")
+	if da.Count != db.Count {
+		t.Fatalf("setup: counts differ %d vs %d", da.Count, db.Count)
+	}
+	if da.Hash == db.Hash {
+		t.Error("digest collided on differing content (separator ambiguity)")
+	}
+}

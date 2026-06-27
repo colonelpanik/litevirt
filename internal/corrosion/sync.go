@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/hlc"
@@ -227,6 +228,15 @@ func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
 			strings.Join(repeatPlaceholders(len(table.Columns)), ", ") + ")"
 
 		for _, row := range table.Rows {
+			// A peer dump whose row doesn't match the declared column count is
+			// malformed/corrupt: skip it rather than index out of range below or
+			// hand SQLite a mismatched arg count.
+			if len(row) != len(table.Columns) {
+				slog.Warn("sync: skipping malformed row (column count mismatch)",
+					"table", table.Name, "want", len(table.Columns), "got", len(row))
+				skipped++
+				continue
+			}
 			if existing != nil {
 				incomingTS, _ := row[updatedAtIdx].(string)
 				if incomingTS != "" {
@@ -482,14 +492,20 @@ func (c *Client) StateDigest(ctx context.Context) ([]TableDigest, error) {
 			if err := rows.Scan(ptrs...); err != nil {
 				continue
 			}
+			// Length-prefix every cell so the encoding is unambiguous: a value
+			// can contain any byte (incl. would-be separators) without aliasing
+			// an adjacent column or row. NULL is a distinct marker (values always
+			// start with a digit).
 			var sb strings.Builder
 			for _, v := range vals {
 				if v == nil {
-					sb.WriteByte(0x00) // distinguish NULL from an empty string
+					sb.WriteString("N;")
 				} else {
-					sb.WriteString(coerceString(v))
+					s := coerceString(v)
+					sb.WriteString(strconv.Itoa(len(s)))
+					sb.WriteByte(':')
+					sb.WriteString(s)
 				}
-				sb.WriteByte(0x1f) // unit separator between columns
 			}
 			rowKeys = append(rowKeys, sb.String())
 		}
@@ -498,8 +514,7 @@ func (c *Client) StateDigest(ctx context.Context) ([]TableDigest, error) {
 
 		h := sha256.New()
 		for _, rk := range rowKeys {
-			h.Write([]byte(rk))
-			h.Write([]byte{0x1e}) // record separator between rows
+			h.Write([]byte(strconv.Itoa(len(rk)) + ":" + rk)) // length-prefix each row too
 		}
 		digests = append(digests, TableDigest{
 			Name:  table,

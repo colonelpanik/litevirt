@@ -18,7 +18,8 @@ func setupLBSchema(t *testing.T, c *Client) {
 		ports      TEXT NOT NULL DEFAULT '[]',
 		enabled    INTEGER NOT NULL DEFAULT 1,
 		updated_at TEXT NOT NULL,
-		deleted_at TEXT
+		deleted_at TEXT,
+		generation TEXT NOT NULL DEFAULT ''
 	)`)
 	_ = c.execLocal(ctx, `DROP TABLE IF EXISTS lb_backends`)
 	_ = c.execLocal(ctx, `CREATE TABLE lb_backends (
@@ -30,8 +31,23 @@ func setupLBSchema(t *testing.T, c *Client) {
 		enabled    INTEGER NOT NULL DEFAULT 1,
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT,
+		generation TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (lb_name, name)
 	)`)
+}
+
+// seedLBConfig inserts a minimal live config (generation ”) so the JOIN in
+// ListLBBackends has a config to match against. Backend-primitive tests that
+// don't otherwise create a config need this — a backend with no live config
+// correctly does not render (see TestListLBBackends_NoConfigDoesNotRender).
+func seedLBConfig(t *testing.T, c *Client, names ...string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, n := range names {
+		if err := UpsertLBConfig(ctx, c, LBConfigRecord{Name: n, VIP: "10.0.0.1", Algorithm: "rr", Hosts: "[]", Enabled: true}); err != nil {
+			t.Fatalf("seedLBConfig %q: %v", n, err)
+		}
+	}
 }
 
 // TestLBStore_SQLMetacharactersRoundTrip is the F1 regression: names/values
@@ -293,6 +309,7 @@ func TestUpsertLBBackend(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	setupLBSchema(t, c)
+	seedLBConfig(t, c, "web-lb")
 
 	rec := LBBackendRecord{
 		LBName:  "web-lb",
@@ -321,6 +338,7 @@ func TestUpsertLBBackend_VMBackend(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	setupLBSchema(t, c)
+	seedLBConfig(t, c, "web-lb")
 
 	rec := LBBackendRecord{
 		LBName:  "web-lb",
@@ -350,6 +368,7 @@ func TestUpsertLBBackend_Update(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	setupLBSchema(t, c)
+	seedLBConfig(t, c, "lb1")
 
 	rec := LBBackendRecord{LBName: "lb1", Name: "b1", Address: "10.0.0.1", Enabled: true}
 	if err := UpsertLBBackend(ctx, c, rec); err != nil {
@@ -374,6 +393,7 @@ func TestDeleteLBBackend(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	setupLBSchema(t, c)
+	seedLBConfig(t, c, "lb1")
 
 	_ = UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b1", Address: "10.0.0.1", Enabled: true})
 	_ = UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b2", Address: "10.0.0.2", Enabled: true})
@@ -395,6 +415,7 @@ func TestDeleteLBBackends(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	setupLBSchema(t, c)
+	seedLBConfig(t, c, "lb1", "lb2")
 
 	_ = UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b1", Address: "10.0.0.1", Enabled: true})
 	_ = UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b2", Address: "10.0.0.2", Enabled: true})

@@ -32,10 +32,8 @@ var antiEntropyExcluded = map[string]string{
 	"mutation_log":           "the replication WAL itself — never full-state-synced",
 	"replication_watermarks": "per-node replication progress",
 	"mutation_seen":          "per-node relay-dedup table",
-
-	// Secret stores not yet safe for the peer-only sensitive repair lane.
-	"user_2fa":       "2FA enrollment secrets; DeleteUser2FA is still a hard delete, so full-state repair could resurrect",
-	"recovery_codes": "single-use 2FA secrets; no updated_at and re-enrollment is set-regeneration, so not LWW-safe",
+	// (user_2fa, recovery_codes, recovery_code_sets are now in sensitiveTableNames
+	//  — schema v32 made them LWW-repairable: soft-delete + active-set pointer.)
 }
 
 // localOnly are schemaDDL tables that are NOT CRDT-replicated (written via direct

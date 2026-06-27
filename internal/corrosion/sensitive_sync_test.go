@@ -79,6 +79,17 @@ func TestPublicDumpExcludesSensitiveState(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// 2FA/recovery joined the sensitive lane in v32 — seed all three so the dump
+	// covers them. InsertRecoveryCodes writes both recovery_codes and the
+	// recovery_code_sets pointer.
+	if err := InsertUser2FA(ctx, c, User2FARecord{
+		Username: "alice", Method: "totp", Secret: "JBSWY3DPEHPK3PXP-totp-secret", Label: "phone",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$10$hashone", "$2a$10$hashtwo"}); err != nil {
+		t.Fatal(err)
+	}
 
 	publicPayload, err := decompressPayload(c.DumpStateBytes())
 	if err != nil {
@@ -90,8 +101,10 @@ func TestPublicDumpExcludesSensitiveState(t *testing.T) {
 		}
 	}
 	plain, _ := json.Marshal(publicPayload)
-	if strings.Contains(string(plain), "super-secret-token") || strings.Contains(string(plain), "hook.example/secret") {
-		t.Fatalf("public dump leaked sensitive row data: %s", plain)
+	for _, secret := range []string{"super-secret-token", "hook.example/secret", "JBSWY3DPEHPK3PXP-totp-secret", "$2a$10$hashone"} {
+		if strings.Contains(string(plain), secret) {
+			t.Fatalf("public dump leaked sensitive row data (%q): %s", secret, plain)
+		}
 	}
 
 	got := payloadTableNames(t, c.DumpSensitiveStateBytes())

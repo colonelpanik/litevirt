@@ -1,0 +1,279 @@
+package corrosion
+
+import (
+	"context"
+	"slices"
+	"testing"
+)
+
+// activeSetID returns the user's current active recovery-code set pointer (or "").
+func activeSetID(t *testing.T, c *Client, username string) string {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT active_set_id FROM recovery_code_sets WHERE username = ? AND deleted_at IS NULL`, username)
+	if err != nil {
+		t.Fatalf("read active_set_id: %v", err)
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	return rows[0].String("active_set_id")
+}
+
+func has2FA(t *testing.T, c *Client, username, method string) bool {
+	t.Helper()
+	fs, err := ListUser2FA(context.Background(), c, username)
+	if err != nil {
+		t.Fatalf("ListUser2FA: %v", err)
+	}
+	for _, f := range fs {
+		if f.Method == method {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUser2FA_SoftDeleteSurvivesStaleMerge: un-enrolling a factor must survive a
+// stale peer that still has it live — RED while DeleteUser2FA was a hard delete
+// (the union merge re-inserted it). Re-enroll then clears the tombstone.
+func TestUser2FA_SoftDeleteSurvivesStaleMerge(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "totp", Secret: "s0", Label: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteUser2FA(ctx, c, "alice", "totp", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale peer re-pushes the factor LIVE (deleted_at nil) with an OLDER updated_at.
+	c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{{
+		Name:    "user_2fa",
+		Columns: []string{"username", "method", "secret", "label", "enrolled_at", "last_used_at", "updated_at", "last_step", "deleted_at"},
+		Rows:    [][]interface{}{{"alice", "totp", "s0", "", "2020-01-01T00:00:00Z", nil, "2020-01-01T00:00:00Z", 0, nil}},
+	}}}))
+
+	if has2FA(t, c, "alice", "totp") {
+		t.Error("soft-deleted factor resurrected by a stale peer merge")
+	}
+
+	// Re-enroll reactivates (tombstone cleared, ratchet reset).
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "totp", Secret: "s1", Label: ""}); err != nil {
+		t.Fatal(err)
+	}
+	fs, _ := ListUser2FA(ctx, c, "alice")
+	if len(fs) != 1 || fs[0].Secret != "s1" {
+		t.Errorf("re-enroll did not reactivate the factor: %+v", fs)
+	}
+}
+
+// TestUser2FA_WritePathsNeverNullLabel pins the normalization contract: no write
+// path leaves a NULL label (the composite-PK NULL trap). The column stays
+// physically nullable, so this guards the writers, not the storage.
+func TestUser2FA_WritePathsNeverNullLabel(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "bob", Method: "totp", Secret: "x", Label: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteUser2FA(ctx, c, "bob", "totp", ""); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM user_2fa WHERE label IS NULL`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := rows[0].Int("n"); n != 0 {
+		t.Errorf("a write path produced %d NULL-label row(s); writes must normalize to ''", n)
+	}
+}
+
+// TestUser2FA_DataFixNormalizesNullLabel: a pre-existing NULL-label row (from an
+// old binary / manual edit) is normalized to ” by the InitSchema data fix, so it
+// can't sit as a distinct PK component that duplicates a factor or dodges a tombstone.
+func TestUser2FA_DataFixNormalizesNullLabel(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	// Insert a raw NULL-label row (bypassing the normalized write paths).
+	if err := c.execLocal(ctx,
+		`INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at)
+		 VALUES ('carol', 'totp', 's', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyV32DataFixes(ctx, c, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM user_2fa WHERE label IS NULL`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := rows[0].Int("n"); n != 0 {
+		t.Errorf("data fix left %d NULL-label row(s)", n)
+	}
+}
+
+// TestRecoveryCodes_OldSetNotAcceptedAfterReEnroll is the recovery-code OR-set
+// regression: after re-enroll moves the active-set pointer, a peer that
+// resurrects an old-set code LIVE (newer updated_at, deleted_at nil) must NOT
+// have it accepted — validity is gated on set_id == active_set_id, not deletion.
+func TestRecoveryCodes_OldSetNotAcceptedAfterReEnroll(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$hashOLD"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$hashNEW"}); err != nil {
+		t.Fatal(err) // re-enroll: pointer → new set, old code soft-deleted
+	}
+
+	// Peer resurrects the old-set code LIVE with a FUTURE updated_at (LWW would
+	// keep the row live) but carrying the SUPERSEDED set_id.
+	c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{{
+		Name:    "recovery_codes",
+		Columns: []string{"username", "code_hash", "used_at", "created_at", "set_id", "updated_at", "deleted_at"},
+		Rows:    [][]interface{}{{"alice", "$2a$hashOLD", nil, "2020-01-01T00:00:00Z", "superseded-set-id", "2099-01-01T00:00:00Z", nil}},
+	}}}))
+
+	got, err := ListUnusedRecoveryCodes(ctx, c, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"$2a$hashNEW"}) {
+		t.Errorf("verifier accepted an old-set code: got %v, want [$2a$hashNEW]", got)
+	}
+}
+
+// TestRecoveryCodes_UsedBeatsUnusedLWW: marking a code used wins over a peer's
+// stale "unused" copy of the SAME code (same active set) via updated_at LWW.
+func TestRecoveryCodes_UsedBeatsUnusedLWW(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$hashA"}); err != nil {
+		t.Fatal(err)
+	}
+	setID := activeSetID(t, c, "alice")
+	if err := MarkRecoveryCodeUsed(ctx, c, "alice", "$2a$hashA"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Peer pushes the SAME code (current set) UNUSED with an OLDER updated_at.
+	c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{{
+		Name:    "recovery_codes",
+		Columns: []string{"username", "code_hash", "used_at", "created_at", "set_id", "updated_at", "deleted_at"},
+		Rows:    [][]interface{}{{"alice", "$2a$hashA", nil, "2020-01-01T00:00:00Z", setID, "2020-01-01T00:00:00Z", nil}},
+	}}}))
+
+	got, _ := ListUnusedRecoveryCodes(ctx, c, "alice")
+	if slices.Contains(got, "$2a$hashA") {
+		t.Errorf("a used code reverted to unused via a stale peer merge: %v", got)
+	}
+}
+
+// TestRecoveryCodes_OldDumpMissingColumnsNotAccepted (mixed-version): an old
+// (pre-v32) peer dumps recovery_codes WITHOUT set_id/updated_at/deleted_at,
+// carrying a code LIVE. It lands with set_id=” (default); against a user whose
+// active set is a real (non-”) id, it does not validate.
+func TestRecoveryCodes_OldDumpMissingColumnsNotAccepted(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$hashCurrent"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// OLD-shape dump: only the pre-v32 columns, a LIVE code.
+	c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{{
+		Name:    "recovery_codes",
+		Columns: []string{"username", "code_hash", "used_at", "created_at"},
+		Rows:    [][]interface{}{{"alice", "$2a$hashLegacy", nil, "2020-01-01T00:00:00Z"}},
+	}}}))
+
+	got, _ := ListUnusedRecoveryCodes(ctx, c, "alice")
+	if slices.Contains(got, "$2a$hashLegacy") {
+		t.Errorf("old-shape ('' set_id) code accepted under a real active set: %v", got)
+	}
+}
+
+// TestDeleteUser_CascadesAndNoResurrect: deleting a user tombstones its 2FA +
+// recovery codes + set pointer, and recreating the user does not resurrect them.
+func TestDeleteUser_CascadesAndNoResurrect(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := InsertUser(ctx, c, "dave", "operator", "ph"); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "dave", Method: "totp", Secret: "s", Label: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertRecoveryCodes(ctx, c, "dave", []string{"$2a$hashD"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DeleteUser(ctx, c, "dave"); err != nil {
+		t.Fatal(err)
+	}
+	if has2FA(t, c, "dave", "totp") {
+		t.Error("2FA factor survived DeleteUser")
+	}
+	if got, _ := ListUnusedRecoveryCodes(ctx, c, "dave"); len(got) != 0 {
+		t.Errorf("recovery codes survived DeleteUser: %v", got)
+	}
+
+	// Recreate: no stale factor/codes come back.
+	if err := InsertUser(ctx, c, "dave", "operator", "ph2"); err != nil {
+		t.Fatal(err)
+	}
+	if has2FA(t, c, "dave", "totp") {
+		t.Error("2FA factor resurrected after delete→recreate")
+	}
+	if got, _ := ListUnusedRecoveryCodes(ctx, c, "dave"); len(got) != 0 {
+		t.Errorf("recovery codes resurrected after delete→recreate: %v", got)
+	}
+}
+
+// TestRecoveryCodes_LegacyBackfillStillValidates: a pre-v32 DB has recovery_codes
+// with set_id=” and NO pointer row. The InitSchema backfill gives them an
+// active_set_id=” pointer so they keep validating; a later re-enroll supersedes
+// them; re-running the backfill is a no-op for the re-enrolled user.
+func TestRecoveryCodes_LegacyBackfillStillValidates(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	// Simulate a pre-v32 row: legacy shape (set_id/updated_at default to '', no pointer).
+	if err := c.execLocal(ctx,
+		`INSERT INTO recovery_codes (username, code_hash, created_at) VALUES ('erin', '$2a$legacy', '2021-06-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	// Before the backfill there is no pointer, so the code can't validate yet.
+	if got, _ := ListUnusedRecoveryCodes(ctx, c, "erin"); len(got) != 0 {
+		t.Fatalf("precondition: expected no valid codes before backfill, got %v", got)
+	}
+
+	if err := applyV32DataFixes(ctx, c, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ListUnusedRecoveryCodes(ctx, c, "erin"); !slices.Equal(got, []string{"$2a$legacy"}) {
+		t.Errorf("legacy code did not validate after backfill: %v", got)
+	}
+
+	// Re-enroll supersedes the legacy set.
+	if err := InsertRecoveryCodes(ctx, c, "erin", []string{"$2a$fresh"}); err != nil {
+		t.Fatal(err)
+	}
+	// Re-running the backfill must NOT reset the re-enrolled user's pointer.
+	if err := applyV32DataFixes(ctx, c, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := ListUnusedRecoveryCodes(ctx, c, "erin")
+	if !slices.Equal(got, []string{"$2a$fresh"}) {
+		t.Errorf("re-enrolled set not active after backfill re-run: %v", got)
+	}
+}

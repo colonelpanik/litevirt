@@ -100,18 +100,26 @@ func TestLBConfig_SurvivesStaleMerge(t *testing.T) {
 }
 
 // TestLBBackend_RecreateHidesOldTombstone: after a backend is deleted then the LB
-// is recreated with the same backend, the live row wins (tombstone cleared).
+// is recreated (a fresh generation) with the same backend, the live row wins
+// (tombstone cleared) and renders under the new incarnation.
 func TestLBBackend_RecreateHidesOldTombstone(t *testing.T) {
 	c := mustTestClient(t)
 	ctx := context.Background()
-	if err := UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b1", Address: "10.0.0.1", Enabled: true}); err != nil {
+	// Original incarnation: config + backend share generation g1.
+	if err := UpsertLBConfig(ctx, c, LBConfigRecord{Name: "lb1", VIP: "10.0.0.9", Algorithm: "rr", Enabled: true, Generation: "g1"}); err != nil {
+		t.Fatalf("UpsertLBConfig: %v", err)
+	}
+	if err := UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b1", Address: "10.0.0.1", Enabled: true, Generation: "g1"}); err != nil {
 		t.Fatalf("UpsertLBBackend: %v", err)
 	}
 	if err := TombstoneLBBackend(ctx, c, "lb1", "b1"); err != nil {
 		t.Fatalf("TombstoneLBBackend: %v", err)
 	}
-	if err := UpsertLBBackend(ctx, c, LBBackendRecord{LBName: "lb1", Name: "b1", Address: "10.0.0.2", Enabled: true}); err != nil {
-		t.Fatalf("re-add UpsertLBBackend: %v", err)
+	// Recreate the whole LB with a fresh generation g2 and the same backend at a
+	// new address (mirrors CreateLoadBalancer → PersistLBFull).
+	if err := PersistLBFull(ctx, c, LBConfigRecord{Name: "lb1", VIP: "10.0.0.9", Algorithm: "rr", Enabled: true, Generation: "g2"},
+		[]LBBackendRecord{{Name: "b1", Address: "10.0.0.2", Enabled: true}}); err != nil {
+		t.Fatalf("PersistLBFull recreate: %v", err)
 	}
 	bs, err := ListLBBackends(ctx, c, "lb1")
 	if err != nil {

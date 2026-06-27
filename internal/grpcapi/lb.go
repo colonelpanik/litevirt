@@ -544,15 +544,15 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 
 	// Build backends.
 	var lbBackends []lb.Backend
+	var backendRecords []corrosion.LBBackendRecord
 	backendPort := int(req.Ports[0].Target)
 
-	// Recreate (same name) clears any locally-known stale backend tombstones for
-	// this LB before inserting the requested set, so an old backend can't linger.
-	// (Does not cover backend rows a peer has but this node never saw — that needs
-	// a generation/epoch design; tracked as a follow-up.)
-	if err := corrosion.SoftDeleteLBBackends(ctx, s.db, req.Name); err != nil {
-		slog.Warn("CreateLoadBalancer: clear prior backends", "error", err)
-	}
+	// Mint a fresh generation token for this incarnation. Readers render only
+	// backends carrying the current config's generation, so a stale backend a
+	// partitioned peer still holds (and this node never saw) can merge under
+	// anti-entropy but never renders — recreating the same name can't re-route
+	// traffic to a removed backend.
+	generation := newID()
 
 	// Explicit backends.
 	for _, b := range req.Backends {
@@ -562,11 +562,9 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			name = addr
 		}
 		lbBackends = append(lbBackends, lb.Backend{Name: name, IP: addr, Port: backendPort})
-		if err := corrosion.UpsertLBBackend(ctx, s.db, corrosion.LBBackendRecord{
+		backendRecords = append(backendRecords, corrosion.LBBackendRecord{
 			LBName: req.Name, Name: name, Address: addr, Enabled: true,
-		}); err != nil {
-			slog.Warn("CreateLoadBalancer: persist backend", "error", err)
-		}
+		})
 	}
 
 	// VM backends — resolve IPs.
@@ -579,27 +577,29 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			}
 			if ip != "" {
 				lbBackends = append(lbBackends, lb.Backend{Name: vmName, IP: ip, Port: backendPort})
-				if err := corrosion.UpsertLBBackend(ctx, s.db, corrosion.LBBackendRecord{
+				backendRecords = append(backendRecords, corrosion.LBBackendRecord{
 					LBName: req.Name, Name: vmName, Address: ip, IsVM: true, VMName: vmName, Enabled: true,
-				}); err != nil {
-					slog.Warn("CreateLoadBalancer: persist VM backend", "error", err)
-				}
+				})
 				break
 			}
 		}
 	}
 
-	// Persist LB config.
+	// Persist the config + the full backend set as ONE atomic batch stamped with
+	// the new generation: a recreate bulk-tombstones any prior backends and
+	// re-stamps the survivors, so the persistent model is never left half-written
+	// for the DB-render reapply to act on (was warn-only per-row before).
 	hostsJSON, _ := json.Marshal(req.Hosts)
 	portsJSON, _ := json.Marshal(req.Ports)
-	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
-		Name:      req.Name,
-		VIP:       req.Vip,
-		Algorithm: algorithm,
-		Hosts:     string(hostsJSON),
-		Ports:     string(portsJSON),
-		Enabled:   true,
-	}); err != nil {
+	if err := corrosion.PersistLBFull(ctx, s.db, corrosion.LBConfigRecord{
+		Name:       req.Name,
+		VIP:        req.Vip,
+		Algorithm:  algorithm,
+		Hosts:      string(hostsJSON),
+		Ports:      string(portsJSON),
+		Enabled:    true,
+		Generation: generation,
+	}, backendRecords); err != nil {
 		return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
 	}
 
@@ -726,7 +726,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 
 	// Look up existing config.
 	rows, err := s.db.Query(ctx,
-		`SELECT name, stack_name, vip, algorithm, hosts, ports, enabled FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.Name)
+		`SELECT name, stack_name, vip, algorithm, hosts, ports, enabled, generation FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.Name)
 	if err != nil || len(rows) == 0 {
 		return nil, status.Errorf(codes.NotFound, "load balancer %q not found", req.Name)
 	}
@@ -792,19 +792,20 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		}
 	}
 
-	// Handle backend changes.
-	for _, name := range req.RemoveBackends {
-		corrosion.TombstoneLBBackend(ctx, s.db, req.Name, name)
-	}
-	for _, vmName := range req.RemoveVmBackends {
-		corrosion.TombstoneLBBackend(ctx, s.db, req.Name, vmName)
-	}
+	// Collect backend changes; persisted atomically with the config below (one
+	// batch) so an edit can't leave a partial model. The PRESERVED generation
+	// keeps the already-stored backends matching the config and rendering.
+	generation := r.String("generation")
+	var tombstones []string
+	tombstones = append(tombstones, req.RemoveBackends...)
+	tombstones = append(tombstones, req.RemoveVmBackends...)
+	var upserts []corrosion.LBBackendRecord
 	for _, b := range req.AddBackends {
 		name := b.Name
 		if name == "" {
 			name = b.Address
 		}
-		corrosion.UpsertLBBackend(ctx, s.db, corrosion.LBBackendRecord{
+		upserts = append(upserts, corrosion.LBBackendRecord{
 			LBName: req.Name, Name: name, Address: b.Address, Enabled: true,
 		})
 	}
@@ -812,7 +813,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vmName)
 		for _, iface := range ifaces {
 			if iface.IP != "" {
-				corrosion.UpsertLBBackend(ctx, s.db, corrosion.LBBackendRecord{
+				upserts = append(upserts, corrosion.LBBackendRecord{
 					LBName: req.Name, Name: vmName, Address: iface.IP, IsVM: true, VMName: vmName, Enabled: true,
 				})
 				break
@@ -820,16 +821,17 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		}
 	}
 
-	// Persist updated config.
-	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
-		Name:      req.Name,
-		StackName: r.String("stack_name"),
-		VIP:       vip,
-		Algorithm: algorithm,
-		Hosts:     hostsStr,
-		Ports:     portsStr,
-		Enabled:   r.Int("enabled") == 1,
-	}); err != nil {
+	// Persist updated config + backend changes atomically (generation preserved).
+	if err := corrosion.PersistLBIncremental(ctx, s.db, corrosion.LBConfigRecord{
+		Name:       req.Name,
+		StackName:  r.String("stack_name"),
+		VIP:        vip,
+		Algorithm:  algorithm,
+		Hosts:      hostsStr,
+		Ports:      portsStr,
+		Enabled:    r.Int("enabled") == 1,
+		Generation: generation,
+	}, upserts, tombstones); err != nil {
 		return nil, status.Errorf(codes.Internal, "persist LB config: %v", err)
 	}
 
@@ -1149,11 +1151,22 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 	backends := s.collectLBBackends(ctx, spec.StackName, lbSpec)
 
 	// Read old hosts before computing new ones so we can clean up stale hosts.
+	// Read the existing generation too: preserve it when the LB already exists
+	// (its explicit backends keep matching), and mint a fresh one only for a
+	// brand-new stack LB. A pre-v31 LB reads generation='' and keeps it, so its
+	// '' backends still match — don't re-stamp and orphan them.
 	var oldHosts []string
-	if rows, err := s.db.Query(ctx, `SELECT hosts FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, lbName); err == nil && len(rows) > 0 {
+	generation := ""
+	haveConfig := false
+	if rows, err := s.db.Query(ctx, `SELECT hosts, generation FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, lbName); err == nil && len(rows) > 0 {
+		haveConfig = true
+		generation = rows[0].String("generation")
 		if h := rows[0].String("hosts"); h != "" && h != "[]" {
 			json.Unmarshal([]byte(h), &oldHosts)
 		}
+	}
+	if !haveConfig {
+		generation = newID()
 	}
 
 	// Determine which hosts should run the LB.
@@ -1182,13 +1195,14 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 	hostsJSON, _ := json.Marshal(targetHosts)
 	portsJSON, _ := json.Marshal(lbSpec.Ports)
 	corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
-		Name:      lbName,
-		StackName: spec.StackName,
-		VIP:       lbSpec.Vip,
-		Algorithm: algorithm,
-		Hosts:     string(hostsJSON),
-		Ports:     string(portsJSON),
-		Enabled:   true,
+		Name:       lbName,
+		StackName:  spec.StackName,
+		VIP:        lbSpec.Vip,
+		Algorithm:  algorithm,
+		Hosts:      string(hostsJSON),
+		Ports:      string(portsJSON),
+		Enabled:    true,
+		Generation: generation,
 	})
 
 	// Apply locally if this host is a target.

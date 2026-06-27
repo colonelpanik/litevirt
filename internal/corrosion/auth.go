@@ -7,6 +7,8 @@ package corrosion
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 )
@@ -285,24 +287,28 @@ type User2FARecord struct {
 	LastStep   int64 // highest consumed TOTP time-step (replay guard); 0 = none yet
 }
 
-// InsertUser2FA records an enrolled factor.
+// InsertUser2FA records an enrolled factor. Re-enrolling a previously
+// soft-deleted (username, method, label) reactivates it: deleted_at is cleared
+// and the TOTP replay ratchet is reset (mirrors UpsertLBConfig/InsertUser).
+// label is a Go string (never NULL), so the composite PK never carries a NULL.
 func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(username, method, label) DO UPDATE
-		   SET secret = excluded.secret, updated_at = excluded.updated_at`,
+		   SET secret = excluded.secret, updated_at = excluded.updated_at,
+		       deleted_at = NULL, last_step = 0`,
 		r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now)
 }
 
-// ListUser2FA returns the user's enrolled factors. Empty slice = no 2FA.
+// ListUser2FA returns the user's enrolled (non-deleted) factors. Empty slice = no 2FA.
 func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FARecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT username, method, secret, COALESCE(label, '') AS label,
 		        enrolled_at, COALESCE(last_used_at, '') AS last_used_at,
 		        COALESCE(last_step, 0) AS last_step
-		 FROM user_2fa WHERE username = ?`, username)
+		 FROM user_2fa WHERE username = ? AND deleted_at IS NULL`, username)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +329,7 @@ func TouchUser2FA(ctx context.Context, c *Client, username, method, label string
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE user_2fa SET last_used_at = ?, updated_at = ?
-		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
+		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND deleted_at IS NULL`,
 		nowRFC3339(), now, username, method, label)
 }
 
@@ -337,45 +343,97 @@ func RecordTOTPStep(ctx context.Context, c *Client, username, method, label stri
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE user_2fa SET last_step = ?, last_used_at = ?, updated_at = ?
-		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND last_step < ?`,
+		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND last_step < ? AND deleted_at IS NULL`,
 		step, nowRFC3339(), now, username, method, label, step)
 }
 
-// DeleteUser2FA un-enrolls a single factor.
+// DeleteUser2FA un-enrolls a single factor. It SOFT-deletes (sets deleted_at +
+// bumps updated_at) rather than hard-deleting: anti-entropy is a union merge that
+// can't propagate a hard delete, so a peer that missed it would resurrect the
+// factor. The newer updated_at carries the tombstone under the sensitive lane.
 func DeleteUser2FA(ctx context.Context, c *Client, username, method, label string) error {
+	now := c.NowTS()
 	return c.Execute(ctx,
-		`DELETE FROM user_2fa WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
-		username, method, label)
+		`UPDATE user_2fa SET deleted_at = ?, updated_at = ?
+		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
+		nowRFC3339(), now, username, method, label)
 }
 
 // ────────────────────────────── RECOVERY CODES ──────────────────────────────
 
-// InsertRecoveryCodes stores N bcrypt-hashed single-use codes.
+// randomSetID mints an opaque 16-byte hex token naming a recovery-code
+// enrollment set. It is an identity match only (no ordering), so per-node clock
+// skew is irrelevant — unlike a numeric/MAX generation, which NowTS()'s per-node
+// (not cluster) monotonicity would make unsafe for selecting the active set.
+func randomSetID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("recovery set id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// InsertRecoveryCodes stores N bcrypt-hashed single-use codes as a new
+// enrollment set and points the user at it. Validity comes from the active-set
+// pointer (recovery_code_sets), NOT from deletion: a code is accepted only when
+// its set_id equals the pointer's active_set_id, so a stale old-set code a peer
+// resurrects can never validate even if its tombstone was missed. One atomic
+// batch (a single NowTS for the LWW keys):
+//
+//	(a) LWW-upsert the pointer to a freshly-minted random set_id;
+//	(b) best-effort soft-delete locally-known old unused codes (cleanup only —
+//	    validity already comes from the pointer);
+//	(c) insert the new set's codes carrying that set_id.
 func InsertRecoveryCodes(ctx context.Context, c *Client, username string, codeHashes []string) error {
-	now := nowRFC3339() // recovery_codes.created_at — bare marker (no updated_at on this table)
-	stmts := make([]Statement, 0, len(codeHashes)+1)
-	// Wipe any prior unused codes — re-enrollment invalidates old ones.
+	setID, err := randomSetID()
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()       // LWW key for the pointer + code rows
+	marker := nowRFC3339() // bare created_at/deleted_at markers (non-LWW)
+	stmts := make([]Statement, 0, len(codeHashes)+2)
+	// (a) Point the user at the new set (LWW on updated_at).
 	stmts = append(stmts, Statement{
-		SQL:    `DELETE FROM recovery_codes WHERE username = ? AND used_at IS NULL`,
-		Params: []interface{}{username},
+		SQL: `INSERT INTO recovery_code_sets (username, active_set_id, updated_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(username) DO UPDATE SET
+			   active_set_id = excluded.active_set_id,
+			   updated_at = excluded.updated_at,
+			   deleted_at = NULL`,
+		Params: []interface{}{username, setID, now},
 	})
+	// (b) Cleanup: soft-delete this node's old unused codes from prior sets.
+	stmts = append(stmts, Statement{
+		SQL: `UPDATE recovery_codes SET deleted_at = ?, updated_at = ?
+			 WHERE username = ? AND used_at IS NULL AND set_id != ?`,
+		Params: []interface{}{marker, now, username, setID},
+	})
+	// (c) Insert the new codes. ON CONFLICT re-homes a recurring hash into the new
+	//     set (bcrypt salting makes recurrence practically impossible; defensive).
 	for _, h := range codeHashes {
 		stmts = append(stmts, Statement{
-			SQL: `INSERT INTO recovery_codes (username, code_hash, created_at)
-			 VALUES (?, ?, ?)
-			 ON CONFLICT(username, code_hash) DO NOTHING`,
-			Params: []interface{}{username, h, now},
+			SQL: `INSERT INTO recovery_codes (username, code_hash, created_at, set_id, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(username, code_hash) DO UPDATE SET
+			   set_id = excluded.set_id, used_at = NULL,
+			   deleted_at = NULL, updated_at = excluded.updated_at`,
+			Params: []interface{}{username, h, marker, setID, now},
 		})
 	}
 	return c.ExecuteBatch(ctx, stmts)
 }
 
-// ListUnusedRecoveryCodes returns the bcrypt hashes the verifier should
-// try against a presented code.
+// ListUnusedRecoveryCodes returns the bcrypt hashes the verifier should try
+// against a presented code: unused, not tombstoned, and belonging to the user's
+// CURRENT active set. An old-set code (a resurrected peer row) is excluded even
+// if its tombstone was missed, because its set_id no longer matches the pointer.
 func ListUnusedRecoveryCodes(ctx context.Context, c *Client, username string) ([]string, error) {
 	rows, err := c.Query(ctx,
-		`SELECT code_hash FROM recovery_codes WHERE username = ? AND used_at IS NULL`,
-		username)
+		`SELECT code_hash FROM recovery_codes
+		 WHERE username = ? AND used_at IS NULL AND deleted_at IS NULL
+		   AND set_id = (SELECT active_set_id FROM recovery_code_sets
+		                 WHERE username = ? AND deleted_at IS NULL)`,
+		username, username)
 	if err != nil {
 		return nil, err
 	}
@@ -386,9 +444,16 @@ func ListUnusedRecoveryCodes(ctx context.Context, c *Client, username string) ([
 	return out, nil
 }
 
-// MarkRecoveryCodeUsed sets used_at on a hash so it can't be reused.
+// MarkRecoveryCodeUsed sets used_at on a hash so it can't be reused, and bumps
+// updated_at so "used" beats a peer's stale "unused" under LWW. The defensive
+// WHERE (active-set match, unused, not tombstoned) means a re-enroll landing
+// between list-and-mark can't flip an old-set row.
 func MarkRecoveryCodeUsed(ctx context.Context, c *Client, username, codeHash string) error {
+	now := c.NowTS()
 	return c.Execute(ctx,
-		`UPDATE recovery_codes SET used_at = ? WHERE username = ? AND code_hash = ?`,
-		nowRFC3339(), username, codeHash) // bare marker (no updated_at on this table)
+		`UPDATE recovery_codes SET used_at = ?, updated_at = ?
+		 WHERE username = ? AND code_hash = ? AND used_at IS NULL AND deleted_at IS NULL
+		   AND set_id = (SELECT active_set_id FROM recovery_code_sets
+		                 WHERE username = ? AND deleted_at IS NULL)`,
+		nowRFC3339(), now, username, codeHash, username)
 }

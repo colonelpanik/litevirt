@@ -154,7 +154,24 @@ import (
 //	     O(N^2) live-Ping fan-out. Additive INTEGER DEFAULT 0; old rows read 0
 //	     (unknown → never an upgrade source) until the peer writes its own at boot.
 //	     gap-1 from v29.
-const CurrentSchemaVersion = 30
+//	v31: lb_configs.generation + lb_backends.generation — a per-incarnation token
+//	     (minted on create/recreate, preserved on edit). Readers render only the
+//	     backends whose generation matches their lb_config's, so a stale backend a
+//	     partitioned peer held (and this node never saw) can merge under anti-entropy
+//	     but never renders — closing the LB OR-set edge. Additive TEXT DEFAULT '';
+//	     pre-migration rows match '' = '' and keep rendering. gap-1 from v30.
+//	v32: make 2FA/recovery peer-repairable so they can join the sensitive
+//	     anti-entropy lane. user_2fa.deleted_at (soft-delete, was a hard delete);
+//	     recovery_codes.set_id + updated_at + deleted_at; and a new
+//	     recovery_code_sets(username PK, active_set_id, updated_at, deleted_at)
+//	     per-user pointer. A recovery code is valid only when its set_id equals the
+//	     pointer's active_set_id, so a stale old-set code a peer resurrects can't
+//	     validate. The pointer converges by ordinary updated_at LWW (no numeric/MAX
+//	     generation ordering, which per-node-monotonic NowTS would make unsafe).
+//	     Four ADD COLUMNs + one CREATE TABLE; gap-1 from v31. InitSchema runs two
+//	     idempotent post-migration data fixes (user_2fa NULL→'' label; legacy
+//	     recovery_codes set/pointer backfill) via raw SQL, not replicated mutations.
+const CurrentSchemaVersion = 32
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -247,6 +264,13 @@ func InitSchema(ctx context.Context, c *Client) error {
 		healed++
 	}
 
+	// v32 post-migration data fixes (idempotent, LOCAL-only — schema-init data
+	// repair must not emit replication mutations). Runs after the ledger loop so
+	// the v32 columns + recovery_code_sets are guaranteed present.
+	if err := applyV32DataFixes(ctx, c, now); err != nil {
+		return fmt.Errorf("schema init: v32 data fixes: %w", err)
+	}
+
 	for _, idx := range schemaIndexes {
 		if err := c.execLocal(ctx, idx); err != nil {
 			slog.Warn("index creation failed (non-fatal)", "error", err)
@@ -261,6 +285,42 @@ func InitSchema(ctx context.Context, c *Client) error {
 	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
 		"version", eff, "ledger", len(schemaMigrationLedger), "healed", healed)
+	return nil
+}
+
+// applyV32DataFixes runs the idempotent, LOCAL-only data repairs the v32
+// migration needs but that schemaMigrations (ADD COLUMN only) can't express:
+//
+//   - Normalize user_2fa.label NULL → ” so the composite PK never carries a NULL
+//     component — a NULL-label row and an ”-label row are distinct, which would
+//     let the sensitive merge duplicate a factor or skip a tombstone.
+//   - Backfill recovery-code sets: give every pre-v32 user an active-set pointer
+//     (active_set_id=”) and stamp legacy codes' LWW key (updated_at=created_at),
+//     so existing unused codes (set_id=”) keep validating until the next
+//     re-enroll mints a real set and supersedes them.
+//
+// Every statement is a no-op on a fresh or already-fixed DB, and the pointer
+// insert is INSERT-ONLY so a re-run never resets a user who has since re-enrolled
+// (their pointer already holds a real active_set_id). The column stays physically
+// nullable (additive-only — no ALTER COLUMN); normalized write paths keep it ”
+// going forward.
+func applyV32DataFixes(ctx context.Context, c *Client, now string) error {
+	type stmt struct {
+		sql    string
+		params []interface{}
+	}
+	for _, s := range []stmt{
+		{`UPDATE user_2fa SET label = '' WHERE label IS NULL`, nil},
+		{`INSERT INTO recovery_code_sets (username, active_set_id, updated_at, deleted_at)
+		  SELECT username, '', COALESCE(MAX(created_at), ?), NULL
+		  FROM recovery_codes GROUP BY username
+		  ON CONFLICT(username) DO NOTHING`, []interface{}{now}},
+		{`UPDATE recovery_codes SET updated_at = created_at WHERE updated_at = ''`, nil},
+	} {
+		if err := c.execLocal(ctx, s.sql, s.params...); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -719,7 +779,8 @@ var schemaDDL = []string{
 		ports        TEXT NOT NULL DEFAULT '[]',
 		enabled      INTEGER NOT NULL DEFAULT 1,
 		updated_at   TEXT NOT NULL,
-		deleted_at   TEXT
+		deleted_at   TEXT,
+		generation   TEXT NOT NULL DEFAULT ''
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS lb_backends (
@@ -731,6 +792,7 @@ var schemaDDL = []string{
 		enabled      INTEGER NOT NULL DEFAULT 1,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
+		generation   TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (lb_name, name)
 	)`,
 
@@ -814,22 +876,41 @@ var schemaDDL = []string{
 		username      TEXT NOT NULL,
 		method        TEXT NOT NULL,        -- totp | webauthn
 		secret        TEXT NOT NULL,
-		label         TEXT,                 -- user-supplied label (e.g. "phone")
+		label         TEXT,                 -- user-supplied label (e.g. "phone"); normalized to '' on write, never NULL
 		enrolled_at   TEXT NOT NULL,
 		last_used_at  TEXT,
 		updated_at    TEXT NOT NULL,
 		last_step     INTEGER NOT NULL DEFAULT 0, -- highest consumed TOTP time-step (replay guard)
+		deleted_at    TEXT,                 -- soft-delete tombstone (sensitive anti-entropy lane)
 		PRIMARY KEY (username, method, label)
 	)`,
 
 	// Recovery codes (single-use). Used codes have used_at set
-	// rather than being deleted, so reuse is detectable.
+	// rather than being deleted, so reuse is detectable. set_id ties a code to
+	// its enrollment set; a code validates only when set_id == the user's
+	// active_set_id (recovery_code_sets), so a resurrected old-set code can't
+	// be accepted after re-enroll. updated_at/deleted_at make it LWW-repairable.
 	`CREATE TABLE IF NOT EXISTS recovery_codes (
 		username   TEXT NOT NULL,
 		code_hash  TEXT NOT NULL,           -- bcrypt of code
 		used_at    TEXT,
 		created_at TEXT NOT NULL,
+		set_id     TEXT NOT NULL DEFAULT '', -- enrollment set; valid only if == active_set_id
+		updated_at TEXT NOT NULL DEFAULT '', -- LWW key for the sensitive anti-entropy lane
+		deleted_at TEXT,                      -- soft-delete tombstone
 		PRIMARY KEY (username, code_hash)
+	)`,
+
+	// recovery_code_sets is the per-user active recovery-code pointer. Re-enroll
+	// mints a random active_set_id and LWW-upserts this row; verification matches
+	// a code's set_id against active_set_id. Converges by ordinary updated_at LWW
+	// (no numeric/MAX generation ordering, which per-node-monotonic NowTS makes
+	// unsafe across nodes).
+	`CREATE TABLE IF NOT EXISTS recovery_code_sets (
+		username      TEXT PRIMARY KEY,
+		active_set_id TEXT NOT NULL,
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT
 	)`,
 
 	// ═══════════ DNS ═══════════
@@ -1346,6 +1427,7 @@ var tablePrimaryKeys = map[string][]string{
 	"sessions":               {"id"},
 	"user_2fa":               {"username", "method", "label"},
 	"recovery_codes":         {"username", "code_hash"},
+	"recovery_code_sets":     {"username"},
 	"dns_records":            {"name"},
 	"fencing_log":            {"id"},
 	"audit_log":              {"id"},
@@ -1525,6 +1607,16 @@ var schemaMigrations = []string{
 
 	// v30: persist each host's running-binary schema for the self-upgrade watcher.
 	`ALTER TABLE hosts ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 0`,
+
+	// v31: per-incarnation LB generation token (render only current-incarnation backends).
+	`ALTER TABLE lb_configs ADD COLUMN generation TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE lb_backends ADD COLUMN generation TEXT NOT NULL DEFAULT ''`,
+
+	// v32: make 2FA/recovery peer-repairable (sensitive anti-entropy lane).
+	`ALTER TABLE user_2fa ADD COLUMN deleted_at TEXT`,
+	`ALTER TABLE recovery_codes ADD COLUMN set_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE recovery_codes ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE recovery_codes ADD COLUMN deleted_at TEXT`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -1592,7 +1684,9 @@ var alterVersions = []int{
 	25,     // containers.project
 	28, 28, // containers.is_template/on_host_failure
 	29, 29, // tokens.updated_at, lb_backends.deleted_at
-	30, // hosts.schema_version
+	30,     // hosts.schema_version
+	31, 31, // lb_configs.generation, lb_backends.generation
+	32, 32, 32, 32, // user_2fa.deleted_at; recovery_codes.set_id/updated_at/deleted_at
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -1607,6 +1701,7 @@ var createTableUnits = []struct {
 	{13, "vm_events"}, {14, "vm_backups"}, {20, "notification_targets"},
 	{21, "ip_sets"}, {22, "replication_checkpoints"}, {23, "registry_credentials"},
 	{26, "container_backups"}, {27, "container_snapshots"},
+	{32, "recovery_code_sets"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

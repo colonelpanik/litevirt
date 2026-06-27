@@ -121,6 +121,144 @@ func TestUser2FA_UnseenPeerFactorDoesNotResurrect(t *testing.T) {
 	}
 }
 
+// TestRecordTOTPStep_RatchetSingleUse: the step ratchet consumes a given step
+// once. A second update at the same (or lower) step changes zero rows and
+// reports false, so the verifier won't authenticate a replay that raced past the
+// Go-level pre-check.
+func TestRecordTOTPStep_RatchetSingleUse(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "totp", Secret: "sek", Label: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := RecordTOTPStep(ctx, c, "alice", "totp", "", "sek", 100); err != nil || !ok {
+		t.Fatalf("first ratchet: ok=%v err=%v (want true)", ok, err)
+	}
+	if ok, err := RecordTOTPStep(ctx, c, "alice", "totp", "", "sek", 100); err != nil || ok {
+		t.Errorf("replay at same step: ok=%v err=%v (want false)", ok, err)
+	}
+	if ok, _ := RecordTOTPStep(ctx, c, "alice", "totp", "", "sek", 50); ok {
+		t.Error("ratchet moved backward")
+	}
+	if ok, err := RecordTOTPStep(ctx, c, "alice", "totp", "", "sek", 101); err != nil || !ok {
+		t.Errorf("forward step: ok=%v err=%v (want true)", ok, err)
+	}
+}
+
+// TestRecordTOTPStep_RejectsWrongSecretAndStaleEpoch: the ratchet only fires for
+// the exact verified secret and the active epoch, so a re-enroll (new secret) or
+// a disable (tombstoned pointer) landing between list-and-mark can't authenticate.
+func TestRecordTOTPStep_RejectsWrongSecretAndStaleEpoch(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "totp", Secret: "sek", Label: ""}); err != nil {
+		t.Fatal(err)
+	}
+	// Wrong secret (a re-enroll changed it) → no ratchet.
+	if ok, _ := RecordTOTPStep(ctx, c, "alice", "totp", "", "STALE-secret", 100); ok {
+		t.Error("ratchet fired for a stale secret")
+	}
+	// Disable the factor (last one → pointer tombstoned); the active epoch is gone.
+	if err := DeleteUser2FA(ctx, c, "alice", "totp", ""); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := RecordTOTPStep(ctx, c, "alice", "totp", "", "sek", 100); ok {
+		t.Error("ratchet fired with no live active-set pointer")
+	}
+}
+
+// TestDeleteUser2FA_LastFactorTombstonesPointer (finding 3): removing the last
+// live factor tombstones the active-set pointer, so a peer's unseen factor under
+// that epoch can't silently re-enable 2FA. A non-last removal leaves it live.
+func TestDeleteUser2FA_LastFactorTombstonesPointer(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "totp", Secret: "s", Label: "phone"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertUser2FA(ctx, c, User2FARecord{Username: "alice", Method: "webauthn", Secret: "b", Label: "key"}); err != nil {
+		t.Fatal(err)
+	}
+	epoch, _, _ := activeUser2FAEpoch(ctx, c, "alice")
+
+	// Remove one of two factors → pointer stays live.
+	if err := DeleteUser2FA(ctx, c, "alice", "webauthn", "key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, live, _ := activeUser2FAEpoch(ctx, c, "alice"); !live {
+		t.Error("pointer tombstoned while a live factor remains")
+	}
+
+	// Remove the last factor → pointer tombstoned.
+	if err := DeleteUser2FA(ctx, c, "alice", "totp", "phone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, live, _ := activeUser2FAEpoch(ctx, c, "alice"); live {
+		t.Error("pointer still live after the last factor was removed")
+	}
+
+	// A peer resurrects an unseen factor under the now-stale epoch → must not render.
+	c.MergeSensitiveStateBytesLWW(encodeSyncPayload(t, &syncPayload{Tables: []syncTable{{
+		Name:    "user_2fa",
+		Columns: []string{"username", "method", "secret", "label", "enrolled_at", "last_used_at", "updated_at", "last_step", "deleted_at", "epoch"},
+		Rows:    [][]interface{}{{"alice", "totp", "ghost", "ghost", "2099-01-01T00:00:00Z", nil, "2099-01-01T00:00:00Z", 0, nil, epoch}},
+	}}}))
+	if fs, _ := ListUser2FA(ctx, c, "alice"); len(fs) != 0 {
+		t.Errorf("2FA re-enabled by an unseen factor after the last factor was disabled: %+v", fs)
+	}
+}
+
+// TestV32Backfill_DeletedUserNotRevived (finding 2): a user deleted under a
+// pre-v32 binary (no auth cascade) keeps live orphan factors/codes and no
+// pointer. The migration must give them a TOMBSTONED pointer (and tombstone the
+// orphans), so reactivating the username doesn't revive old auth state.
+func TestV32Backfill_DeletedUserNotRevived(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	// Simulate pre-v32 on-disk state via raw writes (no cascade, no pointers).
+	if err := c.execLocal(ctx,
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at, deleted_at)
+		 VALUES ('ghost', 'viewer', 'x', '2021-01-01T00:00:00Z', '2021-06-01T00:00:00Z', '2021-06-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.execLocal(ctx,
+		`INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at)
+		 VALUES ('ghost', 'totp', 'oldsecret', '', '2021-01-01T00:00:00Z', '2021-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.execLocal(ctx,
+		`INSERT INTO recovery_codes (username, code_hash, created_at) VALUES ('ghost', '$2a$old', '2021-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := applyV32DataFixes(ctx, c, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pointer must be tombstoned (not a live '' pointer).
+	if _, live, _ := activeUser2FAEpoch(ctx, c, "ghost"); live {
+		t.Error("deleted user got a LIVE 2FA pointer during migration")
+	}
+	if fs, _ := ListUser2FA(ctx, c, "ghost"); len(fs) != 0 {
+		t.Errorf("deleted user's 2FA visible after migration: %+v", fs)
+	}
+	if got, _ := ListUnusedRecoveryCodes(ctx, c, "ghost"); len(got) != 0 {
+		t.Errorf("deleted user's recovery codes valid after migration: %v", got)
+	}
+
+	// Reactivate the username — old auth state must stay dead.
+	if err := InsertUser(ctx, c, "ghost", "viewer", "newpw"); err != nil {
+		t.Fatal(err)
+	}
+	if fs, _ := ListUser2FA(ctx, c, "ghost"); len(fs) != 0 {
+		t.Errorf("reactivation revived old 2FA: %+v", fs)
+	}
+	if got, _ := ListUnusedRecoveryCodes(ctx, c, "ghost"); len(got) != 0 {
+		t.Errorf("reactivation revived old recovery codes: %v", got)
+	}
+}
+
 // TestUser2FA_MultipleFactorsShareEpoch: enrolling a second factor reuses the
 // live epoch (doesn't orphan the first) — both render.
 func TestUser2FA_MultipleFactorsShareEpoch(t *testing.T) {

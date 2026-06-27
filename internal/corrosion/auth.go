@@ -380,29 +380,53 @@ func TouchUser2FA(ctx context.Context, c *Client, username, method, label string
 }
 
 // RecordTOTPStep ratchets last_step forward (and bumps last_used_at) after a
-// successful TOTP verification. The `last_step < ?` guard means a concurrent
-// double-submit of the same code on this node can't move the ratchet twice,
-// and replicates the new high-water step to peers so the same code can't be
-// replayed on a different node either. The caller still performs a Go-level
-// `step <= LastStep` pre-check; this is the persistence + concurrency backstop.
-func RecordTOTPStep(ctx context.Context, c *Client, username, method, label string, step int64) error {
+// successful TOTP verification, and reports whether it actually did. It returns
+// true ONLY when the guarded UPDATE changed a row: the step must advance the
+// ratchet (`last_step < ?`), the factor must still be live, in the active set
+// (epoch match), and carry the SAME secret the caller verified against. So a
+// concurrent double-submit of the same step, or a disable/re-enroll landing
+// between list-and-mark (secret or epoch changed), changes zero rows and returns
+// false — the caller must NOT authenticate on a false. The ratchet replicates
+// the new high-water step so the code can't be replayed on another node either.
+func RecordTOTPStep(ctx context.Context, c *Client, username, method, label, secret string, step int64) (bool, error) {
 	now := c.NowTS()
-	return c.Execute(ctx,
+	n, err := c.ExecuteRows(ctx,
 		`UPDATE user_2fa SET last_step = ?, last_used_at = ?, updated_at = ?
-		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND last_step < ? AND deleted_at IS NULL`,
-		step, nowRFC3339(), now, username, method, label, step)
+		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND secret = ?
+		   AND last_step < ? AND deleted_at IS NULL
+		   AND epoch = (SELECT active_epoch FROM user_2fa_sets
+		                WHERE username = ? AND deleted_at IS NULL)`,
+		step, nowRFC3339(), now, username, method, label, secret, step, username)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // DeleteUser2FA un-enrolls a single factor. It SOFT-deletes (sets deleted_at +
 // bumps updated_at) rather than hard-deleting: anti-entropy is a union merge that
 // can't propagate a hard delete, so a peer that missed it would resurrect the
 // factor. The newer updated_at carries the tombstone under the sensitive lane.
+//
+// If that was the LAST live factor in the active set, it also tombstones the
+// user_2fa_sets pointer in the same batch — otherwise the epoch stays live and a
+// peer's unseen factor under it would silently re-enable 2FA (the API treats
+// "no factors" as "no 2FA"). A later enroll mints a fresh epoch.
 func DeleteUser2FA(ctx context.Context, c *Client, username, method, label string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE user_2fa SET deleted_at = ?, updated_at = ?
-		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
-		nowRFC3339(), now, username, method, label)
+	marker := nowRFC3339()
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: `UPDATE user_2fa SET deleted_at = ?, updated_at = ?
+			 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
+			Params: []interface{}{marker, now, username, method, label}},
+		{SQL: `UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ?
+			 WHERE username = ? AND deleted_at IS NULL
+			   AND NOT EXISTS (SELECT 1 FROM user_2fa f
+			                   WHERE f.username = user_2fa_sets.username
+			                     AND f.deleted_at IS NULL
+			                     AND f.epoch = user_2fa_sets.active_epoch)`,
+			Params: []interface{}{marker, now, username}},
+	})
 }
 
 // ────────────────────────────── RECOVERY CODES ──────────────────────────────

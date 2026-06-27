@@ -316,15 +316,29 @@ func applyV32DataFixes(ctx context.Context, c *Client, now string) error {
 	}
 	for _, s := range []stmt{
 		{`UPDATE user_2fa SET label = '' WHERE label IS NULL`, nil},
+		// Pointer backfill. The pointer is born TOMBSTONED for a user whose account
+		// is already deleted (deleted_at inherited from the users row): a pre-v32
+		// DeleteUser did NOT cascade auth rows, so a deleted user can still hold
+		// live orphan factors/codes that a LIVE pointer would revive on reactivation.
+		// A user with no users row (external realm) inherits NULL -> a live pointer.
 		{`INSERT INTO user_2fa_sets (username, active_epoch, updated_at, deleted_at)
-		  SELECT username, '', COALESCE(MAX(updated_at), ?), NULL
-		  FROM user_2fa GROUP BY username
+		  SELECT f.username, '', COALESCE(MAX(f.updated_at), ?),
+		         (SELECT u.deleted_at FROM users u WHERE u.username = f.username)
+		  FROM user_2fa f GROUP BY f.username
 		  ON CONFLICT(username) DO NOTHING`, []interface{}{now}},
 		{`INSERT INTO recovery_code_sets (username, active_set_id, updated_at, deleted_at)
-		  SELECT username, '', COALESCE(MAX(created_at), ?), NULL
-		  FROM recovery_codes GROUP BY username
+		  SELECT r.username, '', COALESCE(MAX(r.created_at), ?),
+		         (SELECT u.deleted_at FROM users u WHERE u.username = r.username)
+		  FROM recovery_codes r GROUP BY r.username
 		  ON CONFLICT(username) DO NOTHING`, []interface{}{now}},
 		{`UPDATE recovery_codes SET updated_at = created_at WHERE updated_at = ''`, nil},
+		// Tombstone the orphan factor/code rows of already-deleted users (pre-v32
+		// delete left them live) so no live secret rows linger behind the tombstoned
+		// pointer. Idempotent: only touches still-live rows.
+		{`UPDATE user_2fa SET deleted_at = ?, updated_at = ?
+		  WHERE deleted_at IS NULL AND username IN (SELECT username FROM users WHERE deleted_at IS NOT NULL)`, []interface{}{now, now}},
+		{`UPDATE recovery_codes SET deleted_at = ?, updated_at = ?
+		  WHERE deleted_at IS NULL AND username IN (SELECT username FROM users WHERE deleted_at IS NOT NULL)`, []interface{}{now, now}},
 	} {
 		if err := c.execLocal(ctx, s.sql, s.params...); err != nil {
 			return err

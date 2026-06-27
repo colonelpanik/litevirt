@@ -159,8 +159,16 @@ func VerifyTOTP(ctx context.Context, db *corrosion.Client, username, code string
 		if step <= f.LastStep {
 			return false, nil
 		}
-		if err := corrosion.RecordTOTPStep(ctx, db, username, f.Method, f.Label, step); err != nil {
+		recorded, err := corrosion.RecordTOTPStep(ctx, db, username, f.Method, f.Label, f.Secret, step)
+		if err != nil {
 			return false, fmt.Errorf("record totp step: %w", err)
+		}
+		if !recorded {
+			// Lost the replay-ratchet race, or the factor was disabled/re-enrolled
+			// (secret or active epoch changed) between list and mark — do not
+			// authenticate on a zero-row update, and don't fall through to recovery
+			// codes (a replayed/stale TOTP is not a recovery code).
+			return false, nil
 		}
 		return true, nil
 	}

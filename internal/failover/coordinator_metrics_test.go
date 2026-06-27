@@ -223,3 +223,53 @@ func TestFailoverMetrics_FenceLogWriteFailureProceeds(t *testing.T) {
 		t.Errorf("failover did not proceed past fence-log failure: host=%+v (want state=fenced)", h)
 	}
 }
+
+// TestFailoverMetrics_RecoveryQuorumQueryErrorObservable: a DB error on the
+// recovery quorum query must not be silently folded into "not enough healthy
+// observers" — it's counted as a recovery error (fail-open behavior unchanged).
+func TestFailoverMetrics_RecoveryQuorumQueryErrorObservable(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	// An 'offline' host with no fencing_log row reaches the quorum query.
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h1", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "offline",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Force the quorum query to error (the recovery health source is gone) while
+	// ListHosts / recentlyFenced still work.
+	if _, err := db.DB().ExecContext(ctx, `DROP TABLE host_health`); err != nil {
+		t.Fatalf("drop host_health: %v", err)
+	}
+
+	c := newTestCoordinator("coordinator", db)
+	fm := newFakeMetrics()
+	c.Metrics = fm
+	c.recoverHosts(ctx, 1)
+
+	if got := fm.attempts[foKey(PhaseRecovery, ResultError, ErrDBError)]; got != 1 {
+		t.Errorf("recovery-query-error counter = %d, want 1 (attempts=%v)", got, fm.attempts)
+	}
+}
+
+// TestFailoverMetrics_FenceLogReadErrorObservable: a fencing_log read error in
+// the recent-fence / manual-confirmation check fails open (returns false) but is
+// now counted, so a store fault on the safety path is visible.
+func TestFailoverMetrics_FenceLogReadErrorObservable(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	if _, err := db.DB().ExecContext(ctx, `DROP TABLE fencing_log`); err != nil {
+		t.Fatalf("drop fencing_log: %v", err)
+	}
+
+	c := newTestCoordinator("coordinator", db)
+	fm := newFakeMetrics()
+	c.Metrics = fm
+
+	if c.fenceWithinWindow(ctx, "anyhost", false) {
+		t.Error("fenceWithinWindow should fail open (false) on a read error")
+	}
+	if got := fm.attempts[foKey(PhaseHealth, ResultError, ErrDBError)]; got != 1 {
+		t.Errorf("fence-log-read-error counter = %d, want 1 (attempts=%v)", got, fm.attempts)
+	}
+}

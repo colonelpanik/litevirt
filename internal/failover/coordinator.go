@@ -204,8 +204,14 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		// Skip if this host is already in a terminal state.
 		h, err := corrosion.GetHost(ctx, c.db, target)
-		if err != nil || h == nil {
+		if err != nil {
+			// A store error here silently drops a fence candidate; surface it.
+			slog.Warn("failover: resolve target host failed, skipping", "host", target, "error", err)
+			c.mAttempt(PhaseHealth, ResultError, ErrDBError)
 			continue
+		}
+		if h == nil {
+			continue // unknown host (e.g. raced delete) — quiet skip
 		}
 		if h.State == "offline" || h.State == "maintenance" || h.State == "fenced" {
 			c.fenced[target] = true
@@ -298,8 +304,15 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 			   AND consecutive_failures = 0
 			   AND updated_at > ?`,
 			h.Name, freshCutoff)
-		if err != nil || len(rows) == 0 || rows[0].Int("n") < quorum {
+		if err != nil {
+			// A query error would otherwise be indistinguishable from "not enough
+			// healthy observers" and silently suppress recovery.
+			slog.Warn("failover: recovery quorum query failed", "host", h.Name, "error", err)
+			c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 			continue
+		}
+		if len(rows) == 0 || rows[0].Int("n") < quorum {
+			continue // not enough fresh healthy observers to recover
 		}
 		if err := corrosion.UpdateHostState(ctx, c.db, h.Name, "active"); err != nil {
 			slog.Error("failover: recover host", "host", h.Name, "state", h.State, "error", err)
@@ -440,6 +453,10 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 	rows, err := c.db.Query(ctx,
 		`SELECT result, timestamp FROM fencing_log WHERE host_name = ?`, host)
 	if err != nil {
+		// Fail open (treat as no recent fence) but make the read error visible —
+		// it affects both recent-fence suppression and manual confirmation.
+		slog.Warn("failover: fencing_log read failed, treating as no recent fence", "host", host, "error", err)
+		c.mAttempt(PhaseHealth, ResultError, ErrDBError)
 		return false
 	}
 	cutoff := c.now().Add(-recentFenceWindow)

@@ -472,6 +472,73 @@ func TestPruneMutationSeen(t *testing.T) {
 	}
 }
 
+func seenCount(t *testing.T, c *Client) int {
+	t.Helper()
+	var n int
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	c.db.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM mutation_seen").Scan(&n)
+	return n
+}
+
+// TestPruneMutationSeen_DataRelative proves the cutoff is derived from the
+// newest stored HLC, not the wall clock. All rows sit in the year 2000 — far
+// behind "now" — so the old wall-clock cutoff would have deleted every row;
+// the data-relative cutoff deletes only the one >15m behind the table's max.
+func TestPruneMutationSeen_DataRelative(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+
+	baseMS := int64(946684800000) // 2000-01-01, far behind any plausible now
+	mk := func(ms int64, node string) string { return fmt.Sprintf("%013d-%04d-%s", ms, 0, node) }
+
+	c.mu.Lock()
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "max", mk(baseMS, "max"))
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "keep", mk(baseMS-5*60*1000, "keep"))
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "drop", mk(baseMS-20*60*1000, "drop"))
+	c.mu.Unlock()
+
+	r.pruneMutationSeen(ctx)
+
+	if got := seenCount(t, c); got != 2 {
+		t.Errorf("data-relative prune: count = %d, want 2 (max + keep; only the 20m-old row dropped)", got)
+	}
+}
+
+// TestPruneMutationSeen_MalformedSurvives ensures a row that is not a canonical
+// HLC neither defines the max nor is deleted. "12abc12345678-0000-x" is the
+// case a loose '[0-9][0-9]*-*' GLOB would have wrongly matched.
+func TestPruneMutationSeen_MalformedSurvives(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+
+	nowMS := time.Now().UnixMilli()
+	mk := func(ms int64, node string) string { return fmt.Sprintf("%013d-%04d-%s", ms, 0, node) }
+
+	c.mu.Lock()
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "max", mk(nowMS, "max"))
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "old", mk(nowMS-20*60*1000, "old"))
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "bad", "12abc12345678-0000-x")
+	c.mu.Unlock()
+
+	r.pruneMutationSeen(ctx)
+
+	// max + malformed survive; the valid 20m-old row is pruned.
+	if got := seenCount(t, c); got != 2 {
+		t.Errorf("malformed prune: count = %d, want 2 (max + malformed kept; valid old row dropped)", got)
+	}
+	var badCount int
+	c.mu.RLock()
+	c.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM mutation_seen WHERE origin = 'bad'").Scan(&badCount)
+	c.mu.RUnlock()
+	if badCount != 1 {
+		t.Errorf("malformed row was pruned (count=%d), want kept", badCount)
+	}
+}
+
 // ─── Fallback Tests ─────────────────────────────────────────────────────────
 
 func TestFallbackActivation(t *testing.T) {

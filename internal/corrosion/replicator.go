@@ -636,17 +636,36 @@ func (r *Replicator) pruneMutationLog(ctx context.Context) {
 	}
 }
 
-// pruneMutationSeen deletes old entries from the dedup table.
-// Uses HLC lexicographic ordering: entries with physical time older than 15 minutes are pruned.
-func (r *Replicator) pruneMutationSeen(ctx context.Context) {
-	cutoffMS := time.Now().Add(-15 * time.Minute).UnixMilli()
-	cutoffHLC := fmt.Sprintf("%013d-0000-", cutoffMS)
+// mutationSeenRetention bounds how far behind the newest dedup entry a row may
+// be before it is pruned. Measured against the data (the newest stored HLC),
+// not the wall clock, so an NTP step can't skew the cutoff. A var so tests can
+// drive the prune directly.
+var mutationSeenRetention = 15 * time.Minute
 
+// validHLCPredicate is a SQL fragment that matches only rows whose hlc has the
+// exact canonical layout "<13 digits>-<4 digits>-<node>" (hlc.Timestamp.String).
+// Position/length are enforced with fixed-count GLOB digit classes — not a loose
+// '[0-9]*' which would also match e.g. "12abc-…" — so a malformed/legacy row
+// neither defines the max nor gets pruned by a misleading CAST(...)→0.
+const validHLCPredicate = "length(hlc) >= 19 " +
+	"AND substr(hlc,1,13) GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' " +
+	"AND substr(hlc,14,1) = '-' " +
+	"AND substr(hlc,15,4) GLOB '[0-9][0-9][0-9][0-9]' " +
+	"AND substr(hlc,19,1) = '-'"
+
+// pruneMutationSeen deletes dedup entries whose physical time is more than
+// mutationSeenRetention behind the newest valid HLC row. The cutoff is derived
+// from the stored data (MAX over valid rows), so it is immune to wall-clock /
+// NTP steps; an empty or all-malformed table yields a NULL max → no-op.
+func (r *Replicator) pruneMutationSeen(ctx context.Context) {
 	r.client.mu.Lock()
 	defer r.client.mu.Unlock()
 
 	result, err := r.client.db.ExecContext(ctx,
-		`DELETE FROM mutation_seen WHERE hlc < ?`, cutoffHLC)
+		`DELETE FROM mutation_seen WHERE `+validHLCPredicate+
+			` AND CAST(substr(hlc,1,13) AS INTEGER) <`+
+			` (SELECT MAX(CAST(substr(hlc,1,13) AS INTEGER)) FROM mutation_seen WHERE `+validHLCPredicate+`) - ?`,
+		mutationSeenRetention.Milliseconds())
 	if err != nil {
 		slog.Warn("replicator: prune mutation_seen error", "error", err)
 		return

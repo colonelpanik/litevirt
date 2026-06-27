@@ -81,10 +81,11 @@ spreads the binary pulls across the ~R relays instead of all hammering one node.
   `version` equals ours (no-op) or whose `schema_version` < ours.
 - **Cooldown** after any attempt (success re-execs; failure backs off) so a
   broken peer or a transient mixed-version window can't cause a tight loop.
-- Skips while the host is already `upgrading`, draining, or fencing-relevant
-  (reuses the upgrade preflight in non-blocking/warn mode; a rejoining laggard
-  has no in-flight work to protect, and KillMode=process keeps VMs alive across
-  the re-exec).
+- Skips a tick while this host's state is already `upgrading`, so it never races
+  a push upgrade (`lv host upgrade`) already in flight. (It does not currently run
+  the full upgrade preflight — in-flight migration / pending fence / replication
+  backlog — for self-upgrade; a rejoining laggard typically has no such work, and
+  `KillMode=process` keeps VMs alive across the re-exec.)
 - Witness hosts self-upgrade like any other (they vote in quorum).
 
 ## Out of scope (documented)

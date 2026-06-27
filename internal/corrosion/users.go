@@ -152,7 +152,10 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 	if !looksLikeAPIToken(rawToken) {
 		return nil, nil
 	}
-	now := c.NowTS()
+	// Bare RFC3339 cutoff: expires_at is stored bare, and a NowTS (fractional)
+	// cutoff would let a token expiring at "…01Z" survive until the next second
+	// because "…01Z" sorts AFTER "…01.5Z" ('Z' > '.'). Compare like-with-like.
+	now := nowRFC3339()
 	rows, err := c.Query(ctx,
 		`SELECT t.id, t.username, t.token_hash, t.scope_paths, u.role
 		 FROM tokens t

@@ -239,18 +239,16 @@ func GetSession(ctx context.Context, c *Client, id string) (*SessionRecord, erro
 // TouchSession bumps last_used_at on every authenticated request so
 // idle-timeout calculations are accurate.
 func TouchSession(ctx context.Context, c *Client, id string) error {
-	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE sessions SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`,
-		now, id)
+		nowRFC3339(), id) // bare marker (parsed for idle checks; not an LWW key)
 }
 
 // RevokeSession marks a session as terminated immediately.
 func RevokeSession(ctx context.Context, c *Client, id string) error {
-	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
-		now, id)
+		nowRFC3339(), id) // bare marker
 }
 
 // ListSessionsForUser returns active sessions for a username.
@@ -354,7 +352,7 @@ func DeleteUser2FA(ctx context.Context, c *Client, username, method, label strin
 
 // InsertRecoveryCodes stores N bcrypt-hashed single-use codes.
 func InsertRecoveryCodes(ctx context.Context, c *Client, username string, codeHashes []string) error {
-	now := c.NowTS()
+	now := nowRFC3339() // recovery_codes.created_at — bare marker (no updated_at on this table)
 	stmts := make([]Statement, 0, len(codeHashes)+1)
 	// Wipe any prior unused codes — re-enrollment invalidates old ones.
 	stmts = append(stmts, Statement{
@@ -390,8 +388,7 @@ func ListUnusedRecoveryCodes(ctx context.Context, c *Client, username string) ([
 
 // MarkRecoveryCodeUsed sets used_at on a hash so it can't be reused.
 func MarkRecoveryCodeUsed(ctx context.Context, c *Client, username, codeHash string) error {
-	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE recovery_codes SET used_at = ? WHERE username = ? AND code_hash = ?`,
-		now, username, codeHash)
+		nowRFC3339(), username, codeHash) // bare marker (no updated_at on this table)
 }

@@ -87,12 +87,13 @@ func TestGCSupersededRows(t *testing.T) {
 	gcRC(t, c, "bob", "$rc_orphan_ancient", "set-X", ancient) // orphan, 30d old → DELETE
 
 	// ── lb_backends ─────────────────────────────────────────────────
-	gcLBConfig(t, c, "lb-live", "gen-NEW", recent, false)          // live config, current gen NEW
-	gcLBBackend(t, c, "lb-live", "be_current_old", "gen-NEW", old) // matches live gen, OLD → KEEP
-	gcLBBackend(t, c, "lb-live", "be_stale_old", "gen-OLD", old)   // stale gen under live config, OLD → DELETE
-	gcLBConfig(t, c, "lb-dead", "gen-D", recent, true)             // tombstoned config
-	gcLBBackend(t, c, "lb-dead", "be_tombstoned", "gen-D", old)    // config tombstoned, OLD → DELETE (core)
-	gcLBBackend(t, c, "lb-orphan", "be_orphan_24h", "gen-Z", old)  // no config row, 72h old → KEEP under orphan retention
+	gcLBConfig(t, c, "lb-live", "gen-NEW", recent, false)                 // live config, current gen NEW
+	gcLBBackend(t, c, "lb-live", "be_current_old", "gen-NEW", old)        // matches live gen, OLD → KEEP
+	gcLBBackend(t, c, "lb-live", "be_stale_old", "gen-OLD", old)          // stale gen under live config, OLD → DELETE
+	gcLBConfig(t, c, "lb-dead", "gen-D", recent, true)                    // tombstoned config
+	gcLBBackend(t, c, "lb-dead", "be_tombstoned", "gen-D", old)           // config tombstoned, OLD → DELETE (core)
+	gcLBBackend(t, c, "lb-orphan", "be_orphan_24h", "gen-Z", old)         // no config row, 72h old → KEEP under orphan retention
+	gcLBBackend(t, c, "lb-orphan", "be_orphan_ancient", "gen-Z", ancient) // no config row, 30d old → DELETE (orphan branch)
 
 	deleted, err := GCSupersededRows(ctx, c, time.Hour, 7*24*time.Hour)
 	if err != nil {
@@ -129,9 +130,12 @@ func TestGCSupersededRows(t *testing.T) {
 	if !lbBackendExists(t, c, "lb-orphan", "be_orphan_24h") {
 		t.Error("72h-old orphan backend GC'd under the core cutoff — should use orphan retention")
 	}
+	if lbBackendExists(t, c, "lb-orphan", "be_orphan_ancient") {
+		t.Error("30d-old orphan backend not GC'd under the orphan retention (cautious branch)")
+	}
 
-	if deleted["recovery_codes"] != 2 || deleted["lb_backends"] != 2 {
-		t.Errorf("delete counts = %v, want recovery_codes=2, lb_backends=2", deleted)
+	if deleted["recovery_codes"] != 2 || deleted["lb_backends"] != 3 {
+		t.Errorf("delete counts = %v, want recovery_codes=2, lb_backends=3", deleted)
 	}
 }
 

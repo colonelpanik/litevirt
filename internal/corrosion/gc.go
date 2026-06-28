@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -99,6 +100,8 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 	}
 
 	// Bounded, best-effort space reclaim (no-op without incremental auto_vacuum).
-	_ = c.execLocal(ctx, "PRAGMA incremental_vacuum(?)", gcVacuumPages)
+	// A PRAGMA argument can't be a bound parameter, so format it (gcVacuumPages is
+	// a trusted int constant) — mirrors the mutation_log prune.
+	_ = c.execLocal(ctx, fmt.Sprintf("PRAGMA incremental_vacuum(%d)", gcVacuumPages))
 	return counts, nil
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"google.golang.org/grpc/metadata"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -149,5 +151,48 @@ func TestRestoreContainerFromBackup_FindsManifestAndDrives(t *testing.T) {
 	}
 	if gotName != "ct1" || gotTs != "2026-06-27T12:00:00Z" || gotRepo != "main" {
 		t.Fatalf("drove restore repo=%q name=%q ts=%q; want the registered NAME 'main' + ct1 + ts", gotRepo, gotName, gotTs)
+	}
+}
+
+// TestRestoreContainer_StampsRelocateTokenFromMetadata exercises the production
+// metadata hop: a RestoreContainer call carrying the x-litevirt-relocate-token
+// metadata stamps that token on the restored row's RelocateToken (the
+// coordinator later matches it as provenance).
+func TestRestoreContainer_StampsRelocateTokenFromMetadata(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
+
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running", Image: "alpine:3.19", Project: "acme",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "ct1", HostName: "host-a", RepoPath: repo, Timestamp: "2026-06-27T13:00:00Z",
+	}, bk); err != nil {
+		t.Fatalf("BackupContainer: %v", err)
+	}
+	_ = corrosion.DeleteContainer(ctx, s.db, "host-a", "ct1")
+
+	// Restore with the relocation attempt token in incoming metadata.
+	rctx := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(relocateTokenMDKey, "tok-xyz"))
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: rctx}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: "2026-06-27T13:00:00Z",
+	}, rs); err != nil {
+		t.Fatalf("RestoreContainer: %v", err)
+	}
+
+	row, err := corrosion.GetContainer(ctx, s.db, "host-a", "ct1")
+	if err != nil || row == nil {
+		t.Fatalf("restored row missing: %v", err)
+	}
+	if row.RelocateToken != "tok-xyz" {
+		t.Fatalf("restored RelocateToken = %q, want tok-xyz (metadata hop not stamped)", row.RelocateToken)
 	}
 }

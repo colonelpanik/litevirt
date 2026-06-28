@@ -193,7 +193,9 @@ falling back to **recreate from image** (`ct.relocate.recreate` — managed NICs
 reconstructed from the persisted create spec), and finally **skip** a container
 that's neither restorable nor re-pullable (`ct.relocate.skipped`, left visible for
 operator recovery). The restore path is idempotent + crash-recoverable (source
-marker `relocate-restore:<target>`, `container_restore_timeout_sec`). See
+marker `relocate-restore:<target>:<token>`, where the attempt token is stamped on
+the restored target row so the coordinator only completes the handoff against a
+row proven to be its own restore; `container_restore_timeout_sec`). See
 [containers.md](containers.md#host-loss-relocation).
 
 ## Monitoring

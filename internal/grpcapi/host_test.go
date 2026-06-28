@@ -13,11 +13,9 @@ import (
 )
 
 // TestHostStateToPB_NeverMasqueradesAsActive guards the host-state display
-// mapping: a host the daemon wrote as "fenced" or "upgrading" — and any
-// unknown/future state — must NOT report as HOST_ACTIVE, which would show a
-// dead or transitioning host as healthy in `lv host ls` / UI / REST. (Surfaced
-// by a real-cluster failover drill: a fenced host displayed as HOST_ACTIVE
-// because hostStateToPB lacked a "fenced" case and defaulted to HOST_ACTIVE.)
+// mapping: "fenced", "upgrading", and unknown future states must not report
+// as HOST_ACTIVE, which would show a dead or transitioning host as healthy in
+// `lv host ls` / UI / REST.
 func TestHostStateToPB_NeverMasqueradesAsActive(t *testing.T) {
 	cases := []struct {
 		in   string

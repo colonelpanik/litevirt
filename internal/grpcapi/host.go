@@ -673,20 +673,28 @@ func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (c
 	return
 }
 
+// hostStateToPB maps a stored hosts.state string to the wire enum for display.
+// Critically it must never report a non-active host as HOST_ACTIVE: a fenced
+// (forcibly isolated after failover) or upgrading host shown as ACTIVE would
+// hide a dead/transitioning node from operators. There is no HOST_FENCED /
+// HOST_UPGRADING enum yet (would need a proto bump), so fenced maps to the
+// honest "unavailable" state OFFLINE and upgrading to the transitional DRAINING.
+// The default fails safe to OFFLINE so an unknown/future state can't masquerade
+// as healthy.
 func hostStateToPB(s string) pb.HostState {
 	switch s {
 	case "active":
 		return pb.HostState_HOST_ACTIVE
-	case "draining":
+	case "draining", "upgrading":
 		return pb.HostState_HOST_DRAINING
 	case "maintenance":
 		return pb.HostState_HOST_MAINTENANCE
 	case "suspect":
 		return pb.HostState_HOST_SUSPECT
-	case "offline":
+	case "offline", "fenced":
 		return pb.HostState_HOST_OFFLINE
 	default:
-		return pb.HostState_HOST_ACTIVE
+		return pb.HostState_HOST_OFFLINE
 	}
 }
 

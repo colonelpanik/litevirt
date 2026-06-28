@@ -105,14 +105,31 @@ func TestFleet_OneOwnerAfterHeal(t *testing.T) {
 	if vmAfter == nil || vmAfter.HostName == victim.Name {
 		t.Fatalf("vm-own should have been reassigned off the fenced victim, got %+v", vmAfter)
 	}
+	survivor := c.Node(vmAfter.HostName)
 
-	// Heal: the victim's reconciler runs again and finds vm-own still running
-	// locally but owned (in corrosion) by the survivor → it self-fences the stale
-	// local copy. One owner remains.
+	// Model the partition+heal split-brain: the survivor's reconciler has already
+	// started vm-own (so it runs there), while the victim's stale copy is STILL
+	// running locally — two running copies at the instant of heal.
+	survivor.Virt.SetState("vm-own", libvirtfake.StateRunning)
+
+	// Heal: the victim's reconciler runs and finds vm-own running locally but owned
+	// (in corrosion) by the survivor → it self-fences ONLY its own stale copy.
 	rec := health.NewReconciler(victim.Name, t.TempDir(), victim.DB, victim.Virt)
 	rec.ReconcileOnce(ctx)
 
 	if victim.Virt.DomainExists("vm-own") {
 		t.Fatal("fenced victim must self-fence its stale local domain after the VM was reassigned")
+	}
+
+	// Exactly one owner remains, and it's the DB-owner (the survivor) — not zero,
+	// not two.
+	var owners []string
+	for _, n := range c.Nodes {
+		if n.Virt.DomainExists("vm-own") {
+			owners = append(owners, n.Name)
+		}
+	}
+	if len(owners) != 1 || owners[0] != vmAfter.HostName {
+		t.Fatalf("expected exactly one running owner == %s, got %v", vmAfter.HostName, owners)
 	}
 }

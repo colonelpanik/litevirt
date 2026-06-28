@@ -569,8 +569,11 @@ const vmLockTTL = 10 * time.Minute
 // lock then discovered the VM moved, and we release without acting", not
 // "two hosts both started the VM."
 func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
-	now := r.now().UTC().Format(time.RFC3339)
-	expires := r.now().Add(vmLockTTL).UTC().Format(time.RFC3339)
+	// Read the clock ONCE so `now` and `expires` derive from the same instant
+	// (a per-call test clock could otherwise advance between two reads).
+	base := r.now().UTC()
+	now := base.Format(time.RFC3339)
+	expires := base.Add(vmLockTTL).Format(time.RFC3339)
 	// expired-check compares RFC3339-vs-RFC3339 (bound now), not datetime('now'):
 	// expires_at is RFC3339, so a string compare to datetime('now')'s space text
 	// breaks on a date match ('T' > ' ') and a same-day lock NEVER looks expired —

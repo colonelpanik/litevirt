@@ -119,46 +119,17 @@ var (
 // dumpStateForTables serializes the selected allowlist as gzipped JSON for
 // push/pull sync.
 func (c *Client) dumpStateForTables(tables []string) []byte {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	start := time.Now()
 
+	// Read each table under its OWN brief read lock (released between tables), and
+	// marshal + gzip entirely OUTSIDE any lock. This replaces one long all-table
+	// RLock that — being write-preferring — convoyed every queued writer (incl. the
+	// health path) behind the whole dump+serialize. A per-table dump is NOT a single
+	// cross-table snapshot, which is fine: this feeds LWW anti-entropy, which
+	// converges per-row by updated_at regardless of the relative timing of tables.
 	var payload syncPayload
 	for _, table := range tables {
-		st := syncTable{Name: table}
-
-		rows, err := c.db.Query("SELECT * FROM " + table)
-		if err != nil {
-			// Table might not exist yet
-			continue
-		}
-
-		cols, err := rows.Columns()
-		if err != nil {
-			rows.Close()
-			continue
-		}
-		st.Columns = cols
-
-		for rows.Next() {
-			vals := make([]interface{}, len(cols))
-			ptrs := make([]interface{}, len(cols))
-			for i := range vals {
-				ptrs[i] = &vals[i]
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				continue
-			}
-			// Convert []byte to string
-			for i, v := range vals {
-				if b, ok := v.([]byte); ok {
-					vals[i] = string(b)
-				}
-			}
-			st.Rows = append(st.Rows, vals)
-		}
-		rows.Close()
-
-		if len(st.Rows) > 0 {
+		if st, ok := c.dumpTable(table); ok && len(st.Rows) > 0 {
 			payload.Tables = append(payload.Tables, st)
 		}
 	}
@@ -169,14 +140,54 @@ func (c *Client) dumpStateForTables(tables []string) []byte {
 		return nil
 	}
 
-	// Gzip compress
+	// Gzip compress (lock-free).
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	gz.Write(data)
 	gz.Close()
 
+	c.observeDump(time.Since(start), buf.Len())
 	slog.Info("sync: state dump", "tables", len(payload.Tables), "bytes", buf.Len())
 	return buf.Bytes()
+}
+
+// dumpTable reads one table's rows into a syncTable under a brief read lock. The
+// lock is released on return, before the caller marshals/gzips. ok=false means
+// the table doesn't exist yet (or couldn't be read).
+func (c *Client) dumpTable(table string) (syncTable, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	st := syncTable{Name: table}
+	rows, err := c.db.Query("SELECT * FROM " + table)
+	if err != nil {
+		return st, false // table might not exist yet
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return st, false
+	}
+	st.Columns = cols
+	for rows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			continue
+		}
+		// Convert []byte to string so JSON round-trips as text.
+		for i, v := range vals {
+			if b, ok := v.([]byte); ok {
+				vals[i] = string(b)
+			}
+		}
+		st.Rows = append(st.Rows, vals)
+	}
+	return st, true
 }
 
 // dumpState serializes all operator-safe replicated tables.
@@ -259,89 +270,162 @@ func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
 }
 
 func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowedTables map[string]bool) {
+	start := time.Now()
+	merged, skipped := 0, 0
+	for _, table := range payload.Tables {
+		m, s := c.mergeTable(table, allowedTables)
+		merged += m
+		skipped += s
+	}
+	c.observeMerge(time.Since(start), merged, skipped)
+	slog.Info("sync: merged remote state (LWW)", "tables", len(payload.Tables), "merged", merged, "skipped", skipped)
+}
+
+// mergeApplyChunkRows bounds how many rows a single merge transaction applies
+// before committing and RELEASING c.mu, so a large table's merge can't hold the
+// write lock (stalling normal + health writes) for its entire duration. A var so
+// tests can shrink it to force multi-chunk commits.
+var mergeApplyChunkRows = 1000
+
+// mergeTable LWW-merges one dump table. It validates the peer-supplied
+// name/columns against the local schema once, then applies the rows in bounded
+// chunks (mergeChunk), each its own committed transaction.
+//
+// PARTIAL-MERGE SEMANTICS: because each chunk commits independently and the lock
+// is released between chunks, a merge is NO LONGER all-or-nothing — a
+// cancelled/failed merge (or one interrupted between chunks) may leave a PREFIX
+// of chunks applied. That is safe by design: LWW is per-row idempotent, so the
+// next anti-entropy cycle re-converges from wherever it stopped. The lock release
+// is the whole point — a slow merge no longer convoys other writers behind it.
+func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (merged, skipped int) {
+	// Defense-in-depth: table.Name and table.Columns come from a peer and are
+	// interpolated into SQL. Only touch known tables/columns.
+	if !allowedTables[table.Name] {
+		slog.Warn("sync: skipping unknown table in dump", "table", table.Name)
+		return 0, 0
+	}
+	localCols, ok := c.readTableColumns(table.Name)
+	if !ok {
+		return 0, 0
+	}
+	if len(table.Columns) == 0 || !columnsKnown(table.Columns, localCols) {
+		slog.Warn("sync: skipping dump table with unexpected columns", "table", table.Name)
+		return 0, 0
+	}
+
+	pkCols := tablePrimaryKeys[table.Name]
+	pkIdx := columnIndexes(table.Columns, pkCols)
+	// A dump for a table with a known PK that omits a PK column can't be
+	// LWW-merged (we couldn't identify the row); refuse it rather than blindly
+	// inserting PK-less rows. Normal dumps always carry every column.
+	if len(pkCols) > 0 && len(pkIdx) != len(pkCols) {
+		slog.Warn("sync: skipping dump table missing primary-key column(s)", "table", table.Name)
+		return 0, 0
+	}
+	updatedAtIdx := indexOf(table.Columns, "updated_at")
+	if localCols["updated_at"] && len(pkCols) > 0 && updatedAtIdx < 0 {
+		slog.Warn("sync: skipping dump table missing updated_at column", "table", table.Name)
+		return 0, 0
+	}
+
+	insertSQL := "INSERT OR REPLACE INTO " + table.Name +
+		" (" + strings.Join(table.Columns, ", ") + ") VALUES (" +
+		strings.Join(repeatPlaceholders(len(table.Columns)), ", ") + ")"
+
+	for start := 0; start < len(table.Rows); start += mergeApplyChunkRows {
+		end := start + mergeApplyChunkRows
+		if end > len(table.Rows) {
+			end = len(table.Rows)
+		}
+		m, s := c.mergeChunk(table, table.Rows[start:end], insertSQL, pkCols, pkIdx, updatedAtIdx)
+		merged += m
+		skipped += s
+	}
+	return merged, skipped
+}
+
+// mergeChunk applies one bounded slice of a table's rows under a single
+// write-locked transaction: prefetch existing updated_at, LWW-compare, and
+// INSERT OR REPLACE the winners. Prefetch and inserts share the tx (held under
+// the lock), so the compare→insert decision is atomic within the chunk; the lock
+// is released on return so the next chunk doesn't monopolize it.
+func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL string, pkCols []string, pkIdx []int, updatedAtIdx int) (merged, skipped int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	tx, err := c.db.Begin()
 	if err != nil {
-		slog.Error("sync: begin tx", "error", err)
-		return
+		slog.Error("sync: begin tx", "table", table.Name, "error", err)
+		return 0, 0
 	}
 
-	merged, skipped := 0, 0
-	for _, table := range payload.Tables {
-		// Defense-in-depth: table.Name and table.Columns come from a peer and
-		// are interpolated into SQL. Only touch known tables/columns.
-		if !allowedTables[table.Name] {
-			slog.Warn("sync: skipping unknown table in dump", "table", table.Name)
-			continue
-		}
-		localCols, err := tableColumns(tx, table.Name)
-		if err != nil {
-			slog.Warn("sync: read local columns", "table", table.Name, "error", err)
-			continue
-		}
-		if len(table.Columns) == 0 || !columnsKnown(table.Columns, localCols) {
-			slog.Warn("sync: skipping dump table with unexpected columns", "table", table.Name)
-			continue
-		}
+	// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
+	var existing map[string]string
+	if updatedAtIdx >= 0 && len(pkCols) > 0 {
+		existing = c.prefetchUpdatedAt(tx, table.Name, pkCols, rows, pkIdx)
+	}
 
-		pkCols := tablePrimaryKeys[table.Name]
-		pkIdx := columnIndexes(table.Columns, pkCols)
-		// A dump for a table with a known PK that omits a PK column can't be
-		// LWW-merged (we couldn't identify the row); refuse it rather than blindly
-		// inserting PK-less rows. Normal dumps always carry every column.
-		if len(pkCols) > 0 && len(pkIdx) != len(pkCols) {
-			slog.Warn("sync: skipping dump table missing primary-key column(s)", "table", table.Name)
+	for _, row := range rows {
+		// A peer dump whose row doesn't match the declared column count is
+		// malformed/corrupt: skip it rather than index out of range below or
+		// hand SQLite a mismatched arg count.
+		if len(row) != len(table.Columns) {
+			slog.Warn("sync: skipping malformed row (column count mismatch)",
+				"table", table.Name, "want", len(table.Columns), "got", len(row))
+			skipped++
 			continue
 		}
-		updatedAtIdx := indexOf(table.Columns, "updated_at")
-		if localCols["updated_at"] && len(pkCols) > 0 && updatedAtIdx < 0 {
-			slog.Warn("sync: skipping dump table missing updated_at column", "table", table.Name)
-			continue
-		}
-
-		// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
-		var existing map[string]string
-		if updatedAtIdx >= 0 && len(pkCols) > 0 {
-			existing = c.prefetchUpdatedAt(tx, table.Name, pkCols, table.Rows, pkIdx)
-		}
-
-		insertSQL := "INSERT OR REPLACE INTO " + table.Name +
-			" (" + strings.Join(table.Columns, ", ") + ") VALUES (" +
-			strings.Join(repeatPlaceholders(len(table.Columns)), ", ") + ")"
-
-		for _, row := range table.Rows {
-			// A peer dump whose row doesn't match the declared column count is
-			// malformed/corrupt: skip it rather than index out of range below or
-			// hand SQLite a mismatched arg count.
-			if len(row) != len(table.Columns) {
-				slog.Warn("sync: skipping malformed row (column count mismatch)",
-					"table", table.Name, "want", len(table.Columns), "got", len(row))
-				skipped++
-				continue
-			}
-			if existing != nil {
-				incomingTS, _ := row[updatedAtIdx].(string)
-				if incomingTS != "" {
-					if localTS, ok := existing[pkKeyAt(row, pkIdx)]; ok && localWinsLWW(localTS, incomingTS) {
-						skipped++
-						continue
-					}
+		if existing != nil {
+			incomingTS, _ := row[updatedAtIdx].(string)
+			if incomingTS != "" {
+				if localTS, ok := existing[pkKeyAt(row, pkIdx)]; ok && localWinsLWW(localTS, incomingTS) {
+					skipped++
+					continue
 				}
 			}
-			if _, err := tx.Exec(insertSQL, row...); err != nil {
-				slog.Warn("sync: merge row", "table", table.Name, "error", err)
-			} else {
-				merged++
-			}
+		}
+		if _, err := tx.Exec(insertSQL, row...); err != nil {
+			slog.Warn("sync: merge row", "table", table.Name, "error", err)
+		} else {
+			merged++
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		slog.Error("sync: commit", "error", err)
+		slog.Error("sync: commit", "table", table.Name, "error", err)
+		return 0, skipped // commit failed → nothing in this chunk landed
 	}
-	slog.Info("sync: merged remote state (LWW)", "tables", len(payload.Tables), "merged", merged, "skipped", skipped)
+	return merged, skipped
+}
+
+// readTableColumns returns the local table's column set under a brief read lock.
+// Used by the merge to validate peer-supplied columns once per table without
+// holding the write lock across the whole multi-table merge.
+func (c *Client) readTableColumns(table string) (map[string]bool, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	rows, err := c.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		slog.Warn("sync: read local columns", "table", table, "error", err)
+		return nil, false
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid       int
+			name, typ string
+			notnull   int
+			dfltValue interface{}
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
+			return nil, false
+		}
+		cols[name] = true
+	}
+	return cols, true
 }
 
 // mergePrefetchMaxParams caps bind variables per prefetch query, kept under
@@ -544,58 +628,19 @@ type TableDigest struct {
 // StateDigest returns a lightweight fingerprint of each replicated table.
 // Two nodes with identical digests are in sync; mismatched tables indicate drift.
 func (c *Client) stateDigestForTables(ctx context.Context, tables []string) ([]TableDigest, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	start := time.Now()
 
+	// Per-cycle hot path: anti-entropy calls this every tick before deciding
+	// whether to dump/merge. Read each table's row encodings under a brief read
+	// lock, then sort + hash OUTSIDE the lock — a large table's hash must not hold
+	// the lock against writers (incl. the health path).
 	var digests []TableDigest
 	for _, table := range tables {
-		// Content digest: hash the table's row VALUES (the declared columns —
-		// SELECT * never returns the rowid), sorted so insertion order can't
-		// change the result. The old digest hashed GROUP_CONCAT(rowid), which is
-		// node-local: identical content inserted in a different order (or after
-		// INSERT-OR-REPLACE churn) produced different digests — so anti-entropy
-		// re-synced already-converged peers forever — while two nodes with equal
-		// row counts but contiguous rowids hashed identically regardless of
-		// content, hiding real drift. Hashing content fixes both.
-		rows, err := c.db.QueryContext(ctx, "SELECT * FROM "+table)
-		if err != nil {
+		rowKeys, ok := c.digestTableRows(ctx, table)
+		if !ok {
 			continue // table may not exist yet
 		}
-		cols, err := rows.Columns()
-		if err != nil {
-			rows.Close()
-			continue
-		}
-		var rowKeys []string
-		for rows.Next() {
-			vals := make([]interface{}, len(cols))
-			ptrs := make([]interface{}, len(cols))
-			for i := range vals {
-				ptrs[i] = &vals[i]
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				continue
-			}
-			// Length-prefix every cell so the encoding is unambiguous: a value
-			// can contain any byte (incl. would-be separators) without aliasing
-			// an adjacent column or row. NULL is a distinct marker (values always
-			// start with a digit).
-			var sb strings.Builder
-			for _, v := range vals {
-				if v == nil {
-					sb.WriteString("N;")
-				} else {
-					s := coerceString(v)
-					sb.WriteString(strconv.Itoa(len(s)))
-					sb.WriteByte(':')
-					sb.WriteString(s)
-				}
-			}
-			rowKeys = append(rowKeys, sb.String())
-		}
-		rows.Close()
 		sort.Strings(rowKeys)
-
 		h := sha256.New()
 		for _, rk := range rowKeys {
 			h.Write([]byte(strconv.Itoa(len(rk)) + ":" + rk)) // length-prefix each row too
@@ -606,7 +651,62 @@ func (c *Client) stateDigestForTables(ctx context.Context, tables []string) ([]T
 			Hash:  fmt.Sprintf("%x", h.Sum(nil))[:16],
 		})
 	}
+	c.observeDigest(time.Since(start))
 	return digests, nil
+}
+
+// digestTableRows reads one table's length-prefixed row encodings into memory
+// under a brief read lock (released on return), so the caller can sort + hash
+// outside the lock.
+//
+// Content digest: it encodes the table's row VALUES (the declared columns —
+// SELECT * never returns the rowid). The old digest hashed GROUP_CONCAT(rowid),
+// which is node-local: identical content inserted in a different order (or after
+// INSERT-OR-REPLACE churn) produced different digests — so anti-entropy re-synced
+// already-converged peers forever — while two nodes with equal row counts but
+// contiguous rowids hashed identically regardless of content, hiding real drift.
+// Hashing content fixes both.
+func (c *Client) digestTableRows(ctx context.Context, table string) ([]string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	rows, err := c.db.QueryContext(ctx, "SELECT * FROM "+table)
+	if err != nil {
+		return nil, false // table may not exist yet
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, false
+	}
+	var rowKeys []string
+	for rows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			continue
+		}
+		// Length-prefix every cell so the encoding is unambiguous: a value can
+		// contain any byte (incl. would-be separators) without aliasing an
+		// adjacent column or row. NULL is a distinct marker (values always start
+		// with a digit).
+		var sb strings.Builder
+		for _, v := range vals {
+			if v == nil {
+				sb.WriteString("N;")
+			} else {
+				s := coerceString(v)
+				sb.WriteString(strconv.Itoa(len(s)))
+				sb.WriteByte(':')
+				sb.WriteString(s)
+			}
+		}
+		rowKeys = append(rowKeys, sb.String())
+	}
+	return rowKeys, true
 }
 
 // StateDigest returns a lightweight fingerprint of each operator-safe

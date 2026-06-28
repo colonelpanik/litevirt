@@ -262,6 +262,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	go d.metrics.Start()
 
+	// Anti-entropy dump/digest/merge timing. Lives on the Client so dumps served
+	// directly through grpcapi (DumpStateBytes / StreamStateDump) are observed too.
+	d.db.SetSyncMetrics(metrics.NewAntiEntropyMetrics())
+
 	// Start host health checker
 	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
 	go d.checker.Start(ctx)

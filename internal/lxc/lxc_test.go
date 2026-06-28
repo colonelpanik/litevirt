@@ -236,6 +236,14 @@ type fakeRuntime struct {
 	createErr  error
 	stateMap   map[string]State
 	listOut    []string
+	statsMap   map[string]ContainerStats // scripted Stats responses; absent → ErrStatsUnavailable
+}
+
+func (f *fakeRuntime) Stats(_ context.Context, name string) (ContainerStats, error) {
+	if st, ok := f.statsMap[name]; ok {
+		return st, nil
+	}
+	return ContainerStats{}, ErrStatsUnavailable
 }
 
 func newFakeRuntime() *fakeRuntime {

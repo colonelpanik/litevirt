@@ -7,6 +7,48 @@ import (
 	"time"
 )
 
+func TestLoadConfig_ImagePullDenyPolicy(t *testing.T) {
+	dir := t.TempDir()
+	cp := filepath.Join(dir, "config.yaml")
+	t.Setenv("LITEVIRT_CONFIG", cp)
+
+	// An invalid CIDR must FAIL load (never silently drop a security policy).
+	if err := os.WriteFile(cp, []byte("host_name: h\nimage_pull_blocked_cidrs: [\"not-a-cidr\"]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("LoadConfig accepted an invalid image_pull_blocked_cidrs")
+	}
+
+	// A valid policy loads and resolves to a non-empty, deduped prefix set.
+	if err := os.WriteFile(cp, []byte("host_name: h\nimage_pull_block_metadata: true\nimage_pull_blocked_cidrs: [\"10.0.0.0/8\"]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig (valid policy): %v", err)
+	}
+	prefixes, err := cfg.ImagePullBlockedPrefixes()
+	if err != nil {
+		t.Fatalf("ImagePullBlockedPrefixes: %v", err)
+	}
+	if len(prefixes) < 2 { // at least 10.0.0.0/8 + the metadata set
+		t.Errorf("expected resolved prefixes, got %v", prefixes)
+	}
+
+	// Default (no policy) → no prefixes (no network guard).
+	if err := os.WriteFile(cp, []byte("host_name: h\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := cfg.ImagePullBlockedPrefixes(); len(p) != 0 {
+		t.Errorf("default config produced a deny policy: %v", p)
+	}
+}
+
 func TestLoadConfig_Valid(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

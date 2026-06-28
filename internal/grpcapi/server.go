@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -47,9 +48,11 @@ type Server struct {
 
 	// imageMaxBytes / imagePullTimeout bound image pull+import (disk-fill /
 	// SSRF guards), set from daemon config via SetImageLimits. Zero → the image
-	// package defaults apply.
-	imageMaxBytes    int64
-	imagePullTimeout time.Duration
+	// package defaults apply. imageBlockedCIDRs is the opt-in URL-pull network
+	// deny policy (nil → no guard); applies to image.Pull only.
+	imageMaxBytes     int64
+	imagePullTimeout  time.Duration
+	imageBlockedCIDRs []netip.Prefix
 
 	// Session lifetimes. Zero means "use the package default" (see
 	// idleTimeout/hardExpiry); set from daemon config via SetSessionTimeouts.

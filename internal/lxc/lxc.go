@@ -27,10 +27,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/litevirt/litevirt/internal/safename"
 )
+
+// ErrStatsUnavailable is returned by Stats when live cgroup usage can't be read
+// (e.g. a cgroup-v1-only host, or the container has no cgroup yet). Callers (the
+// metrics collector) skip the usage sample via errors.Is rather than logging.
+var ErrStatsUnavailable = errors.New("container cgroup stats unavailable")
+
+// ContainerStats is a point-in-time cgroup-v2 usage sample for a container.
+type ContainerStats struct {
+	CPUUsageUsec uint64 // cumulative CPU time (cpu.stat usage_usec)
+	MemBytes     int64  // current memory usage (memory.current)
+}
 
 // State is the libvirt-style lifecycle state, mirrored for parity with
 // the existing VM domain states so the UI can render both with the
@@ -124,6 +137,9 @@ type Runtime interface {
 	// a fresh identity (new hostname/uts.name, regenerated NIC MAC(s), reset
 	// machine-id). The src should be stopped/frozen for a consistent copy.
 	CloneContainer(ctx context.Context, src, dst string) error
+	// Stats returns a live cgroup-v2 usage sample (host-local, no RPC). Returns
+	// ErrStatsUnavailable when usage can't be read (cgroup-v1 host, no cgroup yet).
+	Stats(ctx context.Context, name string) (ContainerStats, error)
 }
 
 // CreateOpts collects parameters for Runtime.Create.
@@ -183,6 +199,13 @@ type LxcRunner struct {
 	// Lxcpath optionally overrides /var/lib/lxc — set per-host so test
 	// rigs and fenced containers can coexist.
 	Lxcpath string
+
+	// cgPathMu guards cgPathCache, which memoizes each running container's
+	// resolved cgroup-v2 directory so Stats doesn't shell out to lxc-info on
+	// every Prometheus scrape (which may run concurrently). Invalidated on a
+	// stat failure (container restarted → new cgroup path).
+	cgPathMu    sync.Mutex
+	cgPathCache map[string]string
 }
 
 // NewLxcRunner returns a Runtime configured to talk to /var/lib/lxc.
@@ -364,6 +387,114 @@ func (r *LxcRunner) IP(ctx context.Context, name string) (string, error) {
 		return "", err
 	}
 	return parseLxcInfoIP(string(out)), nil
+}
+
+// Stats reads a running container's live cgroup-v2 usage. It discovers the
+// cgroup directory from the container's init PID (`lxc-info -n <name> -p -H` →
+// /proc/<pid>/cgroup), caches it (mutex-guarded; concurrent scrapes), and reads
+// cpu.stat + memory.current. Returns ErrStatsUnavailable on a cgroup-v1 host or
+// when the container has no readable cgroup (so the collector skips, no spam).
+func (r *LxcRunner) Stats(ctx context.Context, name string) (ContainerStats, error) {
+	if err := safename.ValidateContainerName(name); err != nil {
+		return ContainerStats{}, err
+	}
+
+	dir, err := r.cgroupDir(ctx, name)
+	if err != nil {
+		return ContainerStats{}, err
+	}
+	cpu, cerr := readCPUUsageUsec(filepath.Join(dir, "cpu.stat"))
+	mem, merr := readUint(filepath.Join(dir, "memory.current"))
+	if cerr != nil || merr != nil {
+		// Require BOTH reads: a partial read would emit a bogus 0 for the missing
+		// metric (a fake counter reset / memory drop). A failure usually means the
+		// cached path is stale (container restarted → new cgroup) or gone, so drop
+		// it; the next scrape re-discovers. Report unavailable for this round.
+		r.cgPathMu.Lock()
+		delete(r.cgPathCache, name)
+		r.cgPathMu.Unlock()
+		return ContainerStats{}, ErrStatsUnavailable
+	}
+	return ContainerStats{CPUUsageUsec: cpu, MemBytes: int64(mem)}, nil
+}
+
+// cgroupDir resolves (and memoizes) the container's cgroup-v2 directory under
+// /sys/fs/cgroup. Returns ErrStatsUnavailable on a non-v2 layout.
+func (r *LxcRunner) cgroupDir(ctx context.Context, name string) (string, error) {
+	r.cgPathMu.Lock()
+	if r.cgPathCache != nil {
+		if dir, ok := r.cgPathCache[name]; ok {
+			r.cgPathMu.Unlock()
+			return dir, nil
+		}
+	}
+	r.cgPathMu.Unlock()
+
+	out, _, err := r.run(ctx, "lxc-info", "-n", name, "-p", "-H")
+	if err != nil {
+		return "", ErrStatsUnavailable
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || pid <= 0 {
+		return "", ErrStatsUnavailable // not running / no init PID
+	}
+	rel, err := cgroupV2RelPath(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return "", err
+	}
+	// rel begins with "/"; filepath.Join keeps it inside /sys/fs/cgroup.
+	dir := filepath.Join("/sys/fs/cgroup", filepath.Clean("/"+rel))
+	r.cgPathMu.Lock()
+	if r.cgPathCache == nil {
+		r.cgPathCache = map[string]string{}
+	}
+	r.cgPathCache[name] = dir
+	r.cgPathMu.Unlock()
+	return dir, nil
+}
+
+// cgroupV2RelPath parses /proc/<pid>/cgroup and returns the unified-hierarchy
+// (cgroup-v2) path — the line prefixed "0::". Absent → ErrStatsUnavailable
+// (cgroup-v1 host; usage lives in per-controller hierarchies we don't read).
+func cgroupV2RelPath(procCgroupFile string) (string, error) {
+	data, err := os.ReadFile(procCgroupFile)
+	if err != nil {
+		return "", ErrStatsUnavailable
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if rel, ok := strings.CutPrefix(line, "0::"); ok {
+			return strings.TrimSpace(rel), nil
+		}
+	}
+	return "", ErrStatsUnavailable
+}
+
+// readCPUUsageUsec extracts the `usage_usec` value from a cgroup-v2 cpu.stat file.
+func readCPUUsageUsec(path string) (uint64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "usage_usec "); ok {
+			return strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		}
+	}
+	return 0, fmt.Errorf("usage_usec not found in %s", path)
+}
+
+// readUint reads a single-integer cgroup file (e.g. memory.current). A "max"
+// sentinel (unlimited) reads as 0.
+func readUint(path string) (uint64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "max" {
+		return 0, nil
+	}
+	return strconv.ParseUint(s, 10, 64)
 }
 
 // parseLxcInfoIP returns the first non-loopback IPv4 from lxc-info -iH output.

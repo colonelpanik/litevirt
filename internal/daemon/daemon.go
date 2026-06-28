@@ -255,8 +255,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, time.Duration(d.cfg.AntiEntropyIntervalSec)*time.Second)
 	go ae.Start(ctx)
 
-	// Start metrics server
-	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, d.cfg.HostName)
+	// Start metrics server. Create the LXC runner ONCE here and share it with the
+	// gRPC container adapter + health checker below, so the metrics collector can
+	// also read live container cgroup usage (host-local, no RPC).
+	lxcRunner := lxc.NewLxcRunner()
+	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	go d.metrics.Start()
 
 	// Start host health checker
@@ -316,6 +319,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Hourly local GC of superseded/orphaned auth + LB rows (re-enroll / LB-recreate
 	// churn). Local-only deterministic deletes — runs on every node.
 	go d.runSupersededGC(ctx, metrics.NewGCMetrics())
+
+	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
+	// placement engine's DiskIOPS/NetBW dimensions.
+	go d.runRuntimeUsageSampler(ctx)
 
 	// Start embedded DNS server
 	dnsSrv := dns.NewServer(d.cfg.DNSDomain, d.cfg.DNSPort, d.db)
@@ -420,7 +427,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// We always wire it — when lxc-* binaries aren't installed, the
 	// individual RPCs surface the error from the binary lookup, which
 	// is more useful than a blanket "container runtime not wired".
-	lxcRunner := lxc.NewLxcRunner()
+	// lxcRunner was created above (shared with the metrics collector).
 	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
 
 	// Advertise LXC capability as a host label so the compose planner places
@@ -500,8 +507,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// effectively (every schedule errors with ErrNoRepoConfigured until
 	// the operator adds a repo).
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
-	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
-	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second)
+	svc.SetBackupRepos(d.cfg.BackupRepos)               // let RPC handlers resolve repo names
+	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
+	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)
 	d.snapScheduler.ReplRunner = svc // *grpcapi.Server implements RunReplication
 	go d.snapScheduler.Run(ctx)
 

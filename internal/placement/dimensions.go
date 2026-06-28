@@ -109,7 +109,16 @@ func (d netBWDim) Demand(req *Request) float64 { return 0 }
 // hostLabelCapacity reads a positive float capacity from a host label. Absent,
 // empty, unparseable, or non-positive → 0, which makes scoreDimension skip the
 // dimension for that host (no signal) rather than treat it as infinite headroom.
+//
+// It also requires a runtime-usage SAMPLE for the host: a labeled host with no
+// host_runtime_usage row (never sampled, DB read failed, or the in-memory batch
+// path) has no meaningful Used, so the dimension must skip — otherwise a missing
+// Used reads as 0 and the host is credited full headroom (the very skew the
+// capacity-gating is meant to avoid). A real zero sample stays active.
 func hostLabelCapacity(s *ClusterSnapshot, host, label string) float64 {
+	if !s.UsageSampled[host] {
+		return 0
+	}
 	h, ok := s.Hosts[host]
 	if !ok {
 		return 0

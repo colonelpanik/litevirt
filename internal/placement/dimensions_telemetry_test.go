@@ -25,25 +25,35 @@ func TestScoreDimension_ZeroCapacitySkipped(t *testing.T) {
 // a busy host scores below an idle one (real signal), and a host without the
 // label is unaffected (capacity 0 → skipped).
 func TestDiskNetDims_LabelCapacityAndUsage(t *testing.T) {
+	labels := map[string]string{"placement.iops_capacity": "1000", "placement.netbw_mbps": "1000"}
 	hosts := []corrosion.HostRecord{
-		{Name: "busy", State: "active", CPUTotal: 8, MemTotal: 8192, Labels: map[string]string{"placement.iops_capacity": "1000", "placement.netbw_mbps": "1000"}},
-		{Name: "idle", State: "active", CPUTotal: 8, MemTotal: 8192, Labels: map[string]string{"placement.iops_capacity": "1000", "placement.netbw_mbps": "1000"}},
+		{Name: "busy", State: "active", CPUTotal: 8, MemTotal: 8192, Labels: labels},
+		{Name: "idle", State: "active", CPUTotal: 8, MemTotal: 8192, Labels: labels},
+		{Name: "labeled_nosample", State: "active", CPUTotal: 8, MemTotal: 8192, Labels: labels},
 		{Name: "nolabel", State: "active", CPUTotal: 8, MemTotal: 8192},
 	}
 	usage := map[string]corrosion.HostRuntimeUsage{
-		"busy": {DiskIOPS: 800, NetMbps: 800},
+		"busy":    {DiskIOPS: 800, NetMbps: 800}, // sampled, loaded
+		"idle":    {DiskIOPS: 0, NetMbps: 0},     // sampled, a REAL zero → still active
+		"nolabel": {DiskIOPS: 50, NetMbps: 50},   // sampled but no capacity label
+		// labeled_nosample: labeled but NO usage row → must SKIP (no sample).
 	}
 	snap := BuildSnapshotFromUsage(hosts, nil, usage)
 
 	for _, d := range []Dimension{diskIOPSDim{w: 15}, netBWDim{w: 10}} {
 		busy := scoreDimension(d, snap, "busy", &Request{}, PolicyBalance)
 		idle := scoreDimension(d, snap, "idle", &Request{}, PolicyBalance)
-		nolabel := scoreDimension(d, snap, "nolabel", &Request{}, PolicyBalance)
 		if !(idle > busy) {
 			t.Errorf("%s: idle (%v) should score above the busy host (%v)", d.Name(), idle, busy)
 		}
-		if nolabel != 0 {
-			t.Errorf("%s: host without a capacity label should contribute 0, got %v", d.Name(), nolabel)
+		// A labeled host with NO usage sample must skip (not be credited full
+		// headroom from a missing Used) — the finding-1 regression.
+		if got := scoreDimension(d, snap, "labeled_nosample", &Request{}, PolicyBalance); got != 0 {
+			t.Errorf("%s: labeled-but-unsampled host should contribute 0, got %v", d.Name(), got)
+		}
+		// No capacity label → skipped regardless of sample.
+		if got := scoreDimension(d, snap, "nolabel", &Request{}, PolicyBalance); got != 0 {
+			t.Errorf("%s: host without a capacity label should contribute 0, got %v", d.Name(), got)
 		}
 	}
 }

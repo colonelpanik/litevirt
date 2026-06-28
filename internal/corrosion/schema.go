@@ -179,10 +179,10 @@ import (
 //	v33: host_runtime_usage(host_name PK, disk_iops, net_mbps, updated_at,
 //	     deleted_at) — a per-host runtime-telemetry row the placement engine reads
 //	     to score the DiskIOPS/NetBW dimensions. Kept OUT of the full-state
-//	     anti-entropy set (antiEntropyExcluded, like host_health): it replicates via
-//	     mutation_log but stale telemetry self-corrects on the next sample, so it
-//	     must not bloat the digest/dump or churn durable host metadata. One CREATE
-//	     TABLE; gap-1 from v32.
+//	     anti-entropy set (antiEntropyExcluded): it replicates via mutation_log but
+//	     stale telemetry self-corrects on the next sample (cf. vm_events), so it
+//	     needn't be full-state-repaired and must not bloat the digest/dump or churn
+//	     durable host metadata. One CREATE TABLE; gap-1 from v32.
 const CurrentSchemaVersion = 33
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the

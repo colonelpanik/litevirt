@@ -38,6 +38,12 @@ type ClusterSnapshot struct {
 	// these for Used; capacity comes from host labels.
 	DiskIOPSUsed map[string]int // aggregate disk IOPS
 	NetMbpsUsed  map[string]int // aggregate network Mbps
+	// UsageSampled marks hosts that actually have a host_runtime_usage row. The
+	// DiskIOPS/NetBW dimensions are active ONLY for a sampled host: a labeled host
+	// with no sample (never sampled / DB read failed / the in-memory batch path)
+	// must SKIP the dimension, not be credited full headroom from a missing Used.
+	// A real zero sample stays active.
+	UsageSampled map[string]bool
 
 	// Per-host PCI device pool — used by Devices dimension and topology
 	// scoring. Optional; lazily loaded by Select if Devices > 0.
@@ -88,6 +94,7 @@ func BuildSnapshotFromUsage(hosts []corrosion.HostRecord, vms []corrosion.VMReco
 		VMCount:        make(map[string]int, len(hosts)),
 		DiskIOPSUsed:   make(map[string]int, len(hosts)),
 		NetMbpsUsed:    make(map[string]int, len(hosts)),
+		UsageSampled:   make(map[string]bool, len(hosts)),
 		ReplicasByBase: make(map[string]map[string]int),
 		VMHost:         make(map[string]string, len(vms)),
 	}
@@ -96,6 +103,7 @@ func BuildSnapshotFromUsage(hosts []corrosion.HostRecord, vms []corrosion.VMReco
 		if u, ok := usage[h.Name]; ok {
 			s.DiskIOPSUsed[h.Name] = int(u.DiskIOPS)
 			s.NetMbpsUsed[h.Name] = int(u.NetMbps)
+			s.UsageSampled[h.Name] = true
 		}
 	}
 	for _, vm := range vms {

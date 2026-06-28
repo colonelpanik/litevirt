@@ -402,3 +402,38 @@ func TestResolvePendingRelocations_UnrelatedTargetRowDoesNotComplete(t *testing.
 		t.Fatalf("unrelated target container must be untouched, got %+v", tgt)
 	}
 }
+
+// TestResolvePendingRelocations_StaleCollidingTargetSkips: a stale marker whose
+// target now holds an UNRELATED same-name container (token mismatch) must neither
+// complete (no provenance) nor clobber — it skips, preserving both. Exercises the
+// imageRecreateOrSkip collision branch with a non-empty target.
+func TestResolvePendingRelocations_StaleCollidingTargetSkips(t *testing.T) {
+	db, _, _ := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+	c.RelocateRestoreTimeout = time.Nanosecond // marker is immediately stale
+
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.RelocateRestoreDetail("surv", "tokA")); err != nil {
+		t.Fatal(err)
+	}
+	// Unrelated same-name container already on the target (different token).
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "surv", Name: "ct1", State: "running", Image: "other:1", RelocateToken: "different",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	c.resolvePendingRelocations(ctx)
+
+	// Token mismatch ⇒ no completion; collision ⇒ no clobber. Source skipped (kept),
+	// unrelated target untouched.
+	src, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
+	if src == nil || src.StateDetail != corrosion.ContainerRelocateSkippedDetail {
+		t.Fatalf("source should be relocate-skipped (kept), got %+v", src)
+	}
+	tgt, _ := corrosion.GetContainer(ctx, db, "surv", "ct1")
+	if tgt == nil || tgt.Image != "other:1" {
+		t.Fatalf("unrelated target container must be untouched, got %+v", tgt)
+	}
+}

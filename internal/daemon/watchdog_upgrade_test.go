@@ -2,10 +2,15 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"google.golang.org/grpc"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/upgrade"
 )
@@ -150,5 +155,57 @@ func TestStartUpgradeWatchdog_Disabled(t *testing.T) {
 	d.startUpgradeWatchdog(t.Context())
 	if d.upgradePending {
 		t.Fatal("disabled watchdog must not set upgradePending")
+	}
+}
+
+// fakePinger fails the first failN Pings, then succeeds.
+type fakePinger struct {
+	calls int
+	failN int
+}
+
+func (f *fakePinger) Ping(ctx context.Context, _ *pb.PingRequest, _ ...grpc.CallOption) (*pb.PingResponse, error) {
+	f.calls++
+	if f.calls <= f.failN {
+		return nil, errors.New("not serving yet")
+	}
+	return &pb.PingResponse{}, nil
+}
+
+func TestPingUntil_SucceedsAfterRetries(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+
+	p := &fakePinger{failN: 3}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if !pingUntil(ctx, p) {
+		t.Fatal("pingUntil should return true once Ping succeeds")
+	}
+	if p.calls != 4 {
+		t.Fatalf("expected 4 ping attempts (3 fail + 1 ok), got %d", p.calls)
+	}
+}
+
+func TestPingUntil_DeadlineReturnsFalse(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+
+	p := &fakePinger{failN: 1 << 30} // never succeeds
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if pingUntil(ctx, p) {
+		t.Fatal("pingUntil must return false when the deadline elapses without a successful Ping")
+	}
+}
+
+// TestLocalGRPCClient_BadPKI: a missing PKI dir surfaces an error (no rollback —
+// runUpgradeWatchdog treats this as environmental and skips).
+func TestLocalGRPCClient_BadPKI(t *testing.T) {
+	d := &Daemon{cfg: &Config{PKIDir: filepath.Join(t.TempDir(), "nonexistent"), GRPCPort: 7443}}
+	if _, _, err := d.localGRPCClient(); err == nil {
+		t.Fatal("expected an error building the local gRPC client with a bad PKI dir")
 	}
 }

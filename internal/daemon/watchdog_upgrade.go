@@ -157,10 +157,20 @@ func (d *Daemon) localGRPCClient() (pb.LiteVirtClient, *grpc.ClientConn, error) 
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
 
+// pinger is the slice of the gRPC client pingUntil needs — narrowed so tests can
+// drive it without a live server. *pb.LiteVirtClient (the interface returned by
+// localGRPCClient) satisfies it.
+type pinger interface {
+	Ping(ctx context.Context, in *pb.PingRequest, opts ...grpc.CallOption) (*pb.PingResponse, error)
+}
+
+// pingPollInterval is how often pingUntil retries; a var so tests can shrink it.
+var pingPollInterval = 2 * time.Second
+
 // pingUntil polls the local gRPC Ping until it succeeds or ctx (the deadline)
 // expires. Returns true on the first successful Ping.
-func pingUntil(ctx context.Context, client pb.LiteVirtClient) bool {
-	ticker := time.NewTicker(2 * time.Second)
+func pingUntil(ctx context.Context, client pinger) bool {
+	ticker := time.NewTicker(pingPollInterval)
 	defer ticker.Stop()
 	for {
 		pctx, pcancel := context.WithTimeout(ctx, 2*time.Second)

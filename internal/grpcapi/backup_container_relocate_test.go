@@ -4,7 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -194,5 +196,26 @@ func TestRestoreContainer_StampsRelocateTokenFromMetadata(t *testing.T) {
 	}
 	if row.RelocateToken != "tok-xyz" {
 		t.Fatalf("restored RelocateToken = %q, want tok-xyz (metadata hop not stamped)", row.RelocateToken)
+	}
+}
+
+// TestClassifyRestoreError maps restore RPC error codes to outcomes: definite
+// pre-row failures (incl. AlreadyExists — an unrelated same-name container, never
+// "landed") vs indeterminate (Internal / transport breaks → defer, don't clobber).
+func TestClassifyRestoreError(t *testing.T) {
+	beforeRow := []codes.Code{
+		codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument,
+		codes.PermissionDenied, codes.Unimplemented, codes.AlreadyExists,
+	}
+	for _, code := range beforeRow {
+		if got := classifyRestoreError(status.Error(code, "x")); got != corrosion.RestoreFailedBeforeRow {
+			t.Errorf("classifyRestoreError(%v) = %v, want RestoreFailedBeforeRow", code, got)
+		}
+	}
+	unknown := []codes.Code{codes.Internal, codes.Unavailable, codes.Canceled, codes.DeadlineExceeded, codes.Unknown}
+	for _, code := range unknown {
+		if got := classifyRestoreError(status.Error(code, "x")); got != corrosion.RestoreUnknown {
+			t.Errorf("classifyRestoreError(%v) = %v, want RestoreUnknown", code, got)
+		}
 	}
 }

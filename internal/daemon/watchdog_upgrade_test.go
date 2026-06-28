@@ -1,10 +1,12 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/upgrade"
 )
 
@@ -69,6 +71,44 @@ func TestRollbackToOld(t *testing.T) {
 	s2, ok := upgrade.Read(bin)
 	if !ok || s2.Attempt != 1 {
 		t.Fatalf("sentinel after rollback: ok=%v attempt=%d, want true/1 (flap guard)", ok, s2.Attempt)
+	}
+}
+
+// TestConfirmUpgradeHealthy proves the confirm path (Ping succeeded): the
+// sentinel is cleared and the host flips upgrading→active.
+func TestConfirmUpgradeHealthy(t *testing.T) {
+	ctx := context.Background()
+	db, err := corrosion.NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: "upgrading",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+
+	bin := filepath.Join(t.TempDir(), "litevirt")
+	if err := upgrade.Arm(bin, "v-old"); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+
+	d := &Daemon{cfg: &Config{HostName: "h"}, db: db}
+	d.confirmUpgradeHealthy(bin)
+
+	if _, ok := upgrade.Read(bin); ok {
+		t.Fatal("sentinel must be cleared after a healthy confirm")
+	}
+	h, err := corrosion.GetHost(ctx, db, "h")
+	if err != nil || h == nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	if h.State != "active" {
+		t.Fatalf("host state = %q after confirm, want active", h.State)
 	}
 }
 

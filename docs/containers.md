@@ -245,8 +245,11 @@ Containers are first-class tenancy citizens, at parity with VMs:
 - **Metrics** — the Prometheus exporter emits `litevirt_container_state` (1=running),
   `litevirt_container_cpu_limit`, `litevirt_container_memory_limit_mib`, and
   `litevirt_host_container_count`; running containers also count toward
-  `litevirt_host_pressure`. (Actual cgroup cpu/mem *usage* metrics are a follow-up;
-  today the limit/allocation is reported.)
+  `litevirt_host_pressure`. For **live cgroup usage**, running containers also emit
+  `litevirt_container_cpu_seconds_total` (cumulative CPU seconds, cgroup-v2
+  `cpu.stat`) and `litevirt_container_memory_bytes` (cgroup-v2 `memory.current`).
+  Usage metrics require cgroup-v2 (the modern default); on a cgroup-v1-only host
+  they are quietly omitted (limits/state are still reported).
 
 ## Backup & restore
 

@@ -8,6 +8,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 )
 
 // Container metrics are emitted by the collector: state (1=running, 0=other),
@@ -29,7 +30,7 @@ func TestCollect_ContainerMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 	ch := make(chan prometheus.Metric, 200)
 	c.Collect(ch)
 	close(ch)
@@ -67,6 +68,80 @@ func TestCollect_ContainerMetrics(t *testing.T) {
 	}
 }
 
+// fakeCtStat scripts container cgroup usage; an unknown name → ErrStatsUnavailable.
+type fakeCtStat struct{ m map[string]lxc.ContainerStats }
+
+func (f fakeCtStat) Stats(_ context.Context, name string) (lxc.ContainerStats, error) {
+	if st, ok := f.m[name]; ok {
+		return st, nil
+	}
+	return lxc.ContainerStats{}, lxc.ErrStatsUnavailable
+}
+
+// TestCollect_ContainerUsageMetrics: with a runtime wired, the collector emits
+// live cgroup cpu/mem usage for RUNNING containers it can stat, and skips both
+// stopped containers and running ones whose stats are unavailable (no panic).
+func TestCollect_ContainerUsageMetrics(t *testing.T) {
+	db := testCollectorDB(t)
+	ctx := context.Background()
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	// "web" running + statable; "ghost" running but unstatable; "idle" stopped.
+	for _, c := range []corrosion.ContainerRecord{
+		{HostName: "host-a", Name: "web", State: "running", CPULimit: 2, MemMiB: 512},
+		{HostName: "host-a", Name: "ghost", State: "running", CPULimit: 1, MemMiB: 256},
+		{HostName: "host-a", Name: "idle", State: "stopped", CPULimit: 1, MemMiB: 256},
+	} {
+		if err := corrosion.UpsertContainer(ctx, db, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := fakeCtStat{m: map[string]lxc.ContainerStats{
+		"web":  {CPUUsageUsec: 5_000_000, MemBytes: 1 << 20}, // 5s, 1 MiB
+		"idle": {CPUUsageUsec: 9_000_000, MemBytes: 9 << 20}, // stopped → must NOT be sampled
+	}}
+
+	c := newCollector(db, nil, st, "host-a")
+	ch := make(chan prometheus.Metric, 400)
+	c.Collect(ch)
+	close(ch)
+
+	cpuByName := map[string]float64{}
+	memByName := map[string]float64{}
+	for m := range ch {
+		d := m.Desc().String()
+		var dm dto.Metric
+		if m.Write(&dm) != nil {
+			continue
+		}
+		name := ""
+		for _, l := range dm.GetLabel() {
+			if l.GetName() == "container" {
+				name = l.GetValue()
+			}
+		}
+		if containsStr(d, "litevirt_container_cpu_seconds_total") {
+			cpuByName[name] = dm.GetCounter().GetValue()
+		}
+		if containsStr(d, "litevirt_container_memory_bytes") {
+			memByName[name] = dm.GetGauge().GetValue()
+		}
+	}
+	if cpuByName["web"] != 5.0 {
+		t.Errorf("web cpu_seconds_total = %v, want 5", cpuByName["web"])
+	}
+	if memByName["web"] != float64(1<<20) {
+		t.Errorf("web memory_bytes = %v, want %d", memByName["web"], 1<<20)
+	}
+	if _, ok := cpuByName["ghost"]; ok {
+		t.Error("unstatable running container should be skipped, not emitted")
+	}
+	if _, ok := cpuByName["idle"]; ok {
+		t.Error("stopped container must not have usage sampled")
+	}
+}
+
 func testCollectorDB(t *testing.T) *corrosion.Client {
 	t.Helper()
 	db, err := corrosion.NewTestClient()
@@ -79,7 +154,7 @@ func testCollectorDB(t *testing.T) *corrosion.Client {
 
 func TestDescribe_AllDescs(t *testing.T) {
 	db := testCollectorDB(t)
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 
 	// Buffer must be large enough to absorb every Desc emit; keep it
 	// loose so adding metrics doesn't deadlock the test.
@@ -126,7 +201,7 @@ func TestDescribe_AllDescs(t *testing.T) {
 
 func TestCollect_EmitsFDMetric(t *testing.T) {
 	db := testCollectorDB(t)
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 
 	ch := make(chan prometheus.Metric, 50)
 	c.Collect(ch)

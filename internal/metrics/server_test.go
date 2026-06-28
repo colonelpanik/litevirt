@@ -20,7 +20,7 @@ func testDB(t *testing.T) *corrosion.Client {
 
 func TestNewServer(t *testing.T) {
 	db := testDB(t)
-	s := NewServer(7444, "", db, nil, "host-a")
+	s := NewServer(7444, "", db, nil, nil, "host-a")
 
 	if s.port != 7444 {
 		t.Errorf("port = %d, want 7444", s.port)
@@ -38,7 +38,7 @@ func TestNewServer(t *testing.T) {
 
 func TestHandleStatus(t *testing.T) {
 	db := testDB(t)
-	s := NewServer(7444, "", db, nil, "host-a")
+	s := NewServer(7444, "", db, nil, nil, "host-a")
 
 	req := httptest.NewRequest("GET", "/api/v1/status", nil)
 	w := httptest.NewRecorder()
@@ -63,7 +63,7 @@ func TestHandleStatus(t *testing.T) {
 
 func TestNewCollector(t *testing.T) {
 	db := testDB(t)
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 
 	if c.hostName != "host-a" {
 		t.Errorf("hostName = %s", c.hostName)

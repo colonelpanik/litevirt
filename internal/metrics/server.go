@@ -14,7 +14,14 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/lxc"
 )
+
+// containerStatter reads a container's live cgroup usage (host-local, no RPC).
+// nil → container usage metrics are skipped. *lxc.LxcRunner satisfies it.
+type containerStatter interface {
+	Stats(ctx context.Context, name string) (lxc.ContainerStats, error)
+}
 
 // Server serves Prometheus metrics on an HTTP endpoint.
 type Server struct {
@@ -22,26 +29,29 @@ type Server struct {
 	bindAddr string // host part of the listen address; "" = all interfaces
 	db       *corrosion.Client
 	virt     *libvirt.Client
+	ctStat   containerStatter
 	hostName string
 	httpSrv  *http.Server
 }
 
 // NewServer creates a metrics server. bindAddr is the interface to listen on
 // (e.g. "127.0.0.1" to restrict /metrics to loopback); an empty string keeps
-// the historical behaviour of binding all interfaces.
-func NewServer(port int, bindAddr string, db *corrosion.Client, virt *libvirt.Client, hostName string) *Server {
+// the historical behaviour of binding all interfaces. ctStat may be nil
+// (container cgroup-usage metrics are then skipped).
+func NewServer(port int, bindAddr string, db *corrosion.Client, virt *libvirt.Client, ctStat containerStatter, hostName string) *Server {
 	return &Server{
 		port:     port,
 		bindAddr: bindAddr,
 		db:       db,
 		virt:     virt,
+		ctStat:   ctStat,
 		hostName: hostName,
 	}
 }
 
 // Start begins serving metrics. Blocks.
 func (s *Server) Start() {
-	collector := newCollector(s.db, s.virt, s.hostName)
+	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
 	prometheus.MustRegister(collector)
 
 	mux := http.NewServeMux()
@@ -76,6 +86,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 type collector struct {
 	db       *corrosion.Client
 	virt     *libvirt.Client
+	ctStat   containerStatter
 	hostName string
 
 	hostVMCount    *prometheus.Desc
@@ -88,6 +99,8 @@ type collector struct {
 	ctState        *prometheus.Desc
 	ctCPULimit     *prometheus.Desc
 	ctMemLimit     *prometheus.Desc
+	ctCPUSeconds   *prometheus.Desc // live cgroup CPU usage (A3b)
+	ctMemBytes     *prometheus.Desc // live cgroup memory usage (A3b)
 	vmDiskRead     *prometheus.Desc
 	vmDiskWrite    *prometheus.Desc
 	vmDiskReadOps  *prometheus.Desc
@@ -116,10 +129,11 @@ type collector struct {
 	rebalanceApplied   *prometheus.Desc // applied/approved/rejected proposals
 }
 
-func newCollector(db *corrosion.Client, virt *libvirt.Client, hostName string) *collector {
+func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerStatter, hostName string) *collector {
 	return &collector{
 		db:       db,
 		virt:     virt,
+		ctStat:   ctStat,
 		hostName: hostName,
 		hostVMCount: prometheus.NewDesc(
 			"litevirt_host_vm_count", "Number of VMs on this host",
@@ -159,6 +173,14 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, hostName string) *
 		),
 		ctMemLimit: prometheus.NewDesc(
 			"litevirt_container_memory_limit_mib", "Container memory limit in MiB (0=unlimited)",
+			[]string{"container"}, nil,
+		),
+		ctCPUSeconds: prometheus.NewDesc(
+			"litevirt_container_cpu_seconds_total", "Cumulative container CPU time in seconds (cgroup-v2 cpu.stat)",
+			[]string{"container"}, nil,
+		),
+		ctMemBytes: prometheus.NewDesc(
+			"litevirt_container_memory_bytes", "Current container memory usage in bytes (cgroup-v2 memory.current)",
 			[]string{"container"}, nil,
 		),
 		// Per-VM I/O counters sourced from libvirt.GetAllDomainStats.
@@ -284,6 +306,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ctState
 	ch <- c.ctCPULimit
 	ch <- c.ctMemLimit
+	ch <- c.ctCPUSeconds
+	ch <- c.ctMemBytes
 	ch <- c.vmDiskRead
 	ch <- c.vmDiskWrite
 	ch <- c.vmDiskReadOps
@@ -332,8 +356,10 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	// Container metrics. State + declared limits from the containers table (no
-	// new runtime primitive); actual cgroup cpu/mem usage is a follow-up (A3b).
+	// Container metrics. State + declared limits from the containers table;
+	// actual cgroup cpu/mem usage (A3b) comes from the host-local runtime when
+	// one is wired (ctStat), best-effort — a container with no readable cgroup
+	// (stopped, or a cgroup-v1 host → ErrStatsUnavailable) is silently skipped.
 	if cts, err := corrosion.ListContainers(ctx, c.db, c.hostName); err == nil {
 		ch <- prometheus.MustNewConstMetric(c.hostCtCount, prometheus.GaugeValue, float64(len(cts)))
 		for _, ct := range cts {
@@ -344,6 +370,12 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.ctState, prometheus.GaugeValue, running, ct.Name, ct.State)
 			ch <- prometheus.MustNewConstMetric(c.ctCPULimit, prometheus.GaugeValue, float64(ct.CPULimit), ct.Name)
 			ch <- prometheus.MustNewConstMetric(c.ctMemLimit, prometheus.GaugeValue, float64(ct.MemMiB), ct.Name)
+			if c.ctStat != nil && ct.State == "running" {
+				if st, serr := c.ctStat.Stats(ctx, ct.Name); serr == nil {
+					ch <- prometheus.MustNewConstMetric(c.ctCPUSeconds, prometheus.CounterValue, float64(st.CPUUsageUsec)/1e6, ct.Name)
+					ch <- prometheus.MustNewConstMetric(c.ctMemBytes, prometheus.GaugeValue, float64(st.MemBytes), ct.Name)
+				}
+			}
 		}
 	}
 

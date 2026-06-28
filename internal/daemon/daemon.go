@@ -255,8 +255,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, time.Duration(d.cfg.AntiEntropyIntervalSec)*time.Second)
 	go ae.Start(ctx)
 
-	// Start metrics server
-	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, d.cfg.HostName)
+	// Start metrics server. Create the LXC runner ONCE here and share it with the
+	// gRPC container adapter + health checker below, so the metrics collector can
+	// also read live container cgroup usage (host-local, no RPC).
+	lxcRunner := lxc.NewLxcRunner()
+	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	go d.metrics.Start()
 
 	// Start host health checker
@@ -416,7 +419,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// We always wire it — when lxc-* binaries aren't installed, the
 	// individual RPCs surface the error from the binary lookup, which
 	// is more useful than a blanket "container runtime not wired".
-	lxcRunner := lxc.NewLxcRunner()
+	// lxcRunner was created above (shared with the metrics collector).
 	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
 
 	// Advertise LXC capability as a host label so the compose planner places

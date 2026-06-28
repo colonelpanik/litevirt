@@ -102,7 +102,7 @@ func TestCollect_ReplicationPeerLag(t *testing.T) {
 		want[r.String("peer_name")] = float64(lag)
 	}
 
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 	ch := make(chan prometheus.Metric, 100)
 	c.Collect(ch)
 	close(ch)
@@ -150,7 +150,7 @@ func TestCollect_ReplicationPending(t *testing.T) {
 		t.Fatalf("test setup: expected a positive backlog, got %v", want)
 	}
 
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 	ch := make(chan prometheus.Metric, 100)
 	c.Collect(ch)
 	close(ch)
@@ -178,7 +178,7 @@ func TestCollect_ReplicationPending_NoLivePeers(t *testing.T) {
 		t.Fatalf("insert watermark: %v", err)
 	}
 
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 	ch := make(chan prometheus.Metric, 100)
 	c.Collect(ch)
 	close(ch)
@@ -230,7 +230,7 @@ func TestCollect_WithVMs(t *testing.T) {
 		}
 	}
 
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 	ch := make(chan prometheus.Metric, 100)
 	c.Collect(ch)
 	close(ch)
@@ -295,7 +295,7 @@ func TestCollect_WithPeerHealth(t *testing.T) {
 		t.Fatalf("insert health: %v", err)
 	}
 
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 	ch := make(chan prometheus.Metric, 100)
 	c.Collect(ch)
 	close(ch)
@@ -325,7 +325,7 @@ func TestCollect_WithClockSkew(t *testing.T) {
 		t.Fatalf("insert clock_skew: %v", err)
 	}
 
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 	ch := make(chan prometheus.Metric, 100)
 	c.Collect(ch)
 	close(ch)
@@ -361,7 +361,7 @@ func TestCollect_WithSnapshots(t *testing.T) {
 		}
 	}
 
-	c := newCollector(db, nil, "host-a")
+	c := newCollector(db, nil, nil, "host-a")
 	ch := make(chan prometheus.Metric, 100)
 	c.Collect(ch)
 	close(ch)
@@ -379,7 +379,7 @@ func TestCollect_WithSnapshots(t *testing.T) {
 
 func TestDescribe_AllDescsExtra(t *testing.T) {
 	db := initTestDB(t)
-	c := newCollector(db, nil, "host-test")
+	c := newCollector(db, nil, nil, "host-test")
 
 	ch := make(chan *prometheus.Desc, 64)
 	c.Describe(ch)
@@ -397,7 +397,7 @@ func TestDescribe_AllDescsExtra(t *testing.T) {
 
 func TestHandleStatus_Method(t *testing.T) {
 	db := initTestDB(t)
-	s := NewServer(7444, "", db, nil, "host-a")
+	s := NewServer(7444, "", db, nil, nil, "host-a")
 
 	// Test with POST — should still work (no method restriction).
 	req := httptest.NewRequest("POST", "/api/v1/status", nil)
@@ -412,7 +412,7 @@ func TestHandleStatus_Method(t *testing.T) {
 
 func TestNewServer_Fields(t *testing.T) {
 	db := initTestDB(t)
-	s := NewServer(9999, "", db, nil, "myhost")
+	s := NewServer(9999, "", db, nil, nil, "myhost")
 	if s.port != 9999 {
 		t.Errorf("port = %d", s.port)
 	}
@@ -433,7 +433,7 @@ func TestStop_NilHttpSrv(t *testing.T) {
 func TestCollect_NoHost(t *testing.T) {
 	db := initTestDB(t)
 	// Collector with a host name that doesn't exist.
-	c := newCollector(db, nil, "nonexistent-host")
+	c := newCollector(db, nil, nil, "nonexistent-host")
 	ch := make(chan prometheus.Metric, 100)
 	c.Collect(ch)
 	close(ch)

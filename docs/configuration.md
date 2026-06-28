@@ -165,6 +165,14 @@ vm_event_error_retention_days: 90
 vm_event_max_per_vm: 1000
 vm_event_prune_hours: 24
 
+# Post-upgrade health watchdog. After a self-upgrade re-exec, verify the NEW
+# binary's local gRPC becomes pingable within the deadline; if not, roll back to
+# the previous binary (.old) and exit so systemd restarts it. Catches a binary
+# that starts but is non-functional (the gap systemd's crash-loop rollback
+# misses). See docs/upgrades.md.
+upgrade_watchdog_enabled: true        # false to disable (also LITEVIRT_UNSAFE_NO_UPGRADE_WATCHDOG=1)
+upgrade_health_deadline_sec: 120      # 0 → 120s; widen for very slow N-step schema migrates
+
 # ACME / autocert for the web UI cert (#13). When set, the daemon TERMINATES UI
 # TLS itself (port 7445) using a cert from the configured ACME directory, with an
 # internal-PKI fallback during issuance. Unset (default) = UI stays plain HTTP

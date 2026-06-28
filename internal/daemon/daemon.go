@@ -79,6 +79,16 @@ type Daemon struct {
 	// schedules. Built before the gRPC server (so daemon Run can wire
 	// the Runner once svc exists) and Stop()-ed on shutdown.
 	snapScheduler *scheduler.SnapshotScheduler
+
+	// upgradePending is set at startup when a post-upgrade sentinel is present:
+	// this boot is a freshly-swapped binary that must prove its local gRPC is
+	// healthy before its host state flips upgrading→active (the watchdog does the
+	// flip on confirm). Set once in startUpgradeWatchdog, read in Run.
+	upgradePending bool
+
+	// exitFunc terminates the process on a watchdog rollback. Defaults to os.Exit;
+	// overridable in tests.
+	exitFunc func(int)
 }
 
 // New creates a new daemon instance.
@@ -136,6 +146,11 @@ func (d *Daemon) markRestarting() {
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// Arm the post-upgrade health watchdog FIRST (before any potentially-hanging
+	// init step), and independently, so a boot that hangs before the gRPC server
+	// can serve is still caught. No-op on a normal boot (no sentinel).
+	d.startUpgradeWatchdog(ctx)
+
 	// Pre-flight: refuse to start under a systemd unit that would kill
 	// child QEMU processes on stop. See preflight.go for the rationale.
 	if err := preflightUnitCheck(); err != nil {
@@ -229,7 +244,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else {
 		slog.Warn("NodeInfo failed at startup; writing host state without resources", "error", niErr)
 	}
-	if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, "active", d.cfg.Version, cpus, memMiB, diskGiB, niErr == nil); err != nil {
+	// On an upgrade boot, stay "upgrading" until the watchdog confirms local gRPC
+	// is healthy (it flips to "active"); version + resources are still written
+	// here either way so the new version propagates immediately.
+	bootState := "active"
+	if d.upgradePending {
+		bootState = "upgrading"
+	}
+	if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, bootState, d.cfg.Version, cpus, memMiB, diskGiB, niErr == nil); err != nil {
 		slog.Warn("failed to write host startup state", "error", err)
 	}
 	// Record version on the corrosion client so it goes into Crescent

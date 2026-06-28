@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/upgrade"
 )
 
 // UpgradeHost receives a new binary over gRPC streaming, swaps it in,
@@ -94,7 +95,14 @@ func (s *Server) applyStagedBinary(ctx context.Context, stagingPath string) erro
 	if err := os.Rename(stagingPath, binaryPath); err != nil {
 		return fmt.Errorf("swap binary: %w", err)
 	}
-	// The new binary's startup transitions back to `active` once healthy.
+	// Arm the post-upgrade health watchdog: the re-exec'd new binary must prove
+	// its local gRPC is pingable within the deadline or roll back to .old. The
+	// sentinel carries the version being replaced for the rollback log/metric.
+	if err := upgrade.Arm(binaryPath, s.version); err != nil {
+		slog.Warn("upgrade: failed to arm health-watchdog sentinel", "error", err)
+	}
+	// The new binary's startup transitions back to `active` once the watchdog
+	// confirms the local gRPC is healthy.
 	if err := corrosion.UpdateHostState(ctx, s.db, s.hostName, "upgrading"); err != nil {
 		slog.Warn("upgrade: failed to mark host upgrading", "error", err)
 	}

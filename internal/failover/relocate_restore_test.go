@@ -19,13 +19,14 @@ type fakeRestorer struct {
 	db      *corrosion.Client
 }
 
-func (f *fakeRestorer) RestoreContainerFromBackup(ctx context.Context, ctName, target string) (corrosion.RestoreOutcome, error) {
+func (f *fakeRestorer) RestoreContainerFromBackup(ctx context.Context, ctName, target, token string) (corrosion.RestoreOutcome, error) {
 	f.calls++
 	if f.outcome == corrosion.RestoreLanded {
-		// Simulate the target having recorded its (eventually-replicated) row.
+		// Simulate the target recording its (eventually-replicated) row, stamping
+		// the attempt token as the real RestoreContainer would.
 		_ = corrosion.UpsertContainer(ctx, f.db, corrosion.ContainerRecord{
 			HostName: target, Name: ctName, State: "stopped", Image: "alpine:3.19",
-			OnHostFailure: "image-recreate",
+			OnHostFailure: "image-recreate", RelocateToken: token,
 		})
 	}
 	return f.outcome, f.err
@@ -187,11 +188,11 @@ func TestRelocate_ResumeRestoredThenCrashBeforeTombstone(t *testing.T) {
 
 	// Simulate: marker set + restore already created the target row, but the
 	// coordinator crashed before tombstoning the source.
-	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.ContainerRelocateRestorePrefix+"surv"); err != nil {
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.RelocateRestoreDetail("surv", "tok1")); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
 	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
-		HostName: "surv", Name: "ct1", State: "stopped", Image: "alpine:3.19", OnHostFailure: "image-recreate",
+		HostName: "surv", Name: "ct1", State: "stopped", Image: "alpine:3.19", OnHostFailure: "image-recreate", RelocateToken: "tok1",
 	}); err != nil {
 		t.Fatalf("seed target: %v", err)
 	}
@@ -215,7 +216,7 @@ func TestRelocate_ResumeFreshMarkerSkips(t *testing.T) {
 	c.Restorer = fr
 	c.RelocateRestoreTimeout = time.Hour // marker just written ⇒ fresh
 
-	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.ContainerRelocateRestorePrefix+"surv"); err != nil {
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.RelocateRestoreDetail("surv", "tok1")); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
 
@@ -239,7 +240,7 @@ func TestRelocate_ResumeStaleMarkerFallsBack(t *testing.T) {
 	c.Restorer = fr
 	c.RelocateRestoreTimeout = time.Nanosecond // any marker is immediately stale
 
-	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.ContainerRelocateRestorePrefix+"surv"); err != nil {
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.RelocateRestoreDetail("surv", "tok1")); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
 	time.Sleep(2 * time.Millisecond) // ensure now-updated_at > timeout
@@ -270,7 +271,7 @@ func TestRelocate_UnknownLeavesMarkerForResolve(t *testing.T) {
 	c.relocateContainers(ctx, src, cands, &idx)
 
 	row, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
-	tgt, restoring := corrosion.RelocateRestoreTarget(rowState(row), rowDetail(row))
+	tgt, _, restoring := corrosion.RelocateRestoreMarker(rowState(row), rowDetail(row))
 	if row == nil || !restoring || tgt != "surv" {
 		t.Fatalf("indeterminate restore must leave the relocate-restore marker on the source, got %+v", row)
 	}
@@ -288,11 +289,11 @@ func TestResolvePendingRelocations_CompletesWhenTargetRowAppears(t *testing.T) {
 	c := newTestCoordinator("coord", db)
 
 	// Leftover marker + the target row has since appeared (replication converged).
-	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.ContainerRelocateRestorePrefix+"surv"); err != nil {
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.RelocateRestoreDetail("surv", "tok1")); err != nil {
 		t.Fatal(err)
 	}
 	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
-		HostName: "surv", Name: "ct1", State: "stopped", Image: "alpine:3.19", OnHostFailure: "image-recreate",
+		HostName: "surv", Name: "ct1", State: "stopped", Image: "alpine:3.19", OnHostFailure: "image-recreate", RelocateToken: "tok1",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +313,7 @@ func TestResolvePendingRelocations_StaleFallsBack(t *testing.T) {
 	c := newTestCoordinator("coord", db)
 	c.RelocateRestoreTimeout = time.Nanosecond // any marker is immediately stale
 
-	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.ContainerRelocateRestorePrefix+"surv"); err != nil {
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.RelocateRestoreDetail("surv", "tok1")); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond)
@@ -365,5 +366,39 @@ func TestRelocate_CollisionTargetPreservesBoth(t *testing.T) {
 	tgt, _ := corrosion.GetContainer(ctx, db, "surv", "ct1")
 	if tgt == nil || tgt.Image != "other:1" || tgt.StateDetail == corrosion.ContainerRelocateRecreateDetail {
 		t.Fatalf("unrelated same-name container on the target must be untouched, got %+v", tgt)
+	}
+}
+
+// TestResolvePendingRelocations_UnrelatedTargetRowDoesNotComplete is the
+// provenance guarantee: a marker whose target holds an UNRELATED same-name
+// container (no matching attempt token) must NOT be treated as landed — the
+// source is preserved, not tombstoned over the unrelated container.
+func TestResolvePendingRelocations_UnrelatedTargetRowDoesNotComplete(t *testing.T) {
+	db, _, _ := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+
+	// Source marked for restore with token "tokA".
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.RelocateRestoreDetail("surv", "tokA")); err != nil {
+		t.Fatal(err)
+	}
+	// The target already runs an UNRELATED ct1 (no / different relocate token).
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "surv", Name: "ct1", State: "running", Image: "other:1", RelocateToken: "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c.resolvePendingRelocations(ctx)
+
+	// Source NOT tombstoned (no token match ⇒ no provenance ⇒ no completion); the
+	// unrelated target container untouched.
+	src, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
+	if src == nil {
+		t.Fatal("source must NOT be tombstoned when the target row isn't proven to be our restore")
+	}
+	tgt, _ := corrosion.GetContainer(ctx, db, "surv", "ct1")
+	if tgt == nil || tgt.Image != "other:1" {
+		t.Fatalf("unrelated target container must be untouched, got %+v", tgt)
 	}
 }

@@ -62,8 +62,13 @@ type ContainerRecord struct {
 	// that. Carried verbatim by RelocateContainer; kept current by every path that
 	// (re)creates a container (Create/Clone/Restore).
 	CreateSpec string
-	CreatedAt  string
-	UpdatedAt  string
+	// RelocateToken is stamped by a restore-relocation (the coordinator's attempt
+	// token) so the coordinator can prove a (host,name) row is ITS restore — names
+	// aren't cluster-unique — before tombstoning the source. '' for normal
+	// containers. Schema v34.
+	RelocateToken string
+	CreatedAt     string
+	UpdatedAt     string
 }
 
 // ContainerCreateSpec captures a container's create-time intent so host-loss
@@ -134,8 +139,8 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
 	return c.Execute(ctx,
-		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
 		   image = excluded.image,
@@ -151,10 +156,11 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 		   -- generic upsert can't wipe the create-time intent (it's "current
 		   -- intent", forward-only).
 		   create_spec = CASE WHEN excluded.create_spec <> '' THEN excluded.create_spec ELSE create_spec END,
+		   relocate_token = excluded.relocate_token,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
-		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.CreatedAt, now,
+		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken, r.CreatedAt, now,
 	)
 }
 
@@ -199,18 +205,31 @@ const ContainerRelocateRecreateDetail = "relocate-recreate"
 // ContainerRelocateRestorePrefix marks a container the coordinator is relocating
 // via restore-from-backup. Unlike relocate-recreate (an image path stamped on the
 // TARGET row), this is stamped on the SOURCE (dead-host) row as
-// state="relocating", detail="relocate-restore:<target>", and the row stays put
-// until the restore lands — so a re-tick (e.g. after a coordinator crash) can
-// re-derive progress from it (see RelocateRestoreTarget).
+// state="relocating", detail="relocate-restore:<target>:<token>", and the row
+// stays put until the restore lands — so a re-tick (e.g. after a coordinator
+// crash) can re-derive progress (see RelocateRestoreMarker). The token is the
+// attempt token: the same value the target stamps on its restored row's
+// relocate_token, letting the coordinator prove a (target,name) row is THIS
+// restore before tombstoning the source (names aren't cluster-unique).
 const ContainerRelocateRestorePrefix = "relocate-restore:"
 
-// RelocateRestoreTarget parses a relocate-restore marker, returning the chosen
-// target host and true, or ("", false) if the row isn't so marked.
-func RelocateRestoreTarget(state, detail string) (string, bool) {
+// RelocateRestoreDetail builds the source-row marker for a restore relocation.
+func RelocateRestoreDetail(target, token string) string {
+	return ContainerRelocateRestorePrefix + target + ":" + token
+}
+
+// RelocateRestoreMarker parses a relocate-restore marker into (target, token,
+// ok). ok=false if the row isn't so marked. A legacy marker without a token
+// (pre-token) parses with token="".
+func RelocateRestoreMarker(state, detail string) (target, token string, ok bool) {
 	if state != "relocating" || !strings.HasPrefix(detail, ContainerRelocateRestorePrefix) {
-		return "", false
+		return "", "", false
 	}
-	return strings.TrimPrefix(detail, ContainerRelocateRestorePrefix), true
+	rest := strings.TrimPrefix(detail, ContainerRelocateRestorePrefix)
+	if i := strings.LastIndex(rest, ":"); i >= 0 {
+		return rest[:i], rest[i+1:], true
+	}
+	return rest, "", true
 }
 
 // ContainerRelocateSkippedDetail is the terminal state_detail the coordinator
@@ -300,6 +319,7 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 		        COALESCE(is_template, 0) AS is_template,
 		        COALESCE(on_host_failure, '') AS on_host_failure,
 		        COALESCE(create_spec, '') AS create_spec,
+		        COALESCE(relocate_token, '') AS relocate_token,
 		        created_at, updated_at
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		hostName, name)
@@ -324,6 +344,7 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 		   COALESCE(is_template, 0) AS is_template,
 		   COALESCE(on_host_failure, '') AS on_host_failure,
 		   COALESCE(create_spec, '') AS create_spec,
+		   COALESCE(relocate_token, '') AS relocate_token,
 		   created_at, updated_at
 		FROM containers WHERE deleted_at IS NULL`
 	var params []interface{}
@@ -356,6 +377,7 @@ func scanContainer(r Row) ContainerRecord {
 		IsTemplate:    r.Int("is_template") == 1,
 		OnHostFailure: r.String("on_host_failure"),
 		CreateSpec:    r.String("create_spec"),
+		RelocateToken: r.String("relocate_token"),
 		CreatedAt:     r.String("created_at"), UpdatedAt: r.String("updated_at"),
 	}
 }

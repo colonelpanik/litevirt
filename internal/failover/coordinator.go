@@ -74,7 +74,7 @@ type ContainerRestorer interface {
 	// coordinator needn't read its own (replication-lagged) replica. Landed ⇒
 	// complete; NotAttempted/FailedBeforeRow ⇒ fall back; Unknown ⇒ defer (the row
 	// may have landed but the confirmation was lost).
-	RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) (corrosion.RestoreOutcome, error)
+	RestoreContainerFromBackup(ctx context.Context, ctName, targetHost, token string) (corrosion.RestoreOutcome, error)
 }
 
 // Coordinator watches for host failures and triggers failover.
@@ -300,7 +300,7 @@ func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
 		return
 	}
 	for _, ct := range cts {
-		target, restoring := corrosion.RelocateRestoreTarget(ct.State, ct.StateDetail)
+		target, token, restoring := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail)
 		if !restoring {
 			continue
 		}
@@ -310,7 +310,7 @@ func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
 		}
 		// candidates/fallbackIdx are only consulted if the marker carries no target
 		// (it always does), so an empty candidate set is fine here.
-		c.resumeRestoreRelocation(ctx, src, ct, target, nil, new(int))
+		c.resumeRestoreRelocation(ctx, src, ct, target, token, nil, new(int))
 	}
 }
 
@@ -859,9 +859,9 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 			continue
 		}
 		// Crash recovery: a prior tick already began a restore-relocation (marker on
-		// the source row, carrying the target). Re-derive rather than restarting.
-		if target, restoring := corrosion.RelocateRestoreTarget(ct.State, ct.StateDetail); restoring {
-			c.resumeRestoreRelocation(ctx, h, ct, target, candidates, fallbackIdx)
+		// the source row, carrying the target + attempt token). Re-derive.
+		if target, token, restoring := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); restoring {
+			c.resumeRestoreRelocation(ctx, h, ct, target, token, candidates, fallbackIdx)
 			continue
 		}
 		c.startRelocation(ctx, h, ct, candidates, fallbackIdx)
@@ -880,19 +880,21 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 	// Tier-2: restore-from-backup when a restorer is wired and the survivor is
 	// schema-compatible.
 	if c.Restorer != nil && c.survivorSchemaCompatible(ctx, target) {
-		// Mark the SOURCE row first (idempotent; carries the target) so a crash
-		// mid-restore is recoverable. The marker is load-bearing for that recovery,
-		// so if its write FAILS we must NOT proceed with the restore (an unmarked
-		// restore the next tick couldn't re-derive) — defer to a later tick.
-		if err := corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "relocating", corrosion.ContainerRelocateRestorePrefix+target); err != nil {
+		// Mark the SOURCE row first (idempotent; carries the target + a fresh attempt
+		// token) so a crash mid-restore is recoverable. The marker is load-bearing
+		// for that recovery, so if its write FAILS we must NOT proceed with the
+		// restore (an unmarked restore the next tick couldn't re-derive) — defer.
+		token := newID()
+		if err := corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "relocating", corrosion.RelocateRestoreDetail(target, token)); err != nil {
 			slog.Warn("failover: failed to mark relocate-restore; deferring relocation to next tick",
 				"container", ct.Name, "error", err)
 			c.mCt(ActionRelocate, ResultError, ErrDBError)
 			return
 		}
 		// We do NOT pre-create a target row — RestoreContainer refuses an existing
-		// row, and a genuinely-failed restore must leave none.
-		switch outcome, err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target); outcome {
+		// row, and a genuinely-failed restore must leave none. The token rides to the
+		// target, which stamps it on the restored row so we can prove it's ours.
+		switch outcome, err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target, token); outcome {
 		case corrosion.RestoreLanded:
 			// The target recorded its row (even if a later start errored) — complete
 			// the handoff; do NOT image-recreate over a valid restored container.
@@ -921,16 +923,15 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 
 // resumeRestoreRelocation re-derives a relocate-restore marker on a re-tick
 // (typically after a coordinator restart mid-restore).
-func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string, candidates []corrosion.HostRecord, fallbackIdx *int) {
+func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target, token string, candidates []corrosion.HostRecord, fallbackIdx *int) {
 	// Restore already landed? (crashed after the target row was created but before
-	// the source was tombstoned). A target row exists ⇒ a complete restore, because
-	// RestoreContainer's row write is mandatory + post-import (see backup_container.go).
-	// Provenance: the target in the marker was chosen collision-free (pickContainerTarget
-	// skips hosts already running the name) and only OUR restore writes the name there;
-	// a collision during the attempt clears the marker via the image-recreate fallback,
-	// so a marker reaching here attributes the target row to our restore.
-	if target != "" {
-		if tgt, _ := corrosion.GetContainer(ctx, c.db, target, ct.Name); tgt != nil {
+	// the source was tombstoned). Require PROVENANCE: the (target,name) row must
+	// carry OUR attempt token (the target stamps relocate_token from the marker's
+	// token). Names aren't cluster-unique, so a same-name row could otherwise be an
+	// unrelated container (operator create / delayed anti-entropy) — completing on
+	// that would tombstone the source over it. A token match proves it's our restore.
+	if target != "" && token != "" {
+		if tgt, _ := corrosion.GetContainer(ctx, c.db, target, ct.Name); tgt != nil && tgt.RelocateToken == token {
 			c.completeRestore(ctx, h, ct, target)
 			return
 		}

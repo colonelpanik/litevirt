@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -51,6 +52,12 @@ const containerBackupDisk = "rootfs"
 // once it has recorded the cluster row (post-import, pre-start). A remote driver
 // uses it to detect a LANDED restore even if a later step (start) errors.
 const restoreRowRecordedStatus = "cluster-row-recorded"
+
+// relocateTokenMDKey is the gRPC metadata key carrying the failover coordinator's
+// attempt token to a restore-relocation. The target stamps it on the restored
+// row's relocate_token so the coordinator can prove the (target,name) row is ITS
+// restore. Passed via metadata (not a proto field) so no contract change.
+const relocateTokenMDKey = "x-litevirt-relocate-token"
 
 // BackupContainer freezes a container, streams its rootfs+config as a full,
 // content-addressed manifest into a host-local repo, and indexes the size for
@@ -170,12 +177,23 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 // needn't consult its own replication-lagged replica to tell a landed restore
 // from a genuine failure. landed=false + err ⇒ fall back to image-recreate.
 // Satisfies failover.ContainerRestorer.
-func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) (corrosion.RestoreOutcome, error) {
+func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost, token string) (corrosion.RestoreOutcome, error) {
 	repoName, timestamp, err := s.findLatestContainerBackup(ctName)
 	if err != nil {
 		return corrosion.RestoreNotAttempted, err
 	}
-	return s.driveRemoteRestore(ctx, targetHost, repoName, ctName, timestamp)
+	return s.driveRemoteRestore(ctx, targetHost, repoName, ctName, timestamp, token)
+}
+
+// relocateTokenFromMD reads the relocation attempt token from incoming gRPC
+// metadata (” for a direct, non-relocation restore).
+func relocateTokenFromMD(ctx context.Context) string {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if v := md.Get(relocateTokenMDKey); len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
 }
 
 // driveRemoteRestore opens RestoreContainer on the target over peer mTLS, drains
@@ -185,7 +203,7 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 // else after the RPC started is indeterminate (the row may have landed but the
 // frame/stream was lost) → RestoreUnknown, which the coordinator defers rather
 // than destructively falling back.
-func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp string) (corrosion.RestoreOutcome, error) {
+func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string) (corrosion.RestoreOutcome, error) {
 	if s.migrateRestoreOverride != nil {
 		// Test seam (shared with MigrateContainer): a nil error ⇒ landed; an error
 		// is indeterminate (the override doesn't model where it failed).
@@ -193,6 +211,10 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 			return corrosion.RestoreUnknown, e
 		}
 		return corrosion.RestoreLanded, nil
+	}
+	// Carry the attempt token to the target so it stamps the restored row.
+	if token != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, relocateTokenMDKey, token)
 	}
 	c, conn, derr := s.peerClient(ctx, target)
 	if derr != nil {
@@ -434,6 +456,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		CreateSpec:    spec.CreateSpec,
 		OnHostFailure: spec.OnHostFailure,
 		IsTemplate:    spec.IsTemplate,
+		// Stamp the failover coordinator's attempt token (if this is a
+		// restore-relocation) so it can prove this row is its restore.
+		RelocateToken: relocateTokenFromMD(ctx),
 	}
 	// The cluster-row write is MANDATORY. A restore that imported the runtime
 	// container but failed to record the row would strand an untracked container —

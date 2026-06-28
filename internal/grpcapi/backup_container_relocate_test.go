@@ -122,7 +122,7 @@ func TestRestoreContainerFromBackup_FindsManifestAndDrives(t *testing.T) {
 	s.SetBackupRepos(map[string]string{"main": repo})
 
 	// No backup yet → no manifest → not attempted, error.
-	if outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b"); err == nil || outcome != corrosion.RestoreNotAttempted {
+	if outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b", "tok-x"); err == nil || outcome != corrosion.RestoreNotAttempted {
 		t.Fatalf("want (RestoreNotAttempted, err) with no manifest, got (%v, %v)", outcome, err)
 	}
 
@@ -143,7 +143,7 @@ func TestRestoreContainerFromBackup_FindsManifestAndDrives(t *testing.T) {
 		gotRepo, gotName, gotTs = repoPath, name, ts
 		return nil
 	}
-	outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b")
+	outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b", "tok-x")
 	if err != nil || outcome != corrosion.RestoreLanded {
 		t.Fatalf("want (RestoreLanded, nil), got (%v, %v)", outcome, err)
 	}

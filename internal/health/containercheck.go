@@ -65,6 +65,11 @@ func (c *ContainerChecker) Start(ctx context.Context) {
 	}
 }
 
+// SweepOnce runs a single reconcile pass — the body of the periodic loop,
+// exported (mirroring Reconciler.ReconcileOnce) so the fleet harness and one-shot
+// ops can drive a deterministic pass without waiting on the 15s ticker.
+func (c *ContainerChecker) SweepOnce(ctx context.Context) { c.sweep(ctx) }
+
 func (c *ContainerChecker) sweep(ctx context.Context) {
 	if c.runtime == nil {
 		return

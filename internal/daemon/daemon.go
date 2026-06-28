@@ -313,6 +313,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// stays bounded (see config vm_event_*).
 	go d.runVMEventPrune(ctx)
 
+	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
+	// placement engine's DiskIOPS/NetBW dimensions.
+	go d.runRuntimeUsageSampler(ctx)
+
 	// Start embedded DNS server
 	dnsSrv := dns.NewServer(d.cfg.DNSDomain, d.cfg.DNSPort, d.db)
 	go dnsSrv.Start(ctx)

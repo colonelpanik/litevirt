@@ -176,7 +176,14 @@ import (
 //	     Five ADD COLUMNs + two CREATE TABLEs; gap-1 from v31. InitSchema runs
 //	     idempotent post-migration data fixes (user_2fa NULL→'' label; legacy
 //	     2FA/recovery pointer backfill) via raw SQL, not replicated mutations.
-const CurrentSchemaVersion = 32
+//	v33: host_runtime_usage(host_name PK, disk_iops, net_mbps, updated_at,
+//	     deleted_at) — a per-host runtime-telemetry row the placement engine reads
+//	     to score the DiskIOPS/NetBW dimensions. Kept OUT of the full-state
+//	     anti-entropy set (antiEntropyExcluded): it replicates via mutation_log but
+//	     stale telemetry self-corrects on the next sample (cf. vm_events), so it
+//	     needn't be full-state-repaired and must not bloat the digest/dump or churn
+//	     durable host metadata. One CREATE TABLE; gap-1 from v32.
+const CurrentSchemaVersion = 33
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -557,6 +564,17 @@ var schemaDDL = []string{
 		skew_seconds REAL NOT NULL,
 		updated_at   TEXT NOT NULL,
 		PRIMARY KEY (observer, target)
+	)`,
+
+	// Per-host runtime telemetry the placement engine reads for the DiskIOPS/NetBW
+	// dimensions (v33). Each host writes only its own row. Anti-entropy-excluded
+	// (replicates via mutation_log; stale telemetry self-corrects on the next sample).
+	`CREATE TABLE IF NOT EXISTS host_runtime_usage (
+		host_name    TEXT PRIMARY KEY,
+		disk_iops    INTEGER NOT NULL DEFAULT 0,
+		net_mbps     INTEGER NOT NULL DEFAULT 0,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS crl_versions (
@@ -1438,6 +1456,7 @@ var tablePrimaryKeys = map[string][]string{
 	"hosts":                  {"name"},
 	"host_labels":            {"host_name", "key"},
 	"host_health":            {"observer", "target"},
+	"host_runtime_usage":     {"host_name"},
 	"clock_skew":             {"observer", "target"},
 	"crl_versions":           {"host"},
 	"leader_election":        {"key"},
@@ -1739,6 +1758,7 @@ var createTableUnits = []struct {
 	{21, "ip_sets"}, {22, "replication_checkpoints"}, {23, "registry_credentials"},
 	{26, "container_backups"}, {27, "container_snapshots"},
 	{32, "recovery_code_sets"}, {32, "user_2fa_sets"},
+	{33, "host_runtime_usage"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

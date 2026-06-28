@@ -61,6 +61,7 @@ const (
 	ErrFenceLogWrite     = "fence_log_write_failed"
 	ErrPromoteFailed     = "promote_failed"
 	ErrRelocateFailed    = "relocate_failed"
+	ErrRestoreUnknown    = "restore_unknown"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

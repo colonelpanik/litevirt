@@ -219,6 +219,31 @@ func RelocateRestoreTarget(state, detail string) (string, bool) {
 // and the relocate loop skips rows already so marked so it can't loop.
 const ContainerRelocateSkippedDetail = "relocate-skipped"
 
+// RestoreOutcome classifies a container restore-from-backup attempt so the
+// failover coordinator can decide between completing the handoff, falling back
+// to image-recreate, or DEFERRING an indeterminate result to a later reconcile
+// (never destructively falling back over a restore that may have landed). Lives
+// in corrosion so both grpcapi (producer) and failover (consumer) share it
+// without a new package edge.
+type RestoreOutcome int
+
+const (
+	// RestoreNotAttempted: no manifest found, or the restore RPC never established
+	// — nothing was written. Safe to fall back immediately.
+	RestoreNotAttempted RestoreOutcome = iota
+	// RestoreFailedBeforeRow: the target returned a definite pre-row failure (e.g.
+	// it can't open the repo / find the manifest) before recording any row. Safe
+	// to fall back immediately.
+	RestoreFailedBeforeRow
+	// RestoreLanded: the target recorded its cluster row (the restore took effect),
+	// even if a later step (start) errored. Complete the handoff.
+	RestoreLanded
+	// RestoreUnknown: the RPC started but the outcome is indeterminate (the
+	// row-recorded frame / stream was lost). The row MAY have been written — do not
+	// fall back; leave the marker and let the resolve pass settle it.
+	RestoreUnknown
+)
+
 // RelocateContainer re-homes a container from oldHost to newHost after a host
 // loss: it soft-deletes the old (oldHost,name) row and inserts a fresh row on
 // newHost in state 'pending' with detail 'relocate-recreate', preserving the

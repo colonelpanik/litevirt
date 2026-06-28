@@ -121,9 +121,9 @@ func TestRestoreContainerFromBackup_FindsManifestAndDrives(t *testing.T) {
 	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
 	s.SetBackupRepos(map[string]string{"main": repo})
 
-	// No backup yet → no manifest → not landed, error.
-	if landed, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b"); err == nil || landed {
-		t.Fatalf("want (false, err) with no manifest, got (%v, %v)", landed, err)
+	// No backup yet → no manifest → not attempted, error.
+	if outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b"); err == nil || outcome != corrosion.RestoreNotAttempted {
+		t.Fatalf("want (RestoreNotAttempted, err) with no manifest, got (%v, %v)", outcome, err)
 	}
 
 	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
@@ -143,9 +143,9 @@ func TestRestoreContainerFromBackup_FindsManifestAndDrives(t *testing.T) {
 		gotRepo, gotName, gotTs = repoPath, name, ts
 		return nil
 	}
-	landed, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b")
-	if err != nil || !landed {
-		t.Fatalf("want (true, nil), got (%v, %v)", landed, err)
+	outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b")
+	if err != nil || outcome != corrosion.RestoreLanded {
+		t.Fatalf("want (RestoreLanded, nil), got (%v, %v)", outcome, err)
 	}
 	if gotName != "ct1" || gotTs != "2026-06-27T12:00:00Z" || gotRepo != "main" {
 		t.Fatalf("drove restore repo=%q name=%q ts=%q; want the registered NAME 'main' + ct1 + ts", gotRepo, gotName, gotTs)

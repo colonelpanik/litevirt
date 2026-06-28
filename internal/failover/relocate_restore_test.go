@@ -13,24 +13,22 @@ import (
 // simulates RestoreContainer having created the target row (its mandatory,
 // post-import row write).
 type fakeRestorer struct {
-	calls int
-	err   error
-	// landed is the TARGET's authoritative "row recorded" signal returned to the
-	// coordinator (true even when err != nil models "restored but start failed").
-	landed bool
-	db     *corrosion.Client
+	calls   int
+	outcome corrosion.RestoreOutcome // zero value = RestoreNotAttempted
+	err     error
+	db      *corrosion.Client
 }
 
-func (f *fakeRestorer) RestoreContainerFromBackup(ctx context.Context, ctName, target string) (bool, error) {
+func (f *fakeRestorer) RestoreContainerFromBackup(ctx context.Context, ctName, target string) (corrosion.RestoreOutcome, error) {
 	f.calls++
-	if f.landed {
+	if f.outcome == corrosion.RestoreLanded {
 		// Simulate the target having recorded its (eventually-replicated) row.
 		_ = corrosion.UpsertContainer(ctx, f.db, corrosion.ContainerRecord{
 			HostName: target, Name: ctName, State: "stopped", Image: "alpine:3.19",
 			OnHostFailure: "image-recreate",
 		})
 	}
-	return f.landed, f.err
+	return f.outcome, f.err
 }
 
 // relocateSetup builds a fenced source host + a survivor and a container on the
@@ -72,7 +70,7 @@ func TestRelocate_RestorePreferred(t *testing.T) {
 	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
 	ctx := context.Background()
 	c := newTestCoordinator("coord", db)
-	fr := &fakeRestorer{db: db, landed: true}
+	fr := &fakeRestorer{db: db, outcome: corrosion.RestoreLanded}
 	c.Restorer = fr
 
 	idx := 0
@@ -93,7 +91,7 @@ func TestRelocate_FallbackToImageRecreateOnRestoreError(t *testing.T) {
 	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
 	ctx := context.Background()
 	c := newTestCoordinator("coord", db)
-	c.Restorer = &fakeRestorer{db: db, err: errors.New("no manifest")}
+	c.Restorer = &fakeRestorer{db: db, outcome: corrosion.RestoreFailedBeforeRow, err: errors.New("no manifest")}
 
 	idx := 0
 	c.relocateContainers(ctx, src, cands, &idx)
@@ -112,7 +110,7 @@ func TestRelocate_SkipWhenNeitherRestoreNorImage(t *testing.T) {
 	db, src, cands := relocateSetup(t, "", corrosion.CurrentSchemaVersion) // empty image = non-re-pullable
 	ctx := context.Background()
 	c := newTestCoordinator("coord", db)
-	c.Restorer = &fakeRestorer{db: db, err: errors.New("no manifest")}
+	c.Restorer = &fakeRestorer{db: db, outcome: corrosion.RestoreFailedBeforeRow, err: errors.New("no manifest")}
 
 	idx := 0
 	c.relocateContainers(ctx, src, cands, &idx)
@@ -145,7 +143,7 @@ func TestRelocate_RestoreRowExistsDespiteError(t *testing.T) {
 	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
 	ctx := context.Background()
 	c := newTestCoordinator("coord", db)
-	c.Restorer = &fakeRestorer{db: db, err: errors.New("restored but start failed"), landed: true}
+	c.Restorer = &fakeRestorer{db: db, outcome: corrosion.RestoreLanded, err: errors.New("restored but start failed")}
 
 	idx := 0
 	c.relocateContainers(ctx, src, cands, &idx)
@@ -257,4 +255,88 @@ func TestRelocate_ResumeStaleMarkerFallsBack(t *testing.T) {
 	if tgt == nil || tgt.StateDetail != corrosion.ContainerRelocateRecreateDetail {
 		t.Fatalf("expected image-recreate fallback after stale marker, got %+v", tgt)
 	}
+}
+
+// TestRelocate_UnknownLeavesMarkerForResolve proves an indeterminate restore is
+// NOT destructively fallen back: the relocate-restore marker is left in place
+// (source not tombstoned, no image-recreate) for the resolve pass to settle.
+func TestRelocate_UnknownLeavesMarkerForResolve(t *testing.T) {
+	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+	c.Restorer = &fakeRestorer{db: db, outcome: corrosion.RestoreUnknown, err: errors.New("stream broke")}
+
+	idx := 0
+	c.relocateContainers(ctx, src, cands, &idx)
+
+	row, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
+	tgt, restoring := corrosion.RelocateRestoreTarget(rowState(row), rowDetail(row))
+	if row == nil || !restoring || tgt != "surv" {
+		t.Fatalf("indeterminate restore must leave the relocate-restore marker on the source, got %+v", row)
+	}
+	if t2, _ := corrosion.GetContainer(ctx, db, "surv", "ct1"); t2 != nil && t2.StateDetail == corrosion.ContainerRelocateRecreateDetail {
+		t.Fatal("indeterminate restore must NOT image-recreate over a possibly-landed restore")
+	}
+}
+
+// TestResolvePendingRelocations_CompletesWhenTargetRowAppears proves the resolve
+// pass tombstones the source once the target row has (replicated and) appeared —
+// independent of the fence cycle.
+func TestResolvePendingRelocations_CompletesWhenTargetRowAppears(t *testing.T) {
+	db, _, _ := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+
+	// Leftover marker + the target row has since appeared (replication converged).
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.ContainerRelocateRestorePrefix+"surv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "surv", Name: "ct1", State: "stopped", Image: "alpine:3.19", OnHostFailure: "image-recreate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c.resolvePendingRelocations(ctx)
+
+	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow != nil {
+		t.Fatal("resolve pass should tombstone the source once the target row exists")
+	}
+}
+
+// TestResolvePendingRelocations_StaleFallsBack proves a stale marker with no
+// target row falls back to image-recreate via the resolve pass.
+func TestResolvePendingRelocations_StaleFallsBack(t *testing.T) {
+	db, _, _ := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+	c.RelocateRestoreTimeout = time.Nanosecond // any marker is immediately stale
+
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.ContainerRelocateRestorePrefix+"surv"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	c.resolvePendingRelocations(ctx)
+
+	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow != nil {
+		t.Fatal("stale marker should fall back to image-recreate (source soft-deleted)")
+	}
+	tgt, _ := corrosion.GetContainer(ctx, db, "surv", "ct1")
+	if tgt == nil || tgt.StateDetail != corrosion.ContainerRelocateRecreateDetail {
+		t.Fatalf("expected image-recreate fallback, got %+v", tgt)
+	}
+}
+
+func rowState(r *corrosion.ContainerRecord) string {
+	if r == nil {
+		return ""
+	}
+	return r.State
+}
+func rowDetail(r *corrosion.ContainerRecord) string {
+	if r == nil {
+		return ""
+	}
+	return r.StateDetail
 }

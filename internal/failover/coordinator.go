@@ -69,12 +69,12 @@ type ReplicaPromoter interface {
 // (networking + non-image state) over a bare image-recreate. Optional — nil
 // disables tier-2 and the coordinator always image-recreates.
 type ContainerRestorer interface {
-	// RestoreContainerFromBackup drives the restore on targetHost. landed reports
-	// whether the TARGET recorded its cluster row (the restore took effect) even if
-	// err is non-nil because a later step (start) failed — an authoritative,
-	// replication-lag-free signal so the coordinator needn't read its own replica
-	// of the target row. landed=false + err ⇒ genuine failure (fall back).
-	RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) (landed bool, err error)
+	// RestoreContainerFromBackup drives the restore on targetHost and classifies
+	// the result (corrosion.RestoreOutcome): the signal is the TARGET's, so the
+	// coordinator needn't read its own (replication-lagged) replica. Landed ⇒
+	// complete; NotAttempted/FailedBeforeRow ⇒ fall back; Unknown ⇒ defer (the row
+	// may have landed but the confirmation was lost).
+	RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) (corrosion.RestoreOutcome, error)
 }
 
 // Coordinator watches for host failures and triggers failover.
@@ -283,6 +283,35 @@ func (c *Coordinator) run(ctx context.Context) {
 	// it's healthy again. A transient drop (a daemon restart, a brief blip) must
 	// self-heal — otherwise health reconverges in seconds but hosts.state sticks.
 	c.recoverHosts(ctx, quorum)
+
+	// Settle any relocate-restore markers left by an indeterminate restore or a
+	// coordinator crash mid-restore. This runs every cycle, independent of the
+	// fence path (an already-fenced host is skipped above, so relocateContainers
+	// won't re-run for it) — so a deferred restore still gets resolved.
+	c.resolvePendingRelocations(ctx)
+}
+
+// resolvePendingRelocations re-derives every relocate-restore marker in the
+// cluster (a container left "relocating" by an indeterminate restore or a crash),
+// independent of the fence cycle. Leader-gated by run's lease.
+func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
+	cts, err := corrosion.ListContainers(ctx, c.db, "")
+	if err != nil {
+		return
+	}
+	for _, ct := range cts {
+		target, restoring := corrosion.RelocateRestoreTarget(ct.State, ct.StateDetail)
+		if !restoring {
+			continue
+		}
+		src, err := corrosion.GetHost(ctx, c.db, ct.HostName)
+		if err != nil || src == nil {
+			continue
+		}
+		// candidates/fallbackIdx are only consulted if the marker carries no target
+		// (it always does), so an empty candidate set is fine here.
+		c.resumeRestoreRelocation(ctx, src, ct, target, nil, new(int))
+	}
 }
 
 // recoverHosts promotes a host the coordinator marked down back to 'active'
@@ -863,25 +892,26 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 		}
 		// We do NOT pre-create a target row — RestoreContainer refuses an existing
 		// row, and a genuinely-failed restore must leave none.
-		landed, err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target)
-		if err == nil {
+		switch outcome, err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target); outcome {
+		case corrosion.RestoreLanded:
+			// The target recorded its row (even if a later start errored) — complete
+			// the handoff; do NOT image-recreate over a valid restored container.
 			c.completeRestore(ctx, h, ct, target)
 			return
-		}
-		// A restore error doesn't always mean nothing landed: RestoreContainer
-		// writes the target row BEFORE attempting start, then errors if start fails.
-		// `landed` is the TARGET's authoritative signal (it recorded the row) — used
-		// instead of reading our own replica, which in a real cluster may not have
-		// caught up in this same tick. landed ⇒ the handoff completed; do NOT
-		// image-recreate over a valid restored container.
-		if landed {
-			slog.Warn("failover: restore landed on the target but a later step (start) failed — treating as complete",
+		case corrosion.RestoreUnknown:
+			// Indeterminate: the row MAY have been recorded on the target (the
+			// confirmation frame/stream was lost). Destructively falling back could
+			// clobber a landed restore — instead leave the relocate-restore marker
+			// and let resolvePendingRelocations settle it on a later tick (target row
+			// appears ⇒ complete; stale + absent ⇒ image-recreate).
+			slog.Warn("failover: container restore outcome indeterminate; leaving marker for the resolve pass",
 				"container", ct.Name, "target", target, "error", err)
-			c.completeRestore(ctx, h, ct, target)
+			c.mCt(ActionRelocate, ResultError, ErrRestoreUnknown)
 			return
+		default: // RestoreNotAttempted | RestoreFailedBeforeRow → nothing landed
+			slog.Warn("failover: container restore not attempted / failed before any row; falling back to image-recreate",
+				"container", ct.Name, "target", target, "error", err)
 		}
-		slog.Warn("failover: container restore-from-backup failed; falling back to image-recreate",
-			"container", ct.Name, "target", target, "error", err)
 	}
 	// Tier-1: image-recreate (re-pullable) or skip. RelocateContainer (recreate)
 	// soft-deletes the source row, clearing any relocate-restore marker; the skip

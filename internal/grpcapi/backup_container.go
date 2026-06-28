@@ -170,48 +170,79 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 // needn't consult its own replication-lagged replica to tell a landed restore
 // from a genuine failure. landed=false + err ⇒ fall back to image-recreate.
 // Satisfies failover.ContainerRestorer.
-func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) (landed bool, err error) {
+func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) (corrosion.RestoreOutcome, error) {
 	repoName, timestamp, err := s.findLatestContainerBackup(ctName)
 	if err != nil {
-		return false, err
+		return corrosion.RestoreNotAttempted, err
 	}
 	return s.driveRemoteRestore(ctx, targetHost, repoName, ctName, timestamp)
 }
 
-// driveRemoteRestore opens RestoreContainer on the target over peer mTLS and
-// drains its progress stream, reporting whether the restore landed (the target
-// emitted restoreRowRecordedStatus) regardless of any subsequent error.
-func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp string) (landed bool, err error) {
+// driveRemoteRestore opens RestoreContainer on the target over peer mTLS, drains
+// its progress stream, and classifies the result. The authoritative "row
+// recorded" signal is the target's restoreRowRecordedStatus frame (or a clean
+// DONE/EOF); a definite pre-row status code means nothing was written; anything
+// else after the RPC started is indeterminate (the row may have landed but the
+// frame/stream was lost) → RestoreUnknown, which the coordinator defers rather
+// than destructively falling back.
+func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp string) (corrosion.RestoreOutcome, error) {
 	if s.migrateRestoreOverride != nil {
-		// Test seam (shared with MigrateContainer): a nil error ⇒ landed.
-		e := s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true)
-		return e == nil, e
+		// Test seam (shared with MigrateContainer): a nil error ⇒ landed; an error
+		// is indeterminate (the override doesn't model where it failed).
+		if e := s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true); e != nil {
+			return corrosion.RestoreUnknown, e
+		}
+		return corrosion.RestoreLanded, nil
 	}
 	c, conn, derr := s.peerClient(ctx, target)
 	if derr != nil {
-		return false, fmt.Errorf("dial target: %w", derr)
+		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", derr)
 	}
 	defer conn.Close()
 	rs, rerr := c.RestoreContainer(ctx, &pb.RestoreContainerRequest{
 		RepoPath: repoPath, Name: name, Timestamp: timestamp, HostName: target, Start: true,
 	})
 	if rerr != nil {
-		return false, rerr
+		return corrosion.RestoreNotAttempted, rerr // RPC never established
 	}
+	landed := false
 	for {
 		p, e := rs.Recv()
 		if e == io.EOF {
-			return true, nil // clean DONE ⇒ full success
+			return corrosion.RestoreLanded, nil // clean DONE ⇒ full success
 		}
 		if e != nil {
-			return landed, e // landed reflects whether the row-recorded frame arrived first
+			if landed {
+				return corrosion.RestoreLanded, nil // row recorded before the break
+			}
+			return classifyRestoreError(e), e
 		}
 		if p.Error != "" {
-			return landed, fmt.Errorf("target restore: %s", p.Error)
+			if landed {
+				return corrosion.RestoreLanded, nil
+			}
+			return corrosion.RestoreUnknown, fmt.Errorf("target restore: %s", p.Error)
 		}
 		if p.Status == restoreRowRecordedStatus {
 			landed = true
 		}
+	}
+}
+
+// classifyRestoreError maps a restore RPC error (received WITHOUT a prior
+// row-recorded frame) to an outcome. Definite pre-row status codes — the target
+// can't open the repo / find the manifest / isn't the target / unauthorized, or
+// the row already exists from a prior attempt — are conclusive; anything else
+// (Internal, or a transport break that may have dropped the row-recorded frame
+// after the row was written) is indeterminate.
+func classifyRestoreError(err error) corrosion.RestoreOutcome {
+	switch status.Code(err) {
+	case codes.AlreadyExists:
+		return corrosion.RestoreLanded // the row exists on the target
+	case codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied, codes.Unimplemented:
+		return corrosion.RestoreFailedBeforeRow
+	default:
+		return corrosion.RestoreUnknown
 	}
 }
 

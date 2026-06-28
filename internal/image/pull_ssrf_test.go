@@ -44,6 +44,29 @@ func TestParseBlockPolicy(t *testing.T) {
 	}
 }
 
+// TestBlocked_UnmapsV4MappedV6: an IPv4-mapped IPv6 literal (::ffff:a.b.c.d) must
+// be matched against an IPv4 prefix — the Unmap guards against a bypass.
+func TestBlocked_UnmapsV4MappedV6(t *testing.T) {
+	o := PullOptions{BlockedCIDRs: mustPolicy(t, []string{"127.0.0.0/8"}, false, false)}
+	if !o.blocked(netip.MustParseAddr("::ffff:127.0.0.1")) {
+		t.Error("IPv4-mapped IPv6 ::ffff:127.0.0.1 should be blocked by 127.0.0.0/8")
+	}
+}
+
+// TestParseBlockPolicy_PrivateIncludesMetadata: block_private is a superset of
+// block_metadata — it must also cover link-local/metadata, not just RFC1918.
+func TestParseBlockPolicy_PrivateIncludesMetadata(t *testing.T) {
+	o := PullOptions{BlockedCIDRs: mustPolicy(t, nil, false, true)} // block_private only
+	for _, ip := range []string{"169.254.169.254", "10.1.2.3", "192.168.1.5", "172.16.0.1", "127.0.0.1", "100.64.0.1"} {
+		if !o.blocked(netip.MustParseAddr(ip)) {
+			t.Errorf("block_private should cover %s", ip)
+		}
+	}
+	if o.blocked(netip.MustParseAddr("8.8.8.8")) {
+		t.Error("block_private must not block a public address")
+	}
+}
+
 // TestPull_BlockedCIDRFailsAtConnect: with the server's range blocked, the pull
 // is rejected at connect (the guard fires before any bytes flow).
 func TestPull_BlockedCIDRFailsAtConnect(t *testing.T) {

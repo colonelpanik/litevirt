@@ -313,6 +313,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// stays bounded (see config vm_event_*).
 	go d.runVMEventPrune(ctx)
 
+	// Hourly local GC of superseded/orphaned auth + LB rows (re-enroll / LB-recreate
+	// churn). Local-only deterministic deletes — runs on every node.
+	go d.runSupersededGC(ctx, metrics.NewGCMetrics())
+
 	// Start embedded DNS server
 	dnsSrv := dns.NewServer(d.cfg.DNSDomain, d.cfg.DNSPort, d.db)
 	go dnsSrv.Start(ctx)
@@ -1146,6 +1150,49 @@ func (d *Daemon) runVMEventPrune(ctx context.Context) {
 			return
 		case <-ticker.C:
 			prune()
+		}
+	}
+}
+
+// runSupersededGC periodically hard-deletes provably-inert superseded/orphaned
+// auth + LB rows (local-only, deterministic per node — see
+// corrosion.GCSupersededRows). Hourly, with an initial delay after startup.
+func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
+	core := time.Duration(d.cfg.TombstoneGCRetentionHours) * time.Hour
+	if core <= 0 {
+		core = 24 * time.Hour
+	}
+	orphan := time.Duration(d.cfg.TombstoneGCOrphanRetentionHours) * time.Hour
+	if orphan <= 0 {
+		orphan = 7 * 24 * time.Hour
+	}
+	gc := func() {
+		counts, err := corrosion.GCSupersededRows(ctx, d.db, core, orphan)
+		if err != nil {
+			slog.Warn("superseded-row GC", "error", err)
+			return
+		}
+		for tbl, n := range counts {
+			m.RowsDeleted(tbl, n)
+			if n > 0 {
+				slog.Info("GC reclaimed superseded rows", "table", tbl, "count", n)
+			}
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(2 * time.Minute):
+		gc()
+	}
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			gc()
 		}
 	}
 }

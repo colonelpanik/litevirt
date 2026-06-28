@@ -206,6 +206,23 @@ join_peers:
 
 Multiple peers can be listed for redundancy. The membership protocol discovers the remaining cluster members automatically, and state replication streams mutations to all peers via gRPC.
 
+## Garbage collection
+
+Re-enrolling 2FA recovery codes and recreating load balancers leave behind rows
+that can never validate or render again (superseded recovery-code sets, stale LB
+backend generations). An hourly per-node sweep hard-deletes them once they age
+past a retention floor; the count is exported as `litevirt_gc_rows_deleted_total`
+(labeled by `table`).
+
+```yaml
+tombstone_gc_retention_hours: 24          # provably-inert rows (superseded set / stale generation); 0 → 24h
+tombstone_gc_orphan_retention_hours: 168  # rows whose owning pointer/config is absent (cautious); 0 → 7d
+```
+
+The sweep is local-only and deterministic (each node prunes its own copy; it
+never touches a current-active-set or current-generation row), so it is safe on a
+live cluster.
+
 ## Ports summary
 
 | Setting | Default | Protocol | Purpose |

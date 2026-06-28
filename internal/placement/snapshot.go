@@ -24,14 +24,20 @@ type ClusterSnapshot struct {
 	HostsBy []corrosion.HostRecord // stable iteration order
 
 	// VMs indexed by name AND grouped by host.
-	VMs        map[string]corrosion.VMRecord
-	VMsByHost  map[string][]corrosion.VMRecord
+	VMs       map[string]corrosion.VMRecord
+	VMsByHost map[string][]corrosion.VMRecord
 
 	// Per-host accumulated usage, derived once during construction so the
 	// dimensions don't have to recompute on every Used() call.
-	CPUUsed map[string]int  // cores
-	MemUsed map[string]int  // MiB
+	CPUUsed map[string]int // cores
+	MemUsed map[string]int // MiB
 	VMCount map[string]int
+
+	// Per-host runtime telemetry (from host_runtime_usage; empty when not loaded
+	// — e.g. the SelectBatch in-memory path). The DiskIOPS/NetBW dimensions read
+	// these for Used; capacity comes from host labels.
+	DiskIOPSUsed map[string]int // aggregate disk IOPS
+	NetMbpsUsed  map[string]int // aggregate network Mbps
 
 	// Per-host PCI device pool — used by Devices dimension and topology
 	// scoring. Optional; lazily loaded by Select if Devices > 0.
@@ -55,12 +61,23 @@ func BuildSnapshot(ctx context.Context, db *corrosion.Client) (*ClusterSnapshot,
 	if err != nil {
 		return nil, fmt.Errorf("list VMs: %w", err)
 	}
-	return BuildSnapshotFrom(hosts, vms), nil
+	// Per-host runtime telemetry for the DiskIOPS/NetBW dimensions. Best-effort:
+	// on error the maps stay empty (those dims are then skipped, like a host with
+	// no capacity label) rather than failing placement.
+	usage, _ := corrosion.ListHostRuntimeUsage(ctx, db)
+	return BuildSnapshotFromUsage(hosts, vms, usage), nil
 }
 
-// BuildSnapshotFrom constructs a snapshot from already-fetched slices.
-// Used by SelectBatch which manipulates a working copy mid-pass.
+// BuildSnapshotFrom constructs a snapshot from already-fetched slices, with no
+// runtime telemetry (the DiskIOPS/NetBW Used maps stay empty). Used by SelectBatch
+// which manipulates a working copy mid-pass and by tests.
 func BuildSnapshotFrom(hosts []corrosion.HostRecord, vms []corrosion.VMRecord) *ClusterSnapshot {
+	return BuildSnapshotFromUsage(hosts, vms, nil)
+}
+
+// BuildSnapshotFromUsage is BuildSnapshotFrom plus per-host runtime telemetry
+// (host_runtime_usage, keyed by host name). usage may be nil.
+func BuildSnapshotFromUsage(hosts []corrosion.HostRecord, vms []corrosion.VMRecord, usage map[string]corrosion.HostRuntimeUsage) *ClusterSnapshot {
 	s := &ClusterSnapshot{
 		Hosts:          make(map[string]corrosion.HostRecord, len(hosts)),
 		HostsBy:        hosts,
@@ -69,11 +86,17 @@ func BuildSnapshotFrom(hosts []corrosion.HostRecord, vms []corrosion.VMRecord) *
 		CPUUsed:        make(map[string]int, len(hosts)),
 		MemUsed:        make(map[string]int, len(hosts)),
 		VMCount:        make(map[string]int, len(hosts)),
+		DiskIOPSUsed:   make(map[string]int, len(hosts)),
+		NetMbpsUsed:    make(map[string]int, len(hosts)),
 		ReplicasByBase: make(map[string]map[string]int),
 		VMHost:         make(map[string]string, len(vms)),
 	}
 	for _, h := range hosts {
 		s.Hosts[h.Name] = h
+		if u, ok := usage[h.Name]; ok {
+			s.DiskIOPSUsed[h.Name] = int(u.DiskIOPS)
+			s.NetMbpsUsed[h.Name] = int(u.NetMbps)
+		}
 	}
 	for _, vm := range vms {
 		s.VMs[vm.Name] = vm

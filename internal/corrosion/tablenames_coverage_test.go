@@ -32,6 +32,7 @@ var antiEntropyExcluded = map[string]string{
 	"mutation_log":           "the replication WAL itself — never full-state-synced",
 	"replication_watermarks": "per-node replication progress",
 	"mutation_seen":          "per-node relay-dedup table",
+	"host_runtime_usage":     "per-host runtime telemetry (disk_iops/net_mbps); replicates via WAL but self-corrects each sample, so not full-state-repaired (like host_health)",
 	// (user_2fa, recovery_codes, recovery_code_sets are now in sensitiveTableNames
 	//  — schema v32 made them LWW-repairable: soft-delete + active-set pointer.)
 }

@@ -925,6 +925,10 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 	// Restore already landed? (crashed after the target row was created but before
 	// the source was tombstoned). A target row exists ⇒ a complete restore, because
 	// RestoreContainer's row write is mandatory + post-import (see backup_container.go).
+	// Provenance: the target in the marker was chosen collision-free (pickContainerTarget
+	// skips hosts already running the name) and only OUR restore writes the name there;
+	// a collision during the attempt clears the marker via the image-recreate fallback,
+	// so a marker reaching here attributes the target row to our restore.
 	if target != "" {
 		if tgt, _ := corrosion.GetContainer(ctx, c.db, target, ct.Name); tgt != nil {
 			c.completeRestore(ctx, h, ct, target)
@@ -977,11 +981,25 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 		c.mCt(ActionRelocate, ResultSkipped, ErrNonRepullable)
 		return
 	}
-	if target == "" {
-		slog.Warn("failover: no target for container relocation", "container", ct.Name)
+	// No collision-free target (none available, or the only candidate already runs
+	// a same-name container). Skip — leave the source visible; recreating would
+	// either have nowhere to go or clobber an unrelated container. Mark terminal so
+	// it doesn't loop (and so any relocate-restore marker is cleared, not left for
+	// the resolve pass to misread against an unrelated target row).
+	if target == "" || c.targetHasLiveContainer(ctx, target, ct.Name) {
+		if err := corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "stopped", corrosion.ContainerRelocateSkippedDetail); err != nil {
+			slog.Warn("failover: mark container relocate-skipped", "container", ct.Name, "error", err)
+		}
+		slog.Warn("failover: no collision-free target for container relocation — skipping",
+			"container", ct.Name, "target", target, "host", h.Name)
+		c.auditRelocate(ctx, "ct.relocate.skipped", ct.Name,
+			"no collision-free relocation target after fencing "+h.Name+" (left for operator recovery)", "skipped")
+		c.mCt(ActionRelocate, ResultSkipped, ErrNoCandidates)
 		return
 	}
 	if err := corrosion.RelocateContainer(ctx, c.db, h.Name, ct.Name, target); err != nil {
+		// Includes the no-clobber guard (a same-name container appeared on the
+		// target since the check above) — never lose the source.
 		slog.Error("failover: relocate container (image-recreate)", "container", ct.Name, "error", err)
 		c.mCt(ActionRelocate, ResultError, ErrRelocateFailed)
 		return
@@ -994,19 +1012,33 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 }
 
 // pickContainerTarget chooses a survivor via the placement engine, falling back
-// to round-robin over the candidate list. Returns "" if none.
+// to round-robin over the candidate list. It skips any host that already runs a
+// LIVE container of the same name (names aren't cluster-unique), so relocation
+// never collides with / clobbers an unrelated container. Returns "" if no
+// collision-free target exists.
 func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) string {
-	target, err := placement.Select(ctx, c.db, placement.Request{
+	if target, err := placement.Select(ctx, c.db, placement.Request{
 		VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
-	})
-	if err != nil {
-		if len(candidates) == 0 {
-			return ""
-		}
-		target = candidates[*fallbackIdx%len(candidates)].Name
-		*fallbackIdx++
+	}); err == nil && !c.targetHasLiveContainer(ctx, target, ct.Name) {
+		return target
 	}
-	return target
+	// Placement failed or its pick collides — round-robin a collision-free candidate.
+	for i := 0; i < len(candidates); i++ {
+		cand := candidates[*fallbackIdx%len(candidates)].Name
+		*fallbackIdx++
+		if !c.targetHasLiveContainer(ctx, cand, ct.Name) {
+			return cand
+		}
+	}
+	return ""
+}
+
+// targetHasLiveContainer reports whether host already runs a live (non-deleted)
+// container of the given name — a relocation collision (names are PK'd by
+// (host_name,name), so the same name can legitimately exist on another host).
+func (c *Coordinator) targetHasLiveContainer(ctx context.Context, host, name string) bool {
+	r, err := corrosion.GetContainer(ctx, c.db, host, name)
+	return err == nil && r != nil
 }
 
 // survivorSchemaCompatible reports whether the survivor is at least as new as

@@ -231,15 +231,20 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 
 // classifyRestoreError maps a restore RPC error (received WITHOUT a prior
 // row-recorded frame) to an outcome. Definite pre-row status codes — the target
-// can't open the repo / find the manifest / isn't the target / unauthorized, or
-// the row already exists from a prior attempt — are conclusive; anything else
-// (Internal, or a transport break that may have dropped the row-recorded frame
-// after the row was written) is indeterminate.
+// can't open the repo / find the manifest / isn't the target / unauthorized — are
+// conclusive (nothing of ours was written); anything else (Internal, or a
+// transport break that may have dropped the row-recorded frame after the row was
+// written) is indeterminate.
+//
+// AlreadyExists is NOT treated as "landed": container names aren't cluster-unique
+// (PK is (host_name,name)), so it means the target already holds SOME live
+// container of that name — possibly UNRELATED. Without provenance we must not
+// claim our restore landed there (that would tombstone the source over an
+// unrelated container), so it's a pre-row failure; the coordinator's
+// collision-aware fallback then declines to clobber it.
 func classifyRestoreError(err error) corrosion.RestoreOutcome {
 	switch status.Code(err) {
-	case codes.AlreadyExists:
-		return corrosion.RestoreLanded // the row exists on the target
-	case codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied, codes.Unimplemented:
+	case codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied, codes.Unimplemented, codes.AlreadyExists:
 		return corrosion.RestoreFailedBeforeRow
 	default:
 		return corrosion.RestoreUnknown

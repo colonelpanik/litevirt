@@ -340,3 +340,30 @@ func rowDetail(r *corrosion.ContainerRecord) string {
 	}
 	return r.StateDetail
 }
+
+// TestRelocate_CollisionTargetPreservesBoth proves relocation never clobbers an
+// unrelated same-name container on the only candidate: it skips that target,
+// leaving BOTH the source and the unrelated target container intact.
+func TestRelocate_CollisionTargetPreservesBoth(t *testing.T) {
+	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
+	ctx := context.Background()
+	// The only survivor already runs an UNRELATED container of the same name.
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "surv", Name: "ct1", State: "running", Image: "other:1", Project: "_default",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestCoordinator("coord", db) // no Restorer → image-recreate path
+
+	idx := 0
+	c.relocateContainers(ctx, src, cands, &idx)
+
+	// Source preserved (not lost), and the unrelated surv/ct1 untouched (not clobbered).
+	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow == nil {
+		t.Fatal("source must be preserved when the only target collides")
+	}
+	tgt, _ := corrosion.GetContainer(ctx, db, "surv", "ct1")
+	if tgt == nil || tgt.Image != "other:1" || tgt.StateDetail == corrosion.ContainerRelocateRecreateDetail {
+		t.Fatalf("unrelated same-name container on the target must be untouched, got %+v", tgt)
+	}
+}

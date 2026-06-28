@@ -259,6 +259,13 @@ func RelocateContainer(ctx context.Context, c *Client, oldHost, name, newHost st
 	if old == nil {
 		return fmt.Errorf("container %q not found on host %q", name, oldHost)
 	}
+	// Container names aren't cluster-unique (PK is (host_name,name)). Refuse to
+	// re-key onto a target that already holds a LIVE container of the same name —
+	// the UpsertContainer below would otherwise clobber an unrelated container.
+	// Fail BEFORE deleting the source so nothing is lost.
+	if existing, _ := GetContainer(ctx, c, newHost, name); existing != nil {
+		return fmt.Errorf("target host %q already has a live container %q; refusing to clobber", newHost, name)
+	}
 	if err := DeleteContainer(ctx, c, oldHost, name); err != nil {
 		return err
 	}

@@ -53,14 +53,27 @@ Default weights (tunable via `Request.Weights`):
 |---|---|---|
 | CPU | 25 | yes |
 | RAM | 25 | yes |
-| Disk IOPS | 15 | placeholder (planned) |
-| Network bandwidth | 10 | placeholder (planned) |
+| Disk IOPS | 15 | label-declared capacity + sampled usage |
+| Network bandwidth | 10 | label-declared capacity + sampled usage |
 | NUMA fit | 10 | label-driven |
 | Host generation | 5 | label-driven |
-| Power / thermal | 5 | placeholder |
+| Power / thermal | 5 | placeholder (needs IPMI) |
 
-Dimensions without telemetry (capacity ≤ 0) contribute zero — the cluster
-runs cleanly even before all sensors are online.
+A dimension with **capacity ≤ 0 contributes nothing** (it is skipped, not treated
+as infinite headroom) — so the cluster scores cleanly on CPU+RAM even before the
+other sensors are online.
+
+**Disk IOPS / network bandwidth** become active per host once you declare that
+host's budget with a label; usage is sampled automatically from libvirt domain
+stats into `host_runtime_usage`:
+
+```bash
+lv host config host-a --label placement.iops_capacity=20000   # ops/sec
+lv host config host-a --label placement.netbw_mbps=10000      # Mbps
+```
+
+Hosts without the label leave those dimensions inert (capacity 0 → skipped), so
+the feature is opt-in per host.
 
 Soft bonuses on top of the dimensional score:
 

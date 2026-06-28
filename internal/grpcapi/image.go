@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -16,16 +17,19 @@ import (
 )
 
 // SetImageLimits records the daemon's image pull/import bounds (disk-fill +
-// SSRF guards). Zero values fall back to the image package defaults.
-func (s *Server) SetImageLimits(maxBytes int64, timeout time.Duration) {
+// SSRF guards). Zero values fall back to the image package defaults;
+// blockedCIDRs nil → no URL-pull network deny policy.
+func (s *Server) SetImageLimits(maxBytes int64, timeout time.Duration, blockedCIDRs []netip.Prefix) {
 	s.imageMaxBytes = maxBytes
 	s.imagePullTimeout = timeout
+	s.imageBlockedCIDRs = blockedCIDRs
 }
 
 // imagePullOptions builds the configured PullOptions (defaults applied inside
-// image.Pull when a field is zero).
+// image.Pull when a field is zero). BlockedCIDRs is the opt-in URL-pull network
+// deny policy; it does NOT apply to streamed Import/Push (byte-ceiling only).
 func (s *Server) imagePullOptions() image.PullOptions {
-	return image.PullOptions{Timeout: s.imagePullTimeout, MaxBytes: s.imageMaxBytes}
+	return image.PullOptions{Timeout: s.imagePullTimeout, MaxBytes: s.imageMaxBytes, BlockedCIDRs: s.imageBlockedCIDRs}
 }
 
 // maxImageBytes returns the effective image byte ceiling for streamed

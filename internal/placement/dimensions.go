@@ -32,9 +32,10 @@ func DefaultWeights() DimensionWeights {
 // AllDimensions returns the dimension list with the given weights. Pass
 // DefaultWeights() unless a test is exercising a specific weight ratio.
 //
-// Dimensions whose telemetry isn't yet wired (DiskIOPS, NetBW, Power) return
-// Capacity=0, which the scoring loop treats as "skip this dimension." So the
-// list is safe to use today even though only ships CPU+RAM+NUMA+HostGen.
+// CPU/RAM are always wired; NUMA/HostGen and DiskIOPS/NetBW are label-driven
+// (a host without the relevant label reports Capacity=0). Power has no telemetry
+// yet. A dimension with Capacity<=0 is skipped by scoreDimension, so the list is
+// always safe — unconfigured dimensions simply don't contribute.
 func AllDimensions(w DimensionWeights) []Dimension {
 	return []Dimension{
 		cpuDim{w: w.CPU},
@@ -71,30 +72,67 @@ func (d ramDim) Capacity(s *ClusterSnapshot, host string) float64 {
 }
 func (d ramDim) Demand(req *Request) float64 { return float64(req.MemMiBNeeded) }
 
-// ───────── DiskIOPS (placeholder) ─────────
+// ───────── DiskIOPS (label-declared capacity) ─────────
 //
-// Once internal/storage Driver Stats() returns IOPS rates we'll wire them
-// here. Until then Capacity=0 → dimension skipped by scoreDimension.
+// Used = aggregate disk IOPS from host_runtime_usage (sampled per-host from
+// libvirt domain block stats). Capacity = the `placement.iops_capacity` host
+// label; unset → 0 → scoreDimension skips this dim for that host, so it's real
+// only where an operator has declared the host's IOPS budget.
 
 type diskIOPSDim struct{ w float64 }
 
-func (d diskIOPSDim) Name() string                                     { return "disk_iops" }
-func (d diskIOPSDim) Weight() float64                                  { return d.w }
-func (d diskIOPSDim) Used(s *ClusterSnapshot, host string) float64     { return 0 }
-func (d diskIOPSDim) Capacity(s *ClusterSnapshot, host string) float64 { return 0 }
-func (d diskIOPSDim) Demand(req *Request) float64                      { return 0 }
+func (d diskIOPSDim) Name() string    { return "disk_iops" }
+func (d diskIOPSDim) Weight() float64 { return d.w }
+func (d diskIOPSDim) Used(s *ClusterSnapshot, host string) float64 {
+	return float64(s.DiskIOPSUsed[host])
+}
+func (d diskIOPSDim) Capacity(s *ClusterSnapshot, host string) float64 {
+	return hostLabelCapacity(s, host, "placement.iops_capacity")
+}
+func (d diskIOPSDim) Demand(req *Request) float64 { return 0 }
 
-// ───────── Network bandwidth (placeholder) ─────────
+// ───────── Network bandwidth (label-declared capacity) ─────────
 //
-// Wired once libvirt domain interface stats are sampled and aggregated.
+// Used = aggregate rx+tx Mbps from host_runtime_usage; Capacity = the
+// `placement.netbw_mbps` host label (unset → 0 → dimension skipped).
 
 type netBWDim struct{ w float64 }
 
-func (d netBWDim) Name() string                                     { return "net_bw" }
-func (d netBWDim) Weight() float64                                  { return d.w }
-func (d netBWDim) Used(s *ClusterSnapshot, host string) float64     { return 0 }
-func (d netBWDim) Capacity(s *ClusterSnapshot, host string) float64 { return 0 }
-func (d netBWDim) Demand(req *Request) float64                      { return 0 }
+func (d netBWDim) Name() string                                 { return "net_bw" }
+func (d netBWDim) Weight() float64                              { return d.w }
+func (d netBWDim) Used(s *ClusterSnapshot, host string) float64 { return float64(s.NetMbpsUsed[host]) }
+func (d netBWDim) Capacity(s *ClusterSnapshot, host string) float64 {
+	return hostLabelCapacity(s, host, "placement.netbw_mbps")
+}
+func (d netBWDim) Demand(req *Request) float64 { return 0 }
+
+// hostLabelCapacity reads a positive float capacity from a host label. Absent,
+// empty, unparseable, or non-positive → 0, which makes scoreDimension skip the
+// dimension for that host (no signal) rather than treat it as infinite headroom.
+//
+// It also requires a runtime-usage SAMPLE for the host: a labeled host with no
+// host_runtime_usage row (never sampled, DB read failed, or the in-memory batch
+// path) has no meaningful Used, so the dimension must skip — otherwise a missing
+// Used reads as 0 and the host is credited full headroom (the very skew the
+// capacity-gating is meant to avoid). A real zero sample stays active.
+func hostLabelCapacity(s *ClusterSnapshot, host, label string) float64 {
+	if !s.UsageSampled[host] {
+		return 0
+	}
+	h, ok := s.Hosts[host]
+	if !ok {
+		return 0
+	}
+	v, ok := h.Labels[label]
+	if !ok || v == "" {
+		return 0
+	}
+	c, err := parseFloat(v)
+	if err != nil || c <= 0 {
+		return 0
+	}
+	return c
+}
 
 // ───────── NUMA fit (label-driven for now) ─────────
 //

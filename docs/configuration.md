@@ -206,6 +206,37 @@ join_peers:
 
 Multiple peers can be listed for redundancy. The membership protocol discovers the remaining cluster members automatically, and state replication streams mutations to all peers via gRPC.
 
+## Image-pull controls
+
+URL-based image pulls (`lv image pull <url>`) are bounded by:
+
+```yaml
+max_image_bytes: 68719476736      # hard ceiling per pull/import (bytes); 0 → 64 GiB default
+image_pull_timeout_sec: 1800      # total wall-clock timeout for a pull; 0 → 30 min default
+
+# Optional, OPT-IN SSRF network deny policy (all default off → no blocking).
+# A pull's RESOLVED destination IP is rejected at connect time if it falls in a
+# blocked range — checked on every connection, so it is DNS-rebinding- and
+# redirect-safe.
+image_pull_block_metadata: false  # block link-local / cloud-metadata (169.254.0.0/16, IPv6 link-local, AWS IMDS)
+image_pull_block_private: false   # block RFC1918 + loopback + CGNAT + ULA + link-local (superset of the above)
+image_pull_blocked_cidrs: []      # extra explicit CIDRs to block, e.g. ["10.20.0.0/16"]
+```
+
+Notes:
+
+- **Opt-in.** With no policy set (the default) pulls are unrestricted and honor
+  `HTTP(S)_PROXY`. Recommended on cloud hosts: set `image_pull_block_metadata: true`
+  so a hostile image URL can't reach the instance-metadata endpoint.
+- **Direct-only when a policy is set.** Enabling any deny policy disables proxy use
+  for pulls (a proxied request can't be validated against the post-proxy target);
+  connections go direct so the resolved IP is always inspectable.
+- **Scope.** The deny policy applies to **URL pulls only**. `lv image import` /
+  `push` are streamed over gRPC (no outbound fetch) and are bounded only by
+  `max_image_bytes`.
+- An invalid CIDR in `image_pull_blocked_cidrs` **fails daemon startup** (a
+  configured security policy is never silently dropped).
+
 ## Ports summary
 
 | Setting | Default | Protocol | Purpose |

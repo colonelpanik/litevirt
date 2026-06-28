@@ -2,12 +2,14 @@ package daemon
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/image"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
@@ -61,6 +63,14 @@ type Config struct {
 	// (64 GiB / 30 min).
 	MaxImageBytes       int64 `yaml:"max_image_bytes,omitempty"`
 	ImagePullTimeoutSec int   `yaml:"image_pull_timeout_sec,omitempty"`
+
+	// Image-pull network deny policy (OPT-IN SSRF guard; all default off → no
+	// blocking, env proxies honored). A pull's RESOLVED destination IP is rejected
+	// at connect time if it falls in any of these ranges (see image.ParseBlockPolicy).
+	// Applies to URL pulls only (ImageImport/Push are streamed, byte-ceiling only).
+	ImagePullBlockedCIDRs  []string `yaml:"image_pull_blocked_cidrs,omitempty"`
+	ImagePullBlockMetadata bool     `yaml:"image_pull_block_metadata,omitempty"` // 169.254/16 + IPv6 link-local + AWS IMDS
+	ImagePullBlockPrivate  bool     `yaml:"image_pull_block_private,omitempty"`  // RFC1918 + loopback + CGNAT + ULA + link-local
 
 	// BillingWebhookURL receives JSON-formatted metered events from
 	// internal/billing on every VM lifecycle transition. Empty
@@ -224,5 +234,18 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("host_name is required in config")
 	}
 
+	// Validate the image-pull deny policy now so a bad CIDR fails load loudly
+	// (never silently drop a configured security policy).
+	if _, err := cfg.ImagePullBlockedPrefixes(); err != nil {
+		return nil, fmt.Errorf("config image_pull_blocked_cidrs: %w", err)
+	}
+
 	return cfg, nil
+}
+
+// ImagePullBlockedPrefixes resolves the image-pull deny config (explicit CIDRs +
+// the block_metadata/block_private convenience booleans) into a deduped prefix
+// list. Empty when nothing is configured (the default → no network guard).
+func (c *Config) ImagePullBlockedPrefixes() ([]netip.Prefix, error) {
+	return image.ParseBlockPolicy(c.ImagePullBlockedCIDRs, c.ImagePullBlockMetadata, c.ImagePullBlockPrivate)
 }

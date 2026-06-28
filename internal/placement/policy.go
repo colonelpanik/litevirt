@@ -117,6 +117,15 @@ func scoreDimension(d Dimension, snap *ClusterSnapshot, host string, req *Reques
 	if w <= 0 {
 		return 0
 	}
+	// A dimension with no capacity carries no signal for this host (its telemetry
+	// is unwired, or — for a label-driven dim — the host hasn't declared one).
+	// Contribute NOTHING rather than treating zero capacity as infinite headroom:
+	// the balance/cost-aware branch below maps pressure 0 → head 1.0 → full weight,
+	// which would award every host the same constant bonus and dilute the real
+	// CPU/RAM signal. (matches the documented "skip this dimension" intent.)
+	if d.Capacity(snap, host) <= 0 {
+		return 0
+	}
 	p := Pressure(d, snap, host, req)
 	switch policy {
 	case PolicyBinPack:

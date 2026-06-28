@@ -316,6 +316,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// stays bounded (see config vm_event_*).
 	go d.runVMEventPrune(ctx)
 
+	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
+	// placement engine's DiskIOPS/NetBW dimensions.
+	go d.runRuntimeUsageSampler(ctx)
+
 	// Start embedded DNS server
 	dnsSrv := dns.NewServer(d.cfg.DNSDomain, d.cfg.DNSPort, d.db)
 	go dnsSrv.Start(ctx)
@@ -499,8 +503,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// effectively (every schedule errors with ErrNoRepoConfigured until
 	// the operator adds a repo).
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
-	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
-	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second)
+	svc.SetBackupRepos(d.cfg.BackupRepos)               // let RPC handlers resolve repo names
+	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
+	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)
 	d.snapScheduler.ReplRunner = svc // *grpcapi.Server implements RunReplication
 	go d.snapScheduler.Run(ctx)
 

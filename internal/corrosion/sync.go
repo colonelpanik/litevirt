@@ -287,6 +287,10 @@ func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowed
 // tests can shrink it to force multi-chunk commits.
 var mergeApplyChunkRows = 1000
 
+// mergeChunkHook is a test-only seam invoked between merge chunks (with c.mu
+// released). Nil in production.
+var mergeChunkHook func()
+
 // mergeTable LWW-merges one dump table. It validates the peer-supplied
 // name/columns against the local schema once, then applies the rows in bounded
 // chunks (mergeChunk), each its own committed transaction.
@@ -340,6 +344,12 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 		m, s := c.mergeChunk(table, table.Rows[start:end], insertSQL, pkCols, pkIdx, updatedAtIdx)
 		merged += m
 		skipped += s
+		// Test seam: fired at a chunk boundary with c.mu RELEASED. A write issued
+		// here proves the merge doesn't hold the lock across chunks (it would
+		// self-deadlock otherwise). Nil in production.
+		if mergeChunkHook != nil {
+			mergeChunkHook()
+		}
 	}
 	return merged, skipped
 }

@@ -113,41 +113,50 @@ func TestMergeChunked_AllRowsLand(t *testing.T) {
 	}
 }
 
-// TestMergeChunked_ConcurrentWrites proves the chunked merge releases the write
-// lock between chunks: a concurrent writer makes progress WHILE a merge runs, and
-// both the merged rows and the concurrent writes land. Run under -race to catch
-// lock misuse.
-func TestMergeChunked_ConcurrentWrites(t *testing.T) {
+// TestMergeChunked_ReleasesLockBetweenChunks deterministically proves the chunked
+// merge releases the write lock between chunks. The chunk-boundary hook issues a
+// write FROM THE MERGE'S OWN GOROUTINE while the merge is mid-flight: if the merge
+// still held c.mu, that write (which takes c.mu) would self-deadlock (the test
+// would hang). Its success — observed BEFORE mergeStatePayloadLWW returns — is the
+// proof, with no goroutine-timing flakiness.
+func TestMergeChunked_ReleasesLockBetweenChunks(t *testing.T) {
 	ctx := context.Background()
 	old := mergeApplyChunkRows
-	mergeApplyChunkRows = 1
+	mergeApplyChunkRows = 1 // one row per chunk → a boundary after each host
 	defer func() { mergeApplyChunkRows = old }()
 
 	src := testClient(t)
-	seedHosts(ctx, src, 50)
+	seedHosts(ctx, src, 3)
 	full, err := decompressPayload(src.dumpState())
 	if err != nil {
 		t.Fatalf("decompress: %v", err)
 	}
 
 	dst := testClient(t)
-	done := make(chan struct{})
-	go func() {
-		for i := 0; i < 50; i++ {
-			InsertImage(ctx, dst, ImageRecord{Name: fmt.Sprintf("img%02d", i), Format: "qcow2", SizeBytes: int64(i)})
+	wroteMidMerge := false
+	mergeChunkHook = func() {
+		if wroteMidMerge {
+			return // only need to prove it once
 		}
-		close(done)
-	}()
-	dst.mergeStatePayloadLWW(full)
-	<-done
-
-	hosts, _ := ListHosts(ctx, dst)
-	if len(hosts) != 50 {
-		t.Fatalf("merged %d hosts, want 50", len(hosts))
+		// Same goroutine as the in-flight merge; succeeds ONLY because c.mu is
+		// released at the chunk boundary (otherwise this self-deadlocks).
+		if err := InsertImage(ctx, dst, ImageRecord{Name: "mid-merge", Format: "qcow2", SizeBytes: 1}); err == nil {
+			wroteMidMerge = true
+		}
 	}
-	imgs, _ := ListImages(ctx, dst)
-	if len(imgs) != 50 {
-		t.Fatalf("concurrent writer landed %d images, want 50 (lock not released between chunks?)", len(imgs))
+	defer func() { mergeChunkHook = nil }()
+
+	dst.mergeStatePayloadLWW(full)
+
+	if !wroteMidMerge {
+		t.Fatal("no write completed at a chunk boundary — merge did not release the lock mid-flight")
+	}
+	if img, _ := GetImage(ctx, dst, "mid-merge"); img == nil {
+		t.Fatal("mid-merge write did not land")
+	}
+	hosts, _ := ListHosts(ctx, dst)
+	if len(hosts) != 3 {
+		t.Fatalf("merged %d hosts, want 3", len(hosts))
 	}
 }
 

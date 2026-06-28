@@ -50,6 +50,9 @@ func (f *fakeCtRuntime) State(ctx context.Context, name string) (lxc.State, erro
 	}
 	return lxc.StateUnknown, nil
 }
+func (f *fakeCtRuntime) Stats(ctx context.Context, name string) (lxc.ContainerStats, error) {
+	return lxc.ContainerStats{}, lxc.ErrStatsUnavailable
+}
 func (f *fakeCtRuntime) IP(ctx context.Context, name string) (string, error) { return "", nil }
 func (f *fakeCtRuntime) Freeze(ctx context.Context, name string) error       { return nil }
 func (f *fakeCtRuntime) Unfreeze(ctx context.Context, name string) error     { return nil }

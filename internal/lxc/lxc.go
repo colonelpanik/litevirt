@@ -405,9 +405,11 @@ func (r *LxcRunner) Stats(ctx context.Context, name string) (ContainerStats, err
 	}
 	cpu, cerr := readCPUUsageUsec(filepath.Join(dir, "cpu.stat"))
 	mem, merr := readUint(filepath.Join(dir, "memory.current"))
-	if cerr != nil && merr != nil {
-		// Cached path is stale (container restarted → new cgroup) or gone; drop it
-		// so the next scrape re-discovers, and report unavailable for this round.
+	if cerr != nil || merr != nil {
+		// Require BOTH reads: a partial read would emit a bogus 0 for the missing
+		// metric (a fake counter reset / memory drop). A failure usually means the
+		// cached path is stale (container restarted → new cgroup) or gone, so drop
+		// it; the next scrape re-discovers. Report unavailable for this round.
 		r.cgPathMu.Lock()
 		delete(r.cgPathCache, name)
 		r.cgPathMu.Unlock()

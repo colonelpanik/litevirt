@@ -206,6 +206,15 @@ Scrape `http://<host>:7444/metrics` for:
 - `litevirt_migration_downtime_ms` — histogram of guest-visible downtime during the cutover
 - `litevirt_fence_failures_total` — cumulative non-success rows in `fencing_log`; pages should fire on any non-zero increase
 - `litevirt_failover_leader` — `1` on the host currently holding the failover lease, `0` elsewhere
+- `litevirt_failover_attempts_total{phase,result,error_class}` — failover decision points, counted by
+  `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
+  `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
+  `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
+  `db_error`, `fence_log_write_failed`). A skip is `result=skipped` with the reason in `error_class`
+- `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
+  (`action` = `promote`/`reschedule`)
+- `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions
+  (`action` = `relocate`)
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across all peers; a stalled value means replication is backing up

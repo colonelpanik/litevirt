@@ -189,6 +189,7 @@ Operators should monitor these Prometheus metrics:
 | `litevirt_hlc_rejected_total` | > 0 (sustained) |
 | `litevirt_fence_failures_total` | rate > 0 over 5 min |
 | `litevirt_failover_leader` | sum across cluster != 1 sustained |
+| `litevirt_failover_attempts_total{result="error"}` | rate > 0 over 5 min (a failover decision hit a store/fence error) |
 | `litevirt_mutation_log_rows` | rapidly growing (replication backlog) |
 | `litevirt_replication_min_watermark_seq` | not advancing for > 5 min |
 | `litevirt_daemon_open_fds` | > 5000 (FD leak) |

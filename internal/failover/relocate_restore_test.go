@@ -15,18 +15,21 @@ import (
 type fakeRestorer struct {
 	calls int
 	err   error
-	db    *corrosion.Client
+	// createThenErr models RestoreContainer's "row written, then start failed":
+	// the target row is created AND an error is returned.
+	createThenErr bool
+	db            *corrosion.Client
 }
 
 func (f *fakeRestorer) RestoreContainerFromBackup(ctx context.Context, ctName, target string) error {
 	f.calls++
-	if f.err != nil {
-		return f.err
+	if f.err == nil || f.createThenErr {
+		_ = corrosion.UpsertContainer(ctx, f.db, corrosion.ContainerRecord{
+			HostName: target, Name: ctName, State: "stopped", Image: "alpine:3.19",
+			OnHostFailure: "image-recreate",
+		})
 	}
-	return corrosion.UpsertContainer(ctx, f.db, corrosion.ContainerRecord{
-		HostName: target, Name: ctName, State: "stopped", Image: "alpine:3.19",
-		OnHostFailure: "image-recreate",
-	})
+	return f.err
 }
 
 // relocateSetup builds a fenced source host + a survivor and a container on the
@@ -113,13 +116,45 @@ func TestRelocate_SkipWhenNeitherRestoreNorImage(t *testing.T) {
 	idx := 0
 	c.relocateContainers(ctx, src, cands, &idx)
 
-	// Restore failed + non-re-pullable → skip; the marker is cleared (source
-	// tombstoned) so it can't loop.
-	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow != nil {
-		t.Fatal("source row should be tombstoned on skip so the relocate-restore marker can't loop")
+	// Restore failed + non-re-pullable → skip; the row is LEFT VISIBLE for operator
+	// recovery (not tombstoned), with a terminal relocate-skipped detail.
+	row, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
+	if row == nil {
+		t.Fatal("skipped container must remain visible for operator recovery, not be tombstoned")
+	}
+	if row.StateDetail != corrosion.ContainerRelocateSkippedDetail {
+		t.Fatalf("skipped row detail = %q, want %q", row.StateDetail, corrosion.ContainerRelocateSkippedDetail)
 	}
 	if tgt, _ := corrosion.GetContainer(ctx, db, "surv", "ct1"); tgt != nil {
 		t.Fatal("no target row should be created when skipping")
+	}
+
+	// A second pass must NOT re-process the skipped row (no loop).
+	c.relocateContainers(ctx, src, cands, &idx)
+	row2, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
+	if row2 == nil || row2.StateDetail != corrosion.ContainerRelocateSkippedDetail {
+		t.Fatalf("skipped row should be untouched on a second pass, got %+v", row2)
+	}
+}
+
+// TestRelocate_RestoreRowExistsDespiteError covers a restore that wrote the
+// target row but then errored (e.g. start failed): the coordinator must treat it
+// as complete (tombstone source) — NOT image-recreate over the good restored row.
+func TestRelocate_RestoreRowExistsDespiteError(t *testing.T) {
+	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+	c.Restorer = &fakeRestorer{db: db, err: errors.New("restored but start failed"), createThenErr: true}
+
+	idx := 0
+	c.relocateContainers(ctx, src, cands, &idx)
+
+	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow != nil {
+		t.Fatal("source must be tombstoned: the restore landed (target row exists) despite the error")
+	}
+	tgt, _ := corrosion.GetContainer(ctx, db, "surv", "ct1")
+	if tgt == nil || tgt.StateDetail == corrosion.ContainerRelocateRecreateDetail {
+		t.Fatalf("target should be the restored row, not an image-recreate, got %+v", tgt)
 	}
 }
 

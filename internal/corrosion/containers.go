@@ -213,6 +213,12 @@ func RelocateRestoreTarget(state, detail string) (string, bool) {
 	return strings.TrimPrefix(detail, ContainerRelocateRestorePrefix), true
 }
 
+// ContainerRelocateSkippedDetail is the terminal state_detail the coordinator
+// stamps on a container it could neither restore nor image-recreate after a host
+// loss. The row is left VISIBLE (for operator recovery) rather than tombstoned,
+// and the relocate loop skips rows already so marked so it can't loop.
+const ContainerRelocateSkippedDetail = "relocate-skipped"
+
 // RelocateContainer re-homes a container from oldHost to newHost after a host
 // loss: it soft-deletes the old (oldHost,name) row and inserts a fresh row on
 // newHost in state 'pending' with detail 'relocate-recreate', preserving the

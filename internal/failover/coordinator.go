@@ -819,6 +819,11 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 		if ct.OnHostFailure == "" || ct.OnHostFailure == "none" {
 			continue
 		}
+		// Already triaged to skipped in a prior pass — left visible for operator
+		// recovery; don't re-process (and don't loop on it).
+		if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail {
+			continue
+		}
 		// Crash recovery: a prior tick already began a restore-relocation (marker on
 		// the source row, carrying the target). Re-derive rather than restarting.
 		if target, restoring := corrosion.RelocateRestoreTarget(ct.State, ct.StateDetail); restoring {
@@ -839,23 +844,43 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 	}
 
 	// Tier-2: restore-from-backup when a restorer is wired and the survivor is
-	// schema-compatible. Mark the SOURCE row first (idempotent; carries the target)
-	// so a crash mid-restore is recoverable. We do NOT pre-create a target row —
-	// RestoreContainer refuses an existing row, and a failed restore must leave none.
-	markerSet := false
+	// schema-compatible.
 	if c.Restorer != nil && c.survivorSchemaCompatible(ctx, target) {
-		_ = corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "relocating", corrosion.ContainerRelocateRestorePrefix+target)
-		markerSet = true
-		if err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target); err == nil {
+		// Mark the SOURCE row first (idempotent; carries the target) so a crash
+		// mid-restore is recoverable. The marker is load-bearing for that recovery,
+		// so if its write FAILS we must NOT proceed with the restore (an unmarked
+		// restore the next tick couldn't re-derive) — defer to a later tick.
+		if err := corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "relocating", corrosion.ContainerRelocateRestorePrefix+target); err != nil {
+			slog.Warn("failover: failed to mark relocate-restore; deferring relocation to next tick",
+				"container", ct.Name, "error", err)
+			c.mCt(ActionRelocate, ResultError, ErrDBError)
+			return
+		}
+		// We do NOT pre-create a target row — RestoreContainer refuses an existing
+		// row, and a genuinely-failed restore must leave none.
+		err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target)
+		if err == nil {
 			c.completeRestore(ctx, h, ct, target)
 			return
-		} else {
-			slog.Warn("failover: container restore-from-backup failed; falling back to image-recreate",
-				"container", ct.Name, "target", target, "error", err)
 		}
+		// A restore error doesn't always mean nothing landed: RestoreContainer
+		// writes the target row BEFORE attempting start, then errors if start fails
+		// (leaving a valid, tracked 'stopped' row). If the target row exists, the
+		// handoff completed — do NOT image-recreate over it. Mirrors the
+		// crash-recovery check in resumeRestoreRelocation.
+		if tgt, _ := corrosion.GetContainer(ctx, c.db, target, ct.Name); tgt != nil {
+			slog.Warn("failover: restore reported an error but the target row exists (e.g. start failed) — treating as complete",
+				"container", ct.Name, "target", target, "error", err)
+			c.completeRestore(ctx, h, ct, target)
+			return
+		}
+		slog.Warn("failover: container restore-from-backup failed; falling back to image-recreate",
+			"container", ct.Name, "target", target, "error", err)
 	}
-	// Tier-1: image-recreate (re-pullable) or skip. Clears the marker if one was set.
-	c.imageRecreateOrSkip(ctx, h, ct, target, markerSet)
+	// Tier-1: image-recreate (re-pullable) or skip. RelocateContainer (recreate)
+	// soft-deletes the source row, clearing any relocate-restore marker; the skip
+	// path replaces the marker with a terminal relocate-skipped detail.
+	c.imageRecreateOrSkip(ctx, h, ct, target)
 }
 
 // resumeRestoreRelocation re-derives a relocate-restore marker on a re-tick
@@ -880,7 +905,7 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 	if target == "" {
 		target = c.pickContainerTarget(ctx, ct, candidates, fallbackIdx)
 	}
-	c.imageRecreateOrSkip(ctx, h, ct, target, true)
+	c.imageRecreateOrSkip(ctx, h, ct, target)
 }
 
 // completeRestore finalizes a successful restore: the target row was created by
@@ -896,19 +921,23 @@ func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostReco
 	c.auditRelocate(ctx, "ct.relocate.restored", ct.Name, "restored from backup to "+target+" after fencing "+h.Name, "ok")
 }
 
-// imageRecreateOrSkip is the tier-1 path. tombstoneOnSkip clears a
-// relocate-restore marker on the source row when skipping, so it can't loop.
-func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string, tombstoneOnSkip bool) {
+// imageRecreateOrSkip is the tier-1 path: recreate from a re-pullable image, else
+// skip. The skip leaves the row VISIBLE (for operator recovery) with a terminal
+// relocate-skipped detail — which also replaces any relocate-restore marker, so
+// the relocate loop won't re-process it.
+func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string) {
 	// A container with no re-pullable image can't be rebuilt here (its rootfs died
 	// with the host) — skip and loudly audit so the operator knows to recover it.
 	if !containerImageRepullable(ct.Image) {
-		if tombstoneOnSkip {
-			_ = corrosion.DeleteContainer(ctx, c.db, h.Name, ct.Name) // clear the relocating marker
+		// Keep the row visible; "stopped" reflects that it isn't running anywhere,
+		// and the terminal detail stops the relocate loop from re-processing it.
+		if err := corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "stopped", corrosion.ContainerRelocateSkippedDetail); err != nil {
+			slog.Warn("failover: mark container relocate-skipped", "container", ct.Name, "error", err)
 		}
 		slog.Warn("failover: container not relocatable (no re-pullable image, no usable backup) — skipping",
 			"container", ct.Name, "image", ct.Image, "host", h.Name)
 		c.auditRelocate(ctx, "ct.relocate.skipped", ct.Name,
-			"no re-pullable image and no usable backup after fencing "+h.Name, "skipped")
+			"no re-pullable image and no usable backup after fencing "+h.Name+" (left for operator recovery)", "skipped")
 		c.mCt(ActionRelocate, ResultSkipped, ErrNonRepullable)
 		return
 	}

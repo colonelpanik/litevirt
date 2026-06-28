@@ -139,7 +139,10 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		HostName: s.hostName, Name: req.Target, State: "stopped",
 		Image: src.Image, CPULimit: src.CPULimit, MemMiB: src.MemMiB,
 		Labels: src.Labels, RestartPolicy: src.RestartPolicy,
-		Project: project, OnHostFailure: src.OnHostFailure, CreatedAt: now,
+		Project: project, OnHostFailure: src.OnHostFailure,
+		// Carry the source's create-time intent (template/distro/release/arch/
+		// networks) so the clone is relocation/restore-faithful too.
+		CreateSpec: src.CreateSpec, CreatedAt: now,
 		// A clone is a normal container, never a template.
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {

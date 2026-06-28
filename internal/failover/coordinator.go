@@ -44,6 +44,10 @@ const (
 	// binary stream + restart, short enough that a host that died mid-upgrade
 	// still fails over instead of stranding its VMs forever.
 	upgradingTimeout = 2 * time.Minute
+	// defaultRelocateRestoreTimeout is the fallback for Coordinator.RelocateRestoreTimeout
+	// (config container_restore_timeout_sec): how long a relocate-restore marker is
+	// treated as in-flight before the coordinator gives up and image-recreates.
+	defaultRelocateRestoreTimeout = 10 * time.Minute
 )
 
 // Fencer abstracts fence.Execute so tests can inject a stub. Production code
@@ -59,6 +63,15 @@ type ReplicaPromoter interface {
 	AutoPromoteReplica(ctx context.Context, vmName string) error
 }
 
+// ContainerRestorer restores a container onto a survivor host from its latest
+// valid backup. The grpcapi server implements it; the coordinator calls it
+// during host-loss relocation to prefer a faithful restore-from-backup
+// (networking + non-image state) over a bare image-recreate. Optional — nil
+// disables tier-2 and the coordinator always image-recreates.
+type ContainerRestorer interface {
+	RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) error
+}
+
 // Coordinator watches for host failures and triggers failover.
 type Coordinator struct {
 	hostName string
@@ -66,6 +79,13 @@ type Coordinator struct {
 	fencer   Fencer
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
+	// Restorer, when set, lets host-loss relocation restore a container from its
+	// latest backup before falling back to image-recreate. nil → image-recreate only.
+	Restorer ContainerRestorer
+	// RelocateRestoreTimeout bounds how long a relocate-restore marker is treated
+	// as in-flight before the coordinator gives up on the restore and falls back
+	// to image-recreate. 0 → defaultRelocateRestoreTimeout.
+	RelocateRestoreTimeout time.Duration
 	// fencing tracks hosts that have already been fenced in this session
 	// to avoid double-fencing on repeated poll cycles.
 	fenced map[string]bool
@@ -784,9 +804,10 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 }
 
 // relocateContainers re-homes the fenced host's relocatable containers onto
-// healthy hosts (state-only; the target reconciler recreates them). Shares the
-// round-robin fallbackIdx with the VM loop so placement-failure fallbacks stay
-// spread across candidates.
+// healthy hosts. For each, it prefers a faithful restore-from-backup (tier-2),
+// falls back to image-recreate (tier-1), else skips — and re-derives the outcome
+// of any in-flight restore-relocation (crash recovery). Shares the round-robin
+// fallbackIdx with the VM loop so placement-failure fallbacks stay spread.
 func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostRecord, candidates []corrosion.HostRecord, fallbackIdx *int) {
 	cts, err := corrosion.ListContainers(ctx, c.db, h.Name)
 	if err != nil {
@@ -795,52 +816,165 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 		return
 	}
 	for _, ct := range cts {
-		policy := ct.OnHostFailure
-		if policy == "" || policy == "none" {
+		if ct.OnHostFailure == "" || ct.OnHostFailure == "none" {
 			continue
 		}
-		// Tier-1 relocation re-creates from a re-pullable image; a container with
-		// no such origin can't be brought back here (its rootfs died with the
-		// host) — skip and loudly audit so the operator knows it needs a restore.
-		if !containerImageRepullable(ct.Image) {
-			slog.Warn("failover: container not relocatable (no re-pullable image) — skipping",
-				"container", ct.Name, "image", ct.Image, "host", h.Name)
-			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-				ID: newID(), Username: "failover-coordinator", HostName: c.hostName,
-				Action: "ct.relocate.skipped", Target: ct.Name,
-				Detail: "no re-pullable image origin after fencing " + h.Name + " (restore from backup to recover)",
-				Result: "skipped",
-			})
-			c.mCt(ActionRelocate, ResultSkipped, ErrNonRepullable)
+		// Crash recovery: a prior tick already began a restore-relocation (marker on
+		// the source row, carrying the target). Re-derive rather than restarting.
+		if target, restoring := corrosion.RelocateRestoreTarget(ct.State, ct.StateDetail); restoring {
+			c.resumeRestoreRelocation(ctx, h, ct, target, candidates, fallbackIdx)
 			continue
 		}
-
-		target, err := placement.Select(ctx, c.db, placement.Request{
-			VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
-		})
-		if err != nil {
-			if len(candidates) == 0 {
-				slog.Warn("failover: no target for container relocation", "container", ct.Name)
-				continue
-			}
-			target = candidates[*fallbackIdx%len(candidates)].Name
-			*fallbackIdx++
-		}
-
-		if err := corrosion.RelocateContainer(ctx, c.db, h.Name, ct.Name, target); err != nil {
-			slog.Error("failover: relocate container", "container", ct.Name, "error", err)
-			c.mCt(ActionRelocate, ResultError, ErrRelocateFailed)
-			continue
-		}
-		c.fenceRelocated[h.Name] = true
-		c.mCt(ActionRelocate, ResultSuccess, errClassNone)
-		slog.Info("failover: relocating container", "container", ct.Name, "from", h.Name, "to", target, "policy", policy)
-		_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-			ID: newID(), Username: "failover-coordinator", HostName: c.hostName,
-			Action: "ct.relocate", Target: ct.Name,
-			Detail: "relocated from " + h.Name + " to " + target + " (recreate from image)", Result: "ok",
-		})
+		c.startRelocation(ctx, h, ct, candidates, fallbackIdx)
 	}
+}
+
+// startRelocation relocates one not-yet-marked container: restore-from-backup if
+// possible, else image-recreate, else skip.
+func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) {
+	target := c.pickContainerTarget(ctx, ct, candidates, fallbackIdx)
+	if target == "" {
+		slog.Warn("failover: no target for container relocation", "container", ct.Name)
+		return
+	}
+
+	// Tier-2: restore-from-backup when a restorer is wired and the survivor is
+	// schema-compatible. Mark the SOURCE row first (idempotent; carries the target)
+	// so a crash mid-restore is recoverable. We do NOT pre-create a target row —
+	// RestoreContainer refuses an existing row, and a failed restore must leave none.
+	markerSet := false
+	if c.Restorer != nil && c.survivorSchemaCompatible(ctx, target) {
+		_ = corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "relocating", corrosion.ContainerRelocateRestorePrefix+target)
+		markerSet = true
+		if err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target); err == nil {
+			c.completeRestore(ctx, h, ct, target)
+			return
+		} else {
+			slog.Warn("failover: container restore-from-backup failed; falling back to image-recreate",
+				"container", ct.Name, "target", target, "error", err)
+		}
+	}
+	// Tier-1: image-recreate (re-pullable) or skip. Clears the marker if one was set.
+	c.imageRecreateOrSkip(ctx, h, ct, target, markerSet)
+}
+
+// resumeRestoreRelocation re-derives a relocate-restore marker on a re-tick
+// (typically after a coordinator restart mid-restore).
+func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string, candidates []corrosion.HostRecord, fallbackIdx *int) {
+	// Restore already landed? (crashed after the target row was created but before
+	// the source was tombstoned). A target row exists ⇒ a complete restore, because
+	// RestoreContainer's row write is mandatory + post-import (see backup_container.go).
+	if target != "" {
+		if tgt, _ := corrosion.GetContainer(ctx, c.db, target, ct.Name); tgt != nil {
+			c.completeRestore(ctx, h, ct, target)
+			return
+		}
+	}
+	// No target row. Fresh marker → a restore may be in flight; skip to avoid a
+	// duplicate. Stale marker → it never completed; fall back to image-recreate.
+	if c.markerFresh(ct) {
+		return
+	}
+	slog.Warn("failover: stale relocate-restore marker — falling back to image-recreate",
+		"container", ct.Name, "target", target)
+	if target == "" {
+		target = c.pickContainerTarget(ctx, ct, candidates, fallbackIdx)
+	}
+	c.imageRecreateOrSkip(ctx, h, ct, target, true)
+}
+
+// completeRestore finalizes a successful restore: the target row was created by
+// RestoreContainer, so tombstone the dead-host source row to complete the
+// (logical, idempotent) handoff — the source host is fenced and won't write again.
+func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string) {
+	if err := corrosion.DeleteContainer(ctx, c.db, h.Name, ct.Name); err != nil {
+		slog.Warn("failover: tombstone source row after restore", "container", ct.Name, "error", err)
+	}
+	c.fenceRelocated[h.Name] = true
+	c.mCt(ActionRelocate, ResultSuccess, errClassNone)
+	slog.Info("failover: container relocated via restore-from-backup", "container", ct.Name, "from", h.Name, "to", target)
+	c.auditRelocate(ctx, "ct.relocate.restored", ct.Name, "restored from backup to "+target+" after fencing "+h.Name, "ok")
+}
+
+// imageRecreateOrSkip is the tier-1 path. tombstoneOnSkip clears a
+// relocate-restore marker on the source row when skipping, so it can't loop.
+func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string, tombstoneOnSkip bool) {
+	// A container with no re-pullable image can't be rebuilt here (its rootfs died
+	// with the host) — skip and loudly audit so the operator knows to recover it.
+	if !containerImageRepullable(ct.Image) {
+		if tombstoneOnSkip {
+			_ = corrosion.DeleteContainer(ctx, c.db, h.Name, ct.Name) // clear the relocating marker
+		}
+		slog.Warn("failover: container not relocatable (no re-pullable image, no usable backup) — skipping",
+			"container", ct.Name, "image", ct.Image, "host", h.Name)
+		c.auditRelocate(ctx, "ct.relocate.skipped", ct.Name,
+			"no re-pullable image and no usable backup after fencing "+h.Name, "skipped")
+		c.mCt(ActionRelocate, ResultSkipped, ErrNonRepullable)
+		return
+	}
+	if target == "" {
+		slog.Warn("failover: no target for container relocation", "container", ct.Name)
+		return
+	}
+	if err := corrosion.RelocateContainer(ctx, c.db, h.Name, ct.Name, target); err != nil {
+		slog.Error("failover: relocate container (image-recreate)", "container", ct.Name, "error", err)
+		c.mCt(ActionRelocate, ResultError, ErrRelocateFailed)
+		return
+	}
+	c.fenceRelocated[h.Name] = true
+	c.mCt(ActionRelocate, ResultSuccess, errClassNone)
+	slog.Info("failover: relocating container (image-recreate)", "container", ct.Name, "from", h.Name, "to", target)
+	c.auditRelocate(ctx, "ct.relocate.recreate", ct.Name,
+		"relocated from "+h.Name+" to "+target+" (recreate from image)", "ok")
+}
+
+// pickContainerTarget chooses a survivor via the placement engine, falling back
+// to round-robin over the candidate list. Returns "" if none.
+func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) string {
+	target, err := placement.Select(ctx, c.db, placement.Request{
+		VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
+	})
+	if err != nil {
+		if len(candidates) == 0 {
+			return ""
+		}
+		target = candidates[*fallbackIdx%len(candidates)].Name
+		*fallbackIdx++
+	}
+	return target
+}
+
+// survivorSchemaCompatible reports whether the survivor is at least as new as
+// this coordinator's schema, so it fully supports the restore/create_spec path. A
+// behind survivor (mid rolling-upgrade) or unknown schema → fall back to
+// image-recreate (graceful; restore-failure also falls back regardless).
+func (c *Coordinator) survivorSchemaCompatible(ctx context.Context, target string) bool {
+	hr, err := corrosion.GetHost(ctx, c.db, target)
+	if err != nil || hr == nil {
+		return false
+	}
+	return hr.SchemaVersion >= corrosion.CurrentSchemaVersion
+}
+
+// markerFresh reports whether a relocate-restore marker is still within the
+// in-flight window (a restore might still be running).
+func (c *Coordinator) markerFresh(ct corrosion.ContainerRecord) bool {
+	to := c.RelocateRestoreTimeout
+	if to <= 0 {
+		to = defaultRelocateRestoreTimeout
+	}
+	t, err := time.Parse(time.RFC3339, ct.UpdatedAt)
+	if err != nil {
+		return true // unparseable → conservatively treat as fresh (avoid double-restore)
+	}
+	return c.now().Sub(t) < to
+}
+
+func (c *Coordinator) auditRelocate(ctx context.Context, action, target, detail, result string) {
+	_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+		ID: newID(), Username: "failover-coordinator", HostName: c.hostName,
+		Action: action, Target: target, Detail: detail, Result: result,
+	})
 }
 
 // containerImageRepullable reports whether a container's image origin can be

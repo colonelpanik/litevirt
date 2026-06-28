@@ -33,6 +33,14 @@ type containerBackupSpec struct {
 	Labels        map[string]string `json:"labels,omitempty"`
 	RestartPolicy string            `json:"restart_policy,omitempty"`
 	Project       string            `json:"project"`
+	// v34: create-time intent (JSON ContainerCreateSpec: template/distro/release/
+	// arch/networks) + the relocation policy and template flag, so a restore — or a
+	// downstream host-loss relocation — rebuilds the container faithfully, incl.
+	// litevirt-managed networking. Empty for backups taken before v34; readers
+	// tolerate that and fall back to a bare image-recreate.
+	CreateSpec    string `json:"create_spec,omitempty"`
+	OnHostFailure string `json:"on_host_failure,omitempty"`
+	IsTemplate    bool   `json:"is_template,omitempty"`
 }
 
 // containerBackupDisk is the manifest "disk" name for a container — a container
@@ -146,6 +154,54 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	})
 }
 
+// RestoreContainerFromBackup restores ctName's latest valid backup onto
+// targetHost. It searches THIS daemon's configured repos for the newest valid
+// manifest, then drives the target's RestoreContainer over peer mTLS (reusing
+// migrateRestore), passing the registered repo NAME so the target resolves it in
+// its OWN config (the shared-repo assumption the migrate path already relies on).
+// Returns an error when no manifest is found or the target can't restore — the
+// failover coordinator falls back to image-recreate. Satisfies
+// failover.ContainerRestorer.
+func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) error {
+	repoName, timestamp, err := s.findLatestContainerBackup(ctName)
+	if err != nil {
+		return err
+	}
+	return s.migrateRestore(ctx, targetHost, repoName, ctName, timestamp, true)
+}
+
+// findLatestContainerBackup scans the daemon's configured repos for the newest
+// structurally-valid rootfs manifest of ctName, returning the registered repo
+// NAME (not path) + the manifest timestamp. A registered name is preferred so
+// the target can resolve the same repo via its own config.
+func (s *Server) findLatestContainerBackup(ctName string) (repoName, timestamp string, err error) {
+	if len(s.backupRepos) == 0 {
+		return "", "", fmt.Errorf("no backup repos configured")
+	}
+	var bestName, bestTS string
+	for name, path := range s.backupRepos {
+		repo, oerr := pbsstore.Open(path)
+		if oerr != nil {
+			continue // repo not openable from here — skip
+		}
+		m, ok, merr := repo.LatestManifestFor(ctName, containerBackupDisk)
+		if merr != nil || !ok || m == nil {
+			continue
+		}
+		if pbsstore.ValidateManifest(m) != nil {
+			continue // structurally invalid → not restorable
+		}
+		// Manifest timestamps are RFC3339 (lexical == chronological).
+		if m.Timestamp > bestTS {
+			bestTS, bestName = m.Timestamp, name
+		}
+	}
+	if bestName == "" {
+		return "", "", fmt.Errorf("no valid backup manifest for %q in configured repos", ctName)
+	}
+	return bestName, bestTS, nil
+}
+
 // archiveContainer streams a container's whole on-disk directory (rootfs + LXC
 // config) into repo as a full, content-addressed manifest, embedding its spec
 // so a restore is self-contained. The caller holds the ct lock and has already
@@ -155,6 +211,7 @@ func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec 
 	specJSON, _ := json.Marshal(containerBackupSpec{
 		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
 		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
+		CreateSpec: rec.CreateSpec, OnHostFailure: rec.OnHostFailure, IsTemplate: rec.IsTemplate,
 	})
 	// Pipe the export tar straight into the chunk store so we never buffer the
 	// whole rootfs. If PushDisk returns early (error), CloseWithError unblocks
@@ -290,13 +347,34 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		Image: spec.Image, CPULimit: spec.CPULimit, MemMiB: spec.MemMiB,
 		Labels: spec.Labels, RestartPolicy: spec.RestartPolicy,
 		Project: tenancy.NormalizeProject(project),
+		// Carry forward the create-time intent + relocation policy/template flag so
+		// a future host-loss relocation of THIS restored container is faithful.
+		// Empty CreateSpec (pre-v34 backup) is tolerated downstream.
+		CreateSpec:    spec.CreateSpec,
+		OnHostFailure: spec.OnHostFailure,
+		IsTemplate:    spec.IsTemplate,
 	}
+	// The cluster-row write is MANDATORY. A restore that imported the runtime
+	// container but failed to record the row would strand an untracked container —
+	// and at failover the coordinator could tombstone the source believing the
+	// move completed (point: relocate-restore relies on "row exists ⇒ restore
+	// landed"). On failure, best-effort delete the just-imported container so
+	// nothing untracked is left, then error out.
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
-		slog.Warn("container restore: cluster row write failed", "name", req.Name, "error", err)
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+			slog.Warn("container restore: failed to clean up imported container after row-write failure",
+				"name", req.Name, "error", delErr)
+		}
+		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+		return status.Errorf(codes.Internal, "restore: record cluster row: %v", err)
 	}
 
 	if req.Start {
 		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
+			// Partial success: the container is restored AND tracked (row stays
+			// 'stopped'), so the reconciler / restart policy can start it later. We
+			// return an error but deliberately do NOT delete the row — a tracked
+			// stopped container is recoverable; an ambiguous half-state is not.
 			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (start failed)", "error")
 			return status.Errorf(codes.Internal, "restored but start failed: %v", err)
 		}

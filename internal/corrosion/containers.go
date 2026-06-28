@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // Reserved labels litevirt uses to manage compose-deployed containers. They
@@ -55,8 +56,60 @@ type ContainerRecord struct {
 	// recreate from a re-pullable origin on another host). Both added in v28.
 	IsTemplate    bool
 	OnHostFailure string
-	CreatedAt     string
-	UpdatedAt     string
+	// CreateSpec is the JSON-encoded ContainerCreateSpec (schema v34): the
+	// create-time intent (template/distro/release/arch/networks) not captured by
+	// the other columns. '' for rows created before v34 — readers must tolerate
+	// that. Carried verbatim by RelocateContainer; kept current by every path that
+	// (re)creates a container (Create/Clone/Restore).
+	CreateSpec string
+	CreatedAt  string
+	UpdatedAt  string
+}
+
+// ContainerCreateSpec captures a container's create-time intent so host-loss
+// relocation + restore can faithfully rebuild it — including litevirt-managed
+// networking, which the flat columns don't record. Persisted JSON-encoded in
+// containers.create_spec (schema v34). Forward-only: an empty/zero value means
+// "unknown" (a pre-v34 row or old backup), and callers fall back to a bare
+// image-recreate.
+type ContainerCreateSpec struct {
+	Template string             `json:"template,omitempty"`
+	Distro   string             `json:"distro,omitempty"`
+	Release  string             `json:"release,omitempty"`
+	Arch     string             `json:"arch,omitempty"`
+	Networks []ContainerNetwork `json:"networks,omitempty"`
+}
+
+// ContainerNetwork is one NIC of a ContainerCreateSpec (mirrors lxc.NetworkAttach
+// without importing the lxc package into corrosion).
+type ContainerNetwork struct {
+	Name   string `json:"name,omitempty"`
+	Bridge string `json:"bridge,omitempty"`
+	IP     string `json:"ip,omitempty"`
+	MAC    string `json:"mac,omitempty"`
+}
+
+// EncodeCreateSpec marshals a create spec for storage. Returns "" for a
+// zero/empty spec so it round-trips as "unknown".
+func EncodeCreateSpec(s ContainerCreateSpec) string {
+	if s.Template == "" && s.Distro == "" && s.Release == "" && s.Arch == "" && len(s.Networks) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// DecodeCreateSpec parses a stored create spec; a blank/garbage value yields a
+// zero spec (treated as "unknown" by callers).
+func DecodeCreateSpec(raw string) ContainerCreateSpec {
+	var s ContainerCreateSpec
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &s)
+	}
+	return s
 }
 
 // UpsertContainer creates or updates the cluster row for a container.
@@ -81,8 +134,8 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
 	return c.Execute(ctx,
-		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
 		   image = excluded.image,
@@ -94,10 +147,14 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 		   project = excluded.project,
 		   is_template = excluded.is_template,
 		   on_host_failure = excluded.on_host_failure,
+		   -- Keep an existing create_spec when the caller didn't supply one, so a
+		   -- generic upsert can't wipe the create-time intent (it's "current
+		   -- intent", forward-only).
+		   create_spec = CASE WHEN excluded.create_spec <> '' THEN excluded.create_spec ELSE create_spec END,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
-		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreatedAt, now,
+		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.CreatedAt, now,
 	)
 }
 
@@ -138,6 +195,23 @@ func SetContainerStateDetail(ctx context.Context, c *Client, hostName, name, sta
 // stamps on a container it re-homes after a host loss. The target host's
 // container reconciler reads it to recreate the container from its image (B5).
 const ContainerRelocateRecreateDetail = "relocate-recreate"
+
+// ContainerRelocateRestorePrefix marks a container the coordinator is relocating
+// via restore-from-backup. Unlike relocate-recreate (an image path stamped on the
+// TARGET row), this is stamped on the SOURCE (dead-host) row as
+// state="relocating", detail="relocate-restore:<target>", and the row stays put
+// until the restore lands — so a re-tick (e.g. after a coordinator crash) can
+// re-derive progress from it (see RelocateRestoreTarget).
+const ContainerRelocateRestorePrefix = "relocate-restore:"
+
+// RelocateRestoreTarget parses a relocate-restore marker, returning the chosen
+// target host and true, or ("", false) if the row isn't so marked.
+func RelocateRestoreTarget(state, detail string) (string, bool) {
+	if state != "relocating" || !strings.HasPrefix(detail, ContainerRelocateRestorePrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(detail, ContainerRelocateRestorePrefix), true
+}
 
 // RelocateContainer re-homes a container from oldHost to newHost after a host
 // loss: it soft-deletes the old (oldHost,name) row and inserts a fresh row on
@@ -187,6 +261,7 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 		        COALESCE(project, '_default') AS project,
 		        COALESCE(is_template, 0) AS is_template,
 		        COALESCE(on_host_failure, '') AS on_host_failure,
+		        COALESCE(create_spec, '') AS create_spec,
 		        created_at, updated_at
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		hostName, name)
@@ -210,6 +285,7 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 		   COALESCE(project, '_default') AS project,
 		   COALESCE(is_template, 0) AS is_template,
 		   COALESCE(on_host_failure, '') AS on_host_failure,
+		   COALESCE(create_spec, '') AS create_spec,
 		   created_at, updated_at
 		FROM containers WHERE deleted_at IS NULL`
 	var params []interface{}
@@ -241,6 +317,7 @@ func scanContainer(r Row) ContainerRecord {
 		Project:       r.String("project"),
 		IsTemplate:    r.Int("is_template") == 1,
 		OnHostFailure: r.String("on_host_failure"),
+		CreateSpec:    r.String("create_spec"),
 		CreatedAt:     r.String("created_at"), UpdatedAt: r.String("updated_at"),
 	}
 }

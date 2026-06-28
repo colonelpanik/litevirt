@@ -16,9 +16,10 @@ import (
 // tests. State is whatever the test sets; Start records the call and (unless
 // startErr is set) flips the container to running, mimicking a successful boot.
 type fakeCtRuntime struct {
-	states   map[string]lxc.State
-	startErr map[string]error
-	started  []string
+	states     map[string]lxc.State
+	startErr   map[string]error
+	started    []string
+	lastCreate lxc.CreateOpts // captured by Create for assertions
 }
 
 func newFakeCtRuntime() *fakeCtRuntime {
@@ -26,6 +27,7 @@ func newFakeCtRuntime() *fakeCtRuntime {
 }
 
 func (f *fakeCtRuntime) Create(ctx context.Context, opts lxc.CreateOpts) (*lxc.Container, error) {
+	f.lastCreate = opts
 	return &lxc.Container{Name: opts.Name, State: lxc.StateStopped}, nil
 }
 func (f *fakeCtRuntime) Start(ctx context.Context, name string) error {
@@ -332,4 +334,32 @@ func mustGetCt(t *testing.T, db *corrosion.Client, name string) corrosion.Contai
 		t.Fatalf("GetContainer(%s): %v (nil=%v)", name, err, rec == nil)
 	}
 	return *rec
+}
+
+// TestContainerCheck_RelocateRecreate_RebuildsNetworking proves the image-recreate
+// relocation path reconstructs litevirt-managed NICs from the v34 create_spec,
+// instead of recreating a network-blind container.
+func TestContainerCheck_RelocateRecreate_RebuildsNetworking(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime() // ct not in states → StateUnknown → recreate fires
+
+	spec := corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+		Networks: []corrosion.ContainerNetwork{{Name: "eth0", Bridge: "br0", IP: "10.1.2.3", MAC: "52:54:00:ab:cd:ef"}},
+	})
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "alpine:3.19", CreateSpec: spec,
+	})
+
+	c := NewContainerChecker("node1", db, rt)
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if len(rt.lastCreate.Network) != 1 {
+		t.Fatalf("recreate should rebuild 1 NIC from create_spec, got %d (network-blind recreate?)", len(rt.lastCreate.Network))
+	}
+	if n := rt.lastCreate.Network[0]; n.Bridge != "br0" || n.IP != "10.1.2.3" {
+		t.Fatalf("recreated NIC = %+v, want bridge=br0 ip=10.1.2.3", n)
+	}
 }

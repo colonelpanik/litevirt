@@ -183,7 +183,14 @@ import (
 //	     stale telemetry self-corrects on the next sample (cf. vm_events), so it
 //	     needn't be full-state-repaired and must not bloat the digest/dump or churn
 //	     durable host metadata. One CREATE TABLE; gap-1 from v32.
-const CurrentSchemaVersion = 33
+//	v34: containers.create_spec — JSON of a container's create-time intent
+//	     (template/distro/release/arch + litevirt-managed networks) that the other
+//	     columns don't capture. Lets host-loss relocation and restore rebuild a
+//	     container faithfully (networking included) instead of a bare image
+//	     recreate. Forward-only: rows/manifests from before v34 have an empty spec;
+//	     readers tolerate that and fall back to image-recreate. One ADD COLUMN;
+//	     gap-1 from v33.
+const CurrentSchemaVersion = 34
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1134,7 +1141,8 @@ var schemaDDL = []string{
 		state_detail   TEXT,                  -- stop cause / intent, e.g. 'operator-stop' (v24)
 		project        TEXT NOT NULL DEFAULT '_default', -- tenancy bucket, mirrors vms.project (v25)
 		is_template     INTEGER NOT NULL DEFAULT 0,       -- clone-source template, mirrors vms.is_template (v28)
-		on_host_failure TEXT,                             -- host-loss policy: ''/'none' | 'image-recreate' (v28)
+		on_host_failure TEXT,                             -- host-loss policy: ''/'none' | 'image-recreate' (v28); v34 prefers restore-from-backup, then image-recreate
+		create_spec     TEXT,                             -- JSON create-time intent (template/distro/release/arch/networks) for faithful relocation/restore (v34)
 		created_at     TEXT NOT NULL,
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT,
@@ -1673,6 +1681,11 @@ var schemaMigrations = []string{
 	`ALTER TABLE recovery_codes ADD COLUMN set_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE recovery_codes ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE recovery_codes ADD COLUMN deleted_at TEXT`,
+
+	// v34: persist a container's create-time spec (template/distro/release/arch/
+	// networks) so host-loss relocation + restore can faithfully rebuild it,
+	// including litevirt-managed networking the other columns don't capture.
+	`ALTER TABLE containers ADD COLUMN create_spec TEXT`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -1743,6 +1756,7 @@ var alterVersions = []int{
 	30,     // hosts.schema_version
 	31, 31, // lb_configs.generation, lb_backends.generation
 	32, 32, 32, 32, 32, // user_2fa.deleted_at/epoch; recovery_codes.set_id/updated_at/deleted_at
+	34, // containers.create_spec
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

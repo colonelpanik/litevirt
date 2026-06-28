@@ -550,7 +550,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
 	// replica promoter (auto_promote recovery) and start the coordinator.
-	fc.Promoter = svc                         // *grpcapi.Server implements failover.ReplicaPromoter
+	fc.Promoter = svc // *grpcapi.Server implements failover.ReplicaPromoter
+	fc.Restorer = svc // implements failover.ContainerRestorer (tier-2 relocate-from-backup)
+	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
 	fc.OnFence = svc.NotifyHostFenced         // operator notification on fence (#5)
 	fc.Metrics = metrics.NewFailoverMetrics() // structured failover counters (U9)
 	go fc.Start(ctx)

@@ -26,11 +26,16 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -81,6 +86,13 @@ type Node struct {
 	// peerConn caches a self-loopback client for scenario assertions
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn
+
+	// partition gate: replication/state-sync RPCs whose mTLS caller CN is in
+	// blockedFrom are refused, modeling a network partition on the real
+	// transport. Guarded by partMu (Partition/Heal mutate it concurrently with
+	// in-flight RPCs).
+	partMu      sync.Mutex
+	blockedFrom map[string]bool
 }
 
 // New brings up a Cluster ready for scenarios. Each node has:
@@ -111,10 +123,11 @@ func New(t *testing.T, opts Options) *Cluster {
 	for i := 0; i < opts.Nodes; i++ {
 		name := fmt.Sprintf("node-%d", i)
 		n := &Node{
-			Name:    name,
-			Region:  regionFor(opts.RegionByIndex, i),
-			Address: "127.0.0.1",
-			PKIDir:  filepath.Join(c.tmpRoot, name, "pki"),
+			Name:        name,
+			Region:      regionFor(opts.RegionByIndex, i),
+			Address:     "127.0.0.1",
+			PKIDir:      filepath.Join(c.tmpRoot, name, "pki"),
+			blockedFrom: make(map[string]bool),
 		}
 		c.mintHostCert(n)
 		// Reserve an ephemeral port — close the listener immediately
@@ -369,10 +382,15 @@ func (c *Cluster) buildServer(n *Node) {
 	// With no bearer token in metadata the auth path treats the
 	// caller as mTLS-authenticated admin, which is what SelfClient
 	// produces.
+	// The partition interceptors run BEFORE auth: a partitioned peer's
+	// replication RPC is dropped (codes.Unavailable) regardless of identity, as
+	// if the link were severed. Both a unary and a stream interceptor are needed
+	// — the streaming dump RPCs (StreamStateDump / StreamSensitiveStateDump)
+	// never hit a unary interceptor.
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.UnaryInterceptor(n.Server.UnaryAuthInterceptor),
-		grpc.StreamInterceptor(n.Server.StreamAuthInterceptor),
+		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.Server.UnaryAuthInterceptor),
+		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.Server.StreamAuthInterceptor),
 	)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv
@@ -386,6 +404,96 @@ func (c *Cluster) buildServer(n *Node) {
 	if err := waitTCP(n.Address, n.Port, 2*time.Second); err != nil {
 		c.t.Fatalf("%s did not start gRPC: %v", n.Name, err)
 	}
+}
+
+// replicationMethods are the gRPC method names (final path segment) the
+// partition gate drops. It covers BOTH lanes — public and sensitive — and both
+// the digest and the dump/push/ack steps; omitting the sensitive lane would let
+// it converge during a "partition".
+var replicationMethods = map[string]bool{
+	"PushMutations":            true,
+	"AckMutations":             true,
+	"GetStateDigest":           true,
+	"GetStateDump":             true,
+	"StreamStateDump":          true,
+	"GetSensitiveStateDigest":  true,
+	"StreamSensitiveStateDump": true,
+}
+
+// methodName returns the final segment of a gRPC full-method string
+// ("/litevirt.v1.LiteVirt/PushMutations" → "PushMutations").
+func methodName(full string) string {
+	if i := strings.LastIndex(full, "/"); i >= 0 {
+		return full[i+1:]
+	}
+	return full
+}
+
+// peerCertCN extracts the caller's mTLS certificate CommonName (== node name in
+// the harness), mirroring grpcapi.peerCommonName.
+func peerCertCN(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return ""
+	}
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok || len(tlsInfo.State.PeerCertificates) == 0 {
+		return ""
+	}
+	return tlsInfo.State.PeerCertificates[0].Subject.CommonName
+}
+
+// blocked reports whether a replication RPC from the given caller is currently
+// partitioned away from this node.
+func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
+	if !replicationMethods[methodName(fullMethod)] {
+		return false
+	}
+	caller := peerCertCN(ctx)
+	if caller == "" {
+		return false
+	}
+	n.partMu.Lock()
+	defer n.partMu.Unlock()
+	return n.blockedFrom[caller]
+}
+
+func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	if n.blocked(info.FullMethod, ctx) {
+		return nil, status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
+	}
+	return handler(ctx, req)
+}
+
+func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	if n.blocked(info.FullMethod, ss.Context()) {
+		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
+	}
+	return handler(srv, ss)
+}
+
+func (n *Node) setBlocked(peer string, blocked bool) {
+	n.partMu.Lock()
+	defer n.partMu.Unlock()
+	if blocked {
+		n.blockedFrom[peer] = true
+	} else {
+		delete(n.blockedFrom, peer)
+	}
+}
+
+// Partition severs replication/state-sync RPCs between a and b in BOTH
+// directions (each refuses the other's replication calls), modeling a network
+// partition on the real loopback transport. Non-replication RPCs are unaffected.
+func (c *Cluster) Partition(a, b *Node) {
+	a.setBlocked(b.Name, true)
+	b.setBlocked(a.Name, true)
+}
+
+// Heal removes a partition between a and b so replication can flow again.
+func (c *Cluster) Heal(a, b *Node) {
+	a.setBlocked(b.Name, false)
+	b.setBlocked(a.Name, false)
 }
 
 // regionFor reads the region label for index i, defaulting to "default".

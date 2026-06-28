@@ -54,6 +54,7 @@ type Fake struct {
 	snapshots   map[string]map[string]struct{} // domain → snapshot names
 	diskSources map[string]map[string]string   // domain → target-dev → source file
 	stats       map[string]*libvirt.DomainStats
+	reasons     map[string]string // domain → injected DomainStateReason.Reason
 	events      []Event
 
 	// Optional time source for events. Defaults to time.Now.
@@ -70,8 +71,8 @@ type Fake struct {
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
 	FailDomainState        func(name string) error
-	FailMigrateToTarget func(name, dconnuri string) error
-	FailBlockPull       func(domain, disk string) error
+	FailMigrateToTarget    func(name, dconnuri string) error
+	FailBlockPull          func(domain, disk string) error
 	// BlockJobStatusFn lets a scenario script block-job progress. Nil =
 	// "no job in progress" (Found=false), i.e. the pull is already done —
 	// the simplest happy path for the live-restore blockpull poll.
@@ -86,6 +87,7 @@ func New() *Fake {
 		snapshots:   make(map[string]map[string]struct{}),
 		diskSources: make(map[string]map[string]string),
 		stats:       make(map[string]*libvirt.DomainStats),
+		reasons:     make(map[string]string),
 		Now:         time.Now,
 	}
 }
@@ -258,6 +260,44 @@ func (f *Fake) DomainExists(name string) bool {
 	defer f.mu.Unlock()
 	_, ok := f.domains[name]
 	return ok
+}
+
+// SetStateReason injects the Reason returned by DomainStateReason for a domain
+// (e.g. "crashed" to drive an on-failure restart decision). Scenario helper.
+func (f *Fake) SetStateReason(name, reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reasons[name] = reason
+}
+
+// DomainStateReason returns the coarse state + a reason, satisfying
+// health.LibvirtBackend (the restart-policy path). The coarse vocabulary matches
+// libvirt.coarseDomainState: shutoff→"stopped", running→"running", else
+// "unknown". Reason defaults to "running" for a running domain (or an injected
+// value via SetStateReason), else "unknown".
+func (f *Fake) DomainStateReason(name string) (libvirt.DomainStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.domains[name]
+	if !ok {
+		return libvirt.DomainStatus{State: "unknown", Reason: "unknown"}, nil
+	}
+	coarse := "unknown"
+	switch s {
+	case StateRunning:
+		coarse = "running"
+	case StateShutdown: // == StateDefined == "shutoff"
+		coarse = "stopped"
+	}
+	reason := f.reasons[name]
+	if reason == "" {
+		if s == StateRunning {
+			reason = "running"
+		} else {
+			reason = "unknown"
+		}
+	}
+	return libvirt.DomainStatus{State: coarse, Reason: reason}, nil
 }
 
 func (f *Fake) ListDomains() ([]string, error) {

@@ -27,25 +27,41 @@ type Reconciler struct {
 	hostName         string
 	dataDir          string
 	db               *corrosion.Client
-	virt             *lv.Client
+	virt             LibvirtBackend
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
+
+	// Now is the reconciler's clock for vm_lock lease timestamps. Defaults to
+	// time.Now; the fleet harness overrides it so lock-expiry scenarios advance
+	// deterministically without sleeping.
+	Now func() time.Time
 }
 
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1) so the
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 
-// NewReconciler creates a VM reconciler for the local host.
-func NewReconciler(hostName, dataDir string, db *corrosion.Client, virt *lv.Client) *Reconciler {
+// NewReconciler creates a VM reconciler for the local host. virt is a
+// LibvirtBackend — production passes the real *libvirt.Client; tests/the fleet
+// harness pass a fake. A nil virt is tolerated (the reconcile loop guards every
+// use), so existing call sites that pass nil keep working.
+func NewReconciler(hostName, dataDir string, db *corrosion.Client, virt LibvirtBackend) *Reconciler {
 	return &Reconciler{
 		hostName: hostName,
 		dataDir:  dataDir,
 		db:       db,
 		virt:     virt,
 	}
+}
+
+// now returns the reconciler's clock (overridable via Now for tests).
+func (r *Reconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 // SetOnVMStarted registers a callback invoked after a pending VM is started.
@@ -545,8 +561,8 @@ const vmLockTTL = 10 * time.Minute
 // lock then discovered the VM moved, and we release without acting", not
 // "two hosts both started the VM."
 func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
-	now := time.Now().UTC().Format(time.RFC3339)
-	expires := time.Now().Add(vmLockTTL).UTC().Format(time.RFC3339)
+	now := r.now().UTC().Format(time.RFC3339)
+	expires := r.now().Add(vmLockTTL).UTC().Format(time.RFC3339)
 	// expired-check compares RFC3339-vs-RFC3339 (bound now), not datetime('now'):
 	// expires_at is RFC3339, so a string compare to datetime('now')'s space text
 	// breaks on a date match ('T' > ' ') and a same-day lock NEVER looks expired —

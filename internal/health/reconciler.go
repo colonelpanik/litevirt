@@ -83,6 +83,14 @@ func (r *Reconciler) SetBackupInProgress(fn func(vmName string) bool) {
 	r.backupInProgress = fn
 }
 
+// ReconcileOnce runs a single reconcile + self-fence pass — the body of the
+// periodic loop, exported for the fleet harness (and one-shot ops) to drive a
+// deterministic pass without waiting on the ticker.
+func (r *Reconciler) ReconcileOnce(ctx context.Context) {
+	r.reconcile(ctx)
+	r.selfFence(ctx)
+}
+
 // Start begins the reconcile loop. Blocks until ctx is cancelled.
 func (r *Reconciler) Start(ctx context.Context) {
 	ticker := time.NewTicker(reconcileInterval)

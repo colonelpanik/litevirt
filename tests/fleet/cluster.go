@@ -87,6 +87,10 @@ type Node struct {
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn
 
+	// repl is the node's Replicator (wired into the server for PushMutations;
+	// background loop not started — see buildServer).
+	repl *corrosion.Replicator
+
 	// partition gate: replication/state-sync RPCs whose mTLS caller CN is in
 	// blockedFrom are refused, modeling a network partition on the real
 	// transport. Guarded by partMu (Partition/Heal mutate it concurrently with
@@ -366,11 +370,16 @@ func (c *Cluster) buildServer(n *Node) {
 		Virt:     n.Virt,
 	})
 
-	// Replicator drives mutation_log → peer fan-out. Real PKI dir so
-	// peer TLS works over loopback.
-	repl := corrosion.NewReplicator(n.DB, n.PKIDir, corrosion.RelayConfig{})
-	n.Server.SetReplicator(repl)
-	_ = repl // Start() is called once gRPC is up
+	// Wire a real Replicator so the server's PushMutations handler + write-notify
+	// path are exercised. Its background push loop is deliberately NOT started: it
+	// discovers peers via memberlist (corrosion.Client.Members()), and the
+	// in-process fleet doesn't join a gossip mesh, so Members() is empty here and a
+	// started loop would be a no-op. Cross-node convergence is instead driven
+	// deterministically over the REAL anti-entropy repair RPC (StreamStateDump →
+	// MergeStateBytesLWW — the exact production path; see partition_test.go),
+	// rather than the gossip-timed ticker.
+	n.repl = corrosion.NewReplicator(n.DB, n.PKIDir, corrosion.RelayConfig{})
+	n.Server.SetReplicator(n.repl)
 
 	// Start the gRPC server on n.Listener.
 	tlsCfg, err := pki.ServerTLSConfig(n.PKIDir)

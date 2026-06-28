@@ -92,14 +92,18 @@ func (s *Server) applyStagedBinary(ctx context.Context, stagingPath string) erro
 	if err := copyFile(binaryPath, binaryPath+".old"); err != nil {
 		return fmt.Errorf("backup current binary: %w", err)
 	}
-	if err := os.Rename(stagingPath, binaryPath); err != nil {
-		return fmt.Errorf("swap binary: %w", err)
-	}
-	// Arm the post-upgrade health watchdog: the re-exec'd new binary must prove
-	// its local gRPC is pingable within the deadline or roll back to .old. The
-	// sentinel carries the version being replaced for the rollback log/metric.
+	// Arm the post-upgrade health-watchdog sentinel BEFORE swapping the binary in.
+	// The sentinel is the safety mechanism — without it the re-exec'd new binary
+	// would mark itself active with NO health check — so this is fail-CLOSED: if we
+	// can't arm it, we do NOT swap (the old binary keeps running). A sentinel
+	// sitting next to the still-current binary is harmless: if we crash before the
+	// swap, the current binary just self-confirms healthy and clears it.
 	if err := upgrade.Arm(binaryPath, s.version); err != nil {
-		slog.Warn("upgrade: failed to arm health-watchdog sentinel", "error", err)
+		return fmt.Errorf("arm health-watchdog sentinel: %w", err)
+	}
+	if err := os.Rename(stagingPath, binaryPath); err != nil {
+		upgrade.Clear(binaryPath) // no new binary was installed → nothing to watch
+		return fmt.Errorf("swap binary: %w", err)
 	}
 	// The new binary's startup transitions back to `active` once the watchdog
 	// confirms the local gRPC is healthy.

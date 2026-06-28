@@ -101,6 +101,17 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		return nil, status.Errorf(codes.Internal, "create: %v", err)
 	}
 
+	// Persist the create-time intent (incl. networking) so host-loss relocation /
+	// restore can rebuild this container faithfully, not as a bare image recreate.
+	createSpec := corrosion.ContainerCreateSpec{
+		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
+	}
+	for _, n := range req.Networks {
+		createSpec.Networks = append(createSpec.Networks, corrosion.ContainerNetwork{
+			Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac,
+		})
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: info.Name,
@@ -109,6 +120,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Labels: req.Labels, RestartPolicy: encodeRestartPolicy(req.Restart),
 		Project:       req.Project, // UpsertContainer normalizes "" → "_default"
 		OnHostFailure: req.OnHostFailure,
+		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
 		CreatedAt:     now,
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {

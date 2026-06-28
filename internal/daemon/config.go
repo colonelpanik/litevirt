@@ -106,6 +106,12 @@ type Config struct {
 	UpgradeWatchdogEnabled   bool `yaml:"upgrade_watchdog_enabled"`
 	UpgradeHealthDeadlineSec int  `yaml:"upgrade_health_deadline_sec"`
 
+	// ContainerRestoreTimeoutSec bounds how long the failover coordinator treats a
+	// relocate-restore marker as "in flight" before deciding the restore stalled
+	// and falling back to image-recreate. Default 600s (10m) — comfortably longer
+	// than a real rootfs restore.
+	ContainerRestoreTimeoutSec int `yaml:"container_restore_timeout_sec"`
+
 	// WebAuthn configures the second-factor enrolment dance. Required
 	// fields: rp_id (the bare host operators reach via the UI, e.g.
 	// "litevirt.corp") and rp_origins (full origins, e.g.
@@ -246,6 +252,8 @@ func LoadConfig() (*Config, error) {
 
 		UpgradeWatchdogEnabled:   true,
 		UpgradeHealthDeadlineSec: 120,
+
+		ContainerRestoreTimeoutSec: 600,
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

@@ -99,10 +99,17 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	}
 	slog.Info("containercheck: recreating relocated container from image",
 		"container", ct.Name, "image", ct.Image)
-	if _, err := c.runtime.Create(ctx, lxc.CreateOpts{
+	// Reconstruct litevirt-managed networking from the persisted create spec
+	// (v34) so an image-recreate isn't network-blind. Empty for pre-v34 rows →
+	// recreated with no managed NICs (prior behavior).
+	opts := lxc.CreateOpts{
 		Name: ct.Name, Template: ct.Image,
 		CPULimit: ct.CPULimit, MemoryMiB: ct.MemMiB, Labels: ct.Labels,
-	}); err != nil {
+	}
+	for _, n := range corrosion.DecodeCreateSpec(ct.CreateSpec).Networks {
+		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC})
+	}
+	if _, err := c.runtime.Create(ctx, opts); err != nil {
 		slog.Error("containercheck: relocate-recreate failed (will retry)",
 			"container", ct.Name, "image", ct.Image, "error", err)
 		c.publish("ct.relocate.failed", ct.Name, err.Error())

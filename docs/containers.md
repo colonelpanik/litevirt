@@ -332,15 +332,32 @@ every container clone is independent, so reverting a template is always safe.
 
 Opt a container in at create time: `lv ct create web --on-host-failure
 image-recreate` (default is `none` — left in place). If a host is fenced, the
-failover coordinator relocates its containers that carry that policy: it picks a
-healthy host via
-the placement engine, re-keys the container there, and the target's reconciler
-**recreates it from its image**. A container with no re-pullable image (a
-hand-built rootfs with no origin) can't be rebuilt this way — it's **skipped and
-loudly audited** (`ct.relocate.skipped`) so an operator knows to restore it from
-a backup. This is best-effort tier-1: the recreated container is a fresh instance
-of the image (networks/advanced config aren't preserved); the faithful path
-(restore the latest `lv ct backup`) is a planned tier-2.
+failover coordinator relocates its containers that carry that policy onto a
+healthy host (chosen via the placement engine), preferring the most faithful
+option available:
+
+1. **Restore from the latest backup** (`ct.relocate.restored`) — when a valid
+   backup manifest exists in a repo the survivor can reach and the survivor is
+   schema-compatible. The container is restored over peer mTLS (rootfs + the
+   create-time spec, so litevirt-managed **networking is preserved**). This is
+   driven idempotently: the coordinator marks the source row `relocating` (it
+   never pre-creates a target row), and only tombstones the source once the
+   restore lands — so a coordinator crash mid-restore re-derives correctly and
+   never double-restores or strands the container.
+2. **Recreate from image** (`ct.relocate.recreate`) — the fallback when no usable
+   backup exists (or the restore failed / the survivor is mid-upgrade). The
+   container is re-keyed and the target's reconciler rebuilds it from its
+   re-pullable image, reconstructing managed NICs from the persisted create spec.
+3. **Skip** (`ct.relocate.skipped`) — when neither is possible (e.g. a hand-built
+   rootfs with no re-pullable image and no backup). Loudly audited so an operator
+   knows to recover it manually.
+
+Restore-from-backup requires a backup repo reachable from the survivor (a
+registered repo name / shared NFS). `container_restore_timeout_sec`
+(default 10m) bounds how long a relocate-restore is treated as in-flight before
+the coordinator gives up and image-recreates. The create-time networking spec is
+persisted from schema **v34** — containers created/backed-up before v34 fall back
+to image-recreate (without managed-NIC reconstruction).
 
 ## Cold migration
 

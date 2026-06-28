@@ -173,6 +173,13 @@ vm_event_prune_hours: 24
 upgrade_watchdog_enabled: true        # false to disable (also LITEVIRT_UNSAFE_NO_UPGRADE_WATCHDOG=1)
 upgrade_health_deadline_sec: 120      # 0 → 120s; widen for very slow N-step schema migrates
 
+# Container host-loss relocation. When a host is fenced, the failover coordinator
+# relocates its containers (on_host_failure != none), preferring a faithful
+# restore from the latest backup (networking + non-image state) before falling
+# back to recreate-from-image. container_restore_timeout_sec bounds how long a
+# relocate-restore is treated as in-flight before giving up and image-recreating.
+container_restore_timeout_sec: 600    # 0 → 600s (10m)
+
 # ACME / autocert for the web UI cert (#13). When set, the daemon TERMINATES UI
 # TLS itself (port 7445) using a cert from the configured ACME directory, with an
 # internal-PKI fallback during issuance. Unset (default) = UI stays plain HTTP

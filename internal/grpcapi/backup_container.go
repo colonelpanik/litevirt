@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -33,11 +34,30 @@ type containerBackupSpec struct {
 	Labels        map[string]string `json:"labels,omitempty"`
 	RestartPolicy string            `json:"restart_policy,omitempty"`
 	Project       string            `json:"project"`
+	// v34: create-time intent (JSON ContainerCreateSpec: template/distro/release/
+	// arch/networks) + the relocation policy and template flag, so a restore — or a
+	// downstream host-loss relocation — rebuilds the container faithfully, incl.
+	// litevirt-managed networking. Empty for backups taken before v34; readers
+	// tolerate that and fall back to a bare image-recreate.
+	CreateSpec    string `json:"create_spec,omitempty"`
+	OnHostFailure string `json:"on_host_failure,omitempty"`
+	IsTemplate    bool   `json:"is_template,omitempty"`
 }
 
 // containerBackupDisk is the manifest "disk" name for a container — a container
 // has one logical volume, its rootfs.
 const containerBackupDisk = "rootfs"
+
+// restoreRowRecordedStatus is the progress-frame Status RestoreContainer sends
+// once it has recorded the cluster row (post-import, pre-start). A remote driver
+// uses it to detect a LANDED restore even if a later step (start) errors.
+const restoreRowRecordedStatus = "cluster-row-recorded"
+
+// relocateTokenMDKey is the gRPC metadata key carrying the failover coordinator's
+// attempt token to a restore-relocation. The target stamps it on the restored
+// row's relocate_token so the coordinator can prove the (target,name) row is ITS
+// restore. Passed via metadata (not a proto field) so no contract change.
+const relocateTokenMDKey = "x-litevirt-relocate-token"
 
 // BackupContainer freezes a container, streams its rootfs+config as a full,
 // content-addressed manifest into a host-local repo, and indexes the size for
@@ -146,6 +166,145 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	})
 }
 
+// RestoreContainerFromBackup restores ctName's latest valid backup onto
+// targetHost. It searches THIS daemon's configured repos for the newest valid
+// manifest, then drives the target's RestoreContainer over peer mTLS, passing the
+// registered repo NAME so the target resolves it in its OWN config (the
+// shared-repo assumption the migrate path already relies on).
+//
+// It returns landed=true once the TARGET reports it recorded the cluster row
+// (authoritative, even if a later start errors), so the failover coordinator
+// needn't consult its own replication-lagged replica to tell a landed restore
+// from a genuine failure. landed=false + err ⇒ fall back to image-recreate.
+// Satisfies failover.ContainerRestorer.
+func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost, token string) (corrosion.RestoreOutcome, error) {
+	repoName, timestamp, err := s.findLatestContainerBackup(ctName)
+	if err != nil {
+		return corrosion.RestoreNotAttempted, err
+	}
+	return s.driveRemoteRestore(ctx, targetHost, repoName, ctName, timestamp, token)
+}
+
+// relocateTokenFromMD reads the relocation attempt token from incoming gRPC
+// metadata (” for a direct, non-relocation restore).
+func relocateTokenFromMD(ctx context.Context) string {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if v := md.Get(relocateTokenMDKey); len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+// driveRemoteRestore opens RestoreContainer on the target over peer mTLS, drains
+// its progress stream, and classifies the result. The authoritative "row
+// recorded" signal is the target's restoreRowRecordedStatus frame (or a clean
+// DONE/EOF); a definite pre-row status code means nothing was written; anything
+// else after the RPC started is indeterminate (the row may have landed but the
+// frame/stream was lost) → RestoreUnknown, which the coordinator defers rather
+// than destructively falling back.
+func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string) (corrosion.RestoreOutcome, error) {
+	if s.migrateRestoreOverride != nil {
+		// Test seam (shared with MigrateContainer): a nil error ⇒ landed; an error
+		// is indeterminate (the override doesn't model where it failed).
+		if e := s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true); e != nil {
+			return corrosion.RestoreUnknown, e
+		}
+		return corrosion.RestoreLanded, nil
+	}
+	// Carry the attempt token to the target so it stamps the restored row.
+	if token != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, relocateTokenMDKey, token)
+	}
+	c, conn, derr := s.peerClient(ctx, target)
+	if derr != nil {
+		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", derr)
+	}
+	defer conn.Close()
+	rs, rerr := c.RestoreContainer(ctx, &pb.RestoreContainerRequest{
+		RepoPath: repoPath, Name: name, Timestamp: timestamp, HostName: target, Start: true,
+	})
+	if rerr != nil {
+		return corrosion.RestoreNotAttempted, rerr // RPC never established
+	}
+	landed := false
+	for {
+		p, e := rs.Recv()
+		if e == io.EOF {
+			return corrosion.RestoreLanded, nil // clean DONE ⇒ full success
+		}
+		if e != nil {
+			if landed {
+				return corrosion.RestoreLanded, nil // row recorded before the break
+			}
+			return classifyRestoreError(e), e
+		}
+		if p.Error != "" {
+			if landed {
+				return corrosion.RestoreLanded, nil
+			}
+			return corrosion.RestoreUnknown, fmt.Errorf("target restore: %s", p.Error)
+		}
+		if p.Status == restoreRowRecordedStatus {
+			landed = true
+		}
+	}
+}
+
+// classifyRestoreError maps a restore RPC error (received WITHOUT a prior
+// row-recorded frame) to an outcome. Definite pre-row status codes — the target
+// can't open the repo / find the manifest / isn't the target / unauthorized — are
+// conclusive (nothing of ours was written); anything else (Internal, or a
+// transport break that may have dropped the row-recorded frame after the row was
+// written) is indeterminate.
+//
+// AlreadyExists is NOT treated as "landed": container names aren't cluster-unique
+// (PK is (host_name,name)), so it means the target already holds SOME live
+// container of that name — possibly UNRELATED. Without provenance we must not
+// claim our restore landed there (that would tombstone the source over an
+// unrelated container), so it's a pre-row failure; the coordinator's
+// collision-aware fallback then declines to clobber it.
+func classifyRestoreError(err error) corrosion.RestoreOutcome {
+	switch status.Code(err) {
+	case codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied, codes.Unimplemented, codes.AlreadyExists:
+		return corrosion.RestoreFailedBeforeRow
+	default:
+		return corrosion.RestoreUnknown
+	}
+}
+
+// findLatestContainerBackup scans the daemon's configured repos for the newest
+// structurally-valid rootfs manifest of ctName, returning the registered repo
+// NAME (not path) + the manifest timestamp. A registered name is preferred so
+// the target can resolve the same repo via its own config.
+func (s *Server) findLatestContainerBackup(ctName string) (repoName, timestamp string, err error) {
+	if len(s.backupRepos) == 0 {
+		return "", "", fmt.Errorf("no backup repos configured")
+	}
+	var bestName, bestTS string
+	for name, path := range s.backupRepos {
+		repo, oerr := pbsstore.Open(path)
+		if oerr != nil {
+			continue // repo not openable from here — skip
+		}
+		m, ok, merr := repo.LatestManifestFor(ctName, containerBackupDisk)
+		if merr != nil || !ok || m == nil {
+			continue
+		}
+		if pbsstore.ValidateManifest(m) != nil {
+			continue // structurally invalid → not restorable
+		}
+		// Manifest timestamps are RFC3339 (lexical == chronological).
+		if m.Timestamp > bestTS {
+			bestTS, bestName = m.Timestamp, name
+		}
+	}
+	if bestName == "" {
+		return "", "", fmt.Errorf("no valid backup manifest for %q in configured repos", ctName)
+	}
+	return bestName, bestTS, nil
+}
+
 // archiveContainer streams a container's whole on-disk directory (rootfs + LXC
 // config) into repo as a full, content-addressed manifest, embedding its spec
 // so a restore is self-contained. The caller holds the ct lock and has already
@@ -155,6 +314,7 @@ func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec 
 	specJSON, _ := json.Marshal(containerBackupSpec{
 		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
 		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
+		CreateSpec: rec.CreateSpec, OnHostFailure: rec.OnHostFailure, IsTemplate: rec.IsTemplate,
 	})
 	// Pipe the export tar straight into the chunk store so we never buffer the
 	// whole rootfs. If PushDisk returns early (error), CloseWithError unblocks
@@ -290,13 +450,43 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		Image: spec.Image, CPULimit: spec.CPULimit, MemMiB: spec.MemMiB,
 		Labels: spec.Labels, RestartPolicy: spec.RestartPolicy,
 		Project: tenancy.NormalizeProject(project),
+		// Carry forward the create-time intent + relocation policy/template flag so
+		// a future host-loss relocation of THIS restored container is faithful.
+		// Empty CreateSpec (pre-v34 backup) is tolerated downstream.
+		CreateSpec:    spec.CreateSpec,
+		OnHostFailure: spec.OnHostFailure,
+		IsTemplate:    spec.IsTemplate,
+		// Stamp the failover coordinator's attempt token (if this is a
+		// restore-relocation) so it can prove this row is its restore.
+		RelocateToken: relocateTokenFromMD(ctx),
 	}
+	// The cluster-row write is MANDATORY. A restore that imported the runtime
+	// container but failed to record the row would strand an untracked container —
+	// and at failover the coordinator could tombstone the source believing the
+	// move completed (point: relocate-restore relies on "row exists ⇒ restore
+	// landed"). On failure, best-effort delete the just-imported container so
+	// nothing untracked is left, then error out.
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
-		slog.Warn("container restore: cluster row write failed", "name", req.Name, "error", err)
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+			slog.Warn("container restore: failed to clean up imported container after row-write failure",
+				"name", req.Name, "error", delErr)
+		}
+		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+		return status.Errorf(codes.Internal, "restore: record cluster row: %v", err)
 	}
+	// Signal that the cluster row has been recorded — the restore has LANDED. A
+	// remote driver (failover RestoreContainerFromBackup) keys off this frame to
+	// distinguish a landed restore whose later start failed from a genuine restore
+	// failure, WITHOUT consulting its own (possibly replication-lagged) view of the
+	// target row.
+	_ = send(&pb.RestoreContainerProgress{Phase: pb.RestoreContainerProgress_IMPORT, Status: restoreRowRecordedStatus})
 
 	if req.Start {
 		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
+			// Partial success: the container is restored AND tracked (row stays
+			// 'stopped'), so the reconciler / restart policy can start it later. We
+			// return an error but deliberately do NOT delete the row — a tracked
+			// stopped container is recoverable; an ambiguous half-state is not.
 			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (start failed)", "error")
 			return status.Errorf(codes.Internal, "restored but start failed: %v", err)
 		}

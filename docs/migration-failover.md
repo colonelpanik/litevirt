@@ -184,13 +184,18 @@ archive → restore on target → restart if it was running). `--repo` must be
 reachable from both hosts. No live/CRIU migration.
 
 **Host-loss relocation** — when a host is fenced, the failover coordinator
-relocates its containers that carry an `on_host_failure: image-recreate` policy
-(set with `lv ct create --on-host-failure image-recreate`): it picks a healthy
-host via the placement engine, re-keys the container there, and the target's
-reconciler **recreates it from its image**. A container with no re-pullable image
-is **skipped and loudly audited** (`ct.relocate.skipped`) — recover it from a
-backup. Tier-1 recreate is best-effort (networks/advanced config not preserved);
-restore-from-backup relocation is a planned follow-up. See
+relocates its containers that carry an `on_host_failure` policy (set with
+`lv ct create --on-host-failure image-recreate`) onto a placement-chosen healthy
+host, preferring the most faithful option: **restore from the latest backup**
+(`ct.relocate.restored` — preserves networking + non-image state, when a
+reachable repo holds a valid manifest and the survivor is schema-compatible),
+falling back to **recreate from image** (`ct.relocate.recreate` — managed NICs
+reconstructed from the persisted create spec), and finally **skip** a container
+that's neither restorable nor re-pullable (`ct.relocate.skipped`, left visible for
+operator recovery). The restore path is idempotent + crash-recoverable (source
+marker `relocate-restore:<target>:<token>`, where the attempt token is stamped on
+the restored target row so the coordinator only completes the handoff against a
+row proven to be its own restore; `container_restore_timeout_sec`). See
 [containers.md](containers.md#host-loss-relocation).
 
 ## Monitoring

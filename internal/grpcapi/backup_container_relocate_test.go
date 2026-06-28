@@ -107,3 +107,47 @@ func TestRestoreContainer_RowWriteFailureCleansUp(t *testing.T) {
 		t.Fatalf("imported container must be deleted on row-write failure; deleteCalls=%v", rt.deleteCalls)
 	}
 }
+
+// TestRestoreContainerFromBackup_FindsManifestAndDrives covers the coordinator
+// entry point: no manifest → (false, err); after a backup it finds the newest
+// manifest, passes the registered repo NAME to the target, and reports landed
+// from the drive.
+func TestRestoreContainerFromBackup_FindsManifestAndDrives(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
+	s.SetBackupRepos(map[string]string{"main": repo})
+
+	// No backup yet → no manifest → not landed, error.
+	if landed, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b"); err == nil || landed {
+		t.Fatalf("want (false, err) with no manifest, got (%v, %v)", landed, err)
+	}
+
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running", Image: "alpine:3.19", Project: "acme",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "ct1", HostName: "host-a", RepoPath: "main", Timestamp: "2026-06-27T12:00:00Z",
+	}, bk); err != nil {
+		t.Fatalf("BackupContainer: %v", err)
+	}
+
+	var gotRepo, gotName, gotTs string
+	s.migrateRestoreOverride = func(_ context.Context, target, repoPath, name, ts string, start bool) error {
+		gotRepo, gotName, gotTs = repoPath, name, ts
+		return nil
+	}
+	landed, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b")
+	if err != nil || !landed {
+		t.Fatalf("want (true, nil), got (%v, %v)", landed, err)
+	}
+	if gotName != "ct1" || gotTs != "2026-06-27T12:00:00Z" || gotRepo != "main" {
+		t.Fatalf("drove restore repo=%q name=%q ts=%q; want the registered NAME 'main' + ct1 + ts", gotRepo, gotName, gotTs)
+	}
+}

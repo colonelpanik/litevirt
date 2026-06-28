@@ -47,6 +47,11 @@ type containerBackupSpec struct {
 // has one logical volume, its rootfs.
 const containerBackupDisk = "rootfs"
 
+// restoreRowRecordedStatus is the progress-frame Status RestoreContainer sends
+// once it has recorded the cluster row (post-import, pre-start). A remote driver
+// uses it to detect a LANDED restore even if a later step (start) errors.
+const restoreRowRecordedStatus = "cluster-row-recorded"
+
 // BackupContainer freezes a container, streams its rootfs+config as a full,
 // content-addressed manifest into a host-local repo, and indexes the size for
 // quota. Containers are host-local, so this runs on the owning host; if the
@@ -156,18 +161,58 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 
 // RestoreContainerFromBackup restores ctName's latest valid backup onto
 // targetHost. It searches THIS daemon's configured repos for the newest valid
-// manifest, then drives the target's RestoreContainer over peer mTLS (reusing
-// migrateRestore), passing the registered repo NAME so the target resolves it in
-// its OWN config (the shared-repo assumption the migrate path already relies on).
-// Returns an error when no manifest is found or the target can't restore — the
-// failover coordinator falls back to image-recreate. Satisfies
-// failover.ContainerRestorer.
-func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) error {
+// manifest, then drives the target's RestoreContainer over peer mTLS, passing the
+// registered repo NAME so the target resolves it in its OWN config (the
+// shared-repo assumption the migrate path already relies on).
+//
+// It returns landed=true once the TARGET reports it recorded the cluster row
+// (authoritative, even if a later start errors), so the failover coordinator
+// needn't consult its own replication-lagged replica to tell a landed restore
+// from a genuine failure. landed=false + err ⇒ fall back to image-recreate.
+// Satisfies failover.ContainerRestorer.
+func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) (landed bool, err error) {
 	repoName, timestamp, err := s.findLatestContainerBackup(ctName)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return s.migrateRestore(ctx, targetHost, repoName, ctName, timestamp, true)
+	return s.driveRemoteRestore(ctx, targetHost, repoName, ctName, timestamp)
+}
+
+// driveRemoteRestore opens RestoreContainer on the target over peer mTLS and
+// drains its progress stream, reporting whether the restore landed (the target
+// emitted restoreRowRecordedStatus) regardless of any subsequent error.
+func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp string) (landed bool, err error) {
+	if s.migrateRestoreOverride != nil {
+		// Test seam (shared with MigrateContainer): a nil error ⇒ landed.
+		e := s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true)
+		return e == nil, e
+	}
+	c, conn, derr := s.peerClient(ctx, target)
+	if derr != nil {
+		return false, fmt.Errorf("dial target: %w", derr)
+	}
+	defer conn.Close()
+	rs, rerr := c.RestoreContainer(ctx, &pb.RestoreContainerRequest{
+		RepoPath: repoPath, Name: name, Timestamp: timestamp, HostName: target, Start: true,
+	})
+	if rerr != nil {
+		return false, rerr
+	}
+	for {
+		p, e := rs.Recv()
+		if e == io.EOF {
+			return true, nil // clean DONE ⇒ full success
+		}
+		if e != nil {
+			return landed, e // landed reflects whether the row-recorded frame arrived first
+		}
+		if p.Error != "" {
+			return landed, fmt.Errorf("target restore: %s", p.Error)
+		}
+		if p.Status == restoreRowRecordedStatus {
+			landed = true
+		}
+	}
 }
 
 // findLatestContainerBackup scans the daemon's configured repos for the newest
@@ -368,6 +413,12 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 		return status.Errorf(codes.Internal, "restore: record cluster row: %v", err)
 	}
+	// Signal that the cluster row has been recorded — the restore has LANDED. A
+	// remote driver (failover RestoreContainerFromBackup) keys off this frame to
+	// distinguish a landed restore whose later start failed from a genuine restore
+	// failure, WITHOUT consulting its own (possibly replication-lagged) view of the
+	// target row.
+	_ = send(&pb.RestoreContainerProgress{Phase: pb.RestoreContainerProgress_IMPORT, Status: restoreRowRecordedStatus})
 
 	if req.Start {
 		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {

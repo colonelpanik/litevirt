@@ -15,21 +15,22 @@ import (
 type fakeRestorer struct {
 	calls int
 	err   error
-	// createThenErr models RestoreContainer's "row written, then start failed":
-	// the target row is created AND an error is returned.
-	createThenErr bool
-	db            *corrosion.Client
+	// landed is the TARGET's authoritative "row recorded" signal returned to the
+	// coordinator (true even when err != nil models "restored but start failed").
+	landed bool
+	db     *corrosion.Client
 }
 
-func (f *fakeRestorer) RestoreContainerFromBackup(ctx context.Context, ctName, target string) error {
+func (f *fakeRestorer) RestoreContainerFromBackup(ctx context.Context, ctName, target string) (bool, error) {
 	f.calls++
-	if f.err == nil || f.createThenErr {
+	if f.landed {
+		// Simulate the target having recorded its (eventually-replicated) row.
 		_ = corrosion.UpsertContainer(ctx, f.db, corrosion.ContainerRecord{
 			HostName: target, Name: ctName, State: "stopped", Image: "alpine:3.19",
 			OnHostFailure: "image-recreate",
 		})
 	}
-	return f.err
+	return f.landed, f.err
 }
 
 // relocateSetup builds a fenced source host + a survivor and a container on the
@@ -71,7 +72,7 @@ func TestRelocate_RestorePreferred(t *testing.T) {
 	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
 	ctx := context.Background()
 	c := newTestCoordinator("coord", db)
-	fr := &fakeRestorer{db: db}
+	fr := &fakeRestorer{db: db, landed: true}
 	c.Restorer = fr
 
 	idx := 0
@@ -144,13 +145,13 @@ func TestRelocate_RestoreRowExistsDespiteError(t *testing.T) {
 	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
 	ctx := context.Background()
 	c := newTestCoordinator("coord", db)
-	c.Restorer = &fakeRestorer{db: db, err: errors.New("restored but start failed"), createThenErr: true}
+	c.Restorer = &fakeRestorer{db: db, err: errors.New("restored but start failed"), landed: true}
 
 	idx := 0
 	c.relocateContainers(ctx, src, cands, &idx)
 
 	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow != nil {
-		t.Fatal("source must be tombstoned: the restore landed (target row exists) despite the error")
+		t.Fatal("source must be tombstoned: the target signaled the restore landed despite the error")
 	}
 	tgt, _ := corrosion.GetContainer(ctx, db, "surv", "ct1")
 	if tgt == nil || tgt.StateDetail == corrosion.ContainerRelocateRecreateDetail {

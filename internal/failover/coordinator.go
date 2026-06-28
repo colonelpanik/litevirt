@@ -69,7 +69,12 @@ type ReplicaPromoter interface {
 // (networking + non-image state) over a bare image-recreate. Optional — nil
 // disables tier-2 and the coordinator always image-recreates.
 type ContainerRestorer interface {
-	RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) error
+	// RestoreContainerFromBackup drives the restore on targetHost. landed reports
+	// whether the TARGET recorded its cluster row (the restore took effect) even if
+	// err is non-nil because a later step (start) failed — an authoritative,
+	// replication-lag-free signal so the coordinator needn't read its own replica
+	// of the target row. landed=false + err ⇒ genuine failure (fall back).
+	RestoreContainerFromBackup(ctx context.Context, ctName, targetHost string) (landed bool, err error)
 }
 
 // Coordinator watches for host failures and triggers failover.
@@ -858,18 +863,19 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 		}
 		// We do NOT pre-create a target row — RestoreContainer refuses an existing
 		// row, and a genuinely-failed restore must leave none.
-		err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target)
+		landed, err := c.Restorer.RestoreContainerFromBackup(ctx, ct.Name, target)
 		if err == nil {
 			c.completeRestore(ctx, h, ct, target)
 			return
 		}
 		// A restore error doesn't always mean nothing landed: RestoreContainer
-		// writes the target row BEFORE attempting start, then errors if start fails
-		// (leaving a valid, tracked 'stopped' row). If the target row exists, the
-		// handoff completed — do NOT image-recreate over it. Mirrors the
-		// crash-recovery check in resumeRestoreRelocation.
-		if tgt, _ := corrosion.GetContainer(ctx, c.db, target, ct.Name); tgt != nil {
-			slog.Warn("failover: restore reported an error but the target row exists (e.g. start failed) — treating as complete",
+		// writes the target row BEFORE attempting start, then errors if start fails.
+		// `landed` is the TARGET's authoritative signal (it recorded the row) — used
+		// instead of reading our own replica, which in a real cluster may not have
+		// caught up in this same tick. landed ⇒ the handoff completed; do NOT
+		// image-recreate over a valid restored container.
+		if landed {
+			slog.Warn("failover: restore landed on the target but a later step (start) failed — treating as complete",
 				"container", ct.Name, "target", target, "error", err)
 			c.completeRestore(ctx, h, ct, target)
 			return

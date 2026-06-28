@@ -104,16 +104,23 @@ func (d *Daemon) runUpgradeWatchdog(ctx context.Context, binaryPath string, sent
 	}
 }
 
-// confirmUpgradeHealthy is the success action: clear the sentinel and flip the
-// host upgrading→active. Extracted so it's directly testable without standing up
-// a gRPC server for the Ping loop.
+// confirmUpgradeHealthy is the success action: flip the host upgrading→active,
+// then clear the sentinel. Extracted so it's directly testable without standing
+// up a gRPC server for the Ping loop.
+//
+// Order matters: the active-state write happens FIRST and the sentinel is
+// cleared only if it succeeds. Clearing first would strand the host in
+// 'upgrading' with no watchdog if that (transient) write failed; by keeping the
+// sentinel, the next boot's watchdog re-confirms and retries the flip.
 func (d *Daemon) confirmUpgradeHealthy(binaryPath string) {
-	upgrade.Clear(binaryPath)
 	mctx, mcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer mcancel()
 	if err := corrosion.UpdateHostState(mctx, d.db, d.cfg.HostName, "active"); err != nil {
-		slog.Warn("post-upgrade watchdog: confirmed healthy but failed to mark host active", "error", err)
+		slog.Warn("post-upgrade watchdog: confirmed healthy but failed to mark host active — keeping sentinel for retry next boot", "error", err)
+		metrics.UpgradeWatchdogOutcome("confirm_failed")
+		return
 	}
+	upgrade.Clear(binaryPath)
 	slog.Info("post-upgrade watchdog: new binary healthy (local gRPC ping ok)", "version", d.cfg.Version)
 	metrics.UpgradeWatchdogOutcome("confirmed")
 }

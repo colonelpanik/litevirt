@@ -225,7 +225,7 @@ they'd break the previous binary equally, so rolling back would just flap.
 `upgrade_health_deadline_sec` (default `120`, wide enough for a slow N-step
 schema migrate). Override-disable with `LITEVIRT_UNSAFE_NO_UPGRADE_WATCHDOG=1`.
 Outcomes are exported as `litevirt_upgrade_watchdog_total{outcome}`
-(`confirmed` / `rollback` / `giveup` / `no_old`).
+(`confirmed` / `confirm_failed` / `rollback` / `giveup` / `no_old`).
 
 **Binary path.** The watchdog targets the **actually-running** binary
 (`os.Executable()`, matching the upgrade swap and the re-exec), so it is correct

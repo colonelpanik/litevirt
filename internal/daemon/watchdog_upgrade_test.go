@@ -112,6 +112,37 @@ func TestConfirmUpgradeHealthy(t *testing.T) {
 	}
 }
 
+// TestConfirmUpgradeHealthy_RetainsSentinelOnWriteFailure proves the sentinel is
+// NOT cleared when the active-state write fails — so a transient DB error can't
+// strand the host in 'upgrading' with no watchdog; the next boot re-confirms.
+func TestConfirmUpgradeHealthy_RetainsSentinelOnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := corrosion.NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	// Force the state write to fail by removing the table it targets.
+	if err := db.Execute(ctx, `DROP TABLE hosts`); err != nil {
+		t.Fatalf("drop hosts: %v", err)
+	}
+
+	bin := filepath.Join(t.TempDir(), "litevirt")
+	if err := upgrade.Arm(bin, "v-old"); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+
+	d := &Daemon{cfg: &Config{HostName: "h"}, db: db}
+	d.confirmUpgradeHealthy(bin)
+
+	if _, ok := upgrade.Read(bin); !ok {
+		t.Fatal("sentinel must be RETAINED when the active-state write fails (so the next boot retries)")
+	}
+}
+
 // TestStartUpgradeWatchdog_Disabled confirms the watchdog is inert when disabled
 // and never sets upgradePending.
 func TestStartUpgradeWatchdog_Disabled(t *testing.T) {

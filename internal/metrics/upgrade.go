@@ -13,7 +13,7 @@ var (
 
 // UpgradeWatchdogOutcome records a post-upgrade health-watchdog outcome:
 //
-//	confirmed | rollback | giveup | no_old
+//	confirmed | confirm_failed | rollback | giveup | no_old
 //
 // It registers lazily on the default registry on first use, so it works even
 // when called before the metrics HTTP server is constructed — the watchdog arms
@@ -22,7 +22,7 @@ func UpgradeWatchdogOutcome(outcome string) {
 	upgradeWatchdogOnce.Do(func() {
 		upgradeWatchdogTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_upgrade_watchdog_total",
-			Help: "Post-upgrade health-watchdog outcomes (confirmed, rollback, giveup, no_old).",
+			Help: "Post-upgrade health-watchdog outcomes (confirmed, confirm_failed, rollback, giveup, no_old).",
 		}, []string{"outcome"})
 		prometheus.DefaultRegisterer.MustRegister(upgradeWatchdogTotal)
 	})

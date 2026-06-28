@@ -17,6 +17,18 @@ import (
 	"github.com/litevirt/litevirt/internal/hlc"
 )
 
+// SyncMetrics is the optional, nil-safe observability sink for anti-entropy
+// dump/digest/merge timing. It is defined here (not imported from
+// internal/metrics) so the corrosion package stays free of a Prometheus
+// dependency and the metrics package — which already imports corrosion — can
+// implement it without an import cycle. *metrics.AntiEntropyMetrics satisfies it
+// structurally.
+type SyncMetrics interface {
+	ObserveDump(d time.Duration, bytes int)
+	ObserveDigest(d time.Duration)
+	ObserveMerge(d time.Duration, merged, skipped int)
+}
+
 // Config holds configuration for the embedded state store.
 type Config struct {
 	HostName  string   // identity of this node
@@ -54,11 +66,41 @@ type Client struct {
 	// migrate. 0 = not yet seeded → EffectiveDBSchema() falls back to the const.
 	effectiveDBSchema atomic.Int32
 
+	// syncMetrics is the optional, nil-safe anti-entropy timing sink, set once at
+	// daemon startup via SetSyncMetrics. It lives on the Client (not the
+	// AntiEntropy loop) so dumps served directly through grpcapi (DumpStateBytes /
+	// StreamStateDump) are observed too.
+	syncMetrics SyncMetrics
+
 	// tsMu guards lastTS, the monotonic source behind NowTS(). Kept separate from
 	// mu so timestamp generation (called before a write acquires mu) never
 	// contends with or re-enters the main lock.
 	tsMu   sync.Mutex
 	lastTS time.Time
+}
+
+// SetSyncMetrics installs the anti-entropy timing sink. Nil-safe; call once at
+// daemon startup before the replicator / anti-entropy loops start.
+func (c *Client) SetSyncMetrics(m SyncMetrics) { c.syncMetrics = m }
+
+// observeDump / observeDigest / observeMerge are nil-safe wrappers so the
+// dump/digest/merge paths can record unconditionally.
+func (c *Client) observeDump(d time.Duration, bytes int) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveDump(d, bytes)
+	}
+}
+
+func (c *Client) observeDigest(d time.Duration) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveDigest(d)
+	}
+}
+
+func (c *Client) observeMerge(d time.Duration, merged, skipped int) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveMerge(d, merged, skipped)
+	}
 }
 
 // nowTSLayout is fixed-width RFC3339 with 9 fractional digits so values sort

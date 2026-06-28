@@ -241,6 +241,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.refreshDBPoolCapacity(ctx)
 	go d.refreshStoragePools(ctx)
 
+	// Install the anti-entropy timing sink on the Client BEFORE starting the
+	// replicator / anti-entropy loops (and the gRPC server) that read it — the
+	// field is set-once-then-read, so wiring it here establishes happens-before
+	// and avoids a data race with those goroutines. It lives on the Client so
+	// dumps served directly through grpcapi (DumpStateBytes / StreamStateDump)
+	// are observed too.
+	d.db.SetSyncMetrics(metrics.NewAntiEntropyMetrics())
+
 	// Start WAL-based replicator with Crescent relay protocol.
 	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, corrosion.RelayConfig{
 		BaseRelays:      3,

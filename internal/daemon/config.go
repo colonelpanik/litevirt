@@ -95,6 +95,17 @@ type Config struct {
 	TombstoneGCRetentionHours       int `yaml:"tombstone_gc_retention_hours"`
 	TombstoneGCOrphanRetentionHours int `yaml:"tombstone_gc_orphan_retention_hours"`
 
+	// Post-upgrade health watchdog: after a self-upgrade re-exec, an armed
+	// watchdog verifies the NEW binary's local gRPC becomes pingable within
+	// UpgradeHealthDeadlineSec; if not, it rolls back to the previous binary
+	// (.old) and exits so systemd restarts the restored binary. Only catches
+	// binary-INTRINSIC faults (gRPC never serves); systemd's OnFailure still
+	// handles crash-loops. Enabled by default; deadline defaults to 120s (wide
+	// enough for a slow N-step schema migrate). Override-disable for an
+	// environment that swaps binaries out-of-band: LITEVIRT_UNSAFE_NO_UPGRADE_WATCHDOG=1.
+	UpgradeWatchdogEnabled   bool `yaml:"upgrade_watchdog_enabled"`
+	UpgradeHealthDeadlineSec int  `yaml:"upgrade_health_deadline_sec"`
+
 	// WebAuthn configures the second-factor enrolment dance. Required
 	// fields: rp_id (the bare host operators reach via the UI, e.g.
 	// "litevirt.corp") and rp_origins (full origins, e.g.
@@ -232,6 +243,9 @@ func LoadConfig() (*Config, error) {
 		VMEventErrorRetentionDays: 90,
 		VMEventMaxPerVM:           1000,
 		VMEventPruneHours:         24,
+
+		UpgradeWatchdogEnabled:   true,
+		UpgradeHealthDeadlineSec: 120,
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

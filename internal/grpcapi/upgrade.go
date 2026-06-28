@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/upgrade"
 )
 
 // UpgradeHost receives a new binary over gRPC streaming, swaps it in,
@@ -91,10 +92,21 @@ func (s *Server) applyStagedBinary(ctx context.Context, stagingPath string) erro
 	if err := copyFile(binaryPath, binaryPath+".old"); err != nil {
 		return fmt.Errorf("backup current binary: %w", err)
 	}
+	// Arm the post-upgrade health-watchdog sentinel BEFORE swapping the binary in.
+	// The sentinel is the safety mechanism — without it the re-exec'd new binary
+	// would mark itself active with NO health check — so this is fail-CLOSED: if we
+	// can't arm it, we do NOT swap (the old binary keeps running). A sentinel
+	// sitting next to the still-current binary is harmless: if we crash before the
+	// swap, the current binary just self-confirms healthy and clears it.
+	if err := upgrade.Arm(binaryPath, s.version); err != nil {
+		return fmt.Errorf("arm health-watchdog sentinel: %w", err)
+	}
 	if err := os.Rename(stagingPath, binaryPath); err != nil {
+		upgrade.Clear(binaryPath) // no new binary was installed → nothing to watch
 		return fmt.Errorf("swap binary: %w", err)
 	}
-	// The new binary's startup transitions back to `active` once healthy.
+	// The new binary's startup transitions back to `active` once the watchdog
+	// confirms the local gRPC is healthy.
 	if err := corrosion.UpdateHostState(ctx, s.db, s.hostName, "upgrading"); err != nil {
 		slog.Warn("upgrade: failed to mark host upgrading", "error", err)
 	}

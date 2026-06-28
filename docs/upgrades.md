@@ -189,20 +189,49 @@ systemctl status litevirt                # should be active again, on the .old b
 litevirt --version                       # confirms the rolled-back version
 ```
 
-### Limitations
+The systemd rollback unit handles the **panic-loop** case: a binary that
+crashes/exits on startup. The **post-upgrade health watchdog** (below) covers
+the complementary "starts but doesn't function" gap. Together they do NOT cover:
 
-The rollback handles the **panic-loop** case: a binary that crashes on
-startup. It does NOT cover:
+- Subtle regressions that don't trip either mechanism (e.g., wrong placement
+  decisions — the binary is intrinsically functional). Catch these with
+  metrics + alerts, not auto-rollback.
 
-- A new binary that *starts* but doesn't *function* (e.g., hangs in
-  `InitSchema`). systemd's `Restart=on-failure` doesn't fire because the
-  process never exited. Operator must intervene.
-- Subtle regressions that don't trip systemd's failure detection
-  (e.g., wrong placement decisions). Catch these with metrics + alerts,
-  not the rollback unit.
+## Post-upgrade health watchdog
 
-A health-check-after-restart watchdog is a planned follow-up for the
-"starts but doesn't function" gap.
+When the upgrade RPC (or the `from_peer` self-upgrade) swaps in a new binary, it
+arms a node-local **sentinel** next to the binary (`<binary>.upgrade-pending`).
+On the re-exec, the new daemon's watchdog — armed *first*, before any
+potentially-hanging init, so a hung boot is still caught — verifies the binary is
+**intrinsically functional**: it self-`Ping`s the local gRPC endpoint over real
+mTLS (the local host cert; the cert includes `127.0.0.1`) until a deadline.
+
+- **Healthy** (Ping succeeds before the deadline) → clears the sentinel and flips
+  the host `upgrading → active`. (On an upgrade boot the host deliberately stays
+  `upgrading` until this confirmation; version/resources are written immediately
+  regardless.)
+- **Unhealthy** (local gRPC never answers within the deadline — e.g. a hung
+  `InitSchema`, or a daemon that serves but is wedged) → restores `<binary>.old`
+  over the running path and exits non-zero so systemd restarts the **restored**
+  binary. This is a **one-attempt** flap guard: the sentinel records the attempt,
+  so if the restored binary is *also* unhealthy the watchdog gives up rather than
+  flap, deferring to `StartLimitBurst` / the failover coordinator.
+
+**Scope — binary-intrinsic faults only.** Environmental faults (libvirt down,
+replication backlog, broken PKI) are deliberately NOT gated by the watchdog:
+they'd break the previous binary equally, so rolling back would just flap.
+
+**Config.** `upgrade_watchdog_enabled` (default `true`) and
+`upgrade_health_deadline_sec` (default `120`, wide enough for a slow N-step
+schema migrate). Override-disable with `LITEVIRT_UNSAFE_NO_UPGRADE_WATCHDOG=1`.
+Outcomes are exported as `litevirt_upgrade_watchdog_total{outcome}`
+(`confirmed` / `confirm_failed` / `rollback` / `giveup` / `no_old`).
+
+**Binary path.** The watchdog targets the **actually-running** binary
+(`os.Executable()`, matching the upgrade swap and the re-exec), so it is correct
+for any install path. The systemd rollback *unit* still references the canonical
+`/usr/local/bin/litevirt` (as does its `ExecStart`); on a standard systemd
+install these coincide.
 
 ---
 

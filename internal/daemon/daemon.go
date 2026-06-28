@@ -496,8 +496,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// effectively (every schedule errors with ErrNoRepoConfigured until
 	// the operator adds a repo).
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
-	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
-	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second)
+	svc.SetBackupRepos(d.cfg.BackupRepos)               // let RPC handlers resolve repo names
+	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
+	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)
 	d.snapScheduler.ReplRunner = svc // *grpcapi.Server implements RunReplication
 	go d.snapScheduler.Run(ctx)
 

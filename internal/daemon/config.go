@@ -87,6 +87,14 @@ type Config struct {
 	VMEventMaxPerVM           int `yaml:"vm_event_max_per_vm"`
 	VMEventPruneHours         int `yaml:"vm_event_prune_hours"`
 
+	// Superseded-row GC retention. The core retention applies to provably-inert
+	// rows (superseded recovery-code sets / stale LB generations); the longer
+	// orphan retention applies to rows whose owning pointer/config is absent
+	// (malformed-state cleanup). 0 → defaults (24h / 168h). An hourly local sweep
+	// hard-deletes past these cutoffs (see corrosion.GCSupersededRows).
+	TombstoneGCRetentionHours       int `yaml:"tombstone_gc_retention_hours"`
+	TombstoneGCOrphanRetentionHours int `yaml:"tombstone_gc_orphan_retention_hours"`
+
 	// WebAuthn configures the second-factor enrolment dance. Required
 	// fields: rp_id (the bare host operators reach via the UI, e.g.
 	// "litevirt.corp") and rp_origins (full origins, e.g.

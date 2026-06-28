@@ -365,6 +365,21 @@ func (c *Client) execLocal(ctx context.Context, sqlStr string, params ...interfa
 	return err
 }
 
+// execLocalRows is execLocal that also reports rows affected. Like execLocal it
+// is LOCAL-only (no mutation_log row, not replicated) — for deterministic
+// per-node maintenance (e.g. GC of superseded rows) where the caller wants a
+// deleted-row count for metrics/logging.
+func (c *Client) execLocalRows(ctx context.Context, sqlStr string, params ...interface{}) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	res, err := c.db.ExecContext(ctx, sqlStr, params...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // execBatchLocal runs multiple statements in ONE transaction locally, WITHOUT
 // writing a mutation_log row or notifying the replicator. It is the
 // non-replicating sibling of executeBatchInternal, for DDL/schema work that

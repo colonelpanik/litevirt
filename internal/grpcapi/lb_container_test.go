@@ -274,9 +274,10 @@ func TestCollectLBBackends_MixedVMAndContainer(t *testing.T) {
 	}
 }
 
-// containerBackendIP prefers the recorded static label, then falls back to a
-// local lxc-info lookup for a container on this host (DHCP NICs); a remote
-// container with no recorded IP is left unresolved.
+// containerBackendIP prefers the recorded static label, then the replicated
+// managed-NIC IP, then a local lxc-info lookup for a running container on this
+// host; a remote container with no recorded IP is unresolved UNLESS allowRemote
+// (then it's resolved via the owning peer — see the remote-resolution test).
 func TestContainerBackendIP_StaticThenLocalFallback(t *testing.T) {
 	s := testServer(t) // hostName = "test-host"
 	ctx := adminCtx()
@@ -284,22 +285,37 @@ func TestContainerBackendIP_StaticThenLocalFallback(t *testing.T) {
 
 	// Static label wins, no runtime call needed (even on a remote host).
 	if ip := s.containerBackendIP(ctx, corrosion.ContainerRecord{
-		Name: "web", HostName: "other-host", Labels: map[string]string{corrosion.LabelIP: "10.0.0.20"},
-	}); ip != "10.0.0.20" {
+		Name: "web", HostName: "other-host", State: "running",
+		Labels: map[string]string{corrosion.LabelIP: "10.0.0.20"},
+	}, false); ip != "10.0.0.20" {
 		t.Errorf("static label IP = %q, want 10.0.0.20", ip)
 	}
 
-	// No label, but container is local → lxc-info fallback resolves it.
+	// No label, running + local → lxc-info fallback resolves it.
 	if ip := s.containerBackendIP(ctx, corrosion.ContainerRecord{
-		Name: "local-ct", HostName: "test-host",
-	}); ip != "10.0.0.30" {
+		Name: "local-ct", HostName: "test-host", State: "running",
+	}, false); ip != "10.0.0.30" {
 		t.Errorf("local fallback IP = %q, want 10.0.0.30", ip)
 	}
 
-	// No label and remote → unresolved (cross-host DHCP discovery is a follow-up).
+	// No label, remote, allowRemote=false → unresolved (status path stays cheap).
 	if ip := s.containerBackendIP(ctx, corrosion.ContainerRecord{
-		Name: "remote-ct", HostName: "other-host",
-	}); ip != "" {
-		t.Errorf("remote no-label IP = %q, want empty", ip)
+		Name: "remote-ct", HostName: "other-host", State: "running",
+	}, false); ip != "" {
+		t.Errorf("remote no-label IP (allowRemote=false) = %q, want empty", ip)
+	}
+
+	// The replicated managed-NIC IP resolves a REMOTE container with no live lookup
+	// (the owning host's scanner persisted it) — even with allowRemote=false.
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "other-host", CtName: "dhcp-ct", NetworkName: "br0", Ordinal: 0,
+		MAC: "52:00:00:00:00:01", IP: "10.0.0.40", VethDevice: "lvcabc",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ip := s.containerBackendIP(ctx, corrosion.ContainerRecord{
+		Name: "dhcp-ct", HostName: "other-host", State: "running",
+	}, false); ip != "10.0.0.40" {
+		t.Errorf("remote recorded-NIC IP = %q, want 10.0.0.40", ip)
 	}
 }

@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/network"
 )
 
@@ -532,6 +533,42 @@ func TestMigrateContainer_SourceRuntimeDeleteFailure_Errors(t *testing.T) {
 	}
 	if src.State != "stopped" || src.StateDetail != "operator-stop" {
 		t.Errorf("source not parked stopped: state=%q detail=%q", src.State, src.StateDetail)
+	}
+}
+
+// TestMigrateContainer_RemovesSourceDNS: migrate finalize tombstones the source's
+// auto DNS record (the target host's scanner re-creates it at the target IP).
+func TestMigrateContainer_RemovesSourceDNS(t *testing.T) {
+	s, _, repo := migrateTestServer(t, "running")
+	s.dnsDomain = "litevirt.local"
+	ctx := context.Background()
+	// Give the source a stack label + an existing DNS record.
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running", Project: "acme",
+		Labels: map[string]string{corrosion.LabelStack: "prod"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dns.UpsertRecord(ctx, s.db, "ct1.prod.litevirt.local", "10.0.0.5"); err != nil {
+		t.Fatal(err)
+	}
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: target, Name: name, State: "running", Project: "acme",
+		}); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		return corrosion.RestoreLanded, nil
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); err != nil {
+		t.Fatalf("MigrateContainer: %v", err)
+	}
+	if dnsRecordActive(t, s, "ct1.prod.litevirt.local") {
+		t.Error("source DNS record was not removed on migrate")
 	}
 }
 

@@ -1237,6 +1237,11 @@ message SyncVTEPRequest {
 message GetVMIPRequest {
     string mac          = 1;
     string network_name = 2;
+    // owner_kind selects how the peer resolves the address: "" or "vm" (default,
+    // back-compatible) → MAC-based ARP/DHCP lookup; "ct" → resolve owner_name as a
+    // container (lxc-info / its interface row). owner_name is the container name.
+    string owner_kind = 3;
+    string owner_name = 4;
 }
 message GetVMIPResponse {
     string ip = 1;

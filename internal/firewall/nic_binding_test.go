@@ -79,6 +79,72 @@ func TestCorrosionPlanLoader_BindsSGsToNICs(t *testing.T) {
 	)
 }
 
+// TestCorrosionPlanLoader_BindsSGsToContainerVeths: a managed container NIC's
+// security groups bind to its veth exactly like a VM's tap; a NIC with no veth
+// yet (not provisioned) is skipped.
+func TestCorrosionPlanLoader_BindsSGsToContainerVeths(t *testing.T) {
+	ctx := context.Background()
+	db, err := corrosion.NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "ct-sg", Name: "ctweb"}); err != nil {
+		t.Fatalf("InsertSecurityGroup: %v", err)
+	}
+	if err := corrosion.InsertSGRule(ctx, db, corrosion.SGRule{ID: "ctr1", SGID: "ct-sg",
+		Direction: "ingress", Proto: "tcp", PortRange: "8080", Action: "accept"}); err != nil {
+		t.Fatalf("InsertSGRule: %v", err)
+	}
+	// Live container (the loader joins the live row) + a managed NIC with a veth.
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct-web", State: "running", Project: "acme",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	if err := corrosion.UpsertContainerInterface(ctx, db, corrosion.ContainerInterfaceRecord{
+		HostName: "host-a", CtName: "ct-web", NetworkName: "prod", Ordinal: 0,
+		MAC: "52:00:00:00:00:10", IP: "10.0.0.11", VethDevice: "lvc0abc",
+		SecurityGroups: []string{"ctweb"},
+	}); err != nil {
+		t.Fatalf("UpsertContainerInterface: %v", err)
+	}
+	// A second NIC with NO veth yet — must be skipped (not provisioned).
+	if err := corrosion.UpsertContainerInterface(ctx, db, corrosion.ContainerInterfaceRecord{
+		HostName: "host-a", CtName: "ct-web", NetworkName: "mgmt", Ordinal: 1,
+		MAC: "52:00:00:00:00:11", VethDevice: "", SecurityGroups: []string{"ctweb"},
+	}); err != nil {
+		t.Fatalf("UpsertContainerInterface(no-veth): %v", err)
+	}
+
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{})(ctx)
+	if err != nil {
+		t.Fatalf("loader: %v", err)
+	}
+	var ctNIC *NICBinding
+	for i := range plan.NICs {
+		if plan.NICs[i].NICDev == "" {
+			t.Error("a NIC with no veth must be skipped, not emitted")
+		}
+		if plan.NICs[i].NICDev == "lvc0abc" {
+			ctNIC = &plan.NICs[i]
+		}
+	}
+	if ctNIC == nil {
+		t.Fatalf("no NICBinding for the container veth; got %+v", plan.NICs)
+	}
+	if !equalStringSlice(ctNIC.SecurityGroups, []string{"ctweb"}) {
+		t.Errorf("CT veth SGs = %v, want [ctweb]", ctNIC.SecurityGroups)
+	}
+	out, err := Render(plan)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	mustContainAll(t, out, "oifname lvc0abc tcp dport 8080 accept")
+}
+
 // TestCorrosionPlanLoader_DropsUnknownSGNamesGracefully — typo in the
 // binding shouldn't take the firewall down. Stale references log only;
 // the rest of the plan applies.

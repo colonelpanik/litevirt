@@ -232,3 +232,14 @@ func VMRecordName(vmName, stackName, domain string) string {
 	}
 	return fmt.Sprintf("%s.%s", vmName, domain)
 }
+
+// ContainerRecordName returns the DNS name for a container in a stack:
+// ct.stack.domain (a standalone container ⇒ ct.domain). Containers share the VM
+// name→IP namespace, so this mirrors VMRecordName exactly.
+func ContainerRecordName(ctName, stackName, domain string) string {
+	domain = strings.TrimSuffix(domain, ".")
+	if stackName != "" {
+		return fmt.Sprintf("%s.%s.%s", ctName, stackName, domain)
+	}
+	return fmt.Sprintf("%s.%s", ctName, domain)
+}

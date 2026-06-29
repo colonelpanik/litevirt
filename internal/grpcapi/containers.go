@@ -265,6 +265,12 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// Capture the stack label NOW (for the DNS-record name) — the row is about to be
+	// tombstoned. Best-effort: if the row is already gone, the reaper backstops.
+	dnsStack := ""
+	if rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); rec != nil {
+		dnsStack = containerStackLabel(*rec)
+	}
 	// A runtime "not found" is acceptable (idempotent) — proceed to the row
 	// tombstone so a retry after "runtime gone but DB write failed" can clear the
 	// ghost row. A real runtime failure still aborts.
@@ -290,6 +296,9 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// retry (now zero-row) must still clean them up, else a later same-host/name
 	// recreate inherits stale leases/rows.
 	nicErr := s.releaseContainerNICs(ctx, req.Name)
+	// Remove the auto DNS record (prompt — a lingering record could resolve to a now
+	// freed/reassigned IP). Best-effort; the reaper backstops.
+	s.deleteContainerDNS(ctx, req.Name, dnsStack)
 	if err := corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name); err != nil {
 		slog.Warn("container delete: failed to clear restart state (harmless, GC'able)", "name", req.Name, "error", err)
 	}

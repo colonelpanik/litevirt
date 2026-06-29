@@ -278,6 +278,11 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	if err := corrosion.DeleteContainerInterfaces(ctx, s.db, source, req.Name); err != nil {
 		slog.Warn("container migrate: source interface-row cleanup failed", "name", req.Name, "error", err)
 	}
+	// Remove the source's auto DNS record — the target's IP scanner re-creates it
+	// (same ct.stack.domain name) pointing at the target. Prompt removal avoids a
+	// stale record resolving to the source's now-freed IP. The DNS name is
+	// host-independent, so this keys off the source record's stack label.
+	s.deleteContainerDNS(ctx, req.Name, containerStackLabel(*rec))
 	_ = corrosion.DeleteContainerRestartState(ctx, s.db, source, req.Name)
 
 	s.audit(ctx, "ct.migrate", req.Name, fmt.Sprintf("project=%s %s→%s", project, source, req.TargetHost), "ok")

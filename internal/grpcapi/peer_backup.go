@@ -109,7 +109,20 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 		manifestBuf   []byte
 		manifestSeen  bool
 		manifestFinal bool
+		stagingToken  string // non-empty when the target is a per-transfer staging repo
+		committed     bool
 	)
+	// A per-transfer staging repo only has value once its manifest commits (a
+	// migrate/restore then consumes it). If this push aborts (bad/cancelled stream,
+	// missing manifest), remove the staging namespace NOW rather than leaving it for
+	// the next daemon-startup sweep — a long-lived target must not accumulate failed
+	// transfers. A CONFIGURED repo is the operator's; never auto-remove it (its
+	// orphan chunks are dedup-safe and GC-collectable).
+	defer func() {
+		if stagingToken != "" && !committed {
+			s.removeStagingRepo(stagingToken)
+		}
+	}()
 
 	for {
 		frame, err := stream.Recv()
@@ -129,6 +142,8 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 				return err
 			}
 			repo = r
+			stagingToken = f.Header.GetTarget().GetStagingToken() // "" for a configured repo
+
 		case *pb.PushBackupFrame_Chunk:
 			if repo == nil {
 				return status.Error(codes.InvalidArgument, "push-backup: chunk frame before header")
@@ -193,6 +208,7 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 	if err := repo.PutManifest(&m); err != nil {
 		return status.Errorf(codes.Internal, "push-backup: write manifest: %v", err)
 	}
+	committed = true // a staging repo now holds a committed manifest for the restore to consume
 	return stream.SendAndClose(&stats)
 }
 
@@ -294,7 +310,20 @@ func (s *Server) resolveRepoTarget(ctx context.Context, t *pb.RepoTarget) (*pbss
 		if !ok {
 			return nil, status.Errorf(codes.NotFound, "unknown backup repo %q (remote streaming requires a configured logical repo name)", name)
 		}
-		return pbsstore.Open(path)
+		repo, err := pbsstore.Open(path)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "open repo %q: %v", name, err)
+		}
+		// Fail closed: writing a peer push into an encrypted repo requires the
+		// daemon to hold its key (so chunks are sealed at rest, not silently stored
+		// as plaintext). The daemon has no repo-key config yet, so an encrypted
+		// destination repo is refused up front (at the HasChunks probe / first
+		// PushBackup frame) rather than failing mid-stream on the first PutChunk.
+		if repo.IsEncrypted() {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"backup repo %q is encrypted, but peer streaming into an encrypted repo needs daemon-side key material (not yet configurable); use a plaintext repo as the sink", name)
+		}
+		return repo, nil
 	default:
 		return nil, status.Error(codes.InvalidArgument, "repo target: repo_name or staging_token required")
 	}

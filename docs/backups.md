@@ -360,15 +360,22 @@ cross the wire.
   manifest into the target's internal per-transfer staging repo, then drives the
   target's restore against it. No `--repo` reachable from both hosts needed.
 
-Mechanics: chunks travel as **plaintext over mTLS** (the source decrypts on read,
-the destination re-encrypts at rest with its own key — no key crosses the wire),
-so a transfer works even between repos with different encryption modes. Each
-chunk's BLAKE3 id is verified on the receiver before it's written, and the
-manifest is written last, only after every chunk it references is confirmed
-present. The RPCs are peer-only (host cert) and load-shed under a serving
-semaphore. The owner's transient backup staging repo is itself encrypted with an
-ephemeral, never-persisted key, so backup data is never at rest in plaintext even
-mid-transfer; orphaned staging repos are swept at daemon startup.
+Mechanics: chunks travel as **plaintext over mTLS** (the source decrypts on read;
+no key crosses the wire — the chunk id is the plaintext BLAKE3, so dedup works
+across repos regardless of encryption mode). The destination writes via its own
+repo config: a **plaintext** repo stores chunks plaintext at rest (the same
+posture as any local daemon backup today; the in-flight protection is the mTLS
+transport), and an **encrypted** repo seals them with its own key. The daemon does
+**not** yet carry repo encryption keys, so a peer push into a destination repo
+marked encrypted is **refused (fail-closed)** rather than silently writing
+plaintext into it — wiring daemon-side repo keys is a follow-up. The owner's
+transient backup staging repo is itself encrypted with an ephemeral,
+never-persisted key, so backup data is never at rest in plaintext even
+mid-transfer. Each chunk's BLAKE3 id is verified on the receiver before it's
+written, and the manifest is written last, only after every chunk it references
+is confirmed present. The RPCs are peer-only (host cert) and load-shed under a
+serving semaphore. Orphaned per-transfer staging repos are removed receiver-side
+when a push doesn't commit, and any survivors are swept at daemon startup.
 
 **Old-peer behavior differs by flow.** *Cold migrate / failover restore* fall
 back to the shared-repo path when the target predates peer streaming (the target

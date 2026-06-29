@@ -112,6 +112,30 @@ func openStaging(t *testing.T, s *Server, token string) *pbsstore.Repo {
 	return repo
 }
 
+// seedConfiguredRepo Inits a plaintext repo, registers it under name on s, and
+// returns a header frame targeting it (the operator-repo case, where aborted
+// pushes leave GC'able orphan chunks rather than removing the repo).
+func seedConfiguredRepo(t *testing.T, s *Server, name string) *pb.PushBackupFrame {
+	t.Helper()
+	dir := t.TempDir()
+	if _, err := pbsstore.Init(dir); err != nil {
+		t.Fatalf("init configured repo: %v", err)
+	}
+	s.SetBackupRepos(map[string]string{name: dir})
+	return &pb.PushBackupFrame{Frame: &pb.PushBackupFrame_Header{
+		Header: &pb.PushBackupHeader{Target: &pb.RepoTarget{RepoName: name}},
+	}}
+}
+
+func openConfigured(t *testing.T, s *Server, name string) *pbsstore.Repo {
+	t.Helper()
+	repo, err := pbsstore.Open(s.backupRepos[name])
+	if err != nil {
+		t.Fatalf("open configured repo: %v", err)
+	}
+	return repo
+}
+
 // The happy path: header + chunk sub-frames + manifest → chunk written, manifest
 // landed and selects the chunk, restore reproduces the bytes.
 func TestPushBackup_HappyPath(t *testing.T) {
@@ -251,24 +275,42 @@ func TestPushBackup_RejectsManifestMidChunk(t *testing.T) {
 	}
 }
 
-// A stream that ends before the manifest commits nothing — the repo has the
-// chunk but NO manifest references it.
+// A stream that ends before the manifest commits nothing — into a CONFIGURED
+// repo the chunk remains as a GC'able orphan (no manifest references it), and the
+// operator's repo is never auto-removed.
 func TestPushBackup_NoManifestCommitsNothing(t *testing.T) {
 	s := newPeerAuthServer(t)
 	peer := mtlsCtx("peer-1")
+	hdr := seedConfiguredRepo(t, s, "r1")
 	data := []byte("orphan chunk content")
-	frames := append([]*pb.PushBackupFrame{stagingHeader("tok")}, chunkFrames(data, 8, "")...)
+	frames := append([]*pb.PushBackupFrame{hdr}, chunkFrames(data, 8, "")...)
 	// No manifest frame.
 	if _, err := runPush(s, peer, frames...); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("want FailedPrecondition for missing manifest, got %v", err)
 	}
-	repo := openStaging(t, s, "tok")
-	// The chunk landed (GC'able orphan), but no manifest selects it.
+	repo := openConfigured(t, s, "r1")
 	if _, err := repo.GetManifest("ct1", "2026-06-29T10:00:00Z", "rootfs"); err == nil {
 		t.Fatal("a manifest was written despite an aborted stream")
 	}
 	if !repo.HasChunk(pbsstore.ChunkID(data)) {
-		t.Fatal("expected the orphan chunk to be present")
+		t.Fatal("expected the orphan chunk to remain in the configured repo")
+	}
+}
+
+// On an aborted push, a STAGING repo (a transient transfer buffer) is removed
+// receiver-side immediately — a long-lived target must not accumulate failed
+// per-transfer staging namespaces until the next startup sweep.
+func TestPushBackup_StagingRemovedOnAbort(t *testing.T) {
+	s := newPeerAuthServer(t)
+	peer := mtlsCtx("peer-1")
+	data := []byte("orphan in staging")
+	frames := append([]*pb.PushBackupFrame{stagingHeader("tok")}, chunkFrames(data, 8, "")...)
+	// No manifest frame → abort.
+	if _, err := runPush(s, peer, frames...); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("want FailedPrecondition for missing manifest, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.dataDir, "restore-staging", "tok")); !os.IsNotExist(err) {
+		t.Fatalf("staging repo should be removed on an aborted push, stat err = %v", err)
 	}
 }
 
@@ -287,12 +329,13 @@ func TestPushBackup_RejectsManifestReferencingMissingChunk(t *testing.T) {
 			{ID: pbsstore.ChunkID(missing), Size: int64(len(missing)), Offset: int64(len(pushed))},
 		},
 	}
-	frames := append([]*pb.PushBackupFrame{stagingHeader("tok")}, chunkFrames(pushed, 8, "")...)
+	hdr := seedConfiguredRepo(t, s, "r1")
+	frames := append([]*pb.PushBackupFrame{hdr}, chunkFrames(pushed, 8, "")...)
 	frames = append(frames, manifestFrame(t, m))
 	if _, err := runPush(s, peer, frames...); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("want FailedPrecondition for missing referenced chunk, got %v", err)
 	}
-	repo := openStaging(t, s, "tok")
+	repo := openConfigured(t, s, "r1")
 	if _, err := repo.GetManifest("ct1", "2026-06-29T10:00:00Z", "rootfs"); err == nil {
 		t.Fatal("manifest written despite a missing referenced chunk")
 	}

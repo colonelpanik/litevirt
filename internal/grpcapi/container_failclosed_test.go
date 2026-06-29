@@ -101,6 +101,44 @@ func TestDeleteContainer_RuntimeNotFound_StillTombstones(t *testing.T) {
 	}
 }
 
+// DeleteContainer is intentionally idempotent: deleting an already-gone /
+// never-present container is a success (the desired end state — absent — holds),
+// so retries (e.g. from failover relocation) are safe. The zero-row tombstone is
+// the documented exception to the strict "zero-row = failure" rule.
+func TestDeleteContainer_AlreadyGone_Idempotent(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	s.SetContainerRuntime(&fakeCTRuntime{deleteErr: lxc.ErrContainerNotFound})
+
+	// No cluster row for "ghost" → the strict tombstone matches zero rows.
+	if _, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: "ghost", HostName: "test-host"}); err != nil {
+		t.Fatalf("deleting an already-absent container must be idempotent success, got %v", err)
+	}
+}
+
+// StartContainer must surface a state-READ failure as Internal (not mask it as
+// FailedPrecondition: not found) — while staying fail-closed (no runtime start).
+func TestStartContainer_StateReadError_Internal(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	rt := &fakeCTRuntime{}
+	s.SetContainerRuntime(rt)
+
+	if err := s.db.Execute(ctx, `DROP TABLE containers`); err != nil {
+		t.Fatalf("drop containers: %v", err)
+	}
+	_, err := s.StartContainer(ctx, &pb.StartContainerRequest{Name: "web", HostName: "test-host"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal on a state-read failure, got %v", err)
+	}
+	rt.mu.Lock()
+	starts := len(rt.startCalls)
+	rt.mu.Unlock()
+	if starts != 0 {
+		t.Fatalf("must not start the runtime when the state read failed, got %d start(s)", starts)
+	}
+}
+
 // The strict corrosion helper must report a zero-row UPDATE as ErrNoRowsAffected
 // (a soft-deleted/missing row), which a false "success" would hide.
 func TestSetContainerStateDetailStrict_ZeroRows(t *testing.T) {

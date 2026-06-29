@@ -159,7 +159,12 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// Preflight the cluster row BEFORE touching the runtime: a missing/soft-deleted
 	// row means we'd start an UNTRACKED container, so refuse. (Also folds in the
 	// template check — a frozen clone source can't be started.)
-	rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	rec, err := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	if err != nil {
+		// A state-read failure is not the same as "not found" — surface it as
+		// Internal rather than masking a storage problem behind FailedPrecondition.
+		return nil, status.Errorf(codes.Internal, "start: read container row: %v", err)
+	}
 	if rec == nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "container %q not found on host %q", req.Name, s.hostName)
 	}
@@ -245,9 +250,18 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	// Mandatory tombstone: a ghost (stale-live) row skews quota + makes failover
-	// chase a container that no longer exists. An already-gone row
-	// (ErrNoRowsAffected) is the idempotent no-op; a real DB error surfaces.
-	if err := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name); err != nil && !errors.Is(err, corrosion.ErrNoRowsAffected) {
+	// chase a container that no longer exists. Delete is intentionally IDEMPOTENT
+	// (the documented exception to the strict "zero-row = failure" rule that
+	// governs start/stop): retry-safety matters for the failover/relocation paths
+	// that re-issue deletes. So an already-gone row (ErrNoRowsAffected) is a
+	// success — but audited distinctly (not a silent "ok") so an operator typo
+	// isn't invisible; only a REAL DB error surfaces as Internal.
+	if err := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name); err != nil {
+		if errors.Is(err, corrosion.ErrNoRowsAffected) {
+			s.audit(ctx, "ct.delete", req.Name, "project="+project+" already-absent", "ok")
+			slog.Info("container delete: cluster row already absent (idempotent no-op)", "name", req.Name, "host", s.hostName)
+			return &emptypb.Empty{}, nil
+		}
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "delete: remove cluster row: %v", err)
 	}

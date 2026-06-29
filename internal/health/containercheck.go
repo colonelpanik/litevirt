@@ -81,10 +81,23 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 		return
 	}
 	now := time.Now()
+	live := make(map[string]bool, len(cts))
 	for _, ct := range cts {
+		live[ct.Name] = true
 		c.checkContainer(ctx, ct, now)
 	}
+	// GC IPAM leases stranded by a crash between allocating a lease and persisting
+	// the container row (an orphan lease — owner with no live container row). The
+	// age guard keeps this from racing an in-flight create.
+	if _, err := network.ReleaseOrphanContainerLeases(ctx, c.db, c.hostName, live, orphanLeaseMinAge); err != nil {
+		slog.Warn("containercheck: orphan-lease GC failed", "error", err)
+	}
 }
+
+// orphanLeaseMinAge is how long a CT IPAM lease with no live container row must
+// persist before the sweep reclaims it — comfortably longer than any in-flight
+// create (which holds the name lock and completes in seconds).
+const orphanLeaseMinAge = 5 * time.Minute
 
 // recreateRelocated rebuilds a container the failover coordinator re-homed here
 // after a host loss (B5), from its re-pullable image. Best-effort tier-1: the

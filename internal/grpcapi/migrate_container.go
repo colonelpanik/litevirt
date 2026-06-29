@@ -9,10 +9,12 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
@@ -133,10 +135,15 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
 		slog.Warn("container migrate: source row soft-delete failed", "name", req.Name, "error", err)
 	}
-	// Release the source's managed NICs (IPAM leases + interface rows); the target
-	// rebuilt its own from the create spec during restore. source == s.hostName.
-	if err := s.releaseContainerNICs(ctx, req.Name); err != nil {
-		slog.Warn("container migrate: source NIC release failed (leases/rows may linger, GC'able)", "name", req.Name, "error", err)
+	// Hand the managed IPAM leases to the target EXPLICITLY (source kept them so
+	// the target's restore wouldn't blank the IPs); keyed on the full source owner,
+	// so it's a precise move, not a guess. Then tombstone the source's interface
+	// rows (the target wrote its own). source == s.hostName.
+	if err := network.TransferContainerLeases(ctx, s.db, source, req.TargetHost, req.Name); err != nil {
+		slog.Warn("container migrate: lease transfer to target failed (target may re-discover IPs)", "name", req.Name, "error", err)
+	}
+	if err := corrosion.DeleteContainerInterfaces(ctx, s.db, source, req.Name); err != nil {
+		slog.Warn("container migrate: source interface-row cleanup failed", "name", req.Name, "error", err)
 	}
 	_ = corrosion.DeleteContainerRestartState(ctx, s.db, source, req.Name)
 
@@ -159,7 +166,11 @@ func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, tim
 		return fmt.Errorf("dial target: %w", err)
 	}
 	defer conn.Close()
-	rs, err := c.RestoreContainer(ctx, &pb.RestoreContainerRequest{
+	// Tell the target this is a migrate FROM us, so it keeps the imported NIC IPs
+	// (we transfer the IPAM leases explicitly in finalize) rather than re-reserving
+	// and blanking them.
+	mctx := metadata.AppendToOutgoingContext(ctx, migrateFromMDKey, s.hostName)
+	rs, err := c.RestoreContainer(mctx, &pb.RestoreContainerRequest{
 		RepoPath: repoPath, Name: name, Timestamp: timestamp, HostName: target, Start: start,
 	})
 	if err != nil {

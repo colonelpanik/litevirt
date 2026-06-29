@@ -76,6 +76,17 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
+	// Serialize same-name creates on this host, and reject a duplicate BEFORE
+	// allocating any IPAM lease. Without this, a duplicate / concurrent create that
+	// later fails would run the lease-cleanup path (keyed on host+name) and tombstone
+	// the EXISTING container's leases + interface rows. The lock + preflight make the
+	// failure cleanup safe (this is the only live container of this name on the host).
+	unlock := s.lockVM("ct/" + req.Name)
+	defer unlock()
+	if existing, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); existing != nil {
+		return nil, status.Errorf(codes.AlreadyExists, "container %q already exists on host %q", req.Name, s.hostName)
+	}
+
 	// Tenancy admission — containers draw down the SAME project vCPU/Mem budget
 	// as VMs (mirrors CreateVM). Runs on the owning host (post-forward) so the
 	// check happens once against the cluster-wide usage view.

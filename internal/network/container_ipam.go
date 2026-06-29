@@ -50,6 +50,48 @@ func ReleaseContainerLeases(ctx context.Context, db *corrosion.Client, host, ctN
 		now, now, host, ctName)
 }
 
+// TransferContainerLeases re-homes ALL of a container's live IPAM leases from
+// fromHost to toHost (owner_host: fromHost→toHost), keyed on the FULL prior owner
+// (ct, fromHost, ctName) so it's precise — never touches a same-named container
+// on a third host. The mover (migrate) uses it for an explicit cross-host handoff,
+// which ReserveContainerIP deliberately won't infer.
+func TransferContainerLeases(ctx context.Context, db *corrosion.Client, fromHost, toHost, ctName string) error {
+	now := db.NowTS()
+	return db.Execute(ctx,
+		`UPDATE ip_allocations SET owner_host = ?, updated_at = ?
+		 WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL`,
+		toHost, now, fromHost, ctName)
+}
+
+// ReleaseOrphanContainerLeases tombstones CT leases on host whose owner has no
+// live container row AND that are older than minAge — i.e. leases stranded by a
+// daemon crash between allocating a lease and persisting the container row. The
+// age guard keeps it from racing an in-flight create (which holds the name lock
+// and finishes in seconds). Returns how many it released.
+func ReleaseOrphanContainerLeases(ctx context.Context, db *corrosion.Client, host string, live map[string]bool, minAge time.Duration) (int, error) {
+	cutoff := time.Now().Add(-minAge).UTC().Format(time.RFC3339)
+	rows, err := db.Query(ctx,
+		`SELECT DISTINCT vm_name FROM ip_allocations
+		 WHERE owner_kind = 'ct' AND owner_host = ? AND deleted_at IS NULL AND allocated_at < ?`,
+		host, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	released := 0
+	for _, r := range rows {
+		name := r.String("vm_name")
+		if live[name] {
+			continue
+		}
+		if err := ReleaseContainerLeases(ctx, db, host, name); err != nil {
+			return released, err
+		}
+		slog.Warn("released orphan container IPAM lease (no live container row)", "host", host, "ct", name)
+		released++
+	}
+	return released, nil
+}
+
 // ReserveContainerNICs re-reserves the IPs of a re-homed container's managed
 // interface rows on this host (restore). It runs AFTER the rows are written. For
 // each NIC with an IP it conditionally reserves the address; if it can't (held by

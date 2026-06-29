@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 var _ grpc.ServerStreamingServer[pb.MigrateContainerProgress] = (*progressStream[pb.MigrateContainerProgress])(nil)
@@ -87,6 +88,58 @@ func TestMigrateContainer_Success(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("live ct1 rows = %d, want exactly 1", n)
+	}
+}
+
+// TestMigrateContainer_TransfersManagedLease proves the cross-host handoff of a
+// managed IP: ReserveContainerIP deliberately refuses to infer ownership of a
+// same-named CT on another host (steal-safety), so the mover must transfer the
+// lease explicitly. After a successful migrate the IPAM lease is owned by the
+// target and the source's interface rows are tombstoned — no duplicate claim,
+// no stranded lease.
+func TestMigrateContainer_TransfersManagedLease(t *testing.T) {
+	s, _, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+
+	const (
+		net = "br-acme"
+		ip  = "10.9.0.5"
+		mac = "02:11:22:33:44:55"
+	)
+	if ok, err := network.ReserveContainerIP(ctx, s.db, net, ip, mac, "host-a", "ct1"); err != nil || !ok {
+		t.Fatalf("seed ReserveContainerIP: ok=%v err=%v", ok, err)
+	}
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "host-a", CtName: "ct1", NetworkName: net, Ordinal: 0,
+		MAC: mac, IP: ip, VethDevice: "lvtest0",
+	}); err != nil {
+		t.Fatalf("seed interface row: %v", err)
+	}
+
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, _ bool) error {
+		return corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: target, Name: name, State: "running", Project: "acme",
+		})
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); err != nil {
+		t.Fatalf("MigrateContainer: %v", err)
+	}
+
+	// The lease moved to the target...
+	if a, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "host-b", "ct1"); a == nil || a.IP != ip {
+		t.Errorf("lease not owned by host-b after migrate: %+v", a)
+	}
+	// ...and is no longer claimed under the source host.
+	if a, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "host-a", "ct1"); a != nil {
+		t.Errorf("lease still claimed by host-a after migrate: %+v", a)
+	}
+	// Source interface rows are tombstoned (the target wrote its own).
+	if ifs, _ := corrosion.GetContainerInterfaces(ctx, s.db, "host-a", "ct1"); len(ifs) != 0 {
+		t.Errorf("source interface rows still live after migrate: %+v", ifs)
 	}
 }
 

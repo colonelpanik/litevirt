@@ -60,6 +60,23 @@ const restoreRowRecordedStatus = "cluster-row-recorded"
 // restore. Passed via metadata (not a proto field) so no contract change.
 const relocateTokenMDKey = "x-litevirt-relocate-token"
 
+// migrateFromMDKey marks a restore as the target side of a cross-host MIGRATE,
+// carrying the source host. When set, RestoreContainer keeps the imported NIC IPs
+// (does NOT re-reserve/blank them) because the source explicitly TRANSFERS its
+// IPAM leases to this host — a move ReserveContainerIP won't infer from a name.
+const migrateFromMDKey = "x-litevirt-migrate-from-host"
+
+// migrateFromMD reads the migrate source host from incoming gRPC metadata ("" if
+// this restore isn't a migrate).
+func migrateFromMD(ctx context.Context) string {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if v := md.Get(migrateFromMDKey); len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
+}
+
 // BackupContainer freezes a container, streams its rootfs+config as a full,
 // content-addressed manifest into a host-local repo, and indexes the size for
 // quota. Containers are host-local, so this runs on the owning host; if the
@@ -479,10 +496,19 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// NIC whose IP a different workload now holds). Runs after the rows are written.
 	// unreserved NICs gate the start below: the IMPORTED on-disk config still names
 	// those IPs, so booting would cause the very conflict the blank avoids.
-	unreserved, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs)
-	if rerr != nil {
-		slog.Warn("container restore: IP re-reservation incomplete (NIC may be re-discovered)",
-			"name", req.Name, "error", rerr)
+	//
+	// EXCEPTION — a cross-host MIGRATE (migrate-from set): keep the imported IPs as
+	// is; the source daemon TRANSFERS its IPAM leases to this host explicitly (a
+	// move ReserveContainerIP won't infer from a name), so re-reserving here would
+	// wrongly blank a still-valid address.
+	unreserved := 0
+	if migrateFromMD(ctx) == "" {
+		u, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs)
+		if rerr != nil {
+			slog.Warn("container restore: IP re-reservation incomplete (NIC may be re-discovered)",
+				"name", req.Name, "error", rerr)
+		}
+		unreserved = u
 	}
 
 	// Signal that the cluster row has been recorded — the restore has LANDED. A

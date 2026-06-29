@@ -467,7 +467,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// landed"). On failure, delete the just-imported runtime container so nothing
 	// untracked is left, then error out (before signalling "landed").
 	ifs := corrosion.BuildContainerInterfacesFromSpec(s.hostName, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec))
-	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifs, nil); err != nil {
+	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifs); err != nil {
 		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 			slog.Warn("container restore: failed to clean up imported container after cluster-state-write failure",
 				"name", req.Name, "error", delErr)
@@ -476,11 +476,13 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Errorf(codes.Internal, "restore: record cluster state: %v", err)
 	}
 	// Re-reserve the managed IPs on this host (conditional — never steals; blanks a
-	// NIC whose IP a different workload now holds). Runs after the rows are written;
-	// best-effort, since the rows + spec are persisted and the IP is re-derivable.
-	if err := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs); err != nil {
+	// NIC whose IP a different workload now holds). Runs after the rows are written.
+	// unreserved NICs gate the start below: the IMPORTED on-disk config still names
+	// those IPs, so booting would cause the very conflict the blank avoids.
+	unreserved, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs)
+	if rerr != nil {
 		slog.Warn("container restore: IP re-reservation incomplete (NIC may be re-discovered)",
-			"name", req.Name, "error", err)
+			"name", req.Name, "error", rerr)
 	}
 
 	// Signal that the cluster row has been recorded — the restore has LANDED. A
@@ -491,6 +493,14 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	_ = send(&pb.RestoreContainerProgress{Phase: pb.RestoreContainerProgress_IMPORT, Status: restoreRowRecordedStatus})
 
 	if req.Start {
+		if unreserved > 0 {
+			// The imported on-disk config still names IP(s) we couldn't reserve (held
+			// by another workload). Starting would create a real network conflict, so
+			// leave it stopped + tracked (recoverable) and surface the reason.
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (ip unavailable; not started)", "error")
+			return status.Errorf(codes.FailedPrecondition,
+				"restored %q but %d NIC(s) had unavailable IPs — left stopped to avoid a network conflict", req.Name, unreserved)
+		}
 		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 			// Partial success: the container is restored AND tracked (row stays
 			// 'stopped'), so the reconciler / restart policy can start it later. We

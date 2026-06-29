@@ -67,16 +67,16 @@ func (s *Server) resolveBridgeToNetwork(ctx context.Context, bridge string) (str
 type containerNICPlan struct {
 	lxcNics  []ContainerNICOpt
 	ifaces   []corrosion.ContainerInterfaceRecord
-	leases   []corrosion.IPLease
 	specNets []corrosion.ContainerNetwork
 }
 
 // resolveContainerNICs turns the requested NICs into runtime attachments, the
-// managed-interface rows, the IPAM leases to take, and the create-spec network
-// intent. A NIC is MANAGED when it names — or its bridge resolves to — exactly
-// one known network; otherwise it's a legacy raw-bridge attachment with no
-// managed state (no interface row, IPAM, or veth). Pure resolution: it computes
-// candidate IPs but writes nothing (the caller persists rows + leases atomically).
+// managed-interface rows, and the create-spec network intent, ALLOCATING each
+// managed NIC's IPAM lease as it goes (tombstone/race-safe). A NIC is MANAGED
+// when it names — or its bridge resolves to — exactly one known network;
+// otherwise it's a legacy raw-bridge attachment with no managed state (no
+// interface row, IPAM, or veth). On error the caller must release this
+// container's leases (network.ReleaseContainerLeases) to undo partial allocation.
 func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics []*pb.ContainerNetwork) (*containerNICPlan, error) {
 	p := &containerNICPlan{}
 	for i, n := range nics {
@@ -132,11 +132,26 @@ func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics [
 			mac = GenerateMAC()
 		}
 		veth := containerVethName(ctName, i)
-		ip := n.Ip
-		if ip == "" && def.Subnet != "" {
-			cand, err := network.ComputeCandidateIP(ctx, s.db, netName, def.Subnet)
-			if err != nil {
-				return nil, status.Errorf(codes.ResourceExhausted, "allocate IP on network %q: %v", netName, err)
+		// Allocate the IP NOW (writing the lease) — tombstone- and race-safe. A
+		// static request reserves that exact address (fail if held by another);
+		// otherwise litevirt allocates from the subnet; a subnet-less network is
+		// DHCP (blank IP, no lease). The caller releases all of this container's
+		// leases (network.ReleaseContainerLeases) if create later fails.
+		ip := ""
+		switch {
+		case n.Ip != "":
+			ok, rerr := network.ReserveContainerIP(ctx, s.db, netName, n.Ip, mac, s.hostName, ctName)
+			if rerr != nil {
+				return nil, status.Errorf(codes.Internal, "reserve IP %q on %q: %v", n.Ip, netName, rerr)
+			}
+			if !ok {
+				return nil, status.Errorf(codes.AlreadyExists, "static IP %q on network %q is already in use", n.Ip, netName)
+			}
+			ip = n.Ip
+		case def.Subnet != "":
+			cand, aerr := network.AllocateIPFor(ctx, s.db, netName, def.Subnet, mac, "ct", s.hostName, ctName)
+			if aerr != nil {
+				return nil, status.Errorf(codes.ResourceExhausted, "allocate IP on network %q: %v", netName, aerr)
 			}
 			ip = cand
 		}
@@ -145,11 +160,6 @@ func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics [
 			HostName: s.hostName, CtName: ctName, NetworkName: netName, Ordinal: i,
 			MAC: mac, IP: ip, VethDevice: veth, SecurityGroups: n.SecurityGroups,
 		})
-		if ip != "" { // static or litevirt-assigned → take a lease; DHCP (blank) → none
-			p.leases = append(p.leases, corrosion.IPLease{
-				Network: netName, IP: ip, MAC: mac, OwnerKind: "ct", OwnerHost: s.hostName, OwnerName: ctName,
-			})
-		}
 		// create_spec stores the EFFECTIVE IP (static or auto-allocated), so a
 		// rebuild (restore/migrate/relocate) re-reserves the same address instead of
 		// losing an auto-allocated one. The rebuild's reserve is conditional (never
@@ -166,18 +176,11 @@ func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics [
 // its interface rows (the delete cascade). Best-effort: returns the first error
 // for logging but always attempts every step.
 func (s *Server) releaseContainerNICs(ctx context.Context, ctName string) error {
-	ifaces, err := corrosion.GetContainerInterfaces(ctx, s.db, s.hostName, ctName)
-	if err != nil {
-		return err
-	}
-	var firstErr error
-	for _, ifc := range ifaces {
-		if ifc.IP != "" {
-			if e := network.ReleaseIPFor(ctx, s.db, ifc.NetworkName, "ct", s.hostName, ctName); e != nil && firstErr == nil {
-				firstErr = e
-			}
-		}
-	}
+	// Release every IPAM lease this container holds on the host (across networks),
+	// then tombstone its interface rows. ReleaseContainerLeases works even when the
+	// interface rows are absent (e.g. rolling back a create that failed before the
+	// rows were written).
+	firstErr := network.ReleaseContainerLeases(ctx, s.db, s.hostName, ctName)
 	if e := corrosion.DeleteContainerInterfaces(ctx, s.db, s.hostName, ctName); e != nil && firstErr == nil {
 		firstErr = e
 	}

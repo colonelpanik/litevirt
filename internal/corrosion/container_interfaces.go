@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
-	"time"
 )
 
 // ContainerVethName derives the deterministic, IFNAMSIZ-safe (≤15 bytes) host
@@ -62,18 +61,6 @@ type ContainerInterfaceRecord struct {
 	SecurityGroups []string
 }
 
-// IPLease is a single ip_allocations row to write atomically with the container
-// + interface rows. vm_name is the legacy owner-name column; OwnerKind/OwnerHost
-// (v36) disambiguate a VM from a CT and same-named CTs across hosts.
-type IPLease struct {
-	Network   string
-	IP        string
-	MAC       string
-	OwnerKind string // "vm" | "ct"
-	OwnerHost string // "" for VMs; the host for CTs
-	OwnerName string
-}
-
 // UpsertContainerInterface writes one container NIC row (resurrecting a
 // soft-deleted row), keyed by (host_name, ct_name, ordinal). Used by the
 // migrate/restore/relocate-recreate paths to rebuild a NIC.
@@ -96,24 +83,6 @@ func containerInterfaceStmt(c *Client, r ContainerInterfaceRecord) (Statement, e
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		Params: []interface{}{r.HostName, r.CtName, r.NetworkName, r.Ordinal, r.MAC, r.IP, r.VethDevice, sgs, c.NowTS()},
 	}, nil
-}
-
-// containerLeaseStmts builds plain ip_allocations INSERTs for the create batch
-// (CreateContainerAtomic). A PK conflict on (network, ip) from a racing
-// allocation fails the whole batch rather than clobbering an existing lease.
-func containerLeaseStmts(c *Client, leases []IPLease) []Statement {
-	now := c.NowTS()
-	allocAt := time.Now().UTC().Format(time.RFC3339)
-	out := make([]Statement, 0, len(leases))
-	for _, l := range leases {
-		out = append(out, Statement{
-			SQL: `INSERT INTO ip_allocations
-			 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			Params: []interface{}{l.Network, l.IP, l.MAC, l.OwnerName, l.OwnerKind, l.OwnerHost, allocAt, now},
-		})
-	}
-	return out
 }
 
 // ContainerMAC derives a deterministic, locally-administered MAC for a container

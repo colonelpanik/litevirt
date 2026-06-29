@@ -87,10 +87,12 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 
 	// Resolve the requested NICs into runtime attachments + managed-interface rows
-	// + IPAM leases + create-spec intent (managed network vs legacy raw bridge).
-	// Pure resolution — nothing is written yet.
+	// + create-spec intent, ALLOCATING each managed NIC's IPAM lease as it goes
+	// (managed network vs legacy raw bridge). On any later failure we release this
+	// container's leases (s.releaseContainerNICs) to undo partial allocation.
 	plan, err := s.resolveContainerNICs(ctx, req.Name, req.Networks)
 	if err != nil {
+		_ = s.releaseContainerNICs(ctx, req.Name) // undo any leases taken before the error
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
 		return nil, err
 	}
@@ -101,6 +103,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: plan.lxcNics, Labels: req.Labels,
 	})
 	if err != nil {
+		_ = s.releaseContainerNICs(ctx, req.Name)
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: %v", err)
 	}
@@ -123,12 +126,12 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
 		CreatedAt:     now,
 	}
-	// Write the container row + managed interface rows + IPAM leases in ONE atomic
-	// batch (the ip_allocations PK rejects a racing IP, failing the whole batch).
-	// Fail closed: the runtime container exists but the DB write failed → nothing
-	// was persisted, so delete the just-created container and error. No partial
-	// tracked state, no leaked lease (mirrors RestoreContainer's atomic write).
-	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces, plan.leases); err != nil {
+	// Write the container row + managed interface rows in ONE atomic batch. Fail
+	// closed: the runtime container exists but the DB write failed → delete the
+	// just-created container and release its leases, so no partial tracked state
+	// and no leaked lease.
+	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces); err != nil {
+		_ = s.releaseContainerNICs(ctx, info.Name)
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
 			slog.Warn("container create: cleanup after cluster-state-write failure also failed",
 				"name", info.Name, "error", delErr)

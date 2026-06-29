@@ -138,23 +138,53 @@ func ComputeCandidateIP(ctx context.Context, db *corrosion.Client, network, subn
 
 // AllocateIPFor claims the next free host IP in subnet for an owner of the given
 // kind ('vm'|'ct'). ownerHost is "" for VMs (names are cluster-global) and the
-// container's host for CTs (CT names are per-host). Retries 3x on PK conflict.
+// container's host for CTs (CT names are per-host). It resurrects a tombstoned
+// lease for the chosen address (so a RELEASED IP is reusable — the (network,ip)
+// PK otherwise blocks a plain re-INSERT) but never clobbers a LIVE lease: a
+// guarded ON CONFLICT update + a read-back confirm ownership, and a lost race
+// retries a fresh candidate.
 func AllocateIPFor(ctx context.Context, db *corrosion.Client, network, subnet, mac, ownerKind, ownerHost, name string) (string, error) {
-	for attempt := 0; attempt < 3; attempt++ {
-		ip, err := ComputeCandidateIP(ctx, db, network, subnet)
+	for attempt := 0; attempt < 5; attempt++ {
+		ip, err := ComputeCandidateIP(ctx, db, network, subnet) // free or tombstoned (excludes LIVE)
 		if err != nil {
 			return "", err
 		}
-		err = db.Execute(ctx,
+		if err := db.Execute(ctx,
 			`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			network, ip, mac, name, ownerKind, ownerHost, time.Now().UTC().Format(time.RFC3339), db.NowTS())
-		if err == nil {
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(network, ip) DO UPDATE SET
+			   mac = excluded.mac, vm_name = excluded.vm_name, owner_kind = excluded.owner_kind,
+			   owner_host = excluded.owner_host, allocated_at = excluded.allocated_at,
+			   updated_at = excluded.updated_at, deleted_at = NULL
+			 WHERE ip_allocations.deleted_at IS NOT NULL`, // only resurrect a tombstone; LIVE → no-op
+			network, ip, mac, name, ownerKind, ownerHost, time.Now().UTC().Format(time.RFC3339), db.NowTS()); err != nil {
+			return "", err
+		}
+		// Confirm WE hold (network, ip): the guarded UPDATE no-ops if a LIVE lease
+		// won the race, so a no-op means try a fresh candidate.
+		held, err := ipLeaseHeldBy(ctx, db, network, ip, ownerKind, ownerHost, name)
+		if err != nil {
+			return "", err
+		}
+		if held {
 			return ip, nil
 		}
-		// PK (network, ip) conflict from a race → retry with a fresh candidate.
 	}
-	return "", fmt.Errorf("failed to allocate IP after 3 attempts")
+	return "", fmt.Errorf("failed to allocate IP after retries (contention or subnet exhausted)")
+}
+
+// ipLeaseHeldBy reports whether (network, ip) is held by a LIVE lease owned by
+// exactly (kind, host, name) — the read-back the conditional reserve/allocate
+// paths use to detect a no-op guarded update.
+func ipLeaseHeldBy(ctx context.Context, db *corrosion.Client, network, ip, ownerKind, ownerHost, name string) (bool, error) {
+	rows, err := db.Query(ctx,
+		`SELECT 1 AS ok FROM ip_allocations
+		 WHERE network = ? AND ip = ? AND vm_name = ? AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL`,
+		network, ip, name, ownerKind, ownerHost)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
 }
 
 // AllocateIP is the VM-owner wrapper (owner_kind='vm', owner_host='').

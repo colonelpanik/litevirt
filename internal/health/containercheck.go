@@ -92,10 +92,21 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 // from the original aren't preserved — the faithful path is restore-from-backup,
 // a follow-up). On failure it leaves the row pending so the next sweep retries.
 func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.ContainerRecord) {
-	// Already materialized by a prior tick? Clear the relocate marker and let
-	// normal reconciliation take over.
+	spec := corrosion.DecodeCreateSpec(ct.CreateSpec)
+
+	// Already materialized by a prior tick (runtime container exists)? A prior tick
+	// may have created the runtime but failed to write the interface rows — so
+	// ENSURE the managed rows are present (and IPs re-reserved) BEFORE clearing the
+	// relocate marker, otherwise clearing it would drop the rebuild forever.
 	if live, err := c.runtime.State(ctx, ct.Name); err == nil &&
 		(live == lxc.StateRunning || live == lxc.StateStopped) {
+		ifs := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec)
+		if !c.writeRelocatedNICs(ctx, ct.Name, ifs) {
+			return // row write failed → keep the marker, retry next sweep
+		}
+		if _, err := network.ReserveContainerNICs(ctx, c.db, c.hostName, ct.Name, ifs); err != nil {
+			slog.Warn("containercheck: relocate IP re-reservation incomplete", "container", ct.Name, "error", err)
+		}
 		state := "stopped"
 		if live == lxc.StateRunning {
 			state = "running"
@@ -103,45 +114,50 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, state, "")
 		return
 	}
+
 	slog.Info("containercheck: recreating relocated container from image",
 		"container", ct.Name, "image", ct.Image)
-	// Reconstruct litevirt-managed networking from the persisted create spec
-	// (v34) so an image-recreate isn't network-blind. Empty for pre-v34 rows →
-	// recreated with no managed NICs (prior behavior).
-	spec := corrosion.DecodeCreateSpec(ct.CreateSpec)
+	// Reconstruct litevirt-managed networking from the create spec, RESERVING each
+	// managed IP up front so the on-disk config never names an address we don't own
+	// (a NIC we can't claim is rendered without an IP → DHCP/re-discovery). Legacy
+	// raw-bridge NICs pass through with no managed state.
 	opts := lxc.CreateOpts{
 		Name: ct.Name, Template: ct.Image,
 		CPULimit: ct.CPULimit, MemoryMiB: ct.MemMiB, Labels: ct.Labels,
 	}
+	var ifs []corrosion.ContainerInterfaceRecord
 	for i, n := range spec.Networks {
-		veth := ""
-		if n.NetworkName != "" { // managed NIC → deterministic, trackable veth
-			veth = corrosion.ContainerVethName(ct.Name, i)
+		if n.NetworkName == "" {
+			opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC})
+			continue
 		}
-		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: veth})
+		veth := corrosion.ContainerVethName(ct.Name, i)
+		ip := n.IP
+		if ip != "" {
+			if ok, rerr := network.ReserveContainerIP(ctx, c.db, n.NetworkName, ip, n.MAC, c.hostName, ct.Name); rerr != nil || !ok {
+				if rerr != nil {
+					slog.Warn("containercheck: relocate IP reserve errored; using DHCP", "container", ct.Name, "ip", ip, "error", rerr)
+				}
+				ip = "" // couldn't claim → don't put it on-disk
+			}
+		}
+		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: ip, MAC: n.MAC, Veth: veth})
+		ifs = append(ifs, corrosion.ContainerInterfaceRecord{
+			HostName: c.hostName, CtName: ct.Name, NetworkName: n.NetworkName, Ordinal: i,
+			MAC: n.MAC, IP: ip, VethDevice: veth, SecurityGroups: n.SecurityGroups,
+		})
 	}
 	if _, err := c.runtime.Create(ctx, opts); err != nil {
+		_ = network.ReleaseContainerLeases(ctx, c.db, c.hostName, ct.Name) // undo the reserved leases
 		slog.Error("containercheck: relocate-recreate failed (will retry)",
 			"container", ct.Name, "image", ct.Image, "error", err)
 		c.publish("ct.relocate.failed", ct.Name, err.Error())
 		return // leave pending → retried next sweep
 	}
-	// Re-home the managed interface rows on this (relocate target) host from the
-	// create spec, so the relocated container keeps its network identity + SG
-	// bindings. Fail closed: if a row write fails, leave the relocate marker so the
-	// next sweep retries — never clear it (below) with NIC state missing.
-	ifs := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec)
-	for _, ifc := range ifs {
-		if err := corrosion.UpsertContainerInterface(ctx, c.db, ifc); err != nil {
-			slog.Error("containercheck: relocate interface-row write failed (will retry)",
-				"container", ct.Name, "network", ifc.NetworkName, "error", err)
-			return // leave pending+relocate-recreate → retried next sweep
-		}
-	}
-	// Re-reserve the managed IPs (conditional — never steals; blanks a NIC whose IP
-	// another workload now holds). Best-effort; the row IP is re-derivable.
-	if err := network.ReserveContainerNICs(ctx, c.db, c.hostName, ct.Name, ifs); err != nil {
-		slog.Warn("containercheck: relocate IP re-reservation incomplete", "container", ct.Name, "error", err)
+	// Fail closed: if the interface rows can't be written, leave the relocate marker
+	// so the next sweep retries — never clear it with NIC state missing.
+	if !c.writeRelocatedNICs(ctx, ct.Name, ifs) {
+		return
 	}
 	if err := c.runtime.Start(ctx, ct.Name); err != nil {
 		slog.Error("containercheck: relocate-recreate start failed", "container", ct.Name, "error", err)
@@ -151,6 +167,19 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "running", "")
 	c.publish("ct.relocated", ct.Name, "recreated from image after host loss")
 	slog.Info("containercheck: relocated container recreated", "container", ct.Name)
+}
+
+// writeRelocatedNICs persists the relocated container's managed interface rows.
+// Returns false (caller keeps the relocate marker for retry) if any write fails.
+func (c *ContainerChecker) writeRelocatedNICs(ctx context.Context, ctName string, ifs []corrosion.ContainerInterfaceRecord) bool {
+	for _, ifc := range ifs {
+		if err := corrosion.UpsertContainerInterface(ctx, c.db, ifc); err != nil {
+			slog.Error("containercheck: relocate interface-row write failed (will retry)",
+				"container", ctName, "network", ifc.NetworkName, "error", err)
+			return false
+		}
+	}
+	return true
 }
 
 // checkContainer reconciles one container's cluster row to the runtime's reality

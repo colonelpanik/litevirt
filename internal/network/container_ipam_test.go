@@ -7,9 +7,11 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// ReserveContainerIP must transfer an IP for the SAME container re-homing across
-// hosts, but never steal one held by a DIFFERENT workload.
-func TestReserveContainerIP_TransfersButNeverSteals(t *testing.T) {
+// ReserveContainerIP reserves a free IP and is idempotent for the SAME owner,
+// but never steals a live lease — including a same-named CT on ANOTHER host
+// (v36: CT names are per-host, so that may be a different workload), and a
+// released (tombstoned) IP is reusable.
+func TestReserveContainerIP_NeverStealsAcrossHosts(t *testing.T) {
 	ctx := context.Background()
 	db, err := corrosion.NewTestClient()
 	if err != nil {
@@ -20,25 +22,29 @@ func TestReserveContainerIP_TransfersButNeverSteals(t *testing.T) {
 		t.Fatalf("InitSchema: %v", err)
 	}
 
-	// Container "a" on h1 claims a free IP.
+	// "a" on h1 claims a free IP; re-reserving on h1 is idempotent.
 	if ok, err := ReserveContainerIP(ctx, db, "net1", "10.0.0.5", "mac-a", "h1", "a"); err != nil || !ok {
 		t.Fatalf("free IP should reserve: ok=%v err=%v", ok, err)
 	}
-	// Same container re-homing to h2 → transfer (owner_host moves to h2).
-	if ok, err := ReserveContainerIP(ctx, db, "net1", "10.0.0.5", "mac-a", "h2", "a"); err != nil || !ok {
-		t.Fatalf("same container should transfer its IP: ok=%v err=%v", ok, err)
+	if ok, err := ReserveContainerIP(ctx, db, "net1", "10.0.0.5", "mac-a", "h1", "a"); err != nil || !ok {
+		t.Fatalf("same owner re-reserve should be idempotent: ok=%v err=%v", ok, err)
 	}
-	if al, _ := GetAllocationFor(ctx, db, "net1", "ct", "h2", "a"); al == nil || al.IP != "10.0.0.5" {
-		t.Fatalf("transfer should move the lease to h2, got %+v", al)
+	// A same-NAMED container on ANOTHER host must NOT steal it (can't prove it's ours).
+	if ok, err := ReserveContainerIP(ctx, db, "net1", "10.0.0.5", "mac-a", "h2", "a"); err != nil || ok {
+		t.Fatalf("must not steal a same-named CT's IP across hosts: ok=%v err=%v", ok, err)
 	}
-	// A DIFFERENT container must NOT steal it.
+	// A different container must NOT steal it either.
 	if ok, err := ReserveContainerIP(ctx, db, "net1", "10.0.0.5", "mac-b", "h3", "b"); err != nil || ok {
 		t.Fatalf("must not steal an IP held by another container: ok=%v err=%v", ok, err)
 	}
-	if al, _ := GetAllocationFor(ctx, db, "net1", "ct", "h2", "a"); al == nil {
-		t.Fatal("original owner (a) must remain intact after a steal attempt")
+	if al, _ := GetAllocationFor(ctx, db, "net1", "ct", "h1", "a"); al == nil {
+		t.Fatal("original owner (a@h1) must remain intact after steal attempts")
 	}
-	if al, _ := GetAllocationFor(ctx, db, "net1", "ct", "h3", "b"); al != nil {
-		t.Fatal("the other container (b) must not have acquired the IP")
+	// A RELEASED IP becomes reusable (tombstone resurrected).
+	if err := ReleaseIPFor(ctx, db, "net1", "ct", "h1", "a"); err != nil {
+		t.Fatalf("ReleaseIPFor: %v", err)
+	}
+	if ok, err := ReserveContainerIP(ctx, db, "net1", "10.0.0.5", "mac-c", "h2", "c"); err != nil || !ok {
+		t.Fatalf("a released IP must be reusable: ok=%v err=%v", ok, err)
 	}
 }

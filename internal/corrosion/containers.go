@@ -192,12 +192,13 @@ func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 	}, nil
 }
 
-// CreateContainerAtomic writes the container row, its managed interface rows, and
-// its IPAM leases in ONE transaction (plain lease INSERTs — the ip_allocations PK
-// rejects a racing allocation, failing the whole batch). A crash/kill therefore
-// never leaves a live tracked container with missing NIC/IPAM state.
-func CreateContainerAtomic(ctx context.Context, c *Client, rec ContainerRecord, ifaces []ContainerInterfaceRecord, leases []IPLease) error {
-	stmts := make([]Statement, 0, 1+len(ifaces)+len(leases))
+// CreateContainerAtomic writes the container row and its managed interface rows
+// in ONE transaction, so a crash/kill never leaves a live tracked container with
+// missing interface rows. IPAM leases are allocated separately (they need a
+// conditional, tombstone/race-safe write that a plain batch can't express; the
+// caller reserves them before this and rolls them back on failure).
+func CreateContainerAtomic(ctx context.Context, c *Client, rec ContainerRecord, ifaces []ContainerInterfaceRecord) error {
+	stmts := make([]Statement, 0, 1+len(ifaces))
 	cs, err := upsertContainerStmt(c, rec)
 	if err != nil {
 		return err
@@ -210,7 +211,6 @@ func CreateContainerAtomic(ctx context.Context, c *Client, rec ContainerRecord, 
 		}
 		stmts = append(stmts, s)
 	}
-	stmts = append(stmts, containerLeaseStmts(c, leases)...)
 	return c.ExecuteBatch(ctx, stmts)
 }
 

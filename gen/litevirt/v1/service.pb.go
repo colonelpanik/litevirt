@@ -15549,9 +15549,14 @@ func (x *SyncVTEPRequest) GetVni() int32 {
 }
 
 type GetVMIPRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Mac           string                 `protobuf:"bytes,1,opt,name=mac,proto3" json:"mac,omitempty"`
-	NetworkName   string                 `protobuf:"bytes,2,opt,name=network_name,json=networkName,proto3" json:"network_name,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Mac         string                 `protobuf:"bytes,1,opt,name=mac,proto3" json:"mac,omitempty"`
+	NetworkName string                 `protobuf:"bytes,2,opt,name=network_name,json=networkName,proto3" json:"network_name,omitempty"`
+	// owner_kind selects how the peer resolves the address: "" or "vm" (default,
+	// back-compatible) → MAC-based ARP/DHCP lookup; "ct" → resolve owner_name as a
+	// container (lxc-info / its interface row). owner_name is the container name.
+	OwnerKind     string `protobuf:"bytes,3,opt,name=owner_kind,json=ownerKind,proto3" json:"owner_kind,omitempty"`
+	OwnerName     string `protobuf:"bytes,4,opt,name=owner_name,json=ownerName,proto3" json:"owner_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -15596,6 +15601,20 @@ func (x *GetVMIPRequest) GetMac() string {
 func (x *GetVMIPRequest) GetNetworkName() string {
 	if x != nil {
 		return x.NetworkName
+	}
+	return ""
+}
+
+func (x *GetVMIPRequest) GetOwnerKind() string {
+	if x != nil {
+		return x.OwnerKind
+	}
+	return ""
+}
+
+func (x *GetVMIPRequest) GetOwnerName() string {
+	if x != nil {
+		return x.OwnerName
 	}
 	return ""
 }
@@ -20719,10 +20738,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fSyncVTEPRequest\x12!\n" +
 	"\fnetwork_name\x18\x01 \x01(\tR\vnetworkName\x12\x17\n" +
 	"\avtep_ip\x18\x02 \x01(\tR\x06vtepIp\x12\x10\n" +
-	"\x03vni\x18\x03 \x01(\x05R\x03vni\"E\n" +
+	"\x03vni\x18\x03 \x01(\x05R\x03vni\"\x83\x01\n" +
 	"\x0eGetVMIPRequest\x12\x10\n" +
 	"\x03mac\x18\x01 \x01(\tR\x03mac\x12!\n" +
-	"\fnetwork_name\x18\x02 \x01(\tR\vnetworkName\"!\n" +
+	"\fnetwork_name\x18\x02 \x01(\tR\vnetworkName\x12\x1d\n" +
+	"\n" +
+	"owner_kind\x18\x03 \x01(\tR\townerKind\x12\x1d\n" +
+	"\n" +
+	"owner_name\x18\x04 \x01(\tR\townerName\"!\n" +
 	"\x0fGetVMIPResponse\x12\x0e\n" +
 	"\x02ip\x18\x01 \x01(\tR\x02ip\"1\n" +
 	"\x10RefreshLBRequest\x12\x1d\n" +

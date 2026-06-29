@@ -46,6 +46,11 @@ func (s *IPScanner) Start(ctx context.Context) {
 }
 
 func (s *IPScanner) scan(ctx context.Context) {
+	s.scanVMs(ctx)
+	s.scanContainers(ctx)
+}
+
+func (s *IPScanner) scanVMs(ctx context.Context) {
 	vms, err := corrosion.ListVMs(ctx, s.db, "", s.hostName)
 	if err != nil {
 		return
@@ -93,6 +98,56 @@ func (s *IPScanner) scan(ctx context.Context) {
 				s.server.broadcastFDBUpdate(ctx, iface.NetworkName, def.VNI, iface.MAC, "", localVTEP)
 			}
 		}
+	}
+}
+
+// scanContainers is the convergent CT-DNS reconciler: for each RUNNING local
+// container it discovers the live IP (lxc-info), persists a freshly-discovered or
+// changed address into the managed interface row, and (re)upserts the auto DNS
+// record so the container is name-resolvable. It runs on the container's OWN host
+// (lxc-info is host-local) and is idempotent — covers static IPs (known at create),
+// DHCP IPs (discovered here), migrate (the target host re-creates the record), and
+// IP changes (UpsertRecord replaces). Removal is the delete/migrate cascade's job.
+func (s *IPScanner) scanContainers(ctx context.Context) {
+	if s.server.containerRuntime == nil {
+		return
+	}
+	cts, err := corrosion.ListContainers(ctx, s.db, s.hostName)
+	if err != nil {
+		return
+	}
+	for _, ct := range cts {
+		if ct.State != "running" {
+			continue
+		}
+		ifaces, _ := corrosion.GetContainerInterfaces(ctx, s.db, s.hostName, ct.Name)
+		if len(ifaces) == 0 {
+			continue // legacy/unmanaged NIC — no record to maintain
+		}
+		// lxc-info returns the container's primary IP (one address); map it to the
+		// first managed NIC. The recorded IP wins if discovery comes back empty.
+		live, _ := s.server.containerRuntime.IPContainer(ctx, ct.Name)
+		recorded := ""
+		for _, ifc := range ifaces {
+			if ifc.IP != "" {
+				recorded = ifc.IP
+				break
+			}
+		}
+		ip := recorded
+		if live != "" {
+			ip = live
+		}
+		if ip == "" {
+			continue // no IP known yet (DHCP still pending)
+		}
+		// Persist a newly-discovered / changed address onto the primary managed NIC.
+		if live != "" && live != recorded {
+			if err := corrosion.UpdateContainerInterfaceIP(ctx, s.db, s.hostName, ct.Name, ifaces[0].Ordinal, live); err != nil {
+				slog.Warn("ip_scanner: persist container IP failed", "container", ct.Name, "error", err)
+			}
+		}
+		s.server.upsertContainerDNS(ctx, ct.Name, containerStackLabel(ct), ip)
 	}
 }
 

@@ -47,6 +47,22 @@ func (s *Server) ReapOrphanDNSRecords(ctx context.Context) {
 			}
 		}
 	}
+	// Containers share the auto-DNS namespace: a live CT with a known managed-NIC
+	// IP must be in the expected set, or the reaper would delete its record.
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		slog.Warn("dns reaper: list containers", "error", err)
+		return
+	}
+	for _, ct := range cts {
+		ifaces, _ := corrosion.GetContainerInterfaces(ctx, s.db, ct.HostName, ct.Name)
+		for _, ifc := range ifaces {
+			if ifc.IP != "" {
+				expected[strings.ToLower(dns.ContainerRecordName(ct.Name, ct.Labels[corrosion.LabelStack], domain))] = true
+				break
+			}
+		}
+	}
 
 	rows, err := s.db.Query(ctx,
 		`SELECT name, updated_at FROM dns_records

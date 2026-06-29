@@ -333,8 +333,34 @@ func (s *Server) SyncVTEP(ctx context.Context, req *pb.SyncVTEPRequest) (*emptyp
 	return &emptypb.Empty{}, nil
 }
 
-// GetVMIPRemote discovers a VM's IP locally via ARP/DHCP (called by peers for LB backend discovery).
+// GetVMIPRemote discovers a workload's IP LOCALLY for a peer doing LB backend
+// discovery: a VM (owner_kind "" / "vm") by MAC via ARP/DHCP, or a container
+// (owner_kind "ct") by name via lxc-info, falling back to its recorded managed
+// interface row. PEER-ONLY: it's a cluster-internal discovery call, so it requires
+// a peer host certificate (an operator bearer/user credential cannot reach it) —
+// this also closes the gap that it was previously ungated.
 func (s *Server) GetVMIPRemote(ctx context.Context, req *pb.GetVMIPRequest) (*pb.GetVMIPResponse, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
+	if req.OwnerKind == "ct" {
+		ip := ""
+		if s.containerRuntime != nil {
+			if v, err := s.containerRuntime.IPContainer(ctx, req.OwnerName); err == nil {
+				ip = v
+			}
+		}
+		if ip == "" {
+			ifaces, _ := corrosion.GetContainerInterfaces(ctx, s.db, s.hostName, req.OwnerName)
+			for _, ifc := range ifaces {
+				if ifc.IP != "" {
+					ip = ifc.IP
+					break
+				}
+			}
+		}
+		return &pb.GetVMIPResponse{Ip: ip}, nil
+	}
 	ip := lv.GetIPFromARP(req.Mac)
 	if ip == "" {
 		ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", req.Mac)

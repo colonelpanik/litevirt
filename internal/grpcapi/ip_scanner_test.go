@@ -133,6 +133,44 @@ func TestIPScanner_DNSNotSetWhenNoDomain(t *testing.T) {
 	}
 }
 
+// TestIPScanner_ContainerDNSReconcile: the scanner discovers a running local
+// container's IP (lxc-info), persists it onto the managed NIC row, and upserts the
+// auto DNS record (ct.stack.domain → IP) — the convergent CT-DNS reconciler.
+func TestIPScanner_ContainerDNSReconcile(t *testing.T) {
+	s := testServer(t) // hostName = "test-host"
+	s.dnsDomain = "litevirt.local"
+	s.SetContainerRuntime(&fakeCTRuntime{ipByName: map[string]string{"ct1": "10.0.60.5"}})
+	ctx := context.Background()
+
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "test-host", Name: "ct1", State: "running", Project: "acme",
+		Labels: map[string]string{corrosion.LabelStack: "prod"},
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	// A managed NIC with no IP yet (DHCP pending).
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "test-host", CtName: "ct1", NetworkName: "br0", Ordinal: 0,
+		MAC: "52:00:00:00:00:02", IP: "", VethDevice: "lvc123",
+	}); err != nil {
+		t.Fatalf("UpsertContainerInterface: %v", err)
+	}
+
+	NewIPScanner(s).scanContainers(ctx)
+
+	// IP persisted onto the NIC row.
+	ifaces, _ := corrosion.GetContainerInterfaces(ctx, s.db, "test-host", "ct1")
+	if len(ifaces) != 1 || ifaces[0].IP != "10.0.60.5" {
+		t.Fatalf("NIC IP not persisted: %+v", ifaces)
+	}
+	// DNS record upserted at ct.stack.domain.
+	rows, _ := s.db.Query(ctx,
+		`SELECT value FROM dns_records WHERE name = ? AND deleted_at IS NULL`, "ct1.prod.litevirt.local")
+	if len(rows) != 1 || rows[0].String("value") != "10.0.60.5" {
+		t.Fatalf("CT DNS record not upserted: %+v", rows)
+	}
+}
+
 func TestCleanupFDBForVM_NonVXLAN(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()

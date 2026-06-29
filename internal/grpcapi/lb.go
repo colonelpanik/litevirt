@@ -67,22 +67,53 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 
 // lbBackends returns the live backend list for an LB by looking up running VMs
 // in the corresponding stack, or explicit backends from lb_backends table.
-// containerBackendIP resolves a stack container's address for LB backend use.
-// Containers have no vm_interfaces row, so the address comes from the recorded
-// static IP (corrosion.LabelIP, replicated cluster-wide) first, then a local
-// lxc-info lookup when the container runs on this host (covers DHCP NICs).
-// A DHCP container on a *remote* host with no recorded IP is not yet resolved
-// (a peer GetContainerIPRemote, mirroring VMs, is the follow-up).
-func (s *Server) containerBackendIP(ctx context.Context, ct corrosion.ContainerRecord) string {
+// containerBackendIP resolves a stack container's address for LB backend use, in
+// order: the static label (corrosion.LabelIP), the recorded managed-NIC IP (the
+// container_interfaces row — replicated, so it covers a DHCP IP the owning host's
+// scanner already discovered, even for a REMOTE container), then a live lxc-info
+// lookup if it runs on this host, then (allowRemote) a peer lookup on the owning
+// host. Returns "" when no IP is known yet (e.g. a DHCP NIC still acquiring) — the
+// caller skips that backend and retries next sweep; never a stale/guessed address.
+func (s *Server) containerBackendIP(ctx context.Context, ct corrosion.ContainerRecord, allowRemote bool) string {
 	if ip := ct.Labels[corrosion.LabelIP]; ip != "" {
 		return ip
 	}
-	if ct.HostName == s.hostName && s.containerRuntime != nil {
-		if ip, err := s.containerRuntime.IPContainer(ctx, ct.Name); err == nil {
-			return ip
+	ifaces, _ := corrosion.GetContainerInterfaces(ctx, s.db, ct.HostName, ct.Name)
+	for _, ifc := range ifaces {
+		if ifc.IP != "" {
+			return ifc.IP
 		}
 	}
+	if ct.State != "running" {
+		return ""
+	}
+	if ct.HostName == s.hostName {
+		if s.containerRuntime != nil {
+			if ip, err := s.containerRuntime.IPContainer(ctx, ct.Name); err == nil {
+				return ip
+			}
+		}
+		return ""
+	}
+	if allowRemote {
+		return s.remoteContainerIP(ctx, ct.HostName, ct.Name)
+	}
 	return ""
+}
+
+// remoteContainerIP asks the owning peer for a container's live IP via the
+// generalized GetVMIPRemote (owner_kind="ct"). Best-effort, "" on any error.
+func (s *Server) remoteContainerIP(ctx context.Context, host, ctName string) string {
+	client, conn, err := s.peerClient(ctx, host)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	resp, err := client.GetVMIPRemote(ctx, &pb.GetVMIPRequest{OwnerKind: "ct", OwnerName: ctName})
+	if err != nil {
+		return ""
+	}
+	return resp.Ip
 }
 
 // resolvedBackend is one LB backend (VM or container) with its discovered
@@ -147,10 +178,11 @@ func (s *Server) resolveStackBackends(ctx context.Context, stackName string, all
 		}
 		out = append(out, resolvedBackend{Name: vm.Name, IP: ip, Running: running})
 	}
-	// Containers in the stack (found via the reserved stack label).
+	// Containers in the stack (found via the reserved stack label). The render path
+	// (allowRemote) resolves a remote DHCP container's IP via the owning peer.
 	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
 	for _, ct := range cts {
-		out = append(out, resolvedBackend{Name: ct.Name, IP: s.containerBackendIP(ctx, ct), Running: ct.State == "running"})
+		out = append(out, resolvedBackend{Name: ct.Name, IP: s.containerBackendIP(ctx, ct, allowRemote), Running: ct.State == "running"})
 	}
 	return out
 }

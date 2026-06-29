@@ -35,6 +35,22 @@ func TestVMRecordName(t *testing.T) {
 	}
 }
 
+func TestContainerRecordName(t *testing.T) {
+	cases := []struct {
+		ct, stack, domain, want string
+	}{
+		{"web", "mystack", "litevirt.local", "web.mystack.litevirt.local"},
+		{"web", "", "litevirt.local", "web.litevirt.local"},
+		{"db", "prod", "litevirt.local.", "db.prod.litevirt.local"},
+	}
+	for _, tc := range cases {
+		got := ContainerRecordName(tc.ct, tc.stack, tc.domain)
+		if got != tc.want {
+			t.Errorf("ContainerRecordName(%q,%q,%q) = %q, want %q", tc.ct, tc.stack, tc.domain, got, tc.want)
+		}
+	}
+}
+
 func TestUpsertAndLookup(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()

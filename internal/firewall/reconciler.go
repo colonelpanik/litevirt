@@ -247,6 +247,31 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 				SecurityGroups: bound,
 			})
 		}
+
+		// Container NICs: identical per-NIC SG enforcement on the veth. The loader
+		// is host-scoped and ListContainerInterfacesByHost joins the live container
+		// row, so only this host's MANAGED, live CT NICs appear; skip a NIC with no
+		// veth yet (not provisioned), mirroring the tap_device skip above.
+		ctIfaces, err := corrosion.ListContainerInterfacesByHost(ctx, db, hostName)
+		if err != nil {
+			return plan, err
+		}
+		for _, ifc := range ctIfaces {
+			if ifc.VethDevice == "" {
+				continue
+			}
+			bound := make([]string, 0, len(ifc.SecurityGroups))
+			for _, name := range ifc.SecurityGroups {
+				if valid[name] {
+					bound = append(bound, name)
+				}
+			}
+			plan.NICs = append(plan.NICs, NICBinding{
+				NICDev:         ifc.VethDevice,
+				VMName:         ifc.CtName,
+				SecurityGroups: bound,
+			})
+		}
 		return plan, nil
 	}
 }

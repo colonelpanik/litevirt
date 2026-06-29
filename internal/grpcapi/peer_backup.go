@@ -19,6 +19,28 @@ import (
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
+// requireSinkPeer authorizes a sink_host-bearing backup request. sink_host is an
+// internal field set ONLY by the sink daemon when it forwards a remote backup to
+// the owning host (to its own hostname), so the owner pushes the manifest back to
+// it. The owner must therefore accept it only from that peer over mTLS — the
+// caller's host-cert CN must equal sink_host. An empty sink_host is the ordinary
+// local-backup path and is unrestricted here. This stops an operator/API client
+// from driving an owner→sink push that bypasses the sink's authoritative
+// landing/accounting path.
+func (s *Server) requireSinkPeer(ctx context.Context, sinkHost string) error {
+	if sinkHost == "" {
+		return nil
+	}
+	if err := s.requirePeerCert(ctx); err != nil {
+		return err
+	}
+	if cn := callerMTLSCommonName(ctx); cn != sinkHost {
+		return status.Errorf(codes.PermissionDenied,
+			"sink_host is an internal peer field; it may only be set by the sink daemon (caller %q != sink_host %q)", cn, sinkHost)
+	}
+	return nil
+}
+
 // dialPeer returns a LiteVirtClient for the named host plus a closer, honoring
 // the test seam. Production wraps peerClient (real mTLS dial); tests can inject a
 // fake client wired to a second in-process server.
@@ -377,7 +399,10 @@ func (s *Server) openStagingRepo(token string) (*pbsstore.Repo, error) {
 // over mTLS) and the sink re-encrypts at rest with ITS own key — the chunk id is
 // the plaintext BLAKE3, so cross-key dedup still works.
 func (s *Server) newLocalStagingRepo() (*pbsstore.Repo, func(), error) {
-	token := newTransferToken()
+	token, err := newTransferToken()
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	path := filepath.Join(s.dataDir, "backup-staging", token)
 	r, err := pbsstore.InitEncrypted(path, pbsstore.EncryptionModeAESGCM)
 	if err != nil {

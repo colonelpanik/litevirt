@@ -16,11 +16,15 @@ import (
 )
 
 // newTransferToken returns a fresh, safename-valid per-transfer token used to
-// name a target's internal staging repo so concurrent transfers can't collide.
-func newTransferToken() string {
+// name a target's internal staging repo so concurrent transfers can't collide. It
+// fails if the system entropy source does — a zero/predictable token would defeat
+// the per-transfer namespace isolation, so callers must abort rather than proceed.
+func newTransferToken() (string, error) {
 	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate transfer token: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // pushManifestToStaging streams one container manifest (and only the chunks the
@@ -33,7 +37,10 @@ func (s *Server) pushManifestToStaging(ctx context.Context, client pb.LiteVirtCl
 	if err != nil {
 		return "", fmt.Errorf("load source manifest: %w", err)
 	}
-	token := newTransferToken()
+	token, err := newTransferToken()
+	if err != nil {
+		return "", err
+	}
 	sink := newRemoteRepoSink(ctx, client, &pb.RepoTarget{StagingToken: token})
 	defer sink.Close()
 	if _, err := pbsstore.SyncManifest(ctx, srcRepo, m, sink); err != nil {

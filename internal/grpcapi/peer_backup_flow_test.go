@@ -15,6 +15,41 @@ import (
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
+// mtlsAdminCtx mirrors what the auth interceptor sets for a daemon-to-daemon mTLS
+// peer: admin role + the peer's host-cert CN. sink_host-bearing requests are only
+// accepted from such a peer whose CN equals sink_host.
+func mtlsAdminCtx(cn string) context.Context {
+	ctx := context.WithValue(context.Background(), ctxKeyUsername, "admin")
+	ctx = context.WithValue(ctx, ctxKeyRole, "admin")
+	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodMTLS)
+	return context.WithValue(ctx, ctxKeyMTLSCommonName, cn)
+}
+
+// ownerForSink builds an owner server holding ct1, wired to push to sink, and
+// registers sink's host so the owner accepts sink_host from it.
+func ownerForSink(t *testing.T, sink *Server) *Server {
+	t.Helper()
+	owner := testServer(t)
+	owner.hostName = "owner-host"
+	owner.dataDir = t.TempDir()
+	owner.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs-bytes-rootfs-bytes")})
+	if err := corrosion.UpsertContainer(context.Background(), owner.db, corrosion.ContainerRecord{
+		HostName: "owner-host", Name: "ct1", State: "stopped",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	// The owner must know the sink host to accept its sink_host (requirePeerCert).
+	if err := corrosion.InsertHost(context.Background(), owner.db, corrosion.HostRecord{
+		Name: sink.hostName, Address: "127.0.0.1", State: "active",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	owner.peerClientOverride = func(_ context.Context, _ string) (pb.LiteVirtClient, func(), error) {
+		return &fakeLVClient{srv: sink, peerCtx: mtlsCtx("peer-1")}, func() {}, nil
+	}
+	return owner
+}
+
 // Flow 2 (owner side): a container backup with sink_host set archives into a
 // local staging repo and PushBackup-streams the manifest to the sink's CONFIGURED
 // repo — the manifest lands there with no shared filesystem.
@@ -27,21 +62,9 @@ func TestBackupContainer_RemotePushToSink(t *testing.T) {
 	}
 	sink.SetBackupRepos(map[string]string{"r1": sinkRepoDir})
 
-	// Owner: holds the container + a fake runtime; pushes to the sink.
-	owner := testServer(t)
-	owner.hostName = "owner-host"
-	owner.dataDir = t.TempDir()
-	owner.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs-bytes-rootfs-bytes")})
-	if err := corrosion.UpsertContainer(context.Background(), owner.db, corrosion.ContainerRecord{
-		HostName: "owner-host", Name: "ct1", State: "stopped",
-	}); err != nil {
-		t.Fatalf("UpsertContainer: %v", err)
-	}
-	owner.peerClientOverride = func(_ context.Context, _ string) (pb.LiteVirtClient, func(), error) {
-		return &fakeLVClient{srv: sink, peerCtx: mtlsCtx("peer-1")}, func() {}, nil
-	}
-
-	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	owner := ownerForSink(t, sink)
+	// Driven by the sink daemon over mTLS (CN == sink_host).
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: mtlsAdminCtx(sink.hostName)}
 	if err := owner.BackupContainer(&pb.BackupContainerRequest{
 		Name: "ct1", HostName: "owner-host", RepoPath: "r1",
 		Timestamp: "2026-06-29T10:00:00Z", SinkHost: sink.hostName,
@@ -71,26 +94,37 @@ func TestBackupContainer_RemotePushToEncryptedSink_FailedPrecondition(t *testing
 	}
 	sink.SetBackupRepos(map[string]string{"r1": encDir})
 
-	owner := testServer(t)
-	owner.hostName = "owner-host"
-	owner.dataDir = t.TempDir()
-	owner.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs-bytes-rootfs-bytes")})
-	if err := corrosion.UpsertContainer(context.Background(), owner.db, corrosion.ContainerRecord{
-		HostName: "owner-host", Name: "ct1", State: "stopped",
-	}); err != nil {
-		t.Fatalf("UpsertContainer: %v", err)
-	}
-	owner.peerClientOverride = func(_ context.Context, _ string) (pb.LiteVirtClient, func(), error) {
-		return &fakeLVClient{srv: sink, peerCtx: mtlsCtx("peer-1")}, func() {}, nil
-	}
-
-	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	owner := ownerForSink(t, sink)
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: mtlsAdminCtx(sink.hostName)}
 	err := owner.BackupContainer(&pb.BackupContainerRequest{
 		Name: "ct1", HostName: "owner-host", RepoPath: "r1",
 		Timestamp: "2026-06-29T10:00:00Z", SinkHost: sink.hostName,
 	}, bk)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("want FailedPrecondition propagated from the encrypted sink, got %v", err)
+	}
+}
+
+// sink_host is an internal peer field: an operator/API client (non-peer, or a peer
+// whose CN != sink_host) must NOT be able to set it and drive an owner→sink push
+// that bypasses the sink's accounting.
+func TestBackupContainer_SinkHostRejectedFromNonPeer(t *testing.T) {
+	sink := newPeerAuthServer(t)
+	owner := ownerForSink(t, sink)
+
+	// Operator bearer (no mTLS) setting sink_host → rejected.
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := owner.BackupContainer(&pb.BackupContainerRequest{
+		Name: "ct1", HostName: "owner-host", RepoPath: "r1", SinkHost: sink.hostName,
+	}, bk); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("operator setting sink_host: want PermissionDenied, got %v", err)
+	}
+	// A peer whose CN doesn't match sink_host → rejected.
+	bk2 := &progressStream[pb.BackupContainerProgress]{ctx: mtlsAdminCtx("some-other-host")}
+	if err := owner.BackupContainer(&pb.BackupContainerRequest{
+		Name: "ct1", HostName: "owner-host", RepoPath: "r1", SinkHost: sink.hostName,
+	}, bk2); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("peer CN != sink_host: want PermissionDenied, got %v", err)
 	}
 }
 

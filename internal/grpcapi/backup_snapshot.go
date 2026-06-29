@@ -36,6 +36,14 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 	if req.VmName == "" || req.RepoPath == "" {
 		return status.Error(codes.InvalidArgument, "vm_name and repo_path required")
 	}
+	// sink_host is an INTERNAL peer field: the only legitimate setter is the sink
+	// daemon forwarding to the owner (it sets sink_host to its OWN hostname). An
+	// operator/API client must not set it — that would drive the owner→sink push
+	// while bypassing the sink's authoritative landing + accounting path. Require
+	// the caller to be that peer over mTLS (CN == sink_host).
+	if err := s.requireSinkPeer(ctx, req.SinkHost); err != nil {
+		return err
+	}
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {

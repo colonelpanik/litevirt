@@ -194,7 +194,7 @@ lv ct ls
 lv ct exec <name> -- <cmd> [args...]
 lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
-lv ct migrate <name> <target-host> --repo <shared-dir> # cold-migrate (stop → transfer → start)
+lv ct migrate <name> <target-host> --repo <src-dir>    # cold-migrate (stop → stream → start)
 lv ct snapshot create <name> <snapshot>                # freeze+tar point-in-time snapshot
 lv ct snapshot ls <name>                               # list a container's snapshots
 lv ct snapshot revert <name> <snapshot>                # roll back (stop → restore → restart)
@@ -213,8 +213,11 @@ earlier backups is automatic). `lv ct restore` rebuilds it from the repo alone
 
 `lv ct migrate` cold-migrates a container to another host by reusing that
 backup→restore transport: stop → archive → restore on target → restart (if it
-was running). `--repo` must be reachable from **both** hosts (e.g. an
-NFS-mounted repo). A failure before cutover leaves the container intact on the
+was running). The source archives into `--repo` locally and **streams the
+manifest to the target over peer mTLS**, so `--repo` need only exist on the
+**source** (no shared/NFS repo required). An older target that predates peer
+streaming falls back to re-opening `--repo` by name, which then must be reachable
+from both hosts. A failure before cutover leaves the container intact on the
 source. No live migration / CRIU.
 
 ## Registry credentials

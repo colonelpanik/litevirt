@@ -132,6 +132,12 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	// sink_host is an internal peer field — only the sink daemon may set it (to its
+	// own hostname), so an operator/API client can't drive an owner→sink push that
+	// skips the sink's authoritative landing + accounting. See requireSinkPeer.
+	if err := s.requireSinkPeer(ctx, req.SinkHost); err != nil {
+		return err
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "backup.create", "operator"); err != nil {
 		s.audit(ctx, "ct.backup", req.Name, "project="+project, "denied")

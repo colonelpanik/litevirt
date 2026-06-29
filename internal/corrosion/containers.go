@@ -136,6 +136,17 @@ func DecodeCreateSpec(raw string) ContainerCreateSpec {
 // Atomic: the (host_name, name) primary key plus a soft-delete-aware
 // UPDATE keeps us from racing with concurrent List queries.
 func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
+	stmt, err := upsertContainerStmt(c, r)
+	if err != nil {
+		return err
+	}
+	return c.ExecuteBatch(ctx, []Statement{stmt})
+}
+
+// upsertContainerStmt builds the container UPSERT as a Statement so it can be
+// written in the SAME ExecuteBatch as the interface rows + IPAM leases (atomic
+// create — a crash can't leave a tracked container with missing NIC/IPAM state).
+func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 	now := c.NowTS()
 	if r.CreatedAt == "" {
 		r.CreatedAt = now
@@ -147,14 +158,14 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 	if len(r.Labels) > 0 {
 		b, err := json.Marshal(r.Labels)
 		if err != nil {
-			return err
+			return Statement{}, err
 		}
 		labelsJSON = string(b)
 	}
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
-	return c.Execute(ctx,
-		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
+	return Statement{
+		SQL: `INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
@@ -174,9 +185,33 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 		   relocate_token = excluded.relocate_token,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
-		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken, r.CreatedAt, now,
-	)
+		Params: []interface{}{
+			r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
+			labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken, r.CreatedAt, now,
+		},
+	}, nil
+}
+
+// CreateContainerAtomic writes the container row, its managed interface rows, and
+// its IPAM leases in ONE transaction (plain lease INSERTs — the ip_allocations PK
+// rejects a racing allocation, failing the whole batch). A crash/kill therefore
+// never leaves a live tracked container with missing NIC/IPAM state.
+func CreateContainerAtomic(ctx context.Context, c *Client, rec ContainerRecord, ifaces []ContainerInterfaceRecord, leases []IPLease) error {
+	stmts := make([]Statement, 0, 1+len(ifaces)+len(leases))
+	cs, err := upsertContainerStmt(c, rec)
+	if err != nil {
+		return err
+	}
+	stmts = append(stmts, cs)
+	for _, ifc := range ifaces {
+		s, err := containerInterfaceStmt(c, ifc)
+		if err != nil {
+			return err
+		}
+		stmts = append(stmts, s)
+	}
+	stmts = append(stmts, containerLeaseStmts(c, leases, false)...)
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // SetContainerTemplate flips a container's is_template flag (ConvertContainer-

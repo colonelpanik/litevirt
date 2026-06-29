@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -11,6 +12,33 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
 )
+
+// cloneContainerNICs rebuilds the MANAGED interface rows + create-spec networks
+// for a CLONE from its source's create spec. The clone is a NEW workload: it gets
+// a deterministic per-NIC MAC + veth (from the clone's name — matching what the
+// runtime clone writes on-disk) and a DYNAMIC IP (blank: a clone must not reuse
+// the source's address), so no IPAM lease is taken here. Legacy raw NICs are
+// copied verbatim (no managed state).
+func (s *Server) cloneContainerNICs(ctName string, srcSpec corrosion.ContainerCreateSpec) ([]corrosion.ContainerInterfaceRecord, []corrosion.ContainerNetwork) {
+	var ifaces []corrosion.ContainerInterfaceRecord
+	var specNets []corrosion.ContainerNetwork
+	for i, n := range srcSpec.Networks {
+		if n.NetworkName == "" {
+			specNets = append(specNets, n) // legacy/unmanaged → copy as-is
+			continue
+		}
+		mac := corrosion.ContainerMAC(ctName, i)
+		veth := corrosion.ContainerVethName(ctName, i)
+		ifaces = append(ifaces, corrosion.ContainerInterfaceRecord{
+			HostName: s.hostName, CtName: ctName, NetworkName: n.NetworkName, Ordinal: i,
+			MAC: mac, IP: "", VethDevice: veth, SecurityGroups: n.SecurityGroups,
+		})
+		specNets = append(specNets, corrosion.ContainerNetwork{
+			Name: n.Name, Bridge: n.Bridge, MAC: mac, NetworkName: n.NetworkName, SecurityGroups: n.SecurityGroups,
+		})
+	}
+	return ifaces, specNets
+}
 
 // containerVethName is the deterministic host veth name for a container NIC.
 // Defined in corrosion (shared with the health/relocate path); kept as a local
@@ -73,8 +101,26 @@ func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics [
 			continue
 		}
 
-		// Managed NIC.
-		bridge := resolveBridge(ctx, s.db, netName)
+		// Managed NIC. Containers support only L2 bridge-family networks; direct
+		// (macvtap) and SR-IOV are VM-only (they'd render VM-shaped link values
+		// like "direct:<iface>" into lxc.net.N.link).
+		switch def.Type {
+		case "direct", "sriov":
+			return nil, status.Errorf(codes.InvalidArgument,
+				"network %q type %q is not supported for containers", netName, def.Type)
+		}
+		// Provision the network on this host (creates/ensures the bridge/vxlan/
+		// isolated device) and use the real bridge — like the VM path. Best-effort,
+		// matching VM create: a provisioning failure falls back to the resolved
+		// bridge name (pre-provisioned hosts, tests) rather than hard-failing.
+		bridge, perr := provisionNetworkForVM(ctx, s.db, netName, s.hostName)
+		if perr != nil || bridge == "" {
+			if perr != nil {
+				slog.Warn("container network provision failed; using resolved bridge name",
+					"network", netName, "error", perr)
+			}
+			bridge = resolveBridge(ctx, s.db, netName)
+		}
 		mac := n.Mac
 		if mac == "" {
 			mac = GenerateMAC()

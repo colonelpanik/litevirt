@@ -135,17 +135,25 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	// Rebuild the clone's MANAGED NIC identity (fresh deterministic MAC+veth, a
+	// dynamic IP — a clone must not reuse the source's address) from the source's
+	// create spec, and rewrite the spec to match. The runtime clone
+	// (cloneFreshIdentity) stamps the SAME deterministic MAC/veth on-disk and drops
+	// the source's static IP, so the clone's DB state and on-disk config agree.
+	cloneSpec := corrosion.DecodeCreateSpec(src.CreateSpec)
+	ifaces, specNets := s.cloneContainerNICs(req.Target, cloneSpec)
+	cloneSpec.Networks = specNets
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: req.Target, State: "stopped",
 		Image: src.Image, CPULimit: src.CPULimit, MemMiB: src.MemMiB,
 		Labels: src.Labels, RestartPolicy: src.RestartPolicy,
 		Project: project, OnHostFailure: src.OnHostFailure,
-		// Carry the source's create-time intent (template/distro/release/arch/
-		// networks) so the clone is relocation/restore-faithful too.
-		CreateSpec: src.CreateSpec, CreatedAt: now,
+		CreateSpec: corrosion.EncodeCreateSpec(cloneSpec), CreatedAt: now,
 		// A clone is a normal container, never a template.
 	}
-	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
+	// Atomic: the container row + the clone's interface rows in one batch (no IPAM
+	// lease — clone NICs are dynamic).
+	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifaces, nil); err != nil {
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
 	}
 

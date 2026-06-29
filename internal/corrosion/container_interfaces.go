@@ -26,18 +26,29 @@ func ContainerVethName(ctName string, ordinal int) string {
 // The veth is recomputed deterministically; IP carries the create-time STATIC
 // intent only (an auto-allocated address was stored empty, so it's re-discovered
 // / re-allocated rather than reusing a stale value).
-func BuildContainerInterfacesFromSpec(hostName, ctName string, spec ContainerCreateSpec) []ContainerInterfaceRecord {
-	var out []ContainerInterfaceRecord
+// It also returns the IPAM leases to (re)take on the target — one per managed NIC
+// that has a STATIC IP (the create-time intent). Auto-allocated NICs were stored
+// with an empty IP, so they take no lease here (re-allocated/re-discovered on the
+// new host). The caller writes both via WriteContainerNetworkAtomic with
+// replaceLeases=true so a static lease transfers from the prior owner.
+func BuildContainerInterfacesFromSpec(hostName, ctName string, spec ContainerCreateSpec) ([]ContainerInterfaceRecord, []IPLease) {
+	var ifs []ContainerInterfaceRecord
+	var leases []IPLease
 	for i, n := range spec.Networks {
 		if n.NetworkName == "" {
 			continue // legacy/unmanaged NIC — no row
 		}
-		out = append(out, ContainerInterfaceRecord{
+		ifs = append(ifs, ContainerInterfaceRecord{
 			HostName: hostName, CtName: ctName, NetworkName: n.NetworkName, Ordinal: i,
 			MAC: n.MAC, IP: n.IP, VethDevice: ContainerVethName(ctName, i), SecurityGroups: n.SecurityGroups,
 		})
+		if n.IP != "" { // static intent → reserve/transfer the lease so IPAM won't reassign it
+			leases = append(leases, IPLease{
+				Network: n.NetworkName, IP: n.IP, MAC: n.MAC, OwnerKind: "ct", OwnerHost: hostName, OwnerName: ctName,
+			})
+		}
 	}
-	return out
+	return ifs, leases
 }
 
 // ContainerInterfaceRecord is one litevirt-MANAGED container NIC — the container
@@ -94,11 +105,11 @@ func containerInterfaceStmt(c *Client, r ContainerInterfaceRecord) (Statement, e
 }
 
 // WriteContainerNetworkAtomic writes a container's interface rows and IPAM leases
-// in ONE transaction. Leases use a plain INSERT (not OR REPLACE) so a PK
-// conflict on (network, ip) from a racing allocation fails the whole batch —
-// nothing is half-written and no lease leaks (the caller rolls back the runtime
-// container + the already-written container row).
-func WriteContainerNetworkAtomic(ctx context.Context, c *Client, ifaces []ContainerInterfaceRecord, leases []IPLease) error {
+// in ONE transaction. replaceLeases=false (create) uses plain lease INSERTs so a
+// PK conflict on (network, ip) from a racing allocation fails the whole batch;
+// replaceLeases=true (restore/migrate/relocate rebuild) uses INSERT OR REPLACE so
+// a re-homed container TRANSFERS an existing static-IP lease from its prior owner.
+func WriteContainerNetworkAtomic(ctx context.Context, c *Client, ifaces []ContainerInterfaceRecord, leases []IPLease, replaceLeases bool) error {
 	stmts := make([]Statement, 0, len(ifaces)+len(leases))
 	for _, ifc := range ifaces {
 		s, err := containerInterfaceStmt(c, ifc)
@@ -107,20 +118,44 @@ func WriteContainerNetworkAtomic(ctx context.Context, c *Client, ifaces []Contai
 		}
 		stmts = append(stmts, s)
 	}
+	stmts = append(stmts, containerLeaseStmts(c, leases, replaceLeases)...)
+	if len(stmts) == 0 {
+		return nil
+	}
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+// containerLeaseStmts builds the ip_allocations INSERTs for a batch. replace=true
+// uses INSERT OR REPLACE (transfer ownership on a rebuild); replace=false uses a
+// plain INSERT so a create race on (network, ip) fails rather than clobbers.
+func containerLeaseStmts(c *Client, leases []IPLease, replace bool) []Statement {
+	verb := "INSERT INTO"
+	if replace {
+		verb = "INSERT OR REPLACE INTO"
+	}
 	now := c.NowTS()
 	allocAt := time.Now().UTC().Format(time.RFC3339)
+	out := make([]Statement, 0, len(leases))
 	for _, l := range leases {
-		stmts = append(stmts, Statement{
-			SQL: `INSERT INTO ip_allocations
+		out = append(out, Statement{
+			SQL: verb + ` ip_allocations
 			 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			Params: []interface{}{l.Network, l.IP, l.MAC, l.OwnerName, l.OwnerKind, l.OwnerHost, allocAt, now},
 		})
 	}
-	if len(stmts) == 0 {
-		return nil
-	}
-	return c.ExecuteBatch(ctx, stmts)
+	return out
+}
+
+// ContainerMAC derives a deterministic, locally-administered MAC for a container
+// NIC from (ct name, ordinal). Deterministic so the clone path writes the SAME
+// MAC into the on-disk LXC config and the interface row (no drift), and a
+// relocate/restore rebuild reproduces it.
+func ContainerMAC(ctName string, ordinal int) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(fmt.Sprintf("%s/%d", ctName, ordinal)))
+	s := h.Sum32()
+	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", byte(s>>16), byte(s>>8), byte(s))
 }
 
 // GetContainerInterfaces returns the live NICs of a container on a host, ordered.

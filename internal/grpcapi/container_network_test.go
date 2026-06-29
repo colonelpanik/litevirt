@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -125,6 +128,61 @@ func TestIPAM_VMandCTSameName_NoAlias(t *testing.T) {
 	}
 	if a, _ := network.GetAllocationFor(ctx, db, "net1", "ct", "h1", "web"); a == nil {
 		t.Fatal("releasing the VM lease wrongly released the same-named CT lease")
+	}
+}
+
+// A clone gets FRESH managed NIC identity keyed on the CLONE's name (deterministic
+// veth + MAC matching the on-disk config the runtime clone rewrites) and a dynamic
+// IP — it must not reuse the source's address — with a create_spec that records the
+// managed network.
+func TestCloneContainer_RebuildsManagedNICs(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	mkManagedNetwork(t, s, "net1", "br-test", "10.9.0.0/24")
+	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "src", Template: "download", Distro: "alpine",
+		Networks: []*pb.ContainerNetwork{{Name: "eth0", NetworkName: "net1"}},
+	}); err != nil {
+		t.Fatalf("CreateContainer(src): %v", err)
+	}
+	if _, err := s.CloneContainer(ctx, &pb.CloneContainerRequest{Source: "src", Target: "clone1", HostName: "test-host"}); err != nil {
+		t.Fatalf("CloneContainer: %v", err)
+	}
+	ifs, _ := corrosion.GetContainerInterfaces(ctx, s.db, "test-host", "clone1")
+	if len(ifs) != 1 {
+		t.Fatalf("clone should have 1 managed interface row, got %d", len(ifs))
+	}
+	if ifs[0].VethDevice != corrosion.ContainerVethName("clone1", 0) {
+		t.Fatalf("clone veth %q not keyed on the clone name", ifs[0].VethDevice)
+	}
+	if ifs[0].MAC != corrosion.ContainerMAC("clone1", 0) {
+		t.Fatalf("clone MAC %q not the deterministic clone MAC", ifs[0].MAC)
+	}
+	if ifs[0].IP != "" {
+		t.Fatalf("clone NIC must be dynamic (blank IP), got %q", ifs[0].IP)
+	}
+	rec, _ := corrosion.GetContainer(ctx, s.db, "test-host", "clone1")
+	if spec := corrosion.DecodeCreateSpec(rec.CreateSpec); len(spec.Networks) != 1 || spec.Networks[0].NetworkName != "net1" {
+		t.Fatalf("clone create_spec lost the managed network identity: %+v", spec.Networks)
+	}
+}
+
+// A container NIC attaching to a direct/sriov (VM-only) network is rejected.
+func TestCreateContainer_RejectsDirectNetwork(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	cfg, _ := json.Marshal(compose.NetworkDef{Interface: "eth0"})
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "dnet", Type: "direct", Config: string(cfg)}); err != nil {
+		t.Fatalf("UpsertNetwork: %v", err)
+	}
+	_, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "c", Template: "download", Distro: "alpine",
+		Networks: []*pb.ContainerNetwork{{Name: "eth0", NetworkName: "dnet"}},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument attaching a container to a direct network, got %v", err)
 	}
 }
 

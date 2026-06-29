@@ -123,30 +123,18 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
 		CreatedAt:     now,
 	}
-	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
-		// Fail closed: the runtime container was created but the cluster row write
-		// failed. A "success" here would strand an untracked container (wrong
-		// quota/accounting, invisible to failover). Best-effort delete the
-		// just-created container, then return an error. (Mirrors RestoreContainer.)
+	// Write the container row + managed interface rows + IPAM leases in ONE atomic
+	// batch (the ip_allocations PK rejects a racing IP, failing the whole batch).
+	// Fail closed: the runtime container exists but the DB write failed → nothing
+	// was persisted, so delete the just-created container and error. No partial
+	// tracked state, no leaked lease (mirrors RestoreContainer's atomic write).
+	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces, plan.leases); err != nil {
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
-			slog.Warn("container create: cleanup after cluster-row-write failure also failed",
+			slog.Warn("container create: cleanup after cluster-state-write failure also failed",
 				"name", info.Name, "error", delErr)
 		}
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
-		return nil, status.Errorf(codes.Internal, "create: record cluster row: %v", err)
-	}
-	// Write the managed interface rows + IPAM leases ATOMICALLY (one batch — the
-	// ip_allocations PK rejects a racing IP). On failure roll back fully: tombstone
-	// the container row + delete the runtime container, so no half-tracked state
-	// and no leaked lease (leases only exist if the whole batch committed).
-	if err := corrosion.WriteContainerNetworkAtomic(ctx, s.db, plan.ifaces, plan.leases); err != nil {
-		_ = corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, info.Name)
-		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
-			slog.Warn("container create: cleanup after network-write failure also failed",
-				"name", info.Name, "error", delErr)
-		}
-		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
-		return nil, status.Errorf(codes.Internal, "create: record container network: %v", err)
+		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)

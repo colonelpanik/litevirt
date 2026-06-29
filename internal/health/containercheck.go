@@ -125,13 +125,15 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		c.publish("ct.relocate.failed", ct.Name, err.Error())
 		return // leave pending → retried next sweep
 	}
-	// Re-home the managed interface rows on this (relocate target) host from the
-	// create spec so the container keeps its network identity + SG bindings.
-	// Best-effort: the container is materialized; rows are re-derivable.
-	for _, ifc := range corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec) {
-		if err := corrosion.UpsertContainerInterface(ctx, c.db, ifc); err != nil {
-			slog.Warn("containercheck: failed to record relocated interface row",
-				"container", ct.Name, "network", ifc.NetworkName, "error", err)
+	// Re-home the managed interface rows + static-IP IPAM leases on this (relocate
+	// target) host from the create spec, so the relocated container keeps its
+	// network identity + SG bindings and its static address isn't reassigned by
+	// IPAM (replaceLeases=true transfers the lease from the dead source). Best-
+	// effort: the container is materialized; rows are re-derivable.
+	if ifs, leases := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec); len(ifs) > 0 {
+		if err := corrosion.WriteContainerNetworkAtomic(ctx, c.db, ifs, leases, true); err != nil {
+			slog.Warn("containercheck: failed to re-home relocated managed NICs",
+				"container", ct.Name, "error", err)
 		}
 	}
 	if err := c.runtime.Start(ctx, ct.Name); err != nil {

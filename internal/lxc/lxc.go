@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -722,10 +723,20 @@ func (r *LxcRunner) cloneFreshIdentity(name string) error {
 		case strings.HasPrefix(t, "lxc.uts.name"):
 			lines[i] = "lxc.uts.name = " + name
 		case strings.HasPrefix(t, "lxc.net.") && strings.Contains(t, ".hwaddr"):
-			// Preserve the key (lxc.net.N.hwaddr), assign a fresh MAC.
-			if key, _, ok := strings.Cut(t, "="); ok {
-				lines[i] = strings.TrimSpace(key) + " = " + randomMAC()
+			// Fresh, DETERMINISTIC MAC keyed on the clone's name+ordinal, so the
+			// on-disk config matches the interface row the clone path records.
+			if n, ok := lxcNetOrdinal(t); ok {
+				lines[i] = fmt.Sprintf("lxc.net.%d.hwaddr = %s", n, corrosion.ContainerMAC(name, n))
 			}
+		case strings.HasPrefix(t, "lxc.net.") && strings.Contains(t, ".veth.pair"):
+			// Re-key the host veth to the clone's deterministic name so it can't
+			// collide with the source's veth on the same host (and matches the DB).
+			if n, ok := lxcNetOrdinal(t); ok {
+				lines[i] = fmt.Sprintf("lxc.net.%d.veth.pair = %s", n, corrosion.ContainerVethName(name, n))
+			}
+		case strings.HasPrefix(t, "lxc.net.") && strings.Contains(t, ".ipv4.address"):
+			// Drop the source's static IP — a clone is a new workload (dynamic IP).
+			lines[i] = ""
 		}
 	}
 	if err := os.WriteFile(cfg, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
@@ -750,6 +761,20 @@ func randomMAC() string {
 	buf := make([]byte, 3)
 	_, _ = rand.Read(buf)
 	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", buf[0], buf[1], buf[2])
+}
+
+// lxcNetOrdinal extracts N from a "lxc.net.<N>.<key>" config line.
+func lxcNetOrdinal(line string) (int, bool) {
+	rest := strings.TrimPrefix(strings.TrimSpace(line), "lxc.net.")
+	dot := strings.IndexByte(rest, '.')
+	if dot <= 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(rest[:dot])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // rewriteRootFSPath pins the container config's lxc.rootfs.path to this host's

@@ -2,8 +2,10 @@ package grpcapi
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -43,6 +45,12 @@ const hasChunksMaxBatch = 8192
 // refs). A manifest is ~ disk_size/4MiB * ~120 bytes; this comfortably covers
 // multi-TB disks while refusing an unbounded malicious manifest stream.
 const maxManifestBytes = 256 << 20
+
+// maxPushFrameBytes caps a single PushBackup sub-frame's payload, enforced by the
+// receiver independently of the daemon's (larger) gRPC max message size. The
+// client frames at pushFrameSize (1 MiB); a little headroom tolerates framing
+// overhead without admitting a giant single frame.
+const maxPushFrameBytes = pushFrameSize + (64 << 10) // 1 MiB + 64 KiB headroom
 
 // HasChunks reports, for each requested id, whether the destination repo already
 // holds that chunk — the batched dedup probe behind SyncManifest's wire path.
@@ -138,6 +146,9 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 			if cr.inProgress() {
 				return status.Error(codes.InvalidArgument, "push-backup: manifest frame while a chunk is incomplete")
 			}
+			if len(f.Manifest.GetData()) > maxPushFrameBytes {
+				return status.Errorf(codes.InvalidArgument, "push-backup: manifest sub-frame %d bytes exceeds cap %d", len(f.Manifest.GetData()), maxPushFrameBytes)
+			}
 			manifestSeen = true
 			manifestBuf = append(manifestBuf, f.Manifest.GetData()...)
 			if len(manifestBuf) > maxManifestBytes {
@@ -200,6 +211,11 @@ func (cr *chunkReassembler) inProgress() bool { return cr.id != "" }
 func (cr *chunkReassembler) accept(repo *pbsstore.Repo, c *pb.PushChunkFrame, stats *pb.PushBackupResponse) error {
 	if c.GetTotalSize() < 0 || c.GetTotalSize() > pbsstore.ChunkSize {
 		return status.Errorf(codes.InvalidArgument, "push-backup: chunk total_size %d out of range (0..%d)", c.GetTotalSize(), pbsstore.ChunkSize)
+	}
+	// Enforce the per-frame transport cap independently of the daemon's gRPC max
+	// message size — a peer must not send a giant single sub-frame.
+	if len(c.GetData()) > maxPushFrameBytes {
+		return status.Errorf(codes.InvalidArgument, "push-backup: chunk sub-frame %d bytes exceeds cap %d", len(c.GetData()), maxPushFrameBytes)
 	}
 	if err := safename.ValidateChunkID(c.GetChunkId()); err != nil {
 		return status.Errorf(codes.InvalidArgument, "push-backup: chunk id: %v", err)
@@ -305,18 +321,53 @@ func (s *Server) openStagingRepo(token string) (*pbsstore.Repo, error) {
 	return pbsstore.Init(path)
 }
 
-// newLocalStagingRepo creates a fresh local staging repo (a plaintext transfer
-// buffer under <DataDir>/backup-staging/<token>/) and returns a cleanup closure.
-// Used by remote backup: the owning daemon runs the backup engine into it, then
-// streams the manifest to the sink and removes it.
+// newLocalStagingRepo creates a fresh local staging repo (a transfer buffer under
+// <DataDir>/backup-staging/<token>/) and returns a cleanup closure. Used by remote
+// backup: the owning daemon runs the backup engine into it, then streams the
+// manifest to the sink and removes it.
+//
+// The staging repo is ENCRYPTED with an ephemeral, never-persisted key: the
+// operator may have chosen an encrypted sink repo precisely so backup data is
+// never at rest in plaintext, and a transient plaintext staging copy on the owner
+// would defeat that. The key lives only in this process's memory and is discarded
+// with the Repo, so even a crash-orphaned staging dir holds only chunks sealed
+// under a lost key. SyncManifest reads via GetChunk (decrypts in memory → plain
+// over mTLS) and the sink re-encrypts at rest with ITS own key — the chunk id is
+// the plaintext BLAKE3, so cross-key dedup still works.
 func (s *Server) newLocalStagingRepo() (*pbsstore.Repo, func(), error) {
 	token := newTransferToken()
 	path := filepath.Join(s.dataDir, "backup-staging", token)
-	r, err := pbsstore.Init(path)
+	r, err := pbsstore.InitEncrypted(path, pbsstore.EncryptionModeAESGCM)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.Internal, "create backup staging repo: %v", err)
 	}
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		_ = os.RemoveAll(path)
+		return nil, nil, status.Errorf(codes.Internal, "staging key: %v", err)
+	}
+	if err := r.SetKey(key[:]); err != nil {
+		_ = os.RemoveAll(path)
+		return nil, nil, status.Errorf(codes.Internal, "staging key: %v", err)
+	}
 	return r, func() { _ = os.RemoveAll(path) }, nil
+}
+
+// SweepTransferStaging removes every per-transfer staging repo left under the
+// staging roots. It is called ONCE at daemon startup: any staging dir present then
+// is an orphan from a previous process incarnation (a crashed/aborted transfer, or
+// a push whose restore was never driven — see drivePeerRestore), since a live
+// transfer holds its dir only for the duration of an in-process operation. Best-
+// effort; a leftover dir is wasted space, never correctness.
+func (s *Server) SweepTransferStaging() {
+	for _, root := range []string{
+		filepath.Join(s.dataDir, "backup-staging"),
+		s.stagingRepoRoot(),
+	} {
+		if err := os.RemoveAll(root); err != nil {
+			slog.Warn("sweep transfer staging", "root", root, "error", err)
+		}
+	}
 }
 
 // pushManifestToPeerRepo streams one manifest + its missing chunks from a local

@@ -9606,16 +9606,18 @@ func (x *RestoreContainerProgress) GetError() string {
 
 // MigrateContainerRequest cold-migrates a container to another host by reusing
 // the backup→restore data path: the source archives the (stopped) container into
-// a staging repo, the target restores from it. repo_path must therefore be
-// reachable from BOTH hosts (e.g. an NFS-mounted backup repo). No CRIU / live
-// migration — the container is stopped for the transfer and restarted on the
-// target if it was running.
+// repo_path locally, then STREAMS the manifest to the target over peer mTLS (into
+// a per-transfer staging repo), so repo_path need only exist on the SOURCE. (An
+// older target that predates peer streaming falls back to re-opening repo_path by
+// name, which then must be reachable from both hosts.) No CRIU / live migration —
+// the container is stopped for the transfer and restarted on the target if it was
+// running.
 type MigrateContainerRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	SourceHost    string                 `protobuf:"bytes,2,opt,name=source_host,json=sourceHost,proto3" json:"source_host,omitempty"` // empty = resolve by name
 	TargetHost    string                 `protobuf:"bytes,3,opt,name=target_host,json=targetHost,proto3" json:"target_host,omitempty"`
-	RepoPath      string                 `protobuf:"bytes,4,opt,name=repo_path,json=repoPath,proto3" json:"repo_path,omitempty"` // staging repo reachable from both hosts
+	RepoPath      string                 `protobuf:"bytes,4,opt,name=repo_path,json=repoPath,proto3" json:"repo_path,omitempty"` // source-local staging repo (streamed to the target)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

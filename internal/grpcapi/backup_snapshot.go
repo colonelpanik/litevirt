@@ -90,9 +90,12 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 			return err
 		}
 		defer cleanup()
-		// The parent manifest (if any) lives on the SINK, not here, so a fresh
-		// staging repo has no parent — read full. The push still dedups against the
-		// sink, so unchanged chunks don't cross the wire.
+		// The parent manifest (if any) lives on the SINK, not in this fresh staging
+		// repo, so an incremental READ has nothing to diff against here — read full.
+		// The push still dedups against the sink (SyncManifest probes HasChunks), so
+		// unchanged chunks don't cross the wire; only the owner-side read I/O isn't
+		// dirty-bitmap-optimized. (Follow-up: fetch the parent manifest from the sink
+		// to restore the incremental read.)
 		full := proto.Clone(req).(*pb.BackupSnapshotRequest)
 		full.Incremental = false
 		req = full

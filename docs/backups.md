@@ -366,8 +366,19 @@ so a transfer works even between repos with different encryption modes. Each
 chunk's BLAKE3 id is verified on the receiver before it's written, and the
 manifest is written last, only after every chunk it references is confirmed
 present. The RPCs are peer-only (host cert) and load-shed under a serving
-semaphore. An older peer that predates this transport falls back to the
-shared-repo path (pass a repo name reachable from both hosts).
+semaphore. The owner's transient backup staging repo is itself encrypted with an
+ephemeral, never-persisted key, so backup data is never at rest in plaintext even
+mid-transfer; orphaned staging repos are swept at daemon startup.
+
+**Old-peer behavior differs by flow.** *Cold migrate / failover restore* fall
+back to the shared-repo path when the target predates peer streaming (the target
+re-opens the repo by name — it must then be reachable from both hosts). *Remote
+VM/CT backup* has no pre-existing remote path to fall back to (cross-host backup
+is new in this transport): if the sink daemon can't receive a push, the operation
+returns an error rather than silently landing the backup on the wrong host.
+Incremental READ for a remote backup (dirty-bitmap savings) is a follow-up — the
+read is currently full, though the push still dedups so only changed chunks cross
+the wire.
 
 ## Compose integration
 

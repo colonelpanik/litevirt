@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -189,6 +190,20 @@ func TestPushBackup_RejectsOversizeChunk(t *testing.T) {
 	}
 }
 
+// A single sub-frame whose payload exceeds the per-frame cap is rejected,
+// independently of the daemon's (larger) gRPC max message size.
+func TestPushBackup_RejectsOversizeFrame(t *testing.T) {
+	s := newPeerAuthServer(t)
+	peer := mtlsCtx("peer-1")
+	big := make([]byte, maxPushFrameBytes+1)
+	frame := &pb.PushBackupFrame{Frame: &pb.PushBackupFrame_Chunk{
+		Chunk: &pb.PushChunkFrame{ChunkId: pbsstore.ChunkID(big), TotalSize: int64(len(big)), Offset: 0, Data: big},
+	}}
+	if _, err := runPush(s, peer, stagingHeader("tok"), frame); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("want InvalidArgument for oversize sub-frame, got %v", err)
+	}
+}
+
 // A gap in a chunk's offsets (not contiguous tiling) is rejected.
 func TestPushBackup_RejectsOffsetGap(t *testing.T) {
 	s := newPeerAuthServer(t)
@@ -299,6 +314,46 @@ func TestPushBackup_SemaphoreSheds(t *testing.T) {
 	}
 	if _, err := runPush(s, mtlsCtx("peer-1"), stagingHeader("tok")); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("want ResourceExhausted when semaphore full, got %v", err)
+	}
+}
+
+// The owner's transient backup staging repo is encrypted at rest (ephemeral key),
+// so backup data is never in plaintext on disk mid-transfer.
+func TestNewLocalStagingRepo_Encrypted(t *testing.T) {
+	s := newPeerAuthServer(t)
+	repo, cleanup, err := s.newLocalStagingRepo()
+	if err != nil {
+		t.Fatalf("newLocalStagingRepo: %v", err)
+	}
+	defer cleanup()
+	if !repo.IsEncrypted() {
+		t.Fatal("backup staging repo must be encrypted at rest")
+	}
+	// A round-trip through the encrypted repo returns the original plaintext.
+	id, _, err := repo.PutChunk([]byte("secret payload"))
+	if err != nil {
+		t.Fatalf("PutChunk: %v", err)
+	}
+	got, err := repo.GetChunk(id)
+	if err != nil || string(got) != "secret payload" {
+		t.Fatalf("GetChunk = %q, %v", got, err)
+	}
+}
+
+// SweepTransferStaging removes orphaned per-transfer staging dirs left by a prior
+// process incarnation (crashed transfer, or a push whose restore was never driven).
+func TestSweepTransferStaging_RemovesOrphans(t *testing.T) {
+	s := newPeerAuthServer(t)
+	for _, sub := range []string{"backup-staging/tokA", "restore-staging/tokB"} {
+		if err := os.MkdirAll(filepath.Join(s.dataDir, sub), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	s.SweepTransferStaging()
+	for _, root := range []string{"backup-staging", "restore-staging"} {
+		if _, err := os.Stat(filepath.Join(s.dataDir, root)); !os.IsNotExist(err) {
+			t.Fatalf("%s should be swept, stat err = %v", root, err)
+		}
 	}
 }
 

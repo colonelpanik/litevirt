@@ -777,15 +777,17 @@ message RestoreContainerProgress {
 
 // MigrateContainerRequest cold-migrates a container to another host by reusing
 // the backup→restore data path: the source archives the (stopped) container into
-// a staging repo, the target restores from it. repo_path must therefore be
-// reachable from BOTH hosts (e.g. an NFS-mounted backup repo). No CRIU / live
-// migration — the container is stopped for the transfer and restarted on the
-// target if it was running.
+// repo_path locally, then STREAMS the manifest to the target over peer mTLS (into
+// a per-transfer staging repo), so repo_path need only exist on the SOURCE. (An
+// older target that predates peer streaming falls back to re-opening repo_path by
+// name, which then must be reachable from both hosts.) No CRIU / live migration —
+// the container is stopped for the transfer and restarted on the target if it was
+// running.
 message MigrateContainerRequest {
     string name        = 1;
     string source_host = 2;  // empty = resolve by name
     string target_host = 3;
-    string repo_path   = 4;  // staging repo reachable from both hosts
+    string repo_path   = 4;  // source-local staging repo (streamed to the target)
 }
 
 message MigrateContainerProgress {

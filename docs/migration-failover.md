@@ -178,10 +178,13 @@ Set in compose `migrate` section:
 
 ## Containers
 
-**Cold migration** — `lv ct migrate <name> <target> --repo <shared-dir>` moves a
+**Cold migration** — `lv ct migrate <name> <target> --repo <dir>` moves a
 container to another host by reusing the backup→restore transport (stop →
-archive → restore on target → restart if it was running). `--repo` must be
-reachable from both hosts. No live/CRIU migration.
+archive → restore on target → restart if it was running). The source archives
+into `--repo` locally and **streams the manifest to the target over peer mTLS**
+(into a per-transfer staging repo), so `--repo` no longer needs to be reachable
+from both hosts. If the target predates peer streaming it falls back to
+re-opening `--repo` by name, which then must be shared. No live/CRIU migration.
 
 **Host-loss relocation** — when a host is fenced, the failover coordinator
 relocates its containers that carry an `on_host_failure` policy (set with

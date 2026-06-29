@@ -64,5 +64,6 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		ReExecCh:       make(chan struct{}, 1),
 		ShutdownCh:     make(chan struct{}, 1),
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
+		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 }

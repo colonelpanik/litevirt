@@ -129,6 +129,11 @@ type Server struct {
 	// nil → unbounded (defensive; constructors initialize it).
 	fetchBinarySem chan struct{}
 
+	// pushBackupSem bounds concurrent PushBackup streams this node serves as a
+	// sink, so a burst of remote backups/migrations can't exhaust disk/CPU.
+	// nil → unbounded (defensive; constructors initialize it).
+	pushBackupSem chan struct{}
+
 	// authEngine is the path-based RBAC engine. transitional:
 	// when nil OR when no role-bindings exist for the caller, RequirePerm
 	// falls back to the legacy admin/operator/viewer roleLevel comparison.
@@ -284,6 +289,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		ReExecCh:       make(chan struct{}, 1),
 		ShutdownCh:     make(chan struct{}, 1),
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
+		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 }
 

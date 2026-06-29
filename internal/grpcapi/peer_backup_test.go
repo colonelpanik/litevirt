@@ -20,10 +20,11 @@ import (
 // captures the response.
 type fakePushServer struct {
 	grpc.ClientStreamingServer[pb.PushBackupFrame, pb.PushBackupResponse]
-	ctx    context.Context
-	frames []*pb.PushBackupFrame
-	i      int
-	resp   *pb.PushBackupResponse
+	ctx     context.Context
+	frames  []*pb.PushBackupFrame
+	i       int
+	resp    *pb.PushBackupResponse
+	sendErr error // when set, SendAndClose returns it (models a lost close response)
 }
 
 func (f *fakePushServer) Context() context.Context { return f.ctx }
@@ -39,7 +40,7 @@ func (f *fakePushServer) Recv() (*pb.PushBackupFrame, error) {
 
 func (f *fakePushServer) SendAndClose(r *pb.PushBackupResponse) error {
 	f.resp = r
-	return nil
+	return f.sendErr
 }
 
 func stagingHeader(token string) *pb.PushBackupFrame {
@@ -341,6 +342,38 @@ func TestPushBackup_RejectsManifestReferencingMissingChunk(t *testing.T) {
 	}
 }
 
+// A frame arriving after the final manifest sub-frame is rejected (the manifest
+// is the last thing on the wire).
+func TestPushBackup_RejectsFrameAfterFinalManifest(t *testing.T) {
+	s := newPeerAuthServer(t)
+	peer := mtlsCtx("peer-1")
+	data := []byte("a chunk")
+	m := manifestFor(data, "2026-06-29T10:00:00Z")
+	frames := append([]*pb.PushBackupFrame{stagingHeader("tok")}, chunkFrames(data, 4, "")...)
+	frames = append(frames, manifestFrame(t, m), manifestFrame(t, m)) // a trailing frame after final
+	if _, err := runPush(s, peer, frames...); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("want InvalidArgument for a frame after the final manifest, got %v", err)
+	}
+}
+
+// If the close response is lost AFTER the manifest committed, the source won't
+// drive the restore, so a STAGING repo must still be removed receiver-side (it
+// isn't "committed" from the source's perspective).
+func TestPushBackup_StagingRemovedWhenCloseFails(t *testing.T) {
+	s := newPeerAuthServer(t)
+	data := []byte("staged content")
+	m := manifestFor(data, "2026-06-29T10:00:00Z")
+	frames := append([]*pb.PushBackupFrame{stagingHeader("tok")}, chunkFrames(data, 4, "")...)
+	frames = append(frames, manifestFrame(t, m))
+	fs := &fakePushServer{ctx: mtlsCtx("peer-1"), frames: frames, sendErr: io.ErrClosedPipe}
+	if err := s.PushBackup(fs); err == nil {
+		t.Fatal("expected SendAndClose error to surface")
+	}
+	if _, err := os.Stat(filepath.Join(s.dataDir, "restore-staging", "tok")); !os.IsNotExist(err) {
+		t.Fatalf("staging repo should be removed when the close fails, stat err = %v", err)
+	}
+}
+
 // Peer-only: a non-peer (operator) caller is rejected before anything is read.
 func TestPushBackup_PeerOnly(t *testing.T) {
 	s := newPeerAuthServer(t)
@@ -397,6 +430,20 @@ func TestSweepTransferStaging_RemovesOrphans(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(s.dataDir, root)); !os.IsNotExist(err) {
 			t.Fatalf("%s should be swept, stat err = %v", root, err)
 		}
+	}
+}
+
+// A configured sink repo that is encrypted is refused (the daemon has no key to
+// seal chunks) with FailedPrecondition — never a silent plaintext write.
+func TestResolveRepoTarget_RefusesEncryptedConfiguredRepo(t *testing.T) {
+	s := newPeerAuthServer(t)
+	dir := t.TempDir()
+	if _, err := pbsstore.InitEncrypted(dir, pbsstore.EncryptionModeAESGCM); err != nil {
+		t.Fatalf("InitEncrypted: %v", err)
+	}
+	s.SetBackupRepos(map[string]string{"enc": dir})
+	if _, err := s.resolveRepoTarget(context.Background(), &pb.RepoTarget{RepoName: "enc"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("want FailedPrecondition for an encrypted configured sink repo, got %v", err)
 	}
 }
 

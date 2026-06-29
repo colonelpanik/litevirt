@@ -59,6 +59,41 @@ func TestBackupContainer_RemotePushToSink(t *testing.T) {
 	}
 }
 
+// Flow 2 (owner side), encrypted sink: a push to a sink whose configured repo is
+// encrypted (no daemon key) fails with FailedPrecondition — the sink's status code
+// is PRESERVED through SyncManifest + pushManifestToPeerRepo, not flattened to
+// Internal.
+func TestBackupContainer_RemotePushToEncryptedSink_FailedPrecondition(t *testing.T) {
+	sink := newPeerAuthServer(t)
+	encDir := t.TempDir()
+	if _, err := pbsstore.InitEncrypted(encDir, pbsstore.EncryptionModeAESGCM); err != nil {
+		t.Fatalf("InitEncrypted: %v", err)
+	}
+	sink.SetBackupRepos(map[string]string{"r1": encDir})
+
+	owner := testServer(t)
+	owner.hostName = "owner-host"
+	owner.dataDir = t.TempDir()
+	owner.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs-bytes-rootfs-bytes")})
+	if err := corrosion.UpsertContainer(context.Background(), owner.db, corrosion.ContainerRecord{
+		HostName: "owner-host", Name: "ct1", State: "stopped",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	owner.peerClientOverride = func(_ context.Context, _ string) (pb.LiteVirtClient, func(), error) {
+		return &fakeLVClient{srv: sink, peerCtx: mtlsCtx("peer-1")}, func() {}, nil
+	}
+
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	err := owner.BackupContainer(&pb.BackupContainerRequest{
+		Name: "ct1", HostName: "owner-host", RepoPath: "r1",
+		Timestamp: "2026-06-29T10:00:00Z", SinkHost: sink.hostName,
+	}, bk)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("want FailedPrecondition propagated from the encrypted sink, got %v", err)
+	}
+}
+
 // Flow 2 (sink side): the called daemon forwards to the owner and reports success
 // only after CONFIRMING the manifest landed in its own repo. An owning daemon too
 // old to honor sink_host (reports DONE but pushes nothing) surfaces as an error,

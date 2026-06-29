@@ -132,6 +132,11 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 		if err != nil {
 			return err // transport error or context cancel — nothing committed
 		}
+		// The manifest is the LAST thing on the wire: nothing may follow its final
+		// sub-frame (the client CloseSends after it). Reject a trailing frame.
+		if manifestFinal {
+			return status.Error(codes.InvalidArgument, "push-backup: frame after the final manifest frame")
+		}
 		switch f := frame.GetFrame().(type) {
 		case *pb.PushBackupFrame_Header:
 			if repo != nil {
@@ -208,8 +213,16 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 	if err := repo.PutManifest(&m); err != nil {
 		return status.Errorf(codes.Internal, "push-backup: write manifest: %v", err)
 	}
-	committed = true // a staging repo now holds a committed manifest for the restore to consume
-	return stream.SendAndClose(&stats)
+	// Mark committed only AFTER the close succeeds: if SendAndClose fails the source
+	// sees an error and won't drive the restore, so a staging repo whose manifest
+	// landed is still useless to it — the deferred cleanup must remove it (committed
+	// stays false). A configured repo (stagingToken == "") is never auto-removed
+	// regardless, so its now-valid manifest is kept.
+	if err := stream.SendAndClose(&stats); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // chunkReassembler buffers exactly one in-flight chunk while a PushBackup stream
@@ -411,10 +424,19 @@ func (s *Server) pushManifestToPeerRepo(ctx context.Context, sinkHost, repoName 
 	sink := newRemoteRepoSink(ctx, c, &pb.RepoTarget{RepoName: repoName})
 	defer sink.Close()
 	if _, err := pbsstore.SyncManifest(ctx, srcRepo, m, sink); err != nil {
-		if status.Code(err) == codes.Unimplemented {
+		// SyncManifest wraps the sink's RPC error (status.Code unwraps the %w chain).
+		// Preserve the sink-returned status so the operator sees the real reason —
+		// e.g. FailedPrecondition for an encrypted sink repo without daemon-side key
+		// material, ResourceExhausted, NotFound — instead of a flattened Internal.
+		switch code := status.Code(err); code {
+		case codes.Unimplemented:
 			return status.Errorf(codes.FailedPrecondition, "sink host %q predates peer backup streaming", sinkHost)
+		case codes.Unknown, codes.OK:
+			// Not a gRPC status (e.g. a local chunk read error) → genuinely internal.
+			return status.Errorf(codes.Internal, "push backup to sink %q: %v", sinkHost, err)
+		default:
+			return status.Errorf(code, "push backup to sink %q: %v", sinkHost, err)
 		}
-		return status.Errorf(codes.Internal, "push backup to sink %q: %v", sinkHost, err)
 	}
 	return nil
 }

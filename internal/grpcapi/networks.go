@@ -15,6 +15,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // CreateNetwork provisions a standalone network on this host and persists it.
@@ -344,6 +345,12 @@ func (s *Server) GetVMIPRemote(ctx context.Context, req *pb.GetVMIPRequest) (*pb
 		return nil, err
 	}
 	if req.OwnerKind == "ct" {
+		// owner_name is wire-supplied and composes a shell argument (lxc-info -n) and
+		// a DB lookup — validate it before any runtime/DB touch (defense in depth even
+		// though this RPC is peer-only).
+		if err := safename.ValidateContainerName(req.OwnerName); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
 		ip := ""
 		if s.containerRuntime != nil {
 			if v, err := s.containerRuntime.IPContainer(ctx, req.OwnerName); err == nil {

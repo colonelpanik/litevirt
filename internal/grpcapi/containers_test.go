@@ -36,8 +36,10 @@ type fakeCTRuntime struct {
 	deleteErr error
 
 	// ipByName lets a test simulate a locally-discovered (e.g. DHCP) container
-	// IP — what IPContainer (lxc-info -iH) would return on the LB host.
+	// IP — what IPContainer (lxc-info -iH) would return on the LB host. ipCalls
+	// records the names IPContainer was invoked with (to assert it was/wasn't hit).
 	ipByName map[string]string
+	ipCalls  []string
 
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
@@ -127,6 +129,7 @@ func (f *fakeCTRuntime) StateContainer(_ context.Context, _ string) (string, err
 func (f *fakeCTRuntime) IPContainer(_ context.Context, name string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ipCalls = append(f.ipCalls, name)
 	return f.ipByName[name], nil
 }
 func (f *fakeCTRuntime) FreezeContainer(_ context.Context, name string) error {

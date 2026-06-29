@@ -41,6 +41,20 @@ func TestGetVMIPRemote_PeerGatedAndContainer(t *testing.T) {
 	if resp.Ip != "10.0.0.77" {
 		t.Errorf("CT IP = %q, want 10.0.0.77", resp.Ip)
 	}
+
+	// A wire-supplied bad container name is rejected BEFORE any runtime/DB touch.
+	rt := s.containerRuntime.(*fakeCTRuntime)
+	before := len(rt.ipCalls)
+	if _, err := s.GetVMIPRemote(mtlsCtx("peer-1"), &pb.GetVMIPRequest{OwnerKind: "ct", OwnerName: "../bad"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("bad owner_name: got %v, want InvalidArgument", err)
+	}
+	if len(rt.ipCalls) != before {
+		t.Errorf("runtime IPContainer was called for an invalid name: %v", rt.ipCalls)
+	}
+	// An empty container name is likewise rejected.
+	if _, err := s.GetVMIPRemote(mtlsCtx("peer-1"), &pb.GetVMIPRequest{OwnerKind: "ct", OwnerName: ""}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty owner_name: got %v, want InvalidArgument", err)
+	}
 }
 
 // TestDeleteContainer_RemovesDNSRecord: the delete cascade tombstones the

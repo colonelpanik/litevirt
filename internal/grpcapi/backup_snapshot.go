@@ -23,11 +23,12 @@ import (
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
-// BackupSnapshot streams a VM disk into a host-local backup repo.
-// only the daemon-you-call-with-LV_HOST does work; if
-// the VM lives on a different host, FailedPrecondition tells the
-// operator which host to retry against. Cross-host disk streaming
-// is a follow-up (would need a peer streaming primitive).
+// BackupSnapshot streams a VM disk into the called daemon's backup repo. Call the
+// repo-owning daemon: if the VM lives elsewhere, this daemon (the repo sink) has
+// the owning daemon read the disk locally and PushBackup-streams the manifest back
+// over peer mTLS (sinkRemoteVMBackup), then confirms it landed in our repo — so no
+// shared repo is required (PR 4). sink_host is the internal field that drives the
+// owner side of that forward; clients leave it empty (requireSinkPeer gates it).
 func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.ServerStreamingServer[pb.BackupSnapshotProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

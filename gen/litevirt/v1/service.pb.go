@@ -7570,12 +7570,12 @@ type BackupSnapshotRequest struct {
 	// when the VM advertises one, else proceeds crash-consistent; "off" forces
 	// crash-consistent. A freeze failure never fails an otherwise-good backup.
 	Quiesce string `protobuf:"bytes,6,opt,name=quiesce,proto3" json:"quiesce,omitempty"`
-	// sink_host (PR 4) makes a REMOTE backup possible without a shared repo: the
-	// owning daemon reads the disk locally and PushBackup-streams the manifest to
-	// sink_host's repo (repo_path is resolved as a logical name on sink_host).
-	// Empty = today's local-write behavior. Requires a configured logical repo
-	// name (a direct absolute repo_path is local-only and rejected for remote
-	// streaming, since no peer can resolve it).
+	// sink_host (PR 4) is an INTERNAL field — clients do NOT set it. The repo-
+	// owning "sink" daemon sets it (to its own hostname) when it forwards a remote
+	// backup to the owning daemon, telling the owner to read the disk locally and
+	// PushBackup-stream the manifest back to sink_host (resolved there as a logical
+	// repo name). The owner accepts it only from that peer over mTLS (host-cert CN
+	// == sink_host); a non-peer request that sets it is rejected. Leave empty.
 	SinkHost      string `protobuf:"bytes,7,opt,name=sink_host,json=sinkHost,proto3" json:"sink_host,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -9246,18 +9246,20 @@ func (x *PullOCIImageRequest) GetPassword() string {
 }
 
 // BackupContainerRequest pushes a container's rootfs (and its LXC config) into a
-// host-local backup repo as a full, content-addressed manifest. Containers are
-// host-local, so this runs on the owning host; an empty host_name is resolved by
-// name and, if the owner is a different daemon, FailedPrecondition names it.
+// backup repo as a full, content-addressed manifest. Call the repo-owning daemon:
+// if the container lives elsewhere, that daemon has the owning daemon archive
+// locally and streams the manifest back over peer mTLS (PR 4) — no shared repo
+// needed; an empty host_name is resolved by name.
 type BackupContainerRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Name      string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	HostName  string                 `protobuf:"bytes,2,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"` // empty = resolve by name
 	RepoPath  string                 `protobuf:"bytes,3,opt,name=repo_path,json=repoPath,proto3" json:"repo_path,omitempty"` // host-local directory (must be initialised)
 	Timestamp string                 `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`               // RFC3339; empty = now
-	// sink_host (PR 4): the owning daemon archives locally and PushBackup-streams
-	// the manifest to sink_host's repo (repo_path resolved as a logical name on
-	// sink_host). Empty = local write. See BackupSnapshotRequest.sink_host.
+	// sink_host (PR 4): INTERNAL — clients do NOT set it. See
+	// BackupSnapshotRequest.sink_host: the repo-owning sink daemon sets it when
+	// forwarding to the owner, which accepts it only from that peer over mTLS
+	// (CN == sink_host). Leave empty.
 	SinkHost      string `protobuf:"bytes,5,opt,name=sink_host,json=sinkHost,proto3" json:"sink_host,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

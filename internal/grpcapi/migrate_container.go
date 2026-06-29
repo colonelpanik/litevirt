@@ -20,15 +20,17 @@ import (
 
 // MigrateContainer cold-migrates a container to another host by reusing the
 // backup→restore data path (one tested transport): on the SOURCE host it stops
-// the container (cold), archives it into a staging repo, then drives the
-// TARGET's RestoreContainer over a peer connection; on success it re-keys the
-// owner (the target's restore created the new row) and removes the source copy.
-// A failure anywhere before finalisation leaves the container intact on the
-// source (restarted if it had been running). repo_path must be reachable from
-// both hosts (e.g. an NFS-mounted repo).
+// the container (cold), archives it into a source-local staging repo, then drives
+// the TARGET's RestoreContainer over a peer connection — streaming the manifest
+// into the target's internal staging repo over peer mTLS (drivePeerRestore), so
+// repo_path need only exist on the SOURCE (no shared repo required; an older
+// target falls back to re-opening repo_path by name). On success it re-keys the
+// owner (the target's restore created the new row) and removes the source copy. A
+// failure anywhere before finalisation leaves the container intact on the source
+// (restarted if it had been running).
 //
-// Runs on the source host — like BackupContainer, point it at the owning daemon
-// (FailedPrecondition names it otherwise). No CRIU / live migration.
+// Runs on the source host — point it at the owning daemon (FailedPrecondition
+// names it otherwise). No CRIU / live migration.
 func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.ServerStreamingServer[pb.MigrateContainerProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

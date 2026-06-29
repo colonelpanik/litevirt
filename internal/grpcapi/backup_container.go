@@ -117,10 +117,12 @@ func (s *Server) migrateSourceFromPeer(ctx context.Context) string {
 }
 
 // BackupContainer freezes a container, streams its rootfs+config as a full,
-// content-addressed manifest into a host-local repo, and indexes the size for
-// quota. Containers are host-local, so this runs on the owning host; if the
-// container lives elsewhere FailedPrecondition names that host (mirrors
-// BackupSnapshot — cross-host streaming is a follow-up).
+// content-addressed manifest into the called daemon's repo, and indexes the size
+// for quota. Call the repo-owning daemon: if the container lives elsewhere, this
+// daemon (the repo sink) has the owning daemon archive locally and PushBackup-
+// streams the manifest back over peer mTLS (sinkRemoteContainerBackup), then
+// confirms it landed — so no shared repo is required (PR 4). sink_host drives the
+// owner side of that forward and is gated to the sink peer (requireSinkPeer).
 func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.ServerStreamingServer[pb.BackupContainerProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

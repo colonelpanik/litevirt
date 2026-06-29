@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
@@ -98,6 +100,40 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			return status.Errorf(codes.Internal, "stop for migration: %v", err)
 		}
 	}
+	// Record a migration stop intent for EVERY source — not only a running one —
+	// IMMEDIATELY, before the (potentially long) archive→transfer→restore window.
+	// During that window the source row is all that keeps the reconciler from
+	// (re)starting it: a running source still reads "running" until we mark it, and
+	// an ALREADY-stopped source with a restart policy (stopped out-of-band, no
+	// operator-stop) would be restarted on the very next sweep. Either way a restart
+	// produces writes AFTER the archive was taken, which are then lost when the
+	// source is removed once the target lands. operator-stop is the reconciler's
+	// guaranteed-stick "leave it down" marker. The write is STRICT (zero rows ⇒
+	// error): the row was confirmed at preflight, but a concurrent / replicated
+	// delete could soft-delete it before this write — and a non-strict UPDATE would
+	// silently match 0 rows, leaving us "migrating" a container whose marker was
+	// never recorded.
+	if err := corrosion.SetContainerStateDetailStrict(ctx, s.db, source, req.Name, "stopped", "operator-stop"); err != nil {
+		if errors.Is(err, corrosion.ErrNoRowsAffected) {
+			// The source row vanished (deleted/soft-deleted) since the preflight read.
+			// The container is no longer tracked — do NOT restart its runtime (that
+			// would resurrect an UNTRACKED container). Best-effort delete the now-orphan
+			// runtime (idempotent if the delete path already removed it) and fail closed.
+			if derr := s.containerRuntime.DeleteContainer(ctx, req.Name); derr != nil && !errors.Is(derr, lxc.ErrContainerNotFound) {
+				slog.Warn("container migrate: orphan source runtime cleanup failed", "name", req.Name, "error", derr)
+			}
+			s.audit(ctx, "ct.migrate", req.Name, "project="+project+" source row vanished before stop-intent", "error")
+			return status.Errorf(codes.FailedPrecondition, "container %q no longer exists (deleted during migration setup)", req.Name)
+		}
+		// A real (transient) DB error: undo the stop (if we made one) and abort.
+		if wasRunning {
+			if serr := s.containerRuntime.StartContainer(ctx, req.Name); serr != nil {
+				slog.Error("container migrate: failed to restart source after stop-intent write failure", "name", req.Name, "error", serr)
+			}
+		}
+		s.audit(ctx, "ct.migrate", req.Name, "project="+project, "error")
+		return status.Errorf(codes.Internal, "record stop intent for migration: %v", err)
+	}
 	// srcIfaces is the source's managed NIC set (read once, before the handoff): it
 	// names the IPs that must be source-owned before the transfer and target-owned
 	// after — and source-owned again if we roll back.
@@ -133,12 +169,24 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			}
 			leasesOnTarget = false
 		}
+		// Restore the source's PRE-migration run state — we set operator-stop only for
+		// the transfer window and must not leave it changing the source's behavior.
 		if wasRunning {
 			if serr := s.containerRuntime.StartContainer(ctx, req.Name); serr != nil {
 				slog.Error("container migrate: rollback restart failed", "name", req.Name, "error", serr)
+				// We couldn't bring it back up — CLEAR the migration stop-intent so the
+				// reconciler can recover the source per its restart policy. Leaving
+				// operator-stop on would strand the source down (the reconciler honors
+				// that marker), which is worse than the mid-migration restart it guards.
+				_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "")
 			} else {
 				_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "running", "")
 			}
+		} else {
+			// Originally stopped: put back exactly its prior state + detail (NOT the
+			// migration operator-stop), so e.g. a restart policy retrying an out-of-band
+			// stop resumes as it would have without the migration attempt.
+			_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, rec.State, rec.StateDetail)
 		}
 		s.audit(ctx, "ct.migrate", req.Name, "project="+project+" rolled back: "+reason.Error(), "error")
 		_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FAILED, Error: reason.Error()})
@@ -210,20 +258,23 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	}
 
 	// Re-key: the target LANDED and owns the IPAM leases (handed over + verified).
-	// Remove the source copy. The source ROW tombstone is MANDATORY — leaving it
-	// live is a ghost row (two live rows: quota double-counts, failover chases a
-	// container that moved). On failure we must NOT hand the leases back (the target
-	// owns them) and must NOT claim success: park the source and surface it. Runtime
-	// + interface-row + restart-state cleanup are best-effort (a stale source
-	// interface row is hidden once the source container row is gone).
+	// Remove the source copy. Both the source RUNTIME delete and the source ROW
+	// tombstone are MANDATORY — a failure of either parks the source and errors
+	// (never claims success, never hands the leases back: the target owns them).
+	// Ordered runtime-FIRST so a runtime-delete failure leaves the source row LIVE,
+	// keeping it tracked + stopped + operator-stop (manual cleanup) rather than a
+	// leaked untracked root container (the PR-1 class). A runtime "not found" is an
+	// idempotent success (a retry, or it was already gone).
 	leasesOnTarget = false
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FINALIZING, Status: "removing source copy"})
+	if err := s.containerRuntime.DeleteContainer(ctx, req.Name); err != nil && !errors.Is(err, lxc.ErrContainerNotFound) {
+		return parkSource(fmt.Errorf("target landed but source runtime cleanup failed: %v (source left tracked+stopped on %s)", err, source))
+	}
 	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
 		return parkSource(fmt.Errorf("target landed but source row tombstone failed: %v (remove the source row on %s)", err, source))
 	}
-	if err := s.containerRuntime.DeleteContainer(ctx, req.Name); err != nil {
-		slog.Warn("container migrate: source runtime cleanup failed", "name", req.Name, "error", err)
-	}
+	// Best-effort now (a stale source interface row is hidden once the source
+	// container row is gone; restart state is harmless).
 	if err := corrosion.DeleteContainerInterfaces(ctx, s.db, source, req.Name); err != nil {
 		slog.Warn("container migrate: source interface-row cleanup failed", "name", req.Name, "error", err)
 	}

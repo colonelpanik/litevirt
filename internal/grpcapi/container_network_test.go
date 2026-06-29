@@ -156,7 +156,7 @@ func TestCloneContainer_RebuildsManagedNICs(t *testing.T) {
 	if ifs[0].VethDevice != corrosion.ContainerVethName("clone1", 0) {
 		t.Fatalf("clone veth %q not keyed on the clone name", ifs[0].VethDevice)
 	}
-	if ifs[0].MAC != corrosion.ContainerMAC("clone1", 0) {
+	if ifs[0].MAC != corrosion.ContainerMAC(s.hostName, "clone1", 0) {
 		t.Fatalf("clone MAC %q not the deterministic clone MAC", ifs[0].MAC)
 	}
 	if ifs[0].IP != "" {

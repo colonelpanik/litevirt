@@ -164,7 +164,8 @@ func TestCloneContainer_FreshIdentity(t *testing.T) {
 	if strings.Contains(cfgStr, "52:54:00:aa:bb:cc") {
 		t.Errorf("clone kept the source MAC — should be regenerated:\n%s", cfgStr)
 	}
-	if !strings.Contains(cfgStr, "lxc.net.0.hwaddr = 52:54:00:") {
+	// Regenerated to the wide locally-administered CT scheme (52: + 5 hash octets).
+	if !strings.Contains(cfgStr, "lxc.net.0.hwaddr = 52:") {
 		t.Errorf("clone has no regenerated MAC:\n%s", cfgStr)
 	}
 	if got, _ := os.ReadFile(filepath.Join(path, "clone1", "rootfs", "etc", "hostname")); string(got) != "clone1\n" {

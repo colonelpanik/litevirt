@@ -289,6 +289,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// gRPC container adapter + health checker below, so the metrics collector can
 	// also read live container cgroup usage (host-local, no RPC).
 	lxcRunner := lxc.NewLxcRunner()
+	lxcRunner.HostName = d.cfg.HostName
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	go d.metrics.Start()
 

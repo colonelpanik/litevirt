@@ -6,16 +6,21 @@ import (
 	"hash/fnv"
 )
 
-// ContainerVethName derives the deterministic, IFNAMSIZ-safe (≤15 bytes) host
-// veth name for a container NIC from (ct name, ordinal). Stable across recreate
-// — the create, restore, relocate-recreate, and firewall paths all recompute it
-// rather than persisting it. "lvc" + 8 hex (fnv32a of the name) + ordinal ⇒
-// ≤13 bytes for ordinal<100. Lives here (the lowest layer) so grpcapi and health
-// share it without a cross-package edge.
+// ContainerVethName derives the deterministic, IFNAMSIZ-safe host veth name for a
+// container NIC from (ct name, ordinal). Stable across recreate — the create,
+// restore, relocate-recreate, and firewall paths all recompute it rather than
+// persisting it. "lvc" + 12 hex = 15 bytes, exactly the IFNAMSIZ max (16 incl. the
+// NUL). The 48 bits are fnv64a over (ct, ordinal): folding the ordinal INTO the
+// hash (instead of appending it as decimal) keeps every NIC fixed-width and
+// distinct, and 48 bits makes a per-host name collision negligible (the old scheme
+// kept only 32 bits and appended the ordinal). The veth is host-LOCAL, so the host
+// is deliberately NOT in the hash (it's constant per host — no added entropy).
+// Lives here (the lowest layer) so grpcapi and health share it without a
+// cross-package edge.
 func ContainerVethName(ctName string, ordinal int) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(ctName))
-	return fmt.Sprintf("lvc%08x%d", h.Sum32(), ordinal)
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(fmt.Sprintf("%s/%d", ctName, ordinal)))
+	return fmt.Sprintf("lvc%012x", h.Sum64()&0xffffffffffff)
 }
 
 // BuildContainerInterfacesFromSpec reconstructs the MANAGED interface rows for a
@@ -86,14 +91,23 @@ func containerInterfaceStmt(c *Client, r ContainerInterfaceRecord) (Statement, e
 }
 
 // ContainerMAC derives a deterministic, locally-administered MAC for a container
-// NIC from (ct name, ordinal). Deterministic so the clone path writes the SAME
-// MAC into the on-disk LXC config and the interface row (no drift), and a
-// relocate/restore rebuild reproduces it.
-func ContainerMAC(ctName string, ordinal int) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(fmt.Sprintf("%s/%d", ctName, ordinal)))
-	s := h.Sum32()
-	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", byte(s>>16), byte(s>>8), byte(s))
+// NIC from (host, ct name, ordinal). Deterministic so the clone path writes the
+// SAME MAC into the on-disk LXC config and the interface row (no drift), and a
+// fresh create reproduces it; migrate/restore/relocate read the PERSISTED MAC
+// (create_spec) rather than regenerating, so a host change never re-derives it.
+//
+// First octet 0x52 is locally-administered (0x02 set) + unicast (0x01 clear) — the
+// familiar litevirt look, still a valid LAA. The other 5 octets (40 bits) are
+// fnv64a over (host, ct, ordinal): the HOST keeps two same-named containers on
+// different hosts (e.g. sharing a vxlan L2) from deriving the SAME MAC, and 40 bits
+// makes a birthday collision negligible at fleet scale (the old scheme fixed
+// 52:54:00 and kept only 24 bits).
+func ContainerMAC(hostName, ctName string, ordinal int) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(fmt.Sprintf("%s/%s/%d", hostName, ctName, ordinal)))
+	s := h.Sum64()
+	return fmt.Sprintf("52:%02x:%02x:%02x:%02x:%02x",
+		byte(s>>32), byte(s>>24), byte(s>>16), byte(s>>8), byte(s))
 }
 
 // GetContainerInterfaces returns the live NICs of a container on a host, ordered.

@@ -468,3 +468,172 @@ func TestMigrateContainer_SourceTombstoneFailure_Errors(t *testing.T) {
 		t.Fatalf("final phase = %v, want FAILED (not DONE) on a tombstone failure", last.Phase)
 	}
 }
+
+// TestMigrateContainer_StopIntentPersistedBeforeRestore proves the source's stop
+// intent (operator-stop) is recorded right after the cold stop, before the long
+// archive→transfer→restore window — so the reconciler can't see a stopped runtime
+// with a running row and restart the source mid-migration.
+func TestMigrateContainer_StopIntentPersistedBeforeRestore(t *testing.T) {
+	s, _, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+	var srcState, srcDetail string
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		// The restore drive runs after stop+archive+transfer; capture the source row.
+		if src, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1"); src != nil {
+			srcState, srcDetail = src.State, src.StateDetail
+		}
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: target, Name: name, State: "running", Project: "acme",
+		}); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		return corrosion.RestoreLanded, nil
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); err != nil {
+		t.Fatalf("MigrateContainer: %v", err)
+	}
+	if srcState != "stopped" || srcDetail != "operator-stop" {
+		t.Errorf("stop intent not persisted before restore: state=%q detail=%q, want stopped/operator-stop", srcState, srcDetail)
+	}
+}
+
+// TestMigrateContainer_SourceRuntimeDeleteFailure_Errors: after the target lands,
+// a source RUNTIME delete failure must NOT report success or leave an untracked
+// container — it errors and the source row stays LIVE (tracked+stopped) for manual
+// cleanup, because the runtime delete is ordered before the row tombstone.
+func TestMigrateContainer_SourceRuntimeDeleteFailure_Errors(t *testing.T) {
+	s, rt, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+	rt.deleteErr = errors.New("rmdir: directory busy")
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: target, Name: name, State: "running", Project: "acme",
+		}); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		return corrosion.RestoreLanded, nil
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal when the source runtime delete fails, got %v", err)
+	}
+	// Row NOT tombstoned (runtime delete is ordered first), so the source stays
+	// tracked + stopped + operator-stop — recoverable, not an untracked leak.
+	src, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1")
+	if src == nil {
+		t.Fatal("source row must remain live when its runtime delete fails")
+	}
+	if src.State != "stopped" || src.StateDetail != "operator-stop" {
+		t.Errorf("source not parked stopped: state=%q detail=%q", src.State, src.StateDetail)
+	}
+}
+
+// TestMigrateContainer_StoppedSourceGetsStopIntent: an ALREADY-stopped source
+// (e.g. stopped out-of-band, with a restart policy) must also be marked
+// operator-stop for the transfer window — otherwise the reconciler would restart
+// it mid-migration and its post-archive writes would be lost when the source is
+// removed after the target lands.
+func TestMigrateContainer_StoppedSourceGetsStopIntent(t *testing.T) {
+	s, _, repo := migrateTestServer(t, "stopped")
+	ctx := context.Background()
+	// A non-operator-stop detail: the reconciler WOULD act on this (restart policy).
+	if err := corrosion.SetContainerStateDetail(ctx, s.db, "host-a", "ct1", "stopped", "out-of-band-stop"); err != nil {
+		t.Fatal(err)
+	}
+
+	var srcDetail string
+	var sawStart bool
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, start bool) (corrosion.RestoreOutcome, error) {
+		sawStart = start
+		if src, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1"); src != nil {
+			srcDetail = src.StateDetail
+		}
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: target, Name: name, State: "stopped", Project: "acme",
+		}); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		return corrosion.RestoreLanded, nil
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); err != nil {
+		t.Fatalf("MigrateContainer: %v", err)
+	}
+	if srcDetail != "operator-stop" {
+		t.Errorf("stop intent not recorded for an already-stopped source: detail=%q, want operator-stop", srcDetail)
+	}
+	if sawStart {
+		t.Error("an already-stopped source must not be started on the target")
+	}
+}
+
+// TestMigrateContainer_StoppedSourceRollbackRestoresPriorDetail: on rollback, an
+// originally-stopped source must be put back to its PRIOR state+detail — the
+// migration operator-stop was only for the transfer window and must not be left
+// behind (it would suppress the source's own restart policy).
+func TestMigrateContainer_StoppedSourceRollbackRestoresPriorDetail(t *testing.T) {
+	s, _, repo := migrateTestServer(t, "stopped")
+	ctx := context.Background()
+	if err := corrosion.SetContainerStateDetail(ctx, s.db, "host-a", "ct1", "stopped", "out-of-band-stop"); err != nil {
+		t.Fatal(err)
+	}
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		return corrosion.RestoreFailedBeforeRow, errors.New("target unreachable")
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal, got %v", err)
+	}
+	src, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1")
+	if src == nil || src.State != "stopped" || src.StateDetail != "out-of-band-stop" {
+		t.Errorf("rollback did not restore the prior stopped state/detail: %+v", src)
+	}
+}
+
+// TestMigrateContainer_SourceRowVanishedBeforeMarker_FailsClosed: if the source
+// row is deleted/soft-deleted between the preflight read and the (strict)
+// stop-intent write, migration fails closed — it does NOT restart the now-orphan
+// runtime (which would resurrect an untracked container) and does NOT proceed to
+// the restore.
+func TestMigrateContainer_SourceRowVanishedBeforeMarker_FailsClosed(t *testing.T) {
+	s, rt, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+	// Simulate a concurrent/replicated delete landing during the cold stop — i.e.
+	// after the preflight read, before the strict stop-intent write.
+	rt.stopHook = func() { _ = corrosion.DeleteContainer(ctx, s.db, "host-a", "ct1") }
+	restoreCalled := false
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		restoreCalled = true
+		return corrosion.RestoreLanded, nil
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition when the source row vanished, got %v", err)
+	}
+	if restoreCalled {
+		t.Error("migration must not proceed to restore after the source row vanished")
+	}
+	if len(rt.startCalls) != 0 {
+		t.Errorf("must NOT restart a vanished (untracked) source; start calls = %v", rt.startCalls)
+	}
+	// Best-effort orphan cleanup ran (the source runtime was deleted, not left).
+	if len(rt.deleteCalls) != 1 || rt.deleteCalls[0] != "ct1" {
+		t.Errorf("expected best-effort orphan runtime delete of ct1; delete calls = %v", rt.deleteCalls)
+	}
+}

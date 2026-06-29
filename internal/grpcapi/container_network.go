@@ -27,7 +27,7 @@ func (s *Server) cloneContainerNICs(ctName string, srcSpec corrosion.ContainerCr
 			specNets = append(specNets, n) // legacy/unmanaged → copy as-is
 			continue
 		}
-		mac := corrosion.ContainerMAC(ctName, i)
+		mac := corrosion.ContainerMAC(s.hostName, ctName, i)
 		veth := corrosion.ContainerVethName(ctName, i)
 		ifaces = append(ifaces, corrosion.ContainerInterfaceRecord{
 			HostName: s.hostName, CtName: ctName, NetworkName: n.NetworkName, Ordinal: i,
@@ -129,7 +129,11 @@ func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics [
 		}
 		mac := n.Mac
 		if mac == "" {
-			mac = GenerateMAC()
+			// Wide (40-bit), host-aware, deterministic CT MAC — same generator the
+			// clone/relocate paths use, so a rebuild reproduces it and two same-named
+			// CTs on different hosts (shared L2) don't collide. (GenerateMAC's 24-bit
+			// 52:54:00 space is VM-shared; CTs get the wider scheme.)
+			mac = corrosion.ContainerMAC(s.hostName, ctName, i)
 		}
 		veth := containerVethName(ctName, i)
 		// Allocate the IP NOW (writing the lease) — tombstone- and race-safe. A

@@ -208,6 +208,11 @@ type LxcRunner struct {
 	// rigs and fenced containers can coexist.
 	Lxcpath string
 
+	// HostName is this daemon's cluster host name, mixed into a clone's
+	// deterministic NIC MAC (corrosion.ContainerMAC) so the on-disk config matches
+	// the interface row grpcapi records on the SAME host. Empty in bare/test rigs.
+	HostName string
+
 	// cgPathMu guards cgPathCache, which memoizes each running container's
 	// resolved cgroup-v2 directory so Stats doesn't shell out to lxc-info on
 	// every Prometheus scrape (which may run concurrently). Invalidated on a
@@ -726,7 +731,7 @@ func (r *LxcRunner) cloneFreshIdentity(name string) error {
 			// Fresh, DETERMINISTIC MAC keyed on the clone's name+ordinal, so the
 			// on-disk config matches the interface row the clone path records.
 			if n, ok := lxcNetOrdinal(t); ok {
-				lines[i] = fmt.Sprintf("lxc.net.%d.hwaddr = %s", n, corrosion.ContainerMAC(name, n))
+				lines[i] = fmt.Sprintf("lxc.net.%d.hwaddr = %s", n, corrosion.ContainerMAC(r.HostName, name, n))
 			}
 		case strings.HasPrefix(t, "lxc.net.") && strings.Contains(t, ".veth.pair"):
 			// Re-key the host veth to the clone's deterministic name so it can't

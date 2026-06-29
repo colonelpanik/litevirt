@@ -142,9 +142,9 @@ func TestRestoreContainerFromBackup_FindsManifestAndDrives(t *testing.T) {
 	}
 
 	var gotRepo, gotName, gotTs string
-	s.migrateRestoreOverride = func(_ context.Context, target, repoPath, name, ts string, start bool) error {
+	s.migrateRestoreOverride = func(_ context.Context, target, repoPath, name, ts string, start bool) (corrosion.RestoreOutcome, error) {
 		gotRepo, gotName, gotTs = repoPath, name, ts
-		return nil
+		return corrosion.RestoreLanded, nil
 	}
 	outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b", "tok-x")
 	if err != nil || outcome != corrosion.RestoreLanded {

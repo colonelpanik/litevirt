@@ -96,10 +96,12 @@ type ContainerCreateSpec struct {
 // ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-
 // time intent so relocate/restore/clone can faithfully rebuild the NIC:
 // NetworkName (the managed logical network, "" = legacy raw bridge),
-// SecurityGroups (SG names), MAC (the stable generated/assigned MAC), and IP
-// (the user's STATIC intent only — an auto-allocated address is left empty so a
-// rebuild re-allocates rather than reusing a now-stale lease). The derived veth
-// is NOT stored; it's recomputed deterministically from (host, ct, ordinal).
+// SecurityGroups (SG names), MAC (the stable generated/assigned MAC), and IP —
+// the EFFECTIVE address, static OR auto-allocated (stored back at create time),
+// so a relocate/restore/migrate re-reserves the SAME address instead of losing an
+// auto-allocated one. (A clone is the exception: it builds the spec with IP empty
+// so the copy gets a fresh address.) The derived veth is NOT stored; it's
+// recomputed deterministically from (host, ct, ordinal).
 type ContainerNetwork struct {
 	Name           string   `json:"name,omitempty"`
 	Bridge         string   `json:"bridge,omitempty"`

@@ -3,7 +3,6 @@ package grpcapi
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"time"
 
@@ -145,6 +144,18 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FAILED, Error: reason.Error()})
 		return status.Errorf(codes.Internal, "migrate %s: %v (rolled back; container intact on %s)", req.Name, reason, source)
 	}
+	// parkSource is the NON-rollback failure exit, used once the target may already
+	// hold the container (an indeterminate restore, or a post-landing source-cleanup
+	// failure): we must NOT restart the source or hand its leases back (the target
+	// may be live on them), and we can't safely claim success. Leave the source
+	// stopped + operator-stop (the reconciler won't auto-restart it without its
+	// leases) and surface the ambiguity for an operator to resolve.
+	parkSource := func(reason error) error {
+		_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "operator-stop")
+		s.audit(ctx, "ct.migrate", req.Name, "project="+project+" "+reason.Error(), "error")
+		_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FAILED, Error: reason.Error()})
+		return status.Errorf(codes.Internal, "migrate %s: %v", req.Name, reason)
+	}
 
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_ARCHIVING, Status: "archiving rootfs into staging repo"})
@@ -157,13 +168,12 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	// Hand the managed IPAM leases to the target BEFORE the restore: the target
 	// keeps the imported IPs (it does not re-reserve a verified migrate), so it must
 	// already OWN every managed IP before it can start the container. The handoff is
-	// MANDATORY and verified per-NIC, derived from the source's managed interface
-	// rows (the IPs the restored container will actually assert) — NOT from a lease
-	// count, which can't see a NIC whose IP lost (or never had) a backing lease.
-	srcIfaces, err = corrosion.GetContainerInterfaces(ctx, s.db, source, req.Name)
-	if err != nil {
-		return rollback(fmt.Errorf("read source NIC rows: %w", err))
-	}
+	// MANDATORY and verified per-NIC. The expected NIC set is built from the SAME
+	// create_spec the target rebuilds from (and asserts) — NOT the source's
+	// container_interfaces rows, which could diverge from the spec and let an
+	// unverified IP through. create_spec carries the effective IP (static AND
+	// auto-allocated), so this is exactly the set of addresses the target will name.
+	srcIfaces = corrosion.BuildContainerInterfacesFromSpec(source, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec))
 	// Precondition: the source must cleanly own EVERY managed non-empty IP. If a NIC
 	// names an IP no source lease backs (stale spec, lost/stolen lease), migrating
 	// would hand the target an address it can't own — refuse rather than create a
@@ -185,23 +195,34 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	}
 
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_RESTORING, Status: "restoring on target"})
-	if err := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning); err != nil {
-		return rollback(fmt.Errorf("restore on %s: %w", req.TargetHost, err))
+	outcome, rerr := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning)
+	switch outcome {
+	case corrosion.RestoreLanded:
+		// The target recorded its row (authoritative). Even if its start then failed,
+		// the container now LIVES on the target (tracked + recoverable) and owns the
+		// leases — rolling back here would create a second copy and yank the leases
+		// from under it. Proceed to remove the source.
+	case corrosion.RestoreNotAttempted, corrosion.RestoreFailedBeforeRow:
+		// Nothing was written on the target — safe to roll the source back fully.
+		return rollback(fmt.Errorf("restore on %s: %w", req.TargetHost, rerr))
+	default: // RestoreUnknown — the row MAY have landed and the target MAY be running.
+		return parkSource(fmt.Errorf("restore on %s indeterminate: %v (target may hold it — verify both hosts)", req.TargetHost, rerr))
 	}
 
-	// Re-key: the target's RestoreContainer created the new (target,name) row and
-	// already owns the IPAM leases (handed over and verified above). Finalise by
-	// removing the source copy — runtime container + soft-deleted cluster row +
-	// source interface rows — so exactly one live row survives the window. Past this
-	// point the migration has succeeded; cleanup failures are logged, not fatal, and
-	// the leases must NOT be handed back (the target owns them now).
+	// Re-key: the target LANDED and owns the IPAM leases (handed over + verified).
+	// Remove the source copy. The source ROW tombstone is MANDATORY — leaving it
+	// live is a ghost row (two live rows: quota double-counts, failover chases a
+	// container that moved). On failure we must NOT hand the leases back (the target
+	// owns them) and must NOT claim success: park the source and surface it. Runtime
+	// + interface-row + restart-state cleanup are best-effort (a stale source
+	// interface row is hidden once the source container row is gone).
 	leasesOnTarget = false
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FINALIZING, Status: "removing source copy"})
+	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
+		return parkSource(fmt.Errorf("target landed but source row tombstone failed: %v (remove the source row on %s)", err, source))
+	}
 	if err := s.containerRuntime.DeleteContainer(ctx, req.Name); err != nil {
 		slog.Warn("container migrate: source runtime cleanup failed", "name", req.Name, "error", err)
-	}
-	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
-		slog.Warn("container migrate: source row soft-delete failed", "name", req.Name, "error", err)
 	}
 	if err := corrosion.DeleteContainerInterfaces(ctx, s.db, source, req.Name); err != nil {
 		slog.Warn("container migrate: source interface-row cleanup failed", "name", req.Name, "error", err)
@@ -216,37 +237,29 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 }
 
 // migrateRestore drives the target host's RestoreContainer over a peer
-// connection (daemon-to-daemon mTLS authenticates as admin). The test seam
-// replaces it so the success path is unit-testable without a second daemon.
-func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool) error {
+// connection (daemon-to-daemon mTLS authenticates as admin) and returns the
+// classified outcome (drainRestoreStream) so MigrateContainer can tell a LANDED
+// restore (whose later start may have failed) from a genuine pre-row failure and
+// only roll back the source in the latter case. The test seam replaces the whole
+// drive so the path is unit-testable without a second daemon.
+func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error) {
 	if s.migrateRestoreOverride != nil {
 		return s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, start)
 	}
 	c, conn, err := s.peerClient(ctx, target)
 	if err != nil {
-		return fmt.Errorf("dial target: %w", err)
+		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", err)
 	}
 	defer conn.Close()
-	// Tell the target this is a migrate FROM us, so it keeps the imported NIC IPs
-	// (we transfer the IPAM leases explicitly in finalize) rather than re-reserving
-	// and blanking them.
+	// Tell the target this is a migrate FROM us (peer-verified on the far side), so
+	// it keeps the imported NIC IPs — we handed it the IPAM leases before this call
+	// — rather than re-reserving and blanking them.
 	mctx := metadata.AppendToOutgoingContext(ctx, migrateFromMDKey, s.hostName)
 	rs, err := c.RestoreContainer(mctx, &pb.RestoreContainerRequest{
 		RepoPath: repoPath, Name: name, Timestamp: timestamp, HostName: target, Start: start,
 	})
 	if err != nil {
-		return err
+		return corrosion.RestoreNotAttempted, err // RPC never established
 	}
-	for {
-		p, err := rs.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if p.Error != "" {
-			return fmt.Errorf("target restore: %s", p.Error)
-		}
-	}
+	return drainRestoreStream(rs)
 }

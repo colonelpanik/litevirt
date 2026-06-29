@@ -254,12 +254,9 @@ func relocateTokenFromMD(ctx context.Context) string {
 // than destructively falling back.
 func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string) (corrosion.RestoreOutcome, error) {
 	if s.migrateRestoreOverride != nil {
-		// Test seam (shared with MigrateContainer): a nil error ⇒ landed; an error
-		// is indeterminate (the override doesn't model where it failed).
-		if e := s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true); e != nil {
-			return corrosion.RestoreUnknown, e
-		}
-		return corrosion.RestoreLanded, nil
+		// Test seam (shared with MigrateContainer): the override returns the
+		// classified outcome directly.
+		return s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true)
 	}
 	// Carry the attempt token to the target so it stamps the restored row.
 	if token != "" {
@@ -276,6 +273,18 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 	if rerr != nil {
 		return corrosion.RestoreNotAttempted, rerr // RPC never established
 	}
+	return drainRestoreStream(rs)
+}
+
+// drainRestoreStream classifies a remote RestoreContainer progress stream. The
+// authoritative "row recorded" signal is the target's restoreRowRecordedStatus
+// frame (or a clean DONE/EOF) ⇒ RestoreLanded — once seen, a later error is the
+// target's own recoverable post-land state (e.g. a start failure), NOT a reason to
+// undo the restore. A definite pre-row status code means nothing was written;
+// anything else after the row may have landed is indeterminate (RestoreUnknown).
+// Shared by driveRemoteRestore (failover) and migrateRestore (cold migrate) so
+// both make the same land/rollback decision.
+func drainRestoreStream(rs grpc.ServerStreamingClient[pb.RestoreContainerProgress]) (corrosion.RestoreOutcome, error) {
 	landed := false
 	for {
 		p, e := rs.Recv()

@@ -34,6 +34,32 @@ func migrateTestServer(t *testing.T, state string) (*Server, *fakeCTRuntime, str
 	return s, rt, repo
 }
 
+// seedManagedSourceNIC gives the source ct1 a managed NIC that the source cleanly
+// OWNS: the NIC is written into the container's create_spec (the set the migrate
+// ownership proof is derived from — what the target rebuilds and asserts), backed
+// by a real IPAM lease under (ct, host-a, ct1) and a matching interface row.
+func seedManagedSourceNIC(t *testing.T, s *Server, ctx context.Context, net, ip, mac string) {
+	t.Helper()
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running", Image: "alpine:3.19",
+		CPULimit: 2, MemMiB: 256, Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+			Networks: []corrosion.ContainerNetwork{{NetworkName: net, IP: ip, MAC: mac}},
+		}),
+	}); err != nil {
+		t.Fatalf("seed source create_spec: %v", err)
+	}
+	if ok, err := network.ReserveContainerIP(ctx, s.db, net, ip, mac, "host-a", "ct1"); err != nil || !ok {
+		t.Fatalf("seed ReserveContainerIP: ok=%v err=%v", ok, err)
+	}
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "host-a", CtName: "ct1", NetworkName: net, Ordinal: 0,
+		MAC: mac, IP: ip, VethDevice: "lvtest0",
+	}); err != nil {
+		t.Fatalf("seed interface row: %v", err)
+	}
+}
+
 // TestMigrateContainer_Success exercises the happy path via the restore seam:
 // stop → archive → (target restores) → re-key + source cleanup, leaving exactly
 // one live row owned by the target.
@@ -43,12 +69,15 @@ func TestMigrateContainer_Success(t *testing.T) {
 
 	var gotTarget, gotName string
 	var gotStart bool
-	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, start bool) error {
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, start bool) (corrosion.RestoreOutcome, error) {
 		gotTarget, gotName, gotStart = target, name, start
-		// Mimic the target's RestoreContainer creating the new owner row.
-		return corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		// Mimic the target's RestoreContainer creating the new owner row + landing.
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
 			HostName: target, Name: name, State: "running", Project: "acme",
-		})
+		}); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		return corrosion.RestoreLanded, nil
 	}
 
 	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
@@ -106,20 +135,15 @@ func TestMigrateContainer_TransfersManagedLease(t *testing.T) {
 		ip  = "10.9.0.5"
 		mac = "02:11:22:33:44:55"
 	)
-	if ok, err := network.ReserveContainerIP(ctx, s.db, net, ip, mac, "host-a", "ct1"); err != nil || !ok {
-		t.Fatalf("seed ReserveContainerIP: ok=%v err=%v", ok, err)
-	}
-	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
-		HostName: "host-a", CtName: "ct1", NetworkName: net, Ordinal: 0,
-		MAC: mac, IP: ip, VethDevice: "lvtest0",
-	}); err != nil {
-		t.Fatalf("seed interface row: %v", err)
-	}
+	seedManagedSourceNIC(t, s, ctx, net, ip, mac)
 
-	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, _ bool) error {
-		return corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
 			HostName: target, Name: name, State: "running", Project: "acme",
-		})
+		}); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		return corrosion.RestoreLanded, nil
 	}
 
 	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
@@ -151,17 +175,20 @@ func TestMigrateContainer_TransfersManagedLease(t *testing.T) {
 func TestMigrateContainer_RefusesWhenSourceLeaseMissing(t *testing.T) {
 	s, _, repo := migrateTestServer(t, "running")
 	ctx := context.Background()
-	// Managed NIC with an IP but NO ip_allocations lease behind it.
-	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
-		HostName: "host-a", CtName: "ct1", NetworkName: "br-acme", Ordinal: 0,
-		MAC: "02:00:00:00:00:09", IP: "10.9.0.9", VethDevice: "lvtest0",
+	// A managed NIC in the create_spec (what the target rebuilds + asserts) whose IP
+	// has NO ip_allocations lease behind it — the source does not own it.
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running", Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+			Networks: []corrosion.ContainerNetwork{{NetworkName: "br-acme", IP: "10.9.0.9", MAC: "02:00:00:00:00:09"}},
+		}),
 	}); err != nil {
-		t.Fatalf("seed interface row: %v", err)
+		t.Fatalf("seed source create_spec: %v", err)
 	}
 	restoreCalled := false
-	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) error {
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) (corrosion.RestoreOutcome, error) {
 		restoreCalled = true
-		return nil
+		return corrosion.RestoreLanded, nil
 	}
 
 	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
@@ -196,23 +223,16 @@ func TestMigrateContainer_RollbackHandsLeasesBack(t *testing.T) {
 		ip  = "10.9.0.7"
 		mac = "02:aa:bb:cc:dd:ee"
 	)
-	if ok, err := network.ReserveContainerIP(ctx, s.db, net, ip, mac, "host-a", "ct1"); err != nil || !ok {
-		t.Fatalf("seed ReserveContainerIP: ok=%v err=%v", ok, err)
-	}
-	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
-		HostName: "host-a", CtName: "ct1", NetworkName: net, Ordinal: 0,
-		MAC: mac, IP: ip, VethDevice: "lvtest0",
-	}); err != nil {
-		t.Fatalf("seed interface row: %v", err)
-	}
+	seedManagedSourceNIC(t, s, ctx, net, ip, mac)
 
-	// The restore fails — but by the time it runs the leases must already be on the
-	// target (the handoff is a precondition, not a finalize step).
-	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) error {
+	// The restore fails BEFORE the target wrote a row (a pre-land failure) — but by
+	// the time it runs the leases must already be on the target (the handoff is a
+	// precondition, not a finalize step), and a pre-land failure rolls them back.
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) (corrosion.RestoreOutcome, error) {
 		if a, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "host-b", "ct1"); a == nil {
 			t.Error("leases were not handed to the target before the restore ran")
 		}
-		return errors.New("target unreachable")
+		return corrosion.RestoreFailedBeforeRow, errors.New("target unreachable")
 	}
 
 	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
@@ -241,8 +261,8 @@ func TestMigrateContainer_RollbackHandsLeasesBack(t *testing.T) {
 func TestMigrateContainer_RollbackOnRestoreFailure(t *testing.T) {
 	s, rt, repo := migrateTestServer(t, "running")
 	ctx := context.Background()
-	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) error {
-		return errors.New("target unreachable")
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		return corrosion.RestoreNotAttempted, errors.New("target unreachable")
 	}
 
 	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
@@ -270,9 +290,9 @@ func TestMigrateContainer_RollbackOnArchiveFailure(t *testing.T) {
 	s, rt, repo := migrateTestServer(t, "running")
 	rt.exportErr = errors.New("tar read error")
 	restoreCalled := false
-	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) error {
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) (corrosion.RestoreOutcome, error) {
 		restoreCalled = true
-		return nil
+		return corrosion.RestoreLanded, nil
 	}
 
 	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
@@ -333,5 +353,118 @@ func TestMigrateContainer_TargetAlreadyHasIt(t *testing.T) {
 	}, st)
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("expected AlreadyExists, got %v", err)
+	}
+}
+
+// TestMigrateContainer_LandedThenStartFailed_Finalizes proves the core fix: once
+// the target has LANDED its row, a later (start) failure does NOT roll the source
+// back — that would leave two copies and yank the leases from a target that owns
+// them. The migration finalizes (source removed) and the target keeps the
+// container, recoverable as tracked+stopped.
+func TestMigrateContainer_LandedThenStartFailed_Finalizes(t *testing.T) {
+	s, rt, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		// The target recorded its row (landed) but then its start failed: Landed +
+		// a non-nil error. MigrateContainer must treat this as landed and finalize.
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: target, Name: name, State: "stopped", Project: "acme",
+		}); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		return corrosion.RestoreLanded, errors.New("started but start failed on target")
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); err != nil {
+		t.Fatalf("a landed restore whose start failed must still finalize, got %v", err)
+	}
+	if last := st.Sent[len(st.Sent)-1]; last.Phase != pb.MigrateContainerProgress_DONE {
+		t.Fatalf("final phase = %v, want DONE", last.Phase)
+	}
+	// Source removed; NOT restarted (no rollback).
+	if len(rt.startCalls) != 0 {
+		t.Errorf("source must not be restarted after a landed restore; start calls = %v", rt.startCalls)
+	}
+	if src, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1"); src != nil {
+		t.Errorf("source row still live after a landed migration: %+v", src)
+	}
+}
+
+// TestMigrateContainer_IndeterminateRestore_ParksSource: when the restore outcome
+// is indeterminate (the row MAY have landed and the target MAY be running), the
+// migration must NOT roll back — it parks the source stopped (operator-stop, so the
+// reconciler won't auto-run it without its leases, which are on the target) and
+// errors. The leases stay on the target; the source row is left live + stopped.
+func TestMigrateContainer_IndeterminateRestore_ParksSource(t *testing.T) {
+	s, rt, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+	const (
+		net = "br-acme"
+		ip  = "10.9.0.11"
+		mac = "02:de:ad:be:ef:01"
+	)
+	seedManagedSourceNIC(t, s, ctx, net, ip, mac)
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		return corrosion.RestoreUnknown, errors.New("stream broke after the row may have landed")
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal (indeterminate), got %v", err)
+	}
+	// NOT restarted (parked, not rolled back).
+	if len(rt.startCalls) != 0 {
+		t.Errorf("source must not be restarted on an indeterminate restore; start calls = %v", rt.startCalls)
+	}
+	// Source parked stopped + operator-stop; row still live (not tombstoned).
+	src, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1")
+	if src == nil {
+		t.Fatal("source row must remain live on an indeterminate restore")
+	}
+	if src.State != "stopped" || src.StateDetail != "operator-stop" {
+		t.Errorf("source not parked: state=%q detail=%q, want stopped/operator-stop", src.State, src.StateDetail)
+	}
+	// Leases stay on the target (NOT handed back) — the target may be live on them.
+	if a, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "host-b", "ct1"); a == nil {
+		t.Error("leases must stay on the target on an indeterminate restore")
+	}
+	if a, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "host-a", "ct1"); a != nil {
+		t.Errorf("leases must NOT be handed back to the source on an indeterminate restore: %+v", a)
+	}
+}
+
+// TestMigrateContainer_SourceTombstoneFailure_Errors proves the "exactly one live
+// row" invariant: after the target lands, if the source row tombstone fails the
+// migration does NOT report DONE — it surfaces an error (no silent ghost row).
+func TestMigrateContainer_SourceTombstoneFailure_Errors(t *testing.T) {
+	s, _, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+	s.migrateRestoreOverride = func(_ context.Context, target, _, name, _ string, _ bool) (corrosion.RestoreOutcome, error) {
+		// Land the target, then break the containers table so the source-row tombstone
+		// in finalize fails.
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: target, Name: name, State: "running", Project: "acme",
+		}); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		if err := s.db.Execute(ctx, `DROP TABLE containers`); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+		return corrosion.RestoreLanded, nil
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal when the source row tombstone fails, got %v", err)
+	}
+	if last := st.Sent[len(st.Sent)-1]; last.Phase != pb.MigrateContainerProgress_FAILED {
+		t.Fatalf("final phase = %v, want FAILED (not DONE) on a tombstone failure", last.Phase)
 	}
 }

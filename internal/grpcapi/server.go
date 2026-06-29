@@ -80,10 +80,12 @@ type Server struct {
 	// when non-nil it reports whether this host's keepalived for an LB is running.
 	lbKeepalivedOverride func(name string) bool
 
-	// migrateRestoreOverride is a test seam for container cold migration: when
-	// non-nil it replaces the real "dial the target peer + drive RestoreContainer"
-	// step (unit tests have no second daemon). Production leaves it nil.
-	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) error
+	// migrateRestoreOverride is a test seam for container cold migration + failover
+	// relocation: when non-nil it replaces the real "dial the target peer + drive
+	// RestoreContainer" step (unit tests have no second daemon) and returns the
+	// classified restore outcome directly, so a test can model a landed restore, a
+	// pre-row failure, or an indeterminate stream break. Production leaves it nil.
+	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error)
 
 	// stopVMOverride is a test seam for ShutdownHostWorkloads: when non-nil it
 	// replaces the in-process StopVM call (unit tests have no libvirt/peer), so

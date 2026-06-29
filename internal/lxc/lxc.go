@@ -349,28 +349,18 @@ func (r *LxcRunner) Stop(ctx context.Context, name string, timeoutSec int) error
 // running"), so `lv ct rm` and `compose down` of a running container would fail.
 func (r *LxcRunner) Delete(ctx context.Context, name string) error {
 	if _, stderr, err := r.run(ctx, "lxc-destroy", "-f", "-n", name); err != nil {
-		if containerNotFoundStderr(stderr) {
-			// Classify here (in the runtime layer) so callers use errors.Is and
-			// never string-match lxc-* output.
+		// Only classify as not-found when the container is ACTUALLY gone on disk
+		// (its config is absent). A broad stderr match would mask a real failure —
+		// a corrupt config, a busy mount, a permission/read error — that leaves
+		// runtime state behind while the gRPC layer tombstones the row and reports
+		// success. Verifying the path keeps that across lxc-* versions/wording.
+		cfg := filepath.Join(r.lxcpath(), name, "config")
+		if _, statErr := os.Stat(cfg); os.IsNotExist(statErr) {
 			return fmt.Errorf("%w: lxc-destroy %s: %s", ErrContainerNotFound, name, strings.TrimSpace(string(stderr)))
 		}
 		return cmdErr("lxc-destroy", name, stderr, err)
 	}
 	return nil
-}
-
-// containerNotFoundStderr reports whether lxc-destroy's stderr indicates the
-// container does not exist (so deletion is a no-op). lxc-destroy phrases this a
-// few ways across versions ("not defined", "doesn't exist", "Failed to load
-// config").
-func containerNotFoundStderr(stderr []byte) bool {
-	s := strings.ToLower(string(stderr))
-	for _, m := range []string{"not defined", "doesn't exist", "does not exist", "no such", "not found", "failed to load config"} {
-		if strings.Contains(s, m) {
-			return true
-		}
-	}
-	return false
 }
 
 // execPATH is injected into the attach context so a bare command (e.g. "cat")

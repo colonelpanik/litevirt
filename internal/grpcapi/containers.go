@@ -256,17 +256,23 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// that re-issue deletes. So an already-gone row (ErrNoRowsAffected) is a
 	// success — but audited distinctly (not a silent "ok") so an operator typo
 	// isn't invisible; only a REAL DB error surfaces as Internal.
-	if err := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name); err != nil {
-		if errors.Is(err, corrosion.ErrNoRowsAffected) {
-			s.audit(ctx, "ct.delete", req.Name, "project="+project+" already-absent", "ok")
-			slog.Info("container delete: cluster row already absent (idempotent no-op)", "name", req.Name, "host", s.hostName)
-			return &emptypb.Empty{}, nil
-		}
+	derr := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name)
+	if derr != nil && !errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
-		return nil, status.Errorf(codes.Internal, "delete: remove cluster row: %v", err)
+		return nil, status.Errorf(codes.Internal, "delete: remove cluster row: %v", derr)
 	}
+	// Best-effort restart-state cleanup on BOTH the normal and already-absent
+	// paths: a prior delete may have tombstoned the row but failed here, so a
+	// retry (now zero-row) must still clear it — otherwise a later same-host/name
+	// recreate could inherit stale restart state.
 	if err := corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name); err != nil {
 		slog.Warn("container delete: failed to clear restart state (harmless, GC'able)", "name", req.Name, "error", err)
+	}
+	if errors.Is(derr, corrosion.ErrNoRowsAffected) {
+		// Idempotent: the row was already gone. Audited distinctly, not a silent "ok".
+		s.audit(ctx, "ct.delete", req.Name, "project="+project+" already-absent", "ok")
+		slog.Info("container delete: cluster row already absent (idempotent no-op)", "name", req.Name, "host", s.hostName)
+		return &emptypb.Empty{}, nil
 	}
 	s.audit(ctx, "ct.delete", req.Name, "project="+project, "ok")
 	slog.Info("container deleted", "name", req.Name, "host", s.hostName)

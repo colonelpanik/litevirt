@@ -588,10 +588,19 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		if unreserved > 0 {
 			// The imported on-disk config still names IP(s) we couldn't reserve (held
 			// by another workload). Starting would create a real network conflict, so
-			// leave it stopped + tracked (recoverable) and surface the reason.
-			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (ip unavailable; not started)", "error")
+			// leave it stopped + tracked (recoverable) and surface the reason. The row
+			// was created with an EMPTY detail (we intended to start it) and keeps its
+			// restart policy — which the reconciler would read as an out-of-band stop
+			// and restart into that very conflict. Stamp the sticky operator-stop marker
+			// so it stays down until an operator frees the IP and starts it explicitly.
+			if derr := corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "stopped", "operator-stop"); derr != nil {
+				s.audit(ctx, "ct.restore", req.Name, "project="+project+" (ip unavailable; failed to mark no-restart)", "error")
+				return status.Errorf(codes.Internal,
+					"restored %q but %d NIC(s) had unavailable IPs and marking it no-restart failed: %v", req.Name, unreserved, derr)
+			}
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (ip unavailable; left stopped)", "error")
 			return status.Errorf(codes.FailedPrecondition,
-				"restored %q but %d NIC(s) had unavailable IPs — left stopped to avoid a network conflict", req.Name, unreserved)
+				"restored %q but %d NIC(s) had unavailable IPs — left stopped (operator-stop) to avoid a network conflict", req.Name, unreserved)
 		}
 		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 			// Partial success: the container is restored AND tracked (row stays

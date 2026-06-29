@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // TestBackupContainer_RoundTripPreservesCreateSpec proves the v34 create-spec
@@ -164,6 +165,63 @@ func TestRestoreContainer_PreservesStopIntentWhenNotStarted(t *testing.T) {
 	rec2, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1")
 	if rec2 == nil || rec2.State != "running" || rec2.StateDetail != "" {
 		t.Fatalf("started restore should be running with no stop intent: %+v", rec2)
+	}
+}
+
+// TestRestoreContainer_IPUnavailable_StampsNoRestart: a Start=true restore whose
+// managed IP is held by another workload is left stopped — and stamped sticky
+// operator-stop so the reconciler won't auto-restart the imported config (which
+// still names the conflicting IP) into that very conflict.
+func TestRestoreContainer_IPUnavailable_StampsNoRestart(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	rt := &fakeCTRuntime{exportPayload: []byte("rootfs")}
+	s.SetContainerRuntime(rt)
+
+	const (
+		net = "br-acme"
+		ip  = "10.9.0.5"
+		mac = "52:11:22:33:44:55"
+	)
+	// Source with a managed static-IP NIC (in create_spec) and a restart policy.
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: s.hostName, Name: "ct1", State: "running", Image: "alpine:3.19", Project: "acme",
+		RestartPolicy: `{"condition":"any"}`,
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+			Networks: []corrosion.ContainerNetwork{{NetworkName: net, IP: ip, MAC: mac}},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "ct1", HostName: s.hostName, RepoPath: repo, Timestamp: "2026-06-29T11:00:00Z",
+	}, bk); err != nil {
+		t.Fatalf("BackupContainer: %v", err)
+	}
+	_ = corrosion.DeleteContainer(ctx, s.db, s.hostName, "ct1")
+
+	// Another workload (a CT on a different host) now holds the IP, so the restore
+	// can't reserve it and blanks the NIC → unreserved > 0.
+	if ok, err := network.ReserveContainerIP(ctx, s.db, net, ip, mac, "host-z", "squatter"); err != nil || !ok {
+		t.Fatalf("seed squatter lease: ok=%v err=%v", ok, err)
+	}
+
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: "2026-06-29T11:00:00Z", Start: true,
+	}, rs); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition (IP unavailable), got %v", err)
+	}
+	if len(rt.startCalls) != 0 {
+		t.Errorf("must not start a CT whose IP is unavailable; start calls = %v", rt.startCalls)
+	}
+	// Stamped sticky no-restart so the container checker leaves it down.
+	rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, "ct1")
+	if rec == nil || rec.State != "stopped" || rec.StateDetail != "operator-stop" {
+		t.Errorf("IP-unavailable restore not marked no-restart: %+v", rec)
 	}
 }
 

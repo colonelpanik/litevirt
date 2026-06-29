@@ -102,3 +102,28 @@ func TestEngine_EmitsBillingEvents(t *testing.T) {
 		t.Errorf("second event mismatch: %+v", rec.Events[1])
 	}
 }
+
+// TestAdmitAttach: a workload may use a GLOBAL (empty-project) resource or one its
+// own project owns; cross-project use is denied. Both sides normalize, so a blank
+// workload project is the default project — which still may not use a NAMED
+// project's owned resource.
+func TestAdmitAttach(t *testing.T) {
+	cases := []struct {
+		wl, owner string
+		want      bool
+	}{
+		{"acme", "", true},       // global resource — any project
+		{"", "", true},           // global, default workload
+		{"acme", "acme", true},   // same project
+		{Default, "", true},      // default workload, global
+		{"", Default, true},      // blank workload normalizes to default == default-owned
+		{"acme", "beta", false},  // cross-project
+		{"", "acme", false},      // default workload may not use an acme-owned resource
+		{"acme", Default, false}, // acme workload may not use a default-owned resource
+	}
+	for _, c := range cases {
+		if got := AdmitAttach(c.wl, c.owner); got != c.want {
+			t.Errorf("AdmitAttach(%q,%q) = %v, want %v", c.wl, c.owner, got, c.want)
+		}
+	}
+}

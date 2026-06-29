@@ -207,7 +207,15 @@ import (
 //	     per-host), so a VM and a CT — or two same-named CTs on different hosts —
 //	     can't alias to one lease. Old rows default to owner_kind='vm'/owner_host=''
 //	     preserving VM behavior. Two ADD COLUMNs; gap-1 from v35.
-const CurrentSchemaVersion = 36
+//	v37: project-scoped isolation — networks.project, storage_pools.project,
+//	     volumes.project (all TEXT NOT NULL DEFAULT ''). EMPTY = global/shared
+//	     (usable by every project — the deliberate admin escape hatch); a non-empty
+//	     value means owned + isolated, so a workload may only attach to a network/
+//	     pool that is global OR owned by its own project. DEFAULT '' makes every
+//	     pre-v37 network/pool/volume global, so no existing workload is suddenly
+//	     denied (a '_default' default would have done exactly that). Three ADD
+//	     COLUMNs; gap-1 from v36.
+const CurrentSchemaVersion = 37
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1735,6 +1743,10 @@ var schemaMigrations = []string{
 	// v36: generalize IPAM ownership beyond VMs (see History v36).
 	`ALTER TABLE ip_allocations ADD COLUMN owner_kind TEXT NOT NULL DEFAULT 'vm'`,
 	`ALTER TABLE ip_allocations ADD COLUMN owner_host TEXT NOT NULL DEFAULT ''`,
+	// v37: project-scoped isolation (see History v37). '' = global/shared.
+	`ALTER TABLE networks ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE storage_pools ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE volumes ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -1807,6 +1819,7 @@ var alterVersions = []int{
 	32, 32, 32, 32, 32, // user_2fa.deleted_at/epoch; recovery_codes.set_id/updated_at/deleted_at
 	34, 34, // containers.create_spec, containers.relocate_token
 	36, 36, // ip_allocations.owner_kind, ip_allocations.owner_host
+	37, 37, 37, // networks.project, storage_pools.project, volumes.project
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

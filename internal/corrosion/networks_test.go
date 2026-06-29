@@ -488,3 +488,54 @@ func TestScopeSpecNetworkNames(t *testing.T) {
 		})
 	}
 }
+
+// TestNetworkProjectRoundTrip: the v37 project column round-trips through
+// Upsert/Get/List, and an absent value reads back as "" (global).
+func TestNetworkProjectRoundTrip(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	if err := UpsertNetwork(ctx, c, NetworkRecord{Name: "owned", Type: "bridge", Config: "{}", Project: "acme"}); err != nil {
+		t.Fatalf("UpsertNetwork(owned): %v", err)
+	}
+	if err := UpsertNetwork(ctx, c, NetworkRecord{Name: "shared", Type: "bridge", Config: "{}"}); err != nil {
+		t.Fatalf("UpsertNetwork(shared): %v", err)
+	}
+	owned, _ := GetNetwork(ctx, c, "owned")
+	if owned == nil || owned.Project != "acme" {
+		t.Fatalf("owned.Project = %+v, want acme", owned)
+	}
+	shared, _ := GetNetwork(ctx, c, "shared")
+	if shared == nil || shared.Project != "" {
+		t.Fatalf("shared.Project = %+v, want \"\" (global)", shared)
+	}
+	list, _ := ListNetworks(ctx, c)
+	got := map[string]string{}
+	for _, n := range list {
+		got[n.Name] = n.Project
+	}
+	if got["owned"] != "acme" || got["shared"] != "" {
+		t.Errorf("ListNetworks projects = %v, want owned=acme shared=\"\"", got)
+	}
+}
+
+// TestStoragePoolProjectRoundTrip: the v37 project column round-trips for pools.
+func TestStoragePoolProjectRoundTrip(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	if err := UpsertStoragePool(ctx, c, StoragePoolRecord{HostName: "h1", Name: "owned", Driver: "local", State: "active", Project: "acme"}); err != nil {
+		t.Fatalf("UpsertStoragePool(owned): %v", err)
+	}
+	if err := UpsertStoragePool(ctx, c, StoragePoolRecord{HostName: "h1", Name: "shared", Driver: "local", State: "active"}); err != nil {
+		t.Fatalf("UpsertStoragePool(shared): %v", err)
+	}
+	owned, ok, _ := GetStoragePool(ctx, c, "h1", "owned")
+	if !ok || owned.Project != "acme" {
+		t.Fatalf("owned pool Project = %q (ok=%v), want acme", owned.Project, ok)
+	}
+	shared, ok, _ := GetStoragePool(ctx, c, "h1", "shared")
+	if !ok || shared.Project != "" {
+		t.Fatalf("shared pool Project = %q (ok=%v), want \"\" (global)", shared.Project, ok)
+	}
+}

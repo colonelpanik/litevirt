@@ -77,7 +77,7 @@ type containerNICPlan struct {
 // otherwise it's a legacy raw-bridge attachment with no managed state (no
 // interface row, IPAM, or veth). On error the caller must release this
 // container's leases (network.ReleaseContainerLeases) to undo partial allocation.
-func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics []*pb.ContainerNetwork) (*containerNICPlan, error) {
+func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName string, nics []*pb.ContainerNetwork) (*containerNICPlan, error) {
 	p := &containerNICPlan{}
 	for i, n := range nics {
 		netName := n.NetworkName
@@ -99,6 +99,14 @@ func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics [
 			p.lxcNics = append(p.lxcNics, ContainerNICOpt{Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac})
 			p.specNets = append(p.specNets, corrosion.ContainerNetwork{Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac})
 			continue
+		}
+
+		// Managed NIC → project isolation applies: the container may attach only to a
+		// global network or one its own project owns. Also closes the raw-bridge
+		// escape hatch — a bridge that RESOLVES to another project's managed network
+		// is denied here (an unresolved raw bridge stays legacy/global above).
+		if err := s.admitNetworkAttach(ctx, project, netName); err != nil {
+			return nil, err
 		}
 
 		// Managed NIC. Containers support only L2 bridge-family networks; direct

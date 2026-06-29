@@ -31,7 +31,7 @@ func newPoolCmd() *cobra.Command {
 }
 
 func newPoolCreateCmd() *cobra.Command {
-	var driver, source, target, host string
+	var driver, source, target, host, project string
 	var opts []string
 	cmd := &cobra.Command{
 		Use:   "create <name>",
@@ -55,6 +55,7 @@ Options are key=value pairs; pass --option multiple times.`,
 					Target:  target,
 					Options: parsedOpts,
 					Host:    host,
+					Project: project,
 				})
 				if err != nil {
 					return fmt.Errorf("create pool: %w", err)
@@ -70,6 +71,7 @@ Options are key=value pairs; pass --option multiple times.`,
 	cmd.Flags().StringVar(&target, "target", "", "local mount/path override")
 	cmd.Flags().StringSliceVar(&opts, "option", nil, "driver-specific option (key=value; repeatable)")
 	cmd.Flags().StringVar(&host, "host", "", "target host (default: caller's local host)")
+	cmd.Flags().StringVar(&project, "project", "", "Owning project (empty = global/shared, usable by all projects)")
 	_ = cmd.MarkFlagRequired("driver")
 	return cmd
 }

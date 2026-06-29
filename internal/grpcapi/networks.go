@@ -18,11 +18,21 @@ import (
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
-// CreateNetwork provisions a standalone network on this host and persists it.
+// CreateNetwork provisions a network on this host and persists it. A network is
+// either GLOBAL (req.Project == "" → admin-managed, RBAC-anchored at root) or
+// OWNED by a project (RBAC at /projects/<p>/...): only that project's workloads
+// (or root) may attach to an owned network.
 func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest) (*pb.NetworkInfo, error) {
-	// Networks are cluster-global; scope the check to the root path so a
-	// project-scoped token can't define one, keeping the operator floor.
-	if err := s.RequirePerm(ctx, "/", "network.create", "operator"); err != nil {
+	// Empty project = global/shared; do NOT normalize to "_default" (that would
+	// make it an OWNED network of the default project, not global). Validate the
+	// name format of a non-empty project.
+	project := req.Project
+	if project != "" {
+		if _, err := safename.CanonicalProjectName(project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid project %q: %v", project, err)
+		}
+	}
+	if err := s.RequirePerm(ctx, networkRBACPathFor(project, req.Name), "network.create", "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
@@ -60,13 +70,13 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 		def.Interface = req.Name
 	}
 
-	ni, err := s.provisionAndPersistNetwork(ctx, req.Name, "", def)
+	ni, err := s.provisionAndPersistNetwork(ctx, req.Name, "", project, def)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "provision network: %v", err)
 	}
 
 	s.publish("network.created", req.Name, fmt.Sprintf("type=%s", ntype))
-	s.audit(ctx, "network.create", req.Name, "", "ok")
+	s.audit(ctx, "network.create", req.Name, "project="+project, "ok")
 	return ni, nil
 }
 
@@ -96,21 +106,30 @@ func (s *Server) GetNetwork(ctx context.Context, req *pb.GetNetworkRequest) (*pb
 	return ni, nil
 }
 
-// DeleteNetwork tears down a network and removes it from the database.
+// DeleteNetwork tears down a network and removes it from the database. The RBAC
+// check is scoped to the network's OWNING project (global → root), so a
+// project-scoped operator can delete only their own networks, never a global or
+// another project's.
 func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest) (*emptypb.Empty, error) {
-	if err := s.RequirePerm(ctx, "/", "network.delete", "operator"); err != nil {
+	// Operator role floor BEFORE the lookup (a viewer can't probe existence); the
+	// project-scoped check follows once we know the network's owning project.
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
-
+	// Fail closed on a read error — we must not delete a network we couldn't
+	// resolve the ownership of.
 	nr, err := corrosion.GetNetwork(ctx, s.db, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "get network: %v", err)
 	}
 	if nr == nil {
 		return nil, status.Errorf(codes.NotFound, "network %q not found", req.Name)
+	}
+	if err := s.RequirePerm(ctx, networkRBACPathFor(nr.Project, req.Name), "network.delete", "operator"); err != nil {
+		return nil, err
 	}
 
 	// Check if VMs are still using this network.
@@ -205,7 +224,7 @@ func (s *Server) ListNetworks(ctx context.Context, _ *emptypb.Empty) (*pb.ListNe
 // config changes (e.g., bridge → direct), the new config is replicated to all
 // cluster hosts immediately — preventing other hosts' reconcilers from
 // provisioning the stale config.
-func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName string, def compose.NetworkDef) (*pb.NetworkInfo, error) {
+func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName, project string, def compose.NetworkDef) (*pb.NetworkInfo, error) {
 	ntype := def.Type
 	if ntype == "" {
 		ntype = "bridge"
@@ -216,6 +235,7 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 		StackName: stackName,
 		Type:      ntype,
 		Config:    string(cfgJSON),
+		Project:   project, // "" = global/shared
 	}); err != nil {
 		return nil, fmt.Errorf("persist network: %w", err)
 	}
@@ -257,6 +277,7 @@ func networkRecordToInfo(nr *corrosion.NetworkRecord) *pb.NetworkInfo {
 		Name:      nr.Name,
 		StackName: nr.StackName,
 		Type:      nr.Type,
+		Project:   nr.Project,
 	}
 	var cfg struct {
 		Interface string `json:"interface"`

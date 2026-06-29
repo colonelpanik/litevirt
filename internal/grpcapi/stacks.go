@@ -1448,7 +1448,9 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 			netDef.Interface = name
 		}
 		scopedName := compose.ScopedNetworkName(f.Name, name)
-		if _, err := s.provisionAndPersistNetwork(ctx, scopedName, f.Name, netDef); err != nil {
+		// Stack networks remain GLOBAL/shared ("") — preserving pre-v37 behavior;
+		// project-scoping stack-defined networks is a separate follow-up.
+		if _, err := s.provisionAndPersistNetwork(ctx, scopedName, f.Name, "", netDef); err != nil {
 			errs = append(errs, fmt.Sprintf("network %q: %v", name, err))
 		} else {
 			slog.Info("pre-deploy: provisioned network", "name", scopedName, "type", netDef.Type, "interface", netDef.Interface)

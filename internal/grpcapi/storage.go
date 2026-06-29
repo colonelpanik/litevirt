@@ -35,6 +35,7 @@ func storagePoolRecordToPB(p corrosion.StoragePoolRecord) *pb.StoragePool {
 		TotalBytes: p.TotalBytes,
 		UsedBytes:  p.UsedBytes,
 		State:      p.State,
+		Project:    p.Project,
 	}
 }
 

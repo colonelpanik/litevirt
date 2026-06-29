@@ -109,6 +109,7 @@ func newNetworkCreateCmd() *cobra.Command {
 		dhcp       bool
 		pf         string
 		spoofCheck bool
+		project    string
 	)
 	cmd := &cobra.Command{
 		Use:   "create <name>",
@@ -134,12 +135,17 @@ Examples:
 					Dhcp:       dhcp,
 					Pf:         pf,
 					SpoofCheck: spoofCheck,
+					Project:    project,
 				})
 				if err != nil {
 					return fmt.Errorf("create network: %w", err)
 				}
 
-				fmt.Printf("Network %s created (type=%s)\n", ni.Name, ni.Type)
+				owner := ni.Project
+				if owner == "" {
+					owner = "global"
+				}
+				fmt.Printf("Network %s created (type=%s, project=%s)\n", ni.Name, ni.Type, owner)
 				return nil
 			})
 		},
@@ -153,6 +159,7 @@ Examples:
 	cmd.Flags().BoolVar(&dhcp, "dhcp", false, "Enable DHCP on this network")
 	cmd.Flags().StringVar(&pf, "pf", "", "SR-IOV physical function")
 	cmd.Flags().BoolVar(&spoofCheck, "spoof-check", false, "Enable SR-IOV spoof checking")
+	cmd.Flags().StringVar(&project, "project", "", "Owning project (empty = global/shared, usable by all projects)")
 	return cmd
 }
 

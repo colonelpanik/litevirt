@@ -14,6 +14,10 @@ type NetworkRecord struct {
 	StackName string
 	Type      string
 	Config    string // JSON blob of NetworkDef
+	// Project is the owning tenant. EMPTY means GLOBAL/shared — usable by every
+	// project (the admin escape hatch). A non-empty value means owned + isolated:
+	// only a workload in the SAME project (or with root scope) may attach.
+	Project   string
 	CreatedAt string
 	UpdatedAt string
 }
@@ -22,22 +26,23 @@ type NetworkRecord struct {
 func UpsertNetwork(ctx context.Context, c *Client, r NetworkRecord) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
-		`INSERT INTO networks (name, stack_name, type, config, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO networks (name, stack_name, type, config, project, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(name) DO UPDATE SET
 		   stack_name = excluded.stack_name,
 		   type = excluded.type,
 		   config = excluded.config,
+		   project = excluded.project,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		r.Name, r.StackName, r.Type, r.Config, nowRFC3339(), now,
+		r.Name, r.StackName, r.Type, r.Config, r.Project, nowRFC3339(), now,
 	)
 }
 
 // ListNetworks returns all active network records.
 func ListNetworks(ctx context.Context, c *Client) ([]NetworkRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT name, stack_name, type, config, created_at, updated_at
+		`SELECT name, stack_name, type, config, COALESCE(project, '') AS project, created_at, updated_at
 		 FROM networks WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
@@ -45,14 +50,7 @@ func ListNetworks(ctx context.Context, c *Client) ([]NetworkRecord, error) {
 
 	records := make([]NetworkRecord, 0, len(rows))
 	for _, r := range rows {
-		records = append(records, NetworkRecord{
-			Name:      r.String("name"),
-			StackName: r.String("stack_name"),
-			Type:      r.String("type"),
-			Config:    r.String("config"),
-			CreatedAt: r.String("created_at"),
-			UpdatedAt: r.String("updated_at"),
-		})
+		records = append(records, scanNetwork(r))
 	}
 	return records, nil
 }
@@ -60,7 +58,7 @@ func ListNetworks(ctx context.Context, c *Client) ([]NetworkRecord, error) {
 // GetNetwork returns a single network by name, or nil if not found.
 func GetNetwork(ctx context.Context, c *Client, name string) (*NetworkRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT name, stack_name, type, config, created_at, updated_at
+		`SELECT name, stack_name, type, config, COALESCE(project, '') AS project, created_at, updated_at
 		 FROM networks WHERE name = ? AND deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
@@ -68,15 +66,20 @@ func GetNetwork(ctx context.Context, c *Client, name string) (*NetworkRecord, er
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	r := rows[0]
-	return &NetworkRecord{
+	rec := scanNetwork(rows[0])
+	return &rec, nil
+}
+
+func scanNetwork(r Row) NetworkRecord {
+	return NetworkRecord{
 		Name:      r.String("name"),
 		StackName: r.String("stack_name"),
 		Type:      r.String("type"),
 		Config:    r.String("config"),
+		Project:   r.String("project"),
 		CreatedAt: r.String("created_at"),
 		UpdatedAt: r.String("updated_at"),
-	}, nil
+	}
 }
 
 // DeleteNetwork soft-deletes a network record.
@@ -106,7 +109,7 @@ func CountVMsOnNetwork(ctx context.Context, c *Client, networkName string) (int,
 // on the host or VMs on the host attached to them.
 func ListNetworksByHost(ctx context.Context, c *Client, hostName string) ([]NetworkRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT DISTINCT n.name, n.stack_name, n.type, n.config, n.created_at, n.updated_at
+		`SELECT DISTINCT n.name, n.stack_name, n.type, n.config, COALESCE(n.project, '') AS project, n.created_at, n.updated_at
 		 FROM networks n
 		 WHERE n.deleted_at IS NULL AND (
 		   EXISTS (SELECT 1 FROM network_vteps v
@@ -121,14 +124,7 @@ func ListNetworksByHost(ctx context.Context, c *Client, hostName string) ([]Netw
 
 	records := make([]NetworkRecord, 0, len(rows))
 	for _, r := range rows {
-		records = append(records, NetworkRecord{
-			Name:      r.String("name"),
-			StackName: r.String("stack_name"),
-			Type:      r.String("type"),
-			Config:    r.String("config"),
-			CreatedAt: r.String("created_at"),
-			UpdatedAt: r.String("updated_at"),
-		})
+		records = append(records, scanNetwork(r))
 	}
 	return records, nil
 }

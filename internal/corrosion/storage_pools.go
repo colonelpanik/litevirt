@@ -8,12 +8,16 @@ import (
 
 // StoragePoolRecord represents a storage pool on a host.
 type StoragePoolRecord struct {
-	HostName   string
-	Name       string
-	Driver     string
-	Source     string
-	Target     string
-	Options    map[string]string
+	HostName string
+	Name     string
+	Driver   string
+	Source   string
+	Target   string
+	Options  map[string]string
+	// Project is the owning tenant. EMPTY means GLOBAL/shared — usable by every
+	// project; a non-empty value means owned + isolated (only that project's
+	// workloads may place disks on it).
+	Project    string
 	TotalBytes int64
 	UsedBytes  int64
 	State      string
@@ -34,9 +38,9 @@ func UpsertStoragePool(ctx context.Context, c *Client, p StoragePoolRecord) erro
 	}
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO storage_pools
-			(host_name, name, driver, source, target, options, total_bytes, used_bytes, state, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		p.HostName, p.Name, p.Driver, p.Source, p.Target, optsJSON,
+			(host_name, name, driver, source, target, options, project, total_bytes, used_bytes, state, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		p.HostName, p.Name, p.Driver, p.Source, p.Target, optsJSON, p.Project,
 		p.TotalBytes, p.UsedBytes, p.State, now,
 	)
 }
@@ -44,7 +48,7 @@ func UpsertStoragePool(ctx context.Context, c *Client, p StoragePoolRecord) erro
 // ListAllStoragePools returns all active storage pools across the cluster.
 func ListAllStoragePools(ctx context.Context, c *Client) ([]StoragePoolRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, name, driver, source, target, options, total_bytes, used_bytes, state
+		`SELECT host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state
 		 FROM storage_pools WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
@@ -59,7 +63,7 @@ func ListAllStoragePools(ctx context.Context, c *Client) ([]StoragePoolRecord, e
 // ListStoragePoolsForHost returns all active storage pools for a specific host.
 func ListStoragePoolsForHost(ctx context.Context, c *Client, hostName string) ([]StoragePoolRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, name, driver, source, target, options, total_bytes, used_bytes, state
+		`SELECT host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state
 		 FROM storage_pools WHERE host_name = ? AND deleted_at IS NULL`, hostName)
 	if err != nil {
 		return nil, err
@@ -76,7 +80,7 @@ func ListStoragePoolsForHost(ctx context.Context, c *Client, hostName string) ([
 // distinguish "missing" from "error" — a NotFound RPC code is enough.
 func GetStoragePool(ctx context.Context, c *Client, hostName, name string) (StoragePoolRecord, bool, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, name, driver, source, target, options, total_bytes, used_bytes, state
+		`SELECT host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state
 		 FROM storage_pools WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		hostName, name)
 	if err != nil {
@@ -129,6 +133,7 @@ func scanStoragePool(r Row) StoragePoolRecord {
 		Driver:     r.String("driver"),
 		Source:     r.String("source"),
 		Target:     r.String("target"),
+		Project:    r.String("project"),
 		TotalBytes: r.Int64("total_bytes"),
 		UsedBytes:  r.Int64("used_bytes"),
 		State:      r.String("state"),

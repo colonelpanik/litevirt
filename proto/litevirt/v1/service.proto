@@ -590,6 +590,13 @@ message ContainerNetwork {
     string bridge = 2;  // host bridge to attach to
     string ip     = 3;  // optional static IP
     string mac    = 4;  // optional fixed MAC
+    // network_name names the litevirt-managed logical network this NIC attaches
+    // to. When set (or when `bridge` resolves to exactly one known network) the
+    // NIC is MANAGED: it gets a container_interfaces row, IPAM, DNS, and SG
+    // enforcement. A bare `bridge` that resolves to no/many networks is a
+    // legacy-unmanaged raw attachment (no managed state). (v35)
+    string network_name = 5;
+    repeated string security_groups = 6;  // SG names bound to this NIC (managed NICs only)
 }
 
 message CreateContainerRequest {

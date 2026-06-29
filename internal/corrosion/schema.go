@@ -193,7 +193,21 @@ import (
 //	     the target row so the coordinator can PROVE a (target,name) row is its own
 //	     restore (names aren't cluster-unique) before tombstoning the source. Two
 //	     ADD COLUMNs; gap-1 from v33.
-const CurrentSchemaVersion = 34
+//	v35: container_interfaces(host_name, ct_name, network_name, ordinal, mac, ip,
+//	     veth_device, security_groups, updated_at, deleted_at; PK
+//	     (host_name,ct_name,ordinal)) — the container analogue of vm_interfaces,
+//	     giving every litevirt-managed container NIC a cluster row + a stable,
+//	     deterministic host veth device so IPAM/DNS/security-groups can apply to
+//	     containers like VMs. PK keyed by ordinal (not network) to allow multiple
+//	     NICs on one network. One CREATE TABLE; gap-1 from v34.
+//	v36: ip_allocations.owner_kind ('vm'|'ct', DEFAULT 'vm') + owner_host
+//	     (DEFAULT '') — generalize IPAM ownership beyond VMs. Leases now key on
+//	     (network, owner_kind, owner_host, vm_name): VMs keep an empty owner_host
+//	     (names are cluster-global), containers use their host (CT names are
+//	     per-host), so a VM and a CT — or two same-named CTs on different hosts —
+//	     can't alias to one lease. Old rows default to owner_kind='vm'/owner_host=''
+//	     preserving VM behavior. Two ADD COLUMNs; gap-1 from v35.
+const CurrentSchemaVersion = 36
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -746,6 +760,27 @@ var schemaDDL = []string{
 		PRIMARY KEY (vm_name, network_name)
 	)`,
 
+	// container_interfaces is the container analogue of vm_interfaces (v35): one
+	// row per litevirt-MANAGED container NIC. veth_device is the deterministic
+	// host-side veth the firewall reconciler binds security groups to (the CT
+	// equivalent of vm_interfaces.tap_device). PK is (host_name, ct_name, ordinal)
+	// — ordinal, not network_name, so a container can hold multiple NICs on one
+	// network. Raw/unmanaged bridge NICs get NO row (this table is the managed-NIC
+	// source of truth).
+	`CREATE TABLE IF NOT EXISTS container_interfaces (
+		host_name       TEXT NOT NULL,
+		ct_name         TEXT NOT NULL,
+		network_name    TEXT NOT NULL,
+		ordinal         INTEGER NOT NULL,
+		mac             TEXT NOT NULL,
+		ip              TEXT,
+		veth_device     TEXT,
+		security_groups TEXT,                    -- JSON []string of SG names; NULL = none
+		updated_at      TEXT NOT NULL,
+		deleted_at      TEXT,
+		PRIMARY KEY (host_name, ct_name, ordinal)
+	)`,
+
 	`CREATE TABLE IF NOT EXISTS vm_disks (
 		vm_name      TEXT NOT NULL,
 		disk_name    TEXT NOT NULL,
@@ -1104,7 +1139,9 @@ var schemaDDL = []string{
 		network      TEXT NOT NULL,
 		ip           TEXT NOT NULL,
 		mac          TEXT NOT NULL,
-		vm_name      TEXT NOT NULL,
+		vm_name      TEXT NOT NULL,        -- the owner NAME (legacy column name); see owner_kind
+		owner_kind   TEXT NOT NULL DEFAULT 'vm',  -- 'vm' | 'ct' (v36)
+		owner_host   TEXT NOT NULL DEFAULT '',    -- '' for VMs (cluster-global names); host for CTs (v36)
 		allocated_at TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
@@ -1482,6 +1519,7 @@ var tablePrimaryKeys = map[string][]string{
 	"stacks":                 {"name"},
 	"vms":                    {"name"},
 	"vm_interfaces":          {"vm_name", "network_name"},
+	"container_interfaces":   {"host_name", "ct_name", "ordinal"},
 	"vm_disks":               {"vm_name", "disk_name"},
 	"snapshots":              {"id"},
 	"lb_configs":             {"name"},
@@ -1694,6 +1732,9 @@ var schemaMigrations = []string{
 	// cluster-unique) before tombstoning the source.
 	`ALTER TABLE containers ADD COLUMN create_spec TEXT`,
 	`ALTER TABLE containers ADD COLUMN relocate_token TEXT`,
+	// v36: generalize IPAM ownership beyond VMs (see History v36).
+	`ALTER TABLE ip_allocations ADD COLUMN owner_kind TEXT NOT NULL DEFAULT 'vm'`,
+	`ALTER TABLE ip_allocations ADD COLUMN owner_host TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -1765,6 +1806,7 @@ var alterVersions = []int{
 	31, 31, // lb_configs.generation, lb_backends.generation
 	32, 32, 32, 32, 32, // user_2fa.deleted_at/epoch; recovery_codes.set_id/updated_at/deleted_at
 	34, 34, // containers.create_spec, containers.relocate_token
+	36, 36, // ip_allocations.owner_kind, ip_allocations.owner_host
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -1781,6 +1823,7 @@ var createTableUnits = []struct {
 	{26, "container_backups"}, {27, "container_snapshots"},
 	{32, "recovery_code_sets"}, {32, "user_2fa_sets"},
 	{33, "host_runtime_usage"},
+	{35, "container_interfaces"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

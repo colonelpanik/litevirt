@@ -8,16 +8,20 @@ import (
 // TestNetworkConfig_HappyPath checks the bridge + flags + IP rendering
 // for a representative two-NIC container.
 func TestNetworkConfig_HappyPath(t *testing.T) {
-	got := NetworkConfig([]NetworkAttach{
-		{Name: "eth0", Bridge: "br0", IP: "10.0.0.5/24", MAC: "aa:bb:cc:dd:ee:ff"},
+	got, err := NetworkConfig([]NetworkAttach{
+		{Name: "eth0", Bridge: "br0", IP: "10.0.0.5/24", MAC: "aa:bb:cc:dd:ee:ff", Veth: "lvc0abc1234"},
 		{Name: "eth1", Bridge: "vxlan-prod"},
 	})
+	if err != nil {
+		t.Fatalf("NetworkConfig: %v", err)
+	}
 	mustContainAll(t, got,
 		"lxc.net.0.type = veth",
 		"lxc.net.0.link = br0",
 		"lxc.net.0.flags = up",
 		"lxc.net.0.name = eth0",
 		"lxc.net.0.hwaddr = aa:bb:cc:dd:ee:ff",
+		"lxc.net.0.veth.pair = lvc0abc1234",
 		"lxc.net.0.ipv4.address = 10.0.0.5/24",
 		"lxc.net.1.type = veth",
 		"lxc.net.1.link = vxlan-prod",
@@ -32,16 +36,29 @@ func TestNetworkConfig_HappyPath(t *testing.T) {
 // TestNetworkConfig_StableOrdering ensures two equivalent inputs render
 // identically — important for diff-friendly config files.
 func TestNetworkConfig_StableOrdering(t *testing.T) {
-	a := NetworkConfig([]NetworkAttach{
+	a, errA := NetworkConfig([]NetworkAttach{
 		{Name: "eth1", Bridge: "br1"},
 		{Name: "eth0", Bridge: "br0"},
 	})
-	b := NetworkConfig([]NetworkAttach{
+	b, errB := NetworkConfig([]NetworkAttach{
 		{Name: "eth0", Bridge: "br0"},
 		{Name: "eth1", Bridge: "br1"},
 	})
+	if errA != nil || errB != nil {
+		t.Fatalf("NetworkConfig: %v / %v", errA, errB)
+	}
 	if a != b {
 		t.Errorf("non-deterministic ordering:\nA=%s\nB=%s", a, b)
+	}
+}
+
+// TestNetworkConfig_RejectsConfigInjection ensures a NIC field containing a
+// newline can't forge extra lxc.* directives.
+func TestNetworkConfig_RejectsConfigInjection(t *testing.T) {
+	if _, err := NetworkConfig([]NetworkAttach{
+		{Name: "eth0", Bridge: "br0\nlxc.net.0.script.up = /evil"},
+	}); err == nil {
+		t.Fatal("expected an error for a NIC field with an embedded newline")
 	}
 }
 

@@ -74,7 +74,7 @@ var tableNames = []string{
 	"lb_configs", "lb_backends", "users", "tokens", "dns_records",
 	"fencing_log", "audit_log",
 	"network_vteps", "bgp_peers", "ip_allocations", "security_groups", "sg_rules",
-	"containers",
+	"containers", "container_interfaces",
 	// Cluster-global config + state — full-state anti-entropy coverage. All
 	// LWW-safe (PK + updated_at) and free of plaintext secrets. Previously
 	// push-replicated only, so a node that missed a push (partition/restart)

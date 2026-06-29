@@ -474,6 +474,18 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 		return status.Errorf(codes.Internal, "restore: record cluster row: %v", err)
 	}
+	// Re-home the MANAGED network identity (container_interfaces rows) on this
+	// host from the create spec, so a restored/migrated container keeps its
+	// network_name + SG bindings + deterministic veth. Best-effort: the container
+	// is already tracked and the spec persisted, so a transient failure here is
+	// recoverable (re-derivable from create_spec); don't fail the landed restore.
+	for _, ifc := range corrosion.BuildContainerInterfacesFromSpec(s.hostName, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec)) {
+		if err := corrosion.UpsertContainerInterface(ctx, s.db, ifc); err != nil {
+			slog.Warn("container restore: failed to record interface row (re-derivable from create_spec)",
+				"name", req.Name, "network", ifc.NetworkName, "error", err)
+		}
+	}
+
 	// Signal that the cluster row has been recorded — the restore has LANDED. A
 	// remote driver (failover RestoreContainerFromBackup) keys off this frame to
 	// distinguish a landed restore whose later start failed from a genuine restore

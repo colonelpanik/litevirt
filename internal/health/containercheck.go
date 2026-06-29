@@ -107,18 +107,32 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	// Reconstruct litevirt-managed networking from the persisted create spec
 	// (v34) so an image-recreate isn't network-blind. Empty for pre-v34 rows →
 	// recreated with no managed NICs (prior behavior).
+	spec := corrosion.DecodeCreateSpec(ct.CreateSpec)
 	opts := lxc.CreateOpts{
 		Name: ct.Name, Template: ct.Image,
 		CPULimit: ct.CPULimit, MemoryMiB: ct.MemMiB, Labels: ct.Labels,
 	}
-	for _, n := range corrosion.DecodeCreateSpec(ct.CreateSpec).Networks {
-		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC})
+	for i, n := range spec.Networks {
+		veth := ""
+		if n.NetworkName != "" { // managed NIC → deterministic, trackable veth
+			veth = corrosion.ContainerVethName(ct.Name, i)
+		}
+		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: veth})
 	}
 	if _, err := c.runtime.Create(ctx, opts); err != nil {
 		slog.Error("containercheck: relocate-recreate failed (will retry)",
 			"container", ct.Name, "image", ct.Image, "error", err)
 		c.publish("ct.relocate.failed", ct.Name, err.Error())
 		return // leave pending → retried next sweep
+	}
+	// Re-home the managed interface rows on this (relocate target) host from the
+	// create spec so the container keeps its network identity + SG bindings.
+	// Best-effort: the container is materialized; rows are re-derivable.
+	for _, ifc := range corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec) {
+		if err := corrosion.UpsertContainerInterface(ctx, c.db, ifc); err != nil {
+			slog.Warn("containercheck: failed to record relocated interface row",
+				"container", ct.Name, "network", ifc.NetworkName, "error", err)
+		}
 	}
 	if err := c.runtime.Start(ctx, ct.Name); err != nil {
 		slog.Error("containercheck: relocate-recreate start failed", "container", ct.Name, "error", err)

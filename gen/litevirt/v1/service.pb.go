@@ -8026,13 +8026,20 @@ func (x *Container) GetProject() string {
 }
 
 type ContainerNetwork struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`     // unique within container (eth0, eth1, …)
-	Bridge        string                 `protobuf:"bytes,2,opt,name=bridge,proto3" json:"bridge,omitempty"` // host bridge to attach to
-	Ip            string                 `protobuf:"bytes,3,opt,name=ip,proto3" json:"ip,omitempty"`         // optional static IP
-	Mac           string                 `protobuf:"bytes,4,opt,name=mac,proto3" json:"mac,omitempty"`       // optional fixed MAC
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`     // unique within container (eth0, eth1, …)
+	Bridge string                 `protobuf:"bytes,2,opt,name=bridge,proto3" json:"bridge,omitempty"` // host bridge to attach to
+	Ip     string                 `protobuf:"bytes,3,opt,name=ip,proto3" json:"ip,omitempty"`         // optional static IP
+	Mac    string                 `protobuf:"bytes,4,opt,name=mac,proto3" json:"mac,omitempty"`       // optional fixed MAC
+	// network_name names the litevirt-managed logical network this NIC attaches
+	// to. When set (or when `bridge` resolves to exactly one known network) the
+	// NIC is MANAGED: it gets a container_interfaces row, IPAM, DNS, and SG
+	// enforcement. A bare `bridge` that resolves to no/many networks is a
+	// legacy-unmanaged raw attachment (no managed state). (v35)
+	NetworkName    string   `protobuf:"bytes,5,opt,name=network_name,json=networkName,proto3" json:"network_name,omitempty"`
+	SecurityGroups []string `protobuf:"bytes,6,rep,name=security_groups,json=securityGroups,proto3" json:"security_groups,omitempty"` // SG names bound to this NIC (managed NICs only)
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ContainerNetwork) Reset() {
@@ -8091,6 +8098,20 @@ func (x *ContainerNetwork) GetMac() string {
 		return x.Mac
 	}
 	return ""
+}
+
+func (x *ContainerNetwork) GetNetworkName() string {
+	if x != nil {
+		return x.NetworkName
+	}
+	return ""
+}
+
+func (x *ContainerNetwork) GetSecurityGroups() []string {
+	if x != nil {
+		return x.SecurityGroups
+	}
+	return nil
 }
 
 type CreateContainerRequest struct {
@@ -20127,12 +20148,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\arestart\x18\t \x01(\v2\x1a.litevirt.v1.RestartPolicyR\arestart\x12!\n" +
 	"\fstate_detail\x18\n" +
 	" \x01(\tR\vstateDetail\x12\x18\n" +
-	"\aproject\x18\v \x01(\tR\aproject\"`\n" +
+	"\aproject\x18\v \x01(\tR\aproject\"\xac\x01\n" +
 	"\x10ContainerNetwork\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06bridge\x18\x02 \x01(\tR\x06bridge\x12\x0e\n" +
 	"\x02ip\x18\x03 \x01(\tR\x02ip\x12\x10\n" +
-	"\x03mac\x18\x04 \x01(\tR\x03mac\"\xa9\x04\n" +
+	"\x03mac\x18\x04 \x01(\tR\x03mac\x12!\n" +
+	"\fnetwork_name\x18\x05 \x01(\tR\vnetworkName\x12'\n" +
+	"\x0fsecurity_groups\x18\x06 \x03(\tR\x0esecurityGroups\"\xa9\x04\n" +
 	"\x16CreateContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1a\n" +

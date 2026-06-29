@@ -242,6 +242,7 @@ type ContainerNICOpt struct {
 	Bridge string
 	IP     string
 	MAC    string
+	Veth   string // deterministic host-side veth name (managed NICs); "" = legacy/unmanaged
 }
 
 // ContainerInfo is the minimal post-create record handed back.

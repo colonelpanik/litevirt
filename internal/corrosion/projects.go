@@ -278,6 +278,23 @@ func SumProjectUsage(ctx context.Context, c *Client, name string) (*ProjectUsage
 			}
 		}
 	}
+	// Container NICs count toward the same NIC / public-IP budget (v35: containers
+	// are now first-class network citizens via container_interfaces).
+	ctIPRows, err := c.Query(ctx,
+		`SELECT container_interfaces.ip AS ip
+		 FROM container_interfaces
+		 JOIN containers ON container_interfaces.host_name = containers.host_name
+		                AND container_interfaces.ct_name = containers.name
+		 WHERE containers.project = ? AND containers.deleted_at IS NULL AND container_interfaces.deleted_at IS NULL`,
+		name)
+	if err == nil {
+		u.NICUsed += len(ctIPRows)
+		for _, r := range ctIPRows {
+			if ip := net.ParseIP(r.String("ip")); ip != nil && !ip.IsPrivate() {
+				u.PublicIPsUsed++
+			}
+		}
+	}
 
 	// Backup footprint: VMs and containers draw down the SAME backup_gib budget.
 	// Sum the latest backup size per (vm, disk, repo) from vm_backups and per

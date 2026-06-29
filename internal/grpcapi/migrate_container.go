@@ -133,6 +133,11 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
 		slog.Warn("container migrate: source row soft-delete failed", "name", req.Name, "error", err)
 	}
+	// Release the source's managed NICs (IPAM leases + interface rows); the target
+	// rebuilt its own from the create spec during restore. source == s.hostName.
+	if err := s.releaseContainerNICs(ctx, req.Name); err != nil {
+		slog.Warn("container migrate: source NIC release failed (leases/rows may linger, GC'able)", "name", req.Name, "error", err)
+	}
 	_ = corrosion.DeleteContainerRestartState(ctx, s.db, source, req.Name)
 
 	s.audit(ctx, "ct.migrate", req.Name, fmt.Sprintf("project=%s %s→%s", project, source, req.TargetHost), "ok")

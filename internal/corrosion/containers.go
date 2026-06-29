@@ -93,13 +93,20 @@ type ContainerCreateSpec struct {
 	Networks []ContainerNetwork `json:"networks,omitempty"`
 }
 
-// ContainerNetwork is one NIC of a ContainerCreateSpec (mirrors lxc.NetworkAttach
-// without importing the lxc package into corrosion).
+// ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-
+// time intent so relocate/restore/clone can faithfully rebuild the NIC:
+// NetworkName (the managed logical network, "" = legacy raw bridge),
+// SecurityGroups (SG names), MAC (the stable generated/assigned MAC), and IP
+// (the user's STATIC intent only — an auto-allocated address is left empty so a
+// rebuild re-allocates rather than reusing a now-stale lease). The derived veth
+// is NOT stored; it's recomputed deterministically from (host, ct, ordinal).
 type ContainerNetwork struct {
-	Name   string `json:"name,omitempty"`
-	Bridge string `json:"bridge,omitempty"`
-	IP     string `json:"ip,omitempty"`
-	MAC    string `json:"mac,omitempty"`
+	Name           string   `json:"name,omitempty"`
+	Bridge         string   `json:"bridge,omitempty"`
+	IP             string   `json:"ip,omitempty"`
+	MAC            string   `json:"mac,omitempty"`
+	NetworkName    string   `json:"network_name,omitempty"`
+	SecurityGroups []string `json:"security_groups,omitempty"`
 }
 
 // EncodeCreateSpec marshals a create spec for storage. Returns "" for a

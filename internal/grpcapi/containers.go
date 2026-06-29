@@ -86,15 +86,19 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 	}
 
-	nics := make([]ContainerNICOpt, 0, len(req.Networks))
-	for _, n := range req.Networks {
-		nics = append(nics, ContainerNICOpt{Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac})
+	// Resolve the requested NICs into runtime attachments + managed-interface rows
+	// + IPAM leases + create-spec intent (managed network vs legacy raw bridge).
+	// Pure resolution — nothing is written yet.
+	plan, err := s.resolveContainerNICs(ctx, req.Name, req.Networks)
+	if err != nil {
+		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
+		return nil, err
 	}
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		CPULimit: int(req.Cpu), MemoryMiB: int(req.MemoryMib),
-		Networks: nics, Labels: req.Labels,
+		Networks: plan.lxcNics, Labels: req.Labels,
 	})
 	if err != nil {
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
@@ -105,11 +109,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// restore can rebuild this container faithfully, not as a bare image recreate.
 	createSpec := corrosion.ContainerCreateSpec{
 		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
-	}
-	for _, n := range req.Networks {
-		createSpec.Networks = append(createSpec.Networks, corrosion.ContainerNetwork{
-			Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac,
-		})
+		Networks: plan.specNets,
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -134,6 +134,19 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster row: %v", err)
+	}
+	// Write the managed interface rows + IPAM leases ATOMICALLY (one batch — the
+	// ip_allocations PK rejects a racing IP). On failure roll back fully: tombstone
+	// the container row + delete the runtime container, so no half-tracked state
+	// and no leaked lease (leases only exist if the whole batch committed).
+	if err := corrosion.WriteContainerNetworkAtomic(ctx, s.db, plan.ifaces, plan.leases); err != nil {
+		_ = corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, info.Name)
+		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
+			slog.Warn("container create: cleanup after network-write failure also failed",
+				"name", info.Name, "error", delErr)
+		}
+		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
+		return nil, status.Errorf(codes.Internal, "create: record container network: %v", err)
 	}
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
@@ -261,10 +274,14 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "delete: remove cluster row: %v", derr)
 	}
-	// Best-effort restart-state cleanup on BOTH the normal and already-absent
-	// paths: a prior delete may have tombstoned the row but failed here, so a
-	// retry (now zero-row) must still clear it — otherwise a later same-host/name
-	// recreate could inherit stale restart state.
+	// Cascade the managed network state (IPAM leases + container_interfaces rows)
+	// and clear restart state, on BOTH the normal and already-absent paths — a
+	// prior delete may have tombstoned the container row but failed these, so a
+	// retry (now zero-row) must still clean them up, else a later same-host/name
+	// recreate inherits stale leases/rows.
+	if err := s.releaseContainerNICs(ctx, req.Name); err != nil {
+		slog.Warn("container delete: failed to release managed NICs (leases/interface rows may linger, GC'able)", "name", req.Name, "error", err)
+	}
 	if err := corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name); err != nil {
 		slog.Warn("container delete: failed to clear restart state (harmless, GC'able)", "name", req.Name, "error", err)
 	}

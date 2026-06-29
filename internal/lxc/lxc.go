@@ -83,6 +83,7 @@ type NetworkAttach struct {
 	Bridge string // host bridge to attach to (br0, vxlan-prod, …)
 	IP     string // optional static IP; empty = DHCP / RA
 	MAC    string // optional fixed MAC; empty = OS-generated
+	Veth   string // optional deterministic host-side veth name (lxc.net.N.veth.pair); ≤15 bytes
 }
 
 // ExecResult captures the outcome of lxc-attach.
@@ -893,7 +894,10 @@ func (r *LxcRunner) finalizeContainerConfig(opts CreateOpts) error {
 	}
 	cfg := strings.TrimRight(b.String(), "\n") + "\n"
 
-	netCfg := NetworkConfig(opts.Network)
+	netCfg, err := NetworkConfig(opts.Network)
+	if err != nil {
+		return fmt.Errorf("render network config: %w", err)
+	}
 	if netCfg == "" {
 		netCfg = defaultNetConfig()
 	}

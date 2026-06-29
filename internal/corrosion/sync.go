@@ -699,24 +699,34 @@ func (c *Client) digestTableRows(ctx context.Context, table string) ([]string, b
 		if err := rows.Scan(ptrs...); err != nil {
 			continue
 		}
-		// Length-prefix every cell so the encoding is unambiguous: a value can
-		// contain any byte (incl. would-be separators) without aliasing an
-		// adjacent column or row. NULL is a distinct marker (values always start
-		// with a digit).
-		var sb strings.Builder
-		for _, v := range vals {
-			if v == nil {
-				sb.WriteString("N;")
-			} else {
-				s := coerceString(v)
-				sb.WriteString(strconv.Itoa(len(s)))
-				sb.WriteByte(':')
-				sb.WriteString(s)
-			}
-		}
-		rowKeys = append(rowKeys, sb.String())
+		rowKeys = append(rowKeys, encodeRowCells(vals))
 	}
 	return rowKeys, true
+}
+
+// encodeRowCells produces the canonical, unambiguous encoding of a row's cells —
+// the single source of truth for content hashing across the digest, the
+// divergence scanner (Phase 0), and the LWW resolvers. Length-prefix every cell
+// so a value can contain any byte (incl. would-be separators) without aliasing an
+// adjacent column or row; NULL is a distinct marker ("N;") since non-null values
+// always start with a digit.
+//
+// BYTE-FROZEN: pinned by golden vectors (TestEncodeRowCells_GoldenVectors). A
+// change here re-fingerprints every row and forces a cluster-wide anti-entropy
+// resync storm across the version boundary — don't.
+func encodeRowCells(vals []interface{}) string {
+	var sb strings.Builder
+	for _, v := range vals {
+		if v == nil {
+			sb.WriteString("N;")
+		} else {
+			s := coerceString(v)
+			sb.WriteString(strconv.Itoa(len(s)))
+			sb.WriteByte(':')
+			sb.WriteString(s)
+		}
+	}
+	return sb.String()
 }
 
 // StateDigest returns a lightweight fingerprint of each operator-safe

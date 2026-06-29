@@ -184,7 +184,11 @@ func TestBackupContainer_StoppedSkipsFreeze(t *testing.T) {
 
 // TestBackupContainer_WrongHost mirrors the VM single-host model: a container
 // owned by another host returns FailedPrecondition naming it.
-func TestBackupContainer_WrongHost(t *testing.T) {
+// A remote container backup with an ABSOLUTE repo_path is rejected (PR 4):
+// remote streaming requires a configured logical repo name; an absolute path is
+// local-only. (Pre-PR-4 a remote container returned FailedPrecondition; the sink
+// now forwards to the owner instead.)
+func TestBackupContainer_RemoteCT_AbsoluteRepoRejected(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"
 	s.SetContainerRuntime(&fakeCTRuntime{})
@@ -193,8 +197,8 @@ func TestBackupContainer_WrongHost(t *testing.T) {
 	})
 	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
 	err := s.BackupContainer(&pb.BackupContainerRequest{Name: "ctB", RepoPath: t.TempDir()}, bk)
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected FailedPrecondition, got %v", err)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for remote CT + absolute repo, got %v", err)
 	}
 }
 

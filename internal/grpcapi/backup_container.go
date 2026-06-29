@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -137,10 +138,16 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		return err
 	}
 
-	// Resolve the owning host and confirm it's us — LXC is host-local.
+	// Resolve the owning host.
 	host, rec, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
 	if err != nil {
 		return err
+	}
+	// PR-4 flow 2 (remote CT backup, no shared repo): a remote container called
+	// with no sink_host means WE are the repo SINK — have the owning daemon archive
+	// locally and PushBackup the manifest back here, then confirm it landed.
+	if req.SinkHost == "" && host != s.hostName {
+		return s.sinkRemoteContainerBackup(ctx, host, req, stream)
 	}
 	if host != s.hostName {
 		return status.Errorf(codes.FailedPrecondition,
@@ -154,13 +161,31 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
-	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
-	if err != nil {
-		return err
-	}
-	repo, err := pbsstore.Open(repoPath)
-	if err != nil {
-		return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
+	// When asked to push to a remote sink (sink_host set), archive into a LOCAL
+	// staging repo and stream the manifest to the sink afterward; otherwise write
+	// directly into the resolved local repo (today's path).
+	pushToSink := req.SinkHost != "" && req.SinkHost != s.hostName
+	var repo *pbsstore.Repo
+	if pushToSink {
+		if filepath.IsAbs(req.RepoPath) {
+			return status.Error(codes.InvalidArgument,
+				"remote container backup requires a configured logical repo name on the sink (an absolute repo_path is local-only)")
+		}
+		var cleanup func()
+		repo, cleanup, err = s.newLocalStagingRepo()
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+	} else {
+		repoPath, rerr := s.resolveBackupRepoPath(ctx, req.RepoPath)
+		if rerr != nil {
+			return rerr
+		}
+		repo, err = pbsstore.Open(repoPath)
+		if err != nil {
+			return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
+		}
 	}
 	timestamp := req.Timestamp
 	if timestamp == "" {
@@ -208,7 +233,14 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		return status.Errorf(codes.Internal, "backup push: %v", perr)
 	}
 
-	if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, manifest.TotalSize); err != nil {
+	if pushToSink {
+		// Stream the just-created manifest + its missing chunks to the sink's repo.
+		// The sink records its own usage index; we don't double-count here.
+		if err := s.pushManifestToPeerRepo(ctx, req.SinkHost, req.RepoPath, repo, manifest); err != nil {
+			s.audit(ctx, "ct.backup", req.Name, "project="+project, "error")
+			return err
+		}
+	} else if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, manifest.TotalSize); err != nil {
 		slog.Warn("container backup: update container_backups usage index",
 			"name", req.Name, "repo", req.RepoPath, "error", err)
 	}
@@ -219,6 +251,75 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		ChunksTotal:    int32(len(manifest.Chunks)),
 		BytesProcessed: manifest.TotalSize,
 		Status:         fmt.Sprintf("backup stored at %s", manifest.Timestamp),
+	})
+}
+
+// sinkRemoteContainerBackup runs on the daemon the operator called (the repo
+// SINK) when the container lives on another host: it asks the owning daemon to
+// archive locally and PushBackup the manifest back here (sink_host = us), proxies
+// progress, then CONFIRMS the manifest landed in our repo — so an owning daemon
+// too old to honor sink_host surfaces as an error, not a false success.
+func (s *Server) sinkRemoteContainerBackup(ctx context.Context, owner string, req *pb.BackupContainerRequest, stream grpc.ServerStreamingServer[pb.BackupContainerProgress]) error {
+	if filepath.IsAbs(req.RepoPath) {
+		return status.Error(codes.InvalidArgument,
+			"remote container backup requires a configured logical repo name (an absolute repo_path is local-only)")
+	}
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	c, closeConn, err := s.dialPeer(ctx, owner)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "reach owning host %q: %v", owner, err)
+	}
+	defer closeConn()
+
+	fwd := proto.Clone(req).(*pb.BackupContainerRequest)
+	fwd.SinkHost = s.hostName
+	stream2, err := c.BackupContainer(ctx, fwd)
+	if err != nil {
+		return err
+	}
+	var ownerTS string
+	for {
+		p, e := stream2.Recv()
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			return e
+		}
+		if p.ManifestTs != "" {
+			ownerTS = p.ManifestTs
+		}
+		if p.Phase != pb.BackupContainerProgress_DONE {
+			_ = stream.Send(p)
+		}
+	}
+
+	ts := ownerTS
+	if ts == "" {
+		ts = req.Timestamp
+	}
+	repo, err := pbsstore.Open(repoPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "open sink repo: %v", err)
+	}
+	m, err := repo.GetManifest(req.Name, ts, containerBackupDisk)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"remote backup did not land in repo %q (the owning daemon %q may not support peer backup streaming): %v",
+			req.RepoPath, owner, err)
+	}
+	if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, m.TotalSize); err != nil {
+		slog.Warn("container backup: update container_backups usage index", "name", req.Name, "repo", req.RepoPath, "error", err)
+	}
+	return stream.Send(&pb.BackupContainerProgress{
+		Phase:          pb.BackupContainerProgress_DONE,
+		ManifestTs:     m.Timestamp,
+		ChunksTotal:    int32(len(m.Chunks)),
+		BytesProcessed: m.TotalSize,
+		Status:         fmt.Sprintf("backup stored at %s (archived on %s)", m.Timestamp, owner),
 	})
 }
 

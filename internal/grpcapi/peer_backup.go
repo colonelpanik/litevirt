@@ -17,6 +17,20 @@ import (
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
+// dialPeer returns a LiteVirtClient for the named host plus a closer, honoring
+// the test seam. Production wraps peerClient (real mTLS dial); tests can inject a
+// fake client wired to a second in-process server.
+func (s *Server) dialPeer(ctx context.Context, host string) (pb.LiteVirtClient, func(), error) {
+	if s.peerClientOverride != nil {
+		return s.peerClientOverride(ctx, host)
+	}
+	c, conn, err := s.peerClient(ctx, host)
+	if err != nil {
+		return nil, nil, err
+	}
+	return c, func() { _ = conn.Close() }, nil
+}
+
 // pushBackupMaxConcurrent caps simultaneous PushBackup streams a node serves as
 // a sink, so a burst of remote backups/migrations can't exhaust disk/CPU.
 const pushBackupMaxConcurrent = 4
@@ -289,6 +303,40 @@ func (s *Server) openStagingRepo(token string) (*pbsstore.Repo, error) {
 		return pbsstore.Open(path)
 	}
 	return pbsstore.Init(path)
+}
+
+// newLocalStagingRepo creates a fresh local staging repo (a plaintext transfer
+// buffer under <DataDir>/backup-staging/<token>/) and returns a cleanup closure.
+// Used by remote backup: the owning daemon runs the backup engine into it, then
+// streams the manifest to the sink and removes it.
+func (s *Server) newLocalStagingRepo() (*pbsstore.Repo, func(), error) {
+	token := newTransferToken()
+	path := filepath.Join(s.dataDir, "backup-staging", token)
+	r, err := pbsstore.Init(path)
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "create backup staging repo: %v", err)
+	}
+	return r, func() { _ = os.RemoveAll(path) }, nil
+}
+
+// pushManifestToPeerRepo streams one manifest + its missing chunks from a local
+// (staging) repo into a peer's CONFIGURED logical repo over peer mTLS — the owner
+// side of remote VM/CT backup (the owner pushes to the sink's repo by name).
+func (s *Server) pushManifestToPeerRepo(ctx context.Context, sinkHost, repoName string, srcRepo *pbsstore.Repo, m *pbsstore.Manifest) error {
+	c, closeConn, err := s.dialPeer(ctx, sinkHost)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "reach sink host %q: %v", sinkHost, err)
+	}
+	defer closeConn()
+	sink := newRemoteRepoSink(ctx, c, &pb.RepoTarget{RepoName: repoName})
+	defer sink.Close()
+	if _, err := pbsstore.SyncManifest(ctx, srcRepo, m, sink); err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return status.Errorf(codes.FailedPrecondition, "sink host %q predates peer backup streaming", sinkHost)
+		}
+		return status.Errorf(codes.Internal, "push backup to sink %q: %v", sinkHost, err)
+	}
+	return nil
 }
 
 // removeStagingRepo deletes a per-transfer staging repo and everything under it.

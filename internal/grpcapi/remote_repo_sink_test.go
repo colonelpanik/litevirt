@@ -3,12 +3,15 @@ package grpcapi
 import (
 	"bytes"
 	"context"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -34,12 +37,16 @@ func (c *fakePushClient) CloseAndRecv() (*pb.PushBackupResponse, error) {
 	return fs.resp, nil
 }
 
-// fakeLVClient routes the two transport RPCs to the real server handlers with a
-// peer context; every other method panics (unused here).
+// fakeLVClient routes the transport RPCs to the real server handlers with a peer
+// context; BackupContainer is driven by an optional hook (the sink-forward test);
+// every other method panics (unused here).
 type fakeLVClient struct {
 	pb.LiteVirtClient
 	srv     *Server
 	peerCtx context.Context
+	// backupContainerFn, when set, supplies the progress frames a forwarded
+	// BackupContainer returns (simulating the owning daemon). nil → Unimplemented.
+	backupContainerFn func(*pb.BackupContainerRequest) ([]*pb.BackupContainerProgress, error)
 }
 
 func (c *fakeLVClient) HasChunks(_ context.Context, in *pb.HasChunksRequest, _ ...grpc.CallOption) (*pb.HasChunksResponse, error) {
@@ -48,6 +55,32 @@ func (c *fakeLVClient) HasChunks(_ context.Context, in *pb.HasChunksRequest, _ .
 
 func (c *fakeLVClient) PushBackup(_ context.Context, _ ...grpc.CallOption) (grpc.ClientStreamingClient[pb.PushBackupFrame, pb.PushBackupResponse], error) {
 	return &fakePushClient{srv: c.srv, peerCtx: c.peerCtx}, nil
+}
+
+func (c *fakeLVClient) BackupContainer(_ context.Context, in *pb.BackupContainerRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.BackupContainerProgress], error) {
+	if c.backupContainerFn == nil {
+		return nil, status.Error(codes.Unimplemented, "fake: no BackupContainer hook")
+	}
+	frames, err := c.backupContainerFn(in)
+	if err != nil {
+		return nil, err
+	}
+	return &fakeBackupCtStream{frames: frames}, nil
+}
+
+type fakeBackupCtStream struct {
+	grpc.ServerStreamingClient[pb.BackupContainerProgress]
+	frames []*pb.BackupContainerProgress
+	i      int
+}
+
+func (f *fakeBackupCtStream) Recv() (*pb.BackupContainerProgress, error) {
+	if f.i >= len(f.frames) {
+		return nil, io.EOF
+	}
+	p := f.frames[f.i]
+	f.i++
+	return p, nil
 }
 
 func grpcRandomBytes(t *testing.T, n int) []byte {

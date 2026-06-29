@@ -64,11 +64,11 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 		// without a second daemon.
 		return s.migrateRestoreOverride(ctx, target, repoName, name, timestamp, start)
 	}
-	c, conn, err := s.peerClient(ctx, target)
+	c, closeConn, err := s.dialPeer(ctx, target)
 	if err != nil {
 		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", err)
 	}
-	defer conn.Close()
+	defer closeConn()
 
 	octx := ctx
 	if len(mdPairs) > 0 {

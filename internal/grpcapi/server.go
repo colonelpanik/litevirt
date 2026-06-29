@@ -87,6 +87,12 @@ type Server struct {
 	// pre-row failure, or an indeterminate stream break. Production leaves it nil.
 	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error)
 
+	// peerClientOverride is a test seam for the PR-4 peer backup/restore streaming
+	// helpers (dialPeer): when non-nil it returns a fake LiteVirtClient + closer
+	// instead of dialing a real peer over mTLS, so the owner→sink push path is
+	// unit-testable in-process. Production leaves it nil → real peerClient.
+	peerClientOverride func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error)
+
 	// stopVMOverride is a test seam for ShutdownHostWorkloads: when non-nil it
 	// replaces the in-process StopVM call (unit tests have no libvirt/peer), so
 	// the test can observe the reverse-startup-order sequence and stop_delay

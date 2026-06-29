@@ -158,6 +158,14 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, err
 	}
 	if host != s.hostName {
+		// Run the reference guard on THIS (entry) node's replicated view BEFORE
+		// forwarding, so a NEW entry node enforces the check even when the pool's
+		// host runs an OLD daemon that lacks it (mixed-cluster). The target
+		// re-checks against its own authoritative view below — a reference
+		// visible to EITHER node blocks (unless --force).
+		if err := s.poolReferenceGuard(ctx, host, req.Name, req.Force); err != nil {
+			return nil, err
+		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "dial %q: %v", host, err)
@@ -167,24 +175,9 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return client.DeleteStoragePool(ctx, req)
 	}
 
-	// Reference guard — refuse to hide a pool still in use unless --force. Both
-	// counts are HOST-scoped (pools are host-local). Fail CLOSED on a count error:
-	// a DB read failure must not be read as "no references" and let the delete
-	// through silently.
-	disks, err := corrosion.CountDisksUsingPool(ctx, s.db, host, req.Name)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "count disks using pool: %v", err)
-	}
-	scheds, err := corrosion.CountActiveSchedulesUsingPool(ctx, s.db, host, req.Name)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "count schedules using pool: %v", err)
-	}
-	if (disks > 0 || scheds > 0) && !req.Force {
-		detail := fmt.Sprintf("disks=%d schedules=%d", disks, scheds)
-		s.audit(ctx, "storage.pool.delete", req.Name, detail, "blocked")
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"pool %q on %q is still referenced (%s); use --force to delete anyway",
-			req.Name, host, detail)
+	// Target path: re-run the guard against this host's authoritative view.
+	if err := s.poolReferenceGuard(ctx, host, req.Name, req.Force); err != nil {
+		return nil, err
 	}
 
 	// Driver teardown (unmount NFS / log out of iSCSI) is best-effort about ERRORS
@@ -263,15 +256,42 @@ func (s *Server) driverTeardownIfPossible(ctx context.Context, rec corrosion.Sto
 	if td == nil {
 		return nil // local/dir/ceph/zfs/btrfs/lvm-thin — nothing to tear down
 	}
-	// Refcount: don't tear down a source another pool on this host still uses.
-	shared, err := corrosion.CountPoolsSharingSource(ctx, s.db, rec.HostName, rec.Name, rec.Source)
+	// Refcount: don't tear down a mount/session another pool on this host still
+	// uses. The shared resource is driver-specific (NFS derived mountpoint, iSCSI
+	// IQN+portal), not merely the same source string.
+	shared, err := corrosion.CountPoolsSharingResource(ctx, s.db, rec)
 	if err != nil {
-		return fmt.Errorf("count pools sharing source: %w", err)
+		return fmt.Errorf("count pools sharing resource: %w", err)
 	}
 	if shared > 0 {
-		slog.Info("storage pool teardown skipped: source shared by another pool",
-			"host", rec.HostName, "name", rec.Name, "source", rec.Source, "sharing", shared)
+		slog.Info("storage pool teardown skipped: resource shared by another pool",
+			"host", rec.HostName, "name", rec.Name, "driver", rec.Driver, "source", rec.Source, "sharing", shared)
 		return nil
 	}
 	return td.Teardown(ctx)
+}
+
+// poolReferenceGuard refuses (codes.FailedPrecondition) to delete a pool that is
+// still referenced by live VM disks or ENABLED backup/replication schedules,
+// unless force. Both counts are HOST-scoped (pools are host-local) and read from
+// replicated state, so it runs meaningfully on BOTH the entry node (pre-forward)
+// and the target host. Fail CLOSED on a count error — a DB read failure must
+// never be read as "no references". Audits the refusal as "blocked".
+func (s *Server) poolReferenceGuard(ctx context.Context, host, name string, force bool) error {
+	disks, err := corrosion.CountDisksUsingPool(ctx, s.db, host, name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "count disks using pool: %v", err)
+	}
+	scheds, err := corrosion.CountActiveSchedulesUsingPool(ctx, s.db, host, name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "count schedules using pool: %v", err)
+	}
+	if (disks > 0 || scheds > 0) && !force {
+		detail := fmt.Sprintf("disks=%d schedules=%d", disks, scheds)
+		s.audit(ctx, "storage.pool.delete", name, detail, "blocked")
+		return status.Errorf(codes.FailedPrecondition,
+			"pool %q on %q is still referenced (%s); use --force to delete anyway",
+			name, host, detail)
+	}
+	return nil
 }

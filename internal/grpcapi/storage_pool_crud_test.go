@@ -276,6 +276,33 @@ func TestDeleteStoragePool_DisabledScheduleDoesNotBlock(t *testing.T) {
 	}
 }
 
+// A delete forwarded to a remote host must be reference-guarded on THIS (entry)
+// node BEFORE it forwards — otherwise a new node forwarding to an old (unguarded)
+// node could hide a referenced pool. The guard blocks before any peer dial.
+func TestDeleteStoragePool_EntryNodeGuardsBeforeForward(t *testing.T) {
+	s := newPoolTestServer(t) // hostName = host-a
+	if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
+		HostName: "host-b", Name: "p1", Driver: "local", State: "active",
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+	if err := corrosion.InsertDisk(adminCtx(), s.db, corrosion.DiskRecord{
+		VMName: "vm1", DiskName: "root", HostName: "host-b",
+		StorageType: "local", StorageVolume: "p1", Path: "/x/root.qcow2",
+	}); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+	// Host-b is unreachable in the test; the guard must fire first (FailedPrecondition),
+	// not a dial error.
+	_, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "p1", Host: "host-b"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("entry node must guard before forwarding; got %v", err)
+	}
+	if n := auditRows(t, s, "storage.pool.delete", "blocked"); n != 1 {
+		t.Fatalf("want 1 blocked audit row on entry node, got %d", n)
+	}
+}
+
 // The clean path: an unreferenced pool deletes, undefines the libvirt object, and audits "ok".
 func TestDeleteStoragePool_UnreferencedSucceeds(t *testing.T) {
 	s := newPoolTestServer(t)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // StoragePoolRecord represents a storage pool on a host.
@@ -132,18 +133,52 @@ func CountDisksUsingPool(ctx context.Context, c *Client, host, poolName string) 
 	return rows[0].Int("n"), nil
 }
 
-// CountPoolsSharingSource counts OTHER live pool rows on host that reference the
-// same underlying source (NFS export / iSCSI target IQN) as (host, excludeName).
-// It's the refcount behind teardown: a shared NFS mount or iSCSI session must NOT
-// be torn down while another pool on the host still uses it. Empty source ⇒ 0.
-func CountPoolsSharingSource(ctx context.Context, c *Client, host, excludeName, source string) (int, error) {
-	if source == "" {
+// CountPoolsSharingResource counts OTHER live pool rows on rec's host that would
+// share the SAME host-level resource rec's teardown releases — the refcount that
+// stops us tearing down a mount/session another pool still needs. The shared
+// resource is DRIVER-SPECIFIC, not just "same source":
+//
+//   - nfs: the litevirt-DERIVED mountpoint, keyed by source. Only OTHER
+//     litevirt-owned NFS pools (target='') with the same source mount it at the
+//     same path; an operator-managed (targetOverride) pool mounts elsewhere and
+//     is excluded — counting it would falsely block a derived-mount unmount.
+//   - iscsi: the (target IQN, portal) session. Same source (IQN) AND same portal
+//     (empty/absent normalizes to 127.0.0.1, matching the driver default) — two
+//     pools on the same IQN via DIFFERENT portals are distinct sessions and must
+//     not block each other.
+//   - every other driver: no host-level resource to refcount → 0 (teardown is a
+//     no-op for them anyway).
+func CountPoolsSharingResource(ctx context.Context, c *Client, rec StoragePoolRecord) (int, error) {
+	if rec.Source == "" {
 		return 0, nil
 	}
-	rows, err := c.Query(ctx,
-		`SELECT COUNT(*) AS n FROM storage_pools
-		 WHERE host_name = ? AND name != ? AND source = ? AND deleted_at IS NULL`,
-		host, excludeName, source)
+	switch strings.ToLower(rec.Driver) {
+	case "nfs", "netfs":
+		rows, err := c.Query(ctx,
+			`SELECT COUNT(*) AS n FROM storage_pools
+			 WHERE host_name = ? AND name != ? AND driver = ? AND source = ?
+			   AND COALESCE(target, '') = '' AND deleted_at IS NULL`,
+			rec.HostName, rec.Name, rec.Driver, rec.Source)
+		return countN(rows, err)
+	case "iscsi":
+		portal := rec.Options["portal"]
+		if portal == "" {
+			portal = "127.0.0.1"
+		}
+		rows, err := c.Query(ctx,
+			`SELECT COUNT(*) AS n FROM storage_pools
+			 WHERE host_name = ? AND name != ? AND driver = 'iscsi' AND source = ? AND deleted_at IS NULL
+			   AND CASE WHEN COALESCE(json_extract(options, '$.portal'), '') = ''
+			            THEN '127.0.0.1' ELSE json_extract(options, '$.portal') END = ?`,
+			rec.HostName, rec.Name, rec.Source, portal)
+		return countN(rows, err)
+	default:
+		return 0, nil
+	}
+}
+
+// countN reads a single COUNT(*) AS n result.
+func countN(rows []Row, err error) (int, error) {
 	if err != nil {
 		return 0, err
 	}

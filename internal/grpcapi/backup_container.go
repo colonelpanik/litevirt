@@ -43,6 +43,13 @@ type containerBackupSpec struct {
 	CreateSpec    string `json:"create_spec,omitempty"`
 	OnHostFailure string `json:"on_host_failure,omitempty"`
 	IsTemplate    bool   `json:"is_template,omitempty"`
+	// StateDetail carries the source's stop intent so a restore that does NOT start
+	// the container (req.Start == false, e.g. cold-migrating an already-stopped CT)
+	// preserves it. Only "operator-stop" is load-bearing — without it the target
+	// reconciler treats the stopped row as an out-of-band stop and restarts it,
+	// resurrecting a container the operator had deliberately stopped. (Other details
+	// are transient — the reconciler overwrites them on its next sweep.)
+	StateDetail string `json:"state_detail,omitempty"`
 }
 
 // containerBackupDisk is the manifest "disk" name for a container — a container
@@ -373,6 +380,7 @@ func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec 
 		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
 		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
 		CreateSpec: rec.CreateSpec, OnHostFailure: rec.OnHostFailure, IsTemplate: rec.IsTemplate,
+		StateDetail: rec.StateDetail,
 	})
 	// Pipe the export tar straight into the chunk store so we never buffer the
 	// whole rootfs. If PushDisk returns early (error), CloseWithError unblocks
@@ -509,8 +517,18 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	if manifest.ContainerSpecJSON != "" {
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
 	}
+	// Preserve the source's stop intent ONLY when we are NOT going to start the
+	// container (req.Start == false — e.g. cold-migrating an already-stopped CT).
+	// Otherwise the row lands as stopped with an empty detail and the reconciler
+	// treats it as an out-of-band stop, restarting a CT the operator had stopped.
+	// When we DO start it, leave the detail empty (a successful start clears it; a
+	// failed start must not inherit a stale stop intent).
+	stateDetail := ""
+	if !req.Start {
+		stateDetail = spec.StateDetail
+	}
 	rec := corrosion.ContainerRecord{
-		HostName: s.hostName, Name: req.Name, State: "stopped",
+		HostName: s.hostName, Name: req.Name, State: "stopped", StateDetail: stateDetail,
 		Image: spec.Image, CPULimit: spec.CPULimit, MemMiB: spec.MemMiB,
 		Labels: spec.Labels, RestartPolicy: spec.RestartPolicy,
 		Project: tenancy.NormalizeProject(project),

@@ -21,9 +21,21 @@ func TestParseCTNetworks(t *testing.T) {
 		t.Errorf("nic1 bridge wrong: %+v", nics[1])
 	}
 
-	// bridge is required
+	// Managed NIC: network= + semicolon-separated security-groups.
+	mn, err := parseCTNetworks([]string{"network=app-net,name=eth0,security-groups=web;db"})
+	if err != nil {
+		t.Fatalf("managed NIC: %v", err)
+	}
+	if mn[0].NetworkName != "app-net" || mn[0].Name != "eth0" {
+		t.Errorf("managed NIC parsed wrong: %+v", mn[0])
+	}
+	if len(mn[0].SecurityGroups) != 2 || mn[0].SecurityGroups[0] != "web" || mn[0].SecurityGroups[1] != "db" {
+		t.Errorf("security groups parsed wrong: %v", mn[0].SecurityGroups)
+	}
+
+	// network= OR bridge= is required (neither → error)
 	if _, err := parseCTNetworks([]string{"name=eth0"}); err == nil {
-		t.Error("expected error when bridge is missing")
+		t.Error("expected error when neither network= nor bridge= is given")
 	}
 	// unknown key rejected
 	if _, err := parseCTNetworks([]string{"bridge=br0,foo=bar"}); err == nil {

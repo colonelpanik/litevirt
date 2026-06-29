@@ -180,6 +180,13 @@ missing. Recommended order:
   `lv sg bind <vm> --network <net> --sg web` mutates at runtime. The
   reconciler's `CorrosionPlanLoader` resolves names to real taps every
   tick.
+- **Containers get identical per-NIC enforcement on their veth.** A managed
+  container NIC's `container_interfaces.security_groups` binds to its
+  deterministic veth exactly like a VM NIC binds to its tap — the same
+  `CorrosionPlanLoader` emits a `nic_<veth>` chain (host-scoped, live containers
+  only, skipping a NIC with no veth yet). Set at create with
+  `lv ct create --network network=<net>,security-groups=web;db` (or compose). A
+  day-2 CT-aware rebind (the `lv sg bind` analogue) is a follow-up.
 - **`lv firewall reload` actually forces** — `ReloadFirewall` RPC
   drives the local reconciler synchronously and returns a
   `FirewallStatus` snapshot.

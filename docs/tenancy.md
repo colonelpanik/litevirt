@@ -106,6 +106,42 @@ lv role grant Operator group:acme-eng@oidc:corp --path /projects/acme --propagat
 The grant covers every VM, network, and stack created under `acme`
 *and* its descendants. See `docs/auth.md`.
 
+## Project-scoped network & storage isolation
+
+A network or storage pool is either **owned by a project** or **global**:
+
+```bash
+lv network create app-net --type bridge --project acme   # owned by acme
+lv pool create fast --driver zfs --source tank --project acme
+lv network create mgmt --type bridge                     # global (shared)
+```
+
+- **Global** (the default, and every object that pre-existed this feature) is
+  usable by **every** project — the deliberate shared-infrastructure escape hatch.
+- **Owned** means isolated: only workloads in that project (or a root operator)
+  may attach to it.
+
+Enforcement is at **attach time**, not just display. When a VM or container binds a
+NIC or places a disk, litevirt admits the workload's project against the target's
+owner: a workload may use a global resource or one its own project owns, never
+another project's. This covers create **and** the day-2 paths — disk move,
+replicate, import, replication-schedule creation, and replica promotion. A
+raw/unmanaged bridge is outside isolation, so attaching to one requires
+cluster-root network authority; a project-scoped workload must use a managed
+network.
+
+Reads are scoped too: `lv network ls` / `lv pool ls` show global objects plus
+those owned by projects the caller can read, and each object shows its owner.
+RBAC follows the object — an owned object authorizes under
+`/projects/<p>/networks|storage_pools/<name>`, a global one at the root path (so
+only a root grant manages shared fabric).
+
+This is logical isolation enforced at the control plane. A *dataplane* cross-project
+L2 firewall deny is intentionally **not** part of it: admission already makes its
+firing condition unreachable (two different projects can't share a non-global L2,
+and a global L2 is shared by design — put a default-deny security group there to
+lock it down). VLAN/VXLAN-range and network-namespace separation remain follow-ups.
+
 ## Billing events
 
 Every VM lifecycle transition emits a billing event when
@@ -150,10 +186,12 @@ are still exercised but no HTTP traffic is generated. Tests inject
 
 The tenancy design covers more than this slice ships:
 
-- **Hard isolation** — per-project VLAN/VXLAN ranges, per-project Ceph
-  pool/RBD namespace, per-project network-namespace separation on
-  every host. Today everything shares the cluster's underlying pools
-  and bridges; isolation is logical, enforced by RBAC + quotas.
+- **Dataplane hard isolation** — per-project VLAN/VXLAN ranges, per-project Ceph
+  pool/RBD namespace, per-project network-namespace separation on every host, and a
+  cross-project L2 firewall deny. Project ownership of networks/pools and
+  *attach-time* admission already ship (see *Project-scoped network & storage
+  isolation* above); what remains is enforcing separation in the dataplane rather
+  than only at the control plane.
 - **Per-tenant PKI sub-CA** — cluster CA issues a tenant sub-CA, tenant
   operators get certs from the sub-CA so root-cluster trust isn't
   shared. Today every operator presents a cert from the single

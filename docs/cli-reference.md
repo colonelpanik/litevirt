@@ -182,7 +182,9 @@ than silently breaking BitLocker. The explicit refusals:
 ```bash
 lv ct pull <oci-image> --dest <rootfs>       # Pull an OCI image (skopeo + umoci)
 lv ct pull <oci-image> --dest <rootfs> --username <u> --password-stdin   # ad-hoc auth pull
-lv ct create <name> [--image <oci>] [--distro alpine --release 3.19] [--local]
+lv ct create <name> [--image <oci>] [--distro alpine --release 3.19] [--local] [--project <p>]
+lv ct create <name> --network network=<managed-net>[,name=eth0,ip=<cidr>,security-groups=web;db]  # managed NIC (IPAM/DNS/SG)
+lv ct create <name> --network bridge=<br>[,name=eth0,ip=<cidr>,mac=..]   # raw NIC (admin/root only under project tenancy)
 lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-delay 5s]  # auto-restart on unexpected stop
 lv ct create <name> --on-host-failure image-recreate   # rebuild on a surviving host if this one is fenced
 lv ct start <name>
@@ -293,13 +295,19 @@ lv network create <name> --type bridge [flags]    # Create a network
   --interface <name> | --vni <int> --underlay <iface>
   --subnet <cidr> [--dhcp]
   --pf <iface> --spoof-check                      # SR-IOV variants
+  --project <name>                                # owning project (empty = global/shared)
 lv network rm <name> [--force]
 ```
+
+`--project` makes the network owned + isolated: only that project's workloads (or
+a root operator) may attach. Omit it for a global/shared network. `lv network ls`
+shows the owner. See `docs/tenancy.md`.
 
 ## Storage pools
 
 ```bash
 lv pool create <name> --driver <d> [--source <s>] [--target <t>] [--option k=v]
+  [--project <name>]                              # owning project (empty = global/shared)
   # drivers: local | dir | nfs | iscsi | ceph | zfs | btrfs | lvm-thin
 lv pool ls
 lv pool inspect <name>

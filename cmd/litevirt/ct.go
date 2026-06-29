@@ -270,7 +270,7 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&arch, "arch", "amd64", "Architecture for download template")
 	cmd.Flags().IntVar(&cpu, "cpu", 0, "CPU shares (0 = unlimited)")
 	cmd.Flags().IntVar(&memMiB, "memory", 0, "Memory cap MiB (0 = unlimited)")
-	cmd.Flags().StringArrayVar(&networks, "network", nil, "Attach a NIC: bridge=<br>[,name=eth0][,ip=10.0.0.5/24][,mac=AA:BB:..] (repeatable; default: lxcbr0)")
+	cmd.Flags().StringArrayVar(&networks, "network", nil, "Attach a NIC: network=<managed-net> (IPAM/DNS/SG) OR bridge=<br> (raw)[,name=eth0][,ip=10.0.0.5/24][,mac=..][,security-groups=web;db] (repeatable; default: lxcbr0)")
 	cmd.Flags().StringVar(&host, "host", "", "Target host (default: the daemon you're connected to)")
 	cmd.Flags().StringVar(&onHostFailure, "on-host-failure", "", "Host-loss relocation policy: none (default) | image-recreate (rebuild on a surviving host if this one is fenced)")
 	cmd.Flags().StringVar(&project, "project", "", "Tenancy project (default: _default)")
@@ -295,9 +295,13 @@ func parseCTNetworks(specs []string) ([]*pb.ContainerNetwork, error) {
 			}
 			k, v, ok := strings.Cut(kv, "=")
 			if !ok {
-				return nil, fmt.Errorf("invalid --network %q: want comma-separated key=value pairs (bridge=,name=,ip=,mac=)", spec)
+				return nil, fmt.Errorf("invalid --network %q: want comma-separated key=value pairs (network=|bridge=,name=,ip=,mac=,security-groups=)", spec)
 			}
 			switch key := strings.TrimSpace(k); key {
+			case "network", "net":
+				// Managed logical network — gets a tracked interface row, deterministic
+				// veth/MAC, an IPAM lease, DNS, and security-group enforcement.
+				n.NetworkName = strings.TrimSpace(v)
 			case "bridge", "br":
 				n.Bridge = strings.TrimSpace(v)
 			case "name", "nic":
@@ -306,12 +310,19 @@ func parseCTNetworks(specs []string) ([]*pb.ContainerNetwork, error) {
 				n.Ip = strings.TrimSpace(v)
 			case "mac":
 				n.Mac = strings.TrimSpace(v)
+			case "security-groups", "sg":
+				// Semicolon-separated (commas already delimit the key=value pairs).
+				for _, g := range strings.Split(v, ";") {
+					if g = strings.TrimSpace(g); g != "" {
+						n.SecurityGroups = append(n.SecurityGroups, g)
+					}
+				}
 			default:
-				return nil, fmt.Errorf("invalid --network key %q (want bridge|name|ip|mac)", key)
+				return nil, fmt.Errorf("invalid --network key %q (want network|bridge|name|ip|mac|security-groups)", key)
 			}
 		}
-		if n.Bridge == "" {
-			return nil, fmt.Errorf("--network %q: bridge is required", spec)
+		if n.Bridge == "" && n.NetworkName == "" {
+			return nil, fmt.Errorf("--network %q: network= (managed) or bridge= (raw) is required", spec)
 		}
 		out = append(out, n)
 	}

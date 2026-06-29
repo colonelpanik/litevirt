@@ -120,6 +120,39 @@ Multiple networks can be attached to a single VM:
         ip: "172.16.0.10"
 ```
 
+## Container network attachment
+
+Containers attach to the same logical networks as VMs and reach parity on the
+managed path. A *managed* NIC (`network=<name>` on the CLI, or a compose `kind:
+lxc` workload's `network:`) gets a tracked `container_interfaces` row, a
+deterministic host veth + locally-administered MAC, an IPAM lease, a DNS record,
+and per-NIC security-group enforcement on its veth. A *raw* NIC (`bridge=<br>`)
+attaches straight onto a host bridge with no managed state (the admin escape
+hatch).
+
+```bash
+lv ct create web --network network=app-net,name=eth0,security-groups=web;db
+```
+
+Bridge-family networks (bridge / vxlan / isolated) are supported; `direct` and
+`sriov` are VM-only. See [containers.md](containers.md) for the full container
+networking model.
+
+## Network ownership (project isolation)
+
+A network is either **global** (the default — usable by every project) or **owned
+by a project**:
+
+```bash
+lv network create app-net --type bridge --project acme   # owned + isolated
+lv network create mgmt --type bridge                     # global (shared)
+```
+
+A workload may attach only to a global network or one its own project owns;
+attaching to another project's network is denied at create/attach time. A raw
+bridge is outside isolation, so it requires cluster-root authority (a project
+workload must use a managed network). See [tenancy.md](tenancy.md).
+
 ## VLAN trunk mode
 
 For VMs that need to handle multiple VLANs (e.g., virtual routers):
@@ -202,9 +235,9 @@ Notes:
 
 ## DNS
 
-litevirt runs a lightweight DNS server (default port 5354) that resolves VM names to IP addresses. Records are automatically created and removed as VMs start and stop.
+litevirt runs a lightweight DNS server (default port 5354) that resolves VM **and managed-container** names to IP addresses. Records are created and removed automatically as workloads get an IP, move, or are deleted.
 
-Name format: `<vm>.<stack>.<domain>` for VMs in a stack, or `<vm>.<domain>` for standalone VMs. For example, with the default domain `litevirt.local`, a VM named `web-1` in the `myapp` stack resolves as `web-1.myapp.litevirt.local`.
+Name format: `<name>.<stack>.<domain>` in a stack, or `<name>.<domain>` standalone — the same namespace for VMs and containers. For example, with the default domain `litevirt.local`, `web-1` in the `myapp` stack resolves as `web-1.myapp.litevirt.local`. A managed container's record is maintained by the per-host IP scanner (which discovers a DHCP address, persists it, and writes the record); a migrate re-creates it on the target.
 
 Configure the domain in `config.yaml`:
 

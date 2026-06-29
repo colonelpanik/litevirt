@@ -260,27 +260,14 @@ func relocateTokenFromMD(ctx context.Context) string {
 // frame/stream was lost) → RestoreUnknown, which the coordinator defers rather
 // than destructively falling back.
 func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string) (corrosion.RestoreOutcome, error) {
-	if s.migrateRestoreOverride != nil {
-		// Test seam (shared with MigrateContainer): the override returns the
-		// classified outcome directly.
-		return s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true)
-	}
-	// Carry the attempt token to the target so it stamps the restored row.
+	// Carry the attempt token to the target (on the RestoreContainer call) so it
+	// stamps the restored row. The transport (PR-4 push to staging vs. shared-repo
+	// fallback) is handled by drivePeerRestore.
+	var md []string
 	if token != "" {
-		ctx = metadata.AppendToOutgoingContext(ctx, relocateTokenMDKey, token)
+		md = []string{relocateTokenMDKey, token}
 	}
-	c, conn, derr := s.peerClient(ctx, target)
-	if derr != nil {
-		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", derr)
-	}
-	defer conn.Close()
-	rs, rerr := c.RestoreContainer(ctx, &pb.RestoreContainerRequest{
-		RepoPath: repoPath, Name: name, Timestamp: timestamp, HostName: target, Start: true,
-	})
-	if rerr != nil {
-		return corrosion.RestoreNotAttempted, rerr // RPC never established
-	}
-	return drainRestoreStream(rs)
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, true, md...)
 }
 
 // drainRestoreStream classifies a remote RestoreContainer progress stream. The
@@ -406,8 +393,8 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
 	}
-	if req.RepoPath == "" || req.Name == "" || req.Timestamp == "" {
-		return status.Error(codes.InvalidArgument, "repo_path, name and timestamp required")
+	if req.Name == "" || req.Timestamp == "" || (req.RepoPath == "" && req.StagingToken == "") {
+		return status.Error(codes.InvalidArgument, "name, timestamp and one of repo_path / staging_token required")
 	}
 	// Validate the name before it composes the permission path, the staging
 	// tar path (dataDir/ct-restore), or the container dir.
@@ -427,13 +414,29 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
-	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
-	if err != nil {
-		return err
-	}
-	repo, err := pbsstore.Open(repoPath)
-	if err != nil {
-		return status.Errorf(codes.NotFound, "open repo: %v", err)
+	// Resolve the source of the manifest+chunks. staging_token (PR 4) is the
+	// per-transfer internal repo a migrate/failover coordinator PushBackup-streamed
+	// into — so the target restores WITHOUT needing the source's repo over NFS. It
+	// is a transient transfer buffer, removed once we've materialised the tar.
+	var (
+		repo *pbsstore.Repo
+		err  error
+	)
+	if req.StagingToken != "" {
+		repo, err = s.openStagingRepo(req.StagingToken)
+		if err != nil {
+			return err
+		}
+		defer s.removeStagingRepo(req.StagingToken)
+	} else {
+		repoPath, rerr := s.resolveBackupRepoPath(ctx, req.RepoPath)
+		if rerr != nil {
+			return rerr
+		}
+		repo, err = pbsstore.Open(repoPath)
+		if err != nil {
+			return status.Errorf(codes.NotFound, "open repo: %v", err)
+		}
 	}
 	manifest, err := repo.GetManifest(req.Name, req.Timestamp, containerBackupDisk)
 	if err != nil {

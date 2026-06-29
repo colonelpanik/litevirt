@@ -5835,6 +5835,7 @@ type CreateNetworkRequest struct {
 	Dhcp          bool                   `protobuf:"varint,10,opt,name=dhcp,proto3" json:"dhcp,omitempty"`
 	Pf            string                 `protobuf:"bytes,11,opt,name=pf,proto3" json:"pf,omitempty"` // SR-IOV physical function
 	SpoofCheck    bool                   `protobuf:"varint,12,opt,name=spoof_check,json=spoofCheck,proto3" json:"spoof_check,omitempty"`
+	Project       string                 `protobuf:"bytes,13,opt,name=project,proto3" json:"project,omitempty"` // owning tenant; empty = global/shared (usable by all)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5951,6 +5952,13 @@ func (x *CreateNetworkRequest) GetSpoofCheck() bool {
 		return x.SpoofCheck
 	}
 	return false
+}
+
+func (x *CreateNetworkRequest) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
 }
 
 type GetNetworkRequest struct {
@@ -6104,6 +6112,7 @@ type NetworkInfo struct {
 	Dhcp          bool                   `protobuf:"varint,7,opt,name=dhcp,proto3" json:"dhcp,omitempty"`
 	Vni           int32                  `protobuf:"varint,8,opt,name=vni,proto3" json:"vni,omitempty"`
 	VmCount       int32                  `protobuf:"varint,9,opt,name=vm_count,json=vmCount,proto3" json:"vm_count,omitempty"`
+	Project       string                 `protobuf:"bytes,10,opt,name=project,proto3" json:"project,omitempty"` // owning tenant; empty = global/shared
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6199,6 +6208,13 @@ func (x *NetworkInfo) GetVmCount() int32 {
 		return x.VmCount
 	}
 	return 0
+}
+
+func (x *NetworkInfo) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
 }
 
 type ListLBResponse struct {
@@ -13905,6 +13921,7 @@ type CreateStoragePoolRequest struct {
 	Target        string                 `protobuf:"bytes,4,opt,name=target,proto3" json:"target,omitempty"`                                                                             // local mount/path override
 	Options       map[string]string      `protobuf:"bytes,5,rep,name=options,proto3" json:"options,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // driver-specific key/value flags
 	Host          string                 `protobuf:"bytes,6,opt,name=host,proto3" json:"host,omitempty"`                                                                                 // optional — defaults to caller's host
+	Project       string                 `protobuf:"bytes,7,opt,name=project,proto3" json:"project,omitempty"`                                                                           // owning tenant; empty = global/shared (usable by all)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13981,6 +13998,13 @@ func (x *CreateStoragePoolRequest) GetHost() string {
 	return ""
 }
 
+func (x *CreateStoragePoolRequest) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
+}
+
 type CreateStoragePoolResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Pool          *StoragePool           `protobuf:"bytes,1,opt,name=pool,proto3" json:"pool,omitempty"`
@@ -14028,7 +14052,8 @@ func (x *CreateStoragePoolResponse) GetPool() *StoragePool {
 type DeleteStoragePoolRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Host          string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"` // optional — defaults to caller's host
+	Host          string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"`       // optional — defaults to caller's host
+	Project       string                 `protobuf:"bytes,3,opt,name=project,proto3" json:"project,omitempty"` // owning tenant (tenancy scoping); field 4 reserved for force
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14073,6 +14098,13 @@ func (x *DeleteStoragePoolRequest) GetName() string {
 func (x *DeleteStoragePoolRequest) GetHost() string {
 	if x != nil {
 		return x.Host
+	}
+	return ""
+}
+
+func (x *DeleteStoragePoolRequest) GetProject() string {
+	if x != nil {
+		return x.Project
 	}
 	return ""
 }
@@ -19981,7 +20013,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\rsnapshot_name\x18\x02 \x01(\tR\fsnapshotName\"U\n" +
 	"\x15DeleteSnapshotRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12#\n" +
-	"\rsnapshot_name\x18\x02 \x01(\tR\fsnapshotName\"\xa3\x02\n" +
+	"\rsnapshot_name\x18\x02 \x01(\tR\fsnapshotName\"\xbd\x02\n" +
 	"\x14CreateNetworkRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x14\n" +
@@ -19996,14 +20028,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" \x01(\bR\x04dhcp\x12\x0e\n" +
 	"\x02pf\x18\v \x01(\tR\x02pf\x12\x1f\n" +
 	"\vspoof_check\x18\f \x01(\bR\n" +
-	"spoofCheck\"'\n" +
+	"spoofCheck\x12\x18\n" +
+	"\aproject\x18\r \x01(\tR\aproject\"'\n" +
 	"\x11GetNetworkRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"@\n" +
 	"\x14DeleteNetworkRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05force\x18\x02 \x01(\bR\x05force\"L\n" +
 	"\x14ListNetworksResponse\x124\n" +
-	"\bnetworks\x18\x01 \x03(\v2\x18.litevirt.v1.NetworkInfoR\bnetworks\"\xdd\x01\n" +
+	"\bnetworks\x18\x01 \x03(\v2\x18.litevirt.v1.NetworkInfoR\bnetworks\"\xf7\x01\n" +
 	"\vNetworkInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -20014,7 +20047,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\agateway\x18\x06 \x01(\tR\agateway\x12\x12\n" +
 	"\x04dhcp\x18\a \x01(\bR\x04dhcp\x12\x10\n" +
 	"\x03vni\x18\b \x01(\x05R\x03vni\x12\x19\n" +
-	"\bvm_count\x18\t \x01(\x05R\avmCount\"=\n" +
+	"\bvm_count\x18\t \x01(\x05R\avmCount\x12\x18\n" +
+	"\aproject\x18\n" +
+	" \x01(\tR\aproject\"=\n" +
 	"\x0eListLBResponse\x12+\n" +
 	"\x03lbs\x18\x01 \x03(\v2\x19.litevirt.v1.LoadBalancerR\x03lbs\"&\n" +
 	"\x10InspectLBRequest\x12\x12\n" +
@@ -20607,22 +20642,24 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bdefaults\x18\x01 \x03(\v2\x1c.litevirt.v1.FirewallDefaultR\bdefaults\"\x19\n" +
 	"\x17ListStoragePoolsRequest\"J\n" +
 	"\x18ListStoragePoolsResponse\x12.\n" +
-	"\x05pools\x18\x01 \x03(\v2\x18.litevirt.v1.StoragePoolR\x05pools\"\x94\x02\n" +
+	"\x05pools\x18\x01 \x03(\v2\x18.litevirt.v1.StoragePoolR\x05pools\"\xae\x02\n" +
 	"\x18CreateStoragePoolRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06driver\x18\x02 \x01(\tR\x06driver\x12\x16\n" +
 	"\x06source\x18\x03 \x01(\tR\x06source\x12\x16\n" +
 	"\x06target\x18\x04 \x01(\tR\x06target\x12L\n" +
 	"\aoptions\x18\x05 \x03(\v22.litevirt.v1.CreateStoragePoolRequest.OptionsEntryR\aoptions\x12\x12\n" +
-	"\x04host\x18\x06 \x01(\tR\x04host\x1a:\n" +
+	"\x04host\x18\x06 \x01(\tR\x04host\x12\x18\n" +
+	"\aproject\x18\a \x01(\tR\aproject\x1a:\n" +
 	"\fOptionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"I\n" +
 	"\x19CreateStoragePoolResponse\x12,\n" +
-	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\"B\n" +
+	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\"\\\n" +
 	"\x18DeleteStoragePoolRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
-	"\x04host\x18\x02 \x01(\tR\x04host\"\x1b\n" +
+	"\x04host\x18\x02 \x01(\tR\x04host\x12\x18\n" +
+	"\aproject\x18\x03 \x01(\tR\aproject\"\x1b\n" +
 	"\x19DeleteStoragePoolResponse\"?\n" +
 	"\x15GetStoragePoolRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +

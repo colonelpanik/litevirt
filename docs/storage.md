@@ -51,6 +51,12 @@ paths, ZFS volblocksize, iSCSI portal addresses, …). The full
 schema lives in `internal/storage/storage.go`'s `Config.Options` —
 each driver pulls its own keys out of the map.
 
+`--project <name>` makes a pool **owned** by a tenancy project: only that
+project's workloads (or a root operator) may place, move, replicate, import, or
+promote disks onto it. Omit it for a **global** pool (the default, and every
+pre-existing pool) usable by all projects. Enforcement is at use time, across
+create and the day-2 storage paths. See [tenancy.md](tenancy.md).
+
 `lv pool delete` soft-deletes the row from cluster state. The
 driver is asked to tear down (unmount NFS, log out of iSCSI) on a
 best-effort basis but failure does not block the delete — operators

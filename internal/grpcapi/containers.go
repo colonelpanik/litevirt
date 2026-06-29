@@ -109,7 +109,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// + create-spec intent, ALLOCATING each managed NIC's IPAM lease as it goes
 	// (managed network vs legacy raw bridge). On any later failure we release this
 	// container's leases (s.releaseContainerNICs) to undo partial allocation.
-	plan, err := s.resolveContainerNICs(ctx, req.Name, req.Networks)
+	plan, err := s.resolveContainerNICs(ctx, req.Project, req.Name, req.Networks)
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name) // undo any leases taken before the error
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")

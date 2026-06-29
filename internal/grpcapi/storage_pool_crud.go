@@ -32,10 +32,16 @@ import (
 // re-runs Prepare — operators expect `lv pool create` to be safe to
 // retry after a transient mount failure.
 func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoolRequest) (*pb.CreateStoragePoolResponse, error) {
-	// Cluster-global infra authority (configures a host mount/source); checked
-	// at the root path so a project-scoped token can't reach it, with the same
-	// operator floor for legacy role-based callers.
-	if err := s.RequirePerm(ctx, "/", "storage.pool.write", "operator"); err != nil {
+	// A pool is GLOBAL (req.Project == "" → admin-managed, RBAC-anchored at root) or
+	// OWNED by a project (RBAC at /projects/<p>/...). Empty project is NOT normalized
+	// to "_default" — that would make it owned, not global.
+	project := req.Project
+	if project != "" {
+		if _, err := safename.CanonicalProjectName(project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid project %q: %v", project, err)
+		}
+	}
+	if err := s.RequirePerm(ctx, poolRBACPathFor(project, req.Name), "storage.pool.write", "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
@@ -89,6 +95,7 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		Source:   req.Source,
 		Target:   req.Target,
 		Options:  req.Options,
+		Project:  project, // "" = global/shared
 		State:    "active",
 	}
 	// Populate capacity immediately for file-based pools so the UI/inspect and
@@ -123,7 +130,9 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 // the pool gone from the inventory even if cleanup is incomplete, and
 // can always re-mount manually. The error is logged so it's not silent.
 func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoolRequest) (*pb.DeleteStoragePoolResponse, error) {
-	if err := s.RequirePerm(ctx, "/", "storage.pool.write", "operator"); err != nil {
+	// Operator role floor BEFORE any lookup, so a viewer is rejected without being
+	// able to probe pool existence; the project-scoped check follows the fetch.
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
@@ -133,6 +142,20 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	if host == "" {
 		host = s.hostName
 	}
+	// Authorize against the pool's OWNING project (its STORED project, never the
+	// request's claim), scoped to the pool's host. storage_pools is replicated, so
+	// the entry node can read the record to RBAC-check before forwarding to the
+	// owning host. Fail closed on a read error.
+	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "lookup: %v", err)
+	}
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", req.Name, host)
+	}
+	if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, req.Name), "storage.pool.write", "operator"); err != nil {
+		return nil, err
+	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
@@ -141,14 +164,6 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		defer conn.Close()
 		req.Host = host
 		return client.DeleteStoragePool(ctx, req)
-	}
-
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, req.Name)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "lookup: %v", err)
-	}
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", req.Name, host)
 	}
 
 	if err := s.driverTeardownIfPossible(ctx, rec); err != nil {
@@ -165,10 +180,10 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 }
 
 // GetStoragePool returns one pool's full details. Used by `lv pool inspect`.
+// Read is project-scoped: a global pool is visible to any viewer, an owned one
+// only to its project (or root) — previously this required root for ALL pools,
+// which both over-restricted a project's own pool and under-scoped reads.
 func (s *Server) GetStoragePool(ctx context.Context, req *pb.GetStoragePoolRequest) (*pb.GetStoragePoolResponse, error) {
-	if err := s.RequirePerm(ctx, "/", "storage.pool.read", "viewer"); err != nil {
-		return nil, err
-	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name is required")
 	}
@@ -182,6 +197,9 @@ func (s *Server) GetStoragePool(ctx context.Context, req *pb.GetStoragePoolReque
 	}
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", req.Name, host)
+	}
+	if err := s.authorizeResourceRead(ctx, rec.Project, poolRBACPathFor(rec.Project, rec.Name), "storage.pool.read"); err != nil {
+		return nil, err
 	}
 	return &pb.GetStoragePoolResponse{Pool: storagePoolRecordToPB(rec)}, nil
 }

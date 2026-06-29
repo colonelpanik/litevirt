@@ -57,6 +57,25 @@ func ctRBACPathFor(project, name string) string {
 	return projectRBACBase(project) + "/containers/" + safeRBACSegment(name)
 }
 
+// networkRBACPathFor builds the RBAC path for a network keyed on its owning
+// project. A GLOBAL network (project == "") is admin-managed shared fabric, so it
+// anchors under root ("/networks/<name>") — only a root "/" grant manages it, NOT
+// a per-project grant. A project-owned network lives under "/projects/<p>/...".
+func networkRBACPathFor(project, name string) string {
+	if project == "" {
+		return "/networks/" + safeRBACSegment(name)
+	}
+	return projectRBACBase(project) + "/networks/" + safeRBACSegment(name)
+}
+
+// poolRBACPathFor is the storage-pool analogue of networkRBACPathFor.
+func poolRBACPathFor(project, name string) string {
+	if project == "" {
+		return "/storage_pools/" + safeRBACSegment(name)
+	}
+	return projectRBACBase(project) + "/storage_pools/" + safeRBACSegment(name)
+}
+
 // stackRBACPath builds the RBAC path for a stack under the default project,
 // validating the stack-name segment (a path-like name yields a sentinel).
 func stackRBACPath(stack string) string {

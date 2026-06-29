@@ -4911,6 +4911,7 @@ type StoragePool struct {
 	State         string                 `protobuf:"bytes,8,opt,name=state,proto3" json:"state,omitempty"` // "active" | "error" | "unmounted"
 	TotalBytes    int64                  `protobuf:"varint,9,opt,name=total_bytes,json=totalBytes,proto3" json:"total_bytes,omitempty"`
 	UsedBytes     int64                  `protobuf:"varint,10,opt,name=used_bytes,json=usedBytes,proto3" json:"used_bytes,omitempty"`
+	Project       string                 `protobuf:"bytes,11,opt,name=project,proto3" json:"project,omitempty"` // owning tenant; empty = global/shared
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5013,6 +5014,13 @@ func (x *StoragePool) GetUsedBytes() int64 {
 		return x.UsedBytes
 	}
 	return 0
+}
+
+func (x *StoragePool) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
 }
 
 var File_litevirt_v1_types_proto protoreflect.FileDescriptor
@@ -5498,7 +5506,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x16\n" +
 	"\x06detail\x18\x03 \x01(\tR\x06detail\x12\x1a\n" +
 	"\busername\x18\x04 \x01(\tR\busername\x128\n" +
-	"\ttimestamp\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\x8b\x02\n" +
+	"\ttimestamp\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xa5\x02\n" +
 	"\vStoragePool\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06driver\x18\x02 \x01(\tR\x06driver\x12\x16\n" +
@@ -5512,7 +5520,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"totalBytes\x12\x1d\n" +
 	"\n" +
 	"used_bytes\x18\n" +
-	" \x01(\x03R\tusedBytes*\x8c\x01\n" +
+	" \x01(\x03R\tusedBytes\x12\x18\n" +
+	"\aproject\x18\v \x01(\tR\aproject*\x8c\x01\n" +
 	"\aVMState\x12\x0f\n" +
 	"\vVM_CREATING\x10\x00\x12\x0f\n" +
 	"\vVM_STARTING\x10\x01\x12\x0e\n" +

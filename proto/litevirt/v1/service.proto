@@ -375,6 +375,7 @@ message CreateNetworkRequest {
     bool   dhcp       = 10;
     string pf         = 11; // SR-IOV physical function
     bool   spoof_check = 12;
+    string project    = 13; // owning tenant; empty = global/shared (usable by all)
 }
 message GetNetworkRequest      { string name = 1; }
 message DeleteNetworkRequest   { string name = 1; bool force = 2; }
@@ -389,6 +390,7 @@ message NetworkInfo {
     bool   dhcp       = 7;
     int32  vni        = 8;
     int32  vm_count   = 9;
+    string project    = 10; // owning tenant; empty = global/shared
 }
 
 // ── Load Balancers ──
@@ -1071,12 +1073,14 @@ message CreateStoragePoolRequest {
     string target     = 4; // local mount/path override
     map<string,string> options = 5; // driver-specific key/value flags
     string host       = 6; // optional — defaults to caller's host
+    string project    = 7; // owning tenant; empty = global/shared (usable by all)
 }
 message CreateStoragePoolResponse { StoragePool pool = 1; }
 
 message DeleteStoragePoolRequest {
     string name = 1;
     string host = 2; // optional — defaults to caller's host
+    string project = 3; // owning tenant (tenancy scoping); field 4 reserved for force
 }
 message DeleteStoragePoolResponse {}
 

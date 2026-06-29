@@ -68,6 +68,22 @@ func NormalizeProject(name string) string {
 	return name
 }
 
+// AdmitAttach reports whether a workload in project wlProject may attach to (or
+// place a disk on) a resource owned by ownerProject. A GLOBAL resource
+// (ownerProject == "", the admin escape hatch) is usable by every project;
+// otherwise the workload must be in the SAME project. Cross-project use is denied.
+// Both names are normalized, so a blank workload project is the default project —
+// which still may NOT use another named project's owned resource.
+//
+// This is the root of project network/storage isolation: enforced at attach time
+// (you simply cannot bind to another project's owned resource), not merely shown.
+func AdmitAttach(wlProject, ownerProject string) bool {
+	if ownerProject == "" {
+		return true // global/shared
+	}
+	return NormalizeProject(wlProject) == NormalizeProject(ownerProject)
+}
+
 // Admit gates a CreateVM-style request against the project's quota.
 // Returns nil when the request fits; otherwise a descriptive error
 // the caller maps to ResourceExhausted. The default project skips

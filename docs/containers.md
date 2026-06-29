@@ -160,33 +160,82 @@ section below. Per-NIC security-group provisioning for containers is a follow-up
 
 ## Networking
 
-LXC's native `veth` driver attaches into an existing bridge. Containers
-inherit the same network primitives the VM side uses (bridge, vxlan,
-isolated), so a container can sit on a VXLAN-overlaid VNet alongside
-VMs without any extra plumbing.
+LXC's native `veth` driver attaches into a bridge. Containers inherit the same
+network primitives the VM side uses (bridge, vxlan, isolated), so a container can
+sit on a VXLAN-overlaid VNet alongside VMs.
 
-Attach NICs from the CLI with `--network` (repeat it for multiple NICs).
-`bridge=` is required; `name=`, `ip=`, and `mac=` are optional:
+A NIC is attached one of two ways:
+
+- **`network=<managed-net>`** — a *managed* NIC on a litevirt logical network. It
+  gets a tracked `container_interfaces` row, a deterministic host veth and MAC, an
+  IPAM lease, DNS, and security-group enforcement (see below). This is the
+  first-class path and the one tenants use.
+- **`bridge=<br>`** — a *raw* NIC straight onto a host bridge, with no managed
+  state. The legacy/admin escape hatch (see *Project isolation* below).
 
 ```
+# Managed NIC on logical network "app-net", with security groups:
 lv ct create web --distro alpine --release 3.21 \
-    --network bridge=br0,name=eth0,ip=10.0.0.6/24 \
+    --network network=app-net,name=eth0,security-groups=web;db \
     --cpu 2 --memory 512
+
+# Raw bridge NIC with a static IP:
+lv ct create edge --distro alpine --release 3.21 \
+    --network bridge=br0,name=eth0,ip=10.0.0.6/24
 ```
 
-With no `--network`, the container gets a single veth on the host's default
-`lxcbr0` bridge (NAT to the outside). When `ip=` is given, litevirt also writes
-the guest's `/etc/network/interfaces` (ifupdown) so the static address survives
-boot — otherwise the stock image's DHCP client would flush the address LXC
-assigned. `internal/lxc/network.go` renders the config snippet:
+Stacks attach the same way: a compose `kind: lxc` workload's `network:` names a
+managed network. With no `--network`, the container gets a single raw veth on the
+host's default `lxcbr0` bridge (NAT to the outside).
+
+When `ip=` is given (or a managed network assigns a static address), litevirt also
+writes the guest's `/etc/network/interfaces` (ifupdown) so the address survives
+boot — otherwise the stock image's DHCP client would flush it. `internal/lxc/
+network.go` renders the config snippet, emitting the deterministic veth pair so the
+host side is trackable:
 
 ```
 lxc.net.0.type = veth
-lxc.net.0.link = br0
+lxc.net.0.link = br-app-net
+lxc.net.0.veth.pair = lvc1a2b3c4d5e6f
+lxc.net.0.hwaddr = 52:1a:2b:3c:4d:5e
 lxc.net.0.flags = up
 lxc.net.0.name = eth0
 lxc.net.0.ipv4.address = 10.0.0.6/24
 ```
+
+### Managed-NIC identity, IPAM, DNS, security groups, load balancing
+
+A managed NIC (one naming a `network=`) reaches **VM parity**:
+
+- **Interface row + deterministic identity.** Every managed NIC gets a
+  `container_interfaces` row keyed `(host, ct, ordinal)`, a deterministic host veth
+  (`lvc` + a hash, ≤15 bytes / IFNAMSIZ) and a generated locally-administered MAC
+  (`52:` + a 40-bit host-scoped hash, so two same-named containers on different
+  hosts sharing an L2 don't collide). The veth/MAC are stable across
+  restart/restore/migrate/clone.
+- **IPAM.** A static IP reserves that exact address; a subnet-backed network
+  auto-allocates one; a subnet-less network is DHCP (the IP is discovered later).
+  Leases are non-aliasing across VMs and same-named containers.
+- **DNS.** A managed container with a known IP is resolvable at
+  `ct.stack.domain` (the container analogue of VM DNS). The per-host IP scanner
+  discovers a DHCP address, persists it, and (re)writes the record; delete/migrate
+  remove it.
+- **Security groups.** `security-groups=` binds SGs to the container's veth with
+  the same per-NIC nftables enforcement VMs get on their tap. (Bound at
+  create/recreate time; a day-2 CT-aware rebind API is a follow-up.)
+- **Load balancing.** A stack's `loadbalancer:` resolves managed containers as
+  backends, including a container running on a **remote** host (resolved via a
+  peer lookup).
+
+### Project isolation
+
+A container in a tenancy project may attach only to a network that is **global**
+(unowned) or **owned by its own project** — attaching to another project's network
+is denied. A *raw* bridge (`bridge=`) is outside isolation, so it requires
+cluster-root network authority: a **project-scoped** caller must use a managed
+`network=`; a cluster admin keeps the raw-bridge escape hatch. See
+[tenancy.md](tenancy.md) and [networking.md](networking.md).
 
 ## Resource limits
 
@@ -414,8 +463,12 @@ was running it's restarted on the target.
   registry; the backup chunk store will eventually absorb image
   layers.
 - Compose `workloads:` → Containers RPC dispatch **(shipped)**: `lv compose up`
-  now routes `kind: lxc` (download template or rootfs path) workloads through
+  routes `kind: lxc` (download template or rootfs path) workloads through
   CreateContainer + StartContainer on the planner-resolved host, so a stack can
-  mix VMs and containers. Remaining: auto-pull of OCI **registry** refs (pre-pull
-  required today), and full network/IPAM/security-group provisioning for
-  container NICs.
+  mix VMs and containers.
+- Managed container networking **(shipped)**: interface rows, IPAM, deterministic
+  veth/MAC, DNS, security-group enforcement on veths, cross-host LB resolution, and
+  project-scoped attach isolation — see *Networking* above. Remaining: auto-pull of
+  OCI **registry** refs (pre-pull required today); a day-2 CT-aware security-group
+  rebind API; a dataplane cross-project L2 firewall deny (admission already enforces
+  the isolation invariant).

@@ -110,15 +110,21 @@ func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics [
 				"network %q type %q is not supported for containers", netName, def.Type)
 		}
 		// Provision the network on this host (creates/ensures the bridge/vxlan/
-		// isolated device) and use the real bridge — like the VM path. Best-effort,
-		// matching VM create: a provisioning failure falls back to the resolved
-		// bridge name (pre-provisioned hosts, tests) rather than hard-failing.
+		// isolated device) and use the real bridge — like the VM path.
 		bridge, perr := provisionNetworkForVM(ctx, s.db, netName, s.hostName)
-		if perr != nil || bridge == "" {
-			if perr != nil {
-				slog.Warn("container network provision failed; using resolved bridge name",
-					"network", netName, "error", perr)
+		if perr != nil {
+			// vxlan / isolated devices MUST be provisioned by litevirt (lxc can't
+			// auto-create them), so a provision failure means the link won't exist —
+			// hard-fail rather than track a managed NIC on a phantom device. A plain
+			// bridge falls back to the resolved name (lxc auto-creates it, or it's
+			// pre-existing), matching VM create.
+			if def.Type == "vxlan" || def.Type == "isolated" {
+				return nil, status.Errorf(codes.FailedPrecondition, "provision %s network %q: %v", def.Type, netName, perr)
 			}
+			slog.Warn("container network provision failed; using resolved bridge name",
+				"network", netName, "error", perr)
+			bridge = resolveBridge(ctx, s.db, netName)
+		} else if bridge == "" {
 			bridge = resolveBridge(ctx, s.db, netName)
 		}
 		mac := n.Mac
@@ -144,10 +150,12 @@ func (s *Server) resolveContainerNICs(ctx context.Context, ctName string, nics [
 				Network: netName, IP: ip, MAC: mac, OwnerKind: "ct", OwnerHost: s.hostName, OwnerName: ctName,
 			})
 		}
-		// create_spec stores the user's STATIC IP intent (n.Ip) — an auto-allocated
-		// address is left empty so a rebuild re-allocates rather than reusing a stale one.
+		// create_spec stores the EFFECTIVE IP (static or auto-allocated), so a
+		// rebuild (restore/migrate/relocate) re-reserves the same address instead of
+		// losing an auto-allocated one. The rebuild's reserve is conditional (never
+		// steals), so reusing it is safe.
 		p.specNets = append(p.specNets, corrosion.ContainerNetwork{
-			Name: n.Name, Bridge: bridge, IP: n.Ip, MAC: mac,
+			Name: n.Name, Bridge: bridge, IP: ip, MAC: mac,
 			NetworkName: netName, SecurityGroups: n.SecurityGroups,
 		})
 	}

@@ -152,8 +152,14 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		// A clone is a normal container, never a template.
 	}
 	// Atomic: the container row + the clone's interface rows in one batch (no IPAM
-	// lease — clone NICs are dynamic).
+	// lease — clone NICs are dynamic). Fail closed: if persistence fails, delete the
+	// just-cloned runtime container so we don't strand an untracked clone (same rule
+	// as CreateContainer).
 	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifaces, nil); err != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
+			slog.Warn("container clone: cleanup after persist failure also failed", "name", req.Target, "error", delErr)
+		}
+		s.audit(ctx, "ct.clone", req.Target, "project="+project+" source="+req.Source, "error")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
 	}
 

@@ -2,7 +2,6 @@ package lxc
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -29,13 +28,14 @@ func NetworkConfig(attaches []NetworkAttach) (string, error) {
 	if len(attaches) == 0 {
 		return "", nil
 	}
-	sortedNames := make([]NetworkAttach, len(attaches))
-	copy(sortedNames, attaches)
-	// Stable ordering by Name so the config file stays diff-friendly.
-	sort.Slice(sortedNames, func(i, j int) bool { return sortedNames[i].Name < sortedNames[j].Name })
-
+	// Preserve the caller's order: the lxc.net.N index MUST equal each NIC's
+	// ordinal, because the cluster interface rows + the deterministic veth/MAC are
+	// keyed on ordinal (and the clone path rewrites the config by that index).
+	// Sorting by name here would desync the DB rows from the on-disk config for a
+	// container whose NICs aren't requested in name order. The caller's order is
+	// already stable (request / create-spec order), so the file stays diff-friendly.
 	var b strings.Builder
-	for i, n := range sortedNames {
+	for i, n := range attaches {
 		for _, v := range []string{n.Bridge, n.Name, n.MAC, n.IP, n.Veth} {
 			if err := lxcConfigSafe(v); err != nil {
 				return "", fmt.Errorf("network %q: %w", n.Name, err)

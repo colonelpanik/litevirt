@@ -210,7 +210,7 @@ func CreateContainerAtomic(ctx context.Context, c *Client, rec ContainerRecord, 
 		}
 		stmts = append(stmts, s)
 	}
-	stmts = append(stmts, containerLeaseStmts(c, leases, false)...)
+	stmts = append(stmts, containerLeaseStmts(c, leases)...)
 	return c.ExecuteBatch(ctx, stmts)
 }
 

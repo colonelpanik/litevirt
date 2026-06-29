@@ -26,14 +26,13 @@ func ContainerVethName(ctName string, ordinal int) string {
 // The veth is recomputed deterministically; IP carries the create-time STATIC
 // intent only (an auto-allocated address was stored empty, so it's re-discovered
 // / re-allocated rather than reusing a stale value).
-// It also returns the IPAM leases to (re)take on the target — one per managed NIC
-// that has a STATIC IP (the create-time intent). Auto-allocated NICs were stored
-// with an empty IP, so they take no lease here (re-allocated/re-discovered on the
-// new host). The caller writes both via WriteContainerNetworkAtomic with
-// replaceLeases=true so a static lease transfers from the prior owner.
-func BuildContainerInterfacesFromSpec(hostName, ctName string, spec ContainerCreateSpec) ([]ContainerInterfaceRecord, []IPLease) {
+// The IP carries the create-time EFFECTIVE address (static or the originally
+// auto-allocated one), so the rebuild can re-reserve it. The caller (see
+// network.ReserveContainerNICs) conditionally re-reserves each non-empty IP —
+// never stealing one held by another workload — and blanks the row's IP if it
+// can't, so we never assert an address we don't own.
+func BuildContainerInterfacesFromSpec(hostName, ctName string, spec ContainerCreateSpec) []ContainerInterfaceRecord {
 	var ifs []ContainerInterfaceRecord
-	var leases []IPLease
 	for i, n := range spec.Networks {
 		if n.NetworkName == "" {
 			continue // legacy/unmanaged NIC — no row
@@ -42,13 +41,8 @@ func BuildContainerInterfacesFromSpec(hostName, ctName string, spec ContainerCre
 			HostName: hostName, CtName: ctName, NetworkName: n.NetworkName, Ordinal: i,
 			MAC: n.MAC, IP: n.IP, VethDevice: ContainerVethName(ctName, i), SecurityGroups: n.SecurityGroups,
 		})
-		if n.IP != "" { // static intent → reserve/transfer the lease so IPAM won't reassign it
-			leases = append(leases, IPLease{
-				Network: n.NetworkName, IP: n.IP, MAC: n.MAC, OwnerKind: "ct", OwnerHost: hostName, OwnerName: ctName,
-			})
-		}
 	}
-	return ifs, leases
+	return ifs
 }
 
 // ContainerInterfaceRecord is one litevirt-MANAGED container NIC — the container
@@ -104,41 +98,16 @@ func containerInterfaceStmt(c *Client, r ContainerInterfaceRecord) (Statement, e
 	}, nil
 }
 
-// WriteContainerNetworkAtomic writes a container's interface rows and IPAM leases
-// in ONE transaction. replaceLeases=false (create) uses plain lease INSERTs so a
-// PK conflict on (network, ip) from a racing allocation fails the whole batch;
-// replaceLeases=true (restore/migrate/relocate rebuild) uses INSERT OR REPLACE so
-// a re-homed container TRANSFERS an existing static-IP lease from its prior owner.
-func WriteContainerNetworkAtomic(ctx context.Context, c *Client, ifaces []ContainerInterfaceRecord, leases []IPLease, replaceLeases bool) error {
-	stmts := make([]Statement, 0, len(ifaces)+len(leases))
-	for _, ifc := range ifaces {
-		s, err := containerInterfaceStmt(c, ifc)
-		if err != nil {
-			return err
-		}
-		stmts = append(stmts, s)
-	}
-	stmts = append(stmts, containerLeaseStmts(c, leases, replaceLeases)...)
-	if len(stmts) == 0 {
-		return nil
-	}
-	return c.ExecuteBatch(ctx, stmts)
-}
-
-// containerLeaseStmts builds the ip_allocations INSERTs for a batch. replace=true
-// uses INSERT OR REPLACE (transfer ownership on a rebuild); replace=false uses a
-// plain INSERT so a create race on (network, ip) fails rather than clobbers.
-func containerLeaseStmts(c *Client, leases []IPLease, replace bool) []Statement {
-	verb := "INSERT INTO"
-	if replace {
-		verb = "INSERT OR REPLACE INTO"
-	}
+// containerLeaseStmts builds plain ip_allocations INSERTs for the create batch
+// (CreateContainerAtomic). A PK conflict on (network, ip) from a racing
+// allocation fails the whole batch rather than clobbering an existing lease.
+func containerLeaseStmts(c *Client, leases []IPLease) []Statement {
 	now := c.NowTS()
 	allocAt := time.Now().UTC().Format(time.RFC3339)
 	out := make([]Statement, 0, len(leases))
 	for _, l := range leases {
 		out = append(out, Statement{
-			SQL: verb + ` ip_allocations
+			SQL: `INSERT INTO ip_allocations
 			 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			Params: []interface{}{l.Network, l.IP, l.MAC, l.OwnerName, l.OwnerKind, l.OwnerHost, allocAt, now},

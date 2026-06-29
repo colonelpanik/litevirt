@@ -33,23 +33,25 @@ func TestNetworkConfig_HappyPath(t *testing.T) {
 	}
 }
 
-// TestNetworkConfig_StableOrdering ensures two equivalent inputs render
-// identically — important for diff-friendly config files.
-func TestNetworkConfig_StableOrdering(t *testing.T) {
-	a, errA := NetworkConfig([]NetworkAttach{
-		{Name: "eth1", Bridge: "br1"},
-		{Name: "eth0", Bridge: "br0"},
+// TestNetworkConfig_PreservesOrdinalOrder pins the contract that lxc.net.N
+// follows the CALLER's order (not sorted by name): N must equal the NIC's
+// ordinal, since the cluster interface rows + deterministic veth/MAC are keyed
+// on ordinal. Same input → same output (deterministic); a NIC out of name order
+// keeps its index.
+func TestNetworkConfig_PreservesOrdinalOrder(t *testing.T) {
+	got, err := NetworkConfig([]NetworkAttach{
+		{Name: "ethX", Bridge: "br0"}, // index 0 despite not being name-first
+		{Name: "ethA", Bridge: "br1"},
 	})
-	b, errB := NetworkConfig([]NetworkAttach{
-		{Name: "eth0", Bridge: "br0"},
-		{Name: "eth1", Bridge: "br1"},
-	})
-	if errA != nil || errB != nil {
-		t.Fatalf("NetworkConfig: %v / %v", errA, errB)
+	if err != nil {
+		t.Fatalf("NetworkConfig: %v", err)
 	}
-	if a != b {
-		t.Errorf("non-deterministic ordering:\nA=%s\nB=%s", a, b)
-	}
+	mustContainAll(t, got,
+		"lxc.net.0.link = br0",
+		"lxc.net.0.name = ethX",
+		"lxc.net.1.link = br1",
+		"lxc.net.1.name = ethA",
+	)
 }
 
 // TestNetworkConfig_RejectsConfigInjection ensures a NIC field containing a

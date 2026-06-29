@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
@@ -460,30 +461,25 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		// restore-relocation) so it can prove this row is its restore.
 		RelocateToken: relocateTokenFromMD(ctx),
 	}
-	// The cluster-row write is MANDATORY. A restore that imported the runtime
-	// container but failed to record the row would strand an untracked container —
-	// and at failover the coordinator could tombstone the source believing the
-	// move completed (point: relocate-restore relies on "row exists ⇒ restore
-	// landed"). On failure, best-effort delete the just-imported container so
-	// nothing untracked is left, then error out.
-	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
+	// The cluster-state write is MANDATORY and atomic: the container row AND its
+	// managed interface rows go in ONE batch, so a restore can't land a tracked
+	// container with missing NIC state (failover relies on "row exists ⇒ restore
+	// landed"). On failure, delete the just-imported runtime container so nothing
+	// untracked is left, then error out (before signalling "landed").
+	ifs := corrosion.BuildContainerInterfacesFromSpec(s.hostName, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec))
+	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifs, nil); err != nil {
 		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
-			slog.Warn("container restore: failed to clean up imported container after row-write failure",
+			slog.Warn("container restore: failed to clean up imported container after cluster-state-write failure",
 				"name", req.Name, "error", delErr)
 		}
 		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
-		return status.Errorf(codes.Internal, "restore: record cluster row: %v", err)
+		return status.Errorf(codes.Internal, "restore: record cluster state: %v", err)
 	}
-	// Re-home the MANAGED network identity on this host from the create spec, so a
-	// restored/migrated container keeps its network_name + SG bindings +
-	// deterministic veth, AND transfers its static-IP IPAM lease to this host (so
-	// IPAM won't reassign that address). replaceLeases=true takes over the lease
-	// from the prior owner. Best-effort: the container is already tracked and the
-	// spec persisted, so a transient failure here is re-derivable; don't fail the
-	// landed restore.
-	ifs, leases := corrosion.BuildContainerInterfacesFromSpec(s.hostName, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec))
-	if err := corrosion.WriteContainerNetworkAtomic(ctx, s.db, ifs, leases, true); err != nil {
-		slog.Warn("container restore: failed to re-home managed NICs (re-derivable from create_spec)",
+	// Re-reserve the managed IPs on this host (conditional — never steals; blanks a
+	// NIC whose IP a different workload now holds). Runs after the rows are written;
+	// best-effort, since the rows + spec are persisted and the IP is re-derivable.
+	if err := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs); err != nil {
+		slog.Warn("container restore: IP re-reservation incomplete (NIC may be re-discovered)",
 			"name", req.Name, "error", err)
 	}
 

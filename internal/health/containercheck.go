@@ -11,6 +11,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 const containerCheckInterval = 15 * time.Second
@@ -125,16 +126,22 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		c.publish("ct.relocate.failed", ct.Name, err.Error())
 		return // leave pending → retried next sweep
 	}
-	// Re-home the managed interface rows + static-IP IPAM leases on this (relocate
-	// target) host from the create spec, so the relocated container keeps its
-	// network identity + SG bindings and its static address isn't reassigned by
-	// IPAM (replaceLeases=true transfers the lease from the dead source). Best-
-	// effort: the container is materialized; rows are re-derivable.
-	if ifs, leases := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec); len(ifs) > 0 {
-		if err := corrosion.WriteContainerNetworkAtomic(ctx, c.db, ifs, leases, true); err != nil {
-			slog.Warn("containercheck: failed to re-home relocated managed NICs",
-				"container", ct.Name, "error", err)
+	// Re-home the managed interface rows on this (relocate target) host from the
+	// create spec, so the relocated container keeps its network identity + SG
+	// bindings. Fail closed: if a row write fails, leave the relocate marker so the
+	// next sweep retries — never clear it (below) with NIC state missing.
+	ifs := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec)
+	for _, ifc := range ifs {
+		if err := corrosion.UpsertContainerInterface(ctx, c.db, ifc); err != nil {
+			slog.Error("containercheck: relocate interface-row write failed (will retry)",
+				"container", ct.Name, "network", ifc.NetworkName, "error", err)
+			return // leave pending+relocate-recreate → retried next sweep
 		}
+	}
+	// Re-reserve the managed IPs (conditional — never steals; blanks a NIC whose IP
+	// another workload now holds). Best-effort; the row IP is re-derivable.
+	if err := network.ReserveContainerNICs(ctx, c.db, c.hostName, ct.Name, ifs); err != nil {
+		slog.Warn("containercheck: relocate IP re-reservation incomplete", "container", ct.Name, "error", err)
 	}
 	if err := c.runtime.Start(ctx, ct.Name); err != nil {
 		slog.Error("containercheck: relocate-recreate start failed", "container", ct.Name, "error", err)

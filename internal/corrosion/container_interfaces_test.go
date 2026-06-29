@@ -21,18 +21,14 @@ func TestBuildContainerInterfacesFromSpec_ManagedOnly(t *testing.T) {
 		{Name: "eth0", NetworkName: "net1", MAC: "52:54:00:ab:cd:ef", IP: "10.0.0.5", SecurityGroups: []string{"web"}},
 		{Name: "eth1", Bridge: "br-raw"}, // legacy/unmanaged → no row
 	}}
-	ifs, leases := BuildContainerInterfacesFromSpec("h1", "web", spec)
+	ifs := BuildContainerInterfacesFromSpec("h1", "web", spec)
 	if len(ifs) != 1 {
-		t.Fatalf("expected 1 managed interface, got %d", len(ifs))
+		t.Fatalf("expected 1 managed interface (legacy NIC skipped), got %d", len(ifs))
 	}
 	got := ifs[0]
 	if got.HostName != "h1" || got.CtName != "web" || got.NetworkName != "net1" ||
 		got.IP != "10.0.0.5" || got.MAC != "52:54:00:ab:cd:ef" ||
 		got.VethDevice != ContainerVethName("web", 0) || len(got.SecurityGroups) != 1 {
 		t.Fatalf("unexpected rebuilt interface: %+v", got)
-	}
-	// The static-IP NIC yields a transferable lease; the legacy NIC does not.
-	if len(leases) != 1 || leases[0].IP != "10.0.0.5" || leases[0].OwnerKind != "ct" || leases[0].OwnerHost != "h1" {
-		t.Fatalf("expected one CT lease for the static-IP NIC, got %+v", leases)
 	}
 }

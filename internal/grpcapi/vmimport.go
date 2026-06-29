@@ -108,6 +108,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
+	// Project isolation: the imported VM's project may land in a global pool or one
+	// it owns. The import converts disks into first.TargetPool on this host.
+	if err := s.admitPoolAttach(ctx, project, s.hostName, first.TargetPool); err != nil {
+		return err
+	}
+
 	// ── Convert each data disk → qcow2 in the target pool ──
 	poolDir, err := s.importPoolDir(ctx, first.TargetPool)
 	if err != nil {

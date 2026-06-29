@@ -1,5 +1,23 @@
 package grpcapi
 
+// Project isolation model (v37).
+//
+// The isolation guarantee is enforced at ATTACH TIME, not in the dataplane: a
+// workload may bind a NIC / place a disk only on a network/pool that is GLOBAL
+// (empty project — the deliberate admin escape hatch) or OWNED by its own project.
+// This is the privilege boundary — admitNetworkAttach / admitPoolAttach gate every
+// create and day-2 path (move, replicate, import, schedule, runner), and a
+// named-project workload may not use a raw/unmanaged bridge at all.
+//
+// There is intentionally NO dataplane cross-project L2 firewall deny. Admission
+// already makes its firing condition unreachable: two DIFFERENT named projects can
+// never share a non-global L2 (neither can attach to the other's owned network,
+// and a named project can't use a raw bridge), and a GLOBAL network is shared by
+// design (two tenants placed there CAN talk unless an SG/default-deny says
+// otherwise — the operator's choice, not an isolation failure). A per-NIC
+// cross-project nftables synthesis would be redundant defense-in-depth for an
+// admission bypass; it's a deliberate non-goal here, a clean follow-up if wanted.
+
 import (
 	"context"
 
@@ -12,9 +30,13 @@ import (
 
 // admitNetworkAttach is the attach-time enforcement of project network isolation:
 // a workload in wlProject may attach to a network that is GLOBAL (empty project)
-// or OWNED by its own project, never another project's. A name with no managed
-// network record (a raw bridge that maps to nothing) is unowned, so allowed — it's
-// the deliberate legacy/global escape hatch. Fail closed: a lookup error denies.
+// or OWNED by its own project, never another project's. Fail closed: a lookup
+// error denies.
+//
+// A name with NO managed network record is a raw/unmanaged bridge — outside
+// isolation entirely (no project, SGs, IPAM, or firewall bindings). A NAMED-project
+// workload may NOT use one (hard tenant isolation requires a managed network); the
+// default project / root keeps the legacy raw-bridge escape hatch.
 func (s *Server) admitNetworkAttach(ctx context.Context, wlProject, networkName string) error {
 	if networkName == "" {
 		return nil
@@ -24,7 +46,7 @@ func (s *Server) admitNetworkAttach(ctx context.Context, wlProject, networkName 
 		return status.Errorf(codes.Internal, "network admission lookup %q: %v", networkName, err)
 	}
 	if nr == nil {
-		return nil // no managed record ⇒ unowned ⇒ not project-isolated
+		return s.admitRawBridge(wlProject, networkName)
 	}
 	if !tenancy.AdmitAttach(wlProject, nr.Project) {
 		return status.Errorf(codes.PermissionDenied,
@@ -32,6 +54,45 @@ func (s *Server) admitNetworkAttach(ctx context.Context, wlProject, networkName 
 			networkName, nr.Project, tenancy.NormalizeProject(wlProject))
 	}
 	return nil
+}
+
+// admitRawBridge gates a raw/unmanaged bridge attachment (no managed network row).
+// A named-project workload is denied — it must use a managed network so isolation,
+// SGs, IPAM and firewall bindings apply; the default project / root keeps the
+// legacy escape hatch. ref is the bridge/name for the error message.
+func (s *Server) admitRawBridge(wlProject, ref string) error {
+	if tenancy.NormalizeProject(wlProject) != tenancy.Default {
+		return status.Errorf(codes.PermissionDenied,
+			"project %q workloads must attach to a managed network, not a raw/unmanaged bridge %q",
+			tenancy.NormalizeProject(wlProject), ref)
+	}
+	return nil
+}
+
+// authorizeResourceRead authorizes VIEWING a project-owned-or-global resource. A
+// GLOBAL (empty-project) resource is shared infrastructure, visible to any viewer;
+// an OWNED one requires read access to its project path (so a project-scoped caller
+// can read its own + global, never another project's). Returned by Get* and used
+// as a per-row filter by List* (skip rows where it's non-nil). A legacy cluster
+// viewer (no binding) passes via the role fallback → unchanged broad visibility.
+func (s *Server) authorizeResourceRead(ctx context.Context, project, rbacPath, verb string) error {
+	if project == "" {
+		return RequireRole(ctx, "viewer")
+	}
+	return s.RequirePerm(ctx, rbacPath, verb, "viewer")
+}
+
+// admitVMPoolUse is the centralized day-2 storage-pool admission: a VM's project
+// may place/move/copy/import onto a target pool only if that pool is global or
+// owned by the VM's own project. host is where the target pool lives ("" ⇒ the
+// VM's own host). Used by create, move, replicate, import, replication-schedule
+// creation, and the replication runner so every path that targets a pool enforces
+// the same rule. Fail closed on a lookup error.
+func (s *Server) admitVMPoolUse(ctx context.Context, vm *corrosion.VMRecord, host, poolName string) error {
+	if host == "" {
+		host = vm.HostName
+	}
+	return s.admitPoolAttach(ctx, vm.Project, host, poolName)
 }
 
 // admitPoolAttach is the attach-time enforcement of project storage isolation: a

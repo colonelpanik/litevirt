@@ -68,6 +68,11 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		return status.Errorf(codes.NotFound, "vm %q has no disk %q", req.VmName, req.DiskName)
 	}
 
+	// Project isolation: the VM's project may replicate only into a global pool or
+	// one it owns (target pool resolved on this host — ReplicateVolume runs locally).
+	if err := s.admitVMPoolUse(ctx, vm, s.hostName, req.TargetPool); err != nil {
+		return err
+	}
 	dstPool, ok := s.resolvePool(ctx, req.TargetPool)
 	if !ok {
 		return status.Errorf(codes.NotFound, "target pool %q not configured on this host", req.TargetPool)

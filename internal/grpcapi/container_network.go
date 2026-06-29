@@ -95,7 +95,17 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 		}
 
 		if def == nil {
-			// Legacy-unmanaged raw bridge: pass through verbatim. No managed state.
+			// Legacy-unmanaged raw bridge: outside isolation. A named-project
+			// container may NOT use one (hard isolation requires a managed network);
+			// the default project / root keeps the escape hatch.
+			ref := n.Bridge
+			if ref == "" {
+				ref = n.NetworkName
+			}
+			if err := s.admitRawBridge(project, ref); err != nil {
+				return nil, err
+			}
+			// Pass through verbatim. No managed state.
 			p.lxcNics = append(p.lxcNics, ContainerNICOpt{Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac})
 			p.specNets = append(p.specNets, corrosion.ContainerNetwork{Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac})
 			continue

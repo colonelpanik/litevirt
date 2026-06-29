@@ -79,6 +79,14 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 		}
 	}
 
+	// Project isolation (day-2): the VM's project may replicate only into a pool
+	// that is global or its own — enforced at RUN time (against the resolved target
+	// host) so a schedule created before v37, or any path, can't copy data into
+	// another project's pool. Promotion runs through this path too.
+	if err := s.admitVMPoolUse(ctx, vm, targetHost, sched.TargetPool); err != nil {
+		return fmt.Errorf("replication target pool admission: %w", err)
+	}
+
 	ts := runAt.UTC().Format("20060102-150405")
 
 	// Incremental path (opt-in): transfer only dirty extents into a raw replica

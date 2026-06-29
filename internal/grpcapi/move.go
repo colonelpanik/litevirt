@@ -139,6 +139,11 @@ func (s *Server) moveOneVolume(
 			"VM %q has %d snapshot(s); a disk with a snapshot overlay can't be moved between pools (its backing chain would be orphaned) — remove them first (`lv snapshot rm %s <name>`), then move", vm.Name, len(snaps), vm.Name)
 	}
 
+	// Project isolation: the VM's project may move a disk only onto a global pool or
+	// one it owns (the target pool is on this host — moveOneVolume is local).
+	if err := s.admitVMPoolUse(ctx, vm, s.hostName, targetPool); err != nil {
+		return err
+	}
 	dstPool, ok := s.lookupStoragePool(targetPool)
 	if !ok {
 		return status.Errorf(codes.NotFound, "target pool %q not configured on host %q", targetPool, s.hostName)

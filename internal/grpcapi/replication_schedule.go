@@ -33,8 +33,14 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 		if req.VmName == "" {
 			return nil, status.Error(codes.InvalidArgument, "vm_name required for vm-scoped schedule")
 		}
-		if vm, err := corrosion.GetVM(ctx, s.db, req.VmName); err != nil || vm == nil {
+		vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
+		if err != nil || vm == nil {
 			return nil, status.Errorf(codes.NotFound, "vm %q not found", req.VmName)
+		}
+		// Project isolation: don't let a schedule target another project's pool.
+		// (The runner re-checks at run time too — defense in depth.)
+		if err := s.admitVMPoolUse(ctx, vm, req.TargetHost, req.TargetPool); err != nil {
+			return nil, err
 		}
 	case "pool":
 		if req.PoolName == "" {

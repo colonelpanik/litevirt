@@ -125,17 +125,12 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 		return nil, status.Errorf(codes.ResourceExhausted, "%v", err)
 	}
 
-	// Project isolation: admit every network/pool attachment BEFORE creating any
-	// disk or provisioning any network, so a cross-project denial fails fast with no
-	// partial state. A VM may attach only to a global network/pool or one its own
-	// project owns.
+	// Project isolation (networks): admit every network attachment up front — network
+	// names are cluster-global, so this is host-independent and fails fast with no
+	// partial state. POOL admission is host-scoped, so it waits until after placement
+	// (below) when the target host is known.
 	for _, n := range spec.Network {
 		if err := s.admitNetworkAttach(ctx, project, n.Name); err != nil {
-			return nil, err
-		}
-	}
-	for _, d := range spec.Disks {
-		if err := s.admitPoolAttach(ctx, project, s.hostName, d.Storage); err != nil {
 			return nil, err
 		}
 	}
@@ -185,6 +180,15 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 	targetHost, err := placement.Select(ctx, s.db, placementReq)
 	if err != nil {
 		return nil, status.Errorf(codes.ResourceExhausted, "placement failed: %v", err)
+	}
+	// Project isolation (storage): pools are HOST-scoped, so admit each disk's pool
+	// against the SELECTED target host — not the entry host (which may hold a
+	// same-named foreign-owned pool). Done before the forward/local-create so a
+	// cross-project placement is denied with no partial state.
+	for _, d := range spec.Disks {
+		if err := s.admitPoolAttach(ctx, project, targetHost, d.Storage); err != nil {
+			return nil, err
+		}
 	}
 	if targetHost != s.hostName {
 		slog.Info("forwarding CreateVM to target host", "vm", spec.Name, "target", targetHost)

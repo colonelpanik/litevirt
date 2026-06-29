@@ -80,11 +80,10 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 	return ni, nil
 }
 
-// GetNetwork returns details for a single network.
+// GetNetwork returns details for a single network. Read is project-scoped: a
+// global network is visible to any viewer, an owned one only to its project (or
+// root).
 func (s *Server) GetNetwork(ctx context.Context, req *pb.GetNetworkRequest) (*pb.NetworkInfo, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
-		return nil, err
-	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
@@ -95,6 +94,9 @@ func (s *Server) GetNetwork(ctx context.Context, req *pb.GetNetworkRequest) (*pb
 	}
 	if nr == nil {
 		return nil, status.Errorf(codes.NotFound, "network %q not found", req.Name)
+	}
+	if err := s.authorizeResourceRead(ctx, nr.Project, networkRBACPathFor(nr.Project, nr.Name), "network.read"); err != nil {
+		return nil, err
 	}
 
 	ni := networkRecordToInfo(nr)
@@ -155,12 +157,10 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 	return &emptypb.Empty{}, nil
 }
 
-// ListNetworks returns all known networks.
+// ListNetworks returns the networks the caller may view: global networks (any
+// viewer) + those owned by a project the caller can read. A legacy cluster viewer
+// (no project binding) still sees all via the role fallback.
 func (s *Server) ListNetworks(ctx context.Context, _ *emptypb.Empty) (*pb.ListNetworksResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
-		return nil, err
-	}
-
 	dbNets, err := corrosion.ListNetworks(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list networks: %v", err)
@@ -176,6 +176,10 @@ func (s *Server) ListNetworks(ctx context.Context, _ *emptypb.Empty) (*pb.ListNe
 
 	resp := &pb.ListNetworksResponse{}
 	for _, nr := range dbNets {
+		// Project-scoped read filter: skip networks the caller can't view.
+		if s.authorizeResourceRead(ctx, nr.Project, networkRBACPathFor(nr.Project, nr.Name), "network.read") != nil {
+			continue
+		}
 		ni := networkRecordToInfo(&nr)
 
 		// VM count: match by compose network name OR by interface name.
@@ -203,14 +207,17 @@ func (s *Server) ListNetworks(ctx context.Context, _ *emptypb.Empty) (*pb.ListNe
 		resp.Networks = append(resp.Networks, ni)
 	}
 
-	// Include networks only known from VM interfaces (not in DB).
-	for name, count := range vmCount {
-		if !seen[name] && ifaceToNet[name] == "" {
-			resp.Networks = append(resp.Networks, &pb.NetworkInfo{
-				Name:    name,
-				Type:    "bridge",
-				VmCount: int32(count),
-			})
+	// Include networks only known from VM interfaces (not in DB). These have no
+	// managed record (no project), so they're treated as global — viewer-gated.
+	if s.authorizeResourceRead(ctx, "", "", "network.read") == nil {
+		for name, count := range vmCount {
+			if !seen[name] && ifaceToNet[name] == "" {
+				resp.Networks = append(resp.Networks, &pb.NetworkInfo{
+					Name:    name,
+					Type:    "bridge",
+					VmCount: int32(count),
+				})
+			}
 		}
 	}
 

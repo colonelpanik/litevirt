@@ -180,10 +180,10 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 }
 
 // GetStoragePool returns one pool's full details. Used by `lv pool inspect`.
+// Read is project-scoped: a global pool is visible to any viewer, an owned one
+// only to its project (or root) — previously this required root for ALL pools,
+// which both over-restricted a project's own pool and under-scoped reads.
 func (s *Server) GetStoragePool(ctx context.Context, req *pb.GetStoragePoolRequest) (*pb.GetStoragePoolResponse, error) {
-	if err := s.RequirePerm(ctx, "/", "storage.pool.read", "viewer"); err != nil {
-		return nil, err
-	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name is required")
 	}
@@ -197,6 +197,9 @@ func (s *Server) GetStoragePool(ctx context.Context, req *pb.GetStoragePoolReque
 	}
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", req.Name, host)
+	}
+	if err := s.authorizeResourceRead(ctx, rec.Project, poolRBACPathFor(rec.Project, rec.Name), "storage.pool.read"); err != nil {
+		return nil, err
 	}
 	return &pb.GetStoragePoolResponse{Pool: storagePoolRecordToPB(rec)}, nil
 }

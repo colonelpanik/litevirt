@@ -73,6 +73,7 @@ type Fake struct {
 	FailDomainState        func(name string) error
 	FailMigrateToTarget    func(name, dconnuri string) error
 	FailBlockPull          func(domain, disk string) error
+	FailPoolDestroy        func(name string) error
 	// BlockJobStatusFn lets a scenario script block-job progress. Nil =
 	// "no job in progress" (Found=false), i.e. the pull is already done —
 	// the simplest happy path for the live-restore blockpull poll.
@@ -585,6 +586,22 @@ func (f *Fake) EnsureStoragePool(name, driver, source, target string, opts map[s
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("ensure-pool", name, driver)
+	return nil
+}
+
+// PoolDestroyIfDefined records the libvirt-undefine belt-and-suspenders step on
+// pool delete. Idempotent in the real client (no-op when the pool isn't defined);
+// here it always records so a test can assert the delete path reached it. A
+// FailPoolDestroy hook lets a scenario model an undefine failure.
+func (f *Fake) PoolDestroyIfDefined(name string) error {
+	if f.FailPoolDestroy != nil {
+		if err := f.FailPoolDestroy(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("pool-destroy", name, "")
 	return nil
 }
 

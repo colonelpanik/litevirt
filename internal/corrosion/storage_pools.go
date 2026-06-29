@@ -113,6 +113,46 @@ func HostsWithPool(ctx context.Context, c *Client, poolName, excludeHost string)
 	return out, nil
 }
 
+// CountDisksUsingPool counts live VM disks placed on (host, poolName). Pools are
+// HOST-scoped, so the guard must scope by host too — a cluster-wide
+// `storage_volume = ?` count would be both too broad (a same-named pool's disks on
+// another host) and wrong. The pool delete refuses (without --force) when this is
+// non-zero.
+func CountDisksUsingPool(ctx context.Context, c *Client, host, poolName string) (int, error) {
+	rows, err := c.Query(ctx,
+		`SELECT COUNT(*) AS n FROM vm_disks
+		 WHERE storage_volume = ? AND host_name = ? AND deleted_at IS NULL`,
+		poolName, host)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Int("n"), nil
+}
+
+// CountPoolsSharingSource counts OTHER live pool rows on host that reference the
+// same underlying source (NFS export / iSCSI target IQN) as (host, excludeName).
+// It's the refcount behind teardown: a shared NFS mount or iSCSI session must NOT
+// be torn down while another pool on the host still uses it. Empty source ⇒ 0.
+func CountPoolsSharingSource(ctx context.Context, c *Client, host, excludeName, source string) (int, error) {
+	if source == "" {
+		return 0, nil
+	}
+	rows, err := c.Query(ctx,
+		`SELECT COUNT(*) AS n FROM storage_pools
+		 WHERE host_name = ? AND name != ? AND source = ? AND deleted_at IS NULL`,
+		host, excludeName, source)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Int("n"), nil
+}
+
 // MarkStoragePoolDeleted soft-deletes a pool row by stamping deleted_at.
 // The corresponding driver teardown (unmount NFS, log out of iSCSI) is
 // the caller's responsibility — we don't tear down here because the

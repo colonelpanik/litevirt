@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"syscall"
@@ -166,8 +167,39 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return client.DeleteStoragePool(ctx, req)
 	}
 
+	// Reference guard — refuse to hide a pool still in use unless --force. Both
+	// counts are HOST-scoped (pools are host-local). Fail CLOSED on a count error:
+	// a DB read failure must not be read as "no references" and let the delete
+	// through silently.
+	disks, err := corrosion.CountDisksUsingPool(ctx, s.db, host, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "count disks using pool: %v", err)
+	}
+	scheds, err := corrosion.CountActiveSchedulesUsingPool(ctx, s.db, host, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "count schedules using pool: %v", err)
+	}
+	if (disks > 0 || scheds > 0) && !req.Force {
+		detail := fmt.Sprintf("disks=%d schedules=%d", disks, scheds)
+		s.audit(ctx, "storage.pool.delete", req.Name, detail, "blocked")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"pool %q on %q is still referenced (%s); use --force to delete anyway",
+			req.Name, host, detail)
+	}
+
+	// Driver teardown (unmount NFS / log out of iSCSI) is best-effort about ERRORS
+	// — an operator who hit delete wants the pool gone from inventory even if
+	// cleanup is incomplete — but its refcount PREDICATES are hard guards (never
+	// tear down a mount/session another pool still uses).
 	if err := s.driverTeardownIfPossible(ctx, rec); err != nil {
 		slog.Warn("storage pool teardown failed (continuing with row delete)",
+			"host", host, "name", req.Name, "error", err)
+	}
+	// Belt-and-suspenders: drop any libvirt pool object. Idempotent — runtime
+	// pools usually have no libvirt handle (Create doesn't EnsureStoragePool), so
+	// this is a no-op in the common case and never deletes underlying storage.
+	if err := s.virt.PoolDestroyIfDefined(req.Name); err != nil {
+		slog.Warn("libvirt pool undefine failed (continuing with row delete)",
 			"host", host, "name", req.Name, "error", err)
 	}
 
@@ -175,6 +207,7 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	s.removeStoragePoolRef(req.Name)
+	s.audit(ctx, "storage.pool.delete", req.Name, fmt.Sprintf("force=%t", req.Force), "ok")
 	slog.Info("storage pool deleted", "host", host, "name", req.Name)
 	return &pb.DeleteStoragePoolResponse{}, nil
 }
@@ -204,15 +237,41 @@ func (s *Server) GetStoragePool(ctx context.Context, req *pb.GetStoragePoolReque
 	return &pb.GetStoragePoolResponse{Pool: storagePoolRecordToPB(rec)}, nil
 }
 
-// driverTeardownIfPossible best-effort calls a driver-specific cleanup.
-// Most drivers (local, dir, ceph) have nothing to undo at the host level
-// because Prepare is a no-op for them. NFS/iSCSI could implement an
-// Unmount/Logout hook, but those interfaces don't exist yet
-// . For now this is a no-op — operators who want
-// strict teardown can pair `lv pool delete` with a manual `umount`.
-func (s *Server) driverTeardownIfPossible(_ context.Context, rec corrosion.StoragePoolRecord) error {
+// driverTeardownIfPossible builds the pool's driver and, when it implements the
+// optional storage.Teardowner capability (NFS umount / iSCSI logout), invokes it
+// — but ONLY after a hard refcount guard: a shared NFS export/mount or iSCSI
+// session must never be torn down while another live pool row on this host still
+// references the same underlying source. Drivers without a Teardown method
+// (local, dir, ceph, zfs, btrfs, lvm-thin) are a no-op. The driver-side hook is
+// itself idempotent and skips operator-managed mounts (NFS targetOverride).
+func (s *Server) driverTeardownIfPossible(ctx context.Context, rec corrosion.StoragePoolRecord) error {
 	if rec.Name == "" {
 		return errors.New("missing pool name")
 	}
-	return nil
+	driver, err := storage.New(s.dataDir, storage.Config{
+		Driver:  rec.Driver,
+		Source:  rec.Source,
+		Target:  rec.Target,
+		Options: rec.Options,
+	})
+	if err != nil {
+		// An unknown/unbuildable driver has nothing host-level to undo — the row
+		// delete should still proceed.
+		return fmt.Errorf("build driver for teardown: %w", err)
+	}
+	td := storage.AsTeardowner(driver)
+	if td == nil {
+		return nil // local/dir/ceph/zfs/btrfs/lvm-thin — nothing to tear down
+	}
+	// Refcount: don't tear down a source another pool on this host still uses.
+	shared, err := corrosion.CountPoolsSharingSource(ctx, s.db, rec.HostName, rec.Name, rec.Source)
+	if err != nil {
+		return fmt.Errorf("count pools sharing source: %w", err)
+	}
+	if shared > 0 {
+		slog.Info("storage pool teardown skipped: source shared by another pool",
+			"host", rec.HostName, "name", rec.Name, "source", rec.Source, "sharing", shared)
+		return nil
+	}
+	return td.Teardown(ctx)
 }

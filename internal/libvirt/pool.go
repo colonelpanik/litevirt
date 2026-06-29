@@ -60,6 +60,29 @@ func (c *Client) EnsureStoragePool(name, driver, source, target string, opts map
 	return nil
 }
 
+// PoolDestroyIfDefined stops (if active) and undefines a libvirt storage pool.
+// Tolerates the pool not being defined — returns nil (idempotent), since litevirt
+// runtime pools usually have no libvirt object (CreateStoragePool doesn't
+// EnsureStoragePool). Belt-and-suspenders cleanup on `lv pool delete`; it does NOT
+// delete the underlying storage (no StoragePoolDelete), only the libvirt handle.
+func (c *Client) PoolDestroyIfDefined(name string) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	pool, err := c.virt.StoragePoolLookupByName(name)
+	if err != nil {
+		return nil // not defined in libvirt — nothing to undefine
+	}
+	if active, _ := c.virt.StoragePoolIsActive(pool); active != 0 {
+		c.virt.StoragePoolDestroy(pool) //nolint:errcheck // best-effort stop before undefine
+	}
+	if err := c.virt.StoragePoolUndefine(pool); err != nil {
+		return fmt.Errorf("pool undefine %s: %w", name, err)
+	}
+	slog.Info("undefined libvirt storage pool", "pool", name)
+	return nil
+}
+
 // generatePoolXML builds the libvirt storage pool XML for the given driver type.
 func generatePoolXML(name, driver, source, target string, opts map[string]string) (string, error) {
 	switch driver {

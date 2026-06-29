@@ -97,6 +97,10 @@ type LibvirtBackend interface {
 	// Storage pool ensure (CreateVM path).
 	EnsureStoragePool(name, driver, source, target string, opts map[string]string) error
 
+	// PoolDestroyIfDefined stops + undefines a libvirt storage pool (idempotent;
+	// no-op when the pool isn't defined). Belt-and-suspenders on pool delete.
+	PoolDestroyIfDefined(name string) error
+
 	// VLAN tap configuration — invoked after CreateVM's StartDomain
 	// to push bridge-vlan rules onto the tap device libvirt created.
 	ConfigureVLANTap(domainName, bridge, mac string, vlanID int) error

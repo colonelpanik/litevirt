@@ -15,9 +15,31 @@ import (
 type iscsiDriver struct {
 	target string
 	opts   map[string]string
+	run    cmdRunner // iscsiadm seam (Teardown); tests inject a fake
 }
 
 func (d *iscsiDriver) String() string { return "iscsi" }
+
+// Teardown logs the host out of the iSCSI target on pool delete. Idempotent: a
+// "no matching"/"not found" logout is treated as already-gone. The caller is
+// responsible for the cross-pool refcount (don't log out a target another pool's
+// LUN still uses). Safe to call without a prior Prepare.
+func (d *iscsiDriver) Teardown(ctx context.Context) error {
+	portal := d.opts["portal"]
+	if portal == "" {
+		portal = "127.0.0.1"
+	}
+	run := d.run
+	if run == nil {
+		run = realCmd
+	}
+	out, err := run(ctx, "iscsiadm", "-m", "node", "-T", d.target, "-p", portal, "--logout")
+	if err != nil && !strings.Contains(string(out), "No matching") && !strings.Contains(string(out), "not found") {
+		return fmt.Errorf("iscsi logout %s: %w: %s", d.target, err, out)
+	}
+	slog.Info("iSCSI logged out", "target", d.target)
+	return nil
+}
 
 func (d *iscsiDriver) Prepare(ctx context.Context) error {
 	portal := d.opts["portal"]

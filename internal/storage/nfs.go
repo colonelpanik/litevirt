@@ -22,9 +22,37 @@ type nfsDriver struct {
 	targetOverride string            // explicit mount point from pool config
 	opts           map[string]string // mount options et al.
 	mountDir       string            // resolved by Prepare()
+	run            cmdRunner         // mountpoint/umount seam (Teardown); tests inject a fake
 }
 
 func (d *nfsDriver) String() string { return "nfs" }
+
+// Teardown unmounts a litevirt-OWNED NFS mount on pool delete. It does NOT touch a
+// mount the operator manages (targetOverride set) — that's a shared path we didn't
+// create. Idempotent: a no-op when the path isn't mounted. Derives the mountpoint
+// the same way Prepare does, so it's safe to call without a prior Prepare. The
+// caller is responsible for the cross-pool refcount (don't tear down an export
+// another pool still uses).
+func (d *nfsDriver) Teardown(ctx context.Context) error {
+	if d.targetOverride != "" {
+		slog.Info("NFS teardown skipped: operator-managed mount", "source", d.source, "target", d.targetOverride)
+		return nil
+	}
+	run := d.run
+	if run == nil {
+		run = realCmd
+	}
+	safe := strings.NewReplacer("/", "_", ":", "_").Replace(d.source)
+	mountDir := filepath.Join(d.mountBase, safe)
+	if _, err := run(ctx, "mountpoint", "-q", mountDir); err != nil {
+		return nil // not mounted → nothing to undo
+	}
+	if out, err := run(ctx, "umount", mountDir); err != nil {
+		return fmt.Errorf("umount nfs %s: %w: %s", mountDir, err, out)
+	}
+	slog.Info("NFS unmounted", "source", d.source, "mountpoint", mountDir)
+	return nil
+}
 
 func (d *nfsDriver) Prepare(ctx context.Context) error {
 	if d.targetOverride != "" {

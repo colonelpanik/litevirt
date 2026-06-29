@@ -14053,7 +14053,8 @@ type DeleteStoragePoolRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	Host          string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"`       // optional — defaults to caller's host
-	Project       string                 `protobuf:"bytes,3,opt,name=project,proto3" json:"project,omitempty"` // owning tenant (tenancy scoping); field 4 reserved for force
+	Project       string                 `protobuf:"bytes,3,opt,name=project,proto3" json:"project,omitempty"` // owning tenant (tenancy scoping)
+	Force         bool                   `protobuf:"varint,4,opt,name=force,proto3" json:"force,omitempty"`    // delete even if VM disks / active schedules still reference it
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14107,6 +14108,13 @@ func (x *DeleteStoragePoolRequest) GetProject() string {
 		return x.Project
 	}
 	return ""
+}
+
+func (x *DeleteStoragePoolRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 type DeleteStoragePoolResponse struct {
@@ -20655,11 +20663,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"I\n" +
 	"\x19CreateStoragePoolResponse\x12,\n" +
-	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\"\\\n" +
+	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\"r\n" +
 	"\x18DeleteStoragePoolRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12\x18\n" +
-	"\aproject\x18\x03 \x01(\tR\aproject\"\x1b\n" +
+	"\aproject\x18\x03 \x01(\tR\aproject\x12\x14\n" +
+	"\x05force\x18\x04 \x01(\bR\x05force\"\x1b\n" +
 	"\x19DeleteStoragePoolResponse\"?\n" +
 	"\x15GetStoragePoolRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +

@@ -121,6 +121,32 @@ func nullableString(s string) interface{} {
 	return s
 }
 
+// CountActiveSchedulesUsingPool counts ENABLED, non-deleted schedules that target
+// (host, poolName) — the schedule half of the pool-delete reference guard
+// (disabled schedules don't block). Three matches, per the host-scoping nuance:
+//   - a pool-scoped backup schedule (scope='pool', pool_name=poolName);
+//   - a replication schedule targeting poolName with NO target_host set — ambiguous
+//     across same-named pools on other hosts, so blocked CONSERVATIVELY (any pool
+//     of that name) unless --force;
+//   - a replication schedule targeting (poolName, host) explicitly.
+func CountActiveSchedulesUsingPool(ctx context.Context, c *Client, host, poolName string) (int, error) {
+	rows, err := c.Query(ctx,
+		`SELECT COUNT(*) AS n FROM backup_schedules
+		 WHERE deleted_at IS NULL AND enabled = 1 AND (
+		     (scope = 'pool' AND pool_name = ?)
+		  OR (target_pool = ? AND COALESCE(target_host, '') = '')
+		  OR (target_pool = ? AND target_host = ?)
+		 )`,
+		poolName, poolName, poolName, host)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Int("n"), nil
+}
+
 // ListBackupSchedules returns every non-deleted schedule.
 func ListBackupSchedules(ctx context.Context, c *Client) ([]BackupScheduleRecord, error) {
 	rows, err := c.Query(ctx,

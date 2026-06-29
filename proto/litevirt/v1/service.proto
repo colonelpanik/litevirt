@@ -1080,7 +1080,8 @@ message CreateStoragePoolResponse { StoragePool pool = 1; }
 message DeleteStoragePoolRequest {
     string name = 1;
     string host = 2; // optional — defaults to caller's host
-    string project = 3; // owning tenant (tenancy scoping); field 4 reserved for force
+    string project = 3; // owning tenant (tenancy scoping)
+    bool   force = 4; // delete even if VM disks / active schedules still reference it
 }
 message DeleteStoragePoolResponse {}
 

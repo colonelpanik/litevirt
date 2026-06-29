@@ -131,18 +131,20 @@ func newPoolInspectCmd() *cobra.Command {
 
 func newPoolDeleteCmd() *cobra.Command {
 	var host string
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "delete <name>",
 		Short: "Soft-delete a storage pool from the inventory",
-		Long: `Remove a pool from cluster state. The driver is asked to tear down
-(unmount NFS, log out of iSCSI) on a best-effort basis — a teardown
-failure does not block the row delete, so the pool always disappears
-from the inventory.`,
+		Long: `Remove a pool from cluster state. The delete is REFUSED when VM disks
+or active backup/replication schedules still reference the pool —
+pass --force to override. The driver is then asked to tear down
+(unmount NFS, log out of iSCSI) on a best-effort basis; a teardown
+failure does not block the row delete.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if _, err := c.DeleteStoragePool(ctx, &pb.DeleteStoragePoolRequest{
-					Name: args[0], Host: host,
+					Name: args[0], Host: host, Force: force,
 				}); err != nil {
 					return fmt.Errorf("delete pool: %w", err)
 				}
@@ -152,6 +154,7 @@ from the inventory.`,
 		},
 	}
 	cmd.Flags().StringVar(&host, "host", "", "target host (default: caller's local host)")
+	cmd.Flags().BoolVar(&force, "force", false, "delete even if VM disks or active schedules still reference the pool")
 	return cmd
 }
 

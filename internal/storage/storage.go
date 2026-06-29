@@ -117,11 +117,12 @@ func New(dataDir string, cfg Config) (Driver, error) {
 			mountBase:      mountBase,
 			targetOverride: cfg.Target,
 			opts:           cfg.Options,
+			run:            realCmd,
 		}, nil
 	case "ceph":
 		return &cephDriver{pool: cfg.Source, opts: cfg.Options}, nil
 	case "iscsi":
-		return &iscsiDriver{target: cfg.Source, opts: cfg.Options}, nil
+		return &iscsiDriver{target: cfg.Source, opts: cfg.Options, run: realCmd}, nil
 	case "zfs":
 		return &zfsDriver{dataset: cfg.Source, opts: cfg.Options}, nil
 	case "btrfs":

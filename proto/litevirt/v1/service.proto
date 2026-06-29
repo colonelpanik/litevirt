@@ -1370,6 +1370,62 @@ message SensitiveStateRequest {
     string sender = 1;
 }
 
+// ── Divergence scanner (Phase 0, read-only) ──
+//
+// DiagnoseDivergence is the operator/admin entrypoint (lv doctor divergence): the
+// called daemon fans out to peers, compares per-row metadata + cluster-wide
+// semantic invariants, and returns a classified report. ScanSensitiveDivergence
+// is the peer-only lane each node answers about its OWN secret-bearing rows,
+// returning ONLY domain-separated keyed HMACs (never raw PKs/content).
+message DiagnoseDivergenceRequest {
+    bool            include_sensitive = 1; // also scan the secret-bearing tables (admin)
+    repeated string tables            = 2; // optional filter; empty = all replicated tables
+}
+message NodeRowMeta {
+    string host       = 1;
+    string updated_at = 2;
+    string row_hash   = 3;
+    bool   deleted    = 4;
+    string state      = 5;
+}
+message DivergenceRow {
+    string               table    = 1;
+    string               pk       = 2; // plaintext PK, or HMAC label for sensitive tables
+    string               class    = 3; // DivergenceClass
+    repeated NodeRowMeta per_node = 4;
+}
+message SemanticViolationPB {
+    string          kind   = 1;
+    string          key    = 2;
+    string          detail = 3;
+    repeated string hosts  = 4;
+}
+message DivergenceReport {
+    repeated string              nodes_scanned     = 1;
+    repeated string              nodes_unreachable = 2;
+    repeated DivergenceRow       rows              = 3;
+    repeated SemanticViolationPB violations        = 4;
+    int32                        samples           = 5; // samples taken (persistence filter)
+    bool                         stable            = 6; // per-table digests stable across samples
+}
+
+message ScanSensitiveRequest {
+    string          sender   = 1; // peer's own host name (verified vs cert CN)
+    bytes           scan_key = 2; // per-scan HMAC key — peer-mTLS transported, never logged
+    repeated string tables   = 3;
+}
+message SensitiveRowMetaPB {
+    string table      = 1;
+    string pk_label   = 2; // HMAC(scan_key, "pk\0"+table+"\0"+pk)
+    string row_hash   = 3; // HMAC(scan_key, "row\0"+table+"\0"+encoding)
+    string updated_at = 4;
+    bool   deleted    = 5;
+}
+message ScanSensitiveResponse {
+    string                      host_name = 1;
+    repeated SensitiveRowMetaPB rows      = 2;
+}
+
 // ── WAL Replication ──
 
 message MutationEntry {
@@ -1693,6 +1749,13 @@ service LiteVirt {
     // operator or REST surface.
     rpc GetSensitiveStateDigest(SensitiveStateRequest) returns (StateDigestResponse);
     rpc StreamSensitiveStateDump(SensitiveStateRequest) returns (stream StateDumpChunk);
+
+    // ── Divergence scanner (Phase 0) ──
+    // DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
+    // and returns a classified cross-node divergence report. ScanSensitiveDivergence:
+    // peer-mTLS only — each node returns HMAC'd metadata for its own secret rows.
+    rpc DiagnoseDivergence(DiagnoseDivergenceRequest) returns (DivergenceReport);
+    rpc ScanSensitiveDivergence(ScanSensitiveRequest)  returns (ScanSensitiveResponse);
 
     // ── Internal: WAL Replication ──
     rpc PushMutations(ReplicateRequest)             returns (ReplicateResponse);

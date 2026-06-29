@@ -197,6 +197,8 @@ const (
 	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
 	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
 	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
+	LiteVirt_DiagnoseDivergence_FullMethodName         = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
+	LiteVirt_ScanSensitiveDivergence_FullMethodName    = "/litevirt.v1.LiteVirt/ScanSensitiveDivergence"
 	LiteVirt_PushMutations_FullMethodName              = "/litevirt.v1.LiteVirt/PushMutations"
 	LiteVirt_AckMutations_FullMethodName               = "/litevirt.v1.LiteVirt/AckMutations"
 	LiteVirt_ListRebalanceProposals_FullMethodName     = "/litevirt.v1.LiteVirt/ListRebalanceProposals"
@@ -468,6 +470,12 @@ type LiteVirtClient interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error)
+	// ── Divergence scanner (Phase 0) ──
+	// DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
+	// and returns a classified cross-node divergence report. ScanSensitiveDivergence:
+	// peer-mTLS only — each node returns HMAC'd metadata for its own secret rows.
+	DiagnoseDivergence(ctx context.Context, in *DiagnoseDivergenceRequest, opts ...grpc.CallOption) (*DivergenceReport, error)
+	ScanSensitiveDivergence(ctx context.Context, in *ScanSensitiveRequest, opts ...grpc.CallOption) (*ScanSensitiveResponse, error)
 	// ── Internal: WAL Replication ──
 	PushMutations(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error)
 	AckMutations(ctx context.Context, in *AckRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2545,6 +2553,26 @@ func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *Sensi
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
+func (c *liteVirtClient) DiagnoseDivergence(ctx context.Context, in *DiagnoseDivergenceRequest, opts ...grpc.CallOption) (*DivergenceReport, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DivergenceReport)
+	err := c.cc.Invoke(ctx, LiteVirt_DiagnoseDivergence_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ScanSensitiveDivergence(ctx context.Context, in *ScanSensitiveRequest, opts ...grpc.CallOption) (*ScanSensitiveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ScanSensitiveResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ScanSensitiveDivergence_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) PushMutations(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReplicateResponse)
@@ -3102,6 +3130,12 @@ type LiteVirtServer interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(context.Context, *SensitiveStateRequest) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error
+	// ── Divergence scanner (Phase 0) ──
+	// DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
+	// and returns a classified cross-node divergence report. ScanSensitiveDivergence:
+	// peer-mTLS only — each node returns HMAC'd metadata for its own secret rows.
+	DiagnoseDivergence(context.Context, *DiagnoseDivergenceRequest) (*DivergenceReport, error)
+	ScanSensitiveDivergence(context.Context, *ScanSensitiveRequest) (*ScanSensitiveResponse, error)
 	// ── Internal: WAL Replication ──
 	PushMutations(context.Context, *ReplicateRequest) (*ReplicateResponse, error)
 	AckMutations(context.Context, *AckRequest) (*emptypb.Empty, error)
@@ -3711,6 +3745,12 @@ func (UnimplementedLiteVirtServer) GetSensitiveStateDigest(context.Context, *Sen
 }
 func (UnimplementedLiteVirtServer) StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error {
 	return status.Error(codes.Unimplemented, "method StreamSensitiveStateDump not implemented")
+}
+func (UnimplementedLiteVirtServer) DiagnoseDivergence(context.Context, *DiagnoseDivergenceRequest) (*DivergenceReport, error) {
+	return nil, status.Error(codes.Unimplemented, "method DiagnoseDivergence not implemented")
+}
+func (UnimplementedLiteVirtServer) ScanSensitiveDivergence(context.Context, *ScanSensitiveRequest) (*ScanSensitiveResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ScanSensitiveDivergence not implemented")
 }
 func (UnimplementedLiteVirtServer) PushMutations(context.Context, *ReplicateRequest) (*ReplicateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PushMutations not implemented")
@@ -6745,6 +6785,42 @@ func _LiteVirt_StreamSensitiveStateDump_Handler(srv interface{}, stream grpc.Ser
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpServer = grpc.ServerStreamingServer[StateDumpChunk]
 
+func _LiteVirt_DiagnoseDivergence_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DiagnoseDivergenceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).DiagnoseDivergence(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_DiagnoseDivergence_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).DiagnoseDivergence(ctx, req.(*DiagnoseDivergenceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ScanSensitiveDivergence_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ScanSensitiveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ScanSensitiveDivergence(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ScanSensitiveDivergence_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ScanSensitiveDivergence(ctx, req.(*ScanSensitiveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_PushMutations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReplicateRequest)
 	if err := dec(in); err != nil {
@@ -7857,6 +7933,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSensitiveStateDigest",
 			Handler:    _LiteVirt_GetSensitiveStateDigest_Handler,
+		},
+		{
+			MethodName: "DiagnoseDivergence",
+			Handler:    _LiteVirt_DiagnoseDivergence_Handler,
+		},
+		{
+			MethodName: "ScanSensitiveDivergence",
+			Handler:    _LiteVirt_ScanSensitiveDivergence_Handler,
 		},
 		{
 			MethodName: "PushMutations",

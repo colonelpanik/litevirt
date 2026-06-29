@@ -336,10 +336,56 @@ rootfs **and** LXC config, and pushes a content-addressed, **dedup'd** manifest
 that embeds the container spec — so `lv ct restore` rebuilds it from the repo
 alone, even after `lv ct rm` or if the original image is gone. Full-only (no
 dirty-bitmap incremental); the chunk store's dedup gives storage-side
-incrementality. Host-local like VM backup (run against the owning host); a
-container's footprint counts toward the project's `backup_gib` quota. See
+incrementality. Like VM backup it can run against the repo-owning daemon even
+when the container lives elsewhere (the owner archives locally and streams the
+manifest back — see *Peer streaming* below); a container's footprint counts
+toward the project's `backup_gib` quota. See
 [containers.md](containers.md#backup--restore). (Local point-in-time snapshots
 without a repo are `lv ct snapshot` — see that doc.)
+
+## Peer streaming (no shared repo required)
+
+Backup, restore, and cold migration move data between daemons over the existing
+peer mTLS channel, so **a shared NFS/Ceph repo reachable from both hosts is no
+longer required** for cross-host operations. The transport reuses the chunk
+store's content-addressed dedup: only the chunks the destination is missing
+cross the wire.
+
+- **Remote VM / container backup** — call the daemon that owns the repo. If the
+  workload lives on another host, that owning daemon reads the disk/rootfs
+  locally and `PushBackup`-streams the new manifest's missing chunks back to the
+  repo, then the called daemon confirms the manifest landed before reporting
+  success.
+- **Cold migrate / failover restore** — the repo-holding daemon streams the one
+  manifest into the target's internal per-transfer staging repo, then drives the
+  target's restore against it. No `--repo` reachable from both hosts needed.
+
+Mechanics: chunks travel as **plaintext over mTLS** (the source decrypts on read;
+no key crosses the wire — the chunk id is the plaintext BLAKE3, so dedup works
+across repos regardless of encryption mode). The destination writes via its own
+repo config: a **plaintext** repo stores chunks plaintext at rest (the same
+posture as any local daemon backup today; the in-flight protection is the mTLS
+transport), and an **encrypted** repo seals them with its own key. The daemon does
+**not** yet carry repo encryption keys, so a peer push into a destination repo
+marked encrypted is **refused (fail-closed)** rather than silently writing
+plaintext into it — wiring daemon-side repo keys is a follow-up. The owner's
+transient backup staging repo is itself encrypted with an ephemeral,
+never-persisted key, so backup data is never at rest in plaintext even
+mid-transfer. Each chunk's BLAKE3 id is verified on the receiver before it's
+written, and the manifest is written last, only after every chunk it references
+is confirmed present. The RPCs are peer-only (host cert) and load-shed under a
+serving semaphore. Orphaned per-transfer staging repos are removed receiver-side
+when a push doesn't commit, and any survivors are swept at daemon startup.
+
+**Old-peer behavior differs by flow.** *Cold migrate / failover restore* fall
+back to the shared-repo path when the target predates peer streaming (the target
+re-opens the repo by name — it must then be reachable from both hosts). *Remote
+VM/CT backup* has no pre-existing remote path to fall back to (cross-host backup
+is new in this transport): if the sink daemon can't receive a push, the operation
+returns an error rather than silently landing the backup on the wrong host.
+Incremental READ for a remote backup (dirty-bitmap savings) is a follow-up — the
+read is currently full, though the push still dedups so only changed chunks cross
+the wire.
 
 ## Compose integration
 
@@ -390,9 +436,12 @@ Restore destinations are a pool-relative filename by default; a custom absolute
 
 - **gRPC `BackupSnapshot` + `RestoreFromBackup` + `RestoreLive`** —
   the CLI commands are thin wrappers; programmatic clients can call
-  the RPCs directly. Cross-host VMs return `FailedPrecondition` with
-  the host name to retry against (point `LV_HOST` at the VM's owning
-  daemon).
+  the RPCs directly. A cross-host VM no longer needs a re-run against
+  its owning daemon: the daemon you call (which owns the repo) has the
+  owning host read the disk locally and **stream the manifest back**
+  over peer mTLS (see *Peer streaming* below). A direct absolute
+  `repo_path` stays local-only — remote streaming needs a configured
+  logical repo name the sink can resolve.
 - **WebUI `/backups`** — read-only manifest list. With `backup_repos:`
   configured, lists every configured repo and its snapshot count +
   total size. Click through to drill into one repo's manifests.

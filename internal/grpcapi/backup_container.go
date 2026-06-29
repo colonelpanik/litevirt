@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -116,10 +117,12 @@ func (s *Server) migrateSourceFromPeer(ctx context.Context) string {
 }
 
 // BackupContainer freezes a container, streams its rootfs+config as a full,
-// content-addressed manifest into a host-local repo, and indexes the size for
-// quota. Containers are host-local, so this runs on the owning host; if the
-// container lives elsewhere FailedPrecondition names that host (mirrors
-// BackupSnapshot — cross-host streaming is a follow-up).
+// content-addressed manifest into the called daemon's repo, and indexes the size
+// for quota. Call the repo-owning daemon: if the container lives elsewhere, this
+// daemon (the repo sink) has the owning daemon archive locally and PushBackup-
+// streams the manifest back over peer mTLS (sinkRemoteContainerBackup), then
+// confirms it landed — so no shared repo is required (PR 4). sink_host drives the
+// owner side of that forward and is gated to the sink peer (requireSinkPeer).
 func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.ServerStreamingServer[pb.BackupContainerProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
@@ -131,16 +134,28 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	// sink_host is an internal peer field — only the sink daemon may set it (to its
+	// own hostname), so an operator/API client can't drive an owner→sink push that
+	// skips the sink's authoritative landing + accounting. See requireSinkPeer.
+	if err := s.requireSinkPeer(ctx, req.SinkHost); err != nil {
+		return err
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "backup.create", "operator"); err != nil {
 		s.audit(ctx, "ct.backup", req.Name, "project="+project, "denied")
 		return err
 	}
 
-	// Resolve the owning host and confirm it's us — LXC is host-local.
+	// Resolve the owning host.
 	host, rec, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
 	if err != nil {
 		return err
+	}
+	// PR-4 flow 2 (remote CT backup, no shared repo): a remote container called
+	// with no sink_host means WE are the repo SINK — have the owning daemon archive
+	// locally and PushBackup the manifest back here, then confirm it landed.
+	if req.SinkHost == "" && host != s.hostName {
+		return s.sinkRemoteContainerBackup(ctx, host, req, stream)
 	}
 	if host != s.hostName {
 		return status.Errorf(codes.FailedPrecondition,
@@ -154,13 +169,31 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
-	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
-	if err != nil {
-		return err
-	}
-	repo, err := pbsstore.Open(repoPath)
-	if err != nil {
-		return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
+	// When asked to push to a remote sink (sink_host set), archive into a LOCAL
+	// staging repo and stream the manifest to the sink afterward; otherwise write
+	// directly into the resolved local repo (today's path).
+	pushToSink := req.SinkHost != "" && req.SinkHost != s.hostName
+	var repo *pbsstore.Repo
+	if pushToSink {
+		if filepath.IsAbs(req.RepoPath) {
+			return status.Error(codes.InvalidArgument,
+				"remote container backup requires a configured logical repo name on the sink (an absolute repo_path is local-only)")
+		}
+		var cleanup func()
+		repo, cleanup, err = s.newLocalStagingRepo()
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+	} else {
+		repoPath, rerr := s.resolveBackupRepoPath(ctx, req.RepoPath)
+		if rerr != nil {
+			return rerr
+		}
+		repo, err = pbsstore.Open(repoPath)
+		if err != nil {
+			return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
+		}
 	}
 	timestamp := req.Timestamp
 	if timestamp == "" {
@@ -208,7 +241,14 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		return status.Errorf(codes.Internal, "backup push: %v", perr)
 	}
 
-	if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, manifest.TotalSize); err != nil {
+	if pushToSink {
+		// Stream the just-created manifest + its missing chunks to the sink's repo.
+		// The sink records its own usage index; we don't double-count here.
+		if err := s.pushManifestToPeerRepo(ctx, req.SinkHost, req.RepoPath, repo, manifest); err != nil {
+			s.audit(ctx, "ct.backup", req.Name, "project="+project, "error")
+			return err
+		}
+	} else if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, manifest.TotalSize); err != nil {
 		slog.Warn("container backup: update container_backups usage index",
 			"name", req.Name, "repo", req.RepoPath, "error", err)
 	}
@@ -219,6 +259,75 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		ChunksTotal:    int32(len(manifest.Chunks)),
 		BytesProcessed: manifest.TotalSize,
 		Status:         fmt.Sprintf("backup stored at %s", manifest.Timestamp),
+	})
+}
+
+// sinkRemoteContainerBackup runs on the daemon the operator called (the repo
+// SINK) when the container lives on another host: it asks the owning daemon to
+// archive locally and PushBackup the manifest back here (sink_host = us), proxies
+// progress, then CONFIRMS the manifest landed in our repo — so an owning daemon
+// too old to honor sink_host surfaces as an error, not a false success.
+func (s *Server) sinkRemoteContainerBackup(ctx context.Context, owner string, req *pb.BackupContainerRequest, stream grpc.ServerStreamingServer[pb.BackupContainerProgress]) error {
+	if filepath.IsAbs(req.RepoPath) {
+		return status.Error(codes.InvalidArgument,
+			"remote container backup requires a configured logical repo name (an absolute repo_path is local-only)")
+	}
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	c, closeConn, err := s.dialPeer(ctx, owner)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "reach owning host %q: %v", owner, err)
+	}
+	defer closeConn()
+
+	fwd := proto.Clone(req).(*pb.BackupContainerRequest)
+	fwd.SinkHost = s.hostName
+	stream2, err := c.BackupContainer(ctx, fwd)
+	if err != nil {
+		return err
+	}
+	var ownerTS string
+	for {
+		p, e := stream2.Recv()
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			return e
+		}
+		if p.ManifestTs != "" {
+			ownerTS = p.ManifestTs
+		}
+		if p.Phase != pb.BackupContainerProgress_DONE {
+			_ = stream.Send(p)
+		}
+	}
+
+	ts := ownerTS
+	if ts == "" {
+		ts = req.Timestamp
+	}
+	repo, err := pbsstore.Open(repoPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "open sink repo: %v", err)
+	}
+	m, err := repo.GetManifest(req.Name, ts, containerBackupDisk)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"remote backup did not land in repo %q (the owning daemon %q may not support peer backup streaming): %v",
+			req.RepoPath, owner, err)
+	}
+	if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, m.TotalSize); err != nil {
+		slog.Warn("container backup: update container_backups usage index", "name", req.Name, "repo", req.RepoPath, "error", err)
+	}
+	return stream.Send(&pb.BackupContainerProgress{
+		Phase:          pb.BackupContainerProgress_DONE,
+		ManifestTs:     m.Timestamp,
+		ChunksTotal:    int32(len(m.Chunks)),
+		BytesProcessed: m.TotalSize,
+		Status:         fmt.Sprintf("backup stored at %s (archived on %s)", m.Timestamp, owner),
 	})
 }
 
@@ -260,27 +369,14 @@ func relocateTokenFromMD(ctx context.Context) string {
 // frame/stream was lost) → RestoreUnknown, which the coordinator defers rather
 // than destructively falling back.
 func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string) (corrosion.RestoreOutcome, error) {
-	if s.migrateRestoreOverride != nil {
-		// Test seam (shared with MigrateContainer): the override returns the
-		// classified outcome directly.
-		return s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true)
-	}
-	// Carry the attempt token to the target so it stamps the restored row.
+	// Carry the attempt token to the target (on the RestoreContainer call) so it
+	// stamps the restored row. The transport (PR-4 push to staging vs. shared-repo
+	// fallback) is handled by drivePeerRestore.
+	var md []string
 	if token != "" {
-		ctx = metadata.AppendToOutgoingContext(ctx, relocateTokenMDKey, token)
+		md = []string{relocateTokenMDKey, token}
 	}
-	c, conn, derr := s.peerClient(ctx, target)
-	if derr != nil {
-		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", derr)
-	}
-	defer conn.Close()
-	rs, rerr := c.RestoreContainer(ctx, &pb.RestoreContainerRequest{
-		RepoPath: repoPath, Name: name, Timestamp: timestamp, HostName: target, Start: true,
-	})
-	if rerr != nil {
-		return corrosion.RestoreNotAttempted, rerr // RPC never established
-	}
-	return drainRestoreStream(rs)
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, true, md...)
 }
 
 // drainRestoreStream classifies a remote RestoreContainer progress stream. The
@@ -406,8 +502,8 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
 	}
-	if req.RepoPath == "" || req.Name == "" || req.Timestamp == "" {
-		return status.Error(codes.InvalidArgument, "repo_path, name and timestamp required")
+	if req.Name == "" || req.Timestamp == "" || (req.RepoPath == "" && req.StagingToken == "") {
+		return status.Error(codes.InvalidArgument, "name, timestamp and one of repo_path / staging_token required")
 	}
 	// Validate the name before it composes the permission path, the staging
 	// tar path (dataDir/ct-restore), or the container dir.
@@ -427,13 +523,29 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
-	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
-	if err != nil {
-		return err
-	}
-	repo, err := pbsstore.Open(repoPath)
-	if err != nil {
-		return status.Errorf(codes.NotFound, "open repo: %v", err)
+	// Resolve the source of the manifest+chunks. staging_token (PR 4) is the
+	// per-transfer internal repo a migrate/failover coordinator PushBackup-streamed
+	// into — so the target restores WITHOUT needing the source's repo over NFS. It
+	// is a transient transfer buffer, removed once we've materialised the tar.
+	var (
+		repo *pbsstore.Repo
+		err  error
+	)
+	if req.StagingToken != "" {
+		repo, err = s.openStagingRepo(req.StagingToken)
+		if err != nil {
+			return err
+		}
+		defer s.removeStagingRepo(req.StagingToken)
+	} else {
+		repoPath, rerr := s.resolveBackupRepoPath(ctx, req.RepoPath)
+		if rerr != nil {
+			return rerr
+		}
+		repo, err = pbsstore.Open(repoPath)
+		if err != nil {
+			return status.Errorf(codes.NotFound, "open repo: %v", err)
+		}
 	}
 	manifest, err := repo.GetManifest(req.Name, req.Timestamp, containerBackupDisk)
 	if err != nil {

@@ -425,9 +425,12 @@ was running it's restarted on the target.
 - **Atomic re-key.** The owner moves to the target only after the restore
   succeeds; exactly one live row survives the window. **A failure before cutover
   leaves the container intact on the source** (restarted if it had been running).
-- **Shared repo required.** `--repo` must be reachable from both hosts (e.g. an
-  NFS-mounted backup repo) — that's the transfer medium. Run against the source
-  host (`LV_HOST`).
+- **No shared repo required.** The source archives into `--repo` locally and
+  **streams the manifest to the target over peer mTLS** (into a per-transfer
+  staging repo), so `--repo` need only exist on the source. (An older target
+  predating peer streaming falls back to re-opening `--repo` by name, which then
+  must be shared/reachable from both hosts.) Run against the source host
+  (`LV_HOST`).
 - Refuses to migrate onto a host that already has a container of that name.
 
 ## gRPC + WebUI

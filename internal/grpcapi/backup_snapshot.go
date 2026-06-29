@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -21,11 +23,12 @@ import (
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
-// BackupSnapshot streams a VM disk into a host-local backup repo.
-// only the daemon-you-call-with-LV_HOST does work; if
-// the VM lives on a different host, FailedPrecondition tells the
-// operator which host to retry against. Cross-host disk streaming
-// is a follow-up (would need a peer streaming primitive).
+// BackupSnapshot streams a VM disk into the called daemon's backup repo. Call the
+// repo-owning daemon: if the VM lives elsewhere, this daemon (the repo sink) has
+// the owning daemon read the disk locally and PushBackup-streams the manifest back
+// over peer mTLS (sinkRemoteVMBackup), then confirms it landed in our repo — so no
+// shared repo is required (PR 4). sink_host is the internal field that drives the
+// owner side of that forward; clients leave it empty (requireSinkPeer gates it).
 func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.ServerStreamingServer[pb.BackupSnapshotProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
@@ -34,8 +37,14 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 	if req.VmName == "" || req.RepoPath == "" {
 		return status.Error(codes.InvalidArgument, "vm_name and repo_path required")
 	}
-	unlock := s.lockVM(req.VmName)
-	defer unlock()
+	// sink_host is an INTERNAL peer field: the only legitimate setter is the sink
+	// daemon forwarding to the owner (it sets sink_host to its OWN hostname). An
+	// operator/API client must not set it — that would drive the owner→sink push
+	// while bypassing the sink's authoritative landing + accounting path. Require
+	// the caller to be that peer over mTLS (CN == sink_host).
+	if err := s.requireSinkPeer(ctx, req.SinkHost); err != nil {
+		return err
+	}
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
@@ -44,29 +53,70 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "backup.create", "operator"); err != nil {
 		return err
 	}
+
+	// PR-4 flow 1 (remote VM backup, no shared repo): a remote VM called with no
+	// sink_host means WE are the repo SINK — have the owning daemon read the disk
+	// locally and PushBackup the manifest back to us, then confirm it landed in OUR
+	// repo (authoritative). This replaces the old "re-run against that daemon"
+	// refusal.
+	if req.SinkHost == "" && vm.HostName != s.hostName {
+		return s.sinkRemoteVMBackup(ctx, vm, req, stream)
+	}
 	if vm.HostName != s.hostName {
 		return status.Errorf(codes.FailedPrecondition,
 			"vm %q lives on host %q; re-run against that daemon (set LV_HOST)",
 			req.VmName, vm.HostName)
 	}
 
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
 	disk, err := pickDisk(ctx, s.db, req.VmName, req.DiskName)
 	if err != nil {
 		return err
 	}
 
-	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
-	if err != nil {
-		return err
-	}
-	repo, err := pbsstore.Open(repoPath)
-	if err != nil {
-		return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
-	}
-
 	timestamp := req.Timestamp
 	if timestamp == "" {
 		timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	// When asked to push to a remote sink (sink_host set, flow 1 owner side), back
+	// up into a LOCAL staging repo and stream the manifest to the sink afterward.
+	// Otherwise write directly into the resolved local repo (today's path).
+	pushToSink := req.SinkHost != "" && req.SinkHost != s.hostName
+	var repo *pbsstore.Repo
+	if pushToSink {
+		// Remote streaming needs a logical repo name the sink can resolve; an
+		// absolute path is local-only.
+		if filepath.IsAbs(req.RepoPath) {
+			return status.Error(codes.InvalidArgument,
+				"remote VM backup requires a configured logical repo name on the sink (an absolute repo_path is local-only)")
+		}
+		var cleanup func()
+		repo, cleanup, err = s.newLocalStagingRepo()
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		// The parent manifest (if any) lives on the SINK, not in this fresh staging
+		// repo, so an incremental READ has nothing to diff against here — read full.
+		// The push still dedups against the sink (SyncManifest probes HasChunks), so
+		// unchanged chunks don't cross the wire; only the owner-side read I/O isn't
+		// dirty-bitmap-optimized. (Follow-up: fetch the parent manifest from the sink
+		// to restore the incremental read.)
+		full := proto.Clone(req).(*pb.BackupSnapshotRequest)
+		full.Incremental = false
+		req = full
+	} else {
+		repoPath, rerr := s.resolveBackupRepoPath(ctx, req.RepoPath)
+		if rerr != nil {
+			return rerr
+		}
+		repo, err = pbsstore.Open(repoPath)
+		if err != nil {
+			return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
+		}
 	}
 
 	// Snoop the running bytes_read off the COPY frames so the DONE frame
@@ -96,7 +146,20 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 		})
 		return err
 	}
-	s.recordBackupUsage(ctx, req.VmName, disk.DiskName, req.RepoPath, manifest.TotalSize)
+
+	if pushToSink {
+		// Stream the just-created manifest + its missing chunks to the sink's repo.
+		if err := s.pushManifestToPeerRepo(ctx, req.SinkHost, req.RepoPath, repo, manifest); err != nil {
+			s.recordVMEvent(ctx, req.VmName, "backup.failed", "error", err.Error())
+			s.notify(ctx, notify.Notification{
+				Kind: "backup.failed", Severity: notify.SevError, Subject: req.VmName, Detail: err.Error(),
+			})
+			return err
+		}
+		// Usage is recorded by the sink for its own repo; don't double-count here.
+	} else {
+		s.recordBackupUsage(ctx, req.VmName, disk.DiskName, req.RepoPath, manifest.TotalSize)
+	}
 	s.recordVMEvent(ctx, req.VmName, "backup.succeeded", "ok",
 		fmt.Sprintf("manual → %s @ %s", req.RepoPath, manifest.Timestamp))
 	return send(&pb.BackupSnapshotProgress{
@@ -106,6 +169,84 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 		BytesProcessed: manifest.TotalSize,
 		BytesRead:      lastBytesRead,
 		Status:         fmt.Sprintf("snapshot stored at %s", manifest.Timestamp),
+	})
+}
+
+// sinkRemoteVMBackup runs on the daemon the operator called (the repo SINK) when
+// the target VM lives on another host. It asks the owning daemon to back the VM
+// up locally and PushBackup the manifest back here (sink_host = us), proxies the
+// owner's progress to the operator, and then CONFIRMS the manifest actually
+// landed in our repo before reporting success — so an owning daemon too old to
+// honor sink_host (which would land the backup on itself) surfaces as an error,
+// not a false success.
+func (s *Server) sinkRemoteVMBackup(ctx context.Context, vm *corrosion.VMRecord, req *pb.BackupSnapshotRequest, stream grpc.ServerStreamingServer[pb.BackupSnapshotProgress]) error {
+	if filepath.IsAbs(req.RepoPath) {
+		return status.Error(codes.InvalidArgument,
+			"remote VM backup requires a configured logical repo name (an absolute repo_path is local-only)")
+	}
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	// We must be able to select the disk to verify the landing (vm_disks is
+	// replicated, so we can resolve it here even though the VM is remote).
+	disk, err := pickDisk(ctx, s.db, req.VmName, req.DiskName)
+	if err != nil {
+		return err
+	}
+
+	c, closeConn, err := s.dialPeer(ctx, vm.HostName)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "reach owning host %q: %v", vm.HostName, err)
+	}
+	defer closeConn()
+
+	fwd := proto.Clone(req).(*pb.BackupSnapshotRequest)
+	fwd.SinkHost = s.hostName // tell the owner to push back to us
+	owner, err := c.BackupSnapshot(ctx, fwd)
+	if err != nil {
+		return err
+	}
+	var ownerTS string
+	for {
+		p, e := owner.Recv()
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			return e
+		}
+		if p.ManifestTs != "" {
+			ownerTS = p.ManifestTs
+		}
+		// Relay the owner's progress to the operator, but suppress its terminal
+		// DONE — OUR landing check below is the authoritative success signal.
+		if p.Phase != pb.BackupSnapshotProgress_DONE {
+			_ = stream.Send(p)
+		}
+	}
+
+	ts := ownerTS
+	if ts == "" {
+		ts = req.Timestamp
+	}
+	repo, err := pbsstore.Open(repoPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "open sink repo: %v", err)
+	}
+	m, err := repo.GetManifest(req.VmName, ts, disk.DiskName)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"remote backup did not land in repo %q (the owning daemon %q may not support peer backup streaming): %v",
+			req.RepoPath, vm.HostName, err)
+	}
+	s.recordBackupUsage(ctx, req.VmName, disk.DiskName, req.RepoPath, m.TotalSize)
+	return stream.Send(&pb.BackupSnapshotProgress{
+		Phase:          pb.BackupSnapshotProgress_DONE,
+		ManifestTs:     m.Timestamp,
+		ChunksTotal:    int32(len(m.Chunks)),
+		BytesProcessed: m.TotalSize,
+		Status:         fmt.Sprintf("snapshot stored at %s (read on %s)", m.Timestamp, vm.HostName),
 	})
 }
 

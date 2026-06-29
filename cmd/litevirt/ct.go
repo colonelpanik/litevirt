@@ -644,7 +644,8 @@ are gone. Runs on the target host; pass --start to bring it up.`,
 }
 
 // newCTMigrateCmd cold-migrates a container to another host via the backup→
-// restore transport. The repo must be reachable from both hosts.
+// restore transport. The source archives into --repo locally and streams the
+// manifest to the target over peer mTLS — no shared repo needed.
 func newCTMigrateCmd() *cobra.Command {
 	var source, repo string
 	cmd := &cobra.Command{
@@ -656,12 +657,14 @@ into a staging repo, and the target rebuilds from it. If it was running
 it's restarted on the target. A failure before cutover leaves the
 container intact on the source.
 
---repo must point at a staging repo reachable from BOTH hosts (e.g. an
-NFS-mounted backup repo). Run against the owning host (set LV_HOST).`,
+--repo is a staging repo on the SOURCE; the manifest is streamed to the
+target over peer mTLS, so it need not be shared. (An older target falls
+back to re-opening --repo by name, which then must be reachable from both
+hosts.) Run against the owning host (set LV_HOST).`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if repo == "" {
-				return fmt.Errorf("--repo is required (must be reachable from both hosts)")
+				return fmt.Errorf("--repo is required (staging repo on the source host)")
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				stream, err := c.MigrateContainer(ctx, &pb.MigrateContainerRequest{
@@ -694,7 +697,7 @@ NFS-mounted backup repo). Run against the owning host (set LV_HOST).`,
 		},
 	}
 	cmd.Flags().StringVar(&source, "source", "", "Source host (default: resolve by name)")
-	cmd.Flags().StringVar(&repo, "repo", "", "Staging repo path reachable from both hosts")
+	cmd.Flags().StringVar(&repo, "repo", "", "Staging repo path on the source host (streamed to the target over peer mTLS)")
 	return cmd
 }
 

@@ -104,7 +104,11 @@ func TestBackupSnapshot_LocalRoundTrip(t *testing.T) {
 // TestBackupSnapshot_VMOnRemoteHost_FailedPrecondition is the
 // single-host model regression: callers point at the VM's owning
 // daemon explicitly.
-func TestBackupSnapshot_VMOnRemoteHost_FailedPrecondition(t *testing.T) {
+// A remote VM backup with an ABSOLUTE repo_path is rejected (PR 4): remote
+// streaming requires a configured logical repo name the sink can resolve; an
+// absolute path is local-only. (Pre-PR-4 this returned FailedPrecondition
+// "re-run against that daemon"; the sink now forwards to the owner instead.)
+func TestBackupSnapshot_RemoteVM_AbsoluteRepoRejected(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"
 	if err := corrosion.InsertVM(context.Background(), s.db,
@@ -119,10 +123,10 @@ func TestBackupSnapshot_VMOnRemoteHost_FailedPrecondition(t *testing.T) {
 
 	stream := &progressStream[pb.BackupSnapshotProgress]{ctx: adminCtx()}
 	err := s.BackupSnapshot(&pb.BackupSnapshotRequest{
-		VmName: "vmB", RepoPath: t.TempDir(),
+		VmName: "vmB", RepoPath: t.TempDir(), // absolute path
 	}, stream)
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected FailedPrecondition for cross-host VM, got %v", err)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for remote VM + absolute repo, got %v", err)
 	}
 }
 

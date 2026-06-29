@@ -9,7 +9,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -21,15 +20,17 @@ import (
 
 // MigrateContainer cold-migrates a container to another host by reusing the
 // backup→restore data path (one tested transport): on the SOURCE host it stops
-// the container (cold), archives it into a staging repo, then drives the
-// TARGET's RestoreContainer over a peer connection; on success it re-keys the
-// owner (the target's restore created the new row) and removes the source copy.
-// A failure anywhere before finalisation leaves the container intact on the
-// source (restarted if it had been running). repo_path must be reachable from
-// both hosts (e.g. an NFS-mounted repo).
+// the container (cold), archives it into a source-local staging repo, then drives
+// the TARGET's RestoreContainer over a peer connection — streaming the manifest
+// into the target's internal staging repo over peer mTLS (drivePeerRestore), so
+// repo_path need only exist on the SOURCE (no shared repo required; an older
+// target falls back to re-opening repo_path by name). On success it re-keys the
+// owner (the target's restore created the new row) and removes the source copy. A
+// failure anywhere before finalisation leaves the container intact on the source
+// (restarted if it had been running).
 //
-// Runs on the source host — like BackupContainer, point it at the owning daemon
-// (FailedPrecondition names it otherwise). No CRIU / live migration.
+// Runs on the source host — point it at the owning daemon (FailedPrecondition
+// names it otherwise). No CRIU / live migration.
 func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.ServerStreamingServer[pb.MigrateContainerProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
@@ -299,23 +300,9 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 // only roll back the source in the latter case. The test seam replaces the whole
 // drive so the path is unit-testable without a second daemon.
 func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error) {
-	if s.migrateRestoreOverride != nil {
-		return s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, start)
-	}
-	c, conn, err := s.peerClient(ctx, target)
-	if err != nil {
-		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", err)
-	}
-	defer conn.Close()
 	// Tell the target this is a migrate FROM us (peer-verified on the far side), so
 	// it keeps the imported NIC IPs — we handed it the IPAM leases before this call
-	// — rather than re-reserving and blanking them.
-	mctx := metadata.AppendToOutgoingContext(ctx, migrateFromMDKey, s.hostName)
-	rs, err := c.RestoreContainer(mctx, &pb.RestoreContainerRequest{
-		RepoPath: repoPath, Name: name, Timestamp: timestamp, HostName: target, Start: start,
-	})
-	if err != nil {
-		return corrosion.RestoreNotAttempted, err // RPC never established
-	}
-	return drainRestoreStream(rs)
+	// — rather than re-reserving and blanking them. The transport (PR-4 push to the
+	// target's staging repo vs. shared-repo fallback) is handled by drivePeerRestore.
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, migrateFromMDKey, s.hostName)
 }

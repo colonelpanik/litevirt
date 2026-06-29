@@ -505,9 +505,11 @@ message RevokeTokenRequest { string id = 1; }
 
 // ── Backup snapshots ──
 //
-// Repo location model: the daemon you call owns the repo. If the
-// named VM doesn't live on this daemon's host, the RPC returns
-// FailedPrecondition with the host-name to retry against.
+// Repo location model: the daemon you call owns the repo. If the named VM lives
+// on another host, that called daemon (the repo sink) has the owning daemon read
+// the disk locally and streams the manifest back over peer mTLS — so no shared
+// repo and no "re-run against the owning daemon" is needed (PR 4). A remote backup
+// requires a configured logical repo name (an absolute repo_path is local-only).
 
 message BackupSnapshotRequest {
     string vm_name   = 1;
@@ -528,6 +530,13 @@ message BackupSnapshotRequest {
     // when the VM advertises one, else proceeds crash-consistent; "off" forces
     // crash-consistent. A freeze failure never fails an otherwise-good backup.
     string quiesce = 6;
+    // sink_host (PR 4) is an INTERNAL field — clients do NOT set it. The repo-
+    // owning "sink" daemon sets it (to its own hostname) when it forwards a remote
+    // backup to the owning daemon, telling the owner to read the disk locally and
+    // PushBackup-stream the manifest back to sink_host (resolved there as a logical
+    // repo name). The owner accepts it only from that peer over mTLS (host-cert CN
+    // == sink_host); a non-peer request that sets it is rejected. Leave empty.
+    string sink_host = 7;
 }
 message BackupSnapshotProgress {
     enum Phase {
@@ -548,6 +557,59 @@ message BackupSnapshotProgress {
     // incremental (or a sparse full) this is ≪ bytes_processed; the gap is
     // the read-I/O the dirty bitmap / allocation map saved.
     int64  bytes_read      = 9;
+}
+
+// ── Peer streaming backup transport (PR 4) ──
+//
+// RepoTarget identifies the DESTINATION repo a transfer writes into, resolved in
+// the SERVER's own config — never an arbitrary caller-supplied path. Exactly one
+// of repo_name / staging_token is set: repo_name is a configured logical repo;
+// staging_token addresses a per-transfer internal staging repo at
+// <DataDir>/restore-staging/<token>/ (created on demand, used by CT
+// migrate/restore so the target never needs the source's repo over NFS).
+message RepoTarget {
+    string repo_name      = 1;
+    string staging_token  = 2;
+}
+
+message HasChunksRequest {
+    RepoTarget      target    = 1;
+    repeated string chunk_ids = 2;  // bounded batch
+}
+message HasChunksResponse {
+    repeated bool present = 1;  // aligned 1:1 with request chunk_ids
+}
+
+// PushBackupFrame is one frame of a PushBackup stream. The stream is: one header,
+// then chunk sub-frames (a 4 MiB chunk spans multiple ≤1 MiB transport frames),
+// then manifest sub-frames LAST. The receiver reassembles one chunk at a time,
+// verifies its BLAKE3 == chunk_id before writing, and writes the manifest only
+// after every chunk it references is confirmed present.
+message PushBackupFrame {
+    oneof frame {
+        PushBackupHeader  header   = 1;
+        PushChunkFrame    chunk    = 2;
+        PushManifestFrame manifest = 3;
+    }
+}
+message PushBackupHeader {
+    RepoTarget target = 1;
+}
+message PushChunkFrame {
+    string chunk_id   = 1;  // BLAKE3 hex of the PLAINTEXT chunk
+    int64  total_size = 2;  // full plaintext size of this chunk (<= ChunkSize)
+    int64  offset     = 3;  // byte offset of this sub-frame within the chunk
+    bytes  data       = 4;  // sub-frame payload (transport-capped)
+    bool   final      = 5;  // last sub-frame for this chunk_id
+}
+message PushManifestFrame {
+    bytes data  = 1;  // manifest JSON, sub-framed
+    bool  final = 2;  // last manifest sub-frame
+}
+message PushBackupResponse {
+    int32 chunks_written = 1;
+    int32 chunks_deduped = 2;
+    int64 bytes_written  = 3;
 }
 
 message RestoreFromBackupRequest {
@@ -652,14 +714,20 @@ message PullOCIImageRequest {
 }
 
 // BackupContainerRequest pushes a container's rootfs (and its LXC config) into a
-// host-local backup repo as a full, content-addressed manifest. Containers are
-// host-local, so this runs on the owning host; an empty host_name is resolved by
-// name and, if the owner is a different daemon, FailedPrecondition names it.
+// backup repo as a full, content-addressed manifest. Call the repo-owning daemon:
+// if the container lives elsewhere, that daemon has the owning daemon archive
+// locally and streams the manifest back over peer mTLS (PR 4) — no shared repo
+// needed; an empty host_name is resolved by name.
 message BackupContainerRequest {
     string name      = 1;
     string host_name = 2;  // empty = resolve by name
     string repo_path = 3;  // host-local directory (must be initialised)
     string timestamp = 4;  // RFC3339; empty = now
+    // sink_host (PR 4): INTERNAL — clients do NOT set it. See
+    // BackupSnapshotRequest.sink_host: the repo-owning sink daemon sets it when
+    // forwarding to the owner, which accepts it only from that peer over mTLS
+    // (CN == sink_host). Leave empty.
+    string sink_host = 5;
 }
 
 message BackupContainerProgress {
@@ -689,6 +757,11 @@ message RestoreContainerRequest {
     string timestamp = 3;  // exact RFC3339 of manifest
     string host_name = 4;  // target host; empty = this daemon
     bool   start     = 5;  // start the container after restore
+    // staging_token (PR 4): when set, the target resolves the repo as its OWN
+    // internal per-transfer staging repo (<DataDir>/restore-staging/<token>/)
+    // that the coordinator PushBackup-streamed the manifest into — so the target
+    // never needs the source's repo over NFS. Empty = resolve repo_path normally.
+    string staging_token = 6;
 }
 
 message RestoreContainerProgress {
@@ -708,15 +781,17 @@ message RestoreContainerProgress {
 
 // MigrateContainerRequest cold-migrates a container to another host by reusing
 // the backup→restore data path: the source archives the (stopped) container into
-// a staging repo, the target restores from it. repo_path must therefore be
-// reachable from BOTH hosts (e.g. an NFS-mounted backup repo). No CRIU / live
-// migration — the container is stopped for the transfer and restarted on the
-// target if it was running.
+// repo_path locally, then STREAMS the manifest to the target over peer mTLS (into
+// a per-transfer staging repo), so repo_path need only exist on the SOURCE. (An
+// older target that predates peer streaming falls back to re-opening repo_path by
+// name, which then must be reachable from both hosts.) No CRIU / live migration —
+// the container is stopped for the transfer and restarted on the target if it was
+// running.
 message MigrateContainerRequest {
     string name        = 1;
     string source_host = 2;  // empty = resolve by name
     string target_host = 3;
-    string repo_path   = 4;  // staging repo reachable from both hosts
+    string repo_path   = 4;  // source-local staging repo (streamed to the target)
 }
 
 message MigrateContainerProgress {
@@ -1504,6 +1579,15 @@ service LiteVirt {
     // ── Backup snapshots ──
     rpc BackupSnapshot(BackupSnapshotRequest)       returns (stream BackupSnapshotProgress);
     rpc RestoreFromBackup(RestoreFromBackupRequest) returns (stream RestoreFromBackupProgress);
+
+    // ── Peer streaming backup transport (PR 4) ──
+    // Move ONE manifest + only its missing chunks between two daemons over peer
+    // mTLS, so backup/restore/migrate no longer need a shared NFS repo. Peer-only
+    // (host cert CN); chunks travel as plaintext (re-encrypted at rest on the
+    // destination). HasChunks is the batched dedup probe; PushBackup streams the
+    // chunks (sub-chunk framed) then the manifest LAST.
+    rpc HasChunks(HasChunksRequest)   returns (HasChunksResponse);
+    rpc PushBackup(stream PushBackupFrame) returns (PushBackupResponse);
 
     // ── Containers ──
     rpc CreateContainer(CreateContainerRequest) returns (Container);

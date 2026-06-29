@@ -69,8 +69,16 @@ func (r *Repo) IsEncrypted() bool {
 
 // encryptForStorage seals plaintext for writing to chunks/<id>. The
 // on-disk format is nonce(12) || ciphertext+tag.
+//
+// Fail closed: a repo marked encrypted in repo.json but opened WITHOUT a key must
+// never write plaintext — that would silently corrupt the repo (its metadata says
+// encrypted, so a later reader with the real key fails GCM auth). Return
+// ErrKeyMissing instead.
 func (r *Repo) encryptForStorage(plaintext []byte) ([]byte, error) {
 	if r.aead == nil {
+		if r.IsEncrypted() {
+			return nil, ErrKeyMissing
+		}
 		return plaintext, nil
 	}
 	nonce := make([]byte, r.aead.NonceSize())
@@ -83,9 +91,14 @@ func (r *Repo) encryptForStorage(plaintext []byte) ([]byte, error) {
 	return out, nil
 }
 
-// decryptFromStorage reverses encryptForStorage.
+// decryptFromStorage reverses encryptForStorage. Fail closed when the repo is
+// encrypted but no key is attached (otherwise it would hand back raw stored bytes
+// as if they were plaintext).
 func (r *Repo) decryptFromStorage(blob []byte) ([]byte, error) {
 	if r.aead == nil {
+		if r.IsEncrypted() {
+			return nil, ErrKeyMissing
+		}
 		return blob, nil
 	}
 	if len(blob) < r.aead.NonceSize() {

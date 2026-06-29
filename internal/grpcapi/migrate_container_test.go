@@ -143,6 +143,98 @@ func TestMigrateContainer_TransfersManagedLease(t *testing.T) {
 	}
 }
 
+// TestMigrateContainer_RefusesWhenSourceLeaseMissing proves the per-NIC handoff
+// PRECONDITION: a managed NIC whose IP has no backing source lease (a stale spec
+// or a lost/stolen lease) aborts the migration BEFORE the target restore, so the
+// target — which skips re-reservation on a verified migrate — can never start an
+// unowned, potentially conflicting address.
+func TestMigrateContainer_RefusesWhenSourceLeaseMissing(t *testing.T) {
+	s, _, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+	// Managed NIC with an IP but NO ip_allocations lease behind it.
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "host-a", CtName: "ct1", NetworkName: "br-acme", Ordinal: 0,
+		MAC: "02:00:00:00:00:09", IP: "10.9.0.9", VethDevice: "lvtest0",
+	}); err != nil {
+		t.Fatalf("seed interface row: %v", err)
+	}
+	restoreCalled := false
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) error {
+		restoreCalled = true
+		return nil
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal (refused), got %v", err)
+	}
+	if restoreCalled {
+		t.Error("restore must not run when the source does not own a managed NIC IP")
+	}
+	// Nothing handed to the target; source row intact.
+	if a, _ := network.GetAllocationFor(ctx, s.db, "br-acme", "ct", "host-b", "ct1"); a != nil {
+		t.Errorf("no lease should be on host-b after a refused migrate: %+v", a)
+	}
+	if src, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1"); src == nil {
+		t.Error("source row vanished after a refused migration")
+	}
+}
+
+// TestMigrateContainer_RollbackHandsLeasesBack proves the lease handoff is a
+// reversible PRECONDITION of the restore: the leases move to the target before the
+// target can run, and if the restore then fails the leases are handed back to the
+// source (which gets restarted), so the source never ends up running an IP it no
+// longer owns.
+func TestMigrateContainer_RollbackHandsLeasesBack(t *testing.T) {
+	s, _, repo := migrateTestServer(t, "running")
+	ctx := context.Background()
+
+	const (
+		net = "br-acme"
+		ip  = "10.9.0.7"
+		mac = "02:aa:bb:cc:dd:ee"
+	)
+	if ok, err := network.ReserveContainerIP(ctx, s.db, net, ip, mac, "host-a", "ct1"); err != nil || !ok {
+		t.Fatalf("seed ReserveContainerIP: ok=%v err=%v", ok, err)
+	}
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "host-a", CtName: "ct1", NetworkName: net, Ordinal: 0,
+		MAC: mac, IP: ip, VethDevice: "lvtest0",
+	}); err != nil {
+		t.Fatalf("seed interface row: %v", err)
+	}
+
+	// The restore fails — but by the time it runs the leases must already be on the
+	// target (the handoff is a precondition, not a finalize step).
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, _ string, _ bool) error {
+		if a, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "host-b", "ct1"); a == nil {
+			t.Error("leases were not handed to the target before the restore ran")
+		}
+		return errors.New("target unreachable")
+	}
+
+	st := &progressStream[pb.MigrateContainerProgress]{ctx: adminCtx()}
+	if err := s.MigrateContainer(&pb.MigrateContainerRequest{
+		Name: "ct1", SourceHost: "host-a", TargetHost: "host-b", RepoPath: repo,
+	}, st); status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal, got %v", err)
+	}
+
+	// Lease handed BACK to the source; nothing stranded on the target.
+	if a, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "host-a", "ct1"); a == nil || a.IP != ip {
+		t.Errorf("lease not handed back to host-a after rollback: %+v", a)
+	}
+	if a, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "host-b", "ct1"); a != nil {
+		t.Errorf("lease still on host-b after rollback: %+v", a)
+	}
+	// Source restarted (it was running) and its row is intact.
+	if src, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1"); src == nil {
+		t.Error("source row vanished after a rolled-back migration")
+	}
+}
+
 // TestMigrateContainer_RollbackOnRestoreFailure is the key corner case: if the
 // target restore fails, the container must stay intact on the source — and be
 // restarted if it had been running.

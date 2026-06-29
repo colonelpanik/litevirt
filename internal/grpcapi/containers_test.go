@@ -62,12 +62,23 @@ type fakeCTRuntime struct {
 	// B4 clone: records (src,dst) clone calls; cloneErr injects a failure.
 	cloneCalls []struct{ Src, Dst string }
 	cloneErr   error
+
+	// createHook / importHook run INSIDE the respective runtime call (after the
+	// gRPC handler's pre-runtime preflight, before the post-runtime cluster-row
+	// write). A test uses these to break the row write only AFTER the runtime
+	// object exists — exercising the fail-closed cleanup path without tripping the
+	// handler's earlier same-name preflight read.
+	createHook func()
+	importHook func()
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, opts)
+	if f.createHook != nil {
+		f.createHook()
+	}
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -153,6 +164,9 @@ func (f *fakeCTRuntime) ImportContainer(_ context.Context, name string, r io.Rea
 	data, _ := io.ReadAll(r)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.importHook != nil {
+		f.importHook()
+	}
 	if f.importErr != nil {
 		return f.importErr
 	}

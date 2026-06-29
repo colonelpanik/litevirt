@@ -8,6 +8,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -17,6 +18,42 @@ import (
 
 var _ grpc.ServerStreamingServer[pb.BackupContainerProgress] = (*progressStream[pb.BackupContainerProgress])(nil)
 var _ grpc.ServerStreamingServer[pb.RestoreContainerProgress] = (*progressStream[pb.RestoreContainerProgress])(nil)
+
+// TestMigrateSourceFromPeer: the migrate-from marker that lets a restore keep its
+// imported IPs (skipping IP re-reservation) is honored ONLY over peer mTLS whose
+// CN matches the claimed source host (a known cluster host). An operator/bearer
+// caller — or a peer impersonating another source — must not be able to set the
+// header to import an address this host doesn't own; an unverified marker is
+// ignored, degrading to the safe re-reserve path.
+func TestMigrateSourceFromPeer(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "host-a", Address: "127.0.0.1", State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	withMarker := func(base context.Context, src string) context.Context {
+		return metadata.NewIncomingContext(base, metadata.Pairs(migrateFromMDKey, src))
+	}
+
+	cases := []struct {
+		name string
+		ctx  context.Context
+		want string
+	}{
+		{"no marker", ctx, ""},
+		{"marker without peer mTLS (operator)", withMarker(adminCtx(), "host-a"), ""},
+		{"marker, peer CN mismatch", withMarker(mtlsCtx("host-b"), "host-a"), ""},
+		{"marker, peer CN unknown host", withMarker(mtlsCtx("ghost"), "ghost"), ""},
+		{"verified marker (peer CN = known source)", withMarker(mtlsCtx("host-a"), "host-a"), "host-a"},
+	}
+	for _, tc := range cases {
+		if got := s.migrateSourceFromPeer(tc.ctx); got != tc.want {
+			t.Errorf("%s: migrateSourceFromPeer = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
 
 // ctTestRepo initialises a fresh pbsstore repo under a temp dir.
 func ctTestRepo(t *testing.T) string {

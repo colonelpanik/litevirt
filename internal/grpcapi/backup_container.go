@@ -61,13 +61,14 @@ const restoreRowRecordedStatus = "cluster-row-recorded"
 const relocateTokenMDKey = "x-litevirt-relocate-token"
 
 // migrateFromMDKey marks a restore as the target side of a cross-host MIGRATE,
-// carrying the source host. When set, RestoreContainer keeps the imported NIC IPs
-// (does NOT re-reserve/blank them) because the source explicitly TRANSFERS its
-// IPAM leases to this host — a move ReserveContainerIP won't infer from a name.
+// carrying the source host. When honored, RestoreContainer keeps the imported NIC
+// IPs (does NOT re-reserve/blank them) because the source has explicitly handed
+// its IPAM leases to this host — a move ReserveContainerIP won't infer from a name.
 const migrateFromMDKey = "x-litevirt-migrate-from-host"
 
-// migrateFromMD reads the migrate source host from incoming gRPC metadata ("" if
-// this restore isn't a migrate).
+// migrateFromMD reads the raw (UNVERIFIED) migrate-source claim from incoming gRPC
+// metadata ("" if absent). Callers must NOT trust this directly — see
+// migrateSourceFromPeer, which is the only path allowed to honor it.
 func migrateFromMD(ctx context.Context) string {
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		if v := md.Get(migrateFromMDKey); len(v) > 0 {
@@ -75,6 +76,36 @@ func migrateFromMD(ctx context.Context) string {
 		}
 	}
 	return ""
+}
+
+// migrateSourceFromPeer returns the migrate source host ONLY when the marker is
+// backed by peer mTLS whose certificate CN matches the claimed source (a known
+// cluster host). RestoreContainer is operator-facing, so an operator/bearer caller
+// — or a peer impersonating a different source — must NOT be able to set this
+// header to skip IP re-reservation and import an address this host doesn't own.
+// An unverified marker is IGNORED (returns ""), degrading safely to the normal
+// reserve-or-blank path rather than rejecting the restore.
+func (s *Server) migrateSourceFromPeer(ctx context.Context) string {
+	claimed := migrateFromMD(ctx)
+	if claimed == "" {
+		return ""
+	}
+	if callerAuthMethod(ctx) != authMethodMTLS {
+		slog.Warn("restore: ignoring migrate-from marker — caller is not a peer mTLS connection",
+			"claimed_source", claimed)
+		return ""
+	}
+	if cn := callerMTLSCommonName(ctx); cn != claimed {
+		slog.Warn("restore: ignoring migrate-from marker — peer cert CN does not match the claimed source",
+			"peer_cn", cn, "claimed_source", claimed)
+		return ""
+	}
+	if h, _ := corrosion.GetHost(ctx, s.db, claimed); h == nil {
+		slog.Warn("restore: ignoring migrate-from marker — claimed source is not a known cluster host",
+			"claimed_source", claimed)
+		return ""
+	}
+	return claimed
 }
 
 // BackupContainer freezes a container, streams its rootfs+config as a full,
@@ -404,8 +435,14 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
-	// Refuse to clobber a live container of the same name on this host.
-	if existing, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); existing != nil {
+	// Refuse to clobber a live container of the same name on this host. Fail CLOSED
+	// on a read error — proceeding could land a restore over an existing container
+	// (and a later cleanup keyed on (host, name) could release its NIC state).
+	existing, gerr := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	if gerr != nil {
+		return status.Errorf(codes.Internal, "check existing container: %v", gerr)
+	}
+	if existing != nil {
 		return status.Errorf(codes.AlreadyExists,
 			"container %q already exists on host %q; delete it first or restore under a different name",
 			req.Name, s.hostName)
@@ -497,12 +534,14 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// unreserved NICs gate the start below: the IMPORTED on-disk config still names
 	// those IPs, so booting would cause the very conflict the blank avoids.
 	//
-	// EXCEPTION — a cross-host MIGRATE (migrate-from set): keep the imported IPs as
-	// is; the source daemon TRANSFERS its IPAM leases to this host explicitly (a
-	// move ReserveContainerIP won't infer from a name), so re-reserving here would
-	// wrongly blank a still-valid address.
+	// EXCEPTION — a VERIFIED cross-host MIGRATE (peer-authenticated migrate-from):
+	// keep the imported IPs as is; the source daemon has handed its IPAM leases to
+	// this host explicitly (a move ReserveContainerIP won't infer from a name), so
+	// re-reserving here would wrongly blank a still-valid address. The marker is
+	// honored only over peer mTLS with a CN matching the source (migrateSourceFromPeer)
+	// — an operator-supplied header falls through to the safe re-reserve path.
 	unreserved := 0
-	if migrateFromMD(ctx) == "" {
+	if s.migrateSourceFromPeer(ctx) == "" {
 		u, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs)
 		if rerr != nil {
 			slog.Warn("container restore: IP re-reservation incomplete (NIC may be re-discovered)",

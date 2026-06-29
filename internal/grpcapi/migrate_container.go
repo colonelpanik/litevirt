@@ -58,8 +58,11 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	if s.containerRuntime == nil {
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
-	// Refuse if the target already owns a container of this name.
-	if existing, _ := corrosion.GetContainer(ctx, s.db, req.TargetHost, req.Name); existing != nil {
+	// Refuse if the target already owns a container of this name. Fail CLOSED on a
+	// read error — we must not migrate onto a name we couldn't prove is free.
+	if existing, gerr := corrosion.GetContainer(ctx, s.db, req.TargetHost, req.Name); gerr != nil {
+		return status.Errorf(codes.Internal, "check target container: %v", gerr)
+	} else if existing != nil {
 		return status.Errorf(codes.AlreadyExists,
 			"container %q already exists on target host %q", req.Name, req.TargetHost)
 	}
@@ -96,9 +99,41 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			return status.Errorf(codes.Internal, "stop for migration: %v", err)
 		}
 	}
+	// srcIfaces is the source's managed NIC set (read once, before the handoff): it
+	// names the IPs that must be source-owned before the transfer and target-owned
+	// after — and source-owned again if we roll back.
+	var srcIfaces []corrosion.ContainerInterfaceRecord
+	// leasesOnTarget tracks whether the IPAM leases have been handed to the target
+	// (done BEFORE the restore so the target owns its IPs before it can run). On
+	// rollback the leases must be handed BACK to the source — it's the source
+	// container we restart, and it must own its IPs again.
+	leasesOnTarget := false
 	// rollback restores the source to its pre-migration state on any failure
 	// before the owner is re-keyed — the container never goes missing.
 	rollback := func(reason error) error {
+		if leasesOnTarget {
+			// Hand the leases back and PROVE the source owns every managed IP again
+			// before we dare restart it — restarting with an IP it no longer owns is
+			// exactly the conflict we're guarding against. An incomplete hand-back
+			// parks the source stopped + operator-stop (the reconciler's guaranteed-
+			// stick marker, so it isn't auto-restarted without IPAM ownership) and
+			// surfaces an explicit "manual repair" error instead of running it.
+			moved, terr := network.TransferContainerLeases(ctx, s.db, req.TargetHost, source, req.Name)
+			ownsAll := false
+			if terr == nil {
+				ownsAll, _ = network.ContainerLeasesOwnedBy(ctx, s.db, source, req.Name, srcIfaces)
+			}
+			if terr != nil || !ownsAll {
+				slog.Error("container migrate: rollback lease hand-back INCOMPLETE — leaving source stopped",
+					"name", req.Name, "moved", moved, "ownsAll", ownsAll, "error", terr)
+				_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "operator-stop")
+				s.audit(ctx, "ct.migrate", req.Name, "project="+project+" rollback IPAM hand-back incomplete: "+reason.Error(), "error")
+				_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FAILED, Error: reason.Error()})
+				return status.Errorf(codes.Internal,
+					"migrate %s: %v (ROLLBACK INCOMPLETE — source left stopped, manual IPAM repair needed)", req.Name, reason)
+			}
+			leasesOnTarget = false
+		}
 		if wasRunning {
 			if serr := s.containerRuntime.StartContainer(ctx, req.Name); serr != nil {
 				slog.Error("container migrate: rollback restart failed", "name", req.Name, "error", serr)
@@ -119,28 +154,54 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		return rollback(fmt.Errorf("archive: %w", err))
 	}
 
+	// Hand the managed IPAM leases to the target BEFORE the restore: the target
+	// keeps the imported IPs (it does not re-reserve a verified migrate), so it must
+	// already OWN every managed IP before it can start the container. The handoff is
+	// MANDATORY and verified per-NIC, derived from the source's managed interface
+	// rows (the IPs the restored container will actually assert) — NOT from a lease
+	// count, which can't see a NIC whose IP lost (or never had) a backing lease.
+	srcIfaces, err = corrosion.GetContainerInterfaces(ctx, s.db, source, req.Name)
+	if err != nil {
+		return rollback(fmt.Errorf("read source NIC rows: %w", err))
+	}
+	// Precondition: the source must cleanly own EVERY managed non-empty IP. If a NIC
+	// names an IP no source lease backs (stale spec, lost/stolen lease), migrating
+	// would hand the target an address it can't own — refuse rather than create a
+	// conflict on the far side.
+	if ownsAll, oerr := network.ContainerLeasesOwnedBy(ctx, s.db, source, req.Name, srcIfaces); oerr != nil {
+		return rollback(fmt.Errorf("verify source NIC ownership: %w", oerr))
+	} else if !ownsAll {
+		return rollback(fmt.Errorf("source does not own every managed NIC IP — refusing to migrate (recreate its NICs first)"))
+	}
+	if _, terr := network.TransferContainerLeases(ctx, s.db, source, req.TargetHost, req.Name); terr != nil {
+		return rollback(fmt.Errorf("transfer IPAM leases to target: %w", terr))
+	}
+	leasesOnTarget = true
+	// Postcondition: EVERY managed non-empty IP is now owned by (ct, target, name).
+	if ownsAll, oerr := network.ContainerLeasesOwnedBy(ctx, s.db, req.TargetHost, req.Name, srcIfaces); oerr != nil {
+		return rollback(fmt.Errorf("verify target NIC ownership: %w", oerr))
+	} else if !ownsAll {
+		return rollback(fmt.Errorf("IPAM lease handoff incomplete — target does not own every managed NIC IP"))
+	}
+
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_RESTORING, Status: "restoring on target"})
 	if err := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning); err != nil {
 		return rollback(fmt.Errorf("restore on %s: %w", req.TargetHost, err))
 	}
 
-	// Re-key: the target's RestoreContainer created the new (target,name) row.
-	// Finalise by removing the source copy — runtime container + soft-deleted
-	// cluster row — so exactly one live row survives the window. Past this point
-	// the migration has succeeded; cleanup failures are logged, not fatal.
+	// Re-key: the target's RestoreContainer created the new (target,name) row and
+	// already owns the IPAM leases (handed over and verified above). Finalise by
+	// removing the source copy — runtime container + soft-deleted cluster row +
+	// source interface rows — so exactly one live row survives the window. Past this
+	// point the migration has succeeded; cleanup failures are logged, not fatal, and
+	// the leases must NOT be handed back (the target owns them now).
+	leasesOnTarget = false
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FINALIZING, Status: "removing source copy"})
 	if err := s.containerRuntime.DeleteContainer(ctx, req.Name); err != nil {
 		slog.Warn("container migrate: source runtime cleanup failed", "name", req.Name, "error", err)
 	}
 	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
 		slog.Warn("container migrate: source row soft-delete failed", "name", req.Name, "error", err)
-	}
-	// Hand the managed IPAM leases to the target EXPLICITLY (source kept them so
-	// the target's restore wouldn't blank the IPs); keyed on the full source owner,
-	// so it's a precise move, not a guess. Then tombstone the source's interface
-	// rows (the target wrote its own). source == s.hostName.
-	if err := network.TransferContainerLeases(ctx, s.db, source, req.TargetHost, req.Name); err != nil {
-		slog.Warn("container migrate: lease transfer to target failed (target may re-discover IPs)", "name", req.Name, "error", err)
 	}
 	if err := corrosion.DeleteContainerInterfaces(ctx, s.db, source, req.Name); err != nil {
 		slog.Warn("container migrate: source interface-row cleanup failed", "name", req.Name, "error", err)

@@ -86,12 +86,11 @@ func TestRestoreContainer_RowWriteFailureCleansUp(t *testing.T) {
 	}, bk); err != nil {
 		t.Fatalf("BackupContainer: %v", err)
 	}
-	// Remove the live row (so restore proceeds past the AlreadyExists guard) AND
-	// drop the table so the restore's row write fails after the import succeeds.
+	// Remove the live row so restore proceeds past the AlreadyExists guard, then
+	// drop the table DURING the import (after the handler's same-name preflight) so
+	// the restore's row write fails once the runtime container already exists.
 	_ = corrosion.DeleteContainer(ctx, s.db, "host-a", "ct1")
-	if err := s.db.Execute(ctx, `DROP TABLE containers`); err != nil {
-		t.Fatalf("drop containers: %v", err)
-	}
+	rt.importHook = func() { _ = s.db.Execute(ctx, `DROP TABLE containers`) }
 
 	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
 	err := s.RestoreContainer(&pb.RestoreContainerRequest{

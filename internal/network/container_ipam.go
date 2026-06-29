@@ -54,13 +54,46 @@ func ReleaseContainerLeases(ctx context.Context, db *corrosion.Client, host, ctN
 // fromHost to toHost (owner_host: fromHost→toHost), keyed on the FULL prior owner
 // (ct, fromHost, ctName) so it's precise — never touches a same-named container
 // on a third host. The mover (migrate) uses it for an explicit cross-host handoff,
-// which ReserveContainerIP deliberately won't infer.
-func TransferContainerLeases(ctx context.Context, db *corrosion.Client, fromHost, toHost, ctName string) error {
+// which ReserveContainerIP deliberately won't infer. Returns the number of leases
+// moved so the caller can assert the handoff was complete (every held lease).
+//
+// allocated_at is RESET to now on the new owner: the orphan-lease GC keys off the
+// lease's age, so a transferred lease (which keeps its original, possibly old,
+// timestamp) must restart its age clock on the target — otherwise the target's GC
+// could immediately reclaim it in the brief window before the migrated container
+// row is visible there.
+func TransferContainerLeases(ctx context.Context, db *corrosion.Client, fromHost, toHost, ctName string) (int64, error) {
 	now := db.NowTS()
-	return db.Execute(ctx,
-		`UPDATE ip_allocations SET owner_host = ?, updated_at = ?
+	allocAt := time.Now().UTC().Format(time.RFC3339)
+	return db.ExecuteRows(ctx,
+		`UPDATE ip_allocations SET owner_host = ?, allocated_at = ?, updated_at = ?
 		 WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL`,
-		toHost, now, fromHost, ctName)
+		toHost, allocAt, now, fromHost, ctName)
+}
+
+// ContainerLeasesOwnedBy reports whether (ct, host, ctName) owns the live IPAM
+// lease for EVERY non-empty IP among ifaces — the per-NIC handoff invariant the
+// migrate finaliser checks both BEFORE and AFTER the lease transfer. A managed NIC
+// whose IP has no live lease, or whose lease is held by another owner, makes it
+// return false. This is stricter than counting leases: a count can't catch a
+// container_interfaces / create-spec NIC whose IP was never (or is no longer)
+// backed by a source lease — exactly the case where the target, skipping
+// re-reservation on a verified migrate, would otherwise start an unowned/
+// conflicting address.
+func ContainerLeasesOwnedBy(ctx context.Context, db *corrosion.Client, host, ctName string, ifaces []corrosion.ContainerInterfaceRecord) (bool, error) {
+	for _, ifc := range ifaces {
+		if ifc.IP == "" {
+			continue
+		}
+		ok, err := ipLeaseHeldBy(ctx, db, ifc.NetworkName, ifc.IP, "ct", host, ctName)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // ReleaseOrphanContainerLeases tombstones CT leases on host whose owner has no

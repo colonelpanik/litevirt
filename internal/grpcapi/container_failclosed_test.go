@@ -25,11 +25,10 @@ func TestCreateContainer_RowWriteFailure_CleansUpRuntime(t *testing.T) {
 	rt := &fakeCTRuntime{}
 	s.SetContainerRuntime(rt)
 
-	// Break the cluster-row write so UpsertContainer fails after the runtime
-	// container is created.
-	if err := s.db.Execute(ctx, `DROP TABLE containers`); err != nil {
-		t.Fatalf("drop containers: %v", err)
-	}
+	// Break the cluster-row write AFTER the runtime container is created (the hook
+	// fires inside the runtime CreateContainer call, past the handler's same-name
+	// preflight), so CreateContainerAtomic fails and the fail-closed cleanup runs.
+	rt.createHook = func() { _ = s.db.Execute(ctx, `DROP TABLE containers`) }
 
 	_, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
 		Name: "web", Template: "download", Distro: "alpine", Release: "3.19",

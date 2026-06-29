@@ -83,7 +83,15 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// failure cleanup safe (this is the only live container of this name on the host).
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
-	if existing, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); existing != nil {
+	// Fail CLOSED on a read error: if we can't prove the name is free, a later
+	// cleanup keyed on (host, name) could release an existing container's managed
+	// NIC state — so never proceed to allocate leases / touch the runtime on a
+	// read we couldn't complete.
+	existing, gerr := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	if gerr != nil {
+		return nil, status.Errorf(codes.Internal, "check existing container: %v", gerr)
+	}
+	if existing != nil {
 		return nil, status.Errorf(codes.AlreadyExists, "container %q already exists on host %q", req.Name, s.hostName)
 	}
 
@@ -281,11 +289,18 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// prior delete may have tombstoned the container row but failed these, so a
 	// retry (now zero-row) must still clean them up, else a later same-host/name
 	// recreate inherits stale leases/rows.
-	if err := s.releaseContainerNICs(ctx, req.Name); err != nil {
-		slog.Warn("container delete: failed to release managed NICs (leases/interface rows may linger, GC'able)", "name", req.Name, "error", err)
-	}
+	nicErr := s.releaseContainerNICs(ctx, req.Name)
 	if err := corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name); err != nil {
 		slog.Warn("container delete: failed to clear restart state (harmless, GC'able)", "name", req.Name, "error", err)
+	}
+	// The managed-NIC cascade is part of the CT network invariant: a stale lease or
+	// interface row would be inherited by a later same-host/same-name recreate —
+	// which makes the name live again and so hides the orphan from the lease GC.
+	// Surface a cascade failure so the caller retries; the whole delete is
+	// idempotent (runtime not-found OK, row tombstone zero-row OK, cascade re-runs).
+	if nicErr != nil {
+		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
+		return nil, status.Errorf(codes.Internal, "delete: release managed NICs: %v", nicErr)
 	}
 	if errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		// Idempotent: the row was already gone. Audited distinctly, not a silent "ok".

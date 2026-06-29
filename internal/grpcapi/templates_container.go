@@ -115,7 +115,11 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"source %q must be a template or stopped to clone (current: %s)", req.Source, src.State)
 	}
-	if existing, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Target); existing != nil {
+	// Fail CLOSED on a read error — never clone onto a name we couldn't prove free
+	// (a later cleanup keyed on (host, name) could release an existing CT's NICs).
+	if existing, gerr := corrosion.GetContainer(ctx, s.db, s.hostName, req.Target); gerr != nil {
+		return nil, status.Errorf(codes.Internal, "check existing container: %v", gerr)
+	} else if existing != nil {
 		return nil, status.Errorf(codes.AlreadyExists, "container %q already exists on host %q", req.Target, s.hostName)
 	}
 

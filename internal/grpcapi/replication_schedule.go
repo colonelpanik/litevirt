@@ -37,9 +37,33 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 		if err != nil || vm == nil {
 			return nil, status.Errorf(codes.NotFound, "vm %q not found", req.VmName)
 		}
+		// Resolve the host that will actually hold the replica (mirroring the runner's
+		// selection) so we (a) admit against the right pool — pools are host-scoped —
+		// and (b) don't persist a schedule that can never run. Explicit target_host
+		// wins; else the VM's host if it has the pool; else any active peer with it.
+		tgtHost := req.TargetHost
+		if tgtHost == "" {
+			if _, ok, _ := corrosion.GetStoragePool(ctx, s.db, vm.HostName, req.TargetPool); ok {
+				tgtHost = vm.HostName
+			} else if peers, _ := corrosion.HostsWithPool(ctx, s.db, req.TargetPool, ""); len(peers) > 0 {
+				tgtHost = peers[0]
+			} else {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"no active host has pool %q; set target_host explicitly", req.TargetPool)
+			}
+		}
+		// Verify the target pool actually EXISTS on the chosen host — including an
+		// EXPLICIT target_host — so we don't persist a schedule that fails every tick
+		// (the admission below no-ops on a missing pool, so it can't catch this).
+		if _, ok, err := corrosion.GetStoragePool(ctx, s.db, tgtHost, req.TargetPool); err != nil {
+			return nil, status.Errorf(codes.Internal, "lookup target pool: %v", err)
+		} else if !ok {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"target pool %q not found on host %q", req.TargetPool, tgtHost)
+		}
 		// Project isolation: don't let a schedule target another project's pool.
 		// (The runner re-checks at run time too — defense in depth.)
-		if err := s.admitVMPoolUse(ctx, vm, req.TargetHost, req.TargetPool); err != nil {
+		if err := s.admitVMPoolUse(ctx, vm, tgtHost, req.TargetPool); err != nil {
 			return nil, err
 		}
 	case "pool":

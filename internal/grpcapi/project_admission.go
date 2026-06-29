@@ -46,7 +46,7 @@ func (s *Server) admitNetworkAttach(ctx context.Context, wlProject, networkName 
 		return status.Errorf(codes.Internal, "network admission lookup %q: %v", networkName, err)
 	}
 	if nr == nil {
-		return s.admitRawBridge(wlProject, networkName)
+		return s.admitRawBridge(ctx, networkName)
 	}
 	if !tenancy.AdmitAttach(wlProject, nr.Project) {
 		return status.Errorf(codes.PermissionDenied,
@@ -56,15 +56,18 @@ func (s *Server) admitNetworkAttach(ctx context.Context, wlProject, networkName 
 	return nil
 }
 
-// admitRawBridge gates a raw/unmanaged bridge attachment (no managed network row).
-// A named-project workload is denied — it must use a managed network so isolation,
-// SGs, IPAM and firewall bindings apply; the default project / root keeps the
-// legacy escape hatch. ref is the bridge/name for the error message.
-func (s *Server) admitRawBridge(wlProject, ref string) error {
-	if tenancy.NormalizeProject(wlProject) != tenancy.Default {
+// admitRawBridge gates a raw/unmanaged bridge attachment (a name with no managed
+// network row). A raw bridge is OUTSIDE isolation (no project / SG / IPAM / firewall
+// bindings) and a name can collide with another project's RENDERED bridge, so it's
+// the ADMIN escape hatch — gated on the CALLER's cluster-root network authority,
+// NOT on the workload's project (_default is a tenant, not root, so a _default
+// workload could otherwise reach an owned network's bridge by raw name). A
+// cluster/root operator (or a legacy cluster-wide operator via the role fallback)
+// passes; a project-scoped caller must use a managed network.
+func (s *Server) admitRawBridge(ctx context.Context, ref string) error {
+	if err := s.RequirePerm(ctx, "/", "network.create", "operator"); err != nil {
 		return status.Errorf(codes.PermissionDenied,
-			"project %q workloads must attach to a managed network, not a raw/unmanaged bridge %q",
-			tenancy.NormalizeProject(wlProject), ref)
+			"attaching to a raw/unmanaged bridge %q requires cluster-root network authority; use a managed network", ref)
 	}
 	return nil
 }

@@ -107,6 +107,15 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 		return err
 	}
 
+	// Project isolation: the VM's project may promote a replica only from a pool
+	// that is global or one it owns — checked against the RESOLVED replica host
+	// before relaying, so a cross-project promote is rejected at the entry. (Safe
+	// for the trusted failover path: a VM's own replica lives in its own/global
+	// pool, and pre-v37 pools are all global.)
+	if err := s.admitVMPoolUse(ctx, vm, host, pool); err != nil {
+		return err
+	}
+
 	// The replica file + libvirt live on `host`; forward there if it isn't us.
 	if host != s.hostName {
 		fwd := &pb.PromoteReplicaRequest{
@@ -269,6 +278,11 @@ func (s *Server) relayPromote(ctx context.Context, host string, req *pb.PromoteR
 func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, src *corrosion.DiskRecord, pool, replica string, send func(*pb.PromoteReplicaProgress) error) error {
 	if s.virt == nil {
 		return status.Error(codes.FailedPrecondition, "no libvirt backend on this host")
+	}
+	// Defense in depth: the pool lives on this host, so re-check project ownership
+	// locally — a relayed/peer-direct call must not promote from a foreign pool.
+	if err := s.admitVMPoolUse(ctx, vm, s.hostName, pool); err != nil {
+		return err
 	}
 	poolRef, ok := s.resolvePool(ctx, pool)
 	if !ok {

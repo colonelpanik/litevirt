@@ -64,25 +64,32 @@ func TestCreateContainer_NetworkProjectAdmission(t *testing.T) {
 	}
 }
 
-// TestCreateContainer_NamedProjectDeniesRawBridge: a NAMED-project container may
-// not attach to a raw/unmanaged bridge (outside isolation); the default project
-// keeps the legacy escape hatch.
-func TestCreateContainer_NamedProjectDeniesRawBridge(t *testing.T) {
+// TestAdmitRawBridge_RootGated: a raw/unmanaged bridge is the ADMIN escape hatch —
+// allowed only with cluster-root network authority (admin/root, or a legacy
+// cluster-wide operator via the role fallback), denied for a non-root caller. It's
+// gated on the CALLER, not the workload's project (_default is a tenant, not root).
+// Wired into VM + container create.
+func TestAdmitRawBridge_RootGated(t *testing.T) {
 	s := testServer(t)
-	ctx := adminCtx()
-	s.SetContainerRuntime(&fakeCTRuntime{})
-
-	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
-		Name: "raw-named", Template: "download", Distro: "alpine", Project: "acme",
-		Networks: []*pb.ContainerNetwork{{Name: "eth0", Bridge: "br-raw"}},
-	}); status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("named-project raw bridge: got %v, want PermissionDenied", err)
+	if err := s.admitRawBridge(adminCtx(), "br-raw"); err != nil {
+		t.Errorf("root/admin caller should be allowed a raw bridge: %v", err)
 	}
-	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
-		Name: "raw-default", Template: "download", Distro: "alpine",
+	if err := s.admitRawBridge(viewerCtx(), "br-raw"); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("non-root caller raw bridge: got %v, want PermissionDenied", err)
+	}
+}
+
+// TestCreateContainer_RootCanUseRawBridge: the wiring still lets a cluster-root
+// caller (admin) attach a container to a raw bridge — the legacy escape hatch is
+// preserved for admins (only project-scoped/non-root callers are restricted).
+func TestCreateContainer_RootCanUseRawBridge(t *testing.T) {
+	s := testServer(t)
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	if _, err := s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{
+		Name: "raw-ok", Template: "download", Distro: "alpine",
 		Networks: []*pb.ContainerNetwork{{Name: "eth0", Bridge: "br-raw"}},
 	}); err != nil {
-		t.Fatalf("default-project raw bridge should be allowed: %v", err)
+		t.Fatalf("root caller raw bridge should be allowed: %v", err)
 	}
 }
 
@@ -107,6 +114,24 @@ func TestReplicationSchedule_CrossProjectPoolDenied(t *testing.T) {
 	})
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("cross-project replication target pool: got %v, want PermissionDenied", err)
+	}
+}
+
+// TestReplicationSchedule_MissingTargetPoolRejected: an explicit target_host whose
+// pool doesn't exist is rejected at CREATE, not persisted to fail every tick.
+func TestReplicationSchedule_MissingTargetPoolRejected(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: s.hostName, State: "stopped",
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.CreateReplicationSchedule(ctx, &pb.CreateReplicationScheduleRequest{
+		Scope: "vm", VmName: "vm1", TargetPool: "nope", TargetHost: s.hostName, Cron: "0 0 * * *",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("missing target pool: got %v, want FailedPrecondition", err)
 	}
 }
 

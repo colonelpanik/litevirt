@@ -102,7 +102,7 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			if ref == "" {
 				ref = n.NetworkName
 			}
-			if err := s.admitRawBridge(project, ref); err != nil {
+			if err := s.admitRawBridge(ctx, ref); err != nil {
 				return nil, err
 			}
 			// Pass through verbatim. No managed state.

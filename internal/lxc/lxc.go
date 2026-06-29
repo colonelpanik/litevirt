@@ -39,6 +39,12 @@ import (
 // metrics collector) skip the usage sample via errors.Is rather than logging.
 var ErrStatsUnavailable = errors.New("container cgroup stats unavailable")
 
+// ErrContainerNotFound is returned (wrapped) by Delete when lxc-destroy reports
+// the container does not exist. The fail-closed DeleteContainer handler tests it
+// with errors.Is to treat deletion as idempotent (a runtime that's already gone
+// is success) — without string-matching command output up in the gRPC layer.
+var ErrContainerNotFound = errors.New("container not found")
+
 // ContainerStats is a point-in-time cgroup-v2 usage sample for a container.
 type ContainerStats struct {
 	CPUUsageUsec uint64 // cumulative CPU time (cpu.stat usage_usec)
@@ -343,9 +349,28 @@ func (r *LxcRunner) Stop(ctx context.Context, name string, timeoutSec int) error
 // running"), so `lv ct rm` and `compose down` of a running container would fail.
 func (r *LxcRunner) Delete(ctx context.Context, name string) error {
 	if _, stderr, err := r.run(ctx, "lxc-destroy", "-f", "-n", name); err != nil {
+		if containerNotFoundStderr(stderr) {
+			// Classify here (in the runtime layer) so callers use errors.Is and
+			// never string-match lxc-* output.
+			return fmt.Errorf("%w: lxc-destroy %s: %s", ErrContainerNotFound, name, strings.TrimSpace(string(stderr)))
+		}
 		return cmdErr("lxc-destroy", name, stderr, err)
 	}
 	return nil
+}
+
+// containerNotFoundStderr reports whether lxc-destroy's stderr indicates the
+// container does not exist (so deletion is a no-op). lxc-destroy phrases this a
+// few ways across versions ("not defined", "doesn't exist", "Failed to load
+// config").
+func containerNotFoundStderr(stderr []byte) bool {
+	s := strings.ToLower(string(stderr))
+	for _, m := range []string{"not defined", "doesn't exist", "does not exist", "no such", "not found", "failed to load config"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // execPATH is injected into the attach context so a bare command (e.g. "cat")

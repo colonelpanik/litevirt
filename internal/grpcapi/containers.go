@@ -124,10 +124,16 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		CreatedAt:     now,
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
-		// Container exists in LXC but not in cluster state — log; the
-		// next List will repopulate via ContainerRuntime.ListContainers.
-		slog.Warn("container created but cluster row write failed",
-			"name", info.Name, "error", err)
+		// Fail closed: the runtime container was created but the cluster row write
+		// failed. A "success" here would strand an untracked container (wrong
+		// quota/accounting, invisible to failover). Best-effort delete the
+		// just-created container, then return an error. (Mirrors RestoreContainer.)
+		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
+			slog.Warn("container create: cleanup after cluster-row-write failure also failed",
+				"name", info.Name, "error", delErr)
+		}
+		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
+		return nil, status.Errorf(codes.Internal, "create: record cluster row: %v", err)
 	}
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
@@ -150,17 +156,34 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
-	// A template is a frozen clone source — refuse to start it (mirrors VMs).
-	if rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); rec != nil && rec.IsTemplate {
+	// Preflight the cluster row BEFORE touching the runtime: a missing/soft-deleted
+	// row means we'd start an UNTRACKED container, so refuse. (Also folds in the
+	// template check — a frozen clone source can't be started.)
+	rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	if rec == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "container %q not found on host %q", req.Name, s.hostName)
+	}
+	if rec.IsTemplate {
 		return nil, status.Errorf(codes.FailedPrecondition, "%q is a template and cannot be started; clone it instead", req.Name)
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
-	// Clear any prior stop intent (e.g. 'operator-stop') so a subsequent
-	// unexpected stop is correctly treated as unexpected by the reconciler.
-	_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "running", "")
+	// Clear any prior stop intent ('operator-stop') so a later unexpected stop is
+	// judged fresh. Strict: if the row vanished mid-flight the container is now
+	// untracked → stop it and error; a transient DB error leaves it running + errors.
+	if err := corrosion.SetContainerStateDetailStrict(ctx, s.db, s.hostName, req.Name, "running", ""); err != nil {
+		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
+		if errors.Is(err, corrosion.ErrNoRowsAffected) {
+			if stopErr := s.containerRuntime.StopContainer(ctx, req.Name, 0); stopErr != nil {
+				slog.Warn("container start: failed to stop now-untracked container after its row vanished",
+					"name", req.Name, "error", stopErr)
+			}
+			return nil, status.Errorf(codes.FailedPrecondition, "container %q row vanished during start; stopped to avoid an untracked container", req.Name)
+		}
+		return nil, status.Errorf(codes.Internal, "start: clear stop intent: %v", err)
+	}
 	s.audit(ctx, "ct.start", req.Name, "project="+project, "ok")
 	return &emptypb.Empty{}, nil
 }
@@ -185,9 +208,14 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 		s.audit(ctx, "ct.stop", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "stop: %v", err)
 	}
-	// Record operator intent so the container reconciler leaves it stopped
-	// (the container analogue of StopVM writing vms.state_detail='operator-stop').
-	_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "stopped", "operator-stop")
+	// Record operator intent so the container reconciler leaves it stopped (the
+	// container analogue of StopVM's vms.state_detail='operator-stop'). Strict:
+	// this marker is load-bearing — without it the reconciler auto-restarts the
+	// container — so a missing-row / failed write must surface, not silently pass.
+	if err := corrosion.SetContainerStateDetailStrict(ctx, s.db, s.hostName, req.Name, "stopped", "operator-stop"); err != nil {
+		s.audit(ctx, "ct.stop", req.Name, "project="+project, "error")
+		return nil, status.Errorf(codes.Internal, "stop: record operator-stop intent: %v", err)
+	}
 	s.audit(ctx, "ct.stop", req.Name, "project="+project, "ok")
 	return &emptypb.Empty{}, nil
 }
@@ -209,12 +237,23 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
-	if err := s.containerRuntime.DeleteContainer(ctx, req.Name); err != nil {
+	// A runtime "not found" is acceptable (idempotent) — proceed to the row
+	// tombstone so a retry after "runtime gone but DB write failed" can clear the
+	// ghost row. A real runtime failure still aborts.
+	if err := s.containerRuntime.DeleteContainer(ctx, req.Name); err != nil && !errors.Is(err, lxc.ErrContainerNotFound) {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
-	_ = corrosion.DeleteContainer(ctx, s.db, s.hostName, req.Name)
-	_ = corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name)
+	// Mandatory tombstone: a ghost (stale-live) row skews quota + makes failover
+	// chase a container that no longer exists. An already-gone row
+	// (ErrNoRowsAffected) is the idempotent no-op; a real DB error surfaces.
+	if err := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name); err != nil && !errors.Is(err, corrosion.ErrNoRowsAffected) {
+		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
+		return nil, status.Errorf(codes.Internal, "delete: remove cluster row: %v", err)
+	}
+	if err := corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name); err != nil {
+		slog.Warn("container delete: failed to clear restart state (harmless, GC'able)", "name", req.Name, "error", err)
+	}
 	s.audit(ctx, "ct.delete", req.Name, "project="+project, "ok")
 	slog.Info("container deleted", "name", req.Name, "host", s.hostName)
 	return &emptypb.Empty{}, nil

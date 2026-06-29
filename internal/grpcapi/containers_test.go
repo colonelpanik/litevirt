@@ -33,6 +33,7 @@ type fakeCTRuntime struct {
 
 	createErr error
 	createOut *ContainerInfo
+	deleteErr error
 
 	// ipByName lets a test simulate a locally-discovered (e.g. DHCP) container
 	// IP — what IPContainer (lxc-info -iH) would return on the LB host.
@@ -94,7 +95,7 @@ func (f *fakeCTRuntime) DeleteContainer(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, name)
-	return nil
+	return f.deleteErr
 }
 func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []string) (ContainerExecResult, error) {
 	f.mu.Lock()

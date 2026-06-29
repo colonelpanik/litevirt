@@ -3,9 +3,17 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrNoRowsAffected is returned by the strict container-lifecycle write helpers
+// when the guarded UPDATE matches zero live rows — i.e. the container row is
+// missing or already soft-deleted. Callers use errors.Is to distinguish "the
+// row vanished" from a transient DB error (the former is a fail-closed signal,
+// not a success). Mirrors the zero-row-consume-guard used for single-use tokens.
+var ErrNoRowsAffected = errors.New("no rows affected")
 
 // Reserved labels litevirt uses to manage compose-deployed containers. They
 // live here (the lowest layer) so corrosion, compose, grpcapi, and the daemon
@@ -197,6 +205,26 @@ func SetContainerStateDetail(ctx context.Context, c *Client, hostName, name, sta
 		state, detail, now, hostName, name)
 }
 
+// SetContainerStateDetailStrict is SetContainerStateDetail that treats a zero-row
+// UPDATE (the row is missing or already soft-deleted) as ErrNoRowsAffected
+// instead of a silent success. The fail-closed container lifecycle uses it so a
+// Stop/Start that can't record its state change surfaces, rather than leaving
+// the runtime and the cluster row to diverge.
+func SetContainerStateDetailStrict(ctx context.Context, c *Client, hostName, name, state, detail string) error {
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		state, detail, now, hostName, name)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // ContainerRelocateRecreateDetail is the state_detail the failover coordinator
 // stamps on a container it re-homes after a host loss. The target host's
 // container reconciler reads it to recreate the container from its image (B5).
@@ -305,6 +333,27 @@ func DeleteContainer(ctx context.Context, c *Client, hostName, name string) erro
 		`UPDATE containers SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ?`,
 		nowRFC3339(), now, hostName, name)
+}
+
+// DeleteContainerStrict soft-deletes a LIVE row (WHERE deleted_at IS NULL) and
+// reports ErrNoRowsAffected when nothing matched — i.e. the row was already gone.
+// The fail-closed DeleteContainer handler uses it so a real DB failure surfaces
+// (codes.Internal) while an already-tombstoned row is the idempotent no-op the
+// caller can treat as success. (Plain DeleteContainer lacks the deleted_at guard,
+// so it would "affect one row" re-deleting a tombstone and hide that case.)
+func DeleteContainerStrict(ctx context.Context, c *Client, hostName, name string) error {
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE containers SET deleted_at = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		nowRFC3339(), now, hostName, name)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRowsAffected
+	}
+	return nil
 }
 
 // GetContainer returns one container row (including soft-deleted, so

@@ -74,6 +74,31 @@ func TestGenerateDomainXML_BIOS(t *testing.T) {
 	if strings.Contains(xmlOut, "guest_agent") {
 		t.Error("guest agent should not be present when GuestAgent=false")
 	}
+	// Regression: libvirt's <os><boot dev=...> accepts only fd|hd|cdrom|network,
+	// never "disk". The default boot ("disk") must be emitted as "hd", or
+	// DomainDefineXML rejects the VM with
+	// "Invalid value for attribute 'dev' in element 'boot': 'disk'".
+	if !strings.Contains(xmlOut, `<boot dev="hd">`) {
+		t.Errorf("BIOS mode should emit <boot dev=\"hd\">; got:\n%s", xmlOut)
+	}
+	if strings.Contains(xmlOut, `<boot dev="disk"`) {
+		t.Error(`BIOS mode must not emit <boot dev="disk"> (invalid libvirt value)`)
+	}
+}
+
+func TestLibvirtBootDev(t *testing.T) {
+	cases := map[string]string{
+		"disk":    "hd",
+		"":        "hd",
+		"cdrom":   "cdrom",
+		"network": "network",
+		"weird":   "hd",
+	}
+	for in, want := range cases {
+		if got := libvirtBootDev(in); got != want {
+			t.Errorf("libvirtBootDev(%q) = %q, want %q", in, got, want)
+		}
+	}
 }
 
 func TestGenerateDomainXML_ISOBoot(t *testing.T) {

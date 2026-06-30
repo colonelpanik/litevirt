@@ -148,6 +148,27 @@ unrelated row also diverges is a future optimization). In practice this cost is
 paid only by genuinely-stuck rows awaiting repair.
 
 Resolve an unresolved row by making one side authoritative with a fresh write —
-which clears the tracking and lets the table converge. A VM ownership split is
-repaired with `lv doctor repair-owner <vm> <host>` (re-stamps the running host
-with a new timestamp so it wins everywhere by ordinary LWW).
+which clears the tracking and lets the table converge.
+
+### VM ownership ties — automatic and manual repair
+
+A `vms.host_name` split is the runtime-owned category: the resolver keeps it
+local (never picks an owner by value) and defers to runtime repair.
+
+- **Automatic (runtime owner-assert).** Each host's reconciler watches for a VM
+  that runs **locally** but whose DB row points at another host. Before
+  reclaiming it, it queries **every other active host's local libvirt** (the
+  peer-only `CheckVMRuntime` RPC) and re-stamps ownership to itself **only when
+  all of them answer `absent`**, no migration/lease marker is present, and the
+  condition has persisted past a short debounce. If any host reports `running`
+  it's a true split-brain → it refuses to act and logs an alert (destruction
+  needs fencing proof, never a host-order coin-flip). If any host is unreachable
+  or holds a stale definition → inconclusive → it retries later. This is why a
+  segmented host's VM (e.g. one the rest of the fleet can't reach) is left for
+  manual repair rather than auto-reclaimed.
+- **Manual.** `lv doctor repair-owner <vm> <host>` forwards to `<host>`, which
+  re-stamps ownership only if it confirms the VM runs there locally. Use it for
+  the segmented case, or to force a specific owner the operator knows is correct.
+
+Either way the fresh timestamp wins everywhere by ordinary LWW and clears the
+unresolved tracking.

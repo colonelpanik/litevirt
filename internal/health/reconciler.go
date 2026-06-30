@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -37,6 +38,22 @@ type Reconciler struct {
 	// time.Now; the fleet harness overrides it so lock-expiry scenarios advance
 	// deterministically without sleeping.
 	Now func() time.Time
+
+	// checkPeerRuntime asks a peer for its LOCAL libvirt view of a VM
+	// (absent/defined_stopped/running/unknown) — injected by the daemon (it wires
+	// the gRPC CheckVMRuntime client). nil disables runtime owner-assert (e.g. in
+	// tests that don't exercise it). See SetPeerRuntimeChecker.
+	checkPeerRuntime func(ctx context.Context, host, name string) (string, error)
+	// onOwnerAssert observes each owner-assert decision (result ∈ asserted /
+	// split_brain / inconclusive / error) — nil-safe; tests assert on it and
+	// Phase 5 can wire a metric. See SetOwnerAssertObserver.
+	onOwnerAssert func(vm, result string)
+
+	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
+	// was first observed running-locally-but-owned-elsewhere, so a transient
+	// in-flight ownership move isn't reclaimed before its marker lands.
+	ownerMu            sync.Mutex
+	ownershipFirstSeen map[string]time.Time
 }
 
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1) so the
@@ -89,6 +106,7 @@ func (r *Reconciler) SetBackupInProgress(fn func(vmName string) bool) {
 func (r *Reconciler) ReconcileOnce(ctx context.Context) {
 	r.reconcile(ctx)
 	r.selfFence(ctx)
+	r.assertRuntimeOwnership(ctx)
 }
 
 // Start begins the reconcile loop. Blocks until ctx is cancelled.
@@ -102,6 +120,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 		case <-ticker.C:
 			r.reconcile(ctx)
 			r.selfFence(ctx)
+			r.assertRuntimeOwnership(ctx)
 		}
 	}
 }

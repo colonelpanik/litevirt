@@ -412,6 +412,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
+	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
+	// row points elsewhere against every other active host's libvirt before
+	// reclaiming it.
+	reconciler.SetPeerRuntimeChecker(svc.CheckPeerVMRuntime)
 
 	// Rebalance executor: leader-gated loop that applies operator-approved
 	// migration proposals (rc above only *proposes*). Reuses the rebalancer's

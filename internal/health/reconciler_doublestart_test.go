@@ -151,6 +151,27 @@ func TestReconciler_SelfFence_ResumableStateNotDestroyed(t *testing.T) {
 	}
 }
 
+// Defensive: a cleanable REASON under a non-"stopped" coarse state is still NOT
+// cleaned (both conditions must hold). Can't happen under the current real mapping
+// — guards a future reason/state decoupling.
+func TestReconciler_SelfFence_CleanableReasonButNotStopped(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateRunning) // coarse state "running"
+	fake.SetStateReason("vm1", "destroyed")        // a cleanable reason, but state isn't "stopped"
+
+	NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
+
+	if wasDestroyed(fake, "vm1") {
+		t.Fatal("selfFence must require BOTH a stopped state AND a clearly-dead reason")
+	}
+}
+
 // An unreadable state fails closed — it could be a running domain mid-query.
 func TestReconciler_SelfFence_UnreadableNotDestroyed(t *testing.T) {
 	db := testReconcilerDB(t)

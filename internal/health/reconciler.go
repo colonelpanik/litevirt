@@ -297,7 +297,7 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// coarse DomainState, because the latter collapses paused/pm-suspended/
 			// saved/shutoff all into "stopped" and would destroy resumable workloads.
 			st, serr := r.virt.DomainStateReason(domName)
-			if serr != nil || !cleanableDomainReason(st.Reason) {
+			if serr != nil || !cleanableLeftover(st) {
 				slog.Warn("reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair",
 					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", st.State, "reason", st.Reason, "state_err", serr)
 				continue
@@ -316,15 +316,25 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 	}
 }
 
-// cleanableDomainReason is the allowlist of DomainStateReason values that mark a
-// local domain as a CLEARLY-DEAD leftover — no live or resumable state — so it is
-// safe to destroy+undefine when its DB row has moved to another host. It is an
-// allowlist (default: do NOT clean) so any state holding recoverable memory
-// (paused, pmsuspended, saved), in transition (shutting-down, migrated,
-// from-snapshot), needing investigation (crashed), or unknown/unreadable is
-// skipped — the Phase-1 guard fails closed and defers to runtime ownership repair.
-func cleanableDomainReason(reason string) bool {
-	switch reason {
+// cleanableLeftover reports whether a local domain is a CLEARLY-DEAD leftover —
+// no live or resumable state — so it is safe to destroy+undefine when its DB row
+// has moved to another host. Both conditions must hold (positive proof, fail
+// closed):
+//
+//   - coarse State == "stopped" — defensive belt-and-suspenders. Today the
+//     cleanable reasons below all originate from DomainShutoff (which coarse-maps
+//     to "stopped"), so this is redundant against the current mapping; it guards
+//     against a future reason/state decoupling silently re-admitting a non-stopped
+//     (possibly live) domain to destruction.
+//   - Reason in the allowlist below. An allowlist (default: do NOT clean) so any
+//     state holding recoverable memory (paused, pmsuspended, saved), in transition
+//     (shutting-down, migrated, from-snapshot), needing investigation (crashed), or
+//     unknown/unreadable is skipped and deferred to Phase-3 runtime ownership repair.
+func cleanableLeftover(st lv.DomainStatus) bool {
+	if st.State != "stopped" {
+		return false
+	}
+	switch st.Reason {
 	case "guest-shutdown", // guest cleanly powered itself off
 		"destroyed", // forcibly destroyed — no state retained
 		"daemon",    // shut off by the daemon

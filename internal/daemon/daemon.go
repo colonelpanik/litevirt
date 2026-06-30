@@ -416,6 +416,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// row points elsewhere against every other active host's libvirt before
 	// reclaiming it.
 	reconciler.SetPeerRuntimeChecker(svc.CheckPeerVMRuntime)
+	// Runtime ownership repair metrics (Phase 5): VM owner-assert + CT re-key
+	// outcomes → litevirt_runtime_owner_assert_total.
+	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
+	reconciler.SetOwnerAssertObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("vm", result) })
 
 	// Rebalance executor: leader-gated loop that applies operator-approved
 	// migration proposals (rc above only *proposes*). Reuses the rebalancer's
@@ -511,6 +515,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// whose only live DB row points elsewhere against every workload-capable peer
 	// before reclaiming it (a PK re-key).
 	ctChecker.SetPeerContainerRuntimeChecker(svc.CheckPeerContainerRuntime)
+	ctChecker.SetContainerRekeyObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("ct", result) })
 	go ctChecker.Start(ctx)
 
 	// wire the libvirt blockdev-mirror driver so MoveVolume

@@ -439,7 +439,11 @@ func (c *Client) resolveTie(table string, cols []string, local, incoming []inter
 			c.trackUnresolved(table, pkKeyAt(incoming, pkIdx), local, incoming, path, d.category)
 			return true, true
 		}
-		c.observeTieBreak(table, d.resolver, winnerLabel(d.keepLocal))
+		if d.resolver == "tombstone" {
+			c.observeTombstoneTie(table)
+		} else {
+			c.observeTieBreak(table, d.resolver, winnerLabel(d.keepLocal))
+		}
 		return d.keepLocal, false
 	}
 	// A well-formed chain always ends in a terminal rule, so this is unreachable;

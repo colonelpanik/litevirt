@@ -20,6 +20,7 @@ type AntiEntropyMetrics struct {
 	rowsSkipped   prometheus.Counter
 	tieBreaks     *prometheus.CounterVec
 	tieUnresolved *prometheus.CounterVec
+	tombstoneTies *prometheus.CounterVec
 }
 
 // NewAntiEntropyMetrics registers the anti-entropy timing metrics on the default
@@ -63,8 +64,12 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Name: "litevirt_lww_tie_unresolved_total",
 			Help: "Distinct equal-timestamp ties with no safe winner (kept local; needs human/runtime repair), by table, path, and category.",
 		}, []string{"table", "path", "category"}),
+		tombstoneTies: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_lww_tombstone_tie_total",
+			Help: "Equal-timestamp ties settled by a one-sided soft-delete (a delete racing a write — benign), by table.",
+		}, []string{"table"}),
 	}
-	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved)
+	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies)
 	return m
 }
 
@@ -100,4 +105,9 @@ func (m *AntiEntropyMetrics) ObserveTieBreak(table, resolver, winner string) {
 // ObserveTieUnresolved records a distinct unresolved equal-timestamp tie. (Satisfies corrosion.SyncMetrics.)
 func (m *AntiEntropyMetrics) ObserveTieUnresolved(table, path, category string) {
 	m.tieUnresolved.WithLabelValues(table, path, category).Inc()
+}
+
+// ObserveTombstoneTie records a tie settled by a one-sided soft-delete. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveTombstoneTie(table string) {
+	m.tombstoneTies.WithLabelValues(table).Inc()
 }

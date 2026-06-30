@@ -129,15 +129,39 @@ The anti-entropy merge is the authority; the WAL fast-path resolves full-image
 upserts through the same engine and otherwise keeps local and lets anti-entropy
 converge the row, so the two paths can never disagree.
 
-### Metrics & repairing an unresolved tie
+### Metrics
 
-- `litevirt_lww_tie_break_total{table,resolver,winner}` — ties that converged. A
-  steadily climbing value means a node is minting colliding timestamps (the
-  upstream smell), not just a one-off split.
+- `litevirt_lww_tie_break_total{table,resolver,winner}` — ties that converged by a
+  deterministic resolver (`content_max`/`numeric_max`/`timestamp_max`/
+  `non_null_wins`/`lb_generation`). A steadily climbing value means a node is
+  minting colliding timestamps (the upstream smell), not just a one-off split.
 - `litevirt_lww_tie_unresolved_total{table,path,category}` — **distinct** ties
   with no safe winner (counted once per row, not per cycle). Any nonzero value is
   alert-worthy: the row is intentionally left divergent and needs operator or
-  runtime repair.
+  runtime repair. `category` ∈ {`runtime_owned`, `opaque`, `tenancy`, `policy`,
+  `control_plane`, `auth_factor`, `auth_pointer`, `lb_token`}.
+- `litevirt_lww_tombstone_tie_total{table}` — ties a one-sided soft-delete settled
+  (a delete racing a write). Benign and expected; tracked separately so it doesn't
+  muddy the tie-break smell.
+- `litevirt_runtime_owner_assert_total{kind,result}` — runtime ownership repair
+  outcomes. `kind` ∈ {`vm`, `ct`}; `result` ∈ {`asserted`, `rekeyed`,
+  `split_brain`, `inconclusive`, `error`}. A `split_brain` is a workload running on
+  two hosts at once → page; sustained `inconclusive` means a peer the repair needs
+  is unreachable.
+
+### Alerts
+
+```promql
+# Any unresolved tie needs a human/runtime repair (the row is divergent on purpose).
+litevirt_lww_tie_unresolved_total > 0
+# Auth/security-critical unresolved ties — page distinctly.
+sum by (category) (litevirt_lww_tie_unresolved_total{category=~"auth_factor|auth_pointer"}) > 0   # auth_unresolved_tie
+litevirt_lww_tie_unresolved_total{category="policy"} > 0                                          # policy_unresolved_tie
+# Steady tie-breaks ⇒ a node is minting colliding timestamps (an upstream clock/ID bug).
+rate(litevirt_lww_tie_break_total[15m]) > 0
+# A workload running in two places at once — page immediately.
+increase(litevirt_runtime_owner_assert_total{result="split_brain"}[10m]) > 0
+```
 
 The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the
 alert fires once per distinct divergence, not per cycle. The **divergence itself
@@ -195,3 +219,39 @@ markers / `relocate_token`), skips ambiguous cases (a live local row, more than
 one remote row, templates), and — like the VM path — only an active worker acts,
 a peer reporting `running` is a logged split-brain (no re-key), and a debounce
 guards the transition window.
+
+## Operational repair flow
+
+When `lv doctor divergence` reports rows (or an alert fires), work through them in
+this order. The ordering is a **safety invariant**: the selfFence non-destruction
+guard must be live on every node before the tie resolver runs anywhere, or a
+converged-wrong `host_name` could drive a node to destroy a live workload.
+
+1. **Capture evidence first.** Run `lv doctor divergence` (add `--json`) and save
+   it — convergence destroys the per-node evidence, so this is your only snapshot
+   of who-had-what.
+2. **Roll the guard fleet-wide, then the resolver.** When deploying the LWW repair
+   itself: get the selfFence guard onto *every* node first; only then roll the
+   resolver. Mixed guard/no-guard during the resolver roll is the unsafe window.
+3. **Classify each reported row:**
+   - **`vms`/`containers` ownership** (`runtime_owned` / `duplicate_live_container`)
+     — leave it to the **automatic runtime repair** (it reclaims on positive
+     all-peers-absent proof), or force it: `lv doctor repair-owner <vm> <host>` for
+     a VM, or for a container that the fleet can't auto-resolve (e.g. a segmented
+     host) make the running side authoritative. Never destroy by host-order.
+   - **`opaque` / `tenancy` / `policy` / `auth_*` / `lb_token`** — these are
+     deliberately unresolved (a wrong auto-pick would lose data or escalate). Pick
+     the correct side and make it authoritative with a fresh write **through the
+     normal API** (e.g. re-save the VM spec, re-apply the role binding, re-enroll
+     the factor). The fresh `updated_at` wins by ordinary LWW and clears the
+     tracking.
+   - **`schema_shape_mismatch`** — a column-order/shape skew from ALTER history,
+     not an LWW tie; harmless but it keeps a table's digest mismatched. Normalize
+     it on the next schema touch.
+4. **Re-run `lv doctor divergence`** to confirm the row converged, and verify the
+   live views agree (`lv ls`, `lv host ls`, per-host `virsh`/`lxc-info`).
+
+> **Never edit `state.db` directly.** Every repair goes through the daemon (an API
+> write or an audited `lv doctor` command) so it replicates and is auditable. A
+> direct SQLite edit isn't replicated, isn't audited, and re-creates the very
+> divergence you're fixing.

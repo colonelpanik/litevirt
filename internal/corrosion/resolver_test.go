@@ -136,12 +136,19 @@ func TestResolver_TenancyUnresolved(t *testing.T) {
 
 func TestResolver_TombstoneWins(t *testing.T) {
 	cols := []string{"name", "value", "updated_at", "deleted_at"}
-	// Incoming deleted, local live → take incoming (the tombstone).
+	// Incoming deleted, local live → take incoming (the tombstone). A tombstone tie
+	// is recorded in its own benign counter, NOT the tie-break series.
 	_, sm, keepLocal, unresolved := resolve(t, "dns_records", cols,
 		[]interface{}{"a", "1.1.1.1", "T", nil},
 		[]interface{}{"a", "1.1.1.1", "T", "2026-06-03T00:00:00Z"})
-	if keepLocal || unresolved || len(sm.tieBreaks) != 1 || sm.tieBreaks[0] != "dns_records/tombstone/incoming" {
-		t.Fatalf("one-sided tombstone must win (take incoming), got keepLocal=%v breaks=%v", keepLocal, sm.tieBreaks)
+	if keepLocal || unresolved {
+		t.Fatalf("one-sided tombstone must win (take incoming), got keepLocal=%v unresolved=%v", keepLocal, unresolved)
+	}
+	if len(sm.tieBreaks) != 0 {
+		t.Fatalf("a tombstone tie must not hit the tie-break series, got %v", sm.tieBreaks)
+	}
+	if len(sm.tombstoneTies) != 1 || sm.tombstoneTies[0] != "dns_records" {
+		t.Fatalf("a tombstone tie must be counted in the tombstone series, got %v", sm.tombstoneTies)
 	}
 }
 

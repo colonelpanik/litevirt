@@ -13,6 +13,7 @@ type fakeSyncMetrics struct {
 	lastMerged, lastSkipped int
 	tieBreaks               []string // "table/resolver/winner"
 	tieUnresolved           []string // "table/path/category"
+	tombstoneTies           []string // "table"
 }
 
 func (f *fakeSyncMetrics) ObserveDump(time.Duration, int) { f.dumps++ }
@@ -26,6 +27,9 @@ func (f *fakeSyncMetrics) ObserveTieBreak(table, resolver, winner string) {
 }
 func (f *fakeSyncMetrics) ObserveTieUnresolved(table, path, category string) {
 	f.tieUnresolved = append(f.tieUnresolved, table+"/"+path+"/"+category)
+}
+func (f *fakeSyncMetrics) ObserveTombstoneTie(table string) {
+	f.tombstoneTies = append(f.tombstoneTies, table)
 }
 
 func seedHosts(ctx context.Context, c *Client, n int) {

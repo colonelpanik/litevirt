@@ -445,8 +445,10 @@ func TestGenerateDomainXML_VideoDevice(t *testing.T) {
 	if len(dom.Devices.Videos) != 1 {
 		t.Fatalf("expected 1 video, got %d", len(dom.Devices.Videos))
 	}
-	if dom.Devices.Videos[0].Model.Type != "virtio" {
-		t.Errorf("video model = %q, want virtio", dom.Devices.Videos[0].Model.Type)
+	// BIOS guests get a legacy VGA model — virtio-gpu has no VGA BIOS, so SeaBIOS/
+	// GRUB render nothing on it (black VNC). UEFI keeps virtio-gpu.
+	if dom.Devices.Videos[0].Model.Type != "vga" {
+		t.Errorf("video model = %q, want vga (BIOS)", dom.Devices.Videos[0].Model.Type)
 	}
 }
 

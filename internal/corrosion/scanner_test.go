@@ -48,6 +48,35 @@ func TestScanLocalTables_AndDumpRoundTrip(t *testing.T) {
 	}
 }
 
+// Regression for the local-vs-dump integer encoding artifact: a row with a large
+// INTEGER column (storage_pools.total_bytes) must hash IDENTICALLY whether read
+// via this node's own ScanLocalTables or via a peer's gzip-JSON dump. A direct SQL
+// scan yields int64 ("5000000000"); the dump round-trips through JSON to float64
+// ("5e+09"), so if ScanLocalTables ever reverts to a direct scan the two paths
+// diverge and the scanner fabricates a divergence on every numeric column.
+func TestScanLocalTables_NumericColumnNoArtifact(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	if err := UpsertStoragePool(ctx, c, StoragePoolRecord{
+		HostName: "host-a", Name: "pool1", Driver: "local", TotalBytes: 5000000000, State: "active",
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+	self, _, err := c.ScanLocalTables(ctx, []string{"storage_pools"})
+	if err != nil {
+		t.Fatalf("ScanLocalTables: %v", err)
+	}
+	peer, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"storage_pools": true})
+	if err != nil {
+		t.Fatalf("SnapshotFromDumpBytes: %v", err)
+	}
+	pk := "host-a" + pkSep + "pool1"
+	sh, ph := self["storage_pools"].Rows[pk].RowHash, peer["storage_pools"].Rows[pk].RowHash
+	if sh == "" || sh != ph {
+		t.Fatalf("local and peer read paths must hash a numeric-column row identically (int64/float64 artifact): local=%q peer=%q", sh, ph)
+	}
+}
+
 func TestScanLocalSensitive_HMACOnly(t *testing.T) {
 	ctx := context.Background()
 	c := testClient(t)

@@ -142,30 +142,25 @@ func ipOwnerID(ownerKind, ownerHost, ownerName string) string {
 	return "vm:" + ownerName
 }
 
-// ScanLocalTables reads this node's own rows for the given operator-safe tables
-// and returns per-table snapshots plus the owned rows for semantic checks.
-func (c *Client) ScanLocalTables(ctx context.Context, tables []string) (map[string]TableSnapshot, []OwnedRow, error) {
-	out := make(map[string]TableSnapshot, len(tables))
-	var owned []OwnedRow
-	for _, table := range tables {
-		rows, err := c.Query(ctx, "SELECT * FROM "+table)
-		if err != nil {
-			return nil, nil, fmt.Errorf("scan %s: %w", table, err)
-		}
-		if len(rows) == 0 {
-			out[table] = TableSnapshot{Rows: map[string]RowMeta{}}
-			continue
-		}
-		cols := rows[0].Columns
-		vals := make([][]interface{}, len(rows))
-		for i, r := range rows {
-			vals[i] = r.Values
-		}
-		ts, o := tableSnapshotFromRows(table, cols, vals)
-		out[table] = ts
-		owned = append(owned, o...)
+// ScanLocalTables builds this node's per-table snapshots (+ owned rows for the
+// semantic checks) for the given operator-safe tables.
+//
+// It deliberately reads through the SAME serialization peers use — the gzipped
+// state dump (DumpStateBytes → SnapshotFromDumpBytes) — NOT a direct SQL scan.
+// The dump round-trips values through JSON, which decodes integer columns as
+// float64, whereas a direct scan yields int64; encodeRowCells would then render
+// the same stored value two different ways ("5000000000" vs "5e+09"), making the
+// local node's hash differ from every peer's and fabricating a divergence on
+// EVERY row with a numeric column. Reading every node through the dump makes the
+// scanner's row-equality identical to what cluster replication itself uses
+// (MergeStateBytesLWW also merges via the dump), so only genuine differences are
+// reported. ctx is unused (the dump is taken under the store's own lock).
+func (c *Client) ScanLocalTables(_ context.Context, tables []string) (map[string]TableSnapshot, []OwnedRow, error) {
+	want := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		want[t] = true
 	}
-	return out, owned, nil
+	return SnapshotFromDumpBytes(c.DumpStateBytes(), want)
 }
 
 // SnapshotFromDumpBytes parses a peer's gzipped operator-safe state dump into

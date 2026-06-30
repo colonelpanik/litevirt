@@ -11,8 +11,12 @@ Every host runs `litevirt`. There is **no master node**. State (hosts, VMs,
 networks, etc.) is replicated as a CRDT via the embedded Corrosion store using
 the Crescent relay-quorum protocol over mTLS gRPC. Each host's Hybrid Logical
 Clock orders the replication log and de-duplicates mutations; row **conflict
-resolution is last-writer-wins by the row's wall-clock `updated_at` (RFC3339)**,
-so all hosts must run NTP (HLC does not arbitrate conflicts). Health is observed
+resolution is last-writer-wins by the row's `updated_at`** (sub-second monotonic
+per node), so all hosts must run NTP (HLC does not arbitrate conflicts). An
+**exact-timestamp tie** with differing content is settled by a **table-aware
+resolver**: a deterministic winner where any pick is safe, otherwise the row is
+kept-local and flagged for repair (ownership/tenancy/policy/auth are never
+coin-flipped) — see [Diagnostics](diagnostics.md). Health is observed
 peer-to-peer (TLS probes every 2 s).
 Failover is decided by quorum among observers, gated by a CRDT-stored leader
 lease. Fencing has multiple strategies; safety guards refuse to reschedule
@@ -222,8 +226,12 @@ boundary, not an oversight:
   workloads to tolerate it.
 - **Synchronous cross-host writes.** All writes are local; replication is
   async.
-- **Automatic split-brain reconciliation.** When fencing fails, a human
-  decides.
+- **Automatic *true* split-brain reconciliation.** A divergence that's safe to
+  resolve — a workload running on exactly one host whose DB ownership drifted — is
+  reclaimed automatically (runtime owner-assert / re-key, on all-peers-absent
+  proof). But a genuine split-brain (the same workload running on two hosts) is
+  never auto-resolved by host-order: litevirt refuses, alerts, and a human decides
+  (destruction needs positive fencing proof). See [Diagnostics](diagnostics.md).
 - **Cluster-wide rolling-upgrade automation that is invisible to operators.**
   Upgrades are explicit (`lv host upgrade`) and can be batched but never
   silent.

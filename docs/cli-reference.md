@@ -663,6 +663,19 @@ lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics
 ```
 
+## Cluster diagnostics
+
+```bash
+lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Report replicated rows that disagree across nodes (read-only)
+lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
+```
+
+`divergence` is read-only; `repair-owner` is an audited, admin-gated repair for an
+equal-timestamp ownership split a stationary VM can't self-heal. Most ownership
+splits are reclaimed automatically by the runtime-repair reconcilers — see
+`docs/diagnostics.md` for the full model (categories, metrics, alerts, and the
+operational repair flow).
+
 ## Ansible integration
 
 ```bash

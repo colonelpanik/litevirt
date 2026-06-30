@@ -18,13 +18,19 @@ import (
 // travels over peer mTLS (a compromised peer can already write the DB directly).
 const repairActorMDKey = "x-litevirt-repair-actor"
 
-// repairActor resolves who to attribute a repair to: the operator identity
-// forwarded in peer-mTLS metadata if present (a forwarded call), otherwise the
-// authenticated caller (the entry node / a direct call).
-func repairActor(ctx context.Context) string {
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if v := md.Get(repairActorMDKey); len(v) > 0 && v[0] != "" {
-			return v[0]
+// repairActor resolves who to attribute a repair to. The x-litevirt-repair-actor
+// metadata is honored ONLY when the transport caller is a genuine cluster peer
+// (host-cert mTLS — the same trust boundary as requirePeerCert); on a forwarded
+// call that's how the real initiator reaches the write site. For any other caller
+// (an operator's bearer token or non-host mTLS client) the metadata is ignored
+// and the actor is the authenticated caller, so a direct caller cannot spoof the
+// audit attribution by injecting the header.
+func (s *Server) repairActor(ctx context.Context) string {
+	if s.requirePeerCert(ctx) == nil {
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			if v := md.Get(repairActorMDKey); len(v) > 0 && v[0] != "" {
+				return v[0]
+			}
 		}
 	}
 	return callerUsername(ctx)
@@ -74,7 +80,7 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 		return nil, err
 	}
 
-	actor := repairActor(ctx)
+	actor := s.repairActor(ctx)
 
 	// Forward to the named host — only it can corroborate against its OWN
 	// libvirt that the VM runs there. Carry the real operator identity so the

@@ -80,8 +80,41 @@ func TestRepairVMOwner(t *testing.T) {
 }
 
 // A forwarded call (peer mTLS authenticates as the bearerless "admin") must
-// attribute the audit to the operator who initiated it, carried in metadata.
+// attribute the audit to the operator who initiated it, carried in trusted
+// peer-mTLS metadata.
 func TestRepairVMOwner_ForwardedActorAttribution(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := context.Background()
+
+	// The actor override is honored only for a genuine cluster peer (a host-cert
+	// CN registered in `hosts`).
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "docker-peer", Address: "10.0.0.9", State: "active"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "host-b", State: "running", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	// Simulate the target receiving a forward from peer "docker-peer": the
+	// initiating operator ("alice") rides in trusted metadata.
+	fwd := metadata.NewIncomingContext(mtlsAdminCtx("docker-peer"), metadata.Pairs(repairActorMDKey, "alice"))
+	if _, err := s.RepairVMOwner(fwd, &pb.RepairVMOwnerRequest{Name: "vm1", Host: "host-a"}); err != nil {
+		t.Fatalf("RepairVMOwner (forwarded): %v", err)
+	}
+	if got := auditActor(t, s, "vm.repair-owner", "ok"); got != "alice" {
+		t.Fatalf("forwarded audit actor = %q, want alice (the initiator), not the peer admin", got)
+	}
+}
+
+// A non-peer caller (no host-cert mTLS) cannot spoof the audit actor by injecting
+// the metadata — the override is honored only for a genuine peer, so the audit
+// records the real caller.
+func TestRepairVMOwner_NonPeerCannotSpoofActor(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"
 	fake := libvirtfake.New()
@@ -94,14 +127,13 @@ func TestRepairVMOwner_ForwardedActorAttribution(t *testing.T) {
 	}
 	fake.SetState("vm1", libvirtfake.StateRunning)
 
-	// Simulate the target receiving a forward: the transport caller is the peer
-	// "admin", but the initiating operator ("alice") rides in trusted metadata.
-	fwd := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(repairActorMDKey, "alice"))
-	if _, err := s.RepairVMOwner(fwd, &pb.RepairVMOwnerRequest{Name: "vm1", Host: "host-a"}); err != nil {
-		t.Fatalf("RepairVMOwner (forwarded): %v", err)
+	// A direct admin caller injects the actor header — it must be ignored.
+	spoof := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(repairActorMDKey, "alice"))
+	if _, err := s.RepairVMOwner(spoof, &pb.RepairVMOwnerRequest{Name: "vm1", Host: "host-a"}); err != nil {
+		t.Fatalf("RepairVMOwner: %v", err)
 	}
-	if got := auditActor(t, s, "vm.repair-owner", "ok"); got != "alice" {
-		t.Fatalf("forwarded audit actor = %q, want alice (the initiator), not the peer admin", got)
+	if got := auditActor(t, s, "vm.repair-owner", "ok"); got != "admin" {
+		t.Fatalf("audit actor = %q, want admin (spoofed header must be ignored)", got)
 	}
 }
 

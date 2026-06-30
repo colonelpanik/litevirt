@@ -97,15 +97,20 @@ Move a VM's disk to a different pool on the same host:
 lv move-volume web-1 root warm --delete-source
 ```
 
-**Stopped VMs** — `qemu-img convert` between source and destination,
-then atomic DB pivot.
+**Stopped VMs** — `qemu-img convert` from source to destination, then the inactive
+libvirt domain's disk source is repointed and the disk record is updated in a single
+atomic write (host, path, driver, and pool together). The redefine happens *before*
+the DB commit, so a mid-move failure rolls back cleanly; if a prior attempt already
+repointed the domain at the destination, the copy is skipped so a newer destination is
+never clobbered.
 
-**Running VMs** — libvirt `BlockCopy` mirrors writes into
-the destination while the VM keeps running, then `BlockJobAbort PIVOT`
-swaps the source file atomically. Operator-visible downtime: zero.
-The orchestrator preallocates the destination, polls progress every
-~250 ms, cancels on context-cancel or pivot failure, and updates the
-disk record only after a successful pivot.
+**Running VMs** — libvirt `BlockCopy` mirrors writes into the destination while the VM
+keeps running. The persistent domain config and the disk record are moved to the
+destination **before** the `BlockJobAbort PIVOT` that swaps the live disk — the pivot is
+the irreversible commit, so durable state never lags behind a pivoted guest and no
+acknowledged write is lost. Operator-visible downtime: zero. The orchestrator
+preallocates the destination, polls progress every ~250 ms, and cancels/rolls back on
+context-cancel or pivot failure.
 
 > **Note:** `lv replicate-volume`'s copy step uses `qemu-img convert`, which
 > needs the source disk quiescent — replicate a **stopped** VM (or a disk no

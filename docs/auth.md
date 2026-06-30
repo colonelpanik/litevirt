@@ -79,12 +79,22 @@ binding can:
 
 - **Images** are a shared base-image library: `image.{pull,import,push,build}`
   are checked at `/`. (Override with project-scoped image namespaces if needed.)
-- **Storage pools** (`storage.pool.*`) configure host mounts/sources — real infra
-  authority; create/delete/update are checked at `/`. **Pool contents**
-  (`storage.content.*`, file upload/list/delete) are checked at the pool path
-  `/storage/pools/<name>`.
+- **Storage pools** (`storage.pool.*`, configure host mounts/sources) and their
+  **contents** (`storage.content.*`, file upload/list/delete) are both checked at the
+  pool's project path via `poolRBACPathFor`: `/storage_pools/<name>` for a global pool
+  (top-level — effectively a root/global grant, matching their real-infra authority),
+  `/projects/<p>/storage_pools/<name>` for a project-owned one. Intra-cluster content
+  calls (an entry-node forward, cross-host replication, auto-promote) authenticate as a
+  cluster host cert and bypass this tenant check — a deliberate peer-trust boundary:
+  any known cluster host cert can reach pool contents via these RPCs.
 - **Networks** (`network.create`, `network.delete`) and **resource mappings**
   (`resourcemap.*`, PCI/device pools) are cluster-global, checked at `/`.
+
+> **Upgrade note (content RBAC):** storage-pool content ops moved off the legacy flat
+> path `/storage/pools/<name>` onto the project-scoped path above. Re-issue any explicit
+> `storage.content.*` grant on the old path (admin / role-floor grants are unaffected).
+> The check runs on the **entry** node a user authenticates to, so the isolation takes
+> effect once those nodes are upgraded — an un-upgraded entry node still uses the old path.
 
 Interactive guest access — **console, VNC, and SPICE** — requires `vm.console`
 on the specific VM's project path (`/projects/<project>/vms/<name>`), not just a

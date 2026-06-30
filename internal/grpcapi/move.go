@@ -20,6 +20,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -201,39 +202,63 @@ func (s *Server) moveOneVolume(
 		return nil
 	}
 
-	if err := emit(&pb.MoveVolumeProgress{
-		Phase:  pb.MoveVolumeProgress_COPY,
-		Status: fmt.Sprintf("copying %s → %s", src.Path, dstPath),
-	}); err != nil {
-		return err
+	// Preflight the persistent cutover WITHOUT changing anything. A prior partial move
+	// may have left the persistent config already booting from dstPath (with possibly
+	// newer guest writes than src.Path); re-copying src→dst would clobber it. So decide
+	// the cutover BEFORE the copy.
+	cs, origXML, newXML, perr := s.planCutover(vm, src, dstPath)
+	if perr != nil {
+		s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
+			fmt.Sprintf("%s: cutover preflight failed: %v", src.DiskName, perr))
+		return status.Errorf(codes.Internal, "inspect persistent domain config (cutover aborted, source preserved): %v", perr)
 	}
 
-	if err := convertQcow2(ctx, src.Path, dstPath, emit); err != nil {
-		// Best-effort cleanup of partial output.
-		_ = os.Remove(dstPath)
-		return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
-	}
-
-	// Update DB: point the disk record at the new path/pool.
-	if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, src.DiskName, vm.HostName, dstPath); err != nil {
-		return status.Errorf(codes.Internal, "update disk record: %v", err)
-	}
-	if err := corrosion.UpdateDiskStorage(ctx, s.db, vm.Name, src.DiskName, dstPool.Driver, targetPool); err != nil {
-		return status.Errorf(codes.Internal, "update disk storage pool: %v", err)
-	}
-	// Point the persistent libvirt domain at the new path. The live path gets
-	// this from the blockdev-mirror pivot; the offline (stopped-VM) path must
-	// rewrite the inactive domain's <source file>, or the VM fails to start
-	// with "Cannot access storage file" at the moved-away (and deleted) path.
-	if s.virt != nil {
-		if xml, derr := s.virt.DumpXML(vm.Name); derr != nil {
-			slog.Warn("move: dump domain xml for redefine — VM may not start until redefined",
-				"vm", vm.Name, "error", derr)
-		} else if updated := strings.ReplaceAll(xml, src.Path, dstPath); updated != xml {
-			if derr := s.virt.DefineDomain(updated); derr != nil {
-				slog.Warn("move: redefine domain with new disk path",
-					"vm", vm.Name, "old", src.Path, "new", dstPath, "error", derr)
+	if cs == cutoverAlreadyAtDst {
+		// Persistent already boots from dstPath — it is authoritative (and may hold
+		// newer writes than src). Do NOT re-copy; just commit the DB to catch up. On
+		// failure keep dstPath (the VM boots from it) so a later retry can complete.
+		if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, dstPath, dstPool.Driver, targetPool); err != nil {
+			slog.Error("move: persistent domain already at the new path; DB catch-up commit failed — keeping the new file so the VM boots, operator must reconcile the disk row",
+				"vm", vm.Name, "disk", src.DiskName, "dest", dstPath, "error", err)
+			if errors.Is(err, corrosion.ErrNoRowsAffected) {
+				return status.Errorf(codes.Aborted, "disk %q/%q changed during move; aborted before completing", vm.Name, src.DiskName)
 			}
+			return status.Errorf(codes.Internal, "update disk placement: %v", err)
+		}
+	} else {
+		// Forward path: copy src→dst, then (if libvirt) repoint the persistent config,
+		// then commit — redefine before commit so a single fault is fully reversible.
+		if err := emit(&pb.MoveVolumeProgress{
+			Phase:  pb.MoveVolumeProgress_COPY,
+			Status: fmt.Sprintf("copying %s → %s", src.Path, dstPath),
+		}); err != nil {
+			return err
+		}
+		if err := convertQcow2(ctx, src.Path, dstPath, emit); err != nil {
+			_ = os.Remove(dstPath) // best-effort cleanup of partial output
+			return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
+		}
+		if cs == cutoverRedefined {
+			// The stopped VM must be redefined or it fails to start with "Cannot access
+			// storage file" once the old path is removed.
+			if derr := s.virt.DefineDomain(newXML); derr != nil {
+				_ = os.Remove(dstPath)
+				s.recordVMEvent(ctx, vm.Name, "disk.moved", "error",
+					fmt.Sprintf("%s: cutover aborted (source preserved): %v", src.DiskName, derr))
+				return status.Errorf(codes.Internal, "redefine inactive domain (cutover aborted, source preserved): %v", derr)
+			}
+		}
+		if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, dstPath, dstPool.Driver, targetPool); err != nil {
+			// Roll the cutover back; only remove the copy if the persistent config no
+			// longer points at it. A clean rollback leaves DB recording the old pool, so
+			// a retry is a fresh move.
+			if s.rollbackCutover(cs, vm.Name, origXML) {
+				_ = os.Remove(dstPath)
+			}
+			if errors.Is(err, corrosion.ErrNoRowsAffected) {
+				return status.Errorf(codes.Aborted, "disk %q/%q changed during move; aborted before completing", vm.Name, src.DiskName)
+			}
+			return status.Errorf(codes.Internal, "update disk placement: %v", err)
 		}
 	}
 	s.syncStackComposeForMovedDisk(ctx, vm, src.DiskName, targetPool)
@@ -256,6 +281,95 @@ func (s *Server) moveOneVolume(
 		BytesCopied: totalBytes,
 		CopyPct:     100,
 	})
+}
+
+// redefineMovedDiskSource repoints the moved disk's <source> in the VM's PERSISTENT
+// domain config from src.Path to dstPath and reports whether a libvirt define was
+// performed (so the caller can roll it back) plus the original XML for that rollback.
+// It is the precise, hard cutover gate shared by the offline and live MoveVolume
+// paths: any error must abort/roll back the move rather than leave the persistent
+// config stale (which fails the next start with "Cannot access storage file").
+//
+// It reads the INACTIVE config (DumpXMLInactive): for a running domain the live
+// config may already show the new path post-pivot, but the persistent config — what
+// a restart loads — is what must be rewritten. It is idempotent: if the config
+// already points the disk at dstPath it returns (false, xml, nil), so a retry after a
+// partial cutover heals cleanly. When there is no libvirt backend (tests) it is a
+// no-op.
+// cutoverState records what redefineMovedDiskSource did to the PERSISTENT domain
+// config. It decides post-failure cleanup: the destination file is safe to remove
+// only when the persistent config does NOT point at it.
+type cutoverState int
+
+const (
+	cutoverNoVirt       cutoverState = iota // no libvirt backend (tests) — nothing references dst
+	cutoverRedefined                        // rewrote the disk source src→dst this call (origXML restores src)
+	cutoverAlreadyAtDst                      // the persistent config already pointed the disk at dst
+)
+
+// planCutover INSPECTS the persistent domain config and decides the cutover WITHOUT
+// changing anything (no DefineDomain, no file writes). The move paths run it as a
+// read-only preflight *before* copying, so a prior partial cutover that already points
+// the persistent config at dstPath is detected before the (possibly stale) source
+// could clobber the authoritative destination.
+//   - cutoverNoVirt       — no libvirt backend (tests)
+//   - cutoverAlreadyAtDst — persistent already boots the disk from dstPath (newXML "")
+//   - cutoverRedefined    — needs DefineDomain(newXML) to repoint src→dst (origXML restores src)
+func (s *Server) planCutover(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (cs cutoverState, origXML, newXML string, err error) {
+	if s.virt == nil {
+		return cutoverNoVirt, "", "", nil
+	}
+	xml, derr := s.virt.DumpXMLInactive(vm.Name)
+	if derr != nil {
+		return cutoverNoVirt, "", "", fmt.Errorf("dump inactive domain xml: %w", derr)
+	}
+	out, changed, derr := libvirt.RewriteDiskSourceFile(xml, src.TargetDev, src.Path, dstPath)
+	if derr != nil {
+		return cutoverNoVirt, xml, "", derr
+	}
+	if !changed {
+		return cutoverAlreadyAtDst, xml, "", nil
+	}
+	return cutoverRedefined, xml, out, nil
+}
+
+// redefineMovedDiskSource is planCutover followed by APPLYING the redefine. The live
+// path uses it (it has no separate copy step to gate); the offline path uses
+// planCutover directly so it can decide whether to copy first.
+func (s *Server) redefineMovedDiskSource(vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPath string) (cutoverState, string, error) {
+	cs, origXML, newXML, err := s.planCutover(vm, src, dstPath)
+	if err != nil {
+		return cs, origXML, err
+	}
+	if cs == cutoverRedefined {
+		if derr := s.virt.DefineDomain(newXML); derr != nil {
+			return cutoverNoVirt, origXML, fmt.Errorf("define domain: %w", derr)
+		}
+	}
+	return cs, origXML, nil
+}
+
+// rollbackCutover undoes redefineMovedDiskSource after a failed move and reports
+// whether the destination file is now safe to remove. It NEVER reports safe while the
+// persistent config still points the disk at dst (removing it would strand the domain).
+func (s *Server) rollbackCutover(cs cutoverState, vmName, origXML string) (safeToRemoveDst bool) {
+	switch cs {
+	case cutoverRedefined:
+		if err := s.virt.DefineDomain(origXML); err != nil {
+			slog.Error("move: cutover rollback failed — persistent domain still points at the new path; keeping the new file so the VM boots, operator must reconcile the disk row",
+				"vm", vmName, "error", err)
+			return false
+		}
+		return true // persistent restored to the source path
+	case cutoverAlreadyAtDst:
+		// Persistent already pointed at dst before this move; there is no source XML to
+		// restore, so keep the file (the VM boots from it) and surface for reconcile.
+		slog.Error("move: persistent domain already pointed at the new path before this move and the commit failed — keeping the new file so the VM boots, operator must reconcile the disk row",
+			"vm", vmName)
+		return false
+	default: // cutoverNoVirt — no persistent config references dst
+		return true
+	}
 }
 
 // deleteSourceIfUnreferenced removes the moved disk's old file after a

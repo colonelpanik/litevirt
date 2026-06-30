@@ -326,6 +326,13 @@ func (f *Fake) DumpXML(name string) (string, error) {
 	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
 }
 
+// DumpXMLInactive mirrors DumpXML for the fake — it stores a single XML per domain
+// (DefineDomain captures it), so the active and inactive configs are the same. Tests
+// that need to model a post-pivot live/persistent divergence set them explicitly.
+func (f *Fake) DumpXMLInactive(name string) (string, error) {
+	return f.DumpXML(name)
+}
+
 func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
 	// The fake transitions synchronously; the wait always succeeds.
 	f.mu.Lock()

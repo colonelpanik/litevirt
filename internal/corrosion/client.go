@@ -33,7 +33,8 @@ type SyncMetrics interface {
 	ObserveTieBreak(table, resolver, winner string)
 	// ObserveTieUnresolved records a DISTINCT unresolved tie (counted once per
 	// (table,PK,content-pair), not per cycle): path ∈ {ae, wal}; category ∈
-	// {runtime_owned, tenancy, policy, auth_factor, auth_pointer, lb_token}.
+	// {runtime_owned, opaque, tenancy, policy, control_plane, auth_factor,
+	// auth_pointer, lb_token}.
 	ObserveTieUnresolved(table, path, category string)
 }
 

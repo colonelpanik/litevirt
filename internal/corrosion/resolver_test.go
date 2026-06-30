@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -303,6 +304,49 @@ func TestLocalZeroRowWriteKeepsUnresolved(t *testing.T) {
 	}
 	if c.UnresolvedTieCount() != 1 {
 		t.Fatalf("a zero-row write must not clear the unresolved tracking, count=%d", c.UnresolvedTieCount())
+	}
+}
+
+// TestResolver_OpaqueDefinitionUnresolved: a differing opaque definition blob
+// (vms.spec, networks.config, …) is NEVER content-max'd — it is unresolved, so an
+// arbitrary length-prefix tiebreak can't silently downgrade a live definition to
+// a stale serialization (the prod regression that motivated this).
+func TestResolver_OpaqueDefinitionUnresolved(t *testing.T) {
+	vmCols := []string{"name", "host_name", "project", "spec", "updated_at"}
+
+	// A differing spec at a tie → unresolved, category "opaque".
+	_, sm, keepLocal, unresolved := resolve(t, "vms", vmCols,
+		[]interface{}{"db1", "docker002", "_default", `{"cpu":4,"x":1}`, "T"},
+		[]interface{}{"db1", "docker002", "_default", `{"cpu":4,"x":2}`, "T"})
+	if !keepLocal || !unresolved || len(sm.tieUnresolved) != 1 || sm.tieUnresolved[0] != "vms/ae/opaque" {
+		t.Fatalf("a differing vms.spec must be unresolved (opaque), got keepLocal=%v unresolved=%v track=%v", keepLocal, unresolved, sm.tieUnresolved)
+	}
+
+	// The exact prod shape: a SHORTER stale spec must NOT win over a longer live
+	// one (content-max would pick it by length prefix) — it must be unresolved.
+	_, _, keep2, unres2 := resolve(t, "vms", vmCols,
+		[]interface{}{"db1", "docker002", "_default", strings.Repeat("x", 1149), "T"}, // live, longer
+		[]interface{}{"db1", "docker002", "_default", strings.Repeat("y", 963), "T"})  // stale, shorter
+	if !keep2 || !unres2 {
+		t.Fatalf("live-vs-stale spec tie must be unresolved (no silent downgrade), got keepLocal=%v unresolved=%v", keep2, unres2)
+	}
+
+	// networks.config behaves the same.
+	nCols := []string{"name", "project", "config", "updated_at"}
+	_, sm3, _, unres3 := resolve(t, "networks", nCols,
+		[]interface{}{"n1", "_default", `{"bridge":"br0"}`, "T"},
+		[]interface{}{"n1", "_default", `{"bridge":"br1"}`, "T"})
+	if !unres3 || sm3.tieUnresolved[0] != "networks/ae/opaque" {
+		t.Fatalf("a differing networks.config must be unresolved, got %v", sm3.tieUnresolved)
+	}
+
+	// A NON-opaque difference (same spec, a benign scalar differs) still converges.
+	benignCols := []string{"name", "host_name", "project", "spec", "state", "updated_at"}
+	_, sm4, _, unres4 := resolve(t, "vms", benignCols,
+		[]interface{}{"db1", "docker002", "_default", `{"cpu":4}`, "running", "T"},
+		[]interface{}{"db1", "docker002", "_default", `{"cpu":4}`, "paused", "T"})
+	if unres4 || len(sm4.tieBreaks) != 1 || sm4.tieBreaks[0] != "vms/content_max/local" {
+		t.Fatalf("an equal-spec tie differing only in a benign column must still converge, got unresolved=%v breaks=%v", unres4, sm4.tieBreaks)
 	}
 }
 

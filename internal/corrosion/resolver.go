@@ -263,9 +263,29 @@ func parseInstant(s string) (time.Time, bool) {
 // ───────────────────────── chains ─────────────────────────
 
 // chain helpers for the common shapes.
+//
+// "Opaque" columns are large structured-blob workload/resource DEFINITIONS
+// (vms.spec, containers.create_spec, networks.config, …). They must NEVER be
+// content-max'd: the canonical encoder length-prefixes each cell, so content-max
+// orders two specs by their length digits — an arbitrary, non-semantic tiebreak
+// that (as seen in prod) can converge a whole cluster DOWN to one bystander's
+// stale serialization, silently overwriting the live definition. A differing
+// opaque column has no safe deterministic winner → unresolved (keep local +
+// alert), and a human / runtime repair makes one side authoritative.
 func contentDefaultChain() []tieRule { return []tieRule{ruleTombstone(), ruleContentMax()} }
-func tenancyContentChain(projectCol string) []tieRule {
-	return []tieRule{ruleColUnresolved(projectCol, "tenancy"), ruleTombstone(), ruleContentMax()}
+func contentOpaqueChain(opaqueCols ...string) []tieRule {
+	chain := []tieRule{ruleTombstone()}
+	if len(opaqueCols) > 0 {
+		chain = append(chain, ruleAnyColUnresolved(opaqueCols, "opaque"))
+	}
+	return append(chain, ruleContentMax())
+}
+func tenancyOpaqueChain(projectCol string, opaqueCols ...string) []tieRule {
+	chain := []tieRule{ruleColUnresolved(projectCol, "tenancy"), ruleTombstone()}
+	if len(opaqueCols) > 0 {
+		chain = append(chain, ruleAnyColUnresolved(opaqueCols, "opaque"))
+	}
+	return append(chain, ruleContentMax())
 }
 func policyChain() []tieRule { return []tieRule{ruleTombstone(), ruleUnresolved("policy")} }
 func authPointerChain(pointerCol string) []tieRule {
@@ -287,18 +307,22 @@ var capabilityMap = map[string]tableResolver{
 	"vms": {category: "runtime-owned", chain: []tieRule{
 		ruleColUnresolved("host_name", "runtime_owned"),
 		ruleColUnresolved("project", "tenancy"),
-		ruleTombstone(), ruleContentMax(),
+		ruleTombstone(),
+		ruleAnyColUnresolved([]string{"spec"}, "opaque"), // never content-max the VM definition
+		ruleContentMax(),
 	}},
 	// containers: host_name is part of the PK (an ownership split is two distinct
 	// rows the per-PK resolver can't see — Phase 4 runtime re-key handles it), so
-	// only the tenancy column needs a carve-out here.
-	"containers": {category: "tenancy-content", chain: tenancyContentChain("project")},
+	// only the tenancy column needs a carve-out here. create_spec is the
+	// relocation-critical definition blob → opaque.
+	"containers": {category: "tenancy-content", chain: tenancyOpaqueChain("project", "create_spec")},
 
-	// Tenancy-bearing, otherwise content-default.
-	"networks":         {category: "tenancy-content", chain: tenancyContentChain("project")},
-	"storage_pools":    {category: "tenancy-content", chain: tenancyContentChain("project")},
-	"volumes":          {category: "tenancy-content", chain: tenancyContentChain("project")},
-	"backup_schedules": {category: "tenancy-content", chain: tenancyContentChain("project_name")},
+	// Tenancy-bearing, otherwise content-default. config is the resource
+	// definition blob → opaque (storage_pools has only scalar columns).
+	"networks":         {category: "tenancy-content", chain: tenancyOpaqueChain("project", "config")},
+	"storage_pools":    {category: "tenancy-content", chain: tenancyOpaqueChain("project")},
+	"volumes":          {category: "tenancy-content", chain: tenancyOpaqueChain("project", "config")},
+	"backup_schedules": {category: "tenancy-content", chain: tenancyOpaqueChain("project_name")},
 
 	// Whole-table policy / authorization / accounting — content-max could
 	// converge to the more-permissive value (privilege/isolation regression) or
@@ -362,7 +386,7 @@ var capabilityMap = map[string]tableResolver{
 	"host_health":             {category: "content", chain: contentDefaultChain()},
 	"images":                  {category: "content", chain: contentDefaultChain()},
 	"image_hosts":             {category: "content", chain: contentDefaultChain()},
-	"stacks":                  {category: "content", chain: contentDefaultChain()},
+	"stacks":                  {category: "content", chain: contentOpaqueChain("spec", "compose_yaml")},
 	"vm_interfaces":           {category: "content", chain: contentDefaultChain()},
 	"vm_disks":                {category: "content", chain: contentDefaultChain()},
 	"snapshots":               {category: "content", chain: contentDefaultChain()},

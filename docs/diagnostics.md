@@ -111,10 +111,15 @@ order (both nodes pick the same winner, so the row converges) or it deliberately
 |---|---|---|
 | content-default | inventory/config tables with no authorization, isolation, runtime, or auth meaning (`images`, `hosts`, `dns_records`, …) | a one-sided soft-delete wins, else the canonically-greater row wins (deterministic; converges) |
 | runtime-owned | `vms.host_name` | **unresolved** — never adopt an owner by value (it could name a non-running host); defer to runtime repair |
+| opaque definition | the workload/resource definition blobs: `vms.spec`, `containers.create_spec`, `networks.config`, `volumes.config`, `stacks.spec`/`compose_yaml` | **unresolved** when the blob differs — the canonical encoder orders specs by their length prefix, so content-max is an arbitrary, non-semantic tiebreak that could silently downgrade a live definition to a stale serialization; a human / runtime repair makes one side authoritative |
 | tenancy | `project` on `vms`/`containers`/`networks`/`storage_pools`/`volumes`, `project_name` on `backup_schedules` | **unresolved** when the tenancy column differs (a content-max could silently move a resource between tenants) |
 | policy | `roles`, `role_bindings`, `users`, `tokens`, `projects`, firewall/SG tables, secret-bearing config | a delete wins, else **unresolved** (a value tiebreak could converge to the more-permissive grant) |
 | auth | `user_2fa` (replay ratchet → max; consume/tombstone irreversible), `recovery_codes`, the active-set pointers | converging rules where safe, else **unresolved** (never resurrect a superseded factor/code) |
 | LB | `lb_configs`, `lb_backends` | a non-empty incarnation token beats empty; two different non-empty tokens are **unresolved** |
+
+A table can mix categories in one chain — e.g. `vms` resolves a `host_name` tie as
+runtime-owned, a `project` tie as tenancy, a `spec` tie as opaque, and any other
+column tie by content-max — applied in that order, first strict decision wins.
 
 `containers` ownership is part of the primary key, so an ownership split is two
 distinct rows (not a single-row tie) — detected by `duplicate_live_container`

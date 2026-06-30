@@ -58,8 +58,9 @@ func (r *Reconciler) observeOwnerAssert(vm, result string) {
 // decision-complete proof that no other host also runs the VM.
 //
 // This is the automated, more-conservative sibling of the manual
-// `lv doctor repair-owner`: it corroborates against EVERY active host, not just
-// the one the operator names, and stands down on any ambiguity.
+// `lv doctor repair-owner`: it corroborates against EVERY workload-capable peer,
+// not just the one the operator names, and stands down on any ambiguity. Only an
+// active worker host (never a witness) runs this repair.
 func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 	if r.virt == nil || r.checkPeerRuntime == nil {
 		return
@@ -73,15 +74,36 @@ func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	// Corroborate against active WORKLOAD-capable hosts only. A witness is active
-	// (it votes) but never hosts VMs and may have no libvirt client — its
-	// CheckVMRuntime would always answer "unknown", which would otherwise block
-	// every reclaim forever.
+
+	// Local host gate: only an ACTIVE WORKER may claim a workload. A witness votes
+	// but never owns workloads (the witness invariant); a non-active local host
+	// (draining/upgrading/fenced) must not be writing new ownership. If our own
+	// row is missing/witness/non-active, stand down entirely.
+	var self *corrosion.HostRecord
+	for i := range hosts {
+		if hosts[i].Name == r.hostName {
+			self = &hosts[i]
+			break
+		}
+	}
+	if self == nil || self.State != "active" || self.IsWitness() {
+		return
+	}
+
+	// Corroborate against every peer that COULD be running the VM. We must include
+	// not just active hosts but draining/upgrading/offline ones too — a domain
+	// keeps running across a daemon re-exec (KillMode=process) and during a drain,
+	// so skipping them could miss a live copy and assert into a split-brain. We
+	// exclude only: self; witnesses (never host workloads, and may have no libvirt
+	// → always "unknown", which would block every reclaim); and FENCED hosts
+	// (positively dead by fencing proof → their domains are gone). An unreachable
+	// peer in any included state simply yields "inconclusive", which is safe.
 	var others []string
 	for _, h := range hosts {
-		if h.Name != r.hostName && h.State == "active" && !h.IsWitness() {
-			others = append(others, h.Name)
+		if h.Name == r.hostName || h.IsWitness() || h.State == "fenced" {
+			continue
 		}
+		others = append(others, h.Name)
 	}
 
 	seen := make(map[string]bool, len(localDomains))
@@ -119,7 +141,7 @@ func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 }
 
 // tryAssertOwnership runs the decision-complete corroboration: query every other
-// active host's local libvirt and act only on a unanimous, unambiguous result.
+// workload-capable peer's local libvirt and act only on a unanimous result.
 func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string, others []string) {
 	anyRunning := false
 	allAbsent := true
@@ -162,7 +184,7 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 			"vm", name, "db_host", dbHost)
 		r.observeOwnerAssert(name, "inconclusive")
 	default:
-		// Decision-complete: every other active host answered ABSENT and the VM
+		// Decision-complete: every workload-capable peer answered ABSENT and the VM
 		// runs here → reclaim ownership with a fresh timestamp (wins by ordinary
 		// LWW everywhere). Non-destructive: a DB row write only.
 		if err := corrosion.UpdateVMHost(ctx, r.db, name, r.hostName, RuntimeRunning); err != nil {
@@ -170,7 +192,7 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 			r.observeOwnerAssert(name, "error")
 			return
 		}
-		slog.Warn("owner-assert: reclaimed VM ownership — runs locally and all other active hosts report absent",
+		slog.Warn("owner-assert: reclaimed VM ownership — runs locally and all workload-capable peers report absent",
 			"vm", name, "from_host", dbHost, "to_host", r.hostName)
 		r.auditOwnerAssert(ctx, name, dbHost)
 		r.observeOwnerAssert(name, "asserted")
@@ -232,7 +254,7 @@ func (r *Reconciler) auditOwnerAssert(ctx context.Context, name, fromHost string
 		HostName: r.hostName,
 		Action:   "vm.runtime-owner-assert",
 		Target:   name,
-		Detail:   "reclaimed from " + fromHost + " (runs locally; all other active hosts absent)",
+		Detail:   "reclaimed from " + fromHost + " (runs locally; all workload-capable peers absent)",
 		Result:   "ok",
 	})
 }

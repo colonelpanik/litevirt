@@ -235,6 +235,52 @@ func TestOwnerAssert_ProbeTimeoutBounded(t *testing.T) {
 	}
 }
 
+// A WITNESS local host must NEVER claim a workload to itself, even if it somehow
+// runs a domain and all workers are absent (the witness invariant).
+func TestOwnerAssert_LocalWitnessStandsDown(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, clock, results := ownerAssertFixture(t)
+	if err := corrosion.UpdateHostRole(ctx, db, "node-a", "witness"); err != nil {
+		t.Fatalf("UpdateHostRole: %v", err)
+	}
+	r.SetPeerRuntimeChecker(func(_ context.Context, _, _ string) (string, error) { return RuntimeAbsent, nil })
+	r.assertRuntimeOwnership(ctx)
+	*clock = clock.Add(ownershipAssertDebounce + time.Minute)
+	r.assertRuntimeOwnership(ctx)
+	if ownerOf(t, db, "vm1") != "node-b" {
+		t.Fatal("a witness local host must not claim ownership")
+	}
+	if results["vm1"] != "" {
+		t.Fatalf("a witness must not even reach a decision, got %q", results["vm1"])
+	}
+}
+
+// A peer that is UPGRADING (or draining) can still be running the VM — it must be
+// probed, and if it reports running the result is split-brain, not a wrongful
+// reclaim. Regression for "only active peers were probed".
+func TestOwnerAssert_UpgradingPeerRunningIsSplitBrain(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, clock, results := ownerAssertFixture(t)
+	if err := corrosion.UpdateHostState(ctx, db, "node-b", "upgrading"); err != nil {
+		t.Fatalf("UpdateHostState: %v", err)
+	}
+	r.SetPeerRuntimeChecker(func(_ context.Context, host, _ string) (string, error) {
+		if host == "node-b" {
+			return RuntimeRunning, nil // still running the VM mid-upgrade
+		}
+		return RuntimeAbsent, nil
+	})
+	r.assertRuntimeOwnership(ctx)
+	*clock = clock.Add(ownershipAssertDebounce + time.Minute)
+	r.assertRuntimeOwnership(ctx)
+	if ownerOf(t, db, "vm1") != "node-b" {
+		t.Fatal("an upgrading peer still running the VM must NOT be skipped → no reclaim")
+	}
+	if results["vm1"] != "split_brain" {
+		t.Fatalf("result = %q, want split_brain (upgrading peer reported running)", results["vm1"])
+	}
+}
+
 func auditCount(t *testing.T, db *corrosion.Client, action string) int {
 	t.Helper()
 	rows, err := db.Query(context.Background(),

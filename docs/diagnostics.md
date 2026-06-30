@@ -157,7 +157,7 @@ local (never picks an owner by value) and defers to runtime repair.
 
 - **Automatic (runtime owner-assert).** Each host's reconciler watches for a VM
   that runs **locally** but whose DB row points at another host. Before
-  reclaiming it, it queries **every other active host's local libvirt** (the
+  reclaiming it, it queries **every workload-capable peer's local libvirt** (the
   peer-only `CheckVMRuntime` RPC) and re-stamps ownership to itself **only when
   all of them answer `absent`**, no migration/lease marker is present, and the
   condition has persisted past a short debounce. If any host reports `running`

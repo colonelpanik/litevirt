@@ -88,8 +88,9 @@ message RepairVMOwnerResponse { string host = 1; string previous_host = 2; }
 // nothing else — it never consults or forwards through the cluster DB (the DB
 // host_name is the disputed value being corroborated against ground truth).
 // Peer-only (host-cert mTLS). `state` ∈ {absent, defined_stopped, running,
-// unknown}. The runtime owner-assert reconciler queries this on every active
-// host except self before reclaiming a VM it runs locally.
+// unknown}. The runtime owner-assert reconciler queries this on every
+// workload-capable peer (worker hosts that aren't fenced) before reclaiming a
+// VM it runs locally.
 message CheckVMRuntimeRequest  { string name = 1; }
 message CheckVMRuntimeResponse { string state = 1; }
 

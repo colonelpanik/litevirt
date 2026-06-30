@@ -45,7 +45,7 @@ func (s *Server) localVMRuntime(name string) string {
 
 // CheckPeerVMRuntime dials a peer and asks for its local libvirt view of a VM.
 // It is the hook the reconciler uses (via SetPeerRuntimeChecker) to corroborate
-// ownership against runtime truth on every other active host.
+// ownership against runtime truth on every workload-capable peer.
 func (s *Server) CheckPeerVMRuntime(ctx context.Context, host, name string) (string, error) {
 	client, conn, err := s.peerClient(ctx, host)
 	if err != nil {

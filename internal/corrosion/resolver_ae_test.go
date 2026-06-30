@@ -85,6 +85,37 @@ func TestAntiEntropy_RuntimeOwnedTieKeepsLocal(t *testing.T) {
 	}
 }
 
+// TestAntiEntropy_RepairClearsUnresolved: the remediation path is a fresh/newer
+// write (e.g. repair-owner re-stamping ownership). A strictly-newer incoming row
+// applies AND clears the tracked unresolved tie, so UnresolvedTieCount returns to
+// zero after repair (the finding-1 regression).
+func TestAntiEntropy_RepairClearsUnresolved(t *testing.T) {
+	ctx := context.Background()
+	src, dst := testClient(t), testClient(t)
+	const ts = "2026-06-03T18:40:00Z"
+
+	_ = InsertVM(ctx, src, VMRecord{Name: "vm1", HostName: "host-b", State: "running", Spec: "{}"}, nil, nil)
+	_ = InsertVM(ctx, dst, VMRecord{Name: "vm1", HostName: "host-a", State: "running", Spec: "{}"}, nil, nil)
+	forceUpdatedAt(t, src, "vms", "name", "vm1", ts)
+	forceUpdatedAt(t, dst, "vms", "name", "vm1", ts)
+
+	dst.MergeStateBytesLWW(src.DumpStateBytes()) // unresolved host_name tie
+	if dst.UnresolvedTieCount() != 1 {
+		t.Fatalf("expected one tracked unresolved tie, got %d", dst.UnresolvedTieCount())
+	}
+
+	// Repair: the owning side re-stamps with a strictly-newer timestamp.
+	forceUpdatedAt(t, src, "vms", "name", "vm1", "2026-06-30T00:00:00Z")
+	dst.MergeStateBytesLWW(src.DumpStateBytes())
+
+	if got, _ := GetVM(ctx, dst, "vm1"); got == nil || got.HostName != "host-b" {
+		t.Fatalf("strictly-newer repair must apply, got %+v", got)
+	}
+	if dst.UnresolvedTieCount() != 0 {
+		t.Fatalf("repair (newer write) must clear the unresolved tracking, count=%d", dst.UnresolvedTieCount())
+	}
+}
+
 // TestAntiEntropy_TieConvergesThenStable: after content-max converges a tie, a
 // re-merge applies nothing (the digests now match) — no infinite resync.
 func TestAntiEntropy_TieConvergesThenStable(t *testing.T) {

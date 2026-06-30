@@ -86,20 +86,19 @@ type Client struct {
 	tsMu   sync.Mutex
 	lastTS time.Time
 
-	// tieMu guards the bounded equal-timestamp-tie state below. Separate from mu
+	// tieMu guards the equal-timestamp-tie tracking state below. Separate from mu
 	// so the resolver (called while mu is held during a merge) records without
 	// re-entrancy.
 	tieMu sync.Mutex
 	// unresolvedTies records, per (table,PK), the sorted content-hash pair of the
 	// last classified-unresolved tie. It makes lww_tie_unresolved count DISTINCT
-	// rows (re-observing the same divergence is a no-op) and is the source for the
-	// anti-entropy re-sync suppression. Cleared when the row's content changes.
+	// rows (re-observing the same divergence is a no-op) and drives the alert.
+	// Cleared when the row converges or is repaired (a newer write to the PK).
 	unresolvedTies map[string]string
-	// reconciledDivergent memoizes, per (peer,table), the (localHash,remoteHash)
-	// digest pair already reconciled to a known-unresolved divergence, so
-	// anti-entropy does not re-pull a table whose only delta is intentional
-	// divergence (the bound that removes the infinite no-op resync).
-	reconciledDivergent map[string]string
+	// unresolvedLen mirrors len(unresolvedTies) for a lock-free fast path: the
+	// clear-on-write hooks (which run on every applied/local row) skip the lock
+	// entirely when nothing is tracked — the overwhelmingly common case.
+	unresolvedLen atomic.Int64
 }
 
 // SetSyncMetrics installs the anti-entropy timing sink. Nil-safe; call once at
@@ -427,6 +426,15 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		return 0, fmt.Errorf("commit: %w", err)
 	}
 	c.mu.Unlock()
+
+	// A local write to a PK clears any stale unresolved-tie tracking for it — the
+	// remediation path (e.g. repair-owner's UpdateVMHost re-stamps ownership with
+	// a fresh timestamp). Lock-free when nothing is tracked.
+	if c.anyUnresolved() {
+		for _, s := range stmts {
+			c.clearUnresolvedFromStmt(s)
+		}
+	}
 
 	if notify {
 		c.notifyReplicator()

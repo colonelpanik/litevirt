@@ -437,6 +437,13 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			slog.Warn("sync: merge row", "table", table.Name, "error", err)
 		} else {
 			merged++
+			// Applying a strictly-newer or resolver-chosen incoming row replaces
+			// the local value, so any unresolved tie tracked for this PK is now
+			// stale (this IS the repair path — e.g. repair-owner re-stamping with
+			// a fresh timestamp propagates here). Lock-free when nothing tracked.
+			if c.anyUnresolved() {
+				c.clearUnresolved(table.Name, pkKeyAt(row, pkIdx))
+			}
 		}
 	}
 

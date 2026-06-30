@@ -1,6 +1,7 @@
 package corrosion
 
 import (
+	"context"
 	"testing"
 )
 
@@ -257,21 +258,43 @@ func TestUnresolvedTracker_DistinctOnce(t *testing.T) {
 	}
 }
 
-func TestReconciledDivergentMemo(t *testing.T) {
+// TestLocalWriteClearsUnresolved: a local write to a tracked PK (the on-node
+// remediation path, e.g. repair-owner's UpdateVMHost) clears the stale tracking.
+func TestLocalWriteClearsUnresolved(t *testing.T) {
+	ctx := context.Background()
 	c := testClient(t)
-	if c.isReconciledDivergent("peer1", "vms", "lh", "rh") {
-		t.Fatal("nothing memoized yet")
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm1", HostName: "host-a", State: "running", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
 	}
-	c.markReconciledDivergent("peer1", "vms", "lh", "rh")
-	if !c.isReconciledDivergent("peer1", "vms", "lh", "rh") {
-		t.Fatal("memoized pair should suppress")
+	// Track an unresolved tie for vm1 via the real resolver path (pkKey-formatted key).
+	cols := []string{"name", "host_name", "updated_at"}
+	c.resolveTie("vms", cols, []interface{}{"vm1", "host-a", "T"}, []interface{}{"vm1", "host-b", "T"}, []int{0}, pathAE)
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("expected one tracked tie, got %d", c.UnresolvedTieCount())
 	}
-	// A changed hash on either side invalidates the memo (real new data → re-sync).
-	if c.isReconciledDivergent("peer1", "vms", "lh2", "rh") {
-		t.Fatal("changed local hash must not be suppressed")
+	// A local write to the same PK clears it.
+	if err := UpdateVMHost(ctx, c, "vm1", "host-a", "running"); err != nil {
+		t.Fatalf("UpdateVMHost: %v", err)
 	}
-	c.clearReconciledDivergent("peer1", "vms")
-	if c.isReconciledDivergent("peer1", "vms", "lh", "rh") {
-		t.Fatal("cleared memo must not suppress")
+	if c.UnresolvedTieCount() != 0 {
+		t.Fatalf("a local write to the PK must clear the unresolved tracking, count=%d", c.UnresolvedTieCount())
+	}
+}
+
+func TestResolver_HostsControlPlaneUnresolved(t *testing.T) {
+	cols := []string{"name", "state", "fence_strategy", "cpu_total", "updated_at"}
+	// A control-plane column (fence_strategy) differs → unresolved (no coin-flip).
+	_, sm, keepLocal, unresolved := resolve(t, "hosts", cols,
+		[]interface{}{"h1", "active", "reboot", "16", "T"},
+		[]interface{}{"h1", "active", "poweroff", "16", "T"})
+	if !keepLocal || !unresolved || len(sm.tieUnresolved) != 1 || sm.tieUnresolved[0] != "hosts/ae/control_plane" {
+		t.Fatalf("a control-plane host tie must be unresolved, got keepLocal=%v unresolved=%v track=%v", keepLocal, unresolved, sm.tieUnresolved)
+	}
+	// Only a benign telemetry column (cpu_total) differs → content-max converges.
+	_, sm2, _, unres2 := resolve(t, "hosts", cols,
+		[]interface{}{"h1", "active", "reboot", "16", "T"},
+		[]interface{}{"h1", "active", "reboot", "32", "T"})
+	if unres2 || len(sm2.tieBreaks) != 1 {
+		t.Fatalf("a benign-only host tie should converge by content-max, got unresolved=%v breaks=%v", unres2, sm2.tieBreaks)
 	}
 }

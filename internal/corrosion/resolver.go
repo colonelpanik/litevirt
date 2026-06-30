@@ -122,6 +122,22 @@ func ruleColUnresolved(col, category string) tieRule {
 	}
 }
 
+// ruleAnyColUnresolved: if ANY of the named columns differ, the tie has no safe
+// winner → unresolved. For tables (like hosts) that are content-default for
+// benign telemetry but carry a few control-plane/safety columns where a
+// content-max coin-flip would be unsafe. Columns absent from the dump's declared
+// subset are skipped (mixed-schema safe).
+func ruleAnyColUnresolved(cols []string, category string) tieRule {
+	return func(rv rowView) tieDecision {
+		for _, col := range cols {
+			if rv.has(col) && rv.localStr(col) != rv.incomingStr(col) {
+				return decideUnresolved(category)
+			}
+		}
+		return pass
+	}
+}
+
 // ruleNumericMax: integer-max on a monotonic ratchet column (e.g. user_2fa
 // last_step — a TOTP replay guard that must never decrease). Equal → pass.
 func ruleNumericMax(col string) tieRule {
@@ -327,8 +343,21 @@ var capabilityMap = map[string]tableResolver{
 
 	// Content-default (explicitly assigned — no authorization/isolation/runtime/
 	// auth meaning). Tombstone-delete wins, then symmetric content-max converges.
-	"cluster":                 {category: "content", chain: contentDefaultChain()},
-	"hosts":                   {category: "content", chain: contentDefaultChain()},
+	"cluster": {category: "content", chain: contentDefaultChain()},
+	// hosts is mostly content-default telemetry (cpu/mem/disk totals, labels,
+	// version) BUT carries control-plane/safety columns where a content-max
+	// coin-flip could pick a wrong fencing strategy, IPMI target, cert serial,
+	// address/port, role, or schema version. Those differing → unresolved; a tie
+	// in only the benign columns still converges by content-max.
+	"hosts": {category: "host-control-plane", chain: []tieRule{
+		ruleTombstone(),
+		ruleAnyColUnresolved([]string{
+			"state", "address", "ssh_user", "ssh_port", "grpc_port", "cert_serial",
+			"ipmi_address", "ipmi_user", "ipmi_pass", "watchdog_dev", "fence_strategy",
+			"role", "schema_version",
+		}, "control_plane"),
+		ruleContentMax(),
+	}},
 	"host_labels":             {category: "content", chain: contentDefaultChain()},
 	"host_health":             {category: "content", chain: contentDefaultChain()},
 	"images":                  {category: "content", chain: contentDefaultChain()},

@@ -6,21 +6,25 @@ import (
 	"strings"
 )
 
-// Bounded unresolved-tie state.
+// Unresolved-tie tracking.
 //
-// An unresolved tie keeps the row divergent on purpose, so the table digest
-// stays mismatched and naive anti-entropy would re-pull and re-merge that table
-// every cycle — exactly the no-op resync this work removes. Two bounds:
+// An unresolved tie is kept local on purpose. We track (table,PK)->sorted
+// content-hash-pair so lww_tie_unresolved counts DISTINCT rows (re-observing the
+// same divergence is a no-op) and the alert fires once. The entry is cleared
+// when the row's content changes — a real new write on either side (the
+// remediation path, e.g. repair-owner re-stamping ownership with a fresh
+// timestamp), a convergent merge, or a local write to the PK — so a later
+// genuine divergence re-alerts and the count reflects reality after repair.
 //
-//  1. unresolvedTies records (table,PK)->sorted-content-hash-pair. lww_tie_unresolved
-//     is emitted only when this transitions to a NEW pair (a genuinely new
-//     divergence), so the metric counts distinct rows and the alert fires once.
-//     A real new write on either side changes the content → re-runs the resolver.
-//  2. reconciledDivergent memoizes (peer,table)->digest-pair so the AE loop skips
-//     re-pulling a table whose only delta is a known, unchanged unresolved tie.
+// NOTE: a divergent table is NOT suppressed from anti-entropy re-pulls here.
+// Table-level suppression could hide an unrelated divergent row in the same
+// table; a correct, row-proofed bound (only suppress when EVERY remaining
+// differing PK matches a tracked unresolved content-pair) is a deferred
+// follow-up. Until then a persistently-unresolved table may be re-pulled each
+// cycle — a bounded cost paid only by genuinely-stuck rows awaiting repair, and
+// strictly safer than risking hidden divergence.
 
-func unresolvedKey(table, pk string) string   { return table + "\x00" + pk }
-func reconciledKey(peer, table string) string { return peer + "\x00" + table }
+func unresolvedKey(table, pk string) string { return table + "\x00" + pk }
 
 // contentPair returns a stable, order-independent fingerprint of the two rows'
 // content, so the same divergence (regardless of which side is "local") maps to
@@ -31,6 +35,9 @@ func contentPair(local, incoming []interface{}) string {
 	sort.Strings(pair)
 	return strings.Join(pair, "\x01")
 }
+
+// anyUnresolved is the lock-free fast path for the clear-on-write hooks.
+func (c *Client) anyUnresolved() bool { return c.unresolvedLen.Load() > 0 }
 
 // trackUnresolved records an unresolved tie. It increments lww_tie_unresolved and
 // logs an alert ONCE per distinct (table,PK,content-pair); re-observing the same
@@ -48,6 +55,9 @@ func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}
 	if isNew {
 		c.unresolvedTies[key] = pair
 	}
+	if !existed {
+		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
+	}
 	c.tieMu.Unlock()
 
 	if isNew {
@@ -57,12 +67,38 @@ func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}
 	}
 }
 
-// clearUnresolved drops the tracked entry for (table,PK) — call when the row
+// clearUnresolved drops the tracked entry for (table,PK) — called when the row
 // converges or is repaired so a future genuine divergence re-alerts.
 func (c *Client) clearUnresolved(table, pk string) {
 	c.tieMu.Lock()
-	delete(c.unresolvedTies, unresolvedKey(table, pk))
+	if _, ok := c.unresolvedTies[unresolvedKey(table, pk)]; ok {
+		delete(c.unresolvedTies, unresolvedKey(table, pk))
+		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
+	}
 	c.tieMu.Unlock()
+}
+
+// clearUnresolvedFromStmt clears the tracked unresolved entry for the row a
+// statement mutates — the hook for the WAL apply path and local writes, so a
+// fresh/newer write (the remediation path) drops the stale tracking. Lock-free
+// when nothing is tracked.
+func (c *Client) clearUnresolvedFromStmt(s Statement) {
+	if !c.anyUnresolved() {
+		return
+	}
+	table := extractTableName(s.SQL)
+	if table == "" {
+		return
+	}
+	pkCols := tablePrimaryKeys[table]
+	if len(pkCols) == 0 {
+		return
+	}
+	vals := extractPKValues(table, pkCols, s)
+	if len(vals) != len(pkCols) {
+		return
+	}
+	c.clearUnresolved(table, pkKey(vals))
 }
 
 // UnresolvedTieCount returns the number of distinct currently-tracked unresolved
@@ -71,50 +107,4 @@ func (c *Client) UnresolvedTieCount() int {
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
 	return len(c.unresolvedTies)
-}
-
-// hasUnresolvedForTable reports whether any tracked unresolved tie belongs to the
-// given table (used to decide whether a persistent digest mismatch is explainable
-// by intentional divergence).
-func (c *Client) hasUnresolvedForTable(table string) bool {
-	c.tieMu.Lock()
-	defer c.tieMu.Unlock()
-	prefix := table + "\x00"
-	for k := range c.unresolvedTies {
-		if strings.HasPrefix(k, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-// markReconciledDivergent memoizes that (peer,table) at this exact digest pair has
-// already been reconciled as far as it can be (a known unresolved divergence
-// remains). The AE loop consults isReconciledDivergent to avoid re-pulling.
-func (c *Client) markReconciledDivergent(peer, table, localHash, remoteHash string) {
-	c.tieMu.Lock()
-	if c.reconciledDivergent == nil {
-		c.reconciledDivergent = make(map[string]string)
-	}
-	c.reconciledDivergent[reconciledKey(peer, table)] = localHash + "\x00" + remoteHash
-	c.tieMu.Unlock()
-}
-
-// isReconciledDivergent reports whether (peer,table) at this digest pair was
-// already reconciled to a known unresolved divergence — so the mismatch is
-// intentional and must not trigger another full-table pull/merge. Any change to
-// either hash invalidates the memo (a real new write to re-sync).
-func (c *Client) isReconciledDivergent(peer, table, localHash, remoteHash string) bool {
-	c.tieMu.Lock()
-	defer c.tieMu.Unlock()
-	v, ok := c.reconciledDivergent[reconciledKey(peer, table)]
-	return ok && v == localHash+"\x00"+remoteHash
-}
-
-// clearReconciledDivergent forgets the memo for (peer,table) — call when a merge
-// converges the table so a later genuine drift re-syncs normally.
-func (c *Client) clearReconciledDivergent(peer, table string) {
-	c.tieMu.Lock()
-	delete(c.reconciledDivergent, reconciledKey(peer, table))
-	c.tieMu.Unlock()
 }

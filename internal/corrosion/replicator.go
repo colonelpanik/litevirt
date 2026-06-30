@@ -942,6 +942,9 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	// For DELETE statements, always apply (soft-deletes use UPDATE anyway).
 	if isDeleteStatement(s.SQL) {
 		_, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if err == nil {
+			r.client.clearUnresolvedFromStmt(s)
+		}
 		return err
 	}
 
@@ -962,6 +965,12 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		applied = replaceInsertStrategy(applied, "INSERT OR REPLACE")
 	}
 	_, err := tx.ExecContext(ctx, applied, s.Params...)
+	if err == nil {
+		// A strictly-newer / resolver-chosen incoming write to this PK clears any
+		// stale unresolved-tie tracking (the remediation path). Lock-free when
+		// nothing is tracked.
+		r.client.clearUnresolvedFromStmt(s)
+	}
 	return err
 }
 

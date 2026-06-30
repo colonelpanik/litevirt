@@ -1,9 +1,15 @@
 # Cluster diagnostics
 
-Read-only tools for inspecting cluster-state health. They never write or merge
-state.
+Tools for inspecting and repairing cluster-state health. The **divergence
+scanner** (`lv doctor divergence`) is strictly read-only — it never writes or
+merges state. **Repair commands** under `lv doctor` (e.g. `repair-owner`,
+below) are intentionally mutating and audited; each is called out as such.
 
 ## `lv doctor divergence`
+
+Read-only.
+
+
 
 Scans every active node and reports replicated rows that **disagree across nodes**,
 plus cluster-wide **semantic-invariant violations**. This is the pre-remediation

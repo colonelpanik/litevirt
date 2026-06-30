@@ -199,7 +199,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 
 	// Boot: BIOS uses <boot dev="..."> in <os>, UEFI uses boot order on devices.
 	if !isUEFI {
-		dom.OS.Boot = &osBoot{Dev: cfg.Boot}
+		dom.OS.Boot = &osBoot{Dev: libvirtBootDev(cfg.Boot)}
 	}
 
 	// Secure Boot requires UEFI + q35 + SMM (G1).
@@ -632,6 +632,22 @@ type osNvram struct {
 
 type osBoot struct {
 	Dev string `xml:"dev,attr"`
+}
+
+// libvirtBootDev maps litevirt's boot keyword (disk|cdrom|network) to a value
+// libvirt accepts in <os><boot dev="...">. libvirt allows fd|hd|cdrom|network —
+// notably NOT "disk" — so the default "disk" must be rendered as "hd", otherwise
+// DomainDefineXML rejects the domain with
+// "Invalid value for attribute 'dev' in element 'boot': 'disk'".
+func libvirtBootDev(boot string) string {
+	switch boot {
+	case "cdrom":
+		return "cdrom"
+	case "network":
+		return "network"
+	default: // "disk", "" and anything unexpected → boot from the hard disk
+		return "hd"
+	}
 }
 
 type features struct {

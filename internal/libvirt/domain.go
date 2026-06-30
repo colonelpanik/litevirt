@@ -495,7 +495,9 @@ func (c *Client) SetBootOrder(domainName, bootOrder string) error {
 		return fmt.Errorf("get domain XML %s: %w", domainName, err)
 	}
 
-	updated := patchBootDev(xmlDesc, bootOrder)
+	// Map litevirt's keyword (disk|cdrom|network) to a valid libvirt boot dev
+	// (hd|cdrom|network); "disk" is rejected by libvirt.
+	updated := patchBootDev(xmlDesc, libvirtBootDev(bootOrder))
 
 	if _, err := c.virt.DomainDefineXML(updated); err != nil {
 		return fmt.Errorf("redefine domain %s: %w", domainName, err)

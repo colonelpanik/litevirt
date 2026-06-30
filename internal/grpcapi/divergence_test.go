@@ -132,6 +132,70 @@ func TestDiagnoseDivergence_RejectsUnknownTable(t *testing.T) {
 	}
 }
 
+// A sensitive table named WITHOUT --include-sensitive is rejected (it would
+// otherwise resolve to no scanned table and read as clean).
+func TestDiagnoseDivergence_RejectsSensitiveTableWithoutFlag(t *testing.T) {
+	old := divergenceResampleDelay
+	divergenceResampleDelay = 0
+	defer func() { divergenceResampleDelay = old }()
+	s := newPeerAuthServer(t)
+	_, err := s.DiagnoseDivergence(adminCtx(), &pb.DiagnoseDivergenceRequest{Tables: []string{"recovery_codes"}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("want InvalidArgument for a sensitive table without --include-sensitive, got %v", err)
+	}
+	// With the flag, it's accepted.
+	if _, err := s.DiagnoseDivergence(adminCtx(), &pb.DiagnoseDivergenceRequest{
+		Tables: []string{"recovery_codes"}, IncludeSensitive: true,
+	}); err != nil {
+		t.Fatalf("recovery_codes + --include-sensitive should be accepted, got %v", err)
+	}
+}
+
+// --include-sensitive with only an operator-safe table in scope must NOT mark
+// every host sensitive-unreachable (no sensitive table was actually scanned).
+func TestDiagnoseDivergence_NoSensitiveTableNoPartial(t *testing.T) {
+	old := divergenceResampleDelay
+	divergenceResampleDelay = 0
+	defer func() { divergenceResampleDelay = old }()
+
+	s := newPeerAuthServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "self", Address: "127.0.0.1", State: "active"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	rep, err := s.DiagnoseDivergence(adminCtx(), &pb.DiagnoseDivergenceRequest{
+		IncludeSensitive: true, Tables: []string{"vms"}, // no sensitive table in scope
+	})
+	if err != nil {
+		t.Fatalf("DiagnoseDivergence: %v", err)
+	}
+	if len(rep.GetSensitiveUnreachable()) != 0 {
+		t.Fatalf("no sensitive table scanned → sensitive_unreachable must be empty, got %v", rep.GetSensitiveUnreachable())
+	}
+}
+
+// A semantic violation present in only ONE sample (a migration in flight) is NOT
+// reported; one present in BOTH is.
+func TestReconcileViolations(t *testing.T) {
+	dupA := []corrosion.SemanticViolation{{Kind: "duplicate_live_container", Key: "web", Hosts: []string{"host-a", "host-b"}}}
+	// s1 has the duplicate, s2 doesn't (fixed / migration settled) → not reported.
+	if got := reconcileViolations(dupA, nil); len(got) != 0 {
+		t.Fatalf("transient violation (only s1) must not be reported, got %+v", got)
+	}
+	if got := reconcileViolations(nil, dupA); len(got) != 0 {
+		t.Fatalf("transient violation (only s2) must not be reported, got %+v", got)
+	}
+	// Present in both with the same identity → reported.
+	if got := reconcileViolations(dupA, dupA); len(got) != 1 || got[0].GetKey() != "web" {
+		t.Fatalf("stable violation must be reported, got %+v", got)
+	}
+	// Same kind/key but DIFFERENT hosts across samples → not stable.
+	dupB := []corrosion.SemanticViolation{{Kind: "duplicate_live_container", Key: "web", Hosts: []string{"host-a", "host-c"}}}
+	if got := reconcileViolations(dupA, dupB); len(got) != 0 {
+		t.Fatalf("host-set changed between samples → not stable, got %+v", got)
+	}
+}
+
 // With --include-sensitive, a host whose sensitive lane fails is surfaced as
 // sensitive_unreachable (partial), never silently treated as clean.
 func TestDiagnoseDivergence_SensitivePartialSurfaced(t *testing.T) {

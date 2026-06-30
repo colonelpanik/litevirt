@@ -32,17 +32,23 @@ func (s *Server) DiagnoseDivergence(ctx context.Context, req *pb.DiagnoseDiverge
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
-	// Reject unknown --table values: a typo must surface, never silently scan
-	// nothing and report "clean".
-	if err := validateTableFilter(req.GetTables()); err != nil {
+	// Reject unknown --table values, and a sensitive table named without
+	// --include-sensitive (it would otherwise silently scan nothing and read as
+	// "clean") — the same false-reassurance class as an unknown table.
+	if err := validateTableFilter(req.GetTables(), req.GetIncludeSensitive()); err != nil {
 		return nil, err
 	}
 
 	opTables := intersect(corrosion.OperatorTableNames(), req.GetTables())
 	var sensTables []string
-	var scanKey []byte
 	if req.GetIncludeSensitive() {
 		sensTables = intersect(corrosion.SensitiveTableNames(), req.GetTables())
+	}
+	// Drive the sensitive lane (key, scan, reporting) only when a sensitive table
+	// is actually in scope — e.g. `--include-sensitive --table vms` has no
+	// sensitive table, so it must not mint a key or mark every host partial.
+	var scanKey []byte
+	if len(sensTables) > 0 {
 		var err error
 		if scanKey, err = randomScanKey(); err != nil {
 			return nil, status.Errorf(codes.Internal, "scan key: %v", err)
@@ -85,13 +91,17 @@ func (s *Server) DiagnoseDivergence(ctx context.Context, req *pb.DiagnoseDiverge
 	commonSens := intersectStrSets(s1.sensReachable, s2.sensReachable)
 	report.NodesScanned = commonOp
 	report.NodesUnreachable = subtract(activeNames(active), commonOp)
-	if req.GetIncludeSensitive() {
+	if len(sensTables) > 0 {
 		report.SensitiveUnreachable = subtract(activeNames(active), commonSens)
 	}
 
 	// Semantic invariants run regardless of node count — a single node can hold a
-	// jointly-illegal state (e.g. the same container name live on two hosts).
-	report.Violations = semanticViolationsPB(append(s1.owned, s2.owned...))
+	// jointly-illegal state. Reconcile across BOTH samples (like row divergence):
+	// report a violation only if it appears in both, so an in-flight migration
+	// (web on host-a in s1, host-b in s2 — never both live at once) isn't faked
+	// into a duplicate, and one fixed before s2 isn't preserved.
+	report.Violations = reconcileViolations(
+		semanticViolations(s1.owned), semanticViolations(s2.owned))
 
 	if len(commonOp) >= 2 || len(commonSens) >= 2 {
 		d1 := classifyLanes(opTables, sensTables, commonOp, commonSens, s1.snaps)
@@ -103,7 +113,7 @@ func (s *Server) DiagnoseDivergence(ctx context.Context, req *pb.DiagnoseDiverge
 	// sets in both samples AND no scanned table's content changed between them.
 	// When false, a stuck_different may be lagging backlog, not a true split.
 	nodeSetsStable := equalStrSet(s1.opReachable, s2.opReachable) &&
-		(!req.GetIncludeSensitive() || equalStrSet(s1.sensReachable, s2.sensReachable))
+		(len(sensTables) == 0 || equalStrSet(s1.sensReachable, s2.sensReachable))
 	report.Stable = nodeSetsStable &&
 		sampleFingerprint(commonOp, commonSens, opTables, sensTables, s1.snaps) ==
 			sampleFingerprint(commonOp, commonSens, opTables, sensTables, s2.snaps)
@@ -269,26 +279,39 @@ func intersect(base, filter []string) []string {
 }
 
 // validateTableFilter rejects any --table value that isn't a known replicated
-// table — a typo must error, not silently scan nothing and report "clean".
-func validateTableFilter(tables []string) error {
+// table (a typo must error, not silently scan nothing and read as "clean"), and a
+// SENSITIVE table named without --include-sensitive (it would otherwise resolve to
+// no scanned table — the same false-reassurance class).
+func validateTableFilter(tables []string, includeSensitive bool) error {
 	if len(tables) == 0 {
 		return nil
 	}
-	known := map[string]bool{}
+	op := map[string]bool{}
 	for _, t := range corrosion.OperatorTableNames() {
-		known[t] = true
+		op[t] = true
 	}
+	sens := map[string]bool{}
 	for _, t := range corrosion.SensitiveTableNames() {
-		known[t] = true
+		sens[t] = true
 	}
-	var unknown []string
+	var unknown, sensWithoutFlag []string
 	for _, t := range tables {
-		if !known[t] {
+		switch {
+		case op[t]:
+		case sens[t]:
+			if !includeSensitive {
+				sensWithoutFlag = append(sensWithoutFlag, t)
+			}
+		default:
 			unknown = append(unknown, t)
 		}
 	}
 	if len(unknown) > 0 {
 		return status.Errorf(codes.InvalidArgument, "unknown table(s): %s", strings.Join(unknown, ", "))
+	}
+	if len(sensWithoutFlag) > 0 {
+		return status.Errorf(codes.InvalidArgument,
+			"table(s) %s are secret-bearing; pass --include-sensitive to scan them", strings.Join(sensWithoutFlag, ", "))
 	}
 	return nil
 }
@@ -461,7 +484,9 @@ func rowDivergenceToPB(d corrosion.RowDivergence, class corrosion.DivergenceClas
 	return &pb.DivergenceRow{Table: d.Table, Pk: d.PKLabel, Class: string(class), PerNode: per}
 }
 
-func semanticViolationsPB(owned []corrosion.OwnedRow) []*pb.SemanticViolationPB {
+// semanticViolations runs the cluster-wide invariant checks over ONE sample's
+// owned rows.
+func semanticViolations(owned []corrosion.OwnedRow) []corrosion.SemanticViolation {
 	var containers, ips []corrosion.OwnedRow
 	for _, o := range owned {
 		if o.Host != "" && o.Name != "" && o.IP == "" {
@@ -474,9 +499,27 @@ func semanticViolationsPB(owned []corrosion.OwnedRow) []*pb.SemanticViolationPB 
 	var vs []corrosion.SemanticViolation
 	vs = append(vs, corrosion.CheckLiveContainerNames(containers)...)
 	vs = append(vs, corrosion.CheckDuplicateIPOwners(ips)...)
-	out := make([]*pb.SemanticViolationPB, 0, len(vs))
-	for _, v := range vs {
-		out = append(out, &pb.SemanticViolationPB{Kind: v.Kind, Key: v.Key, Detail: v.Detail, Hosts: v.Hosts})
+	return vs
+}
+
+// reconcileViolations reports a semantic violation only when it appears in BOTH
+// samples with the SAME identity (kind + key + hosts) — so a violation that was
+// transient (an in-flight migration that never had both rows live at once) or
+// fixed before the second sample is not reported, matching the row-divergence
+// persistence policy.
+func reconcileViolations(v1, v2 []corrosion.SemanticViolation) []*pb.SemanticViolationPB {
+	key := func(v corrosion.SemanticViolation) string {
+		return v.Kind + "\x00" + v.Key + "\x00" + strings.Join(v.Hosts, ",")
+	}
+	in1 := make(map[string]bool, len(v1))
+	for _, v := range v1 {
+		in1[key(v)] = true
+	}
+	var out []*pb.SemanticViolationPB
+	for _, v := range v2 {
+		if in1[key(v)] {
+			out = append(out, &pb.SemanticViolationPB{Kind: v.Kind, Key: v.Key, Detail: v.Detail, Hosts: v.Hosts})
+		}
 	}
 	return out
 }

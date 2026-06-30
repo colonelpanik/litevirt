@@ -43,6 +43,7 @@ const (
 	LiteVirt_StopVM_FullMethodName                     = "/litevirt.v1.LiteVirt/StopVM"
 	LiteVirt_RestartVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestartVM"
 	LiteVirt_DeleteVM_FullMethodName                   = "/litevirt.v1.LiteVirt/DeleteVM"
+	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
 	LiteVirt_CloneVM_FullMethodName                    = "/litevirt.v1.LiteVirt/CloneVM"
 	LiteVirt_ConvertToTemplate_FullMethodName          = "/litevirt.v1.LiteVirt/ConvertToTemplate"
 	LiteVirt_ExecVM_FullMethodName                     = "/litevirt.v1.LiteVirt/ExecVM"
@@ -268,6 +269,7 @@ type LiteVirtClient interface {
 	StopVM(ctx context.Context, in *StopVMRequest, opts ...grpc.CallOption) (*VM, error)
 	RestartVM(ctx context.Context, in *RestartVMRequest, opts ...grpc.CallOption) (*VM, error)
 	DeleteVM(ctx context.Context, in *DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
 	CloneVM(ctx context.Context, in *CloneVMRequest, opts ...grpc.CallOption) (*VM, error)
 	ConvertToTemplate(ctx context.Context, in *ConvertToTemplateRequest, opts ...grpc.CallOption) (*VM, error)
 	ExecVM(ctx context.Context, in *ExecVMRequest, opts ...grpc.CallOption) (*ExecVMResponse, error)
@@ -812,6 +814,16 @@ func (c *liteVirtClient) DeleteVM(ctx context.Context, in *DeleteVMRequest, opts
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_DeleteVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RepairVMOwnerResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RepairVMOwner_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2928,6 +2940,7 @@ type LiteVirtServer interface {
 	StopVM(context.Context, *StopVMRequest) (*VM, error)
 	RestartVM(context.Context, *RestartVMRequest) (*VM, error)
 	DeleteVM(context.Context, *DeleteVMRequest) (*emptypb.Empty, error)
+	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
 	CloneVM(context.Context, *CloneVMRequest) (*VM, error)
 	ConvertToTemplate(context.Context, *ConvertToTemplateRequest) (*VM, error)
 	ExecVM(context.Context, *ExecVMRequest) (*ExecVMResponse, error)
@@ -3283,6 +3296,9 @@ func (UnimplementedLiteVirtServer) RestartVM(context.Context, *RestartVMRequest)
 }
 func (UnimplementedLiteVirtServer) DeleteVM(context.Context, *DeleteVMRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteVM not implemented")
+}
+func (UnimplementedLiteVirtServer) RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RepairVMOwner not implemented")
 }
 func (UnimplementedLiteVirtServer) CloneVM(context.Context, *CloneVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method CloneVM not implemented")
@@ -4230,6 +4246,24 @@ func _LiteVirt_DeleteVM_Handler(srv interface{}, ctx context.Context, dec func(i
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).DeleteVM(ctx, req.(*DeleteVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RepairVMOwner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RepairVMOwnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RepairVMOwner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RepairVMOwner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RepairVMOwner(ctx, req.(*RepairVMOwnerRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7425,6 +7459,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteVM",
 			Handler:    _LiteVirt_DeleteVM_Handler,
+		},
+		{
+			MethodName: "RepairVMOwner",
+			Handler:    _LiteVirt_RepairVMOwner_Handler,
 		},
 		{
 			MethodName: "CloneVM",

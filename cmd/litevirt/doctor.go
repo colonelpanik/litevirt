@@ -19,8 +19,36 @@ func newDoctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "Read-only cluster diagnostics",
 	}
-	cmd.AddCommand(newDoctorDivergenceCmd())
+	cmd.AddCommand(newDoctorDivergenceCmd(), newDoctorRepairOwnerCmd())
 	return cmd
+}
+
+func newDoctorRepairOwnerCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "repair-owner <vm> <host>",
+		Short: "Re-assert a VM's owner on the host that runs it (converge an equal-timestamp ownership split)",
+		Long: `Re-stamp a VM's host_name ownership with a fresh timestamp on <host>, which must
+be the host that actually runs the VM. The daemon forwards the request to <host>
+and applies the write ONLY if that host confirms the VM is running locally — so it
+can never point ownership at a host that doesn't run the VM. It is non-destructive
+(a DB owner write; it never touches the domain).
+
+Use it to converge a stale bystander host_name left by an equal-timestamp
+last-writer-wins split that a stationary VM can't self-heal — find such rows with
+'lv doctor divergence'. Admin only; audited.`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.RepairVMOwner(ctx, &pb.RepairVMOwnerRequest{Name: args[0], Host: args[1]})
+				if err != nil {
+					return fmt.Errorf("repair owner: %w", err)
+				}
+				fmt.Printf("vm %s owner re-asserted on %s (was %s); a fresh timestamp will converge stale peers\n",
+					args[0], resp.GetHost(), resp.GetPreviousHost())
+				return nil
+			})
+		},
+	}
 }
 
 func newDoctorDivergenceCmd() *cobra.Command {

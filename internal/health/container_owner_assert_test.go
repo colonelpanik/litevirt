@@ -244,6 +244,26 @@ func TestRekeyContainerOwner_GuardRejectsRaces(t *testing.T) {
 	if liveCt(t, db4, "node-a", "ct1") != nil {
 		t.Fatal("refused re-key must not create a target row")
 	}
+
+	// (e) a lease exists for the SAME ip on a DIFFERENT network than the managed
+	// NIC claims → refuse (ip_allocations is keyed by (network, ip); a net-b lease
+	// does not back a net-a NIC).
+	db5 := testLogicDB(t)
+	spec5, _ := json.Marshal(corrosion.ContainerCreateSpec{
+		Networks: []corrosion.ContainerNetwork{{NetworkName: "net-a", IP: "10.0.0.5"}},
+	})
+	insertCt(t, db5, corrosion.ContainerRecord{HostName: "node-b", Name: "ct1", State: "running", Image: "alpine", CreateSpec: string(spec5)})
+	remote5, _ := corrosion.GetContainer(ctx, db5, "node-b", "ct1")
+	// Lease is for net-b/10.0.0.5 — the WRONG network.
+	if ok, err := network.ReserveContainerIP(ctx, db5, "net-b", "10.0.0.5", "mac", "node-b", "ct1"); err != nil || !ok {
+		t.Fatalf("ReserveContainerIP: %v", err)
+	}
+	if applied, _ := corrosion.RekeyContainerOwner(ctx, db5, *remote5, "node-a"); applied {
+		t.Fatal("re-key must refuse: the lease is for a different network than the managed NIC")
+	}
+	if liveCt(t, db5, "node-a", "ct1") != nil {
+		t.Fatal("wrong-network lease re-key must not create a target row")
+	}
 }
 
 // Another host reports the container running → split-brain → never re-key.

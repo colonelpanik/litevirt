@@ -345,19 +345,21 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 		if n > 0 {
 			return false, nil // a real local row appeared — abort, never clobber it
 		}
-		// (c) source must own the live IPAM lease for every managed NIC IP we are
-		// about to assert on the target (mirror the migrate ContainerLeasesOwnedBy
-		// invariant) — never claim an IP IPAM doesn't back.
-		for _, ip := range managedIPs {
+		// (c) source must own the live IPAM lease for every managed NIC (network, ip)
+		// we are about to assert on the target (mirror the migrate
+		// ContainerLeasesOwnedBy invariant) — matched on BOTH network and ip, since
+		// ip_allocations is keyed by (network, ip) and the rebuilt interface row
+		// claims a specific network. Never claim an address IPAM doesn't back.
+		for _, nic := range managedIPs {
 			var ln int
 			if err := tx.QueryRowContext(ctx,
 				`SELECT COUNT(*) FROM ip_allocations
-				 WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND ip = ? AND deleted_at IS NULL`,
-				src.HostName, src.Name, ip).Scan(&ln); err != nil {
+				 WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND network = ? AND ip = ? AND deleted_at IS NULL`,
+				src.HostName, src.Name, nic.network, nic.ip).Scan(&ln); err != nil {
 				return false, err
 			}
 			if ln == 0 {
-				return false, nil // a managed IP with no source lease — refuse
+				return false, nil // a managed (network, ip) with no source lease — refuse
 			}
 		}
 		return true, nil
@@ -394,18 +396,23 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
 
-// managedNICIPs returns the non-empty static/effective IPs of a container's
-// MANAGED NICs (those with a network_name) derived from its create_spec — the
-// IPs the re-key will assert on the target and must therefore prove the source
-// holds the IPAM lease for.
-func managedNICIPs(src ContainerRecord) []string {
-	var ips []string
+// managedNICIP is a managed NIC's (network, ip) — the FULL IPAM key. The lease
+// precondition must match both: ip_allocations is keyed by (network, ip), and the
+// rebuilt target interface row claims a specific network_name, so a lease for the
+// same ip on a DIFFERENT network does not back it.
+type managedNICIP struct{ network, ip string }
+
+// managedNICIPs returns the (network, ip) of each MANAGED NIC (network_name set)
+// with a non-empty static/effective IP, derived from create_spec — the addresses
+// the re-key will assert on the target and must prove the source holds a lease for.
+func managedNICIPs(src ContainerRecord) []managedNICIP {
+	var out []managedNICIP
 	for _, ifc := range BuildContainerInterfacesFromSpec(src.HostName, src.Name, DecodeCreateSpec(src.CreateSpec)) {
 		if ifc.IP != "" {
-			ips = append(ips, ifc.IP)
+			out = append(out, managedNICIP{network: ifc.NetworkName, ip: ifc.IP})
 		}
 	}
-	return ips
+	return out
 }
 
 // rekeyContainerStmt builds the dedicated re-key row write: an INSERT OR REPLACE

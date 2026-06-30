@@ -381,6 +381,74 @@ func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
 	return err
 }
 
+// ExecuteBatchGuarded runs stmts in ONE transaction ONLY IF guard — evaluated
+// INSIDE that transaction against a consistent snapshot — returns true. It is the
+// compare-and-swap primitive for a repair that must not race its own
+// read→probe→write window: the guard re-reads the preconditions atomically with
+// the writes. Returns applied=false (no error) when the guard declines, so the
+// caller treats that as "preconditions no longer hold — skip and retry later".
+func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx) (bool, error), stmts []Statement) (bool, error) {
+	c.mu.Lock()
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		c.mu.Unlock()
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	ok, gerr := guard(tx)
+	if gerr != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, fmt.Errorf("guard: %w", gerr)
+	}
+	if !ok {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, nil
+	}
+	var mutated []Statement
+	for _, s := range stmts {
+		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, fmt.Errorf("exec guarded batch: %w", err)
+		}
+		if n, e := res.RowsAffected(); e == nil && n > 0 {
+			mutated = append(mutated, s)
+		}
+	}
+	if c.clock != nil {
+		stmtsJSON, err := json.Marshal(stmts)
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, fmt.Errorf("marshal stmts: %w", err)
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO mutation_log (hlc, origin, stmts, created_at) VALUES (?, ?, ?, ?)`,
+			c.clock.Now().String(), c.hostName, string(stmtsJSON), now,
+		); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, fmt.Errorf("write mutation_log: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		c.mu.Unlock()
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	c.mu.Unlock()
+
+	if c.anyUnresolved() {
+		for _, s := range mutated {
+			c.clearUnresolvedFromStmt(s)
+		}
+	}
+	c.notifyReplicator()
+	return true, nil
+}
+
 func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify bool) (int64, error) {
 	c.mu.Lock()
 	tx, err := c.db.BeginTx(ctx, nil)

@@ -157,10 +157,21 @@ func (c *ContainerChecker) tryRekey(ctx context.Context, name string, remote cor
 		c.observeRekey(name, "inconclusive")
 	default:
 		// Decision-complete: runs here, exactly one remote owner row, no other
-		// host runs it. Re-key ownership to us (atomic PK change).
-		if err := corrosion.RekeyContainerOwner(ctx, c.db, remote, c.hostName); err != nil {
+		// host runs it. Re-key ownership to us (guarded atomic PK change across the
+		// row, its interface rows, and its IPAM leases).
+		applied, err := corrosion.RekeyContainerOwner(ctx, c.db, remote, c.hostName)
+		if err != nil {
 			slog.Warn("ct-rekey: RekeyContainerOwner failed", "container", name, "error", err)
 			c.observeRekey(name, "error")
+			return
+		}
+		if !applied {
+			// The guard declined: between our read/probe and the write the source
+			// changed (deleted / entered relocation / updated), a live local row
+			// appeared, or a managed NIC IP isn't lease-backed on the source. Skip
+			// and retry next sweep — never write a partial/clobbering state.
+			slog.Info("ct-rekey: preconditions no longer hold (raced) — deferring", "container", name, "db_host", remote.HostName)
+			c.observeRekey(name, "inconclusive")
 			return
 		}
 		slog.Warn("ct-rekey: reclaimed container ownership — runs locally and no other host runs it",

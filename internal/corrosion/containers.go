@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -302,12 +303,66 @@ const ContainerRuntimeRekeyDetail = "runtime-owner-rekey"
 // created_at and relocate_token are preserved from src (never minted). This is
 // the container analogue of UpdateVMHost — but a PK CHANGE across three tables,
 // because container ownership is part of the primary key (host_name, name).
-func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, toHost string) error {
+//
+// The whole thing is GUARDED (compare-and-swap): the preconditions are re-checked
+// inside the write transaction against src.UpdatedAt (optimistic concurrency), so
+// a source that was deleted, entered relocation/migration, or whose updated_at
+// changed since the caller observed it — or a live target row that appeared, or a
+// managed NIC IP the source doesn't actually hold the lease for — aborts the
+// re-key WITHOUT writing anything. Returns applied=false (no error) on a declined
+// guard; the caller skips and retries next sweep.
+func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, toHost string) (bool, error) {
 	now := c.NowTS()
 	rk, err := rekeyContainerStmt(c, src, toHost, now)
 	if err != nil {
-		return err
+		return false, err
 	}
+	managedIPs := managedNICIPs(src)
+	guard := func(tx *sql.Tx) (bool, error) {
+		// (a) source row still live, unchanged since observed, not relocating.
+		var state, detail, token, updatedAt string
+		err := tx.QueryRowContext(ctx,
+			`SELECT state, COALESCE(state_detail,''), COALESCE(relocate_token,''), updated_at
+			 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			src.HostName, src.Name).Scan(&state, &detail, &token, &updatedAt)
+		if err == sql.ErrNoRows {
+			return false, nil // source vanished
+		}
+		if err != nil {
+			return false, err
+		}
+		if updatedAt != src.UpdatedAt || token != "" ||
+			state == "migrating" || state == "relocating" || state == "pending" {
+			return false, nil // changed / now under relocation
+		}
+		// (b) no LIVE target row may exist (only a soft-deleted one may be replaced).
+		var n int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			toHost, src.Name).Scan(&n); err != nil {
+			return false, err
+		}
+		if n > 0 {
+			return false, nil // a real local row appeared — abort, never clobber it
+		}
+		// (c) source must own the live IPAM lease for every managed NIC IP we are
+		// about to assert on the target (mirror the migrate ContainerLeasesOwnedBy
+		// invariant) — never claim an IP IPAM doesn't back.
+		for _, ip := range managedIPs {
+			var ln int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM ip_allocations
+				 WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND ip = ? AND deleted_at IS NULL`,
+				src.HostName, src.Name, ip).Scan(&ln); err != nil {
+				return false, err
+			}
+			if ln == 0 {
+				return false, nil // a managed IP with no source lease — refuse
+			}
+		}
+		return true, nil
+	}
+
 	stmts := []Statement{
 		// (1) tombstone the source container row.
 		{
@@ -326,7 +381,7 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 	for _, ifc := range BuildContainerInterfacesFromSpec(toHost, src.Name, DecodeCreateSpec(src.CreateSpec)) {
 		s, err := containerInterfaceStmt(c, ifc)
 		if err != nil {
-			return err
+			return false, err
 		}
 		stmts = append(stmts, s)
 	}
@@ -336,7 +391,21 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 		      WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL`,
 		Params: []interface{}{toHost, nowRFC3339(), now, src.HostName, src.Name},
 	})
-	return c.ExecuteBatch(ctx, stmts)
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// managedNICIPs returns the non-empty static/effective IPs of a container's
+// MANAGED NICs (those with a network_name) derived from its create_spec — the
+// IPs the re-key will assert on the target and must therefore prove the source
+// holds the IPAM lease for.
+func managedNICIPs(src ContainerRecord) []string {
+	var ips []string
+	for _, ifc := range BuildContainerInterfacesFromSpec(src.HostName, src.Name, DecodeCreateSpec(src.CreateSpec)) {
+		if ifc.IP != "" {
+			ips = append(ips, ifc.IP)
+		}
+	}
+	return ips
 }
 
 // rekeyContainerStmt builds the dedicated re-key row write: an INSERT OR REPLACE

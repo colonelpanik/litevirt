@@ -186,6 +186,66 @@ func TestCtRekey_LeaseNotGCdBeforeRepair(t *testing.T) {
 	}
 }
 
+// The guarded re-key transaction must DECLINE (write nothing) when a precondition
+// changes between the caller's observation and the write — the read→probe→write
+// race the reconciler can't otherwise close.
+func TestRekeyContainerOwner_GuardRejectsRaces(t *testing.T) {
+	ctx := context.Background()
+
+	// (a) source updated_at changed since observed (it was touched / re-homed).
+	db := testLogicDB(t)
+	insertCt(t, db, corrosion.ContainerRecord{HostName: "node-b", Name: "ct1", State: "running", Image: "alpine"})
+	remote, _ := corrosion.GetContainer(ctx, db, "node-b", "ct1")
+	insertCt(t, db, corrosion.ContainerRecord{HostName: "node-b", Name: "ct1", State: "running", Image: "alpine2"}) // bumps updated_at
+	if applied, err := corrosion.RekeyContainerOwner(ctx, db, *remote, "node-a"); err != nil || applied {
+		t.Fatalf("stale-source re-key must be declined, applied=%v err=%v", applied, err)
+	}
+	if liveCt(t, db, "node-a", "ct1") != nil {
+		t.Fatal("declined re-key must not create a target row")
+	}
+	if liveCt(t, db, "node-b", "ct1") == nil {
+		t.Fatal("declined re-key must leave the source live")
+	}
+
+	// (b) a LIVE target row appeared → abort, never clobber it.
+	db2 := testLogicDB(t)
+	insertCt(t, db2, corrosion.ContainerRecord{HostName: "node-b", Name: "ct1", State: "running", Image: "alpine"})
+	remote2, _ := corrosion.GetContainer(ctx, db2, "node-b", "ct1")
+	insertCt(t, db2, corrosion.ContainerRecord{HostName: "node-a", Name: "ct1", State: "running", Image: "LIVE-LOCAL"})
+	if applied, _ := corrosion.RekeyContainerOwner(ctx, db2, *remote2, "node-a"); applied {
+		t.Fatal("re-key must abort when a live target row exists")
+	}
+	if got := liveCt(t, db2, "node-a", "ct1"); got == nil || got.Image != "LIVE-LOCAL" {
+		t.Fatalf("a live target row must NOT be clobbered, got %+v", got)
+	}
+
+	// (c) source entered relocation since observed.
+	db3 := testLogicDB(t)
+	insertCt(t, db3, corrosion.ContainerRecord{HostName: "node-b", Name: "ct1", State: "running", Image: "alpine"})
+	remote3, _ := corrosion.GetContainer(ctx, db3, "node-b", "ct1")
+	insertCt(t, db3, corrosion.ContainerRecord{
+		HostName: "node-b", Name: "ct1", State: "relocating", Image: "alpine",
+		StateDetail: corrosion.RelocateRestoreDetail("node-a", "tok"),
+	})
+	if applied, _ := corrosion.RekeyContainerOwner(ctx, db3, *remote3, "node-a"); applied {
+		t.Fatal("re-key must abort when the source entered relocation")
+	}
+
+	// (d) a managed NIC IP with no source lease → refuse (never assert an unowned IP).
+	db4 := testLogicDB(t)
+	specJSON, _ := json.Marshal(corrosion.ContainerCreateSpec{
+		Networks: []corrosion.ContainerNetwork{{NetworkName: "net1", IP: "10.0.0.5"}},
+	})
+	insertCt(t, db4, corrosion.ContainerRecord{HostName: "node-b", Name: "ct1", State: "running", Image: "alpine", CreateSpec: string(specJSON)})
+	remote4, _ := corrosion.GetContainer(ctx, db4, "node-b", "ct1")
+	if applied, _ := corrosion.RekeyContainerOwner(ctx, db4, *remote4, "node-a"); applied {
+		t.Fatal("re-key must refuse a managed NIC IP the source holds no lease for")
+	}
+	if liveCt(t, db4, "node-a", "ct1") != nil {
+		t.Fatal("refused re-key must not create a target row")
+	}
+}
+
 // Another host reports the container running → split-brain → never re-key.
 func TestCtRekey_SplitBrainRefuses(t *testing.T) {
 	ctx := context.Background()

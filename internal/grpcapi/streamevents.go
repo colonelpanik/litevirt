@@ -206,11 +206,22 @@ func (s *Server) ListAuditLog(ctx context.Context, req *pb.ListAuditLogRequest) 
 	return resp, nil
 }
 
-// audit records an action in the audit_log table. Errors are logged but not propagated.
+// audit records an action in the audit_log table, attributed to the caller.
+// Errors are logged but not propagated.
 func (s *Server) audit(ctx context.Context, action, target, detail, result string) {
+	s.auditAs(ctx, callerUsername(ctx), action, target, detail, result)
+}
+
+// auditAs records an action attributed to an explicit actor rather than the
+// transport caller. It exists for cross-node operations forwarded over peer
+// mTLS: the peer authenticates as the bearerless "admin" identity, so a plain
+// audit on the target would mis-attribute the write to "admin" instead of the
+// operator who initiated it. The initiating principal is carried to the target
+// in trusted peer-mTLS metadata and passed here.
+func (s *Server) auditAs(ctx context.Context, actor, action, target, detail, result string) {
 	rec := corrosion.AuditRecord{
 		ID:       newID(),
-		Username: callerUsername(ctx),
+		Username: actor,
 		HostName: s.hostName,
 		Action:   action,
 		Target:   target,

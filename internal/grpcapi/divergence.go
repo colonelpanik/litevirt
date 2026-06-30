@@ -3,8 +3,11 @@ package grpcapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -29,6 +32,11 @@ func (s *Server) DiagnoseDivergence(ctx context.Context, req *pb.DiagnoseDiverge
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
+	// Reject unknown --table values: a typo must surface, never silently scan
+	// nothing and report "clean".
+	if err := validateTableFilter(req.GetTables()); err != nil {
+		return nil, err
+	}
 
 	opTables := intersect(corrosion.OperatorTableNames(), req.GetTables())
 	var sensTables []string
@@ -51,24 +59,15 @@ func (s *Server) DiagnoseDivergence(ctx context.Context, req *pb.DiagnoseDiverge
 			active = append(active, h)
 		}
 	}
-	nodeNames := make([]string, 0, len(active))
-	for _, h := range active {
-		nodeNames = append(nodeNames, h.Name)
-	}
-	sort.Strings(nodeNames)
 
-	// Fewer than two reachable nodes ⇒ nothing to compare.
-	s1, owned, unreachable := s.sampleCluster(ctx, active, opTables, sensTables, scanKey)
-	report := &pb.DivergenceReport{Samples: 1, NodesUnreachable: unreachable}
-	report.NodesScanned = reachableNames(nodeNames, unreachable)
-	if len(report.NodesScanned) < 2 {
-		// Still run semantic invariants — a single node can hold jointly-illegal rows.
-		report.Violations = semanticViolationsPB(owned)
-		return report, nil
-	}
+	s1 := s.sampleCluster(ctx, active, opTables, sensTables, scanKey)
+	report := &pb.DivergenceReport{Samples: 1}
 
-	// Second sample after a brief settle; only divergences stable across both are
-	// real (the plan's "stable repeated divergence after catch-up").
+	// A second sample after a brief settle. A divergence is real only when it
+	// persists across both samples with unchanged content; an in-flight delta
+	// changes between samples and is dropped. Per-lane reachability is tracked
+	// separately so a host whose sensitive lane failed isn't treated as "missing"
+	// the sensitive rows (a false divergence) and is surfaced as partial.
 	if divergenceResampleDelay > 0 {
 		select {
 		case <-time.After(divergenceResampleDelay):
@@ -76,84 +75,125 @@ func (s *Server) DiagnoseDivergence(ctx context.Context, req *pb.DiagnoseDiverge
 			return nil, ctx.Err()
 		}
 	}
-	s2, owned2, _ := s.sampleCluster(ctx, active, opTables, sensTables, scanKey)
+	s2 := s.sampleCluster(ctx, active, opTables, sensTables, scanKey)
 	report.Samples = 2
 
-	d1 := classifyAll(append(opTables, sensTables...), report.NodesScanned, s1)
-	d2 := classifyAll(append(opTables, sensTables...), report.NodesScanned, s2)
-	report.Rows = reconcileSamples(d1, d2)
-	report.Stable = true
-	report.Violations = semanticViolationsPB(append(owned, owned2...))
+	// Compare only over nodes reachable (per lane) in BOTH samples — a node that
+	// flapped is excluded from classification (so its absence in one sample can't
+	// fabricate a divergence) and surfaced as unreachable.
+	commonOp := intersectStrSets(s1.opReachable, s2.opReachable)
+	commonSens := intersectStrSets(s1.sensReachable, s2.sensReachable)
+	report.NodesScanned = commonOp
+	report.NodesUnreachable = subtract(activeNames(active), commonOp)
+	if req.GetIncludeSensitive() {
+		report.SensitiveUnreachable = subtract(activeNames(active), commonSens)
+	}
+
+	// Semantic invariants run regardless of node count — a single node can hold a
+	// jointly-illegal state (e.g. the same container name live on two hosts).
+	report.Violations = semanticViolationsPB(append(s1.owned, s2.owned...))
+
+	if len(commonOp) >= 2 || len(commonSens) >= 2 {
+		d1 := classifyLanes(opTables, sensTables, commonOp, commonSens, s1.snaps)
+		d2 := classifyLanes(opTables, sensTables, commonOp, commonSens, s2.snaps)
+		report.Rows = reconcileSamples(d1, d2)
+	}
+
+	// stable: the cluster was QUIESCENT across the scan — identical per-lane node
+	// sets in both samples AND no scanned table's content changed between them.
+	// When false, a stuck_different may be lagging backlog, not a true split.
+	nodeSetsStable := equalStrSet(s1.opReachable, s2.opReachable) &&
+		(!req.GetIncludeSensitive() || equalStrSet(s1.sensReachable, s2.sensReachable))
+	report.Stable = nodeSetsStable &&
+		sampleFingerprint(commonOp, commonSens, opTables, sensTables, s1.snaps) ==
+			sampleFingerprint(commonOp, commonSens, opTables, sensTables, s2.snaps)
 	return report, nil
 }
 
-// sampleCluster gathers one snapshot per active host (self locally, peers via
-// StreamStateDump + the sensitive HMAC RPC), returning the per-node snapshots,
-// the union of semantic owned-rows, and the hosts that were unreachable.
-func (s *Server) sampleCluster(ctx context.Context, active []corrosion.HostRecord, opTables, sensTables []string, scanKey []byte) (map[string]corrosion.NodeSnapshot, []corrosion.OwnedRow, []string) {
-	snaps := make(map[string]corrosion.NodeSnapshot, len(active))
-	var owned []corrosion.OwnedRow
-	var unreachable []string
+// clusterSample is one fan-out pass: per-node snapshots plus, per lane, the set
+// of hosts that answered successfully (so a failed lane is partial, not silently
+// clean — and not a fabricated divergence).
+type clusterSample struct {
+	snaps         map[string]corrosion.NodeSnapshot
+	owned         []corrosion.OwnedRow
+	opReachable   map[string]bool // host → op-safe lane succeeded
+	sensReachable map[string]bool // host → sensitive lane succeeded
+}
 
+// sampleCluster gathers one snapshot per active host (self locally, peers via
+// StreamStateDump + the sensitive HMAC RPC).
+func (s *Server) sampleCluster(ctx context.Context, active []corrosion.HostRecord, opTables, sensTables []string, scanKey []byte) clusterSample {
+	cs := clusterSample{
+		snaps:         make(map[string]corrosion.NodeSnapshot, len(active)),
+		opReachable:   map[string]bool{},
+		sensReachable: map[string]bool{},
+	}
 	for _, h := range active {
+		var tables map[string]corrosion.TableSnapshot
+		var owned []corrosion.OwnedRow
+		var sensOK bool
+
 		if h.Name == s.hostName {
-			tables, o, err := s.db.ScanLocalTables(ctx, opTables)
+			t, o, err := s.db.ScanLocalTables(ctx, opTables)
 			if err != nil {
-				unreachable = append(unreachable, h.Name)
-				continue
+				continue // op lane failed for self → not opReachable
 			}
-			owned = append(owned, o...)
+			tables, owned = t, o
 			if len(sensTables) > 0 {
 				if srows, serr := s.db.ScanLocalSensitive(ctx, scanKey, sensTables); serr == nil {
 					mergeSnapshot(tables, corrosion.SensitiveRowsToSnapshot(srows))
+					sensOK = true
 				}
 			}
-			snaps[h.Name] = corrosion.NodeSnapshot{Host: h.Name, Tables: tables}
-			continue
+		} else {
+			t, o, ok, sok := s.fetchPeerSnapshot(ctx, h.Name, opTables, sensTables, scanKey)
+			if !ok {
+				continue // op lane failed for peer
+			}
+			tables, owned, sensOK = t, o, sok
 		}
-		// Peer.
-		tables, o, ok := s.fetchPeerSnapshot(ctx, h.Name, opTables, sensTables, scanKey)
-		if !ok {
-			unreachable = append(unreachable, h.Name)
-			continue
+
+		cs.opReachable[h.Name] = true
+		if len(sensTables) > 0 && sensOK {
+			cs.sensReachable[h.Name] = true
 		}
-		owned = append(owned, o...)
-		snaps[h.Name] = corrosion.NodeSnapshot{Host: h.Name, Tables: tables}
+		cs.owned = append(cs.owned, owned...)
+		cs.snaps[h.Name] = corrosion.NodeSnapshot{Host: h.Name, Tables: tables}
 	}
-	sort.Strings(unreachable)
-	return snaps, owned, unreachable
+	return cs
 }
 
-// fetchPeerSnapshot pulls a peer's operator-safe dump (+ sensitive HMACs) and
-// builds its snapshot. ok=false on any unreachable/RPC failure.
-func (s *Server) fetchPeerSnapshot(ctx context.Context, host string, opTables, sensTables []string, scanKey []byte) (map[string]corrosion.TableSnapshot, []corrosion.OwnedRow, bool) {
+// fetchPeerSnapshot pulls a peer's operator-safe dump (+ sensitive HMACs). ok is
+// the op-safe lane; sensOK is the sensitive lane (false when not requested OR the
+// sensitive RPC failed — the caller marks that host's sensitive lane partial).
+func (s *Server) fetchPeerSnapshot(ctx context.Context, host string, opTables, sensTables []string, scanKey []byte) (tables map[string]corrosion.TableSnapshot, owned []corrosion.OwnedRow, ok, sensOK bool) {
 	client, conn, err := s.peerClient(ctx, host)
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
 	defer conn.Close()
 
 	buf, err := fetchPeerStateDump(ctx, client)
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
 	want := make(map[string]bool, len(opTables))
 	for _, t := range opTables {
 		want[t] = true
 	}
-	tables, owned, err := corrosion.SnapshotFromDumpBytes(buf, want)
+	tables, owned, err = corrosion.SnapshotFromDumpBytes(buf, want)
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
 	if len(sensTables) > 0 {
-		resp, serr := client.ScanSensitiveDivergence(ctx, &pb.ScanSensitiveRequest{
+		if resp, serr := client.ScanSensitiveDivergence(ctx, &pb.ScanSensitiveRequest{
 			Sender: s.hostName, ScanKey: scanKey, Tables: sensTables,
-		})
-		if serr == nil {
+		}); serr == nil {
 			mergeSnapshot(tables, sensitivePBToSnapshot(resp.GetRows()))
+			sensOK = true
 		}
 	}
-	return tables, owned, true
+	return tables, owned, true, sensOK
 }
 
 // ScanSensitiveDivergence is the peer-only lane: it returns ONLY domain-separated
@@ -228,18 +268,77 @@ func intersect(base, filter []string) []string {
 	return out
 }
 
-func reachableNames(all, unreachable []string) []string {
-	bad := make(map[string]bool, len(unreachable))
-	for _, u := range unreachable {
-		bad[u] = true
+// validateTableFilter rejects any --table value that isn't a known replicated
+// table — a typo must error, not silently scan nothing and report "clean".
+func validateTableFilter(tables []string) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	known := map[string]bool{}
+	for _, t := range corrosion.OperatorTableNames() {
+		known[t] = true
+	}
+	for _, t := range corrosion.SensitiveTableNames() {
+		known[t] = true
+	}
+	var unknown []string
+	for _, t := range tables {
+		if !known[t] {
+			unknown = append(unknown, t)
+		}
+	}
+	if len(unknown) > 0 {
+		return status.Errorf(codes.InvalidArgument, "unknown table(s): %s", strings.Join(unknown, ", "))
+	}
+	return nil
+}
+
+func activeNames(active []corrosion.HostRecord) []string {
+	out := make([]string, 0, len(active))
+	for _, h := range active {
+		out = append(out, h.Name)
+	}
+	return out
+}
+
+// intersectStrSets returns the sorted hosts present in both sets.
+func intersectStrSets(a, b map[string]bool) []string {
+	var out []string
+	for k := range a {
+		if b[k] {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// subtract returns the sorted names in all that are not in keep.
+func subtract(all, keep []string) []string {
+	k := make(map[string]bool, len(keep))
+	for _, n := range keep {
+		k[n] = true
 	}
 	var out []string
 	for _, n := range all {
-		if !bad[n] {
+		if !k[n] {
 			out = append(out, n)
 		}
 	}
+	sort.Strings(out)
 	return out
+}
+
+func equalStrSet(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
 }
 
 // mergeSnapshot folds src table snapshots into dst (used to add the sensitive
@@ -261,16 +360,51 @@ func sensitivePBToSnapshot(rows []*pb.SensitiveRowMetaPB) map[string]corrosion.T
 	return corrosion.SensitiveRowsToSnapshot(conv)
 }
 
-// classifyAll runs ClassifyTable across every table and keys the results by
-// "table\x00pk" for cross-sample reconciliation.
-func classifyAll(tables, nodes []string, snaps map[string]corrosion.NodeSnapshot) map[string]corrosion.RowDivergence {
+// classifyLanes classifies the operator-safe tables over the op-reachable node
+// set and the sensitive tables over the sensitive-reachable set (a host whose
+// sensitive lane failed isn't in the sensitive set, so its absence can't fabricate
+// a missing_row for a sensitive table). Keyed by "table\x00pk" for reconciliation.
+func classifyLanes(opTables, sensTables, opNodes, sensNodes []string, snaps map[string]corrosion.NodeSnapshot) map[string]corrosion.RowDivergence {
 	out := map[string]corrosion.RowDivergence{}
-	for _, table := range tables {
-		for _, d := range corrosion.ClassifyTable(table, nodes, snaps) {
-			out[table+"\x00"+d.PKLabel] = d
+	classify := func(tables, nodes []string) {
+		if len(nodes) < 2 {
+			return
+		}
+		for _, table := range tables {
+			for _, d := range corrosion.ClassifyTable(table, nodes, snaps) {
+				out[table+"\x00"+d.PKLabel] = d
+			}
 		}
 	}
+	classify(opTables, opNodes)
+	classify(sensTables, sensNodes)
 	return out
+}
+
+// sampleFingerprint hashes every (host, table, pk, rowHash) over the in-scope
+// per-lane node sets, so two samples can be compared for quiescence: identical
+// fingerprints ⇒ no table content changed between samples.
+func sampleFingerprint(opNodes, sensNodes, opTables, sensTables []string, snaps map[string]corrosion.NodeSnapshot) string {
+	var lines []string
+	collect := func(tables, nodes []string) {
+		for _, host := range nodes {
+			ns := snaps[host]
+			for _, table := range tables {
+				for pk, m := range ns.Tables[table].Rows {
+					lines = append(lines, host+"\x00"+table+"\x00"+pk+"\x00"+m.RowHash)
+				}
+			}
+		}
+	}
+	collect(opTables, opNodes)
+	collect(sensTables, sensNodes)
+	sort.Strings(lines)
+	h := sha256.New()
+	for _, l := range lines {
+		h.Write([]byte(l))
+		h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // reconcileSamples keeps only divergences present in BOTH samples with unchanged

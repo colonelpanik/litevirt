@@ -70,7 +70,13 @@ func renderDivergenceReport(rep *pb.DivergenceReport) {
 	if u := rep.GetNodesUnreachable(); len(u) > 0 {
 		fmt.Printf("UNREACHABLE (not scanned): %s\n", strings.Join(u, ", "))
 	}
-	fmt.Printf("samples: %d\n", rep.GetSamples())
+	if su := rep.GetSensitiveUnreachable(); len(su) > 0 {
+		fmt.Printf("SENSITIVE LANE PARTIAL (secret tables NOT scanned on): %s\n", strings.Join(su, ", "))
+	}
+	fmt.Printf("samples: %d   stable: %t\n", rep.GetSamples(), rep.GetStable())
+	if !rep.GetStable() {
+		fmt.Println("WARNING: cluster was not quiescent across the scan — a stuck_different may be replication backlog; re-run when settled.")
+	}
 
 	if len(rep.GetRows()) == 0 && len(rep.GetViolations()) == 0 {
 		fmt.Println("\nno divergence detected.")

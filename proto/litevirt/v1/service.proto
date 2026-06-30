@@ -1401,12 +1401,20 @@ message SemanticViolationPB {
     repeated string hosts  = 4;
 }
 message DivergenceReport {
-    repeated string              nodes_scanned     = 1;
-    repeated string              nodes_unreachable = 2;
-    repeated DivergenceRow       rows              = 3;
-    repeated SemanticViolationPB violations        = 4;
-    int32                        samples           = 5; // samples taken (persistence filter)
-    bool                         stable            = 6; // per-table digests stable across samples
+    repeated string              nodes_scanned         = 1; // operator-safe lane: reachable in BOTH samples
+    repeated string              nodes_unreachable     = 2; // operator-safe lane failed in some sample
+    repeated DivergenceRow       rows                  = 3;
+    repeated SemanticViolationPB violations            = 4;
+    int32                        samples               = 5; // samples taken (persistence filter)
+    // stable is true only when replication was QUIESCENT across the two samples
+    // (the reachable node set was identical AND no scanned table's content changed
+    // between samples). When false, a reported stuck_different may be lagging
+    // backlog rather than a true permanent split — re-run when the cluster settles.
+    bool                         stable                = 6;
+    // sensitive_unreachable lists hosts whose secret-bearing (HMAC) lane failed in
+    // some sample under --include-sensitive — their sensitive tables were NOT
+    // scanned, so the sensitive result is partial for them (never silently clean).
+    repeated string              sensitive_unreachable = 7;
 }
 
 message ScanSensitiveRequest {

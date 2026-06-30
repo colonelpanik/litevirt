@@ -42,7 +42,18 @@ illegal:
 
 - `duplicate_live_container` — the same container name live on more than one host
   (a cross-host ownership split the per-row resolver structurally can't see).
-- `duplicate_ip_owner` — one IP owned by more than one workload.
+- `duplicate_ip_owner` — one IP owned by more than one workload. Owner identity is
+  fully qualified (`vm:<name>`, `ct:<host>:<name>` with `owner_kind`/`owner_host`),
+  so two same-named containers on different hosts are never collapsed into one
+  owner.
+
+> **Not yet covered (deferred to a later phase):** *duplicate runtime ownership*
+> and *runtime-vs-DB owner mismatch* — i.e. the DB rows have converged but disagree
+> with which host actually runs the workload. Detecting those requires per-host
+> runtime introspection (`CheckVMRuntime`/`CheckContainerRuntime`), which lands with
+> the runtime-repair phases; until then `lv doctor divergence` checks only the
+> DB-level invariants above. A clean report does **not** yet prove the DB agrees
+> with runtime truth.
 
 ### The sensitive lane
 
@@ -55,8 +66,24 @@ distributed to peers only over the peer-mTLS channel (never logged). Identical r
 produce identical HMACs across nodes, so divergence is still detectable, while a
 different scan reveals no cross-scan equality.
 
+### Reachability, partials, and stability
+
+Comparison runs only over nodes reachable **in both samples** (per lane). A node
+that flaps between samples is excluded from row classification — so its absence
+can't fabricate a `missing_row` — and surfaced in `nodes_unreachable`. Under
+`--include-sensitive`, a host whose sensitive (HMAC) lane fails is listed in
+`sensitive_unreachable`: its secret-bearing tables were **not** scanned, so the
+sensitive result is partial for that host and never silently "clean".
+
+The report's `stable` flag is true only when the cluster was **quiescent** across
+the scan: the reachable node set was identical in both samples **and** no scanned
+table's content changed between them. When `stable` is false, a reported
+`stuck_different` may be lagging replication backlog rather than a true permanent
+split — re-run once the cluster settles. An unknown `--table` value is rejected
+outright rather than scanning nothing.
+
 ### Output
 
 Human-readable table by default; `--json` for the full structured report (node
-lists, per-row per-node `updated_at`/hash, and violations). `--table` restricts
-the scan to specific tables.
+lists incl. `sensitive_unreachable`, per-row per-node `updated_at`/hash, `stable`,
+and violations). `--table` restricts the scan to specific tables.

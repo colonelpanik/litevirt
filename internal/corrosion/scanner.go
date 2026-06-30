@@ -117,16 +117,29 @@ func ownedRow(table string, idx map[string]int, vals []interface{}) (OwnedRow, b
 	}
 	switch table {
 	case "containers":
+		// For the duplicate-NAME check: group an unqualified name across hosts.
 		return OwnedRow{Host: get("host_name"), Name: get("name")}, true
 	case "ip_allocations":
-		// owner identity = vm_name (legacy owner-name column); IP is the address.
-		return OwnedRow{Name: get("vm_name"), IP: get("ip")}, true
+		// owner_kind/owner_host (schema v36) disambiguate same-named owners across
+		// kinds/hosts — vm_name is the legacy owner-NAME column for both. Two CTs
+		// named "web" on different hosts must NOT collapse to one owner.
+		return OwnedRow{Name: ipOwnerID(get("owner_kind"), get("owner_host"), get("vm_name")), IP: get("ip")}, true
 	case "vm_interfaces":
-		return OwnedRow{Name: get("vm_name"), IP: get("ip")}, true
+		return OwnedRow{Name: "vm:" + get("vm_name"), IP: get("ip")}, true
 	case "container_interfaces":
-		return OwnedRow{Name: get("ct_name"), IP: get("ip")}, true
+		return OwnedRow{Name: "ct:" + get("host_name") + ":" + get("ct_name"), IP: get("ip")}, true
 	}
 	return OwnedRow{}, false
+}
+
+// ipOwnerID composes a fully-qualified IP owner identity so distinct owners never
+// alias: vm:<name> (VMs are cluster-unique by name) and ct:<host>:<name>
+// (container names are per-host). Empty owner_kind defaults to vm (legacy rows).
+func ipOwnerID(ownerKind, ownerHost, ownerName string) string {
+	if ownerKind == "ct" {
+		return "ct:" + ownerHost + ":" + ownerName
+	}
+	return "vm:" + ownerName
 }
 
 // ScanLocalTables reads this node's own rows for the given operator-safe tables

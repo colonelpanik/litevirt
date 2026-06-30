@@ -122,6 +122,50 @@ func TestDiagnoseDivergence_AdminGateAndSemantic(t *testing.T) {
 	}
 }
 
+// An unknown --table value is rejected, not silently scanned-as-nothing (which
+// would read as a clean scan — false reassurance for a diagnostic).
+func TestDiagnoseDivergence_RejectsUnknownTable(t *testing.T) {
+	s := newPeerAuthServer(t)
+	_, err := s.DiagnoseDivergence(adminCtx(), &pb.DiagnoseDivergenceRequest{Tables: []string{"recovery_code"}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("want InvalidArgument for an unknown table, got %v", err)
+	}
+}
+
+// With --include-sensitive, a host whose sensitive lane fails is surfaced as
+// sensitive_unreachable (partial), never silently treated as clean.
+func TestDiagnoseDivergence_SensitivePartialSurfaced(t *testing.T) {
+	old := divergenceResampleDelay
+	divergenceResampleDelay = 0
+	defer func() { divergenceResampleDelay = old }()
+
+	s := newPeerAuthServer(t) // self + active host "peer-1" (unreachable in test)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "self", Address: "127.0.0.1", State: "active"}); err != nil {
+		t.Fatalf("InsertHost self: %v", err)
+	}
+	rep, err := s.DiagnoseDivergence(adminCtx(), &pb.DiagnoseDivergenceRequest{IncludeSensitive: true})
+	if err != nil {
+		t.Fatalf("DiagnoseDivergence: %v", err)
+	}
+	// peer-1 is unreachable for BOTH lanes → in nodes_unreachable AND sensitive_unreachable.
+	if !hostListHas(rep.GetNodesUnreachable(), "peer-1") {
+		t.Fatalf("peer-1 should be nodes_unreachable, got %v", rep.GetNodesUnreachable())
+	}
+	if !hostListHas(rep.GetSensitiveUnreachable(), "peer-1") {
+		t.Fatalf("peer-1 should be sensitive_unreachable, got %v", rep.GetSensitiveUnreachable())
+	}
+}
+
+func hostListHas(hs []string, want string) bool {
+	for _, h := range hs {
+		if h == want {
+			return true
+		}
+	}
+	return false
+}
+
 func containsStr(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

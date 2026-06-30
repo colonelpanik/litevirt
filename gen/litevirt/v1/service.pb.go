@@ -16878,14 +16878,22 @@ func (x *SemanticViolationPB) GetHosts() []string {
 
 type DivergenceReport struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
-	NodesScanned     []string               `protobuf:"bytes,1,rep,name=nodes_scanned,json=nodesScanned,proto3" json:"nodes_scanned,omitempty"`
-	NodesUnreachable []string               `protobuf:"bytes,2,rep,name=nodes_unreachable,json=nodesUnreachable,proto3" json:"nodes_unreachable,omitempty"`
+	NodesScanned     []string               `protobuf:"bytes,1,rep,name=nodes_scanned,json=nodesScanned,proto3" json:"nodes_scanned,omitempty"`             // operator-safe lane: reachable in BOTH samples
+	NodesUnreachable []string               `protobuf:"bytes,2,rep,name=nodes_unreachable,json=nodesUnreachable,proto3" json:"nodes_unreachable,omitempty"` // operator-safe lane failed in some sample
 	Rows             []*DivergenceRow       `protobuf:"bytes,3,rep,name=rows,proto3" json:"rows,omitempty"`
 	Violations       []*SemanticViolationPB `protobuf:"bytes,4,rep,name=violations,proto3" json:"violations,omitempty"`
 	Samples          int32                  `protobuf:"varint,5,opt,name=samples,proto3" json:"samples,omitempty"` // samples taken (persistence filter)
-	Stable           bool                   `protobuf:"varint,6,opt,name=stable,proto3" json:"stable,omitempty"`   // per-table digests stable across samples
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// stable is true only when replication was QUIESCENT across the two samples
+	// (the reachable node set was identical AND no scanned table's content changed
+	// between samples). When false, a reported stuck_different may be lagging
+	// backlog rather than a true permanent split — re-run when the cluster settles.
+	Stable bool `protobuf:"varint,6,opt,name=stable,proto3" json:"stable,omitempty"`
+	// sensitive_unreachable lists hosts whose secret-bearing (HMAC) lane failed in
+	// some sample under --include-sensitive — their sensitive tables were NOT
+	// scanned, so the sensitive result is partial for them (never silently clean).
+	SensitiveUnreachable []string `protobuf:"bytes,7,rep,name=sensitive_unreachable,json=sensitiveUnreachable,proto3" json:"sensitive_unreachable,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *DivergenceReport) Reset() {
@@ -16958,6 +16966,13 @@ func (x *DivergenceReport) GetStable() bool {
 		return x.Stable
 	}
 	return false
+}
+
+func (x *DivergenceReport) GetSensitiveUnreachable() []string {
+	if x != nil {
+		return x.SensitiveUnreachable
+	}
+	return nil
 }
 
 type ScanSensitiveRequest struct {
@@ -21943,7 +21958,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x16\n" +
 	"\x06detail\x18\x03 \x01(\tR\x06detail\x12\x14\n" +
-	"\x05hosts\x18\x04 \x03(\tR\x05hosts\"\x88\x02\n" +
+	"\x05hosts\x18\x04 \x03(\tR\x05hosts\"\xbd\x02\n" +
 	"\x10DivergenceReport\x12#\n" +
 	"\rnodes_scanned\x18\x01 \x03(\tR\fnodesScanned\x12+\n" +
 	"\x11nodes_unreachable\x18\x02 \x03(\tR\x10nodesUnreachable\x12.\n" +
@@ -21952,7 +21967,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"violations\x18\x04 \x03(\v2 .litevirt.v1.SemanticViolationPBR\n" +
 	"violations\x12\x18\n" +
 	"\asamples\x18\x05 \x01(\x05R\asamples\x12\x16\n" +
-	"\x06stable\x18\x06 \x01(\bR\x06stable\"a\n" +
+	"\x06stable\x18\x06 \x01(\bR\x06stable\x123\n" +
+	"\x15sensitive_unreachable\x18\a \x03(\tR\x14sensitiveUnreachable\"a\n" +
 	"\x14ScanSensitiveRequest\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12\x19\n" +
 	"\bscan_key\x18\x02 \x01(\fR\ascanKey\x12\x16\n" +

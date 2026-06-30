@@ -85,6 +85,43 @@ func TestScanLocalSensitive_HMACOnly(t *testing.T) {
 	}
 }
 
+// Two containers named "web" on different hosts must NOT collapse to one IP owner
+// (owner_kind/owner_host qualify the identity), so sharing an IP is reported as a
+// duplicate_ip_owner rather than silently deduped away.
+func TestScanLocalTables_IPOwnerNotCollapsedAcrossHosts(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	now := c.NowTS()
+	seed := func(network, ip, kind, host, name string) {
+		if err := c.Execute(ctx,
+			`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			network, ip, "00:00:00:00:00:01", name, kind, host, now, now); err != nil {
+			t.Fatalf("seed ip_allocations: %v", err)
+		}
+	}
+	// Same IP, two CTs named "web" on different hosts → distinct owners.
+	seed("net-a", "10.0.0.5", "ct", "host-a", "web")
+	seed("net-b", "10.0.0.5", "ct", "host-b", "web")
+
+	_, owned, err := c.ScanLocalTables(ctx, []string{"ip_allocations"})
+	if err != nil {
+		t.Fatalf("ScanLocalTables: %v", err)
+	}
+	owners := map[string]struct{}{}
+	for _, o := range owned {
+		if o.IP == "10.0.0.5" {
+			owners[o.Name] = struct{}{}
+		}
+	}
+	if len(owners) != 2 {
+		t.Fatalf("want 2 distinct owners for the shared IP (no collapse), got %v", owners)
+	}
+	if v := CheckDuplicateIPOwners(owned); len(v) != 1 || v[0].Key != "10.0.0.5" {
+		t.Fatalf("want duplicate_ip_owner for 10.0.0.5, got %+v", v)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

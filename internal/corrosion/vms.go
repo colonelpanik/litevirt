@@ -637,6 +637,29 @@ func UpdateDiskStorage(ctx context.Context, c *Client, vmName, diskName, storage
 		storageType, storageVolume, now, vmName, diskName)
 }
 
+// UpdateDiskPlacement atomically repoints a disk's full placement — host, path,
+// storage driver, and pool — in ONE LWW write, so a mid-move failure can't leave
+// the row half-moved (path updated but pool stale, or vice versa). It is the
+// commit point for both the offline and live MoveVolume paths. Strict: a zero-row
+// update (the disk is missing or already soft-deleted) returns ErrNoRowsAffected
+// instead of a silent success, so a move never mistakes a vanished disk for a
+// completed one. Replaces the prior UpdateDiskHostAndPath + UpdateDiskStorage pair
+// at the move sites (those remain for migration / snapshot reconcile).
+func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostName, path, storageType, storageVolume string) error {
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE vm_disks SET host_name = ?, path = ?, storage_type = ?, storage_volume = ?, updated_at = ?
+		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+		hostName, path, storageType, storageVolume, now, vmName, diskName)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // UpdateDiskSize updates the size_bytes for a disk.
 func UpdateDiskSize(ctx context.Context, c *Client, vmName, diskName string, sizeBytes int64) error {
 	now := c.NowTS()

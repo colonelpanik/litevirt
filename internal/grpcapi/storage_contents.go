@@ -22,14 +22,16 @@ import (
 // ISOs/images are large.
 const maxPoolUploadBytes int64 = 2 << 40 // 2 TiB
 
-// poolContentRBACPath validates a pool name and returns its RBAC path. Building
-// the path only through here keeps a malformed pool name out of the auth path.
-func poolContentRBACPath(pool string) (string, error) {
-	if err := safename.ValidatePoolName(pool); err != nil {
-		return "", err
-	}
-	return "/storage/pools/" + pool, nil
-}
+// Storage-pool CONTENT RPCs authorize against the pool's OWNING project
+// (poolRBACPathFor on the STORED rec.Project), the same boundary pool CRUD uses —
+// resolve the pool first, then authorize, then forward. A cluster PEER call (an
+// entry-node forward, cross-host replication, or auto-promote — see requirePeerCert)
+// skips tenant RBAC: the user was already authorized on the entry node, or it's a
+// system flow. The peer bypass skips ONLY tenant RBAC — pool-name/filename validation
+// and SafeJoin still run for both peer and user calls.
+//
+// TRUST BOUNDARY: any known cluster host cert can reach pool contents via these RPCs.
+// This is a deliberate bypass of project RBAC, consistent with the peer-RPC model.
 
 // ListStoragePoolContents lists the files in a file-based storage pool (used by
 // the UI content browser to pick ISOs). Block-backed pools (ceph/iscsi/zfs/
@@ -39,12 +41,8 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 	if req.PoolName == "" {
 		return nil, status.Error(codes.InvalidArgument, "pool_name required")
 	}
-	rbacPath, err := poolContentRBACPath(req.PoolName)
-	if err != nil {
+	if err := safename.ValidatePoolName(req.PoolName); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
-	}
-	if err := s.RequirePerm(ctx, rbacPath, "storage.content.read", "viewer"); err != nil {
-		return nil, err
 	}
 	host := req.Host
 	if host == "" {
@@ -56,6 +54,13 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 	}
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", req.PoolName, host)
+	}
+	// Peer calls (forward / replication / auto-promote) skip tenant RBAC; user calls
+	// authorize against the pool's owning project.
+	if s.requirePeerCert(ctx) != nil {
+		if err := s.authorizeResourceRead(ctx, rec.Project, poolRBACPathFor(rec.Project, req.PoolName), "storage.content.read"); err != nil {
+			return nil, err
+		}
 	}
 
 	// Files live on the owning host — forward there if it isn't us.
@@ -112,12 +117,8 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if req.PoolName == "" || req.Filename == "" {
 		return nil, status.Error(codes.InvalidArgument, "pool_name and filename required")
 	}
-	rbacPath, err := poolContentRBACPath(req.PoolName)
-	if err != nil {
+	if err := safename.ValidatePoolName(req.PoolName); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
-	}
-	if err := s.RequirePerm(ctx, rbacPath, "storage.content.write", "operator"); err != nil {
-		return nil, err
 	}
 	if err := safename.ValidateName(req.Filename); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "filename: %v", err)
@@ -132,6 +133,11 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	}
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", req.PoolName, host)
+	}
+	if s.requirePeerCert(ctx) != nil {
+		if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, req.PoolName), "storage.content.write", "operator"); err != nil {
+			return nil, err
+		}
 	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
@@ -173,12 +179,13 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if first.PoolName == "" || first.Filename == "" {
 		return status.Error(codes.InvalidArgument, "pool_name and filename required")
 	}
-	rbacPath, err := poolContentRBACPath(first.PoolName)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "%v", err)
+	// The first frame is a header only — pool/host/filename, no payload — so
+	// authorization always precedes any byte hitting disk. Reject a bundled chunk.
+	if len(first.Chunk) != 0 {
+		return status.Error(codes.InvalidArgument, "first message must carry only pool_name/host/filename (no chunk data)")
 	}
-	if err := s.RequirePerm(ctx, rbacPath, "storage.content.write", "operator"); err != nil {
-		return err
+	if err := safename.ValidatePoolName(first.PoolName); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if err := safename.ValidateName(first.Filename); err != nil {
 		return status.Errorf(codes.InvalidArgument, "filename: %v", err)
@@ -193,6 +200,13 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	}
 	if !ok {
 		return status.Errorf(codes.NotFound, "pool %q not on host %q", first.PoolName, host)
+	}
+	// Authorize BEFORE creating a temp file or reading any further frame (peer calls
+	// skip tenant RBAC). A denied upload writes nothing and drains no chunks.
+	if s.requirePeerCert(ctx) != nil {
+		if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, first.PoolName), "storage.content.write", "operator"); err != nil {
+			return err
+		}
 	}
 
 	// Remote pool: proxy the stream to the owning host.

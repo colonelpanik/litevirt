@@ -33,6 +33,11 @@ type LibvirtBackend interface {
 	DomainExists(name string) bool
 	ListDomains() ([]string, error)
 	DumpXML(name string) (string, error)
+	// DumpXMLInactive returns the PERSISTENT (inactive) domain config — what a cold
+	// boot loads. For a running domain this differs from DumpXML (which returns the
+	// live config); MoveVolume's cutover edits through here so it rewrites the
+	// definition a restart will actually use.
+	DumpXMLInactive(name string) (string, error)
 	WaitForShutdown(name string, timeout time.Duration) bool
 
 	// VNC / SPICE.

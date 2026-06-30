@@ -279,6 +279,26 @@ func (c *Client) DumpXML(name string) (string, error) {
 	return xml, nil
 }
 
+// DumpXMLInactive returns the PERSISTENT (inactive) XML of a domain — what a cold
+// boot would use — via VIR_DOMAIN_XML_INACTIVE. This differs from DumpXML for a
+// RUNNING domain: plain DumpXML returns the live/active config (which, after a
+// blockdev-mirror pivot, already shows the new disk path), whereas the persistent
+// config still references the old path. A cutover that must rewrite the on-disk
+// definition (MoveVolume) reads through here so it edits the config a restart will
+// actually load. For a stopped domain inactive == the only config, so this is also
+// correct offline.
+func (c *Client) DumpXMLInactive(name string) (string, error) {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return "", fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	xml, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
+	if err != nil {
+		return "", fmt.Errorf("get inactive XML for %s: %w", name, err)
+	}
+	return xml, nil
+}
+
 func (c *Client) DomainExists(name string) bool {
 	_, err := c.virt.DomainLookupByName(name)
 	return err == nil

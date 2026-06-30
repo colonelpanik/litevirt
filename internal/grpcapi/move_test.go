@@ -22,11 +22,12 @@ import (
 // streamRecorder is a minimal grpc.ServerStreamingServer[pb.MoveVolumeProgress]
 // for unit testing — captures every Send into Sent.
 type streamRecorder[T any] struct {
-	ctx  context.Context
-	Sent []*T
+	ctx     context.Context
+	Sent    []*T
+	sendErr error // if set, Send records the frame then returns this (simulates a dropped client)
 }
 
-func (r *streamRecorder[T]) Send(m *T) error              { r.Sent = append(r.Sent, m); return nil }
+func (r *streamRecorder[T]) Send(m *T) error              { r.Sent = append(r.Sent, m); return r.sendErr }
 func (r *streamRecorder[T]) Context() context.Context     { return r.ctx }
 func (r *streamRecorder[T]) SetHeader(metadata.MD) error  { return nil }
 func (r *streamRecorder[T]) SendHeader(metadata.MD) error { return nil }

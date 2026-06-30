@@ -941,8 +941,8 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 
 	// For DELETE statements, always apply (soft-deletes use UPDATE anyway).
 	if isDeleteStatement(s.SQL) {
-		_, err := tx.ExecContext(ctx, s.SQL, s.Params...)
-		if err == nil {
+		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if err == nil && rowsChanged(res) {
 			r.client.clearUnresolvedFromStmt(s)
 		}
 		return err
@@ -964,14 +964,24 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	if isInsertStatement(applied) {
 		applied = replaceInsertStrategy(applied, "INSERT OR REPLACE")
 	}
-	_, err := tx.ExecContext(ctx, applied, s.Params...)
-	if err == nil {
-		// A strictly-newer / resolver-chosen incoming write to this PK clears any
-		// stale unresolved-tie tracking (the remediation path). Lock-free when
-		// nothing is tracked.
+	res, err := tx.ExecContext(ctx, applied, s.Params...)
+	if err == nil && rowsChanged(res) {
+		// A strictly-newer / resolver-chosen incoming write that actually CHANGED
+		// the row clears any stale unresolved-tie tracking (the remediation path).
+		// A guarded zero-row UPDATE is excluded. Lock-free when nothing is tracked.
 		r.client.clearUnresolvedFromStmt(s)
 	}
 	return err
+}
+
+// rowsChanged reports whether a SQL result provably affected at least one row.
+// Used to gate the unresolved-tie clear so a guarded zero-row statement
+// (WHERE … matched nothing) doesn't drop a still-valid tie. SQLite always
+// reports RowsAffected; an unavailable count is treated as "no change" (don't
+// clear) so the clear is never based on a guess.
+func rowsChanged(res sql.Result) bool {
+	n, err := res.RowsAffected()
+	return err == nil && n > 0
 }
 
 // shouldSkipLWW reports whether to skip applying the incoming mutation under

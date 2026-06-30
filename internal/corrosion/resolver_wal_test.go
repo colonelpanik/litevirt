@@ -99,3 +99,45 @@ func TestWAL_TiePartialUpdateKeepsLocal(t *testing.T) {
 		t.Fatal("a tied partial UPDATE must keep local (defer convergence to anti-entropy)")
 	}
 }
+
+// TestWAL_ZeroRowUpdateKeepsUnresolved: a strictly-newer WAL UPDATE that matches
+// NO row (guarded) applies cleanly but changes nothing, so it must NOT clear the
+// tracked unresolved tie.
+func TestWAL_ZeroRowUpdateKeepsUnresolved(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	const oldTs = "2026-06-03T18:40:00Z"
+	const newTs = "2026-06-30T00:00:00Z"
+
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm1", HostName: "host-a", State: "running", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	forceUpdatedAt(t, c, "vms", "name", "vm1", oldTs)
+	cols := []string{"name", "host_name", "updated_at"}
+	c.resolveTie("vms", cols, []interface{}{"vm1", "host-a", oldTs}, []interface{}{"vm1", "host-b", oldTs}, []int{0}, pathAE)
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("expected one tracked tie, got %d", c.UnresolvedTieCount())
+	}
+
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	// Newer timestamp (so LWW would apply) but the guard matches 0 rows (vm1 live).
+	s := Statement{
+		SQL:    `UPDATE vms SET state = 'x', updated_at = ? WHERE name = ? AND deleted_at IS NOT NULL`,
+		Params: []interface{}{newTs, "vm1"},
+	}
+	if err := r.applyStatementLWW(ctx, tx, s, newTs); err != nil {
+		t.Fatalf("applyStatementLWW: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("a WAL zero-row update must not clear the unresolved tracking, count=%d", c.UnresolvedTieCount())
+	}
+}

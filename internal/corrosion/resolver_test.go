@@ -281,6 +281,31 @@ func TestLocalWriteClearsUnresolved(t *testing.T) {
 	}
 }
 
+// TestLocalZeroRowWriteKeepsUnresolved: a guarded local write that matches NO row
+// (e.g. WHERE … deleted_at IS NOT NULL on a live row) changed no content, so it
+// must NOT clear the tracked tie.
+func TestLocalZeroRowWriteKeepsUnresolved(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm1", HostName: "host-a", State: "running", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	cols := []string{"name", "host_name", "updated_at"}
+	c.resolveTie("vms", cols, []interface{}{"vm1", "host-a", "T"}, []interface{}{"vm1", "host-b", "T"}, []int{0}, pathAE)
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("expected one tracked tie, got %d", c.UnresolvedTieCount())
+	}
+	// vm1 is live (deleted_at NULL), so this matches 0 rows.
+	if err := c.ExecuteBatch(ctx, []Statement{{
+		SQL: `UPDATE vms SET state = 'x' WHERE name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{"vm1"},
+	}}); err != nil {
+		t.Fatalf("ExecuteBatch: %v", err)
+	}
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("a zero-row write must not clear the unresolved tracking, count=%d", c.UnresolvedTieCount())
+	}
+}
+
 func TestResolver_HostsControlPlaneUnresolved(t *testing.T) {
 	cols := []string{"name", "state", "fence_strategy", "cpu_total", "updated_at"}
 	// A control-plane column (fence_strategy) differs → unresolved (no coin-flip).

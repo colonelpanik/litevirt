@@ -389,6 +389,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 
 	var affected int64
+	var mutated []Statement // statements that changed ≥1 row (for unresolved-clear)
 	for _, s := range stmts {
 		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if err != nil {
@@ -398,6 +399,9 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		}
 		if n, e := res.RowsAffected(); e == nil {
 			affected += n
+			if n > 0 {
+				mutated = append(mutated, s)
+			}
 		}
 	}
 
@@ -427,11 +431,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 	c.mu.Unlock()
 
-	// A local write to a PK clears any stale unresolved-tie tracking for it — the
-	// remediation path (e.g. repair-owner's UpdateVMHost re-stamps ownership with
-	// a fresh timestamp). Lock-free when nothing is tracked.
+	// A local write that actually CHANGED a row clears any stale unresolved-tie
+	// tracking for that PK — the remediation path (e.g. repair-owner's
+	// UpdateVMHost). A guarded zero-row statement (WHERE … matched nothing) is
+	// excluded: it changed no content, so the tie must stay tracked. Lock-free
+	// when nothing is tracked.
 	if c.anyUnresolved() {
-		for _, s := range stmts {
+		for _, s := range mutated {
 			c.clearUnresolvedFromStmt(s)
 		}
 	}

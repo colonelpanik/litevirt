@@ -134,9 +134,15 @@ converge the row, so the two paths can never disagree.
   alert-worthy: the row is intentionally left divergent and needs operator or
   runtime repair.
 
-An unresolved tie is **bounded**: the row stays divergent on purpose, but
-anti-entropy will not re-pull the table every cycle solely because of it (a real
-new write to either side clears the suppression and re-evaluates). Resolve an
-unresolved row by making one side authoritative with a fresh write — e.g. a VM
-ownership split is repaired with `lv doctor repair-owner <vm> <host>` (re-stamps
-the running host with a new timestamp so it wins everywhere by ordinary LWW).
+The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the
+alert fires once per distinct divergence, not per cycle. The **divergence itself
+is not suppressed**: while a row remains unresolved its table's digest stays
+mismatched, so anti-entropy may continue to re-pull that table each cycle until
+the row is repaired (a row-proofed suppression that re-pulls only when an
+unrelated row also diverges is a future optimization). In practice this cost is
+paid only by genuinely-stuck rows awaiting repair.
+
+Resolve an unresolved row by making one side authoritative with a fresh write —
+which clears the tracking and lets the table converge. A VM ownership split is
+repaired with `lv doctor repair-owner <vm> <host>` (re-stamps the running host
+with a new timestamp so it wins everywhere by ordinary LWW).

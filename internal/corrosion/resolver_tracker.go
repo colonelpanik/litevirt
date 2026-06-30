@@ -55,9 +55,13 @@ func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}
 	if isNew {
 		c.unresolvedTies[key] = pair
 	}
-	n := len(c.unresolvedTies)
 	if !existed {
-		c.unresolvedLen.Store(int64(n))
+		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
+		// Export the gauge WHILE holding tieMu so concurrent track/clear exports
+		// serialize in mutation order — the gauge can never settle on a stale
+		// (backwards) value due to callback reordering. The prometheus Set is a
+		// cheap atomic store and never re-enters our locks.
+		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
 	}
 	c.tieMu.Unlock()
 
@@ -66,27 +70,19 @@ func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}
 		slog.Warn("lww: unresolved equal-timestamp tie (kept local, needs repair)",
 			"table", table, "pk", pk, "category", category, "path", string(path))
 	}
-	if !existed {
-		c.observeUnresolvedTieCurrent(n) // current-state gauge (drops on repair)
-	}
 }
 
 // clearUnresolved drops the tracked entry for (table,PK) — called when the row
 // converges or is repaired so a future genuine divergence re-alerts.
 func (c *Client) clearUnresolved(table, pk string) {
 	c.tieMu.Lock()
-	deleted := false
-	n := len(c.unresolvedTies)
 	if _, ok := c.unresolvedTies[unresolvedKey(table, pk)]; ok {
 		delete(c.unresolvedTies, unresolvedKey(table, pk))
-		n = len(c.unresolvedTies)
-		c.unresolvedLen.Store(int64(n))
-		deleted = true
+		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
+		// Export under the lock (see trackUnresolved) so the gauge can't regress.
+		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
 	}
 	c.tieMu.Unlock()
-	if deleted {
-		c.observeUnresolvedTieCurrent(n) // current-state gauge (drops on repair)
-	}
 }
 
 // clearUnresolvedFromStmt clears the tracked unresolved entry for the row a

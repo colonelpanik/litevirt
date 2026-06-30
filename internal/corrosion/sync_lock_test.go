@@ -3,12 +3,17 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
 
-// fakeSyncMetrics is a trivial SyncMetrics recorder for assertions.
+// fakeSyncMetrics is a SyncMetrics recorder for assertions. The real
+// implementation (*metrics.AntiEntropyMetrics) is concurrency-safe and the
+// resolver calls it from many goroutines, so this double must be too — a mutex
+// guards every field. Read the fields only after the writers have joined.
 type fakeSyncMetrics struct {
+	mu                      sync.Mutex
 	dumps, digests, merges  int
 	lastMerged, lastSkipped int
 	tieBreaks               []string // "table/resolver/winner"
@@ -17,22 +22,34 @@ type fakeSyncMetrics struct {
 	unresolvedCurrent       int      // last current-unresolved gauge value
 }
 
-func (f *fakeSyncMetrics) ObserveDump(time.Duration, int) { f.dumps++ }
-func (f *fakeSyncMetrics) ObserveDigest(time.Duration)    { f.digests++ }
+func (f *fakeSyncMetrics) ObserveDump(time.Duration, int) { f.mu.Lock(); f.dumps++; f.mu.Unlock() }
+func (f *fakeSyncMetrics) ObserveDigest(time.Duration)    { f.mu.Lock(); f.digests++; f.mu.Unlock() }
 func (f *fakeSyncMetrics) ObserveMerge(_ time.Duration, m, s int) {
+	f.mu.Lock()
 	f.merges++
 	f.lastMerged, f.lastSkipped = m, s
+	f.mu.Unlock()
 }
 func (f *fakeSyncMetrics) ObserveTieBreak(table, resolver, winner string) {
+	f.mu.Lock()
 	f.tieBreaks = append(f.tieBreaks, table+"/"+resolver+"/"+winner)
+	f.mu.Unlock()
 }
 func (f *fakeSyncMetrics) ObserveTieUnresolved(table, path, category string) {
+	f.mu.Lock()
 	f.tieUnresolved = append(f.tieUnresolved, table+"/"+path+"/"+category)
+	f.mu.Unlock()
 }
 func (f *fakeSyncMetrics) ObserveTombstoneTie(table string) {
+	f.mu.Lock()
 	f.tombstoneTies = append(f.tombstoneTies, table)
+	f.mu.Unlock()
 }
-func (f *fakeSyncMetrics) ObserveUnresolvedTieCurrent(n int) { f.unresolvedCurrent = n }
+func (f *fakeSyncMetrics) ObserveUnresolvedTieCurrent(n int) {
+	f.mu.Lock()
+	f.unresolvedCurrent = n
+	f.mu.Unlock()
+}
 
 func seedHosts(ctx context.Context, c *Client, n int) {
 	for i := 0; i < n; i++ {

@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -273,6 +275,42 @@ func TestUnresolvedTracker_DistinctOnce(t *testing.T) {
 	}
 	if sm.unresolvedCurrent != 0 {
 		t.Fatalf("current-unresolved gauge must drop to 0 after repair, got %d", sm.unresolvedCurrent)
+	}
+}
+
+// TestUnresolvedGauge_ConcurrentTrackClear: under concurrent track/clear the
+// exported current-unresolved gauge must always settle on the true map length —
+// never a stale (backwards) value from callback reordering. Run with -race.
+func TestUnresolvedGauge_ConcurrentTrackClear(t *testing.T) {
+	c := testClient(t)
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	const n = 50
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c.trackUnresolved("vms", fmt.Sprintf("vm%d", i),
+				[]interface{}{"a"}, []interface{}{"b"}, pathAE, "runtime_owned")
+		}(i)
+	}
+	wg.Wait()
+	if c.UnresolvedTieCount() != n || sm.unresolvedCurrent != n {
+		t.Fatalf("after %d concurrent tracks: count=%d gauge=%d, want %d", n, c.UnresolvedTieCount(), sm.unresolvedCurrent, n)
+	}
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c.clearUnresolved("vms", fmt.Sprintf("vm%d", i))
+		}(i)
+	}
+	wg.Wait()
+	if c.UnresolvedTieCount() != 0 || sm.unresolvedCurrent != 0 {
+		t.Fatalf("after clearing all: count=%d gauge=%d, want 0 (gauge must not be left stale)", c.UnresolvedTieCount(), sm.unresolvedCurrent)
 	}
 }
 

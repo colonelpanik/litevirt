@@ -12,15 +12,16 @@ import (
 // never imports this one — avoiding the import cycle (metrics already imports
 // corrosion). Registered on the default registry that promhttp serves on :7444.
 type AntiEntropyMetrics struct {
-	dumpSeconds   prometheus.Histogram
-	digestSeconds prometheus.Histogram
-	mergeSeconds  prometheus.Histogram
-	dumpBytes     prometheus.Histogram
-	rowsMerged    prometheus.Counter
-	rowsSkipped   prometheus.Counter
-	tieBreaks     *prometheus.CounterVec
-	tieUnresolved *prometheus.CounterVec
-	tombstoneTies *prometheus.CounterVec
+	dumpSeconds          prometheus.Histogram
+	digestSeconds        prometheus.Histogram
+	mergeSeconds         prometheus.Histogram
+	dumpBytes            prometheus.Histogram
+	rowsMerged           prometheus.Counter
+	rowsSkipped          prometheus.Counter
+	tieBreaks            *prometheus.CounterVec
+	tieUnresolved        *prometheus.CounterVec
+	tombstoneTies        *prometheus.CounterVec
+	tieUnresolvedCurrent prometheus.Gauge
 }
 
 // NewAntiEntropyMetrics registers the anti-entropy timing metrics on the default
@@ -68,8 +69,12 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Name: "litevirt_lww_tombstone_tie_total",
 			Help: "Equal-timestamp ties settled by a one-sided soft-delete (a delete racing a write — benign), by table.",
 		}, []string{"table"}),
+		tieUnresolvedCurrent: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "litevirt_lww_tie_unresolved_current",
+			Help: "Distinct unresolved ties this node is CURRENTLY tracking (a gauge — drops to 0 when repaired). Alert on this for 'something is divergent now'; the _total counter is monotonic and would page forever.",
+		}),
 	}
-	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies)
+	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent)
 	return m
 }
 
@@ -110,4 +115,9 @@ func (m *AntiEntropyMetrics) ObserveTieUnresolved(table, path, category string) 
 // ObserveTombstoneTie records a tie settled by a one-sided soft-delete. (Satisfies corrosion.SyncMetrics.)
 func (m *AntiEntropyMetrics) ObserveTombstoneTie(table string) {
 	m.tombstoneTies.WithLabelValues(table).Inc()
+}
+
+// ObserveUnresolvedTieCurrent sets the current-unresolved-ties gauge. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveUnresolvedTieCurrent(n int) {
+	m.tieUnresolvedCurrent.Set(float64(n))
 }

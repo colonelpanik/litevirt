@@ -135,11 +135,16 @@ converge the row, so the two paths can never disagree.
   deterministic resolver (`content_max`/`numeric_max`/`timestamp_max`/
   `non_null_wins`/`lb_generation`). A steadily climbing value means a node is
   minting colliding timestamps (the upstream smell), not just a one-off split.
-- `litevirt_lww_tie_unresolved_total{table,path,category}` — **distinct** ties
-  with no safe winner (counted once per row, not per cycle). Any nonzero value is
-  alert-worthy: the row is intentionally left divergent and needs operator or
-  runtime repair. `category` ∈ {`runtime_owned`, `opaque`, `tenancy`, `policy`,
-  `control_plane`, `auth_factor`, `auth_pointer`, `lb_token`}.
+- `litevirt_lww_tie_unresolved_total{table,path,category}` — **monotonic counter**
+  of distinct unresolved ties *observed* (counted once per row, not per cycle).
+  Use `increase(...)` to alert on "a new unresolved tie appeared" — a bare `> 0`
+  would page forever, since a counter never decreases. `category` ∈
+  {`runtime_owned`, `opaque`, `tenancy`, `policy`, `control_plane`, `auth_factor`,
+  `auth_pointer`, `lb_token`}.
+- `litevirt_lww_tie_unresolved_current` — **gauge**: distinct ties this node is
+  *currently* tracking as unresolved. Drops back to 0 when the rows are repaired
+  (the per-(table,PK) tracking is cleared on any newer write). This is the right
+  signal for "something is divergent right now."
 - `litevirt_lww_tombstone_tie_total{table}` — ties a one-sided soft-delete settled
   (a delete racing a write). Benign and expected; tracked separately so it doesn't
   muddy the tie-break smell.
@@ -152,13 +157,17 @@ converge the row, so the two paths can never disagree.
 ### Alerts
 
 ```promql
-# Any unresolved tie needs a human/runtime repair (the row is divergent on purpose).
-litevirt_lww_tie_unresolved_total > 0
-# Auth/security-critical unresolved ties — page distinctly.
-sum by (category) (litevirt_lww_tie_unresolved_total{category=~"auth_factor|auth_pointer"}) > 0   # auth_unresolved_tie
-litevirt_lww_tie_unresolved_total{category="policy"} > 0                                          # policy_unresolved_tie
-# Steady tie-breaks ⇒ a node is minting colliding timestamps (an upstream clock/ID bug).
+# Something is divergent RIGHT NOW (clears automatically on repair — gauge, not counter).
+max(litevirt_lww_tie_unresolved_current) > 0
+# A NEW auth/policy-critical unresolved tie appeared — page distinctly (use increase,
+# since the _total series is a monotonic counter that never returns to 0).
+increase(litevirt_lww_tie_unresolved_total{category=~"auth_factor|auth_pointer"}[15m]) > 0   # auth_unresolved_tie
+increase(litevirt_lww_tie_unresolved_total{category="policy"}[15m]) > 0                       # policy_unresolved_tie
+# Sustained ties ⇒ a node is minting colliding timestamps (an upstream clock/ID bug).
+# Tombstone ties (a delete racing a write) are benign individually but, if sustained,
+# are the same colliding-timestamp evidence — include at a lower severity.
 rate(litevirt_lww_tie_break_total[15m]) > 0
+rate(litevirt_lww_tombstone_tie_total[15m]) > 0   # lower severity
 # A workload running in two places at once — page immediately.
 increase(litevirt_runtime_owner_assert_total{result="split_brain"}[10m]) > 0
 ```

@@ -14,6 +14,7 @@ type fakeSyncMetrics struct {
 	tieBreaks               []string // "table/resolver/winner"
 	tieUnresolved           []string // "table/path/category"
 	tombstoneTies           []string // "table"
+	unresolvedCurrent       int      // last current-unresolved gauge value
 }
 
 func (f *fakeSyncMetrics) ObserveDump(time.Duration, int) { f.dumps++ }
@@ -31,6 +32,7 @@ func (f *fakeSyncMetrics) ObserveTieUnresolved(table, path, category string) {
 func (f *fakeSyncMetrics) ObserveTombstoneTie(table string) {
 	f.tombstoneTies = append(f.tombstoneTies, table)
 }
+func (f *fakeSyncMetrics) ObserveUnresolvedTieCurrent(n int) { f.unresolvedCurrent = n }
 
 func seedHosts(ctx context.Context, c *Client, n int) {
 	for i := 0; i < n; i++ {

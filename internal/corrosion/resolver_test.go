@@ -251,18 +251,28 @@ func TestUnresolvedTracker_DistinctOnce(t *testing.T) {
 	if c.UnresolvedTieCount() != 1 || len(sm.tieUnresolved) != 1 {
 		t.Fatalf("re-observing the same divergence must count once, got count=%d metric=%d", c.UnresolvedTieCount(), len(sm.tieUnresolved))
 	}
+	if sm.unresolvedCurrent != 1 {
+		t.Fatalf("current-unresolved gauge = %d, want 1", sm.unresolvedCurrent)
+	}
 
-	// The content changes (a real new write) → re-evaluated, counted again.
+	// The content changes (a real new write) → re-evaluated, counted again (the
+	// monotonic counter), but it's the SAME row so the current gauge stays 1.
 	b2 := []interface{}{"db1", "docker004", "T"}
 	c.resolveTie("vms", cols, a, b2, []int{0}, pathAE)
 	if len(sm.tieUnresolved) != 2 {
 		t.Fatalf("a changed divergence must re-count, got metric=%d", len(sm.tieUnresolved))
 	}
+	if sm.unresolvedCurrent != 1 {
+		t.Fatalf("a same-row content change must not bump the current gauge, got %d", sm.unresolvedCurrent)
+	}
 
-	// Convergence clears the entry.
+	// Convergence clears the entry → the gauge drops to 0 (the counter stays at 2).
 	c.clearUnresolved("vms", pkKeyAt(b2, []int{0}))
 	if c.UnresolvedTieCount() != 0 {
 		t.Fatalf("clearUnresolved must drop the entry, count=%d", c.UnresolvedTieCount())
+	}
+	if sm.unresolvedCurrent != 0 {
+		t.Fatalf("current-unresolved gauge must drop to 0 after repair, got %d", sm.unresolvedCurrent)
 	}
 }
 

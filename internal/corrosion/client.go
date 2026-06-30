@@ -42,6 +42,12 @@ type SyncMetrics interface {
 	// write) — counting it in the tie-break series would muddy the "steady ties ⇒
 	// colliding timestamps" signal.
 	ObserveTombstoneTie(table string)
+	// ObserveUnresolvedTieCurrent reports the CURRENT count of distinct
+	// unresolved ties this node is tracking — a gauge, not the monotonic
+	// lww_tie_unresolved_total counter. It drops back to 0 when the rows are
+	// repaired (clearUnresolved), so it's the right signal for a "something is
+	// divergent right now" alert (the counter would page forever after one tie).
+	ObserveUnresolvedTieCurrent(n int)
 }
 
 // Config holds configuration for the embedded state store.
@@ -147,6 +153,12 @@ func (c *Client) observeTieUnresolved(table, path, category string) {
 func (c *Client) observeTombstoneTie(table string) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveTombstoneTie(table)
+	}
+}
+
+func (c *Client) observeUnresolvedTieCurrent(n int) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveUnresolvedTieCurrent(n)
 	}
 }
 

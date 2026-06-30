@@ -37,6 +37,37 @@ var peerRuntimeProbeTimeout = 3 * time.Second
 // the urgent case).
 const ownershipAssertDebounce = 2 * time.Minute
 
+// workloadCapablePeers returns the hosts to corroborate runtime ownership
+// against: every host that COULD be running the workload. We must include not
+// just active hosts but draining/upgrading/offline ones too — a domain/container
+// keeps running across a daemon re-exec (KillMode=process) and during a drain, so
+// skipping them could miss a live copy and reclaim into a split-brain. We exclude
+// only: self; witnesses (never host workloads, and may have no runtime → always
+// "unknown", which would block every reclaim); and FENCED hosts (positively dead
+// by fencing proof → their workloads are gone). An unreachable peer in any
+// included state simply yields "inconclusive", which is safe.
+func workloadCapablePeers(hosts []corrosion.HostRecord, self string) []string {
+	var others []string
+	for _, h := range hosts {
+		if h.Name == self || h.IsWitness() || h.State == "fenced" {
+			continue
+		}
+		others = append(others, h.Name)
+	}
+	return others
+}
+
+// localHostIsActiveWorker reports whether this host may perform a runtime
+// ownership repair: it must be present, active, and a worker (never a witness).
+func localHostIsActiveWorker(hosts []corrosion.HostRecord, self string) bool {
+	for i := range hosts {
+		if hosts[i].Name == self {
+			return hosts[i].State == "active" && !hosts[i].IsWitness()
+		}
+	}
+	return false
+}
+
 // SetPeerRuntimeChecker injects the peer CheckVMRuntime client. Without it,
 // runtime owner-assert is disabled (no peer corroboration possible).
 func (r *Reconciler) SetPeerRuntimeChecker(fn func(ctx context.Context, host, name string) (string, error)) {
@@ -77,34 +108,11 @@ func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 
 	// Local host gate: only an ACTIVE WORKER may claim a workload. A witness votes
 	// but never owns workloads (the witness invariant); a non-active local host
-	// (draining/upgrading/fenced) must not be writing new ownership. If our own
-	// row is missing/witness/non-active, stand down entirely.
-	var self *corrosion.HostRecord
-	for i := range hosts {
-		if hosts[i].Name == r.hostName {
-			self = &hosts[i]
-			break
-		}
-	}
-	if self == nil || self.State != "active" || self.IsWitness() {
+	// (draining/upgrading/fenced) must not be writing new ownership.
+	if !localHostIsActiveWorker(hosts, r.hostName) {
 		return
 	}
-
-	// Corroborate against every peer that COULD be running the VM. We must include
-	// not just active hosts but draining/upgrading/offline ones too — a domain
-	// keeps running across a daemon re-exec (KillMode=process) and during a drain,
-	// so skipping them could miss a live copy and assert into a split-brain. We
-	// exclude only: self; witnesses (never host workloads, and may have no libvirt
-	// → always "unknown", which would block every reclaim); and FENCED hosts
-	// (positively dead by fencing proof → their domains are gone). An unreachable
-	// peer in any included state simply yields "inconclusive", which is safe.
-	var others []string
-	for _, h := range hosts {
-		if h.Name == r.hostName || h.IsWitness() || h.State == "fenced" {
-			continue
-		}
-		others = append(others, h.Name)
-	}
+	others := workloadCapablePeers(hosts, r.hostName)
 
 	seen := make(map[string]bool, len(localDomains))
 	for _, domName := range localDomains {

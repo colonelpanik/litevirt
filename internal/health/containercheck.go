@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -34,6 +35,23 @@ type ContainerChecker struct {
 	db       *corrosion.Client
 	runtime  lxc.Runtime
 	bus      *events.Bus
+
+	// checkPeerRuntime asks a peer for its local LXC view of a container
+	// (absent/defined_stopped/running/unknown) — injected by the daemon. nil
+	// disables runtime re-key. See SetPeerContainerRuntimeChecker.
+	checkPeerRuntime func(ctx context.Context, host, name string) (string, error)
+	// onRekey observes each runtime re-key decision (result ∈ rekeyed /
+	// split_brain / inconclusive / error) — nil-safe; tests assert on it.
+	onRekey func(name, result string)
+
+	// Now is the clock for the re-key debounce (defaults to time.Now); tests
+	// override it to advance deterministically.
+	Now func() time.Time
+
+	// ownerMu guards ownershipFirstSeen, the debounce map recording when each
+	// container was first seen running-locally-but-owned-elsewhere.
+	ownerMu            sync.Mutex
+	ownershipFirstSeen map[string]time.Time
 }
 
 // NewContainerChecker creates a container reconciler/restart engine for the
@@ -92,6 +110,10 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 	if _, err := network.ReleaseOrphanContainerLeases(ctx, c.db, c.hostName, live, orphanLeaseMinAge); err != nil {
 		slog.Warn("containercheck: orphan-lease GC failed", "error", err)
 	}
+
+	// Runtime owner re-key (Phase 4): reclaim a container running locally whose
+	// only live DB row points at another host.
+	c.assertContainerOwnership(ctx)
 }
 
 // orphanLeaseMinAge is how long a CT IPAM lease with no live container row must

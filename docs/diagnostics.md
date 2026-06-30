@@ -172,3 +172,21 @@ local (never picks an owner by value) and defers to runtime repair.
 
 Either way the fresh timestamp wins everywhere by ordinary LWW and clears the
 unresolved tracking.
+
+### Container ownership — automatic runtime re-key
+
+Container ownership is part of the primary key `(host_name, name)`, so an
+ownership split is **two distinct rows**, not a single-row tie — the row resolver
+can't see it (it's surfaced as `duplicate_live_container` above). The container
+reconciler repairs it directly: when a container runs **locally** but its only
+live DB row points at another host (and no live local row exists), it queries
+**every workload-capable peer's local LXC** (the peer-only `CheckContainerRuntime`
+RPC) and, only if none reports it running (a peer's stale *stopped* leftover does
+not block; an unreachable/unknown peer does), performs an atomic **PK re-key**:
+tombstone the remote row, insert a local row carrying the container's
+`create_spec` and a distinct `runtime-owner-rekey` provenance marker. It stands
+clear of any container under an active relocation/restore/migration (PR #57
+markers / `relocate_token`), skips ambiguous cases (a live local row, more than
+one remote row, templates), and — like the VM path — only an active worker acts,
+a peer reporting `running` is a logged split-brain (no re-key), and a debounce
+guards the transition window.

@@ -274,6 +274,42 @@ func SetContainerStateDetailStrict(ctx context.Context, c *Client, hostName, nam
 // container reconciler reads it to recreate the container from its image (B5).
 const ContainerRelocateRecreateDetail = "relocate-recreate"
 
+// ContainerRuntimeRekeyDetail is the provenance marker the Phase-4 runtime re-key
+// reconciler stamps on a container row it reclaims (a container running locally
+// whose only live DB row pointed at another host). It is DISTINCT from
+// relocate_token / relocate-restore (which the failover coordinator keys on), so
+// the runtime-repair path never collides with an in-flight relocation —
+// relocate_token is preserved if already present and NEVER minted by this path.
+const ContainerRuntimeRekeyDetail = "runtime-owner-rekey"
+
+// RekeyContainerOwner atomically re-homes a container's DB ownership from
+// src.HostName to toHost: it tombstones the (src.HostName, name) row and
+// (re)inserts a (toHost, name) row carrying src's identity (create_spec, image,
+// limits, labels, …) marked running with the runtime-rekey provenance detail.
+// Both writes share one transaction, so a reader never sees zero or two live
+// rows. created_at and relocate_token are preserved from src (never minted).
+//
+// This is the container analogue of UpdateVMHost — but a PK CHANGE, because
+// container ownership is part of the primary key (host_name, name): an ownership
+// "split" is two distinct rows, not a single-row LWW tie.
+func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, toHost string) error {
+	now := c.NowTS()
+	tombstone := Statement{
+		SQL: `UPDATE containers SET deleted_at = ?, updated_at = ?
+		      WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		Params: []interface{}{now, now, src.HostName, src.Name},
+	}
+	newRow := src
+	newRow.HostName = toHost
+	newRow.State = "running"
+	newRow.StateDetail = ContainerRuntimeRekeyDetail
+	ins, err := upsertContainerStmt(c, newRow)
+	if err != nil {
+		return err
+	}
+	return c.ExecuteBatch(ctx, []Statement{tombstone, ins})
+}
+
 // ContainerRelocateRestorePrefix marks a container the coordinator is relocating
 // via restore-from-backup. Unlike relocate-recreate (an image path stamped on the
 // TARGET row), this is stamped on the SOURCE (dead-host) row as

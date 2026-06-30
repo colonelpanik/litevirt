@@ -507,6 +507,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// above; operator-stopped containers are left alone (state_detail).
 	ctChecker := health.NewContainerChecker(d.cfg.HostName, d.db, lxcRunner)
 	ctChecker.SetEventBus(svc.EventBus())
+	// Runtime container re-key (Phase 4): corroborate a locally-running container
+	// whose only live DB row points elsewhere against every workload-capable peer
+	// before reclaiming it (a PK re-key).
+	ctChecker.SetPeerContainerRuntimeChecker(svc.CheckPeerContainerRuntime)
 	go ctChecker.Start(ctx)
 
 	// wire the libvirt blockdev-mirror driver so MoveVolume

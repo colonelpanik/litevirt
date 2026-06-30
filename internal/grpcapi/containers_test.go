@@ -41,6 +41,12 @@ type fakeCTRuntime struct {
 	ipByName map[string]string
 	ipCalls  []string
 
+	// CheckContainerRuntime probes: listNames is what ListContainers returns
+	// (nil = none → absent); stateByName overrides StateContainer per name
+	// (unset → "running" for back-compat with the lifecycle tests).
+	listNames   []string
+	stateByName map[string]string
+
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
 	rootfs        string
@@ -123,7 +129,12 @@ func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []str
 	}{name, argv})
 	return ContainerExecResult{Stdout: []byte("ok"), ExitCode: 0}, nil
 }
-func (f *fakeCTRuntime) StateContainer(_ context.Context, _ string) (string, error) {
+func (f *fakeCTRuntime) StateContainer(_ context.Context, name string) (string, error) {
+	if f.stateByName != nil {
+		if s, ok := f.stateByName[name]; ok {
+			return s, nil
+		}
+	}
 	return "running", nil
 }
 func (f *fakeCTRuntime) IPContainer(_ context.Context, name string) (string, error) {
@@ -205,7 +216,7 @@ func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error
 	f.cloneCalls = append(f.cloneCalls, struct{ Src, Dst string }{src, dst})
 	return nil
 }
-func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return nil, nil }
+func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return f.listNames, nil }
 func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

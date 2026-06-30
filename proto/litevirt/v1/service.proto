@@ -94,6 +94,15 @@ message RepairVMOwnerResponse { string host = 1; string previous_host = 2; }
 message CheckVMRuntimeRequest  { string name = 1; }
 message CheckVMRuntimeResponse { string state = 1; }
 
+// CheckContainerRuntime is the container analogue of CheckVMRuntime: it reports
+// the responding host's LOCAL LXC view of a container ({absent, defined_stopped,
+// running, unknown}) and never consults the DB. Peer-only. The container runtime
+// re-key reconciler queries it on every workload-capable peer before reclaiming a
+// container it runs locally (a PK re-key, since container ownership is part of
+// the primary key).
+message CheckContainerRuntimeRequest  { string name = 1; }
+message CheckContainerRuntimeResponse { string state = 1; }
+
 // CloneVM creates a new VM from a template or an existing VM (optionally a
 // snapshot of it). mode "" → storage-aware auto (linked on shared storage,
 // full on local); "linked" / "full" force a mode. The clone gets a fresh
@@ -1553,6 +1562,7 @@ service LiteVirt {
     rpc DeleteVM(DeleteVMRequest)        returns (google.protobuf.Empty);
     rpc RepairVMOwner(RepairVMOwnerRequest) returns (RepairVMOwnerResponse);
     rpc CheckVMRuntime(CheckVMRuntimeRequest) returns (CheckVMRuntimeResponse);
+    rpc CheckContainerRuntime(CheckContainerRuntimeRequest) returns (CheckContainerRuntimeResponse);
     rpc CloneVM(CloneVMRequest)          returns (VM);
     rpc ConvertToTemplate(ConvertToTemplateRequest) returns (VM);
     rpc ExecVM(ExecVMRequest)            returns (ExecVMResponse);

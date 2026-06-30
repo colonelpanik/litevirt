@@ -45,6 +45,7 @@ const (
 	LiteVirt_DeleteVM_FullMethodName                   = "/litevirt.v1.LiteVirt/DeleteVM"
 	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
 	LiteVirt_CheckVMRuntime_FullMethodName             = "/litevirt.v1.LiteVirt/CheckVMRuntime"
+	LiteVirt_CheckContainerRuntime_FullMethodName      = "/litevirt.v1.LiteVirt/CheckContainerRuntime"
 	LiteVirt_CloneVM_FullMethodName                    = "/litevirt.v1.LiteVirt/CloneVM"
 	LiteVirt_ConvertToTemplate_FullMethodName          = "/litevirt.v1.LiteVirt/ConvertToTemplate"
 	LiteVirt_ExecVM_FullMethodName                     = "/litevirt.v1.LiteVirt/ExecVM"
@@ -272,6 +273,7 @@ type LiteVirtClient interface {
 	DeleteVM(ctx context.Context, in *DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
 	CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeRequest, opts ...grpc.CallOption) (*CheckVMRuntimeResponse, error)
+	CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error)
 	CloneVM(ctx context.Context, in *CloneVMRequest, opts ...grpc.CallOption) (*VM, error)
 	ConvertToTemplate(ctx context.Context, in *ConvertToTemplateRequest, opts ...grpc.CallOption) (*VM, error)
 	ExecVM(ctx context.Context, in *ExecVMRequest, opts ...grpc.CallOption) (*ExecVMResponse, error)
@@ -836,6 +838,16 @@ func (c *liteVirtClient) CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckVMRuntimeResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_CheckVMRuntime_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckContainerRuntimeResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_CheckContainerRuntime_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2954,6 +2966,7 @@ type LiteVirtServer interface {
 	DeleteVM(context.Context, *DeleteVMRequest) (*emptypb.Empty, error)
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
 	CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error)
+	CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error)
 	CloneVM(context.Context, *CloneVMRequest) (*VM, error)
 	ConvertToTemplate(context.Context, *ConvertToTemplateRequest) (*VM, error)
 	ExecVM(context.Context, *ExecVMRequest) (*ExecVMResponse, error)
@@ -3315,6 +3328,9 @@ func (UnimplementedLiteVirtServer) RepairVMOwner(context.Context, *RepairVMOwner
 }
 func (UnimplementedLiteVirtServer) CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckVMRuntime not implemented")
+}
+func (UnimplementedLiteVirtServer) CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckContainerRuntime not implemented")
 }
 func (UnimplementedLiteVirtServer) CloneVM(context.Context, *CloneVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method CloneVM not implemented")
@@ -4298,6 +4314,24 @@ func _LiteVirt_CheckVMRuntime_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).CheckVMRuntime(ctx, req.(*CheckVMRuntimeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_CheckContainerRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckContainerRuntimeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_CheckContainerRuntime_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, req.(*CheckContainerRuntimeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7501,6 +7535,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckVMRuntime",
 			Handler:    _LiteVirt_CheckVMRuntime_Handler,
+		},
+		{
+			MethodName: "CheckContainerRuntime",
+			Handler:    _LiteVirt_CheckContainerRuntime_Handler,
 		},
 		{
 			MethodName: "CloneVM",

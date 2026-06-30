@@ -43,7 +43,7 @@
       <listen type="address" address="127.0.0.1"></listen>
     </graphics>
     <video>
-      <model type="virtio"></model>
+      <model type="vga"></model>
     </video>
     <memballoon model="virtio"></memballoon>
   </devices>

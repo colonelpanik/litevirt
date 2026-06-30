@@ -395,8 +395,16 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		})
 	}
 	if cfg.EnableVNC || cfg.EnableSPICE {
+		// virtio-gpu has no VGA BIOS, so SeaBIOS/GRUB draw nothing on it — a BIOS
+		// guest shows a black VNC through firmware/boot. OVMF drives virtio-gpu, so
+		// UEFI is fine; use a legacy VGA model for BIOS so the console renders from
+		// power-on.
+		videoType := "virtio"
+		if !isUEFI {
+			videoType = "vga"
+		}
 		dev.Videos = append(dev.Videos, videoDevice{
-			Model: videoModel{Type: "virtio"},
+			Model: videoModel{Type: videoType},
 		})
 	}
 

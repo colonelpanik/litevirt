@@ -107,18 +107,26 @@ func TestFleet_OneOwnerAfterHeal(t *testing.T) {
 	}
 	survivor := c.Node(vmAfter.HostName)
 
-	// Model the partition+heal split-brain: the survivor's reconciler has already
-	// started vm-own (so it runs there), while the victim's stale copy is STILL
-	// running locally — two running copies at the instant of heal.
+	// The survivor's reconciler has started vm-own there.
 	survivor.Virt.SetState("vm-own", libvirtfake.StateRunning)
 
-	// Heal: the victim's reconciler runs and finds vm-own running locally but owned
-	// (in corrosion) by the survivor → it self-fences ONLY its own stale copy.
+	// The victim was SUCCESSFULLY fenced (the coordinator used a succeeding fencer),
+	// which stops the loser — model that outcome: on heal its local domain is a
+	// dead, shut-off leftover. selfFence's job here is to GC that husk.
+	//
+	// NB: Phase 1 deliberately will NOT destroy a still-RUNNING victim copy on a
+	// bare DB-ownership read (the §2.1 data-loss path) — that true-split-brain case
+	// (e.g. a FAILED fence) is deferred to the Phase-3 runtime/fencing repair and is
+	// covered by the reconciler unit tests, not asserted here.
+	victim.Virt.SetState("vm-own", libvirtfake.StateDefined)
+	victim.Virt.SetStateReason("vm-own", "destroyed")
+
+	// Heal: the victim's reconciler GCs its stopped, moved-away leftover.
 	rec := health.NewReconciler(victim.Name, t.TempDir(), victim.DB, victim.Virt)
 	rec.ReconcileOnce(ctx)
 
 	if victim.Virt.DomainExists("vm-own") {
-		t.Fatal("fenced victim must self-fence its stale local domain after the VM was reassigned")
+		t.Fatal("fenced victim must GC its stopped, moved-away leftover after heal")
 	}
 
 	// Exactly one owner remains, and it's the DB-owner (the survivor) — not zero,

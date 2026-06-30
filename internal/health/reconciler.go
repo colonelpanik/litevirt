@@ -285,22 +285,25 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 		// If corrosion says this VM belongs to a different host, we no longer own it.
 		if vm.HostName != r.hostName {
 			// Non-destruction guard (LWW-repair Phase 1): NEVER destroy a domain
-			// that is RUNNING locally, whatever the DB host_name says. A
-			// converged-wrong host_name — the equal-`updated_at` LWW tie this repair
-			// targets — must not be able to drive selfFence into destroying a live
-			// VM. Running-local is proof only that a destructive self-fence is
-			// UNSAFE; it is NOT proof of ownership (ownership is reconciled against
-			// runtime + fencing in Phase 3). Fail CLOSED: destroy ONLY when we can
-			// positively read the domain and it is not running — an unreadable state
-			// could be a running domain mid-query, so we skip it.
-			state, serr := r.virt.DomainState(domName)
-			if serr != nil || state == "running" {
-				slog.Warn("reconciler: NOT destroying a locally-running/indeterminate domain whose DB row points elsewhere; deferring to runtime ownership repair",
-					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", state, "state_err", serr)
+			// that holds live or resumable state locally, whatever the DB host_name
+			// says. A converged-wrong host_name — the equal-`updated_at` LWW tie this
+			// repair targets — must not be able to drive selfFence into destroying a
+			// live VM. Destroying is permitted ONLY on positive proof the domain is a
+			// clearly-dead leftover (see cleanableDomainReason); everything else —
+			// running, PAUSED, PM-SUSPENDED, SAVED (managed-save memory image),
+			// shutting-down, crashed, migrated, from-snapshot, and any unknown or
+			// unreadable state — is skipped and deferred to the Phase-3 runtime/
+			// fencing ownership reconciliation. We use DomainStateReason, not the
+			// coarse DomainState, because the latter collapses paused/pm-suspended/
+			// saved/shutoff all into "stopped" and would destroy resumable workloads.
+			st, serr := r.virt.DomainStateReason(domName)
+			if serr != nil || !cleanableDomainReason(st.Reason) {
+				slog.Warn("reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair",
+					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", st.State, "reason", st.Reason, "state_err", serr)
 				continue
 			}
-			slog.Warn("reconciler: removing stale non-running local domain whose DB row moved to another host",
-				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", state)
+			slog.Warn("reconciler: removing clearly-dead local leftover whose DB row moved to another host",
+				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "reason", st.Reason)
 			if err := r.virt.DestroyDomain(domName); err != nil {
 				slog.Warn("reconciler: destroy stale domain failed", "vm", domName, "error", err)
 			}
@@ -310,6 +313,25 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 				slog.Warn("reconciler: undefine stale domain failed", "vm", domName, "error", err)
 			}
 		}
+	}
+}
+
+// cleanableDomainReason is the allowlist of DomainStateReason values that mark a
+// local domain as a CLEARLY-DEAD leftover — no live or resumable state — so it is
+// safe to destroy+undefine when its DB row has moved to another host. It is an
+// allowlist (default: do NOT clean) so any state holding recoverable memory
+// (paused, pmsuspended, saved), in transition (shutting-down, migrated,
+// from-snapshot), needing investigation (crashed), or unknown/unreadable is
+// skipped — the Phase-1 guard fails closed and defers to runtime ownership repair.
+func cleanableDomainReason(reason string) bool {
+	switch reason {
+	case "guest-shutdown", // guest cleanly powered itself off
+		"destroyed", // forcibly destroyed — no state retained
+		"daemon",    // shut off by the daemon
+		"failed":    // failed to start — never held live state
+		return true
+	default:
+		return false
 	}
 }
 

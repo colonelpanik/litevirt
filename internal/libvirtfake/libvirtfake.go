@@ -71,6 +71,7 @@ type Fake struct {
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
 	FailDomainState        func(name string) error
+	FailDomainStateReason  func(name string) error
 	FailMigrateToTarget    func(name, dconnuri string) error
 	FailBlockPull          func(domain, disk string) error
 	FailPoolDestroy        func(name string) error
@@ -277,6 +278,11 @@ func (f *Fake) SetStateReason(name, reason string) {
 // "unknown". Reason defaults to "running" for a running domain (or an injected
 // value via SetStateReason), else "unknown".
 func (f *Fake) DomainStateReason(name string) (libvirt.DomainStatus, error) {
+	if f.FailDomainStateReason != nil {
+		if err := f.FailDomainStateReason(name); err != nil {
+			return libvirt.DomainStatus{State: "unknown", Reason: "unknown"}, err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s, ok := f.domains[name]

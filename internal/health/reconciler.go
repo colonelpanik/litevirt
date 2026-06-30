@@ -284,13 +284,28 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 
 		// If corrosion says this VM belongs to a different host, we no longer own it.
 		if vm.HostName != r.hostName {
-			slog.Warn("reconciler: split-brain detected — destroying local domain that moved to another host",
-				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName)
+			// Non-destruction guard (LWW-repair Phase 1): NEVER destroy a domain
+			// that is RUNNING locally, whatever the DB host_name says. A
+			// converged-wrong host_name — the equal-`updated_at` LWW tie this repair
+			// targets — must not be able to drive selfFence into destroying a live
+			// VM. Running-local is proof only that a destructive self-fence is
+			// UNSAFE; it is NOT proof of ownership (ownership is reconciled against
+			// runtime + fencing in Phase 3). Fail CLOSED: destroy ONLY when we can
+			// positively read the domain and it is not running — an unreadable state
+			// could be a running domain mid-query, so we skip it.
+			state, serr := r.virt.DomainState(domName)
+			if serr != nil || state == "running" {
+				slog.Warn("reconciler: NOT destroying a locally-running/indeterminate domain whose DB row points elsewhere; deferring to runtime ownership repair",
+					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", state, "state_err", serr)
+				continue
+			}
+			slog.Warn("reconciler: removing stale non-running local domain whose DB row moved to another host",
+				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", state)
 			if err := r.virt.DestroyDomain(domName); err != nil {
 				slog.Warn("reconciler: destroy stale domain failed", "vm", domName, "error", err)
 			}
-			// wipe by design: the VM now lives on another host; this is a dead
-			// local copy (the authoritative firmware state travels with it).
+			// wipe by design: a stopped/defined leftover whose VM now lives on
+			// another host (the authoritative firmware state travels with it).
 			if err := r.virt.UndefineDomain(domName, false); err != nil {
 				slog.Warn("reconciler: undefine stale domain failed", "vm", domName, "error", err)
 			}

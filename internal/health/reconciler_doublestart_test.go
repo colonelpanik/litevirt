@@ -95,32 +95,74 @@ func TestReconciler_StartPendingVM_RefusesWhenLockHeld(t *testing.T) {
 // running locally that corrosion says now belongs to ANOTHER host is destroyed +
 // undefined locally (the loser of a partition+heal reassignment), leaving exactly
 // one owner cluster-wide.
-func TestReconciler_SelfFenceDestroysMovedDomain(t *testing.T) {
+func wasDestroyed(fake *libvirtfake.Fake, name string) bool {
+	for _, e := range fake.EventLog() {
+		if e.Domain == name && e.Op == "destroy" {
+			return true
+		}
+	}
+	return false
+}
+
+// Phase 1 guard: a domain RUNNING locally whose DB row points to another host is
+// NOT destroyed — a converged-wrong host_name (the equal-timestamp LWW tie) must
+// not drive selfFence into killing a live VM. Ownership is reconciled later
+// against runtime/fencing (Phase 3), not by trusting the DB field.
+func TestReconciler_SelfFence_RunningLocalNotDestroyed(t *testing.T) {
 	db := testReconcilerDB(t)
 	ctx := context.Background()
-
-	// Corrosion: vm1 now owned by node-b, running there.
 	if err := corrosion.InsertVM(ctx, db,
 		corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	// But it's still running locally on node-a (a stale copy from before the move).
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateRunning) // still running locally on node-a
+
+	NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
+
+	if !fake.DomainExists("vm1") || wasDestroyed(fake, "vm1") {
+		t.Fatal("selfFence must NOT destroy a locally-running domain whose DB row moved away")
+	}
+}
+
+// An indeterminate state (can't read it) also fails closed — it could be a
+// running domain mid-query, so selfFence must not destroy it.
+func TestReconciler_SelfFence_IndeterminateNotDestroyed(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
+	fake.FailDomainState = func(string) error { return context.DeadlineExceeded } // state unreadable
 
-	r := NewReconciler("node-a", t.TempDir(), db, fake)
-	r.selfFence(ctx)
+	NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
+
+	if wasDestroyed(fake, "vm1") {
+		t.Fatal("selfFence must fail closed (not destroy) when the local state is unreadable")
+	}
+}
+
+// A STOPPED/defined leftover whose DB row moved to another host is still cleaned
+// up (destroy + undefine) — that's a dead local copy, not a live VM.
+func TestReconciler_SelfFence_StoppedLeftoverDestroyed(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateDefined) // defined-but-not-running ("shutoff")
+
+	NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
 
 	if fake.DomainExists("vm1") {
-		t.Fatal("selfFence must destroy+undefine the local domain that moved to another host")
+		t.Fatal("selfFence must clean up a stopped leftover whose VM moved to another host")
 	}
-	var destroyed bool
-	for _, e := range fake.EventLog() {
-		if e.Domain == "vm1" && e.Op == "destroy" {
-			destroyed = true
-		}
-	}
-	if !destroyed {
-		t.Fatal("expected a destroy event for the moved-away vm1")
+	if !wasDestroyed(fake, "vm1") {
+		t.Fatal("expected a destroy event for the stopped moved-away leftover")
 	}
 }

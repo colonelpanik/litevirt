@@ -17,7 +17,12 @@ import (
 func newDoctorCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Read-only cluster diagnostics",
+		Short: "Cluster diagnostics and repairs",
+		Long: `Cluster-health diagnostics and targeted repairs.
+
+Most subcommands are read-only (e.g. 'divergence'). A few mutate cluster state
+to remediate a diagnosed problem (e.g. 'repair-owner') — those are admin-gated
+and audited; check each subcommand's help before running it.`,
 	}
 	cmd.AddCommand(newDoctorDivergenceCmd(), newDoctorRepairOwnerCmd())
 	return cmd
@@ -27,15 +32,17 @@ func newDoctorRepairOwnerCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "repair-owner <vm> <host>",
 		Short: "Re-assert a VM's owner on the host that runs it (converge an equal-timestamp ownership split)",
-		Long: `Re-stamp a VM's host_name ownership with a fresh timestamp on <host>, which must
-be the host that actually runs the VM. The daemon forwards the request to <host>
-and applies the write ONLY if that host confirms the VM is running locally — so it
-can never point ownership at a host that doesn't run the VM. It is non-destructive
-(a DB owner write; it never touches the domain).
+		Long: `Re-stamp a VM's ownership with a fresh timestamp on <host>, which must be the
+host that actually runs the VM. The daemon forwards the request to <host> and
+applies the write ONLY if that host confirms the VM is running locally — so it
+can never point ownership at a host that doesn't run the VM. It rewrites only the
+VM's DB row (host_name, state=running, cleared state_detail, fresh timestamp); it
+never touches the running domain, so it cannot move or destroy a workload.
 
 Use it to converge a stale bystander host_name left by an equal-timestamp
 last-writer-wins split that a stationary VM can't self-heal — find such rows with
-'lv doctor divergence'. Admin only; audited.`,
+'lv doctor divergence'. Requires the vm.repair-owner permission on the VM's path
+(admin by default); audited.`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {

@@ -2076,12 +2076,13 @@ func (x *DeleteVMRequest) GetKeepDisks() bool {
 	return false
 }
 
-// RepairVMOwner re-stamps a VM's host_name ownership with a fresh timestamp on the
-// host that actually runs it — the narrow, audited admin repair for an
-// equal-timestamp LWW ownership split that a stationary VM can't self-heal (a
-// bystander node holds a stale host_name at the same updated_at). It is forwarded
-// to `host` and applied ONLY if that host positively confirms the VM is running
-// locally; it is non-destructive (a DB owner write, never touches the domain).
+// RepairVMOwner re-stamps a VM's ownership (host_name + running state) with a
+// fresh timestamp on the host that actually runs it — the narrow, audited repair
+// for an equal-timestamp LWW ownership split that a stationary VM can't self-heal
+// (a bystander node holds a stale host_name at the same updated_at). Requires the
+// vm.repair-owner permission on the VM's path (enforced before forwarding). It is
+// forwarded to `host` and applied ONLY if that host positively confirms the VM is
+// running locally; it rewrites only the VM's DB row (never touches the domain).
 type RepairVMOwnerRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`

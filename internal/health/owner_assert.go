@@ -19,6 +19,14 @@ const (
 	RuntimeUnknown        = "unknown"
 )
 
+// peerRuntimeProbeTimeout bounds each peer CheckVMRuntime probe. PeerDial is lazy
+// (it doesn't connect at construction), so an unreachable/segmented peer would
+// otherwise hang on the reconciler's long-lived daemon context and wedge the
+// whole tick (including normal reconcile + selfFence). A timed-out probe is
+// treated as inconclusive (we just can't confirm absence). A var so tests can
+// shrink it.
+var peerRuntimeProbeTimeout = 3 * time.Second
+
 // ownershipAssertDebounce is how long the "runs locally but the DB says another
 // host" condition must persist before the reconciler reclaims ownership. The
 // PRIMARY guards against racing a legitimate ownership move are the migration
@@ -65,9 +73,13 @@ func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	// Corroborate against active WORKLOAD-capable hosts only. A witness is active
+	// (it votes) but never hosts VMs and may have no libvirt client — its
+	// CheckVMRuntime would always answer "unknown", which would otherwise block
+	// every reclaim forever.
 	var others []string
 	for _, h := range hosts {
-		if h.Name != r.hostName && h.State == "active" {
+		if h.Name != r.hostName && h.State == "active" && !h.IsWitness() {
 			others = append(others, h.Name)
 		}
 	}
@@ -112,10 +124,13 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 	anyRunning := false
 	allAbsent := true
 	for _, h := range others {
-		st, err := r.checkPeerRuntime(ctx, h, name)
+		// Bound each probe so an unreachable/segmented peer can't stall the tick.
+		pctx, cancel := context.WithTimeout(ctx, peerRuntimeProbeTimeout)
+		st, err := r.checkPeerRuntime(pctx, h, name)
+		cancel()
 		if err != nil {
-			// Unreachable / segmented / old build with no CheckVMRuntime → we
-			// cannot confirm absence, so we must not assert.
+			// Unreachable / segmented / timed-out / old build with no
+			// CheckVMRuntime → we cannot confirm absence, so we must not assert.
 			allAbsent = false
 			slog.Info("owner-assert: peer unreachable, deferring", "vm", name, "peer", h, "error", err)
 			continue

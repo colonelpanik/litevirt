@@ -170,6 +170,71 @@ func TestOwnerAssert_SkipsInFlightOps(t *testing.T) {
 	}
 }
 
+// An ACTIVE WITNESS is excluded from corroboration — it never hosts VMs and may
+// have no libvirt (its CheckVMRuntime answers "unknown"), so it must not block a
+// reclaim when all worker peers are absent.
+func TestOwnerAssert_WitnessExcluded(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, clock, results := ownerAssertFixture(t)
+	if err := corrosion.UpdateHostRole(ctx, db, "node-c", "witness"); err != nil {
+		t.Fatalf("UpdateHostRole: %v", err)
+	}
+	queriedC := false
+	r.SetPeerRuntimeChecker(func(_ context.Context, host, _ string) (string, error) {
+		if host == "node-c" {
+			queriedC = true
+			return RuntimeUnknown, nil // witness has no libvirt — would block if queried
+		}
+		return RuntimeAbsent, nil
+	})
+	r.assertRuntimeOwnership(ctx) // seed the debounce
+	*clock = clock.Add(ownershipAssertDebounce + time.Minute)
+	r.assertRuntimeOwnership(ctx)
+
+	if queriedC {
+		t.Fatal("the witness node-c must NOT be probed")
+	}
+	if ownerOf(t, db, "vm1") != "node-a" {
+		t.Fatalf("must reclaim with only the worker peer absent, got %s", ownerOf(t, db, "vm1"))
+	}
+	if results["vm1"] != "asserted" {
+		t.Fatalf("result = %q, want asserted", results["vm1"])
+	}
+}
+
+// A peer probe that hangs must be bounded — the reconciler returns promptly with
+// "inconclusive" rather than wedging on the long-lived daemon context.
+func TestOwnerAssert_ProbeTimeoutBounded(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, clock, results := ownerAssertFixture(t)
+
+	saved := peerRuntimeProbeTimeout
+	peerRuntimeProbeTimeout = 50 * time.Millisecond
+	defer func() { peerRuntimeProbeTimeout = saved }()
+
+	// A checker that hangs until ITS context is cancelled (the per-probe timeout).
+	r.SetPeerRuntimeChecker(func(c context.Context, _, _ string) (string, error) {
+		<-c.Done()
+		return "", c.Err()
+	})
+	r.assertRuntimeOwnership(ctx) // seed the debounce
+	*clock = clock.Add(ownershipAssertDebounce + time.Minute)
+
+	start := time.Now()
+	r.assertRuntimeOwnership(ctx)
+	elapsed := time.Since(start)
+
+	if elapsed > 1*time.Second {
+		t.Fatalf("owner-assert did not bound the hung probes (took %s)", elapsed)
+	}
+	if ownerOf(t, db, "vm1") != "node-b" {
+		t.Fatal("must not reclaim when probes time out")
+	}
+	if results["vm1"] != "inconclusive" {
+		t.Fatalf("result = %q, want inconclusive", results["vm1"])
+	}
+}
+
 func auditCount(t *testing.T, db *corrosion.Client, action string) int {
 	t.Helper()
 	rows, err := db.Query(context.Background(),

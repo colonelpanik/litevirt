@@ -11,6 +11,8 @@ import (
 type fakeSyncMetrics struct {
 	dumps, digests, merges  int
 	lastMerged, lastSkipped int
+	tieBreaks               []string // "table/resolver/winner"
+	tieUnresolved           []string // "table/path/category"
 }
 
 func (f *fakeSyncMetrics) ObserveDump(time.Duration, int) { f.dumps++ }
@@ -18,6 +20,12 @@ func (f *fakeSyncMetrics) ObserveDigest(time.Duration)    { f.digests++ }
 func (f *fakeSyncMetrics) ObserveMerge(_ time.Duration, m, s int) {
 	f.merges++
 	f.lastMerged, f.lastSkipped = m, s
+}
+func (f *fakeSyncMetrics) ObserveTieBreak(table, resolver, winner string) {
+	f.tieBreaks = append(f.tieBreaks, table+"/"+resolver+"/"+winner)
+}
+func (f *fakeSyncMetrics) ObserveTieUnresolved(table, path, category string) {
+	f.tieUnresolved = append(f.tieUnresolved, table+"/"+path+"/"+category)
 }
 
 func seedHosts(ctx context.Context, c *Client, n int) {

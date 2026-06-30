@@ -206,9 +206,13 @@ func TestMergeLWW_MixedFormat(t *testing.T) {
 	if h, _ := GetHost(ctx, c, "h1"); h == nil || h.Version != "nano-newer" {
 		t.Fatalf("later-nano should win, got %+v", h)
 	}
-	// Exact-equal instant → keep local (no churn).
-	merge("nano-tie", "2026-06-27T10:03:01.000000001Z")
+	// Exact-equal instant with IDENTICAL content → no-op (no churn). A
+	// differing-content equal-instant tie is no longer a blind keep-local: it is
+	// resolved deterministically by the table-aware resolver (content-max for the
+	// content-default `hosts` table) — see TestAntiEntropy_ContentTieConverges and
+	// the resolver unit tests.
+	merge("nano-newer", "2026-06-27T10:03:01.000000001Z")
 	if h, _ := GetHost(ctx, c, "h1"); h == nil || h.Version != "nano-newer" {
-		t.Errorf("equal instant should keep local, got %+v", h)
+		t.Errorf("equal instant + equal content should be a stable no-op, got %+v", h)
 	}
 }

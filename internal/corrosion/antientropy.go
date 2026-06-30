@@ -96,38 +96,78 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		return
 	}
 
-	// Compare digests.
-	mismatch := false
-	for _, remote := range resp.Tables {
-		local, exists := localMap[remote.Name]
-		if !exists {
-			mismatch = true
-			break
-		}
-		if local.Count != int(remote.Count) || local.Hash != remote.Hash {
-			slog.Info("anti-entropy: drift detected",
-				"peer", peerName, "table", remote.Name,
-				"local_count", local.Count, "remote_count", remote.Count,
-				"local_hash", local.Hash, "remote_hash", remote.Hash)
-			mismatch = true
-			break
-		}
-	}
-
-	if mismatch {
-		// Fetch full state dump and merge with LWW.
-		slog.Info("anti-entropy: syncing from peer", "peer", peerName)
+	// A digest mismatch whose only delta is a known, unchanged unresolved tie is
+	// INTENTIONAL divergence (kept-local by the resolver). Suppressing it here is
+	// the bound that stops a stuck tie from triggering a full dump+merge every
+	// cycle (the old infinite no-op resync). A real new write changes a hash and
+	// invalidates the memo, so genuine drift still syncs.
+	if mismatched := ae.genuineMismatches(peerName, resp.Tables, localMap); len(mismatched) > 0 {
+		slog.Info("anti-entropy: syncing from peer", "peer", peerName, "tables", mismatched)
 		data, err := fetchStateDump(ctx, client)
 		if err != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
-			return
+		} else {
+			ae.client.MergeStateBytesLWW(data)
+			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
+			ae.updateReconciledMemo(peerName, resp.Tables, func() ([]TableDigest, error) {
+				return ae.client.StateDigest(ctx)
+			})
 		}
-
-		ae.client.MergeStateBytesLWW(data)
-		slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
 	}
 
 	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap)
+}
+
+// genuineMismatches returns the tables whose digest differs from the peer AND is
+// not an already-reconciled, unchanged unresolved divergence (those are skipped).
+func (ae *AntiEntropy) genuineMismatches(peer string, remote []*pb.TableDigest, localMap map[string]TableDigest) []string {
+	var out []string
+	for _, r := range remote {
+		local, exists := localMap[r.Name]
+		if exists && local.Count == int(r.Count) && local.Hash == r.Hash {
+			continue // in sync
+		}
+		if exists && ae.client.isReconciledDivergent(peer, r.Name, local.Hash, r.Hash) {
+			continue // intentional, already-reconciled divergence — don't re-pull
+		}
+		lh := ""
+		if exists {
+			lh = local.Hash
+		}
+		slog.Info("anti-entropy: drift detected",
+			"peer", peer, "table", r.Name, "local_hash", lh, "remote_hash", r.Hash)
+		out = append(out, r.Name)
+	}
+	return out
+}
+
+// updateReconciledMemo runs after a merge: for each table still divergent from
+// the peer because of a known unresolved tie, it memoizes the (peer,table)
+// digest pair so the next cycle won't re-pull; for tables that converged it
+// clears any stale memo.
+func (ae *AntiEntropy) updateReconciledMemo(peer string, remote []*pb.TableDigest, recompute func() ([]TableDigest, error)) {
+	nl, err := recompute()
+	if err != nil {
+		return
+	}
+	nm := make(map[string]TableDigest, len(nl))
+	for _, d := range nl {
+		nm[d.Name] = d
+	}
+	for _, r := range remote {
+		cur, ok := nm[r.Name]
+		if ok && cur.Count == int(r.Count) && cur.Hash == r.Hash {
+			ae.client.clearReconciledDivergent(peer, r.Name)
+			continue
+		}
+		if ae.client.hasUnresolvedForTable(r.Name) {
+			lh := ""
+			if ok {
+				lh = cur.Hash
+			}
+			ae.client.markReconciledDivergent(peer, r.Name, lh, r.Hash)
+		}
+	}
 }
 
 func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest) {
@@ -145,27 +185,12 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		return
 	}
 
-	mismatch := false
-	for _, remote := range resp.Tables {
-		local, exists := localMap[remote.Name]
-		if !exists {
-			mismatch = true
-			break
-		}
-		if local.Count != int(remote.Count) || local.Hash != remote.Hash {
-			slog.Info("anti-entropy: sensitive drift detected",
-				"peer", peerName, "table", remote.Name,
-				"local_count", local.Count, "remote_count", remote.Count,
-				"local_hash", local.Hash, "remote_hash", remote.Hash)
-			mismatch = true
-			break
-		}
-	}
-	if !mismatch {
+	mismatched := ae.genuineMismatches(peerName, resp.Tables, localMap)
+	if len(mismatched) == 0 {
 		return
 	}
 
-	slog.Info("anti-entropy: syncing sensitive state from peer", "peer", peerName)
+	slog.Info("anti-entropy: syncing sensitive state from peer", "peer", peerName, "tables", mismatched)
 	data, err := fetchSensitiveStateDump(ctx, client, req)
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
@@ -177,6 +202,9 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 	}
 	ae.client.MergeSensitiveStateBytesLWW(data)
 	slog.Info("anti-entropy: sensitive merge complete", "peer", peerName, "bytes", len(data))
+	ae.updateReconciledMemo(peerName, resp.Tables, func() ([]TableDigest, error) {
+		return ae.client.SensitiveStateDigest(ctx)
+	})
 }
 
 // fetchStateDump pulls a peer's full state dump, preferring the chunked

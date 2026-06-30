@@ -34,22 +34,39 @@ import (
 // wrongly lose to an older bare-second value during the RFC3339→nano rollout.
 // An exact-equal instant keeps local (anti-entropy stability).
 func localWinsLWW(localTS, incomingTS string) bool {
+	return lwwOrder(localTS, incomingTS) >= 0
+}
+
+// lwwOrder is the strict last-writer-wins comparator behind localWinsLWW. It
+// returns +1 when local is strictly newer, -1 when incoming is strictly newer,
+// and 0 on an EXACT tie (same instant). Only a 0 reaches the tie resolver; every
+// non-tie conflict is settled here by timestamp alone (unchanged behavior). The
+// format handling mirrors the original localWinsLWW (HLC beats legacy RFC3339;
+// RFC3339 compared as parsed instants, not lexically).
+func lwwOrder(localTS, incomingTS string) int {
 	localHLC, incomingHLC := hlc.IsHLC(localTS), hlc.IsHLC(incomingTS)
 	switch {
 	case localHLC && !incomingHLC:
-		return true // local HLC beats a legacy RFC3339 incoming
+		return 1 // local HLC beats a legacy RFC3339 incoming
 	case !localHLC && incomingHLC:
-		return false // incoming HLC beats a legacy RFC3339 local
+		return -1 // incoming HLC beats a legacy RFC3339 local
 	case localHLC && incomingHLC:
-		return localTS >= incomingTS // both HLC → lexical == chronological
+		return strings.Compare(localTS, incomingTS) // both HLC → lexical == chronological
 	default:
 		// Both RFC3339 (bare second or fixed-width fractional).
 		lt, lerr := time.Parse(time.RFC3339, localTS)
 		it, ierr := time.Parse(time.RFC3339, incomingTS)
 		if lerr == nil && ierr == nil {
-			return !lt.Before(it) // local newer-or-equal → keep local
+			switch {
+			case lt.After(it):
+				return 1
+			case lt.Before(it):
+				return -1
+			default:
+				return 0
+			}
 		}
-		return localTS >= incomingTS // unparseable → lexical fallback
+		return strings.Compare(localTS, incomingTS) // unparseable → lexical fallback
 	}
 }
 
@@ -388,9 +405,31 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		if existing != nil {
 			incomingTS, _ := row[updatedAtIdx].(string)
 			if incomingTS != "" {
-				if localTS, ok := existing[pkKeyAt(row, pkIdx)]; ok && localWinsLWW(localTS, incomingTS) {
-					skipped++
-					continue
+				if localTS, ok := existing[pkKeyAt(row, pkIdx)]; ok {
+					switch ord := lwwOrder(localTS, incomingTS); {
+					case ord > 0:
+						// Local strictly newer → keep local.
+						skipped++
+						continue
+					case ord == 0:
+						// Exact tie → table-aware resolver over the local row
+						// (aligned to the incoming dump's declared columns).
+						localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+						if found {
+							keepLocal, unresolved := c.resolveTie(table.Name, table.Columns, localRow, row, pkIdx, pathAE)
+							if !unresolved {
+								// Converged (either direction) → drop any stale
+								// unresolved/reconciled state for this PK.
+								c.clearUnresolved(table.Name, pkKeyAt(row, pkIdx))
+							}
+							if keepLocal {
+								skipped++
+								continue
+							}
+						}
+						// resolver chose incoming (or no local row) → apply below.
+					}
+					// ord < 0 → incoming strictly newer → apply below.
 				}
 			}
 		}
@@ -517,6 +556,59 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 			out[pkKey(cells[:len(pkCols)])] = coerceString(cells[len(pkCols)])
 		}
 		rs.Close()
+	}
+	return out
+}
+
+// fetchLocalRowCells reads the local row for one incoming dump row's PK, scanned
+// into the incoming dump's declared columns, and normalized through the SAME
+// JSON round-trip the incoming row underwent in transit (numbers → float64,
+// []byte → text). Without that normalization the resolver would compare a local
+// int64 against an incoming float64 of the same value and see a false difference
+// (the PR #67 read-path artifact). Only called on an exact timestamp tie, so the
+// per-row SELECT is rare. ok=false means no local row (resolver takes incoming).
+func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkIdx []int, incomingRow []interface{}) ([]interface{}, bool) {
+	if len(pkCols) == 0 || len(cols) == 0 {
+		return nil, false
+	}
+	where := make([]string, len(pkCols))
+	args := make([]interface{}, len(pkCols))
+	for i, col := range pkCols {
+		where[i] = col + " = ?"
+		if i < len(pkIdx) && pkIdx[i] >= 0 && pkIdx[i] < len(incomingRow) {
+			args[i] = incomingRow[pkIdx[i]] // raw incoming PK value (matches prefetch)
+		}
+	}
+	q := "SELECT " + strings.Join(cols, ", ") + " FROM " + tableName + " WHERE " + strings.Join(where, " AND ")
+	raw := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range raw {
+		ptrs[i] = &raw[i]
+	}
+	if err := tx.QueryRow(q, args...).Scan(ptrs...); err != nil {
+		return nil, false
+	}
+	// Mirror dumpTable: []byte → string, then JSON round-trip so the value kinds
+	// match the post-transit incoming row exactly.
+	for i, v := range raw {
+		if b, ok := v.([]byte); ok {
+			raw[i] = string(b)
+		}
+	}
+	return jsonRoundTripCells(raw), true
+}
+
+// jsonRoundTripCells marshals then unmarshals a scanned row so its numeric/text
+// representation matches an incoming dump row (which arrived via JSON). On any
+// error it returns the input unchanged.
+func jsonRoundTripCells(cells []interface{}) []interface{} {
+	b, err := json.Marshal(cells)
+	if err != nil {
+		return cells
+	}
+	var out []interface{}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return cells
 	}
 	return out
 }

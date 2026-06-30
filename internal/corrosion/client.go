@@ -27,6 +27,14 @@ type SyncMetrics interface {
 	ObserveDump(d time.Duration, bytes int)
 	ObserveDigest(d time.Duration)
 	ObserveMerge(d time.Duration, merged, skipped int)
+	// ObserveTieBreak records an exact-timestamp tie that a resolver converged:
+	// resolver ∈ {tombstone, content_max, numeric_max, timestamp_max,
+	// non_null_wins, lb_generation}; winner ∈ {local, incoming}.
+	ObserveTieBreak(table, resolver, winner string)
+	// ObserveTieUnresolved records a DISTINCT unresolved tie (counted once per
+	// (table,PK,content-pair), not per cycle): path ∈ {ae, wal}; category ∈
+	// {runtime_owned, tenancy, policy, auth_factor, auth_pointer, lb_token}.
+	ObserveTieUnresolved(table, path, category string)
 }
 
 // Config holds configuration for the embedded state store.
@@ -77,6 +85,21 @@ type Client struct {
 	// contends with or re-enters the main lock.
 	tsMu   sync.Mutex
 	lastTS time.Time
+
+	// tieMu guards the bounded equal-timestamp-tie state below. Separate from mu
+	// so the resolver (called while mu is held during a merge) records without
+	// re-entrancy.
+	tieMu sync.Mutex
+	// unresolvedTies records, per (table,PK), the sorted content-hash pair of the
+	// last classified-unresolved tie. It makes lww_tie_unresolved count DISTINCT
+	// rows (re-observing the same divergence is a no-op) and is the source for the
+	// anti-entropy re-sync suppression. Cleared when the row's content changes.
+	unresolvedTies map[string]string
+	// reconciledDivergent memoizes, per (peer,table), the (localHash,remoteHash)
+	// digest pair already reconciled to a known-unresolved divergence, so
+	// anti-entropy does not re-pull a table whose only delta is intentional
+	// divergence (the bound that removes the infinite no-op resync).
+	reconciledDivergent map[string]string
 }
 
 // SetSyncMetrics installs the anti-entropy timing sink. Nil-safe; call once at
@@ -100,6 +123,18 @@ func (c *Client) observeDigest(d time.Duration) {
 func (c *Client) observeMerge(d time.Duration, merged, skipped int) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveMerge(d, merged, skipped)
+	}
+}
+
+func (c *Client) observeTieBreak(table, resolver, winner string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveTieBreak(table, resolver, winner)
+	}
+}
+
+func (c *Client) observeTieUnresolved(table, path, category string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveTieUnresolved(table, path, category)
 	}
 }
 

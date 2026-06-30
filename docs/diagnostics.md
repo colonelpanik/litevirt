@@ -87,3 +87,50 @@ outright rather than scanning nothing.
 Human-readable table by default; `--json` for the full structured report (node
 lists incl. `sensitive_unreachable`, per-row per-node `updated_at`/hash, `stable`,
 and violations). `--table` restricts the scan to specific tables.
+
+## Equal-timestamp tie resolution
+
+Strict last-writer-wins settles every conflict whose `updated_at` values differ.
+An **exact** tie (byte-equal instant) with differing content is the pathological
+case `equal_updated_at_different_content` above: keeping local on the tie is a
+per-node choice, not a cluster total order, so the two values never re-converge.
+
+On an exact tie the merge consults a **table-aware resolver**. Every replicated
+table is assigned exactly one resolution chain (enforced by coverage tests — a new
+table cannot silently get a default). A chain is either a deterministic total
+order (both nodes pick the same winner, so the row converges) or it deliberately
+**refuses to converge** and leaves the row for a human / runtime repair:
+
+| Category | Tables | On an exact tie |
+|---|---|---|
+| content-default | inventory/config tables with no authorization, isolation, runtime, or auth meaning (`images`, `hosts`, `dns_records`, …) | a one-sided soft-delete wins, else the canonically-greater row wins (deterministic; converges) |
+| runtime-owned | `vms.host_name` | **unresolved** — never adopt an owner by value (it could name a non-running host); defer to runtime repair |
+| tenancy | `project` on `vms`/`containers`/`networks`/`storage_pools`/`volumes`, `project_name` on `backup_schedules` | **unresolved** when the tenancy column differs (a content-max could silently move a resource between tenants) |
+| policy | `roles`, `role_bindings`, `users`, `tokens`, `projects`, firewall/SG tables, secret-bearing config | a delete wins, else **unresolved** (a value tiebreak could converge to the more-permissive grant) |
+| auth | `user_2fa` (replay ratchet → max; consume/tombstone irreversible), `recovery_codes`, the active-set pointers | converging rules where safe, else **unresolved** (never resurrect a superseded factor/code) |
+| LB | `lb_configs`, `lb_backends` | a non-empty incarnation token beats empty; two different non-empty tokens are **unresolved** |
+
+`containers` ownership is part of the primary key, so an ownership split is two
+distinct rows (not a single-row tie) — detected by `duplicate_live_container`
+above and repaired by the container runtime-repair phase, not the row resolver.
+
+The anti-entropy merge is the authority; the WAL fast-path resolves full-image
+upserts through the same engine and otherwise keeps local and lets anti-entropy
+converge the row, so the two paths can never disagree.
+
+### Metrics & repairing an unresolved tie
+
+- `litevirt_lww_tie_break_total{table,resolver,winner}` — ties that converged. A
+  steadily climbing value means a node is minting colliding timestamps (the
+  upstream smell), not just a one-off split.
+- `litevirt_lww_tie_unresolved_total{table,path,category}` — **distinct** ties
+  with no safe winner (counted once per row, not per cycle). Any nonzero value is
+  alert-worthy: the row is intentionally left divergent and needs operator or
+  runtime repair.
+
+An unresolved tie is **bounded**: the row stays divergent on purpose, but
+anti-entropy will not re-pull the table every cycle solely because of it (a real
+new write to either side clears the suppression and re-evaluates). Resolve an
+unresolved row by making one side authoritative with a fresh write — e.g. a VM
+ownership split is repaired with `lv doctor repair-owner <vm> <host>` (re-stamps
+the running host with a new timestamp so it wins everywhere by ordinary LWW).

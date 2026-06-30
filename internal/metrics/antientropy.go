@@ -18,6 +18,8 @@ type AntiEntropyMetrics struct {
 	dumpBytes     prometheus.Histogram
 	rowsMerged    prometheus.Counter
 	rowsSkipped   prometheus.Counter
+	tieBreaks     *prometheus.CounterVec
+	tieUnresolved *prometheus.CounterVec
 }
 
 // NewAntiEntropyMetrics registers the anti-entropy timing metrics on the default
@@ -53,8 +55,16 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Name: "litevirt_antientropy_rows_skipped_total",
 			Help: "Rows skipped by anti-entropy merges (LWW kept local, or malformed).",
 		}),
+		tieBreaks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_lww_tie_break_total",
+			Help: "Exact-timestamp ties a resolver converged, by table, resolver rule, and winner (local/incoming).",
+		}, []string{"table", "resolver", "winner"}),
+		tieUnresolved: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_lww_tie_unresolved_total",
+			Help: "Distinct equal-timestamp ties with no safe winner (kept local; needs human/runtime repair), by table, path, and category.",
+		}, []string{"table", "path", "category"}),
 	}
-	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped)
+	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved)
 	return m
 }
 
@@ -80,4 +90,14 @@ func (m *AntiEntropyMetrics) ObserveMerge(d time.Duration, merged, skipped int) 
 	if skipped > 0 {
 		m.rowsSkipped.Add(float64(skipped))
 	}
+}
+
+// ObserveTieBreak records a converged equal-timestamp tie. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveTieBreak(table, resolver, winner string) {
+	m.tieBreaks.WithLabelValues(table, resolver, winner).Inc()
+}
+
+// ObserveTieUnresolved records a distinct unresolved equal-timestamp tie. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveTieUnresolved(table, path, category string) {
+	m.tieUnresolved.WithLabelValues(table, path, category).Inc()
 }

@@ -174,6 +174,38 @@ func extractColumnValueFromUpdateSet(s Statement, want string) (string, bool) {
 	return "", false
 }
 
+// extractInsertRow returns the column list and values of a full-image INSERT
+// (a single VALUES tuple whose params map 1:1 to the parsed column list), so an
+// exact-timestamp tie on a replicated upsert can be resolved over the full row
+// by the SAME engine the anti-entropy merge uses. ok=false for anything that is
+// not an unambiguous full-image INSERT (e.g. a partial UPDATE, a multi-row
+// insert, or a column/param-count mismatch) — those keep local and let
+// anti-entropy converge them.
+func extractInsertRow(s Statement) (cols []string, vals []interface{}, ok bool) {
+	if !isInsertStatement(s.SQL) {
+		return nil, nil, false
+	}
+	open := strings.Index(s.SQL, "(")
+	if open < 0 {
+		return nil, nil, false
+	}
+	rel := strings.Index(s.SQL[open:], ")")
+	if rel < 0 {
+		return nil, nil, false
+	}
+	raw := strings.Split(s.SQL[open+1:open+rel], ",")
+	cols = make([]string, len(raw))
+	for i, c := range raw {
+		cols[i] = cleanColumnName(c)
+	}
+	// Require a 1:1 column→param mapping (one VALUES tuple). Anything else is
+	// ambiguous to reconstruct safely.
+	if len(cols) == 0 || len(s.Params) != len(cols) {
+		return nil, nil, false
+	}
+	return cols, s.Params, true
+}
+
 func cleanColumnName(s string) string {
 	s = strings.TrimSpace(s)
 	if dot := strings.LastIndex(s, "."); dot >= 0 {

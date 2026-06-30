@@ -101,6 +101,33 @@ func TestLibvirtBootDev(t *testing.T) {
 	}
 }
 
+func TestGenerateDomainXML_VideoModelByFirmware(t *testing.T) {
+	// virtio-gpu has no VGA BIOS: a BIOS guest needs a legacy VGA video model or
+	// VNC stays black through firmware/GRUB. UEFI (OVMF) drives virtio-gpu fine.
+	base := func(fw string) VMConfig {
+		return VMConfig{
+			Name: "vid-" + fw, CPU: 1, MemoryMiB: 512, Firmware: fw, EnableVNC: true,
+			Disks: []DiskConfig{{Name: "root", Path: "/d.qcow2", Bus: "virtio"}},
+		}
+	}
+
+	bios, err := GenerateDomainXML(base("bios"))
+	if err != nil {
+		t.Fatalf("bios: %v", err)
+	}
+	if !strings.Contains(bios, `<video>`) || !strings.Contains(bios, `<model type="vga">`) {
+		t.Errorf("BIOS+VNC should use legacy vga video model; got:\n%s", bios)
+	}
+
+	uefi, err := GenerateDomainXML(base("uefi"))
+	if err != nil {
+		t.Fatalf("uefi: %v", err)
+	}
+	if !strings.Contains(uefi, `<video>`) || !strings.Contains(uefi, `<model type="virtio">`) {
+		t.Errorf("UEFI+VNC should keep virtio video model; got:\n%s", uefi)
+	}
+}
+
 func TestGenerateDomainXML_ISOBoot(t *testing.T) {
 	cfg := VMConfig{
 		Name:      "iso-vm",

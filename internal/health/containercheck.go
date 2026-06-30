@@ -104,16 +104,28 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 		live[ct.Name] = true
 		c.checkContainer(ctx, ct, now)
 	}
+
+	// Runtime owner re-key (Phase 4): reclaim a container running locally whose
+	// only live DB row points at another host. Runs BEFORE the orphan-lease GC so
+	// a re-key (which transfers the container's leases to us) isn't racing a GC of
+	// those same leases.
+	c.assertContainerOwnership(ctx)
+
 	// GC IPAM leases stranded by a crash between allocating a lease and persisting
 	// the container row (an orphan lease — owner with no live container row). The
-	// age guard keeps this from racing an in-flight create.
+	// age guard keeps this from racing an in-flight create. The live set also
+	// includes every container present in the LOCAL RUNTIME, not just those with a
+	// local DB row: in the exact ownership-divergence case the runtime container
+	// exists but its DB row points elsewhere, and its lease must NOT be reclaimed
+	// out from under the pending re-key.
+	if names, lerr := c.runtime.List(ctx); lerr == nil {
+		for _, n := range names {
+			live[n] = true
+		}
+	}
 	if _, err := network.ReleaseOrphanContainerLeases(ctx, c.db, c.hostName, live, orphanLeaseMinAge); err != nil {
 		slog.Warn("containercheck: orphan-lease GC failed", "error", err)
 	}
-
-	// Runtime owner re-key (Phase 4): reclaim a container running locally whose
-	// only live DB row points at another host.
-	c.assertContainerOwnership(ctx)
 }
 
 // orphanLeaseMinAge is how long a CT IPAM lease with no live container row must

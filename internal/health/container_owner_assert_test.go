@@ -2,13 +2,28 @@ package health
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/network"
 )
+
+func ctLeaseOwner(t *testing.T, db *corrosion.Client, ctName string) string {
+	t.Helper()
+	rows, err := db.Query(context.Background(),
+		`SELECT owner_host FROM ip_allocations WHERE owner_kind='ct' AND vm_name=? AND deleted_at IS NULL`, ctName)
+	if err != nil {
+		t.Fatalf("lease query: %v", err)
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	return rows[0].String("owner_host")
+}
 
 // ctRekeyFixture: ct1 runs locally on node-a's runtime, but the only live DB row
 // is owned by node-b. Active worker hosts node-a/b/c. Controllable clock.
@@ -74,6 +89,100 @@ func TestCtRekey_NoneRunningReclaims(t *testing.T) {
 	}
 	if n := auditCount(t, db, "ct.runtime-owner-rekey"); n != 1 {
 		t.Fatalf("want 1 rekey audit row, got %d", n)
+	}
+}
+
+// Re-key must move the WHOLE ownership footprint: the container_interfaces rows
+// and the IPAM leases follow the row to the repaired host (regression — PR 2a
+// made those part of CT ownership).
+func TestCtRekey_MovesInterfacesAndLeases(t *testing.T) {
+	ctx := context.Background()
+	db := testLogicDB(t)
+	specJSON, _ := json.Marshal(corrosion.ContainerCreateSpec{
+		Networks: []corrosion.ContainerNetwork{{NetworkName: "net1", MAC: "52:54:00:aa:bb:cc", IP: "10.0.0.5"}},
+	})
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node-b", Name: "ct1", State: "running", Image: "alpine", CreateSpec: string(specJSON),
+	})
+	// Managed interface row + IPAM lease on the stale owner (node-b).
+	if err := corrosion.UpsertContainerInterface(ctx, db, corrosion.ContainerInterfaceRecord{
+		HostName: "node-b", CtName: "ct1", NetworkName: "net1", Ordinal: 0,
+		MAC: "52:54:00:aa:bb:cc", IP: "10.0.0.5", VethDevice: corrosion.ContainerVethName("ct1", 0),
+	}); err != nil {
+		t.Fatalf("UpsertContainerInterface: %v", err)
+	}
+	if ok, err := network.ReserveContainerIP(ctx, db, "net1", "10.0.0.5", "52:54:00:aa:bb:cc", "node-b", "ct1"); err != nil || !ok {
+		t.Fatalf("ReserveContainerIP: ok=%v err=%v", ok, err)
+	}
+	for i, h := range []string{"node-a", "node-b", "node-c"} {
+		_ = corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: h, Address: fmt.Sprintf("10.9.0.%d", i+1), State: "active"})
+	}
+	rt := newFakeCtRuntime()
+	rt.states["ct1"] = lxc.StateRunning
+	c := NewContainerChecker("node-a", db, rt)
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.Now = func() time.Time { return clock }
+	c.SetPeerContainerRuntimeChecker(func(_ context.Context, _, _ string) (string, error) { return RuntimeAbsent, nil })
+
+	c.assertContainerOwnership(ctx)
+	clock = clock.Add(ownershipAssertDebounce + time.Minute)
+	c.assertContainerOwnership(ctx)
+
+	// Interface row moved node-b → node-a.
+	if ifs, _ := corrosion.GetContainerInterfaces(ctx, db, "node-b", "ct1"); len(ifs) != 0 {
+		t.Fatalf("source interface rows must be tombstoned, got %d", len(ifs))
+	}
+	ifs, _ := corrosion.GetContainerInterfaces(ctx, db, "node-a", "ct1")
+	if len(ifs) != 1 || ifs[0].NetworkName != "net1" {
+		t.Fatalf("interface row must be rebuilt on node-a, got %+v", ifs)
+	}
+	// Lease owner_host moved node-b → node-a.
+	if owner := ctLeaseOwner(t, db, "ct1"); owner != "node-a" {
+		t.Fatalf("lease owner_host must be node-a after re-key, got %q", owner)
+	}
+}
+
+// A stale soft-deleted target row must not leak old create_spec into the
+// resurrected row (the dedicated re-key write replaces, never keep-existing).
+func TestCtRekey_StaleTargetRowReplaced(t *testing.T) {
+	ctx := context.Background()
+	c, db, clock, _ := ctRekeyFixture(t)
+	// A leftover soft-deleted (node-a, ct1) row with STALE metadata.
+	insertCt(t, db, corrosion.ContainerRecord{HostName: "node-a", Name: "ct1", State: "stopped", CreateSpec: `{"image":"STALE"}`})
+	if err := db.Execute(ctx, `UPDATE containers SET deleted_at = ? WHERE host_name='node-a' AND name='ct1'`, db.NowTS()); err != nil {
+		t.Fatalf("soft-delete: %v", err)
+	}
+	c.SetPeerContainerRuntimeChecker(func(_ context.Context, _, _ string) (string, error) { return RuntimeAbsent, nil })
+	c.assertContainerOwnership(ctx)
+	*clock = clock.Add(ownershipAssertDebounce + time.Minute)
+	c.assertContainerOwnership(ctx)
+
+	got := liveCt(t, db, "node-a", "ct1")
+	if got == nil || got.CreateSpec != `{"image":"alpine"}` {
+		t.Fatalf("resurrected row must carry the SOURCE create_spec, not the stale one, got %+v", got)
+	}
+}
+
+// The orphan-lease GC must NOT release a local lease for a container that exists
+// in the local RUNTIME but whose DB row points elsewhere (the divergence case) —
+// even when no re-key happens (peers inconclusive). One sweep keeps the lease.
+func TestCtRekey_LeaseNotGCdBeforeRepair(t *testing.T) {
+	ctx := context.Background()
+	c, db, _, _ := ctRekeyFixture(t)
+	// An aged local lease for ct1 (owner node-a) with no live node-a DB row.
+	if ok, err := network.ReserveContainerIP(ctx, db, "net1", "10.0.0.5", "mac", "node-a", "ct1"); err != nil || !ok {
+		t.Fatalf("ReserveContainerIP: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE ip_allocations SET allocated_at = ? WHERE vm_name='ct1'`, "2020-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("age lease: %v", err)
+	}
+	// Peers inconclusive → no re-key — isolates the GC-live-set fix.
+	c.SetPeerContainerRuntimeChecker(func(_ context.Context, _, _ string) (string, error) { return RuntimeUnknown, nil })
+
+	c.SweepOnce(ctx)
+
+	if owner := ctLeaseOwner(t, db, "ct1"); owner != "node-a" {
+		t.Fatalf("a runtime-present container's lease must NOT be GC'd before repair, owner now %q", owner)
 	}
 }
 

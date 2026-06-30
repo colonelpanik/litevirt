@@ -282,32 +282,91 @@ const ContainerRelocateRecreateDetail = "relocate-recreate"
 // relocate_token is preserved if already present and NEVER minted by this path.
 const ContainerRuntimeRekeyDetail = "runtime-owner-rekey"
 
-// RekeyContainerOwner atomically re-homes a container's DB ownership from
-// src.HostName to toHost: it tombstones the (src.HostName, name) row and
-// (re)inserts a (toHost, name) row carrying src's identity (create_spec, image,
-// limits, labels, …) marked running with the runtime-rekey provenance detail.
-// Both writes share one transaction, so a reader never sees zero or two live
-// rows. created_at and relocate_token are preserved from src (never minted).
+// RekeyContainerOwner atomically re-homes a container's ENTIRE ownership
+// footprint from src.HostName to toHost — the container's first-class identity
+// after PR 2a is the row PLUS its managed interface rows PLUS its IPAM leases, so
+// moving only the row would strand the NICs/leases on the old host and break
+// firewall/SG binding, DNS/LB, quota, and IPAM ownership. In ONE transaction it:
 //
-// This is the container analogue of UpdateVMHost — but a PK CHANGE, because
-// container ownership is part of the primary key (host_name, name): an ownership
-// "split" is two distinct rows, not a single-row LWW tie.
+//  1. tombstones the (src.HostName, name) container row;
+//  2. re-keys the row onto (toHost, name) marked running with the runtime-rekey
+//     provenance detail, via a DEDICATED INSERT OR REPLACE that writes exactly
+//     src's repair-safe fields (no "keep existing" merge), so a stale
+//     soft-deleted (toHost, name) row can't leak old create_spec/metadata;
+//  3. tombstones the source's managed container_interfaces rows;
+//  4. rebuilds this host's managed interface rows from create_spec (veth
+//     recomputed deterministically for toHost), mirroring the migrate finaliser;
+//  5. transfers the container's IPAM leases (owner_host src→toHost, allocated_at
+//     reset so the target's orphan-GC doesn't immediately reclaim them).
+//
+// created_at and relocate_token are preserved from src (never minted). This is
+// the container analogue of UpdateVMHost — but a PK CHANGE across three tables,
+// because container ownership is part of the primary key (host_name, name).
 func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, toHost string) error {
 	now := c.NowTS()
-	tombstone := Statement{
-		SQL: `UPDATE containers SET deleted_at = ?, updated_at = ?
-		      WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-		Params: []interface{}{now, now, src.HostName, src.Name},
-	}
-	newRow := src
-	newRow.HostName = toHost
-	newRow.State = "running"
-	newRow.StateDetail = ContainerRuntimeRekeyDetail
-	ins, err := upsertContainerStmt(c, newRow)
+	rk, err := rekeyContainerStmt(c, src, toHost, now)
 	if err != nil {
 		return err
 	}
-	return c.ExecuteBatch(ctx, []Statement{tombstone, ins})
+	stmts := []Statement{
+		// (1) tombstone the source container row.
+		{
+			SQL:    `UPDATE containers SET deleted_at = ?, updated_at = ? WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{now, now, src.HostName, src.Name},
+		},
+		// (2) re-key the row onto the new host.
+		rk,
+		// (3) tombstone the source's managed interface rows.
+		{
+			SQL:    `UPDATE container_interfaces SET deleted_at = ?, updated_at = ? WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{now, now, src.HostName, src.Name},
+		},
+	}
+	// (4) rebuild the managed interface rows on the new host from create_spec.
+	for _, ifc := range BuildContainerInterfacesFromSpec(toHost, src.Name, DecodeCreateSpec(src.CreateSpec)) {
+		s, err := containerInterfaceStmt(c, ifc)
+		if err != nil {
+			return err
+		}
+		stmts = append(stmts, s)
+	}
+	// (5) transfer the IPAM leases (owner_host src→toHost), resetting allocated_at.
+	stmts = append(stmts, Statement{
+		SQL: `UPDATE ip_allocations SET owner_host = ?, allocated_at = ?, updated_at = ?
+		      WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL`,
+		Params: []interface{}{toHost, nowRFC3339(), now, src.HostName, src.Name},
+	})
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+// rekeyContainerStmt builds the dedicated re-key row write: an INSERT OR REPLACE
+// that writes EXACTLY src's repair-safe fields onto (toHost, name) marked running
+// with the runtime-rekey marker. Unlike the generic upsert it has no
+// keep-existing semantics, so a stale soft-deleted target row is fully replaced
+// rather than leaking old create_spec / relocation metadata.
+func rekeyContainerStmt(c *Client, src ContainerRecord, toHost, now string) (Statement, error) {
+	labelsJSON := ""
+	if len(src.Labels) > 0 {
+		b, err := json.Marshal(src.Labels)
+		if err != nil {
+			return Statement{}, err
+		}
+		labelsJSON = string(b)
+	}
+	createdAt := src.CreatedAt
+	if createdAt == "" {
+		createdAt = now
+	}
+	return Statement{
+		SQL: `INSERT OR REPLACE INTO containers
+		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		Params: []interface{}{
+			toHost, src.Name, src.Image, src.CPULimit, src.MemMiB, labelsJSON,
+			src.RestartPolicy, ContainerRuntimeRekeyDetail, src.Project, boolToInt(src.IsTemplate),
+			src.OnHostFailure, src.CreateSpec, src.RelocateToken, createdAt, now,
+		},
+	}, nil
 }
 
 // ContainerRelocateRestorePrefix marks a container the coordinator is relocating

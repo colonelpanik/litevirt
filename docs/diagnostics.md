@@ -182,9 +182,14 @@ reconciler repairs it directly: when a container runs **locally** but its only
 live DB row points at another host (and no live local row exists), it queries
 **every workload-capable peer's local LXC** (the peer-only `CheckContainerRuntime`
 RPC) and, only if none reports it running (a peer's stale *stopped* leftover does
-not block; an unreachable/unknown peer does), performs an atomic **PK re-key**:
-tombstone the remote row, insert a local row carrying the container's
-`create_spec` and a distinct `runtime-owner-rekey` provenance marker. It stands
+not block; an unreachable/unknown peer does), performs an atomic **PK re-key** of
+the container's whole ownership footprint: in one transaction it tombstones the
+remote container row **and its managed `container_interfaces` rows**, inserts a
+local row carrying the container's `create_spec` and a distinct
+`runtime-owner-rekey` provenance marker, rebuilds the managed interface rows on
+the local host (veth recomputed), and **transfers the IPAM leases**
+(`owner_host`) — so firewall/SG binding, DNS/LB, quota, and IPAM ownership all
+follow. It stands
 clear of any container under an active relocation/restore/migration (PR #57
 markers / `relocate_token`), skips ambiguous cases (a live local row, more than
 one remote row, templates), and — like the VM path — only an active worker acts,

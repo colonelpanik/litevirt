@@ -1,5 +1,10 @@
 {{define "content"}}
-<h1>Dashboard</h1>
+<div class="screen__head">
+  <div>
+    <h1>Dashboard</h1>
+    <div class="sub">Live overview of cluster {{.ClusterName}}</div>
+  </div>
+</div>
 
 <div id="cluster-live" hx-get="/ui/cluster-stats" hx-trigger="every 5s" hx-swap="outerHTML">
   {{template "cluster-live" .}}
@@ -11,27 +16,41 @@
 {{if .Error}}
 <div style="color:var(--red);padding:16px">Error: {{.Error}}</div>
 {{else}}
-<!-- Summary Cards -->
-<div class="grid-4" style="margin-bottom:20px">
-  <div class="card">
-    <div class="card-title">Hosts</div>
-    <div class="card-value">{{.Stats.ActiveHosts}} / {{.Stats.TotalHosts}}</div>
-    <div class="card-sub">active</div>
+<!-- Summary KPIs -->
+<div class="kpi-strip">
+  <div class="kpi">
+    <div class="kpi__top">
+      <span class="kpi__icon"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.4"><use href="#i-host"/></svg></span>
+      <span class="kpi__label">Hosts</span>
+    </div>
+    <div class="kpi__value">{{.Stats.ActiveHosts}}<span class="unit">/ {{.Stats.TotalHosts}}</span></div>
+    <div class="kpi__meta">active</div>
   </div>
-  <div class="card">
-    <div class="card-title">VMs</div>
-    <div class="card-value">{{.Stats.RunningVMs}} / {{.Stats.TotalVMs}}</div>
-    <div class="card-sub">{{.Stats.ErrorVMs}} error · {{.Stats.StoppedVMs}} stopped</div>
+  <div class="kpi">
+    <div class="kpi__top">
+      <span class="kpi__icon"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.4"><use href="#i-vm"/></svg></span>
+      <span class="kpi__label">VMs</span>
+    </div>
+    <div class="kpi__value">{{.Stats.RunningVMs}}<span class="unit">/ {{.Stats.TotalVMs}}</span></div>
+    <div class="kpi__meta">{{.Stats.ErrorVMs}} error · {{.Stats.StoppedVMs}} stopped</div>
   </div>
-  <div class="card">
-    <div class="card-title">CPU Allocated</div>
-    <div class="card-value">{{.Stats.CPUUsed}} / {{.Stats.CPUTotal}}</div>
-    <div class="progress-bar"><div class="progress-bar-fill" style="width:{{formatPct .Stats.CPUPct}}%;background:var(--accent)"></div></div>
+  <div class="kpi">
+    <div class="kpi__top">
+      <span class="kpi__icon"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.4"><use href="#i-chart"/></svg></span>
+      <span class="kpi__label">CPU allocated</span>
+    </div>
+    <div class="kpi__value">{{formatPct .Stats.CPUPct}}<span class="unit">%</span></div>
+    <div class="progress-bar" style="margin:2px 0 4px"><div class="progress-bar-fill" style="width:{{formatPct .Stats.CPUPct}}%;background:var(--accent)"></div></div>
+    <div class="kpi__meta">{{.Stats.CPUUsed}} / {{.Stats.CPUTotal}} vCPU</div>
   </div>
-  <div class="card">
-    <div class="card-title">Memory</div>
-    <div class="card-value">{{.Stats.MemUsedGiB}}G / {{.Stats.MemTotalGiB}}G</div>
-    <div class="progress-bar"><div class="progress-bar-fill" style="width:{{formatPct .Stats.MemPct}}%;background:var(--blue)"></div></div>
+  <div class="kpi">
+    <div class="kpi__top">
+      <span class="kpi__icon"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.4"><use href="#i-storage"/></svg></span>
+      <span class="kpi__label">Memory</span>
+    </div>
+    <div class="kpi__value">{{formatPct .Stats.MemPct}}<span class="unit">%</span></div>
+    <div class="progress-bar" style="margin:2px 0 4px"><div class="progress-bar-fill" style="width:{{formatPct .Stats.MemPct}}%;background:var(--blue)"></div></div>
+    <div class="kpi__meta">{{.Stats.MemUsedGiB}}G / {{.Stats.MemTotalGiB}}G</div>
   </div>
 </div>
 
@@ -110,17 +129,24 @@
 
   <div>
     <!-- Recent Events -->
-    <div class="section" style="margin-bottom:16px">
-      <div class="section-header" style="display:flex;align-items:center"><h2>Recent Events</h2><a href="/events" style="font-size:12px;margin-left:auto">View all</a></div>
-      {{range .Events}}
-      <div style="padding:6px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px;align-items:center">
-        <span class="badge {{if eq .Result "error"}}badge-error{{end}}" style="font-size:10px">{{.Type}}</span>
-        {{if .VmName}}<a href="/vms/{{.VmName}}">{{.VmName}}</a>{{else}}<span class="muted">—</span>{{end}}
-        <span style="color:var(--muted);font-size:12px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px" title="{{.Detail}}">{{relTime .Ts}}</span>
+    <div class="panel" style="margin-bottom:16px">
+      <div class="panel__head"><h2>Recent Events</h2><a href="/events" class="hint">View all</a></div>
+      <div class="panel__body">
+        <div class="timeline">
+        {{range .Events}}
+          <div class="event {{if eq .Result "error"}}error{{else}}info{{end}}">
+            <span class="event__dot"></span>
+            <div style="min-width:0">
+              <div class="event__action">{{.Type}}</div>
+              <div class="event__target">{{if .VmName}}<a href="/vms/{{.VmName}}">{{.VmName}}</a>{{else}}—{{end}}</div>
+            </div>
+            <span class="event__when" title="{{.Detail}}">{{relTime .Ts}}</span>
+          </div>
+        {{else}}
+          <p class="muted" style="font-size:13px">No recent events</p>
+        {{end}}
+        </div>
       </div>
-      {{else}}
-      <p style="padding:12px;color:var(--muted);font-size:13px">No recent events</p>
-      {{end}}
     </div>
 
     <!-- Active Alerts -->

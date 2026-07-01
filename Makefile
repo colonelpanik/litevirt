@@ -6,6 +6,10 @@ LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
 UPLOT_VERSION := 1.6.31
 UPLOT_DIR := internal/ui/static/vendor/uplot
+HTMX_VERSION := 2.0.0
+HTMX_SSE_VERSION := 2.2.2
+HTMX_DIR := internal/ui/static/vendor/htmx
+FONTS_DIR := internal/ui/static/fonts
 
 all: proto vendor-js build
 
@@ -20,12 +24,26 @@ build-litevirt:
 	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o bin/litevirt ./cmd/litevirt
 	ln -sf litevirt bin/lv
 
-vendor-js: $(UPLOT_DIR)/uPlot.iife.min.js
+# vendor-js fetches the front-end assets that ship embedded in the single binary
+# (go:embed static/*). They are gitignored and pulled at build so no CDN is hit at
+# RUNTIME — the daemon serves htmx, uPlot, and the fonts itself.
+vendor-js: $(UPLOT_DIR)/uPlot.iife.min.js $(HTMX_DIR)/htmx.min.js $(FONTS_DIR)/source-sans-3.woff2
 
 $(UPLOT_DIR)/uPlot.iife.min.js:
 	@mkdir -p $(UPLOT_DIR)
 	curl -sL "https://cdn.jsdelivr.net/npm/uplot@$(UPLOT_VERSION)/dist/uPlot.iife.min.js" -o $(UPLOT_DIR)/uPlot.iife.min.js
 	curl -sL "https://cdn.jsdelivr.net/npm/uplot@$(UPLOT_VERSION)/dist/uPlot.min.css" -o $(UPLOT_DIR)/uPlot.min.css
+
+$(HTMX_DIR)/htmx.min.js:
+	@mkdir -p $(HTMX_DIR)
+	curl -sL "https://cdn.jsdelivr.net/npm/htmx.org@$(HTMX_VERSION)/dist/htmx.min.js" -o $(HTMX_DIR)/htmx.min.js
+	curl -sL "https://cdn.jsdelivr.net/npm/htmx-ext-sse@$(HTMX_SSE_VERSION)/sse.js" -o $(HTMX_DIR)/sse.js
+
+# Source Sans 3 / Source Code Pro (SIL OFL 1.1) — variable woff2 (latin) via fontsource.
+$(FONTS_DIR)/source-sans-3.woff2:
+	@mkdir -p $(FONTS_DIR)
+	curl -sL "https://cdn.jsdelivr.net/npm/@fontsource-variable/source-sans-3/files/source-sans-3-latin-wght-normal.woff2" -o $(FONTS_DIR)/source-sans-3.woff2
+	curl -sL "https://cdn.jsdelivr.net/npm/@fontsource-variable/source-code-pro/files/source-code-pro-latin-wght-normal.woff2" -o $(FONTS_DIR)/source-code-pro.woff2
 
 proto:
 	buf generate

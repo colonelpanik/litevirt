@@ -39,8 +39,10 @@ state.db-shm
 /etc/litevirt/
 config.local.yaml
 
-# Downloaded JS vendor libs (fetched by `make vendor-js`)
+# Downloaded front-end vendor assets (fetched by `make vendor-js`, embedded at build)
 internal/ui/static/vendor/uplot/
+internal/ui/static/vendor/htmx/
+internal/ui/static/fonts/
 
 # IDE / editor
 .idea/

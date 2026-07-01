@@ -41,6 +41,7 @@ lv events [--type <filter>]        # Stream cluster events live
 lv events <vm> [--limit N] [--since <RFC3339>]   # One VM's activity history (lifecycle + backup outcomes)
 lv top [--interval 3s]             # Live resource dashboard
 lv ui [--open]                     # Show web UI URL
+lv mcp [--max-list-items N] [--allow-write]  # Run the stdio MCP server for operator assistants
 lv version                         # Print version
 lv cluster digest                  # Per-table state digest for each host
 lv cluster sync                    # Pull full state from connected host and merge

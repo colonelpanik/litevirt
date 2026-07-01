@@ -111,3 +111,4 @@ See the [Installation](installation.md) guide for multi-host cluster setup, addi
 | [Audit log](audit-log.md) | SHA-256 hash chain, `lv audit verify`, WORM JSON export |
 | [Diagnostics](diagnostics.md) | `lv doctor divergence` scanner, equal-timestamp tie resolution, runtime ownership repair, metrics/alerts, repair runbook |
 | [GitOps](gitops.md) | `litevirt gitops` reconcile subcommand, `DiffStack` short-circuit, `gh` post-back |
+| [MCP Server](mcp.md) | `litevirt mcp` stdio server for safe operator-assistant reads and guarded lifecycle actions |

@@ -544,11 +544,19 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 			stepIdx = i
 		}
 	}
+	if statusIdx < 0 {
+		// runtime_action_proofs always carries a status column; an incoming dump that
+		// lacks it is malformed/hostile and can't be checked against the monotone
+		// lifecycle. FAIL CLOSED — keep the local row rather than let plain LWW resurrect
+		// a spent (terminal) proof with a newer-timestamped non-terminal copy. A
+		// legitimately-newer state still converges via the schema-complete WAL path or a
+		// well-formed later dump; a well-formed peer never omits the column, so this never
+		// stalls real convergence.
+		slog.Warn("sync: runtime_action_proofs dump missing status column; keeping local (fail-closed)")
+		return true
+	}
 	localTS, _ := localRow[updatedAtIdx].(string)
 	incomingTS, _ := row[updatedAtIdx].(string)
-	if statusIdx < 0 {
-		return localWinsLWW(localTS, incomingTS) // no status column → plain LWW fallback
-	}
 	localStatus, _ := localRow[statusIdx].(string)
 	incomingStatus, _ := row[statusIdx].(string)
 

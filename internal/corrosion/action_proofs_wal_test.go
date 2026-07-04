@@ -61,6 +61,42 @@ func TestWAL_ActionProofMonotone(t *testing.T) {
 	}
 }
 
+// A well-formed peer's proof dump always carries the status column; an incoming AE
+// dump that OMITS it can't be checked against the monotone lifecycle, so
+// proofMergeKeepLocalRow must FAIL CLOSED (keep local) rather than fall back to plain
+// LWW — otherwise a newer-timestamped, status-less row could resurrect a spent proof.
+func TestProofMergeKeepLocalRow_NoStatusColumnFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	// Local row is terminal (completed).
+	p := ActionProof{ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1", DestHost: "h", Coordinator: "h"}
+	if err := WriteActionProof(ctx, c, p); err != nil {
+		t.Fatalf("WriteActionProof: %v", err)
+	}
+	if err := ClaimActionProof(ctx, c, "p1", "h"); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Execute(ctx, `UPDATE runtime_action_proofs SET status='completed', updated_at=? WHERE id='p1'`, c.NowTS()); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	// Incoming AE dump omits the status column entirely, with a FAR-FUTURE updated_at
+	// that would win a plain LWW compare.
+	tbl := syncTable{Name: "runtime_action_proofs", Columns: []string{"id", "updated_at"}}
+	row := []interface{}{"p1", "2999-01-01T00:00:00Z"}
+
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	keepLocal := c.proofMergeKeepLocalRow(tx, tbl, row, []string{"id"}, []int{0}, 1)
+	if !keepLocal {
+		t.Fatal("no-status dump: keepLocal=false; want true — a status-less proof dump must fail closed, not LWW-resurrect a terminal proof")
+	}
+}
+
 // proofMergeKeepLocal is the monotone anti-entropy decision: rank wins over
 // timestamp, and a completed⊕failed conflict keeps local.
 func TestProofMergeKeepLocal(t *testing.T) {

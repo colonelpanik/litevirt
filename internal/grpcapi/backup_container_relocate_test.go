@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -337,6 +338,28 @@ func TestRestoreContainer_RunningLeftoverRefused(t *testing.T) {
 	}
 	if len(rt.deleteCalls) != 0 {
 		t.Fatal("must NOT DeleteContainer a running leftover")
+	}
+}
+
+// When the runtime can't report the leftover's state, restore must FAIL CLOSED rather than
+// force-destroy it — DeleteContainer is lxc-destroy -f and a transient state-read failure
+// must never be a licence to stop what could be a live workload.
+func TestRestoreContainer_LeftoverStateUnreadableRefused(t *testing.T) {
+	s, rt, repo, ts, token, proofID := setupProofRestore(t)
+	rt.existsByName = map[string]bool{"ct1": true}
+	rt.stateErrByName = map[string]error{"ct1": errors.New("lxc-info: transient failure")} // can't confirm stopped
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}
+	err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: ts, Proof: relocProof(proofID, token),
+	}, rs)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("an unreadable-state leftover must be refused fail-closed (Internal); got %v", err)
+	}
+	if len(rt.deleteCalls) != 0 {
+		t.Fatal("must NOT DeleteContainer when the state read failed (can't confirm stopped)")
+	}
+	if _, imported := rt.imported["ct1"]; imported {
+		t.Fatal("must NOT import over a leftover whose state could not be read")
 	}
 }
 

@@ -711,9 +711,16 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 				// Untracked, unmarked leftover (marker genuinely ABSENT — crash before the
 				// marker landed, or an orphan; nothing in the DB tracks it). Clean it and
 				// re-import under this proof rather than adopt an artifact we can't attribute —
-				// but NEVER force-destroy a RUNNING container (that would kill a live workload);
-				// refuse and let the operator stop it first.
-				if st, serr := s.containerRuntime.StateContainer(ctx, req.Name); serr == nil && strings.EqualFold(st, "running") {
+				// but DeleteContainer is a force-destroy (lxc-destroy -f) that would kill a live
+				// workload, so ONLY clean when the state read positively confirms it is STOPPED.
+				// Fail closed on RUNNING *and* on a state-read error (can't confirm stopped →
+				// don't force-destroy); let the operator stop/remove it first.
+				st, serr := s.containerRuntime.StateContainer(ctx, req.Name)
+				if serr != nil {
+					return status.Errorf(codes.Internal,
+						"restore refused: cannot determine state of untracked container %q (%v) — stop/remove it before restoring over it", req.Name, serr)
+				}
+				if strings.EqualFold(st, "running") {
 					return status.Errorf(codes.FailedPrecondition,
 						"restore refused: an untracked container %q is RUNNING here — stop/remove it before restoring over it", req.Name)
 				}

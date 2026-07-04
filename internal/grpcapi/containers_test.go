@@ -46,6 +46,9 @@ type fakeCTRuntime struct {
 	// (unset → "running" for back-compat with the lifecycle tests).
 	listNames   []string
 	stateByName map[string]string
+	// stateErrByName injects a StateContainer read error per name (unset → no error) so a
+	// test can exercise the fail-closed path when the runtime can't report container state.
+	stateErrByName map[string]error
 
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
@@ -152,6 +155,11 @@ func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []str
 	return ContainerExecResult{Stdout: []byte("ok"), ExitCode: 0}, nil
 }
 func (f *fakeCTRuntime) StateContainer(_ context.Context, name string) (string, error) {
+	if f.stateErrByName != nil {
+		if err, ok := f.stateErrByName[name]; ok {
+			return "", err
+		}
+	}
 	if f.stateByName != nil {
 		if s, ok := f.stateByName[name]; ok {
 			return s, nil

@@ -93,6 +93,10 @@ detection) — scaling to hundreds of nodes with no master to lose.
   <em>Cluster-wide VM list</em>
 </p>
 <p align="center">
+  <img src="docs/img/ui-vm-detail.png" alt="VM detail with live CPU, memory, disk and network graphs" width="100%"><br>
+  <em>Per-VM live metrics — CPU, memory, disk &amp; network</em>
+</p>
+<p align="center">
   <img src="docs/img/ui-create-modal.png" alt="Create VM" width="70%"><br>
   <em>VM creation — resources, boot, passthrough, cloud-init, networking</em>
 </p>

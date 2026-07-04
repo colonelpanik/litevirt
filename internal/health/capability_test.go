@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -77,6 +78,37 @@ func TestCapabilityActive(t *testing.T) {
 	})
 }
 
+// A positive CapabilityActive result is cached for capActivePosTTL: a second call within
+// the window returns the cached positive WITHOUT re-sweeping every voting peer, so the
+// post-latch HA monitor doesn't fan out a fresh capability sweep on every tick.
+func TestCapabilityActive_PositiveCached(t *testing.T) {
+	const tok = capabilities.SplitBrainGateV1
+	db := testCheckHostDB(t)
+	gateHost(t, db, "host-a", "active", "worker")
+	gateHost(t, db, "host-b", "active", "worker")
+	c := NewChecker("host-a", "/etc/litevirt/pki", db)
+
+	var calls int
+	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) {
+		calls++
+		return []string{tok}, nil
+	})
+
+	if ok, _ := c.CapabilityActive(context.Background(), tok); !ok {
+		t.Fatal("first call: want active")
+	}
+	first := calls
+	if first == 0 {
+		t.Fatal("first call must sweep peers")
+	}
+	if ok, _ := c.CapabilityActive(context.Background(), tok); !ok {
+		t.Fatal("second call: want active")
+	}
+	if calls != first {
+		t.Fatalf("second call re-swept peers (pinger calls %d→%d); want a cached positive with no fresh sweep", first, calls)
+	}
+}
+
 // Enforced latches: once activation is confirmed cluster-wide it stays on even
 // when a later fresh Ping can't confirm (a partition must fail closed, not revert
 // to the legacy path).
@@ -101,6 +133,12 @@ func TestEnforced_Latches(t *testing.T) {
 	}
 	// Simulate a partition: peers unreachable → CapabilityActive would be false.
 	supporting = false
+	// Clear the cached positive so this exercises a FRESH sweep; the positive cache would
+	// otherwise mask the partition for capActivePosTTL, which is orthogonal to the latch
+	// under test.
+	c.mu.Lock()
+	c.capActivePos = map[string]time.Time{}
+	c.mu.Unlock()
 	if ok, _ := c.CapabilityActive(ctx, tok); ok {
 		t.Fatal("precondition: CapabilityActive should now be false (partition)")
 	}

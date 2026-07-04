@@ -66,6 +66,14 @@ type Checker struct {
 	// to activate.
 	capActiveNeg map[string]capNegEntry
 
+	// capActivePos caches a POSITIVE CapabilityActive result per token for capActivePosTTL.
+	// Pre-latch there is no repeated positive to cache (Enforced latches on the first one);
+	// this exists for the POST-latch HA monitor (evaluateHADegraded), which would otherwise
+	// re-fan-out a fresh capability sweep across every voting peer on every tick. A capability
+	// regression on an already-latched cluster still surfaces within the TTL, and the entry is
+	// cleared the moment any sweep yields a negative (cacheNeg), so a regression is never masked.
+	capActivePos map[string]time.Time
+
 	// activated latches, PER TOKEN, "enforcement has activated cluster-wide"
 	// (monotone, durable via a per-token marker file) so a later partition fails
 	// closed, not to legacy. Keyed by token so distinct features (Phase 2/4/5) latch
@@ -116,6 +124,7 @@ func NewChecker(hostName, pkiDir string, db *corrosion.Client) *Checker {
 		peers:               make(map[string]*peerState),
 		peerCaps:            make(map[string]peerCapEntry),
 		capActiveNeg:        make(map[string]capNegEntry),
+		capActivePos:        make(map[string]time.Time),
 		activated:           make(map[string]bool),
 		activationPersisted: make(map[string]bool),
 	}

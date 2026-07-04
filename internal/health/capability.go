@@ -35,6 +35,13 @@ const capActivationTimeout = 4 * time.Second
 // cluster activates promptly; only negatives are cached (a positive clears it + latches).
 const capActiveNegTTL = 3 * time.Second
 
+// capActivePosTTL caches a POSITIVE CapabilityActive result this long. Only the post-latch
+// HA monitor recomputes positives (Enforced short-circuits once latched), so a TTL longer
+// than the negative one collapses its per-tick capability sweep across every voting peer to
+// roughly once per window, while a capability regression on the latched cluster still
+// surfaces within the TTL. Cleared on any negative (cacheNeg), so it never masks a regression.
+const capActivePosTTL = 60 * time.Second
+
 // SetPeerPinger injects the peer capability reader. Without it, no capability is
 // ever active (every gate stays log-only) — fail closed.
 func (c *Checker) SetPeerPinger(fn PeerPinger) {
@@ -206,6 +213,10 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 		c.mu.Unlock()
 		return false, e.reason // recent negative → skip the fresh-Ping fan-out
 	}
+	if at, ok := c.capActivePos[token]; ok && time.Since(at) < capActivePosTTL {
+		c.mu.Unlock()
+		return true, "" // recent positive → skip the fan-out (a regression still surfaces within capActivePosTTL)
+	}
 	c.mu.Unlock()
 	if pinger == nil {
 		return c.cacheNeg(token, ReasonActivationUnconfirm)
@@ -232,9 +243,11 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 			return c.cacheNeg(token, ReasonUnsupportedCapability)
 		}
 	}
-	// Positive: clear any cached negative so the latch reacts immediately.
+	// Positive: clear any cached negative so the latch reacts immediately, and cache the
+	// positive so the post-latch HA monitor doesn't re-fan-out this sweep every tick.
 	c.mu.Lock()
 	delete(c.capActiveNeg, token)
+	c.capActivePos[token] = time.Now()
 	c.mu.Unlock()
 	return true, ""
 }
@@ -243,6 +256,7 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 func (c *Checker) cacheNeg(token, reason string) (bool, string) {
 	c.mu.Lock()
 	c.capActiveNeg[token] = capNegEntry{reason: reason, at: time.Now()}
+	delete(c.capActivePos, token) // a negative invalidates any cached positive (fail-closed)
 	c.mu.Unlock()
 	return false, reason
 }

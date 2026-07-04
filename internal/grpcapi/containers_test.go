@@ -61,6 +61,10 @@ type fakeCTRuntime struct {
 	imported      map[string][]byte
 	exportErr     error
 	importErr     error
+	// existsByName overrides ContainerExists per name (for the restore-resume tests to
+	// simulate an untracked leftover artifact); unset → falls back to `imported` presence.
+	existsByName map[string]bool
+	existsErr    error
 
 	// B2 snapshot revert: captures bytes handed to RevertContainer keyed by name;
 	// revertErr injects a failure.
@@ -118,7 +122,25 @@ func (f *fakeCTRuntime) DeleteContainer(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, name)
+	if f.deleteErr == nil {
+		delete(f.imported, name)
+		delete(f.existsByName, name)
+	}
 	return f.deleteErr
+}
+func (f *fakeCTRuntime) ContainerExists(_ context.Context, name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.existsErr != nil {
+		return false, f.existsErr
+	}
+	if f.existsByName != nil {
+		if v, ok := f.existsByName[name]; ok {
+			return v, nil
+		}
+	}
+	_, ok := f.imported[name]
+	return ok, nil
 }
 func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []string) (ContainerExecResult, error) {
 	f.mu.Lock()

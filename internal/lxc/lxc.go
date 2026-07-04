@@ -137,6 +137,9 @@ type Runtime interface {
 	// produced by ExportContainer, then rewrites the config's rootfs path so it
 	// is valid at this host's lxcpath. The container is left stopped.
 	ImportContainer(ctx context.Context, name string, r io.Reader) error
+	// ContainerExists reports whether the on-disk container dir exists (independent of
+	// any DB row) — used by the crash-idempotent restore resume path.
+	ContainerExists(name string) (bool, error)
 	// RevertContainer replaces an EXISTING container's on-disk dir from a
 	// snapshot tar (in-place snapshot revert — clobbers). The container must be
 	// stopped first.
@@ -623,6 +626,24 @@ func (r *LxcRunner) ImportContainer(ctx context.Context, name string, src io.Rea
 // container is unsafe.
 func (r *LxcRunner) RevertContainer(ctx context.Context, name string, src io.Reader) error {
 	return r.importContainer(ctx, name, src, true)
+}
+
+// ContainerExists reports whether the on-disk container dir <lxcpath>/<name> exists,
+// independent of any DB row or valid config — the primitive the restore resume path uses
+// to detect an untracked artifact left by a crash between import and row-write. A stat
+// error other than "not exist" is returned so the caller fails closed.
+func (r *LxcRunner) ContainerExists(name string) (bool, error) {
+	if err := safename.ValidateContainerName(name); err != nil {
+		return false, err
+	}
+	_, err := os.Stat(filepath.Join(r.lxcpath(), name))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // importContainer is the shared extract path. replace=false refuses to clobber

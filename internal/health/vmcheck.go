@@ -13,6 +13,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -40,6 +41,24 @@ type VMChecker struct {
 	// migrateVM is an optional callback to migrate a VM via the full MigrateVM
 	// RPC path (with post-migration steps: GARP, LB, FDB, DNS, network provisioning).
 	migrateVMFunc func(ctx context.Context, vmName, targetHost string) error
+
+	// gate is the split-brain safety gate (Phase 1). When set + enforced, a
+	// restart-policy start requires local quorum. nil disables (tests). onGateRefused
+	// feeds the refusal metric (nil-safe).
+	gate          runtimeGate
+	onGateRefused func(action, reason string)
+}
+
+// SetGate injects the split-brain safety gate (the health.Checker).
+func (v *VMChecker) SetGate(g runtimeGate) { v.gate = g }
+
+// SetGateRefusedObserver wires the refusal metric hook (nil-safe).
+func (v *VMChecker) SetGateRefusedObserver(fn func(action, reason string)) { v.onGateRefused = fn }
+
+func (v *VMChecker) noteGateRefused(action, reason string) {
+	if v.onGateRefused != nil {
+		v.onGateRefused(action, reason)
+	}
 }
 
 // SetEventBus sets the event bus for publishing health check events.
@@ -329,6 +348,15 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 	if err != nil || fresh == nil {
 		return
 	}
+	// Ownership may have moved off this host since the health probe was QUEUED (the
+	// sweep spawns checks async on a snapshot). Act ONLY if we still own it — else a
+	// destroy/start would hit a stale local domain, or a migrate would use a stale
+	// source host, fighting the new owner. Everything below acts on the FRESH record.
+	if fresh.HostName != v.hostName {
+		slog.Info("vmcheck: skipping action — VM no longer owned by this host",
+			"vm", vm.Name, "owner", fresh.HostName)
+		return
+	}
 	if fresh.State == "stopped" && fresh.StateDetail == "operator-stop" {
 		slog.Info("vmcheck: skipping action — VM was stopped by operator", "vm", vm.Name)
 		return
@@ -336,6 +364,30 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 	if fresh.State != "running" {
 		slog.Info("vmcheck: skipping action — VM state changed", "vm", vm.Name, "state", fresh.State)
 		return
+	}
+
+	// Split-brain gate (Phase 1): "restart" (destroy+start) and "migrate" are
+	// automated RUNTIME actions — once enforcement is latched they require local
+	// quorum (ExecutionGate), so an isolated host with a failing health probe can't
+	// restart-in-place or migrate a VM without quorum. "alert" is a notification, not
+	// a runtime action, and still fires. Fail-open until split_brain_gate_v1 is
+	// cluster-wide. (This is separate from the restart-POLICY gate in maybeRestartVM.)
+	if action == "restart" || action == "migrate" {
+		// Self-fence is an UNCONDITIONAL hard gate (independent of enforcement): a doomed
+		// node must not restart-in-place or migrate a VM during its fence-timeout window.
+		if selfFenceHardGate(v.gate) {
+			slog.Warn("vmcheck: self-fenced — refusing health-check action", "vm", vm.Name, "action", action)
+			v.noteGateRefused(corrosion.ActionReschedule, ReasonSelfFenced)
+			return
+		}
+		if v.gate != nil && v.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+			if g := v.gate.ExecutionGate(ctx); !g.OK {
+				slog.Warn("vmcheck: execution gate refused health-check action (no quorum)",
+					"vm", vm.Name, "action", action, "reason", g.Reason)
+				v.noteGateRefused(corrosion.ActionReschedule, g.Reason)
+				return
+			}
+		}
 	}
 
 	slog.Warn("vmcheck: taking action", "vm", vm.Name, "action", action)
@@ -357,7 +409,7 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 		slog.Info("vmcheck: VM restarted", "vm", vm.Name)
 
 	case "migrate":
-		v.migrateVM(ctx, vm)
+		v.migrateVM(ctx, *fresh) // act on the fresh record (current owner), not the queued snapshot
 
 	case "alert":
 		v.publish("vm.health.alert", vm.Name, fmt.Sprintf("type=%s target=%s", hspec.Type, hspec.Target))
@@ -512,6 +564,24 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	// Check delay since last restart.
 	if rs != nil && !rs.LastRestart.IsZero() && now.Sub(rs.LastRestart) < delay {
 		return
+	}
+
+	// Self-fence is an UNCONDITIONAL hard gate (independent of enforcement): a doomed
+	// node must not restart a VM per restart-policy during its fence-timeout window.
+	if selfFenceHardGate(v.gate) {
+		slog.Info("vmcheck: self-fenced — refusing restart-policy start", "vm", vm.Name)
+		v.noteGateRefused(corrosion.ActionReschedule, ReasonSelfFenced)
+		return
+	}
+	// Split-brain gate (Phase 1): a restart-policy start is a runtime action; once
+	// enforced it needs local quorum, so an isolated host with stale local ownership
+	// can't restart-into a double-run. Fail-open until latched.
+	if v.gate != nil && v.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+		if g := v.gate.ExecutionGate(ctx); !g.OK {
+			slog.Info("vmcheck: execution gate refused restart (no quorum)", "vm", vm.Name, "reason", g.Reason)
+			v.noteGateRefused(corrosion.ActionReschedule, g.Reason)
+			return
+		}
 	}
 
 	// Perform restart.

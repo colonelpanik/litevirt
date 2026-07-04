@@ -176,6 +176,71 @@ Set in compose `migrate` section:
 | `restart-same` | Wait for original host to recover |
 | `none` | Do not reschedule |
 
+## Load-balancer VIP split-brain safety
+
+Load-balancer VIPs (keepalived/VRRP) are protected against split-brain by the same core
+rule as VM/container ownership: **no quorum or proof ⇒ no new ownership action. A safe gap
+(a VIP briefly down) is acceptable; two hosts answering the same VIP is the bug.**
+
+This hardening is **capability-gated and rolled out per-cluster** — it activates only once
+every participating host advertises support, so a mixed-version cluster keeps its previous
+behavior until the whole fleet can enforce it. **No hardware watchdog is required** for any
+of it; a watchdog, where present, is only an optional self-fence backstop.
+
+### Minority self-demotes
+
+An isolated load-balancer host that loses quorum stands its **own** VIPs down — stops
+keepalived and removes the address — so it can't keep answering on the wrong side of a
+partition. A brief blip never triggers this (there's a sustained-loss threshold,
+`quorum_loss_demote_after_sec`); a freshly-restarted host still in warm-up never drops a
+healthy VIP. If the stand-down can't be confirmed (e.g. a wedged keepalived) and the host
+has a verified hardware watchdog, it self-fences; otherwise it keeps retrying and raises a
+persistent `HA degraded` status rather than ever pretending to be down.
+
+### Majority reclaims only with proof
+
+The surviving majority (re)claims a VIP only on **proof the old holder has released it** —
+either the old holder is reachable (directly, or relayed through a peer that can reach it)
+and reports the VIP absent, or an operator has attested it is down (below). If the old
+holder is **unreachable and unproven**, the majority leaves the VIP **down and raises an
+alert** — an outage, never a blind takeover. This is the `safe` policy, and it is the only
+supported one:
+
+```yaml
+# daemon config — the default; the only accepted value
+no_quorum_vip_policy: safe
+```
+
+There is intentionally **no** weaker "take over after a timeout without proof" tier — it
+would reintroduce the dual-master risk this feature exists to prevent. The supported way to
+recover a stuck VIP is the manual fence-confirm below, not a weaker policy.
+
+### Recovering a VIP from a dead, unreachable holder
+
+If a VIP's holder has failed and can't be reached — and you need the VIP back — verify the
+host is genuinely powered off out-of-band (IPMI / PDU / console), then attest it:
+
+```bash
+lv host fence-confirm <host>
+```
+
+This is the same operator attestation that releases a manually-fenced host's VMs, and it
+also releases that host's VIPs: a host you have confirmed down has, by definition, let go of
+its VIP, so the majority reclaims it. The attestation is trusted only briefly (re-run it if
+recovery drags on), and **only an explicit `fence-confirm` counts** — an automatic fence
+*attempt* that may have partially failed does not. This is the answer to "I need my VIP
+back now": a fast, safe, operator-driven override — no weaker cluster-wide policy needed.
+
+### Coverage boundaries
+
+- A **data-plane-only** partition — gRPC/gossip quorum intact on both sides but the VRRP L2
+  segment split — is not auto-resolved (neither side loses quorum, so neither self-demotes).
+  Watch for a VIP-conflict alert and resolve the L2 fault.
+- Reclaiming an unreachable holder's VIP **automatically** (without the manual attestation
+  above) requires proof-grade fencing (IPMI power-off / SBD), a separate optional rollout.
+  Until then the unreachable case is a deliberate availability trade-off: VIP down + alert,
+  recovered by the fence-confirm step above.
+
 ## Containers
 
 **Cold migration** — `lv ct migrate <name> <target> --repo <dir>` moves a

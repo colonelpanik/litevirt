@@ -23,6 +23,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/billing"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
@@ -32,6 +33,7 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/metrics"
@@ -271,11 +273,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// are observed too.
 	d.db.SetSyncMetrics(metrics.NewAntiEntropyMetrics())
 
+	// Create the host health checker BEFORE the replicator so the proof-table WAL
+	// gate is installed before any replication goroutine runs (a nil gate fails
+	// closed, but wiring it up front means no reliance on that). Load the durable
+	// split-brain activation latch here too, before any runtime work is wired, so a
+	// previously-enforced node that restarts (including mid-partition) gates onboot
+	// VM starts / LB (re)apply instead of running them ungated. (Peer capability is
+	// wired later via SetPeerPinger; until then PeerSupports fails closed, so proof
+	// WAL entries defer rather than leak — never a schema-version guess.)
+	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
+	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, "split_brain_activated"))
+	gateMetrics := metrics.NewRuntimeGateMetrics() // shared by all gate observers
+
 	// Start WAL-based replicator with Crescent relay protocol.
 	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, corrosion.RelayConfig{
 		BaseRelays:      3,
 		NodesPerRelay:   50,
 		FallbackTimeout: 15 * time.Second,
+	})
+	// Token-based (fresh-Ping-cached) gate for proof-table WAL replication, wired
+	// BEFORE Start: only send runtime_action_proofs mutations to a peer that
+	// advertises the gate. Fail-closed until SetPeerPinger (below) — proofs defer.
+	repl.SetProofReplicaGate(func(ctx context.Context, peer string) bool {
+		return d.checker.PeerSupports(ctx, peer, capabilities.SplitBrainGateV1)
 	})
 	repl.Start(ctx)
 
@@ -293,8 +313,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	go d.metrics.Start()
 
-	// Start host health checker
-	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
+	// Start the host health checker (created above, before the replicator).
 	go d.checker.Start(ctx)
 
 	// Create the failover coordinator; started after the gRPC server is built
@@ -311,9 +330,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// constructed (it reuses lockVM + pickDisk).
 	d.snapScheduler = scheduler.NewSnapshotScheduler(d.db, d.cfg.HostName, nil /* runner set after server build */)
 
-	// Start VM health checker (event bus wired after gRPC server is created below).
+	// Create the VM health checker (event bus wired after gRPC server is created
+	// below). Gate restart-policy starts on local quorum (once enforced). The sweep
+	// loop is NOT started here — it launches below, only after the full gate
+	// (SetPeerPinger) and its callbacks are wired, so a gated runtime start never
+	// runs in a window where capability can't yet be confirmed.
 	vmChecker := health.NewVMChecker(d.cfg.HostName, d.db, d.virt)
-	go vmChecker.Start(ctx)
+	vmChecker.SetGate(d.checker)
+	vmChecker.SetGateRefusedObserver(gateMetrics.Refused)
 
 	// Start libvirt reconnect loop — auto-reconnects if libvirtd restarts (#42).
 	go d.virt.StartReconnectLoop(ctx)
@@ -335,13 +359,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	})
 
-	// Start VM reconciler (picks up "pending" VMs from failover and starts them)
+	// Create the VM reconciler (picks up "pending" VMs from failover and starts
+	// them). Wire the split-brain gate now, but DON'T start the reconcile loop or
+	// onboot autostart yet — they launch below, after SetPeerPinger and the
+	// reconciler's callbacks (LB refresh, image pull, firmware paths) are wired, so
+	// an isolated/latched restart can't run automated starts before the gate can
+	// confirm capability.
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
-	go reconciler.Start(ctx)
-	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
-	// already running in libvirt, so a daemon restart (qemu kept alive by
-	// KillMode=process) is a no-op while a host reboot brings them up in order.
-	go reconciler.StartOnbootVMs(ctx)
+	reconciler.SetGate(d.checker)
+	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 
 	// Daily prune of this host's vm_events rows so the operational event store
 	// stays bounded (see config vm_event_*).
@@ -359,8 +385,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	dnsSrv := dns.NewServer(d.cfg.DNSDomain, d.cfg.DNSPort, d.db)
 	go dnsSrv.Start(ctx)
 
-	// Start hardware watchdog heartbeat (optional)
-	go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0)
+	// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP
+	// self-demotion trip a self-fence when a demotion can't be confirmed.
+	watchdogCtrl := watchdog.NewController()
+	go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl)
+	// Central self-fence hard gate: once this node self-fences, the checker's Execution/
+	// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
+	// grpcapi server, failover coordinator) refuses runtime-ownership work during the
+	// doomed fence-timeout window.
+	d.checker.SetSelfFenced(watchdogCtrl.Fenced)
 
 	// PCI device startup scan
 	d.runPCIScan(ctx)
@@ -386,6 +419,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	d.svc = svc
+	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
+	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
+	svc.SetGate(d.checker)
+	svc.SetGateRefusedObserver(gateMetrics.Refused)
 	// Target the upgrade swap at the binary we're actually running (re-exec uses
 	// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
 	if exe, err := os.Executable(); err == nil {
@@ -401,6 +438,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
+	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	svc.SetReplicator(repl)
 	svc.SetAuthEngine(d.authEngine)
@@ -416,10 +454,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// row points elsewhere against every other active host's libvirt before
 	// reclaiming it.
 	reconciler.SetPeerRuntimeChecker(svc.CheckPeerVMRuntime)
+	// Split-brain hardening (Phase 1): fresh-Ping peers for capability tokens so
+	// cluster-wide activation of fail-closed gates is computed from live
+	// reachability, never stale replicated rows. Once this is set, the proof-table
+	// WAL gate (wired before repl.Start above) can positively confirm peers; until
+	// now PeerSupports failed closed, deferring proof entries rather than leaking.
+	d.checker.SetPeerPinger(svc.PeerCapabilities)
 	// Runtime ownership repair metrics (Phase 5): VM owner-assert + CT re-key
 	// outcomes → litevirt_runtime_owner_assert_total.
 	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
 	reconciler.SetOwnerAssertObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("vm", result) })
+
+	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
+	// for cluster-wide capability confirmation) and every reconciler/vmChecker
+	// callback is set, start the runtime loops. Launching them here — not at
+	// construction — guarantees no automated runtime start (reschedule, restart
+	// policy, onboot autostart) ever runs in the window before the gate can confirm
+	// capability, closing the fail-open race for a should-enforce node.
+	go vmChecker.Start(ctx)
+	go reconciler.Start(ctx)
+	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
+	// already running in libvirt, so a daemon restart (qemu kept alive by
+	// KillMode=process) is a no-op while a host reboot brings them up in order.
+	go reconciler.StartOnbootVMs(ctx)
 
 	// Rebalance executor: leader-gated loop that applies operator-approved
 	// migration proposals (rc above only *proposes*). Reuses the rebalancer's
@@ -438,6 +495,49 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Keep litevirt_lb_keepalived_up tracking live keepalived state, not just
 	// the last apply.
 	go svc.RunLBMetricsRefresher(ctx, 30*time.Second)
+
+	// Split-brain Phase 2: minority VIP self-demotion. On sustained local quorum
+	// loss, an isolated LB host drops its own VIPs (stop keepalived + remove the
+	// address). This runs WITHOUT a hardware watchdog — the minority stops answering
+	// its own VIP regardless. A watchdog is an OPTIONAL backstop: if the demote can't
+	// be confirmed AND a verified watchdog is armed, the node self-fences; otherwise it
+	// keeps retrying + raises HA-degraded and the majority holds in the safe gap.
+	// Inert until vip_demote_v1 is enforced cluster-wide (validate on an ephemeral
+	// partition before flipping).
+	vipDemoter := health.NewVIPDemoter(d.checker, time.Duration(d.cfg.QuorumLossDemoteAfterSec)*time.Second)
+	keepalivedStopTimeout := time.Duration(d.cfg.KeepalivedStopTimeoutSec) * time.Second
+	vipDemoter.SetDemoteLocalVIPs(func(ctx context.Context) (bool, error) {
+		// Runtime-driven: demote whatever keepalived is actually configured/running on
+		// THIS host (not the possibly-stale DB view), using the exact rendered tuple.
+		return lb.NewManager().DemoteAll(keepalivedStopTimeout)
+	})
+	// A demotion FAILURE self-fences only when a verified watchdog is armed; without one
+	// the demoter stays up + raises HA-degraded (safe gap). SetArmed feeds that decision.
+	vipDemoter.SetSelfFence(watchdogCtrl.SelfFence)
+	vipDemoter.SetArmed(watchdogCtrl.Armed)
+	// Active when vip_demote_v1 is ENFORCED CLUSTER-WIDE (the durable Enforced() latch —
+	// every enforcement-relevant member advertises it, latched so a later partition can't
+	// un-arm it). NO watchdog gate: routing through the same latch as Phase 1 means the
+	// flip doesn't activate a lone rolled node before the whole cluster can participate,
+	// but a watchdog-less node still self-demotes (only its failure-handling differs).
+	vipDemoter.SetEnabled(func(ctx context.Context) bool {
+		return d.checker.Enforced(ctx, capabilities.VIPDemoteV1)
+	})
+	vipDemoter.SetRefusedObserver(gateMetrics.Refused)
+	// Surface an unfenced demotion failure (demote failed + no verified self-fence) as a
+	// durable HA-degraded condition so an operator can provide a fence / intervene.
+	vipDemoter.SetDemotionUnfencedObserver(svc.SetDemotionUnfenced)
+	// On quorum heal after a self-demotion, re-apply this host's LBs — DemoteAll stopped
+	// keepalived + removed the VIP, and nothing else recovers it otherwise.
+	vipDemoter.SetOnQuorumRestored(svc.ReconcileLBs)
+	go vipDemoter.Start(ctx)
+	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
+	// with no holder) — a durable alertable status + transition events.
+	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
+	// Once this node self-fences it de-advertises ALL split-brain capabilities — it is
+	// committed to rebooting, so it stops presenting as a healthy member for the
+	// fence-timeout window (defense-in-depth; reclaim still gates on VIPAssigned/fence-proof).
+	svc.SetWatchdogFenced(watchdogCtrl.Fenced)
 
 	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
 	ipScanner := grpcapi.NewIPScanner(svc)
@@ -516,6 +616,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// before reclaiming it (a PK re-key).
 	ctChecker.SetPeerContainerRuntimeChecker(svc.CheckPeerContainerRuntime)
 	ctChecker.SetContainerRekeyObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("ct", result) })
+	// Split-brain safety gate (Phase 1): a container re-key needs local quorum once
+	// enforced — wired before the container reconcile loop starts.
+	ctChecker.SetGate(d.checker)
+	ctChecker.SetGateRefusedObserver(gateMetrics.Refused)
 	go ctChecker.Start(ctx)
 
 	// wire the libvirt blockdev-mirror driver so MoveVolume
@@ -570,6 +674,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
 	fc.OnFence = svc.NotifyHostFenced         // operator notification on fence (#5)
 	fc.Metrics = metrics.NewFailoverMetrics() // structured failover counters (U9)
+	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
+	// decide site + writes a durable proof; the reconciler validates/claims it
+	// before start. Both are enforced only once split_brain_gate_v1 is
+	// cluster-wide (fail-open/log-only until then).
+	fc.Gate = d.checker // reconciler + svc gates were wired earlier (before their runtime work)
+	fc.SetGateRefusedObserver(gateMetrics.Refused)
+	// A self-fenced coordinator stops driving failover during the fence-timeout window.
+	fc.SelfFenced = watchdogCtrl.Fenced
 	go fc.Start(ctx)
 
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was

@@ -85,6 +85,10 @@ func (a *LXCRuntimeAdapter) ImportContainer(ctx context.Context, name string, r 
 	return a.Inner.ImportContainer(ctx, name, r)
 }
 
+func (a *LXCRuntimeAdapter) ContainerExists(ctx context.Context, name string) (bool, error) {
+	return a.Inner.ContainerExists(name)
+}
+
 func (a *LXCRuntimeAdapter) RevertContainer(ctx context.Context, name string, r io.Reader) error {
 	return a.Inner.RevertContainer(ctx, name, r)
 }

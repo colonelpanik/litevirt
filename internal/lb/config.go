@@ -181,6 +181,12 @@ func RenderHAProxy(cfg Config) (string, error) {
 }
 
 // RenderKeepalived produces a keepalived.conf content string.
+//
+// INVARIANT: the template emits EXACTLY ONE address in the virtual_ipaddress block
+// (a single {{.VIP}}/{{.VIPPrefix}} per LB). parseKeepalivedVIP relies on this — it
+// returns the sole address in that block — so if this template is ever changed to render
+// multiple VIPs per instance, parseKeepalivedVIP + DemoteAll must be revisited to
+// enumerate all of them (today "one LB ⇒ one VIP" makes single-address parsing exact).
 func RenderKeepalived(cfg Config) (string, error) {
 	var buf bytes.Buffer
 	// Augment cfg with a derived, per-LB VRRP auth password (F6).

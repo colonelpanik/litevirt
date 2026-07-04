@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -111,6 +112,18 @@ func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 	// (draining/upgrading/fenced) must not be writing new ownership.
 	if !localHostIsActiveWorker(hosts, r.hostName) {
 		return
+	}
+	// Split-brain gate (Phase 1): once enforced cluster-wide, an owner-assert
+	// reclaim (a runtime-ownership write) additionally requires local quorum —
+	// an isolated minority worker must not re-key ownership. ExecutionGate-only:
+	// this is a per-host reclaim, not a coordinator-forwarded action (no lease,
+	// no proof). Fail-open until split_brain_gate_v1 is cluster-wide.
+	if r.gate != nil && r.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+		if g := r.gate.ExecutionGate(ctx); !g.OK {
+			slog.Info("owner-assert: execution gate refused reclaim (no quorum)", "reason", g.Reason)
+			r.noteGateRefused(corrosion.ActionOwnerAssert, g.Reason)
+			return
+		}
 	}
 	others := workloadCapablePeers(hosts, r.hostName)
 

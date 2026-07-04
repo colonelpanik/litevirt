@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -18,6 +19,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -361,6 +363,49 @@ func relocateTokenFromMD(ctx context.Context) string {
 	return ""
 }
 
+// relocationProofTokenBound reports whether a carried relocation proof's token is bound
+// to the token being stamped on the restored row: both present and equal. The
+// coordinator's recovery treats the row's relocate_token as provenance, so the validated
+// proof and the stamped token must be the SAME non-empty attempt.
+func relocationProofTokenBound(proofToken, mdToken string) bool {
+	return proofToken != "" && mdToken != "" && proofToken == mdToken
+}
+
+// Restore proof markers — a host-local, DB-independent record of which restore PROOF
+// produced the on-disk container artifact for `name`. Written after ImportContainer and
+// BEFORE the DB row, so a crash between them is resumable by proof (reuse the artifact
+// only when its marker proves THIS proof; a different/absent marker is refused or a clean
+// untracked leftover is removed). Survives daemon restart; keyed by the validated name.
+
+func (s *Server) restoreMarkerPath(name string) string {
+	return filepath.Join(s.dataDir, "ct-restore-markers", name)
+}
+
+// readRestoreMarker returns the proof id recorded for `name`. It distinguishes ABSENT
+// (no file → "", nil) from UNREADABLE/corrupt (permission, I/O, … → "", err): an empty
+// marker is treated by the resume path as "untracked leftover, safe to clean + re-import",
+// so a read error must NOT collapse to "" — that could destroy an artifact another restore
+// owns. The caller fails closed on a non-nil error.
+func (s *Server) readRestoreMarker(name string) (string, error) {
+	b, err := os.ReadFile(s.restoreMarkerPath(name))
+	if os.IsNotExist(err) {
+		return "", nil // genuinely absent
+	}
+	if err != nil {
+		return "", err // unreadable/corrupt → indeterminate, fail closed
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+func (s *Server) writeRestoreMarker(name, proofID string) error {
+	if err := os.MkdirAll(filepath.Join(s.dataDir, "ct-restore-markers"), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(s.restoreMarkerPath(name), []byte(proofID), 0o600)
+}
+
+func (s *Server) removeRestoreMarker(name string) { _ = os.Remove(s.restoreMarkerPath(name)) }
+
 // driveRemoteRestore opens RestoreContainer on the target over peer mTLS, drains
 // its progress stream, and classifies the result. The authoritative "row
 // recorded" signal is the target's restoreRowRecordedStatus frame (or a clean
@@ -373,10 +418,24 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 	// stamps the restored row. The transport (PR-4 push to staging vs. shared-repo
 	// fallback) is handled by drivePeerRestore.
 	var md []string
+	var proof *pb.RuntimeActionProof
 	if token != "" {
 		md = []string{relocateTokenMDKey, token}
+		// Carry the FULL relocation proof (read from our just-written local row) so
+		// the target validates + claims it without depending on proof-row gossip.
+		if pr, ok, _ := corrosion.GetActionProofByToken(ctx, s.db, token); ok {
+			proof = &pb.RuntimeActionProof{
+				Id: pr.ID, Action: pr.Action, TargetKind: pr.TargetKind, TargetName: pr.TargetName,
+				DestHost: pr.DestHost, Coordinator: pr.Coordinator, RelocationToken: pr.RelocationToken,
+			}
+		} else if s.gateActive(ctx) {
+			// Under enforcement the coordinator minted a proof for this token; a miss
+			// means we must NOT drive a proofless restore (the target would refuse) —
+			// defer and retry rather than silently downgrade.
+			return corrosion.RestoreNotAttempted, fmt.Errorf("relocation proof for token %s not found under enforcement; deferring", token)
+		}
 	}
-	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, true, md...)
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, true, proof, md...)
 }
 
 // drainRestoreStream classifies a remote RestoreContainer progress stream. The
@@ -523,6 +582,52 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
+	// Split-brain gate (Phase 1): a restore-relocation is a runtime-ownership
+	// action. The target must have local quorum (ExecutionGate) AND, for a
+	// token-bound coordinator restore, validate + single-use-claim the proof before
+	// importing/recording. A carried proof MARKER forces the ExecutionGate even if
+	// THIS host hasn't latched enforcement — an asymmetric partition can deliver a
+	// valid proof to a target lacking quorum, which must not restore. Fail-open only
+	// for a proofless restore before activation.
+	if reason, refused := s.execGateForAction(ctx, req.Proof != nil); refused {
+		s.noteGateRefused(corrosion.ActionRelocate, reason)
+		return status.Errorf(codes.FailedPrecondition, "restore refused: %s", reason)
+	}
+	// A carried relocation proof must arrive over peer mTLS (coordinator-driven).
+	if req.Proof != nil {
+		if err := s.requirePeerCert(ctx); err != nil {
+			return status.Error(codes.PermissionDenied, "restore relocation proof requires a peer cert")
+		}
+		// Bind the carried proof to the relocation token that will be stamped on the row
+		// (relocateTokenFromMD). The coordinator's recovery treats the row's relocate_token
+		// as PROVENANCE — completeRestore tombstones the source only when the row token
+		// matches its attempt token — so the proof we validate and the token we stamp MUST
+		// be the SAME non-empty attempt. Refuse (before claiming) otherwise, so a malformed
+		// peer can't use a valid proof for token A while stamping token B (or none),
+		// diverging proof from provenance. (The DB-driven relocate-recreate path binds them
+		// by looking the proof up BY the row token; the direct RPC binds by exact equality.)
+		mdToken := relocateTokenFromMD(ctx)
+		if !relocationProofTokenBound(req.Proof.GetRelocationToken(), mdToken) {
+			s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofConflict)
+			return status.Errorf(codes.FailedPrecondition,
+				"restore refused: relocation proof token %q does not match the stamped relocation token %q",
+				req.Proof.GetRelocationToken(), mdToken)
+		}
+	}
+	// Validate + single-use-claim the FULL carried proof (no dependence on proof-row
+	// gossip). claimCarriedProof enforces action/target/dest==self + exact durable
+	// binding; the execute-side ExecutionGate above enforces local quorum. A
+	// proofless restore under enforcement is refused.
+	restoreProofID, cpErr := s.claimCarriedProof(ctx, req.Proof, corrosion.ActionRelocate, "container", req.Name)
+	if cpErr != nil {
+		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofConflict)
+		return cpErr
+	}
+	if req.Proof == nil && s.gateActive(ctx) && s.requirePeerCert(ctx) == nil {
+		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofMissing)
+		return status.Error(codes.FailedPrecondition, "restore refused: coordinator restore requires a proof under enforcement")
+	}
+
 	// Resolve the source of the manifest+chunks. staging_token (PR 4) is the
 	// per-transfer internal repo a migrate/failover coordinator PushBackup-streamed
 	// into — so the target restores WITHOUT needing the source's repo over NFS. It
@@ -578,45 +683,94 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	}
 
 	send := func(p *pb.RestoreContainerProgress) error { return stream.Send(p) }
-	if err := send(&pb.RestoreContainerProgress{
-		Phase:       pb.RestoreContainerProgress_RESTORE,
-		ChunksTotal: int32(len(manifest.Chunks)),
-		Status:      fmt.Sprintf("restoring %s@%s on %s", req.Name, req.Timestamp, s.hostName),
-	}); err != nil {
-		return err
+
+	// Crash-idempotent resume (proof-gated coordinator restores). A crash between
+	// ImportContainer and the DB row write below leaves an UNTRACKED runtime artifact
+	// (dir exists, no DB row — the row was checked above). On retry we resume by PROOF,
+	// never by re-importing blindly or adopting an unmarked/foreign artifact: a host-local
+	// marker (written right after import, before the row) records which proof produced it.
+	skipImport := false
+	if restoreProofID != "" {
+		exists, xerr := s.containerRuntime.ContainerExists(ctx, req.Name)
+		if xerr != nil {
+			return status.Errorf(codes.Unavailable, "check existing container artifact: %v", xerr)
+		}
+		if exists {
+			marker, merr := s.readRestoreMarker(req.Name)
+			switch {
+			case merr != nil:
+				// Marker unreadable/corrupt — NOT proof the artifact is unowned. Fail closed
+				// rather than destroy an artifact a different restore attempt may own.
+				return status.Errorf(codes.Internal, "restore refused: cannot read restore marker for %q: %v", req.Name, merr)
+			case marker == restoreProofID:
+				skipImport = true // our own prior import (crash after import) → reuse it
+			case marker != "":
+				return status.Errorf(codes.FailedPrecondition,
+					"restore refused: existing runtime artifact for %q belongs to a different restore attempt", req.Name)
+			default:
+				// Untracked, unmarked leftover (marker genuinely ABSENT — crash before the
+				// marker landed, or an orphan; nothing in the DB tracks it). Clean it and
+				// re-import under this proof rather than adopt an artifact we can't attribute.
+				if derr := s.containerRuntime.DeleteContainer(ctx, req.Name); derr != nil {
+					return status.Errorf(codes.Internal, "clean untracked leftover container %q: %v", req.Name, derr)
+				}
+			}
+		}
 	}
 
-	// Materialise the archived tar to a staging file (RestoreToFile is atomic +
-	// corruption-checked), then stream it into the runtime's importer.
-	stageDir := filepath.Join(s.dataDir, "ct-restore")
-	if err := os.MkdirAll(stageDir, 0o755); err != nil {
-		return status.Errorf(codes.Internal, "staging dir: %v", err)
-	}
-	tarPath := filepath.Join(stageDir, fmt.Sprintf("%s-%d.tar", req.Name, time.Now().UnixNano()))
-	defer os.Remove(tarPath)
-	if err := pbsstore.RestoreToFile(ctx, repo, manifest, tarPath, pbsstore.RestoreOptions{
-		Progress: func(p pbsstore.RestoreProgress) {
-			_ = send(&pb.RestoreContainerProgress{
-				Phase:        pb.RestoreContainerProgress_RESTORE,
-				BytesWritten: p.BytesWritten,
-				ChunksDone:   int32(p.ChunksDone), ChunksTotal: int32(p.ChunksTotal),
-			})
-		},
-	}); err != nil {
-		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
-		return status.Errorf(codes.Internal, "restore chunks: %v", err)
-	}
+	if !skipImport {
+		if err := send(&pb.RestoreContainerProgress{
+			Phase:       pb.RestoreContainerProgress_RESTORE,
+			ChunksTotal: int32(len(manifest.Chunks)),
+			Status:      fmt.Sprintf("restoring %s@%s on %s", req.Name, req.Timestamp, s.hostName),
+		}); err != nil {
+			return err
+		}
 
-	_ = send(&pb.RestoreContainerProgress{Phase: pb.RestoreContainerProgress_IMPORT, Status: "laying down container"})
-	f, err := os.Open(tarPath)
-	if err != nil {
-		return status.Errorf(codes.Internal, "open staged tar: %v", err)
-	}
-	importErr := s.containerRuntime.ImportContainer(ctx, req.Name, f)
-	_ = f.Close()
-	if importErr != nil {
-		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
-		return status.Errorf(codes.Internal, "import container: %v", importErr)
+		// Materialise the archived tar to a staging file (RestoreToFile is atomic +
+		// corruption-checked), then stream it into the runtime's importer.
+		stageDir := filepath.Join(s.dataDir, "ct-restore")
+		if err := os.MkdirAll(stageDir, 0o755); err != nil {
+			return status.Errorf(codes.Internal, "staging dir: %v", err)
+		}
+		tarPath := filepath.Join(stageDir, fmt.Sprintf("%s-%d.tar", req.Name, time.Now().UnixNano()))
+		defer os.Remove(tarPath)
+		if err := pbsstore.RestoreToFile(ctx, repo, manifest, tarPath, pbsstore.RestoreOptions{
+			Progress: func(p pbsstore.RestoreProgress) {
+				_ = send(&pb.RestoreContainerProgress{
+					Phase:        pb.RestoreContainerProgress_RESTORE,
+					BytesWritten: p.BytesWritten,
+					ChunksDone:   int32(p.ChunksDone), ChunksTotal: int32(p.ChunksTotal),
+				})
+			},
+		}); err != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+			return status.Errorf(codes.Internal, "restore chunks: %v", err)
+		}
+
+		_ = send(&pb.RestoreContainerProgress{Phase: pb.RestoreContainerProgress_IMPORT, Status: "laying down container"})
+		f, err := os.Open(tarPath)
+		if err != nil {
+			return status.Errorf(codes.Internal, "open staged tar: %v", err)
+		}
+		importErr := s.containerRuntime.ImportContainer(ctx, req.Name, f)
+		_ = f.Close()
+		if importErr != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+			return status.Errorf(codes.Internal, "import container: %v", importErr)
+		}
+		// Stamp the proof marker immediately after import, BEFORE the DB row — so a crash
+		// in the row write resumes (marker match → skipImport) instead of re-importing. If
+		// the marker can't be written, a later crash would strand an unmarked artifact, so
+		// fail closed by cleaning up the just-imported container.
+		if restoreProofID != "" {
+			if err := s.writeRestoreMarker(req.Name, restoreProofID); err != nil {
+				if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+					slog.Warn("container restore: cleanup after marker-write failure", "name", req.Name, "error", delErr)
+				}
+				return status.Errorf(codes.Internal, "record restore marker: %v", err)
+			}
+		}
 	}
 
 	// Recreate the cluster row from the embedded spec. The spec is UNTRUSTED
@@ -665,8 +819,20 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			slog.Warn("container restore: failed to clean up imported container after cluster-state-write failure",
 				"name", req.Name, "error", delErr)
 		}
+		s.removeRestoreMarker(req.Name) // artifact removed → drop its proof marker
 		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 		return status.Errorf(codes.Internal, "restore: record cluster state: %v", err)
+	}
+	// The row landed (point of no return): the DB row is now the durable record, so the
+	// host-local proof marker is no longer needed (any future retry hits the "row already
+	// exists" guard above, never the resume path). Drop it best-effort.
+	s.removeRestoreMarker(req.Name)
+	// Mark the relocation proof terminal (single-use) so a duplicate restore of the same
+	// attempt can't re-import.
+	if restoreProofID != "" {
+		if err := corrosion.CompleteActionProof(ctx, s.db, restoreProofID, s.hostName); err != nil {
+			slog.Warn("container restore: complete relocation proof", "name", req.Name, "proof", restoreProofID, "error", err)
+		}
 	}
 	// Re-reserve the managed IPs on this host (conditional — never steals; blanks a
 	// NIC whose IP a different workload now holds). Runs after the rows are written.

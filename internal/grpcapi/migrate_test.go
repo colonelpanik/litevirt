@@ -129,6 +129,63 @@ func TestMigrateVM_TargetNotActive(t *testing.T) {
 	}
 }
 
+// A migration is refused at the source when enforcement is latched and the source
+// lacks local quorum (ExecutionGate) — the split-brain recheck at the irreversible
+// step, covering the loss-of-quorum window and explicit operator migrations. The VM
+// is left running (never entered "migrating").
+func TestMigrateVM_SplitBrainGateRefusesWithoutQuorum(t *testing.T) {
+	s := testServerWithLocks(t)
+	ctx := adminCtx()
+	stream := &mockMigrateStream{ctx: ctx}
+
+	insertTestVM(t, ctx, s.db, "local-vm", "test-host", "running")
+	insertTestHost(t, ctx, s.db, "active-host", "active")
+
+	// Enforced, but the source's ExecutionGate refuses (no quorum).
+	s.SetGate(fakeServerGate{enforced: true, execOK: false})
+
+	err := s.MigrateVM(&pb.MigrateVMRequest{
+		VmName:     "local-vm",
+		TargetHost: "active-host",
+	}, stream)
+	if err == nil {
+		t.Fatal("expected the migration to be refused")
+	}
+	if c := status.Code(err); c != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", c)
+	}
+	if !strings.Contains(err.Error(), "migration refused") {
+		t.Errorf("error = %q, want it to contain 'migration refused'", err.Error())
+	}
+	vm, _ := corrosion.GetVM(ctx, s.db, "local-vm")
+	if vm.State != "running" {
+		t.Errorf("vm state = %q, want running (refused before the irreversible step)", vm.State)
+	}
+}
+
+// StartVM of an owned VM is refused when enforcement is latched and the source lacks
+// local quorum — bringing a possibly-stale-owned VM to running without quorum could
+// double-run it. RestartVM shares the same gate.
+func TestStartVM_SplitBrainGateRefusesWithoutQuorum(t *testing.T) {
+	s := testServerWithLocks(t)
+	ctx := adminCtx()
+	insertTestVM(t, ctx, s.db, "vm1", "test-host", "stopped")
+
+	s.SetGate(fakeServerGate{enforced: true, execOK: false}) // enforced, no quorum
+
+	_, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "vm1"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition", status.Code(err))
+	}
+	if !strings.Contains(err.Error(), "start refused") {
+		t.Errorf("err = %q, want it to contain 'start refused'", err.Error())
+	}
+	vm, _ := corrosion.GetVM(ctx, s.db, "vm1")
+	if vm.State != "stopped" {
+		t.Errorf("vm state = %q, want stopped (start refused, no runtime change)", vm.State)
+	}
+}
+
 func TestMigrateVM_LocalDiskBlocksLive(t *testing.T) {
 	s := testServerWithLocks(t)
 	ctx := adminCtx()

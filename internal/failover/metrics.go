@@ -42,6 +42,8 @@ const (
 	errClassNone = ""
 
 	ErrNoQuorum          = "no_quorum"
+	ErrDestUngated       = "dest_ungated" // target no longer advertises the split-brain gate
+	ErrSelfFenced        = "self_fenced"  // this coordinator self-fenced; skips driving failover until reboot
 	ErrLeaseLost         = "lease_lost"
 	ErrNotLeader         = "not_leader"
 	ErrTerminalState     = "terminal_state"

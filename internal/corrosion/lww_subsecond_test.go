@@ -50,7 +50,7 @@ func TestNowTS_MonotonicFixedWidth(t *testing.T) {
 	}
 }
 
-// TestHostVersion_PropagatesAfterSameSecondBootWrites is the kvm001 regression:
+// TestHostVersion_PropagatesAfterSameSecondBootWrites is a same-second-boot regression:
 // a node re-execs and writes its hosts row's state then version in the same
 // wall-clock second. A peer that already holds an older copy of the row applies
 // the state-write (bumping updated_at), then the version-write arrives with an

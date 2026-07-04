@@ -215,7 +215,12 @@ import (
 //	     pre-v37 network/pool/volume global, so no existing workload is suddenly
 //	     denied (a '_default' default would have done exactly that). Three ADD
 //	     COLUMNs; gap-1 from v36.
-const CurrentSchemaVersion = 37
+//	v38: split-brain hardening (Phase 1) — new table runtime_action_proofs (durable
+//	     single-use runtime-ownership authorization with a monotone action lifecycle;
+//	     NON-LWW merge, kept off replication until split_brain_gate_v1 is cluster-wide)
+//	     + vms.pending_action_id (TEXT NOT NULL DEFAULT '') linking a pending start to
+//	     its proof. One CREATE TABLE + one ADD COLUMN; gap-1 from v37.
+const CurrentSchemaVersion = 38
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -642,6 +647,48 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL
 	)`,
 
+	// runtime_action_proofs (v38, split-brain hardening) — the durable, single-use
+	// authorization a coordinator (holding the failover lease + local quorum) writes
+	// BEFORE a dangerous runtime-ownership action, so the executing host (which does
+	// not hold the lease) can validate it. Carries a full action lifecycle with a
+	// monotone state lattice (the merge lives in sync.go — proofRank /
+	// proofMergeKeepLocal(Row), a dedicated customMergeTables bucket, NOT resolver.go):
+	// rows are immutable except forward status transitions (prepared→in_progress→
+	// completed/failed); terminal beats non-terminal and never regresses regardless of
+	// updated_at; a completed⊕failed disagreement is left unresolved (a safety fault).
+	// SECURITY-CRITICAL, NON-LWW merge. Replication (see sync.go, authoritative): WAL
+	// relay is receiver-capability-gated (suppressed to peers lacking split_brain_gate_v1)
+	// and anti-entropy carries it on the peer-mTLS SENSITIVE lane UNCONDITIONALLY — safe
+	// because the merging node always runs the v38 monotone resolver and proof rows are
+	// only ever written once the gate is cluster-wide. VMs bind via (target_name +
+	// vms.pending_action_id); containers bind via relocation_token (their PK row is
+	// tombstoned+reinserted on re-key, so a column on it would not survive).
+	`CREATE TABLE IF NOT EXISTS runtime_action_proofs (
+		id                TEXT PRIMARY KEY,
+		action            TEXT NOT NULL,           -- reschedule | promote | relocate | lb_apply | owner_assert
+		target_kind       TEXT NOT NULL,           -- vm | container | lb
+		target_name       TEXT NOT NULL,
+		dest_host         TEXT NOT NULL,
+		coordinator       TEXT NOT NULL,
+		lease_holder      TEXT NOT NULL DEFAULT '',
+		lease_expires_at  TEXT NOT NULL DEFAULT '',
+		quorum_live       INTEGER NOT NULL DEFAULT 0,
+		quorum_needed     INTEGER NOT NULL DEFAULT 0,
+		owner_epoch       TEXT NOT NULL DEFAULT '', -- superseded owner epoch (Phase 4/5); '' pre-epoch
+		fence_epoch       TEXT NOT NULL DEFAULT '', -- fence proof reference (Phase 5); '' pre-epoch
+		relocation_token  TEXT NOT NULL DEFAULT '', -- container binding key; '' for VMs
+		status            TEXT NOT NULL DEFAULT 'prepared', -- prepared | in_progress | completed | failed
+		step_state        TEXT NOT NULL DEFAULT '', -- forward-only step checkpoints for multi-step resume
+		result_code       TEXT NOT NULL DEFAULT '',
+		result_detail     TEXT NOT NULL DEFAULT '',
+		started_at        TEXT NOT NULL DEFAULT '',
+		completed_at      TEXT NOT NULL DEFAULT '',
+		executor_host     TEXT NOT NULL DEFAULT '',
+		created_at        TEXT NOT NULL,
+		updated_at        TEXT NOT NULL,
+		deleted_at        TEXT
+	)`,
+
 	// Rebalancer proposals. One row per (vm, generation). Pending
 	// rows expire if not approved/applied within the proposal TTL.
 	`CREATE TABLE IF NOT EXISTS rebalance_proposals (
@@ -742,17 +789,22 @@ var schemaDDL = []string{
 
 	// ═══════════ VMS ═══════════
 	`CREATE TABLE IF NOT EXISTS vms (
-		name         TEXT PRIMARY KEY,
-		stack_name   TEXT,
-		host_name    TEXT NOT NULL,
-		spec         TEXT NOT NULL,
-		state        TEXT NOT NULL DEFAULT 'creating',
-		state_detail TEXT,
-		cpu_actual   INTEGER,
-		mem_actual   INTEGER,
-		created_at   TEXT NOT NULL,
-		updated_at   TEXT NOT NULL,
-		deleted_at   TEXT
+		name              TEXT PRIMARY KEY,
+		stack_name        TEXT,
+		host_name         TEXT NOT NULL,
+		spec              TEXT NOT NULL,
+		state             TEXT NOT NULL DEFAULT 'creating',
+		state_detail      TEXT,
+		cpu_actual        INTEGER,
+		mem_actual        INTEGER,
+		created_at        TEXT NOT NULL,
+		updated_at        TEXT NOT NULL,
+		deleted_at        TEXT,
+		-- v38 (split-brain hardening): control-plane pointer linking a state='pending'
+		-- transition to the runtime_action_proofs row that authorizes the start. Set once
+		-- with the pending transition, cleared in the same mutation that exits pending.
+		-- '' = no in-flight proof-gated action. Carved out of LWW (ruleColUnresolved).
+		pending_action_id TEXT NOT NULL DEFAULT ''
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS vm_interfaces (
@@ -1518,6 +1570,7 @@ var tablePrimaryKeys = map[string][]string{
 	"crl_versions":           {"host"},
 	"leader_election":        {"key"},
 	"vm_locks":               {"vm_name"},
+	"runtime_action_proofs":  {"id"},
 	"rebalance_proposals":    {"id"},
 	"host_pci_devices":       {"host_name", "address"},
 	"images":                 {"name"},
@@ -1747,6 +1800,9 @@ var schemaMigrations = []string{
 	`ALTER TABLE networks ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE storage_pools ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE volumes ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+	// v38: split-brain hardening (see History v38). Links a pending start to its
+	// runtime_action_proofs row; '' = no in-flight proof-gated action.
+	`ALTER TABLE vms ADD COLUMN pending_action_id TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -1820,6 +1876,7 @@ var alterVersions = []int{
 	34, 34, // containers.create_spec, containers.relocate_token
 	36, 36, // ip_allocations.owner_kind, ip_allocations.owner_host
 	37, 37, 37, // networks.project, storage_pools.project, volumes.project
+	38, // vms.pending_action_id
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -1837,6 +1894,7 @@ var createTableUnits = []struct {
 	{32, "recovery_code_sets"}, {32, "user_2fa_sets"},
 	{33, "host_runtime_usage"},
 	{35, "container_interfaces"},
+	{38, "runtime_action_proofs"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

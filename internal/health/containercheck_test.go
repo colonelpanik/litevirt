@@ -69,6 +69,7 @@ func (f *fakeCtRuntime) ImportContainer(ctx context.Context, name string, r io.R
 	_, err := io.Copy(io.Discard, r)
 	return err
 }
+func (f *fakeCtRuntime) ContainerExists(name string) (bool, error) { return false, nil }
 func (f *fakeCtRuntime) RevertContainer(ctx context.Context, name string, r io.Reader) error {
 	_, err := io.Copy(io.Discard, r)
 	return err
@@ -318,6 +319,62 @@ func TestContainerCheck_RelocateRecreate(t *testing.T) {
 	fresh := mustGetCt(t, db, "ct1")
 	if fresh.State != "running" || fresh.StateDetail != "" {
 		t.Errorf("after recreate state=%q detail=%q, want running/'' (marker cleared)", fresh.State, fresh.StateDetail)
+	}
+}
+
+// Defense-in-depth: a relocate-recreate container carrying a relocate_token (marker)
+// with NO gate wired fails CLOSED — no recreate — since we can't verify quorum or
+// validate the proof. (A markerless relocate-recreate still proceeds; see above.)
+func TestContainerCheck_RelocateRecreate_MarkerNilGateFailsClosed(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail:   corrosion.ContainerRelocateRecreateDetail,
+		Image:         "alpine:3.19",
+		RelocateToken: "tok-1", // marker present
+	})
+
+	c := NewContainerChecker("node1", db, rt) // NO gate wired
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if rt.startCount("ct1") != 0 {
+		t.Fatalf("relocate_token marker with no gate must fail closed (no recreate), started=%d", rt.startCount("ct1"))
+	}
+	// The pending/relocate-recreate row is left intact for a later (gated) retry.
+	fresh := mustGetCt(t, db, "ct1")
+	if fresh.State != "pending" || fresh.StateDetail != corrosion.ContainerRelocateRecreateDetail {
+		t.Fatalf("row mutated on fail-closed: state=%q detail=%q; want pending/relocate-recreate", fresh.State, fresh.StateDetail)
+	}
+}
+
+// Post-activation, a relocate-recreate row with NO token is a stale / pre-activation
+// / hand-mutated coordinator transfer — refused (proof_missing), not recreated
+// proof-less, even with quorum held.
+func TestContainerCheck_RelocateRecreate_EnforcedMarkerlessRefused(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "alpine:3.19", // NO RelocateToken
+	})
+
+	var refused []string
+	c := NewContainerChecker("node1", db, rt)
+	c.SetGate(fakeGate{exec: GateResult{OK: true}, active: true}) // enforced + quorum held
+	c.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if rt.startCount("ct1") != 0 {
+		t.Fatalf("enforced token-less relocate-recreate must be refused, not recreated (started=%d)", rt.startCount("ct1"))
+	}
+	if len(refused) != 1 || refused[0] != ReasonProofMissing {
+		t.Fatalf("refusal=%v; want [proof_missing]", refused)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"time"
@@ -135,7 +136,35 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 	// Sourcing it from the DB-applied schema would make every node report the
 	// pre-staged forward version before any binary swap and wrongly think it's
 	// behind, defeating pre-stage. See corrosion.EffectiveDBSchema.
-	return &pb.PingResponse{HostName: s.hostName, Version: s.version, SchemaVersion: int32(corrosion.CurrentSchemaVersion)}, nil
+	return &pb.PingResponse{
+		HostName:      s.hostName,
+		Version:       s.version,
+		SchemaVersion: int32(corrosion.CurrentSchemaVersion),
+		// Split-brain-hardening feature tokens this build supports. Read via a
+		// fresh Ping to compute cluster-wide activation of fail-closed checks.
+		Capabilities: s.advertisedCapabilities(),
+	}, nil
+}
+
+// PeerCapabilities fresh-Pings a peer (or short-circuits for self) and returns
+// its advertised split-brain-hardening capability tokens. It is injected into
+// the health checker (SetPeerPinger) so cluster-wide activation is computed from
+// live reachability, never from stale replicated rows. An unreachable peer
+// returns an error so the caller can fail closed.
+func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, error) {
+	if host == s.hostName {
+		return s.advertisedCapabilities(), nil
+	}
+	c, closeConn, err := s.dialPeer(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+	resp, err := c.Ping(ctx, &pb.PingRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetCapabilities(), nil
 }
 
 // DrainHost marks the host as draining and migrates all its VMs to healthy hosts.
@@ -150,6 +179,43 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	h, err := corrosion.GetHost(ctx, s.db, req.Name)
 	if err != nil || h == nil {
 		return status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	}
+
+	// Drain must run ON the host being drained: only there is this daemon the SOURCE
+	// of the host's VMs, so it can STOP each VM before reassigning ownership (a
+	// reassign WITHOUT a source stop is split-brain) and gate on the source's local
+	// quorum. Forward the whole stream to req.Name if we're not it.
+	if req.Name != s.hostName {
+		client, conn, cerr := s.peerClient(ctx, req.Name)
+		if cerr != nil {
+			return status.Errorf(codes.Unavailable, "cannot reach drain host %s: %v", req.Name, cerr)
+		}
+		defer conn.Close()
+		remote, rerr := client.DrainHost(ctx, req)
+		if rerr != nil {
+			return rerr
+		}
+		for {
+			msg, rerr := remote.Recv()
+			if rerr != nil {
+				if rerr == io.EOF {
+					return nil
+				}
+				return rerr
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Split-brain gate (Phase 1): draining moves this host's VMs to peers (runtime-
+	// ownership moves), so the SOURCE must hold local quorum once enforced — else an
+	// isolated host could evacuate its VMs onto peers without quorum. Checked before
+	// marking "draining" so a refusal is a clean no-op. Fail-open until cluster-wide.
+	if reason, refused := s.execGateRefused(ctx); refused {
+		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		return status.Errorf(codes.FailedPrecondition, "drain refused: %s", reason)
 	}
 
 	if err := corrosion.UpdateHostState(ctx, s.db, req.Name, "draining"); err != nil {
@@ -301,14 +367,29 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	unlock := s.lockVM(vm.Name)
 	defer unlock()
 
-	// Re-read state under lock — skip if VM is mid-backup.
+	// Re-read under lock and act on the CURRENT row, not the queued snapshot:
+	// ownership or state may have changed since the drain job was queued, and a stale
+	// snapshot could otherwise live-migrate / cold-reassign a VM this daemon no longer
+	// owns (split-brain). Everything below uses `fresh`.
 	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
-	if err == nil && fresh != nil && fresh.State == "backing-up" {
-		return &pb.DrainProgress{
-			VmName: vm.Name,
-			Status: "skipped",
-			Error:  "active backup in progress — re-run drain after backup completes",
-		}
+	if err != nil || fresh == nil {
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			Error: "VM no longer exists"}
+	}
+	if fresh.State == "backing-up" {
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			Error: "active backup in progress — re-run drain after backup completes"}
+	}
+	// Only drain a VM we still OWN, in a drainable state. Never act on one that moved
+	// off this host (or changed state) after the job was queued — a reassign of a VM
+	// running elsewhere would double-run it.
+	if fresh.HostName != s.hostName {
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			Error: "VM no longer owned by this host (moved since drain was queued)"}
+	}
+	if fresh.State != "running" && fresh.State != "stopped" {
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			Error: fmt.Sprintf("VM is %s — not drainable", fresh.State)}
 	}
 
 	progress := &pb.DrainProgress{
@@ -333,15 +414,29 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// VMs REGARDLESS of storage type (NVRAM is host-local even on shared disks) and
 	// point the operator at explicit migration, which captures firmware quiescently
 	// and transfers it (G1).
-	if usesFirmwareState(vm.Spec) {
+	if usesFirmwareState(fresh.Spec) {
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
 			Error: "Secure Boot / vTPM VM can't be drained automatically (its firmware state isn't transferred) — stop it and migrate it explicitly (`lv migrate " + vm.Name + " --strategy=cold`), which carries the firmware",
 		}
 	}
 
-	if vm.State == "running" && !hasLocalOnly && vm.HostName == s.hostName {
-		// Live migrate — disks are on shared storage.
+	// Split-brain gate, PER-VM re-check: DrainHost gated once up front, but drain is
+	// long-running and batch-oriented, so quorum can be lost between VMs. Re-check on
+	// the source right before THIS VM's irreversible move (live-migrate, or cold
+	// shutdown+reassign below) so a mid-drain quorum loss stops further moves. Placed
+	// after the fresh-row read and before any runtime/ownership mutation. Fail-open
+	// until split_brain_gate_v1 is cluster-wide.
+	if reason, refused := s.execGateRefused(ctx); refused {
+		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		return &pb.DrainProgress{
+			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			Error: "drain refused: " + reason,
+		}
+	}
+
+	if fresh.State == "running" && !hasLocalOnly {
+		// Live migrate — disks are on shared storage. (Ownership confirmed above.)
 		progress.Strategy = pb.MigrateStrategy_MIGRATE_LIVE
 		dconnuri := fmt.Sprintf("qemu+tls://%s/system", target.Address)
 		if err := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true}); err != nil {
@@ -356,9 +451,23 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		}
 	}
 
-	// Cold migration: stop on source, reassign to target.
+	// Split-brain gate, re-check before the COLD fallback: a failed live migration
+	// above can run long enough to lose quorum, and cold migration shuts the VM down
+	// and reassigns ownership (irreversible). Re-check so a quorum loss during the
+	// live attempt stops the fallback. (Cheap/redundant on the direct-cold path, where
+	// the per-VM check above just ran with no long op since.) On refusal the VM is
+	// left running on the source (live migration failure leaves the source domain up).
+	if reason, refused := s.execGateRefused(ctx); refused {
+		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		return &pb.DrainProgress{
+			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			Error: "drain refused: " + reason,
+		}
+	}
+
+	// Cold migration: stop on source (we own it), reassign to target.
 	progress.Strategy = pb.MigrateStrategy_MIGRATE_COLD
-	if vm.State == "running" && vm.HostName == s.hostName {
+	if fresh.State == "running" {
 		if err := s.virt.ShutdownDomain(vm.Name); err != nil {
 			slog.Warn("shutdown failed during drain", "vm", vm.Name, "error", err)
 			progress.Status = "error"
@@ -368,6 +477,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	}
 
 	// Reassign VM to target host. Target daemon will pick it up and start it.
+	// Ownership was confirmed above (fresh.HostName == s.hostName), so this never
+	// yanks a VM running elsewhere.
 	if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, target.Name, "stopped"); err != nil {
 		progress.Status = "error"
 		progress.Error = err.Error()

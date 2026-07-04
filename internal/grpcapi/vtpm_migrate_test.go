@@ -340,7 +340,7 @@ func TestDrainOneVM_RefusesFirmwareVM(t *testing.T) {
 func TestPromoteReplica_RefusesFirmwareVM(t *testing.T) {
 	s := testServer(t)
 	vm := &corrosion.VMRecord{Name: "fw", HostName: s.hostName, Spec: `{"name":"fw","secure_boot":true,"tpm":true,"uuid":"u1"}`}
-	err := s.promoteResolved(context.Background(), &pb.PromoteReplicaRequest{VmName: "fw"}, vm, func(*pb.PromoteReplicaProgress) error { return nil })
+	err := s.promoteResolved(context.Background(), &pb.PromoteReplicaRequest{VmName: "fw"}, vm, false, func(*pb.PromoteReplicaProgress) error { return nil })
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition promoting an SB/vTPM VM, got %v", err)
 	}

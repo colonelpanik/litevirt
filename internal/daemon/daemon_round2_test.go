@@ -27,6 +27,43 @@ func TestLoadConfig_TabIndented(t *testing.T) {
 	}
 }
 
+// The Phase-2 VIP self-demote timings must both be positive (majority reclaim is
+// proof-gated, so there is no demote-vs-takeover invariant — just sane durations).
+func TestLoadConfig_VIPTimingInvariant(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	// A zero keepalived-stop timeout is nonsensical (DemoteAll would give up instantly).
+	yaml := "host_name: \"h\"\nquorum_loss_demote_after_sec: 12\nkeepalived_stop_timeout_sec: 0\n"
+	if err := os.WriteFile(configPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITEVIRT_CONFIG", configPath)
+
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected LoadConfig to reject a non-positive VIP self-demote timing")
+	} else if !strings.Contains(err.Error(), "VIP self-demote timing") {
+		t.Errorf("error = %q, want it to mention the VIP self-demote timing", err.Error())
+	}
+}
+
+// The defaults are positive and load cleanly.
+func TestLoadConfig_VIPTimingDefaultsValid(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("host_name: \"h\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITEVIRT_CONFIG", configPath)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig with defaults: %v", err)
+	}
+	if cfg.QuorumLossDemoteAfterSec != 12 || cfg.KeepalivedStopTimeoutSec != 3 {
+		t.Errorf("unexpected VIP timing defaults: %+v", cfg)
+	}
+}
+
 func TestLoadConfig_WhitespaceHostName(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

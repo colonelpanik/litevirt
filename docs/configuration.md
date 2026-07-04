@@ -63,6 +63,20 @@ dns_domain: "litevirt.local"
 # (split-brain risk). Override with LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1.
 watchdog_dev: ""
 
+# Load-balancer VIP split-brain safety (see migration-failover.md).
+# quorum_loss_demote_after_sec: sustained local quorum loss before an isolated
+#   LB host stands its own VIPs down (must be > 0). Default 12.
+# keepalived_stop_timeout_sec: how long the stand-down waits for keepalived to
+#   confirm stopped before escalating (must be > 0). Default 3.
+# no_quorum_vip_policy: how the majority reclaims a VIP whose holder can't be
+#   reached or proven released. Only "safe" is accepted (empty → safe): reclaim
+#   ONLY on a release proof, else leave the VIP down + alert (never a blind
+#   takeover). A weaker takeover-without-proof tier is intentionally not
+#   implemented; recover a dead unreachable holder with `lv host fence-confirm`.
+quorum_loss_demote_after_sec: 12
+keepalived_stop_timeout_sec: 3
+no_quorum_vip_policy: safe
+
 # Peers to join on startup. At least one existing host.
 join_peers:
   - "10.0.50.10:7946"

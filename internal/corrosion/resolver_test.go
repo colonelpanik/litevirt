@@ -24,6 +24,9 @@ func TestCapabilityMap_Bijection(t *testing.T) {
 		repaired[n] = true
 	}
 	for n := range repaired {
+		if customMergeTables[n] {
+			continue // bespoke MONOTONE merge (customMergeTables) — bypasses the LWW resolver
+		}
 		if _, ok := capabilityMap[n]; !ok {
 			t.Errorf("repaired table %q has no capabilityMap entry — assign it a resolver category", n)
 		}
@@ -32,22 +35,32 @@ func TestCapabilityMap_Bijection(t *testing.T) {
 		if !repaired[n] {
 			t.Errorf("capabilityMap has %q, which is not in tableNames/sensitiveTableNames — remove it or add it to a lane", n)
 		}
+		if customMergeTables[n] {
+			t.Errorf("capabilityMap has %q, which uses the bespoke customMergeTables merge — it must NOT go through the LWW resolver", n)
+		}
 	}
 }
 
 // TestCapabilityMap_PartitionsSchema: every CREATE-TABLE in the schema is in
-// EXACTLY ONE of {capabilityMap, antiEntropyExcluded}. A new table can neither
-// silently get a resolver nor silently be excluded — it must be explicitly
-// placed.
+// EXACTLY ONE of {capabilityMap (LWW resolver), customMergeTables (bespoke
+// monotone merge), antiEntropyExcluded}. A new table can neither silently get a
+// resolver nor silently be excluded — it must be explicitly placed.
 func TestCapabilityMap_PartitionsSchema(t *testing.T) {
 	for _, tbl := range schemaDDLTables() {
 		_, resolved := capabilityMap[tbl]
 		_, excluded := antiEntropyExcluded[tbl]
+		custom := customMergeTables[tbl]
+		n := 0
+		for _, in := range []bool{resolved, custom, excluded} {
+			if in {
+				n++
+			}
+		}
 		switch {
-		case resolved && excluded:
-			t.Errorf("table %q is both in capabilityMap and antiEntropyExcluded — pick one", tbl)
-		case !resolved && !excluded:
-			t.Errorf("table %q is in neither capabilityMap nor antiEntropyExcluded — assign a category or exclude with a reason", tbl)
+		case n > 1:
+			t.Errorf("table %q is in more than one of {capabilityMap, customMergeTables, antiEntropyExcluded} — pick one", tbl)
+		case n == 0:
+			t.Errorf("table %q is in none of {capabilityMap, customMergeTables, antiEntropyExcluded} — assign a category or exclude with a reason", tbl)
 		}
 	}
 }
@@ -109,8 +122,8 @@ func resolve(t *testing.T, table string, cols []string, local, incoming []interf
 func TestResolver_RuntimeOwnedHostName(t *testing.T) {
 	cols := []string{"name", "host_name", "updated_at"}
 	c, sm, keepLocal, unresolved := resolve(t, "vms", cols,
-		[]interface{}{"db1", "docker002", "T"},
-		[]interface{}{"db1", "docker003", "T"})
+		[]interface{}{"db1", "node-2", "T"},
+		[]interface{}{"db1", "node-3", "T"})
 	if !keepLocal || !unresolved {
 		t.Fatalf("vms host_name split must be unresolved+keep-local, got keepLocal=%v unresolved=%v", keepLocal, unresolved)
 	}
@@ -243,8 +256,8 @@ func TestUnresolvedTracker_DistinctOnce(t *testing.T) {
 	sm := &fakeSyncMetrics{}
 	c.SetSyncMetrics(sm)
 	cols := []string{"name", "host_name", "updated_at"}
-	a := []interface{}{"db1", "docker002", "T"}
-	b := []interface{}{"db1", "docker003", "T"}
+	a := []interface{}{"db1", "node-2", "T"}
+	b := []interface{}{"db1", "node-3", "T"}
 
 	// Same divergence observed repeatedly → counted once.
 	for i := 0; i < 5; i++ {
@@ -259,7 +272,7 @@ func TestUnresolvedTracker_DistinctOnce(t *testing.T) {
 
 	// The content changes (a real new write) → re-evaluated, counted again (the
 	// monotonic counter), but it's the SAME row so the current gauge stays 1.
-	b2 := []interface{}{"db1", "docker004", "T"}
+	b2 := []interface{}{"db1", "node-4", "T"}
 	c.resolveTie("vms", cols, a, b2, []int{0}, pathAE)
 	if len(sm.tieUnresolved) != 2 {
 		t.Fatalf("a changed divergence must re-count, got metric=%d", len(sm.tieUnresolved))
@@ -371,8 +384,8 @@ func TestResolver_OpaqueDefinitionUnresolved(t *testing.T) {
 
 	// A differing spec at a tie → unresolved, category "opaque".
 	_, sm, keepLocal, unresolved := resolve(t, "vms", vmCols,
-		[]interface{}{"db1", "docker002", "_default", `{"cpu":4,"x":1}`, "T"},
-		[]interface{}{"db1", "docker002", "_default", `{"cpu":4,"x":2}`, "T"})
+		[]interface{}{"db1", "node-2", "_default", `{"cpu":4,"x":1}`, "T"},
+		[]interface{}{"db1", "node-2", "_default", `{"cpu":4,"x":2}`, "T"})
 	if !keepLocal || !unresolved || len(sm.tieUnresolved) != 1 || sm.tieUnresolved[0] != "vms/ae/opaque" {
 		t.Fatalf("a differing vms.spec must be unresolved (opaque), got keepLocal=%v unresolved=%v track=%v", keepLocal, unresolved, sm.tieUnresolved)
 	}
@@ -380,8 +393,8 @@ func TestResolver_OpaqueDefinitionUnresolved(t *testing.T) {
 	// The exact prod shape: a SHORTER stale spec must NOT win over a longer live
 	// one (content-max would pick it by length prefix) — it must be unresolved.
 	_, _, keep2, unres2 := resolve(t, "vms", vmCols,
-		[]interface{}{"db1", "docker002", "_default", strings.Repeat("x", 1149), "T"}, // live, longer
-		[]interface{}{"db1", "docker002", "_default", strings.Repeat("y", 963), "T"})  // stale, shorter
+		[]interface{}{"db1", "node-2", "_default", strings.Repeat("x", 1149), "T"}, // live, longer
+		[]interface{}{"db1", "node-2", "_default", strings.Repeat("y", 963), "T"})  // stale, shorter
 	if !keep2 || !unres2 {
 		t.Fatalf("live-vs-stale spec tie must be unresolved (no silent downgrade), got keepLocal=%v unresolved=%v", keep2, unres2)
 	}
@@ -398,8 +411,8 @@ func TestResolver_OpaqueDefinitionUnresolved(t *testing.T) {
 	// A NON-opaque difference (same spec, a benign scalar differs) still converges.
 	benignCols := []string{"name", "host_name", "project", "spec", "state", "updated_at"}
 	_, sm4, _, unres4 := resolve(t, "vms", benignCols,
-		[]interface{}{"db1", "docker002", "_default", `{"cpu":4}`, "running", "T"},
-		[]interface{}{"db1", "docker002", "_default", `{"cpu":4}`, "paused", "T"})
+		[]interface{}{"db1", "node-2", "_default", `{"cpu":4}`, "running", "T"},
+		[]interface{}{"db1", "node-2", "_default", `{"cpu":4}`, "paused", "T"})
 	if unres4 || len(sm4.tieBreaks) != 1 || sm4.tieBreaks[0] != "vms/content_max/local" {
 		t.Fatalf("an equal-spec tie differing only in a benign column must still converge, got unresolved=%v breaks=%v", unres4, sm4.tieBreaks)
 	}

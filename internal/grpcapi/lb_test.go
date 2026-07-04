@@ -254,8 +254,8 @@ func TestApplyLB_DefaultAlgorithm(t *testing.T) {
 // --- RemoveLB ---
 
 func TestRemoveLB_MissingName(t *testing.T) {
-	s := testServer(t)
-	ctx := adminCtx()
+	s := newPeerAuthServer(t) // hostName "self", knows host "peer-1"
+	ctx := mtlsCtx("peer-1")  // RemoveLB is peer-only
 
 	_, err := s.RemoveLB(ctx, &pb.RemoveLBRequest{})
 	if err == nil {
@@ -266,9 +266,17 @@ func TestRemoveLB_MissingName(t *testing.T) {
 	}
 }
 
+// RemoveLB is a peer-only RPC: a non-peer (operator) caller is refused.
+func TestRemoveLB_RejectsNonPeer(t *testing.T) {
+	s := newPeerAuthServer(t)
+	if _, err := s.RemoveLB(adminCtx(), &pb.RemoveLBRequest{LbName: "x"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied (peer-only)", status.Code(err))
+	}
+}
+
 func TestRemoveLB_NonExistent(t *testing.T) {
-	s := testServer(t)
-	ctx := adminCtx()
+	s := newPeerAuthServer(t)
+	ctx := mtlsCtx("peer-1")
 
 	// RemoveLB for a name that was never applied should still succeed
 	// (lb.Manager.Remove is idempotent).

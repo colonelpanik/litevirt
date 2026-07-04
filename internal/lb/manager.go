@@ -243,7 +243,18 @@ func killProcByConfig(binary, cfgPath string) {
 	}
 }
 
-// Remove stops and removes LB instances for the given name.
+// removeKeepalivedStopTimeout bounds how long Remove waits to CONFIRM keepalived is
+// gone before giving up (and reporting an error). keepalived normally exits well within
+// this; the ceiling only bites a stuck instance — exactly the case we must not paper over.
+const removeKeepalivedStopTimeout = 5 * time.Second
+
+// Remove stops and removes LB instances for the given name. keepalived — which owns the
+// VIP and, as a VRRP participant, could re-assert it or become master — is stopped with
+// CONFIRMED semantics: SIGTERM then SIGKILL the tracked + config-bound processes and
+// VERIFY none survive. If it can't be confirmed stopped, Remove returns an error AND
+// keeps the keepalived config (so DemoteAll's orphan sweep can still find it and the VIP
+// tuple isn't lost) — the Phase-2 stand-down turns that error into a refused takeover, so
+// a surviving VRRP backup can never pass as "released". haproxy/conntrackd are best-effort.
 func (m *Manager) Remove(ctx context.Context, name string) error {
 	// Same key as Apply so teardown can't interleave with an in-flight apply
 	// (which would resurrect what we're tearing down / orphan a process).
@@ -251,37 +262,51 @@ func (m *Manager) Remove(ctx context.Context, name string) error {
 	lk.Lock()
 	defer lk.Unlock()
 
-	keepalivedPid := filepath.Join(m.runDir, name+"-keepalived.pid")
-	pidFiles := []string{
+	// Confirm keepalived is truly stopped FIRST (it holds/claims the VIP).
+	kaErr := m.stopKeepalivedConfirmed(name, removeKeepalivedStopTimeout)
+
+	// haproxy + conntrackd teardown (best-effort — they don't hold the VIP).
+	for _, pidFile := range []string{
 		filepath.Join(m.runDir, name+"-haproxy.pid"),
-		keepalivedPid,
 		filepath.Join(m.runDir, name+"-conntrackd.pid"),
-	}
-	// keepalived's vrrp/checkers children have their own per-LB pidfiles now.
-	pidFiles = append(pidFiles, keepalivedChildPidFiles(keepalivedPid)...)
-	for _, pidFile := range pidFiles {
+	} {
 		killByPidFile(pidFile)
 	}
-
-	// Sweep any haproxy/keepalived still bound to this LB's config file. Reloads
-	// and racing restarts (haproxy `-sf`, repeated applyLBFromSpec) can leave a
-	// sibling the pidfile no longer tracks; this catches them so teardown leaves
-	// no orphaned process (killing a keepalived parent reaps its children too).
+	// Sweep any haproxy still bound to this LB's config file (reload/restart siblings the
+	// pidfile no longer tracks). keepalived was already handled with confirmation above.
 	killProcByConfig("haproxy", filepath.Join(m.configDir, name+"-haproxy.cfg"))
-	killProcByConfig("keepalived", filepath.Join(m.configDir, name+"-keepalived.conf"))
 
-	// Remove config files.
-	for _, f := range []string{
+	// Remove config files. Keep the keepalived config if it couldn't be confirmed
+	// stopped — deleting it would orphan the survivor (DemoteAll's glob wouldn't see it).
+	cfgFiles := []string{
 		filepath.Join(m.configDir, name+"-haproxy.cfg"),
-		filepath.Join(m.configDir, name+"-keepalived.conf"),
 		filepath.Join(m.configDir, name+"-conntrackd.conf"),
 		filepath.Join(m.configDir, name+"-notify.sh"),
-	} {
+	}
+	if kaErr == nil {
+		cfgFiles = append(cfgFiles, filepath.Join(m.configDir, name+"-keepalived.conf"))
+	}
+	for _, f := range cfgFiles {
 		os.Remove(f)
 	}
 
+	if kaErr != nil {
+		return fmt.Errorf("remove LB %q: keepalived not confirmed stopped: %w", name, kaErr)
+	}
 	slog.Info("LB removed", "name", name)
 	return nil
+}
+
+// HasLB reports whether this host is a CONFIGURED PARTICIPANT for the LB: it has a
+// rendered keepalived config OR a running keepalived bound to it. This finds VRRP
+// BACKUPS (no VIP assigned, but still able to become master), which a kernel VIP-address
+// check misses — the signal Phase 2 needs to resolve true membership for hosts=[] LBs.
+func (m *Manager) HasLB(name string) bool {
+	cfgPath := filepath.Join(m.configDir, name+"-keepalived.conf")
+	if _, err := os.Stat(cfgPath); err == nil {
+		return true
+	}
+	return len(keepalivedPidsForConfig(cfgPath)) > 0
 }
 
 // SetBackendEnabled enables or disables a backend in HAProxy via its stats socket.

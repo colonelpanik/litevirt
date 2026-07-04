@@ -90,6 +90,17 @@ func (e *RebalanceExecutor) RunOnce(ctx context.Context) {
 	if !e.rb.HoldsLease(ctx) {
 		return
 	}
+	// Split-brain gate (Phase 1): the CRDT rebalance lease can be "held" on both
+	// sides of a partition, so it can't authorize an automated ownership move alone.
+	// Once enforced, require DecisionGate (quorum + coordinator-eligible) too, so a
+	// partitioned leader can't rebalance-migrate VMs on stale placement data without
+	// quorum. Fail-open until split_brain_gate_v1 is cluster-wide. reapStale (below)
+	// is local bookkeeping, not a runtime move, so it stays outside the gate.
+	if reason, refused := e.svc.decideGateRefused(ctx); refused {
+		slog.Info("rebalance executor: decision gate refused (no quorum) — skipping tick", "reason", reason)
+		e.svc.noteGateRefused(corrosion.ActionReschedule, reason)
+		return
+	}
 	e.reapStale(ctx)
 
 	maxConcurrent, maxPerHour, _ := scheduler.ClusterRebalanceBudget(ctx, e.db)

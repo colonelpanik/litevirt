@@ -48,6 +48,10 @@ type VMRecord struct {
 	// IsTemplate marks a VM that can't start; its disks are immutable clone
 	// sources (Proxmox-style template).
 	IsTemplate bool
+	// PendingActionID links a state='pending' transition to the
+	// runtime_action_proofs row authorizing the start (split-brain hardening,
+	// v38). Empty when no proof-gated action is in flight.
+	PendingActionID string
 }
 
 // InterfaceRecord represents a VM network interface.
@@ -193,7 +197,8 @@ func GetVM(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT name, stack_name, host_name, spec, state, state_detail,
 			cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
-			COALESCE(is_template, 0) AS is_template, created_at, updated_at
+			COALESCE(is_template, 0) AS is_template,
+			COALESCE(pending_action_id, '') AS pending_action_id, created_at, updated_at
 		 FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
@@ -204,18 +209,19 @@ func GetVM(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 
 	r := rows[0]
 	return &VMRecord{
-		Name:        r.String("name"),
-		StackName:   r.String("stack_name"),
-		HostName:    r.String("host_name"),
-		Spec:        r.String("spec"),
-		State:       r.String("state"),
-		StateDetail: r.String("state_detail"),
-		CPUActual:   r.Int("cpu_actual"),
-		MemActual:   r.Int("mem_actual"),
-		Project:     r.String("project"),
-		IsTemplate:  r.Int("is_template") == 1,
-		CreatedAt:   r.String("created_at"),
-		UpdatedAt:   r.String("updated_at"),
+		Name:            r.String("name"),
+		StackName:       r.String("stack_name"),
+		HostName:        r.String("host_name"),
+		Spec:            r.String("spec"),
+		State:           r.String("state"),
+		StateDetail:     r.String("state_detail"),
+		CPUActual:       r.Int("cpu_actual"),
+		MemActual:       r.Int("mem_actual"),
+		Project:         r.String("project"),
+		IsTemplate:      r.Int("is_template") == 1,
+		PendingActionID: r.String("pending_action_id"),
+		CreatedAt:       r.String("created_at"),
+		UpdatedAt:       r.String("updated_at"),
 	}, nil
 }
 

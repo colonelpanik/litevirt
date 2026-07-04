@@ -629,6 +629,15 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
 	}
 
+	// Split-brain gate note (Phase 1): CreateVM is DELIBERATELY NOT gated. Unlike
+	// StartVM/RestartVM/MigrateVM/failover (which bring an EXISTING, possibly
+	// stale-owned VM to running and so risk a double-run), a create mints a BRAND-NEW
+	// VM with a unique name and no prior/other owner — there is no ownership contest
+	// to arbitrate, so it can't double-run. Gating it would only block new workloads
+	// on a quorum-degraded node with zero safety benefit. The one cross-partition
+	// hazard (two operators creating the SAME name on both sides) is an operator error
+	// caught by the vms PK + owner-assert on heal, not something a quorum gate closes.
+
 	// pre_start hook — fires before the domain is started for the first time.
 	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
@@ -848,6 +857,16 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return client.StartVM(ctx, req)
 	}
 
+	// Split-brain gate (Phase 1): bringing an owned VM to running is a runtime action
+	// that, under STALE ownership (the VM was failed over elsewhere during a partition
+	// but this side's row still says stopped+here), would double-run it. Require local
+	// quorum on the SOURCE (we forwarded here) once enforced — same rationale as the
+	// automated start paths. Fail-open until split_brain_gate_v1 is cluster-wide.
+	if reason, refused := s.execGateRefused(ctx); refused {
+		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		return nil, status.Errorf(codes.FailedPrecondition, "start refused: %s", reason)
+	}
+
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, pbVM, hspec)
@@ -965,6 +984,14 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		}
 		defer conn.Close()
 		return client.RestartVM(ctx, req)
+	}
+
+	// Split-brain gate (Phase 1): a restart (destroy+start) is a runtime action on a
+	// possibly-stale-owned VM; require local quorum on the SOURCE (we forwarded here)
+	// once enforced. Fail-open until split_brain_gate_v1 is cluster-wide.
+	if reason, refused := s.execGateRefused(ctx); refused {
+		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		return nil, status.Errorf(codes.FailedPrecondition, "restart refused: %s", reason)
 	}
 
 	// Destroy then start

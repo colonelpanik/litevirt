@@ -65,7 +65,7 @@ func (s *Server) pushManifestToStaging(ctx context.Context, client pb.LiteVirtCl
 // mdPairs are appended to the outgoing context for the RestoreContainer call
 // (migrate-from for cold migrate, relocate-token for failover) — never to the
 // push, which is authenticated by the peer host cert alone.
-func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, timestamp string, start bool, mdPairs ...string) (corrosion.RestoreOutcome, error) {
+func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, timestamp string, start bool, proof *pb.RuntimeActionProof, mdPairs ...string) (corrosion.RestoreOutcome, error) {
 	if s.migrateRestoreOverride != nil {
 		// Test seam (shared by migrate + failover): return the classified outcome
 		// without a second daemon.
@@ -94,7 +94,7 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 		switch {
 		case perr == nil:
 			rs, e := c.RestoreContainer(octx, &pb.RestoreContainerRequest{
-				StagingToken: token, Name: name, Timestamp: timestamp, HostName: target, Start: start,
+				StagingToken: token, Name: name, Timestamp: timestamp, HostName: target, Start: start, Proof: proof,
 			})
 			if e != nil {
 				return corrosion.RestoreNotAttempted, e
@@ -110,7 +110,7 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 	// Shared-repo fallback: the target re-opens repoName in its own config (the
 	// pre-PR-4 behavior; only works when the repo is reachable from both hosts).
 	rs, e := c.RestoreContainer(octx, &pb.RestoreContainerRequest{
-		RepoPath: repoName, Name: name, Timestamp: timestamp, HostName: target, Start: start,
+		RepoPath: repoName, Name: name, Timestamp: timestamp, HostName: target, Start: start, Proof: proof,
 	})
 	if e != nil {
 		return corrosion.RestoreNotAttempted, e

@@ -94,6 +94,37 @@ message RepairVMOwnerResponse { string host = 1; string previous_host = 2; }
 message CheckVMRuntimeRequest  { string name = 1; }
 message CheckVMRuntimeResponse { string state = 1; }
 
+// CheckVIPParticipant asks a peer whether it could HOLD or BECOME MASTER of a VIP: it
+// renders a keepalived config whose virtual_ipaddress includes vip (a VRRP participant —
+// master OR backup) OR the vip address is assigned on its kernel. This is the by-VIP
+// ownership signal Phase 2 gates on; a kernel-address-only check would miss a BACKUP
+// (holds no address yet can take over). Used for the fresh-claim absence proof and the
+// removed-holder release verify. Peer-only (mTLS).
+message CheckVIPParticipantRequest  { string vip = 1; }
+message CheckVIPParticipantResponse { bool claims = 1; }
+
+// RelayCheckVIPParticipant asks a REACHABLE peer to probe a THIRD host {target_host, vip}
+// on the caller's behalf — for the fresh-VIP absence proof when the caller can't reach the
+// target directly (e.g. a permanent directional network segmentation, but the relay can).
+// The relay does a FRESH capability Ping + FRESH CheckVIPParticipant against the target and
+// returns a tri-state; it decides NOTHING and keeps NO cache/durable proof. The caller
+// accepts a NO_CLAIMS (absence) only from a quorum-visible reachable relay, and only for the
+// current VIP proof check — every other outcome is fail-closed. Peer-only (mTLS).
+enum RelayVIPResult {
+    RELAY_VIP_UNKNOWN   = 0; // relay couldn't reach/verify the target → caller fails closed
+    RELAY_VIP_CLAIMS    = 1; // target still renders a config for / holds the VIP
+    RELAY_VIP_NO_CLAIMS = 2; // target provably does not claim the VIP
+}
+message RelayCheckVIPParticipantRequest  { string target_host = 1; string vip = 2; }
+message RelayCheckVIPParticipantResponse { RelayVIPResult result = 1; }
+
+// CheckLBPresent asks a peer whether it is a CONFIGURED PARTICIPANT for an LB — i.e. it
+// has a rendered keepalived config or a running keepalived for lb_name. Like
+// CheckVIPParticipant but keyed by LB NAME (used to resolve the true participant set for
+// implicit/legacy hosts=[] LBs before a move). Peer-only (mTLS).
+message CheckLBPresentRequest  { string lb_name = 1; }
+message CheckLBPresentResponse { bool present = 1; }
+
 // CheckContainerRuntime is the container analogue of CheckVMRuntime: it reports
 // the responding host's LOCAL LXC view of a container ({absent, defined_stopped,
 // running, unknown}) and never consults the DB. Peer-only. The container runtime
@@ -438,6 +469,10 @@ message ApplyLBRequest {
     repeated LBBackend backends = 4; // resolved backend IPs
     repeated LBPort    ports    = 5;
     repeated string    hosts    = 6; // all designated LB hosts (for VRRP priority)
+    // proof authorizes a gated LB apply / VIP takeover (split-brain hardening, v38);
+    // nil pre-activation. The LB host validates it (dest==self, action==lb_apply) and
+    // claims it single-use before applying.
+    RuntimeActionProof proof = 7;
 }
 
 // RemoveLBRequest tells a host to tear down a local LB instance.
@@ -791,6 +826,11 @@ message RestoreContainerRequest {
     // that the coordinator PushBackup-streamed the manifest into — so the target
     // never needs the source's repo over NFS. Empty = resolve repo_path normally.
     string staging_token = 6;
+    // proof is the full single-use relocation proof for a coordinator-driven
+    // restore-relocation (split-brain hardening, v38) — carried in-request so the
+    // target validates + claims it without depending on proof-row gossip timing.
+    // nil for an operator-driven restore.
+    RuntimeActionProof proof = 7;
 }
 
 message RestoreContainerProgress {
@@ -1251,6 +1291,26 @@ message PushReplicaIncrementResponse {
 }
 
 // ── Failover promotion (recover a VM from a replica) ──
+// RuntimeActionProof is the single-use authorization a coordinator (holding the
+// failover lease + local quorum) mints for a dangerous runtime-ownership action
+// and carries to the executing host — which does NOT hold the lease — so it can
+// VALIDATE the coordinator's assertions (action/target/dest) and claim it once
+// before acting (split-brain hardening, v38). Carried in-message (not just an id)
+// so validation does not depend on the proof row having replicated yet.
+message RuntimeActionProof {
+    string id               = 1;
+    string action           = 2; // reschedule | promote | relocate | lb_apply
+    string target_kind      = 3; // vm | container | lb
+    string target_name      = 4;
+    string dest_host        = 5;
+    string coordinator      = 6;
+    string lease_holder     = 7;
+    string lease_expires_at = 8;
+    int32  quorum_live      = 9;
+    int32  quorum_needed    = 10;
+    string relocation_token = 11;
+}
+
 message PromoteReplicaRequest {
     string vm_name     = 1; // VM whose replica to promote
     string target_pool = 2; // optional — pool holding the replica; defaults to the VM's replication schedule
@@ -1259,6 +1319,11 @@ message PromoteReplicaRequest {
     string new_name    = 5; // optional — promote under a new name (alongside the original)
     bool   force       = 6; // promote even if a VM by that name is still on a healthy host
     bool   no_localize  = 7; // skip blockpull (leaves the live disk backed by the replica — pins it)
+    // proof authorizes an AUTOMATED (failover-coordinator) promote when the gate is
+    // enforced; nil for operator-driven PromoteReplica. The executing host validates
+    // it (dest==self, target==vm, action==promote), upserts it, and claims it
+    // single-use before the destructive define+start.
+    RuntimeActionProof proof = 8;
 }
 message PromoteReplicaProgress {
     enum Phase {
@@ -1279,7 +1344,17 @@ message PromoteReplicaProgress {
 
 // ── Internal ──
 message PingRequest  {}
-message PingResponse { string host_name = 1; string version = 2; int32 schema_version = 3; }
+message PingResponse {
+  string host_name = 1;
+  string version = 2;
+  int32 schema_version = 3;
+  // capabilities advertises named split-brain-hardening feature tokens
+  // (e.g. "split_brain_gate_v1", "vip_demote_v1") this daemon supports.
+  // Read via a FRESH Ping (never stale replicated rows); an old peer returns an
+  // empty list and is treated as unsupported. Enforcement of a fail-closed check
+  // activates only once every enforcement-relevant member advertises its token.
+  repeated string capabilities = 4;
+}
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
 message FetchBinaryRequest {}
@@ -1563,6 +1638,9 @@ service LiteVirt {
     rpc RepairVMOwner(RepairVMOwnerRequest) returns (RepairVMOwnerResponse);
     rpc CheckVMRuntime(CheckVMRuntimeRequest) returns (CheckVMRuntimeResponse);
     rpc CheckContainerRuntime(CheckContainerRuntimeRequest) returns (CheckContainerRuntimeResponse);
+    rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
+    rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
+    rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);
     rpc CloneVM(CloneVMRequest)          returns (VM);
     rpc ConvertToTemplate(ConvertToTemplateRequest) returns (VM);
     rpc ExecVM(ExecVMRequest)            returns (ExecVMResponse);

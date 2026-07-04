@@ -2853,9 +2853,10 @@ func TestDrainHost_NotFound(t *testing.T) {
 func TestDrainHost_NoRunningVMs(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
-	insertTestHostCov(t, ctx, s.db, "drain-host", "active")
+	// Drain the LOCAL host (drain runs on the source); no VMs → clean nil return.
+	insertTestHostCov(t, ctx, s.db, "test-host", "active")
 	stream := &mockDrainStream{ctx: ctx}
-	err := s.DrainHost(&pb.DrainHostRequest{Name: "drain-host"}, stream)
+	err := s.DrainHost(&pb.DrainHostRequest{Name: "test-host"}, stream)
 	if err != nil {
 		t.Fatalf("DrainHost: %v", err)
 	}

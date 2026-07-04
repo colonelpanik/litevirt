@@ -99,6 +99,18 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 		return counts, err
 	}
 
+	// NOTE: runtime_action_proofs is DELIBERATELY NOT swept here. Unlike the inert rows
+	// above, a terminal proof is NOT resurrection-safe to delete locally: a direct-RPC
+	// executor re-seeds a carried proof via WriteActionProof (INSERT OR IGNORE) and then
+	// claims it, and a lagging prepared/in_progress copy on a partitioned peer re-merges
+	// after a local delete — either can revive a spent proof to prepared/in_progress and
+	// let its action run again (a delete is not a lattice state). Per the plan, proof-table
+	// GC MUST be tombstone-based AND gated on cluster-wide convergence ("delete only once
+	// every enforcement-relevant member has observed the terminal state"); a plain local
+	// delete is explicitly forbidden. That convergence-gated reaper is a separate follow-up
+	// (the table is empty until the split-brain gate is flipped, so there's nothing to reap
+	// pre-flip); it must not be added to this local-only sweep.
+
 	// Bounded, best-effort space reclaim (no-op without incremental auto_vacuum).
 	// A PRAGMA argument can't be a bound parameter, so format it (gcVacuumPages is
 	// a trusted int constant) — mirrors the mutation_log prune.

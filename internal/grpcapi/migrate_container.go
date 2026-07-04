@@ -304,5 +304,5 @@ func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, tim
 	// it keeps the imported NIC IPs — we handed it the IPAM leases before this call
 	// — rather than re-reserving and blanking them. The transport (PR-4 push to the
 	// target's staging repo vs. shared-repo fallback) is handled by drivePeerRestore.
-	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, migrateFromMDKey, s.hostName)
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, nil, migrateFromMDKey, s.hostName)
 }

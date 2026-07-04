@@ -3,7 +3,43 @@ package corrosion
 import (
 	"context"
 	"testing"
+	"time"
 )
+
+// HostManualFenceConfirmed trusts ONLY a recent result="manual-confirmed" row (operator
+// attestation the host is down) — not an automatic result="fenced" attempt, and not one
+// older than the window.
+func TestHostManualFenceConfirmed(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	const window = 5 * time.Minute
+
+	// No fencing_log row → not confirmed.
+	if ok, err := HostManualFenceConfirmed(ctx, c, "h1", time.Now(), window); err != nil || ok {
+		t.Fatalf("no row: ok=%v err=%v; want false/nil", ok, err)
+	}
+
+	// An automatic 'fenced' attempt (may have partially failed) must NOT count.
+	if err := InsertFenceLog(ctx, c, FenceLogRecord{ID: "f1", HostName: "h1", Method: "ipmi", Result: "fenced"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := HostManualFenceConfirmed(ctx, c, "h1", time.Now(), window); err != nil || ok {
+		t.Fatalf("automatic 'fenced' must not confirm: ok=%v err=%v", ok, err)
+	}
+
+	// A fresh operator manual-confirm → confirmed within the window.
+	if err := InsertFenceLog(ctx, c, FenceLogRecord{ID: "m1", HostName: "h2", Method: "manual", Result: "manual-confirmed"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := HostManualFenceConfirmed(ctx, c, "h2", time.Now(), window); err != nil || !ok {
+		t.Fatalf("fresh manual-confirm must confirm: ok=%v err=%v", ok, err)
+	}
+
+	// Same row, but evaluated an hour later with a 5-min window → expired (fail-closed).
+	if ok, err := HostManualFenceConfirmed(ctx, c, "h2", time.Now().Add(time.Hour), window); err != nil || ok {
+		t.Fatalf("expired manual-confirm must NOT confirm: ok=%v err=%v", ok, err)
+	}
+}
 
 func TestInsertAuditLog(t *testing.T) {
 	c := testClient(t)

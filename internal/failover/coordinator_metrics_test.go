@@ -48,6 +48,35 @@ func TestFailoverMetrics_SkipUpgrading(t *testing.T) {
 	}
 }
 
+// A self-fenced coordinator refuses to drive failover: run() returns before the lease/
+// fence logic, so a down host is NOT fenced and the skip is observable. A doomed node
+// must not arbitrate cluster ownership during its fence-timeout window.
+func TestFailoverMetrics_SelfFencedSkips(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "bad", Address: "10.0.0.99", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	downObservers(t, db, "bad", "h1", "h2", "h3")
+
+	c := newTestCoordinator("coordinator", db)
+	fm := newFakeMetrics()
+	c.Metrics = fm
+	c.SelfFenced = func() bool { return true }
+	c.run(ctx)
+
+	if got := fm.attempts[foKey(PhaseSkip, ResultSkipped, ErrSelfFenced)]; got != 1 {
+		t.Errorf("self-fenced skip counter = %d, want 1 (attempts=%v)", got, fm.attempts)
+	}
+	// No fence attempt should have run at all.
+	if got := fm.attempts[foKey(PhaseFence, ResultSuccess, errClassNone)]; got != 0 {
+		t.Errorf("a self-fenced coordinator must not fence; fence-success=%d", got)
+	}
+}
+
 // TestFailoverMetrics_FenceSuccess: a successful fence is counted (no VMs → no
 // reschedule, but the fence outcome is observable).
 func TestFailoverMetrics_FenceSuccess(t *testing.T) {

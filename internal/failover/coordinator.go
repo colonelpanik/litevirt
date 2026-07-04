@@ -12,8 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/placement"
 )
 
@@ -112,7 +114,77 @@ type Coordinator struct {
 	// Metrics, when set, counts failover decisions/outcomes/errors by
 	// phase+result+error_class (U9). Optional + nil-safe (see metrics.go).
 	Metrics Metrics
+	// Gate is the split-brain safety gate (Phase 1), implemented by *health.Checker.
+	// When set AND split_brain_gate_v1 is cluster-wide, the reschedule decide site
+	// requires DecisionGate and writes a durable, single-use runtime_action_proofs
+	// row linked to the VM's pending transition. nil / pre-activation → legacy path.
+	Gate FailoverGate
+	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
+	// it to litevirt_runtime_action_refused_total).
+	onGateRefused func(action, reason string)
+	// SelfFenced reports whether THIS node has self-fenced (tripped the watchdog) and is
+	// waiting to reboot. A doomed node must not drive ANY failover decision during that
+	// window, even if quorum transiently returns first. Wired by the daemon from the
+	// watchdog controller; nil → never fenced.
+	SelfFenced func() bool
 }
+
+// FailoverGate is the subset of *health.Checker the coordinator consults at
+// decide sites. Kept as an interface so the coordinator stays testable and the
+// gate is optional.
+type FailoverGate interface {
+	DecisionGate(ctx context.Context) health.GateResult
+	QuorumProof(ctx context.Context) (health.QuorumState, int, int)
+	// Enforced is the LATCHED enforcement decision (partition → fail closed).
+	Enforced(ctx context.Context, token string) bool
+	// PeerSupportsFresh fresh-Pings peer (UNcached) and reports whether it advertises
+	// token — used to confirm a destination can honor a proof BEFORE stamping one.
+	// Uncached so a target that regressed within the cache TTL is caught immediately.
+	PeerSupportsFresh(ctx context.Context, peer, token string) bool
+}
+
+// SetGateRefusedObserver wires the refusal metric hook (nil-safe).
+func (c *Coordinator) SetGateRefusedObserver(fn func(action, reason string)) { c.onGateRefused = fn }
+
+func (c *Coordinator) noteGateRefused(action, reason string) {
+	if c.onGateRefused != nil {
+		c.onGateRefused(action, reason)
+	}
+}
+
+// gateEnforced reports whether the split-brain gate is active cluster-wide, so
+// the coordinator must write proof-linked pending transitions. Fail-open
+// (returns false) until every enforcement-relevant member advertises the token —
+// so a mid-roll cluster keeps failing over via the legacy path.
+func (c *Coordinator) gateEnforced(ctx context.Context) bool {
+	if c.Gate == nil {
+		return false
+	}
+	return c.Gate.Enforced(ctx, capabilities.SplitBrainGateV1)
+}
+
+// destAdvertisesGate fresh-Pings dest to confirm it advertises split_brain_gate_v1
+// BEFORE the coordinator stamps a proof-bearing action there. A latched-enforcement
+// coordinator must never stamp a proof a REGRESSED/replaced target (no longer
+// advertising, e.g. downgraded) can't honor — the target would be required to
+// validate a proof it doesn't understand, or silently take the legacy path. Fail
+// closed: unconfirmed support → false → the mint site refuses.
+func (c *Coordinator) destAdvertisesGate(ctx context.Context, dest string) bool {
+	if c.Gate == nil {
+		return false
+	}
+	if dest == c.hostName {
+		// A self-fenced node advertises nothing split-brain-related (it de-advertises to
+		// peers via advertisedCapabilities); mirror that locally so it never stamps a
+		// self-targeted proof. run() already hard-gates a fenced coordinator, so this is
+		// defense-in-depth against any self-dest mint path.
+		return !c.selfFenced() && capabilities.Has(capabilities.Supported(), capabilities.SplitBrainGateV1)
+	}
+	return c.Gate.PeerSupportsFresh(ctx, dest, capabilities.SplitBrainGateV1)
+}
+
+// selfFenced reports whether THIS node has self-fenced (nil predicate → false).
+func (c *Coordinator) selfFenced() bool { return c.SelfFenced != nil && c.SelfFenced() }
 
 // NewCoordinator creates a new failover coordinator with the real fencer.
 func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
@@ -159,6 +231,14 @@ func (c *Coordinator) Start(ctx context.Context) {
 func (c *Coordinator) RunOnce(ctx context.Context) { c.run(ctx) }
 
 func (c *Coordinator) run(ctx context.Context) {
+	// Self-fence is a HARD local gate: a doomed node (waiting for the watchdog to reboot
+	// it) must not drive any failover decision during the live-but-doomed window, even if
+	// it briefly reacquires quorum/lease. Checked before the lease so a fenced node also
+	// stops renewing coordinator leadership.
+	if c.selfFenced() {
+		c.mAttempt(PhaseSkip, ResultSkipped, ErrSelfFenced)
+		return
+	}
 	// Leader election: only one coordinator may drive recovery at a time.
 	// Acquire (or renew) the lease; if another coordinator holds it, skip.
 	if !c.acquireLease(ctx) {
@@ -295,6 +375,20 @@ func (c *Coordinator) run(ctx context.Context) {
 // cluster (a container left "relocating" by an indeterminate restore or a crash),
 // independent of the fence cycle. Leader-gated by run's lease.
 func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
+	// Decide-site gate (Phase 1): resuming a relocate-restore re-keys the container row —
+	// imageRecreateOrSkip re-homes it and completeRestore tombstones the SOURCE — which is
+	// a runtime-ownership DECISION. run()'s failover lease alone is insufficient: a CRDT
+	// lease can be "held" on both sides of a partition, so a minority leader with a latched
+	// gate could re-home the row to a minority target and tombstone the source without
+	// quorum, manufacturing the two-row split Phase 6 exists to repair (execution on the
+	// target is still ExecutionGate-blocked, so no double-run — but the DB ownership
+	// diverges). Once enforced, require DecisionGate (quorum + coordinator-eligible).
+	if c.gateEnforced(ctx) {
+		if g := c.Gate.DecisionGate(ctx); !g.OK {
+			c.noteGateRefused(ActionRelocate, g.Reason)
+			return
+		}
+	}
 	cts, err := corrosion.ListContainers(ctx, c.db, "")
 	if err != nil {
 		return
@@ -476,6 +570,20 @@ func (c *Coordinator) holdLease(ctx context.Context) bool {
 	}
 	// Renew.
 	return c.acquireLease(ctx)
+}
+
+// leaseSnapshot returns the current failover-lease holder + expiry to record in a
+// proof. leader_election has no lease TERM column, so the proof captures the
+// snapshot (holder + expires_at), matching the plan's honest trust model.
+func (c *Coordinator) leaseSnapshot(ctx context.Context) (holder, expiresAt string) {
+	rows, err := c.db.Query(ctx,
+		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
+	if err != nil || len(rows) == 0 {
+		// An honesty record must not FABRICATE a holder on a read error — reporting self
+		// would falsely assert this node held the lease. Return empty (unknown).
+		return "", ""
+	}
+	return rows[0].String("holder"), rows[0].String("expires_at")
 }
 
 // recentlyFenced returns true if the fencing_log shows a successful fence for
@@ -722,6 +830,19 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		// holding it and re-homes the record. On success, move to the next VM.
 		// On failure, fall through to the policy-based reschedule below.
 		if c.Promoter != nil && c.autoPromoteEnabled(ctx, vm.Name) {
+			// Split-brain gate (Phase 1, decide site): promoting a replica is a
+			// runtime-ownership action; once enforced, re-check DecisionGate before
+			// initiating so an isolated minority coordinator can't promote. The
+			// execute-side proof (metadata-carried, single-use) is the remaining
+			// direct-RPC closeout. Fail-open until cluster-wide.
+			if c.gateEnforced(ctx) {
+				if g := c.Gate.DecisionGate(ctx); !g.OK {
+					slog.Warn("failover: decision gate refused auto-promote", "vm", vm.Name, "reason", g.Reason)
+					c.noteGateRefused(corrosion.ActionPromote, g.Reason)
+					c.mVM(ActionPromote, ResultError, ErrNoQuorum)
+					continue
+				}
+			}
 			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name); err != nil {
 				slog.Warn("failover: auto-promote failed, falling back to reschedule",
 					"vm", vm.Name, "error", err)
@@ -808,7 +929,42 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		slog.Info("failover: rescheduling VM",
 			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", policy)
 
-		if err := corrosion.UpdateVMHost(ctx, c.db, vm.Name, targetName, "pending"); err != nil {
+		if c.gateEnforced(ctx) {
+			// Enforcement active: re-check DecisionGate (quorum + coordinator-eligible;
+			// the lease is already held in this failover path) as close to the write as
+			// possible, then write a durable proof linked to the pending transition so
+			// the target's reconciler can validate + single-use-claim it before starting.
+			if g := c.Gate.DecisionGate(ctx); !g.OK {
+				slog.Warn("failover: decision gate refused reschedule", "vm", vm.Name, "reason", g.Reason)
+				c.noteGateRefused(ActionReschedule, g.Reason)
+				c.mVM(ActionReschedule, ResultError, ErrNoQuorum)
+				continue
+			}
+			// Never stamp a proof for a target that no longer advertises the gate
+			// (a regressed/replaced host that couldn't honor it) — fresh-Ping it
+			// first and refuse (fail closed) rather than reschedule there ungated.
+			if !c.destAdvertisesGate(ctx, targetName) {
+				slog.Warn("failover: reschedule target does not advertise split-brain gate — refusing (fail closed)",
+					"vm", vm.Name, "target", targetName)
+				c.noteGateRefused(ActionReschedule, health.ReasonUnsupportedCapability)
+				c.mVM(ActionReschedule, ResultError, ErrDestUngated)
+				continue
+			}
+			_, live, needed := c.Gate.QuorumProof(ctx)
+			leaseHolder, leaseExp := c.leaseSnapshot(ctx)
+			proof := corrosion.ActionProof{
+				ID: newID(), Action: corrosion.ActionReschedule, TargetKind: "vm",
+				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
+				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
+				QuorumLive: live, QuorumNeeded: needed,
+			}
+			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
+				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
+				c.mVM(ActionReschedule, ResultError, ErrDBError)
+				continue
+			}
+		} else if err := corrosion.UpdateVMHost(ctx, c.db, vm.Name, targetName, "pending"); err != nil {
+			// Legacy (pre-activation) path — unchanged.
 			slog.Error("failover: update VM host", "vm", vm.Name, "error", err)
 			c.mVM(ActionReschedule, ResultError, ErrDBError)
 			continue
@@ -843,6 +999,18 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 // of any in-flight restore-relocation (crash recovery). Shares the round-robin
 // fallbackIdx with the VM loop so placement-failure fallbacks stay spread.
 func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostRecord, candidates []corrosion.HostRecord, fallbackIdx *int) {
+	// Split-brain gate (Phase 1, decide site): once enforced, re-check DecisionGate
+	// (quorum + coordinator-eligible; lease already held in the failover path)
+	// before relocating any container off the fenced host — an isolated minority
+	// coordinator must not initiate relocation. Fail-open until cluster-wide.
+	if c.gateEnforced(ctx) {
+		if g := c.Gate.DecisionGate(ctx); !g.OK {
+			slog.Warn("failover: decision gate refused container relocation", "host", h.Name, "reason", g.Reason)
+			c.noteGateRefused(corrosion.ActionRelocate, g.Reason)
+			c.mCt(ActionRelocate, ResultError, ErrNoQuorum)
+			return
+		}
+	}
 	cts, err := corrosion.ListContainers(ctx, c.db, h.Name)
 	if err != nil {
 		slog.Error("failover: list containers", "host", h.Name, "error", err)
@@ -885,6 +1053,29 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 		// for that recovery, so if its write FAILS we must NOT proceed with the
 		// restore (an unmarked restore the next tick couldn't re-derive) — defer.
 		token := newID()
+		// Split-brain hardening: under active enforcement, mint a durable single-use
+		// proof bound to this restore token so RestoreContainer validates + claims it
+		// (dest==self + quorum) before importing/recording. Fail-open until cluster-wide.
+		if c.gateEnforced(ctx) {
+			// Never stamp a proof for a target that doesn't advertise the gate.
+			if !c.destAdvertisesGate(ctx, target) {
+				slog.Warn("failover: restore-relocation target does not advertise split-brain gate — refusing (fail closed)",
+					"container", ct.Name, "target", target)
+				c.noteGateRefused(ActionRelocate, health.ReasonUnsupportedCapability)
+				c.mCt(ActionRelocate, ResultError, ErrDestUngated)
+				return
+			}
+			proof := corrosion.ActionProof{
+				ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
+				TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
+				LeaseHolder: c.hostName, RelocationToken: token,
+			}
+			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
+				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
+				c.mCt(ActionRelocate, ResultError, ErrDBError)
+				return
+			}
+		}
 		if err := corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "relocating", corrosion.RelocateRestoreDetail(target, token)); err != nil {
 			slog.Warn("failover: failed to mark relocate-restore; deferring relocation to next tick",
 				"container", ct.Name, "error", err)
@@ -998,7 +1189,33 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 		c.mCt(ActionRelocate, ResultSkipped, ErrNoCandidates)
 		return
 	}
-	if err := corrosion.RelocateContainer(ctx, c.db, h.Name, ct.Name, target); err != nil {
+	// Split-brain hardening (Phase 1): under active enforcement, mint a durable
+	// single-use proof bound to a relocation token and stamp the token on the
+	// re-keyed row, so the target claims it by token before recreating. Fail-open
+	// (empty token, no proof) until split_brain_gate_v1 is cluster-wide.
+	relocToken := ""
+	if c.gateEnforced(ctx) {
+		// Never stamp a proof for a target that doesn't advertise the gate.
+		if !c.destAdvertisesGate(ctx, target) {
+			slog.Warn("failover: relocation target does not advertise split-brain gate — refusing (fail closed)",
+				"container", ct.Name, "target", target)
+			c.noteGateRefused(ActionRelocate, health.ReasonUnsupportedCapability)
+			c.mCt(ActionRelocate, ResultError, ErrDestUngated)
+			return
+		}
+		relocToken = newID()
+		proof := corrosion.ActionProof{
+			ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
+			TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
+			LeaseHolder: c.hostName, RelocationToken: relocToken,
+		}
+		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
+			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)
+			c.mCt(ActionRelocate, ResultError, ErrDBError)
+			return
+		}
+	}
+	if err := corrosion.RelocateContainerWithToken(ctx, c.db, h.Name, ct.Name, target, relocToken); err != nil {
 		// Includes the no-clobber guard (a same-name container appeared on the
 		// target since the check above) — never lose the source.
 		slog.Error("failover: relocate container (image-recreate)", "container", ct.Name, "error", err)

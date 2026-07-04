@@ -307,6 +307,10 @@ var capabilityMap = map[string]tableResolver{
 	"vms": {category: "runtime-owned", chain: []tieRule{
 		ruleColUnresolved("host_name", "runtime_owned"),
 		ruleColUnresolved("project", "tenancy"),
+		// v38: pending_action_id is a control-plane pointer to the authorizing
+		// runtime_action_proofs row. On an exact-ts tie a differing pointer has no
+		// safe winner (content-max could pick a stale/other proof) → unresolved.
+		ruleColUnresolved("pending_action_id", "runtime_owned"),
 		ruleTombstone(),
 		ruleAnyColUnresolved([]string{"spec"}, "opaque"), // never content-max the VM definition
 		ruleContentMax(),

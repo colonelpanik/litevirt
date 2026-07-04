@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -12,6 +15,30 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
 )
+
+// readRestoreMarker must distinguish ABSENT (→ "",nil, the safe clean+reimport path) from
+// UNREADABLE/corrupt (→ err, the caller fails closed rather than destroy an artifact a
+// different restore may own).
+func TestReadRestoreMarker(t *testing.T) {
+	s := &Server{dataDir: t.TempDir()}
+	if v, err := s.readRestoreMarker("ct1"); v != "" || err != nil {
+		t.Fatalf("absent marker → '',nil; got %q,%v", v, err)
+	}
+	if err := s.writeRestoreMarker("ct1", "proof-1"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if v, err := s.readRestoreMarker("ct1"); v != "proof-1" || err != nil {
+		t.Fatalf("present marker → 'proof-1',nil; got %q,%v", v, err)
+	}
+	// Unreadable: a directory at the marker path makes os.ReadFile fail with a non-IsNotExist
+	// error, which must surface (not collapse to "").
+	if err := os.MkdirAll(filepath.Join(s.dataDir, "ct-restore-markers", "ct2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := s.readRestoreMarker("ct2"); err == nil {
+		t.Fatalf("unreadable marker must return an error (fail closed); got %q,nil", v)
+	}
+}
 
 // TestBackupContainer_RoundTripPreservesCreateSpec proves the v34 create-spec
 // (networks/template) survives a backup→restore so a restored container — and a
@@ -165,6 +192,154 @@ func TestRestoreContainer_PreservesStopIntentWhenNotStarted(t *testing.T) {
 	rec2, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1")
 	if rec2 == nil || rec2.State != "running" || rec2.StateDetail != "" {
 		t.Fatalf("started restore should be running with no stop intent: %+v", rec2)
+	}
+}
+
+// relocationProofTokenBound: the carried proof's token and the stamped (metadata) token
+// must both be present and equal — the exact-token binding that keeps proof and row
+// provenance from diverging.
+func TestRelocationProofTokenBound(t *testing.T) {
+	cases := []struct {
+		proof, md string
+		want      bool
+	}{
+		{"tok", "tok", true},
+		{"tokA", "tokB", false}, // mismatch
+		{"", "tok", false},      // proof token missing
+		{"tok", "", false},      // metadata token missing
+		{"", "", false},         // both missing
+	}
+	for _, c := range cases {
+		if got := relocationProofTokenBound(c.proof, c.md); got != c.want {
+			t.Errorf("relocationProofTokenBound(%q,%q) = %v, want %v", c.proof, c.md, got, c.want)
+		}
+	}
+}
+
+// Enforced direct-RPC regression: a coordinator restore whose carried proof token does
+// NOT equal the relocation token in metadata (the one that would be stamped on the row)
+// must be REFUSED before claiming — proof and provenance can't diverge.
+func TestRestoreContainer_ProofTokenMustMatchStampedToken(t *testing.T) {
+	s := newPeerAuthServer(t) // hostName "self", knows peer "peer-1"
+	s.gate = fakeServerGate{execOK: true}
+	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
+
+	// mTLS + admin caller (passes requirePermPrecheck + requirePeerCert), carrying md
+	// relocate-token "tokenB" — but the proof asserts token "tokenA".
+	ctx := metadata.NewIncomingContext(mtlsAdminCtx("peer-1"), metadata.Pairs(relocateTokenMDKey, "tokenB"))
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: ctx}
+	err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: "/does/not/matter", Timestamp: "2026-07-02T10:00:00Z",
+		Proof: &pb.RuntimeActionProof{
+			Id: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+			TargetName: "ct1", DestHost: "self", RelocationToken: "tokenA",
+		},
+	}, rs)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "does not match the stamped relocation token") {
+		t.Fatalf("mismatched proof/stamp token must refuse with the token-binding error; got %v", err)
+	}
+}
+
+// setupProofRestore builds a peer-auth server with an OK exec gate, backs up a source
+// container "ct1" to a repo, then deletes the source row — leaving everything a
+// proof-gated (coordinator) restore needs. Returns the pieces the resume tests vary.
+func setupProofRestore(t *testing.T) (s *Server, rt *fakeCTRuntime, repo, ts, token, proofID string) {
+	t.Helper()
+	s = newPeerAuthServer(t) // hostName "self", knows peer "peer-1"
+	s.dataDir = t.TempDir()
+	s.gate = fakeServerGate{execOK: true}
+	rt = &fakeCTRuntime{exportPayload: []byte("rootfs")}
+	s.SetContainerRuntime(rt)
+	repo, ts, token, proofID = ctTestRepo(t), "2026-07-03T10:00:00Z", "reloc-token-1", "restore-proof-1"
+
+	ctx := adminCtx()
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "self", Name: "ct1", State: "running", Image: "alpine:3.19", Project: "acme",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{Name: "ct1", HostName: "self", RepoPath: repo, Timestamp: ts}, bk); err != nil {
+		t.Fatalf("BackupContainer: %v", err)
+	}
+	_ = corrosion.DeleteContainer(ctx, s.db, "self", "ct1")
+	return
+}
+
+func proofRestoreCtx(token string) context.Context {
+	return metadata.NewIncomingContext(mtlsAdminCtx("peer-1"), metadata.Pairs(relocateTokenMDKey, token))
+}
+
+func relocProof(proofID, token string) *pb.RuntimeActionProof {
+	return &pb.RuntimeActionProof{
+		Id: proofID, Action: corrosion.ActionRelocate, TargetKind: "container",
+		TargetName: "ct1", DestHost: "self", Coordinator: "coord", RelocationToken: token,
+	}
+}
+
+// Crash between ImportContainer and the DB-row write: the artifact exists WITH our proof
+// marker but no row. Retry must RESUME by proof — skip re-import, write the row, complete —
+// not re-import or refuse.
+func TestRestoreContainer_ResumesAfterImportCrash(t *testing.T) {
+	s, rt, repo, ts, token, proofID := setupProofRestore(t)
+	rt.existsByName = map[string]bool{"ct1": true}               // artifact already imported
+	if err := s.writeRestoreMarker("ct1", proofID); err != nil { // ...under OUR proof
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: ts, Proof: relocProof(proofID, token),
+	}, rs); err != nil {
+		t.Fatalf("resume restore: %v", err)
+	}
+	if row, _ := corrosion.GetContainer(context.Background(), s.db, "self", "ct1"); row == nil {
+		t.Fatal("resume must write the DB row")
+	}
+	if _, imported := rt.imported["ct1"]; imported {
+		t.Fatal("resume must SKIP re-import when the marker proves our proof")
+	}
+}
+
+// An existing artifact marked by a DIFFERENT restore proof must be refused (never adopted).
+func TestRestoreContainer_DifferentProofMarkerRefuses(t *testing.T) {
+	s, rt, repo, ts, token, proofID := setupProofRestore(t)
+	rt.existsByName = map[string]bool{"ct1": true}
+	if err := s.writeRestoreMarker("ct1", "a-different-proof"); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}
+	err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: ts, Proof: relocProof(proofID, token),
+	}, rs)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "different restore attempt") {
+		t.Fatalf("foreign-proof artifact must refuse; got %v", err)
+	}
+	if _, imported := rt.imported["ct1"]; imported {
+		t.Fatal("a foreign-proof artifact must not be imported over")
+	}
+}
+
+// An UNMARKED untracked leftover (crash before the marker landed) is cleaned and
+// re-imported under this proof — not adopted, not left stuck.
+func TestRestoreContainer_UnmarkedLeftoverCleanedAndReimported(t *testing.T) {
+	s, rt, repo, ts, token, proofID := setupProofRestore(t)
+	rt.existsByName = map[string]bool{"ct1": true} // exists, but NO marker written
+
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: ts, Proof: relocProof(proofID, token),
+	}, rs); err != nil {
+		t.Fatalf("unmarked leftover should be cleaned + reimported: %v", err)
+	}
+	if len(rt.deleteCalls) == 0 {
+		t.Fatal("an unmarked leftover must be DeleteContainer'd before re-import")
+	}
+	if _, imported := rt.imported["ct1"]; !imported {
+		t.Fatal("must re-import after cleaning the unmarked leftover")
+	}
+	if row, _ := corrosion.GetContainer(context.Background(), s.db, "self", "ct1"); row == nil {
+		t.Fatal("row must be written after a clean re-import")
 	}
 }
 

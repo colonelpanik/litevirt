@@ -278,3 +278,37 @@ func InsertFenceLog(ctx context.Context, c *Client, r FenceLogRecord) error {
 		r.ID, r.HostName, r.Method, r.Result, now, r.Detail,
 	)
 }
+
+// HostManualFenceConfirmed reports whether an operator has written a "manual-confirmed"
+// fencing_log row for host within (now-window, now] — the operator's attestation, via
+// `lv host fence-confirm <host>`, that they have VERIFIED the host is DOWN. It is trusted as a
+// proof-grade "the host is down" signal, distinct from an automatic result="fenced" row,
+// which is only a fence ATTEMPT that may have partially failed (so "fenced" must NOT be
+// trusted this way). Used both by failover (reschedule VMs) and by the Phase-2 VIP reclaim
+// path (an unreachable holder attested down has released its VIP).
+//
+// The recency comparison is done in Go, NOT SQL: fencing_log.timestamp is RFC3339 and
+// comparing it against SQLite datetime() text is an unreliable string compare that differs
+// between the CLI and the pure-Go engine the daemon links (see the failover coordinator's
+// fenceWithinWindow). Fail-closed: a read error returns (false, err) so a caller never
+// treats an unreadable log as a confirmation.
+func HostManualFenceConfirmed(ctx context.Context, c *Client, host string, now time.Time, window time.Duration) (bool, error) {
+	rows, err := c.Query(ctx, `SELECT result, timestamp FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		return false, err
+	}
+	cutoff := now.Add(-window)
+	for _, r := range rows {
+		if r.String("result") != "manual-confirmed" {
+			continue
+		}
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil {
+			continue
+		}
+		if ts.After(cutoff) {
+			return true, nil
+		}
+	}
+	return false, nil
+}

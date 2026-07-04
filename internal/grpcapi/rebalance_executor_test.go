@@ -61,6 +61,34 @@ func eventually(t *testing.T, cond func() bool) {
 	t.Fatal("condition not met within 2s")
 }
 
+// Once enforced, the rebalance executor requires DecisionGate ON TOP of its CRDT
+// lease: a partitioned leader (lease held, no quorum) must not migrate, and the
+// approved proposal is left untouched for a later gated retry.
+func TestRebalanceExecutor_DecisionGateRefuses(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminContext(context.Background())
+
+	insertTestHostR2(t, ctx, s.db, "src", "active")
+	insertTestHostR2(t, ctx, s.db, "dst", "active")
+	insertTestVMR2WithSpec(t, ctx, s.db, "vm-a", "src", "running", budgetSpec(2, 10))
+	insertProposal(t, ctx, s.db, "p1", "vm-a", "src", "dst", "approved")
+
+	// Enforced, but DecisionGate refuses (no quorum) — only the CRDT lease is held.
+	s.SetGate(fakeServerGate{enforced: true, decideOK: false})
+
+	var called atomic.Bool
+	e := NewRebalanceExecutor(s, "exec-host", s.db)
+	e.migrateOverride = func(_ context.Context, _, _ string) error { called.Store(true); return nil }
+	e.RunOnce(ctx)
+
+	if called.Load() {
+		t.Fatal("rebalance migration must be refused when DecisionGate is not OK (no quorum)")
+	}
+	if st, _, _ := proposalStatus(t, ctx, s.db, "p1"); st != "approved" {
+		t.Fatalf("proposal status=%q; want approved (untouched — refused before claim)", st)
+	}
+}
+
 // An approved proposal is claimed, migrated, and marked applied.
 func TestRebalanceExecutor_AppliesApproved(t *testing.T) {
 	s := testServerR2(t)

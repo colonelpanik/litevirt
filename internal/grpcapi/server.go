@@ -8,14 +8,17 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -71,6 +74,29 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// probeHolder is a test seam for the Phase-2 VIP takeover check: when non-nil it
+	// replaces the real fresh-probe of a peer holder's (reachable, supports, assigned)
+	// state. Production leaves it nil.
+	probeHolder func(ctx context.Context, host, vip string) holderStatus
+
+	// vipGateFlipped is a test seam: when non-nil it overrides the "is vip_demote_v1
+	// advertised by this build" check, so tests can exercise the takeover gate with the
+	// token flipped while the shipped build keeps it de-advertised. Production nil.
+	vipGateFlipped func() bool
+
+	// removeLBFromHost is a test seam for the Phase-2 synchronous stand-down of a removed
+	// VIP holder (a peer RemoveLB RPC). Production leaves it nil (the real RemoveLB call).
+	removeLBFromHost func(ctx context.Context, lbName, host string) error
+
+	// lbParticipantsOverride is a test seam for resolving the ACTUAL participants of an LB
+	// by name (Phase-2 High-2: ground-truth membership — incl. VRRP backups — for
+	// implicit/legacy hosts=[] LBs). Production nil.
+	lbParticipantsOverride func(ctx context.Context, lbName string) ([]string, bool)
+
+	// vipHoldersOverride is a test seam for resolving which hosts currently hold a VIP by
+	// ADDRESS (Phase-2 create kernel-absence proof). Production nil.
+	vipHoldersOverride func(ctx context.Context, vip string) ([]string, bool)
+
 	// lbHealthOverride is a test seam for InspectLoadBalancer's HAProxy health
 	// overlay (unit tests have no running haproxy): when non-nil it returns the
 	// server-name→raw-status map instead of querying the stats socket.
@@ -106,6 +132,7 @@ type Server struct {
 
 	migrationMetrics *metrics.MigrationMetrics
 	lbMetrics        *metrics.LBMetrics
+	haMetrics        *metrics.HAHealthMetrics
 
 	// storagePools holds host-level pool refs (name → ref) used to resolve
 	// move/replicate/compose volume targets. Seeded from daemon config at
@@ -192,7 +219,184 @@ type Server struct {
 	binaryPath string
 	// logDir is the directory for VM log files. Defaults to /var/log/libvirt/qemu.
 	logDir string
+
+	// gate is the split-brain safety gate (Phase 1), implemented by *health.Checker.
+	// When set + enforced, ApplyLB (VIP takeover) requires local quorum. nil /
+	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
+	gate          serverGate
+	onGateRefused func(action, reason string)
+
+	// demotionUnfenced is set by the VIPDemoter (SetDemotionUnfenced) when a minority VIP
+	// self-demote FAILED and this node has no verified self-fence — a durable HA-degraded
+	// condition (the majority won't reclaim without proof, so the VIP stays down). It does
+	// NOT gate advertisement: vip_demote_v1 is a software capability advertised regardless
+	// of watchdog (the decouple), so a watchdog-less node still self-demotes.
+	demotionUnfenced atomic.Bool
+
+	// watchdogFenced reports whether this node has SELF-FENCED (tripped the watchdog) and
+	// is only waiting for the hardware timeout to reboot. During that live-but-doomed
+	// window it must stop being trusted as a healthy member — advertisedCapabilities drops
+	// ALL split-brain tokens so peers stop counting it. Set by the daemon from the watchdog
+	// controller. nil → never fenced.
+	watchdogFenced func() bool
 }
+
+// SetDemotionUnfenced records whether a minority VIP demote failed with no verified
+// self-fence (from the VIPDemoter) — read by evaluateHADegraded to surface the durable
+// haDemotionUnfenced condition.
+func (s *Server) SetDemotionUnfenced(on bool) { s.demotionUnfenced.Store(on) }
+
+// SetWatchdogFenced injects the self-fenced predicate (Phase 2 defense-in-depth).
+func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced = fn }
+
+// advertisedCapabilities is Supported() as-is — vip_demote_v1 is a SOFTWARE capability
+// advertised by every new-binary node regardless of any hardware watchdog (the decouple:
+// self-demotion runs without one; the watchdog is only an optional self-fence backstop).
+//
+// Once this node has SELF-FENCED it advertises NOTHING split-brain-related: it is
+// committed to going down, so it de-advertises immediately rather than presenting as a
+// healthy participant for the fence-timeout window. This is safe (doesn't wrongly free a
+// VIP): the majority's reclaim gates on the ground-truth VIPAssigned probe / a Phase-5
+// fence proof, never on the token, and peers already latched keep enforcing regardless.
+func (s *Server) advertisedCapabilities() []string {
+	if s.watchdogFenced != nil && s.watchdogFenced() {
+		return []string{}
+	}
+	return capabilities.Supported()
+}
+
+// serverGate is the subset of *health.Checker the gRPC server consults.
+type serverGate interface {
+	ExecutionGate(ctx context.Context) health.GateResult
+	// DecisionGate is the coordinator/decide-site gate (quorum + coordinator-eligible).
+	// Leader-gated decide loops (rebalance executor) require it ON TOP of their CRDT
+	// lease, since a lease can be "held" on both sides of a partition.
+	DecisionGate(ctx context.Context) health.GateResult
+	CapabilityActive(ctx context.Context, token string) (bool, string)
+	// Enforced is the LATCHED enforcement decision — once activated cluster-wide it
+	// stays true even when a fresh Ping can't confirm (partition → fail closed).
+	Enforced(ctx context.Context, token string) bool
+	// PeerSupportsFresh fresh-Pings peer (UNcached) and reports whether it advertises
+	// token — used before stamping/forwarding a proof-bearing action, so a
+	// regressed/replaced target that can't honor the proof is never sent one.
+	// Uncached so a target that regressed within the cache TTL is caught immediately.
+	PeerSupportsFresh(ctx context.Context, peer, token string) bool
+	// HealthyPeers returns the peers this node currently counts toward quorum (probed
+	// healthy this run AND voting-eligible by host state). Used to pick a quorum-visible
+	// relay for the VIP absence proof when the target isn't directly reachable.
+	HealthyPeers(ctx context.Context) []string
+}
+
+// SetGate injects the split-brain safety gate.
+func (s *Server) SetGate(g serverGate) { s.gate = g }
+
+// SetGateRefusedObserver wires the refusal metric hook (nil-safe).
+func (s *Server) SetGateRefusedObserver(fn func(action, reason string)) { s.onGateRefused = fn }
+
+func (s *Server) noteGateRefused(action, reason string) {
+	if s.onGateRefused != nil {
+		s.onGateRefused(action, reason)
+	}
+}
+
+// gateActive reports whether the split-brain gate is enforced cluster-wide
+// (split_brain_gate_v1 present on every enforcement-relevant member). Fail-open
+// (false) until then. Recomputed per call.
+func (s *Server) gateActive(ctx context.Context) bool {
+	if s.gate == nil {
+		return false
+	}
+	return s.gate.Enforced(ctx, capabilities.SplitBrainGateV1)
+}
+
+// selfFenced reports whether THIS node has self-fenced (tripped the watchdog) and is
+// only waiting for the hardware timeout to reboot. During that live-but-doomed window it
+// must refuse every runtime-ownership decide/execute — even if quorum transiently returns
+// before the reboot — since it has already committed to going down. nil predicate → false.
+func (s *Server) selfFenced() bool { return s.watchdogFenced != nil && s.watchdogFenced() }
+
+// execGateForAction reports whether the split-brain gate blocks a runtime-ownership
+// action on THIS host. It runs the local ExecutionGate (must be an active worker
+// with quorum) when EITHER a proof marker is carried OR enforcement is latched
+// cluster-wide. The marker forcing the gate is essential: in an asymmetric
+// partition a target can receive a valid carried proof while itself lacking quorum,
+// and must NOT execute. Legacy (ungated) is allowed ONLY when there is no marker
+// AND enforcement never activated. Fail-open ("" ok) in that legacy case.
+func (s *Server) execGateForAction(ctx context.Context, markerPresent bool) (reason string, refused bool) {
+	// Self-fence is a HARD, unconditional local gate (independent of markers, quorum, or
+	// enforcement): a doomed node must not execute already-stamped or self-minted actions
+	// during the fence-timeout window.
+	if s.selfFenced() {
+		return health.ReasonSelfFenced, true
+	}
+	if s.gate == nil {
+		// A carried proof MARKER with no gate to verify quorum fails CLOSED — we
+		// cannot confirm this host has quorum, and a proof implies enforcement was
+		// active somewhere. Only a truly markerless legacy action proceeds ungated.
+		if markerPresent {
+			return health.ReasonNoQuorum, true
+		}
+		return "", false
+	}
+	if !markerPresent && !s.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+		return "", false
+	}
+	if g := s.gate.ExecutionGate(ctx); !g.OK {
+		return g.Reason, true
+	}
+	return "", false
+}
+
+// execGateRefused is the markerless form (enforcement-gated only). Direct-RPC
+// executors that may carry a proof must use execGateForAction(ctx, proof != nil).
+func (s *Server) execGateRefused(ctx context.Context) (reason string, refused bool) {
+	return s.execGateForAction(ctx, false)
+}
+
+// decideGateRefused reports whether the split-brain DECIDE gate blocks a
+// coordinator-driven runtime-ownership decision on THIS host: enforced cluster-wide
+// AND DecisionGate not OK (no quorum / not coordinator-eligible). Fail-open until
+// split_brain_gate_v1 is cluster-wide. Used by leader-gated decide loops (the
+// rebalance executor) ON TOP of their CRDT lease — a lease can be "held" on both
+// sides of a partition, so it is never sufficient alone for an automated move.
+func (s *Server) decideGateRefused(ctx context.Context) (reason string, refused bool) {
+	// A self-fenced node must not DECIDE either (same hard gate as execute).
+	if s.selfFenced() {
+		return health.ReasonSelfFenced, true
+	}
+	if s.gate == nil {
+		return "", false
+	}
+	if !s.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+		return "", false
+	}
+	if g := s.gate.DecisionGate(ctx); !g.OK {
+		return g.Reason, true
+	}
+	return "", false
+}
+
+// destSupportsGate fresh-Pings dest to confirm it advertises split_brain_gate_v1
+// BEFORE this (latched-enforcement) node stamps/forwards a proof-bearing action
+// there. A regressed/replaced dest that no longer advertises can't honor the proof
+// — proceeding would strand the action or silently drop it to the legacy path on
+// the dest, both defeating the gate. Fail closed: unconfirmed support → false.
+func (s *Server) destSupportsGate(ctx context.Context, dest string) bool {
+	if s.gate == nil {
+		return false
+	}
+	if dest == s.hostName {
+		// Our own capability is known locally — no self-Ping needed. Read the SAME
+		// dynamic advertised view Ping returns (advertisedCapabilities), so a self-fenced
+		// node reports itself as NOT gate-capable and won't stamp/forward a self-targeted
+		// proof, matching what peers see.
+		return capabilities.Has(s.advertisedCapabilities(), capabilities.SplitBrainGateV1)
+	}
+	return s.gate.PeerSupportsFresh(ctx, dest, capabilities.SplitBrainGateV1)
+}
+
+// lbGateRefused is the markerless execute-gate at the LB-apply chokepoint.
+func (s *Server) lbGateRefused(ctx context.Context) (string, bool) { return s.execGateRefused(ctx) }
 
 // FirewallReconciler is the subset of *firewall.Reconciler the gRPC
 // layer calls — kept narrow so tests can swap a fake without
@@ -215,6 +419,10 @@ type ContainerRuntime interface {
 	StateContainer(ctx context.Context, name string) (string, error)
 	IPContainer(ctx context.Context, name string) (string, error)
 	ListContainers(ctx context.Context) ([]string, error)
+	// ContainerExists reports whether the on-disk container artifact (dir) exists —
+	// independent of any DB row. Used by the crash-idempotent restore resume path to
+	// tell an untracked leftover (import done, row not yet written) from a clean slate.
+	ContainerExists(ctx context.Context, name string) (bool, error)
 	// FreezeContainer/UnfreezeContainer quiesce a container for a consistent
 	// rootfs read (backup/snapshot); ContainerRootFSPath returns the host path of
 	// its root tree. Added in B0 (container day-2 primitives).
@@ -398,6 +606,11 @@ func (s *Server) SetMigrationMetrics(m *metrics.MigrationMetrics) {
 // SetLBMetrics attaches Prometheus load-balancer gauges.
 func (s *Server) SetLBMetrics(m *metrics.LBMetrics) {
 	s.lbMetrics = m
+}
+
+// SetHAHealthMetrics attaches the persistent HA-degraded gauge (Phase 2 H1).
+func (s *Server) SetHAHealthMetrics(m *metrics.HAHealthMetrics) {
+	s.haMetrics = m
 }
 
 // recordLBKeepalived publishes whether this host's keepalived for lbName is

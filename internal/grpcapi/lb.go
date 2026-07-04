@@ -16,8 +16,10 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
@@ -569,6 +571,19 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 		return nil, status.Errorf(codes.AlreadyExists, "VIP %s already in use by %q", req.Vip, existingVIP[0].String("name"))
 	}
 
+	// Split-brain gate (Phase 2): creating a VIP is a NEW runtime-ownership claim. The
+	// DB uniqueness check above only proves no OTHER row uses it — not that the address
+	// is actually free in the kernel. A prior delete or partition could have left a
+	// keepalived still answering the VIP after its row disappeared; claiming it then
+	// would overlap. Require a cluster KERNEL-ABSENCE proof: the VIP must be unassigned
+	// on every cluster host. Fails closed if it can't be confirmed (unreachable host /
+	// enumeration error) — the same pre-Phase-5 availability tradeoff as elsewhere.
+	// Inert until vip_demote_v1 is enforced cluster-wide.
+	if reason, refused := s.vipClaimRefused(ctx, req.Vip); refused {
+		s.noteGateRefused(corrosion.ActionLBApply, reason)
+		return nil, status.Errorf(codes.FailedPrecondition, "lb create refused: VIP not provably free — %s", reason)
+	}
+
 	algorithm := req.Algorithm
 	if algorithm == "" {
 		algorithm = "roundrobin"
@@ -700,10 +715,18 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 				return
 			}
 			defer conn.Close()
-			client.ApplyLB(ctx, &pb.ApplyLBRequest{
+			proof := s.mintLBProof(ctx, req.Name, host)
+			if s.gateActive(ctx) && proof == nil {
+				slog.Error("CreateLoadBalancer: cannot mint LB proof under enforcement; skipping remote apply",
+					"host", host, "lb", req.Name)
+				return
+			}
+			if _, aerr := client.ApplyLB(ctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: req.Vip, Algorithm: algorithm,
-				Backends: pbBackends, Ports: req.Ports, Hosts: req.Hosts,
-			})
+				Backends: pbBackends, Ports: req.Ports, Hosts: req.Hosts, Proof: proof,
+			}); aerr != nil {
+				slog.Warn("CreateLoadBalancer: remote apply failed", "host", host, "lb", req.Name, "error", aerr)
+			}
 		}(h)
 	}
 
@@ -716,6 +739,25 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 // lbApplyDisabled test seam lets unit tests exercise CreateLoadBalancer's
 // persistence + rollback logic without root privileges or a haproxy binary.
 func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config) error {
+	// Split-brain gate (Phase 1): claiming/serving a VIP requires local quorum,
+	// enforced at this single chokepoint so BOTH the ApplyLB RPC and the
+	// event-triggered refresh path (refreshLBLocal → applyLBFromSpec) are covered —
+	// an isolated minority host must not bring up a VIP via keepalived. Fail-open
+	// until split_brain_gate_v1 is cluster-wide. (Routine LB apply is event-driven,
+	// not failover-lease-driven, so local ExecutionGate — not a coordinator proof —
+	// is the right gate; a proof is validated separately when a caller supplies one.)
+	if reason, refused := s.lbGateRefused(ctx); refused {
+		s.noteGateRefused(corrosion.ActionLBApply, reason)
+		return status.Errorf(codes.FailedPrecondition, "lb apply refused: %s", reason)
+	}
+	// NOTE: the Phase-2 VIP-takeover gate is NOT here. Whether a new claim is safe is
+	// a TRANSITION decision (which OLD holder is being removed and must release), and
+	// only the orchestration sites (applyLBFromSpec / UpdateLoadBalancer) know old vs
+	// new. A local snapshot check here — "is any other current holder assigned?" —
+	// would wrongly refuse normal multi-host VRRP (exactly one holder should be the
+	// master). The orchestration gate runs BEFORE this apply is reached (locally or
+	// via a forwarded ApplyLB), so this chokepoint only enforces the Phase-1 quorum
+	// gate above.
 	var err error
 	if s.lbApplyOverride != nil {
 		err = s.lbApplyOverride(ctx, cfg)
@@ -726,6 +768,576 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config) error {
 		s.recordLBKeepalived(cfg.Name) // publish whether the VIP came up
 	}
 	return err
+}
+
+// CheckVIPParticipant reports whether THIS host could HOLD or BECOME MASTER of the VIP —
+// it renders a keepalived config for it (VRRP participant: master OR backup) or the
+// address is assigned on its kernel. The by-VIP ownership signal Phase 2 gates on; a
+// kernel-address-only check would miss a backup. Peer-only. Fails CLOSED on an `ip`
+// error (returns an error so the caller treats it as "still claiming").
+func (s *Server) CheckVIPParticipant(ctx context.Context, req *pb.CheckVIPParticipantRequest) (*pb.CheckVIPParticipantResponse, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, status.Error(codes.PermissionDenied, "CheckVIPParticipant is peer-only")
+	}
+	claims, err := lb.NewManager().ClaimsVIP(req.Vip)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "cannot determine VIP participation: %v", err)
+	}
+	return &pb.CheckVIPParticipantResponse{Claims: claims}, nil
+}
+
+// RelayCheckVIPParticipant probes a THIRD host {target_host, vip} on the caller's behalf —
+// the relay leg of the fresh-VIP absence proof for a target the caller can't reach directly
+// (a permanent directional segmentation where this relay CAN reach it). It DECIDES nothing
+// and keeps NO cache / no wall-clock freshness claim / no durable proof: it does a FRESH
+// capability Ping (target must advertise vip_release_probe_v1 — it answers absence probes
+// authoritatively) THEN a FRESH CheckVIPParticipant against the target, and returns a
+// tri-state. Every failure — unreachable/unsupported target, RPC error — maps to UNKNOWN so
+// the caller fails closed. Peer-only (mTLS).
+func (s *Server) RelayCheckVIPParticipant(ctx context.Context, req *pb.RelayCheckVIPParticipantRequest) (*pb.RelayCheckVIPParticipantResponse, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, status.Error(codes.PermissionDenied, "RelayCheckVIPParticipant is peer-only")
+	}
+	if req.TargetHost == "" || req.Vip == "" {
+		return nil, status.Error(codes.InvalidArgument, "target_host and vip required")
+	}
+	unknown := &pb.RelayCheckVIPParticipantResponse{Result: pb.RelayVIPResult_RELAY_VIP_UNKNOWN}
+
+	// Target is THIS relay itself → answer from the local by-VIP check (no self-dial).
+	if req.TargetHost == s.hostName {
+		claims, err := lb.NewManager().ClaimsVIP(req.Vip)
+		if err != nil {
+			return unknown, nil
+		}
+		return &pb.RelayCheckVIPParticipantResponse{Result: relayVIPResult(claims)}, nil
+	}
+	// Fresh capability Ping: only trust a target that advertises vip_release_probe_v1 (it
+	// answers by-VIP absence probes authoritatively, so its CheckVIPParticipant answer is a
+	// valid release-proof input). Uncached.
+	if s.gate == nil || !s.gate.PeerSupportsFresh(ctx, req.TargetHost, capabilities.VIPReleaseProbeV1) {
+		return unknown, nil
+	}
+	// Fresh CheckVIPParticipant against the target.
+	c, closeConn, err := s.dialPeer(ctx, req.TargetHost)
+	if err != nil {
+		return unknown, nil
+	}
+	defer closeConn()
+	resp, err := c.CheckVIPParticipant(ctx, &pb.CheckVIPParticipantRequest{Vip: req.Vip})
+	if err != nil {
+		return unknown, nil
+	}
+	return &pb.RelayCheckVIPParticipantResponse{Result: relayVIPResult(resp.GetClaims())}, nil
+}
+
+// relayVIPResult maps a target's boolean claim into the relay tri-state (never UNKNOWN —
+// UNKNOWN is reserved for a relay that couldn't reach/verify the target).
+func relayVIPResult(claims bool) pb.RelayVIPResult {
+	if claims {
+		return pb.RelayVIPResult_RELAY_VIP_CLAIMS
+	}
+	return pb.RelayVIPResult_RELAY_VIP_NO_CLAIMS
+}
+
+// CheckLBPresent reports whether THIS host is a configured participant for the LB (has a
+// keepalived config or a running keepalived for it) — including a VRRP BACKUP that holds
+// no VIP but could become master. Phase 2 uses it to find the true old-holder set for
+// implicit/legacy hosts=[] LBs. Peer-only.
+func (s *Server) CheckLBPresent(ctx context.Context, req *pb.CheckLBPresentRequest) (*pb.CheckLBPresentResponse, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, status.Error(codes.PermissionDenied, "CheckLBPresent is peer-only")
+	}
+	if req.LbName == "" {
+		return nil, status.Error(codes.InvalidArgument, "lb_name required")
+	}
+	return &pb.CheckLBPresentResponse{Present: lb.NewManager().HasLB(req.LbName)}, nil
+}
+
+// holderStatus is one configured LB holder's reclaim-relevant state (fresh-probed via
+// the probeHolder seam). The transition gate (removedHolderReleased) consults only
+// reachable + assigned: a removed holder must be reachable AND report the VIP not
+// assigned to count as released. supports (advertises vip_release_probe_v1) is retained
+// for the seam/diagnostics but is NOT itself consulted here — the real trust check lives in
+// participantReachable / peerVIPClaims, which require the token before trusting an answer.
+type holderStatus struct {
+	reachable bool // fresh probe succeeded
+	supports  bool // advertises vip_release_probe_v1 (answers absence probes authoritatively)
+	assigned  bool // VIP currently assigned on its kernel
+}
+
+// vipGateActive reports whether Phase-2 MAJORITY-side takeover gating is ENFORCED
+// cluster-wide: the same durable, latched Enforced() decision Phase 1 uses — every
+// enforcement-relevant member advertises vip_release_probe_v1 (so the majority can obtain a
+// trusted release proof about any of them), latched so a partition fails closed. Keyed off
+// the release-probe token, not vip_demote_v1: the two flip together, and it is the ability to
+// PROVE release cluster-wide that makes proof-gated reclaim safe to enforce. NOT a local
+// "does this build advertise it" check, which would activate the flip on the first rolled
+// node before the cluster can participate. Overridable in tests via s.vipGateFlipped.
+func (s *Server) vipGateActive(ctx context.Context) bool {
+	if s.vipGateFlipped != nil {
+		return s.vipGateFlipped()
+	}
+	return s.gate != nil && s.gate.Enforced(ctx, capabilities.VIPReleaseProbeV1)
+}
+
+// removedHosts returns the hosts present in old but absent from new — the holders
+// being taken OFF the LB by this change. Self is NOT filtered out: if THIS host is
+// the one being removed, it must release the VIP too. Empty entries are dropped.
+func removedHosts(old, new []string) []string {
+	newSet := make(map[string]bool, len(new))
+	for _, h := range new {
+		newSet[h] = true
+	}
+	var removed []string
+	for _, h := range old {
+		if h != "" && !newSet[h] {
+			removed = append(removed, h)
+		}
+	}
+	return removed
+}
+
+// parseHostsJSON decodes a stored hosts column ("[]" / "" / a JSON array). ok=false
+// only when a non-empty value fails to parse — the member set is the Phase-2 boundary,
+// so a corrupt value must read as UNKNOWN (fail closed), not as an empty set.
+func parseHostsJSON(s string) (hosts []string, ok bool) {
+	if s == "" || s == "[]" {
+		return nil, true
+	}
+	if err := json.Unmarshal([]byte(s), &hosts); err != nil {
+		return nil, false
+	}
+	return hosts, true
+}
+
+// vipMoveRefused is the Phase-2 orchestration-side gate: may this change cause any
+// host to NEWLY claim the VIP? It is a TRANSITION predicate, not a snapshot — it acts
+// on ONLY the removed holders (old∖new); an unchanged/added holder that currently has
+// the VIP is normal VRRP state (exactly one master) and must NOT block the operation.
+//
+// For each removed holder it does break-before-make with a STRONG release proof:
+//  1. synchronously stand the holder down (RemoveLB → keepalived stopped + config
+//     removed, so it can't later become VRRP master and re-claim the VIP);
+//  2. then require the VIP address is no longer assigned there.
+//
+// Absence alone is NOT release: a removed holder that is a VRRP BACKUP reports the VIP
+// absent while still able to take over, so we must first make its keepalived inert.
+//
+// VIP semantics (oldVip = the address current holders serve; newVip = the address after
+// this change; equal when the VIP isn't changing): removed holders are proven to release
+// oldVip (what they actually had); a fresh claim / VIP change proves newVip is free. This
+// split matters for a combined VIP+host change — verifying a removed holder against newVip
+// would check an address it never served and miss a stale oldVip assignment.
+//
+// Fails closed everywhere: unknown old membership refuses; a stand-down that errors
+// (unreachable / RPC failure) refuses; a holder still claiming after stand-down refuses.
+// When old membership is empty it is resolved from GROUND TRUTH (who actually holds the
+// VIP now) so an implicit/legacy stack LB can't hide a removed holder. Inert until
+// vip_release_probe_v1 is enforced cluster-wide (the majority-side takeover latch).
+func (s *Server) vipMoveRefused(ctx context.Context, lbName, oldVip, newVip string, oldHosts, newHosts []string, oldKnown, hostsChanged bool) (string, bool) {
+	if !s.vipGateActive(ctx) {
+		return "", false // inert until enforced cluster-wide
+	}
+	if !oldKnown {
+		// Can't determine which holders are being removed — the member set is the
+		// Phase-2 security boundary, so an unreadable old set must refuse.
+		return health.ReasonVIPReleaseUnconfirmed, true
+	}
+
+	// Prove newVip is free before bringing it up, UNLESS we can affirmatively establish
+	// the existing participants already legitimately serve exactly it — i.e. only skip when
+	// oldVip is KNOWN and equals newVip. This covers three cases as one:
+	//   - oldVip != newVip: a VIP change (fresh claim of newVip);
+	//   - oldVip == "": the row is absent so the old VIP is UNKNOWN — bringing up newVip is
+	//     effectively a fresh claim. Treating "" as "no proof needed" was the hole: a
+	//     recreated stack LB whose row was lost but whose stale by-name participants still
+	//     exist would fill oldHosts below and skip the fresh-claim branch, claiming newVip
+	//     unproven. Must prove it even when by-name participants are found.
+	// (Redundant with the no-participant fresh-claim branch for a truly brand-new LB, which
+	// is harmless — vipAbsenceRefused short-circuits on the first refusal.)
+	if oldVip == "" || oldVip != newVip {
+		if reason, refused := s.vipAbsenceRefused(ctx, newVip); refused {
+			return reason, true
+		}
+	}
+
+	if len(oldHosts) == 0 {
+		// Stored membership is empty. This is a genuinely-holderless LB OR an
+		// implicit/legacy stack LB whose real participants were only ever derived at
+		// runtime (never persisted) — in which case old∖new would hide a removed
+		// participant. Resolve the ACTUAL participants from ground truth. This asks
+		// "who is CONFIGURED for this LB" (keepalived present), NOT just "who holds the
+		// VIP address" — a VRRP BACKUP holds no VIP yet can still become master.
+		participants, ok := s.actualLBParticipants(ctx, lbName)
+		if !ok {
+			return health.ReasonVIPReleaseUnconfirmed, true // can't enumerate → fail closed
+		}
+		oldHosts = participants
+	}
+
+	if !hostsChanged {
+		// No host move requested (e.g. a VIP-only edit): the target set equals the CURRENT
+		// participants, not the literal newHosts. This matters for an implicit hosts=[] LB
+		// whose "unchanged" set isn't literally [] — treating [] as the new set would mark
+		// every live participant as removed and tear the LB down.
+		newHosts = oldHosts
+	}
+
+	if len(oldHosts) == 0 {
+		// No existing participant to move FROM: this is a FRESH claim (first bring-up or
+		// a recreate of a deleted stack LB). Prove the CLAIMED vip (newVip) is free of
+		// participants cluster-wide — catches a config-less orphan keepalived or a stale
+		// kernel VIP a prior delete/partition left behind, which the by-name participant
+		// check can't. (This is why stack LBs, which reach the gate only through here, are
+		// covered without a separate call.)
+		return s.vipAbsenceRefused(ctx, newVip)
+	}
+
+	// The set that must be stood down + provably released before we proceed: holders
+	// LEAVING the LB (old∖new). A first-host (VRRP master) change is takeover-like — the
+	// OLD master must relinquish before the NEW one claims, else both could master under
+	// a VRRP-segment partition — so add the old master too (it is re-applied as a backup
+	// afterwards: break-before-make for the master role).
+	mustRelease := removedHosts(oldHosts, newHosts)
+	masterChanged := len(oldHosts) > 0 && len(newHosts) > 0 && oldHosts[0] != newHosts[0]
+	if masterChanged {
+		mustRelease = appendUnique(mustRelease, oldHosts[0])
+	}
+
+	// Adding a participant OR changing the master brings up a NEW VRRP claimant. That is
+	// a new runtime-ownership action: it is only safe if the RETAINED existing
+	// participants are reachable (so VRRP adverts flow and the newcomer won't self-elect
+	// master alongside an unreachable-but-live holder). Fail closed on any unreachable
+	// retained participant. (Retained = old∩new and NOT already being released.)
+	adding := len(removedHosts(newHosts, oldHosts)) > 0
+	if adding || masterChanged {
+		releasing := make(map[string]bool, len(mustRelease))
+		for _, h := range mustRelease {
+			releasing[h] = true
+		}
+		newSet := make(map[string]bool, len(newHosts))
+		for _, h := range newHosts {
+			newSet[h] = true
+		}
+		for _, h := range oldHosts {
+			if releasing[h] || !newSet[h] {
+				continue // handled by the release proof below / not retained
+			}
+			if !s.participantReachable(ctx, h) {
+				return health.ReasonVIPReleaseUnconfirmed, true
+			}
+		}
+	}
+
+	for _, h := range mustRelease {
+		// (1) Stand the holder down so its keepalived is inert.
+		if err := s.standDownHolder(ctx, lbName, h); err != nil {
+			return health.ReasonVIPReleaseUnconfirmed, true
+		}
+		// (2) Require it no longer claims the OLD VIP it was serving (a config for it or
+		//     the address) — not newVip, which it never had.
+		if !s.removedHolderReleased(ctx, h, oldVip) {
+			return health.ReasonVIPReleaseUnconfirmed, true
+		}
+	}
+	return "", false
+}
+
+// vipClaimRefused gates a FRESH VIP claim (CreateLoadBalancer): the VIP must be provably
+// free of PARTICIPANTS across the cluster before we bring it up — no host renders a
+// keepalived config for it (master or backup) and no kernel holds it — so a leftover
+// keepalived from a prior delete/partition can't overlap with the new claim. Inert until
+// enforced; fails closed when absence can't be confirmed.
+func (s *Server) vipClaimRefused(ctx context.Context, vip string) (string, bool) {
+	if !s.vipGateActive(ctx) {
+		return "", false // inert until enforced cluster-wide
+	}
+	return s.vipAbsenceRefused(ctx, vip)
+}
+
+// vipAbsenceRefused is the by-VIP participant-absence check itself (no gate guard):
+// refuse unless the VIP is provably unclaimable across the cluster. Shared by the create
+// claim gate and vipMoveRefused's fresh-claim branch.
+func (s *Server) vipAbsenceRefused(ctx context.Context, vip string) (string, bool) {
+	claimable, ok := s.vipClaimableAnywhere(ctx, vip)
+	if !ok || claimable {
+		return health.ReasonVIPReleaseUnconfirmed, true // unproven absence / a participant exists → fail closed
+	}
+	return "", false
+}
+
+// vipClaimableAnywhere reports whether ANY cluster host could hold or become master of
+// the VIP — a by-VIP PARTICIPANT (renders a keepalived config for it: master OR backup)
+// or a kernel address holder. ok=false — fail closed — if the host list can't be
+// enumerated or the local check errors. peerVIPClaims fail-closes to claims=true on any
+// error, so an unreachable host reads as claiming (absence unproven → refuse).
+//
+// Scope (High: offline is NOT a fence proof): it probes EVERY non-deleted host, NOT just
+// the quorum-"voting-eligible" ones. A host is marked "offline"/"fenced" even when a
+// fence only PARTIALLY succeeded (see FenceHost, which marks offline regardless of fence
+// success), so those states don't prove the host is down and its VIP gone — excluding
+// them could let a still-live host keep a leftover VIP that a fresh claim then overlaps.
+// Only a genuinely-removed host (deleted_at, already filtered by ListHosts) is skipped.
+// Reclaiming from a PROVEN-fenced host is the Phase-5 domain; here we fail closed (a
+// fresh claim is refused while any non-deleted host is unreachable — the safe gap).
+//
+// OPERATOR CAVEAT (H3): on a DIRECTIONALLY-SEGMENTED topology (a live, non-deleted host
+// THIS caller can't reach over gRPC) a caller-local probe alone would refuse fresh VIP
+// claims from the segmented side forever. The relay-probe (RelayCheckVIPParticipant) now
+// covers that: an unreachable-but-live host is probed via a quorum-visible peer that CAN
+// reach it, so the claim proceeds when the relay proves absence. It only stays fail-closed
+// when NO reachable peer can reach the target either (a truly isolated host that might hold
+// a leftover VIP) — the correct posture, surfaced by the persistent `unsupported_member`
+// HA-degraded status. Do NOT silently exclude an unreachable host — that reopens the
+// leftover-VIP hole. (Callers with a valid path to every member never hit this.)
+func (s *Server) vipClaimableAnywhere(ctx context.Context, vip string) (claimable bool, ok bool) {
+	if s.vipHoldersOverride != nil {
+		holders, ok := s.vipHoldersOverride(ctx, vip) // test seam
+		return len(holders) > 0, ok
+	}
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return false, false
+	}
+	for _, h := range hosts {
+		if h.Name == s.hostName {
+			c, cerr := lb.NewManager().ClaimsVIP(vip)
+			if cerr != nil {
+				return false, false // local check failed → unknown → fail closed
+			}
+			if c {
+				return true, true
+			}
+			continue
+		}
+		if s.peerVIPClaims(ctx, h.Name, vip) {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// appendUnique appends h to xs unless already present.
+func appendUnique(xs []string, h string) []string {
+	for _, x := range xs {
+		if x == h {
+			return xs
+		}
+	}
+	return append(xs, h)
+}
+
+// participantReachable reports whether an EXISTING LB participant is reachable enough to
+// coordinate VRRP with a new claimant AND can be trusted for a release proof. Self is always
+// reachable. For a peer it uses a FRESH Ping that also confirms it advertises
+// vip_release_probe_v1 (reachable AND answers by-VIP absence probes authoritatively); an
+// unreachable/incapable existing participant fails closed. Overridable in tests via the
+// probeHolder seam (its reachable field).
+func (s *Server) participantReachable(ctx context.Context, host string) bool {
+	if host == s.hostName {
+		return true
+	}
+	if s.probeHolder != nil {
+		return s.probeHolder(ctx, host, "").reachable
+	}
+	return s.gate != nil && s.gate.PeerSupportsFresh(ctx, host, capabilities.VIPReleaseProbeV1)
+}
+
+// standDownHolder synchronously removes the LB from `host` so its keepalived is stopped
+// and its config removed — an inert keepalived cannot later become VRRP master and
+// re-claim the VIP, which VIP-address absence alone does NOT guarantee. Returns an error
+// (→ refuse) if the removal can't be driven/confirmed. Self is torn down locally; peers
+// via a blocking RemoveLB RPC (peer-only handler).
+func (s *Server) standDownHolder(ctx context.Context, lbName, host string) error {
+	if host == s.hostName {
+		return s.removeLBLocal(ctx, lbName)
+	}
+	if s.removeLBFromHost != nil {
+		return s.removeLBFromHost(ctx, lbName, host) // test seam
+	}
+	c, closeConn, err := s.dialPeer(ctx, host)
+	if err == nil {
+		_, err = c.RemoveLB(ctx, &pb.RemoveLBRequest{LbName: lbName})
+		closeConn()
+		if err == nil {
+			return nil
+		}
+	}
+	// Couldn't reach/stop the holder. gRPC dials LAZILY, so an unreachable peer errors on the
+	// RemoveLB call, not at dialPeer — hence this handles both. If an operator has attested
+	// (manual-fence-confirm) the host is DOWN, its keepalived is already gone: it is stood
+	// down by fact, and no RemoveLB is possible or needed. This mirrors the release proof
+	// removedHolderReleased/peerVIPClaims accept, so both steps of the move gate honor the
+	// same attestation. Otherwise fail closed (the RPC failure refuses the move).
+	if s.manualFenceConfirmedVIP(ctx, host) {
+		return nil
+	}
+	return err
+}
+
+// actualLBParticipants resolves the hosts that are CONFIGURED PARTICIPANTS for the LB by
+// asking every cluster host (ground truth: keepalived config/process present, not just a
+// kernel VIP — so VRRP backups are included). ok=false — fail closed — if the host list
+// can't be enumerated. peerLBPresent fail-closes to present=true on any error, so an
+// unreachable host reads as a participant (and, if being removed, will refuse the move).
+func (s *Server) actualLBParticipants(ctx context.Context, lbName string) (participants []string, ok bool) {
+	if s.lbParticipantsOverride != nil {
+		return s.lbParticipantsOverride(ctx, lbName) // test seam
+	}
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return nil, false
+	}
+	for _, h := range hosts {
+		if h.Name == s.hostName {
+			if lb.NewManager().HasLB(lbName) {
+				participants = append(participants, h.Name)
+			}
+			continue
+		}
+		if s.peerLBPresent(ctx, h.Name, lbName) {
+			participants = append(participants, h.Name)
+		}
+	}
+	return participants, true
+}
+
+// peerLBPresent asks a peer whether it is a configured participant for lbName. Fail-
+// closed: any error (unreachable / old binary without CheckLBPresent / RPC failure) →
+// assume PRESENT, so a removed participant that can't be checked refuses the move.
+func (s *Server) peerLBPresent(ctx context.Context, host, lbName string) bool {
+	c, closeConn, err := s.dialPeer(ctx, host)
+	if err != nil {
+		return true
+	}
+	defer closeConn()
+	resp, err := c.CheckLBPresent(ctx, &pb.CheckLBPresentRequest{LbName: lbName})
+	if err != nil {
+		return true
+	}
+	return resp.GetPresent()
+}
+
+// removedHolderReleased reports whether a holder that was stood down has provably let go
+// of the VIP — by the by-VIP CLAIM signal, not just the kernel address: it must no
+// longer render a keepalived config for the VIP (so it can't become master again) AND
+// not hold the address. After a confirmed RemoveLB (config removed + keepalived stopped)
+// both are true; checking claim rather than address alone catches a stand-down that
+// somehow left the config. Fail-closed in every uncertain case: a self check that
+// errors, an unreachable peer, or a peer that still claims (or won't confirm) → NOT
+// released.
+func (s *Server) removedHolderReleased(ctx context.Context, host, vip string) bool {
+	if host == s.hostName {
+		// Local by-VIP check; a probe error is NOT release (fail closed).
+		claims, err := lb.NewManager().ClaimsVIP(vip)
+		return err == nil && !claims
+	}
+	if s.probeHolder != nil {
+		st := s.probeHolder(ctx, host, vip)
+		return st.reachable && !st.assigned // seam: .assigned models "still claims the VIP"
+	}
+	// peerVIPClaims fail-closes to claims=true on any error, so "not claiming" here means
+	// the peer definitively answered released.
+	return !s.peerVIPClaims(ctx, host, vip)
+}
+
+// peerVIPClaims asks a peer whether it could still hold or become master of the VIP
+// (renders a config for it OR holds the address). Fail-closed: any error (unreachable /
+// old binary / the peer's own check failed / not release-probe-capable) → assume it STILL
+// claims, so the action is refused. A reachable peer's "not claiming" answer is trusted as a
+// release-proof input ONLY if it advertises vip_release_probe_v1 — the SAME trust anchor the
+// relay path applies to the probed target, so the direct and relayed paths are consistent.
+func (s *Server) peerVIPClaims(ctx context.Context, host, vip string) bool {
+	// Try a FRESH, authoritative DIRECT answer: the peer must advertise vip_release_probe_v1
+	// (PeerSupportsFresh does a fresh Ping, which also proves reachability) AND answer
+	// CheckVIPParticipant. gRPC dials LAZILY — an unreachable peer surfaces its error at the
+	// Ping / CheckVIPParticipant call, NOT at dialPeer — so every step is checked and any
+	// failure falls through to the release-proof resolution below (rather than trusting a
+	// half-open connection or a non-probe-capable peer).
+	if s.gate != nil && s.gate.PeerSupportsFresh(ctx, host, capabilities.VIPReleaseProbeV1) {
+		if c, closeConn, err := s.dialPeer(ctx, host); err == nil {
+			resp, cerr := c.CheckVIPParticipant(ctx, &pb.CheckVIPParticipantRequest{Vip: vip})
+			closeConn()
+			if cerr == nil {
+				return resp.GetClaims()
+			}
+		}
+	}
+	// No fresh direct answer (unreachable / not probe-capable / RPC error). Accept a release
+	// proof — a relayed NO_CLAIMS via a quorum-visible reachable peer (so a permanent
+	// directional segmentation doesn't force a blanket fail-closed), or a recent operator
+	// manual-fence-confirm (an attestation the host is DOWN, so its VIP is released; the
+	// availability-first recovery, `lv host fence-confirm`). Else fail closed (assume it
+	// STILL claims). An automatic 'fenced' state does NOT count (it's only a fence attempt).
+	if s.relayedVIPNoClaims(ctx, host, vip) {
+		return false
+	}
+	return !s.manualFenceConfirmedVIP(ctx, host)
+}
+
+// vipManualFenceWindow bounds how long an operator's manual-fence-confirm authorizes VIP
+// reclaim of an UNREACHABLE holder — matches the failover coordinator's recent-fence window.
+// After it expires the operator must re-confirm (the fail-closed direction). While the holder
+// is reachable this is never consulted — its live probe answers directly.
+const vipManualFenceWindow = 5 * time.Minute
+
+// manualFenceConfirmedVIP reports whether an operator has recently confirmed (via
+// `lv host fence-confirm <host>`) that host is DOWN — trusted as a proof-grade release proof
+// for an UNREACHABLE VIP holder (the supported availability-first recovery path).
+//
+// It is honored ONLY while the host is NOT a currently-healthy quorum member. The attestation
+// means "this host is down"; if the host is a live, reachable, quorum-counted member — because
+// it never actually went down, or because it has REJOINED since the confirm — its live state
+// governs, not a past attestation. Without this, a reachable-but-uncooperative peer (doesn't
+// advertise the probe token / errors on the probe) or a host that rejoined within the window
+// could have a stale confirm wrongly free its VIP. The audit window bounds staleness in time;
+// this bounds it to the host actually being down. Fail-closed: no db/gate, read error, or a
+// healthy host → not confirmed (the holder is assumed to still claim).
+func (s *Server) manualFenceConfirmedVIP(ctx context.Context, host string) bool {
+	if s.db == nil || s.gate == nil {
+		return false
+	}
+	for _, h := range s.gate.HealthyPeers(ctx) {
+		if h == host {
+			return false // up + participating → live state governs, not a past confirm
+		}
+	}
+	ok, err := corrosion.HostManualFenceConfirmed(ctx, s.db, host, time.Now(), vipManualFenceWindow)
+	return err == nil && ok
+}
+
+// relayedVIPNoClaims reports whether a quorum-visible reachable RELAY peer definitively says
+// `target` does NOT claim `vip`. This is the ONLY relayed outcome we accept as an absence
+// proof; a relayed CLAIMS, UNKNOWN, an unreachable relay, or no eligible relay all return
+// false (the caller then fails closed). Trust is anchored two ways: the relay must be a peer
+// this node counts toward quorum (HealthyPeers), and reachability is proven by the dial
+// succeeding. No caching, no durable proof — a fresh probe for THIS VIP check only.
+func (s *Server) relayedVIPNoClaims(ctx context.Context, target, vip string) bool {
+	if s.gate == nil {
+		return false
+	}
+	for _, relay := range s.gate.HealthyPeers(ctx) {
+		if relay == target || relay == s.hostName {
+			continue // never relay to the target itself or to self
+		}
+		c, closeConn, err := s.dialPeer(ctx, relay)
+		if err != nil {
+			continue // relay not reachable right now → try the next
+		}
+		resp, rerr := c.RelayCheckVIPParticipant(ctx, &pb.RelayCheckVIPParticipantRequest{TargetHost: target, Vip: vip})
+		closeConn()
+		if rerr != nil {
+			continue
+		}
+		switch resp.GetResult() {
+		case pb.RelayVIPResult_RELAY_VIP_NO_CLAIMS:
+			return true // definitive absence from a quorum-visible reachable relay
+		case pb.RelayVIPResult_RELAY_VIP_CLAIMS:
+			return false // definitive: target still claims → fail closed
+		}
+		// RELAY_VIP_UNKNOWN → this relay couldn't verify; try another.
+	}
+	return false
 }
 
 // removeLBLocal stops this host's haproxy/keepalived for an LB and clears its
@@ -765,7 +1377,8 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	r := rows[0]
 
 	// Merge changes.
-	vip := r.String("vip")
+	oldVip := r.String("vip")
+	vip := oldVip
 	if req.Vip != "" {
 		// Check VIP uniqueness. A DB error must not bypass the guard (F9).
 		existingVIP, err := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE vip = ? AND name != ? AND enabled = 1 AND deleted_at IS NULL`, req.Vip, req.Name)
@@ -794,6 +1407,25 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	if len(req.Ports) > 0 {
 		p, _ := json.Marshal(req.Ports)
 		portsStr = string(p)
+	}
+
+	// Split-brain gate (Phase 2): gate a host-set change OR a VIP change — the two edits
+	// that can bring the VIP up on a new host/address. A pure backend/algorithm edit
+	// (req.Hosts empty AND vip unchanged) is NOT gated: it re-renders on the same holders
+	// (no takeover), and gating it would, for a stored hosts=[] LB, resolve the live
+	// participants and compare them against an empty new set and tear the LB down — which
+	// is why vipMoveRefused takes hostsChanged and, when false, treats the target set as
+	// the current participants. vipMoveRefused proves the new VIP free (if it changed),
+	// verifies removed holders released the OLD VIP, and stands them down break-before-make.
+	// oldKnown unless the stored JSON is corrupt. Inert until the flip.
+	hostsChanged := len(req.Hosts) > 0
+	if hostsChanged || vip != oldVip {
+		oldH, oldKnown := parseHostsJSON(oldHostsStr)
+		newH, _ := parseHostsJSON(hostsStr)
+		if reason, refused := s.vipMoveRefused(ctx, req.Name, oldVip, vip, oldH, newH, oldKnown, hostsChanged); refused {
+			s.noteGateRefused(corrosion.ActionLBApply, reason)
+			return nil, status.Errorf(codes.FailedPrecondition, "lb update refused: VIP takeover — %s", reason)
+		}
 	}
 
 	existingBackends, err := corrosion.ListLBBackends(ctx, s.db, req.Name)
@@ -943,19 +1575,31 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 				return
 			}
 			defer conn.Close()
-			client.ApplyLB(ctx, &pb.ApplyLBRequest{
+			proof := s.mintLBProof(ctx, req.Name, host)
+			if s.gateActive(ctx) && proof == nil {
+				slog.Error("UpdateLoadBalancer: cannot mint LB proof under enforcement; skipping remote apply",
+					"host", host, "lb", req.Name)
+				return
+			}
+			if _, aerr := client.ApplyLB(ctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: vip, Algorithm: algorithm,
-				Backends: pbBackends, Ports: parsedPorts, Hosts: lbHosts,
-			})
+				Backends: pbBackends, Ports: parsedPorts, Hosts: lbHosts, Proof: proof,
+			}); aerr != nil {
+				slog.Warn("UpdateLoadBalancer: remote apply failed", "host", host, "lb", req.Name, "error", aerr)
+			}
 		}(h)
 	}
 
-	// Remove LB from hosts that were in the old list but not the new one.
-	var oldHosts []string
-	if oldHostsStr != "" && oldHostsStr != "[]" {
-		json.Unmarshal([]byte(oldHostsStr), &oldHosts)
+	// Remove LB from hosts that were in the old list but not the new one. When the
+	// gate ran (active AND an explicit host change) it already stood the removed holders
+	// down (break-before-make); only the ungated path needs it here.
+	if !s.vipGateActive(ctx) {
+		var oldHosts []string
+		if oldHostsStr != "" && oldHostsStr != "[]" {
+			json.Unmarshal([]byte(oldHostsStr), &oldHosts)
+		}
+		s.removeLBFromStaleHosts(ctx, req.Name, oldHosts, lbHosts)
 	}
-	s.removeLBFromStaleHosts(ctx, req.Name, oldHosts, lbHosts)
 
 	s.publish("lb.updated", req.Name, fmt.Sprintf("vip=%s", vip))
 	s.audit(ctx, "lb.update", req.Name, "", "ok")
@@ -1189,12 +1833,19 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 	// '' backends still match — don't re-stamp and orphan them.
 	var oldHosts []string
 	generation := ""
+	oldVip := ""
 	haveConfig := false
-	if rows, err := s.db.Query(ctx, `SELECT hosts, generation FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, lbName); err == nil && len(rows) > 0 {
+	oldReadOK := true // fail-closed: a DB read error means old membership is UNKNOWN
+	if rows, err := s.db.Query(ctx, `SELECT hosts, generation, vip FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, lbName); err != nil {
+		oldReadOK = false
+	} else if len(rows) > 0 {
 		haveConfig = true
 		generation = rows[0].String("generation")
+		oldVip = rows[0].String("vip")
 		if h := rows[0].String("hosts"); h != "" && h != "[]" {
-			json.Unmarshal([]byte(h), &oldHosts)
+			if jerr := json.Unmarshal([]byte(h), &oldHosts); jerr != nil {
+				oldReadOK = false // stored hosts unparseable → old membership UNKNOWN
+			}
 		}
 	}
 	if !haveConfig {
@@ -1214,6 +1865,27 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 					targetHosts = append(targetHosts, vm.HostName)
 				}
 			}
+		}
+	}
+
+	// Split-brain gate (Phase 2, orchestration site): before overwriting the row's hosts
+	// and (re)applying, prove the mutation is safe. vipMoveRefused proves a CHANGED VIP is
+	// free (oldVip→lbSpec.Vip — a stack LB can change its VIP too, which manual updates
+	// already gate), stands down every REMOVED holder (old∖new) break-before-make and
+	// verifies it released the OLD VIP it served, and refuses a fresh claim whose VIP a
+	// leftover still participates in. Unchanged/added holders are NOT gated (normal VRRP).
+	// targetHosts is the authoritative recomputed set, so hostsChanged is true here.
+	//
+	// Only run when there IS a claim to make (targetHosts non-empty). An empty target (no
+	// running VMs / no explicit hosts) makes no new claim, so there's no takeover to gate —
+	// and gating it against a resolved participant set would tear the LB down. The
+	// stale-removal below handles that teardown instead. Inert until the flip.
+	if len(targetHosts) > 0 {
+		if reason, refused := s.vipMoveRefused(ctx, lbName, oldVip, lbSpec.Vip, oldHosts, targetHosts, oldReadOK, true); refused {
+			s.noteGateRefused(corrosion.ActionLBApply, reason)
+			slog.Warn("applyLBFromSpec: VIP takeover refused — a removed holder hasn't released",
+				"stack", spec.StackName, "lb", lbName, "reason", reason)
+			return
 		}
 	}
 
@@ -1255,13 +1927,17 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 		if h == s.hostName {
 			continue
 		}
-		go s.forwardLBApply(context.Background(), h, spec)
+		go s.forwardLBApply(context.Background(), h, spec, targetHosts)
 	}
 
-	// Remove LB from hosts that are no longer in the target list.
-	// This handles the case where VMs migrate and the auto-resolved
-	// host list changes (e.g. LB was on hostA, VMs moved to hostB).
-	s.removeLBFromStaleHosts(ctx, lbName, oldHosts, targetHosts)
+	// Remove LB from hosts that are no longer in the target list. This handles the
+	// case where VMs migrate and the auto-resolved host list changes (e.g. LB was on
+	// hostA, VMs moved to hostB). When the gate ran (active AND there was a claim to
+	// make) it already stood the removed holders down (break-before-make); otherwise —
+	// ungated, OR a gated teardown with no target hosts — do it here.
+	if !s.vipGateActive(ctx) || len(targetHosts) == 0 {
+		s.removeLBFromStaleHosts(ctx, lbName, oldHosts, targetHosts)
+	}
 }
 
 // removeLBFromStaleHosts stops haproxy+keepalived on hosts that were
@@ -1304,7 +1980,45 @@ func (s *Server) removeLBFromStaleHosts(ctx context.Context, lbName string, oldH
 }
 
 // forwardLBApply sends an ApplyLB request to a remote host.
-func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.VMSpec) {
+// mintLBProof mints + persists a single-use lb_apply proof bound to destHost when
+// the split-brain gate is active, for forwarding with an ApplyLB call so the
+// receiving LB host can validate + claim it (it refuses a proofless peer call once
+// enforced). Returns nil pre-activation (fail-open).
+func (s *Server) mintLBProof(ctx context.Context, lbName, destHost string) *pb.RuntimeActionProof {
+	if !s.gateActive(ctx) {
+		return nil
+	}
+	// Fresh-Ping the destination LB host: never stamp/forward a proof to a target
+	// that no longer advertises the gate (a regressed/replaced host that couldn't
+	// honor it). Returning nil under enforcement makes every caller's
+	// "gateActive && proof == nil → skip forward" guard refuse the apply — the VIP
+	// is not brought up on a host that can't participate in the gate (fail closed).
+	if !s.destSupportsGate(ctx, destHost) {
+		slog.Error("mintLBProof: destination does not advertise the split-brain gate; refusing proof-bearing LB apply",
+			"lb", lbName, "dest", destHost)
+		s.noteGateRefused(corrosion.ActionLBApply, health.ReasonUnsupportedCapability)
+		return nil
+	}
+	p := corrosion.ActionProof{
+		ID: newID(), Action: corrosion.ActionLBApply, TargetKind: "lb",
+		TargetName: lbName, DestHost: destHost, Coordinator: s.hostName,
+	}
+	if err := corrosion.WriteActionProof(ctx, s.db, p); err != nil {
+		slog.Warn("mintLBProof: write proof failed", "lb", lbName, "dest", destHost, "error", err)
+		return nil
+	}
+	return &pb.RuntimeActionProof{
+		Id: p.ID, Action: p.Action, TargetKind: p.TargetKind, TargetName: p.TargetName,
+		DestHost: p.DestHost, Coordinator: p.Coordinator,
+	}
+}
+
+// forwardLBApply asks a remote host to apply the LB. resolvedHosts is the RESOLVED
+// target host set (implicit stack LBs derive it from VM placement) — it MUST be passed
+// so the remote computes the same VRRP priority the local apply did; sending the raw
+// (possibly empty) lbSpec.Hosts would make ApplyLB hand the remote priority 100
+// (len==0), producing two masters.
+func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.VMSpec, resolvedHosts []string) {
 	lbSpec := spec.Loadbalancer
 	if lbSpec == nil {
 		return
@@ -1339,13 +2053,23 @@ func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.V
 		})
 	}
 
+	lbName := spec.StackName + "-lb"
+	proof := s.mintLBProof(ctx, lbName, hostName)
+	if s.gateActive(ctx) && proof == nil {
+		// Enforced but couldn't mint a proof for this dest (unreachable / doesn't
+		// advertise the gate) — refuse to forward an ungated apply (fail closed).
+		slog.Error("forwardLBApply: cannot mint LB proof under enforcement; skipping remote apply",
+			"host", hostName, "lb", lbName)
+		return
+	}
 	if _, err := client.ApplyLB(ctx, &pb.ApplyLBRequest{
-		LbName:    spec.StackName + "-lb",
+		LbName:    lbName,
 		Vip:       lbSpec.Vip,
 		Algorithm: lbSpec.Algorithm,
 		Backends:  pbBackends,
 		Ports:     pbPorts,
-		Hosts:     lbSpec.Hosts,
+		Hosts:     resolvedHosts,
+		Proof:     proof,
 	}); err != nil {
 		slog.Warn("forwardLBApply: remote apply failed", "host", hostName, "error", err)
 	} else {
@@ -1357,6 +2081,35 @@ func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.V
 func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.Empty, error) {
 	if req.LbName == "" {
 		return nil, status.Error(codes.InvalidArgument, "lb_name required")
+	}
+
+	// Split-brain gate (Phase 1): local-quorum ExecutionGate is enforced at the
+	// applyLBLocal chokepoint below. Additionally, a FORWARDED (peer→peer) apply
+	// must carry a coordinator proof once enforced — otherwise any cluster peer
+	// could ask a quorum-holding LB host to claim a VIP unauthorized. A peer call
+	// with no proof under enforcement is refused; validate + single-use-claim a
+	// present proof.
+	if req.Proof != nil {
+		// A carried proof must come from a known cluster host (peer mTLS).
+		if err := s.requirePeerCert(ctx); err != nil {
+			return nil, status.Error(codes.PermissionDenied, "lb apply proof requires a peer cert")
+		}
+	} else if s.gateActive(ctx) && s.requirePeerCert(ctx) == nil {
+		s.noteGateRefused(corrosion.ActionLBApply, health.ReasonProofMissing)
+		return nil, status.Error(codes.FailedPrecondition, "lb apply refused: forwarded apply requires a proof under enforcement")
+	}
+	lbProofID, err := s.claimCarriedProof(ctx, req.Proof, corrosion.ActionLBApply, "lb", req.LbName)
+	if err != nil {
+		s.noteGateRefused(corrosion.ActionLBApply, health.ReasonProofConflict)
+		return nil, err
+	}
+	// A carried proof MARKER forces the local ExecutionGate even if THIS host hasn't
+	// latched enforcement — a partitioned target must not bring up a VIP without
+	// local quorum. (applyLBLocal below also gates, but only under local enforcement,
+	// so it would miss a proof-carrying apply on a not-yet-enforcing regressed host.)
+	if reason, refused := s.execGateForAction(ctx, req.Proof != nil); refused {
+		s.noteGateRefused(corrosion.ActionLBApply, reason)
+		return nil, status.Errorf(codes.FailedPrecondition, "lb apply refused: %s", reason)
 	}
 
 	algorithm := req.Algorithm
@@ -1421,12 +2174,25 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 	// Internal ApplyLB RPC doesn't carry snat flag; default to true (previous behaviour).
 	s.updateIsolationForLB(ctx, lbIface, vipIP, ports, true)
 
+	if lbProofID != "" {
+		if err := corrosion.CompleteActionProof(ctx, s.db, lbProofID, s.hostName); err != nil {
+			slog.Warn("ApplyLB: complete proof", "lb", req.LbName, "proof", lbProofID, "error", err)
+		}
+	}
 	slog.Info("ApplyLB: applied", "lb", req.LbName, "vip", req.Vip, "backends", len(backends))
 	return &emptypb.Empty{}, nil
 }
 
 // RemoveLB handles a request from a peer to tear down a local LB instance.
 func (s *Server) RemoveLB(ctx context.Context, req *pb.RemoveLBRequest) (*emptypb.Empty, error) {
+	// Peer-only: RemoveLB stops keepalived + haproxy and tears down the VIP, and Phase 2
+	// relies on it to stand a removed holder down before a new host claims the VIP. It is
+	// only ever invoked host→host (the operator path is DeleteLoadBalancer, which fans
+	// this out to peers and handles the local host directly). Refuse non-peer callers so
+	// it can't be driven by a stale/unauthorized client.
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, status.Error(codes.PermissionDenied, "RemoveLB is a peer-only RPC")
+	}
 	if req.LbName == "" {
 		return nil, status.Error(codes.InvalidArgument, "lb_name required")
 	}
@@ -1604,11 +2370,59 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 		if !cfg.Enabled || !s.lbRunsOnHost(ctx, cfg) {
 			continue
 		}
-		// Use refreshLBLocal which reads the full spec and re-applies.
 		if cfg.StackName != "" {
+			// Stack LB: refreshLBLocal reads the full spec and re-applies.
 			s.refreshLBLocal(ctx, cfg.StackName)
-			slog.Info("LB reconciled on startup", "lb", cfg.Name, "stack", cfg.StackName)
+			slog.Info("LB reconciled", "lb", cfg.Name, "stack", cfg.StackName)
+			continue
 		}
+		// Explicit (non-stack) LB: reconstruct from the stored row + backends and
+		// re-apply. Previously skipped entirely — harmless when nothing ever stopped
+		// keepalived spontaneously, but Phase-2 DemoteAll now does, so an explicit LB
+		// must be re-appliable to recover on quorum heal (and at startup).
+		s.reapplyExplicitLB(ctx, cfg)
+	}
+}
+
+// reapplyExplicitLB rebuilds an explicit (non-stack) LB's lb.Config from its stored row +
+// backends and re-applies it locally (idempotent; the Phase-1 exec gate still guards it).
+func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRecord) {
+	vipIP, vipPrefix, err := lb.ParseVIP(cfg.VIP)
+	if err != nil {
+		slog.Warn("reapplyExplicitLB: parse vip", "lb", cfg.Name, "error", err)
+		return
+	}
+	hosts, _ := parseHostsJSON(cfg.Hosts)
+	priority := 50
+	if len(hosts) == 0 || hosts[0] == s.hostName {
+		priority = 100
+	}
+	var parsed []*pb.LBPort
+	json.Unmarshal([]byte(cfg.Ports), &parsed)
+	var ports []lb.Port
+	backendPort := 80
+	for _, p := range parsed {
+		ports = append(ports, lb.Port{Listen: int(p.Listen), Target: int(p.Target), Protocol: p.Protocol})
+	}
+	if len(ports) > 0 {
+		backendPort = ports[0].Target
+	}
+	var backends []lb.Backend
+	if bs, berr := corrosion.ListLBBackends(ctx, s.db, cfg.Name); berr == nil {
+		for _, b := range bs {
+			if b.Enabled {
+				backends = append(backends, lb.Backend{Name: b.Name, IP: b.Address, Port: backendPort})
+			}
+		}
+	}
+	if err := s.applyLBLocal(ctx, lb.Config{
+		Name: cfg.Name, VIP: vipIP, VIPPrefix: vipPrefix,
+		Interface: lb.DetectInterfaceForIP(vipIP), VRID: s.allocVRID(ctx, cfg.Name),
+		Priority: priority, Backends: backends, Ports: ports, Algorithm: cfg.Algorithm,
+	}); err != nil {
+		slog.Warn("reapplyExplicitLB: apply failed", "lb", cfg.Name, "error", err)
+	} else {
+		slog.Info("LB reconciled", "lb", cfg.Name)
 	}
 }
 

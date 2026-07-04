@@ -514,6 +514,15 @@ const (
 // reconciler recreates the rootfs from the image. Only relocatable fields are
 // carried; runtime state resets to pending.
 func RelocateContainer(ctx context.Context, c *Client, oldHost, name, newHost string) error {
+	return RelocateContainerWithToken(ctx, c, oldHost, name, newHost, "")
+}
+
+// RelocateContainerWithToken is RelocateContainer that also stamps a relocation
+// token on the re-keyed row. When the split-brain gate is enforced, the
+// coordinator mints a runtime_action_proofs row bound to this token and the
+// target's reconciler claims it single-use by token before recreating. token=""
+// is the unenforced/legacy path (no proof binding).
+func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, newHost, token string) error {
 	old, err := GetContainer(ctx, c, oldHost, name)
 	if err != nil {
 		return err
@@ -535,6 +544,7 @@ func RelocateContainer(ctx context.Context, c *Client, oldHost, name, newHost st
 	rec.HostName = newHost
 	rec.State = "pending"
 	rec.StateDetail = ContainerRelocateRecreateDetail
+	rec.RelocateToken = token
 	rec.CreatedAt = "" // fresh row on the target
 	return UpsertContainer(ctx, c, rec)
 }

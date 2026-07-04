@@ -18,6 +18,43 @@ import (
 	"github.com/litevirt/litevirt/internal/hlc"
 )
 
+// customMergeTables use a bespoke, NON-LWW merge (handled inline in both merge
+// paths — mergeChunk for anti-entropy and applyStatementLWW for the WAL) instead
+// of the capabilityMap resolver. They ARE anti-entropy-repaired (present in
+// tableNames) but must never be resolved by resolveTie/lwwOrder alone.
+var customMergeTables = map[string]bool{
+	"runtime_action_proofs": true, // monotone lifecycle merge (see proofMergeKeepLocal)
+}
+
+// proofRank orders the runtime_action_proofs lifecycle so a terminal state can
+// never be overwritten by an earlier one, regardless of updated_at.
+func proofRank(status string) int {
+	switch status {
+	case "in_progress":
+		return 1
+	case "completed", "failed":
+		return 2 // terminal
+	default: // prepared / unknown
+		return 0
+	}
+}
+
+// proofMergeKeepLocal is the monotone merge decision for a runtime_action_proofs
+// row: keep whichever side has the higher lifecycle rank; on an equal rank keep
+// local unless the incoming is strictly newer with the SAME status (LWW only
+// among same-status peers); a completed⊕failed conflict keeps local (the
+// deliberate "unresolved" divergence rather than a coin-flip).
+func proofMergeKeepLocal(localStatus, localTS, incomingStatus, incomingTS string) bool {
+	lr, ir := proofRank(localStatus), proofRank(incomingStatus)
+	if lr != ir {
+		return lr > ir
+	}
+	if lr == 2 && localStatus != incomingStatus {
+		return true // completed⊕failed — keep local, don't converge to a coin-flip
+	}
+	return localWinsLWW(localTS, incomingTS)
+}
+
 // localWinsLWW decides whether the existing local row should be kept over an
 // incoming one under last-writer-wins.
 //
@@ -118,6 +155,25 @@ var sensitiveTableNames = []string{
 	"user_2fa_sets",
 	"recovery_codes",
 	"recovery_code_sets",
+	// Split-brain runtime-action proofs (v38). Peer-only because a proof carries a
+	// bearer capability (relocation_token) that must never be operator-readable.
+	// The WAL relay is the primary, TOKEN-gated replication path; this AE lane is
+	// the convergence SAFETY NET for a peer that was offline past MaxLogRetention
+	// (it recovers vms.pending_action_id via the public lane, so it must recover
+	// the linked proof too, or a proof-required start strands). Merge is the
+	// bespoke MONOTONE resolver (customMergeTables in mergeChunk), NOT LWW — a
+	// newer non-terminal copy can't resurrect a spent proof.
+	//
+	// DELIBERATE DEVIATION from "the token gates proof replication on EVERY path":
+	// this lane is peer-mTLS-gated, not token-gated. It is safe because (a) any node
+	// holding the table ships the monotone resolver in the same v38 binary, so the
+	// merge is single-use-safe regardless of the token; (b) execute sites force BOTH
+	// the ExecutionGate AND proof validation on marker presence, so even a proof that
+	// reached a node that "shouldn't" have it cannot drive an ungated runtime action;
+	// and (c) pre-flip no proof rows exist, so this carries nothing until the gate is
+	// cluster-wide. The pull applier is always a v38 node (it runs this code), so no
+	// LWW-only node ever merges a proof.
+	"runtime_action_proofs",
 }
 
 func tableSet(tables []string) map[string]bool {
@@ -402,6 +458,22 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			skipped++
 			continue
 		}
+		// Custom monotone merge (runtime_action_proofs): decide by lifecycle rank,
+		// not LWW, so anti-entropy repairs the proof row without a newer non-terminal
+		// copy resurrecting a spent proof. Handled entirely here (bypasses lwwOrder /
+		// resolveTie).
+		if customMergeTables[table.Name] {
+			if c.proofMergeKeepLocalRow(tx, table, row, pkCols, pkIdx, updatedAtIdx) {
+				skipped++
+				continue
+			}
+			if _, err := tx.Exec(insertSQL, row...); err != nil {
+				slog.Warn("sync: merge row", "table", table.Name, "error", err)
+			} else {
+				merged++
+			}
+			continue
+		}
 		if existing != nil {
 			incomingTS, _ := row[updatedAtIdx].(string)
 			if incomingTS != "" {
@@ -452,6 +524,97 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		return 0, skipped // commit failed → nothing in this chunk landed
 	}
 	return merged, skipped
+}
+
+// proofMergeKeepLocalRow is the anti-entropy monotone decision for a
+// runtime_action_proofs row: fetch the local row's status + updated_at (aligned
+// to the incoming dump columns) and compare via proofMergeKeepLocal. No local row
+// → apply the incoming (false).
+func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool {
+	localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if !found {
+		return false
+	}
+	statusIdx, stepIdx := -1, -1
+	for i, col := range table.Columns {
+		switch col {
+		case "status":
+			statusIdx = i
+		case "step_state":
+			stepIdx = i
+		}
+	}
+	localTS, _ := localRow[updatedAtIdx].(string)
+	incomingTS, _ := row[updatedAtIdx].(string)
+	if statusIdx < 0 {
+		return localWinsLWW(localTS, incomingTS) // no status column → plain LWW fallback
+	}
+	localStatus, _ := localRow[statusIdx].(string)
+	incomingStatus, _ := row[statusIdx].(string)
+
+	// A completed⊕failed split is a safety fault (a proof executed on two hosts):
+	// keep local AND surface it as an unresolved tie for operator/reconciler review,
+	// never silently diverge.
+	if proofRank(localStatus) == 2 && proofRank(incomingStatus) == 2 && localStatus != incomingStatus {
+		c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "runtime_owned")
+		return true
+	}
+
+	keepLocal := proofMergeKeepLocal(localStatus, localTS, incomingStatus, incomingTS)
+	// Forward-only step_state in BOTH directions: whichever row wins, the merge must
+	// not drop a checkpoint the other side already recorded — losing "started" would
+	// let a promote resume destroy a running domain.
+	if stepIdx >= 0 {
+		ls, _ := localRow[stepIdx].(string)
+		is, _ := row[stepIdx].(string)
+		union := unionSteps(ls, is)
+		if !keepLocal {
+			// Incoming row lands → carry local's checkpoints into it.
+			row[stepIdx] = union
+		} else if union != ls {
+			// Local row stays, but incoming recorded a checkpoint local lacks →
+			// fold it into the local row so a later resume still sees it. No-op when
+			// local is already a superset (the common case, single-executor proofs).
+			c.updateProofStepState(tx, table.Name, pkCols, pkIdx, row, union)
+		}
+	}
+	return keepLocal
+}
+
+// updateProofStepState folds a unioned step_state back into the surviving local row
+// (used when local wins the merge but the incoming copy carried an extra checkpoint).
+// Local-only, on the merge tx — symmetric with the incoming-row apply path.
+func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []string, pkIdx []int, incomingRow []interface{}, union string) {
+	if len(pkCols) == 0 {
+		return
+	}
+	where := make([]string, len(pkCols))
+	args := make([]interface{}, 0, len(pkCols)+1)
+	args = append(args, union)
+	for i, col := range pkCols {
+		where[i] = col + " = ?"
+		if i < len(pkIdx) && pkIdx[i] >= 0 && pkIdx[i] < len(incomingRow) {
+			args = append(args, incomingRow[pkIdx[i]])
+		}
+	}
+	q := "UPDATE " + tableName + " SET step_state = ? WHERE " + strings.Join(where, " AND ")
+	if _, err := tx.Exec(q, args...); err != nil {
+		slog.Warn("sync: fold step_state union into local proof", "table", tableName, "error", err)
+	}
+}
+
+// unionSteps merges two space-separated step_state sets, preserving order and
+// dropping duplicates (forward-only — a merge never loses a recorded step).
+func unionSteps(a, b string) string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, s := range strings.Fields(a + " " + b) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // readTableColumns returns the local table's column set under a brief read lock.

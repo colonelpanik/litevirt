@@ -41,6 +41,39 @@ type Replicator struct {
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
+
+	// proofReplicaGate reports whether a peer advertises the split-brain gate
+	// capability (token-based, fresh-Ping-cached). Injected by the daemon BEFORE
+	// Start (so no replication goroutine runs with a nil gate). When nil, the WAL
+	// proof filter FAILS CLOSED — proof-bearing entries are deferred, never sent on
+	// a schema_version guess (a schema-38 peer that doesn't advertise the token
+	// would otherwise wrongly receive proofs after the flip).
+	proofReplicaGate func(ctx context.Context, peer string) bool
+}
+
+// SetProofReplicaGate injects the per-peer capability gate for proof-table WAL
+// replication (see internal/health Checker.PeerSupports).
+func (r *Replicator) SetProofReplicaGate(fn func(ctx context.Context, peer string) bool) {
+	r.mu.Lock()
+	r.proofReplicaGate = fn
+	r.mu.Unlock()
+}
+
+// peerLacksProofSupport reports whether proof-table mutations must be filtered
+// from the stream to peer. Token-based (the gate is a fresh-Ping-cached capability
+// check wired before Start). A nil gate FAILS CLOSED — treat the peer as lacking
+// support so proof-bearing entries defer rather than leak on a schema guess (the
+// schema_version fallback wrongly passed a schema-38 peer that doesn't advertise
+// the token). Only proofs ever exist post-flip, so a nil-gate defer is a no-op
+// pre-flip and a safe stall for the brief pre-wiring window otherwise.
+func (r *Replicator) peerLacksProofSupport(ctx context.Context, peer string) bool {
+	r.mu.Lock()
+	gate := r.proofReplicaGate
+	r.mu.Unlock()
+	if gate == nil {
+		return true // fail closed: no way to confirm support
+	}
+	return !gate(ctx, peer)
 }
 
 // NewReplicator creates a replicator for the given client.
@@ -436,6 +469,34 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		return 0, fmt.Errorf("read mutation_log: %w", err)
 	}
 
+	// Per-peer capability filtering (split-brain hardening): a peer whose DB is
+	// pre-v38 does NOT have runtime_action_proofs, so sending it a proof mutation
+	// would fail-to-apply and back-pressure the whole stream. But a proof write is
+	// co-batched with its marker (the vms.pending_action_id stamp) in a SINGLE
+	// mutation entry, so we must NOT split the entry: dropping only the proof
+	// statement would leave a dangling pending_action_id pointing at a proof the
+	// peer will never receive (and a pre-v38 peer can't apply the marker column
+	// either). Instead DEFER THE WHOLE proof-bearing entry — truncate the batch at
+	// the first such entry and hold the watermark before it, so the entry (proof +
+	// marker together) replicates atomically once the peer gains support. Proofs
+	// are only WRITTEN once the gate is cluster-wide, so nothing is deferred in
+	// steady state — this only covers a mid-roll / downgraded / offline peer, whose
+	// proof stream deliberately stalls until it can honor the monotone-consume
+	// resolver (surfaced separately as HA-degraded). The gate is TOKEN-based
+	// (fresh-Ping-cached capability); a nil gate FAILS CLOSED (defers proofs) — there
+	// is no schema_version fallback (a schema-38 peer that doesn't advertise the
+	// token would otherwise wrongly receive proofs after the flip).
+	if r.peerLacksProofSupport(ctx, peerName) {
+		kept, ceiling, truncated := deferUnsupportedProofEntries(entries)
+		entries = kept
+		if len(entries) == 0 {
+			return 0, nil // first entry is proof-bearing — send nothing, hold watermark
+		}
+		if truncated {
+			maxSeqSeen = ceiling // don't advance the watermark past the deferred entry
+		}
+	}
+
 	// If entries were skipped (originated from peer) but nothing to send,
 	// advance the watermark past the skipped entries so we don't re-read them.
 	if len(entries) == 0 {
@@ -505,6 +566,48 @@ type mutationEntry struct {
 	Origin    string
 	Stmts     string
 	CreatedAt string
+}
+
+// deferUnsupportedProofEntries truncates a batch at the FIRST proof-bearing entry, for a
+// destination peer that can't yet apply proofs (pre-v38 / not advertising the token). The
+// proof write is co-batched with its vms.pending_action_id marker in a SINGLE entry, so it
+// must replicate ATOMICALLY (never split) or DEFER WHOLE: everything before the first
+// proof-bearing entry is proof-free and safe to send now; that entry and all after it wait
+// for a later cycle once the peer gains support. Returns the sendable prefix, and — when it
+// truncated to a NON-EMPTY prefix — the watermark ceiling (the last kept entry's seq) so the
+// caller won't advance past the deferred entry. truncated=false means either no proof entry
+// was found (batch unchanged) OR the very first entry is proof-bearing (kept is empty →
+// caller sends nothing and holds the watermark).
+func deferUnsupportedProofEntries(entries []mutationEntry) (kept []mutationEntry, ceiling int64, truncated bool) {
+	for i, e := range entries {
+		if entryTouchesCustomMerge(e.Stmts) {
+			kept = entries[:i]
+			if len(kept) == 0 {
+				return nil, 0, false // first entry proof-bearing → hold watermark, send nothing
+			}
+			return kept, kept[len(kept)-1].Seq, true
+		}
+	}
+	return entries, 0, false // no proof-bearing entry → whole batch is sendable
+}
+
+// entryTouchesCustomMerge reports whether a serialized mutation entry contains ANY
+// statement targeting a customMergeTables table (runtime_action_proofs). Such an
+// entry must be replicated ATOMICALLY (proof + co-batched vms.pending_action_id
+// marker together) or DEFERRED WHOLE for a peer that can't yet apply the proof —
+// never split. On a parse error it returns true (conservative: treat as
+// proof-bearing and defer, rather than risk sending a partial to an unready peer).
+func entryTouchesCustomMerge(stmtsJSON string) bool {
+	var stmts []Statement
+	if err := json.Unmarshal([]byte(stmtsJSON), &stmts); err != nil {
+		return true
+	}
+	for _, s := range stmts {
+		if customMergeTables[extractTableName(s.SQL)] {
+			return true
+		}
+	}
+	return false
 }
 
 // readMutationLog reads entries after afterSeq, filtering out entries originating
@@ -936,6 +1039,46 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	if tableName == "fencing_log" || tableName == "audit_log" || tableName == "mutation_log" || tableName == "vm_events" {
 		replaced := replaceInsertStrategy(s.SQL, "INSERT OR IGNORE")
 		_, err := tx.ExecContext(ctx, replaced, s.Params...)
+		return err
+	}
+
+	// runtime_action_proofs (split-brain hardening, v38): a MONOTONE lifecycle, not
+	// LWW. A row is immutable after creation except forward, GUARDED status
+	// transitions (prepared→in_progress→{completed|failed}, each an UPDATE …
+	// WHERE status IN (<legal predecessors>)). Two rules make the merge monotone
+	// WITHOUT a timestamp compare — so a newer non-terminal copy can't resurrect a
+	// spent proof:
+	//   - a replicated INSERT uses INSERT OR IGNORE (never OR REPLACE), so it can
+	//     only create the row when absent and never clobbers one that has progressed;
+	//   - the guarded UPDATEs travel with their WHERE clause and are applied
+	//     directly (no LWW skip): they no-op on a peer whose local status is already
+	//     terminal or ahead, giving terminal-beats-non-terminal regardless of
+	//     updated_at. A completed⊕failed split (only reachable if a proof somehow
+	//     executed on two hosts) stays divergent — each keeps its own terminal — as
+	//     the deliberate "unresolved" outcome rather than a coin-flip.
+	//
+	// DELIBERATE DEVIATION on terminal disagreement: this WAL apply path processes
+	// STATEMENTS, not full rows, so it cannot compare the local vs incoming terminal
+	// and does NOT itself call trackUnresolved — a completed⊕failed split just stays
+	// divergent here (each side's guarded UPDATE no-ops on the other's terminal). The
+	// safety-fault SIGNAL is raised by the periodic anti-entropy full-row compare
+	// (proofMergeKeepLocalRow → trackUnresolved, sync.go), which reconciles digests
+	// within one AE interval and flags the split for operator repair. This delay is
+	// acceptable: both proofs are already terminal, so neither authorizes any further
+	// runtime action — the divergence is a detection concern, not a control gap.
+	// (Mixed-version safety has TWO layers on the send side, so a peer that can't
+	//  honor a proof never receives one: the WAL relay DEFERS a whole proof-bearing
+	//  entry to any peer not advertising split_brain_gate_v1 — token-gated, fail
+	//  closed on a nil gate — see peerLacksProofSupport/entryTouchesCustomMerge; and
+	//  proofs are only written once the gate is cluster-wide. This apply path is the
+	//  receive side: it stays monotone regardless, so an out-of-order/duplicated
+	//  proof mutation still can't resurrect a spent proof.)
+	if customMergeTables[tableName] {
+		sqlStmt := s.SQL
+		if isInsertStatement(sqlStmt) {
+			sqlStmt = replaceInsertStrategy(sqlStmt, "INSERT OR IGNORE")
+		}
+		_, err := tx.ExecContext(ctx, sqlStmt, s.Params...)
 		return err
 	}
 

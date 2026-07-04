@@ -90,6 +90,14 @@ func TestPublicDumpExcludesSensitiveState(t *testing.T) {
 	if err := InsertRecoveryCodes(ctx, c, "alice", []string{"$2a$10$hashone", "$2a$10$hashtwo"}); err != nil {
 		t.Fatal(err)
 	}
+	// runtime_action_proofs joined the sensitive lane (v38): peer-only because a
+	// proof carries a bearer relocation_token that must never reach the operator dump.
+	if err := WriteActionProof(ctx, c, ActionProof{
+		ID: "p1", Action: ActionRelocate, TargetKind: "container", TargetName: "ct1",
+		DestHost: "host-b", Coordinator: "host-a", RelocationToken: "reloc-bearer-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	publicPayload, err := decompressPayload(c.DumpStateBytes())
 	if err != nil {
@@ -101,7 +109,7 @@ func TestPublicDumpExcludesSensitiveState(t *testing.T) {
 		}
 	}
 	plain, _ := json.Marshal(publicPayload)
-	for _, secret := range []string{"super-secret-token", "hook.example/secret", "JBSWY3DPEHPK3PXP-totp-secret", "$2a$10$hashone"} {
+	for _, secret := range []string{"super-secret-token", "hook.example/secret", "JBSWY3DPEHPK3PXP-totp-secret", "$2a$10$hashone", "reloc-bearer-secret"} {
 		if strings.Contains(string(plain), secret) {
 			t.Fatalf("public dump leaked sensitive row data (%q): %s", secret, plain)
 		}
@@ -112,6 +120,107 @@ func TestPublicDumpExcludesSensitiveState(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Fatalf("sensitive dump tables = %v, want %v", got, want)
+	}
+}
+
+// A proof missing on a peer (e.g. it was offline past MaxLogRetention and missed
+// the WAL window) converges via the peer-only sensitive anti-entropy lane — and
+// the merge is MONOTONE over that lane too, so a stale prepared copy can't
+// resurrect a spent proof.
+func TestSensitiveAE_ProofConverges(t *testing.T) {
+	ctx := context.Background()
+	src := mustTestClient(t)
+	dst := mustTestClient(t)
+
+	// Source has a completed proof; dst has never seen it.
+	p := ActionProof{ID: "p1", Action: ActionRelocate, TargetKind: "container",
+		TargetName: "ct1", DestHost: "h", Coordinator: "h"}
+	if err := WriteActionProof(ctx, src, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClaimActionProof(ctx, src, "p1", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompleteActionProof(ctx, src, "p1", "h"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Convergence: dst merges src's sensitive dump → the proof appears (the AE
+	// recovery path the WAL retention window assumes).
+	dst.MergeSensitiveStateBytesLWW(src.DumpSensitiveStateBytes())
+	pr, ok, err := GetActionProof(ctx, dst, "p1")
+	if err != nil || !ok {
+		t.Fatalf("proof did not converge to dst via sensitive AE: ok=%v err=%v", ok, err)
+	}
+	if pr.Status != ProofCompleted {
+		t.Fatalf("converged status=%q; want completed", pr.Status)
+	}
+
+	// Monotone over the sensitive lane: a merge carrying a (newer) PREPARED copy
+	// must not resurrect the spent proof.
+	stale := mustTestClient(t)
+	if err := WriteActionProof(ctx, stale, p); err != nil { // prepared, freshly-stamped
+		t.Fatal(err)
+	}
+	dst.MergeSensitiveStateBytesLWW(stale.DumpSensitiveStateBytes())
+	pr, _, _ = GetActionProof(ctx, dst, "p1")
+	if pr.Status != ProofCompleted {
+		t.Fatalf("status=%q after stale merge; want completed — sensitive-lane merge must be MONOTONE", pr.Status)
+	}
+}
+
+// TestSensitiveAE_StepStateUnionBothDirections pins the forward-only step_state
+// invariant on the merge path: whichever row WINS, the surviving row must carry the
+// UNION of both sides' checkpoints — losing a recorded step (e.g. "started") could let a
+// later promote resume destroy a running domain. Here the local row wins the merge (it is
+// terminal, higher rank) but the incoming copy carries a step local lacks, so the union
+// must be folded back into the surviving local row.
+func TestSensitiveAE_StepStateUnionBothDirections(t *testing.T) {
+	ctx := context.Background()
+	dst := mustTestClient(t)
+	src := mustTestClient(t)
+
+	p := ActionProof{ID: "p-steps", Action: ActionPromote, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "h", Coordinator: "h"}
+
+	// dst: terminal (completed) proof that recorded step "started".
+	if err := WriteActionProof(ctx, dst, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClaimActionProof(ctx, dst, "p-steps", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendProofStep(ctx, dst, "p-steps", "started"); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompleteActionProof(ctx, dst, "p-steps", "h"); err != nil {
+		t.Fatal(err)
+	}
+
+	// src: a lower-rank (in_progress) copy that recorded a DIFFERENT step, "diskbuilt".
+	if err := WriteActionProof(ctx, src, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClaimActionProof(ctx, src, "p-steps", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendProofStep(ctx, src, "p-steps", "diskbuilt"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Merge src → dst. Local (completed) outranks incoming (in_progress) so local wins,
+	// but the incoming step must still be folded in.
+	dst.MergeSensitiveStateBytesLWW(src.DumpSensitiveStateBytes())
+
+	pr, ok, err := GetActionProof(ctx, dst, "p-steps")
+	if err != nil || !ok {
+		t.Fatalf("proof missing after merge: ok=%v err=%v", ok, err)
+	}
+	if pr.Status != ProofCompleted {
+		t.Fatalf("local terminal status must survive; got %q", pr.Status)
+	}
+	if !ProofStepDone(pr.StepState, "started") || !ProofStepDone(pr.StepState, "diskbuilt") {
+		t.Fatalf("surviving row must carry BOTH checkpoints (union); got step_state=%q", pr.StepState)
 	}
 }
 

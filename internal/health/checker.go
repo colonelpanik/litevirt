@@ -23,9 +23,18 @@ const (
 
 // peerState tracks the last known health state for a peer so we only write
 // to the database on state transitions, not every tick.
+//
+// lastHealthyAt/lastFailureAt are LOCAL MONOTONIC anchors (time.Now, so they
+// carry a monotonic reading): split-brain timing (Phase 2 self-demotion, Phase 5
+// watchdog) must measure elapsed time by the local clock, never by comparing
+// cross-node RFC3339 timestamps (which can be ±MaxSkew apart). They live only in
+// memory, so a daemon restart deliberately resets them — a restart must re-earn
+// its timing, not credit a pre-restart reading.
 type peerState struct {
-	status   string // "healthy" or "suspect"
-	failures int
+	status        string // "healthy" or "suspect"
+	failures      int
+	lastHealthyAt time.Time // monotonic; zero if never probed healthy
+	lastFailureAt time.Time // monotonic; zero if never probed unhealthy
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -38,15 +47,77 @@ type Checker struct {
 	mu     sync.Mutex
 	peers  map[string]*peerState // target hostname → cached state
 	crlVer int64                 // last published CRL version
+
+	// Warmup / quorum-timing anchors (local monotonic; reset on restart).
+	startedAt  time.Time // when Start began; bounds the Unknown warmup window
+	probedOnce bool      // set true after the first full probe cycle completes
+
+	// peerPinger fresh-Pings a peer for its capability tokens (SetPeerPinger).
+	peerPinger PeerPinger
+	// peerCaps caches each peer's advertised capabilities with a short TTL so the
+	// replicator can gate proof replication per-peer without a Ping storm.
+	peerCaps map[string]peerCapEntry
+
+	// capActiveNeg caches a NEGATIVE CapabilityActive result per token for a short TTL, so
+	// the frequent pre-latch Enforced() calls on hot paths (StartVM/MigrateVM/applyLBLocal,
+	// the 2s demoter tick, owner-assert) don't re-fan-out fresh Pings every call. Only
+	// negatives are cached — Enforced latches on the first positive, so there's no repeated
+	// positive recompute to cache; the short TTL bounds how long a just-healed cluster waits
+	// to activate.
+	capActiveNeg map[string]capNegEntry
+
+	// activated latches, PER TOKEN, "enforcement has activated cluster-wide"
+	// (monotone, durable via a per-token marker file) so a later partition fails
+	// closed, not to legacy. Keyed by token so distinct features (Phase 2/4/5) latch
+	// INDEPENDENTLY — a single global latch would conflate them. activationPersisted
+	// tracks whether each token's durable marker write SUCCEEDED; a failed write is
+	// retried on the next Enforced call (a lost marker would re-open the legacy path
+	// across a restart during a partition). Per-token marker file = base + "." + token.
+	activated            map[string]bool
+	activationPersisted  map[string]bool
+	activationMarkerBase string
+
+	// selfFenced reports whether THIS node has self-fenced (tripped the watchdog) and is
+	// waiting to reboot. When true, ExecutionGate AND DecisionGate fail closed regardless
+	// of quorum/role — a doomed node must take no runtime-ownership decide/execute during
+	// the fence-timeout window. Injected by the daemon from the watchdog controller;
+	// nil-safe (unset → never fenced). This is the central chokepoint that also covers the
+	// reconciler's startPendingVM and every other gate consumer.
+	selfFenced func() bool
+}
+
+// SetSelfFenced injects the self-fenced predicate (Phase 2 defense-in-depth). nil-safe.
+func (c *Checker) SetSelfFenced(fn func() bool) { c.selfFenced = fn }
+
+// SelfFenced reports whether this node has self-fenced (nil predicate → false). Public so
+// the reconcile/health loops can hard-gate runtime actions on it even on paths that don't
+// consult Execution/DecisionGate (the markerless legacy path).
+func (c *Checker) SelfFenced() bool { return c.isSelfFenced() }
+
+// isSelfFenced reports whether this node has self-fenced (nil predicate → false).
+func (c *Checker) isSelfFenced() bool { return c.selfFenced != nil && c.selfFenced() }
+
+type peerCapEntry struct {
+	caps      []string
+	fetchedAt time.Time // local monotonic
+}
+
+type capNegEntry struct {
+	reason string
+	at     time.Time // local monotonic
 }
 
 // NewChecker creates a new health checker.
 func NewChecker(hostName, pkiDir string, db *corrosion.Client) *Checker {
 	return &Checker{
-		hostName: hostName,
-		pkiDir:   pkiDir,
-		db:       db,
-		peers:    make(map[string]*peerState),
+		hostName:            hostName,
+		pkiDir:              pkiDir,
+		db:                  db,
+		peers:               make(map[string]*peerState),
+		peerCaps:            make(map[string]peerCapEntry),
+		capActiveNeg:        make(map[string]capNegEntry),
+		activated:           make(map[string]bool),
+		activationPersisted: make(map[string]bool),
 	}
 }
 
@@ -60,6 +131,10 @@ func (c *Checker) Start(ctx context.Context) {
 		return
 	}
 
+	c.mu.Lock()
+	c.startedAt = time.Now()
+	c.mu.Unlock()
+
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
@@ -68,16 +143,27 @@ func (c *Checker) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.checkAllPeers(ctx)
+			// Only a cycle that actually enumerated hosts ends warmup — a ListHosts error
+			// probed nobody, so leaving probedOnce false keeps quorum Unknown (not a
+			// premature No off an empty c.peers).
+			if c.checkAllPeers(ctx) {
+				c.mu.Lock()
+				c.probedOnce = true
+				c.mu.Unlock()
+			}
 		}
 	}
 }
 
-func (c *Checker) checkAllPeers(ctx context.Context) {
+// checkAllPeers probes every peer once. It returns true only when it actually
+// ENUMERATED the host list — a ListHosts error probes nobody and returns false, so the
+// caller must not treat that tick as a completed warmup cycle (else Unknown collapses to
+// No with an empty c.peers on a single transient DB error).
+func (c *Checker) checkAllPeers(ctx context.Context) bool {
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {
 		slog.Error("health check: list hosts", "error", err)
-		return
+		return false
 	}
 
 	// Check local CRL version and publish it for gossip-based distribution (#49).
@@ -134,6 +220,7 @@ func (c *Checker) checkAllPeers(ctx context.Context) {
 	boundedFanout(targets, probeConcurrency, func(h corrosion.HostRecord) {
 		c.checkHost(ctx, h)
 	})
+	return true
 }
 
 // boundedFanout runs work over items with at most `concurrency` goroutines in
@@ -196,6 +283,14 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	changed := !exists || newStatus != prev.status || newFailures != prev.failures
 	prev.status = newStatus
 	prev.failures = newFailures
+	// Local monotonic anchors updated every probe (not just on change) so Phase 2/5
+	// timers measure "time since last direct contact" by our own clock.
+	mono := time.Now()
+	if healthy {
+		prev.lastHealthyAt = mono
+	} else {
+		prev.lastFailureAt = mono
+	}
 	c.mu.Unlock()
 
 	if !changed {

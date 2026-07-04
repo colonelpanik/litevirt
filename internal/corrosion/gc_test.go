@@ -47,6 +47,43 @@ func gcLBBackend(t *testing.T, c *Client, lbName, name, generation, updatedAt st
 	}
 }
 
+func gcProof(t *testing.T, c *Client, id, status, updatedAt string) {
+	t.Helper()
+	if err := c.execLocal(context.Background(),
+		`INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator, status, relocation_token, created_at, updated_at)
+		 VALUES (?, 'reschedule', 'vm', 'x', 'h', 'coord', ?, '', ?, ?)`,
+		id, status, updatedAt, updatedAt); err != nil {
+		t.Fatalf("insert proof: %v", err)
+	}
+}
+
+func proofExists(t *testing.T, c *Client, id string) bool {
+	t.Helper()
+	rows, err := c.Query(context.Background(), `SELECT 1 FROM runtime_action_proofs WHERE id = ?`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(rows) > 0
+}
+
+// Proof rows are DELIBERATELY not GC'd by the local sweep — a plain local delete of a
+// terminal proof can be resurrected (re-seed via WriteActionProof / a lagging peer copy),
+// so the plan requires a separate convergence-gated reaper. Guard against a regression that
+// re-adds an unsafe local delete: even an old terminal proof survives GCSupersededRows.
+func TestGCSupersededRows_ProofsNotLocallyDeleted(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	old := time.Now().Add(-72 * time.Hour).UTC().Format(time.RFC3339Nano)
+	gcProof(t, c, "p-terminal-old", "completed", old)
+
+	if _, err := GCSupersededRows(ctx, c, time.Hour, 7*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if !proofExists(t, c, "p-terminal-old") {
+		t.Fatal("a terminal proof must NOT be locally deleted by the superseded-row sweep (needs convergence-gated GC)")
+	}
+}
+
 func rcExists(t *testing.T, c *Client, hash string) bool {
 	t.Helper()
 	rows, err := c.Query(context.Background(), `SELECT 1 FROM recovery_codes WHERE code_hash = ?`, hash)

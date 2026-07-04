@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
 )
@@ -50,6 +51,16 @@ func (c *ContainerChecker) assertContainerOwnership(ctx context.Context) {
 	}
 	if !localHostIsActiveWorker(hosts, c.hostName) {
 		return
+	}
+	// Split-brain gate (Phase 1): once enforced, a container re-key (a
+	// runtime-ownership write) additionally requires local quorum. ExecutionGate-
+	// only (per-host reclaim; no lease/proof). Fail-open until cluster-wide.
+	if c.gate != nil && c.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+		if g := c.gate.ExecutionGate(ctx); !g.OK {
+			slog.Info("container owner-assert: execution gate refused re-key (no quorum)", "reason", g.Reason)
+			c.noteGateRefused(corrosion.ActionOwnerAssert, g.Reason)
+			return
+		}
 	}
 	others := workloadCapablePeers(hosts, c.hostName)
 

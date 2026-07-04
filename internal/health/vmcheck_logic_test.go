@@ -93,6 +93,103 @@ func TestSetMigrateFunc(t *testing.T) {
 	}
 }
 
+// ── takeAction: split-brain gate ────────────────────────────────────────────
+
+// A health-check "restart"/"migrate" is an automated runtime action: once enforced
+// it requires local quorum (ExecutionGate). An isolated host (no quorum) must not
+// restart-in-place or migrate a failing VM.
+func TestTakeAction_GatedWithoutQuorum(t *testing.T) {
+	for _, action := range []string{"restart", "migrate"} {
+		t.Run(action, func(t *testing.T) {
+			db := testLogicDB(t)
+			ctx := context.Background()
+			if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+				Name: "vm1", HostName: "node1", Spec: `{}`, State: "running",
+			}, nil, nil); err != nil {
+				t.Fatalf("InsertVM: %v", err)
+			}
+
+			var refused []string
+			v := NewVMChecker("node1", db, nil)
+			// Enforced (latched) but ExecutionGate refuses (no quorum).
+			v.SetGate(fakeGate{exec: GateResult{OK: false, Reason: ReasonNoQuorum}, active: true})
+			v.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
+
+			vm := corrosion.VMRecord{Name: "vm1", HostName: "node1", State: "running"}
+			v.takeAction(ctx, vm, &pb.HealthCheckSpec{Type: "tcp", Target: "10.0.0.1:80", Action: action})
+
+			if len(refused) != 1 || refused[0] != ReasonNoQuorum {
+				t.Fatalf("refusal=%v; want [no_quorum]", refused)
+			}
+			fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+			if fresh.State != "running" {
+				t.Fatalf("vm state=%q; want running (action refused, no runtime change)", fresh.State)
+			}
+		})
+	}
+}
+
+// "alert" is a notification, not a runtime action — it is NOT gated and still fires
+// even without quorum.
+func TestTakeAction_AlertNotGated(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node1", Spec: `{}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	var refused []string
+	v := NewVMChecker("node1", db, nil)
+	v.SetGate(fakeGate{exec: GateResult{OK: false, Reason: ReasonNoQuorum}, active: true})
+	v.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
+
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "node1", State: "running"}
+	v.takeAction(ctx, vm, &pb.HealthCheckSpec{Type: "tcp", Target: "10.0.0.1:80", Action: "alert"})
+
+	if len(refused) != 0 {
+		t.Fatalf("alert must not be gated; refusals=%v", refused)
+	}
+}
+
+// A health action is DROPPED if ownership moved off this host between the queued
+// async probe and now — no destroy/start of a stale local domain, no migrate with a
+// stale source (the check precedes the gate and acts on the fresh owner).
+func TestTakeAction_DroppedWhenOwnershipMoved(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	// The current row shows the VM owned by node2 (moved since the probe was queued).
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node2", Spec: `{}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	bus := events.NewBus()
+	ch, unsub := bus.Subscribe()
+	defer unsub()
+
+	v := NewVMChecker("node1", db, nil) // this host is node1
+	v.SetEventBus(bus)
+
+	// The queued snapshot still claims node1 (stale).
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "node1", State: "running"}
+	v.takeAction(ctx, vm, &pb.HealthCheckSpec{Type: "tcp", Target: "10.0.0.1:80", Action: "restart"})
+
+	// The ownership check returns BEFORE the "vm.health.failed" publish — so no action
+	// event is emitted, and the row is untouched.
+	select {
+	case evt := <-ch:
+		t.Fatalf("expected no action event (VM moved off host); got %q", evt.Action)
+	case <-time.After(100 * time.Millisecond):
+	}
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	if fresh.HostName != "node2" || fresh.State != "running" {
+		t.Fatalf("row mutated: host=%q state=%q; want node2/running (action dropped)", fresh.HostName, fresh.State)
+	}
+}
+
 // ── takeAction: suppressed by correlated failures ───────────────────────────
 
 func TestTakeAction_SuppressedByCorrelatedFailures(t *testing.T) {

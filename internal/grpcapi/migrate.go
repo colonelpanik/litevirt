@@ -162,6 +162,19 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition, "target host %q is not active", req.TargetHost)
 	}
 
+	// Split-brain gate (Phase 1), SOURCE-side: a migration is a runtime-ownership
+	// move, so the source must hold local quorum. This runs ON THE SOURCE (a
+	// non-source caller forwarded above and returned) and re-checks quorum HERE — not
+	// just at schedule time — closing the loss-of-quorum window between the rebalance
+	// executor / health-checker's DECISION and the actual move, AND covering an
+	// explicit operator MigrateVM that has no earlier gate. Placed before any
+	// target-side setup (PCI/network/disk provisioning) so a refusal wastes no work.
+	// Fail-open until split_brain_gate_v1 is cluster-wide.
+	if reason, refused := s.execGateRefused(ctx); refused {
+		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		return status.Errorf(codes.FailedPrecondition, "migration refused: %s", reason)
+	}
+
 	// Gate the explicit target on the matching host capability (mirrors what
 	// placement does for auto placement) — a firmware VM that lands on a
 	// non-capable host can't define.
@@ -378,6 +391,16 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// Combined with MigrateTunnelled, all data flows over the single libvirt
 	// TLS port (16514) — no SSH or extra ports required.
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", targetHost.Address)
+
+	// Split-brain gate, LATE re-check: the early gate (after target validation) is a
+	// fail-fast, but preflight/provisioning ran since then. Re-check quorum on the
+	// source IMMEDIATELY before the irreversible step (state → migrating, then
+	// MigrateToTarget), so a quorum loss during setup still stops the move. Fail-open
+	// until split_brain_gate_v1 is cluster-wide.
+	if reason, refused := s.execGateRefused(ctx); refused {
+		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		return status.Errorf(codes.FailedPrecondition, "migration refused: %s", reason)
+	}
 
 	// Mark as migrating in state store
 	corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", fmt.Sprintf("→ %s", req.TargetHost))

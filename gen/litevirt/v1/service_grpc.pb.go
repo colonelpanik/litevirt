@@ -46,6 +46,9 @@ const (
 	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
 	LiteVirt_CheckVMRuntime_FullMethodName             = "/litevirt.v1.LiteVirt/CheckVMRuntime"
 	LiteVirt_CheckContainerRuntime_FullMethodName      = "/litevirt.v1.LiteVirt/CheckContainerRuntime"
+	LiteVirt_CheckVIPParticipant_FullMethodName        = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
+	LiteVirt_RelayCheckVIPParticipant_FullMethodName   = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
+	LiteVirt_CheckLBPresent_FullMethodName             = "/litevirt.v1.LiteVirt/CheckLBPresent"
 	LiteVirt_CloneVM_FullMethodName                    = "/litevirt.v1.LiteVirt/CloneVM"
 	LiteVirt_ConvertToTemplate_FullMethodName          = "/litevirt.v1.LiteVirt/ConvertToTemplate"
 	LiteVirt_ExecVM_FullMethodName                     = "/litevirt.v1.LiteVirt/ExecVM"
@@ -274,6 +277,9 @@ type LiteVirtClient interface {
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
 	CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeRequest, opts ...grpc.CallOption) (*CheckVMRuntimeResponse, error)
 	CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error)
+	CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error)
+	RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error)
+	CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error)
 	CloneVM(ctx context.Context, in *CloneVMRequest, opts ...grpc.CallOption) (*VM, error)
 	ConvertToTemplate(ctx context.Context, in *ConvertToTemplateRequest, opts ...grpc.CallOption) (*VM, error)
 	ExecVM(ctx context.Context, in *ExecVMRequest, opts ...grpc.CallOption) (*ExecVMResponse, error)
@@ -848,6 +854,36 @@ func (c *liteVirtClient) CheckContainerRuntime(ctx context.Context, in *CheckCon
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckContainerRuntimeResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_CheckContainerRuntime_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckVIPParticipantResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_CheckVIPParticipant_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RelayCheckVIPParticipantResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RelayCheckVIPParticipant_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckLBPresentResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_CheckLBPresent_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2967,6 +3003,9 @@ type LiteVirtServer interface {
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
 	CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error)
 	CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error)
+	CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error)
+	RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error)
+	CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error)
 	CloneVM(context.Context, *CloneVMRequest) (*VM, error)
 	ConvertToTemplate(context.Context, *ConvertToTemplateRequest) (*VM, error)
 	ExecVM(context.Context, *ExecVMRequest) (*ExecVMResponse, error)
@@ -3331,6 +3370,15 @@ func (UnimplementedLiteVirtServer) CheckVMRuntime(context.Context, *CheckVMRunti
 }
 func (UnimplementedLiteVirtServer) CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckContainerRuntime not implemented")
+}
+func (UnimplementedLiteVirtServer) CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckVIPParticipant not implemented")
+}
+func (UnimplementedLiteVirtServer) RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RelayCheckVIPParticipant not implemented")
+}
+func (UnimplementedLiteVirtServer) CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckLBPresent not implemented")
 }
 func (UnimplementedLiteVirtServer) CloneVM(context.Context, *CloneVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method CloneVM not implemented")
@@ -4332,6 +4380,60 @@ func _LiteVirt_CheckContainerRuntime_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, req.(*CheckContainerRuntimeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_CheckVIPParticipant_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckVIPParticipantRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).CheckVIPParticipant(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_CheckVIPParticipant_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).CheckVIPParticipant(ctx, req.(*CheckVIPParticipantRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RelayCheckVIPParticipant_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RelayCheckVIPParticipantRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RelayCheckVIPParticipant(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RelayCheckVIPParticipant_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RelayCheckVIPParticipant(ctx, req.(*RelayCheckVIPParticipantRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_CheckLBPresent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckLBPresentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).CheckLBPresent(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_CheckLBPresent_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).CheckLBPresent(ctx, req.(*CheckLBPresentRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7539,6 +7641,18 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckContainerRuntime",
 			Handler:    _LiteVirt_CheckContainerRuntime_Handler,
+		},
+		{
+			MethodName: "CheckVIPParticipant",
+			Handler:    _LiteVirt_CheckVIPParticipant_Handler,
+		},
+		{
+			MethodName: "RelayCheckVIPParticipant",
+			Handler:    _LiteVirt_RelayCheckVIPParticipant_Handler,
+		},
+		{
+			MethodName: "CheckLBPresent",
+			Handler:    _LiteVirt_CheckLBPresent_Handler,
 		},
 		{
 			MethodName: "CloneVM",

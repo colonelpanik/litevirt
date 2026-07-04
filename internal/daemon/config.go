@@ -112,6 +112,35 @@ type Config struct {
 	// than a real rootfs restore.
 	ContainerRestoreTimeoutSec int `yaml:"container_restore_timeout_sec"`
 
+	// Split-brain Phase 2 — minority VIP self-demotion. Both are seconds, consumed as
+	// time.Duration. An isolated (quorum-lost) LB host drops its own VIP so keepalived
+	// stops answering on the wrong side of a partition:
+	//   - QuorumLossDemoteAfterSec: sustained quorum loss before the minority self-demotes.
+	//   - KeepalivedStopTimeoutSec: how long DemoteAll waits for keepalived to confirm stopped
+	//     (else it self-fences).
+	// NOTE: majority-side RECLAIM is PROOF-gated, not timer-gated — the majority only
+	// (re)claims a VIP after synchronously standing the removed holder down and proving
+	// its keepalived is inert and the address released (see vipMoveRefused). So there is
+	// no "wait N seconds then take over" timer in Phase 2, and thus no demote-vs-takeover
+	// timing invariant to validate here. Reclaiming an UNREACHABLE holder (which can't
+	// prove release) is deliberately deferred to Phase 5 fencing; a timer floor, if one
+	// is ever needed, belongs there.
+	QuorumLossDemoteAfterSec int `yaml:"quorum_loss_demote_after_sec"`
+	KeepalivedStopTimeoutSec int `yaml:"keepalived_stop_timeout_sec"`
+
+	// NoQuorumVIPPolicy selects how the MAJORITY reclaims a VIP whose holder can neither be
+	// reached nor proven released. Only "safe" (the default) is accepted today:
+	//   - "safe": reclaim ONLY on a release proof (a reachable/relayed VIPAssigned=false, or
+	//     an operator manual-fence-confirm attesting the holder is down —
+	//     `lv host fence-confirm <host>`). An unreachable, unproven holder leaves the VIP DOWN + HA-degraded —
+	//     an outage, never a takeover. This upholds the core invariant (no proof ⇒ no new
+	//     ownership; a safe gap beats overlap).
+	// A weaker "best-effort" tier (timer-based takeover WITHOUT proof — availability over the
+	// split-brain guarantee) is intentionally NOT implemented; it would reintroduce
+	// dual-master risk. The supported availability-first recovery is the manual-fence-confirm
+	// above, not a weaker policy. Empty → "safe".
+	NoQuorumVIPPolicy string `yaml:"no_quorum_vip_policy"`
+
 	// WebAuthn configures the second-factor enrolment dance. Required
 	// fields: rp_id (the bare host operators reach via the UI, e.g.
 	// "litevirt.corp") and rp_origins (full origins, e.g.
@@ -254,6 +283,10 @@ func LoadConfig() (*Config, error) {
 		UpgradeHealthDeadlineSec: 120,
 
 		ContainerRestoreTimeoutSec: 600,
+
+		QuorumLossDemoteAfterSec: 12,
+		KeepalivedStopTimeoutSec: 3,
+		NoQuorumVIPPolicy:        "safe",
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
@@ -262,6 +295,26 @@ func LoadConfig() (*Config, error) {
 
 	if cfg.HostName == "" {
 		return nil, fmt.Errorf("host_name is required in config")
+	}
+
+	// (No demote-vs-takeover timing invariant: majority reclaim is proof-gated, not
+	// timer-gated — see the QuorumLossDemoteAfterSec/KeepalivedStopTimeoutSec doc above.)
+	if cfg.QuorumLossDemoteAfterSec <= 0 || cfg.KeepalivedStopTimeoutSec <= 0 {
+		return nil, fmt.Errorf("invalid VIP self-demote timing: quorum_loss_demote_after(%ds) and keepalived_stop_timeout(%ds) must both be > 0",
+			cfg.QuorumLossDemoteAfterSec, cfg.KeepalivedStopTimeoutSec)
+	}
+
+	// VIP no-quorum reclaim policy: only "safe" is supported today (empty → safe). A weaker
+	// takeover-without-proof tier is intentionally not implemented (see the field doc), so
+	// reject any other value loudly rather than silently ignoring a misconfigured policy.
+	if cfg.NoQuorumVIPPolicy == "" {
+		cfg.NoQuorumVIPPolicy = "safe"
+	}
+	if cfg.NoQuorumVIPPolicy != "safe" {
+		return nil, fmt.Errorf("invalid no_quorum_vip_policy %q: only \"safe\" is supported "+
+			"(a takeover-without-proof tier is intentionally not implemented; to recover an "+
+			"unreachable VIP holder, verify it is down and run `lv host fence-confirm <host>`)",
+			cfg.NoQuorumVIPPolicy)
 	}
 
 	// Validate the image-pull deny policy now so a bad CIDR fails load loudly

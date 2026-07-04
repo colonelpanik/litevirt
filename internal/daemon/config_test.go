@@ -49,6 +49,48 @@ func TestLoadConfig_ImagePullDenyPolicy(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_NoQuorumVIPPolicy(t *testing.T) {
+	dir := t.TempDir()
+	cp := filepath.Join(dir, "config.yaml")
+	t.Setenv("LITEVIRT_CONFIG", cp)
+
+	// Absent → defaults to "safe".
+	if err := os.WriteFile(cp, []byte("host_name: h\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig (default): %v", err)
+	}
+	if cfg.NoQuorumVIPPolicy != "safe" {
+		t.Errorf("default no_quorum_vip_policy = %q; want safe", cfg.NoQuorumVIPPolicy)
+	}
+
+	// Explicit empty string → normalized to "safe".
+	if err := os.WriteFile(cp, []byte("host_name: h\nno_quorum_vip_policy: \"\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = LoadConfig(); err != nil || cfg.NoQuorumVIPPolicy != "safe" {
+		t.Fatalf("empty policy: cfg=%q err=%v; want safe/nil", cfg.NoQuorumVIPPolicy, err)
+	}
+
+	// "safe" accepted.
+	if err := os.WriteFile(cp, []byte("host_name: h\nno_quorum_vip_policy: safe\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(); err != nil {
+		t.Fatalf("safe policy rejected: %v", err)
+	}
+
+	// The weaker tier is deliberately NOT implemented → LoadConfig must reject it loudly.
+	if err := os.WriteFile(cp, []byte("host_name: h\nno_quorum_vip_policy: best-effort\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("LoadConfig accepted no_quorum_vip_policy: best-effort (must reject — not implemented)")
+	}
+}
+
 func TestLoadConfig_Valid(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

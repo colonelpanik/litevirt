@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -16,9 +17,32 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/metrics"
 )
+
+// flipExecGate returns ExecutionGate OK on the FIRST call, then refuses — modeling
+// quorum lost DURING a long live migration, so a re-check on the cold fallback path
+// catches it. DecisionGate/Enforced/PeerSupportsFresh always pass so only the
+// ExecutionGate transition is under test.
+type flipExecGate struct{ calls int }
+
+func (g *flipExecGate) ExecutionGate(context.Context) health.GateResult {
+	g.calls++
+	if g.calls == 1 {
+		return health.GateResult{OK: true}
+	}
+	return health.GateResult{OK: false, Reason: health.ReasonNoQuorum}
+}
+func (g *flipExecGate) DecisionGate(context.Context) health.GateResult {
+	return health.GateResult{OK: true}
+}
+func (g *flipExecGate) CapabilityActive(context.Context, string) (bool, string) { return true, "" }
+func (g *flipExecGate) Enforced(context.Context, string) bool                   { return true }
+func (g *flipExecGate) PeerSupportsFresh(context.Context, string, string) bool  { return true }
+func (g *flipExecGate) HealthyPeers(context.Context) []string                   { return nil }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -978,12 +1002,12 @@ func TestDrainHost_RunningVMs_NoTargets(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminContext(context.Background())
 
-	// Insert the host being drained and a running VM on it.
-	insertTestHostR2(t, ctx, s.db, "drain-h2", "active")
-	insertTestVMR2WithStack(t, ctx, s.db, "drain-vm1", "drain-h2", "running", "")
+	// Drain the LOCAL host (drain runs on the source). Running VM on it, no target.
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+	insertTestVMR2WithStack(t, ctx, s.db, "drain-vm1", "test-host", "running", "")
 
 	stream := &mockDrainStreamR2{ctx: ctx}
-	err := s.DrainHost(&pb.DrainHostRequest{Name: "drain-h2"}, stream)
+	err := s.DrainHost(&pb.DrainHostRequest{Name: "test-host"}, stream)
 
 	// No target hosts available, so VMs remain → FailedPrecondition or nil (partial drain).
 	// At minimum, some progress messages should be sent.
@@ -1023,11 +1047,11 @@ func TestDrainHost_ErrorVMs_Skipped(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminContext(context.Background())
 
-	insertTestHostR2(t, ctx, s.db, "drain-err-host", "active")
-	insertTestVMR2(t, ctx, s.db, "err-vm1", "drain-err-host", "error")
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+	insertTestVMR2(t, ctx, s.db, "err-vm1", "test-host", "error")
 
 	stream := &mockDrainStreamR2{ctx: ctx}
-	err := s.DrainHost(&pb.DrainHostRequest{Name: "drain-err-host"}, stream)
+	err := s.DrainHost(&pb.DrainHostRequest{Name: "test-host"}, stream)
 
 	// Error VMs are not "running" or "stopped", so toMigrate is empty → nil return.
 	if err != nil {
@@ -1052,9 +1076,113 @@ func TestDrainOneVM_BackingUp(t *testing.T) {
 	}
 }
 
-// ── drainOneVM: VM on other host (cold migration reassign) ──────────────────
+// ── drainOneVM: cold-reassign a SOURCE-owned stopped VM ─────────────────────
 
-func TestDrainOneVM_OtherHost_ColdReassign(t *testing.T) {
+func TestDrainOneVM_ColdReassign(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+
+	// VM owned by THIS daemon (the source) — the only VM drain may reassign.
+	insertTestVMR2(t, ctx, s.db, "own-vm", "test-host", "stopped")
+
+	vm := corrosion.VMRecord{Name: "own-vm", HostName: "test-host", State: "stopped"}
+	target := corrosion.HostRecord{Name: "target-h", Address: "10.0.0.2"}
+
+	progress := s.drainOneVM(ctx, vm, target)
+	// Stopped + source-owned → cold reassign (no libvirt calls).
+	if progress.Status != "done" {
+		t.Errorf("Status = %q, want done", progress.Status)
+	}
+	if progress.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
+		t.Errorf("Strategy = %v, want MIGRATE_COLD", progress.Strategy)
+	}
+	got, _ := corrosion.GetVM(ctx, s.db, "own-vm")
+	if got.HostName != "target-h" {
+		t.Errorf("host = %q, want target-h (reassigned)", got.HostName)
+	}
+}
+
+// drainOneVM re-reads under the lock and acts on the CURRENT row: a VM whose
+// ownership MOVED off this host after the drain job was queued is skipped, even
+// though the stale queued snapshot still claims this host owns it — otherwise the
+// stale snapshot would reassign a VM now owned (and possibly running) elsewhere.
+func TestDrainOneVM_OwnershipMovedAfterQueue_Skipped(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+
+	// Current row: the VM has since moved to another host and is running there.
+	insertTestVMR2(t, ctx, s.db, "moved-vm", "other-host", "running")
+
+	// The queued snapshot still claims THIS host (test-host) owns it, stopped —
+	// which would have passed the old stale-snapshot guard.
+	staleSnapshot := corrosion.VMRecord{Name: "moved-vm", HostName: "test-host", State: "stopped"}
+	target := corrosion.HostRecord{Name: "target-h", Address: "10.0.0.2"}
+
+	progress := s.drainOneVM(ctx, staleSnapshot, target)
+	if progress.Status != "skipped" {
+		t.Errorf("Status = %q, want skipped (ownership moved after the job was queued)", progress.Status)
+	}
+	got, _ := corrosion.GetVM(ctx, s.db, "moved-vm")
+	if got.HostName != "other-host" || got.State != "running" {
+		t.Errorf("host/state = %q/%q; want other-host/running (untouched — not reassigned)", got.HostName, got.State)
+	}
+}
+
+// drainOneVM re-checks the split-brain gate PER VM (drain is long-running and
+// batch-oriented, so quorum can be lost mid-drain). With enforcement latched and no
+// quorum, an owned drainable VM is skipped, not moved.
+func TestDrainOneVM_GateRefusesMidDrain(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+
+	insertTestVMR2(t, ctx, s.db, "own-vm", "test-host", "stopped")
+	s.SetGate(fakeServerGate{enforced: true, execOK: false}) // enforced, no quorum
+
+	vm := corrosion.VMRecord{Name: "own-vm", HostName: "test-host", State: "stopped"}
+	target := corrosion.HostRecord{Name: "target-h", Address: "10.0.0.2"}
+
+	progress := s.drainOneVM(ctx, vm, target)
+	if progress.Status != "skipped" {
+		t.Errorf("Status = %q, want skipped (gate refused mid-drain)", progress.Status)
+	}
+	got, _ := corrosion.GetVM(ctx, s.db, "own-vm")
+	if got.HostName != "test-host" {
+		t.Errorf("host = %q, want test-host (not reassigned — gate refused)", got.HostName)
+	}
+}
+
+// A live migration that FAILS during drain re-checks the gate before the COLD
+// fallback: if quorum was lost during the (long) live attempt, the fallback shutdown
+// + reassign is refused, leaving the VM on the source.
+func TestDrainOneVM_LiveFailure_ColdFallbackReGated(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+
+	// Running VM, shared storage (no local disks) → enters the live-migrate path.
+	insertTestVMR2(t, ctx, s.db, "live-vm", "test-host", "running")
+	f := libvirtfake.New()
+	f.FailMigrateToTarget = func(_, _ string) error { return errors.New("live migrate failed") }
+	s.virt = f
+	s.SetGate(&flipExecGate{}) // per-VM check OK, cold-fallback check refuses
+
+	vm := corrosion.VMRecord{Name: "live-vm", HostName: "test-host", State: "running"}
+	target := corrosion.HostRecord{Name: "target-h", Address: "10.0.0.2"}
+
+	progress := s.drainOneVM(ctx, vm, target)
+	if progress.Status != "skipped" {
+		t.Errorf("Status = %q, want skipped (cold fallback re-gated after live failure)", progress.Status)
+	}
+	// VM left on the source (live migration failure leaves the source domain up; the
+	// re-gate stopped the cold shutdown+reassign).
+	got, _ := corrosion.GetVM(ctx, s.db, "live-vm")
+	if got.HostName != "test-host" {
+		t.Errorf("host = %q, want test-host (not reassigned — cold fallback refused)", got.HostName)
+	}
+}
+
+// drainOneVM refuses to reassign a VM this daemon is NOT the source of — guards
+// against yanking a still-running VM off its real owner (the split-brain bug).
+func TestDrainOneVM_NonSource_Skipped(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 
@@ -1064,13 +1192,12 @@ func TestDrainOneVM_OtherHost_ColdReassign(t *testing.T) {
 	target := corrosion.HostRecord{Name: "target-h", Address: "10.0.0.2"}
 
 	progress := s.drainOneVM(ctx, vm, target)
-	// VM is stopped and on other-host, so no libvirt calls are made.
-	// It goes through cold migration path, updating host assignment.
-	if progress.Status != "done" {
-		t.Errorf("Status = %q, want done", progress.Status)
+	if progress.Status != "skipped" {
+		t.Errorf("Status = %q, want skipped (not the source host)", progress.Status)
 	}
-	if progress.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
-		t.Errorf("Strategy = %v, want MIGRATE_COLD", progress.Strategy)
+	got, _ := corrosion.GetVM(ctx, s.db, "other-vm")
+	if got.HostName != "other-host" {
+		t.Errorf("host = %q, want other-host (not reassigned by a non-source daemon)", got.HostName)
 	}
 }
 
@@ -1578,9 +1705,9 @@ func TestDrainHost_WithTargetHost_ColdReassign(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminContext(context.Background())
 
-	// Source host being drained.
-	insertTestHostR2(t, ctx, s.db, "drain-src", "active")
-	// Target host available.
+	// Drain runs ON the source (this daemon IS the drained host), where it can stop
+	// each VM before reassigning it. test-host == s.hostName.
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
 	err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
 		Name:     "drain-dst",
 		Address:  "10.0.0.2",
@@ -1595,48 +1722,70 @@ func TestDrainHost_WithTargetHost_ColdReassign(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// VM on drain-src, stopped state. Will go through cold migration path.
-	insertTestVMR2WithStack(t, ctx, s.db, "drain-cold-vm", "drain-src", "stopped", "")
+	// Stopped VM on the source → cold reassign (no libvirt needed).
+	insertTestVMR2WithStack(t, ctx, s.db, "drain-cold-vm", "test-host", "stopped", "")
 
 	stream := &mockDrainStreamR2{ctx: ctx}
-	err = s.DrainHost(&pb.DrainHostRequest{Name: "drain-src", Parallel: 1}, stream)
-	// After drain, the VM should be reassigned to drain-dst.
-	_ = err
+	if err := s.DrainHost(&pb.DrainHostRequest{Name: "test-host", Parallel: 1}, stream); err != nil {
+		t.Fatalf("DrainHost: %v", err)
+	}
 	if len(stream.sent) == 0 {
-		t.Error("expected at least one drain progress message")
+		t.Fatal("expected at least one drain progress message")
+	}
+	// The stopped VM was cold-reassigned to the target.
+	vm, _ := corrosion.GetVM(ctx, s.db, "drain-cold-vm")
+	if vm.HostName != "drain-dst" {
+		t.Errorf("vm host = %q, want drain-dst (cold reassigned)", vm.HostName)
 	}
 }
 
-// ── DrainHost: with running VM on non-local host (skips libvirt) ────────────
-
-func TestDrainHost_RunningVM_OtherHostTarget(t *testing.T) {
+// Draining is refused (before marking the host "draining") when enforcement is
+// latched and the source lacks local quorum — an isolated host can't evacuate its
+// VMs onto peers without quorum.
+func TestDrainHost_SplitBrainGateRefuses(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminContext(context.Background())
 
-	insertTestHostR2(t, ctx, s.db, "drain-r-src", "active")
-	err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
-		Name:     "drain-r-dst",
-		Address:  "10.0.0.3",
-		SSHUser:  "root",
-		SSHPort:  22,
-		GRPCPort: 7443,
-		State:    "active",
-		CPUTotal: 32,
-		MemTotal: 65536,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	insertTestHostR2(t, ctx, s.db, "test-host", "active") // == s.hostName (source)
+	insertTestVMR2(t, ctx, s.db, "vm1", "test-host", "stopped")
 
-	// Running VM on drain-r-src. Since drain-r-src != test-host (s.hostName),
-	// drainOneVM skips live migration and goes to cold migration path.
-	insertTestVMR2(t, ctx, s.db, "drain-r-vm", "drain-r-src", "running")
+	s.SetGate(fakeServerGate{enforced: true, execOK: false}) // enforced, no quorum
 
 	stream := &mockDrainStreamR2{ctx: ctx}
-	err = s.DrainHost(&pb.DrainHostRequest{Name: "drain-r-src", Parallel: 2}, stream)
-	_ = err
-	if len(stream.sent) == 0 {
-		t.Error("expected progress messages")
+	err := s.DrainHost(&pb.DrainHostRequest{Name: "test-host"}, stream)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (drain refused)", status.Code(err))
+	}
+	// The host was NOT marked draining (gate precedes that write).
+	h, _ := corrosion.GetHost(ctx, s.db, "test-host")
+	if h != nil && h.State == "draining" {
+		t.Error("host must not be marked draining when the gate refuses")
+	}
+}
+
+// ── DrainHost: draining a REMOTE host forwards to that host ─────────────────
+
+// Draining a host that is not this daemon forwards the stream to the drained host —
+// drain must run on the SOURCE so it can stop each VM before reassigning it. A
+// non-source daemon must NEVER reassign a running VM (that was the split-brain bug).
+// In this unit test there is no reachable peer, so the forward fails cleanly and the
+// VM is left untouched.
+func TestDrainHost_ForwardsToSourceHost(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminContext(context.Background())
+
+	insertTestHostR2(t, ctx, s.db, "drain-remote", "active")
+	insertTestVMR2(t, ctx, s.db, "drain-remote-vm", "drain-remote", "running")
+
+	stream := &mockDrainStreamR2{ctx: ctx}
+	err := s.DrainHost(&pb.DrainHostRequest{Name: "drain-remote", Parallel: 2}, stream)
+	if err == nil {
+		t.Fatal("draining a remote host with no reachable peer should error (forwarded), not succeed locally")
+	}
+	// Crucially, the running VM was NOT reassigned by this non-source daemon.
+	vm, _ := corrosion.GetVM(ctx, s.db, "drain-remote-vm")
+	if vm.HostName != "drain-remote" || vm.State != "running" {
+		t.Errorf("vm host/state = %q/%q; want drain-remote/running (untouched — no non-source reassign)", vm.HostName, vm.State)
 	}
 }
 

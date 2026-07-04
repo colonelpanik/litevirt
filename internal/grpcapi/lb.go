@@ -2385,6 +2385,47 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 	}
 }
 
+// RunLBReconciler periodically re-applies this host's enabled LBs whose keepalived is NOT
+// running. The one-shot boot ReconcileLBs is refused while the split-brain ExecutionGate is
+// in warmup (a fresh restart) or the host is 'upgrading', and nothing else re-applies
+// keepalived/haproxy (KillMode=process means a restart emits no VM events) — so a sole VIP
+// holder would stay down and VRRP redundancy would silently vanish. This loop retries until
+// local quorum lets the gated apply through, and only touches DEAD LBs so a healthy holder is
+// never churned. It also recovers a Phase-2 self-demoted VIP once quorum heals.
+func (s *Server) RunLBReconciler(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.reconcileDeadLBs(ctx)
+		}
+	}
+}
+
+// reconcileDeadLBs re-applies this host's enabled LBs whose keepalived isn't running. The
+// re-apply path (refreshLBLocal / reapplyExplicitLB -> applyLBLocal) is split-brain-gated, so
+// it no-ops during warmup/upgrading and succeeds once local quorum returns.
+func (s *Server) reconcileDeadLBs(ctx context.Context) {
+	configs, err := corrosion.ListLBConfigs(ctx, s.db)
+	if err != nil {
+		return
+	}
+	for _, cfg := range configs {
+		if !cfg.Enabled || !s.lbRunsOnHost(ctx, cfg) || s.lbKeepalivedRunning(cfg.Name) {
+			continue
+		}
+		if cfg.StackName != "" {
+			s.refreshLBLocal(ctx, cfg.StackName)
+		} else {
+			s.reapplyExplicitLB(ctx, cfg)
+		}
+		slog.Info("LB reconciler: re-applied a stopped LB", "lb", cfg.Name)
+	}
+}
+
 // reapplyExplicitLB rebuilds an explicit (non-stack) LB's lb.Config from its stored row +
 // backends and re-applies it locally (idempotent; the Phase-1 exec gate still guards it).
 func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRecord) {

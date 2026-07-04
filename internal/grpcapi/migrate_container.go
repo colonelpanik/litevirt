@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -300,9 +301,53 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 // only roll back the source in the latter case. The test seam replaces the whole
 // drive so the path is unit-testable without a second daemon.
 func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error) {
-	// Tell the target this is a migrate FROM us (peer-verified on the far side), so
-	// it keeps the imported NIC IPs — we handed it the IPAM leases before this call
-	// — rather than re-reserving and blanking them. The transport (PR-4 push to the
-	// target's staging repo vs. shared-repo fallback) is handled by drivePeerRestore.
-	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, nil, migrateFromMDKey, s.hostName)
+	// Tell the target this is a migrate FROM us (peer-verified on the far side), so it keeps
+	// the imported NIC IPs — we handed it the IPAM leases before this call — rather than
+	// re-reserving and blanking them. The transport (PR-4 push to the target's staging repo
+	// vs. shared-repo fallback) is handled by drivePeerRestore.
+	mdPairs := []string{migrateFromMDKey, s.hostName}
+
+	// Under active enforcement the target's RestoreContainer refuses a PROOFLESS restore, so a
+	// migrate would stop+archive the container then get refused and roll back — a stop/start
+	// bounce with the feature broken. MigrateContainer is an RBAC-gated OPERATOR action, so we
+	// mint a durable single-use relocation proof bound to a fresh token (the same shape the
+	// failover coordinator mints) and carry it + the stamped token, so the target validates +
+	// claims it. Fail-open until the gate is cluster-wide (pre-flip / mixed roll).
+	var proof *pb.RuntimeActionProof
+	if s.gateActive(ctx) {
+		proof = s.mintRelocationProof(ctx, name, target)
+		if proof == nil {
+			return corrosion.RestoreNotAttempted, fmt.Errorf(
+				"migrate refused: could not mint a relocation proof for %q (target may not advertise the split-brain gate)", target)
+		}
+		mdPairs = append(mdPairs, relocateTokenMDKey, proof.GetRelocationToken())
+	}
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, proof, mdPairs...)
+}
+
+// mintRelocationProof writes a durable single-use container-relocation proof (dest==target,
+// coordinator==this host) and returns its PB form for an operator-driven MigrateContainer —
+// the analog of mintLBProof/the failover coordinator's mint. Fresh-Pings the target so a proof
+// is never handed to a host that doesn't advertise the gate. nil on an ungated target / write
+// failure (the caller refuses the migrate under enforcement).
+func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHost string) *pb.RuntimeActionProof {
+	if !s.destSupportsGate(ctx, destHost) {
+		slog.Error("mintRelocationProof: destination does not advertise the split-brain gate; refusing proof-bearing migrate",
+			"container", containerName, "dest", destHost)
+		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonUnsupportedCapability)
+		return nil
+	}
+	pr := corrosion.ActionProof{
+		ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
+		TargetName: containerName, DestHost: destHost, Coordinator: s.hostName,
+		LeaseHolder: s.hostName, RelocationToken: newID(),
+	}
+	if err := corrosion.WriteActionProof(ctx, s.db, pr); err != nil {
+		slog.Warn("mintRelocationProof: write proof failed", "container", containerName, "dest", destHost, "error", err)
+		return nil
+	}
+	return &pb.RuntimeActionProof{
+		Id: pr.ID, Action: pr.Action, TargetKind: pr.TargetKind, TargetName: pr.TargetName,
+		DestHost: pr.DestHost, Coordinator: pr.Coordinator, RelocationToken: pr.RelocationToken,
+	}
 }

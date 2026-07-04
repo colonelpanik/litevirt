@@ -495,6 +495,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Keep litevirt_lb_keepalived_up tracking live keepalived state, not just
 	// the last apply.
 	go svc.RunLBMetricsRefresher(ctx, 30*time.Second)
+	// Periodically re-apply this host's LBs whose keepalived is dead — recovers a sole VIP
+	// holder after a restart/upgrade (the one-shot boot ReconcileLBs above is refused during
+	// warmup / while 'upgrading') and a self-demoted VIP on quorum heal. Only touches dead LBs.
+	go svc.RunLBReconciler(ctx, 30*time.Second)
 
 	// Split-brain Phase 2: minority VIP self-demotion. On sustained local quorum
 	// loss, an isolated LB host drops its own VIPs (stop keepalived + remove the

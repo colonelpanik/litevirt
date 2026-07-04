@@ -3878,3 +3878,73 @@ func TestMigrateVM_VMNotFound(t *testing.T) {
 		t.Errorf("code = %v, want NotFound", c)
 	}
 }
+
+// reconcileDeadLBs (the periodic LB self-heal) re-applies only LBs whose keepalived is DEAD,
+// never churning a healthy holder — recovering keepalived after a restart/upgrade or a
+// self-demote heal once quorum lets the gated apply through.
+func TestReconcileDeadLBs_OnlyReappliesDead(t *testing.T) {
+	s := testServerCov(t)
+	applies := 0
+	s.lbApplyOverride = func(context.Context, lb.Config) error { applies++; return nil }
+	ctx := adminCtx()
+	createLBTable(t, ctx, s.db)
+	if _, err := s.CreateLoadBalancer(ctx, &pb.CreateLBRequest{
+		Name: "lb1", Vip: "10.0.100.70/24", Algorithm: "roundrobin",
+		Ports:    []*pb.LBPort{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+		Backends: []*pb.LBBackendAddress{{Name: "b1", Address: "10.0.1.10:8080"}},
+		Hosts:    []string{"test-host"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	applies = 0
+
+	// keepalived RUNNING → no re-apply.
+	s.lbKeepalivedOverride = func(string) bool { return true }
+	s.reconcileDeadLBs(ctx)
+	if applies != 0 {
+		t.Fatalf("a running LB must not be re-applied; got %d applies", applies)
+	}
+
+	// keepalived DEAD → re-applied once.
+	s.lbKeepalivedOverride = func(string) bool { return false }
+	s.reconcileDeadLBs(ctx)
+	if applies != 1 {
+		t.Fatalf("a dead LB must be re-applied exactly once; got %d applies", applies)
+	}
+}
+
+// Under active enforcement, an operator MigrateContainer must MINT a relocation proof (so the
+// target's RestoreContainer accepts it) instead of sending proof=nil — otherwise every migrate
+// stops+archives the container, gets refused, and rolls back. A target that doesn't advertise
+// the gate is refused (fail closed).
+func TestMigrateRestore_MintsRelocationProofUnderEnforcement(t *testing.T) {
+	ctx := context.Background()
+	newS := func(destGated bool) *Server {
+		db, err := corrosion.NewTestClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.InitSchema(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+		s := &Server{hostName: "src", db: db, gate: fakeServerGate{enforced: true, supports: map[string]bool{"tgt": destGated}}}
+		s.migrateRestoreOverride = func(context.Context, string, string, string, string, bool) (corrosion.RestoreOutcome, error) {
+			return corrosion.RestoreNotAttempted, nil // bypass the real peer restore
+		}
+		return s
+	}
+	// Enforced + gated target → mint succeeds, a relocation proof row is written.
+	s := newS(true)
+	if _, err := s.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true); err != nil {
+		t.Fatalf("migrate to a gated target under enforcement must succeed (mint proof); got %v", err)
+	}
+	rows, _ := s.db.Query(ctx, `SELECT action, dest_host FROM runtime_action_proofs WHERE target_name = 'ct1'`)
+	if len(rows) != 1 || rows[0].String("action") != corrosion.ActionRelocate || rows[0].String("dest_host") != "tgt" {
+		t.Fatalf("expected one relocation proof for ct1→tgt; got %d rows", len(rows))
+	}
+	// Enforced + UNGATED target → refused (fail closed), no proofless migrate.
+	s2 := newS(false)
+	if _, err := s2.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true); err == nil {
+		t.Fatal("migrate under enforcement to a target that doesn't advertise the gate must be refused")
+	}
+}

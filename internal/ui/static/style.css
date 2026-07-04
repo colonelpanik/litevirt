@@ -1,9 +1,8 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 /* ============================================================================
-   Design tokens — DataCrunch / Verda design system, imported from the
-   claude.ai/design "Litevirt Console" project (tokens.css) and inlined here so
-   the whole UI ships in the single Go binary (go:embed static/*), no CDN.
+   Design tokens — the litevirt console design system, inlined here so the whole
+   UI ships in the single Go binary (go:embed static/*), with no CDN dependency.
 
    Fonts (Source Sans 3 / Source Code Pro, SIL OFL 1.1) are self-hosted from
    /static/fonts and fetched at build by `make vendor-js`; they degrade to
@@ -25,7 +24,7 @@
 }
 
 :root {
-  /* Brand (DataCrunch / Verda blues) */
+  /* Brand palette (blues) */
   --color-brand-100: #f6f9fd; --color-brand-200: #bad2f9; --color-brand-300: #84b2fd;
   --color-brand-400: #6ba4ff; --color-brand-450: #468eff; --color-brand-500: #195cc7;
   --color-brand-600: #335ca0; --color-brand-700: #1d4587; --color-brand-800: #0f2750;
@@ -326,9 +325,42 @@ form.inline { display: inline; }
 .form-row { margin-bottom: 12px; }
 .form-row label { display: block; font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
 .form-row input, .form-row select, .form-row textarea { width: 100%; background: var(--surface); border: 1px solid var(--color-border-action); color: var(--text); padding: 8px 10px; border-radius: var(--radii-md); font-family: inherit; font-size: 13px; transition: border-color var(--durations-default), box-shadow var(--durations-default); }
+/* Checkboxes/radios must NOT inherit the full-width field styling above — that stretched
+   the control to 100% and floated the tick centered above its label. Reset to native size. */
+.form-row input[type="checkbox"], .form-row input[type="radio"] { width: auto; padding: 0; accent-color: var(--color-accent); }
 .form-row input:hover, .form-row select:hover, .form-row textarea:hover { border-color: var(--color-border-hover); }
 .form-row input:focus, .form-row select:focus, .form-row textarea:focus { outline: none; border-color: var(--color-border-focused); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-brand-500) 18%, transparent); }
 .form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+/* Tabbed form modal (Create/Edit VM): a fixed-height shell so only the body scrolls and the
+   header + footer stay pinned — the submit button can never fall off-screen. Opt-in via the
+   extra .form-modal class so other modals keep the plain .modal behaviour. */
+.modal.form-modal { padding: 0; max-width: none; width: min(680px, 94vw); max-height: 86vh; display: flex; flex-direction: column; }
+.modal.form-modal > form { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.fm-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+.fm-head h3 { margin: 0; font-size: 16px; }
+.fm-x { background: none; border: none; color: var(--muted); font-size: 20px; line-height: 1; cursor: pointer; padding: 2px 8px; border-radius: var(--radii-md); }
+.fm-x:hover { color: var(--text); background: var(--color-surface-hover); }
+.fm-tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border); overflow-x: auto; flex: 0 0 auto; }
+.fm-tab { appearance: none; background: none; border: none; color: var(--muted); cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600; padding: 12px 14px; white-space: nowrap; border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color var(--durations-default); }
+.fm-tab:hover { color: var(--text); }
+.fm-tab.is-active { color: var(--text); border-bottom-color: var(--color-accent); }
+.fm-tab:focus-visible { outline: 2px solid var(--color-border-focused); outline-offset: -2px; border-radius: var(--radii-md); }
+.fm-body { flex: 1 1 auto; overflow-y: auto; min-height: 0; padding: 20px; }
+.fm-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-top: 1px solid var(--border); background: var(--color-surface-raised); flex: 0 0 auto; }
+.fm-foot .hint { font-size: 12px; color: var(--muted); }
+.fm-actions { display: flex; gap: 8px; }
+/* section divider + sub-card inside a tab pane */
+.fm-group { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 20px 0 12px; padding-top: 14px; border-top: 1px solid var(--border); }
+.fm-group:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+.fm-subcard { border: 1px solid var(--border); border-radius: var(--radii-md); padding: 14px; background: var(--bg); }
+.fm-subcard-title { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+/* checkbox row: box at the START of the line, description indented under the LABEL.
+   label.chk-row (0,1,1) beats .form-row label { display:block } (0,1,1) by order. */
+label.chk-row { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; font-weight: 400; margin-bottom: 0; }
+.chk-row > input[type="checkbox"] { margin-top: 2px; flex: 0 0 auto; }
+.chk-row .chk-text { display: flex; flex-direction: column; gap: 3px; }
+.chk-row .chk-sub { color: var(--muted); font-size: 12px; }
 
 /* Page header with breadcrumb */
 .page-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }

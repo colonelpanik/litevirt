@@ -1,224 +1,250 @@
 <div class="modal-overlay" id="new-vm-modal">
-  <div class="modal" style="max-width:620px">
-    <h3>Create VM</h3>
+  <div class="modal form-modal">
     <form hx-post="/ui/vms" hx-swap="none" hx-on::after-request="document.getElementById('new-vm-modal').remove()">
-      <div class="form-row">
-        <label>Name</label>
-        <input type="text" name="name" placeholder="my-vm" required>
-      </div>
-      <div class="form-row">
-        <label>Image</label>
-        <select name="image">
-          <option value="">— none (blank disk — e.g. install from ISO) —</option>
-          {{range .Images}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
-        </select>
-      </div>
-      <div class="grid-2" style="gap:12px">
-        <div class="form-row">
-          <label>vCPU</label>
-          <input type="number" name="cpu" value="2" min="1" max="128">
-        </div>
-        <div class="form-row">
-          <label>Memory (MiB)</label>
-          <input type="number" name="memory" value="4096" min="512" step="512">
-        </div>
-      </div>
-      <div class="form-row">
-        <label>Root Disk Size</label>
-        <input type="text" name="disk" value="20G" placeholder="20G">
-      </div>
-      <div class="grid-2" style="gap:12px">
-        <div class="form-row">
-          <label>Installer ISO <span style="color:var(--muted)">(optional)</span></label>
-          <div style="display:flex;gap:6px">
-            <input type="text" name="iso" placeholder="/var/lib/litevirt/isos/debian-12.iso" style="flex:1">
-            <button type="button" class="btn" hx-get="/ui/storage/iso-browser?field=iso" hx-target="body" hx-swap="beforeend">Browse…</button>
-          </div>
-        </div>
-        <div class="form-row">
-          <label>Boot from</label>
-          <select name="boot">
-            <option value="">Auto (CD-ROM if ISO set, else disk)</option>
-            <option value="disk">Disk</option>
-            <option value="cdrom">CD-ROM</option>
-            <option value="network">Network (PXE)</option>
-          </select>
-        </div>
-      </div>
-      <div class="form-row">
-        <label>Host (optional — auto-placed if empty)</label>
-        <select name="host" id="vm-host-select" onchange="hostChanged()">
-          <option value="">Auto</option>
-          {{range .Hosts}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
-        </select>
+      <div class="fm-head">
+        <h3>Create VM</h3>
+        <button type="button" class="fm-x" aria-label="Close" onclick="document.getElementById('new-vm-modal').remove()">&times;</button>
       </div>
 
-      <!-- Memory ballooning + startup ordering -->
-      <details style="margin-top:8px;border:1px solid var(--border);border-radius:6px;padding:8px 12px">
-        <summary style="cursor:pointer;font-weight:600">Memory ballooning &amp; startup</summary>
-        <div class="grid-2" style="gap:12px;margin-top:8px">
-          <div class="form-row">
-            <label>Min memory (MiB) <span style="color:var(--muted)">balloon floor</span></label>
-            <input type="number" name="min_memory" value="0" min="0" step="256">
-          </div>
-          <div class="form-row">
-            <label>Max memory (MiB) <span style="color:var(--muted)">0 = fixed</span></label>
-            <input type="number" name="max_memory" value="0" min="0" step="256">
-          </div>
-        </div>
-        <div class="form-row">
-          <label><input type="checkbox" name="onboot" value="true"> Start automatically when the host boots</label>
-        </div>
-        <div class="grid-2" style="gap:12px">
-          <div class="form-row">
-            <label>Startup order <span style="color:var(--muted)">lower first</span></label>
-            <input type="number" name="startup_order" value="0" min="0">
-          </div>
-          <div class="form-row">
-            <label>Start delay (s)</label>
-            <input type="number" name="start_delay" value="0" min="0">
-          </div>
-        </div>
-        <div class="form-row">
-          <label>Stop delay (s) <span style="color:var(--muted)">ordered shutdown</span></label>
-          <input type="number" name="stop_delay" value="0" min="0">
-        </div>
-        <div class="form-row">
-          <label>Auto-restart policy</label>
-          <select name="restart_condition">
-            <option value="none">None (never auto-restart)</option>
-            <option value="on-failure">On failure (restart on crash/fence; clean shutdown sticks)</option>
-            <option value="always">Always (restart on any unexpected stop)</option>
-          </select>
-          <span style="color:var(--muted);font-size:0.85em">A clean guest shutdown or a manual stop is never auto-restarted.</span>
-        </div>
-        <div class="grid-2" style="gap:12px">
-          <div class="form-row">
-            <label>Max attempts <span style="color:var(--muted)">0 = unlimited</span></label>
-            <input type="number" name="restart_max_attempts" value="0" min="0">
-          </div>
-          <div class="form-row">
-            <label>Restart delay <span style="color:var(--muted)">e.g. 5s</span></label>
-            <input type="text" name="restart_delay" placeholder="5s">
-          </div>
-        </div>
-      </details>
-
-      <!-- Optimization Profile -->
-      <div class="form-row">
-        <label>Optimization Profile</label>
-        <select name="profile" id="profile-select" onchange="applyProfile(this.value)">
-          <option value="">General Purpose</option>
-          <option value="compute">Compute Optimized</option>
-          <option value="gpu">GPU Passthrough</option>
-          <option value="network">Network Intensive</option>
-        </select>
+      <div class="fm-tabs" role="tablist">
+        <button type="button" class="fm-tab is-active" onclick="vmTab(this,'basics')">Basics</button>
+        <button type="button" class="fm-tab" onclick="vmTab(this,'boot')">Boot &amp; Console</button>
+        <button type="button" class="fm-tab" onclick="vmTab(this,'advanced')">Advanced</button>
+        <button type="button" class="fm-tab" onclick="vmTab(this,'cloud')">Cloud-init</button>
+        <button type="button" class="fm-tab" onclick="vmTab(this,'net')">Network &amp; Devices</button>
       </div>
 
-      <!-- Resource Tuning Knobs -->
-      <div id="tuning-knobs" style="margin-top:4px;padding:12px;border:1px solid var(--border);border-radius:6px">
-        <div style="font-weight:600;margin-bottom:8px;font-size:13px">Resource Tuning</div>
-        <div class="grid-2" style="gap:12px">
-          <div class="form-row" style="margin-bottom:4px">
-            <label><input type="checkbox" name="hugepages" value="true" id="knob-hugepages" onchange="markCustomProfile()"> Hugepages</label>
-            <div style="font-size:11px;color:var(--muted)">Back guest memory with host hugepages. Reduces TLB misses.</div>
+      <div class="fm-body">
+        <!-- BASICS -->
+        <div class="tab-pane" data-pane="basics">
+          <div class="form-row">
+            <label>Name</label>
+            <input type="text" name="name" placeholder="my-vm" required>
           </div>
-          <div class="form-row" style="margin-bottom:4px">
-            <label>I/O Threads</label>
-            <input type="number" name="io_threads" value="0" min="0" max="16" id="knob-iothreads" onchange="markCustomProfile()">
-            <div style="font-size:11px;color:var(--muted)">Parallel disk I/O threads (0 = disabled).</div>
+          <div class="form-row">
+            <label>Image</label>
+            <select name="image">
+              <option value="">— none (blank disk — e.g. install from ISO) —</option>
+              {{range .Images}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+            </select>
           </div>
-          <div class="form-row" style="margin-bottom:4px">
-            <label><input type="checkbox" name="numa_strict" value="true" id="knob-numa" onchange="markCustomProfile()"> NUMA Strict Binding</label>
-            <div style="font-size:11px;color:var(--muted)">Pin memory to the device's NUMA node. Fail if unavailable.</div>
-          </div>
-          <div class="form-row" style="margin-bottom:4px">
-            <label>CPU Pinning</label>
-            <input type="text" name="cpu_pinning" value="" id="knob-cpupin" placeholder="e.g. 0,1,2,3" onchange="markCustomProfile()">
-            <div style="font-size:11px;color:var(--muted)">Comma-separated host CPU IDs to pin vCPUs to.</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="form-row" style="margin-top:8px">
-        <label><input type="checkbox" name="disable_vnc" value="true"> Headless (no VNC)</label>
-      </div>
-      <div class="form-row" style="margin-bottom:8px">
-        <label><input type="checkbox" name="enable_spice" value="true"> Enable SPICE console <span style="color:var(--muted)">(connect with virt-viewer)</span></label>
-      </div>
-      <div class="form-row">
-        <label>Tags <span style="color:var(--muted)">(optional — <code>key=value</code> or bare <code>key</code>, comma-separated)</span></label>
-        <input type="text" name="tags" placeholder="env=prod, team=infra">
-      </div>
-
-      <!-- Cloud-init -->
-      <details style="margin-top:8px;border:1px solid var(--border);border-radius:6px;padding:8px 12px">
-        <summary style="cursor:pointer;font-weight:600;font-size:13px">Cloud-init <span style="color:var(--muted);font-weight:400">— first-boot user, SSH key, packages (optional)</span></summary>
-        <div style="margin-top:10px">
           <div class="grid-2" style="gap:12px">
-            <div class="form-row" style="margin-bottom:8px">
-              <label style="font-size:12px">Username</label>
-              <input type="text" name="ci_user" placeholder="e.g. ubuntu" autocomplete="off">
+            <div class="form-row">
+              <label>vCPU</label>
+              <input type="number" name="cpu" value="2" min="1" max="128">
             </div>
-            <div class="form-row" style="margin-bottom:8px">
-              <label style="font-size:12px">Password <span style="color:var(--muted)">(optional)</span></label>
-              <input type="password" name="ci_password" autocomplete="new-password">
+            <div class="form-row">
+              <label>Memory (MiB)</label>
+              <input type="number" name="memory" value="4096" min="512" step="512">
             </div>
           </div>
-          <div class="form-row" style="margin-bottom:8px">
-            <label style="font-size:12px">SSH authorized keys <span style="color:var(--muted)">(one per line)</span></label>
-            <textarea name="ci_ssh_keys" rows="3" placeholder="ssh-ed25519 AAAA... you@host" style="width:100%;font-family:monospace;font-size:12px"></textarea>
-          </div>
-          <div class="form-row" style="margin-bottom:8px">
-            <label style="font-size:12px">Packages <span style="color:var(--muted)">(comma-separated)</span></label>
-            <input type="text" name="ci_packages" placeholder="htop, curl, qemu-guest-agent">
-          </div>
-          <div class="form-row" style="margin-bottom:4px">
-            <label><input type="checkbox" name="ci_upgrade" value="true"> Upgrade packages on first boot</label>
-          </div>
-          <details style="margin-top:6px">
-            <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Advanced: raw #cloud-config (overrides the fields above)</summary>
-            <textarea name="ci_raw" rows="6" placeholder="#cloud-config&#10;runcmd:&#10;  - echo hello" style="width:100%;font-family:monospace;font-size:12px;margin-top:6px"></textarea>
-          </details>
-        </div>
-      </details>
-
-      <!-- Networks -->
-      <div id="networks-section">
-        <label style="font-weight:600;margin-bottom:4px;display:block">Networks</label>
-        <div id="network-list">
-          <div class="network-row grid-2" style="gap:8px;margin-bottom:8px">
-            <div class="form-row" style="margin-bottom:0">
-              <label style="font-size:12px">Bridge</label>
-              <input type="text" name="net_bridge[]" value="virbr0" placeholder="virbr0">
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Root Disk Size</label>
+              <input type="text" name="disk" value="20G" placeholder="20G">
             </div>
-            <div class="form-row" style="margin-bottom:0">
-              <label style="font-size:12px">Model</label>
-              <select name="net_model[]">
-                <option value="virtio" selected>virtio</option>
-                <option value="e1000">e1000</option>
+            <div class="form-row">
+              <label>Host <span style="color:var(--muted)">(auto-placed if empty)</span></label>
+              <select name="host" id="vm-host-select" onchange="hostChanged()">
+                <option value="">Auto</option>
+                {{range .Hosts}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
               </select>
             </div>
           </div>
+          <div class="form-row">
+            <label>Tags <span style="color:var(--muted)">(optional — <code>key=value</code> or bare <code>key</code>, comma-separated)</span></label>
+            <input type="text" name="tags" placeholder="env=prod, team=infra">
+          </div>
         </div>
-        <button type="button" class="btn btn-sm" onclick="addNetworkRow()">+ Add Network</button>
+
+        <!-- BOOT & CONSOLE -->
+        <div class="tab-pane" data-pane="boot" hidden>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Installer ISO <span style="color:var(--muted)">(optional)</span></label>
+              <div style="display:flex;gap:6px">
+                <input type="text" name="iso" placeholder="/var/lib/litevirt/isos/debian-12.iso" style="flex:1">
+                <button type="button" class="btn" hx-get="/ui/storage/iso-browser?field=iso" hx-target="body" hx-swap="beforeend">Browse…</button>
+              </div>
+            </div>
+            <div class="form-row">
+              <label>Boot from</label>
+              <select name="boot">
+                <option value="">Auto (CD-ROM if ISO set, else disk)</option>
+                <option value="disk">Disk</option>
+                <option value="cdrom">CD-ROM</option>
+                <option value="network">Network (PXE)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <label class="chk-row"><input type="checkbox" name="disable_vnc" value="true"><span class="chk-text">Headless — no VNC console</span></label>
+          </div>
+          <div class="form-row">
+            <label class="chk-row"><input type="checkbox" name="enable_spice" value="true"><span class="chk-text">Enable SPICE console<span class="chk-sub">Connect with virt-viewer.</span></span></label>
+          </div>
+        </div>
+
+        <!-- ADVANCED -->
+        <div class="tab-pane" data-pane="advanced" hidden>
+          <div class="fm-group">Optimization</div>
+          <div class="form-row">
+            <label>Profile</label>
+            <select name="profile" id="profile-select" onchange="applyProfile(this.value)">
+              <option value="">General Purpose</option>
+              <option value="compute">Compute Optimized</option>
+              <option value="gpu">GPU Passthrough</option>
+              <option value="network">Network Intensive</option>
+            </select>
+          </div>
+          <div class="fm-subcard" id="tuning-knobs">
+            <div class="fm-subcard-title">Resource tuning</div>
+            <div class="grid-2" style="gap:14px">
+              <div class="form-row" style="margin-bottom:0">
+                <label class="chk-row"><input type="checkbox" name="hugepages" value="true" id="knob-hugepages" onchange="markCustomProfile()"><span class="chk-text">Hugepages<span class="chk-sub">Back guest memory with host hugepages. Reduces TLB misses.</span></span></label>
+              </div>
+              <div class="form-row" style="margin-bottom:0">
+                <label>I/O Threads</label>
+                <input type="number" name="io_threads" value="0" min="0" max="16" id="knob-iothreads" onchange="markCustomProfile()">
+                <div class="chk-sub" style="margin-top:4px">Parallel disk I/O threads (0 = disabled).</div>
+              </div>
+              <div class="form-row" style="margin-bottom:0">
+                <label class="chk-row"><input type="checkbox" name="numa_strict" value="true" id="knob-numa" onchange="markCustomProfile()"><span class="chk-text">NUMA strict binding<span class="chk-sub">Pin memory to the device's NUMA node. Fail if unavailable.</span></span></label>
+              </div>
+              <div class="form-row" style="margin-bottom:0">
+                <label>CPU Pinning</label>
+                <input type="text" name="cpu_pinning" value="" id="knob-cpupin" placeholder="e.g. 0,1,2,3" onchange="markCustomProfile()">
+                <div class="chk-sub" style="margin-top:4px">Comma-separated host CPU IDs to pin vCPUs to.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="fm-group">Memory ballooning</div>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Min memory (MiB) <span style="color:var(--muted)">balloon floor</span></label>
+              <input type="number" name="min_memory" value="0" min="0" step="256">
+            </div>
+            <div class="form-row">
+              <label>Max memory (MiB) <span style="color:var(--muted)">0 = fixed</span></label>
+              <input type="number" name="max_memory" value="0" min="0" step="256">
+            </div>
+          </div>
+
+          <div class="fm-group">Startup &amp; restart</div>
+          <div class="form-row">
+            <label class="chk-row"><input type="checkbox" name="onboot" value="true"><span class="chk-text">Start automatically when the host boots</span></label>
+          </div>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Startup order <span style="color:var(--muted)">lower first</span></label>
+              <input type="number" name="startup_order" value="0" min="0">
+            </div>
+            <div class="form-row">
+              <label>Start delay (s)</label>
+              <input type="number" name="start_delay" value="0" min="0">
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Stop delay (s) <span style="color:var(--muted)">ordered shutdown</span></label>
+            <input type="number" name="stop_delay" value="0" min="0">
+          </div>
+          <div class="form-row">
+            <label>Auto-restart policy</label>
+            <select name="restart_condition">
+              <option value="none">None (never auto-restart)</option>
+              <option value="on-failure">On failure (restart on crash/fence; clean shutdown sticks)</option>
+              <option value="always">Always (restart on any unexpected stop)</option>
+            </select>
+            <div class="chk-sub" style="margin-top:4px">A clean guest shutdown or a manual stop is never auto-restarted.</div>
+          </div>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Max attempts <span style="color:var(--muted)">0 = unlimited</span></label>
+              <input type="number" name="restart_max_attempts" value="0" min="0">
+            </div>
+            <div class="form-row">
+              <label>Restart delay <span style="color:var(--muted)">e.g. 5s</span></label>
+              <input type="text" name="restart_delay" placeholder="5s">
+            </div>
+          </div>
+        </div>
+
+        <!-- CLOUD-INIT -->
+        <div class="tab-pane" data-pane="cloud" hidden>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Username</label>
+              <input type="text" name="ci_user" placeholder="e.g. ubuntu" autocomplete="off">
+            </div>
+            <div class="form-row">
+              <label>Password <span style="color:var(--muted)">(optional)</span></label>
+              <input type="password" name="ci_password" autocomplete="new-password">
+            </div>
+          </div>
+          <div class="form-row">
+            <label>SSH authorized keys <span style="color:var(--muted)">(one per line)</span></label>
+            <textarea name="ci_ssh_keys" rows="3" placeholder="ssh-ed25519 AAAA... you@host" style="font-family:monospace;font-size:12px"></textarea>
+          </div>
+          <div class="form-row">
+            <label>Packages <span style="color:var(--muted)">(comma-separated)</span></label>
+            <input type="text" name="ci_packages" placeholder="htop, curl, qemu-guest-agent">
+          </div>
+          <div class="form-row">
+            <label class="chk-row"><input type="checkbox" name="ci_upgrade" value="true"><span class="chk-text">Upgrade packages on first boot</span></label>
+          </div>
+          <div class="form-row">
+            <label>Raw <code>#cloud-config</code> <span style="color:var(--muted)">(overrides the fields above)</span></label>
+            <textarea name="ci_raw" rows="5" placeholder="#cloud-config&#10;runcmd:&#10;  - echo hello" style="font-family:monospace;font-size:12px"></textarea>
+          </div>
+        </div>
+
+        <!-- NETWORK & DEVICES -->
+        <div class="tab-pane" data-pane="net" hidden>
+          <div class="fm-group">Networks</div>
+          <div id="network-list">
+            <div class="network-row grid-2" style="gap:8px;margin-bottom:8px">
+              <div class="form-row" style="margin-bottom:0">
+                <label style="font-size:12px">Bridge</label>
+                <input type="text" name="net_bridge[]" value="virbr0" placeholder="virbr0">
+              </div>
+              <div class="form-row" style="margin-bottom:0">
+                <label style="font-size:12px">Model</label>
+                <select name="net_model[]">
+                  <option value="virtio" selected>virtio</option>
+                  <option value="e1000">e1000</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          <button type="button" class="btn btn-sm" onclick="addNetworkRow()">+ Add Network</button>
+
+          <div class="fm-group">PCI Devices</div>
+          <div id="device-list"></div>
+          <button type="button" class="btn btn-sm" onclick="addDeviceRow()">+ Add PCI Device</button>
+        </div>
       </div>
 
-      <!-- PCI Devices -->
-      <div id="devices-section" style="margin-top:12px">
-        <label style="font-weight:600;margin-bottom:4px;display:block">PCI Devices</label>
-        <div id="device-list"></div>
-        <button type="button" class="btn btn-sm" onclick="addDeviceRow()">+ Add PCI Device</button>
-      </div>
-
-      <div class="form-actions">
-        <button type="button" class="btn" onclick="document.getElementById('new-vm-modal').remove()">Cancel</button>
-        <button type="submit" class="btn btn-primary">Create</button>
+      <div class="fm-foot">
+        <span class="hint">Only <b style="color:var(--text)">Name</b> and <b style="color:var(--text)">Image</b> are required — the rest have sensible defaults.</span>
+        <div class="fm-actions">
+          <button type="button" class="btn" onclick="document.getElementById('new-vm-modal').remove()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Create VM</button>
+        </div>
       </div>
     </form>
   </div>
 </div>
 <script>
+// Tab switcher — scoped to the modal so it works for both create + edit dialogs.
+function vmTab(btn, pane) {
+  var modal = btn.closest('.modal');
+  modal.querySelectorAll('.fm-tab').forEach(function(t) { t.classList.toggle('is-active', t === btn); });
+  modal.querySelectorAll('.tab-pane').forEach(function(p) { p.hidden = (p.dataset.pane !== pane); });
+  var body = modal.querySelector('.fm-body');
+  if (body) body.scrollTop = 0;
+}
+
 // Profile definitions: each key maps to {hugepages, ioThreads, numaStrict, cpuPin}.
 var profiles = {
   '':        {hugepages: false, ioThreads: 0, numaStrict: false, cpuPin: ''},

@@ -1,292 +1,295 @@
 <div class="modal-overlay" id="vm-edit-modal">
-  <div class="modal" style="max-width:700px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-      <h3 style="margin:0">Edit VM: {{.VM.Name}} {{vmStateBadge .VM.State}}</h3>
-      <button class="btn" onclick="document.getElementById('vm-edit-modal').remove()">Close</button>
+  <div class="modal form-modal">
+    <div class="fm-head">
+      <h3>Edit VM: {{.VM.Name}} {{vmStateBadge .VM.State}}</h3>
+      <button type="button" class="fm-x" aria-label="Close" onclick="document.getElementById('vm-edit-modal').remove()">&times;</button>
     </div>
 
-    <!-- Resources -->
-    <h4 style="margin:12px 0 8px">Resources</h4>
-    {{if eq .VM.State.String "VM_RUNNING"}}
-    <p style="color:#e88;font-size:13px;margin-bottom:8px">VM must be stopped to change resources.</p>
-    {{end}}
-    <form hx-post="/ui/vms/{{.VM.Name}}/update-spec" hx-swap="none"
-          hx-on::after-request="if(event.detail.successful){location.reload()}">
-      <div class="form-row">
-        <label>CPU</label>
-        <input type="number" name="cpu" value="{{.VM.CpuActual}}" min="1" max="128"
-               {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-      </div>
-      <div class="form-row">
-        <label>Memory (MiB)</label>
-        <input type="number" name="memory_mib" value="{{.VM.MemActualMib}}" min="128" step="128"
-               {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-      </div>
-      <div class="form-row">
-        <label>CPU Mode</label>
-        <select name="cpu_mode" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-          <option value="" {{if eq .VM.Spec.CpuMode ""}}selected{{end}}>Default (QEMU)</option>
-          <option value="host-passthrough" {{if eq .VM.Spec.CpuMode "host-passthrough"}}selected{{end}}>Host Passthrough</option>
-          <option value="host-model" {{if eq .VM.Spec.CpuMode "host-model"}}selected{{end}}>Host Model</option>
-          <option value="custom" {{if eq .VM.Spec.CpuMode "custom"}}selected{{end}}>Custom</option>
-        </select>
-      </div>
-      <div class="form-row">
-        <label>Disable VNC</label>
-        <input type="checkbox" name="disable_vnc" value="true"
-               {{if .VM.Spec.DisableVnc}}checked{{end}}
-               {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-      </div>
-      <div class="grid-2" style="gap:12px">
-        <div class="form-row">
-          <label>Min memory (MiB) <span style="color:var(--muted)">balloon floor; 0 = none</span></label>
-          <input type="number" name="min_memory_mib" value="{{.VM.Spec.MinMemoryMib}}" min="0" step="128"
-                 {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-        </div>
-        <div class="form-row">
-          <label>Max memory (MiB) <span style="color:var(--muted)">balloon ceiling; 0 = fixed</span></label>
-          <input type="number" name="max_memory_mib" value="{{.VM.Spec.MaxMemoryMib}}" min="0" step="128"
-                 {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-        </div>
-      </div>
-      <div class="grid-2" style="gap:12px">
-        <div class="form-row">
-          <label>Machine</label>
-          <input type="text" name="machine" value="{{.VM.Spec.Machine}}" placeholder="q35"
-                 {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-        </div>
-        <div class="form-row">
-          <label>Firmware</label>
-          <select name="firmware" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-            <option value="" {{if eq .VM.Spec.Firmware ""}}selected{{end}}>(unchanged)</option>
-            <option value="uefi" {{if eq .VM.Spec.Firmware "uefi"}}selected{{end}}>UEFI</option>
-            <option value="bios" {{if eq .VM.Spec.Firmware "bios"}}selected{{end}}>BIOS</option>
-          </select>
-        </div>
-      </div>
-      <div class="form-row">
-        <label>Guest agent</label>
-        <input type="checkbox" name="guest_agent" value="true"
-               {{if .VM.Spec.GuestAgent}}checked{{end}}
-               {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-      </div>
-      <div class="form-row">
-        <button type="submit" class="btn"
-                {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>Save Resources</button>
-      </div>
-    </form>
+    <div class="fm-tabs" role="tablist">
+      <button type="button" class="fm-tab is-active" onclick="vmTab(this,'resources')">Resources</button>
+      <button type="button" class="fm-tab" onclick="vmTab(this,'lifecycle')">Lifecycle &amp; Boot</button>
+      <button type="button" class="fm-tab" onclick="vmTab(this,'disks')">Disks</button>
+      <button type="button" class="fm-tab" onclick="vmTab(this,'network')">Network</button>
+      <button type="button" class="fm-tab" onclick="vmTab(this,'devices')">Devices</button>
+    </div>
 
-    <!-- Lifecycle & restart policy (applies live — no stop needed) -->
-    <h4 style="margin:16px 0 8px">Lifecycle &amp; restart policy</h4>
-    <p style="color:var(--muted);font-size:13px;margin-bottom:8px">Applies live — the VM does not need to be stopped.</p>
-    <form hx-post="/ui/vms/{{.VM.Name}}/update-lifecycle" hx-swap="none"
-          hx-on::after-request="if(event.detail.successful){location.reload()}">
-      <div class="form-row">
-        <label>Auto-restart policy</label>
-        <select name="restart_condition">
-          <option value="none" {{if not .VM.Spec.Restart}}selected{{end}}>None (never auto-restart)</option>
-          <option value="on-failure" {{if and .VM.Spec.Restart (eq .VM.Spec.Restart.Condition "on-failure")}}selected{{end}}>On failure (crash/fence; clean shutdown sticks)</option>
-          <option value="always" {{if and .VM.Spec.Restart (eq .VM.Spec.Restart.Condition "always")}}selected{{end}}>Always (any unexpected stop)</option>
-        </select>
-        <span style="color:var(--muted);font-size:0.85em">A clean guest shutdown or a manual stop is never auto-restarted.</span>
+    <div class="fm-body">
+      <!-- RESOURCES -->
+      <div class="tab-pane" data-pane="resources">
+        {{if eq .VM.State.String "VM_RUNNING"}}
+        <p style="color:var(--color-text-warning);font-size:13px;margin-bottom:12px">The VM must be stopped to change resources.</p>
+        {{end}}
+        <form hx-post="/ui/vms/{{.VM.Name}}/update-spec" hx-swap="none"
+              hx-on::after-request="if(event.detail.successful){location.reload()}">
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>CPU</label>
+              <input type="number" name="cpu" value="{{.VM.CpuActual}}" min="1" max="128" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+            </div>
+            <div class="form-row">
+              <label>Memory (MiB)</label>
+              <input type="number" name="memory_mib" value="{{.VM.MemActualMib}}" min="128" step="128" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>CPU Mode</label>
+            <select name="cpu_mode" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+              <option value="" {{if eq .VM.Spec.CpuMode ""}}selected{{end}}>Default (QEMU)</option>
+              <option value="host-passthrough" {{if eq .VM.Spec.CpuMode "host-passthrough"}}selected{{end}}>Host Passthrough</option>
+              <option value="host-model" {{if eq .VM.Spec.CpuMode "host-model"}}selected{{end}}>Host Model</option>
+              <option value="custom" {{if eq .VM.Spec.CpuMode "custom"}}selected{{end}}>Custom</option>
+            </select>
+          </div>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Min memory (MiB) <span style="color:var(--muted)">balloon floor; 0 = none</span></label>
+              <input type="number" name="min_memory_mib" value="{{.VM.Spec.MinMemoryMib}}" min="0" step="128" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+            </div>
+            <div class="form-row">
+              <label>Max memory (MiB) <span style="color:var(--muted)">ceiling; 0 = fixed</span></label>
+              <input type="number" name="max_memory_mib" value="{{.VM.Spec.MaxMemoryMib}}" min="0" step="128" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+            </div>
+          </div>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Machine</label>
+              <input type="text" name="machine" value="{{.VM.Spec.Machine}}" placeholder="q35" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+            </div>
+            <div class="form-row">
+              <label>Firmware</label>
+              <select name="firmware" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+                <option value="" {{if eq .VM.Spec.Firmware ""}}selected{{end}}>(unchanged)</option>
+                <option value="uefi" {{if eq .VM.Spec.Firmware "uefi"}}selected{{end}}>UEFI</option>
+                <option value="bios" {{if eq .VM.Spec.Firmware "bios"}}selected{{end}}>BIOS</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <label class="chk-row"><input type="checkbox" name="disable_vnc" value="true" {{if .VM.Spec.DisableVnc}}checked{{end}} {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}><span class="chk-text">Headless — disable VNC console</span></label>
+          </div>
+          <div class="form-row">
+            <label class="chk-row"><input type="checkbox" name="guest_agent" value="true" {{if .VM.Spec.GuestAgent}}checked{{end}} {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}><span class="chk-text">Enable QEMU guest agent</span></label>
+          </div>
+          <div class="form-row" style="margin-bottom:0">
+            <button type="submit" class="btn btn-primary" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>Save Resources</button>
+          </div>
+        </form>
       </div>
-      <div class="grid-2" style="gap:12px">
-        <div class="form-row">
-          <label>Max attempts <span style="color:var(--muted)">0 = ∞</span></label>
-          <input type="number" name="restart_max_attempts" min="0"
-                 value="{{if .VM.Spec.Restart}}{{.VM.Spec.Restart.MaxAttempts}}{{else}}0{{end}}">
-        </div>
-        <div class="form-row">
-          <label>Restart delay <span style="color:var(--muted)">e.g. 5s</span></label>
-          <input type="text" name="restart_delay" placeholder="5s"
-                 value="{{if .VM.Spec.Restart}}{{.VM.Spec.Restart.Delay}}{{end}}">
-        </div>
-      </div>
-      <div class="form-row">
-        <label><input type="checkbox" name="onboot" value="true" {{if .VM.Spec.Onboot}}checked{{end}}> Start automatically when the host boots</label>
-      </div>
-      <div class="grid-2" style="gap:12px">
-        <div class="form-row">
-          <label>Startup order <span style="color:var(--muted)">lower first</span></label>
-          <input type="number" name="startup_order" value="{{.VM.Spec.StartupOrder}}" min="0">
-        </div>
-        <div class="form-row">
-          <label>Start delay (s)</label>
-          <input type="number" name="start_delay_sec" value="{{.VM.Spec.StartDelaySec}}" min="0">
-        </div>
-      </div>
-      <div class="form-row">
-        <label>Stop delay (s) <span style="color:var(--muted)">ordered shutdown</span></label>
-        <input type="number" name="stop_delay_sec" value="{{.VM.Spec.StopDelaySec}}" min="0">
-      </div>
-      <div class="form-row">
-        <button type="submit" class="btn btn-primary">Save Lifecycle</button>
-      </div>
-    </form>
 
-    <!-- Boot Order -->
-    <form hx-post="/ui/vms/{{.VM.Name}}/boot-order" hx-swap="none"
-          hx-on::after-request="if(event.detail.successful){location.reload()}" style="margin-top:12px">
-      <div class="form-row">
-        <label>Boot Order</label>
-        <select name="boot_order">
-          <option value="disk" {{if eq .VM.Spec.Boot "disk"}}selected{{end}}>Disk</option>
-          <option value="cdrom" {{if eq .VM.Spec.Boot "cdrom"}}selected{{end}}>CD-ROM</option>
-          <option value="network" {{if eq .VM.Spec.Boot "network"}}selected{{end}}>Network (PXE)</option>
-        </select>
-      </div>
-      <div class="form-row">
-        <button type="submit" class="btn"
-                {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>Set Boot Order</button>
-      </div>
-    </form>
+      <!-- LIFECYCLE & BOOT -->
+      <div class="tab-pane" data-pane="lifecycle" hidden>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:12px">Restart policy applies live — the VM does not need to be stopped.</p>
+        <form hx-post="/ui/vms/{{.VM.Name}}/update-lifecycle" hx-swap="none"
+              hx-on::after-request="if(event.detail.successful){location.reload()}">
+          <div class="form-row">
+            <label>Auto-restart policy</label>
+            <select name="restart_condition">
+              <option value="none" {{if not .VM.Spec.Restart}}selected{{end}}>None (never auto-restart)</option>
+              <option value="on-failure" {{if and .VM.Spec.Restart (eq .VM.Spec.Restart.Condition "on-failure")}}selected{{end}}>On failure (crash/fence; clean shutdown sticks)</option>
+              <option value="always" {{if and .VM.Spec.Restart (eq .VM.Spec.Restart.Condition "always")}}selected{{end}}>Always (any unexpected stop)</option>
+            </select>
+            <div class="chk-sub" style="margin-top:4px">A clean guest shutdown or a manual stop is never auto-restarted.</div>
+          </div>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Max attempts <span style="color:var(--muted)">0 = ∞</span></label>
+              <input type="number" name="restart_max_attempts" min="0" value="{{if .VM.Spec.Restart}}{{.VM.Spec.Restart.MaxAttempts}}{{else}}0{{end}}">
+            </div>
+            <div class="form-row">
+              <label>Restart delay <span style="color:var(--muted)">e.g. 5s</span></label>
+              <input type="text" name="restart_delay" placeholder="5s" value="{{if .VM.Spec.Restart}}{{.VM.Spec.Restart.Delay}}{{end}}">
+            </div>
+          </div>
+          <div class="form-row">
+            <label class="chk-row"><input type="checkbox" name="onboot" value="true" {{if .VM.Spec.Onboot}}checked{{end}}><span class="chk-text">Start automatically when the host boots</span></label>
+          </div>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Startup order <span style="color:var(--muted)">lower first</span></label>
+              <input type="number" name="startup_order" value="{{.VM.Spec.StartupOrder}}" min="0">
+            </div>
+            <div class="form-row">
+              <label>Start delay (s)</label>
+              <input type="number" name="start_delay_sec" value="{{.VM.Spec.StartDelaySec}}" min="0">
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Stop delay (s) <span style="color:var(--muted)">ordered shutdown</span></label>
+            <input type="number" name="stop_delay_sec" value="{{.VM.Spec.StopDelaySec}}" min="0">
+          </div>
+          <div class="form-row" style="margin-bottom:0">
+            <button type="submit" class="btn btn-primary">Save Lifecycle</button>
+          </div>
+        </form>
 
-    <hr style="border:none;border-top:1px solid #333;margin:16px 0">
+        <div class="fm-group">Boot order</div>
+        <form hx-post="/ui/vms/{{.VM.Name}}/boot-order" hx-swap="none"
+              hx-on::after-request="if(event.detail.successful){location.reload()}">
+          <div class="form-row">
+            <label>Boot from</label>
+            <select name="boot_order">
+              <option value="disk" {{if eq .VM.Spec.Boot "disk"}}selected{{end}}>Disk</option>
+              <option value="cdrom" {{if eq .VM.Spec.Boot "cdrom"}}selected{{end}}>CD-ROM</option>
+              <option value="network" {{if eq .VM.Spec.Boot "network"}}selected{{end}}>Network (PXE)</option>
+            </select>
+          </div>
+          <div class="form-row" style="margin-bottom:0">
+            <button type="submit" class="btn" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>Set Boot Order</button>
+          </div>
+        </form>
+      </div>
 
-    <!-- Disks -->
-    <h4 style="margin:0 0 8px">Disks</h4>
-    {{range .Disks}}
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <span class="badge">{{.StorageType}}</span>
-      <span>{{.Name}} — {{formatBytes .SizeBytes}}</span>
-      <div style="display:flex;gap:4px;margin-left:auto">
-        <button class="btn btn-sm"
-                hx-get="/ui/vms/{{$.VM.Name}}/resize-disk-modal?disk={{.Name}}&current={{.SizeBytes}}"
-                hx-target="body" hx-swap="beforeend">Resize</button>
-        <form hx-post="/ui/vms/{{$.VM.Name}}/detach-disk" hx-swap="none"
-              hx-on::after-request="if(event.detail.successful){location.reload()}"
-              hx-confirm="Detach disk {{.Name}}?">
-          <input type="hidden" name="disk_name" value="{{.Name}}">
-          <button type="submit" class="btn btn-sm btn-danger">Detach</button>
+      <!-- DISKS -->
+      <div class="tab-pane" data-pane="disks" hidden>
+        {{range .Disks}}
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span class="badge">{{.StorageType}}</span>
+          <span>{{.Name}} — {{formatBytes .SizeBytes}}</span>
+          <div style="display:flex;gap:4px;margin-left:auto">
+            <button class="btn btn-sm" hx-get="/ui/vms/{{$.VM.Name}}/resize-disk-modal?disk={{.Name}}&current={{.SizeBytes}}" hx-target="body" hx-swap="beforeend">Resize</button>
+            <form hx-post="/ui/vms/{{$.VM.Name}}/detach-disk" hx-swap="none"
+                  hx-on::after-request="if(event.detail.successful){location.reload()}" hx-confirm="Detach disk {{.Name}}?">
+              <input type="hidden" name="disk_name" value="{{.Name}}">
+              <button type="submit" class="btn btn-sm btn-danger">Detach</button>
+            </form>
+          </div>
+        </div>
+        {{else}}
+        <p style="color:var(--muted);font-size:13px">No disks attached.</p>
+        {{end}}
+
+        <div class="fm-group">Add disk</div>
+        <form hx-post="/ui/vms/{{.VM.Name}}/attach-disk" hx-swap="none"
+              hx-on::after-request="if(event.detail.successful){location.reload()}">
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Name</label>
+              <input type="text" name="name" placeholder="data0" required>
+            </div>
+            <div class="form-row">
+              <label>Size (GiB)</label>
+              <input type="number" name="size_gib" value="10" min="1" required>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Bus</label>
+            <select name="bus">
+              <option value="virtio">virtio</option>
+              <option value="scsi">scsi</option>
+              <option value="sata">sata</option>
+            </select>
+          </div>
+          <div class="form-row" style="margin-bottom:0">
+            <button type="submit" class="btn">Attach Disk</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- NETWORK -->
+      <div class="tab-pane" data-pane="network" hidden>
+        {{range .Interfaces}}
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span class="badge">{{.NetworkName}}</span>
+          <span style="font-family:monospace;font-size:13px">{{.Mac}}</span>
+          <form hx-post="/ui/vms/{{$.VM.Name}}/detach-nic" hx-swap="none"
+                hx-on::after-request="if(event.detail.successful){location.reload()}" hx-confirm="Detach NIC {{.Mac}}?" style="margin-left:auto">
+            <input type="hidden" name="nic_mac" value="{{.Mac}}">
+            <button type="submit" class="btn btn-sm btn-danger">Detach</button>
+          </form>
+        </div>
+        {{else}}
+        <p style="color:var(--muted);font-size:13px">No network interfaces attached.</p>
+        {{end}}
+
+        <div class="fm-group">Add NIC</div>
+        <form hx-post="/ui/vms/{{.VM.Name}}/attach-nic" hx-swap="none"
+              hx-on::after-request="if(event.detail.successful){location.reload()}">
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Bridge</label>
+              <select name="bridge" required>
+                <option value="" disabled selected>Select network...</option>
+                {{range .Networks}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+              </select>
+            </div>
+            <div class="form-row">
+              <label>Model</label>
+              <select name="model">
+                <option value="virtio">virtio</option>
+                <option value="e1000">e1000</option>
+                <option value="rtl8139">rtl8139</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row" style="margin-bottom:0">
+            <button type="submit" class="btn">Attach NIC</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- DEVICES -->
+      <div class="tab-pane" data-pane="devices" hidden>
+        {{if .VM.Spec.Devices}}
+        {{range .VM.Spec.Devices}}
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span class="badge">{{.Type}}</span>
+          <span style="font-family:monospace;font-size:13px">{{.Address}}</span>
+          <form hx-post="/ui/vms/{{$.VM.Name}}/detach-pci" hx-swap="none"
+                hx-on::after-request="if(event.detail.successful){location.reload()}" hx-confirm="Detach PCI device {{.Address}}?" style="margin-left:auto">
+            <input type="hidden" name="pci_address" value="{{.Address}}">
+            <button type="submit" class="btn btn-sm btn-danger">Detach</button>
+          </form>
+        </div>
+        {{end}}
+        {{else}}
+        <p style="color:var(--muted);font-size:13px">No PCI devices attached.</p>
+        {{end}}
+
+        <div class="fm-group">Add PCI device</div>
+        <form hx-post="/ui/vms/{{.VM.Name}}/attach-pci" hx-swap="none"
+              hx-on::after-request="if(event.detail.successful){location.reload()}">
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>Type</label>
+              <select name="type" id="pci-type-select"
+                      hx-get="/ui/hosts/{{.VM.HostName}}/available-devices"
+                      hx-include="[name='type']" hx-target="#pci-device-select" hx-trigger="change" hx-swap="innerHTML">
+                <option value="" disabled selected>Select type...</option>
+                <option value="gpu">GPU</option>
+                <option value="nic">NIC</option>
+                <option value="nvme">NVMe</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>Device</label>
+              <select name="address" id="pci-device-select" required>
+                <option value="" disabled selected>Select type first...</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row" style="margin-bottom:0">
+            <button type="submit" class="btn">Attach PCI</button>
+          </div>
         </form>
       </div>
     </div>
-    {{else}}
-    <p style="color:#888;font-size:13px">No disks attached.</p>
-    {{end}}
 
-    <details style="margin-top:8px">
-      <summary style="cursor:pointer;color:#6af;font-size:13px">Add Disk</summary>
-      <form hx-post="/ui/vms/{{.VM.Name}}/attach-disk" hx-swap="none"
-            hx-on::after-request="if(event.detail.successful){location.reload()}" style="margin-top:8px">
-        <div class="form-row">
-          <label>Name</label>
-          <input type="text" name="name" placeholder="data0" required>
-        </div>
-        <div class="form-row">
-          <label>Size (GiB)</label>
-          <input type="number" name="size_gib" value="10" min="1" required>
-        </div>
-        <div class="form-row">
-          <label>Bus</label>
-          <select name="bus">
-            <option value="virtio">virtio</option>
-            <option value="scsi">scsi</option>
-            <option value="sata">sata</option>
-          </select>
-        </div>
-        <div class="form-row">
-          <button type="submit" class="btn">Attach Disk</button>
-        </div>
-      </form>
-    </details>
-
-    <hr style="border:none;border-top:1px solid #333;margin:16px 0">
-
-    <!-- Network Interfaces -->
-    <h4 style="margin:0 0 8px">Network Interfaces</h4>
-    {{range .Interfaces}}
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <span class="badge">{{.NetworkName}}</span>
-      <span style="font-family:monospace;font-size:13px">{{.Mac}}</span>
-      <form hx-post="/ui/vms/{{$.VM.Name}}/detach-nic" hx-swap="none"
-            hx-on::after-request="if(event.detail.successful){location.reload()}"
-            hx-confirm="Detach NIC {{.Mac}}?" style="margin-left:auto">
-        <input type="hidden" name="nic_mac" value="{{.Mac}}">
-        <button type="submit" class="btn btn-sm btn-danger">Detach</button>
-      </form>
+    <div class="fm-foot">
+      <span class="hint">Each section saves on its own.</span>
+      <div class="fm-actions">
+        <button type="button" class="btn" onclick="document.getElementById('vm-edit-modal').remove()">Close</button>
+      </div>
     </div>
-    {{else}}
-    <p style="color:#888;font-size:13px">No network interfaces attached.</p>
-    {{end}}
-
-    <details style="margin-top:8px">
-      <summary style="cursor:pointer;color:#6af;font-size:13px">Add NIC</summary>
-      <form hx-post="/ui/vms/{{.VM.Name}}/attach-nic" hx-swap="none"
-            hx-on::after-request="if(event.detail.successful){location.reload()}" style="margin-top:8px">
-        <div class="form-row">
-          <label>Bridge</label>
-          <select name="bridge" required>
-            <option value="" disabled selected>Select network...</option>
-            {{range .Networks}}
-            <option value="{{.Name}}">{{.Name}}</option>
-            {{end}}
-          </select>
-        </div>
-        <div class="form-row">
-          <label>Model</label>
-          <select name="model">
-            <option value="virtio">virtio</option>
-            <option value="e1000">e1000</option>
-            <option value="rtl8139">rtl8139</option>
-          </select>
-        </div>
-        <div class="form-row">
-          <button type="submit" class="btn">Attach NIC</button>
-        </div>
-      </form>
-    </details>
-
-    <hr style="border:none;border-top:1px solid #333;margin:16px 0">
-
-    <!-- PCI Devices -->
-    <h4 style="margin:0 0 8px">PCI Devices</h4>
-    {{if .VM.Spec.Devices}}
-    {{range .VM.Spec.Devices}}
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <span class="badge">{{.Type}}</span>
-      <span style="font-family:monospace;font-size:13px">{{.Address}}</span>
-      <form hx-post="/ui/vms/{{$.VM.Name}}/detach-pci" hx-swap="none"
-            hx-on::after-request="if(event.detail.successful){location.reload()}"
-            hx-confirm="Detach PCI device {{.Address}}?" style="margin-left:auto">
-        <input type="hidden" name="pci_address" value="{{.Address}}">
-        <button type="submit" class="btn btn-sm btn-danger">Detach</button>
-      </form>
-    </div>
-    {{end}}
-    {{else}}
-    <p style="color:#888;font-size:13px">No PCI devices attached.</p>
-    {{end}}
-
-    <details style="margin-top:8px">
-      <summary style="cursor:pointer;color:#6af;font-size:13px">Add PCI Device</summary>
-      <form hx-post="/ui/vms/{{.VM.Name}}/attach-pci" hx-swap="none"
-            hx-on::after-request="if(event.detail.successful){location.reload()}" style="margin-top:8px">
-        <div class="form-row">
-          <label>Type</label>
-          <select name="type" id="pci-type-select"
-                  hx-get="/ui/hosts/{{.VM.HostName}}/available-devices"
-                  hx-include="[name='type']"
-                  hx-target="#pci-device-select"
-                  hx-trigger="change"
-                  hx-swap="innerHTML">
-            <option value="" disabled selected>Select type...</option>
-            <option value="gpu">GPU</option>
-            <option value="nic">NIC</option>
-            <option value="nvme">NVMe</option>
-            <option value="other">Other</option>
-          </select>
-        </div>
-        <div class="form-row">
-          <label>Device</label>
-          <select name="address" id="pci-device-select" required>
-            <option value="" disabled selected>Select type first...</option>
-          </select>
-        </div>
-        <div class="form-row">
-          <button type="submit" class="btn">Attach PCI</button>
-        </div>
-      </form>
-    </details>
   </div>
 </div>
+<script>
+// Tab switcher (also defined by the create modal; safe to redefine).
+function vmTab(btn, pane) {
+  var modal = btn.closest('.modal');
+  modal.querySelectorAll('.fm-tab').forEach(function(t) { t.classList.toggle('is-active', t === btn); });
+  modal.querySelectorAll('.tab-pane').forEach(function(p) { p.hidden = (p.dataset.pane !== pane); });
+  var body = modal.querySelector('.fm-body');
+  if (body) body.scrollTop = 0;
+}
+</script>

@@ -469,32 +469,27 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		return 0, fmt.Errorf("read mutation_log: %w", err)
 	}
 
-	// Per-peer capability filtering (split-brain hardening): a peer whose DB is
-	// pre-v38 does NOT have runtime_action_proofs, so sending it a proof mutation
-	// would fail-to-apply and back-pressure the whole stream. But a proof write is
-	// co-batched with its marker (the vms.pending_action_id stamp) in a SINGLE
-	// mutation entry, so we must NOT split the entry: dropping only the proof
-	// statement would leave a dangling pending_action_id pointing at a proof the
-	// peer will never receive (and a pre-v38 peer can't apply the marker column
-	// either). Instead DEFER THE WHOLE proof-bearing entry — truncate the batch at
-	// the first such entry and hold the watermark before it, so the entry (proof +
-	// marker together) replicates atomically once the peer gains support. Proofs
-	// are only WRITTEN once the gate is cluster-wide, so nothing is deferred in
-	// steady state — this only covers a mid-roll / downgraded / offline peer, whose
-	// proof stream deliberately stalls until it can honor the monotone-consume
-	// resolver (surfaced separately as HA-degraded). The gate is TOKEN-based
-	// (fresh-Ping-cached capability); a nil gate FAILS CLOSED (defers proofs) — there
-	// is no schema_version fallback (a schema-38 peer that doesn't advertise the
-	// token would otherwise wrongly receive proofs after the flip).
+	// Per-peer capability filtering (split-brain hardening): a peer that can't honor the
+	// monotone proof resolver (DB pre-v38 → no runtime_action_proofs table, or a v38 DB
+	// whose binary doesn't yet advertise the token) must not receive proof mutations — it
+	// would apply them as plain LWW and could resurrect a spent proof. A proof write is
+	// co-batched with its marker (the vms.pending_action_id stamp) in a SINGLE mutation
+	// entry, so we DROP THE WHOLE ENTRY, never split it (dropping only the proof statement
+	// would leave a dangling pending_action_id, and a pre-v38 peer can't apply the marker
+	// column either). Crucially we DROP, not defer: the watermark still advances PAST the
+	// removed entries, so the rest of the stream — leader_election, vm_locks, everything
+	// after a proof — keeps flowing instead of stalling behind a proof for up to
+	// MaxLogRetention. Both halves reconverge once the peer gains support: the proof via
+	// the peer-only sensitive anti-entropy net (the documented convergence safety net —
+	// sync.go sensitiveTableNames) and pending_action_id via the public AE lane. Proofs are
+	// only WRITTEN once the gate is cluster-wide, so nothing is dropped in steady state —
+	// this only covers a mid-roll / downgraded / offline peer (that same peer surfaces as
+	// the unsupported_member HA-degraded reason). The gate is TOKEN-based (fresh-Ping-cached
+	// capability); a nil gate FAILS CLOSED (drops proofs) — there is no schema_version
+	// fallback (a schema-38 peer that doesn't advertise the token would otherwise wrongly
+	// receive proofs after the flip).
 	if r.peerLacksProofSupport(ctx, peerName) {
-		kept, ceiling, truncated := deferUnsupportedProofEntries(entries)
-		entries = kept
-		if len(entries) == 0 {
-			return 0, nil // first entry is proof-bearing — send nothing, hold watermark
-		}
-		if truncated {
-			maxSeqSeen = ceiling // don't advance the watermark past the deferred entry
-		}
+		entries = dropUnsupportedProofEntries(entries)
 	}
 
 	// If entries were skipped (originated from peer) but nothing to send,
@@ -578,17 +573,21 @@ type mutationEntry struct {
 // caller won't advance past the deferred entry. truncated=false means either no proof entry
 // was found (batch unchanged) OR the very first entry is proof-bearing (kept is empty →
 // caller sends nothing and holds the watermark).
-func deferUnsupportedProofEntries(entries []mutationEntry) (kept []mutationEntry, ceiling int64, truncated bool) {
-	for i, e := range entries {
+// dropUnsupportedProofEntries returns entries with every proof-bearing entry removed
+// (order preserved). The removed proofs are intentionally NOT re-sent via the WAL — the
+// caller advances the watermark past them and they reconverge via the peer-only sensitive
+// anti-entropy net once the peer advertises support. Dropping the WHOLE entry (not just
+// the proof statement) preserves the co-batched proof+marker atomicity; keeping every
+// OTHER entry lets the stream flow instead of stalling behind a proof.
+func dropUnsupportedProofEntries(entries []mutationEntry) []mutationEntry {
+	kept := make([]mutationEntry, 0, len(entries))
+	for _, e := range entries {
 		if entryTouchesCustomMerge(e.Stmts) {
-			kept = entries[:i]
-			if len(kept) == 0 {
-				return nil, 0, false // first entry proof-bearing → hold watermark, send nothing
-			}
-			return kept, kept[len(kept)-1].Seq, true
+			continue // proof-bearing → drop; reconverges via the sensitive AE net
 		}
+		kept = append(kept, e)
 	}
-	return entries, 0, false // no proof-bearing entry → whole batch is sendable
+	return kept
 }
 
 // entryTouchesCustomMerge reports whether a serialized mutation entry contains ANY

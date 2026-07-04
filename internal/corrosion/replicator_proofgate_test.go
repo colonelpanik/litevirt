@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -33,10 +34,11 @@ func TestPeerLacksProofSupport_FailsClosed(t *testing.T) {
 	}
 }
 
-// deferUnsupportedProofEntries truncates a batch at the first proof-bearing entry so proof +
-// co-batched marker replicate atomically (or defer whole) to an unsupported peer — never
-// split, never advance the watermark past the deferred entry.
-func TestDeferUnsupportedProofEntries(t *testing.T) {
+// dropUnsupportedProofEntries removes proof-bearing entries from the batch (never splitting
+// an entry) while keeping every OTHER entry in order, so the WAL stream keeps flowing instead
+// of stalling behind a proof destined for a peer that can't honor it — the dropped proofs
+// reconverge via the peer-only sensitive AE net.
+func TestDropUnsupportedProofEntries(t *testing.T) {
 	mustJSON := func(ss []Statement) string { b, _ := json.Marshal(ss); return string(b) }
 	proofEntry := func(seq int64) mutationEntry {
 		return mutationEntry{Seq: seq, Stmts: mustJSON([]Statement{
@@ -49,25 +51,32 @@ func TestDeferUnsupportedProofEntries(t *testing.T) {
 			{SQL: `UPDATE vms SET state='running' WHERE name=?`, Params: []interface{}{"vm1"}},
 		})}
 	}
-
-	// No proof-bearing entry → whole batch sendable, no truncation.
-	kept, _, truncated := deferUnsupportedProofEntries([]mutationEntry{plainEntry(1), plainEntry(2)})
-	if len(kept) != 2 || truncated {
-		t.Fatalf("proof-free batch: kept=%d truncated=%v; want 2/false", len(kept), truncated)
+	seqs := func(es []mutationEntry) []int64 {
+		out := make([]int64, len(es))
+		for i, e := range es {
+			out[i] = e.Seq
+		}
+		return out
 	}
 
-	// First entry proof-bearing → send NOTHING, hold the watermark (kept empty, not truncated).
-	kept, _, truncated = deferUnsupportedProofEntries([]mutationEntry{proofEntry(1), plainEntry(2)})
-	if len(kept) != 0 || truncated {
-		t.Fatalf("leading proof entry: kept=%d truncated=%v; want 0/false (hold watermark)", len(kept), truncated)
+	// No proof-bearing entry → whole batch kept.
+	if got := seqs(dropUnsupportedProofEntries([]mutationEntry{plainEntry(1), plainEntry(2)})); !reflect.DeepEqual(got, []int64{1, 2}) {
+		t.Fatalf("proof-free batch: kept=%v; want [1 2]", got)
 	}
 
-	// Proof-free prefix then a proof entry → send the prefix, ceiling = last kept seq, so the
-	// watermark can't advance past the deferred proof entry.
-	kept, ceiling, truncated := func() ([]mutationEntry, int64, bool) {
-		return deferUnsupportedProofEntries([]mutationEntry{plainEntry(5), plainEntry(6), proofEntry(7), plainEntry(8)})
-	}()
-	if len(kept) != 2 || !truncated || ceiling != 6 {
-		t.Fatalf("prefix+proof: kept=%d truncated=%v ceiling=%d; want 2/true/6", len(kept), truncated, ceiling)
+	// Leading proof entry → dropped, the plain entry after it still flows (no stall).
+	if got := seqs(dropUnsupportedProofEntries([]mutationEntry{proofEntry(1), plainEntry(2)})); !reflect.DeepEqual(got, []int64{2}) {
+		t.Fatalf("leading proof entry: kept=%v; want [2] (drop the proof, keep the rest flowing)", got)
+	}
+
+	// Plain entries on BOTH sides of a proof → proof dropped, both plains kept in order:
+	// leader_election / vm_locks after a proof no longer stall.
+	if got := seqs(dropUnsupportedProofEntries([]mutationEntry{plainEntry(5), plainEntry(6), proofEntry(7), plainEntry(8)})); !reflect.DeepEqual(got, []int64{5, 6, 8}) {
+		t.Fatalf("prefix+proof+suffix: kept=%v; want [5 6 8]", got)
+	}
+
+	// All proof entries → all dropped (the caller advances the watermark past them).
+	if got := dropUnsupportedProofEntries([]mutationEntry{proofEntry(1), proofEntry(2)}); len(got) != 0 {
+		t.Fatalf("all-proof batch: kept=%d; want 0", len(got))
 	}
 }

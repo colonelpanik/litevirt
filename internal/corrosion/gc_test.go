@@ -84,6 +84,103 @@ func TestGCSupersededRows_ProofsNotLocallyDeleted(t *testing.T) {
 	}
 }
 
+func gcProofDeleted(t *testing.T, c *Client, id, status, updatedAt, deletedAt string) {
+	t.Helper()
+	if err := c.execLocal(context.Background(),
+		`INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator, status, relocation_token, created_at, updated_at, deleted_at)
+		 VALUES (?, 'reschedule', 'vm', 'x', 'h', 'coord', ?, '', ?, ?, ?)`,
+		id, status, updatedAt, updatedAt, deletedAt); err != nil {
+		t.Fatalf("insert tombstoned proof: %v", err)
+	}
+}
+
+func proofTombstoned(t *testing.T, c *Client, id string) bool {
+	t.Helper()
+	rows, err := c.Query(context.Background(), `SELECT 1 FROM runtime_action_proofs WHERE id = ? AND deleted_at IS NOT NULL`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(rows) > 0
+}
+
+// ReapSpentProofs is the two-phase proof reaper: Phase A replicated-tombstones aged terminal
+// proofs (always safe, monotone), Phase B hard-deletes long-tombstoned rows LOCALLY but only
+// when every host is active (a stale non-terminal copy can only survive on a partitioned node).
+func TestReapSpentProofs(t *testing.T) {
+	ctx := context.Background()
+	const old = "2020-01-01T00:00:00Z"
+	recent := time.Now().UTC().Format(time.RFC3339Nano)
+
+	t.Run("Phase A tombstones only aged terminal proofs", func(t *testing.T) {
+		c := mustTestClient(t)
+		if err := InsertHost(ctx, c, HostRecord{Name: "self", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		gcProof(t, c, "done-old", "completed", old)
+		gcProof(t, c, "failed-old", "failed", old)
+		gcProof(t, c, "prepared-old", "prepared", old)    // non-terminal → never tombstoned
+		gcProof(t, c, "done-recent", "completed", recent) // terminal but within the grace
+
+		// reapAfter huge → Phase B reclaims nothing; observe Phase A alone.
+		ts, reaped, err := ReapSpentProofs(ctx, c, time.Hour, 1_000_000*time.Hour)
+		if err != nil {
+			t.Fatalf("ReapSpentProofs: %v", err)
+		}
+		if reaped != 0 {
+			t.Fatalf("reaped=%d; want 0 (reap cutoff far in the past)", reaped)
+		}
+		if ts != 2 {
+			t.Fatalf("tombstoned=%d; want 2 (the two aged terminal proofs)", ts)
+		}
+		if !proofTombstoned(t, c, "done-old") || !proofTombstoned(t, c, "failed-old") {
+			t.Error("aged terminal proofs must be tombstoned")
+		}
+		if proofTombstoned(t, c, "prepared-old") {
+			t.Error("a non-terminal proof must NEVER be tombstoned")
+		}
+		if proofTombstoned(t, c, "done-recent") {
+			t.Error("a terminal proof within the grace must not be tombstoned yet")
+		}
+		if !proofExists(t, c, "done-old") {
+			t.Error("Phase A only soft-deletes; the row must still exist")
+		}
+	})
+
+	t.Run("Phase B reclaims long-tombstoned proofs only when fully healthy", func(t *testing.T) {
+		c := mustTestClient(t)
+		if err := InsertHost(ctx, c, HostRecord{Name: "self", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := InsertHost(ctx, c, HostRecord{Name: "peer", State: "offline"}); err != nil {
+			t.Fatal(err)
+		}
+		gcProofDeleted(t, c, "reapable", "completed", old, old)
+
+		// A host is offline → a stale copy could rejoin → fail safe, keep the row.
+		if _, reaped, err := ReapSpentProofs(ctx, c, time.Hour, time.Hour); err != nil {
+			t.Fatalf("degraded reap: %v", err)
+		} else if reaped != 0 {
+			t.Fatalf("reaped=%d with an offline host; want 0 (fail safe)", reaped)
+		}
+		if !proofExists(t, c, "reapable") {
+			t.Fatal("reapable must survive while a host is offline")
+		}
+
+		// Heal the cluster → the long-tombstoned proof is now safe to reclaim.
+		if err := c.execLocal(ctx, `UPDATE hosts SET state='active' WHERE name='peer'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, reaped, err := ReapSpentProofs(ctx, c, time.Hour, time.Hour); err != nil {
+			t.Fatalf("healthy reap: %v", err)
+		} else if reaped != 1 {
+			t.Fatalf("reaped=%d after healing; want 1", reaped)
+		}
+		if proofExists(t, c, "reapable") {
+			t.Fatal("reapable must be hard-deleted once the cluster is fully healthy")
+		}
+	})
+}
+
 func rcExists(t *testing.T, c *Client, hash string) bool {
 	t.Helper()
 	rows, err := c.Query(context.Background(), `SELECT 1 FROM recovery_codes WHERE code_hash = ?`, hash)

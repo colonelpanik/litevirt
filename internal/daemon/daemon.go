@@ -1341,12 +1341,25 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 		counts, err := corrosion.GCSupersededRows(ctx, d.db, core, orphan)
 		if err != nil {
 			slog.Warn("superseded-row GC", "error", err)
-			return
+		} else {
+			for tbl, n := range counts {
+				m.RowsDeleted(tbl, n)
+				if n > 0 {
+					slog.Info("GC reclaimed superseded rows", "table", tbl, "count", n)
+				}
+			}
 		}
-		for tbl, n := range counts {
-			m.RowsDeleted(tbl, n)
-			if n > 0 {
-				slog.Info("GC reclaimed superseded rows", "table", tbl, "count", n)
+		// Split-brain runtime_action_proofs: replicated monotone tombstone (core) + a
+		// convergence-gated local reclaim of long-tombstoned rows (orphan, >= WAL retention).
+		// No-op until the gate is flipped and proofs start accruing.
+		if tombstoned, reaped, perr := corrosion.ReapSpentProofs(ctx, d.db, core, orphan); perr != nil {
+			slog.Warn("proof reaper", "error", perr)
+		} else {
+			if reaped > 0 {
+				m.RowsDeleted("runtime_action_proofs", reaped)
+			}
+			if tombstoned > 0 || reaped > 0 {
+				slog.Info("proof reaper", "tombstoned", tombstoned, "reaped", reaped)
 			}
 		}
 	}

@@ -45,9 +45,10 @@ type Replicator struct {
 	// proofReplicaGate reports whether a peer advertises the split-brain gate
 	// capability (token-based, fresh-Ping-cached). Injected by the daemon BEFORE
 	// Start (so no replication goroutine runs with a nil gate). When nil, the WAL
-	// proof filter FAILS CLOSED — proof-bearing entries are deferred, never sent on
-	// a schema_version guess (a schema-38 peer that doesn't advertise the token
-	// would otherwise wrongly receive proofs after the flip).
+	// proof filter FAILS CLOSED — proof-bearing entries are DROPPED from the stream
+	// (never sent on a schema_version guess; a schema-38 peer that doesn't advertise
+	// the token would otherwise wrongly receive proofs after the flip). Dropped
+	// proofs reconverge via the peer-only sensitive AE net once the peer gains support.
 	proofReplicaGate func(ctx context.Context, peer string) bool
 }
 
@@ -62,10 +63,11 @@ func (r *Replicator) SetProofReplicaGate(fn func(ctx context.Context, peer strin
 // peerLacksProofSupport reports whether proof-table mutations must be filtered
 // from the stream to peer. Token-based (the gate is a fresh-Ping-cached capability
 // check wired before Start). A nil gate FAILS CLOSED — treat the peer as lacking
-// support so proof-bearing entries defer rather than leak on a schema guess (the
-// schema_version fallback wrongly passed a schema-38 peer that doesn't advertise
-// the token). Only proofs ever exist post-flip, so a nil-gate defer is a no-op
-// pre-flip and a safe stall for the brief pre-wiring window otherwise.
+// support so proof-bearing entries are DROPPED rather than leak on a schema guess
+// (the schema_version fallback wrongly passed a schema-38 peer that doesn't advertise
+// the token). Dropped proofs reconverge via the sensitive AE net; only proofs ever
+// exist post-flip, so a nil-gate drop is a no-op pre-flip and, in the brief
+// pre-wiring window, drops only the proof entries (the rest of the stream still flows).
 func (r *Replicator) peerLacksProofSupport(ctx context.Context, peer string) bool {
 	r.mu.Lock()
 	gate := r.proofReplicaGate
@@ -583,9 +585,10 @@ func dropUnsupportedProofEntries(entries []mutationEntry) []mutationEntry {
 // entryTouchesCustomMerge reports whether a serialized mutation entry contains ANY
 // statement targeting a customMergeTables table (runtime_action_proofs). Such an
 // entry must be replicated ATOMICALLY (proof + co-batched vms.pending_action_id
-// marker together) or DEFERRED WHOLE for a peer that can't yet apply the proof —
-// never split. On a parse error it returns true (conservative: treat as
-// proof-bearing and defer, rather than risk sending a partial to an unready peer).
+// marker together) or DROPPED WHOLE for a peer that can't yet apply the proof —
+// never split (the dropped proof reconverges via the sensitive AE net). On a parse
+// error it returns true (conservative: treat as proof-bearing and drop, rather than
+// risk sending a partial to an unready peer).
 func entryTouchesCustomMerge(stmtsJSON string) bool {
 	var stmts []Statement
 	if err := json.Unmarshal([]byte(stmtsJSON), &stmts); err != nil {
@@ -1056,12 +1059,13 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	// acceptable: both proofs are already terminal, so neither authorizes any further
 	// runtime action — the divergence is a detection concern, not a control gap.
 	// (Mixed-version safety has TWO layers on the send side, so a peer that can't
-	//  honor a proof never receives one: the WAL relay DEFERS a whole proof-bearing
+	//  honor a proof never receives one: the WAL relay DROPS a whole proof-bearing
 	//  entry to any peer not advertising split_brain_gate_v1 — token-gated, fail
-	//  closed on a nil gate — see peerLacksProofSupport/entryTouchesCustomMerge; and
-	//  proofs are only written once the gate is cluster-wide. This apply path is the
-	//  receive side: it stays monotone regardless, so an out-of-order/duplicated
-	//  proof mutation still can't resurrect a spent proof.)
+	//  closed on a nil gate — see peerLacksProofSupport/entryTouchesCustomMerge (the
+	//  dropped proof reconverges via the peer-only sensitive AE net); and proofs are
+	//  only written once the gate is cluster-wide. This apply path is the receive
+	//  side: it stays monotone regardless, so an out-of-order/duplicated proof
+	//  mutation still can't resurrect a spent proof.)
 	if customMergeTables[tableName] {
 		sqlStmt := s.SQL
 		if isInsertStatement(sqlStmt) {

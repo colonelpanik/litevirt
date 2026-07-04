@@ -144,10 +144,10 @@ func TestProofMergeKeepLocal(t *testing.T) {
 }
 
 // entryTouchesCustomMerge flags any entry carrying a runtime_action_proofs
-// statement so the WAL push defers the WHOLE entry to an unready peer — a proof
+// statement so the WAL push DROPS the WHOLE entry for an unready peer — a proof
 // write and its co-batched vms.pending_action_id marker must never be split (a
 // marker without its proof would dangle on the peer, and a pre-v38 peer can't
-// apply the marker column either).
+// apply the marker column either). The dropped proof reconverges via sensitive AE.
 func TestEntryTouchesCustomMerge(t *testing.T) {
 	mustJSON := func(ss []Statement) string {
 		b, _ := json.Marshal(ss)
@@ -157,9 +157,9 @@ func TestEntryTouchesCustomMerge(t *testing.T) {
 	vmStmt := Statement{SQL: `UPDATE vms SET state='pending' WHERE name=?`, Params: []interface{}{"vm1"}}
 	markerStmt := Statement{SQL: `UPDATE vms SET pending_action_id=? WHERE name=?`, Params: []interface{}{"p1", "vm1"}}
 
-	// A batch co-mingling the proof and its marker is proof-bearing → defer whole.
+	// A batch co-mingling the proof and its marker is proof-bearing → drop whole.
 	if !entryTouchesCustomMerge(mustJSON([]Statement{proofStmt, markerStmt})) {
-		t.Fatal("proof+marker batch must be flagged (defer whole entry)")
+		t.Fatal("proof+marker batch must be flagged (drop whole entry)")
 	}
 	// Proof-only batch is proof-bearing.
 	if !entryTouchesCustomMerge(mustJSON([]Statement{proofStmt})) {
@@ -171,7 +171,7 @@ func TestEntryTouchesCustomMerge(t *testing.T) {
 	}
 	// Malformed JSON is treated conservatively as proof-bearing.
 	if !entryTouchesCustomMerge("{not json") {
-		t.Fatal("unparseable entry must be treated as proof-bearing (deferred)")
+		t.Fatal("unparseable entry must be treated as proof-bearing (dropped)")
 	}
 }
 

@@ -59,7 +59,7 @@ func petWatchdog(fd uintptr) error { return unix.IoctlWatchdogKeepalive(int(fd))
 // watchdogTimeLeft reports the seconds left on the timer (WDIOC_GETTIMELEFT). ok=false when the
 // device doesn't support the ioctl (can't verify) — distinct from a real 0 (armed-but-stopped).
 // Used to VERIFY the watchdog is actually counting before advertising self-fence, so a device
-// that opens+enables cleanly yet silently never runs (seen on an ASUS BMC's ipmi_watchdog) is
+// that opens+enables cleanly yet silently never runs (seen on some BMCs' ipmi_watchdog) is
 // caught instead of trusted.
 func watchdogTimeLeft(fd uintptr) (secs int, ok bool) {
 	n, err := unix.IoctlGetInt(int(fd), wdiocGetTimeLeft)

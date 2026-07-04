@@ -247,3 +247,26 @@ func TestDecisionGate_NotCoordinatorEligibleWhenDraining(t *testing.T) {
 		t.Fatalf("draining coordinator: got OK=%v reason=%q; want not_coordinator_eligible", r.OK, r.Reason)
 	}
 }
+
+// A transient PeerTLSConfig failure at Start must NOT leave startedAt==0 (which would make
+// QuorumProof skip warmup and report a permanent false QuorumNo — refusing every gated action).
+// Start anchors the warmup clock BEFORE the (now-retrying) TLS load, so QuorumProof reports
+// Unknown (warmup, safe fail-closed) instead of a bogus confirmed loss.
+func TestChecker_TLSLoadFailureAnchorsWarmup(t *testing.T) {
+	db := testCheckHostDB(t)
+	gateHost(t, db, "host-a", "active", "worker")
+	gateHost(t, db, "host-b", "active", "worker")
+	gateHost(t, db, "host-c", "active", "worker")
+	c := NewChecker("host-a", "/nonexistent/litevirt/pki", db) // PeerTLSConfig fails → retry loop
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Start(ctx)
+	var st QuorumState
+	for i := 0; i < 200; i++ {
+		if st, _, _ = c.QuorumProof(context.Background()); st == QuorumUnknown {
+			return // PASS: warmup (anchored), never a false loss
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("QuorumProof never reached Unknown despite the startedAt anchor (last=%v) — false quorum-loss on TLS failure", st)
+}

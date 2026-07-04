@@ -198,8 +198,8 @@ func TestLBInspectDisabled(t *testing.T) {
 // --- ApplyLB ---
 
 func TestApplyLB_MissingName(t *testing.T) {
-	s := testServer(t)
-	ctx := adminCtx()
+	s := newPeerAuthServer(t)
+	ctx := mtlsCtx("peer-1")
 
 	_, err := s.ApplyLB(ctx, &pb.ApplyLBRequest{})
 	if err == nil {
@@ -211,8 +211,8 @@ func TestApplyLB_MissingName(t *testing.T) {
 }
 
 func TestApplyLB_InvalidVIP(t *testing.T) {
-	s := testServer(t)
-	ctx := adminCtx()
+	s := newPeerAuthServer(t)
+	ctx := mtlsCtx("peer-1")
 
 	_, err := s.ApplyLB(ctx, &pb.ApplyLBRequest{
 		LbName: "test-lb",
@@ -227,8 +227,8 @@ func TestApplyLB_InvalidVIP(t *testing.T) {
 }
 
 func TestApplyLB_DefaultAlgorithm(t *testing.T) {
-	s := testServer(t)
-	ctx := adminCtx()
+	s := newPeerAuthServer(t)
+	ctx := mtlsCtx("peer-1")
 
 	// ApplyLB with valid VIP but no algorithm — should default to "roundrobin".
 	// The actual Apply call will fail (no haproxy binary) but the error
@@ -248,6 +248,16 @@ func TestApplyLB_DefaultAlgorithm(t *testing.T) {
 	}
 	if c := status.Code(err); c != codes.Internal {
 		t.Errorf("code = %v, want Internal (from lb.Manager.Apply)", c)
+	}
+}
+
+// ApplyLB is peer-only: a non-peer (bearer) caller — even admin — must be rejected before
+// any VIP work, so an authenticated client can't drive an arbitrary VIP bring-up.
+func TestApplyLB_RejectsNonPeer(t *testing.T) {
+	s := newPeerAuthServer(t)
+	_, err := s.ApplyLB(adminCtx(), &pb.ApplyLBRequest{LbName: "x", Vip: "10.0.0.50/24"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("non-peer ApplyLB must be PermissionDenied; got %v", status.Code(err))
 	}
 }
 

@@ -2079,22 +2079,23 @@ func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.V
 
 // ApplyLB handles a request from a peer to configure HAProxy + keepalived locally.
 func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.Empty, error) {
+	// Peer-only: ApplyLB is the host→host forwarded-apply RPC (the operator path is
+	// Create/UpdateLoadBalancer, which fan out to peers and handle the local host via
+	// applyLBLocal). Refuse non-peer callers so an authenticated bearer — even a viewer —
+	// can't drive an arbitrary VIP bring-up. Sibling RemoveLB is likewise peer-only.
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, status.Error(codes.PermissionDenied, "ApplyLB is a peer-only RPC")
+	}
 	if req.LbName == "" {
 		return nil, status.Error(codes.InvalidArgument, "lb_name required")
 	}
 
-	// Split-brain gate (Phase 1): local-quorum ExecutionGate is enforced at the
-	// applyLBLocal chokepoint below. Additionally, a FORWARDED (peer→peer) apply
-	// must carry a coordinator proof once enforced — otherwise any cluster peer
-	// could ask a quorum-holding LB host to claim a VIP unauthorized. A peer call
-	// with no proof under enforcement is refused; validate + single-use-claim a
-	// present proof.
-	if req.Proof != nil {
-		// A carried proof must come from a known cluster host (peer mTLS).
-		if err := s.requirePeerCert(ctx); err != nil {
-			return nil, status.Error(codes.PermissionDenied, "lb apply proof requires a peer cert")
-		}
-	} else if s.gateActive(ctx) && s.requirePeerCert(ctx) == nil {
+	// Split-brain gate: the local-quorum ExecutionGate is enforced at the applyLBLocal
+	// chokepoint below. Additionally, a forwarded apply must carry a coordinator proof once
+	// enforced — otherwise any peer could ask a quorum-holding LB host to claim a VIP
+	// unauthorized. No proof under enforcement is refused; a present proof is validated +
+	// single-use-claimed below.
+	if req.Proof == nil && s.gateActive(ctx) {
 		s.noteGateRefused(corrosion.ActionLBApply, health.ReasonProofMissing)
 		return nil, status.Error(codes.FailedPrecondition, "lb apply refused: forwarded apply requires a proof under enforcement")
 	}

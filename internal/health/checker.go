@@ -123,17 +123,30 @@ func NewChecker(hostName, pkiDir string, db *corrosion.Client) *Checker {
 
 // Start begins periodic health checking. Blocks until context is cancelled.
 func (c *Checker) Start(ctx context.Context) {
-	// Load TLS config for peer connections
-	var err error
-	c.tlsCfg, err = pki.PeerTLSConfig(c.pkiDir)
-	if err != nil {
-		slog.Error("health checker: failed to load TLS config", "error", err)
-		return
-	}
-
+	// Anchor the warmup clock FIRST. A transient PeerTLSConfig failure below must not leave
+	// startedAt==0 — that makes QuorumProof skip warmup and report a permanent false QuorumNo
+	// (refusing every gated action on this node; post-Phase-2 it would demote/self-fence a
+	// healthy node).
 	c.mu.Lock()
 	c.startedAt = time.Now()
 	c.mu.Unlock()
+
+	// Load TLS config for peer connections; RETRY a transient failure (e.g. a PKI-setup race
+	// at boot) rather than giving up — a checker that never loads TLS never probes peers, so
+	// it would report a permanent quorum loss. Loud on each failure; recovers when PKI heals.
+	var err error
+	for {
+		c.tlsCfg, err = pki.PeerTLSConfig(c.pkiDir)
+		if err == nil {
+			break
+		}
+		slog.Error("health checker: failed to load TLS config; retrying (peer health checks blocked until it succeeds)", "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
 
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()

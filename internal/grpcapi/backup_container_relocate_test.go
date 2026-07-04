@@ -322,9 +322,28 @@ func TestRestoreContainer_DifferentProofMarkerRefuses(t *testing.T) {
 
 // An UNMARKED untracked leftover (crash before the marker landed) is cleaned and
 // re-imported under this proof — not adopted, not left stuck.
+// A RUNNING untracked leftover must be REFUSED — restore must never force-destroy a live
+// workload to make room. (Only a stopped/orphan leftover is cleaned + re-imported.)
+func TestRestoreContainer_RunningLeftoverRefused(t *testing.T) {
+	s, rt, repo, ts, token, proofID := setupProofRestore(t)
+	rt.existsByName = map[string]bool{"ct1": true}
+	rt.stateByName = map[string]string{"ct1": "running"} // live workload
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}
+	err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: ts, Proof: relocProof(proofID, token),
+	}, rs)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a running untracked leftover must be refused (FailedPrecondition); got %v", err)
+	}
+	if len(rt.deleteCalls) != 0 {
+		t.Fatal("must NOT DeleteContainer a running leftover")
+	}
+}
+
 func TestRestoreContainer_UnmarkedLeftoverCleanedAndReimported(t *testing.T) {
 	s, rt, repo, ts, token, proofID := setupProofRestore(t)
-	rt.existsByName = map[string]bool{"ct1": true} // exists, but NO marker written
+	rt.existsByName = map[string]bool{"ct1": true}       // exists, but NO marker written
+	rt.stateByName = map[string]string{"ct1": "stopped"} // stopped → safe to clean
 
 	rs := &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}
 	if err := s.RestoreContainer(&pb.RestoreContainerRequest{

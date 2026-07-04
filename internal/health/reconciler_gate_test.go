@@ -603,3 +603,26 @@ func TestOnbootRetry_DropsOnOperatorIntentChange(t *testing.T) {
 		t.Fatalf("onbootPending should be drained (both dropped on intent change), have %d", n)
 	}
 }
+
+// A pending VM whose proof id can't be read/found (GC'd / never replicated / hand-mutated
+// pointer) must be REFUSED, not started — ClaimActionProof matches only by id+status, so
+// skipping validation on a read error/miss would start it unvalidated (fail-open double-run).
+func TestStartPendingVM_ProofUnreadableRefuses(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "pending", PendingActionID: "ghost"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	r.startPendingVM(ctx, *fresh)
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a VM whose proof can't be read/found must NOT be started (fail closed)")
+	}
+	if vm, _ := corrosion.GetVM(ctx, db, "vm1"); vm.State == "running" {
+		t.Fatalf("vm must not be marked running; state=%q", vm.State)
+	}
+}

@@ -592,17 +592,25 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		// The proof must actually authorize THIS start: a reschedule proof whose
 		// target/dest is this VM on this host. A mismatched id (stale pointer,
 		// collision) must never authorize a start.
-		if pr, ok, gerr := corrosion.GetActionProof(ctx, r.db, proofID); gerr == nil && ok {
-			// Exact match required: a reschedule proof for THIS vm, destined for THIS
-			// host. An empty/other dest is not accepted — a malformed/stale proof for
-			// the right VM must not become usable on any host.
-			if pr.Action != corrosion.ActionReschedule || pr.TargetKind != "vm" ||
-				pr.TargetName != vm.Name || pr.DestHost != r.hostName {
-				slog.Warn("reconciler: pending proof does not match this VM/host, refusing start",
-					"vm", vm.Name, "proof", proofID, "proof_target", pr.TargetName, "proof_dest", pr.DestHost)
-				r.noteGateRefused(corrosion.ActionReschedule, ReasonProofConflict)
-				return
-			}
+		pr, ok, gerr := corrosion.GetActionProof(ctx, r.db, proofID)
+		if gerr != nil || !ok {
+			// Can't read/find the proof row → we can't verify it authorizes THIS start, and
+			// ClaimActionProof matches only by id+status, so it would start the VM UNVALIDATED
+			// (a fail-open double-run vector). Refuse (fail closed).
+			slog.Warn("reconciler: pending proof unreadable/missing — refusing start (fail closed)",
+				"vm", vm.Name, "proof", proofID, "found", ok, "error", gerr)
+			r.noteGateRefused(corrosion.ActionReschedule, ReasonProofConflict)
+			return
+		}
+		// Exact match required: a reschedule proof for THIS vm, destined for THIS host. An
+		// empty/other dest is not accepted — a malformed/stale proof for the right VM must not
+		// become usable on any host.
+		if pr.Action != corrosion.ActionReschedule || pr.TargetKind != "vm" ||
+			pr.TargetName != vm.Name || pr.DestHost != r.hostName {
+			slog.Warn("reconciler: pending proof does not match this VM/host, refusing start",
+				"vm", vm.Name, "proof", proofID, "proof_target", pr.TargetName, "proof_dest", pr.DestHost)
+			r.noteGateRefused(corrosion.ActionReschedule, ReasonProofConflict)
+			return
 		}
 		if err := corrosion.ClaimActionProof(ctx, r.db, proofID, r.hostName); err != nil {
 			if errors.Is(err, corrosion.ErrProofSpent) {

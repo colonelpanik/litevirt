@@ -563,16 +563,6 @@ type mutationEntry struct {
 	CreatedAt string
 }
 
-// deferUnsupportedProofEntries truncates a batch at the FIRST proof-bearing entry, for a
-// destination peer that can't yet apply proofs (pre-v38 / not advertising the token). The
-// proof write is co-batched with its vms.pending_action_id marker in a SINGLE entry, so it
-// must replicate ATOMICALLY (never split) or DEFER WHOLE: everything before the first
-// proof-bearing entry is proof-free and safe to send now; that entry and all after it wait
-// for a later cycle once the peer gains support. Returns the sendable prefix, and — when it
-// truncated to a NON-EMPTY prefix — the watermark ceiling (the last kept entry's seq) so the
-// caller won't advance past the deferred entry. truncated=false means either no proof entry
-// was found (batch unchanged) OR the very first entry is proof-bearing (kept is empty →
-// caller sends nothing and holds the watermark).
 // dropUnsupportedProofEntries returns entries with every proof-bearing entry removed
 // (order preserved). The removed proofs are intentionally NOT re-sent via the WAL — the
 // caller advances the watermark past them and they reconverge via the peer-only sensitive

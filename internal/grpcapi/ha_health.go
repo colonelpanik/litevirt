@@ -76,7 +76,7 @@ func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 	out := map[string]bool{}
 	if s.gate != nil {
 		for _, tok := range capabilities.Supported() {
-			ok, reason := s.gate.CapabilityActive(ctx, tok)
+			ok, reason := s.gate.CapabilityActiveForHealth(ctx, tok)
 			if r := capabilityDegradedReason(tok, ok, reason); r != "" {
 				out[r] = true
 			}

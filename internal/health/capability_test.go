@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -78,10 +77,12 @@ func TestCapabilityActive(t *testing.T) {
 	})
 }
 
-// A positive CapabilityActive result is cached for capActivePosTTL: a second call within
-// the window returns the cached positive WITHOUT re-sweeping every voting peer, so the
-// post-latch HA monitor doesn't fan out a fresh capability sweep on every tick.
-func TestCapabilityActive_PositiveCached(t *testing.T) {
+// CapabilityActiveForHealth caches a positive for capActivePosTTL: a second call within the
+// window returns it WITHOUT re-sweeping every voting peer, so the post-latch HA monitor
+// doesn't fan out a fresh capability sweep on every tick. Critically, the ACTIVATION path
+// (CapabilityActive) does NOT read that cache — it re-sweeps freshly so the latch can't turn
+// on from a stale positive.
+func TestCapabilityActiveForHealth_PositiveCached(t *testing.T) {
 	const tok = capabilities.SplitBrainGateV1
 	db := testCheckHostDB(t)
 	gateHost(t, db, "host-a", "active", "worker")
@@ -94,18 +95,26 @@ func TestCapabilityActive_PositiveCached(t *testing.T) {
 		return []string{tok}, nil
 	})
 
-	if ok, _ := c.CapabilityActive(context.Background(), tok); !ok {
-		t.Fatal("first call: want active")
+	if ok, _ := c.CapabilityActiveForHealth(context.Background(), tok); !ok {
+		t.Fatal("first monitor call: want active")
 	}
 	first := calls
 	if first == 0 {
-		t.Fatal("first call must sweep peers")
+		t.Fatal("first monitor call must sweep peers")
 	}
-	if ok, _ := c.CapabilityActive(context.Background(), tok); !ok {
-		t.Fatal("second call: want active")
+	if ok, _ := c.CapabilityActiveForHealth(context.Background(), tok); !ok {
+		t.Fatal("second monitor call: want active")
 	}
 	if calls != first {
-		t.Fatalf("second call re-swept peers (pinger calls %d→%d); want a cached positive with no fresh sweep", first, calls)
+		t.Fatalf("second monitor call re-swept peers (pinger calls %d→%d); want a cached positive", first, calls)
+	}
+
+	// The activation path must NOT be served from the monitor's positive cache — it sweeps.
+	if ok, _ := c.CapabilityActive(context.Background(), tok); !ok {
+		t.Fatal("activation call: want active")
+	}
+	if calls == first {
+		t.Fatalf("CapabilityActive was served from the positive cache (pinger calls stayed %d); activation must re-sweep freshly", first)
 	}
 }
 
@@ -131,14 +140,9 @@ func TestEnforced_Latches(t *testing.T) {
 	if !c.Enforced(ctx, tok) {
 		t.Fatal("all members advertise the token → Enforced must be true")
 	}
-	// Simulate a partition: peers unreachable → CapabilityActive would be false.
+	// Simulate a partition: peers unreachable → CapabilityActive re-sweeps and returns false
+	// (the activation path never reads the positive cache, so no clearing is needed here).
 	supporting = false
-	// Clear the cached positive so this exercises a FRESH sweep; the positive cache would
-	// otherwise mask the partition for capActivePosTTL, which is orthogonal to the latch
-	// under test.
-	c.mu.Lock()
-	c.capActivePos = map[string]time.Time{}
-	c.mu.Unlock()
 	if ok, _ := c.CapabilityActive(ctx, tok); ok {
 		t.Fatal("precondition: CapabilityActive should now be false (partition)")
 	}

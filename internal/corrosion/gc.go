@@ -116,41 +116,26 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 	return counts, nil
 }
 
-// ReapSpentProofs bounds the runtime_action_proofs table once the split-brain gate is
-// flipped (pre-flip the table is empty, so this is a no-op). A proof is NOT a plain inert
-// row, so it CANNOT be reclaimed by GCSupersededRows' local-only delete: a direct-RPC
-// carrier re-seeds a proof via INSERT OR IGNORE, and a lagging prepared/in_progress copy on
-// a partitioned peer re-merges after a local delete — either could resurrect a spent proof
-// to a non-terminal state and re-run its action. Reaping therefore runs in TWO phases with
-// different guarantees:
+// ReapSpentProofs bounds the CONSUMABLE runtime_action_proofs set once the split-brain gate
+// is flipped (pre-flip the table is empty, so this is a no-op). It REPLICATED-tombstones a
+// terminal (completed/failed) proof older than tombstoneAfter — sets deleted_at via a guarded
+// monotone UPDATE. This is a lattice state, NOT a delete: it can't un-terminal a row, it
+// no-ops on any peer whose copy is still non-terminal (WHERE status IN terminal), and every
+// proof consume path already filters `deleted_at IS NULL`, so the tombstone renders the proof
+// inert cluster-wide while KEEPING its terminal rank — a tombstone still beats any lagging
+// non-terminal copy on merge, so it can never resurrect a spent proof.
 //
-//   Phase A — TOMBSTONE (replicated, monotone, ALWAYS safe): a terminal (completed/failed)
-//     proof older than tombstoneAfter gets deleted_at set via a REPLICATED guarded UPDATE.
-//     This is a lattice state, not a delete — it can't un-terminal a row, it no-ops on any
-//     peer whose copy is still non-terminal (WHERE status IN terminal), and every proof
-//     consume path already filters `deleted_at IS NULL`, so the tombstone renders the proof
-//     inert cluster-wide. A tombstone keeps its terminal rank, so it still BEATS any lagging
-//     non-terminal copy on merge — it actively protects against resurrection during
-//     convergence rather than opening a gap.
-//
-//   Phase B — HARD DELETE (local-only, convergence-gated): a TOMBSTONED proof older than
-//     reapAfter is hard-deleted locally (execLocalRows, no mutation_log row) ONLY when the
-//     cluster is fully healthy — every current host is `active` (allHostsActive). A stale
-//     non-terminal copy can only survive on a node that never converged the terminal state,
-//     i.e. one that has been offline/partitioned; if every host is active (and thus
-//     replicating) none holds such a copy, so no peer can re-merge a non-terminal proof into
-//     the reaped gap. With reapAfter >= the WAL retention window (MaxLogRetention), any
-//     mutation_log entry that could re-seed a stale copy is already pruned too. Each node
-//     runs the same deterministic sweep on its own copy; a transient re-merge of the (inert)
-//     tombstone from a not-yet-swept peer is harmless and re-reaped next cycle — the same
-//     property GCSupersededRows relies on. If ANY host is not active, Phase B is SKIPPED
-//     (fail safe): tombstones — tiny and inert — simply accumulate until the cluster is whole.
-func ReapSpentProofs(ctx context.Context, c *Client, tombstoneAfter, reapAfter time.Duration) (tombstoned, reaped int, err error) {
-	now := time.Now().UTC()
-	tombstoneCutoff := now.Add(-tombstoneAfter).Format(tsSecLayout)
-	reapCutoff := now.Add(-reapAfter).Format(tsSecLayout)
-
-	// Phase A — replicated monotone tombstone of spent (terminal) proofs.
+// It deliberately does NOT hard-delete (reclaim rows). A local hard delete of a proof is
+// union-unsafe — a lagging prepared/in_progress copy on a partitioned peer, or a direct-RPC
+// carrier's re-seed, can revive a spent proof AFTER the delete — and there is no CHEAP local
+// signal that proves every enforcement-relevant member has observed the terminal/tombstone:
+// the replicated hosts.state can read `active` for a peer this node hasn't actually reached
+// since a partition, so it is NOT convergence evidence. Reclaiming tombstoned rows must wait
+// on REAL local convergence evidence (per-peer replication watermarks past the tombstone's
+// mutation_log seq) and is left as a separate follow-up; tombstones are tiny and inert until
+// then, and the consumable set — all that gates a runtime action — is already bounded here.
+func ReapSpentProofs(ctx context.Context, c *Client, tombstoneAfter time.Duration) (tombstoned int, err error) {
+	tombstoneCutoff := time.Now().UTC().Add(-tombstoneAfter).Format(tsSecLayout)
 	ts := c.NowTS()
 	n, err := c.ExecuteRows(ctx,
 		`UPDATE runtime_action_proofs
@@ -160,48 +145,7 @@ func ReapSpentProofs(ctx context.Context, c *Client, tombstoneAfter, reapAfter t
 		    AND substr(updated_at, 1, 19) < ?`,
 		ts, ts, tombstoneCutoff)
 	if err != nil {
-		return 0, 0, fmt.Errorf("tombstone spent proofs: %w", err)
+		return 0, fmt.Errorf("tombstone spent proofs: %w", err)
 	}
-	tombstoned = int(n)
-
-	// Phase B — convergence-gated local reclaim of long-tombstoned proofs.
-	healthy, herr := allHostsActive(ctx, c)
-	if herr != nil {
-		return tombstoned, 0, fmt.Errorf("proof reap membership check: %w", herr)
-	}
-	if !healthy {
-		return tombstoned, 0, nil // a host may rejoin with a stale copy → don't reclaim yet
-	}
-	rn, rerr := c.execLocalRows(ctx,
-		`DELETE FROM runtime_action_proofs -- full-state-delete-ok: convergence-gated reclaim of an ALREADY-tombstoned proof (every host active + past WAL retention); a re-merged tombstone is inert and re-reaped next cycle
-		   WHERE deleted_at IS NOT NULL
-		     AND status IN ('completed','failed')
-		     AND substr(COALESCE(NULLIF(deleted_at, ''), updated_at), 1, 19) < ?`,
-		reapCutoff)
-	if rerr != nil {
-		return tombstoned, 0, fmt.Errorf("reap tombstoned proofs: %w", rerr)
-	}
-	return tombstoned, int(rn), nil
-}
-
-// allHostsActive reports whether EVERY current cluster host is in the `active` state
-// (ListHosts already excludes soft-deleted / departed hosts). It gates the proof reaper's
-// hard-delete phase: a stale non-terminal proof copy can only survive on a node that never
-// converged the terminal state — one that has been offline/partitioned — so if any host is
-// not active we must not reclaim (it could rejoin and re-merge a non-terminal copy into the
-// reaped gap). Fails safe: an empty membership or a query error reports NOT-all-active.
-func allHostsActive(ctx context.Context, c *Client) (bool, error) {
-	hosts, err := ListHosts(ctx, c)
-	if err != nil {
-		return false, err
-	}
-	if len(hosts) == 0 {
-		return false, nil // unknown membership → don't reclaim
-	}
-	for _, h := range hosts {
-		if h.State != "active" {
-			return false, nil
-		}
-	}
-	return true, nil
+	return int(n), nil
 }

@@ -534,14 +534,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// On quorum heal after a self-demotion, re-apply this host's LBs — DemoteAll stopped
 	// keepalived + removed the VIP, and nothing else recovers it otherwise.
 	vipDemoter.SetOnQuorumRestored(svc.ReconcileLBs)
+	// Once this node self-fences it de-advertises ALL split-brain capabilities — it is
+	// committed to rebooting, so it stops presenting as a healthy member for the
+	// fence-timeout window (defense-in-depth; reclaim still gates on VIPAssigned/fence-proof).
+	// Wired BEFORE the goroutines below: the HA-health monitor self-Pings into
+	// advertisedCapabilities, which reads this predicate. (Storage is atomic, so a late wire
+	// is race-free regardless, but wiring first means a self-fence is honored immediately.)
+	svc.SetWatchdogFenced(watchdogCtrl.Fenced)
 	go vipDemoter.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.
 	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
-	// Once this node self-fences it de-advertises ALL split-brain capabilities — it is
-	// committed to rebooting, so it stops presenting as a healthy member for the
-	// fence-timeout window (defense-in-depth; reclaim still gates on VIPAssigned/fence-proof).
-	svc.SetWatchdogFenced(watchdogCtrl.Fenced)
 
 	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
 	ipScanner := grpcapi.NewIPScanner(svc)
@@ -1349,18 +1352,14 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 				}
 			}
 		}
-		// Split-brain runtime_action_proofs: replicated monotone tombstone (core) + a
-		// convergence-gated local reclaim of long-tombstoned rows (orphan, >= WAL retention).
-		// No-op until the gate is flipped and proofs start accruing.
-		if tombstoned, reaped, perr := corrosion.ReapSpentProofs(ctx, d.db, core, orphan); perr != nil {
+		// Split-brain runtime_action_proofs: a REPLICATED monotone tombstone of spent
+		// (terminal) proofs past the core retention. This bounds the consumable set; row
+		// reclamation is intentionally deferred (needs real convergence evidence, not
+		// replicated hosts.state — see ReapSpentProofs). No-op until the gate is flipped.
+		if tombstoned, perr := corrosion.ReapSpentProofs(ctx, d.db, core); perr != nil {
 			slog.Warn("proof reaper", "error", perr)
-		} else {
-			if reaped > 0 {
-				m.RowsDeleted("runtime_action_proofs", reaped)
-			}
-			if tombstoned > 0 || reaped > 0 {
-				slog.Info("proof reaper", "tombstoned", tombstoned, "reaped", reaped)
-			}
+		} else if tombstoned > 0 {
+			slog.Info("proof reaper", "tombstoned", tombstoned)
 		}
 	}
 	select {

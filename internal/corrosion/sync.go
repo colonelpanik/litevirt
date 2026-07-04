@@ -436,6 +436,16 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// runtime_action_proofs merges MONOTONICALLY on status; a dump that OMITS the status
+	// column can't be checked against the lifecycle, so refuse the WHOLE chunk (fail closed)
+	// rather than INSERT a status-less row — which would default to 'prepared' (schema.go) and
+	// resurrect a spent proof, whether or not a local row exists. A well-formed peer always
+	// includes the column, so this never blocks real convergence.
+	if customMergeTables[table.Name] && indexOf(table.Columns, "status") < 0 {
+		slog.Warn("sync: runtime_action_proofs dump missing status column; refusing chunk (fail-closed)", "table", table.Name)
+		return 0, len(rows)
+	}
+
 	tx, err := c.db.Begin()
 	if err != nil {
 		slog.Error("sync: begin tx", "table", table.Name, "error", err)

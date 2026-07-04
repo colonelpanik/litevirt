@@ -97,6 +97,27 @@ func TestProofMergeKeepLocalRow_NoStatusColumnFailsClosed(t *testing.T) {
 	}
 }
 
+// A runtime_action_proofs AE dump that OMITS the status column is refused at the CHUNK level
+// — including for an ABSENT local row — so a malformed/hostile dump can't INSERT a status-less
+// row that defaults to 'prepared' and manufactures a live proof.
+func TestMergeChunk_RefusesStatuslessProofDump(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	merged, skipped := c.mergeChunk(
+		syncTable{Name: "runtime_action_proofs", Columns: []string{"id", "updated_at"}},
+		[][]interface{}{{"ghost", "2999-01-01T00:00:00Z"}},
+		"INSERT OR REPLACE INTO runtime_action_proofs (id, updated_at) VALUES (?, ?)",
+		[]string{"id"}, []int{0}, 1,
+	)
+	if merged != 0 || skipped != 1 {
+		t.Fatalf("status-less proof dump: merged=%d skipped=%d; want 0/1 (chunk refused)", merged, skipped)
+	}
+	if _, ok, err := GetActionProof(ctx, c, "ghost"); err != nil || ok {
+		t.Fatalf("status-less dump inserted a proof: ok=%v err=%v; want no row (refused)", ok, err)
+	}
+}
+
 // proofMergeKeepLocal is the monotone anti-entropy decision: rank wins over
 // timestamp, and a completed⊕failed conflict keeps local.
 func TestProofMergeKeepLocal(t *testing.T) {

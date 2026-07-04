@@ -237,8 +237,10 @@ type Server struct {
 	// is only waiting for the hardware timeout to reboot. During that live-but-doomed
 	// window it must stop being trusted as a healthy member — advertisedCapabilities drops
 	// ALL split-brain tokens so peers stop counting it. Set by the daemon from the watchdog
-	// controller. nil → never fenced.
-	watchdogFenced func() bool
+	// controller. Stored atomically: the HA-health monitor goroutine can self-Ping into
+	// advertisedCapabilities before the daemon wires this in, so the read must not race the
+	// write. Unset (nil) → never fenced.
+	watchdogFenced atomic.Pointer[func() bool]
 }
 
 // SetDemotionUnfenced records whether a minority VIP demote failed with no verified
@@ -247,7 +249,7 @@ type Server struct {
 func (s *Server) SetDemotionUnfenced(on bool) { s.demotionUnfenced.Store(on) }
 
 // SetWatchdogFenced injects the self-fenced predicate (Phase 2 defense-in-depth).
-func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced = fn }
+func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced.Store(&fn) }
 
 // advertisedCapabilities is Supported() as-is — vip_demote_v1 is a SOFTWARE capability
 // advertised by every new-binary node regardless of any hardware watchdog (the decouple:
@@ -259,7 +261,7 @@ func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced = fn }
 // VIP): the majority's reclaim gates on the ground-truth VIPAssigned probe / a Phase-5
 // fence proof, never on the token, and peers already latched keep enforcing regardless.
 func (s *Server) advertisedCapabilities() []string {
-	if s.watchdogFenced != nil && s.watchdogFenced() {
+	if s.selfFenced() {
 		return []string{}
 	}
 	return capabilities.Supported()
@@ -273,6 +275,9 @@ type serverGate interface {
 	// lease, since a lease can be "held" on both sides of a partition.
 	DecisionGate(ctx context.Context) health.GateResult
 	CapabilityActive(ctx context.Context, token string) (bool, string)
+	// CapabilityActiveForHealth is the positive-cached variant for the periodic HA-degraded
+	// monitor ONLY — never the activation path (see health.Checker).
+	CapabilityActiveForHealth(ctx context.Context, token string) (bool, string)
 	// Enforced is the LATCHED enforcement decision — once activated cluster-wide it
 	// stays true even when a fresh Ping can't confirm (partition → fail closed).
 	Enforced(ctx context.Context, token string) bool
@@ -313,7 +318,12 @@ func (s *Server) gateActive(ctx context.Context) bool {
 // only waiting for the hardware timeout to reboot. During that live-but-doomed window it
 // must refuse every runtime-ownership decide/execute — even if quorum transiently returns
 // before the reboot — since it has already committed to going down. nil predicate → false.
-func (s *Server) selfFenced() bool { return s.watchdogFenced != nil && s.watchdogFenced() }
+func (s *Server) selfFenced() bool {
+	if fn := s.watchdogFenced.Load(); fn != nil {
+		return (*fn)()
+	}
+	return false
+}
 
 // execGateForAction reports whether the split-brain gate blocks a runtime-ownership
 // action on THIS host. It runs the local ExecutionGate (must be an active worker

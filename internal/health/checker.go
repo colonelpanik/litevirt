@@ -66,12 +66,13 @@ type Checker struct {
 	// to activate.
 	capActiveNeg map[string]capNegEntry
 
-	// capActivePos caches a POSITIVE CapabilityActive result per token for capActivePosTTL.
-	// Pre-latch there is no repeated positive to cache (Enforced latches on the first one);
-	// this exists for the POST-latch HA monitor (evaluateHADegraded), which would otherwise
-	// re-fan-out a fresh capability sweep across every voting peer on every tick. A capability
-	// regression on an already-latched cluster still surfaces within the TTL, and the entry is
-	// cleared the moment any sweep yields a negative (cacheNeg), so a regression is never masked.
+	// capActivePos caches a POSITIVE result per token for capActivePosTTL, populated and read
+	// ONLY by CapabilityActiveForHealth — the post-latch HA monitor (evaluateHADegraded),
+	// which would otherwise re-fan-out a fresh capability sweep across every voting peer on
+	// every tick. The ACTIVATION path (CapabilityActive/Enforced) deliberately does NOT read
+	// this — the latch must never turn on from a stale positive. A regression on an already-
+	// latched cluster still surfaces within the TTL, and the entry is cleared the moment any
+	// sweep yields a negative (cacheNeg), so a regression is never masked.
 	capActivePos map[string]time.Time
 
 	// activated latches, PER TOKEN, "enforcement has activated cluster-wide"

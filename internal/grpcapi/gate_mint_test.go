@@ -42,6 +42,9 @@ func (f fakeServerGate) DecisionGate(context.Context) health.GateResult {
 func (f fakeServerGate) CapabilityActive(_ context.Context, token string) (bool, string) {
 	return f.enforcedFor(token), ""
 }
+func (f fakeServerGate) CapabilityActiveForHealth(_ context.Context, token string) (bool, string) {
+	return f.enforcedFor(token), ""
+}
 func (f fakeServerGate) Enforced(_ context.Context, token string) bool { return f.enforcedFor(token) }
 func (f fakeServerGate) enforcedFor(token string) bool {
 	if f.enforcedTok != nil {
@@ -90,7 +93,8 @@ func TestGates_SelfFencedHardRefuse(t *testing.T) {
 	fenced := func() bool { return true }
 
 	// Even with an otherwise-passing gate + quorum, fenced refuses.
-	s := &Server{hostName: "h", gate: fakeServerGate{execOK: true, decideOK: true, enforced: true}, watchdogFenced: fenced}
+	s := &Server{hostName: "h", gate: fakeServerGate{execOK: true, decideOK: true, enforced: true}}
+	s.SetWatchdogFenced(fenced)
 	if reason, refused := s.execGateForAction(ctx, false); !refused || reason != health.ReasonSelfFenced {
 		t.Fatalf("fenced markerless execute: refused=%v reason=%q; want true/self_fenced", refused, reason)
 	}
@@ -101,12 +105,14 @@ func TestGates_SelfFencedHardRefuse(t *testing.T) {
 		t.Fatalf("fenced decide: refused=%v reason=%q; want true/self_fenced", refused, reason)
 	}
 	// Fenced with a NIL gate still refuses (the fenced check precedes the nil-gate legacy path).
-	sNil := &Server{hostName: "h", watchdogFenced: fenced}
+	sNil := &Server{hostName: "h"}
+	sNil.SetWatchdogFenced(fenced)
 	if reason, refused := sNil.execGateForAction(ctx, false); !refused || reason != health.ReasonSelfFenced {
 		t.Fatalf("fenced + nil gate execute: refused=%v reason=%q; want true/self_fenced", refused, reason)
 	}
 	// Not fenced → normal behavior (markerless + unenforced fails open).
-	sOK := &Server{hostName: "h", gate: fakeServerGate{}, watchdogFenced: func() bool { return false }}
+	sOK := &Server{hostName: "h", gate: fakeServerGate{}}
+	sOK.SetWatchdogFenced(func() bool { return false })
 	if _, refused := sOK.execGateForAction(ctx, false); refused {
 		t.Fatal("unfenced markerless+unenforced must fail open")
 	}

@@ -35,10 +35,10 @@ const capActivationTimeout = 4 * time.Second
 // cluster activates promptly; only negatives are cached (a positive clears it + latches).
 const capActiveNegTTL = 3 * time.Second
 
-// capActivePosTTL caches a POSITIVE CapabilityActive result this long. Only the post-latch
-// HA monitor recomputes positives (Enforced short-circuits once latched), so a TTL longer
-// than the negative one collapses its per-tick capability sweep across every voting peer to
-// roughly once per window, while a capability regression on the latched cluster still
+// capActivePosTTL caches a POSITIVE CapabilityActiveForHealth result this long. Only the
+// post-latch HA monitor uses that wrapper (the activation path re-sweeps freshly), so a TTL
+// longer than the negative one collapses its per-tick capability sweep across every voting
+// peer to roughly once per window, while a capability regression on the latched cluster still
 // surfaces within the TTL. Cleared on any negative (cacheNeg), so it never masks a regression.
 const capActivePosTTL = 60 * time.Second
 
@@ -211,11 +211,7 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 	pinger := c.peerPinger
 	if e, ok := c.capActiveNeg[token]; ok && time.Since(e.at) < capActiveNegTTL {
 		c.mu.Unlock()
-		return false, e.reason // recent negative → skip the fresh-Ping fan-out
-	}
-	if at, ok := c.capActivePos[token]; ok && time.Since(at) < capActivePosTTL {
-		c.mu.Unlock()
-		return true, "" // recent positive → skip the fan-out (a regression still surfaces within capActivePosTTL)
+		return false, e.reason // recent negative → skip the fresh-Ping fan-out (fail closed)
 	}
 	c.mu.Unlock()
 	if pinger == nil {
@@ -243,13 +239,35 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 			return c.cacheNeg(token, ReasonUnsupportedCapability)
 		}
 	}
-	// Positive: clear any cached negative so the latch reacts immediately, and cache the
-	// positive so the post-latch HA monitor doesn't re-fan-out this sweep every tick.
+	// Positive: clear any cached negative so the latch reacts immediately. NB the positive
+	// is NOT cached here — this is the activation path (Enforced) and must re-sweep freshly
+	// every call; only CapabilityActiveForHealth caches positives, for the HA monitor.
 	c.mu.Lock()
 	delete(c.capActiveNeg, token)
-	c.capActivePos[token] = time.Now()
 	c.mu.Unlock()
 	return true, ""
+}
+
+// CapabilityActiveForHealth is CapabilityActive with a POSITIVE-result cache, for the
+// periodic HA-degraded monitor ONLY (RunHAHealthMonitor). It must NEVER be used on the
+// activation path: Enforced needs a fresh sweep so the latch can't turn on from a stale
+// positive. The positive is cached for capActivePosTTL and cleared on ANY negative (cacheNeg,
+// invoked by the fresh CapabilityActive below or any other caller), so a capability
+// regression still surfaces within the TTL.
+func (c *Checker) CapabilityActiveForHealth(ctx context.Context, token string) (bool, string) {
+	c.mu.Lock()
+	if at, ok := c.capActivePos[token]; ok && time.Since(at) < capActivePosTTL {
+		c.mu.Unlock()
+		return true, "" // recent positive → skip the fan-out (a regression still surfaces within capActivePosTTL)
+	}
+	c.mu.Unlock()
+	ok, reason := c.CapabilityActive(ctx, token)
+	if ok {
+		c.mu.Lock()
+		c.capActivePos[token] = time.Now()
+		c.mu.Unlock()
+	}
+	return ok, reason
 }
 
 // cacheNeg records a negative CapabilityActive result for capActiveNegTTL and returns it.

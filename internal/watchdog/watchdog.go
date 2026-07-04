@@ -179,7 +179,10 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 	}
 	fenced := false
 	defer func() {
-		if !fenced {
+		// Also honor ctrl.Fenced(): if SelfFence was tripped but ctx.Done (graceful shutdown)
+		// won the select race before the fence case ran, `fenced` is still false — disarming
+		// here would defeat a self-fence the node already committed to. Leave it armed.
+		if !fenced && !ctrl.Fenced() {
 			// Graceful shutdown: disable + write 'V' to disarm so the watchdog doesn't fire.
 			if ctrl != nil {
 				ctrl.armed.Store(false)

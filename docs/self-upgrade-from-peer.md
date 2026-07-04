@@ -28,18 +28,21 @@ downgrade-safe**:
    `schema_version` **strictly greater** than the local `CurrentSchemaVersion`.
    Schema only ever moves forward, so this is unambiguous and is exactly the
    case that would otherwise get replication-refused. → catch up.
-2. **Same-schema version drift (majority):** the highest-schema peers are at the
-   **same** schema as us, but a **strict majority** of the reachable cluster
-   (peers + self) runs a single binary `version` that differs from ours. → catch
-   up to that version. The majority requirement stops a lone newer node from
-   being dragged backwards by one stale peer.
+2. **Same-schema, newer version (newest-wins):** the most-advanced reachable peer
+   is at our schema but a **strictly-newer** `version` (semver compare on the
+   `vX.Y.Z` tag). → catch up to it. **No majority is required** — seeding the new
+   binary onto a *single* node lets it flow to the entire fleet, which is the only
+   model that scales past a handful of nodes. Movement is forward-only (never to an
+   older `version`), so a lone stale peer can't drag anyone backwards, and an
+   unparseable `version` (a `dev` or git-describe ephemeral build) is never a
+   target, so a local build can't pull the cluster onto an un-orderable version.
 
 **Hard guard:** never apply a binary whose advertised `schema_version` is **less
 than** ours (no schema downgrade — the daemon already refuses to start against a
 forward-migrated DB, but we refuse before swapping to avoid a crash-loop).
 
-The peer to pull from is the one at the highest schema (then the majority
-version), among **active** hosts. When several equally-good sources exist, an
+The peer to pull from is the most-advanced **active** host (highest schema, then
+the newest semver version). When several equally-good sources exist, an
 elected **relay** (Crescent `ComputeRelays`) is preferred so a fleet-wide flip
 spreads the binary pulls across the ~R relays instead of all hammering one node.
 
@@ -90,7 +93,16 @@ spreads the binary pulls across the ~R relays instead of all hammering one node.
 
 ## Out of scope (documented)
 
-- Cross-version *downgrade* is never automatic (guarded above).
-- A binary change with **no** schema bump and **no** clear cluster majority is
-  left to the operator (`lv host upgrade`) — we don't guess direction without a
-  monotonic (schema) or majority signal.
+- Cross-version *downgrade* is never automatic (guarded above): schema is never
+  rolled back, and a same-schema `version` only ever moves forward to a
+  strictly-newer semver.
+- A newer same-schema binary on **any single** reachable node propagates to the
+  whole fleet (newest-wins, above) — putting a build on one node is enough to roll
+  the cluster. This is deliberate (it's how a large fleet upgrades from one seed);
+  the guardrails are that `FetchBinary` is **peer-mTLS-only** (an operator's
+  user/bearer credential can't inject a binary), the streamed checksum +
+  confirm-`Ping` `(version, schema)` must match, and a schema downgrade is never
+  applied. Don't leave a newer build on a prod node you didn't intend to roll.
+- To hold a test build on a subset **without** it propagating, set
+  `auto_upgrade.from_peer: false` on those nodes (config + restart) before
+  deploying, and re-enable after.

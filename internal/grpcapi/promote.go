@@ -329,7 +329,17 @@ func (s *Server) promoteMarkerPath(name string) string {
 }
 func (s *Server) promoteMarkerPresent(name string) bool {
 	_, err := os.Stat(s.promoteMarkerPath(name))
-	return err == nil
+	if err == nil {
+		return true
+	}
+	if os.IsNotExist(err) {
+		return false
+	}
+	// Indeterminate stat (permission / I/O) → fail CLOSED: assume the marker MAY be present so
+	// a retry adopts a possibly-ours running domain rather than destroy+rebuild it (mirrors the
+	// fail-closed readRestoreMarker discipline for a safety marker).
+	slog.Warn("promoteMarkerPresent: indeterminate stat, assuming present (fail closed)", "name", name, "error", err)
+	return true
 }
 func (s *Server) writePromoteMarker(name, proofID string) error {
 	if err := os.MkdirAll(filepath.Join(s.dataDir, "promote-markers"), 0o700); err != nil {
@@ -344,12 +354,15 @@ func (s *Server) removePromoteMarker(name string) { _ = os.Remove(s.promoteMarke
 // if it actually EXISTS and is RUNNING, and either this proof's own start_attempted
 // checkpoint is set (same-proof crash after libvirt-start) or the host-local promote
 // marker is present (CROSS-proof — each failover cycle mints a fresh proof, so step_state
-// alone can't recognize our own prior promotion). A "started" checkpoint short-circuits.
+// alone can't recognize our own prior promotion).
+//
+// Adoption REQUIRES the domain to actually exist and be RUNNING now: a checkpoint or marker
+// only proves the domain is OURS (so a retry mustn't destroy+rebuild a stranger), not that
+// it's still alive. A prior 'started' whose domain has since DIED must NOT be adopted — that
+// would persist a dead domain as running and skip the rebuild; it falls through to the
+// (re)build/(re)start path instead.
 func promoteDomainAlreadyStarted(startedStep, startAttemptedStep, markerPresent, domainExists, domainRunning bool) bool {
-	if startedStep {
-		return true
-	}
-	return domainExists && domainRunning && (startAttemptedStep || markerPresent)
+	return domainExists && domainRunning && (startedStep || startAttemptedStep || markerPresent)
 }
 
 // promoteDiskBuilt honors the disk_built checkpoint only when the live disk actually
@@ -668,6 +681,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if err := s.virt.StartDomain(targetName); err != nil {
 			_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
 			os.Remove(livePath)
+			// Don't leak the marker: we tore the half-built domain down, so a later --force
+			// retry must not treat a same-name stranger as our adopted prior promotion.
+			s.removePromoteMarker(targetName)
 			return status.Errorf(codes.Internal, "start domain: %v", err)
 		}
 		recordStep("started") // checkpoint: never destroy/rebuild this domain on a retry

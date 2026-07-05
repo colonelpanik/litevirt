@@ -411,13 +411,10 @@ func rebuildRefcounts(f *os.File, h *Header, fileEnd uint64, refcountBits uint32
 	refcounts := make([]uint16, totalClusters)
 
 	// Mark metadata clusters.
-	// Cluster 0: header.
+	// Cluster 0: header. The refcount table and blocks are (re)allocated at EOF
+	// below and marked there — the table's original reserved area from Create is
+	// abandoned (left as free space), so it is deliberately NOT marked here.
 	markRef(refcounts, 0)
-	// Refcount table clusters (mark the table itself, not the old blocks —
-	// we'll allocate new blocks and mark them below).
-	for i := uint32(0); i < h.RefcountTableClusters; i++ {
-		markRef(refcounts, h.RefcountTableOffset/clusterSize+uint64(i))
-	}
 
 	// Scan L1 table and mark L1 clusters.
 	l1Bytes := uint64(h.L1Size) * 8
@@ -477,43 +474,53 @@ func rebuildRefcounts(f *os.File, h *Header, fileEnd uint64, refcountBits uint32
 		}
 	}
 
-	// Calculate how many refcount blocks we need.
+	// Lay out the refcount blocks AND the refcount table at the end of the file so
+	// they don't collide with L1/L2/data. The table and blocks must count every
+	// cluster including themselves, and the table's size depends on the block count
+	// (which depends on how many clusters the table+blocks add) — a self-referential
+	// layout solved by the same fixed-point iteration create uses. Relocating the
+	// table to EOF (rather than rewriting it in place at its Create-reserved cluster)
+	// is what lets it GROW past one cluster for a small-cluster/large image without
+	// spilling over the L1/data region.
 	entriesPerBlock := clusterSize * 8 / uint64(refcountBits)
-
-	// Allocate refcount blocks at the end of the file so they don't
-	// collide with L1/L2/data.  Align to cluster boundary since QEMU
-	// requires refcount blocks to be cluster-aligned.
 	rcBlockBase := (fileEnd + clusterSize - 1) / clusterSize * clusterSize
+	baseCluster := rcBlockBase / clusterSize // first EOF cluster; == current totalClusters
+
+	numBlocks := uint64(1)
+	rcTableClusters := uint64(1)
 	for {
-		numBlocks := (totalClusters + entriesPerBlock - 1) / entriesPerBlock
-		needed := rcBlockBase/clusterSize + numBlocks
-		if needed <= totalClusters {
+		total := baseCluster + numBlocks + rcTableClusters
+		nb := (total + entriesPerBlock - 1) / entriesPerBlock
+		nt := (nb*8 + clusterSize - 1) / clusterSize
+		if nb <= numBlocks && nt <= rcTableClusters {
 			break
 		}
-		// Grow the slice to accommodate the refcount block clusters.
-		for uint64(len(refcounts)) < needed {
-			refcounts = append(refcounts, 0)
+		if nb > numBlocks {
+			numBlocks = nb
 		}
-		totalClusters = uint64(len(refcounts))
+		if nt > rcTableClusters {
+			rcTableClusters = nt
+		}
 	}
-	numBlocks := (totalClusters + entriesPerBlock - 1) / entriesPerBlock
 
-	// Mark refcount block clusters themselves.
+	// Grow the refcount map to cover the block + table clusters, then mark them.
+	totalClusters = baseCluster + numBlocks + rcTableClusters
+	for uint64(len(refcounts)) < totalClusters {
+		refcounts = append(refcounts, 0)
+	}
 	for b := uint64(0); b < numBlocks; b++ {
-		markRef(refcounts, rcBlockBase/clusterSize+b)
+		markRef(refcounts, baseCluster+b)
+	}
+	for i := uint64(0); i < rcTableClusters; i++ {
+		markRef(refcounts, baseCluster+numBlocks+i)
 	}
 
-	// Write refcount blocks.
-	rcTableSize := numBlocks * 8
-	rcTableClusters := (rcTableSize + clusterSize - 1) / clusterSize
-
-	// Write refcount table at cluster 1 (already allocated in Create).
+	// Write the refcount blocks and build the table that points at them.
 	rcTable := make([]byte, rcTableClusters*clusterSize)
 	for b := uint64(0); b < numBlocks; b++ {
 		blockOffset := rcBlockBase + b*clusterSize
 		binary.BigEndian.PutUint64(rcTable[b*8:b*8+8], blockOffset)
 
-		// Build and write refcount block.
 		block := make([]byte, clusterSize)
 		for e := uint64(0); e < entriesPerBlock; e++ {
 			globalIdx := b*entriesPerBlock + e
@@ -527,18 +534,28 @@ func rebuildRefcounts(f *os.File, h *Header, fileEnd uint64, refcountBits uint32
 		}
 	}
 
-	// Write refcount table.
-	if _, err := f.WriteAt(rcTable[:rcTableClusters*clusterSize], int64(h.RefcountTableOffset)); err != nil {
+	// Write the refcount table at EOF (right after the blocks).
+	tableOffset := (baseCluster + numBlocks) * clusterSize
+	if _, err := f.WriteAt(rcTable, int64(tableOffset)); err != nil {
 		return fmt.Errorf("write rctable: %w", err)
 	}
 
-	// Update header refcount table clusters if changed.
+	// Point the header at the relocated table and its (possibly grown) size.
+	if tableOffset != h.RefcountTableOffset {
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], tableOffset)
+		if _, err := f.WriteAt(buf[:], 48); err != nil { // offset 48 = RefcountTableOffset
+			return err
+		}
+		h.RefcountTableOffset = tableOffset
+	}
 	if uint32(rcTableClusters) != h.RefcountTableClusters {
 		var buf [4]byte
 		binary.BigEndian.PutUint32(buf[:], uint32(rcTableClusters))
-		if _, err := f.WriteAt(buf[:], 56); err != nil {
+		if _, err := f.WriteAt(buf[:], 56); err != nil { // offset 56 = RefcountTableClusters
 			return err
 		}
+		h.RefcountTableClusters = uint32(rcTableClusters)
 	}
 
 	return nil

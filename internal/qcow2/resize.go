@@ -53,7 +53,15 @@ func Resize(path string, newSizeBytes uint64) error {
 		return fmt.Errorf("write L1 size: %w", err)
 	}
 
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync: %w", err)
+	}
+	// Self-check tripwire. Resize mutates metadata in place (no temp+rename), so a
+	// failure here can't be rolled back — but a resize was one of the confirmed
+	// refcount-corruption paths, so surfacing an inconsistent result as a loud error
+	// beats silently leaving a corrupt image for a later write to trip over. The
+	// data is Sync'd above; Check opens its own read handle.
+	return Check(path)
 }
 
 // expandL1 allocates a new, larger L1 table, copies old entries, and updates

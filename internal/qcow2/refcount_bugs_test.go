@@ -1,6 +1,7 @@
 package qcow2
 
 import (
+	"context"
 	"encoding/binary"
 	"os"
 	"os/exec"
@@ -227,6 +228,74 @@ func TestResize_EmptyImageStillWorks(t *testing.T) {
 		t.Fatalf("Check: %v", err)
 	}
 	qemuCheckIfAvailable(t, path)
+}
+
+// TestConvert_RefcountTableGrowth exercises the refcount-TABLE growth path: with
+// small clusters and enough data, the rebuilt refcount table needs more than one
+// cluster. Pre-fix, rebuildRefcounts rewrote the grown table in place at its
+// Create-reserved cluster, spilling over the L1/data region (caught only reactively
+// by Check → convert failed). Post-fix the table is relocated to EOF and the header
+// is repointed, so convert produces a valid image and the data round-trips.
+func TestConvert_RefcountTableGrowth(t *testing.T) {
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		t.Skip("qemu-img not available")
+	}
+	if _, err := exec.LookPath("qemu-io"); err != nil {
+		t.Skip("qemu-io not available")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.qcow2")
+	dst := filepath.Join(dir, "dst.qcow2")
+
+	// ~16MB of allocated data. At 512B clusters one refcount-table cluster covers
+	// ~8MB of file, so the destination needs >1 table cluster → the growth path.
+	run(t, "qemu-img", "create", "-f", "qcow2", src, "64M")
+	run(t, "qemu-io", "-f", "qcow2", "-c", "write -P 0xab 0 16M", src)
+
+	// Uncompressed so the data actually occupies clusters (compressing 0xab would
+	// shrink the file below the one-table-cluster threshold and skip the growth).
+	if err := Convert(context.Background(), src, dst, &Options{ClusterBits: 9, Uncompressed: true}); err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	// Prove the growth path actually ran: the table must have grown past one cluster.
+	info, err := os.Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := readHeader(info)
+	info.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.RefcountTableClusters < 2 {
+		t.Fatalf("expected the refcount table to grow past 1 cluster, got %d — test no longer exercises growth",
+			h.RefcountTableClusters)
+	}
+
+	if err := Check(dst); err != nil {
+		t.Fatalf("internal Check on grown-table image: %v", err)
+	}
+	qemuCheckIfAvailable(t, dst)
+
+	// Data must survive the conversion.
+	out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "read -P 0xab 0 16M", dst).CombinedOutput()
+	if err != nil {
+		t.Fatalf("qemu-io data read-back failed: %v\n%s", err, out)
+	}
+}
+
+// TestResize_SelfCheckTripwire confirms Resize now self-checks: a resize of a
+// healthy image passes, and the guard runs (a corrupt result would surface as an
+// error rather than being published silently).
+func TestResize_SelfCheckTripwire(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "img.qcow2")
+	if err := Create(path, 1<<30, &Options{ClusterBits: 9}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := Resize(path, 8<<30); err != nil { // crosses a refcount-block boundary at 512B
+		t.Fatalf("Resize should pass its self-check on a correct image: %v", err)
+	}
 }
 
 // TestCreate_Atomic_NoPartialFileOnFailure proves the temp+rename discipline: a

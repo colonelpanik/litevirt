@@ -6,9 +6,16 @@ import (
 	"os"
 )
 
-// Check validates the internal consistency of a qcow2 file.
-// It verifies: magic/version, refcount integrity, L1/L2 table bounds,
-// and backing file metadata.
+// Check validates the internal consistency of a qcow2 file: magic/version,
+// L1/L2 table bounds, backing-file metadata, and — reconstructed from the active
+// L1/L2/data plus the refcount metadata — that every referenced cluster's recorded
+// refcount matches its reference count.
+//
+// SCOPE: this models the images THIS package writes (litevirt-native: no internal
+// snapshots, no other shared-cluster qcow2 features). It is a fail-loud tripwire
+// for the writer, NOT a general `qemu-img check` replacement — an image using
+// features this writer never produces (internal snapshots, bitmaps, external data
+// files) could legitimately have refcounts this reconstruction does not model.
 func Check(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

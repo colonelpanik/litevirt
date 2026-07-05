@@ -1413,6 +1413,21 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	}
 
 	oldHostsStr := r.String("hosts")
+	// Legacy explicit LB with no recorded holder (pre-durable-holder hosts=[]):
+	// resolve its ORIGINAL holder from the live participants up front — BEFORE the
+	// host/VIP transition logic below — so both the split-brain gate AND the pre-flip
+	// stale-holder cleanup know whom to stand down on a move. Without this, moving a
+	// hosts=[] LB to a new host leaves the old holder's keepalived running (the gate
+	// is inert pre-flip, and the cleanup reads [] and removes nothing). Only a single
+	// proven participant is adopted; if none can be, the pre-persist check below
+	// fails closed. (No refuse here: a colliding-backend edit must still fail with
+	// InvalidArgument first, and that validation runs after the gate.)
+	if r.String("stack_name") == "" && (oldHostsStr == "" || oldHostsStr == "[]") {
+		if participants, ok := s.actualLBParticipants(ctx, req.Name); ok && len(participants) == 1 {
+			h, _ := json.Marshal(participants)
+			oldHostsStr = string(h)
+		}
+	}
 	hostsStr := oldHostsStr
 	if len(req.Hosts) > 0 {
 		h, _ := json.Marshal(req.Hosts)
@@ -1501,19 +1516,15 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		}
 	}
 
-	// Legacy explicit LB with no recorded holder (pre-durable-holder row): establish
-	// it BEFORE persisting so the edit has a real apply/forward target — or refuse,
-	// rather than persist a reload-required change that would apply nowhere. Runs
-	// after backend/name validation (an invalid edit still fails first with
-	// InvalidArgument) and after the holder/VIP gate (which resolves participants
-	// itself for a host/VIP change). Repair probes the single proven participant.
-	if r.String("stack_name") == "" && (hostsStr == "" || hostsStr == "[]") {
-		repaired := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: req.Name, Hosts: hostsStr})
-		if repaired.Hosts == "" || repaired.Hosts == "[]" {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"load balancer %q has no established holder (legacy row): retry once its VIP host is reachable, or re-create it", req.Name)
-		}
-		hostsStr = repaired.Hosts
+	// Fail closed for a legacy explicit LB whose original holder couldn't be resolved
+	// above (zero or multiple proven participants): every edit needs to apply
+	// somewhere, and a move needs a known old holder to stand down — so refuse rather
+	// than persist a reload-required change with no safe target (or orphan a live
+	// VIP). Placed after backend/name validation so an invalid edit still fails first
+	// with InvalidArgument.
+	if r.String("stack_name") == "" && (oldHostsStr == "" || oldHostsStr == "[]") {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"load balancer %q has no established holder (legacy row): retry once its VIP host is reachable, or re-create it", req.Name)
 	}
 
 	// Persist updated config + backend changes atomically (generation preserved).

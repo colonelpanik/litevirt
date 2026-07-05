@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -13,15 +16,47 @@ func TestPageToken_RoundTrip(t *testing.T) {
 		t.Errorf("no parts should yield empty token, got %q", got)
 	}
 	tok := encodePageToken("host-b", "vm-7")
-	parts := decodePageToken(tok)
-	if len(parts) != 2 || parts[0] != "host-b" || parts[1] != "vm-7" {
-		t.Errorf("round-trip = %v, want [host-b vm-7]", parts)
+	parts, ok := decodePageToken(tok)
+	if !ok || len(parts) != 2 || parts[0] != "host-b" || parts[1] != "vm-7" {
+		t.Errorf("round-trip = %v (ok=%v), want [host-b vm-7]", parts, ok)
 	}
-	if decodePageToken("") != nil {
-		t.Error("empty token should decode to nil")
+	if parts, ok := decodePageToken(""); parts != nil || !ok {
+		t.Error("empty token should decode to (nil, ok) — first page, not an error")
 	}
-	if decodePageToken("!!! not base64 !!!") != nil {
-		t.Error("malformed token should decode to nil (degrade to first page)")
+	// A malformed token must be reported (ok=false), NOT silently treated as
+	// first-page — otherwise a client with a corrupt cursor loops forever.
+	if _, ok := decodePageToken("!!! not base64 !!!"); ok {
+		t.Error("malformed token must decode to ok=false")
+	}
+}
+
+func TestNormalizePageSize(t *testing.T) {
+	if _, err := normalizePageSize(-1); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("negative page_size = %v, want InvalidArgument", err)
+	}
+	if n, err := normalizePageSize(0); err != nil || n != 0 {
+		t.Errorf("page_size 0 = %d,%v; want 0 (unpaginated)", n, err)
+	}
+	if n, err := normalizePageSize(maxPageSize + 5); err != nil || n != maxPageSize {
+		t.Errorf("oversize page_size = %d,%v; want clamp to %d", n, err, maxPageSize)
+	}
+}
+
+func TestPageCursor(t *testing.T) {
+	// Empty token → nil parts, no error (first page).
+	if parts, err := pageCursor("", 1); err != nil || parts != nil {
+		t.Errorf("empty cursor = %v,%v; want nil,nil", parts, err)
+	}
+	// Malformed base64 → InvalidArgument, not a silent first-page restart.
+	if _, err := pageCursor("@@@bad@@@", 1); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("malformed cursor = %v, want InvalidArgument", err)
+	}
+	// Wrong part count (a 2-part cursor fed to a 1-part list) → InvalidArgument.
+	if _, err := pageCursor(encodePageToken("a", "b"), 1); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("wrong-arity cursor = %v, want InvalidArgument", err)
+	}
+	if parts, err := pageCursor(encodePageToken("a", "b"), 2); err != nil || len(parts) != 2 {
+		t.Errorf("valid 2-part cursor = %v,%v; want 2 parts", parts, err)
 	}
 }
 

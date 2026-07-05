@@ -172,8 +172,16 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
+	q := r.URL.Query()
+	pageSize, perr := pageSizeParam(q.Get("page_size"))
+	if perr != nil {
+		jsonError(w, http.StatusBadRequest, perr.Error())
+		return
+	}
 	resp, err := s.grpc.ListContainers(s.grpcCtx(r), &pb.ListContainersRequest{
-		HostName: r.URL.Query().Get("host"),
+		HostName:  q.Get("host"),
+		PageSize:  pageSize,
+		PageToken: q.Get("page_token"),
 	})
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)

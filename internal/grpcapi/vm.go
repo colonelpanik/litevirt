@@ -768,13 +768,19 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 	// without a separate count. page_size == 0 preserves the legacy unpaginated
 	// behavior for callers that don't opt in.
 	resp := &pb.ListVMsResponse{}
-	pageSize := int(req.PageSize)
+	pageSize, err := normalizePageSize(req.PageSize)
+	if err != nil {
+		return nil, err
+	}
 	var vms []corrosion.VMRecord
-	var err error
 	if pageSize > 0 {
+		parts, cerr := pageCursor(req.PageToken, 1)
+		if cerr != nil {
+			return nil, cerr
+		}
 		after := ""
-		if p := decodePageToken(req.PageToken); len(p) >= 1 {
-			after = p[0]
+		if len(parts) >= 1 {
+			after = parts[0]
 		}
 		vms, err = corrosion.ListVMsPage(ctx, s.db, req.StackName, req.HostName, after, pageSize+1)
 		if err != nil {

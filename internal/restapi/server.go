@@ -17,7 +17,7 @@
 //	POST   /api/v1/hosts/{name}/rescan                 → RescanHost
 //	GET    /api/v1/hosts/{name}/stats                  → GetHostStats
 //	POST   /api/v1/hosts/{name}/config                 → ConfigureHost
-//	GET    /api/v1/vms                                 → ListVMs (?stack=&host=)
+//	GET    /api/v1/vms                                 → ListVMs (?stack=&host=&page_size=&page_token=)
 //	POST   /api/v1/vms/{name}                          → CreateVM
 //	GET    /api/v1/vms/{name}                          → InspectVM
 //	PUT    /api/v1/vms/{name}                          → UpdateVM
@@ -369,9 +369,16 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	pageSize, perr := pageSizeParam(q.Get("page_size"))
+	if perr != nil {
+		jsonError(w, http.StatusBadRequest, perr.Error())
+		return
+	}
 	resp, err := s.grpc.ListVMs(s.grpcCtx(r), &pb.ListVMsRequest{
 		StackName: q.Get("stack"),
 		HostName:  q.Get("host"),
+		PageSize:  pageSize,
+		PageToken: q.Get("page_token"),
 	})
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
@@ -1192,6 +1199,20 @@ func jsonProto(w http.ResponseWriter, msg proto.Message) {
 		return
 	}
 	_, _ = w.Write(b)
+}
+
+// pageSizeParam parses a REST ?page_size= query value. Empty → 0 (the gRPC
+// layer's legacy unpaginated path). A non-integer or negative value is a client
+// error; the gRPC layer additionally clamps oversized values to its ceiling.
+func pageSizeParam(v string) (int32, error) {
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("page_size must be a non-negative integer")
+	}
+	return int32(n), nil
 }
 
 func jsonError(w http.ResponseWriter, code int, msg string) {

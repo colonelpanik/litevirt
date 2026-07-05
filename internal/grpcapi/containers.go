@@ -361,16 +361,22 @@ func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersReque
 		return nil, err
 	}
 	resp := &pb.ListContainersResponse{}
-	pageSize := int(req.PageSize)
+	pageSize, err := normalizePageSize(req.PageSize)
+	if err != nil {
+		return nil, err
+	}
 	var rows []corrosion.ContainerRecord
-	var err error
 	if pageSize > 0 {
 		// Composite (host_name, name) keyset cursor — containers are keyed by that
 		// pair, so name alone isn't unique across hosts. Fetch one extra to detect
 		// a next page.
+		parts, cerr := pageCursor(req.PageToken, 2)
+		if cerr != nil {
+			return nil, cerr
+		}
 		afterHost, afterName := "", ""
-		if p := decodePageToken(req.PageToken); len(p) >= 2 {
-			afterHost, afterName = p[0], p[1]
+		if len(parts) == 2 {
+			afterHost, afterName = parts[0], parts[1]
 		}
 		rows, err = corrosion.ListContainersPage(ctx, s.db, req.HostName, afterHost, afterName, pageSize+1)
 		if err != nil {

@@ -53,7 +53,15 @@ func Resize(path string, newSizeBytes uint64) error {
 		return fmt.Errorf("write L1 size: %w", err)
 	}
 
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync: %w", err)
+	}
+	// Self-check tripwire. Resize mutates metadata in place (no temp+rename), so a
+	// failure here can't be rolled back — but a resize was one of the confirmed
+	// refcount-corruption paths, so surfacing an inconsistent result as a loud error
+	// beats silently leaving a corrupt image for a later write to trip over. The
+	// data is Sync'd above; Check opens its own read handle.
+	return Check(path)
 }
 
 // expandL1 allocates a new, larger L1 table, copies old entries, and updates
@@ -127,6 +135,15 @@ func setRefcount(f *os.File, h *Header, clusterIdx uint64, value uint16, refcoun
 	blockIdx := clusterIdx / entriesPerBlock
 	entryIdx := clusterIdx % entriesPerBlock
 
+	// The refcount table entry for this block must lie within the table's own
+	// cluster(s); if not, the image needs a larger refcount table (not grown here).
+	// Fail loud rather than writing past the table into the following cluster.
+	rcTableBytes := uint64(h.RefcountTableClusters) * clusterSize
+	if blockIdx*8+8 > rcTableBytes {
+		return fmt.Errorf("refcount table too small for cluster %d (block %d exceeds %d-byte table)",
+			clusterIdx, blockIdx, rcTableBytes)
+	}
+
 	// Read refcount table entry.
 	rcTableEntryOffset := int64(h.RefcountTableOffset) + int64(blockIdx*8)
 	var rcEntry [8]byte
@@ -142,8 +159,20 @@ func setRefcount(f *os.File, h *Header, clusterIdx uint64, value uint16, refcoun
 			return err
 		}
 		blockOffset = (uint64(fi.Size()) + clusterSize - 1) / clusterSize * clusterSize
+		newBlockCluster := blockOffset / clusterSize
 		block := make([]byte, clusterSize)
 		writeRefcount(block, entryIdx, value, refcountBits)
+		// The new refcount block occupies a cluster that itself must be counted.
+		// If that cluster falls within THIS block's own coverage, set it in-place
+		// (the common case: the block sits right after the clusters it covers);
+		// otherwise it belongs to a different block, handled by the recursive call
+		// after this block is linked. Without this the new block's own cluster is
+		// left refcount 0 → qemu treats it as free and hands it out on the next
+		// allocation while it holds live refcount data → silent corruption.
+		selfBlockIdx := newBlockCluster / entriesPerBlock
+		if selfBlockIdx == blockIdx {
+			writeRefcount(block, newBlockCluster%entriesPerBlock, 1, refcountBits)
+		}
 		if _, err := f.WriteAt(block, int64(blockOffset)); err != nil {
 			return err
 		}
@@ -151,6 +180,12 @@ func setRefcount(f *os.File, h *Header, clusterIdx uint64, value uint16, refcoun
 		binary.BigEndian.PutUint64(rcEntry[:], blockOffset)
 		if _, err := f.WriteAt(rcEntry[:], rcTableEntryOffset); err != nil {
 			return err
+		}
+		if selfBlockIdx != blockIdx {
+			// The new block's own cluster is covered by a different refcount block.
+			// Count it there (bounded recursion — a block covers entriesPerBlock
+			// clusters, so this terminates once a block's cluster lands in itself).
+			return setRefcount(f, h, newBlockCluster, 1, refcountBits)
 		}
 		return nil
 	}

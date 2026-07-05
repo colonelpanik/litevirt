@@ -205,16 +205,22 @@ func ParseSize(s string) (uint64, error) {
 		return 0, fmt.Errorf("parse size %q: %w", s, err)
 	}
 
+	var mult uint64
 	switch suffix {
 	case "K":
-		return num * 1024, nil
+		mult = 1024
 	case "M":
-		return num * 1024 * 1024, nil
+		mult = 1024 * 1024
 	case "G":
-		return num * 1024 * 1024 * 1024, nil
+		mult = 1024 * 1024 * 1024
 	case "T":
-		return num * 1024 * 1024 * 1024 * 1024, nil
+		mult = 1024 * 1024 * 1024 * 1024
 	default:
 		return 0, fmt.Errorf("unknown size suffix %q in %q", suffix, s)
 	}
+	// Reject overflow rather than silently wrapping to a tiny size.
+	if num > 0 && num > (1<<64-1)/mult {
+		return 0, fmt.Errorf("size %q overflows uint64", s)
+	}
+	return num * mult, nil
 }

@@ -763,15 +763,40 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
 	}
-	vms, err := corrosion.ListVMs(ctx, s.db, req.StackName, req.HostName)
+
+	// Keyset pagination (page_size > 0): fetch one extra row to detect a next page
+	// without a separate count. page_size == 0 preserves the legacy unpaginated
+	// behavior for callers that don't opt in.
+	resp := &pb.ListVMsResponse{}
+	pageSize, err := normalizePageSize(req.PageSize)
 	if err != nil {
+		return nil, err
+	}
+	var vms []corrosion.VMRecord
+	if pageSize > 0 {
+		parts, cerr := pageCursor(req.PageToken, 1)
+		if cerr != nil {
+			return nil, cerr
+		}
+		after := ""
+		if len(parts) >= 1 {
+			after = parts[0]
+		}
+		vms, err = corrosion.ListVMsPage(ctx, s.db, req.StackName, req.HostName, after, pageSize+1)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "list VMs: %v", err)
+		}
+		if len(vms) > pageSize {
+			vms = vms[:pageSize]
+			resp.NextPageToken = encodePageToken(vms[len(vms)-1].Name)
+		}
+	} else if vms, err = corrosion.ListVMs(ctx, s.db, req.StackName, req.HostName); err != nil {
 		return nil, status.Errorf(codes.Internal, "list VMs: %v", err)
 	}
 
 	// Batch-load all interfaces in a single query instead of per-VM N+1.
 	allIfaces, _ := corrosion.BatchGetVMInterfaces(ctx, s.db)
 
-	resp := &pb.ListVMsResponse{}
 	for _, vm := range vms {
 		// Reconcile DB state with libvirt for local VMs.
 		state := vm.State

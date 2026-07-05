@@ -645,6 +645,49 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 	return out, nil
 }
 
+// ListContainersPage returns up to limit containers, ordered by (host_name, name),
+// whose (host_name, name) sorts strictly after (afterHost, afterName) — keyset
+// pagination for ListContainers. Containers are keyed by (host_name, name), so the
+// composite is the stable cursor. Empty afterHost starts at the beginning; limit
+// <= 0 returns all matching rows.
+func ListContainersPage(ctx context.Context, c *Client, hostName, afterHost, afterName string, limit int) ([]ContainerRecord, error) {
+	sql := `SELECT host_name, name, state, COALESCE(image, '') AS image,
+		   cpu_limit, memory_mib, COALESCE(labels, '') AS labels,
+		   COALESCE(restart_policy, '') AS restart_policy,
+		   COALESCE(state_detail, '') AS state_detail,
+		   COALESCE(project, '_default') AS project,
+		   COALESCE(is_template, 0) AS is_template,
+		   COALESCE(on_host_failure, '') AS on_host_failure,
+		   COALESCE(create_spec, '') AS create_spec,
+		   COALESCE(relocate_token, '') AS relocate_token,
+		   created_at, updated_at
+		FROM containers WHERE deleted_at IS NULL`
+	var params []interface{}
+	if hostName != "" {
+		sql += " AND host_name = ?"
+		params = append(params, hostName)
+	}
+	if afterHost != "" || afterName != "" {
+		// Row-value comparison for a composite keyset cursor.
+		sql += " AND (host_name, name) > (?, ?)"
+		params = append(params, afterHost, afterName)
+	}
+	sql += " ORDER BY host_name, name"
+	if limit > 0 {
+		sql += " LIMIT ?"
+		params = append(params, limit)
+	}
+	rows, err := c.Query(ctx, sql, params...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ContainerRecord, len(rows))
+	for i, r := range rows {
+		out[i] = scanContainer(r)
+	}
+	return out, nil
+}
+
 // scanContainer builds a ContainerRecord from a row carrying the full
 // container column set (used by GetContainer + ListContainers).
 func scanContainer(r Row) ContainerRecord {

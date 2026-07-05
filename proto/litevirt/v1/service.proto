@@ -66,8 +66,13 @@ message ConfigureHostRequest {
 // ── VMs ──
 message CreateVMRequest  { VMSpec spec = 1; }
 message ListVMsRequest   { string stack_name = 1; string host_name = 2;
-    map<string, string> label_filter = 3; }
-message ListVMsResponse  { repeated VM vms = 1; }
+    map<string, string> label_filter = 3;
+    // Keyset pagination (additive; mixed-version safe — an old server ignores these
+    // and returns the full list, an old client ignores next_page_token). page_size
+    // 0 = unpaginated (legacy behavior). page_token is the opaque cursor returned as
+    // next_page_token by the previous page.
+    int32 page_size = 4; string page_token = 5; }
+message ListVMsResponse  { repeated VM vms = 1; string next_page_token = 2; }
 message InspectVMRequest { string name = 1; }
 message StartVMRequest   { string name = 1; }
 message StopVMRequest    { string name = 1; bool force = 2; int32 timeout = 3; }
@@ -759,8 +764,9 @@ message ExecContainerResponse {
     int32 exit_code = 3;
 }
 
-message ListContainersRequest  { string host_name = 1; } // empty = every host
-message ListContainersResponse { repeated Container containers = 1; }
+message ListContainersRequest  { string host_name = 1; // empty = every host
+    int32 page_size = 2; string page_token = 3; } // keyset pagination (see ListVMsRequest)
+message ListContainersResponse { repeated Container containers = 1; string next_page_token = 2; }
 
 message PullOCIImageRequest {
     string host_name = 1;

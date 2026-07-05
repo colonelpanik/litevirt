@@ -1741,10 +1741,14 @@ func (x *ConfigureHostRequest) GetRegion() string {
 
 // ── VMs ──
 type CreateVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Spec          *VMSpec                `protobuf:"bytes,1,opt,name=spec,proto3" json:"spec,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Spec  *VMSpec                `protobuf:"bytes,1,opt,name=spec,proto3" json:"spec,omitempty"`
+	// Optional client-supplied key for exactly-once retries: a lost-response retry
+	// carrying the same key replays the original result instead of creating a
+	// second VM. Reusing a key with a different request is a client bug (→ 409).
+	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateVMRequest) Reset() {
@@ -1782,6 +1786,13 @@ func (x *CreateVMRequest) GetSpec() *VMSpec {
 		return x.Spec
 	}
 	return nil
+}
+
+func (x *CreateVMRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
 }
 
 type ListVMsRequest struct {
@@ -9285,23 +9296,24 @@ func (x *ContainerNetwork) GetSecurityGroups() []string {
 }
 
 type CreateContainerRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	HostName      string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Template      string                 `protobuf:"bytes,3,opt,name=template,proto3" json:"template,omitempty"` // "download" | path-to-rootfs
-	Distro        string                 `protobuf:"bytes,4,opt,name=distro,proto3" json:"distro,omitempty"`     // for download template
-	Release       string                 `protobuf:"bytes,5,opt,name=release,proto3" json:"release,omitempty"`
-	Arch          string                 `protobuf:"bytes,6,opt,name=arch,proto3" json:"arch,omitempty"`
-	Cpu           int32                  `protobuf:"varint,7,opt,name=cpu,proto3" json:"cpu,omitempty"`
-	MemoryMib     int32                  `protobuf:"varint,8,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
-	Networks      []*ContainerNetwork    `protobuf:"bytes,9,rep,name=networks,proto3" json:"networks,omitempty"`
-	Labels        map[string]string      `protobuf:"bytes,10,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Image         string                 `protobuf:"bytes,11,opt,name=image,proto3" json:"image,omitempty"`
-	Restart       *RestartPolicy         `protobuf:"bytes,12,opt,name=restart,proto3" json:"restart,omitempty"`                                    // auto-restart policy (nil/condition="none" = never)
-	Project       string                 `protobuf:"bytes,13,opt,name=project,proto3" json:"project,omitempty"`                                    // tenancy bucket (default "_default")
-	OnHostFailure string                 `protobuf:"bytes,14,opt,name=on_host_failure,json=onHostFailure,proto3" json:"on_host_failure,omitempty"` // host-loss relocation policy: ''/'none' | 'image-recreate'
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	HostName       string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Template       string                 `protobuf:"bytes,3,opt,name=template,proto3" json:"template,omitempty"` // "download" | path-to-rootfs
+	Distro         string                 `protobuf:"bytes,4,opt,name=distro,proto3" json:"distro,omitempty"`     // for download template
+	Release        string                 `protobuf:"bytes,5,opt,name=release,proto3" json:"release,omitempty"`
+	Arch           string                 `protobuf:"bytes,6,opt,name=arch,proto3" json:"arch,omitempty"`
+	Cpu            int32                  `protobuf:"varint,7,opt,name=cpu,proto3" json:"cpu,omitempty"`
+	MemoryMib      int32                  `protobuf:"varint,8,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	Networks       []*ContainerNetwork    `protobuf:"bytes,9,rep,name=networks,proto3" json:"networks,omitempty"`
+	Labels         map[string]string      `protobuf:"bytes,10,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Image          string                 `protobuf:"bytes,11,opt,name=image,proto3" json:"image,omitempty"`
+	Restart        *RestartPolicy         `protobuf:"bytes,12,opt,name=restart,proto3" json:"restart,omitempty"`                                     // auto-restart policy (nil/condition="none" = never)
+	Project        string                 `protobuf:"bytes,13,opt,name=project,proto3" json:"project,omitempty"`                                     // tenancy bucket (default "_default")
+	OnHostFailure  string                 `protobuf:"bytes,14,opt,name=on_host_failure,json=onHostFailure,proto3" json:"on_host_failure,omitempty"`  // host-loss relocation policy: ''/'none' | 'image-recreate'
+	IdempotencyKey string                 `protobuf:"bytes,15,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"` // exactly-once retry key (see CreateVMRequest.idempotency_key)
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateContainerRequest) Reset() {
@@ -9428,6 +9440,13 @@ func (x *CreateContainerRequest) GetProject() string {
 func (x *CreateContainerRequest) GetOnHostFailure() string {
 	if x != nil {
 		return x.OnHostFailure
+	}
+	return ""
+}
+
+func (x *CreateContainerRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
 	}
 	return ""
 }
@@ -21555,9 +21574,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\tipmi_pass\x18\x05 \x01(\tR\bipmiPass\x12!\n" +
 	"\fwatchdog_dev\x18\x06 \x01(\tR\vwatchdogDev\x12\x12\n" +
 	"\x04role\x18\a \x01(\tR\x04role\x12\x16\n" +
-	"\x06region\x18\b \x01(\tR\x06region\":\n" +
+	"\x06region\x18\b \x01(\tR\x06region\"c\n" +
 	"\x0fCreateVMRequest\x12'\n" +
-	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\"\xdd\x01\n" +
+	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\x12'\n" +
+	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\"\xdd\x01\n" +
 	"\x0eListVMsRequest\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\x01 \x01(\tR\tstackName\x12\x1b\n" +
@@ -22183,7 +22203,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x02ip\x18\x03 \x01(\tR\x02ip\x12\x10\n" +
 	"\x03mac\x18\x04 \x01(\tR\x03mac\x12!\n" +
 	"\fnetwork_name\x18\x05 \x01(\tR\vnetworkName\x12'\n" +
-	"\x0fsecurity_groups\x18\x06 \x03(\tR\x0esecurityGroups\"\xa9\x04\n" +
+	"\x0fsecurity_groups\x18\x06 \x03(\tR\x0esecurityGroups\"\xd2\x04\n" +
 	"\x16CreateContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1a\n" +
@@ -22200,7 +22220,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05image\x18\v \x01(\tR\x05image\x124\n" +
 	"\arestart\x18\f \x01(\v2\x1a.litevirt.v1.RestartPolicyR\arestart\x12\x18\n" +
 	"\aproject\x18\r \x01(\tR\aproject\x12&\n" +
-	"\x0fon_host_failure\x18\x0e \x01(\tR\ronHostFailure\x1a9\n" +
+	"\x0fon_host_failure\x18\x0e \x01(\tR\ronHostFailure\x12'\n" +
+	"\x0fidempotency_key\x18\x0f \x01(\tR\x0eidempotencyKey\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"H\n" +

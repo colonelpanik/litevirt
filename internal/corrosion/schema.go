@@ -220,7 +220,12 @@ import (
 //	     NON-LWW merge, kept off replication until split_brain_gate_v1 is cluster-wide)
 //	     + vms.pending_action_id (TEXT NOT NULL DEFAULT '') linking a pending start to
 //	     its proof. One CREATE TABLE + one ADD COLUMN; gap-1 from v37.
-const CurrentSchemaVersion = 38
+//	v39: request idempotency — new table idempotency_keys(key PK, method, request_hash,
+//	     response, status, expires_at, …) recording a completed mutating RPC so a
+//	     lost-response retry replays the original result instead of executing twice.
+//	     WAL-replicated for cross-node dedup but anti-entropy-excluded and TTL-reaped
+//	     (ephemeral). One CREATE TABLE; gap-1 from v38.
+const CurrentSchemaVersion = 39
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1226,6 +1231,24 @@ var schemaDDL = []string{
 		deleted_at  TEXT
 	)`,
 
+	// idempotency_keys (v39): records a completed mutating RPC keyed by a
+	// client-supplied idempotency key, so a lost-response retry replays the stored
+	// response instead of executing twice. request_hash detects key reuse with a
+	// different payload (→ 409). WAL-replicated (a retry to any node dedups) but
+	// anti-entropy-excluded and TTL-reaped via expires_at — the records are
+	// ephemeral (only useful within the retry window).
+	`CREATE TABLE IF NOT EXISTS idempotency_keys (
+		key          TEXT PRIMARY KEY,
+		method       TEXT NOT NULL,
+		request_hash TEXT NOT NULL,
+		response     TEXT NOT NULL DEFAULT '',
+		status       TEXT NOT NULL DEFAULT 'completed',
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		expires_at   TEXT NOT NULL,
+		deleted_at   TEXT
+	)`,
+
 	// containers cluster state. One row per LXC/OCI
 	// container; aggregated by `lv ct ls` cluster-wide. Lifecycle
 	// transitions are written by the daemon owning the container.
@@ -1571,6 +1594,7 @@ var tablePrimaryKeys = map[string][]string{
 	"leader_election":        {"key"},
 	"vm_locks":               {"vm_name"},
 	"runtime_action_proofs":  {"id"},
+	"idempotency_keys":       {"key"},
 	"rebalance_proposals":    {"id"},
 	"host_pci_devices":       {"host_name", "address"},
 	"images":                 {"name"},
@@ -1895,6 +1919,7 @@ var createTableUnits = []struct {
 	{33, "host_runtime_usage"},
 	{35, "container_interfaces"},
 	{38, "runtime_action_proofs"},
+	{39, "idempotency_keys"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

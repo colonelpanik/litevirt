@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -50,7 +51,7 @@ func (s *Server) containerProject(ctx context.Context, host, name string) string
 	return "_default"
 }
 
-func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*pb.Container, error) {
+func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
@@ -68,6 +69,25 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	if err := s.RequirePerm(ctx, ctRBACPathFor(req.Project, req.Name), "ct.create", "operator"); err != nil {
 		s.audit(ctx, "ct.create", req.Name, "project="+tenancy.NormalizeProject(req.Project), "denied")
 		return nil, err
+	}
+	// Idempotency: replay a completed create on a lost-response retry (see CreateVM).
+	// Placed before the forward so a retry replays without re-forwarding; recorded
+	// on success across all return paths.
+	if req.IdempotencyKey != "" {
+		reqHash := idempotencyRequestHash(req)
+		if replay, err := s.idempotencyReplay(ctx, req.IdempotencyKey, "CreateContainer", reqHash); err != nil {
+			return nil, err
+		} else if replay != nil {
+			out := &pb.Container{}
+			if proto.Unmarshal(replay, out) == nil {
+				return out, nil
+			}
+		}
+		defer func() {
+			if retErr == nil && resp != nil {
+				s.idempotencyStore(ctx, req.IdempotencyKey, "CreateContainer", reqHash, resp)
+			}
+		}()
 	}
 	if forwarded, err := s.forwardCreateContainer(ctx, req); err != nil || forwarded != nil {
 		return forwarded, err

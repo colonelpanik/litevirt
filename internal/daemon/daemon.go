@@ -1369,6 +1369,14 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 		} else if tombstoned > 0 {
 			slog.Info("proof reaper", "tombstoned", tombstoned)
 		}
+		// Idempotency keys: hard-delete records past their TTL (v39). Ephemeral +
+		// bounded by expires_at; a resurrected expired copy never matches, so a
+		// plain local delete is safe.
+		if reaped, perr := corrosion.ReapExpiredIdempotencyKeys(ctx, d.db); perr != nil {
+			slog.Warn("idempotency-key reaper", "error", perr)
+		} else if reaped > 0 {
+			slog.Info("idempotency-key reaper", "reaped", reaped)
+		}
 	}
 	select {
 	case <-ctx.Done():

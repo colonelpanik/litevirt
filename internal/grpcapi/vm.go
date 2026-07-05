@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -62,7 +63,7 @@ func validateSpecNames(spec *pb.VMSpec) error {
 	return nil
 }
 
-func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM, error) {
+func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *pb.VM, retErr error) {
 	spec := req.Spec
 	if spec == nil {
 		return nil, status.Error(codes.InvalidArgument, "spec required")
@@ -75,6 +76,30 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err
+	}
+
+	// Idempotency: a lost-response retry carrying the same key replays the original
+	// result instead of creating a second VM. The check runs before the forward
+	// decision below, so a retry replays without re-forwarding; the record is
+	// written on success (deferred, all return paths). A forwarded (peer) leg also
+	// carries the key, but during the original op nothing is recorded yet, so it
+	// executes; on a retry the entry node — or the owning host on a re-forward —
+	// finds the record and replays. Recording is idempotent (first writer wins).
+	if req.IdempotencyKey != "" {
+		reqHash := idempotencyRequestHash(req)
+		if replay, err := s.idempotencyReplay(ctx, req.IdempotencyKey, "CreateVM", reqHash); err != nil {
+			return nil, err
+		} else if replay != nil {
+			out := &pb.VM{}
+			if proto.Unmarshal(replay, out) == nil {
+				return out, nil
+			}
+		}
+		defer func() {
+			if retErr == nil && resp != nil {
+				s.idempotencyStore(ctx, req.IdempotencyKey, "CreateVM", reqHash, resp)
+			}
+		}()
 	}
 	// F3: defining a lifecycle hook = the ability to run an arbitrary root
 	// shell command on whatever host the VM lands on (hooks.Run shells out to

@@ -20,7 +20,7 @@ func hasArg(args []string, want string) bool {
 // serves guest DNS via the bridge gateway IP, so loopback must be excluded.
 func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 	args := dnsmasqArgs("br-test", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
-		"/var/run/litevirt-dnsmasq-br-test.pid", []string{"8.8.8.8"})
+		"/var/run/litevirt-dnsmasq-br-test.pid", []string{"8.8.8.8"}, "litevirt.local", 5354)
 
 	for _, want := range []string{
 		"--interface=br-test",
@@ -33,6 +33,8 @@ func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 		"--dhcp-range=10.0.0.2,10.0.0.254,255.255.255.0,12h",
 		"--server=8.8.8.8",
 		"--no-resolv",
+		// Domain-specific forward to the embedded DNS so guests resolve litevirt names.
+		"--server=/litevirt.local/127.0.0.1#5354",
 	} {
 		if !hasArg(args, want) {
 			t.Errorf("dnsmasq args missing %q\ngot: %s", want, strings.Join(args, " "))
@@ -48,7 +50,7 @@ func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 // advertisements (and still excludes loopback).
 func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {
 	args := dnsmasqArgs("br-v6", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64",
-		"/var/run/litevirt-dnsmasq-br-v6.pid", nil)
+		"/var/run/litevirt-dnsmasq-br-v6.pid", nil, "", 0)
 	if !hasArg(args, "--enable-ra") {
 		t.Error("--enable-ra not set for IPv6 gateway")
 	}
@@ -58,5 +60,11 @@ func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {
 	// No upstream DNS supplied → must NOT force --no-resolv (fall back to resolv.conf).
 	if hasArg(args, "--no-resolv") {
 		t.Error("--no-resolv should not be set when no upstream DNS was resolved")
+	}
+	// No local resolver configured → no domain-specific forward.
+	for _, a := range args {
+		if strings.HasPrefix(a, "--server=/") {
+			t.Errorf("unexpected domain-specific --server with no local resolver: %q", a)
+		}
 	}
 }

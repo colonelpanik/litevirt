@@ -12,6 +12,23 @@ import (
 	"time"
 )
 
+// localResolverDomain/Port name the embedded DNS server that per-bridge dnsmasq
+// instances chain to for the litevirt domain. Set once at daemon start via
+// SetLocalResolver, before any network is provisioned. Empty domain / zero port
+// (the default) leaves dnsmasq forwarding everything upstream, as before.
+var (
+	localResolverDomain string
+	localResolverPort   int
+)
+
+// SetLocalResolver configures the embedded-DNS domain + port that new dnsmasq
+// instances forward that domain's queries to (127.0.0.1#port). Call once at
+// daemon start before reconcileNetworks.
+func SetLocalResolver(domain string, port int) {
+	localResolverDomain = strings.TrimSuffix(domain, ".")
+	localResolverPort = port
+}
+
 // startDHCPFunc is the active DHCP starter; replaced in tests to avoid spawning real dnsmasq.
 var startDHCPFunc = StartDHCP
 
@@ -47,7 +64,7 @@ var startDHCPFunc = StartDHCP
 // scanner doesn't read.
 const dnsmasqLeaseDir = "/var/lib/libvirt/dnsmasq"
 
-func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, upstreamDNS []string) []string {
+func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, upstreamDNS []string, localDomain string, localPort int) []string {
 	args := []string{
 		"--interface=" + bridge,
 		"--except-interface=lo",
@@ -63,6 +80,15 @@ func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, up
 	// route and dnsmasq's DHCPv6 server is announced.
 	if isIPv6Gateway(gateway) {
 		args = append(args, "--enable-ra", "--dhcp-authoritative")
+	}
+	// Domain-specific forward to the embedded DNS: guests get dnsmasq (the gateway)
+	// as their resolver, and dnsmasq forwards ONLY <localDomain> queries to the
+	// local embedded server, so litevirt VM/container/anycast names resolve while
+	// everything else still goes upstream. Without this the embedded server is
+	// orphaned and guests can't resolve litevirt names.
+	if localDomain != "" && localPort > 0 {
+		dom := strings.TrimSuffix(localDomain, ".")
+		args = append(args, fmt.Sprintf("--server=/%s/127.0.0.1#%d", dom, localPort))
 	}
 	for _, dns := range upstreamDNS {
 		args = append(args, "--server="+dns)
@@ -100,7 +126,7 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 	// dnsmasq will forward DNS queries from guests to these servers.
 	upstreamDNS := resolveUpstreamDNS()
 
-	cmd := exec.Command("dnsmasq", dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile, upstreamDNS)...)
+	cmd := exec.Command("dnsmasq", dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile, upstreamDNS, localResolverDomain, localResolverPort)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdout = nil
 	cmd.Stderr = nil

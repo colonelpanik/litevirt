@@ -696,6 +696,10 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 				return nil, status.Errorf(codes.Internal,
 					"load balancer %q provisioning failed on %s: %v", req.Name, s.hostName, err)
 			}
+			// Record firewall intent when the VIP is on a host-isolated network
+			// (VIP:port exceptions + SNAT), same as the stack/peer paths. No-op for
+			// non-isolated networks. snat defaults true (matches the peer ApplyLB path).
+			s.updateIsolationForLB(ctx, req.Name, cfg.Interface, vipIP, ports, true)
 			break
 		}
 	}
@@ -1345,6 +1349,11 @@ func (s *Server) relayedVIPNoClaims(ctx context.Context, target, vip string) boo
 func (s *Server) removeLBLocal(ctx context.Context, name string) error {
 	err := lb.NewManager().Remove(ctx, name)
 	s.clearLBKeepalived(name)
+	// Drop this LB's firewall intent (VIP:port exceptions + SNAT) unconditionally,
+	// keyed on the LB name — every local teardown path funnels through here, so a
+	// stale lb:<name> row can't keep exceptions/SNAT live on a host that no longer
+	// serves the VIP. Base network isolation (net:<network>) is untouched.
+	_ = corrosion.DeleteHostFWIntent(ctx, s.db, s.hostName, "lb:"+name)
 	return err
 }
 
@@ -1639,6 +1648,7 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 	if err := s.removeLBLocal(ctx, req.Name); err != nil {
 		slog.Warn("DeleteLoadBalancer: local remove failed", "error", err)
 	}
+	s.reconcileFirewall(ctx) // removeLBLocal dropped the LB intent — restore base isolation now
 
 	// Forward to remote hosts.
 	targetHosts := lbHosts
@@ -2198,29 +2208,13 @@ func (s *Server) RemoveLB(ctx context.Context, req *pb.RemoveLBRequest) (*emptyp
 		return nil, status.Error(codes.InvalidArgument, "lb_name required")
 	}
 
-	// Before removing, check if the LB was on an isolated bridge so we
-	// can restore base isolation (no LB exceptions) after teardown.
-	rows, _ := s.db.Query(ctx,
-		`SELECT vip FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.LbName)
-	var lbVIP string
-	if len(rows) > 0 {
-		lbVIP = rows[0].String("vip")
-	}
-
 	if err := s.removeLBLocal(ctx, req.LbName); err != nil {
 		return nil, status.Errorf(codes.Internal, "remove LB: %v", err)
 	}
-
-	// Drop this LB's firewall intent (its VIP:port exceptions + SNAT). The
-	// network's base isolation intent remains, so the bridge stays dropped without
-	// the LB holes — the canonical reconciler renders the restored state.
-	if lbVIP != "" {
-		vipIP, _, _ := lb.ParseVIP(lbVIP)
-		lbIface := lb.DetectInterfaceForIP(vipIP)
-		if netDef, _ := s.findIsolatedNetworkForBridge(ctx, lbIface); netDef != nil {
-			_ = corrosion.DeleteHostFWIntent(ctx, s.db, s.hostName, "lb:"+req.LbName)
-		}
-	}
+	// removeLBLocal drops this LB's firewall intent; the network's base isolation
+	// intent remains, so the canonical reconciler restores the drop without the LB
+	// holes. A best-effort reconcile applies that immediately rather than next tick.
+	s.reconcileFirewall(ctx)
 
 	slog.Info("RemoveLB: removed", "lb", req.LbName)
 	return &emptypb.Empty{}, nil
@@ -2464,6 +2458,8 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 	}); err != nil {
 		slog.Warn("reapplyExplicitLB: apply failed", "lb", cfg.Name, "error", err)
 	} else {
+		// Re-record firewall intent for an isolated-network VIP (exceptions + SNAT).
+		s.updateIsolationForLB(ctx, cfg.Name, lb.DetectInterfaceForIP(vipIP), vipIP, ports, true)
 		slog.Info("LB reconciled", "lb", cfg.Name)
 	}
 }
@@ -2714,10 +2710,13 @@ func (s *Server) updateIsolationForLB(ctx context.Context, lbName, bridge, vip s
 	for _, p := range ports {
 		listenPorts = append(listenPorts, p.Listen)
 	}
+	// Isolation itself is owned by the network's net:<network> intent — the LB row
+	// carries ONLY the VIP:port holes (and SNAT below), never Isolate. That way a
+	// stale LB row can't keep a bridge dropped after the network's isolation is
+	// removed, and the exceptions/SNAT only take effect while the network is isolated.
 	intent := corrosion.HostFWIntent{
 		ScopeKey:   "lb:" + lbName,
 		Bridge:     bridge,
-		Isolate:    true, // the bridge is dropped, with the exceptions below punched through
 		Exceptions: []corrosion.HostFWException{{VIP: vip, Ports: listenPorts}},
 	}
 
@@ -2736,6 +2735,8 @@ func (s *Server) updateIsolationForLB(ctx context.Context, lbName, bridge, vip s
 	if err := corrosion.UpsertHostFWIntent(ctx, s.db, s.hostName, intent); err != nil {
 		slog.Warn("updateIsolationForLB: record firewall intent failed", "bridge", bridge, "error", err)
 	}
+	// Apply the VIP exceptions / SNAT now rather than waiting for the next tick.
+	s.reconcileFirewall(ctx)
 }
 
 // findIsolatedNetworkForBridge looks up all networks in Corrosion and returns the

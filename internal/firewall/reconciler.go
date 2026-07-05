@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -343,47 +345,45 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 }
 
 // intentToNATIsolation aggregates per-host firewall intent rows into the
-// renderer's NAT + isolation inputs. Masquerade and SNAT rows each become a
-// postrouting NATRule; isolation is merged per bridge (a bridge is isolated if
-// ANY row marks it so, and its exceptions are the union across all rows for that
-// bridge — so an LB row's VIP:port holes attach to the network row's drop).
+// renderer's NAT + isolation inputs.
+//
+// Isolation is OWNED by network intent (scope "net:<name>"): only a net row can
+// mark a bridge isolated. An LB row (scope "lb:<name>") contributes VIP:port
+// exceptions and SNAT but never isolation authority — so a stale LB row can't keep
+// a bridge dropped after the network's isolation is removed. SNAT likewise renders
+// only while the bridge still has a base isolated-network intent.
 func intentToNATIsolation(intents []corrosion.HostFWIntent) ([]NATRule, []IsolationChain) {
-	var nat []NATRule
 	isolated := map[string]bool{}
-	exc := map[string][]IsolationException{}
-	var order []string // preserve first-seen bridge order; renderer sorts anyway
+	for _, in := range intents {
+		if in.Bridge != "" && in.Isolate && strings.HasPrefix(in.ScopeKey, "net:") {
+			isolated[in.Bridge] = true
+		}
+	}
 
+	var nat []NATRule
+	exc := map[string][]IsolationException{}
 	for _, in := range intents {
 		if in.MasqueradeSubnet != "" {
 			nat = append(nat, NATRule{Subnet: in.MasqueradeSubnet, Bridge: in.Bridge})
 		}
-		if in.SNATVIP != "" {
+		if in.SNATVIP != "" && isolated[in.Bridge] {
 			nat = append(nat, NATRule{OutIface: in.SNATOutIface, Subnet: in.SNATSubnet, SNATTo: in.SNATVIP})
 		}
-		if in.Bridge != "" && (in.Isolate || len(in.Exceptions) > 0) {
-			if _, seen := exc[in.Bridge]; !seen {
-				order = append(order, in.Bridge)
-			}
-			if in.Isolate {
-				isolated[in.Bridge] = true
-			}
-			for _, e := range in.Exceptions {
-				exc[in.Bridge] = append(exc[in.Bridge], IsolationException{VIP: e.VIP, Ports: e.Ports})
-			}
-			if _, ok := exc[in.Bridge]; !ok {
-				exc[in.Bridge] = nil // ensure the bridge is tracked even with no exceptions
-			}
+		for _, e := range in.Exceptions {
+			exc[in.Bridge] = append(exc[in.Bridge], IsolationException{VIP: e.VIP, Ports: e.Ports})
 		}
 	}
 
+	// One isolation chain per isolated bridge, merging exceptions from every row
+	// (the net base + any LB holes) for it. Sorted for determinism (renderer re-sorts).
+	bridges := make([]string, 0, len(isolated))
+	for b := range isolated {
+		bridges = append(bridges, b)
+	}
+	sort.Strings(bridges)
 	var iso []IsolationChain
-	for _, bridge := range order {
-		if !isolated[bridge] {
-			// Exceptions with no isolation drop are meaningless — skip (the bridge
-			// isn't isolated, so there's nothing to punch through).
-			continue
-		}
-		iso = append(iso, IsolationChain{Bridge: bridge, Exceptions: exc[bridge]})
+	for _, b := range bridges {
+		iso = append(iso, IsolationChain{Bridge: b, Exceptions: exc[b]})
 	}
 	return nat, iso
 }

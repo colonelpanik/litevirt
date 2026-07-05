@@ -146,6 +146,7 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 	if err := network.Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
 		slog.Warn("network deprovision failed", "network", req.Name, "error", err)
 	}
+	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
 
 	// Soft-delete the DB record.
 	if err := corrosion.DeleteNetwork(ctx, s.db, req.Name); err != nil {
@@ -251,6 +252,7 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	if _, err := network.SafeProvision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
 		return nil, err
 	}
+	s.reconcileFirewall(ctx) // apply any NAT/isolation intent this provision recorded
 
 	nr, _ := corrosion.GetNetwork(ctx, s.db, name)
 	if nr == nil {
@@ -275,6 +277,7 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 	if err := network.Deprovision(ctx, s.db, name, def, s.hostName); err != nil {
 		return err
 	}
+	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
 	return corrosion.DeleteNetwork(ctx, s.db, name)
 }
 
@@ -345,6 +348,7 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 	if _, err := network.SafeProvision(ctx, s.db, req.Name, def, localIP, s.hostName); err != nil {
 		return nil, status.Errorf(codes.Internal, "provision network %q: %v", req.Name, err)
 	}
+	s.reconcileFirewall(ctx) // apply any NAT/isolation intent this provision recorded
 
 	// For VXLAN, notify existing peers about our VTEP.
 	if def.Type == "vxlan" && def.VNI != 0 {

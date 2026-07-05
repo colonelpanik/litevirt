@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strconv"
@@ -538,6 +539,21 @@ func (s *Server) RealmRegistry() *auth.Registry { return s.realmRegistry }
 // SetFirewallReconciler wires the daemon's firewall reconciler so the
 // ReloadFirewall RPC can drive a synchronous Reconcile.
 func (s *Server) SetFirewallReconciler(r FirewallReconciler) { s.fwReconciler = r }
+
+// reconcileFirewall applies the firewall ruleset now, best-effort. Callers use it
+// after writing/deleting host_fw_intent (NAT/SNAT/isolation) so the change takes
+// effect immediately instead of on the next 30s reconciler tick — host isolation
+// must not be fail-open, and NAT/VIP exceptions must not be missing, for a whole
+// tick after a create. A failure is only a latency regression (the tick still
+// applies it), so it is logged, not surfaced.
+func (s *Server) reconcileFirewall(ctx context.Context) {
+	if s.fwReconciler == nil {
+		return
+	}
+	if err := s.fwReconciler.Reconcile(ctx); err != nil {
+		slog.Debug("firewall reconcile after intent change failed (next tick will apply)", "error", err)
+	}
+}
 
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).
 func (s *Server) SetFirmwarePaths(fp lv.FirmwarePaths) { s.firmware = fp }

@@ -446,6 +446,10 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 			// For VXLAN networks, notify existing peers about our VTEP
 			// so they can add our flood entry (reverse-sync).
 			s.notifyVTEPPeersForNetwork(ctx, n.Name)
+			// Provisioning may have recorded NAT/isolation intent for a
+			// newly-provisioned network on this host — render it now so isolation
+			// isn't fail-open (and NAT absent) until the next reconciler tick.
+			s.reconcileFirewall(ctx)
 		}
 
 		vlan := 0

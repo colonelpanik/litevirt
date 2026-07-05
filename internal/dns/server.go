@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,10 +21,9 @@ import (
 )
 
 const (
-	defaultTTL     = 30 // seconds
-	forwardTimeout = 3 * time.Second
-	// upstream resolvers used when the query is outside our domain
-	upstreamDNS = "8.8.8.8:53"
+	defaultTTL       = 30 // seconds
+	forwardTimeout   = 3 * time.Second
+	fallbackUpstream = "8.8.8.8:53" // only if /etc/resolv.conf yields nothing usable
 )
 
 // Server is the embedded DNS resolver.
@@ -33,6 +33,7 @@ type Server struct {
 	db        *corrosion.Client
 	srv       *dns.Server
 	rrCounter atomic.Uint64 // service-endpoint round-robin pointer
+	upstream  string        // resolver for out-of-domain forwards
 }
 
 // NewServer creates a DNS server for the given domain on the given UDP port.
@@ -40,7 +41,28 @@ func NewServer(domain string, port int, db *corrosion.Client) *Server {
 	if !strings.HasSuffix(domain, ".") {
 		domain += "."
 	}
-	return &Server{domain: domain, port: port, db: db}
+	return &Server{domain: domain, port: port, db: db, upstream: resolvConfUpstream()}
+}
+
+// resolvConfUpstream returns the first non-loopback nameserver from
+// /etc/resolv.conf as "ip:53", falling back to a public resolver. Used only for
+// out-of-domain forwards — which, once dnsmasq forwards ONLY the litevirt domain
+// to this server, are rare (a direct query here for an external name). Replaces a
+// hardcoded 8.8.8.8 so a host with a real upstream is honored.
+func resolvConfUpstream() string {
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return fallbackUpstream
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "nameserver" {
+			if ip := net.ParseIP(f[1]); ip != nil && !ip.IsLoopback() {
+				return net.JoinHostPort(f[1], "53")
+			}
+		}
+	}
+	return fallbackUpstream
 }
 
 // Start begins serving DNS. Blocks until ctx is cancelled.
@@ -74,6 +96,7 @@ func (s *Server) handleLocal(w dns.ResponseWriter, r *dns.Msg) {
 	m.SetReply(r)
 	m.Authoritative = true
 
+	nameMissed := false
 	for _, q := range r.Question {
 		if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
 			continue
@@ -81,52 +104,60 @@ func (s *Server) handleLocal(w dns.ResponseWriter, r *dns.Msg) {
 
 		name := strings.ToLower(q.Name)
 
-		// anycast: service_endpoints rows return multiple
-		// A records for one name, round-robin-rotated. Falls through
-		// to the legacy single-value dns_records lookup if no
-		// service is registered under this name.
-		if ips := s.lookupService(name); len(ips) > 0 {
-			for _, ip := range ips {
-				parsed := net.ParseIP(ip).To4()
-				if parsed == nil {
-					continue
-				}
-				m.Answer = append(m.Answer, &dns.A{
-					Hdr: dns.RR_Header{
-						Name:   q.Name,
-						Rrtype: dns.TypeA,
-						Class:  dns.ClassINET,
-						Ttl:    defaultTTL,
-					},
-					A: parsed,
-				})
+		// anycast: service_endpoints rows return multiple records for one name,
+		// round-robin-rotated. Falls through to the legacy single-value dns_records
+		// lookup if no service is registered under this name.
+		var ips []string
+		if svc := s.lookupService(name); len(svc) > 0 {
+			ips = svc
+		} else if ip := s.lookup(name); ip != "" {
+			ips = []string{ip}
+		} else {
+			// The name has no record at all. Don't NXDOMAIN mid-loop (that would
+			// discard answers already gathered for earlier questions); decide after.
+			nameMissed = true
+			continue
+		}
+		for _, ip := range ips {
+			if rr := recordFor(q, ip); rr != nil {
+				m.Answer = append(m.Answer, rr)
 			}
-			continue
 		}
+	}
 
-		ip := s.lookup(name)
-		if ip == "" {
-			m.SetRcode(r, dns.RcodeNameError)
-			w.WriteMsg(m) //nolint:errcheck
-			return
-		}
-
-		parsed := net.ParseIP(ip).To4()
-		if parsed == nil {
-			continue
-		}
-		m.Answer = append(m.Answer, &dns.A{
-			Hdr: dns.RR_Header{
-				Name:   q.Name,
-				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET,
-				Ttl:    defaultTTL,
-			},
-			A: parsed,
-		})
+	// NXDOMAIN only when a queried name genuinely does not exist AND we produced
+	// no answers. A name that exists but has no record of the requested family
+	// (e.g. an AAAA query for a v4-only name) is NODATA/NOERROR, not NXDOMAIN.
+	if len(m.Answer) == 0 && nameMissed {
+		m.SetRcode(r, dns.RcodeNameError)
 	}
 
 	w.WriteMsg(m) //nolint:errcheck
+}
+
+// recordFor builds the answer RR for a question given a stored IP: an A record
+// for an A query with an IPv4 value, or an AAAA record for an AAAA query with an
+// IPv6 value. Returns nil when the query type and the address family don't match
+// — a v4-only name must yield NO answer to an AAAA query, never an A record in an
+// AAAA response (the prior code emitted A records for AAAA queries).
+func recordFor(q dns.Question, ip string) dns.RR {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return nil
+	}
+	hdr := func(t uint16) dns.RR_Header {
+		return dns.RR_Header{Name: q.Name, Rrtype: t, Class: dns.ClassINET, Ttl: defaultTTL}
+	}
+	if q.Qtype == dns.TypeAAAA {
+		if parsed.To4() == nil {
+			return &dns.AAAA{Hdr: hdr(dns.TypeAAAA), AAAA: parsed.To16()}
+		}
+		return nil
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		return &dns.A{Hdr: hdr(dns.TypeA), A: v4}
+	}
+	return nil
 }
 
 // lookupService returns the IPs registered for a service name in
@@ -169,8 +200,9 @@ func (s *Server) lookupService(name string) []string {
 	return append(expanded[off:], expanded[:off]...)
 }
 
-// lookup finds the IP for a DNS name by querying the dns_records table.
-// It tries an exact match first, then strips one label at a time.
+// lookup finds the IP for a DNS name by an EXACT match against dns_records
+// (litevirt names are flat — <vm>.<domain> or <vm>.<stack>.<domain> — and are
+// written whole, so no label-stripping is performed).
 func (s *Server) lookup(name string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -191,7 +223,7 @@ func (s *Server) lookup(name string) string {
 // handleForward proxies queries outside our domain to the upstream resolver.
 func (s *Server) handleForward(w dns.ResponseWriter, r *dns.Msg) {
 	c := &dns.Client{Timeout: forwardTimeout}
-	resp, _, err := c.Exchange(r, upstreamDNS)
+	resp, _, err := c.Exchange(r, s.upstream)
 	if err != nil {
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)

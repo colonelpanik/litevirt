@@ -2173,7 +2173,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 
 	// Update host-isolation rules if the LB interface is on an isolated bridge.
 	// Internal ApplyLB RPC doesn't carry snat flag; default to true (previous behaviour).
-	s.updateIsolationForLB(ctx, lbIface, vipIP, ports, true)
+	s.updateIsolationForLB(ctx, req.LbName, lbIface, vipIP, ports, true)
 
 	if lbProofID != "" {
 		if err := corrosion.CompleteActionProof(ctx, s.db, lbProofID, s.hostName); err != nil {
@@ -2211,14 +2211,14 @@ func (s *Server) RemoveLB(ctx context.Context, req *pb.RemoveLBRequest) (*emptyp
 		return nil, status.Errorf(codes.Internal, "remove LB: %v", err)
 	}
 
-	// Restore base isolation (drop all, no LB exceptions) + remove SNAT.
+	// Drop this LB's firewall intent (its VIP:port exceptions + SNAT). The
+	// network's base isolation intent remains, so the bridge stays dropped without
+	// the LB holes — the canonical reconciler renders the restored state.
 	if lbVIP != "" {
 		vipIP, _, _ := lb.ParseVIP(lbVIP)
 		lbIface := lb.DetectInterfaceForIP(vipIP)
-		netDef, _ := s.findIsolatedNetworkForBridge(ctx, lbIface)
-		if netDef != nil {
-			network.EnsureHostIsolation(lbIface, nil) //nolint:errcheck
-			network.RemoveSNAT(lbIface)               //nolint:errcheck
+		if netDef, _ := s.findIsolatedNetworkForBridge(ctx, lbIface); netDef != nil {
+			_ = corrosion.DeleteHostFWIntent(ctx, s.db, s.hostName, "lb:"+req.LbName)
 		}
 	}
 
@@ -2693,40 +2693,48 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 	}
 
 	// Update host-isolation rules if the LB interface is on an isolated bridge.
-	s.updateIsolationForLB(ctx, lbIface, vipIP, ports, snat)
+	s.updateIsolationForLB(ctx, lbName, lbIface, vipIP, ports, snat)
 
 	s.publish("lb.applied", lbName, fmt.Sprintf("vip=%s backends=%d", vip, len(backends)))
 	return nil
 }
 
-// updateIsolationForLB checks if a bridge has host-isolation enabled and, if so,
-// re-applies the isolation chain with LB port exceptions so VMs can reach the VIP.
-// Also sets up SNAT rules if the network's LB has snat enabled.
-func (s *Server) updateIsolationForLB(ctx context.Context, bridge, vip string, ports []lb.Port, snat bool) {
+// updateIsolationForLB records this LB's firewall intent when its bridge belongs
+// to a host-isolated network: VIP:port holes punched through the isolation drop
+// so VMs can reach the VIP, plus SNAT to the VIP when enabled. The canonical
+// nftables reconciler renders it, merged with the network's base isolation intent.
+func (s *Server) updateIsolationForLB(ctx context.Context, lbName, bridge, vip string, ports []lb.Port, snat bool) {
 	// Find a network whose bridge matches this interface and has host-isolation.
 	netDef, subnet := s.findIsolatedNetworkForBridge(ctx, bridge)
 	if netDef == nil {
 		return
 	}
 
-	// Build LB exceptions for the isolation chain.
 	var listenPorts []int
 	for _, p := range ports {
 		listenPorts = append(listenPorts, p.Listen)
 	}
-	exc := []network.IsolationLBException{{VIP: vip, Ports: listenPorts}}
-	if err := network.EnsureHostIsolation(bridge, exc); err != nil {
-		slog.Warn("updateIsolationForLB: failed to update isolation rules", "bridge", bridge, "error", err)
+	intent := corrosion.HostFWIntent{
+		ScopeKey:   "lb:" + lbName,
+		Bridge:     bridge,
+		Isolate:    true, // the bridge is dropped, with the exceptions below punched through
+		Exceptions: []corrosion.HostFWException{{VIP: vip, Ports: listenPorts}},
 	}
 
-	// Set up SNAT if explicitly enabled.
+	// SNAT if explicitly enabled.
 	if snat && subnet != "" {
-		outIface := network.DefaultRouteIface()
-		if outIface != "" {
-			if err := network.EnsureSNAT(bridge, subnet, vip, outIface); err != nil {
-				slog.Warn("updateIsolationForLB: SNAT setup failed", "bridge", bridge, "error", err)
+		if outIface := network.DefaultRouteIface(); outIface != "" {
+			if err := network.EnableIPForwarding(); err != nil {
+				slog.Warn("updateIsolationForLB: enable ip_forward failed", "error", err)
 			}
+			intent.SNATSubnet = subnet
+			intent.SNATVIP = vip
+			intent.SNATOutIface = outIface
 		}
+	}
+
+	if err := corrosion.UpsertHostFWIntent(ctx, s.db, s.hostName, intent); err != nil {
+		slog.Warn("updateIsolationForLB: record firewall intent failed", "bridge", bridge, "error", err)
 	}
 }
 

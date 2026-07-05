@@ -266,3 +266,74 @@ func mustContainAll(t *testing.T, haystack string, needles ...string) {
 		}
 	}
 }
+
+// TestRender_NATIsolationOmittedWhenEmpty: a plan with no NAT/isolation must not
+// emit the nat/input chains, so it stays byte-identical to the pre-feature output
+// (and so removing the last rule drops the chain on the next atomic replace).
+func TestRender_NATIsolationOmittedWhenEmpty(t *testing.T) {
+	out, err := Render(Plan{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "chain postrouting") || strings.Contains(out, "chain input") {
+		t.Errorf("empty plan must not emit nat/input chains:\n%s", out)
+	}
+}
+
+// TestRender_MasqueradeAndSNAT pins the two postrouting forms.
+func TestRender_MasqueradeAndSNAT(t *testing.T) {
+	out, err := Render(Plan{NAT: []NATRule{
+		{Subnet: "10.0.1.0/24", Bridge: "br-mgd"},
+		{Subnet: "10.100.0.0/24", OutIface: "eth0", SNATTo: "203.0.113.5"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustContainAll(t, out,
+		"chain postrouting {",
+		"type nat hook postrouting priority srcnat; policy accept;",
+		"ip saddr 10.0.1.0/24 oifname != br-mgd masquerade",
+		"oifname eth0 ip saddr 10.100.0.0/24 snat to 203.0.113.5",
+	)
+	// SNAT (specific) must precede masquerade (general) in the chain.
+	if strings.Index(out, "snat to") > strings.Index(out, "masquerade") {
+		t.Error("SNAT rules must be emitted before masquerade")
+	}
+}
+
+// TestRender_HostIsolationDropAndExceptions pins the input chain.
+func TestRender_HostIsolationDropAndExceptions(t *testing.T) {
+	out, err := Render(Plan{HostIsolation: []IsolationChain{
+		{Bridge: "br-iso", Exceptions: []IsolationException{{VIP: "10.100.0.50", Ports: []int{80}}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustContainAll(t, out,
+		"chain input {",
+		"type filter hook input priority filter; policy accept;",
+		"iifname br-iso ip protocol 112 accept",
+		"iifname br-iso ip daddr 10.100.0.50 tcp dport 80 accept",
+		"iifname br-iso drop",
+	)
+	// The catch-all drop must come after the exceptions or it shadows them.
+	if strings.Index(out, "iifname br-iso drop") < strings.Index(out, "tcp dport 80 accept") {
+		t.Error("isolation drop must follow the exceptions")
+	}
+}
+
+func TestValidate_NATRejectsBadInput(t *testing.T) {
+	cases := []Plan{
+		{NAT: []NATRule{{Subnet: "", Bridge: "br0"}}},                                  // empty subnet
+		{NAT: []NATRule{{Subnet: "fd00::/64", Bridge: "br0"}}},                          // IPv6 subnet
+		{NAT: []NATRule{{Subnet: "10.0.0.0/24"}}},                                       // masquerade w/o bridge
+		{NAT: []NATRule{{Subnet: "10.0.0.0/24", SNATTo: "1.2.3.4"}}},                     // SNAT w/o out-iface
+		{HostIsolation: []IsolationChain{{Bridge: ""}}},                                 // empty bridge
+		{HostIsolation: []IsolationChain{{Bridge: "br0", Exceptions: []IsolationException{{VIP: "fd00::1", Ports: []int{80}}}}}}, // IPv6 VIP
+	}
+	for i, p := range cases {
+		if _, err := Render(p); err == nil {
+			t.Errorf("case %d: expected validation error, got none", i)
+		}
+	}
+}

@@ -58,6 +58,24 @@ func TestRenderGolden(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "nat_and_isolation",
+			path: "testdata/render_nat_isolation.golden",
+			plan: Plan{
+				NAT: []NATRule{
+					// out of order to prove deterministic sort + SNAT-before-masquerade.
+					{Subnet: "10.0.2.0/24", Bridge: "br-mgd-b"},
+					{Subnet: "10.0.1.0/24", Bridge: "br-mgd-a"},
+					{Subnet: "10.100.0.0/24", OutIface: "eth0", SNATTo: "203.0.113.5"},
+				},
+				HostIsolation: []IsolationChain{
+					{Bridge: "br-iso-z"},
+					{Bridge: "br-iso-a", Exceptions: []IsolationException{
+						{VIP: "10.100.0.50", Ports: []int{80, 443}},
+					}},
+				},
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

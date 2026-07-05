@@ -143,7 +143,7 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 
 	// Deprovision the network infrastructure.
 	def := networkRecordToDef(nr)
-	if err := network.Deprovision(req.Name, def); err != nil {
+	if err := network.Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
 		slog.Warn("network deprovision failed", "network", req.Name, "error", err)
 	}
 
@@ -272,7 +272,7 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		return nil // nothing to deprovision
 	}
 	def := networkRecordToDef(nr)
-	if err := network.Deprovision(name, def); err != nil {
+	if err := network.Deprovision(ctx, s.db, name, def, s.hostName); err != nil {
 		return err
 	}
 	return corrosion.DeleteNetwork(ctx, s.db, name)

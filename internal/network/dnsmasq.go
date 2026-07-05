@@ -497,46 +497,10 @@ func resolveUpstreamDNS() []string {
 	return servers
 }
 
-// EnsureNAT sets up IP forwarding and iptables MASQUERADE so VMs on the bridge
-// subnet can reach the internet through the host. Idempotent.
-func EnsureNAT(subnet, bridge string) error {
-	// Enable IP forwarding.
-	out, err := execCommand("sysctl", "-w", "net.ipv4.ip_forward=1")
-	if err != nil {
-		return fmt.Errorf("enable ip forwarding: %w: %s", err, out)
-	}
-
-	// Add MASQUERADE rule (skip if already present).
-	_, err = execCommand("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", subnet, "!", "-o", bridge, "-j", "MASQUERADE")
-	if err != nil {
-		// Rule doesn't exist, add it.
-		out, err = execCommand("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "!", "-o", bridge, "-j", "MASQUERADE")
-		if err != nil {
-			return fmt.Errorf("add masquerade rule: %w: %s", err, out)
-		}
-	}
-
-	// Allow forwarding to/from the bridge.
-	_, err = execCommand("iptables", "-C", "FORWARD", "-i", bridge, "-j", "ACCEPT")
-	if err != nil {
-		out, err = execCommand("iptables", "-A", "FORWARD", "-i", bridge, "-j", "ACCEPT")
-		if err != nil {
-			return fmt.Errorf("add forward accept (in): %w: %s", err, out)
-		}
-	}
-	_, err = execCommand("iptables", "-C", "FORWARD", "-o", bridge, "-j", "ACCEPT")
-	if err != nil {
-		out, err = execCommand("iptables", "-A", "FORWARD", "-o", bridge, "-j", "ACCEPT")
-		if err != nil {
-			return fmt.Errorf("add forward accept (out): %w: %s", err, out)
-		}
-	}
-
-	slog.Info("NAT configured", "subnet", subnet, "bridge", bridge)
-	return nil
-}
-
-// RemoveNAT tears down the iptables rules added by EnsureNAT.
+// RemoveNAT tears down the legacy iptables MASQUERADE + FORWARD rules a prior
+// binary added for a managed subnet. Masquerade is now rendered as nft in the
+// canonical litevirt-fw table; this remains for deprovision teardown and the
+// one-time upgrade migration (RemoveLegacyBridgeFirewall). Idempotent.
 func RemoveNAT(subnet, bridge string) error {
 	execCommand("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "!", "-o", bridge, "-j", "MASQUERADE") //nolint:errcheck
 	execCommand("iptables", "-D", "FORWARD", "-i", bridge, "-j", "ACCEPT")                                         //nolint:errcheck

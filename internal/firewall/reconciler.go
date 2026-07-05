@@ -34,6 +34,14 @@ type Reconciler struct {
 	doneCh   chan struct{}
 	lastErr  error
 	lastTick time.Time
+
+	// legacyCleanup removes a bridge's pre-consolidation out-of-band rules (old
+	// iptables masquerade + the separate `inet litevirt` iso/snat chains) once the
+	// equivalent rules are live in litevirt-fw. Run per bridge exactly once
+	// (tracked in cleaned) AFTER a successful apply, so there is never a window
+	// without NAT/isolation during the upgrade migration. nil in tests.
+	legacyCleanup func(bridge, masqueradeSubnet string)
+	cleaned       map[string]bool
 }
 
 // NewReconciler wires a loader to an applier. interval controls the
@@ -44,7 +52,16 @@ func NewReconciler(loader PlanLoader, applier *Applier, interval time.Duration) 
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-	return &Reconciler{loader: loader, applier: applier, interval: interval}
+	return &Reconciler{loader: loader, applier: applier, interval: interval, cleaned: map[string]bool{}}
+}
+
+// SetLegacyCleanup registers the per-bridge migration hook that clears
+// pre-consolidation NAT/isolation rules a prior binary left behind. The daemon
+// wires network.RemoveLegacyBridgeFirewall; tests leave it unset.
+func (r *Reconciler) SetLegacyCleanup(fn func(bridge, masqueradeSubnet string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.legacyCleanup = fn
 }
 
 // Start launches the reconciler in a goroutine. Calling Start while
@@ -114,7 +131,47 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		slog.Info("firewall ruleset applied",
 			"rules", countRules(plan), "nics", len(plan.NICs))
 	}
+	// New NAT/isolation rules are now live in litevirt-fw (this apply, or an earlier
+	// one if unchanged) — safe to clear the old out-of-band rules for these bridges.
+	r.migrateLegacy(plan)
 	return nil
+}
+
+// migrateLegacy removes, once per bridge, the pre-consolidation rules a prior
+// binary applied out-of-band. Keyed on bridges the just-applied plan now covers,
+// so a bridge's old rules are only removed after its new rules exist.
+func (r *Reconciler) migrateLegacy(p Plan) {
+	r.mu.Lock()
+	fn := r.legacyCleanup
+	r.mu.Unlock()
+	if fn == nil {
+		return
+	}
+	// bridge → masquerade subnet ("" when the bridge is isolation/SNAT-only).
+	masq := map[string]string{}
+	bridges := map[string]bool{}
+	for _, n := range p.NAT {
+		if n.SNATTo == "" && n.Bridge != "" { // masquerade rule
+			masq[n.Bridge] = n.Subnet
+			bridges[n.Bridge] = true
+		}
+	}
+	for _, iso := range p.HostIsolation {
+		if iso.Bridge != "" {
+			bridges[iso.Bridge] = true
+		}
+	}
+	for b := range bridges {
+		r.mu.Lock()
+		done := r.cleaned[b]
+		if !done {
+			r.cleaned[b] = true
+		}
+		r.mu.Unlock()
+		if !done {
+			fn(b, masq[b])
+		}
+	}
 }
 
 func (r *Reconciler) loop(ctx context.Context) {
@@ -272,8 +329,63 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 				SecurityGroups: bound,
 			})
 		}
+
+		// NAT / SNAT / host-isolation infra: read this host's resolved intent
+		// (written by network provisioning + LB apply) and fold it into the same
+		// atomic ruleset. Empty → no nat/input chains, identical to before v40.
+		intents, err := corrosion.ListHostFWIntent(ctx, db, hostName)
+		if err != nil {
+			return plan, err
+		}
+		plan.NAT, plan.HostIsolation = intentToNATIsolation(intents)
 		return plan, nil
 	}
+}
+
+// intentToNATIsolation aggregates per-host firewall intent rows into the
+// renderer's NAT + isolation inputs. Masquerade and SNAT rows each become a
+// postrouting NATRule; isolation is merged per bridge (a bridge is isolated if
+// ANY row marks it so, and its exceptions are the union across all rows for that
+// bridge — so an LB row's VIP:port holes attach to the network row's drop).
+func intentToNATIsolation(intents []corrosion.HostFWIntent) ([]NATRule, []IsolationChain) {
+	var nat []NATRule
+	isolated := map[string]bool{}
+	exc := map[string][]IsolationException{}
+	var order []string // preserve first-seen bridge order; renderer sorts anyway
+
+	for _, in := range intents {
+		if in.MasqueradeSubnet != "" {
+			nat = append(nat, NATRule{Subnet: in.MasqueradeSubnet, Bridge: in.Bridge})
+		}
+		if in.SNATVIP != "" {
+			nat = append(nat, NATRule{OutIface: in.SNATOutIface, Subnet: in.SNATSubnet, SNATTo: in.SNATVIP})
+		}
+		if in.Bridge != "" && (in.Isolate || len(in.Exceptions) > 0) {
+			if _, seen := exc[in.Bridge]; !seen {
+				order = append(order, in.Bridge)
+			}
+			if in.Isolate {
+				isolated[in.Bridge] = true
+			}
+			for _, e := range in.Exceptions {
+				exc[in.Bridge] = append(exc[in.Bridge], IsolationException{VIP: e.VIP, Ports: e.Ports})
+			}
+			if _, ok := exc[in.Bridge]; !ok {
+				exc[in.Bridge] = nil // ensure the bridge is tracked even with no exceptions
+			}
+		}
+	}
+
+	var iso []IsolationChain
+	for _, bridge := range order {
+		if !isolated[bridge] {
+			// Exceptions with no isolation drop are meaningless — skip (the bridge
+			// isn't isolated, so there's nothing to punch through).
+			continue
+		}
+		iso = append(iso, IsolationChain{Bridge: bridge, Exceptions: exc[bridge]})
+	}
+	return nat, iso
 }
 
 // toFWRules converts the on-disk cluster/host-tier rows into renderer Rules,

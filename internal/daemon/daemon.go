@@ -568,6 +568,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fwApplier := firewall.NewApplier(firewall.NftBinary{})
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
+	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
+	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
+	// masquerade + `inet litevirt` chains) a prior binary left for it.
+	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
 	svc.SetFirewallReconciler(d.fwReconciler)
 	d.fwReconciler.Start(ctx)
 

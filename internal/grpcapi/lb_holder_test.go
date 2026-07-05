@@ -63,3 +63,24 @@ func TestLBRunsOnHost_ExplicitNeedsRecordedHolder(t *testing.T) {
 		t.Error("stack LB with no local VMs must not run here")
 	}
 }
+
+// TestRepairLegacyLBHolder_Guards: the migration repair only claims a legacy
+// explicit LB this host is actually serving. A stack LB, an already-owned LB, or
+// an LB whose keepalived isn't running here (the default in tests) is left as-is —
+// so a non-holder never claims a VIP.
+func TestRepairLegacyLBHolder_Guards(t *testing.T) {
+	s := testServerR2(t)
+	ctx := context.Background()
+
+	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "x", StackName: "s", Hosts: "[]"}); got.Hosts != "[]" {
+		t.Errorf("stack LB must not be repaired; hosts = %q", got.Hosts)
+	}
+	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "x", Hosts: `["h"]`}); got.Hosts != `["h"]` {
+		t.Errorf("already-owned LB must not be re-claimed; hosts = %q", got.Hosts)
+	}
+	// Explicit unowned LB, but keepalived for it isn't running on this host (no
+	// pidfile in the test env) → not claimed, left for the real holder.
+	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "not-running-lb", Hosts: "[]"}); got.Hosts != "[]" {
+		t.Errorf("must not claim an LB this host isn't serving; hosts = %q", got.Hosts)
+	}
+}

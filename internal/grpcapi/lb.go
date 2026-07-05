@@ -1563,6 +1563,14 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	// here until its holder is re-established (re-create).
 	var lbHosts []string
 	json.Unmarshal([]byte(hostsStr), &lbHosts) //nolint:errcheck
+	if len(lbHosts) == 0 && r.String("stack_name") == "" {
+		// Legacy explicit LB with no recorded holder (pre-durable-holder row). If
+		// THIS node is serving the VIP, claim ownership so the update applies +
+		// reloads here; if not, the local loop below skips and the change reaches
+		// the holder via its own reconcile. Either way we don't blindly claim self.
+		repaired := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: req.Name, Hosts: hostsStr})
+		json.Unmarshal([]byte(repaired.Hosts), &lbHosts) //nolint:errcheck
+	}
 
 	// Apply locally.
 	for _, h := range lbHosts {
@@ -2381,7 +2389,16 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 		return
 	}
 	for _, cfg := range configs {
-		if !cfg.Enabled || !s.lbRunsOnHost(ctx, cfg) {
+		if !cfg.Enabled {
+			continue
+		}
+		// Migration repair: an explicit LB persisted before durable holders has
+		// hosts=[] and is otherwise unowned (lbRunsOnHost returns false, so it would
+		// never revive). If keepalived for it is live on THIS host, we ARE its holder
+		// — claim ownership so it re-applies here and future update/reconcile target
+		// the real holder. Decentralized + CAS'd: exactly one live holder wins.
+		cfg = s.repairLegacyLBHolder(ctx, cfg)
+		if !s.lbRunsOnHost(ctx, cfg) {
 			continue
 		}
 		if cfg.StackName != "" {
@@ -2396,6 +2413,33 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 		// must be re-appliable to recover on quorum heal (and at startup).
 		s.reapplyExplicitLB(ctx, cfg)
 	}
+}
+
+// repairLegacyLBHolder backfills a durable holder for a legacy explicit LB
+// (StackName=="" with empty hosts) that THIS host is actually serving. It returns
+// the possibly-updated config. Only a host whose keepalived for the VIP is live
+// claims it, so the recorded holder reflects reality; the claim is CAS'd
+// (ClaimLBHolderIfUnowned) so exactly one live holder wins and a peer that already
+// claimed is left as-is. A legacy LB that NO host is serving stays unowned — it
+// can't be safely auto-assigned, and the operator must re-create it.
+func (s *Server) repairLegacyLBHolder(ctx context.Context, cfg corrosion.LBConfigRecord) corrosion.LBConfigRecord {
+	if cfg.StackName != "" || !(cfg.Hosts == "" || cfg.Hosts == "[]") {
+		return cfg
+	}
+	if !lb.NewManager().KeepalivedRunning(cfg.Name) {
+		return cfg // not serving it here — leave unowned for the actual holder to claim
+	}
+	self, _ := json.Marshal([]string{s.hostName})
+	claimed, err := corrosion.ClaimLBHolderIfUnowned(ctx, s.db, cfg.Name, string(self))
+	if err != nil {
+		slog.Warn("repairLegacyLBHolder: claim failed", "lb", cfg.Name, "error", err)
+		return cfg
+	}
+	if claimed {
+		slog.Info("repaired legacy LB: backfilled durable holder", "lb", cfg.Name, "host", s.hostName)
+		cfg.Hosts = string(self)
+	}
+	return cfg
 }
 
 // RunLBReconciler periodically re-applies this host's enabled LBs whose keepalived is NOT

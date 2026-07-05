@@ -81,6 +81,20 @@ func ListLBConfigs(ctx context.Context, c *Client) ([]LBConfigRecord, error) {
 	return records, nil
 }
 
+// ClaimLBHolderIfUnowned atomically records hostsJSON as an LB's holder set ONLY
+// while it currently has none (hosts '' or '[]'). It is the migration repair for
+// explicit LBs persisted before durable holders: the host actually serving the VIP
+// backfills itself. The guarded UPDATE makes it a compare-and-set — exactly one
+// live holder wins across concurrent hosts — and returns whether THIS call claimed
+// it (rows affected).
+func ClaimLBHolderIfUnowned(ctx context.Context, c *Client, name, hostsJSON string) (bool, error) {
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE lb_configs SET hosts = ?, updated_at = ?
+		 WHERE name = ? AND deleted_at IS NULL AND (hosts = '' OR hosts = '[]')`,
+		hostsJSON, c.NowTS(), name)
+	return n > 0, err
+}
+
 // SoftDeleteLBConfig tombstones an LB config (UPDATE-only — a no-op when the row
 // doesn't exist locally, so cleanup paths can't manufacture a tombstone for an LB
 // that never existed). The tombstone (newer updated_at) is what propagates the

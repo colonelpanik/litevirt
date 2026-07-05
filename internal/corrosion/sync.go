@@ -74,6 +74,53 @@ func localWinsLWW(localTS, incomingTS string) bool {
 	return lwwOrder(localTS, incomingTS) >= 0
 }
 
+// skewCutoff mirrors hlc.MaxSkewMS: an incoming updated_at whose instant is more
+// than this far ahead of local wall-clock now is treated as clock-corrupted.
+var skewCutoff = time.Duration(hlc.MaxSkewMS) * time.Millisecond
+
+// tsInstant returns the wall-clock instant an updated_at value represents. It
+// handles both HLC ("<physms>-<logical>-<node>") and RFC3339 forms; ok=false for
+// anything it can't interpret (left to the existing comparator).
+func tsInstant(ts string) (time.Time, bool) {
+	if hlc.IsHLC(ts) {
+		if p, ok := hlc.Parse(ts); ok {
+			return time.UnixMilli(p.PhysicalMS).UTC(), true
+		}
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+// tsFutureSkewed reports whether ts is implausibly far in the future relative to
+// now (beyond skewCutoff). Unparseable values are never skewed (return false) so
+// they fall through to the normal comparator.
+func tsFutureSkewed(ts string, now time.Time) bool {
+	inst, ok := tsInstant(ts)
+	if !ok {
+		return false
+	}
+	return inst.After(now.Add(skewCutoff))
+}
+
+// skewQuarantinesIncoming reports whether the skew guard should keep the local
+// row and reject incoming: the guard is enabled, incoming is future-skewed, and
+// local is NOT (if both are skewed we can't tell which is worse, so fall through
+// to normal LWW). Increments the quarantine counter when it fires. `now` is
+// passed for testability.
+func (c *Client) skewQuarantinesIncoming(guardOn bool, localTS, incomingTS string, now time.Time) bool {
+	if !guardOn {
+		return false
+	}
+	if tsFutureSkewed(incomingTS, now) && !tsFutureSkewed(localTS, now) {
+		c.skewQuarantined.Add(1)
+		return true
+	}
+	return false
+}
+
 // lwwOrder is the strict last-writer-wins comparator behind localWinsLWW. It
 // returns +1 when local is strictly newer, -1 when incoming is strictly newer,
 // and 0 on an EXACT tie (same instant). Only a 0 reaches the tie resolver; every
@@ -458,6 +505,11 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		existing = c.prefetchUpdatedAt(tx, table.Name, pkCols, rows, pkIdx)
 	}
 
+	// Read the skew-guard state once per chunk (cheap latch read; constant for the
+	// batch) so a clock-corrupted peer's future-dated rows can be quarantined below.
+	skewGuardOn := c.hlcSkewGuardOn()
+	skewNow := time.Now()
+
 	for _, row := range rows {
 		// A peer dump whose row doesn't match the declared column count is
 		// malformed/corrupt: skip it rather than index out of range below or
@@ -483,6 +535,26 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				merged++
 			}
 			continue
+		}
+		// Skew quarantine applies to EVERY parseable incoming LWW row, whether
+		// or not we have a local row: a future-skewed CREATE would otherwise poison
+		// a first-seen PK, and legitimate later writes would lose to that inflated
+		// updated_at. localTS is "" when unseen — skewQuarantinesIncoming then keys
+		// solely on the incoming value being future-skewed (a both-skewed pair falls
+		// through to normal LWW).
+		if updatedAtIdx >= 0 {
+			if incomingTS, _ := row[updatedAtIdx].(string); incomingTS != "" {
+				localTS := ""
+				if existing != nil {
+					localTS = existing[pkKeyAt(row, pkIdx)]
+				}
+				if c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow) {
+					slog.Warn("sync: quarantined future-skewed incoming row (not applied)",
+						"table", table.Name, "incoming_updated_at", incomingTS, "first_seen", localTS == "")
+					skipped++
+					continue
+				}
+			}
 		}
 		if existing != nil {
 			incomingTS, _ := row[updatedAtIdx].(string)

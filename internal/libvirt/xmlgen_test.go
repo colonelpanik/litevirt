@@ -6,6 +6,74 @@ import (
 	"testing"
 )
 
+func TestMachineTypeFromXML(t *testing.T) {
+	cases := []struct {
+		name string
+		xml  string
+		want string
+	}{
+		{"resolved q35", `<domain><os><type arch="x86_64" machine="pc-q35-9.0">hvm</type></os></domain>`, "pc-q35-9.0"},
+		{"alias only", `<domain><os><type arch="x86_64" machine="q35">hvm</type></os></domain>`, "q35"},
+		{"no machine attr", `<domain><os><type arch="x86_64">hvm</type></os></domain>`, ""},
+		{"malformed", `not xml`, ""},
+		{"empty", ``, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MachineTypeFromXML(tc.xml); got != tc.want {
+				t.Errorf("MachineTypeFromXML = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsPinnedMachineType(t *testing.T) {
+	pinned := []string{"pc-q35-9.0", "pc-q35-8.2", "pc-i440fx-7.1", "virt-9.0"}
+	notPinned := []string{"", "q35", "pc", "pc-q35", "virt", "pc-q35-"}
+	for _, m := range pinned {
+		if !IsPinnedMachineType(m) {
+			t.Errorf("IsPinnedMachineType(%q) = false, want true", m)
+		}
+	}
+	for _, m := range notPinned {
+		if IsPinnedMachineType(m) {
+			t.Errorf("IsPinnedMachineType(%q) = true, want false", m)
+		}
+	}
+}
+
+func TestIsQ35Machine(t *testing.T) {
+	q35 := []string{"", "q35", "pc-q35", "pc-q35-9.0", "pc-q35-8.2"}
+	notQ35 := []string{"pc", "pc-i440fx-7.1", "pc-i440fx", "microvm", "virt-9.0"}
+	for _, m := range q35 {
+		if !isQ35Machine(m) {
+			t.Errorf("isQ35Machine(%q) = false, want true", m)
+		}
+	}
+	for _, m := range notQ35 {
+		if isQ35Machine(m) {
+			t.Errorf("isQ35Machine(%q) = true, want false", m)
+		}
+	}
+}
+
+// TestSecureBoot_RejectsPinnedI440fx: a pinned i440fx machine must be rejected for
+// Secure Boot (the pre-fix check only caught the bare "pc" alias).
+func TestSecureBoot_RejectsPinnedI440fx(t *testing.T) {
+	cfg := VMConfig{
+		Name: "sb", CPU: 2, MemoryMiB: 2048, Machine: "pc-i440fx-7.1",
+		Firmware: "uefi", SecureBoot: true, LoaderPath: "/l", NvramTemplate: "/n",
+	}
+	if _, err := GenerateDomainXML(cfg); err == nil {
+		t.Fatal("expected Secure Boot on pinned i440fx to be rejected")
+	}
+	// A pinned q35 must pass the machine-type gate.
+	cfg.Machine = "pc-q35-9.0"
+	if _, err := GenerateDomainXML(cfg); err != nil {
+		t.Fatalf("Secure Boot on pinned q35 should pass the machine gate, got: %v", err)
+	}
+}
+
 func TestGenerateDomainXML_Basic(t *testing.T) {
 	cfg := VMConfig{
 		Name:       "test-vm",

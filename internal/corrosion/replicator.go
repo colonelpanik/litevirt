@@ -1155,12 +1155,9 @@ func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName st
 		fmt.Sprintf("SELECT updated_at FROM %s WHERE %s", tableName, where),
 		args...,
 	).Scan(&localUpdatedAt)
-	if err != nil {
-		return false // no local row or error — don't skip
-	}
-
-	if !localUpdatedAt.Valid || localUpdatedAt.String == "" {
-		return false
+	localTS := ""
+	if err == nil && localUpdatedAt.Valid {
+		localTS = localUpdatedAt.String
 	}
 
 	// Prefer the row's own updated_at when the statement carries it. Most real
@@ -1173,7 +1170,23 @@ func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName st
 		incomingTS = incomingHLC
 	}
 
-	switch ord := lwwOrder(localUpdatedAt.String, incomingTS); {
+	// Skew quarantine runs BEFORE the no-local-row early return: a future-
+	// skewed incoming value must be dropped even for a PK this node has not seen,
+	// or the inflated updated_at becomes the row's baseline and legitimate later
+	// writes lose to it. localTS is "" when unseen (skewQuarantinesIncoming then
+	// keys solely on the incoming being future-skewed).
+	if r.client.skewQuarantinesIncoming(r.client.hlcSkewGuardOn(), localTS, incomingTS, time.Now()) {
+		slog.Warn("replicator: quarantined future-skewed incoming statement (not applied)",
+			"table", tableName, "incoming_updated_at", incomingTS, "first_seen", localTS == "")
+		return true // skip incoming
+	}
+
+	// No local row (or unreadable) → nothing to compare; apply incoming.
+	if err != nil || localTS == "" {
+		return false
+	}
+
+	switch ord := lwwOrder(localTS, incomingTS); {
 	case ord > 0:
 		return true // local strictly newer → skip incoming
 	case ord < 0:

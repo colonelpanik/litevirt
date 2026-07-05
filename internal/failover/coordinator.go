@@ -600,6 +600,20 @@ func (c *Coordinator) manualFenceConfirmed(ctx context.Context, host string) boo
 	return c.fenceWithinWindow(ctx, host, true)
 }
 
+// safeFenceRequiresProof reports whether a FAILED best-effort fence of h must be
+// confirmed (like "manual") before rescheduling. True only when the safe-fence
+// policy (SafeFenceDefaultV1) is enforced cluster-wide AND the host has not opted
+// into the legacy proceed-anyway behavior via LabelUnsafeAutoFailover. Pre-flip
+// (token not enforced) it is false, preserving today's behavior for a
+// mixed-version roll. A nil Gate (tests without the split-brain gate wired) is
+// also false — the policy is a strict addition on top of the gate.
+func (c *Coordinator) safeFenceRequiresProof(ctx context.Context, h *corrosion.HostRecord) bool {
+	if c.Gate == nil || !c.Gate.Enforced(ctx, capabilities.SafeFenceDefaultV1) {
+		return false
+	}
+	return h == nil || h.Labels[corrosion.LabelUnsafeAutoFailover] != "true"
+}
+
 // fenceWithinWindow reports whether host has a fencing_log row with an accepted
 // result newer than now-recentFenceWindow. manualOnly restricts the accepted
 // result to "manual-confirmed".
@@ -750,9 +764,33 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
 	}
 
+	// Safe-fence default (gated by SafeFenceDefaultV1). A best-effort fence is
+	// fire-and-forget SSH: it reports Success=true even when the poweroff never
+	// landed (fence.fenceSSH lenient mode), so it can NEVER confirm the host is
+	// actually down. This check must therefore run BEFORE the !fr.Success guard
+	// below — a lenient best-effort success would otherwise sail straight through
+	// to reschedule. Once the policy is enforced cluster-wide, a best-effort fence
+	// is treated like "manual": reschedule only with an operator fence-confirm,
+	// unless the host explicitly opts into legacy proceed-anyway. Pre-flip (token
+	// not enforced) this is a no-op, so a mixed-version roll keeps today's behavior.
+	if fence.ResolveStrategy(h.FenceStrategy) == "best-effort" && c.safeFenceRequiresProof(ctx, h) {
+		if !c.manualFenceConfirmed(ctx, h.Name) {
+			slog.Error("failover: best-effort fence unconfirmed under safe-fence policy, NOT rescheduling",
+				"host", h.Name, "detail", fr.Detail,
+				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off, "+
+					"or set host label "+corrosion.LabelUnsafeAutoFailover+"=true to opt into legacy proceed-anyway")
+			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			return
+		}
+		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
+		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+	}
+
 	// Split-brain guard. Reschedule only if:
 	//   - fence succeeded (real fence happened), OR
-	//   - strategy is "best-effort" (operator opted out of safety), OR
+	//   - strategy is "best-effort" (operator opted out of safety — a lenient SSH
+	//     fence reports Success=true, so this switch is skipped; the safe-fence
+	//     policy above is what gates it), OR
 	//   - strategy is "manual" AND an operator confirmation row exists.
 	// Manual fence used to claim Success=true unconditionally; it now reports
 	// Success=false and the coordinator must see an explicit confirmation row

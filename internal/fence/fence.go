@@ -46,9 +46,10 @@ type HostConfig struct {
 //	"watchdog"     – write to /dev/watchdog to stop heartbeat (self-fencing, caller is local)
 //	""             – treated as "best-effort"
 func Execute(ctx context.Context, h HostConfig) Result {
-	strategy := strings.ToLower(h.FenceStrategy)
-	if strategy == "" {
-		strategy = "best-effort"
+	raw := strings.ToLower(strings.TrimSpace(h.FenceStrategy))
+	strategy := ResolveStrategy(h.FenceStrategy)
+	if strategy == "best-effort" && raw != "" && raw != "best-effort" {
+		slog.Warn("unknown fence strategy, falling back to best-effort", "strategy", raw, "host", h.Name)
 	}
 
 	switch strategy {
@@ -56,16 +57,29 @@ func Execute(ctx context.Context, h HostConfig) Result {
 		return fenceIPMI(ctx, h)
 	case "ssh":
 		return fenceSSH(ctx, h, false)
-	case "best-effort":
-		r := fenceSSH(ctx, h, true)
-		return r
 	case "manual":
 		return fenceManual(h)
 	case "watchdog":
 		return fenceWatchdog(h)
-	default:
-		slog.Warn("unknown fence strategy, falling back to best-effort", "strategy", strategy, "host", h.Name)
+	default: // "best-effort" — lenient fire-and-forget SSH
 		return fenceSSH(ctx, h, true)
+	}
+}
+
+// ResolveStrategy returns the effective fence strategy Execute will run for a
+// (possibly empty, mixed-case, or unknown) configured value. "", an unrecognized
+// value, and "best-effort" all resolve to "best-effort" (lenient SSH). This is
+// the SINGLE source of that normalization: any caller that must reason about
+// which effective strategy will run — notably the safe-fence policy, which gates
+// the best-effort path — MUST use this so it sees exactly what Execute sees and
+// can't drift (e.g. a host with fence_strategy="" or a typo'd value would
+// otherwise slip past a literal "best-effort" comparison).
+func ResolveStrategy(raw string) string {
+	switch s := strings.ToLower(strings.TrimSpace(raw)); s {
+	case "ipmi", "ssh", "manual", "watchdog":
+		return s
+	default:
+		return "best-effort"
 	}
 }
 

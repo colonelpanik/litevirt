@@ -695,6 +695,16 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 		ifaceRecords[i].TapDevice = tap
 	}
 
+	// Pin the resolved machine type. libvirt expanded whatever alias we
+	// rendered ("q35") into a concrete, versioned type (e.g. "pc-q35-9.0") when
+	// it defined the domain; persist that exact value so a later migration or
+	// failover carries the guest ABI with it instead of re-resolving "q35" to a
+	// different version on the destination's qemu. Best-effort: a read/parse
+	// failure just leaves the alias, matching prior behavior.
+	if pinned := s.resolveMachineType(spec.Name); lv.IsPinnedMachineType(pinned) {
+		spec.Machine = pinned
+	}
+
 	// Serialize spec to JSON for storage
 	specJSON, _ := json.Marshal(spec)
 
@@ -732,6 +742,21 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 	hooks.Run(ctx, hooks.PostStart, stubVM, spec.Hooks)
 
 	return s.vmToProto(ctx, spec.Name)
+}
+
+// resolveMachineType reads the concrete, versioned machine type libvirt bound a
+// domain to (e.g. "pc-q35-9.0") from its persistent XML. Returns "" if the
+// domain is absent, unreadable, or carries no machine attribute. Used to pin
+// the machine type at create and to backfill VMs stored with a bare alias.
+func (s *Server) resolveMachineType(name string) string {
+	if s.virt == nil {
+		return ""
+	}
+	xml, err := s.virt.DumpXMLInactive(name)
+	if err != nil {
+		return ""
+	}
+	return lv.MachineTypeFromXML(xml)
 }
 
 func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListVMsResponse, error) {
@@ -2330,6 +2355,16 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			_ = s.virt.DefineDomain(oldXML)
 		}
 		return nil, status.Errorf(codes.Internal, "redefine domain: %v", err)
+	}
+
+	// Pin the resolved machine type. The redefine just resolved any alias
+	// ("q35") to a concrete versioned type in the persistent domain; re-read it and
+	// re-marshal so the DURABLE spec carries the concrete value. specJSON was built
+	// from the pre-pin spec above, so it must be regenerated here — otherwise a
+	// stopped VM redefined with --machine q35 would persist the alias.
+	if pinned := s.resolveMachineType(req.Name); lv.IsPinnedMachineType(pinned) && pinned != spec.Machine {
+		spec.Machine = pinned
+		specJSON, _ = json.Marshal(spec)
 	}
 
 	// The durable spec MUST match the live domain. If the write fails, roll the

@@ -43,6 +43,7 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 	}
 	prev := map[string]bool{}
 	eval := func() {
+		s.driveCapabilityActivation(ctx)
 		cur := s.evaluateHADegraded(ctx)
 		for _, r := range haReasons {
 			on := cur[r]
@@ -66,6 +67,24 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 		case <-t.C:
 			eval()
 		}
+	}
+}
+
+// driveCapabilityActivation flips the durable enforcement latch for every SUPPORTED
+// token by calling Enforced — the ONLY path that latches (CapabilityActive/…ForHealth
+// only compute). Most tokens are latched by their consumers calling Enforced at a
+// decision point (the coordinator for split_brain_gate_v1 / safe_fence_default_v1, the
+// VIP paths for the vip_* tokens). A token whose sole consumer reads the cheap Latched()
+// on a hot path — lww_skew_guard_v1's per-merge skew guard — has NO such caller, so without
+// this periodic drive its latch would never flip even after it is added to `supported`,
+// and the guard would stay off forever. This runs at the HA-monitor cadence (off the hot
+// path) and is idempotent for already-latched tokens (cheap `already` path in Enforced).
+func (s *Server) driveCapabilityActivation(ctx context.Context) {
+	if s.gate == nil {
+		return
+	}
+	for _, tok := range capabilities.Supported() {
+		s.gate.Enforced(ctx, tok)
 	}
 }
 

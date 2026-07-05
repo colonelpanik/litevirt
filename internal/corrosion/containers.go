@@ -33,6 +33,13 @@ const (
 	// their host dependencies differ. Placement requires whichever a VM spec needs.
 	LabelTPMCapable        = "litevirt.tpm"
 	LabelSecureBootCapable = "litevirt.secureboot"
+	// LabelUnsafeAutoFailover, when "true" on a host, restores the LEGACY
+	// proceed-anyway behavior for a failed best-effort fence even after the
+	// safe-fence-default policy (capabilities.SafeFenceDefaultV1) is enforced. It
+	// is the explicit operator opt-in to "reschedule my VMs off this host without
+	// proof of power-off," accepting the split-brain risk. Absent/anything-else =
+	// the safe default (require an operator fence-confirm).
+	LabelUnsafeAutoFailover = "litevirt.unsafe_auto_failover"
 	// LabelIP records a container's primary IPv4 so it can serve as a load
 	// balancer backend cluster-wide (containers have no vm_interfaces table).
 	// Set from a static compose NIC address at create; the LB host re-discovers

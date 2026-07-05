@@ -106,6 +106,44 @@ type NetworkConfig struct {
 	Direct string // non-empty = macvtap direct attach to this interface (e.g. "bond0.206")
 }
 
+// MachineTypeFromXML extracts the resolved <os><type machine="…"> value from a
+// libvirt domain XML. libvirt expands an alias like "q35" to a concrete,
+// versioned type (e.g. "pc-q35-9.0") when it defines a domain, so reading it
+// back from the persistent XML yields the exact machine the guest ABI is bound
+// to. Returns "" if the XML has no machine attribute (or doesn't parse).
+func MachineTypeFromXML(domXML string) string {
+	var d struct {
+		OS osType `xml:"os>type"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return ""
+	}
+	return d.OS.Machine
+}
+
+// isQ35Machine reports whether m is the q35 machine family, in either the
+// unversioned alias form ("q35", or "" which GenerateDomainXML defaults to q35)
+// or a pinned versioned form ("pc-q35-9.0"). Used to gate Secure Boot, which
+// requires q35 — a check on the bare "pc" alias alone would wrongly accept a
+// pinned i440fx type like "pc-i440fx-7.1".
+func isQ35Machine(m string) bool {
+	return m == "" || m == "q35" || strings.HasPrefix(m, "pc-q35-") || m == "pc-q35"
+}
+
+// IsPinnedMachineType reports whether m is a concrete, versioned machine type
+// (e.g. "pc-q35-9.0") rather than an unversioned alias ("q35", "pc", "") that
+// libvirt resolves differently per host qemu version. A pinned type travels
+// with the VM so a migration/failover can't silently shift the guest ABI.
+func IsPinnedMachineType(m string) bool {
+	// Versioned types carry a "-X.Y" suffix; aliases do not. Require a digit
+	// after the last '-' to distinguish "pc-q35-9.0" from the bare "pc-q35"/"q35".
+	i := strings.LastIndex(m, "-")
+	if i < 0 || i == len(m)-1 {
+		return false
+	}
+	return m[i+1] >= '0' && m[i+1] <= '9'
+}
+
 // GenerateDomainXML produces libvirt domain XML from a VMConfig.
 func GenerateDomainXML(cfg VMConfig) (string, error) {
 	if cfg.Machine == "" {
@@ -207,8 +245,8 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		if !isUEFI {
 			return "", fmt.Errorf("secure boot requires uefi firmware (got %q)", cfg.Firmware)
 		}
-		if cfg.Machine == "pc" {
-			return "", fmt.Errorf("secure boot requires the q35 machine type, not pc")
+		if !isQ35Machine(cfg.Machine) {
+			return "", fmt.Errorf("secure boot requires the q35 machine type, got %q", cfg.Machine)
 		}
 		if cfg.LoaderPath == "" || cfg.NvramTemplate == "" {
 			return "", fmt.Errorf("secure boot requires resolved firmware paths (LoaderPath/NvramTemplate) — the daemon must supply them")

@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/mod/semver"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -159,10 +160,11 @@ type peerVersionInfo struct {
 }
 
 // selfUpgradeTarget decides whether this host is behind and, if so, which peer
-// to pull from. Two downgrade-safe signals (see docs/self-upgrade-from-peer.md):
-//  1. a reachable peer at a strictly HIGHER schema_version (definitive), or
-//  2. same schema, but a strict MAJORITY of {self + active peers} run a
-//     single version that differs from ours.
+// to pull from. NEWEST-WINS convergence (see docs/self-upgrade-from-peer.md): pull
+// the single most-advanced reachable build — highest schema_version, then (at equal
+// schema) the strictly-newer semver version. No majority is required, so seeding ONE
+// node flows to the whole fleet. Downgrade-safe: never selects a peer below our
+// schema, and never chases an unparseable (dev / ephemeral) version.
 //
 // Peer (version, schema) is read from the replicated hosts table — one local
 // query — instead of dialing every peer each tick (that was O(N^2) cluster-wide
@@ -237,39 +239,56 @@ func (s *Server) preferRelaySource(target peerVersionInfo, peers []peerVersionIn
 //   - Signal 2 (majority): same schema as us, but a strict majority of
 //     {self + peers} run a single version that differs from ours.
 func chooseSelfUpgradeTarget(myVersion string, mySchema int, peers []peerVersionInfo) (peerVersionInfo, bool) {
-	if len(peers) == 0 {
-		return peerVersionInfo{}, false
-	}
-
-	// Signal 1: highest peer schema strictly above ours → catch up.
-	best := peers[0]
-	for _, p := range peers[1:] {
-		if p.schema > best.schema {
-			best = p
-		}
-	}
-	if best.schema > mySchema {
-		return best, true
-	}
-
-	// Signal 2: same-schema majority drift. Only peers at schema >= ours are
-	// eligible targets (never downgrade schema).
-	tally := map[string]int{}
-	example := map[string]peerVersionInfo{}
+	// NEWEST-WINS: converge to the single most-advanced build reachable, so seeding
+	// ONE node flows to the whole fleet (the only model that scales past a handful of
+	// nodes). "Most advanced" = highest schema; among equal schema, the strictly-newer
+	// semver version. Never downgrades schema (peers below our schema are skipped), and
+	// never chases an unparseable version (dev / ephemeral build) — those can't be
+	// ordered, so they're never a newer target.
+	var best peerVersionInfo
+	found := false
 	for _, p := range peers {
 		if p.schema < mySchema {
-			continue
+			continue // never downgrade schema
 		}
-		tally[p.version]++
-		example[p.version] = p
+		if !found || moreAdvanced(p, best) {
+			best, found = p, true
+		}
 	}
-	majority := (len(peers)+1)/2 + 1 // include self in the denominator
-	for ver, n := range tally {
-		if ver != myVersion && n >= majority {
-			return example[ver], true
-		}
+	if !found {
+		return peerVersionInfo{}, false
+	}
+	// Pull only if the best peer is strictly ahead of ME: a higher schema (definitive,
+	// monotonic) or the same schema with a strictly-newer semver version.
+	if best.schema > mySchema || (best.schema == mySchema && versionNewer(best.version, myVersion)) {
+		return best, true
 	}
 	return peerVersionInfo{}, false
+}
+
+// moreAdvanced reports whether a is a newer build than b: a higher schema, or the
+// same schema with a strictly-newer semver version. At equal schema a parseable
+// (valid-semver) version outranks an unparseable one, so a dev/ephemeral peer never
+// shadows a real release when picking the best candidate.
+func moreAdvanced(a, b peerVersionInfo) bool {
+	if a.schema != b.schema {
+		return a.schema > b.schema
+	}
+	av, bv := semver.IsValid(a.version), semver.IsValid(b.version)
+	if av != bv {
+		return av // a valid release beats an unparseable version
+	}
+	if !av {
+		return false // both unparseable → neither is "newer"
+	}
+	return semver.Compare(a.version, b.version) > 0
+}
+
+// versionNewer reports whether a is a strictly-newer valid semver than b. Both must
+// be parseable — an unparseable version (dev / git-describe ephemeral) is never
+// treated as newer, so a lone dev box can't drag the fleet onto an un-orderable build.
+func versionNewer(a, b string) bool {
+	return semver.IsValid(a) && semver.IsValid(b) && semver.Compare(a, b) > 0
 }
 
 // pingPeerVersion returns a peer's live (version, schema) via Ping.

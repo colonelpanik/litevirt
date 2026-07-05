@@ -3,55 +3,54 @@ package grpcapi
 import (
 	"context"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// TestIdempotency_ReplayStoreConflict covers the full dedup decision: store a
-// response, replay it, reject a same-key-different-payload (409), and re-execute
-// once expired.
-func TestIdempotency_ReplayStoreConflict(t *testing.T) {
+// TestIdempotency_ClaimReplayConflictInProgress covers the full claim protocol:
+// claim → in-progress on a concurrent retry → replay after completion → 409 on a
+// different payload → re-claimable after release.
+func TestIdempotency_ClaimReplayConflictInProgress(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	req := &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "vm1"}, IdempotencyKey: "key-1"}
 	h := idempotencyRequestHash(req)
 
-	// No record yet → proceed (replay nil, no error).
-	if replay, err := s.idempotencyReplay(ctx, "key-1", "CreateVM", h); err != nil || replay != nil {
-		t.Fatalf("first call = %v, %v; want proceed", replay, err)
+	// First call claims → proceed.
+	if replay, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h); err != nil || replay != nil {
+		t.Fatalf("first begin = %v,%v; want claim (nil,nil)", replay, err)
+	}
+	// A concurrent retry (claim held, not yet finished) → Aborted (retryable), NOT proceed.
+	if _, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h); status.Code(err) != codes.Aborted {
+		t.Errorf("concurrent begin = %v; want Aborted (in progress)", err)
+	}
+	// Different payload, same key → 409 even while in progress.
+	if _, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", "other-hash"); status.Code(err) != codes.AlreadyExists {
+		t.Errorf("different-payload begin = %v; want AlreadyExists", err)
 	}
 
-	// Record a completed response, then a retry with the same key+payload replays it.
-	orig := &pb.VM{Name: "vm1", State: pb.VMState_VM_RUNNING}
-	s.idempotencyStore(ctx, "key-1", "CreateVM", h, orig)
-	replay, err := s.idempotencyReplay(ctx, "key-1", "CreateVM", h)
+	// Finish successfully → a later retry replays the stored response.
+	s.idempotencyFinish(ctx, "key-1", &pb.VM{Name: "vm1", State: pb.VMState_VM_RUNNING}, nil)
+	replay, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h)
 	if err != nil || replay == nil {
-		t.Fatalf("retry replay = %v, %v; want the stored response", replay, err)
+		t.Fatalf("post-finish begin = %v,%v; want replay", replay, err)
 	}
 	out := &pb.VM{}
-	if perr := proto.Unmarshal(replay, out); perr != nil || out.Name != "vm1" || out.State != pb.VMState_VM_RUNNING {
-		t.Errorf("replayed response = %+v (%v), want vm1/RUNNING", out, perr)
+	if proto.Unmarshal(replay, out) != nil || out.Name != "vm1" || out.State != pb.VMState_VM_RUNNING {
+		t.Errorf("replayed = %+v, want vm1/RUNNING", out)
 	}
 
-	// Same key, DIFFERENT payload → 409 AlreadyExists.
-	_, cErr := s.idempotencyReplay(ctx, "key-1", "CreateVM", "different-hash")
-	if status.Code(cErr) != codes.AlreadyExists {
-		t.Errorf("key reuse with a different payload = %v; want AlreadyExists", cErr)
+	// A failed op releases its claim → the key is claimable again.
+	if replay, err := s.idempotencyBegin(ctx, "key-2", "CreateVM", h); err != nil || replay != nil {
+		t.Fatalf("claim key-2: %v,%v", replay, err)
 	}
-
-	// An expired record → treated as absent (re-execute).
-	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
-	_ = corrosion.PutIdempotencyRecord(ctx, s.db, corrosion.IdempotencyRecord{
-		Key: "key-exp", Method: "CreateVM", RequestHash: h, Response: "x", ExpiresAt: past,
-	})
-	if replay, err := s.idempotencyReplay(ctx, "key-exp", "CreateVM", h); err != nil || replay != nil {
-		t.Errorf("expired record = %v, %v; want proceed (nil,nil)", replay, err)
+	s.idempotencyFinish(ctx, "key-2", nil, status.Error(codes.Internal, "boom"))
+	if replay, err := s.idempotencyBegin(ctx, "key-2", "CreateVM", h); err != nil || replay != nil {
+		t.Errorf("after a failed op, key-2 must be re-claimable; got %v,%v", replay, err)
 	}
 }
 
@@ -59,10 +58,7 @@ func TestIdempotency_ReplayStoreConflict(t *testing.T) {
 // identical requests hash apart (which would spuriously 409 a legitimate retry).
 func TestIdempotencyRequestHash_Deterministic(t *testing.T) {
 	mk := func() *pb.CreateContainerRequest {
-		return &pb.CreateContainerRequest{
-			Name:   "ct1",
-			Labels: map[string]string{"a": "1", "b": "2", "c": "3"},
-		}
+		return &pb.CreateContainerRequest{Name: "ct1", Labels: map[string]string{"a": "1", "b": "2", "c": "3"}}
 	}
 	if idempotencyRequestHash(mk()) != idempotencyRequestHash(mk()) {
 		t.Error("identical requests (with a map field) must hash identically")

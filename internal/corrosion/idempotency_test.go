@@ -6,35 +6,71 @@ import (
 	"time"
 )
 
-func TestIdempotencyRecord_PutGetFirstWriterWins(t *testing.T) {
+func TestClaimIdempotencyKey_ClaimReplayInProgress(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
 
-	if err := PutIdempotencyRecord(ctx, c, IdempotencyRecord{
-		Key: "k1", Method: "CreateVM", RequestHash: "h1", Response: "resp-A", ExpiresAt: future,
-	}); err != nil {
-		t.Fatalf("Put: %v", err)
+	// First claim succeeds.
+	claimed, existing, err := ClaimIdempotencyKey(ctx, c, "k1", "CreateVM", "h1", future)
+	if err != nil || !claimed || existing != nil {
+		t.Fatalf("first claim = %v,%v,%v; want claimed", claimed, existing, err)
 	}
-	// Second write with the same key must NOT overwrite (first writer wins).
-	if err := PutIdempotencyRecord(ctx, c, IdempotencyRecord{
-		Key: "k1", Method: "CreateVM", RequestHash: "h1", Response: "resp-B", ExpiresAt: future,
-	}); err != nil {
-		t.Fatalf("Put 2: %v", err)
+	// A concurrent claim (still in_progress) does NOT acquire and reports the live claim.
+	claimed, existing, err = ClaimIdempotencyKey(ctx, c, "k1", "CreateVM", "h1", future)
+	if err != nil || claimed || existing == nil {
+		t.Fatalf("second claim = %v,%v,%v; want not-claimed + existing", claimed, existing, err)
 	}
-	got, err := GetIdempotencyRecord(ctx, c, "k1")
-	if err != nil || got == nil {
-		t.Fatalf("Get: %v, %v", got, err)
+	if existing.Status != IdempotencyInProgress {
+		t.Errorf("status = %q, want in_progress", existing.Status)
 	}
-	if got.Response != "resp-A" {
-		t.Errorf("response = %q, want the original resp-A (first writer wins)", got.Response)
+	// Complete it; a later claim now sees the completed record + response.
+	if err := CompleteIdempotencyKey(ctx, c, "k1", "resp-A", future); err != nil {
+		t.Fatalf("complete: %v", err)
 	}
-	if got.Method != "CreateVM" || got.RequestHash != "h1" {
-		t.Errorf("unexpected record: %+v", got)
+	_, existing, _ = ClaimIdempotencyKey(ctx, c, "k1", "CreateVM", "h1", future)
+	if existing == nil || existing.Status != IdempotencyCompleted || existing.Response != "resp-A" {
+		t.Errorf("after complete = %+v; want completed/resp-A", existing)
 	}
-	// Absent key → nil, no error.
-	if r, err := GetIdempotencyRecord(ctx, c, "nope"); err != nil || r != nil {
-		t.Errorf("absent key = %v, %v; want nil, nil", r, err)
+}
+
+func TestClaimIdempotencyKey_ReleaseAndReclaim(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+
+	if claimed, _, _ := ClaimIdempotencyKey(ctx, c, "k", "m", "h", future); !claimed {
+		t.Fatal("initial claim should succeed")
+	}
+	// Release the in-progress claim (op failed) → the key is claimable again.
+	if err := ReleaseIdempotencyKey(ctx, c, "k"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if claimed, _, _ := ClaimIdempotencyKey(ctx, c, "k", "m", "h", future); !claimed {
+		t.Error("after release, the key must be re-claimable")
+	}
+	// Release must NOT delete a completed record.
+	_ = CompleteIdempotencyKey(ctx, c, "k", "done", future)
+	_ = ReleaseIdempotencyKey(ctx, c, "k")
+	if rec, _ := GetIdempotencyRecord(ctx, c, "k"); rec == nil || rec.Status != IdempotencyCompleted {
+		t.Error("release must not remove a completed record")
+	}
+}
+
+func TestClaimIdempotencyKey_StealsExpired(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+
+	// A crashed in-progress claim whose lease has lapsed...
+	if claimed, _, _ := ClaimIdempotencyKey(ctx, c, "k", "m", "h", past); !claimed {
+		t.Fatal("seed claim")
+	}
+	// ...is stolen by the next claimant rather than blocking it.
+	claimed, existing, err := ClaimIdempotencyKey(ctx, c, "k", "m", "h", future)
+	if err != nil || !claimed || existing != nil {
+		t.Fatalf("expired claim should be stealable: %v,%v,%v", claimed, existing, err)
 	}
 }
 
@@ -43,20 +79,14 @@ func TestReapExpiredIdempotencyKeys(t *testing.T) {
 	ctx := context.Background()
 	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
 	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
-	_ = PutIdempotencyRecord(ctx, c, IdempotencyRecord{Key: "old", Method: "m", RequestHash: "h", ExpiresAt: past})
-	_ = PutIdempotencyRecord(ctx, c, IdempotencyRecord{Key: "new", Method: "m", RequestHash: "h", ExpiresAt: future})
+	_, _, _ = ClaimIdempotencyKey(ctx, c, "old", "m", "h", past)
+	_, _, _ = ClaimIdempotencyKey(ctx, c, "new", "m", "h", future)
 
 	n, err := ReapExpiredIdempotencyKeys(ctx, c)
-	if err != nil {
-		t.Fatalf("reap: %v", err)
+	if err != nil || n != 1 {
+		t.Fatalf("reap = %d,%v; want 1 (only the expired record)", n, err)
 	}
-	if n != 1 {
-		t.Errorf("reaped %d, want 1 (only the expired record)", n)
-	}
-	if r, _ := GetIdempotencyRecord(ctx, c, "old"); r != nil {
-		t.Error("expired record should be gone")
-	}
-	if r, _ := GetIdempotencyRecord(ctx, c, "new"); r == nil {
+	if rec, _ := GetIdempotencyRecord(ctx, c, "new"); rec == nil {
 		t.Error("unexpired record must survive")
 	}
 }

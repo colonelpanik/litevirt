@@ -87,19 +87,18 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// finds the record and replays. Recording is idempotent (first writer wins).
 	if req.IdempotencyKey != "" {
 		reqHash := idempotencyRequestHash(req)
-		if replay, err := s.idempotencyReplay(ctx, req.IdempotencyKey, "CreateVM", reqHash); err != nil {
-			return nil, err
-		} else if replay != nil {
-			out := &pb.VM{}
-			if proto.Unmarshal(replay, out) == nil {
-				return out, nil
-			}
+		replay, ierr := s.idempotencyBegin(ctx, req.IdempotencyKey, "CreateVM", reqHash)
+		if ierr != nil {
+			return nil, ierr
 		}
-		defer func() {
-			if retErr == nil && resp != nil {
-				s.idempotencyStore(ctx, req.IdempotencyKey, "CreateVM", reqHash, resp)
+		if replay != nil {
+			out := &pb.VM{}
+			if proto.Unmarshal(replay, out) != nil {
+				return nil, status.Error(codes.Internal, "corrupt idempotency record")
 			}
-		}()
+			return out, nil
+		}
+		defer func() { s.idempotencyFinish(ctx, req.IdempotencyKey, resp, retErr) }()
 	}
 	// F3: defining a lifecycle hook = the ability to run an arbitrary root
 	// shell command on whatever host the VM lands on (hooks.Run shells out to

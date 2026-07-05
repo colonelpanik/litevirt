@@ -75,19 +75,18 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// on success across all return paths.
 	if req.IdempotencyKey != "" {
 		reqHash := idempotencyRequestHash(req)
-		if replay, err := s.idempotencyReplay(ctx, req.IdempotencyKey, "CreateContainer", reqHash); err != nil {
-			return nil, err
-		} else if replay != nil {
-			out := &pb.Container{}
-			if proto.Unmarshal(replay, out) == nil {
-				return out, nil
-			}
+		replay, ierr := s.idempotencyBegin(ctx, req.IdempotencyKey, "CreateContainer", reqHash)
+		if ierr != nil {
+			return nil, ierr
 		}
-		defer func() {
-			if retErr == nil && resp != nil {
-				s.idempotencyStore(ctx, req.IdempotencyKey, "CreateContainer", reqHash, resp)
+		if replay != nil {
+			out := &pb.Container{}
+			if proto.Unmarshal(replay, out) != nil {
+				return nil, status.Error(codes.Internal, "corrupt idempotency record")
 			}
-		}()
+			return out, nil
+		}
+		defer func() { s.idempotencyFinish(ctx, req.IdempotencyKey, resp, retErr) }()
 	}
 	if forwarded, err := s.forwardCreateContainer(ctx, req); err != nil || forwarded != nil {
 		return forwarded, err

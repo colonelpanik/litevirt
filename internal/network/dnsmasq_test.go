@@ -46,6 +46,43 @@ func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 	}
 }
 
+// TestCmdlineMatchesArgs covers the drift check that decides whether a running
+// dnsmasq must be restarted to pick up new args (e.g. the embedded-DNS
+// --server= forward added on upgrade).
+func TestCmdlineMatchesArgs(t *testing.T) {
+	want := dnsmasqArgs("br0", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
+		"/run/lv-br0.pid", []string{"8.8.8.8"}, "litevirt.local", 5354)
+
+	// A cmdline built from exactly these args (argv[0] + args, NUL-joined, any
+	// order) is considered current — no restart.
+	blob := func(argv0 string, args []string) []byte {
+		return []byte(strings.Join(append([]string{argv0}, args...), "\x00"))
+	}
+	if !cmdlineMatchesArgs(blob("dnsmasq", want), want) {
+		t.Error("identical arg set must be reported current")
+	}
+	// Order must not matter.
+	shuffled := append([]string(nil), want...)
+	shuffled[0], shuffled[len(shuffled)-1] = shuffled[len(shuffled)-1], shuffled[0]
+	if !cmdlineMatchesArgs(blob("dnsmasq", shuffled), want) {
+		t.Error("reordered arg set must still be current")
+	}
+	// The load-bearing case: a dnsmasq started BEFORE the local resolver was
+	// configured lacks the --server=/domain/ forward → must be flagged stale.
+	stale := dnsmasqArgs("br0", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
+		"/run/lv-br0.pid", []string{"8.8.8.8"}, "", 0)
+	if cmdlineMatchesArgs(blob("dnsmasq", stale), want) {
+		t.Error("a cmdline missing the embedded-DNS forward must be flagged stale")
+	}
+	// An empty / unreadable cmdline defaults to current (no spurious restart).
+	if !cmdlineMatchesArgs(nil, want) {
+		t.Error("empty cmdline must default to current")
+	}
+	if !cmdlineMatchesArgs([]byte("dnsmasq"), want) {
+		t.Error("argv0-only cmdline must default to current")
+	}
+}
+
 // TestDnsmasqArgs_V6EnablesRA confirms an IPv6 gateway turns on router
 // advertisements (and still excludes loopback).
 func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {

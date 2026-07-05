@@ -109,24 +109,35 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 		return fmt.Errorf("assign gateway to %s: %w: %s", bridge, err, out)
 	}
 
-	// If dnsmasq is already running for this bridge, leave it alone.
-	// Re-provisioning (e.g., during VM creation) should not restart a
-	// healthy DHCP server — doing so creates a window where no DHCP is
-	// available and can cause VMs to miss their lease.
+	// Resolve upstream DNS servers from the host's /etc/resolv.conf and build the
+	// arg set we'd launch with NOW. Computed before the already-running check so we
+	// can detect config drift against the live process.
+	upstreamDNS := resolveUpstreamDNS()
+	desiredArgs := dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile, upstreamDNS, localResolverDomain, localResolverPort)
+
+	// If dnsmasq is already running for this bridge, leave it alone — UNLESS its
+	// live command line has drifted from what we'd launch now. Re-provisioning
+	// (e.g. during VM creation) must not bounce a healthy DHCP server for no
+	// reason: that opens a window with no DHCP and can cost a VM its lease. But a
+	// stale process — most importantly one started before the embedded-DNS
+	// resolver was configured (so it lacks the --server=/<domain>/ forward and
+	// guests can't resolve litevirt names) — must be replaced. The desired args
+	// are compared against /proc/<pid>/cmdline so the decision survives a daemon
+	// re-exec with no in-memory state.
 	if pid := readPidFile(pidFile); pid > 0 && processRunning(pid) {
-		slog.Debug("dnsmasq already running", "bridge", bridge, "pid", pid)
-		return nil
+		if dnsmasqArgsCurrent(pid, desiredArgs) {
+			slog.Debug("dnsmasq already running", "bridge", bridge, "pid", pid)
+			return nil
+		}
+		slog.Info("dnsmasq config drifted; restarting to apply new args", "bridge", bridge, "pid", pid)
+		_ = StopDHCP(pidFile)
 	}
 
 	// Ensure the lease directory exists (it doubles as the IP scanner's read
 	// path). libvirt usually creates it, but a KVM-less / fresh host may not.
 	os.MkdirAll(dnsmasqLeaseDir, 0o755) //nolint:errcheck
 
-	// Resolve upstream DNS servers from the host's /etc/resolv.conf.
-	// dnsmasq will forward DNS queries from guests to these servers.
-	upstreamDNS := resolveUpstreamDNS()
-
-	cmd := exec.Command("dnsmasq", dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile, upstreamDNS, localResolverDomain, localResolverPort)...)
+	cmd := exec.Command("dnsmasq", desiredArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -183,6 +194,50 @@ func readPidFile(path string) int {
 // processRunning checks if a process with the given PID is alive.
 func processRunning(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
+}
+
+// dnsmasqArgsCurrent reports whether the live dnsmasq process `pid` was started
+// with the same argument SET as `want`. It reads /proc/<pid>/cmdline, so the
+// answer survives a daemon re-exec (no in-memory state). On any read/parse
+// failure it returns true (assume current) so a transient error can't force a
+// needless restart and DHCP gap.
+func dnsmasqArgsCurrent(pid int, want []string) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return true
+	}
+	return cmdlineMatchesArgs(data, want)
+}
+
+// cmdlineMatchesArgs compares a raw /proc/<pid>/cmdline blob (NUL-separated,
+// argv[0] first) against a desired dnsmasq arg set, order-insensitive. A blob
+// with no args (≤1 field) is treated as matching so a read race can't trigger a
+// restart.
+func cmdlineMatchesArgs(cmdline []byte, want []string) bool {
+	fields := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+	if len(fields) <= 1 {
+		return true
+	}
+	return sameStringSet(fields[1:], want) // drop argv[0]
+}
+
+// sameStringSet reports whether two arg slices contain the same multiset of
+// strings, ignoring order (dnsmasq doesn't care about flag order).
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, s := range a {
+		counts[s]++
+	}
+	for _, s := range b {
+		counts[s]--
+		if counts[s] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // StopDHCP kills the dnsmasq instance for a bridge. It first SIGTERMs the PID

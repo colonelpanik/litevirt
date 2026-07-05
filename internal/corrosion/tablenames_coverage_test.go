@@ -33,7 +33,7 @@ var antiEntropyExcluded = map[string]string{
 	"replication_watermarks": "per-node replication progress",
 	"mutation_seen":          "per-node relay-dedup table",
 	"host_runtime_usage":     "per-host runtime telemetry (disk_iops/net_mbps); replicates via the WAL/mutation_log but is excluded from full-state anti-entropy — stale telemetry self-corrects on the next sample (cf. vm_events), so it needn't be repaired and shouldn't bloat the digest/dump",
-	"idempotency_keys":       "ephemeral request-dedup records (v39); replicate via the WAL for cross-node dedup but are TTL-reaped, so they needn't be full-state anti-entropy-repaired",
+	"idempotency_keys":       "ephemeral request-dedup records (v39); LOCAL-only (owned by the entry node, never replicated), so no anti-entropy repair applies — see localOnly",
 	// (user_2fa, recovery_codes, recovery_code_sets are now in sensitiveTableNames
 	//  — schema v32 made them LWW-repairable: soft-delete + active-set pointer.)
 }
@@ -42,7 +42,8 @@ var antiEntropyExcluded = map[string]string{
 // DB access, not the replicating Execute path). The updated_at→primary-key
 // invariant below doesn't apply to them.
 var localOnly = map[string]bool{
-	"schema_state": true, // per-node schema version, set during InitSchema/migrate
+	"schema_state":     true, // per-node schema version, set during InitSchema/migrate
+	"idempotency_keys": true, // v39: entry-node-owned request dedup; execLocal writes, never replicated
 }
 
 var createTableRe = regexp.MustCompile(`CREATE TABLE IF NOT EXISTS ([a-z_0-9]+)`)

@@ -1234,12 +1234,15 @@ var schemaDDL = []string{
 	// idempotency_keys (v39): records a mutating RPC keyed by a client-supplied
 	// idempotency key. It is claimed in_progress (with an opaque claim_id owner
 	// token) BEFORE side effects, then completed with the response, so a
-	// lost-response retry replays the stored response instead of executing twice.
-	// claim_id gates complete/release/extend so a stale owner whose claim was
-	// stolen after its lease lapsed can't mutate the newer claim. request_hash
-	// detects key reuse with a different payload (→ 409). WAL-replicated (a retry
-	// to any node dedups) but anti-entropy-excluded and TTL-reaped via expires_at
-	// — the records are ephemeral (only useful within the retry window).
+	// lost-response retry to the SAME entry node replays the stored response instead
+	// of executing twice. claim_id gates complete/release/extend so a stale owner
+	// whose claim was stolen after its lease lapsed can't mutate the newer claim.
+	// request_hash detects key reuse with a different payload (→ 409). This table is
+	// LOCAL-only (written via execLocal, never replicated): the create RPCs own the
+	// claim on the entry node and strip the key before forwarding, so a mutable
+	// in_progress row never replicates to lose an LWW race against a completed row.
+	// Cross-node dedup falls back to the create name-uniqueness constraint. Records
+	// are ephemeral and TTL-reaped via expires_at.
 	`CREATE TABLE IF NOT EXISTS idempotency_keys (
 		key          TEXT PRIMARY KEY,
 		claim_id     TEXT NOT NULL DEFAULT '',

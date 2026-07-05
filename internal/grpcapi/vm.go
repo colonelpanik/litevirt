@@ -101,7 +101,12 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		stopHB := s.startIdempotencyHeartbeat(ctx, req.IdempotencyKey, claimID)
 		defer func() {
 			stopHB()
-			s.idempotencyFinish(ctx, req.IdempotencyKey, claimID, resp, retErr)
+			// Fail closed: if a successful create's result couldn't be durably
+			// recorded, surface that as the RPC error rather than a success we
+			// can't replay.
+			if ferr := s.idempotencyFinish(ctx, req.IdempotencyKey, claimID, resp, retErr); ferr != nil && retErr == nil {
+				resp, retErr = nil, ferr
+			}
 		}()
 	}
 	// F3: defining a lifecycle hook = the ability to run an arbitrary root
@@ -225,13 +230,23 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", targetHost, err)
 		}
 		defer conn.Close()
-		resp, err := client.CreateVM(ctx, req)
+		// The entry node owns the idempotency claim. Strip the key from the
+		// forwarded copy so the executor does NOT re-enter the idempotency path and
+		// self-conflict on the same key — otherwise the entry's claim either aborts
+		// the forward (if it replicated first) or the executor races a duplicate
+		// claim on the same row.
+		fwd := req
+		if req.IdempotencyKey != "" {
+			fwd = proto.Clone(req).(*pb.CreateVMRequest)
+			fwd.IdempotencyKey = ""
+		}
+		out, err := client.CreateVM(ctx, fwd)
 		if err != nil {
 			return nil, err
 		}
 		// The remote host's mutation_log entry will be replicated to us
 		// via the WAL-based replicator. No need to manually sync.
-		return resp, nil
+		return out, nil
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)

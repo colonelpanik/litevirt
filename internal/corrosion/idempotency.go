@@ -13,10 +13,16 @@ const (
 
 // IdempotencyRecord is a mutating-RPC operation keyed by a client-supplied
 // idempotency key. It is first claimed in_progress (before side effects) and then
-// completed with the response, so both a lost-response retry AND a concurrent
-// duplicate are handled: the first caller claims, a same-node retry sees the claim.
-// Records are ephemeral — they replicate via the WAL for cross-node dedup but are
-// TTL-reaped (ReapExpiredIdempotencyKeys) and excluded from anti-entropy.
+// completed with the response, so a lost-response retry to the SAME entry node
+// replays the result instead of executing twice.
+//
+// The record is LOCAL-only (written via execLocal, never WAL-replicated). The
+// create RPCs claim on the entry node and strip the key before forwarding, so the
+// entry node is the sole owner/reader and a mutable in_progress row can never
+// replicate and lose an LWW race against a completed row on a peer. Cross-node
+// dedup (a retry landing on a different node) is not provided by this table — it
+// falls back to the create name-uniqueness constraint (AlreadyExists). Records are
+// ephemeral and TTL-reaped (ReapExpiredIdempotencyKeys).
 type IdempotencyRecord struct {
 	Key         string
 	ClaimID     string // opaque owner token; complete/release/extend must match it
@@ -71,17 +77,16 @@ func GetIdempotencyRecord(ctx context.Context, c *Client, key string) (*Idempote
 //   - claimed=false, existing   → a live record already exists: completed → replay
 //     its Response; in_progress → the operation is running (elsewhere / concurrently).
 //
-// The claim is a local `INSERT … ON CONFLICT DO NOTHING`, so on a single node it
-// fully serializes concurrent same-key requests (the first claims, the rest see the
-// claim). Cross-node concurrency is narrowed to the WAL-replication window rather
-// than eliminated (a cluster-wide lock would be heavier); creates also have the
-// name-uniqueness backstop. expiresAt is the claim lease — the owner heartbeats it
-// (ExtendIdempotencyClaim) while working, so it only lapses on a genuine crash, and
-// a lapsed claim is stealable.
+// The claim is a local `INSERT … ON CONFLICT DO NOTHING` (execLocal — not
+// replicated), so on the owning node it fully serializes concurrent same-key
+// requests (the first claims, the rest see the claim). The create RPCs additionally
+// have the name-uniqueness backstop for cross-node concurrency. expiresAt is the
+// claim lease — the owner heartbeats it (ExtendIdempotencyClaim) while working, so
+// it only lapses on a genuine crash, and a lapsed claim is stealable.
 func ClaimIdempotencyKey(ctx context.Context, c *Client, key, claimID, method, reqHash, expiresAt string) (claimed bool, existing *IdempotencyRecord, err error) {
 	now := c.NowTS()
 	insert := func() (int64, error) {
-		return c.ExecuteRows(ctx,
+		return c.execLocalRows(ctx,
 			`INSERT INTO idempotency_keys (key, claim_id, method, request_hash, response, status, created_at, updated_at, expires_at)
 			 VALUES (?, ?, ?, ?, '', ?, ?, ?, ?) ON CONFLICT(key) DO NOTHING`,
 			key, claimID, method, reqHash, IdempotencyInProgress, now, now, expiresAt)
@@ -113,7 +118,7 @@ func ClaimIdempotencyKey(ctx context.Context, c *Client, key, claimID, method, r
 	// stealers can't both win — the loser's insert conflicts and it reports the
 	// winner's record instead.
 	if idempotencyRecordExpired(rec) {
-		if _, derr := c.ExecuteRows(ctx,
+		if _, derr := c.execLocalRows(ctx,
 			`DELETE FROM idempotency_keys WHERE key = ? AND expires_at = ?`, key, rec.ExpiresAt); derr == nil {
 			if n, ierr := insert(); ierr == nil && n > 0 {
 				return true, nil, nil
@@ -129,7 +134,7 @@ func ClaimIdempotencyKey(ctx context.Context, c *Client, key, claimID, method, r
 // out to expiresAt (the heartbeat). ok=false means we no longer own it — the row is
 // gone or was stolen (a newer claim_id) — so the caller should stop heartbeating.
 func ExtendIdempotencyClaim(ctx context.Context, c *Client, key, claimID, expiresAt string) (ok bool, err error) {
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.execLocalRows(ctx,
 		`UPDATE idempotency_keys SET expires_at = ?, updated_at = ?
 		 WHERE key = ? AND claim_id = ? AND status = ?`,
 		expiresAt, c.NowTS(), key, claimID, IdempotencyInProgress)
@@ -142,7 +147,7 @@ func ExtendIdempotencyClaim(ctx context.Context, c *Client, key, claimID, expire
 // newer claim. ok=false means our claim was stolen/gone — the caller lost the race
 // and must not treat completion as recorded.
 func CompleteIdempotencyKey(ctx context.Context, c *Client, key, claimID, responseB64, expiresAt string) (ok bool, err error) {
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.execLocalRows(ctx,
 		`UPDATE idempotency_keys SET status = ?, response = ?, expires_at = ?, updated_at = ?
 		 WHERE key = ? AND claim_id = ? AND status = ?`,
 		IdempotencyCompleted, responseB64, expiresAt, c.NowTS(), key, claimID, IdempotencyInProgress)
@@ -153,17 +158,16 @@ func CompleteIdempotencyKey(ctx context.Context, c *Client, key, claimID, respon
 // can proceed after a failed operation. Matches on claim_id (a stale owner can't
 // delete a newer claim) and never removes a completed record.
 func ReleaseIdempotencyKey(ctx context.Context, c *Client, key, claimID string) error {
-	return c.Execute(ctx,
+	return c.execLocal(ctx,
 		`DELETE FROM idempotency_keys WHERE key = ? AND claim_id = ? AND status = ?`,
 		key, claimID, IdempotencyInProgress)
 }
 
 // ReapExpiredIdempotencyKeys deletes records past their TTL (completed past the
 // replay window, or crashed in-progress claims). Called from the periodic GC
-// sweep. A lagging peer can't resurrect a useful record: an expired row is
-// reclaimable/ignored anyway, so a plain local delete is safe.
+// sweep. Local-only, like the rest of the table's writes.
 func ReapExpiredIdempotencyKeys(ctx context.Context, c *Client) (int64, error) {
-	return c.ExecuteRows(ctx,
+	return c.execLocalRows(ctx,
 		`DELETE FROM idempotency_keys WHERE expires_at < ?`,
 		time.Now().UTC().Format(time.RFC3339Nano))
 }

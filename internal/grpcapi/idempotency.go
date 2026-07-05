@@ -126,45 +126,58 @@ func (s *Server) startIdempotencyHeartbeat(ctx context.Context, key, claimID str
 // claimID, so if our claim was stolen (we lost the race) it no-ops rather than
 // clobbering the new owner's record.
 //
-// Completion is written synchronously with bounded retries BEFORE the RPC returns:
-// if it isn't persisted the record stays in_progress, lapses, and could be
-// stolen/re-run — so a transient store blip must not skip it. It uses a context
-// detached from the RPC's cancellation (the client may have hung up, but the
-// outcome must still be recorded). Only after exhausting retries do we give up and
-// log; the create name-uniqueness constraint is the last-resort backstop against an
-// actual double create.
-func (s *Server) idempotencyFinish(ctx context.Context, key, claimID string, resp proto.Message, retErr error) {
+// It is FAIL-CLOSED and returns an error the caller MUST fold into the RPC result:
+// completion is written synchronously (with bounded retries, on a context detached
+// from the caller's cancellation) BEFORE the RPC returns. If it can't be persisted,
+// or our claim was stolen mid-op, we do NOT report a clean success — a recorded
+// result is part of the guarantee. The claim is then released best-effort so a
+// retry re-runs and resolves via the create name-uniqueness constraint
+// (AlreadyExists) rather than sitting in Aborted limbo until the lease lapses.
+//
+// The returned error is only meaningful on the success path (retErr == nil): when
+// the op itself already failed, the claim is released and nil is returned so the
+// original failure stands.
+func (s *Server) idempotencyFinish(ctx context.Context, key, claimID string, resp proto.Message, retErr error) error {
 	if claimID == "" {
-		return // no claim held (replay path, or no key)
+		return nil // no claim held (replay path, or no key)
 	}
 	fctx := context.WithoutCancel(ctx)
 	if retErr != nil || resp == nil {
 		_ = corrosion.ReleaseIdempotencyKey(fctx, s.db, key, claimID)
-		return
+		return nil // the op already failed; its own error stands
 	}
 	b, err := proto.Marshal(resp)
 	if err != nil {
 		_ = corrosion.ReleaseIdempotencyKey(fctx, s.db, key, claimID)
-		return
+		return status.Error(codes.Internal, "could not encode idempotent result")
 	}
 	respB64 := base64.StdEncoding.EncodeToString(b)
 	expires := time.Now().Add(idempotencyReplayTTL).UTC().Format(time.RFC3339Nano)
 	var lastErr error
 	for attempt := 0; attempt < idempotencyCompleteAttempts; attempt++ {
-		// A nil error means completion is settled: either it persisted, or our claim
-		// was already stolen (ok==false) and the new owner has the key now — nothing
-		// more to record either way.
-		_, cerr := corrosion.CompleteIdempotencyKey(fctx, s.db, key, claimID, respB64, expires)
+		ok, cerr := corrosion.CompleteIdempotencyKey(fctx, s.db, key, claimID, respB64, expires)
 		if cerr == nil {
-			return
+			if ok {
+				return nil // recorded — clean success
+			}
+			// Our claim was reclaimed mid-op: another actor owns the key now, so we
+			// can't vouch that THIS result is what will replay. Fail closed.
+			slog.Warn("idempotency: claim reclaimed before completion", "key", key)
+			return status.Error(codes.Aborted, "idempotency claim was reclaimed mid-operation; retry")
 		}
 		lastErr = cerr
 		select {
 		case <-fctx.Done():
-			return
+			lastErr = fctx.Err()
 		case <-time.After(idempotencyCompleteBackoff):
+			continue
 		}
+		break
 	}
-	slog.Error("idempotency: could not record completion; a later retry may re-run",
-		"key", key, "error", lastErr)
+	// Result isn't durably recorded. Release best-effort so a retry re-runs (and
+	// hits the name-uniqueness backstop) instead of getting Aborted until the lease
+	// lapses, and fail closed rather than returning a success we can't replay.
+	_ = corrosion.ReleaseIdempotencyKey(fctx, s.db, key, claimID)
+	slog.Error("idempotency: could not record completion; failing closed", "key", key, "error", lastErr)
+	return status.Error(codes.Unavailable, "operation completed but its result could not be recorded; retry")
 }

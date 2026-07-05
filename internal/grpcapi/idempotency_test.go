@@ -9,7 +9,30 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// TestIdempotencyFinish_FailsClosedWhenClaimLost proves a successful op whose
+// completion can't be durably recorded (the claim vanished / was reclaimed) is
+// reported as an error, not a clean success we can't replay.
+func TestIdempotencyFinish_FailsClosedWhenClaimLost(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	req := &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "vmx"}, IdempotencyKey: "kx"}
+	h := idempotencyRequestHash(req)
+
+	_, claimID, err := s.idempotencyBegin(ctx, "kx", "CreateVM", h)
+	if err != nil || claimID == "" {
+		t.Fatalf("claim: %q,%v", claimID, err)
+	}
+	// The claim disappears out from under us (crash-reclaim / reap / steal).
+	if err := corrosion.ReleaseIdempotencyKey(ctx, s.db, "kx", claimID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if ferr := s.idempotencyFinish(ctx, "kx", claimID, &pb.VM{Name: "vmx"}, nil); status.Code(ferr) != codes.Aborted {
+		t.Errorf("finish after a lost claim = %v; want Aborted (fail closed)", ferr)
+	}
+}
 
 // TestIdempotency_ClaimReplayConflictInProgress covers the full claim protocol:
 // claim → in-progress on a concurrent retry → replay after completion → 409 on a

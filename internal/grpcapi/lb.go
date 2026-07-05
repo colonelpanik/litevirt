@@ -1361,6 +1361,19 @@ func (s *Server) removeLBLocal(ctx context.Context, name string) error {
 	return err
 }
 
+// lbApplyHosts parses a stored LB hosts JSON array and normalizes the empty case
+// to self. A standalone explicit LB is persisted with hosts=[] but runs on the
+// node that handled its create; apply/forward/intent-refresh on update must target
+// this host too rather than treating [] as "runs nowhere".
+func lbApplyHosts(hostsJSON, self string) []string {
+	var hosts []string
+	_ = json.Unmarshal([]byte(hostsJSON), &hosts)
+	if len(hosts) == 0 {
+		return []string{self}
+	}
+	return hosts
+}
+
 func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest) (*pb.LoadBalancer, error) {
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
@@ -1551,8 +1564,11 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	}
 
 	vipIP, vipPrefix, _ := lb.ParseVIP(vip)
-	var lbHosts []string
-	json.Unmarshal([]byte(hostsStr), &lbHosts)
+	// A standalone explicit LB is created with an empty hosts list but runs on the
+	// handling node (CreateLoadBalancer defaults []→[self]). Normalize the same way
+	// on update, or the local apply loop is skipped for that shape — leaving
+	// HAProxy/keepalived unreloaded AND the LB firewall intent (VIP/ports/SNAT) stale.
+	lbHosts := lbApplyHosts(hostsStr, s.hostName)
 
 	// Apply locally.
 	for _, h := range lbHosts {

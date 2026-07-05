@@ -53,6 +53,29 @@ Rules are evaluated top-to-bottom inside the kernel forward chain:
 Each chain is a regular nftables chain; the forward chain hooks the
 netfilter forward path and `jump`s into the three tiers in order.
 
+## NAT, SNAT and host isolation
+
+The same renderer also emits the host's network-infra rules into the
+`litevirt-fw` table, so a single atomic replace covers filtering **and**
+NAT/isolation (there is no separate `inet litevirt` table or out-of-band
+iptables any more):
+
+- **Masquerade** — a `postrouting` nat chain SNATs managed-subnet guest egress
+  out the host's uplink (`ip saddr <subnet> oifname != <bridge> masquerade`).
+- **SNAT** — a load balancer on a host-isolated network rewrites guest egress to
+  its VIP (`oifname <uplink> ip saddr <subnet> snat to <vip>`), emitted before
+  masquerade.
+- **Host isolation** — an `input` chain drops guest→host traffic per isolated
+  bridge (`iifname <bridge> drop`), punching through VRRP + declared LB VIP ports
+  first so guests can still reach an HAProxy VIP.
+
+These decisions are made by network provisioning and the LB apply path and
+recorded per host in `host_fw_intent`; the reconciler reads that table and
+renders the chains. Because rules are per-host local state, the table is not
+replicated. On upgrade, once a bridge's rules are live in `litevirt-fw` the
+reconciler clears the pre-consolidation rules a prior binary left behind, so
+there is never a window without NAT or isolation.
+
 ## Stateful conntrack baked in
 
 Every chain begins with:

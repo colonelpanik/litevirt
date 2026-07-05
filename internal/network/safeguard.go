@@ -203,7 +203,7 @@ func SafeProvision(ctx context.Context, db *corrosion.Client, networkName string
 		"network", networkName, "failures", consecutiveFailures)
 
 	// Deprovision what we just created.
-	if depErr := Deprovision(networkName, def); depErr != nil {
+	if depErr := Deprovision(ctx, db, networkName, def, hostName); depErr != nil {
 		slog.Error("network safeguard: deprovision failed during rollback",
 			"network", networkName, "error", depErr)
 	}

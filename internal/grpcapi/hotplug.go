@@ -227,6 +227,11 @@ func (s *Server) attachNIC(ctx context.Context, vmName string, spec *pb.NetworkA
 			localIP := getLocalIP()
 			if _, err := network.SafeProvision(ctx, s.db, spec.Name, def, localIP, s.hostName); err != nil {
 				slog.Warn("attachNIC: failed to provision network locally", "network", spec.Name, "error", err)
+			} else if ferr := s.reconcileFirewallRequired(ctx); ferr != nil {
+				// Fail closed: don't attach a NIC onto a host-isolated network whose
+				// isolation drop hasn't applied (fail-open host reachability).
+				return nil, status.Errorf(codes.Internal,
+					"apply firewall after provisioning network %q: %v", spec.Name, ferr)
 			}
 		}
 	}

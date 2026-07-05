@@ -636,7 +636,16 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	// the new generation: a recreate bulk-tombstones any prior backends and
 	// re-stamps the survivors, so the persistent model is never left half-written
 	// for the DB-render reapply to act on (was warn-only per-row before).
-	hostsJSON, _ := json.Marshal(req.Hosts)
+	// Persist a DURABLE holder: an explicit LB created with no hosts still runs on
+	// this node, so record [s.hostName] rather than [] — otherwise a later
+	// update/reapply can't tell WHO holds the VIP and could double-serve it from
+	// another node (a stack LB, which derives membership from its VMs, is created
+	// via the stack path, not here).
+	targetHosts := req.Hosts
+	if len(targetHosts) == 0 {
+		targetHosts = []string{s.hostName}
+	}
+	hostsJSON, _ := json.Marshal(targetHosts)
 	portsJSON, _ := json.Marshal(req.Ports)
 	if err := corrosion.PersistLBFull(ctx, s.db, corrosion.LBConfigRecord{
 		Name:       req.Name,
@@ -660,13 +669,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 		})
 	}
 
-	// Determine LB hosts.
-	targetHosts := req.Hosts
-	if len(targetHosts) == 0 {
-		targetHosts = []string{s.hostName}
-	}
-
-	// Apply locally if this host is a target.
+	// Apply locally if this host is a target (targetHosts resolved above).
 	for _, h := range targetHosts {
 		if h == s.hostName {
 			priority := 50
@@ -696,6 +699,10 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 				return nil, status.Errorf(codes.Internal,
 					"load balancer %q provisioning failed on %s: %v", req.Name, s.hostName, err)
 			}
+			// Record firewall intent when the VIP is on a host-isolated network
+			// (VIP:port exceptions + SNAT), same as the stack/peer paths. No-op for
+			// non-isolated networks. snat defaults true (matches the peer ApplyLB path).
+			s.updateIsolationForLB(ctx, req.Name, cfg.Interface, vipIP, ports, true)
 			break
 		}
 	}
@@ -1345,6 +1352,15 @@ func (s *Server) relayedVIPNoClaims(ctx context.Context, target, vip string) boo
 func (s *Server) removeLBLocal(ctx context.Context, name string) error {
 	err := lb.NewManager().Remove(ctx, name)
 	s.clearLBKeepalived(name)
+	// Drop this LB's firewall intent (VIP:port exceptions + SNAT) ONLY once the LB
+	// is confirmed removed. Manager.Remove errors when keepalived can't be confirmed
+	// stopped — the VIP may still be served, so removing its exceptions/SNAT on the
+	// next reconcile would damage a live service. Every local teardown path funnels
+	// through here, so on success a stale lb:<name> row can't linger. Base network
+	// isolation (net:<network>) is untouched either way.
+	if err == nil {
+		_ = corrosion.DeleteHostFWIntent(ctx, s.db, s.hostName, "lb:"+name)
+	}
 	return err
 }
 
@@ -1397,6 +1413,21 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	}
 
 	oldHostsStr := r.String("hosts")
+	// Legacy explicit LB with no recorded holder (pre-durable-holder hosts=[]):
+	// resolve its ORIGINAL holder from the live participants up front — BEFORE the
+	// host/VIP transition logic below — so both the split-brain gate AND the pre-flip
+	// stale-holder cleanup know whom to stand down on a move. Without this, moving a
+	// hosts=[] LB to a new host leaves the old holder's keepalived running (the gate
+	// is inert pre-flip, and the cleanup reads [] and removes nothing). Only a single
+	// proven participant is adopted; if none can be, the pre-persist check below
+	// fails closed. (No refuse here: a colliding-backend edit must still fail with
+	// InvalidArgument first, and that validation runs after the gate.)
+	if r.String("stack_name") == "" && (oldHostsStr == "" || oldHostsStr == "[]") {
+		if participants, ok := s.actualLBParticipants(ctx, req.Name); ok && len(participants) == 1 {
+			h, _ := json.Marshal(participants)
+			oldHostsStr = string(h)
+		}
+	}
 	hostsStr := oldHostsStr
 	if len(req.Hosts) > 0 {
 		h, _ := json.Marshal(req.Hosts)
@@ -1485,6 +1516,17 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		}
 	}
 
+	// Fail closed for a legacy explicit LB whose original holder couldn't be resolved
+	// above (zero or multiple proven participants): every edit needs to apply
+	// somewhere, and a move needs a known old holder to stand down — so refuse rather
+	// than persist a reload-required change with no safe target (or orphan a live
+	// VIP). Placed after backend/name validation so an invalid edit still fails first
+	// with InvalidArgument.
+	if r.String("stack_name") == "" && (oldHostsStr == "" || oldHostsStr == "[]") {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"load balancer %q has no established holder (legacy row): retry once its VIP host is reachable, or re-create it", req.Name)
+	}
+
 	// Persist updated config + backend changes atomically (generation preserved).
 	if err := corrosion.PersistLBIncremental(ctx, s.db, corrosion.LBConfigRecord{
 		Name:       req.Name,
@@ -1538,8 +1580,12 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	}
 
 	vipIP, vipPrefix, _ := lb.ParseVIP(vip)
+	// hosts is the LB's durable holder set — CreateLoadBalancer records a concrete
+	// holder, and a legacy no-holder row was either repaired to its proven
+	// participant above or the update was refused. So the local apply loop runs on
+	// the holder and the forward loop reaches the rest; no []→self guessing.
 	var lbHosts []string
-	json.Unmarshal([]byte(hostsStr), &lbHosts)
+	json.Unmarshal([]byte(hostsStr), &lbHosts) //nolint:errcheck
 
 	// Apply locally.
 	for _, h := range lbHosts {
@@ -1555,6 +1601,11 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			}
 			if err := s.applyLBLocal(ctx, cfg); err != nil {
 				slog.Warn("UpdateLoadBalancer: local apply failed", "error", err)
+			} else {
+				// Refresh firewall intent so a changed VIP/ports updates the
+				// exceptions/SNAT (an upsert on lb:<name>), not leaving the old
+				// holes behind. No-op off host-isolated networks.
+				s.updateIsolationForLB(ctx, req.Name, cfg.Interface, vipIP, ports, true)
 			}
 			break
 		}
@@ -1639,6 +1690,7 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 	if err := s.removeLBLocal(ctx, req.Name); err != nil {
 		slog.Warn("DeleteLoadBalancer: local remove failed", "error", err)
 	}
+	s.reconcileFirewall(ctx) // removeLBLocal dropped the LB intent — restore base isolation now
 
 	// Forward to remote hosts.
 	targetHosts := lbHosts
@@ -2173,7 +2225,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 
 	// Update host-isolation rules if the LB interface is on an isolated bridge.
 	// Internal ApplyLB RPC doesn't carry snat flag; default to true (previous behaviour).
-	s.updateIsolationForLB(ctx, lbIface, vipIP, ports, true)
+	s.updateIsolationForLB(ctx, req.LbName, lbIface, vipIP, ports, true)
 
 	if lbProofID != "" {
 		if err := corrosion.CompleteActionProof(ctx, s.db, lbProofID, s.hostName); err != nil {
@@ -2198,29 +2250,13 @@ func (s *Server) RemoveLB(ctx context.Context, req *pb.RemoveLBRequest) (*emptyp
 		return nil, status.Error(codes.InvalidArgument, "lb_name required")
 	}
 
-	// Before removing, check if the LB was on an isolated bridge so we
-	// can restore base isolation (no LB exceptions) after teardown.
-	rows, _ := s.db.Query(ctx,
-		`SELECT vip FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, req.LbName)
-	var lbVIP string
-	if len(rows) > 0 {
-		lbVIP = rows[0].String("vip")
-	}
-
 	if err := s.removeLBLocal(ctx, req.LbName); err != nil {
 		return nil, status.Errorf(codes.Internal, "remove LB: %v", err)
 	}
-
-	// Restore base isolation (drop all, no LB exceptions) + remove SNAT.
-	if lbVIP != "" {
-		vipIP, _, _ := lb.ParseVIP(lbVIP)
-		lbIface := lb.DetectInterfaceForIP(vipIP)
-		netDef, _ := s.findIsolatedNetworkForBridge(ctx, lbIface)
-		if netDef != nil {
-			network.EnsureHostIsolation(lbIface, nil) //nolint:errcheck
-			network.RemoveSNAT(lbIface)               //nolint:errcheck
-		}
-	}
+	// removeLBLocal drops this LB's firewall intent; the network's base isolation
+	// intent remains, so the canonical reconciler restores the drop without the LB
+	// holes. A best-effort reconcile applies that immediately rather than next tick.
+	s.reconcileFirewall(ctx)
 
 	slog.Info("RemoveLB: removed", "lb", req.LbName)
 	return &emptypb.Empty{}, nil
@@ -2368,7 +2404,16 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 		return
 	}
 	for _, cfg := range configs {
-		if !cfg.Enabled || !s.lbRunsOnHost(ctx, cfg) {
+		if !cfg.Enabled {
+			continue
+		}
+		// Migration repair: an explicit LB persisted before durable holders has
+		// hosts=[] and is otherwise unowned (lbRunsOnHost returns false, so it would
+		// never revive). If keepalived for it is live on THIS host, we ARE its holder
+		// — claim ownership so it re-applies here and future update/reconcile target
+		// the real holder. Decentralized + CAS'd: exactly one live holder wins.
+		cfg = s.repairLegacyLBHolder(ctx, cfg)
+		if !s.lbRunsOnHost(ctx, cfg) {
 			continue
 		}
 		if cfg.StackName != "" {
@@ -2383,6 +2428,44 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 		// must be re-appliable to recover on quorum heal (and at startup).
 		s.reapplyExplicitLB(ctx, cfg)
 	}
+}
+
+// repairLegacyLBHolder backfills a durable holder for a legacy explicit LB
+// (StackName=="" with empty hosts) — the shape older binaries persisted before
+// CreateLoadBalancer recorded a holder. It resolves the LB's CONFIGURED
+// PARTICIPANTS cluster-wide via the ground-truth probe (actualLBParticipants) and
+// repairs ONLY when exactly one is proven, writing that host as the durable
+// holder. Any node can perform the repair (it records the probed holder, not
+// itself). Zero participants (nobody serving — operator must re-create) or
+// multiple (ambiguous / a pre-existing dual-holder split) are left unowned rather
+// than guessed. ClaimLBHolderIfUnowned then only sets a row still recorded as
+// unowned, so a concurrent repair can't clobber an established holder.
+func (s *Server) repairLegacyLBHolder(ctx context.Context, cfg corrosion.LBConfigRecord) corrosion.LBConfigRecord {
+	if cfg.StackName != "" || !(cfg.Hosts == "" || cfg.Hosts == "[]") {
+		return cfg
+	}
+	participants, ok := s.actualLBParticipants(ctx, cfg.Name)
+	if !ok {
+		return cfg // couldn't enumerate cluster hosts — leave unowned, retry later
+	}
+	if len(participants) != 1 {
+		if len(participants) > 1 {
+			slog.Warn("legacy LB has multiple participants; not auto-repairing (ambiguous holder — operator repair needed)",
+				"lb", cfg.Name, "participants", participants)
+		}
+		return cfg
+	}
+	holderJSON, _ := json.Marshal(participants)
+	claimed, err := corrosion.ClaimLBHolderIfUnowned(ctx, s.db, cfg.Name, string(holderJSON))
+	if err != nil {
+		slog.Warn("repairLegacyLBHolder: claim failed", "lb", cfg.Name, "error", err)
+		return cfg
+	}
+	if claimed {
+		slog.Info("repaired legacy LB: backfilled durable holder", "lb", cfg.Name, "holder", participants[0])
+		cfg.Hosts = string(holderJSON)
+	}
+	return cfg
 }
 
 // RunLBReconciler periodically re-applies this host's enabled LBs whose keepalived is NOT
@@ -2414,7 +2497,16 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 		return
 	}
 	for _, cfg := range configs {
-		if !cfg.Enabled || !s.lbRunsOnHost(ctx, cfg) || s.lbKeepalivedRunning(cfg.Name) {
+		if !cfg.Enabled {
+			continue
+		}
+		// Also retry the legacy-holder backfill here, not just at startup: the
+		// participant probe can be transiently inconclusive during a rolling upgrade
+		// (a restarting peer fail-closes to "present"), so a periodic retry lets a
+		// legacy hosts=[] LB acquire its durable holder once the cluster settles.
+		// No-op (no probe) unless the row is an unowned explicit LB.
+		cfg = s.repairLegacyLBHolder(ctx, cfg)
+		if !s.lbRunsOnHost(ctx, cfg) || s.lbKeepalivedRunning(cfg.Name) {
 			continue
 		}
 		if cfg.StackName != "" {
@@ -2464,6 +2556,8 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 	}); err != nil {
 		slog.Warn("reapplyExplicitLB: apply failed", "lb", cfg.Name, "error", err)
 	} else {
+		// Re-record firewall intent for an isolated-network VIP (exceptions + SNAT).
+		s.updateIsolationForLB(ctx, cfg.Name, lb.DetectInterfaceForIP(vipIP), vipIP, ports, true)
 		slog.Info("LB reconciled", "lb", cfg.Name)
 	}
 }
@@ -2477,6 +2571,13 @@ func (s *Server) lbRunsOnHost(ctx context.Context, cfg corrosion.LBConfigRecord)
 		json.Unmarshal([]byte(cfg.Hosts), &hosts)
 	}
 	if len(hosts) == 0 {
+		// VM-derived implicit membership is ONLY valid for a stack LB (its holders
+		// are wherever the stack's VMs run). An explicit LB (StackName=="") with no
+		// recorded holder must NOT be claimed by any host that merely has a VM —
+		// that would let arbitrary hosts reapply/double-serve the VIP.
+		if cfg.StackName == "" {
+			return false
+		}
 		vms, _ := corrosion.ListVMs(ctx, s.db, cfg.StackName, s.hostName)
 		return len(vms) > 0
 	}
@@ -2693,41 +2794,54 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 	}
 
 	// Update host-isolation rules if the LB interface is on an isolated bridge.
-	s.updateIsolationForLB(ctx, lbIface, vipIP, ports, snat)
+	s.updateIsolationForLB(ctx, lbName, lbIface, vipIP, ports, snat)
 
 	s.publish("lb.applied", lbName, fmt.Sprintf("vip=%s backends=%d", vip, len(backends)))
 	return nil
 }
 
-// updateIsolationForLB checks if a bridge has host-isolation enabled and, if so,
-// re-applies the isolation chain with LB port exceptions so VMs can reach the VIP.
-// Also sets up SNAT rules if the network's LB has snat enabled.
-func (s *Server) updateIsolationForLB(ctx context.Context, bridge, vip string, ports []lb.Port, snat bool) {
+// updateIsolationForLB records this LB's firewall intent when its bridge belongs
+// to a host-isolated network: VIP:port holes punched through the isolation drop
+// so VMs can reach the VIP, plus SNAT to the VIP when enabled. The canonical
+// nftables reconciler renders it, merged with the network's base isolation intent.
+func (s *Server) updateIsolationForLB(ctx context.Context, lbName, bridge, vip string, ports []lb.Port, snat bool) {
 	// Find a network whose bridge matches this interface and has host-isolation.
 	netDef, subnet := s.findIsolatedNetworkForBridge(ctx, bridge)
 	if netDef == nil {
 		return
 	}
 
-	// Build LB exceptions for the isolation chain.
 	var listenPorts []int
 	for _, p := range ports {
 		listenPorts = append(listenPorts, p.Listen)
 	}
-	exc := []network.IsolationLBException{{VIP: vip, Ports: listenPorts}}
-	if err := network.EnsureHostIsolation(bridge, exc); err != nil {
-		slog.Warn("updateIsolationForLB: failed to update isolation rules", "bridge", bridge, "error", err)
+	// Isolation itself is owned by the network's net:<network> intent — the LB row
+	// carries ONLY the VIP:port holes (and SNAT below), never Isolate. That way a
+	// stale LB row can't keep a bridge dropped after the network's isolation is
+	// removed, and the exceptions/SNAT only take effect while the network is isolated.
+	intent := corrosion.HostFWIntent{
+		ScopeKey:   "lb:" + lbName,
+		Bridge:     bridge,
+		Exceptions: []corrosion.HostFWException{{VIP: vip, Ports: listenPorts}},
 	}
 
-	// Set up SNAT if explicitly enabled.
+	// SNAT if explicitly enabled.
 	if snat && subnet != "" {
-		outIface := network.DefaultRouteIface()
-		if outIface != "" {
-			if err := network.EnsureSNAT(bridge, subnet, vip, outIface); err != nil {
-				slog.Warn("updateIsolationForLB: SNAT setup failed", "bridge", bridge, "error", err)
+		if outIface := network.DefaultRouteIface(); outIface != "" {
+			if err := network.EnableIPForwarding(); err != nil {
+				slog.Warn("updateIsolationForLB: enable ip_forward failed", "error", err)
 			}
+			intent.SNATSubnet = subnet
+			intent.SNATVIP = vip
+			intent.SNATOutIface = outIface
 		}
 	}
+
+	if err := corrosion.UpsertHostFWIntent(ctx, s.db, s.hostName, intent); err != nil {
+		slog.Warn("updateIsolationForLB: record firewall intent failed", "bridge", bridge, "error", err)
+	}
+	// Apply the VIP exceptions / SNAT now rather than waiting for the next tick.
+	s.reconcileFirewall(ctx)
 }
 
 // findIsolatedNetworkForBridge looks up all networks in Corrosion and returns the

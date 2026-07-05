@@ -237,7 +237,7 @@ func TestDeprovision_Direct(t *testing.T) {
 		Type:      "direct",
 		Interface: "bond0.206",
 	}
-	err := Deprovision("test-direct", def)
+	err := Deprovision(context.Background(), nil, "test-direct", def, "test-host")
 	if err != nil {
 		t.Fatalf("Deprovision direct: %v", err)
 	}

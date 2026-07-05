@@ -79,16 +79,19 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		// (same logic as pre-existing bridges).
 		onPhysicalVLAN := def.VLAN > 0
 
+		scope := fwScopeNet(networkName)
 		if def.HostIsolation {
 			// Host-isolated: no DHCP, no NAT. IPs delivered via cloud-init.
-			if err := EnsureHostIsolation(bridge, nil); err != nil {
-				return "", fmt.Errorf("ensure host isolation on %s: %w", bridge, err)
+			if err := corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{
+				ScopeKey: scope, Bridge: bridge, Isolate: true,
+			}); err != nil {
+				return "", fmt.Errorf("record host-isolation intent for %s: %w", bridge, err)
 			}
 		} else if !onPhysicalVLAN {
-			RemoveHostIsolation(bridge) //nolint:errcheck
 			// If subnet is defined and this is a litevirt-managed bridge (not
 			// pre-existing infrastructure or physical VLAN), enable DHCP and
 			// optionally NAT.
+			natSubnet := ""
 			if def.Subnet != "" && (!bridgePreExisted || def.DHCP) {
 				gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)
 				if err != nil {
@@ -99,10 +102,16 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 					return "", fmt.Errorf("start DHCP on %s: %w", bridge, err)
 				}
 				if def.NATEnabled() {
-					if err := EnsureNAT(def.Subnet, bridge); err != nil {
-						return "", fmt.Errorf("ensure NAT on %s: %w", bridge, err)
+					if err := EnableIPForwarding(); err != nil {
+						return "", err
 					}
+					natSubnet = def.Subnet
 				}
+			}
+			// Record NAT intent (masquerade) or clear any stale intent for this
+			// network. The reconciler renders it and migrates off any old rules.
+			if err := recordNATOrClear(ctx, db, hostName, scope, bridge, natSubnet); err != nil {
+				return "", err
 			}
 			// Enable proxy ARP only when the host IS the VM gateway — i.e.,
 			// DHCP and NAT are active, not on a physical VLAN.
@@ -110,6 +119,11 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				if err := EnsureProxyARP(bridge); err != nil {
 					slog.Warn("proxy ARP setup failed (VMs may be unreachable from outside)", "bridge", bridge, "error", err)
 				}
+			}
+		} else {
+			// Physical VLAN — litevirt manages no NAT/isolation here; clear stale intent.
+			if err := corrosion.DeleteHostFWIntent(ctx, db, hostName, scope); err != nil {
+				return "", err
 			}
 		}
 		return bridge, nil
@@ -145,6 +159,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			return "", fmt.Errorf("sync flood entries: %w", err)
 		}
 
+		natSubnet := ""
 		if def.Subnet != "" {
 			// IRB (anycast gateway) is always set up — VMs need a default route.
 			if _, err := EnsureIRB(vni, def.Subnet); err != nil {
@@ -156,9 +171,10 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				// IRB gateway stays for routing (FORWARD), but INPUT is dropped.
 			} else {
 				if def.NATEnabled() {
-					if err := EnsureNAT(def.Subnet, bridge); err != nil {
-						return "", fmt.Errorf("ensure NAT on %s: %w", bridge, err)
+					if err := EnableIPForwarding(); err != nil {
+						return "", err
 					}
+					natSubnet = def.Subnet
 				}
 				if isGatewayHost(ctx, db, networkName, hostName) {
 					gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)
@@ -173,12 +189,16 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			}
 		}
 
+		// Record NAT/isolation intent for the canonical firewall reconciler.
+		scope := fwScopeNet(networkName)
 		if def.HostIsolation {
-			if err := EnsureHostIsolation(bridge, nil); err != nil {
-				return "", fmt.Errorf("ensure host isolation on %s: %w", bridge, err)
+			if err := corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{
+				ScopeKey: scope, Bridge: bridge, Isolate: true,
+			}); err != nil {
+				return "", fmt.Errorf("record host-isolation intent for %s: %w", bridge, err)
 			}
-		} else {
-			RemoveHostIsolation(bridge) //nolint:errcheck
+		} else if err := recordNATOrClear(ctx, db, hostName, scope, bridge, natSubnet); err != nil {
+			return "", err
 		}
 
 		return bridge, nil
@@ -196,13 +216,19 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			return "", fmt.Errorf("ip link set %s up: %w: %s", bridge, err, out)
 		}
 
+		scope := fwScopeNet(networkName)
 		if def.HostIsolation {
 			// Host-isolated: no DHCP. IPs delivered via cloud-init.
-			if err := EnsureHostIsolation(bridge, nil); err != nil {
-				return "", fmt.Errorf("ensure host isolation on %s: %w", bridge, err)
+			if err := corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{
+				ScopeKey: scope, Bridge: bridge, Isolate: true,
+			}); err != nil {
+				return "", fmt.Errorf("record host-isolation intent for %s: %w", bridge, err)
 			}
 		} else {
-			RemoveHostIsolation(bridge) //nolint:errcheck
+			// Not isolated and no uplink → no NAT either; clear any stale intent.
+			if err := corrosion.DeleteHostFWIntent(ctx, db, hostName, scope); err != nil {
+				return "", err
+			}
 			// If subnet is defined, enable DHCP implicitly.
 			if def.Subnet != "" {
 				gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)
@@ -249,7 +275,15 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 // Deprovision tears down network infrastructure for def on this host.
 // It is the inverse of Provision: stops DHCP, removes bridges/VXLAN/IRB.
 // networkName is the logical network name (used for isolated bridge naming).
-func Deprovision(networkName string, def compose.NetworkDef) error {
+//
+// It deletes this network's firewall intent (so the canonical reconciler drops
+// its litevirt-fw NAT/isolation chains on the next pass) AND directly removes the
+// legacy out-of-band rules — safe and immediate on teardown, where we want the
+// rules gone rather than kept in lockstep.
+func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, hostName string) error {
+	if db != nil {
+		_ = corrosion.DeleteHostFWIntent(ctx, db, hostName, fwScopeNet(networkName))
+	}
 	switch def.Type {
 	case "", "bridge":
 		bridge := def.Interface
@@ -323,6 +357,22 @@ func Deprovision(networkName string, def compose.NetworkDef) error {
 	default:
 		return fmt.Errorf("unknown network type %q", def.Type)
 	}
+}
+
+// fwScopeNet is the host_fw_intent scope key for a network's provisioning
+// decision (its LB counterpart is "lb:<name>", written by the LB path).
+func fwScopeNet(networkName string) string { return "net:" + networkName }
+
+// recordNATOrClear upserts a masquerade intent for (bridge, natSubnet) when
+// natSubnet is set, or deletes any stale intent for the scope when it isn't — so a
+// network that loses NAT (or never had it) leaves no orphaned masquerade behind.
+func recordNATOrClear(ctx context.Context, db *corrosion.Client, hostName, scope, bridge, natSubnet string) error {
+	if natSubnet == "" {
+		return corrosion.DeleteHostFWIntent(ctx, db, hostName, scope)
+	}
+	return corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{
+		ScopeKey: scope, Bridge: bridge, MasqueradeSubnet: natSubnet,
+	})
 }
 
 // isNoSuchDevice returns true if the command output indicates the device does not exist.

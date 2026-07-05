@@ -143,9 +143,10 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 
 	// Deprovision the network infrastructure.
 	def := networkRecordToDef(nr)
-	if err := network.Deprovision(req.Name, def); err != nil {
+	if err := network.Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
 		slog.Warn("network deprovision failed", "network", req.Name, "error", err)
 	}
+	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
 
 	// Soft-delete the DB record.
 	if err := corrosion.DeleteNetwork(ctx, s.db, req.Name); err != nil {
@@ -251,6 +252,11 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	if _, err := network.SafeProvision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
 		return nil, err
 	}
+	// Fail closed: don't report a provisioned network while its host-isolation/NAT
+	// rules haven't applied.
+	if err := s.reconcileFirewallRequired(ctx); err != nil {
+		return nil, status.Errorf(codes.Internal, "apply firewall for network %q: %v", name, err)
+	}
 
 	nr, _ := corrosion.GetNetwork(ctx, s.db, name)
 	if nr == nil {
@@ -272,9 +278,10 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		return nil // nothing to deprovision
 	}
 	def := networkRecordToDef(nr)
-	if err := network.Deprovision(name, def); err != nil {
+	if err := network.Deprovision(ctx, s.db, name, def, s.hostName); err != nil {
 		return err
 	}
+	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
 	return corrosion.DeleteNetwork(ctx, s.db, name)
 }
 
@@ -344,6 +351,11 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 	localIP := getLocalIP()
 	if _, err := network.SafeProvision(ctx, s.db, req.Name, def, localIP, s.hostName); err != nil {
 		return nil, status.Errorf(codes.Internal, "provision network %q: %v", req.Name, err)
+	}
+	// Fail closed: don't report a provisioned network while its host-isolation/NAT
+	// rules haven't applied.
+	if err := s.reconcileFirewallRequired(ctx); err != nil {
+		return nil, status.Errorf(codes.Internal, "apply firewall for network %q: %v", req.Name, err)
 	}
 
 	// For VXLAN, notify existing peers about our VTEP.

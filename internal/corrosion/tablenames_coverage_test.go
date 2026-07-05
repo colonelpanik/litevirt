@@ -34,6 +34,7 @@ var antiEntropyExcluded = map[string]string{
 	"mutation_seen":          "per-node relay-dedup table",
 	"host_runtime_usage":     "per-host runtime telemetry (disk_iops/net_mbps); replicates via the WAL/mutation_log but is excluded from full-state anti-entropy — stale telemetry self-corrects on the next sample (cf. vm_events), so it needn't be repaired and shouldn't bloat the digest/dump",
 	"idempotency_keys":       "ephemeral request-dedup records (v39); LOCAL-only (owned by the entry node, never replicated), so no anti-entropy repair applies — see localOnly",
+	"host_fw_intent":         "per-host firewall infra decisions (v40, NAT/SNAT/isolation); LOCAL-only (nft rules are per-host state, never replicated) — see localOnly",
 	// (user_2fa, recovery_codes, recovery_code_sets are now in sensitiveTableNames
 	//  — schema v32 made them LWW-repairable: soft-delete + active-set pointer.)
 }
@@ -44,6 +45,7 @@ var antiEntropyExcluded = map[string]string{
 var localOnly = map[string]bool{
 	"schema_state":     true, // per-node schema version, set during InitSchema/migrate
 	"idempotency_keys": true, // v39: entry-node-owned request dedup; execLocal writes, never replicated
+	"host_fw_intent":   true, // v40: per-host firewall infra intent; execLocal writes, never replicated
 }
 
 var createTableRe = regexp.MustCompile(`CREATE TABLE IF NOT EXISTS ([a-z_0-9]+)`)

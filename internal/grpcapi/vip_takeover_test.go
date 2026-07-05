@@ -529,14 +529,97 @@ func TestUpdateLoadBalancer_BackendOnlyEditNotGated(t *testing.T) {
 
 	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
 		Name: "lb4", VIP: "10.0.100.80/24", Algorithm: "roundrobin",
-		Hosts: `[]`, Ports: "[]", Enabled: true, Generation: "g1",
+		Hosts: `["lb-host-1"]`, Ports: "[]", Enabled: true, Generation: "g1",
 	}); err != nil {
 		t.Fatalf("UpsertLBConfig: %v", err)
 	}
 
-	// Algorithm-only edit, no req.Hosts → must not be gated/refused.
+	// Algorithm-only edit, no req.Hosts → must not be gated/refused (the gate must
+	// not resolve participants). The LB has a recorded holder, so the legacy-holder
+	// repair doesn't engage either.
 	if _, err := s.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "lb4", Algorithm: "leastconn"}); err != nil {
 		t.Fatalf("backend/algorithm-only edit must not be refused, got: %v", err)
+	}
+}
+
+// TestUpdateLoadBalancer_LegacyNoHolderRepairOrRefuse: updating a legacy explicit
+// LB with no recorded holder (hosts=[]) either backfills the single proven
+// participant and proceeds, or fails closed — never silently persists a
+// reload-required change that would apply nowhere.
+func TestUpdateLoadBalancer_LegacyNoHolderRepairOrRefuse(t *testing.T) {
+	ctx := adminCtx()
+
+	// No resolvable participant → FailedPrecondition, and the edit is NOT persisted.
+	s := testServerR2(t)
+	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
+	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return nil, true }
+	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "orphan-lb", VIP: "10.0.100.81/24", Algorithm: "roundrobin", Hosts: `[]`, Ports: "[]", Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := s.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "orphan-lb", Algorithm: "leastconn"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("unowned legacy LB update = %v; want FailedPrecondition", err)
+	}
+	rows, _ := s.db.Query(ctx, `SELECT algorithm FROM lb_configs WHERE name = 'orphan-lb' AND deleted_at IS NULL`)
+	if len(rows) > 0 && rows[0].String("algorithm") != "roundrobin" {
+		t.Errorf("refused update must not persist; algorithm = %q", rows[0].String("algorithm"))
+	}
+
+	// Exactly one proven participant → backfilled as holder and the update proceeds.
+	s2 := testServerR2(t)
+	s2.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
+	s2.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return []string{"lb-host-1"}, true }
+	if err := corrosion.UpsertLBConfig(ctx, s2.db, corrosion.LBConfigRecord{
+		Name: "adopt-lb", VIP: "10.0.100.82/24", Algorithm: "roundrobin", Hosts: `[]`, Ports: "[]", Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := s2.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "adopt-lb", Algorithm: "leastconn"}); err != nil {
+		t.Fatalf("update with a resolvable holder must proceed, got: %v", err)
+	}
+	rows, _ = s2.db.Query(ctx, `SELECT hosts, algorithm FROM lb_configs WHERE name = 'adopt-lb' AND deleted_at IS NULL`)
+	if len(rows) == 0 || rows[0].String("hosts") != `["lb-host-1"]` || rows[0].String("algorithm") != "leastconn" {
+		t.Errorf("expected backfilled holder + applied edit; got %v", rows)
+	}
+}
+
+// TestUpdateLoadBalancer_LegacyMoveStandsOldHolderDown (pre-flip): moving a legacy
+// hosts=[] LB to a new host must stand the OLD holder down even with the VIP gate
+// de-advertised. The original holder is resolved from live participants up front,
+// so the pre-flip stale-holder cleanup knows whom to remove — without it the old
+// keepalived would keep running alongside the new holder.
+func TestUpdateLoadBalancer_LegacyMoveStandsOldHolderDown(t *testing.T) {
+	s := testServerR2(t) // hostName "test-host"
+	ctx := adminCtx()
+	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
+	s.vipGateFlipped = func() bool { return false } // pre-flip: gate inert
+	// The legacy LB's live holder resolves to THIS host, so its stand-down runs
+	// locally (removeLBLocal) — observable, unlike the remote fire-and-forget path.
+	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return []string{"test-host"}, true }
+
+	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "move-lb", VIP: "10.0.100.90/24", Algorithm: "roundrobin", Hosts: `[]`, Ports: "[]", Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed lb: %v", err)
+	}
+	// Seed the LB's firewall intent on the old holder; standing it down deletes it.
+	if err := corrosion.UpsertHostFWIntent(ctx, s.db, "test-host", corrosion.HostFWIntent{
+		ScopeKey: "lb:move-lb", Bridge: "br-iso-x",
+		Exceptions: []corrosion.HostFWException{{VIP: "10.0.100.90", Ports: []int{80}}},
+	}); err != nil {
+		t.Fatalf("seed intent: %v", err)
+	}
+
+	if _, err := s.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "move-lb", Hosts: []string{"new-host"}}); err != nil {
+		t.Fatalf("move of a legacy LB with a resolvable holder must be allowed pre-flip, got: %v", err)
+	}
+	// The old holder (this host) was stood down → its LB firewall intent is gone.
+	intents, _ := corrosion.ListHostFWIntent(ctx, s.db, "test-host")
+	for _, in := range intents {
+		if in.ScopeKey == "lb:move-lb" {
+			t.Error("old legacy holder not stood down on move: lb:move-lb firewall intent still present")
+		}
 	}
 }
 

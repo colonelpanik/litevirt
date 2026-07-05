@@ -112,6 +112,36 @@ type IPSet struct {
 	CIDRs []string
 }
 
+// NATRule is one postrouting NAT rule. SNATTo distinguishes the two forms:
+//   - SNATTo == "" → masquerade for a managed subnet's guest egress:
+//     `ip saddr <Subnet> oifname != <Bridge> masquerade`
+//   - SNATTo != "" → source-NAT to a fixed address (LB VIP for an isolated net):
+//     `oifname <OutIface> ip saddr <Subnet> snat to <SNATTo>`
+//
+// These fold in the old out-of-band paths: iptables MASQUERADE (network.EnsureNAT)
+// and the nft snat chain (network.EnsureSNAT).
+type NATRule struct {
+	Subnet   string // ip saddr match (required)
+	Bridge   string // masquerade: oifname != Bridge (egress leaves via any iface but this bridge)
+	OutIface string // SNAT: oifname == OutIface
+	SNATTo   string // SNAT target; empty → masquerade
+}
+
+// IsolationException lists VIP ports punched through a bridge's host-isolation
+// drop so guests can still reach an HAProxy VIP (plus VRRP for keepalived).
+type IsolationException struct {
+	VIP   string
+	Ports []int
+}
+
+// IsolationChain makes the host invisible to guests on Bridge: every packet
+// arriving from the bridge at the host (input hook) is dropped, except the
+// optional LB exceptions. Folds in network.EnsureHostIsolation.
+type IsolationChain struct {
+	Bridge     string
+	Exceptions []IsolationException
+}
+
 // NICBinding attaches one VM NIC to zero or more security groups, plus
 // any per-NIC rules layered on top. The NICDev string is the host-side
 // device name (tap-… or veth…); it's the iifname/oifname token the
@@ -142,6 +172,13 @@ type Plan struct {
 	SecurityGroups []SecurityGroup
 	IPSets         []IPSet
 	NICs           []NICBinding
+
+	// NAT (postrouting masquerade + SNAT) and HostIsolation (input drops) are
+	// per-host infra rules folded in from the old out-of-band paths. They render
+	// into their own hook chains in the same table, so the atomic replace keeps
+	// them in lockstep with the filter rules.
+	NAT           []NATRule
+	HostIsolation []IsolationChain
 }
 
 // Render turns the Plan into an nftables ruleset that can be fed to
@@ -206,8 +243,85 @@ func Render(p Plan) (string, error) {
 	renderTierChain(&b, "host_overrides", p.HostRules, "")
 	renderNICDispatch(&b, p.NICs, sgByName)
 
+	// Infra chains on their own hooks. Emitted only when non-empty so a plan with
+	// no NAT / isolation renders byte-identically to before this feature (and so
+	// removing the last rule drops the whole chain on the next atomic replace).
+	renderNAT(&b, p.NAT)
+	renderHostIsolation(&b, p.HostIsolation)
+
 	b.WriteString("}\n")
 	return b.String(), nil
+}
+
+// renderNAT emits a single `postrouting` nat chain covering masquerade (managed
+// guest egress) and SNAT (LB VIP source rewrite). SNAT rules are emitted before
+// masquerade — more specific first — and each group is sorted for byte-determinism.
+func renderNAT(b *strings.Builder, rules []NATRule) {
+	if len(rules) == 0 {
+		return
+	}
+	var snat, masq []NATRule
+	for _, r := range rules {
+		if r.SNATTo != "" {
+			snat = append(snat, r)
+		} else {
+			masq = append(masq, r)
+		}
+	}
+	sort.Slice(snat, func(i, j int) bool {
+		if snat[i].OutIface != snat[j].OutIface {
+			return snat[i].OutIface < snat[j].OutIface
+		}
+		if snat[i].Subnet != snat[j].Subnet {
+			return snat[i].Subnet < snat[j].Subnet
+		}
+		return snat[i].SNATTo < snat[j].SNATTo
+	})
+	sort.Slice(masq, func(i, j int) bool {
+		if masq[i].Subnet != masq[j].Subnet {
+			return masq[i].Subnet < masq[j].Subnet
+		}
+		return masq[i].Bridge < masq[j].Bridge
+	})
+
+	fmt.Fprintf(b, "    chain postrouting {\n")
+	fmt.Fprintf(b, "        type nat hook postrouting priority srcnat; policy accept;\n")
+	for _, r := range snat {
+		fmt.Fprintf(b, "        oifname %s ip saddr %s snat to %s\n", r.OutIface, r.Subnet, r.SNATTo)
+	}
+	for _, r := range masq {
+		fmt.Fprintf(b, "        ip saddr %s oifname != %s masquerade\n", r.Subnet, r.Bridge)
+	}
+	fmt.Fprintf(b, "    }\n\n")
+}
+
+// renderHostIsolation emits a single `input` filter chain that drops guest→host
+// traffic per isolated bridge, punching through VRRP + declared LB VIP ports
+// first. Policy is accept — only the explicit iifname-<bridge> drops bite, so
+// non-isolated bridges and host-local traffic are untouched.
+func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
+	if len(chains) == 0 {
+		return
+	}
+	sorted := make([]IsolationChain, len(chains))
+	copy(sorted, chains)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Bridge < sorted[j].Bridge })
+
+	fmt.Fprintf(b, "    chain input {\n")
+	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
+	for _, c := range sorted {
+		if len(c.Exceptions) > 0 {
+			// VRRP (keepalived) once per bridge, then each VIP:port.
+			fmt.Fprintf(b, "        iifname %s ip protocol 112 accept\n", c.Bridge)
+			for _, exc := range c.Exceptions {
+				for _, port := range exc.Ports {
+					fmt.Fprintf(b, "        iifname %s ip daddr %s tcp dport %d accept\n", c.Bridge, exc.VIP, port)
+				}
+			}
+		}
+		fmt.Fprintf(b, "        iifname %s drop\n", c.Bridge)
+	}
+	fmt.Fprintf(b, "    }\n\n")
 }
 
 // renderIPSets writes one `set <name> { … }` block per IPSet.
@@ -403,6 +517,31 @@ func validate(p Plan) error {
 	for _, sg := range p.SecurityGroups {
 		if sg.Name == "" {
 			return errors.New("security group with empty name")
+		}
+	}
+	// NAT / isolation are IPv4-only (same as the filter rules) and must be
+	// complete — a blank field would emit a malformed rule that poisons the whole
+	// atomic ruleset at apply time.
+	for i, r := range p.NAT {
+		if r.Subnet == "" || strings.Contains(r.Subnet, ":") {
+			return fmt.Errorf("nat rule %d: subnet %q must be a non-empty IPv4 CIDR", i, r.Subnet)
+		}
+		if r.SNATTo != "" {
+			if r.OutIface == "" || strings.Contains(r.SNATTo, ":") {
+				return fmt.Errorf("nat rule %d: SNAT needs an out-iface and an IPv4 target (got iface=%q to=%q)", i, r.OutIface, r.SNATTo)
+			}
+		} else if r.Bridge == "" {
+			return fmt.Errorf("nat rule %d: masquerade needs a bridge", i)
+		}
+	}
+	for i, c := range p.HostIsolation {
+		if c.Bridge == "" {
+			return fmt.Errorf("isolation chain %d: empty bridge", i)
+		}
+		for _, exc := range c.Exceptions {
+			if exc.VIP == "" || strings.Contains(exc.VIP, ":") {
+				return fmt.Errorf("isolation chain %q: exception VIP %q must be a non-empty IPv4 address", c.Bridge, exc.VIP)
+			}
 		}
 	}
 	return nil

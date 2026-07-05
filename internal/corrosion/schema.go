@@ -226,7 +226,14 @@ import (
 //	     instead of executing twice. LOCAL-only (execLocal, never replicated) and
 //	     TTL-reaped (ephemeral); cross-node retries fall back to resource-name
 //	     uniqueness. One CREATE TABLE; gap-1 from v38.
-const CurrentSchemaVersion = 39
+//	v40: firewall consolidation — new table host_fw_intent recording this host's
+//	     resolved NAT (masquerade), SNAT, and host-isolation decisions so the single
+//	     canonical nftables renderer emits them in the atomic litevirt-fw table
+//	     replace (previously out-of-band iptables + a second nft table). LOCAL-only
+//	     (execLocal, never replicated) — nft rules are per-host state; provisioning /
+//	     LB apply write intent, the firewall reconciler renders it. One CREATE TABLE;
+//	     gap-1 from v39.
+const CurrentSchemaVersion = 40
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1257,6 +1264,27 @@ var schemaDDL = []string{
 		deleted_at   TEXT
 	)`,
 
+	// host_fw_intent (v40): this host's resolved firewall infra decisions, written
+	// by network provisioning + LB apply and rendered by the canonical nftables
+	// reconciler. One row per intent source (scope_key = "net:<network>" |
+	// "lb:<name>"); each contributes what it sets — a masquerade subnet, an
+	// isolation flag + JSON LB exceptions, and/or an SNAT (subnet/vip/out-iface).
+	// LOCAL-only (execLocal, never replicated): nft rules are per-host state, so
+	// there's no cross-node LWW to arbitrate.
+	`CREATE TABLE IF NOT EXISTS host_fw_intent (
+		host_name       TEXT NOT NULL,
+		scope_key       TEXT NOT NULL,
+		bridge          TEXT NOT NULL,
+		masquerade_subnet TEXT NOT NULL DEFAULT '',
+		isolate         INTEGER NOT NULL DEFAULT 0,
+		exceptions      TEXT NOT NULL DEFAULT '',
+		snat_subnet     TEXT NOT NULL DEFAULT '',
+		snat_vip        TEXT NOT NULL DEFAULT '',
+		snat_out_iface  TEXT NOT NULL DEFAULT '',
+		updated_at      TEXT NOT NULL,
+		PRIMARY KEY (host_name, scope_key)
+	)`,
+
 	// containers cluster state. One row per LXC/OCI
 	// container; aggregated by `lv ct ls` cluster-wide. Lifecycle
 	// transitions are written by the daemon owning the container.
@@ -1928,6 +1956,7 @@ var createTableUnits = []struct {
 	{35, "container_interfaces"},
 	{38, "runtime_action_proofs"},
 	{39, "idempotency_keys"},
+	{40, "host_fw_intent"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

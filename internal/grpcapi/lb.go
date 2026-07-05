@@ -1568,6 +1568,11 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			}
 			if err := s.applyLBLocal(ctx, cfg); err != nil {
 				slog.Warn("UpdateLoadBalancer: local apply failed", "error", err)
+			} else {
+				// Refresh firewall intent so a changed VIP/ports updates the
+				// exceptions/SNAT (an upsert on lb:<name>), not leaving the old
+				// holes behind. No-op off host-isolated networks.
+				s.updateIsolationForLB(ctx, req.Name, cfg.Interface, vipIP, ports, true)
 			}
 			break
 		}

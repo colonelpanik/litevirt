@@ -64,23 +64,41 @@ func TestLBRunsOnHost_ExplicitNeedsRecordedHolder(t *testing.T) {
 	}
 }
 
-// TestRepairLegacyLBHolder_Guards: the migration repair only claims a legacy
-// explicit LB this host is actually serving. A stack LB, an already-owned LB, or
-// an LB whose keepalived isn't running here (the default in tests) is left as-is —
-// so a non-holder never claims a VIP.
-func TestRepairLegacyLBHolder_Guards(t *testing.T) {
+// TestRepairLegacyLBHolder_ProbesParticipants: the migration repair backfills a
+// holder ONLY when the cluster-wide participant probe proves exactly one, and
+// never touches a stack LB or an already-owned row. Zero or multiple participants
+// are left unowned (not guessed).
+func TestRepairLegacyLBHolder_ProbesParticipants(t *testing.T) {
 	s := testServerR2(t)
 	ctx := context.Background()
 
+	// Guards: stack LB and already-owned rows are returned untouched.
 	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "x", StackName: "s", Hosts: "[]"}); got.Hosts != "[]" {
 		t.Errorf("stack LB must not be repaired; hosts = %q", got.Hosts)
 	}
 	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "x", Hosts: `["h"]`}); got.Hosts != `["h"]` {
 		t.Errorf("already-owned LB must not be re-claimed; hosts = %q", got.Hosts)
 	}
-	// Explicit unowned LB, but keepalived for it isn't running on this host (no
-	// pidfile in the test env) → not claimed, left for the real holder.
-	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "not-running-lb", Hosts: "[]"}); got.Hosts != "[]" {
-		t.Errorf("must not claim an LB this host isn't serving; hosts = %q", got.Hosts)
+
+	// Zero participants → left unowned.
+	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return nil, true }
+	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "none", Hosts: "[]"}); got.Hosts != "[]" {
+		t.Errorf("no participants → must stay unowned; hosts = %q", got.Hosts)
+	}
+	// Multiple participants → ambiguous, left unowned (not guessed).
+	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return []string{"a", "b"}, true }
+	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "multi", Hosts: "[]"}); got.Hosts != "[]" {
+		t.Errorf("multiple participants → must stay unowned; hosts = %q", got.Hosts)
+	}
+
+	// Exactly one proven participant → backfilled as the durable holder.
+	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "one", VIP: "10.0.0.7/24", Hosts: "[]", Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return []string{"holder-h"}, true }
+	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "one", Hosts: "[]"}); got.Hosts != `["holder-h"]` {
+		t.Errorf("exactly one participant → must backfill it as holder; hosts = %q", got.Hosts)
 	}
 }

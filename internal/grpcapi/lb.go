@@ -1554,23 +1554,12 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	}
 
 	vipIP, vipPrefix, _ := lb.ParseVIP(vip)
-	// hosts is the LB's durable holder set. CreateLoadBalancer now records
-	// [s.hostName] for a default explicit LB, so this is non-empty for anything a
-	// current binary created — the local apply loop runs on the holder and the
-	// forward loop reaches the rest. We deliberately do NOT default []→self here:
-	// a legacy row with no recorded holder (or a corrupt hosts field) must not make
-	// a non-holder node claim/refresh the VIP. Such a row simply doesn't re-apply
-	// here until its holder is re-established (re-create).
+	// hosts is the LB's durable holder set — CreateLoadBalancer records a concrete
+	// holder, and a legacy no-holder row was either repaired to its proven
+	// participant above or the update was refused. So the local apply loop runs on
+	// the holder and the forward loop reaches the rest; no []→self guessing.
 	var lbHosts []string
 	json.Unmarshal([]byte(hostsStr), &lbHosts) //nolint:errcheck
-	if len(lbHosts) == 0 && r.String("stack_name") == "" {
-		// Legacy explicit LB with no recorded holder (pre-durable-holder row). If
-		// THIS node is serving the VIP, claim ownership so the update applies +
-		// reloads here; if not, the local loop below skips and the change reaches
-		// the holder via its own reconcile. Either way we don't blindly claim self.
-		repaired := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: req.Name, Hosts: hostsStr})
-		json.Unmarshal([]byte(repaired.Hosts), &lbHosts) //nolint:errcheck
-	}
 
 	// Apply locally.
 	for _, h := range lbHosts {
@@ -2416,28 +2405,39 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 }
 
 // repairLegacyLBHolder backfills a durable holder for a legacy explicit LB
-// (StackName=="" with empty hosts) that THIS host is actually serving. It returns
-// the possibly-updated config. Only a host whose keepalived for the VIP is live
-// claims it, so the recorded holder reflects reality; the claim is CAS'd
-// (ClaimLBHolderIfUnowned) so exactly one live holder wins and a peer that already
-// claimed is left as-is. A legacy LB that NO host is serving stays unowned — it
-// can't be safely auto-assigned, and the operator must re-create it.
+// (StackName=="" with empty hosts) — the shape older binaries persisted before
+// CreateLoadBalancer recorded a holder. It resolves the LB's CONFIGURED
+// PARTICIPANTS cluster-wide via the ground-truth probe (actualLBParticipants) and
+// repairs ONLY when exactly one is proven, writing that host as the durable
+// holder. Any node can perform the repair (it records the probed holder, not
+// itself). Zero participants (nobody serving — operator must re-create) or
+// multiple (ambiguous / a pre-existing dual-holder split) are left unowned rather
+// than guessed. ClaimLBHolderIfUnowned then only sets a row still recorded as
+// unowned, so a concurrent repair can't clobber an established holder.
 func (s *Server) repairLegacyLBHolder(ctx context.Context, cfg corrosion.LBConfigRecord) corrosion.LBConfigRecord {
 	if cfg.StackName != "" || !(cfg.Hosts == "" || cfg.Hosts == "[]") {
 		return cfg
 	}
-	if !lb.NewManager().KeepalivedRunning(cfg.Name) {
-		return cfg // not serving it here — leave unowned for the actual holder to claim
+	participants, ok := s.actualLBParticipants(ctx, cfg.Name)
+	if !ok {
+		return cfg // couldn't enumerate cluster hosts — leave unowned, retry later
 	}
-	self, _ := json.Marshal([]string{s.hostName})
-	claimed, err := corrosion.ClaimLBHolderIfUnowned(ctx, s.db, cfg.Name, string(self))
+	if len(participants) != 1 {
+		if len(participants) > 1 {
+			slog.Warn("legacy LB has multiple participants; not auto-repairing (ambiguous holder — operator repair needed)",
+				"lb", cfg.Name, "participants", participants)
+		}
+		return cfg
+	}
+	holderJSON, _ := json.Marshal(participants)
+	claimed, err := corrosion.ClaimLBHolderIfUnowned(ctx, s.db, cfg.Name, string(holderJSON))
 	if err != nil {
 		slog.Warn("repairLegacyLBHolder: claim failed", "lb", cfg.Name, "error", err)
 		return cfg
 	}
 	if claimed {
-		slog.Info("repaired legacy LB: backfilled durable holder", "lb", cfg.Name, "host", s.hostName)
-		cfg.Hosts = string(self)
+		slog.Info("repaired legacy LB: backfilled durable holder", "lb", cfg.Name, "holder", participants[0])
+		cfg.Hosts = string(holderJSON)
 	}
 	return cfg
 }
@@ -2471,7 +2471,16 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 		return
 	}
 	for _, cfg := range configs {
-		if !cfg.Enabled || !s.lbRunsOnHost(ctx, cfg) || s.lbKeepalivedRunning(cfg.Name) {
+		if !cfg.Enabled {
+			continue
+		}
+		// Also retry the legacy-holder backfill here, not just at startup: the
+		// participant probe can be transiently inconclusive during a rolling upgrade
+		// (a restarting peer fail-closes to "present"), so a periodic retry lets a
+		// legacy hosts=[] LB acquire its durable holder once the cluster settles.
+		// No-op (no probe) unless the row is an unowned explicit LB.
+		cfg = s.repairLegacyLBHolder(ctx, cfg)
+		if !s.lbRunsOnHost(ctx, cfg) || s.lbKeepalivedRunning(cfg.Name) {
 			continue
 		}
 		if cfg.StackName != "" {

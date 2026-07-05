@@ -81,12 +81,17 @@ func ListLBConfigs(ctx context.Context, c *Client) ([]LBConfigRecord, error) {
 	return records, nil
 }
 
-// ClaimLBHolderIfUnowned atomically records hostsJSON as an LB's holder set ONLY
-// while it currently has none (hosts '' or '[]'). It is the migration repair for
-// explicit LBs persisted before durable holders: the host actually serving the VIP
-// backfills itself. The guarded UPDATE makes it a compare-and-set — exactly one
-// live holder wins across concurrent hosts — and returns whether THIS call claimed
-// it (rows affected).
+// ClaimLBHolderIfUnowned records hostsJSON as an LB's holder set ONLY while it
+// currently has none (hosts '' or '[]'), returning whether THIS call wrote it.
+// It's the migration write for explicit LBs persisted before durable holders; the
+// CALLER decides the correct holder (via the cluster-wide participant probe) — this
+// guard only avoids clobbering a holder that another node already established.
+//
+// NOTE: the guard is atomic within local SQLite, not cluster-wide. lb_configs is a
+// CRDT/LWW table, so two nodes writing during a partition can both succeed locally
+// and converge by last-writer-wins. That's why callers must resolve a single
+// proven participant BEFORE calling this, rather than relying on the write to
+// arbitrate a contested holder.
 func ClaimLBHolderIfUnowned(ctx context.Context, c *Client, name, hostsJSON string) (bool, error) {
 	n, err := c.ExecuteRows(ctx,
 		`UPDATE lb_configs SET hosts = ?, updated_at = ?

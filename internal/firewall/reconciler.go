@@ -42,7 +42,7 @@ type Reconciler struct {
 	// equivalent rules are live in litevirt-fw. Run per bridge exactly once
 	// (tracked in cleaned) AFTER a successful apply, so there is never a window
 	// without NAT/isolation during the upgrade migration. nil in tests.
-	legacyCleanup func(bridge, masqueradeSubnet string)
+	legacyCleanup func(bridge, masqueradeSubnet string) error
 	cleaned       map[string]bool
 }
 
@@ -60,7 +60,7 @@ func NewReconciler(loader PlanLoader, applier *Applier, interval time.Duration) 
 // SetLegacyCleanup registers the per-bridge migration hook that clears
 // pre-consolidation NAT/isolation rules a prior binary left behind. The daemon
 // wires network.RemoveLegacyBridgeFirewall; tests leave it unset.
-func (r *Reconciler) SetLegacyCleanup(fn func(bridge, masqueradeSubnet string)) {
+func (r *Reconciler) SetLegacyCleanup(fn func(bridge, masqueradeSubnet string) error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.legacyCleanup = fn
@@ -166,13 +166,21 @@ func (r *Reconciler) migrateLegacy(p Plan) {
 	for b := range bridges {
 		r.mu.Lock()
 		done := r.cleaned[b]
-		if !done {
-			r.cleaned[b] = true
-		}
 		r.mu.Unlock()
-		if !done {
-			fn(b, masq[b])
+		if done {
+			continue
 		}
+		// Mark cleaned ONLY after the hook confirms the old rules are gone. A
+		// transient nft/iptables failure must not permanently strand old
+		// `inet litevirt` chains (which would lack the new LB exceptions) — leave
+		// the bridge unmarked so the next tick retries.
+		if err := fn(b, masq[b]); err != nil {
+			slog.Warn("firewall: legacy rule cleanup failed; will retry next tick", "bridge", b, "error", err)
+			continue
+		}
+		r.mu.Lock()
+		r.cleaned[b] = true
+		r.mu.Unlock()
 	}
 }
 

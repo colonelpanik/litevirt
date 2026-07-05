@@ -78,11 +78,22 @@ func RemoveSNAT(bridge string) error {
 // masqueradeSubnet is set, the iptables MASQUERADE + FORWARD rules. It is the
 // upgrade-migration cleanup, driven by the firewall reconciler ONCE the equivalent
 // rules are live in `inet litevirt-fw` — so there is never a window without NAT.
-// All steps are idempotent (safe to call when nothing is present).
-func RemoveLegacyBridgeFirewall(bridge, masqueradeSubnet string) {
-	RemoveHostIsolation(bridge) //nolint:errcheck
-	RemoveSNAT(bridge)          //nolint:errcheck
+//
+// It returns an error if a chain that exists couldn't be removed, so the caller
+// retries rather than recording the bridge as cleaned while a stale old iso chain
+// (lacking the new LB exceptions) lingers. RemoveHostIsolation/RemoveSNAT treat a
+// missing chain as success, so a clean host returns nil. The iptables masquerade
+// delete stays best-effort — iptables -D can't distinguish already-absent from a
+// real failure.
+func RemoveLegacyBridgeFirewall(bridge, masqueradeSubnet string) error {
+	if err := RemoveHostIsolation(bridge); err != nil {
+		return err
+	}
+	if err := RemoveSNAT(bridge); err != nil {
+		return err
+	}
 	if masqueradeSubnet != "" {
 		RemoveNAT(masqueradeSubnet, bridge) //nolint:errcheck
 	}
+	return nil
 }

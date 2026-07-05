@@ -636,7 +636,16 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	// the new generation: a recreate bulk-tombstones any prior backends and
 	// re-stamps the survivors, so the persistent model is never left half-written
 	// for the DB-render reapply to act on (was warn-only per-row before).
-	hostsJSON, _ := json.Marshal(req.Hosts)
+	// Persist a DURABLE holder: an explicit LB created with no hosts still runs on
+	// this node, so record [s.hostName] rather than [] — otherwise a later
+	// update/reapply can't tell WHO holds the VIP and could double-serve it from
+	// another node (a stack LB, which derives membership from its VMs, is created
+	// via the stack path, not here).
+	targetHosts := req.Hosts
+	if len(targetHosts) == 0 {
+		targetHosts = []string{s.hostName}
+	}
+	hostsJSON, _ := json.Marshal(targetHosts)
 	portsJSON, _ := json.Marshal(req.Ports)
 	if err := corrosion.PersistLBFull(ctx, s.db, corrosion.LBConfigRecord{
 		Name:       req.Name,
@@ -660,13 +669,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 		})
 	}
 
-	// Determine LB hosts.
-	targetHosts := req.Hosts
-	if len(targetHosts) == 0 {
-		targetHosts = []string{s.hostName}
-	}
-
-	// Apply locally if this host is a target.
+	// Apply locally if this host is a target (targetHosts resolved above).
 	for _, h := range targetHosts {
 		if h == s.hostName {
 			priority := 50
@@ -1361,19 +1364,6 @@ func (s *Server) removeLBLocal(ctx context.Context, name string) error {
 	return err
 }
 
-// lbApplyHosts parses a stored LB hosts JSON array and normalizes the empty case
-// to self. A standalone explicit LB is persisted with hosts=[] but runs on the
-// node that handled its create; apply/forward/intent-refresh on update must target
-// this host too rather than treating [] as "runs nowhere".
-func lbApplyHosts(hostsJSON, self string) []string {
-	var hosts []string
-	_ = json.Unmarshal([]byte(hostsJSON), &hosts)
-	if len(hosts) == 0 {
-		return []string{self}
-	}
-	return hosts
-}
-
 func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest) (*pb.LoadBalancer, error) {
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
@@ -1564,11 +1554,15 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	}
 
 	vipIP, vipPrefix, _ := lb.ParseVIP(vip)
-	// A standalone explicit LB is created with an empty hosts list but runs on the
-	// handling node (CreateLoadBalancer defaults []→[self]). Normalize the same way
-	// on update, or the local apply loop is skipped for that shape — leaving
-	// HAProxy/keepalived unreloaded AND the LB firewall intent (VIP/ports/SNAT) stale.
-	lbHosts := lbApplyHosts(hostsStr, s.hostName)
+	// hosts is the LB's durable holder set. CreateLoadBalancer now records
+	// [s.hostName] for a default explicit LB, so this is non-empty for anything a
+	// current binary created — the local apply loop runs on the holder and the
+	// forward loop reaches the rest. We deliberately do NOT default []→self here:
+	// a legacy row with no recorded holder (or a corrupt hosts field) must not make
+	// a non-holder node claim/refresh the VIP. Such a row simply doesn't re-apply
+	// here until its holder is re-established (re-create).
+	var lbHosts []string
+	json.Unmarshal([]byte(hostsStr), &lbHosts) //nolint:errcheck
 
 	// Apply locally.
 	for _, h := range lbHosts {
@@ -2498,6 +2492,13 @@ func (s *Server) lbRunsOnHost(ctx context.Context, cfg corrosion.LBConfigRecord)
 		json.Unmarshal([]byte(cfg.Hosts), &hosts)
 	}
 	if len(hosts) == 0 {
+		// VM-derived implicit membership is ONLY valid for a stack LB (its holders
+		// are wherever the stack's VMs run). An explicit LB (StackName=="") with no
+		// recorded holder must NOT be claimed by any host that merely has a VM —
+		// that would let arbitrary hosts reapply/double-serve the VIP.
+		if cfg.StackName == "" {
+			return false
+		}
 		vms, _ := corrosion.ListVMs(ctx, s.db, cfg.StackName, s.hostName)
 		return len(vms) > 0
 	}

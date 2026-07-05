@@ -59,7 +59,38 @@ func Check(path string) error {
 		}
 	}
 
-	// Validate L1 → L2 references are within file bounds.
+	refcountBits := uint32(1) << h.RefcountOrder
+	entriesPerBlock := clusterSize * 8 / uint64(refcountBits)
+	if entriesPerBlock == 0 {
+		return fmt.Errorf("invalid refcount geometry (order %d, cluster %d)", h.RefcountOrder, clusterSize)
+	}
+	totalClusters := (fileSize + clusterSize - 1) / clusterSize
+
+	// expected[c] counts how many times cluster c is referenced by the image
+	// structure. It is built during the L1/L2 walk below and compared against the
+	// on-disk refcounts at the end. This is the check that actually catches a
+	// metadata cluster left uncounted (the create/resize refcount bugs) — the prior
+	// Check validated only that offsets stayed in-bounds, so those bugs sailed
+	// through and reached disk, where qemu later reused an in-use cluster.
+	expected := make([]uint64, totalClusters)
+	mark := func(cluster uint64) {
+		if cluster < totalClusters {
+			expected[cluster]++
+		}
+	}
+
+	// Metadata clusters: header, refcount table, L1 table (refcount blocks are
+	// marked after the table is read, below).
+	mark(0)
+	for i := uint64(0); i < uint64(h.RefcountTableClusters); i++ {
+		mark(h.RefcountTableOffset/clusterSize + i)
+	}
+	l1Clusters := (l1Bytes + clusterSize - 1) / clusterSize
+	for i := uint64(0); i < l1Clusters; i++ {
+		mark(h.L1TableOffset/clusterSize + i)
+	}
+
+	// Validate L1 → L2 references are within file bounds and mark L2 + data clusters.
 	l1 := make([]byte, l1Bytes)
 	if _, err := f.ReadAt(l1, int64(h.L1TableOffset)); err != nil {
 		return fmt.Errorf("read L1 table: %w", err)
@@ -75,6 +106,7 @@ func Check(path string) error {
 			return fmt.Errorf("L1[%d] points to L2 at %d, beyond file end %d",
 				i, l2Offset, fileSize)
 		}
+		mark(l2Offset / clusterSize)
 
 		// Validate L2 entries.
 		l2 := make([]byte, clusterSize)
@@ -100,31 +132,68 @@ func Check(path string) error {
 					return fmt.Errorf("L2[%d][%d] compressed data at %d+%d exceeds file",
 						i, j, hostOffset, sectors*512)
 				}
+				startCluster := hostOffset / clusterSize
+				endCluster := (endByte + clusterSize - 1) / clusterSize
+				for c := startCluster; c < endCluster; c++ {
+					mark(c)
+				}
 			} else {
 				hostOffset := l2Entry & 0x00fffffffffffe00
-				if hostOffset > 0 && hostOffset+clusterSize > fileSize {
-					return fmt.Errorf("L2[%d][%d] data cluster at %d exceeds file",
-						i, j, hostOffset)
+				if hostOffset > 0 {
+					if hostOffset+clusterSize > fileSize {
+						return fmt.Errorf("L2[%d][%d] data cluster at %d exceeds file",
+							i, j, hostOffset)
+					}
+					mark(hostOffset / clusterSize)
 				}
 			}
 		}
 	}
 
-	// Validate refcount table entries.
+	// Validate refcount table entries and mark the refcount block clusters.
 	rcTable := make([]byte, rcTableBytes)
 	if _, err := f.ReadAt(rcTable, int64(h.RefcountTableOffset)); err != nil {
 		return fmt.Errorf("read refcount table: %w", err)
 	}
 
 	rcEntries := rcTableBytes / 8
+	blockOffsets := make([]uint64, rcEntries)
 	for i := uint64(0); i < rcEntries; i++ {
 		blockOffset := binary.BigEndian.Uint64(rcTable[i*8 : i*8+8])
+		blockOffsets[i] = blockOffset
 		if blockOffset == 0 {
 			continue
 		}
 		if blockOffset+clusterSize > fileSize {
 			return fmt.Errorf("refcount table[%d] points to block at %d, beyond file",
 				i, blockOffset)
+		}
+		mark(blockOffset / clusterSize)
+	}
+
+	// Compare the reconstructed reference counts against the recorded refcounts.
+	// A referenced cluster recorded with a LOWER refcount (typically 0) is the
+	// corruption vector — qemu will hand it to a new allocation while it is in use.
+	// A HIGHER recorded refcount is a leak (wasted space). Both mean the writer
+	// produced an inconsistent image, so flag either.
+	blockCache := make(map[uint64][]byte)
+	for c := uint64(0); c < totalClusters; c++ {
+		blockIdx := c / entriesPerBlock
+		var actual uint64
+		if blockIdx < rcEntries && blockOffsets[blockIdx] != 0 {
+			blk, ok := blockCache[blockIdx]
+			if !ok {
+				blk = make([]byte, clusterSize)
+				if _, err := f.ReadAt(blk, int64(blockOffsets[blockIdx])); err != nil {
+					return fmt.Errorf("read refcount block %d: %w", blockIdx, err)
+				}
+				blockCache[blockIdx] = blk
+			}
+			actual = readRefcount(blk, c%entriesPerBlock, refcountBits)
+		}
+		if actual != expected[c] {
+			return fmt.Errorf("refcount mismatch at cluster %d: recorded %d, referenced %d times",
+				c, actual, expected[c])
 		}
 	}
 

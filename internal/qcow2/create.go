@@ -5,7 +5,20 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
+
+// fsyncDir best-effort fsyncs a directory so a rename into it survives power
+// loss. Errors are ignored: the file is already renamed and valid on the live
+// filesystem; the dir fsync only upgrades crash-durability of the directory entry.
+func fsyncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
+}
 
 // closeAndCleanup closes c and folds any Close error into err (when err is
 // otherwise nil), then removes path if the overall result is an error. A failed
@@ -116,26 +129,57 @@ func CreateWithBackingURI(path, backingURI string, sizeBytes uint64, opts *Optio
 //
 // On-disk layout (cluster indices):
 //
-//	Cluster 0: Header + header extensions + optional backing file path
-//	Cluster 1: Refcount table
-//	Cluster 2: Refcount block 0
-//	Cluster 3: L1 table
+//	Cluster 0:                     Header + header extensions + optional backing path
+//	Clusters [1, 1+T):             Refcount table (T clusters)
+//	Clusters [1+T, 1+T+B):         Refcount blocks (B clusters)
+//	Clusters [1+T+B, 1+T+B+L1):    L1 table
+//
+// The refcount blocks (B) and table (T) must count EVERY metadata cluster,
+// including themselves — both are self-referential, so their sizes are solved
+// by a fixed-point iteration. At the 64K default this settles at T=1, B=1 (the
+// classic single-block layout: rctable@1, rcblock@2, L1@3); only a small cluster
+// size with a large virtual size needs B>1. Writing a single fixed block there
+// (the old behavior) silently dropped the refcounts of every metadata cluster
+// past the block's capacity — qemu would later hand those in-use clusters to a
+// new allocation, corrupting the guest.
 func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts *Options) (err error) {
 	clusterBits := opts.clusterBits()
 	clusterSize := opts.clusterSize()
 	refcountOrder := opts.refcountOrder()
+	refcountBits := uint32(1) << refcountOrder
+	entriesPerBlock := clusterSize * 8 / uint64(refcountBits)
 
 	l1Size := l1Entries(sizeBytes, clusterSize)
-
-	// How many clusters the L1 table needs.
 	l1Bytes := uint64(l1Size) * 8
 	l1Clusters := (l1Bytes + clusterSize - 1) / clusterSize
 	if l1Clusters == 0 {
 		l1Clusters = 1
 	}
 
-	// Total metadata clusters: header(1) + rctable(1) + rcblock(1) + L1(l1Clusters).
-	totalMeta := 3 + l1Clusters
+	// Solve refcount-table-cluster (T) and refcount-block (B) counts to a fixed
+	// point: B must cover header+T+B+L1 metadata clusters, and T must be able to
+	// point at B blocks. Both grow monotonically, so this converges in a few steps.
+	rcTableClusters := uint64(1)
+	rcBlocks := uint64(1)
+	for {
+		totalMeta := 1 + rcTableClusters + rcBlocks + l1Clusters
+		neededBlocks := (totalMeta + entriesPerBlock - 1) / entriesPerBlock
+		neededTable := (neededBlocks*8 + clusterSize - 1) / clusterSize
+		if neededBlocks <= rcBlocks && neededTable <= rcTableClusters {
+			break
+		}
+		if neededBlocks > rcBlocks {
+			rcBlocks = neededBlocks
+		}
+		if neededTable > rcTableClusters {
+			rcTableClusters = neededTable
+		}
+	}
+	totalMeta := 1 + rcTableClusters + rcBlocks + l1Clusters
+
+	rcTableOffset := 1 * clusterSize
+	rcBlockBase := (1 + rcTableClusters) * clusterSize
+	l1Offset := (1 + rcTableClusters + rcBlocks) * clusterSize
 
 	h := &Header{
 		Magic:                 Magic,
@@ -143,18 +187,27 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 		ClusterBits:           clusterBits,
 		Size:                  sizeBytes,
 		L1Size:                l1Size,
-		L1TableOffset:         3 * clusterSize, // cluster 3
-		RefcountTableOffset:   1 * clusterSize, // cluster 1
-		RefcountTableClusters: 1,
+		L1TableOffset:         l1Offset,
+		RefcountTableOffset:   rcTableOffset,
+		RefcountTableClusters: uint32(rcTableClusters),
 		RefcountOrder:         refcountOrder,
 		HeaderLength:          104,
 	}
 
-	f, err := os.Create(path)
+	// Write to a temp file and atomically rename into place, then fsync the parent
+	// dir: a crash mid-write can't leave a partial/torn qcow2 at the real path.
+	tmpPath := path + ".tmp"
+	f, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
-	defer func() { err = closeAndCleanup(f, path, err) }()
+	committed := false
+	defer func() {
+		if !committed {
+			f.Close() // may double-close after the explicit Close below — harmless
+			os.Remove(tmpPath)
+		}
+	}()
 
 	// Write header.
 	if err = writeHeader(f, h); err != nil {
@@ -173,8 +226,7 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 		}
 		n, wErr := writeHeaderExtension(f, extOffset, ExtBackingFormat, []byte(bf))
 		if wErr != nil {
-			err = fmt.Errorf("write backing format ext: %w", wErr)
-			return err
+			return fmt.Errorf("write backing format ext: %w", wErr)
 		}
 		extOffset += n
 	}
@@ -188,11 +240,17 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 	// Write backing file path (after extensions, still in cluster 0).
 	if backingPath != "" {
 		backingBytes := []byte(backingPath)
+		// The header + extensions + backing path all live in cluster 0; refuse a
+		// path that would spill into the refcount table rather than silently
+		// corrupt it (previously only caught reactively by the post-create Check).
+		if uint64(extOffset)+uint64(len(backingBytes)) > clusterSize {
+			return fmt.Errorf("backing path (%d bytes at offset %d) does not fit in cluster 0 (%d bytes)",
+				len(backingBytes), extOffset, clusterSize)
+		}
 		h.BackingFileOffset = uint64(extOffset)
 		h.BackingFileSize = uint32(len(backingBytes))
 		if _, wErr := f.WriteAt(backingBytes, extOffset); wErr != nil {
-			err = fmt.Errorf("write backing file path: %w", wErr)
-			return err
+			return fmt.Errorf("write backing file path: %w", wErr)
 		}
 
 		// Re-write header with updated backing file offset/size.
@@ -201,41 +259,49 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 		}
 	}
 
-	// Cluster 1: Refcount table — one entry pointing to refcount block 0 at cluster 2.
-	rcTable := make([]byte, clusterSize)
-	binary.BigEndian.PutUint64(rcTable[0:8], 2*clusterSize) // rcblock 0 at cluster 2
-	if _, err = f.WriteAt(rcTable, int64(1*clusterSize)); err != nil {
+	// Refcount table: one entry per refcount block.
+	rcTable := make([]byte, rcTableClusters*clusterSize)
+	for b := uint64(0); b < rcBlocks; b++ {
+		binary.BigEndian.PutUint64(rcTable[b*8:b*8+8], rcBlockBase+b*clusterSize)
+	}
+	if _, err = f.WriteAt(rcTable, int64(rcTableOffset)); err != nil {
 		return fmt.Errorf("write refcount table: %w", err)
 	}
 
-	// Cluster 2: Refcount block 0 — set refcount=1 for each metadata cluster.
-	rcBlock := make([]byte, clusterSize)
-	refcountBits := uint32(1) << refcountOrder
+	// Refcount blocks: refcount=1 for every metadata cluster in [0, totalMeta),
+	// spread across as many blocks as the layout requires.
+	rcBlockBytes := make([]byte, rcBlocks*clusterSize)
 	for i := uint64(0); i < totalMeta; i++ {
-		writeRefcount(rcBlock, i, 1, refcountBits)
+		b := i / entriesPerBlock
+		e := i % entriesPerBlock
+		writeRefcount(rcBlockBytes[b*clusterSize:(b+1)*clusterSize], e, 1, refcountBits)
 	}
-	if _, err = f.WriteAt(rcBlock, int64(2*clusterSize)); err != nil {
-		return fmt.Errorf("write refcount block: %w", err)
+	if _, err = f.WriteAt(rcBlockBytes, int64(rcBlockBase)); err != nil {
+		return fmt.Errorf("write refcount blocks: %w", err)
 	}
 
-	// Cluster 3+: L1 table — all zeros (no data allocated yet).
+	// L1 table — all zeros (no data allocated yet).
 	l1Table := make([]byte, l1Clusters*clusterSize)
-	if _, err = f.WriteAt(l1Table, int64(3*clusterSize)); err != nil {
+	if _, err = f.WriteAt(l1Table, int64(l1Offset)); err != nil {
 		return fmt.Errorf("write L1 table: %w", err)
 	}
 
 	if err = f.Sync(); err != nil {
 		return fmt.Errorf("sync: %w", err)
 	}
-
-	// Self-check. The contents are Sync'd above, so Check can read them back
-	// while f is still open; the deferred closeAndCleanup performs the single
-	// close (and surfaces any close error). Closing here too would double-close
-	// and the spurious "file already closed" error would wrongly remove the file.
-	if checkErr := Check(path); checkErr != nil {
-		err = fmt.Errorf("post-create check failed: %w", checkErr)
-		return err
+	if err = f.Close(); err != nil {
+		return fmt.Errorf("close: %w", err)
 	}
+
+	// Self-check the finished temp image before publishing it.
+	if err = Check(tmpPath); err != nil {
+		return fmt.Errorf("post-create check failed: %w", err)
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename into place: %w", err)
+	}
+	committed = true
+	fsyncDir(filepath.Dir(path))
 	return nil
 }
 

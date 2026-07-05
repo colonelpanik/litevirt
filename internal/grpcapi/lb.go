@@ -907,8 +907,17 @@ func removedHosts(old, new []string) []string {
 // parseHostsJSON decodes a stored hosts column ("[]" / "" / a JSON array). ok=false
 // only when a non-empty value fails to parse — the member set is the Phase-2 boundary,
 // so a corrupt value must read as UNKNOWN (fail closed), not as an empty set.
+// lbHostsUnset reports whether a stored LB hosts value records NO holder — the
+// legacy shape an older CLI create persisted. `lv lb create` with no --host
+// marshals a NIL slice, which encoding/json renders as the string "null" (NOT
+// "[]"), so all of "", "[]", and "null" must count as unowned. (Durable-holder
+// creates now always record a concrete host, so this only matches legacy rows.)
+func lbHostsUnset(hostsJSON string) bool {
+	return hostsJSON == "" || hostsJSON == "[]" || hostsJSON == "null"
+}
+
 func parseHostsJSON(s string) (hosts []string, ok bool) {
-	if s == "" || s == "[]" {
+	if lbHostsUnset(s) {
 		return nil, true
 	}
 	if err := json.Unmarshal([]byte(s), &hosts); err != nil {
@@ -1422,7 +1431,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	// proven participant is adopted; if none can be, the pre-persist check below
 	// fails closed. (No refuse here: a colliding-backend edit must still fail with
 	// InvalidArgument first, and that validation runs after the gate.)
-	if r.String("stack_name") == "" && (oldHostsStr == "" || oldHostsStr == "[]") {
+	if r.String("stack_name") == "" && lbHostsUnset(oldHostsStr) {
 		if participants, ok := s.actualLBParticipants(ctx, req.Name); ok && len(participants) == 1 {
 			h, _ := json.Marshal(participants)
 			oldHostsStr = string(h)
@@ -1522,7 +1531,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	// than persist a reload-required change with no safe target (or orphan a live
 	// VIP). Placed after backend/name validation so an invalid edit still fails first
 	// with InvalidArgument.
-	if r.String("stack_name") == "" && (oldHostsStr == "" || oldHostsStr == "[]") {
+	if r.String("stack_name") == "" && lbHostsUnset(oldHostsStr) {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"load balancer %q has no established holder (legacy row): retry once its VIP host is reachable, or re-create it", req.Name)
 	}
@@ -2441,7 +2450,7 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 // than guessed. ClaimLBHolderIfUnowned then only sets a row still recorded as
 // unowned, so a concurrent repair can't clobber an established holder.
 func (s *Server) repairLegacyLBHolder(ctx context.Context, cfg corrosion.LBConfigRecord) corrosion.LBConfigRecord {
-	if cfg.StackName != "" || !(cfg.Hosts == "" || cfg.Hosts == "[]") {
+	if cfg.StackName != "" || !lbHostsUnset(cfg.Hosts) {
 		return cfg
 	}
 	participants, ok := s.actualLBParticipants(ctx, cfg.Name)
@@ -2567,7 +2576,7 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 // stack.
 func (s *Server) lbRunsOnHost(ctx context.Context, cfg corrosion.LBConfigRecord) bool {
 	var hosts []string
-	if cfg.Hosts != "" && cfg.Hosts != "[]" {
+	if !lbHostsUnset(cfg.Hosts) {
 		json.Unmarshal([]byte(cfg.Hosts), &hosts)
 	}
 	if len(hosts) == 0 {

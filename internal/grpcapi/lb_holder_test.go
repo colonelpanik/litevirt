@@ -102,3 +102,19 @@ func TestRepairLegacyLBHolder_ProbesParticipants(t *testing.T) {
 		t.Errorf("exactly one participant → must backfill it as holder; hosts = %q", got.Hosts)
 	}
 }
+
+// TestLBHostsUnset: the legacy `lv lb create` (no --host) persists hosts as the
+// JSON string "null" (a marshaled nil slice), NOT "[]" — all unowned shapes must
+// be recognized so the repair fires on real legacy rows.
+func TestLBHostsUnset(t *testing.T) {
+	for _, s := range []string{"", "[]", "null"} {
+		if !lbHostsUnset(s) {
+			t.Errorf("lbHostsUnset(%q) = false; want true (unowned)", s)
+		}
+	}
+	for _, s := range []string{`["h"]`, `["a","b"]`} {
+		if lbHostsUnset(s) {
+			t.Errorf("lbHostsUnset(%q) = true; want false (has holder)", s)
+		}
+	}
+}

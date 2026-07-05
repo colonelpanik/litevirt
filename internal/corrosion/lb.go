@@ -95,7 +95,7 @@ func ListLBConfigs(ctx context.Context, c *Client) ([]LBConfigRecord, error) {
 func ClaimLBHolderIfUnowned(ctx context.Context, c *Client, name, hostsJSON string) (bool, error) {
 	n, err := c.ExecuteRows(ctx,
 		`UPDATE lb_configs SET hosts = ?, updated_at = ?
-		 WHERE name = ? AND deleted_at IS NULL AND (hosts = '' OR hosts = '[]')`,
+		 WHERE name = ? AND deleted_at IS NULL AND (hosts IS NULL OR hosts IN ('', '[]', 'null'))`,
 		hostsJSON, c.NowTS(), name)
 	return n > 0, err
 }

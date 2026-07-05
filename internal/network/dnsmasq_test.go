@@ -7,6 +7,30 @@ import (
 	"time"
 )
 
+// TestCmdlineHasPidFile guards the recycled-PID hazard: StopDHCP / the drift
+// restart only signal a PID whose cmdline carries THIS bridge's --pid-file, so an
+// unrelated process holding a recycled PID is never SIGTERM/SIGKILLed.
+func TestCmdlineHasPidFile(t *testing.T) {
+	blob := func(args ...string) []byte { return []byte(strings.Join(args, "\x00")) }
+	const pf = "/run/litevirt-dnsmasq-br9.pid"
+
+	if !cmdlineHasPidFile(blob("dnsmasq", "--interface=br9", "--pid-file="+pf), pf) {
+		t.Error("our own dnsmasq cmdline must be recognized")
+	}
+	// A different bridge's dnsmasq must NOT match (don't kill a sibling instance).
+	if cmdlineHasPidFile(blob("dnsmasq", "--pid-file=/run/litevirt-dnsmasq-other.pid"), pf) {
+		t.Error("a different --pid-file must not match")
+	}
+	// An unrelated recycled-PID process must NOT match.
+	if cmdlineHasPidFile(blob("sleep", "30"), pf) {
+		t.Error("an unrelated process must not match")
+	}
+	// Empty / unreadable cmdline is conservatively not-ours.
+	if cmdlineHasPidFile(nil, pf) {
+		t.Error("empty cmdline must not match")
+	}
+}
+
 // TestWaitProcessExit_KillsLingerer proves the drift-restart path won't launch a
 // replacement dnsmasq while the old one still holds the socket: waitProcessExit
 // escalates to SIGKILL and returns only once the process is actually gone.

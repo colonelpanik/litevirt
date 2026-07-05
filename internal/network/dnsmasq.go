@@ -123,8 +123,10 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 	// resolver was configured (so it lacks the --server=/<domain>/ forward and
 	// guests can't resolve litevirt names) — must be replaced. The desired args
 	// are compared against /proc/<pid>/cmdline so the decision survives a daemon
-	// re-exec with no in-memory state.
-	if pid := readPidFile(pidFile); pid > 0 && processRunning(pid) {
+	// re-exec with no in-memory state. The procIsOurDnsmasq guard ensures a stale
+	// pidfile whose PID was recycled to an unrelated process is treated as "not
+	// running" (start fresh) rather than being stopped/killed as if it were ours.
+	if pid := readPidFile(pidFile); pid > 0 && processRunning(pid) && procIsOurDnsmasq(pid, pidFile) {
 		if dnsmasqArgsCurrent(pid, desiredArgs) {
 			slog.Debug("dnsmasq already running", "bridge", bridge, "pid", pid)
 			return nil
@@ -255,6 +257,32 @@ func dnsmasqArgsCurrent(pid int, want []string) bool {
 	return cmdlineMatchesArgs(data, want)
 }
 
+// procIsOurDnsmasq reports whether the live process pid is one of OUR dnsmasq
+// instances — its command line carries this bridge's unique --pid-file arg. It is
+// the guard before signaling a pidfile's PID directly (or SIGKILLing it): a stale
+// pidfile whose PID has been recycled to an unrelated process must NOT be signaled.
+// A /proc read failure returns false (treat as not-ours; fall back to the
+// pidfile-pattern pkill) — the conservative choice for a destructive action.
+func procIsOurDnsmasq(pid int, pidFile string) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	return cmdlineHasPidFile(data, pidFile)
+}
+
+// cmdlineHasPidFile reports whether a raw /proc/<pid>/cmdline blob carries a
+// --pid-file arg for pidFile (the unique discriminator for one of our dnsmasq
+// instances).
+func cmdlineHasPidFile(cmdline []byte, pidFile string) bool {
+	for _, f := range strings.Split(string(cmdline), "\x00") {
+		if strings.Contains(f, "pid-file="+pidFile) {
+			return true
+		}
+	}
+	return false
+}
+
 // cmdlineMatchesArgs compares a raw /proc/<pid>/cmdline blob (NUL-separated,
 // argv[0] first) against a desired dnsmasq arg set, order-insensitive. A blob
 // with no args (≤1 field) is treated as matching so a read race can't trigger a
@@ -296,10 +324,19 @@ func sameStringSet(a, b []string) bool {
 func StopDHCP(pidFile string) error {
 	if data, err := os.ReadFile(pidFile); err == nil {
 		if pid, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil {
-			if proc, ferr := os.FindProcess(pid); ferr == nil {
-				if err := proc.Signal(syscall.SIGTERM); err != nil {
-					slog.Debug("dnsmasq already stopped", "pid", pid)
+			// Only signal the recorded PID directly if it is verifiably still one of
+			// our dnsmasq processes. A stale pidfile plus PID reuse could otherwise
+			// SIGTERM an unrelated process; in that case skip the direct signal and
+			// rely on the --pid-file pattern pkill below.
+			if procIsOurDnsmasq(pid, pidFile) {
+				if proc, ferr := os.FindProcess(pid); ferr == nil {
+					if err := proc.Signal(syscall.SIGTERM); err != nil {
+						slog.Debug("dnsmasq already stopped", "pid", pid)
+					}
 				}
+			} else {
+				slog.Debug("dnsmasq pidfile PID is not ours (stale/recycled); relying on pattern kill",
+					"pid", pid, "pidfile", pidFile)
 			}
 		}
 	}

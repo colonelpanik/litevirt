@@ -1,9 +1,37 @@
 package network
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestWaitProcessExit_KillsLingerer proves the drift-restart path won't launch a
+// replacement dnsmasq while the old one still holds the socket: waitProcessExit
+// escalates to SIGKILL and returns only once the process is actually gone.
+func TestWaitProcessExit_KillsLingerer(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot spawn helper process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	go func() { _ = cmd.Wait() }() // reap so the PID doesn't linger as a zombie
+
+	if !processRunning(pid) {
+		t.Fatal("helper should be running before waitProcessExit")
+	}
+	// We never SIGTERM it here (StopDHCP does that in production), so this
+	// exercises the SIGKILL escalation after the graceful window elapses.
+	start := time.Now()
+	waitProcessExit(pid, 100*time.Millisecond)
+	if processRunning(pid) {
+		t.Error("waitProcessExit must SIGKILL a process that outlives the timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("waitProcessExit took %v; expected to return promptly after SIGKILL", elapsed)
+	}
+}
 
 func hasArg(args []string, want string) bool {
 	for _, a := range args {

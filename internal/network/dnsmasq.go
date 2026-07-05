@@ -131,13 +131,38 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 		}
 		slog.Info("dnsmasq config drifted; restarting to apply new args", "bridge", bridge, "pid", pid)
 		_ = StopDHCP(pidFile)
+		// Wait for the old process to actually exit before launching the
+		// replacement. StopDHCP only signals — it doesn't wait — so the outgoing
+		// dnsmasq may still hold the bridge gateway IP:53 and cause the new one to
+		// die with a bind failure. Escalate to SIGKILL if it lingers past the
+		// graceful window.
+		waitProcessExit(pid, 3*time.Second)
 	}
 
 	// Ensure the lease directory exists (it doubles as the IP scanner's read
 	// path). libvirt usually creates it, but a KVM-less / fresh host may not.
 	os.MkdirAll(dnsmasqLeaseDir, 0o755) //nolint:errcheck
 
-	cmd := exec.Command("dnsmasq", desiredArgs...)
+	// Spawn and verify it stays up. A just-stopped predecessor can hold the socket
+	// for a brief moment, so an immediate exit (bind failure) is retried once after
+	// a short backoff before giving up to the caller's reconcile.
+	var startErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		if startErr = spawnDnsmasq(bridge, pidFile, rangeStart, rangeEnd, desiredArgs); startErr == nil {
+			return nil
+		}
+	}
+	return startErr
+}
+
+// spawnDnsmasq launches one dnsmasq with args and confirms it survives a brief
+// settling window. An immediate exit usually means a bind conflict with a
+// not-yet-released predecessor; the caller retries. Returns nil once confirmed up.
+func spawnDnsmasq(bridge, pidFile, rangeStart, rangeEnd string, args []string) error {
+	cmd := exec.Command("dnsmasq", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -166,6 +191,27 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 
 	slog.Info("dnsmasq started", "bridge", bridge, "range", rangeStart+"-"+rangeEnd, "pid", cmd.Process.Pid)
 	return nil
+}
+
+// waitProcessExit waits up to timeout for pid to disappear, then escalates to
+// SIGKILL and waits briefly for the kill to take. Best-effort: a recycled PID is
+// unlikely in this sub-second window, and StopDHCP already matched the process by
+// its unique --pid-file before we get here.
+func waitProcessExit(pid int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processRunning(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	for i := 0; i < 20; i++ {
+		if !processRunning(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // isIPv6Gateway reports whether `gateway` (in IP or IP/prefix form) is a v6

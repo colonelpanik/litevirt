@@ -21,6 +21,15 @@ func TestCmdlineHasPidFile(t *testing.T) {
 	if cmdlineHasPidFile(blob("dnsmasq", "--pid-file=/run/litevirt-dnsmasq-other.pid"), pf) {
 		t.Error("a different --pid-file must not match")
 	}
+	// A superstring of our path must NOT match — this is the substring hazard the
+	// exact-arg match closes (an unrelated process holding a recycled PID whose arg
+	// merely contains our path).
+	if cmdlineHasPidFile(blob("dnsmasq", "--pid-file="+pf+".bak"), pf) {
+		t.Error("a superstring --pid-file value must not match")
+	}
+	if cmdlineHasPidFile(blob("weirdproc", "--other-flag=pid-file="+pf), pf) {
+		t.Error("the path embedded in a different flag must not match")
+	}
 	// An unrelated recycled-PID process must NOT match.
 	if cmdlineHasPidFile(blob("sleep", "30"), pf) {
 		t.Error("an unrelated process must not match")

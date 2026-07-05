@@ -271,12 +271,16 @@ func procIsOurDnsmasq(pid int, pidFile string) bool {
 	return cmdlineHasPidFile(data, pidFile)
 }
 
-// cmdlineHasPidFile reports whether a raw /proc/<pid>/cmdline blob carries a
-// --pid-file arg for pidFile (the unique discriminator for one of our dnsmasq
-// instances).
+// cmdlineHasPidFile reports whether a raw /proc/<pid>/cmdline blob carries the
+// exact --pid-file arg for pidFile (the unique discriminator for one of our
+// dnsmasq instances). It matches whole argv elements, not substrings, so an
+// unrelated process with an argument that merely CONTAINS the path (e.g.
+// "--pid-file=<path>.bak", or the path embedded in some other flag) is not
+// mistaken for ours.
 func cmdlineHasPidFile(cmdline []byte, pidFile string) bool {
+	want := "--pid-file=" + pidFile
 	for _, f := range strings.Split(string(cmdline), "\x00") {
-		if strings.Contains(f, "pid-file="+pidFile) {
+		if f == want {
 			return true
 		}
 	}

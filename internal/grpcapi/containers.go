@@ -75,7 +75,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// on success across all return paths.
 	if req.IdempotencyKey != "" {
 		reqHash := idempotencyRequestHash(req)
-		replay, ierr := s.idempotencyBegin(ctx, req.IdempotencyKey, "CreateContainer", reqHash)
+		replay, claimID, ierr := s.idempotencyBegin(ctx, req.IdempotencyKey, "CreateContainer", reqHash)
 		if ierr != nil {
 			return nil, ierr
 		}
@@ -86,7 +86,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 			}
 			return out, nil
 		}
-		defer func() { s.idempotencyFinish(ctx, req.IdempotencyKey, resp, retErr) }()
+		stopHB := s.startIdempotencyHeartbeat(ctx, req.IdempotencyKey, claimID)
+		defer func() {
+			stopHB()
+			s.idempotencyFinish(ctx, req.IdempotencyKey, claimID, resp, retErr)
+		}()
 	}
 	if forwarded, err := s.forwardCreateContainer(ctx, req); err != nil || forwarded != nil {
 		return forwarded, err

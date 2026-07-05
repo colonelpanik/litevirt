@@ -20,22 +20,30 @@ func TestIdempotency_ClaimReplayConflictInProgress(t *testing.T) {
 	req := &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "vm1"}, IdempotencyKey: "key-1"}
 	h := idempotencyRequestHash(req)
 
-	// First call claims → proceed.
-	if replay, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h); err != nil || replay != nil {
-		t.Fatalf("first begin = %v,%v; want claim (nil,nil)", replay, err)
+	// First call claims → proceed (returns an owner claim_id, no replay).
+	replay, claimID, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h)
+	if err != nil || replay != nil || claimID == "" {
+		t.Fatalf("first begin = %v,%q,%v; want claim (nil, claimID, nil)", replay, claimID, err)
 	}
 	// A concurrent retry (claim held, not yet finished) → Aborted (retryable), NOT proceed.
-	if _, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h); status.Code(err) != codes.Aborted {
+	if _, _, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h); status.Code(err) != codes.Aborted {
 		t.Errorf("concurrent begin = %v; want Aborted (in progress)", err)
 	}
 	// Different payload, same key → 409 even while in progress.
-	if _, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", "other-hash"); status.Code(err) != codes.AlreadyExists {
+	if _, _, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", "other-hash"); status.Code(err) != codes.AlreadyExists {
 		t.Errorf("different-payload begin = %v; want AlreadyExists", err)
 	}
 
-	// Finish successfully → a later retry replays the stored response.
-	s.idempotencyFinish(ctx, "key-1", &pb.VM{Name: "vm1", State: pb.VMState_VM_RUNNING}, nil)
-	replay, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h)
+	// A STALE owner (different claim_id) must not overwrite the live claim: finishing
+	// with the wrong id is a no-op, so the key stays in_progress.
+	s.idempotencyFinish(ctx, "key-1", "not-the-owner", &pb.VM{Name: "evil"}, nil)
+	if _, _, err := s.idempotencyBegin(ctx, "key-1", "CreateVM", h); status.Code(err) != codes.Aborted {
+		t.Errorf("after a stale-owner finish, key-1 must still be in progress; got %v", err)
+	}
+
+	// The real owner finishes successfully → a later retry replays the stored response.
+	s.idempotencyFinish(ctx, "key-1", claimID, &pb.VM{Name: "vm1", State: pb.VMState_VM_RUNNING}, nil)
+	replay, _, err = s.idempotencyBegin(ctx, "key-1", "CreateVM", h)
 	if err != nil || replay == nil {
 		t.Fatalf("post-finish begin = %v,%v; want replay", replay, err)
 	}
@@ -45,11 +53,12 @@ func TestIdempotency_ClaimReplayConflictInProgress(t *testing.T) {
 	}
 
 	// A failed op releases its claim → the key is claimable again.
-	if replay, err := s.idempotencyBegin(ctx, "key-2", "CreateVM", h); err != nil || replay != nil {
-		t.Fatalf("claim key-2: %v,%v", replay, err)
+	_, claimID2, err := s.idempotencyBegin(ctx, "key-2", "CreateVM", h)
+	if err != nil || claimID2 == "" {
+		t.Fatalf("claim key-2: %q,%v", claimID2, err)
 	}
-	s.idempotencyFinish(ctx, "key-2", nil, status.Error(codes.Internal, "boom"))
-	if replay, err := s.idempotencyBegin(ctx, "key-2", "CreateVM", h); err != nil || replay != nil {
+	s.idempotencyFinish(ctx, "key-2", claimID2, nil, status.Error(codes.Internal, "boom"))
+	if replay, _, err := s.idempotencyBegin(ctx, "key-2", "CreateVM", h); err != nil || replay != nil {
 		t.Errorf("after a failed op, key-2 must be re-claimable; got %v,%v", replay, err)
 	}
 }

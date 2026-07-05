@@ -19,6 +19,7 @@ const (
 // TTL-reaped (ReapExpiredIdempotencyKeys) and excluded from anti-entropy.
 type IdempotencyRecord struct {
 	Key         string
+	ClaimID     string // opaque owner token; complete/release/extend must match it
 	Method      string
 	RequestHash string
 	Response    string // base64 of the recorded proto response (empty while in_progress)
@@ -42,7 +43,7 @@ func idempotencyRecordExpired(rec *IdempotencyRecord) bool {
 // GetIdempotencyRecord returns the record for key, or nil if none exists.
 func GetIdempotencyRecord(ctx context.Context, c *Client, key string) (*IdempotencyRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT key, method, request_hash, response, status, expires_at
+		`SELECT key, claim_id, method, request_hash, response, status, expires_at
 		 FROM idempotency_keys WHERE key = ? AND deleted_at IS NULL LIMIT 1`, key)
 	if err != nil {
 		return nil, err
@@ -53,6 +54,7 @@ func GetIdempotencyRecord(ctx context.Context, c *Client, key string) (*Idempote
 	r := rows[0]
 	return &IdempotencyRecord{
 		Key:         r.String("key"),
+		ClaimID:     r.String("claim_id"),
 		Method:      r.String("method"),
 		RequestHash: r.String("request_hash"),
 		Response:    r.String("response"),
@@ -61,9 +63,11 @@ func GetIdempotencyRecord(ctx context.Context, c *Client, key string) (*Idempote
 	}, nil
 }
 
-// ClaimIdempotencyKey atomically claims key for an in-progress operation.
+// ClaimIdempotencyKey atomically claims key for an in-progress operation, tagging
+// the row with claimID (the caller's opaque owner token).
 //   - claimed=true              → THIS caller acquired the claim; run the op, then
-//     Complete or Release it. (Also true when it stole an expired prior record.)
+//     Complete or Release it with the SAME claimID. (Also true when it stole an
+//     expired prior record — the new claimID becomes the owner.)
 //   - claimed=false, existing   → a live record already exists: completed → replay
 //     its Response; in_progress → the operation is running (elsewhere / concurrently).
 //
@@ -71,15 +75,16 @@ func GetIdempotencyRecord(ctx context.Context, c *Client, key string) (*Idempote
 // fully serializes concurrent same-key requests (the first claims, the rest see the
 // claim). Cross-node concurrency is narrowed to the WAL-replication window rather
 // than eliminated (a cluster-wide lock would be heavier); creates also have the
-// name-uniqueness backstop. expiresAt is the claim lease — a crashed op frees the
-// key after it lapses.
-func ClaimIdempotencyKey(ctx context.Context, c *Client, key, method, reqHash, expiresAt string) (claimed bool, existing *IdempotencyRecord, err error) {
+// name-uniqueness backstop. expiresAt is the claim lease — the owner heartbeats it
+// (ExtendIdempotencyClaim) while working, so it only lapses on a genuine crash, and
+// a lapsed claim is stealable.
+func ClaimIdempotencyKey(ctx context.Context, c *Client, key, claimID, method, reqHash, expiresAt string) (claimed bool, existing *IdempotencyRecord, err error) {
 	now := c.NowTS()
 	insert := func() (int64, error) {
 		return c.ExecuteRows(ctx,
-			`INSERT INTO idempotency_keys (key, method, request_hash, response, status, created_at, updated_at, expires_at)
-			 VALUES (?, ?, ?, '', ?, ?, ?, ?) ON CONFLICT(key) DO NOTHING`,
-			key, method, reqHash, IdempotencyInProgress, now, now, expiresAt)
+			`INSERT INTO idempotency_keys (key, claim_id, method, request_hash, response, status, created_at, updated_at, expires_at)
+			 VALUES (?, ?, ?, ?, '', ?, ?, ?, ?) ON CONFLICT(key) DO NOTHING`,
+			key, claimID, method, reqHash, IdempotencyInProgress, now, now, expiresAt)
 	}
 	n, err := insert()
 	if err != nil {
@@ -104,6 +109,9 @@ func ClaimIdempotencyKey(ctx context.Context, c *Client, key, method, reqHash, e
 	}
 	// Steal an expired record (a crashed in-progress claim, or a completed record
 	// past its replay window) so a retry isn't blocked until the hourly reaper runs.
+	// The DELETE is CAS'd on the exact expires_at we observed, so two racing
+	// stealers can't both win — the loser's insert conflicts and it reports the
+	// winner's record instead.
 	if idempotencyRecordExpired(rec) {
 		if _, derr := c.ExecuteRows(ctx,
 			`DELETE FROM idempotency_keys WHERE key = ? AND expires_at = ?`, key, rec.ExpiresAt); derr == nil {
@@ -117,22 +125,37 @@ func ClaimIdempotencyKey(ctx context.Context, c *Client, key, method, reqHash, e
 	return false, rec, nil
 }
 
-// CompleteIdempotencyKey marks a claimed key completed with its response and
-// extends the expiry to the replay window. Only transitions a row THIS caller
-// holds (status in_progress).
-func CompleteIdempotencyKey(ctx context.Context, c *Client, key, responseB64, expiresAt string) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE idempotency_keys SET status = ?, response = ?, expires_at = ?, updated_at = ?
-		 WHERE key = ? AND status = ?`,
-		IdempotencyCompleted, responseB64, expiresAt, now, key, IdempotencyInProgress)
+// ExtendIdempotencyClaim pushes the lease of an in-progress claim THIS caller owns
+// out to expiresAt (the heartbeat). ok=false means we no longer own it — the row is
+// gone or was stolen (a newer claim_id) — so the caller should stop heartbeating.
+func ExtendIdempotencyClaim(ctx context.Context, c *Client, key, claimID, expiresAt string) (ok bool, err error) {
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE idempotency_keys SET expires_at = ?, updated_at = ?
+		 WHERE key = ? AND claim_id = ? AND status = ?`,
+		expiresAt, c.NowTS(), key, claimID, IdempotencyInProgress)
+	return n > 0, err
 }
 
-// ReleaseIdempotencyKey deletes an unfinished (in_progress) claim so a retry can
-// proceed after a failed operation. Never removes a completed record.
-func ReleaseIdempotencyKey(ctx context.Context, c *Client, key string) error {
+// CompleteIdempotencyKey marks the claim THIS caller owns completed with its
+// response and extends the expiry to the replay window. It matches on claim_id so a
+// stale owner (whose claim was stolen after its lease lapsed) can't overwrite the
+// newer claim. ok=false means our claim was stolen/gone — the caller lost the race
+// and must not treat completion as recorded.
+func CompleteIdempotencyKey(ctx context.Context, c *Client, key, claimID, responseB64, expiresAt string) (ok bool, err error) {
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE idempotency_keys SET status = ?, response = ?, expires_at = ?, updated_at = ?
+		 WHERE key = ? AND claim_id = ? AND status = ?`,
+		IdempotencyCompleted, responseB64, expiresAt, c.NowTS(), key, claimID, IdempotencyInProgress)
+	return n > 0, err
+}
+
+// ReleaseIdempotencyKey deletes the in-progress claim THIS caller owns so a retry
+// can proceed after a failed operation. Matches on claim_id (a stale owner can't
+// delete a newer claim) and never removes a completed record.
+func ReleaseIdempotencyKey(ctx context.Context, c *Client, key, claimID string) error {
 	return c.Execute(ctx,
-		`DELETE FROM idempotency_keys WHERE key = ? AND status = ?`, key, IdempotencyInProgress)
+		`DELETE FROM idempotency_keys WHERE key = ? AND claim_id = ? AND status = ?`,
+		key, claimID, IdempotencyInProgress)
 }
 
 // ReapExpiredIdempotencyKeys deletes records past their TTL (completed past the

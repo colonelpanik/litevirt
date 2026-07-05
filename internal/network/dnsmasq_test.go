@@ -1,9 +1,70 @@
 package network
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestCmdlineHasPidFile guards the recycled-PID hazard: StopDHCP / the drift
+// restart only signal a PID whose cmdline carries THIS bridge's --pid-file, so an
+// unrelated process holding a recycled PID is never SIGTERM/SIGKILLed.
+func TestCmdlineHasPidFile(t *testing.T) {
+	blob := func(args ...string) []byte { return []byte(strings.Join(args, "\x00")) }
+	const pf = "/run/litevirt-dnsmasq-br9.pid"
+
+	if !cmdlineHasPidFile(blob("dnsmasq", "--interface=br9", "--pid-file="+pf), pf) {
+		t.Error("our own dnsmasq cmdline must be recognized")
+	}
+	// A different bridge's dnsmasq must NOT match (don't kill a sibling instance).
+	if cmdlineHasPidFile(blob("dnsmasq", "--pid-file=/run/litevirt-dnsmasq-other.pid"), pf) {
+		t.Error("a different --pid-file must not match")
+	}
+	// A superstring of our path must NOT match — this is the substring hazard the
+	// exact-arg match closes (an unrelated process holding a recycled PID whose arg
+	// merely contains our path).
+	if cmdlineHasPidFile(blob("dnsmasq", "--pid-file="+pf+".bak"), pf) {
+		t.Error("a superstring --pid-file value must not match")
+	}
+	if cmdlineHasPidFile(blob("weirdproc", "--other-flag=pid-file="+pf), pf) {
+		t.Error("the path embedded in a different flag must not match")
+	}
+	// An unrelated recycled-PID process must NOT match.
+	if cmdlineHasPidFile(blob("sleep", "30"), pf) {
+		t.Error("an unrelated process must not match")
+	}
+	// Empty / unreadable cmdline is conservatively not-ours.
+	if cmdlineHasPidFile(nil, pf) {
+		t.Error("empty cmdline must not match")
+	}
+}
+
+// TestWaitProcessExit_KillsLingerer proves the drift-restart path won't launch a
+// replacement dnsmasq while the old one still holds the socket: waitProcessExit
+// escalates to SIGKILL and returns only once the process is actually gone.
+func TestWaitProcessExit_KillsLingerer(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot spawn helper process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	go func() { _ = cmd.Wait() }() // reap so the PID doesn't linger as a zombie
+
+	if !processRunning(pid) {
+		t.Fatal("helper should be running before waitProcessExit")
+	}
+	// We never SIGTERM it here (StopDHCP does that in production), so this
+	// exercises the SIGKILL escalation after the graceful window elapses.
+	start := time.Now()
+	waitProcessExit(pid, 100*time.Millisecond)
+	if processRunning(pid) {
+		t.Error("waitProcessExit must SIGKILL a process that outlives the timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("waitProcessExit took %v; expected to return promptly after SIGKILL", elapsed)
+	}
+}
 
 func hasArg(args []string, want string) bool {
 	for _, a := range args {
@@ -20,7 +81,7 @@ func hasArg(args []string, want string) bool {
 // serves guest DNS via the bridge gateway IP, so loopback must be excluded.
 func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 	args := dnsmasqArgs("br-test", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
-		"/var/run/litevirt-dnsmasq-br-test.pid", []string{"8.8.8.8"})
+		"/var/run/litevirt-dnsmasq-br-test.pid", []string{"8.8.8.8"}, "litevirt.local", 5354)
 
 	for _, want := range []string{
 		"--interface=br-test",
@@ -33,6 +94,8 @@ func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 		"--dhcp-range=10.0.0.2,10.0.0.254,255.255.255.0,12h",
 		"--server=8.8.8.8",
 		"--no-resolv",
+		// Domain-specific forward to the embedded DNS so guests resolve litevirt names.
+		"--server=/litevirt.local/127.0.0.1#5354",
 	} {
 		if !hasArg(args, want) {
 			t.Errorf("dnsmasq args missing %q\ngot: %s", want, strings.Join(args, " "))
@@ -44,11 +107,48 @@ func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 	}
 }
 
+// TestCmdlineMatchesArgs covers the drift check that decides whether a running
+// dnsmasq must be restarted to pick up new args (e.g. the embedded-DNS
+// --server= forward added on upgrade).
+func TestCmdlineMatchesArgs(t *testing.T) {
+	want := dnsmasqArgs("br0", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
+		"/run/lv-br0.pid", []string{"8.8.8.8"}, "litevirt.local", 5354)
+
+	// A cmdline built from exactly these args (argv[0] + args, NUL-joined, any
+	// order) is considered current — no restart.
+	blob := func(argv0 string, args []string) []byte {
+		return []byte(strings.Join(append([]string{argv0}, args...), "\x00"))
+	}
+	if !cmdlineMatchesArgs(blob("dnsmasq", want), want) {
+		t.Error("identical arg set must be reported current")
+	}
+	// Order must not matter.
+	shuffled := append([]string(nil), want...)
+	shuffled[0], shuffled[len(shuffled)-1] = shuffled[len(shuffled)-1], shuffled[0]
+	if !cmdlineMatchesArgs(blob("dnsmasq", shuffled), want) {
+		t.Error("reordered arg set must still be current")
+	}
+	// The load-bearing case: a dnsmasq started BEFORE the local resolver was
+	// configured lacks the --server=/domain/ forward → must be flagged stale.
+	stale := dnsmasqArgs("br0", "10.0.0.2", "10.0.0.254", "255.255.255.0", "10.0.0.1/24",
+		"/run/lv-br0.pid", []string{"8.8.8.8"}, "", 0)
+	if cmdlineMatchesArgs(blob("dnsmasq", stale), want) {
+		t.Error("a cmdline missing the embedded-DNS forward must be flagged stale")
+	}
+	// An empty / unreadable cmdline defaults to current (no spurious restart).
+	if !cmdlineMatchesArgs(nil, want) {
+		t.Error("empty cmdline must default to current")
+	}
+	if !cmdlineMatchesArgs([]byte("dnsmasq"), want) {
+		t.Error("argv0-only cmdline must default to current")
+	}
+}
+
 // TestDnsmasqArgs_V6EnablesRA confirms an IPv6 gateway turns on router
 // advertisements (and still excludes loopback).
 func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {
 	args := dnsmasqArgs("br-v6", "2001:db8::2", "2001:db8::ffff", "64", "2001:db8::1/64",
-		"/var/run/litevirt-dnsmasq-br-v6.pid", nil)
+		"/var/run/litevirt-dnsmasq-br-v6.pid", nil, "", 0)
 	if !hasArg(args, "--enable-ra") {
 		t.Error("--enable-ra not set for IPv6 gateway")
 	}
@@ -58,5 +158,11 @@ func TestDnsmasqArgs_V6EnablesRA(t *testing.T) {
 	// No upstream DNS supplied → must NOT force --no-resolv (fall back to resolv.conf).
 	if hasArg(args, "--no-resolv") {
 		t.Error("--no-resolv should not be set when no upstream DNS was resolved")
+	}
+	// No local resolver configured → no domain-specific forward.
+	for _, a := range args {
+		if strings.HasPrefix(a, "--server=/") {
+			t.Errorf("unexpected domain-specific --server with no local resolver: %q", a)
+		}
 	}
 }

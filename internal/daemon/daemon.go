@@ -389,8 +389,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// placement engine's DiskIOPS/NetBW dimensions.
 	go d.runRuntimeUsageSampler(ctx)
 
-	// Start embedded DNS server
+	// Start embedded DNS server, and tell the network layer to chain per-bridge
+	// dnsmasq instances to it for the litevirt domain so guests can resolve
+	// VM/container/anycast names (SetLocalResolver must precede network provisioning).
 	dnsSrv := dns.NewServer(d.cfg.DNSDomain, d.cfg.DNSPort, d.db)
+	network.SetLocalResolver(d.cfg.DNSDomain, d.cfg.DNSPort)
 	go dnsSrv.Start(ctx)
 
 	// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP

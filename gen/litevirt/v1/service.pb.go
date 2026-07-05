@@ -1800,10 +1800,16 @@ func (x *CreateVMRequest) GetIdempotencyKey() string {
 }
 
 type ListVMsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StackName     string                 `protobuf:"bytes,1,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
-	HostName      string                 `protobuf:"bytes,2,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
-	LabelFilter   map[string]string      `protobuf:"bytes,3,rep,name=label_filter,json=labelFilter,proto3" json:"label_filter,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	StackName   string                 `protobuf:"bytes,1,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
+	HostName    string                 `protobuf:"bytes,2,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	LabelFilter map[string]string      `protobuf:"bytes,3,rep,name=label_filter,json=labelFilter,proto3" json:"label_filter,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Keyset pagination (additive; mixed-version safe — an old server ignores these
+	// and returns the full list, an old client ignores next_page_token). page_size
+	// 0 = unpaginated (legacy behavior). page_token is the opaque cursor returned as
+	// next_page_token by the previous page.
+	PageSize      int32  `protobuf:"varint,4,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	PageToken     string `protobuf:"bytes,5,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1859,9 +1865,24 @@ func (x *ListVMsRequest) GetLabelFilter() map[string]string {
 	return nil
 }
 
+func (x *ListVMsRequest) GetPageSize() int32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+func (x *ListVMsRequest) GetPageToken() string {
+	if x != nil {
+		return x.PageToken
+	}
+	return ""
+}
+
 type ListVMsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Vms           []*VM                  `protobuf:"bytes,1,rep,name=vms,proto3" json:"vms,omitempty"`
+	NextPageToken string                 `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1901,6 +1922,13 @@ func (x *ListVMsResponse) GetVms() []*VM {
 		return x.Vms
 	}
 	return nil
+}
+
+func (x *ListVMsResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 type InspectVMRequest struct {
@@ -9741,7 +9769,9 @@ func (x *ExecContainerResponse) GetExitCode() int32 {
 
 type ListContainersRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	HostName      string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	HostName      string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"` // empty = every host
+	PageSize      int32                  `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	PageToken     string                 `protobuf:"bytes,3,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9783,9 +9813,24 @@ func (x *ListContainersRequest) GetHostName() string {
 	return ""
 }
 
+func (x *ListContainersRequest) GetPageSize() int32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+func (x *ListContainersRequest) GetPageToken() string {
+	if x != nil {
+		return x.PageToken
+	}
+	return ""
+}
+
 type ListContainersResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Containers    []*Container           `protobuf:"bytes,1,rep,name=containers,proto3" json:"containers,omitempty"`
+	NextPageToken string                 `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9825,6 +9870,13 @@ func (x *ListContainersResponse) GetContainers() []*Container {
 		return x.Containers
 	}
 	return nil
+}
+
+func (x *ListContainersResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 type PullOCIImageRequest struct {
@@ -21581,17 +21633,21 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06region\x18\b \x01(\tR\x06region\"c\n" +
 	"\x0fCreateVMRequest\x12'\n" +
 	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\x12'\n" +
-	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\"\xdd\x01\n" +
+	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\"\x99\x02\n" +
 	"\x0eListVMsRequest\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\x01 \x01(\tR\tstackName\x12\x1b\n" +
 	"\thost_name\x18\x02 \x01(\tR\bhostName\x12O\n" +
-	"\flabel_filter\x18\x03 \x03(\v2,.litevirt.v1.ListVMsRequest.LabelFilterEntryR\vlabelFilter\x1a>\n" +
+	"\flabel_filter\x18\x03 \x03(\v2,.litevirt.v1.ListVMsRequest.LabelFilterEntryR\vlabelFilter\x12\x1b\n" +
+	"\tpage_size\x18\x04 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x05 \x01(\tR\tpageToken\x1a>\n" +
 	"\x10LabelFilterEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"4\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\\\n" +
 	"\x0fListVMsResponse\x12!\n" +
-	"\x03vms\x18\x01 \x03(\v2\x0f.litevirt.v1.VMR\x03vms\"&\n" +
+	"\x03vms\x18\x01 \x03(\v2\x0f.litevirt.v1.VMR\x03vms\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"&\n" +
 	"\x10InspectVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"$\n" +
 	"\x0eStartVMRequest\x12\x12\n" +
@@ -22247,13 +22303,17 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x15ExecContainerResponse\x12\x16\n" +
 	"\x06stdout\x18\x01 \x01(\fR\x06stdout\x12\x16\n" +
 	"\x06stderr\x18\x02 \x01(\fR\x06stderr\x12\x1b\n" +
-	"\texit_code\x18\x03 \x01(\x05R\bexitCode\"4\n" +
+	"\texit_code\x18\x03 \x01(\x05R\bexitCode\"p\n" +
 	"\x15ListContainersRequest\x12\x1b\n" +
-	"\thost_name\x18\x01 \x01(\tR\bhostName\"P\n" +
+	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x1b\n" +
+	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x03 \x01(\tR\tpageToken\"x\n" +
 	"\x16ListContainersResponse\x126\n" +
 	"\n" +
 	"containers\x18\x01 \x03(\v2\x16.litevirt.v1.ContainerR\n" +
-	"containers\"\xa6\x01\n" +
+	"containers\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xa6\x01\n" +
 	"\x13PullOCIImageRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +
 	"\x05image\x18\x02 \x01(\tR\x05image\x12\x12\n" +

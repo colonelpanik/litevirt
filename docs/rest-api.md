@@ -94,7 +94,7 @@ Configure host request body (all fields optional):
 
 ```
 POST   /api/v1/vms                              # Create a VM
-GET    /api/v1/vms                              # List VMs (?stack=<name>&host=<name>)
+GET    /api/v1/vms                              # List VMs (?stack=<name>&host=<name>&page_size=&page_token=)
 GET    /api/v1/vms/{name}                       # Inspect a VM
 PUT    /api/v1/vms/{name}                       # Update VM resources (cpu, memory)
 POST   /api/v1/vms/{name}/start                 # Start a VM
@@ -272,7 +272,7 @@ name in the JSON body rather than a path segment, so they are
 | `/api/v1/2fa` | GET | `ListTwoFactors` |
 | `/api/v1/2fa` | DELETE | `DisableTwoFactor` (body: `{method, label}`) |
 | `/api/v1/2fa/totp/enroll` | POST | `EnrollTOTP` |
-| `/api/v1/containers` | GET | `ListContainers` (?host=) |
+| `/api/v1/containers` | GET | `ListContainers` (?host=&page_size=&page_token=) |
 | `/api/v1/containers/create` | POST | `CreateContainer` |
 | `/api/v1/containers/start` | POST | `StartContainer` (name in body) |
 | `/api/v1/containers/stop` | POST | `StopContainer` (name in body) |
@@ -325,6 +325,30 @@ move to WebSocket in a later iteration:
   stream; modelling that over HTTP is awkward.
 - `GetSpiceInfo` — short-lived URL handoff, but tied to a
   per-connection token; not worth duplicating yet.
+
+## Pagination
+
+`GET /api/v1/vms` and `GET /api/v1/containers` support opt-in keyset pagination:
+
+- `page_size` — max items to return. Omitted or `0` returns the full list
+  (legacy behavior). Values above the server ceiling are clamped; a negative or
+  non-integer value returns `400`.
+- `page_token` — the opaque `next_page_token` from the previous response. Pass it
+  to fetch the next page; a malformed token returns `400`.
+
+Each response carries `next_page_token`. Keep requesting with it until it comes
+back empty:
+
+```bash
+token=""
+while :; do
+  resp=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    "http://10.0.50.10:7446/api/v1/vms?page_size=100&page_token=$token")
+  echo "$resp" | jq -c '.vms[]'
+  token=$(echo "$resp" | jq -r '.next_page_token // ""')
+  [ -z "$token" ] && break
+done
+```
 
 ## Response format
 

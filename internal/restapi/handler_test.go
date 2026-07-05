@@ -68,7 +68,8 @@ type mockGRPC struct {
 	createNetworkResp  *pb.NetworkInfo
 
 	// Track calls
-	lastListVMsReq       *pb.ListVMsRequest
+	lastListVMsReq        *pb.ListVMsRequest
+	lastListContainersReq *pb.ListContainersRequest
 	lastInspectVMName    string
 	lastInspectHostName  string
 	lastStartVMName      string
@@ -489,8 +490,9 @@ func (m *mockGRPC) DeleteContainer(context.Context, *pb.DeleteContainerRequest, 
 func (m *mockGRPC) ExecContainer(context.Context, *pb.ExecContainerRequest, ...grpc.CallOption) (*pb.ExecContainerResponse, error) {
 	return &pb.ExecContainerResponse{}, nil
 }
-func (m *mockGRPC) ListContainers(context.Context, *pb.ListContainersRequest, ...grpc.CallOption) (*pb.ListContainersResponse, error) {
-	return &pb.ListContainersResponse{}, nil
+func (m *mockGRPC) ListContainers(_ context.Context, in *pb.ListContainersRequest, _ ...grpc.CallOption) (*pb.ListContainersResponse, error) {
+	m.lastListContainersReq = in
+	return &pb.ListContainersResponse{NextPageToken: "ct-next"}, nil
 }
 func (m *mockGRPC) PullOCIImage(context.Context, *pb.PullOCIImageRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
@@ -830,6 +832,63 @@ func TestListVMs_WithFilters(t *testing.T) {
 	}
 	if mock.lastListVMsReq.HostName != "node1" {
 		t.Errorf("host filter = %q, want node1", mock.lastListVMsReq.HostName)
+	}
+}
+
+// TestListVMs_Pagination asserts the REST gateway forwards page_size/page_token
+// to gRPC and echoes next_page_token back in the JSON body.
+func TestListVMs_Pagination(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.listVMsResp = &pb.ListVMsResponse{Vms: []*pb.VM{{Name: "vm1"}}, NextPageToken: "next-cursor"}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/vms?page_size=1&page_token=abc", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if mock.lastListVMsReq.PageSize != 1 || mock.lastListVMsReq.PageToken != "abc" {
+		t.Errorf("forwarded page_size=%d page_token=%q; want 1/abc",
+			mock.lastListVMsReq.PageSize, mock.lastListVMsReq.PageToken)
+	}
+	if !strings.Contains(rec.Body.String(), "next-cursor") {
+		t.Errorf("response body should echo next_page_token; got %s", rec.Body.String())
+	}
+}
+
+// TestListContainers_Pagination is the container-side analogue.
+func TestListContainers_Pagination(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/containers?page_size=5&page_token=xyz", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if mock.lastListContainersReq.PageSize != 5 || mock.lastListContainersReq.PageToken != "xyz" {
+		t.Errorf("forwarded page_size=%d page_token=%q; want 5/xyz",
+			mock.lastListContainersReq.PageSize, mock.lastListContainersReq.PageToken)
+	}
+	if !strings.Contains(rec.Body.String(), "ct-next") {
+		t.Errorf("response body should echo next_page_token; got %s", rec.Body.String())
+	}
+}
+
+// TestListVMs_BadPageSize rejects a non-integer / overflowing page_size with 400
+// before reaching gRPC.
+func TestListVMs_BadPageSize(t *testing.T) {
+	for _, bad := range []string{"abc", "-1", "9999999999999999999"} {
+		s, _ := newMockServer("test-token")
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/vms?page_size="+bad, nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		rec := httptest.NewRecorder()
+		s.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("page_size=%q → status %d, want 400", bad, rec.Code)
+		}
 	}
 }
 

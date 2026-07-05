@@ -174,20 +174,63 @@ func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRe
 
 	vms := make([]VMRecord, len(rows))
 	for i, r := range rows {
-		vms[i] = VMRecord{
-			Name:        r.String("name"),
-			StackName:   r.String("stack_name"),
-			HostName:    r.String("host_name"),
-			Spec:        r.String("spec"),
-			State:       r.String("state"),
-			StateDetail: r.String("state_detail"),
-			CPUActual:   r.Int("cpu_actual"),
-			MemActual:   r.Int("mem_actual"),
-			Project:     r.String("project"),
-			IsTemplate:  r.Int("is_template") == 1,
-			CreatedAt:   r.String("created_at"),
-			UpdatedAt:   r.String("updated_at"),
-		}
+		vms[i] = scanVMRow(r)
+	}
+	return vms, nil
+}
+
+// scanVMRow maps a row carrying the ListVMs column set to a VMRecord.
+func scanVMRow(r Row) VMRecord {
+	return VMRecord{
+		Name:        r.String("name"),
+		StackName:   r.String("stack_name"),
+		HostName:    r.String("host_name"),
+		Spec:        r.String("spec"),
+		State:       r.String("state"),
+		StateDetail: r.String("state_detail"),
+		CPUActual:   r.Int("cpu_actual"),
+		MemActual:   r.Int("mem_actual"),
+		Project:     r.String("project"),
+		IsTemplate:  r.Int("is_template") == 1,
+		CreatedAt:   r.String("created_at"),
+		UpdatedAt:   r.String("updated_at"),
+	}
+}
+
+// ListVMsPage returns up to limit VMs, ordered by name, whose name sorts strictly
+// after afterName — keyset pagination for ListVMs. name is the primary key (unique
+// cluster-wide) so it is a stable cursor. afterName "" starts at the beginning;
+// limit <= 0 returns all matching rows (unpaginated).
+func ListVMsPage(ctx context.Context, c *Client, stackName, hostName, afterName string, limit int) ([]VMRecord, error) {
+	sql := `SELECT name, stack_name, host_name, spec, state, state_detail,
+		cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
+		COALESCE(is_template, 0) AS is_template, created_at, updated_at
+		FROM vms WHERE deleted_at IS NULL`
+	var params []interface{}
+	if stackName != "" {
+		sql += " AND stack_name = ?"
+		params = append(params, stackName)
+	}
+	if hostName != "" {
+		sql += " AND host_name = ?"
+		params = append(params, hostName)
+	}
+	if afterName != "" {
+		sql += " AND name > ?"
+		params = append(params, afterName)
+	}
+	sql += " ORDER BY name"
+	if limit > 0 {
+		sql += " LIMIT ?"
+		params = append(params, limit)
+	}
+	rows, err := c.Query(ctx, sql, params...)
+	if err != nil {
+		return nil, err
+	}
+	vms := make([]VMRecord, len(rows))
+	for i, r := range rows {
+		vms[i] = scanVMRow(r)
 	}
 	return vms, nil
 }

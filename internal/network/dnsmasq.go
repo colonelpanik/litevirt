@@ -12,6 +12,23 @@ import (
 	"time"
 )
 
+// localResolverDomain/Port name the embedded DNS server that per-bridge dnsmasq
+// instances chain to for the litevirt domain. Set once at daemon start via
+// SetLocalResolver, before any network is provisioned. Empty domain / zero port
+// (the default) leaves dnsmasq forwarding everything upstream, as before.
+var (
+	localResolverDomain string
+	localResolverPort   int
+)
+
+// SetLocalResolver configures the embedded-DNS domain + port that new dnsmasq
+// instances forward that domain's queries to (127.0.0.1#port). Call once at
+// daemon start before reconcileNetworks.
+func SetLocalResolver(domain string, port int) {
+	localResolverDomain = strings.TrimSuffix(domain, ".")
+	localResolverPort = port
+}
+
 // startDHCPFunc is the active DHCP starter; replaced in tests to avoid spawning real dnsmasq.
 var startDHCPFunc = StartDHCP
 
@@ -47,7 +64,7 @@ var startDHCPFunc = StartDHCP
 // scanner doesn't read.
 const dnsmasqLeaseDir = "/var/lib/libvirt/dnsmasq"
 
-func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, upstreamDNS []string) []string {
+func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, upstreamDNS []string, localDomain string, localPort int) []string {
 	args := []string{
 		"--interface=" + bridge,
 		"--except-interface=lo",
@@ -63,6 +80,15 @@ func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, up
 	// route and dnsmasq's DHCPv6 server is announced.
 	if isIPv6Gateway(gateway) {
 		args = append(args, "--enable-ra", "--dhcp-authoritative")
+	}
+	// Domain-specific forward to the embedded DNS: guests get dnsmasq (the gateway)
+	// as their resolver, and dnsmasq forwards ONLY <localDomain> queries to the
+	// local embedded server, so litevirt VM/container/anycast names resolve while
+	// everything else still goes upstream. Without this the embedded server is
+	// orphaned and guests can't resolve litevirt names.
+	if localDomain != "" && localPort > 0 {
+		dom := strings.TrimSuffix(localDomain, ".")
+		args = append(args, fmt.Sprintf("--server=/%s/127.0.0.1#%d", dom, localPort))
 	}
 	for _, dns := range upstreamDNS {
 		args = append(args, "--server="+dns)
@@ -83,24 +109,62 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 		return fmt.Errorf("assign gateway to %s: %w: %s", bridge, err, out)
 	}
 
-	// If dnsmasq is already running for this bridge, leave it alone.
-	// Re-provisioning (e.g., during VM creation) should not restart a
-	// healthy DHCP server — doing so creates a window where no DHCP is
-	// available and can cause VMs to miss their lease.
-	if pid := readPidFile(pidFile); pid > 0 && processRunning(pid) {
-		slog.Debug("dnsmasq already running", "bridge", bridge, "pid", pid)
-		return nil
+	// Resolve upstream DNS servers from the host's /etc/resolv.conf and build the
+	// arg set we'd launch with NOW. Computed before the already-running check so we
+	// can detect config drift against the live process.
+	upstreamDNS := resolveUpstreamDNS()
+	desiredArgs := dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile, upstreamDNS, localResolverDomain, localResolverPort)
+
+	// If dnsmasq is already running for this bridge, leave it alone — UNLESS its
+	// live command line has drifted from what we'd launch now. Re-provisioning
+	// (e.g. during VM creation) must not bounce a healthy DHCP server for no
+	// reason: that opens a window with no DHCP and can cost a VM its lease. But a
+	// stale process — most importantly one started before the embedded-DNS
+	// resolver was configured (so it lacks the --server=/<domain>/ forward and
+	// guests can't resolve litevirt names) — must be replaced. The desired args
+	// are compared against /proc/<pid>/cmdline so the decision survives a daemon
+	// re-exec with no in-memory state. The procIsOurDnsmasq guard ensures a stale
+	// pidfile whose PID was recycled to an unrelated process is treated as "not
+	// running" (start fresh) rather than being stopped/killed as if it were ours.
+	if pid := readPidFile(pidFile); pid > 0 && processRunning(pid) && procIsOurDnsmasq(pid, pidFile) {
+		if dnsmasqArgsCurrent(pid, desiredArgs) {
+			slog.Debug("dnsmasq already running", "bridge", bridge, "pid", pid)
+			return nil
+		}
+		slog.Info("dnsmasq config drifted; restarting to apply new args", "bridge", bridge, "pid", pid)
+		_ = StopDHCP(pidFile)
+		// Wait for the old process to actually exit before launching the
+		// replacement. StopDHCP only signals — it doesn't wait — so the outgoing
+		// dnsmasq may still hold the bridge gateway IP:53 and cause the new one to
+		// die with a bind failure. Escalate to SIGKILL if it lingers past the
+		// graceful window.
+		waitProcessExit(pid, 3*time.Second)
 	}
 
 	// Ensure the lease directory exists (it doubles as the IP scanner's read
 	// path). libvirt usually creates it, but a KVM-less / fresh host may not.
 	os.MkdirAll(dnsmasqLeaseDir, 0o755) //nolint:errcheck
 
-	// Resolve upstream DNS servers from the host's /etc/resolv.conf.
-	// dnsmasq will forward DNS queries from guests to these servers.
-	upstreamDNS := resolveUpstreamDNS()
+	// Spawn and verify it stays up. A just-stopped predecessor can hold the socket
+	// for a brief moment, so an immediate exit (bind failure) is retried once after
+	// a short backoff before giving up to the caller's reconcile.
+	var startErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		if startErr = spawnDnsmasq(bridge, pidFile, rangeStart, rangeEnd, desiredArgs); startErr == nil {
+			return nil
+		}
+	}
+	return startErr
+}
 
-	cmd := exec.Command("dnsmasq", dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile, upstreamDNS)...)
+// spawnDnsmasq launches one dnsmasq with args and confirms it survives a brief
+// settling window. An immediate exit usually means a bind conflict with a
+// not-yet-released predecessor; the caller retries. Returns nil once confirmed up.
+func spawnDnsmasq(bridge, pidFile, rangeStart, rangeEnd string, args []string) error {
+	cmd := exec.Command("dnsmasq", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -131,6 +195,27 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 	return nil
 }
 
+// waitProcessExit waits up to timeout for pid to disappear, then escalates to
+// SIGKILL and waits briefly for the kill to take. Best-effort: a recycled PID is
+// unlikely in this sub-second window, and StopDHCP already matched the process by
+// its unique --pid-file before we get here.
+func waitProcessExit(pid int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processRunning(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	for i := 0; i < 20; i++ {
+		if !processRunning(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // isIPv6Gateway reports whether `gateway` (in IP or IP/prefix form) is a v6
 // address.
 func isIPv6Gateway(gateway string) bool {
@@ -159,6 +244,80 @@ func processRunning(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
+// dnsmasqArgsCurrent reports whether the live dnsmasq process `pid` was started
+// with the same argument SET as `want`. It reads /proc/<pid>/cmdline, so the
+// answer survives a daemon re-exec (no in-memory state). On any read/parse
+// failure it returns true (assume current) so a transient error can't force a
+// needless restart and DHCP gap.
+func dnsmasqArgsCurrent(pid int, want []string) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return true
+	}
+	return cmdlineMatchesArgs(data, want)
+}
+
+// procIsOurDnsmasq reports whether the live process pid is one of OUR dnsmasq
+// instances — its command line carries this bridge's unique --pid-file arg. It is
+// the guard before signaling a pidfile's PID directly (or SIGKILLing it): a stale
+// pidfile whose PID has been recycled to an unrelated process must NOT be signaled.
+// A /proc read failure returns false (treat as not-ours; fall back to the
+// pidfile-pattern pkill) — the conservative choice for a destructive action.
+func procIsOurDnsmasq(pid int, pidFile string) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	return cmdlineHasPidFile(data, pidFile)
+}
+
+// cmdlineHasPidFile reports whether a raw /proc/<pid>/cmdline blob carries the
+// exact --pid-file arg for pidFile (the unique discriminator for one of our
+// dnsmasq instances). It matches whole argv elements, not substrings, so an
+// unrelated process with an argument that merely CONTAINS the path (e.g.
+// "--pid-file=<path>.bak", or the path embedded in some other flag) is not
+// mistaken for ours.
+func cmdlineHasPidFile(cmdline []byte, pidFile string) bool {
+	want := "--pid-file=" + pidFile
+	for _, f := range strings.Split(string(cmdline), "\x00") {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+// cmdlineMatchesArgs compares a raw /proc/<pid>/cmdline blob (NUL-separated,
+// argv[0] first) against a desired dnsmasq arg set, order-insensitive. A blob
+// with no args (≤1 field) is treated as matching so a read race can't trigger a
+// restart.
+func cmdlineMatchesArgs(cmdline []byte, want []string) bool {
+	fields := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+	if len(fields) <= 1 {
+		return true
+	}
+	return sameStringSet(fields[1:], want) // drop argv[0]
+}
+
+// sameStringSet reports whether two arg slices contain the same multiset of
+// strings, ignoring order (dnsmasq doesn't care about flag order).
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, s := range a {
+		counts[s]++
+	}
+	for _, s := range b {
+		counts[s]--
+		if counts[s] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // StopDHCP kills the dnsmasq instance for a bridge. It first SIGTERMs the PID
 // recorded in pidFile, then — as a backstop — kills any dnsmasq still running
 // with this --pid-file argument. The backstop matters because a leaked dnsmasq
@@ -169,10 +328,19 @@ func processRunning(pid int) bool {
 func StopDHCP(pidFile string) error {
 	if data, err := os.ReadFile(pidFile); err == nil {
 		if pid, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil {
-			if proc, ferr := os.FindProcess(pid); ferr == nil {
-				if err := proc.Signal(syscall.SIGTERM); err != nil {
-					slog.Debug("dnsmasq already stopped", "pid", pid)
+			// Only signal the recorded PID directly if it is verifiably still one of
+			// our dnsmasq processes. A stale pidfile plus PID reuse could otherwise
+			// SIGTERM an unrelated process; in that case skip the direct signal and
+			// rely on the --pid-file pattern pkill below.
+			if procIsOurDnsmasq(pid, pidFile) {
+				if proc, ferr := os.FindProcess(pid); ferr == nil {
+					if err := proc.Signal(syscall.SIGTERM); err != nil {
+						slog.Debug("dnsmasq already stopped", "pid", pid)
+					}
 				}
+			} else {
+				slog.Debug("dnsmasq pidfile PID is not ours (stale/recycled); relying on pattern kill",
+					"pid", pid, "pidfile", pidFile)
 			}
 		}
 	}

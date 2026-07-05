@@ -388,11 +388,36 @@ func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersReque
 	if err := s.RequirePerm(ctx, "/", "ct.read", "viewer"); err != nil {
 		return nil, err
 	}
-	rows, err := corrosion.ListContainers(ctx, s.db, req.HostName)
+	resp := &pb.ListContainersResponse{}
+	pageSize, err := normalizePageSize(req.PageSize)
 	if err != nil {
+		return nil, err
+	}
+	var rows []corrosion.ContainerRecord
+	if pageSize > 0 {
+		// Composite (host_name, name) keyset cursor — containers are keyed by that
+		// pair, so name alone isn't unique across hosts. Fetch one extra to detect
+		// a next page.
+		parts, cerr := pageCursor(req.PageToken, 2)
+		if cerr != nil {
+			return nil, cerr
+		}
+		afterHost, afterName := "", ""
+		if len(parts) == 2 {
+			afterHost, afterName = parts[0], parts[1]
+		}
+		rows, err = corrosion.ListContainersPage(ctx, s.db, req.HostName, afterHost, afterName, pageSize+1)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "list: %v", err)
+		}
+		if len(rows) > pageSize {
+			rows = rows[:pageSize]
+			last := rows[len(rows)-1]
+			resp.NextPageToken = encodePageToken(last.HostName, last.Name)
+		}
+	} else if rows, err = corrosion.ListContainers(ctx, s.db, req.HostName); err != nil {
 		return nil, status.Errorf(codes.Internal, "list: %v", err)
 	}
-	resp := &pb.ListContainersResponse{}
 	for _, r := range rows {
 		resp.Containers = append(resp.Containers, toPbContainer(r))
 	}

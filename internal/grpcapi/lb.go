@@ -1349,11 +1349,15 @@ func (s *Server) relayedVIPNoClaims(ctx context.Context, target, vip string) boo
 func (s *Server) removeLBLocal(ctx context.Context, name string) error {
 	err := lb.NewManager().Remove(ctx, name)
 	s.clearLBKeepalived(name)
-	// Drop this LB's firewall intent (VIP:port exceptions + SNAT) unconditionally,
-	// keyed on the LB name — every local teardown path funnels through here, so a
-	// stale lb:<name> row can't keep exceptions/SNAT live on a host that no longer
-	// serves the VIP. Base network isolation (net:<network>) is untouched.
-	_ = corrosion.DeleteHostFWIntent(ctx, s.db, s.hostName, "lb:"+name)
+	// Drop this LB's firewall intent (VIP:port exceptions + SNAT) ONLY once the LB
+	// is confirmed removed. Manager.Remove errors when keepalived can't be confirmed
+	// stopped — the VIP may still be served, so removing its exceptions/SNAT on the
+	// next reconcile would damage a live service. Every local teardown path funnels
+	// through here, so on success a stale lb:<name> row can't linger. Base network
+	// isolation (net:<network>) is untouched either way.
+	if err == nil {
+		_ = corrosion.DeleteHostFWIntent(ctx, s.db, s.hostName, "lb:"+name)
+	}
 	return err
 }
 

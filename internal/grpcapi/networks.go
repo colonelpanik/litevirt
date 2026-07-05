@@ -252,7 +252,11 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	if _, err := network.SafeProvision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
 		return nil, err
 	}
-	s.reconcileFirewall(ctx) // apply any NAT/isolation intent this provision recorded
+	// Fail closed: don't report a provisioned network while its host-isolation/NAT
+	// rules haven't applied.
+	if err := s.reconcileFirewallRequired(ctx); err != nil {
+		return nil, status.Errorf(codes.Internal, "apply firewall for network %q: %v", name, err)
+	}
 
 	nr, _ := corrosion.GetNetwork(ctx, s.db, name)
 	if nr == nil {
@@ -348,7 +352,11 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 	if _, err := network.SafeProvision(ctx, s.db, req.Name, def, localIP, s.hostName); err != nil {
 		return nil, status.Errorf(codes.Internal, "provision network %q: %v", req.Name, err)
 	}
-	s.reconcileFirewall(ctx) // apply any NAT/isolation intent this provision recorded
+	// Fail closed: don't report a provisioned network while its host-isolation/NAT
+	// rules haven't applied.
+	if err := s.reconcileFirewallRequired(ctx); err != nil {
+		return nil, status.Errorf(codes.Internal, "apply firewall for network %q: %v", req.Name, err)
+	}
 
 	// For VXLAN, notify existing peers about our VTEP.
 	if def.Type == "vxlan" && def.VNI != 0 {

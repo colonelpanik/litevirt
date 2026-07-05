@@ -555,6 +555,20 @@ func (s *Server) reconcileFirewall(ctx context.Context) {
 	}
 }
 
+// reconcileFirewallRequired is the fail-CLOSED variant: it returns the apply
+// error so a caller that just recorded host-isolation / NAT intent can fail
+// rather than report success while nft hasn't applied the rules. Use it on the
+// provisioning paths (network create/provision, NIC hotplug, VM-local network
+// setup) — a swallowed failure there is a fail-open regression from the old
+// direct EnsureHostIsolation/EnsureNAT calls, which returned the error. Teardown
+// and LB paths use the best-effort reconcileFirewall instead.
+func (s *Server) reconcileFirewallRequired(ctx context.Context) error {
+	if s.fwReconciler == nil {
+		return nil
+	}
+	return s.fwReconciler.Reconcile(ctx)
+}
+
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).
 func (s *Server) SetFirmwarePaths(fp lv.FirmwarePaths) { s.firmware = fp }
 

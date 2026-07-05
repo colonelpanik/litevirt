@@ -98,6 +98,7 @@ func TestUpdateLoadBalancer_CanReplaceBackendWithSameName(t *testing.T) {
 	createLBTable(t, ctx, s.db)
 	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
 		Name: "replace-lb", VIP: "10.0.100.54/24", Algorithm: "roundrobin",
+		Hosts: `["lb-host-1"]`, // durable holder — not the legacy no-holder shape
 		Ports: `[{"listen":80,"target":8080}]`, Enabled: true,
 	}); err != nil {
 		t.Fatalf("UpsertLBConfig: %v", err)

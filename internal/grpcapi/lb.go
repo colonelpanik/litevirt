@@ -1501,6 +1501,21 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		}
 	}
 
+	// Legacy explicit LB with no recorded holder (pre-durable-holder row): establish
+	// it BEFORE persisting so the edit has a real apply/forward target — or refuse,
+	// rather than persist a reload-required change that would apply nowhere. Runs
+	// after backend/name validation (an invalid edit still fails first with
+	// InvalidArgument) and after the holder/VIP gate (which resolves participants
+	// itself for a host/VIP change). Repair probes the single proven participant.
+	if r.String("stack_name") == "" && (hostsStr == "" || hostsStr == "[]") {
+		repaired := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: req.Name, Hosts: hostsStr})
+		if repaired.Hosts == "" || repaired.Hosts == "[]" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"load balancer %q has no established holder (legacy row): retry once its VIP host is reachable, or re-create it", req.Name)
+		}
+		hostsStr = repaired.Hosts
+	}
+
 	// Persist updated config + backend changes atomically (generation preserved).
 	if err := corrosion.PersistLBIncremental(ctx, s.db, corrosion.LBConfigRecord{
 		Name:       req.Name,

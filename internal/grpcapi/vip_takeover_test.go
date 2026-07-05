@@ -529,14 +529,58 @@ func TestUpdateLoadBalancer_BackendOnlyEditNotGated(t *testing.T) {
 
 	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
 		Name: "lb4", VIP: "10.0.100.80/24", Algorithm: "roundrobin",
-		Hosts: `[]`, Ports: "[]", Enabled: true, Generation: "g1",
+		Hosts: `["lb-host-1"]`, Ports: "[]", Enabled: true, Generation: "g1",
 	}); err != nil {
 		t.Fatalf("UpsertLBConfig: %v", err)
 	}
 
-	// Algorithm-only edit, no req.Hosts → must not be gated/refused.
+	// Algorithm-only edit, no req.Hosts → must not be gated/refused (the gate must
+	// not resolve participants). The LB has a recorded holder, so the legacy-holder
+	// repair doesn't engage either.
 	if _, err := s.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "lb4", Algorithm: "leastconn"}); err != nil {
 		t.Fatalf("backend/algorithm-only edit must not be refused, got: %v", err)
+	}
+}
+
+// TestUpdateLoadBalancer_LegacyNoHolderRepairOrRefuse: updating a legacy explicit
+// LB with no recorded holder (hosts=[]) either backfills the single proven
+// participant and proceeds, or fails closed — never silently persists a
+// reload-required change that would apply nowhere.
+func TestUpdateLoadBalancer_LegacyNoHolderRepairOrRefuse(t *testing.T) {
+	ctx := adminCtx()
+
+	// No resolvable participant → FailedPrecondition, and the edit is NOT persisted.
+	s := testServerR2(t)
+	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
+	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return nil, true }
+	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "orphan-lb", VIP: "10.0.100.81/24", Algorithm: "roundrobin", Hosts: `[]`, Ports: "[]", Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := s.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "orphan-lb", Algorithm: "leastconn"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("unowned legacy LB update = %v; want FailedPrecondition", err)
+	}
+	rows, _ := s.db.Query(ctx, `SELECT algorithm FROM lb_configs WHERE name = 'orphan-lb' AND deleted_at IS NULL`)
+	if len(rows) > 0 && rows[0].String("algorithm") != "roundrobin" {
+		t.Errorf("refused update must not persist; algorithm = %q", rows[0].String("algorithm"))
+	}
+
+	// Exactly one proven participant → backfilled as holder and the update proceeds.
+	s2 := testServerR2(t)
+	s2.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
+	s2.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return []string{"lb-host-1"}, true }
+	if err := corrosion.UpsertLBConfig(ctx, s2.db, corrosion.LBConfigRecord{
+		Name: "adopt-lb", VIP: "10.0.100.82/24", Algorithm: "roundrobin", Hosts: `[]`, Ports: "[]", Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := s2.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "adopt-lb", Algorithm: "leastconn"}); err != nil {
+		t.Fatalf("update with a resolvable holder must proceed, got: %v", err)
+	}
+	rows, _ = s2.db.Query(ctx, `SELECT hosts, algorithm FROM lb_configs WHERE name = 'adopt-lb' AND deleted_at IS NULL`)
+	if len(rows) == 0 || rows[0].String("hosts") != `["lb-host-1"]` || rows[0].String("algorithm") != "leastconn" {
+		t.Errorf("expected backfilled holder + applied edit; got %v", rows)
 	}
 }
 

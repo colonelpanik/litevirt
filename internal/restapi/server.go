@@ -1208,9 +1208,11 @@ func pageSizeParam(v string) (int32, error) {
 	if v == "" {
 		return 0, nil
 	}
-	n, err := strconv.Atoi(v)
+	// Parse directly into int32 range: a value that overflows int32 would wrap to
+	// a negative when cast and slip past the gRPC layer's clamp, so reject it here.
+	n, err := strconv.ParseInt(v, 10, 32)
 	if err != nil || n < 0 {
-		return 0, fmt.Errorf("page_size must be a non-negative integer")
+		return 0, fmt.Errorf("page_size must be a non-negative 32-bit integer")
 	}
 	return int32(n), nil
 }

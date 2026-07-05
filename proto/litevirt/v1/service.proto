@@ -65,9 +65,13 @@ message ConfigureHostRequest {
 
 // ── VMs ──
 message CreateVMRequest  { VMSpec spec = 1;
-    // Optional client-supplied key for exactly-once retries: a lost-response retry
-    // carrying the same key replays the original result instead of creating a
-    // second VM. Reusing a key with a different request is a client bug (→ 409).
+    // Optional client-supplied retry key. A lost-response retry carrying the same
+    // key replays the original result instead of creating a second VM — but the
+    // record is node-local, so this holds only when the retry reaches the SAME
+    // entry node (pin retries to one endpoint for exactly-once). A retry that lands
+    // on a different node relies on resource-name uniqueness as a best-effort
+    // backstop, which is not linearizable in this masterless design. Reusing a key
+    // with a different request is a client bug (→ 409).
     string idempotency_key = 2; }
 message ListVMsRequest   { string stack_name = 1; string host_name = 2;
     map<string, string> label_filter = 3; }
@@ -746,7 +750,7 @@ message CreateContainerRequest {
     RestartPolicy restart = 12;  // auto-restart policy (nil/condition="none" = never)
     string project   = 13;       // tenancy bucket (default "_default")
     string on_host_failure = 14; // host-loss relocation policy: ''/'none' | 'image-recreate'
-    string idempotency_key = 15; // exactly-once retry key (see CreateVMRequest.idempotency_key)
+    string idempotency_key = 15; // same-entry-node retry key (see CreateVMRequest.idempotency_key)
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }

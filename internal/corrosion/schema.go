@@ -220,11 +220,12 @@ import (
 //	     NON-LWW merge, kept off replication until split_brain_gate_v1 is cluster-wide)
 //	     + vms.pending_action_id (TEXT NOT NULL DEFAULT '') linking a pending start to
 //	     its proof. One CREATE TABLE + one ADD COLUMN; gap-1 from v37.
-//	v39: request idempotency — new table idempotency_keys(key PK, method, request_hash,
-//	     response, status, expires_at, …) recording a completed mutating RPC so a
-//	     lost-response retry replays the original result instead of executing twice.
-//	     WAL-replicated for cross-node dedup but anti-entropy-excluded and TTL-reaped
-//	     (ephemeral). One CREATE TABLE; gap-1 from v38.
+//	v39: request idempotency — new table idempotency_keys(key PK, claim_id, method,
+//	     request_hash, response, status, expires_at, …) recording a mutating RPC so a
+//	     lost-response retry to the SAME entry node replays the original result
+//	     instead of executing twice. LOCAL-only (execLocal, never replicated) and
+//	     TTL-reaped (ephemeral); cross-node retries fall back to resource-name
+//	     uniqueness. One CREATE TABLE; gap-1 from v38.
 const CurrentSchemaVersion = 39
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the

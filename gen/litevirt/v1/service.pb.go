@@ -1743,9 +1743,13 @@ func (x *ConfigureHostRequest) GetRegion() string {
 type CreateVMRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Spec  *VMSpec                `protobuf:"bytes,1,opt,name=spec,proto3" json:"spec,omitempty"`
-	// Optional client-supplied key for exactly-once retries: a lost-response retry
-	// carrying the same key replays the original result instead of creating a
-	// second VM. Reusing a key with a different request is a client bug (→ 409).
+	// Optional client-supplied retry key. A lost-response retry carrying the same
+	// key replays the original result instead of creating a second VM — but the
+	// record is node-local, so this holds only when the retry reaches the SAME
+	// entry node (pin retries to one endpoint for exactly-once). A retry that lands
+	// on a different node relies on resource-name uniqueness as a best-effort
+	// backstop, which is not linearizable in this masterless design. Reusing a key
+	// with a different request is a client bug (→ 409).
 	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -9311,7 +9315,7 @@ type CreateContainerRequest struct {
 	Restart        *RestartPolicy         `protobuf:"bytes,12,opt,name=restart,proto3" json:"restart,omitempty"`                                     // auto-restart policy (nil/condition="none" = never)
 	Project        string                 `protobuf:"bytes,13,opt,name=project,proto3" json:"project,omitempty"`                                     // tenancy bucket (default "_default")
 	OnHostFailure  string                 `protobuf:"bytes,14,opt,name=on_host_failure,json=onHostFailure,proto3" json:"on_host_failure,omitempty"`  // host-loss relocation policy: ''/'none' | 'image-recreate'
-	IdempotencyKey string                 `protobuf:"bytes,15,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"` // exactly-once retry key (see CreateVMRequest.idempotency_key)
+	IdempotencyKey string                 `protobuf:"bytes,15,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"` // same-entry-node retry key (see CreateVMRequest.idempotency_key)
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }

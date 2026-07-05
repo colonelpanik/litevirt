@@ -112,6 +112,36 @@ type Client struct {
 	// clear-on-write hooks (which run on every applied/local row) skip the lock
 	// entirely when nothing is tracked — the overwhelmingly common case.
 	unresolvedLen atomic.Int64
+
+	// hlcSkewGuard, when non-nil and returning true, enables LWW skew quarantine:
+	// an incoming row whose updated_at is beyond hlc.MaxSkewMS into the
+	// future (relative to local wall clock) is NOT allowed to win a conflict —
+	// kept-local and counted — so a clock-corrupted peer can't dominate LWW. Gated
+	// on the LWWSkewGuardV1 latch (injected via SetHLCSkewGuard) so a mixed-version
+	// roll doesn't start quarantining before the whole cluster enforces it. Nil/false
+	// = legacy behavior (no skew check). Read once per merge batch, not per row.
+	// Only the FUTURE-skew case — NowTS still emits wall-clock, so backward-clock
+	// regression on restart is not covered here (deferred).
+	hlcSkewGuard func() bool
+	// skewQuarantined counts rows kept-local by the skew guard, for the metrics
+	// layer (mirrors hlc.Clock.Rejected()). Lock-free.
+	skewQuarantined atomic.Uint64
+}
+
+// SetHLCSkewGuard injects the predicate that enables LWW future-skew quarantine.
+// Wired at daemon start to the LWWSkewGuardV1 enforcement latch. Nil-safe: an unset
+// guard leaves the legacy no-skew-check behavior, so an old-binary node in a
+// mixed-version roll is unaffected.
+func (c *Client) SetHLCSkewGuard(fn func() bool) { c.hlcSkewGuard = fn }
+
+// SkewQuarantinedCount returns the cumulative number of incoming rows kept-local
+// by the LWW skew guard. Exposed so the metrics layer can publish it.
+func (c *Client) SkewQuarantinedCount() uint64 { return c.skewQuarantined.Load() }
+
+// hlcSkewGuardOn reports whether skew quarantine is currently enforced. Cheap;
+// read once per merge batch.
+func (c *Client) hlcSkewGuardOn() bool {
+	return c.hlcSkewGuard != nil && c.hlcSkewGuard()
 }
 
 // SetSyncMetrics installs the anti-entropy timing sink. Nil-safe; call once at

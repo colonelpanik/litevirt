@@ -709,6 +709,21 @@ func InsertInterface(ctx context.Context, c *Client, i InterfaceRecord) error {
 		i.VMName, i.NetworkName, i.Ordinal, i.MAC, i.IP, i.TapDevice, now)
 }
 
+// UpdateVMSpecIfUnchanged writes newSpec ONLY if the row's spec still equals
+// oldSpec (compare-and-swap on the spec column). It touches neither cpu_actual
+// nor mem_actual, so a machine-type backfill can't clobber a concurrent user
+// spec edit: if the spec changed since the caller read it, zero rows update and
+// applied=false (the caller re-reads and retries next tick). Returns applied,
+// error.
+func UpdateVMSpecIfUnchanged(ctx context.Context, c *Client, name, oldSpec, newSpec string) (bool, error) {
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND spec = ? AND deleted_at IS NULL`,
+		newSpec, now, name, oldSpec,
+	)
+	return n > 0, err
+}
+
 // UpdateVMSpec updates the spec JSON and actual CPU/memory for a stopped VM.
 func UpdateVMSpec(ctx context.Context, c *Client, name, specJSON string, cpu, mem int) error {
 	now := c.NowTS()

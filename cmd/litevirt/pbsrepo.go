@@ -135,26 +135,36 @@ func newBackupRepoVerifyCmd() *cobra.Command {
 }
 
 func newBackupRepoGCCmd() *cobra.Command {
-	return &cobra.Command{
+	grace := pbsstore.DefaultChunkGracePeriod
+	cmd := &cobra.Command{
 		Use:   "gc <path>",
 		Short: "Sweep chunks no manifest references",
-		Args:  cobra.ExactArgs(1),
+		Long: "Sweep chunks no manifest references.\n\n" +
+			"Unreferenced chunks younger than --grace are retained: a backup in " +
+			"flight writes its chunks before its manifest, so a shorter window " +
+			"risks deleting a concurrent push's data. Only lower --grace when no " +
+			"push can be running against this repository.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r, err := pbsstore.Open(args[0])
 			if err != nil {
 				return err
 			}
-			stats, err := pbsstore.GC(cmd.Context(), r)
+			stats, err := pbsstore.GCWithOptions(cmd.Context(), r, pbsstore.GCOptions{ChunkGracePeriod: grace})
 			if err != nil {
 				return err
 			}
 			fmt.Printf("Manifests scanned: %d\n", stats.ManifestsScanned)
 			fmt.Printf("Live chunks:       %d\n", stats.ChunksReferenced)
 			fmt.Printf("Deleted chunks:    %d\n", stats.ChunksDeleted)
+			fmt.Printf("Retained (young):  %d\n", stats.ChunksSkippedYoung)
 			fmt.Printf("Bytes reclaimed:   %d\n", stats.BytesReclaimed)
 			return nil
 		},
 	}
+	cmd.Flags().DurationVar(&grace, "grace", grace,
+		"retain unreferenced chunks younger than this (guards against a concurrent push)")
+	return cmd
 }
 
 func newBackupRepoPruneCmd() *cobra.Command {

@@ -297,6 +297,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	repl.SetProofReplicaGate(func(ctx context.Context, peer string) bool {
 		return d.checker.PeerSupports(ctx, peer, capabilities.SplitBrainGateV1)
 	})
+	// LWW future-skew quarantine (partial): enabled only once LWWSkewGuardV1 has
+	// latched on this node (cheap marker read, no ping/I/O), so a future-skewed peer's
+	// rows can't win a conflict. Dark until the token is flipped + latched cluster-wide.
+	// NOTE: does not address the backward-clock case (NowTS still emits wall-clock) —
+	// that's deferred to a separate conflict-key migration.
+	d.db.SetHLCSkewGuard(func() bool {
+		return d.checker.Latched(capabilities.LWWSkewGuardV1)
+	})
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).

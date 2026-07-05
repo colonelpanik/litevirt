@@ -17,20 +17,52 @@ type GCStats struct {
 	ChunksReferenced int   // unique chunks reached from any manifest
 	ChunksOnDisk     int   // chunks present in chunks/ at scan time
 	ChunksDeleted    int   // chunks removed because no manifest pointed at them
+	ChunksSkippedYoung int // unreferenced chunks retained because within the grace window
 	BytesReclaimed   int64 // total bytes of deleted chunks
 }
 
-// GC performs a mark-and-sweep over the repository:
+// DefaultChunkGracePeriod is how long an unreferenced chunk is retained
+// before GC is allowed to sweep it. It exists to close the push/GC race:
+// PushDisk writes content-addressed chunks incrementally and only writes
+// the manifest that references them once every chunk has landed, so a
+// chunk emitted by an in-flight push looks like garbage until its manifest
+// appears. Any chunk younger than this window is left alone, matching
+// Proxmox Backup Server's own chunk grace discipline. This is the robust,
+// cross-host-safe guard (an flock is unreliable over NFS and only a
+// same-host push takes one); coordination leases are an additional, not a
+// substitute, protection.
+const DefaultChunkGracePeriod = 24 * time.Hour
+
+// GCOptions tunes a sweep. The zero value is NOT the safe default — use
+// GC (which applies DefaultChunkGracePeriod) unless you explicitly want a
+// different grace (e.g. 0 in a test that asserts the sweep mechanic).
+type GCOptions struct {
+	// ChunkGracePeriod: an unreferenced chunk whose mtime is younger than
+	// this is retained rather than deleted. Zero sweeps every unreferenced
+	// chunk regardless of age (unsafe against a concurrent push).
+	ChunkGracePeriod time.Duration
+}
+
+// GC performs a mark-and-sweep over the repository with the default chunk
+// grace period. See GCWithOptions.
+func GC(ctx context.Context, r *Repo) (GCStats, error) {
+	return GCWithOptions(ctx, r, GCOptions{ChunkGracePeriod: DefaultChunkGracePeriod})
+}
+
+// GCWithOptions performs a mark-and-sweep over the repository:
 //  1. Walks every manifest and collects the union of chunk ids.
-//  2. Walks chunks/aa/aabbcc... and deletes any chunk not in the union.
+//  2. Walks chunks/aa/aabbcc... and deletes any chunk not in the union
+//     that is also older than opts.ChunkGracePeriod.
 //
 // GC is safe to run concurrently with reads (GetChunk on a deleted
-// chunk returns an error which the caller already handles), but should
-// NOT run concurrently with PushDisk in another process — a chunk that
-// was just emitted but whose manifest hasn't landed yet looks like
-// garbage. Cluster-level coordination is the caller's job (litevirt
-// uses a leader-election lease keyed by the repo path).
-func GC(ctx context.Context, r *Repo) (GCStats, error) {
+// chunk returns an error which the caller already handles). The grace
+// period makes it safe against a concurrent PushDisk in another process
+// or on another host: a chunk emitted by an in-flight (or very recently
+// completed) push whose manifest hasn't landed yet is younger than the
+// window and is retained. Cluster-level coordination (a leader-election
+// lease keyed by the repo path) is still recommended to avoid two GC
+// passes racing each other, but is no longer required for push safety.
+func GCWithOptions(ctx context.Context, r *Repo, opts GCOptions) (GCStats, error) {
 	var stats GCStats
 	manifests, err := r.ListManifests()
 	if err != nil {
@@ -45,6 +77,7 @@ func GC(ctx context.Context, r *Repo) (GCStats, error) {
 	}
 	stats.ChunksReferenced = len(live)
 
+	cutoff := time.Now().Add(-opts.ChunkGracePeriod)
 	chunksRoot := filepath.Join(r.root, "chunks")
 	err = filepath.WalkDir(chunksRoot, func(path string, d os.DirEntry, werr error) error {
 		if werr != nil {
@@ -73,6 +106,13 @@ func GC(ctx context.Context, r *Repo) (GCStats, error) {
 		}
 		st, sErr := d.Info()
 		if sErr != nil {
+			return nil
+		}
+		// Retain a chunk that is younger than the grace window — it may
+		// belong to a push whose manifest has not yet landed. Only sweep
+		// once it has been unreferenced-and-quiescent for the full window.
+		if opts.ChunkGracePeriod > 0 && st.ModTime().After(cutoff) {
+			stats.ChunksSkippedYoung++
 			return nil
 		}
 		if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {

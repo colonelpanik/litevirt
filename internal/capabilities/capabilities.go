@@ -36,6 +36,29 @@ const (
 	FenceEpochV1 = "fence_epoch_v1"
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
 	OwnerEpochV1 = "owner_epoch_v1"
+	// SafeFenceDefaultV1 gates the safe-fencing-default policy: once enforced
+	// cluster-wide, an UNCONFIRMED best-effort fence is no longer treated as proof
+	// of power-off — the coordinator requires an operator fence-confirm before
+	// rescheduling (as it already does for the "manual" strategy), unless the host
+	// explicitly opts into legacy proceed-anyway via LabelUnsafeAutoFailover. Gated
+	// (not unconditional) because it changes live failover behavior, so a
+	// mixed-version cluster must not flip mid-roll.
+	SafeFenceDefaultV1 = "safe_fence_default_v1"
+	// LWWSkewGuardV1 gates FUTURE-SKEW QUARANTINE for LWW merges (partial): once
+	// enforced cluster-wide, an incoming row whose updated_at is beyond MaxSkew into
+	// the future is quarantined (kept-local) rather than allowed to win, so a
+	// fast-clock peer can't dominate last-writer-wins. Gated because a mixed-version
+	// cluster must not start quarantining before every node enforces it.
+	//
+	// SCOPE — this is NOT a full HLC LWW fix. updated_at is STILL stamped from
+	// per-process wall-clock RFC3339 (see corrosion.Client.NowTS), so this token does
+	// NOT address the BACKWARD-clock case (a restart after a wall-clock step-back can
+	// still emit older conflict keys → lost updates). Do not flip this thinking
+	// split-brain item 2 is fully solved. The remaining work — persist the monotonic
+	// timestamp high-water and/or emit HLC (a separately-validated conflict-key
+	// migration) — is deliberately deferred to its own token, so this one is named for
+	// exactly what it does (skew guard), leaving "hlc_lww_v1" free for the real flip.
+	LWWSkewGuardV1 = "lww_skew_guard_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -99,7 +122,7 @@ var supported = []string{SplitBrainGateV1}
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

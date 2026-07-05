@@ -350,6 +350,9 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				r.startPendingVM(ctx, vm)
 				break
 			}
+			// One-shot machine-type backfill: pin the concrete machine type for VMs created
+			// before pinning existed. No-op once pinned (cheap stored-spec check).
+			r.maybePinMachineType(ctx, vm)
 			// The domain is defined but may have been stopped out-of-band (a
 			// crash, an external `virsh destroy`, or a fence that powered it
 			// off). Reconcile the cluster state to libvirt reality so it doesn't
@@ -372,6 +375,13 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			slog.Warn("reconciler: VM stopped out-of-band — syncing cluster state",
 				"vm", vm.Name, "reason", st.Reason, "to", newState)
 			corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail)
+
+		case "stopped":
+			// One-shot machine-type backfill for a STOPPED but still-defined VM (a legacy VM,
+			// or one updated with --machine q35 while stopped): pin the concrete
+			// machine type from its persistent domain. No-op once pinned, and a
+			// no-op if the domain isn't defined (DumpXMLInactive errors → "").
+			r.maybePinMachineType(ctx, vm)
 
 		case "error":
 			// Check if an errored VM is actually running in libvirt (e.g. after
@@ -417,6 +427,65 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 // selfFence detects split-brain: VMs running locally in libvirt that corrosion
 // says belong to another host. This happens when a network partition heals and
 // the VM was rescheduled during the partition (#5).
+// maybePinMachineType is the one-shot machine-type backfill for VMs created before
+// machine-type pinning. If the stored spec still carries an unversioned alias
+// ("q35"/"pc"/"") but libvirt has the domain bound to a concrete versioned type
+// (e.g. "pc-q35-9.0"), it rewrites spec.machine to that concrete value so a
+// later failover/reschedule regenerates the domain XML with the same guest ABI
+// instead of re-resolving the alias on the destination host's qemu version.
+// Fires at most once per VM — the cheap stored-spec pre-check makes every
+// subsequent tick a no-op — and preserves every other spec field via a raw edit.
+func (r *Reconciler) maybePinMachineType(ctx context.Context, vm corrosion.VMRecord) {
+	if r.virt == nil || vm.Spec == "" {
+		return
+	}
+	var cur struct {
+		Machine string `json:"machine"`
+	}
+	if err := json.Unmarshal([]byte(vm.Spec), &cur); err != nil {
+		return
+	}
+	if lv.IsPinnedMachineType(cur.Machine) {
+		return // already pinned — the steady-state case
+	}
+	xmlDesc, err := r.virt.DumpXMLInactive(vm.Name)
+	if err != nil {
+		return
+	}
+	resolved := lv.MachineTypeFromXML(xmlDesc)
+	if !lv.IsPinnedMachineType(resolved) {
+		return // libvirt gave no concrete type; leave the alias untouched
+	}
+	// Surgical edit: round-trip the raw object and replace only "machine" so no
+	// other spec field is dropped or reordered.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(vm.Spec), &raw); err != nil {
+		return
+	}
+	mj, err := json.Marshal(resolved)
+	if err != nil {
+		return
+	}
+	raw["machine"] = mj
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return
+	}
+	// Compare-and-swap on the spec column keyed by the exact spec we based the edit
+	// on: if a concurrent user UpdateVM changed the spec since this reconcile pass
+	// read it, the write no-ops (applied=false) rather than clobbering that edit
+	// with our stale-plus-machine copy — the next tick re-reads and retries.
+	applied, err := corrosion.UpdateVMSpecIfUnchanged(ctx, r.db, vm.Name, vm.Spec, string(out))
+	if err != nil {
+		slog.Warn("reconciler: pin machine type failed", "vm", vm.Name, "machine", resolved, "error", err)
+		return
+	}
+	if !applied {
+		return // spec changed underneath us; retry next tick off the fresh value
+	}
+	slog.Info("reconciler: pinned machine type (one-shot backfill)", "vm", vm.Name, "from", cur.Machine, "to", resolved)
+}
+
 func (r *Reconciler) selfFence(ctx context.Context) {
 	if r.virt == nil {
 		return

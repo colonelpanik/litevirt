@@ -114,6 +114,18 @@ func (c *Checker) Enforced(ctx context.Context, token string) bool {
 	return true
 }
 
+// Latched reports whether token's enforcement has ALREADY latched on this node
+// (durable marker preloaded at startup or set by a prior Enforced call). Unlike
+// Enforced it NEVER recomputes/pings — it is a pure in-memory marker read, cheap
+// enough to consult on a hot path (e.g. per-row merge). It therefore returns
+// false for a token that has not yet latched, without trying to activate it; use
+// Enforced at decision sites that should also DRIVE activation.
+func (c *Checker) Latched(token string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.activated[token]
+}
+
 // persistActivationMarker writes a token's durable activation latch. On failure it
 // logs loudly and leaves activationPersisted[token] false so the next Enforced call
 // retries — a silently-lost marker would let a restart mid-partition revert to the

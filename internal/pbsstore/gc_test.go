@@ -26,7 +26,9 @@ func TestGC_RemovesUnreferencedChunks(t *testing.T) {
 		t.Fatalf("remove manifest: %v", err)
 	}
 
-	stats, err := GC(context.Background(), r)
+	// grace=0: this test asserts the sweep mechanic on a genuinely orphaned
+	// chunk, so opt out of the default retention window.
+	stats, err := GCWithOptions(context.Background(), r, GCOptions{ChunkGracePeriod: 0})
 	if err != nil {
 		t.Fatalf("GC: %v", err)
 	}
@@ -37,6 +39,45 @@ func TestGC_RemovesUnreferencedChunks(t *testing.T) {
 		if r.HasChunk(c.ID) {
 			t.Errorf("chunk %s should have been swept", c.ID)
 		}
+	}
+}
+
+// TestGC_GracePeriodRetainsYoungOrphans is the push/GC race regression: a
+// chunk that is unreferenced (no manifest points at it — as during an
+// in-flight push whose manifest has not landed) but younger than the grace
+// window must NOT be swept by a default GC, yet must be swept once it ages
+// out (grace=0 here stands in for "older than the window").
+func TestGC_GracePeriodRetainsYoungOrphans(t *testing.T) {
+	r := newTestRepo(t)
+	// A freshly written, unreferenced chunk — exactly what an in-flight
+	// push looks like before its manifest is written.
+	refs, err := r.PutBytes(randomBytes(t, ChunkSize))
+	if err != nil {
+		t.Fatalf("PutBytes: %v", err)
+	}
+	// Default GC (24h grace) must retain it.
+	stats, err := GC(context.Background(), r)
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if stats.ChunksDeleted != 0 {
+		t.Errorf("default GC deleted %d young orphan chunks, want 0 (push/GC race)", stats.ChunksDeleted)
+	}
+	if stats.ChunksSkippedYoung != len(refs) {
+		t.Errorf("skipped-young = %d, want %d", stats.ChunksSkippedYoung, len(refs))
+	}
+	for _, c := range refs {
+		if !r.HasChunk(c.ID) {
+			t.Errorf("young orphan chunk %s was swept by default GC; would corrupt a concurrent push", c.ID)
+		}
+	}
+	// Once it ages out (grace=0 simulates "older than the window"), it is swept.
+	stats, err = GCWithOptions(context.Background(), r, GCOptions{ChunkGracePeriod: 0})
+	if err != nil {
+		t.Fatalf("GC grace=0: %v", err)
+	}
+	if stats.ChunksDeleted != len(refs) {
+		t.Errorf("aged-out GC deleted %d, want %d", stats.ChunksDeleted, len(refs))
 	}
 }
 
@@ -251,7 +292,9 @@ func TestApplyPrune_DeletesManifestFiles(t *testing.T) {
 	if len(mans) != 1 || mans[0].Timestamp != "2026-05-09T00:00:00Z" {
 		t.Errorf("manifests after prune: %+v", mans)
 	}
-	stats, err := GC(context.Background(), r)
+	// grace=0: this test asserts prune→GC reclaims the newly orphaned chunks;
+	// the default grace window would (correctly) retain them as too young.
+	stats, err := GCWithOptions(context.Background(), r, GCOptions{ChunkGracePeriod: 0})
 	if err != nil {
 		t.Fatalf("GC: %v", err)
 	}

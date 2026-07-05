@@ -12,6 +12,9 @@ import (
 // destination) decision.
 type fakeFailoverGate struct {
 	supports map[string]bool
+	// enforced maps token → enforcement decision. A nil map means "all enforced"
+	// (back-compat for tests that only exercise the mint-site PeerSupports path).
+	enforced map[string]bool
 }
 
 func (f fakeFailoverGate) DecisionGate(context.Context) health.GateResult {
@@ -20,7 +23,12 @@ func (f fakeFailoverGate) DecisionGate(context.Context) health.GateResult {
 func (f fakeFailoverGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
 	return health.QuorumYes, 2, 2
 }
-func (f fakeFailoverGate) Enforced(context.Context, string) bool { return true }
+func (f fakeFailoverGate) Enforced(_ context.Context, token string) bool {
+	if f.enforced == nil {
+		return true
+	}
+	return f.enforced[token]
+}
 func (f fakeFailoverGate) PeerSupportsFresh(_ context.Context, peer, _ string) bool {
 	return f.supports[peer]
 }

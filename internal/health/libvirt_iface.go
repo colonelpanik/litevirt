@@ -15,6 +15,7 @@ type LibvirtBackend interface {
 	DomainExists(name string) bool
 	DomainState(name string) (string, error)
 	DomainStateReason(name string) (lv.DomainStatus, error)
+	DumpXMLInactive(name string) (string, error)
 	ListDomains() ([]string, error)
 	DefineDomain(xmlConfig string) error
 	StartDomain(name string) error

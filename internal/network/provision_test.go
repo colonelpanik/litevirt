@@ -49,6 +49,67 @@ func TestProvision_Bridge(t *testing.T) {
 	}
 }
 
+// TestProvision_Bridge_PreExistingNAT_NoDHCP reproduces the upgrade cutover gap:
+// a managed NAT network with DHCP off, re-provisioned onto a bridge that already
+// exists (every litevirt bridge "pre-exists" on a re-provision / daemon restart),
+// must still record its masquerade intent so the consolidated renderer migrates
+// the network off the pre-consolidation iptables rule. Before the fix the NAT
+// intent was gated behind (!bridgePreExisted || def.DHCP), so this shape recorded
+// nothing and the old iptables MASQUERADE was stranded.
+func TestProvision_Bridge_PreExistingNAT_NoDHCP(t *testing.T) {
+	execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
+	defer func() { execCommand = defaultExec }()
+	dhcpStarted := false
+	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+		dhcpStarted = true
+		return nil
+	}
+	defer func() { startDHCPFunc = StartDHCP }()
+
+	db, err := corrosion.NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	ctx := context.Background()
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	// "lo" always exists, so BridgeExists(lo) is true → bridgePreExisted, exactly
+	// like a litevirt bridge on a re-provision. NAT default (nil→true), DHCP off.
+	def := compose.NetworkDef{
+		Type:      "bridge",
+		Interface: "lo",
+		Subnet:    "10.77.0.0/24",
+		DHCP:      false,
+	}
+	if _, err := Provision(ctx, db, "reprov-net", def, "10.0.0.1", "host1"); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	intents, err := corrosion.ListHostFWIntent(ctx, db, "host1")
+	if err != nil {
+		t.Fatalf("ListHostFWIntent: %v", err)
+	}
+	var got *corrosion.HostFWIntent
+	for i := range intents {
+		if intents[i].ScopeKey == "net:reprov-net" {
+			got = &intents[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("expected a host_fw_intent row for net:reprov-net (masquerade), got none: %v", intents)
+	}
+	if got.MasqueradeSubnet != "10.77.0.0/24" {
+		t.Errorf("expected MasqueradeSubnet=10.77.0.0/24, got %q", got.MasqueradeSubnet)
+	}
+	// DHCP must still NOT start on a pre-existing bridge with DHCP off — only the
+	// NAT intent is decoupled from that gate.
+	if dhcpStarted {
+		t.Error("DHCP must not start on a pre-existing bridge with DHCP disabled")
+	}
+}
+
 func TestProvision_VXLAN(t *testing.T) {
 	var calls [][]string
 	execCommand = func(name string, args ...string) ([]byte, error) {

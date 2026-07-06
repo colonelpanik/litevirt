@@ -21,7 +21,9 @@ import (
 // plain WriteAt suffices — no qcow2 writer needed. base="" makes it a full push.
 func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementServer) error {
 	ctx := stream.Context()
-	if err := RequireRole(ctx, "operator"); err != nil {
+	// Peer-only: dirty-extent replica pushes come from a peer over host mTLS
+	// (no direct operator caller). Tighter than the old RequireRole("operator").
+	if err := s.requirePeerCert(ctx); err != nil {
 		return err
 	}
 	first, err := stream.Recv()

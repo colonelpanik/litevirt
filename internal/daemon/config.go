@@ -217,6 +217,14 @@ type AuthConfig struct {
 	// SessionIdleTimeout is the inactivity window, refreshed on each request.
 	SessionIdleTimeout string `yaml:"session_idle_timeout,omitempty"`
 	SessionHardExpiry  string `yaml:"session_hard_expiry,omitempty"`
+	// StrictMTLSIdentity, when true, enforces the strict mTLS-identity model on
+	// this node: a bearerless "client" certificate (a distributable lv-cli cert,
+	// or any cert whose CN is not a live cluster host) is no longer treated as
+	// admin and must present a session bearer (run `lv login`). Peer (known-host)
+	// and on-node loopback certs are unaffected. Default false; enforcement also
+	// requires the StrictMTLSIdentityV1 capability active cluster-wide. This flag
+	// is the enforcement + kill switch — set false to disable regardless of latch.
+	StrictMTLSIdentity bool `yaml:"strict_mtls_identity,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

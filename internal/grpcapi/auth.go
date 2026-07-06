@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -25,12 +28,23 @@ const (
 	ctxKeyScopePaths
 	ctxKeyAuthMethod
 	ctxKeyMTLSCommonName
+	ctxKeyPrincipalKind
 )
 
 const (
 	authMethodSession = "session"
 	authMethodToken   = "token"
 	authMethodMTLS    = "mtls"
+)
+
+// principalKind* classify a bearerless mTLS caller. peer and local-root keep
+// admin authority (a cluster node / on-node root); a client cert (a
+// distributable lv-cli cert, an unknown/empty CN, or a removed host's CN) is
+// denied once strict-mTLS identity is enforced.
+const (
+	principalKindPeer      = "peer"
+	principalKindLocalRoot = "local-root"
+	principalKindClient    = "client"
 )
 
 // SessionTokenPrefix marks bearer strings that resolve via the sessions
@@ -75,6 +89,12 @@ func (s *Server) SetSessionTimeouts(idle, hard time.Duration) {
 		s.sessionHardExpiry = hard
 	}
 }
+
+// SetStrictMTLSIdentity sets this node's enforcement switch for the strict
+// mTLS-identity model. When true (and the StrictMTLSIdentityV1 gate is active
+// cluster-wide), a bearerless "client" cert is denied. The flag is the kill
+// switch — false short-circuits enforcement regardless of any latch marker.
+func (s *Server) SetStrictMTLSIdentity(on bool) { s.strictMTLSIdentity = on }
 
 // skipAuth lists RPC methods that bypass authentication.
 var skipAuth = map[string]bool{
@@ -160,15 +180,107 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 			return ctx, nil
 		}
 	}
-	// No bearer token — authenticated via mTLS client cert (CLI / daemon-to-daemon).
+	// No bearer token — classify the mTLS client cert into a principal kind.
+	// peer / local-root keep admin authority (trusted node / on-node root); a
+	// "client" cert is denied once strict-mTLS identity is enforced. A bearer,
+	// when present, always wins and is handled above.
+	kind, cn := s.classifyBearerlessMTLS(ctx)
+	if kind == principalKindClient && s.strictMTLSEnforced(ctx) {
+		return nil, status.Error(codes.Unauthenticated,
+			"client certificate without a session: run `lv login` (strict mTLS identity enforced)")
+	}
 	ctx = context.WithValue(ctx, ctxKeyUsername, "admin")
 	ctx = context.WithValue(ctx, ctxKeyRole, "admin")
 	ctx = context.WithValue(ctx, ctxKeyRealm, "local")
 	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodMTLS)
-	if cn := peerCommonName(ctx); cn != "" {
+	ctx = context.WithValue(ctx, ctxKeyPrincipalKind, kind)
+	if cn != "" {
 		ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, cn)
 	}
 	return ctx, nil
+}
+
+// classifyBearerlessMTLS maps a bearerless mTLS caller to a principal kind and
+// returns the presented CN (may be empty). local-root = loopback transport + a
+// trusted host CN (on-node root); peer = non-loopback + trusted host CN (a
+// cluster node); client = anything else (distributable lv-cli cert, unknown/
+// empty CN, or a removed host's CN).
+func (s *Server) classifyBearerlessMTLS(ctx context.Context) (kind, cn string) {
+	cn = peerCommonName(ctx)
+	if s.isTrustedHostCN(ctx, cn) {
+		if isLoopbackPeer(ctx) {
+			return principalKindLocalRoot, cn
+		}
+		return principalKindPeer, cn
+	}
+	return principalKindClient, cn
+}
+
+// isTrustedHostCN reports whether cn names a live (non-removed) cluster host.
+// GetHost filters deleted_at IS NULL, and host removal/decommission sets
+// deleted_at (DeleteHost), so a removed node's cert is excluded by
+// construction. Transient operational states (active/draining/fenced/offline/
+// upgrading/maintenance) all stay trusted — a recovering node must remain a
+// trusted peer so its own anti-entropy/rejoin RPCs are accepted while its state
+// clears; the removal boundary is deleted_at, not operational state.
+func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
+	if cn == "" {
+		return false
+	}
+	h, _ := corrosion.GetHost(ctx, s.db, cn)
+	return h != nil
+}
+
+// isLoopbackPeer reports whether the RPC arrived over a loopback transport
+// (127.0.0.0/8 or ::1, incl. IPv4-mapped IPv6). The kernel drops off-box
+// martian source addresses, so a genuine loopback peer originates on-box — the
+// already-root threat — which is why an on-node CLI presenting the host cert
+// classifies as local-root (admin). A non-TCP/unparseable addr is not loopback.
+func isLoopbackPeer(ctx context.Context) bool {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.Addr == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(p.Addr.String())
+	if err != nil {
+		host = p.Addr.String() // no host:port form (rare) — try the raw string
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
+}
+
+// strictMTLSEnforced reports whether this node denies bearerless "client"
+// certs. The config flag is the enforcement switch (and kill switch); the
+// capability gate coordinates the cluster-wide flip. The config bool
+// short-circuits, so the gate's Ping fan-out is never touched in the dark
+// default. The loopback local-root path is never gated on this — it is the
+// on-node escape hatch.
+func (s *Server) strictMTLSEnforced(ctx context.Context) bool {
+	return s.strictMTLSIdentity && s.gate != nil && s.gate.Enforced(ctx, capabilities.StrictMTLSIdentityV1)
+}
+
+// callerPrincipalKind returns the classified kind (peer/local-root/client) for
+// a caller that authenticated via mTLS; empty for bearer callers.
+func callerPrincipalKind(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKeyPrincipalKind).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// requirePeerOrRole gates a dual-use RPC that BOTH cluster peers (host cert) and
+// operator bearers legitimately invoke — e.g. the anti-entropy state RPCs, which
+// the UI diagnostics page and `lv cluster sync` also call with a bearer. A
+// trusted peer passes; otherwise the caller must hold at least minRole. A pure
+// requirePeerCert here would break the bearer (UI/CLI) path.
+func (s *Server) requirePeerOrRole(ctx context.Context, minRole string) error {
+	if s.requirePeerCert(ctx) == nil {
+		return nil
+	}
+	return RequireRole(ctx, minRole)
 }
 
 // authenticateSession validates a "lvs_<id>"-prefixed bearer against the

@@ -59,6 +59,17 @@ const (
 	// migration) — is deliberately deferred to its own token, so this one is named for
 	// exactly what it does (skew guard), leaving "hlc_lww_v1" free for the real flip.
 	LWWSkewGuardV1 = "lww_skew_guard_v1"
+	// StrictMTLSIdentityV1 gates the strict mTLS-identity auth model: a bearerless
+	// client certificate (a distributable lv-cli cert, an unknown/empty CN, or a
+	// removed host's CN) is no longer treated as admin — it must present a session
+	// bearer. Peer (known-host) and on-node loopback certs keep admin authority, so
+	// NO node-to-node wire behavior changes. Unlike the split-brain tokens this gates
+	// an AUTH decision, so it deliberately does NOT rely on the hard fail-closed latch
+	// for recovery: the daemon config flag auth.strict_mtls_identity is the real
+	// enforcement switch (enforcement is config AND Enforced) and kill switch, and the
+	// loopback local-root path is never gated — so a mis-flip is reversible and can
+	// never lock out on-node root.
+	StrictMTLSIdentityV1 = "strict_mtls_identity_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -117,12 +128,12 @@ const (
 // (This is now LIVE for split_brain_gate_v1: once a node latches it, de-advertising alone
 // won't revert it — delete <dataDir>/split_brain_activated.split_brain_gate_v1 to stand it
 // down. Still inert for the Phase-2 tokens, which no shipped build advertises yet.)
-var supported = []string{SplitBrainGateV1}
+var supported = []string{SplitBrainGateV1, StrictMTLSIdentityV1}
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, StrictMTLSIdentityV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

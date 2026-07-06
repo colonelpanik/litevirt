@@ -86,7 +86,7 @@ func (s *Server) requirePeerCert(ctx context.Context) error {
 	if cn == "" {
 		return status.Error(codes.PermissionDenied, "peer certificate common name required")
 	}
-	if h, _ := corrosion.GetHost(ctx, s.db, cn); h == nil {
+	if !s.isTrustedHostCN(ctx, cn) {
 		return status.Errorf(codes.PermissionDenied, "peer %q is not a known cluster host", cn)
 	}
 	return nil

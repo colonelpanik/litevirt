@@ -88,10 +88,10 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				return "", fmt.Errorf("record host-isolation intent for %s: %w", bridge, err)
 			}
 		} else if !onPhysicalVLAN {
-			// If subnet is defined and this is a litevirt-managed bridge (not
-			// pre-existing infrastructure or physical VLAN), enable DHCP and
-			// optionally NAT.
-			natSubnet := ""
+			// Start DHCP only on a litevirt-managed bridge — a pre-existing
+			// infrastructure bridge (e.g. br0) must not get a DHCP server unless
+			// the user explicitly enabled it. This gate stays keyed on
+			// (!bridgePreExisted || def.DHCP).
 			if def.Subnet != "" && (!bridgePreExisted || def.DHCP) {
 				gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)
 				if err != nil {
@@ -101,21 +101,27 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile); err != nil {
 					return "", fmt.Errorf("start DHCP on %s: %w", bridge, err)
 				}
-				if def.NATEnabled() {
-					if err := EnableIPForwarding(); err != nil {
-						return "", err
-					}
-					natSubnet = def.Subnet
-				}
 			}
-			// Record NAT intent (masquerade) or clear any stale intent for this
-			// network. The reconciler renders it and migrates off any old rules.
+			// Record NAT (masquerade) intent whenever this managed subnet-network
+			// wants NAT — independent of the DHCP-start gate above. On a
+			// re-provision the bridge always exists, so gating NAT on
+			// !bridgePreExisted would drop the intent and strand the network on
+			// the pre-consolidation iptables rule; the empty-subnet check keeps
+			// infra bridges (no subnet, e.g. br0) untouched. Matches the vxlan
+			// case, which already records NAT on Subnet != "" && NATEnabled().
+			natSubnet := ""
+			if def.Subnet != "" && def.NATEnabled() {
+				if err := EnableIPForwarding(); err != nil {
+					return "", err
+				}
+				natSubnet = def.Subnet
+			}
 			if err := recordNATOrClear(ctx, db, hostName, scope, bridge, natSubnet); err != nil {
 				return "", err
 			}
-			// Enable proxy ARP only when the host IS the VM gateway — i.e.,
-			// DHCP and NAT are active, not on a physical VLAN.
-			if def.Subnet != "" && def.NATEnabled() && (!bridgePreExisted || def.DHCP) {
+			// Enable proxy ARP only when the host IS the VM gateway — i.e., NAT
+			// is active (same condition as the masquerade intent above).
+			if natSubnet != "" {
 				if err := EnsureProxyARP(bridge); err != nil {
 					slog.Warn("proxy ARP setup failed (VMs may be unreachable from outside)", "bridge", bridge, "error", err)
 				}

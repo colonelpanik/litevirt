@@ -38,6 +38,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/restapi"
@@ -91,6 +92,10 @@ type Daemon struct {
 	// exitFunc terminates the process on a watchdog rollback. Defaults to os.Exit;
 	// overridable in tests.
 	exitFunc func(int)
+
+	// flushTelemetry flushes OTLP telemetry with a bounded timeout. Set in Run;
+	// called by exit() so an os.Exit path doesn't drop the last spans/logs.
+	flushTelemetry func()
 }
 
 // New creates a new daemon instance.
@@ -148,6 +153,32 @@ func (d *Daemon) markRestarting() {
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// Initialize observability first so every subsequent slog.* call in this
+	// process is structured/enriched and — when an OTLP endpoint is configured —
+	// exported alongside traces and metrics. Fail-open: a telemetry setup error
+	// degrades to local logging and never blocks boot.
+	shutdownTelemetry, terr := obs.Setup(ctx, obs.Config{
+		ServiceName:  "litevirt",
+		Version:      d.cfg.Version,
+		Environment:  d.cfg.Telemetry.Environment,
+		HostName:     d.cfg.HostName,
+		OTLPEndpoint: d.cfg.Telemetry.OTLPEndpoint,
+		SampleRate:   d.cfg.Telemetry.SampleRate,
+		LogLevel:     d.cfg.Telemetry.LogLevel,
+		LogFormat:    d.cfg.Telemetry.LogFormat,
+	})
+	if terr != nil {
+		slog.Warn("telemetry setup degraded to local logging", "error", terr)
+	}
+	// Bounded flush for abnormal (os.Exit) paths; see (*Daemon).exit. Set before
+	// the watchdog goroutine starts so a rollback can flush.
+	d.flushTelemetry = func() {
+		fctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = shutdownTelemetry(fctx)
+	}
+	defer func() { _ = shutdownTelemetry(context.Background()) }()
+
 	// Arm the post-upgrade health watchdog FIRST (before any potentially-hanging
 	// init step), and independently, so a boot that hangs before the gRPC server
 	// can serve is still caught. No-op on a normal boot (no sentinel).
@@ -759,7 +790,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	rpcMetrics := metrics.NewRPCMetrics()
-	d.grpcSrv = grpc.NewServer(
+	grpcOpts := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
 		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
 		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
@@ -770,7 +801,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// non-chunked paths during/after a mixed-version rollout.
 		grpc.MaxRecvMsgSize(grpcMaxMsgSize),
 		grpc.MaxSendMsgSize(grpcMaxMsgSize),
-	)
+	}
+	// otelgrpc server handler (only when tracing is active): creates a server span
+	// per RPC and extracts inbound W3C trace context, so a peer-mesh call
+	// (migrate/failover/replicate) continues the caller's trace. Empty when off —
+	// no otel in the serve path unless an OTLP endpoint is configured.
+	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
+	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
 	pb.RegisterLiteVirtServer(d.grpcSrv, svc)
 

@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -80,6 +81,13 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 // It streams MigrateProgress messages back to the caller.
 func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreamingServer[pb.MigrateProgress]) error {
 	ctx := stream.Context()
+	// Named span for the whole migration; child peer RPCs (define/copy/cutover on
+	// the target daemon) hang off this via the otelgrpc handlers, so a migration
+	// renders as one trace across both hosts. No-op when tracing is off.
+	ctx, span := obs.Span(ctx, "vm.migrate")
+	span.SetAttribute("vm.name", req.GetVmName())
+	span.SetAttribute("vm.target_host", req.GetTargetHost())
+	defer span.End()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
 	}

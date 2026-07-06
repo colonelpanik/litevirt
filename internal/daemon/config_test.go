@@ -287,3 +287,41 @@ pci:
 		t.Errorf("MaxVFsPerPF = %d, want 16", cfg.PCI.SRIOV.MaxVFsPerPF)
 	}
 }
+
+func TestValidateTelemetry(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      TelemetryConfig
+		wantErr bool
+		wantLvl string // normalized level, when no error
+		wantFmt string
+	}{
+		{name: "empty ok", in: TelemetryConfig{}, wantErr: false},
+		{name: "valid full", in: TelemetryConfig{OTLPEndpoint: "http://c:4317", SampleRate: 0.5, LogLevel: "info", LogFormat: "JSON"}, wantErr: false, wantLvl: "INFO", wantFmt: "json"},
+		{name: "warn rejected (must be WARNING)", in: TelemetryConfig{LogLevel: "WARN"}, wantErr: true},
+		{name: "warning accepted", in: TelemetryConfig{LogLevel: "warning"}, wantErr: false, wantLvl: "WARNING"},
+		{name: "bad format", in: TelemetryConfig{LogFormat: "yaml"}, wantErr: true},
+		{name: "pretty ok", in: TelemetryConfig{LogFormat: "pretty"}, wantErr: false, wantFmt: "pretty"},
+		{name: "sample too high", in: TelemetryConfig{SampleRate: 1.5}, wantErr: true},
+		{name: "sample negative", in: TelemetryConfig{SampleRate: -0.1}, wantErr: true},
+		{name: "endpoint bad scheme", in: TelemetryConfig{OTLPEndpoint: "grpc://c:4317"}, wantErr: true},
+		{name: "endpoint no host", in: TelemetryConfig{OTLPEndpoint: "http://"}, wantErr: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc := c.in
+			err := validateTelemetry(&tc)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("validateTelemetry(%+v) err=%v, wantErr=%v", c.in, err, c.wantErr)
+			}
+			if !c.wantErr {
+				if c.wantLvl != "" && tc.LogLevel != c.wantLvl {
+					t.Errorf("normalized level = %q; want %q", tc.LogLevel, c.wantLvl)
+				}
+				if c.wantFmt != "" && tc.LogFormat != c.wantFmt {
+					t.Errorf("normalized format = %q; want %q", tc.LogFormat, c.wantFmt)
+				}
+			}
+		})
+	}
+}

@@ -3,7 +3,9 @@ package daemon
 import (
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -162,8 +164,25 @@ type Config struct {
 	// DefaultWebhook seeds a catch-all webhook target without UI/CLI.
 	Notifications NotificationsConfig `yaml:"notifications,omitempty"`
 
+	// Telemetry configures structured logging + distributed tracing/metrics via
+	// provide-telemetry. With no otlp_endpoint the daemon logs locally and traces
+	// are no-ops; set otlp_endpoint to export traces/metrics/logs to a collector.
+	// PROVIDE_*/OTEL_* env vars override these fields.
+	Telemetry TelemetryConfig `yaml:"telemetry,omitempty"`
+
 	// Version is set at startup from build-time ldflags (not from config file).
 	Version string `yaml:"-"`
+}
+
+// TelemetryConfig maps litevirt's daemon config onto the provide-telemetry
+// environment contract (see internal/obs). Every field is optional; an empty
+// OTLPEndpoint leaves OTLP export off (local structured logging only).
+type TelemetryConfig struct {
+	OTLPEndpoint string  `yaml:"otlp_endpoint,omitempty"` // OTLP gRPC endpoint, e.g. "otel-collector:4317"; empty = export disabled
+	Environment  string  `yaml:"environment,omitempty"`   // deployment env label, e.g. "prod"/"homelab"
+	SampleRate   float64 `yaml:"sample_rate,omitempty"`   // trace sample rate 0.0–1.0; 0 = library default
+	LogLevel     string  `yaml:"log_level,omitempty"`     // DEBUG|INFO|WARN|ERROR (default INFO)
+	LogFormat    string  `yaml:"log_format,omitempty"`    // json|console (default json)
 }
 
 // ACMEConfig configures autocert for the web UI (#13). directory_url points at
@@ -323,7 +342,53 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config image_pull_blocked_cidrs: %w", err)
 	}
 
+	// Validate telemetry now so a typo (e.g. log_level: WARN, which the exporter
+	// rejects) fails load with a clear message instead of silently degrading to
+	// local logging at daemon start. Normalizes level/format to canonical case.
+	if err := validateTelemetry(&cfg.Telemetry); err != nil {
+		return nil, fmt.Errorf("config telemetry: %w", err)
+	}
+
 	return cfg, nil
+}
+
+// validateTelemetry checks and normalizes the telemetry block. Accepted sets
+// mirror provide-telemetry's own validators (log level is WARNING, not WARN).
+func validateTelemetry(t *TelemetryConfig) error {
+	if t.SampleRate < 0 || t.SampleRate > 1 {
+		return fmt.Errorf("sample_rate %.3f out of range — must be between 0.0 and 1.0", t.SampleRate)
+	}
+	if t.LogLevel != "" {
+		lvl := strings.ToUpper(t.LogLevel)
+		switch lvl {
+		case "TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL":
+			t.LogLevel = lvl
+		default:
+			return fmt.Errorf("log_level %q invalid — use TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (note WARNING, not WARN)", t.LogLevel)
+		}
+	}
+	if t.LogFormat != "" {
+		f := strings.ToLower(t.LogFormat)
+		switch f {
+		case "json", "console", "pretty":
+			t.LogFormat = f
+		default:
+			return fmt.Errorf("log_format %q invalid — use json|console|pretty", t.LogFormat)
+		}
+	}
+	if t.OTLPEndpoint != "" {
+		u, err := url.Parse(t.OTLPEndpoint)
+		if err != nil {
+			return fmt.Errorf("otlp_endpoint %q is not a valid URL: %w", t.OTLPEndpoint, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("otlp_endpoint %q must use http:// or https:// (got scheme %q)", t.OTLPEndpoint, u.Scheme)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("otlp_endpoint %q must include a host:port", t.OTLPEndpoint)
+		}
+	}
+	return nil
 }
 
 // ImagePullBlockedPrefixes resolves the image-pull deny config (explicit CIDRs +

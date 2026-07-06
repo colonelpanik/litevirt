@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -806,7 +807,9 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 		// clear reason so console/VNC forwarders can report it to the user.
 		return nil, nil, fmt.Errorf("host %q has no address in cluster state", hostName)
 	}
-	conn, err := pki.PeerDial(s.pkiDir, peerTarget(host.Address, host.GRPCPort))
+	// obs.ClientDialOptions() injects W3C trace context on the outbound peer RPC
+	// when tracing is active (returns nil otherwise, so no otel in the path).
+	conn, err := pki.PeerDial(s.pkiDir, peerTarget(host.Address, host.GRPCPort), obs.ClientDialOptions()...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial host %s: %w", hostName, err)
 	}

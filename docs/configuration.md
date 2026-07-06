@@ -211,6 +211,19 @@ acme:
 # page; they are CRDT-replicated cluster-wide.
 notifications:
   default_webhook: ""               # e.g. https://hooks.slack.com/services/…  (empty = none)
+
+# Telemetry: structured logging + distributed tracing over OTLP (see
+# telemetry.md). Metrics stay on Prometheus (metrics_port) — this block does NOT
+# touch them. Export is OFF until otlp_endpoint is set; with no endpoint the
+# daemon logs locally and attaches no otel handler to any gRPC path (zero cost).
+# The auth secret for the collector belongs in LITEVIRT_OTEL_HEADERS (env), not
+# here. LITEVIRT_* env overrides win over these fields.
+telemetry:
+  otlp_endpoint: ""                 # OTLP endpoint, e.g. http://otel-collector:4317 (empty = export disabled)
+  environment: ""                   # service.env label, e.g. "prod"/"homelab"
+  sample_rate: 0                    # trace sampling 0.0–1.0; 0 → library default
+  log_level: "INFO"                 # TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL
+  log_format: "json"                # json|console|pretty
 ```
 
 ## Minimal config
@@ -303,3 +316,11 @@ live cluster.
 | `LV_HOST` | CLI: default remote gRPC/mTLS target (`host` or `host:port`; a legacy `user@host` prefix is ignored) |
 | `LV_TOKEN` | CLI: bearer token to authenticate gRPC calls. Overrides the credential stored by `lv login`. |
 | `LITEVIRT_UNSAFE_NO_KILLMODE_CHECK` | Skip startup `KillMode=process` self-check (development / non-systemd hosts only). Default check protects against unit-file regressions that would kill child QEMU processes on daemon stop. |
+| `LITEVIRT_OTEL_ENDPOINT` | Telemetry: OTLP endpoint; turns logs+traces export on. Overrides `telemetry.otlp_endpoint`. |
+| `LITEVIRT_OTEL_HEADERS` | Telemetry: OTLP headers, e.g. `Authorization=Basic <b64>` (collector auth — keep in env, not the config file). |
+| `LITEVIRT_LOG_LEVEL` | Telemetry: log level `TRACE`\|`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`\|`CRITICAL`. |
+| `LITEVIRT_LOG_FORMAT` | Telemetry: log format `json`\|`console`\|`pretty`. |
+| `LITEVIRT_TELEMETRY_ENV` / `LITEVIRT_TELEMETRY_SERVICE` / `LITEVIRT_TELEMETRY_VERSION` | Telemetry: `service.env` / `service.name` / `service.version` labels. |
+| `LITEVIRT_TRACES_SAMPLE_RATE` | Telemetry: trace sample rate `0.0`–`1.0`. |
+
+See [telemetry.md](telemetry.md) for the full telemetry setup and an OpenObserve quick start.

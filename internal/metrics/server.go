@@ -53,6 +53,7 @@ func NewServer(port int, bindAddr string, db *corrosion.Client, virt *libvirt.Cl
 func (s *Server) Start() {
 	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
 	prometheus.MustRegister(collector)
+	registerTelemetryMetrics()
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())

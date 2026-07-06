@@ -225,6 +225,13 @@ type AuthConfig struct {
 	// requires the StrictMTLSIdentityV1 capability active cluster-wide. This flag
 	// is the enforcement + kill switch — set false to disable regardless of latch.
 	StrictMTLSIdentity bool `yaml:"strict_mtls_identity,omitempty"`
+	// ForwardedIdentity, when true, makes this node (as the owner of a resource)
+	// re-authenticate the forwarded user's session bearer relayed by the entry
+	// node and run RBAC + audit as the real user, instead of the peer=admin
+	// trusted-forward. Send-side propagation is always on; this flag + the
+	// ForwardedIdentityV1 capability active cluster-wide gate the owner-side
+	// promotion. Default false; the flag is the enforcement + kill switch.
+	ForwardedIdentity bool `yaml:"forwarded_identity,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

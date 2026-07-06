@@ -448,6 +448,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetFirmwarePaths(firmwarePaths)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
+	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())

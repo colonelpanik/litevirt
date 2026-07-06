@@ -71,6 +71,12 @@ type Server struct {
 	// being active cluster-wide; the flag is also the kill switch. Default false.
 	strictMTLSIdentity bool
 
+	// forwardedIdentity, when true, is this node's enforcement switch for owner-
+	// side promotion of a forwarded user identity (x-litevirt-fwd-bearer). Gated
+	// by this flag AND the ForwardedIdentityV1 capability active cluster-wide.
+	// Default false; the flag is the kill switch.
+	forwardedIdentity bool
+
 	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
 	// at daemon startup so CreateVM/restore render the same files the capability
 	// label was derived from.

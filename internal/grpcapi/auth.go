@@ -16,6 +16,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 type ctxKey int
@@ -95,6 +96,12 @@ func (s *Server) SetSessionTimeouts(idle, hard time.Duration) {
 // cluster-wide), a bearerless "client" cert is denied. The flag is the kill
 // switch — false short-circuits enforcement regardless of any latch marker.
 func (s *Server) SetStrictMTLSIdentity(on bool) { s.strictMTLSIdentity = on }
+
+// SetForwardedIdentity sets this node's enforcement switch for owner-side
+// promotion of a forwarded user identity. When true (and the
+// ForwardedIdentityV1 gate is active cluster-wide), a peer relaying a user's
+// session bearer is authenticated as the real user. The flag is the kill switch.
+func (s *Server) SetForwardedIdentity(on bool) { s.forwardedIdentity = on }
 
 // skipAuth lists RPC methods that bypass authentication.
 var skipAuth = map[string]bool{
@@ -189,6 +196,16 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 		return nil, status.Error(codes.Unauthenticated,
 			"client certificate without a session: run `lv login` (strict mTLS identity enforced)")
 	}
+	// Forwarded identity: a trusted peer relaying an entry-authorized user request
+	// carries the user's bearer under FwdBearerMDKey. When enforced, promote to the
+	// real user (RBAC + audit as that user). ONLY a peer may promote — a client can
+	// never inject this to impersonate. A peer with no forwarded bearer is a system
+	// continuation and stays admin (audits as system).
+	if kind == principalKindPeer && s.forwardedIdentityEnforced(ctx) {
+		if fwd := fwdBearerFromCtx(ctx); fwd != "" {
+			return s.authenticateForwardedBearer(ctx, fwd)
+		}
+	}
 	ctx = context.WithValue(ctx, ctxKeyUsername, "admin")
 	ctx = context.WithValue(ctx, ctxKeyRole, "admin")
 	ctx = context.WithValue(ctx, ctxKeyRealm, "local")
@@ -260,6 +277,102 @@ func isLoopbackPeer(ctx context.Context) bool {
 // on-node escape hatch.
 func (s *Server) strictMTLSEnforced(ctx context.Context) bool {
 	return s.strictMTLSIdentity && s.gate != nil && s.gate.Enforced(ctx, capabilities.StrictMTLSIdentityV1)
+}
+
+// forwardedIdentityEnforced reports whether this node promotes a forwarded user
+// bearer to the real user (owner-side). Config flag AND capability gate, like
+// strict mTLS — the flag is the kill switch, short-circuiting the gate.
+func (s *Server) forwardedIdentityEnforced(ctx context.Context) bool {
+	return s.forwardedIdentity && s.gate != nil && s.gate.Enforced(ctx, capabilities.ForwardedIdentityV1)
+}
+
+// fwdBearerFromCtx returns the forwarded user bearer relayed by an entry node
+// (pki.FwdBearerMDKey), or "" if absent.
+func fwdBearerFromCtx(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	if v := md.Get(pki.FwdBearerMDKey); len(v) > 0 {
+		return v[0]
+	}
+	return ""
+}
+
+// authenticateForwardedBearer resolves a forwarded user bearer (relayed by a
+// trusted peer) into the real user identity, so the owner runs RBAC + audit as
+// that user rather than the peer=admin trusted-forward. Fail-closed with
+// distinct codes: an identity that does not resolve locally (session/user not
+// yet replicated to this owner) → Unavailable (retryable); an expired/revoked/
+// malformed bearer → Unauthenticated. A resolvable identity that RBAC later
+// denies surfaces as PermissionDenied from RequirePerm (normal — including a
+// just-granted role that hasn't replicated). It never falls back to peer=admin.
+func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (context.Context, error) {
+	if !strings.HasPrefix(val, "Bearer ") {
+		return nil, status.Error(codes.Unauthenticated, "forwarded identity: malformed bearer")
+	}
+	raw := strings.TrimPrefix(val, "Bearer ")
+
+	if strings.HasPrefix(raw, SessionTokenPrefix) {
+		sid := strings.TrimPrefix(raw, SessionTokenPrefix)
+		if sid == "" {
+			return nil, status.Error(codes.Unauthenticated, "forwarded identity: empty session id")
+		}
+		sess, err := corrosion.GetSession(ctx, s.db, sid)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "forwarded session lookup: %v", err)
+		}
+		if sess == nil {
+			// Session not (yet) replicated to this owner — the lag case. Retryable.
+			return nil, status.Error(codes.Unavailable, "forwarded identity not yet visible on owner; retry")
+		}
+		if sess.RevokedAt != "" {
+			return nil, status.Error(codes.Unauthenticated, "forwarded session revoked")
+		}
+		now := time.Now().UTC()
+		if exp, perr := time.Parse(time.RFC3339, sess.ExpiresAt); perr != nil || now.After(exp) {
+			return nil, status.Error(codes.Unauthenticated, "forwarded session expired")
+		}
+		if last, perr := time.Parse(time.RFC3339, sess.LastUsedAt); perr != nil || now.Sub(last) > s.idleTimeout() {
+			return nil, status.Error(codes.Unauthenticated, "forwarded session idle-timeout exceeded")
+		}
+		user, err := corrosion.GetUser(ctx, s.db, sess.Username)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "forwarded session user lookup: %v", err)
+		}
+		if user == nil {
+			// User row not yet replicated → retryable, not a hard denial. Do NOT
+			// TouchSession here — the entry node owns last_used_at; touching from
+			// the owner would churn the row across nodes.
+			return nil, status.Error(codes.Unavailable, "forwarded identity not yet visible on owner; retry")
+		}
+		ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
+		ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
+		ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
+		ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
+		ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
+		return ctx, nil
+	}
+
+	// Legacy API token: ValidateToken already rejects expired/invalid (→ nil).
+	// Tokens are pre-created and long-lived, so replication lag is not a concern
+	// (unlike freshly-minted sessions) — a nil result is treated as invalid.
+	user, err := corrosion.ValidateToken(ctx, s.db, raw)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "forwarded token validation: %v", err)
+	}
+	if user == nil {
+		return nil, status.Error(codes.Unauthenticated, "forwarded identity: invalid or expired token")
+	}
+	ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
+	ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
+	ctx = context.WithValue(ctx, ctxKeyRealm, "local")
+	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodToken)
+	ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
+	if len(user.ScopePaths) > 0 {
+		ctx = context.WithValue(ctx, ctxKeyScopePaths, user.ScopePaths)
+	}
+	return ctx, nil
 }
 
 // callerPrincipalKind returns the classified kind (peer/local-root/client) for

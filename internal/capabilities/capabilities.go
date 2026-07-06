@@ -70,6 +70,16 @@ const (
 	// loopback local-root path is never gated — so a mis-flip is reversible and can
 	// never lock out on-node root.
 	StrictMTLSIdentityV1 = "strict_mtls_identity_v1"
+	// ForwardedIdentityV1 gates the owner-side promotion of a forwarded user
+	// identity. An entry node propagates the caller's session bearer to the owning
+	// node in x-litevirt-fwd-bearer (send-side is ungated + forward-compatible);
+	// once this token is enforced, the owner re-authenticates that bearer and runs
+	// RBAC + audit as the REAL user instead of the peer=admin trusted-forward. A
+	// forward with no bearer (a system continuation off a background context) stays
+	// peer=admin/system. Owner-side validation is fail-closed: a session/user not
+	// yet replicated → Unavailable (retryable), not silent admin. Config-gated
+	// (auth.forwarded_identity) + reversible like StrictMTLSIdentityV1.
+	ForwardedIdentityV1 = "forwarded_identity_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -128,12 +138,12 @@ const (
 // (This is now LIVE for split_brain_gate_v1: once a node latches it, de-advertising alone
 // won't revert it — delete <dataDir>/split_brain_activated.split_brain_gate_v1 to stand it
 // down. Still inert for the Phase-2 tokens, which no shipped build advertises yet.)
-var supported = []string{SplitBrainGateV1, StrictMTLSIdentityV1}
+var supported = []string{SplitBrainGateV1, StrictMTLSIdentityV1, ForwardedIdentityV1}
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, StrictMTLSIdentityV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, StrictMTLSIdentityV1, ForwardedIdentityV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

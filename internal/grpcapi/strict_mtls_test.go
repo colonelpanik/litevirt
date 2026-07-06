@@ -17,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // mtlsPeerCtx builds a server-incoming context as the auth interceptor sees it:
@@ -246,5 +247,138 @@ func TestStep0Gates_DualUse(t *testing.T) {
 		if c := status.Code(tc.call(viewer)); c != codes.PermissionDenied {
 			t.Errorf("%s viewer: code = %v, want PermissionDenied", tc.name, c)
 		}
+	}
+}
+
+// --- Stage 2: forwarded identity ---
+
+// fwdServer returns a test server with the forwarded-identity config flag set
+// and a fake gate whose Enforced(ForwardedIdentityV1) returns gateOn.
+func fwdServer(t *testing.T, flag, gateOn bool, hosts ...string) *Server {
+	t.Helper()
+	s := testServer(t)
+	for _, h := range hosts {
+		if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: h, Address: "10.0.0.9", State: "active"}); err != nil {
+			t.Fatalf("InsertHost(%s): %v", h, err)
+		}
+	}
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.ForwardedIdentityV1: gateOn}})
+	s.SetForwardedIdentity(flag)
+	return s
+}
+
+// withFwdBearer adds a forwarded user bearer to the incoming metadata of ctx.
+func withFwdBearer(ctx context.Context, val string) context.Context {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		md = metadata.MD{}
+	} else {
+		md = md.Copy()
+	}
+	md.Set(pki.FwdBearerMDKey, val)
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+func aliceSession(t *testing.T, s *Server) string {
+	t.Helper()
+	ctx := context.Background()
+	if err := corrosion.InsertUser(ctx, s.db, "alice", "viewer", "x"); err != nil {
+		t.Fatalf("InsertUser: %v", err)
+	}
+	token, _, _, err := s.mintSession(ctx, "alice", "local", "10.0.0.9", "test")
+	if err != nil {
+		t.Fatalf("mintSession: %v", err)
+	}
+	return token
+}
+
+func TestForwardedIdentity_PeerPromotesToRealUser(t *testing.T) {
+	s := fwdServer(t, true, true, "peer-1")
+	token := aliceSession(t, s)
+	ctx := withFwdBearer(mtlsPeerCtx("peer-1", tcpAddr("10.0.0.9"), ""), "Bearer "+token)
+
+	newCtx, err := s.authenticate(ctx)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if u := callerUsername(newCtx); u != "alice" {
+		t.Errorf("username = %q, want alice (promoted from fwd-bearer)", u)
+	}
+	if r := callerRole(newCtx); r != "viewer" {
+		t.Errorf("role = %q, want viewer (not admin)", r)
+	}
+}
+
+func TestForwardedIdentity_DarkKeepsPeerAdmin(t *testing.T) {
+	// Flag/gate off: the fwd-bearer is ignored, peer stays admin (trusted forward).
+	s := fwdServer(t, false, false, "peer-1")
+	token := aliceSession(t, s)
+	ctx := withFwdBearer(mtlsPeerCtx("peer-1", tcpAddr("10.0.0.9"), ""), "Bearer "+token)
+
+	newCtx, err := s.authenticate(ctx)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if u := callerUsername(newCtx); u != "admin" {
+		t.Errorf("username = %q, want admin (dark: fwd-bearer ignored)", u)
+	}
+}
+
+func TestForwardedIdentity_PeerNoBearerIsSystemAdmin(t *testing.T) {
+	// A peer with NO fwd-bearer (a system continuation) stays admin even when enforced.
+	s := fwdServer(t, true, true, "peer-1")
+	newCtx, err := s.authenticate(mtlsPeerCtx("peer-1", tcpAddr("10.0.0.9"), ""))
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if r := callerRole(newCtx); r != "admin" {
+		t.Errorf("role = %q, want admin (system continuation)", r)
+	}
+	if k := callerPrincipalKind(newCtx); k != principalKindPeer {
+		t.Errorf("kind = %q, want peer", k)
+	}
+}
+
+func TestForwardedIdentity_ClientCannotImpersonate(t *testing.T) {
+	// A client cert injecting a fwd-bearer must NOT be promoted (only a peer may).
+	// With strict OFF the client is a dark admin; the fwd-bearer is ignored.
+	s := fwdServer(t, true, true) // fwd enforced, but caller is a client (unknown CN)
+	token := aliceSession(t, s)
+	ctx := withFwdBearer(mtlsPeerCtx("lv-cli", tcpAddr("10.0.0.9"), ""), "Bearer "+token)
+
+	newCtx, err := s.authenticate(ctx)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if u := callerUsername(newCtx); u == "alice" {
+		t.Error("client cert was promoted to alice via injected fwd-bearer — impersonation")
+	}
+}
+
+func TestForwardedIdentity_FailClosedCodes(t *testing.T) {
+	s := fwdServer(t, true, true, "peer-1")
+	peerAddr := tcpAddr("10.0.0.9")
+
+	// (a) session not present locally (not-yet-replicated) → Unavailable (retryable).
+	ctx := withFwdBearer(mtlsPeerCtx("peer-1", peerAddr, ""), "Bearer "+SessionTokenPrefix+"deadbeef")
+	if _, err := s.authenticate(ctx); status.Code(err) != codes.Unavailable {
+		t.Errorf("missing session: code = %v, want Unavailable", status.Code(err))
+	}
+
+	// (b) revoked session → Unauthenticated (do not retry).
+	token := aliceSession(t, s)
+	sid := token[len(SessionTokenPrefix):]
+	if err := corrosion.RevokeSession(context.Background(), s.db, sid); err != nil {
+		t.Fatalf("RevokeSession: %v", err)
+	}
+	ctx = withFwdBearer(mtlsPeerCtx("peer-1", peerAddr, ""), "Bearer "+token)
+	if _, err := s.authenticate(ctx); status.Code(err) != codes.Unauthenticated {
+		t.Errorf("revoked session: code = %v, want Unauthenticated", status.Code(err))
+	}
+
+	// (c) malformed (no Bearer prefix) → Unauthenticated.
+	ctx = withFwdBearer(mtlsPeerCtx("peer-1", peerAddr, ""), "not-a-bearer")
+	if _, err := s.authenticate(ctx); status.Code(err) != codes.Unauthenticated {
+		t.Errorf("malformed fwd-bearer: code = %v, want Unauthenticated", status.Code(err))
 	}
 }

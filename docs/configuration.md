@@ -127,6 +127,18 @@ auth:
   # (refreshed on each request); session_hard_expiry is the absolute cap.
   session_idle_timeout: ""                # e.g. "8h"
   session_hard_expiry: ""                 # e.g. "168h" (7 days)
+  # Strict mTLS identity: when true (and the strict_mtls_identity_v1 capability
+  # is active cluster-wide), a bearerless "client" certificate (the distributable
+  # CLI client cert, or any cert whose CN is not a live cluster host) is no longer
+  # treated as admin — it must present a session bearer (`lv login`). Host/peer
+  # certs and on-node loopback are unaffected. Default false. This flag is the
+  # enforcement + kill switch. See docs/auth.md.
+  strict_mtls_identity: false
+  # Forwarded identity: when true (and the forwarded_identity_v1 capability is
+  # active cluster-wide), the owning node re-authenticates a forwarded user's
+  # bearer and runs RBAC + audit as the real user instead of the peer=admin
+  # trusted-forward. Default false.
+  forwarded_identity: false
   realms:
     - name: corp                          # realm short name; users login as alice@corp
       kind: oidc

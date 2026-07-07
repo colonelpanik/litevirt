@@ -254,8 +254,17 @@ loopback local-root path is never gated — so a mis-flip is reversible and can
 never lock out an on-node operator. Because peer/forwarded traffic uses host
 certs (which stay `admin`), enabling it changes **no** node-to-node behavior; the
 only operator-visible change is that a **remote** CLI must `lv login` first
-(on-node `lv` over loopback is unaffected). Roll it out flag-enabled on every
-node only after the capability is advertised fleet-wide.
+(on-node `lv` over loopback is unaffected).
+
+**The token ships DARK** — it is in the capability registry but NOT advertised
+(`capabilities.all`, not `supported`), so merging/deploying this build is fully
+inert: nothing activates and there is no HA-degraded during the rollout. Flipping
+is a deliberate two-step: **(1)** ship a release that adds `strict_mtls_identity_v1`
+to `capabilities.supported` and roll it fleet-wide (nodes then advertise it; the
+capability activates + latches once all do — and a transient
+`ha_degraded{unsupported_member}` is expected during that window until every node
+is upgraded), then **(2)** set `auth.strict_mtls_identity: true` on every node.
+Enforcement needs both; validate on an ephemeral cluster before either step.
 
 ### Forwarded identity (`auth.forwarded_identity`)
 

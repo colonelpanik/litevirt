@@ -69,6 +69,11 @@ const (
 	// enforcement switch (enforcement is config AND Enforced) and kill switch, and the
 	// loopback local-root path is never gated — so a mis-flip is reversible and can
 	// never lock out on-node root.
+	//
+	// DARK: in `all` only, NOT `supported` — deploying this build does not advertise
+	// it, so a merge/rollout is fully inert (no activation, no HA-degraded). The flip
+	// is deliberate: add it to `supported` (a release → the fleet advertises it) AND
+	// set auth.strict_mtls_identity; enforcement needs BOTH.
 	StrictMTLSIdentityV1 = "strict_mtls_identity_v1"
 	// ForwardedIdentityV1 gates the owner-side promotion of a forwarded user
 	// identity. An entry node propagates the caller's session bearer to the owning
@@ -79,6 +84,11 @@ const (
 	// peer=admin/system. Owner-side validation is fail-closed: a session/user not
 	// yet replicated → Unavailable (retryable), not silent admin. Config-gated
 	// (auth.forwarded_identity) + reversible like StrictMTLSIdentityV1.
+	//
+	// DARK: in `all` only, NOT `supported` (see StrictMTLSIdentityV1) — inert until a
+	// deliberate flip advertises it AND auth.forwarded_identity is set. (The send-side
+	// bearer relay is always on but forward-compatible: with this token dark, no owner
+	// promotes, so the relayed header is ignored.)
 	ForwardedIdentityV1 = "forwarded_identity_v1"
 )
 
@@ -138,7 +148,7 @@ const (
 // (This is now LIVE for split_brain_gate_v1: once a node latches it, de-advertising alone
 // won't revert it — delete <dataDir>/split_brain_activated.split_brain_gate_v1 to stand it
 // down. Still inert for the Phase-2 tokens, which no shipped build advertises yet.)
-var supported = []string{SplitBrainGateV1, StrictMTLSIdentityV1, ForwardedIdentityV1}
+var supported = []string{SplitBrainGateV1}
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable

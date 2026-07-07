@@ -223,6 +223,30 @@ acme:
 # page; they are CRDT-replicated cluster-wide.
 notifications:
   default_webhook: ""               # e.g. https://hooks.slack.com/services/…  (empty = none)
+
+# Peer self-upgrade (auto-catch-up). A lagging daemon pulls a newer *released*
+# binary from a healthy peer and re-execs, so a host that was down during a
+# cluster upgrade converges on its own. Forward-only + release-only: it never
+# downgrades, and never chases a dev / git-describe (`vX.Y.Z-N-gHASH`) build.
+# See docs/self-upgrade-from-peer.md.
+auto_upgrade:
+  from_peer: true                   # default true (unset = on). Set false to PIN this
+                                    # node's binary (e.g. hold a test build in place) —
+                                    # it then upgrades only via `lv host upgrade`.
+  interval_minutes: 5               # how often to check peers for a newer build; 0 → 5
+
+# Image-pull bounds for URL pulls (`lv image pull <url>`). The block_* / blocked_cidrs
+# deny policy is an OPT-IN SSRF guard (all default off). See "Image-pull controls".
+max_image_bytes: 0                  # hard ceiling per pull/import, bytes; 0 → 64 GiB default
+image_pull_timeout_sec: 0           # total wall-clock timeout for a pull; 0 → 30 min default
+image_pull_block_metadata: false    # block link-local / cloud-metadata (169.254.0.0/16, IMDS)
+image_pull_block_private: false     # block RFC1918 + loopback + CGNAT + ULA + link-local
+image_pull_blocked_cidrs: []        # extra explicit CIDRs to block; an invalid CIDR fails startup
+
+# Superseded-row garbage collection — an hourly, local, deterministic sweep that
+# hard-deletes provably-inert rows past a retention floor. See "Garbage collection".
+tombstone_gc_retention_hours: 0         # provably-inert rows (superseded set / stale LB gen); 0 → 24h
+tombstone_gc_orphan_retention_hours: 0  # rows whose owning pointer/config is absent; 0 → 168h (7d)
 ```
 
 ## Minimal config
@@ -249,22 +273,12 @@ Multiple peers can be listed for redundancy. The membership protocol discovers t
 
 ## Image-pull controls
 
-URL-based image pulls (`lv image pull <url>`) are bounded by:
-
-```yaml
-max_image_bytes: 68719476736      # hard ceiling per pull/import (bytes); 0 → 64 GiB default
-image_pull_timeout_sec: 1800      # total wall-clock timeout for a pull; 0 → 30 min default
-
-# Optional, OPT-IN SSRF network deny policy (all default off → no blocking).
-# A pull's RESOLVED destination IP is rejected at connect time if it falls in a
-# blocked range — checked on every connection, so it is DNS-rebinding- and
-# redirect-safe.
-image_pull_block_metadata: false  # block link-local / cloud-metadata (169.254.0.0/16, IPv6 link-local, AWS IMDS)
-image_pull_block_private: false   # block RFC1918 + loopback + CGNAT + ULA + link-local (superset of the above)
-image_pull_blocked_cidrs: []      # extra explicit CIDRs to block, e.g. ["10.20.0.0/16"]
-```
-
-Notes:
+URL-based image pulls (`lv image pull <url>`) are bounded by `max_image_bytes`
+and `image_pull_timeout_sec`, plus an OPT-IN SSRF network deny policy
+(`image_pull_block_metadata` / `image_pull_block_private` / `image_pull_blocked_cidrs`)
+— all in the reference above. A pull's RESOLVED destination IP is rejected at
+connect time if it falls in a blocked range, checked on every connection, so it is
+DNS-rebinding- and redirect-safe. Notes:
 
 - **Opt-in.** With no policy set (the default) pulls are unrestricted and honor
   `HTTP(S)_PROXY`. Recommended on cloud hosts: set `image_pull_block_metadata: true`
@@ -283,13 +297,9 @@ Notes:
 Re-enrolling 2FA recovery codes and recreating load balancers leave behind rows
 that can never validate or render again (superseded recovery-code sets, stale LB
 backend generations). An hourly per-node sweep hard-deletes them once they age
-past a retention floor; the count is exported as `litevirt_gc_rows_deleted_total`
-(labeled by `table`).
-
-```yaml
-tombstone_gc_retention_hours: 24          # provably-inert rows (superseded set / stale generation); 0 → 24h
-tombstone_gc_orphan_retention_hours: 168  # rows whose owning pointer/config is absent (cautious); 0 → 7d
-```
+past a retention floor (`tombstone_gc_retention_hours` /
+`tombstone_gc_orphan_retention_hours` in the reference above); the count is exported
+as `litevirt_gc_rows_deleted_total` (labeled by `table`).
 
 The sweep is local-only and deterministic (each node prunes its own copy; it
 never touches a current-active-set or current-generation row), so it is safe on a

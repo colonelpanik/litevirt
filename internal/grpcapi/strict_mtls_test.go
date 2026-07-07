@@ -382,3 +382,44 @@ func TestForwardedIdentity_FailClosedCodes(t *testing.T) {
 		t.Errorf("malformed fwd-bearer: code = %v, want Unauthenticated", status.Code(err))
 	}
 }
+
+// TestRequirePeerCert_PromotedForwardedPeer: a forwarded-identity promotion changes
+// authMethod to session but PRESERVES the peer transport (principalKind=peer + CN),
+// so requirePeerCert must still accept it — otherwise flipping forwarded_identity_v1
+// would break every user-initiated fan-out to a peer-only RPC (network/LB provision,
+// remote backup, container migrate). An operator bearer and a client cert stay denied.
+func TestRequirePeerCert_PromotedForwardedPeer(t *testing.T) {
+	s := newPeerAuthServer(t) // inserts trusted host "peer-1"
+
+	// Promoted forwarded peer: transport peer (principalKind=peer, CN=peer-1), but
+	// the identity was promoted to a user (authMethod=session).
+	promoted := context.WithValue(context.Background(), ctxKeyPrincipalKind, principalKindPeer)
+	promoted = context.WithValue(promoted, ctxKeyMTLSCommonName, "peer-1")
+	promoted = context.WithValue(promoted, ctxKeyAuthMethod, authMethodSession)
+	promoted = context.WithValue(promoted, ctxKeyUsername, "alice")
+	if err := s.requirePeerCert(promoted); err != nil {
+		t.Errorf("promoted forwarded peer must pass requirePeerCert (peer transport): got %v", err)
+	}
+	if err := requireReplicationPeer(promoted, "peer-1"); err != nil {
+		t.Errorf("promoted forwarded peer must pass requireReplicationPeer for its sender: got %v", err)
+	}
+
+	// An operator bearer (no principalKind) is still rejected.
+	op := context.WithValue(context.Background(), ctxKeyAuthMethod, authMethodSession)
+	op = context.WithValue(op, ctxKeyRole, "operator")
+	if err := s.requirePeerCert(op); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("operator bearer must be rejected: got %v", err)
+	}
+
+	// A client cert (principalKind=client) is still rejected.
+	cl := context.WithValue(context.Background(), ctxKeyPrincipalKind, principalKindClient)
+	cl = context.WithValue(cl, ctxKeyMTLSCommonName, "lv-cli")
+	if err := s.requirePeerCert(cl); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("client cert must be rejected: got %v", err)
+	}
+
+	// A promoted peer claiming a DIFFERENT sender is still rejected by CN==sender.
+	if err := requireReplicationPeer(promoted, "peer-2"); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("replication sender mismatch must be rejected: got %v", err)
+	}
+}

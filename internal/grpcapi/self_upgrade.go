@@ -79,7 +79,13 @@ func (s *Server) FetchBinary(_ *pb.FetchBinaryRequest, stream grpc.ServerStreami
 // NOT pass — so a binary/secret-bearing peer RPC isn't reachable by an operator
 // bearer/user credential.
 func (s *Server) requirePeerCert(ctx context.Context) error {
-	if callerAuthMethod(ctx) != authMethodMTLS {
+	// Gate on the TRANSPORT being a trusted host cert, not on authMethod. The
+	// principal kind is set by classifyBearerlessMTLS (peer/local-root only after a
+	// trusted-host CN) and is PRESERVED as "peer" through a forwarded-identity
+	// promotion (which changes authMethod to session but keeps the peer transport).
+	// So this accepts a direct peer, an on-node local-root, and a promoted forwarded
+	// peer, while rejecting an operator bearer (no kind) and a client cert.
+	if k := callerPrincipalKind(ctx); k != principalKindPeer && k != principalKindLocalRoot {
 		return status.Error(codes.PermissionDenied, "peer mTLS required")
 	}
 	cn := callerMTLSCommonName(ctx)

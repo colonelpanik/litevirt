@@ -99,7 +99,8 @@ func contentPeerCtx(t *testing.T, s *Server) context.Context {
 		t.Fatalf("InsertHost: %v", err)
 	}
 	ctx := context.WithValue(context.Background(), ctxKeyAuthMethod, authMethodMTLS)
-	return context.WithValue(ctx, ctxKeyMTLSCommonName, "peer1")
+	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, "peer1")
+	return context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
 }
 
 // TestStoragePoolContents_ProjectIsolation: a user scoped to project A may browse/

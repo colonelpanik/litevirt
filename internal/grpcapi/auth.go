@@ -351,6 +351,9 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 		ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
 		ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
 		ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
+		// Preserve the relaying peer's transport CN so requirePeerCert /
+		// requireReplicationPeer (and audit) still see it through the promotion.
+		ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, peerCommonName(ctx))
 		return ctx, nil
 	}
 
@@ -369,6 +372,7 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 	ctx = context.WithValue(ctx, ctxKeyRealm, "local")
 	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodToken)
 	ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
+	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, peerCommonName(ctx))
 	if len(user.ScopePaths) > 0 {
 		ctx = context.WithValue(ctx, ctxKeyScopePaths, user.ScopePaths)
 	}

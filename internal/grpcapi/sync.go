@@ -226,7 +226,11 @@ func (s *Server) AckMutations(ctx context.Context, req *pb.AckRequest) (*emptypb
 }
 
 func requireReplicationPeer(ctx context.Context, sender string) error {
-	if callerAuthMethod(ctx) != authMethodMTLS {
+	// Transport must be a trusted host cert (see requirePeerCert) — accepts a
+	// forwarded-identity-promoted peer too (principalKind preserved), while the
+	// CN==sender check below (CN also preserved through promotion) still pins it to
+	// the claimed sender.
+	if k := callerPrincipalKind(ctx); k != principalKindPeer && k != principalKindLocalRoot {
 		return status.Error(codes.PermissionDenied, "replication RPC requires peer mTLS")
 	}
 	cn := callerMTLSCommonName(ctx)

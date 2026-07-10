@@ -981,9 +981,11 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		// RPC that mutated libvirt but failed before writing state). Reconcile
 		// the record to "running" rather than surfacing "already running".
 		if st, sErr := s.virt.DomainState(req.Name); sErr == nil && st == "running" {
-			if werr := corrosion.UpdateVMStateStrict(ctx, s.db, req.Name, "running", "reconciled: already running in libvirt"); werr != nil {
-				s.noteStateWriteFail(corrosion.OpVMState, werr)
-				return nil, status.Errorf(codes.Internal, "start: domain already running but recording state failed: %v", werr)
+			// Domain is already running: a lost "running" write is low-harm (the
+			// reconciler heals it from libvirt), so record best-effort with retry
+			// but never skip the follow-up (hooks) or fail the start.
+			if werr := s.persistVMState(ctx, req.Name, "running", "reconciled: already running in libvirt", corrosion.OpVMState); werr != nil {
+				slog.Error("StartVM: recording reconciled running state failed — reconciler will heal", "vm", req.Name, "error", werr)
 			}
 			slog.Warn("StartVM: domain already running in libvirt, reconciled cluster state", "vm", req.Name)
 			pbVM.State = pb.VMState_VM_RUNNING
@@ -993,11 +995,12 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
 
-	// The domain is up; do not signal success (event + PostStart hook) unless the
-	// running state is durably recorded. On failure the reconciler heals the row.
-	if err := corrosion.UpdateVMStateStrict(ctx, s.db, req.Name, "running", ""); err != nil {
-		s.noteStateWriteFail(corrosion.OpVMState, err)
-		return nil, status.Errorf(codes.Internal, "started but recording running state failed: %v", err)
+	// The domain is up. A lost "running" write is low-harm (the reconciler heals
+	// it from libvirt), so record it best-effort with retry and still run the
+	// follow-up (VLAN taps, PostStart hook) — skipping those would leave a running
+	// but unreachable VM that nothing re-heals.
+	if err := s.persistVMState(ctx, req.Name, "running", "", corrosion.OpVMState); err != nil {
+		slog.Error("StartVM: recording running state failed — reconciler will heal", "vm", req.Name, "error", err)
 	}
 	s.recordVMEvent(ctx, req.Name, "vm.started", "ok", "")
 
@@ -1068,8 +1071,11 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	// auto-restart a VM the operator deliberately stopped, so it must land before
 	// we signal success (event, LB refresh, PostStop hook). The reconciler heals
 	// the row on failure.
-	if err := corrosion.UpdateVMStateStrict(ctx, s.db, req.Name, "stopped", "operator-stop"); err != nil {
-		s.noteStateWriteFail(corrosion.OpVMState, err)
+	// Unlike a "running" write, a lost operator-stop can't be healed by the
+	// reconciler (it can't know the stop was intentional) and lets HA auto-restart
+	// the VM (#29), so this one is fail-closed: retry, then surface an error if it
+	// still can't land, rather than signal a clean stop.
+	if err := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
 	s.recordVMEvent(ctx, req.Name, "vm.stopped", "ok", "")
@@ -1118,9 +1124,10 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, status.Errorf(codes.Internal, "restart: %v", err)
 	}
 
-	if err := corrosion.UpdateVMStateStrict(ctx, s.db, req.Name, "running", ""); err != nil {
-		s.noteStateWriteFail(corrosion.OpVMState, err)
-		return nil, status.Errorf(codes.Internal, "restarted but recording running state failed: %v", err)
+	// Low-harm "running" write (reconciler heals from libvirt): record best-effort
+	// with retry, still record the event, never fail an already-restarted VM.
+	if err := s.persistVMState(ctx, req.Name, "running", "", corrosion.OpVMState); err != nil {
+		slog.Error("RestartVM: recording running state failed — reconciler will heal", "vm", req.Name, "error", err)
 	}
 	s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "")
 	return s.vmToProto(ctx, req.Name)

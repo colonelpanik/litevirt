@@ -397,6 +397,12 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 		// stale stop cause so a later unexpected stop is judged fresh.
 		if ct.State != "running" {
 			if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", ""); err != nil {
+				if errors.Is(err, corrosion.ErrNoRowsAffected) {
+					// Row vanished between the sweep list and here (concurrent
+					// delete) — nothing to reconcile, not a write fault.
+					slog.Debug("containercheck: reconcile target row gone; skipping", "container", ct.Name)
+					return
+				}
 				slog.Error("containercheck: reconcile write failed — NOT publishing reconciled event",
 					"container", ct.Name, "error", err)
 				c.noteStateWriteFail(corrosion.OpContainerState, err)

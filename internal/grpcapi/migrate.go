@@ -470,8 +470,10 @@ poll:
 					}
 					slog.Warn("migration failed but VM still running on source",
 						"vm", vm.Name, "target", req.TargetHost, "error", res.err)
-				} else if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "error", res.err.Error()); werr != nil {
-					s.noteStateWriteFail(corrosion.OpVMState, werr)
+				} else {
+					if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "error", res.err.Error()); werr != nil {
+						s.noteStateWriteFail(corrosion.OpVMState, werr)
+					}
 				}
 				// Remove the disk stubs + cloud-init ISO we pre-created on the
 				// target — the VM never got defined there, so they're orphaned

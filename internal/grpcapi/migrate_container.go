@@ -185,8 +185,10 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 				if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", ""); werr != nil {
 					s.noteStateWriteFail(corrosion.OpContainerState, werr)
 				}
-			} else if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "running", ""); werr != nil {
-				s.noteStateWriteFail(corrosion.OpContainerState, werr)
+			} else {
+				if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "running", ""); werr != nil {
+					s.noteStateWriteFail(corrosion.OpContainerState, werr)
+				}
 			}
 		} else {
 			// Originally stopped: put back exactly its prior state + detail (NOT the

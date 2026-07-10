@@ -71,6 +71,34 @@ func TestWritecheck_HonorsAllowDirective(t *testing.T) {
 	}
 }
 
+func TestWritecheck_FlagsGoAndDefer(t *testing.T) {
+	p := writeTemp(t, header+
+		"\tgo corrosion.UpdateVMState(nil, db, \"vm\", \"running\", \"\")\n"+
+		"\tdefer corrosion.SetContainerState(nil, db, \"h\", \"c\", \"stopped\")\n}\n")
+	v, err := scanFile(p)
+	if err != nil {
+		t.Fatalf("scanFile: %v", err)
+	}
+	if len(v) != 2 {
+		t.Fatalf("want 2 violations (go + defer), got %d: %+v", len(v), v)
+	}
+}
+
+func TestWritecheck_AllowDirectiveOnMultilineClosingLine(t *testing.T) {
+	// The directive on the trailing `})` line of a multi-line call must suppress.
+	p := writeTemp(t, header+
+		"\tcorrosion.InsertImage(nil, db, corrosion.ImageRecord{\n"+
+		"\t\tName: \"img\",\n"+
+		"\t}) //writecheck:allow best-effort placeholder\n}\n")
+	v, err := scanFile(p)
+	if err != nil {
+		t.Fatalf("scanFile: %v", err)
+	}
+	if len(v) != 0 {
+		t.Fatalf("allow directive on the closing line should suppress, got %+v", v)
+	}
+}
+
 func TestWritecheck_IgnoresNonCorrosionAndReturn(t *testing.T) {
 	p := writeTemp(t, header+
 		"\tsomethingElse()\n}\n\nfunc g(ctx interface{}, db *corrosion.Client) error {\n"+

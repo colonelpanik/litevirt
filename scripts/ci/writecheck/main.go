@@ -31,8 +31,11 @@ import (
 	"strings"
 )
 
-// guarded is the closed set of corrosion write functions whose error must be
-// checked. Keep in sync with internal/corrosion (writeobs.go names the ops).
+// guarded is the closed set of corrosion write FUNCTION names whose error must be
+// checked. This is the authoritative list (there is no single symbol in
+// internal/corrosion to diff against — writeobs.go names the metric ops, not these
+// functions), so when you add an authoritative state/ownership/image writer to
+// internal/corrosion, add it here too.
 var guarded = map[string]bool{
 	"UpdateVMState":                 true,
 	"UpdateVMStateStrict":           true,
@@ -131,26 +134,43 @@ func scanFile(path string) ([]violation, error) {
 	}
 
 	var out []violation
-	report := func(pos token.Pos, fn string) {
-		line := fset.Position(pos).Line
-		if allow[line] {
-			return
+	// report anchors the violation at the call's FIRST line, but honors a
+	// //writecheck:allow directive on ANY line the statement spans — a guarded
+	// write is usually a multi-line call (a struct-literal arg), and the natural
+	// place for the directive is the trailing `})` line, not the opening one.
+	report := func(n ast.Node, fn string) {
+		start := fset.Position(n.Pos()).Line
+		end := fset.Position(n.End()).Line
+		for ln := start; ln <= end; ln++ {
+			if allow[ln] {
+				return
+			}
 		}
-		out = append(out, violation{file: path, line: line, fn: fn})
+		out = append(out, violation{file: path, line: start, fn: fn})
 	}
 
 	ast.Inspect(file, func(n ast.Node) bool {
 		switch s := n.(type) {
 		case *ast.ExprStmt:
 			if fn := corrosionWrite(s.X); fn != "" {
-				report(s.Pos(), fn)
+				report(s, fn)
 			}
 		case *ast.AssignStmt:
 			if len(s.Rhs) != 1 {
 				return true
 			}
 			if fn := corrosionWrite(s.Rhs[0]); fn != "" && allBlank(s.Lhs) {
-				report(s.Pos(), fn)
+				report(s, fn)
+			}
+		case *ast.GoStmt:
+			// `go corrosion.X(...)` inherently discards the return.
+			if fn := corrosionWrite(s.Call); fn != "" {
+				report(s, fn)
+			}
+		case *ast.DeferStmt:
+			// `defer corrosion.X(...)` inherently discards the return.
+			if fn := corrosionWrite(s.Call); fn != "" {
+				report(s, fn)
 			}
 		}
 		return true

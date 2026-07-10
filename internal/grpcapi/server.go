@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -321,6 +322,29 @@ func (s *Server) noteStateWriteFail(op string, err error) {
 	if s.onStateWriteFail != nil {
 		s.onStateWriteFail(op, corrosion.ClassifyWriteErr(err))
 	}
+}
+
+// persistVMState records an authoritative VM state via the strict helper,
+// retrying briefly to absorb a transient Corrosion/DB error (the realistic
+// failure after a runtime action already succeeded). A zero-row result
+// (ErrNoRowsAffected — the row vanished) returns immediately; retrying it is
+// pointless. On a persistent failure it counts the drop (state-write metric) and
+// returns the error, letting the caller decide whether losing THIS write is fatal
+// (operator-stop, whose loss lets HA restart a stopped VM) or merely observed (a
+// "running" state the reconciler heals from libvirt).
+func (s *Server) persistVMState(ctx context.Context, name, state, detail, op string) error {
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		if err = corrosion.UpdateVMStateStrict(ctx, s.db, name, state, detail); err == nil {
+			return nil
+		}
+		if errors.Is(err, corrosion.ErrNoRowsAffected) {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	s.noteStateWriteFail(op, err)
+	return err
 }
 
 func (s *Server) noteGateRefused(action, reason string) {

@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -174,6 +175,12 @@ func (v *VMChecker) sweep(ctx context.Context) {
 			if st, err := v.virt.DomainState(vm.Name); err == nil && st == "running" {
 				if werr := corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running",
 					"reconciled from libvirt: domain running"); werr != nil {
+					if errors.Is(werr, corrosion.ErrNoRowsAffected) {
+						// Row vanished between the list and here (concurrent delete)
+						// — nothing to reconcile, not a write fault.
+						slog.Debug("vmcheck: reconcile target row gone; skipping", "vm", vm.Name)
+						continue
+					}
 					slog.Error("vmcheck: reconcile write failed — NOT publishing reconciled event",
 						"vm", vm.Name, "error", werr)
 					v.noteStateWriteFail(corrosion.OpVMState, werr)
@@ -490,9 +497,20 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 		return
 	}
 
-	if err := corrosion.UpdateVMHost(ctx, v.db, vm.Name, target.Name, "running"); err != nil {
-		slog.Error("vmcheck: post-migration ownership write failed — NOT publishing migrated event", "vm", vm.Name, "to", target.Name, "error", err)
-		v.noteStateWriteFail(corrosion.OpVMHost, err)
+	// The domain has already moved to the target; the ownership write MUST land or
+	// the source row strands a VM it no longer runs (dual/stale ownership). Retry
+	// briefly to absorb a transient error before giving up to the reconciler.
+	var werr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if werr = corrosion.UpdateVMHost(ctx, v.db, vm.Name, target.Name, "running"); werr == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	if werr != nil {
+		slog.Error("vmcheck: post-migration ownership write failed after retries — VM stranded on source row; reconciler must resolve",
+			"vm", vm.Name, "to", target.Name, "error", werr)
+		v.noteStateWriteFail(corrosion.OpVMHost, werr)
 		return
 	}
 	v.publish("vm.health.migrated", vm.Name, fmt.Sprintf("from=%s to=%s", v.hostName, target.Name))

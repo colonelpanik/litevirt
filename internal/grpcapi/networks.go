@@ -325,6 +325,11 @@ func networkRecordToDef(nr *corrosion.NetworkRecord) compose.NetworkDef {
 
 // ProvisionNetwork provisions a network on this host (called by peers during stack deploy).
 func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkRequest) (*emptypb.Empty, error) {
+	// Peer-only: provisioning is fanned out host-to-host over peer mTLS; there is
+	// no direct CLI/UI caller.
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
 	var def compose.NetworkDef
 	if err := json.Unmarshal([]byte(req.Config), &def); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "parse config: %v", err)
@@ -368,6 +373,10 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 
 // SyncVTEP adds a flood entry for a remote VTEP on this host.
 func (s *Server) SyncVTEP(ctx context.Context, req *pb.SyncVTEPRequest) (*emptypb.Empty, error) {
+	// Peer-only: VTEP flood sync is a host-to-host fan-out over peer mTLS.
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
 	if err := network.FloodEntry(int(req.Vni), req.VtepIp); err != nil {
 		return nil, status.Errorf(codes.Internal, "add flood entry: %v", err)
 	}
@@ -417,6 +426,10 @@ func (s *Server) GetVMIPRemote(ctx context.Context, req *pb.GetVMIPRequest) (*pb
 
 // UpdateFDB updates a unicast FDB entry on this host (called by peers during migration/discovery).
 func (s *Server) UpdateFDB(ctx context.Context, req *pb.UpdateFDBRequest) (*emptypb.Empty, error) {
+	// Peer-only: FDB updates are a host-to-host fan-out over peer mTLS.
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
 	if req.OldVtepIp != "" {
 		network.DeleteFDBEntry(int(req.Vni), req.Mac, req.OldVtepIp)
 	}

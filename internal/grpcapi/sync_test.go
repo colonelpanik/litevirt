@@ -194,7 +194,8 @@ func TestSensitiveStateRPCsRequirePeerMTLS(t *testing.T) {
 
 func replicationPeerCtx(name string) context.Context {
 	ctx := context.WithValue(adminCtx(), ctxKeyAuthMethod, authMethodMTLS)
-	return context.WithValue(ctx, ctxKeyMTLSCommonName, name)
+	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, name)
+	return context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
 }
 
 func TestReplicationRPCsRequirePeerMTLS(t *testing.T) {

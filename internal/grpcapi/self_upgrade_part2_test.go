@@ -16,7 +16,8 @@ import (
 
 func mtlsCtx(cn string) context.Context {
 	ctx := context.WithValue(context.Background(), ctxKeyAuthMethod, authMethodMTLS)
-	return context.WithValue(ctx, ctxKeyMTLSCommonName, cn)
+	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, cn)
+	return context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
 }
 
 func TestJitterDuration(t *testing.T) {

@@ -22,7 +22,8 @@ func mtlsAdminCtx(cn string) context.Context {
 	ctx := context.WithValue(context.Background(), ctxKeyUsername, "admin")
 	ctx = context.WithValue(ctx, ctxKeyRole, "admin")
 	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodMTLS)
-	return context.WithValue(ctx, ctxKeyMTLSCommonName, cn)
+	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, cn)
+	return context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
 }
 
 // ownerForSink builds an owner server holding ct1, wired to push to sink, and

@@ -87,6 +87,29 @@ func TestChooseSelfUpgradeTarget(t *testing.T) {
 			peers:  []peerVersionInfo{p("a", "dev", 18), p("b", "v1.0.46", 18)},
 			wantOK: true, wantVer: "v1.0.46",
 		},
+		{
+			// The clobber this test exists to prevent: git-describe "v1.0.51-2-gHASH"
+			// (2 commits AHEAD of the tag) IS valid semver, but the "-2-gHASH" parses
+			// as a PRE-RELEASE, which semver ranks BELOW the bare release "v1.0.51".
+			// So the node running the NEWER dev build must NOT be "upgraded" back to
+			// the older release.
+			name:  "NEVER DOWNGRADE: my git-describe dev build must not revert to its base release",
+			myVer: "v1.0.51-2-gfec12be", mySchema: 40,
+			peers:  []peerVersionInfo{p("a", "v1.0.51", 40)},
+			wantOK: false,
+		},
+		{
+			name:  "a dev build DOES take a genuinely newer RELEASE",
+			myVer: "v1.0.51-2-gfec12be", mySchema: 40,
+			peers:  []peerVersionInfo{p("a", "v1.0.52", 40)},
+			wantOK: true, wantVer: "v1.0.52",
+		},
+		{
+			name:  "never chase a peer's dev build, even of a newer base",
+			myVer: "v1.0.51", mySchema: 40,
+			peers:  []peerVersionInfo{p("a", "v1.0.52-1-gdeadbee", 40)},
+			wantOK: false,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

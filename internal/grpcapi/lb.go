@@ -2400,6 +2400,10 @@ func (s *Server) refreshLBLocal(ctx context.Context, stackName string) *pb.VMSpe
 
 // RefreshLB handles the RefreshLB RPC from peers — refreshes locally only (no re-forwarding).
 func (s *Server) RefreshLB(ctx context.Context, req *pb.RefreshLBRequest) (*emptypb.Empty, error) {
+	// Peer-only: LB refresh is a host-to-host fan-out over peer mTLS.
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
 	s.refreshLBLocal(ctx, req.StackName)
 	return &emptypb.Empty{}, nil
 }

@@ -18,7 +18,9 @@ import (
 // GetStateDigest returns a lightweight fingerprint of each replicated table
 // on this host. Callers can compare digests across hosts to detect drift.
 func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.StateDigestResponse, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	// Dual-use: anti-entropy peers (host cert) OR an operator bearer (UI
+	// diagnostics / `lv cluster sync`).
+	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
 
@@ -53,7 +55,8 @@ func stateDigestResponse(hostName string, digests []corrosion.TableDigest) *pb.S
 // GetStateDump returns a full gzipped state dump that can be merged into
 // another node's database. Used by `lv cluster sync` to force convergence.
 func (s *Server) GetStateDump(ctx context.Context, _ *emptypb.Empty) (*pb.StateDumpResponse, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	// Dual-use: anti-entropy peers (host cert) OR an operator bearer.
+	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
 
@@ -74,7 +77,8 @@ var stateDumpChunkSize = 1 << 20 // 1 MiB
 // GetStateDump returns, so the client reassembles and merges them identically.
 // GetStateDump is kept for old peers; see the StreamStateDump RPC comment.
 func (s *Server) StreamStateDump(_ *emptypb.Empty, stream grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
-	if err := RequireRole(stream.Context(), "operator"); err != nil {
+	// Dual-use: anti-entropy peers (host cert) OR an operator bearer.
+	if err := s.requirePeerOrRole(stream.Context(), "operator"); err != nil {
 		return err
 	}
 	return streamStateDump(s.db.DumpStateBytes(), stream.Send)
@@ -222,7 +226,11 @@ func (s *Server) AckMutations(ctx context.Context, req *pb.AckRequest) (*emptypb
 }
 
 func requireReplicationPeer(ctx context.Context, sender string) error {
-	if callerAuthMethod(ctx) != authMethodMTLS {
+	// Transport must be a trusted host cert (see requirePeerCert) — accepts a
+	// forwarded-identity-promoted peer too (principalKind preserved), while the
+	// CN==sender check below (CN also preserved through promotion) still pins it to
+	// the claimed sender.
+	if k := callerPrincipalKind(ctx); k != principalKindPeer && k != principalKindLocalRoot {
 		return status.Error(codes.PermissionDenied, "replication RPC requires peer mTLS")
 	}
 	cn := callerMTLSCommonName(ctx)

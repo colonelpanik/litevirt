@@ -34,6 +34,17 @@ func adminCtx() context.Context {
 	return context.WithValue(ctx, ctxKeyRole, "admin")
 }
 
+// peerCtxFor inserts cn as a live cluster host in s.db and returns an mTLS peer
+// context for it, so a call passes requirePeerCert (and classifies as `peer`).
+// Used by tests of peer-only RPCs that call handlers directly.
+func peerCtxFor(t *testing.T, s *Server, cn string) context.Context {
+	t.Helper()
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: cn, Address: "10.0.0.9", State: "active"}); err != nil {
+		t.Fatalf("InsertHost(%s): %v", cn, err)
+	}
+	return mtlsCtx(cn)
+}
+
 func TestCallerUsername_Default(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ctxKeyUsername, "alice")
 	if got := callerUsername(ctx); got != "alice" {

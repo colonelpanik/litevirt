@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 )
 
 // encodeSGs turns a list of security-group names into JSON (or empty
@@ -707,6 +709,85 @@ func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostN
 		return ErrNoRowsAffected
 	}
 	return nil
+}
+
+// CommitMigrationOwnership atomically repoints a VM and every one of its disks
+// from sourceHost to targetHost in ONE guarded transaction — the ownership commit
+// after a migration cutover. The libvirt cutover is irreversible, so this must be
+// all-or-nothing: a per-row loop leaves a crash window where some disk rows point
+// at the target while the VM row still points at the source.
+//
+// expected is a disk snapshot captured BEFORE cutover. The guard, evaluated inside
+// the transaction against a consistent view, requires that:
+//   - the VM row still sits on sourceHost (or is ALREADY on targetHost — see below),
+//   - every expected disk's live row still matches its captured immutable placement
+//     (host is source-or-target, path, storage_type, storage_volume all unchanged),
+//   - no extra live disk rows have appeared.
+//
+// This refuses to clobber a concurrent move/retarget that changed a disk's pool or
+// type while leaving its path similar.
+//
+// Idempotent: when the VM and all disks are ALREADY on targetHost (a retry after an
+// ambiguous transaction-boundary failure), the writes are no-ops but the guard still
+// passes, so it returns committed=true — never a spurious precondition failure.
+//
+// Returns committed=false (no error) when the preconditions no longer hold; the
+// caller MUST treat that as a hard abort, not success.
+func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost, targetHost, finalState string, expected []DiskRecord) (bool, error) {
+	now := c.NowTS()
+	stmts := []Statement{{
+		SQL:    `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
+		Params: []interface{}{targetHost, finalState, now, vmName},
+	}}
+	for _, d := range expected {
+		stmts = append(stmts, Statement{
+			SQL: `UPDATE vm_disks SET host_name = ?, updated_at = ?
+			      WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{targetHost, now, vmName, d.DiskName},
+		})
+	}
+
+	guard := func(tx *sql.Tx) (bool, error) {
+		var vmHost string
+		switch err := tx.QueryRowContext(ctx, `SELECT host_name FROM vms WHERE name = ?`, vmName).Scan(&vmHost); {
+		case errors.Is(err, sql.ErrNoRows):
+			return false, nil // VM vanished mid-migration → decline
+		case err != nil:
+			return false, err
+		}
+		if vmHost != sourceHost && vmHost != targetHost {
+			return false, nil // moved to a third host → decline
+		}
+		for _, d := range expected {
+			var host, path, stype, svol string
+			switch err := tx.QueryRowContext(ctx,
+				`SELECT host_name, path, storage_type, storage_volume FROM vm_disks
+				 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`, vmName, d.DiskName).
+				Scan(&host, &path, &stype, &svol); {
+			case errors.Is(err, sql.ErrNoRows):
+				return false, nil // disk vanished → decline
+			case err != nil:
+				return false, err
+			}
+			// host is allowed to be source (normal) or target (half-committed retry);
+			// path/type/volume must be exactly what we captured before cutover.
+			if (host != sourceHost && host != targetHost) ||
+				path != d.Path || stype != d.StorageType || svol != d.StorageVolume {
+				return false, nil // drift → decline
+			}
+		}
+		var live int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM vm_disks WHERE vm_name = ? AND deleted_at IS NULL`, vmName).Scan(&live); err != nil {
+			return false, err
+		}
+		if live != len(expected) {
+			return false, nil // a disk was added/removed → decline
+		}
+		return true, nil
+	}
+
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
 
 // UpdateDiskSize updates the size_bytes for a disk.

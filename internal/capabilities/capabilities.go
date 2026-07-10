@@ -59,6 +59,37 @@ const (
 	// migration) — is deliberately deferred to its own token, so this one is named for
 	// exactly what it does (skew guard), leaving "hlc_lww_v1" free for the real flip.
 	LWWSkewGuardV1 = "lww_skew_guard_v1"
+	// StrictMTLSIdentityV1 gates the strict mTLS-identity auth model: a bearerless
+	// client certificate (a distributable lv-cli cert, an unknown/empty CN, or a
+	// removed host's CN) is no longer treated as admin — it must present a session
+	// bearer. Peer (known-host) and on-node loopback certs keep admin authority, so
+	// NO node-to-node wire behavior changes. Unlike the split-brain tokens this gates
+	// an AUTH decision, so it deliberately does NOT rely on the hard fail-closed latch
+	// for recovery: the daemon config flag auth.strict_mtls_identity is the real
+	// enforcement switch (enforcement is config AND Enforced) and kill switch, and the
+	// loopback local-root path is never gated — so a mis-flip is reversible and can
+	// never lock out on-node root.
+	//
+	// DARK: in `all` only, NOT `supported` — deploying this build does not advertise
+	// it, so a merge/rollout is fully inert (no activation, no HA-degraded). The flip
+	// is deliberate: add it to `supported` (a release → the fleet advertises it) AND
+	// set auth.strict_mtls_identity; enforcement needs BOTH.
+	StrictMTLSIdentityV1 = "strict_mtls_identity_v1"
+	// ForwardedIdentityV1 gates the owner-side promotion of a forwarded user
+	// identity. An entry node propagates the caller's session bearer to the owning
+	// node in x-litevirt-fwd-bearer (send-side is ungated + forward-compatible);
+	// once this token is enforced, the owner re-authenticates that bearer and runs
+	// RBAC + audit as the REAL user instead of the peer=admin trusted-forward. A
+	// forward with no bearer (a system continuation off a background context) stays
+	// peer=admin/system. Owner-side validation is fail-closed: a session/user not
+	// yet replicated → Unavailable (retryable), not silent admin. Config-gated
+	// (auth.forwarded_identity) + reversible like StrictMTLSIdentityV1.
+	//
+	// DARK: in `all` only, NOT `supported` (see StrictMTLSIdentityV1) — inert until a
+	// deliberate flip advertises it AND auth.forwarded_identity is set. (The send-side
+	// bearer relay is always on but forward-compatible: with this token dark, no owner
+	// promotes, so the relayed header is ignored.)
+	ForwardedIdentityV1 = "forwarded_identity_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -122,7 +153,7 @@ var supported = []string{SplitBrainGateV1}
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, StrictMTLSIdentityV1, ForwardedIdentityV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

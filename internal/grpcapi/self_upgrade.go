@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	mrand "math/rand"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/mod/semver"
@@ -79,14 +80,20 @@ func (s *Server) FetchBinary(_ *pb.FetchBinaryRequest, stream grpc.ServerStreami
 // NOT pass — so a binary/secret-bearing peer RPC isn't reachable by an operator
 // bearer/user credential.
 func (s *Server) requirePeerCert(ctx context.Context) error {
-	if callerAuthMethod(ctx) != authMethodMTLS {
+	// Gate on the TRANSPORT being a trusted host cert, not on authMethod. The
+	// principal kind is set by classifyBearerlessMTLS (peer/local-root only after a
+	// trusted-host CN) and is PRESERVED as "peer" through a forwarded-identity
+	// promotion (which changes authMethod to session but keeps the peer transport).
+	// So this accepts a direct peer, an on-node local-root, and a promoted forwarded
+	// peer, while rejecting an operator bearer (no kind) and a client cert.
+	if k := callerPrincipalKind(ctx); k != principalKindPeer && k != principalKindLocalRoot {
 		return status.Error(codes.PermissionDenied, "peer mTLS required")
 	}
 	cn := callerMTLSCommonName(ctx)
 	if cn == "" {
 		return status.Error(codes.PermissionDenied, "peer certificate common name required")
 	}
-	if h, _ := corrosion.GetHost(ctx, s.db, cn); h == nil {
+	if !s.isTrustedHostCN(ctx, cn) {
 		return status.Errorf(codes.PermissionDenied, "peer %q is not a known cluster host", cn)
 	}
 	return nil
@@ -239,17 +246,27 @@ func (s *Server) preferRelaySource(target peerVersionInfo, peers []peerVersionIn
 //   - Signal 2 (majority): same schema as us, but a strict majority of
 //     {self + peers} run a single version that differs from ours.
 func chooseSelfUpgradeTarget(myVersion string, mySchema int, peers []peerVersionInfo) (peerVersionInfo, bool) {
-	// NEWEST-WINS: converge to the single most-advanced build reachable, so seeding
+	// NEWEST-WINS: converge to the single most-advanced RELEASE reachable, so seeding
 	// ONE node flows to the whole fleet (the only model that scales past a handful of
 	// nodes). "Most advanced" = highest schema; among equal schema, the strictly-newer
-	// semver version. Never downgrades schema (peers below our schema are skipped), and
-	// never chases an unparseable version (dev / ephemeral build) — those can't be
-	// ordered, so they're never a newer target.
+	// release. STRICT + FORWARD-ONLY:
+	//   - never downgrade schema (peers below our schema are skipped);
+	//   - only a CLEAN TAGGED release is ever a candidate. A dev / git-describe build
+	//     "vX.Y.Z-N-gHASH" IS valid semver but its "-N-gHASH" parses as a PRE-RELEASE,
+	//     which semver ranks BELOW the bare release "vX.Y.Z". If such builds were
+	//     orderable candidates, a peer on the release would "upgrade" a node running a
+	//     NEWER dev build back to the tag — a silent DOWNGRADE — and a lone dev box
+	//     could drag the fleet onto an un-blessed build. So they are filtered out here;
+	//   - and we compare the best release against OUR OWN release core, so a node on a
+	//     dev build is never reverted to the base release it descends from.
 	var best peerVersionInfo
 	found := false
 	for _, p := range peers {
 		if p.schema < mySchema {
 			continue // never downgrade schema
+		}
+		if !isCleanRelease(p.version) {
+			continue // never chase a dev / prerelease / unparseable build
 		}
 		if !found || moreAdvanced(p, best) {
 			best, found = p, true
@@ -258,37 +275,49 @@ func chooseSelfUpgradeTarget(myVersion string, mySchema int, peers []peerVersion
 	if !found {
 		return peerVersionInfo{}, false
 	}
-	// Pull only if the best peer is strictly ahead of ME: a higher schema (definitive,
-	// monotonic) or the same schema with a strictly-newer semver version.
-	if best.schema > mySchema || (best.schema == mySchema && versionNewer(best.version, myVersion)) {
+	// Pull only if the best release is strictly ahead of ME: a higher schema
+	// (definitive, monotonic) or the same schema with a strictly-newer release than my
+	// own release core (a valid semver required to compare — an unparseable local
+	// version never moves on version alone, only on a higher schema).
+	if best.schema > mySchema ||
+		(best.schema == mySchema && semver.IsValid(myVersion) && semver.Compare(best.version, releaseCore(myVersion)) > 0) {
 		return best, true
 	}
 	return peerVersionInfo{}, false
 }
 
-// moreAdvanced reports whether a is a newer build than b: a higher schema, or the
-// same schema with a strictly-newer semver version. At equal schema a parseable
-// (valid-semver) version outranks an unparseable one, so a dev/ephemeral peer never
-// shadows a real release when picking the best candidate.
+// isCleanRelease reports whether v is a valid, TAGGED release with no pre-release
+// or build suffix — the only legitimate self-upgrade target. A git-describe build
+// "vX.Y.Z-N-gHASH" is valid semver but carries a pre-release segment, so it is NOT a
+// clean release and is never chased (nor downgraded to).
+func isCleanRelease(v string) bool {
+	return semver.IsValid(v) && semver.Prerelease(v) == "" && semver.Build(v) == ""
+}
+
+// releaseCore strips any pre-release / build suffix, returning the vX.Y.Z core. A
+// clean release is returned unchanged; a git-describe dev build "v1.0.51-2-gHASH"
+// returns "v1.0.51" — so a dev build is compared by the release it descends from and
+// is never treated as older than (i.e. downgraded to) that base release.
+func releaseCore(v string) string {
+	if !semver.IsValid(v) {
+		return v
+	}
+	if pre := semver.Prerelease(v); pre != "" {
+		v = strings.TrimSuffix(v, pre)
+	}
+	if b := semver.Build(v); b != "" {
+		v = strings.TrimSuffix(v, b)
+	}
+	return v
+}
+
+// moreAdvanced ranks two already-filtered CLEAN releases: a higher schema, or the
+// same schema with a strictly-newer release version.
 func moreAdvanced(a, b peerVersionInfo) bool {
 	if a.schema != b.schema {
 		return a.schema > b.schema
 	}
-	av, bv := semver.IsValid(a.version), semver.IsValid(b.version)
-	if av != bv {
-		return av // a valid release beats an unparseable version
-	}
-	if !av {
-		return false // both unparseable → neither is "newer"
-	}
 	return semver.Compare(a.version, b.version) > 0
-}
-
-// versionNewer reports whether a is a strictly-newer valid semver than b. Both must
-// be parseable — an unparseable version (dev / git-describe ephemeral) is never
-// treated as newer, so a lone dev box can't drag the fleet onto an un-orderable build.
-func versionNewer(a, b string) bool {
-	return semver.IsValid(a) && semver.IsValid(b) && semver.Compare(a, b) > 0
 }
 
 // pingPeerVersion returns a peer's live (version, schema) via Ping.

@@ -220,7 +220,76 @@ is the only authority.
 |---|---|---|
 | `lvs_<hex>` | `sessions` | revoked, hard-expired, idle-timeout |
 | `<hex>` (no prefix) | `tokens` (bcrypt match) | `deleted_at`, `expires_at` |
-| (no Authorization header) | mTLS client cert | invalid/expired peer cert |
+| (no Authorization header) | mTLS client cert → classified (see below) | invalid/expired peer cert |
 
-mTLS callers are treated as `admin` because only the cluster's PKI can
-issue valid client certs.
+## mTLS principal model
+
+A bearerless mTLS caller (no `Authorization` bearer) is classified by its
+certificate, not blanket-trusted as `admin`:
+
+| kind | condition | authority |
+|---|---|---|
+| **local-root** | connection is loopback **and** the cert CN is a live cluster host | `admin` (on-node root — running `lv` on a node is already root-equivalent) |
+| **peer** | non-loopback **and** the cert CN is a live cluster host | `admin` (a trusted cluster node: peer RPCs + relaying an already-authorized user forward) |
+| **client** | any other cert — the distributable CLI client cert, an unknown/empty CN, or a **removed** host's CN | must present a session bearer (`lv login`); denied once strict mode is enforced |
+
+A bearer, when present, always wins and yields the real user (role/scope).
+"Live cluster host" means a non-removed `hosts` row — a decommissioned node's
+still-CA-valid cert is no longer trusted.
+
+**Threat model.** The daemon runs as root against the local libvirt socket and a
+replicated state DB, so root on a node is already full local + cluster power —
+RBAC does not (and cannot) constrain it, and a host cert is a legitimately
+root-obtained *node* identity. What this model closes is that a **distributable**
+credential (the shared CLI client cert) no longer equals admin: hand someone CLI
+reach and they still need to `lv login` to act.
+
+### Enforcement (`auth.strict_mtls_identity`)
+
+Denial of bearerless `client` certs is off by default and gated by both the
+`auth.strict_mtls_identity` config flag **and** the `strict_mtls_identity_v1`
+capability being active cluster-wide. The config flag is the enforcement switch
+**and** kill switch (set it false to disable regardless of any latch), and the
+loopback local-root path is never gated — so a mis-flip is reversible and can
+never lock out an on-node operator. Because peer/forwarded traffic uses host
+certs (which stay `admin`), enabling it changes **no** node-to-node behavior; the
+only operator-visible change is that a **remote** CLI must `lv login` first
+(on-node `lv` over loopback is unaffected).
+
+**The token ships DARK** — it is in the capability registry but NOT advertised
+(`capabilities.all`, not `supported`), so merging/deploying this build is fully
+inert: nothing activates and there is no HA-degraded during the rollout. Flipping
+is a deliberate two-step: **(1)** ship a release that adds `strict_mtls_identity_v1`
+to `capabilities.supported` and roll it fleet-wide (nodes then advertise it; the
+capability activates + latches once all do — and a transient
+`ha_degraded{unsupported_member}` is expected during that window until every node
+is upgraded), then **(2)** set `auth.strict_mtls_identity: true` on every node.
+Enforcement needs both; validate on an ephemeral cluster before either step.
+
+### Forwarded identity (`auth.forwarded_identity`)
+
+Cross-node requests are authorized on the **entry** node against the real user,
+then forwarded to the owning node. The entry node relays the user's bearer to the
+owner in `x-litevirt-fwd-bearer` (send-side is always on and ignored by nodes
+that don't enforce it). When `auth.forwarded_identity` + the
+`forwarded_identity_v1` capability are active, the owner re-authenticates that
+bearer and runs RBAC + audit as the **real user** instead of `admin`; a forward
+with no bearer (a background/system continuation — failover, reconcilers,
+rebalancer, LB refresh, self-upgrade, replication) stays `admin` and audits as
+`system`. Owner-side validation is fail-closed and never falls back to admin: a
+session/user not yet replicated to the owner returns a **retryable** `Unavailable`
+("forwarded identity not yet visible on owner; retry"), an
+expired/revoked/malformed bearer returns `Unauthenticated`, and a resolvable user
+that RBAC denies returns `PermissionDenied` — so an action taken immediately after
+login or a role grant may briefly need a retry until replication catches up. The
+forwarded bearer is only honored from a **peer** principal; a client cannot inject
+it to impersonate a user.
+
+> Peer-only RPC set (for a future flip that would stop accepting host certs on
+> user-facing RPCs entirely): the replication/anti-entropy lane
+> (`PushMutations`/`AckMutations`/state digest+dump/sensitive dumps), backup/
+> restore transfer (`HasChunks`/`PushBackup`), failover probes
+> (`CheckVMRuntime`/`CheckContainerRuntime`/`CheckVIPParticipant`/`CheckLBPresent`),
+> `FetchBinary`, `GetVMIPRemote`, proof-bearing `PromoteReplica`/`ApplyLB`, and the
+> peer-gated `ProvisionNetwork`/`SyncVTEP`/`UpdateFDB`/`RefreshLB`/
+> `PushReplicaIncrement`. Not enforced today.

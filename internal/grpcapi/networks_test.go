@@ -536,7 +536,7 @@ func TestListNetworks_AfterDelete(t *testing.T) {
 
 func TestProvisionNetwork_SRIOVType(t *testing.T) {
 	s := testServerR2(t)
-	ctx := adminCtx()
+	ctx := peerCtxFor(t, s, "peer-1")
 
 	cfg := `{"pf":"ens1f0","interface":"sriov-prov"}`
 	_, err := s.ProvisionNetwork(ctx, &pb.ProvisionNetworkRequest{
@@ -551,7 +551,7 @@ func TestProvisionNetwork_SRIOVType(t *testing.T) {
 
 func TestProvisionNetwork_InvalidConfig(t *testing.T) {
 	s := testServerR2(t)
-	ctx := adminCtx()
+	ctx := peerCtxFor(t, s, "peer-1")
 
 	_, err := s.ProvisionNetwork(ctx, &pb.ProvisionNetworkRequest{
 		Name:    "prov-bad",

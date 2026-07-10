@@ -508,44 +508,24 @@ poll:
 	send(pb.MigratePhase_MIGRATE_CUTOVER, 100, 0)    //nolint:errcheck
 	send(pb.MigratePhase_MIGRATE_COMPLETING, 100, 0) //nolint:errcheck
 
+	// The libvirt cutover has happened and cannot be rolled back. Commit the
+	// VM+disk ownership move to the target atomically BEFORE any destructive
+	// source cleanup or success signal — a failed commit is loud divergence, never
+	// silent success. `disks` is the pre-cutover snapshot captured above.
+	if err := s.finalizeMigrationOwnership(ctx, vm, req.TargetHost, withStorage, disks); err != nil {
+		s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
+		s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error",
+			"cut over to "+req.TargetHost+" but ownership commit failed: "+err.Error())
+		s.audit(context.WithoutCancel(ctx), "vm.migrate", vm.Name, "from="+s.hostName+" to="+req.TargetHost, "error")
+		return status.Errorf(codes.Internal,
+			"VM %q cut over to %s but committing ownership failed: %v", vm.Name, req.TargetHost, err)
+	}
+
 	downtimeMs := float64(time.Since(cutoverStart).Milliseconds())
 	s.recordMigrationMetrics(strategyLabel, "success", time.Since(migrationStart), downtimeMs, 0)
-
-	// Update state: VM now lives on target host
-	corrosion.UpdateVMHost(ctx, s.db, vm.Name, req.TargetHost, "running")
 	slog.Info("migration complete", "vm", vm.Name, "from", s.hostName, "to", req.TargetHost)
-	s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok", "from="+s.hostName+" to="+req.TargetHost)
-	s.audit(ctx, "vm.migrate", vm.Name, "from="+s.hostName+" to="+req.TargetHost, "ok")
-
-	// Update disk path records to reflect the target host.
-	// For cold migration with --with-storage, libvirt copies files to the same
-	// relative path on the target. Update host_name so queries work correctly.
-	if disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name); err == nil {
-		for _, d := range disks {
-			corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, d.DiskName, req.TargetHost, d.Path)
-			// A --with-storage migration COPIES the disk to the target's own
-			// filesystem, leaving the source's local copy orphaned. Remove it
-			// (we run on the source host). Host-local drivers ONLY: for shared
-			// pools (nfs/ceph/iscsi) the source path is the same file the target
-			// now uses, so deleting it would destroy the live disk.
-			if withStorage && isHostLocalDiskDriver(d.StorageType) && d.Path != "" {
-				// Never delete a source disk that still backs a linked clone or
-				// is referenced by another VM — doing so corrupts the clone's
-				// backing chain / destroys a live disk (bug-sweep #1). Mirrors
-				// the guard MoveVolume/DeleteVM already enforce.
-				if referenced, reason, _ := s.pathStillReferenced(ctx, d.Path, vm.Name, d.DiskName); referenced {
-					slog.Warn("post-migration: source disk still referenced — NOT deleting",
-						"vm", vm.Name, "path", d.Path, "referenced_by", reason)
-				} else if rmErr := os.Remove(d.Path); rmErr != nil && !os.IsNotExist(rmErr) {
-					slog.Warn("post-migration: could not remove orphaned source disk",
-						"vm", vm.Name, "path", d.Path, "error", rmErr)
-				} else if rmErr == nil {
-					slog.Info("post-migration: removed orphaned source disk",
-						"vm", vm.Name, "path", d.Path)
-				}
-			}
-		}
-	}
+	s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "ok", "from="+s.hostName+" to="+req.TargetHost)
+	s.audit(context.WithoutCancel(ctx), "vm.migrate", vm.Name, "from="+s.hostName+" to="+req.TargetHost, "ok")
 
 	// (Firmware-state cleanup is handled in coldMigrateFirmwareVM, which firmware
 	// VMs take instead of this runtime-migration path — see the early return above.)
@@ -597,6 +577,72 @@ poll:
 	go s.cleanupPostMigration(vm.Name)
 
 	return send(pb.MigratePhase_MIGRATE_DONE, 100, 0)
+}
+
+// finalizeMigrationOwnership commits the VM + disk ownership move to targetHost and
+// only then removes orphaned source disks for a --with-storage host-local migration.
+// disks is the placement snapshot captured before cutover.
+//
+// The libvirt cutover has already happened and cannot be rolled back, so:
+//   - The ownership move (VM row + all disk rows) is one atomic guarded commit
+//     (corrosion.CommitMigrationOwnership), so a failure can't leave some disks on
+//     the target while the VM still points at the source.
+//   - It runs on a bounded DETACHED context with a short retry, because the request
+//     context may already be cancelled after cutover — losing the commit to a
+//     cancelled ctx would recreate the very divergence we are closing.
+//   - A source disk is deleted ONLY after the commit lands. A failed commit returns
+//     an error (loud divergence) and deletes nothing.
+func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.VMRecord, targetHost string, withStorage bool, disks []corrosion.DiskRecord) error {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	var lastErr error
+	committed := false
+	for attempt := 0; attempt < 3; attempt++ {
+		ok, err := corrosion.CommitMigrationOwnership(fctx, s.db, vm.Name, s.hostName, targetHost, "running", disks)
+		if err != nil {
+			lastErr = err
+			slog.Error("post-migration: ownership commit failed, retrying",
+				"vm", vm.Name, "to", targetHost, "attempt", attempt, "error", err)
+			time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
+			continue
+		}
+		if !ok {
+			// Preconditions no longer hold (VM/disks changed during migration) —
+			// a hard abort, never silent success.
+			return fmt.Errorf("ownership commit precondition failed: VM %q or its disks changed during migration", vm.Name)
+		}
+		committed = true
+		break
+	}
+	if !committed {
+		return fmt.Errorf("ownership commit for VM %q did not land after retries: %w", vm.Name, lastErr)
+	}
+
+	// A --with-storage migration COPIES each host-local disk to the target's own
+	// filesystem, leaving the source copy orphaned. Remove it (we run on the source
+	// host) — but ONLY now that ownership is committed, and never a disk still
+	// referenced by a linked clone or another VM (bug-sweep #1). Shared pools
+	// (nfs/ceph/iscsi) share the file with the target, so they are left untouched.
+	if !withStorage {
+		return nil
+	}
+	for _, d := range disks {
+		if !isHostLocalDiskDriver(d.StorageType) || d.Path == "" {
+			continue
+		}
+		if referenced, reason, _ := s.pathStillReferenced(fctx, d.Path, vm.Name, d.DiskName); referenced {
+			slog.Warn("post-migration: source disk still referenced — NOT deleting",
+				"vm", vm.Name, "path", d.Path, "referenced_by", reason)
+		} else if rmErr := os.Remove(d.Path); rmErr != nil && !os.IsNotExist(rmErr) {
+			slog.Warn("post-migration: could not remove orphaned source disk",
+				"vm", vm.Name, "path", d.Path, "error", rmErr)
+		} else if rmErr == nil {
+			slog.Info("post-migration: removed orphaned source disk",
+				"vm", vm.Name, "path", d.Path)
+		}
+	}
+	return nil
 }
 
 // cleanupPostMigration removes the source host's cloud-init ISO after migration.

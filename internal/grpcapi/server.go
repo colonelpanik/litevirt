@@ -65,6 +65,18 @@ type Server struct {
 	sessionIdleTimeout time.Duration
 	sessionHardExpiry  time.Duration
 
+	// strictMTLSIdentity, when true, is this node's enforcement switch for the
+	// strict mTLS-identity model (a bearerless "client" cert is denied; must
+	// `lv login`). Enforcement is this flag AND the StrictMTLSIdentityV1 gate
+	// being active cluster-wide; the flag is also the kill switch. Default false.
+	strictMTLSIdentity bool
+
+	// forwardedIdentity, when true, is this node's enforcement switch for owner-
+	// side promotion of a forwarded user identity (x-litevirt-fwd-bearer). Gated
+	// by this flag AND the ForwardedIdentityV1 capability active cluster-wide.
+	// Default false; the flag is the kill switch.
+	forwardedIdentity bool
+
 	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
 	// at daemon startup so CreateVM/restore render the same files the capability
 	// label was derived from.

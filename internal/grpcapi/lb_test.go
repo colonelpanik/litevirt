@@ -303,7 +303,7 @@ func TestRemoveLB_NonExistent(t *testing.T) {
 
 func TestRefreshLB_EmptyStackName(t *testing.T) {
 	s := testServer(t)
-	ctx := adminCtx()
+	ctx := peerCtxFor(t, s, "peer-1")
 
 	resp, err := s.RefreshLB(ctx, &pb.RefreshLBRequest{StackName: ""})
 	if err != nil {
@@ -316,7 +316,7 @@ func TestRefreshLB_EmptyStackName(t *testing.T) {
 
 func TestRefreshLB_NoVMs(t *testing.T) {
 	s := testServer(t)
-	ctx := adminCtx()
+	ctx := peerCtxFor(t, s, "peer-1")
 
 	resp, err := s.RefreshLB(ctx, &pb.RefreshLBRequest{StackName: "nonexistent"})
 	if err != nil {
@@ -329,7 +329,7 @@ func TestRefreshLB_NoVMs(t *testing.T) {
 
 func TestRefreshLB_VMsWithoutLBSpec(t *testing.T) {
 	s := testServer(t)
-	ctx := adminCtx()
+	ctx := peerCtxFor(t, s, "peer-1")
 
 	spec := &pb.VMSpec{
 		Name:      "web-1",
@@ -359,7 +359,7 @@ func TestRefreshLB_VMsWithoutLBSpec(t *testing.T) {
 
 func TestRefreshLB_VMsWithDisabledLB(t *testing.T) {
 	s := testServer(t)
-	ctx := adminCtx()
+	ctx := peerCtxFor(t, s, "peer-1")
 
 	spec := &pb.VMSpec{
 		Name:      "web-1",

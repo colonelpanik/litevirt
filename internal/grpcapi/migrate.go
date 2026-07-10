@@ -403,7 +403,9 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	}
 
 	// Mark as migrating in state store
-	corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", fmt.Sprintf("→ %s", req.TargetHost))
+	if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", fmt.Sprintf("→ %s", req.TargetHost)); err != nil {
+		s.noteStateWriteFail(corrosion.OpVMState, err)
+	}
 	migrationStart := time.Now()
 
 	if err := send(pb.MigratePhase_MIGRATE_COPYING, 0, 0); err != nil {
@@ -462,12 +464,16 @@ poll:
 				// Check if the domain is still alive; if so, restore to "running"
 				// instead of leaving it in "error" (#21).
 				if state, sErr := s.virt.DomainState(vm.Name); sErr == nil && state == "running" {
-					corrosion.UpdateVMState(ctx, s.db, vm.Name, "running",
-						fmt.Sprintf("migration to %s failed: %v", req.TargetHost, res.err))
+					if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "running",
+						fmt.Sprintf("migration to %s failed: %v", req.TargetHost, res.err)); werr != nil {
+						s.noteStateWriteFail(corrosion.OpVMState, werr)
+					}
 					slog.Warn("migration failed but VM still running on source",
 						"vm", vm.Name, "target", req.TargetHost, "error", res.err)
 				} else {
-					corrosion.UpdateVMState(ctx, s.db, vm.Name, "error", res.err.Error())
+					if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "error", res.err.Error()); werr != nil {
+						s.noteStateWriteFail(corrosion.OpVMState, werr)
+					}
 				}
 				// Remove the disk stubs + cloud-init ISO we pre-created on the
 				// target — the VM never got defined there, so they're orphaned
@@ -945,7 +951,10 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 	// VM/disk records never diverge and nothing on the source is lost.
 	rollbackDisks := func() {
 		for _, d := range disks {
-			_ = corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, d.DiskName, s.hostName, d.Path)
+			if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, d.DiskName, s.hostName, d.Path); err != nil {
+				slog.Error("cold firmware migration: disk rollback re-point failed", "vm", vm.Name, "disk", d.DiskName, "error", err)
+				s.noteStateWriteFail(corrosion.OpDiskHostPath, err)
+			}
 		}
 	}
 	for _, d := range disks {

@@ -163,7 +163,9 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			if terr != nil || !ownsAll {
 				slog.Error("container migrate: rollback lease hand-back INCOMPLETE — leaving source stopped",
 					"name", req.Name, "moved", moved, "ownsAll", ownsAll, "error", terr)
-				_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "operator-stop")
+				if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "operator-stop"); werr != nil {
+					s.noteStateWriteFail(corrosion.OpContainerState, werr)
+				}
 				s.audit(ctx, "ct.migrate", req.Name, "project="+project+" rollback IPAM hand-back incomplete: "+reason.Error(), "error")
 				_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FAILED, Error: reason.Error()})
 				return status.Errorf(codes.Internal,
@@ -180,15 +182,21 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 				// reconciler can recover the source per its restart policy. Leaving
 				// operator-stop on would strand the source down (the reconciler honors
 				// that marker), which is worse than the mid-migration restart it guards.
-				_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "")
+				if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", ""); werr != nil {
+					s.noteStateWriteFail(corrosion.OpContainerState, werr)
+				}
 			} else {
-				_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "running", "")
+				if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "running", ""); werr != nil {
+					s.noteStateWriteFail(corrosion.OpContainerState, werr)
+				}
 			}
 		} else {
 			// Originally stopped: put back exactly its prior state + detail (NOT the
 			// migration operator-stop), so e.g. a restart policy retrying an out-of-band
 			// stop resumes as it would have without the migration attempt.
-			_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, rec.State, rec.StateDetail)
+			if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, rec.State, rec.StateDetail); werr != nil {
+				s.noteStateWriteFail(corrosion.OpContainerState, werr)
+			}
 		}
 		s.audit(ctx, "ct.migrate", req.Name, "project="+project+" rolled back: "+reason.Error(), "error")
 		_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FAILED, Error: reason.Error()})
@@ -201,7 +209,9 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	// stopped + operator-stop (the reconciler won't auto-restart it without its
 	// leases) and surface the ambiguity for an operator to resolve.
 	parkSource := func(reason error) error {
-		_ = corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "operator-stop")
+		if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "operator-stop"); werr != nil {
+			s.noteStateWriteFail(corrosion.OpContainerState, werr)
+		}
 		s.audit(ctx, "ct.migrate", req.Name, "project="+project+" "+reason.Error(), "error")
 		_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FAILED, Error: reason.Error()})
 		return status.Errorf(codes.Internal, "migrate %s: %v", req.Name, reason)

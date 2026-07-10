@@ -599,6 +599,25 @@ func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) e
 	)
 }
 
+// UpdateVMStateStrict is UpdateVMState that reports a zero-row update as
+// ErrNoRowsAffected instead of a silent success. Use it where the write's success
+// GATES a subsequent action (an event, audit, LB refresh, hook, or ownership
+// handoff) so a vanished/renamed VM row cannot be mistaken for a completed write.
+func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail string) error {
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
+		state, detail, now, name,
+	)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // UpdateVMHost moves a VM's host assignment and state after migration.
 func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
 	now := c.NowTS()

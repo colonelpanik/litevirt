@@ -901,7 +901,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (start failed)", "error")
 			return status.Errorf(codes.Internal, "restored but start failed: %v", err)
 		}
-		_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "running", "")
+		if werr := corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "running", ""); werr != nil {
+			s.noteStateWriteFail(corrosion.OpContainerState, werr)
+		}
 	}
 
 	s.audit(ctx, "ct.restore", req.Name, fmt.Sprintf("project=%s from %s @ %s", project, req.RepoPath, req.Timestamp), "ok")

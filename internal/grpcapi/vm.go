@@ -857,9 +857,12 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 				case vm.State == "stopped" && liveState == "running":
 					// Graceful shutdown in progress — trust DB
 				case vm.State == "running" && liveState == "stopped":
-					// VM crashed or was stopped externally — trust libvirt
+					// VM crashed or was stopped externally — trust libvirt. Best-effort
+					// drift heal in a read path; a failed write is re-healed next list.
 					state = liveState
-					corrosion.UpdateVMState(ctx, s.db, vm.Name, liveState, "")
+					if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, liveState, ""); err != nil {
+						s.noteStateWriteFail(corrosion.OpVMState, err)
+					}
 				default:
 					state = liveState
 				}
@@ -978,7 +981,12 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		// RPC that mutated libvirt but failed before writing state). Reconcile
 		// the record to "running" rather than surfacing "already running".
 		if st, sErr := s.virt.DomainState(req.Name); sErr == nil && st == "running" {
-			corrosion.UpdateVMState(ctx, s.db, req.Name, "running", "reconciled: already running in libvirt")
+			// Domain is already running: a lost "running" write is low-harm (the
+			// reconciler heals it from libvirt), so record best-effort with retry
+			// but never skip the follow-up (hooks) or fail the start.
+			if werr := s.persistVMState(ctx, req.Name, "running", "reconciled: already running in libvirt", corrosion.OpVMState); werr != nil {
+				slog.Error("StartVM: recording reconciled running state failed — reconciler will heal", "vm", req.Name, "error", werr)
+			}
 			slog.Warn("StartVM: domain already running in libvirt, reconciled cluster state", "vm", req.Name)
 			pbVM.State = pb.VMState_VM_RUNNING
 			hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
@@ -987,7 +995,13 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
 
-	corrosion.UpdateVMState(ctx, s.db, req.Name, "running", "")
+	// The domain is up. A lost "running" write is low-harm (the reconciler heals
+	// it from libvirt), so record it best-effort with retry and still run the
+	// follow-up (VLAN taps, PostStart hook) — skipping those would leave a running
+	// but unreachable VM that nothing re-heals.
+	if err := s.persistVMState(ctx, req.Name, "running", "", corrosion.OpVMState); err != nil {
+		slog.Error("StartVM: recording running state failed — reconciler will heal", "vm", req.Name, "error", err)
+	}
 	s.recordVMEvent(ctx, req.Name, "vm.started", "ok", "")
 
 	// Reapply VLAN tap config: VLAN tagging lives on the host tap (libvirt assigns
@@ -1052,9 +1066,18 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	// Release PCI passthrough devices and unbind from vfio-pci.
 	s.releaseDevices(ctx, req.Name)
 
-	// Mark as "stopped" with detail indicating operator-initiated stop.
-	// This distinguishes operator stops from crashes (#29).
-	corrosion.UpdateVMState(ctx, s.db, req.Name, "stopped", "operator-stop")
+	// Mark as "stopped" with detail indicating operator-initiated stop. This
+	// distinguishes operator stops from crashes (#29): losing this write lets HA
+	// auto-restart a VM the operator deliberately stopped, so it must land before
+	// we signal success (event, LB refresh, PostStop hook). The reconciler heals
+	// the row on failure.
+	// Unlike a "running" write, a lost operator-stop can't be healed by the
+	// reconciler (it can't know the stop was intentional) and lets HA auto-restart
+	// the VM (#29), so this one is fail-closed: retry, then surface an error if it
+	// still can't land, rather than signal a clean stop.
+	if err := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
+		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
+	}
 	s.recordVMEvent(ctx, req.Name, "vm.stopped", "ok", "")
 
 	// Refresh LB backends so stopped VM is removed from rotation.
@@ -1101,7 +1124,11 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, status.Errorf(codes.Internal, "restart: %v", err)
 	}
 
-	corrosion.UpdateVMState(ctx, s.db, req.Name, "running", "")
+	// Low-harm "running" write (reconciler heals from libvirt): record best-effort
+	// with retry, still record the event, never fail an already-restarted VM.
+	if err := s.persistVMState(ctx, req.Name, "running", "", corrosion.OpVMState); err != nil {
+		slog.Error("RestartVM: recording running state failed — reconciler will heal", "vm", req.Name, "error", err)
+	}
 	s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "")
 	return s.vmToProto(ctx, req.Name)
 }
@@ -1923,7 +1950,9 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			slog.Error("cutover: "+step+" failed", "vm", req.VmName, "error", e, "firmware_vm", fwVM)
 			s.recordVMEvent(ctx, req.VmName, "vm.cutover", "error", step+" failed: "+e.Error())
 			if fwVM {
-				corrosion.UpdateVMState(ctx, s.db, req.VmName, "error", "cutover "+step+" failed: "+e.Error())
+				if werr := corrosion.UpdateVMState(ctx, s.db, req.VmName, "error", "cutover "+step+" failed: "+e.Error()); werr != nil {
+					s.noteStateWriteFail(corrosion.OpVMState, werr)
+				}
 				return status.Errorf(codes.Internal, "cutover %s for %q: %v", step, req.VmName, e)
 			}
 			return nil // plain VM — reconciler will rebuild

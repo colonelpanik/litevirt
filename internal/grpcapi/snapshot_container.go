@@ -196,7 +196,9 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 		if err := s.containerRuntime.StopContainer(ctx, req.Name, 30); err != nil {
 			return nil, status.Errorf(codes.Internal, "stop for revert: %v", err)
 		}
-		_ = corrosion.SetContainerStateDetail(ctx, s.db, host, req.Name, "stopped", "snapshot-revert")
+		if werr := corrosion.SetContainerStateDetail(ctx, s.db, host, req.Name, "stopped", "snapshot-revert"); werr != nil {
+			s.noteStateWriteFail(corrosion.OpContainerState, werr)
+		}
 	}
 	if err := s.containerRuntime.RevertContainer(ctx, req.Name, f); err != nil {
 		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "error")
@@ -207,7 +209,9 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 			s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project+" (restart failed)", "error")
 			return nil, status.Errorf(codes.Internal, "reverted but restart failed: %v", err)
 		}
-		_ = corrosion.SetContainerStateDetail(ctx, s.db, host, req.Name, "running", "")
+		if werr := corrosion.SetContainerStateDetail(ctx, s.db, host, req.Name, "running", ""); werr != nil {
+			s.noteStateWriteFail(corrosion.OpContainerState, werr)
+		}
 	}
 	s.audit(ctx, "ct.snapshot.revert", req.Name, fmt.Sprintf("project=%s snapshot=%s", project, req.Snapshot), "ok")
 	return &emptypb.Empty{}, nil

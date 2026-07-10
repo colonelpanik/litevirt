@@ -62,6 +62,9 @@ jobs:
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
         run: ./scripts/ci/check-schema-bump.sh
 
+      - name: No fail-open authoritative state writes
+        run: go run ./scripts/ci/writecheck -root .
+
   release:
     name: Release
     needs: test

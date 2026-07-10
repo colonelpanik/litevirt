@@ -326,7 +326,10 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	s.reconcileDiskPaths(ctx, req.VmName)
 
 	// After revert, VM may be running or paused depending on snapshot type.
-	corrosion.UpdateVMState(ctx, s.db, req.VmName, "running", "restored from "+req.SnapshotName)
+	if err := corrosion.UpdateVMStateStrict(ctx, s.db, req.VmName, "running", "restored from "+req.SnapshotName); err != nil {
+		s.noteStateWriteFail(corrosion.OpVMState, err)
+		return nil, status.Errorf(codes.Internal, "snapshot restored but recording running state failed: %v", err)
+	}
 	slog.Info("snapshot restored", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.restored", "ok", req.SnapshotName)
 	return s.vmToProto(ctx, req.VmName)

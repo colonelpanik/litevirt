@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"time"
@@ -56,18 +57,27 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	// is visible in ListImages immediately.
 	bgCtx := context.Background()
 	now := time.Now().UTC().Format(time.RFC3339)
-	corrosion.InsertImage(bgCtx, s.db, corrosion.ImageRecord{
+	// Create the catalog + per-host rows up front (visible in ListImages during the
+	// pull). These are not cosmetic: a lost write leaves an image on disk that
+	// placement/failover cannot see, so fail closed rather than pull invisibly.
+	if err := corrosion.InsertImage(bgCtx, s.db, corrosion.ImageRecord{
 		Name:      req.Name,
 		Format:    req.Format,
 		SourceURL: req.SourceUrl,
-	})
-	corrosion.InsertImageHost(bgCtx, s.db, corrosion.ImageHostRecord{
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpImage, err)
+		return status.Errorf(codes.Internal, "record image: %v", err)
+	}
+	if err := corrosion.InsertImageHost(bgCtx, s.db, corrosion.ImageHostRecord{
 		ImageName: req.Name,
 		HostName:  s.hostName,
 		Path:      s.images.ImagePath(req.Name),
 		Status:    "pulling",
 		PulledAt:  now,
-	})
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpImageHost, err)
+		return status.Errorf(codes.Internal, "record image host: %v", err)
+	}
 
 	// Create a progress channel
 	progressCh := make(chan image.PullProgress, 10)
@@ -80,11 +90,18 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 		errCh <- pullErr
 		if pullErr != nil {
 			slog.Error("image pull failed", "name", req.Name, "error", pullErr)
-			corrosion.UpdateImageHostStatus(bgCtx, s.db, req.Name, s.hostName, "error")
+			if err := corrosion.UpdateImageHostStatus(bgCtx, s.db, req.Name, s.hostName, "error"); err != nil {
+				s.noteStateWriteFail(corrosion.OpImageHost, err)
+			}
 			return
 		}
 		// Persist final result with a background context — stream ctx may be cancelled.
-		s.persistImageRecord(req)
+		if err := s.persistImageRecord(req); err != nil {
+			slog.Error("image record persist failed after pull", "name", req.Name, "error", err)
+			if uerr := corrosion.UpdateImageHostStatus(bgCtx, s.db, req.Name, s.hostName, "error"); uerr != nil {
+				s.noteStateWriteFail(corrosion.OpImageHost, uerr)
+			}
+		}
 	}()
 
 	// Stream progress to client and persist to DB for UI polling.
@@ -125,7 +142,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 }
 
 // persistImageRecord writes the image and image_host records after a successful pull.
-func (s *Server) persistImageRecord(req *pb.PullImageRequest) {
+func (s *Server) persistImageRecord(req *pb.PullImageRequest) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -135,23 +152,30 @@ func (s *Server) persistImageRecord(req *pb.PullImageRequest) {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
 		Name:      req.Name,
 		Format:    req.Format,
 		SourceURL: req.SourceUrl,
 		Checksum:  req.Checksum,
 		SizeBytes: sizeBytes,
-	})
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpImage, err)
+		return fmt.Errorf("persist image record: %w", err)
+	}
 
-	corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 		ImageName: req.Name,
 		HostName:  s.hostName,
 		Path:      s.images.ImagePath(req.Name),
 		Status:    "ready",
 		PulledAt:  now,
-	})
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpImageHost, err)
+		return fmt.Errorf("persist image_host record: %w", err)
+	}
 
 	slog.Info("image record persisted", "name", req.Name)
+	return nil
 }
 
 func (s *Server) ListImages(ctx context.Context, _ *emptypb.Empty) (*pb.ListImagesResponse, error) {

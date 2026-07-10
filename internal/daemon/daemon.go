@@ -283,7 +283,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// WAL entries defer rather than leak — never a schema-version guess.)
 	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
 	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, "split_brain_activated"))
-	gateMetrics := metrics.NewRuntimeGateMetrics() // shared by all gate observers
+	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
+	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
 	// Start WAL-based replicator with Crescent relay protocol.
 	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, corrosion.RelayConfig{
@@ -346,6 +347,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	vmChecker := health.NewVMChecker(d.cfg.HostName, d.db, d.virt)
 	vmChecker.SetGate(d.checker)
 	vmChecker.SetGateRefusedObserver(gateMetrics.Refused)
+	vmChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 
 	// Start libvirt reconnect loop — auto-reconnects if libvirtd restarts (#42).
 	go d.virt.StartReconnectLoop(ctx)
@@ -362,8 +364,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return // don't act on intentional stops
 			}
 			slog.Warn("domain event: VM stopped/crashed", "vm", domName, "event", event, "detail", detail)
-			corrosion.UpdateVMState(ctx, d.db, domName, "error",
-				fmt.Sprintf("domain event: stopped (detail=%d). Check host dmesg for OOM.", detail))
+			if err := corrosion.UpdateVMState(ctx, d.db, domName, "error",
+				fmt.Sprintf("domain event: stopped (detail=%d). Check host dmesg for OOM.", detail)); err != nil {
+				slog.Error("domain event: failed to record crash state — reconciler will re-detect", "vm", domName, "error", err)
+				stateWriteMetrics.Failed(corrosion.OpVMState, corrosion.ClassifyWriteErr(err))
+			}
 		}
 	})
 
@@ -376,6 +381,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	reconciler.SetGate(d.checker)
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
+	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 
 	// Daily prune of this host's vm_events rows so the operational event store
 	// stays bounded (see config vm_event_*).
@@ -434,6 +440,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
+	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// Target the upgrade swap at the binary we're actually running (re-exec uses
 	// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
 	if exe, err := os.Executable(); err == nil {
@@ -644,6 +651,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// enforced — wired before the container reconcile loop starts.
 	ctChecker.SetGate(d.checker)
 	ctChecker.SetGateRefusedObserver(gateMetrics.Refused)
+	ctChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	go ctChecker.Start(ctx)
 
 	// wire the libvirt blockdev-mirror driver so MoveVolume

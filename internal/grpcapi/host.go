@@ -444,7 +444,13 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 				"vm", vm.Name, "error", err)
 			// Fall through to cold migration.
 		} else {
-			corrosion.UpdateVMHost(ctx, s.db, vm.Name, target.Name, "running")
+			if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, target.Name, "running"); err != nil {
+				slog.Error("drain: post-migration ownership write failed", "vm", vm.Name, "to", target.Name, "error", err)
+				s.noteStateWriteFail(corrosion.OpVMHost, err)
+				progress.Status = "error"
+				progress.Error = "migrated but recording new owner failed: " + err.Error()
+				return progress
+			}
 			progress.Status = "done"
 			progress.ProgressPct = 100
 			return progress

@@ -47,6 +47,9 @@ type VMChecker struct {
 	// feeds the refusal metric (nil-safe).
 	gate          runtimeGate
 	onGateRefused func(action, reason string)
+	// onStateWriteFail observes an authoritative state write that failed (nil-safe);
+	// wired to the litevirt_state_write_failures_total counter by the daemon.
+	onStateWriteFail func(op, class string)
 }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
@@ -58,6 +61,15 @@ func (v *VMChecker) SetGateRefusedObserver(fn func(action, reason string)) { v.o
 func (v *VMChecker) noteGateRefused(action, reason string) {
 	if v.onGateRefused != nil {
 		v.onGateRefused(action, reason)
+	}
+}
+
+// SetStateWriteFailObserver wires the state-write-failure metric hook (nil-safe).
+func (v *VMChecker) SetStateWriteFailObserver(fn func(op, class string)) { v.onStateWriteFail = fn }
+
+func (v *VMChecker) noteStateWriteFail(op string, err error) {
+	if v.onStateWriteFail != nil {
+		v.onStateWriteFail(op, corrosion.ClassifyWriteErr(err))
 	}
 }
 
@@ -160,8 +172,13 @@ func (v *VMChecker) sweep(ctx context.Context) {
 		// operator's intent wins even if a stop didn't fully take effect.
 		if vm.StateDetail != "operator-stop" && v.virt != nil {
 			if st, err := v.virt.DomainState(vm.Name); err == nil && st == "running" {
-				corrosion.UpdateVMState(ctx, v.db, vm.Name, "running",
-					"reconciled from libvirt: domain running")
+				if werr := corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running",
+					"reconciled from libvirt: domain running"); werr != nil {
+					slog.Error("vmcheck: reconcile write failed — NOT publishing reconciled event",
+						"vm", vm.Name, "error", werr)
+					v.noteStateWriteFail(corrosion.OpVMState, werr)
+					continue
+				}
 				v.publish("vm.state.reconciled", vm.Name,
 					fmt.Sprintf("cluster state was %q, libvirt reports running", vm.State))
 				slog.Warn("vmcheck: reconciled stale VM state", "vm", vm.Name, "was", vm.State)
@@ -401,10 +418,16 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 		v.virt.DestroyDomain(vm.Name)
 		if err := v.virt.StartDomain(vm.Name); err != nil {
 			slog.Error("vmcheck: restart failed", "vm", vm.Name, "error", err)
-			corrosion.UpdateVMState(ctx, v.db, vm.Name, "error", fmt.Sprintf("health check restart failed: %v", err))
+			if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error", fmt.Sprintf("health check restart failed: %v", err)); werr != nil {
+				v.noteStateWriteFail(corrosion.OpVMState, werr)
+			}
 			return
 		}
-		corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", "restarted by health checker")
+		if err := corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restarted by health checker"); err != nil {
+			slog.Error("vmcheck: restart state write failed — NOT publishing restarted event", "vm", vm.Name, "error", err)
+			v.noteStateWriteFail(corrosion.OpVMState, err)
+			return
+		}
 		v.publish("vm.health.restarted", vm.Name, "restarted by health checker")
 		slog.Info("vmcheck: VM restarted", "vm", vm.Name)
 
@@ -428,7 +451,9 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 	target, err := v.pickMigrationTarget(ctx, vm.HostName, vm.MemActual)
 	if err != nil {
 		slog.Error("vmcheck: no migration target available", "vm", vm.Name, "error", err)
-		corrosion.UpdateVMState(ctx, v.db, vm.Name, "error", "health check failed, no migration target available")
+		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error", "health check failed, no migration target available"); werr != nil {
+			v.noteStateWriteFail(corrosion.OpVMState, werr)
+		}
 		return
 	}
 
@@ -452,16 +477,24 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 		return
 	}
 
-	corrosion.UpdateVMState(ctx, v.db, vm.Name, "migrating", fmt.Sprintf("health check → %s", target.Name))
+	if err := corrosion.UpdateVMState(ctx, v.db, vm.Name, "migrating", fmt.Sprintf("health check → %s", target.Name)); err != nil {
+		v.noteStateWriteFail(corrosion.OpVMState, err)
+	}
 
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", target.Address)
 	if err := v.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{Live: true}); err != nil {
 		slog.Error("vmcheck: migration failed", "vm", vm.Name, "target", target.Name, "error", err)
-		corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", fmt.Sprintf("migration to %s failed: %v", target.Name, err))
+		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", fmt.Sprintf("migration to %s failed: %v", target.Name, err)); werr != nil {
+			v.noteStateWriteFail(corrosion.OpVMState, werr)
+		}
 		return
 	}
 
-	corrosion.UpdateVMHost(ctx, v.db, vm.Name, target.Name, "running")
+	if err := corrosion.UpdateVMHost(ctx, v.db, vm.Name, target.Name, "running"); err != nil {
+		slog.Error("vmcheck: post-migration ownership write failed — NOT publishing migrated event", "vm", vm.Name, "to", target.Name, "error", err)
+		v.noteStateWriteFail(corrosion.OpVMHost, err)
+		return
+	}
 	v.publish("vm.health.migrated", vm.Name, fmt.Sprintf("from=%s to=%s", v.hostName, target.Name))
 	slog.Info("vmcheck: VM migrated successfully", "vm", vm.Name, "to", target.Name)
 }
@@ -599,11 +632,17 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	_ = v.virt.DestroyDomain(vm.Name)
 	if err := v.virt.StartDomain(vm.Name); err != nil {
 		slog.Error("vmcheck: restart policy start failed", "vm", vm.Name, "error", err)
-		corrosion.UpdateVMState(ctx, v.db, vm.Name, "error",
-			fmt.Sprintf("restart policy start failed: %v", err))
+		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error",
+			fmt.Sprintf("restart policy start failed: %v", err)); werr != nil {
+			v.noteStateWriteFail(corrosion.OpVMState, werr)
+		}
 		return
 	}
-	corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", "restart policy: "+decision)
+	if err := corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restart policy: "+decision); err != nil {
+		slog.Error("vmcheck: restart-policy state write failed — NOT publishing restart event", "vm", vm.Name, "error", err)
+		v.noteStateWriteFail(corrosion.OpVMState, err)
+		return
+	}
 	v.publish("vm.restart.policy", vm.Name,
 		fmt.Sprintf("condition=%s attempt=%d (%s)", rp.Condition, safeAttemptCount(rs)+1, decision))
 }

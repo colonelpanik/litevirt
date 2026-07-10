@@ -88,6 +88,8 @@ test-fuzz:
 # BASE_REF overrides what the schema-growth check diffs against (default origin/main).
 ci-guards:
 	./scripts/ci/check-schema-bump.sh
+	go run ./scripts/ci/writecheck -root .
+	go test ./scripts/ci/writecheck/
 	go test ./internal/corrosion/ -run TestSchemaHistoryDocumentsCurrentVersion
 	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestValidateInvocation|TestCheckIdentifier|TestExtractInvocations'
 

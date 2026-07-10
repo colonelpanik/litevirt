@@ -172,7 +172,9 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 			s.audit(ctx, "ct.clone", req.Target, "project="+project+" (start failed)", "error")
 			return nil, status.Errorf(codes.Internal, "cloned but start failed: %v", err)
 		}
-		_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Target, "running", "")
+		if werr := corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Target, "running", ""); werr != nil {
+			s.noteStateWriteFail(corrosion.OpContainerState, werr)
+		}
 		rec.State = "running"
 	}
 	s.audit(ctx, "ct.clone", req.Target, fmt.Sprintf("project=%s source=%s", project, req.Source), "ok")

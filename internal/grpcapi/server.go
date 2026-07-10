@@ -226,6 +226,9 @@ type Server struct {
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
 	gate          serverGate
 	onGateRefused func(action, reason string)
+	// onStateWriteFail observes an authoritative state/image write that failed
+	// (nil-safe); the daemon wires it to litevirt_state_write_failures_total.
+	onStateWriteFail func(op, class string)
 
 	// demotionUnfenced is set by the VIPDemoter (SetDemotionUnfenced) when a minority VIP
 	// self-demote FAILED and this node has no verified self-fence — a durable HA-degraded
@@ -298,6 +301,15 @@ func (s *Server) SetGate(g serverGate) { s.gate = g }
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (s *Server) SetGateRefusedObserver(fn func(action, reason string)) { s.onGateRefused = fn }
+
+// SetStateWriteFailObserver wires the state-write-failure metric hook (nil-safe).
+func (s *Server) SetStateWriteFailObserver(fn func(op, class string)) { s.onStateWriteFail = fn }
+
+func (s *Server) noteStateWriteFail(op string, err error) {
+	if s.onStateWriteFail != nil {
+		s.onStateWriteFail(op, corrosion.ClassifyWriteErr(err))
+	}
+}
 
 func (s *Server) noteGateRefused(action, reason string) {
 	if s.onGateRefused != nil {

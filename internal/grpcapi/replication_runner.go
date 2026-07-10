@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,13 @@ import (
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/storage"
 )
+
+// errCheckpointCommit marks a failure to durably record the NEW replication
+// checkpoint anchor after a transfer. It is distinct from a transfer failure: the
+// parent anchor (DB row + libvirt bitmap) is left intact, so RunReplication must
+// NOT reset the chain and fall back to a full copy (that would erase the retryable
+// parent). The next run retries from the preserved parent.
+var errCheckpointCommit = errors.New("replication checkpoint commit failed")
 
 // RunReplication is the scheduler's replication dispatch (scheduler.Replication
 // Runner). It replicates the VM's disk to the schedule's target pool, keeping
@@ -94,10 +102,24 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	// when the session can't open (stopped VM / old libvirt) or the transfer
 	// fails — resetting the chain so the next run re-bases cleanly.
 	if sched.Incremental && s.backupSource != nil {
-		if err := s.replicateIncremental(ctx, sched, vm, src, targetHost, ts); err == nil {
+		err := s.replicateIncremental(ctx, sched, vm, src, targetHost, ts)
+		switch {
+		case err == nil:
 			return nil
-		} else {
-			_ = corrosion.SetReplicationCheckpoint(ctx, s.db, sched.VMName, sched.Repo, "")
+		case errors.Is(err, errCheckpointCommit):
+			// The transfer succeeded but the new anchor couldn't be recorded. The
+			// parent anchor (DB row + bitmap) is intact — do NOT reset the chain or
+			// fall back (that would erase the retryable parent). Retry next run.
+			slog.Error("incremental replication: checkpoint commit failed; parent anchor preserved for retry",
+				"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
+			return err
+		default:
+			// Genuine transfer/session failure: reset the chain so the next run
+			// re-bases cleanly, then fall through to the full qcow2 copy.
+			if rerr := corrosion.SetReplicationCheckpoint(ctx, s.db, sched.VMName, sched.Repo, ""); rerr != nil {
+				slog.Error("incremental replication: chain reset write failed",
+					"vm", sched.VMName, "pool", sched.TargetPool, "error", rerr)
+			}
 			slog.Warn("incremental replication fell back to full copy",
 				"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
 		}
@@ -313,12 +335,11 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 		}
 	}
 
-	// Advance the chain: drop the old anchor (best-effort; never the new one),
-	// record the new one, then prune older replicas.
-	if parentCP != "" && parentCP != newCP {
-		_ = s.backupSource.DeleteCheckpoint(sched.VMName, parentCP)
+	// Advance the chain: record the new anchor, then drop the old one. On failure
+	// this returns errCheckpointCommit and leaves the parent anchor intact.
+	if err := s.advanceReplicationCheckpoint(ctx, sched.VMName, sched.Repo, parentCP, newCP); err != nil {
+		return err
 	}
-	_ = corrosion.SetReplicationCheckpoint(ctx, s.db, sched.VMName, sched.Repo, newCP)
 	committed = true // newCP is now the recorded anchor — keep it
 
 	pruned := s.pruneReplicasAnywhere(ctx, sched.TargetPool, targetHost, sched.VMName, src.DiskName, sched.KeepReplicas)
@@ -331,6 +352,27 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 		detail += fmt.Sprintf(", pruned %d old", pruned)
 	}
 	s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "ok", detail)
+	return nil
+}
+
+// advanceReplicationCheckpoint commits the checkpoint chain forward. It records
+// newCP as the schedule's anchor FIRST — checked — and only after that write lands
+// does it drop the superseded parent bitmap. If the anchor write fails it returns
+// errCheckpointCommit WITHOUT touching the parent, so the caller preserves a fully
+// retryable state (parent bitmap + parent DB anchor both intact) and the just-
+// created newCP is cleaned up by replicateIncremental's deferred rollback.
+func (s *Server) advanceReplicationCheckpoint(ctx context.Context, vmName, repo, parentCP, newCP string) error {
+	if err := corrosion.SetReplicationCheckpoint(ctx, s.db, vmName, repo, newCP); err != nil {
+		return fmt.Errorf("%w: record %q for %s/%s: %v", errCheckpointCommit, newCP, vmName, repo, err)
+	}
+	// Anchor is durable; the parent is now superseded. Dropping its bitmap is
+	// best-effort — a failure only leaks a bitmap, it can't break the chain.
+	if parentCP != "" && parentCP != newCP {
+		if err := s.backupSource.DeleteCheckpoint(vmName, parentCP); err != nil {
+			slog.Warn("replication: dropping superseded parent checkpoint failed (bitmap leak; not fatal)",
+				"vm", vmName, "parent", parentCP, "error", err)
+		}
+	}
 	return nil
 }
 

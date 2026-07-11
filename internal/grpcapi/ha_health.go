@@ -72,7 +72,13 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 	}
 	prev := map[string]bool{}
 	eval := func() {
-		s.driveCapabilityActivation(ctx)
+		// One peer op per cycle: while any configured token is still unlatched, spend it
+		// latching one; once all are latched, spend it on a round-robin FRESHNESS check
+		// so a post-latch regression (a peer that rolled back / stopped advertising)
+		// still surfaces — the durable latch alone never flips back.
+		if !s.driveCapabilityActivation(ctx) {
+			s.checkOneCapabilityHealth(ctx)
+		}
 		// Rollout observability: per-feature config intent + latch state.
 		if s.gate != nil {
 			for _, tok := range capabilities.Supported() {
@@ -115,9 +121,9 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 // this periodic drive its latch would never flip even after it is added to `supported`,
 // and the guard would stay off forever. This runs at the HA-monitor cadence (off the hot
 // path) and is idempotent for already-latched tokens (cheap `already` path in Enforced).
-func (s *Server) driveCapabilityActivation(ctx context.Context) {
+func (s *Server) driveCapabilityActivation(ctx context.Context) bool {
 	if s.gate == nil {
-		return
+		return false
 	}
 	// Drive the latch for the tokens this node is configured to enforce (mandatory
 	// split_brain_gate_v1 ∪ config-on optional tokens) — establishing the durable
@@ -128,7 +134,7 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) {
 	// enforcing). Bound the cost: an unlatched token pays a fresh-Ping sweep, so drive
 	// at most ONE unlatched token per cycle (already-latched Enforced() is a cheap
 	// map read); the rest latch over subsequent cycles.
-	drovenUnlatched := false
+	drove := false
 	for _, tok := range capabilities.Supported() {
 		if !s.tokenEnabled(tok) {
 			continue
@@ -137,12 +143,47 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) {
 			s.gate.Enforced(ctx, tok) // cheap already-path; keeps the marker persisted
 			continue
 		}
-		if drovenUnlatched {
+		if drove {
 			continue
 		}
 		s.gate.Enforced(ctx, tok) // one CapabilityActive fresh-Ping sweep this cycle
-		drovenUnlatched = true
+		drove = true
 	}
+	return drove
+}
+
+// checkOneCapabilityHealth does ONE bounded freshness check per cycle: it round-robins
+// over the configured-on tokens and re-queries CapabilityActiveForHealth for the next
+// one, recording the result in capHealthLast. This is how a POST-latch regression is
+// detected (a latched token whose peer support later disappears) without the multi-token
+// fan-out — each token is re-checked every ~N cycles. Called only when
+// driveCapabilityActivation had no unlatched token to drive, so the cycle spends at most
+// one peer op total.
+func (s *Server) checkOneCapabilityHealth(ctx context.Context) {
+	if s.gate == nil {
+		return
+	}
+	var toks []string
+	for _, tok := range capabilities.Supported() {
+		if s.tokenEnabled(tok) {
+			toks = append(toks, tok)
+		}
+	}
+	if len(toks) == 0 {
+		return
+	}
+	s.capHealthMu.Lock()
+	if s.capHealthLast == nil {
+		s.capHealthLast = map[string]bool{}
+	}
+	tok := toks[s.capHealthCursor%len(toks)]
+	s.capHealthCursor++
+	s.capHealthMu.Unlock()
+
+	ok, _ := s.gate.CapabilityActiveForHealth(ctx, tok)
+	s.capHealthMu.Lock()
+	s.capHealthLast[tok] = ok
+	s.capHealthMu.Unlock()
 }
 
 // evaluateHADegraded computes the currently-degraded reasons. A configured-to-enforce
@@ -159,13 +200,17 @@ func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 			if !s.tokenEnabled(tok) {
 				continue
 			}
-			// Cheap Latched read, NOT CapabilityActiveForHealth: the latter fresh-Pings
-			// on an unlatched token (its 3s neg-cache < the 15s monitor cadence), so
-			// looping it over several unlatched flag-on tokens re-introduces the exact
-			// multi-token fan-out driveCapabilityActivation bounds to one/cycle. The
-			// bounded driver above establishes the latch; here we only READ it. `!Latched`
-			// == "enforcement not yet confirmed cluster-wide" == haUnsupportedMember.
-			if r := capabilityDegradedReason(tok, s.gate.Latched(tok), ""); r != "" {
+			// Degraded when either the token has NOT latched yet (activation pending),
+			// OR a bounded round-robin freshness check (checkOneCapabilityHealth) most
+			// recently found it unsupported/unreachable (a POST-latch regression the
+			// durable marker can't reflect). No fan-out here — we only read cheap
+			// in-memory state; the freshness Ping is the bounded one-per-cycle check.
+			latched := s.gate.Latched(tok)
+			s.capHealthMu.Lock()
+			lastOK, checked := s.capHealthLast[tok]
+			s.capHealthMu.Unlock()
+			healthy := latched && (!checked || lastOK)
+			if r := capabilityDegradedReason(tok, healthy, ""); r != "" {
 				out[r] = true
 			}
 		}

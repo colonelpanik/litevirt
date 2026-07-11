@@ -13,14 +13,17 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// vipMoveRefused is INERT until vip_demote_v1 is flipped — even a removed holder
-// that still holds the VIP does not refuse while the token is de-advertised.
+// vipMoveRefused is INERT until vip_proof_reclaim is enabled — even a removed holder
+// that still holds the VIP does not refuse while the enforcement.vip_proof_reclaim
+// config flag is off (its default). The token is advertised by this build, so
+// inertness here comes from the kill-switch flag being off, not de-advertisement.
 func TestVIPMove_InertUntilFlipped(t *testing.T) {
+	// enfVIPProofReclaim defaults false (kill-switch off) and gate is nil.
 	s := &Server{hostName: "self", probeHolder: func(context.Context, string, string) holderStatus {
 		return holderStatus{reachable: true, assigned: true} // still holds it
 	}}
 	if _, refused := s.vipMoveRefused(context.Background(), "lb", "10.0.0.1", "10.0.0.1", []string{"old"}, []string{"new"}, true, true); refused {
-		t.Fatal("must be inert (not refuse) while vip_demote_v1 is de-advertised")
+		t.Fatal("must be inert (not refuse) while enforcement.vip_proof_reclaim is off")
 	}
 }
 

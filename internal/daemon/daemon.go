@@ -389,7 +389,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	})
 	// LWW future-skew quarantine (partial): enabled only once LWWSkewGuardV1 has
 	// latched on this node (cheap marker read, no ping/I/O), so a future-skewed peer's
-	// rows can't win a conflict. Dark until the token is flipped + latched cluster-wide.
+	// rows can't win a conflict. The token is advertised, so enforcement is gated on the
+	// enforcement.lww_skew_guard config flag AND the latch — behavior-neutral until an
+	// operator enables it (and the flag is the reversible kill switch).
 	// NOTE: does not address the backward-clock case (NowTS still emits wall-clock) —
 	// that's deferred to a separate conflict-key migration.
 	d.db.SetHLCSkewGuard(func() bool {

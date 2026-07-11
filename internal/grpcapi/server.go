@@ -90,6 +90,14 @@ type Server struct {
 	enfVIPSelfDemote   bool
 	enfVIPProofReclaim bool
 
+	// capHealthLast records the most recent bounded freshness-check result per
+	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
+	// monitor detects a POST-latch capability regression (a peer that later stops
+	// advertising) that the one-way durable latch can't reflect. Guarded by capHealthMu.
+	capHealthMu     sync.Mutex
+	capHealthLast   map[string]bool
+	capHealthCursor int
+
 	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
 	// at daemon startup so CreateVM/restore render the same files the capability
 	// label was derived from.
@@ -105,9 +113,10 @@ type Server struct {
 	// state. Production leaves it nil.
 	probeHolder func(ctx context.Context, host, vip string) holderStatus
 
-	// vipGateFlipped is a test seam: when non-nil it overrides the "is vip_demote_v1
-	// advertised by this build" check, so tests can exercise the takeover gate with the
-	// token flipped while the shipped build keeps it de-advertised. Production nil.
+	// vipGateFlipped is a test seam for the CAPABILITY side of vipGateActive only: when
+	// non-nil it overrides the VIPReleaseProbeV1 latch check. It is still AND-ed with the
+	// enforcement.vip_proof_reclaim config flag (see vipGateActive), so a test can't use
+	// it to bypass the kill-switch. Production nil.
 	vipGateFlipped func() bool
 
 	// removeLBFromHost is a test seam for the Phase-2 synchronous stand-down of a removed

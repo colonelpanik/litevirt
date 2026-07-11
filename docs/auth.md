@@ -256,15 +256,17 @@ certs (which stay `admin`), enabling it changes **no** node-to-node behavior; th
 only operator-visible change is that a **remote** CLI must `lv login` first
 (on-node `lv` over loopback is unaffected).
 
-**The token ships DARK** — it is in the capability registry but NOT advertised
-(`capabilities.all`, not `supported`), so merging/deploying this build is fully
-inert: nothing activates and there is no HA-degraded during the rollout. Flipping
-is a deliberate two-step: **(1)** ship a release that adds `strict_mtls_identity_v1`
-to `capabilities.supported` and roll it fleet-wide (nodes then advertise it; the
-capability activates + latches once all do — and a transient
-`ha_degraded{unsupported_member}` is expected during that window until every node
-is upgraded), then **(2)** set `auth.strict_mtls_identity: true` on every node.
-Enforcement needs both; validate on an ephemeral cluster before either step.
+**The token is advertised by this build; enforcement remains default-off.**
+`strict_mtls_identity_v1` is in `capabilities.supported`, so deploying this build
+lets the capability activate + latch cluster-wide — but that is behavior-neutral,
+because enforcement is `auth.strict_mtls_identity` (default false) **AND** the
+latch. Deploying does NOT change auth. HA-degraded does NOT fire for an
+advertised-but-disabled token (degraded tracks configured-to-enforce, not merely
+advertised). Enabling is a single config step: set `auth.strict_mtls_identity:
+true` on every node; the HA monitor drives the latch while the cluster is healthy,
+and the config flag stays the reversible kill switch (set it false + restart to
+stand down, regardless of the latch marker). Validate on an ephemeral cluster
+before enabling.
 
 ### Forwarded identity (`auth.forwarded_identity`)
 

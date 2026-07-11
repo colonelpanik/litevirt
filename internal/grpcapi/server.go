@@ -803,6 +803,17 @@ func peerTarget(addr string, port int) string {
 	return net.JoinHostPort(addr, strconv.Itoa(port))
 }
 
+// dialPeerAddr opens an mTLS gRPC connection to a peer daemon at an already-known
+// "host:port" target (skipping the corrosion host lookup that dialPeer does).
+// pki.PeerDial itself attaches tracing dial options (via the hook the daemon
+// wires with pki.SetTraceDialOptions at boot) so W3C traceparent propagates on
+// the outbound call — a no-op when tracing is off — for every PeerDial caller,
+// not just this one; a new call site can no longer silently drop trace
+// propagation by forgetting to pass obs.ClientDialOptions() explicitly.
+func (s *Server) dialPeerAddr(target string) (*grpc.ClientConn, error) {
+	return pki.PeerDial(s.pkiDir, target)
+}
+
 // peerClient creates a gRPC client connection to a remote host's daemon.
 // The caller must close the returned connection when done.
 func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
@@ -818,7 +829,9 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 		// clear reason so console/VNC forwarders can report it to the user.
 		return nil, nil, fmt.Errorf("host %q has no address in cluster state", hostName)
 	}
-	conn, err := pki.PeerDial(s.pkiDir, peerTarget(host.Address, host.GRPCPort))
+	// dialPeer always attaches obs trace-context options (injects W3C trace context
+	// on the outbound peer RPC when tracing is active; nil otherwise).
+	conn, err := s.dialPeerAddr(peerTarget(host.Address, host.GRPCPort))
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial host %s: %w", hostName, err)
 	}

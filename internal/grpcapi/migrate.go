@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -22,7 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
-	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/vfio"
@@ -80,6 +81,13 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 // It streams MigrateProgress messages back to the caller.
 func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreamingServer[pb.MigrateProgress]) error {
 	ctx := stream.Context()
+	// Named span for the whole migration; child peer RPCs (define/copy/cutover on
+	// the target daemon) hang off this via the otelgrpc handlers, so a migration
+	// renders as one trace across both hosts. No-op when tracing is off.
+	ctx, span := obs.Span(ctx, "vm.migrate")
+	span.SetAttribute("vm.name", req.GetVmName())
+	span.SetAttribute("vm.target_host", req.GetTargetHost())
+	defer span.End()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
 	}
@@ -570,7 +578,7 @@ poll:
 	hooks.Run(ctx, hooks.PostMigrate, pbVM, hspec)
 
 	// Dial target host to re-establish gRPC so it can load TLS creds.
-	go s.notifyTargetHostOfVM(req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name)
+	go s.notifyTargetHostOfVM(ctx, req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name)
 
 	// Clean up orphaned files on the source host (cloud-init ISO, and disk
 	// files for --with-storage migrations where copies now live on target).
@@ -703,17 +711,35 @@ func (s *Server) recordMigrationMetrics(strategy, result string, duration time.D
 	}
 }
 
+// reattachVFTimeout bounds the whole post-cutover VF-reattach fan of
+// AttachDevice calls, so a hung target can't block the migrate path forever.
+const reattachVFTimeout = 60 * time.Second
+
 // reattachVFsOnTarget sends AttachDevice RPCs to the target host for each VF
 // that was detached before migration. The target allocates equivalent VFs from its own pool.
 func (s *Server) reattachVFsOnTarget(ctx context.Context, targetHostName, addr string, grpcPort int, vmName string, vfs []corrosion.PCIDeviceRecord) {
-	conn, err := pki.PeerDial(s.pkiDir, peerTarget(addr, grpcPort))
+	conn, err := s.dialPeerAddr(peerTarget(addr, grpcPort))
 	if err != nil {
 		slog.Warn("reattach VFs: dial target", "host", targetHostName, "error", err)
 		return
 	}
 	defer conn.Close()
+	s.sendReattachVFs(ctx, pb.NewLiteVirtClient(conn), targetHostName, vmName, vfs)
+}
 
-	client := pb.NewLiteVirtClient(conn)
+// sendReattachVFs issues an AttachDevice to the target for each pre-migration
+// detached VF. It runs on a context detached from the inbound RPC — same
+// rationale as notifyDetachedContext (finding 6): a long migration (large disk
+// copy) can outlive the entry-node user's forwarded bearer, and under
+// ForwardedIdentityV1 the owning target has no peer-identity fallback, so a
+// stale bearer copied onto these RPCs would be rejected Unauthenticated and the
+// migrated VM would come up without its passthrough devices. Detaching makes
+// this a plain peer/system call; the span survives (via ctx's value chain) so
+// the reattach still links into the vm.migrate trace. The client is a parameter
+// so a test can capture the exact outbound context.
+func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, targetHostName, vmName string, vfs []corrosion.PCIDeviceRecord) {
+	ctx, cancel := notifyDetachedContext(ctx, reattachVFTimeout)
+	defer cancel()
 	for _, vf := range vfs {
 		_, err := client.AttachDevice(ctx, &pb.AttachDeviceRequest{
 			VmName: vmName,
@@ -1195,9 +1221,26 @@ func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string,
 	}
 }
 
+// notifyDetachedContext builds the context for a migrate-notify call that
+// outlives the originating RPC. It detaches from BOTH the inbound RPC's
+// cancellation (context.WithoutCancel) AND its inbound gRPC metadata — a
+// forwarded user's authorization bearer can expire mid-migration, and under
+// ForwardedIdentityV1 the owning node never falls back to peer identity, so a
+// stale bearer would otherwise fail this background nudge outright. Stripping
+// makes the notify a plain peer/system call, which is correct for a
+// background nudge. The span value is NOT metadata — it survives via ctx's
+// ordinary value chain — so the notify still links into the same vm.migrate
+// trace via dialPeer's injected traceparent. metadata.MD{} (present-but-empty)
+// is used rather than an absent key so FromIncomingContext's ok/not-ok
+// semantics stay unambiguous.
+func notifyDetachedContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	base := metadata.NewIncomingContext(context.WithoutCancel(ctx), metadata.MD{})
+	return context.WithTimeout(base, timeout)
+}
+
 // notifyTargetHostOfVM pings the target daemon so it picks up the migrated VM.
-func (s *Server) notifyTargetHostOfVM(targetHostName, addr string, grpcPort int, vmName string) {
-	conn, err := pki.PeerDial(s.pkiDir, peerTarget(addr, grpcPort))
+func (s *Server) notifyTargetHostOfVM(ctx context.Context, targetHostName, addr string, grpcPort int, vmName string) {
+	conn, err := s.dialPeerAddr(peerTarget(addr, grpcPort))
 	if err != nil {
 		slog.Warn("migrate notify: dial target", "host", targetHostName, "error", err)
 		return
@@ -1205,7 +1248,7 @@ func (s *Server) notifyTargetHostOfVM(targetHostName, addr string, grpcPort int,
 	defer conn.Close()
 
 	client := pb.NewLiteVirtClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := notifyDetachedContext(ctx, 10*time.Second)
 	defer cancel()
 
 	_, err = client.InspectVM(ctx, &pb.InspectVMRequest{Name: vmName})

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -288,6 +290,80 @@ func TestRecordMigrationMetrics_NilMetrics(t *testing.T) {
 	s := testServer(t)
 	// Should not panic when migrationMetrics is nil.
 	s.recordMigrationMetrics("live", "success", 0, 0, 0)
+}
+
+// notifyDetachedContext must strip inbound gRPC metadata (so a forwarded
+// user's bearer, which can expire mid-migration, can't fail the detached
+// post-migration notify — finding 6) while keeping the span so the notify
+// still links into the same vm.migrate trace via dialPeer's traceparent, and
+// while applying the caller's timeout.
+func TestNotifyDetachedContext_StripsInboundMetadataKeepsSpanAndTimeout(t *testing.T) {
+	md := metadata.Pairs("authorization", "Bearer usertoken", "x-other", "v")
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+	ctx, span := sdktrace.NewTracerProvider().Tracer("test").Start(ctx, "vm.migrate")
+	defer span.End()
+	wantSpanCtx := oteltrace.SpanContextFromContext(ctx)
+
+	got, cancel := notifyDetachedContext(ctx, 10*time.Second)
+	defer cancel()
+
+	if gotMD, ok := metadata.FromIncomingContext(got); !ok || len(gotMD) != 0 {
+		t.Errorf("notifyDetachedContext kept inbound metadata %v; want present-but-empty", gotMD)
+	}
+	if got := oteltrace.SpanContextFromContext(got); !got.Equal(wantSpanCtx) {
+		t.Errorf("notifyDetachedContext lost the span context; got %v, want %v", got, wantSpanCtx)
+	}
+	if _, hasDeadline := got.Deadline(); !hasDeadline {
+		t.Error("notifyDetachedContext did not apply a timeout")
+	}
+	if got.Err() != nil {
+		t.Errorf("notifyDetachedContext returned an already-done context: %v", got.Err())
+	}
+
+	// Detached from the parent's cancellation: cancelling the original inbound
+	// ctx's underlying cause must not cancel the notify context.
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	parentCtx = metadata.NewIncomingContext(parentCtx, md)
+	detached, cancel2 := notifyDetachedContext(parentCtx, 10*time.Second)
+	defer cancel2()
+	parentCancel()
+	if detached.Err() != nil {
+		t.Errorf("notifyDetachedContext was cancelled by parent cancellation; want detached, got %v", detached.Err())
+	}
+}
+
+// End-to-end of finding 6's threat model: after notifyDetachedContext, the
+// pki.propagateFwdBearer path (what PeerDial's interceptor runs) must NOT
+// copy a stale user bearer onto the outgoing notify. We re-implement the
+// same "read inbound authorization" check here without importing pki's
+// unexported helper — the contract is on the context shape.
+func TestNotifyDetachedContext_NoInboundBearerForFwdRelay(t *testing.T) {
+	md := metadata.Pairs(
+		"authorization", "Bearer expired-user-token",
+		"x-litevirt-fwd-bearer", "Bearer should-also-be-stripped",
+	)
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+	ctx, span := sdktrace.NewTracerProvider().Tracer("test").Start(ctx, "vm.migrate")
+	defer span.End()
+
+	detached, cancel := notifyDetachedContext(ctx, 10*time.Second)
+	defer cancel()
+
+	// Present-but-empty inbound MD: FromIncomingContext ok=true, no keys.
+	gotMD, ok := metadata.FromIncomingContext(detached)
+	if !ok {
+		t.Fatal("inbound metadata absent; want present-but-empty so FromIncomingContext semantics stay unambiguous")
+	}
+	if len(gotMD.Get("authorization")) != 0 {
+		t.Errorf("authorization survived detach: %v", gotMD.Get("authorization"))
+	}
+	if len(gotMD.Get("x-litevirt-fwd-bearer")) != 0 {
+		t.Errorf("fwd-bearer survived detach: %v", gotMD.Get("x-litevirt-fwd-bearer"))
+	}
+	// Span still present for traceparent injection on the peer dial.
+	if !oteltrace.SpanContextFromContext(detached).IsValid() {
+		t.Error("span context lost; notify would not link into vm.migrate trace")
+	}
 }
 
 // ── post-migration tests ────────────────────────────────────────────────────

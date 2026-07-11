@@ -1,0 +1,47 @@
+# Continuous coverage-guided fuzz of telemetry validation (obs).
+# Runs on GitHub-hosted Ubuntu VMs — "continuous cloud" at repo CI scale.
+# This is the same engine family as OSS-Fuzz native Go fuzz targets, but
+# executed on our runners rather than Google's ClusterFuzz fleet.
+#
+# Schedule: nightly long run builds corpus depth.
+# PRs: shorter run when telemetry paths change.
+name: Fuzz telemetry
+
+on:
+  schedule:
+    # 06:17 UTC daily (offset to avoid top-of-hour stampede)
+    - cron: "17 6 * * *"
+  pull_request:
+    paths:
+      - "internal/obs/**"
+      - "scripts/ci/fuzz-telemetry.sh"
+      - ".github/workflows/fuzz-telemetry.yml"
+      - "Makefile"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "go test -fuzztime duration (e.g. 2m, 30m, 1h)"
+        required: false
+        default: "10m"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: go test -fuzz (telemetry)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # PR: 2m per target (fast signal). Nightly/dispatch: longer budget.
+      - name: Run telemetry fuzz targets
+        env:
+          FUZZTIME: ${{ github.event_name == 'pull_request' && '2m' || github.event.inputs.fuzztime || '15m' }}
+        run: ./scripts/ci/fuzz-telemetry.sh

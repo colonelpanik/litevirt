@@ -325,8 +325,12 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	// place; disk-only revert restores the original) — reconcile either way.
 	s.reconcileDiskPaths(ctx, req.VmName)
 
-	// After revert, VM may be running or paused depending on snapshot type.
-	corrosion.UpdateVMState(ctx, s.db, req.VmName, "running", "restored from "+req.SnapshotName)
+	// After revert, VM may be running or paused depending on snapshot type. A lost
+	// "running" write is low-harm (the reconciler heals from libvirt), so record
+	// best-effort with retry rather than failing an already-completed restore.
+	if err := s.persistVMState(ctx, req.VmName, "running", "restored from "+req.SnapshotName, corrosion.OpVMState); err != nil {
+		slog.Error("snapshot restore: recording running state failed — reconciler will heal", "vm", req.VmName, "error", err)
+	}
 	slog.Info("snapshot restored", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.restored", "ok", req.SnapshotName)
 	return s.vmToProto(ctx, req.VmName)

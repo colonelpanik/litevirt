@@ -244,6 +244,25 @@ func SetContainerState(ctx context.Context, c *Client, hostName, name, state str
 		state, now, hostName, name)
 }
 
+// SetContainerStateStrict is SetContainerState (no state_detail) that reports a
+// zero-row UPDATE as ErrNoRowsAffected instead of a silent success — the no-detail
+// twin of SetContainerStateDetailStrict, for must-exist writes that intentionally
+// leave state_detail unchanged.
+func SetContainerStateStrict(ctx context.Context, c *Client, hostName, name, state string) error {
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE containers SET state = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		state, now, hostName, name)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // SetContainerStateDetail updates state + state_detail together (leaving
 // restart_policy untouched). Used by StopContainer to record operator intent
 // ('operator-stop') and by the container reconciler to sync the cluster row to

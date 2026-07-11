@@ -1357,19 +1357,25 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 
 		// Persist image + image_host records.
 		now := time.Now().UTC().Format(time.RFC3339)
-		corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+		if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
 			Name:      img,
 			Format:    def.Format,
 			SourceURL: def.Source,
 			Checksum:  def.Checksum,
-		})
-		corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+		}); err != nil {
+			s.noteStateWriteFail(corrosion.OpImage, err)
+			return status.Errorf(codes.Internal, "record auto-pulled image %q: %v", img, err)
+		}
+		if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 			ImageName: img,
 			HostName:  s.hostName,
 			Path:      s.images.ImagePath(img),
 			Status:    "ready",
 			PulledAt:  now,
-		})
+		}); err != nil {
+			s.noteStateWriteFail(corrosion.OpImageHost, err)
+			return status.Errorf(codes.Internal, "record auto-pulled image host %q: %v", img, err)
+		}
 
 		slog.Info("image auto-pulled successfully", "image", img)
 		_ = stream.Send(&pb.DeployProgress{

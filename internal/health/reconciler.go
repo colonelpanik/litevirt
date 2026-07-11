@@ -65,6 +65,9 @@ type Reconciler struct {
 	// onGateRefused observes each gate/proof refusal (action, reason from the
 	// closed vocab) — nil-safe; the daemon wires it to the refusal metric.
 	onGateRefused func(action, reason string)
+	// onStateWriteFail observes an authoritative state write that failed (nil-safe);
+	// the daemon wires it to the litevirt_state_write_failures_total counter.
+	onStateWriteFail func(op, class string)
 
 	// onbootMu guards onbootPending: onboot VMs whose boot-time autostart the
 	// split-brain gate refused (warmup / transient quorum loss). reconcile() retries
@@ -101,6 +104,15 @@ func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (r *Reconciler) SetGateRefusedObserver(fn func(action, reason string)) { r.onGateRefused = fn }
+
+// SetStateWriteFailObserver wires the state-write-failure metric hook (nil-safe).
+func (r *Reconciler) SetStateWriteFailObserver(fn func(op, class string)) { r.onStateWriteFail = fn }
+
+func (r *Reconciler) noteStateWriteFail(op string, err error) {
+	if r.onStateWriteFail != nil {
+		r.onStateWriteFail(op, corrosion.ClassifyWriteErr(err))
+	}
+}
 
 func (r *Reconciler) noteGateRefused(action, reason string) {
 	if r.onGateRefused != nil {
@@ -374,7 +386,10 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			}
 			slog.Warn("reconciler: VM stopped out-of-band — syncing cluster state",
 				"vm", vm.Name, "reason", st.Reason, "to", newState)
-			corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail)
+			if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail); err != nil {
+				slog.Error("reconciler: out-of-band stop sync write failed", "vm", vm.Name, "error", err)
+				r.noteStateWriteFail(corrosion.OpVMState, err)
+			}
 
 		case "stopped":
 			// One-shot machine-type backfill for a STOPPED but still-defined VM (a legacy VM,
@@ -390,7 +405,9 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				if state, err := r.virt.DomainState(vm.Name); err == nil && state == "running" {
 					slog.Info("reconciler: VM in error state but running in libvirt — updating state",
 						"vm", vm.Name)
-					corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "reconciler: domain is alive")
+					if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "reconciler: domain is alive"); err != nil {
+						r.noteStateWriteFail(corrosion.OpVMState, err)
+					}
 				}
 			}
 
@@ -415,7 +432,9 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				live = st
 			}
 			slog.Info("reconciler: clearing stuck backing-up state", "vm", vm.Name, "live", live)
-			corrosion.UpdateVMState(ctx, r.db, vm.Name, live, "reconciler: stale backing-up cleared")
+			if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, live, "reconciler: stale backing-up cleared"); err != nil {
+				r.noteStateWriteFail(corrosion.OpVMState, err)
+			}
 		}
 	}
 
@@ -714,8 +733,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 					slog.Error("reconciler: complete start proof (already-running) did not apply — leaving state for reconcile",
 						"vm", vm.Name, "proof", proofID, "error", cerr)
 				}
-			} else {
-				corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "domain already present")
+			} else if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "domain already present"); err != nil {
+				slog.Error("reconciler: already-present running-state write failed", "vm", vm.Name, "error", err)
+				r.noteStateWriteFail(corrosion.OpVMState, err)
 			}
 			r.clearOnbootPending(vm.Name) // onboot duty discharged
 			return
@@ -727,7 +747,10 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.virt.UndefineDomainPreservingState(vm.Name)
 	}
 
-	corrosion.UpdateVMState(ctx, r.db, vm.Name, "starting", "reconciler")
+	if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "starting", "reconciler"); err != nil {
+		slog.Error("reconciler: failover start-marker write failed", "vm", vm.Name, "error", err)
+		r.noteStateWriteFail(corrosion.OpVMState, err)
+	}
 
 	// Parse the stored spec to rebuild the domain XML.
 	spec := &pb.VMSpec{}
@@ -948,8 +971,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			slog.Error("reconciler: complete start proof did not apply after start — leaving 'starting' for the reconcile starting-case to retry",
 				"vm", vm.Name, "proof", proofID, "error", err)
 		}
-	} else {
-		corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover")
+	} else if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover"); err != nil {
+		slog.Error("reconciler: post-failover running-state write failed", "vm", vm.Name, "error", err)
+		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	r.clearOnbootPending(vm.Name) // onboot duty discharged
 	slog.Info("reconciler: VM started successfully", "vm", vm.Name)
@@ -973,17 +997,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 //     pointer, so no in_progress proof dangles and no marker-less pending row is left.
 func (r *Reconciler) failPendingStart(ctx context.Context, vmName, proofID string, retryable bool, detail string) {
 	if proofID == "" {
-		corrosion.UpdateVMState(ctx, r.db, vmName, "error", detail)
+		if err := corrosion.UpdateVMState(ctx, r.db, vmName, "error", detail); err != nil {
+			r.noteStateWriteFail(corrosion.OpVMState, err)
+		}
 		return
 	}
 	if retryable {
-		corrosion.UpdateVMState(ctx, r.db, vmName, "pending", "retrying after transient start failure: "+detail)
+		if err := corrosion.UpdateVMState(ctx, r.db, vmName, "pending", "retrying after transient start failure: "+detail); err != nil {
+			slog.Error("reconciler: retry re-arm write failed", "vm", vmName, "error", err)
+			r.noteStateWriteFail(corrosion.OpVMState, err)
+		}
 		return
 	}
 	if err := corrosion.FailActionProof(ctx, r.db, proofID, vmName, "start_failed", detail); err != nil {
 		slog.Error("reconciler: terminalize failed-start proof did not apply — setting VM error",
 			"vm", vmName, "proof", proofID, "error", err)
-		corrosion.UpdateVMState(ctx, r.db, vmName, "error", detail)
+		if werr := corrosion.UpdateVMState(ctx, r.db, vmName, "error", detail); werr != nil {
+			r.noteStateWriteFail(corrosion.OpVMState, werr)
+		}
 	}
 }
 

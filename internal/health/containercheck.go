@@ -51,6 +51,9 @@ type ContainerChecker struct {
 	// SetGate. onGateRefused feeds the refusal metric (nil-safe).
 	gate          runtimeGate
 	onGateRefused func(action, reason string)
+	// onStateWriteFail observes an authoritative state write that failed (nil-safe);
+	// wired to the litevirt_state_write_failures_total counter by the daemon.
+	onStateWriteFail func(op, class string)
 
 	// Now is the clock for the re-key debounce (defaults to time.Now); tests
 	// override it to advance deterministically.
@@ -82,6 +85,17 @@ func (c *ContainerChecker) SetGateRefusedObserver(fn func(action, reason string)
 func (c *ContainerChecker) noteGateRefused(action, reason string) {
 	if c.onGateRefused != nil {
 		c.onGateRefused(action, reason)
+	}
+}
+
+// SetStateWriteFailObserver wires the state-write-failure metric hook (nil-safe).
+func (c *ContainerChecker) SetStateWriteFailObserver(fn func(op, class string)) {
+	c.onStateWriteFail = fn
+}
+
+func (c *ContainerChecker) noteStateWriteFail(op string, err error) {
+	if c.onStateWriteFail != nil {
+		c.onStateWriteFail(op, corrosion.ClassifyWriteErr(err))
 	}
 }
 
@@ -180,7 +194,10 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		if live == lxc.StateRunning {
 			state = "running"
 		}
-		_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, state, "")
+		if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, state, ""); err != nil {
+			slog.Warn("containercheck: relocate materialize state write failed", "container", ct.Name, "error", err)
+			c.noteStateWriteFail(corrosion.OpContainerState, err)
+		}
 		return
 	}
 
@@ -230,10 +247,17 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	}
 	if err := c.runtime.Start(ctx, ct.Name); err != nil {
 		slog.Error("containercheck: relocate-recreate start failed", "container", ct.Name, "error", err)
-		_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", "")
+		if werr := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", ""); werr != nil {
+			c.noteStateWriteFail(corrosion.OpContainerState, werr)
+		}
 		return
 	}
-	_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "running", "")
+	if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", ""); err != nil {
+		slog.Error("containercheck: relocate-recreate state write failed — NOT publishing relocated event",
+			"container", ct.Name, "error", err)
+		c.noteStateWriteFail(corrosion.OpContainerState, err)
+		return
+	}
 	c.publish("ct.relocated", ct.Name, "recreated from image after host loss")
 	slog.Info("containercheck: relocated container recreated", "container", ct.Name)
 }
@@ -372,7 +396,18 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 		// Reality: up (FROZEN maps to running). Heal cluster drift and clear any
 		// stale stop cause so a later unexpected stop is judged fresh.
 		if ct.State != "running" {
-			_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "running", "")
+			if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", ""); err != nil {
+				if errors.Is(err, corrosion.ErrNoRowsAffected) {
+					// Row vanished between the sweep list and here (concurrent
+					// delete) — nothing to reconcile, not a write fault.
+					slog.Debug("containercheck: reconcile target row gone; skipping", "container", ct.Name)
+					return
+				}
+				slog.Error("containercheck: reconcile write failed — NOT publishing reconciled event",
+					"container", ct.Name, "error", err)
+				c.noteStateWriteFail(corrosion.OpContainerState, err)
+				return
+			}
 			c.publish("ct.state.reconciled", ct.Name,
 				fmt.Sprintf("cluster state was %q, runtime reports running", ct.State))
 			slog.Warn("containercheck: reconciled stale container state", "container", ct.Name, "was", ct.State)
@@ -390,7 +425,10 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	// Operator intent always wins (the container analogue of vms.state_detail).
 	if ct.StateDetail == operatorStopDetail {
 		if ct.State != "stopped" {
-			_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", operatorStopDetail)
+			if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", operatorStopDetail); err != nil {
+				slog.Warn("containercheck: operator-stop heal write failed", "container", ct.Name, "error", err)
+				c.noteStateWriteFail(corrosion.OpContainerState, err)
+			}
 		}
 		return
 	}
@@ -399,7 +437,10 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	if rp == nil {
 		// No policy: heal state drift only — don't fabricate a stop cause or act.
 		if ct.State != "stopped" {
-			_ = corrosion.SetContainerState(ctx, c.db, c.hostName, ct.Name, "stopped")
+			if err := corrosion.SetContainerState(ctx, c.db, c.hostName, ct.Name, "stopped"); err != nil {
+				slog.Warn("containercheck: no-policy state heal write failed", "container", ct.Name, "error", err)
+				c.noteStateWriteFail(corrosion.OpContainerState, err)
+			}
 		}
 		return
 	}
@@ -409,7 +450,10 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	// restartDecision reads (containers have no libvirt-style cause, so we pass
 	// cause="" and let the detail drive the decision).
 	if ct.State != "stopped" || ct.StateDetail != outOfBandDestroyDetail {
-		_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", outOfBandDestroyDetail)
+		if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", outOfBandDestroyDetail); err != nil {
+			slog.Warn("containercheck: out-of-band stop record write failed", "container", ct.Name, "error", err)
+			c.noteStateWriteFail(corrosion.OpContainerState, err)
+		}
 	}
 
 	ok, decision := restartDecision("", outOfBandDestroyDetail, false, rp.Condition)
@@ -464,11 +508,18 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	}
 	if err := c.runtime.Start(ctx, ct.Name); err != nil {
 		slog.Error("containercheck: restart policy start failed", "container", ct.Name, "error", err)
-		_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "error",
-			"restart policy start failed: "+err.Error())
+		if werr := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "error",
+			"restart policy start failed: "+err.Error()); werr != nil {
+			c.noteStateWriteFail(corrosion.OpContainerState, werr)
+		}
 		return
 	}
-	_ = corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "running", "restart policy: "+decision)
+	if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", "restart policy: "+decision); err != nil {
+		slog.Error("containercheck: restart-policy state write failed — NOT publishing restart event",
+			"container", ct.Name, "error", err)
+		c.noteStateWriteFail(corrosion.OpContainerState, err)
+		return
+	}
 	c.publish("ct.restart.policy", ct.Name,
 		fmt.Sprintf("condition=%s attempt=%d (%s)", rp.Condition, ctAttemptCount(rs)+1, decision))
 }

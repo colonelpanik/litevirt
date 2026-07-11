@@ -110,20 +110,26 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 
 	// Record in DB.
 	now := time.Now().UTC().Format(time.RFC3339)
-	corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
 		Name:      name,
 		Format:    format,
 		Checksum:  got,
 		SizeBytes: total,
 		SourceURL: "import",
-	})
-	corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpImage, err)
+		return status.Errorf(codes.Internal, "record image: %v", err)
+	}
+	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 		ImageName: name,
 		HostName:  s.hostName,
 		Path:      destPath,
 		Status:    "ready",
 		PulledAt:  now,
-	})
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpImageHost, err)
+		return status.Errorf(codes.Internal, "record image host: %v", err)
+	}
 
 	slog.Info("image imported", "name", name, "size", total)
 	return stream.SendAndClose(&pb.ImportImageResponse{
@@ -366,19 +372,25 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 
 	// Record in DB.
 	now := time.Now().UTC().Format(time.RFC3339)
-	corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
 		Name:      req.ImageName,
 		Format:    "qcow2",
 		SourceURL: "build:" + req.VmName,
 		SizeBytes: info.Size(),
-	})
-	corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpImage, err)
+		return nil, status.Errorf(codes.Internal, "record image: %v", err)
+	}
+	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 		ImageName: req.ImageName,
 		HostName:  s.hostName,
 		Path:      destPath,
 		Status:    "ready",
 		PulledAt:  now,
-	})
+	}); err != nil {
+		s.noteStateWriteFail(corrosion.OpImageHost, err)
+		return nil, status.Errorf(codes.Internal, "record image host: %v", err)
+	}
 
 	slog.Info("image built", "name", req.ImageName, "size", info.Size())
 	s.publish("image.built", req.ImageName, "from="+req.VmName)

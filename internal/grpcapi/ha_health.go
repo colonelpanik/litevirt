@@ -7,6 +7,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lb"
+	"github.com/litevirt/litevirt/internal/notify"
 )
 
 // HA-degraded reasons (closed vocabulary for litevirt_ha_degraded{reason}).
@@ -37,6 +38,33 @@ func capabilityDegradedReason(token string, ok bool, reason string) string {
 // transition (a durable, alertable surface — not just a per-refusal counter). Inert on the
 // capability axis until a token is actually flipped (Supported() is empty pre-flip), and on
 // the VIP axis until vip_demote_v1 is enforced.
+// HA notification Kinds (stable — notification routes subscribe to these; see
+// docs/notifications.md). Keep these strings stable across releases.
+const (
+	kindVIPNoHolder         = "ha.vip.no_holder"
+	kindVIPDemotionUnfenced = "ha.vip.demotion_unfenced"
+)
+
+// pageHADegraded routes the alertable VIP HA-degraded reasons to notify (a durable
+// page, not just the event bus + gauge). Other reasons stay gauge+event only.
+func (s *Server) pageHADegraded(ctx context.Context, reason string) {
+	var kind string
+	switch reason {
+	case haVIPNoHolder:
+		kind = kindVIPNoHolder
+	case haDemotionUnfenced:
+		kind = kindVIPDemotionUnfenced
+	default:
+		return
+	}
+	s.notify(ctx, notify.Notification{
+		Kind:     kind,
+		Severity: notify.SevError,
+		Subject:  s.hostName,
+		Detail:   "HA degraded (" + reason + "): a VIP is unheld or a minority demote is unconfirmed — operator action may be required.",
+	})
+}
+
 func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 15 * time.Second
@@ -44,6 +72,12 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 	prev := map[string]bool{}
 	eval := func() {
 		s.driveCapabilityActivation(ctx)
+		// Rollout observability: per-feature config intent + latch state.
+		if s.gate != nil {
+			for _, tok := range capabilities.Supported() {
+				s.haMetrics.SetEnforcement(tok, s.tokenEnabled(tok), s.gate.Latched(tok))
+			}
+		}
 		cur := s.evaluateHADegraded(ctx)
 		for _, r := range haReasons {
 			on := cur[r]
@@ -51,6 +85,7 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 			switch {
 			case on && !prev[r]:
 				s.publish("ha.degraded", r, "HA degraded: "+r)
+				s.pageHADegraded(ctx, r) // route the alertable VIP reasons to notify
 			case !on && prev[r]:
 				s.publish("ha.recovered", r, "")
 			}
@@ -83,8 +118,29 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) {
 	if s.gate == nil {
 		return
 	}
+	// Drive the latch for the tokens this node is configured to enforce (mandatory
+	// split_brain_gate_v1 ∪ config-on optional tokens) — establishing the durable
+	// marker WHILE HEALTHY, so a token whose only decision-site caller is rare/
+	// incident-time (safe_fence, only during a failover) is already latched before a
+	// partition, not first attempted mid-partition when CapabilityActive fails closed.
+	// A config-off token is deliberately NOT driven (advertised ≠ latched ≠
+	// enforcing). Bound the cost: an unlatched token pays a fresh-Ping sweep, so drive
+	// at most ONE unlatched token per cycle (already-latched Enforced() is a cheap
+	// map read); the rest latch over subsequent cycles.
+	drovenUnlatched := false
 	for _, tok := range capabilities.Supported() {
-		s.gate.Enforced(ctx, tok)
+		if !s.tokenEnabled(tok) {
+			continue
+		}
+		if s.gate.Latched(tok) {
+			s.gate.Enforced(ctx, tok) // cheap already-path; keeps the marker persisted
+			continue
+		}
+		if drovenUnlatched {
+			continue
+		}
+		s.gate.Enforced(ctx, tok) // one CapabilityActive fresh-Ping sweep this cycle
+		drovenUnlatched = true
 	}
 }
 
@@ -95,13 +151,22 @@ func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 	out := map[string]bool{}
 	if s.gate != nil {
 		for _, tok := range capabilities.Supported() {
+			// Only a token this node is configured to ENFORCE can be "degraded" —
+			// an advertised-but-disabled token (or one still mid-rollout on old
+			// peers) must not generate haUnsupportedMember noise.
+			if !s.tokenEnabled(tok) {
+				continue
+			}
 			ok, reason := s.gate.CapabilityActiveForHealth(ctx, tok)
 			if r := capabilityDegradedReason(tok, ok, reason); r != "" {
 				out[r] = true
 			}
 		}
 	}
-	if s.vipGateActive(ctx) && s.anyVIPUnheld(ctx) {
+	// vip_no_holder is a real outage whenever VIP HA is active in EITHER direction
+	// (demote-only can leave a VIP holderless), so it keys off vipHAHealthEnabled,
+	// NOT vipGateActive (which is only the proof-reclaim gate).
+	if s.vipHAHealthEnabled() && s.anyVIPUnheld(ctx) {
 		out[haVIPNoHolder] = true
 	}
 	// A minority node whose VIP self-demote FAILED and that has no verified self-fence

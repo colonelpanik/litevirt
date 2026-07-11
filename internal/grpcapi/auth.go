@@ -14,6 +14,9 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -90,6 +93,14 @@ func (s *Server) SetSessionTimeouts(idle, hard time.Duration) {
 		s.sessionHardExpiry = hard
 	}
 }
+
+// bearerlessClientAdmin counts requests authenticated by a bearerless "client"
+// certificate and accepted as admin — the exact population that strict mTLS would
+// DENY. Read it to size the bearer migration before enabling auth.strict_mtls_identity.
+var bearerlessClientAdmin = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "litevirt_auth_bearerless_client_admin_total",
+	Help: "Bearerless client-cert requests accepted as admin (would be denied under strict mTLS).",
+})
 
 // SetStrictMTLSIdentity sets this node's enforcement switch for the strict
 // mTLS-identity model. When true (and the StrictMTLSIdentityV1 gate is active
@@ -192,9 +203,16 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 	// "client" cert is denied once strict-mTLS identity is enforced. A bearer,
 	// when present, always wins and is handled above.
 	kind, cn := s.classifyBearerlessMTLS(ctx)
-	if kind == principalKindClient && s.strictMTLSEnforced(ctx) {
-		return nil, status.Error(codes.Unauthenticated,
-			"client certificate without a session: run `lv login` (strict mTLS identity enforced)")
+	if kind == principalKindClient {
+		if s.strictMTLSEnforced(ctx) {
+			return nil, status.Error(codes.Unauthenticated,
+				"client certificate without a session: run `lv login` (strict mTLS identity enforced)")
+		}
+		// Not enforced yet: this request WOULD be denied under strict mTLS. Count it
+		// (no labels — always the client kind) so operators can size the bearer
+		// migration before flipping auth.strict_mtls_identity: read this at 0 over the
+		// window ⇒ no bearerless client-cert automation remains.
+		bearerlessClientAdmin.Inc()
 	}
 	// Forwarded identity: a trusted peer relaying an entry-authorized user request
 	// carries the user's bearer under FwdBearerMDKey. When enforced, promote to the

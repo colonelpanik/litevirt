@@ -8,42 +8,85 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
-// recordingGate records the tokens Enforced() was called with. Only the methods
-// exercised by driveCapabilityActivation are meaningful; the rest satisfy serverGate.
+// recordingGate records the tokens Enforced() was called with and models the durable
+// latch: once Enforced confirms a token it stays Latched (mirroring health.Checker).
+// Only the methods driveCapabilityActivation exercises are meaningful; the rest come
+// from the embedded fakeServerGate.
 type recordingGate struct {
 	fakeServerGate
 	mu       sync.Mutex
 	enforced []string
+	latched  map[string]bool
 }
 
 func (g *recordingGate) Enforced(_ context.Context, token string) bool {
 	g.mu.Lock()
 	g.enforced = append(g.enforced, token)
+	if g.latched == nil {
+		g.latched = map[string]bool{}
+	}
+	g.latched[token] = true
 	g.mu.Unlock()
 	return true
 }
 
-// TestDriveCapabilityActivation_DrivesEverySupportedToken proves the fix for the
-// lww_skew_guard_v1 activation gap: the HA monitor drives Enforced (the latching path)
-// for every supported token, so a token whose only consumer reads the cheap
-// Latched() still gets its first-time activation driven.
-func TestDriveCapabilityActivation_DrivesEverySupportedToken(t *testing.T) {
-	g := &recordingGate{}
-	s := &Server{gate: g}
-	s.driveCapabilityActivation(context.Background())
-
+func (g *recordingGate) Latched(token string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	got := map[string]bool{}
-	for _, tok := range g.enforced {
-		got[tok] = true
+	return g.latched[token]
+}
+
+func (g *recordingGate) drivenUnique() map[string]bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := map[string]bool{}
+	for _, t := range g.enforced {
+		out[t] = true
 	}
-	for _, want := range capabilities.Supported() {
-		if !got[want] {
-			t.Errorf("Enforced was not driven for supported token %q (activation would never latch)", want)
+	return out
+}
+
+// TestDriveCapabilityActivation_FlagAwareBoundedDriver covers the monitor-as-latch-driver:
+// it drives Enforced (the only latching path) for the mandatory token and any config-on
+// optional token, never for an advertised-but-disabled token, and at most one still-
+// unlatched token per cycle (bounded pre-latch fan-out).
+func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
+	// (a) all flags off → only the mandatory split_brain_gate_v1 is ever driven; a
+	// flag-off advertised token is NEVER driven, so it never latches (advertised ≠
+	// enforcing). Run many cycles to be sure.
+	g := &recordingGate{}
+	s := &Server{gate: g}
+	for i := 0; i < 10; i++ {
+		s.driveCapabilityActivation(context.Background())
+	}
+	got := g.drivenUnique()
+	if !got[capabilities.SplitBrainGateV1] {
+		t.Error("mandatory split_brain_gate_v1 must be driven even with all flags off")
+	}
+	for _, tok := range capabilities.Supported() {
+		if tok == capabilities.SplitBrainGateV1 {
+			continue
+		}
+		if got[tok] {
+			t.Errorf("flag-off token %q was driven — it must not latch until configured-on", tok)
 		}
 	}
-	if len(capabilities.Supported()) > 0 && len(g.enforced) == 0 {
-		t.Fatal("no tokens driven")
+
+	// (b) lww flag on → split_brain (first unlatched in order) latches cycle 1; the
+	// one-unlatched-per-cycle bound means lww latches only by cycle 2.
+	g2 := &recordingGate{}
+	s2 := &Server{gate: g2}
+	s2.SetEnforcementConfig(false /*safeFence*/, true /*lww*/, false /*vipSelfDemote*/, false /*vipProofReclaim*/)
+
+	s2.driveCapabilityActivation(context.Background())
+	if !g2.Latched(capabilities.SplitBrainGateV1) {
+		t.Error("split_brain_gate_v1 should latch on cycle 1")
+	}
+	if g2.Latched(capabilities.LWWSkewGuardV1) {
+		t.Error("lww latched on cycle 1 — the one-unlatched-per-cycle bound was violated")
+	}
+	s2.driveCapabilityActivation(context.Background())
+	if !g2.Latched(capabilities.LWWSkewGuardV1) {
+		t.Error("lww should latch by cycle 2 (one interval per unlatched token)")
 	}
 }

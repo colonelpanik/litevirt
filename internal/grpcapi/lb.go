@@ -881,10 +881,25 @@ type holderStatus struct {
 // "does this build advertise it" check, which would activate the flip on the first rolled
 // node before the cluster can participate. Overridable in tests via s.vipGateFlipped.
 func (s *Server) vipGateActive(ctx context.Context) bool {
+	// Config kill-switch first: proof-reclaim off ⇒ legacy (no break-before-make gate),
+	// regardless of any capability latch.
+	if !s.enfVIPProofReclaim {
+		return false
+	}
+	// vipGateFlipped is a test seam for the CAPABILITY side ONLY — it is still AND-ed
+	// with the config flag above, so a test can't bypass the kill-switch.
 	if s.vipGateFlipped != nil {
 		return s.vipGateFlipped()
 	}
 	return s.gate != nil && s.gate.Enforced(ctx, capabilities.VIPReleaseProbeV1)
+}
+
+// vipHAHealthEnabled reports whether VIP HA is active in EITHER direction. A
+// holderless VIP is an alertable outage whenever self-demote OR proof-reclaim is on
+// (demote-only can leave a VIP holderless), so vip_no_holder keys off this, NOT
+// vipGateActive (which is proof-reclaim only).
+func (s *Server) vipHAHealthEnabled() bool {
+	return s.enfVIPSelfDemote || s.enfVIPProofReclaim
 }
 
 // removedHosts returns the hosts present in old but absent from new — the holders

@@ -117,6 +117,20 @@ storage_pools:
       id: admin
       conf: /etc/ceph/ceph.conf
 
+# Split-brain-family enforcement kill-switches. Each is a per-node on/off for a
+# hardening feature whose capability token the build advertises but does NOT enforce
+# until you opt in. Enforcement = this flag AND the token's cluster-wide latch, so the
+# flag is BOTH the enable and the kill switch: set it false + restart to disable,
+# regardless of any durable latch (never delete marker files). All default false; a
+# fresh deploy changes no behavior. Enable fleet-uniformly for lww_skew_guard (it
+# changes merge behavior) and for vip_* enable the pair together.
+enforcement:
+  safe_fence_default: false   # a best-effort (unconfirmable) fence must carry an operator
+                              # proof (`lv host fence-confirm`) before reschedule/promote
+  lww_skew_guard: false       # quarantine an incoming LWW row >5 min future-skewed (future-skew only)
+  vip_self_demote: false      # a minority node releases its VIPs on sustained quorum loss
+  vip_proof_reclaim: false    # majority refuses a VIP takeover without a release/fence proof
+
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and
 # LDAP realms are loaded into a Registry at startup; `Login` dispatches

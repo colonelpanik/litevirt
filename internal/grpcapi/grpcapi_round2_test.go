@@ -44,6 +44,7 @@ func (g *flipExecGate) CapabilityActiveForHealth(context.Context, string) (bool,
 	return true, ""
 }
 func (g *flipExecGate) Enforced(context.Context, string) bool                   { return true }
+func (g *flipExecGate) Latched(string) bool                                     { return true }
 func (g *flipExecGate) PeerSupportsFresh(context.Context, string, string) bool  { return true }
 func (g *flipExecGate) HealthyPeers(context.Context) []string                   { return nil }
 

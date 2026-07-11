@@ -46,6 +46,7 @@ func (f fakeServerGate) CapabilityActiveForHealth(_ context.Context, token strin
 	return f.enforcedFor(token), ""
 }
 func (f fakeServerGate) Enforced(_ context.Context, token string) bool { return f.enforcedFor(token) }
+func (f fakeServerGate) Latched(token string) bool                     { return f.enforcedFor(token) }
 func (f fakeServerGate) enforcedFor(token string) bool {
 	if f.enforcedTok != nil {
 		return f.enforcedTok[token]

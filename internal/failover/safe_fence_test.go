@@ -37,16 +37,23 @@ func TestSafeFenceRequiresProof(t *testing.T) {
 		t.Error("nil gate must not require proof")
 	}
 	// gate present but token NOT enforced → legacy behavior.
-	notEnforced := &Coordinator{Gate: gateEnforcing()}
+	notEnforced := &Coordinator{SafeFenceEnforce: true, Gate: gateEnforcing()}
 	if notEnforced.safeFenceRequiresProof(ctx, host) {
 		t.Error("token not enforced must not require proof (pre-flip mixed-version safe)")
 	}
-	// token enforced, no opt-out → requires proof.
-	enforced := &Coordinator{Gate: gateEnforcing(capabilities.SafeFenceDefaultV1)}
+	// KILL-SWITCH: config flag OFF but capability latched → still no proof required
+	// (the flag short-circuits the latch, so enforcement can be disabled without a
+	// redeploy or marker deletion).
+	flagOff := &Coordinator{SafeFenceEnforce: false, Gate: gateEnforcing(capabilities.SafeFenceDefaultV1)}
+	if flagOff.safeFenceRequiresProof(ctx, host) {
+		t.Error("config flag off must disable enforcement even when the capability is latched")
+	}
+	// flag ON + token enforced, no opt-out → requires proof.
+	enforced := &Coordinator{SafeFenceEnforce: true, Gate: gateEnforcing(capabilities.SafeFenceDefaultV1)}
 	if !enforced.safeFenceRequiresProof(ctx, host) {
 		t.Error("enforced policy must require proof for a best-effort host")
 	}
-	// token enforced but host opted into legacy proceed-anyway → does not require proof.
+	// flag ON + token enforced but host opted into legacy proceed-anyway → no proof.
 	if enforced.safeFenceRequiresProof(ctx, optOut) {
 		t.Error("unsafe-auto-failover opt-out must restore legacy proceed-anyway")
 	}
@@ -93,6 +100,7 @@ func TestFailover_BestEffort_RefusedUnderPolicy(t *testing.T) {
 	c := NewCoordinator("coordinator", db)
 	c.SetFencer(bestEffortFencer())
 	c.Gate = gateEnforcing(capabilities.SafeFenceDefaultV1)
+	c.SafeFenceEnforce = true
 	fm := newFakeMetrics()
 	c.Metrics = fm
 	c.run(ctx)
@@ -121,6 +129,7 @@ func TestFailover_EmptyAndUnknownStrategy_RefusedUnderPolicy(t *testing.T) {
 			c := NewCoordinator("coordinator", db)
 			c.SetFencer(bestEffortFencer())
 			c.Gate = gateEnforcing(capabilities.SafeFenceDefaultV1)
+			c.SafeFenceEnforce = true
 			fm := newFakeMetrics()
 			c.Metrics = fm
 			c.run(ctx)
@@ -153,6 +162,7 @@ func TestFailover_BestEffort_OptOutProceedsUnderPolicy(t *testing.T) {
 	c := NewCoordinator("coordinator", db)
 	c.SetFencer(bestEffortFencer())
 	c.Gate = gateEnforcing(capabilities.SafeFenceDefaultV1)
+	c.SafeFenceEnforce = true
 	fm := newFakeMetrics()
 	c.Metrics = fm
 	c.run(ctx)

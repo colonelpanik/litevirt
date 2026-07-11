@@ -304,7 +304,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// NOTE: does not address the backward-clock case (NowTS still emits wall-clock) —
 	// that's deferred to a separate conflict-key migration.
 	d.db.SetHLCSkewGuard(func() bool {
-		return d.checker.Latched(capabilities.LWWSkewGuardV1)
+		// Config kill-switch AND the latched capability (the HA monitor drives the
+		// latch while healthy). Latched (not Enforced) keeps this merge-hot-path read
+		// off any peer dial.
+		return d.cfg.Enforcement.LWWSkewGuard && d.checker.Latched(capabilities.LWWSkewGuardV1)
 	})
 	repl.Start(ctx)
 
@@ -456,6 +459,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
+	// Split-brain-family enforcement kill-switches — so the HA monitor drives the
+	// right tokens' latches (mandatory ∪ configured-on) and gates degraded/paging on
+	// config intent. The actual enforcement predicates live on the consumers
+	// (Coordinator, the lww/vip closures above), wired from the same config below.
+	svc.SetEnforcementConfig(
+		d.cfg.Enforcement.SafeFenceDefault,
+		d.cfg.Enforcement.LWWSkewGuard,
+		d.cfg.Enforcement.VIPSelfDemote,
+		d.cfg.Enforcement.VIPProofReclaim,
+	)
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
@@ -545,7 +558,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// flip doesn't activate a lone rolled node before the whole cluster can participate,
 	// but a watchdog-less node still self-demotes (only its failure-handling differs).
 	vipDemoter.SetEnabled(func(ctx context.Context) bool {
-		return d.checker.Enforced(ctx, capabilities.VIPDemoteV1)
+		// Config kill-switch AND the cluster-wide latch (HA monitor drives it while
+		// healthy). Flag false ⇒ never self-demote (legacy: keepalived VRRP handles it).
+		return d.cfg.Enforcement.VIPSelfDemote && d.checker.Enforced(ctx, capabilities.VIPDemoteV1)
 	})
 	vipDemoter.SetRefusedObserver(gateMetrics.Refused)
 	// Surface an unfenced demotion failure (demote failed + no verified self-fence) as a
@@ -704,8 +719,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Promoter = svc // *grpcapi.Server implements failover.ReplicaPromoter
 	fc.Restorer = svc // implements failover.ContainerRestorer (tier-2 relocate-from-backup)
 	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
-	fc.OnFence = svc.NotifyHostFenced         // operator notification on fence (#5)
-	fc.Metrics = metrics.NewFailoverMetrics() // structured failover counters (U9)
+	fc.OnFence = svc.NotifyHostFenced                        // operator notification on fence (#5)
+	fc.Metrics = metrics.NewFailoverMetrics()                // structured failover counters (U9)
+	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault // safe-fence kill-switch (config AND SafeFenceDefaultV1)
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is

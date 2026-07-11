@@ -142,13 +142,31 @@ const (
 // from `supported` stops NEW activation, but Enforced() first honors the durable
 // per-token marker (<dataDir>/split_brain_activated.<token>) and returns true from
 // it before consulting current advertised support — the whole point of the
-// fail-closed latch (a partition mustn't silently re-open the legacy path). So on a
-// data dir where the token was EVER latched, a build with empty `supported` still
-// enforces. To truly stand a latched node down, delete its marker file(s) as well.
-// (This is now LIVE for split_brain_gate_v1: once a node latches it, de-advertising alone
-// won't revert it — delete <dataDir>/split_brain_activated.split_brain_gate_v1 to stand it
-// down. Still inert for the Phase-2 tokens, which no shipped build advertises yet.)
-var supported = []string{SplitBrainGateV1}
+// fail-closed latch (a partition mustn't silently re-open the legacy path).
+//
+// KILL SWITCH (the modern way — DO NOT delete marker files): every flippable token
+// EXCEPT split_brain_gate_v1 is gated `configFlag && Enforced/Latched` at its
+// decision site (auth.strict_mtls_identity/forwarded_identity, and
+// enforcement.{safe_fence_default,lww_skew_guard,vip_self_demote,vip_proof_reclaim}).
+// The config flag is authoritative for enforcement AND recovery: set it false +
+// restart and enforcement stops regardless of the latch marker. Deleting a marker
+// file to "stand down" is retired — it confuses the state machine (the HA monitor
+// re-establishes the latch while the flag is on and the cluster is healthy). Only
+// split_brain_gate_v1 has no config flag; for it, marker deletion remains the sole
+// stand-down (it flips via `supported` alone).
+var supported = []string{
+	SplitBrainGateV1,
+	// Advertised so the cluster can latch these; enforcement stays inert until the
+	// matching config kill-switch is set true (see EnforcementConfig / AuthConfig).
+	// Advertising a token means "this build SUPPORTS the feature", NOT "this node is
+	// currently enforcing it".
+	SafeFenceDefaultV1,
+	LWWSkewGuardV1,
+	VIPDemoteV1,
+	VIPReleaseProbeV1,
+	StrictMTLSIdentityV1,
+	ForwardedIdentityV1,
+}
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable

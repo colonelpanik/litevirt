@@ -50,6 +50,16 @@ type Config struct {
 	// "local" realm is always present and need not be listed.
 	Auth AuthConfig `yaml:"auth"`
 
+	// Enforcement holds the per-node kill-switches for split-brain-family
+	// capability tokens. Each is the enforcement AND kill switch: enforcement is
+	// this flag AND the token's cluster-wide capability latch, so false disables
+	// the behavior regardless of any durable latch marker (flag=false + restart is
+	// the only stand-down — never delete marker files). All default false; the
+	// build still ADVERTISES the tokens (capabilities.supported) so the cluster can
+	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
+	// forwarded-identity switches live under Auth for historical reasons.)
+	Enforcement EnforcementConfig `yaml:"enforcement"`
+
 	// BackupRepos maps a logical repo name (referenced from compose
 	// `vms.<name>.backup.repo:`) to an on-disk path the snapshot
 	// scheduler opens via pbsstore.Open. Daemons not configured to
@@ -232,6 +242,33 @@ type AuthConfig struct {
 	// ForwardedIdentityV1 capability active cluster-wide gate the owner-side
 	// promotion. Default false; the flag is the enforcement + kill switch.
 	ForwardedIdentity bool `yaml:"forwarded_identity,omitempty"`
+}
+
+// EnforcementConfig holds the per-node kill-switches for the split-brain-family
+// capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
+// flag is authoritative for enforcement AND recovery, so false disables the
+// behavior regardless of the durable latch. All default false.
+type EnforcementConfig struct {
+	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
+	// proof-of-power-off before the coordinator reschedules/promotes off the host
+	// (capabilities.SafeFenceDefaultV1). Best-effort-fenced hosts then need
+	// `lv host fence-confirm` (or the per-host unsafe-auto-failover opt-out label)
+	// to auto-recover.
+	SafeFenceDefault bool `yaml:"safe_fence_default,omitempty"`
+	// LWWSkewGuard: quarantine an incoming LWW row whose updated_at is >5 min into
+	// the future when the local copy is not (capabilities.LWWSkewGuardV1). Future-
+	// skew only — the backward-clock case is a separate, deferred token. Changes
+	// merge behavior, so enable fleet-uniformly.
+	LWWSkewGuard bool `yaml:"lww_skew_guard,omitempty"`
+	// VIPSelfDemote: on sustained local quorum loss, a minority node stops
+	// keepalived + releases its VIPs so it can't serve a VIP the majority may bring
+	// up (capabilities.VIPDemoteV1).
+	VIPSelfDemote bool `yaml:"vip_self_demote,omitempty"`
+	// VIPProofReclaim: the majority refuses a VIP move/claim until the prior holder
+	// is proven released (break-before-make), gating majority-side reclaim on a
+	// release/fence proof (capabilities.VIPReleaseProbeV1). Named for the behavior
+	// it gates, not the release-probe RPC (which still serves when this is off).
+	VIPProofReclaim bool `yaml:"vip_proof_reclaim,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

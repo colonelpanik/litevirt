@@ -232,13 +232,15 @@ func TestParticipantReachable_RequiresReleaseProbe(t *testing.T) {
 // release cluster-wide), NOT vip_demote_v1.
 func TestVIPGateActive_KeysOffReleaseProbe(t *testing.T) {
 	ctx := context.Background()
-	demoteOnly := &Server{hostName: "self", gate: fakeServerGate{
+	// Config flag on for both — the point of this test is that vipGateActive keys off
+	// the release-probe CAPABILITY, not vip_demote_v1.
+	demoteOnly := &Server{hostName: "self", enfVIPProofReclaim: true, gate: fakeServerGate{
 		enforcedTok: map[string]bool{capabilities.VIPDemoteV1: true},
 	}}
 	if demoteOnly.vipGateActive(ctx) {
 		t.Fatal("vip_demote_v1 enforced alone must NOT activate the majority takeover gate")
 	}
-	probeEnforced := &Server{hostName: "self", gate: fakeServerGate{
+	probeEnforced := &Server{hostName: "self", enfVIPProofReclaim: true, gate: fakeServerGate{
 		enforcedTok: map[string]bool{capabilities.VIPReleaseProbeV1: true},
 	}}
 	if !probeEnforced.vipGateActive(ctx) {

@@ -189,6 +189,12 @@ func pingUntil(ctx context.Context, client pinger) bool {
 
 // exit terminates the process (overridable in tests).
 func (d *Daemon) exit(code int) {
+	// Flush telemetry (bounded) before an abnormal exit — os.Exit bypasses the
+	// deferred ShutdownTelemetry in Run, so the last spans/logs (e.g. the rollback
+	// itself) would otherwise be lost.
+	if d.flushTelemetry != nil {
+		d.flushTelemetry()
+	}
 	if d.exitFunc != nil {
 		d.exitFunc(code)
 		return

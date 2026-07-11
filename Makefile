@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: all build proto lint test test-fleet test-fleet-race test-fuzz update-golden ci-guards clean
+.PHONY: all build proto lint test test-fleet test-fleet-race test-fuzz test-fuzz-telemetry test-telemetry-mutation update-golden ci-guards clean
 
 UPLOT_VERSION := 1.6.31
 UPLOT_DIR := internal/ui/static/vendor/uplot
@@ -63,6 +63,12 @@ test-fleet:
 test-fleet-race:
 	go test ./tests/fleet/ -count=1 -race
 
+# Mutation-prove telemetry pass-2 guards (clean tree required). Each case
+# breaks one fix, asserts the pinning test goes red, restores. See
+# scripts/ci/telemetry-mutation.sh.
+test-telemetry-mutation:
+	./scripts/ci/telemetry-mutation.sh
+
 # Refresh golden files in place after an intentional rendering change.
 # Inspect the diff before committing.
 update-golden:
@@ -80,6 +86,14 @@ test-fuzz:
 	go test ./internal/firewall/ -run='^$$' -fuzz='^FuzzFromCorrosionRule$$' -fuzztime=$(FUZZTIME)
 	go test ./internal/firewall/ -run='^$$' -fuzz='^FuzzRender$$'            -fuzztime=$(FUZZTIME)
 	go test ./internal/lb/       -run='^$$' -fuzz='^FuzzParseVIP$$'          -fuzztime=$(FUZZTIME)
+	$(MAKE) test-fuzz-telemetry
+
+# Coverage-guided fuzz of telemetry validation (endpoint / sample rate / log redaction).
+# Same family of testing as OSS-Fuzz native Go targets; safe to run on a Mac.
+test-fuzz-telemetry:
+	go test ./internal/obs/ -run='^$$' -fuzz='^FuzzValidEndpoint$$'      -fuzztime=$(FUZZTIME)
+	go test ./internal/obs/ -run='^$$' -fuzz='^FuzzValidSampleRate$$'    -fuzztime=$(FUZZTIME)
+	go test ./internal/obs/ -run='^$$' -fuzz='^FuzzSafeEndpointForLog$$' -fuzztime=$(FUZZTIME)
 
 # CI guardrails (see docs/upgrades.md → CI guardrails):
 #   - schema growth must come with a CurrentSchemaVersion bump (diff-based)

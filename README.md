@@ -117,12 +117,12 @@ detection) — scaling to hundreds of nodes with no master to lose.
 | [Upgrades](docs/upgrades.md) | Pre-flight gates, upgrading state, auto-rollback |
 | [Operating Model](docs/operating-model.md) | Cluster guarantees, recovery playbook |
 | [GPU & PCI Passthrough](docs/pci-passthrough.md) | Device assignment, SR-IOV, hot-plug |
-| [Containers (LXC/OCI)](docs/containers.md) · [REST API](docs/rest-api.md) · [Web UI](docs/ui.md) · [Notifications](docs/notifications.md) | |
+| [Containers (LXC/OCI)](docs/containers.md) · [REST API](docs/rest-api.md) · [Web UI](docs/ui.md) · [Notifications](docs/notifications.md) · [Telemetry](docs/telemetry.md) | |
 
 ## Build & test
 
 ```bash
-make build   # single binary bin/litevirt (~35 MB, static, no CGO) + bin/lv symlink — Go 1.25+
+make build   # single binary bin/litevirt (~35 MB, static, no CGO) + bin/lv symlink — Go 1.26+
 make test
 ```
 

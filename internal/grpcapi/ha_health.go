@@ -20,8 +20,8 @@ const (
 
 var haReasons = []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending}
 
-// capabilityDegradedReason maps a SUPPORTED (flipped) token's CapabilityActive result to
-// an HA-degraded reason, or "" if it's fine. vip_demote_v1 is a software capability (no
+// capabilityDegradedReason maps a configured-to-enforce token's latch state (ok = latched)
+// to an HA-degraded reason, or "" if it's fine. vip_demote_v1 is a software capability (no
 // watchdog gate), so a reachable member that doesn't advertise it is simply on an older
 // binary mid-roll — an unsupported member that holds back enforcement. (The dangerous
 // "demoted but can't self-fence" state is a per-node RUNTIME condition surfaced separately
@@ -35,9 +35,10 @@ func capabilityDegradedReason(token string, ok bool, reason string) string {
 
 // RunHAHealthMonitor periodically evaluates the persistent HA-degraded conditions,
 // updates the litevirt_ha_degraded gauge, and emits an event on each set→clear / clear→set
-// transition (a durable, alertable surface — not just a per-refusal counter). Inert on the
-// capability axis until a token is actually flipped (Supported() is empty pre-flip), and on
-// the VIP axis until vip_demote_v1 is enforced.
+// transition (a durable, alertable surface — not just a per-refusal counter). Quiet by
+// default: a token contributes only when this node is configured to enforce it
+// (tokenEnabled) — advertising a token (Supported()) does not by itself raise degraded —
+// and the VIP axis only when vip_self_demote / vip_proof_reclaim is enabled.
 // HA notification Kinds (stable — notification routes subscribe to these; see
 // docs/notifications.md). Keep these strings stable across releases.
 const (
@@ -144,9 +145,10 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) {
 	}
 }
 
-// evaluateHADegraded computes the currently-degraded reasons. For every SUPPORTED token,
-// an unconfirmed CapabilityActive is a degraded status; when the VIP gate is enforced, a
-// configured VIP that no reachable participant holds is a zero-holder outage.
+// evaluateHADegraded computes the currently-degraded reasons. A configured-to-enforce
+// token that has not latched is degraded (enforcement not yet confirmed cluster-wide);
+// when VIP HA is active, a configured VIP no reachable participant holds is a zero-holder
+// outage.
 func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 	out := map[string]bool{}
 	if s.gate != nil {
@@ -157,8 +159,13 @@ func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 			if !s.tokenEnabled(tok) {
 				continue
 			}
-			ok, reason := s.gate.CapabilityActiveForHealth(ctx, tok)
-			if r := capabilityDegradedReason(tok, ok, reason); r != "" {
+			// Cheap Latched read, NOT CapabilityActiveForHealth: the latter fresh-Pings
+			// on an unlatched token (its 3s neg-cache < the 15s monitor cadence), so
+			// looping it over several unlatched flag-on tokens re-introduces the exact
+			// multi-token fan-out driveCapabilityActivation bounds to one/cycle. The
+			// bounded driver above establishes the latch; here we only READ it. `!Latched`
+			// == "enforcement not yet confirmed cluster-wide" == haUnsupportedMember.
+			if r := capabilityDegradedReason(tok, s.gate.Latched(tok), ""); r != "" {
 				out[r] = true
 			}
 		}

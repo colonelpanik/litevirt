@@ -38,12 +38,23 @@ func (r *fakeBackupReader) Close() error { return nil }
 // fakeBackupSource hands out a full or incremental reader depending on
 // whether a parent checkpoint was supplied, and records what it was asked.
 type fakeBackupSource struct {
-	full         *fakeBackupReader
-	incr         *fakeBackupReader
+	full          *fakeBackupReader
+	incr          *fakeBackupReader
 	lastParentCP  string
 	lastNewCP     string
 	gcKeep        []string
 	lastDeletedCP string
+	deleted       []string // every checkpoint name passed to DeleteCheckpoint, in order
+}
+
+// deletedCheckpoint reports whether name was ever deleted.
+func (s *fakeBackupSource) deletedCheckpoint(name string) bool {
+	for _, n := range s.deleted {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *fakeBackupSource) BeginBackup(domain, diskPath, parentCP, newCP string) (BackupReader, error) {
@@ -59,6 +70,7 @@ func (s *fakeBackupSource) GCCheckpoints(domain, diskName string, keep []string)
 }
 func (s *fakeBackupSource) DeleteCheckpoint(domain, name string) error {
 	s.lastDeletedCP = name
+	s.deleted = append(s.deleted, name)
 	return nil
 }
 

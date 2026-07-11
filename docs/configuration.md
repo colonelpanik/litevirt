@@ -229,7 +229,9 @@ notifications:
 # touch them. Export is OFF until otlp_endpoint is set; with no endpoint the
 # daemon logs locally and attaches no otel handler to any gRPC path (zero cost).
 # The auth secret for the collector belongs in LITEVIRT_OTEL_HEADERS (env), not
-# here. LITEVIRT_* env overrides win over these fields.
+# here. LITEVIRT_* env overrides win over these fields — including for DISABLING:
+# clearing otlp_endpoint here does not turn export off while LITEVIRT_OTEL_ENDPOINT
+# (or OTEL_EXPORTER_OTLP_ENDPOINT) is still set in the daemon's environment.
 telemetry:
   otlp_endpoint: ""                 # OTLP HTTP endpoint URL, e.g. http://otel-collector:4318 (http://|https:// required; empty = export disabled)
   environment: ""                   # service.env label, e.g. "prod"/"homelab"

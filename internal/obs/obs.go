@@ -390,9 +390,13 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	// so the header env vars are no longer needed. Scrub them from the process
 	// environment: otherwise every child the daemon forks (QEMU, libvirt helpers,
 	// hook scripts, gh) inherits the collector credential. Endpoint and other vars
-	// are not secret and stay in place. (The vendor is env-driven, so we can't avoid
-	// putting the header in env for Setup; scrubbing after it is consumed is the
-	// mitigation.)
+	// are not secret and stay in place. (This Setup path is env-driven, so the
+	// header must transit env today; scrubbing after it is consumed is the
+	// mitigation. Vendor v0.5.1 added an in-memory config API — WithConfig — plus
+	// otlptracehttp.WithHeaders, so a follow-up can pass config + credentials
+	// entirely in-memory and retire this env round-trip and scrub. Until then the
+	// pristine-env re-exec in cmd/litevirt/daemon.go depends on this scrub running
+	// AFTER the snapshot is taken there, never before daemon start.)
 	for _, k := range credentialEnvVars {
 		_ = os.Unsetenv(k)
 	}

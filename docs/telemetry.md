@@ -67,13 +67,31 @@ internally.
 The standard `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS` are also
 honored directly if you prefer them.
 
+### Turning export off
+
+The endpoint **is** the switch: with no endpoint resolved, nothing exports, no
+otel handler attaches to any gRPC path, and local logging stays on the stock
+handler. But env wins over config — clearing `telemetry.otlp_endpoint` in
+`config.yaml` does **not** disable export while `LITEVIRT_OTEL_ENDPOINT` (or
+`OTEL_EXPORTER_OTLP_ENDPOINT`) is still set in the daemon's environment, e.g. in
+the systemd unit. To turn export off, clear the config field **and** any
+endpoint env vars, then restart the daemon.
+
 ### Exporter resilience (`LITEVIRT_OTEL_*`)
 
 These bound the OTLP export calls themselves so a **slow or unreachable
-collector** can't stall the daemon. They're off by default (the library sets no
-caps); set them if your collector can be slow or flap. Each knob fans out to both
-active signals (logs **and** traces) — one value tunes the whole export path,
-no per-signal `PROVIDE_EXPORTER_*` fiddling.
+collector** can't stall the daemon. Set them if your collector can be slow or
+flap. Each knob fans out to both active signals (logs **and** traces) — one
+value tunes the whole export path, no per-signal `PROVIDE_EXPORTER_*` fiddling.
+
+When unset, the two signals default **differently**: logs ride the vendor's
+exporter, which sets no caps of its own (unbounded until you set these knobs);
+traces ride an obs-owned exporter (that's what makes `sample_rate` real — see
+below), which falls back to the OTel SDK defaults — ~10s per-export timeout and
+retries capped at about a minute. So an uncapped collector stall can hold a
+**log** export open indefinitely, while a **trace** export self-bounds. Setting
+`LITEVIRT_OTEL_TIMEOUT`/`RETRIES`/`BACKOFF` overrides both signals to the same
+explicit values.
 
 | litevirt env | Purpose | Example |
 |---|---|---|

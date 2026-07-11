@@ -70,10 +70,10 @@ const (
 	// loopback local-root path is never gated — so a mis-flip is reversible and can
 	// never lock out on-node root.
 	//
-	// DARK: in `all` only, NOT `supported` — deploying this build does not advertise
-	// it, so a merge/rollout is fully inert (no activation, no HA-degraded). The flip
-	// is deliberate: add it to `supported` (a release → the fleet advertises it) AND
-	// set auth.strict_mtls_identity; enforcement needs BOTH.
+	// ADVERTISED (in `supported`), enforcement default-off: this build advertises the
+	// token so the cluster can latch it, but enforcement stays inert until an operator
+	// sets auth.strict_mtls_identity — enforcement is config AND the latch, so a deploy
+	// is behavior-neutral and the config flag is the reversible kill switch.
 	StrictMTLSIdentityV1 = "strict_mtls_identity_v1"
 	// ForwardedIdentityV1 gates the owner-side promotion of a forwarded user
 	// identity. An entry node propagates the caller's session bearer to the owning
@@ -85,25 +85,26 @@ const (
 	// yet replicated → Unavailable (retryable), not silent admin. Config-gated
 	// (auth.forwarded_identity) + reversible like StrictMTLSIdentityV1.
 	//
-	// DARK: in `all` only, NOT `supported` (see StrictMTLSIdentityV1) — inert until a
-	// deliberate flip advertises it AND auth.forwarded_identity is set. (The send-side
-	// bearer relay is always on but forward-compatible: with this token dark, no owner
-	// promotes, so the relayed header is ignored.)
+	// ADVERTISED (in `supported`), enforcement default-off (see StrictMTLSIdentityV1) —
+	// inert until auth.forwarded_identity is set. (The send-side bearer relay is always
+	// on but forward-compatible: with enforcement off, no owner promotes, so the relayed
+	// header is ignored.)
 	ForwardedIdentityV1 = "forwarded_identity_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
 // token is added here only once its machinery is fully wired, so cluster-wide
-// activation of a fail-closed check can never precede a node's ability to honor
-// it. (Phase 2 appends the pair VIPDemoteV1 + VIPReleaseProbeV1; Phases 4/5 append the
-// epoch tokens.)
+// activation of a fail-closed check can never precede a node's ability to honor it.
+// (Phases 4/5 will append the epoch tokens.)
 //
-// Phase 1's SplitBrainGateV1 is now ADVERTISED (the Phase-1 flip, validated on an ephemeral
-// partition first); Phase 2's tokens are NOT yet. So Phase-1 enforcement activates once every
-// enforcement-relevant member advertises the token (fresh Ping) and then latches per node,
-// while Phase 2 stays inert (its tokens de-advertised):
+// ALL currently-implemented tokens are now ADVERTISED. SplitBrainGateV1 has no kill
+// switch (it flips via advertisement alone); every OTHER token is gated `configFlag &&
+// latch` (enforcement.* / auth.*), so advertising it is behavior-neutral until an
+// operator sets its flag — the flip is decoupled from enablement. Enforcement of any
+// token still activates only once every enforcement-relevant member advertises it
+// (fresh Ping) and it latches per node.
 //
-//   - Phase 1 (SplitBrainGateV1) — FLIPPED: the composable dangerous-action gate. Machinery +
+//   - Phase 1 (SplitBrainGateV1) — FLIPPED (no config flag): the composable dangerous-action gate. Machinery +
 //     activation-hardening in place and tested — full proof carried+validated for
 //     promote/ApplyLB/restore, relocation token-bound proof, promote crash-idempotent
 //     step resume, token-gated per-peer WAL proof replication PLUS a peer-only
@@ -111,7 +112,8 @@ const (
 //     fresh-Ping the destination before stamping, marker presence forcing BOTH the
 //     ExecutionGate and proof validation at execute sites, and a per-token durable
 //     activation LATCH (partition fails closed, never reverts to legacy).
-//   - Phase 2 (VIPDemoteV1 + VIPReleaseProbeV1) — NOT yet flipped: minority VIP self-demotion + majority
+//   - Phase 2 (VIPDemoteV1 + VIPReleaseProbeV1) — ADVERTISED, enforcement default-off (gated by
+//     enforcement.vip_self_demote / enforcement.vip_proof_reclaim): minority VIP self-demotion + majority
 //     proof-gated reclaim, DECOUPLED from the watchdog. VIPDemoteV1 (minority): an isolated
 //     (quorum-lost) LB host stops keepalived + removes its own VIP address — WITHOUT a
 //     hardware watchdog. VIPReleaseProbeV1 (majority trust): peers reclaim a VIP only on a
@@ -130,10 +132,11 @@ const (
 //     partition (gRPC/gossip healthy but VRRP split) needs a VIP-conflict detector
 //     (Phase-6 follow-up).
 //
-// Each flip is a one-line change: add the token(s) to `supported`. Phase 1 is DONE
-// (SplitBrainGateV1 above); the Phase-2 flip appends VIPDemoteV1 + VIPReleaseProbeV1 after
-// their own ephemeral-partition validation. Once advertised, enforcement activates only
-// after EVERY enforcement-relevant member advertises it (fresh Ping) and then latches.
+// Advertising is done for all implemented tokens; ENABLING each (setting its config
+// flag in prod) is the staged step, gated per token on its own ephemeral-partition
+// validation. Once advertised, enforcement activates only after EVERY
+// enforcement-relevant member advertises it (fresh Ping), it latches, AND the config
+// flag is on.
 // OPERATOR NOTE: with the gate enforced, a 2-worker cluster with NO witness refuses
 // automated failover (even-worker + no-witness blocks HA — deliberate); add a witness or
 // accept the trade-off. Validate on an ephemeral partition before flipping in prod.
@@ -142,13 +145,31 @@ const (
 // from `supported` stops NEW activation, but Enforced() first honors the durable
 // per-token marker (<dataDir>/split_brain_activated.<token>) and returns true from
 // it before consulting current advertised support — the whole point of the
-// fail-closed latch (a partition mustn't silently re-open the legacy path). So on a
-// data dir where the token was EVER latched, a build with empty `supported` still
-// enforces. To truly stand a latched node down, delete its marker file(s) as well.
-// (This is now LIVE for split_brain_gate_v1: once a node latches it, de-advertising alone
-// won't revert it — delete <dataDir>/split_brain_activated.split_brain_gate_v1 to stand it
-// down. Still inert for the Phase-2 tokens, which no shipped build advertises yet.)
-var supported = []string{SplitBrainGateV1}
+// fail-closed latch (a partition mustn't silently re-open the legacy path).
+//
+// KILL SWITCH (the modern way — DO NOT delete marker files): every flippable token
+// EXCEPT split_brain_gate_v1 is gated `configFlag && Enforced/Latched` at its
+// decision site (auth.strict_mtls_identity/forwarded_identity, and
+// enforcement.{safe_fence_default,lww_skew_guard,vip_self_demote,vip_proof_reclaim}).
+// The config flag is authoritative for enforcement AND recovery: set it false +
+// restart and enforcement stops regardless of the latch marker. Deleting a marker
+// file to "stand down" is retired — it confuses the state machine (the HA monitor
+// re-establishes the latch while the flag is on and the cluster is healthy). Only
+// split_brain_gate_v1 has no config flag; for it, marker deletion remains the sole
+// stand-down (it flips via `supported` alone).
+var supported = []string{
+	SplitBrainGateV1,
+	// Advertised so the cluster can latch these; enforcement stays inert until the
+	// matching config kill-switch is set true (see EnforcementConfig / AuthConfig).
+	// Advertising a token means "this build SUPPORTS the feature", NOT "this node is
+	// currently enforcing it".
+	SafeFenceDefaultV1,
+	LWWSkewGuardV1,
+	VIPDemoteV1,
+	VIPReleaseProbeV1,
+	StrictMTLSIdentityV1,
+	ForwardedIdentityV1,
+}
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable

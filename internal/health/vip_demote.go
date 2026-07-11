@@ -149,10 +149,13 @@ func (d *VIPDemoter) Start(ctx context.Context) {
 
 // evaluate is one monitor pass (exported-ish for tests via the same package).
 func (d *VIPDemoter) evaluate(ctx context.Context) {
-	// Inert unless vip_demote_v1 is ENFORCED cluster-wide (built + flipped + latched). A
-	// hardware watchdog is NOT required — self-demotion runs without one; the watchdog
-	// only decides whether a demotion FAILURE self-fences (see the err path below). Ships
-	// dark (token de-advertised) so it's validated on an ephemeral partition first.
+	// Inert unless vip_demote_v1 is ENFORCED cluster-wide (built + latched) AND the
+	// enforcement.vip_self_demote config flag is on — the `enabled` closure is
+	// `flag && Enforced`, so this is behavior-neutral until an operator enables it and
+	// the flag is the reversible kill switch. A hardware watchdog is NOT required —
+	// self-demotion runs without one; the watchdog only decides whether a demotion
+	// FAILURE self-fences (see the err path below). Enable it only after validating on
+	// an ephemeral partition first.
 	if d.gate == nil || d.enabled == nil || !d.enabled(ctx) {
 		return
 	}

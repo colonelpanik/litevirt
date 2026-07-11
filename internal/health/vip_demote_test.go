@@ -55,7 +55,8 @@ func TestVIPDemoter_InertUntilEnabled(t *testing.T) {
 	d, calls, clock := newTestDemoter(g, false, 12*time.Second)
 	calls.held = true
 
-	// Even after a long sustained "No", nothing happens while the token is de-advertised.
+	// Even after a long sustained "No", nothing happens while the `enabled` closure is
+	// false (in prod: enforcement.vip_self_demote off, or the token not yet enforced).
 	d.evaluate(context.Background())
 	*clock = clock.Add(time.Hour)
 	d.evaluate(context.Background())

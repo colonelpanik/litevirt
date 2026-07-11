@@ -98,6 +98,7 @@ func TestAnyStrandedPending(t *testing.T) {
 func TestEvaluateHADegraded_VIPNoHolder(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
+	s.enfVIPProofReclaim = true // vip_no_holder keys off vipHAHealthEnabled (either VIP flag)
 	s.vipGateFlipped = func() bool { return true }
 	s.probeHolder = func(context.Context, string, string) holderStatus {
 		return holderStatus{reachable: true, assigned: false} // reachable, holds nothing

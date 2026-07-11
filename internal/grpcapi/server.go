@@ -78,6 +78,26 @@ type Server struct {
 	// Default false; the flag is the kill switch.
 	forwardedIdentity bool
 
+	// enfSafeFence / enfLWWSkew / enfVIPSelfDemote / enfVIPProofReclaim mirror the
+	// split-brain-family enforcement kill-switches (config.Enforcement) so the HA
+	// monitor can drive the right tokens' latches (mandatory ∪ configured-on) and
+	// gate the degraded/paging contributions on config intent, not mere
+	// advertisement. The actual enforcement predicates live on the consumers
+	// (Coordinator, daemon closures, vipGateActive); the daemon wires both from one
+	// config source. See SetEnforcementConfig / tokenEnabled. All default false.
+	enfSafeFence       bool
+	enfLWWSkew         bool
+	enfVIPSelfDemote   bool
+	enfVIPProofReclaim bool
+
+	// capHealthLast records the most recent bounded freshness-check result per
+	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
+	// monitor detects a POST-latch capability regression (a peer that later stops
+	// advertising) that the one-way durable latch can't reflect. Guarded by capHealthMu.
+	capHealthMu     sync.Mutex
+	capHealthLast   map[string]bool
+	capHealthCursor int
+
 	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
 	// at daemon startup so CreateVM/restore render the same files the capability
 	// label was derived from.
@@ -93,9 +113,10 @@ type Server struct {
 	// state. Production leaves it nil.
 	probeHolder func(ctx context.Context, host, vip string) holderStatus
 
-	// vipGateFlipped is a test seam: when non-nil it overrides the "is vip_demote_v1
-	// advertised by this build" check, so tests can exercise the takeover gate with the
-	// token flipped while the shipped build keeps it de-advertised. Production nil.
+	// vipGateFlipped is a test seam for the CAPABILITY side of vipGateActive only: when
+	// non-nil it overrides the VIPReleaseProbeV1 latch check. It is still AND-ed with the
+	// enforcement.vip_proof_reclaim config flag (see vipGateActive), so a test can't use
+	// it to bypass the kill-switch. Production nil.
 	vipGateFlipped func() bool
 
 	// removeLBFromHost is a test seam for the Phase-2 synchronous stand-down of a removed
@@ -272,6 +293,14 @@ func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced.Store(&fn)
 // advertised by every new-binary node regardless of any hardware watchdog (the decouple:
 // self-demotion runs without one; the watchdog is only an optional self-fence backstop).
 //
+// ADVERTISED MEANS "THIS BINARY SUPPORTS THE FEATURE", NOT "THIS NODE IS ENFORCING IT".
+// With the kill-switch flags, a node advertises a token (so the cluster can latch it)
+// while `enforcement.*` / `auth.*` is false and it does NOT act on it — e.g. it
+// advertises vip_demote_v1 but will not self-demote. Future code MUST NOT read a peer's
+// advertisement (PeerSupportsFresh(VIPDemoteV1), CapabilityActive, …) as proof the peer
+// will self-demote or otherwise enforce; the majority proof path keys on
+// vip_release_probe_v1 + the ground-truth VIPAssigned probe, never on vip_demote_v1.
+//
 // Once this node has SELF-FENCED it advertises NOTHING split-brain-related: it is
 // committed to going down, so it de-advertises immediately rather than presenting as a
 // healthy participant for the fence-timeout window. This is safe (doesn't wrongly free a
@@ -298,6 +327,10 @@ type serverGate interface {
 	// Enforced is the LATCHED enforcement decision — once activated cluster-wide it
 	// stays true even when a fresh Ping can't confirm (partition → fail closed).
 	Enforced(ctx context.Context, token string) bool
+	// Latched is a cheap in-memory read of whether token has already latched (no
+	// Ping). The HA monitor's bounded latch-driver uses it to skip already-latched
+	// tokens so it drives at most one unlatched token per cycle.
+	Latched(token string) bool
 	// PeerSupportsFresh fresh-Pings peer (UNcached) and reports whether it advertises
 	// token — used before stamping/forwarding a proof-bearing action, so a
 	// regressed/replaced target that can't honor the proof is never sent one.
@@ -311,6 +344,42 @@ type serverGate interface {
 
 // SetGate injects the split-brain safety gate.
 func (s *Server) SetGate(g serverGate) { s.gate = g }
+
+// SetEnforcementConfig records the split-brain-family kill-switch flags so the HA
+// monitor drives/gates the right tokens. Wired once from config.Enforcement.
+func (s *Server) SetEnforcementConfig(safeFence, lwwSkew, vipSelfDemote, vipProofReclaim bool) {
+	s.enfSafeFence = safeFence
+	s.enfLWWSkew = lwwSkew
+	s.enfVIPSelfDemote = vipSelfDemote
+	s.enfVIPProofReclaim = vipProofReclaim
+}
+
+// tokenEnabled reports whether this node is configured to ENFORCE token — the
+// single source of "configured-to-enforce" the HA monitor uses to decide which
+// tokens to latch-drive and which may contribute to HA-degraded. split_brain_gate_v1
+// is mandatory (no flag); every other token is gated by its config kill-switch.
+// NOTE: enabled ≠ latched ≠ advertised — advertisement is build-static, latch is
+// cluster confirmation, this is local config intent.
+func (s *Server) tokenEnabled(token string) bool {
+	switch token {
+	case capabilities.SplitBrainGateV1:
+		return true
+	case capabilities.SafeFenceDefaultV1:
+		return s.enfSafeFence
+	case capabilities.LWWSkewGuardV1:
+		return s.enfLWWSkew
+	case capabilities.VIPDemoteV1:
+		return s.enfVIPSelfDemote
+	case capabilities.VIPReleaseProbeV1:
+		return s.enfVIPProofReclaim
+	case capabilities.StrictMTLSIdentityV1:
+		return s.strictMTLSIdentity
+	case capabilities.ForwardedIdentityV1:
+		return s.forwardedIdentity
+	default:
+		return false
+	}
+}
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (s *Server) SetGateRefusedObserver(fn func(action, reason string)) { s.onGateRefused = fn }

@@ -29,8 +29,16 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
 | `replication.failed` | error | a scheduled replication run fails |
+| `ha.vip.no_holder` | error | a configured VIP is served by nobody (VIP HA enabled) — a VIP outage |
+| `ha.vip.demotion_unfenced` | error | a minority node's VIP self-demote failed with no verified self-fence; the majority holds in the safe gap (VIP outage until an operator provides a fence / intervenes) |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
+
+> **Route the `ha.vip.*` kinds if you enable VIP HA** (`enforcement.vip_self_demote` /
+> `enforcement.vip_proof_reclaim`). VIP Phase-2 deliberately converts a partition
+> overlap into a VIP *outage* rather than a dual-VIP — that is only a safe trade if the
+> outage pages. Add a route matching `ha.vip.*` (or `ha.*`) at `error` severity, or a
+> silent VIP gap can go unnoticed. Recovery is `lv host fence-confirm <host>`.
 
 Event-pattern globs: `*` (all), `backup.*` (a prefix), or an exact kind like
 `host.fenced`.

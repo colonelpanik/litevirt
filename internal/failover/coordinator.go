@@ -120,6 +120,12 @@ type Coordinator struct {
 	// requires DecisionGate and writes a durable, single-use runtime_action_proofs
 	// row linked to the VM's pending transition. nil / pre-activation → legacy path.
 	Gate FailoverGate
+	// SafeFenceEnforce is the per-node kill-switch for the safe-fence-default policy
+	// (config.Enforcement.SafeFenceDefault). Enforcement is this flag AND the
+	// SafeFenceDefaultV1 capability latch; the zero value (false) preserves the
+	// legacy proceed-anyway behavior, so a hand-built Coordinator / test is unaffected
+	// until explicitly enabled. Wired by the daemon.
+	SafeFenceEnforce bool
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
@@ -609,7 +615,10 @@ func (c *Coordinator) manualFenceConfirmed(ctx context.Context, host string) boo
 // mixed-version roll. A nil Gate (tests without the split-brain gate wired) is
 // also false — the policy is a strict addition on top of the gate.
 func (c *Coordinator) safeFenceRequiresProof(ctx context.Context, h *corrosion.HostRecord) bool {
-	if c.Gate == nil || !c.Gate.Enforced(ctx, capabilities.SafeFenceDefaultV1) {
+	// Config kill-switch (default false, zero value = legacy) AND the cluster-wide
+	// capability latch. The flag short-circuits the latch, so it can be disabled
+	// without a redeploy or marker deletion.
+	if !c.SafeFenceEnforce || c.Gate == nil || !c.Gate.Enforced(ctx, capabilities.SafeFenceDefaultV1) {
 		return false
 	}
 	return h == nil || h.Labels[corrosion.LabelUnsafeAutoFailover] != "true"

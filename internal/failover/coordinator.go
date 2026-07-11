@@ -16,6 +16,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/placement"
 )
 
@@ -704,6 +705,13 @@ func (c *Coordinator) countLiveHosts(ctx context.Context) (int, error) {
 
 // failover fences the host and reschedules its VMs.
 func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
+	// Named span for the fence+reschedule sequence; the fence RPC and the
+	// per-VM peer relocations hang off it, so an auto-failover is one connected
+	// trace across the coordinator and the target hosts. No-op when tracing off.
+	ctx, span := obs.Span(ctx, "failover.host")
+	span.SetAttribute("host.name", h.Name)
+	defer span.End()
+
 	c.fenced[h.Name] = true
 	// Track whether this fence actually relocates any VM. A fence that moves
 	// nothing (e.g. a spurious fence of a host whose VMs all stayed put) is safe

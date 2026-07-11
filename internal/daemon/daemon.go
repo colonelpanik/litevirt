@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/restapi"
@@ -91,6 +93,22 @@ type Daemon struct {
 	// exitFunc terminates the process on a watchdog rollback. Defaults to os.Exit;
 	// overridable in tests.
 	exitFunc func(int)
+
+	// flushTelemetry flushes OTLP telemetry with a bounded timeout. Assigned
+	// once in Run, BEFORE the upgrade watchdog is armed — the watchdog
+	// goroutine can call exit() before obs.Setup completes, and this field
+	// itself must never be nil/racing when it does. It reads the real
+	// shutdown func from telemetryShutdown rather than closing over it
+	// directly, so it's safe to call at any time. Called by exit() so an
+	// os.Exit path doesn't drop the last spans/logs.
+	flushTelemetry func()
+
+	// telemetryShutdown holds obs.Setup's shutdown func once Setup completes;
+	// nil until then. Written once from Run, read concurrently by
+	// flushTelemetry — which the watchdog goroutine (armed before Setup runs)
+	// can invoke via exit() at any time — so this needs atomic access, not a
+	// plain field. Finding 7.
+	telemetryShutdown atomic.Pointer[func(context.Context) error]
 }
 
 // New creates a new daemon instance.
@@ -147,11 +165,82 @@ func (d *Daemon) markRestarting() {
 	time.Sleep(2 * time.Second)
 }
 
+// telemetryShutdownTimeout bounds every telemetry flush so a wedged collector
+// can't stall daemon shutdown / a rolling upgrade past systemd's TimeoutStopSec.
+const telemetryShutdownTimeout = 2 * time.Second
+
+// armWatchdogThenSetupTelemetry enforces the load-bearing boot order: arm the
+// post-upgrade watchdog FIRST, then run (possibly-blocking) telemetry setup, so a
+// setup that hangs is still caught by the already-armed watchdog. Returns
+// telemetry's shutdown func and setup error. Split out so the ordering invariant
+// is testable without standing up a live daemon.
+func armWatchdogThenSetupTelemetry(
+	armWatchdog func(),
+	setupTelemetry func() (func(context.Context) error, error),
+) (func(context.Context) error, error) {
+	armWatchdog()
+	return setupTelemetry()
+}
+
+// boundedTelemetryShutdown flushes telemetry under a hard timeout. The returned
+// shutdown honors context cancellation, so a slow/unreachable collector can't
+// stall the flush past timeout. Safe with a nil shutdown (no-op).
+func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time.Duration) error {
+	if shutdown == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return shutdown(ctx)
+}
+
 func (d *Daemon) Run(ctx context.Context) error {
-	// Arm the post-upgrade health watchdog FIRST (before any potentially-hanging
-	// init step), and independently, so a boot that hangs before the gRPC server
-	// can serve is still caught. No-op on a normal boot (no sentinel).
-	d.startUpgradeWatchdog(ctx)
+	// Boot order is load-bearing: arm the post-upgrade watchdog FIRST, then run
+	// telemetry setup (which can block on a slow/unreachable collector — production
+	// sets none of the PROVIDE_*_TIMEOUT caps). If setup ran first and hung, a
+	// boot-hang would never roll back. Extracted to a helper so the ordering is
+	// unit-tested without a live daemon (see daemon_telemetry_test.go). Fail-open:
+	// a setup error degrades to local logging and never blocks boot.
+	// Assigned BEFORE the watchdog is armed: startUpgradeWatchdog (below) can
+	// spawn a goroutine that calls exit() while Setup is still running (or
+	// hung), so this field must never be nil/racing at that point. It reads
+	// telemetryShutdown — set at the bottom of this block, once Setup
+	// returns — via atomic.Pointer, so the closure itself is safe to assign
+	// once and call at any time; a call before Setup completes is a safe
+	// no-op instead of a lost-rollback-telemetry bug. Finding 7.
+	d.flushTelemetry = func() {
+		if fn := d.telemetryShutdown.Load(); fn != nil {
+			_ = boundedTelemetryShutdown(*fn, telemetryShutdownTimeout)
+		}
+	}
+	shutdownTelemetry, terr := armWatchdogThenSetupTelemetry(
+		func() { d.startUpgradeWatchdog(ctx) },
+		func() (func(context.Context) error, error) {
+			return obs.Setup(ctx, obs.Config{
+				ServiceName:  "litevirt",
+				Version:      d.cfg.Version,
+				Environment:  d.cfg.Telemetry.Environment,
+				HostName:     d.cfg.HostName,
+				OTLPEndpoint: d.cfg.Telemetry.OTLPEndpoint,
+				SampleRate:   d.cfg.Telemetry.SampleRate,
+				LogLevel:     d.cfg.Telemetry.LogLevel,
+				LogFormat:    d.cfg.Telemetry.LogFormat,
+			})
+		},
+	)
+	if terr != nil {
+		slog.Warn("telemetry setup degraded to local logging", "error", terr)
+	}
+	d.telemetryShutdown.Store(&shutdownTelemetry)
+	// Every telemetry flush is bounded (abnormal os.Exit path and normal defer
+	// alike) so a wedged collector can't stall graceful stop / a rolling upgrade
+	// past systemd's TimeoutStopSec into SIGKILL.
+	defer func() { _ = boundedTelemetryShutdown(shutdownTelemetry, telemetryShutdownTimeout) }()
+	// Wire tracing dial options into every pki.PeerDial caller (including the
+	// corrosion replicator/anti-entropy dials, which pass none of their own —
+	// finding 8), now that obs.Setup has resolved whether tracing is active.
+	// Safe here: replication/anti-entropy start later in this method.
+	pki.SetTraceDialOptions(obs.ClientDialOptions)
 
 	// Pre-flight: refuse to start under a systemd unit that would kill
 	// child QEMU processes on stop. See preflight.go for the rationale.
@@ -785,7 +874,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	rpcMetrics := metrics.NewRPCMetrics()
-	d.grpcSrv = grpc.NewServer(
+	grpcOpts := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
 		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
 		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
@@ -796,7 +885,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// non-chunked paths during/after a mixed-version rollout.
 		grpc.MaxRecvMsgSize(grpcMaxMsgSize),
 		grpc.MaxSendMsgSize(grpcMaxMsgSize),
-	)
+	}
+	// otelgrpc server handler (only when tracing is active): creates a server span
+	// per RPC and extracts inbound W3C trace context, so a peer-mesh call
+	// (migrate/failover/replicate) continues the caller's trace. Empty when off —
+	// no otel in the serve path unless an OTLP endpoint is configured.
+	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
+	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
 	pb.RegisterLiteVirtServer(d.grpcSrv, svc)
 

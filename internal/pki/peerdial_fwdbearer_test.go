@@ -54,3 +54,14 @@ func TestPropagateFwdBearer_NoInboundBearer(t *testing.T) {
 		t.Errorf("propagated fwd-bearer with no authorization header: %v", md.Get(FwdBearerMDKey))
 	}
 }
+
+// Present-but-empty inbound MD (the notifyDetachedContext shape) must not
+// propagate a bearer — empty is not "absent", and a nil-vs-empty confusion
+// here would reintroduce finding 6.
+func TestPropagateFwdBearer_PresentButEmptyIncomingMD(t *testing.T) {
+	in := metadata.NewIncomingContext(context.Background(), metadata.MD{})
+	out := propagateFwdBearer(in)
+	if md, ok := metadata.FromOutgoingContext(out); ok && len(md.Get(FwdBearerMDKey)) != 0 {
+		t.Errorf("propagated fwd-bearer from empty inbound MD: %v", md.Get(FwdBearerMDKey))
+	}
+}

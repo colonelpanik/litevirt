@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"runtime"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -200,6 +201,12 @@ func TestDescribe_AllDescs(t *testing.T) {
 }
 
 func TestCollect_EmitsFDMetric(t *testing.T) {
+	// The daemonOpenFDs metric is emitted only when /proc/self/fd is readable
+	// (server.go), which is Linux-only by design. Skip elsewhere (e.g. darwin
+	// dev boxes) rather than red-fail on a platform the metric never targets.
+	if runtime.GOOS != "linux" {
+		t.Skip("daemonOpenFDs reads /proc/self/fd; Linux-only")
+	}
 	db := testCollectorDB(t)
 	c := newCollector(db, nil, nil, "host-a")
 

@@ -238,6 +238,21 @@ acme:
 notifications:
   default_webhook: ""               # e.g. https://hooks.slack.com/services/…  (empty = none)
 
+# Telemetry: structured logging + distributed tracing over OTLP (see
+# telemetry.md). Metrics stay on Prometheus (metrics_port) — this block does NOT
+# touch them. Export is OFF until otlp_endpoint is set; with no endpoint the
+# daemon logs locally and attaches no otel handler to any gRPC path (zero cost).
+# The auth secret for the collector belongs in LITEVIRT_OTEL_HEADERS (env), not
+# here. LITEVIRT_* env overrides win over these fields — including for DISABLING:
+# clearing otlp_endpoint here does not turn export off while LITEVIRT_OTEL_ENDPOINT
+# (or OTEL_EXPORTER_OTLP_ENDPOINT) is still set in the daemon's environment.
+telemetry:
+  otlp_endpoint: ""                 # OTLP HTTP endpoint URL, e.g. http://otel-collector:4318 (http://|https:// required; empty = export disabled)
+  environment: ""                   # service.env label, e.g. "prod"/"homelab"
+  # sample_rate: 1.0                # trace sampling 0.0–1.0; unset = library default (100%), 0 = disabled
+  log_level: "INFO"                 # TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL
+  log_format: "console"             # json|console|pretty (default console; set json for structured export)
+
 # Peer self-upgrade (auto-catch-up). A lagging daemon pulls a newer *released*
 # binary from a healthy peer and re-execs, so a host that was down during a
 # cluster upgrade converges on its own. Forward-only + release-only: it never
@@ -339,3 +354,14 @@ live cluster.
 | `LV_HOST` | CLI: default remote gRPC/mTLS target (`host` or `host:port`; a legacy `user@host` prefix is ignored) |
 | `LV_TOKEN` | CLI: bearer token to authenticate gRPC calls. Overrides the credential stored by `lv login`. |
 | `LITEVIRT_UNSAFE_NO_KILLMODE_CHECK` | Skip startup `KillMode=process` self-check (development / non-systemd hosts only). Default check protects against unit-file regressions that would kill child QEMU processes on daemon stop. |
+| `LITEVIRT_OTEL_ENDPOINT` | Telemetry: OTLP endpoint; turns logs+traces export on. Overrides `telemetry.otlp_endpoint`. |
+| `LITEVIRT_OTEL_HEADERS` | Telemetry: OTLP headers, e.g. `Authorization=Basic <b64>` (collector auth — keep in env, not the config file). |
+| `LITEVIRT_LOG_LEVEL` | Telemetry: log level `TRACE`\|`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`\|`CRITICAL`. |
+| `LITEVIRT_LOG_FORMAT` | Telemetry: log format `json`\|`console`\|`pretty`. |
+| `LITEVIRT_TELEMETRY_ENV` / `LITEVIRT_TELEMETRY_SERVICE` / `LITEVIRT_TELEMETRY_VERSION` | Telemetry: `service.env` / `service.name` / `service.version` labels. |
+| `LITEVIRT_TRACES_SAMPLE_RATE` | Telemetry: trace sample rate `0.0`–`1.0`. |
+| `LITEVIRT_OTEL_TIMEOUT` / `LITEVIRT_OTEL_RETRIES` / `LITEVIRT_OTEL_BACKOFF` | Telemetry exporter resilience (seconds / count / seconds): bound the OTLP export calls so a slow collector can't stall the daemon. Fan out to logs + traces. Off by default. |
+| `LITEVIRT_OTEL_FAIL_OPEN` | Telemetry: drop on export failure instead of blocking (`true`/`false`). Fans out to logs + traces. |
+| `LITEVIRT_OTEL_SHUTDOWN_TIMEOUT` | Telemetry: drain cap (seconds) on daemon stop; logs signal only. |
+
+See [telemetry.md](telemetry.md) for the full telemetry setup and an OpenObserve quick start.

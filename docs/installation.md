@@ -31,7 +31,7 @@ This produces a single static binary (no CGO, no runtime dependencies):
   `litevirt <cmd>` is the CLI; `litevirt schema-migrate <db>` pre-stages schema.
 - `bin/lv` — a convenience symlink to `litevirt` (so `lv <cmd>` keeps working).
 
-Requires Go 1.25+. Install Go from https://go.dev/dl/ if needed.
+Requires Go 1.26+. Install Go from https://go.dev/dl/ if needed.
 
 ## Standalone single-node setup
 

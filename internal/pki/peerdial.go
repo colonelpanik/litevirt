@@ -3,11 +3,32 @@ package pki
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 )
+
+// traceDialOptions is a hook PeerDial consults to attach tracing dial options
+// (obs.ClientDialOptions) without pki importing obs directly — pki is a
+// zero-internal-import leaf, and importing obs would pull the telemetry
+// vendor into pki's (and corrosion's) dependency closure. Set once at boot,
+// but PeerDial is called concurrently by the replicator and anti-entropy
+// loops, so this needs atomic access, not a plain package var. Finding 8.
+var traceDialOptions atomic.Pointer[func() []grpc.DialOption]
+
+// SetTraceDialOptions installs (or, with nil, clears) the trace-dial-options
+// hook. Call once at boot, after telemetry setup, so every PeerDial caller —
+// including the corrosion replicator/anti-entropy dials, which pass none of
+// their own today — picks up tracing dial options automatically.
+func SetTraceDialOptions(fn func() []grpc.DialOption) {
+	if fn == nil {
+		traceDialOptions.Store(nil)
+		return
+	}
+	traceDialOptions.Store(&fn)
+}
 
 // FwdBearerMDKey is the outgoing metadata key that relays a forwarded user's
 // bearer from an entry node to the owning node. It is deliberately NOT
@@ -59,13 +80,19 @@ func PeerDial(pkiDir, target string, opts ...grpc.DialOption) (*grpc.ClientConn,
 	if err != nil {
 		return nil, fmt.Errorf("peer TLS config: %w", err)
 	}
-	dialOpts := make([]grpc.DialOption, 0, len(opts)+3)
+	dialOpts := make([]grpc.DialOption, 0, len(opts)+4)
 	// Forwarded-identity relay (send-side, always on + forward-compatible): copy
 	// the inbound user bearer onto the peer call under FwdBearerMDKey.
 	dialOpts = append(dialOpts,
 		grpc.WithChainUnaryInterceptor(fwdBearerUnaryInterceptor),
 		grpc.WithChainStreamInterceptor(fwdBearerStreamInterceptor),
 	)
+	// Trace propagation (when the hook is set — tracing active): every
+	// PeerDial caller gets it automatically, including corrosion's
+	// replicator/anti-entropy dials, which pass none of their own.
+	if fn := traceDialOptions.Load(); fn != nil {
+		dialOpts = append(dialOpts, (*fn)()...)
+	}
 	dialOpts = append(dialOpts, opts...)
 	dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
 

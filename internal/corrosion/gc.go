@@ -6,11 +6,18 @@ import (
 	"time"
 )
 
-// secResolution is the 19-char "YYYY-MM-DDTHH:MM:SS" prefix shared by both
-// RFC3339 (created_at) and fixed-width RFC3339Nano (NowTS updated_at). Comparing
-// substr(ts,1,19) avoids the 'Z'-vs-'.' lexical pitfall between the two formats
-// and gives clean second-resolution age comparison — plenty for a GC cutoff.
-const tsSecLayout = "2006-01-02T15:04:05"
+// tsMsSQL returns a SQL expression that yields the wall-clock epoch-milliseconds of a
+// timestamp column/expression in EITHER format: the HLC LWW-key form
+// ("<13-digit-ms>-<logical>-<node>", detected by a 13-digit + '-' prefix via GLOB) uses
+// its physical-ms prefix; otherwise the RFC3339 second-prefix is converted via julianday.
+// Age/GC cutoffs must use this (compared against an epoch-ms bound) rather than a lexical
+// `substr(ts,1,19) < cutoff`, which can't span the RFC3339 and HLC forms — post-hlc_lww
+// an HLC "1752…" sorts below every RFC3339 cutoff and would make every row read as old.
+func tsMsSQL(col string) string {
+	return "(CASE WHEN (" + col + ") GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-*'" +
+		" THEN CAST(substr((" + col + "),1,13) AS INTEGER)" +
+		" ELSE CAST((julianday(substr((" + col + "),1,19))-2440587.5)*86400000 AS INTEGER) END)"
+}
 
 // gcVacuumPages bounds the post-sweep incremental vacuum (mirrors the
 // mutation_log prune). Best-effort: only returns pages to the OS when the DB was
@@ -41,8 +48,8 @@ const gcVacuumPages = 2000
 // copy of one of those could validate/render). Returns per-table delete counts.
 func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanRetention time.Duration) (map[string]int, error) {
 	now := time.Now().UTC()
-	coreCutoff := now.Add(-coreRetention).Format(tsSecLayout)
-	orphanCutoff := now.Add(-orphanRetention).Format(tsSecLayout)
+	coreCutoff := now.Add(-coreRetention).UnixMilli()
+	orphanCutoff := now.Add(-orphanRetention).UnixMilli()
 	counts := map[string]int{}
 
 	sweep := func(table, sql string, args ...interface{}) error {
@@ -54,10 +61,11 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 		return nil
 	}
 
+	rcAge := tsMsSQL("COALESCE(NULLIF(updated_at, ''), created_at)")
 	// recovery_codes — core: superseded set under a live active-set pointer.
 	if err := sweep("recovery_codes",
 		`DELETE FROM recovery_codes -- full-state-delete-ok: superseded set_id, inert (validity gated on the active-set pointer)
-		 WHERE substr(COALESCE(NULLIF(updated_at, ''), created_at), 1, 19) < ?
+		 WHERE `+rcAge+` < ?
 		   AND EXISTS (SELECT 1 FROM recovery_code_sets s
 		               WHERE s.username = recovery_codes.username AND s.deleted_at IS NULL)
 		   AND set_id != (SELECT active_set_id FROM recovery_code_sets s
@@ -68,7 +76,7 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 	// recovery_codes — cautious: orphaned (no live pointer at all).
 	if err := sweep("recovery_codes",
 		`DELETE FROM recovery_codes -- full-state-delete-ok: orphaned (no live active-set pointer); malformed-state cleanup, longer retention
-		 WHERE substr(COALESCE(NULLIF(updated_at, ''), created_at), 1, 19) < ?
+		 WHERE `+rcAge+` < ?
 		   AND NOT EXISTS (SELECT 1 FROM recovery_code_sets s
 		                   WHERE s.username = recovery_codes.username AND s.deleted_at IS NULL)`,
 		orphanCutoff); err != nil {
@@ -79,9 +87,10 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 	// backend's generation (stale generation under a live config, OR a tombstoned
 	// config — the render JOIN gates on cfg.deleted_at IS NULL + matching generation,
 	// so both are inert). Current-generation-under-live-config rows are NOT matched.
+	lbAge := tsMsSQL("updated_at")
 	if err := sweep("lb_backends",
 		`DELETE FROM lb_backends -- full-state-delete-ok: stale generation / tombstoned config, inert (render JOIN gates on live config + matching generation)
-		 WHERE substr(updated_at, 1, 19) < ?
+		 WHERE `+lbAge+` < ?
 		   AND EXISTS (SELECT 1 FROM lb_configs c WHERE c.name = lb_backends.lb_name)
 		   AND NOT EXISTS (SELECT 1 FROM lb_configs c
 		                   WHERE c.name = lb_backends.lb_name
@@ -93,7 +102,7 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 	// lb_backends — cautious: orphaned (no lb_configs row at all).
 	if err := sweep("lb_backends",
 		`DELETE FROM lb_backends -- full-state-delete-ok: orphaned (no lb_configs row); malformed-state cleanup, longer retention
-		 WHERE substr(updated_at, 1, 19) < ?
+		 WHERE `+lbAge+` < ?
 		   AND NOT EXISTS (SELECT 1 FROM lb_configs c WHERE c.name = lb_backends.lb_name)`,
 		orphanCutoff); err != nil {
 		return counts, err
@@ -135,15 +144,16 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 // mutation_log seq) and is left as a separate follow-up; tombstones are tiny and inert until
 // then, and the consumable set — all that gates a runtime action — is already bounded here.
 func ReapSpentProofs(ctx context.Context, c *Client, tombstoneAfter time.Duration) (tombstoned int, err error) {
-	tombstoneCutoff := time.Now().UTC().Add(-tombstoneAfter).Format(tsSecLayout)
-	ts := c.NowTS()
+	tombstoneCutoff := time.Now().UTC().Add(-tombstoneAfter).UnixMilli()
+	ts := c.NowTS()     // updated_at = LWW key
+	wall := c.NowWall() // deleted_at = wall (tombstone marker, never the HLC key)
 	n, err := c.ExecuteRows(ctx,
 		`UPDATE runtime_action_proofs
 		    SET deleted_at = ?, updated_at = ?
 		  WHERE deleted_at IS NULL
 		    AND status IN ('completed','failed')
-		    AND substr(updated_at, 1, 19) < ?`,
-		ts, ts, tombstoneCutoff)
+		    AND `+tsMsSQL("updated_at")+` < ?`,
+		wall, ts, tombstoneCutoff)
 	if err != nil {
 		return 0, fmt.Errorf("tombstone spent proofs: %w", err)
 	}

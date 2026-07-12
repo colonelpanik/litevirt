@@ -80,12 +80,101 @@ const MaxSkewMS int64 = 5 * 60 * 1000
 // Clock is a Hybrid Logical Clock bound to a specific node.
 // It is safe for concurrent use.
 type Clock struct {
-	mu        sync.Mutex
-	nodeID    string
-	lastPhys  int64
-	lastLog   uint16
-	nowFn     func() time.Time // injectable for testing
-	rejected  uint64           // count of timestamps rejected for skew
+	mu       sync.Mutex
+	nodeID   string
+	lastPhys int64
+	lastLog  uint16
+	nowFn    func() time.Time // injectable for testing
+	rejected uint64           // count of timestamps rejected for skew
+
+	// ceilMS is the last durably-persisted physical-ms ceiling; persist commits a
+	// new one ahead of lastPhys so a restart-after-clock-rollback can't regress the
+	// physical high-water (the HLC side of the backward-clock fix). nil persist ⇒
+	// in-memory only (default; unchanged behavior). persistFatal is invoked when the
+	// ceiling can't be durably advanced (see persistAheadLocked) — production exits.
+	ceilMS       int64
+	persist      func(ms int64) error
+	persistFatal func()
+}
+
+const (
+	// hlcPersistAheadMS is how far ahead of the current physical the durable ceiling
+	// is committed, so persistence happens ~once per this interval, not per timestamp.
+	hlcPersistAheadMS int64 = 2000
+	// hlcPersistRetries bounds the in-line retry before failing closed.
+	hlcPersistRetries = 3
+	// hlcMaxLogical is the largest logical value the fixed-width %04d String()/Parse
+	// format can represent. Beyond it a value is unparsable AND sorts wrong, so the
+	// counter spills into physical (see normalizeLogicalLocked).
+	hlcMaxLogical uint16 = 9999
+)
+
+// SetPersistence wires durable persistence of the physical high-water. floorMS raises
+// the clock so it never emits below a previously-persisted physical ms (call at load).
+// persist commits a ceiling AHEAD of the current physical; if it keeps failing, fatal
+// is called (production exits) rather than emit a value beyond the durable ceiling
+// (which would regress on restart) or a clamped duplicate. Nil persist ⇒ in-memory only.
+func (c *Clock) SetPersistence(floorMS int64, persist func(ms int64) error, fatal func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if floorMS > c.lastPhys {
+		c.lastPhys = floorMS
+		c.lastLog = 0
+	}
+	c.ceilMS = floorMS
+	c.persist = persist
+	c.persistFatal = fatal
+}
+
+// PhysicalMS returns the clock's current physical high-water in epoch-ms. Used to
+// bridge the RFC3339 emission path so it never emits below the HLC physical (a safe
+// hlc_lww rollback — see corrosion.Client.NowTS).
+func (c *Clock) PhysicalMS() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastPhys
+}
+
+// normalizeLogicalLocked spills a logical counter that overflowed the 4-digit format
+// into the physical ms, keeping every emitted value parsable and strictly ordered.
+func (c *Clock) normalizeLogicalLocked() {
+	for c.lastLog > hlcMaxLogical {
+		c.lastPhys++
+		c.lastLog -= (hlcMaxLogical + 1)
+	}
+}
+
+// afterAdvanceLocked runs after every Now/Update mutation: normalize a logical overflow
+// (so the value stays parsable + ordered) BEFORE committing the physical ceiling.
+func (c *Clock) afterAdvanceLocked() {
+	c.normalizeLogicalLocked()
+	c.persistAheadLocked()
+}
+
+// persistAheadLocked commits a physical ceiling ahead of lastPhys once it advances past
+// the last committed one. On a persist error it FAILS CLOSED: it retries, then calls
+// persistFatal (production exits) rather than return a value beyond the durable ceiling
+// (a crash would then regress) or a clamped duplicate. Called with c.mu held.
+func (c *Clock) persistAheadLocked() {
+	if c.persist == nil || c.lastPhys <= c.ceilMS {
+		return
+	}
+	newCeil := c.lastPhys + hlcPersistAheadMS
+	for i := 0; i < hlcPersistRetries; i++ {
+		if err := c.persist(newCeil); err == nil {
+			c.ceilMS = newCeil
+			return
+		}
+	}
+	// Fail closed: the ceiling can't be durably advanced.
+	if c.persistFatal != nil {
+		c.persistFatal()
+	}
+	// Only reached in tests (production persistFatal exits): clamp to the durable
+	// ceiling so a returned value isn't beyond what's persisted.
+	if c.lastPhys > c.ceilMS {
+		c.lastPhys = c.ceilMS
+	}
 }
 
 // Rejected returns the cumulative count of remote timestamps rejected for
@@ -118,6 +207,7 @@ func (c *Clock) Now() Timestamp {
 		c.lastLog++
 	}
 
+	c.afterAdvanceLocked()
 	return Timestamp{
 		PhysicalMS: c.lastPhys,
 		Logical:    c.lastLog,
@@ -152,6 +242,7 @@ func (c *Clock) Update(remote Timestamp) Timestamp {
 		} else {
 			c.lastLog++
 		}
+		c.afterAdvanceLocked()
 		return Timestamp{
 			PhysicalMS: c.lastPhys,
 			Logical:    c.lastLog,
@@ -179,6 +270,7 @@ func (c *Clock) Update(remote Timestamp) Timestamp {
 		}
 	}
 
+	c.afterAdvanceLocked()
 	return Timestamp{
 		PhysicalMS: c.lastPhys,
 		Logical:    c.lastLog,

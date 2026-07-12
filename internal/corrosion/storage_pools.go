@@ -198,7 +198,7 @@ func MarkStoragePoolDeleted(ctx context.Context, c *Client, hostName, name strin
 	return c.Execute(ctx,
 		`UPDATE storage_pools SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-		now, now, hostName, name)
+		nowRFC3339(), now, hostName, name)
 }
 
 func scanStoragePool(r Row) StoragePoolRecord {

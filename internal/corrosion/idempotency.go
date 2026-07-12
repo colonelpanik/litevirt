@@ -89,7 +89,7 @@ func ClaimIdempotencyKey(ctx context.Context, c *Client, key, claimID, method, r
 		return c.execLocalRows(ctx,
 			`INSERT INTO idempotency_keys (key, claim_id, method, request_hash, response, status, created_at, updated_at, expires_at)
 			 VALUES (?, ?, ?, ?, '', ?, ?, ?, ?) ON CONFLICT(key) DO NOTHING`,
-			key, claimID, method, reqHash, IdempotencyInProgress, now, now, expiresAt)
+			key, claimID, method, reqHash, IdempotencyInProgress, nowRFC3339(), now, expiresAt) // created_at=wall, updated_at=LWW key
 	}
 	n, err := insert()
 	if err != nil {

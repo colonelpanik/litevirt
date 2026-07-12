@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -68,6 +69,14 @@ type Client struct {
 	clock    *hlc.Clock
 	version  string // local litevirtd binary version, for skew checks
 
+	// dataDir is where the durable monotonic-clock high-water lives
+	// (<dataDir>/nowts.hwm). Empty ⇒ no persistence (in-memory monotonic only:
+	// throwaway/legacy clients with no data dir).
+	dataDir string
+	// nowFn is the wall-clock source behind NowTS, injectable for tests (default
+	// time.Now). The HLC clock has its own nowFn seam.
+	nowFn func() time.Time
+
 	// replicator is notified when new mutations are written to mutation_log.
 	// Set via SetReplicator after construction.
 	replicatorNotify chan struct{}
@@ -93,11 +102,28 @@ type Client struct {
 	// StreamStateDump) are observed too.
 	syncMetrics SyncMetrics
 
-	// tsMu guards lastTS, the monotonic source behind NowTS(). Kept separate from
-	// mu so timestamp generation (called before a write acquires mu) never
-	// contends with or re-enters the main lock.
+	// tsMu guards lastTS + durableTS, the monotonic source behind NowTS(). Kept
+	// separate from mu so timestamp generation (called before a write acquires mu)
+	// never contends with or re-enters the main lock.
 	tsMu   sync.Mutex
 	lastTS time.Time
+	// durableTS is the LWW-key ceiling durably persisted to <dataDir>/nowts.hwm:
+	// NowTS never emits a value beyond it without first persisting a higher one
+	// (persist-ahead), so a restart-after-clock-rollback cannot regress below what
+	// this node already emitted. Zero when there's no dataDir (no persistence).
+	durableTS time.Time
+	// hwm persists the monotonic high-waters (LWW-key + HLC physical). nil ⇒ no
+	// dataDir ⇒ in-memory monotonic only.
+	hwm *hwmStore
+	// durableHLCMS is the HLC physical-ms ceiling persisted to nowts.hwm (paired
+	// with durableTS in the same file). Advanced by the HLC clock's persist hook.
+	// Guarded by tsMu.
+	durableHLCMS int64
+	// onPersistFatal is invoked when NowTS cannot persist a higher ceiling AND has no
+	// headroom left below the durable one (sustained disk-write failure). Production
+	// logs + exits — a node that can't durably advance its LWW clock must not keep
+	// emitting timestamps that could regress on the next restart. Overridable in tests.
+	onPersistFatal func(err error)
 
 	// tieMu guards the equal-timestamp-tie tracking state below. Separate from mu
 	// so the resolver (called while mu is held during a merge) records without
@@ -126,7 +152,20 @@ type Client struct {
 	// skewQuarantined counts rows kept-local by the skew guard, for the metrics
 	// layer (mirrors hlc.Clock.Rejected()). Lock-free.
 	skewQuarantined atomic.Uint64
+
+	// hlcEmit, when non-nil and returning true, makes NowTS emit the LWW conflict key
+	// (updated_at) as an HLC string instead of RFC3339Nano — the backward-clock fix.
+	// Gated on `enforcement.hlc_lww && HLCLwwV1 latched` (injected via SetHLCEmit),
+	// so a mixed-version roll only starts emitting HLC once every node can parse it.
+	// Cheap in-memory read (no ping/I/O) — safe on the per-write path. Nil/false =
+	// legacy RFC3339 emission.
+	hlcEmit func() bool
 }
+
+// SetHLCEmit injects the predicate that switches NowTS to HLC conflict keys. Wired at
+// daemon start to `enforcement.hlc_lww && checker.Latched(HLCLwwV1)`. Nil-safe: an unset
+// predicate keeps legacy RFC3339 emission.
+func (c *Client) SetHLCEmit(fn func() bool) { c.hlcEmit = fn }
 
 // SetHLCSkewGuard injects the predicate that enables LWW future-skew quarantine.
 // Wired at daemon start to the LWWSkewGuardV1 enforcement latch. Nil-safe: an unset
@@ -204,6 +243,33 @@ const nowTSLayout = "2006-01-02T15:04:05.000000000Z07:00"
 // mis-order mixed old/new rows. Only updated_at (the LWW key) uses NowTS.
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// NowWall returns a bare-second RFC3339 UTC wall-clock timestamp for NON-LWW columns
+// (created_at, deleted_at, last_seen, and other *_at display/expiry/age markers). It is
+// the Client-method form of nowRFC3339 for callers outside this package (e.g. the
+// health checker). CRUCIAL vs NowTS: this is NOT the LWW conflict key and NEVER becomes
+// an HLC string, so any column read as wall time — display, age math, GC cutoffs,
+// timeout parsing — MUST use NowWall, not NowTS. (NowTS becomes HLC once hlc_lww is
+// enabled; a wall column stamped with NowTS would then hold an unparseable HLC string.)
+func (c *Client) NowWall() string { return c.now().Format(time.RFC3339) }
+
+const (
+	// nowTSPersistAhead is how far ahead of the last-emitted LWW timestamp we commit
+	// the durable ceiling, so persistence I/O happens ~once per this interval, not per
+	// write. Well under hlc.MaxSkewMS (5 min) so our own slightly-ahead emission is
+	// never skew-quarantined by peers.
+	nowTSPersistAhead = 2 * time.Second
+	// nowTSPersistRetries bounds the in-line retry when crossing the ceiling.
+	nowTSPersistRetries = 3
+)
+
+// now returns the current wall time via the injectable seam (default time.Now).
+func (c *Client) now() time.Time {
+	if c.nowFn != nil {
+		return c.nowFn().UTC()
+	}
+	return time.Now().UTC()
+}
+
 // NowTS returns a strictly-monotonic, fixed-width RFC3339Nano UTC timestamp for
 // this Client. It is the timestamp source for replicated rows' updated_at (the
 // LWW conflict key): two writes from the same node in the same wall-clock
@@ -211,15 +277,147 @@ func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 // host boot sequence) can't produce a last-writer-wins tie that strands the later
 // write on a peer. Per-Client (not a package global) so independent in-process
 // test nodes keep independent clocks. NOT used for HLC physical time.
+//
+// The monotonic high-water is PERSISTED to <dataDir>/nowts.hwm (persist-ahead), so a
+// restart after a wall-clock step-back can't emit an OLDER key than this node already
+// replicated — the backward-clock lost-update. Clients with no dataDir (throwaway
+// tools) keep the in-memory-only monotonic behavior.
+//
+// This is the LWW CONFLICT KEY ONLY: it is destined to emit an HLC string once the
+// hlc_lww migration is enabled, so it must be used ONLY for `updated_at`. Any NON-LWW
+// column (created_at, deleted_at, last_seen, display/age/expiry markers) must use
+// NowWall — a value read as wall time would break when this starts emitting HLC.
 func (c *Client) NowTS() string {
+	// HLC conflict-key emission (gated). The HLC clock is itself monotonic + persisted
+	// (SetPersistence, PR 1A), so it carries the same backward-clock protection; its
+	// physical is current wall-ms, instant-comparable with any RFC3339 key still in
+	// flight (per lwwOrder), so the RFC3339↔HLC switch — and a flag-off rollback — never
+	// regress. Off the RFC3339 persist-ahead path below.
+	if c.hlcEmit != nil && c.clock != nil && c.hlcEmit() {
+		return c.clock.Now().String()
+	}
+	// Bridge floor from the HLC physical high-water — read BEFORE taking tsMu (lock
+	// order: persistHLCCeiling takes tsMu while holding the clock lock, so NowTS must
+	// never acquire the clock lock while holding tsMu). After HLC emission or a
+	// skewed-peer HLC adoption, the HLC physical can be AHEAD of wall; a rollback to
+	// RFC3339 must not emit below it, or a fresh RFC key would sort older than existing
+	// HLC rows and silently lose LWW. Zero when there's no clock.
+	var hlcFloor time.Time
+	if c.clock != nil {
+		hlcFloor = time.UnixMilli(c.clock.PhysicalMS())
+	}
 	c.tsMu.Lock()
 	defer c.tsMu.Unlock()
-	t := time.Now().UTC()
+	t := c.now()
 	if !t.After(c.lastTS) {
 		t = c.lastTS.Add(time.Nanosecond)
 	}
+	// Strictly after the HLC physical instant, so the instant comparator ranks a
+	// rollback RFC key ABOVE an equal-millisecond HLC key (an exact-instant tie goes to
+	// HLC, which would lose the fresh RFC write).
+	if !t.After(hlcFloor) {
+		t = hlcFloor.Add(time.Nanosecond)
+	}
+	if c.hwm != nil && t.After(c.durableTS) {
+		t = c.advanceDurableLWWLocked(t)
+	}
 	c.lastTS = t
 	return t.Format(nowTSLayout)
+}
+
+// advanceDurableLWWLocked commits a new LWW ceiling (t + persist-ahead) BEFORE NowTS
+// returns a value beyond the last durable one, then returns the timestamp NowTS may
+// safely emit. On a persistence failure it FAILS CLOSED: it never returns a value past
+// the last durably-committed ceiling (so a crash can't regress); it uses any headroom
+// left below that ceiling from a prior persist-ahead, and calls onPersistFatal only
+// when headroom is exhausted AND persistence is still failing. Called with tsMu held.
+func (c *Client) advanceDurableLWWLocked(t time.Time) time.Time {
+	newCeil := t.Add(nowTSPersistAhead)
+	var err error
+	for i := 0; i < nowTSPersistRetries; i++ {
+		if err = c.hwm.store(newCeil, c.durableHLCMS); err == nil {
+			c.durableTS = newCeil
+			return t
+		}
+	}
+	slog.Error("nowts: failed to persist monotonic high-water; clamping to durable ceiling (fail-closed)",
+		"error", err, "durable", c.durableTS.Format(nowTSLayout), "want", t.Format(nowTSLayout))
+	if t.After(c.durableTS) {
+		t = c.durableTS
+	}
+	if !t.After(c.lastTS) {
+		// Headroom exhausted AND persistence failing: advancing would exceed the
+		// durable ceiling; not advancing would collide/regress. Refuse.
+		if c.onPersistFatal != nil {
+			c.onPersistFatal(err)
+		}
+		// Only reached in tests (production onPersistFatal exits). Return a
+		// monotonic +1ns so the caller doesn't spin; this is past the durable
+		// ceiling, but the fatal hook has already fired.
+		t = c.lastTS.Add(time.Nanosecond)
+	}
+	return t
+}
+
+// persistHLCCeiling durably records a new HLC physical-ms ceiling (paired with the
+// current LWW ceiling in nowts.hwm). Wired as the HLC clock's persist hook; the clock
+// calls it (under its own lock) when it advances past its last committed ceiling and
+// fails closed if this returns an error. No-op without a dataDir.
+func (c *Client) persistHLCCeiling(ms int64) error {
+	c.tsMu.Lock()
+	defer c.tsMu.Unlock()
+	if c.hwm == nil {
+		return nil
+	}
+	if err := c.hwm.store(c.durableTS, ms); err != nil {
+		return err
+	}
+	c.durableHLCMS = ms
+	return nil
+}
+
+// initClockPersistence loads the persisted high-waters (if a dataDir is set) and wires
+// durable persistence into NowTS + the HLC clock. A corrupt hwm file is a hard error
+// (fail closed + loud) — the caller refuses to start rather than silently reset to
+// wall clock. Sets the default onPersistFatal (exit) unless a test already set one.
+func (c *Client) initClockPersistence() error {
+	if c.nowFn == nil {
+		c.nowFn = time.Now
+	}
+	if c.onPersistFatal == nil {
+		// DELIBERATE fail-closed decision: when the monotonic ceiling can't be
+		// persisted AND the in-memory headroom is exhausted, exit rather than emit an
+		// LWW key below the last durable ceiling (which would silently lose updates
+		// after a restart). Sustained failure (e.g. a full dataDir disk) therefore
+		// crash-loops the daemon — an accepted trade-off: the SQLite state DB lives on
+		// the SAME filesystem, so a full disk already fails authoritative writes; a loud
+		// crash surfaces it instead of silently corrupting LWW ordering. Recovery = free
+		// space (or, as a last resort, delete <dataDir>/nowts.hwm to reset the ceiling,
+		// re-opening the regression window until wall time passes the old ceiling).
+		c.onPersistFatal = func(err error) {
+			slog.Error("nowts: monotonic clock persistence failing and headroom exhausted — exiting to avoid a silent lost update", "error", err)
+			os.Exit(1)
+		}
+	}
+	if c.dataDir == "" {
+		return nil // no persistence (throwaway client)
+	}
+	c.hwm = newHWMStore(c.dataDir)
+	lww, hlcMS, found, err := c.hwm.load()
+	if err != nil {
+		return fmt.Errorf("load monotonic high-water: %w (inspect or remove %s to reset — accepts a monotonicity gap)", err, c.hwm.path)
+	}
+	if found {
+		c.lastTS, c.durableTS, c.durableHLCMS = lww, lww, hlcMS
+	}
+	if c.clock != nil {
+		// The HLC clock shares nowts.hwm; a sustained persist failure there is the same
+		// fail-closed condition as the RFC path, so route its fatal through onPersistFatal.
+		c.clock.SetPersistence(hlcMS, c.persistHLCCeiling, func() {
+			c.onPersistFatal(fmt.Errorf("hlc clock: cannot persist physical ceiling"))
+		})
+	}
+	return nil
 }
 
 // LocalVersion returns the binary version this Client was created with.
@@ -274,8 +472,13 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 		db:               db,
 		hostName:         cfg.HostName,
 		clock:            clock,
+		dataDir:          cfg.DataDir,
 		replicatorNotify: make(chan struct{}, 1),
 		membershipNotify: make(chan struct{}, 1),
+	}
+	if err := c.initClockPersistence(); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	// Set up memberlist (used for membership detection only — no data replication)
@@ -328,12 +531,17 @@ func NewLocalClient(dataDir string, hostName ...string) (*Client, error) {
 	}
 	c := &Client{
 		db:               db,
+		dataDir:          dataDir,
 		replicatorNotify: make(chan struct{}, 1),
 		membershipNotify: make(chan struct{}, 1),
 	}
 	if len(hostName) > 0 && hostName[0] != "" {
 		c.hostName = hostName[0]
 		c.clock = hlc.NewClock(hostName[0])
+	}
+	if err := c.initClockPersistence(); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return c, nil
 }

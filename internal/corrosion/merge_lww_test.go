@@ -27,31 +27,32 @@ func labelVal(t *testing.T, c *Client, host, key string) string {
 	return rows[0].String("value")
 }
 
-// TestMergeLWW_HLCBeatsLegacyRFC3339 is the live-path bug fix: a legacy RFC3339
-// local timestamp sorts lexically ABOVE any HLC ("2099…" > "17…"), so the old
-// shouldSkipMergeLWW would wrongly keep it; the engine now uses localWinsLWW, so
-// the incoming HLC row wins.
+// TestMergeLWW_HLCBeatsLegacyRFC3339 is the live-path check that a FRESH incoming HLC
+// beats a STALE legacy RFC3339 local, even though the RFC3339 string sorts lexically
+// ABOVE any HLC ("2020…" > "17…"). The engine orders by INSTANT (not lexically, and not
+// "HLC always wins"): the current-time HLC is newer than the 2020 RFC3339, so it wins.
 func TestMergeLWW_HLCBeatsLegacyRFC3339(t *testing.T) {
 	c := mustTestClient(t)
 	ctx := context.Background()
 	cols := []string{"name", "address", "ssh_user", "cert_serial", "created_at", "updated_at"}
 
+	// Legacy local timestamp genuinely OLDER than the incoming HLC's instant.
 	if err := c.Execute(ctx,
 		`INSERT INTO hosts (name, address, ssh_user, cert_serial, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
-		"h1", "10.0.0.1", "root", "s1", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z"); err != nil {
+		"h1", "10.0.0.1", "root", "s1", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed host: %v", err)
 	}
 
-	incomingHLC := hlc.NewClock("n2").Now().String()
+	incomingHLC := hlc.NewClock("n2").Now().String() // current time ≫ 2020
 	c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
 		Name:    "hosts",
 		Columns: cols,
-		Rows:    [][]interface{}{{"h1", "10.9.9.9", "root", "s1", "2099-01-01T00:00:00Z", incomingHLC}},
+		Rows:    [][]interface{}{{"h1", "10.9.9.9", "root", "s1", "2020-01-01T00:00:00Z", incomingHLC}},
 	}}})
 
 	if got := hostAddr(t, c, "h1"); got != "10.9.9.9" {
-		t.Errorf("address = %q, want 10.9.9.9 (incoming HLC must beat legacy RFC3339 local)", got)
+		t.Errorf("address = %q, want 10.9.9.9 (fresher incoming HLC must beat stale RFC3339 local)", got)
 	}
 }
 

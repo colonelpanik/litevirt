@@ -128,6 +128,13 @@ enforcement:
   safe_fence_default: false   # a best-effort (unconfirmable) fence must carry an operator
                               # proof (`lv host fence-confirm`) before reschedule/promote
   lww_skew_guard: false       # quarantine an incoming LWW row >5 min future-skewed (future-skew only)
+  hlc_lww: false              # emit HLC conflict keys for updated_at (fixes the backward-clock
+                              # lost-update: a wall-clock step-back can otherwise mint older-sorting
+                              # keys that lose cluster-wide). The persisted monotonic clock
+                              # (nowts.hwm) is ALWAYS on; this flips only the KEY FORMAT and is a
+                              # real kill switch — per-node rollback is safe (the comparator orders
+                              # HLC and RFC3339 by instant). Enable fleet-uniformly, AFTER every
+                              # node is on the build.
   vip_self_demote: false      # a minority node releases its VIPs on sustained quorum loss
   vip_proof_reclaim: false    # majority refuses a VIP takeover without a release/fence proof
   shared_storage_fence: false # a cross-host transfer (auto-promote/reschedule) of a VM with a

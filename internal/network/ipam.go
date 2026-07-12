@@ -198,7 +198,7 @@ func ReleaseIPFor(ctx context.Context, db *corrosion.Client, network, ownerKind,
 	return db.Execute(ctx,
 		`UPDATE ip_allocations SET deleted_at = ?, updated_at = ?
 		 WHERE network = ? AND vm_name = ? AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL`,
-		now, now, network, name, ownerKind, ownerHost)
+		db.NowWall(), now, network, name, ownerKind, ownerHost)
 }
 
 // ReleaseIP is the VM-owner wrapper.

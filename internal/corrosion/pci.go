@@ -123,7 +123,7 @@ func SoftDeletePCIDevice(ctx context.Context, c *Client, hostName, address strin
 	return c.Execute(ctx,
 		`UPDATE host_pci_devices SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND address = ?`,
-		now, now, hostName, address)
+		nowRFC3339(), now, hostName, address)
 }
 
 // GetAvailableDevicesByType returns unassigned devices of a given type on a host.

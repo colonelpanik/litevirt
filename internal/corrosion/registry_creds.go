@@ -34,7 +34,7 @@ func UpsertRegistryCredential(ctx context.Context, c *Client, rc RegistryCredent
 		{
 			SQL: `UPDATE registry_credentials SET deleted_at = ?, updated_at = ?
 			       WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL`,
-			Params: []interface{}{now, now, rc.Scope, rc.Owner, rc.Registry},
+			Params: []interface{}{nowRFC3339(), now, rc.Scope, rc.Owner, rc.Registry},
 		},
 		{
 			SQL: `INSERT INTO registry_credentials
@@ -105,7 +105,7 @@ func DeleteRegistryCredential(ctx context.Context, c *Client, scope, owner, regi
 	if err := c.Execute(ctx,
 		`UPDATE registry_credentials SET deleted_at = ?, updated_at = ?
 		 WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL`,
-		now, now, scope, owner, registry); err != nil {
+		nowRFC3339(), now, scope, owner, registry); err != nil {
 		return false, err
 	}
 	return true, nil

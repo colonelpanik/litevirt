@@ -80,12 +80,58 @@ const MaxSkewMS int64 = 5 * 60 * 1000
 // Clock is a Hybrid Logical Clock bound to a specific node.
 // It is safe for concurrent use.
 type Clock struct {
-	mu        sync.Mutex
-	nodeID    string
-	lastPhys  int64
-	lastLog   uint16
-	nowFn     func() time.Time // injectable for testing
-	rejected  uint64           // count of timestamps rejected for skew
+	mu       sync.Mutex
+	nodeID   string
+	lastPhys int64
+	lastLog  uint16
+	nowFn    func() time.Time // injectable for testing
+	rejected uint64           // count of timestamps rejected for skew
+
+	// ceilMS is the last durably-persisted physical-ms ceiling; persist commits a
+	// new one ahead of lastPhys so a restart-after-clock-rollback can't regress the
+	// physical high-water (the HLC side of the backward-clock fix). nil persist ⇒
+	// in-memory only (default; unchanged behavior).
+	ceilMS  int64
+	persist func(ms int64) error
+}
+
+// hlcPersistAheadMS is how far ahead of the current physical the durable ceiling is
+// committed, so persistence happens ~once per this interval, not per timestamp.
+const hlcPersistAheadMS int64 = 2000
+
+// SetPersistence wires durable persistence of the physical high-water. floorMS raises
+// the clock so it never emits below a previously-persisted physical ms (call at load).
+// persist is invoked (under the clock lock) to commit a ceiling AHEAD of the current
+// physical; a persist error makes the clock fail closed — it will not advance physical
+// past the last committed ceiling. Nil persist ⇒ in-memory only.
+func (c *Clock) SetPersistence(floorMS int64, persist func(ms int64) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if floorMS > c.lastPhys {
+		c.lastPhys = floorMS
+		c.lastLog = 0
+	}
+	c.ceilMS = floorMS
+	c.persist = persist
+}
+
+// persistAheadLocked commits a physical ceiling ahead of lastPhys once it advances past
+// the last committed one. On a persist error it FAILS CLOSED: clamps lastPhys back to
+// the committed ceiling so a crash can't leave an un-persisted-higher physical (a
+// sustained failure of the shared nowts.hwm store is escalated to fatal by the
+// corrosion NowTS path, which uses the same store). Called with c.mu held.
+func (c *Clock) persistAheadLocked() {
+	if c.persist == nil || c.lastPhys <= c.ceilMS {
+		return
+	}
+	newCeil := c.lastPhys + hlcPersistAheadMS
+	if err := c.persist(newCeil); err != nil {
+		if c.lastPhys > c.ceilMS {
+			c.lastPhys = c.ceilMS
+		}
+		return
+	}
+	c.ceilMS = newCeil
 }
 
 // Rejected returns the cumulative count of remote timestamps rejected for
@@ -118,6 +164,7 @@ func (c *Clock) Now() Timestamp {
 		c.lastLog++
 	}
 
+	c.persistAheadLocked()
 	return Timestamp{
 		PhysicalMS: c.lastPhys,
 		Logical:    c.lastLog,
@@ -152,6 +199,7 @@ func (c *Clock) Update(remote Timestamp) Timestamp {
 		} else {
 			c.lastLog++
 		}
+		c.persistAheadLocked()
 		return Timestamp{
 			PhysicalMS: c.lastPhys,
 			Logical:    c.lastLog,
@@ -179,6 +227,7 @@ func (c *Clock) Update(remote Timestamp) Timestamp {
 		}
 	}
 
+	c.persistAheadLocked()
 	return Timestamp{
 		PhysicalMS: c.lastPhys,
 		Logical:    c.lastLog,

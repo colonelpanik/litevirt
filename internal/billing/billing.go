@@ -86,7 +86,12 @@ func (w *WebhookEmitter) Emit(ctx context.Context, e Event) {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now().UTC()
 	}
-	go w.doEmit(ctx, e)
+	// Detach from the caller's context: Emit runs the POST on a goroutine, and the
+	// caller is a gRPC handler whose context the runtime cancels the moment the RPC
+	// returns — a successful CreateVM/DeleteVM would otherwise cancel its own billing
+	// POST. WithoutCancel keeps values (trace) but drops cancellation+deadline; the
+	// POST stays bounded by the emitter's own Client.Timeout.
+	go w.doEmit(context.WithoutCancel(ctx), e)
 }
 
 func (w *WebhookEmitter) doEmit(ctx context.Context, e Event) {
@@ -110,7 +115,7 @@ func (w *WebhookEmitter) doEmit(ctx context.Context, e Event) {
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-			slog.Warn("billing: post failed", "url", w.URL, "kind", e.Kind, "error", err)
+			slog.Error("billing: post failed — event dropped", "url", w.URL, "kind", e.Kind, "error", err)
 			return
 		}
 		resp.Body.Close()
@@ -121,7 +126,7 @@ func (w *WebhookEmitter) doEmit(ctx context.Context, e Event) {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		slog.Warn("billing: non-success status", "url", w.URL, "kind", e.Kind, "status", resp.StatusCode)
+		slog.Error("billing: non-success status — event dropped", "url", w.URL, "kind", e.Kind, "status", resp.StatusCode)
 		return
 	}
 }

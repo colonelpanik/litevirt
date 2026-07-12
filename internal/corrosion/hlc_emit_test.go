@@ -49,3 +49,38 @@ func TestNowTS_HLCEmissionGated(t *testing.T) {
 		t.Fatalf("RFC3339 emitted after HLC (rollback) must be newer by instant: lwwOrder(%q,%q) <= 0", off2, on1)
 	}
 }
+
+// TestNowTS_RollbackBridgesFromHLCPhysical: the hard rollback case. After HLC emission
+// (or a skewed-peer HLC adoption) the HLC physical high-water can be AHEAD of wall. When
+// hlc_lww is turned OFF, a fresh RFC3339 key must NOT sort below existing HLC rows — the
+// RFC path bridges from the HLC physical so a rollback write still wins LWW.
+func TestNowTS_RollbackBridgesFromHLCPhysical(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewLocalClient(dir, "node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Drive the HLC physical an hour AHEAD of wall (simulates post-emission / adoption).
+	// The HLC physical is ms-resolution, so the bridge floor is that ms (an HLC key
+	// carries ns=0), which is what the RFC key must beat.
+	futureMS := time.Now().Add(time.Hour).UnixMilli()
+	floor := time.UnixMilli(futureMS).UTC()
+	c.clock.SetPersistence(futureMS, func(int64) error { return nil }, nil)
+
+	// hlcEmit is off (never set) → RFC3339 path. It must bridge above the HLC physical.
+	rfc := c.NowTS()
+	if hlc.IsHLC(rfc) {
+		t.Fatalf("expected RFC3339 (hlc_lww off), got HLC %q", rfc)
+	}
+	inst := parseTS(t, rfc)
+	if inst.Before(floor) {
+		t.Fatalf("rollback RFC3339 key %s regressed below HLC physical %s — would lose LWW to HLC rows", inst, floor)
+	}
+	// And it strictly beats an HLC key sitting at that physical floor.
+	hlcKey := hlc.Timestamp{PhysicalMS: futureMS, Logical: 0, NodeID: "node-1"}.String()
+	if lwwOrder(rfc, hlcKey) <= 0 {
+		t.Fatalf("rollback RFC3339 %q must beat the HLC key %q at the physical floor", rfc, hlcKey)
+	}
+}

@@ -145,14 +145,15 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 // then, and the consumable set — all that gates a runtime action — is already bounded here.
 func ReapSpentProofs(ctx context.Context, c *Client, tombstoneAfter time.Duration) (tombstoned int, err error) {
 	tombstoneCutoff := time.Now().UTC().Add(-tombstoneAfter).UnixMilli()
-	ts := c.NowTS()
+	ts := c.NowTS()     // updated_at = LWW key
+	wall := c.NowWall() // deleted_at = wall (tombstone marker, never the HLC key)
 	n, err := c.ExecuteRows(ctx,
 		`UPDATE runtime_action_proofs
 		    SET deleted_at = ?, updated_at = ?
 		  WHERE deleted_at IS NULL
 		    AND status IN ('completed','failed')
 		    AND `+tsMsSQL("updated_at")+` < ?`,
-		ts, ts, tombstoneCutoff)
+		wall, ts, tombstoneCutoff)
 	if err != nil {
 		return 0, fmt.Errorf("tombstone spent proofs: %w", err)
 	}

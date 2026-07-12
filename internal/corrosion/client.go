@@ -296,11 +296,27 @@ func (c *Client) NowTS() string {
 	if c.hlcEmit != nil && c.clock != nil && c.hlcEmit() {
 		return c.clock.Now().String()
 	}
+	// Bridge floor from the HLC physical high-water — read BEFORE taking tsMu (lock
+	// order: persistHLCCeiling takes tsMu while holding the clock lock, so NowTS must
+	// never acquire the clock lock while holding tsMu). After HLC emission or a
+	// skewed-peer HLC adoption, the HLC physical can be AHEAD of wall; a rollback to
+	// RFC3339 must not emit below it, or a fresh RFC key would sort older than existing
+	// HLC rows and silently lose LWW. Zero when there's no clock.
+	var hlcFloor time.Time
+	if c.clock != nil {
+		hlcFloor = time.UnixMilli(c.clock.PhysicalMS())
+	}
 	c.tsMu.Lock()
 	defer c.tsMu.Unlock()
 	t := c.now()
 	if !t.After(c.lastTS) {
 		t = c.lastTS.Add(time.Nanosecond)
+	}
+	// Strictly after the HLC physical instant, so the instant comparator ranks a
+	// rollback RFC key ABOVE an equal-millisecond HLC key (an exact-instant tie goes to
+	// HLC, which would lose the fresh RFC write).
+	if !t.After(hlcFloor) {
+		t = hlcFloor.Add(time.Nanosecond)
 	}
 	if c.hwm != nil && t.After(c.durableTS) {
 		t = c.advanceDurableLWWLocked(t)
@@ -386,7 +402,11 @@ func (c *Client) initClockPersistence() error {
 		c.lastTS, c.durableTS, c.durableHLCMS = lww, lww, hlcMS
 	}
 	if c.clock != nil {
-		c.clock.SetPersistence(hlcMS, c.persistHLCCeiling)
+		// The HLC clock shares nowts.hwm; a sustained persist failure there is the same
+		// fail-closed condition as the RFC path, so route its fatal through onPersistFatal.
+		c.clock.SetPersistence(hlcMS, c.persistHLCCeiling, func() {
+			c.onPersistFatal(fmt.Errorf("hlc clock: cannot persist physical ceiling"))
+		})
 	}
 	return nil
 }

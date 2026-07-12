@@ -44,9 +44,9 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 		if r.Int("enabled") == 0 {
 			state = "disabled"
 		}
-		var lbHosts []string
-		if h := r.String("hosts"); h != "" && h != "[]" {
-			json.Unmarshal([]byte(h), &lbHosts)
+		lbHosts, ok := parseHostsJSON(r.String("hosts"))
+		if !ok {
+			slog.Warn("ListLoadBalancers: LB has a corrupt hosts column; surfacing UNKNOWN membership", "lb", r.String("name"))
 		}
 		var ports []*pb.LBPort
 		if p := r.String("ports"); p != "" && p != "[]" {
@@ -297,12 +297,12 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 		state = "disabled"
 	}
 
-	var lbHosts []string
-	if h := r.String("hosts"); h != "" && h != "[]" {
-		json.Unmarshal([]byte(h), &lbHosts)
+	lbHosts, ok := parseHostsJSON(r.String("hosts"))
+	if !ok {
+		slog.Warn("InspectLoadBalancer: LB has a corrupt hosts column; surfacing UNKNOWN membership", "lb", r.String("name"))
 	}
 	if len(lbHosts) == 0 {
-		// Empty hosts: resolve to hosts running VMs in this stack.
+		// Empty (or UNKNOWN) hosts: resolve to hosts running VMs in this stack.
 		if stackName := r.String("stack_name"); stackName != "" {
 			vms, _ := corrosion.ListVMs(ctx, s.db, stackName, "")
 			seen := map[string]bool{}
@@ -1452,6 +1452,17 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			oldHostsStr = string(h)
 		}
 	}
+	// Fail closed on a corrupt stored hosts column BEFORE any mutation. It is the
+	// Phase-2 ownership boundary that the split-brain gate, the local apply, the
+	// remote forward, and the stale-holder cleanup below all read; a value that
+	// won't parse can't be safely acted on, so refuse (delete + recreate is the
+	// remediation). lbHostsUnset ("" / "[]" / "null") is the legacy unowned shape
+	// and parses fine — this rejects only genuinely corrupt JSON. Doing it here (not
+	// at each downstream parse) avoids a partial apply followed by a late refusal.
+	if _, ok := parseHostsJSON(oldHostsStr); !ok {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"lb update refused: stored hosts for %q is corrupt (unparseable) — delete and recreate the load balancer", req.Name)
+	}
 	hostsStr := oldHostsStr
 	if len(req.Hosts) > 0 {
 		h, _ := json.Marshal(req.Hosts)
@@ -1608,8 +1619,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	// holder, and a legacy no-holder row was either repaired to its proven
 	// participant above or the update was refused. So the local apply loop runs on
 	// the holder and the forward loop reaches the rest; no []→self guessing.
-	var lbHosts []string
-	json.Unmarshal([]byte(hostsStr), &lbHosts) //nolint:errcheck
+	lbHosts, _ := parseHostsJSON(hostsStr) // hostsStr validated fail-closed above
 
 	// Apply locally.
 	for _, h := range lbHosts {
@@ -1669,10 +1679,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	// gate ran (active AND an explicit host change) it already stood the removed holders
 	// down (break-before-make); only the ungated path needs it here.
 	if !s.vipGateActive(ctx) {
-		var oldHosts []string
-		if oldHostsStr != "" && oldHostsStr != "[]" {
-			json.Unmarshal([]byte(oldHostsStr), &oldHosts)
-		}
+		oldHosts, _ := parseHostsJSON(oldHostsStr) // oldHostsStr validated fail-closed above
 		s.removeLBFromStaleHosts(ctx, req.Name, oldHosts, lbHosts)
 	}
 
@@ -1705,9 +1712,15 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 		return nil, status.Errorf(codes.NotFound, "load balancer %q not found", req.Name)
 	}
 
-	var lbHosts []string
-	if h := rows[0].String("hosts"); h != "" && h != "[]" {
-		json.Unmarshal([]byte(h), &lbHosts)
+	// Teardown-everywhere on a corrupt hosts column: deletion is the remediation for
+	// a corrupt row, so we NEVER refuse. parseHostsJSON returns ok=false for corrupt;
+	// we then fall through to the all-known-hosts fan-out below (targetHosts empty)
+	// and log the degraded path. A legacy unowned row ("" / "[]" / "null") likewise
+	// yields an empty set and the same all-hosts teardown.
+	lbHosts, ok := parseHostsJSON(rows[0].String("hosts"))
+	if !ok {
+		slog.Warn("DeleteLoadBalancer: corrupt hosts column; tearing down on all known hosts (degraded)", "lb", req.Name)
+		lbHosts = nil
 	}
 
 	// Stop locally.
@@ -1809,9 +1822,10 @@ func (s *Server) forwardLBStats(ctx context.Context, req *pb.LBStatsRequest) *pb
 	if len(rows) == 0 {
 		return nil
 	}
-	var lbHosts []string
-	if h := rows[0].String("hosts"); h != "" && h != "[]" {
-		json.Unmarshal([]byte(h), &lbHosts)
+	lbHosts, ok := parseHostsJSON(rows[0].String("hosts"))
+	if !ok {
+		slog.Warn("forwardLBStats: corrupt hosts column; surfacing UNKNOWN membership", "lb", req.Name)
+		lbHosts = nil
 	}
 	if len(lbHosts) == 0 {
 		// Resolve from stack VM hosts.
@@ -2554,7 +2568,13 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 		slog.Warn("reapplyExplicitLB: parse vip", "lb", cfg.Name, "error", err)
 		return
 	}
-	hosts, _ := parseHostsJSON(cfg.Hosts)
+	hosts, ok := parseHostsJSON(cfg.Hosts)
+	if !ok {
+		// Corrupt hosts column: fail closed — don't reapply. We can't prove this host
+		// is a holder, and guessing could double-serve the VIP.
+		slog.Warn("reapplyExplicitLB: corrupt hosts column; skipping reapply (UNKNOWN membership)", "lb", cfg.Name)
+		return
+	}
 	priority := 50
 	if len(hosts) == 0 || hosts[0] == s.hostName {
 		priority = 100
@@ -2594,9 +2614,12 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 // host in cfg.Hosts, or (when Hosts is empty) a host that has VMs in the LB's
 // stack.
 func (s *Server) lbRunsOnHost(ctx context.Context, cfg corrosion.LBConfigRecord) bool {
-	var hosts []string
-	if !lbHostsUnset(cfg.Hosts) {
-		json.Unmarshal([]byte(cfg.Hosts), &hosts)
+	hosts, ok := parseHostsJSON(cfg.Hosts)
+	if !ok {
+		// Corrupt hosts column: fail closed — this host does NOT claim the LB. A
+		// guessed claim could double-serve the VIP.
+		slog.Warn("lbRunsOnHost: corrupt hosts column; not claiming (UNKNOWN membership)", "lb", cfg.Name)
+		return false
 	}
 	if len(hosts) == 0 {
 		// VM-derived implicit membership is ONLY valid for a stack LB (its holders

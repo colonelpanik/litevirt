@@ -130,6 +130,15 @@ type Coordinator struct {
 	// legacy proceed-anyway behavior, so a hand-built Coordinator / test is unaffected
 	// until explicitly enabled. Wired by the daemon.
 	SafeFenceEnforce bool
+	// SharedStorageFenceEnforce is the per-node kill-switch for the shared-disk
+	// ownership-transfer fence gate (config.Enforcement.SharedStorageFence).
+	// Enforcement is this flag AND the SharedStorageFenceV1 capability latch. When
+	// enforced, the coordinator refuses to CREATE a cross-host transfer of a VM with
+	// a writable shared disk unless it has a proof-grade fence of the old owner
+	// (a non-empty fence_epoch) — failing closed at the SOURCE so a config-skewed or
+	// regressed target can never receive an unfenced shared-disk transfer. Wired by
+	// the daemon.
+	SharedStorageFenceEnforce bool
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
@@ -628,6 +637,14 @@ func (c *Coordinator) safeFenceRequiresProof(ctx context.Context, h *corrosion.H
 	return h == nil || h.Labels[corrosion.LabelUnsafeAutoFailover] != "true"
 }
 
+// sharedStorageFenceEnforced reports whether this coordinator enforces the
+// shared-disk ownership-transfer fence gate: the config kill-switch AND the
+// SharedStorageFenceV1 cluster-wide latch. Mirrors safeFenceRequiresProof's
+// flag-short-circuits-latch model — a nil Gate (tests) is not enforcing.
+func (c *Coordinator) sharedStorageFenceEnforced(ctx context.Context) bool {
+	return c.SharedStorageFenceEnforce && c.Gate != nil && c.Gate.Enforced(ctx, capabilities.SharedStorageFenceV1)
+}
+
 // fenceWithinWindow reports whether host has a fencing_log row with an accepted
 // result newer than now-recentFenceWindow. manualOnly restricts the accepted
 // result to "manual-confirmed".
@@ -919,6 +936,28 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			})
 			c.mVM(ActionReschedule, ResultSkipped, ErrFirmwareState)
 			continue
+		}
+
+		// Shared-disk split-brain gate (decide site): if this coordinator enforces
+		// the shared-storage fence and the VM has a writable shared disk, a cross-host
+		// transfer needs a PROOF-GRADE fence of the old owner. fenceEpoch is non-empty
+		// ONLY when proofGradeFenceRef found one (IPMI / manual-confirmed); a
+		// best-effort fence yields "". Refuse to CREATE the transfer (auto-promote OR
+		// reschedule) at the SOURCE when there's no proof-grade fence — so a
+		// config-skewed / regressed target can never receive (and ungated-start) a
+		// shared-disk transfer lacking a proven power-off. When a proof-grade fence
+		// DOES exist the transfer proceeds and even an unenforcing target starts
+		// safely (the owner is provably down). The executor re-verifies as
+		// defense-in-depth. Operator remediation: `lv host fence-confirm` (or an IPMI
+		// fence strategy) makes fenceEpoch proof-grade on the next cycle.
+		if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) {
+			if disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name); derr == nil && corrosion.VMHasWritableSharedDisk(disks) {
+				slog.Error("failover: shared-disk VM transfer refused — no proof-grade fence of old owner (storage_unverified); run 'lv host fence-confirm' or set an IPMI fence strategy",
+					"vm", vm.Name, "old_owner", h.Name)
+				c.noteGateRefused(corrosion.ActionReschedule, health.ReasonStorageUnverified)
+				c.mVM(ActionReschedule, ResultError, ErrStorageUnverified)
+				continue
+			}
 		}
 
 		// Auto-promotion is an explicit per-schedule DR opt-in, so it takes

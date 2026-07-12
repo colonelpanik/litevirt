@@ -812,9 +812,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Promoter = svc // *grpcapi.Server implements failover.ReplicaPromoter
 	fc.Restorer = svc // implements failover.ContainerRestorer (tier-2 relocate-from-backup)
 	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
-	fc.OnFence = svc.NotifyHostFenced                        // operator notification on fence (#5)
-	fc.Metrics = metrics.NewFailoverMetrics()                // structured failover counters (U9)
-	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault // safe-fence kill-switch (config AND SafeFenceDefaultV1)
+	fc.OnFence = svc.NotifyHostFenced                                   // operator notification on fence (#5)
+	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
+	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
+	fc.SharedStorageFenceEnforce = d.cfg.Enforcement.SharedStorageFence // decide-side shared-disk fence kill-switch (config AND SharedStorageFenceV1)
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is

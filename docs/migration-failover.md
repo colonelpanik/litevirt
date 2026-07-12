@@ -171,6 +171,14 @@ stale `fenced` host state). If the proof reference hasn't replicated to the exec
 yet the transfer retries on the next cycle; a missing or non-proof-grade fence is
 refused with the `storage_unverified` reason.
 
+Enforcement is fail-closed at **both** ends. The coordinator refuses to *create* a
+shared-disk transfer at the source when it has no proof-grade fence (a best-effort
+fence yields an empty `fence_epoch`), so a target that is a mixed-rollout laggard
+(has the capability but not yet the config flag) or a regressed binary can never
+receive an *unfenced* shared-disk transfer. When a proof-grade fence does exist the
+owner is provably powered off, so the transfer is safe even if the target hasn't
+enabled the flag. The executor re-verifies as defense-in-depth.
+
 This is **host-fence-gated shared storage, not storage-level exclusivity** — litevirt
 does not (yet) take storage-side locks (RBD blocklist, iSCSI PR keys). It is a
 config kill-switch (`enforcement.shared_storage_fence`, default off) plus the

@@ -400,6 +400,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// off any peer dial.
 		return d.cfg.Enforcement.LWWSkewGuard && d.checker.Latched(capabilities.LWWSkewGuardV1)
 	})
+	// Emit the LWW conflict key (updated_at) as HLC instead of RFC3339Nano once
+	// enforcement.hlc_lww is set AND the token has latched cluster-wide (the HA monitor
+	// drives the latch while healthy). Cheap Latched read on the per-write path; the
+	// instant-based comparator makes the RFC3339↔HLC switch and a flag-off rollback safe.
+	d.db.SetHLCEmit(func() bool {
+		return d.cfg.Enforcement.HLCLww && d.checker.Latched(capabilities.HLCLwwV1)
+	})
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
@@ -557,6 +564,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetEnforcementConfig(
 		d.cfg.Enforcement.SafeFenceDefault,
 		d.cfg.Enforcement.LWWSkewGuard,
+		d.cfg.Enforcement.HLCLww,
 		d.cfg.Enforcement.VIPSelfDemote,
 		d.cfg.Enforcement.VIPProofReclaim,
 	)

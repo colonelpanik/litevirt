@@ -152,7 +152,20 @@ type Client struct {
 	// skewQuarantined counts rows kept-local by the skew guard, for the metrics
 	// layer (mirrors hlc.Clock.Rejected()). Lock-free.
 	skewQuarantined atomic.Uint64
+
+	// hlcEmit, when non-nil and returning true, makes NowTS emit the LWW conflict key
+	// (updated_at) as an HLC string instead of RFC3339Nano — the backward-clock fix.
+	// Gated on `enforcement.hlc_lww && HLCLwwV1 latched` (injected via SetHLCEmit),
+	// so a mixed-version roll only starts emitting HLC once every node can parse it.
+	// Cheap in-memory read (no ping/I/O) — safe on the per-write path. Nil/false =
+	// legacy RFC3339 emission.
+	hlcEmit func() bool
 }
+
+// SetHLCEmit injects the predicate that switches NowTS to HLC conflict keys. Wired at
+// daemon start to `enforcement.hlc_lww && checker.Latched(HLCLwwV1)`. Nil-safe: an unset
+// predicate keeps legacy RFC3339 emission.
+func (c *Client) SetHLCEmit(fn func() bool) { c.hlcEmit = fn }
 
 // SetHLCSkewGuard injects the predicate that enables LWW future-skew quarantine.
 // Wired at daemon start to the LWWSkewGuardV1 enforcement latch. Nil-safe: an unset
@@ -275,6 +288,14 @@ func (c *Client) now() time.Time {
 // column (created_at, deleted_at, last_seen, display/age/expiry markers) must use
 // NowWall — a value read as wall time would break when this starts emitting HLC.
 func (c *Client) NowTS() string {
+	// HLC conflict-key emission (gated). The HLC clock is itself monotonic + persisted
+	// (SetPersistence, PR 1A), so it carries the same backward-clock protection; its
+	// physical is current wall-ms, instant-comparable with any RFC3339 key still in
+	// flight (per lwwOrder), so the RFC3339↔HLC switch — and a flag-off rollback — never
+	// regress. Off the RFC3339 persist-ahead path below.
+	if c.hlcEmit != nil && c.clock != nil && c.hlcEmit() {
+		return c.clock.Now().String()
+	}
 	c.tsMu.Lock()
 	defer c.tsMu.Unlock()
 	t := c.now()

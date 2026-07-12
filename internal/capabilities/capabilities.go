@@ -50,15 +50,24 @@ const (
 	// fast-clock peer can't dominate last-writer-wins. Gated because a mixed-version
 	// cluster must not start quarantining before every node enforces it.
 	//
-	// SCOPE — this is NOT a full HLC LWW fix. updated_at is STILL stamped from
-	// per-process wall-clock RFC3339 (see corrosion.Client.NowTS), so this token does
-	// NOT address the BACKWARD-clock case (a restart after a wall-clock step-back can
-	// still emit older conflict keys → lost updates). Do not flip this thinking
-	// split-brain item 2 is fully solved. The remaining work — persist the monotonic
-	// timestamp high-water and/or emit HLC (a separately-validated conflict-key
-	// migration) — is deliberately deferred to its own token, so this one is named for
-	// exactly what it does (skew guard), leaving "hlc_lww_v1" free for the real flip.
+	// SCOPE — this is NOT a full HLC LWW fix. It only guards FUTURE skew; the
+	// backward-clock case (a restart after a wall-clock step-back emitting older
+	// conflict keys) is addressed separately: the monotonic-high-water persistence
+	// (always-on) plus HLCLwwV1 below, which flips the conflict-key ENCODING to HLC.
 	LWWSkewGuardV1 = "lww_skew_guard_v1"
+	// HLCLwwV1 gates emitting the LWW conflict key (updated_at, via Client.NowTS) as
+	// an HLC string instead of RFC3339Nano — the real backward-clock fix: an HLC key
+	// carries a monotonic (physical-ms, logical, node-id) rank that a wall-clock
+	// step-back can't undercut, and it breaks cross-node equal-instant ties
+	// deterministically by node-id (killing the keep-local infinite-resync tie class).
+	// Gated + config-flagged (enforcement.hlc_lww) because it changes the conflict-key
+	// encoding: emission activates only once every node ADVERTISES the token (so every
+	// receiver's lwwOrder can parse+instant-compare HLC — shipped ahead of emission)
+	// AND the local flag is set AND the token has latched. The comparator is
+	// instant-based, so a per-node canary and a flag-off rollback are both safe (a
+	// fresh RFC3339 write never loses to an older HLC one). NOT a full clock rewrite:
+	// updated_at is the only column that becomes HLC; wall/display columns keep RFC3339.
+	HLCLwwV1 = "hlc_lww_v1"
 	// StrictMTLSIdentityV1 gates the strict mTLS-identity auth model: a bearerless
 	// client certificate (a distributable lv-cli cert, an unknown/empty CN, or a
 	// removed host's CN) is no longer treated as admin — it must present a session
@@ -165,6 +174,7 @@ var supported = []string{
 	// currently enforcing it".
 	SafeFenceDefaultV1,
 	LWWSkewGuardV1,
+	HLCLwwV1,
 	VIPDemoteV1,
 	VIPReleaseProbeV1,
 	StrictMTLSIdentityV1,
@@ -174,7 +184,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, StrictMTLSIdentityV1, ForwardedIdentityV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

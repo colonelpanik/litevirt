@@ -192,11 +192,11 @@ type Config struct {
 // environment contract (see internal/obs). Every field is optional; an empty
 // OTLPEndpoint leaves OTLP export off (local structured logging only).
 type TelemetryConfig struct {
-	OTLPEndpoint string  `yaml:"otlp_endpoint,omitempty"` // OTLP HTTP endpoint URL, e.g. "http://otel-collector:4318"; http://|https://, no URL userinfo (use LITEVIRT_OTEL_HEADERS for auth); empty = export disabled
-	Environment  string  `yaml:"environment,omitempty"`   // deployment env label, e.g. "prod"/"homelab"
-	SampleRate   *float64 `yaml:"sample_rate,omitempty"`  // trace sample rate 0.0–1.0; unset = library default (100%), 0 = disabled (0%)
-	LogLevel     string  `yaml:"log_level,omitempty"`     // TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO; note WARNING, not WARN)
-	LogFormat    string  `yaml:"log_format,omitempty"`    // json|console|pretty (default console — human text; set json for structured export)
+	OTLPEndpoint string   `yaml:"otlp_endpoint,omitempty"` // OTLP HTTP endpoint URL, e.g. "http://otel-collector:4318"; http://|https://, no URL userinfo (use LITEVIRT_OTEL_HEADERS for auth); empty = export disabled
+	Environment  string   `yaml:"environment,omitempty"`   // deployment env label, e.g. "prod"/"homelab"
+	SampleRate   *float64 `yaml:"sample_rate,omitempty"`   // trace sample rate 0.0–1.0; unset = library default (100%), 0 = disabled (0%)
+	LogLevel     string   `yaml:"log_level,omitempty"`     // TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO; note WARNING, not WARN)
+	LogFormat    string   `yaml:"log_format,omitempty"`    // json|console|pretty (default console — human text; set json for structured export)
 }
 
 // ACMEConfig configures autocert for the web UI (#13). directory_url points at
@@ -283,6 +283,11 @@ type EnforcementConfig struct {
 	// skew only — the backward-clock case is a separate, deferred token. Changes
 	// merge behavior, so enable fleet-uniformly.
 	LWWSkewGuard bool `yaml:"lww_skew_guard,omitempty"`
+	// HLCLww: emit the LWW conflict key (updated_at) as an HLC string instead of
+	// RFC3339Nano (capabilities.HLCLwwV1) — the backward-clock fix. Emission activates
+	// only when this flag is set AND the token has latched cluster-wide; the comparator
+	// is instant-based so a per-node canary and a flag-off rollback are both safe.
+	HLCLww bool `yaml:"hlc_lww,omitempty"`
 	// VIPSelfDemote: on sustained local quorum loss, a minority node stops
 	// keepalived + releases its VIPs so it can't serve a VIP the majority may bring
 	// up (capabilities.VIPDemoteV1).

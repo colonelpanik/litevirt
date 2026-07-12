@@ -87,6 +87,7 @@ type Server struct {
 	// config source. See SetEnforcementConfig / tokenEnabled. All default false.
 	enfSafeFence       bool
 	enfLWWSkew         bool
+	enfHLCLww          bool
 	enfVIPSelfDemote   bool
 	enfVIPProofReclaim bool
 
@@ -347,9 +348,10 @@ func (s *Server) SetGate(g serverGate) { s.gate = g }
 
 // SetEnforcementConfig records the split-brain-family kill-switch flags so the HA
 // monitor drives/gates the right tokens. Wired once from config.Enforcement.
-func (s *Server) SetEnforcementConfig(safeFence, lwwSkew, vipSelfDemote, vipProofReclaim bool) {
+func (s *Server) SetEnforcementConfig(safeFence, lwwSkew, hlcLww, vipSelfDemote, vipProofReclaim bool) {
 	s.enfSafeFence = safeFence
 	s.enfLWWSkew = lwwSkew
+	s.enfHLCLww = hlcLww
 	s.enfVIPSelfDemote = vipSelfDemote
 	s.enfVIPProofReclaim = vipProofReclaim
 }
@@ -368,6 +370,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfSafeFence
 	case capabilities.LWWSkewGuardV1:
 		return s.enfLWWSkew
+	case capabilities.HLCLwwV1:
+		return s.enfHLCLww
 	case capabilities.VIPDemoteV1:
 		return s.enfVIPSelfDemote
 	case capabilities.VIPReleaseProbeV1:

@@ -76,7 +76,7 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 	// one-unlatched-per-cycle bound means lww latches only by cycle 2.
 	g2 := &recordingGate{}
 	s2 := &Server{gate: g2}
-	s2.SetEnforcementConfig(false /*safeFence*/, true /*lww*/, false /*vipSelfDemote*/, false /*vipProofReclaim*/)
+	s2.SetEnforcementConfig(false /*safeFence*/, true /*lww*/, false /*hlcLww*/, false /*vipSelfDemote*/, false /*vipProofReclaim*/)
 
 	s2.driveCapabilityActivation(context.Background())
 	if !g2.Latched(capabilities.SplitBrainGateV1) {

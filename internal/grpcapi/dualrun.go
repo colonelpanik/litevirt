@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +43,17 @@ const dualRunDebounce = 2
 // stall a whole pass (which, if it exceeded the lease TTL, would let a second node also
 // take leadership). Mirrors the 5s bound other periodic peer probes use.
 const dualRunPeerTimeout = 5 * time.Second
+
+// lxcCapable reports whether this host has the lxc-* tooling (lxc-create) needed to run
+// containers — the SAME probe the daemon uses to set the LXC-capable host label. The
+// container runtime is wired even where the tooling is absent, so on a VM-only host a
+// container list would fail "lxc-ls: executable not found"; that is NOT a coverage blind
+// spot (containers can't run here), so the detector skips the CT probe entirely rather
+// than marking the snapshot partial. It's a var so tests can stub it.
+var lxcCapable = func() bool {
+	_, err := exec.LookPath("lxc-create")
+	return err == nil
+}
 
 // migrationStates are DB workload states in which the DB owner legitimately differs from
 // the sole runtime holder — the OWNER-MISMATCH cutover-lag window (the DB row is mid-move
@@ -122,8 +134,10 @@ func (s *Server) localRuntimeSnapshot(ctx context.Context) runtimeSnapshot {
 		}
 	}
 
-	// Running containers.
-	if s.containerRuntime != nil {
+	// Running containers — only on an LXC-capable host (see lxcCapable). A non-LXC host has
+	// no local containers to miss, so it is neither probed nor marked partial. On a capable
+	// host a probe error IS a real gap → partial.
+	if s.containerRuntime != nil && lxcCapable() {
 		names, err := s.containerRuntime.ListContainers(ctx)
 		if err != nil {
 			snap.partial = true

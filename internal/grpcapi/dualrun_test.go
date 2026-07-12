@@ -733,3 +733,62 @@ func TestStepDownDualRun_ClearsProbeFailedGauge(t *testing.T) {
 		t.Fatalf("detected series = %d after step-down, want 0", got)
 	}
 }
+
+// fakeCT is a minimal ContainerRuntime for the LXC-capability-gate tests.
+type fakeCT struct {
+	ContainerRuntime
+	names   []string
+	listErr error
+	states  map[string]string
+}
+
+func (f *fakeCT) ListContainers(context.Context) ([]string, error) { return f.names, f.listErr }
+func (f *fakeCT) StateContainer(_ context.Context, n string) (string, error) {
+	return f.states[n], nil
+}
+
+// TestLocalRuntimeSnapshot_NonLXCHost_NotPartial: on a host without lxc-* tooling the CT
+// probe is skipped entirely — a "lxc-ls not found" error must NOT mark the snapshot partial
+// (there are no local containers to miss), else every VM-only host would page a standing
+// coverage alert.
+func TestLocalRuntimeSnapshot_NonLXCHost_NotPartial(t *testing.T) {
+	orig := lxcCapable
+	lxcCapable = func() bool { return false }
+	defer func() { lxcCapable = orig }()
+
+	s := testServer(t)
+	// The runtime is wired (as the daemon does) but would error — must be ignored.
+	s.containerRuntime = &fakeCT{listErr: fmt.Errorf("exec: \"lxc-ls\": executable file not found in $PATH")}
+	snap := s.localRuntimeSnapshot(context.Background())
+	if snap.partial {
+		t.Fatal("a non-LXC host must not be marked partial by a skipped CT probe")
+	}
+	if len(snap.runningCTs) != 0 {
+		t.Fatalf("expected no CTs on a non-LXC host, got %v", snap.runningCTs)
+	}
+}
+
+// TestLocalRuntimeSnapshot_LXCCapable_ProbeErrorPartial: on an LXC-capable host, a genuine
+// container-list error IS a coverage gap → partial.
+func TestLocalRuntimeSnapshot_LXCCapable_ProbeErrorPartial(t *testing.T) {
+	orig := lxcCapable
+	lxcCapable = func() bool { return true }
+	defer func() { lxcCapable = orig }()
+
+	s := testServer(t)
+	s.containerRuntime = &fakeCT{listErr: fmt.Errorf("lxc-ls: permission denied")}
+	if !s.localRuntimeSnapshot(context.Background()).partial {
+		t.Fatal("a container-list error on an LXC-capable host must mark the snapshot partial")
+	}
+
+	// And a healthy capable host reports its running containers, not partial.
+	s2 := testServer(t)
+	s2.containerRuntime = &fakeCT{names: []string{"ctA", "ctB"}, states: map[string]string{"ctA": "running", "ctB": "stopped"}}
+	snap := s2.localRuntimeSnapshot(context.Background())
+	if snap.partial {
+		t.Fatal("a healthy LXC host must not be partial")
+	}
+	if len(snap.runningCTs) != 1 || snap.runningCTs[0] != "ctA" {
+		t.Fatalf("running CTs = %v, want [ctA]", snap.runningCTs)
+	}
+}

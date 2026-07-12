@@ -29,6 +29,10 @@ type DualRunMetrics struct {
 // NewDualRunMetrics registers the gauges on the default registry.
 func NewDualRunMetrics() *DualRunMetrics { return newDualRunMetrics(prometheus.DefaultRegisterer) }
 
+// NewDualRunMetricsWith registers the gauges on the given registry — for callers (tests
+// across packages) that need an isolated registry to introspect the emitted series.
+func NewDualRunMetricsWith(reg prometheus.Registerer) *DualRunMetrics { return newDualRunMetrics(reg) }
+
 // newDualRunMetrics is the test seam (fresh registry per test).
 func newDualRunMetrics(reg prometheus.Registerer) *DualRunMetrics {
 	m := &DualRunMetrics{

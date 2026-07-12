@@ -2805,8 +2805,13 @@ type ReportRuntimeResponse struct {
 	RunningContainers  []string               `protobuf:"bytes,2,rep,name=running_containers,json=runningContainers,proto3" json:"running_containers,omitempty"`
 	KernelAssignedVips []string               `protobuf:"bytes,3,rep,name=kernel_assigned_vips,json=kernelAssignedVips,proto3" json:"kernel_assigned_vips,omitempty"`
 	UnresolvedTieCount int32                  `protobuf:"varint,4,opt,name=unresolved_tie_count,json=unresolvedTieCount,proto3" json:"unresolved_tie_count,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// partial is true when ANY local runtime probe errored (libvirt list/state, container
+	// list/state, LB-config read, or the kernel `ip` dump). The positive holders reported
+	// are still real, but the ABSENCE of a workload is NOT reliable — the leader must not
+	// use a partial snapshot as "probed and absent" proof, and raises a coverage gap for it.
+	Partial       bool `protobuf:"varint,5,opt,name=partial,proto3" json:"partial,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReportRuntimeResponse) Reset() {
@@ -2865,6 +2870,13 @@ func (x *ReportRuntimeResponse) GetUnresolvedTieCount() int32 {
 		return x.UnresolvedTieCount
 	}
 	return 0
+}
+
+func (x *ReportRuntimeResponse) GetPartial() bool {
+	if x != nil {
+		return x.Partial
+	}
+	return false
 }
 
 // CloneVM creates a new VM from a template or an existing VM (optionally a
@@ -21814,12 +21826,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"5\n" +
 	"\x1dCheckContainerRuntimeResponse\x12\x14\n" +
 	"\x05state\x18\x01 \x01(\tR\x05state\"\x16\n" +
-	"\x14ReportRuntimeRequest\"\xd2\x01\n" +
+	"\x14ReportRuntimeRequest\"\xec\x01\n" +
 	"\x15ReportRuntimeResponse\x12&\n" +
 	"\x0fdisk_holder_vms\x18\x01 \x03(\tR\rdiskHolderVms\x12-\n" +
 	"\x12running_containers\x18\x02 \x03(\tR\x11runningContainers\x120\n" +
 	"\x14kernel_assigned_vips\x18\x03 \x03(\tR\x12kernelAssignedVips\x120\n" +
-	"\x14unresolved_tie_count\x18\x04 \x01(\x05R\x12unresolvedTieCount\"\xd1\x01\n" +
+	"\x14unresolved_tie_count\x18\x04 \x01(\x05R\x12unresolvedTieCount\x12\x18\n" +
+	"\apartial\x18\x05 \x01(\bR\apartial\"\xd1\x01\n" +
 	"\x0eCloneVMRequest\x12\x16\n" +
 	"\x06source\x18\x01 \x01(\tR\x06source\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x12\n" +

@@ -36,7 +36,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.dualrun.vip` | error | a VIP is kernel-assigned on more than one host — a dual VIP holder |
 | `ha.owner.mismatch` | error | a VM's DB owner is not its sole runtime holder — the DB and runtime disagree (ownership drift) |
 | `ha.lww.unresolved` | warn | a node is tracking unresolved equal-timestamp LWW ties |
-| `ha.dualrun.coverage` | warn | a workload-capable host could not be probed this pass — the dual-run check has a coverage gap (a segmented or down host cannot be checked) |
+| `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 

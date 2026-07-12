@@ -7,21 +7,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/metrics"
 )
 
 // recordingVirt is a minimal LibvirtBackend that answers ListDomains/DomainState from a
-// map and COUNTS any destructive call — the dual-run detector must never destroy.
+// map and COUNTS any destructive call — the dual-run detector must never destroy. listErr
+// and stateErrOn inject failures for the partial-snapshot tests.
 type recordingVirt struct {
 	LibvirtBackend
-	domains   map[string]string // name -> coarse state ("running" / "stopped")
-	destroys  int
-	undefines int
+	domains    map[string]string // name -> coarse state ("running" / "stopped")
+	listErr    error             // if set, ListDomains fails
+	stateErrOn map[string]bool   // domains whose DomainState fails
+	destroys   int
+	undefines  int
 }
 
 func (r *recordingVirt) ListDomains() ([]string, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
 	names := make([]string, 0, len(r.domains))
 	for n := range r.domains {
 		names = append(names, n)
@@ -30,6 +39,9 @@ func (r *recordingVirt) ListDomains() ([]string, error) {
 }
 
 func (r *recordingVirt) DomainState(name string) (string, error) {
+	if r.stateErrOn[name] {
+		return "", fmt.Errorf("injected state error for %q", name)
+	}
 	if st, ok := r.domains[name]; ok {
 		return st, nil
 	}
@@ -156,21 +168,49 @@ func TestDualRun_VMOnTwoHosts_PagesAfterDebounce(t *testing.T) {
 	}
 }
 
-// TestDualRun_MigratingVM_NoAlert: a VM whose DB state is "migrating" has a legitimate
-// second disk-holder (the incoming target) and must not page.
-func TestDualRun_MigratingVM_NoAlert(t *testing.T) {
+// TestDualRun_StuckMigrationTwoDiskHolders_Pages: a DB state of "migrating"/"pending" must
+// NOT suppress the multi-holder finding — a stuck/failed failover where BOTH hosts actively
+// run (and write) the VM is precisely the split-brain this check exists for. (A healthy live
+// migration keeps the target PAUSED → only one disk-holder → no finding; the debounce covers
+// the brief cutover overlap.)
+func TestDualRun_StuckMigrationTwoDiskHolders_Pages(t *testing.T) {
+	for _, state := range []string{"migrating", "pending", "relocating", "starting"} {
+		s := dualRunTestServer(t, 2)
+		seedVM(t, s, "vmA", "h1", state)
+		s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+			"h1": {diskHolderVMs: []string{"vmA"}},
+			"h2": {diskHolderVMs: []string{"vmA"}},
+		})
+		ctx := context.Background()
+		st := newDualRunState()
+		s.detectDualRunPass(ctx, st)
+		s.detectDualRunPass(ctx, st)
+		if !confirmed(st, kindDualRunVM, "vmA") {
+			t.Fatalf("state %q: two active disk-holders must page regardless of DB migration state", state)
+		}
+	}
+}
+
+// TestDualRun_OwnerMismatch_MigrationExempt: the migration-state exemption still applies to
+// OWNER-MISMATCH (cutover lag) — a migrating VM with a SINGLE holder that isn't the DB owner
+// is legitimate mid-move and must not page.
+func TestDualRun_OwnerMismatch_MigrationExempt(t *testing.T) {
 	s := dualRunTestServer(t, 2)
 	seedVM(t, s, "vmA", "h1", "migrating")
+	// Sole holder is h2 (the migration target), DB owner still h1 — legitimate cutover lag.
 	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
-		"h1": {diskHolderVMs: []string{"vmA"}},
+		"h1": {},
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	})
 	ctx := context.Background()
 	st := newDualRunState()
 	s.detectDualRunPass(ctx, st)
 	s.detectDualRunPass(ctx, st)
+	if confirmed(st, kindOwnerMismatch, "vmA") {
+		t.Fatal("owner-mismatch must stay exempt for a migrating VM (cutover lag)")
+	}
 	if confirmed(st, kindDualRunVM, "vmA") {
-		t.Fatal("migrating VM should not page as a dual-run")
+		t.Fatal("single holder is not a dual-run")
 	}
 }
 
@@ -437,7 +477,9 @@ func TestDualRun_ContainerOnTwoHosts(t *testing.T) {
 		t.Fatal("a container running on two hosts should page")
 	}
 
-	// Migrating container -> the second holder is legitimate; no page.
+	// A DB "migrating" state does NOT suppress the multi-holder finding: cold CT migration
+	// stops the source before starting the target, so two RUNNING holders is a real dual-run
+	// (a stuck/failed move), not a legitimate cutover.
 	sMig := dualRunTestServer(t, 2)
 	seedContainer(t, sMig, "ctB", "h1", "migrating")
 	sMig.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
@@ -447,8 +489,8 @@ func TestDualRun_ContainerOnTwoHosts(t *testing.T) {
 	stMig := newDualRunState()
 	sMig.detectDualRunPass(ctx, stMig)
 	sMig.detectDualRunPass(ctx, stMig)
-	if confirmed(stMig, kindDualRunCT, "ctB") {
-		t.Fatal("a migrating container should not page as a dual-run")
+	if !confirmed(stMig, kindDualRunCT, "ctB") {
+		t.Fatal("two running containers must page regardless of DB migration state")
 	}
 }
 
@@ -560,5 +602,134 @@ func TestDetectedLabels_ExcludesCoverage(t *testing.T) {
 	}
 	if _, ok := got[kindDualRunCoverage]; ok {
 		t.Fatal("coverage kind leaked into detected labels")
+	}
+}
+
+// TestLocalRuntimeSnapshot_PartialOnProbeError: a probe error marks the snapshot partial
+// (so ABSENCE is not trusted) rather than being swallowed into a false-empty result. A
+// per-item state error still reports the healthy siblings — one wedged domain must not
+// blind the whole host.
+func TestLocalRuntimeSnapshot_PartialOnProbeError(t *testing.T) {
+	// Enumeration failure → partial, no VMs.
+	s := testServer(t)
+	s.virt = &recordingVirt{listErr: fmt.Errorf("libvirt down")}
+	snap := s.localRuntimeSnapshot(context.Background())
+	if !snap.partial {
+		t.Fatal("ListDomains error must mark the snapshot partial")
+	}
+
+	// Per-item state error → partial, but the readable sibling is still reported.
+	s2 := testServer(t)
+	s2.virt = &recordingVirt{
+		domains:    map[string]string{"ok": "running", "wedged": "running"},
+		stateErrOn: map[string]bool{"wedged": true},
+	}
+	snap2 := s2.localRuntimeSnapshot(context.Background())
+	if !snap2.partial {
+		t.Fatal("a per-item DomainState error must mark the snapshot partial")
+	}
+	if len(snap2.diskHolderVMs) != 1 || snap2.diskHolderVMs[0] != "ok" {
+		t.Fatalf("healthy sibling must still be reported despite a wedged domain: %v", snap2.diskHolderVMs)
+	}
+
+	// Clean host → not partial.
+	s3 := testServer(t)
+	s3.virt = &recordingVirt{domains: map[string]string{"ok": "running"}}
+	if s3.localRuntimeSnapshot(context.Background()).partial {
+		t.Fatal("a clean host must not be marked partial")
+	}
+}
+
+// TestReportRuntime_CarriesPartial: the partial flag rides the RPC response.
+func TestReportRuntime_CarriesPartial(t *testing.T) {
+	s := testServer(t)
+	s.virt = &recordingVirt{listErr: fmt.Errorf("libvirt down")}
+	resp, err := s.ReportRuntime(peerCtxFor(t, s, "peer-1"), &pb.ReportRuntimeRequest{})
+	if err != nil {
+		t.Fatalf("ReportRuntime: %v", err)
+	}
+	if !resp.GetPartial() {
+		t.Fatal("ReportRuntime must report partial=true when a local probe errored")
+	}
+}
+
+// TestDualRun_PartialOwner_NoFalseOwnerMismatch: a DB owner whose snapshot is PARTIAL must
+// not be used as absence proof — its VM running solely elsewhere must NOT page owner-mismatch
+// (its own runtime is unreliable); instead the partial owner raises a coverage gap.
+func TestDualRun_PartialOwner_NoFalseOwnerMismatch(t *testing.T) {
+	s := dualRunTestServer(t, 3)
+	seedVM(t, s, "vmA", "h3", "running")
+	// h3 (DB owner) returned a PARTIAL snapshot (absence unreliable); vmA runs solely on h2.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {},
+		"h2": {diskHolderVMs: []string{"vmA"}},
+		"h3": {partial: true},
+	})
+	ctx := context.Background()
+	st := newDualRunState()
+	s.detectDualRunPass(ctx, st)
+	s.detectDualRunPass(ctx, st)
+	if confirmed(st, kindOwnerMismatch, "vmA") {
+		t.Fatal("owner-mismatch must be deferred when the owner's snapshot is partial")
+	}
+	if !confirmed(st, kindDualRunCoverage, "h3") {
+		t.Fatal("a partial host must raise a coverage finding")
+	}
+}
+
+// TestDualRun_PartialHost_PositiveHoldersStillCounted: a partial host's REPORTED holders are
+// still real — a VM it reports running that also runs elsewhere is a genuine dual-run.
+func TestDualRun_PartialHost_PositiveHoldersStillCounted(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}},
+		"h2": {diskHolderVMs: []string{"vmA"}, partial: true},
+	})
+	ctx := context.Background()
+	st := newDualRunState()
+	s.detectDualRunPass(ctx, st)
+	s.detectDualRunPass(ctx, st)
+	if !confirmed(st, kindDualRunVM, "vmA") {
+		t.Fatal("a partial host's positive holder must still count toward a dual-run")
+	}
+}
+
+// seriesCount counts the active series of a metric family in a gathered registry.
+func seriesCount(t *testing.T, reg *prometheus.Registry, name string) int {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == name {
+			return len(mf.GetMetric())
+		}
+	}
+	return 0
+}
+
+// TestStepDownDualRun_ClearsProbeFailedGauge: on leadership loss a former leader must clear
+// BOTH gauges — including probe_failed set by unsupported-only peers (which populate neither
+// seen nor confirmed), so no stale series is stranded after a handoff.
+func TestStepDownDualRun_ClearsProbeFailedGauge(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	s := testServer(t)
+	s.dualRunMetrics = metrics.NewDualRunMetricsWith(reg)
+
+	// Simulate a former leader whose only output was a probe_failed series (unsupported peer).
+	s.dualRunMetrics.SetProbeFailed([]string{"old-peer"})
+	s.dualRunMetrics.SetDetected([]metrics.DualRunLabel{{Kind: "vm", Target: "vmA"}})
+	if seriesCount(t, reg, "litevirt_dual_run_probe_failed") != 1 {
+		t.Fatal("precondition: probe_failed should have 1 series")
+	}
+
+	s.stepDownDualRun()
+
+	if got := seriesCount(t, reg, "litevirt_dual_run_probe_failed"); got != 0 {
+		t.Fatalf("probe_failed series = %d after step-down, want 0", got)
+	}
+	if got := seriesCount(t, reg, "litevirt_dual_run_detected"); got != 0 {
+		t.Fatalf("detected series = %d after step-down, want 0", got)
 	}
 }

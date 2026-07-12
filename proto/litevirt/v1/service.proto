@@ -159,6 +159,11 @@ message ReportRuntimeResponse {
     repeated string running_containers   = 2;
     repeated string kernel_assigned_vips = 3;
     int32           unresolved_tie_count = 4;
+    // partial is true when ANY local runtime probe errored (libvirt list/state, container
+    // list/state, LB-config read, or the kernel `ip` dump). The positive holders reported
+    // are still real, but the ABSENCE of a workload is NOT reliable — the leader must not
+    // use a partial snapshot as "probed and absent" proof, and raises a coverage gap for it.
+    bool            partial              = 5;
 }
 
 // CloneVM creates a new VM from a template or an existing VM (optionally a

@@ -78,6 +78,16 @@ func localWinsLWW(localTS, incomingTS string) bool {
 // than this far ahead of local wall-clock now is treated as clock-corrupted.
 var skewCutoff = time.Duration(hlc.MaxSkewMS) * time.Millisecond
 
+// ParseUpdatedAt returns the wall-clock instant an `updated_at` value represents,
+// interpreting BOTH the HLC form ("<physms>-<logical>-<node>", where the instant is the
+// physical ms) and the legacy RFC3339 form. It is the ONLY correct way to read
+// updated_at as wall time (age math, GC/freshness cutoffs, display), because updated_at
+// is the LWW key that becomes an HLC string once hlc_lww is enabled — a raw
+// time.Parse(RFC3339) or substr on it would then break. ok=false for an uninterpretable
+// value (caller decides the fail-safe direction). Exported wrapper over tsInstant for
+// consumers outside this package (failover, grpcapi, region, …).
+func ParseUpdatedAt(ts string) (time.Time, bool) { return tsInstant(ts) }
+
 // tsInstant returns the wall-clock instant an updated_at value represents. It
 // handles both HLC ("<physms>-<logical>-<node>") and RFC3339 forms; ok=false for
 // anything it can't interpret (left to the existing comparator).
@@ -121,36 +131,62 @@ func (c *Client) skewQuarantinesIncoming(guardOn bool, localTS, incomingTS strin
 	return false
 }
 
+// cmpInstants orders two wall instants: +1 a newer, -1 b newer, 0 exact tie.
+func cmpInstants(a, b time.Time) int {
+	switch {
+	case a.After(b):
+		return 1
+	case b.After(a):
+		return -1
+	default:
+		return 0
+	}
+}
+
 // lwwOrder is the strict last-writer-wins comparator behind localWinsLWW. It
 // returns +1 when local is strictly newer, -1 when incoming is strictly newer,
 // and 0 on an EXACT tie (same instant). Only a 0 reaches the tie resolver; every
-// non-tie conflict is settled here by timestamp alone (unchanged behavior). The
-// format handling mirrors the original localWinsLWW (HLC beats legacy RFC3339;
-// RFC3339 compared as parsed instants, not lexically).
+// non-tie conflict is settled here.
+//
+// CROSS-FORMAT ordering is INSTANT-based, not categorical: an HLC value is compared
+// by its physical-ms wall instant against the RFC3339 instant, so a genuinely-newer
+// RFC3339Nano write (even sub-ms within the HLC's millisecond) still wins — same
+// skew-sensitivity as the RFC/RFC baseline, no regression. HLC wins over RFC3339 ONLY
+// at an exact-instant tie (RFC ns=0 landing on the HLC ms), deterministically. This is
+// what makes a per-node HLC-emission canary/rollback safe: an older HLC key can never
+// beat a newer RFC3339 one. Two HLC values keep the total order (physical, logical,
+// node) via their lexically-sortable string.
+//
+// The comparator is anti-symmetric (lwwOrder(a,b) == -lwwOrder(b,a)) across every
+// format pair; see lww_instant_test.go.
 func lwwOrder(localTS, incomingTS string) int {
 	localHLC, incomingHLC := hlc.IsHLC(localTS), hlc.IsHLC(incomingTS)
 	switch {
-	case localHLC && !incomingHLC:
-		return 1 // local HLC beats a legacy RFC3339 incoming
-	case !localHLC && incomingHLC:
-		return -1 // incoming HLC beats a legacy RFC3339 local
 	case localHLC && incomingHLC:
-		return strings.Compare(localTS, incomingTS) // both HLC → lexical == chronological
-	default:
+		return strings.Compare(localTS, incomingTS) // both HLC → total order (incl. node id)
+	case !localHLC && !incomingHLC:
 		// Both RFC3339 (bare second or fixed-width fractional).
 		lt, lerr := time.Parse(time.RFC3339, localTS)
 		it, ierr := time.Parse(time.RFC3339, incomingTS)
 		if lerr == nil && ierr == nil {
-			switch {
-			case lt.After(it):
-				return 1
-			case lt.Before(it):
-				return -1
-			default:
-				return 0
-			}
+			return cmpInstants(lt, it)
 		}
 		return strings.Compare(localTS, incomingTS) // unparseable → lexical fallback
+	default:
+		// Cross-format: compare by wall instant (HLC physical-ms vs full RFC3339Nano).
+		li, lok := tsInstant(localTS)
+		ii, iok := tsInstant(incomingTS)
+		if !lok || !iok {
+			return strings.Compare(localTS, incomingTS) // unparseable → lexical fallback
+		}
+		if ord := cmpInstants(li, ii); ord != 0 {
+			return ord
+		}
+		// Exact-instant tie across formats → HLC wins, deterministically.
+		if localHLC {
+			return 1
+		}
+		return -1
 	}
 }
 

@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"strings"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -819,8 +818,10 @@ func parseTimestamp(s string) *timestamppb.Timestamp {
 	if s == "" {
 		return nil
 	}
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
+	// Both-format: updated_at is the LWW key (RFC3339 or HLC once hlc_lww is enabled);
+	// last_seen/created_at are wall RFC3339. ParseUpdatedAt handles either.
+	t, ok := corrosion.ParseUpdatedAt(s)
+	if !ok {
 		return nil
 	}
 	return timestamppb.New(t)

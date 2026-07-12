@@ -230,6 +230,15 @@ const nowTSLayout = "2006-01-02T15:04:05.000000000Z07:00"
 // mis-order mixed old/new rows. Only updated_at (the LWW key) uses NowTS.
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// NowWall returns a bare-second RFC3339 UTC wall-clock timestamp for NON-LWW columns
+// (created_at, deleted_at, last_seen, and other *_at display/expiry/age markers). It is
+// the Client-method form of nowRFC3339 for callers outside this package (e.g. the
+// health checker). CRUCIAL vs NowTS: this is NOT the LWW conflict key and NEVER becomes
+// an HLC string, so any column read as wall time — display, age math, GC cutoffs,
+// timeout parsing — MUST use NowWall, not NowTS. (NowTS becomes HLC once hlc_lww is
+// enabled; a wall column stamped with NowTS would then hold an unparseable HLC string.)
+func (c *Client) NowWall() string { return c.now().Format(time.RFC3339) }
+
 const (
 	// nowTSPersistAhead is how far ahead of the last-emitted LWW timestamp we commit
 	// the durable ceiling, so persistence I/O happens ~once per this interval, not per
@@ -260,6 +269,11 @@ func (c *Client) now() time.Time {
 // restart after a wall-clock step-back can't emit an OLDER key than this node already
 // replicated — the backward-clock lost-update. Clients with no dataDir (throwaway
 // tools) keep the in-memory-only monotonic behavior.
+//
+// This is the LWW CONFLICT KEY ONLY: it is destined to emit an HLC string once the
+// hlc_lww migration is enabled, so it must be used ONLY for `updated_at`. Any NON-LWW
+// column (created_at, deleted_at, last_seen, display/age/expiry markers) must use
+// NowWall — a value read as wall time would break when this starts emitting HLC.
 func (c *Client) NowTS() string {
 	c.tsMu.Lock()
 	defer c.tsMu.Unlock()

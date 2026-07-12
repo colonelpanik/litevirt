@@ -47,7 +47,7 @@ func ReleaseContainerLeases(ctx context.Context, db *corrosion.Client, host, ctN
 	return db.Execute(ctx,
 		`UPDATE ip_allocations SET deleted_at = ?, updated_at = ?
 		 WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL`,
-		now, now, host, ctName)
+		db.NowWall(), now, host, ctName)
 }
 
 // TransferContainerLeases re-homes ALL of a container's live IPAM leases from

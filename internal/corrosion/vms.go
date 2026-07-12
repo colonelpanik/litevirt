@@ -629,11 +629,12 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 
 // DeleteVM tombstones a VM and its interfaces/disks.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
-	now := c.NowTS()
+	now := c.NowTS()     // LWW key (updated_at)
+	wall := nowRFC3339() // deleted_at is a wall/display column, never the HLC key
 	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{now, now, name}},
-		{SQL: `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{now, now, name}},
-		{SQL: `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{now, now, name}},
+		{SQL: `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{wall, now, name}},
+		{SQL: `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+		{SQL: `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
 	})
 }
 
@@ -834,7 +835,7 @@ func SoftDeleteDisk(ctx context.Context, c *Client, vmName, diskName string) err
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND disk_name = ?`,
-		now, now, vmName, diskName)
+		nowRFC3339(), now, vmName, diskName)
 }
 
 // ListDisks returns all disks for a VM (alias for GetVMDisks).
@@ -881,5 +882,5 @@ func SoftDeleteInterfaceByMAC(ctx context.Context, c *Client, vmName, mac string
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND mac = ?`,
-		now, now, vmName, mac)
+		nowRFC3339(), now, vmName, mac)
 }

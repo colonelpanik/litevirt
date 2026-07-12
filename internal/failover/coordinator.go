@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -279,28 +280,50 @@ func (c *Coordinator) run(ctx context.Context) {
 	// the failure threshold. The freshness predicate prevents stale rows from
 	// dead observers from satisfying quorum.
 	//
-	// host_health.updated_at is RFC3339; the cutoff must be RFC3339 too, NOT
-	// datetime('now', …) — a string compare against datetime()'s space text is
-	// always true once the date matches ('T' > ' '), which would let a DEAD
-	// observer's stale "suspect" row still count toward fencing quorum
-	// (defeating the freshness gate — a false-positive-fence safety hole).
-	freshCutoff := c.now().Add(-healthFreshness).UTC().Format(time.RFC3339)
-	rows, err := c.db.Query(ctx,
-		`SELECT target, COUNT(DISTINCT observer) AS observer_count
+	// Freshness is filtered in GO via corrosion.ParseUpdatedAt, NOT a SQL
+	// `updated_at > cutoff` string compare: updated_at is the LWW key, which becomes
+	// an HLC string ("<physms>-…") once hlc_lww is enabled, and a lexical/text compare
+	// can't span the RFC3339 and HLC forms (an HLC row would sort below an RFC3339
+	// cutoff and read as permanently stale — silently killing fencing quorum). Both
+	// forms decode to a wall instant, so the DISTINCT-observer-per-target quorum
+	// aggregation is done here too. An unparseable/stale row simply doesn't count.
+	freshCutoff := c.now().Add(-healthFreshness)
+	hh, err := c.db.Query(ctx,
+		`SELECT target, observer, updated_at
 		 FROM host_health
 		 WHERE target != ?
-		   AND consecutive_failures >= ?
-		   AND updated_at > ?
-		 GROUP BY target
-		 HAVING observer_count >= ?`,
-		c.hostName, offlineThreshold, freshCutoff, quorum)
+		   AND consecutive_failures >= ?`,
+		c.hostName, offlineThreshold)
 	if err != nil {
 		slog.Error("failover: query host_health", "error", err)
 		c.mAttempt(PhaseHealth, ResultError, ErrDBError)
 		return
 	}
+	freshObservers := map[string]map[string]struct{}{}
+	for _, r := range hh {
+		inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok || !inst.After(freshCutoff) {
+			continue // stale or unparseable → does not count toward quorum
+		}
+		t := r.String("target")
+		if freshObservers[t] == nil {
+			freshObservers[t] = map[string]struct{}{}
+		}
+		freshObservers[t][r.String("observer")] = struct{}{}
+	}
+	type fenceCandidate struct {
+		target    string
+		observers int
+	}
+	var candidates []fenceCandidate
+	for t, obs := range freshObservers {
+		if len(obs) >= quorum {
+			candidates = append(candidates, fenceCandidate{t, len(obs)})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].target < candidates[j].target })
 
-	for _, r := range rows {
+	for _, cand := range candidates {
 		// Re-validate lease before each destructive action: long fence runs
 		// (IPMI verify up to 15 s) can outlast the lease without renewal.
 		if !c.holdLease(ctx) {
@@ -309,7 +332,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			return
 		}
 
-		target := r.String("target")
+		target := cand.target
 		if c.fenced[target] {
 			continue
 		}
@@ -339,8 +362,8 @@ func (c *Coordinator) run(ctx context.Context) {
 		// stranded — so we only skip while it's within upgradingTimeout. On a
 		// timestamp parse error we err on the safe side and keep skipping.
 		if h.State == "upgrading" {
-			upd, perr := time.Parse(time.RFC3339, h.UpdatedAt)
-			if perr != nil || c.now().Sub(upd) < upgradingTimeout {
+			upd, ok := corrosion.ParseUpdatedAt(h.UpdatedAt)
+			if !ok || c.now().Sub(upd) < upgradingTimeout {
 				slog.Info("failover: target is upgrading, skipping fence", "host", target)
 				c.mAttempt(PhaseSkip, ResultSkipped, ErrUpgrading)
 				continue
@@ -360,7 +383,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		}
 
 		slog.Warn("failover: quorum reached — host exceeded failure threshold",
-			"host", target, "observers", r.Int("observer_count"), "quorum", quorum)
+			"host", target, "observers", cand.observers, "quorum", quorum)
 
 		c.failover(ctx, h)
 	}
@@ -436,7 +459,7 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 		return
 	}
-	freshCutoff := c.now().Add(-healthFreshness).UTC().Format(time.RFC3339)
+	freshCutoff := c.now().Add(-healthFreshness)
 	for _, h := range hosts {
 		switch h.State {
 		case "offline":
@@ -452,13 +475,14 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 			continue
 		}
 
+		// Freshness filtered in Go (both-format updated_at); see the fence-quorum
+		// query above for why a SQL string compare can't span RFC3339 + HLC.
 		rows, err := c.db.Query(ctx,
-			`SELECT COUNT(DISTINCT observer) AS n
+			`SELECT observer, updated_at
 			 FROM host_health
 			 WHERE target = ?
-			   AND consecutive_failures = 0
-			   AND updated_at > ?`,
-			h.Name, freshCutoff)
+			   AND consecutive_failures = 0`,
+			h.Name)
 		if err != nil {
 			// A query error would otherwise be indistinguishable from "not enough
 			// healthy observers" and silently suppress recovery.
@@ -466,7 +490,13 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 			c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 			continue
 		}
-		if len(rows) == 0 || rows[0].Int("n") < quorum {
+		fresh := map[string]struct{}{}
+		for _, r := range rows {
+			if inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at")); ok && inst.After(freshCutoff) {
+				fresh[r.String("observer")] = struct{}{}
+			}
+		}
+		if len(fresh) < quorum {
 			continue // not enough fresh healthy observers to recover
 		}
 		if err := corrosion.UpdateHostState(ctx, c.db, h.Name, "active"); err != nil {
@@ -1333,8 +1363,8 @@ func (c *Coordinator) markerFresh(ct corrosion.ContainerRecord) bool {
 	if to <= 0 {
 		to = defaultRelocateRestoreTimeout
 	}
-	t, err := time.Parse(time.RFC3339, ct.UpdatedAt)
-	if err != nil {
+	t, ok := corrosion.ParseUpdatedAt(ct.UpdatedAt)
+	if !ok {
 		return true // unparseable → conservatively treat as fresh (avoid double-restore)
 	}
 	return c.now().Sub(t) < to

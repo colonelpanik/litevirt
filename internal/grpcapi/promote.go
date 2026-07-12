@@ -79,11 +79,18 @@ func (s *Server) requireProofGradeFence(ctx context.Context, fenceEpoch, oldOwne
 // reschedule. fenceEpoch binds the carried proof to the proof-grade fence of the
 // old owner that authorizes this transfer (see the shared-disk gate below).
 //
-// Force is set because the original host is dead. The shared-disk split-brain
-// protection is the fence_epoch gate in doPromoteLocal (re-verified against the
-// append-only fencing_log) — NOT the healthy-owner guard, which reads the
-// executor's replicated hosts.state and would false-refuse under fence-state
-// gossip lag (stranding a local-disk DR VM that has no shared-write hazard).
+// Force is RETAINED on auto-promote — a deliberate, ratified deviation from the
+// plan's §8 "remove Force" cherry-pick (see TODO §8). It keeps TWO behaviors, both
+// by design:
+//  1. Bypass the healthy-owner guard: that guard reads the executor's REPLICATED
+//     hosts.state, so fence-state gossip lag would false-refuse and strand a
+//     local-disk DR VM (which has no shared-write hazard). The shared-disk
+//     split-brain protection is instead the fence_epoch gate in doPromoteLocal,
+//     re-verified against the append-only fencing_log — robust to that lag.
+//  2. Destroy-on-collision: a pre-existing same-name domain on the replica host is
+//     destroyed+rebuilt rather than refused. Retained for crash-recovery of a
+//     half-built promotion; a running domain that is OUR OWN prior promotion is
+//     still ADOPTED (never destroyed) via the promote marker / started checkpoint.
 func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error {
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {

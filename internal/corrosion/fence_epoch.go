@@ -9,8 +9,14 @@ import (
 
 // SharedDiskFenceWindow bounds how recent a proof-grade fence must be to authorize
 // a shared-disk cross-host transfer — a stale prior fence of the old owner must not
-// authorize a fresh transfer. Matches the coordinator's recentFenceWindow.
-const SharedDiskFenceWindow = 5 * time.Minute
+// authorize a fresh transfer. It is the EXECUTOR-side check; the coordinator's
+// proofGradeFenceRef already enforces the tighter recentFenceWindow (5m) at mint.
+// This window is deliberately WIDER (recentFenceWindow + a MaxSkew margin) because
+// the executor compares the coordinator's wall timestamp against ITS OWN clock, and
+// a REJECT here is terminal — a zero-margin window would false-reject a legitimately
+// recent fence under normal inter-host clock skew (≤ MaxSkew). Recency is a
+// secondary defense; the fence_epoch already binds the specific authorizing row.
+const SharedDiskFenceWindow = 10 * time.Minute
 
 // FenceCheck classifies a proof-grade-fence verification: OK to proceed, RETRY
 // (the referenced fencing_log row hasn't replicated here yet — transient), or

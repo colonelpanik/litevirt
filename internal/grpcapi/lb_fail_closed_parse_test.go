@@ -189,3 +189,45 @@ func TestListInspectLB_CorruptSurfacesUnknown(t *testing.T) {
 		t.Errorf("Inspect must surface UNKNOWN (empty) hosts on corrupt row, got %v", insp.LbHosts)
 	}
 }
+
+// TestInspectLB_CorruptStackStaysUnknown: a STACK LB with a corrupt hosts column
+// must NOT be repopulated from its stack's VM hosts — that would mask the
+// corruption behind a fabricated (guessed) membership. A legacy-empty stack LB
+// (hosts parses cleanly as unowned) still expands to VM-derived membership.
+func TestInspectLB_CorruptStackStaysUnknown(t *testing.T) {
+	s := testServerCov(t)
+	ctx := adminCtx()
+	createLBTable(t, ctx, s.db)
+
+	// A VM in stack "app" on host "vh1" — VM-derived membership WOULD resolve to it.
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "appvm", StackName: "app", HostName: "vh1", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Corrupt STACK LB → membership must stay UNKNOWN (empty), NOT expand to vh1.
+	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "cstack", StackName: "app", VIP: "10.0.0.5/24", Algorithm: "roundrobin",
+		Hosts: corruptHosts, Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed corrupt stack LB: %v", err)
+	}
+	if insp, err := s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: "cstack"}); err != nil {
+		t.Fatalf("Inspect corrupt stack LB: %v", err)
+	} else if len(insp.LbHosts) != 0 {
+		t.Errorf("corrupt stack LB must stay UNKNOWN (not expand to VM hosts), got %v", insp.LbHosts)
+	}
+
+	// Control: a legacy-empty stack LB (hosts="null", parses cleanly) DOES expand.
+	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "lstack", StackName: "app", VIP: "10.0.0.6/24", Algorithm: "roundrobin",
+		Hosts: "null", Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed legacy stack LB: %v", err)
+	}
+	if insp, err := s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: "lstack"}); err != nil {
+		t.Fatalf("Inspect legacy stack LB: %v", err)
+	} else if len(insp.LbHosts) != 1 || insp.LbHosts[0] != "vh1" {
+		t.Errorf("legacy-empty stack LB must expand to VM hosts [vh1], got %v", insp.LbHosts)
+	}
+}

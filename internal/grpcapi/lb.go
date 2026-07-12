@@ -301,8 +301,12 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 	if !ok {
 		slog.Warn("InspectLoadBalancer: LB has a corrupt hosts column; surfacing UNKNOWN membership", "lb", r.String("name"))
 	}
-	if len(lbHosts) == 0 {
-		// Empty (or UNKNOWN) hosts: resolve to hosts running VMs in this stack.
+	// Expand to stack-VM-derived membership ONLY when the stored hosts column parsed
+	// cleanly and was empty (a normal stack LB). A CORRUPT column (ok=false) stays
+	// UNKNOWN — reconstructing guessed membership would mask the corruption for stack
+	// LBs and route the VIP/backends to a fabricated host set.
+	if ok && len(lbHosts) == 0 {
+		// Empty hosts: resolve to hosts running VMs in this stack.
 		if stackName := r.String("stack_name"); stackName != "" {
 			vms, _ := corrosion.ListVMs(ctx, s.db, stackName, "")
 			seen := map[string]bool{}
@@ -1827,7 +1831,9 @@ func (s *Server) forwardLBStats(ctx context.Context, req *pb.LBStatsRequest) *pb
 		slog.Warn("forwardLBStats: corrupt hosts column; surfacing UNKNOWN membership", "lb", req.Name)
 		lbHosts = nil
 	}
-	if len(lbHosts) == 0 {
+	// Only fall back to stack-VM-derived hosts when the column parsed cleanly (ok) and
+	// was empty. A corrupt column stays UNKNOWN → no stats routing to guessed hosts.
+	if ok && len(lbHosts) == 0 {
 		// Resolve from stack VM hosts.
 		if stackName := rows[0].String("stack_name"); stackName != "" {
 			vms, _ := corrosion.ListVMs(ctx, s.db, stackName, "")

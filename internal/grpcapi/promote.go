@@ -75,22 +75,21 @@ func (s *Server) requireProofGradeFence(ctx context.Context, fenceEpoch, oldOwne
 // AutoPromoteReplica is the failover coordinator's trusted, non-streaming entry
 // point: after a host is fenced, promote the freshest replica of vmName onto a
 // healthy peer so a VM on lost local storage can resume. Returns an error when
-// there is no replica to promote, so the coordinator can fall back to a bare
+// there is no replica to promote, so the coordinator can fall back to a
 // reschedule. fenceEpoch binds the carried proof to the proof-grade fence of the
 // old owner that authorizes this transfer (see the shared-disk gate below).
 //
-// It does NOT set Force: the original owner is already marked fenced/offline (not
-// "active") by the time the coordinator promotes, so the healthy-owner split-brain
-// guard passes on its own; keeping Force would additionally FORCE-DESTROY a domain
-// that merely collides on the target name (possibly not ours). A name collision now
-// refuses (AlreadyExists) and the coordinator falls back to reschedule. Force is
-// reserved for the operator `promote --force` override.
+// Force is set because the original host is dead. The shared-disk split-brain
+// protection is the fence_epoch gate in doPromoteLocal (re-verified against the
+// append-only fencing_log) — NOT the healthy-owner guard, which reads the
+// executor's replicated hosts.state and would false-refuse under fence-state
+// gossip lag (stranding a local-disk DR VM that has no shared-write hazard).
 func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error {
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return fmt.Errorf("vm %q not found", vmName)
 	}
-	req := &pb.PromoteReplicaRequest{VmName: vmName}
+	req := &pb.PromoteReplicaRequest{VmName: vmName, Force: true}
 	// Split-brain hardening (Phase 1): once enforced, mint a durable single-use
 	// proof so the executing (possibly relayed) host validates + claims it before
 	// the destructive define+start — preventing a duplicate/retried promote from

@@ -46,11 +46,14 @@ func TestProofGradeFenceRef(t *testing.T) {
 	}
 }
 
-// TestCoordinator_AutoPromote_RetryableSkipsReschedule: a retryable Unavailable
-// from auto-promote (e.g. the fence_epoch fencing_log row hasn't replicated to the
-// executor yet) must NOT be downgraded to a bare reschedule — the VM is left on the
-// (fenced) source for the next cycle rather than started through a weaker path.
-func TestCoordinator_AutoPromote_RetryableSkipsReschedule(t *testing.T) {
+// TestCoordinator_AutoPromote_RetryableFallsThroughToReschedule: a retryable
+// Unavailable from auto-promote (e.g. the fence_epoch fencing_log row hasn't
+// replicated to the replica host yet) must NOT strand the VM. A fenced host is
+// processed only once, so the coordinator falls through to the reschedule path —
+// which carries the same fence_epoch and is re-gated by the TARGET reconciler
+// (whose retry loop does handle a not-yet-replicated fence). The VM must end up
+// re-pointed off the fenced source (pending on a healthy host), not left behind.
+func TestCoordinator_AutoPromote_RetryableFallsThroughToReschedule(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 
@@ -85,10 +88,14 @@ func TestCoordinator_AutoPromote_RetryableSkipsReschedule(t *testing.T) {
 	if len(prom.promoted) != 1 {
 		t.Fatalf("expected one auto-promote attempt, got %v", prom.promoted)
 	}
-	// The VM must NOT have been rescheduled onto a healthy host: it stays on the
-	// fenced source for a retry (the retryable path did `continue`).
+	// The retryable promote error falls through to reschedule, so the VM must be
+	// re-pointed off the fenced source onto a healthy host — never stranded on 'bad'
+	// (a fenced host is processed only once, so a `continue` here would strand it).
 	vm, _ := corrosion.GetVM(ctx, db, "vm1")
-	if vm == nil || vm.HostName != "bad" {
-		t.Errorf("retryable auto-promote must not reschedule; want vm1 still on 'bad', got %+v", vm)
+	if vm == nil || vm.HostName == "bad" {
+		t.Errorf("retryable auto-promote must fall through to reschedule off 'bad', got %+v", vm)
+	}
+	if vm.HostName != "good" {
+		t.Errorf("want vm1 rescheduled to 'good', got host=%q", vm.HostName)
 	}
 }

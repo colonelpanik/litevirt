@@ -12,9 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -946,17 +943,16 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				}
 			}
 			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch); err != nil {
-				// A retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
-				// replicated to the executor yet, on a shared-disk transfer) must NOT be
-				// downgraded to a bare reschedule — that could start the VM on a shared
-				// disk through a weaker path. Skip it this cycle; the next reconcile
-				// retries once replication catches up.
-				if status.Code(err) == codes.Unavailable {
-					slog.Warn("failover: auto-promote not yet ready (retryable), will retry next cycle",
-						"vm", vm.Name, "error", err)
-					c.mVM(ActionPromote, ResultError, ErrPromoteFailed)
-					continue
-				}
+				// Fall through to the reschedule path on ANY promote error, including a
+				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
+				// replicated to the replica host yet). This is NOT a downgrade to a
+				// weaker path: the reschedule now carries the same fence_epoch, and the
+				// TARGET reconciler re-enforces the shared-disk proof-grade gate before
+				// starting — and, unlike this once-per-fenced-host loop, the reconciler
+				// genuinely retries a not-yet-replicated fence on its next tick. A bare
+				// `continue` here would strand the VM, since a fenced host is processed
+				// only once (c.fenced / state=="fenced" / recentlyFenced all short-circuit
+				// later cycles until the host recovers).
 				slog.Warn("failover: auto-promote failed, falling back to reschedule",
 					"vm", vm.Name, "error", err)
 				c.mVM(ActionPromote, ResultError, ErrPromoteFailed)

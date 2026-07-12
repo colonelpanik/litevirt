@@ -388,14 +388,10 @@ func cloneMode(requested string, allShared bool) string {
 
 // diskIsShared reports whether a disk lives on cluster-shared storage (so a
 // linked clone backed by it can run on any host). Local/dir/btrfs/lvm are
-// host-local; nfs/ceph/iscsi are shared.
+// host-local; nfs/ceph/iscsi are shared. Delegates to corrosion.DiskIsShared —
+// the single shared definition the failover coordinator + reconciler also use.
 func diskIsShared(d corrosion.DiskRecord) bool {
-	switch strings.ToLower(d.StorageType) {
-	case "nfs", "ceph", "rbd", "iscsi":
-		return true
-	default:
-		return false
-	}
+	return corrosion.DiskIsShared(d)
 }
 
 // allDisksShared reports whether every disk is on shared storage.

@@ -63,7 +63,11 @@ type Fencer func(ctx context.Context, h fence.HostConfig) fence.Result
 // host's local storage can resume from its replica instead of failing to start
 // for want of a disk. Optional — nil disables auto-promotion.
 type ReplicaPromoter interface {
-	AutoPromoteReplica(ctx context.Context, vmName string) error
+	// fenceEpoch binds the promote proof to the specific proof-grade fence of the
+	// old owner that authorizes this cross-host transfer (see proofGradeFenceRef);
+	// "" when no proof-grade fence exists (a best-effort/SSH fence), which the
+	// executor treats as fail-closed for a shared-disk VM.
+	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error
 }
 
 // ContainerRestorer restores a container onto a survivor host from its latest
@@ -126,6 +130,15 @@ type Coordinator struct {
 	// legacy proceed-anyway behavior, so a hand-built Coordinator / test is unaffected
 	// until explicitly enabled. Wired by the daemon.
 	SafeFenceEnforce bool
+	// SharedStorageFenceEnforce is the per-node kill-switch for the shared-disk
+	// ownership-transfer fence gate (config.Enforcement.SharedStorageFence).
+	// Enforcement is this flag AND the SharedStorageFenceV1 capability latch. When
+	// enforced, the coordinator refuses to CREATE a cross-host transfer of a VM with
+	// a writable shared disk unless it has a proof-grade fence of the old owner
+	// (a non-empty fence_epoch) — failing closed at the SOURCE so a config-skewed or
+	// regressed target can never receive an unfenced shared-disk transfer. Wired by
+	// the daemon.
+	SharedStorageFenceEnforce bool
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
@@ -624,6 +637,14 @@ func (c *Coordinator) safeFenceRequiresProof(ctx context.Context, h *corrosion.H
 	return h == nil || h.Labels[corrosion.LabelUnsafeAutoFailover] != "true"
 }
 
+// sharedStorageFenceEnforced reports whether this coordinator enforces the
+// shared-disk ownership-transfer fence gate: the config kill-switch AND the
+// SharedStorageFenceV1 cluster-wide latch. Mirrors safeFenceRequiresProof's
+// flag-short-circuits-latch model — a nil Gate (tests) is not enforcing.
+func (c *Coordinator) sharedStorageFenceEnforced(ctx context.Context) bool {
+	return c.SharedStorageFenceEnforce && c.Gate != nil && c.Gate.Enforced(ctx, capabilities.SharedStorageFenceV1)
+}
+
 // fenceWithinWindow reports whether host has a fencing_log row with an accepted
 // result newer than now-recentFenceWindow. manualOnly restricts the accepted
 // result to "manual-confirmed".
@@ -662,6 +683,39 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 		}
 	}
 	return false
+}
+
+// proofGradeFenceRef returns the fence_epoch binding for the newest PROOF-GRADE
+// fence of host within recentFenceWindow, or "" when none exists (a best-effort /
+// SSH fence, or no fence yet). A shared-disk cross-host transfer executor re-reads
+// FenceID from fencing_log and re-verifies it (never a stale hosts.state). The
+// recency filter mirrors fenceWithinWindow (Go-side, RFC3339). An IPMI fence
+// finds the row this cycle just inserted; a manual fence finds the operator's
+// "manual-confirmed" row (the fence-time "manual"/"partial" row is not proof-grade).
+func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) string {
+	rows, err := c.db.Query(ctx,
+		`SELECT id, method, result, timestamp FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		slog.Warn("failover: fencing_log read for fence_epoch failed", "host", host, "error", err)
+		return ""
+	}
+	cutoff := c.now().Add(-recentFenceWindow)
+	var best time.Time
+	var bestRef corrosion.FenceEpochRef
+	for _, r := range rows {
+		if !corrosion.FenceProofGrade(r.String("method"), r.String("result")) {
+			continue
+		}
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil || !ts.After(cutoff) {
+			continue
+		}
+		if bestRef.FenceID == "" || ts.After(best) {
+			best = ts
+			bestRef = corrosion.FenceEpochRef{Host: host, FenceID: r.String("id"), TS: r.String("timestamp")}
+		}
+	}
+	return bestRef.String()
 }
 
 // autoPromoteEnabled reports whether vmName has a replication schedule with
@@ -837,6 +891,13 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		}
 	}
 
+	// Bind cross-host transfer proofs to THIS fence: for a VM with a writable
+	// shared disk the executor requires a proof-grade power-off of the old owner
+	// (SharedStorageFenceV1), re-verified from fencing_log via this reference. ""
+	// when the fence wasn't proof-grade (best-effort/SSH) — the executor then fails
+	// a shared-disk transfer closed while a local-disk transfer still proceeds.
+	fenceEpoch := c.proofGradeFenceRef(ctx, h.Name)
+
 	// Step 3: Find VMs that should be restarted.
 	vms, err := corrosion.ListVMs(ctx, c.db, "", h.Name)
 	if err != nil {
@@ -877,6 +938,28 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			continue
 		}
 
+		// Shared-disk split-brain gate (decide site): if this coordinator enforces
+		// the shared-storage fence and the VM has a writable shared disk, a cross-host
+		// transfer needs a PROOF-GRADE fence of the old owner. fenceEpoch is non-empty
+		// ONLY when proofGradeFenceRef found one (IPMI / manual-confirmed); a
+		// best-effort fence yields "". Refuse to CREATE the transfer (auto-promote OR
+		// reschedule) at the SOURCE when there's no proof-grade fence — so a
+		// config-skewed / regressed target can never receive (and ungated-start) a
+		// shared-disk transfer lacking a proven power-off. When a proof-grade fence
+		// DOES exist the transfer proceeds and even an unenforcing target starts
+		// safely (the owner is provably down). The executor re-verifies as
+		// defense-in-depth. Operator remediation: `lv host fence-confirm` (or an IPMI
+		// fence strategy) makes fenceEpoch proof-grade on the next cycle.
+		if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) {
+			if disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name); derr == nil && corrosion.VMHasWritableSharedDisk(disks) {
+				slog.Error("failover: shared-disk VM transfer refused — no proof-grade fence of old owner (storage_unverified); run 'lv host fence-confirm' or set an IPMI fence strategy",
+					"vm", vm.Name, "old_owner", h.Name)
+				c.noteGateRefused(corrosion.ActionReschedule, health.ReasonStorageUnverified)
+				c.mVM(ActionReschedule, ResultError, ErrStorageUnverified)
+				continue
+			}
+		}
+
 		// Auto-promotion is an explicit per-schedule DR opt-in, so it takes
 		// precedence over the VM's on_host_failure policy (which defaults to
 		// "none" for `lv run` VMs). A VM on the fenced host's local storage has
@@ -898,7 +981,17 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 					continue
 				}
 			}
-			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name); err != nil {
+			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch); err != nil {
+				// Fall through to the reschedule path on ANY promote error, including a
+				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
+				// replicated to the replica host yet). This is NOT a downgrade to a
+				// weaker path: the reschedule now carries the same fence_epoch, and the
+				// TARGET reconciler re-enforces the shared-disk proof-grade gate before
+				// starting — and, unlike this once-per-fenced-host loop, the reconciler
+				// genuinely retries a not-yet-replicated fence on its next tick. A bare
+				// `continue` here would strand the VM, since a fenced host is processed
+				// only once (c.fenced / state=="fenced" / recentlyFenced all short-circuit
+				// later cycles until the host recovers).
 				slog.Warn("failover: auto-promote failed, falling back to reschedule",
 					"vm", vm.Name, "error", err)
 				c.mVM(ActionPromote, ResultError, ErrPromoteFailed)
@@ -1011,7 +1104,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				ID: newID(), Action: corrosion.ActionReschedule, TargetKind: "vm",
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
-				QuorumLive: live, QuorumNeeded: needed,
+				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)

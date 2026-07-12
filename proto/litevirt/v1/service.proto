@@ -1324,6 +1324,13 @@ message RuntimeActionProof {
     int32  quorum_live      = 9;
     int32  quorum_needed    = 10;
     string relocation_token = 11;
+    // fence_epoch binds an auto-promote/reschedule proof to the SPECIFIC fence of
+    // the old owner that authorizes the cross-host transfer, so the executor can
+    // re-verify a proof-grade power-off (never a stale hosts.state=="fenced").
+    // Format: "host=<old-owner>;fence_id=<fencing_log id>;ts=<rfc3339>". Empty on
+    // a proof minted by a pre-fence_epoch node ⇒ a new executor fails a shared-disk
+    // transfer closed. Additive/wire-compatible.
+    string fence_epoch      = 12;
 }
 
 message PromoteReplicaRequest {

@@ -46,6 +46,7 @@ const (
 	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
 	LiteVirt_CheckVMRuntime_FullMethodName             = "/litevirt.v1.LiteVirt/CheckVMRuntime"
 	LiteVirt_CheckContainerRuntime_FullMethodName      = "/litevirt.v1.LiteVirt/CheckContainerRuntime"
+	LiteVirt_ReportRuntime_FullMethodName              = "/litevirt.v1.LiteVirt/ReportRuntime"
 	LiteVirt_CheckVIPParticipant_FullMethodName        = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
 	LiteVirt_RelayCheckVIPParticipant_FullMethodName   = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
 	LiteVirt_CheckLBPresent_FullMethodName             = "/litevirt.v1.LiteVirt/CheckLBPresent"
@@ -277,6 +278,7 @@ type LiteVirtClient interface {
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
 	CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeRequest, opts ...grpc.CallOption) (*CheckVMRuntimeResponse, error)
 	CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error)
+	ReportRuntime(ctx context.Context, in *ReportRuntimeRequest, opts ...grpc.CallOption) (*ReportRuntimeResponse, error)
 	CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error)
@@ -854,6 +856,16 @@ func (c *liteVirtClient) CheckContainerRuntime(ctx context.Context, in *CheckCon
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckContainerRuntimeResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_CheckContainerRuntime_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReportRuntime(ctx context.Context, in *ReportRuntimeRequest, opts ...grpc.CallOption) (*ReportRuntimeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportRuntimeResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReportRuntime_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3003,6 +3015,7 @@ type LiteVirtServer interface {
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
 	CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error)
 	CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error)
+	ReportRuntime(context.Context, *ReportRuntimeRequest) (*ReportRuntimeResponse, error)
 	CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error)
@@ -3370,6 +3383,9 @@ func (UnimplementedLiteVirtServer) CheckVMRuntime(context.Context, *CheckVMRunti
 }
 func (UnimplementedLiteVirtServer) CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckContainerRuntime not implemented")
+}
+func (UnimplementedLiteVirtServer) ReportRuntime(context.Context, *ReportRuntimeRequest) (*ReportRuntimeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportRuntime not implemented")
 }
 func (UnimplementedLiteVirtServer) CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckVIPParticipant not implemented")
@@ -4380,6 +4396,24 @@ func _LiteVirt_CheckContainerRuntime_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, req.(*CheckContainerRuntimeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReportRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportRuntimeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReportRuntime(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReportRuntime_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReportRuntime(ctx, req.(*ReportRuntimeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7641,6 +7675,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckContainerRuntime",
 			Handler:    _LiteVirt_CheckContainerRuntime_Handler,
+		},
+		{
+			MethodName: "ReportRuntime",
+			Handler:    _LiteVirt_ReportRuntime_Handler,
 		},
 		{
 			MethodName: "CheckVIPParticipant",

@@ -26,7 +26,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 	}
 	s := testServer(t) // real db so evaluateHADegraded's stranded-pending query is safe
 	s.gate = g
-	s.SetEnforcementConfig(false, true, false, false) // lww configured-on
+	s.SetEnforcementConfig(false, true, false, false, false) // lww configured-on
 
 	// Nothing to latch (all latched) ⇒ each cycle spends its peer op on a freshness
 	// check; round-robin covers both configured tokens within a few cycles.

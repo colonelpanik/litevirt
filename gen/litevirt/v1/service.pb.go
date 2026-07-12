@@ -16045,8 +16045,15 @@ type RuntimeActionProof struct {
 	QuorumLive      int32                  `protobuf:"varint,9,opt,name=quorum_live,json=quorumLive,proto3" json:"quorum_live,omitempty"`
 	QuorumNeeded    int32                  `protobuf:"varint,10,opt,name=quorum_needed,json=quorumNeeded,proto3" json:"quorum_needed,omitempty"`
 	RelocationToken string                 `protobuf:"bytes,11,opt,name=relocation_token,json=relocationToken,proto3" json:"relocation_token,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// fence_epoch binds an auto-promote/reschedule proof to the SPECIFIC fence of
+	// the old owner that authorizes the cross-host transfer, so the executor can
+	// re-verify a proof-grade power-off (never a stale hosts.state=="fenced").
+	// Format: "host=<old-owner>;fence_id=<fencing_log id>;ts=<rfc3339>". Empty on
+	// a proof minted by a pre-fence_epoch node ⇒ a new executor fails a shared-disk
+	// transfer closed. Additive/wire-compatible.
+	FenceEpoch    string `protobuf:"bytes,12,opt,name=fence_epoch,json=fenceEpoch,proto3" json:"fence_epoch,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RuntimeActionProof) Reset() {
@@ -16152,6 +16159,13 @@ func (x *RuntimeActionProof) GetQuorumNeeded() int32 {
 func (x *RuntimeActionProof) GetRelocationToken() string {
 	if x != nil {
 		return x.RelocationToken
+	}
+	return ""
+}
+
+func (x *RuntimeActionProof) GetFenceEpoch() string {
+	if x != nil {
+		return x.FenceEpoch
 	}
 	return ""
 }
@@ -22766,7 +22780,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04data\x18\a \x01(\fR\x04data\"W\n" +
 	"\x1cPushReplicaIncrementResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12#\n" +
-	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\xfb\x02\n" +
+	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\x9c\x03\n" +
 	"\x12RuntimeActionProof\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06action\x18\x02 \x01(\tR\x06action\x12\x1f\n" +
@@ -22782,7 +22796,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"quorumLive\x12#\n" +
 	"\rquorum_needed\x18\n" +
 	" \x01(\x05R\fquorumNeeded\x12)\n" +
-	"\x10relocation_token\x18\v \x01(\tR\x0frelocationToken\"\x95\x02\n" +
+	"\x10relocation_token\x18\v \x01(\tR\x0frelocationToken\x12\x1f\n" +
+	"\vfence_epoch\x18\f \x01(\tR\n" +
+	"fenceEpoch\"\x95\x02\n" +
 	"\x15PromoteReplicaRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_pool\x18\x02 \x01(\tR\n" +

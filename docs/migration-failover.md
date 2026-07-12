@@ -148,6 +148,44 @@ records a `manual-confirmed` row in `fencing_log`. This gate prevents
 the coordinator from rescheduling a manually-fenced host's VMs before
 an operator has actually confirmed the fence.
 
+### Shared-disk fence gating (host-fence-gated shared storage)
+
+A VM whose disk lives on **shared** storage (NFS/Ceph/RBD/iSCSI) is a special
+split-brain hazard: the same bytes are writable from any host, so starting the VM
+on a second host while the original owner may still be writing corrupts the disk.
+A local-disk replica is a *different* image, so promoting it carries no such hazard.
+
+When `enforcement.shared_storage_fence` is enabled (and the cluster has latched the
+`shared_storage_fence_v1` capability), an **ownership transfer** — auto-promote or
+reschedule — of a VM with a writable shared disk starts only once the old owner is
+**proven powered off**:
+
+- Accepted: a confirmed power-off (`ipmi`), or an operator `lv host fence-confirm`
+  (`manual-confirmed`).
+- Rejected: a `best-effort`/`ssh` fence — a lenient SSH poweroff reports success but
+  never confirms the host is down.
+
+The proof is bound to the specific fence in the failover proof's `fence_epoch`, and
+the executing host re-verifies it against the append-only `fencing_log` (never a
+stale `fenced` host state). If the proof reference hasn't replicated to the executor
+yet the transfer retries on the next cycle; a missing or non-proof-grade fence is
+refused with the `storage_unverified` reason.
+
+This is **host-fence-gated shared storage, not storage-level exclusivity** — litevirt
+does not (yet) take storage-side locks (RBD blocklist, iSCSI PR keys). It is a
+config kill-switch (`enforcement.shared_storage_fence`, default off) plus the
+capability latch, so a deploy is behavior-neutral until enabled fleet-uniformly, and
+disabling the flag restores the legacy behavior.
+
+**Per-host implication:** a host whose fence strategy is `best-effort`/`ssh`/`manual`
+(anything but `ipmi`) gives its shared-disk VMs *manual-confirm-only* automated
+failover once this is enforced. `lv host inspect <host>` prints a note when a host's
+fence strategy can't prove a power-off. Give shared-disk hosts an IPMI fence strategy,
+or expect to run `lv host fence-confirm` for their failover.
+
+Local-disk VMs are unaffected: their transfers keep the existing quorum/proof gate
+(a `best-effort` fence is sufficient — no shared-write hazard).
+
 ### Witness hosts (even-N quorum)
 
 For 2-node or 4-node deployments, add a vote-only witness host to break

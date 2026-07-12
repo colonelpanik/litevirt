@@ -12,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -63,7 +66,11 @@ type Fencer func(ctx context.Context, h fence.HostConfig) fence.Result
 // host's local storage can resume from its replica instead of failing to start
 // for want of a disk. Optional — nil disables auto-promotion.
 type ReplicaPromoter interface {
-	AutoPromoteReplica(ctx context.Context, vmName string) error
+	// fenceEpoch binds the promote proof to the specific proof-grade fence of the
+	// old owner that authorizes this cross-host transfer (see proofGradeFenceRef);
+	// "" when no proof-grade fence exists (a best-effort/SSH fence), which the
+	// executor treats as fail-closed for a shared-disk VM.
+	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error
 }
 
 // ContainerRestorer restores a container onto a survivor host from its latest
@@ -664,6 +671,39 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 	return false
 }
 
+// proofGradeFenceRef returns the fence_epoch binding for the newest PROOF-GRADE
+// fence of host within recentFenceWindow, or "" when none exists (a best-effort /
+// SSH fence, or no fence yet). A shared-disk cross-host transfer executor re-reads
+// FenceID from fencing_log and re-verifies it (never a stale hosts.state). The
+// recency filter mirrors fenceWithinWindow (Go-side, RFC3339). An IPMI fence
+// finds the row this cycle just inserted; a manual fence finds the operator's
+// "manual-confirmed" row (the fence-time "manual"/"partial" row is not proof-grade).
+func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) string {
+	rows, err := c.db.Query(ctx,
+		`SELECT id, method, result, timestamp FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		slog.Warn("failover: fencing_log read for fence_epoch failed", "host", host, "error", err)
+		return ""
+	}
+	cutoff := c.now().Add(-recentFenceWindow)
+	var best time.Time
+	var bestRef corrosion.FenceEpochRef
+	for _, r := range rows {
+		if !corrosion.FenceProofGrade(r.String("method"), r.String("result")) {
+			continue
+		}
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil || !ts.After(cutoff) {
+			continue
+		}
+		if bestRef.FenceID == "" || ts.After(best) {
+			best = ts
+			bestRef = corrosion.FenceEpochRef{Host: host, FenceID: r.String("id"), TS: r.String("timestamp")}
+		}
+	}
+	return bestRef.String()
+}
+
 // autoPromoteEnabled reports whether vmName has a replication schedule with
 // auto_promote set. Best-effort: a query error returns false (fall back to a
 // bare reschedule rather than risk an unwanted promotion).
@@ -837,6 +877,13 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		}
 	}
 
+	// Bind cross-host transfer proofs to THIS fence: for a VM with a writable
+	// shared disk the executor requires a proof-grade power-off of the old owner
+	// (SharedStorageFenceV1), re-verified from fencing_log via this reference. ""
+	// when the fence wasn't proof-grade (best-effort/SSH) — the executor then fails
+	// a shared-disk transfer closed while a local-disk transfer still proceeds.
+	fenceEpoch := c.proofGradeFenceRef(ctx, h.Name)
+
 	// Step 3: Find VMs that should be restarted.
 	vms, err := corrosion.ListVMs(ctx, c.db, "", h.Name)
 	if err != nil {
@@ -898,7 +945,18 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 					continue
 				}
 			}
-			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name); err != nil {
+			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch); err != nil {
+				// A retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
+				// replicated to the executor yet, on a shared-disk transfer) must NOT be
+				// downgraded to a bare reschedule — that could start the VM on a shared
+				// disk through a weaker path. Skip it this cycle; the next reconcile
+				// retries once replication catches up.
+				if status.Code(err) == codes.Unavailable {
+					slog.Warn("failover: auto-promote not yet ready (retryable), will retry next cycle",
+						"vm", vm.Name, "error", err)
+					c.mVM(ActionPromote, ResultError, ErrPromoteFailed)
+					continue
+				}
 				slog.Warn("failover: auto-promote failed, falling back to reschedule",
 					"vm", vm.Name, "error", err)
 				c.mVM(ActionPromote, ResultError, ErrPromoteFailed)
@@ -1011,7 +1069,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				ID: newID(), Action: corrosion.ActionReschedule, TargetKind: "vm",
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
-				QuorumLive: live, QuorumNeeded: needed,
+				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)

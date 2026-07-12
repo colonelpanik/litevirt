@@ -476,6 +476,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetGate(d.checker)
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
 
 	// Daily prune of this host's vm_events rows so the operational event store
 	// stays bounded (see config vm_event_*).
@@ -559,6 +560,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cfg.Enforcement.LWWSkewGuard,
 		d.cfg.Enforcement.VIPSelfDemote,
 		d.cfg.Enforcement.VIPProofReclaim,
+		d.cfg.Enforcement.SharedStorageFence,
 	)
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())

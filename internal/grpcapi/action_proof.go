@@ -18,7 +18,7 @@ func proofFromPB(p *pb.RuntimeActionProof) corrosion.ActionProof {
 		TargetName: p.GetTargetName(), DestHost: p.GetDestHost(), Coordinator: p.GetCoordinator(),
 		LeaseHolder: p.GetLeaseHolder(), LeaseExpiresAt: p.GetLeaseExpiresAt(),
 		QuorumLive: int(p.GetQuorumLive()), QuorumNeeded: int(p.GetQuorumNeeded()),
-		RelocationToken: p.GetRelocationToken(),
+		RelocationToken: p.GetRelocationToken(), FenceEpoch: p.GetFenceEpoch(),
 	}
 }
 
@@ -64,7 +64,8 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 		return "", status.Errorf(codes.Unavailable, "read proof %s: %v", p.GetId(), err)
 	} else if !ok || pr.Action != p.GetAction() || pr.TargetKind != p.GetTargetKind() ||
 		pr.TargetName != p.GetTargetName() || pr.DestHost != p.GetDestHost() ||
-		pr.Coordinator != p.GetCoordinator() || pr.RelocationToken != p.GetRelocationToken() {
+		pr.Coordinator != p.GetCoordinator() || pr.RelocationToken != p.GetRelocationToken() ||
+		pr.FenceEpoch != p.GetFenceEpoch() {
 		return "", status.Errorf(codes.FailedPrecondition,
 			"persisted proof %s does not match the carried proof (divergent/seeded row)", p.GetId())
 	}

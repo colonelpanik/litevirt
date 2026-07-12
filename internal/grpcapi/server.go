@@ -85,10 +85,11 @@ type Server struct {
 	// advertisement. The actual enforcement predicates live on the consumers
 	// (Coordinator, daemon closures, vipGateActive); the daemon wires both from one
 	// config source. See SetEnforcementConfig / tokenEnabled. All default false.
-	enfSafeFence       bool
-	enfLWWSkew         bool
-	enfVIPSelfDemote   bool
-	enfVIPProofReclaim bool
+	enfSafeFence          bool
+	enfLWWSkew            bool
+	enfVIPSelfDemote      bool
+	enfVIPProofReclaim    bool
+	enfSharedStorageFence bool
 
 	// capHealthLast records the most recent bounded freshness-check result per
 	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
@@ -347,11 +348,19 @@ func (s *Server) SetGate(g serverGate) { s.gate = g }
 
 // SetEnforcementConfig records the split-brain-family kill-switch flags so the HA
 // monitor drives/gates the right tokens. Wired once from config.Enforcement.
-func (s *Server) SetEnforcementConfig(safeFence, lwwSkew, vipSelfDemote, vipProofReclaim bool) {
+func (s *Server) SetEnforcementConfig(safeFence, lwwSkew, vipSelfDemote, vipProofReclaim, sharedStorageFence bool) {
 	s.enfSafeFence = safeFence
 	s.enfLWWSkew = lwwSkew
 	s.enfVIPSelfDemote = vipSelfDemote
 	s.enfVIPProofReclaim = vipProofReclaim
+	s.enfSharedStorageFence = sharedStorageFence
+}
+
+// sharedStorageFenceActive reports whether this node ENFORCES the shared-storage
+// fence gate: the config kill-switch AND the cluster-wide latch. Mirrors the
+// family's `flag && Enforced` model (strictMTLSActive / forwardedIdentityActive).
+func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
+	return s.enfSharedStorageFence && s.gate != nil && s.gate.Enforced(ctx, capabilities.SharedStorageFenceV1)
 }
 
 // tokenEnabled reports whether this node is configured to ENFORCE token — the
@@ -376,6 +385,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.strictMTLSIdentity
 	case capabilities.ForwardedIdentityV1:
 		return s.forwardedIdentity
+	case capabilities.SharedStorageFenceV1:
+		return s.enfSharedStorageFence
 	default:
 		return false
 	}
@@ -521,6 +532,20 @@ func (s *Server) destSupportsGate(ctx context.Context, dest string) bool {
 		return capabilities.Has(s.advertisedCapabilities(), capabilities.SplitBrainGateV1)
 	}
 	return s.gate.PeerSupportsFresh(ctx, dest, capabilities.SplitBrainGateV1)
+}
+
+// destSupportsSharedStorageFence fresh-Pings dest to confirm it advertises
+// shared_storage_fence_v1 before this node stamps a proof whose shared-disk
+// proof-grade requirement the dest must honor on execute. Self-aware + fail
+// closed, mirroring destSupportsGate.
+func (s *Server) destSupportsSharedStorageFence(ctx context.Context, dest string) bool {
+	if s.gate == nil {
+		return false
+	}
+	if dest == s.hostName {
+		return capabilities.Has(s.advertisedCapabilities(), capabilities.SharedStorageFenceV1)
+	}
+	return s.gate.PeerSupportsFresh(ctx, dest, capabilities.SharedStorageFenceV1)
 }
 
 // lbGateRefused is the markerless execute-gate at the LB-apply chokepoint.

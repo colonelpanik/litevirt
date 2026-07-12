@@ -62,6 +62,12 @@ type Reconciler struct {
 	// and validates/claims the linked runtime_action_proofs row before starting.
 	// nil disables gating (tests that don't exercise it). See SetGate.
 	gate runtimeGate
+	// sharedStorageFenceEnforce is the config kill-switch for the shared-disk
+	// ownership-transfer fence gate (enforcement.shared_storage_fence). With it AND
+	// SharedStorageFenceV1 latched, an ownership-transfer start of a VM with a
+	// writable shared disk requires a proof-grade fence of the old owner (carried in
+	// the proof's fence_epoch). See SetSharedStorageFenceEnforce.
+	sharedStorageFenceEnforce bool
 	// onGateRefused observes each gate/proof refusal (action, reason from the
 	// closed vocab) — nil-safe; the daemon wires it to the refusal metric.
 	onGateRefused func(action, reason string)
@@ -101,6 +107,10 @@ func selfFenceHardGate(g runtimeGate) bool { return g != nil && g.SelfFenced() }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
+
+// SetSharedStorageFenceEnforce sets the config kill-switch for the shared-disk
+// ownership-transfer fence gate (enforcement.shared_storage_fence).
+func (r *Reconciler) SetSharedStorageFenceEnforce(v bool) { r.sharedStorageFenceEnforce = v }
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (r *Reconciler) SetGateRefusedObserver(fn func(action, reason string)) { r.onGateRefused = fn }
@@ -676,6 +686,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
+	var proofFenceEpoch string // the validated proof's fence_epoch (shared-disk gate below)
 	if proofID != "" {
 		// The proof must actually authorize THIS start: a reschedule proof whose
 		// target/dest is this VM on this host. A mismatched id (stale pointer,
@@ -700,6 +711,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			r.noteGateRefused(corrosion.ActionReschedule, ReasonProofConflict)
 			return
 		}
+		proofFenceEpoch = pr.FenceEpoch
 		if err := corrosion.ClaimActionProof(ctx, r.db, proofID, r.hostName); err != nil {
 			if errors.Is(err, corrosion.ErrProofSpent) {
 				slog.Warn("reconciler: pending proof terminal/missing, refusing start",
@@ -768,6 +780,35 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		slog.Error("reconciler: list disks", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("list disks: %v", err)) // transient DB
 		return
+	}
+
+	// Shared-disk split-brain gate: an ownership TRANSFER (a pending row carrying a
+	// coordinator proof) of a VM with a writable SHARED disk (nfs/ceph/rbd/iscsi) may
+	// start only once the old owner is PROVEN powered off — carried in the proof's
+	// fence_epoch and re-verified against the append-only fencing_log. A local-disk
+	// transfer keeps the proof/quorum gate above (its disk is host-local; no
+	// shared-write hazard). Fail closed once enforced; the kill-switch restores legacy.
+	// host_name was re-pointed to this target, so we trust the proof-protected
+	// fence_epoch.Host as the old owner (oldOwner "").
+	if proofID != "" && r.sharedStorageFenceEnforce && r.gate != nil &&
+		r.gate.Enforced(ctx, capabilities.SharedStorageFenceV1) &&
+		corrosion.VMHasWritableSharedDisk(diskRecords) {
+		switch verdict, detail := corrosion.CheckProofGradeFence(ctx, r.db, proofFenceEpoch, "", corrosion.SharedDiskFenceWindow); verdict {
+		case corrosion.FenceOK:
+			// proof-grade fence verified — proceed.
+		case corrosion.FenceRetry:
+			// The fencing_log row rides the same replication as the proof; the proof was
+			// already single-use-claimed, so re-mint on the next failover cycle if needed.
+			slog.Warn("reconciler: shared-disk transfer fence not yet verifiable, retrying",
+				"vm", vm.Name, "detail", detail)
+			return
+		default: // FenceReject
+			slog.Error("reconciler: shared-disk transfer refused — no proof-grade fence of old owner (storage_unverified)",
+				"vm", vm.Name, "detail", detail)
+			r.noteGateRefused(corrosion.ActionReschedule, ReasonStorageUnverified)
+			r.failPendingStart(ctx, vm.Name, proofID, false, "shared-disk transfer refused: "+detail)
+			return
+		}
 	}
 
 	var diskConfigs []lv.DiskConfig

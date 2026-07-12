@@ -130,6 +130,12 @@ enforcement:
   lww_skew_guard: false       # quarantine an incoming LWW row >5 min future-skewed (future-skew only)
   vip_self_demote: false      # a minority node releases its VIPs on sustained quorum loss
   vip_proof_reclaim: false    # majority refuses a VIP takeover without a release/fence proof
+  shared_storage_fence: false # a cross-host transfer (auto-promote/reschedule) of a VM with a
+                              # writable SHARED disk (nfs/ceph/rbd/iscsi) requires a proof-grade
+                              # fence of the old owner (IPMI or `lv host fence-confirm`); a
+                              # best-effort SSH fence is rejected. Local-disk transfers keep
+                              # today's gate. Enable fleet-uniformly (changes failover behavior).
+                              # See docs/migration-failover.md → "Shared-disk fence gating".
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

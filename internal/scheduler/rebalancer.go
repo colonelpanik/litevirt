@@ -558,6 +558,16 @@ func vmBaseName(name string) string {
 }
 
 // recordProposal writes a pending proposal to the rebalance_proposals table.
+//
+// LWW-key exception (deliberate): updated_at here is stamped as WALL RFC3339 via the
+// rebalancer's injected clock (r.now()), NOT via the corrosion client's NowLWW, so it
+// is never an HLC LWW key. That is safe because rebalance_proposals is LEADER-GATED
+// single-writer (both the proposing loop and the executor gate on the same lease), so
+// there is no concurrent multi-writer LWW conflict to protect against, and the reaper
+// (rebalance_executor.go reapStale) compares updated_at lexically as RFC3339. If these
+// writers are ever switched to NowLWW/HLC, reapStale MUST move to the tsMsSQL helper
+// FIRST (an HLC "175…" sorts below every RFC3339 cutoff → every in-flight row insta-
+// times-out). The pair is allowlisted in updated_at_consumer_guard_test.go.
 func (r *Rebalancer) recordProposal(ctx context.Context, p Proposal) error {
 	rNow := r.now()
 	now := rNow.UTC().Format(time.RFC3339)

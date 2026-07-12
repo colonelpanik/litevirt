@@ -385,6 +385,15 @@ func (c *Client) initClockPersistence() error {
 		c.nowFn = time.Now
 	}
 	if c.onPersistFatal == nil {
+		// DELIBERATE fail-closed decision: when the monotonic ceiling can't be
+		// persisted AND the in-memory headroom is exhausted, exit rather than emit an
+		// LWW key below the last durable ceiling (which would silently lose updates
+		// after a restart). Sustained failure (e.g. a full dataDir disk) therefore
+		// crash-loops the daemon — an accepted trade-off: the SQLite state DB lives on
+		// the SAME filesystem, so a full disk already fails authoritative writes; a loud
+		// crash surfaces it instead of silently corrupting LWW ordering. Recovery = free
+		// space (or, as a last resort, delete <dataDir>/nowts.hwm to reset the ceiling,
+		// re-opening the regression window until wall time passes the old ceiling).
 		c.onPersistFatal = func(err error) {
 			slog.Error("nowts: monotonic clock persistence failing and headroom exhausted — exiting to avoid a silent lost update", "error", err)
 			os.Exit(1)

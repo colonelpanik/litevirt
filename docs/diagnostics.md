@@ -94,6 +94,32 @@ Human-readable table by default; `--json` for the full structured report (node
 lists incl. `sensitive_unreachable`, per-row per-node `updated_at`/hash, `stable`,
 and violations). `--table` restricts the scan to specific tables.
 
+## Persisted LWW clock & backward-clock protection
+
+The `updated_at` conflict key is minted from a **monotonic** clock whose high-water
+mark is persisted to `<dataDir>/nowts.hwm`, so a wall-clock step-back or a restart
+can't mint an older-sorting key that silently loses cluster-wide. This protection is
+**always on** (no flag). Enabling `enforcement.hlc_lww` additionally flips the key
+*format* to HLC (see [configuration.md](configuration.md)); the persisted clock works
+the same either way.
+
+Operational notes:
+
+- **Sticky future-skew.** If a node's clock jumps far into the future, the persisted
+  high-water stays ahead even after the clock is corrected — the node keeps emitting at
+  the old ceiling until wall time catches up, and (with `lww_skew_guard`) peers may
+  quarantine its writes in the meantime. **Recovery:** correct the clock (NTP) and wait
+  it out. As a last resort, stop the daemon and delete `<dataDir>/nowts.hwm` to reset the
+  ceiling — this re-opens the backward-regression window until wall time passes the old
+  ceiling, so only do it when the skew was large and you understand the trade-off.
+- **Re-image / dataDir wipe.** A node whose `dataDir` is wiped loses its high-water and
+  regains the regression window until its wall clock passes the pre-wipe ceiling. Ensure
+  NTP is healthy before rejoining.
+- **Persistence failure is fail-closed.** If the daemon cannot persist a higher ceiling
+  and its in-memory headroom is exhausted, it **exits** rather than emit a key below the
+  last durable ceiling. Because the state DB shares the `dataDir` filesystem, a full disk
+  already fails writes; the crash surfaces it loudly. Recovery = free space.
+
 ## Equal-timestamp tie resolution
 
 Strict last-writer-wins settles every conflict whose `updated_at` values differ.

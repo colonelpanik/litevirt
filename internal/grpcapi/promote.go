@@ -54,12 +54,44 @@ func (s *Server) PromoteReplica(req *pb.PromoteReplicaRequest, stream grpc.Serve
 	return s.promoteResolved(ctx, req, vm, false /*operator*/, stream.Send)
 }
 
+// requireProofGradeFence verifies fenceEpoch proves a proof-grade power-off of the
+// old owner, for a shared-disk cross-host transfer, mapping the shared
+// corrosion.CheckProofGradeFence tri-state to gRPC: RETRY ⇒ Unavailable (the
+// referenced fencing_log row rides the same replication as the carried proof, so
+// right after a fence the executor may not have it yet); REJECT ⇒ FailedPrecondition
+// with the storage_unverified refusal reason.
+func (s *Server) requireProofGradeFence(ctx context.Context, fenceEpoch, oldOwner string) error {
+	switch verdict, detail := corrosion.CheckProofGradeFence(ctx, s.db, fenceEpoch, oldOwner, corrosion.SharedDiskFenceWindow); verdict {
+	case corrosion.FenceOK:
+		return nil
+	case corrosion.FenceRetry:
+		return status.Errorf(codes.Unavailable, "shared-disk promote: %s — retry", detail)
+	default: // FenceReject
+		s.noteGateRefused(corrosion.ActionPromote, health.ReasonStorageUnverified)
+		return status.Errorf(codes.FailedPrecondition, "shared-disk promote refused: %s (storage_unverified)", detail)
+	}
+}
+
 // AutoPromoteReplica is the failover coordinator's trusted, non-streaming entry
 // point: after a host is fenced, promote the freshest replica of vmName onto a
-// healthy peer so a VM on lost local storage can resume. Force is set because
-// the original host is dead (no split-brain). Returns an error when there is no
-// replica to promote, so the coordinator can fall back to a bare reschedule.
-func (s *Server) AutoPromoteReplica(ctx context.Context, vmName string) error {
+// healthy peer so a VM on lost local storage can resume. Returns an error when
+// there is no replica to promote, so the coordinator can fall back to a
+// reschedule. fenceEpoch binds the carried proof to the proof-grade fence of the
+// old owner that authorizes this transfer (see the shared-disk gate below).
+//
+// Force is RETAINED on auto-promote — a deliberate, ratified deviation from the
+// plan's §8 "remove Force" cherry-pick (see TODO §8). It keeps TWO behaviors, both
+// by design:
+//  1. Bypass the healthy-owner guard: that guard reads the executor's REPLICATED
+//     hosts.state, so fence-state gossip lag would false-refuse and strand a
+//     local-disk DR VM (which has no shared-write hazard). The shared-disk
+//     split-brain protection is instead the fence_epoch gate in doPromoteLocal,
+//     re-verified against the append-only fencing_log — robust to that lag.
+//  2. Destroy-on-collision: a pre-existing same-name domain on the replica host is
+//     destroyed+rebuilt rather than refused. Retained for crash-recovery of a
+//     half-built promotion; a running domain that is OUR OWN prior promotion is
+//     still ADOPTED (never destroyed) via the promote marker / started checkpoint.
+func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error {
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return fmt.Errorf("vm %q not found", vmName)
@@ -77,6 +109,7 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName string) error {
 		req.Proof = &pb.RuntimeActionProof{
 			Id: newID(), Action: corrosion.ActionPromote, TargetKind: "vm",
 			TargetName: vmName, Coordinator: s.hostName, LeaseHolder: s.hostName,
+			FenceEpoch: fenceEpoch,
 		}
 	}
 	return s.promoteResolved(ctx, req, vm, true /*automated*/, func(*pb.PromoteReplicaProgress) error { return nil })
@@ -142,6 +175,15 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 			s.noteGateRefused(corrosion.ActionPromote, health.ReasonUnsupportedCapability)
 			return status.Errorf(codes.FailedPrecondition,
 				"promote refused: destination %q does not advertise the split-brain gate", host)
+		}
+		// If THIS node enforces the shared-storage fence, the destination must also
+		// advertise the token so it will honor the proof-grade requirement on execute
+		// — a regressed/replaced dest that lost it would otherwise run the shared-disk
+		// transfer ungated. Fresh-Ping, fail closed.
+		if s.sharedStorageFenceActive(ctx) && !s.destSupportsSharedStorageFence(ctx, host) {
+			s.noteGateRefused(corrosion.ActionPromote, health.ReasonUnsupportedCapability)
+			return status.Errorf(codes.FailedPrecondition,
+				"promote refused: destination %q does not advertise the shared-storage fence gate", host)
 		}
 		req.Proof.DestHost = host
 		if err := corrosion.WriteActionProof(ctx, s.db, proofFromPB(req.Proof)); err != nil {
@@ -407,6 +449,24 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	proofID, err := s.claimCarriedProof(ctx, req.Proof, corrosion.ActionPromote, "vm", vm.Name)
 	if err != nil {
 		return err
+	}
+	// Shared-disk split-brain gate: an automated cross-host TRANSFER (a coordinator
+	// promote carries a proof; an operator override does not) of a VM with a writable
+	// SHARED disk (nfs/ceph/rbd/iscsi) may start only once the OLD OWNER is PROVEN
+	// powered off — a best-effort SSH "fence" never confirms that, and the shared disk
+	// is writable from both hosts, so a double-run corrupts it. A local-disk transfer
+	// (a replica is a different image) keeps the existing quorum/proof gate above. Fail
+	// closed once enforced; kill-switch (enforcement.shared_storage_fence) restores legacy.
+	if req.Proof != nil && s.sharedStorageFenceActive(ctx) {
+		disks, derr := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+		if derr != nil {
+			return status.Errorf(codes.Unavailable, "shared-disk fence check — list disks: %v", derr)
+		}
+		if corrosion.VMHasWritableSharedDisk(disks) {
+			if err := s.requireProofGradeFence(ctx, req.Proof.GetFenceEpoch(), vm.HostName); err != nil {
+				return err
+			}
+		}
 	}
 	// Durable step-resume: promote is a multi-step, partly-destructive sequence
 	// (build disk → define → start → persist). We checkpoint each step in the

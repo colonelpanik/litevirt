@@ -267,6 +267,9 @@ type FenceLogRecord struct {
 	Method   string
 	Result   string
 	Detail   string
+	// Timestamp is the RFC3339 event time. Set only on READ (GetFenceLog);
+	// InsertFenceLog stamps its own `now` and ignores this field.
+	Timestamp string
 }
 
 // InsertFenceLog records a fencing attempt.

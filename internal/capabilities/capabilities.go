@@ -32,6 +32,16 @@ const (
 	// may advertise one of {VIPDemoteV1, VIPReleaseProbeV1} without the other; the two flip
 	// together as the Phase-2 pair. Also a software capability (no watchdog).
 	VIPReleaseProbeV1 = "vip_release_probe_v1"
+	// SharedStorageFenceV1 gates proof-grade fencing for a cross-host ownership
+	// TRANSFER start of a VM with a writable SHARED disk (nfs/ceph/rbd/iscsi). Once
+	// enforced cluster-wide, auto-promote / reschedule of such a VM requires a
+	// proof-grade fence of the old owner — a confirmed power-off (IPMI) or an
+	// operator manual-confirm — carried in the proof's fence_epoch; a best-effort
+	// SSH "success" (never confirms power-off) is rejected. A local-disk transfer
+	// (a replica is a different image; no shared-write hazard) keeps today's gate.
+	// Host-fence-gated, NOT storage-level exclusivity. Gated (config kill-switch +
+	// latch) because it changes live failover behavior for shared-disk VMs.
+	SharedStorageFenceV1 = "shared_storage_fence_v1"
 	// FenceEpochV1 gates Phase-5 fence-epoch staleness enforcement.
 	FenceEpochV1 = "fence_epoch_v1"
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
@@ -179,12 +189,13 @@ var supported = []string{
 	VIPReleaseProbeV1,
 	StrictMTLSIdentityV1,
 	ForwardedIdentityV1,
+	SharedStorageFenceV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

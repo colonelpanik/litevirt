@@ -297,6 +297,14 @@ type EnforcementConfig struct {
 	// release/fence proof (capabilities.VIPReleaseProbeV1). Named for the behavior
 	// it gates, not the release-probe RPC (which still serves when this is off).
 	VIPProofReclaim bool `yaml:"vip_proof_reclaim,omitempty"`
+	// SharedStorageFence: a cross-host ownership TRANSFER start (auto-promote /
+	// reschedule) of a VM with a writable SHARED disk (nfs/ceph/rbd/iscsi) requires
+	// a proof-grade fence of the old owner — confirmed power-off (IPMI) or operator
+	// manual-confirm, carried in the proof's fence_epoch (capabilities.
+	// SharedStorageFenceV1). A best-effort SSH fence is rejected for such a VM; a
+	// local-disk transfer keeps today's gate. Changes live failover behavior for
+	// shared-disk VMs, so enable fleet-uniformly after every node is on the build.
+	SharedStorageFence bool `yaml:"shared_storage_fence,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

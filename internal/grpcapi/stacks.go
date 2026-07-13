@@ -790,6 +790,22 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	nets, _ := corrosion.ListNetworks(ctx, s.db)
 	for _, nr := range nets {
 		if networkBelongsToStack(nr, req.Name) && !externalNets[nr.Name] {
+			// Tear down the static subnet route injected on deploy (injectSubnetRoutes),
+			// which network.Deprovision otherwise leaves behind → CIDR reuse can misroute.
+			// RemoveSubnetRoute is idempotent (deletes only a route whose `via` matches),
+			// so attempting it for every active peer address on THIS host is safe.
+			// NOTE: the route was injected only on the host that ran DeployStack, so this
+			// cleanup is effective when delete runs where deploy ran; cross-host cleanup
+			// would need the same non-target-host fan-out the deploy path defers.
+			if def := networkRecordToDef(&nr); def.Subnet != "" {
+				if hosts, herr := corrosion.ListHosts(ctx, s.db); herr == nil {
+					for _, h := range hosts {
+						if h.Address != "" {
+							network.RemoveSubnetRoute(def.Subnet, h.Address)
+						}
+					}
+				}
+			}
 			if err := s.deprovisionNetworkByName(ctx, nr.Name); err != nil {
 				hadFailures = true
 				slog.Warn("stack network deprovision failed", "network", nr.Name, "error", err)

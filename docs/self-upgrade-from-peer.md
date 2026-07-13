@@ -4,11 +4,12 @@
 
 `lv host upgrade` is operator-initiated and only touches **reachable** hosts. A
 host that is **down during a cluster upgrade** comes back on its **old binary**
-and stays there — nothing auto-corrects it. If the upgrade bumped the schema by
-more than one version, that host's replication is then **refused** by the
-skew handshake (`internal/grpcapi/sync.go`), isolating it until an operator
-re-runs the upgrade. Even within tolerance, version drift is untidy and
-surprising.
+and stays there — nothing auto-corrects it. If the upgrade bumped the schema at
+all, that host is missing migrations, so its skew handshake
+(`internal/grpcapi/sync.go`) then **refuses** inbound mutations from the newer
+peers (a receiver rejects any sender strictly ahead of it — even by one),
+isolating it until an operator re-runs the upgrade. Even a same-schema version
+drift is untidy and surprising.
 
 This feature lets a lagging daemon **pull the newer binary from a healthy peer
 and self-upgrade**, with no operator action.

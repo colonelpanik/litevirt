@@ -14,7 +14,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/scheduler"
 )
 
@@ -83,12 +82,31 @@ func (s *Server) CreateBackupSchedule(ctx context.Context, req *pb.CreateBackupS
 func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName, projectName string) string {
 	switch scope {
 	case "pool":
-		// A malformed pool name must not map onto another pool's grant; an
-		// invalid one yields a sentinel that matches no normal grant.
-		if err := safename.ValidatePoolName(poolName); err != nil {
-			return "/storage/pools/\x00invalid"
+		// Authorize against the PROJECT-scoped pool path (matching pool CRUD/content, which
+		// moved to poolRBACPathFor); the legacy "/storage/pools/<name>" matched no
+		// currently-issued grant. Resolve the owning project from the stored pool record,
+		// and FAIL CLOSED to an unmatched sentinel when it can't be resolved to exactly one
+		// project — never emit a guessed path (an empty project would compose the real
+		// GLOBAL "/storage_pools/<name>" path a grant could match).
+		pools, err := corrosion.ListAllStoragePools(ctx, s.db)
+		if err != nil {
+			return "/storage_pools/\x00invalid" // can't verify → deny
 		}
-		return "/storage/pools/" + poolName
+		projects := map[string]bool{}
+		for _, p := range pools {
+			if p.Name == poolName {
+				projects[p.Project] = true // a found GLOBAL pool has Project "" — a valid, unique match
+			}
+		}
+		if len(projects) != 1 {
+			// 0 = unknown/deleted pool; ≥2 = same name across different projects (collision).
+			return "/storage_pools/\x00invalid"
+		}
+		var project string
+		for pr := range projects {
+			project = pr
+		}
+		return poolRBACPathFor(project, poolName)
 	case "project":
 		return projectRBACBase(projectName)
 	case "cluster":

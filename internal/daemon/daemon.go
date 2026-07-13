@@ -703,6 +703,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// masquerade + `inet litevirt` chains) a prior binary left for it.
 	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
 	svc.SetFirewallReconciler(d.fwReconciler)
+	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
 	d.fwReconciler.Start(ctx)
 
 	// tenancy + billing engine. The webhook URL is empty

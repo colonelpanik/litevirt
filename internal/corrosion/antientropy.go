@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -15,6 +16,12 @@ import (
 	"github.com/litevirt/litevirt/internal/pki"
 )
 
+// antiEntropyCooldown debounces manual/scheduled triggers: a pass won't start if one ran
+// within this window. Well under the default 60s interval (so a scheduled tick is never
+// debounced) and well above a hammer loop (so `lv cluster converge --all` in a tight loop
+// can't turn into a self-inflicted SQLite-lock load test).
+const antiEntropyCooldown = 12 * time.Second
+
 // AntiEntropy periodically compares state digests with peers and triggers
 // a full state merge when drift is detected. This is a safety net — the
 // primary replication path is the WAL-based Replicator.
@@ -22,6 +29,13 @@ type AntiEntropy struct {
 	client   *Client
 	pkiDir   string
 	interval time.Duration
+
+	// mu guards the trigger decision only (not the pass itself): a pass no-ops when one is
+	// already running or ran within antiEntropyCooldown. It never bypasses checkPeers's
+	// per-table digest-gating (merge only on mismatch) — it just decides whether to run.
+	mu         sync.Mutex
+	inProgress bool
+	lastRan    time.Time
 }
 
 // NewAntiEntropy creates an anti-entropy checker.
@@ -47,9 +61,32 @@ func (ae *AntiEntropy) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ae.checkPeers(ctx)
+			ae.RunOnce(ctx) // debounced; scheduled ticks share the trigger guard
 		}
 	}
+}
+
+// RunOnce runs a single anti-entropy pass now, unless one is already in progress or ran
+// within antiEntropyCooldown, in which case it no-ops. Returns true iff a pass actually ran.
+// It blocks until the pass completes, so a caller (e.g. `lv cluster converge`) can read
+// digests afterward knowing convergence was attempted. It ONLY schedules the existing pass —
+// checkPeers still merges a table only on a digest mismatch.
+func (ae *AntiEntropy) RunOnce(ctx context.Context) bool {
+	ae.mu.Lock()
+	if ae.inProgress || (!ae.lastRan.IsZero() && time.Since(ae.lastRan) < antiEntropyCooldown) {
+		ae.mu.Unlock()
+		return false
+	}
+	ae.inProgress = true
+	ae.mu.Unlock()
+
+	ae.checkPeers(ctx)
+
+	ae.mu.Lock()
+	ae.inProgress = false
+	ae.lastRan = time.Now()
+	ae.mu.Unlock()
+	return true
 }
 
 func (ae *AntiEntropy) checkPeers(ctx context.Context) {

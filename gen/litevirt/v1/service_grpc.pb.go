@@ -204,6 +204,8 @@ const (
 	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
 	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
 	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
+	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
+	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
 	LiteVirt_DiagnoseDivergence_FullMethodName         = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
 	LiteVirt_ScanSensitiveDivergence_FullMethodName    = "/litevirt.v1.LiteVirt/ScanSensitiveDivergence"
 	LiteVirt_PushMutations_FullMethodName              = "/litevirt.v1.LiteVirt/PushMutations"
@@ -484,6 +486,10 @@ type LiteVirtClient interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error)
+	// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
+	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
+	TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error)
+	GetClusterStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ClusterStateDigestResponse, error)
 	// ── Divergence scanner (Phase 0) ──
 	// DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
 	// and returns a classified cross-node divergence report. ScanSensitiveDivergence:
@@ -2637,6 +2643,26 @@ func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *Sensi
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
+func (c *liteVirtClient) TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TriggerAntiEntropyResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_TriggerAntiEntropy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetClusterStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ClusterStateDigestResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClusterStateDigestResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetClusterStateDigest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) DiagnoseDivergence(ctx context.Context, in *DiagnoseDivergenceRequest, opts ...grpc.CallOption) (*DivergenceReport, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DivergenceReport)
@@ -3221,6 +3247,10 @@ type LiteVirtServer interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(context.Context, *SensitiveStateRequest) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error
+	// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
+	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
+	TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error)
+	GetClusterStateDigest(context.Context, *emptypb.Empty) (*ClusterStateDigestResponse, error)
 	// ── Divergence scanner (Phase 0) ──
 	// DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
 	// and returns a classified cross-node divergence report. ScanSensitiveDivergence:
@@ -3857,6 +3887,12 @@ func (UnimplementedLiteVirtServer) GetSensitiveStateDigest(context.Context, *Sen
 }
 func (UnimplementedLiteVirtServer) StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error {
 	return status.Error(codes.Unimplemented, "method StreamSensitiveStateDump not implemented")
+}
+func (UnimplementedLiteVirtServer) TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TriggerAntiEntropy not implemented")
+}
+func (UnimplementedLiteVirtServer) GetClusterStateDigest(context.Context, *emptypb.Empty) (*ClusterStateDigestResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetClusterStateDigest not implemented")
 }
 func (UnimplementedLiteVirtServer) DiagnoseDivergence(context.Context, *DiagnoseDivergenceRequest) (*DivergenceReport, error) {
 	return nil, status.Error(codes.Unimplemented, "method DiagnoseDivergence not implemented")
@@ -7023,6 +7059,42 @@ func _LiteVirt_StreamSensitiveStateDump_Handler(srv interface{}, stream grpc.Ser
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpServer = grpc.ServerStreamingServer[StateDumpChunk]
 
+func _LiteVirt_TriggerAntiEntropy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TriggerAntiEntropyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).TriggerAntiEntropy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_TriggerAntiEntropy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).TriggerAntiEntropy(ctx, req.(*TriggerAntiEntropyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetClusterStateDigest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetClusterStateDigest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetClusterStateDigest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetClusterStateDigest(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_DiagnoseDivergence_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DiagnoseDivergenceRequest)
 	if err := dec(in); err != nil {
@@ -8199,6 +8271,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSensitiveStateDigest",
 			Handler:    _LiteVirt_GetSensitiveStateDigest_Handler,
+		},
+		{
+			MethodName: "TriggerAntiEntropy",
+			Handler:    _LiteVirt_TriggerAntiEntropy_Handler,
+		},
+		{
+			MethodName: "GetClusterStateDigest",
+			Handler:    _LiteVirt_GetClusterStateDigest_Handler,
 		},
 		{
 			MethodName: "DiagnoseDivergence",

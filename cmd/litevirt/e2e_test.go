@@ -545,6 +545,12 @@ func (m *mockClient) UpdateFDB(_ context.Context, _ *pb.UpdateFDBRequest, _ ...g
 func (m *mockClient) GetStateDigest(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (*pb.StateDigestResponse, error) {
 	return &pb.StateDigestResponse{HostName: "test-host"}, nil
 }
+func (m *mockClient) GetClusterStateDigest(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (*pb.ClusterStateDigestResponse, error) {
+	return &pb.ClusterStateDigestResponse{Hosts: []*pb.StateDigestResponse{{HostName: "test-host"}}}, nil
+}
+func (m *mockClient) TriggerAntiEntropy(_ context.Context, _ *pb.TriggerAntiEntropyRequest, _ ...grpc.CallOption) (*pb.TriggerAntiEntropyResponse, error) {
+	return &pb.TriggerAntiEntropyResponse{Triggered: []string{"test-host"}}, nil
+}
 func (m *mockClient) GetStateDump(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (*pb.StateDumpResponse, error) {
 	return &pb.StateDumpResponse{}, nil
 }

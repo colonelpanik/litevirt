@@ -43,8 +43,9 @@ lv top [--interval 3s]             # Live resource dashboard
 lv ui [--open]                     # Show web UI URL
 lv mcp [--max-list-items N] [--allow-write]  # Run the stdio MCP server for operator assistants
 lv version                         # Print version
-lv cluster digest                  # Per-table state digest for each host
-lv cluster sync                    # Pull full state from connected host and merge
+lv cluster digest                  # Per-table state digest for every host (fanned out server-side)
+lv cluster converge [--all]        # Kick an immediate anti-entropy pass + report cross-host convergence
+                                   #   (`lv cluster sync` is a deprecated alias)
 lv health                          # Cluster health matrix
 ```
 

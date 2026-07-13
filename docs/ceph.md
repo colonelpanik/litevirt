@@ -118,7 +118,7 @@ vms:
   db-1:
     image: ubuntu-24.04
     disks:
-      data: { size: 500G, volume: rbd-fast, format: raw }
+      data: { size: 500G, storage: rbd-fast, format: raw }
 ```
 
 `format: raw` is required for Ceph RBD — qcow2 over rbd costs you the

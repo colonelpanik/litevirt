@@ -110,12 +110,16 @@ sign the resulting JSON with a separate signing key.
 
 ## Operational notes
 
-- The chain is **per-cluster**, not per-host. Audit rows replicate via
-  Corrosion like any other table; the chain hashes are computed on
-  the writer host at insert time and replicated as a normal column
-  value. Two hosts inserting simultaneously each link to whichever
-  row their own HLC saw last — a slight ambiguity that does not
-  weaken tamper-detection (a missing row still breaks the chain).
+- **The rows are per-cluster; the hash chain is per-host.** Audit rows
+  replicate via Corrosion like any other table (append-only,
+  `INSERT OR IGNORE`), so every host sees every row. The chain hashes are
+  computed on the writer host at insert time and replicated as normal
+  column values, but each row's `prev_hash` links only to the previous row
+  written by the **same** host — so each host has an independent sub-chain.
+  `verify` walks the rows ordered by `host_name` and validates each host's
+  sub-chain against a per-host running tail. Because a host only authors its
+  own rows, concurrent inserts on different hosts can't fork a single chain,
+  and a missing or altered row still breaks that host's sub-chain.
 - A clock skew that violates HLC's `MaxSkewMS` is clamped, so a wildly
   wrong host clock cannot reorder audit rows in a way that breaks the
   chain.

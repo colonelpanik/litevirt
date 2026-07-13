@@ -133,6 +133,19 @@ func (v *VMChecker) sweep(ctx context.Context) {
 		return
 	}
 
+	// Prune per-VM tracking for VMs no longer on this host, so a deleted VM neither
+	// leaks these maps nor keeps poisoning isCorrelatedFailure below with a stale
+	// failures[…] ≥ 2 (which would wrongly suppress auto-restart of healthy VMs).
+	// Behind the ListVMs-success guard above so a transient DB error can't wipe live
+	// counters mid-episode. Benign race: an in-flight async checkVM for a just-deleted
+	// VM can repopulate its key AFTER this prune; the next sweep re-prunes it — do NOT
+	// "fix" that by holding v.mu across the whole sweep.
+	current := make(map[string]bool, len(vms))
+	for i := range vms {
+		current[vms[i].Name] = true
+	}
+	v.pruneVMState(current)
+
 	// Pre-sweep: count how many VMs are in a failing state. If many are
 	// failing simultaneously, it's likely correlated (NFS outage, etc.) (#47).
 	if v.isCorrelatedFailure() {
@@ -197,6 +210,39 @@ func (v *VMChecker) sweep(ctx context.Context) {
 			continue
 		}
 		v.maybeRestartVM(ctx, vm, now)
+	}
+}
+
+// pruneVMState drops per-VM tracking (failures/lastAction/actionCount) for VMs not in the
+// current host-scoped set. Called from sweep after a successful ListVMs so a deleted (or
+// moved-away) VM stops leaking and stops counting toward isCorrelatedFailure. Also drops a
+// zero-valued activeActions entry for a stack that has no VMs mid-action (minor leak only).
+func (v *VMChecker) pruneVMState(current map[string]bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for name := range v.failures {
+		if !current[name] {
+			delete(v.failures, name)
+			delete(v.lastAction, name)
+			delete(v.actionCount, name)
+		}
+	}
+	// lastAction/actionCount may hold keys not in failures (e.g. failures reset to 0 then
+	// deleted) — sweep those independently.
+	for name := range v.lastAction {
+		if !current[name] {
+			delete(v.lastAction, name)
+		}
+	}
+	for name := range v.actionCount {
+		if !current[name] {
+			delete(v.actionCount, name)
+		}
+	}
+	for stack, n := range v.activeActions {
+		if n == 0 {
+			delete(v.activeActions, stack)
+		}
 	}
 }
 

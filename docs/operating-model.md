@@ -36,9 +36,10 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   and is the safety net for divergence the WAL replicator missed. Public,
   operator-readable state uses `StreamStateDump`; eligible secret-bearing config
   uses a separate peer-mTLS-only sensitive dump. The older unary `GetStateDump`
-  is retained as a fallback for mixed-version clusters and is the path
-  `lv cluster sync` still uses, so manual operator sync intentionally remains
-  redacted.
+  is retained as a fallback for mixed-version clusters. Convergence is automatic;
+  `lv cluster converge` only *accelerates* it (kicks an immediate anti-entropy
+  pass) and *verifies* it (cross-host digest report) — it never exports or merges
+  redacted state itself.
 
 ### HA / Failover
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh
@@ -109,8 +110,9 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 
 ### Secret-bearing repair is peer-only
 - Secret-bearing config is **excluded from the operator-readable full-state
-  dump**. `lv cluster sync` and `GetStateDump` do not export registry passwords,
-  notification webhook URLs, or 2FA material.
+  dump**. `GetStateDump` (and the `lv cluster converge` digest report, which shows
+  only table hashes) do not export registry passwords, notification webhook URLs,
+  or 2FA material.
 - Eligible secret-bearing config (`registry_credentials`,
   `notification_targets`, `notification_routes`, `user_2fa`, `user_2fa_sets`,
   `recovery_codes`, `recovery_code_sets`) is repaired by a separate peer-mTLS-only

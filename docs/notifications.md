@@ -7,7 +7,7 @@ out to multiple typed targets selected by **routes** (event-pattern + minimum
 severity). The implementation is `internal/notify`; targets/routes are stored in
 the `notification_targets` / `notification_routes` tables and replicated to
 peers. Because their config can carry webhook tokens/URLs, they are excluded
-from the operator-readable `GetStateDump` / `lv cluster sync` path, but daemon
+from the operator-readable `GetStateDump` path, but daemon
 peers repair missed pushes through a peer-mTLS-only sensitive anti-entropy lane.
 
 ## Model

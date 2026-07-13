@@ -115,3 +115,18 @@ func (c *Client) UnresolvedTieCount() int {
 	defer c.tieMu.Unlock()
 	return len(c.unresolvedTies)
 }
+
+// UnresolvedTieTables returns the count of currently-tracked unresolved ties per table
+// (keys are the `table\x00pk` unresolvedKey form — split on the NUL). Lets a divergence
+// report attribute a cross-host hash mismatch to a deliberate safety-fault tie vs real drift.
+func (c *Client) UnresolvedTieTables() map[string]int {
+	c.tieMu.Lock()
+	defer c.tieMu.Unlock()
+	out := make(map[string]int, len(c.unresolvedTies))
+	for k := range c.unresolvedTies {
+		if i := strings.IndexByte(k, 0); i > 0 {
+			out[k[:i]]++
+		}
+	}
+	return out
+}

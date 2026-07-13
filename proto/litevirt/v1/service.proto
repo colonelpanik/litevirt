@@ -1489,11 +1489,36 @@ message TableDigest {
     string name  = 1;
     int32  count = 2;
     string hash  = 3;
+    // unresolved_ties is the number of equal-timestamp LWW ties this host is currently
+    // tracking for this table with no applicable resolver rule — deliberate, safety-fault
+    // divergence (NOT drift). A cross-host hash mismatch on a table with unresolved_ties > 0
+    // is expected until `lv doctor repair-owner`; the verify report must not count it as drift.
+    int32  unresolved_ties = 4;
 }
 
 message StateDigestResponse {
     string host_name                = 1;
     repeated TableDigest tables     = 2;
+}
+
+// TriggerAntiEntropy kicks an immediate anti-entropy pass (rather than waiting for the
+// periodic tick), debounced per node. With all=true the connected host also relays the
+// trigger to each active peer (one level, no recursion). Operator- or peer-callable.
+message TriggerAntiEntropyRequest { bool all = 1; }
+message TriggerAntiEntropyResponse {
+    repeated string triggered   = 1; // hosts where a pass ran this call
+    repeated string debounced   = 2; // hosts where a pass was skipped (in progress / within cooldown)
+    repeated string unreachable = 3; // peers that could not be reached (all=true)
+    repeated string unsupported = 4; // peers on an older binary without this RPC (all=true)
+}
+
+// GetClusterStateDigest fans GetStateDigest + GetSensitiveStateDigest out to every active
+// host (self locally, peers via host-cert relay) so an operator connected to ONE node sees
+// cross-host convergence. Operator- or peer-callable.
+message ClusterStateDigestResponse {
+    repeated StateDigestResponse hosts = 1; // per-host merged (public + sensitive) table digests
+    repeated string unreachable        = 2; // active hosts that could not be reached
+    repeated string unsupported        = 3; // active hosts on an older binary without this RPC
 }
 
 message StateDumpResponse {
@@ -1909,6 +1934,10 @@ service LiteVirt {
     // operator or REST surface.
     rpc GetSensitiveStateDigest(SensitiveStateRequest) returns (StateDigestResponse);
     rpc StreamSensitiveStateDump(SensitiveStateRequest) returns (stream StateDumpChunk);
+    // TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
+    // fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
+    rpc TriggerAntiEntropy(TriggerAntiEntropyRequest) returns (TriggerAntiEntropyResponse);
+    rpc GetClusterStateDigest(google.protobuf.Empty) returns (ClusterStateDigestResponse);
 
     // ── Divergence scanner (Phase 0) ──
     // DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out

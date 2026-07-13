@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -19,107 +21,149 @@ func newClusterCmd() *cobra.Command {
 	}
 	cmd.AddCommand(
 		newClusterDigestCmd(),
-		newClusterSyncCmd(),
+		newClusterConvergeCmd(),
 	)
 	return cmd
 }
 
-// lv cluster digest — compare state digests across all hosts.
+// lv cluster digest — per-table state digest for EVERY host, aggregated server-side (the
+// connected host fans GetStateDigest/GetSensitiveStateDigest out to its peers), so it works
+// from a single connection.
 func newClusterDigestCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "digest",
-		Short: "Show per-table state digest for each host",
+		Short: "Show per-table state digest for every host",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				// Get local host's digest.
-				local, err := c.GetStateDigest(ctx, &emptypb.Empty{})
+				dig, err := c.GetClusterStateDigest(ctx, &emptypb.Empty{})
 				if err != nil {
-					return fmt.Errorf("get digest: %w", err)
+					return fmt.Errorf("cluster digest: %w", err)
 				}
-
-				// Get all hosts so we can compare across the cluster.
-				hosts, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
-				if err != nil {
-					return fmt.Errorf("list hosts: %w", err)
-				}
-
-				// Collect digests: connected host is always available.
-				type hostDigest struct {
-					host   string
-					tables []*pb.TableDigest
-				}
-				all := []hostDigest{{host: local.HostName, tables: local.Tables}}
-
-				// For other hosts, we'd need to connect to each.
-				// For now, show what we have from the connected host and
-				// indicate how many peers exist.
 				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-				fmt.Fprintf(w, "HOST\tTABLE\tROWS\tHASH\n")
-				for _, hd := range all {
-					for _, t := range hd.tables {
-						if t.Count == 0 {
+				fmt.Fprintf(w, "HOST\tTABLE\tROWS\tHASH\tTIES\n")
+				for _, h := range dig.GetHosts() {
+					for _, t := range h.GetTables() {
+						if t.GetCount() == 0 && t.GetUnresolvedTies() == 0 {
 							continue
 						}
-						fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", hd.host, t.Name, t.Count, t.Hash)
+						ties := ""
+						if t.GetUnresolvedTies() > 0 {
+							ties = fmt.Sprintf("%d", t.GetUnresolvedTies())
+						}
+						fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", h.GetHostName(), t.GetName(), t.GetCount(), t.GetHash(), ties)
 					}
 				}
 				w.Flush()
-
-				if len(hosts.GetHosts()) > 1 {
-					fmt.Printf("\nTo compare across hosts, run this command against each host:\n")
-					fmt.Printf("  LV_HOST=user@<host-address> lv cluster digest\n")
-				}
+				printCoverageGaps(dig)
 				return nil
 			})
 		},
 	}
 }
 
-// lv cluster sync — pull state from the connected host and merge.
-func newClusterSyncCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "sync",
-		Short: "Pull full state from the connected host and merge locally",
-		Long: `Force a full state sync from the connected litevirtd host.
+// lv cluster converge — kick an immediate anti-entropy pass and verify cross-host convergence.
+func newClusterConvergeCmd() *cobra.Command {
+	var all bool
+	cmd := &cobra.Command{
+		Use:     "converge",
+		Aliases: []string{"sync"},
+		Short:   "Kick an immediate anti-entropy pass and report cross-host convergence",
+		Long: `Cluster state converges automatically via anti-entropy (roughly once a minute) plus
+WAL replication. This command ACCELERATES that (kick a pass now instead of waiting) and
+VERIFIES it (report per-table digest convergence across hosts). It does not merge or repair
+state by itself.
 
-This fetches the complete state dump from the daemon and merges it
-into the daemon's local database. Use this to repair state drift
-after network partitions or gossip failures.
+  --all   relay the kick to every active peer as well (default: only the connected host)
 
-When run on a cluster host, it pulls state from a peer:
-  LV_HOST=user@host2 lv cluster sync`,
+Divergence caused by a deliberate safety fault — unresolved equal-timestamp LWW ties, which
+anti-entropy will NOT auto-merge — is labelled as such; resolve those with
+'lv doctor repair-owner', not by re-running this. For a row-level scan use 'lv doctor divergence'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.CalledAs() == "sync" {
+				fmt.Fprintln(os.Stderr, "note: `lv cluster sync` is deprecated — use `lv cluster converge`")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				// Get digest before sync.
-				before, err := c.GetStateDigest(ctx, &emptypb.Empty{})
+				tr, err := c.TriggerAntiEntropy(ctx, &pb.TriggerAntiEntropyRequest{All: all})
 				if err != nil {
-					return fmt.Errorf("get digest: %w", err)
+					return fmt.Errorf("trigger anti-entropy: %w", err)
 				}
-
-				// Get full state dump.
-				dump, err := c.GetStateDump(ctx, &emptypb.Empty{})
+				printTriggerSummary(tr)
+				dig, err := c.GetClusterStateDigest(ctx, &emptypb.Empty{})
 				if err != nil {
-					return fmt.Errorf("get state dump: %w", err)
+					return fmt.Errorf("cluster digest: %w", err)
 				}
-
-				fmt.Printf("Received state dump from %s (%d bytes)\n", before.HostName, len(dump.Data))
-
-				// The dump is from the connected host. To actually merge it
-				// into another host, we'd need to connect to the target and
-				// push. For now, this verifies the sync infrastructure works
-				// and prints the digest for comparison.
-				fmt.Printf("\nState digest for %s:\n", before.HostName)
-				total := 0
-				for _, t := range before.Tables {
-					if t.Count > 0 {
-						fmt.Printf("  %-20s %d rows  %s\n", t.Name, t.Count, t.Hash)
-						total += int(t.Count)
-					}
-				}
-				fmt.Printf("  Total: %d rows\n", total)
-
+				printConvergence(dig)
 				return nil
 			})
 		},
+	}
+	cmd.Flags().BoolVar(&all, "all", false, "relay the anti-entropy kick to every active peer")
+	return cmd
+}
+
+func printTriggerSummary(tr *pb.TriggerAntiEntropyResponse) {
+	line := func(label string, hosts []string) {
+		if len(hosts) > 0 {
+			fmt.Printf("  %-12s %s\n", label+":", strings.Join(hosts, ", "))
+		}
+	}
+	fmt.Println("Anti-entropy pass:")
+	line("triggered", tr.GetTriggered())
+	line("debounced", tr.GetDebounced()) // ran too recently — a pass is already fresh
+	line("unreachable", tr.GetUnreachable())
+	line("older-binary", tr.GetUnsupported())
+}
+
+// printConvergence groups the per-host digests by table and reports each table's convergence,
+// distinguishing real drift from deliberate safety-fault ties. Converged tables are summarized,
+// not listed.
+func printConvergence(dig *pb.ClusterStateDigestResponse) {
+	type cell struct {
+		hash string
+	}
+	tables := map[string]map[string]cell{} // table -> host -> cell
+	ties := map[string]int32{}             // table -> total unresolved ties across hosts
+	var order []string
+	for _, h := range dig.GetHosts() {
+		for _, t := range h.GetTables() {
+			if _, ok := tables[t.GetName()]; !ok {
+				tables[t.GetName()] = map[string]cell{}
+				order = append(order, t.GetName())
+			}
+			tables[t.GetName()][h.GetHostName()] = cell{hash: t.GetHash()}
+			ties[t.GetName()] += t.GetUnresolvedTies()
+		}
+	}
+	sort.Strings(order)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "\nTABLE\tSTATUS\tDETAIL\n")
+	converged := 0
+	for _, name := range order {
+		hosts := tables[name]
+		hashes := map[string]bool{}
+		for _, c := range hosts {
+			hashes[c.hash] = true
+		}
+		switch {
+		case len(hashes) <= 1:
+			converged++
+		case ties[name] > 0:
+			fmt.Fprintf(w, "%s\tSAFETY-FAULT\t%d unresolved tie(s) — deliberate; run `lv doctor repair-owner`\n", name, ties[name])
+		default:
+			fmt.Fprintf(w, "%s\tDIVERGENT\thashes differ across %d hosts (drift)\n", name, len(hosts))
+		}
+	}
+	w.Flush()
+	fmt.Printf("\n%d/%d table(s) converged across %d reporting host(s).\n", converged, len(order), len(dig.GetHosts()))
+	printCoverageGaps(dig)
+}
+
+func printCoverageGaps(dig *pb.ClusterStateDigestResponse) {
+	if len(dig.GetUnreachable()) > 0 {
+		fmt.Printf("⚠ unreachable (state NOT verified): %s\n", strings.Join(dig.GetUnreachable(), ", "))
+	}
+	if len(dig.GetUnsupported()) > 0 {
+		fmt.Printf("⚠ older binary (no cluster-digest RPC): %s\n", strings.Join(dig.GetUnsupported(), ", "))
 	}
 }

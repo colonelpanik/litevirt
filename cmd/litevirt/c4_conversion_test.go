@@ -62,7 +62,8 @@ func TestC4_ConvertedCommandsRun(t *testing.T) {
 		{"status", []string{"status"}, ""},
 		// cluster.go
 		{"cluster digest", []string{"cluster", "digest"}, ""},
-		{"cluster sync", []string{"cluster", "sync"}, "Received state dump"},
+		{"cluster converge", []string{"cluster", "converge"}, "Anti-entropy pass"},
+		{"cluster sync", []string{"cluster", "sync"}, "Anti-entropy pass"}, // deprecated alias of converge
 		// firewall.go
 		{"firewall reload", []string{"firewall", "reload"}, "Reloaded"},
 		// rebuild.go

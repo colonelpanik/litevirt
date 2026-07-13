@@ -229,6 +229,11 @@ type Server struct {
 	// `lv firewall reload` push semantics rather than a 30s wait.
 	fwReconciler FirewallReconciler
 
+	// antiEntropy is the daemon's anti-entropy loop. TriggerAntiEntropy calls RunOnce on
+	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
+	// for the periodic tick. Same synchronous-push pattern as fwReconciler.
+	antiEntropy AntiEntropyTrigger
+
 	// tenancy gates CreateVM/stack admission against project quotas
 	// and emits metered billing events. Optional — nil means
 	// unbounded admission + no billing.
@@ -573,6 +578,13 @@ type FirewallReconciler interface {
 	LastTick() time.Time
 }
 
+// AntiEntropyTrigger runs a single debounced anti-entropy pass (corrosion.AntiEntropy).
+// RunOnce returns true iff a pass actually ran (false = debounced: already running or
+// within cooldown).
+type AntiEntropyTrigger interface {
+	RunOnce(ctx context.Context) bool
+}
+
 // ContainerRuntime is the subset of internal/lxc.Runtime the gRPC
 // layer calls. Defined here (not imported) so server.go doesn't pull
 // internal/lxc into every test that constructs a Server.
@@ -694,6 +706,10 @@ func (s *Server) RealmRegistry() *auth.Registry { return s.realmRegistry }
 // SetFirewallReconciler wires the daemon's firewall reconciler so the
 // ReloadFirewall RPC can drive a synchronous Reconcile.
 func (s *Server) SetFirewallReconciler(r FirewallReconciler) { s.fwReconciler = r }
+
+// SetAntiEntropy wires the daemon's anti-entropy loop so TriggerAntiEntropy can drive an
+// immediate (debounced) pass for `lv cluster converge`.
+func (s *Server) SetAntiEntropy(a AntiEntropyTrigger) { s.antiEntropy = a }
 
 // reconcileFirewall applies the firewall ruleset now, best-effort. Callers use it
 // after writing/deleting host_fw_intent (NAT/SNAT/isolation) so the change takes

@@ -282,10 +282,14 @@ func TestSnapshotHasSubcommands(t *testing.T) {
 
 func TestClusterHasSubcommands(t *testing.T) {
 	cmd := newClusterCmd()
-	for _, name := range []string{"digest", "sync"} {
+	for _, name := range []string{"digest", "converge"} {
 		if findSubcommand(cmd, name) == nil {
 			t.Errorf("cluster missing subcommand %q", name)
 		}
+	}
+	// `sync` is retained as a deprecated alias of `converge`.
+	if c, _, err := cmd.Find([]string{"sync"}); err != nil || c.Name() != "converge" {
+		t.Errorf("`sync` should resolve to the converge alias, got %v (err %v)", c, err)
 	}
 }
 

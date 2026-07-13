@@ -170,6 +170,15 @@ type Server struct {
 	migrationMetrics *metrics.MigrationMetrics
 	lbMetrics        *metrics.LBMetrics
 	haMetrics        *metrics.HAHealthMetrics
+	dualRunMetrics   *metrics.DualRunMetrics
+
+	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
+	// gather (self-local + peer ReportRuntime): when non-nil it replaces the real probes,
+	// returning the snapshot per successfully-gathered host, the hosts that could not be
+	// reached this pass (a coverage gap), and the hosts on an older binary that does not
+	// implement ReportRuntime (surfaced but NOT paged as a coverage gap — expected during
+	// a rolling upgrade).
+	gatherRuntimeOverride func(ctx context.Context, hosts []string) (snaps map[string]runtimeSnapshot, unreachable, unsupported []string)
 
 	// storagePools holds host-level pool refs (name → ref) used to resolve
 	// move/replicate/compose volume targets. Seeded from daemon config at
@@ -797,6 +806,11 @@ func (s *Server) SetLBMetrics(m *metrics.LBMetrics) {
 // SetHAHealthMetrics attaches the persistent HA-degraded gauge (Phase 2 H1).
 func (s *Server) SetHAHealthMetrics(m *metrics.HAHealthMetrics) {
 	s.haMetrics = m
+}
+
+// SetDualRunMetrics attaches the leader-gated dual-run detector gauges.
+func (s *Server) SetDualRunMetrics(m *metrics.DualRunMetrics) {
+	s.dualRunMetrics = m
 }
 
 // recordLBKeepalived publishes whether this host's keepalived for lbName is

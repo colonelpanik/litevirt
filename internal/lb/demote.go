@@ -155,6 +155,29 @@ func (m *Manager) VIPAssigned(vip, iface string) (bool, error) {
 	return addrShowHasVIP(string(out), vip), nil
 }
 
+// AssignedVIPs returns, of the given VIPs (each a bare IP or a CIDR), the subset currently
+// assigned on this host's KERNEL — a SINGLE `ip addr` dump matched against every VIP,
+// rather than one dump per VIP. Keys in the result are BARE IPs (prefix stripped) so a
+// VIP configured as a CIDR groups with the same bare address a peer reports. Fails closed:
+// any `ip` error returns the error (an UNKNOWN kernel state must never read as "none
+// assigned").
+func (m *Manager) AssignedVIPs(vips []string) (map[string]bool, error) {
+	if len(vips) == 0 {
+		return nil, nil
+	}
+	out, err := exec.Command("ip", "-o", "addr", "show").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("ip addr show: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	res := make(map[string]bool, len(vips))
+	for _, v := range vips {
+		if v != "" && addrShowHasVIP(string(out), v) {
+			res[bareIP(v)] = true
+		}
+	}
+	return res, nil
+}
+
 // ClaimsVIP reports whether THIS host could hold OR become master of vip — the by-VIP
 // ownership signal Phase 2 needs. It is true if this host renders a keepalived config
 // whose virtual_ipaddress includes vip (a VRRP participant: the MASTER holds the address,

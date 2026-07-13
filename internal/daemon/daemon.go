@@ -573,6 +573,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
+	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	svc.SetReplicator(repl)
 	svc.SetAuthEngine(d.authEngine)
@@ -681,6 +682,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.
 	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
+	// Leader-gated dual-run detector: alert-only cross-check that no workload/VIP runs on
+	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
+	// the work so the fleet pages once, not N times.
+	go svc.RunDualRunDetector(ctx, 60*time.Second)
 
 	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
 	ipScanner := grpcapi.NewIPScanner(svc)

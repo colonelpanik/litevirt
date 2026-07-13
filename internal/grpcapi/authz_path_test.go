@@ -46,14 +46,5 @@ func TestRBACPathBuilders(t *testing.T) {
 	}
 }
 
-// TestScheduleRBACTarget_PoolSentinel verifies a malformed pool name yields the
-// deny-safe sentinel rather than concatenating into a real pool's grant.
-func TestScheduleRBACTarget_PoolSentinel(t *testing.T) {
-	s := &Server{}
-	if got := s.scheduleRBACTarget(nil, "pool", "", "main", ""); got != "/storage/pools/main" {
-		t.Errorf("good pool = %q", got)
-	}
-	if got := s.scheduleRBACTarget(nil, "pool", "", "../etc", ""); got != "/storage/pools/\x00invalid" {
-		t.Errorf("bad pool = %q, want sentinel", got)
-	}
-}
+// Pool-scoped schedule RBAC (project-scoped path + fail-closed sentinels) is covered by
+// TestScheduleRBACTarget_PoolProjectScoped in backup_schedule_rbac_test.go.

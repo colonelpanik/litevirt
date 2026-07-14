@@ -271,7 +271,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		if err != nil {
 			slog.Warn("VFIO bind failed", "address", addr, "error", err)
 			// Roll back: release all assigned devices.
-			s.releaseDevices(ctx, vmName)
+			s.releaseDeviceSet(ctx, vmName, addresses)
 			return nil, status.Errorf(codes.Internal,
 				"failed to bind device %s to vfio-pci: %v", addr, err)
 		}
@@ -301,6 +301,29 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) {
 
 	if err := corrosion.ReleasePCIDevicesByVM(ctx, s.db, vmName); err != nil {
 		slog.Warn("failed to release PCI devices in DB", "vm", vmName, "error", err)
+	}
+}
+
+// releaseDeviceSet rolls back EXACTLY the devices an allocation claimed (unbind
+// from vfio-pci + owner-scoped DB release), leaving the VM's pre-existing
+// passthrough devices untouched. This is the rollback primitive for a FAILED
+// allocation/attach — using the whole-VM releaseDevices there would over-release
+// every device the VM already owned.
+func (s *Server) releaseDeviceSet(ctx context.Context, vmName string, addrs []string) {
+	drivers := map[string]string{}
+	if devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); err == nil {
+		for _, d := range devices {
+			drivers[d.Address] = d.Driver
+		}
+	}
+	for _, addr := range addrs {
+		if err := vfio.Unbind(addr, drivers[addr]); err != nil {
+			slog.Warn("VFIO unbind failed", "address", addr, "error", err)
+		}
+		// Owner-scoped: a no-op if another VM has since claimed this address.
+		if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
+			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
+		}
 	}
 }
 
@@ -393,7 +416,7 @@ func (s *Server) allocateSRIOVVFs(ctx context.Context, vmName string, spec *pb.D
 	for _, addr := range vfAddrs {
 		if _, err := vfio.Bind(addr); err != nil {
 			slog.Warn("VFIO bind VF failed", "address", addr, "error", err)
-			s.releaseDevices(ctx, vmName)
+			s.releaseDeviceSet(ctx, vmName, vfAddrs)
 			return nil, status.Errorf(codes.Internal,
 				"failed to bind VF %s to vfio-pci: %v", addr, err)
 		}

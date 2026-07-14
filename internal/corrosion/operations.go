@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -196,6 +197,87 @@ func ListOperationSteps(ctx context.Context, c *Client, operationID string, owne
 		}
 	}
 	return out, nil
+}
+
+// BeginVMOperation atomically claims a VM for an operation. In ONE transaction
+// it verifies the VM's expected owner epoch + spec generation and that no OTHER
+// operation holds the barrier, then sets the desired spec, bumps spec_generation,
+// sets active_operation_id, and writes the operation header + its 'planned' step.
+// Returns applied=false (no error) when the preconditions no longer hold — a
+// concurrent operation holds the barrier, or the epoch/generation is stale — so
+// the caller defers/retries. It is idempotent for the SAME operation id (a retry
+// after this op already holds the barrier is a no-op that still reports applied).
+// After a successful first claim the VM's spec_generation is expectedSpecGen+1;
+// use that (with ownerEpoch) for CompleteVMOperation.
+func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desiredSpec string, expectedOwnerEpoch, expectedSpecGen int64) (bool, error) {
+	now := c.NowTS()
+	guard := func(tx *sql.Tx) (bool, error) {
+		var ownerEpoch, specGen int64
+		var activeOp string
+		err := tx.QueryRowContext(ctx,
+			`SELECT vm_owner_epoch, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`,
+			op.ResourceID).Scan(&ownerEpoch, &specGen, &activeOp)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if activeOp == op.ID {
+			return true, nil // already begun (retry) — the guarded stmts below no-op
+		}
+		if activeOp != "" {
+			return false, nil // barrier held by another operation
+		}
+		return ownerEpoch == expectedOwnerEpoch && specGen == expectedSpecGen, nil
+	}
+	stmts := []Statement{
+		// Self-contained CAS so a retry (active_operation_id already set) is a no-op.
+		{SQL: `UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, active_operation_id = ?, updated_at = ?
+		       WHERE name = ? AND active_operation_id = '' AND vm_owner_epoch = ? AND spec_generation = ?`,
+			Params: []interface{}{desiredSpec, op.ID, now, op.ResourceID, expectedOwnerEpoch, expectedSpecGen}},
+		{SQL: `INSERT OR IGNORE INTO operations (` + operationCols + `)
+		       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			Params: []interface{}{op.ID, op.Method, op.Principal, op.Project, op.ResourceKind, op.ResourceID,
+				op.OperationKind, op.RequestHash, op.IdempotencyKey, op.ReservationJSON, op.DesiredRef,
+				expectedOwnerEpoch, nowRFC3339(), now}},
+		{SQL: `INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
+		       VALUES (?, ?, ?, '', ?, ?, NULL)`,
+			Params: []interface{}{op.ID, expectedOwnerEpoch, OpStepPlanned, nowRFC3339(), now}},
+	}
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// CompleteVMOperation clears the VM's mutation barrier ONLY if this operation
+// still holds it at the expected owner epoch + spec generation (so a stale writer
+// whose op was superseded cannot clear a newer op's barrier), and records the
+// 'completed' step — atomically. Returns applied=false when the CAS no longer
+// matches.
+func (c *Client) CompleteVMOperation(ctx context.Context, vmName, operationID string, ownerEpoch, expectedSpecGen int64) (bool, error) {
+	now := c.NowTS()
+	guard := func(tx *sql.Tx) (bool, error) {
+		var oe, sg int64
+		var activeOp string
+		err := tx.QueryRowContext(ctx,
+			`SELECT vm_owner_epoch, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`,
+			vmName).Scan(&oe, &sg, &activeOp)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return activeOp == operationID && oe == ownerEpoch && sg == expectedSpecGen, nil
+	}
+	stmts := []Statement{
+		{SQL: `UPDATE vms SET active_operation_id = '', updated_at = ?
+		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`,
+			Params: []interface{}{now, vmName, operationID, ownerEpoch, expectedSpecGen}},
+		{SQL: `INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
+		       VALUES (?, ?, ?, '', ?, ?, NULL)`,
+			Params: []interface{}{operationID, ownerEpoch, OpStepCompleted, nowRFC3339(), now}},
+	}
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
 
 // OperationCurrentState reduces an operation's recorded steps (for the given

@@ -110,6 +110,15 @@ lv role grant Viewer   group:contractors@ldap:corp --path /projects/acme
 only — server-side filtered). `lv role revoke <binding-id>` soft-deletes
 a row by id.
 
+Grants and revokes take effect **immediately**, without a daemon restart: a
+grant reloads the engine synchronously, a revoke applies as an in-memory delta
+(so it holds even if a subsequent reload fails, while the row tombstone keeps a
+later reload from resurrecting it), and a ~30s backstop reload picks up bindings
+mutated on a **peer** — the effective bound on a peer-side change is one
+successful reload interval after it becomes locally visible. Deleting a user
+tombstones that user's role bindings in the same transaction, so a deleted
+account cannot retain access through a lingering binding.
+
 ## Sessions
 
 `Login` mints an opaque session id (32 random bytes hex-encoded, prefixed
@@ -267,6 +276,36 @@ true` on every node; the HA monitor drives the latch while the cluster is health
 and the config flag stays the reversible kill switch (set it false + restart to
 stand down, regardless of the latch marker). Validate on an ephemeral cluster
 before enabling.
+
+### Realm-aware role bindings (`auth.rbac_realm`)
+
+Role bindings enforce against **realm-qualified** principals
+(`user:<name>@<realm>`), so a legacy **bare** grant (`user:<name>`) never matches
+and is inert. `auth.rbac_realm` opts a node into realm-aware grant grammar so it
+stops minting new inert bindings. Like `auth.strict_mtls_identity`, it is gated by
+the config flag **and** the `rbac_realm_v1` capability latched cluster-wide, and
+the flag is the reversible kill switch (default false):
+
+- **Flag off (default):** a bare grant is stored verbatim — legacy behavior,
+  mixed-version-safe.
+- **Flag on, not yet latched:** a bare `user:<name>` grant is **rejected**
+  (`FailedPrecondition`) — specify an explicit realm. This is the safe
+  pre-uniformity state: while any peer might still mint bare bindings, we refuse
+  rather than canonicalize.
+- **Flag on and latched fleet-wide:** a bare grant for a **known local user** is
+  **resolved** to `user:<name>@local` and stored canonically; one that names no
+  known local user is rejected (spell out the realm).
+
+The grammar treats a principal as realm-qualified only when the part after the
+last `@` names a realm (`local`, `oidc:*`, `ldap:*`) — so `user:alice@example.com`
+is a bare username (an email), while `user:alice@oidc:corp` is realm-qualified.
+
+Existing bare bindings created before enabling this remain **inert** (they never
+granted access) until rewritten. Once the capability has latched fleet-wide, run
+the one-time idempotent migration `lv role normalize` (supports `--dry-run`) to
+rewrite resolvable legacy bare rows to canonical form; a bare binding whose realm
+can't be resolved is left in place and reported as skipped. External OIDC/LDAP
+**group** bindings are not yet enforced (group claims are not session-persisted).
 
 ### Forwarded identity (`auth.forwarded_identity`)
 

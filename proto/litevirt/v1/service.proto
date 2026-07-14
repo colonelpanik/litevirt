@@ -1020,6 +1020,18 @@ message RevokeRoleResponse {}
 message ListRoleBindingsRequest  { string principal = 1; } // empty = all
 message ListRoleBindingsResponse { repeated RoleBinding bindings = 1; }
 
+// NormalizeRoleBindings rewrites legacy bare `user:<name>` bindings to the
+// canonical realm-qualified form (`user:<name>@<realm>`) so they enforce. It is
+// a deliberate, idempotent one-time admin job — run once after auth.rbac_realm
+// is enabled fleet-wide and the rbac_realm_v1 capability has latched.
+message NormalizeRoleBindingsRequest {
+    bool dry_run = 1; // when true, report what WOULD change without writing
+}
+message NormalizeRoleBindingsResponse {
+    int32 normalized = 1; // bare bindings rewritten to canonical form
+    int32 skipped    = 2; // bare bindings whose realm could not be resolved
+}
+
 // Live restore from backup. The handler:
 //
 //   1. Opens the manifest's chunk reader.
@@ -1809,6 +1821,7 @@ service LiteVirt {
     rpc GrantRole(GrantRoleRequest)               returns (GrantRoleResponse);
     rpc RevokeRole(RevokeRoleRequest)             returns (RevokeRoleResponse);
     rpc ListRoleBindings(ListRoleBindingsRequest) returns (ListRoleBindingsResponse);
+    rpc NormalizeRoleBindings(NormalizeRoleBindingsRequest) returns (NormalizeRoleBindingsResponse);
     rpc BeginWebAuthnRegistration(BeginWebAuthnRegistrationRequest)   returns (BeginWebAuthnRegistrationResponse);
     rpc FinishWebAuthnRegistration(FinishWebAuthnRegistrationRequest) returns (FinishWebAuthnRegistrationResponse);
     rpc BeginWebAuthnLogin(BeginWebAuthnLoginRequest)                 returns (BeginWebAuthnLoginResponse);

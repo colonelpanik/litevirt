@@ -621,7 +621,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Error("operation journal: open failed; skipping recovery", "error", err)
 	} else {
 		d.opJournal = j
+		svc.SetOpJournal(j) // so the device-lease path can durably record allocations
 		d.runOperationRecovery(ctx)
+		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}
 
 	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
@@ -1547,6 +1549,11 @@ func (d *Daemon) runOperationRecovery(ctx context.Context) {
 		slog.Error("operation recovery: CORRUPT journal entries — host degraded for affected mutations", "files", corrupt)
 	}
 	for _, p := range plan {
+		// device_lease entries are not operation-table ops; they're recovered
+		// (with device rollback) by grpcapi.RecoverDeviceLeases, not here.
+		if p.Entry.Kind == "device_lease" {
+			continue
+		}
 		switch p.Action {
 		case opjournal.RecoveryCleanup, opjournal.RecoverySupersede:
 			if err := d.opJournal.Remove(p.Entry.OperationID); err != nil {

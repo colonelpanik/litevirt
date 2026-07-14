@@ -268,10 +268,13 @@ func (s *Server) detachNIC(ctx context.Context, vmName, mac string) (*pb.VM, err
 }
 
 func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.DeviceSpec) (*pb.VM, error) {
-	addrs, err := s.allocateDevices(ctx, vmName, []*pb.DeviceSpec{spec})
+	addrs, finish, err := s.allocateDevices(ctx, vmName, []*pb.DeviceSpec{spec})
 	if err != nil {
 		return nil, err
 	}
+	// Clear the durable device lease once the attach completes (or on the
+	// rollback below); a crash before this runs is recovered at startup.
+	defer finish()
 
 	for _, addr := range addrs {
 		if err := s.virt.AttachHostdev(vmName, addr); err != nil {

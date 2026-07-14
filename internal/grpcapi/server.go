@@ -25,6 +25,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -225,6 +226,13 @@ type Server struct {
 	// when nil OR when no role-bindings exist for the caller, RequirePerm
 	// falls back to the legacy admin/operator/viewer roleLevel comparison.
 	authEngine *auth.Engine
+
+	// opJournal is the host-local operation journal, wired at daemon startup. The
+	// device-lease path durably records claimed/bound devices here (gated by the
+	// operation_protocol capability) so a crash mid-allocation is recoverable; nil
+	// in tests / when unwired (durable recovery disabled, in-memory rollback still
+	// applies).
+	opJournal *opjournal.Journal
 
 	// realmRegistry is consulted by Login to dispatch authentication
 	// to the right realm by name. Always contains "local"; OIDC/LDAP
@@ -714,6 +722,12 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 func (s *Server) SetAuthEngine(e *auth.Engine) {
 	s.authEngine = e
 }
+
+// SetOpJournal wires the host-local operation journal so the device-lease path
+// can durably record claimed/bound devices (F1). nil-safe (tests leave it nil,
+// which disables durable device-lease recovery — the in-memory scoped rollback
+// still applies).
+func (s *Server) SetOpJournal(j *opjournal.Journal) { s.opJournal = j }
 
 // SetRealmRegistry wires the multi-realm authentication registry. The
 // daemon constructs it from the auth.realms YAML block and calls this

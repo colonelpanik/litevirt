@@ -161,7 +161,14 @@ func (s *Server) ListHostDevices(ctx context.Context, req *pb.ListHostDevicesReq
 // allocateDevices resolves DeviceSpec requests against host inventory,
 // validates IOMMU group conflicts, assigns devices, binds to VFIO-PCI,
 // and returns the PCI addresses for hostdev XML.
-func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb.DeviceSpec) ([]string, error) {
+//
+// It returns the resolved addresses AND a finish func: the durable device-lease
+// entry (F1) is written before the vfio bind, and the CALLER must defer finish()
+// so the lease is cleared once the VM row is finalized (or on the caller's own
+// rollback). A crash before finish() runs leaves the entry for startup recovery
+// (RecoverDeviceLeases) to roll back.
+func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb.DeviceSpec) ([]string, func(), error) {
+	noop := func() {}
 	var addresses []string
 
 	for _, spec := range specs {
@@ -177,10 +184,10 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		if spec.Mapping != "" && spec.Address == "" {
 			addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)
+				return nil, noop, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)
 			}
 			if addr == "" {
-				return nil, status.Errorf(codes.FailedPrecondition,
+				return nil, noop, status.Errorf(codes.FailedPrecondition,
 					"resource mapping %q has no device on host %s", spec.Mapping, s.hostName)
 			}
 			spec.Address = addr
@@ -190,7 +197,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		if spec.Sriov && spec.Address == "" {
 			vfAddrs, err := s.allocateSRIOVVFs(ctx, vmName, spec, count)
 			if err != nil {
-				return nil, err
+				return nil, noop, err
 			}
 			addresses = append(addresses, vfAddrs...)
 			continue
@@ -200,7 +207,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		if spec.Address != "" {
 			// Validate IOMMU group conflict before assignment.
 			if err := s.checkIOMMUConflict(ctx, spec.Address, vmName); err != nil {
-				return nil, err
+				return nil, noop, err
 			}
 
 			addresses = append(addresses, spec.Address)
@@ -222,7 +229,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		// Type-based allocation.
 		available, err := corrosion.GetAvailableDevicesByType(ctx, s.db, s.hostName, spec.Type)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "query devices: %v", err)
+			return nil, noop, status.Errorf(codes.Internal, "query devices: %v", err)
 		}
 
 		// Filter by vendor/model if specified.
@@ -238,7 +245,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		}
 
 		if len(matched) < count {
-			return nil, status.Errorf(codes.ResourceExhausted,
+			return nil, noop, status.Errorf(codes.ResourceExhausted,
 				"need %d %s device(s) but only %d available on host %s",
 				count, spec.Type, len(matched), s.hostName)
 		}
@@ -248,7 +255,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 
 			// Validate IOMMU group conflict.
 			if err := s.checkIOMMUConflict(ctx, d.Address, vmName); err != nil {
-				return nil, err
+				return nil, noop, err
 			}
 
 			addresses = append(addresses, d.Address)
@@ -265,20 +272,27 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		}
 	}
 
+	// Durably record the claimed devices (F1 device lease) BEFORE the irreversible
+	// vfio bind, so a crash before the VM row is finalized is rolled back at
+	// startup. No-op unless the operation_protocol capability is active.
+	finish := s.beginDeviceLease(ctx, vmName, addresses)
+
 	// Bind all allocated devices to vfio-pci.
 	for _, addr := range addresses {
 		prevDriver, err := vfio.Bind(addr)
 		if err != nil {
 			slog.Warn("VFIO bind failed", "address", addr, "error", err)
-			// Roll back: release all assigned devices.
+			// Roll back only the devices this allocation claimed, and clear the
+			// durable lease.
 			s.releaseDeviceSet(ctx, vmName, addresses)
-			return nil, status.Errorf(codes.Internal,
+			finish()
+			return nil, noop, status.Errorf(codes.Internal,
 				"failed to bind device %s to vfio-pci: %v", addr, err)
 		}
 		slog.Info("device bound to vfio-pci", "address", addr, "previous_driver", prevDriver)
 	}
 
-	return addresses, nil
+	return addresses, finish, nil
 }
 
 // releaseDevices unbinds all devices from vfio-pci and releases them in the DB.

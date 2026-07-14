@@ -390,7 +390,7 @@ func TestAllocateDevices_TypeBased_NotEnough(t *testing.T) {
 		VendorID: "10de",
 	})
 
-	_, err := s.allocateDevices(ctx, "test-vm", []*pb.DeviceSpec{
+	_, _, err := s.allocateDevices(ctx, "test-vm", []*pb.DeviceSpec{
 		{Type: "gpu", Count: 2},
 	})
 	if err == nil {
@@ -420,7 +420,7 @@ func TestAllocateDevices_TypeBased_VendorFilter(t *testing.T) {
 	})
 
 	// Request 2 nvidia GPUs — only 1 available.
-	_, err := s.allocateDevices(ctx, "vendor-vm", []*pb.DeviceSpec{
+	_, _, err := s.allocateDevices(ctx, "vendor-vm", []*pb.DeviceSpec{
 		{Type: "gpu", Vendor: "10de", Count: 2},
 	})
 	if err == nil {
@@ -444,7 +444,7 @@ func TestAllocateDevices_ZeroCount_DefaultsToOne(t *testing.T) {
 
 	// Count=0 should default to 1 device.
 	// Will fail at vfio.Bind (no real sysfs), but validates allocation logic.
-	_, err := s.allocateDevices(ctx, "zero-cnt-vm", []*pb.DeviceSpec{
+	_, _, err := s.allocateDevices(ctx, "zero-cnt-vm", []*pb.DeviceSpec{
 		{Type: "nic", Count: 0},
 	})
 	// If it errors, it should be Internal (vfio bind), not ResourceExhausted.

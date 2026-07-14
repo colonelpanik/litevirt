@@ -664,11 +664,14 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 
 	// PCI device passthrough.
 	if len(spec.Devices) > 0 {
-		pciAddrs, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices)
+		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices)
 		if devErr != nil {
 			cleanupDisks()
 			return nil, devErr
 		}
+		// Clear the durable device lease once create returns; a crash before the
+		// VM row is finalized leaves it for startup recovery to roll back.
+		defer devFinish()
 		for _, addr := range pciAddrs {
 			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
 		}

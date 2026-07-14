@@ -236,10 +236,25 @@ func distinctColumnShapes(table string, nodes []string, snaps map[string]NodeSna
 	shapes := map[string]struct{}{}
 	for _, h := range nodes {
 		if ts, ok := snaps[h].Tables[table]; ok && len(ts.Columns) > 0 {
-			shapes[joinCols(ts.Columns)] = struct{}{}
+			shapes[colSetKey(ts.Columns)] = struct{}{}
 		}
 	}
 	return shapes
+}
+
+// colSetKey is an ORDER-INDEPENDENT key for a table's column set: it sorts a
+// copy before joining, so two nodes whose columns differ only in physical order
+// — a fresh CREATE TABLE (DDL order) vs an upgraded ALTER TABLE ADD COLUMN
+// (appended) — produce the SAME key and are not misclassified as a schema-shape
+// mismatch. Only a real column-SET difference (a missing or extra column) yields
+// distinct keys. The per-node display in ClassifyTable keeps real column order
+// via joinCols. (The row digest is positional and byte-frozen, so a pure reorder
+// still shows as row-content divergence until data is remediated; this only stops
+// the spurious schema_shape_mismatch classification.)
+func colSetKey(cols []string) string {
+	sorted := append([]string(nil), cols...)
+	sort.Strings(sorted)
+	return joinCols(sorted)
 }
 
 func joinCols(cols []string) string {

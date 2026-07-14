@@ -36,7 +36,7 @@ compares per-row metadata, and returns a classified report.
 | `missing_row` | Present on some nodes, absent on others. |
 | `tombstone_vs_live` | Tombstoned (soft-deleted) on some nodes, live on others. |
 | `terminal_vs_live` | A workload terminal (stopped/error) on some nodes, running on others. |
-| `schema_shape_mismatch` | The table's column set differs across nodes. |
+| `schema_shape_mismatch` | The table's column **set** differs across nodes (a missing or extra column). Column *order* alone is ignored — a fresh `CREATE TABLE` vs an upgraded `ALTER ADD COLUMN` no longer trips this. |
 
 A divergence is reported **only when it persists across two samples** with
 unchanged per-node content hashes — an in-flight replication delta changes between
@@ -60,6 +60,35 @@ illegal:
 > the runtime-repair phases; until then `lv doctor divergence` checks only the
 > DB-level invariants above. A clean report does **not** yet prove the DB agrees
 > with runtime truth.
+
+### Remediating a persistent `schema_shape_mismatch`
+
+`schema_shape_mismatch` fires only on a real column-**set** difference, not a pure
+column reorder. A genuine mismatch means one node's table was created with a
+different column set than another's — usually an interrupted or skipped migration.
+The scanner is read-only; clearing it is a one-time, **quiesced**, per-node
+operation on the offending node:
+
+1. **Make it safe.** Move any workload the table backs off the node (e.g. relocate
+   the load balancer / VIP) so the node can be taken out of service.
+2. **Stop the daemon** and take a **SQLite-consistent backup** (the `.backup` API,
+   or copy the DB after a WAL checkpoint, including the `-wal`/`-shm` files).
+3. In a `BEGIN IMMEDIATE` transaction, **recreate the table from the canonical
+   schema of the node's current version**, copy and validate rows, drop/rename,
+   then **recreate named indexes and triggers** (they don't survive the drop).
+4. **Validate structurally** with pragmas — `foreign_key_check`, `integrity_check`,
+   `table_info`, `index_list`/`index_xinfo`, `foreign_key_list`, triggers,
+   constraints/defaults/collations, table options (`STRICT`/`WITHOUT ROWID`), and
+   `user_version` — compared against a known-good node (not raw `sqlite_master`
+   text). `COMMIT`.
+5. **Restart**, run `foreign_key_check` again after reopening, then confirm the
+   workload listing is unchanged and `lv doctor divergence` (and the cluster
+   digest) have converged.
+
+> A pure column-order skew that previously mis-reported here now classifies as
+> row-content divergence instead (the row digest is positional). The data
+> remediation above clears the current divergence; an order-invariant digest is a
+> separate planned follow-up that prevents recurrence.
 
 ### The sensitive lane
 

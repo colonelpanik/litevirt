@@ -570,6 +570,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cfg.Enforcement.VIPProofReclaim,
 		d.cfg.Enforcement.SharedStorageFence,
 	)
+	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())

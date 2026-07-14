@@ -91,6 +91,9 @@ type Server struct {
 	enfVIPSelfDemote      bool
 	enfVIPProofReclaim    bool
 	enfSharedStorageFence bool
+	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
+	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
+	enfOperationProtocol bool
 
 	// capHealthLast records the most recent bounded freshness-check result per
 	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
@@ -379,6 +382,18 @@ func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
 	return s.enfSharedStorageFence && s.gate != nil && s.gate.Enforced(ctx, capabilities.SharedStorageFenceV1)
 }
 
+// SetOperationProtocol sets this node's kill-switch for relying on the v41 F1
+// operation protocol. The flag is the reversible kill switch; enforcement is this
+// flag AND the OperationProtocolV1 latch (see operationProtocolActive).
+func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+
+// operationProtocolActive reports whether this node relies on + enforces the v41
+// operation protocol: the config flag AND the cluster-wide latch. Same
+// `flag && Enforced` model as the rest of the family.
+func (s *Server) operationProtocolActive(ctx context.Context) bool {
+	return s.enfOperationProtocol && s.gate != nil && s.gate.Enforced(ctx, capabilities.OperationProtocolV1)
+}
+
 // tokenEnabled reports whether this node is configured to ENFORCE token — the
 // single source of "configured-to-enforce" the HA monitor uses to decide which
 // tokens to latch-drive and which may contribute to HA-degraded. split_brain_gate_v1
@@ -405,6 +420,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.forwardedIdentity
 	case capabilities.SharedStorageFenceV1:
 		return s.enfSharedStorageFence
+	case capabilities.OperationProtocolV1:
+		return s.enfOperationProtocol
 	default:
 		return false
 	}

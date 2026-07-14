@@ -305,6 +305,13 @@ type EnforcementConfig struct {
 	// local-disk transfer keeps today's gate. Changes live failover behavior for
 	// shared-disk VMs, so enable fleet-uniformly after every node is on the build.
 	SharedStorageFence bool `yaml:"shared_storage_fence,omitempty"`
+	// OperationProtocol: rely on the v41 F1 operation protocol (operations journal,
+	// per-VM epoch/generation, active_operation_id mutation barrier). When true
+	// (and the operation_protocol_v1 capability is latched cluster-wide), an
+	// incompatible peer is quarantined from mutating endpoints + replication
+	// sessions (reseed-on-rejoin). The per-host PCI observation/ownership fixes are
+	// unaffected. Default false; the flag is the reversible kill switch.
+	OperationProtocol bool `yaml:"operation_protocol,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

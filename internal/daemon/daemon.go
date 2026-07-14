@@ -40,6 +40,7 @@ import (
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/obs"
+	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/restapi"
@@ -69,6 +70,11 @@ type Daemon struct {
 	// authEngine is wired into the gRPC server below; kept on the daemon
 	// struct so the realm-sync / binding-reload loop can refresh it later.
 	authEngine *auth.Engine
+
+	// opJournal is the host-local tier of the F1 operation journal (durable
+	// artifacts only this host can restore); the startup recovery barrier reduces
+	// it against replicated state before runtime loops + API serving start.
+	opJournal *opjournal.Journal
 
 	// realmRegistry holds Local + every configured OIDC/LDAP realm.
 	// Login dispatches by name through this registry.
@@ -600,6 +606,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// outcomes → litevirt_runtime_owner_assert_total.
 	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
 	reconciler.SetOwnerAssertObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("vm", result) })
+
+	// F1 startup recovery barrier: reduce the host-local operation journal against
+	// replicated state BEFORE any runtime loop or API mutation runs — DB +
+	// capability latch + membership are all wired by this point.
+	if j, err := opjournal.Open(filepath.Join(d.cfg.DataDir, "opjournal")); err != nil {
+		slog.Error("operation journal: open failed; skipping recovery", "error", err)
+	} else {
+		d.opJournal = j
+		d.runOperationRecovery(ctx)
+	}
 
 	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
 	// for cluster-wide capability confirmation) and every reconciler/vmChecker
@@ -1480,6 +1496,60 @@ func (d *Daemon) runVMEventPrune(ctx context.Context) {
 			return
 		case <-ticker.C:
 			prune()
+		}
+	}
+}
+
+// runOperationRecovery is the F1 startup recovery barrier: it reduces the
+// host-local operation journal against replicated state before runtime loops and
+// API serving begin. Cleanup/supersede entries are removed; a resume entry is
+// logged for the resource coordinator; a corrupt journal is logged loudly (the
+// host is degraded for the affected mutations). Best-effort and defensive — it
+// never blocks startup on a transient error.
+func (d *Daemon) runOperationRecovery(ctx context.Context) {
+	if d.opJournal == nil {
+		return
+	}
+	lookup := func(opID string) (bool, int64, bool, error) {
+		op, err := corrosion.GetOperation(ctx, d.db, opID)
+		if err != nil {
+			return false, 0, false, err
+		}
+		if op == nil {
+			return false, 0, false, nil // GC'd → supersede
+		}
+		epoch, ok, err := corrosion.GetVMOwnerEpoch(ctx, d.db, op.ResourceID)
+		if err != nil {
+			return false, 0, false, err
+		}
+		if !ok {
+			return false, 0, false, nil // VM gone → not owned → supersede
+		}
+		state, _, err := corrosion.OperationCurrentState(ctx, d.db, opID, op.VMOwnerEpoch, corrosion.OperationKind(op.OperationKind))
+		if err != nil {
+			return false, 0, false, err
+		}
+		return true, epoch, corrosion.IsOperationTerminal(state), nil
+	}
+	plan, corrupt, err := d.opJournal.PlanRecovery(lookup)
+	if err != nil {
+		slog.Error("operation recovery: plan failed", "error", err)
+		return
+	}
+	if len(corrupt) > 0 {
+		slog.Error("operation recovery: CORRUPT journal entries — host degraded for affected mutations", "files", corrupt)
+	}
+	for _, p := range plan {
+		switch p.Action {
+		case opjournal.RecoveryCleanup, opjournal.RecoverySupersede:
+			if err := d.opJournal.Remove(p.Entry.OperationID); err != nil {
+				slog.Warn("operation recovery: remove entry", "op", p.Entry.OperationID, "action", p.Action.String(), "error", err)
+			} else {
+				slog.Info("operation recovery", "op", p.Entry.OperationID, "action", p.Action.String())
+			}
+		case opjournal.RecoveryResume:
+			slog.Warn("operation recovery: needs resume (deferred to resource coordinator)",
+				"op", p.Entry.OperationID, "vm", p.Entry.ResourceID, "stage", p.Entry.Stage)
 		}
 	}
 }

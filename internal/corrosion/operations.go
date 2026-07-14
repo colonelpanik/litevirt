@@ -96,6 +96,21 @@ func scanOperation(r Row) OperationRecord {
 	}
 }
 
+// GetVMOwnerEpoch returns a VM's CURRENT authorized owner epoch (the vms row),
+// ok=false when the VM is absent or deleted. Used by startup recovery to decide
+// whether the original host is still the authorized owner of an operation.
+func GetVMOwnerEpoch(ctx context.Context, c *Client, name string) (epoch int64, ok bool, err error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(rows) == 0 {
+		return 0, false, nil
+	}
+	return rows[0].Int64("vm_owner_epoch"), true, nil
+}
+
 // GetOperation returns the operation header by id, or nil if absent/tombstoned.
 func GetOperation(ctx context.Context, c *Client, id string) (*OperationRecord, error) {
 	rows, err := c.Query(ctx,

@@ -143,6 +143,12 @@ enforcement:
                               # best-effort SSH fence is rejected. Local-disk transfers keep
                               # today's gate. Enable fleet-uniformly (changes failover behavior).
                               # See docs/migration-failover.md → "Shared-disk fence gating".
+  operation_protocol: false   # rely on the v41 F1 operation protocol (operations journal, per-VM
+                              # epoch/generation, active_operation_id mutation barrier, durable
+                              # device-lease recovery). Advertised CONDITIONALLY on this flag, so the
+                              # cluster-wide latch only forms once EVERY node has it enabled — the
+                              # barrier is never relied upon until the whole fleet has opted in. Enable
+                              # fleet-uniformly; the flag is the reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

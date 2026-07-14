@@ -131,8 +131,14 @@ const (
 	// sessions (with reseed-on-rejoin). Config-gated (enforcement.operation_protocol)
 	// + reversible like StrictMTLSIdentityV1.
 	//
-	// ADVERTISED (in `supported`), enforcement default-off — inert until the config
-	// flag is set; the flag is the reversible kill switch.
+	// Unlike the other reversible tokens (advertised build-static; a flag-off peer
+	// is merely permissive), a peer NOT enforcing the F1 mutation barrier would
+	// CORRUPT an in-flight operation — so this token is advertised CONDITIONALLY on
+	// the local config flag (see Server.advertisedCapabilities). Withholding
+	// advertisement when the flag is off keeps the cluster-wide latch (and thus any
+	// reliance on the barrier) from happening until EVERY node has opted in —
+	// enforcing the "require fleet uniformity before latching" rule. Enforcement is
+	// default-off and the flag is the reversible kill switch.
 	OperationProtocolV1 = "operation_protocol_v1"
 )
 

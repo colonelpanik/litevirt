@@ -342,7 +342,29 @@ func (s *Server) advertisedCapabilities() []string {
 	if s.selfFenced() {
 		return []string{}
 	}
-	return capabilities.Supported()
+	caps := capabilities.Supported()
+	// operation_protocol_v1 is advertised CONDITIONALLY on the local config flag,
+	// unlike the other reversible tokens. Those are additive safety checks where a
+	// flag-off peer is merely permissive; but a peer that isn't enforcing the F1
+	// mutation barrier would CORRUPT an in-flight operation, so the fleet-wide
+	// latch (and thus operationProtocolActive) must require CONFIG uniformity, not
+	// just a uniform build. Withholding advertisement when the flag is off keeps
+	// the cluster from latching — and relying on the barrier — until every node has
+	// opted in.
+	if !s.enfOperationProtocol {
+		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
+	}
+	return caps
+}
+
+func withoutCapability(caps []string, drop string) []string {
+	out := caps[:0:0] // fresh backing array; never mutate capabilities.Supported()'s slice
+	for _, c := range caps {
+		if c != drop {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // serverGate is the subset of *health.Checker the gRPC server consults.

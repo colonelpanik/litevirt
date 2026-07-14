@@ -240,8 +240,8 @@ func TestReleasePCIDevice(t *testing.T) {
 	AssignPCIDevice(ctx, c, "node1", "0000:41:00.0", "vm1")
 	AssignPCIDevice(ctx, c, "node1", "0000:42:00.0", "vm1")
 
-	// Release only one device
-	if err := ReleasePCIDevice(ctx, c, "node1", "0000:41:00.0"); err != nil {
+	// Release only one device (owner-scoped).
+	if err := ReleasePCIDevice(ctx, c, "node1", "0000:41:00.0", "vm1"); err != nil {
 		t.Fatalf("ReleasePCIDevice: %v", err)
 	}
 

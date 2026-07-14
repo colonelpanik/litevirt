@@ -153,12 +153,31 @@ func ReleasePCIDevicesByVM(ctx context.Context, c *Client, vmName string) error 
 		c.NowTS(), vmName)
 }
 
-// ReleasePCIDevice clears the VM assignment for a single PCI device.
-func ReleasePCIDevice(ctx context.Context, c *Client, hostName, address string) error {
+// ClaimPCIDevice atomically assigns a device to a VM, but ONLY if it is active
+// (not tombstoned) AND currently unassigned. Returns true when the claim
+// succeeds, false on a CAS miss (already assigned, or gone). This is the
+// ownership-acquiring counterpart to ObservePCIDevice, which never changes
+// ownership. IOMMU-group siblings must each be claimed by the caller.
+func ClaimPCIDevice(ctx context.Context, c *Client, hostName, address, vmName string) (bool, error) {
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE host_pci_devices SET vm_name = ?, updated_at = ?
+		 WHERE host_name = ? AND address = ? AND deleted_at IS NULL
+		   AND (vm_name IS NULL OR vm_name = '')`,
+		vmName, c.NowTS(), hostName, address)
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ReleasePCIDevice clears a single device's assignment, but ONLY if it is
+// currently owned by expectedVM — so a rollback or detach can never release a
+// device another VM has since claimed. An owner mismatch is a safe no-op.
+func ReleasePCIDevice(ctx context.Context, c *Client, hostName, address, expectedVM string) error {
 	return c.Execute(ctx,
-		`UPDATE host_pci_devices SET vm_name = NULL, updated_at = ?
-		 WHERE host_name = ? AND address = ?`,
-		c.NowTS(), hostName, address)
+		`UPDATE host_pci_devices SET vm_name = '', updated_at = ?
+		 WHERE host_name = ? AND address = ? AND vm_name = ?`,
+		c.NowTS(), hostName, address, expectedVM)
 }
 
 // SoftDeletePCIDevice marks a device as deleted (disappeared from host).

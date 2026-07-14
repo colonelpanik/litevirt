@@ -348,7 +348,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		if err := vfio.Unbind(vf.Address, ""); err != nil {
 			slog.Warn("VFIO unbind failed during migration", "address", vf.Address, "error", err)
 		}
-		corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, vf.Address)
+		corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, vf.Address, req.VmName)
 		slog.Info("VF detached for migration", "vm", req.VmName, "address", vf.Address)
 	}
 

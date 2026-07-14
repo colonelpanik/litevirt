@@ -295,7 +295,7 @@ func (s *Server) detachPCIDevice(ctx context.Context, vmName, pciAddress string)
 		slog.Warn("VFIO unbind after detach failed", "address", pciAddress, "error", err)
 	}
 
-	corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, pciAddress)
+	corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, pciAddress, vmName)
 	slog.Info("PCI device detached", "vm", vmName, "address", pciAddress)
 	s.publish("device.detached", vmName, "pci:"+pciAddress)
 	return s.vmToProto(ctx, vmName)

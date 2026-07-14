@@ -233,7 +233,15 @@ import (
 //	     (execLocal, never replicated) — nft rules are per-host state; provisioning /
 //	     LB apply write intent, the firewall reconciler renders it. One CREATE TABLE;
 //	     gap-1 from v39.
-const CurrentSchemaVersion = 40
+//	v41: F1 operation-journal foundation — vms gains vm_owner_epoch + spec_generation
+//	     (per-VM monotonic ABA-proof recovery state, ruleNumericMax on an exact-ts tie)
+//	     and active_operation_id (the VM-wide mutation barrier pointing at the in-flight
+//	     operations row, carved out of LWW like pending_action_id). New immutable /
+//	     append-only tables operations, operation_steps, project_authority_epochs — the
+//	     replicated tier of the crash-recoverable operation journal, merged by a bespoke
+//	     non-LWW immutable-row merge (identical→idempotent, facts-conflict→unresolved+
+//	     flagged, tombstone dominates). Three ADD COLUMN + three CREATE TABLE; gap-1 from v40.
+const CurrentSchemaVersion = 41
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -702,6 +710,73 @@ var schemaDDL = []string{
 		deleted_at        TEXT
 	)`,
 
+	// operations / operation_steps / project_authority_epochs (v41, F1 operation
+	// journal) — the replicated tier of the crash-recoverable operation journal.
+	// All THREE are IMMUTABLE / append-only and merge via a bespoke non-LWW merge
+	// (immutableMergeKeepLocalRow in sync.go, customMergeTables bucket, NOT
+	// resolver.go): identical rows merge idempotently, a genuine facts-conflict for
+	// one PK is left UNRESOLVED + flagged (never coin-flipped), and a tombstone (GC
+	// of a terminal operation past its retention horizon) dominates a delayed live
+	// copy. No SQL foreign keys between them (replicated arrival order isn't
+	// guaranteed — references are enforced in application reconciliation).
+	//
+	// operations: the immutable header. id is DETERMINISTIC
+	// (hash(method+principal+project+resource_id+idempotency_key)) so two entry nodes
+	// handed the same client key target the same PK everywhere; request_hash reuse
+	// with a different value is a conflict (D4). It holds only the REQUESTED
+	// reservation vectors — actual reservation IDs / authority epochs live in the
+	// operation_steps rows, never the immutable header.
+	`CREATE TABLE IF NOT EXISTS operations (
+		id               TEXT PRIMARY KEY,
+		method           TEXT NOT NULL DEFAULT '',
+		principal        TEXT NOT NULL DEFAULT '',
+		project          TEXT NOT NULL DEFAULT '',
+		resource_kind    TEXT NOT NULL DEFAULT '',
+		resource_id      TEXT NOT NULL DEFAULT '',
+		operation_kind   TEXT NOT NULL DEFAULT '',
+		request_hash     TEXT NOT NULL DEFAULT '',
+		idempotency_key  TEXT NOT NULL DEFAULT '',
+		reservation_json TEXT NOT NULL DEFAULT '',
+		desired_ref      TEXT NOT NULL DEFAULT '',
+		vm_owner_epoch   INTEGER NOT NULL DEFAULT 0,
+		created_at       TEXT NOT NULL,
+		updated_at       TEXT NOT NULL,
+		deleted_at       TEXT
+	)`,
+
+	// operation_steps: append-only, deterministic step keys
+	// (operation_id, owner_epoch, step_name) per the transition graph. Re-appending
+	// the same step with identical facts is idempotent; the same key with DIFFERENT
+	// facts is corruption (flagged unresolved by the merge). NOT a mutable phase
+	// field — a stale owner can't regress it under LWW.
+	`CREATE TABLE IF NOT EXISTS operation_steps (
+		operation_id   TEXT NOT NULL,
+		owner_epoch    INTEGER NOT NULL DEFAULT 0,
+		step_name      TEXT NOT NULL,
+		facts          TEXT NOT NULL DEFAULT '',
+		created_at     TEXT NOT NULL,
+		updated_at     TEXT NOT NULL,
+		deleted_at     TEXT,
+		PRIMARY KEY (operation_id, owner_epoch, step_name)
+	)`,
+
+	// project_authority_epochs: append-only log of project-admission authority
+	// transfers (D1 sticky authority). One row per (project, authority_epoch);
+	// authority_epoch is monotonic per project, the current authority is the max
+	// live epoch. transfer_kind ∈ {initial, planned, fenced}; fence_proof_ref
+	// references the proof that the prior holder was fenced (unplanned takeover).
+	`CREATE TABLE IF NOT EXISTS project_authority_epochs (
+		project         TEXT NOT NULL,
+		authority_epoch INTEGER NOT NULL DEFAULT 0,
+		holder          TEXT NOT NULL DEFAULT '',
+		transfer_kind   TEXT NOT NULL DEFAULT '',
+		fence_proof_ref TEXT NOT NULL DEFAULT '',
+		created_at      TEXT NOT NULL,
+		updated_at      TEXT NOT NULL,
+		deleted_at      TEXT,
+		PRIMARY KEY (project, authority_epoch)
+	)`,
+
 	// Rebalancer proposals. One row per (vm, generation). Pending
 	// rows expire if not approved/applied within the proposal TTL.
 	`CREATE TABLE IF NOT EXISTS rebalance_proposals (
@@ -817,7 +892,15 @@ var schemaDDL = []string{
 		-- transition to the runtime_action_proofs row that authorizes the start. Set once
 		-- with the pending transition, cleared in the same mutation that exits pending.
 		-- '' = no in-flight proof-gated action. Carved out of LWW (ruleColUnresolved).
-		pending_action_id TEXT NOT NULL DEFAULT ''
+		pending_action_id TEXT NOT NULL DEFAULT '',
+		-- v41 (F1 operation journal): per-VM monotonic ownership epoch (bumped on every
+		-- ownership transfer) and spec generation (bumped on every desired-spec mutation)
+		-- give ABA-proof recovery CAS; active_operation_id is the VM-wide mutation barrier
+		-- pointing at the in-flight operations row ('' = none). Epochs resolve ruleNumericMax
+		-- on an exact-ts tie; the pointer is carved out of LWW (ruleColUnresolved).
+		vm_owner_epoch      INTEGER NOT NULL DEFAULT 0,
+		spec_generation     INTEGER NOT NULL DEFAULT 0,
+		active_operation_id TEXT NOT NULL DEFAULT ''
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS vm_interfaces (
@@ -1620,62 +1703,65 @@ var schemaIndexes = []string{
 // tablePrimaryKeys maps table names to their primary key column(s).
 // Used by LWW conflict resolution during replication to look up local rows.
 var tablePrimaryKeys = map[string][]string{
-	"cluster":                {"id"},
-	"hosts":                  {"name"},
-	"host_labels":            {"host_name", "key"},
-	"host_health":            {"observer", "target"},
-	"host_runtime_usage":     {"host_name"},
-	"clock_skew":             {"observer", "target"},
-	"crl_versions":           {"host"},
-	"leader_election":        {"key"},
-	"vm_locks":               {"vm_name"},
-	"runtime_action_proofs":  {"id"},
-	"idempotency_keys":       {"key"},
-	"rebalance_proposals":    {"id"},
-	"host_pci_devices":       {"host_name", "address"},
-	"images":                 {"name"},
-	"image_hosts":            {"image_name", "host_name"},
-	"networks":               {"name"},
-	"volumes":                {"name"},
-	"stacks":                 {"name"},
-	"vms":                    {"name"},
-	"vm_interfaces":          {"vm_name", "network_name"},
-	"container_interfaces":   {"host_name", "ct_name", "ordinal"},
-	"vm_disks":               {"vm_name", "disk_name"},
-	"snapshots":              {"id"},
-	"lb_configs":             {"name"},
-	"lb_backends":            {"lb_name", "name"},
-	"users":                  {"username"},
-	"tokens":                 {"id"},
-	"roles":                  {"name"},
-	"role_bindings":          {"id"},
-	"sessions":               {"id"},
-	"user_2fa":               {"username", "method", "label"},
-	"user_2fa_sets":          {"username"},
-	"recovery_codes":         {"username", "code_hash"},
-	"recovery_code_sets":     {"username"},
-	"dns_records":            {"name"},
-	"fencing_log":            {"id"},
-	"audit_log":              {"id"},
-	"vm_events":              {"id"},
-	"network_vteps":          {"network_name", "host_name"},
-	"bgp_peers":              {"host_name"},
-	"ip_allocations":         {"network", "ip"},
-	"vm_restarts":            {"vm_name"},
-	"security_groups":        {"id"},
-	"sg_rules":               {"id"},
-	"containers":             {"host_name", "name"},
-	"storage_pools":          {"host_name", "name"},
-	"mutation_log":           {"seq"},
-	"replication_watermarks": {"peer_name"},
-	"backup_schedules":       {"vm_name", "repo"},
-	"service_endpoints":      {"service_name", "ip"},
-	"projects":               {"name"},
-	"project_quotas":         {"project_name"},
-	"resource_mappings":      {"name", "host_name", "address"},
-	"notification_targets":   {"id"},
-	"notification_routes":    {"id"},
-	"registry_credentials":   {"id"},
+	"cluster":                  {"id"},
+	"hosts":                    {"name"},
+	"host_labels":              {"host_name", "key"},
+	"host_health":              {"observer", "target"},
+	"host_runtime_usage":       {"host_name"},
+	"clock_skew":               {"observer", "target"},
+	"crl_versions":             {"host"},
+	"leader_election":          {"key"},
+	"vm_locks":                 {"vm_name"},
+	"runtime_action_proofs":    {"id"},
+	"operations":               {"id"},
+	"operation_steps":          {"operation_id", "owner_epoch", "step_name"},
+	"project_authority_epochs": {"project", "authority_epoch"},
+	"idempotency_keys":         {"key"},
+	"rebalance_proposals":      {"id"},
+	"host_pci_devices":         {"host_name", "address"},
+	"images":                   {"name"},
+	"image_hosts":              {"image_name", "host_name"},
+	"networks":                 {"name"},
+	"volumes":                  {"name"},
+	"stacks":                   {"name"},
+	"vms":                      {"name"},
+	"vm_interfaces":            {"vm_name", "network_name"},
+	"container_interfaces":     {"host_name", "ct_name", "ordinal"},
+	"vm_disks":                 {"vm_name", "disk_name"},
+	"snapshots":                {"id"},
+	"lb_configs":               {"name"},
+	"lb_backends":              {"lb_name", "name"},
+	"users":                    {"username"},
+	"tokens":                   {"id"},
+	"roles":                    {"name"},
+	"role_bindings":            {"id"},
+	"sessions":                 {"id"},
+	"user_2fa":                 {"username", "method", "label"},
+	"user_2fa_sets":            {"username"},
+	"recovery_codes":           {"username", "code_hash"},
+	"recovery_code_sets":       {"username"},
+	"dns_records":              {"name"},
+	"fencing_log":              {"id"},
+	"audit_log":                {"id"},
+	"vm_events":                {"id"},
+	"network_vteps":            {"network_name", "host_name"},
+	"bgp_peers":                {"host_name"},
+	"ip_allocations":           {"network", "ip"},
+	"vm_restarts":              {"vm_name"},
+	"security_groups":          {"id"},
+	"sg_rules":                 {"id"},
+	"containers":               {"host_name", "name"},
+	"storage_pools":            {"host_name", "name"},
+	"mutation_log":             {"seq"},
+	"replication_watermarks":   {"peer_name"},
+	"backup_schedules":         {"vm_name", "repo"},
+	"service_endpoints":        {"service_name", "ip"},
+	"projects":                 {"name"},
+	"project_quotas":           {"project_name"},
+	"resource_mappings":        {"name", "host_name", "address"},
+	"notification_targets":     {"id"},
+	"notification_routes":      {"id"},
+	"registry_credentials":     {"id"},
 	// Replicated tables with updated_at that previously lacked an entry, so LWW
 	// was silently skipped in both the merge and the Crescent apply path.
 	"vm_backups":              {"vm_name", "disk_name", "repo"},
@@ -1863,6 +1949,11 @@ var schemaMigrations = []string{
 	// v38: split-brain hardening (see History v38). Links a pending start to its
 	// runtime_action_proofs row; '' = no in-flight proof-gated action.
 	`ALTER TABLE vms ADD COLUMN pending_action_id TEXT NOT NULL DEFAULT ''`,
+	// v41: F1 operation-journal foundation (see History v41). Keep index-aligned
+	// with alterVersions below.
+	`ALTER TABLE vms ADD COLUMN vm_owner_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE vms ADD COLUMN spec_generation INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE vms ADD COLUMN active_operation_id TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -1936,7 +2027,8 @@ var alterVersions = []int{
 	34, 34, // containers.create_spec, containers.relocate_token
 	36, 36, // ip_allocations.owner_kind, ip_allocations.owner_host
 	37, 37, 37, // networks.project, storage_pools.project, volumes.project
-	38, // vms.pending_action_id
+	38,         // vms.pending_action_id
+	41, 41, 41, // vms.vm_owner_epoch, vms.spec_generation, vms.active_operation_id
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -1957,6 +2049,7 @@ var createTableUnits = []struct {
 	{38, "runtime_action_proofs"},
 	{39, "idempotency_keys"},
 	{40, "host_fw_intent"},
+	{41, "operations"}, {41, "operation_steps"}, {41, "project_authority_epochs"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

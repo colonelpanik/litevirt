@@ -78,6 +78,11 @@ type Server struct {
 	// Default false; the flag is the kill switch.
 	forwardedIdentity bool
 
+	// rbacRealm, when true, opts this node into realm-aware role-binding grammar
+	// (reject/resolve bare grants). Gated by this flag AND the RBACRealmV1 latch;
+	// the flag is the reversible kill switch. Default false. See rbacRealmActive.
+	rbacRealm bool
+
 	// enfSafeFence / enfLWWSkew / enfVIPSelfDemote / enfVIPProofReclaim mirror the
 	// split-brain-family enforcement kill-switches (config.Enforcement) so the HA
 	// monitor can drive the right tokens' latches (mandatory ∪ configured-on) and
@@ -405,6 +410,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.forwardedIdentity
 	case capabilities.SharedStorageFenceV1:
 		return s.enfSharedStorageFence
+	case capabilities.RBACRealmV1:
+		return s.rbacRealm
 	default:
 		return false
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Operation-journal storage (F1, v41). The replicated tier of the crash-
@@ -278,6 +279,72 @@ func (c *Client) CompleteVMOperation(ctx context.Context, vmName, operationID st
 			Params: []interface{}{operationID, ownerEpoch, OpStepCompleted, nowRFC3339(), now}},
 	}
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// ReapTerminalOperations tombstones operations that are safely finished:
+// terminal (completed/failed/cancelled/superseded) with their most recent step
+// older than the retention horizon, AND not referenced by any live
+// vms.active_operation_id. Both the header and all its steps are soft-deleted, so
+// the immutable-merge tombstone-dominance keeps a delayed live copy (or a late
+// pre-terminal step) from resurrecting a reaped operation. Retention MUST exceed
+// the WAL/AE repair horizon so no in-flight step can still arrive. Local-
+// deterministic (safe to run on every node); the replicated tombstone converges.
+// Returns the number of operations reaped.
+func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Duration) (int, error) {
+	cutoff := time.Now().Add(-retention)
+
+	arows, err := c.Query(ctx,
+		`SELECT DISTINCT active_operation_id FROM vms WHERE active_operation_id != '' AND deleted_at IS NULL`)
+	if err != nil {
+		return 0, err
+	}
+	active := make(map[string]bool, len(arows))
+	for _, r := range arows {
+		active[r.String("active_operation_id")] = true
+	}
+
+	orows, err := c.Query(ctx,
+		`SELECT id, operation_kind FROM operations WHERE deleted_at IS NULL`)
+	if err != nil {
+		return 0, err
+	}
+	reaped := 0
+	for _, r := range orows {
+		id := r.String("id")
+		if active[id] {
+			continue // a live VM barrier still points at it
+		}
+		kind := OperationKind(r.String("operation_kind"))
+		// All steps across every owner epoch (an owner transfer splits epochs).
+		srows, err := c.Query(ctx,
+			`SELECT step_name, updated_at FROM operation_steps WHERE operation_id = ? AND deleted_at IS NULL`, id)
+		if err != nil {
+			return reaped, err
+		}
+		names := make([]string, 0, len(srows))
+		var last time.Time
+		for _, sr := range srows {
+			names = append(names, sr.String("step_name"))
+			if t, ok := ParseUpdatedAt(sr.String("updated_at")); ok && t.After(last) {
+				last = t
+			}
+		}
+		state, _ := ReduceOperationState(kind, names)
+		if !IsOperationTerminal(state) || last.IsZero() || last.After(cutoff) {
+			continue
+		}
+		now, marker := c.NowTS(), nowRFC3339()
+		if err := c.ExecuteBatch(ctx, []Statement{
+			{SQL: `UPDATE operations SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+				Params: []interface{}{marker, now, id}},
+			{SQL: `UPDATE operation_steps SET deleted_at = ?, updated_at = ? WHERE operation_id = ? AND deleted_at IS NULL`,
+				Params: []interface{}{marker, now, id}},
+		}); err != nil {
+			return reaped, err
+		}
+		reaped++
+	}
+	return reaped, nil
 }
 
 // OperationCurrentState reduces an operation's recorded steps (for the given

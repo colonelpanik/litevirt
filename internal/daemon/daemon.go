@@ -1516,6 +1516,16 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 		} else if tombstoned > 0 {
 			slog.Info("proof reaper", "tombstoned", tombstoned)
 		}
+		// F1 operation journal (v41): tombstone terminal operations + their steps
+		// once past the core retention (which exceeds the WAL/AE repair horizon) and
+		// no VM barrier still references them. Replicated monotone tombstone —
+		// tombstone-dominance in the immutable merge keeps a delayed copy from
+		// resurrecting a reaped operation.
+		if reaped, perr := corrosion.ReapTerminalOperations(ctx, d.db, core); perr != nil {
+			slog.Warn("operation reaper", "error", perr)
+		} else if reaped > 0 {
+			slog.Info("operation reaper", "reaped", reaped)
+		}
 		// Idempotency keys: hard-delete records past their TTL (v39). Ephemeral +
 		// bounded by expires_at; a resurrected expired copy never matches, so a
 		// plain local delete is safe.

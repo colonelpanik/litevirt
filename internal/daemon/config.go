@@ -265,6 +265,14 @@ type AuthConfig struct {
 	// ForwardedIdentityV1 capability active cluster-wide gate the owner-side
 	// promotion. Default false; the flag is the enforcement + kill switch.
 	ForwardedIdentity bool `yaml:"forwarded_identity,omitempty"`
+	// RBACRealm, when true, opts this node into realm-aware role-binding grammar.
+	// With it on, GrantRole stops minting inert legacy bare bindings: while the
+	// RBACRealmV1 capability is not yet latched cluster-wide it REJECTS a bare
+	// user:<name> grant (require an explicit realm); once latched it RESOLVES a
+	// bare grant to the target user's realm and stores it canonically. Default
+	// false (bare grants accepted as-is, legacy behavior); the flag is the
+	// reversible kill switch.
+	RBACRealm bool `yaml:"rbac_realm,omitempty"`
 }
 
 // EnforcementConfig holds the per-node kill-switches for the split-brain-family

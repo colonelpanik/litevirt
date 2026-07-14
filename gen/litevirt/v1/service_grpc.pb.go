@@ -122,6 +122,7 @@ const (
 	LiteVirt_GrantRole_FullMethodName                  = "/litevirt.v1.LiteVirt/GrantRole"
 	LiteVirt_RevokeRole_FullMethodName                 = "/litevirt.v1.LiteVirt/RevokeRole"
 	LiteVirt_ListRoleBindings_FullMethodName           = "/litevirt.v1.LiteVirt/ListRoleBindings"
+	LiteVirt_NormalizeRoleBindings_FullMethodName      = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
 	LiteVirt_BeginWebAuthnRegistration_FullMethodName  = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
 	LiteVirt_FinishWebAuthnRegistration_FullMethodName = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
 	LiteVirt_BeginWebAuthnLogin_FullMethodName         = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
@@ -376,6 +377,7 @@ type LiteVirtClient interface {
 	GrantRole(ctx context.Context, in *GrantRoleRequest, opts ...grpc.CallOption) (*GrantRoleResponse, error)
 	RevokeRole(ctx context.Context, in *RevokeRoleRequest, opts ...grpc.CallOption) (*RevokeRoleResponse, error)
 	ListRoleBindings(ctx context.Context, in *ListRoleBindingsRequest, opts ...grpc.CallOption) (*ListRoleBindingsResponse, error)
+	NormalizeRoleBindings(ctx context.Context, in *NormalizeRoleBindingsRequest, opts ...grpc.CallOption) (*NormalizeRoleBindingsResponse, error)
 	BeginWebAuthnRegistration(ctx context.Context, in *BeginWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(ctx context.Context, in *FinishWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(ctx context.Context, in *BeginWebAuthnLoginRequest, opts ...grpc.CallOption) (*BeginWebAuthnLoginResponse, error)
@@ -1727,6 +1729,16 @@ func (c *liteVirtClient) ListRoleBindings(ctx context.Context, in *ListRoleBindi
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListRoleBindingsResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ListRoleBindings_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) NormalizeRoleBindings(ctx context.Context, in *NormalizeRoleBindingsRequest, opts ...grpc.CallOption) (*NormalizeRoleBindingsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NormalizeRoleBindingsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_NormalizeRoleBindings_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3137,6 +3149,7 @@ type LiteVirtServer interface {
 	GrantRole(context.Context, *GrantRoleRequest) (*GrantRoleResponse, error)
 	RevokeRole(context.Context, *RevokeRoleRequest) (*RevokeRoleResponse, error)
 	ListRoleBindings(context.Context, *ListRoleBindingsRequest) (*ListRoleBindingsResponse, error)
+	NormalizeRoleBindings(context.Context, *NormalizeRoleBindingsRequest) (*NormalizeRoleBindingsResponse, error)
 	BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(context.Context, *FinishWebAuthnRegistrationRequest) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(context.Context, *BeginWebAuthnLoginRequest) (*BeginWebAuthnLoginResponse, error)
@@ -3641,6 +3654,9 @@ func (UnimplementedLiteVirtServer) RevokeRole(context.Context, *RevokeRoleReques
 }
 func (UnimplementedLiteVirtServer) ListRoleBindings(context.Context, *ListRoleBindingsRequest) (*ListRoleBindingsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListRoleBindings not implemented")
+}
+func (UnimplementedLiteVirtServer) NormalizeRoleBindings(context.Context, *NormalizeRoleBindingsRequest) (*NormalizeRoleBindingsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method NormalizeRoleBindings not implemented")
 }
 func (UnimplementedLiteVirtServer) BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BeginWebAuthnRegistration not implemented")
@@ -5675,6 +5691,24 @@ func _LiteVirt_ListRoleBindings_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ListRoleBindings(ctx, req.(*ListRoleBindingsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_NormalizeRoleBindings_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NormalizeRoleBindingsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).NormalizeRoleBindings(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_NormalizeRoleBindings_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).NormalizeRoleBindings(ctx, req.(*NormalizeRoleBindingsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7991,6 +8025,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListRoleBindings",
 			Handler:    _LiteVirt_ListRoleBindings_Handler,
+		},
+		{
+			MethodName: "NormalizeRoleBindings",
+			Handler:    _LiteVirt_NormalizeRoleBindings_Handler,
 		},
 		{
 			MethodName: "BeginWebAuthnRegistration",

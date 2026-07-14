@@ -350,6 +350,14 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	if err := corrosion.DeleteUser(ctx, s.db, req.Username); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete user: %v", err)
 	}
+	// Drop the deleted user's bindings from the live engine immediately, in
+	// memory, for both the canonical and legacy-bare principal forms (matching
+	// the DB tombstone in corrosion.DeleteUser) so access is revoked without
+	// waiting for a reload.
+	if s.authEngine != nil {
+		s.authEngine.RemovePrincipal("user:" + req.Username)
+		s.authEngine.RemovePrincipal("user:" + req.Username + "@local")
+	}
 	slog.Info("user deleted", "username", req.Username)
 	s.publish("user.deleted", req.Username, "")
 	s.audit(ctx, "user.delete", req.Username, "", "ok")

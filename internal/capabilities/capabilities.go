@@ -109,6 +109,18 @@ const (
 	// on but forward-compatible: with enforcement off, no owner promotes, so the relayed
 	// header is ignored.)
 	ForwardedIdentityV1 = "forwarded_identity_v1"
+	// RBACRealmV1 gates realm-aware role-binding grammar. Role bindings enforce
+	// against realm-qualified principals (user:<name>@<realm>), so a legacy bare
+	// grant (user:<name>) is inert. Once this token is enforced, a new daemon
+	// stops minting bare bindings: it either REJECTS a bare grant (config on, not
+	// yet latched fleet-wide — the safe pre-uniformity state) or RESOLVES it to
+	// the target user's realm and stores it canonically (config on AND latched).
+	// Gating on the latch is what keeps this mixed-version-safe: while any peer
+	// still mints bare bindings, we refuse rather than canonicalize.
+	//
+	// ADVERTISED (in `supported`), enforcement default-off (see StrictMTLSIdentityV1) —
+	// inert until auth.rbac_realm is set; the config flag is the reversible kill switch.
+	RBACRealmV1 = "rbac_realm_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -190,12 +202,13 @@ var supported = []string{
 	StrictMTLSIdentityV1,
 	ForwardedIdentityV1,
 	SharedStorageFenceV1,
+	RBACRealmV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

@@ -33,7 +33,11 @@ type PCIDeviceRecord struct {
 	LinkPeers    string // comma-separated PCI addresses
 }
 
-// UpsertPCIDevice inserts or updates a PCI device record.
+// UpsertPCIDevice inserts or fully replaces a PCI device record, INCLUDING
+// vm_name. 🔴 Do NOT use this on a host scan / rescan path: a scan carries no
+// vm_name, so INSERT OR REPLACE would erase the assignment of an owned device.
+// Scan/observation paths MUST use ObservePCIDevice (preserves vm_name). This
+// full-replace form is for genuine full-record writes and test seeding only.
 func UpsertPCIDevice(ctx context.Context, c *Client, d PCIDeviceRecord) error {
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO host_pci_devices
@@ -45,6 +49,46 @@ func UpsertPCIDevice(ctx context.Context, c *Client, d PCIDeviceRecord) error {
 		d.HostName, d.Address, d.VendorID, d.DeviceID, d.VendorName, d.DeviceName,
 		d.Type, d.IOMMUGroup, d.SRIOVCapable, d.SRIOVVFsTotal, d.SRIOVVFsFree,
 		d.Driver, d.VMName, d.NUMANode, d.PCIeRootPort, d.PCIeBridge, d.LinkClique,
+		d.LinkPeers, c.NowTS())
+}
+
+// ObservePCIDevice records a device's HARDWARE facts from a host scan while
+// PRESERVING any existing vm_name assignment: a rescan must never erase which VM
+// owns a device (the bug that INSERT OR REPLACE + an empty scan vm_name caused).
+// A never-seen device is inserted UNASSIGNED; an existing row keeps its vm_name
+// and is revived (deleted_at cleared) if it had disappeared. Ownership is changed
+// only through Assign/Release/Claim, never through observation. Only the owning
+// host observes its own PCI rows.
+func ObservePCIDevice(ctx context.Context, c *Client, d PCIDeviceRecord) error {
+	return c.Execute(ctx,
+		`INSERT INTO host_pci_devices
+		   (host_name, address, vendor_id, device_id, vendor_name, device_name,
+		    type, iommu_group, sriov_capable, sriov_vfs_total, sriov_vfs_free,
+		    driver, vm_name, numa_node, pcie_root_port, pcie_bridge, link_clique,
+		    link_peers, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, NULL)
+		 ON CONFLICT(host_name, address) DO UPDATE SET
+		    vendor_id       = excluded.vendor_id,
+		    device_id       = excluded.device_id,
+		    vendor_name     = excluded.vendor_name,
+		    device_name     = excluded.device_name,
+		    type            = excluded.type,
+		    iommu_group     = excluded.iommu_group,
+		    sriov_capable   = excluded.sriov_capable,
+		    sriov_vfs_total = excluded.sriov_vfs_total,
+		    sriov_vfs_free  = excluded.sriov_vfs_free,
+		    driver          = excluded.driver,
+		    numa_node       = excluded.numa_node,
+		    pcie_root_port  = excluded.pcie_root_port,
+		    pcie_bridge     = excluded.pcie_bridge,
+		    link_clique     = excluded.link_clique,
+		    link_peers      = excluded.link_peers,
+		    updated_at      = excluded.updated_at,
+		    deleted_at      = NULL`,
+		// vm_name is deliberately absent from DO UPDATE SET — it is preserved.
+		d.HostName, d.Address, d.VendorID, d.DeviceID, d.VendorName, d.DeviceName,
+		d.Type, d.IOMMUGroup, d.SRIOVCapable, d.SRIOVVFsTotal, d.SRIOVVFsFree,
+		d.Driver, d.NUMANode, d.PCIeRootPort, d.PCIeBridge, d.LinkClique,
 		d.LinkPeers, c.NowTS())
 }
 

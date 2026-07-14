@@ -1253,7 +1253,7 @@ func (d *Daemon) runPCIScan(ctx context.Context) {
 
 	interesting := pci.FilterInteresting(devices)
 	for _, dev := range interesting {
-		if err := corrosion.UpsertPCIDevice(ctx, d.db, corrosion.PCIDeviceRecord{
+		if err := corrosion.ObservePCIDevice(ctx, d.db, corrosion.PCIDeviceRecord{
 			HostName:      d.cfg.HostName,
 			Address:       dev.Address,
 			VendorID:      dev.VendorID,

@@ -51,7 +51,7 @@ func (s *Server) RescanHost(ctx context.Context, req *pb.RescanHostRequest) (*pb
 
 	for _, d := range interesting {
 		scannedMap[d.Address] = true
-		if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
 			HostName:      s.hostName,
 			Address:       d.Address,
 			VendorID:      d.VendorID,
@@ -87,7 +87,7 @@ func (s *Server) RescanHost(ctx context.Context, req *pb.RescanHostRequest) (*pb
 				if scanErr != nil {
 					continue
 				}
-				if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+				if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
 					HostName:   s.hostName,
 					Address:    vfDev.Address,
 					VendorID:   vfDev.VendorID,
@@ -374,7 +374,7 @@ func (s *Server) allocateSRIOVVFs(ctx context.Context, vmName string, spec *pb.D
 			slog.Warn("failed to scan new VF", "address", vfAddr, "error", scanErr)
 			continue
 		}
-		corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
 			HostName:   s.hostName,
 			Address:    d.Address,
 			VendorID:   d.VendorID,

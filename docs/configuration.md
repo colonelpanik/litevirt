@@ -166,6 +166,12 @@ auth:
   # bearer and runs RBAC + audit as the real user instead of the peer=admin
   # trusted-forward. Default false.
   forwarded_identity: false
+  # Realm-aware role bindings: when true (and the rbac_realm_v1 capability is
+  # active cluster-wide), a bare `user:<name>` grant is rejected pre-latch and
+  # resolved to `user:<name>@<realm>` once latched, so this node stops minting
+  # inert legacy bare bindings. Default false; the flag is the reversible kill
+  # switch. See docs/auth.md.
+  rbac_realm: false
   realms:
     - name: corp                          # realm short name; users login as alice@corp
       kind: oidc

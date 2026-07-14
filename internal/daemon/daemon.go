@@ -67,7 +67,7 @@ type Daemon struct {
 	metrics *metrics.Server
 
 	// authEngine is wired into the gRPC server below; kept on the daemon
-	// struct so the realm-sync / binding-reload loop can refresh it later.
+	// struct so the backstop reload loop (runAuthEngineReload) can refresh it.
 	authEngine *auth.Engine
 
 	// realmRegistry holds Local + every configured OIDC/LDAP realm.
@@ -289,9 +289,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// seed the built-in RBAC roles (Admin, Operator, Viewer,
 	// Auditor, BackupOperator, NetworkAdmin, VMOperator, NoAccess) and
-	// initialize the auth engine. The engine reloads on every daemon
-	// start; mid-run it picks up new bindings via explicit Reload calls
-	//.
+	// initialize the auth engine. The engine reloads on daemon start, then
+	// mid-run: local grants reload synchronously, local revokes/deletes apply
+	// in-memory deltas, and runAuthEngineReload (below) is the ~30s backstop
+	// that picks up peer-replicated mutations.
 	if err := auth.SeedBuiltinRoles(ctx, d.db); err != nil {
 		slog.Warn("failed to seed built-in roles", "error", err)
 	}
@@ -497,6 +498,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// placement engine's DiskIOPS/NetBW dimensions.
 	go d.runRuntimeUsageSampler(ctx)
 
+	// Backstop reload of the RBAC engine so peer-replicated role/binding
+	// mutations take effect without a restart (local grants/revokes already
+	// apply synchronously via reload/delta in the handlers).
+	go d.runAuthEngineReload(ctx)
+
 	// Start embedded DNS server, and tell the network layer to chain per-bridge
 	// dnsmasq instances to it for the litevirt domain so guests can resolve
 	// VM/container/anycast names (SetLocalResolver must precede network provisioning).
@@ -558,6 +564,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
+	svc.SetRBACRealm(d.cfg.Auth.RBACRealm)
 	// Split-brain-family enforcement kill-switches — so the HA monitor drives the
 	// right tokens' latches (mandatory ∪ configured-on) and gates degraded/paging on
 	// config intent. The actual enforcement predicates live on the consumers
@@ -1479,6 +1486,38 @@ func (d *Daemon) runVMEventPrune(ctx context.Context) {
 			return
 		case <-ticker.C:
 			prune()
+		}
+	}
+}
+
+// authEngineReloadInterval is the backstop cadence for refreshing the RBAC
+// engine from replicated state. Local grants reload synchronously and local
+// revokes apply as in-memory deltas, so this backstop exists to pick up
+// peer-originated mutations (which arrive via WAL/AE) and to recover from any
+// missed local reload. The effective bound on a peer mutation taking effect is
+// one successful interval AFTER it becomes locally visible — not 30s from the
+// original mutation (replication lag and a failed-reload gap both add latency).
+const authEngineReloadInterval = 30 * time.Second
+
+// runAuthEngineReload periodically reloads the RBAC engine so peer-replicated
+// role/binding mutations take effect without a restart. On failure it logs and
+// retains the prior snapshot (Reload only swaps on success); the next tick
+// retries. A stalled reload service is observable via the engine's
+// last-successful-reload timestamp.
+func (d *Daemon) runAuthEngineReload(ctx context.Context) {
+	if d.authEngine == nil {
+		return
+	}
+	ticker := time.NewTicker(authEngineReloadInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := d.authEngine.Reload(ctx); err != nil {
+				slog.Warn("auth engine periodic reload failed; retaining prior snapshot", "error", err)
+			}
 		}
 	}
 }

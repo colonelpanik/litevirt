@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -106,8 +108,18 @@ type engineSnapshot struct {
 // authenticated RPC consults Allowed/HasAnyBinding) never need to lock,
 // and Reload's swap is atomic.
 type Engine struct {
-	db   *corrosion.Client
+	db *corrosion.Client
+	// mu serializes every snapshot PRODUCER (Reload + the RemoveBinding/
+	// RemovePrincipal deltas). Held across the DB read AND the Store so a
+	// reload that read stale state can never publish after — and thus
+	// resurrect — a newer delta. Readers (Allowed/HasAnyBinding) stay
+	// lock-free via the atomic snapshot pointer.
+	mu   sync.Mutex
 	snap atomic.Pointer[engineSnapshot]
+	// lastReload is the unix time of the last SUCCESSFUL reload; retained
+	// (never reset) across failed reloads so operators can alert on a
+	// stalled reload service.
+	lastReload atomic.Int64
 }
 
 // NewEngine returns an engine reading from db. Caller must call Reload()
@@ -120,8 +132,12 @@ func NewEngine(db *corrosion.Client) *Engine {
 
 // Reload re-reads the roles and role_bindings tables. Cheap (ms on
 // thousand-binding clusters) so it's safe to call after every mutation
-// and on a periodic refresh.
+// and on the periodic backstop. On error the prior snapshot is retained
+// (we only Store on success), so a transient DB failure degrades to
+// staleness, never to an empty policy.
 func (e *Engine) Reload(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	roles, err := corrosion.ListRoles(ctx, e.db)
 	if err != nil {
 		return err
@@ -135,7 +151,65 @@ func (e *Engine) Reload(ctx context.Context) error {
 		return err
 	}
 	e.snap.Store(&engineSnapshot{roleVerbs: rv, bindings: bindings})
+	e.lastReload.Store(time.Now().Unix())
 	return nil
+}
+
+// RemoveBinding drops the binding with the given id from the live snapshot,
+// in memory, without touching the database. RevokeRole uses this so a revoke
+// takes effect IMMEDIATELY — even if a subsequent DB reload fails — while the
+// caller's DB tombstone makes it durable and keeps a later reload from
+// resurrecting it. Bindings other than the named one are preserved, so a
+// principal keeps whatever perms their remaining bindings supply.
+func (e *Engine) RemoveBinding(id string) {
+	e.removeWhere(func(b corrosion.RoleBindingRecord) bool { return b.ID != id })
+}
+
+// RemovePrincipal drops every binding for the given principal from the live
+// snapshot, in memory. DeleteUser uses this (once per resolvable principal
+// form) so a deleted user loses access immediately.
+func (e *Engine) RemovePrincipal(principal string) {
+	e.removeWhere(func(b corrosion.RoleBindingRecord) bool { return b.Principal != principal })
+}
+
+// removeWhere rebuilds the snapshot keeping only bindings for which keep()
+// returns true. Held under the same mutex as Reload, so an in-flight reload
+// that read pre-mutation state cannot store after — and clobber — this delta.
+func (e *Engine) removeWhere(keep func(corrosion.RoleBindingRecord) bool) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cur := e.snap.Load()
+	if cur == nil {
+		return
+	}
+	kept := make([]corrosion.RoleBindingRecord, 0, len(cur.bindings))
+	changed := false
+	for _, b := range cur.bindings {
+		if keep(b) {
+			kept = append(kept, b)
+			continue
+		}
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	// roleVerbs is immutable once built, so sharing it with the new
+	// snapshot is safe.
+	e.snap.Store(&engineSnapshot{roleVerbs: cur.roleVerbs, bindings: kept})
+}
+
+// LastReloadUnix returns the unix time of the last successful reload (0 if the
+// engine has never reloaded). Exposed for a "last successful reload" metric so
+// a stalled reload service is observable.
+func (e *Engine) LastReloadUnix() int64 {
+	if e == nil {
+		return 0
+	}
+	return e.lastReload.Load()
 }
 
 // Allowed reports whether a principal (and their groups) hold a binding

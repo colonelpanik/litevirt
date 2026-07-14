@@ -1032,6 +1032,37 @@ message NormalizeRoleBindingsResponse {
     int32 skipped    = 2; // bare bindings whose realm could not be resolved
 }
 
+// GetVMOperation / AbortVMOperation are the F1 admin recovery surface for an
+// operation wedged on a VM's mutation barrier (active_operation_id). Inspect
+// shows the operation + reduced state; abort force-clears the barrier via the
+// owner/generation CAS so the VM is mutable again (deliberate, admin-only).
+message GetVMOperationRequest { string vm_name = 1; }
+message OperationStepInfo {
+    string step_name  = 1;
+    int64  owner_epoch = 2;
+    string created_at = 3;
+}
+message GetVMOperationResponse {
+    bool   has_active      = 1;
+    string operation_id    = 2;
+    string operation_kind  = 3;
+    string current_state   = 4;
+    bool   faulted         = 5; // conflicting terminals recorded — a safety fault
+    int64  vm_owner_epoch  = 6;
+    int64  spec_generation = 7;
+    bool   header_missing  = 8; // barrier points at a GC'd/absent operation header
+    repeated OperationStepInfo steps = 9;
+}
+message AbortVMOperationRequest {
+    string vm_name = 1;
+    bool   force   = 2; // required — an abort is never implicit
+}
+message AbortVMOperationResponse {
+    bool   aborted               = 1;
+    string previous_operation_id = 2;
+    string detail                = 3;
+}
+
 // Live restore from backup. The handler:
 //
 //   1. Opens the manifest's chunk reader.
@@ -1822,6 +1853,8 @@ service LiteVirt {
     rpc RevokeRole(RevokeRoleRequest)             returns (RevokeRoleResponse);
     rpc ListRoleBindings(ListRoleBindingsRequest) returns (ListRoleBindingsResponse);
     rpc NormalizeRoleBindings(NormalizeRoleBindingsRequest) returns (NormalizeRoleBindingsResponse);
+    rpc GetVMOperation(GetVMOperationRequest) returns (GetVMOperationResponse);
+    rpc AbortVMOperation(AbortVMOperationRequest) returns (AbortVMOperationResponse);
     rpc BeginWebAuthnRegistration(BeginWebAuthnRegistrationRequest)   returns (BeginWebAuthnRegistrationResponse);
     rpc FinishWebAuthnRegistration(FinishWebAuthnRegistrationRequest) returns (FinishWebAuthnRegistrationResponse);
     rpc BeginWebAuthnLogin(BeginWebAuthnLoginRequest)                 returns (BeginWebAuthnLoginResponse);

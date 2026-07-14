@@ -78,6 +78,47 @@ func TestBeginCompleteVMOperation(t *testing.T) {
 	}
 }
 
+func TestGetVMActiveOperation_AndAbort(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm1", HostName: "h1", State: "running", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// No active operation initially.
+	if _, found, err := GetVMActiveOperation(ctx, c, "vm1"); err != nil || found {
+		t.Fatalf("no active op expected: found=%v err=%v", found, err)
+	}
+	op := OperationRecord{ID: "wedged-op", Method: "UpdateVM", ResourceKind: "vm", ResourceID: "vm1",
+		OperationKind: string(OpResourceUpdateRunning), RequestHash: "h"}
+	if _, err := c.BeginVMOperation(ctx, op, `{"cpu":4}`, 0, 0); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	view, found, err := GetVMActiveOperation(ctx, c, "vm1")
+	if err != nil || !found {
+		t.Fatalf("active op should be found: found=%v err=%v", found, err)
+	}
+	if view.ActiveOperationID != "wedged-op" || view.State != OpStepPlanned || view.Operation == nil {
+		t.Fatalf("unexpected view: %+v", view)
+	}
+
+	// Abort with the wrong generation → no-op.
+	if applied, _ := c.AbortVMOperation(ctx, "vm1", "wedged-op", 0, 99); applied {
+		t.Fatal("abort with a stale generation must not apply")
+	}
+	// Abort correctly → barrier cleared, cancelled step recorded.
+	applied, err := c.AbortVMOperation(ctx, "vm1", "wedged-op", 0, 1)
+	if err != nil || !applied {
+		t.Fatalf("abort: applied=%v err=%v", applied, err)
+	}
+	if _, found, _ := GetVMActiveOperation(ctx, c, "vm1"); found {
+		t.Fatal("barrier should be cleared after abort")
+	}
+	if state, _, _ := OperationCurrentState(ctx, c, "wedged-op", 0, OpResourceUpdateRunning); state != OpStepCancelled {
+		t.Fatalf("aborted op state = %q, want cancelled", state)
+	}
+}
+
 // A stale epoch/generation at begin is refused (the CAS precondition).
 func TestBeginVMOperation_StaleEpochRefused(t *testing.T) {
 	ctx := context.Background()

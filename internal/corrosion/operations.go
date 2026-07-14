@@ -362,6 +362,92 @@ func ReapTerminalOperations(ctx context.Context, c *Client, retention time.Durat
 	return reaped, nil
 }
 
+// VMOperationView is a VM's active-operation snapshot for admin inspection.
+type VMOperationView struct {
+	VMName            string
+	OwnerEpoch        int64
+	SpecGeneration    int64
+	ActiveOperationID string
+	Operation         *OperationRecord // nil if the barrier points at a missing header
+	Steps             []OperationStepRecord
+	State             string
+	Faulted           bool
+}
+
+// GetVMActiveOperation returns the VM's active-operation view, or found=false
+// when the VM has no operation holding its mutation barrier. Used by the admin
+// recovery inspect command.
+func GetVMActiveOperation(ctx context.Context, c *Client, vmName string) (*VMOperationView, bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_owner_epoch, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+	active := rows[0].String("active_operation_id")
+	if active == "" {
+		return nil, false, nil
+	}
+	v := &VMOperationView{
+		VMName: vmName, OwnerEpoch: rows[0].Int64("vm_owner_epoch"),
+		SpecGeneration: rows[0].Int64("spec_generation"), ActiveOperationID: active,
+	}
+	op, err := GetOperation(ctx, c, active)
+	if err != nil {
+		return nil, false, err
+	}
+	v.Operation = op
+	var kind OperationKind
+	if op != nil {
+		kind = OperationKind(op.OperationKind)
+	}
+	v.Steps, err = ListOperationSteps(ctx, c, active, v.OwnerEpoch)
+	if err != nil {
+		return nil, false, err
+	}
+	names := make([]string, len(v.Steps))
+	for i, s := range v.Steps {
+		names[i] = s.StepName
+	}
+	v.State, v.Faulted = ReduceOperationState(kind, names)
+	return v, true, nil
+}
+
+// AbortVMOperation force-clears a WEDGED operation's mutation barrier: it records
+// a cancelled step and clears active_operation_id via the owner/generation CAS,
+// so the VM is mutable again. This is the deliberate admin recovery path — it
+// still requires the exact epoch+generation to match (a stale/superseded caller
+// can't clear a newer op's barrier), and it is NOT reachable via an ordinary
+// --force on a normal mutation. Returns applied=false if the CAS no longer holds.
+func (c *Client) AbortVMOperation(ctx context.Context, vmName, operationID string, ownerEpoch, specGen int64) (bool, error) {
+	now := c.NowTS()
+	guard := func(tx *sql.Tx) (bool, error) {
+		var oe, sg int64
+		var active string
+		err := tx.QueryRowContext(ctx,
+			`SELECT vm_owner_epoch, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`,
+			vmName).Scan(&oe, &sg, &active)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return active == operationID && oe == ownerEpoch && sg == specGen, nil
+	}
+	stmts := []Statement{
+		{SQL: `UPDATE vms SET active_operation_id = '', updated_at = ?
+		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`,
+			Params: []interface{}{now, vmName, operationID, ownerEpoch, specGen}},
+		{SQL: `INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
+		       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+			Params: []interface{}{operationID, ownerEpoch, OpStepCancelled, "admin-abort", nowRFC3339(), now}},
+	}
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
 // OperationCurrentState reduces an operation's recorded steps (for the given
 // owner epoch) to its authoritative current state + safety-fault flag.
 func OperationCurrentState(ctx context.Context, c *Client, operationID string, ownerEpoch int64, kind OperationKind) (state string, faulted bool, err error) {

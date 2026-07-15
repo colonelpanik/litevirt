@@ -35,6 +35,9 @@ lv ct pull docker.io/library/nginx:1.27 --dest /var/lib/lxc/web
 
 # Create the container from the unpacked rootfs. --template accepts the bundle
 # dir (descends into rootfs/) or a rootfs path; the LXC config is generated.
+# The template rootfs is COPIED into the container's own <lxcpath>/<name>/rootfs,
+# so the pulled template stays intact — reuse it for many containers, and
+# `lv ct rm` only removes that container's copy, never the template.
 lv ct create web --template /var/lib/lxc/web
 
 # Start, exec, stop, delete
@@ -152,7 +155,9 @@ resolved when the container runs on the LB's own host. (A DHCP container on a
 
 Current limits: an OCI **registry ref** (`kind: oci`, `image:
 docker.io/library/nginx:1.27`) isn't auto-pulled by compose yet — pre-pull it
-(`lv ct pull <ref> --dest <dir>`) and set `image:` to that rootfs path. A cpu/mem
+(`lv ct pull <ref> --dest <dir>`) and set `image:` to that rootfs path. Each
+container gets its own copy of that rootfs, so one pull backs any number of
+containers and `compose down` never disturbs the pulled template. A cpu/mem
 change recreates the container (no in-place reconfigure). `lv compose ps` lists
 VMs only. Containers have no **live/CRIU** migration; **cold migration**
 (`lv ct migrate`, stop → transfer → start) exists — see the Cold migration

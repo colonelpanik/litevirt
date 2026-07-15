@@ -3,7 +3,10 @@ package grpcapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -2225,6 +2228,88 @@ func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc
 }
 
+// updateRequestHash is the D4 canonical request hash: the deterministic protobuf
+// serialization of the request with idempotency_key cleared, so two entry nodes
+// handed the same client key hash a semantically identical request identically. A
+// reused key with a DIFFERENT hash is a conflict.
+func updateRequestHash(req *pb.UpdateVMRequest) string {
+	clone := proto.Clone(req).(*pb.UpdateVMRequest)
+	clone.IdempotencyKey = ""
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(clone)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// liveGrowVCPUCoordinated is the post-latch (operation_protocol) live vCPU grow: it
+// records a durable reservation + claims the mutation barrier via BeginVMOperation
+// (deterministic op id from D4), applies the live hot-add, persists the observed
+// actual, and completes the operation (releasing the barrier + reservation). On a
+// libvirt failure it aborts the operation so the barrier doesn't wedge the VM.
+func (s *Server) liveGrowVCPUCoordinated(ctx context.Context, req *pb.UpdateVMRequest, vm *corrosion.VMRecord, spec *pb.VMSpec) (*pb.VM, error) {
+	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
+	_, _ = s.ensureProjectAuthority(ctx, vm.Project) // best-effort D1 authority establishment
+
+	cpuDelta := int(req.Cpu) - int(spec.Cpu)
+	rv := corrosion.ReservationVector{
+		Project: vm.Project, ProjectCPU: cpuDelta,
+		TargetHost: vm.HostName, TargetCPU: cpuDelta,
+	}
+	resJSON, err := rv.Encode()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
+	}
+	newSpec := proto.Clone(spec).(*pb.VMSpec)
+	newSpec.Cpu = req.Cpu
+	newSpecJSON, err := json.Marshal(newSpec)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "marshal spec: %v", err)
+	}
+
+	op := corrosion.OperationRecord{
+		ID:              corrosion.DeterministicOperationID("UpdateVM", principal, vm.Project, vm.Name, req.IdempotencyKey),
+		Method:          "UpdateVM",
+		Principal:       principal,
+		Project:         vm.Project,
+		ResourceKind:    "vm",
+		ResourceID:      vm.Name,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		RequestHash:     updateRequestHash(req),
+		IdempotencyKey:  req.IdempotencyKey,
+		ReservationJSON: resJSON,
+	}
+	applied, err := s.db.BeginVMOperation(ctx, op, string(newSpecJSON), vm.OwnerEpoch, vm.SpecGeneration)
+	if err != nil {
+		if errors.Is(err, corrosion.ErrOperationHashConflict) {
+			return nil, status.Errorf(codes.AlreadyExists, "idempotency key reused with a different request for %q", vm.Name)
+		}
+		return nil, status.Errorf(codes.Internal, "begin operation: %v", err)
+	}
+	if !applied {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress or the VM changed underneath", vm.Name)
+	}
+	newGen := vm.SpecGeneration + 1
+
+	if err := s.virt.SetVCPUs(req.Name, int(req.Cpu)); err != nil {
+		// Unwedge: abort the operation so the barrier is released for a retry.
+		if _, aerr := s.db.AbortVMOperation(ctx, vm.Name, op.ID, vm.OwnerEpoch, newGen); aerr != nil {
+			slog.Error("liveGrowVCPUCoordinated: abort after libvirt failure failed", "vm", vm.Name, "error", aerr)
+		}
+		return nil, status.Errorf(codes.Internal, "live vCPU resize: %v", err)
+	}
+	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, req.Name, int(req.Cpu), vm.MemActual, vm.OwnerEpoch, newGen); err != nil {
+		slog.Error("liveGrowVCPUCoordinated: persisting cpu_actual failed", "vm", vm.Name, "error", err)
+	}
+	if _, err := s.db.CompleteVMOperation(ctx, vm.Name, op.ID, vm.OwnerEpoch, newGen); err != nil {
+		slog.Error("liveGrowVCPUCoordinated: completing operation failed — recovery will reconcile", "vm", vm.Name, "error", err)
+	}
+	slog.Info("vm vCPUs grown live (coordinated)", "vm", req.Name, "cpu", req.Cpu)
+	s.recordVMEvent(ctx, req.Name, "vm.updated", "ok", fmt.Sprintf("live vcpu grow to %d", req.Cpu))
+	return s.vmToProto(ctx, req.Name)
+}
+
 // liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop), within the domain's
 // real vCPU hotplug ceiling. Caller has confirmed a pure cpu-grow request on a local
 // running VM with live_resize latched; this takes the VM lock, re-reads, and applies.
@@ -2274,6 +2359,13 @@ func (s *Server) liveGrowVCPU(ctx context.Context, req *pb.UpdateVMRequest) (*pb
 	// (counting in-flight reservations), serialized here by the owner + VM lock.
 	if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, int(req.Cpu)-int(spec.Cpu), 0); err != nil {
 		return nil, err
+	}
+
+	// Post-latch: run the full F1 operation protocol so the grow records a durable
+	// reservation + holds the mutation barrier for its (brief) duration. Pre-latch,
+	// fall through to the direct path (barrier/reservation written but not relied on).
+	if s.operationProtocolActive(ctx) {
+		return s.liveGrowVCPUCoordinated(ctx, req, vm, spec)
 	}
 
 	if err := s.virt.SetVCPUs(req.Name, int(req.Cpu)); err != nil {

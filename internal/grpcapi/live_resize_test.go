@@ -104,6 +104,39 @@ func TestUpdateVM_LiveCPUGrow_NoHeadroom(t *testing.T) {
 	}
 }
 
+// TestUpdateVM_LiveCPUGrow_Coordinated: with operation_protocol latched, a live grow
+// runs the full F1 flow — it grows live, persists the new count, and clears the
+// mutation barrier on completion (no wedged operation).
+func TestUpdateVM_LiveCPUGrow_Coordinated(t *testing.T) {
+	s := reconfigServer(t)
+	ctx := adminCtx()
+	s.SetLiveResize(true)
+	s.SetOperationProtocol(true)
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{
+		capabilities.LiveResizeV1:        true,
+		capabilities.OperationProtocolV1: true,
+	}})
+	insertTestVMWithSpec(t, ctx, s.db, "co", "test-host", "running",
+		seedSpecJSON(t, &pb.VMSpec{Name: "co", Cpu: 2, MaxCpu: 8, MemoryMib: 2048}))
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>co</name><memory unit='KiB'>2097152</memory><vcpu current='2'>8</vcpu></domain>`); err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "co", Cpu: 6}); err != nil {
+		t.Fatalf("coordinated live grow: %v", err)
+	}
+	vm, _ := corrosion.GetVM(ctx, s.db, "co")
+	if vm.CPUActual != 6 {
+		t.Errorf("cpu_actual = %d, want 6", vm.CPUActual)
+	}
+	if vm.ActiveOperationID != "" {
+		t.Errorf("mutation barrier not cleared on completion: active_operation_id = %q", vm.ActiveOperationID)
+	}
+	if _, active, _ := corrosion.GetVMActiveOperation(ctx, s.db, "co"); active {
+		t.Error("operation still active after completion")
+	}
+}
+
 // TestUpdateVM_LiveCPUGrow_HostCapacity: a live grow that would over-commit the
 // host's CPU is rejected (F2 admission), not silently applied.
 func TestUpdateVM_LiveCPUGrow_HostCapacity(t *testing.T) {

@@ -630,3 +630,47 @@ func TestSelectBatch_MemoryTracking(t *testing.T) {
 		t.Errorf("memory overflow: both on %s (only 4096 MiB each)", results["vm1"].Host)
 	}
 }
+
+// TestAssignDevices_SRIOV_NoPin: an SR-IOV request is resolved on-demand by the
+// owner's allocator, so placement neither pins a VF address nor consumes a device.
+func TestAssignDevices_SRIOV_NoPin(t *testing.T) {
+	pool := map[string][]corrosion.PCIDeviceRecord{
+		"node1": {
+			{Address: "0000:41:00.0", Type: "network", VMName: "", SRIOVCapable: true, SRIOVVFsTotal: 7},
+		},
+	}
+	result := assignDevices(pool, "node1", []DeviceRequest{
+		{Type: "network", Count: 1, Sriov: true, Parent: "0000:41:00.0"},
+	})
+	if len(result) != 0 {
+		t.Fatalf("SR-IOV request must not pin a device, got %v", result)
+	}
+	for _, d := range pool["node1"] {
+		if d.VMName == "reserved" {
+			t.Error("SR-IOV request must not consume/reserve a device from the pool")
+		}
+	}
+}
+
+// TestScoreHostDevices_SRIOV: a host with an SR-IOV-capable PF is eligible even with
+// zero existing VFs (VFs are created on-demand); a host without one is not.
+func TestScoreHostDevices_SRIOV(t *testing.T) {
+	pfHost := []corrosion.PCIDeviceRecord{
+		{Address: "0000:41:00.0", Type: "network", SRIOVCapable: true, SRIOVVFsTotal: 7, SRIOVVFsFree: 0},
+	}
+	if ok, _ := scoreHostDevices(pfHost, []DeviceRequest{{Type: "network", Sriov: true}}); !ok {
+		t.Error("an SR-IOV-capable PF with 0 current VFs must still be eligible (created on-demand)")
+	}
+	// Parent-specified match.
+	if ok, _ := scoreHostDevices(pfHost, []DeviceRequest{{Type: "network", Sriov: true, Parent: "0000:41:00.0"}}); !ok {
+		t.Error("matching parent PF must be eligible")
+	}
+	if ok, _ := scoreHostDevices(pfHost, []DeviceRequest{{Type: "network", Sriov: true, Parent: "0000:99:00.0"}}); ok {
+		t.Error("non-matching parent must NOT be eligible")
+	}
+	// No SR-IOV-capable device of the type → not eligible.
+	plain := []corrosion.PCIDeviceRecord{{Address: "0000:03:00.0", Type: "gpu", SRIOVCapable: false}}
+	if ok, _ := scoreHostDevices(plain, []DeviceRequest{{Type: "network", Sriov: true}}); ok {
+		t.Error("host without an SR-IOV-capable network PF must not be eligible")
+	}
+}

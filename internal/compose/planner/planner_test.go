@@ -613,3 +613,37 @@ func containsSubstr(s, substr string) bool {
 	}
 	return false
 }
+
+// TestResolve_UpdatePinsToCurrentHost: a VM UPDATE stays on its current host even
+// when another host has far more free capacity — re-running placement must not move it.
+func TestResolve_UpdatePinsToCurrentHost(t *testing.T) {
+	f := makeFile("mystack", map[string]compose.VMDef{
+		"web": {Image: "ubuntu", CPU: 2, Memory: 1024}, // cpu 1->2 vs current → OpUpdate
+	})
+	state := makeState(
+		// h2 is far roomier; naive placement would pick it.
+		[]corrosion.HostRecord{makeHost("h1", 8, 8192), makeHost("h2", 128, 262144)},
+		[]corrosion.VMRecord{{
+			Name: "web", StackName: "mystack", HostName: "h1",
+			Spec: `{"image":"ubuntu","cpu":1}`, State: "running", CPUActual: 1, MemActual: 1024,
+		}},
+		nil,
+	)
+
+	plan, err := Resolve(context.Background(), f, state)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	found := false
+	for _, vm := range plan.VMs {
+		if vm.VMName == "web" && vm.Kind == OpUpdate {
+			found = true
+			if vm.TargetHost != "h1" {
+				t.Errorf("update moved the VM: TargetHost=%q, want h1 (its current host)", vm.TargetHost)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected an OpUpdate for web")
+	}
+}

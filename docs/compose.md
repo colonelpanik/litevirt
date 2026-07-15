@@ -628,9 +628,17 @@ still take ad-hoc snapshots via `lv backup`. See [`docs/backups.md`](backups.md)
         count: 1
       - type: "network"
         sriov: true
-        parent: "eth1"
+        parent: "0000:41:00.0"      # SR-IOV: PF PCI address (BDF) to draw a VF from
       - mapping: "gpu-a100"         # cluster-wide resource mapping (see below)
 ```
+
+An `sriov: true` device requests an SR-IOV virtual function. Placement only requires
+the target host to have a matching SR-IOV-capable PF (optionally the one named by
+`parent`); the actual VF is **allocated on-demand at create time** — reused if one is
+free, or created on an adopted PF per the host's `pci.sriov` policy (see
+[pci-passthrough.md](pci-passthrough.md#sr-iov-virtual-functions)). It is never pinned
+to a fixed VF address at plan time. `parent` is a PF **PCI address (BDF)**, not a
+NIC name. The same is available ad-hoc via `lv attach-pci <vm> --sriov --parent <BDF>`.
 
 A `mapping` references a cluster-wide **resource mapping** (`lv mapping`) — a named
 alias for an equivalent passthrough device registered on one or more hosts. At

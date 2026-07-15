@@ -165,7 +165,9 @@ hosts that advertise the container runtime, so they never land on a node that
 can't run them. Image forms: `kind: lxc` takes a download template (`image:
 "alpine:3.21"`) or a rootfs path; an OCI **registry ref** must be pre-pulled
 today (`lv ct pull <ref> --dest <rootfs-dir>`, then set `image:` to that rootfs
-path). Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
+path). Each container is given its own copy of the rootfs, so one pull backs any
+number of containers and `compose down` leaves the pulled template untouched.
+Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
 (cpu/mem changes recreate the container rather than live-tuning); and full
 network/IPAM/security-group provisioning for container NICs (a container sharing
 a stack network with a VM uses the bridge the VM path provisions).

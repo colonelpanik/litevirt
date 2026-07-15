@@ -448,6 +448,41 @@ func (c *Client) AbortVMOperation(ctx context.Context, vmName, operationID strin
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
 
+// ListVMsWithActiveOperation returns every locally-owned VM whose mutation barrier
+// is held (a non-empty active_operation_id), with the columns the resource-update
+// recovery pass needs. Used at startup and on a reconciler tick to find resize operations
+// that crashed after committing their desired spec but before completing — so the
+// barrier converges toward the committed spec instead of wedging the VM.
+func ListVMsWithActiveOperation(ctx context.Context, c *Client, hostName string) ([]VMRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT name, stack_name, host_name, spec, state, state_detail,
+			cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
+			vm_owner_epoch, spec_generation, active_operation_id
+		 FROM vms
+		 WHERE host_name = ? AND active_operation_id != '' AND deleted_at IS NULL`, hostName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]VMRecord, len(rows))
+	for i, r := range rows {
+		out[i] = VMRecord{
+			Name:              r.String("name"),
+			StackName:         r.String("stack_name"),
+			HostName:          r.String("host_name"),
+			Spec:              r.String("spec"),
+			State:             r.String("state"),
+			StateDetail:       r.String("state_detail"),
+			CPUActual:         r.Int("cpu_actual"),
+			MemActual:         r.Int("mem_actual"),
+			Project:           r.String("project"),
+			OwnerEpoch:        r.Int64("vm_owner_epoch"),
+			SpecGeneration:    r.Int64("spec_generation"),
+			ActiveOperationID: r.String("active_operation_id"),
+		}
+	}
+	return out, nil
+}
+
 // OperationCurrentState reduces an operation's recorded steps (for the given
 // owner epoch) to its authoritative current state + safety-fault flag.
 func OperationCurrentState(ctx context.Context, c *Client, operationID string, ownerEpoch int64, kind OperationKind) (state string, faulted bool, err error) {

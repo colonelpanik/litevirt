@@ -573,14 +573,18 @@ Control how VMs are updated when a compose file changes. The strategy determines
 
 Strategies:
 
-- `recreate` — (default) Delete then create each VM sequentially. Simple but has downtime.
+- `recreate` — (default) Delete then create each VM sequentially. Simple but has downtime. Deleting a VM destroys its disks.
 - `rolling` / `stop-first` — Update VMs one at a time: stop old, create new, wait for health check, continue.
 - `start-first` — Create new VM first, wait for health check, then stop old. Minimizes downtime.
-- `all-at-once` — Recreate all VMs simultaneously. Fast but risky. Supports `rollback-on-failure`.
+- `all-at-once` — Recreate all VMs simultaneously. Fast but risky.
 - `blue-green` — Create a parallel set of new VMs ("-green" suffix), verify health, then cut over.
-- `in-place` — Try live CPU/memory hot-add without restart. Falls back to recreate for non-hot-modifiable changes.
+- `in-place` — **Live-or-fail: it applies live changes only and NEVER deletes a VM.** A cpu grow (within the `max-cpu` hotplug ceiling) and a memory change (within the `[min-memory, max-memory]` balloon band) are applied to the running VM with no restart; live-metadata changes (restart policy, onboot, ordering, labels, placement, migrate) are patched into the spec. Any change that would need a restart (max-cpu / mem-bounds / cpu-mode / machine / firmware / graphics / secure-boot / tpm / passthrough devices / health-check / hooks / stop-grace / a cpu shrink or grow beyond the ceiling / an out-of-band memory target) or a recreate (image / iso / disk or network topology / cloud-init) is **refused with a clear error — nothing is deleted or partially applied.** Use `recreate` (or stop the VM and `lv update`) for those.
 
-During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last.
+`in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. A destructive recreate happens only under the explicit `recreate` / `all-at-once` / `blue-green` / `snapshot-and-replace` strategies.
+
+During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last. A rolling update fails fast: if any VM update errors, the deploy stops **before** the scale-down step and the stack's stored desired state is left unchanged, so a failed update never deletes a VM the change didn't intend to and never records a half-applied stack.
+
+> Mixed-version note: `in-place`'s non-destructive behavior is enforced by the entry node serving the deploy. Do not rely on the `in-place` strategy until every mutation-serving node in the cluster runs a build that supports it.
 
 ## Migration policy
 

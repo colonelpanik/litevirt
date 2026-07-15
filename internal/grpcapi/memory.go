@@ -42,6 +42,18 @@ func (s *Server) SetVMMemory(ctx context.Context, req *pb.SetVMMemoryRequest) (*
 		return nil, status.Error(codes.InvalidArgument, "target_mib must be positive")
 	}
 
+	// Post-latch: route the balloon through the SAME atomic F1 path as a live resize
+	// (BeginVMOperation commits the desired memory_mib + claims the barrier), so a
+	// balloon and a coordinated resize can't race and the change is crash-recoverable.
+	// The coordinator owns the VM lock, re-reads under it, and enforces the band.
+	if s.operationProtocolActive(ctx) {
+		if err := s.resizeVMLive(ctx, req.Name, &pb.VMSpec{MemoryMib: req.TargetMib}, req.IdempotencyKey); err != nil {
+			return nil, err
+		}
+		return s.vmToProto(ctx, req.Name)
+	}
+
+	// Pre-latch: the direct balloon + mem_actual path.
 	unlock := s.lockVM(req.Name)
 	defer unlock()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)

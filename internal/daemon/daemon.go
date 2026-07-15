@@ -627,6 +627,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}
 
+	// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
+	// resource_update_running operation (a live resize that crashed after committing its
+	// desired spec) — converge it to the committed spec + clear the barrier so a partial
+	// failure never wedges active_operation_id. Uses replicated operation state (not the
+	// host-local journal), so it runs regardless of the journal above. A reconciler pass
+	// retries stragglers.
+	svc.RecoverResourceOperations(ctx)
+	go svc.RunResourceOperationRecovery(ctx)
+
 	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
 	// for cluster-wide capability confirmation) and every reconciler/vmChecker
 	// callback is set, start the runtime loops. Launching them here — not at

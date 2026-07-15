@@ -937,6 +937,20 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return client.StartVM(ctx, req)
 	}
 
+	// Serialize with other lifecycle ops on this VM, then RE-READ under the lock so a
+	// concurrent ownership transfer or state change is observed before we act. If
+	// ownership moved off this host in that window, abort for retry rather than
+	// forward while holding the lock (never hold a process lock across a peer RPC).
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+
 	// Split-brain gate (Phase 1): bringing an owned VM to running is a runtime action
 	// that, under STALE ownership (the VM was failed over elsewhere during a partition
 	// but this side's row still says stopped+here), would double-run it. Require local
@@ -947,26 +961,34 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.FailedPrecondition, "start refused: %s", reason)
 	}
 
+	return s.startVMLocked(ctx, vm)
+}
+
+// startVMLocked brings a LOCAL VM to running. The caller MUST hold the VM lock, have
+// re-read vm under it, confirmed local ownership, and passed the split-brain gate; it
+// never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
+// coordinator's restart path) call it directly under one lock.
+func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, pbVM, hspec)
 
-	if err := s.virt.StartDomain(req.Name); err != nil {
+	if err := s.virt.StartDomain(vm.Name); err != nil {
 		// Heal a state desync: if libvirt reports the domain is already
 		// running, the cluster record was stale (an out-of-band start, or an
 		// RPC that mutated libvirt but failed before writing state). Reconcile
 		// the record to "running" rather than surfacing "already running".
-		if st, sErr := s.virt.DomainState(req.Name); sErr == nil && st == "running" {
+		if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 			// Domain is already running: a lost "running" write is low-harm (the
 			// reconciler heals it from libvirt), so record best-effort with retry
 			// but never skip the follow-up (hooks) or fail the start.
-			if werr := s.persistVMState(ctx, req.Name, "running", "reconciled: already running in libvirt", corrosion.OpVMState); werr != nil {
-				slog.Error("StartVM: recording reconciled running state failed — reconciler will heal", "vm", req.Name, "error", werr)
+			if werr := s.persistVMState(ctx, vm.Name, "running", "reconciled: already running in libvirt", corrosion.OpVMState); werr != nil {
+				slog.Error("StartVM: recording reconciled running state failed — reconciler will heal", "vm", vm.Name, "error", werr)
 			}
-			slog.Warn("StartVM: domain already running in libvirt, reconciled cluster state", "vm", req.Name)
+			slog.Warn("StartVM: domain already running in libvirt, reconciled cluster state", "vm", vm.Name)
 			pbVM.State = pb.VMState_VM_RUNNING
 			hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
-			return s.vmToProto(ctx, req.Name)
+			return s.vmToProto(ctx, vm.Name)
 		}
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
@@ -975,10 +997,10 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// it from libvirt), so record it best-effort with retry and still run the
 	// follow-up (VLAN taps, PostStart hook) — skipping those would leave a running
 	// but unreachable VM that nothing re-heals.
-	if err := s.persistVMState(ctx, req.Name, "running", "", corrosion.OpVMState); err != nil {
-		slog.Error("StartVM: recording running state failed — reconciler will heal", "vm", req.Name, "error", err)
+	if err := s.persistVMState(ctx, vm.Name, "running", "", corrosion.OpVMState); err != nil {
+		slog.Error("StartVM: recording running state failed — reconciler will heal", "vm", vm.Name, "error", err)
 	}
-	s.recordVMEvent(ctx, req.Name, "vm.started", "ok", "")
+	s.recordVMEvent(ctx, vm.Name, "vm.started", "ok", "")
 
 	// Reapply VLAN tap config: VLAN tagging lives on the host tap (libvirt assigns
 	// a fresh vnetN at each start), not the domain XML — so a VM defined-then-
@@ -990,16 +1012,13 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	pbVM.State = pb.VMState_VM_RUNNING
 	hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
 
-	return s.vmToProto(ctx, req.Name)
+	return s.vmToProto(ctx, vm.Name)
 }
 
 func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	unlock := s.lockVM(req.Name)
-	defer unlock()
-
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
@@ -1008,6 +1027,8 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		return nil, err
 	}
 
+	// Forward to the owner BEFORE taking the local lock (never hold a process lock
+	// across a peer RPC).
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -1017,30 +1038,47 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		return client.StopVM(ctx, req)
 	}
 
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+
+	return s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
+}
+
+// stopVMLocked stops a LOCAL VM (force ⇒ destroy, else graceful shutdown with a
+// timeout then force-kill). The caller MUST hold the VM lock, have re-read vm under
+// it, and confirmed local ownership; it never locks or forwards.
+func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32) (*pb.VM, error) {
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
 
-	if req.Force {
-		if err := s.virt.DestroyDomain(req.Name); err != nil {
+	if force {
+		if err := s.virt.DestroyDomain(vm.Name); err != nil {
 			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
 		}
 	} else {
-		if err := s.virt.ShutdownDomain(req.Name); err != nil {
+		if err := s.virt.ShutdownDomain(vm.Name); err != nil {
 			return nil, status.Errorf(codes.Internal, "shutdown: %v", err)
 		}
 		// Wait for graceful shutdown with timeout, then force-kill.
-		timeout := resolveStopTimeout(req.Timeout, vm.Spec)
+		timeout := resolveStopTimeout(timeoutSec, vm.Spec)
 		if timeout > 0 {
-			if !s.virt.WaitForShutdown(req.Name, time.Duration(timeout)*time.Second) {
-				slog.Info("ACPI shutdown timed out, force-killing", "vm", req.Name, "timeout_sec", timeout)
-				_ = s.virt.DestroyDomain(req.Name)
+			if !s.virt.WaitForShutdown(vm.Name, time.Duration(timeout)*time.Second) {
+				slog.Info("ACPI shutdown timed out, force-killing", "vm", vm.Name, "timeout_sec", timeout)
+				_ = s.virt.DestroyDomain(vm.Name)
 			}
 		}
 	}
 
 	// Release PCI passthrough devices and unbind from vfio-pci.
-	s.releaseDevices(ctx, req.Name)
+	s.releaseDevices(ctx, vm.Name)
 
 	// Mark as "stopped" with detail indicating operator-initiated stop. This
 	// distinguishes operator stops from crashes (#29): losing this write lets HA
@@ -1051,10 +1089,10 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	// reconciler (it can't know the stop was intentional) and lets HA auto-restart
 	// the VM (#29), so this one is fail-closed: retry, then surface an error if it
 	// still can't land, rather than signal a clean stop.
-	if err := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
+	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
-	s.recordVMEvent(ctx, req.Name, "vm.stopped", "ok", "")
+	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", "")
 
 	// Refresh LB backends so stopped VM is removed from rotation.
 	go s.refreshLBForStack(context.Background(), vm.StackName)
@@ -1062,7 +1100,7 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	pbVM.State = pb.VMState_VM_STOPPED
 	hooks.Run(ctx, hooks.PostStop, pbVM, hspec)
 
-	return s.vmToProto(ctx, req.Name)
+	return s.vmToProto(ctx, vm.Name)
 }
 
 func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.VM, error) {
@@ -1077,6 +1115,7 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, err
 	}
 
+	// Forward to the owner BEFORE taking the local lock.
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -1084,6 +1123,16 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		}
 		defer conn.Close()
 		return client.RestartVM(ctx, req)
+	}
+
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
 
 	// Split-brain gate (Phase 1): a restart (destroy+start) is a runtime action on a
@@ -1094,19 +1143,15 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, status.Errorf(codes.FailedPrecondition, "restart refused: %s", reason)
 	}
 
-	// Destroy then start
-	s.virt.DestroyDomain(req.Name)
-	if err := s.virt.StartDomain(req.Name); err != nil {
+	// Destroy, then bring it back up through the shared start primitive (so VLAN taps
+	// are reapplied and PostStart hooks run — a plain inline StartDomain skipped both).
+	s.virt.DestroyDomain(vm.Name)
+	out, err := s.startVMLocked(ctx, vm)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "restart: %v", err)
 	}
-
-	// Low-harm "running" write (reconciler heals from libvirt): record best-effort
-	// with retry, still record the event, never fail an already-restarted VM.
-	if err := s.persistVMState(ctx, req.Name, "running", "", corrosion.OpVMState); err != nil {
-		slog.Error("RestartVM: recording running state failed — reconciler will heal", "vm", req.Name, "error", err)
-	}
-	s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "")
-	return s.vmToProto(ctx, req.Name)
+	s.recordVMEvent(ctx, vm.Name, "vm.restarted", "ok", "")
+	return out, nil
 }
 
 // deleteLocalOnly reports whether this DeleteVM call is a peer-search probe

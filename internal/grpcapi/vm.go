@@ -2213,6 +2213,94 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 
 // UpdateVM modifies the spec of a stopped VM (CPU, memory, VNC toggle),
 // regenerates domain XML, and redefines the libvirt domain.
+// isPureCPUGrowRequest reports whether req sets ONLY the vCPU count (no memory,
+// machine/firmware/mem-bounds/max_cpu redefine field, and no live-metadata field) —
+// the shape eligible for the live vCPU hot-add fast path.
+func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
+	return req.Cpu > 0 &&
+		req.MemoryMib == 0 && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
+		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
+		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
+		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc
+}
+
+// liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop), within the domain's
+// real vCPU hotplug ceiling. Caller has confirmed a pure cpu-grow request on a local
+// running VM with live_resize latched; this takes the VM lock, re-reads, and applies.
+func (s *Server) liveGrowVCPU(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM, error) {
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+	if vm.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress", req.Name)
+	}
+	if vm.State != "running" {
+		return nil, status.Errorf(codes.FailedPrecondition, "VM %q is no longer running", req.Name)
+	}
+	spec := &pb.VMSpec{}
+	if vm.Spec != "" {
+		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
+		}
+	}
+	if int(req.Cpu) <= int(spec.Cpu) {
+		return nil, status.Errorf(codes.FailedPrecondition, "live resize only grows vCPUs; stop the VM to shrink from %d to %d", spec.Cpu, req.Cpu)
+	}
+	if spec.Resources != nil && len(spec.Resources.CpuPinning) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q has pinned vCPUs and cannot live-grow CPUs; stop it and update, or pass --restart-if-needed", req.Name)
+	}
+	// Real-headroom check: the RUNNING domain's actual vCPU ceiling — not just the
+	// stored max_cpu intent — must cover the target, else a restart is required to
+	// pick up a raised topology.
+	inactiveXML, xerr := s.virt.DumpXMLInactive(req.Name)
+	if xerr != nil {
+		return nil, status.Errorf(codes.Internal, "read domain XML for %q: %v", req.Name, xerr)
+	}
+	if ceiling := lv.MaxVCPUFromXML(inactiveXML); ceiling < int(req.Cpu) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q boots with a vCPU ceiling of %d; growing to %d needs a restart — set max_cpu (≥%d) and restart, or pass --restart-if-needed",
+			req.Name, ceiling, req.Cpu, req.Cpu)
+	}
+
+	if err := s.virt.SetVCPUs(req.Name, int(req.Cpu)); err != nil {
+		return nil, status.Errorf(codes.Internal, "live vCPU resize: %v", err)
+	}
+
+	// Persist the new boot vCPU count (SetVCPUs also set the CONFIG) and the live
+	// actual, under the barrier + generation discipline.
+	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(old string) (string, error) {
+		fresh := &pb.VMSpec{}
+		if old != "" {
+			if uerr := json.Unmarshal([]byte(old), fresh); uerr != nil {
+				return "", uerr
+			}
+		}
+		fresh.Cpu = req.Cpu
+		b, merr := json.Marshal(fresh)
+		return string(b), merr
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "persist vCPU count: %v", err)
+	}
+	if !applied {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress", req.Name)
+	}
+	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, req.Name, int(req.Cpu), vm.MemActual, vm.OwnerEpoch, newGen); err != nil {
+		slog.Error("liveGrowVCPU: persisting cpu_actual failed — accounting will lag until reconciled", "vm", req.Name, "error", err)
+	}
+	slog.Info("vm vCPUs grown live", "vm", req.Name, "cpu", req.Cpu)
+	s.recordVMEvent(ctx, req.Name, "vm.updated", "ok", fmt.Sprintf("live vcpu grow to %d", req.Cpu))
+	return s.vmToProto(ctx, req.Name)
+}
+
 func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -2244,6 +2332,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
 			return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
 		}
+	}
+
+	// Live CPU hot-add fast path: a pure vCPU GROW on a running VM, when live_resize
+	// is latched, is applied in place (no stop) under the VM lock. Everything else
+	// (shrink, memory, machine/firmware, or a mixed request) falls through to the
+	// stopped-redefine path below.
+	if isPureCPUGrowRequest(req) && int(req.Cpu) > int(spec.Cpu) && vm.State == "running" && s.liveResizeActive(ctx) {
+		return s.liveGrowVCPU(ctx, req)
 	}
 
 	// Snapshot fields whose change would take the redefine off the CPU/memory-only

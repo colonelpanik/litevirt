@@ -561,6 +561,13 @@ func (f *Fake) SetMemory(domainName string, memMiB int) error {
 	return nil
 }
 
+func (f *Fake) SetVCPUs(name string, count int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("set-vcpus", name, fmt.Sprintf("%d", count))
+	return nil
+}
+
 // Stats / introspection.
 
 func (f *Fake) NodeInfo() (cpus int, memMiB int, err error) {

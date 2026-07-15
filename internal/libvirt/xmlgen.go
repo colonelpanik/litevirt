@@ -125,6 +125,21 @@ func MachineTypeFromXML(domXML string) string {
 	return d.OS.Machine
 }
 
+// MaxVCPUFromXML returns a domain's MAXIMUM vCPU count from its XML — the <vcpu>
+// element's body (which is the hotplug ceiling when a current= attr is present, or
+// simply the fixed count otherwise). Used for the real-headroom check before a live
+// vCPU grow: the stored spec's max_cpu is the intent, but only the domain's actual
+// topology proves it can grow live without a restart. Returns 0 if absent/unparsable.
+func MaxVCPUFromXML(domXML string) int {
+	var d struct {
+		VCPU vcpu `xml:"vcpu"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return 0
+	}
+	return d.VCPU.Value
+}
+
 // isQ35Machine reports whether m is the q35 machine family, in either the
 // unversioned alias form ("q35", or "" which GenerateDomainXML defaults to q35)
 // or a pinned versioned form ("pc-q35-9.0"). Used to gate Secure Boot, which

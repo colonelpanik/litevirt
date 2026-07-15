@@ -5,6 +5,23 @@ scanner** (`lv doctor divergence`) is strictly read-only — it never writes or
 merges state. **Repair commands** under `lv doctor` (e.g. `repair-owner`,
 below) are intentionally mutating and audited; each is called out as such.
 
+## Operation recovery (`lv operation`)
+
+Each mutating VM operation holds a per-VM **mutation barrier**
+(`active_operation_id`); other mutations defer while it is set. A crash mid-
+operation is normally cleared by the owner's startup recovery, but a wedged
+operation can be inspected and force-cleared manually:
+
+```
+lv operation show <vm>            # inspect the operation holding the barrier + its steps
+lv operation abort <vm> --force   # force-clear the barrier so the VM is mutable again
+```
+
+`show` is read-only. `abort` is admin-only, requires `--force`, is audited, and
+clears the barrier only via the exact owner-epoch + spec-generation
+compare-and-swap — so it can never clear a newer operation's barrier, and an
+ordinary mutation's `--force` never bypasses the barrier.
+
 ## `lv doctor divergence`
 
 Read-only.

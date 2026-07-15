@@ -268,15 +268,19 @@ func (s *Server) detachNIC(ctx context.Context, vmName, mac string) (*pb.VM, err
 }
 
 func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.DeviceSpec) (*pb.VM, error) {
-	addrs, err := s.allocateDevices(ctx, vmName, []*pb.DeviceSpec{spec})
+	addrs, finish, err := s.allocateDevices(ctx, vmName, []*pb.DeviceSpec{spec})
 	if err != nil {
 		return nil, err
 	}
+	// Clear the durable device lease once the attach completes (or on the
+	// rollback below); a crash before this runs is recovered at startup.
+	defer finish()
 
 	for _, addr := range addrs {
 		if err := s.virt.AttachHostdev(vmName, addr); err != nil {
-			// Roll back VFIO bindings.
-			s.releaseDevices(ctx, vmName)
+			// Roll back only the devices THIS attach claimed (not the VM's
+			// pre-existing passthrough devices).
+			s.releaseDeviceSet(ctx, vmName, addrs)
 			return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
 		}
 		slog.Info("PCI device attached", "vm", vmName, "address", addr)
@@ -295,7 +299,7 @@ func (s *Server) detachPCIDevice(ctx context.Context, vmName, pciAddress string)
 		slog.Warn("VFIO unbind after detach failed", "address", pciAddress, "error", err)
 	}
 
-	corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, pciAddress)
+	corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, pciAddress, vmName)
 	slog.Info("PCI device detached", "vm", vmName, "address", pciAddress)
 	s.publish("device.detached", vmName, "pci:"+pciAddress)
 	return s.vmToProto(ctx, vmName)

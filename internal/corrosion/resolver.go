@@ -311,6 +311,13 @@ var capabilityMap = map[string]tableResolver{
 		// runtime_action_proofs row. On an exact-ts tie a differing pointer has no
 		// safe winner (content-max could pick a stale/other proof) → unresolved.
 		ruleColUnresolved("pending_action_id", "runtime_owned"),
+		// v41: monotonic per-VM counters — the higher value is authoritative (a newer
+		// ownership transfer / spec mutation), so an exact-ts tie converges to the max
+		// rather than coin-flipping content. active_operation_id is a control-plane
+		// pointer to the in-flight operations row → unresolved on a differing tie.
+		ruleNumericMax("vm_owner_epoch"),
+		ruleNumericMax("spec_generation"),
+		ruleColUnresolved("active_operation_id", "runtime_owned"),
 		ruleTombstone(),
 		ruleAnyColUnresolved([]string{"spec"}, "opaque"), // never content-max the VM definition
 		ruleContentMax(),

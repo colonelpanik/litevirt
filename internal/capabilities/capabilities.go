@@ -121,6 +121,25 @@ const (
 	// ADVERTISED (in `supported`), enforcement default-off (see StrictMTLSIdentityV1) —
 	// inert until auth.rbac_realm is set; the config flag is the reversible kill switch.
 	RBACRealmV1 = "rbac_realm_v1"
+	// OperationProtocolV1 gates the v41 F1 operation protocol (the operations/
+	// operation_steps journal, the per-VM vm_owner_epoch/spec_generation, and the
+	// active_operation_id mutation barrier). The per-host PCI observation/ownership
+	// fixes activate independently, but the OPERATION protocol is only safe to rely
+	// on once EVERY mutation-serving peer supports it — an old peer would direct-
+	// write a spec without honoring the barrier/generations. Once latched, an
+	// incompatible peer is quarantined from mutating endpoints + replication
+	// sessions (with reseed-on-rejoin). Config-gated (enforcement.operation_protocol)
+	// + reversible like StrictMTLSIdentityV1.
+	//
+	// Unlike the other reversible tokens (advertised build-static; a flag-off peer
+	// is merely permissive), a peer NOT enforcing the F1 mutation barrier would
+	// CORRUPT an in-flight operation — so this token is advertised CONDITIONALLY on
+	// the local config flag (see Server.advertisedCapabilities). Withholding
+	// advertisement when the flag is off keeps the cluster-wide latch (and thus any
+	// reliance on the barrier) from happening until EVERY node has opted in —
+	// enforcing the "require fleet uniformity before latching" rule. Enforcement is
+	// default-off and the flag is the reversible kill switch.
+	OperationProtocolV1 = "operation_protocol_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -203,12 +222,13 @@ var supported = []string{
 	ForwardedIdentityV1,
 	SharedStorageFenceV1,
 	RBACRealmV1,
+	OperationProtocolV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

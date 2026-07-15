@@ -22,8 +22,23 @@ import (
 // paths — mergeChunk for anti-entropy and applyStatementLWW for the WAL) instead
 // of the capabilityMap resolver. They ARE anti-entropy-repaired (present in
 // tableNames) but must never be resolved by resolveTie/lwwOrder alone.
-var customMergeTables = map[string]bool{
-	"runtime_action_proofs": true, // monotone lifecycle merge (see proofMergeKeepLocal)
+// customMergeFn merges one incoming anti-entropy row for a custom-merge table,
+// returning true to KEEP LOCAL (skip the incoming row) or false to apply it. It
+// runs under the merge tx + client lock and bypasses the LWW resolver entirely.
+type customMergeFn func(c *Client, tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool
+
+// customMergeTables maps a table to its bespoke NON-LWW merge. These tables are
+// anti-entropy-repaired (present in tableNames/sensitiveTableNames) but resolved
+// by their own monotone/immutable merge here, NEVER by resolveTie/lwwOrder.
+var customMergeTables = map[string]customMergeFn{
+	"runtime_action_proofs": (*Client).proofMergeKeepLocalRow, // monotone lifecycle merge (see proofMergeKeepLocal)
+	// v41 F1 operation journal — immutable/append-only rows: identical facts merge
+	// idempotently, a genuine facts-conflict for one PK is left unresolved + flagged
+	// (never coin-flipped), and a tombstone (GC of a terminal op past its horizon)
+	// dominates a delayed live copy. See immutableMergeKeepLocalRow.
+	"operations":               (*Client).immutableMergeKeepLocalRow,
+	"operation_steps":          (*Client).immutableMergeKeepLocalRow,
+	"project_authority_epochs": (*Client).immutableMergeKeepLocalRow,
 }
 
 // proofRank orders the runtime_action_proofs lifecycle so a terminal state can
@@ -223,6 +238,9 @@ var tableNames = []string{
 	"resource_mappings", "service_endpoints",
 	"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults",
 	"vm_backups", "container_backups", "container_snapshots",
+	// v41 F1 operation journal — control-plane metadata (no plaintext secrets); the
+	// non-LWW immutable merge runs regardless of lane (customMergeTables).
+	"operations", "operation_steps", "project_authority_epochs",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS
@@ -524,7 +542,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	// rather than INSERT a status-less row — which would default to 'prepared' (schema.go) and
 	// resurrect a spent proof, whether or not a local row exists. A well-formed peer always
 	// includes the column, so this never blocks real convergence.
-	if customMergeTables[table.Name] && indexOf(table.Columns, "status") < 0 {
+	if table.Name == "runtime_action_proofs" && indexOf(table.Columns, "status") < 0 {
 		slog.Warn("sync: runtime_action_proofs dump missing status column; refusing chunk (fail-closed)", "table", table.Name)
 		return 0, len(rows)
 	}
@@ -560,8 +578,8 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// not LWW, so anti-entropy repairs the proof row without a newer non-terminal
 		// copy resurrecting a spent proof. Handled entirely here (bypasses lwwOrder /
 		// resolveTie).
-		if customMergeTables[table.Name] {
-			if c.proofMergeKeepLocalRow(tx, table, row, pkCols, pkIdx, updatedAtIdx) {
+		if mergeFn := customMergeTables[table.Name]; mergeFn != nil {
+			if mergeFn(c, tx, table, row, pkCols, pkIdx, updatedAtIdx) {
 				skipped++
 				continue
 			}
@@ -727,6 +745,63 @@ func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []str
 	if _, err := tx.Exec(q, args...); err != nil {
 		slog.Warn("sync: fold step_state union into local proof", "table", tableName, "error", err)
 	}
+}
+
+// immutableMergeKeepLocalRow is the anti-entropy merge for the v41 append-only /
+// immutable custom-merge tables (operations, operation_steps,
+// project_authority_epochs). A row's FACTS are immutable once written; only a
+// tombstone (GC of a terminal operation, past its retention horizon) mutates it.
+//
+//   - no local row → take incoming.
+//   - a tombstone (deleted_at set) on exactly one side dominates the live side (a
+//     terminal/GC'd row must beat a delayed live copy) → the tombstoned side wins.
+//   - identical facts (every column except updated_at/deleted_at) → idempotent, keep local.
+//   - differing facts for the SAME primary key → a genuine conflict (two entry nodes
+//     minted one operation id with different request hashes, or two executors recorded
+//     different facts for one step key): keep local AND flag it unresolved. NEVER
+//     coin-flip an immutable row.
+func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool {
+	localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if !found {
+		return false
+	}
+	delIdx := indexOf(table.Columns, "deleted_at")
+	localDeleted := delIdx >= 0 && cellNonEmpty(localRow[delIdx])
+	incomingDeleted := delIdx >= 0 && cellNonEmpty(row[delIdx])
+	if localDeleted != incomingDeleted {
+		return localDeleted // tombstone dominates: keep whichever side is tombstoned
+	}
+	if immutableFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
+		return true // idempotent re-delivery
+	}
+	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "immutable_conflict")
+	return true
+}
+
+// immutableFactsEqual reports whether two rows agree on every column except
+// updated_at and deleted_at (the only mutable metadata on an immutable row). It
+// reuses the byte-frozen row encoder for a canonical, type-normalized compare.
+func immutableFactsEqual(cols []string, a, b []interface{}, updatedAtIdx, deletedAtIdx int) bool {
+	if len(a) != len(cols) || len(b) != len(cols) {
+		return false
+	}
+	fa := make([]interface{}, 0, len(cols))
+	fb := make([]interface{}, 0, len(cols))
+	for i := range cols {
+		if i == updatedAtIdx || i == deletedAtIdx {
+			continue
+		}
+		fa = append(fa, a[i])
+		fb = append(fb, b[i])
+	}
+	return encodeRowCells(fa) == encodeRowCells(fb)
+}
+
+// cellNonEmpty reports whether a scanned cell holds a non-empty string (used for
+// the nullable deleted_at tombstone column).
+func cellNonEmpty(v interface{}) bool {
+	s, ok := v.(string)
+	return ok && s != ""
 }
 
 // unionSteps merges two space-separated step_state sets, preserving order and

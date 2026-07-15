@@ -33,7 +33,11 @@ type PCIDeviceRecord struct {
 	LinkPeers    string // comma-separated PCI addresses
 }
 
-// UpsertPCIDevice inserts or updates a PCI device record.
+// UpsertPCIDevice inserts or fully replaces a PCI device record, INCLUDING
+// vm_name. 🔴 Do NOT use this on a host scan / rescan path: a scan carries no
+// vm_name, so INSERT OR REPLACE would erase the assignment of an owned device.
+// Scan/observation paths MUST use ObservePCIDevice (preserves vm_name). This
+// full-replace form is for genuine full-record writes and test seeding only.
 func UpsertPCIDevice(ctx context.Context, c *Client, d PCIDeviceRecord) error {
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO host_pci_devices
@@ -45,6 +49,46 @@ func UpsertPCIDevice(ctx context.Context, c *Client, d PCIDeviceRecord) error {
 		d.HostName, d.Address, d.VendorID, d.DeviceID, d.VendorName, d.DeviceName,
 		d.Type, d.IOMMUGroup, d.SRIOVCapable, d.SRIOVVFsTotal, d.SRIOVVFsFree,
 		d.Driver, d.VMName, d.NUMANode, d.PCIeRootPort, d.PCIeBridge, d.LinkClique,
+		d.LinkPeers, c.NowTS())
+}
+
+// ObservePCIDevice records a device's HARDWARE facts from a host scan while
+// PRESERVING any existing vm_name assignment: a rescan must never erase which VM
+// owns a device (the bug that INSERT OR REPLACE + an empty scan vm_name caused).
+// A never-seen device is inserted UNASSIGNED; an existing row keeps its vm_name
+// and is revived (deleted_at cleared) if it had disappeared. Ownership is changed
+// only through Assign/Release/Claim, never through observation. Only the owning
+// host observes its own PCI rows.
+func ObservePCIDevice(ctx context.Context, c *Client, d PCIDeviceRecord) error {
+	return c.Execute(ctx,
+		`INSERT INTO host_pci_devices
+		   (host_name, address, vendor_id, device_id, vendor_name, device_name,
+		    type, iommu_group, sriov_capable, sriov_vfs_total, sriov_vfs_free,
+		    driver, vm_name, numa_node, pcie_root_port, pcie_bridge, link_clique,
+		    link_peers, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, NULL)
+		 ON CONFLICT(host_name, address) DO UPDATE SET
+		    vendor_id       = excluded.vendor_id,
+		    device_id       = excluded.device_id,
+		    vendor_name     = excluded.vendor_name,
+		    device_name     = excluded.device_name,
+		    type            = excluded.type,
+		    iommu_group     = excluded.iommu_group,
+		    sriov_capable   = excluded.sriov_capable,
+		    sriov_vfs_total = excluded.sriov_vfs_total,
+		    sriov_vfs_free  = excluded.sriov_vfs_free,
+		    driver          = excluded.driver,
+		    numa_node       = excluded.numa_node,
+		    pcie_root_port  = excluded.pcie_root_port,
+		    pcie_bridge     = excluded.pcie_bridge,
+		    link_clique     = excluded.link_clique,
+		    link_peers      = excluded.link_peers,
+		    updated_at      = excluded.updated_at,
+		    deleted_at      = NULL`,
+		// vm_name is deliberately absent from DO UPDATE SET — it is preserved.
+		d.HostName, d.Address, d.VendorID, d.DeviceID, d.VendorName, d.DeviceName,
+		d.Type, d.IOMMUGroup, d.SRIOVCapable, d.SRIOVVFsTotal, d.SRIOVVFsFree,
+		d.Driver, d.NUMANode, d.PCIeRootPort, d.PCIeBridge, d.LinkClique,
 		d.LinkPeers, c.NowTS())
 }
 
@@ -109,12 +153,31 @@ func ReleasePCIDevicesByVM(ctx context.Context, c *Client, vmName string) error 
 		c.NowTS(), vmName)
 }
 
-// ReleasePCIDevice clears the VM assignment for a single PCI device.
-func ReleasePCIDevice(ctx context.Context, c *Client, hostName, address string) error {
+// ClaimPCIDevice atomically assigns a device to a VM, but ONLY if it is active
+// (not tombstoned) AND currently unassigned. Returns true when the claim
+// succeeds, false on a CAS miss (already assigned, or gone). This is the
+// ownership-acquiring counterpart to ObservePCIDevice, which never changes
+// ownership. IOMMU-group siblings must each be claimed by the caller.
+func ClaimPCIDevice(ctx context.Context, c *Client, hostName, address, vmName string) (bool, error) {
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE host_pci_devices SET vm_name = ?, updated_at = ?
+		 WHERE host_name = ? AND address = ? AND deleted_at IS NULL
+		   AND (vm_name IS NULL OR vm_name = '')`,
+		vmName, c.NowTS(), hostName, address)
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ReleasePCIDevice clears a single device's assignment, but ONLY if it is
+// currently owned by expectedVM — so a rollback or detach can never release a
+// device another VM has since claimed. An owner mismatch is a safe no-op.
+func ReleasePCIDevice(ctx context.Context, c *Client, hostName, address, expectedVM string) error {
 	return c.Execute(ctx,
-		`UPDATE host_pci_devices SET vm_name = NULL, updated_at = ?
-		 WHERE host_name = ? AND address = ?`,
-		c.NowTS(), hostName, address)
+		`UPDATE host_pci_devices SET vm_name = '', updated_at = ?
+		 WHERE host_name = ? AND address = ? AND vm_name = ?`,
+		c.NowTS(), hostName, address, expectedVM)
 }
 
 // SoftDeletePCIDevice marks a device as deleted (disappeared from host).

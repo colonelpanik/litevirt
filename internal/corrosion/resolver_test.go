@@ -24,7 +24,7 @@ func TestCapabilityMap_Bijection(t *testing.T) {
 		repaired[n] = true
 	}
 	for n := range repaired {
-		if customMergeTables[n] {
+		if customMergeTables[n] != nil {
 			continue // bespoke MONOTONE merge (customMergeTables) — bypasses the LWW resolver
 		}
 		if _, ok := capabilityMap[n]; !ok {
@@ -35,7 +35,7 @@ func TestCapabilityMap_Bijection(t *testing.T) {
 		if !repaired[n] {
 			t.Errorf("capabilityMap has %q, which is not in tableNames/sensitiveTableNames — remove it or add it to a lane", n)
 		}
-		if customMergeTables[n] {
+		if customMergeTables[n] != nil {
 			t.Errorf("capabilityMap has %q, which uses the bespoke customMergeTables merge — it must NOT go through the LWW resolver", n)
 		}
 	}
@@ -49,7 +49,7 @@ func TestCapabilityMap_PartitionsSchema(t *testing.T) {
 	for _, tbl := range schemaDDLTables() {
 		_, resolved := capabilityMap[tbl]
 		_, excluded := antiEntropyExcluded[tbl]
-		custom := customMergeTables[tbl]
+		custom := customMergeTables[tbl] != nil
 		n := 0
 		for _, in := range []bool{resolved, custom, excluded} {
 			if in {

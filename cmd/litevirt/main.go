@@ -107,6 +107,7 @@ func newRootCmd() *cobra.Command {
 		newProjectCmd(),
 		newPoolCmd(),
 		newRoleCmd(),
+		newOperationCmd(),
 		newUpdateCmd(),
 		newAuditCmd(),
 		newStatsCmd(),

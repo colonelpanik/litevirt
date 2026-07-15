@@ -595,7 +595,7 @@ func entryTouchesCustomMerge(stmtsJSON string) bool {
 		return true
 	}
 	for _, s := range stmts {
-		if customMergeTables[extractTableName(s.SQL)] {
+		if customMergeTables[extractTableName(s.SQL)] != nil {
 			return true
 		}
 	}
@@ -1066,7 +1066,7 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	//  only written once the gate is cluster-wide. This apply path is the receive
 	//  side: it stays monotone regardless, so an out-of-order/duplicated proof
 	//  mutation still can't resurrect a spent proof.)
-	if customMergeTables[tableName] {
+	if customMergeTables[tableName] != nil {
 		sqlStmt := s.SQL
 		if isInsertStatement(sqlStmt) {
 			sqlStmt = replaceInsertStrategy(sqlStmt, "INSERT OR IGNORE")

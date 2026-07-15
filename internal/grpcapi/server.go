@@ -25,6 +25,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -96,6 +97,9 @@ type Server struct {
 	enfVIPSelfDemote      bool
 	enfVIPProofReclaim    bool
 	enfSharedStorageFence bool
+	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
+	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
+	enfOperationProtocol bool
 
 	// capHealthLast records the most recent bounded freshness-check result per
 	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
@@ -223,6 +227,13 @@ type Server struct {
 	// falls back to the legacy admin/operator/viewer roleLevel comparison.
 	authEngine *auth.Engine
 
+	// opJournal is the host-local operation journal, wired at daemon startup. The
+	// device-lease path durably records claimed/bound devices here (gated by the
+	// operation_protocol capability) so a crash mid-allocation is recoverable; nil
+	// in tests / when unwired (durable recovery disabled, in-memory rollback still
+	// applies).
+	opJournal *opjournal.Journal
+
 	// realmRegistry is consulted by Login to dispatch authentication
 	// to the right realm by name. Always contains "local"; OIDC/LDAP
 	// realms are added from daemon config at startup. nil = legacy path
@@ -331,7 +342,29 @@ func (s *Server) advertisedCapabilities() []string {
 	if s.selfFenced() {
 		return []string{}
 	}
-	return capabilities.Supported()
+	caps := capabilities.Supported()
+	// operation_protocol_v1 is advertised CONDITIONALLY on the local config flag,
+	// unlike the other reversible tokens. Those are additive safety checks where a
+	// flag-off peer is merely permissive; but a peer that isn't enforcing the F1
+	// mutation barrier would CORRUPT an in-flight operation, so the fleet-wide
+	// latch (and thus operationProtocolActive) must require CONFIG uniformity, not
+	// just a uniform build. Withholding advertisement when the flag is off keeps
+	// the cluster from latching — and relying on the barrier — until every node has
+	// opted in.
+	if !s.enfOperationProtocol {
+		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
+	}
+	return caps
+}
+
+func withoutCapability(caps []string, drop string) []string {
+	out := caps[:0:0] // fresh backing array; never mutate capabilities.Supported()'s slice
+	for _, c := range caps {
+		if c != drop {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // serverGate is the subset of *health.Checker the gRPC server consults.
@@ -384,6 +417,18 @@ func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
 	return s.enfSharedStorageFence && s.gate != nil && s.gate.Enforced(ctx, capabilities.SharedStorageFenceV1)
 }
 
+// SetOperationProtocol sets this node's kill-switch for relying on the v41 F1
+// operation protocol. The flag is the reversible kill switch; enforcement is this
+// flag AND the OperationProtocolV1 latch (see operationProtocolActive).
+func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+
+// operationProtocolActive reports whether this node relies on + enforces the v41
+// operation protocol: the config flag AND the cluster-wide latch. Same
+// `flag && Enforced` model as the rest of the family.
+func (s *Server) operationProtocolActive(ctx context.Context) bool {
+	return s.enfOperationProtocol && s.gate != nil && s.gate.Enforced(ctx, capabilities.OperationProtocolV1)
+}
+
 // tokenEnabled reports whether this node is configured to ENFORCE token — the
 // single source of "configured-to-enforce" the HA monitor uses to decide which
 // tokens to latch-drive and which may contribute to HA-degraded. split_brain_gate_v1
@@ -412,6 +457,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfSharedStorageFence
 	case capabilities.RBACRealmV1:
 		return s.rbacRealm
+	case capabilities.OperationProtocolV1:
+		return s.enfOperationProtocol
 	default:
 		return false
 	}
@@ -697,6 +744,12 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 func (s *Server) SetAuthEngine(e *auth.Engine) {
 	s.authEngine = e
 }
+
+// SetOpJournal wires the host-local operation journal so the device-lease path
+// can durably record claimed/bound devices (F1). nil-safe (tests leave it nil,
+// which disables durable device-lease recovery — the in-memory scoped rollback
+// still applies).
+func (s *Server) SetOpJournal(j *opjournal.Journal) { s.opJournal = j }
 
 // SetRealmRegistry wires the multi-realm authentication registry. The
 // daemon constructs it from the auth.realms YAML block and calls this

@@ -216,11 +216,15 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     optional bool  secure_boot     = 16;
     optional bool  tpm             = 17;
     bool           force           = 18;  // allow toggling secure_boot/tpm even when firmware state exists
+    string         idempotency_key = 19;  // cross-entry-node dedup of a retried update (D4 semantics)
+    optional int32 max_cpu         = 20;  // set the vCPU hotplug ceiling (live_resize; latched)
+    optional bool  allow_restart   = 21;  // permit a stop→redefine→start for a change that can't apply live
 }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
 // ballooned via virtio without a redefine.
-message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2; }
+message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2;
+    string idempotency_key = 3; }  // cross-entry-node dedup of a retried balloon (D4 semantics)
 // SetVMLabelsRequest replaces the full label set (the request is authoritative —
 // an empty map clears all tags).
 message SetVMLabelsRequest  { string name = 1; map<string, string> labels = 2; }

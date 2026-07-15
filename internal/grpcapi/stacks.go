@@ -361,11 +361,19 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 		spec.Placement.Host = action.TargetHost
 	}
 
-	// Pin pre-resolved device addresses so allocateDevices uses exact binding.
+	// Pin pre-resolved device addresses so allocateDevices uses exact binding. SR-IOV
+	// devices are intentionally left UNPINNED (Address empty) so the on-demand VF
+	// allocator (create/reuse per policy) runs; placement emits no assignment for them,
+	// so the assignment list aligns with the non-SR-IOV spec devices in order.
 	if len(action.Devices) > 0 {
-		for i, dev := range action.Devices {
-			if i < len(spec.Devices) {
-				spec.Devices[i].Address = dev.Address
+		ai := 0
+		for i := range spec.Devices {
+			if spec.Devices[i].Sriov {
+				continue
+			}
+			if ai < len(action.Devices) {
+				spec.Devices[i].Address = action.Devices[ai].Address
+				ai++
 			}
 		}
 	}

@@ -135,6 +135,15 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	// so anti-affinity references like "web" expand to ["web-1", "web-2", "web-3"].
 	composeInstances := buildComposeInstanceMap(f)
 
+	// Current host per existing VM instance — so a VM UPDATE pins to its current host
+	// instead of re-running placement (which could move it).
+	currentHostByVM := map[string]string{}
+	for _, c := range current {
+		if c.HostName != "" {
+			currentHostByVM[c.Name] = c.HostName
+		}
+	}
+
 	for _, op := range vmPlan.Ops {
 		if op.Kind != OpCreate && op.Kind != OpUpdate {
 			continue
@@ -166,6 +175,14 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 				if h := ctHost[op.VMName]; h != "" {
 					req.PinHost = h
 				}
+			}
+		} else if op.Kind == OpUpdate {
+			// A VM UPDATE stays on its current host — re-running placement could pick a
+			// different node, which for in-place is a misleading plan (the live change
+			// forwards to the owner anyway) and for a recreate-strategy update would
+			// actually move the VM (and its SR-IOV VF / local disk) off its host.
+			if h := currentHostByVM[op.VMName]; h != "" {
+				req.PinHost = h
 			}
 		}
 		placementReqs = append(placementReqs, req)
@@ -693,6 +710,8 @@ func buildPlacementRequest(spec *pb.VMSpec) placement.Request {
 			Type:   dev.Type,
 			Count:  int(dev.Count),
 			Vendor: dev.Vendor,
+			Sriov:  dev.Sriov,
+			Parent: dev.Parent,
 		})
 	}
 	return req

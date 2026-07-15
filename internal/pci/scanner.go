@@ -37,6 +37,14 @@ type Device struct {
 
 var sysDevices = "/sys/bus/pci/devices"
 
+// SetSysDevices overrides the sysfs PCI-devices root and returns a restore func.
+// Test seam: production never calls it (the default points at real sysfs).
+func SetSysDevices(path string) func() {
+	old := sysDevices
+	sysDevices = path
+	return func() { sysDevices = old }
+}
+
 // Scan enumerates all PCI devices on the host.
 func Scan() ([]Device, error) {
 	entries, err := os.ReadDir(sysDevices)

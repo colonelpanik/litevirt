@@ -354,8 +354,16 @@ type PCIConfig struct {
 
 // SRIOVConfig holds SR-IOV settings.
 type SRIOVConfig struct {
-	Managed     bool `yaml:"managed"`        // false = operator creates VFs; true = litevirtd manages
-	MaxVFsPerPF int  `yaml:"max_vfs_per_pf"` // only used when managed=true (default 8)
+	Managed bool `yaml:"managed"` // false = operator provisions VFs; true = litevirtd may create the VF pool on an adopted PF
+	// MaxVFsPerPF caps the VF pool litevirtd creates on a managed PF (default 8),
+	// clamped to the PF's hardware sriov_totalvfs. litevirtd creates a pool of this
+	// size ONCE on an empty adopted PF; it never grows, shrinks, or destroys a pool.
+	MaxVFsPerPF int `yaml:"max_vfs_per_pf"`
+	// ManagedPFs is the allowlist of PF PCI addresses (BDFs) litevirtd may create
+	// VFs on when managed=true. Entries are canonicalized (lowercase, domain-padded)
+	// on load; a malformed entry is warned about and ignored. An empty list with
+	// managed=true means "adopt no PF" — reuse-only.
+	ManagedPFs []string `yaml:"managed_pfs"`
 }
 
 // LoadConfig reads the daemon config from file.

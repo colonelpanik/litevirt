@@ -106,15 +106,41 @@ vms:
 ```yaml
 pci:
   sriov:
-    managed: true           # litevirt creates/destroys VFs
-    max_vfs_per_pf: 8
+    managed: true                    # litevirt may CREATE a VF pool on an adopted PF
+    max_vfs_per_pf: 8                # pool size, clamped to the PF's hardware max
+    managed_pfs: ["0000:41:00.0"]    # PFs litevirt may create VFs on (allowlist)
 ```
 
-With `managed: false` (default), the operator must create VFs manually:
+VF allocation follows a strict policy:
+
+- **Reuse first, on any PF.** litevirt claims a free VF (one present on the host and
+  unassigned in inventory) via an atomic compare-and-set. This works whether or not
+  the PF is managed, and it **never writes `sriov_numvfs`**.
+- **Create only on an adopted, empty PF.** When `managed: true` and the PF is in
+  `managed_pfs` and its VF pool is currently empty, litevirt creates a pool of
+  `min(max_vfs_per_pf, hardware sriov_totalvfs)` VFs **once**, then claims exactly what
+  the request needs. A request larger than that cap is rejected up front.
+- **Never resizes.** litevirt does not grow, shrink, or destroy a VF pool. A PF that
+  already has more VFs than `max_vfs_per_pf` is marked degraded
+  (`litevirt_sriov_degraded{reason="vfs_over_cap"}`); its existing free VFs can still be
+  reused, but litevirt refuses to (re)create its pool. A PF with a non-empty pool short
+  of free VFs fails the request with **no sysfs write**.
+
+With `managed: false` (default), the operator provisions VFs; litevirt reuses the free
+ones but never creates any:
 
 ```bash
 echo 8 > /sys/class/net/eth1/device/sriov_numvfs
 ```
+
+Configured-but-broken managed PFs surface as `litevirt_sriov_degraded` with
+`reason="pf_not_found"` (malformed/absent BDF) or `reason="pf_not_sriov"` (not SR-IOV
+capable); the gauge is aggregated across all PFs, so a reason stays set while any PF
+still has it.
+
+> Mixed-version note: SR-IOV policy is enforced by the host that owns the hardware. Do
+> not set `managed: true` on a PF until its owning host runs a build that supports this
+> policy — an older daemon ignores the allowlist and cap.
 
 ## Hot-plug
 

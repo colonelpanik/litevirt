@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -53,6 +54,10 @@ type VMAction struct {
 	// delete/no-change ops too — where the workload may be gone from the compose
 	// file, so FindVMDef can't classify it.
 	IsContainer bool
+	// Plan classifies an OpUpdate VM change (desired vs stored) into live / restart /
+	// recreate buckets so the rolling engine can apply it without deleting a VM that
+	// only needs a live resize. Empty (Max()==NoChange) for non-update / container ops.
+	Plan compose.ChangePlan
 }
 
 // DeviceAssignment is a pre-resolved PCI device allocation.
@@ -189,6 +194,20 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		return nil, fmt.Errorf("batch placement failed: %w", err)
 	}
 
+	// Stored specs for this stack's VMs (for classifying in-place updates). Built
+	// from the snapshot — no extra queries.
+	storedSpecByVM := map[string]*pb.VMSpec{}
+	for i := range state.VMs {
+		vm := &state.VMs[i]
+		if vm.StackName != f.Name || vm.Spec == "" {
+			continue
+		}
+		ss := &pb.VMSpec{}
+		if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
+			storedSpecByVM[vm.Name] = ss
+		}
+	}
+
 	// Step 4: Build VMActions with resolved hosts and devices.
 	vmHostMap := map[string]string{} // vmName → host (for network/LB resolution)
 	for _, op := range vmPlan.Ops {
@@ -199,6 +218,14 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			DependsOn:   op.DependsOn,
 			Warning:     op.Warning,
 			IsContainer: isContainerWorkload(f, op.VMName, ctHost),
+		}
+
+		// Classify a VM update (desired vs stored) so the rolling engine can route it
+		// live/restart/recreate. Containers are recreated by their own path.
+		if op.Kind == OpUpdate && !action.IsContainer {
+			if stored := storedSpecByVM[op.VMName]; stored != nil {
+				action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
+			}
 		}
 
 		if op.Kind == OpCreate || op.Kind == OpUpdate {

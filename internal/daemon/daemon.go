@@ -555,6 +555,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetGate(d.checker)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
+	// cap, and the degraded gauge. Validate the allowlist against live hardware now,
+	// and re-validate on the rescan cadence.
+	svc.SetSRIOVMetrics(metrics.NewSRIOVMetrics())
+	svc.SetSRIOVPolicy(d.cfg.PCI.SRIOV.Managed, d.cfg.PCI.SRIOV.MaxVFsPerPF, d.cfg.PCI.SRIOV.ManagedPFs)
+	svc.ValidateSRIOVPolicy()
+	if d.cfg.PCI.SRIOV.Managed {
+		go svc.RunSRIOVValidation(ctx, d.parsePCIRescanInterval())
+	}
+	// The udev_hook is deprecated: real-time PCI events are covered by the rescan
+	// interval. Warn (don't fail) so operators migrate off the broken curl-to-REST rule.
+	if d.cfg.PCI.UdevHook {
+		slog.Warn("pci.udev_hook is deprecated and no longer installs a udev rule; rely on pci.rescan_interval instead. Remove any /etc/udev/rules.d/99-litevirt-pci.rules left from an older install.")
+	}
 	// Target the upgrade swap at the binary we're actually running (re-exec uses
 	// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
 	if exe, err := os.Executable(); err == nil {
@@ -626,6 +640,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.runOperationRecovery(ctx)
 		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}
+
+	// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
+	// resource_update_running operation (a live resize that crashed after committing its
+	// desired spec) — converge it to the committed spec + clear the barrier so a partial
+	// failure never wedges active_operation_id. Uses replicated operation state (not the
+	// host-local journal), so it runs regardless of the journal above. A reconciler pass
+	// retries stragglers.
+	svc.RecoverResourceOperations(ctx)
+	go svc.RunResourceOperationRecovery(ctx)
 
 	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
 	// for cluster-wide capability confirmation) and every reconciler/vmChecker

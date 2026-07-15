@@ -14,10 +14,14 @@ const (
 	domainMemAffectConfig = 2 // VIR_DOMAIN_AFFECT_CONFIG
 )
 
-// SetMemory sets the balloon target (current memory) of a domain in MiB. For a
-// running VM this drives the virtio balloon live AND persists to config so a
-// restart keeps the target; the value must not exceed the domain's maxMemory.
-// For a stopped VM it updates the persistent config only.
+// SetMemory sets the balloon target (current memory) of a domain in MiB. It
+// applies the PERSISTENT config first and propagates that error BEFORE driving the
+// live balloon — a live balloon change that a restart discards is worse than a
+// refused resize — then drives the virtio balloon live when the domain is running.
+// The value must not exceed the domain's maxMemory. For a stopped VM it updates
+// the persistent config only. The live balloon converges asynchronously (the guest
+// cooperates), so the set call succeeding is the available live-view confirmation;
+// the observed actual is reconciled from stats afterward.
 func (c *Client) SetMemory(domainName string, memMiB int) error {
 	if memMiB <= 0 {
 		return fmt.Errorf("invalid memory target %d MiB", memMiB)
@@ -26,13 +30,16 @@ func (c *Client) SetMemory(domainName string, memMiB int) error {
 	if err != nil {
 		return fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
-	flags := uint32(domainMemAffectConfig)
-	if state, _, sErr := c.virt.DomainGetState(dom, 0); sErr == nil && state == int32(golibvirt.DomainRunning) {
-		flags |= domainMemAffectLive
+	kib := uint64(memMiB) * 1024
+	// CONFIG first — propagate so a live balloon never applies on top of a persistent
+	// write that libvirt rejected (e.g. above maxMemory).
+	if err := c.virt.DomainSetMemoryFlags(dom, kib, uint32(domainMemAffectConfig)); err != nil {
+		return fmt.Errorf("set memory %q to %d MiB (config): %w", domainName, memMiB, err)
 	}
-	// libvirt takes KiB.
-	if err := c.virt.DomainSetMemoryFlags(dom, uint64(memMiB)*1024, flags); err != nil {
-		return fmt.Errorf("set memory %q to %d MiB: %w", domainName, memMiB, err)
+	if state, _, sErr := c.virt.DomainGetState(dom, 0); sErr == nil && state == int32(golibvirt.DomainRunning) {
+		if err := c.virt.DomainSetMemoryFlags(dom, kib, uint32(domainMemAffectLive)); err != nil {
+			return fmt.Errorf("set memory %q to %d MiB (live): %w", domainName, memMiB, err)
+		}
 	}
 	return nil
 }

@@ -86,15 +86,25 @@ pci:
   # How often to rescan PCI devices. "0" disables periodic rescan.
   rescan_interval: "5m"
 
-  # Install udev rule for real-time PCI hotplug events.
-  udev_hook: true
+  # DEPRECATED: no longer installs a udev rule. Real-time PCI events are covered by
+  # rescan_interval. Setting it true only logs a warning; remove any leftover
+  # /etc/udev/rules.d/99-litevirt-pci.rules (an upgrade cleans up the litevirt one).
+  udev_hook: false
 
   # SR-IOV configuration.
   sriov:
-    # false: operator creates VFs manually. true: litevirt manages VF lifecycle.
+    # false: operators provision VFs (litevirt reuses free VFs on any PF, but never
+    # writes sriov_numvfs). true: litevirt may CREATE the VF pool on an adopted PF.
     managed: false
-    # Maximum VFs per physical function (only when managed: true).
+    # VF pool size litevirt creates on a managed, EMPTY, adopted PF (default 8),
+    # clamped to the PF's hardware sriov_totalvfs. litevirt creates the pool ONCE; it
+    # never grows, shrinks, or destroys a pool.
     max_vfs_per_pf: 8
+    # Allowlist of PF PCI addresses litevirt may create VFs on when managed: true.
+    # Entries are canonicalized (a malformed BDF is warned about + ignored). An empty
+    # list with managed: true adopts no PF (reuse-only). A PF NOT in this list is
+    # never written to — VFs there can still be reused if the operator created them.
+    managed_pfs: ["0000:41:00.0"]
 
 # Host-level storage pools (created as libvirt pools on startup).
 # See storage.md for driver details. Operators may also add pools at

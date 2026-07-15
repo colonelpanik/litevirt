@@ -104,6 +104,19 @@ type Server struct {
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
 
+	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
+	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
+	// pool. pfLocks serializes the inventory→create→observe→claim critical section
+	// per PF. sriovDegraded tracks per-PF degraded reasons for the aggregated gauge.
+	sriovManaged    bool
+	sriovMaxVFs     int
+	sriovManagedPFs map[string]bool
+	pfLocks         map[string]*sync.Mutex
+	pfLocksMu       sync.Mutex
+	sriovMetrics    *metrics.SRIOVMetrics
+	sriovDegradedMu sync.Mutex
+	sriovDegraded   map[string]map[string]bool // canonical PF BDF → reason → active
+
 	// capHealthLast records the most recent bounded freshness-check result per
 	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
 	// monitor detects a POST-latch capability regression (a peer that later stops

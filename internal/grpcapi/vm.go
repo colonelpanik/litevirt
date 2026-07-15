@@ -1191,6 +1191,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// deletes locally if the domain is here, else reports NotFound.
 	localOnly := deleteLocalOnly(ctx)
 
+	// Mutation barrier: an operator delete must not race an in-flight operation
+	// (ordinary --force does NOT bypass it — abort the stuck operation first). A
+	// peer-search probe is part of an already-in-flight delete, not a new mutation,
+	// so it is exempt.
+	if !localOnly && vm.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot delete %q: an operation is in progress (abort it first with `lv operation abort %s`)", req.Name, req.Name)
+	}
+
 	if !localOnly && vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {

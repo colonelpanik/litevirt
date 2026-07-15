@@ -54,6 +54,14 @@ type VMRecord struct {
 	// runtime_action_proofs row authorizing the start (split-brain hardening,
 	// v38). Empty when no proof-gated action is in flight.
 	PendingActionID string
+	// OwnerEpoch, SpecGeneration, and ActiveOperationID are the v41 F1 operation-
+	// protocol columns: OwnerEpoch bumps on every ownership transfer (ABA-proof
+	// recovery), SpecGeneration bumps on every desired-spec mutation, and
+	// ActiveOperationID is the VM-wide mutation barrier (non-empty ⇒ an operation
+	// holds the VM). Populated by GetVM; the ListVMs projection omits them.
+	OwnerEpoch        int64
+	SpecGeneration    int64
+	ActiveOperationID string
 }
 
 // InterfaceRecord represents a VM network interface.
@@ -243,7 +251,8 @@ func GetVM(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 		`SELECT name, stack_name, host_name, spec, state, state_detail,
 			cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
 			COALESCE(is_template, 0) AS is_template,
-			COALESCE(pending_action_id, '') AS pending_action_id, created_at, updated_at
+			COALESCE(pending_action_id, '') AS pending_action_id,
+			vm_owner_epoch, spec_generation, active_operation_id, created_at, updated_at
 		 FROM vms WHERE name = ? AND deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
@@ -254,19 +263,22 @@ func GetVM(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 
 	r := rows[0]
 	return &VMRecord{
-		Name:            r.String("name"),
-		StackName:       r.String("stack_name"),
-		HostName:        r.String("host_name"),
-		Spec:            r.String("spec"),
-		State:           r.String("state"),
-		StateDetail:     r.String("state_detail"),
-		CPUActual:       r.Int("cpu_actual"),
-		MemActual:       r.Int("mem_actual"),
-		Project:         r.String("project"),
-		IsTemplate:      r.Int("is_template") == 1,
-		PendingActionID: r.String("pending_action_id"),
-		CreatedAt:       r.String("created_at"),
-		UpdatedAt:       r.String("updated_at"),
+		Name:              r.String("name"),
+		StackName:         r.String("stack_name"),
+		HostName:          r.String("host_name"),
+		Spec:              r.String("spec"),
+		State:             r.String("state"),
+		StateDetail:       r.String("state_detail"),
+		CPUActual:         r.Int("cpu_actual"),
+		MemActual:         r.Int("mem_actual"),
+		Project:           r.String("project"),
+		IsTemplate:        r.Int("is_template") == 1,
+		PendingActionID:   r.String("pending_action_id"),
+		OwnerEpoch:        r.Int64("vm_owner_epoch"),
+		SpecGeneration:    r.Int64("spec_generation"),
+		ActiveOperationID: r.String("active_operation_id"),
+		CreatedAt:         r.String("created_at"),
+		UpdatedAt:         r.String("updated_at"),
 	}, nil
 }
 
@@ -851,30 +863,6 @@ func InsertInterface(ctx context.Context, c *Client, i InterfaceRecord) error {
 		 (vm_name, network_name, ordinal, mac, ip, tap_device, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
 		i.VMName, i.NetworkName, i.Ordinal, i.MAC, i.IP, i.TapDevice, now)
-}
-
-// UpdateVMSpecIfUnchanged writes newSpec ONLY if the row's spec still equals
-// oldSpec (compare-and-swap on the spec column). It touches neither cpu_actual
-// nor mem_actual, so a machine-type backfill can't clobber a concurrent user
-// spec edit: if the spec changed since the caller read it, zero rows update and
-// applied=false (the caller re-reads and retries next tick). Returns applied,
-// error.
-func UpdateVMSpecIfUnchanged(ctx context.Context, c *Client, name, oldSpec, newSpec string) (bool, error) {
-	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
-		`UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND spec = ? AND deleted_at IS NULL`,
-		newSpec, now, name, oldSpec,
-	)
-	return n > 0, err
-}
-
-// UpdateVMSpec updates the spec JSON and actual CPU/memory for a stopped VM.
-func UpdateVMSpec(ctx context.Context, c *Client, name, specJSON string, cpu, mem int) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vms SET spec = ?, cpu_actual = ?, mem_actual = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
-		specJSON, cpu, mem, now, name,
-	)
 }
 
 // SoftDeleteInterfaceByMAC marks an interface as deleted by MAC address.

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -89,8 +90,9 @@ func TestMaybePinMachineType_CASNoClobber(t *testing.T) {
 	}
 	// A concurrent user update lands AFTER the reconcile pass snapshotted staleSpec.
 	freshSpec := `{"name":"vm1","machine":"q35","cpu":8}`
-	if err := corrosion.UpdateVMSpec(ctx, db, "vm1", freshSpec, 8, 0); err != nil {
-		t.Fatalf("concurrent UpdateVMSpec: %v", err)
+	applied, _, err := corrosion.MutateDesiredSpec(ctx, db, "vm1", func(string) (string, error) { return freshSpec, nil })
+	if err != nil || !applied {
+		t.Fatalf("concurrent MutateDesiredSpec: applied=%v err=%v", applied, err)
 	}
 
 	fake := libvirtfake.New()
@@ -98,16 +100,27 @@ func TestMaybePinMachineType_CASNoClobber(t *testing.T) {
 		t.Fatalf("DefineDomain: %v", err)
 	}
 	r := NewReconciler("node-a", t.TempDir(), db, fake)
-	// Backfill runs off the STALE snapshot (cpu:2) — its CAS must not overwrite the
-	// fresh cpu:8 edit.
+	// Backfill runs off the STALE snapshot (cpu:2). Because it now routes through
+	// MutateDesiredSpec (re-reads the fresh spec, applies only the machine key), it
+	// must NOT clobber the concurrent cpu:8 edit — but it still pins the machine.
 	r.maybePinMachineType(ctx, corrosion.VMRecord{Name: "vm1", Spec: staleSpec, CPUActual: 2})
 
 	got, err := corrosion.GetVM(ctx, db, "vm1")
 	if err != nil {
 		t.Fatalf("GetVM: %v", err)
 	}
-	if got.Spec != freshSpec {
-		t.Errorf("CAS clobbered a concurrent edit: spec = %s, want the fresh %s", got.Spec, freshSpec)
+	var parsed struct {
+		Machine string `json:"machine"`
+		Cpu     int    `json:"cpu"`
+	}
+	if err := json.Unmarshal([]byte(got.Spec), &parsed); err != nil {
+		t.Fatalf("parse spec %q: %v", got.Spec, err)
+	}
+	if parsed.Cpu != 8 {
+		t.Errorf("pin clobbered the concurrent cpu edit: spec = %s", got.Spec)
+	}
+	if !lv.IsPinnedMachineType(parsed.Machine) {
+		t.Errorf("machine not pinned onto the fresh spec: spec = %s", got.Spec)
 	}
 }
 

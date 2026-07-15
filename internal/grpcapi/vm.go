@@ -2319,10 +2319,19 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	specJSON, _ := json.Marshal(spec)
 
 	// Metadata-only update: persist the spec and return — no domain redefine, so a
-	// running VM keeps running untouched.
+	// running VM keeps running untouched. Route through MutateDesiredSpec so this
+	// respects the mutation barrier AND touches only the spec, never cpu_actual/
+	// mem_actual (a running VM's live actuals must survive a metadata edit).
 	if !redefine {
-		if err := corrosion.UpdateVMSpec(ctx, s.db, req.Name, string(specJSON), int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+		applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
+			return string(specJSON), nil
+		})
+		if err != nil {
 			return nil, status.Errorf(codes.Internal, "update VM spec: %v", err)
+		}
+		if !applied {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot update VM %q: an operation is in progress", req.Name)
 		}
 		slog.Info("VM metadata updated (live)", "vm", req.Name,
 			"restart", spec.Restart.GetCondition(), "onboot", spec.Onboot, "startup_order", spec.StartupOrder)
@@ -2475,16 +2484,31 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		specJSON, _ = json.Marshal(spec)
 	}
 
-	// The durable spec MUST match the live domain. If the write fails, roll the
-	// domain back to its old XML rather than return success with libvirt and the
-	// stored spec desynced (fatal — never report a half-applied firmware update).
-	if err := corrosion.UpdateVMSpec(ctx, s.db, req.Name, string(specJSON), int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+	// The durable spec MUST match the live domain. If the write fails or is deferred
+	// by the mutation barrier, roll the domain back to its old XML rather than return
+	// success with libvirt and the stored spec desynced (fatal — never report a
+	// half-applied firmware update). MutateDesiredSpec persists the desired spec and
+	// bumps spec_generation; UpdateObservedActuals then records the stopped VM's new
+	// cpu/mem actuals against that generation so a later start boots the right size.
+	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
+		return string(specJSON), nil
+	})
+	if err != nil || !applied {
 		if oldXML != "" {
 			_ = s.virt.UndefineDomainPreservingState(req.Name)
 			_ = s.virt.DefineDomain(oldXML)
 		}
-		return nil, status.Errorf(codes.Internal,
-			"persist updated spec for %q failed; rolled the domain back to its previous definition: %v", req.Name, err)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"persist updated spec for %q failed; rolled the domain back to its previous definition: %v", req.Name, err)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot update VM %q: an operation is in progress; rolled the domain back to its previous definition", req.Name)
+	}
+	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, req.Name, int(spec.Cpu), int(spec.MemoryMib), -1, newGen); err != nil {
+		// Spec is authoritative and already persisted; a stale stopped-VM actual is a
+		// minor inconsistency reconciled on next observe. Log loudly, don't unwind.
+		slog.Warn("persist actuals after redefine failed", "vm", req.Name, "error", err)
 	}
 
 	slog.Info("VM spec updated", "vm", req.Name, "cpu", spec.Cpu, "memory_mib", spec.MemoryMib, "disable_vnc", spec.DisableVnc)

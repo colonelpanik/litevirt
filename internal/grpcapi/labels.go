@@ -33,22 +33,30 @@ func (s *Server) SetVMLabels(ctx context.Context, req *pb.SetVMLabelsRequest) (*
 	}
 
 	// Merge the new labels into the stored spec and persist. Labels live in the
-	// replicated cluster state (corrosion), so we write directly — no host
-	// forward or libvirt call.
-	spec := &pb.VMSpec{}
-	if vm.Spec != "" {
-		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
-			return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
+	// replicated cluster state (corrosion), so we write directly — no host forward
+	// or libvirt call. MutateDesiredSpec applies the merge to the FRESH spec under
+	// the mutation barrier (and touches only spec, not cpu/mem — this is a metadata
+	// edit that must not clobber a running VM's live actuals).
+	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(old string) (string, error) {
+		spec := &pb.VMSpec{}
+		if old != "" {
+			if err := json.Unmarshal([]byte(old), spec); err != nil {
+				return "", fmt.Errorf("parse stored spec: %w", err)
+			}
 		}
-	}
-	spec.Labels = req.Labels
-	specJSON, err := json.Marshal(spec)
+		spec.Labels = req.Labels
+		b, err := json.Marshal(spec)
+		if err != nil {
+			return "", fmt.Errorf("marshal spec: %w", err)
+		}
+		return string(b), nil
+	})
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "marshal spec: %v", err)
-	}
-	// Preserve current cpu/mem — this is a metadata-only edit.
-	if err := corrosion.UpdateVMSpec(ctx, s.db, req.Name, string(specJSON), vm.CPUActual, vm.MemActual); err != nil {
 		return nil, status.Errorf(codes.Internal, "persist labels: %v", err)
+	}
+	if !applied {
+		s.audit(ctx, "vm.set_labels", req.Name, "operation in progress", "denied")
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot set labels for VM %q: an operation is in progress", req.Name)
 	}
 
 	s.audit(ctx, "vm.set_labels", req.Name, "labels="+labelsSummary(req.Labels), "ok")

@@ -3,7 +3,10 @@ package grpcapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -622,44 +625,17 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		}
 	}
 
-	// Generate libvirt domain XML
-	vmCfg := lv.VMConfig{
-		Name:         spec.Name,
-		UUID:         spec.Uuid,
-		CPU:          int(spec.Cpu),
-		CPUMode:      spec.CpuMode,
-		MemoryMiB:    int(spec.MemoryMib),
-		MinMemoryMiB: int(spec.MinMemoryMib),
-		MaxMemoryMiB: int(spec.MaxMemoryMib),
-		Machine:      spec.Machine,
-		Firmware:     spec.Firmware,
-		GuestAgent:   spec.GuestAgent,
-		EnableVNC:    !spec.DisableVnc,
-		EnableSPICE:  spec.EnableSpice,
-		Disks:        diskConfigs,
-		Networks:     netConfigs,
-		CloudInitISO: cloudInitISO,
-		Boot:         spec.Boot,
-	}
+	// Generate libvirt domain XML from the shared builder (identical field mapping to
+	// a redefine — see baseDomainConfig). Cloud-init ISO is a create-time artifact set
+	// here, not in the shared builder.
+	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
+	vmCfg.CloudInitISO = cloudInitISO
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
 	if err := s.applyFirmwareConfig(&vmCfg, spec); err != nil {
 		cleanupDisks()
 		return nil, err
-	}
-	if r := spec.Resources; r != nil {
-		vmCfg.HugePages = r.Hugepages
-		vmCfg.IOThreads = int(r.IoThreads)
-		for _, pin := range r.CpuPinning {
-			vmCfg.CPUPinning = append(vmCfg.CPUPinning, int(pin))
-		}
-		if np := r.NumaPolicy; np != nil {
-			vmCfg.NUMAPolicy = &lv.NUMAPolicy{
-				PreferredNode: int(np.PreferredNode),
-				Strict:        np.Strict,
-			}
-		}
 	}
 
 	// PCI device passthrough.
@@ -964,6 +940,20 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return client.StartVM(ctx, req)
 	}
 
+	// Serialize with other lifecycle ops on this VM, then RE-READ under the lock so a
+	// concurrent ownership transfer or state change is observed before we act. If
+	// ownership moved off this host in that window, abort for retry rather than
+	// forward while holding the lock (never hold a process lock across a peer RPC).
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+
 	// Split-brain gate (Phase 1): bringing an owned VM to running is a runtime action
 	// that, under STALE ownership (the VM was failed over elsewhere during a partition
 	// but this side's row still says stopped+here), would double-run it. Require local
@@ -974,26 +964,34 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.FailedPrecondition, "start refused: %s", reason)
 	}
 
+	return s.startVMLocked(ctx, vm)
+}
+
+// startVMLocked brings a LOCAL VM to running. The caller MUST hold the VM lock, have
+// re-read vm under it, confirmed local ownership, and passed the split-brain gate; it
+// never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
+// coordinator's restart path) call it directly under one lock.
+func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, pbVM, hspec)
 
-	if err := s.virt.StartDomain(req.Name); err != nil {
+	if err := s.virt.StartDomain(vm.Name); err != nil {
 		// Heal a state desync: if libvirt reports the domain is already
 		// running, the cluster record was stale (an out-of-band start, or an
 		// RPC that mutated libvirt but failed before writing state). Reconcile
 		// the record to "running" rather than surfacing "already running".
-		if st, sErr := s.virt.DomainState(req.Name); sErr == nil && st == "running" {
+		if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 			// Domain is already running: a lost "running" write is low-harm (the
 			// reconciler heals it from libvirt), so record best-effort with retry
 			// but never skip the follow-up (hooks) or fail the start.
-			if werr := s.persistVMState(ctx, req.Name, "running", "reconciled: already running in libvirt", corrosion.OpVMState); werr != nil {
-				slog.Error("StartVM: recording reconciled running state failed — reconciler will heal", "vm", req.Name, "error", werr)
+			if werr := s.persistVMState(ctx, vm.Name, "running", "reconciled: already running in libvirt", corrosion.OpVMState); werr != nil {
+				slog.Error("StartVM: recording reconciled running state failed — reconciler will heal", "vm", vm.Name, "error", werr)
 			}
-			slog.Warn("StartVM: domain already running in libvirt, reconciled cluster state", "vm", req.Name)
+			slog.Warn("StartVM: domain already running in libvirt, reconciled cluster state", "vm", vm.Name)
 			pbVM.State = pb.VMState_VM_RUNNING
 			hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
-			return s.vmToProto(ctx, req.Name)
+			return s.vmToProto(ctx, vm.Name)
 		}
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
@@ -1002,10 +1000,10 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// it from libvirt), so record it best-effort with retry and still run the
 	// follow-up (VLAN taps, PostStart hook) — skipping those would leave a running
 	// but unreachable VM that nothing re-heals.
-	if err := s.persistVMState(ctx, req.Name, "running", "", corrosion.OpVMState); err != nil {
-		slog.Error("StartVM: recording running state failed — reconciler will heal", "vm", req.Name, "error", err)
+	if err := s.persistVMState(ctx, vm.Name, "running", "", corrosion.OpVMState); err != nil {
+		slog.Error("StartVM: recording running state failed — reconciler will heal", "vm", vm.Name, "error", err)
 	}
-	s.recordVMEvent(ctx, req.Name, "vm.started", "ok", "")
+	s.recordVMEvent(ctx, vm.Name, "vm.started", "ok", "")
 
 	// Reapply VLAN tap config: VLAN tagging lives on the host tap (libvirt assigns
 	// a fresh vnetN at each start), not the domain XML — so a VM defined-then-
@@ -1017,16 +1015,13 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	pbVM.State = pb.VMState_VM_RUNNING
 	hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
 
-	return s.vmToProto(ctx, req.Name)
+	return s.vmToProto(ctx, vm.Name)
 }
 
 func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	unlock := s.lockVM(req.Name)
-	defer unlock()
-
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
@@ -1035,6 +1030,8 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		return nil, err
 	}
 
+	// Forward to the owner BEFORE taking the local lock (never hold a process lock
+	// across a peer RPC).
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -1044,30 +1041,47 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		return client.StopVM(ctx, req)
 	}
 
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+
+	return s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
+}
+
+// stopVMLocked stops a LOCAL VM (force ⇒ destroy, else graceful shutdown with a
+// timeout then force-kill). The caller MUST hold the VM lock, have re-read vm under
+// it, and confirmed local ownership; it never locks or forwards.
+func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32) (*pb.VM, error) {
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
 
-	if req.Force {
-		if err := s.virt.DestroyDomain(req.Name); err != nil {
+	if force {
+		if err := s.virt.DestroyDomain(vm.Name); err != nil {
 			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
 		}
 	} else {
-		if err := s.virt.ShutdownDomain(req.Name); err != nil {
+		if err := s.virt.ShutdownDomain(vm.Name); err != nil {
 			return nil, status.Errorf(codes.Internal, "shutdown: %v", err)
 		}
 		// Wait for graceful shutdown with timeout, then force-kill.
-		timeout := resolveStopTimeout(req.Timeout, vm.Spec)
+		timeout := resolveStopTimeout(timeoutSec, vm.Spec)
 		if timeout > 0 {
-			if !s.virt.WaitForShutdown(req.Name, time.Duration(timeout)*time.Second) {
-				slog.Info("ACPI shutdown timed out, force-killing", "vm", req.Name, "timeout_sec", timeout)
-				_ = s.virt.DestroyDomain(req.Name)
+			if !s.virt.WaitForShutdown(vm.Name, time.Duration(timeout)*time.Second) {
+				slog.Info("ACPI shutdown timed out, force-killing", "vm", vm.Name, "timeout_sec", timeout)
+				_ = s.virt.DestroyDomain(vm.Name)
 			}
 		}
 	}
 
 	// Release PCI passthrough devices and unbind from vfio-pci.
-	s.releaseDevices(ctx, req.Name)
+	s.releaseDevices(ctx, vm.Name)
 
 	// Mark as "stopped" with detail indicating operator-initiated stop. This
 	// distinguishes operator stops from crashes (#29): losing this write lets HA
@@ -1078,10 +1092,10 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	// reconciler (it can't know the stop was intentional) and lets HA auto-restart
 	// the VM (#29), so this one is fail-closed: retry, then surface an error if it
 	// still can't land, rather than signal a clean stop.
-	if err := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
+	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
-	s.recordVMEvent(ctx, req.Name, "vm.stopped", "ok", "")
+	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", "")
 
 	// Refresh LB backends so stopped VM is removed from rotation.
 	go s.refreshLBForStack(context.Background(), vm.StackName)
@@ -1089,7 +1103,7 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	pbVM.State = pb.VMState_VM_STOPPED
 	hooks.Run(ctx, hooks.PostStop, pbVM, hspec)
 
-	return s.vmToProto(ctx, req.Name)
+	return s.vmToProto(ctx, vm.Name)
 }
 
 func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.VM, error) {
@@ -1104,6 +1118,7 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, err
 	}
 
+	// Forward to the owner BEFORE taking the local lock.
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -1111,6 +1126,16 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		}
 		defer conn.Close()
 		return client.RestartVM(ctx, req)
+	}
+
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
 
 	// Split-brain gate (Phase 1): a restart (destroy+start) is a runtime action on a
@@ -1121,19 +1146,15 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, status.Errorf(codes.FailedPrecondition, "restart refused: %s", reason)
 	}
 
-	// Destroy then start
-	s.virt.DestroyDomain(req.Name)
-	if err := s.virt.StartDomain(req.Name); err != nil {
+	// Destroy, then bring it back up through the shared start primitive (so VLAN taps
+	// are reapplied and PostStart hooks run — a plain inline StartDomain skipped both).
+	s.virt.DestroyDomain(vm.Name)
+	out, err := s.startVMLocked(ctx, vm)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "restart: %v", err)
 	}
-
-	// Low-harm "running" write (reconciler heals from libvirt): record best-effort
-	// with retry, still record the event, never fail an already-restarted VM.
-	if err := s.persistVMState(ctx, req.Name, "running", "", corrosion.OpVMState); err != nil {
-		slog.Error("RestartVM: recording running state failed — reconciler will heal", "vm", req.Name, "error", err)
-	}
-	s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "")
-	return s.vmToProto(ctx, req.Name)
+	s.recordVMEvent(ctx, vm.Name, "vm.restarted", "ok", "")
+	return out, nil
 }
 
 // deleteLocalOnly reports whether this DeleteVM call is a peer-search probe
@@ -1169,6 +1190,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// into an exponential storm (a real hang observed in the field). A probe just
 	// deletes locally if the domain is here, else reports NotFound.
 	localOnly := deleteLocalOnly(ctx)
+
+	// Mutation barrier: an operator delete must not race an in-flight operation
+	// (ordinary --force does NOT bypass it — abort the stuck operation first). A
+	// peer-search probe is part of an already-in-flight delete, not a new mutation,
+	// so it is exempt.
+	if !localOnly && vm.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot delete %q: an operation is in progress (abort it first with `lv operation abort %s`)", req.Name, req.Name)
+	}
 
 	if !localOnly && vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
@@ -2195,6 +2225,189 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 
 // UpdateVM modifies the spec of a stopped VM (CPU, memory, VNC toggle),
 // regenerates domain XML, and redefines the libvirt domain.
+// isPureCPUGrowRequest reports whether req sets ONLY the vCPU count (no memory,
+// machine/firmware/mem-bounds/max_cpu redefine field, and no live-metadata field) —
+// the shape eligible for the live vCPU hot-add fast path.
+func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
+	return req.Cpu > 0 &&
+		req.MemoryMib == 0 && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
+		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
+		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
+		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc
+}
+
+// updateRequestHash is the D4 canonical request hash: the deterministic protobuf
+// serialization of the request with idempotency_key cleared, so two entry nodes
+// handed the same client key hash a semantically identical request identically. A
+// reused key with a DIFFERENT hash is a conflict.
+func updateRequestHash(req *pb.UpdateVMRequest) string {
+	clone := proto.Clone(req).(*pb.UpdateVMRequest)
+	clone.IdempotencyKey = ""
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(clone)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// liveGrowVCPUCoordinated is the post-latch (operation_protocol) live vCPU grow: it
+// records a durable reservation + claims the mutation barrier via BeginVMOperation
+// (deterministic op id from D4), applies the live hot-add, persists the observed
+// actual, and completes the operation (releasing the barrier + reservation). On a
+// libvirt failure it aborts the operation so the barrier doesn't wedge the VM.
+func (s *Server) liveGrowVCPUCoordinated(ctx context.Context, req *pb.UpdateVMRequest, vm *corrosion.VMRecord, spec *pb.VMSpec) (*pb.VM, error) {
+	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
+	_, _ = s.ensureProjectAuthority(ctx, vm.Project) // best-effort D1 authority establishment
+
+	cpuDelta := int(req.Cpu) - int(spec.Cpu)
+	rv := corrosion.ReservationVector{
+		Project: vm.Project, ProjectCPU: cpuDelta,
+		TargetHost: vm.HostName, TargetCPU: cpuDelta,
+	}
+	resJSON, err := rv.Encode()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
+	}
+	newSpec := proto.Clone(spec).(*pb.VMSpec)
+	newSpec.Cpu = req.Cpu
+	newSpecJSON, err := json.Marshal(newSpec)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "marshal spec: %v", err)
+	}
+
+	op := corrosion.OperationRecord{
+		ID:              corrosion.DeterministicOperationID("UpdateVM", principal, vm.Project, vm.Name, req.IdempotencyKey),
+		Method:          "UpdateVM",
+		Principal:       principal,
+		Project:         vm.Project,
+		ResourceKind:    "vm",
+		ResourceID:      vm.Name,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		RequestHash:     updateRequestHash(req),
+		IdempotencyKey:  req.IdempotencyKey,
+		ReservationJSON: resJSON,
+	}
+	applied, err := s.db.BeginVMOperation(ctx, op, string(newSpecJSON), vm.OwnerEpoch, vm.SpecGeneration)
+	if err != nil {
+		if errors.Is(err, corrosion.ErrOperationHashConflict) {
+			return nil, status.Errorf(codes.AlreadyExists, "idempotency key reused with a different request for %q", vm.Name)
+		}
+		return nil, status.Errorf(codes.Internal, "begin operation: %v", err)
+	}
+	if !applied {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress or the VM changed underneath", vm.Name)
+	}
+	newGen := vm.SpecGeneration + 1
+
+	if err := s.virt.SetVCPUs(req.Name, int(req.Cpu)); err != nil {
+		// Unwedge: abort the operation so the barrier is released for a retry.
+		if _, aerr := s.db.AbortVMOperation(ctx, vm.Name, op.ID, vm.OwnerEpoch, newGen); aerr != nil {
+			slog.Error("liveGrowVCPUCoordinated: abort after libvirt failure failed", "vm", vm.Name, "error", aerr)
+		}
+		return nil, status.Errorf(codes.Internal, "live vCPU resize: %v", err)
+	}
+	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, req.Name, int(req.Cpu), vm.MemActual, vm.OwnerEpoch, newGen); err != nil {
+		slog.Error("liveGrowVCPUCoordinated: persisting cpu_actual failed", "vm", vm.Name, "error", err)
+	}
+	if _, err := s.db.CompleteVMOperation(ctx, vm.Name, op.ID, vm.OwnerEpoch, newGen); err != nil {
+		slog.Error("liveGrowVCPUCoordinated: completing operation failed — recovery will reconcile", "vm", vm.Name, "error", err)
+	}
+	slog.Info("vm vCPUs grown live (coordinated)", "vm", req.Name, "cpu", req.Cpu)
+	s.recordVMEvent(ctx, req.Name, "vm.updated", "ok", fmt.Sprintf("live vcpu grow to %d", req.Cpu))
+	return s.vmToProto(ctx, req.Name)
+}
+
+// liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop), within the domain's
+// real vCPU hotplug ceiling. Caller has confirmed a pure cpu-grow request on a local
+// running VM with live_resize latched; this takes the VM lock, re-reads, and applies.
+func (s *Server) liveGrowVCPU(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM, error) {
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+	if vm.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress", req.Name)
+	}
+	if vm.State != "running" {
+		return nil, status.Errorf(codes.FailedPrecondition, "VM %q is no longer running", req.Name)
+	}
+	spec := &pb.VMSpec{}
+	if vm.Spec != "" {
+		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
+		}
+	}
+	if int(req.Cpu) <= int(spec.Cpu) {
+		return nil, status.Errorf(codes.FailedPrecondition, "live resize only grows vCPUs; stop the VM to shrink from %d to %d", spec.Cpu, req.Cpu)
+	}
+	if spec.Resources != nil && len(spec.Resources.CpuPinning) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q has pinned vCPUs and cannot live-grow CPUs; stop it and update, or pass --restart-if-needed", req.Name)
+	}
+	// Real-headroom check: the RUNNING domain's actual vCPU ceiling — not just the
+	// stored max_cpu intent — must cover the target, else a restart is required to
+	// pick up a raised topology.
+	inactiveXML, xerr := s.virt.DumpXMLInactive(req.Name)
+	if xerr != nil {
+		return nil, status.Errorf(codes.Internal, "read domain XML for %q: %v", req.Name, xerr)
+	}
+	if ceiling := lv.MaxVCPUFromXML(inactiveXML); ceiling < int(req.Cpu) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q boots with a vCPU ceiling of %d; growing to %d needs a restart — set max_cpu (≥%d) and restart, or pass --restart-if-needed",
+			req.Name, ceiling, req.Cpu, req.Cpu)
+	}
+
+	// Admission (F2): the grow must fit the host's free capacity and the project quota
+	// (counting in-flight reservations), serialized here by the owner + VM lock.
+	if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, int(req.Cpu)-int(spec.Cpu), 0); err != nil {
+		return nil, err
+	}
+
+	// Post-latch: run the full F1 operation protocol so the grow records a durable
+	// reservation + holds the mutation barrier for its (brief) duration. Pre-latch,
+	// fall through to the direct path (barrier/reservation written but not relied on).
+	if s.operationProtocolActive(ctx) {
+		return s.liveGrowVCPUCoordinated(ctx, req, vm, spec)
+	}
+
+	if err := s.virt.SetVCPUs(req.Name, int(req.Cpu)); err != nil {
+		return nil, status.Errorf(codes.Internal, "live vCPU resize: %v", err)
+	}
+
+	// Persist the new boot vCPU count (SetVCPUs also set the CONFIG) and the live
+	// actual, under the barrier + generation discipline.
+	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(old string) (string, error) {
+		fresh := &pb.VMSpec{}
+		if old != "" {
+			if uerr := json.Unmarshal([]byte(old), fresh); uerr != nil {
+				return "", uerr
+			}
+		}
+		fresh.Cpu = req.Cpu
+		b, merr := json.Marshal(fresh)
+		return string(b), merr
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "persist vCPU count: %v", err)
+	}
+	if !applied {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress", req.Name)
+	}
+	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, req.Name, int(req.Cpu), vm.MemActual, vm.OwnerEpoch, newGen); err != nil {
+		slog.Error("liveGrowVCPU: persisting cpu_actual failed — accounting will lag until reconciled", "vm", req.Name, "error", err)
+	}
+	slog.Info("vm vCPUs grown live", "vm", req.Name, "cpu", req.Cpu)
+	s.recordVMEvent(ctx, req.Name, "vm.updated", "ok", fmt.Sprintf("live vcpu grow to %d", req.Cpu))
+	return s.vmToProto(ctx, req.Name)
+}
+
 func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -2228,6 +2441,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 	}
 
+	// Live CPU hot-add fast path: a pure vCPU GROW on a running VM, when live_resize
+	// is latched, is applied in place (no stop) under the VM lock. Everything else
+	// (shrink, memory, machine/firmware, or a mixed request) falls through to the
+	// stopped-redefine path below.
+	if isPureCPUGrowRequest(req) && int(req.Cpu) > int(spec.Cpu) && vm.State == "running" && s.liveResizeActive(ctx) {
+		return s.liveGrowVCPU(ctx, req)
+	}
+
+	// Snapshot fields whose change would take the redefine off the CPU/memory-only
+	// fast path (an inactive-XML patch that preserves libvirt-assigned addresses).
+	origDisableVnc := spec.DisableVnc
+
 	// LIVE metadata fields — applied whether the VM is running or stopped. The
 	// reconciler/vmcheck read these fresh from the spec each sweep, so no redefine
 	// is needed. A nil restart means "unchanged"; restart.condition=="none"|""
@@ -2258,12 +2483,48 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
-		req.SecureBoot != nil || req.Tpm != nil
+		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil
+	// A CPU/memory(+bounds)-only redefine can be applied by patching the inactive
+	// domain XML in place rather than regenerating it, so libvirt-assigned details
+	// (PCI slot addresses, controller models) survive — which matters for guests
+	// (e.g. Windows) that key licensing off stable hardware addresses. Any other
+	// redefine-class change (machine/firmware/SB/TPM/guest-agent/cpu-mode/VNC) needs
+	// full regeneration.
+	// max_cpu changes the vCPU-topology XML (<vcpu current=…>), which the value-only
+	// inactive-XML patch doesn't handle, so exclude it from the fast path.
+	cpuMemOnly := redefine && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
+		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
+	restartAfter := false
 	if redefine {
 		if vm.State != "stopped" {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"VM %q must be stopped to change cpu/memory/machine/firmware/mem-bounds (current: %s); restart policy, onboot and startup ordering can be changed live",
-				req.Name, vm.State)
+			// UpdateVM NEVER restarts implicitly. A redefine-class change on a running
+			// VM is refused unless --restart-if-needed (allow_restart), which does a
+			// stop → redefine → start under ONE VM lock.
+			if req.AllowRestart == nil || !*req.AllowRestart {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"VM %q must be stopped to change cpu/memory/machine/firmware/mem-bounds (current: %s); pass --restart-if-needed to reconfigure with a restart",
+					req.Name, vm.State)
+			}
+			unlock := s.lockVM(req.Name)
+			defer unlock()
+			fresh, gerr := corrosion.GetVM(ctx, s.db, req.Name)
+			if gerr != nil || fresh == nil {
+				return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+			}
+			if fresh.HostName != s.hostName {
+				return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, fresh.HostName)
+			}
+			if fresh.ActiveOperationID != "" {
+				return nil, status.Errorf(codes.FailedPrecondition, "cannot reconfigure %q: an operation is in progress", req.Name)
+			}
+			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
+				return nil, serr
+			}
+			// Redefine + restart against the fresh (now-stopped) record.
+			vm = fresh
+			vm.State = "stopped"
+			restartAfter = true
 		}
 		if req.Cpu > 0 {
 			spec.Cpu = req.Cpu
@@ -2288,6 +2549,23 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		if req.MaxMemoryMib != nil {
 			spec.MaxMemoryMib = *req.MaxMemoryMib
+		}
+		if req.MaxCpu != nil {
+			// Setting a vCPU hotplug ceiling is refused until live_resize is latched
+			// cluster-wide — an old peer could drop max_cpu from a spec it rewrites.
+			if !s.liveResizeActive(ctx) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot set max_cpu for %q: live resize is not enabled and latched cluster-wide", req.Name)
+			}
+			effectiveCPU := spec.Cpu
+			if req.Cpu > 0 {
+				effectiveCPU = req.Cpu
+			}
+			if *req.MaxCpu != 0 && *req.MaxCpu < effectiveCPU {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"max_cpu (%d) must be >= cpu (%d)", *req.MaxCpu, effectiveCPU)
+			}
+			spec.MaxCpu = *req.MaxCpu
 		}
 		// Toggling secure_boot/tpm once firmware state exists can brick an
 		// unsigned guest (SB) or orphan BitLocker (TPM) — refuse without --force.
@@ -2319,10 +2597,19 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	specJSON, _ := json.Marshal(spec)
 
 	// Metadata-only update: persist the spec and return — no domain redefine, so a
-	// running VM keeps running untouched.
+	// running VM keeps running untouched. Route through MutateDesiredSpec so this
+	// respects the mutation barrier AND touches only the spec, never cpu_actual/
+	// mem_actual (a running VM's live actuals must survive a metadata edit).
 	if !redefine {
-		if err := corrosion.UpdateVMSpec(ctx, s.db, req.Name, string(specJSON), int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+		applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
+			return string(specJSON), nil
+		})
+		if err != nil {
 			return nil, status.Errorf(codes.Internal, "update VM spec: %v", err)
+		}
+		if !applied {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot update VM %q: an operation is in progress", req.Name)
 		}
 		slog.Info("VM metadata updated (live)", "vm", req.Name,
 			"restart", spec.Restart.GetCondition(), "onboot", spec.Onboot, "startup_order", spec.StartupOrder)
@@ -2395,54 +2682,63 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		})
 	}
 
-	// Regenerate domain XML.
-	vmCfg := lv.VMConfig{
-		Name:        spec.Name,
-		UUID:        spec.Uuid,
-		CPU:         int(spec.Cpu),
-		CPUMode:     spec.CpuMode,
-		MemoryMiB:   int(spec.MemoryMib),
-		Machine:     spec.Machine,
-		Firmware:    spec.Firmware,
-		GuestAgent:  spec.GuestAgent,
-		EnableVNC:   !spec.DisableVnc,
-		EnableSPICE: spec.EnableSpice,
-		Disks:       diskConfigs,
-		Networks:    netConfigs,
-		Boot:        spec.Boot,
+	// Rebuild PCI passthrough <hostdev>s from AUTHORITATIVE ownership (PR 0): the old
+	// inline builder omitted them, so any `lv update` of a stopped VM silently
+	// detached its GPU/NIC. A device the VM still owns that has vanished from the
+	// host is a hard failure — never boot the guest missing its passthrough device.
+	liveDevs, tombstonedDevs, err := corrosion.VMDeviceOwnership(ctx, s.db, s.hostName, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read PCI ownership for %q: %v", req.Name, err)
 	}
-	// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
-	// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
-	// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no
-	// create-time guard), so existing nvram is reused. A SB toggle was capability-
-	// checked above; verify the host can still satisfy it.
-	if spec.SecureBoot && !s.firmware.SecureBootAvailable() {
+	if len(tombstonedDevs) > 0 {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"host %s has no Secure Boot OVMF firmware; cannot redefine %q with Secure Boot", s.hostName, req.Name)
+			"cannot redefine %q: assigned PCI device(s) %v have vanished from host %s; resolve the missing hardware before updating",
+			req.Name, tombstonedDevs, s.hostName)
 	}
-	if spec.Tpm {
-		if err := s.checkTPMHostSupport(); err != nil {
-			return nil, err
-		}
-	}
-	s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
-	if r := spec.Resources; r != nil {
-		vmCfg.HugePages = r.Hugepages
-		vmCfg.IOThreads = int(r.IoThreads)
-		for _, pin := range r.CpuPinning {
-			vmCfg.CPUPinning = append(vmCfg.CPUPinning, int(pin))
-		}
-		if np := r.NumaPolicy; np != nil {
-			vmCfg.NUMAPolicy = &lv.NUMAPolicy{
-				PreferredNode: int(np.PreferredNode),
-				Strict:        np.Strict,
+	// CPU/memory-only fast path: patch the inactive XML in place so libvirt-assigned
+	// details survive. Falls back to full regeneration if the domain can't be dumped
+	// or the patch doesn't apply (both correct — regeneration now includes Min/Max
+	// memory + hostdevs).
+	var domXML string
+	if cpuMemOnly {
+		if inactiveXML, derr := s.virt.DumpXMLInactive(req.Name); derr == nil {
+			if patched, perr := lv.PatchInactiveResources(inactiveXML, int(spec.Cpu), int(spec.MemoryMib), int(spec.MaxMemoryMib)); perr == nil {
+				domXML = patched
+			} else {
+				slog.Warn("inactive-XML patch failed; regenerating", "vm", req.Name, "error", perr)
 			}
 		}
 	}
+	if domXML == "" {
+		var hostdevs []lv.HostdevConfig
+		for _, addr := range liveDevs {
+			hostdevs = append(hostdevs, lv.HostdevConfig{Address: addr})
+		}
+		// Regenerate domain XML from the shared builder (MinMemoryMiB/MaxMemoryMiB +
+		// Hostdevs are populated here — the fields the old inline redefine builder
+		// dropped, collapsing the balloon ceiling and detaching passthrough).
+		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
+		// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
+		// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
+		// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no
+		// create-time guard), so existing nvram is reused. A SB toggle was capability-
+		// checked above; verify the host can still satisfy it.
+		if spec.SecureBoot && !s.firmware.SecureBootAvailable() {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"host %s has no Secure Boot OVMF firmware; cannot redefine %q with Secure Boot", s.hostName, req.Name)
+		}
+		if spec.Tpm {
+			if err := s.checkTPMHostSupport(); err != nil {
+				return nil, err
+			}
+		}
+		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
 
-	domXML, err := lv.GenerateDomainXML(vmCfg)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		var gerr error
+		domXML, gerr = lv.GenerateDomainXML(vmCfg)
+		if gerr != nil {
+			return nil, status.Errorf(codes.Internal, "generate domain XML: %v", gerr)
+		}
 	}
 
 	// Capture the current domain XML so a failure below can restore it: libvirt
@@ -2475,20 +2771,44 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		specJSON, _ = json.Marshal(spec)
 	}
 
-	// The durable spec MUST match the live domain. If the write fails, roll the
-	// domain back to its old XML rather than return success with libvirt and the
-	// stored spec desynced (fatal — never report a half-applied firmware update).
-	if err := corrosion.UpdateVMSpec(ctx, s.db, req.Name, string(specJSON), int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+	// The durable spec MUST match the live domain. If the write fails or is deferred
+	// by the mutation barrier, roll the domain back to its old XML rather than return
+	// success with libvirt and the stored spec desynced (fatal — never report a
+	// half-applied firmware update). MutateDesiredSpec persists the desired spec and
+	// bumps spec_generation; UpdateObservedActuals then records the stopped VM's new
+	// cpu/mem actuals against that generation so a later start boots the right size.
+	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
+		return string(specJSON), nil
+	})
+	if err != nil || !applied {
 		if oldXML != "" {
 			_ = s.virt.UndefineDomainPreservingState(req.Name)
 			_ = s.virt.DefineDomain(oldXML)
 		}
-		return nil, status.Errorf(codes.Internal,
-			"persist updated spec for %q failed; rolled the domain back to its previous definition: %v", req.Name, err)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"persist updated spec for %q failed; rolled the domain back to its previous definition: %v", req.Name, err)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot update VM %q: an operation is in progress; rolled the domain back to its previous definition", req.Name)
+	}
+	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, req.Name, int(spec.Cpu), int(spec.MemoryMib), -1, newGen); err != nil {
+		// Spec is authoritative and already persisted; a stale stopped-VM actual is a
+		// minor inconsistency reconciled on next observe. Log loudly, don't unwind.
+		slog.Warn("persist actuals after redefine failed", "vm", req.Name, "error", err)
 	}
 
 	slog.Info("VM spec updated", "vm", req.Name, "cpu", spec.Cpu, "memory_mib", spec.MemoryMib, "disable_vnc", spec.DisableVnc)
 	s.recordVMEvent(ctx, req.Name, "vm.updated", "ok", fmt.Sprintf("cpu=%d mem=%d vnc=%v", spec.Cpu, spec.MemoryMib, !spec.DisableVnc))
+
+	// --restart-if-needed: bring the VM back up through the shared start primitive
+	// (still holding the VM lock taken above), completing the stop → redefine → start.
+	if restartAfter {
+		if _, serr := s.startVMLocked(ctx, vm); serr != nil {
+			return nil, status.Errorf(codes.Internal, "reconfigured %q but restart failed (VM left stopped): %v", req.Name, serr)
+		}
+		s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "reconfigure --restart-if-needed")
+	}
 
 	return s.vmToProto(ctx, req.Name)
 }

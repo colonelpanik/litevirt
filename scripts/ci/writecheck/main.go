@@ -40,6 +40,8 @@ var guarded = map[string]bool{
 	"UpdateVMState":                 true,
 	"UpdateVMStateStrict":           true,
 	"UpdateVMHost":                  true,
+	"MutateDesiredSpec":             true,
+	"UpdateObservedActuals":         true,
 	"UpdateDiskHostAndPath":         true,
 	"CommitMigrationOwnership":      true,
 	"InsertImage":                   true,

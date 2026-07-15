@@ -140,6 +140,16 @@ const (
 	// enforcing the "require fleet uniformity before latching" rule. Enforcement is
 	// default-off and the flag is the reversible kill switch.
 	OperationProtocolV1 = "operation_protocol_v1"
+	// LiveResizeV1 gates TRUE live CPU hot-add and balloon-memory resize (the
+	// max_cpu vCPU-hotplug ceiling and the <vcpu current=N>MAX</vcpu> XML it needs).
+	// Setting max_cpu is refused until this latches, because an old peer could drop
+	// the field via a typed spec rewrite (labels/health reconciliation) or relay a
+	// mutation that loses it — so the whole fleet must support it first. Once latched,
+	// an incompatible peer is fenced from mutating/membership/replication sessions
+	// (D3). Config-gated (enforcement.live_resize) + reversible like
+	// StrictMTLSIdentityV1; advertised build-static (a flag-off peer is merely
+	// permissive — it just won't originate max_cpu).
+	LiveResizeV1 = "live_resize_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -223,12 +233,13 @@ var supported = []string{
 	SharedStorageFenceV1,
 	RBACRealmV1,
 	OperationProtocolV1,
+	LiveResizeV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

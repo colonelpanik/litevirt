@@ -110,6 +110,7 @@ message VMSpec {
     bool  secure_boot     = 37;  // UEFI Secure Boot (q35 + SMM + secboot/MS OVMF)
     bool  tpm             = 38;  // emulated TPM 2.0 device (Windows 11 / BitLocker)
     string uuid           = 39;  // stable domain identity; makes the libvirt swtpm path deterministic
+    int32  max_cpu        = 40;  // vCPU hotplug ceiling; >cpu emits <vcpu current=cpu>max_cpu</vcpu> for live CPU add (live_resize)
 }
 
 message DiskSpec {

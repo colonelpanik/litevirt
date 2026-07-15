@@ -320,6 +320,11 @@ type EnforcementConfig struct {
 	// sessions (reseed-on-rejoin). The per-host PCI observation/ownership fixes are
 	// unaffected. Default false; the flag is the reversible kill switch.
 	OperationProtocol bool `yaml:"operation_protocol,omitempty"`
+	// LiveResize: allow TRUE live CPU hot-add + balloon-memory resize (setting a
+	// max_cpu vCPU-hotplug ceiling). Refused until the live_resize_v1 capability is
+	// latched cluster-wide (every peer must support it, else the field could be
+	// dropped by an old peer's spec rewrite). Default false; reversible kill switch.
+	LiveResize bool `yaml:"live_resize,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

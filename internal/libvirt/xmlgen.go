@@ -12,18 +12,22 @@ import (
 
 // VMConfig holds all parameters needed to generate a libvirt domain XML.
 type VMConfig struct {
-	Name       string
-	CPU        int
-	MemoryMiB  int
+	Name string
+	CPU  int
+	// MaxCPU (> CPU) is the vCPU hotplug ceiling: the domain boots with CPU vcpus and
+	// can be grown live up to MaxCPU (emits <vcpu current=CPU>MaxCPU</vcpu>). 0 = a
+	// fixed-size domain. Set only when live_resize is latched.
+	MaxCPU    int
+	MemoryMiB int
 	// Memory ballooning (#4). MaxMemoryMiB (> MemoryMiB) raises the balloon
 	// ceiling so the guest can be inflated up to it at runtime; MinMemoryMiB is
 	// the advisory floor SetMemory won't go below. 0 = classic fixed memory.
 	MinMemoryMiB int
 	MaxMemoryMiB int
-	Machine    string // q35 | pc
-	Firmware   string // uefi | bios
-	GuestAgent bool
-	EnableVNC  bool // true = add VNC graphics device, false = headless
+	Machine      string // q35 | pc
+	Firmware     string // uefi | bios
+	GuestAgent   bool
+	EnableVNC    bool // true = add VNC graphics device, false = headless
 	// EnableSPICE adds a SPICE graphics device alongside (or instead of) VNC.
 	// SPICE provides higher-fidelity graphics (USB redirection, audio, multi-
 	// monitor); VNC remains the lowest-common-denominator browser viewer.
@@ -85,11 +89,11 @@ type HostdevConfig struct {
 
 // DiskConfig describes a VM disk.
 type DiskConfig struct {
-	Name   string
-	Path   string
-	Bus    string // virtio | scsi | sata | ide
-	Cache  string // none | writeback | writethrough
-	IsISO  bool   // true for ISO/CDROM
+	Name  string
+	Path  string
+	Bus   string // virtio | scsi | sata | ide
+	Cache string // none | writeback | writethrough
+	IsISO bool   // true for ISO/CDROM
 	// ControllerModel is the SCSI controller model for bus=="scsi" disks
 	// (virtio-scsi | lsisas1068 | lsilogic | vmpvscsi | buslogic). Empty =
 	// virtio-scsi. Imported guests bind their boot driver to this model, so it
@@ -119,6 +123,21 @@ func MachineTypeFromXML(domXML string) string {
 		return ""
 	}
 	return d.OS.Machine
+}
+
+// MaxVCPUFromXML returns a domain's MAXIMUM vCPU count from its XML — the <vcpu>
+// element's body (which is the hotplug ceiling when a current= attr is present, or
+// simply the fixed count otherwise). Used for the real-headroom check before a live
+// vCPU grow: the stored spec's max_cpu is the intent, but only the domain's actual
+// topology proves it can grow live without a restart. Returns 0 if absent/unparsable.
+func MaxVCPUFromXML(domXML string) int {
+	var d struct {
+		VCPU vcpu `xml:"vcpu"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return 0
+	}
+	return d.VCPU.Value
 }
 
 // isQ35Machine reports whether m is the q35 machine family, in either the
@@ -171,7 +190,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			Value: memCeilingMiB * 1024, // libvirt uses KiB
 			Unit:  "KiB",
 		},
-		VCPU: vcpu{Value: cfg.CPU},
+		VCPU: cpuTopologyVCPU(cfg.CPU, cfg.MaxCPU),
 		OS: domainOS{
 			Type: osType{
 				Arch:    "x86_64",
@@ -183,7 +202,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			ACPI: &struct{}{},
 			APIC: &struct{}{},
 		},
-		Clock: clock{Offset: "utc"},
+		Clock:      clock{Offset: "utc"},
 		OnPoweroff: "destroy",
 		OnReboot:   "restart",
 		OnCrash:    "destroy",
@@ -382,8 +401,8 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			}
 		} else {
 			iface = interfaceDevice{
-				Type: "bridge",
-				MAC:  ifaceMAC{Address: mac},
+				Type:   "bridge",
+				MAC:    ifaceMAC{Address: mac},
 				Source: ifaceSource{Bridge: n.Bridge},
 				Model:  ifaceModel{Type: model},
 			}
@@ -393,11 +412,11 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 
 	// Serial console
 	dev.Serials = append(dev.Serials, serialDevice{
-		Type: "pty",
+		Type:   "pty",
 		Target: serialTarget{Type: "isa-serial", Port: 0},
 	})
 	dev.Consoles = append(dev.Consoles, consoleDevice{
-		Type: "pty",
+		Type:   "pty",
 		Target: consoleTarget{Type: "serial", Port: 0},
 	})
 
@@ -543,7 +562,6 @@ func SafeNvramPath(dataDir, vmName string) (string, error) {
 	return NvramPath(dataDir, vmName), nil
 }
 
-
 // CloudInitISOPath returns the standard path for a cloud-init ISO.
 func CloudInitISOPath(dataDir, vmName string) string {
 	return filepath.Join(dataDir, "cloudinit", vmName+".iso")
@@ -602,7 +620,7 @@ type domain struct {
 	CurrentMemory *memory        `xml:"currentMemory,omitempty"`
 	VCPU          vcpu           `xml:"vcpu"`
 	IOThreads     int            `xml:"iothreads,omitempty"`
-	CPUDef        *cpuDef         `xml:"cpu,omitempty"`
+	CPUDef        *cpuDef        `xml:"cpu,omitempty"`
 	CPUTune       *cpuTune       `xml:"cputune,omitempty"`
 	NUMATune      *numaTune      `xml:"numatune,omitempty"`
 	MemoryBacking *memoryBacking `xml:"memoryBacking,omitempty"`
@@ -646,8 +664,22 @@ type memory struct {
 	Unit  string `xml:"unit,attr"`
 }
 
+// cpuTopologyVCPU builds the <vcpu> element: a plain fixed count, or — when a
+// hotplug ceiling above the boot count is set — <vcpu current=cpu>maxCPU</vcpu>,
+// which libvirt requires for live vCPU hot-add.
+func cpuTopologyVCPU(cpu, maxCPU int) vcpu {
+	if maxCPU > cpu {
+		return vcpu{Current: cpu, Value: maxCPU}
+	}
+	return vcpu{Value: cpu}
+}
+
 type vcpu struct {
-	Value int `xml:",chardata"`
+	// Current is the booted vCPU count when it is below the maximum (Value); libvirt
+	// then allows live hot-add up to Value via SetVcpusFlags. Omitted (0) for a
+	// fixed-size domain, where Value alone is the vCPU count.
+	Current int `xml:"current,attr,omitempty"`
+	Value   int `xml:",chardata"`
 }
 
 type domainOS struct {
@@ -715,14 +747,14 @@ type devices struct {
 	Controllers []controllerDevice `xml:"controller"`
 	Disks       []diskDevice       `xml:"disk"`
 	Interfaces  []interfaceDevice  `xml:"interface"`
-	Hostdevs   []hostdevDevice   `xml:"hostdev"`
-	Serials    []serialDevice    `xml:"serial"`
-	Consoles   []consoleDevice   `xml:"console"`
-	Channels   []channelDevice   `xml:"channel"`
-	Graphics   []graphicsDevice  `xml:"graphics"`
-	Videos     []videoDevice     `xml:"video"`
-	MemBalloon *memballoon       `xml:"memballoon,omitempty"`
-	TPM        *tpmDevice        `xml:"tpm,omitempty"`
+	Hostdevs    []hostdevDevice    `xml:"hostdev"`
+	Serials     []serialDevice     `xml:"serial"`
+	Consoles    []consoleDevice    `xml:"console"`
+	Channels    []channelDevice    `xml:"channel"`
+	Graphics    []graphicsDevice   `xml:"graphics"`
+	Videos      []videoDevice      `xml:"video"`
+	MemBalloon  *memballoon        `xml:"memballoon,omitempty"`
+	TPM         *tpmDevice         `xml:"tpm,omitempty"`
 }
 
 // tpmDevice is an emulated TPM 2.0 (G1). State lives at Backend.Source.Path
@@ -734,9 +766,9 @@ type tpmDevice struct {
 }
 
 type tpmBackend struct {
-	Type            string     `xml:"type,attr"`                        // "emulator"
-	Version         string     `xml:"version,attr,omitempty"`           // "2.0"
-	PersistentState string     `xml:"persistent_state,attr,omitempty"`  // "yes"
+	Type            string     `xml:"type,attr"`                       // "emulator"
+	Version         string     `xml:"version,attr,omitempty"`          // "2.0"
+	PersistentState string     `xml:"persistent_state,attr,omitempty"` // "yes"
 	Source          *tpmSource `xml:"source,omitempty"`
 }
 
@@ -759,14 +791,14 @@ type controllerDevice struct {
 }
 
 type diskDevice struct {
-	XMLName   xml.Name    `xml:"disk"`
-	Type      string      `xml:"type,attr"`
-	Device    string      `xml:"device,attr"`
-	Driver    diskDriver  `xml:"driver,omitempty"`
-	Source    diskSource  `xml:"source,omitempty"`
-	Target    diskTarget  `xml:"target"`
-	BootOrder *bootOrder  `xml:"boot,omitempty"`
-	Readonly  *struct{}   `xml:"readonly,omitempty"`
+	XMLName   xml.Name   `xml:"disk"`
+	Type      string     `xml:"type,attr"`
+	Device    string     `xml:"device,attr"`
+	Driver    diskDriver `xml:"driver,omitempty"`
+	Source    diskSource `xml:"source,omitempty"`
+	Target    diskTarget `xml:"target"`
+	BootOrder *bootOrder `xml:"boot,omitempty"`
+	Readonly  *struct{}  `xml:"readonly,omitempty"`
 }
 
 type bootOrder struct {

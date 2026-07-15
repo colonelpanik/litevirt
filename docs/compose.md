@@ -100,6 +100,7 @@ vms:
     iso: "/path/to/boot.iso"  # Boot from ISO instead of image
     kind: "vm"                # vm (default) | lxc | oci — see "Workloads" below
     cpu: 2                    # vCPUs (default 2)
+    max-cpu: 8                # vCPU hotplug ceiling (> cpu); with live_resize, cpu grows live up to it
     cpu-mode: "host-model"    # host-passthrough | host-model | custom
     memory: "4G"              # Memory: "4G", "4096M", or 4096 (MiB) — boot allocation
     min-memory: "1G"          # Ballooning floor the host may reclaim to (0 = none)

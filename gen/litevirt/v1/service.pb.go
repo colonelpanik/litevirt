@@ -3449,27 +3449,30 @@ func (x *CutoverVMRequest) GetVmName() string {
 // restart.condition=="none" clears the policy. Optional fields are additive and
 // ignored by older daemons (forward-compatible in a mixed-version cluster).
 type UpdateVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Cpu           int32                  `protobuf:"varint,2,opt,name=cpu,proto3" json:"cpu,omitempty"`
-	MemoryMib     int32                  `protobuf:"varint,3,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
-	DisableVnc    bool                   `protobuf:"varint,4,opt,name=disable_vnc,json=disableVnc,proto3" json:"disable_vnc,omitempty"`
-	CpuMode       string                 `protobuf:"bytes,5,opt,name=cpu_mode,json=cpuMode,proto3" json:"cpu_mode,omitempty"`
-	Restart       *RestartPolicy         `protobuf:"bytes,6,opt,name=restart,proto3" json:"restart,omitempty"`
-	Onboot        *bool                  `protobuf:"varint,7,opt,name=onboot,proto3,oneof" json:"onboot,omitempty"`
-	StartupOrder  *int32                 `protobuf:"varint,8,opt,name=startup_order,json=startupOrder,proto3,oneof" json:"startup_order,omitempty"`
-	StartDelaySec *int32                 `protobuf:"varint,9,opt,name=start_delay_sec,json=startDelaySec,proto3,oneof" json:"start_delay_sec,omitempty"`
-	StopDelaySec  *int32                 `protobuf:"varint,10,opt,name=stop_delay_sec,json=stopDelaySec,proto3,oneof" json:"stop_delay_sec,omitempty"`
-	Machine       string                 `protobuf:"bytes,11,opt,name=machine,proto3" json:"machine,omitempty"`
-	Firmware      string                 `protobuf:"bytes,12,opt,name=firmware,proto3" json:"firmware,omitempty"`
-	GuestAgent    *bool                  `protobuf:"varint,13,opt,name=guest_agent,json=guestAgent,proto3,oneof" json:"guest_agent,omitempty"`
-	MinMemoryMib  *int32                 `protobuf:"varint,14,opt,name=min_memory_mib,json=minMemoryMib,proto3,oneof" json:"min_memory_mib,omitempty"`
-	MaxMemoryMib  *int32                 `protobuf:"varint,15,opt,name=max_memory_mib,json=maxMemoryMib,proto3,oneof" json:"max_memory_mib,omitempty"`
-	SecureBoot    *bool                  `protobuf:"varint,16,opt,name=secure_boot,json=secureBoot,proto3,oneof" json:"secure_boot,omitempty"`
-	Tpm           *bool                  `protobuf:"varint,17,opt,name=tpm,proto3,oneof" json:"tpm,omitempty"`
-	Force         bool                   `protobuf:"varint,18,opt,name=force,proto3" json:"force,omitempty"` // allow toggling secure_boot/tpm even when firmware state exists
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Cpu            int32                  `protobuf:"varint,2,opt,name=cpu,proto3" json:"cpu,omitempty"`
+	MemoryMib      int32                  `protobuf:"varint,3,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	DisableVnc     bool                   `protobuf:"varint,4,opt,name=disable_vnc,json=disableVnc,proto3" json:"disable_vnc,omitempty"`
+	CpuMode        string                 `protobuf:"bytes,5,opt,name=cpu_mode,json=cpuMode,proto3" json:"cpu_mode,omitempty"`
+	Restart        *RestartPolicy         `protobuf:"bytes,6,opt,name=restart,proto3" json:"restart,omitempty"`
+	Onboot         *bool                  `protobuf:"varint,7,opt,name=onboot,proto3,oneof" json:"onboot,omitempty"`
+	StartupOrder   *int32                 `protobuf:"varint,8,opt,name=startup_order,json=startupOrder,proto3,oneof" json:"startup_order,omitempty"`
+	StartDelaySec  *int32                 `protobuf:"varint,9,opt,name=start_delay_sec,json=startDelaySec,proto3,oneof" json:"start_delay_sec,omitempty"`
+	StopDelaySec   *int32                 `protobuf:"varint,10,opt,name=stop_delay_sec,json=stopDelaySec,proto3,oneof" json:"stop_delay_sec,omitempty"`
+	Machine        string                 `protobuf:"bytes,11,opt,name=machine,proto3" json:"machine,omitempty"`
+	Firmware       string                 `protobuf:"bytes,12,opt,name=firmware,proto3" json:"firmware,omitempty"`
+	GuestAgent     *bool                  `protobuf:"varint,13,opt,name=guest_agent,json=guestAgent,proto3,oneof" json:"guest_agent,omitempty"`
+	MinMemoryMib   *int32                 `protobuf:"varint,14,opt,name=min_memory_mib,json=minMemoryMib,proto3,oneof" json:"min_memory_mib,omitempty"`
+	MaxMemoryMib   *int32                 `protobuf:"varint,15,opt,name=max_memory_mib,json=maxMemoryMib,proto3,oneof" json:"max_memory_mib,omitempty"`
+	SecureBoot     *bool                  `protobuf:"varint,16,opt,name=secure_boot,json=secureBoot,proto3,oneof" json:"secure_boot,omitempty"`
+	Tpm            *bool                  `protobuf:"varint,17,opt,name=tpm,proto3,oneof" json:"tpm,omitempty"`
+	Force          bool                   `protobuf:"varint,18,opt,name=force,proto3" json:"force,omitempty"`                                         // allow toggling secure_boot/tpm even when firmware state exists
+	IdempotencyKey string                 `protobuf:"bytes,19,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`  // cross-entry-node dedup of a retried update (D4 semantics)
+	MaxCpu         *int32                 `protobuf:"varint,20,opt,name=max_cpu,json=maxCpu,proto3,oneof" json:"max_cpu,omitempty"`                   // set the vCPU hotplug ceiling (live_resize; latched)
+	AllowRestart   *bool                  `protobuf:"varint,21,opt,name=allow_restart,json=allowRestart,proto3,oneof" json:"allow_restart,omitempty"` // permit a stop→redefine→start for a change that can't apply live
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *UpdateVMRequest) Reset() {
@@ -3628,15 +3631,37 @@ func (x *UpdateVMRequest) GetForce() bool {
 	return false
 }
 
+func (x *UpdateVMRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+func (x *UpdateVMRequest) GetMaxCpu() int32 {
+	if x != nil && x.MaxCpu != nil {
+		return *x.MaxCpu
+	}
+	return 0
+}
+
+func (x *UpdateVMRequest) GetAllowRestart() bool {
+	if x != nil && x.AllowRestart != nil {
+		return *x.AllowRestart
+	}
+	return false
+}
+
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
 // ballooned via virtio without a redefine.
 type SetVMMemoryRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	TargetMib     int32                  `protobuf:"varint,2,opt,name=target_mib,json=targetMib,proto3" json:"target_mib,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	TargetMib      int32                  `protobuf:"varint,2,opt,name=target_mib,json=targetMib,proto3" json:"target_mib,omitempty"`
+	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *SetVMMemoryRequest) Reset() {
@@ -3681,6 +3706,13 @@ func (x *SetVMMemoryRequest) GetTargetMib() int32 {
 		return x.TargetMib
 	}
 	return 0
+}
+
+func (x *SetVMMemoryRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
 }
 
 // SetVMLabelsRequest replaces the full label set (the request is authoritative —
@@ -22486,7 +22518,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10RebuildVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"+\n" +
 	"\x10CutoverVMRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xfe\x05\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\x8d\a\n" +
 	"\x0fUpdateVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03cpu\x18\x02 \x01(\x05R\x03cpu\x12\x1d\n" +
@@ -22510,7 +22542,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vsecure_boot\x18\x10 \x01(\bH\aR\n" +
 	"secureBoot\x88\x01\x01\x12\x15\n" +
 	"\x03tpm\x18\x11 \x01(\bH\bR\x03tpm\x88\x01\x01\x12\x14\n" +
-	"\x05force\x18\x12 \x01(\bR\x05forceB\t\n" +
+	"\x05force\x18\x12 \x01(\bR\x05force\x12'\n" +
+	"\x0fidempotency_key\x18\x13 \x01(\tR\x0eidempotencyKey\x12\x1c\n" +
+	"\amax_cpu\x18\x14 \x01(\x05H\tR\x06maxCpu\x88\x01\x01\x12(\n" +
+	"\rallow_restart\x18\x15 \x01(\bH\n" +
+	"R\fallowRestart\x88\x01\x01B\t\n" +
 	"\a_onbootB\x10\n" +
 	"\x0e_startup_orderB\x12\n" +
 	"\x10_start_delay_secB\x11\n" +
@@ -22519,11 +22555,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0f_min_memory_mibB\x11\n" +
 	"\x0f_max_memory_mibB\x0e\n" +
 	"\f_secure_bootB\x06\n" +
-	"\x04_tpm\"G\n" +
+	"\x04_tpmB\n" +
+	"\n" +
+	"\b_max_cpuB\x10\n" +
+	"\x0e_allow_restart\"p\n" +
 	"\x12SetVMMemoryRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
-	"target_mib\x18\x02 \x01(\x05R\ttargetMib\"\xa8\x01\n" +
+	"target_mib\x18\x02 \x01(\x05R\ttargetMib\x12'\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\"\xa8\x01\n" +
 	"\x12SetVMLabelsRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12C\n" +
 	"\x06labels\x18\x02 \x03(\v2+.litevirt.v1.SetVMLabelsRequest.LabelsEntryR\x06labels\x1a9\n" +

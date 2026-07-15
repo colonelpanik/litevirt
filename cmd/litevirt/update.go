@@ -25,14 +25,16 @@ func newUpdateCmd() *cobra.Command {
 		startDelay   int32
 		stopDelay    int32
 		// redefine-class (require the VM stopped)
-		machine    string
-		firmware   string
-		guestAgent bool
-		minMem     int32
-		maxMem     int32
-		secureBoot bool
-		tpm        bool
-		force      bool
+		machine         string
+		firmware        string
+		guestAgent      bool
+		minMem          int32
+		maxMem          int32
+		maxCPU          int32
+		secureBoot      bool
+		tpm             bool
+		force           bool
+		restartIfNeeded bool
 	)
 	cmd := &cobra.Command{
 		Use:   "update <vm>",
@@ -42,7 +44,11 @@ func newUpdateCmd() *cobra.Command {
 Restart policy, autostart (onboot) and startup ordering apply LIVE — the VM does
 not need to be stopped. CPU, memory, CPU mode, VNC, machine type, firmware,
 guest-agent and the balloon min/max bounds change the domain definition, so the
-VM must be stopped for those.`,
+VM must be stopped for those.
+
+With live_resize enabled cluster-wide, --cpu GROWS a running VM's vCPUs LIVE up to
+its --max-cpu hotplug ceiling (a CPU shrink or exceeding the ceiling still needs a
+stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			f := cmd.Flags()
@@ -50,7 +56,7 @@ VM must be stopped for those.`,
 			for _, n := range []string{"cpu", "memory", "cpu-mode", "disable-vnc",
 				"restart", "restart-max-attempts", "restart-delay", "restart-window",
 				"onboot", "startup-order", "start-delay", "stop-delay",
-				"machine", "firmware", "guest-agent", "min-mem", "max-mem",
+				"machine", "firmware", "guest-agent", "min-mem", "max-mem", "max-cpu",
 				"secure-boot", "tpm"} {
 				if f.Changed(n) {
 					any = true
@@ -87,6 +93,12 @@ VM must be stopped for those.`,
 			}
 			if f.Changed("max-mem") {
 				req.MaxMemoryMib = &maxMem
+			}
+			if f.Changed("max-cpu") {
+				req.MaxCpu = &maxCPU
+			}
+			if f.Changed("restart-if-needed") {
+				req.AllowRestart = &restartIfNeeded
 			}
 			if f.Changed("secure-boot") {
 				req.SecureBoot = &secureBoot
@@ -147,8 +159,10 @@ VM must be stopped for those.`,
 	cmd.Flags().BoolVar(&guestAgent, "guest-agent", false, "Enable the QEMU guest agent (VM must be stopped)")
 	cmd.Flags().Int32Var(&minMem, "min-mem", 0, "Minimum balloon memory in MiB (VM must be stopped)")
 	cmd.Flags().Int32Var(&maxMem, "max-mem", 0, "Maximum balloon memory in MiB (VM must be stopped)")
+	cmd.Flags().Int32Var(&maxCPU, "max-cpu", 0, "vCPU hotplug ceiling for live CPU hot-add (requires live_resize; set once stopped, then --cpu grows live up to it)")
 	cmd.Flags().BoolVar(&secureBoot, "secure-boot", false, "Enable/disable UEFI Secure Boot (VM must be stopped; --force if firmware state exists)")
 	cmd.Flags().BoolVar(&tpm, "tpm", false, "Enable/disable the emulated TPM 2.0 (VM must be stopped; --force if TPM state exists)")
 	cmd.Flags().BoolVar(&force, "force", false, "Allow toggling secure-boot/tpm even when firmware state exists")
+	cmd.Flags().BoolVar(&restartIfNeeded, "restart-if-needed", false, "Permit a stop→redefine→start for a change that can't apply live (cpu shrink, machine/firmware, beyond the vCPU ceiling)")
 	return cmd
 }

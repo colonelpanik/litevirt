@@ -485,32 +485,40 @@ func (r *Reconciler) maybePinMachineType(ctx context.Context, vm corrosion.VMRec
 	if !lv.IsPinnedMachineType(resolved) {
 		return // libvirt gave no concrete type; leave the alias untouched
 	}
-	// Surgical edit: round-trip the raw object and replace only "machine" so no
-	// other spec field is dropped or reordered.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(vm.Spec), &raw); err != nil {
-		return
-	}
-	mj, err := json.Marshal(resolved)
-	if err != nil {
-		return
-	}
-	raw["machine"] = mj
-	out, err := json.Marshal(raw)
-	if err != nil {
-		return
-	}
-	// Compare-and-swap on the spec column keyed by the exact spec we based the edit
-	// on: if a concurrent user UpdateVM changed the spec since this reconcile pass
-	// read it, the write no-ops (applied=false) rather than clobbering that edit
-	// with our stale-plus-machine copy — the next tick re-reads and retries.
-	applied, err := corrosion.UpdateVMSpecIfUnchanged(ctx, r.db, vm.Name, vm.Spec, string(out))
+	// Surgical edit through the sanctioned barrier-respecting writer: MutateDesiredSpec
+	// re-reads the FRESH spec and replaces only "machine" (no other field dropped or
+	// reordered), so a concurrent user UpdateVM isn't clobbered — if the spec moved
+	// underneath us the CAS misses and we retry next tick. It also defers (applied=
+	// false) while an operation holds the VM's mutation barrier — a pin must not race
+	// an in-flight resource update.
+	applied, _, err := corrosion.MutateDesiredSpec(ctx, r.db, vm.Name, func(old string) (string, error) {
+		var freshM struct {
+			Machine string `json:"machine"`
+		}
+		if err := json.Unmarshal([]byte(old), &freshM); err == nil && lv.IsPinnedMachineType(freshM.Machine) {
+			return old, nil // already pinned in the fresh spec → no-op (no generation bump)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(old), &raw); err != nil {
+			return "", err
+		}
+		mj, err := json.Marshal(resolved)
+		if err != nil {
+			return "", err
+		}
+		raw["machine"] = mj
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	})
 	if err != nil {
 		slog.Warn("reconciler: pin machine type failed", "vm", vm.Name, "machine", resolved, "error", err)
 		return
 	}
 	if !applied {
-		return // spec changed underneath us; retry next tick off the fresh value
+		return // spec changed underneath us / operation active; retry next tick off the fresh value
 	}
 	slog.Info("reconciler: pinned machine type (one-shot backfill)", "vm", vm.Name, "from", cur.Machine, "to", resolved)
 }

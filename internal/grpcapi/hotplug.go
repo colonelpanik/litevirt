@@ -54,11 +54,18 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 		defer conn.Close()
 		return client.AttachDevice(ctx, req)
 	}
+	// Mutation barrier: don't hot-plug while a resource operation holds the VM.
+	if vmRec.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot attach a device to %q: an operation is in progress", req.VmName)
+	}
 	if vmRec.State != "running" {
 		return nil, status.Errorf(codes.FailedPrecondition, "VM %q is not running (state: %s)", req.VmName, vmRec.State)
 	}
 
-	var (out *pb.VM; detail string)
+	var (
+		out    *pb.VM
+		detail string
+	)
 	switch {
 	case req.Disk != nil:
 		out, err = s.attachDisk(ctx, req.VmName, req.Disk)
@@ -103,11 +110,18 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 		defer conn.Close()
 		return client.DetachDevice(ctx, req)
 	}
+	// Mutation barrier: don't hot-unplug while a resource operation holds the VM.
+	if vmRec.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot detach a device from %q: an operation is in progress", req.VmName)
+	}
 	if vmRec.State != "running" {
 		return nil, status.Errorf(codes.FailedPrecondition, "VM %q is not running (state: %s)", req.VmName, vmRec.State)
 	}
 
-	var (out *pb.VM; detail string)
+	var (
+		out    *pb.VM
+		detail string
+	)
 	switch {
 	case req.DiskName != "":
 		out, err = s.detachDisk(ctx, req.VmName, req.DiskName)

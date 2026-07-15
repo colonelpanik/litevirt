@@ -91,6 +91,11 @@ type LibvirtBackend interface {
 	// Memory ballooning (#4): set the live balloon target (MiB) on a running VM.
 	SetMemory(domainName string, memMiB int) error
 
+	// SetVCPUs hot-adds (or reduces, guest permitting) the live vCPU count on a
+	// running domain, persisting to config too — for live CPU resize within the
+	// hotplug ceiling (live_resize).
+	SetVCPUs(name string, count int) error
+
 	// Stats / introspection.
 	NodeInfo() (cpus int, memMiB int, err error)
 	GetDomainStats(name string) (*libvirt.DomainStats, error)

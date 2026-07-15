@@ -404,6 +404,7 @@ type VMSpec struct {
 	SecureBoot    bool   `protobuf:"varint,37,opt,name=secure_boot,json=secureBoot,proto3" json:"secure_boot,omitempty"` // UEFI Secure Boot (q35 + SMM + secboot/MS OVMF)
 	Tpm           bool   `protobuf:"varint,38,opt,name=tpm,proto3" json:"tpm,omitempty"`                                 // emulated TPM 2.0 device (Windows 11 / BitLocker)
 	Uuid          string `protobuf:"bytes,39,opt,name=uuid,proto3" json:"uuid,omitempty"`                                // stable domain identity; makes the libvirt swtpm path deterministic
+	MaxCpu        int32  `protobuf:"varint,40,opt,name=max_cpu,json=maxCpu,proto3" json:"max_cpu,omitempty"`             // vCPU hotplug ceiling; >cpu emits <vcpu current=cpu>max_cpu</vcpu> for live CPU add (live_resize)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -709,6 +710,13 @@ func (x *VMSpec) GetUuid() string {
 		return x.Uuid
 	}
 	return ""
+}
+
+func (x *VMSpec) GetMaxCpu() int32 {
+	if x != nil {
+		return x.MaxCpu
+	}
+	return 0
 }
 
 type DiskSpec struct {
@@ -5027,7 +5035,7 @@ var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xfb\v\n" +
+	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x94\f\n" +
 	"\x06VMSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -5074,7 +5082,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\vsecure_boot\x18% \x01(\bR\n" +
 	"secureBoot\x12\x10\n" +
 	"\x03tpm\x18& \x01(\bR\x03tpm\x12\x12\n" +
-	"\x04uuid\x18' \x01(\tR\x04uuid\x1a9\n" +
+	"\x04uuid\x18' \x01(\tR\x04uuid\x12\x17\n" +
+	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb5\x01\n" +

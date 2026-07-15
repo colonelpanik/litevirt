@@ -560,9 +560,19 @@ func TestUpdateVMSpec(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
+	// A stopped-VM redefine writes the spec (MutateDesiredSpec) then the new-config
+	// actuals (UpdateObservedActuals) — the two sanctioned writers that replaced the
+	// blind UpdateVMSpec.
 	newSpec := `{"cpu":4,"memory":8192}`
-	if err := UpdateVMSpec(ctx, db, "vm-spec", newSpec, 4, 8192); err != nil {
-		t.Fatalf("UpdateVMSpec: %v", err)
+	applied, newGen, err := MutateDesiredSpec(ctx, db, "vm-spec", func(string) (string, error) { return newSpec, nil })
+	if err != nil || !applied {
+		t.Fatalf("MutateDesiredSpec: applied=%v err=%v", applied, err)
+	}
+	if newGen != 1 {
+		t.Errorf("newGen = %d, want 1", newGen)
+	}
+	if _, err := UpdateObservedActuals(ctx, db, "vm-spec", 4, 8192, -1, newGen); err != nil {
+		t.Fatalf("UpdateObservedActuals: %v", err)
 	}
 
 	vm, err := GetVM(ctx, db, "vm-spec")
@@ -577,5 +587,8 @@ func TestUpdateVMSpec(t *testing.T) {
 	}
 	if vm.MemActual != 8192 {
 		t.Errorf("mem = %d, want 8192", vm.MemActual)
+	}
+	if vm.SpecGeneration != 1 {
+		t.Errorf("spec_generation = %d, want 1", vm.SpecGeneration)
 	}
 }

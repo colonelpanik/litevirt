@@ -149,6 +149,11 @@ enforcement:
                               # cluster-wide latch only forms once EVERY node has it enabled — the
                               # barrier is never relied upon until the whole fleet has opted in. Enable
                               # fleet-uniformly; the flag is the reversible kill switch.
+  live_resize: false          # allow TRUE live CPU hot-add + balloon-memory resize. Setting a VM's
+                              # max_cpu vCPU-hotplug ceiling is refused until this latches cluster-wide
+                              # (an old peer could drop max_cpu from a spec it rewrites), after which
+                              # `lv update --cpu` grows a running VM's vCPUs live up to its ceiling.
+                              # Enable fleet-uniformly; the flag is the reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

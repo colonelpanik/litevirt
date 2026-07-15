@@ -130,6 +130,9 @@ lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--disable-vnc]
   [--machine q35] [--firmware uefi|bios] [--guest-agent]
   [--min-mem N] [--max-mem N]
+  [--max-cpu N]                              # vCPU hotplug ceiling (needs live_resize);
+                                             # with it set, --cpu grows a RUNNING VM's
+                                             # vCPUs live up to the ceiling
   [--secure-boot] [--tpm] [--force]          # toggle Secure Boot / vTPM (stopped).
                                              # Once firmware state exists, --force is
                                              # required to change them (enabling SB can

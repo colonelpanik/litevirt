@@ -104,6 +104,55 @@ func TestUpdateVM_LiveCPUGrow_NoHeadroom(t *testing.T) {
 	}
 }
 
+// TestUpdateVM_LiveCPUGrow_HostCapacity: a live grow that would over-commit the
+// host's CPU is rejected (F2 admission), not silently applied.
+func TestUpdateVM_LiveCPUGrow_HostCapacity(t *testing.T) {
+	s := liveResizeServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "test-host", CPUTotal: 8, MemTotal: 65536, State: "HOST_ACTIVE"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "hp", HostName: "test-host", State: "running", CPUActual: 4, MemActual: 2048,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "hp", Cpu: 4, MaxCpu: 16, MemoryMib: 2048}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>hp</name><memory unit='KiB'>2097152</memory><vcpu current='4'>16</vcpu></domain>`); err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+	// Host has 8 vCPU, 4 in use → 4 free; growing by 6 (4→10) over-commits.
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "hp", Cpu: 10}); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("host over-commit: want ResourceExhausted, got %v", err)
+	}
+}
+
+// TestUpdateVM_LiveCPUGrow_ProjectQuota: a live grow that would exceed the project's
+// vCPU quota (committed + this grow) is rejected.
+func TestUpdateVM_LiveCPUGrow_ProjectQuota(t *testing.T) {
+	s := liveResizeServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "test-host", CPUTotal: 64, MemTotal: 262144, State: "HOST_ACTIVE"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.UpsertProjectQuota(ctx, s.db, corrosion.ProjectQuotaRecord{ProjectName: "acme", VCPULimit: 8}); err != nil {
+		t.Fatalf("UpsertProjectQuota: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "hp", HostName: "test-host", State: "running", Project: "acme", CPUActual: 4, MemActual: 2048,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "hp", Cpu: 4, MaxCpu: 16, MemoryMib: 2048}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>hp</name><memory unit='KiB'>2097152</memory><vcpu current='4'>16</vcpu></domain>`); err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+	// Quota 8; used 4; growing by 8 (4→12) exceeds it (host has ample room).
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "hp", Cpu: 12}); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("project quota: want ResourceExhausted, got %v", err)
+	}
+}
+
 // TestUpdateVM_LiveCPUGrow_Pinned: a CPU-pinned VM can't live-grow CPUs.
 func TestUpdateVM_LiveCPUGrow_Pinned(t *testing.T) {
 	s := liveResizeServer(t)

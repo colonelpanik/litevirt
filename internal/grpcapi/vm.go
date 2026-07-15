@@ -2270,6 +2270,12 @@ func (s *Server) liveGrowVCPU(ctx context.Context, req *pb.UpdateVMRequest) (*pb
 			req.Name, ceiling, req.Cpu, req.Cpu)
 	}
 
+	// Admission (F2): the grow must fit the host's free capacity and the project quota
+	// (counting in-flight reservations), serialized here by the owner + VM lock.
+	if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, int(req.Cpu)-int(spec.Cpu), 0); err != nil {
+		return nil, err
+	}
+
 	if err := s.virt.SetVCPUs(req.Name, int(req.Cpu)); err != nil {
 		return nil, status.Errorf(codes.Internal, "live vCPU resize: %v", err)
 	}

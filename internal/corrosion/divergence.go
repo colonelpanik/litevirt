@@ -55,7 +55,8 @@ const (
 // it, so both lanes share this type.
 type RowMeta struct {
 	UpdatedAt string // raw updated_at (RFC3339 or HLC) as stored
-	RowHash   string // hash/HMAC of the canonical row encoding
+	RowHash   string // hash/HMAC of the v1 (positional) canonical row encoding
+	RowHashV2 string // hash/HMAC of the order-invariant digest_v2 encoding; "" unless enabled
 	Deleted   bool   // deleted_at non-null (tombstone)
 	State     string // optional state column (for terminal_vs_live); "" if N/A
 }
@@ -173,14 +174,28 @@ func classifyRow(table string, perNode map[string]RowMeta, nodeCount int) Diverg
 }
 
 func sameHash(perNode map[string]RowMeta) bool {
+	// Prefer the order-invariant v2 hash ONLY when every node supplied it (pairwise
+	// negotiation); otherwise compare the positional v1 hash — so an old/flag-off node
+	// falls back to v1 rather than reading as converged/divergent spuriously.
+	useV2 := len(perNode) > 0
+	for _, m := range perNode {
+		if m.RowHashV2 == "" {
+			useV2 = false
+			break
+		}
+	}
 	var first string
 	set := false
 	for _, m := range perNode {
+		h := m.RowHash
+		if useV2 {
+			h = m.RowHashV2
+		}
 		if !set {
-			first, set = m.RowHash, true
+			first, set = h, true
 			continue
 		}
-		if m.RowHash != first {
+		if h != first {
 			return false
 		}
 	}

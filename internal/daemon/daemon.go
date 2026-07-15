@@ -414,6 +414,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetHLCEmit(func() bool {
 		return d.cfg.Enforcement.HLCLww && d.checker.Latched(capabilities.HLCLwwV1)
 	})
+	// Emit the order-invariant digest_v2 hashes once enforcement.digest_v2 is set. No
+	// capability latch: v2 is negotiated PAIRWISE by wire-field presence (each node emits
+	// v2 only when locally enabled; two peers compare v2 only when both emitted it), so a
+	// non-uniform rollout only affects which node initiates a pull, never a decision.
+	d.db.SetDigestV2Enabled(func() bool { return d.cfg.Enforcement.DigestV2 })
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).

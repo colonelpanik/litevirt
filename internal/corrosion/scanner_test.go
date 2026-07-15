@@ -38,7 +38,7 @@ func TestScanLocalTables_AndDumpRoundTrip(t *testing.T) {
 
 	// Peer-dump round-trip: parsing this node's own operator-safe dump yields the
 	// SAME per-row hash (so cross-node comparison is apples-to-apples).
-	dumpSnaps, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"containers": true})
+	dumpSnaps, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"containers": true}, false)
 	if err != nil {
 		t.Fatalf("SnapshotFromDumpBytes: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestScanLocalTables_NumericColumnNoArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanLocalTables: %v", err)
 	}
-	peer, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"storage_pools": true})
+	peer, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"storage_pools": true}, false)
 	if err != nil {
 		t.Fatalf("SnapshotFromDumpBytes: %v", err)
 	}

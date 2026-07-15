@@ -102,10 +102,54 @@ operation on the offending node:
    workload listing is unchanged and `lv doctor divergence` (and the cluster
    digest) have converged.
 
-> A pure column-order skew that previously mis-reported here now classifies as
-> row-content divergence instead (the row digest is positional). The data
-> remediation above clears the current divergence; an order-invariant digest is a
-> separate planned follow-up that prevents recurrence.
+> A pure column-order skew that previously mis-reported here classifies as
+> row-content divergence when the positional (v1) digest is in force. The
+> order-invariant **digest_v2** (below) makes that skew hash identically across
+> nodes, preventing the recurrence entirely — enable it fleet-wide instead of
+> repeatedly running the data remediation above for a column-order-only skew.
+
+### `digest_v2` — the order-invariant table/row digest
+
+The default (v1) content digest hashes each row's cell **values in physical column
+order**, so a fresh `CREATE TABLE` node and an `ALTER ADD COLUMN`-upgraded node
+compute different table/row hashes for logically identical data. The merge is
+column-**name**-safe, so this never corrupts data — but the hashes stay different
+every cycle, causing perpetual no-op anti-entropy pulls and a standing
+`lv doctor divergence` / `lv cluster digest` mismatch on the reordered tables.
+
+**digest_v2** pairs each value with its column name, sorts by name, and hashes a
+canonical, order-invariant encoding — so column order stops mattering. It is
+negotiated **pairwise by field presence**: a node emits the v2 hash only when its
+own `enforcement.digest_v2` flag is on, and any two peers compare v2 **only when
+both supply it**, otherwise both compare v1. There is no capability latch — the
+digest only *detects*, and each node compares independently, so a non-uniform
+rollout only affects which node pulls, never data. `lv cluster digest` /
+`lv cluster converge` print a `VER` column showing which version was compared per
+table.
+
+**Activation (do it fleet-uniformly, after every node runs a build that supports it):**
+
+1. **Ship** the supporting binary to every node with `enforcement.digest_v2: false`
+   (the default). Flag off ⇒ v1-only emission; behavior is unchanged.
+2. **Converge** — confirm every node is upgraded (`lv host ls`).
+3. **Activate** — set `enforcement.digest_v2: true` in each node's config and
+   rolling-restart the fleet (the same procedure as any other `enforcement.*`
+   flag). Nodes now emit and compare v2 pairwise.
+4. **Controlled resync** — `lv cluster converge --all` (one anti-entropy pass).
+   Precise outcome:
+   - Column-order-only tables **stop pulling** and read converged (`VER v2`).
+   - Strictly-newer LWW drift **may** heal (normal LWW), as always.
+   - Genuine **equal-timestamp safety faults still require explicit remediation** —
+     LWW never auto-heals a tie. `lv doctor repair-owner` restamps **VM-owned rows
+     only** (the `vms` table); other tables (e.g. `lb_configs`) need the quiesced
+     table-remediation procedure above or a table-specific restamp — `repair-owner`
+     cannot repair them, and `lv cluster converge` labels them accordingly.
+   - **In-memory unresolved-tie records do not auto-clear** just because a table's
+     v2 digest now matches; they clear on the next daemon restart.
+
+Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to
+v1-only emission (peers then compare v1 against it). Because negotiation is by
+field presence, a mixed fleet is always safe — never a spurious v1-vs-v2 mismatch.
 
 ### The sensitive lane
 

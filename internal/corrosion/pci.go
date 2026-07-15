@@ -137,6 +137,34 @@ func ListPCIDevices(ctx context.Context, c *Client, hostName, typeFilter string)
 	return devices, nil
 }
 
+// VMDeviceOwnership reports the PCI addresses this host has assigned to vmName,
+// split into live (not tombstoned) and tombstoned. Rebuild a VM's <hostdev> set
+// from live (deterministic address order) on a redefine; a non-empty tombstoned
+// means a device the VM still owns has vanished from the host, so the redefine must
+// fail rather than silently drop the passthrough device (which would boot the guest
+// without its GPU/NIC).
+func VMDeviceOwnership(ctx context.Context, c *Client, hostName, vmName string) (live, tombstoned []string, err error) {
+	lrows, err := c.Query(ctx,
+		`SELECT address FROM host_pci_devices WHERE host_name = ? AND vm_name = ? AND deleted_at IS NULL ORDER BY address`,
+		hostName, vmName)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, r := range lrows {
+		live = append(live, r.String("address"))
+	}
+	trows, err := c.Query(ctx,
+		`SELECT address FROM host_pci_devices WHERE host_name = ? AND vm_name = ? AND deleted_at IS NOT NULL ORDER BY address`,
+		hostName, vmName)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, r := range trows {
+		tombstoned = append(tombstoned, r.String("address"))
+	}
+	return live, tombstoned, nil
+}
+
 // AssignPCIDevice marks a PCI device as assigned to a VM.
 func AssignPCIDevice(ctx context.Context, c *Client, hostName, address, vmName string) error {
 	return c.Execute(ctx,

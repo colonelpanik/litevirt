@@ -622,44 +622,17 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		}
 	}
 
-	// Generate libvirt domain XML
-	vmCfg := lv.VMConfig{
-		Name:         spec.Name,
-		UUID:         spec.Uuid,
-		CPU:          int(spec.Cpu),
-		CPUMode:      spec.CpuMode,
-		MemoryMiB:    int(spec.MemoryMib),
-		MinMemoryMiB: int(spec.MinMemoryMib),
-		MaxMemoryMiB: int(spec.MaxMemoryMib),
-		Machine:      spec.Machine,
-		Firmware:     spec.Firmware,
-		GuestAgent:   spec.GuestAgent,
-		EnableVNC:    !spec.DisableVnc,
-		EnableSPICE:  spec.EnableSpice,
-		Disks:        diskConfigs,
-		Networks:     netConfigs,
-		CloudInitISO: cloudInitISO,
-		Boot:         spec.Boot,
-	}
+	// Generate libvirt domain XML from the shared builder (identical field mapping to
+	// a redefine — see baseDomainConfig). Cloud-init ISO is a create-time artifact set
+	// here, not in the shared builder.
+	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
+	vmCfg.CloudInitISO = cloudInitISO
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
 	if err := s.applyFirmwareConfig(&vmCfg, spec); err != nil {
 		cleanupDisks()
 		return nil, err
-	}
-	if r := spec.Resources; r != nil {
-		vmCfg.HugePages = r.Hugepages
-		vmCfg.IOThreads = int(r.IoThreads)
-		for _, pin := range r.CpuPinning {
-			vmCfg.CPUPinning = append(vmCfg.CPUPinning, int(pin))
-		}
-		if np := r.NumaPolicy; np != nil {
-			vmCfg.NUMAPolicy = &lv.NUMAPolicy{
-				PreferredNode: int(np.PreferredNode),
-				Strict:        np.Strict,
-			}
-		}
 	}
 
 	// PCI device passthrough.
@@ -2228,6 +2201,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 	}
 
+	// Snapshot fields whose change would take the redefine off the CPU/memory-only
+	// fast path (an inactive-XML patch that preserves libvirt-assigned addresses).
+	origDisableVnc := spec.DisableVnc
+
 	// LIVE metadata fields — applied whether the VM is running or stopped. The
 	// reconciler/vmcheck read these fresh from the spec each sweep, so no redefine
 	// is needed. A nil restart means "unchanged"; restart.condition=="none"|""
@@ -2259,6 +2236,15 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
 		req.SecureBoot != nil || req.Tpm != nil
+	// A CPU/memory(+bounds)-only redefine can be applied by patching the inactive
+	// domain XML in place rather than regenerating it, so libvirt-assigned details
+	// (PCI slot addresses, controller models) survive — which matters for guests
+	// (e.g. Windows) that key licensing off stable hardware addresses. Any other
+	// redefine-class change (machine/firmware/SB/TPM/guest-agent/cpu-mode/VNC) needs
+	// full regeneration.
+	cpuMemOnly := redefine && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
+		req.DisableVnc == origDisableVnc
 	if redefine {
 		if vm.State != "stopped" {
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -2404,54 +2390,63 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		})
 	}
 
-	// Regenerate domain XML.
-	vmCfg := lv.VMConfig{
-		Name:        spec.Name,
-		UUID:        spec.Uuid,
-		CPU:         int(spec.Cpu),
-		CPUMode:     spec.CpuMode,
-		MemoryMiB:   int(spec.MemoryMib),
-		Machine:     spec.Machine,
-		Firmware:    spec.Firmware,
-		GuestAgent:  spec.GuestAgent,
-		EnableVNC:   !spec.DisableVnc,
-		EnableSPICE: spec.EnableSpice,
-		Disks:       diskConfigs,
-		Networks:    netConfigs,
-		Boot:        spec.Boot,
+	// Rebuild PCI passthrough <hostdev>s from AUTHORITATIVE ownership (PR 0): the old
+	// inline builder omitted them, so any `lv update` of a stopped VM silently
+	// detached its GPU/NIC. A device the VM still owns that has vanished from the
+	// host is a hard failure — never boot the guest missing its passthrough device.
+	liveDevs, tombstonedDevs, err := corrosion.VMDeviceOwnership(ctx, s.db, s.hostName, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read PCI ownership for %q: %v", req.Name, err)
 	}
-	// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
-	// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
-	// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no
-	// create-time guard), so existing nvram is reused. A SB toggle was capability-
-	// checked above; verify the host can still satisfy it.
-	if spec.SecureBoot && !s.firmware.SecureBootAvailable() {
+	if len(tombstonedDevs) > 0 {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"host %s has no Secure Boot OVMF firmware; cannot redefine %q with Secure Boot", s.hostName, req.Name)
+			"cannot redefine %q: assigned PCI device(s) %v have vanished from host %s; resolve the missing hardware before updating",
+			req.Name, tombstonedDevs, s.hostName)
 	}
-	if spec.Tpm {
-		if err := s.checkTPMHostSupport(); err != nil {
-			return nil, err
-		}
-	}
-	s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
-	if r := spec.Resources; r != nil {
-		vmCfg.HugePages = r.Hugepages
-		vmCfg.IOThreads = int(r.IoThreads)
-		for _, pin := range r.CpuPinning {
-			vmCfg.CPUPinning = append(vmCfg.CPUPinning, int(pin))
-		}
-		if np := r.NumaPolicy; np != nil {
-			vmCfg.NUMAPolicy = &lv.NUMAPolicy{
-				PreferredNode: int(np.PreferredNode),
-				Strict:        np.Strict,
+	// CPU/memory-only fast path: patch the inactive XML in place so libvirt-assigned
+	// details survive. Falls back to full regeneration if the domain can't be dumped
+	// or the patch doesn't apply (both correct — regeneration now includes Min/Max
+	// memory + hostdevs).
+	var domXML string
+	if cpuMemOnly {
+		if inactiveXML, derr := s.virt.DumpXMLInactive(req.Name); derr == nil {
+			if patched, perr := lv.PatchInactiveResources(inactiveXML, int(spec.Cpu), int(spec.MemoryMib), int(spec.MaxMemoryMib)); perr == nil {
+				domXML = patched
+			} else {
+				slog.Warn("inactive-XML patch failed; regenerating", "vm", req.Name, "error", perr)
 			}
 		}
 	}
+	if domXML == "" {
+		var hostdevs []lv.HostdevConfig
+		for _, addr := range liveDevs {
+			hostdevs = append(hostdevs, lv.HostdevConfig{Address: addr})
+		}
+		// Regenerate domain XML from the shared builder (MinMemoryMiB/MaxMemoryMiB +
+		// Hostdevs are populated here — the fields the old inline redefine builder
+		// dropped, collapsing the balloon ceiling and detaching passthrough).
+		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
+		// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
+		// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
+		// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no
+		// create-time guard), so existing nvram is reused. A SB toggle was capability-
+		// checked above; verify the host can still satisfy it.
+		if spec.SecureBoot && !s.firmware.SecureBootAvailable() {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"host %s has no Secure Boot OVMF firmware; cannot redefine %q with Secure Boot", s.hostName, req.Name)
+		}
+		if spec.Tpm {
+			if err := s.checkTPMHostSupport(); err != nil {
+				return nil, err
+			}
+		}
+		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
 
-	domXML, err := lv.GenerateDomainXML(vmCfg)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		var gerr error
+		domXML, gerr = lv.GenerateDomainXML(vmCfg)
+		if gerr != nil {
+			return nil, status.Errorf(codes.Internal, "generate domain XML: %v", gerr)
+		}
 	}
 
 	// Capture the current domain XML so a failure below can restore it: libvirt

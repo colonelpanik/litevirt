@@ -226,6 +226,38 @@ func TestClassify_Mixed_CPUAndCeiling_RestartWins(t *testing.T) {
 	}
 }
 
+// Regression: the STORED spec carries create-time defaults + server-assigned fields
+// (machine, firmware, boot, resolved placement, uuid) that the compose-built DESIRED
+// spec leaves unset. A cpu-only bump must classify as Live — the unset machine/firmware
+// must NOT read as a redefine and block the in-place update. (Found via e2e on real
+// hardware: an in-place cpu grow was refused with "machine-type change needs a redefine".)
+func TestClassify_ServerDefaultedFields_DoNotFalsePositive(t *testing.T) {
+	// Stored: what CreateVM persisted (compose cpu=1,max-cpu=2,mem=256,max-mem=512 +
+	// server defaults).
+	stored := &pb.VMSpec{
+		Name: "app", Image: "cirros", Cpu: 1, MaxCpu: 2, MemoryMib: 256, MaxMemoryMib: 512,
+		Machine: "q35", Firmware: "uefi", Boot: "disk", GuestAgent: true,
+		Uuid:      "aad2e0bb-3311-42a9-92f9-4062205a4dc1",
+		Placement: &pb.PlacementSpec{Host: "node-1"},
+		Update:    &pb.UpdatePolicy{Strategy: "in-place"},
+	}
+	// Desired: what BuildVMSpec produces from the same compose with cpu bumped 1→2 —
+	// machine/firmware/placement/uuid all UNSET.
+	desired := &pb.VMSpec{
+		Name: "app", Image: "cirros", Cpu: 2, MaxCpu: 2, MemoryMib: 256, MaxMemoryMib: 512,
+		Boot: "disk", GuestAgent: true,
+		Update: &pb.UpdatePolicy{Strategy: "in-place"},
+	}
+	p := Classify(desired, stored, StoredDisksFromSpec(stored))
+	if got := p.Max(); got != ActionLive {
+		t.Fatalf("cpu bump against a server-defaulted stored spec: Max()=%v (reasons restart=%v recreate=%v), want Live",
+			got, p.RestartReasons, p.RecreateReasons)
+	}
+	if len(p.ResourceChanges) != 1 || p.ResourceChanges[0].Field != "cpu" {
+		t.Fatalf("expected exactly the cpu resource change, got %+v", p.ResourceChanges)
+	}
+}
+
 func TestClassify_Delegated_NotAnUpdateAction(t *testing.T) {
 	d := baseSpec()
 	d.Loadbalancer = &pb.LBSpec{Vip: "10.0.0.1"}

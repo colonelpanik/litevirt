@@ -121,8 +121,16 @@ func (p ChangePlan) Max() Action {
 // projection) and returns the classified ChangePlan. It is a pure function over
 // neutral types (gen-package protos + StoredDisk) so it lives in compose without
 // importing corrosion, and the planner — which owns the cluster-state snapshot —
-// calls it after building the projection. A nil stored spec is treated as an
-// empty spec (every set field reads as a change).
+// calls it after building the projection.
+//
+// Inherit-on-unset: an UNSET desired scalar/pointer/slice (zero string, zero int,
+// nil message, empty slice) means "compose did not specify it" and is treated as NO
+// change — matching compose's documented merge semantics ("child wins if non-zero;
+// zero-value inherits"). This is essential because the STORED spec carries create-time
+// defaults + server-assigned values (machine, firmware, resolved placement, uuid…)
+// that the compose-built desired spec leaves unset; a naive equality would spuriously
+// flag every such field as a change and wrongly block an in-place update. A nil stored
+// spec is treated as empty.
 func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	var p ChangePlan
 	if desired == nil {
@@ -132,8 +140,8 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 		stored = &pb.VMSpec{}
 	}
 
-	// --- Live resources: cpu ---
-	if desired.Cpu != stored.Cpu {
+	// --- Live resources: cpu (unset desired inherits) ---
+	if desired.Cpu != 0 && desired.Cpu != stored.Cpu {
 		delta := Delta{Field: "cpu", Old: fmt.Sprintf("%d", stored.Cpu), New: fmt.Sprintf("%d", desired.Cpu)}
 		switch {
 		case desired.Cpu < stored.Cpu:
@@ -147,8 +155,8 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 		}
 	}
 
-	// --- Live resources: memory (balloon within the domain's band) ---
-	if desired.MemoryMib != stored.MemoryMib {
+	// --- Live resources: memory balloon within the domain's band (unset inherits) ---
+	if desired.MemoryMib != 0 && desired.MemoryMib != stored.MemoryMib {
 		floor := stored.MinMemoryMib
 		ceiling := stored.MaxMemoryMib
 		if ceiling == 0 {
@@ -163,60 +171,65 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 		}
 	}
 
-	// --- Restart-class: redefine-only fields (no live-apply RPC) ---
+	// --- Restart-class: redefine-only fields (no live-apply RPC); unset desired inherits ---
 	restartIf := func(cond bool, reason string) {
 		if cond {
 			p.RestartReasons = append(p.RestartReasons, reason)
 		}
 	}
-	restartIf(desired.MaxCpu != stored.MaxCpu, fmt.Sprintf("max_cpu %d→%d needs a redefine", stored.MaxCpu, desired.MaxCpu))
-	restartIf(desired.MinMemoryMib != stored.MinMemoryMib, "min-memory change needs a redefine")
-	restartIf(desired.MaxMemoryMib != stored.MaxMemoryMib, "max-memory change needs a redefine")
-	restartIf(desired.CpuMode != stored.CpuMode, "cpu-mode change needs a redefine")
-	restartIf(desired.Machine != stored.Machine, "machine-type change needs a redefine")
-	restartIf(desired.Firmware != stored.Firmware, "firmware change needs a redefine")
+	restartIf(desired.MaxCpu != 0 && desired.MaxCpu != stored.MaxCpu, fmt.Sprintf("max_cpu %d→%d needs a redefine", stored.MaxCpu, desired.MaxCpu))
+	restartIf(desired.MinMemoryMib != 0 && desired.MinMemoryMib != stored.MinMemoryMib, "min-memory change needs a redefine")
+	restartIf(desired.MaxMemoryMib != 0 && desired.MaxMemoryMib != stored.MaxMemoryMib, "max-memory change needs a redefine")
+	restartIf(desired.CpuMode != "" && desired.CpuMode != stored.CpuMode, "cpu-mode change needs a redefine")
+	restartIf(desired.Machine != "" && desired.Machine != stored.Machine, "machine-type change needs a redefine")
+	restartIf(desired.Firmware != "" && desired.Firmware != stored.Firmware, "firmware change needs a redefine")
+	// Bools carry no "unset" sentinel; BuildVMSpec applies the same defaults the create
+	// path stores (e.g. guest-agent via EffectiveGuestAgent), so an equality compare is
+	// safe and won't false-positive on a server default.
 	restartIf(desired.GuestAgent != stored.GuestAgent, "guest-agent toggle needs a redefine")
 	restartIf(desired.DisableVnc != stored.DisableVnc || desired.EnableSpice != stored.EnableSpice, "graphics change needs a redefine")
 	restartIf(desired.SecureBoot != stored.SecureBoot, "secure-boot change needs a redefine")
 	restartIf(desired.Tpm != stored.Tpm, "tpm change needs a redefine")
-	restartIf(desired.StopTimeoutSec != stored.StopTimeoutSec, "stop-grace-period change needs a redefine")
-	restartIf(!proto.Equal(desired.Resources, stored.Resources), "resource-tuning change needs a redefine")
-	restartIf(!proto.Equal(desired.Healthcheck, stored.Healthcheck), "health-check change needs a redefine")
-	restartIf(!proto.Equal(desired.Hooks, stored.Hooks), "lifecycle-hooks change needs a redefine")
-	restartIf(!devicesEqual(desired.Devices, stored.Devices), "passthrough-device change needs a redefine")
+	restartIf(desired.StopTimeoutSec != 0 && desired.StopTimeoutSec != stored.StopTimeoutSec, "stop-grace-period change needs a redefine")
+	restartIf(desired.Resources != nil && !proto.Equal(desired.Resources, stored.Resources), "resource-tuning change needs a redefine")
+	restartIf(desired.Healthcheck != nil && !proto.Equal(desired.Healthcheck, stored.Healthcheck), "health-check change needs a redefine")
+	restartIf(desired.Hooks != nil && !proto.Equal(desired.Hooks, stored.Hooks), "lifecycle-hooks change needs a redefine")
+	restartIf(len(desired.Devices) > 0 && !devicesEqual(desired.Devices, stored.Devices), "passthrough-device change needs a redefine")
 
-	// --- Recreate-class: identity fields (delete+create only) ---
+	// --- Recreate-class: identity fields (delete+create only); unset desired inherits ---
 	recreateIf := func(cond bool, reason string) {
 		if cond {
 			p.RecreateReasons = append(p.RecreateReasons, reason)
 		}
 	}
-	recreateIf(desired.Image != stored.Image, fmt.Sprintf("image %q→%q recreates", stored.Image, desired.Image))
-	recreateIf(desired.Iso != stored.Iso, "boot-media (iso) change recreates")
-	recreateIf(!disksTopologyEqual(StoredDisksFromSpec(desired), storedDisks), "disk-topology change recreates")
-	recreateIf(!networkTopologyEqual(desired.Network, stored.Network), "network-topology change recreates")
-	recreateIf(!proto.Equal(desired.CloudInit, stored.CloudInit), "cloud-init change recreates")
+	recreateIf(desired.Image != "" && desired.Image != stored.Image, fmt.Sprintf("image %q→%q recreates", stored.Image, desired.Image))
+	recreateIf(desired.Iso != "" && desired.Iso != stored.Iso, "boot-media (iso) change recreates")
+	if dd := StoredDisksFromSpec(desired); len(dd) > 0 {
+		recreateIf(!disksTopologyEqual(dd, storedDisks), "disk-topology change recreates")
+	}
+	recreateIf(len(desired.Network) > 0 && !networkTopologyEqual(desired.Network, stored.Network), "network-topology change recreates")
+	recreateIf(desired.CloudInit != nil && !proto.Equal(desired.CloudInit, stored.CloudInit), "cloud-init change recreates")
 
-	// --- Live metadata: spec-persisted, no runtime action ---
+	// --- Live metadata: spec-persisted, no runtime action; unset desired inherits ---
 	metaIf := func(cond bool, field, old, new string) {
 		if cond {
 			p.MetadataChanges = append(p.MetadataChanges, Delta{Field: field, Old: old, New: new})
 		}
 	}
-	metaIf(!proto.Equal(desired.Restart, stored.Restart), "restart", stored.Restart.GetCondition(), desired.Restart.GetCondition())
+	metaIf(desired.Restart != nil && !proto.Equal(desired.Restart, stored.Restart), "restart", stored.Restart.GetCondition(), desired.Restart.GetCondition())
 	metaIf(desired.Onboot != stored.Onboot, "onboot", fmt.Sprintf("%v", stored.Onboot), fmt.Sprintf("%v", desired.Onboot))
 	metaIf(desired.StartupOrder != stored.StartupOrder, "startup_order", fmt.Sprintf("%d", stored.StartupOrder), fmt.Sprintf("%d", desired.StartupOrder))
 	metaIf(desired.StartDelaySec != stored.StartDelaySec, "start_delay", fmt.Sprintf("%d", stored.StartDelaySec), fmt.Sprintf("%d", desired.StartDelaySec))
 	metaIf(desired.StopDelaySec != stored.StopDelaySec, "stop_delay", fmt.Sprintf("%d", stored.StopDelaySec), fmt.Sprintf("%d", desired.StopDelaySec))
-	metaIf(!maps.Equal(desired.Labels, stored.Labels), "labels", "", "")
-	metaIf(!proto.Equal(desired.Placement, stored.Placement), "placement", "", "")
-	metaIf(!proto.Equal(desired.Migrate, stored.Migrate), "migrate", "", "")
+	metaIf(len(desired.Labels) > 0 && !maps.Equal(desired.Labels, stored.Labels), "labels", "", "")
+	metaIf(desired.Placement != nil && !proto.Equal(desired.Placement, stored.Placement), "placement", "", "")
+	metaIf(desired.Migrate != nil && !proto.Equal(desired.Migrate, stored.Migrate), "migrate", "", "")
 
 	// --- Delegated: owned by another path, recorded not ignored ---
-	if !proto.Equal(desired.Loadbalancer, stored.Loadbalancer) {
+	if desired.Loadbalancer != nil && !proto.Equal(desired.Loadbalancer, stored.Loadbalancer) {
 		p.Delegated = append(p.Delegated, "load-balancer")
 	}
-	if !proto.Equal(desired.Update, stored.Update) {
+	if desired.Update != nil && !proto.Equal(desired.Update, stored.Update) {
 		p.Delegated = append(p.Delegated, "update-strategy")
 	}
 

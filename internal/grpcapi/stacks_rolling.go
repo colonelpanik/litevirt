@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -23,21 +26,45 @@ type serverOps struct {
 
 var _ rolling.Ops = (*serverOps)(nil)
 
-func (o *serverOps) RecreateVM(ctx context.Context, name string, f *compose.File) error {
-	// Delete old VM (ignore if already gone).
-	_, _ = o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: name})
-
-	vmDef, baseName := compose.FindVMDef(f, name)
-	if vmDef == nil {
-		return fmt.Errorf("VM %q not found in compose file", name)
+// recreateAs deletes the VM named `target` (failing on any error other than
+// not-found — a delete that couldn't tear down must NOT be followed by a create that
+// leaves the old runtime alive) then creates it from a clone of `desired` renamed to
+// `target`. It DESTROYS the target's disks, so the rolling engine only reaches it
+// under an explicit recreate-class strategy.
+func (o *serverOps) recreateAs(ctx context.Context, target string, desired *pb.VMSpec) error {
+	if desired == nil {
+		return fmt.Errorf("recreate %q: no desired spec", target)
 	}
-	spec, err := compose.BuildVMSpec(name, baseName, vmDef, f)
-	if err != nil {
-		return fmt.Errorf("build spec for %s: %w", name, err)
+	if _, err := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: target}); err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("delete %s before recreate: %w", target, err)
 	}
-
-	_, err = o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	spec := proto.Clone(desired).(*pb.VMSpec)
+	spec.Name = target
+	_, err := o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
 	return err
+}
+
+func (o *serverOps) RecreateVM(ctx context.Context, name string, desired *pb.VMSpec) error {
+	return o.recreateAs(ctx, name, desired)
+}
+
+func (o *serverOps) CreateNextVM(ctx context.Context, name string, desired *pb.VMSpec) error {
+	return o.recreateAs(ctx, name+"-next", desired)
+}
+
+func (o *serverOps) ResizeVMLive(ctx context.Context, name string, desired *pb.VMSpec) error {
+	return o.s.resizeVMLive(ctx, name, desired, "")
+}
+
+func (o *serverOps) ApplyLiveMetadata(ctx context.Context, name string, desired *pb.VMSpec, fields []string) error {
+	return o.s.applyLiveMetadata(ctx, name, desired, fields)
+}
+
+func (o *serverOps) DeleteVM(ctx context.Context, name string) error {
+	if _, err := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: name}); err != nil && status.Code(err) != codes.NotFound {
+		return err
+	}
+	return nil
 }
 
 func (o *serverOps) StopVM(ctx context.Context, name string) error {
@@ -54,32 +81,6 @@ func (o *serverOps) WaitHealthy(ctx context.Context, name string, timeout time.D
 	return o.s.waitForCondition(ctx, name, fmt.Sprintf("healthy:%s", timeout))
 }
 
-func (o *serverOps) HotModifyVM(ctx context.Context, name string, cpu, memMiB int) error {
-	_, err := o.s.UpdateVM(ctx, &pb.UpdateVMRequest{
-		Name:      name,
-		Cpu:       int32(cpu),
-		MemoryMib: int32(memMiB),
-	})
-	return err
-}
-
-func (o *serverOps) CreateNextVM(ctx context.Context, name string, f *compose.File) error {
-	nextName := name + "-next"
-	// Delete any stale -next VM.
-	_, _ = o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: nextName})
-
-	vmDef, baseName := compose.FindVMDef(f, name)
-	if vmDef == nil {
-		return fmt.Errorf("VM %q not found in compose file", name)
-	}
-	spec, err := compose.BuildVMSpec(nextName, baseName, vmDef, f)
-	if err != nil {
-		return fmt.Errorf("build spec for %s: %w", nextName, err)
-	}
-	_, err = o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
-	return err
-}
-
 // useRollingUpdate returns the update strategy if the compose file specifies
 // a non-recreate strategy, or "" if inline recreate should be used.
 func useRollingUpdate(f *compose.File) string {
@@ -91,13 +92,19 @@ func useRollingUpdate(f *compose.File) string {
 	return ""
 }
 
-// getOldComposeYAML fetches the previously stored compose YAML for rollback.
-func (s *Server) getOldComposeYAML(ctx context.Context, stackName string) string {
-	st, err := corrosion.GetStack(ctx, s.db, stackName)
-	if err != nil || st == nil {
-		return ""
+// vmUpdateDef returns the effective update strategy for a VM: its own `update:`
+// block, else the stack default (first VM with an explicit update block), else
+// recreate.
+func vmUpdateDef(f *compose.File, name string) compose.UpdateDef {
+	if def, _ := compose.FindVMDef(f, name); def != nil && def.Update != nil {
+		return *def.Update
 	}
-	return st.ComposeYAML
+	for _, vm := range f.VMs {
+		if vm.Update != nil {
+			return *vm.Update
+		}
+	}
+	return compose.UpdateDef{Strategy: "recreate"}
 }
 
 // executeInlineActions processes all VM actions sequentially using inline
@@ -233,7 +240,10 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 		_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: action.VMName, ProgressPct: 100})
 	}
 
-	// Rolling updates (VMs only).
+	// Rolling updates (VMs only). Fail-fast: a rolling error returns BEFORE the
+	// scale-down deletes below, so a failed update never deletes a VM the update
+	// didn't intend to, and the Deploy handler skips UpsertStack on the returned
+	// error — leaving the prior stack record/hash untouched.
 	if len(updates) > 0 {
 		strategy := useRollingUpdate(f)
 		_ = stream.Send(&pb.DeployProgress{
@@ -241,23 +251,43 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 			Detail: fmt.Sprintf("strategy=%s vms=%d", strategy, len(updates)),
 		})
 
-		oldYAML := s.getOldComposeYAML(ctx, f.Name)
-		ops := &serverOps{s: s}
-		ch := rolling.Update(ctx, s.db, ops, f.Name, f, oldYAML)
-
-		for prog := range ch {
-			phase := prog.Phase
-			detail := prog.Detail
-			errStr := ""
-			if prog.Err != nil {
-				errStr = prog.Err.Error()
+		// Skip VMs on draining/fenced hosts — drain handles those separately (#19).
+		drainingHosts := map[string]bool{}
+		if hosts, herr := corrosion.ListHosts(ctx, s.db); herr == nil {
+			for _, h := range hosts {
+				if h.State == "draining" || h.State == "fenced" {
+					drainingHosts[h.Name] = true
+				}
 			}
-			_ = stream.Send(&pb.DeployProgress{
-				Phase:  phase,
-				VmName: prog.VMName,
-				Detail: detail,
-				Error:  errStr,
+		}
+
+		actions := make([]rolling.VMAction, 0, len(updates))
+		for _, a := range updates {
+			if drainingHosts[a.TargetHost] {
+				_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: a.VMName, Detail: "skipped — host is draining/fenced"})
+				continue
+			}
+			actions = append(actions, rolling.VMAction{
+				Name:     a.VMName,
+				Strategy: vmUpdateDef(f, a.VMName),
+				Plan:     a.Plan,
+				Desired:  a.Spec,
 			})
+		}
+
+		if len(actions) > 0 {
+			ops := &serverOps{s: s}
+			rerr := rolling.Run(ctx, ops, f.Name, actions, func(p rolling.Progress) {
+				errStr := ""
+				if p.Err != nil {
+					errStr = p.Err.Error()
+				}
+				_ = stream.Send(&pb.DeployProgress{Phase: p.Phase, VmName: p.VMName, Detail: p.Detail, Error: errStr})
+			})
+			if rerr != nil {
+				s.audit(ctx, "stack.rolling_update", f.Name, rerr.Error(), "error")
+				return rerr
+			}
 		}
 	}
 

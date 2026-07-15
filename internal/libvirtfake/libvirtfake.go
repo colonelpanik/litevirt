@@ -72,9 +72,13 @@ type Fake struct {
 	FailCreateLiveSnapshot func(domain, snap string) error
 	FailDomainState        func(name string) error
 	FailDomainStateReason  func(name string) error
-	FailMigrateToTarget    func(name, dconnuri string) error
-	FailBlockPull          func(domain, disk string) error
-	FailPoolDestroy        func(name string) error
+	// FailSetVCPUs / FailSetMemory inject a resize primitive failure so scenarios
+	// can exercise partial-apply recovery (e.g. cpu ok, mem fails).
+	FailSetVCPUs        func(name string, count int) error
+	FailSetMemory       func(name string, memMiB int) error
+	FailMigrateToTarget func(name, dconnuri string) error
+	FailBlockPull       func(domain, disk string) error
+	FailPoolDestroy     func(name string) error
 	// BlockJobStatusFn lets a scenario script block-job progress. Nil =
 	// "no job in progress" (Found=false), i.e. the pull is already done —
 	// the simplest happy path for the live-restore blockpull poll.
@@ -555,6 +559,11 @@ func (f *Fake) ThawGuest(domainName string) error {
 }
 
 func (f *Fake) SetMemory(domainName string, memMiB int) error {
+	if f.FailSetMemory != nil {
+		if err := f.FailSetMemory(domainName, memMiB); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("set-memory", domainName, fmt.Sprintf("%d", memMiB))
@@ -562,6 +571,11 @@ func (f *Fake) SetMemory(domainName string, memMiB int) error {
 }
 
 func (f *Fake) SetVCPUs(name string, count int) error {
+	if f.FailSetVCPUs != nil {
+		if err := f.FailSetVCPUs(name, count); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("set-vcpus", name, fmt.Sprintf("%d", count))

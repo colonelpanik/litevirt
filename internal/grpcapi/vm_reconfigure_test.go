@@ -176,6 +176,35 @@ func TestUpdateVM_RedefineOnStopped_Persists(t *testing.T) {
 	}
 }
 
+// (5b) a redefine-class change on a RUNNING VM is refused without --restart-if-needed,
+// and with it does a stop → redefine → start (the VM ends running with the new spec).
+func TestUpdateVM_RestartIfNeeded(t *testing.T) {
+	s := reconfigServer(t)
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, "rr", "test-host", "running",
+		seedSpecJSON(t, &pb.VMSpec{Name: "rr", Cpu: 2, MemoryMib: 2048}))
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>rr</name><memory unit='KiB'>2097152</memory><vcpu>2</vcpu></domain>`); err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+
+	// Running + no allow_restart → refused.
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rr", MemoryMib: 4096}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("running redefine without --restart-if-needed: want FailedPrecondition, got %v", err)
+	}
+
+	// With allow_restart → stop, redefine, start.
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rr", MemoryMib: 4096, AllowRestart: proto.Bool(true)}); err != nil {
+		t.Fatalf("restart-if-needed: %v", err)
+	}
+	vm, _ := corrosion.GetVM(ctx, s.db, "rr")
+	if vm.State != "running" {
+		t.Errorf("VM should be running after a restart-if-needed reconfigure, got %s", vm.State)
+	}
+	if spec := loadStoredSpec(t, s, "rr"); spec.MemoryMib != 4096 {
+		t.Errorf("memory not applied: %d, want 4096", spec.MemoryMib)
+	}
+}
+
 // (6) absent fields are left unchanged (a metadata-only update preserves resources).
 func TestUpdateVM_AbsentFieldsUnchanged(t *testing.T) {
 	s := reconfigServer(t)

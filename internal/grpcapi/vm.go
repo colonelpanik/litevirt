@@ -2495,11 +2495,36 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	cpuMemOnly := redefine && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
 		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
+	restartAfter := false
 	if redefine {
 		if vm.State != "stopped" {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"VM %q must be stopped to change cpu/memory/machine/firmware/mem-bounds (current: %s); restart policy, onboot and startup ordering can be changed live",
-				req.Name, vm.State)
+			// UpdateVM NEVER restarts implicitly. A redefine-class change on a running
+			// VM is refused unless --restart-if-needed (allow_restart), which does a
+			// stop → redefine → start under ONE VM lock.
+			if req.AllowRestart == nil || !*req.AllowRestart {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"VM %q must be stopped to change cpu/memory/machine/firmware/mem-bounds (current: %s); pass --restart-if-needed to reconfigure with a restart",
+					req.Name, vm.State)
+			}
+			unlock := s.lockVM(req.Name)
+			defer unlock()
+			fresh, gerr := corrosion.GetVM(ctx, s.db, req.Name)
+			if gerr != nil || fresh == nil {
+				return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+			}
+			if fresh.HostName != s.hostName {
+				return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, fresh.HostName)
+			}
+			if fresh.ActiveOperationID != "" {
+				return nil, status.Errorf(codes.FailedPrecondition, "cannot reconfigure %q: an operation is in progress", req.Name)
+			}
+			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
+				return nil, serr
+			}
+			// Redefine + restart against the fresh (now-stopped) record.
+			vm = fresh
+			vm.State = "stopped"
+			restartAfter = true
 		}
 		if req.Cpu > 0 {
 			spec.Cpu = req.Cpu
@@ -2775,6 +2800,15 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 
 	slog.Info("VM spec updated", "vm", req.Name, "cpu", spec.Cpu, "memory_mib", spec.MemoryMib, "disable_vnc", spec.DisableVnc)
 	s.recordVMEvent(ctx, req.Name, "vm.updated", "ok", fmt.Sprintf("cpu=%d mem=%d vnc=%v", spec.Cpu, spec.MemoryMib, !spec.DisableVnc))
+
+	// --restart-if-needed: bring the VM back up through the shared start primitive
+	// (still holding the VM lock taken above), completing the stop → redefine → start.
+	if restartAfter {
+		if _, serr := s.startVMLocked(ctx, vm); serr != nil {
+			return nil, status.Errorf(codes.Internal, "reconfigured %q but restart failed (VM left stopped): %v", req.Name, serr)
+		}
+		s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "reconfigure --restart-if-needed")
+	}
 
 	return s.vmToProto(ctx, req.Name)
 }

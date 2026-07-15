@@ -25,15 +25,16 @@ func newUpdateCmd() *cobra.Command {
 		startDelay   int32
 		stopDelay    int32
 		// redefine-class (require the VM stopped)
-		machine    string
-		firmware   string
-		guestAgent bool
-		minMem     int32
-		maxMem     int32
-		maxCPU     int32
-		secureBoot bool
-		tpm        bool
-		force      bool
+		machine         string
+		firmware        string
+		guestAgent      bool
+		minMem          int32
+		maxMem          int32
+		maxCPU          int32
+		secureBoot      bool
+		tpm             bool
+		force           bool
+		restartIfNeeded bool
 	)
 	cmd := &cobra.Command{
 		Use:   "update <vm>",
@@ -95,6 +96,9 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 			}
 			if f.Changed("max-cpu") {
 				req.MaxCpu = &maxCPU
+			}
+			if f.Changed("restart-if-needed") {
+				req.AllowRestart = &restartIfNeeded
 			}
 			if f.Changed("secure-boot") {
 				req.SecureBoot = &secureBoot
@@ -159,5 +163,6 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 	cmd.Flags().BoolVar(&secureBoot, "secure-boot", false, "Enable/disable UEFI Secure Boot (VM must be stopped; --force if firmware state exists)")
 	cmd.Flags().BoolVar(&tpm, "tpm", false, "Enable/disable the emulated TPM 2.0 (VM must be stopped; --force if TPM state exists)")
 	cmd.Flags().BoolVar(&force, "force", false, "Allow toggling secure-boot/tpm even when firmware state exists")
+	cmd.Flags().BoolVar(&restartIfNeeded, "restart-if-needed", false, "Permit a stop→redefine→start for a change that can't apply live (cpu shrink, machine/firmware, beyond the vCPU ceiling)")
 	return cmd
 }

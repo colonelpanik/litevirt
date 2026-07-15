@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -53,7 +54,33 @@ func (o *serverOps) CreateNextVM(ctx context.Context, name string, desired *pb.V
 }
 
 func (o *serverOps) ResizeVMLive(ctx context.Context, name string, desired *pb.VMSpec) error {
-	return o.s.resizeVMLive(ctx, name, desired, "")
+	// Route through the owner-forwarding RPCs so a rolling in-place resize works when
+	// the VM is on a peer of the deploy entry node (resizeVMLive itself is owner-local
+	// and aborts on a non-owner). UpdateVM does the live cpu grow (gated on live_resize)
+	// and SetVMMemory the balloon — both forward to the owner. Only the changed
+	// dimension(s) are sent: an unchanged cpu would take UpdateVM off its live fast path
+	// onto the stopped-redefine path.
+	vm, err := corrosion.GetVM(ctx, o.s.db, name)
+	if err != nil || vm == nil {
+		return status.Errorf(codes.NotFound, "VM %q not found", name)
+	}
+	cur := &pb.VMSpec{}
+	if vm.Spec != "" {
+		if uerr := json.Unmarshal([]byte(vm.Spec), cur); uerr != nil {
+			return status.Errorf(codes.Internal, "parse stored spec for %q: %v", name, uerr)
+		}
+	}
+	if desired.Cpu != 0 && desired.Cpu != cur.Cpu {
+		if _, err := o.s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: name, Cpu: desired.Cpu}); err != nil {
+			return err
+		}
+	}
+	if desired.MemoryMib != 0 && desired.MemoryMib != cur.MemoryMib {
+		if _, err := o.s.SetVMMemory(ctx, &pb.SetVMMemoryRequest{Name: name, TargetMib: desired.MemoryMib}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (o *serverOps) ApplyLiveMetadata(ctx context.Context, name string, desired *pb.VMSpec, fields []string) error {

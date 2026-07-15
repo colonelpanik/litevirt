@@ -37,6 +37,37 @@ func TestExecuteWithRollingUpdates_InPlaceRecreate_FailsNoDelete(t *testing.T) {
 	}
 }
 
+// A combined cpu+mem in-place update applies BOTH dimensions live (via the owner-
+// forwarding UpdateVM + SetVMMemory decomposition) without deleting the VM.
+func TestExecuteWithRollingUpdates_InPlaceCombined_AppliesCpuAndMem(t *testing.T) {
+	s := coordResizeServer(t)
+	ctx := adminCtx()
+	seedRunningVM(t, s, "web", &pb.VMSpec{Name: "web", Cpu: 2, MaxCpu: 8, MemoryMib: 256, MinMemoryMib: 128, MaxMemoryMib: 512}, 2, 256)
+
+	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{
+		"web": {Image: "ubuntu", CPU: 4, Update: &compose.UpdateDef{Strategy: "in-place"}},
+	}}
+	resolved := &planner.ResolvedPlan{StackName: "st", VMs: []planner.VMAction{{
+		Kind: planner.OpUpdate, VMName: "web", TargetHost: "test-host",
+		Spec: &pb.VMSpec{Name: "web", Cpu: 4, MemoryMib: 384},
+		Plan: compose.ChangePlan{ResourceChanges: []compose.Delta{
+			{Field: "cpu", Old: "2", New: "4"}, {Field: "memory", Old: "256", New: "384"},
+		}},
+	}}}
+	stream := &progressStream[pb.DeployProgress]{ctx: ctx}
+
+	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err != nil {
+		t.Fatalf("combined in-place resize: %v", err)
+	}
+	vm, _ := corrosion.GetVM(ctx, s.db, "web")
+	if vm == nil || vm.State != "running" {
+		t.Fatal("VM missing or not running after in-place resize")
+	}
+	if vm.CPUActual != 4 || vm.MemActual != 384 {
+		t.Errorf("actuals = %d/%d, want 4/384", vm.CPUActual, vm.MemActual)
+	}
+}
+
 // A rolling in-place update whose live resize fails propagates the error and does not
 // delete the VM.
 func TestExecuteWithRollingUpdates_InPlaceResizeError_Propagates(t *testing.T) {

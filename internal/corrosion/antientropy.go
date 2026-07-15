@@ -152,15 +152,27 @@ func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string
 	var out []string
 	for _, r := range remote {
 		local, exists := localMap[r.Name]
-		if exists && local.Count == int(r.Count) && local.Hash == r.Hash {
+		if !exists {
+			slog.Info("anti-entropy: drift detected", "peer", peer, "table", r.Name, "local_hash", "", "remote_hash", r.Hash)
+			out = append(out, r.Name)
+			continue
+		}
+		// Pairwise negotiation: compare the order-invariant v2 hash ONLY when BOTH sides
+		// supplied it (⇒ both have digest_v2 enabled); otherwise compare the positional v1
+		// hash. Count is always compared.
+		useV2 := local.HashV2 != "" && r.GetHashV2() != ""
+		var lh, rh string
+		if useV2 {
+			lh, rh = local.HashV2, r.GetHashV2()
+		} else {
+			lh, rh = local.Hash, r.Hash
+		}
+		if local.Count == int(r.Count) && lh == rh {
 			continue // in sync
 		}
-		lh := ""
-		if exists {
-			lh = local.Hash
-		}
 		slog.Info("anti-entropy: drift detected",
-			"peer", peer, "table", r.Name, "local_hash", lh, "remote_hash", r.Hash)
+			"peer", peer, "table", r.Name, "digest", map[bool]string{true: "v2", false: "v1"}[useV2],
+			"local_hash", lh, "remote_hash", rh)
 		out = append(out, r.Name)
 	}
 	return out

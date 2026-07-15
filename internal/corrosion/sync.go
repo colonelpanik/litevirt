@@ -7,9 +7,12 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -1095,7 +1098,10 @@ func repeatPlaceholders(n int) []string {
 type TableDigest struct {
 	Name  string `json:"name"`
 	Count int    `json:"count"`
-	Hash  string `json:"hash"` // truncated SHA-256 of sorted row values
+	Hash  string `json:"hash"` // truncated SHA-256 of sorted v1 (positional) row values
+	// HashV2 is the order-invariant digest_v2 hash — empty unless digest_v2 is enabled
+	// locally AND every row encoded cleanly. Compared only when BOTH peers supply it.
+	HashV2 string `json:"hash_v2,omitempty"`
 }
 
 // StateDigest returns a lightweight fingerprint of each replicated table.
@@ -1109,23 +1115,33 @@ func (c *Client) stateDigestForTables(ctx context.Context, tables []string) ([]T
 	// the lock against writers (incl. the health path).
 	var digests []TableDigest
 	for _, table := range tables {
-		rowKeys, ok := c.digestTableRows(ctx, table)
+		rowKeys, v2Keys, v2ok, ok := c.digestTableRows(ctx, table)
 		if !ok {
 			continue // table may not exist yet
 		}
-		sort.Strings(rowKeys)
-		h := sha256.New()
-		for _, rk := range rowKeys {
-			h.Write([]byte(strconv.Itoa(len(rk)) + ":" + rk)) // length-prefix each row too
-		}
-		digests = append(digests, TableDigest{
+		td := TableDigest{
 			Name:  table,
 			Count: len(rowKeys),
-			Hash:  fmt.Sprintf("%x", h.Sum(nil))[:16],
-		})
+			Hash:  hashRowKeys(rowKeys),
+		}
+		if v2ok {
+			td.HashV2 = hashRowKeys(v2Keys) // order-invariant; sort makes row order irrelevant
+		}
+		digests = append(digests, td)
 	}
 	c.observeDigest(time.Since(start))
 	return digests, nil
+}
+
+// hashRowKeys sorts the per-row encodings (row-order invariance) and length-prefix-hashes
+// them to a truncated SHA-256 — the shared table-hash step for both v1 and v2.
+func hashRowKeys(rowKeys []string) string {
+	sort.Strings(rowKeys)
+	h := sha256.New()
+	for _, rk := range rowKeys {
+		h.Write([]byte(strconv.Itoa(len(rk)) + ":" + rk))
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))[:16]
 }
 
 // digestTableRows reads one table's length-prefixed row encodings into memory
@@ -1139,20 +1155,26 @@ func (c *Client) stateDigestForTables(ctx context.Context, tables []string) ([]T
 // already-converged peers forever — while two nodes with equal row counts but
 // contiguous rowids hashed identically regardless of content, hiding real drift.
 // Hashing content fixes both.
-func (c *Client) digestTableRows(ctx context.Context, table string) ([]string, bool) {
+// digestTableRows returns the per-row v1 (positional) encodings and, when digest_v2 is
+// enabled locally, the per-row v2 (order-invariant) encodings. v2ok is false when v2 is
+// disabled OR any row fails v2 encoding (dup-name / unexpected type) — the table then
+// falls back to a v1-only digest. The v2 keys come from the SAME scan (cols already read),
+// so it's near-free.
+func (c *Client) digestTableRows(ctx context.Context, table string) (v1Keys, v2Keys []string, v2ok, ok bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	rows, err := c.db.QueryContext(ctx, "SELECT * FROM "+table)
 	if err != nil {
-		return nil, false // table may not exist yet
+		return nil, nil, false, false // table may not exist yet
 	}
 	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, false
+		return nil, nil, false, false
 	}
-	var rowKeys []string
+	wantV2 := c.digestV2On()
+	v2ok = wantV2
 	for rows.Next() {
 		vals := make([]interface{}, len(cols))
 		ptrs := make([]interface{}, len(cols))
@@ -1162,9 +1184,20 @@ func (c *Client) digestTableRows(ctx context.Context, table string) ([]string, b
 		if err := rows.Scan(ptrs...); err != nil {
 			continue
 		}
-		rowKeys = append(rowKeys, encodeRowCells(vals))
+		v1Keys = append(v1Keys, encodeRowCells(vals))
+		if v2ok {
+			ek, eerr := encodeRowCellsV2(cols, vals)
+			if eerr != nil {
+				slog.Error("digest_v2: row encode failed — falling back to v1 for this table",
+					"table", table, "error", eerr)
+				v2ok = false
+				v2Keys = nil
+				continue
+			}
+			v2Keys = append(v2Keys, ek)
+		}
 	}
-	return rowKeys, true
+	return v1Keys, v2Keys, v2ok, true
 }
 
 // encodeRowCells produces the canonical, unambiguous encoding of a row's cells —
@@ -1190,6 +1223,130 @@ func encodeRowCells(vals []interface{}) string {
 		}
 	}
 	return sb.String()
+}
+
+// ErrDupColumn marks a row whose column names are not unique — treated as
+// corruption; v2 encoding refuses it and the caller falls back to v1 for that table.
+var ErrDupColumn = errors.New("corrosion: duplicate column name in row")
+
+// encodeRowCellsV2 is the ORDER-INVARIANT row encoding (digest_v2). Unlike the
+// positional encodeRowCells, it pairs each value with its column NAME, sorts pairs by
+// name, and encodes column identity + nullability + a CANONICAL logical value — so two
+// nodes holding the same logical row hash identically even when their physical column
+// order differs (fresh CREATE TABLE vs an upgraded ALTER TABLE ADD COLUMN).
+//
+// Layout, per name-sorted pair: itoa(len(name)) + ":" + name + "=" then either "N;"
+// (NULL, no payload) or "V" + itoa(len(cv)) + ":" + cv where cv = canonicalCellValue(v).
+// Names and values are length-prefixed, so delimiter-like bytes never alias a boundary;
+// NULL ("N;") and empty string ("V0:") are distinct. Duplicate column names → ErrDupColumn.
+//
+// BYTE-FROZEN: pinned by golden vectors (TestEncodeRowCellsV2_GoldenVectors). It does NOT
+// encode cell TYPES — runtime Go types differ by read path (int64 direct-SQL vs float64/
+// json.Number JSON-dump); it encodes the canonical logical value instead.
+func encodeRowCellsV2(cols []string, vals []interface{}) (string, error) {
+	if len(cols) != len(vals) {
+		return "", fmt.Errorf("corrosion: encodeRowCellsV2 col/val length mismatch (%d/%d)", len(cols), len(vals))
+	}
+	type pair struct {
+		name string
+		val  interface{}
+	}
+	pairs := make([]pair, len(cols))
+	seen := make(map[string]struct{}, len(cols))
+	for i, name := range cols {
+		if _, dup := seen[name]; dup {
+			return "", fmt.Errorf("%w: %q", ErrDupColumn, name)
+		}
+		seen[name] = struct{}{}
+		pairs[i] = pair{name: name, val: vals[i]}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].name < pairs[j].name })
+
+	var sb strings.Builder
+	for _, p := range pairs {
+		sb.WriteString(strconv.Itoa(len(p.name)))
+		sb.WriteByte(':')
+		sb.WriteString(p.name)
+		sb.WriteByte('=')
+		if p.val == nil {
+			sb.WriteString("N;")
+			continue
+		}
+		cv, err := canonicalCellValue(p.val)
+		if err != nil {
+			return "", err
+		}
+		sb.WriteByte('V')
+		sb.WriteString(strconv.Itoa(len(cv)))
+		sb.WriteByte(':')
+		sb.WriteString(cv)
+	}
+	return sb.String(), nil
+}
+
+// canonicalCellValue renders a non-NULL cell to a canonical, read-path-independent
+// string for digest_v2. It must map logically-equal values from BOTH read paths (direct
+// SQL int64/float64 and JSON-dump json.Number/float64) to the same bytes — hence it
+// canonicalizes number representations rather than trusting the Go runtime type. An
+// unexpected type or a non-finite float is corruption (caller falls back to v1).
+func canonicalCellValue(v interface{}) (string, error) {
+	switch x := v.(type) {
+	case string:
+		return x, nil
+	case []byte:
+		return string(x), nil
+	case bool:
+		if x {
+			return "true", nil
+		}
+		return "false", nil
+	case int:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int8:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int16:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int32:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int64:
+		return strconv.FormatInt(x, 10), nil
+	case uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%d", x), nil
+	case float32:
+		return canonicalFloat(float64(x))
+	case float64:
+		return canonicalFloat(x)
+	case json.Number:
+		// Exact integer syntax → normalized base-10 via big.Int (lossless for >2^53);
+		// otherwise a float → the same float canonicalizer, so "5e9"/"5000000000" and
+		// "-0"/"0" collapse to one form.
+		if bi, ok := new(big.Int).SetString(string(x), 10); ok {
+			return bi.String(), nil
+		}
+		f, err := x.Float64()
+		if err != nil {
+			return "", fmt.Errorf("corrosion: uncanonical json.Number %q: %w", string(x), err)
+		}
+		return canonicalFloat(f)
+	default:
+		return "", fmt.Errorf("corrosion: canonicalCellValue: unexpected cell type %T", v)
+	}
+}
+
+// canonicalFloat renders a float to one canonical form: non-finite is rejected, ±0
+// collapses to "0", an integral value uses plain (non-exponent) decimal so it matches the
+// int64 form, and a non-integral value uses the shortest round-trippable representation.
+func canonicalFloat(f float64) (string, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return "", fmt.Errorf("corrosion: canonicalCellValue: non-finite float %v", f)
+	}
+	if f == 0 {
+		return "0", nil // normalizes -0
+	}
+	if f == math.Trunc(f) {
+		return strconv.FormatFloat(f, 'f', -1, 64), nil // integral → plain decimal
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64), nil
 }
 
 // StateDigest returns a lightweight fingerprint of each operator-safe

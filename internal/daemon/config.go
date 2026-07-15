@@ -325,6 +325,13 @@ type EnforcementConfig struct {
 	// latched cluster-wide (every peer must support it, else the field could be
 	// dropped by an old peer's spec rewrite). Default false; reversible kill switch.
 	LiveResize bool `yaml:"live_resize,omitempty"`
+	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
+	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
+	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
+	// presence (no cluster latch): a node emits v2 only when this is on, and two peers
+	// compare v2 only when both emitted it — so a non-uniform rollout is safe. Default
+	// false; reversible kill switch.
+	DigestV2 bool `yaml:"digest_v2,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

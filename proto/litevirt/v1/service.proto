@@ -1541,6 +1541,10 @@ message TableDigest {
     // divergence (NOT drift). A cross-host hash mismatch on a table with unresolved_ties > 0
     // is expected until `lv doctor repair-owner`; the verify report must not count it as drift.
     int32  unresolved_ties = 4;
+    // hash_v2 is the order-invariant digest_v2 table hash. Emitted only when the sender
+    // has digest_v2 enabled; compared only when BOTH peers supply it (pairwise negotiation),
+    // else the peers fall back to the positional `hash`.
+    string hash_v2 = 5;
 }
 
 message StateDigestResponse {
@@ -1642,9 +1646,13 @@ message ScanSensitiveRequest {
 message SensitiveRowMetaPB {
     string table      = 1;
     string pk_label   = 2; // HMAC(scan_key, "pk\0"+table+"\0"+pk)
-    string row_hash   = 3; // HMAC(scan_key, "row\0"+table+"\0"+encoding)
+    string row_hash   = 3; // HMAC(scan_key, "row\0"+table+"\0"+v1 encoding)
     string updated_at = 4;
     bool   deleted    = 5;
+    // row_hash_v2 is the order-invariant digest_v2 HMAC (over the v2 row encoding). Emitted
+    // only when the sender has digest_v2 enabled; the orchestrator compares v2 only when
+    // both sides supply it, else falls back to row_hash.
+    string row_hash_v2 = 6;
 }
 message ScanSensitiveResponse {
     string                      host_name = 1;

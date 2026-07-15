@@ -160,12 +160,28 @@ type Client struct {
 	// Cheap in-memory read (no ping/I/O) — safe on the per-write path. Nil/false =
 	// legacy RFC3339 emission.
 	hlcEmit func() bool
+
+	// digestV2Enabled, when non-nil and returning true, makes the state digest + the
+	// divergence scanner ALSO emit the order-invariant digest_v2 hashes (TableDigest.HashV2
+	// / RowMeta.RowHashV2). Gated on `enforcement.digest_v2` alone (injected via
+	// SetDigestV2Enabled) — no cluster latch: v2 is negotiated PAIRWISE by field presence,
+	// so a node only emits v2 when locally enabled and comparison uses v2 only when both
+	// peers emitted it. Cheap in-memory read. Nil/false = v1-only emission (unchanged).
+	digestV2Enabled func() bool
 }
 
 // SetHLCEmit injects the predicate that switches NowTS to HLC conflict keys. Wired at
 // daemon start to `enforcement.hlc_lww && checker.Latched(HLCLwwV1)`. Nil-safe: an unset
 // predicate keeps legacy RFC3339 emission.
 func (c *Client) SetHLCEmit(fn func() bool) { c.hlcEmit = fn }
+
+// SetDigestV2Enabled injects the predicate that makes the digest + scanner emit the
+// order-invariant digest_v2 hashes. Wired at daemon start to `enforcement.digest_v2`.
+// Nil-safe: an unset predicate keeps v1-only emission.
+func (c *Client) SetDigestV2Enabled(fn func() bool) { c.digestV2Enabled = fn }
+
+// digestV2On reports whether digest_v2 emission is enabled on this node (nil-safe).
+func (c *Client) digestV2On() bool { return c.digestV2Enabled != nil && c.digestV2Enabled() }
 
 // SetHLCSkewGuard injects the predicate that enables LWW future-skew quarantine.
 // Wired at daemon start to the LWWSkewGuardV1 enforcement latch. Nil-safe: an unset

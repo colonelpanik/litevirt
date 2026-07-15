@@ -17844,8 +17844,12 @@ type TableDigest struct {
 	// divergence (NOT drift). A cross-host hash mismatch on a table with unresolved_ties > 0
 	// is expected until `lv doctor repair-owner`; the verify report must not count it as drift.
 	UnresolvedTies int32 `protobuf:"varint,4,opt,name=unresolved_ties,json=unresolvedTies,proto3" json:"unresolved_ties,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// hash_v2 is the order-invariant digest_v2 table hash. Emitted only when the sender
+	// has digest_v2 enabled; compared only when BOTH peers supply it (pairwise negotiation),
+	// else the peers fall back to the positional `hash`.
+	HashV2        string `protobuf:"bytes,5,opt,name=hash_v2,json=hashV2,proto3" json:"hash_v2,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TableDigest) Reset() {
@@ -17904,6 +17908,13 @@ func (x *TableDigest) GetUnresolvedTies() int32 {
 		return x.UnresolvedTies
 	}
 	return 0
+}
+
+func (x *TableDigest) GetHashV2() string {
+	if x != nil {
+		return x.HashV2
+	}
+	return ""
 }
 
 type StateDigestResponse struct {
@@ -18713,12 +18724,16 @@ func (x *ScanSensitiveRequest) GetTables() []string {
 }
 
 type SensitiveRowMetaPB struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
-	PkLabel       string                 `protobuf:"bytes,2,opt,name=pk_label,json=pkLabel,proto3" json:"pk_label,omitempty"` // HMAC(scan_key, "pk\0"+table+"\0"+pk)
-	RowHash       string                 `protobuf:"bytes,3,opt,name=row_hash,json=rowHash,proto3" json:"row_hash,omitempty"` // HMAC(scan_key, "row\0"+table+"\0"+encoding)
-	UpdatedAt     string                 `protobuf:"bytes,4,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
-	Deleted       bool                   `protobuf:"varint,5,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Table     string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	PkLabel   string                 `protobuf:"bytes,2,opt,name=pk_label,json=pkLabel,proto3" json:"pk_label,omitempty"` // HMAC(scan_key, "pk\0"+table+"\0"+pk)
+	RowHash   string                 `protobuf:"bytes,3,opt,name=row_hash,json=rowHash,proto3" json:"row_hash,omitempty"` // HMAC(scan_key, "row\0"+table+"\0"+v1 encoding)
+	UpdatedAt string                 `protobuf:"bytes,4,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	Deleted   bool                   `protobuf:"varint,5,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	// row_hash_v2 is the order-invariant digest_v2 HMAC (over the v2 row encoding). Emitted
+	// only when the sender has digest_v2 enabled; the orchestrator compares v2 only when
+	// both sides supply it, else falls back to row_hash.
+	RowHashV2     string `protobuf:"bytes,6,opt,name=row_hash_v2,json=rowHashV2,proto3" json:"row_hash_v2,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -18786,6 +18801,13 @@ func (x *SensitiveRowMetaPB) GetDeleted() bool {
 		return x.Deleted
 	}
 	return false
+}
+
+func (x *SensitiveRowMetaPB) GetRowHashV2() string {
+	if x != nil {
+		return x.RowHashV2
+	}
+	return ""
 }
 
 type ScanSensitiveResponse struct {
@@ -23709,12 +23731,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03vni\x18\x01 \x01(\x05R\x03vni\x12\x10\n" +
 	"\x03mac\x18\x02 \x01(\tR\x03mac\x12\x1e\n" +
 	"\vold_vtep_ip\x18\x03 \x01(\tR\toldVtepIp\x12\x1e\n" +
-	"\vnew_vtep_ip\x18\x04 \x01(\tR\tnewVtepIp\"t\n" +
+	"\vnew_vtep_ip\x18\x04 \x01(\tR\tnewVtepIp\"\x8d\x01\n" +
 	"\vTableDigest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05count\x18\x02 \x01(\x05R\x05count\x12\x12\n" +
 	"\x04hash\x18\x03 \x01(\tR\x04hash\x12'\n" +
-	"\x0funresolved_ties\x18\x04 \x01(\x05R\x0eunresolvedTies\"d\n" +
+	"\x0funresolved_ties\x18\x04 \x01(\x05R\x0eunresolvedTies\x12\x17\n" +
+	"\ahash_v2\x18\x05 \x01(\tR\x06hashV2\"d\n" +
 	"\x13StateDigestResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x120\n" +
 	"\x06tables\x18\x02 \x03(\v2\x18.litevirt.v1.TableDigestR\x06tables\"-\n" +
@@ -23769,14 +23792,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x14ScanSensitiveRequest\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12\x19\n" +
 	"\bscan_key\x18\x02 \x01(\fR\ascanKey\x12\x16\n" +
-	"\x06tables\x18\x03 \x03(\tR\x06tables\"\x99\x01\n" +
+	"\x06tables\x18\x03 \x03(\tR\x06tables\"\xb9\x01\n" +
 	"\x12SensitiveRowMetaPB\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +
 	"\bpk_label\x18\x02 \x01(\tR\apkLabel\x12\x19\n" +
 	"\brow_hash\x18\x03 \x01(\tR\arowHash\x12\x1d\n" +
 	"\n" +
 	"updated_at\x18\x04 \x01(\tR\tupdatedAt\x12\x18\n" +
-	"\adeleted\x18\x05 \x01(\bR\adeleted\"i\n" +
+	"\adeleted\x18\x05 \x01(\bR\adeleted\x12\x1e\n" +
+	"\vrow_hash_v2\x18\x06 \x01(\tR\trowHashV2\"i\n" +
 	"\x15ScanSensitiveResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x123\n" +
 	"\x04rows\x18\x02 \x03(\v2\x1f.litevirt.v1.SensitiveRowMetaPBR\x04rows\"a\n" +

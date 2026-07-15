@@ -191,6 +191,7 @@ func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties 
 			Name:           d.Name,
 			Count:          int32(d.Count),
 			Hash:           d.Hash,
+			HashV2:         d.HashV2, // empty unless digest_v2 is enabled locally
 			UnresolvedTies: int32(ties[d.Name]),
 		})
 	}

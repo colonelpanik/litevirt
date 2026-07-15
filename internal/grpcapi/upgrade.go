@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -287,6 +288,10 @@ func updateSystemdUnit() {
 			}
 		}
 	}
+	// Remove the deprecated litevirt PCI udev rule left by an older host-init — but
+	// ONLY when its contents are the known litevirt rule, so a hand-edited or foreign
+	// file at that path is never deleted (warn + leave instead).
+	removeStaleUdevRule()
 	if !changed {
 		return
 	}
@@ -295,6 +300,45 @@ func updateSystemdUnit() {
 		return
 	}
 	slog.Info("systemd units updated (main + rollback)")
+}
+
+// litevirtUdevRulePath is the deprecated PCI udev rule an older host-init installed.
+const litevirtUdevRulePath = "/etc/udev/rules.d/99-litevirt-pci.rules"
+
+// isLitevirtUdevRule reports whether the file contents are recognizably the litevirt
+// PCI udev rule (an ownership marker), so a stale-rule cleanup never deletes a foreign
+// or hand-edited file at that path.
+func isLitevirtUdevRule(contents string) bool {
+	return strings.Contains(contents, "litevirt") &&
+		strings.Contains(contents, "/api/v1/hosts/rescan") &&
+		strings.Contains(contents, `SUBSYSTEM=="pci"`)
+}
+
+// removeStaleUdevRule deletes the deprecated litevirt PCI udev rule on upgrade.
+func removeStaleUdevRule() {
+	if removeStaleUdevRuleAt(litevirtUdevRulePath) {
+		_, _ = exec.Command("udevadm", "control", "--reload-rules").CombinedOutput()
+	}
+}
+
+// removeStaleUdevRuleAt removes the file at path ONLY when its contents match the
+// known litevirt rule; a foreign/edited file is left in place with a warning. Returns
+// true if a rule was actually removed. Best-effort.
+func removeStaleUdevRuleAt(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false // absent (or unreadable) — nothing to do
+	}
+	if !isLitevirtUdevRule(string(b)) {
+		slog.Warn("leaving unrecognized file at the litevirt udev-rule path untouched", "path", path)
+		return false
+	}
+	if err := os.Remove(path); err != nil {
+		slog.Warn("failed to remove deprecated litevirt udev rule", "path", path, "error", err)
+		return false
+	}
+	slog.Info("removed deprecated litevirt PCI udev rule", "path", path)
+	return true
 }
 
 // countBlocking returns how many findings are severity="block".

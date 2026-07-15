@@ -10,9 +10,12 @@ import (
 	"time"
 )
 
-// CreateVFs increases the number of VFs on a PF and returns the PCI addresses
-// of the newly created VFs. It reads the current numvfs, adds `count`, and
-// writes the new total to sriov_numvfs.
+// CreateVFs creates a VF pool of `count` VFs on an EMPTY PF and returns the PCI
+// addresses of the created VFs. litevirt only ever creates a pool on an empty PF — it
+// never grows an existing pool — so a non-empty PF is refused. A short create (the
+// kernel produced fewer VFs than requested) is a FAILURE: it returns the partial pool
+// alongside a structured error and does NOT auto-zero (the caller rescans + marks the
+// host degraded rather than silently succeeding on a truncated pool).
 func CreateVFs(pfAddress string, count int) ([]string, error) {
 	devPath := filepath.Join(sysDevices, pfAddress)
 
@@ -24,43 +27,31 @@ func CreateVFs(pfAddress string, count int) ([]string, error) {
 
 	totalVFs := readSysInt(totalPath)
 	currentVFs := readSysInt(filepath.Join(devPath, "sriov_numvfs"))
-	targetVFs := currentVFs + count
-
-	if targetVFs > totalVFs {
-		return nil, fmt.Errorf("PF %s: requesting %d VFs total but max is %d",
-			pfAddress, targetVFs, totalVFs)
+	if currentVFs != 0 {
+		return nil, fmt.Errorf("PF %s: refusing to create VFs on a non-empty pool (sriov_numvfs=%d); litevirt only creates a pool on an empty PF and never resizes one",
+			pfAddress, currentVFs)
+	}
+	if count > totalVFs {
+		return nil, fmt.Errorf("PF %s: requested %d VFs but hardware maximum is %d", pfAddress, count, totalVFs)
 	}
 
-	// Snapshot existing VF addresses before creating new ones.
-	existingVFs := listVFAddresses(devPath)
-	existingSet := make(map[string]bool, len(existingVFs))
-	for _, a := range existingVFs {
-		existingSet[a] = true
-	}
-
-	// Write the new VF count.
+	// Write the VF count (pool creation on an empty PF).
 	numvfsPath := filepath.Join(devPath, "sriov_numvfs")
-	if err := os.WriteFile(numvfsPath, []byte(strconv.Itoa(targetVFs)), 0200); err != nil {
+	if err := os.WriteFile(numvfsPath, []byte(strconv.Itoa(count)), 0200); err != nil {
 		return nil, fmt.Errorf("write sriov_numvfs for %s: %w", pfAddress, err)
 	}
 
 	// Wait briefly for the kernel to create the new VF devices.
 	time.Sleep(500 * time.Millisecond)
 
-	// Discover new VF addresses.
-	allVFs := listVFAddresses(devPath)
-	var newVFs []string
-	for _, a := range allVFs {
-		if !existingSet[a] {
-			newVFs = append(newVFs, a)
-		}
-	}
-
+	newVFs := listVFAddresses(devPath)
 	if len(newVFs) < count {
-		slog.Warn("fewer VFs created than expected", "expected", count, "got", len(newVFs), "pf", pfAddress)
+		// Retain the partial pool (no auto-zero) and fail with structured detail.
+		slog.Error("SR-IOV short VF creation", "pf", pfAddress, "requested", count, "got", len(newVFs))
+		return newVFs, fmt.Errorf("PF %s: short VF creation — requested %d, got %d", pfAddress, count, len(newVFs))
 	}
 
-	slog.Info("SR-IOV VFs created", "pf", pfAddress, "new_vfs", len(newVFs), "total", targetVFs)
+	slog.Info("SR-IOV VF pool created", "pf", pfAddress, "vfs", len(newVFs))
 	return newVFs, nil
 }
 

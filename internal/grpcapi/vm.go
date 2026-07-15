@@ -2280,16 +2280,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
-		req.SecureBoot != nil || req.Tpm != nil
+		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil
 	// A CPU/memory(+bounds)-only redefine can be applied by patching the inactive
 	// domain XML in place rather than regenerating it, so libvirt-assigned details
 	// (PCI slot addresses, controller models) survive — which matters for guests
 	// (e.g. Windows) that key licensing off stable hardware addresses. Any other
 	// redefine-class change (machine/firmware/SB/TPM/guest-agent/cpu-mode/VNC) needs
 	// full regeneration.
+	// max_cpu changes the vCPU-topology XML (<vcpu current=…>), which the value-only
+	// inactive-XML patch doesn't handle, so exclude it from the fast path.
 	cpuMemOnly := redefine && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
-		req.DisableVnc == origDisableVnc
+		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
 	if redefine {
 		if vm.State != "stopped" {
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -2319,6 +2321,23 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		if req.MaxMemoryMib != nil {
 			spec.MaxMemoryMib = *req.MaxMemoryMib
+		}
+		if req.MaxCpu != nil {
+			// Setting a vCPU hotplug ceiling is refused until live_resize is latched
+			// cluster-wide — an old peer could drop max_cpu from a spec it rewrites.
+			if !s.liveResizeActive(ctx) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot set max_cpu for %q: live resize is not enabled and latched cluster-wide", req.Name)
+			}
+			effectiveCPU := spec.Cpu
+			if req.Cpu > 0 {
+				effectiveCPU = req.Cpu
+			}
+			if *req.MaxCpu != 0 && *req.MaxCpu < effectiveCPU {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"max_cpu (%d) must be >= cpu (%d)", *req.MaxCpu, effectiveCPU)
+			}
+			spec.MaxCpu = *req.MaxCpu
 		}
 		// Toggling secure_boot/tpm once firmware state exists can brick an
 		// unsigned guest (SB) or orphan BitLocker (TPM) — refuse without --force.

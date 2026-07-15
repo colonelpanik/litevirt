@@ -100,6 +100,9 @@ type Server struct {
 	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
 	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
 	enfOperationProtocol bool
+	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
+	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
+	enfLiveResize bool
 
 	// capHealthLast records the most recent bounded freshness-check result per
 	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
@@ -429,6 +432,16 @@ func (s *Server) operationProtocolActive(ctx context.Context) bool {
 	return s.enfOperationProtocol && s.gate != nil && s.gate.Enforced(ctx, capabilities.OperationProtocolV1)
 }
 
+// SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
+func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
+
+// liveResizeActive reports whether this node may originate live-resize behavior
+// (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
+// old peer can't have max_cpu dropped from a spec it later rewrites.
+func (s *Server) liveResizeActive(ctx context.Context) bool {
+	return s.enfLiveResize && s.gate != nil && s.gate.Enforced(ctx, capabilities.LiveResizeV1)
+}
+
 // tokenEnabled reports whether this node is configured to ENFORCE token — the
 // single source of "configured-to-enforce" the HA monitor uses to decide which
 // tokens to latch-drive and which may contribute to HA-degraded. split_brain_gate_v1
@@ -459,6 +472,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.rbacRealm
 	case capabilities.OperationProtocolV1:
 		return s.enfOperationProtocol
+	case capabilities.LiveResizeV1:
+		return s.enfLiveResize
 	default:
 		return false
 	}

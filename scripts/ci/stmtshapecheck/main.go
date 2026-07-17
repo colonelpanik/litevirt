@@ -22,11 +22,11 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -36,23 +36,14 @@ import (
 
 const corrosionPkgPath = "github.com/litevirt/litevirt/internal/corrosion"
 
-// replicatingMethods are the corrosion Client methods that write a mutation_log row (i.e.
-// replicate). execLocal*/raw db.Exec do not replicate and are not scanned.
-var replicatingMethods = map[string]bool{
-	"Execute":             true,
-	"ExecuteRows":         true,
-	"ExecuteDeferred":     true,
-	"ExecuteBatch":        true,
-	"ExecuteBatchGuarded": true,
-}
-
 type finding struct {
-	pos      token.Position
-	sql      string
-	dynamic  bool
-	policy   string
-	fp       string
-	parseErr string
+	pos             token.Position
+	sql             string
+	dynamic         bool // SQL is not a compile-time constant (runtime-built)
+	unresolvedBatch bool // an ExecuteBatch arg that could not be statically enumerated
+	policy          string
+	fp              string
+	parseErr        string
 }
 
 func main() {
@@ -89,6 +80,8 @@ func main() {
 	if *report {
 		for _, f := range findings {
 			switch {
+			case f.unresolvedBatch:
+				fmt.Printf("%s\tUNRESOLVED-BATCH\tpolicy=%q\n", loc(f.pos), f.policy)
 			case f.dynamic:
 				fmt.Printf("%s\tDYNAMIC\tpolicy=%q\n", loc(f.pos), f.policy)
 			case f.parseErr != "":
@@ -103,9 +96,13 @@ func main() {
 	var gaps []string
 	for _, f := range findings {
 		switch {
+		case f.unresolvedBatch:
+			if !policyOK(f.policy) {
+				gaps = append(gaps, fmt.Sprintf("%s: ExecuteBatch argument could not be statically enumerated and has no valid //stmtshape:policy", loc(f.pos)))
+			}
 		case f.dynamic:
-			if f.policy == "" {
-				gaps = append(gaps, fmt.Sprintf("%s: dynamically-built replicated SQL with no //stmtshape:policy directive", loc(f.pos)))
+			if !policyOK(f.policy) {
+				gaps = append(gaps, fmt.Sprintf("%s: dynamically-built replicated SQL with no valid //stmtshape:policy directive", loc(f.pos)))
 			}
 		case f.parseErr != "":
 			gaps = append(gaps, fmt.Sprintf("%s: replicated SQL does not parse as a supported shape (%s): %q", loc(f.pos), f.parseErr, f.sql))
@@ -133,47 +130,307 @@ func loc(p token.Position) string { return fmt.Sprintf("%s:%d", p.Filename, p.Li
 func scanPkg(pkg *packages.Package) []finding {
 	var out []finding
 	policyAt := harvestPolicyDirectives(pkg)
+	pol := func(n ast.Node) string {
+		return policyBetween(policyAt, pkg.Fset.Position(n.Pos()).Filename,
+			pkg.Fset.Position(n.Pos()).Line, pkg.Fset.Position(n.End()).Line)
+	}
+	// Index package funcs so a batch built by a helper can be resolved one level deep.
+	funcByName := map[string]*ast.FuncDecl{}
 	for _, file := range pkg.Syntax {
-		ast.Inspect(file, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
+		for _, d := range file.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil {
+				funcByName[fd.Name.Name] = fd
 			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || !replicatingMethods[sel.Sel.Name] {
-				return true
+		}
+	}
+
+	for _, file := range pkg.Syntax {
+		for _, d := range file.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
 			}
-			// Resolve the selection: only a method on *corrosion.Client counts.
-			selection := pkg.TypesInfo.Selections[sel]
-			if selection == nil || selection.Kind() != types.MethodVal || !isCorrosionClient(selection.Recv()) {
-				return true
+			// Skip the corrosion Client's own Execute*/exec* plumbing: it constructs
+			// Statement values from its parameters, and those are not builders.
+			if isPlumbingMethod(pkg, fd) {
+				continue
 			}
-			callStart := pkg.Fset.Position(call.Pos()).Line
-			callEnd := pkg.Fset.Position(call.End()).Line
-			pol := policyBetween(policyAt, pkg.Fset.Position(call.Pos()).Filename, callStart, callEnd)
-			for _, sqlExpr := range sqlArgsOf(sel.Sel.Name, call) {
-				pos := pkg.Fset.Position(sqlExpr.Pos())
-				lit, isLit := stringLit(sqlExpr)
-				if !isLit {
-					out = append(out, finding{pos: pos, dynamic: true, policy: pol})
-					continue
+			s := &scanner{pkg: pkg, funcByName: funcByName, pol: pol, fn: fd}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
 				}
-				f := finding{pos: pos, sql: lit}
-				if fp, err := corrosion.FingerprintSQL(lit); err != nil {
-					f.parseErr = err.Error()
-				} else {
-					f.fp = fp
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
 				}
-				out = append(out, f)
-			}
-			return true
-		})
+				method := sel.Sel.Name
+				if !isReplicatingMethod(method) {
+					return true
+				}
+				selection := pkg.TypesInfo.Selections[sel]
+				if selection == nil || selection.Kind() != types.MethodVal || !isCorrosionClient(selection.Recv()) {
+					return true
+				}
+				switch method {
+				case "Execute", "ExecuteRows", "ExecuteDeferred":
+					if len(call.Args) >= 2 {
+						out = append(out, resolveSQL(pkg, call.Args[1], pol(call)))
+					}
+				case "ExecuteBatch": // (ctx, stmts)
+					if len(call.Args) >= 2 {
+						out = append(out, s.resolveBatchArg(call.Args[1], pol(call))...)
+					}
+				case "ExecuteBatchGuarded": // (ctx, guard, stmts)
+					if len(call.Args) >= 3 {
+						out = append(out, s.resolveBatchArg(call.Args[2], pol(call))...)
+					}
+				}
+				return true
+			})
+		}
 	}
 	return out
 }
 
+func isReplicatingMethod(m string) bool {
+	switch m {
+	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded":
+		return true
+	}
+	return false
+}
+
+// isPlumbingMethod reports whether fd is a *corrosion.Client method that itself constructs/
+// applies Statements (the Execute* wrappers, executeBatchInternal, execLocal*/execBatchLocal),
+// as opposed to a builder that calls them.
+func isPlumbingMethod(pkg *packages.Package, fd *ast.FuncDecl) bool {
+	if fd.Recv == nil || len(fd.Recv.List) != 1 {
+		return false
+	}
+	if !isCorrosionClient(pkg.TypesInfo.TypeOf(fd.Recv.List[0].Type)) {
+		return false
+	}
+	switch fd.Name.Name {
+	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
+		"executeBatchInternal", "execLocal", "execLocalRows", "execBatchLocal":
+		return true
+	}
+	return false
+}
+
+// scanner carries the context for resolving one function's batch arguments.
+type scanner struct {
+	pkg        *packages.Package
+	funcByName map[string]*ast.FuncDecl
+	pol        func(ast.Node) string
+	fn         *ast.FuncDecl
+}
+
+// resolveBatchArg resolves the []Statement argument of an ExecuteBatch* call to the concrete
+// statements it carries, following an inline slice literal, a local variable's assignment +
+// appends, and one level of helper return. Anything it cannot resolve fails closed.
+func (s *scanner) resolveBatchArg(arg ast.Expr, pol string) []finding {
+	switch e := arg.(type) {
+	case *ast.CompositeLit: // []Statement{ elt, elt, ... }
+		var out []finding
+		for _, elt := range e.Elts {
+			out = append(out, s.resolveStmtElt(elt, pol)...)
+		}
+		if len(out) == 0 {
+			out = append(out, finding{pos: s.pkg.Fset.Position(e.Pos()), unresolvedBatch: true, policy: pol})
+		}
+		return out
+	case *ast.Ident: // a local variable built via `:= []Statement{...}` and/or append(...)
+		if fs := s.resolveSliceVar(e, pol); fs != nil {
+			return fs
+		}
+	case *ast.CallExpr: // a helper returning []Statement
+		if fs := s.resolveHelperReturn(e, pol); fs != nil {
+			return fs
+		}
+	}
+	return []finding{{pos: s.pkg.Fset.Position(arg.Pos()), unresolvedBatch: true, policy: pol}}
+}
+
+// resolveStmtElt resolves one element of a []Statement literal: a Statement{SQL:...}
+// composite, a local Statement variable (traced to its assignment), or a helper call
+// returning a Statement.
+func (s *scanner) resolveStmtElt(elt ast.Expr, pol string) []finding {
+	if u, ok := elt.(*ast.UnaryExpr); ok {
+		elt = u.X
+	}
+	switch e := elt.(type) {
+	case *ast.CompositeLit:
+		if isCorrosionStatement(s.pkg.TypesInfo.Types[e].Type) {
+			if sqlExpr := statementSQLField(e); sqlExpr != nil {
+				return []finding{resolveSQL(s.pkg, sqlExpr, pol)}
+			}
+			// A Statement{} with no SQL field is a zero value / error-path return
+			// (`return Statement{}, err`), not a real statement — skip it.
+			return []finding{}
+		}
+	case *ast.CallExpr:
+		if fs := s.resolveHelperReturn(e, pol); fs != nil {
+			return fs
+		}
+	case *ast.Ident:
+		if fs := s.resolveStmtVar(e, pol); fs != nil {
+			return fs
+		}
+	}
+	return []finding{{pos: s.pkg.Fset.Position(elt.Pos()), unresolvedBatch: true, policy: pol}}
+}
+
+// resolveStmtVar traces a local Statement variable to the Statement composite or helper
+// call assigned to it within the enclosing function (handles `x := Statement{...}`,
+// `x = Statement{...}`, and `x, err := helper()`).
+func (s *scanner) resolveStmtVar(id *ast.Ident, pol string) []finding {
+	var out []finding
+	found := false
+	ast.Inspect(s.fn.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 {
+			return true
+		}
+		for _, l := range as.Lhs {
+			if lid, ok := l.(*ast.Ident); ok && lid.Name == id.Name {
+				found = true
+				out = append(out, s.resolveStmtElt(as.Rhs[0], pol)...)
+				break
+			}
+		}
+		return true
+	})
+	if !found {
+		return nil
+	}
+	return out
+}
+
+// resolveSliceVar collects statements assigned to a []Statement local via `var/:=`
+// initialization and `append(v, …)` within the enclosing function.
+func (s *scanner) resolveSliceVar(id *ast.Ident, pol string) []finding {
+	var out []finding
+	found := false
+	ast.Inspect(s.fn.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 {
+			return true
+		}
+		// match assignments whose LHS is our identifier
+		lhsMatch := false
+		for _, l := range as.Lhs {
+			if lid, ok := l.(*ast.Ident); ok && lid.Name == id.Name {
+				lhsMatch = true
+			}
+		}
+		if !lhsMatch {
+			return true
+		}
+		switch rhs := as.Rhs[0].(type) {
+		case *ast.CompositeLit: // v := []Statement{...}
+			found = true
+			for _, elt := range rhs.Elts {
+				out = append(out, s.resolveStmtElt(elt, pol)...)
+			}
+		case *ast.CallExpr: // v = append(v, Statement{...}, helper()...)
+			if fn, ok := rhs.Fun.(*ast.Ident); ok && fn.Name == "append" {
+				found = true
+				for _, a := range rhs.Args[1:] {
+					out = append(out, s.resolveStmtElt(a, pol)...)
+				}
+			}
+		}
+		return true
+	})
+	if !found {
+		return nil
+	}
+	if out == nil {
+		out = []finding{}
+	}
+	return out
+}
+
+// resolveHelperReturn resolves a call to a package-local helper that returns []Statement or
+// Statement by following its `return` expressions one level.
+func (s *scanner) resolveHelperReturn(call *ast.CallExpr, pol string) []finding {
+	id, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	fd := s.funcByName[id.Name]
+	if fd == nil || fd.Body == nil {
+		return nil
+	}
+	inner := &scanner{pkg: s.pkg, funcByName: s.funcByName, pol: s.pol, fn: fd}
+	var out []finding
+	found := false
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) == 0 {
+			return true
+		}
+		r0 := ret.Results[0]
+		t := s.pkg.TypesInfo.TypeOf(r0)
+		switch {
+		case isCorrosionStatement(t):
+			found = true
+			out = append(out, inner.resolveStmtElt(r0, pol)...)
+		case isStatementSlice(t):
+			found = true
+			out = append(out, inner.resolveBatchArg(r0, pol)...)
+		}
+		return true
+	})
+	if !found {
+		return nil
+	}
+	if out == nil {
+		out = []finding{}
+	}
+	return out
+}
+
+// isStatementSlice reports whether t is []corrosion.Statement.
+func isStatementSlice(t types.Type) bool {
+	sl, ok := t.(*types.Slice)
+	return ok && isCorrosionStatement(sl.Elem())
+}
+
+// resolveSQL turns one SQL argument expression into a finding: a compile-time constant
+// string is fingerprinted; anything else is dynamic (authorized only via a policy).
+func resolveSQL(pkg *packages.Package, e ast.Expr, pol string) finding {
+	pos := pkg.Fset.Position(e.Pos())
+	s, ok := constString(pkg, e)
+	if !ok {
+		return finding{pos: pos, dynamic: true, policy: pol}
+	}
+	f := finding{pos: pos, sql: s}
+	if fp, err := corrosion.FingerprintSQL(s); err != nil {
+		f.parseErr = err.Error()
+	} else {
+		f.fp = fp
+	}
+	return f
+}
+
 // isCorrosionClient reports whether t is *corrosion.Client (or corrosion.Client).
 func isCorrosionClient(t types.Type) bool {
+	return isCorrosionNamed(t, "Client")
+}
+
+// isCorrosionStatement reports whether t is corrosion.Statement (or *corrosion.Statement).
+func isCorrosionStatement(t types.Type) bool {
+	return isCorrosionNamed(t, "Statement")
+}
+
+func isCorrosionNamed(t types.Type, name string) bool {
+	if t == nil {
+		return false
+	}
 	if p, ok := t.(*types.Pointer); ok {
 		t = p.Elem()
 	}
@@ -182,7 +439,7 @@ func isCorrosionClient(t types.Type) bool {
 		return false
 	}
 	obj := named.Obj()
-	return obj != nil && obj.Name() == "Client" && obj.Pkg() != nil && obj.Pkg().Path() == corrosionPkgPath
+	return obj != nil && obj.Name() == name && obj.Pkg() != nil && obj.Pkg().Path() == corrosionPkgPath
 }
 
 type policyDirective struct {
@@ -216,24 +473,9 @@ func policyBetween(dirs []policyDirective, file string, start, end int) string {
 	return ""
 }
 
-func sqlArgsOf(method string, call *ast.CallExpr) []ast.Expr {
-	switch method {
-	case "Execute", "ExecuteRows", "ExecuteDeferred":
-		if len(call.Args) >= 2 {
-			return []ast.Expr{call.Args[1]}
-		}
-	case "ExecuteBatch", "ExecuteBatchGuarded":
-		var out []ast.Expr
-		for _, a := range call.Args {
-			if e := statementSQLField(a); e != nil {
-				out = append(out, e)
-			}
-		}
-		return out
-	}
-	return nil
-}
-
+// statementSQLField extracts the SQL field value expression from a Statement{SQL: ...}
+// composite-literal element (possibly &Statement{...}); returns nil if the element is not a
+// composite with a keyed SQL field (e.g. a variable spliced into the slice).
 func statementSQLField(a ast.Expr) ast.Expr {
 	if u, ok := a.(*ast.UnaryExpr); ok {
 		a = u.X
@@ -254,14 +496,22 @@ func statementSQLField(a ast.Expr) ast.Expr {
 	return nil
 }
 
-func stringLit(e ast.Expr) (string, bool) {
-	bl, ok := e.(*ast.BasicLit)
-	if !ok || bl.Kind != token.STRING {
+// constString returns e's value if it is any compile-time constant string — a string
+// literal, a const identifier, or a constant concatenation — so a builder using a `const`
+// SQL string is treated as static, not dynamic.
+func constString(pkg *packages.Package, e ast.Expr) (string, bool) {
+	tv, ok := pkg.TypesInfo.Types[e]
+	if !ok || tv.Value == nil || tv.Value.Kind() != constant.String {
 		return "", false
 	}
-	s, err := strconv.Unquote(bl.Value)
-	if err != nil {
-		return "", false
+	return constant.StringVal(tv.Value), true
+}
+
+// policyOK reports whether a //stmtshape:policy directive names a registered policy.
+func policyOK(id string) bool {
+	if id == "" {
+		return false
 	}
-	return s, true
+	_, ok := corrosion.PolicyLookup(id)
+	return ok
 }

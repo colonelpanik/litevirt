@@ -104,7 +104,8 @@ func (p *sqlParser) parseInsert(pkCols []string) (StmtShape, error) {
 	if p.peek().kind != tokRParen {
 		return sh, invalidf("unterminated VALUES tuple")
 	}
-	p.next() // )
+	rparen := p.next() // )
+	sh.InsertValuesEnd = rparen.pos + len(rparen.text)
 	sh.InsertVals = vals
 	if len(cols) != len(vals) {
 		return sh, invalidf("column/value count mismatch (%d cols, %d vals)", len(cols), len(vals))

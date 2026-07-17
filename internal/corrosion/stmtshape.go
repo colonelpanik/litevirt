@@ -162,7 +162,12 @@ type StmtShape struct {
 	// INSERT (stripLeadingAlgo) without a substring search. Both 0 when no algo is present.
 	LeadingAlgoStart int
 	LeadingAlgoEnd   int
-	OnConflict       *ConflictClause
+	// InsertValuesEnd is the byte offset in the ORIGINAL sql just past the VALUES tuple's
+	// closing ')'. The plain-INSERT upsert rewrite splices its ON CONFLICT tail here rather
+	// than appending to the raw string, so a trailing comment or semicolon after VALUES
+	// can't swallow or detach the appended clause. Zero for non-INSERT shapes.
+	InsertValuesEnd int
+	OnConflict      *ConflictClause
 
 	// UPDATE
 	SetAssigns []AssignmentShape

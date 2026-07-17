@@ -502,6 +502,19 @@ func lowerStringSet(ss []string) map[string]bool {
 	return m
 }
 
+// hasDuplicateColumnsFold reports whether cols contains a case-insensitively repeated name.
+func hasDuplicateColumnsFold(cols []string) bool {
+	seen := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		lc := strings.ToLower(c)
+		if seen[lc] {
+			return true
+		}
+		seen[lc] = true
+	}
+	return false
+}
+
 // mergeTable LWW-merges one dump table. It validates the peer-supplied
 // name/columns against the local schema once, then applies the rows in bounded
 // chunks (mergeChunk), each its own committed transaction.
@@ -526,6 +539,13 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 	if len(table.Columns) == 0 || !columnsKnown(table.Columns, localCols) {
 		slog.Warn("sync: skipping dump table with unexpected columns", "table", table.Name)
 		return 0, 0
+	}
+	// buildMergeUpsertSQL and the PK/value indexing assume a unique column list; a malformed
+	// dump with a repeated column name would produce duplicate INSERT/SET targets and
+	// misaligned indices. Reject it (keep local) rather than build inconsistent SQL.
+	if hasDuplicateColumnsFold(table.Columns) {
+		slog.Warn("sync: skipping dump table with duplicate column names", "table", table.Name)
+		return 0, len(table.Rows)
 	}
 
 	pkCols := tablePrimaryKeys[table.Name]

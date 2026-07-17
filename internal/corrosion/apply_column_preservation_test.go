@@ -50,62 +50,108 @@ func TestBuildMergeUpsertSQL(t *testing.T) {
 	}
 }
 
-// TestInsertUpsertRewrite pins the WAL INSERT→upsert rewrite across its branches.
+// TestInsertUpsertRewrite pins the WAL INSERT→upsert rewrite and its fail-closed invariants.
 func TestInsertUpsertRewrite(t *testing.T) {
 	cases := []struct {
-		name   string
-		sql    string
-		pkCols []string
-		wantOK bool
-		want   string
+		name         string
+		sql          string
+		nParams      int
+		pkCols       []string
+		hasUpdatedAt bool
+		wantErr      bool
+		want         string
 	}{
 		{
-			name:   "plain insert",
-			sql:    "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?)",
-			pkCols: []string{"name"}, wantOK: true,
+			name:    "plain insert (LWW)",
+			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?)",
+			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true,
 			want: "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at",
 		},
 		{
-			name:   "OR REPLACE normalized to plain",
-			sql:    "INSERT OR REPLACE INTO hosts (name, address, updated_at) VALUES (?, ?, ?)",
-			pkCols: []string{"name"}, wantOK: true,
+			name:    "OR REPLACE normalized to plain",
+			sql:     "INSERT OR REPLACE INTO hosts (name, address, updated_at) VALUES (?, ?, ?)",
+			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true,
 			want: "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at",
 		},
 		{
-			name:   "explicit ON CONFLICT applied verbatim",
-			sql:    "INSERT INTO hosts (name, address) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address",
-			pkCols: []string{"name"}, wantOK: true,
-			want: "INSERT INTO hosts (name, address) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address",
-		},
-		{
-			name:   "trailing semicolon stripped",
-			sql:    "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?);",
-			pkCols: []string{"name"}, wantOK: true,
+			name:    "explicit ON CONFLICT with updated_at applied verbatim",
+			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at",
+			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true,
 			want: "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at",
 		},
 		{
-			name:   "no full PK identity fails closed",
-			sql:    "INSERT INTO hosts (address, updated_at) VALUES (?, ?)",
-			pkCols: []string{"name"}, wantOK: false,
+			name:    "trailing semicolon stripped",
+			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?);",
+			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true,
+			want: "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at",
 		},
 		{
-			name:   "non-INSERT fails closed",
-			sql:    "UPDATE hosts SET address = ? WHERE name = ?",
-			pkCols: []string{"name"}, wantOK: false,
+			// A trailing line comment must NOT swallow the appended ON CONFLICT clause: the
+			// tail is spliced at the end of the VALUES tuple, dropping the comment.
+			name:    "trailing line comment does not swallow tail",
+			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) -- note",
+			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true,
+			want: "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at",
 		},
 		{
-			name:   "empty pkCols fails closed",
-			sql:    "INSERT INTO t (a) VALUES (?)",
-			pkCols: nil, wantOK: false,
+			// An ObservePCIDevice-shaped explicit partial upsert (literal '' / NULL cells,
+			// updated_at advanced in SET, vm_name deliberately omitted) is applied verbatim.
+			name:    "explicit partial upsert (ObservePCIDevice shape) verbatim",
+			sql:     "INSERT INTO host_pci_devices (host_name, address, vm_name, updated_at, deleted_at) VALUES (?, ?, '', ?, NULL) ON CONFLICT(host_name, address) DO UPDATE SET updated_at = excluded.updated_at, deleted_at = NULL",
+			nParams: 3, pkCols: []string{"host_name", "address"}, hasUpdatedAt: true,
+			want: "INSERT INTO host_pci_devices (host_name, address, vm_name, updated_at, deleted_at) VALUES (?, ?, '', ?, NULL) ON CONFLICT(host_name, address) DO UPDATE SET updated_at = excluded.updated_at, deleted_at = NULL",
+		},
+		{
+			name:    "non-LWW table needs no updated_at",
+			sql:     "INSERT INTO t (id, val) VALUES (?, ?)",
+			nParams: 2, pkCols: []string{"id"}, hasUpdatedAt: false,
+			want: "INSERT INTO t (id, val) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET val = excluded.val",
+		},
+		{
+			name:    "LWW insert omitting updated_at fails closed",
+			sql:     "INSERT INTO hosts (name, address) VALUES (?, ?)",
+			nParams: 2, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
+		},
+		{
+			name:    "explicit upsert not advancing updated_at fails closed",
+			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address",
+			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
+		},
+		{
+			name:    "no full PK identity fails closed",
+			sql:     "INSERT INTO hosts (address, updated_at) VALUES (?, ?)",
+			nParams: 2, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
+		},
+		{
+			name:    "param arity mismatch fails closed",
+			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?)",
+			nParams: 2, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
+		},
+		{
+			name:    "non-INSERT fails closed",
+			sql:     "UPDATE hosts SET address = ? WHERE name = ?",
+			nParams: 2, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
+		},
+		{
+			name:    "empty pkCols fails closed",
+			sql:     "INSERT INTO t (a) VALUES (?)",
+			nParams: 1, pkCols: nil, hasUpdatedAt: false, wantErr: true,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := insertUpsertRewrite(c.sql, c.pkCols)
-			if ok != c.wantOK {
-				t.Fatalf("ok = %v, want %v (sql=%q)", ok, c.wantOK, got)
+			s := Statement{SQL: c.sql, Params: make([]interface{}, c.nParams)}
+			got, err := insertUpsertRewrite(s, c.pkCols, c.hasUpdatedAt)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got %q", got)
+				}
+				return
 			}
-			if ok && got != c.want {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
 				t.Errorf("rewrite:\n got %q\nwant %q", got, c.want)
 			}
 		})
@@ -149,6 +195,177 @@ func TestMergeLWW_PreservesReceiverOnlyColumns(t *testing.T) {
 	}
 	if got := rows[0].Int("ssh_port"); got != 2222 {
 		t.Errorf("ssh_port = %d, want 2222 (receiver-only column erased)", got)
+	}
+}
+
+// TestMergeLWW_PreservesVMControlColumns is the concrete v41 case from the bug report: a
+// v40 sender's dump omits the vms control columns (active_operation_id, spec_generation,
+// vm_owner_epoch), which must survive the merge rather than reset to their defaults.
+func TestMergeLWW_PreservesVMControlColumns(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := c.Execute(ctx,
+		`INSERT INTO vms (name, host_name, spec, state, active_operation_id, spec_generation, vm_owner_epoch, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"vm1", "host-a", "{}", "running", "op-123", 5, 3,
+		"2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const newHLC = "2000000000000-0000-n2"
+	c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
+		Name:    "vms",
+		Columns: []string{"name", "host_name", "spec", "state", "created_at", "updated_at"},
+		Rows:    [][]interface{}{{"vm1", "host-b", "{}", "stopped", "2020-01-01T00:00:00Z", newHLC}},
+	}}})
+
+	rows, err := c.Query(ctx, "SELECT state, active_operation_id, spec_generation, vm_owner_epoch FROM vms WHERE name = ?", "vm1")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("query: err=%v rows=%d", err, len(rows))
+	}
+	if got := rows[0].String("state"); got != "stopped" {
+		t.Errorf("state = %q, want stopped (newer incoming wins)", got)
+	}
+	if got := rows[0].String("active_operation_id"); got != "op-123" {
+		t.Errorf("active_operation_id = %q, want op-123 (v41 control column erased)", got)
+	}
+	if got := rows[0].Int("spec_generation"); got != 5 {
+		t.Errorf("spec_generation = %d, want 5 (v41 control column erased)", got)
+	}
+	if got := rows[0].Int("vm_owner_epoch"); got != 3 {
+		t.Errorf("vm_owner_epoch = %d, want 3 (v41 control column erased)", got)
+	}
+}
+
+// TestMergeLWW_TombstonePreservesReceiverOnlyColumns confirms a winning tombstone (deleted_at
+// set) from a behind sender still preserves columns the sender doesn't know about.
+func TestMergeLWW_TombstonePreservesReceiverOnlyColumns(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := c.Execute(ctx,
+		`INSERT INTO hosts (name, address, ssh_user, cert_serial, ipmi_address, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"h1", "10.0.0.1", "operator", "serialX", "10.0.0.99",
+		"2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const newHLC = "2000000000000-0000-n2"
+	c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
+		Name:    "hosts",
+		Columns: []string{"name", "address", "ssh_user", "cert_serial", "created_at", "updated_at", "deleted_at"},
+		Rows:    [][]interface{}{{"h1", "10.0.0.1", "operator", "serialX", "2020-01-01T00:00:00Z", newHLC, newHLC}},
+	}}})
+
+	rows, err := c.Query(ctx, "SELECT deleted_at, ipmi_address FROM hosts WHERE name = ?", "h1")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("query: err=%v rows=%d", err, len(rows))
+	}
+	if rows[0].String("deleted_at") == "" {
+		t.Error("deleted_at not set (tombstone must apply)")
+	}
+	if got := rows[0].String("ipmi_address"); got != "10.0.0.99" {
+		t.Errorf("ipmi_address = %q, want 10.0.0.99 (receiver-only column erased by tombstone)", got)
+	}
+}
+
+// TestApplyRemoteMutations_ParamArityBackPressure confirms a statement whose bound-parameter
+// count doesn't match its params back-pressures instead of indexing out of range or binding
+// wrong values.
+func TestApplyRemoteMutations_ParamArityBackPressure(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	r := NewReplicator(c, "", RelayConfig{})
+	ts := hlc.NewClock("origin-node").Now().String()
+
+	// Three '?' placeholders, only two params.
+	stmts := `[{"SQL":"INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?)","Params":["h1","10.0.0.1"]}]`
+	entries := []*pb.MutationEntry{{Seq: 1, Hlc: ts, Origin: "origin-node", Stmts: stmts}}
+
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err == nil {
+		t.Fatal("expected back-pressure error for param arity mismatch")
+	}
+	assertNotSeen(t, c, "origin-node")
+}
+
+// TestMergeLWW_SecondaryUniqueKeepsLocal: an incoming snapshots row with a NEW primary key
+// but a colliding UNIQUE(vm_name, name) must NOT delete-and-replace the local row (the old
+// INSERT OR REPLACE behavior). The PK-aware upsert conflicts only on id, so the insert hits
+// the secondary UNIQUE and the local row is kept.
+func TestMergeLWW_SecondaryUniqueKeepsLocal(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := c.Execute(ctx,
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"s1", "vm1", "host-a", "snapA", "ready", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const newHLC = "2000000000000-0000-n2"
+	c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
+		Name:    "snapshots",
+		Columns: []string{"id", "vm_name", "host_name", "name", "state", "created_at", "updated_at"},
+		Rows:    [][]interface{}{{"s2", "vm1", "host-b", "snapA", "ready", "2020-01-01T00:00:00Z", newHLC}},
+	}}})
+
+	rows, err := c.Query(ctx, "SELECT id, host_name FROM snapshots WHERE vm_name = ? AND name = ?", "vm1", "snapA")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want exactly 1 snapshot row, got %d (whole-row replace across the UNIQUE?)", len(rows))
+	}
+	if got := rows[0].String("id"); got != "s1" {
+		t.Errorf("id = %q, want s1 (local row must be kept, not replaced by the colliding incoming)", got)
+	}
+}
+
+// TestApplyRemoteMutations_SecondaryUniqueBackPressure: the same collision on the WAL path
+// surfaces as a constraint error and MUST back-pressure (roll back, don't record seen), not
+// silently drop the mutation.
+func TestApplyRemoteMutations_SecondaryUniqueBackPressure(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	if err := c.Execute(ctx,
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"s1", "vm1", "host-a", "snapA", "ready", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	r := NewReplicator(c, "", RelayConfig{})
+	ts := hlc.NewClock("origin-node").Now().String()
+	stmts := fmt.Sprintf(
+		`[{"SQL":"INSERT INTO snapshots (id, vm_name, host_name, name, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["s2","vm1","host-b","snapA","ready","2020-01-01T00:00:00Z","%s"]}]`, ts)
+	entries := []*pb.MutationEntry{{Seq: 1, Hlc: ts, Origin: "origin-node", Stmts: stmts}}
+
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err == nil {
+		t.Fatal("expected back-pressure error for secondary-UNIQUE collision")
+	}
+	assertNotSeen(t, c, "origin-node")
+
+	// Local row unchanged; nothing inserted.
+	rows, err := c.Query(ctx, "SELECT id FROM snapshots WHERE vm_name = ? AND name = ?", "vm1", "snapA")
+	if err != nil || len(rows) != 1 || rows[0].String("id") != "s1" {
+		t.Fatalf("local snapshot must be intact (s1), got err=%v rows=%d", err, len(rows))
+	}
+}
+
+// assertNotSeen fails if any mutation_seen row exists for origin — proving a back-pressured
+// batch did not advance the dedup watermark (the sender must retry).
+func assertNotSeen(t *testing.T, c *Client, origin string) {
+	t.Helper()
+	seen, err := c.Query(context.Background(), "SELECT COUNT(*) AS n FROM mutation_seen WHERE origin = ?", origin)
+	if err != nil {
+		t.Fatalf("query mutation_seen: %v", err)
+	}
+	if len(seen) > 0 && seen[0].Int("n") != 0 {
+		t.Errorf("mutation_seen has %d rows after back-pressure (should be 0 — sender must retry)", seen[0].Int("n"))
 	}
 }
 

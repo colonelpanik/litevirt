@@ -904,32 +904,34 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 			r.client.clock.Update(remoteTS)
 		}
 
-		// Parse statements.
+		// Parse statements. An undecodable entry is not silently skipped: back-pressure so
+		// the sender retries rather than the row being lost with the watermark advanced.
 		var stmts []Statement
 		if err := json.Unmarshal([]byte(entry.Stmts), &stmts); err != nil {
-			slog.Warn("replicator: unmarshal stmts", "seq", entry.Seq, "error", err)
-			continue
+			_ = tx.Rollback()
+			slog.Error("replicator: undecodable mutation entry — back-pressuring replication",
+				"origin", entry.Origin, "seq", entry.Seq, "error", err)
+			return 0, fmt.Errorf("decode mutation entry (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		}
 
-		// Apply each statement with LWW guard.
+		// Apply each statement fail-closed. ANY failure — schema-missing, a constraint
+		// (e.g. a secondary-UNIQUE collision the PK-aware upsert now surfaces instead of
+		// silently deleting), an operational fault, or an invalid/unprovable statement —
+		// rolls back the whole batch and stalls the watermark so nothing is dropped or
+		// recorded as seen. A permanent fault surfaces via replication backlog; the sender
+		// retries. Logs carry s.SQL (never s.Params, which hold row data).
 		for _, s := range stmts {
 			if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
-				// Schema-missing errors ("no such table", "no such
-				// column") mean the receiver is behind on migrations
-				// and silently dropping this row would lose data
-				// after the rolling upgrade completes. Roll back
-				// the whole batch and surface the error so the
-				// sender stalls its watermark and retries once
-				// this node is upgraded.
+				_ = tx.Rollback()
 				if isSchemaMissingError(err) {
-					_ = tx.Rollback()
 					slog.Error("replicator: schema-missing on receiver — back-pressuring replication",
 						"sql", s.SQL, "error", err,
 						"hint", "upgrade this daemon to match the sender")
 					return 0, fmt.Errorf("schema-missing on receiver (upgrade required): %w", err)
 				}
-				slog.Warn("replicator: apply statement", "sql", s.SQL, "hlc", entry.Hlc, "error", err)
-				// Continue — partial application is better than none.
+				slog.Error("replicator: apply failed — back-pressuring replication",
+					"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
+				return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 			}
 		}
 
@@ -1098,17 +1100,16 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 
 	// Apply INSERTs as a PK-aware upsert so a behind sender's omitted columns keep their
 	// local value instead of being reset by a whole-row replace (the reported data-loss
-	// bug); UPDATE/other run verbatim so their guards (deleted_at IS NULL, CAS) stay.
+	// bug); UPDATE/other run verbatim so their guards (deleted_at IS NULL, CAS) stay. An
+	// INSERT the rewrite can't prove safe returns an error and the caller back-pressures —
+	// never a destructive whole-row replace.
 	applied := s.SQL
 	if isInsertStatement(applied) {
-		if rewritten, ok := insertUpsertRewrite(s.SQL, pkCols); ok {
-			applied = rewritten
-		} else {
-			// The INSERT can't be safely rewritten (unparseable, or no full bound PK to
-			// conflict on). Fall back to the whole-row replace for now; the fail-closed
-			// tri-state slice replaces this fallback with back-pressure.
-			applied = replaceInsertStrategy(applied, "INSERT OR REPLACE")
+		rewritten, rerr := insertUpsertRewrite(s, pkCols, tableHasUpdatedAt(ctx, tx, tableName))
+		if rerr != nil {
+			return rerr
 		}
+		applied = rewritten
 	}
 	res, err := tx.ExecContext(ctx, applied, s.Params...)
 	if err == nil && rowsChanged(res) {
@@ -1131,28 +1132,51 @@ func rowsChanged(res sql.Result) bool {
 }
 
 // insertUpsertRewrite turns a replicated INSERT into a PK-aware upsert that preserves
-// receiver-only columns. A plain INSERT gains ON CONFLICT(pk) DO UPDATE SET nonpk =
-// excluded.nonpk built from the parsed column list, so the original VALUES tuple (params
-// and literals alike) is left untouched and only the sender-supplied non-PK columns are
-// updated on conflict. An INSERT that already carries an explicit ON CONFLICT clause keeps
-// it verbatim, with only a leading OR REPLACE/OR IGNORE normalized to a plain INSERT.
-// ok=false when the statement can't be parsed as an INSERT or lacks a full bound primary
-// key to conflict on; the caller decides the fallback.
-func insertUpsertRewrite(sql string, pkCols []string) (string, bool) {
+// receiver-only columns, failing closed (returning an error that wraps ErrInvalidStmt) on
+// anything it can't prove safe — the caller back-pressures on that error rather than
+// applying a statement that could lose data.
+//
+// A plain INSERT gains ON CONFLICT(pk) DO UPDATE SET nonpk = excluded.nonpk built from the
+// parsed column list, so the original VALUES tuple (params and literals alike) is left
+// untouched and only the sender-supplied non-PK columns are updated on conflict. An INSERT
+// that already carries an explicit ON CONFLICT clause keeps it verbatim, with only a leading
+// OR REPLACE/OR IGNORE normalized to a plain INSERT.
+//
+// Invariants (fail closed): the statement parses as an INSERT; its bound-parameter count
+// matches the supplied params; it carries a full bound primary key to conflict on. When the
+// target is an LWW table (hasUpdatedAt), it must bind updated_at (so a new row carries a
+// clock) AND — for an explicit upsert — assign updated_at in DO UPDATE SET (so the row clock
+// actually advances on conflict; otherwise a winning write would mutate other columns while
+// leaving a stale clock, corrupting later LWW comparisons).
+func insertUpsertRewrite(s Statement, pkCols []string, hasUpdatedAt bool) (string, error) {
 	if len(pkCols) == 0 {
-		return "", false
+		return "", invalidf("INSERT target has no known primary key")
 	}
-	sh, err := parseStmtShape(sql, pkCols)
-	if err != nil || sh.Kind != KindInsert {
-		return "", false
+	sh, err := parseStmtShape(s.SQL, pkCols)
+	if err != nil {
+		return "", err // already wraps ErrInvalidStmt
+	}
+	if sh.Kind != KindInsert {
+		return "", invalidf("expected INSERT, got %s", sh.Kind)
+	}
+	if err := sh.ValidateParamArity(len(s.Params)); err != nil {
+		return "", err
+	}
+	if !sh.HasFullPKIdentity {
+		return "", invalidf("INSERT into %s lacks a full bound primary key", sh.Table)
+	}
+	if hasUpdatedAt {
+		if sh.UpdatedAtParamIdx < 0 {
+			return "", invalidf("INSERT into %s omits a bound updated_at (LWW clock would not advance)", sh.Table)
+		}
+		if sh.OnConflict != nil && !conflictAssignsUpdatedAt(sh.OnConflict) {
+			return "", invalidf("explicit upsert into %s does not advance updated_at on conflict", sh.Table)
+		}
 	}
 	// An explicit upsert already scopes exactly which columns it touches; just normalize a
 	// leading algo (INSERT OR REPLACE/IGNORE → plain INSERT) and apply it verbatim.
 	if sh.OnConflict != nil {
-		return stripLeadingAlgo(sql, sh), true
-	}
-	if !sh.HasFullPKIdentity {
-		return "", false // no full PK bound → can't build ON CONFLICT(pk)
+		return stripLeadingAlgo(s.SQL, sh), nil
 	}
 	pkSet := lowerStringSet(pkCols)
 	sets := make([]string, 0, len(sh.InsertCols))
@@ -1162,12 +1186,59 @@ func insertUpsertRewrite(sql string, pkCols []string) (string, bool) {
 		}
 		sets = append(sets, c+" = excluded."+c)
 	}
-	base := strings.TrimRight(strings.TrimSpace(stripLeadingAlgo(sql, sh)), "; \t\r\n")
+	// Splice the tail at the end of the VALUES tuple (InsertValuesEnd), not the raw string
+	// end, so any trailing comment or semicolon after VALUES can't swallow the ON CONFLICT
+	// clause. The leading OR REPLACE/IGNORE span (if any) sits before InsertValuesEnd, so
+	// stripLeadingAlgo still applies to the truncated head.
+	if sh.InsertValuesEnd <= 0 || sh.InsertValuesEnd > len(s.SQL) {
+		return "", invalidf("INSERT into %s: could not locate VALUES tuple end", sh.Table)
+	}
+	base := stripLeadingAlgo(s.SQL[:sh.InsertValuesEnd], sh)
 	conflict := " ON CONFLICT(" + strings.Join(pkCols, ", ") + ") "
 	if len(sets) == 0 {
-		return base + conflict + "DO NOTHING", true
+		return base + conflict + "DO NOTHING", nil
 	}
-	return base + conflict + "DO UPDATE SET " + strings.Join(sets, ", "), true
+	return base + conflict + "DO UPDATE SET " + strings.Join(sets, ", "), nil
+}
+
+// conflictAssignsUpdatedAt reports whether a DO UPDATE SET assigns updated_at, i.e. the row
+// clock advances on conflict.
+func conflictAssignsUpdatedAt(cc *ConflictClause) bool {
+	for _, a := range cc.Assignments {
+		if strings.EqualFold(a.Column, "updated_at") {
+			return true
+		}
+	}
+	return false
+}
+
+// tableHasUpdatedAt reports whether a known table has an updated_at column, read through the
+// open tx (PRAGMA) so it needs no client lock — ApplyRemoteMutations already holds the write
+// lock, which readTableColumns would deadlock on. Only known tables (in tablePrimaryKeys)
+// are queried, so the interpolated name is never peer-controlled.
+func tableHasUpdatedAt(ctx context.Context, tx *sql.Tx, table string) bool {
+	if _, known := tablePrimaryKeys[table]; !known {
+		return false
+	}
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, typ        string
+			dflt             interface{}
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return false
+		}
+		if strings.EqualFold(name, "updated_at") {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldSkipLWW reports whether to skip applying the incoming mutation under

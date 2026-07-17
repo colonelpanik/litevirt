@@ -155,7 +155,6 @@ func scanPkg(pkg *packages.Package) []finding {
 			if isPlumbingMethod(pkg, fd) {
 				continue
 			}
-			s := &scanner{pkg: pkg, funcByName: funcByName, pol: pol, fn: fd}
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok {
@@ -173,6 +172,8 @@ func scanPkg(pkg *packages.Package) []finding {
 				if selection == nil || selection.Kind() != types.MethodVal || !isCorrosionClient(selection.Recv()) {
 					return true
 				}
+				// Fresh scanner (fresh recursion-visited set) per call site.
+				s := &scanner{pkg: pkg, funcByName: funcByName, pol: pol, fn: fd, visited: map[*ast.FuncDecl]bool{}}
 				switch method {
 				case "Execute", "ExecuteRows", "ExecuteDeferred":
 					if len(call.Args) >= 2 {
@@ -226,6 +227,7 @@ type scanner struct {
 	funcByName map[string]*ast.FuncDecl
 	pol        func(ast.Node) string
 	fn         *ast.FuncDecl
+	visited    map[*ast.FuncDecl]bool // helper-recursion guard, shared across nested scanners
 }
 
 // resolveBatchArg resolves the []Statement argument of an ExecuteBatch* call to the concrete
@@ -243,8 +245,10 @@ func (s *scanner) resolveBatchArg(arg ast.Expr, pol string) []finding {
 		}
 		return out
 	case *ast.Ident: // a local variable built via `:= []Statement{...}` and/or append(...)
-		if fs := s.resolveSliceVar(e, pol); fs != nil {
-			return fs
+		if obj := s.pkg.TypesInfo.ObjectOf(e); obj != nil {
+			if fs := s.resolveSliceVar(obj, pol); fs != nil {
+				return fs
+			}
 		}
 	case *ast.CallExpr: // a helper returning []Statement
 		if fs := s.resolveHelperReturn(e, pol); fs != nil {
@@ -267,66 +271,73 @@ func (s *scanner) resolveStmtElt(elt ast.Expr, pol string) []finding {
 			if sqlExpr := statementSQLField(e); sqlExpr != nil {
 				return []finding{resolveSQL(s.pkg, sqlExpr, pol)}
 			}
-			// A Statement{} with no SQL field is a zero value / error-path return
-			// (`return Statement{}, err`), not a real statement — skip it.
-			return []finding{}
+			// ONLY an entirely empty Statement{} is the intentional zero-value / error-path
+			// return (`return Statement{}, err`). Any other composite that lacks a
+			// statically-resolvable SQL field (e.g. Statement{Params: …}, or a keyless one)
+			// must fail closed rather than be assumed harmless.
+			if len(e.Elts) == 0 {
+				return []finding{}
+			}
+			return []finding{{pos: s.pkg.Fset.Position(e.Pos()), unresolvedBatch: true, policy: pol}}
 		}
 	case *ast.CallExpr:
 		if fs := s.resolveHelperReturn(e, pol); fs != nil {
 			return fs
 		}
 	case *ast.Ident:
-		if fs := s.resolveStmtVar(e, pol); fs != nil {
-			return fs
+		if obj := s.pkg.TypesInfo.ObjectOf(e); obj != nil {
+			if fs := s.resolveStmtVar(obj, pol); fs != nil {
+				return fs
+			}
 		}
 	}
 	return []finding{{pos: s.pkg.Fset.Position(elt.Pos()), unresolvedBatch: true, policy: pol}}
 }
 
-// resolveStmtVar traces a local Statement variable to the Statement composite or helper
-// call assigned to it within the enclosing function (handles `x := Statement{...}`,
-// `x = Statement{...}`, and `x, err := helper()`).
-func (s *scanner) resolveStmtVar(id *ast.Ident, pol string) []finding {
+// assignsTo reports whether any LHS ident of as refers to the SAME object (not merely the
+// same name — this defeats shadowing, review finding 2). Uses go/types object identity.
+func (s *scanner) assignsTo(as *ast.AssignStmt, target types.Object) bool {
+	for _, l := range as.Lhs {
+		if lid, ok := l.(*ast.Ident); ok && s.pkg.TypesInfo.ObjectOf(lid) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveStmtVar traces a local Statement variable (by object identity) to the Statement
+// composite or helper call assigned to it within the enclosing function. Over-approximates
+// across branches (every assignment to the object is included); any unresolvable assignment
+// yields an unresolved finding, so the batch fails closed.
+func (s *scanner) resolveStmtVar(target types.Object, pol string) []finding {
 	var out []finding
 	found := false
 	ast.Inspect(s.fn.Body, func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
-		if !ok || len(as.Rhs) != 1 {
+		if !ok || len(as.Rhs) != 1 || !s.assignsTo(as, target) {
 			return true
 		}
-		for _, l := range as.Lhs {
-			if lid, ok := l.(*ast.Ident); ok && lid.Name == id.Name {
-				found = true
-				out = append(out, s.resolveStmtElt(as.Rhs[0], pol)...)
-				break
-			}
-		}
+		found = true
+		out = append(out, s.resolveStmtElt(as.Rhs[0], pol)...)
 		return true
 	})
 	if !found {
 		return nil
 	}
+	if out == nil {
+		out = []finding{}
+	}
 	return out
 }
 
-// resolveSliceVar collects statements assigned to a []Statement local via `var/:=`
-// initialization and `append(v, …)` within the enclosing function.
-func (s *scanner) resolveSliceVar(id *ast.Ident, pol string) []finding {
+// resolveSliceVar collects statements assigned to a []Statement local (by object identity)
+// via `:=`/`=` initialization and `append(v, …)` within the enclosing function.
+func (s *scanner) resolveSliceVar(target types.Object, pol string) []finding {
 	var out []finding
 	found := false
 	ast.Inspect(s.fn.Body, func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
-		if !ok || len(as.Rhs) != 1 {
-			return true
-		}
-		// match assignments whose LHS is our identifier
-		lhsMatch := false
-		for _, l := range as.Lhs {
-			if lid, ok := l.(*ast.Ident); ok && lid.Name == id.Name {
-				lhsMatch = true
-			}
-		}
-		if !lhsMatch {
+		if !ok || len(as.Rhs) != 1 || !s.assignsTo(as, target) {
 			return true
 		}
 		switch rhs := as.Rhs[0].(type) {
@@ -335,13 +346,22 @@ func (s *scanner) resolveSliceVar(id *ast.Ident, pol string) []finding {
 			for _, elt := range rhs.Elts {
 				out = append(out, s.resolveStmtElt(elt, pol)...)
 			}
-		case *ast.CallExpr: // v = append(v, Statement{...}, helper()...)
-			if fn, ok := rhs.Fun.(*ast.Ident); ok && fn.Name == "append" {
-				found = true
+		case *ast.CallExpr:
+			found = true
+			if fn, ok := rhs.Fun.(*ast.Ident); ok && fn.Name == "append" { // v = append(v, …)
 				for _, a := range rhs.Args[1:] {
 					out = append(out, s.resolveStmtElt(a, pol)...)
 				}
+			} else if fn, ok := rhs.Fun.(*ast.Ident); ok && fn.Name == "make" {
+				// v := make([]Statement, …) — an empty init; the appends carry the statements.
+			} else if fs := s.resolveHelperReturn(rhs, pol); fs != nil { // v = buildStmts()
+				out = append(out, fs...)
+			} else {
+				out = append(out, finding{pos: s.pkg.Fset.Position(rhs.Pos()), unresolvedBatch: true, policy: pol})
 			}
+		default:
+			found = true
+			out = append(out, finding{pos: s.pkg.Fset.Position(as.Rhs[0].Pos()), unresolvedBatch: true, policy: pol})
 		}
 		return true
 	})
@@ -361,11 +381,23 @@ func (s *scanner) resolveHelperReturn(call *ast.CallExpr, pol string) []finding 
 	if !ok {
 		return nil
 	}
+	// Resolve by object identity: only a package-level function (not a local var of the
+	// same name, and not a method) is followed.
+	if _, isFunc := s.pkg.TypesInfo.ObjectOf(id).(*types.Func); !isFunc {
+		return nil
+	}
 	fd := s.funcByName[id.Name]
 	if fd == nil || fd.Body == nil {
 		return nil
 	}
-	inner := &scanner{pkg: s.pkg, funcByName: s.funcByName, pol: s.pol, fn: fd}
+	if s.visited == nil {
+		s.visited = map[*ast.FuncDecl]bool{}
+	}
+	if s.visited[fd] {
+		return nil // recursion guard
+	}
+	s.visited[fd] = true
+	inner := &scanner{pkg: s.pkg, funcByName: s.funcByName, pol: s.pol, fn: fd, visited: s.visited}
 	var out []finding
 	found := false
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -507,11 +539,23 @@ func constString(pkg *packages.Package, e ast.Expr) (string, bool) {
 	return constant.StringVal(tv.Value), true
 }
 
-// policyOK reports whether a //stmtshape:policy directive names a registered policy.
+// policyOK reports whether a //stmtshape:policy directive names a registered policy that is
+// nonempty and whose every declared expansion fingerprint exists in the ledger. This does
+// NOT prove the builder's dynamic expression can only produce those fingerprints — that
+// requires either refactoring the builder to finite constant statements or a structured
+// expression policy (tracked with the four dynamic builders); a bare ID is not enough.
 func policyOK(id string) bool {
 	if id == "" {
 		return false
 	}
-	_, ok := corrosion.PolicyLookup(id)
-	return ok
+	fps, ok := corrosion.PolicyLookup(id)
+	if !ok || len(fps) == 0 {
+		return false
+	}
+	for _, fp := range fps {
+		if _, ok := corrosion.LedgerLookup(fp); !ok {
+			return false
+		}
+	}
+	return true
 }

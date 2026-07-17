@@ -348,6 +348,11 @@ func (s *scanner) resolveStmtVar(target types.Object, pol string) []finding {
 	if !s.isLocalDefinable(target) {
 		return nil // param/global/result ⇒ cannot prove; caller fails closed
 	}
+	if s.escapes(target, false) {
+		// A field write (stmt.SQL=…) or address escape (&stmt) can change the executed SQL
+		// after the composite was fingerprinted ⇒ fail closed (finding: in-place mutation).
+		return []finding{{pos: s.pkg.Fset.Position(target.Pos()), unresolvedBatch: true, policy: pol}}
+	}
 	var out []finding
 	found := false
 	ast.Inspect(s.fn.Body, func(n ast.Node) bool {
@@ -375,11 +380,103 @@ func (s *scanner) precedesCall(n ast.Node) bool {
 	return s.callPos == token.NoPos || n.Pos() < s.callPos
 }
 
+// escapes reports whether the tracked value is mutated in place, or its identity escapes to
+// code the guard cannot see, BEFORE the call — so the SQL actually executed may differ from
+// the composite the resolver fingerprinted, and it must fail closed. It detects, before the
+// call: a field/element write rooted at the object (x.SQL=…, s[i]=…, s[i].SQL=…); taking its
+// address (&x, &s[i], &x.SQL); and — for a slice, whose backing array is shared — passing it
+// to any call other than a mutation-safe builtin / a read-only Execute* sink.
+func (s *scanner) escapes(target types.Object, isSlice bool) bool {
+	escaped := false
+	ast.Inspect(s.fn.Body, func(n ast.Node) bool {
+		if escaped || n == nil {
+			return !escaped
+		}
+		if !s.precedesCall(n) {
+			return true
+		}
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			for _, l := range x.Lhs {
+				if _, plain := l.(*ast.Ident); plain {
+					continue // plain reassignment of the root is modeled by the resolvers
+				}
+				if s.rootsAt(l, target) {
+					escaped = true // x.SQL = …, s[i] = …, s[i].SQL = …
+				}
+			}
+		case *ast.UnaryExpr:
+			if x.Op == token.AND && s.rootsAt(x.X, target) {
+				escaped = true // &x / &s[i] / &x.SQL — the value can be mutated through the pointer
+			}
+		case *ast.CallExpr:
+			if isMutationSafeCall(x) {
+				return true
+			}
+			for _, a := range x.Args {
+				if id, ok := a.(*ast.Ident); ok && isSlice && s.pkg.TypesInfo.ObjectOf(id) == target {
+					escaped = true // a slice shares its backing array → the callee may mutate it
+				}
+			}
+		}
+		return true
+	})
+	return escaped
+}
+
+// rootsAt reports whether the root identifier of an lvalue/address expression is target.
+func (s *scanner) rootsAt(e ast.Expr, target types.Object) bool {
+	id := rootIdent(e)
+	return id != nil && s.pkg.TypesInfo.ObjectOf(id) == target
+}
+
+func rootIdent(e ast.Expr) *ast.Ident {
+	for {
+		switch x := e.(type) {
+		case *ast.Ident:
+			return x
+		case *ast.SelectorExpr:
+			e = x.X
+		case *ast.IndexExpr:
+			e = x.X
+		case *ast.StarExpr:
+			e = x.X
+		case *ast.ParenExpr:
+			e = x.X
+		default:
+			return nil
+		}
+	}
+}
+
+// isMutationSafeCall whitelists calls that cannot mutate a tracked value's SQL: the append/
+// make/len/cap builtins and a read-only corrosion Execute* sink.
+func isMutationSafeCall(x *ast.CallExpr) bool {
+	switch fn := x.Fun.(type) {
+	case *ast.Ident:
+		switch fn.Name {
+		case "append", "make", "len", "cap":
+			return true
+		}
+	case *ast.SelectorExpr:
+		if isReplicatingMethod(fn.Sel.Name) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveSliceVar collects statements assigned to a []Statement local (by object identity)
 // via `:=`/`=` initialization and `append(v, …)` within the enclosing function.
 func (s *scanner) resolveSliceVar(target types.Object, pol string) []finding {
 	if !s.isLocalDefinable(target) {
 		return nil // param/global/result ⇒ cannot prove; caller fails closed
+	}
+	if s.escapes(target, true) {
+		// An element write (stmts[i]=…), address escape (&stmts[i]), or passing the slice —
+		// whose backing array is shared — to unknown code can change the executed SQL after
+		// the composite was fingerprinted ⇒ fail closed.
+		return []finding{{pos: s.pkg.Fset.Position(target.Pos()), unresolvedBatch: true, policy: pol}}
 	}
 	var out []finding
 	found := false

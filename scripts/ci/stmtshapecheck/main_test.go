@@ -14,7 +14,8 @@ type classCount struct{ resolved, dynamic, unresolved, parseErr int }
 // dropped case can't be masked by a duplicated one (review finding 3). Covers direct/const
 // calls, inline/appended/helper/guarded batches, shadowing, assignment-after-call,
 // non-dominating parameter reassignment, the same helper twice, unkeyed composites,
-// recursion (no hang), a runtime-built statement, and an unrelated Execute method.
+// in-place field/index mutation + slice escape to an opaque helper, recursion (no hang),
+// a runtime-built statement, and an unrelated Execute method.
 func TestScanPkg_Fixtures(t *testing.T) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
@@ -52,19 +53,22 @@ func TestScanPkg_Fixtures(t *testing.T) {
 	}
 
 	want := map[string]classCount{
-		"Direct":            {resolved: 1},
-		"ConstBuilder":      {resolved: 1},
-		"InlineBatch":       {resolved: 2},
-		"AppendedBatch":     {resolved: 2},
-		"HelperReturnBatch": {resolved: 1},
-		"Guarded":           {resolved: 1},
-		"SameHelperTwice":   {resolved: 2}, // finding 4: visited set popped, both calls resolve
-		"Shadowed":          {unresolved: 1},
-		"AssignAfterCall":   {unresolved: 1}, // finding 1: post-call assignment ignored
-		"CondParam":         {unresolved: 1}, // finding 1: non-dominating param def rejected
-		"UnkeyedComposite":  {unresolved: 1}, // finding 3: non-empty keyless Statement fails closed
-		"RecursiveBatch":    {unresolved: 1},
-		"DynamicBuilder":    {dynamic: 1},
+		"Direct":             {resolved: 1},
+		"ConstBuilder":       {resolved: 1},
+		"InlineBatch":        {resolved: 2},
+		"AppendedBatch":      {resolved: 2},
+		"HelperReturnBatch":  {resolved: 1},
+		"Guarded":            {resolved: 1},
+		"SameHelperTwice":    {resolved: 2}, // finding 4: visited set popped, both calls resolve
+		"Shadowed":           {unresolved: 1},
+		"AssignAfterCall":    {unresolved: 1}, // finding 1: post-call assignment ignored
+		"CondParam":          {unresolved: 1}, // finding 1: non-dominating param def rejected
+		"UnkeyedComposite":   {unresolved: 1}, // finding 3: non-empty keyless Statement fails closed
+		"RecursiveBatch":     {unresolved: 1},
+		"FieldMutation":      {unresolved: 1}, // escape: stmt.SQL rewritten before the call
+		"IndexedReplacement": {unresolved: 1}, // escape: stmts[i] replaced before the call
+		"HelperMutation":     {unresolved: 1}, // escape: slice passed to opaque helper
+		"DynamicBuilder":     {dynamic: 1},
 	}
 	for fn, exp := range want {
 		cc := got[fn]

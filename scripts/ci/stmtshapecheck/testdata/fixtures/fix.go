@@ -78,6 +78,29 @@ func RecursiveBatch(c *corrosion.Client, ctx context.Context) {
 	_ = c.ExecuteBatch(ctx, recSelf()) // want: unresolved (recursion guarded)
 }
 
+// AssignAfterCall: the only assignment to the param is AFTER the call, so it must not count
+// (flow-sensitivity, review finding 1).
+func AssignAfterCall(c *corrosion.Client, ctx context.Context, stmts []corrosion.Statement) {
+	_ = c.ExecuteBatch(ctx, stmts) // want: unresolved (assignment is after the call)
+	stmts = []corrosion.Statement{{SQL: "INSERT INTO t (a) VALUES (?)"}}
+	_ = stmts
+}
+
+// CondParam: a conditional (non-dominating) reassignment of a PARAMETER must not make it
+// resolved — the param's input value can still reach the call.
+func CondParam(c *corrosion.Client, ctx context.Context, cond bool, stmts []corrosion.Statement) {
+	if cond {
+		stmts = []corrosion.Statement{{SQL: "INSERT INTO t (a) VALUES (?)"}}
+	}
+	_ = c.ExecuteBatch(ctx, stmts) // want: unresolved (parameter, non-dominating def)
+}
+
+// SameHelperTwice: the same non-recursive helper appears twice in one batch; the visited set
+// must be popped so the second call is not mistaken for recursion (review finding 4).
+func SameHelperTwice(c *corrosion.Client, ctx context.Context) {
+	_ = c.ExecuteBatch(ctx, []corrosion.Statement{helperStmt(), helperStmt()}) // want: 2 resolved
+}
+
 // UnrelatedExecute uses text/template.Execute — a different Execute; must NOT be flagged.
 func UnrelatedExecute(tmpl *template.Template) {
 	_ = tmpl.Execute(nil, "UPDATE t SET a = ? WHERE id = ?")

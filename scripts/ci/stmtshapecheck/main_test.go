@@ -1,19 +1,20 @@
 package main
 
 import (
-	"os"
-	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
 )
 
+// classCount is a per-builder tally of finding classes.
+type classCount struct{ resolved, dynamic, unresolved, parseErr int }
+
 // TestScanPkg_Fixtures loads the testdata fixture package with type info and asserts the
-// guard classifies each call/dataflow pattern correctly: direct calls, const SQL, inline /
-// appended / helper-returned / guarded batches (resolved); shadowed params, unkeyed
-// composites, and recursive helpers (unresolved, fail closed); a runtime-built statement
-// (dynamic); and an unrelated Execute method (ignored, not flagged). It also proves the
-// recursion guard terminates.
+// EXACT classification and multiplicity the guard produces for each builder function, so a
+// dropped case can't be masked by a duplicated one (review finding 3). Covers direct/const
+// calls, inline/appended/helper/guarded batches, shadowing, assignment-after-call,
+// non-dominating parameter reassignment, the same helper twice, unkeyed composites,
+// recursion (no hang), a runtime-built statement, and an unrelated Execute method.
 func TestScanPkg_Fixtures(t *testing.T) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
@@ -31,58 +32,87 @@ func TestScanPkg_Fixtures(t *testing.T) {
 		t.Fatalf("expected 1 fixture package, got %d", len(pkgs))
 	}
 
-	var resolved, dynamic, unresolved, parseErr int
-	byLineOK := map[int]bool{} // line -> classified (any)
+	got := map[string]*classCount{}
 	for _, f := range scanPkg(pkgs[0]) {
-		byLineOK[f.pos.Line] = true
+		cc := got[f.fn]
+		if cc == nil {
+			cc = &classCount{}
+			got[f.fn] = cc
+		}
 		switch {
 		case f.unresolvedBatch:
-			unresolved++
+			cc.unresolved++
 		case f.dynamic:
-			dynamic++
+			cc.dynamic++
 		case f.parseErr != "":
-			parseErr++
+			cc.parseErr++
 		default:
-			resolved++
+			cc.resolved++
 		}
 	}
 
-	if parseErr != 0 {
-		t.Errorf("parseErr = %d, want 0", parseErr)
+	want := map[string]classCount{
+		"Direct":            {resolved: 1},
+		"ConstBuilder":      {resolved: 1},
+		"InlineBatch":       {resolved: 2},
+		"AppendedBatch":     {resolved: 2},
+		"HelperReturnBatch": {resolved: 1},
+		"Guarded":           {resolved: 1},
+		"SameHelperTwice":   {resolved: 2}, // finding 4: visited set popped, both calls resolve
+		"Shadowed":          {unresolved: 1},
+		"AssignAfterCall":   {unresolved: 1}, // finding 1: post-call assignment ignored
+		"CondParam":         {unresolved: 1}, // finding 1: non-dominating param def rejected
+		"UnkeyedComposite":  {unresolved: 1}, // finding 3: non-empty keyless Statement fails closed
+		"RecursiveBatch":    {unresolved: 1},
+		"DynamicBuilder":    {dynamic: 1},
 	}
-	if dynamic != 1 {
-		t.Errorf("dynamic = %d, want 1 (DynamicBuilder)", dynamic)
+	for fn, exp := range want {
+		cc := got[fn]
+		if cc == nil {
+			t.Errorf("%s: no findings, want %+v", fn, exp)
+			continue
+		}
+		if *cc != exp {
+			t.Errorf("%s: got %+v, want %+v", fn, *cc, exp)
+		}
 	}
-	if unresolved != 3 {
-		t.Errorf("unresolved = %d, want 3 (Shadowed, UnkeyedComposite, RecursiveBatch)", unresolved)
-	}
-	// Direct, ConstBuilder, InlineBatch(×2), AppendedBatch(≥2), HelperReturnBatch, Guarded.
-	if resolved < 8 {
-		t.Errorf("resolved = %d, want >= 8", resolved)
-	}
-
-	// The unrelated text/template Execute must not be flagged: total findings equal the sum
-	// of the corrosion-only classifications, so any stray would show up as an extra dynamic
-	// (the template SQL arg is a string literal, so it would fingerprint if wrongly matched).
-	// Assert by checking the fixture's UnrelatedExecute line produced no finding.
-	unrelatedLine := findWantLine(t, "UnrelatedExecute uses text/template")
-	if byLineOK[unrelatedLine+1] { // the Execute call is on the next line
-		t.Errorf("text/template.Execute at ~line %d was flagged; must be ignored", unrelatedLine+1)
+	// UnrelatedExecute (text/template.Execute) and pure helpers must produce nothing.
+	for fn := range got {
+		if _, expected := want[fn]; !expected {
+			t.Errorf("unexpected findings attributed to %q: %+v", fn, *got[fn])
+		}
 	}
 }
 
-// findWantLine returns the 1-based line of the fixture source containing marker.
-func findWantLine(t *testing.T, marker string) int {
-	t.Helper()
-	data, err := os.ReadFile("testdata/fixtures/fix.go")
-	if err != nil {
-		t.Fatalf("read fixture: %v", err)
-	}
-	for i, line := range strings.Split(string(data), "\n") {
-		if strings.Contains(line, marker) {
-			return i + 1
+// TestCheckPolicy covers the policy-acceptance logic (review findings 1/2): an unknown,
+// empty, or missing-ledger-expansion policy must be rejected; only a registered, nonempty
+// policy whose every expansion is in the ledger is accepted.
+func TestCheckPolicy(t *testing.T) {
+	inLedger := func(present ...string) func(string) bool {
+		set := map[string]bool{}
+		for _, p := range present {
+			set[p] = true
 		}
+		return func(fp string) bool { return set[fp] }
 	}
-	t.Fatalf("marker %q not found in fixture", marker)
-	return 0
+	cases := []struct {
+		name       string
+		fps        []string
+		registered bool
+		ledger     func(string) bool
+		want       bool
+	}{
+		{"unknown policy", nil, false, inLedger(), false},
+		{"empty policy", []string{}, true, inLedger(), false},
+		{"expansion missing from ledger", []string{"fpA"}, true, inLedger(), false},
+		{"partially missing", []string{"fpA", "fpB"}, true, inLedger("fpA"), false},
+		{"all expansions in ledger", []string{"fpA", "fpB"}, true, inLedger("fpA", "fpB"), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := checkPolicy(c.fps, c.registered, c.ledger); got != c.want {
+				t.Fatalf("checkPolicy = %v, want %v", got, c.want)
+			}
+		})
+	}
 }

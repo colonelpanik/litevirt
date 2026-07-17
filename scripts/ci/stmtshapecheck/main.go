@@ -38,6 +38,7 @@ const corrosionPkgPath = "github.com/litevirt/litevirt/internal/corrosion"
 
 type finding struct {
 	pos             token.Position
+	fn              string // enclosing builder function (for diagnostics/tests)
 	sql             string
 	dynamic         bool // SQL is not a compile-time constant (runtime-built)
 	unresolvedBatch bool // an ExecuteBatch arg that could not be statically enumerated
@@ -172,22 +173,28 @@ func scanPkg(pkg *packages.Package) []finding {
 				if selection == nil || selection.Kind() != types.MethodVal || !isCorrosionClient(selection.Recv()) {
 					return true
 				}
-				// Fresh scanner (fresh recursion-visited set) per call site.
-				s := &scanner{pkg: pkg, funcByName: funcByName, pol: pol, fn: fd, visited: map[*ast.FuncDecl]bool{}}
+				// Fresh scanner (fresh recursion-visited set) per call site; only
+				// assignments before this call may define its batch argument.
+				s := &scanner{pkg: pkg, funcByName: funcByName, pol: pol, fn: fd, callPos: call.Pos(), visited: map[*ast.FuncDecl]bool{}}
+				var got []finding
 				switch method {
 				case "Execute", "ExecuteRows", "ExecuteDeferred":
 					if len(call.Args) >= 2 {
-						out = append(out, resolveSQL(pkg, call.Args[1], pol(call)))
+						got = []finding{resolveSQL(pkg, call.Args[1], pol(call))}
 					}
 				case "ExecuteBatch": // (ctx, stmts)
 					if len(call.Args) >= 2 {
-						out = append(out, s.resolveBatchArg(call.Args[1], pol(call))...)
+						got = s.resolveBatchArg(call.Args[1], pol(call))
 					}
 				case "ExecuteBatchGuarded": // (ctx, guard, stmts)
 					if len(call.Args) >= 3 {
-						out = append(out, s.resolveBatchArg(call.Args[2], pol(call))...)
+						got = s.resolveBatchArg(call.Args[2], pol(call))
 					}
 				}
+				for i := range got {
+					got[i].fn = fd.Name.Name // attribute to the calling builder
+				}
+				out = append(out, got...)
 				return true
 			})
 		}
@@ -227,7 +234,35 @@ type scanner struct {
 	funcByName map[string]*ast.FuncDecl
 	pol        func(ast.Node) string
 	fn         *ast.FuncDecl
+	callPos    token.Pos              // only assignments BEFORE this position may define the batch arg
 	visited    map[*ast.FuncDecl]bool // helper-recursion guard, shared across nested scanners
+}
+
+// isLocalDefinable reports whether obj is a function-local variable whose value at the call
+// can be established from assignments in the body. Parameters, results, the receiver, and
+// package-level globals are rejected (conservative, review finding 1): their value can enter
+// from outside or be set on a non-dominating path, so they cannot be proven resolved here.
+func (s *scanner) isLocalDefinable(obj types.Object) bool {
+	if obj == nil || obj.Parent() == s.pkg.Types.Scope() {
+		return false
+	}
+	inFields := func(fl *ast.FieldList) bool {
+		if fl == nil {
+			return false
+		}
+		for _, f := range fl.List {
+			for _, n := range f.Names {
+				if s.pkg.TypesInfo.ObjectOf(n) == obj {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if inFields(s.fn.Recv) || inFields(s.fn.Type.Params) || inFields(s.fn.Type.Results) {
+		return false
+	}
+	return true
 }
 
 // resolveBatchArg resolves the []Statement argument of an ExecuteBatch* call to the concrete
@@ -310,11 +345,14 @@ func (s *scanner) assignsTo(as *ast.AssignStmt, target types.Object) bool {
 // across branches (every assignment to the object is included); any unresolvable assignment
 // yields an unresolved finding, so the batch fails closed.
 func (s *scanner) resolveStmtVar(target types.Object, pol string) []finding {
+	if !s.isLocalDefinable(target) {
+		return nil // param/global/result ⇒ cannot prove; caller fails closed
+	}
 	var out []finding
 	found := false
 	ast.Inspect(s.fn.Body, func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
-		if !ok || len(as.Rhs) != 1 || !s.assignsTo(as, target) {
+		if !ok || len(as.Rhs) != 1 || !s.precedesCall(as) || !s.assignsTo(as, target) {
 			return true
 		}
 		found = true
@@ -330,14 +368,24 @@ func (s *scanner) resolveStmtVar(target types.Object, pol string) []finding {
 	return out
 }
 
+// precedesCall reports whether n occurs before the call being resolved. Combined with the
+// param/global rejection this is a conservative stand-in for reaching-definition dominance:
+// an assignment after the call, or to a value that can enter from outside, cannot count.
+func (s *scanner) precedesCall(n ast.Node) bool {
+	return s.callPos == token.NoPos || n.Pos() < s.callPos
+}
+
 // resolveSliceVar collects statements assigned to a []Statement local (by object identity)
 // via `:=`/`=` initialization and `append(v, …)` within the enclosing function.
 func (s *scanner) resolveSliceVar(target types.Object, pol string) []finding {
+	if !s.isLocalDefinable(target) {
+		return nil // param/global/result ⇒ cannot prove; caller fails closed
+	}
 	var out []finding
 	found := false
 	ast.Inspect(s.fn.Body, func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
-		if !ok || len(as.Rhs) != 1 || !s.assignsTo(as, target) {
+		if !ok || len(as.Rhs) != 1 || !s.precedesCall(as) || !s.assignsTo(as, target) {
 			return true
 		}
 		switch rhs := as.Rhs[0].(type) {
@@ -394,9 +442,12 @@ func (s *scanner) resolveHelperReturn(call *ast.CallExpr, pol string) []finding 
 		s.visited = map[*ast.FuncDecl]bool{}
 	}
 	if s.visited[fd] {
-		return nil // recursion guard
+		return nil // on the active call stack ⇒ genuine recursion; stop
 	}
+	// Stack semantics: mark for the duration of THIS descent, then pop — so the same
+	// non-recursive helper called twice in one batch is not mistaken for recursion.
 	s.visited[fd] = true
+	defer delete(s.visited, fd)
 	inner := &scanner{pkg: s.pkg, funcByName: s.funcByName, pol: s.pol, fn: fd, visited: s.visited}
 	var out []finding
 	found := false
@@ -406,6 +457,8 @@ func (s *scanner) resolveHelperReturn(call *ast.CallExpr, pol string) []finding 
 			return true
 		}
 		r0 := ret.Results[0]
+		// Within the helper, its own statements are built before this return.
+		inner.callPos = ret.Pos()
 		t := s.pkg.TypesInfo.TypeOf(r0)
 		switch {
 		case isCorrosionStatement(t):
@@ -549,11 +602,20 @@ func policyOK(id string) bool {
 		return false
 	}
 	fps, ok := corrosion.PolicyLookup(id)
-	if !ok || len(fps) == 0 {
+	return checkPolicy(fps, ok, func(fp string) bool {
+		_, has := corrosion.LedgerLookup(fp)
+		return has
+	})
+}
+
+// checkPolicy is the pure validation: a policy is acceptable only if it is registered,
+// nonempty, and every expansion fingerprint exists in the ledger. (Injectable for tests.)
+func checkPolicy(fps []string, registered bool, ledgerHas func(string) bool) bool {
+	if !registered || len(fps) == 0 {
 		return false
 	}
 	for _, fp := range fps {
-		if _, ok := corrosion.LedgerLookup(fp); !ok {
+		if !ledgerHas(fp) {
 			return false
 		}
 	}

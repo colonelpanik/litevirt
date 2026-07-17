@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -672,29 +671,7 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		}
 	}
 
-	// Build SET clauses from non-empty fields.
-	sets := []string{}
-	args := []interface{}{}
-	if req.FenceStrategy != "" {
-		sets = append(sets, "fence_strategy = ?")
-		args = append(args, req.FenceStrategy)
-	}
-	if req.IpmiAddress != "" {
-		sets = append(sets, "ipmi_address = ?")
-		args = append(args, req.IpmiAddress)
-	}
-	if req.IpmiUser != "" {
-		sets = append(sets, "ipmi_user = ?")
-		args = append(args, req.IpmiUser)
-	}
-	if req.IpmiPass != "" {
-		sets = append(sets, "ipmi_pass = ?")
-		args = append(args, req.IpmiPass)
-	}
-	if req.WatchdogDev != "" {
-		sets = append(sets, "watchdog_dev = ?")
-		args = append(args, req.WatchdogDev)
-	}
+	// Validate role if provided (side-effecting: refuse witness promotion with VMs).
 	if req.Role != "" {
 		switch req.Role {
 		case "worker", "witness":
@@ -702,7 +679,6 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 			return nil, status.Errorf(codes.InvalidArgument,
 				"invalid host role %q (valid: worker, witness)", req.Role)
 		}
-		// Refuse promotion to witness if the host still has any VMs.
 		if req.Role == "witness" {
 			vms, err := corrosion.ListVMs(ctx, s.db, "", req.Name)
 			if err != nil {
@@ -714,33 +690,55 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 					req.Name, len(vms))
 			}
 		}
-		sets = append(sets, "role = ?")
-		args = append(args, req.Role)
-	}
-	if req.Region != "" {
-		sets = append(sets, "region = ?")
-		args = append(args, req.Region)
 	}
 
-	if len(sets) == 0 {
+	// One CONSTANT statement (compile-time visible to the ledger / replication apply path)
+	// instead of a dynamically-assembled SET list: each field is COALESCE(?, col), so an
+	// unspecified field (NULL param) keeps its current value and is never clobbered, while a
+	// specified field is set. Order must match configureHostSQL. hosts is replicated, so
+	// updated_at is the monotonic LWW key.
+	fields := []string{
+		req.FenceStrategy, req.IpmiAddress, req.IpmiUser, req.IpmiPass,
+		req.WatchdogDev, req.Role, req.Region,
+	}
+	args := make([]interface{}, 0, len(fields)+2)
+	provided := 0
+	for _, f := range fields {
+		if f == "" {
+			args = append(args, nil)
+			continue
+		}
+		args = append(args, f)
+		provided++
+	}
+	if provided == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no fields to update")
 	}
+	args = append(args, s.db.NowTS(), req.Name)
 
-	sets = append(sets, "updated_at = ?")
-	args = append(args, s.db.NowTS()) // monotonic LWW key (hosts is replicated)
-	args = append(args, req.Name)
-
-	query := fmt.Sprintf("UPDATE hosts SET %s WHERE name = ?",
-		strings.Join(sets, ", "))
-	if err := s.db.Execute(ctx, query, args...); err != nil {
+	if err := s.db.Execute(ctx, configureHostSQL, args...); err != nil {
 		return nil, status.Errorf(codes.Internal, "update host config: %v", err)
 	}
 
 	slog.Info("host configured", "host", req.Name)
-	s.audit(ctx, "host.configure", req.Name, fmt.Sprintf("fields=%d", len(sets)-1), "ok")
+	s.audit(ctx, "host.configure", req.Name, fmt.Sprintf("fields=%d", provided), "ok")
 
 	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
 }
+
+// configureHostSQL is the single fixed shape ConfigureHost emits. COALESCE(?, col) keeps a
+// field's current value when its param is NULL (field not supplied), so a partial update
+// touches only the supplied fields without a dynamic SET list.
+const configureHostSQL = `UPDATE hosts SET ` +
+	`fence_strategy = COALESCE(?, fence_strategy), ` +
+	`ipmi_address = COALESCE(?, ipmi_address), ` +
+	`ipmi_user = COALESCE(?, ipmi_user), ` +
+	`ipmi_pass = COALESCE(?, ipmi_pass), ` +
+	`watchdog_dev = COALESCE(?, watchdog_dev), ` +
+	`role = COALESCE(?, role), ` +
+	`region = COALESCE(?, region), ` +
+	`updated_at = ? ` +
+	`WHERE name = ?`
 
 // RemoveHost removes a host from the cluster. If force is false and the host
 // has running VMs, the request is rejected. CRL revocation is handled here.

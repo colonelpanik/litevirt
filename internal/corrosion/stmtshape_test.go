@@ -180,6 +180,7 @@ func TestParse_Invalid(t *testing.T) {
 		"named param":             "INSERT INTO t (a) VALUES (:a)",
 		"empty column list":       "INSERT INTO t () VALUES ()",
 		"bad OR algo":             "INSERT OR ABORT INTO t (a) VALUES (?)",
+		"BETWEEN in WHERE":        "DELETE FROM t WHERE a BETWEEN ? AND ?",
 	}
 	for name, sql := range cases {
 		t.Run(name, func(t *testing.T) { mustInvalid(t, sql, []string{"a"}) })

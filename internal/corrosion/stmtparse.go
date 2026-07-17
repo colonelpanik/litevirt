@@ -317,13 +317,15 @@ func (p *sqlParser) parseAssignments() ([]AssignmentShape, error) {
 }
 
 // parseExpr consumes a single expression, stopping (at paren depth 0) at a ',',
-// a WHERE/ON keyword, ';', ')' , or EOF. It renders a canonical, case-normalized text and
-// records the bound-parameter indices it consumes in order.
+// a WHERE/ON keyword, ';', ')', or EOF. It builds a canonical typed encoding (Text) and
+// records the bound-parameter indices it consumes in order. It also detects the exact
+// `excluded.<ident>` shape (ExcludedRef) so full-image classification does not depend on
+// the Text format.
 func (p *sqlParser) parseExpr() (NormalizedExpr, error) {
 	var sb strings.Builder
 	var params []int
+	var toks []sqlTok
 	depth := 0
-	tokensSeen := 0
 	for {
 		t := p.peek()
 		if depth == 0 {
@@ -348,40 +350,54 @@ func (p *sqlParser) parseExpr() (NormalizedExpr, error) {
 		case tokQuotedIdent:
 			return NormalizedExpr{}, invalidf("quoted identifier in expression")
 		}
-		if tokensSeen > 0 {
-			sb.WriteByte(' ')
-		}
 		sb.WriteString(canonToken(t))
-		tokensSeen++
+		toks = append(toks, t)
 		p.next()
-		if tokensSeen > 4096 {
+		if len(toks) > 4096 {
 			return NormalizedExpr{}, invalidf("expression too long")
 		}
 	}
 	if depth != 0 {
 		return NormalizedExpr{}, invalidf("unbalanced '(' in expression")
 	}
-	if tokensSeen == 0 {
+	if len(toks) == 0 {
 		return NormalizedExpr{}, invalidf("empty expression")
 	}
-	return NormalizedExpr{Text: sb.String(), ParamIdx: params}, nil
+	ne := NormalizedExpr{Text: sb.String(), ParamIdx: params, SoleParam: -1}
+	// Detect exactly a single bound parameter → used to recognize `updated_at = ?`.
+	if len(toks) == 1 && toks[0].kind == tokParam {
+		ne.SoleParam = params[0]
+	}
+	// Detect exactly `excluded.<ident>` (3 tokens, no params) → the plain copy used for
+	// full-image reasoning.
+	if len(toks) == 3 && len(params) == 0 &&
+		toks[0].kind == tokIdent && strings.EqualFold(toks[0].text, "excluded") &&
+		toks[1].kind == tokDot && toks[2].kind == tokIdent {
+		ne.ExcludedRef = strings.ToLower(toks[2].text)
+	}
+	return ne, nil
 }
 
-// canonToken renders one token to its canonical, case-normalized string for a
-// NormalizedExpr. Identifiers are lower-cased (SQLite identifiers are case-insensitive);
-// keywords/functions therefore also lower-case, which is fine — determinism is what
-// matters. Strings are single-quoted with ” escaping; the surrounding fingerprint
-// encoding length-prefixes the whole Text field, so embedded delimiters cannot alias.
+// canonToken renders one token to a TYPED, length-prefixed canonical encoding for a
+// NormalizedExpr / predicate leaf. A type tag byte plus a length-prefixed payload makes the
+// encoding self-delimiting and collision-free ACROSS token types: an integer literal 1 and
+// an identifier named "i1" produce distinct encodings (`n1:1` vs `d2:i1`), so two statements
+// that differ only in a literal-vs-identifier token never share an authorization fingerprint.
+// Encodings are concatenated with no separator (each is self-delimiting). Identifiers are
+// lower-cased (SQLite identifiers are case-insensitive); this is a canonical form for
+// hashing, not executable SQL.
 func canonToken(t sqlTok) string {
 	switch t.kind {
 	case tokIdent:
-		return strings.ToLower(t.text)
+		s := strings.ToLower(t.text)
+		return "d" + strconv.Itoa(len(s)) + ":" + s
 	case tokParam:
-		return "?"
+		return "p;"
 	case tokInt:
-		return "i" + strconv.FormatInt(t.intVal, 10)
+		s := strconv.FormatInt(t.intVal, 10)
+		return "n" + strconv.Itoa(len(s)) + ":" + s
 	case tokString:
-		return "'" + strings.ReplaceAll(t.strVal, "'", "''") + "'"
+		return "s" + strconv.Itoa(len(t.strVal)) + ":" + t.strVal
 	case tokLParen:
 		return "("
 	case tokRParen:
@@ -395,9 +411,9 @@ func canonToken(t sqlTok) string {
 	case tokEq:
 		return "="
 	case tokOp, tokPlusMinus, tokOther:
-		return t.text
+		return "o" + strconv.Itoa(len(t.text)) + ":" + t.text
 	default:
-		return "?" // unreachable in a bounded expression
+		return "p;" // unreachable in a bounded expression
 	}
 }
 

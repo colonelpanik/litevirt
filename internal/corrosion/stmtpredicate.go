@@ -117,11 +117,14 @@ func (p *sqlParser) parseLeaf() (*predNode, error) {
 			p.paramCount++
 		case tokQuotedIdent:
 			return nil, invalidf("quoted identifier in WHERE")
+		case tokIdent:
+			// BETWEEN's `AND` is NOT a boolean separator, so the flat leaf model would
+			// mis-split `x BETWEEN ? AND ?`. Reject it (fail closed) rather than misparse.
+			if strings.EqualFold(t.text, "BETWEEN") {
+				return nil, invalidf("BETWEEN is not supported in a WHERE predicate")
+			}
 		}
-		if len(toks) > 0 {
-			sb.WriteByte(' ')
-		}
-		sb.WriteString(canonToken(t))
+		sb.WriteString(canonToken(t)) // typed encoding is self-delimiting; no separator
 		toks = append(toks, t)
 		p.next()
 		if len(toks) > 4096 {
@@ -200,8 +203,8 @@ func resolveInsertIdentity(sh *StmtShape, pkCols []string) {
 func resolveUpdateIdentity(sh *StmtShape, pkCols []string) {
 	sh.UpdatedAtParamIdx = -1
 	for _, a := range sh.SetAssigns {
-		if strings.EqualFold(a.Column, "updated_at") && a.Expr.Text == "?" && len(a.Expr.ParamIdx) == 1 {
-			sh.UpdatedAtParamIdx = a.Expr.ParamIdx[0]
+		if strings.EqualFold(a.Column, "updated_at") && a.Expr.SoleParam >= 0 {
+			sh.UpdatedAtParamIdx = a.Expr.SoleParam
 		}
 	}
 	if len(pkCols) == 0 {
@@ -248,8 +251,8 @@ func computeFullImage(insertCols, pkCols []string, cc *ConflictClause) bool {
 	assigned := map[string]bool{}
 	for _, a := range cc.Assignments {
 		lc := strings.ToLower(a.Column)
-		if a.Expr.Text != "excluded . "+lc {
-			return false // transformed / non-copy assignment
+		if a.Expr.ExcludedRef != lc {
+			return false // transformed / non-copy assignment (RHS is not exactly excluded.<col>)
 		}
 		if pkset[lc] {
 			return false // assigning a PK/conflict-key column ⇒ not a clean row image

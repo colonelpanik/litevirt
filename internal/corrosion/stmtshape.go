@@ -93,13 +93,25 @@ type ValueShape struct {
 
 func (v ValueShape) isParam() bool { return v.ParamIndex >= 0 }
 
-// NormalizedExpr is the canonical form of a non-trivial UPDATE SET right-hand side
-// (column references, increments, COALESCE/NULLIF, deterministic functions). Text is the
-// whitespace-normalized, upper-cased-keyword canonical rendering; ParamIdx lists the
-// bound-parameter indices it consumes, left to right.
+// NormalizedExpr is the canonical form of an UPDATE SET / DO UPDATE right-hand side
+// (a bound param, a literal, a column reference, an increment, COALESCE/NULLIF, or another
+// deterministic function). Text is a typed, length-prefixed canonical encoding of the token
+// sequence (see canonToken); ParamIdx lists the bound-parameter indices it consumes, left to
+// right; ExcludedRef is the lower-cased column name when the RHS is exactly `excluded.<col>`
+// (else "").
+//
+// SCOPE (stmtshape/v1): this is an OPAQUE canonical token encoding for EXACT fingerprint
+// matching — it is deliberately NOT a typed expression AST. That is sufficient for the
+// compatibility ledger (exact match) and for full-image detection (via ExcludedRef), but
+// later phases that need real structure (dynamic parameterized policies, reference
+// validation, per-row-LWW expansion) must use finite, structurally-generated policy
+// expansions rather than interpreting this text. Constructs the flat model would mis-handle
+// (e.g. BETWEEN, whose AND is not a boolean separator) are rejected at parse time.
 type NormalizedExpr struct {
-	Text     string
-	ParamIdx []int
+	Text        string
+	ParamIdx    []int
+	ExcludedRef string // lower-cased column when RHS is exactly `excluded.<col>`; else ""
+	SoleParam   int    // the param index when RHS is exactly a single `?`; else -1
 }
 
 // AssignmentShape is one UPDATE `SET col = <expr>` item. When the RHS is a single bound

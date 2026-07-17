@@ -200,10 +200,14 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 		}
 		c.mu.Unlock()
 		if changed {
+			// Bind the timestamp instead of datetime('now'): the receiver-evaluated
+			// function is non-deterministic across nodes (each would stamp its own wall
+			// clock into the LWW key on apply) and can't be structurally validated. NowTS()
+			// is the monotonic LWW clock the rest of the replicated writes use.
 			c.db.ExecuteDeferred(ctx,
 				`INSERT OR REPLACE INTO crl_versions (host, version, updated_at)
-				 VALUES (?, ?, datetime('now'))`,
-				c.hostName, localCRLVersion)
+				 VALUES (?, ?, ?)`,
+				c.hostName, localCRLVersion, c.db.NowTS())
 		}
 	}
 

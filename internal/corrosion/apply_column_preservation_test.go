@@ -113,8 +113,20 @@ func TestInsertUpsertRewrite(t *testing.T) {
 			nParams: 2, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
 		},
 		{
-			name:    "explicit upsert not advancing updated_at fails closed",
+			name:    "explicit upsert not mentioning updated_at fails closed",
 			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address",
+			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
+		},
+		{
+			// Mentioning updated_at is not enough — a non-advancing self/literal assignment
+			// must fail closed (finding 3).
+			name:    "explicit upsert with updated_at = updated_at fails closed",
+			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address, updated_at = updated_at",
+			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
+		},
+		{
+			name:    "explicit upsert with updated_at = '' fails closed",
+			sql:     "INSERT INTO hosts (name, address, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET address = excluded.address, updated_at = ''",
 			nParams: 3, pkCols: []string{"name"}, hasUpdatedAt: true, wantErr: true,
 		},
 		{
@@ -353,6 +365,44 @@ func TestApplyRemoteMutations_SecondaryUniqueBackPressure(t *testing.T) {
 	rows, err := c.Query(ctx, "SELECT id FROM snapshots WHERE vm_name = ? AND name = ?", "vm1", "snapA")
 	if err != nil || len(rows) != 1 || rows[0].String("id") != "s1" {
 		t.Fatalf("local snapshot must be intact (s1), got err=%v rows=%d", err, len(rows))
+	}
+}
+
+// TestApplyRemoteMutations_EmptyStatements confirms a valid-but-empty statement list — both
+// the [] and null JSON representations — back-pressures rather than being acknowledged.
+func TestApplyRemoteMutations_EmptyStatements(t *testing.T) {
+	for _, stmts := range []string{`[]`, `null`} {
+		t.Run(stmts, func(t *testing.T) {
+			c := mustTestClient(t)
+			ctx := context.Background()
+			r := NewReplicator(c, "", RelayConfig{})
+			ts := hlc.NewClock("origin-node").Now().String()
+			entries := []*pb.MutationEntry{{Seq: 1, Hlc: ts, Origin: "origin-node", Stmts: stmts}}
+			if _, err := r.ApplyRemoteMutations(ctx, entries); err == nil {
+				t.Fatalf("expected back-pressure error for empty statement list %q", stmts)
+			}
+			assertNotSeen(t, c, "origin-node")
+		})
+	}
+}
+
+// TestTableHasUpdatedAt covers the schema-introspection helper for known/unknown tables.
+func TestTableHasUpdatedAt(t *testing.T) {
+	c := mustTestClient(t)
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	ctx := context.Background()
+	if has, err := tableHasUpdatedAt(ctx, tx, "hosts"); err != nil || !has {
+		t.Errorf("hosts: has=%v err=%v, want true/nil", has, err)
+	}
+	if has, err := tableHasUpdatedAt(ctx, tx, "mutation_log"); err != nil || has {
+		t.Errorf("mutation_log: has=%v err=%v, want false/nil (append-only, no updated_at)", has, err)
+	}
+	if has, err := tableHasUpdatedAt(ctx, tx, "not_a_table"); err != nil || has {
+		t.Errorf("unknown table: has=%v err=%v, want false/nil", has, err)
 	}
 }
 

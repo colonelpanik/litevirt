@@ -913,6 +913,15 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)
 			return 0, fmt.Errorf("decode mutation entry (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		}
+		// A valid but empty statement list ([] or null) is not a legitimate mutation — a
+		// correct sender never records one. Back-pressure rather than record it seen, so a
+		// malformed/truncated entry surfaces instead of being silently acknowledged.
+		if len(stmts) == 0 {
+			_ = tx.Rollback()
+			slog.Error("replicator: mutation entry has no statements — back-pressuring replication",
+				"origin", entry.Origin, "seq", entry.Seq)
+			return 0, fmt.Errorf("mutation entry has no statements (origin=%s seq=%d)", entry.Origin, entry.Seq)
+		}
 
 		// Apply each statement fail-closed. ANY failure — schema-missing, a constraint
 		// (e.g. a secondary-UNIQUE collision the PK-aware upsert now surfaces instead of
@@ -1105,7 +1114,11 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	// never a destructive whole-row replace.
 	applied := s.SQL
 	if isInsertStatement(applied) {
-		rewritten, rerr := insertUpsertRewrite(s, pkCols, tableHasUpdatedAt(ctx, tx, tableName))
+		hasUpdatedAt, uerr := tableHasUpdatedAt(ctx, tx, tableName)
+		if uerr != nil {
+			return uerr // schema metadata unavailable ⇒ fail closed
+		}
+		rewritten, rerr := insertUpsertRewrite(s, pkCols, hasUpdatedAt)
 		if rerr != nil {
 			return rerr
 		}
@@ -1169,8 +1182,8 @@ func insertUpsertRewrite(s Statement, pkCols []string, hasUpdatedAt bool) (strin
 		if sh.UpdatedAtParamIdx < 0 {
 			return "", invalidf("INSERT into %s omits a bound updated_at (LWW clock would not advance)", sh.Table)
 		}
-		if sh.OnConflict != nil && !conflictAssignsUpdatedAt(sh.OnConflict) {
-			return "", invalidf("explicit upsert into %s does not advance updated_at on conflict", sh.Table)
+		if sh.OnConflict != nil && !conflictAdvancesUpdatedAt(sh.OnConflict) {
+			return "", invalidf("explicit upsert into %s does not advance updated_at (need updated_at = excluded.updated_at)", sh.Table)
 		}
 	}
 	// An explicit upsert already scopes exactly which columns it touches; just normalize a
@@ -1201,12 +1214,16 @@ func insertUpsertRewrite(s Statement, pkCols []string, hasUpdatedAt bool) (strin
 	return base + conflict + "DO UPDATE SET " + strings.Join(sets, ", "), nil
 }
 
-// conflictAssignsUpdatedAt reports whether a DO UPDATE SET assigns updated_at, i.e. the row
-// clock advances on conflict.
-func conflictAssignsUpdatedAt(cc *ConflictClause) bool {
+// conflictAdvancesUpdatedAt reports whether a DO UPDATE SET makes the row clock ADVANCE on
+// conflict — i.e. it assigns exactly `updated_at = excluded.updated_at`. Merely mentioning
+// updated_at (updated_at = updated_at, ”, NULL, or any transformed expression) does NOT
+// advance it and would let a winning write mutate other columns while retaining/corrupting
+// the clock; such a special monotonic/transformed shape must instead carry an exact ledger
+// disposition. ExcludedRef is the parser's proof the RHS is exactly `excluded.<col>`.
+func conflictAdvancesUpdatedAt(cc *ConflictClause) bool {
 	for _, a := range cc.Assignments {
 		if strings.EqualFold(a.Column, "updated_at") {
-			return true
+			return a.Expr.ExcludedRef == "updated_at"
 		}
 	}
 	return false
@@ -1215,16 +1232,19 @@ func conflictAssignsUpdatedAt(cc *ConflictClause) bool {
 // tableHasUpdatedAt reports whether a known table has an updated_at column, read through the
 // open tx (PRAGMA) so it needs no client lock — ApplyRemoteMutations already holds the write
 // lock, which readTableColumns would deadlock on. Only known tables (in tablePrimaryKeys)
-// are queried, so the interpolated name is never peer-controlled.
-func tableHasUpdatedAt(ctx context.Context, tx *sql.Tx, table string) bool {
+// are queried, so the interpolated name is never peer-controlled. It fails CLOSED: any
+// metadata error (query, scan, or rows iteration) is returned so the caller back-pressures
+// rather than silently disabling the LWW clock invariants.
+func tableHasUpdatedAt(ctx context.Context, tx *sql.Tx, table string) (bool, error) {
 	if _, known := tablePrimaryKeys[table]; !known {
-		return false
+		return false, nil
 	}
 	rows, err := tx.QueryContext(ctx, "PRAGMA table_info("+table+")")
 	if err != nil {
-		return false
+		return false, fmt.Errorf("table_info(%s): %w", table, err)
 	}
 	defer rows.Close()
+	has := false
 	for rows.Next() {
 		var (
 			cid, notnull, pk int
@@ -1232,13 +1252,16 @@ func tableHasUpdatedAt(ctx context.Context, tx *sql.Tx, table string) bool {
 			dflt             interface{}
 		)
 		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			return false
+			return false, fmt.Errorf("scan table_info(%s): %w", table, err)
 		}
 		if strings.EqualFold(name, "updated_at") {
-			return true
+			has = true
 		}
 	}
-	return false
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate table_info(%s): %w", table, err)
+	}
+	return has, nil
 }
 
 // shouldSkipLWW reports whether to skip applying the incoming mutation under

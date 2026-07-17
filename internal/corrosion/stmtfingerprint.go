@@ -22,6 +22,19 @@ func stmtFingerprint(sh StmtShape) string {
 	return stmtFingerprintVersion + ":" + hex.EncodeToString(sum[:])
 }
 
+// FingerprintSQL parses sql and returns its stmtshape/v1 fingerprint. It is the single
+// shared primitive used by BOTH the runtime authorization path and the stmtshapecheck CI
+// guard, so a builder's compile-time fingerprint is byte-identical to the one computed for
+// its statement at apply time (they cannot drift). The fingerprint is a pure function of
+// SQL syntax — independent of the table's primary key — so pkCols is not needed here.
+func FingerprintSQL(sql string) (string, error) {
+	sh, err := parseStmtShape(sql, nil)
+	if err != nil {
+		return "", err
+	}
+	return stmtFingerprint(sh), nil
+}
+
 // stmtCanonical builds the canonical, length-prefixed pre-hash encoding. Every field is
 // tagged and length-prefixed so no field's content can alias a delimiter or another field.
 // Identifiers are lower-cased (SQLite identifiers are case-insensitive). Placeholder

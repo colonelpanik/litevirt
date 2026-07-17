@@ -32,7 +32,7 @@ func invalidf(format string, a ...interface{}) error {
 type StmtKind int
 
 const (
-	KindOther StmtKind = iota // parseable shape we do not model (e.g. SELECT) — unauthorized
+	KindOther StmtKind = iota // zero value only; a successful parse never yields this (unmodelled kinds fail closed)
 	KindInsert
 	KindUpdate
 	KindDelete
@@ -145,13 +145,23 @@ type StmtShape struct {
 	InsertCols  []string
 	InsertVals  []ValueShape
 	LeadingAlgo string // "", "OR REPLACE", "OR IGNORE"
-	OnConflict  *ConflictClause
+	// LeadingAlgoStart/End are the byte span of the "OR REPLACE"/"OR IGNORE" keywords in
+	// the ORIGINAL sql, so the apply path can splice them out to normalize to a plain
+	// INSERT (stripLeadingAlgo) without a substring search. Both 0 when no algo is present.
+	LeadingAlgoStart int
+	LeadingAlgoEnd   int
+	OnConflict       *ConflictClause
 
 	// UPDATE
 	SetAssigns []AssignmentShape
 
 	// UPDATE / DELETE
 	Where PredicateTree
+
+	// ParamCount is the total number of bound '?' parameters in the statement. The apply
+	// path MUST verify ParamCount == len(Statement.Params) before reading any parameter by
+	// index — a valid template with truncated params would otherwise index out of range.
+	ParamCount int
 
 	// Row-identity (LWW) mapping, resolved against the table's declared PK columns.
 	// HasFullPKIdentity: for INSERT, every PK column is present in InsertCols and bound
@@ -161,6 +171,17 @@ type StmtShape struct {
 	HasFullPKIdentity bool
 	PKParamIdx        []int
 	UpdatedAtParamIdx int
+}
+
+// ValidateParamArity checks that the number of bound parameters supplied with the statement
+// matches the count the parsed shape requires. The apply path MUST call this (or otherwise
+// verify equality) before reading any parameter by index — a valid template paired with a
+// truncated Statement.Params would otherwise index out of range or bind the wrong value.
+func (sh StmtShape) ValidateParamArity(nParams int) error {
+	if nParams != sh.ParamCount {
+		return invalidf("parameter arity mismatch: statement needs %d, got %d", sh.ParamCount, nParams)
+	}
+	return nil
 }
 
 // parseStmtShape is the single entry point. pkCols is the table's declared primary key
@@ -183,6 +204,7 @@ func parseStmtShape(sql string, pkCols []string) (StmtShape, error) {
 	if p.peek().kind != tokEOF {
 		return StmtShape{}, invalidf("trailing content after statement (%q)", p.peek().text)
 	}
+	sh.ParamCount = p.paramCount
 	return sh, nil
 }
 
@@ -247,9 +269,9 @@ func (p *sqlParser) parseStatement(pkCols []string) (StmtShape, error) {
 	case strings.EqualFold(t.text, "DELETE"):
 		return p.parseDelete(pkCols)
 	default:
-		// A parseable but unmodelled kind (e.g. SELECT/CTE): return KindOther so the
-		// caller treats it as unauthorized rather than mis-applying it.
-		return StmtShape{Kind: KindOther, UpdatedAtParamIdx: -1}, nil
+		// A statement kind we do not model (SELECT/CTE/DDL/…). We never authorize it, so
+		// fail closed directly rather than returning an observable KindOther.
+		return StmtShape{}, invalidf("unsupported statement kind %q", t.text)
 	}
 }
 

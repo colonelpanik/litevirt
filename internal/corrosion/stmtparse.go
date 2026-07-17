@@ -50,7 +50,9 @@ func (p *sqlParser) parseIdentList(what string) ([]string, error) {
 func (p *sqlParser) parseInsert(pkCols []string) (StmtShape, error) {
 	sh := StmtShape{Kind: KindInsert, UpdatedAtParamIdx: -1}
 	p.next() // INSERT
-	if p.acceptKeyword("OR") {
+	if p.peek().kind == tokIdent && strings.EqualFold(p.peek().text, "OR") {
+		orTok := p.next() // OR
+		algoTok := p.peek()
 		switch {
 		case p.acceptKeyword("REPLACE"):
 			sh.LeadingAlgo = "OR REPLACE"
@@ -59,6 +61,10 @@ func (p *sqlParser) parseInsert(pkCols []string) (StmtShape, error) {
 		default:
 			return sh, invalidf("unsupported INSERT OR <algo> (%q)", p.peek().text)
 		}
+		// Record the exact byte span of the algorithm keywords so the apply path can
+		// splice them out (stripLeadingAlgo) rather than string-searching.
+		sh.LeadingAlgoStart = orTok.pos
+		sh.LeadingAlgoEnd = algoTok.pos + len(algoTok.text)
 	}
 	if err := p.expectKeyword("INTO"); err != nil {
 		return sh, err
@@ -276,11 +282,19 @@ func (p *sqlParser) parseDelete(pkCols []string) (StmtShape, error) {
 // literal, or a deterministic expression captured as a NormalizedExpr.
 func (p *sqlParser) parseAssignments() ([]AssignmentShape, error) {
 	var out []AssignmentShape
+	seen := map[string]bool{}
 	for {
 		col, err := p.plainIdent("SET column")
 		if err != nil {
 			return nil, err
 		}
+		lc := strings.ToLower(col)
+		if seen[lc] {
+			// A duplicate SET target makes identity/timestamp classification ambiguous
+			// (which assignment wins?) — reject it.
+			return nil, invalidf("duplicate SET target %q", col)
+		}
+		seen[lc] = true
 		if p.peek().kind != tokEq {
 			return nil, invalidf("expected '=' after SET column %q", col)
 		}
@@ -385,4 +399,17 @@ func canonToken(t sqlTok) string {
 	default:
 		return "?" // unreachable in a bounded expression
 	}
+}
+
+// stripLeadingAlgo returns sql with any leading "OR REPLACE"/"OR IGNORE" removed, yielding
+// a plain INSERT while leaving the rest of the statement — including a verbatim ON CONFLICT
+// tail, literals, and comments — byte-for-byte unchanged. sh must be the parse of sql. This
+// is the structural, offset-based replacement for the old substring replaceInsertStrategy:
+// it never rewrites anything but the exact algorithm-keyword span the parser located.
+func stripLeadingAlgo(sql string, sh StmtShape) string {
+	s, e := sh.LeadingAlgoStart, sh.LeadingAlgoEnd
+	if e <= s || e > len(sql) {
+		return sql
+	}
+	return sql[:s] + sql[e:]
 }

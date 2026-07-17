@@ -226,9 +226,13 @@ func resolveUpdateIdentity(sh *StmtShape, pkCols []string) {
 	sh.PKParamIdx = pkParam
 }
 
-// computeFullImage reports whether an INSERT's ON CONFLICT DO UPDATE copies every supplied
-// non-PK column verbatim (`c = excluded.c`) with no omission, transformation, or WHERE
-// guard — the condition under which a tie may be resolved over the full row image.
+// computeFullImage reports whether an INSERT's ON CONFLICT DO UPDATE copies EXACTLY the
+// supplied non-PK row image and nothing else — the condition under which an exact-timestamp
+// tie may be resolved over the full row. It requires: no WHERE guard; no DO NOTHING; every
+// assignment is `c = excluded.c`; the assigned set equals exactly the supplied non-PK
+// columns (no PK assignments, no columns outside the insert list / receiver-only columns);
+// and no duplicate targets (already rejected at parse time). Anything else keeps local on a
+// tie and defers to anti-entropy. (Not part of the fingerprint — it depends on pkCols.)
 func computeFullImage(insertCols, pkCols []string, cc *ConflictClause) bool {
 	if cc.DoNothing || cc.Where.Node != nil {
 		return false
@@ -237,21 +241,31 @@ func computeFullImage(insertCols, pkCols []string, cc *ConflictClause) bool {
 	for _, pk := range pkCols {
 		pkset[strings.ToLower(pk)] = true
 	}
+	insertSet := map[string]bool{}
+	for _, c := range insertCols {
+		insertSet[strings.ToLower(c)] = true
+	}
 	assigned := map[string]bool{}
 	for _, a := range cc.Assignments {
-		want := "excluded . " + strings.ToLower(a.Column)
-		if a.Expr.Text != want {
-			return false // omitted-by-transform / non-copy assignment
+		lc := strings.ToLower(a.Column)
+		if a.Expr.Text != "excluded . "+lc {
+			return false // transformed / non-copy assignment
 		}
-		assigned[strings.ToLower(a.Column)] = true
-	}
-	for _, c := range insertCols {
-		lc := strings.ToLower(c)
 		if pkset[lc] {
+			return false // assigning a PK/conflict-key column ⇒ not a clean row image
+		}
+		if !insertSet[lc] {
+			return false // assigns a column outside the supplied row (e.g. a receiver-only column)
+		}
+		assigned[lc] = true // duplicates already rejected in parseAssignments
+	}
+	// Exact set: every supplied non-PK column is copied, and nothing else was assigned.
+	for c := range insertSet {
+		if pkset[c] {
 			continue
 		}
-		if !assigned[lc] {
-			return false // a non-PK column is not copied ⇒ not a full image
+		if !assigned[c] {
+			return false // a supplied non-PK column is not copied
 		}
 	}
 	return true

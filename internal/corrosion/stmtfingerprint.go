@@ -110,12 +110,12 @@ func encodeConflict(cc *ConflictClause) string {
 		sb.WriteString("set=" + strconv.Itoa(len(set)) + ":" + set + ";")
 	}
 	where := encodePred(cc.Where.Node)
-	sb.WriteString("where=" + strconv.Itoa(len(where)) + ":" + where + ";")
-	if cc.IsFullImage {
-		sb.WriteString("full=1")
-	} else {
-		sb.WriteString("full=0")
-	}
+	sb.WriteString("where=" + strconv.Itoa(len(where)) + ":" + where)
+	// NOTE: IsFullImage is deliberately NOT part of the fingerprint — it depends on the
+	// table's pkCols (and, in Part H, on which identity key is in force), whereas the
+	// fingerprint must be a pure function of SQL syntax so a statement's v1 hash is stable
+	// regardless of the parsing node's identity metadata. Full-image eligibility is
+	// recomputed at apply time from the conflict target + assignment AST already encoded here.
 	return sb.String()
 }
 

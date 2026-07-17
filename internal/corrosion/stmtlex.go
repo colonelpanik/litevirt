@@ -38,6 +38,7 @@ type sqlTok struct {
 	text   string // original slice text (for keywords/idents/operators)
 	strVal string // tokString
 	intVal int64  // tokInt
+	pos    int    // byte offset of the token's start in the original SQL
 }
 
 // lex tokenises sql. On an unterminated string/comment or an unsupported placeholder form
@@ -46,7 +47,13 @@ func lex(sql string) ([]sqlTok, error) {
 	var toks []sqlTok
 	i := 0
 	n := len(sql)
+	start := 0
+	emit := func(tk sqlTok) {
+		tk.pos = start
+		toks = append(toks, tk)
+	}
 	for i < n {
+		start = i
 		c := sql[i]
 		switch {
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
@@ -94,7 +101,7 @@ func lex(sql string) ([]sqlTok, error) {
 			if !closed {
 				return nil, invalidf("unterminated string literal")
 			}
-			toks = append(toks, sqlTok{kind: tokString, strVal: sb.String()})
+			emit(sqlTok{kind: tokString, strVal: sb.String()})
 			i = j
 		case c == '"' || c == '[' || c == '`':
 			// quoted identifier — tokenise so the parser can reject it explicitly.
@@ -111,14 +118,14 @@ func lex(sql string) ([]sqlTok, error) {
 			if j >= n {
 				return nil, invalidf("unterminated quoted identifier")
 			}
-			toks = append(toks, sqlTok{kind: tokQuotedIdent, text: sql[i+1 : j]})
+			emit(sqlTok{kind: tokQuotedIdent, text: sql[i+1 : j]})
 			i = j + 1
 		case c == '?':
 			// Only the bare positional '?' is supported. Reject ?NNN / :name / @x / $x.
 			if i+1 < n && (isDigit(sql[i+1]) || isIdentStart(sql[i+1])) {
 				return nil, invalidf("unsupported parameter form at %q", sql[i:minInt(i+4, n)])
 			}
-			toks = append(toks, sqlTok{kind: tokParam, text: "?"})
+			emit(sqlTok{kind: tokParam, text: "?"})
 			i++
 		case c == ':' || c == '@' || c == '$':
 			return nil, invalidf("unsupported named-parameter form %q", string(c))
@@ -135,69 +142,69 @@ func lex(sql string) ([]sqlTok, error) {
 			if err != nil {
 				return nil, invalidf("bad integer literal %q", sql[i:j])
 			}
-			toks = append(toks, sqlTok{kind: tokInt, intVal: v})
+			emit(sqlTok{kind: tokInt, intVal: v})
 			i = j
 		case isIdentStart(c):
 			j := i
 			for j < n && isIdentPart(sql[j]) {
 				j++
 			}
-			toks = append(toks, sqlTok{kind: tokIdent, text: sql[i:j]})
+			emit(sqlTok{kind: tokIdent, text: sql[i:j]})
 			i = j
 		case c == '(':
-			toks = append(toks, sqlTok{kind: tokLParen, text: "("})
+			emit(sqlTok{kind: tokLParen, text: "("})
 			i++
 		case c == ')':
-			toks = append(toks, sqlTok{kind: tokRParen, text: ")"})
+			emit(sqlTok{kind: tokRParen, text: ")"})
 			i++
 		case c == ',':
-			toks = append(toks, sqlTok{kind: tokComma, text: ","})
+			emit(sqlTok{kind: tokComma, text: ","})
 			i++
 		case c == ';':
-			toks = append(toks, sqlTok{kind: tokSemi, text: ";"})
+			emit(sqlTok{kind: tokSemi, text: ";"})
 			i++
 		case c == '.':
-			toks = append(toks, sqlTok{kind: tokDot, text: "."})
+			emit(sqlTok{kind: tokDot, text: "."})
 			i++
 		case c == '*':
-			toks = append(toks, sqlTok{kind: tokStar, text: "*"})
+			emit(sqlTok{kind: tokStar, text: "*"})
 			i++
 		case c == '=':
 			// SQLite accepts '==' too; normalise both to '='.
 			if i+1 < n && sql[i+1] == '=' {
 				i++
 			}
-			toks = append(toks, sqlTok{kind: tokEq, text: "="})
+			emit(sqlTok{kind: tokEq, text: "="})
 			i++
 		case c == '<':
 			if i+1 < n && (sql[i+1] == '=' || sql[i+1] == '>') {
-				toks = append(toks, sqlTok{kind: tokOp, text: sql[i : i+2]})
+				emit(sqlTok{kind: tokOp, text: sql[i : i+2]})
 				i += 2
 			} else {
-				toks = append(toks, sqlTok{kind: tokOp, text: "<"})
+				emit(sqlTok{kind: tokOp, text: "<"})
 				i++
 			}
 		case c == '>':
 			if i+1 < n && sql[i+1] == '=' {
-				toks = append(toks, sqlTok{kind: tokOp, text: ">="})
+				emit(sqlTok{kind: tokOp, text: ">="})
 				i += 2
 			} else {
-				toks = append(toks, sqlTok{kind: tokOp, text: ">"})
+				emit(sqlTok{kind: tokOp, text: ">"})
 				i++
 			}
 		case c == '!':
 			if i+1 < n && sql[i+1] == '=' {
-				toks = append(toks, sqlTok{kind: tokOp, text: "!="})
+				emit(sqlTok{kind: tokOp, text: "!="})
 				i += 2
 			} else {
 				return nil, invalidf("unexpected %q", string(c))
 			}
 		case c == '+' || c == '-':
-			toks = append(toks, sqlTok{kind: tokPlusMinus, text: string(c)})
+			emit(sqlTok{kind: tokPlusMinus, text: string(c)})
 			i++
 		case c == '|':
 			if i+1 < n && sql[i+1] == '|' {
-				toks = append(toks, sqlTok{kind: tokOther, text: "||"})
+				emit(sqlTok{kind: tokOther, text: "||"})
 				i += 2
 			} else {
 				return nil, invalidf("unexpected %q", string(c))
@@ -206,7 +213,7 @@ func lex(sql string) ([]sqlTok, error) {
 			return nil, invalidf("unexpected character %q", string(c))
 		}
 	}
-	toks = append(toks, sqlTok{kind: tokEOF})
+	emit(sqlTok{kind: tokEOF})
 	return toks, nil
 }
 

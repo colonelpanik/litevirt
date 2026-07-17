@@ -3,11 +3,14 @@ package corrosion
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestClassifySQLiteError(t *testing.T) {
-	db, err := sql.Open("sqlite", "file:sqlerrtest?mode=memory&cache=shared")
+	db, err := openMem(t, "sqlerrtest")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -50,6 +53,10 @@ func TestClassifySQLiteError(t *testing.T) {
 		{"not_null", trigger(`INSERT INTO t (id, u, nn, ck) VALUES (3, 'c', NULL, 0)`), classConstraint, constraintNotNull},
 		{"check", trigger(`INSERT INTO t (id, u, nn, ck) VALUES (4, 'd', 'y', -1)`), classConstraint, constraintCheck},
 		{"foreign_key", trigger(`INSERT INTO t (id, u, nn, ck, fk) VALUES (5, 'e', 'y', 0, 999)`), classConstraint, constraintForeignKey},
+		// a wrapped constraint error must still classify via errors.As
+		{"wrapped-unique", fmt.Errorf("apply row: %w", trigger(`INSERT INTO t (id, u, nn, ck) VALUES (6, 'a', 'z', 0)`)), classConstraint, constraintUnique},
+		// a generic SQLite error (SQLITE_ERROR, e.g. no such table) is NOT a row constraint
+		{"generic-sqlite", trigger(`INSERT INTO nope (x) VALUES (1)`), classOther, constraintNone},
 		{"non-sqlite", errors.New("boom"), classOther, constraintNone},
 		{"nil", nil, classOther, constraintNone},
 	}
@@ -60,6 +67,60 @@ func TestClassifySQLiteError(t *testing.T) {
 				t.Fatalf("classify(%v) = (%v,%q), want (%v,%q)", c.err, cls, kind, c.cls, c.kind)
 			}
 		})
+	}
+}
+
+// TestClassifySQLiteError_Operational triggers a real SQLITE_BUSY by holding a write
+// transaction on one file-DB handle while a second, independent handle (busy_timeout 0)
+// tries to write, and confirms it classifies as operational (never a keep-local rejection).
+// Two SEPARATE *sql.DB handles on a temp file are used (not a shared in-memory cache, which
+// deadlocks the driver's internal mutex), and the contended write runs in a goroutine gated
+// by a select-timeout so it can never hang the suite regardless of driver behavior.
+func TestClassifySQLiteError_Operational(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "busy.db")
+	holder, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open holder: %v", err)
+	}
+	defer holder.Close()
+	contender, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open contender: %v", err)
+	}
+	// NOTE: no deferred Close on the contender — if the contended write blocks in the
+	// driver (platform-dependent), Close would wait on it; we leak it and Skip instead.
+	if _, err := holder.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := contender.Exec(`PRAGMA busy_timeout=0`); err != nil {
+		t.Fatalf("busy_timeout: %v", err)
+	}
+	// Hold a write lock on the holder handle.
+	tx, err := holder.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO t (id, v) VALUES (1, 'held')`); err != nil {
+		t.Fatalf("acquire write lock: %v", err)
+	}
+
+	ch := make(chan error, 1)
+	go func() {
+		_, e := contender.Exec(`INSERT INTO t (id, v) VALUES (2, 'x')`)
+		ch <- e
+	}()
+	select {
+	case busyErr := <-ch:
+		if busyErr == nil {
+			t.Skip("could not induce a BUSY condition on this platform")
+		}
+		if cls, _ := classifySQLiteError(busyErr); cls != classOperational {
+			t.Fatalf("classify(%v) = %v, want classOperational", busyErr, cls)
+		}
+		contender.Close()
+	case <-time.After(5 * time.Second):
+		t.Skip("contended write blocked instead of returning BUSY on this platform")
 	}
 }
 

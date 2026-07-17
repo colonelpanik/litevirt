@@ -1,9 +1,16 @@
 package corrosion
 
 import (
+	"database/sql"
 	"errors"
 	"testing"
 )
+
+// openMem opens a fresh in-memory SQLite DB (modernc driver) for a test.
+func openMem(t *testing.T, name string) (*sql.DB, error) {
+	t.Helper()
+	return sql.Open("sqlite", "file:"+name+"?mode=memory&cache=shared")
+}
 
 func mustParse(t *testing.T, sql string, pk []string) StmtShape {
 	t.Helper()
@@ -176,6 +183,122 @@ func TestParse_Invalid(t *testing.T) {
 	}
 	for name, sql := range cases {
 		t.Run(name, func(t *testing.T) { mustInvalid(t, sql, []string{"a"}) })
+	}
+}
+
+func TestParse_ParamArity(t *testing.T) {
+	sh := mustParse(t, "UPDATE t SET a = ?, b = ? WHERE id = ?", []string{"id"})
+	if sh.ParamCount != 3 {
+		t.Fatalf("ParamCount=%d, want 3", sh.ParamCount)
+	}
+	if err := sh.ValidateParamArity(3); err != nil {
+		t.Fatalf("arity 3 should be valid: %v", err)
+	}
+	if err := sh.ValidateParamArity(2); err == nil { // missing
+		t.Fatal("arity 2 (missing) should be invalid")
+	}
+	if err := sh.ValidateParamArity(4); err == nil { // excess
+		t.Fatal("arity 4 (excess) should be invalid")
+	}
+	// literals do not count as parameters
+	sh2 := mustParse(t, "INSERT INTO t (a, b, c) VALUES (?, 0, NULL)", []string{"a"})
+	if sh2.ParamCount != 1 {
+		t.Fatalf("ParamCount=%d, want 1 (literals excluded)", sh2.ParamCount)
+	}
+}
+
+func TestParse_FullImage_ExactSet(t *testing.T) {
+	// exact non-PK set copied ⇒ full image
+	full := mustParse(t, "INSERT INTO t (id, a, b) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET a=excluded.a, b=excluded.b", []string{"id"})
+	if !full.OnConflict.IsFullImage {
+		t.Fatal("exact non-PK copy should be full-image")
+	}
+	// an assignment to a column NOT in the supplied row (receiver-only) ⇒ NOT full image
+	extra := mustParse(t, "INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET a=excluded.a, ro=excluded.ro", []string{"id"})
+	if extra.OnConflict.IsFullImage {
+		t.Fatal("assigning a receiver-only column must NOT be full-image")
+	}
+	// assigning the PK/conflict column ⇒ NOT full image
+	pkAssign := mustParse(t, "INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET id=excluded.id, a=excluded.a", []string{"id"})
+	if pkAssign.OnConflict.IsFullImage {
+		t.Fatal("assigning the PK column must NOT be full-image")
+	}
+	// a supplied non-PK column omitted from DO UPDATE ⇒ NOT full image
+	omit := mustParse(t, "INSERT INTO t (id, a, b) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET a=excluded.a", []string{"id"})
+	if omit.OnConflict.IsFullImage {
+		t.Fatal("omitting a supplied non-PK column must NOT be full-image")
+	}
+}
+
+func TestParse_DuplicateSetTargets(t *testing.T) {
+	cases := []string{
+		"UPDATE t SET updated_at = ?, updated_at = NULL WHERE id = ?",                         // dup updated_at
+		"UPDATE t SET id = ?, id = ? WHERE x = ?",                                             // dup pk
+		"UPDATE t SET a = ?, a = ? WHERE id = ?",                                              // dup ordinary
+		"INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET a=excluded.a, a=?", // dup in DO UPDATE
+	}
+	for _, sql := range cases {
+		mustInvalid(t, sql, []string{"id"})
+	}
+}
+
+func TestStripLeadingAlgo(t *testing.T) {
+	cases := []string{
+		"INSERT OR REPLACE INTO t (a, b) VALUES (?, 'x;y') -- c\n",
+		"INSERT OR IGNORE INTO t (a, b) VALUES (?, ?)",
+		"INSERT OR REPLACE INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET a=excluded.a WHERE t.deleted_at IS NOT NULL",
+	}
+	for _, sql := range cases {
+		sh := mustParse(t, sql, []string{"id"})
+		stripped := stripLeadingAlgo(sql, sh)
+		sh2, err := parseStmtShape(stripped, []string{"id"})
+		if err != nil {
+			t.Fatalf("stripped %q did not parse: %v", stripped, err)
+		}
+		if sh2.LeadingAlgo != "" {
+			t.Fatalf("stripped statement still has algo %q: %q", sh2.LeadingAlgo, stripped)
+		}
+		// structural equivalence: same table/cols/values/conflict, only the algo removed.
+		if sh2.Table != sh.Table || len(sh2.InsertCols) != len(sh.InsertCols) || len(sh2.InsertVals) != len(sh.InsertVals) {
+			t.Fatalf("strip changed structure: %q -> %q", sql, stripped)
+		}
+		if (sh.OnConflict == nil) != (sh2.OnConflict == nil) {
+			t.Fatalf("strip changed ON CONFLICT presence: %q", stripped)
+		}
+	}
+	// a plain INSERT (no algo) is returned unchanged.
+	plain := "INSERT INTO t (a) VALUES (?)"
+	if got := stripLeadingAlgo(plain, mustParse(t, plain, []string{"a"})); got != plain {
+		t.Fatalf("plain insert changed: %q", got)
+	}
+}
+
+func TestStripLeadingAlgo_ExecuteEquivalence(t *testing.T) {
+	// The stripped plain-INSERT + ON CONFLICT must execute equivalently to the original
+	// OR REPLACE form for the common same-PK conflict.
+	db, err := openMem(t, "stripexec")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO t (id, a, b) VALUES (1, 'orig', 'keep')`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	orig := "INSERT OR REPLACE INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET a=excluded.a"
+	sh := mustParse(t, orig, []string{"id"})
+	stripped := stripLeadingAlgo(orig, sh)
+	if _, err := db.Exec(stripped, 1, "new"); err != nil {
+		t.Fatalf("exec stripped %q: %v", stripped, err)
+	}
+	var a, b string
+	if err := db.QueryRow(`SELECT a, b FROM t WHERE id = 1`).Scan(&a, &b); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if a != "new" || b != "keep" { // b (receiver-only here) preserved by the DO UPDATE
+		t.Fatalf("got a=%q b=%q, want a=new b=keep", a, b)
 	}
 }
 

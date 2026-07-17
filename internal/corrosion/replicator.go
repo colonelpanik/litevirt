@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1095,10 +1096,19 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 	}
 
-	// Apply with INSERT OR REPLACE for INSERT statements, or directly for UPDATE.
+	// Apply INSERTs as a PK-aware upsert so a behind sender's omitted columns keep their
+	// local value instead of being reset by a whole-row replace (the reported data-loss
+	// bug); UPDATE/other run verbatim so their guards (deleted_at IS NULL, CAS) stay.
 	applied := s.SQL
 	if isInsertStatement(applied) {
-		applied = replaceInsertStrategy(applied, "INSERT OR REPLACE")
+		if rewritten, ok := insertUpsertRewrite(s.SQL, pkCols); ok {
+			applied = rewritten
+		} else {
+			// The INSERT can't be safely rewritten (unparseable, or no full bound PK to
+			// conflict on). Fall back to the whole-row replace for now; the fail-closed
+			// tri-state slice replaces this fallback with back-pressure.
+			applied = replaceInsertStrategy(applied, "INSERT OR REPLACE")
+		}
 	}
 	res, err := tx.ExecContext(ctx, applied, s.Params...)
 	if err == nil && rowsChanged(res) {
@@ -1118,6 +1128,46 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 func rowsChanged(res sql.Result) bool {
 	n, err := res.RowsAffected()
 	return err == nil && n > 0
+}
+
+// insertUpsertRewrite turns a replicated INSERT into a PK-aware upsert that preserves
+// receiver-only columns. A plain INSERT gains ON CONFLICT(pk) DO UPDATE SET nonpk =
+// excluded.nonpk built from the parsed column list, so the original VALUES tuple (params
+// and literals alike) is left untouched and only the sender-supplied non-PK columns are
+// updated on conflict. An INSERT that already carries an explicit ON CONFLICT clause keeps
+// it verbatim, with only a leading OR REPLACE/OR IGNORE normalized to a plain INSERT.
+// ok=false when the statement can't be parsed as an INSERT or lacks a full bound primary
+// key to conflict on; the caller decides the fallback.
+func insertUpsertRewrite(sql string, pkCols []string) (string, bool) {
+	if len(pkCols) == 0 {
+		return "", false
+	}
+	sh, err := parseStmtShape(sql, pkCols)
+	if err != nil || sh.Kind != KindInsert {
+		return "", false
+	}
+	// An explicit upsert already scopes exactly which columns it touches; just normalize a
+	// leading algo (INSERT OR REPLACE/IGNORE → plain INSERT) and apply it verbatim.
+	if sh.OnConflict != nil {
+		return stripLeadingAlgo(sql, sh), true
+	}
+	if !sh.HasFullPKIdentity {
+		return "", false // no full PK bound → can't build ON CONFLICT(pk)
+	}
+	pkSet := lowerStringSet(pkCols)
+	sets := make([]string, 0, len(sh.InsertCols))
+	for _, c := range sh.InsertCols {
+		if pkSet[strings.ToLower(c)] {
+			continue // never reassign the conflict key
+		}
+		sets = append(sets, c+" = excluded."+c)
+	}
+	base := strings.TrimRight(strings.TrimSpace(stripLeadingAlgo(sql, sh)), "; \t\r\n")
+	conflict := " ON CONFLICT(" + strings.Join(pkCols, ", ") + ") "
+	if len(sets) == 0 {
+		return base + conflict + "DO NOTHING", true
+	}
+	return base + conflict + "DO UPDATE SET " + strings.Join(sets, ", "), true
 }
 
 // shouldSkipLWW reports whether to skip applying the incoming mutation under

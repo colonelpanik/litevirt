@@ -427,5 +427,11 @@ func stripLeadingAlgo(sql string, sh StmtShape) string {
 	if e <= s || e > len(sql) {
 		return sql
 	}
+	// Consume one following space so "INSERT OR REPLACE INTO" collapses to "INSERT INTO"
+	// rather than leaving a double space. Only a single ASCII space (the token separator
+	// the lexer emitted) is dropped, never content inside the statement.
+	if e < len(sql) && sql[e] == ' ' {
+		e++
+	}
 	return sql[:s] + sql[e:]
 }

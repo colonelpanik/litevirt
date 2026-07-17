@@ -468,6 +468,40 @@ var mergeApplyChunkRows = 1000
 // released). Nil in production.
 var mergeChunkHook func()
 
+// buildMergeUpsertSQL builds a PK-aware upsert that preserves receiver-only columns. It
+// inserts the supplied columns and, ON CONFLICT on the primary key, updates only the
+// supplied NON-PK columns (never the conflict key), so a column the sender omitted keeps
+// its local value rather than being reset by a whole-row replace. pkCols must be non-empty
+// (the caller keeps local for a PK-less table). When every supplied column is part of the
+// PK there is nothing to update, so it emits DO NOTHING.
+func buildMergeUpsertSQL(table string, columns, pkCols []string) string {
+	pkSet := lowerStringSet(pkCols)
+	sets := make([]string, 0, len(columns))
+	for _, c := range columns {
+		if pkSet[strings.ToLower(c)] {
+			continue // never reassign the conflict key
+		}
+		sets = append(sets, c+" = excluded."+c)
+	}
+	insert := "INSERT INTO " + table +
+		" (" + strings.Join(columns, ", ") + ") VALUES (" +
+		strings.Join(repeatPlaceholders(len(columns)), ", ") + ")"
+	conflict := " ON CONFLICT(" + strings.Join(pkCols, ", ") + ") "
+	if len(sets) == 0 {
+		return insert + conflict + "DO NOTHING"
+	}
+	return insert + conflict + "DO UPDATE SET " + strings.Join(sets, ", ")
+}
+
+// lowerStringSet returns a set of the lower-cased strings, for case-insensitive membership.
+func lowerStringSet(ss []string) map[string]bool {
+	m := make(map[string]bool, len(ss))
+	for _, s := range ss {
+		m[strings.ToLower(s)] = true
+	}
+	return m
+}
+
 // mergeTable LWW-merges one dump table. It validates the peer-supplied
 // name/columns against the local schema once, then applies the rows in bounded
 // chunks (mergeChunk), each its own committed transaction.
@@ -503,15 +537,25 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 		slog.Warn("sync: skipping dump table missing primary-key column(s)", "table", table.Name)
 		return 0, 0
 	}
+	// A PK-less replicated table cannot be merged non-destructively — with no key to
+	// upsert on, a whole-row replace would be the only option, and that erases any
+	// receiver-only column. Keep local and fail closed instead. No table in the
+	// replicated set lacks a PK today; this guards against one being added.
+	if len(pkCols) == 0 {
+		slog.Warn("sync: skipping dump table without a known primary key (keep local)", "table", table.Name)
+		return 0, len(table.Rows)
+	}
 	updatedAtIdx := indexOf(table.Columns, "updated_at")
-	if localCols["updated_at"] && len(pkCols) > 0 && updatedAtIdx < 0 {
+	if localCols["updated_at"] && updatedAtIdx < 0 {
 		slog.Warn("sync: skipping dump table missing updated_at column", "table", table.Name)
 		return 0, 0
 	}
 
-	insertSQL := "INSERT OR REPLACE INTO " + table.Name +
-		" (" + strings.Join(table.Columns, ", ") + ") VALUES (" +
-		strings.Join(repeatPlaceholders(len(table.Columns)), ", ") + ")"
+	// PK-aware upsert: insert the sender-supplied columns and, on a primary-key conflict,
+	// update ONLY those columns. A behind sender's dump omits columns it doesn't know
+	// about; those keep their local value instead of being reset to defaults/NULL by a
+	// whole-row INSERT OR REPLACE (the reported data-loss bug).
+	insertSQL := buildMergeUpsertSQL(table.Name, table.Columns, pkCols)
 
 	for start := 0; start < len(table.Rows); start += mergeApplyChunkRows {
 		end := start + mergeApplyChunkRows

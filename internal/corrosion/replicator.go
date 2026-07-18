@@ -1042,6 +1042,14 @@ func (r *Replicator) recordInMutationLog(ctx context.Context, tx *sql.Tx, entrie
 // statement by the ledger's disposition, using the parsed shape (not positional heuristics)
 // for every last-writer-wins decision.
 func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statement, incomingHLC string) error {
+	// A bounded legacy transformer runs BEFORE parsing: a supported prior release emits a few
+	// shapes the strict parser rejects (crl_versions datetime('now'), the spent-proof-GC tsMs
+	// predicate). Each exact-matched shape is normalized into the current safe apply so a
+	// not-yet-upgraded peer's stream isn't back-pressured during a rolling upgrade.
+	if lt, ok := legacyTransformerFor(s.SQL); ok {
+		return r.applyLegacy(ctx, tx, lt, s, incomingHLC)
+	}
+
 	tableName := extractTableName(s.SQL)
 	pkCols := tablePrimaryKeys[tableName]
 

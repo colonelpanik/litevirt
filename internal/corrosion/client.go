@@ -33,6 +33,10 @@ type SyncMetrics interface {
 	// or parameter values). Counts ATTEMPTS, so a permanent collision increments every cycle;
 	// alert on rate, not absolute value.
 	ObserveMergeRejected(table, path, reason string)
+	// ObserveLegacyTransformed records a prior-release statement the WAL apply path normalized
+	// through a bounded legacy transformer (transformer = the transformer id). A nonzero rate
+	// means a not-yet-upgraded peer is still emitting a legacy shape.
+	ObserveLegacyTransformed(transformer string)
 	// ObserveTieBreak records an exact-timestamp tie that a resolver converged:
 	// resolver ∈ {content_max, numeric_max, timestamp_max, non_null_wins,
 	// lb_generation}; winner ∈ {local, incoming}. (Tombstone ties go to
@@ -231,6 +235,12 @@ func (c *Client) observeMerge(d time.Duration, merged, skipped int) {
 func (c *Client) observeMergeRejected(table, path, reason string) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveMergeRejected(table, path, reason)
+	}
+}
+
+func (c *Client) observeLegacyTransformed(transformer string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveLegacyTransformed(transformer)
 	}
 }
 

@@ -2,11 +2,95 @@ package corrosion
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
+
+// replayEntry builds a mutation entry replaying the exact statements a prior release emitted.
+func replayEntry(t *testing.T, origin, hlc string, stmts ...Statement) []*pb.MutationEntry {
+	t.Helper()
+	b, err := json.Marshal(stmts)
+	if err != nil {
+		t.Fatalf("marshal stmts: %v", err)
+	}
+	return []*pb.MutationEntry{{Seq: 1, Hlc: hlc, Origin: origin, Stmts: string(b)}}
+}
+
+// TestApplyRemoteMutations_LegacyCRLVersions replays v1.3.0's exact datetime('now') crl_versions
+// write: it must be normalized (not parse-error/back-pressure), stamped with the mutation's
+// bound HLC (never a receiver-evaluated clock), and counted by the legacy metric.
+func TestApplyRemoteMutations_LegacyCRLVersions(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	r := NewReplicator(c, "", RelayConfig{})
+	const ts = "2000000000000-0000-n2"
+
+	legacy := Statement{
+		SQL:    "INSERT OR REPLACE INTO crl_versions (host, version, updated_at)\n\t\t\t\t VALUES (?, ?, datetime('now'))",
+		Params: []interface{}{"host-a", float64(7)},
+	}
+	if _, err := r.ApplyRemoteMutations(ctx, replayEntry(t, "origin-node", ts, legacy)); err != nil {
+		t.Fatalf("legacy crl_versions must apply, got: %v", err)
+	}
+	rows, err := c.Query(ctx, "SELECT version, updated_at FROM crl_versions WHERE host = ?", "host-a")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("row not written: err=%v rows=%d", err, len(rows))
+	}
+	if got := rows[0].Int("version"); got != 7 {
+		t.Errorf("version = %d, want 7", got)
+	}
+	if got := rows[0].String("updated_at"); got != ts {
+		t.Errorf("updated_at = %q, want the mutation HLC %q (not datetime('now'))", got, ts)
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.legacyTransformed) != 1 || sm.legacyTransformed[0] != "crl_versions_datetime_now" {
+		t.Errorf("legacyTransformed = %v, want [crl_versions_datetime_now]", sm.legacyTransformed)
+	}
+}
+
+// TestApplyRemoteMutations_LegacyGCReap replays v1.3.0's exact spent-proof GC (tsMs CASE
+// predicate): it must apply through the custom-merge path (tombstone the terminal proof), not
+// back-pressure, and be counted by the legacy metric.
+func TestApplyRemoteMutations_LegacyGCReap(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	if err := c.Execute(ctx,
+		`INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator, status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, ?)`,
+		"p1", "reschedule", "vm", "vm1", "host-a", "host-b", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed proof: %v", err)
+	}
+	r := NewReplicator(c, "", RelayConfig{})
+	const ts = "2000000000000-0000-n2"
+	reap := Statement{
+		SQL: "UPDATE runtime_action_proofs\n\t\t    SET deleted_at = ?, updated_at = ?\n\t\t  WHERE deleted_at IS NULL\n\t\t    AND status IN ('completed','failed')\n\t\t    AND " + tsMsSQL("updated_at") + " < ?",
+		// updated_at 1e12 ms < cutoff 1.5e12 → matches.
+		Params: []interface{}{"2026-01-01T00:00:00Z", ts, float64(1500000000000)},
+	}
+	if _, err := r.ApplyRemoteMutations(ctx, replayEntry(t, "origin-node", ts, reap)); err != nil {
+		t.Fatalf("legacy gc-reap must apply, got: %v", err)
+	}
+	rows, err := c.Query(ctx, "SELECT deleted_at FROM runtime_action_proofs WHERE id = ?", "p1")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("query: err=%v rows=%d", err, len(rows))
+	}
+	if rows[0].String("deleted_at") == "" {
+		t.Error("spent proof must be tombstoned by the legacy gc-reap")
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.legacyTransformed) != 1 || sm.legacyTransformed[0] != "gc_spent_proof_tsms" {
+		t.Errorf("legacyTransformed = %v, want [gc_spent_proof_tsms]", sm.legacyTransformed)
+	}
+}
 
 // TestApplyBulkPerRowLWW_GatesByRowClock proves the per-row-LWW expansion: a single bulk
 // tombstone keyed by a parent column only tombstones the matching rows whose local clock is

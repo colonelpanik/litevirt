@@ -23,6 +23,7 @@ type AntiEntropyMetrics struct {
 	tombstoneTies        *prometheus.CounterVec
 	tieUnresolvedCurrent prometheus.Gauge
 	mergeRejected        *prometheus.CounterVec
+	legacyTransformed    *prometheus.CounterVec
 }
 
 // NewAntiEntropyMetrics registers the anti-entropy timing metrics on the default
@@ -62,6 +63,10 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Name: "litevirt_merge_apply_rejected_total",
 			Help: "Replicated rows/statements the apply path rejected without applying, by table, path (ae/wal), and reason (e.g. constraint). Counts attempts; alert on rate.",
 		}, []string{"table", "path", "reason"}),
+		legacyTransformed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_legacy_mutation_transformed_total",
+			Help: "Prior-release WAL statements normalized through a bounded legacy transformer, by transformer id. A nonzero rate means a not-yet-upgraded peer is still emitting a legacy shape.",
+		}, []string{"transformer"}),
 		tieBreaks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_lww_tie_break_total",
 			Help: "Exact-timestamp ties a resolver converged, by table, resolver rule, and winner (local/incoming).",
@@ -79,7 +84,7 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Help: "Distinct unresolved ties this node is CURRENTLY tracking (a gauge — drops to 0 when repaired). Alert on this for 'something is divergent now'; the _total counter is monotonic and would page forever.",
 		}),
 	}
-	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent, m.mergeRejected)
+	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent, m.mergeRejected, m.legacyTransformed)
 	return m
 }
 
@@ -125,6 +130,11 @@ func (m *AntiEntropyMetrics) ObserveTombstoneTie(table string) {
 // ObserveMergeRejected records a replicated row/statement rejected without applying. (Satisfies corrosion.SyncMetrics.)
 func (m *AntiEntropyMetrics) ObserveMergeRejected(table, path, reason string) {
 	m.mergeRejected.WithLabelValues(table, path, reason).Inc()
+}
+
+// ObserveLegacyTransformed records a prior-release statement normalized by a legacy transformer. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveLegacyTransformed(transformer string) {
+	m.legacyTransformed.WithLabelValues(transformer).Inc()
 }
 
 // ObserveUnresolvedTieCurrent sets the current-unresolved-ties gauge. (Satisfies corrosion.SyncMetrics.)

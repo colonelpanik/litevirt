@@ -909,6 +909,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 		var stmts []Statement
 		if err := json.Unmarshal([]byte(entry.Stmts), &stmts); err != nil {
 			_ = tx.Rollback()
+			r.client.observeMergeRejected("", "wal", "decode")
 			slog.Error("replicator: undecodable mutation entry — back-pressuring replication",
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)
 			return 0, fmt.Errorf("decode mutation entry (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
@@ -918,6 +919,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 		// malformed/truncated entry surfaces instead of being silently acknowledged.
 		if len(stmts) == 0 {
 			_ = tx.Rollback()
+			r.client.observeMergeRejected("", "wal", "empty")
 			slog.Error("replicator: mutation entry has no statements — back-pressuring replication",
 				"origin", entry.Origin, "seq", entry.Seq)
 			return 0, fmt.Errorf("mutation entry has no statements (origin=%s seq=%d)", entry.Origin, entry.Seq)
@@ -932,6 +934,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 		for _, s := range stmts {
 			if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 				_ = tx.Rollback()
+				r.client.observeMergeRejected(extractTableName(s.SQL), "wal", walRejectReason(err))
 				if isSchemaMissingError(err) {
 					slog.Error("replicator: schema-missing on receiver — back-pressuring replication",
 						"sql", s.SQL, "error", err,
@@ -1104,13 +1107,31 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		return execErr
 
 	case DispBulkUpdate:
-		// A bulk (non-full-PK) UPDATE, applied by per-row LWW expansion.
-		return r.applyBulkPerRowLWW(ctx, tx, s, sh, tableName, pkCols)
+		// Dispatch explicitly by the ledger's concurrency category — the categories are
+		// distinct contracts, not interchangeable. Only per-row-LWW is applied by expansion; a
+		// provably-monotonic bulk is safe verbatim; anything else (including a future
+		// unsupported entry) back-pressures.
+		switch entry.Category {
+		case CatPerRowLWW:
+			return r.applyBulkPerRowLWW(ctx, tx, s, sh, tableName, pkCols)
+		case CatMonotonic:
+			res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
+			if execErr == nil && rowsChanged(res) {
+				r.client.clearUnresolvedFromStmt(s)
+			}
+			return execErr
+		default:
+			return invalidf("bulk update on %s has unsupported concurrency category %q", tableName, entry.Category)
+		}
 
 	case DispFullPKUpdateNoClock:
-		// A full-PK maintenance/monotone UPDATE with no bound updated_at (audit reseal,
-		// session touch, token last_used_at): apply verbatim by PK, no LWW gate. The builder's
-		// WHERE keeps it idempotent/monotone; the target may have no updated_at column at all.
+		// A full-PK UPDATE with no bound updated_at, authorized by an explicit audited policy.
+		// A monotonic-timestamp update is applied with a guard so it only ADVANCES the column
+		// (never regresses on an out-of-order write); an idempotent/terminal one (audit reseal,
+		// guarded revoke) applies verbatim by PK.
+		if entry.MonotoneColumn != "" {
+			return r.applyMonotoneTimestamp(ctx, tx, s, sh, entry.MonotoneColumn)
+		}
 		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if execErr == nil && rowsChanged(res) {
 			r.client.clearUnresolvedFromStmt(s)
@@ -1153,6 +1174,44 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 	if err == nil && rowsChanged(res) {
 		// A strictly-newer / resolver-chosen incoming write that actually CHANGED the row
 		// clears any stale unresolved-tie tracking. A guarded zero-row UPDATE is excluded.
+		r.client.clearUnresolvedFromStmt(s)
+	}
+	return err
+}
+
+// applyMonotoneTimestamp applies a no-clock full-PK UPDATE that only ADVANCES a timestamp
+// column (session/token last_used_at). It splices a monotone guard onto the WHERE —
+// `AND (col IS NULL OR col < ?)` bound to the incoming value from the SET — so an out-of-order
+// replicated write can't move the column backwards (aligning the WAL apply with anti-entropy's
+// timestamp-max merge). A NULL local value is advanced (first write lands).
+func (r *Replicator) applyMonotoneTimestamp(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, col string) error {
+	var incoming interface{}
+	found := false
+	for _, a := range sh.SetAssigns {
+		if strings.EqualFold(a.Column, col) {
+			if len(a.Expr.ParamIdx) != 1 {
+				return invalidf("monotone update on %s: %s is not a single bound parameter", sh.Table, col)
+			}
+			idx := a.Expr.ParamIdx[0]
+			if idx < 0 || idx >= len(s.Params) {
+				return invalidf("monotone update on %s: %s parameter out of range", sh.Table, col)
+			}
+			incoming = s.Params[idx]
+			found = true
+		}
+	}
+	if !found {
+		return invalidf("monotone update on %s: SET does not assign %s", sh.Table, col)
+	}
+	if sh.WhereEnd <= sh.WhereStart || sh.WhereEnd > len(s.SQL) {
+		return invalidf("monotone update on %s: no WHERE clause to guard", sh.Table)
+	}
+	applied := s.SQL[:sh.WhereEnd] + " AND (" + col + " IS NULL OR " + col + " < ?)"
+	params := make([]interface{}, 0, len(s.Params)+1)
+	params = append(params, s.Params...)
+	params = append(params, incoming)
+	res, err := tx.ExecContext(ctx, applied, params...)
+	if err == nil && rowsChanged(res) {
 		r.client.clearUnresolvedFromStmt(s)
 	}
 	return err
@@ -1269,6 +1328,27 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 		r.client.clearUnresolvedFromStmt(s)
 	}
 	return nil
+}
+
+// walRejectReason maps a WAL apply error to a BOUNDED metric reason label (never SQL/params):
+// schema_missing, invalid_shape (any ErrInvalidStmt — unregistered / no-PK / arity / parse /
+// unknown-kind), a specific constraint kind (unique/not_null/check/foreign_key/constraint),
+// operational, or other.
+func walRejectReason(err error) string {
+	switch {
+	case isSchemaMissingError(err):
+		return "schema_missing"
+	case errors.Is(err, ErrInvalidStmt):
+		return "invalid_shape"
+	}
+	switch class, kind := classifySQLiteError(err); class {
+	case classConstraint:
+		return string(kind)
+	case classOperational:
+		return "operational"
+	default:
+		return "other"
+	}
 }
 
 // rowsChanged reports whether a SQL result provably affected at least one row.

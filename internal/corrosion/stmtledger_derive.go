@@ -34,17 +34,19 @@ func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 		return DispPlainInsert, CatNone, nil
 	case KindUpdate:
 		if sh.HasFullPKIdentity {
-			// A full-PK UPDATE is LWW-gated ONLY when it binds updated_at (the clock the gate
-			// compares). A full-PK UPDATE that does NOT bind updated_at is a maintenance /
-			// monotone update — the audit_log hash-chain reseal and sessions touch (tables
-			// with NO updated_at column at all), or the token last_used_at bump (deliberately
-			// not advancing the token clock). Gating those by updated_at would either query a
-			// nonexistent column (back-pressuring valid replication) or compare against a
-			// fallback clock; apply them verbatim by PK instead, relying on the builder's WHERE.
+			// A full-PK UPDATE is LWW-gated only when it binds updated_at (the clock the gate
+			// compares).
 			if sh.UpdatedAtParamIdx >= 0 {
 				return DispFullPKUpdate, CatNone, nil
 			}
-			return DispFullPKUpdateNoClock, CatNone, nil
+			// A no-clock full-PK UPDATE (no bound updated_at) is NOT auto-derived: applying it
+			// verbatim can regress a replicated timestamp when writes from different origins
+			// arrive out of order (session/token last_used_at). It requires an EXPLICIT,
+			// audited per-fingerprint policy (explicitPolicyDefs) that says whether it is
+			// idempotent/terminal (apply verbatim) or a monotone-timestamp update (advance
+			// only). LedgerEntryFor consults the explicit policy first; reaching here means a
+			// no-clock shape has none, which fails the guard until one is added.
+			return "", CatNone, invalidf("no-clock full-PK update on %s requires an explicit ledger policy", sh.Table)
 		}
 		// A bulk UPDATE (no full-PK identity) is applied by per-row LWW expansion — but only
 		// when that is provably safe: it must advance a clock (SET updated_at = ?) so each
@@ -73,8 +75,51 @@ func bulkUpdateIsPerRowLWWSafe(sh StmtShape) bool {
 	return sh.UpdatedAtParamIdx >= 0
 }
 
+// explicitPolicyDef is an audited, hand-maintained disposition for a specific statement whose
+// safe handling can NOT be auto-derived — currently the no-clock full-PK updates. Each names
+// its exact statement and, for a monotonic-timestamp update, the column the receiver must only
+// ADVANCE (never regress on an out-of-order write). Idempotent/terminal updates leave
+// MonotoneColumn empty and apply verbatim.
+type explicitPolicyDef struct {
+	SQL            string
+	Disposition    Disposition
+	MonotoneColumn string
+}
+
+var explicitPolicyDefs = []explicitPolicyDef{
+	// audit_log hash-chain reseal: idempotent (recomputes the same hashes) → verbatim.
+	{`UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, DispFullPKUpdateNoClock, ""},
+	// session revoke: a guarded one-shot terminal transition (WHERE revoked_at IS NULL) → verbatim.
+	{`UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, DispFullPKUpdateNoClock, ""},
+	// session touch: last_used_at must only advance (align with AE's timestamp-max merge).
+	{`UPDATE sessions SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`, DispFullPKUpdateNoClock, "last_used_at"},
+	// token touch: last_used_at must only advance.
+	{`UPDATE tokens SET last_used_at = ? WHERE id = ?`, DispFullPKUpdateNoClock, "last_used_at"},
+}
+
+var explicitPolicyByFP = buildExplicitPolicies()
+
+func buildExplicitPolicies() map[string]LedgerEntry {
+	m := make(map[string]LedgerEntry, len(explicitPolicyDefs))
+	for _, d := range explicitPolicyDefs {
+		fp, err := FingerprintSQL(d.SQL)
+		if err != nil {
+			panic("explicit policy SQL does not parse: " + d.SQL + ": " + err.Error())
+		}
+		m[fp] = LedgerEntry{Disposition: d.Disposition, MonotoneColumn: d.MonotoneColumn}
+	}
+	return m
+}
+
+// explicitPolicy returns the audited per-fingerprint policy, if one is registered.
+func explicitPolicy(fp string) (LedgerEntry, bool) {
+	e, ok := explicitPolicyByFP[fp]
+	return e, ok
+}
+
 // LedgerEntryFor derives the compatibility-ledger entry for one replicated builder statement.
-// The CI guard's -emit-ledger mode calls it to generate stmtledger_generated.go.
+// The CI guard's -emit-ledger mode calls it to generate stmtledger_generated.go. An explicit,
+// audited per-fingerprint policy (explicitPolicyDefs) overrides derivation.
 func LedgerEntryFor(sql string) (LedgerEntry, error) {
 	table := extractTableName(sql)
 	pkCols := tablePrimaryKeys[table]
@@ -82,15 +127,14 @@ func LedgerEntryFor(sql string) (LedgerEntry, error) {
 	if err != nil {
 		return LedgerEntry{}, err
 	}
+	fp := stmtFingerprint(sh)
+	if e, ok := explicitPolicy(fp); ok {
+		e.Fingerprint, e.Kind, e.Table = fp, sh.Kind.String(), sh.Table
+		return e, nil
+	}
 	disp, cat, err := deriveDisposition(sh)
 	if err != nil {
 		return LedgerEntry{}, err
 	}
-	return LedgerEntry{
-		Fingerprint: stmtFingerprint(sh),
-		Kind:        sh.Kind.String(),
-		Table:       sh.Table,
-		Disposition: disp,
-		Category:    cat,
-	}, nil
+	return LedgerEntry{Fingerprint: fp, Kind: sh.Kind.String(), Table: sh.Table, Disposition: disp, Category: cat}, nil
 }

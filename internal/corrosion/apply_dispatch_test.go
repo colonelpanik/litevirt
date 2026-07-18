@@ -203,6 +203,58 @@ func TestApplyRemoteMutations_UnregisteredDeleteRejected(t *testing.T) {
 	assertNotSeen(t, c, "origin-node")
 }
 
+// TestApplyRemoteMutations_MonotoneLastUsedAt: a no-clock token last_used_at update is applied
+// with a monotone guard, so an out-of-order replicated write can't move last_used_at backwards
+// (finding 1) — but a genuinely newer one advances it.
+func TestApplyRemoteMutations_MonotoneLastUsedAt(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`INSERT INTO tokens (id, username, name, token_hash, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"t1", "u", "n", "h", "2020-01-01T00:00:00Z", "", "2026-06-01T00:00:00Z"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r := NewReplicator(c, "", RelayConfig{})
+	lastUsedAt := func() string {
+		rows, _ := c.Query(ctx, "SELECT last_used_at FROM tokens WHERE id = ?", "t1")
+		return rows[0].String("last_used_at")
+	}
+
+	// An OUT-OF-ORDER (older) touch must NOT regress last_used_at.
+	older := `[{"SQL":"UPDATE tokens SET last_used_at = ? WHERE id = ?","Params":["2026-05-01T00:00:00Z","t1"]}]`
+	if _, err := r.ApplyRemoteMutations(ctx, []*pb.MutationEntry{{Seq: 1, Hlc: "1-0-a", Origin: "o", Stmts: older}}); err != nil {
+		t.Fatalf("apply older: %v", err)
+	}
+	if got := lastUsedAt(); got != "2026-06-01T00:00:00Z" {
+		t.Errorf("last_used_at = %q, want 2026-06-01 (older touch must not regress it)", got)
+	}
+	// A genuinely NEWER touch advances it.
+	newer := `[{"SQL":"UPDATE tokens SET last_used_at = ? WHERE id = ?","Params":["2026-07-01T00:00:00Z","t1"]}]`
+	if _, err := r.ApplyRemoteMutations(ctx, []*pb.MutationEntry{{Seq: 2, Hlc: "2-0-a", Origin: "o", Stmts: newer}}); err != nil {
+		t.Fatalf("apply newer: %v", err)
+	}
+	if got := lastUsedAt(); got != "2026-07-01T00:00:00Z" {
+		t.Errorf("last_used_at = %q, want 2026-07-01 (newer touch must advance it)", got)
+	}
+}
+
+// TestNoClockUpdateRequiresExplicitPolicy: deriveDisposition must NOT auto-classify a no-clock
+// full-PK update — an unknown one errors, forcing an explicit audited policy (finding 1).
+func TestNoClockUpdateRequiresExplicitPolicy(t *testing.T) {
+	// A no-clock full-PK update with no registered explicit policy.
+	if _, err := LedgerEntryFor(`UPDATE sessions SET something = ? WHERE id = ?`); err == nil {
+		t.Error("a no-clock full-PK update without an explicit policy must not be auto-classified")
+	}
+	// A registered no-clock shape resolves via its explicit policy.
+	le, err := LedgerEntryFor(`UPDATE tokens SET last_used_at = ? WHERE id = ?`)
+	if err != nil {
+		t.Fatalf("registered no-clock shape: %v", err)
+	}
+	if le.Disposition != DispFullPKUpdateNoClock || le.MonotoneColumn != "last_used_at" {
+		t.Errorf("token touch = %+v, want DispFullPKUpdateNoClock / last_used_at", le)
+	}
+}
+
 // TestApplyRemoteMutations_UnregisteredInsertRejected: an INSERT whose fingerprint is in
 // NEITHER the current nor the historical ledger back-pressures — there is no runtime
 // derivation fallback, so an unknown shape is never authorized.

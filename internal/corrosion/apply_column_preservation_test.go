@@ -359,8 +359,8 @@ func TestMergeLWW_SecondaryUniqueRecordsRejectedMetric(t *testing.T) {
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	if len(sm.mergeRejected) != 1 || sm.mergeRejected[0] != "snapshots/ae/constraint" {
-		t.Errorf("mergeRejected = %v, want [snapshots/ae/constraint]", sm.mergeRejected)
+	if len(sm.mergeRejected) != 1 || sm.mergeRejected[0] != "snapshots/ae/unique" {
+		t.Errorf("mergeRejected = %v, want [snapshots/ae/unique]", sm.mergeRejected)
 	}
 }
 

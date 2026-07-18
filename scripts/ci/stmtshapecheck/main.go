@@ -170,37 +170,29 @@ var catIdent = map[corrosion.ConcurrencyCategory]string{
 // checked-in historical ledger entries with provenance, and prints stmtledger_historical.go.
 // Shapes whose fingerprint is already in the current ledger are skipped (not historical-only).
 func emitHistoricalLedger() error {
-	type entry struct {
-		fp, kind, table, disp, cat, family, first, removal string
-	}
-	byFP := map[string]entry{}
+	byFP := map[string]string{}
 	family := map[string][]string{}
 	for _, hs := range corrosion.HistoricalShapes() {
 		le, err := corrosion.LedgerEntryFor(hs.SQL)
 		if err != nil {
 			return fmt.Errorf("derive historical entry for %q: %w", hs.SQL, err)
 		}
-		if _, current := corrosion.LedgerLookup(le.Fingerprint); current {
-			continue // already a current-build shape; not historical-only
+		if corrosion.CurrentLedgerHas(le.Fingerprint) {
+			continue // already a CURRENT-build shape; not historical-only (must not use
+			// LedgerLookup here — it also matches already-generated historical entries)
 		}
-		di, ok := dispIdent[le.Disposition]
-		if !ok {
-			return fmt.Errorf("unknown disposition %q for %q", le.Disposition, hs.SQL)
+		le.FirstEmitter, le.RemovalHorizon = hs.FirstEmitter, hs.Removal
+		rendered, err := renderLedgerEntry(le)
+		if err != nil {
+			return fmt.Errorf("%q: %w", hs.SQL, err)
 		}
-		ci := ""
-		if le.Category != corrosion.CatNone {
-			if ci = catIdent[le.Category]; ci == "" {
-				return fmt.Errorf("unknown category %q for %q", le.Category, hs.SQL)
-			}
-		}
-		e := entry{fp: le.Fingerprint, kind: le.Kind, table: le.Table, disp: di, cat: ci, family: hs.Family, first: hs.FirstEmitter, removal: hs.Removal}
-		if prev, dup := byFP[e.fp]; dup {
-			if prev != e {
-				return fmt.Errorf("fingerprint %s derived two different historical entries", e.fp)
+		if prev, dup := byFP[le.Fingerprint]; dup {
+			if prev != rendered {
+				return fmt.Errorf("fingerprint %s derived two different historical entries", le.Fingerprint)
 			}
 			continue
 		}
-		byFP[e.fp] = e
+		byFP[le.Fingerprint] = rendered
 		family[hs.Family] = append(family[hs.Family], le.Fingerprint)
 	}
 
@@ -223,13 +215,7 @@ func emitHistoricalLedger() error {
 	b.WriteString("// deleting an entry whose FirstEmitter is still a supported peer.\n")
 	b.WriteString("var historicalLedger = map[string]LedgerEntry{\n")
 	for _, fp := range fps {
-		e := byFP[fp]
-		cat := ""
-		if e.cat != "" {
-			cat = ", Category: " + e.cat
-		}
-		fmt.Fprintf(&b, "\t%q: {Fingerprint: %q, Kind: %q, Table: %q, Disposition: %s%s, FirstEmitter: %q, RemovalHorizon: %q},\n",
-			e.fp, e.fp, e.kind, e.table, e.disp, cat, e.first, e.removal)
+		fmt.Fprintf(&b, "\t%q: %s,\n", fp, byFP[fp])
 	}
 	b.WriteString("}\n\n")
 	b.WriteString("// historicalPolicies groups each historical shape family's expansion fingerprints, so the\n")
@@ -249,15 +235,45 @@ func emitHistoricalLedger() error {
 	return nil
 }
 
+// renderLedgerEntry renders a LedgerEntry as a Go composite literal, emitting every field the
+// apply path relies on (Disposition, Category, MonotoneColumn, and any provenance) so a
+// generated entry never silently drops one.
+func renderLedgerEntry(le corrosion.LedgerEntry) (string, error) {
+	di, ok := dispIdent[le.Disposition]
+	if !ok {
+		return "", fmt.Errorf("unknown disposition %q", le.Disposition)
+	}
+	parts := []string{
+		fmt.Sprintf("Fingerprint: %q", le.Fingerprint),
+		fmt.Sprintf("Kind: %q", le.Kind),
+		fmt.Sprintf("Table: %q", le.Table),
+		"Disposition: " + di,
+	}
+	if le.Category != corrosion.CatNone {
+		ci := catIdent[le.Category]
+		if ci == "" {
+			return "", fmt.Errorf("unknown category %q", le.Category)
+		}
+		parts = append(parts, "Category: "+ci)
+	}
+	if le.MonotoneColumn != "" {
+		parts = append(parts, fmt.Sprintf("MonotoneColumn: %q", le.MonotoneColumn))
+	}
+	if le.FirstEmitter != "" {
+		parts = append(parts, fmt.Sprintf("FirstEmitter: %q", le.FirstEmitter))
+	}
+	if le.RemovalHorizon != "" {
+		parts = append(parts, fmt.Sprintf("RemovalHorizon: %q", le.RemovalHorizon))
+	}
+	return "{" + strings.Join(parts, ", ") + "}", nil
+}
+
 // emitGeneratedLedger derives a ledger entry for every resolved builder statement and prints
 // stmtledger_generated.go. It fails if any statement is dynamic/unparseable/unresolved (the
 // ledger would be incomplete) or if two builders share a fingerprint with conflicting
 // dispositions (a derivation bug).
 func emitGeneratedLedger(findings []finding) error {
-	type entry struct {
-		fp, kind, table, disp, cat string
-	}
-	byFP := map[string]entry{}
+	byFP := map[string]string{}
 	for _, f := range findings {
 		if f.unresolvedBatch || f.dynamic || f.parseErr != "" {
 			return fmt.Errorf("%s: statement not statically resolvable; refusing to emit an incomplete ledger", loc(f.pos))
@@ -266,22 +282,14 @@ func emitGeneratedLedger(findings []finding) error {
 		if err != nil {
 			return fmt.Errorf("%s: derive ledger entry: %w (%q)", loc(f.pos), err, f.sql)
 		}
-		di, ok := dispIdent[le.Disposition]
-		if !ok {
-			return fmt.Errorf("%s: unknown disposition %q", loc(f.pos), le.Disposition)
+		rendered, err := renderLedgerEntry(le)
+		if err != nil {
+			return fmt.Errorf("%s: %w", loc(f.pos), err)
 		}
-		ci := ""
-		if le.Category != corrosion.CatNone {
-			ci = catIdent[le.Category]
-			if ci == "" {
-				return fmt.Errorf("%s: unknown category %q", loc(f.pos), le.Category)
-			}
+		if prev, dup := byFP[le.Fingerprint]; dup && prev != rendered {
+			return fmt.Errorf("fingerprint %s derived two different entries: %s vs %s", le.Fingerprint, prev, rendered)
 		}
-		e := entry{fp: le.Fingerprint, kind: le.Kind, table: le.Table, disp: di, cat: ci}
-		if prev, dup := byFP[e.fp]; dup && prev != e {
-			return fmt.Errorf("fingerprint %s derived two different entries: %+v vs %+v", e.fp, prev, e)
-		}
-		byFP[e.fp] = e
+		byFP[le.Fingerprint] = rendered
 	}
 
 	fps := make([]string, 0, len(byFP))
@@ -298,14 +306,7 @@ func emitGeneratedLedger(findings []finding) error {
 	b.WriteString("// fingerprint absent here is an unknown shape and is rejected (back-pressured).\n")
 	b.WriteString("var stmtLedger = map[string]LedgerEntry{\n")
 	for _, fp := range fps {
-		e := byFP[fp]
-		if e.cat != "" {
-			fmt.Fprintf(&b, "\t%q: {Fingerprint: %q, Kind: %q, Table: %q, Disposition: %s, Category: %s},\n",
-				e.fp, e.fp, e.kind, e.table, e.disp, e.cat)
-		} else {
-			fmt.Fprintf(&b, "\t%q: {Fingerprint: %q, Kind: %q, Table: %q, Disposition: %s},\n",
-				e.fp, e.fp, e.kind, e.table, e.disp)
-		}
+		fmt.Fprintf(&b, "\t%q: %s,\n", fp, byFP[fp])
 	}
 	b.WriteString("}\n")
 	fmt.Print(b.String())

@@ -441,7 +441,7 @@ func decompressPayload(buf []byte) (*syncPayload, error) {
 // Per table it (1) validates the peer-supplied table name and columns against
 // the local schema before building any dynamic SQL, (2) batch-prefetches the
 // existing rows' updated_at keyed by primary key, and (3) keeps the local row
-// when localWinsLWW says so, otherwise INSERT OR REPLACEs the incoming row.
+// when localWinsLWW says so, otherwise applies the incoming row via a PK-aware UPSERT.
 func (c *Client) mergeStatePayloadLWW(payload *syncPayload) error {
 	return c.mergeStatePayloadLWWWithAllowlist(payload, replicatedTableSet)
 }
@@ -615,7 +615,7 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 
 // mergeChunk applies one bounded slice of a table's rows under a single
 // write-locked transaction: prefetch existing updated_at, LWW-compare, and
-// INSERT OR REPLACE the winners. Prefetch and inserts share the tx (held under
+// PK-aware UPSERT the winners (never a whole-row replace). Prefetch and inserts share the tx (held under
 // the lock), so the compare→insert decision is atomic within the chunk; the lock
 // is released on return so the next chunk doesn't monopolize it.
 func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL string, pkCols []string, pkIdx []int, updatedAtIdx int) (merged, skipped int, err error) {
@@ -779,9 +779,9 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 // a partial chunk and silently dropping the error.
 func (c *Client) applyMergeRow(tx *sql.Tx, insertSQL string, row []interface{}, table string) (rejected bool, err error) {
 	if _, execErr := tx.Exec(insertSQL, row...); execErr != nil {
-		if class, _ := classifySQLiteError(execErr); class == classConstraint {
+		if class, kind := classifySQLiteError(execErr); class == classConstraint {
 			slog.Warn("sync: merge row rejected by constraint (keeping local)", "table", table, "error", execErr)
-			c.observeMergeRejected(table, "ae", "constraint")
+			c.observeMergeRejected(table, "ae", string(kind)) // unique / not_null / check / foreign_key / constraint
 			return true, nil
 		}
 		return false, fmt.Errorf("merge row into %s: %w", table, execErr)

@@ -53,7 +53,7 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 		}),
 		rowsMerged: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_antientropy_rows_merged_total",
-			Help: "Rows applied (INSERT OR REPLACE) by anti-entropy full-state merges.",
+			Help: "Rows applied (PK-aware UPSERT) by anti-entropy full-state merges.",
 		}),
 		rowsSkipped: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_antientropy_rows_skipped_total",

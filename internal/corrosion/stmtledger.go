@@ -60,6 +60,13 @@ type LedgerEntry struct {
 	// by the current build). The CI guard forbids deleting an entry whose emitter is still a
 	// supported peer. Empty on current-build entries (the guard proves those against source).
 	FirstEmitter, LastEmitter string
+
+	// MonotoneColumn, set on a DispFullPKUpdateNoClock entry via an explicit audited policy,
+	// names a timestamp column the receiver must only ADVANCE. The apply path adds a guard so
+	// an out-of-order replicated write can't move it backwards (session/token last_used_at).
+	// Empty ⇒ the no-clock update is idempotent/terminal and applies verbatim (audit reseal,
+	// a guarded one-shot revoke).
+	MonotoneColumn string
 }
 
 // LedgerLookup returns the entry for a fingerprint, if registered — in the current-build
@@ -72,6 +79,15 @@ func LedgerLookup(fp string) (LedgerEntry, bool) {
 	}
 	e, ok := historicalLedger[fp]
 	return e, ok
+}
+
+// CurrentLedgerHas reports whether a fingerprint is in the CURRENT-build ledger only (not the
+// historical ledger). The historical generator uses this to decide whether a candidate shape
+// is historical-only — LedgerLookup would report every already-generated historical entry as
+// present and yield an empty regeneration.
+func CurrentLedgerHas(fp string) bool {
+	_, ok := stmtLedger[fp]
+	return ok
 }
 
 // PolicyLookup returns a dynamic-SQL policy's finite set of allowed expansion fingerprints.

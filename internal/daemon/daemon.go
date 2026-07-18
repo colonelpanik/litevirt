@@ -434,19 +434,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalIdentity(func() bool {
 		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
 	})
-	// Accept replicated canonical registry-credential writes once enforcement.canonical_registry is
-	// set AND the token has latched cluster-wide (Part H2). This is the ACCEPT gate only — it lets
-	// the one-time legacy-row consolidation's canonical writes land on every node; switching the
-	// WRITER (SetCanonicalRegistry) is gated further on convergence by the migration controller.
-	d.db.SetCanonicalRegistryLatched(func() bool {
-		return d.cfg.Enforcement.CanonicalRegistry && d.checker.Latched(capabilities.CanonicalRegistryV1)
-	})
-	// Switch the credential WRITER to canonical only once canonical_registry_active_v1 (phase 2) has
-	// latched — i.e. EVERY admitted node reports RegistryWriterReady (its legacy rows consolidated).
-	// Gating on the cluster-wide latch (not this node's local readiness) means no node originates a
-	// canonical write for a triple a peer still holds as legacy-live. Reversible via the config flag.
-	d.db.SetCanonicalRegistry(func() bool {
-		return d.cfg.Enforcement.CanonicalRegistry && d.checker.Latched(capabilities.CanonicalRegistryActiveV1)
+	// Part H2: resolve the registry-credential migration phase from the durable/observable inputs —
+	// the ONE state machine that drives writer routing, apply policy, and admission. Phase 1
+	// (canonical_registry_v1) latched ⇒ accept canonical writes + freeze the local writer while it
+	// consolidates and drains; phase 2 (canonical_registry_active_v1) latched ⇒ EVERY node was ready,
+	// so switch the writer to canonical and reject legacy inserts — durable/irreversible, config-off
+	// no longer reverts to the legacy writer. A phase-2-latched node that isn't locally ready is
+	// BLOCKED (reseed) rather than silently serving. Cheap Latched reads on the apply/write path.
+	d.db.SetRegistryMigrationState(func() corrosion.RegistryMigrationState {
+		return corrosion.ResolveRegistryMigrationState(
+			d.cfg.Enforcement.CanonicalRegistry,
+			d.checker.Latched(capabilities.CanonicalRegistryV1),
+			d.checker.Latched(capabilities.CanonicalRegistryActiveV1),
+			d.registryLocallyReady.Load(),
+		)
 	})
 	repl.Start(ctx)
 

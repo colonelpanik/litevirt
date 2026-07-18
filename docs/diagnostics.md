@@ -223,21 +223,35 @@ both nodes target the same primary key and a conflict resolves by normal LWW —
 collision. It rolls out in **two coordinated phases** driven by two capability latches
 (the operator only flips the config flag):
 
-1. **Phase 1 — accept + converge.** Set `enforcement.canonical_registry: true`
-   fleet-wide. Once `canonical_registry_v1` latches (every node advertises it — config
-   uniformity), replicated canonical writes are **accepted**, and each node's migration
-   controller idempotently **consolidates** its legacy rows to their deterministic ids
-   (tombstone the exact legacy row by full-content CAS + upsert the canonical row).
-2. **Phase 2 — switch the writer.** A node advertises `canonical_registry_active_v1`
-   only once it reports **`RegistryWriterReady`** (no legacy live rows remain), so that
-   token latches **exactly when every node is consolidated** — the machine check. On
-   that latch the writer switches to canonical cluster-wide, and the legacy mint-new-id
-   INSERT shape is **rejected on apply** (a stray legacy write afterward — a bug or an
-   old/returning node — can't create a duplicate row; that node needs a reseed).
+A single **migration state machine** owns writer routing, apply policy, and startup
+admission — `legacy → preparing → ready → canonical`, plus a `blocked` state for a node
+that rejoins post-activation without local convergence.
 
-Both phases are **reversible** via the config flag and **fail-closed**: a write that
-would collide back-pressures rather than duplicating. The retired legacy rows stay
-tombstoned (inert under the partial index) for a future watermark-safe GC.
+1. **Phase 1 — accept + converge (FROZEN writer).** Set `enforcement.canonical_registry:
+   true` fleet-wide. Once `canonical_registry_v1` latches (every node advertises it —
+   config uniformity), replicated canonical writes are **accepted**, and each node's
+   migration controller idempotently **consolidates** its legacy rows to their
+   deterministic ids (tombstone the exact legacy row by full-content CAS + upsert the
+   canonical row). While a node is converging, credential writes are **frozen** (a login
+   returns `Unavailable`, retryable) so no new legacy row can appear between readiness and
+   activation and the legacy WAL can drain to a clean barrier.
+2. **Phase 2 — switch the writer.** A node advertises `canonical_registry_active_v1` only
+   once it reports **`RegistryWriterReady`** (no legacy live rows) **and its legacy WAL has
+   drained** (no legacy INSERT left in its mutation/relay log — every peer consumed it), so
+   that token latches **exactly when every node is consolidated and drained past the legacy
+   barrier** — the machine check. On that latch the writer switches to canonical
+   cluster-wide, and the legacy mint-new-id INSERT shape is **rejected on apply** (WAL) and
+   **on sensitive AE** (a live non-canonical dump row is kept-local + counted), so a stray
+   legacy write afterward — a bug or an old/returning node — can't create a duplicate row.
+
+**Reversibility is asymmetric and deliberate.** Phase 1 is a reversible kill switch: turn
+the flag off before phase 2 latches and the node returns to the legacy writer. **Phase 2
+is durable and irreversible** — once `canonical_registry_active_v1` has latched, turning
+the flag off **retains** the canonical writer (it does not revert to legacy, which peers
+would now reject). A node that restarts phase-2-latched but **not** locally ready enters
+`blocked`: it **refuses credential writes** (`FailedPrecondition`) until reseeded, rather
+than serving a stale legacy writer. The retired legacy rows stay tombstoned (inert under
+the partial index) for a future watermark-safe GC.
 
 The **index contract** (replacing the partial `UNIQUE … WHERE deleted_at IS NULL` with
 a non-partial `UNIQUE(scope,owner,registry)`) is **deliberately deferred** — the

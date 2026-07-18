@@ -44,19 +44,32 @@ func (d *Daemon) registryMigrationStep(ctx context.Context, latched bool) {
 		return
 	}
 	// Idempotently consolidate any legacy live rows (including ones replicated from a lagging peer).
+	// The local writer is FROZEN in this phase (RegPreparing/RegReady), so no new legacy row races
+	// the consolidation; consolidation itself is exempt (it uses the guarded batch path directly).
 	if n, err := corrosion.ConsolidateRegistryCredentials(ctx, d.db); err != nil {
 		slog.Warn("registry migration: consolidation error", "error", err)
 	} else if n > 0 {
 		slog.Info("registry migration: consolidated legacy credentials to canonical ids", "count", n)
 	}
-	// Publish local readiness — the phase-2 token (canonical_registry_active_v1) is advertised only
-	// while this is true, so it latches (and the writer switches) only when EVERY node is ready.
+	// Publish local readiness = consolidated (no legacy live row) AND drained (no legacy INSERT left
+	// in this node's mutation/relay log, i.e. every peer consumed our legacy writes). The phase-2
+	// token is advertised only while this holds, so it latches (and the writer switches) only when
+	// EVERY node has both consolidated and drained past the legacy barrier — finding 1's TOCTOU +
+	// drain gap. With the writer frozen, both conditions are monotone, so readiness can't regress.
 	ready, err := corrosion.RegistryWriterReady(ctx, d.db)
 	if err != nil {
 		slog.Warn("registry migration: writer-readiness check failed", "error", err)
 		return
 	}
+	if ready {
+		drained, dErr := corrosion.RegistryLegacyDrained(ctx, d.db)
+		if dErr != nil {
+			slog.Warn("registry migration: legacy-drain check failed", "error", dErr)
+			return
+		}
+		ready = drained
+	}
 	if d.registryLocallyReady.CompareAndSwap(!ready, ready) && ready {
-		slog.Info("registry migration: node writer-ready (legacy rows consolidated) — advertising canonical_registry_active_v1")
+		slog.Info("registry migration: node writer-ready (consolidated + legacy WAL drained) — advertising canonical_registry_active_v1")
 	}
 }

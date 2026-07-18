@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"google.golang.org/grpc/codes"
@@ -12,6 +13,20 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
 )
+
+// registryWriteStatus maps a credential-writer error to a gRPC status. A mid-migration FREEZE is a
+// transient Unavailable (retry once activation completes); a reseed-required (RegBlocked) node is a
+// FailedPrecondition (operator must reseed). Anything else is Internal.
+func registryWriteStatus(err error, action string) error {
+	switch {
+	case errors.Is(err, corrosion.ErrRegistryMigrating):
+		return status.Errorf(codes.Unavailable, "%s: %v", action, err)
+	case errors.Is(err, corrosion.ErrRegistryReseedRequired):
+		return status.Errorf(codes.FailedPrecondition, "%s: %v", action, err)
+	default:
+		return status.Errorf(codes.Internal, "%s: %v", action, err)
+	}
+}
 
 // Registry credentials (v23): per-user and global OCI/Docker registry logins
 // used to authenticate `lv ct pull` / PullOCIImage against private registries.
@@ -56,9 +71,10 @@ func (s *Server) SetRegistryCredential(ctx context.Context, req *pb.SetRegistryC
 		Username: req.Username, Secret: req.Password,
 	}
 	// Auto-selects the canonical deterministic-id writer once H2 is activated, else the legacy
-	// mint-new-id writer — behavior-neutral until the fleet converges (Part H2).
+	// mint-new-id writer — behavior-neutral until the fleet converges (Part H2). A frozen (mid-
+	// migration) or reseed-required node fails closed instead of writing.
 	if err := corrosion.UpsertRegistryCredentialAuto(ctx, s.db, rc); err != nil {
-		return nil, status.Errorf(codes.Internal, "set registry credential: %v", err)
+		return nil, registryWriteStatus(err, "set registry credential")
 	}
 	slog.Info("registry credential set", "scope", scope, "owner", owner, "registry", registry, "username", req.Username)
 	return toPbRegistryCredential(rc), nil
@@ -113,7 +129,7 @@ func (s *Server) DeleteRegistryCredential(ctx context.Context, req *pb.DeleteReg
 	}
 	ok, err := corrosion.DeleteRegistryCredential(ctx, s.db, scope, owner, registry)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "delete registry credential: %v", err)
+		return nil, registryWriteStatus(err, "delete registry credential")
 	}
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no credential for registry %q", registry)

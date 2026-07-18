@@ -201,22 +201,13 @@ type Client struct {
 	// merge batch.
 	canonicalIdentity func() bool
 
-	// canonicalRegistry, when non-nil and returning true, selects the CANONICAL registry-credential
-	// writer: one stable deterministic-id row per (scope,owner,registry), upserted for
-	// create/rotate/revoke/revive — instead of the legacy mint-new-id tombstone+insert whose
-	// concurrent logins collide on the partial UNIQUE (Part H2). Gated on the H2 activation
-	// predicate (capability latch + WAL-drain/consolidation), injected via SetCanonicalRegistry.
-	// Nil/false = legacy writer. Activated only AFTER legacy rows are consolidated to their
-	// deterministic ids, so the two writers never produce two live rows for one triple.
-	canonicalRegistry func() bool
-
-	// canonicalRegistryLatched, when non-nil and returning true, means canonical_registry_v1 is
-	// LATCHED cluster-wide (every node can apply the canonical shape). It gates ACCEPTANCE of a
-	// replicated canonical upsert (DispCanonicalRegistry), which is DECOUPLED from originating one
-	// (canonicalRegistry, the writer): the one-time legacy-row consolidation emits canonical
-	// upserts that peers must accept once latched, BEFORE the writer switches. Nil/false ⇒ reject
-	// the canonical shape (a premature/buggy peer write fails closed).
-	canonicalRegistryLatched func() bool
+	// registryState, when non-nil, returns the Part H2 migration phase — the SINGLE source of truth
+	// for registry-credential writer routing, apply policy, and admission. It replaces the earlier
+	// pair of booleans (writer-on + accept-latched), which could not represent the FROZEN and
+	// RESEED-REQUIRED phases. Injected via SetRegistryMigrationState (daemon computes it from the
+	// config flag + the phase-1/phase-2 latches + this node's local readiness). Nil ⇒ RegLegacy
+	// (legacy writer; canonical shape rejected on apply — the pre-H2 behavior).
+	registryState func() RegistryMigrationState
 }
 
 // SetCanonicalIdentity injects the predicate that enables natural-key identity resolution.
@@ -229,37 +220,31 @@ func (c *Client) canonicalIdentityOn() bool {
 	return c.canonicalIdentity != nil && c.canonicalIdentity()
 }
 
-// SetCanonicalRegistry injects the predicate that activates the canonical registry-credential
-// WRITER (Part H2 — originate canonical writes). Nil-safe: unset keeps the legacy mint-new-id writer.
-func (c *Client) SetCanonicalRegistry(fn func() bool) { c.canonicalRegistry = fn }
+// SetRegistryMigrationState injects the Part H2 migration-state resolver (the daemon computes it
+// from the config flag + phase-1/phase-2 latches + local readiness). Nil-safe: unset ⇒ RegLegacy.
+func (c *Client) SetRegistryMigrationState(fn func() RegistryMigrationState) { c.registryState = fn }
 
-// canonicalRegistryOn reports whether the canonical (deterministic-id) registry writer is active.
-func (c *Client) canonicalRegistryOn() bool {
-	return c.canonicalRegistry != nil && c.canonicalRegistry()
-}
-
-// SetCanonicalRegistryLatched injects the predicate that reports canonical_registry_v1 latched
-// cluster-wide (gates ACCEPTANCE of a replicated canonical upsert). Nil-safe: unset ⇒ reject.
-func (c *Client) SetCanonicalRegistryLatched(fn func() bool) { c.canonicalRegistryLatched = fn }
-
-// canonicalRegistryLatchedOn reports whether the canonical shape may be applied on this receiver.
-func (c *Client) canonicalRegistryLatchedOn() bool {
-	return c.canonicalRegistryLatched != nil && c.canonicalRegistryLatched()
+// registryStateNow returns the current Part H2 migration phase (RegLegacy when unset).
+func (c *Client) registryStateNow() RegistryMigrationState {
+	if c.registryState == nil {
+		return RegLegacy
+	}
+	return c.registryState()
 }
 
 // capabilityActive reports whether a ledger-named capability (RequiresCapability) is active on THIS
-// receiver, so the apply path can resolve a capability-gated shape's effective disposition. For
-// canonical_registry_v1 this is the LATCH (accept the shape), NOT the writer gate — the two are
-// decoupled so consolidation's canonical writes are accepted before the writer switches. An
-// unknown capability returns false (fail closed — a gated shape stays rejected).
+// receiver, so the apply path can resolve a capability-gated shape's effective disposition. The two
+// registry capabilities read the ONE migration state: canonical_registry_v1 = AcceptsCanonical
+// (accept a replicated canonical upsert — decoupled from originating one, so consolidation's writes
+// are accepted before the writer switches); canonical_registry_active_v1 = RejectsLegacy (the writer
+// is canonical cluster-wide, so the legacy INSERT shape back-pressures). An unknown capability
+// returns false (fail closed — a gated shape stays rejected).
 func (c *Client) capabilityActive(name string) bool {
 	switch name {
 	case capabilities.CanonicalRegistryV1:
-		return c.canonicalRegistryLatchedOn()
+		return c.registryStateNow().AcceptsCanonical()
 	case capabilities.CanonicalRegistryActiveV1:
-		// Phase 2 (writer on cluster-wide) reuses the writer gate: once the writer is canonical,
-		// the legacy INSERT shape is rejected on apply.
-		return c.canonicalRegistryOn()
+		return c.registryStateNow().RejectsLegacy()
 	case capabilities.CanonicalIdentityV1:
 		return c.canonicalIdentityOn()
 	default:

@@ -305,6 +305,7 @@ func TestRegistryCanonical_MismatchedIDRejected(t *testing.T) {
 // is tombstoned, and a second run is a no-op (idempotent).
 func TestConsolidateRegistryCredentials_MigratesLegacyLive(t *testing.T) {
 	c := mustTestClient(t)
+	c.SetCanonicalRegistryLatched(func() bool { return true })
 	ctx := context.Background()
 	// Two legacy logins ⇒ a tombstone (rand-1) + a live row (rand-2).
 	if err := UpsertRegistryCredential(ctx, c, RegistryCredential{ID: "rand-1", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s1"}); err != nil {
@@ -343,14 +344,14 @@ func TestConsolidateRegistryCredentials_MigratesLegacyLive(t *testing.T) {
 	if m2, _ := ConsolidateRegistryCredentials(ctx, c); m2 != 0 {
 		t.Errorf("second run must be a no-op, migrated=%d", m2)
 	}
-	if complete, _ := RegistryConsolidationLocallyComplete(ctx, c); !complete {
+	if complete, _ := RegistryWriterReady(ctx, c); !complete {
 		t.Error("must be locally complete after consolidation")
 	}
 }
 
 func mustNotComplete(t *testing.T, c *Client) bool {
 	t.Helper()
-	complete, err := RegistryConsolidationLocallyComplete(context.Background(), c)
+	complete, err := RegistryWriterReady(context.Background(), c)
 	if err != nil {
 		t.Fatalf("completeness: %v", err)
 	}
@@ -378,5 +379,78 @@ func TestRegistryCanonical_EqualTSKeepsLocal(t *testing.T) {
 	rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
 	if len(rows) != 1 || rows[0].String("secret") != "sa" {
 		t.Fatalf("an equal-timestamp conflict must keep local (sa), not overwrite: got %v", rows)
+	}
+}
+
+// TestConsolidate_ReplicatedMigrationKeepsCanonicalLive (finding 1): when a peer's migration
+// entries (a by-id tombstone of the legacy row + the canonical upsert) arrive at a node that has
+// ALREADY consolidated, the canonical live row must survive — the by-id tombstone targets the
+// legacy id, not the canonical id (the old by-triple tombstone would have deleted it).
+func TestConsolidate_ReplicatedMigrationKeepsCanonicalLive(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalRegistryLatched(func() bool { return true })
+	ctx := context.Background()
+	detID := RegistryCredentialID("user", "alice", "ghcr.io")
+	const legacyTS = "2000000000000-0000-legacy"
+	if err := c.Execute(ctx,
+		`INSERT INTO registry_credentials (id, scope, owner, registry, username, secret, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"rand-legacy", "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", legacyTS); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := ConsolidateRegistryCredentials(ctx, c); err != nil {
+		t.Fatalf("consolidate: %v", err)
+	}
+	if live := liveRegistryRows(t, c, "user", "alice", "ghcr.io"); len(live) != 1 || live[0].String("id") != detID {
+		t.Fatalf("precondition: expected canonical live, got %v", live)
+	}
+	// Peer's migration entries (it consolidated the same converged legacy row).
+	if err := applyRegistryWAL(t, c, Statement{SQL: registryTombstoneByIDSQL,
+		Params: []interface{}{"2020-06-01T00:00:00Z", "9000000000000-0000-peer", "rand-legacy", legacyTS}}); err != nil {
+		t.Fatalf("apply peer tombstone: %v", err)
+	}
+	if err := applyRegistryWAL(t, c, canonicalUpsertStmt(detID, "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", legacyTS)); err != nil {
+		t.Fatalf("apply peer canonical: %v", err)
+	}
+	live := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
+	if len(live) != 1 || live[0].String("id") != detID {
+		t.Fatalf("exchanging migration entries must retain the canonical live row, got %v", live)
+	}
+}
+
+// TestRegistryContractReady_vs_WriterReady (finding 4): after consolidation the writer is ready (no
+// legacy LIVE rows) but the CONTRACT is NOT — the legacy tombstone remains, and a non-partial
+// UNIQUE(scope,owner,registry) would reject it. Contract readiness needs the watermark-safe GC to
+// reclaim the tombstones first.
+func TestRegistryContractReady_vs_WriterReady(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalRegistryLatched(func() bool { return true })
+	ctx := context.Background()
+	if err := UpsertRegistryCredential(ctx, c, RegistryCredential{ID: "rand-1", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := ConsolidateRegistryCredentials(ctx, c); err != nil {
+		t.Fatalf("consolidate: %v", err)
+	}
+	if wr, _ := RegistryWriterReady(ctx, c); !wr {
+		t.Fatal("writer-ready must be true after consolidation (no legacy live rows)")
+	}
+	if cr, _ := RegistryContractReady(ctx, c); cr {
+		t.Fatal("contract-ready must be FALSE while a legacy tombstone remains")
+	}
+	// Simulate the watermark-safe GC reclaiming the tombstone.
+	if err := c.Execute(ctx, "DELETE FROM registry_credentials WHERE id = 'rand-1'"); err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	if cr, _ := RegistryContractReady(ctx, c); !cr {
+		t.Fatal("contract-ready must be true once no non-canonical physical rows remain")
+	}
+}
+
+// TestConsolidate_RequiresLatch (finding 5): consolidation refuses to run before the accept-latch,
+// since its canonical writes would be rejected by peers.
+func TestConsolidate_RequiresLatch(t *testing.T) {
+	c := mustTestClient(t) // latch NOT set
+	if _, err := ConsolidateRegistryCredentials(context.Background(), c); err == nil {
+		t.Fatal("consolidation must require canonical_registry_v1 latched")
 	}
 }

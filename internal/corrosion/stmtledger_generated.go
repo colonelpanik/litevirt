@@ -7,6 +7,7 @@ package corrosion
 // fingerprint absent here is an unknown shape and is rejected (back-pressured).
 var stmtLedger = map[string]LedgerEntry{
 	"stmtshape/v1:004d45c86f1d3a7f376ee96f374688ea068f826323f4456a45ccf43de8573224": {Fingerprint: "stmtshape/v1:004d45c86f1d3a7f376ee96f374688ea068f826323f4456a45ccf43de8573224", Kind: "delete", Table: "container_restarts", Disposition: DispDeleteRetention},
+	"stmtshape/v1:017182ad41c8292ba26a6ca9386a631cc3699bda851d4687fe33b7341ac55f35": {Fingerprint: "stmtshape/v1:017182ad41c8292ba26a6ca9386a631cc3699bda851d4687fe33b7341ac55f35", Kind: "update", Table: "registry_credentials", Disposition: DispFullPKUpdate},
 	"stmtshape/v1:01b7a6f0df0d2405f27fd8aebf11ce5fd3b5230396842a0c1c5738fc7969716b": {Fingerprint: "stmtshape/v1:01b7a6f0df0d2405f27fd8aebf11ce5fd3b5230396842a0c1c5738fc7969716b", Kind: "update", Table: "operation_steps", Disposition: DispCustomMerge},
 	"stmtshape/v1:025e0ef4943d9c34fc711fc349de23185d0e58add227ba8618cbd50e890580ae": {Fingerprint: "stmtshape/v1:025e0ef4943d9c34fc711fc349de23185d0e58add227ba8618cbd50e890580ae", Kind: "insert", Table: "tokens", Disposition: DispPlainInsert},
 	"stmtshape/v1:02d2e27272be2595994cbd8a1f62ae7327eaa0a19dd9628f03df71ce7b0bae39": {Fingerprint: "stmtshape/v1:02d2e27272be2595994cbd8a1f62ae7327eaa0a19dd9628f03df71ce7b0bae39", Kind: "update", Table: "storage_pools", Disposition: DispFullPKUpdate},

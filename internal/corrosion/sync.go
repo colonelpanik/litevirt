@@ -654,6 +654,25 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	skewGuardOn := c.hlcSkewGuardOn()
 	skewNow := time.Now()
 
+	// Natural-key identity resolution (canonical_identity_v1): resolve the identity tables by
+	// their UNIQUE natural key, not the minted random id. Column offsets computed once. If the
+	// capability is on but the dump omits an identity column, refuse the chunk (fail closed) —
+	// a well-formed peer always carries them.
+	identityOn := c.canonicalIdentityOn() && hasIdentityKey(table.Name)
+	var identityIDIdx, identityParentIdx int = -1, -1
+	var identityNatIdx []int
+	if identityOn {
+		identityIDIdx = indexOf(table.Columns, "id")
+		identityNatIdx = columnIndexes(table.Columns, tableIdentityKeys[table.Name])
+		if refs := identityReferenceColumns[table.Name]; len(refs) > 0 {
+			identityParentIdx = indexOf(table.Columns, refs[0])
+		}
+		if identityIDIdx < 0 || len(identityNatIdx) != len(tableIdentityKeys[table.Name]) || updatedAtIdx < 0 {
+			_ = tx.Rollback()
+			return 0, len(rows), fmt.Errorf("identity table %s dump missing id/natural-key/updated_at columns", table.Name)
+		}
+	}
+
 	for _, row := range rows {
 		// A peer dump whose row doesn't match the declared column count is
 		// malformed/corrupt: skip it rather than index out of range below or
@@ -687,6 +706,23 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				skipped++
 			} else {
 				merged++
+			}
+			continue
+		}
+		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
+		// natural key (deterministic winner over the group), not the minted random id, so two
+		// nodes that independently created different ids for one logical object converge
+		// instead of colliding on the secondary UNIQUE. Bypasses the id-keyed LWW below.
+		if identityOn {
+			landed, idErr := c.mergeIdentityRow(tx, table, row, insertSQL, identityIDIdx, updatedAtIdx, identityNatIdx, identityParentIdx, skewGuardOn, skewNow)
+			if idErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, idErr
+			}
+			if landed {
+				merged++
+			} else {
+				skipped++
 			}
 			continue
 		}
@@ -769,6 +805,70 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		return 0, skipped, fmt.Errorf("commit merge chunk for %s: %w", table.Name, err)
 	}
 	return merged, skipped, nil
+}
+
+// mergeIdentityRow merges one incoming dump row of an identity table by its NATURAL key. It
+// finds the local row with the same natural key (whatever its id), and:
+//   - keeps local when the deterministic identityWinner says so;
+//   - otherwise adopts the incoming row — DELETING the local row first when the ids differ, so
+//     the incoming id can land without colliding on the secondary UNIQUE (a collapse of the two
+//     independently-minted ids to the single winner).
+//
+// It fails closed on a non-null reference column (provably unused today), and honours the skew
+// quarantine. Returns landed=true when the incoming row was applied. All within the caller's tx.
+func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}, insertSQL string, idIdx, updatedAtIdx int, natIdx []int, parentIdx int, skewGuardOn bool, skewNow time.Time) (landed bool, err error) {
+	incomingID := coerceString(row[idIdx])
+	incomingTS, _ := row[updatedAtIdx].(string)
+
+	// The self-reference class (snapshots.parent_id) is provably unused: a non-null value would
+	// need reference rewrite on collapse, which we don't do — fail closed rather than orphan.
+	if parentIdx >= 0 && cellNonEmpty(row[parentIdx]) {
+		return false, fmt.Errorf("identity table %s: non-null reference under canonical_identity_v1 is unsupported", table.Name)
+	}
+
+	// Local row for this natural key (any id).
+	natCols := tableIdentityKeys[table.Name]
+	where := make([]string, len(natCols))
+	args := make([]interface{}, len(natCols))
+	for i, col := range natCols {
+		where[i] = col + " = ?"
+		args[i] = row[natIdx[i]]
+	}
+	var localID, localUpdatedAt sql.NullString
+	selErr := tx.QueryRow("SELECT id, updated_at FROM "+table.Name+" WHERE "+strings.Join(where, " AND "), args...).Scan(&localID, &localUpdatedAt)
+	if selErr != nil && !errors.Is(selErr, sql.ErrNoRows) {
+		return false, fmt.Errorf("identity lookup on %s: %w", table.Name, selErr)
+	}
+	localTS := ""
+	if selErr == nil && localUpdatedAt.Valid {
+		localTS = localUpdatedAt.String
+	}
+
+	// Future-skew quarantine (same as the LWW path): a skewed incoming clock must not poison
+	// even a first-seen natural key.
+	if incomingTS != "" && c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow) {
+		slog.Warn("sync: quarantined future-skewed identity row (not applied)", "table", table.Name, "incoming_updated_at", incomingTS, "first_seen", selErr != nil)
+		return false, nil
+	}
+
+	if selErr == nil { // a local row shares this natural key
+		if identityWinner(localTS, localID.String, incomingTS, incomingID) == 1 {
+			return false, nil // local wins → keep local
+		}
+		if localID.String != incomingID {
+			// Incoming wins with a different id → collapse: remove the local row so the
+			// incoming id lands without a natural-key collision.
+			if _, dErr := tx.Exec("DELETE FROM "+table.Name+" WHERE id = ?", localID.String); dErr != nil {
+				return false, fmt.Errorf("identity collapse delete on %s: %w", table.Name, dErr)
+			}
+		}
+	}
+
+	rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+	if execErr != nil {
+		return false, execErr
+	}
+	return !rejected, nil
 }
 
 // applyMergeRow executes one winning row's upsert in an anti-entropy merge, classifying any

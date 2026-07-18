@@ -18,36 +18,26 @@ import (
 // truth) so the ledger policy and the runtime activation check can't drift.
 const capCanonicalRegistryV1 = capabilities.CanonicalRegistryV1
 
-// capCanonicalRegistryActiveV1 is the phase-2 token: once latched (canonical writer on cluster-
-// wide) the legacy INSERT shape is rejected on apply.
-const capCanonicalRegistryActiveV1 = capabilities.CanonicalRegistryActiveV1
-
-// RegistryMigrationState is the single explicit phase of the Part H2 registry-credential migration
-// and the SOLE source of truth for writer routing, replicated-apply policy, capability
-// advertisement, and startup admission. It replaces the earlier scattered booleans (writer-on +
-// accept-latched), which could not represent the FROZEN and RESEED-REQUIRED phases and so admitted
-// a window where a legacy write could land between readiness and activation.
+// RegistryMigrationState is the Part H2 registry-credential migration phase. It is intentionally
+// SMALL: the WRITER never switches automatically — the canonical writer is dormant pending a single
+// future operator-run contract transition (writer activation + drain/barrier proof + convergence
+// proof + node admission/reseed + legacy-shape rejection + index contract, done atomically). Until
+// then local API writes stay on the LEGACY writer; the only behavioral effect of this state is the
+// phase-1 ACCEPT gate (AcceptsCanonical), so consolidation's canonical writes are applied.
 type RegistryMigrationState int
 
 const (
 	// RegLegacy: pre-migration (phase-1 not latched, or the flag is off). The legacy mint-new-id
 	// writer is live; the canonical upsert shape is not yet accepted on apply.
 	RegLegacy RegistryMigrationState = iota
-	// RegPreparing: phase-1 (canonical_registry_v1) latched and migrating, but THIS node has not yet
-	// consolidated + drained. Credential mutations are FROZEN so no new legacy row appears between the
-	// readiness snapshot and activation and the legacy WAL can drain to a clean barrier.
+	// RegPreparing: phase-1 (canonical_registry_v1) latched. Replicated canonical upserts are
+	// accepted and the controller idempotently consolidates legacy rows to their deterministic ids —
+	// but new API writes STILL use the legacy writer (no auto-switch).
 	RegPreparing
-	// RegReady: phase-1 latched; this node consolidated, its legacy WAL drained, credentials
-	// AE-converged. Still FROZEN; advertises phase-2 so the latch fires once EVERY node is ready.
-	RegReady
-	// RegCanonical: phase-2 (canonical_registry_active_v1) latched — every node was ready. The
-	// canonical deterministic-id writer is live and the legacy INSERT shape is rejected on apply.
-	// Durable + IRREVERSIBLE: this node never returns to the legacy writer.
-	RegCanonical
-	// RegBlocked: phase-2 latched cluster-wide but THIS node is not locally ready (a restart/rejoin
-	// with stale or pre-barrier state). It refuses to serve credential mutations and must be reseeded
-	// before it can originate canonical writes again.
-	RegBlocked
+	// RegConsolidated: phase-1 latched AND no legacy live row remains locally — a readiness DIAGNOSTIC
+	// for the future operator transition. Behaviorally identical to RegPreparing (writer stays legacy,
+	// canonical apply accepted); it exists only so the operator can see which nodes are ready.
+	RegConsolidated
 )
 
 func (s RegistryMigrationState) String() string {
@@ -56,12 +46,8 @@ func (s RegistryMigrationState) String() string {
 		return "legacy"
 	case RegPreparing:
 		return "preparing"
-	case RegReady:
-		return "ready"
-	case RegCanonical:
-		return "canonical"
-	case RegBlocked:
-		return "blocked"
+	case RegConsolidated:
+		return "consolidated"
 	default:
 		return "unknown"
 	}
@@ -70,46 +56,19 @@ func (s RegistryMigrationState) String() string {
 // AcceptsCanonical reports whether a replicated canonical upsert may be applied (phase-1 latched).
 func (s RegistryMigrationState) AcceptsCanonical() bool { return s != RegLegacy }
 
-// RejectsLegacy reports whether the legacy mint-new-id INSERT shape must be rejected on apply, and
-// whether a non-canonical live credential must be rejected on sensitive AE (phase-2 latched,
-// durably — so a stray legacy write after activation back-pressures instead of duplicating a row).
-func (s RegistryMigrationState) RejectsLegacy() bool { return s == RegCanonical || s == RegBlocked }
-
-// WriterFrozen reports whether local credential mutations must be refused because the migration is
-// mid-flight (draining toward activation) — distinct from Blocked, which is a durable post-activation
-// refusal pending reseed.
-func (s RegistryMigrationState) WriterFrozen() bool { return s == RegPreparing || s == RegReady }
-
-// ResolveRegistryMigrationState computes the phase from the durable/observable inputs. Phase 2 is
-// durable and IRREVERSIBLE: once latched, the node never falls back to the legacy writer even if the
-// config flag is turned off — config-off retains canonical writes (it is a kill switch for phase-1,
-// not an undo for phase-2). A phase-2-latched node whose local state is not ready is BLOCKED (reseed
-// required) rather than silently serving a stale writer.
-func ResolveRegistryMigrationState(flagOn, phase1Latched, phase2Latched, locallyReady bool) RegistryMigrationState {
-	if phase2Latched {
-		if locallyReady {
-			return RegCanonical
-		}
-		return RegBlocked
-	}
+// ResolveRegistryMigrationState computes the phase from the config flag, the phase-1 latch, and this
+// node's consolidation diagnostic. There is NO phase-2 / auto-switch input: the writer activation is
+// a deferred operator-run contract transition, so phase 1 is a reversible accept gate and nothing
+// here ever changes the writer.
+func ResolveRegistryMigrationState(flagOn, phase1Latched, consolidated bool) RegistryMigrationState {
 	if flagOn && phase1Latched {
-		if locallyReady {
-			return RegReady
+		if consolidated {
+			return RegConsolidated
 		}
 		return RegPreparing
 	}
 	return RegLegacy
 }
-
-// ErrRegistryMigrating is returned by the credential writers while the migration is FROZEN
-// (RegPreparing/RegReady): the caller should retry once activation completes. The gRPC layer maps it
-// to codes.Unavailable.
-var ErrRegistryMigrating = errors.New("registry credential migration in progress; retry shortly")
-
-// ErrRegistryReseedRequired is returned when this node is phase-2-latched but not locally ready
-// (RegBlocked): it must be reseeded before it can serve credential writes. Mapped to
-// codes.FailedPrecondition.
-var ErrRegistryReseedRequired = errors.New("registry credentials not consolidated on this node; reseed required before writes are accepted")
 
 // RegistryCredential is one stored OCI/Docker registry login (schema v23).
 // A row is either per-user (Scope="user", Owner=<username>) or global
@@ -167,9 +126,8 @@ const registryTombstoneByTripleSQL = `UPDATE registry_credentials SET deleted_at
 			       WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL`
 
 // registryLegacyInsertSQL mints a new random-id credential row (the legacy writer's second
-// statement). Capability-gated in the ledger: rejected on apply once canonical_registry_active_v1
-// has latched (the canonical writer is on cluster-wide), so a stray legacy INSERT from a bug or an
-// old/returning node can't create a duplicate physical row for a triple after activation.
+// statement). It auto-derives to DispPlainInsert and is always accepted — rejecting the legacy shape
+// is part of the deferred operator-run writer-activation contract, not this reversible core.
 const registryLegacyInsertSQL = `INSERT INTO registry_credentials
 			       (id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at)
 			       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
@@ -421,49 +379,14 @@ func RegistryContractReady(ctx context.Context, c *Client) (bool, error) {
 	return true, nil
 }
 
-// registryLegacyDrainCountSQL counts un-drained LEGACY registry writes still in this node's
-// mutation/relay log. The legacy mint-new-id INSERT is the ONLY registry statement that is an
-// `INSERT INTO registry_credentials` WITHOUT the canonical `ON CONFLICT(id)` tail (the canonical
-// upsert carries it; both tombstones are UPDATEs), so the pattern isolates it. mutation_log entries
-// are pruned only once every live peer's watermark passes them, so a zero count means every peer has
-// consumed this node's legacy credential writes. (stmts is a JSON array of statements, SQL stored
-// verbatim; a param value literally containing "ON CONFLICT(id)" is the only — vanishingly unlikely
-// — false negative, and the writer FREEZE means the count only ever decreases toward the barrier.)
-const registryLegacyDrainCountSQL = `SELECT COUNT(*) AS n FROM mutation_log ` +
-	`WHERE stmts LIKE '%INSERT INTO registry_credentials%' AND stmts NOT LIKE '%ON CONFLICT(id)%'`
-
-// RegistryLegacyDrained reports whether NO legacy credential INSERT remains in this node's
-// mutation/relay log (all peers consumed them). It is the WAL/relay drain barrier finding 1 requires:
-// combined with the writer FREEZE (no new legacy write once RegPreparing) it is monotone — once true
-// and frozen it stays true, so publishing readiness after it holds cannot be un-done by a later write.
-func RegistryLegacyDrained(ctx context.Context, c *Client) (bool, error) {
-	rows, err := c.Query(ctx, registryLegacyDrainCountSQL)
-	if err != nil {
-		return false, err
-	}
-	if len(rows) == 0 {
-		return true, nil
-	}
-	return rows[0].Int("n") == 0, nil
-}
-
-// UpsertRegistryCredentialAuto routes a credential create/rotate through the migration state machine:
-// the canonical deterministic-id writer once activated (RegCanonical), the legacy mint-new-id writer
-// before migration (RegLegacy), and a fail-closed refusal while the migration is FROZEN
-// (RegPreparing/RegReady) or this node needs a reseed (RegBlocked). The freeze closes the window in
-// which a legacy write could land between a node publishing readiness and the writer activating.
+// UpsertRegistryCredentialAuto is the single seam a login/rotate goes through. The canonical writer
+// is DORMANT pending the deferred operator-run contract transition, so this always uses the LEGACY
+// mint-new-id writer. Colliding/duplicate rows are reconciled to their deterministic ids by the
+// phase-1 consolidation controller, and a cross-unique collision back-pressures fail-closed on apply
+// — so the canonical model converges without an in-place writer switch. (Kept as a named seam so the
+// future contract transition has one place to hook.)
 func UpsertRegistryCredentialAuto(ctx context.Context, c *Client, rc RegistryCredential) error {
-	st := c.registryStateNow()
-	switch {
-	case st.WriterFrozen():
-		return ErrRegistryMigrating
-	case st == RegBlocked:
-		return ErrRegistryReseedRequired
-	case st == RegCanonical:
-		return UpsertRegistryCredentialCanonical(ctx, c, rc)
-	default:
-		return UpsertRegistryCredential(ctx, c, rc)
-	}
+	return UpsertRegistryCredential(ctx, c, rc)
 }
 
 func scanRegistryCredentials(rows []Row) []RegistryCredential {
@@ -512,14 +435,6 @@ func ListAllRegistryCredentials(ctx context.Context, c *Client) ([]RegistryCrede
 // registry). The bool reports whether a live row existed (so the handler can
 // return NotFound).
 func DeleteRegistryCredential(ctx context.Context, c *Client, scope, owner, registry string) (bool, error) {
-	// A revoke is a credential mutation too: it must be frozen mid-migration (else a tombstone lands
-	// in the WAL after the drain barrier) and refused on a reseed-required node.
-	switch st := c.registryStateNow(); {
-	case st.WriterFrozen():
-		return false, ErrRegistryMigrating
-	case st == RegBlocked:
-		return false, ErrRegistryReseedRequired
-	}
 	existing, err := c.Query(ctx,
 		`SELECT id FROM registry_credentials
 		 WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL`,

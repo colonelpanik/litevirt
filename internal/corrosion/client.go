@@ -233,18 +233,15 @@ func (c *Client) registryStateNow() RegistryMigrationState {
 }
 
 // capabilityActive reports whether a ledger-named capability (RequiresCapability) is active on THIS
-// receiver, so the apply path can resolve a capability-gated shape's effective disposition. The two
-// registry capabilities read the ONE migration state: canonical_registry_v1 = AcceptsCanonical
-// (accept a replicated canonical upsert — decoupled from originating one, so consolidation's writes
-// are accepted before the writer switches); canonical_registry_active_v1 = RejectsLegacy (the writer
-// is canonical cluster-wide, so the legacy INSERT shape back-pressures). An unknown capability
-// returns false (fail closed — a gated shape stays rejected).
+// receiver, so the apply path can resolve a capability-gated shape's effective disposition.
+// canonical_registry_v1 = AcceptsCanonical (accept a replicated canonical upsert — the phase-1 accept
+// gate, decoupled from originating one, so consolidation's writes are applied even though the local
+// writer stays legacy). An unknown capability returns false (fail closed — a gated shape stays
+// rejected).
 func (c *Client) capabilityActive(name string) bool {
 	switch name {
 	case capabilities.CanonicalRegistryV1:
 		return c.registryStateNow().AcceptsCanonical()
-	case capabilities.CanonicalRegistryActiveV1:
-		return c.registryStateNow().RejectsLegacy()
 	case capabilities.CanonicalIdentityV1:
 		return c.canonicalIdentityOn()
 	default:

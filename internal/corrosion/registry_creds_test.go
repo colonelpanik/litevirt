@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 
@@ -112,41 +111,33 @@ func TestUpsertRegistryCredentialCanonical_CreateRotateRevive(t *testing.T) {
 	}
 }
 
-// TestUpsertRegistryCredentialAuto_Gating: with the gate off the legacy mint-new-id writer runs
-// (two logins leave a tombstone + a live row, distinct random ids); with the gate on the canonical
-// writer keeps a single deterministic-id row.
-func TestUpsertRegistryCredentialAuto_Gating(t *testing.T) {
+// TestUpsertRegistryCredentialAuto_AlwaysLegacy: the writer never auto-switches. Auto uses the
+// legacy mint-new-id writer regardless of migration state (the canonical writer is dormant pending
+// the deferred operator transition), so two logins leave a tombstone + a live row. Convergence to a
+// single deterministic-id row is the consolidation controller's job, not the writer's.
+func TestUpsertRegistryCredentialAuto_AlwaysLegacy(t *testing.T) {
 	ctx := context.Background()
 	rc := RegistryCredential{Scope: "user", Owner: "bob", Registry: "reg:5000", Username: "bob", Secret: "p"}
 
-	// Gate OFF ⇒ legacy: each login mints a fresh id; the prior live row is tombstoned.
-	off := mustTestClient(t)
+	// Even with phase 1 latched (RegPreparing), Auto still writes legacy.
+	c := mustTestClient(t)
+	c.SetRegistryMigrationState(func() RegistryMigrationState { return RegPreparing })
 	rc.ID = "rand-1"
-	if err := UpsertRegistryCredentialAuto(ctx, off, rc); err != nil {
-		t.Fatalf("legacy 1: %v", err)
+	if err := UpsertRegistryCredentialAuto(ctx, c, rc); err != nil {
+		t.Fatalf("login 1: %v", err)
 	}
 	rc.ID = "rand-2"
-	if err := UpsertRegistryCredentialAuto(ctx, off, rc); err != nil {
-		t.Fatalf("legacy 2: %v", err)
+	if err := UpsertRegistryCredentialAuto(ctx, c, rc); err != nil {
+		t.Fatalf("login 2: %v", err)
 	}
-	all, _ := off.Query(ctx, "SELECT id FROM registry_credentials WHERE owner='bob'")
+	all, _ := c.Query(ctx, "SELECT id FROM registry_credentials WHERE owner='bob'")
 	if len(all) != 2 {
-		t.Fatalf("legacy: expected 2 physical rows (live + tombstone), got %d", len(all))
+		t.Fatalf("expected 2 physical rows (live + tombstone) from the legacy writer, got %d", len(all))
 	}
-
-	// Gate ON ⇒ canonical: one deterministic-id row regardless of how many logins.
-	on := mustTestClient(t)
-	on.SetRegistryMigrationState(func() RegistryMigrationState { return RegCanonical })
-	rc.ID = "ignored"
-	if err := UpsertRegistryCredentialAuto(ctx, on, rc); err != nil {
-		t.Fatalf("canonical 1: %v", err)
-	}
-	if err := UpsertRegistryCredentialAuto(ctx, on, rc); err != nil {
-		t.Fatalf("canonical 2: %v", err)
-	}
-	all, _ = on.Query(ctx, "SELECT id FROM registry_credentials WHERE owner='bob'")
-	if len(all) != 1 || all[0].String("id") != RegistryCredentialID("user", "bob", "reg:5000") {
-		t.Fatalf("canonical: expected a single deterministic-id row, got %v", all)
+	// The live row keeps its random (legacy) id — the writer did not switch to the deterministic id.
+	live, _ := c.Query(ctx, "SELECT id FROM registry_credentials WHERE owner='bob' AND deleted_at IS NULL")
+	if len(live) != 1 || live[0].String("id") == RegistryCredentialID("user", "bob", "reg:5000") {
+		t.Fatalf("live row should carry a legacy random id, got %v", live)
 	}
 }
 
@@ -501,133 +492,48 @@ func TestConsolidate_EqualTSDiffContentBackPressures(t *testing.T) {
 	}
 }
 
-// TestRegistryLegacyInsert_GatedByPhase2 (point 7): the legacy mint-new-id INSERT is applied
-// before the canonical writer is on, and REJECTED (back-pressure) once canonical_registry_active_v1
-// is active on the receiver — a stray legacy INSERT after activation can't create a duplicate row.
-func TestRegistryLegacyInsert_GatedByPhase2(t *testing.T) {
+// TestRegistryLegacyInsert_AlwaysApplies: the legacy mint-new-id INSERT auto-derives to a plain
+// insert and is accepted on apply regardless of migration state — rejecting the legacy shape is part
+// of the deferred operator-run contract, not this reversible core.
+func TestRegistryLegacyInsert_AlwaysApplies(t *testing.T) {
 	legacyInsert := func(id string) Statement {
 		return Statement{SQL: registryLegacyInsertSQL,
 			Params: []interface{}{id, "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"}}
 	}
 	ctx := context.Background()
-
-	// Phase 2 OFF (writer off) ⇒ accepted.
-	off := mustTestClient(t)
-	if err := applyRegistryWAL(t, off, legacyInsert("rand-1")); err != nil {
-		t.Fatalf("legacy INSERT must apply before activation: %v", err)
-	}
-	if rows, _ := off.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-1'"); len(rows) != 1 {
-		t.Fatal("legacy row must exist before activation")
-	}
-
-	// Phase 2 ON (writer on) ⇒ rejected.
-	on := mustTestClient(t)
-	on.SetRegistryMigrationState(func() RegistryMigrationState { return RegCanonical })
-	if err := applyRegistryWAL(t, on, legacyInsert("rand-2")); err == nil {
-		t.Fatal("legacy INSERT must be rejected after activation")
-	}
-	if rows, _ := on.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-2'"); len(rows) != 0 {
-		t.Fatal("nothing must be applied after activation")
+	for _, st := range []RegistryMigrationState{RegLegacy, RegPreparing, RegConsolidated} {
+		c := mustTestClient(t)
+		state := st
+		c.SetRegistryMigrationState(func() RegistryMigrationState { return state })
+		if err := applyRegistryWAL(t, c, legacyInsert("rand-1")); err != nil {
+			t.Fatalf("%v: legacy INSERT must apply: %v", st, err)
+		}
+		if rows, _ := c.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-1'"); len(rows) != 1 {
+			t.Fatalf("%v: legacy row must exist", st)
+		}
 	}
 }
 
-// TestResolveRegistryMigrationState is the truth table for the Part H2 state machine. It pins the
-// two safety invariants the review requires: (finding 2) phase-2 is durable + IRREVERSIBLE — a
-// phase-2-latched node NEVER returns to the legacy writer even with the config flag off; and a
-// phase-2-latched node that is not locally ready is BLOCKED (reseed), not silently serving.
+// TestResolveRegistryMigrationState is the truth table for the (small) Part H2 state machine. There
+// is NO auto-switch: phase 1 is a reversible accept gate → {legacy, preparing, consolidated}, and
+// nothing here ever selects a canonical writer.
 func TestResolveRegistryMigrationState(t *testing.T) {
 	cases := []struct {
-		name                string
-		flag, p1, p2, ready bool
-		want                RegistryMigrationState
+		name                   string
+		flag, p1, consolidated bool
+		want                   RegistryMigrationState
 	}{
-		{"pre-migration", false, false, false, false, RegLegacy},
-		{"flag-on-not-latched", true, false, false, false, RegLegacy},
-		{"phase1-preparing", true, true, false, false, RegPreparing},
-		{"phase1-ready-frozen", true, true, false, true, RegReady},
-		{"phase2-ready-canonical", true, true, true, true, RegCanonical},
-		{"phase2-not-ready-blocked", true, true, true, false, RegBlocked},
-		// finding 2: config-off after phase-2 must retain canonical, never revert to legacy.
-		{"phase2-flag-off-stays-canonical", false, true, true, true, RegCanonical},
-		{"phase2-flag-off-not-ready-blocked", false, false, true, false, RegBlocked},
+		{"pre-migration", false, false, false, RegLegacy},
+		{"flag-on-not-latched", true, false, false, RegLegacy},
+		{"latched-not-flagged", false, true, false, RegLegacy},
+		{"phase1-preparing", true, true, false, RegPreparing},
+		{"phase1-consolidated", true, true, true, RegConsolidated},
+		// A reversible accept gate: flag off ⇒ legacy even if consolidation had completed.
+		{"flag-off-reverts-to-legacy", false, true, true, RegLegacy},
 	}
 	for _, tc := range cases {
-		if got := ResolveRegistryMigrationState(tc.flag, tc.p1, tc.p2, tc.ready); got != tc.want {
+		if got := ResolveRegistryMigrationState(tc.flag, tc.p1, tc.consolidated); got != tc.want {
 			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
 		}
-	}
-}
-
-// TestRegistryWriter_FrozenAndBlocked (finding 1/2): a credential create OR revoke fails closed
-// while the migration is frozen (preparing/ready) or the node needs a reseed (blocked), and writes
-// no physical row — so no legacy row can land between readiness and activation.
-func TestRegistryWriter_FrozenAndBlocked(t *testing.T) {
-	ctx := context.Background()
-	rc := RegistryCredential{ID: "x", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s"}
-	for _, tc := range []struct {
-		state   RegistryMigrationState
-		wantErr error
-	}{
-		{RegPreparing, ErrRegistryMigrating},
-		{RegReady, ErrRegistryMigrating},
-		{RegBlocked, ErrRegistryReseedRequired},
-	} {
-		c := mustTestClient(t)
-		st := tc.state
-		c.SetRegistryMigrationState(func() RegistryMigrationState { return st })
-		if err := UpsertRegistryCredentialAuto(ctx, c, rc); !errors.Is(err, tc.wantErr) {
-			t.Errorf("%v: Auto err = %v, want %v", st, err, tc.wantErr)
-		}
-		if _, err := DeleteRegistryCredential(ctx, c, "user", "alice", "ghcr.io"); !errors.Is(err, tc.wantErr) {
-			t.Errorf("%v: Delete err = %v, want %v", st, err, tc.wantErr)
-		}
-		if rows, _ := c.Query(ctx, "SELECT id FROM registry_credentials"); len(rows) != 0 {
-			t.Errorf("%v: expected no rows written while refused, got %d", st, len(rows))
-		}
-	}
-}
-
-// TestRegistryAE_RejectsNonCanonicalLivePostActivation (finding 3): after activation the sensitive
-// AE merge must NOT reintroduce a legacy random-id LIVE credential dumped by a config-off/returning
-// peer (WAL rejects the INSERT, but a full-state dump would otherwise recreate it). A canonical row
-// for another triple still lands; the rejection is counted.
-func TestRegistryAE_RejectsNonCanonicalLivePostActivation(t *testing.T) {
-	ctx := context.Background()
-	// A returning peer still holds a legacy random-id LIVE row (bob) plus a canonical row (carol).
-	src := mustTestClient(t)
-	if err := UpsertRegistryCredential(ctx, src, RegistryCredential{
-		ID: "rand-bob", Scope: "user", Owner: "bob", Registry: "reg1:5000", Username: "bob", Secret: "s"}); err != nil {
-		t.Fatalf("seed legacy: %v", err)
-	}
-	carolID := RegistryCredentialID("user", "carol", "reg2:5000")
-	src.SetRegistryMigrationState(func() RegistryMigrationState { return RegCanonical })
-	if err := UpsertRegistryCredentialCanonical(ctx, src, RegistryCredential{
-		Scope: "user", Owner: "carol", Registry: "reg2:5000", Username: "carol", Secret: "s"}); err != nil {
-		t.Fatalf("seed canonical: %v", err)
-	}
-
-	// Destination is post-activation (RejectsLegacy on).
-	dst := mustTestClient(t)
-	sm := &fakeSyncMetrics{}
-	dst.SetSyncMetrics(sm)
-	dst.SetRegistryMigrationState(func() RegistryMigrationState { return RegCanonical })
-	if err := dst.MergeSensitiveStateBytesLWW(src.DumpSensitiveStateBytes()); err != nil {
-		t.Fatalf("merge: %v", err)
-	}
-
-	if rows, _ := dst.Query(ctx, "SELECT id FROM registry_credentials WHERE owner='bob' AND deleted_at IS NULL"); len(rows) != 0 {
-		t.Fatalf("non-canonical live row must be rejected, got %v", rows)
-	}
-	if rows, _ := dst.Query(ctx, "SELECT id FROM registry_credentials WHERE owner='carol' AND deleted_at IS NULL"); len(rows) != 1 || rows[0].String("id") != carolID {
-		t.Fatalf("canonical row must land, got %v", rows)
-	}
-	found := false
-	for _, s := range sm.mergeRejected {
-		if s == "registry_credentials/ae/noncanonical_live" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("rejection must be counted, got %v", sm.mergeRejected)
 	}
 }

@@ -176,19 +176,11 @@ const (
 	// — only once legacy rows are consolidated to their deterministic ids, so the two writers never
 	// produce two live rows for one triple. Advertised CONDITIONALLY on enforcement.canonical_registry
 	// (like operation_protocol) so the latch requires config uniformity, not just a uniform build.
+	// The WRITER switch, drain/barrier proof, node admission/reseed, legacy-shape rejection, and the
+	// index contract are NOT part of this capability — they are a single future operator-run contract
+	// transition, not an auto-latch (deferred; see docs/diagnostics.md). Until then, local API writes
+	// stay on the legacy writer and this gate only makes consolidation's canonical writes acceptable.
 	CanonicalRegistryV1 = "canonical_registry_v1"
-	// CanonicalRegistryActiveV1 is PHASE 2 of the H2 migration: it gates SWITCHING the credential
-	// writer to canonical. A node advertises it ONLY when it locally reports RegistryWriterReady
-	// (its legacy rows consolidated to deterministic ids), so the token latches EXACTLY when every
-	// admitted node is writer-ready — which, given the converged canonical state, also means
-	// registry credentials have converged and legacy writes have drained. The writer switches on
-	// THIS latch (not on local readiness alone), so no node originates canonical writes for a triple
-	// a peer still holds as legacy-live. The index CONTRACT (partial→non-partial UNIQUE) is
-	// deliberately NOT part of this — the deterministic PK + the partial index already enforce one
-	// live row per triple; the non-partial index is deferred defense-in-depth. After this latches,
-	// the legacy mint-new-id INSERT shape is rejected on apply. Gated by enforcement.canonical_registry
-	// + local writer-readiness (advertisement) + this latch; reversible via the flag.
-	CanonicalRegistryActiveV1 = "canonical_registry_active_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -275,13 +267,12 @@ var supported = []string{
 	LiveResizeV1,
 	CanonicalIdentityV1,
 	CanonicalRegistryV1,
-	CanonicalRegistryActiveV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, CanonicalRegistryActiveV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

@@ -13,14 +13,14 @@ import (
 // shrink it.
 var registryMigrationInterval = 30 * time.Second
 
-// runRegistryMigrationController drives the Part H2 registry-credential online migration on this
-// node. Once canonical_registry_v1 is latched (phase 1 — the accept gate, so peers apply the
-// canonical writes) it idempotently consolidates legacy random-id rows to their deterministic ids
-// and PUBLISHES this node's writer-readiness (registryLocallyReady = RegistryWriterReady). Whether
-// the WRITER actually switches to canonical is decided cluster-wide by the phase-2 latch
-// (canonical_registry_active_v1), which latches only when EVERY node publishes readiness — so no
-// node originates canonical writes for a triple a peer still holds as legacy-live. The index
-// contract is deferred.
+// runRegistryMigrationController drives the Part H2 registry-credential migration on this node. Once
+// canonical_registry_v1 is latched (phase 1 — the accept gate, so peers apply the canonical writes)
+// it idempotently consolidates legacy random-id rows to their deterministic ids and publishes this
+// node's consolidation DIAGNOSTIC (registryConsolidated = RegistryWriterReady). It does NOT switch
+// the writer or drive any advertisement: the writer activation (with its drain/barrier proof,
+// convergence proof, and node admission/reseed rules) is a single deferred operator-run contract
+// transition, not an auto-latch. So new API writes stay on the legacy writer; consolidation merely
+// keeps the canonical rows populated and reconciles duplicates to their deterministic ids.
 func (d *Daemon) runRegistryMigrationController(ctx context.Context) {
 	t := time.NewTicker(registryMigrationInterval)
 	defer t.Stop()
@@ -36,40 +36,28 @@ func (d *Daemon) runRegistryMigrationController(ctx context.Context) {
 
 // registryMigrationStep is one controller iteration, taking the resolved phase-1 accept-latch so it
 // can be unit-tested without a Checker. It consolidates legacy rows and publishes this node's
-// writer-readiness; it does NOT switch the writer (the phase-2 latch does).
+// consolidation diagnostic. It never switches the writer.
 func (d *Daemon) registryMigrationStep(ctx context.Context, latched bool) {
 	if !latched {
-		// Not accepting canonical writes (flag off / not latched) ⇒ not ready, don't consolidate.
-		d.registryLocallyReady.Store(false)
+		// Not accepting canonical writes (flag off / not latched) ⇒ don't consolidate; clear the
+		// diagnostic (reversible — this is a plain accept gate).
+		d.registryConsolidated.Store(false)
 		return
 	}
 	// Idempotently consolidate any legacy live rows (including ones replicated from a lagging peer).
-	// The local writer is FROZEN in this phase (RegPreparing/RegReady), so no new legacy row races
-	// the consolidation; consolidation itself is exempt (it uses the guarded batch path directly).
 	if n, err := corrosion.ConsolidateRegistryCredentials(ctx, d.db); err != nil {
 		slog.Warn("registry migration: consolidation error", "error", err)
 	} else if n > 0 {
 		slog.Info("registry migration: consolidated legacy credentials to canonical ids", "count", n)
 	}
-	// Publish local readiness = consolidated (no legacy live row) AND drained (no legacy INSERT left
-	// in this node's mutation/relay log, i.e. every peer consumed our legacy writes). The phase-2
-	// token is advertised only while this holds, so it latches (and the writer switches) only when
-	// EVERY node has both consolidated and drained past the legacy barrier — finding 1's TOCTOU +
-	// drain gap. With the writer frozen, both conditions are monotone, so readiness can't regress.
+	// Publish the consolidation diagnostic (no legacy live row remains). This is informational for the
+	// deferred operator transition — it does not switch the writer or advertise anything.
 	ready, err := corrosion.RegistryWriterReady(ctx, d.db)
 	if err != nil {
-		slog.Warn("registry migration: writer-readiness check failed", "error", err)
+		slog.Warn("registry migration: consolidation-readiness check failed", "error", err)
 		return
 	}
-	if ready {
-		drained, dErr := corrosion.RegistryLegacyDrained(ctx, d.db)
-		if dErr != nil {
-			slog.Warn("registry migration: legacy-drain check failed", "error", dErr)
-			return
-		}
-		ready = drained
-	}
-	if d.registryLocallyReady.CompareAndSwap(!ready, ready) && ready {
-		slog.Info("registry migration: node writer-ready (consolidated + legacy WAL drained) — advertising canonical_registry_active_v1")
+	if d.registryConsolidated.CompareAndSwap(!ready, ready) && ready {
+		slog.Info("registry migration: node consolidated (no legacy live credential rows remain)")
 	}
 }

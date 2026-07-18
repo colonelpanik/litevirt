@@ -683,26 +683,6 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 	}
 
-	// Post-activation registry hardening (canonical_registry_active_v1). WAL rejects a legacy INSERT
-	// once the canonical writer is on, but a full-state SENSITIVE dump merge would otherwise
-	// reintroduce a legacy random-id LIVE credential dumped by a config-off or returning peer. Reject
-	// (keep local + count) any LIVE non-canonical registry row; tombstoned rows are inert and still
-	// merge, so revokes converge. Column offsets computed once.
-	registryRejectLegacy := table.Name == "registry_credentials" && c.registryStateNow().RejectsLegacy()
-	regIDIdx, regScopeIdx, regOwnerIdx := -1, -1, -1
-	regRegistryIdx, regDelIdx := -1, -1
-	if registryRejectLegacy {
-		regIDIdx = indexOf(table.Columns, "id")
-		regScopeIdx = indexOf(table.Columns, "scope")
-		regOwnerIdx = indexOf(table.Columns, "owner")
-		regRegistryIdx = indexOf(table.Columns, "registry")
-		regDelIdx = indexOf(table.Columns, "deleted_at")
-		if regIDIdx < 0 || regScopeIdx < 0 || regOwnerIdx < 0 || regRegistryIdx < 0 {
-			_ = tx.Rollback()
-			return 0, len(rows), fmt.Errorf("registry_credentials dump missing id/scope/owner/registry columns")
-		}
-	}
-
 	for _, row := range rows {
 		// A peer dump whose row doesn't match the declared column count is
 		// malformed/corrupt: skip it rather than index out of range below or
@@ -755,17 +735,6 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				skipped++
 			}
 			continue
-		}
-		// Post-activation: a LIVE non-canonical registry credential must not be reintroduced by a
-		// dump (finding 3). deleted_at empty ⇒ live; a random id (id != deterministic id for the
-		// triple) ⇒ legacy ⇒ keep local + count. Canonical rows and tombstones fall through.
-		if registryRejectLegacy && (regDelIdx < 0 || coerceString(row[regDelIdx]) == "") {
-			want := RegistryCredentialID(coerceString(row[regScopeIdx]), coerceString(row[regOwnerIdx]), coerceString(row[regRegistryIdx]))
-			if coerceString(row[regIDIdx]) != want {
-				c.observeMergeRejected("registry_credentials", "ae", "noncanonical_live")
-				skipped++
-				continue
-			}
 		}
 		// Skew quarantine applies to EVERY parseable incoming LWW row, whether
 		// or not we have a local row: a future-skewed CREATE would otherwise poison

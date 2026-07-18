@@ -103,13 +103,10 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// Canonical registry-credential upsert (Part H2): REJECT until canonical_registry_v1 is active
 	// on this receiver (so a prematurely-enabled peer can't inject canonical rows while legacy
 	// writers still run), then apply through DispCanonicalRegistry, which verifies the
-	// deterministic-ID contract before the LWW upsert.
+	// deterministic-ID contract before the LWW upsert. (The legacy mint-new-id INSERT is NOT
+	// capability-gated — it auto-derives to DispPlainInsert and stays accepted; rejecting it is part
+	// of the deferred operator-run writer-activation contract, not this reversible core.)
 	{SQL: registryCanonicalUpsertSQL, Disposition: DispReject, RequiresCapability: capCanonicalRegistryV1, DispositionAfter: DispCanonicalRegistry},
-	// Legacy mint-new-id registry INSERT (Part H2, point 7): apply normally UNTIL the canonical
-	// writer is on cluster-wide (canonical_registry_active_v1 latched), then REJECT — a stray legacy
-	// INSERT after activation (a bug / an old or pre-barrier returning node) would create a
-	// duplicate physical row for a triple that already has its canonical row.
-	{SQL: registryLegacyInsertSQL, Disposition: DispPlainInsert, RequiresCapability: capCanonicalRegistryActiveV1, DispositionAfter: DispReject},
 }
 
 var explicitPolicyByFP = buildExplicitPolicies()

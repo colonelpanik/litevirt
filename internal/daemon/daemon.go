@@ -116,11 +116,11 @@ type Daemon struct {
 	// plain field. Finding 7.
 	telemetryShutdown atomic.Pointer[func(context.Context) error]
 
-	// registryLocallyReady is set by the Part H2 migration controller to this node's
-	// RegistryWriterReady (legacy rows consolidated to deterministic ids). It gates advertising
-	// canonical_registry_active_v1 (phase 2), so that token latches only when EVERY node is ready —
-	// the machine check that switches the canonical writer. Read by the gRPC advertisement path.
-	registryLocallyReady atomic.Bool
+	// registryConsolidated is set by the Part H2 migration controller to this node's
+	// RegistryWriterReady (no legacy live rows remain). It is a readiness DIAGNOSTIC for the deferred
+	// operator-run writer-activation contract — it feeds the RegConsolidated state name and can be
+	// surfaced to an operator; it does NOT switch the writer or gate any advertisement.
+	registryConsolidated atomic.Bool
 }
 
 // New creates a new daemon instance.
@@ -434,19 +434,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalIdentity(func() bool {
 		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
 	})
-	// Part H2: resolve the registry-credential migration phase from the durable/observable inputs —
-	// the ONE state machine that drives writer routing, apply policy, and admission. Phase 1
-	// (canonical_registry_v1) latched ⇒ accept canonical writes + freeze the local writer while it
-	// consolidates and drains; phase 2 (canonical_registry_active_v1) latched ⇒ EVERY node was ready,
-	// so switch the writer to canonical and reject legacy inserts — durable/irreversible, config-off
-	// no longer reverts to the legacy writer. A phase-2-latched node that isn't locally ready is
-	// BLOCKED (reseed) rather than silently serving. Cheap Latched reads on the apply/write path.
+	// Part H2: resolve the registry-credential migration phase. Phase 1 (canonical_registry_v1
+	// latched, flag on) is a REVERSIBLE accept gate — replicated canonical writes are applied and the
+	// controller consolidates legacy rows, but the local writer stays legacy. There is no auto-switch:
+	// the writer activation is a deferred operator-run contract transition. registryConsolidated is a
+	// readiness diagnostic (no behavioral effect). Cheap reads on the apply path.
 	d.db.SetRegistryMigrationState(func() corrosion.RegistryMigrationState {
 		return corrosion.ResolveRegistryMigrationState(
 			d.cfg.Enforcement.CanonicalRegistry,
 			d.checker.Latched(capabilities.CanonicalRegistryV1),
-			d.checker.Latched(capabilities.CanonicalRegistryActiveV1),
-			d.registryLocallyReady.Load(),
+			d.registryConsolidated.Load(),
 		)
 	})
 	repl.Start(ctx)
@@ -639,9 +636,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	)
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
-	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity)              // drives the latch + conditional advertisement
-	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry)              // Part H2: drives the latch + conditional advertisement
-	svc.SetRegistryLocallyReady(func() bool { return d.registryLocallyReady.Load() }) // Part H2 phase 2: advertise writer-ready
+	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
+	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())

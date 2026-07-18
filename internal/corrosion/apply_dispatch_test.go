@@ -238,6 +238,29 @@ func TestApplyRemoteMutations_MonotoneLastUsedAt(t *testing.T) {
 	}
 }
 
+// TestApplyRemoteMutations_MonotoneInstantNotLexical proves the monotone gate compares by
+// INSTANT, not lexically (finding 2): a fractional-second value sorts before a whole-second one
+// but is a later instant, so it must still advance.
+func TestApplyRemoteMutations_MonotoneInstantNotLexical(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`INSERT INTO tokens (id, username, name, token_hash, created_at, updated_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"t1", "u", "n", "h", "2020-01-01T00:00:00Z", "", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r := NewReplicator(c, "", RelayConfig{})
+	// "…00.5Z" sorts lexically BEFORE "…00Z" ('.' < 'Z') but is a LATER instant → must advance.
+	later := `[{"SQL":"UPDATE tokens SET last_used_at = ? WHERE id = ?","Params":["2026-01-01T00:00:00.5Z","t1"]}]`
+	if _, err := r.ApplyRemoteMutations(ctx, []*pb.MutationEntry{{Seq: 1, Hlc: "1-0-a", Origin: "o", Stmts: later}}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	rows, _ := c.Query(ctx, "SELECT last_used_at FROM tokens WHERE id = ?", "t1")
+	if got := rows[0].String("last_used_at"); got != "2026-01-01T00:00:00.5Z" {
+		t.Errorf("last_used_at = %q, want the fractional instant (instant-later must advance despite sorting earlier)", got)
+	}
+}
+
 // TestNoClockUpdateRequiresExplicitPolicy: deriveDisposition must NOT auto-classify a no-clock
 // full-PK update — an unknown one errors, forcing an explicit audited policy (finding 1).
 func TestNoClockUpdateRequiresExplicitPolicy(t *testing.T) {

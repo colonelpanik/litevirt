@@ -2,11 +2,54 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
+
+// compatibilityDigest is a FROZEN digest over the IDENTITY of every historical shape (family,
+// fingerprint, disposition, category) and every legacy transformer (id, normalized SQL) — not
+// just their counts. Changing a column, predicate, or disposition of a supported prior-release
+// shape (even one that keeps the family size) changes this digest, so the no-delete rule can't
+// silently swap out an old compatibility shape for an equal-sized replacement. Update it only
+// with a deliberate, reviewed compatibility change (e.g. a release ages out of the horizon).
+const compatibilityDigest = "fd28845a8d8bb8780b7de73750aa8cc13f0c63cfa253d205373c26b585532a0d"
+
+// computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
+// legacy transformers.
+func computeCompatibilityDigest(t *testing.T) string {
+	t.Helper()
+	var lines []string
+	for _, hs := range HistoricalShapes() {
+		le, err := LedgerEntryFor(hs.SQL)
+		if err != nil {
+			t.Fatalf("derive %q: %v", hs.SQL, err)
+		}
+		lines = append(lines, fmt.Sprintf("H|%s|%s|%s|%s", hs.Family, le.Fingerprint, le.Disposition, le.Category))
+	}
+	for key, lt := range legacyTransformers {
+		lines = append(lines, fmt.Sprintf("L|%s|%s", lt.id, key))
+	}
+	sort.Strings(lines)
+	h := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(h[:])
+}
+
+// TestCompatibilityDigestFrozen freezes the identities of the supported prior-release shapes
+// and legacy transformers (finding 1).
+func TestCompatibilityDigestFrozen(t *testing.T) {
+	got := computeCompatibilityDigest(t)
+	if got != compatibilityDigest {
+		t.Errorf("compatibility digest changed: got %s, frozen %s\n"+
+			"A supported prior-release shape's identity (family/fingerprint/disposition/category) or a legacy\n"+
+			"transformer changed. If this is a deliberate, reviewed compatibility change, update compatibilityDigest.", got, compatibilityDigest)
+	}
+}
 
 // supportedReleaseFamilyManifest pins the expected shape count per historical family, FROZEN
 // while its release is a supported peer. It is an INDEPENDENT check the shape generator can't

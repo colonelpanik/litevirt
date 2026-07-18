@@ -909,7 +909,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 		var stmts []Statement
 		if err := json.Unmarshal([]byte(entry.Stmts), &stmts); err != nil {
 			_ = tx.Rollback()
-			r.client.observeMergeRejected("", "wal", "decode")
+			r.client.observeMergeRejected("unknown", "wal", "decode")
 			slog.Error("replicator: undecodable mutation entry — back-pressuring replication",
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)
 			return 0, fmt.Errorf("decode mutation entry (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
@@ -919,7 +919,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 		// malformed/truncated entry surfaces instead of being silently acknowledged.
 		if len(stmts) == 0 {
 			_ = tx.Rollback()
-			r.client.observeMergeRejected("", "wal", "empty")
+			r.client.observeMergeRejected("unknown", "wal", "empty")
 			slog.Error("replicator: mutation entry has no statements — back-pressuring replication",
 				"origin", entry.Origin, "seq", entry.Seq)
 			return 0, fmt.Errorf("mutation entry has no statements (origin=%s seq=%d)", entry.Origin, entry.Seq)
@@ -934,7 +934,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 		for _, s := range stmts {
 			if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 				_ = tx.Rollback()
-				r.client.observeMergeRejected(extractTableName(s.SQL), "wal", walRejectReason(err))
+				r.client.observeMergeRejected(boundedTableLabel(extractTableName(s.SQL)), "wal", walRejectReason(err))
 				if isSchemaMissingError(err) {
 					slog.Error("replicator: schema-missing on receiver — back-pressuring replication",
 						"sql", s.SQL, "error", err,
@@ -1180,41 +1180,67 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 }
 
 // applyMonotoneTimestamp applies a no-clock full-PK UPDATE that only ADVANCES a timestamp
-// column (session/token last_used_at). It splices a monotone guard onto the WHERE —
-// `AND (col IS NULL OR col < ?)` bound to the incoming value from the SET — so an out-of-order
-// replicated write can't move the column backwards (aligning the WAL apply with anti-entropy's
-// timestamp-max merge). A NULL local value is advanced (first write lands).
+// column (session/token last_used_at). It reads the local value and gates with lwwOrder — the
+// SAME instant-based comparison anti-entropy uses — rather than a lexical SQL `col < ?`, which
+// would mis-order valid RFC3339 representations (e.g. a fractional-second value sorts before a
+// whole-second one that is actually earlier). The write is applied verbatim (respecting its own
+// WHERE) only when the incoming value is strictly newer, or when there is no local value yet.
 func (r *Replicator) applyMonotoneTimestamp(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, col string) error {
-	var incoming interface{}
-	found := false
-	for _, a := range sh.SetAssigns {
-		if strings.EqualFold(a.Column, col) {
-			if len(a.Expr.ParamIdx) != 1 {
-				return invalidf("monotone update on %s: %s is not a single bound parameter", sh.Table, col)
-			}
-			idx := a.Expr.ParamIdx[0]
-			if idx < 0 || idx >= len(s.Params) {
-				return invalidf("monotone update on %s: %s parameter out of range", sh.Table, col)
-			}
-			incoming = s.Params[idx]
-			found = true
+	incomingTS, err := monotoneIncomingValue(sh, s, col)
+	if err != nil {
+		return err
+	}
+	pkCols := tablePrimaryKeys[sh.Table]
+	pkVals, ok := pkValuesFromShape(sh, s)
+	if !ok || len(pkVals) != len(pkCols) || len(pkCols) == 0 {
+		return invalidf("monotone update on %s: cannot resolve primary key", sh.Table)
+	}
+	where := ""
+	args := make([]interface{}, len(pkCols))
+	for i, c := range pkCols {
+		if i > 0 {
+			where += " AND "
 		}
+		where += c + " = ?"
+		args[i] = pkVals[i]
 	}
-	if !found {
-		return invalidf("monotone update on %s: SET does not assign %s", sh.Table, col)
+	var local sql.NullString
+	selErr := tx.QueryRowContext(ctx, "SELECT "+col+" FROM "+sh.Table+" WHERE "+where, args...).Scan(&local)
+	if selErr != nil && !errors.Is(selErr, sql.ErrNoRows) {
+		return selErr // operational read failure ⇒ back-pressure
 	}
-	if sh.WhereEnd <= sh.WhereStart || sh.WhereEnd > len(s.SQL) {
-		return invalidf("monotone update on %s: no WHERE clause to guard", sh.Table)
+	localTS := ""
+	if selErr == nil && local.Valid {
+		localTS = local.String
 	}
-	applied := s.SQL[:sh.WhereEnd] + " AND (" + col + " IS NULL OR " + col + " < ?)"
-	params := make([]interface{}, 0, len(s.Params)+1)
-	params = append(params, s.Params...)
-	params = append(params, incoming)
-	res, err := tx.ExecContext(ctx, applied, params...)
+	// Instant-based monotone gate: skip when the local value is newer OR an exact tie.
+	if localTS != "" && lwwOrder(localTS, incomingTS) >= 0 {
+		return nil
+	}
+	res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 	if err == nil && rowsChanged(res) {
 		r.client.clearUnresolvedFromStmt(s)
 	}
 	return err
+}
+
+// monotoneIncomingValue returns the incoming value the SET assigns to the monotone column, as a
+// string (it must be a single bound parameter).
+func monotoneIncomingValue(sh StmtShape, s Statement, col string) (string, error) {
+	for _, a := range sh.SetAssigns {
+		if !strings.EqualFold(a.Column, col) {
+			continue
+		}
+		if len(a.Expr.ParamIdx) != 1 {
+			return "", invalidf("monotone update on %s: %s is not a single bound parameter", sh.Table, col)
+		}
+		idx := a.Expr.ParamIdx[0]
+		if idx < 0 || idx >= len(s.Params) {
+			return "", invalidf("monotone update on %s: %s parameter out of range", sh.Table, col)
+		}
+		return coerceString(s.Params[idx]), nil
+	}
+	return "", invalidf("monotone update on %s: SET does not assign %s", sh.Table, col)
 }
 
 // applyBulkPerRowLWW applies a bulk (non-full-PK) UPDATE as an atomic per-row LWW expansion:
@@ -1328,6 +1354,16 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 		r.client.clearUnresolvedFromStmt(s)
 	}
 	return nil
+}
+
+// boundedTableLabel clamps a metric table label to a known replicated table or "unknown", so a
+// malformed peer statement (extractTableName accepts an arbitrary second token) can't grow the
+// Prometheus label cardinality.
+func boundedTableLabel(table string) string {
+	if _, ok := tablePrimaryKeys[table]; ok {
+		return table
+	}
+	return "unknown"
 }
 
 // walRejectReason maps a WAL apply error to a BOUNDED metric reason label (never SQL/params):

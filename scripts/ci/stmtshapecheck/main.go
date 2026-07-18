@@ -259,8 +259,32 @@ func renderLedgerEntry(le corrosion.LedgerEntry) (string, error) {
 	if le.MonotoneColumn != "" {
 		parts = append(parts, fmt.Sprintf("MonotoneColumn: %q", le.MonotoneColumn))
 	}
+	// Activation/version conditions (Part H). Rendered whenever set so regeneration never
+	// silently drops them once H1/H2 begins populating them.
+	if le.MinSchema != 0 {
+		parts = append(parts, fmt.Sprintf("MinSchema: %d", le.MinSchema))
+	}
+	if le.MaxSchema != 0 {
+		parts = append(parts, fmt.Sprintf("MaxSchema: %d", le.MaxSchema))
+	}
+	if le.RequiresCapability != "" {
+		parts = append(parts, fmt.Sprintf("RequiresCapability: %q", le.RequiresCapability))
+	}
+	if le.DispositionAfter != "" {
+		da, ok := dispIdent[le.DispositionAfter]
+		if !ok {
+			return "", fmt.Errorf("unknown DispositionAfter %q", le.DispositionAfter)
+		}
+		parts = append(parts, "DispositionAfter: "+da)
+	}
+	if le.TransformerID != "" {
+		parts = append(parts, fmt.Sprintf("TransformerID: %q", le.TransformerID))
+	}
 	if le.FirstEmitter != "" {
 		parts = append(parts, fmt.Sprintf("FirstEmitter: %q", le.FirstEmitter))
+	}
+	if le.LastEmitter != "" {
+		parts = append(parts, fmt.Sprintf("LastEmitter: %q", le.LastEmitter))
 	}
 	if le.RemovalHorizon != "" {
 		parts = append(parts, fmt.Sprintf("RemovalHorizon: %q", le.RemovalHorizon))

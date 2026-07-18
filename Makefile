@@ -106,7 +106,7 @@ ci-guards:
 	go test ./scripts/ci/writecheck/
 	go run ./scripts/ci/stmtshapecheck -root .
 	go test ./scripts/ci/stmtshapecheck/
-	go test ./internal/corrosion/ -run 'TestSchemaHistoryDocumentsCurrentVersion|TestHistoricalLedgerComplete|TestHistoricalLedgerNonEmpty|TestSupportedReleaseFamilyManifest|TestLegacyTransformerManifest'
+	go test ./internal/corrosion/ -run 'TestSchemaHistoryDocumentsCurrentVersion|TestHistoricalLedgerComplete|TestHistoricalLedgerNonEmpty|TestSupportedReleaseFamilyManifest|TestLegacyTransformerManifest|TestCompatibilityDigestFrozen'
 	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestValidateInvocation|TestCheckIdentifier|TestExtractInvocations'
 
 build-e2e:

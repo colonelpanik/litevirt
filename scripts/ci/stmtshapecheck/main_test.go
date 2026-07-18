@@ -1,10 +1,51 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// TestRenderLedgerEntry_AllFields verifies the generator renders EVERY LedgerEntry field it is
+// given, so regeneration can't silently drop an activation/provenance field once H1/H2 begins
+// populating them (finding 3).
+func TestRenderLedgerEntry_AllFields(t *testing.T) {
+	e := corrosion.LedgerEntry{
+		Fingerprint:        "fp",
+		Kind:               "update",
+		Table:              "t",
+		Disposition:        corrosion.DispBulkUpdate,
+		Category:           corrosion.CatPerRowLWW,
+		MonotoneColumn:     "last_used_at",
+		MinSchema:          42,
+		MaxSchema:          43,
+		RequiresCapability: "canonical_identity_v1",
+		DispositionAfter:   corrosion.DispFullPKUpdate,
+		TransformerID:      "legacy_x",
+		FirstEmitter:       "v1.3.0",
+		LastEmitter:        "v1.4.0",
+		RemovalHorizon:     "v1.5.0",
+	}
+	got, err := renderLedgerEntry(e)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		`Fingerprint: "fp"`, `Kind: "update"`, `Table: "t"`,
+		"Disposition: DispBulkUpdate", "Category: CatPerRowLWW",
+		`MonotoneColumn: "last_used_at"`, "MinSchema: 42", "MaxSchema: 43",
+		`RequiresCapability: "canonical_identity_v1"`, "DispositionAfter: DispFullPKUpdate",
+		`TransformerID: "legacy_x"`, `FirstEmitter: "v1.3.0"`, `LastEmitter: "v1.4.0"`,
+		`RemovalHorizon: "v1.5.0"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rendered entry missing %q\n got: %s", want, got)
+		}
+	}
+}
 
 // classCount is a per-builder tally of finding classes.
 type classCount struct{ resolved, dynamic, unresolved, parseErr int }

@@ -1114,6 +1114,16 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		// A bulk (non-full-PK) UPDATE, applied by per-row LWW expansion.
 		return r.applyBulkPerRowLWW(ctx, tx, s, sh, tableName, pkCols)
 
+	case DispFullPKUpdateNoClock:
+		// A full-PK maintenance/monotone UPDATE with no bound updated_at (audit reseal,
+		// session touch, token last_used_at): apply verbatim by PK, no LWW gate. The builder's
+		// WHERE keeps it idempotent/monotone; the target may have no updated_at column at all.
+		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if execErr == nil && rowsChanged(res) {
+			r.client.clearUnresolvedFromStmt(s)
+		}
+		return execErr
+
 	case DispPlainInsert, DispExplicitUpsert, DispFullPKUpdate:
 		return r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 	}
@@ -1247,8 +1257,9 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 		if r.client.skewQuarantinesIncoming(skewOn, m.localTS, incomingTS, now) {
 			continue
 		}
-		if m.localTS != "" && lwwOrder(m.localTS, incomingTS) > 0 {
-			continue // local strictly newer → skip this row
+		if m.localTS != "" && lwwOrder(m.localTS, incomingTS) >= 0 {
+			continue // local newer OR an exact tie → keep local (a bulk SET is a partial
+			// projection, not a full row image, so an equal-clock write must not overwrite)
 		}
 		params := make([]interface{}, 0, len(setParams)+len(m.pk))
 		params = append(params, setParams...)
@@ -1479,7 +1490,10 @@ func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName st
 	if fullImage {
 		if cols, vals, okRow := insertRowFromShape(sh, s); okRow {
 			pkIdx := columnIndexes(cols, pkCols)
-			localRow, found := fetchLocalRowCells(tx, tableName, cols, pkCols, pkIdx, vals)
+			localRow, found, fErr := fetchLocalRowCells(tx, tableName, cols, pkCols, pkIdx, vals)
+			if fErr != nil {
+				return false, fErr // operational read failure ⇒ back-pressure
+			}
 			if !found {
 				return false, nil // no local row → apply incoming
 			}

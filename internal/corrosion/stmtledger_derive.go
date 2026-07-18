@@ -35,11 +35,18 @@ func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 		}
 		return DispPlainInsert, CatNone, nil
 	case KindUpdate:
-		// A full-PK UPDATE is LWW-gated + applied verbatim (guards retained). This also
-		// covers deterministic full-PK fixups on otherwise append-only tables (e.g. the
-		// audit_log hash-chain reseal): idempotent and keyed by PK.
 		if sh.HasFullPKIdentity {
-			return DispFullPKUpdate, CatNone, nil
+			// A full-PK UPDATE is LWW-gated ONLY when it binds updated_at (the clock the gate
+			// compares). A full-PK UPDATE that does NOT bind updated_at is a maintenance /
+			// monotone update — the audit_log hash-chain reseal and sessions touch (tables
+			// with NO updated_at column at all), or the token last_used_at bump (deliberately
+			// not advancing the token clock). Gating those by updated_at would either query a
+			// nonexistent column (back-pressuring valid replication) or compare against a
+			// fallback clock; apply them verbatim by PK instead, relying on the builder's WHERE.
+			if sh.UpdatedAtParamIdx >= 0 {
+				return DispFullPKUpdate, CatNone, nil
+			}
+			return DispFullPKUpdateNoClock, CatNone, nil
 		}
 		// A bulk UPDATE (no full-PK identity) is applied by per-row LWW expansion — but only
 		// when that is provably safe: it must advance a clock (SET updated_at = ?) so each

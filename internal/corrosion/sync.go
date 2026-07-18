@@ -28,7 +28,7 @@ import (
 // customMergeFn merges one incoming anti-entropy row for a custom-merge table,
 // returning true to KEEP LOCAL (skip the incoming row) or false to apply it. It
 // runs under the merge tx + client lock and bypasses the LWW resolver entirely.
-type customMergeFn func(c *Client, tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool
+type customMergeFn func(c *Client, tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) (keepLocal bool, err error)
 
 // customMergeTables maps a table to its bespoke NON-LWW merge. These tables are
 // anti-entropy-repaired (present in tableNames/sensitiveTableNames) but resolved
@@ -641,7 +641,12 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
 	var existing map[string]string
 	if updatedAtIdx >= 0 && len(pkCols) > 0 {
-		existing = c.prefetchUpdatedAt(tx, table.Name, pkCols, rows, pkIdx)
+		var perr error
+		existing, perr = c.prefetchUpdatedAt(tx, table.Name, pkCols, rows, pkIdx)
+		if perr != nil {
+			_ = tx.Rollback()
+			return 0, 0, perr
+		}
 	}
 
 	// Read the skew-guard state once per chunk (cheap latch read; constant for the
@@ -664,7 +669,12 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// copy resurrecting a spent proof. Handled entirely here (bypasses lwwOrder /
 		// resolveTie).
 		if mergeFn := customMergeTables[table.Name]; mergeFn != nil {
-			if mergeFn(c, tx, table, row, pkCols, pkIdx, updatedAtIdx) {
+			keepLocal, mErr := mergeFn(c, tx, table, row, pkCols, pkIdx, updatedAtIdx)
+			if mErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, mErr
+			}
+			if keepLocal {
 				skipped++
 				continue
 			}
@@ -712,7 +722,11 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 					case ord == 0:
 						// Exact tie → table-aware resolver over the local row
 						// (aligned to the incoming dump's declared columns).
-						localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+						localRow, found, fErr := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+						if fErr != nil {
+							_ = tx.Rollback()
+							return merged, skipped, fErr
+						}
 						if found {
 							keepLocal, unresolved := c.resolveTie(table.Name, table.Columns, localRow, row, pkIdx, pathAE)
 							if !unresolved {
@@ -778,10 +792,13 @@ func applyMergeRow(tx *sql.Tx, insertSQL string, row []interface{}, table string
 // runtime_action_proofs row: fetch the local row's status + updated_at (aligned
 // to the incoming dump columns) and compare via proofMergeKeepLocal. No local row
 // → apply the incoming (false).
-func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool {
-	localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) (bool, error) {
+	localRow, found, fErr := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if fErr != nil {
+		return false, fErr
+	}
 	if !found {
-		return false
+		return false, nil
 	}
 	statusIdx, stepIdx := -1, -1
 	for i, col := range table.Columns {
@@ -801,7 +818,7 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 		// well-formed later dump; a well-formed peer never omits the column, so this never
 		// stalls real convergence.
 		slog.Warn("sync: runtime_action_proofs dump missing status column; keeping local (fail-closed)")
-		return true
+		return true, nil
 	}
 	localTS, _ := localRow[updatedAtIdx].(string)
 	incomingTS, _ := row[updatedAtIdx].(string)
@@ -813,7 +830,7 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	// never silently diverge.
 	if proofRank(localStatus) == 2 && proofRank(incomingStatus) == 2 && localStatus != incomingStatus {
 		c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "runtime_owned")
-		return true
+		return true, nil
 	}
 
 	keepLocal := proofMergeKeepLocal(localStatus, localTS, incomingStatus, incomingTS)
@@ -834,7 +851,7 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 			c.updateProofStepState(tx, table.Name, pkCols, pkIdx, row, union)
 		}
 	}
-	return keepLocal
+	return keepLocal, nil
 }
 
 // updateProofStepState folds a unioned step_state back into the surviving local row
@@ -872,22 +889,25 @@ func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []str
 //     minted one operation id with different request hashes, or two executors recorded
 //     different facts for one step key): keep local AND flag it unresolved. NEVER
 //     coin-flip an immutable row.
-func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool {
-	localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) (bool, error) {
+	localRow, found, fErr := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if fErr != nil {
+		return false, fErr
+	}
 	if !found {
-		return false
+		return false, nil
 	}
 	delIdx := indexOf(table.Columns, "deleted_at")
 	localDeleted := delIdx >= 0 && cellNonEmpty(localRow[delIdx])
 	incomingDeleted := delIdx >= 0 && cellNonEmpty(row[delIdx])
 	if localDeleted != incomingDeleted {
-		return localDeleted // tombstone dominates: keep whichever side is tombstoned
+		return localDeleted, nil // tombstone dominates: keep whichever side is tombstoned
 	}
 	if immutableFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
-		return true // idempotent re-delivery
+		return true, nil // idempotent re-delivery
 	}
 	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "immutable_conflict")
-	return true
+	return true, nil
 }
 
 // immutableFactsEqual reports whether two rows agree on every column except
@@ -968,7 +988,12 @@ var mergePrefetchMaxParams = 900
 // prefetchUpdatedAt batch-loads the existing updated_at for the dump's rows,
 // keyed by canonical PK, using row-value IN queries chunked under SQLite's
 // bind-variable limit (composite PKs spend len(pkCols) params per tuple).
-func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, rows [][]interface{}, pkIdx []int) map[string]string {
+// prefetchUpdatedAt batch-reads the local updated_at for the dump's PK tuples. It fails
+// CLOSED: any query/scan/iteration error is returned so the caller rolls back and
+// back-pressures — a swallowed read would leave the PK ABSENT from the map, and an absent
+// entry is treated as "no local row", letting an incoming row bypass LWW and overwrite newer
+// local state.
+func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, rows [][]interface{}, pkIdx []int) (map[string]string, error) {
 	out := make(map[string]string)
 
 	// Collect distinct PK tuples present in the dump.
@@ -997,7 +1022,7 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 		tuples = append(tuples, vals)
 	}
 	if len(tuples) == 0 {
-		return out
+		return out, nil
 	}
 
 	chunkSize := mergePrefetchMaxParams / len(pkCols)
@@ -1024,8 +1049,7 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 			" WHERE " + pkColList + " IN (" + strings.Join(valueList, ", ") + ")"
 		rs, err := tx.Query(q, args...)
 		if err != nil {
-			slog.Warn("sync: prefetch updated_at", "table", table, "error", err)
-			continue
+			return nil, fmt.Errorf("prefetch updated_at for %s: %w", table, err)
 		}
 		for rs.Next() {
 			cells := make([]interface{}, len(pkCols)+1)
@@ -1034,13 +1058,18 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 				ptrs[i] = &cells[i]
 			}
 			if err := rs.Scan(ptrs...); err != nil {
-				continue
+				rs.Close()
+				return nil, fmt.Errorf("scan prefetch updated_at for %s: %w", table, err)
 			}
 			out[pkKey(cells[:len(pkCols)])] = coerceString(cells[len(pkCols)])
 		}
+		if err := rs.Err(); err != nil {
+			rs.Close()
+			return nil, fmt.Errorf("iterate prefetch updated_at for %s: %w", table, err)
+		}
 		rs.Close()
 	}
-	return out
+	return out, nil
 }
 
 // fetchLocalRowCells reads the local row for one incoming dump row's PK, scanned
@@ -1049,10 +1078,12 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 // []byte → text). Without that normalization the resolver would compare a local
 // int64 against an incoming float64 of the same value and see a false difference
 // (the PR #67 read-path artifact). Only called on an exact timestamp tie, so the
-// per-row SELECT is rare. ok=false means no local row (resolver takes incoming).
-func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkIdx []int, incomingRow []interface{}) ([]interface{}, bool) {
+// per-row SELECT is rare. It fails CLOSED: only sql.ErrNoRows means "no local row" (found=false,
+// nil error); any other error is operational and is returned so the caller rolls back — a
+// swallowed read must not be mistaken for absence and let the resolver take the incoming row.
+func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkIdx []int, incomingRow []interface{}) ([]interface{}, bool, error) {
 	if len(pkCols) == 0 || len(cols) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	where := make([]string, len(pkCols))
 	args := make([]interface{}, len(pkCols))
@@ -1069,7 +1100,10 @@ func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkI
 		ptrs[i] = &raw[i]
 	}
 	if err := tx.QueryRow(q, args...).Scan(ptrs...); err != nil {
-		return nil, false
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("fetch local row for %s: %w", tableName, err)
 	}
 	// Mirror dumpTable: []byte → string, then JSON round-trip so the value kinds
 	// match the post-transit incoming row exactly.
@@ -1078,7 +1112,7 @@ func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkI
 			raw[i] = string(b)
 		}
 	}
-	return jsonRoundTripCells(raw), true
+	return jsonRoundTripCells(raw), true, nil
 }
 
 // jsonRoundTripCells marshals then unmarshals a scanned row so its numeric/text

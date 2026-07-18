@@ -18,13 +18,14 @@ package corrosion
 type Disposition string
 
 const (
-	DispPlainInsert     Disposition = "plain_insert"     // rewrite to a PK-aware upsert
-	DispExplicitUpsert  Disposition = "explicit_upsert"  // apply verbatim (leading algo normalized)
-	DispFullPKUpdate    Disposition = "full_pk_update"   // LWW-gate by updated_at, guards retained
-	DispBulkUpdate      Disposition = "bulk_update"      // apply per ConcurrencyCategory
-	DispDeleteRetention Disposition = "delete_retention" // hard delete on a registered retention table
-	DispAppendOnly      Disposition = "append_only"      // INSERT OR IGNORE, no LWW
-	DispCustomMerge     Disposition = "custom_merge"     // runtime_action_proofs / operations / …
+	DispPlainInsert         Disposition = "plain_insert"           // rewrite to a PK-aware upsert
+	DispExplicitUpsert      Disposition = "explicit_upsert"        // apply verbatim (leading algo normalized)
+	DispFullPKUpdate        Disposition = "full_pk_update"         // LWW-gate by updated_at, guards retained
+	DispFullPKUpdateNoClock Disposition = "full_pk_update_noclock" // full-PK UPDATE that does NOT bind updated_at (audit reseal / session touch / token last_used_at): apply verbatim by PK, no LWW gate (the builder's WHERE keeps it idempotent/monotone)
+	DispBulkUpdate          Disposition = "bulk_update"            // apply per ConcurrencyCategory
+	DispDeleteRetention     Disposition = "delete_retention"       // hard delete on a registered retention table
+	DispAppendOnly          Disposition = "append_only"            // INSERT OR IGNORE, no LWW
+	DispCustomMerge         Disposition = "custom_merge"           // runtime_action_proofs / operations / …
 )
 
 // ConcurrencyCategory qualifies a DispBulkUpdate entry (see Part C). Empty for non-bulk.

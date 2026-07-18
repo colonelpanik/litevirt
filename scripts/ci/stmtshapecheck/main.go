@@ -140,13 +140,14 @@ func loc(p token.Position) string { return fmt.Sprintf("%s:%d", p.Filename, p.Li
 // dispIdent / catIdent map a derived disposition/category back to its Go identifier so the
 // generated ledger references the exported constants rather than opaque string values.
 var dispIdent = map[corrosion.Disposition]string{
-	corrosion.DispPlainInsert:     "DispPlainInsert",
-	corrosion.DispExplicitUpsert:  "DispExplicitUpsert",
-	corrosion.DispFullPKUpdate:    "DispFullPKUpdate",
-	corrosion.DispBulkUpdate:      "DispBulkUpdate",
-	corrosion.DispDeleteRetention: "DispDeleteRetention",
-	corrosion.DispAppendOnly:      "DispAppendOnly",
-	corrosion.DispCustomMerge:     "DispCustomMerge",
+	corrosion.DispPlainInsert:         "DispPlainInsert",
+	corrosion.DispExplicitUpsert:      "DispExplicitUpsert",
+	corrosion.DispFullPKUpdate:        "DispFullPKUpdate",
+	corrosion.DispFullPKUpdateNoClock: "DispFullPKUpdateNoClock",
+	corrosion.DispBulkUpdate:          "DispBulkUpdate",
+	corrosion.DispDeleteRetention:     "DispDeleteRetention",
+	corrosion.DispAppendOnly:          "DispAppendOnly",
+	corrosion.DispCustomMerge:         "DispCustomMerge",
 }
 
 var catIdent = map[corrosion.ConcurrencyCategory]string{

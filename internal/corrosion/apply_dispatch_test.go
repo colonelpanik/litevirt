@@ -49,6 +49,60 @@ func TestApplyBulkPerRowLWW_GatesByRowClock(t *testing.T) {
 	}
 }
 
+// TestApplyBulkPerRowLWW_KeepsLocalOnTie: an exact-clock bulk update must NOT overwrite the
+// local row — a bulk SET is a partial projection, not a full row image (finding 3).
+func TestApplyBulkPerRowLWW_KeepsLocalOnTie(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	const ts = "2000000000000-0000-n1"
+	if err := c.Execute(ctx,
+		`INSERT INTO vm_interfaces (vm_name, network_name, ordinal, mac, ip, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"vm1", "neta", 0, "00:11:22:33:44:55", "10.0.0.5", ts); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r := NewReplicator(c, "", RelayConfig{})
+	// Bulk tombstone at the SAME clock as the local row.
+	stmts := fmt.Sprintf(
+		`[{"SQL":"UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?","Params":["%s","%s","vm1"]}]`, ts, ts)
+	entries := []*pb.MutationEntry{{Seq: 1, Hlc: ts, Origin: "origin-node", Stmts: stmts}}
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	rows, err := c.Query(ctx, "SELECT deleted_at FROM vm_interfaces WHERE vm_name = ? AND network_name = ?", "vm1", "neta")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("query: err=%v rows=%d", err, len(rows))
+	}
+	if rows[0].String("deleted_at") != "" {
+		t.Error("equal-clock bulk update must keep local (not tombstone)")
+	}
+}
+
+// TestApplyRemoteMutations_NoClockFullPKUpdate: a full-PK UPDATE on a table with NO updated_at
+// column (audit_log reseal) must apply verbatim, not back-pressure trying to LWW-gate on a
+// nonexistent column (finding 2).
+func TestApplyRemoteMutations_NoClockFullPKUpdate(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_log (id, timestamp, action, target, result) VALUES (?, ?, ?, ?, ?)`,
+		"a1", "2020-01-01T00:00:00Z", "login", "user", "ok"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r := NewReplicator(c, "", RelayConfig{})
+	stmts := `[{"SQL":"UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?","Params":["ph","ch","a1"]}]`
+	entries := []*pb.MutationEntry{{Seq: 1, Hlc: "2000000000000-0000-n2", Origin: "origin-node", Stmts: stmts}}
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
+		t.Fatalf("no-clock full-PK update must apply, got: %v", err)
+	}
+	rows, err := c.Query(ctx, "SELECT content_hash FROM audit_log WHERE id = ?", "a1")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("query: err=%v rows=%d", err, len(rows))
+	}
+	if got := rows[0].String("content_hash"); got != "ch" {
+		t.Errorf("content_hash = %q, want ch (reseal must have applied verbatim)", got)
+	}
+}
+
 // TestApplyRemoteMutations_UnregisteredDeleteRejected: a hard DELETE whose shape is not a
 // registered retention template must back-pressure, never be applied on a derived disposition.
 func TestApplyRemoteMutations_UnregisteredDeleteRejected(t *testing.T) {

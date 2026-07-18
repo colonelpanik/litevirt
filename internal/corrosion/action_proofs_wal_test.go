@@ -91,7 +91,10 @@ func TestProofMergeKeepLocalRow_NoStatusColumnFailsClosed(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback()
-	keepLocal := c.proofMergeKeepLocalRow(tx, tbl, row, []string{"id"}, []int{0}, 1)
+	keepLocal, mErr := c.proofMergeKeepLocalRow(tx, tbl, row, []string{"id"}, []int{0}, 1)
+	if mErr != nil {
+		t.Fatalf("proofMergeKeepLocalRow: %v", mErr)
+	}
 	if !keepLocal {
 		t.Fatal("no-status dump: keepLocal=false; want true — a status-less proof dump must fail closed, not LWW-resurrect a terminal proof")
 	}

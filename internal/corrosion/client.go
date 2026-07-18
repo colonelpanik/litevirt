@@ -209,6 +209,14 @@ type Client struct {
 	// Nil/false = legacy writer. Activated only AFTER legacy rows are consolidated to their
 	// deterministic ids, so the two writers never produce two live rows for one triple.
 	canonicalRegistry func() bool
+
+	// canonicalRegistryLatched, when non-nil and returning true, means canonical_registry_v1 is
+	// LATCHED cluster-wide (every node can apply the canonical shape). It gates ACCEPTANCE of a
+	// replicated canonical upsert (DispCanonicalRegistry), which is DECOUPLED from originating one
+	// (canonicalRegistry, the writer): the one-time legacy-row consolidation emits canonical
+	// upserts that peers must accept once latched, BEFORE the writer switches. Nil/false ⇒ reject
+	// the canonical shape (a premature/buggy peer write fails closed).
+	canonicalRegistryLatched func() bool
 }
 
 // SetCanonicalIdentity injects the predicate that enables natural-key identity resolution.
@@ -222,7 +230,7 @@ func (c *Client) canonicalIdentityOn() bool {
 }
 
 // SetCanonicalRegistry injects the predicate that activates the canonical registry-credential
-// writer (Part H2). Nil-safe: an unset predicate keeps the legacy mint-new-id writer.
+// WRITER (Part H2 — originate canonical writes). Nil-safe: unset keeps the legacy mint-new-id writer.
 func (c *Client) SetCanonicalRegistry(fn func() bool) { c.canonicalRegistry = fn }
 
 // canonicalRegistryOn reports whether the canonical (deterministic-id) registry writer is active.
@@ -230,13 +238,24 @@ func (c *Client) canonicalRegistryOn() bool {
 	return c.canonicalRegistry != nil && c.canonicalRegistry()
 }
 
+// SetCanonicalRegistryLatched injects the predicate that reports canonical_registry_v1 latched
+// cluster-wide (gates ACCEPTANCE of a replicated canonical upsert). Nil-safe: unset ⇒ reject.
+func (c *Client) SetCanonicalRegistryLatched(fn func() bool) { c.canonicalRegistryLatched = fn }
+
+// canonicalRegistryLatchedOn reports whether the canonical shape may be applied on this receiver.
+func (c *Client) canonicalRegistryLatchedOn() bool {
+	return c.canonicalRegistryLatched != nil && c.canonicalRegistryLatched()
+}
+
 // capabilityActive reports whether a ledger-named capability (RequiresCapability) is active on THIS
-// receiver, so the apply path can resolve a capability-gated shape's effective disposition. An
+// receiver, so the apply path can resolve a capability-gated shape's effective disposition. For
+// canonical_registry_v1 this is the LATCH (accept the shape), NOT the writer gate — the two are
+// decoupled so consolidation's canonical writes are accepted before the writer switches. An
 // unknown capability returns false (fail closed — a gated shape stays rejected).
 func (c *Client) capabilityActive(name string) bool {
 	switch name {
 	case capabilities.CanonicalRegistryV1:
-		return c.canonicalRegistryOn()
+		return c.canonicalRegistryLatchedOn()
 	case capabilities.CanonicalIdentityV1:
 		return c.canonicalIdentityOn()
 	default:

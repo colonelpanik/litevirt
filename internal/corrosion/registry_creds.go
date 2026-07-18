@@ -65,6 +65,11 @@ func RegistryCredentialID(scope, owner, registry string) string {
 	return id.String()
 }
 
+// registryTombstoneByTripleSQL soft-deletes the LIVE row for a triple (the legacy writer's first
+// statement; also reused by consolidation to retire a legacy live row). Registered shape.
+const registryTombstoneByTripleSQL = `UPDATE registry_credentials SET deleted_at = ?, updated_at = ?
+			       WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL`
+
 // UpsertRegistryCredential replaces the live credential for (scope, owner,
 // registry). It soft-deletes any existing live row for that triple then inserts
 // a fresh id, both in one batch so the partial unique index never collides.
@@ -73,8 +78,7 @@ func UpsertRegistryCredential(ctx context.Context, c *Client, rc RegistryCredent
 	now := c.NowTS()
 	return c.ExecuteBatch(ctx, []Statement{
 		{
-			SQL: `UPDATE registry_credentials SET deleted_at = ?, updated_at = ?
-			       WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL`,
+			SQL:    registryTombstoneByTripleSQL,
 			Params: []interface{}{nowRFC3339(), now, rc.Scope, rc.Owner, rc.Registry},
 		},
 		{
@@ -86,20 +90,14 @@ func UpsertRegistryCredential(ctx context.Context, c *Client, rc RegistryCredent
 	})
 }
 
-// UpsertRegistryCredentialCanonical writes the credential for (scope, owner, registry) as ONE
-// stable row keyed on its deterministic id (Part H2). Create / rotate / revive all funnel through
-// a single PK-keyed upsert: it inserts the row live, or ON CONFLICT updates the credential material
-// and CLEARS deleted_at (a revive), always stamping a fresh HLC updated_at. scope/owner/registry
-// and created_at are never reassigned (the id pins the triple; created_at is set once). No
-// tombstone+insert and no minted id, so two nodes writing the same triple converge by LWW on the
-// PK rather than colliding on the partial UNIQUE. rc.ID is ignored (recomputed).
-// registryCanonicalUpsertSQL is the single frozen statement the canonical writer emits (exported
-// to tests so they can't drift from the ledger-registered shape). The ON CONFLICT SET is a FULL
-// image of the row's mutable content — including created_at = excluded.created_at — so a
-// replicated write CONVERGES the whole row on the winning value: two nodes that independently
-// created this deterministic id (with different wall-clock created_at) otherwise keep different
-// created_at forever and read as a permanent equal-timestamp content fault. scope/owner/registry
-// are not reassigned (the id pins them); deleted_at is always cleared (a write is a revive).
+// registryCanonicalUpsertSQL is the single frozen statement the canonical writer + consolidation
+// emit (also referenced by tests so they can't drift from the ledger-registered shape). The ON
+// CONFLICT SET is a FULL image of the row's mutable content — including created_at =
+// excluded.created_at — so a replicated write CONVERGES the whole row on the winning value: two
+// nodes that independently created this deterministic id (with different wall-clock created_at)
+// otherwise keep different created_at forever and read as a permanent equal-timestamp content
+// fault. scope/owner/registry are not reassigned (the id pins them); deleted_at is always cleared
+// (a write is a revive).
 const registryCanonicalUpsertSQL = `INSERT INTO registry_credentials
 		   (id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at)
 		   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
@@ -110,6 +108,13 @@ const registryCanonicalUpsertSQL = `INSERT INTO registry_credentials
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`
 
+// UpsertRegistryCredentialCanonical writes the credential for (scope, owner, registry) as ONE
+// stable row keyed on its deterministic id (Part H2). Create / rotate / revive all funnel through
+// a single PK-keyed upsert: it inserts the row live, or ON CONFLICT updates the credential material
+// and CLEARS deleted_at (a revive), always stamping a fresh HLC updated_at. scope/owner/registry
+// and created_at are never reassigned (the id pins the triple; created_at is set once). No
+// tombstone+insert and no minted id, so two nodes writing the same triple converge by LWW on the
+// PK rather than colliding on the partial UNIQUE. rc.ID is ignored (recomputed).
 func UpsertRegistryCredentialCanonical(ctx context.Context, c *Client, rc RegistryCredential) error {
 	now := c.NowTS()
 	id := RegistryCredentialID(rc.Scope, rc.Owner, rc.Registry)
@@ -122,8 +127,72 @@ func UpsertRegistryCredentialCanonical(ctx context.Context, c *Client, rc Regist
 	} else if len(existing) == 1 {
 		createdAt = existing[0].String("created_at")
 	}
+	// The SQL const is passed inline so the CI shape guard can resolve the replicated statement.
 	return c.Execute(ctx, registryCanonicalUpsertSQL,
 		id, rc.Scope, rc.Owner, rc.Registry, rc.Username, rc.Secret, createdAt, now)
+}
+
+// ConsolidateRegistryCredentials rewrites legacy random-id LIVE rows to their canonical
+// deterministic-id row — the Part H2 one-time "converge" data migration. IDEMPOTENT (a second run
+// is a no-op). The partial UNIQUE guarantees exactly one live row per triple LOCALLY, so the
+// authoritative row is unambiguous here: each live, non-canonical row is migrated by ATOMICALLY
+// tombstoning the legacy live row (the by-triple soft-delete) and upserting the canonical
+// deterministic-id row with the legacy row's content — username/secret AND created_at preserved,
+// and the legacy updated_at CARRIED so two nodes consolidating the same converged legacy row emit
+// BYTE-IDENTICAL canonical rows (no LWW race, no created_at divergence).
+//
+// An equal-timestamp/different-content conflict is inherently CROSS-NODE (two nodes wrote the same
+// triple at the same HLC; the partial UNIQUE keeps each node's local state to one live row). It is
+// NOT resolvable here — it surfaces where it belongs, at the canonical upsert's LWW apply (an exact
+// tie keeps local and is tracked as an unresolved tie), not by silently picking a winner. The
+// retired legacy rows are left tombstoned for the watermark-gated GC — a local hard delete of a
+// replicated row is union-unsafe (a lagging peer could resurrect it), the rule ReapSpentProofs
+// follows. The canonical writes REPLICATE and are accepted by peers once canonical_registry_v1 has
+// latched; run this after the latch, before switching the writer.
+func ConsolidateRegistryCredentials(ctx context.Context, c *Client) (migrated int, err error) {
+	live, err := c.Query(ctx,
+		`SELECT id, scope, owner, registry, username, secret, created_at, updated_at
+		   FROM registry_credentials WHERE deleted_at IS NULL`)
+	if err != nil {
+		return 0, err
+	}
+	for _, row := range live {
+		scope, owner, registry := row.String("scope"), row.String("owner"), row.String("registry")
+		detID := RegistryCredentialID(scope, owner, registry)
+		if row.String("id") == detID {
+			continue // already canonical
+		}
+		// Atomic: retire the legacy live row, then upsert the canonical row in its place. The
+		// tombstone runs first so the partial UNIQUE never sees two live rows for the triple. Both
+		// SQL consts are inline so the CI shape guard resolves the replicated statements.
+		if bErr := c.ExecuteBatch(ctx, []Statement{
+			{SQL: registryTombstoneByTripleSQL, Params: []interface{}{nowRFC3339(), c.NowTS(), scope, owner, registry}},
+			{SQL: registryCanonicalUpsertSQL, Params: []interface{}{detID, scope, owner, registry,
+				row.String("username"), row.String("secret"), row.String("created_at"), row.String("updated_at")}},
+		}); bErr != nil {
+			return migrated, bErr
+		}
+		migrated++
+	}
+	return migrated, nil
+}
+
+// RegistryConsolidationLocallyComplete reports whether NO legacy (non-canonical) LIVE registry
+// credential row remains locally — the LOCAL component of the H2 contract-readiness predicate. The
+// cross-node component (every admitted peer past the activation barrier, no legacy shape in any
+// mutation/relay log, AE convergence) is evaluated by the daemon-level contract orchestrator.
+func RegistryConsolidationLocallyComplete(ctx context.Context, c *Client) (bool, error) {
+	live, err := c.Query(ctx,
+		`SELECT id, scope, owner, registry FROM registry_credentials WHERE deleted_at IS NULL`)
+	if err != nil {
+		return false, err
+	}
+	for _, row := range live {
+		if row.String("id") != RegistryCredentialID(row.String("scope"), row.String("owner"), row.String("registry")) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // UpsertRegistryCredentialAuto selects the canonical (deterministic-id) writer when the H2

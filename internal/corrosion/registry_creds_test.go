@@ -153,7 +153,7 @@ func TestUpsertRegistryCredentialAuto_Gating(t *testing.T) {
 func TestRegistryCredentialCanonical_ConcurrentConverges(t *testing.T) {
 	ctx := context.Background()
 	c := mustTestClient(t)
-	c.SetCanonicalRegistry(func() bool { return true })
+	c.SetCanonicalRegistryLatched(func() bool { return true })
 
 	// This node's own login (older).
 	rc := RegistryCredential{Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "local"}
@@ -239,9 +239,9 @@ func fullRegistryRow(t *testing.T, c *Client, id string) string {
 func TestRegistryCanonical_TwoClientConverges(t *testing.T) {
 	id := RegistryCredentialID("user", "alice", "ghcr.io")
 	a := mustTestClient(t)
-	a.SetCanonicalRegistry(func() bool { return true })
+	a.SetCanonicalRegistryLatched(func() bool { return true })
 	b := mustTestClient(t)
-	b.SetCanonicalRegistry(func() bool { return true })
+	b.SetCanonicalRegistryLatched(func() bool { return true })
 
 	stmtA := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sa", "2020-01-01T00:00:00Z", "1000000000000-0000-a")
 	stmtB := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sb", "2020-06-01T00:00:00Z", "2000000000000-0000-b") // newer
@@ -290,12 +290,93 @@ func TestRegistryCanonical_RejectedBeforeActivation(t *testing.T) {
 // — it can't insert a noncanonical row or (via ON CONFLICT) hijack an unrelated credential's row.
 func TestRegistryCanonical_MismatchedIDRejected(t *testing.T) {
 	c := mustTestClient(t)
-	c.SetCanonicalRegistry(func() bool { return true })
+	c.SetCanonicalRegistryLatched(func() bool { return true })
 	s := canonicalUpsertStmt("00000000-0000-8000-8000-000000000000", "user", "alice", "ghcr.io", "alice", "s", "2020-01-01T00:00:00Z", "1000000000000-0000-a")
 	if err := applyRegistryWAL(t, c, s); err == nil {
 		t.Fatal("a canonical upsert whose id != RegistryCredentialID(triple) must be rejected")
 	}
 	if rows, _ := c.Query(context.Background(), "SELECT id FROM registry_credentials"); len(rows) != 0 {
 		t.Fatalf("a mismatched-id upsert must apply nothing, got %d rows", len(rows))
+	}
+}
+
+// TestConsolidateRegistryCredentials_MigratesLegacyLive: a legacy random-id live credential is
+// rewritten to its canonical deterministic-id row (content + created_at preserved), the legacy row
+// is tombstoned, and a second run is a no-op (idempotent).
+func TestConsolidateRegistryCredentials_MigratesLegacyLive(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	// Two legacy logins ⇒ a tombstone (rand-1) + a live row (rand-2).
+	if err := UpsertRegistryCredential(ctx, c, RegistryCredential{ID: "rand-1", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s1"}); err != nil {
+		t.Fatalf("seed 1: %v", err)
+	}
+	if err := UpsertRegistryCredential(ctx, c, RegistryCredential{ID: "rand-2", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s2"}); err != nil {
+		t.Fatalf("seed 2: %v", err)
+	}
+	detID := RegistryCredentialID("user", "alice", "ghcr.io")
+	// capture the legacy live row's created_at to assert preservation.
+	pre, _ := c.Query(ctx, "SELECT created_at FROM registry_credentials WHERE id = 'rand-2'")
+	legacyCreated := pre[0].String("created_at")
+
+	if !mustNotComplete(t, c) { // not canonical yet
+		t.Fatal("precondition: should be locally incomplete before consolidation")
+	}
+
+	migrated, err := ConsolidateRegistryCredentials(ctx, c)
+	if err != nil || migrated != 1 {
+		t.Fatalf("consolidate: migrated=%d err=%v (want 1/nil)", migrated, err)
+	}
+	live := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
+	if len(live) != 1 || live[0].String("id") != detID || live[0].String("secret") != "s2" {
+		t.Fatalf("want one canonical live row secret=s2, got %v", live)
+	}
+	// created_at preserved from the legacy live row.
+	got, _ := c.Query(ctx, "SELECT created_at FROM registry_credentials WHERE id = ?", detID)
+	if got[0].String("created_at") != legacyCreated {
+		t.Errorf("created_at not preserved: got %q want %q", got[0].String("created_at"), legacyCreated)
+	}
+	// legacy live row is tombstoned.
+	if gone, _ := c.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-2' AND deleted_at IS NULL"); len(gone) != 0 {
+		t.Error("legacy live row must be tombstoned")
+	}
+	// idempotent + now locally complete.
+	if m2, _ := ConsolidateRegistryCredentials(ctx, c); m2 != 0 {
+		t.Errorf("second run must be a no-op, migrated=%d", m2)
+	}
+	if complete, _ := RegistryConsolidationLocallyComplete(ctx, c); !complete {
+		t.Error("must be locally complete after consolidation")
+	}
+}
+
+func mustNotComplete(t *testing.T, c *Client) bool {
+	t.Helper()
+	complete, err := RegistryConsolidationLocallyComplete(context.Background(), c)
+	if err != nil {
+		t.Fatalf("completeness: %v", err)
+	}
+	return !complete
+}
+
+// TestRegistryCanonical_EqualTSKeepsLocal: an equal-timestamp / different-content canonical
+// conflict (two nodes wrote the same triple at the same HLC) is NOT silently overwritten — the
+// exact-tie apply keeps local, so the divergence is surfaced (by anti-entropy's content resolver)
+// rather than one write clobbering the other. This is where the equal-ts fault the local
+// consolidation cannot see is fail-closed.
+func TestRegistryCanonical_EqualTSKeepsLocal(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalRegistryLatched(func() bool { return true })
+	id := RegistryCredentialID("user", "alice", "ghcr.io")
+	const tie = "5000000000000-0000-tie"
+
+	if err := applyRegistryWAL(t, c, canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sa", "2020-01-01T00:00:00Z", tie)); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	// A conflicting write at the SAME updated_at with different content — must keep local.
+	if err := applyRegistryWAL(t, c, canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sb", "2020-01-01T00:00:00Z", tie)); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
+	if len(rows) != 1 || rows[0].String("secret") != "sa" {
+		t.Fatalf("an equal-timestamp conflict must keep local (sa), not overwrite: got %v", rows)
 	}
 }

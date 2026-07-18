@@ -110,6 +110,11 @@ type Server struct {
 	// identity resolution mutates shared state, so it requires config uniformity, not
 	// just a uniform build.
 	enfCanonicalIdentity bool
+	// enfCanonicalRegistry is this node's kill-switch for the canonical registry-credential model
+	// (Part H2); gated by this flag AND the CanonicalRegistryV1 latch. Advertised CONDITIONALLY on
+	// this flag (like operation_protocol) so the latch — which enables accepting canonical writes,
+	// mutating shared state — requires config uniformity, not just a uniform build.
+	enfCanonicalRegistry bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -384,6 +389,9 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfCanonicalIdentity {
 		caps = withoutCapability(caps, capabilities.CanonicalIdentityV1)
 	}
+	if !s.enfCanonicalRegistry {
+		caps = withoutCapability(caps, capabilities.CanonicalRegistryV1)
+	}
 	return caps
 }
 
@@ -467,6 +475,11 @@ func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
 // CanonicalIdentityV1 cluster-wide latch; advertisement is withheld while it is off.
 func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity = on }
 
+// SetCanonicalRegistryEnforce sets this node's kill-switch for the canonical registry-credential
+// model (enforcement.canonical_registry). Advertisement is withheld while it is off, so the latch
+// (and thus acceptance of canonical writes) can't happen until every node has opted in.
+func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry = on }
+
 // liveResizeActive reports whether this node may originate live-resize behavior
 // (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
 // old peer can't have max_cpu dropped from a spec it later rewrites.
@@ -508,6 +521,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfLiveResize
 	case capabilities.CanonicalIdentityV1:
 		return s.enfCanonicalIdentity
+	case capabilities.CanonicalRegistryV1:
+		return s.enfCanonicalRegistry
 	default:
 		return false
 	}

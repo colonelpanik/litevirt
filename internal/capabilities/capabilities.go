@@ -171,10 +171,11 @@ const (
 	// deterministic-id row per (scope,owner,registry) written by a single PK-keyed upsert, instead
 	// of the legacy mint-new-id tombstone+insert whose concurrent logins collide on the partial
 	// UNIQUE index. Its activation is a COORDINATED online contract (expand → converge → contract),
-	// not just a latch: the canonical writer is enabled only once legacy random-id rows are
-	// consolidated to their deterministic ids (WAL-drain / fencing gate), so the two writers never
-	// produce two live rows for one triple. NOT YET advertised (in `all`, not `supported`) — the
-	// convergence predicate + contract are subsequent increments.
+	// not just a latch: latching only ACCEPTS replicated canonical writes (so the one-time
+	// legacy-row consolidation may run); the canonical WRITER is enabled — and the index contracted
+	// — only once legacy rows are consolidated to their deterministic ids, so the two writers never
+	// produce two live rows for one triple. Advertised CONDITIONALLY on enforcement.canonical_registry
+	// (like operation_protocol) so the latch requires config uniformity, not just a uniform build.
 	CanonicalRegistryV1 = "canonical_registry_v1"
 )
 
@@ -261,6 +262,7 @@ var supported = []string{
 	OperationProtocolV1,
 	LiveResizeV1,
 	CanonicalIdentityV1,
+	CanonicalRegistryV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless

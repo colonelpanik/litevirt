@@ -428,6 +428,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalIdentity(func() bool {
 		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
 	})
+	// Accept replicated canonical registry-credential writes once enforcement.canonical_registry is
+	// set AND the token has latched cluster-wide (Part H2). This is the ACCEPT gate only — it lets
+	// the one-time legacy-row consolidation's canonical writes land on every node; switching the
+	// WRITER (SetCanonicalRegistry) is gated further on convergence by the migration controller.
+	d.db.SetCanonicalRegistryLatched(func() bool {
+		return d.cfg.Enforcement.CanonicalRegistry && d.checker.Latched(capabilities.CanonicalRegistryV1)
+	})
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
@@ -614,6 +621,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
+	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2: drives the latch + conditional advertisement
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())

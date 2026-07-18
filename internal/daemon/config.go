@@ -340,6 +340,14 @@ type EnforcementConfig struct {
 	// cluster-wide (identity resolution mutates shared state, so it must be fleet-uniform, not
 	// pairwise). Default false; reversible kill switch.
 	CanonicalIdentity bool `yaml:"canonical_identity,omitempty"`
+	// CanonicalRegistry: adopt the canonical registry-credential model — one stable
+	// deterministic-id row per (scope,owner,registry) instead of the legacy mint-new-id
+	// tombstone+insert whose concurrent logins collide on the partial UNIQUE
+	// (capabilities.CanonicalRegistryV1). Setting this advertises the token so the cluster can
+	// latch it; once latched, replicated canonical writes are ACCEPTED and the one-time
+	// legacy-row consolidation may run. Switching the writer + contracting the index is gated
+	// further on convergence (the migration controller). Default false; reversible kill switch.
+	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

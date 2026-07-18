@@ -187,6 +187,15 @@ enforcement:
                               # activates only when the flag is set AND the token has latched
                               # fleet-wide. Enable fleet-uniformly; the flag is the reversible kill
                               # switch.
+  canonical_registry: false   # adopt the canonical registry-credential model — one stable
+                              # deterministic-id row per (scope,owner,registry) instead of the
+                              # legacy mint-new-id tombstone+insert whose concurrent logins collide
+                              # on the partial UNIQUE. Setting this advertises the token so the
+                              # cluster can latch it; once latched, replicated canonical writes are
+                              # ACCEPTED (so the one-time legacy-row consolidation can run). Switching
+                              # the writer + contracting the index is gated further on convergence.
+                              # Advertised only while this flag is on (like operation_protocol);
+                              # enable fleet-uniformly. Reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

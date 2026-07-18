@@ -40,10 +40,16 @@ func TestWAL_ActionProofMonotone(t *testing.T) {
 	if err := r.applyStatementLWW(ctx, tx, ins, newer); err != nil {
 		t.Fatalf("apply insert: %v", err)
 	}
+	// The REAL, ledger-registered in_progress transition (ClaimActionProof).
 	upd := Statement{
-		SQL: `UPDATE runtime_action_proofs SET status='in_progress', updated_at=? ` +
-			`WHERE id=? AND deleted_at IS NULL AND status IN ('prepared','in_progress')`,
-		Params: []interface{}{newer, "p1"},
+		SQL: `UPDATE runtime_action_proofs
+		    SET status = 'in_progress',
+		        executor_host = ?,
+		        started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+		        updated_at = ?
+		  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')
+		    AND (executor_host = '' OR executor_host = ?)`,
+		Params: []interface{}{"h", newer, newer, "p1", "h"},
 	}
 	if err := r.applyStatementLWW(ctx, tx, upd, newer); err != nil {
 		t.Fatalf("apply update: %v", err)
@@ -212,10 +218,11 @@ func TestWAL_ActionProofForwardConverges(t *testing.T) {
 
 	const t1 = "2027-01-01T00:00:00Z"
 	tx, _ := c.db.Begin()
+	// The REAL, ledger-registered guarded completed transition.
 	upd := Statement{
-		SQL: `UPDATE runtime_action_proofs SET status='completed', completed_at=?, updated_at=? ` +
-			`WHERE id=? AND deleted_at IS NULL AND status IN ('prepared','in_progress')`,
-		Params: []interface{}{t1, t1, "p1"},
+		SQL: `UPDATE runtime_action_proofs SET status = 'completed', executor_host = ?, completed_at = ?, updated_at = ?
+		  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')`,
+		Params: []interface{}{"h", t1, t1, "p1"},
 	}
 	if err := r.applyStatementLWW(ctx, tx, upd, t1); err != nil {
 		t.Fatalf("apply: %v", err)

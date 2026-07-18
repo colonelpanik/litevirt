@@ -1062,27 +1062,12 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	}
 	entry, ok := LedgerLookup(stmtFingerprint(sh))
 	if !ok {
-		// Not a CURRENT builder shape: in a mixed-version cluster this is a shape emitted by
-		// an older (or newer) binary, whose exact fingerprint isn't in this build's ledger.
-		// Rejecting it outright would back-pressure every cross-version write during a rolling
-		// upgrade — including the column-subset INSERTs the preservation fix targets. Instead
-		// DERIVE its disposition from the structure with the SAME function that generated the
-		// ledger, so a valid historical shape is applied by its safe disposition. An
-		// unclassifiable shape (deriveDisposition errors) is still rejected. Two dispositions
-		// are NEVER honored on a derived (unregistered) shape, so they can't be smuggled in:
-		// a hard DELETE (retention templates must be explicitly registered) and an
-		// unsupported bulk update.
-		disp, cat, derr := deriveDisposition(sh)
-		if derr != nil {
-			return derr
-		}
-		if disp == DispDeleteRetention {
-			return invalidf("unregistered DELETE on %s (retention templates must be registered)", tableName)
-		}
-		if disp == DispBulkUpdate && cat != CatPerRowLWW {
-			return invalidf("unregistered unsupported bulk update on %s", tableName)
-		}
-		entry = LedgerEntry{Disposition: disp, Category: cat}
+		// Fail closed: the fingerprint is absent from BOTH this build's ledger and the
+		// checked-in historical ledger (prior-release shapes still in the supported horizon).
+		// There is NO runtime derivation — checked-in ledger membership IS the authorization
+		// decision, so an unknown shape always back-pressures. A genuinely-new shape must be
+		// added to the ledger (with an explicit compatibility decision) before it can apply.
+		return invalidf("unregistered replicated statement shape (table %s, kind %s)", tableName, sh.Kind)
 	}
 
 	switch entry.Disposition {

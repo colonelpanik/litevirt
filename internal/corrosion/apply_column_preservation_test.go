@@ -447,47 +447,23 @@ func assertNotSeen(t *testing.T, c *Client, origin string) {
 	}
 }
 
-// TestApplyRemoteMutations_INSERTPreservesReceiverOnlyColumns covers the WAL per-statement
-// replay path.
-func TestApplyRemoteMutations_INSERTPreservesReceiverOnlyColumns(t *testing.T) {
+// TestApplyRemoteMutations_UnregisteredSubsetRejected: on the WAL path a column-subset INSERT
+// (a shape no builder emits, so absent from the ledger) must back-pressure — the fail-closed
+// boundary. INSERT column-preservation for a genuinely-registered shape is covered by the AE
+// merge test (TestMergeLWW_PreservesReceiverOnlyColumns) and the upsert-builder unit test
+// (TestInsertUpsertRewrite), which don't depend on ledger membership.
+func TestApplyRemoteMutations_UnregisteredSubsetRejected(t *testing.T) {
 	c := mustTestClient(t)
 	ctx := context.Background()
-
-	if err := c.Execute(ctx,
-		`INSERT INTO hosts (name, address, ssh_user, ssh_port, cert_serial, role, ipmi_address, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		"h1", "10.0.0.1", "operator", 2222, "serialX", "witness", "10.0.0.99",
-		"2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
 	r := NewReplicator(c, "", RelayConfig{})
-	ts := hlc.NewClock("origin-node").Now().String() // current time ≫ seeded HLC
+	ts := hlc.NewClock("origin-node").Now().String()
 
-	// An older sender emits a plain INSERT listing only the columns it knows — omitting
-	// role, ipmi_address, ssh_port. Newer updated_at wins LWW on address.
 	stmts := fmt.Sprintf(
 		`[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)","Params":["h1","10.9.9.9","operator","serialX","2020-01-01T00:00:00Z","%s"]}]`, ts)
 	entries := []*pb.MutationEntry{{Seq: 1, Hlc: ts, Origin: "origin-node", Stmts: stmts}}
 
-	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
-		t.Fatalf("apply: %v", err)
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err == nil {
+		t.Fatal("expected back-pressure for an unregistered column-subset shape")
 	}
-
-	rows, err := c.Query(ctx, "SELECT address, role, ipmi_address, ssh_port FROM hosts WHERE name = ?", "h1")
-	if err != nil || len(rows) == 0 {
-		t.Fatalf("query: err=%v rows=%d", err, len(rows))
-	}
-	if got := rows[0].String("address"); got != "10.9.9.9" {
-		t.Errorf("address = %q, want 10.9.9.9 (newer incoming must win)", got)
-	}
-	if got := rows[0].String("role"); got != "witness" {
-		t.Errorf("role = %q, want witness (receiver-only column erased by whole-row replace)", got)
-	}
-	if got := rows[0].String("ipmi_address"); got != "10.0.0.99" {
-		t.Errorf("ipmi_address = %q, want 10.0.0.99 (receiver-only column erased)", got)
-	}
-	if got := rows[0].Int("ssh_port"); got != 2222 {
-		t.Errorf("ssh_port = %d, want 2222 (receiver-only column erased)", got)
-	}
+	assertNotSeen(t, c, "origin-node")
 }

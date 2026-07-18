@@ -203,25 +203,18 @@ func TestApplyRemoteMutations_UnregisteredDeleteRejected(t *testing.T) {
 	assertNotSeen(t, c, "origin-node")
 }
 
-// TestApplyRemoteMutations_DerivesUnregisteredInsert: a column-subset INSERT (an older
-// sender's shape, absent from this build's ledger) is applied by its derived disposition
-// rather than back-pressured — the mixed-version horizon. (Column preservation itself is
-// covered elsewhere; here we assert the derive path applies at all.)
-func TestApplyRemoteMutations_DerivesUnregisteredInsert(t *testing.T) {
+// TestApplyRemoteMutations_UnregisteredInsertRejected: an INSERT whose fingerprint is in
+// NEITHER the current nor the historical ledger back-pressures — there is no runtime
+// derivation fallback, so an unknown shape is never authorized.
+func TestApplyRemoteMutations_UnregisteredInsertRejected(t *testing.T) {
 	c := mustTestClient(t)
 	ctx := context.Background()
 	r := NewReplicator(c, "", RelayConfig{})
-	// A minimal hosts INSERT — not a shape any current builder emits verbatim.
+	// A minimal hosts INSERT — not a shape any current or historical builder emits.
 	stmts := `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)","Params":["h9","10.0.0.9","root","s9","2020-01-01T00:00:00Z","2000000000000-0000-n2"]}]`
 	entries := []*pb.MutationEntry{{Seq: 1, Hlc: "2000000000000-0000-n2", Origin: "origin-node", Stmts: stmts}}
-	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
-		t.Fatalf("derived-disposition apply must succeed, got: %v", err)
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err == nil {
+		t.Fatal("expected back-pressure for an unregistered INSERT shape")
 	}
-	rows, err := c.Query(ctx, "SELECT address FROM hosts WHERE name = ?", "h9")
-	if err != nil || len(rows) == 0 {
-		t.Fatalf("row not inserted: err=%v rows=%d", err, len(rows))
-	}
-	if got := rows[0].String("address"); got != "10.0.0.9" {
-		t.Errorf("address = %q, want 10.0.0.9", got)
-	}
+	assertNotSeen(t, c, "origin-node")
 }

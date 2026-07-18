@@ -142,10 +142,11 @@ func TestWAL_ZeroRowUpdateKeepsUnresolved(t *testing.T) {
 	}
 	defer tx.Rollback()
 
-	// Newer timestamp (so LWW would apply) but the guard matches 0 rows (vm1 live).
+	// A registered vms UpdateObservedActuals CAS shape with a newer timestamp (so LWW would
+	// apply) but a wrong vm_owner_epoch guard, so it matches 0 rows (CAS miss on a live vm1).
 	s := Statement{
-		SQL:    `UPDATE vms SET state = 'x', updated_at = ? WHERE name = ? AND deleted_at IS NOT NULL`,
-		Params: []interface{}{newTs, "vm1"},
+		SQL:    `UPDATE vms SET cpu_actual = ?, mem_actual = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		Params: []interface{}{4, 8, newTs, "vm1", 999},
 	}
 	if err := r.applyStatementLWW(ctx, tx, s, newTs); err != nil {
 		t.Fatalf("applyStatementLWW: %v", err)

@@ -1,7 +1,5 @@
 package corrosion
 
-import "strings"
-
 // appendOnlyTables are immutable append-only tables: a replicated INSERT is applied with
 // INSERT OR IGNORE and never LWW-gated, because a row never changes after creation.
 var appendOnlyTables = map[string]bool{
@@ -66,19 +64,13 @@ func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 }
 
 // bulkUpdateIsPerRowLWWSafe reports whether a bulk (non-full-PK) UPDATE can be applied by
-// per-row LWW expansion: it must assign updated_at (the incoming clock each row is gated by)
-// and must not assign any primary-key column (a PK rekey can't be gated by that PK).
+// per-row LWW expansion: it must assign updated_at (the incoming clock each matched row is
+// gated by). A rekey of a primary-key column is still safe — the expansion enumerates by the
+// original predicate and applies each row scoped to its FULL prior PK, so it becomes a
+// row-scoped rekey that simply back-pressures (fails closed) if the new key collides with an
+// existing row.
 func bulkUpdateIsPerRowLWWSafe(sh StmtShape) bool {
-	if sh.UpdatedAtParamIdx < 0 {
-		return false // no bound incoming clock ⇒ can't LWW-gate the expansion
-	}
-	pkSet := lowerStringSet(tablePrimaryKeys[sh.Table])
-	for _, a := range sh.SetAssigns {
-		if pkSet[strings.ToLower(a.Column)] {
-			return false // modifies a PK column ⇒ identity rekey, not per-row-LWW-safe
-		}
-	}
-	return true
+	return sh.UpdatedAtParamIdx >= 0
 }
 
 // LedgerEntryFor derives the compatibility-ledger entry for one replicated builder statement.

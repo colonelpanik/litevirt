@@ -54,11 +54,23 @@ type LedgerEntry struct {
 	DispositionAfter     Disposition // disposition once RequiresCapability is active ("" = same)
 	TransformerID        string      // optional entry-level legacy transformer (Part H)
 	RemovalHorizon       string      // release/version after which this entry may be removed
+
+	// Provenance for the mixed-version horizon (Part B). FirstEmitter/LastEmitter are the
+	// earliest/latest supported releases that emit this shape ("" LastEmitter ⇒ still emitted
+	// by the current build). The CI guard forbids deleting an entry whose emitter is still a
+	// supported peer. Empty on current-build entries (the guard proves those against source).
+	FirstEmitter, LastEmitter string
 }
 
-// LedgerLookup returns the entry for a fingerprint, if registered.
+// LedgerLookup returns the entry for a fingerprint, if registered — in the current-build
+// ledger or the checked-in historical ledger (prior-release shapes still in the supported
+// upgrade/WAL-retention horizon). A fingerprint absent from BOTH is an unknown shape and the
+// apply path back-pressures it; there is no runtime derivation fallback.
 func LedgerLookup(fp string) (LedgerEntry, bool) {
-	e, ok := stmtLedger[fp]
+	if e, ok := stmtLedger[fp]; ok {
+		return e, true
+	}
+	e, ok := historicalLedger[fp]
 	return e, ok
 }
 

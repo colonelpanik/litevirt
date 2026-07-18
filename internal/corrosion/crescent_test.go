@@ -202,7 +202,7 @@ func TestDedup_MutationSeen(t *testing.T) {
 		Seq:    1,
 		Hlc:    ts.String(),
 		Origin: "origin-node",
-		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["h1","10.0.0.1","root","serial1","active","2025-01-01T00:00:00Z","` + ts.String() + `"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["h1","10.0.0.1","root",22,7443,"active","serial1",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + ts.String() + `"]}]`,
 	}}
 
 	// First apply should succeed.
@@ -252,13 +252,13 @@ func TestApplyRemoteMutations_AdvancesPastTrailingDuplicates(t *testing.T) {
 			Seq:    1,
 			Hlc:    tsNew,
 			Origin: "origin-node",
-			Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["dedup-new","10.0.0.1","root","serial1","active","2025-01-01T00:00:00Z","` + tsNew + `"]}]`,
+			Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["dedup-new","10.0.0.1","root",22,7443,"active","serial1",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + tsNew + `"]}]`,
 		},
 		{
 			Seq:    2,
 			Hlc:    tsSeen,
 			Origin: "origin-node",
-			Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["dedup-seen","10.0.0.2","root","serial2","active","2025-01-01T00:00:00Z","` + tsSeen + `"]}]`,
+			Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["dedup-seen","10.0.0.2","root",22,7443,"active","serial2",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + tsSeen + `"]}]`,
 		},
 	}
 
@@ -299,7 +299,7 @@ func TestRelay_ForwardsMutations(t *testing.T) {
 		Seq:    1,
 		Hlc:    ts.String(),
 		Origin: "remote-node",
-		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["h2","10.0.0.2","root","serial2","active","2025-01-01T00:00:00Z","` + ts.String() + `"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["h2","10.0.0.2","root",22,7443,"active","serial2",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + ts.String() + `"]}]`,
 	}}
 
 	_, err := r.ApplyRemoteMutations(ctx, entries)
@@ -338,7 +338,7 @@ func TestLeaf_DoesNotRecordInLog(t *testing.T) {
 		Seq:    1,
 		Hlc:    ts.String(),
 		Origin: "remote-node",
-		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["h3","10.0.0.3","root","serial3","active","2025-01-01T00:00:00Z","` + ts.String() + `"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["h3","10.0.0.3","root",22,7443,"active","serial3",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + ts.String() + `"]}]`,
 	}}
 
 	_, err := r.ApplyRemoteMutations(ctx, entries)
@@ -381,7 +381,7 @@ func TestNoEchoBack(t *testing.T) {
 		Seq:    1,
 		Hlc:    ts.String(),
 		Origin: "peer-x",
-		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["h4","10.0.0.4","root","serial4","active","2025-01-01T00:00:00Z","` + ts.String() + `"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["h4","10.0.0.4","root",22,7443,"active","serial4",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + ts.String() + `"]}]`,
 	}}
 
 	_, err := r.ApplyRemoteMutations(ctx, entries)
@@ -429,7 +429,7 @@ func TestLWW_ConcurrentWrites(t *testing.T) {
 		Seq:    1,
 		Hlc:    tsA.String(),
 		Origin: "node-a",
-		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["conflict-host","10.0.0.1","root","serialA","active","2025-01-01T00:00:00Z","` + tsA.String() + `"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["conflict-host","10.0.0.1","root",22,7443,"active","serialA",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + tsA.String() + `"]}]`,
 	}}
 	if _, err := r.ApplyRemoteMutations(ctx, entriesA); err != nil {
 		t.Fatalf("apply A: %v", err)
@@ -440,7 +440,7 @@ func TestLWW_ConcurrentWrites(t *testing.T) {
 		Seq:    2,
 		Hlc:    tsB.String(),
 		Origin: "node-b",
-		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["conflict-host","10.0.0.2","root","serialB","active","2025-01-01T00:00:00Z","` + tsB.String() + `"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["conflict-host","10.0.0.2","root",22,7443,"active","serialB",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + tsB.String() + `"]}]`,
 	}}
 	if _, err := r.ApplyRemoteMutations(ctx, entriesB); err != nil {
 		t.Fatalf("apply B: %v", err)
@@ -468,7 +468,7 @@ func TestLWW_ConcurrentWrites(t *testing.T) {
 		Seq:    3,
 		Hlc:    tsOld.String(),
 		Origin: "node-c",
-		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["conflict-host","10.0.0.3","root","serialC","active","2025-01-01T00:00:00Z","` + tsOld.String() + `"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["conflict-host","10.0.0.3","root",22,7443,"active","serialC",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + tsOld.String() + `"]}]`,
 	}}
 	if _, err := r.ApplyRemoteMutations(ctx, entriesOld); err != nil {
 		t.Fatalf("apply old: %v", err)
@@ -504,7 +504,7 @@ func TestLWW_PrimaryReplicationUsesStatementUpdatedAt(t *testing.T) {
 		Seq:    1,
 		Hlc:    incomingMutationHLC,
 		Origin: "remote-node",
-		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["rfc-conflict","10.0.0.2","root","serial-remote","active","` + incomingRowTS + `","` + incomingRowTS + `"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["rfc-conflict","10.0.0.2","root",22,7443,"active","serial-remote",0,0,0,"best-effort","","worker","` + incomingRowTS + `","` + incomingRowTS + `"]}]`,
 	}}
 	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
 		t.Fatalf("apply older row with newer mutation HLC: %v", err)
@@ -681,7 +681,7 @@ func TestRoleTransition(t *testing.T) {
 	ts1 := clock.Now()
 	entries1 := []*pb.MutationEntry{{
 		Seq: 1, Hlc: ts1.String(), Origin: "remote",
-		Stmts: `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["rt-1","10.0.0.1","root","s1","active","2025-01-01T00:00:00Z","` + ts1.String() + `"]}]`,
+		Stmts: `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["rt-1","10.0.0.1","root",22,7443,"active","s1",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + ts1.String() + `"]}]`,
 	}}
 	if _, err := r.ApplyRemoteMutations(ctx, entries1); err != nil {
 		t.Fatalf("apply as relay: %v", err)
@@ -705,7 +705,7 @@ func TestRoleTransition(t *testing.T) {
 	ts2 := clock.Now()
 	entries2 := []*pb.MutationEntry{{
 		Seq: 2, Hlc: ts2.String(), Origin: "remote",
-		Stmts: `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["rt-2","10.0.0.2","root","s2","active","2025-01-01T00:00:00Z","` + ts2.String() + `"]}]`,
+		Stmts: `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["rt-2","10.0.0.2","root",22,7443,"active","s2",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","` + ts2.String() + `"]}]`,
 	}}
 	if _, err := r.ApplyRemoteMutations(ctx, entries2); err != nil {
 		t.Fatalf("apply as leaf: %v", err)
@@ -740,7 +740,7 @@ func TestNoMutationLoops(t *testing.T) {
 		ts := clock.Now()
 		entries := []*pb.MutationEntry{{
 			Seq: int64(i), Hlc: ts.String(), Origin: "leaf-1",
-			Stmts: fmt.Sprintf(`[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["loop-%d","10.0.0.%d","root","s%d","active","2025-01-01T00:00:00Z","%s"]}]`, i, i, i, ts.String()),
+			Stmts: fmt.Sprintf(`[{"SQL":"INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial, cpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)","Params":["loop-%d","10.0.0.%d","root",22,7443,"active","s%d",0,0,0,"best-effort","","worker","2025-01-01T00:00:00Z","%s"]}]`, i, i, i, ts.String()),
 		}}
 		if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
 			t.Fatalf("apply %d: %v", i, err)

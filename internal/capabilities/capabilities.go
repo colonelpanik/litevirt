@@ -245,6 +245,7 @@ var supported = []string{
 	RBACRealmV1,
 	OperationProtocolV1,
 	LiveResizeV1,
+	CanonicalIdentityV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless

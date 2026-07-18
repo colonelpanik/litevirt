@@ -332,6 +332,14 @@ type EnforcementConfig struct {
 	// compare v2 only when both emitted it — so a non-uniform rollout is safe. Default
 	// false; reversible kill switch.
 	DigestV2 bool `yaml:"digest_v2,omitempty"`
+	// CanonicalIdentity: resolve the natural-key identity tables (snapshots,
+	// container_snapshots) by their UNIQUE natural key instead of the minted random id
+	// (capabilities.CanonicalIdentityV1), so two nodes' independently-minted ids for one
+	// logical object collapse to a single deterministic winner instead of back-pressuring on
+	// the secondary UNIQUE. Enabled only when this flag is set AND the token has latched
+	// cluster-wide (identity resolution mutates shared state, so it must be fleet-uniform, not
+	// pairwise). Default false; reversible kill switch.
+	CanonicalIdentity bool `yaml:"canonical_identity,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

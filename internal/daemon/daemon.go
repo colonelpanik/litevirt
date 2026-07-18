@@ -419,6 +419,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// v2 only when locally enabled; two peers compare v2 only when both emitted it), so a
 	// non-uniform rollout only affects which node initiates a pull, never a decision.
 	d.db.SetDigestV2Enabled(func() bool { return d.cfg.Enforcement.DigestV2 })
+	// Resolve the natural-key identity tables (snapshots, container_snapshots) by their UNIQUE
+	// natural key once enforcement.canonical_identity is set AND the token has latched
+	// cluster-wide. Unlike digest_v2 this is NOT pairwise-negotiated — identity resolution
+	// mutates shared state, so a per-sender flip would be non-convergent; it must be
+	// fleet-uniform, which the cluster-wide latch guarantees. Cheap Latched read (no peer dial)
+	// on the merge/apply hot path; the config flag is the reversible kill switch.
+	d.db.SetCanonicalIdentity(func() bool {
+		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
+	})
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).

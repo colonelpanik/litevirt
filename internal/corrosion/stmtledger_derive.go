@@ -1,5 +1,7 @@
 package corrosion
 
+import "strings"
+
 // appendOnlyTables are immutable append-only tables: a replicated INSERT is applied with
 // INSERT OR IGNORE and never LWW-gated, because a row never changes after creation.
 var appendOnlyTables = map[string]bool{
@@ -39,10 +41,14 @@ func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 		if sh.HasFullPKIdentity {
 			return DispFullPKUpdate, CatNone, nil
 		}
-		// A bulk UPDATE (no full-PK identity) can't be per-row LWW-gated from its shape
-		// alone; it needs an explicitly-annotated concurrency category. None remain in the
-		// tree (the bulk cascades were rewritten row-scoped), so classify it unsupported and
-		// let the guard surface any regression.
+		// A bulk UPDATE (no full-PK identity) is applied by per-row LWW expansion — but only
+		// when that is provably safe: it must advance a clock (SET updated_at = ?) so each
+		// matched row can be LWW-gated, and it must NOT modify a primary-key column (rekeying
+		// a PK can't be gated by that PK; those cascades are row-scoped at the source). Any
+		// other bulk shape is unsupported and back-pressures.
+		if bulkUpdateIsPerRowLWWSafe(sh) {
+			return DispBulkUpdate, CatPerRowLWW, nil
+		}
 		return DispBulkUpdate, CatUnsupported, nil
 	case KindDelete:
 		// A DELETE reaches the ledger only when emitted by a known replicating builder, so
@@ -50,6 +56,22 @@ func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 		return DispDeleteRetention, CatNone, nil
 	}
 	return "", CatNone, invalidf("unclassifiable statement kind %s", sh.Kind)
+}
+
+// bulkUpdateIsPerRowLWWSafe reports whether a bulk (non-full-PK) UPDATE can be applied by
+// per-row LWW expansion: it must assign updated_at (the incoming clock each row is gated by)
+// and must not assign any primary-key column (a PK rekey can't be gated by that PK).
+func bulkUpdateIsPerRowLWWSafe(sh StmtShape) bool {
+	if sh.UpdatedAtParamIdx < 0 {
+		return false // no bound incoming clock ⇒ can't LWW-gate the expansion
+	}
+	pkSet := lowerStringSet(tablePrimaryKeys[sh.Table])
+	for _, a := range sh.SetAssigns {
+		if pkSet[strings.ToLower(a.Column)] {
+			return false // modifies a PK column ⇒ identity rekey, not per-row-LWW-safe
+		}
+	}
+	return true
 }
 
 // LedgerEntryFor derives the compatibility-ledger entry for one replicated builder statement.

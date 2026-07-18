@@ -150,6 +150,17 @@ const (
 	// StrictMTLSIdentityV1; advertised build-static (a flag-off peer is merely
 	// permissive — it just won't originate max_cpu).
 	LiveResizeV1 = "live_resize_v1"
+	// CanonicalIdentityV1 gates natural-key identity resolution for the tables that mint a
+	// random-UUID primary key but carry a UNIQUE natural key (snapshots (vm_name,name);
+	// container_snapshots (host_name,ct_name,name)). Two nodes can independently mint DIFFERENT
+	// ids for one logical object, whose replicated rows then collide on the secondary UNIQUE and
+	// back-pressure. Once this latches cluster-wide, an upgraded receiver ALWAYS resolves these
+	// tables by natural key (a deterministic winner over the natural-key group, collapsing to one
+	// id and rewriting references) — NOT pairwise-negotiated per sender, because identity
+	// resolution mutates shared state and a per-sender flip would be non-convergent. A node that
+	// hasn't latched keeps the old behavior (back-pressures the collision) and converges once the
+	// whole fleet has latched. Enforcement default-off + reversible until latched.
+	CanonicalIdentityV1 = "canonical_identity_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -239,7 +250,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

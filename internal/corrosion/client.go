@@ -177,6 +177,25 @@ type Client struct {
 	// so a node only emits v2 when locally enabled and comparison uses v2 only when both
 	// peers emitted it. Cheap in-memory read. Nil/false = v1-only emission (unchanged).
 	digestV2Enabled func() bool
+
+	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
+	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the
+	// minted random id. Gated on `enforcement.canonical_identity && CanonicalIdentityV1
+	// latched` (injected via SetCanonicalIdentity) — a CLUSTER latch, not pairwise, because
+	// identity resolution mutates shared state (a per-sender flip would be non-convergent).
+	// Nil/false = legacy behavior (a natural-key collision back-pressures). Read once per
+	// merge batch.
+	canonicalIdentity func() bool
+}
+
+// SetCanonicalIdentity injects the predicate that enables natural-key identity resolution.
+// Wired at daemon start to `enforcement.canonical_identity && checker.Latched(CanonicalIdentityV1)`.
+// Nil-safe: an unset predicate keeps legacy behavior (a natural-key collision back-pressures).
+func (c *Client) SetCanonicalIdentity(fn func() bool) { c.canonicalIdentity = fn }
+
+// canonicalIdentityOn reports whether natural-key identity resolution is currently enforced.
+func (c *Client) canonicalIdentityOn() bool {
+	return c.canonicalIdentity != nil && c.canonicalIdentity()
 }
 
 // SetHLCEmit injects the predicate that switches NowTS to HLC conflict keys. Wired at

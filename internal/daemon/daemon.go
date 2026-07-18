@@ -115,6 +115,12 @@ type Daemon struct {
 	// can invoke via exit() at any time — so this needs atomic access, not a
 	// plain field. Finding 7.
 	telemetryShutdown atomic.Pointer[func(context.Context) error]
+
+	// registryWriterActive is set by the Part H2 migration controller once this node's legacy
+	// registry-credential rows are consolidated to their deterministic ids (RegistryWriterReady) —
+	// gating the SWITCH of the credential writer to canonical. Read on the (rare) login write path;
+	// cleared if the capability de-latches or the config flag is turned off (reversible).
+	registryWriterActive atomic.Bool
 }
 
 // New creates a new daemon instance.
@@ -435,6 +441,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalRegistryLatched(func() bool {
 		return d.cfg.Enforcement.CanonicalRegistry && d.checker.Latched(capabilities.CanonicalRegistryV1)
 	})
+	// Switch the credential WRITER to canonical only once the accept gate is on AND this node has
+	// consolidated its legacy rows (registryWriterActive, set by runRegistryMigrationController).
+	// A login for a triple a lagging peer still holds as legacy-live back-pressures on that peer
+	// (fail-closed, self-heals when it consolidates) rather than producing two live rows.
+	d.db.SetCanonicalRegistry(func() bool {
+		return d.cfg.Enforcement.CanonicalRegistry && d.checker.Latched(capabilities.CanonicalRegistryV1) && d.registryWriterActive.Load()
+	})
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
@@ -512,6 +525,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
+
+	// Part H2 registry-credential migration controller: once canonical_registry_v1 is latched,
+	// idempotently consolidate legacy rows to their deterministic ids and activate the canonical
+	// writer once locally converged.
+	go d.runRegistryMigrationController(ctx)
 
 	// Daily prune of this host's vm_events rows so the operational event store
 	// stays bounded (see config vm_event_*).

@@ -389,31 +389,31 @@ func (c *Client) DumpSensitiveStateBytes() []byte {
 // production — so convergence relies on NTP); HLC only orders the mutation log +
 // dedup and is honored defensively when an updated_at value happens to be HLC.
 // It is the live anti-entropy merge path (AntiEntropy.checkPeer → fetchStateDump → here).
-func (c *Client) MergeStateBytesLWW(buf []byte) {
+func (c *Client) MergeStateBytesLWW(buf []byte) error {
 	if len(buf) == 0 {
-		return
+		return nil
 	}
 	payload, err := decompressPayload(buf)
 	if err != nil {
 		slog.Error("sync: decompress", "error", err)
-		return
+		return err
 	}
-	c.mergeStatePayloadLWW(payload)
+	return c.mergeStatePayloadLWW(payload)
 }
 
 // MergeSensitiveStateBytesLWW merges a peer-only sensitive state dump. It uses
 // the same LWW engine as the public merge but with a disjoint allowlist so a
 // sensitive dump cannot mutate public tables.
-func (c *Client) MergeSensitiveStateBytesLWW(buf []byte) {
+func (c *Client) MergeSensitiveStateBytesLWW(buf []byte) error {
 	if len(buf) == 0 {
-		return
+		return nil
 	}
 	payload, err := decompressPayload(buf)
 	if err != nil {
 		slog.Error("sync: decompress sensitive", "error", err)
-		return
+		return err
 	}
-	c.mergeStatePayloadLWWWithAllowlist(payload, sensitiveTableSet)
+	return c.mergeStatePayloadLWWWithAllowlist(payload, sensitiveTableSet)
 }
 
 // decompressPayload decompresses and unmarshals a gzipped sync payload.
@@ -442,20 +442,30 @@ func decompressPayload(buf []byte) (*syncPayload, error) {
 // the local schema before building any dynamic SQL, (2) batch-prefetches the
 // existing rows' updated_at keyed by primary key, and (3) keeps the local row
 // when localWinsLWW says so, otherwise INSERT OR REPLACEs the incoming row.
-func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
-	c.mergeStatePayloadLWWWithAllowlist(payload, replicatedTableSet)
+func (c *Client) mergeStatePayloadLWW(payload *syncPayload) error {
+	return c.mergeStatePayloadLWWWithAllowlist(payload, replicatedTableSet)
 }
 
-func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowedTables map[string]bool) {
+// mergeStatePayloadLWWWithAllowlist merges every table in the dump. A per-table operational
+// failure is returned (after the remaining tables are still attempted, so one bad table
+// doesn't strand the rest), so the caller can surface it; the merge stays non-destructive and
+// the next cycle re-converges. Validation skips (unknown table, malformed columns) are not
+// errors.
+func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowedTables map[string]bool) error {
 	start := time.Now()
 	merged, skipped := 0, 0
+	var firstErr error
 	for _, table := range payload.Tables {
-		m, s := c.mergeTable(table, allowedTables)
+		m, s, err := c.mergeTable(table, allowedTables)
 		merged += m
 		skipped += s
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	c.observeMerge(time.Since(start), merged, skipped)
 	slog.Info("sync: merged remote state (LWW)", "tables", len(payload.Tables), "merged", merged, "skipped", skipped)
+	return firstErr
 }
 
 // mergeApplyChunkRows bounds how many rows a single merge transaction applies
@@ -525,27 +535,29 @@ func hasDuplicateColumnsFold(cols []string) bool {
 // of chunks applied. That is safe by design: LWW is per-row idempotent, so the
 // next anti-entropy cycle re-converges from wherever it stopped. The lock release
 // is the whole point — a slow merge no longer convoys other writers behind it.
-func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (merged, skipped int) {
+func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (merged, skipped int, err error) {
 	// Defense-in-depth: table.Name and table.Columns come from a peer and are
-	// interpolated into SQL. Only touch known tables/columns.
+	// interpolated into SQL. Only touch known tables/columns. These validation skips are
+	// keep-local decisions on a malformed/unknown peer dump, not operational errors, so they
+	// return a nil error (the merge stays non-destructive and the next cycle re-converges).
 	if !allowedTables[table.Name] {
 		slog.Warn("sync: skipping unknown table in dump", "table", table.Name)
-		return 0, 0
+		return 0, 0, nil
 	}
 	localCols, ok := c.readTableColumns(table.Name)
 	if !ok {
-		return 0, 0
+		return 0, 0, nil
 	}
 	if len(table.Columns) == 0 || !columnsKnown(table.Columns, localCols) {
 		slog.Warn("sync: skipping dump table with unexpected columns", "table", table.Name)
-		return 0, 0
+		return 0, 0, nil
 	}
 	// buildMergeUpsertSQL and the PK/value indexing assume a unique column list; a malformed
 	// dump with a repeated column name would produce duplicate INSERT/SET targets and
 	// misaligned indices. Reject it (keep local) rather than build inconsistent SQL.
 	if hasDuplicateColumnsFold(table.Columns) {
 		slog.Warn("sync: skipping dump table with duplicate column names", "table", table.Name)
-		return 0, len(table.Rows)
+		return 0, len(table.Rows), nil
 	}
 
 	pkCols := tablePrimaryKeys[table.Name]
@@ -555,7 +567,7 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 	// inserting PK-less rows. Normal dumps always carry every column.
 	if len(pkCols) > 0 && len(pkIdx) != len(pkCols) {
 		slog.Warn("sync: skipping dump table missing primary-key column(s)", "table", table.Name)
-		return 0, 0
+		return 0, 0, nil
 	}
 	// A PK-less replicated table cannot be merged non-destructively — with no key to
 	// upsert on, a whole-row replace would be the only option, and that erases any
@@ -563,12 +575,12 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 	// replicated set lacks a PK today; this guards against one being added.
 	if len(pkCols) == 0 {
 		slog.Warn("sync: skipping dump table without a known primary key (keep local)", "table", table.Name)
-		return 0, len(table.Rows)
+		return 0, len(table.Rows), nil
 	}
 	updatedAtIdx := indexOf(table.Columns, "updated_at")
 	if localCols["updated_at"] && updatedAtIdx < 0 {
 		slog.Warn("sync: skipping dump table missing updated_at column", "table", table.Name)
-		return 0, 0
+		return 0, 0, nil
 	}
 
 	// PK-aware upsert: insert the sender-supplied columns and, on a primary-key conflict,
@@ -582,9 +594,15 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 		if end > len(table.Rows) {
 			end = len(table.Rows)
 		}
-		m, s := c.mergeChunk(table, table.Rows[start:end], insertSQL, pkCols, pkIdx, updatedAtIdx)
+		m, s, chunkErr := c.mergeChunk(table, table.Rows[start:end], insertSQL, pkCols, pkIdx, updatedAtIdx)
 		merged += m
 		skipped += s
+		if chunkErr != nil {
+			// An operational / commit failure rolled back this chunk; stop and propagate so
+			// the caller surfaces it. Earlier chunks are already committed (per-row-idempotent
+			// LWW), so the next anti-entropy cycle re-converges from here.
+			return merged, skipped, chunkErr
+		}
 		// Test seam: fired at a chunk boundary with c.mu RELEASED. A write issued
 		// here proves the merge doesn't hold the lock across chunks (it would
 		// self-deadlock otherwise). Nil in production.
@@ -592,7 +610,7 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 			mergeChunkHook()
 		}
 	}
-	return merged, skipped
+	return merged, skipped, nil
 }
 
 // mergeChunk applies one bounded slice of a table's rows under a single
@@ -600,7 +618,7 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 // INSERT OR REPLACE the winners. Prefetch and inserts share the tx (held under
 // the lock), so the compare→insert decision is atomic within the chunk; the lock
 // is released on return so the next chunk doesn't monopolize it.
-func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL string, pkCols []string, pkIdx []int, updatedAtIdx int) (merged, skipped int) {
+func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL string, pkCols []string, pkIdx []int, updatedAtIdx int) (merged, skipped int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -611,13 +629,13 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	// includes the column, so this never blocks real convergence.
 	if table.Name == "runtime_action_proofs" && indexOf(table.Columns, "status") < 0 {
 		slog.Warn("sync: runtime_action_proofs dump missing status column; refusing chunk (fail-closed)", "table", table.Name)
-		return 0, len(rows)
+		return 0, len(rows), nil
 	}
 
 	tx, err := c.db.Begin()
 	if err != nil {
 		slog.Error("sync: begin tx", "table", table.Name, "error", err)
-		return 0, 0
+		return 0, 0, fmt.Errorf("begin merge tx for %s: %w", table.Name, err)
 	}
 
 	// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
@@ -650,8 +668,13 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				skipped++
 				continue
 			}
-			if _, err := tx.Exec(insertSQL, row...); err != nil {
-				slog.Warn("sync: merge row", "table", table.Name, "error", err)
+			rejected, execErr := applyMergeRow(tx, insertSQL, row, table.Name)
+			if execErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, execErr
+			}
+			if rejected {
+				skipped++
 			} else {
 				merged++
 			}
@@ -708,25 +731,47 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				}
 			}
 		}
-		if _, err := tx.Exec(insertSQL, row...); err != nil {
-			slog.Warn("sync: merge row", "table", table.Name, "error", err)
-		} else {
-			merged++
-			// Applying a strictly-newer or resolver-chosen incoming row replaces
-			// the local value, so any unresolved tie tracked for this PK is now
-			// stale (this IS the repair path — e.g. repair-owner re-stamping with
-			// a fresh timestamp propagates here). Lock-free when nothing tracked.
-			if c.anyUnresolved() {
-				c.clearUnresolved(table.Name, pkKeyAt(row, pkIdx))
-			}
+		rejected, execErr := applyMergeRow(tx, insertSQL, row, table.Name)
+		if execErr != nil {
+			_ = tx.Rollback()
+			return merged, skipped, execErr
+		}
+		if rejected {
+			skipped++
+			continue
+		}
+		merged++
+		// Applying a strictly-newer or resolver-chosen incoming row replaces
+		// the local value, so any unresolved tie tracked for this PK is now
+		// stale (this IS the repair path — e.g. repair-owner re-stamping with
+		// a fresh timestamp propagates here). Lock-free when nothing tracked.
+		if c.anyUnresolved() {
+			c.clearUnresolved(table.Name, pkKeyAt(row, pkIdx))
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		slog.Error("sync: commit", "table", table.Name, "error", err)
-		return 0, skipped // commit failed → nothing in this chunk landed
+		return 0, skipped, fmt.Errorf("commit merge chunk for %s: %w", table.Name, err)
 	}
-	return merged, skipped
+	return merged, skipped, nil
+}
+
+// applyMergeRow executes one winning row's upsert in an anti-entropy merge, classifying any
+// error so the caller can fail closed. A deterministic constraint violation (e.g. a
+// secondary-UNIQUE collision) is NON-fatal — the incoming row is kept local (rejected=true)
+// and the sender still holds it for the next cycle. An operational or unrecognized failure is
+// returned so the caller rolls back the whole chunk and propagates it, rather than committing
+// a partial chunk and silently dropping the error.
+func applyMergeRow(tx *sql.Tx, insertSQL string, row []interface{}, table string) (rejected bool, err error) {
+	if _, execErr := tx.Exec(insertSQL, row...); execErr != nil {
+		if class, _ := classifySQLiteError(execErr); class == classConstraint {
+			slog.Warn("sync: merge row rejected by constraint (keeping local)", "table", table, "error", execErr)
+			return true, nil
+		}
+		return false, fmt.Errorf("merge row into %s: %w", table, execErr)
+	}
+	return false, nil
 }
 
 // proofMergeKeepLocalRow is the anti-entropy monotone decision for a

@@ -177,7 +177,9 @@ func TestMergeChunked_ReleasesLockBetweenChunks(t *testing.T) {
 	}
 	defer func() { mergeChunkHook = nil }()
 
-	dst.mergeStatePayloadLWW(full)
+	if err := dst.mergeStatePayloadLWW(full); err != nil {
+		t.Fatalf("mergeStatePayloadLWW: %v", err)
+	}
 
 	if !wroteMidMerge {
 		t.Fatal("no write completed at a chunk boundary — merge did not release the lock mid-flight")

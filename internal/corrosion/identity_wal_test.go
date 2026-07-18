@@ -29,11 +29,13 @@ func applyWALSnapshot(t *testing.T, c *Client, s Statement, incomingTS string) e
 	}
 	if aerr := r.applyStatementLWW(ctx, tx, s, incomingTS); aerr != nil {
 		tx.Rollback()
+		c.dropDeferredEffects(tx)
 		return aerr
 	}
 	if cerr := tx.Commit(); cerr != nil {
 		t.Fatalf("commit: %v", cerr)
 	}
+	c.runDeferredEffects(tx) // mirror the production batch: deferred effects run post-commit
 	return nil
 }
 
@@ -179,6 +181,7 @@ func TestWALIdentity_CollapsePreservesReceiverOnlyColumn(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
+	c.runDeferredEffects(tx)
 	rows, _ := c.Query(ctx, "SELECT id, vmstate_path FROM snapshots WHERE vm_name = ? AND name = ?", "vm1", "snap1")
 	if len(rows) != 1 || rows[0].String("id") != "id-remote" {
 		t.Fatalf("want single surviving id-remote, got %v", rows)
@@ -210,5 +213,48 @@ func TestWALIdentity_ContainerSnapshotCollapses(t *testing.T) {
 	rows, _ := c.Query(ctx, "SELECT id FROM container_snapshots WHERE host_name = ? AND ct_name = ? AND name = ?", "host-a", "web", "snap1")
 	if len(rows) != 1 || rows[0].String("id") != "ct-remote" {
 		t.Fatalf("container_snapshots must collapse to the winning id, got %v", rows)
+	}
+}
+
+// TestWALIdentity_OmittedPathColumnNoFalseOrphan (finding 1, WAL): a collapse driven by a
+// statement that OMITS the artifact-path column preserves the local path, so the surviving row
+// still references it — no false orphan alert.
+func TestWALIdentity_OmittedPathColumnNoFalseOrphan(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, vmstate_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"id-local", "vm1", "host-a", "snap1", "ready", "/keep.state", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Same host, statement omits vmstate_path, newer.
+	s := Statement{
+		SQL:    `INSERT OR REPLACE INTO snapshots (id, vm_name, host_name, name, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		Params: []interface{}{"id-remote", "vm1", "host-a", "snap1", "ready", "2020-01-01T00:00:00Z", "2000000000000-0000-n2"},
+	}
+	sh, err := parseStmtShape(s.SQL, tablePrimaryKeys["snapshots"])
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tx, _ := c.db.Begin()
+	if err := r.applyIdentityInsert(ctx, tx, s, sh, "snapshots", tablePrimaryKeys["snapshots"]); err != nil {
+		tx.Rollback()
+		c.dropDeferredEffects(tx)
+		t.Fatalf("applyIdentityInsert: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	c.runDeferredEffects(tx)
+	rows, _ := c.Query(ctx, "SELECT id, vmstate_path FROM snapshots WHERE vm_name = ? AND name = ?", "vm1", "snap1")
+	if len(rows) != 1 || rows[0].String("id") != "id-remote" || rows[0].String("vmstate_path") != "/keep.state" {
+		t.Fatalf("WAL collapse must preserve the omitted path, got %v", rows)
+	}
+	if len(sm.identityOrphan) != 0 {
+		t.Fatalf("a preserved path must NOT be reported orphaned, got %v", sm.identityOrphan)
 	}
 }

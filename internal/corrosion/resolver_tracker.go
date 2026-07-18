@@ -1,6 +1,7 @@
 package corrosion
 
 import (
+	"database/sql"
 	"log/slog"
 	"sort"
 	"strings"
@@ -25,6 +26,43 @@ import (
 // strictly safer than risking hidden divergence.
 
 func unresolvedKey(table, pk string) string { return table + "\x00" + pk }
+
+// deferAfterCommit records fn to run only after the given transaction commits (via
+// runDeferredEffects). A nil tx runs fn immediately (direct callers with no commit boundary). Used
+// for tracker mutations and orphan alerts, which must not take effect if the tx later rolls back.
+func (c *Client) deferAfterCommit(tx *sql.Tx, fn func()) {
+	if tx == nil {
+		fn()
+		return
+	}
+	c.txEffectsMu.Lock()
+	if c.txEffects == nil {
+		c.txEffects = make(map[*sql.Tx][]func())
+	}
+	c.txEffects[tx] = append(c.txEffects[tx], fn)
+	c.txEffectsMu.Unlock()
+}
+
+// runDeferredEffects runs and removes every effect registered for tx — call it right AFTER a
+// successful tx.Commit(). Ordering is registration order.
+func (c *Client) runDeferredEffects(tx *sql.Tx) {
+	c.txEffectsMu.Lock()
+	fns := c.txEffects[tx]
+	delete(c.txEffects, tx)
+	c.txEffectsMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+// dropDeferredEffects discards any effects registered for tx WITHOUT running them — call it on
+// every rollback / early-return path (a deferred dropDeferredEffects is the safe default; a
+// successful runDeferredEffects empties the map first, so the deferred drop then no-ops).
+func (c *Client) dropDeferredEffects(tx *sql.Tx) {
+	c.txEffectsMu.Lock()
+	delete(c.txEffects, tx)
+	c.txEffectsMu.Unlock()
+}
 
 // contentPair returns a stable, order-independent fingerprint of the two rows'
 // content, so the same divergence (regardless of which side is "local") maps to

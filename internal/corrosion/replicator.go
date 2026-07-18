@@ -890,6 +890,9 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 	if err != nil {
 		return 0, fmt.Errorf("begin tx: %w", err)
 	}
+	// Identity tracker/orphan side effects are deferred to run only after this batch COMMITS; any
+	// rollback (a later statement or the commit itself failing) drops them via this cleanup.
+	defer r.client.dropDeferredEffects(tx)
 
 	// Filter out entries we've already processed (dedup).
 	unseen, err := r.filterUnseen(ctx, tx, entries)
@@ -974,6 +977,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit: %w", err)
 	}
+	r.client.runDeferredEffects(tx) // the batch committed → apply the deferred tracker/orphan effects
 
 	// If relay and we recorded entries, wake the replicator to fan out.
 	if isRelay && len(unseen) > 0 {
@@ -1283,14 +1287,21 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 	if dErr != nil {
 		return dErr
 	}
+	// Tracker mutations + orphan alerts are DEFERRED to run only after the batch commits (a later
+	// statement / the commit failing must not leave a cleared tracker or a false orphan alert).
 	switch disp {
 	case idContentFault:
 		slog.Warn("replicator: unresolved identity fault (equal timestamp, unproven-equivalent content) — keeping local", "table", tableName)
-		r.client.trackIdentityFault(tableName, incomingNat, localFullCols, localFullVals, pathWAL)
+		cols2, vals2 := localFullCols, localFullVals
+		r.client.deferAfterCommit(tx, func() { r.client.trackIdentityFault(tableName, incomingNat, cols2, vals2, pathWAL) })
 		return nil
 	case idKeepLocal:
-		// An older / re-observed incoming does NOT resolve a standing fault (the conflicting peer
+		// An older / different-id incoming does NOT resolve a standing fault (the conflicting peer
 		// row still exists), so keep-local never clears the tracked fault.
+		return nil
+	case idAlreadyConverged:
+		// Same id, complete-content equivalence: the group has converged → clear any prior fault.
+		r.client.deferAfterCommit(tx, func() { r.client.clearIdentityFault(tableName, incomingNat) })
 		return nil
 	case idApplyNew, idAdoptSameID:
 		// Plain PK-aware upsert so receiver-only columns keep their local value.
@@ -1306,10 +1317,13 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 		if err != nil {
 			return err
 		}
-		if rowsChanged(res) {
-			r.client.clearUnresolvedFromStmt(s)
-		}
-		r.client.clearIdentityFault(tableName, incomingNat) // clear only AFTER a successful apply
+		changed := rowsChanged(res)
+		r.client.deferAfterCommit(tx, func() {
+			if changed {
+				r.client.clearUnresolvedFromStmt(s)
+			}
+			r.client.clearIdentityFault(tableName, incomingNat) // clear only AFTER a successful apply
+		})
 		return nil
 	default: // idCollapse
 		// A collapse re-keys the losing id; an existing child referencing it would be orphaned
@@ -1335,12 +1349,20 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 			// clear the fault.)
 			return invalidf("identity collapse on %s hit an unexpected constraint", tableName)
 		}
-		if haveArtifact {
-			winnerHost, winnerPath := incomingArtifact(tableName, cols, vals)
-			r.client.surfaceIdentityCollapseOrphan(tableName, localID.String, losingHost, losingPath, incomingID, winnerHost, winnerPath)
+		// Re-read the ACTUAL surviving row's (host, path) AFTER the column-preserving re-key: a
+		// sender-omitted path column was PRESERVED (still referenced), so comparing the incoming
+		// projection would falsely flag a live artifact as orphaned.
+		winnerHost, winnerPath, winnerFound, wErr := identityArtifact(tx, tableName, incomingID)
+		if wErr != nil {
+			return wErr
 		}
-		r.client.clearUnresolvedFromStmt(s)
-		r.client.clearIdentityFault(tableName, incomingNat) // converged → clear only on success
+		r.client.deferAfterCommit(tx, func() {
+			r.client.clearUnresolvedFromStmt(s)
+			r.client.clearIdentityFault(tableName, incomingNat) // converged → clear only on success
+			if haveArtifact && winnerFound {
+				r.client.surfaceIdentityCollapseOrphan(tableName, localID.String, losingHost, losingPath, incomingID, winnerHost, winnerPath)
+			}
+		})
 		return nil
 	}
 }

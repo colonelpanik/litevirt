@@ -180,21 +180,26 @@ every node has latched.
 **Fail-closed guards** (nothing is silently discarded): an exact-instant tie whose
 content is not provably equivalent is an **unresolved identity fault** — keep local,
 remain divergent, and track it in `litevirt_lww_tie_unresolved_current`
-(category `identity_content_conflict`, keyed by natural key) so it alerts and clears
-on convergence — rather than pick a row by id. A collapse also fails closed if the
-incoming id already belongs to a **different** natural key locally (would destroy an
-unrelated row), or if an existing child references the losing id
-(`snapshots.parent_id`, unused today, would be orphaned since references are not
-rewritten).
+(category `identity_content_conflict`, keyed by natural key) so it alerts. It clears
+only on genuine convergence — a successful collapse/apply, or observing the same-id,
+fully-equivalent converged row — never merely because a later observation was older.
+A collapse also fails closed if the incoming id already belongs to a **different**
+natural key locally (would destroy an unrelated row), or if an existing child
+references the losing id (`snapshots.parent_id`, unused today, would be orphaned since
+references are not rewritten). The tracker/alert side effects run only after the merge
+transaction commits, so a rollback can't leave a stale fault or a false alert.
 
 **Orphaned artifacts:** a collapse whose losing row referenced a **different physical
 artifact** — a different `(host, path)` pair — leaves the losing file unreferenced.
-That includes a different host (the whole losing snapshot is stranded) **and** a
-same-host path change (e.g. a `vmstate_path`/`path` rewrite; because `host_name` is
-part of the `container_snapshots` natural key, its collapses are always same-host, so
-a path change is the only way one orphans a file). It is **not** auto-deleted — the
-losing id/host/path is logged (WARN) and counted in
-`litevirt_identity_collapse_orphaned_total` so an operator can reclaim the space.
+The winner's pair is read back from the surviving row **after** the column-preserving
+re-key, so a path column the sender omitted (schema skew) is correctly seen as
+preserved-and-still-referenced, never falsely flagged. Orphaning covers a different
+host (the whole losing snapshot is stranded) **and** a same-host path change (e.g. a
+`vmstate_path`/`path` rewrite; because `host_name` is part of the `container_snapshots`
+natural key, its collapses are always same-host, so a path change is the only way one
+orphans a file). It is **not** auto-deleted — the losing id/host/path is logged (WARN,
+after commit) and counted in `litevirt_identity_collapse_orphaned_total` so an operator
+can reclaim the space.
 
 **Scanner lane:** while it is active fleet-wide, `lv doctor divergence` keys these
 tables by their natural key too, so a still-converging group shows as **one**

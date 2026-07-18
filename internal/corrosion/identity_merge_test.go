@@ -455,6 +455,7 @@ func TestMergeIdentity_FaultDedupAcrossPaths(t *testing.T) {
 		t.Fatalf("WAL apply: %v", err)
 	}
 	_ = tx.Commit()
+	c.runDeferredEffects(tx) // WAL fault tracking is deferred to post-commit
 
 	if c.UnresolvedTieCount() != 1 {
 		t.Fatalf("the same fault across AE + WAL must dedup to ONE tracked entry, count=%d", c.UnresolvedTieCount())
@@ -486,5 +487,59 @@ func TestMergeIdentity_ContainerSnapshotCollapses(t *testing.T) {
 	rows, _ := c.Query(ctx, "SELECT id FROM container_snapshots WHERE host_name = ? AND ct_name = ? AND name = ?", "host-a", "web", "snap1")
 	if len(rows) != 1 || rows[0].String("id") != "ct-remote" {
 		t.Fatalf("container_snapshots must collapse to the winning id, got %v", rows)
+	}
+}
+
+// TestMergeIdentity_OmittedPathColumnNoFalseOrphan (finding 1): when the incoming projection OMITS
+// the artifact-path column, the column-preserving collapse RETAINS the local path — so it is still
+// referenced by the winning row and must NOT be reported as orphaned. Comparing the incoming
+// projection (which lacks the column) would falsely warn an operator to delete live data.
+func TestMergeIdentity_OmittedPathColumnNoFalseOrphan(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	if err := c.Execute(context.Background(),
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, vmstate_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"id-local", "vm1", "host-a", "snap1", "ready", "/keep.state", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Winner on the SAME host, dump OMITS vmstate_path (schema skew), newer.
+	subset := []string{"id", "vm_name", "host_name", "name", "state", "created_at", "updated_at"}
+	incoming := []interface{}{"id-remote", "vm1", "host-a", "snap1", "ready", "2020-01-01T00:00:00Z", "2000000000000-0000-n2"}
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(subset, incoming)); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	rows, _ := c.Query(context.Background(), "SELECT id, vmstate_path FROM snapshots WHERE vm_name = ? AND name = ?", "vm1", "snap1")
+	if len(rows) != 1 || rows[0].String("id") != "id-remote" || rows[0].String("vmstate_path") != "/keep.state" {
+		t.Fatalf("collapse must preserve the omitted path on the winner, got %v", rows)
+	}
+	if len(sm.identityOrphan) != 0 {
+		t.Fatalf("a preserved (still-referenced) path must NOT be reported orphaned, got %v", sm.identityOrphan)
+	}
+}
+
+// TestMergeIdentity_ConvergedSameIDClearsFault (finding 3): after a peer has collapsed onto the
+// winning id, observing that fully-equivalent same-id row clears the standing natural-key fault.
+func TestMergeIdentity_ConvergedSameIDClearsFault(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	const tie = "2000000000000-0000-tie"
+	seedSnapshot(t, c, "id-a", "vm1", "snap1", tie)
+	// Create a standing fault (equal timestamp, different content, different id).
+	fault := []interface{}{"id-b", "vm1", "host-a", "snap1", "error", nil, nil, "disk", nil, 0, "2020-01-01T00:00:00Z", tie, nil}
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, fault)); err != nil {
+		t.Fatalf("merge fault: %v", err)
+	}
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("fault must be tracked, count=%d", c.UnresolvedTieCount())
+	}
+	// Observe the converged row: SAME id as local, equal content, same instant ⇒ clear the fault.
+	converged := snapshotDumpRow("id-a", "vm1", "host-a", "snap1", tie)
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, converged)); err != nil {
+		t.Fatalf("merge converged: %v", err)
+	}
+	if c.UnresolvedTieCount() != 0 {
+		t.Fatalf("a converged same-id observation must clear the fault, count=%d", c.UnresolvedTieCount())
 	}
 }

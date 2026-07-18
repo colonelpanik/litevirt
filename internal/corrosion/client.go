@@ -153,6 +153,14 @@ type Client struct {
 	// entirely when nothing is tracked — the overwhelmingly common case.
 	unresolvedLen atomic.Int64
 
+	// txEffects holds side effects (tracker mutations, orphan alerts/metrics) that must run only
+	// AFTER a merge/apply transaction COMMITS — so a later row/statement or commit failure that
+	// rolls back the DB can't leave a cleared tracker or a false orphan alert behind. Keyed by the
+	// *sql.Tx pointer so concurrent apply transactions never mix effects; the batch/chunk driver
+	// runs (runDeferredEffects) or drops (dropDeferredEffects) its tx's effects. See deferAfterCommit.
+	txEffectsMu sync.Mutex
+	txEffects   map[*sql.Tx][]func()
+
 	// hlcSkewGuard, when non-nil and returning true, enables LWW skew quarantine:
 	// an incoming row whose updated_at is beyond hlc.MaxSkewMS into the
 	// future (relative to local wall clock) is NOT allowed to win a conflict —

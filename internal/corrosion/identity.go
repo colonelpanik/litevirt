@@ -52,11 +52,12 @@ func hasIdentityKey(table string) bool {
 type identityDisposition int
 
 const (
-	idApplyNew     identityDisposition = iota // no local row for this natural key → apply incoming
-	idKeepLocal                               // local wins (newer, or the tie's id winner) → no-op
-	idAdoptSameID                             // same id, incoming newer → plain LWW upsert (no collapse)
-	idCollapse                                // different id, incoming wins → re-key local into the winner
-	idContentFault                            // exact-instant tie with DIFFERENT content → keep local, fault
+	idApplyNew         identityDisposition = iota // no local row for this natural key → apply incoming
+	idKeepLocal                                   // local wins (older/different-id incoming) → no-op, retain any fault
+	idAdoptSameID                                 // same id, incoming newer → plain LWW upsert (no collapse)
+	idCollapse                                    // different id, incoming wins → re-key local into the winner
+	idContentFault                                // exact-instant tie, unproven-equivalent content → keep local, fault
+	idAlreadyConverged                            // same id, exact tie, complete-content equivalence → no-op, CLEAR any fault
 )
 
 // resolveIdentity decides how to apply an incoming natural-key row given whether a local row
@@ -77,8 +78,9 @@ func resolveIdentity(localExists bool, localTS, localID, incomingTS, incomingID 
 		}
 		return idCollapse, nil
 	}
-	// Exact-instant tie: resolve by id ONLY if the content is otherwise equivalent, else it is a
-	// genuine equal-timestamp/different-content safety fault (never silently pick a row).
+	// Exact-instant tie: resolve by id ONLY if the content is provably equivalent (a COMPLETE
+	// local-schema image), else it is a genuine equal-timestamp/unproven-content safety fault
+	// (never silently pick a row).
 	equal, err := contentEqual()
 	if err != nil {
 		return idKeepLocal, err
@@ -86,15 +88,21 @@ func resolveIdentity(localExists bool, localTS, localID, incomingTS, incomingID 
 	if !equal {
 		return idContentFault, nil
 	}
-	// Equivalent content → deterministic collapse to the smaller id, so every node converges to
-	// the same surviving row.
-	if incomingID < localID {
-		if localID == incomingID { // unreachable (strict <), kept for symmetry
-			return idAdoptSameID, nil
-		}
+	// Equivalent, complete-content:
+	switch {
+	case incomingID == localID:
+		// Identical row (same id, equal content, equal instant) — the natural-key group has
+		// CONVERGED (e.g. a peer collapsed onto this id and shipped the converged row back). A
+		// no-op on the DB, but it must CLEAR any prior fault for this key.
+		return idAlreadyConverged, nil
+	case incomingID < localID:
+		// Deterministic collapse to the smaller id, so every node converges to the same row.
 		return idCollapse, nil
+	default:
+		// Local id is the winner; the peer still holds a larger losing id and will collapse onto
+		// us — not yet converged, so keep local and RETAIN any standing fault.
+		return idKeepLocal, nil
 	}
-	return idKeepLocal, nil // local id is the winner (smaller-or-equal)
 }
 
 // identityArtifactColumns names, per table, the host column and the on-disk artifact-path column,

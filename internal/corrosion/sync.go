@@ -637,6 +637,9 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		slog.Error("sync: begin tx", "table", table.Name, "error", err)
 		return 0, 0, fmt.Errorf("begin merge tx for %s: %w", table.Name, err)
 	}
+	// Identity tracker/orphan side effects are deferred to run only after this chunk COMMITS; a
+	// rollback (a later row or the commit itself failing) drops them via this deferred cleanup.
+	defer c.dropDeferredEffects(tx)
 
 	// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
 	var existing map[string]string
@@ -804,6 +807,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		slog.Error("sync: commit", "table", table.Name, "error", err)
 		return 0, skipped, fmt.Errorf("commit merge chunk for %s: %w", table.Name, err)
 	}
+	c.runDeferredEffects(tx) // the chunk committed → apply the deferred tracker/orphan effects
 	return merged, skipped, nil
 }
 
@@ -884,14 +888,21 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 	if dErr != nil {
 		return false, dErr
 	}
+	// Tracker mutations + orphan alerts are DEFERRED to run only after the chunk commits (a later
+	// row / the commit failing must not leave a cleared tracker or a false orphan alert).
 	switch disp {
 	case idContentFault:
 		slog.Warn("sync: unresolved identity fault (equal timestamp, unproven-equivalent content) — keeping local", "table", table.Name)
-		c.trackIdentityFault(table.Name, incomingNat, localFullCols, localFullVals, pathAE)
+		cols, vals := localFullCols, localFullVals
+		c.deferAfterCommit(tx, func() { c.trackIdentityFault(table.Name, incomingNat, cols, vals, pathAE) })
 		return false, nil
 	case idKeepLocal:
-		// An older / re-observed incoming does NOT resolve a standing fault (the conflicting peer
+		// An older / different-id incoming does NOT resolve a standing fault (the conflicting peer
 		// row still exists), so keep-local never clears the tracked fault.
+		return false, nil
+	case idAlreadyConverged:
+		// Same id, complete-content equivalence: the group has converged → clear any prior fault.
+		c.deferAfterCommit(tx, func() { c.clearIdentityFault(table.Name, incomingNat) })
 		return false, nil
 	case idApplyNew, idAdoptSameID:
 		rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
@@ -899,7 +910,7 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 			return false, execErr
 		}
 		if !rejected {
-			c.clearIdentityFault(table.Name, incomingNat) // clear only AFTER a successful apply
+			c.deferAfterCommit(tx, func() { c.clearIdentityFault(table.Name, incomingNat) })
 		}
 		return !rejected, nil
 	default: // idCollapse
@@ -924,11 +935,19 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 			c.observeMergeRejected(table.Name, "ae", "identity_collapse_rejected")
 			return false, nil // do NOT clear the fault on a rejected collapse
 		}
-		c.clearIdentityFault(table.Name, incomingNat) // converged → clear only on success
-		if haveArtifact {
-			winnerHost, winnerPath := incomingArtifact(table.Name, table.Columns, row)
-			c.surfaceIdentityCollapseOrphan(table.Name, localID.String, losingHost, losingPath, incomingID, winnerHost, winnerPath)
+		// Re-read the ACTUAL surviving row's (host, path) AFTER the column-preserving re-key: when
+		// the sender omitted the path column it was PRESERVED (still referenced), so comparing the
+		// incoming projection would falsely flag a live artifact as orphaned.
+		winnerHost, winnerPath, winnerFound, wErr := identityArtifact(tx, table.Name, incomingID)
+		if wErr != nil {
+			return false, wErr
 		}
+		c.deferAfterCommit(tx, func() {
+			c.clearIdentityFault(table.Name, incomingNat) // converged → clear only on success
+			if haveArtifact && winnerFound {
+				c.surfaceIdentityCollapseOrphan(table.Name, localID.String, losingHost, losingPath, incomingID, winnerHost, winnerPath)
+			}
+		})
 		return true, nil
 	}
 }
@@ -1378,23 +1397,6 @@ func identityArtifact(tx *sql.Tx, table, id string) (host, path string, found bo
 		return "", "", false, fmt.Errorf("identity artifact lookup on %s: %w", table, scanErr)
 	}
 	return h.String, p.String, true, nil
-}
-
-// incomingArtifact extracts the winner's (host, artifact-path) from an incoming row's projection.
-// A column the projection omits (schema skew) reads as "" — a safe over-surface (the comparison
-// then treats it as a differing artifact rather than silently matching).
-func incomingArtifact(table string, cols []string, vals []interface{}) (host, path string) {
-	art, ok := identityArtifactColumns[table]
-	if !ok {
-		return "", ""
-	}
-	if i := indexOf(cols, art.host); i >= 0 && i < len(vals) {
-		host = coerceString(vals[i])
-	}
-	if i := indexOf(cols, art.path); i >= 0 && i < len(vals) {
-		path = coerceString(vals[i])
-	}
-	return host, path
 }
 
 // jsonRoundTripCells marshals then unmarshals a scanned row so its numeric/text

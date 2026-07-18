@@ -231,16 +231,20 @@ func (p *sqlParser) parseUpdate(pkCols []string) (StmtShape, error) {
 	if err := p.expectKeyword("SET"); err != nil {
 		return sh, err
 	}
+	sh.SetClauseStart = p.peek().pos
 	assigns, err := p.parseAssignments()
 	if err != nil {
 		return sh, err
 	}
+	sh.SetClauseEnd = p.lastEnd
 	sh.SetAssigns = assigns
 	if p.acceptKeyword("WHERE") {
+		sh.WhereStart = p.peek().pos
 		where, err := p.parsePredicate()
 		if err != nil {
 			return sh, err
 		}
+		sh.WhereEnd = p.lastEnd
 		sh.Where = where
 	}
 	if t := p.peek(); t.kind == tokIdent && strings.EqualFold(t.text, "RETURNING") {

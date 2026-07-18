@@ -1034,86 +1034,108 @@ func (r *Replicator) recordInMutationLog(ctx context.Context, tx *sql.Tx, entrie
 	return nil
 }
 
-// applyStatementLWW applies a single SQL statement with LWW conflict resolution.
-// For tables with updated_at, it only applies if the incoming HLC is newer.
+// applyStatementLWW applies a single replicated statement, PARSE-FIRST and fail-closed: it
+// structurally validates the statement, checks its parameter arity, and authorizes its shape
+// against the compatibility ledger BEFORE anything touches the database. An unparseable,
+// arity-mismatched, or unregistered shape is rejected (the caller back-pressures) — never
+// dispatched by a table-name guess or executed on a best-effort basis. It then applies the
+// statement by the ledger's disposition, using the parsed shape (not positional heuristics)
+// for every last-writer-wins decision.
 func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statement, incomingHLC string) error {
 	tableName := extractTableName(s.SQL)
+	pkCols := tablePrimaryKeys[tableName]
 
-	// For append-only tables (no updated_at), use INSERT OR IGNORE.
-	if tableName == "fencing_log" || tableName == "audit_log" || tableName == "mutation_log" || tableName == "vm_events" {
-		replaced := replaceInsertStrategy(s.SQL, "INSERT OR IGNORE")
-		_, err := tx.ExecContext(ctx, replaced, s.Params...)
+	sh, err := parseStmtShape(s.SQL, pkCols)
+	if err != nil {
 		return err
 	}
+	if err := sh.ValidateParamArity(len(s.Params)); err != nil {
+		return err
+	}
+	entry, ok := LedgerLookup(stmtFingerprint(sh))
+	if !ok {
+		// Not a CURRENT builder shape: in a mixed-version cluster this is a shape emitted by
+		// an older (or newer) binary, whose exact fingerprint isn't in this build's ledger.
+		// Rejecting it outright would back-pressure every cross-version write during a rolling
+		// upgrade — including the column-subset INSERTs the preservation fix targets. Instead
+		// DERIVE its disposition from the structure with the SAME function that generated the
+		// ledger, so a valid historical shape is applied by its safe disposition. An
+		// unclassifiable shape (deriveDisposition errors) is still rejected. Two dispositions
+		// are NEVER honored on a derived (unregistered) shape, so they can't be smuggled in:
+		// a hard DELETE (retention templates must be explicitly registered) and an
+		// unsupported bulk update.
+		disp, cat, derr := deriveDisposition(sh)
+		if derr != nil {
+			return derr
+		}
+		if disp == DispDeleteRetention {
+			return invalidf("unregistered DELETE on %s (retention templates must be registered)", tableName)
+		}
+		if disp == DispBulkUpdate && cat != CatPerRowLWW {
+			return invalidf("unregistered unsupported bulk update on %s", tableName)
+		}
+		entry = LedgerEntry{Disposition: disp, Category: cat}
+	}
 
-	// runtime_action_proofs (split-brain hardening, v38): a MONOTONE lifecycle, not
-	// LWW. A row is immutable after creation except forward, GUARDED status
-	// transitions (prepared→in_progress→{completed|failed}, each an UPDATE …
-	// WHERE status IN (<legal predecessors>)). Two rules make the merge monotone
-	// WITHOUT a timestamp compare — so a newer non-terminal copy can't resurrect a
-	// spent proof:
-	//   - a replicated INSERT uses INSERT OR IGNORE (never OR REPLACE), so it can
-	//     only create the row when absent and never clobbers one that has progressed;
-	//   - the guarded UPDATEs travel with their WHERE clause and are applied
-	//     directly (no LWW skip): they no-op on a peer whose local status is already
-	//     terminal or ahead, giving terminal-beats-non-terminal regardless of
-	//     updated_at. A completed⊕failed split (only reachable if a proof somehow
-	//     executed on two hosts) stays divergent — each keeps its own terminal — as
-	//     the deliberate "unresolved" outcome rather than a coin-flip.
-	//
-	// DELIBERATE DEVIATION on terminal disagreement: this WAL apply path processes
-	// STATEMENTS, not full rows, so it cannot compare the local vs incoming terminal
-	// and does NOT itself call trackUnresolved — a completed⊕failed split just stays
-	// divergent here (each side's guarded UPDATE no-ops on the other's terminal). The
-	// safety-fault SIGNAL is raised by the periodic anti-entropy full-row compare
-	// (proofMergeKeepLocalRow → trackUnresolved, sync.go), which reconciles digests
-	// within one AE interval and flags the split for operator repair. This delay is
-	// acceptable: both proofs are already terminal, so neither authorizes any further
-	// runtime action — the divergence is a detection concern, not a control gap.
-	// (Mixed-version safety has TWO layers on the send side, so a peer that can't
-	//  honor a proof never receives one: the WAL relay DROPS a whole proof-bearing
-	//  entry to any peer not advertising split_brain_gate_v1 — token-gated, fail
-	//  closed on a nil gate — see peerLacksProofSupport/entryTouchesCustomMerge (the
-	//  dropped proof reconverges via the peer-only sensitive AE net); and proofs are
-	//  only written once the gate is cluster-wide. This apply path is the receive
-	//  side: it stays monotone regardless, so an out-of-order/duplicated proof
-	//  mutation still can't resurrect a spent proof.)
-	if customMergeTables[tableName] != nil {
+	switch entry.Disposition {
+	case DispAppendOnly:
+		// Immutable append-only INSERT (fencing_log/audit_log/mutation_log/vm_events):
+		// INSERT OR IGNORE, so it only creates the row when absent and never overwrites.
+		replaced := replaceInsertStrategy(s.SQL, "INSERT OR IGNORE")
+		_, execErr := tx.ExecContext(ctx, replaced, s.Params...)
+		return execErr
+
+	case DispCustomMerge:
+		// Monotone lifecycle / immutable journal (runtime_action_proofs, operations, …): an
+		// INSERT uses INSERT OR IGNORE so it can only create a row when absent and never
+		// clobbers one that has progressed; a guarded UPDATE travels with its WHERE clause
+		// and is applied verbatim, so it no-ops on a peer whose row is already terminal or
+		// ahead (terminal-beats-non-terminal without a timestamp compare). A completed⊕failed
+		// split stays divergent here (statement-level apply can't compare full rows); the
+		// periodic anti-entropy full-row compare raises the safety-fault signal. Mixed-version
+		// safety is enforced on the SEND side (proof-bearing entries are dropped to peers that
+		// don't advertise split_brain_gate_v1), so this receive side just stays monotone.
 		sqlStmt := s.SQL
-		if isInsertStatement(sqlStmt) {
+		if sh.Kind == KindInsert {
 			sqlStmt = replaceInsertStrategy(sqlStmt, "INSERT OR IGNORE")
 		}
-		_, err := tx.ExecContext(ctx, sqlStmt, s.Params...)
-		return err
-	}
+		_, execErr := tx.ExecContext(ctx, sqlStmt, s.Params...)
+		return execErr
 
-	// For DELETE statements, always apply (soft-deletes use UPDATE anyway).
-	if isDeleteStatement(s.SQL) {
-		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
-		if err == nil && rowsChanged(res) {
+	case DispDeleteRetention:
+		// A registered retention DELETE (its presence in the ledger IS the registration).
+		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if execErr == nil && rowsChanged(res) {
 			r.client.clearUnresolvedFromStmt(s)
 		}
+		return execErr
+
+	case DispBulkUpdate:
+		// A bulk (non-full-PK) UPDATE, applied by per-row LWW expansion.
+		return r.applyBulkPerRowLWW(ctx, tx, s, sh, tableName, pkCols)
+
+	case DispPlainInsert, DispExplicitUpsert, DispFullPKUpdate:
+		return r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
+	}
+	return invalidf("unhandled disposition %q for %s", entry.Disposition, tableName)
+}
+
+// applyLWWGated applies a full-PK INSERT/upsert or full-PK UPDATE under last-writer-wins: it
+// LWW-gates by the row's updated_at (using the parsed shape's PK/updated_at parameter
+// indices), then applies. An INSERT is rewritten to a PK-aware upsert so a behind sender's
+// omitted columns keep their local value (never a whole-row replace); an UPDATE runs verbatim
+// so its guards (deleted_at IS NULL, CAS) are retained.
+func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string, incomingHLC string) error {
+	skip, err := r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, sh, incomingHLC)
+	if err != nil {
 		return err
 	}
-
-	// For tables with updated_at and known PKs, check LWW.
-	pkCols := tablePrimaryKeys[tableName]
-	if len(pkCols) > 0 && tableName != "" {
-		// Try to extract PK values and check local updated_at.
-		// If local row exists and has a newer HLC, skip this mutation.
-		if r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, incomingHLC) {
-			slog.Debug("replicator: LWW skip (local is newer)", "table", tableName, "hlc", incomingHLC)
-			return nil
-		}
+	if skip {
+		slog.Debug("replicator: LWW skip (local is newer)", "table", tableName, "hlc", incomingHLC)
+		return nil
 	}
-
-	// Apply INSERTs as a PK-aware upsert so a behind sender's omitted columns keep their
-	// local value instead of being reset by a whole-row replace (the reported data-loss
-	// bug); UPDATE/other run verbatim so their guards (deleted_at IS NULL, CAS) stay. An
-	// INSERT the rewrite can't prove safe returns an error and the caller back-pressures —
-	// never a destructive whole-row replace.
 	applied := s.SQL
-	if isInsertStatement(applied) {
+	if sh.Kind == KindInsert {
 		hasUpdatedAt, uerr := tableHasUpdatedAt(ctx, tx, tableName)
 		if uerr != nil {
 			return uerr // schema metadata unavailable ⇒ fail closed
@@ -1126,12 +1148,123 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	}
 	res, err := tx.ExecContext(ctx, applied, s.Params...)
 	if err == nil && rowsChanged(res) {
-		// A strictly-newer / resolver-chosen incoming write that actually CHANGED
-		// the row clears any stale unresolved-tie tracking (the remediation path).
-		// A guarded zero-row UPDATE is excluded. Lock-free when nothing is tracked.
+		// A strictly-newer / resolver-chosen incoming write that actually CHANGED the row
+		// clears any stale unresolved-tie tracking. A guarded zero-row UPDATE is excluded.
 		r.client.clearUnresolvedFromStmt(s)
 	}
 	return err
+}
+
+// applyBulkPerRowLWW applies a bulk (non-full-PK) UPDATE as an atomic per-row LWW expansion:
+// enumerate the rows matching the ORIGINAL predicate (subqueries and all), then re-apply the
+// original SET to each one ONLY where the incoming clock strictly beats that row's local
+// updated_at, scoped to the exact primary key. This gives per-row last-writer-wins for a
+// cascade that a single bulk UPDATE would apply un-gated (clobbering a concurrently-newer row
+// on a peer). The whole expansion runs in the caller's transaction under the write lock, so
+// the enumerate→apply window has no concurrent local writer; any operational error propagates
+// so the caller rolls back and back-pressures.
+func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string) error {
+	if len(pkCols) == 0 {
+		return invalidf("bulk update on %s has no known primary key", tableName)
+	}
+	if sh.UpdatedAtParamIdx < 0 || sh.UpdatedAtParamIdx >= len(s.Params) {
+		return invalidf("bulk update on %s has no bound updated_at", tableName)
+	}
+	incomingTS := coerceString(s.Params[sh.UpdatedAtParamIdx])
+	if incomingTS == "" {
+		return invalidf("bulk update on %s has empty updated_at", tableName)
+	}
+	if sh.SetClauseStart <= 0 || sh.SetClauseEnd <= sh.SetClauseStart || sh.SetClauseEnd > len(s.SQL) {
+		return invalidf("bulk update on %s: could not locate SET clause", tableName)
+	}
+	setSQL := s.SQL[sh.SetClauseStart:sh.SetClauseEnd]
+	whereSQL := ""
+	if sh.WhereEnd > sh.WhereStart && sh.WhereEnd <= len(s.SQL) {
+		whereSQL = s.SQL[sh.WhereStart:sh.WhereEnd]
+	}
+
+	// Split params into SET (leading) and WHERE (trailing) by the SET clause's param count.
+	setParamCount := 0
+	for _, a := range sh.SetAssigns {
+		setParamCount += len(a.Expr.ParamIdx)
+	}
+	if setParamCount > len(s.Params) {
+		return invalidf("bulk update on %s: SET param count exceeds params", tableName)
+	}
+	setParams := s.Params[:setParamCount]
+	whereParams := s.Params[setParamCount:]
+
+	// 1. Enumerate matching rows' PK + local updated_at with the ORIGINAL predicate.
+	sel := "SELECT " + strings.Join(pkCols, ", ") + ", updated_at FROM " + tableName
+	if whereSQL != "" {
+		sel += " WHERE " + whereSQL
+	}
+	rows, err := tx.QueryContext(ctx, sel, whereParams...)
+	if err != nil {
+		return err
+	}
+	type match struct {
+		pk      []interface{}
+		localTS string
+	}
+	var matches []match
+	for rows.Next() {
+		dst := make([]interface{}, len(pkCols)+1)
+		ptrs := make([]interface{}, len(pkCols)+1)
+		for i := range dst {
+			ptrs[i] = &dst[i]
+		}
+		if scanErr := rows.Scan(ptrs...); scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		// SQLite text scans as []byte; bind PK values back as string so `col = ?` compares.
+		pk := dst[:len(pkCols)]
+		for i, v := range pk {
+			if b, isBytes := v.([]byte); isBytes {
+				pk[i] = string(b)
+			}
+		}
+		matches = append(matches, match{pk: pk, localTS: coerceString(dst[len(pkCols)])})
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		rows.Close()
+		return rowsErr
+	}
+	rows.Close()
+
+	// 2. Per-row: apply the SET only where the incoming clock wins (skew-guarded), scoped to
+	//    the exact PK.
+	skewOn := r.client.hlcSkewGuardOn()
+	now := time.Now()
+	pkWhere := make([]string, len(pkCols))
+	for i, c := range pkCols {
+		pkWhere[i] = c + " = ?"
+	}
+	upd := "UPDATE " + tableName + " SET " + setSQL + " WHERE " + strings.Join(pkWhere, " AND ")
+	changed := false
+	for _, m := range matches {
+		if r.client.skewQuarantinesIncoming(skewOn, m.localTS, incomingTS, now) {
+			continue
+		}
+		if m.localTS != "" && lwwOrder(m.localTS, incomingTS) > 0 {
+			continue // local strictly newer → skip this row
+		}
+		params := make([]interface{}, 0, len(setParams)+len(m.pk))
+		params = append(params, setParams...)
+		params = append(params, m.pk...)
+		res, execErr := tx.ExecContext(ctx, upd, params...)
+		if execErr != nil {
+			return execErr
+		}
+		if rowsChanged(res) {
+			changed = true
+		}
+	}
+	if changed {
+		r.client.clearUnresolvedFromStmt(s)
+	}
+	return nil
 }
 
 // rowsChanged reports whether a SQL result provably affected at least one row.
@@ -1274,13 +1407,14 @@ func tableHasUpdatedAt(ctx context.Context, tx *sql.Tx, table string) (bool, err
 // excluded lease tables, for the existing self-correcting write to overwrite),
 // never resolved from a partial local⊕SET image (which could differ from the
 // source's full row and make AE and WAL diverge).
-func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName string, pkCols []string, s Statement, incomingHLC string) bool {
-	// Extract PK values from the statement params based on the table schema.
-	// This is a best-effort approach — for UPDATE statements we can try to
-	// extract the WHERE clause PK values; for INSERT we use the column order.
-	pkValues := extractPKValues(tableName, pkCols, s)
-	if len(pkValues) != len(pkCols) {
-		return false // can't determine PK, don't skip
+func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName string, pkCols []string, s Statement, sh StmtShape, incomingHLC string) (bool, error) {
+	// PK values come from the PARSED shape's parameter indices, not positional heuristics, so
+	// a mixed literal/parameter tuple (e.g. VALUES (?,0,?,NULL,?)) maps correctly. The
+	// disposition guarantees full-PK identity here, so a failure is an invariant violation ⇒
+	// fail closed (no best-effort "apply anyway").
+	pkValues, ok := pkValuesFromShape(sh, s)
+	if !ok {
+		return false, invalidf("cannot resolve primary key for LWW on %s", tableName)
 	}
 
 	// Build a SELECT for the local row's updated_at.
@@ -1295,64 +1429,122 @@ func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName st
 	}
 
 	var localUpdatedAt sql.NullString
-	err := tx.QueryRowContext(ctx,
+	selErr := tx.QueryRowContext(ctx,
 		fmt.Sprintf("SELECT updated_at FROM %s WHERE %s", tableName, where),
 		args...,
 	).Scan(&localUpdatedAt)
+	if selErr != nil && !errors.Is(selErr, sql.ErrNoRows) {
+		return false, selErr // operational failure ⇒ back-pressure, never treated as "no row"
+	}
 	localTS := ""
-	if err == nil && localUpdatedAt.Valid {
+	if selErr == nil && localUpdatedAt.Valid {
 		localTS = localUpdatedAt.String
 	}
 
-	// Prefer the row's own updated_at when the statement carries it. Most real
-	// tables still store RFC3339 in updated_at; comparing that local RFC3339
-	// against the mutation-log HLC would make every remote mutation win by
-	// format rather than by row timestamp. Fall back to the entry HLC only for
-	// statements whose timestamp cannot be extracted.
-	incomingTS, ok := extractUpdatedAtValue(s)
-	if !ok || incomingTS == "" {
-		incomingTS = incomingHLC
+	// Prefer the row's own updated_at (from the shape's updated_at parameter); fall back to
+	// the entry HLC only when the statement carries no bound updated_at.
+	incomingTS := incomingHLC
+	if ts, has := incomingUpdatedAtFromShape(sh, s); has && ts != "" {
+		incomingTS = ts
 	}
 
-	// Skew quarantine runs BEFORE the no-local-row early return: a future-
-	// skewed incoming value must be dropped even for a PK this node has not seen,
-	// or the inflated updated_at becomes the row's baseline and legitimate later
-	// writes lose to it. localTS is "" when unseen (skewQuarantinesIncoming then
-	// keys solely on the incoming being future-skewed).
+	// Skew quarantine runs BEFORE the no-local-row early return: a future-skewed incoming
+	// value must be dropped even for a PK this node has not seen.
 	if r.client.skewQuarantinesIncoming(r.client.hlcSkewGuardOn(), localTS, incomingTS, time.Now()) {
 		slog.Warn("replicator: quarantined future-skewed incoming statement (not applied)",
 			"table", tableName, "incoming_updated_at", incomingTS, "first_seen", localTS == "")
-		return true // skip incoming
+		return true, nil // skip incoming
 	}
 
-	// No local row (or unreadable) → nothing to compare; apply incoming.
-	if err != nil || localTS == "" {
-		return false
+	// No local row → nothing to compare; apply incoming.
+	if errors.Is(selErr, sql.ErrNoRows) || localTS == "" {
+		return false, nil
 	}
 
 	switch ord := lwwOrder(localTS, incomingTS); {
 	case ord > 0:
-		return true // local strictly newer → skip incoming
+		return true, nil // local strictly newer → skip incoming
 	case ord < 0:
-		return false // incoming strictly newer → apply
+		return false, nil // incoming strictly newer → apply
 	}
-	// Exact tie. AE-excluded tables keep local (existing lease/self-correcting
-	// semantics — they never reach the resolver, matching anti-entropy).
+	// Exact tie. AE-excluded tables keep local (existing lease/self-correcting semantics).
 	if _, repaired := capabilityMap[tableName]; !repaired {
-		return true
+		return true, nil
 	}
-	// A full-image INSERT can be resolved over the full row, exactly as AE does.
-	if cols, vals, isFull := extractInsertRow(s); isFull {
-		pkIdx := columnIndexes(cols, pkCols)
-		localRow, found := fetchLocalRowCells(tx, tableName, cols, pkCols, pkIdx, vals)
-		if !found {
-			return false // no local row → apply incoming
+	// Full-image eligibility for tie resolution: a plain INSERT (all supplied columns), or an
+	// explicit upsert PROVEN full-image (every non-PK column assigned c = excluded.c). A
+	// partial/transformed upsert or any UPDATE keeps local — resolving from a partial image
+	// could disagree with anti-entropy's full-row resolution.
+	fullImage := sh.Kind == KindInsert && (sh.OnConflict == nil || sh.OnConflict.IsFullImage)
+	if fullImage {
+		if cols, vals, okRow := insertRowFromShape(sh, s); okRow {
+			pkIdx := columnIndexes(cols, pkCols)
+			localRow, found := fetchLocalRowCells(tx, tableName, cols, pkCols, pkIdx, vals)
+			if !found {
+				return false, nil // no local row → apply incoming
+			}
+			keepLocal, _ := r.client.resolveTie(tableName, cols, localRow, vals, pkIdx, pathWAL)
+			return keepLocal, nil
 		}
-		keepLocal, _ := r.client.resolveTie(tableName, cols, localRow, vals, pkIdx, pathWAL)
-		return keepLocal
 	}
-	// A tied partial UPDATE: keep local; anti-entropy converges it over the full row.
-	return true
+	// A tied partial UPDATE / non-full-image upsert: keep local; anti-entropy converges it.
+	return true, nil
+}
+
+// pkValuesFromShape returns the primary-key values a full-PK statement binds, from the shape's
+// resolved PK parameter indices. ok=false when the shape has no full-PK identity.
+func pkValuesFromShape(sh StmtShape, s Statement) ([]interface{}, bool) {
+	if !sh.HasFullPKIdentity || len(sh.PKParamIdx) == 0 {
+		return nil, false
+	}
+	vals := make([]interface{}, len(sh.PKParamIdx))
+	for i, idx := range sh.PKParamIdx {
+		if idx < 0 || idx >= len(s.Params) {
+			return nil, false
+		}
+		vals[i] = s.Params[idx]
+	}
+	return vals, true
+}
+
+// incomingUpdatedAtFromShape returns the updated_at value the statement binds, from the
+// shape's resolved updated_at parameter index.
+func incomingUpdatedAtFromShape(sh StmtShape, s Statement) (string, bool) {
+	if sh.UpdatedAtParamIdx < 0 || sh.UpdatedAtParamIdx >= len(s.Params) {
+		return "", false
+	}
+	return coerceString(s.Params[sh.UpdatedAtParamIdx]), true
+}
+
+// insertRowFromShape reconstructs the full column list and row values of an INSERT from the
+// parsed shape, mapping each cell to its bound parameter or canonical literal. This handles
+// mixed literal/parameter tuples that the positional heuristic could not. ok=false for a
+// non-INSERT or a column/value count mismatch.
+func insertRowFromShape(sh StmtShape, s Statement) (cols []string, vals []interface{}, ok bool) {
+	if sh.Kind != KindInsert || len(sh.InsertCols) != len(sh.InsertVals) || len(sh.InsertCols) == 0 {
+		return nil, nil, false
+	}
+	vals = make([]interface{}, len(sh.InsertVals))
+	for i, v := range sh.InsertVals {
+		if v.isParam() {
+			if v.ParamIndex < 0 || v.ParamIndex >= len(s.Params) {
+				return nil, nil, false
+			}
+			vals[i] = s.Params[v.ParamIndex]
+			continue
+		}
+		switch v.Literal.Kind {
+		case LitNull:
+			vals[i] = nil
+		case LitInt:
+			vals[i] = v.Literal.Int
+		case LitString:
+			vals[i] = v.Literal.Str
+		default:
+			return nil, nil, false
+		}
+	}
+	return sh.InsertCols, vals, true
 }
 
 // extractPKValues attempts to extract primary key values from a Statement.

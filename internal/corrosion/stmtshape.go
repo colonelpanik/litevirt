@@ -171,6 +171,13 @@ type StmtShape struct {
 
 	// UPDATE
 	SetAssigns []AssignmentShape
+	// SetClauseStart/End are the byte span of the SET assignment list in the ORIGINAL sql
+	// (after "SET ", before "WHERE"). WhereStart/End are the byte span of the WHERE predicate
+	// (after "WHERE"). The per-row-LWW expansion slices these to rebuild a scoped enumeration
+	// SELECT and per-row UPDATE from the exact source text (subqueries included). Zero when
+	// the clause is absent.
+	SetClauseStart, SetClauseEnd int
+	WhereStart, WhereEnd         int
 
 	// UPDATE / DELETE
 	Where PredicateTree
@@ -231,6 +238,7 @@ type sqlParser struct {
 	toks       []sqlTok
 	pos        int
 	paramCount int // running count of '?' consumed → global positional param index
+	lastEnd    int // byte offset just past the last consumed token (for clause spans)
 }
 
 // takeParam consumes the current '?' sqlTok and returns its global positional index
@@ -253,6 +261,7 @@ func (p *sqlParser) next() sqlTok {
 	t := p.peek()
 	if p.pos < len(p.toks) {
 		p.pos++
+		p.lastEnd = t.pos + len(t.text)
 	}
 	return t
 }

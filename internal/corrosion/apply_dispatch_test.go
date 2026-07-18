@@ -1,0 +1,89 @@
+package corrosion
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+)
+
+// TestApplyBulkPerRowLWW_GatesByRowClock proves the per-row-LWW expansion: a single bulk
+// tombstone keyed by a parent column only tombstones the matching rows whose local clock is
+// OLDER than the incoming write — a concurrently-newer row on this node is kept.
+func TestApplyBulkPerRowLWW_GatesByRowClock(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+
+	const oldTS = "1000000000000-0000-n1"
+	const futureTS = "3000000000000-0000-n1"
+	for i, iface := range []struct{ net, ua string }{{"neta", oldTS}, {"netb", futureTS}} {
+		if err := c.Execute(ctx,
+			`INSERT INTO vm_interfaces (vm_name, network_name, ordinal, mac, updated_at) VALUES (?, ?, ?, ?, ?)`,
+			"vm1", iface.net, i, "00:11:22:33:44:5"+fmt.Sprint(i), iface.ua); err != nil {
+			t.Fatalf("seed %s: %v", iface.net, err)
+		}
+	}
+
+	r := NewReplicator(c, "", RelayConfig{})
+	const midTS = "2000000000000-0000-n2"
+	stmts := fmt.Sprintf(
+		`[{"SQL":"UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?","Params":["%s","%s","vm1"]}]`, midTS, midTS)
+	entries := []*pb.MutationEntry{{Seq: 1, Hlc: midTS, Origin: "origin-node", Stmts: stmts}}
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	deletedAt := func(net string) string {
+		rows, err := c.Query(ctx, "SELECT deleted_at FROM vm_interfaces WHERE vm_name = ? AND network_name = ?", "vm1", net)
+		if err != nil || len(rows) == 0 {
+			t.Fatalf("query %s: err=%v rows=%d", net, err, len(rows))
+		}
+		return rows[0].String("deleted_at")
+	}
+	if deletedAt("neta") == "" {
+		t.Error("neta (older clock) must be tombstoned by the bulk update")
+	}
+	if deletedAt("netb") != "" {
+		t.Error("netb (newer local clock) must be KEPT — per-row LWW must not clobber it")
+	}
+}
+
+// TestApplyRemoteMutations_UnregisteredDeleteRejected: a hard DELETE whose shape is not a
+// registered retention template must back-pressure, never be applied on a derived disposition.
+func TestApplyRemoteMutations_UnregisteredDeleteRejected(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	r := NewReplicator(c, "", RelayConfig{})
+	// The registered vms delete is `WHERE name = ? AND deleted_at IS NOT NULL`; this shape is
+	// different, so it is unregistered.
+	stmts := `[{"SQL":"DELETE FROM vms WHERE host_name = ?","Params":["host-x"]}]`
+	entries := []*pb.MutationEntry{{Seq: 1, Hlc: "2000000000000-0000-n2", Origin: "origin-node", Stmts: stmts}}
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err == nil {
+		t.Fatal("expected back-pressure for an unregistered DELETE shape")
+	}
+	assertNotSeen(t, c, "origin-node")
+}
+
+// TestApplyRemoteMutations_DerivesUnregisteredInsert: a column-subset INSERT (an older
+// sender's shape, absent from this build's ledger) is applied by its derived disposition
+// rather than back-pressured — the mixed-version horizon. (Column preservation itself is
+// covered elsewhere; here we assert the derive path applies at all.)
+func TestApplyRemoteMutations_DerivesUnregisteredInsert(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	r := NewReplicator(c, "", RelayConfig{})
+	// A minimal hosts INSERT — not a shape any current builder emits verbatim.
+	stmts := `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)","Params":["h9","10.0.0.9","root","s9","2020-01-01T00:00:00Z","2000000000000-0000-n2"]}]`
+	entries := []*pb.MutationEntry{{Seq: 1, Hlc: "2000000000000-0000-n2", Origin: "origin-node", Stmts: stmts}}
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
+		t.Fatalf("derived-disposition apply must succeed, got: %v", err)
+	}
+	rows, err := c.Query(ctx, "SELECT address FROM hosts WHERE name = ?", "h9")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("row not inserted: err=%v rows=%d", err, len(rows))
+	}
+	if got := rows[0].String("address"); got != "10.0.0.9" {
+		t.Errorf("address = %q, want 10.0.0.9", got)
+	}
+}

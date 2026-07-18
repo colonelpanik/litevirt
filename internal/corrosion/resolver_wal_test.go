@@ -2,8 +2,24 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 )
+
+// mustSkipLWW parses the statement's shape (as the apply path does) and calls shouldSkipLWW,
+// failing the test on any parse/LWW error.
+func mustSkipLWW(t *testing.T, r *Replicator, ctx context.Context, tx *sql.Tx, table string, pkCols []string, s Statement, ts string) bool {
+	t.Helper()
+	sh, err := parseStmtShape(s.SQL, pkCols)
+	if err != nil {
+		t.Fatalf("parse shape: %v", err)
+	}
+	skip, err := r.shouldSkipLWW(ctx, tx, table, pkCols, s, sh, ts)
+	if err != nil {
+		t.Fatalf("shouldSkipLWW: %v", err)
+	}
+	return skip
+}
 
 // The WAL (replicator) path resolves a full-image-INSERT tie through the SAME
 // engine anti-entropy uses, so the two paths never disagree. Numeric params on
@@ -33,7 +49,7 @@ func TestWAL_TieResolvesFullImageInsert(t *testing.T) {
 		SQL:    `INSERT OR REPLACE INTO images (name, format, size_bytes, updated_at) VALUES (?, ?, ?, ?)`,
 		Params: []interface{}{"img", "zzz", float64(5000000000), ts},
 	}
-	if r.shouldSkipLWW(ctx, tx, "images", []string{"name"}, s, ts) {
+	if mustSkipLWW(t, r, ctx, tx, "images", []string{"name"}, s, ts) {
 		t.Fatal("content-max must take the lexically-greater incoming row (zzz), not skip it")
 	}
 }
@@ -61,7 +77,7 @@ func TestWAL_TieRuntimeOwnedKeepsLocal(t *testing.T) {
 		SQL:    `INSERT OR REPLACE INTO vms (name, host_name, state, spec, updated_at) VALUES (?, ?, ?, ?, ?)`,
 		Params: []interface{}{"vm1", "host-b", "running", "{}", ts},
 	}
-	if !r.shouldSkipLWW(ctx, tx, "vms", []string{"name"}, s, ts) {
+	if !mustSkipLWW(t, r, ctx, tx, "vms", []string{"name"}, s, ts) {
 		t.Fatal("a runtime-owned host_name tie must keep local (skip the incoming)")
 	}
 	if c.UnresolvedTieCount() != 1 {
@@ -95,7 +111,7 @@ func TestWAL_TiePartialUpdateKeepsLocal(t *testing.T) {
 		SQL:    `UPDATE images SET format = ?, updated_at = ? WHERE name = ?`,
 		Params: []interface{}{"zzz", ts, "img"},
 	}
-	if !r.shouldSkipLWW(ctx, tx, "images", []string{"name"}, s, ts) {
+	if !mustSkipLWW(t, r, ctx, tx, "images", []string{"name"}, s, ts) {
 		t.Fatal("a tied partial UPDATE must keep local (defer convergence to anti-entropy)")
 	}
 }

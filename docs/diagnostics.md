@@ -187,10 +187,14 @@ unrelated row), or if an existing child references the losing id
 (`snapshots.parent_id`, unused today, would be orphaned since references are not
 rewritten).
 
-**Orphaned artifacts:** a collapse whose losing row lived on a **different host**
-leaves that host's snapshot file unreferenced. It is **not** auto-deleted — the losing
-id/host/path is logged (WARN) and counted in `litevirt_identity_collapse_orphaned_total`
-so an operator can reclaim the space.
+**Orphaned artifacts:** a collapse whose losing row referenced a **different physical
+artifact** — a different `(host, path)` pair — leaves the losing file unreferenced.
+That includes a different host (the whole losing snapshot is stranded) **and** a
+same-host path change (e.g. a `vmstate_path`/`path` rewrite; because `host_name` is
+part of the `container_snapshots` natural key, its collapses are always same-host, so
+a path change is the only way one orphans a file). It is **not** auto-deleted — the
+losing id/host/path is logged (WARN) and counted in
+`litevirt_identity_collapse_orphaned_total` so an operator can reclaim the space.
 
 **Scanner lane:** while it is active fleet-wide, `lv doctor divergence` keys these
 tables by their natural key too, so a still-converging group shows as **one**

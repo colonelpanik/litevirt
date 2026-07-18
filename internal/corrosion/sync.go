@@ -867,6 +867,7 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 	// On an exact-instant tie the content must be proven equivalent over the FULL local schema
 	// (not just the sender's projection) before an id-based collapse — else keep local as a fault.
 	// The closure captures the full local row so a fault can be tracked by natural key below.
+	var localFullCols []string
 	var localFullVals []interface{}
 	contentEqual := func() (bool, error) {
 		fullCols, fullVals, found, fErr := fetchFullRowByID(tx, table.Name, localID.String)
@@ -876,27 +877,29 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 		if !found {
 			return false, nil
 		}
-		localFullVals = fullVals
+		localFullCols, localFullVals = fullCols, fullVals
 		return identityContentEquivalent(fullCols, fullVals, table.Columns, row), nil
 	}
 	disp, dErr := resolveIdentity(localExists, localTS, localID.String, incomingTS, incomingID, contentEqual)
 	if dErr != nil {
 		return false, dErr
 	}
-	if disp == idContentFault {
-		slog.Warn("sync: unresolved identity fault (equal timestamp, unproven-equivalent content) — keeping local", "table", table.Name)
-		c.trackIdentityFault(table.Name, incomingNat, localFullVals, row, pathAE)
-		return false, nil
-	}
-	// Any resolved disposition supersedes a prior fault for this natural key.
-	c.clearIdentityFault(table.Name, incomingNat)
 	switch disp {
+	case idContentFault:
+		slog.Warn("sync: unresolved identity fault (equal timestamp, unproven-equivalent content) — keeping local", "table", table.Name)
+		c.trackIdentityFault(table.Name, incomingNat, localFullCols, localFullVals, pathAE)
+		return false, nil
 	case idKeepLocal:
+		// An older / re-observed incoming does NOT resolve a standing fault (the conflicting peer
+		// row still exists), so keep-local never clears the tracked fault.
 		return false, nil
 	case idApplyNew, idAdoptSameID:
 		rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
 		if execErr != nil {
 			return false, execErr
+		}
+		if !rejected {
+			c.clearIdentityFault(table.Name, incomingNat) // clear only AFTER a successful apply
 		}
 		return !rejected, nil
 	default: // idCollapse
@@ -907,21 +910,25 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 		} else if orphan {
 			return false, fmt.Errorf("identity collapse on %s would orphan a reference to the losing id", table.Name)
 		}
-		// Capture the losing row's host/artifact BEFORE the re-key overwrites them.
-		losingHost, losingPath := identityArtifact(tx, table.Name, localID.String)
+		// Capture the losing row's (host, artifact-path) BEFORE the re-key overwrites them; a
+		// lookup error fails closed (rolls back the chunk) rather than silently dropping cleanup.
+		losingHost, losingPath, haveArtifact, aErr := identityArtifact(tx, table.Name, localID.String)
+		if aErr != nil {
+			return false, aErr
+		}
 		rejected, cErr := identityCollapseUpdate(tx, table.Name, table.Columns, row, localID.String)
 		if cErr != nil {
 			return false, cErr
 		}
 		if rejected {
 			c.observeMergeRejected(table.Name, "ae", "identity_collapse_rejected")
-			return false, nil
+			return false, nil // do NOT clear the fault on a rejected collapse
 		}
-		winnerHost := ""
-		if hi := indexOf(table.Columns, "host_name"); hi >= 0 {
-			winnerHost = coerceString(row[hi])
+		c.clearIdentityFault(table.Name, incomingNat) // converged → clear only on success
+		if haveArtifact {
+			winnerHost, winnerPath := incomingArtifact(table.Name, table.Columns, row)
+			c.surfaceIdentityCollapseOrphan(table.Name, localID.String, losingHost, losingPath, incomingID, winnerHost, winnerPath)
 		}
-		c.surfaceIdentityCollapseOrphan(table.Name, localID.String, losingHost, losingPath, incomingID, winnerHost)
 		return true, nil
 	}
 }
@@ -1307,11 +1314,19 @@ func fetchFullRowByID(tx *sql.Tx, tableName, idVal string) (cols []string, vals 
 	return cols, jsonRoundTripCells(raw), true, nil
 }
 
-// trackIdentityFault records an exact-instant/different-content identity fault under the natural-key
-// tracker so it feeds litevirt_lww_tie_unresolved_current / _total and dedupes per logical identity
-// (the physical-PK clear path can't cover it — the two rows have different ids).
-func (c *Client) trackIdentityFault(table string, natVals, localFull, incoming []interface{}, path resolveTiePath) {
-	c.trackUnresolved(table, identityFaultPK(natVals), localFull, incoming, path, "identity_content_conflict")
+// trackIdentityFault records an exact-instant/unproven-equivalent identity fault under the
+// natural-key tracker so it feeds litevirt_lww_tie_unresolved_current / _total and dedupes per
+// logical identity (the physical-PK clear path can't cover it — the two rows have different ids).
+// The dedup pair is derived from the LOCAL full row alone, order-invariantly by column NAME
+// (encodeRowCellsV2): local is always the complete schema row, so the same logical fault dedupes
+// whether observed through a full AE dump or a subset/reordered WAL statement, and it re-alerts
+// only when the local row's content actually changes.
+func (c *Client) trackIdentityFault(table string, natVals []interface{}, localCols []string, localFull []interface{}, path resolveTiePath) {
+	pair := encodeRowCells(localFull) // positional fallback
+	if enc, err := encodeRowCellsV2(localCols, localFull); err == nil {
+		pair = enc
+	}
+	c.trackUnresolvedPair(table, identityFaultPK(natVals), pair, path, "identity_content_conflict")
 }
 
 // clearIdentityFault drops any tracked identity fault for this natural key — called on a resolved
@@ -1324,33 +1339,62 @@ func (c *Client) clearIdentityFault(table string, natVals []interface{}) {
 	c.clearUnresolved(table, identityFaultPK(natVals))
 }
 
-// surfaceIdentityCollapseOrphan surfaces a collapse whose LOSING row referenced a different host
-// than the winner: that host's snapshot artifact may now be unreferenced. It is NOT auto-deleted —
-// the losing id/host/path is logged (WARN) and counted (bounded per-table metric) for operator
-// cleanup. losingHost/losingPath are read BEFORE the collapse re-key overwrote them.
-func (c *Client) surfaceIdentityCollapseOrphan(table, losingID, losingHost, losingPath, winnerID, winnerHost string) {
-	if losingHost == "" || losingHost == winnerHost {
-		return // same host (re-keyed in place) → no orphan
+// surfaceIdentityCollapseOrphan surfaces a collapse whose LOSING row referenced a DIFFERENT
+// physical artifact — a different (host, path) pair — than the winner, so the losing file may now
+// be unreferenced. It is NOT auto-deleted: the losing id/host/path is logged (WARN) and counted
+// (bounded per-table metric) for operator cleanup. Comparing the full (host, path) pair matters
+// because host_name is part of the container_snapshots natural key (so a collapse there is always
+// same-host — only a path change orphans a file), and a same-host snapshot collapse can still
+// overwrite vmstate_path. losing* are read BEFORE the re-key overwrote them.
+func (c *Client) surfaceIdentityCollapseOrphan(table, losingID, losingHost, losingPath, winnerID, winnerHost, winnerPath string) {
+	if losingHost == winnerHost && losingPath == winnerPath {
+		return // same physical artifact (re-keyed in place) → nothing orphaned
+	}
+	// A same-host path change orphans a file only if the losing row actually had one.
+	if losingHost == winnerHost && losingPath == "" {
+		return
 	}
 	c.observeIdentityCollapseOrphan(table)
-	slog.Warn("identity collapse orphaned a losing-host artifact (not auto-deleted; needs cleanup)",
-		"table", table, "losing_id", losingID, "losing_host", losingHost, "artifact_path", losingPath,
-		"winner_id", winnerID, "winner_host", winnerHost)
+	slog.Warn("identity collapse orphaned a losing artifact (not auto-deleted; needs cleanup)",
+		"table", table, "losing_id", losingID, "losing_host", losingHost, "losing_path", losingPath,
+		"winner_id", winnerID, "winner_host", winnerHost, "winner_path", winnerPath)
 }
 
-// identityArtifact reads a row's (host, artifact-path) for orphan surfacing. Missing row or no
-// registered artifact columns → empty strings (no surfacing).
-func identityArtifact(tx *sql.Tx, table, id string) (host, path string) {
+// identityArtifact reads a row's (host, artifact-path) for orphan surfacing. It FAILS CLOSED: an
+// operational/schema error propagates (so the caller back-pressures / rolls back rather than
+// silently disabling the cleanup signal), and only sql.ErrNoRows is a benign found=false. A table
+// with no registered artifact columns returns found=false, nil (nothing to surface).
+func identityArtifact(tx *sql.Tx, table, id string) (host, path string, found bool, err error) {
+	art, ok := identityArtifactColumns[table]
+	if !ok {
+		return "", "", false, nil
+	}
+	var h, p sql.NullString
+	q := "SELECT " + art.host + ", COALESCE(" + art.path + ", '') FROM " + table + " WHERE id = ?"
+	if scanErr := tx.QueryRow(q, id).Scan(&h, &p); scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return "", "", false, nil
+		}
+		return "", "", false, fmt.Errorf("identity artifact lookup on %s: %w", table, scanErr)
+	}
+	return h.String, p.String, true, nil
+}
+
+// incomingArtifact extracts the winner's (host, artifact-path) from an incoming row's projection.
+// A column the projection omits (schema skew) reads as "" — a safe over-surface (the comparison
+// then treats it as a differing artifact rather than silently matching).
+func incomingArtifact(table string, cols []string, vals []interface{}) (host, path string) {
 	art, ok := identityArtifactColumns[table]
 	if !ok {
 		return "", ""
 	}
-	var h, p sql.NullString
-	q := "SELECT " + art.host + ", COALESCE(" + art.path + ", '') FROM " + table + " WHERE id = ?"
-	if err := tx.QueryRow(q, id).Scan(&h, &p); err != nil {
-		return "", ""
+	if i := indexOf(cols, art.host); i >= 0 && i < len(vals) {
+		host = coerceString(vals[i])
 	}
-	return h.String, p.String
+	if i := indexOf(cols, art.path); i >= 0 && i < len(vals) {
+		path = coerceString(vals[i])
+	}
+	return host, path
 }
 
 // jsonRoundTripCells marshals then unmarshals a scanned row so its numeric/text

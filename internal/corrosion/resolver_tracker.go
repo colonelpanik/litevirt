@@ -43,7 +43,14 @@ func (c *Client) anyUnresolved() bool { return c.unresolvedLen.Load() > 0 }
 // logs an alert ONCE per distinct (table,PK,content-pair); re-observing the same
 // divergence is a no-op (bounded). Safe to call with c.mu held (uses its own lock).
 func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}, path resolveTiePath, category string) {
-	pair := contentPair(local, incoming)
+	c.trackUnresolvedPair(table, pk, contentPair(local, incoming), path, category)
+}
+
+// trackUnresolvedPair is trackUnresolved with a precomputed content-pair fingerprint, so a caller
+// that needs a projection-independent / order-invariant key (identity faults, where local is the
+// full row but the incoming may be a subset/reordered statement) can supply a stable one instead
+// of the positional (local,incoming) pair.
+func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath, category string) {
 	key := unresolvedKey(table, pk)
 
 	c.tieMu.Lock()

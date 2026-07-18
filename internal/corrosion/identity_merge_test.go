@@ -331,20 +331,142 @@ func TestMergeIdentity_CrossHostCollapseSurfacesOrphan(t *testing.T) {
 	}
 }
 
-// TestMergeIdentity_SameHostCollapseNoOrphan (finding 4, contrast): a collapse on the SAME host is
-// re-keyed in place — no artifact is orphaned, so nothing is surfaced.
-func TestMergeIdentity_SameHostCollapseNoOrphan(t *testing.T) {
+// snapshotDumpRowPath is snapshotDumpRow with an explicit vmstate_path (index 8).
+func snapshotDumpRowPath(id, vmName, host, name, vmstatePath, updatedAt string) []interface{} {
+	r := snapshotDumpRow(id, vmName, host, name, updatedAt)
+	r[8] = vmstatePath
+	return r
+}
+
+// TestMergeIdentity_SameHostSamePathNoOrphan (finding 1): a same-host collapse whose winner points
+// at the SAME artifact is re-keyed in place — nothing is orphaned, so nothing is surfaced.
+func TestMergeIdentity_SameHostSamePathNoOrphan(t *testing.T) {
 	c := mustTestClient(t)
 	c.SetCanonicalIdentity(func() bool { return true })
 	sm := &fakeSyncMetrics{}
 	c.SetSyncMetrics(sm)
-	seedSnapshot(t, c, "id-local", "vm1", "snap1", "1000000000000-0000-n1") // host-a
-	incoming := snapshotDumpRow("id-remote", "vm1", "host-a", "snap1", "2000000000000-0000-n2")
+	// Local + incoming both on host-a with the SAME vmstate_path.
+	if err := c.Execute(context.Background(),
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, vmstate_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"id-local", "vm1", "host-a", "snap1", "ready", "/data/snap.state", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	incoming := snapshotDumpRowPath("id-remote", "vm1", "host-a", "snap1", "/data/snap.state", "2000000000000-0000-n2")
 	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, incoming)); err != nil {
 		t.Fatalf("merge: %v", err)
 	}
 	if len(sm.identityOrphan) != 0 {
-		t.Fatalf("same-host collapse must NOT surface an orphan, got %v", sm.identityOrphan)
+		t.Fatalf("same-host same-path collapse must NOT surface an orphan, got %v", sm.identityOrphan)
+	}
+}
+
+// TestMergeIdentity_SameHostDifferentPathSurfacesOrphan (finding 1): a same-host collapse whose
+// winner points at a DIFFERENT path orphans the losing file — it must be surfaced.
+func TestMergeIdentity_SameHostDifferentPathSurfacesOrphan(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	if err := c.Execute(context.Background(),
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, vmstate_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"id-local", "vm1", "host-a", "snap1", "ready", "/data/old.state", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	incoming := snapshotDumpRowPath("id-remote", "vm1", "host-a", "snap1", "/data/new.state", "2000000000000-0000-n2")
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, incoming)); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(sm.identityOrphan) != 1 || sm.identityOrphan[0] != "snapshots" {
+		t.Fatalf("same-host different-path collapse must surface the orphan, got %v", sm.identityOrphan)
+	}
+}
+
+// TestMergeIdentity_ContainerSnapshotPathOrphan (finding 1): container_snapshots is ALWAYS
+// same-host (host_name is part of its natural key), so cleanup can only ever trigger on a path
+// change — which the (host, path)-pair comparison now catches.
+func TestMergeIdentity_ContainerSnapshotPathOrphan(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	if err := c.Execute(context.Background(),
+		`INSERT INTO container_snapshots (id, ct_name, host_name, name, state, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"ct-local", "web", "host-a", "snap1", "ready", "/ct/old.tar", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	incoming := ctSnapDumpRow("ct-remote", "host-a", "web", "snap1", "2000000000000-0000-n2")
+	incoming[7] = "/ct/new.tar" // path column
+	if err := c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
+		Name: "container_snapshots", Columns: ctSnapDumpCols, Rows: [][]interface{}{incoming},
+	}}}); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(sm.identityOrphan) != 1 || sm.identityOrphan[0] != "container_snapshots" {
+		t.Fatalf("container_snapshots path change must surface the orphan, got %v", sm.identityOrphan)
+	}
+}
+
+// TestMergeIdentity_KeepLocalDoesNotClearFault (finding 2): an OLDER/again-observed incoming that
+// resolves to keep-local must NOT clear a standing identity fault (the conflicting peer persists).
+func TestMergeIdentity_KeepLocalDoesNotClearFault(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	const tie = "2000000000000-0000-tie"
+	seedSnapshot(t, c, "id-a", "vm1", "snap1", tie)
+	fault := []interface{}{"id-b", "vm1", "host-a", "snap1", "error", nil, nil, "disk", nil, 0, "2020-01-01T00:00:00Z", tie, nil}
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, fault)); err != nil {
+		t.Fatalf("merge fault: %v", err)
+	}
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("fault must be tracked, count=%d", c.UnresolvedTieCount())
+	}
+	// A strictly-OLDER incoming resolves to keep-local; it must NOT clear the fault.
+	older := snapshotDumpRow("id-c", "vm1", "host-a", "snap1", "1000000000000-0000-old")
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, older)); err != nil {
+		t.Fatalf("merge older: %v", err)
+	}
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("keep-local (older incoming) must NOT clear the standing fault, count=%d", c.UnresolvedTieCount())
+	}
+}
+
+// TestMergeIdentity_FaultDedupAcrossPaths (finding 4): the SAME logical fault observed through a
+// full AE dump and a subset WAL statement dedupes to one tracked entry (the pair keys on the local
+// full row, order-invariantly, so the incoming projection doesn't matter).
+func TestMergeIdentity_FaultDedupAcrossPaths(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	r := NewReplicator(c, "", RelayConfig{})
+	const tie = "2000000000000-0000-tie"
+	seedSnapshot(t, c, "id-a", "vm1", "snap1", tie)
+
+	// AE full-dump fault.
+	faultAE := []interface{}{"id-b", "vm1", "host-a", "snap1", "error", nil, nil, "disk", nil, 0, "2020-01-01T00:00:00Z", tie, nil}
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, faultAE)); err != nil {
+		t.Fatalf("merge AE: %v", err)
+	}
+	// WAL subset statement at the same tie (any snapshots INSERT ties → incomplete image → fault).
+	tx, _ := c.db.Begin()
+	sWAL := snapshotInsertStmt("id-d", "vm1", "host-a", "snap1", tie)
+	if err := r.applyStatementLWW(context.Background(), tx, sWAL, tie); err != nil {
+		tx.Rollback()
+		t.Fatalf("WAL apply: %v", err)
+	}
+	_ = tx.Commit()
+
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("the same fault across AE + WAL must dedup to ONE tracked entry, count=%d", c.UnresolvedTieCount())
+	}
+	n := 0
+	for _, s := range sm.tieUnresolved {
+		if s == "snapshots/ae/identity_content_conflict" || s == "snapshots/wal/identity_content_conflict" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly one distinct identity-fault alert, got %d (%v)", n, sm.tieUnresolved)
 	}
 }
 

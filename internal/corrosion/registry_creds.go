@@ -6,7 +6,14 @@ import (
 	"encoding/binary"
 
 	"github.com/google/uuid"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
+
+// capCanonicalRegistryV1 is the capability token gating the Part H2 canonical registry writer +
+// its capability-gated ledger disposition. Aliased from the capabilities package (single source of
+// truth) so the ledger policy and the runtime activation check can't drift.
+const capCanonicalRegistryV1 = capabilities.CanonicalRegistryV1
 
 // RegistryCredential is one stored OCI/Docker registry login (schema v23).
 // A row is either per-user (Scope="user", Owner=<username>) or global
@@ -87,21 +94,36 @@ func UpsertRegistryCredential(ctx context.Context, c *Client, rc RegistryCredent
 // tombstone+insert and no minted id, so two nodes writing the same triple converge by LWW on the
 // PK rather than colliding on the partial UNIQUE. rc.ID is ignored (recomputed).
 // registryCanonicalUpsertSQL is the single frozen statement the canonical writer emits (exported
-// to tests so they can't drift from the ledger-registered shape).
+// to tests so they can't drift from the ledger-registered shape). The ON CONFLICT SET is a FULL
+// image of the row's mutable content — including created_at = excluded.created_at — so a
+// replicated write CONVERGES the whole row on the winning value: two nodes that independently
+// created this deterministic id (with different wall-clock created_at) otherwise keep different
+// created_at forever and read as a permanent equal-timestamp content fault. scope/owner/registry
+// are not reassigned (the id pins them); deleted_at is always cleared (a write is a revive).
 const registryCanonicalUpsertSQL = `INSERT INTO registry_credentials
 		   (id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at)
 		   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
 		 ON CONFLICT(id) DO UPDATE SET
 		   username = excluded.username,
 		   secret = excluded.secret,
+		   created_at = excluded.created_at,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`
 
 func UpsertRegistryCredentialCanonical(ctx context.Context, c *Client, rc RegistryCredential) error {
 	now := c.NowTS()
 	id := RegistryCredentialID(rc.Scope, rc.Owner, rc.Registry)
+	// PRESERVE an existing row's created_at (a rotate/revive keeps the original creation time),
+	// then propagate that selected value through the full-image upsert so every node converges on
+	// it. A create (no row yet) stamps a fresh created_at.
+	createdAt := nowRFC3339()
+	if existing, err := c.Query(ctx, "SELECT created_at FROM registry_credentials WHERE id = ?", id); err != nil {
+		return err
+	} else if len(existing) == 1 {
+		createdAt = existing[0].String("created_at")
+	}
 	return c.Execute(ctx, registryCanonicalUpsertSQL,
-		id, rc.Scope, rc.Owner, rc.Registry, rc.Username, rc.Secret, nowRFC3339(), now)
+		id, rc.Scope, rc.Owner, rc.Registry, rc.Username, rc.Secret, createdAt, now)
 }
 
 // UpsertRegistryCredentialAuto selects the canonical (deterministic-id) writer when the H2

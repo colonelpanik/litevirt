@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -184,5 +185,117 @@ func TestRegistryCredentialCanonical_ConcurrentConverges(t *testing.T) {
 	rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
 	if len(rows) != 1 || rows[0].String("id") != id || rows[0].String("secret") != "peer" {
 		t.Fatalf("concurrent logins must converge to one row (newer wins), got %v", rows)
+	}
+}
+
+// canonicalUpsertStmt builds the exact statement the canonical writer emits (ledger-registered).
+func canonicalUpsertStmt(id, scope, owner, registry, username, secret, createdAt, updatedAt string) Statement {
+	return Statement{
+		SQL:    registryCanonicalUpsertSQL,
+		Params: []interface{}{id, scope, owner, registry, username, secret, createdAt, updatedAt},
+	}
+}
+
+// applyRegistryWAL drives one replicated statement through the WAL apply path, returning the apply
+// error (nil on success). Infra failures fail the test.
+func applyRegistryWAL(t *testing.T, c *Client, s Statement) error {
+	t.Helper()
+	r := NewReplicator(c, "", RelayConfig{})
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	aerr := r.applyStatementLWW(context.Background(), tx, s, s.Params[len(s.Params)-1].(string))
+	if aerr != nil {
+		tx.Rollback()
+		return aerr
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	return nil
+}
+
+func fullRegistryRow(t *testing.T, c *Client, id string) string {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		"SELECT id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at FROM registry_credentials WHERE id = ?", id)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want one row for id %s, got %d", id, len(rows))
+	}
+	r := rows[0]
+	return strings.Join([]string{
+		r.String("id"), r.String("scope"), r.String("owner"), r.String("registry"),
+		r.String("username"), r.String("secret"), r.String("created_at"), r.String("updated_at"), r.String("deleted_at"),
+	}, "|")
+}
+
+// TestRegistryCanonical_TwoClientConverges (finding 1): two nodes independently create the same
+// deterministic id with DIFFERENT created_at; after bidirectional replication both nodes hold the
+// IDENTICAL full row (the newer write's, created_at included) — no permanent created_at divergence.
+func TestRegistryCanonical_TwoClientConverges(t *testing.T) {
+	id := RegistryCredentialID("user", "alice", "ghcr.io")
+	a := mustTestClient(t)
+	a.SetCanonicalRegistry(func() bool { return true })
+	b := mustTestClient(t)
+	b.SetCanonicalRegistry(func() bool { return true })
+
+	stmtA := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sa", "2020-01-01T00:00:00Z", "1000000000000-0000-a")
+	stmtB := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sb", "2020-06-01T00:00:00Z", "2000000000000-0000-b") // newer
+
+	// Each node's own create, then exchange both ways.
+	if err := applyRegistryWAL(t, a, stmtA); err != nil {
+		t.Fatalf("a local: %v", err)
+	}
+	if err := applyRegistryWAL(t, b, stmtB); err != nil {
+		t.Fatalf("b local: %v", err)
+	}
+	if err := applyRegistryWAL(t, a, stmtB); err != nil {
+		t.Fatalf("a<-b: %v", err)
+	}
+	if err := applyRegistryWAL(t, b, stmtA); err != nil {
+		t.Fatalf("b<-a: %v", err)
+	}
+
+	rowA, rowB := fullRegistryRow(t, a, id), fullRegistryRow(t, b, id)
+	if rowA != rowB {
+		t.Fatalf("nodes must converge to an identical full row:\n A=%q\n B=%q", rowA, rowB)
+	}
+	// The winner is the newer write — created_at converged to it, not each node's local value.
+	if want := id + "|user|alice|ghcr.io|alice|sb|2020-06-01T00:00:00Z|2000000000000-0000-b|"; rowA != want {
+		t.Fatalf("converged row = %q, want %q (newer write, created_at propagated)", rowA, want)
+	}
+}
+
+// TestRegistryCanonical_RejectedBeforeActivation (finding 2): a canonical upsert applied on a
+// receiver where canonical_registry_v1 is NOT active fails closed (back-pressure) — a prematurely-
+// enabled peer can't inject canonical rows while legacy writers still run.
+func TestRegistryCanonical_RejectedBeforeActivation(t *testing.T) {
+	c := mustTestClient(t) // gate OFF
+	id := RegistryCredentialID("user", "alice", "ghcr.io")
+	s := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "s", "2020-01-01T00:00:00Z", "1000000000000-0000-a")
+	if err := applyRegistryWAL(t, c, s); err == nil {
+		t.Fatal("canonical upsert must be rejected before activation")
+	}
+	if rows, _ := c.Query(context.Background(), "SELECT id FROM registry_credentials"); len(rows) != 0 {
+		t.Fatalf("nothing must be applied before activation, got %d rows", len(rows))
+	}
+}
+
+// TestRegistryCanonical_MismatchedIDRejected (finding 3): even with the capability active, a
+// canonical upsert whose id does NOT equal RegistryCredentialID(scope,owner,registry) fails closed
+// — it can't insert a noncanonical row or (via ON CONFLICT) hijack an unrelated credential's row.
+func TestRegistryCanonical_MismatchedIDRejected(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalRegistry(func() bool { return true })
+	s := canonicalUpsertStmt("00000000-0000-8000-8000-000000000000", "user", "alice", "ghcr.io", "alice", "s", "2020-01-01T00:00:00Z", "1000000000000-0000-a")
+	if err := applyRegistryWAL(t, c, s); err == nil {
+		t.Fatal("a canonical upsert whose id != RegistryCredentialID(triple) must be rejected")
+	}
+	if rows, _ := c.Query(context.Background(), "SELECT id FROM registry_credentials"); len(rows) != 0 {
+		t.Fatalf("a mismatched-id upsert must apply nothing, got %d rows", len(rows))
 	}
 }

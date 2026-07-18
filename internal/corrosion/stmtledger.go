@@ -26,6 +26,16 @@ const (
 	DispDeleteRetention     Disposition = "delete_retention"       // hard delete on a registered retention table
 	DispAppendOnly          Disposition = "append_only"            // INSERT OR IGNORE, no LWW
 	DispCustomMerge         Disposition = "custom_merge"           // runtime_action_proofs / operations / …
+	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
+	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
+	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.
+	DispReject Disposition = "reject"
+	// DispCanonicalRegistry applies the Part H2 canonical registry-credential upsert. Before the
+	// LWW apply it VERIFIES the deterministic-ID contract — id == RegistryCredentialID(scope,
+	// owner,registry) from the SAME statement's params — so an approved shape carrying an id
+	// inconsistent with its triple (a builder bug / malformed entry) can't insert a noncanonical
+	// row or update a different credential's secret. Then applies as an explicit upsert (LWW).
+	DispCanonicalRegistry Disposition = "canonical_registry"
 )
 
 // ConcurrencyCategory qualifies a DispBulkUpdate entry (see Part C). Empty for non-bulk.

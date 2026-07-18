@@ -157,6 +157,8 @@ var dispIdent = map[corrosion.Disposition]string{
 	corrosion.DispDeleteRetention:     "DispDeleteRetention",
 	corrosion.DispAppendOnly:          "DispAppendOnly",
 	corrosion.DispCustomMerge:         "DispCustomMerge",
+	corrosion.DispReject:              "DispReject",
+	corrosion.DispCanonicalRegistry:   "DispCanonicalRegistry",
 }
 
 var catIdent = map[corrosion.ConcurrencyCategory]string{

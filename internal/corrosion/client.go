@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/memberlist"
 	_ "modernc.org/sqlite"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/hlc"
 )
 
@@ -227,6 +228,20 @@ func (c *Client) SetCanonicalRegistry(fn func() bool) { c.canonicalRegistry = fn
 // canonicalRegistryOn reports whether the canonical (deterministic-id) registry writer is active.
 func (c *Client) canonicalRegistryOn() bool {
 	return c.canonicalRegistry != nil && c.canonicalRegistry()
+}
+
+// capabilityActive reports whether a ledger-named capability (RequiresCapability) is active on THIS
+// receiver, so the apply path can resolve a capability-gated shape's effective disposition. An
+// unknown capability returns false (fail closed — a gated shape stays rejected).
+func (c *Client) capabilityActive(name string) bool {
+	switch name {
+	case capabilities.CanonicalRegistryV1:
+		return c.canonicalRegistryOn()
+	case capabilities.CanonicalIdentityV1:
+		return c.canonicalIdentityOn()
+	default:
+		return false
+	}
 }
 
 // SetHLCEmit injects the predicate that switches NowTS to HLC conflict keys. Wired at

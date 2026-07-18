@@ -84,17 +84,27 @@ type explicitPolicyDef struct {
 	SQL            string
 	Disposition    Disposition
 	MonotoneColumn string
+	// RequiresCapability/DispositionAfter make a shape CAPABILITY-GATED (Part H): before the
+	// capability is active on the receiver, Disposition applies (use DispReject to fail closed);
+	// once active, DispositionAfter applies. Empty ⇒ an ungated policy.
+	RequiresCapability string
+	DispositionAfter   Disposition
 }
 
 var explicitPolicyDefs = []explicitPolicyDef{
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes) → verbatim.
-	{`UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, DispFullPKUpdateNoClock, ""},
+	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock},
 	// session revoke: a guarded one-shot terminal transition (WHERE revoked_at IS NULL) → verbatim.
-	{`UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, DispFullPKUpdateNoClock, ""},
+	{SQL: `UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, Disposition: DispFullPKUpdateNoClock},
 	// session touch: last_used_at must only advance (align with AE's timestamp-max merge).
-	{`UPDATE sessions SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`, DispFullPKUpdateNoClock, "last_used_at"},
+	{SQL: `UPDATE sessions SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`, Disposition: DispFullPKUpdateNoClock, MonotoneColumn: "last_used_at"},
 	// token touch: last_used_at must only advance.
-	{`UPDATE tokens SET last_used_at = ? WHERE id = ?`, DispFullPKUpdateNoClock, "last_used_at"},
+	{SQL: `UPDATE tokens SET last_used_at = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock, MonotoneColumn: "last_used_at"},
+	// Canonical registry-credential upsert (Part H2): REJECT until canonical_registry_v1 is active
+	// on this receiver (so a prematurely-enabled peer can't inject canonical rows while legacy
+	// writers still run), then apply through DispCanonicalRegistry, which verifies the
+	// deterministic-ID contract before the LWW upsert.
+	{SQL: registryCanonicalUpsertSQL, Disposition: DispReject, RequiresCapability: capCanonicalRegistryV1, DispositionAfter: DispCanonicalRegistry},
 }
 
 var explicitPolicyByFP = buildExplicitPolicies()
@@ -106,7 +116,12 @@ func buildExplicitPolicies() map[string]LedgerEntry {
 		if err != nil {
 			panic("explicit policy SQL does not parse: " + d.SQL + ": " + err.Error())
 		}
-		m[fp] = LedgerEntry{Disposition: d.Disposition, MonotoneColumn: d.MonotoneColumn}
+		m[fp] = LedgerEntry{
+			Disposition:        d.Disposition,
+			MonotoneColumn:     d.MonotoneColumn,
+			RequiresCapability: d.RequiresCapability,
+			DispositionAfter:   d.DispositionAfter,
+		}
 	}
 	return m
 }

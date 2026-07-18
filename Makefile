@@ -104,6 +104,8 @@ ci-guards:
 	./scripts/ci/check-schema-bump.sh
 	go run ./scripts/ci/writecheck -root .
 	go test ./scripts/ci/writecheck/
+	go run ./scripts/ci/stmtshapecheck -root .
+	go test ./scripts/ci/stmtshapecheck/
 	go test ./internal/corrosion/ -run TestSchemaHistoryDocumentsCurrentVersion
 	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestValidateInvocation|TestCheckIdentifier|TestExtractInvocations'
 

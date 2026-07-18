@@ -239,3 +239,26 @@ func TestSyncMetricsRecorded(t *testing.T) {
 		t.Fatalf("expected >=2 host rows merged, got %d", dm.lastMerged)
 	}
 }
+
+// TestMergeTable_MalformedInputCounted (finding): malformed/unknown AE dump tables are kept-local
+// AND counted in litevirt_merge_apply_rejected_total (not silently returned nil).
+func TestMergeTable_MalformedInputCounted(t *testing.T) {
+	c := mustTestClient(t)
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	// Unknown table (not in the replicated set) → bounded to "unknown".
+	_ = c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{Name: "not_a_real_table", Columns: []string{"id"}, Rows: [][]interface{}{{"x"}}}}})
+	// Duplicate column names on a known table.
+	_ = c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{Name: "snapshots", Columns: []string{"id", "id"}, Rows: [][]interface{}{{"a", "b"}}}}})
+
+	got := map[string]bool{}
+	for _, s := range sm.mergeRejected {
+		got[s] = true
+	}
+	if !got["unknown/ae/unknown_table"] {
+		t.Errorf("unknown table must be counted; got %v", sm.mergeRejected)
+	}
+	if !got["snapshots/ae/duplicate_columns"] {
+		t.Errorf("duplicate columns must be counted; got %v", sm.mergeRejected)
+	}
+}

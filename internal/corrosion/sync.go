@@ -542,21 +542,25 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 	// return a nil error (the merge stays non-destructive and the next cycle re-converges).
 	if !allowedTables[table.Name] {
 		slog.Warn("sync: skipping unknown table in dump", "table", table.Name)
-		return 0, 0, nil
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "unknown_table")
+		return 0, len(table.Rows), nil
 	}
 	localCols, ok := c.readTableColumns(table.Name)
 	if !ok {
-		return 0, 0, nil
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "unknown_table")
+		return 0, len(table.Rows), nil
 	}
 	if len(table.Columns) == 0 || !columnsKnown(table.Columns, localCols) {
 		slog.Warn("sync: skipping dump table with unexpected columns", "table", table.Name)
-		return 0, 0, nil
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "unexpected_columns")
+		return 0, len(table.Rows), nil
 	}
 	// buildMergeUpsertSQL and the PK/value indexing assume a unique column list; a malformed
 	// dump with a repeated column name would produce duplicate INSERT/SET targets and
 	// misaligned indices. Reject it (keep local) rather than build inconsistent SQL.
 	if hasDuplicateColumnsFold(table.Columns) {
 		slog.Warn("sync: skipping dump table with duplicate column names", "table", table.Name)
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "duplicate_columns")
 		return 0, len(table.Rows), nil
 	}
 
@@ -567,7 +571,8 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 	// inserting PK-less rows. Normal dumps always carry every column.
 	if len(pkCols) > 0 && len(pkIdx) != len(pkCols) {
 		slog.Warn("sync: skipping dump table missing primary-key column(s)", "table", table.Name)
-		return 0, 0, nil
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "missing_pk")
+		return 0, len(table.Rows), nil
 	}
 	// A PK-less replicated table cannot be merged non-destructively — with no key to
 	// upsert on, a whole-row replace would be the only option, and that erases any
@@ -575,12 +580,14 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 	// replicated set lacks a PK today; this guards against one being added.
 	if len(pkCols) == 0 {
 		slog.Warn("sync: skipping dump table without a known primary key (keep local)", "table", table.Name)
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "no_pk")
 		return 0, len(table.Rows), nil
 	}
 	updatedAtIdx := indexOf(table.Columns, "updated_at")
 	if localCols["updated_at"] && updatedAtIdx < 0 {
 		slog.Warn("sync: skipping dump table missing updated_at column", "table", table.Name)
-		return 0, 0, nil
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "missing_updated_at")
+		return 0, len(table.Rows), nil
 	}
 
 	// PK-aware upsert: insert the sender-supplied columns and, on a primary-key conflict,
@@ -1029,8 +1036,12 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 		} else if union != ls {
 			// Local row stays, but incoming recorded a checkpoint local lacks →
 			// fold it into the local row so a later resume still sees it. No-op when
-			// local is already a superset (the common case, single-executor proofs).
-			c.updateProofStepState(tx, table.Name, pkCols, pkIdx, row, union)
+			// local is already a superset (the common case, single-executor proofs). A DB
+			// failure here must fail closed (rollback + retry), not commit the merge without
+			// the observed checkpoint.
+			if err := c.updateProofStepState(tx, table.Name, pkCols, pkIdx, row, union); err != nil {
+				return false, err
+			}
 		}
 	}
 	return keepLocal, nil
@@ -1038,10 +1049,12 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 
 // updateProofStepState folds a unioned step_state back into the surviving local row
 // (used when local wins the merge but the incoming copy carried an extra checkpoint).
-// Local-only, on the merge tx — symmetric with the incoming-row apply path.
-func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []string, pkIdx []int, incomingRow []interface{}, union string) {
+// Local-only, on the merge tx — symmetric with the incoming-row apply path. A tx.Exec failure is
+// RETURNED so the caller rolls back the merge rather than committing without the observed
+// checkpoint (which could lose a checkpoint another node has seen).
+func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []string, pkIdx []int, incomingRow []interface{}, union string) error {
 	if len(pkCols) == 0 {
-		return
+		return nil
 	}
 	where := make([]string, len(pkCols))
 	args := make([]interface{}, 0, len(pkCols)+1)
@@ -1054,8 +1067,9 @@ func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []str
 	}
 	q := "UPDATE " + tableName + " SET step_state = ? WHERE " + strings.Join(where, " AND ")
 	if _, err := tx.Exec(q, args...); err != nil {
-		slog.Warn("sync: fold step_state union into local proof", "table", tableName, "error", err)
+		return fmt.Errorf("fold step_state union into local proof on %s: %w", tableName, err)
 	}
+	return nil
 }
 
 // immutableMergeKeepLocalRow is the anti-entropy merge for the v41 append-only /

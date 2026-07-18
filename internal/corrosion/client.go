@@ -199,6 +199,15 @@ type Client struct {
 	// Nil/false = legacy behavior (a natural-key collision back-pressures). Read once per
 	// merge batch.
 	canonicalIdentity func() bool
+
+	// canonicalRegistry, when non-nil and returning true, selects the CANONICAL registry-credential
+	// writer: one stable deterministic-id row per (scope,owner,registry), upserted for
+	// create/rotate/revoke/revive — instead of the legacy mint-new-id tombstone+insert whose
+	// concurrent logins collide on the partial UNIQUE (Part H2). Gated on the H2 activation
+	// predicate (capability latch + WAL-drain/consolidation), injected via SetCanonicalRegistry.
+	// Nil/false = legacy writer. Activated only AFTER legacy rows are consolidated to their
+	// deterministic ids, so the two writers never produce two live rows for one triple.
+	canonicalRegistry func() bool
 }
 
 // SetCanonicalIdentity injects the predicate that enables natural-key identity resolution.
@@ -209,6 +218,15 @@ func (c *Client) SetCanonicalIdentity(fn func() bool) { c.canonicalIdentity = fn
 // canonicalIdentityOn reports whether natural-key identity resolution is currently enforced.
 func (c *Client) canonicalIdentityOn() bool {
 	return c.canonicalIdentity != nil && c.canonicalIdentity()
+}
+
+// SetCanonicalRegistry injects the predicate that activates the canonical registry-credential
+// writer (Part H2). Nil-safe: an unset predicate keeps the legacy mint-new-id writer.
+func (c *Client) SetCanonicalRegistry(fn func() bool) { c.canonicalRegistry = fn }
+
+// canonicalRegistryOn reports whether the canonical (deterministic-id) registry writer is active.
+func (c *Client) canonicalRegistryOn() bool {
+	return c.canonicalRegistry != nil && c.canonicalRegistry()
 }
 
 // SetHLCEmit injects the predicate that switches NowTS to HLC conflict keys. Wired at

@@ -1,0 +1,188 @@
+package corrosion
+
+import (
+	"context"
+	"testing"
+)
+
+// TestRegistryCredentialID_Frozen pins the deterministic id derivation (a change here is a
+// contract break — it would strand every existing credential from its canonical row).
+func TestRegistryCredentialID_Frozen(t *testing.T) {
+	cases := map[string][3]string{
+		"3ccd6170-44ce-80c6-9963-991ad2891923": {"user", "alice", "ghcr.io"},
+		"82f03ff9-767b-82f1-9552-d92e643b6c57": {"global", "", "docker.io"},
+	}
+	for want, in := range cases {
+		if got := RegistryCredentialID(in[0], in[1], in[2]); got != want {
+			t.Errorf("RegistryCredentialID%v = %q, want %q (frozen)", in, got, want)
+		}
+	}
+	// Deterministic: same inputs → same id.
+	if RegistryCredentialID("user", "bob", "reg:5000") != RegistryCredentialID("user", "bob", "reg:5000") {
+		t.Error("id must be deterministic")
+	}
+	// v8 (custom) UUID shape: version nibble 8, RFC-4122 variant.
+	id := RegistryCredentialID("user", "alice", "ghcr.io")
+	if id[14] != '8' {
+		t.Errorf("expected a version-8 UUID, got %q", id)
+	}
+	if v := id[19]; v != '8' && v != '9' && v != 'a' && v != 'b' {
+		t.Errorf("expected RFC-4122 variant, got %q", id)
+	}
+}
+
+// TestRegistryCredentialID_LengthPrefixed: field boundaries are unambiguous — ("ab","c") and
+// ("a","bc") must NOT collide (a naive concatenation would).
+func TestRegistryCredentialID_LengthPrefixed(t *testing.T) {
+	if RegistryCredentialID("user", "ab", "c") == RegistryCredentialID("user", "a", "bc") {
+		t.Error("length-prefixing must keep distinct triples distinct")
+	}
+}
+
+// TestRegistryCredentialID_NoLowercasing: the id hashes the STORED registry verbatim. Since
+// NormalizeRegistry preserves case (it only folds the Docker Hub aliases), the id must NOT
+// re-case — else a credential stored as "GHCR.io" would split from its own pulls.
+func TestRegistryCredentialID_NoLowercasing(t *testing.T) {
+	if RegistryCredentialID("user", "alice", "GHCR.io") == RegistryCredentialID("user", "alice", "ghcr.io") {
+		t.Error("id must not lowercase the registry (normalization is frozen upstream)")
+	}
+}
+
+func liveRegistryRows(t *testing.T, c *Client, scope, owner, registry string) []Row {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		"SELECT id, username, secret FROM registry_credentials WHERE scope=? AND owner=? AND registry=? AND deleted_at IS NULL",
+		scope, owner, registry)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	return rows
+}
+
+// TestUpsertRegistryCredentialCanonical_CreateRotateRevive: create, rotate, revoke, and revive all
+// funnel through the SAME deterministic-id row — one physical row throughout.
+func TestUpsertRegistryCredentialCanonical_CreateRotateRevive(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	rc := RegistryCredential{Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s1"}
+	wantID := RegistryCredentialID("user", "alice", "ghcr.io")
+
+	if err := UpsertRegistryCredentialCanonical(ctx, c, rc); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
+	if len(rows) != 1 || rows[0].String("id") != wantID || rows[0].String("secret") != "s1" {
+		t.Fatalf("create: want one row id=%s secret=s1, got %v", wantID, rows)
+	}
+
+	// Rotate: new secret, SAME row.
+	rc.Secret = "s2"
+	if err := UpsertRegistryCredentialCanonical(ctx, c, rc); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	rows = liveRegistryRows(t, c, "user", "alice", "ghcr.io")
+	if len(rows) != 1 || rows[0].String("id") != wantID || rows[0].String("secret") != "s2" {
+		t.Fatalf("rotate: want one row id=%s secret=s2, got %v", wantID, rows)
+	}
+
+	// Revoke by triple (id-agnostic), then revive via the canonical upsert → same id, no live row lost.
+	if _, err := DeleteRegistryCredential(ctx, c, "user", "alice", "ghcr.io"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io"); len(rows) != 0 {
+		t.Fatalf("revoke: expected no live row, got %v", rows)
+	}
+	rc.Secret = "s3"
+	if err := UpsertRegistryCredentialCanonical(ctx, c, rc); err != nil {
+		t.Fatalf("revive: %v", err)
+	}
+	rows = liveRegistryRows(t, c, "user", "alice", "ghcr.io")
+	if len(rows) != 1 || rows[0].String("id") != wantID || rows[0].String("secret") != "s3" {
+		t.Fatalf("revive: want one row id=%s secret=s3, got %v", wantID, rows)
+	}
+	// And exactly ONE physical row total (deterministic id, revived in place — never a second row).
+	all, _ := c.Query(ctx, "SELECT id FROM registry_credentials WHERE scope=? AND owner=? AND registry=?", "user", "alice", "ghcr.io")
+	if len(all) != 1 {
+		t.Fatalf("expected a single physical row across the lifecycle, got %d", len(all))
+	}
+}
+
+// TestUpsertRegistryCredentialAuto_Gating: with the gate off the legacy mint-new-id writer runs
+// (two logins leave a tombstone + a live row, distinct random ids); with the gate on the canonical
+// writer keeps a single deterministic-id row.
+func TestUpsertRegistryCredentialAuto_Gating(t *testing.T) {
+	ctx := context.Background()
+	rc := RegistryCredential{Scope: "user", Owner: "bob", Registry: "reg:5000", Username: "bob", Secret: "p"}
+
+	// Gate OFF ⇒ legacy: each login mints a fresh id; the prior live row is tombstoned.
+	off := mustTestClient(t)
+	rc.ID = "rand-1"
+	if err := UpsertRegistryCredentialAuto(ctx, off, rc); err != nil {
+		t.Fatalf("legacy 1: %v", err)
+	}
+	rc.ID = "rand-2"
+	if err := UpsertRegistryCredentialAuto(ctx, off, rc); err != nil {
+		t.Fatalf("legacy 2: %v", err)
+	}
+	all, _ := off.Query(ctx, "SELECT id FROM registry_credentials WHERE owner='bob'")
+	if len(all) != 2 {
+		t.Fatalf("legacy: expected 2 physical rows (live + tombstone), got %d", len(all))
+	}
+
+	// Gate ON ⇒ canonical: one deterministic-id row regardless of how many logins.
+	on := mustTestClient(t)
+	on.SetCanonicalRegistry(func() bool { return true })
+	rc.ID = "ignored"
+	if err := UpsertRegistryCredentialAuto(ctx, on, rc); err != nil {
+		t.Fatalf("canonical 1: %v", err)
+	}
+	if err := UpsertRegistryCredentialAuto(ctx, on, rc); err != nil {
+		t.Fatalf("canonical 2: %v", err)
+	}
+	all, _ = on.Query(ctx, "SELECT id FROM registry_credentials WHERE owner='bob'")
+	if len(all) != 1 || all[0].String("id") != RegistryCredentialID("user", "bob", "reg:5000") {
+		t.Fatalf("canonical: expected a single deterministic-id row, got %v", all)
+	}
+}
+
+// TestRegistryCredentialCanonical_ConcurrentConverges is the core H2 win: two nodes creating the
+// SAME credential produce the SAME deterministic id, so the replicated write resolves by normal
+// LWW on that PK — one row, newer wins — instead of two random ids colliding on the partial
+// UNIQUE and back-pressuring (the legacy failure this replaces).
+func TestRegistryCredentialCanonical_ConcurrentConverges(t *testing.T) {
+	ctx := context.Background()
+	c := mustTestClient(t)
+	c.SetCanonicalRegistry(func() bool { return true })
+
+	// This node's own login (older).
+	rc := RegistryCredential{Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "local"}
+	if err := UpsertRegistryCredentialCanonical(ctx, c, rc); err != nil {
+		t.Fatalf("local login: %v", err)
+	}
+	id := RegistryCredentialID("user", "alice", "ghcr.io")
+
+	// A peer's concurrent login for the SAME triple arrives via replication (WAL apply) — same id,
+	// strictly-newer HLC. It must LWW-win on the PK, not collide.
+	r := NewReplicator(c, "", RelayConfig{})
+	newer := "9000000000000-0000-peer"
+	s := Statement{
+		SQL:    registryCanonicalUpsertSQL,
+		Params: []interface{}{id, "user", "alice", "ghcr.io", "alice", "peer", "2020-01-01T00:00:00Z", newer},
+	}
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if aerr := r.applyStatementLWW(ctx, tx, s, newer); aerr != nil {
+		tx.Rollback()
+		t.Fatalf("replicated canonical upsert must apply (not back-pressure): %v", aerr)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
+	if len(rows) != 1 || rows[0].String("id") != id || rows[0].String("secret") != "peer" {
+		t.Fatalf("concurrent logins must converge to one row (newer wins), got %v", rows)
+	}
+}

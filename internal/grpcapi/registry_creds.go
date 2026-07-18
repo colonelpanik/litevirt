@@ -55,7 +55,9 @@ func (s *Server) SetRegistryCredential(ctx context.Context, req *pb.SetRegistryC
 		ID: newID(), Scope: scope, Owner: owner, Registry: registry,
 		Username: req.Username, Secret: req.Password,
 	}
-	if err := corrosion.UpsertRegistryCredential(ctx, s.db, rc); err != nil {
+	// Auto-selects the canonical deterministic-id writer once H2 is activated, else the legacy
+	// mint-new-id writer — behavior-neutral until the fleet converges (Part H2).
+	if err := corrosion.UpsertRegistryCredentialAuto(ctx, s.db, rc); err != nil {
 		return nil, status.Errorf(codes.Internal, "set registry credential: %v", err)
 	}
 	slog.Info("registry credential set", "scope", scope, "owner", owner, "registry", registry, "username", req.Username)

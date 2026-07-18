@@ -167,6 +167,15 @@ const (
 	// latch (and thus any node collapsing rows) cannot happen until every node has opted in.
 	// Enforcement = the flag AND the latch; default-off + reversible.
 	CanonicalIdentityV1 = "canonical_identity_v1"
+	// CanonicalRegistryV1 gates the Part H2 canonical registry-credential model: one stable
+	// deterministic-id row per (scope,owner,registry) written by a single PK-keyed upsert, instead
+	// of the legacy mint-new-id tombstone+insert whose concurrent logins collide on the partial
+	// UNIQUE index. Its activation is a COORDINATED online contract (expand → converge → contract),
+	// not just a latch: the canonical writer is enabled only once legacy random-id rows are
+	// consolidated to their deterministic ids (WAL-drain / fencing gate), so the two writers never
+	// produce two live rows for one triple. NOT YET advertised (in `all`, not `supported`) — the
+	// convergence predicate + contract are subsequent increments.
+	CanonicalRegistryV1 = "canonical_registry_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -257,7 +266,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

@@ -2,6 +2,10 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+
+	"github.com/google/uuid"
 )
 
 // RegistryCredential is one stored OCI/Docker registry login (schema v23).
@@ -24,6 +28,36 @@ const (
 	RegistryScopeGlobal = "global"
 )
 
+// RegistryCredentialID derives the DETERMINISTIC, cluster-stable primary-key id for one logical
+// credential (scope, owner, registry) — the Part H2 canonical model. Because every node computes
+// the SAME id for a triple, two nodes creating/rotating the same credential target the SAME
+// physical PK, so a replication conflict resolves by normal LWW on that PK instead of minting two
+// random ids that collide on the partial UNIQUE index.
+//
+// The encoding is a FROZEN contract (a change ⇒ a new domain tag "credential/v2" + a migration):
+// a domain tag followed by each field LENGTH-PREFIXED (big-endian uint32) so no two distinct
+// triples can frame to the same bytes, hashed with SHA-256; the first 16 bytes become a v8
+// (custom, RFC 9562) UUID. Inputs are the STORED canonical values — `registry` is already
+// normalized by lxc.NormalizeRegistry at write time, and this function applies NO further
+// normalization (notably NO lowercasing: NormalizeRegistry preserves case beyond folding the
+// Docker Hub aliases, so re-casing here would split a credential from its own pulls).
+func RegistryCredentialID(scope, owner, registry string) string {
+	b := make([]byte, 0, 64)
+	b = append(b, "credential/v1"...)
+	for _, f := range []string{scope, owner, registry} {
+		var l [4]byte
+		binary.BigEndian.PutUint32(l[:], uint32(len(f)))
+		b = append(b, l[:]...)
+		b = append(b, f...)
+	}
+	sum := sha256.Sum256(b)
+	var id uuid.UUID
+	copy(id[:], sum[:16])
+	id[6] = (id[6] & 0x0f) | 0x80 // version 8 (custom / hash-derived)
+	id[8] = (id[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return id.String()
+}
+
 // UpsertRegistryCredential replaces the live credential for (scope, owner,
 // registry). It soft-deletes any existing live row for that triple then inserts
 // a fresh id, both in one batch so the partial unique index never collides.
@@ -43,6 +77,41 @@ func UpsertRegistryCredential(ctx context.Context, c *Client, rc RegistryCredent
 			Params: []interface{}{rc.ID, rc.Scope, rc.Owner, rc.Registry, rc.Username, rc.Secret, nowRFC3339(), now},
 		},
 	})
+}
+
+// UpsertRegistryCredentialCanonical writes the credential for (scope, owner, registry) as ONE
+// stable row keyed on its deterministic id (Part H2). Create / rotate / revive all funnel through
+// a single PK-keyed upsert: it inserts the row live, or ON CONFLICT updates the credential material
+// and CLEARS deleted_at (a revive), always stamping a fresh HLC updated_at. scope/owner/registry
+// and created_at are never reassigned (the id pins the triple; created_at is set once). No
+// tombstone+insert and no minted id, so two nodes writing the same triple converge by LWW on the
+// PK rather than colliding on the partial UNIQUE. rc.ID is ignored (recomputed).
+// registryCanonicalUpsertSQL is the single frozen statement the canonical writer emits (exported
+// to tests so they can't drift from the ledger-registered shape).
+const registryCanonicalUpsertSQL = `INSERT INTO registry_credentials
+		   (id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at)
+		   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+		 ON CONFLICT(id) DO UPDATE SET
+		   username = excluded.username,
+		   secret = excluded.secret,
+		   updated_at = excluded.updated_at,
+		   deleted_at = NULL`
+
+func UpsertRegistryCredentialCanonical(ctx context.Context, c *Client, rc RegistryCredential) error {
+	now := c.NowTS()
+	id := RegistryCredentialID(rc.Scope, rc.Owner, rc.Registry)
+	return c.Execute(ctx, registryCanonicalUpsertSQL,
+		id, rc.Scope, rc.Owner, rc.Registry, rc.Username, rc.Secret, nowRFC3339(), now)
+}
+
+// UpsertRegistryCredentialAuto selects the canonical (deterministic-id) writer when the H2
+// activation predicate is on, else the legacy mint-new-id tombstone+insert writer — so a login is
+// behavior-neutral until the fleet has converged and the writer is activated.
+func UpsertRegistryCredentialAuto(ctx context.Context, c *Client, rc RegistryCredential) error {
+	if c.canonicalRegistryOn() {
+		return UpsertRegistryCredentialCanonical(ctx, c, rc)
+	}
+	return UpsertRegistryCredential(ctx, c, rc)
 }
 
 func scanRegistryCredentials(rows []Row) []RegistryCredential {

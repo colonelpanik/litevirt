@@ -151,6 +151,39 @@ Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to
 v1-only emission (peers then compare v1 against it). Because negotiation is by
 field presence, a mixed fleet is always safe — never a spurious v1-vs-v2 mismatch.
 
+### `canonical_identity` — natural-key identity resolution
+
+A few tables mint a **random-UUID primary key** but carry a **UNIQUE natural key**:
+`snapshots` (`vm_name`, `name`) and `container_snapshots` (`host_name`, `ct_name`,
+`name`). Two nodes can independently create the *same logical object* — the same
+snapshot name for the same VM — while each mints its **own** id. The replicated
+rows then collide on the secondary UNIQUE, and the fail-closed apply path
+**back-pressures** (keeps local, retries) rather than pick a winner, so the two ids
+persist and `lv doctor divergence` reports the natural-key group as diverging.
+
+With `enforcement.canonical_identity` enabled **and the `canonical_identity_v1`
+token latched cluster-wide**, an upgraded receiver resolves these tables by their
+**natural key**: it collapses each such pair to a single deterministic winner
+(newest `updated_at`, then the smaller id), deleting the losing id. Because
+identity resolution *mutates shared state* it is **not** negotiated pairwise like
+`digest_v2` — it activates only once the whole fleet is uniformly upgraded (the
+latch), so a partially-upgraded cluster stays non-destructive (older nodes keep
+back-pressuring) and converges once every node has latched. `snapshots.parent_id`
+is unused today, so a non-null reference **fails closed** rather than risk an
+orphan.
+
+**Scanner lane:** while it is active fleet-wide, `lv doctor divergence` keys these
+tables by their natural key too, so a still-converging group shows as **one**
+content divergence instead of two phantom `missing_row`s; a converged group reads
+clean. The lane engages only when the scanning node has latched (uniform fleet).
+
+**Activation** mirrors `digest_v2`: ship the supporting binary everywhere (flag
+off, behavior-neutral), confirm every node is upgraded, then set
+`enforcement.canonical_identity: true` and rolling-restart. Existing divergent
+pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) — no
+separate data migration. Kill switch: set it `false` and restart (the node reverts
+to back-pressuring the collision, still non-destructive).
+
 ### The sensitive lane
 
 `--include-sensitive` also scans secret-bearing tables (2FA factors, recovery

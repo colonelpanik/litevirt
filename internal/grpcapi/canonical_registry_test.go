@@ -33,3 +33,33 @@ func TestCanonicalRegistry_AdvertiseAndTokenEnabled(t *testing.T) {
 		t.Fatal("advertisedCapabilities filtering corrupted the shared Supported() slice")
 	}
 }
+
+// TestCanonicalRegistryActive_AdvertiseGatedOnReadiness: the phase-2 token
+// canonical_registry_active_v1 is advertised (and tokenEnabled) ONLY when the node is
+// config-enforcing AND locally writer-ready — so it latches only when every node has consolidated,
+// the machine check that switches the writer.
+func TestCanonicalRegistryActive_AdvertiseGatedOnReadiness(t *testing.T) {
+	s := testServer(t)
+	s.SetCanonicalRegistryEnforce(true)
+	// Config-on but not yet writer-ready (no readiness hook) ⇒ NOT advertised.
+	if hasCap(s.advertisedCapabilities(), capabilities.CanonicalRegistryActiveV1) {
+		t.Fatal("phase-2 token must not be advertised before writer-ready")
+	}
+	if s.tokenEnabled(capabilities.CanonicalRegistryActiveV1) {
+		t.Fatal("tokenEnabled(active) must be false before writer-ready")
+	}
+	// Writer-ready ⇒ advertised + tokenEnabled (latch driven).
+	s.SetRegistryLocallyReady(func() bool { return true })
+	if !hasCap(s.advertisedCapabilities(), capabilities.CanonicalRegistryActiveV1) {
+		t.Fatal("phase-2 token must be advertised once writer-ready")
+	}
+	if !s.tokenEnabled(capabilities.CanonicalRegistryActiveV1) {
+		t.Fatal("tokenEnabled(active) must be true once writer-ready")
+	}
+	// Writer-ready but the phase-1 flag is off ⇒ NOT advertised (phase 2 requires phase 1).
+	off := testServer(t)
+	off.SetRegistryLocallyReady(func() bool { return true })
+	if hasCap(off.advertisedCapabilities(), capabilities.CanonicalRegistryActiveV1) {
+		t.Fatal("phase-2 token requires enforcement.canonical_registry")
+	}
+}

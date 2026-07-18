@@ -115,6 +115,11 @@ type Server struct {
 	// this flag (like operation_protocol) so the latch — which enables accepting canonical writes,
 	// mutating shared state — requires config uniformity, not just a uniform build.
 	enfCanonicalRegistry bool
+	// registryLocallyReady, when non-nil, reports whether this node's registry credentials are
+	// consolidated (RegistryWriterReady). It gates advertising canonical_registry_active_v1 (H2
+	// phase 2) so that token latches ONLY when every admitted node is writer-ready — the machine
+	// check for switching the writer. Set by the daemon from the migration controller.
+	registryLocallyReady func() bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -392,6 +397,11 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfCanonicalRegistry {
 		caps = withoutCapability(caps, capabilities.CanonicalRegistryV1)
 	}
+	// Phase 2: advertise "writer active" only once this node is consolidated, so the token latches
+	// only when EVERY node is writer-ready.
+	if !s.registryReady() {
+		caps = withoutCapability(caps, capabilities.CanonicalRegistryActiveV1)
+	}
 	return caps
 }
 
@@ -480,6 +490,16 @@ func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity =
 // (and thus acceptance of canonical writes) can't happen until every node has opted in.
 func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry = on }
 
+// SetRegistryLocallyReady injects the predicate reporting this node's registry-credential
+// consolidation readiness (RegistryWriterReady). It gates advertising canonical_registry_active_v1
+// (H2 phase 2). Nil-safe: unset ⇒ not ready (the token is not advertised).
+func (s *Server) SetRegistryLocallyReady(fn func() bool) { s.registryLocallyReady = fn }
+
+// registryReady reports this node's registry-consolidation readiness for phase-2 advertisement.
+func (s *Server) registryReady() bool {
+	return s.enfCanonicalRegistry && s.registryLocallyReady != nil && s.registryLocallyReady()
+}
+
 // liveResizeActive reports whether this node may originate live-resize behavior
 // (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
 // old peer can't have max_cpu dropped from a spec it later rewrites.
@@ -523,6 +543,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfCanonicalIdentity
 	case capabilities.CanonicalRegistryV1:
 		return s.enfCanonicalRegistry
+	case capabilities.CanonicalRegistryActiveV1:
+		return s.registryReady()
 	default:
 		return false
 	}

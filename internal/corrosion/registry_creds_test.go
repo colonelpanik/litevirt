@@ -499,3 +499,33 @@ func TestConsolidate_EqualTSDiffContentBackPressures(t *testing.T) {
 		t.Fatalf("receiver's differing legacy credential must remain live, got %v", live)
 	}
 }
+
+// TestRegistryLegacyInsert_GatedByPhase2 (point 7): the legacy mint-new-id INSERT is applied
+// before the canonical writer is on, and REJECTED (back-pressure) once canonical_registry_active_v1
+// is active on the receiver — a stray legacy INSERT after activation can't create a duplicate row.
+func TestRegistryLegacyInsert_GatedByPhase2(t *testing.T) {
+	legacyInsert := func(id string) Statement {
+		return Statement{SQL: registryLegacyInsertSQL,
+			Params: []interface{}{id, "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"}}
+	}
+	ctx := context.Background()
+
+	// Phase 2 OFF (writer off) ⇒ accepted.
+	off := mustTestClient(t)
+	if err := applyRegistryWAL(t, off, legacyInsert("rand-1")); err != nil {
+		t.Fatalf("legacy INSERT must apply before activation: %v", err)
+	}
+	if rows, _ := off.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-1'"); len(rows) != 1 {
+		t.Fatal("legacy row must exist before activation")
+	}
+
+	// Phase 2 ON (writer on) ⇒ rejected.
+	on := mustTestClient(t)
+	on.SetCanonicalRegistry(func() bool { return true })
+	if err := applyRegistryWAL(t, on, legacyInsert("rand-2")); err == nil {
+		t.Fatal("legacy INSERT must be rejected after activation")
+	}
+	if rows, _ := on.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-2'"); len(rows) != 0 {
+		t.Fatal("nothing must be applied after activation")
+	}
+}

@@ -105,6 +105,11 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// writers still run), then apply through DispCanonicalRegistry, which verifies the
 	// deterministic-ID contract before the LWW upsert.
 	{SQL: registryCanonicalUpsertSQL, Disposition: DispReject, RequiresCapability: capCanonicalRegistryV1, DispositionAfter: DispCanonicalRegistry},
+	// Legacy mint-new-id registry INSERT (Part H2, point 7): apply normally UNTIL the canonical
+	// writer is on cluster-wide (canonical_registry_active_v1 latched), then REJECT — a stray legacy
+	// INSERT after activation (a bug / an old or pre-barrier returning node) would create a
+	// duplicate physical row for a triple that already has its canonical row.
+	{SQL: registryLegacyInsertSQL, Disposition: DispPlainInsert, RequiresCapability: capCanonicalRegistryActiveV1, DispositionAfter: DispReject},
 }
 
 var explicitPolicyByFP = buildExplicitPolicies()

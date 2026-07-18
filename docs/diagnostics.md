@@ -213,6 +213,39 @@ pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) �
 separate data migration. Kill switch: set it `false` and restart (the node reverts
 to back-pressuring the collision, still non-destructive).
 
+### `canonical_registry` — registry-credential migration
+
+Registry logins used to mint a **new random `id` per login** and write via a
+tombstone+insert batch, so two nodes logging into the same registry concurrently
+produced two live rows that collide on the partial `UNIQUE(scope,owner,registry)`.
+The canonical model derives a **deterministic id** from `(scope,owner,registry)`, so
+both nodes target the same primary key and a conflict resolves by normal LWW — no
+collision. It rolls out in **two coordinated phases** driven by two capability latches
+(the operator only flips the config flag):
+
+1. **Phase 1 — accept + converge.** Set `enforcement.canonical_registry: true`
+   fleet-wide. Once `canonical_registry_v1` latches (every node advertises it — config
+   uniformity), replicated canonical writes are **accepted**, and each node's migration
+   controller idempotently **consolidates** its legacy rows to their deterministic ids
+   (tombstone the exact legacy row by full-content CAS + upsert the canonical row).
+2. **Phase 2 — switch the writer.** A node advertises `canonical_registry_active_v1`
+   only once it reports **`RegistryWriterReady`** (no legacy live rows remain), so that
+   token latches **exactly when every node is consolidated** — the machine check. On
+   that latch the writer switches to canonical cluster-wide, and the legacy mint-new-id
+   INSERT shape is **rejected on apply** (a stray legacy write afterward — a bug or an
+   old/returning node — can't create a duplicate row; that node needs a reseed).
+
+Both phases are **reversible** via the config flag and **fail-closed**: a write that
+would collide back-pressures rather than duplicating. The retired legacy rows stay
+tombstoned (inert under the partial index) for a future watermark-safe GC.
+
+The **index contract** (replacing the partial `UNIQUE … WHERE deleted_at IS NULL` with
+a non-partial `UNIQUE(scope,owner,registry)`) is **deliberately deferred** — the
+deterministic primary key plus the partial index already enforce one live credential
+per triple, so the non-partial index is defense-in-depth that would require a much
+riskier irreversible distributed contract. `RegistryContractReady` is available as
+diagnostics for that future cleanup but does not change the index.
+
 ### The sensitive lane
 
 `--include-sensitive` also scans secret-bearing tables (2FA factors, recovery

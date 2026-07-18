@@ -7,8 +7,9 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// TestRegistryMigrationStep drives the H2 controller step: not-latched keeps the writer legacy;
-// latched consolidates legacy rows + activates the canonical writer; de-latching deactivates it.
+// TestRegistryMigrationStep drives the H2 controller step: not-latched publishes not-ready and
+// leaves legacy rows; latched consolidates legacy rows and publishes writer-readiness (which
+// advertises the phase-2 token that switches the writer cluster-wide); de-latching un-publishes.
 func TestRegistryMigrationStep(t *testing.T) {
 	db, err := corrosion.NewTestClient()
 	if err != nil {
@@ -30,8 +31,8 @@ func TestRegistryMigrationStep(t *testing.T) {
 
 	// Not latched ⇒ no consolidation, writer stays legacy.
 	d.registryMigrationStep(ctx, false)
-	if d.registryWriterActive.Load() {
-		t.Fatal("writer must not activate while not latched")
+	if d.registryLocallyReady.Load() {
+		t.Fatal("must not be ready while not latched")
 	}
 	if rows, _ := db.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-1' AND deleted_at IS NULL"); len(rows) != 1 {
 		t.Fatal("legacy row must be untouched while not latched")
@@ -39,8 +40,8 @@ func TestRegistryMigrationStep(t *testing.T) {
 
 	// Latched ⇒ consolidate + activate.
 	d.registryMigrationStep(ctx, true)
-	if !d.registryWriterActive.Load() {
-		t.Fatal("writer must activate once locally consolidated")
+	if !d.registryLocallyReady.Load() {
+		t.Fatal("must publish ready once locally consolidated")
 	}
 	detID := corrosion.RegistryCredentialID("user", "alice", "ghcr.io")
 	live, _ := db.Query(ctx, "SELECT id FROM registry_credentials WHERE scope='user' AND owner='alice' AND registry='ghcr.io' AND deleted_at IS NULL")
@@ -50,7 +51,7 @@ func TestRegistryMigrationStep(t *testing.T) {
 
 	// De-latch ⇒ deactivate (reversible).
 	d.registryMigrationStep(ctx, false)
-	if d.registryWriterActive.Load() {
-		t.Fatal("writer must deactivate when de-latched")
+	if d.registryLocallyReady.Load() {
+		t.Fatal("must un-publish ready when de-latched")
 	}
 }

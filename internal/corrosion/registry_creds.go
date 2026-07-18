@@ -18,6 +18,10 @@ import (
 // truth) so the ledger policy and the runtime activation check can't drift.
 const capCanonicalRegistryV1 = capabilities.CanonicalRegistryV1
 
+// capCanonicalRegistryActiveV1 is the phase-2 token: once latched (canonical writer on cluster-
+// wide) the legacy INSERT shape is rejected on apply.
+const capCanonicalRegistryActiveV1 = capabilities.CanonicalRegistryActiveV1
+
 // RegistryCredential is one stored OCI/Docker registry login (schema v23).
 // A row is either per-user (Scope="user", Owner=<username>) or global
 // (Scope="global", Owner=""). Secret is the raw password/token — List paths
@@ -73,6 +77,14 @@ func RegistryCredentialID(scope, owner, registry string) string {
 const registryTombstoneByTripleSQL = `UPDATE registry_credentials SET deleted_at = ?, updated_at = ?
 			       WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL`
 
+// registryLegacyInsertSQL mints a new random-id credential row (the legacy writer's second
+// statement). Capability-gated in the ledger: rejected on apply once canonical_registry_active_v1
+// has latched (the canonical writer is on cluster-wide), so a stray legacy INSERT from a bug or an
+// old/returning node can't create a duplicate physical row for a triple after activation.
+const registryLegacyInsertSQL = `INSERT INTO registry_credentials
+			       (id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at)
+			       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+
 // UpsertRegistryCredential replaces the live credential for (scope, owner,
 // registry). It soft-deletes any existing live row for that triple then inserts
 // a fresh id, both in one batch so the partial unique index never collides.
@@ -85,9 +97,7 @@ func UpsertRegistryCredential(ctx context.Context, c *Client, rc RegistryCredent
 			Params: []interface{}{nowRFC3339(), now, rc.Scope, rc.Owner, rc.Registry},
 		},
 		{
-			SQL: `INSERT INTO registry_credentials
-			       (id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at)
-			       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			SQL:    registryLegacyInsertSQL,
 			Params: []interface{}{rc.ID, rc.Scope, rc.Owner, rc.Registry, rc.Username, rc.Secret, nowRFC3339(), now},
 		},
 	})

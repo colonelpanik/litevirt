@@ -256,6 +256,10 @@ func (c *Client) capabilityActive(name string) bool {
 	switch name {
 	case capabilities.CanonicalRegistryV1:
 		return c.canonicalRegistryLatchedOn()
+	case capabilities.CanonicalRegistryActiveV1:
+		// Phase 2 (writer on cluster-wide) reuses the writer gate: once the writer is canonical,
+		// the legacy INSERT shape is rejected on apply.
+		return c.canonicalRegistryOn()
 	case capabilities.CanonicalIdentityV1:
 		return c.canonicalIdentityOn()
 	default:

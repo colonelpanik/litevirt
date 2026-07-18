@@ -116,11 +116,11 @@ type Daemon struct {
 	// plain field. Finding 7.
 	telemetryShutdown atomic.Pointer[func(context.Context) error]
 
-	// registryWriterActive is set by the Part H2 migration controller once this node's legacy
-	// registry-credential rows are consolidated to their deterministic ids (RegistryWriterReady) —
-	// gating the SWITCH of the credential writer to canonical. Read on the (rare) login write path;
-	// cleared if the capability de-latches or the config flag is turned off (reversible).
-	registryWriterActive atomic.Bool
+	// registryLocallyReady is set by the Part H2 migration controller to this node's
+	// RegistryWriterReady (legacy rows consolidated to deterministic ids). It gates advertising
+	// canonical_registry_active_v1 (phase 2), so that token latches only when EVERY node is ready —
+	// the machine check that switches the canonical writer. Read by the gRPC advertisement path.
+	registryLocallyReady atomic.Bool
 }
 
 // New creates a new daemon instance.
@@ -441,12 +441,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalRegistryLatched(func() bool {
 		return d.cfg.Enforcement.CanonicalRegistry && d.checker.Latched(capabilities.CanonicalRegistryV1)
 	})
-	// Switch the credential WRITER to canonical only once the accept gate is on AND this node has
-	// consolidated its legacy rows (registryWriterActive, set by runRegistryMigrationController).
-	// A login for a triple a lagging peer still holds as legacy-live back-pressures on that peer
-	// (fail-closed, self-heals when it consolidates) rather than producing two live rows.
+	// Switch the credential WRITER to canonical only once canonical_registry_active_v1 (phase 2) has
+	// latched — i.e. EVERY admitted node reports RegistryWriterReady (its legacy rows consolidated).
+	// Gating on the cluster-wide latch (not this node's local readiness) means no node originates a
+	// canonical write for a triple a peer still holds as legacy-live. Reversible via the config flag.
 	d.db.SetCanonicalRegistry(func() bool {
-		return d.cfg.Enforcement.CanonicalRegistry && d.checker.Latched(capabilities.CanonicalRegistryV1) && d.registryWriterActive.Load()
+		return d.cfg.Enforcement.CanonicalRegistry && d.checker.Latched(capabilities.CanonicalRegistryActiveV1)
 	})
 	repl.Start(ctx)
 
@@ -638,8 +638,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	)
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
-	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
-	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2: drives the latch + conditional advertisement
+	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity)              // drives the latch + conditional advertisement
+	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry)              // Part H2: drives the latch + conditional advertisement
+	svc.SetRegistryLocallyReady(func() bool { return d.registryLocallyReady.Load() }) // Part H2 phase 2: advertise writer-ready
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())

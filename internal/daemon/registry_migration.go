@@ -14,11 +14,13 @@ import (
 var registryMigrationInterval = 30 * time.Second
 
 // runRegistryMigrationController drives the Part H2 registry-credential online migration on this
-// node. Once canonical_registry_v1 is latched (the accept gate — peers apply the canonical writes)
-// it idempotently consolidates legacy random-id rows to their deterministic ids, and — once no
-// legacy live row remains locally (RegistryWriterReady) — activates the canonical WRITER. It is
-// REVERSIBLE: if the flag is turned off or the token de-latches, the writer is deactivated. The
-// CONTRACT (partial→non-partial index swap) is a separate, more-strongly-gated step.
+// node. Once canonical_registry_v1 is latched (phase 1 — the accept gate, so peers apply the
+// canonical writes) it idempotently consolidates legacy random-id rows to their deterministic ids
+// and PUBLISHES this node's writer-readiness (registryLocallyReady = RegistryWriterReady). Whether
+// the WRITER actually switches to canonical is decided cluster-wide by the phase-2 latch
+// (canonical_registry_active_v1), which latches only when EVERY node publishes readiness — so no
+// node originates canonical writes for a triple a peer still holds as legacy-live. The index
+// contract is deferred.
 func (d *Daemon) runRegistryMigrationController(ctx context.Context) {
 	t := time.NewTicker(registryMigrationInterval)
 	defer t.Stop()
@@ -32,14 +34,13 @@ func (d *Daemon) runRegistryMigrationController(ctx context.Context) {
 	}
 }
 
-// registryMigrationStep is one controller iteration, taking the resolved accept-latch so it can be
-// unit-tested without a Checker.
+// registryMigrationStep is one controller iteration, taking the resolved phase-1 accept-latch so it
+// can be unit-tested without a Checker. It consolidates legacy rows and publishes this node's
+// writer-readiness; it does NOT switch the writer (the phase-2 latch does).
 func (d *Daemon) registryMigrationStep(ctx context.Context, latched bool) {
 	if !latched {
-		// Not accepting canonical writes (flag off / not latched) ⇒ keep the writer on legacy.
-		if d.registryWriterActive.CompareAndSwap(true, false) {
-			slog.Info("registry migration: canonical writer deactivated (capability off / de-latched)")
-		}
+		// Not accepting canonical writes (flag off / not latched) ⇒ not ready, don't consolidate.
+		d.registryLocallyReady.Store(false)
 		return
 	}
 	// Idempotently consolidate any legacy live rows (including ones replicated from a lagging peer).
@@ -48,14 +49,14 @@ func (d *Daemon) registryMigrationStep(ctx context.Context, latched bool) {
 	} else if n > 0 {
 		slog.Info("registry migration: consolidated legacy credentials to canonical ids", "count", n)
 	}
-	// Activate the canonical writer once no legacy live row remains locally. Once activated it stays
-	// active (a later legacy row from a lagging peer is consolidated on the next tick).
+	// Publish local readiness — the phase-2 token (canonical_registry_active_v1) is advertised only
+	// while this is true, so it latches (and the writer switches) only when EVERY node is ready.
 	ready, err := corrosion.RegistryWriterReady(ctx, d.db)
 	if err != nil {
 		slog.Warn("registry migration: writer-readiness check failed", "error", err)
 		return
 	}
-	if ready && d.registryWriterActive.CompareAndSwap(false, true) {
-		slog.Info("registry migration: canonical writer activated (local legacy rows consolidated)")
+	if d.registryLocallyReady.CompareAndSwap(!ready, ready) && ready {
+		slog.Info("registry migration: node writer-ready (legacy rows consolidated) — advertising canonical_registry_active_v1")
 	}
 }

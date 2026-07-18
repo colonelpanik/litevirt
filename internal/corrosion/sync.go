@@ -678,7 +678,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				skipped++
 				continue
 			}
-			rejected, execErr := applyMergeRow(tx, insertSQL, row, table.Name)
+			rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
 			if execErr != nil {
 				_ = tx.Rollback()
 				return merged, skipped, execErr
@@ -745,7 +745,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				}
 			}
 		}
-		rejected, execErr := applyMergeRow(tx, insertSQL, row, table.Name)
+		rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
 		if execErr != nil {
 			_ = tx.Rollback()
 			return merged, skipped, execErr
@@ -777,10 +777,11 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 // and the sender still holds it for the next cycle. An operational or unrecognized failure is
 // returned so the caller rolls back the whole chunk and propagates it, rather than committing
 // a partial chunk and silently dropping the error.
-func applyMergeRow(tx *sql.Tx, insertSQL string, row []interface{}, table string) (rejected bool, err error) {
+func (c *Client) applyMergeRow(tx *sql.Tx, insertSQL string, row []interface{}, table string) (rejected bool, err error) {
 	if _, execErr := tx.Exec(insertSQL, row...); execErr != nil {
 		if class, _ := classifySQLiteError(execErr); class == classConstraint {
 			slog.Warn("sync: merge row rejected by constraint (keeping local)", "table", table, "error", execErr)
+			c.observeMergeRejected(table, "ae", "constraint")
 			return true, nil
 		}
 		return false, fmt.Errorf("merge row into %s: %w", table, execErr)

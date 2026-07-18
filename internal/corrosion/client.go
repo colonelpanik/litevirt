@@ -28,6 +28,11 @@ type SyncMetrics interface {
 	ObserveDump(d time.Duration, bytes int)
 	ObserveDigest(d time.Duration)
 	ObserveMerge(d time.Duration, merged, skipped int)
+	// ObserveMergeRejected records a replicated row/statement the apply path rejected but did
+	// NOT apply — path ∈ {ae, wal}; reason ∈ {constraint, …}. Bounded labels only (never SQL
+	// or parameter values). Counts ATTEMPTS, so a permanent collision increments every cycle;
+	// alert on rate, not absolute value.
+	ObserveMergeRejected(table, path, reason string)
 	// ObserveTieBreak records an exact-timestamp tie that a resolver converged:
 	// resolver ∈ {content_max, numeric_max, timestamp_max, non_null_wins,
 	// lb_generation}; winner ∈ {local, incoming}. (Tombstone ties go to
@@ -220,6 +225,12 @@ func (c *Client) observeDigest(d time.Duration) {
 func (c *Client) observeMerge(d time.Duration, merged, skipped int) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveMerge(d, merged, skipped)
+	}
+}
+
+func (c *Client) observeMergeRejected(table, path, reason string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveMergeRejected(table, path, reason)
 	}
 }
 

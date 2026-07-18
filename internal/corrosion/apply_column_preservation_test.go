@@ -336,6 +336,34 @@ func TestMergeLWW_SecondaryUniqueKeepsLocal(t *testing.T) {
 	}
 }
 
+// TestMergeLWW_SecondaryUniqueRecordsRejectedMetric: an AE constraint rejection (keep-local)
+// increments litevirt_merge_apply_rejected_total{table,path=ae,reason=constraint}.
+func TestMergeLWW_SecondaryUniqueRecordsRejectedMetric(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+
+	if err := c.Execute(ctx,
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"s1", "vm1", "host-a", "snapA", "ready", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	const newHLC = "2000000000000-0000-n2"
+	c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
+		Name:    "snapshots",
+		Columns: []string{"id", "vm_name", "host_name", "name", "state", "created_at", "updated_at"},
+		Rows:    [][]interface{}{{"s2", "vm1", "host-b", "snapA", "ready", "2020-01-01T00:00:00Z", newHLC}},
+	}}})
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.mergeRejected) != 1 || sm.mergeRejected[0] != "snapshots/ae/constraint" {
+		t.Errorf("mergeRejected = %v, want [snapshots/ae/constraint]", sm.mergeRejected)
+	}
+}
+
 // TestApplyRemoteMutations_SecondaryUniqueBackPressure: the same collision on the WAL path
 // surfaces as a constraint error and MUST back-pressure (roll back, don't record seen), not
 // silently drop the mutation.

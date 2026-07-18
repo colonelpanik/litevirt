@@ -22,6 +22,7 @@ type AntiEntropyMetrics struct {
 	tieUnresolved        *prometheus.CounterVec
 	tombstoneTies        *prometheus.CounterVec
 	tieUnresolvedCurrent prometheus.Gauge
+	mergeRejected        *prometheus.CounterVec
 }
 
 // NewAntiEntropyMetrics registers the anti-entropy timing metrics on the default
@@ -57,6 +58,10 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Name: "litevirt_antientropy_rows_skipped_total",
 			Help: "Rows skipped by anti-entropy merges (LWW kept local, or malformed).",
 		}),
+		mergeRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_merge_apply_rejected_total",
+			Help: "Replicated rows/statements the apply path rejected without applying, by table, path (ae/wal), and reason (e.g. constraint). Counts attempts; alert on rate.",
+		}, []string{"table", "path", "reason"}),
 		tieBreaks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_lww_tie_break_total",
 			Help: "Exact-timestamp ties a resolver converged, by table, resolver rule, and winner (local/incoming).",
@@ -74,7 +79,7 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Help: "Distinct unresolved ties this node is CURRENTLY tracking (a gauge — drops to 0 when repaired). Alert on this for 'something is divergent now'; the _total counter is monotonic and would page forever.",
 		}),
 	}
-	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent)
+	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent, m.mergeRejected)
 	return m
 }
 
@@ -115,6 +120,11 @@ func (m *AntiEntropyMetrics) ObserveTieUnresolved(table, path, category string) 
 // ObserveTombstoneTie records a tie settled by a one-sided soft-delete. (Satisfies corrosion.SyncMetrics.)
 func (m *AntiEntropyMetrics) ObserveTombstoneTie(table string) {
 	m.tombstoneTies.WithLabelValues(table).Inc()
+}
+
+// ObserveMergeRejected records a replicated row/statement rejected without applying. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveMergeRejected(table, path, reason string) {
+	m.mergeRejected.WithLabelValues(table, path, reason).Inc()
 }
 
 // ObserveUnresolvedTieCurrent sets the current-unresolved-ties gauge. (Satisfies corrosion.SyncMetrics.)

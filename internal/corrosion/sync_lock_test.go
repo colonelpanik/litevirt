@@ -19,6 +19,7 @@ type fakeSyncMetrics struct {
 	tieBreaks               []string // "table/resolver/winner"
 	tieUnresolved           []string // "table/path/category"
 	tombstoneTies           []string // "table"
+	mergeRejected           []string // "table/path/reason"
 	unresolvedCurrent       int      // last current-unresolved gauge value
 }
 
@@ -48,6 +49,11 @@ func (f *fakeSyncMetrics) ObserveTombstoneTie(table string) {
 func (f *fakeSyncMetrics) ObserveUnresolvedTieCurrent(n int) {
 	f.mu.Lock()
 	f.unresolvedCurrent = n
+	f.mu.Unlock()
+}
+func (f *fakeSyncMetrics) ObserveMergeRejected(table, path, reason string) {
+	f.mu.Lock()
+	f.mergeRejected = append(f.mergeRejected, table+"/"+path+"/"+reason)
 	f.mu.Unlock()
 }
 

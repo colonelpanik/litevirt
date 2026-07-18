@@ -38,7 +38,7 @@ func TestScanLocalTables_AndDumpRoundTrip(t *testing.T) {
 
 	// Peer-dump round-trip: parsing this node's own operator-safe dump yields the
 	// SAME per-row hash (so cross-node comparison is apples-to-apples).
-	dumpSnaps, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"containers": true}, false)
+	dumpSnaps, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"containers": true}, false, false)
 	if err != nil {
 		t.Fatalf("SnapshotFromDumpBytes: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestScanLocalTables_NumericColumnNoArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanLocalTables: %v", err)
 	}
-	peer, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"storage_pools": true}, false)
+	peer, _, err := SnapshotFromDumpBytes(c.DumpStateBytes(), map[string]bool{"storage_pools": true}, false, false)
 	if err != nil {
 		t.Fatalf("SnapshotFromDumpBytes: %v", err)
 	}
@@ -74,6 +74,46 @@ func TestScanLocalTables_NumericColumnNoArtifact(t *testing.T) {
 	sh, ph := self["storage_pools"].Rows[pk].RowHash, peer["storage_pools"].Rows[pk].RowHash
 	if sh == "" || sh != ph {
 		t.Fatalf("local and peer read paths must hash a numeric-column row identically (int64/float64 artifact): local=%q peer=%q", sh, ph)
+	}
+}
+
+// TestScannerIdentityLane_KeysByNaturalKey: the divergence scanner keys the identity tables by
+// their natural key ONLY on the natural-key lane (all compared nodes upgraded), else by the
+// physical id. On the physical lane two nodes' independently-minted ids read as two phantom rows;
+// on the natural-key lane they group under one label, so a still-diverging group surfaces as ONE
+// content divergence rather than two phantom missing rows.
+func TestScannerIdentityLane_KeysByNaturalKey(t *testing.T) {
+	cols := snapshotDumpCols
+	rowA := snapshotDumpRow("id-a", "vm1", "host-a", "snap1", "1000000000000-0000-n1")
+	rowB := snapshotDumpRow("id-b", "vm1", "host-b", "snap1", "2000000000000-0000-n2")
+
+	labelOf := func(ts TableSnapshot) string {
+		if len(ts.Rows) != 1 {
+			t.Fatalf("want exactly one keyed row, got %d: %v", len(ts.Rows), ts.Rows)
+		}
+		for k := range ts.Rows {
+			return k
+		}
+		return ""
+	}
+
+	// Physical lane (identityLane=false): keyed by id → distinct labels (phantom rows).
+	physA, _ := tableSnapshotFromRows("snapshots", cols, [][]interface{}{rowA}, false, false)
+	physB, _ := tableSnapshotFromRows("snapshots", cols, [][]interface{}{rowB}, false, false)
+	if labelOf(physA) != "id-a" || labelOf(physB) != "id-b" {
+		t.Fatalf("physical lane must key by id: A=%q B=%q", labelOf(physA), labelOf(physB))
+	}
+
+	// Natural-key lane: keyed by (vm_name, name) → the SAME label on both nodes.
+	natA, _ := tableSnapshotFromRows("snapshots", cols, [][]interface{}{rowA}, false, true)
+	natB, _ := tableSnapshotFromRows("snapshots", cols, [][]interface{}{rowB}, false, true)
+	wantLabel := "vm1" + pkSep + "snap1"
+	if labelOf(natA) != wantLabel || labelOf(natB) != wantLabel {
+		t.Fatalf("natural-key lane must key by (vm_name,name): A=%q B=%q want %q", labelOf(natA), labelOf(natB), wantLabel)
+	}
+	// Un-converged ids under one label ⇒ a truthful content divergence (different id column).
+	if natA.Rows[wantLabel].RowHash == natB.Rows[wantLabel].RowHash {
+		t.Fatal("un-converged rows sharing a natural-key label must show a content divergence")
 	}
 }
 

@@ -43,15 +43,31 @@ func cellString(v interface{}) string {
 	return coerceString(v)
 }
 
-// pkLabel composes the PK label for a row from the table's declared PK columns.
-// Returns "" if the table has no known PK or a PK column is missing from cols.
-func pkLabel(table string, idx map[string]int, vals []interface{}) string {
-	pkCols := tablePrimaryKeys[table]
-	if len(pkCols) == 0 {
+// labelColumns picks the columns that identify a row for cross-node comparison. Normally the
+// table's declared PRIMARY KEY. On the natural-key lane (identityLane), an identity table
+// (snapshots/container_snapshots) is keyed by its UNIQUE natural key instead of the minted random
+// id, so two nodes' independently-minted ids for one logical object group under ONE label rather
+// than reading as two phantom rows. The lane must be uniform across every compared node — the
+// scanner drives it off a single node's canonical_identity latch (see ScanLocalTables) so all
+// snapshots in a run use the same lane.
+func labelColumns(table string, identityLane bool) []string {
+	if identityLane {
+		if nat, ok := tableIdentityKeys[table]; ok {
+			return nat
+		}
+	}
+	return tablePrimaryKeys[table]
+}
+
+// pkLabel composes the row label from the table's identifying columns (see labelColumns).
+// Returns "" if the table has no known key or a key column is missing from cols.
+func pkLabel(table string, idx map[string]int, vals []interface{}, identityLane bool) string {
+	keyCols := labelColumns(table, identityLane)
+	if len(keyCols) == 0 {
 		return ""
 	}
-	parts := make([]string, len(pkCols))
-	for i, c := range pkCols {
+	parts := make([]string, len(keyCols))
+	for i, c := range keyCols {
 		j, ok := idx[c]
 		if !ok || j >= len(vals) {
 			return ""
@@ -89,7 +105,7 @@ func rowMeta(cols []string, idx map[string]int, vals []interface{}, v2 bool) Row
 // tableSnapshotFromRows builds a TableSnapshot (and, for semantic tables, owned
 // rows) from a table's columns + rows. labelKey wraps the PK label so the
 // sensitive lane can substitute an HMAC; pass nil for the operator-safe identity.
-func tableSnapshotFromRows(table string, cols []string, rows [][]interface{}, v2 bool) (TableSnapshot, []OwnedRow) {
+func tableSnapshotFromRows(table string, cols []string, rows [][]interface{}, v2, identityLane bool) (TableSnapshot, []OwnedRow) {
 	idx := colIndex(cols)
 	ts := TableSnapshot{Columns: cols, Rows: make(map[string]RowMeta, len(rows))}
 	var owned []OwnedRow
@@ -97,7 +113,7 @@ func tableSnapshotFromRows(table string, cols []string, rows [][]interface{}, v2
 		if len(vals) != len(cols) {
 			continue // malformed dump row
 		}
-		label := pkLabel(table, idx, vals)
+		label := pkLabel(table, idx, vals, identityLane)
 		if label == "" {
 			continue
 		}
@@ -168,7 +184,7 @@ func (c *Client) ScanLocalTables(_ context.Context, tables []string) (map[string
 	for _, t := range tables {
 		want[t] = true
 	}
-	return SnapshotFromDumpBytes(c.DumpStateBytes(), want, c.digestV2On())
+	return SnapshotFromDumpBytes(c.DumpStateBytes(), want, c.digestV2On(), c.canonicalIdentityOn())
 }
 
 // DigestV2Enabled reports whether digest_v2 emission is enabled on this node — so the
@@ -176,11 +192,20 @@ func (c *Client) ScanLocalTables(_ context.Context, tables []string) (map[string
 // version (v2 is compared only when both snapshots carry it). Nil-safe.
 func (c *Client) DigestV2Enabled() bool { return c.digestV2On() }
 
+// CanonicalIdentityEnabled reports whether this node resolves the identity tables by natural key
+// (enforcement.canonical_identity AND the token latched). The scanner orchestrator uses ONE
+// node's value to build every node's snapshot so the whole run keys identity tables on the same
+// lane — natural-key only when the fleet is uniformly upgraded (the latch guarantees that), else
+// physical id. Nil-safe.
+func (c *Client) CanonicalIdentityEnabled() bool { return c.canonicalIdentityOn() }
+
 // SnapshotFromDumpBytes parses a peer's gzipped operator-safe state dump into
 // per-table snapshots + owned rows, restricted to the requested tables. When v2 is true it
 // also fills each row's order-invariant RowHashV2 (from the same decoded values as v1, so
-// the v1 hash + the merge decode are byte-for-byte unaffected).
-func SnapshotFromDumpBytes(buf []byte, want map[string]bool, v2 bool) (map[string]TableSnapshot, []OwnedRow, error) {
+// the v1 hash + the merge decode are byte-for-byte unaffected). When identityLane is true the
+// identity tables are keyed by their natural key instead of the physical id (see labelColumns);
+// the caller passes ONE node's lane for every node so a run keys rows uniformly.
+func SnapshotFromDumpBytes(buf []byte, want map[string]bool, v2, identityLane bool) (map[string]TableSnapshot, []OwnedRow, error) {
 	payload, err := decompressPayload(buf)
 	if err != nil {
 		return nil, nil, err
@@ -191,7 +216,7 @@ func SnapshotFromDumpBytes(buf []byte, want map[string]bool, v2 bool) (map[strin
 		if want != nil && !want[t.Name] {
 			continue
 		}
-		ts, o := tableSnapshotFromRows(t.Name, t.Columns, t.Rows, v2)
+		ts, o := tableSnapshotFromRows(t.Name, t.Columns, t.Rows, v2, identityLane)
 		out[t.Name] = ts
 		owned = append(owned, o...)
 	}
@@ -222,7 +247,7 @@ func (c *Client) ScanLocalSensitive(ctx context.Context, key []byte, tables []st
 		}
 		for _, r := range rows {
 			idx := colIndex(r.Columns)
-			label := pkLabel(table, idx, r.Values)
+			label := pkLabel(table, idx, r.Values, false) // sensitive tables have no natural-key lane
 			if label == "" {
 				continue
 			}

@@ -111,11 +111,16 @@ const registryCanonicalUpsertSQL = `INSERT INTO registry_credentials
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`
 
-// registryTombstoneByIDSQL soft-deletes a SPECIFIC row by primary key, CAS-guarded on its
-// updated_at + still-live — used by consolidation to retire the exact legacy row without touching
-// an already-canonical row that shares the triple (the by-triple tombstone would delete a peer's
-// canonical live row). Registered shape (full-PK LWW).
-const registryTombstoneByIDSQL = `UPDATE registry_credentials SET deleted_at = ?, updated_at = ? WHERE id = ? AND updated_at = ? AND deleted_at IS NULL`
+// registryTombstoneByIDSQL soft-deletes a SPECIFIC legacy row, CAS-guarded on its COMPLETE
+// expected content — id, triple, username, secret, created_at, updated_at, and still-live. Used by
+// consolidation to retire the exact legacy row. The full-content CAS is what keeps an
+// equal-timestamp/different-content conflict fail-closed: on a peer that holds the same legacy id
+// and updated_at but DIFFERENT content, this tombstone affects ZERO rows, so the following canonical
+// insert collides with the still-live legacy row on the partial UNIQUE and the whole mutation entry
+// rolls back / back-pressures — the migration never silently picks one credential. (A guard on only
+// id + updated_at would retire the peer's differing row and let the sender's canonical row win.)
+// Registered shape (full-PK LWW).
+const registryTombstoneByIDSQL = `UPDATE registry_credentials SET deleted_at = ?, updated_at = ? WHERE id = ? AND scope = ? AND owner = ? AND registry = ? AND username = ? AND secret = ? AND created_at = ? AND updated_at = ? AND deleted_at IS NULL`
 
 // registryWriteRetries bounds the read-modify-write CAS retries for a contended row.
 const registryWriteRetries = 8
@@ -240,7 +245,9 @@ func (c *Client) migrateRegistryTriple(ctx context.Context, scope, owner, regist
 		}
 		writeCanonical := detTS == "" || lwwOrder(detTS, legacyTS) < 0
 
-		stmts := []Statement{{SQL: registryTombstoneByIDSQL, Params: []interface{}{nowRFC3339(), c.NowTS(), legacyID, legacyTS}}}
+		// Full-content CAS: id, triple, username, secret, created_at, updated_at, still-live.
+		stmts := []Statement{{SQL: registryTombstoneByIDSQL, Params: []interface{}{
+			nowRFC3339(), c.NowTS(), legacyID, scope, owner, registry, username, secret, createdAt, legacyTS}}}
 		if writeCanonical {
 			stmts = append(stmts, Statement{SQL: registryCanonicalUpsertSQL,
 				Params: []interface{}{detID, scope, owner, registry, username, secret, createdAt, legacyTS}})

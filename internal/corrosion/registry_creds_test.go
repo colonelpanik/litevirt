@@ -2,8 +2,11 @@ package corrosion
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // TestRegistryCredentialID_Frozen pins the deterministic id derivation (a change here is a
@@ -403,9 +406,10 @@ func TestConsolidate_ReplicatedMigrationKeepsCanonicalLive(t *testing.T) {
 	if live := liveRegistryRows(t, c, "user", "alice", "ghcr.io"); len(live) != 1 || live[0].String("id") != detID {
 		t.Fatalf("precondition: expected canonical live, got %v", live)
 	}
-	// Peer's migration entries (it consolidated the same converged legacy row).
+	// Peer's migration entries (it consolidated the same converged legacy row) — full-content CAS.
 	if err := applyRegistryWAL(t, c, Statement{SQL: registryTombstoneByIDSQL,
-		Params: []interface{}{"2020-06-01T00:00:00Z", "9000000000000-0000-peer", "rand-legacy", legacyTS}}); err != nil {
+		Params: []interface{}{"2020-06-01T00:00:00Z", "9000000000000-0000-peer", "rand-legacy",
+			"user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", legacyTS}}); err != nil {
 		t.Fatalf("apply peer tombstone: %v", err)
 	}
 	if err := applyRegistryWAL(t, c, canonicalUpsertStmt(detID, "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", legacyTS)); err != nil {
@@ -452,5 +456,46 @@ func TestConsolidate_RequiresLatch(t *testing.T) {
 	c := mustTestClient(t) // latch NOT set
 	if _, err := ConsolidateRegistryCredentials(context.Background(), c); err == nil {
 		t.Fatal("consolidation must require canonical_registry_v1 latched")
+	}
+}
+
+// TestConsolidate_EqualTSDiffContentBackPressures (finding): two nodes hold the SAME legacy id and
+// updated_at but DIFFERENT content. When the sender's consolidation entry (a full-content-CAS
+// tombstone + the canonical upsert) is applied on the receiver, the tombstone matches ZERO rows
+// (content mismatch), so the canonical insert collides with the still-live legacy row on the partial
+// UNIQUE and the WHOLE mutation entry rolls back / back-pressures — the migration fails closed
+// instead of silently retiring the receiver's differing credential.
+func TestConsolidate_EqualTSDiffContentBackPressures(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalRegistryLatched(func() bool { return true })
+	ctx := context.Background()
+	r := NewReplicator(c, "", RelayConfig{})
+	const id, ts, created = "rand-X", "2000000000000-0000-legacy", "2020-01-01T00:00:00Z"
+	detID := RegistryCredentialID("user", "alice", "ghcr.io")
+
+	// Receiver holds the legacy row with its OWN (different) secret.
+	if err := c.Execute(ctx,
+		`INSERT INTO registry_credentials (id, scope, owner, registry, username, secret, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, "user", "alice", "ghcr.io", "alice", "receiver-secret", created, ts); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Sender's consolidation entry: tombstone (sender's content) + canonical upsert (sender's content).
+	stmts, _ := json.Marshal([]Statement{
+		{SQL: registryTombstoneByIDSQL, Params: []interface{}{"2020-06-01T00:00:00Z", "9000000000000-0000-peer", id,
+			"user", "alice", "ghcr.io", "alice", "sender-secret", created, ts}},
+		{SQL: registryCanonicalUpsertSQL, Params: []interface{}{detID, "user", "alice", "ghcr.io", "alice", "sender-secret", created, ts}},
+	})
+	entries := []*pb.MutationEntry{{Seq: 1, Hlc: "9000000000000-0000-peer", Origin: "sender-node", Stmts: string(stmts)}}
+
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err == nil {
+		t.Fatal("equal-timestamp/different-content consolidation must back-pressure (fail closed)")
+	}
+	assertNotSeen(t, c, "sender-node") // watermark not advanced
+
+	// The receiver's differing legacy credential must remain LIVE (nothing was retired).
+	live := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
+	if len(live) != 1 || live[0].String("id") != id || live[0].String("secret") != "receiver-secret" {
+		t.Fatalf("receiver's differing legacy credential must remain live, got %v", live)
 	}
 }

@@ -21,6 +21,7 @@ type fakeSyncMetrics struct {
 	tombstoneTies           []string // "table"
 	mergeRejected           []string // "table/path/reason"
 	legacyTransformed       []string // "transformer"
+	identityOrphan          []string // "table"
 	unresolvedCurrent       int      // last current-unresolved gauge value
 }
 
@@ -60,6 +61,11 @@ func (f *fakeSyncMetrics) ObserveMergeRejected(table, path, reason string) {
 func (f *fakeSyncMetrics) ObserveLegacyTransformed(transformer string) {
 	f.mu.Lock()
 	f.legacyTransformed = append(f.legacyTransformed, transformer)
+	f.mu.Unlock()
+}
+func (f *fakeSyncMetrics) ObserveIdentityCollapseOrphan(table string) {
+	f.mu.Lock()
+	f.identityOrphan = append(f.identityOrphan, table)
 	f.mu.Unlock()
 }
 

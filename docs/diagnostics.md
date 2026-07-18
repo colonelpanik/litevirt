@@ -165,22 +165,32 @@ With `enforcement.canonical_identity` enabled **and the `canonical_identity_v1`
 token latched cluster-wide**, an upgraded receiver resolves these tables by their
 **natural key**: it collapses each such pair to a single deterministic winner (newer
 `updated_at` wins; on an **exact-instant tie** the smaller id wins **only if the two
-rows' non-id content is otherwise equivalent**). The collapse **re-keys the surviving
-row in place** — a single column-preserving `UPDATE`, never a delete-then-insert — so
-receiver-only columns a newer-schema node holds are **not** erased when an
-older-schema winner arrives. Because identity resolution *mutates shared state* it is
-**not** negotiated pairwise like `digest_v2`, and — like `operation_protocol` — the
-token is advertised only while the flag is on, so the latch requires **config**
-uniformity: a partially-configured cluster stays non-destructive (nodes not yet
-opted in keep back-pressuring) and converges once every node has latched.
+rows' non-id content is provably equivalent** — a NULL is distinct from an empty
+string, and equivalence requires a **complete** local-schema image, so under schema
+skew an uncompared receiver-only column is treated as a fault, never assumed equal).
+The collapse **re-keys the surviving row in place** — a single column-preserving
+`UPDATE`, never a delete-then-insert — so receiver-only columns a newer-schema node
+holds are **not** erased when an older-schema winner arrives. Because identity
+resolution *mutates shared state* it is **not** negotiated pairwise like `digest_v2`,
+and — like `operation_protocol` — the token is advertised only while the flag is on,
+so the latch requires **config** uniformity: a partially-configured cluster stays
+non-destructive (nodes not yet opted in keep back-pressuring) and converges once
+every node has latched.
 
 **Fail-closed guards** (nothing is silently discarded): an exact-instant tie whose
-content **differs** is an unresolved identity fault — keep local, remain divergent,
-surface it (`litevirt_merge_apply_rejected_total{reason="identity_content_conflict"}`)
-— rather than pick a row by id. A collapse also fails closed if the incoming id
-already belongs to a **different** natural key locally (would destroy an unrelated
-row), or if an existing child references the losing id (`snapshots.parent_id`, unused
-today, would be orphaned since references are not rewritten).
+content is not provably equivalent is an **unresolved identity fault** — keep local,
+remain divergent, and track it in `litevirt_lww_tie_unresolved_current`
+(category `identity_content_conflict`, keyed by natural key) so it alerts and clears
+on convergence — rather than pick a row by id. A collapse also fails closed if the
+incoming id already belongs to a **different** natural key locally (would destroy an
+unrelated row), or if an existing child references the losing id
+(`snapshots.parent_id`, unused today, would be orphaned since references are not
+rewritten).
+
+**Orphaned artifacts:** a collapse whose losing row lived on a **different host**
+leaves that host's snapshot file unreferenced. It is **not** auto-deleted — the losing
+id/host/path is logged (WARN) and counted in `litevirt_identity_collapse_orphaned_total`
+so an operator can reclaim the space.
 
 **Scanner lane:** while it is active fleet-wide, `lv doctor divergence` keys these
 tables by their natural key too, so a still-converging group shows as **one**

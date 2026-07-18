@@ -47,6 +47,11 @@ type SyncMetrics interface {
 	// {runtime_owned, opaque, tenancy, policy, control_plane, auth_factor,
 	// auth_pointer, lb_token}.
 	ObserveTieUnresolved(table, path, category string)
+	// ObserveIdentityCollapseOrphan records a natural-key identity collapse whose losing physical
+	// row referenced a DIFFERENT host/artifact than the winner, so that host's snapshot file may
+	// now be unreferenced. NOT auto-deleted — the losing id/host/path is logged (WARN) for
+	// operator cleanup; this metric (bounded, per-table) is the alert signal.
+	ObserveIdentityCollapseOrphan(table string)
 	// ObserveTombstoneTie records a tie a one-sided soft-delete settled. Tracked
 	// separately because it is a benign, expected outcome (a delete racing a
 	// write) — counting it in the tie-break series would muddy the "steady ties ⇒
@@ -260,6 +265,12 @@ func (c *Client) observeMergeRejected(table, path, reason string) {
 func (c *Client) observeLegacyTransformed(transformer string) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveLegacyTransformed(transformer)
+	}
+}
+
+func (c *Client) observeIdentityCollapseOrphan(table string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveIdentityCollapseOrphan(table)
 	}
 }
 

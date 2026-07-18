@@ -60,19 +60,53 @@ type errTestType string
 
 func (e errTestType) Error() string { return string(e) }
 
-// TestIdentityContentEqual: position-aligned, id-column skipped, nil-safe.
-func TestIdentityContentEqual(t *testing.T) {
-	a := []interface{}{"id-a", "vm1", "snap1", nil, int64(5)}
-	b := []interface{}{"id-b", "vm1", "snap1", nil, float64(5)} // differ only at id (+ int/float of same value)
-	if !identityContentEqual(a, b, 0) {
-		t.Error("rows equal except id must compare equal")
+// TestIdentityCellEqual: NULL is DISTINCT from empty string (finding 1); int/float of the same
+// value are equal (JSON round-trip normalization).
+func TestIdentityCellEqual(t *testing.T) {
+	if !identityCellEqual(nil, nil) {
+		t.Error("nil must equal nil")
 	}
-	c := []interface{}{"id-b", "vm1", "snap2", nil, int64(5)} // name differs
-	if identityContentEqual(a, c, 0) {
-		t.Error("a differing non-id column must compare unequal")
+	if identityCellEqual(nil, "") || identityCellEqual("", nil) {
+		t.Error("NULL must be DISTINCT from empty string")
 	}
-	if identityContentEqual(a, a[:4], 0) {
-		t.Error("different arity must compare unequal")
+	if !identityCellEqual(int64(5), float64(5)) {
+		t.Error("int64(5) and float64(5) must compare equal")
+	}
+	if identityCellEqual("a", "b") {
+		t.Error("distinct present values must be unequal")
+	}
+}
+
+// TestIdentityContentEquivalent: proves equivalence only over a COMPLETE local image (finding 2),
+// with NULL distinct from "" (finding 1).
+func TestIdentityContentEquivalent(t *testing.T) {
+	localCols := []string{"id", "vm_name", "name", "deleted_at"}
+	local := []interface{}{"id-a", "vm1", "snap1", nil} // deleted_at NULL = live
+
+	// Complete image, equal except id ⇒ equivalent.
+	if !identityContentEquivalent(localCols, local, []string{"id", "vm_name", "name", "deleted_at"},
+		[]interface{}{"id-b", "vm1", "snap1", nil}) {
+		t.Error("complete, equal-except-id image must be equivalent")
+	}
+	// Incomplete image (deleted_at omitted) ⇒ NOT proven equivalent (schema skew).
+	if identityContentEquivalent(localCols, local, []string{"id", "vm_name", "name"},
+		[]interface{}{"id-b", "vm1", "snap1"}) {
+		t.Error("an incomplete image must NOT be declared equivalent")
+	}
+	// NULL vs "" on deleted_at ⇒ NOT equivalent (live vs the SQL-predicate-breaking empty string).
+	if identityContentEquivalent(localCols, local, localCols,
+		[]interface{}{"id-b", "vm1", "snap1", ""}) {
+		t.Error("NULL deleted_at must differ from empty-string deleted_at")
+	}
+	// A differing non-id column ⇒ not equivalent.
+	if identityContentEquivalent(localCols, local, localCols,
+		[]interface{}{"id-b", "vm1", "snap2", nil}) {
+		t.Error("a differing non-id column must be unequal")
+	}
+	// An EXTRA incoming column the receiver lacks is ignored (newer sender schema).
+	if !identityContentEquivalent(localCols, local, []string{"id", "vm_name", "name", "deleted_at", "extra"},
+		[]interface{}{"id-b", "vm1", "snap1", nil, "x"}) {
+		t.Error("an extra incoming column must not defeat equivalence")
 	}
 }
 

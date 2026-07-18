@@ -251,3 +251,118 @@ func TestMergeIdentity_CollapseOrphaningChildFailsClosed(t *testing.T) {
 		t.Fatalf("parent must keep its id after fail-closed, got %v", rows)
 	}
 }
+
+// ctSnapDumpCols is the full container_snapshots column list for an anti-entropy dump.
+var ctSnapDumpCols = []string{
+	"id", "ct_name", "host_name", "name", "state", "size_bytes", "type", "path",
+	"created_at", "updated_at", "deleted_at",
+}
+
+func ctSnapDumpRow(id, host, ct, name, updatedAt string) []interface{} {
+	// size_bytes is NOT NULL DEFAULT 0 in the schema, so a dump row carries a concrete 0.
+	return []interface{}{id, ct, host, name, "ready", 0, "tar", nil, "2020-01-01T00:00:00Z", updatedAt, nil}
+}
+
+func seedCtSnapshot(t *testing.T, c *Client, id, host, ct, name, updatedAt string) {
+	t.Helper()
+	if err := c.Execute(context.Background(),
+		`INSERT INTO container_snapshots (id, ct_name, host_name, name, state, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, ct, host, name, "ready", "tar", "2020-01-01T00:00:00Z", updatedAt); err != nil {
+		t.Fatalf("seed ct snapshot %s: %v", id, err)
+	}
+}
+
+// TestMergeIdentity_ContentFaultTracksAndClears (finding 3): an identity content fault is tracked
+// by the persistent unresolved-tie tracker (natural-key label), so it feeds
+// litevirt_lww_tie_unresolved_current, and clears once a newer write converges the group.
+func TestMergeIdentity_ContentFaultTracksAndClears(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	const tie = "2000000000000-0000-tie"
+	seedSnapshot(t, c, "id-a", "vm1", "snap1", tie)
+	fault := []interface{}{"id-b", "vm1", "host-a", "snap1", "error", nil, nil, "disk", nil, 0, "2020-01-01T00:00:00Z", tie, nil}
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, fault)); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("content fault must be tracked as unresolved, count=%d", c.UnresolvedTieCount())
+	}
+	var sawCat bool
+	for _, s := range sm.tieUnresolved {
+		if s == "snapshots/ae/identity_content_conflict" {
+			sawCat = true
+		}
+	}
+	if !sawCat {
+		t.Fatalf("expected snapshots/ae/identity_content_conflict, got %v", sm.tieUnresolved)
+	}
+
+	// A strictly-newer write converges the group ⇒ the tracked fault clears.
+	newer := snapshotDumpRow("id-c", "vm1", "host-a", "snap1", "3000000000000-0000-new")
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, newer)); err != nil {
+		t.Fatalf("merge newer: %v", err)
+	}
+	if c.UnresolvedTieCount() != 0 {
+		t.Fatalf("a converging newer write must clear the identity fault, count=%d", c.UnresolvedTieCount())
+	}
+}
+
+// TestMergeIdentity_CrossHostCollapseSurfacesOrphan (finding 4): a collapse whose losing row lived
+// on a DIFFERENT host surfaces the losing artifact (metric + WARN log) for cleanup.
+func TestMergeIdentity_CrossHostCollapseSurfacesOrphan(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	if err := c.Execute(context.Background(),
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, vmstate_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"id-local", "vm1", "host-a", "snap1", "ready", "/data/snap.state", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Newer winner on a DIFFERENT host ⇒ the losing host-a artifact is now unreferenced.
+	incoming := snapshotDumpRow("id-remote", "vm1", "host-b", "snap1", "2000000000000-0000-n2")
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, incoming)); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(sm.identityOrphan) != 1 || sm.identityOrphan[0] != "snapshots" {
+		t.Fatalf("cross-host collapse must surface the orphan metric, got %v", sm.identityOrphan)
+	}
+}
+
+// TestMergeIdentity_SameHostCollapseNoOrphan (finding 4, contrast): a collapse on the SAME host is
+// re-keyed in place — no artifact is orphaned, so nothing is surfaced.
+func TestMergeIdentity_SameHostCollapseNoOrphan(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	seedSnapshot(t, c, "id-local", "vm1", "snap1", "1000000000000-0000-n1") // host-a
+	incoming := snapshotDumpRow("id-remote", "vm1", "host-a", "snap1", "2000000000000-0000-n2")
+	if err := c.mergeStatePayloadLWW(snapshotSyncPayload(snapshotDumpCols, incoming)); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(sm.identityOrphan) != 0 {
+		t.Fatalf("same-host collapse must NOT surface an orphan, got %v", sm.identityOrphan)
+	}
+}
+
+// TestMergeIdentity_ContainerSnapshotCollapses (finding 5): the three-column natural key
+// (host_name, ct_name, name) resolves on the AE path just like snapshots.
+func TestMergeIdentity_ContainerSnapshotCollapses(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	ctx := context.Background()
+	seedCtSnapshot(t, c, "ct-local", "host-a", "web", "snap1", "1000000000000-0000-n1")
+	incoming := ctSnapDumpRow("ct-remote", "host-a", "web", "snap1", "2000000000000-0000-n2")
+	if err := c.mergeStatePayloadLWW(&syncPayload{Tables: []syncTable{{
+		Name: "container_snapshots", Columns: ctSnapDumpCols, Rows: [][]interface{}{incoming},
+	}}}); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	rows, _ := c.Query(ctx, "SELECT id FROM container_snapshots WHERE host_name = ? AND ct_name = ? AND name = ?", "host-a", "web", "snap1")
+	if len(rows) != 1 || rows[0].String("id") != "ct-remote" {
+		t.Fatalf("container_snapshots must collapse to the winning id, got %v", rows)
+	}
+}

@@ -1263,23 +1263,34 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 		return nil
 	}
 
+	// On an exact-instant tie the content must be proven equivalent over the FULL local schema
+	// (not just this statement's projection) before an id-based collapse — else keep local as a
+	// fault. The closure captures the full local row so a fault can be tracked by natural key.
+	var localFullVals []interface{}
 	contentEqual := func() (bool, error) {
-		localCells, found, fErr := fetchRowCellsByID(tx, tableName, cols, localID.String)
+		fullCols, fullVals, found, fErr := fetchFullRowByID(tx, tableName, localID.String)
 		if fErr != nil {
 			return false, fErr
 		}
-		return found && identityContentEqual(localCells, vals, idIdx), nil
+		if !found {
+			return false, nil
+		}
+		localFullVals = fullVals
+		return identityContentEquivalent(fullCols, fullVals, cols, vals), nil
 	}
 	disp, dErr := resolveIdentity(localExists, localTS, localID.String, incomingTS, incomingID, contentEqual)
 	if dErr != nil {
 		return dErr
 	}
+	if disp == idContentFault {
+		slog.Warn("replicator: unresolved identity fault (equal timestamp, unproven-equivalent content) — keeping local", "table", tableName)
+		r.client.trackIdentityFault(tableName, incomingNat, localFullVals, vals, pathWAL)
+		return nil
+	}
+	// Any resolved disposition supersedes a prior fault for this natural key.
+	r.client.clearIdentityFault(tableName, incomingNat)
 	switch disp {
 	case idKeepLocal:
-		return nil
-	case idContentFault:
-		slog.Warn("replicator: unresolved identity fault (equal timestamp, different content) — keeping local", "table", tableName)
-		r.client.observeMergeRejected(tableName, "wal", "identity_content_conflict")
 		return nil
 	case idApplyNew, idAdoptSameID:
 		// Plain PK-aware upsert so receiver-only columns keep their local value.
@@ -1304,6 +1315,8 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 		} else if orphan {
 			return invalidf("identity collapse on %s would orphan a reference to the losing id", tableName)
 		}
+		// Capture the losing row's host/artifact BEFORE the re-key overwrites them.
+		losingHost, losingPath := identityArtifact(tx, tableName, localID.String)
 		rejected, cErr := identityCollapseUpdate(tx, tableName, cols, vals, localID.String)
 		if cErr != nil {
 			return cErr
@@ -1313,6 +1326,11 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 			// fail closed (back-pressure) rather than silently drop, per the WAL contract.
 			return invalidf("identity collapse on %s hit an unexpected constraint", tableName)
 		}
+		winnerHost := ""
+		if j, has := colIdx["host_name"]; has {
+			winnerHost = coerceString(vals[j])
+		}
+		r.client.surfaceIdentityCollapseOrphan(tableName, localID.String, losingHost, losingPath, incomingID, winnerHost)
 		r.client.clearUnresolvedFromStmt(s)
 		return nil
 	}

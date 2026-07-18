@@ -117,6 +117,41 @@ func TestScannerIdentityLane_KeysByNaturalKey(t *testing.T) {
 	}
 }
 
+// TestScannerIdentityLane_ContainerSnapshots (finding 5): the scanner keys container_snapshots by
+// its THREE-column natural key (host_name, ct_name, name) on the natural-key lane, else by id.
+func TestScannerIdentityLane_ContainerSnapshots(t *testing.T) {
+	cols := ctSnapDumpCols
+	rowA := ctSnapDumpRow("ct-a", "host-a", "web", "snap1", "1000000000000-0000-n1")
+	rowB := ctSnapDumpRow("ct-b", "host-b", "web", "snap1", "2000000000000-0000-n2")
+
+	labelOf := func(ts TableSnapshot) string {
+		if len(ts.Rows) != 1 {
+			t.Fatalf("want one keyed row, got %d: %v", len(ts.Rows), ts.Rows)
+		}
+		for k := range ts.Rows {
+			return k
+		}
+		return ""
+	}
+
+	// Physical lane: keyed by id.
+	physA, _ := tableSnapshotFromRows("container_snapshots", cols, [][]interface{}{rowA}, false, false)
+	if labelOf(physA) != "ct-a" {
+		t.Fatalf("physical lane must key by id, got %q", labelOf(physA))
+	}
+
+	// Natural-key lane: keyed by (host_name, ct_name, name) — note host differs between the two
+	// rows, so their labels differ (they are NOT the same logical object).
+	natA, _ := tableSnapshotFromRows("container_snapshots", cols, [][]interface{}{rowA}, false, true)
+	natB, _ := tableSnapshotFromRows("container_snapshots", cols, [][]interface{}{rowB}, false, true)
+	if labelOf(natA) != "host-a"+pkSep+"web"+pkSep+"snap1" {
+		t.Fatalf("natural-key lane must key by (host_name,ct_name,name), got %q", labelOf(natA))
+	}
+	if labelOf(natA) == labelOf(natB) {
+		t.Fatal("rows with different hosts are different logical objects (distinct labels)")
+	}
+}
+
 func TestScanLocalSensitive_HMACOnly(t *testing.T) {
 	ctx := context.Background()
 	c := testClient(t)

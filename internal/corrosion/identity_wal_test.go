@@ -187,3 +187,28 @@ func TestWALIdentity_CollapsePreservesReceiverOnlyColumn(t *testing.T) {
 		t.Errorf("receiver-only column erased on WAL collapse: vmstate_path=%q, want /keep/me", got)
 	}
 }
+
+// ctSnapInsertStmt builds the container_snapshots INSERT the CreateContainerSnapshot builder emits.
+func ctSnapInsertStmt(id, host, ct, name, updatedAt string) Statement {
+	return Statement{
+		SQL:    `INSERT OR REPLACE INTO container_snapshots (id, ct_name, host_name, name, state, size_bytes, type, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		Params: []interface{}{id, ct, host, name, "ready", float64(0), "tar", nil, "2020-01-01T00:00:00Z", updatedAt},
+	}
+}
+
+// TestWALIdentity_ContainerSnapshotCollapses (finding 5, WAL): the three-column natural key
+// (host_name, ct_name, name) resolves on the WAL path just like snapshots.
+func TestWALIdentity_ContainerSnapshotCollapses(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	ctx := context.Background()
+	seedCtSnapshot(t, c, "ct-local", "host-a", "web", "snap1", "1000000000000-0000-n1")
+
+	if err := applyWALSnapshot(t, c, ctSnapInsertStmt("ct-remote", "host-a", "web", "snap1", "2000000000000-0000-n2"), "2000000000000-0000-n2"); err != nil {
+		t.Fatalf("applyStatementLWW must resolve the container_snapshots collision: %v", err)
+	}
+	rows, _ := c.Query(ctx, "SELECT id FROM container_snapshots WHERE host_name = ? AND ct_name = ? AND name = ?", "host-a", "web", "snap1")
+	if len(rows) != 1 || rows[0].String("id") != "ct-remote" {
+		t.Fatalf("container_snapshots must collapse to the winning id, got %v", rows)
+	}
+}

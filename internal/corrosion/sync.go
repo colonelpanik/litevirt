@@ -864,23 +864,34 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 		return false, nil
 	}
 
+	// On an exact-instant tie the content must be proven equivalent over the FULL local schema
+	// (not just the sender's projection) before an id-based collapse — else keep local as a fault.
+	// The closure captures the full local row so a fault can be tracked by natural key below.
+	var localFullVals []interface{}
 	contentEqual := func() (bool, error) {
-		localCells, found, fErr := fetchRowCellsByID(tx, table.Name, table.Columns, localID.String)
+		fullCols, fullVals, found, fErr := fetchFullRowByID(tx, table.Name, localID.String)
 		if fErr != nil {
 			return false, fErr
 		}
-		return found && identityContentEqual(localCells, row, idIdx), nil
+		if !found {
+			return false, nil
+		}
+		localFullVals = fullVals
+		return identityContentEquivalent(fullCols, fullVals, table.Columns, row), nil
 	}
 	disp, dErr := resolveIdentity(localExists, localTS, localID.String, incomingTS, incomingID, contentEqual)
 	if dErr != nil {
 		return false, dErr
 	}
+	if disp == idContentFault {
+		slog.Warn("sync: unresolved identity fault (equal timestamp, unproven-equivalent content) — keeping local", "table", table.Name)
+		c.trackIdentityFault(table.Name, incomingNat, localFullVals, row, pathAE)
+		return false, nil
+	}
+	// Any resolved disposition supersedes a prior fault for this natural key.
+	c.clearIdentityFault(table.Name, incomingNat)
 	switch disp {
 	case idKeepLocal:
-		return false, nil
-	case idContentFault:
-		slog.Warn("sync: unresolved identity fault (equal timestamp, different content) — keeping local", "table", table.Name)
-		c.observeMergeRejected(table.Name, "ae", "identity_content_conflict")
 		return false, nil
 	case idApplyNew, idAdoptSameID:
 		rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
@@ -896,6 +907,8 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 		} else if orphan {
 			return false, fmt.Errorf("identity collapse on %s would orphan a reference to the losing id", table.Name)
 		}
+		// Capture the losing row's host/artifact BEFORE the re-key overwrites them.
+		losingHost, losingPath := identityArtifact(tx, table.Name, localID.String)
 		rejected, cErr := identityCollapseUpdate(tx, table.Name, table.Columns, row, localID.String)
 		if cErr != nil {
 			return false, cErr
@@ -904,6 +917,11 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 			c.observeMergeRejected(table.Name, "ae", "identity_collapse_rejected")
 			return false, nil
 		}
+		winnerHost := ""
+		if hi := indexOf(table.Columns, "host_name"); hi >= 0 {
+			winnerHost = coerceString(row[hi])
+		}
+		c.surfaceIdentityCollapseOrphan(table.Name, localID.String, losingHost, losingPath, incomingID, winnerHost)
 		return true, nil
 	}
 }
@@ -1253,51 +1271,86 @@ func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkI
 	return jsonRoundTripCells(raw), true, nil
 }
 
-// fetchRowCellsByID reads the row with the given id into cols (JSON-round-tripped like
-// fetchLocalRowCells, so its value kinds match a post-transit dump row for content comparison).
+// fetchFullRowByID reads the ENTIRE local-schema row for the given id (SELECT *), JSON-round-
+// tripped so its value kinds match a post-transit dump row. It returns the receiver's full column
+// list so a tie-equivalence check can require a COMPLETE image (every non-id column compared).
 // Fails closed: only sql.ErrNoRows is found=false; any other error is returned.
-func fetchRowCellsByID(tx *sql.Tx, tableName string, cols []string, idVal string) ([]interface{}, bool, error) {
-	if len(cols) == 0 {
-		return nil, false, nil
+func fetchFullRowByID(tx *sql.Tx, tableName, idVal string) (cols []string, vals []interface{}, found bool, err error) {
+	rows, qErr := tx.Query("SELECT * FROM "+tableName+" WHERE id = ?", idVal)
+	if qErr != nil {
+		return nil, nil, false, fmt.Errorf("fetch full row for %s: %w", tableName, qErr)
 	}
-	q := "SELECT " + strings.Join(cols, ", ") + " FROM " + tableName + " WHERE id = ?"
+	defer rows.Close()
+	cols, cErr := rows.Columns()
+	if cErr != nil {
+		return nil, nil, false, fmt.Errorf("columns for %s: %w", tableName, cErr)
+	}
+	if !rows.Next() {
+		if rErr := rows.Err(); rErr != nil {
+			return nil, nil, false, fmt.Errorf("fetch full row for %s: %w", tableName, rErr)
+		}
+		return nil, nil, false, nil
+	}
 	raw := make([]interface{}, len(cols))
 	ptrs := make([]interface{}, len(cols))
 	for i := range raw {
 		ptrs[i] = &raw[i]
 	}
-	if err := tx.QueryRow(q, idVal).Scan(ptrs...); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("fetch row by id for %s: %w", tableName, err)
+	if sErr := rows.Scan(ptrs...); sErr != nil {
+		return nil, nil, false, fmt.Errorf("scan full row for %s: %w", tableName, sErr)
 	}
 	for i, v := range raw {
 		if b, ok := v.([]byte); ok {
 			raw[i] = string(b)
 		}
 	}
-	return jsonRoundTripCells(raw), true, nil
+	return cols, jsonRoundTripCells(raw), true, nil
 }
 
-// identityContentEqual reports whether two position-aligned rows agree on every column EXCEPT the
-// id at skipIdx. Compared per index with the same string normalization the encoder uses, so it is
-// collision-free (index i is only ever compared to index i). Used ONLY on an exact-instant tie to
-// distinguish an equivalent-except-id pair (safe to collapse) from a genuine different-content
-// safety fault.
-func identityContentEqual(a, b []interface{}, skipIdx int) bool {
-	if len(a) != len(b) {
-		return false
+// trackIdentityFault records an exact-instant/different-content identity fault under the natural-key
+// tracker so it feeds litevirt_lww_tie_unresolved_current / _total and dedupes per logical identity
+// (the physical-PK clear path can't cover it — the two rows have different ids).
+func (c *Client) trackIdentityFault(table string, natVals, localFull, incoming []interface{}, path resolveTiePath) {
+	c.trackUnresolved(table, identityFaultPK(natVals), localFull, incoming, path, "identity_content_conflict")
+}
+
+// clearIdentityFault drops any tracked identity fault for this natural key — called on a resolved
+// disposition (a newer write or a convergent collapse) so a stale fault stops counting. Lock-free
+// when nothing is tracked.
+func (c *Client) clearIdentityFault(table string, natVals []interface{}) {
+	if !c.anyUnresolved() {
+		return
 	}
-	for i := range a {
-		if i == skipIdx {
-			continue
-		}
-		if coerceString(a[i]) != coerceString(b[i]) {
-			return false
-		}
+	c.clearUnresolved(table, identityFaultPK(natVals))
+}
+
+// surfaceIdentityCollapseOrphan surfaces a collapse whose LOSING row referenced a different host
+// than the winner: that host's snapshot artifact may now be unreferenced. It is NOT auto-deleted —
+// the losing id/host/path is logged (WARN) and counted (bounded per-table metric) for operator
+// cleanup. losingHost/losingPath are read BEFORE the collapse re-key overwrote them.
+func (c *Client) surfaceIdentityCollapseOrphan(table, losingID, losingHost, losingPath, winnerID, winnerHost string) {
+	if losingHost == "" || losingHost == winnerHost {
+		return // same host (re-keyed in place) → no orphan
 	}
-	return true
+	c.observeIdentityCollapseOrphan(table)
+	slog.Warn("identity collapse orphaned a losing-host artifact (not auto-deleted; needs cleanup)",
+		"table", table, "losing_id", losingID, "losing_host", losingHost, "artifact_path", losingPath,
+		"winner_id", winnerID, "winner_host", winnerHost)
+}
+
+// identityArtifact reads a row's (host, artifact-path) for orphan surfacing. Missing row or no
+// registered artifact columns → empty strings (no surfacing).
+func identityArtifact(tx *sql.Tx, table, id string) (host, path string) {
+	art, ok := identityArtifactColumns[table]
+	if !ok {
+		return "", ""
+	}
+	var h, p sql.NullString
+	q := "SELECT " + art.host + ", COALESCE(" + art.path + ", '') FROM " + table + " WHERE id = ?"
+	if err := tx.QueryRow(q, id).Scan(&h, &p); err != nil {
+		return "", ""
+	}
+	return h.String, p.String
 }
 
 // jsonRoundTripCells marshals then unmarshals a scanned row so its numeric/text

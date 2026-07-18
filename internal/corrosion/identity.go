@@ -97,6 +97,57 @@ func resolveIdentity(localExists bool, localTS, localID, incomingTS, incomingID 
 	return idKeepLocal, nil // local id is the winner (smaller-or-equal)
 }
 
+// identityArtifactColumns names, per table, the host column and the on-disk artifact-path column,
+// so a collapse can surface a losing-host artifact that may become unreferenced (see
+// surfaceIdentityCollapseOrphan). Both identity tables key the physical artifact by host_name.
+var identityArtifactColumns = map[string]struct{ host, path string }{
+	"snapshots":           {host: "host_name", path: "vmstate_path"},
+	"container_snapshots": {host: "host_name", path: "path"},
+}
+
+// identityFaultPK is the tracker key for an unresolved identity fault: the natural key, namespaced
+// so it can never collide with a physical-PK tracker entry for the same table.
+func identityFaultPK(natVals []interface{}) string { return "nk:" + pkKey(natVals) }
+
+// identityCellEqual compares two normalized cells with NULL DISTINCT from empty string (the
+// digest-v2 cell contract): nil equals only nil; two present values compare by coerceString. This
+// matters for columns like deleted_at, where NULL (live) and "" are semantically different.
+func identityCellEqual(a, b interface{}) bool {
+	an, bn := a == nil, b == nil
+	if an || bn {
+		return an && bn
+	}
+	return coerceString(a) == coerceString(b)
+}
+
+// identityContentEquivalent reports whether the incoming row proves the local row equivalent on
+// EVERY non-id column of the LOCAL (receiver) schema. It requires a COMPLETE image: every local
+// column except id must appear in the incoming projection — otherwise, under schema skew, a
+// receiver-only column is uncompared and equivalence is UNPROVEN, so it returns false (the caller
+// then treats the tie as an unresolved fault rather than collapsing on an unknown difference).
+func identityContentEquivalent(localCols []string, localVals []interface{}, incomingCols []string, incomingVals []interface{}) bool {
+	inc := make(map[string]interface{}, len(incomingCols))
+	for i, c := range incomingCols {
+		if i < len(incomingVals) {
+			inc[strings.ToLower(c)] = incomingVals[i]
+		}
+	}
+	for i, c := range localCols {
+		lc := strings.ToLower(c)
+		if lc == "id" {
+			continue
+		}
+		iv, ok := inc[lc]
+		if !ok {
+			return false // receiver-only column absent from the incoming image → unproven
+		}
+		if i >= len(localVals) || !identityCellEqual(localVals[i], iv) {
+			return false
+		}
+	}
+	return true
+}
+
 // identityIDForeignNaturalKey reports whether the incoming id already exists locally bound to a
 // DIFFERENT natural key. If it does, applying/collapsing would re-key or overwrite an UNRELATED
 // logical row (a builder-bug / UUID-collision within the stated threat model), destroying two

@@ -178,10 +178,15 @@ enforcement:
                               # for one logical object, whose rows then collide on the secondary
                               # UNIQUE and back-pressure; once this latches cluster-wide the
                               # receiver collapses each such pair to a single deterministic winner
-                              # (newest updated_at, then smaller id). Unlike digest_v2 this is NOT
-                              # pairwise — identity resolution mutates shared state, so it activates
-                              # only when the flag is set AND the token has latched fleet-wide.
-                              # Enable fleet-uniformly; the flag is the reversible kill switch.
+                              # (newer updated_at; an exact-instant tie breaks to the smaller id
+                              # ONLY when the rows' content is otherwise equal — a different-content
+                              # tie stays a surfaced fault) by RE-KEYING the surviving row in place,
+                              # so receiver-only columns are preserved. Unlike digest_v2 this is NOT
+                              # pairwise — identity resolution mutates shared state, so (like
+                              # operation_protocol) it is advertised only while this flag is on and
+                              # activates only when the flag is set AND the token has latched
+                              # fleet-wide. Enable fleet-uniformly; the flag is the reversible kill
+                              # switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

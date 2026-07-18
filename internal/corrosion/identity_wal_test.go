@@ -143,3 +143,47 @@ func TestWALIdentity_NonNullReferenceFailsClosed(t *testing.T) {
 		t.Fatal("a non-null parent_id must fail closed under canonical_identity_v1")
 	}
 }
+
+// TestWALIdentity_CollapsePreservesReceiverOnlyColumn (finding 2, WAL): a collapse driven by an
+// older-schema statement that OMITS a column must preserve the local value of that receiver-only
+// column. Exercised via applyIdentityInsert directly with a subset (schema-skewed) statement
+// (a subset shape is not in the ledger, so the ledger would reject it before this point — this
+// unit-tests the collapse's column preservation).
+func TestWALIdentity_CollapsePreservesReceiverOnlyColumn(t *testing.T) {
+	c := mustTestClient(t)
+	c.SetCanonicalIdentity(func() bool { return true })
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, vmstate_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"id-local", "vm1", "host-a", "snap1", "ready", "/keep/me", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Incoming (newer, different id) statement omits vmstate_path.
+	s := Statement{
+		SQL:    `INSERT OR REPLACE INTO snapshots (id, vm_name, host_name, name, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		Params: []interface{}{"id-remote", "vm1", "host-b", "snap1", "ready", "2020-01-01T00:00:00Z", "2000000000000-0000-n2"},
+	}
+	sh, err := parseStmtShape(s.SQL, tablePrimaryKeys["snapshots"])
+	if err != nil {
+		t.Fatalf("parse shape: %v", err)
+	}
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := r.applyIdentityInsert(ctx, tx, s, sh, "snapshots", tablePrimaryKeys["snapshots"]); err != nil {
+		tx.Rollback()
+		t.Fatalf("applyIdentityInsert: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	rows, _ := c.Query(ctx, "SELECT id, vmstate_path FROM snapshots WHERE vm_name = ? AND name = ?", "vm1", "snap1")
+	if len(rows) != 1 || rows[0].String("id") != "id-remote" {
+		t.Fatalf("want single surviving id-remote, got %v", rows)
+	}
+	if got := rows[0].String("vmstate_path"); got != "/keep/me" {
+		t.Errorf("receiver-only column erased on WAL collapse: vmstate_path=%q, want /keep/me", got)
+	}
+}

@@ -1190,13 +1190,14 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 
 // applyIdentityInsert resolves a replicated INSERT into a natural-key identity table by its
 // UNIQUE natural key under canonical_identity_v1 (the WAL analogue of mergeIdentityRow). It finds
-// the local row with the same natural key (whatever its id) and either keeps local (deterministic
-// identityWinner) or adopts the incoming row — DELETING the local row first when the ids differ so
-// the two independently-minted ids collapse to the single winner without colliding on the
-// secondary UNIQUE. The incoming row is then applied as a PK-aware upsert so receiver-only columns
-// are preserved. It fails closed on a non-null self-reference (provably unused today), and honours
-// the same skew quarantine as shouldSkipLWW. All within the caller's tx; any operational error is
-// returned so the caller rolls back and back-pressures.
+// the local row that shares the natural key (whatever its id) and resolves via resolveIdentity:
+// keep local, plain PK-aware upsert (same id — receiver-only columns preserved), a column-
+// preserving collapse (different id, incoming wins — a single atomic re-keying UPDATE, never a
+// delete+insert), or — on an exact-instant tie with DIFFERENT content — an unresolved identity
+// fault that keeps local and remains divergent. It fails closed on a non-null incoming reference,
+// an existing child referencing the losing id, or an incoming id already bound to a different
+// natural key, and honours the same skew quarantine as shouldSkipLWW. All within the caller's tx;
+// any operational error is returned so the caller rolls back and back-pressures.
 func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string) error {
 	cols, vals, ok := insertRowFromShape(sh, s)
 	if !ok {
@@ -1225,25 +1226,32 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 		incomingTS = coerceString(vals[j])
 	}
 
-	// Local row for this natural key (any id).
 	natCols := tableIdentityKeys[tableName]
+	incomingNat := make([]interface{}, len(natCols))
 	where := make([]string, len(natCols))
-	args := make([]interface{}, len(natCols))
 	for i, col := range natCols {
 		j, has := colIdx[strings.ToLower(col)]
 		if !has {
 			return invalidf("identity insert on %s: missing natural-key column %s", tableName, col)
 		}
+		incomingNat[i] = vals[j]
 		where[i] = col + " = ?"
-		args[i] = vals[j]
 	}
+	// Fail closed if the incoming id is already bound to a DIFFERENT natural key locally.
+	if foreign, fErr := identityIDForeignNaturalKey(tx, tableName, natCols, incomingID, incomingNat); fErr != nil {
+		return fErr
+	} else if foreign {
+		return invalidf("identity table %s: incoming id already bound to a different natural key (corruption)", tableName)
+	}
+
 	var localID, localUpdatedAt sql.NullString
-	selErr := tx.QueryRowContext(ctx, "SELECT id, updated_at FROM "+tableName+" WHERE "+strings.Join(where, " AND "), args...).Scan(&localID, &localUpdatedAt)
+	selErr := tx.QueryRowContext(ctx, "SELECT id, updated_at FROM "+tableName+" WHERE "+strings.Join(where, " AND "), incomingNat...).Scan(&localID, &localUpdatedAt)
 	if selErr != nil && !errors.Is(selErr, sql.ErrNoRows) {
 		return selErr // operational read failure ⇒ back-pressure
 	}
+	localExists := selErr == nil
 	localTS := ""
-	if selErr == nil && localUpdatedAt.Valid {
+	if localExists && localUpdatedAt.Valid {
 		localTS = localUpdatedAt.String
 	}
 
@@ -1251,37 +1259,63 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 	// even a first-seen natural key.
 	if incomingTS != "" && r.client.skewQuarantinesIncoming(r.client.hlcSkewGuardOn(), localTS, incomingTS, time.Now()) {
 		slog.Warn("replicator: quarantined future-skewed identity row (not applied)",
-			"table", tableName, "incoming_updated_at", incomingTS, "first_seen", selErr != nil)
+			"table", tableName, "incoming_updated_at", incomingTS, "first_seen", !localExists)
 		return nil
 	}
 
-	if selErr == nil { // a local row shares this natural key
-		if identityWinner(localTS, localID.String, incomingTS, incomingID) == 1 {
-			return nil // local wins → keep local
+	contentEqual := func() (bool, error) {
+		localCells, found, fErr := fetchRowCellsByID(tx, tableName, cols, localID.String)
+		if fErr != nil {
+			return false, fErr
 		}
-		if localID.String != incomingID {
-			// Incoming wins with a different id → collapse: remove the local row so the
-			// incoming id lands without a natural-key collision.
-			if _, dErr := tx.ExecContext(ctx, "DELETE FROM "+tableName+" WHERE id = ?", localID.String); dErr != nil {
-				return dErr // operational failure ⇒ back-pressure
-			}
+		return found && identityContentEqual(localCells, vals, idIdx), nil
+	}
+	disp, dErr := resolveIdentity(localExists, localTS, localID.String, incomingTS, incomingID, contentEqual)
+	if dErr != nil {
+		return dErr
+	}
+	switch disp {
+	case idKeepLocal:
+		return nil
+	case idContentFault:
+		slog.Warn("replicator: unresolved identity fault (equal timestamp, different content) — keeping local", "table", tableName)
+		r.client.observeMergeRejected(tableName, "wal", "identity_content_conflict")
+		return nil
+	case idApplyNew, idAdoptSameID:
+		// Plain PK-aware upsert so receiver-only columns keep their local value.
+		hasUpdatedAt, uerr := tableHasUpdatedAt(ctx, tx, tableName)
+		if uerr != nil {
+			return uerr // schema metadata unavailable ⇒ fail closed
 		}
-	}
-
-	// Apply the incoming as a PK-aware upsert so receiver-only columns are preserved.
-	hasUpdatedAt, uerr := tableHasUpdatedAt(ctx, tx, tableName)
-	if uerr != nil {
-		return uerr // schema metadata unavailable ⇒ fail closed
-	}
-	rewritten, rerr := insertUpsertRewrite(s, pkCols, hasUpdatedAt)
-	if rerr != nil {
-		return rerr
-	}
-	res, err := tx.ExecContext(ctx, rewritten, s.Params...)
-	if err == nil && rowsChanged(res) {
+		rewritten, rerr := insertUpsertRewrite(s, pkCols, hasUpdatedAt)
+		if rerr != nil {
+			return rerr
+		}
+		res, err := tx.ExecContext(ctx, rewritten, s.Params...)
+		if err == nil && rowsChanged(res) {
+			r.client.clearUnresolvedFromStmt(s)
+		}
+		return err
+	default: // idCollapse
+		// A collapse re-keys the losing id; an existing child referencing it would be orphaned
+		// (we do not rewrite references) → fail closed.
+		if orphan, rErr := identityHasChildReference(tx, tableName, localID.String); rErr != nil {
+			return rErr
+		} else if orphan {
+			return invalidf("identity collapse on %s would orphan a reference to the losing id", tableName)
+		}
+		rejected, cErr := identityCollapseUpdate(tx, tableName, cols, vals, localID.String)
+		if cErr != nil {
+			return cErr
+		}
+		if rejected {
+			// A constraint during the collapse is unexpected (we guarded the foreign-id case) —
+			// fail closed (back-pressure) rather than silently drop, per the WAL contract.
+			return invalidf("identity collapse on %s hit an unexpected constraint", tableName)
+		}
 		r.client.clearUnresolvedFromStmt(s)
+		return nil
 	}
-	return err
 }
 
 // applyMonotoneTimestamp applies a no-clock full-PK UPDATE that only ADVANCES a timestamp

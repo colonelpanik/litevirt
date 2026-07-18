@@ -613,6 +613,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	)
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())

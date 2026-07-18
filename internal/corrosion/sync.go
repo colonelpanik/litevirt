@@ -807,15 +807,15 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	return merged, skipped, nil
 }
 
-// mergeIdentityRow merges one incoming dump row of an identity table by its NATURAL key. It
-// finds the local row with the same natural key (whatever its id), and:
-//   - keeps local when the deterministic identityWinner says so;
-//   - otherwise adopts the incoming row — DELETING the local row first when the ids differ, so
-//     the incoming id can land without colliding on the secondary UNIQUE (a collapse of the two
-//     independently-minted ids to the single winner).
-//
-// It fails closed on a non-null reference column (provably unused today), and honours the skew
-// quarantine. Returns landed=true when the incoming row was applied. All within the caller's tx.
+// mergeIdentityRow merges one incoming dump row of an identity table by its NATURAL key. It finds
+// the local row that shares the natural key (whatever its id) and resolves via resolveIdentity:
+// keep local, plain LWW upsert (same id), a column-preserving collapse (different id, incoming
+// wins), or — on an exact-instant tie with DIFFERENT content — an unresolved identity fault that
+// keeps local and remains divergent. A collapse re-keys the local row INTO the winning id in a
+// single atomic UPDATE (identityCollapseUpdate), so receiver-only columns are preserved and the
+// row is never left absent. It fails closed on a non-null incoming reference OR an existing child
+// referencing the losing id, and on an incoming id already bound to a different natural key. Honours
+// the skew quarantine. Returns landed=true when the row was applied/changed. All within the tx.
 func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}, insertSQL string, idIdx, updatedAtIdx int, natIdx []int, parentIdx int, skewGuardOn bool, skewNow time.Time) (landed bool, err error) {
 	incomingID := coerceString(row[idIdx])
 	incomingTS, _ := row[updatedAtIdx].(string)
@@ -826,49 +826,86 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 		return false, fmt.Errorf("identity table %s: non-null reference under canonical_identity_v1 is unsupported", table.Name)
 	}
 
-	// Local row for this natural key (any id).
 	natCols := tableIdentityKeys[table.Name]
+	incomingNat := make([]interface{}, len(natIdx))
+	for i, j := range natIdx {
+		incomingNat[i] = row[j]
+	}
+	// Fail closed if the incoming id is already bound to a DIFFERENT natural key locally —
+	// applying/collapsing would re-key an unrelated logical row.
+	if foreign, fErr := identityIDForeignNaturalKey(tx, table.Name, natCols, incomingID, incomingNat); fErr != nil {
+		return false, fErr
+	} else if foreign {
+		return false, fmt.Errorf("identity table %s: incoming id already bound to a different natural key (corruption)", table.Name)
+	}
+
+	// Local row for this natural key (any id).
 	where := make([]string, len(natCols))
 	args := make([]interface{}, len(natCols))
 	for i, col := range natCols {
 		where[i] = col + " = ?"
-		args[i] = row[natIdx[i]]
+		args[i] = incomingNat[i]
 	}
 	var localID, localUpdatedAt sql.NullString
 	selErr := tx.QueryRow("SELECT id, updated_at FROM "+table.Name+" WHERE "+strings.Join(where, " AND "), args...).Scan(&localID, &localUpdatedAt)
 	if selErr != nil && !errors.Is(selErr, sql.ErrNoRows) {
 		return false, fmt.Errorf("identity lookup on %s: %w", table.Name, selErr)
 	}
+	localExists := selErr == nil
 	localTS := ""
-	if selErr == nil && localUpdatedAt.Valid {
+	if localExists && localUpdatedAt.Valid {
 		localTS = localUpdatedAt.String
 	}
 
 	// Future-skew quarantine (same as the LWW path): a skewed incoming clock must not poison
 	// even a first-seen natural key.
 	if incomingTS != "" && c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow) {
-		slog.Warn("sync: quarantined future-skewed identity row (not applied)", "table", table.Name, "incoming_updated_at", incomingTS, "first_seen", selErr != nil)
+		slog.Warn("sync: quarantined future-skewed identity row (not applied)", "table", table.Name, "incoming_updated_at", incomingTS, "first_seen", !localExists)
 		return false, nil
 	}
 
-	if selErr == nil { // a local row shares this natural key
-		if identityWinner(localTS, localID.String, incomingTS, incomingID) == 1 {
-			return false, nil // local wins → keep local
+	contentEqual := func() (bool, error) {
+		localCells, found, fErr := fetchRowCellsByID(tx, table.Name, table.Columns, localID.String)
+		if fErr != nil {
+			return false, fErr
 		}
-		if localID.String != incomingID {
-			// Incoming wins with a different id → collapse: remove the local row so the
-			// incoming id lands without a natural-key collision.
-			if _, dErr := tx.Exec("DELETE FROM "+table.Name+" WHERE id = ?", localID.String); dErr != nil {
-				return false, fmt.Errorf("identity collapse delete on %s: %w", table.Name, dErr)
-			}
+		return found && identityContentEqual(localCells, row, idIdx), nil
+	}
+	disp, dErr := resolveIdentity(localExists, localTS, localID.String, incomingTS, incomingID, contentEqual)
+	if dErr != nil {
+		return false, dErr
+	}
+	switch disp {
+	case idKeepLocal:
+		return false, nil
+	case idContentFault:
+		slog.Warn("sync: unresolved identity fault (equal timestamp, different content) — keeping local", "table", table.Name)
+		c.observeMergeRejected(table.Name, "ae", "identity_content_conflict")
+		return false, nil
+	case idApplyNew, idAdoptSameID:
+		rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+		if execErr != nil {
+			return false, execErr
 		}
+		return !rejected, nil
+	default: // idCollapse
+		// A collapse re-keys the losing id; an existing child referencing it would be orphaned
+		// (we do not rewrite references) → fail closed.
+		if orphan, rErr := identityHasChildReference(tx, table.Name, localID.String); rErr != nil {
+			return false, rErr
+		} else if orphan {
+			return false, fmt.Errorf("identity collapse on %s would orphan a reference to the losing id", table.Name)
+		}
+		rejected, cErr := identityCollapseUpdate(tx, table.Name, table.Columns, row, localID.String)
+		if cErr != nil {
+			return false, cErr
+		}
+		if rejected {
+			c.observeMergeRejected(table.Name, "ae", "identity_collapse_rejected")
+			return false, nil
+		}
+		return true, nil
 	}
-
-	rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
-	if execErr != nil {
-		return false, execErr
-	}
-	return !rejected, nil
 }
 
 // applyMergeRow executes one winning row's upsert in an anti-entropy merge, classifying any
@@ -1214,6 +1251,53 @@ func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkI
 		}
 	}
 	return jsonRoundTripCells(raw), true, nil
+}
+
+// fetchRowCellsByID reads the row with the given id into cols (JSON-round-tripped like
+// fetchLocalRowCells, so its value kinds match a post-transit dump row for content comparison).
+// Fails closed: only sql.ErrNoRows is found=false; any other error is returned.
+func fetchRowCellsByID(tx *sql.Tx, tableName string, cols []string, idVal string) ([]interface{}, bool, error) {
+	if len(cols) == 0 {
+		return nil, false, nil
+	}
+	q := "SELECT " + strings.Join(cols, ", ") + " FROM " + tableName + " WHERE id = ?"
+	raw := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range raw {
+		ptrs[i] = &raw[i]
+	}
+	if err := tx.QueryRow(q, idVal).Scan(ptrs...); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("fetch row by id for %s: %w", tableName, err)
+	}
+	for i, v := range raw {
+		if b, ok := v.([]byte); ok {
+			raw[i] = string(b)
+		}
+	}
+	return jsonRoundTripCells(raw), true, nil
+}
+
+// identityContentEqual reports whether two position-aligned rows agree on every column EXCEPT the
+// id at skipIdx. Compared per index with the same string normalization the encoder uses, so it is
+// collision-free (index i is only ever compared to index i). Used ONLY on an exact-instant tie to
+// distinguish an equivalent-except-id pair (safe to collapse) from a genuine different-content
+// safety fault.
+func identityContentEqual(a, b []interface{}, skipIdx int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if i == skipIdx {
+			continue
+		}
+		if coerceString(a[i]) != coerceString(b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // jsonRoundTripCells marshals then unmarshals a scanned row so its numeric/text

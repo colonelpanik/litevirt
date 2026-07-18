@@ -154,12 +154,18 @@ const (
 	// random-UUID primary key but carry a UNIQUE natural key (snapshots (vm_name,name);
 	// container_snapshots (host_name,ct_name,name)). Two nodes can independently mint DIFFERENT
 	// ids for one logical object, whose replicated rows then collide on the secondary UNIQUE and
-	// back-pressure. Once this latches cluster-wide, an upgraded receiver ALWAYS resolves these
-	// tables by natural key (a deterministic winner over the natural-key group, collapsing to one
-	// id and rewriting references) — NOT pairwise-negotiated per sender, because identity
-	// resolution mutates shared state and a per-sender flip would be non-convergent. A node that
-	// hasn't latched keeps the old behavior (back-pressures the collision) and converges once the
-	// whole fleet has latched. Enforcement default-off + reversible until latched.
+	// back-pressure. Once this latches cluster-wide, an upgraded receiver resolves these tables by
+	// natural key (a deterministic winner over the natural-key group, collapsing the losing id
+	// into the winner via a column-preserving re-key) — NOT pairwise-negotiated per sender,
+	// because identity resolution mutates shared state and a per-sender flip would be
+	// non-convergent. A node that hasn't latched keeps the old behavior (back-pressures the
+	// collision) and converges once the whole fleet has latched.
+	//
+	// Like OperationProtocolV1, this token is advertised CONDITIONALLY on the local config flag
+	// (enforcement.canonical_identity; see Server.advertisedCapabilities): mutating shared state
+	// on a partial rollout must require CONFIG uniformity, not just a uniform build, so the
+	// latch (and thus any node collapsing rows) cannot happen until every node has opted in.
+	// Enforcement = the flag AND the latch; default-off + reversible.
 	CanonicalIdentityV1 = "canonical_identity_v1"
 )
 

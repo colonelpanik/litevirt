@@ -7,10 +7,10 @@ import (
 
 // Three-node old/new/new-relay interleaving tests for canonical_identity_v1. Two-node lane tests
 // are insufficient (the plan): a per-node lane flip must stay convergent through relay topologies
-// and arbitrary arrival orders. identityWinner is a proven strict total order (identity_test.go),
-// so reducing a natural-key group is associative/commutative/idempotent — these tests exercise
-// that end-to-end across three independent DBs, including an OLD node that back-pressures until it
-// upgrades.
+// and arbitrary arrival orders. resolveIdentity reduces a natural-key group order-invariantly for
+// equivalent content (identity_test.go), so these tests exercise that end-to-end across three
+// independent DBs, including an OLD node that back-pressures until it upgrades. The rows here carry
+// distinct instants (no content-tie fault), so the group always converges to one id.
 
 // idNode is one node's state in the interleaving harness.
 type idNode struct {

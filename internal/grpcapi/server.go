@@ -103,6 +103,13 @@ type Server struct {
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
+	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
+	// resolution (snapshots/container_snapshots); gated by this flag AND the
+	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like
+	// operation_protocol) so the token can only latch once every node has opted in —
+	// identity resolution mutates shared state, so it requires config uniformity, not
+	// just a uniform build.
+	enfCanonicalIdentity bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -370,6 +377,13 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfOperationProtocol {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
 	}
+	// canonical_identity_v1 is likewise advertised CONDITIONALLY on its config flag: identity
+	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
+	// require CONFIG uniformity, not just a uniform build. Withholding advertisement while the
+	// flag is off keeps the cluster from latching until every node has opted in.
+	if !s.enfCanonicalIdentity {
+		caps = withoutCapability(caps, capabilities.CanonicalIdentityV1)
+	}
 	return caps
 }
 
@@ -448,6 +462,11 @@ func (s *Server) operationProtocolActive(ctx context.Context) bool {
 // SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
 func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
 
+// SetCanonicalIdentityEnforce sets this node's kill-switch for natural-key identity
+// resolution (enforcement.canonical_identity). Enforcement is this flag AND the
+// CanonicalIdentityV1 cluster-wide latch; advertisement is withheld while it is off.
+func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity = on }
+
 // liveResizeActive reports whether this node may originate live-resize behavior
 // (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
 // old peer can't have max_cpu dropped from a spec it later rewrites.
@@ -487,6 +506,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfOperationProtocol
 	case capabilities.LiveResizeV1:
 		return s.enfLiveResize
+	case capabilities.CanonicalIdentityV1:
+		return s.enfCanonicalIdentity
 	default:
 		return false
 	}

@@ -111,21 +111,7 @@ func main() {
 		return
 	}
 
-	var gaps []string
-	for _, f := range findings {
-		switch {
-		case f.unresolvedBatch:
-			gaps = append(gaps, fmt.Sprintf("%s: ExecuteBatch argument could not be statically enumerated; rewrite it as finite static SQL (a literal string per statement) so every replicated shape is in the ledger", loc(f.pos)))
-		case f.dynamic:
-			gaps = append(gaps, fmt.Sprintf("%s: dynamically-built replicated SQL; rewrite it as finite static SQL so every shape is in the ledger", loc(f.pos)))
-		case f.parseErr != "":
-			gaps = append(gaps, fmt.Sprintf("%s: replicated SQL does not parse as a supported shape (%s): %q", loc(f.pos), f.parseErr, f.sql))
-		default:
-			if _, ok := corrosion.LedgerLookup(f.fp); !ok {
-				gaps = append(gaps, fmt.Sprintf("%s: replicated statement not in the compatibility ledger (fp %s): %q", loc(f.pos), f.fp, f.sql))
-			}
-		}
-	}
+	gaps := computeGaps(findings)
 	if len(gaps) == 0 {
 		fmt.Printf("stmtshapecheck: %d replicated builder statement(s) all registered; OK\n", len(findings))
 		return
@@ -141,6 +127,29 @@ func main() {
 }
 
 func loc(p token.Position) string { return fmt.Sprintf("%s:%d", p.Filename, p.Line) }
+
+// computeGaps is the guard's top-level PASS/FAIL decision, factored out so it is unit-testable. A
+// finding fails (becomes a gap) if it is a dynamic/unresolved builder, an unparseable statement, OR a
+// parseable statement whose fingerprint is not in the compatibility ledger. A resolved, registered
+// statement produces no gap. It returns one message per gap; an empty result means the guard passes.
+func computeGaps(findings []finding) []string {
+	var gaps []string
+	for _, f := range findings {
+		switch {
+		case f.unresolvedBatch:
+			gaps = append(gaps, fmt.Sprintf("%s: ExecuteBatch argument could not be statically enumerated; rewrite it as finite static SQL (a literal string per statement) so every replicated shape is in the ledger", loc(f.pos)))
+		case f.dynamic:
+			gaps = append(gaps, fmt.Sprintf("%s: dynamically-built replicated SQL; rewrite it as finite static SQL so every shape is in the ledger", loc(f.pos)))
+		case f.parseErr != "":
+			gaps = append(gaps, fmt.Sprintf("%s: replicated SQL does not parse as a supported shape (%s): %q", loc(f.pos), f.parseErr, f.sql))
+		default:
+			if _, ok := corrosion.LedgerLookup(f.fp); !ok {
+				gaps = append(gaps, fmt.Sprintf("%s: replicated statement not in the compatibility ledger (fp %s): %q", loc(f.pos), f.fp, f.sql))
+			}
+		}
+	}
+	return gaps
+}
 
 // dispIdent / catIdent map a derived disposition/category back to its Go identifier so the
 // generated ledger references the exported constants rather than opaque string values.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"go/token"
 	"strings"
 	"testing"
 
@@ -8,6 +9,39 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// TestComputeGaps_UnregisteredStaticBuilderFails (review 5e): the COMPLETE guard decision must FAIL a
+// static, parseable replicated builder whose fingerprint is absent from the ledger — not merely
+// classify it as resolved. Uses a synthetic INSERT with an extra column no builder emits, so it
+// parses to a fingerprint that is not registered.
+func TestComputeGaps_UnregisteredStaticBuilderFails(t *testing.T) {
+	const sql = `INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at, bogus_extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	fp, err := corrosion.FingerprintSQL(sql)
+	if err != nil {
+		t.Fatalf("synthetic fixture must parse to a fingerprint: %v", err)
+	}
+	if _, ok := corrosion.LedgerLookup(fp); ok {
+		t.Fatal("fixture precondition failed: the synthetic shape must NOT be in the ledger")
+	}
+	// A correctly-classified resolved finding (has fp, no parse/dynamic error) must still gap.
+	f := finding{pos: token.Position{Filename: "synthetic.go", Line: 1}, sql: sql, fp: fp}
+	gaps := computeGaps([]finding{f})
+	if len(gaps) != 1 {
+		t.Fatalf("an unregistered static builder must produce exactly one gap, got %d: %v", len(gaps), gaps)
+	}
+	// A registered statement produces no gap (control).
+	reg := `INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+	regFP, err := corrosion.FingerprintSQL(reg)
+	if err != nil {
+		t.Fatalf("control statement must parse: %v", err)
+	}
+	if _, ok := corrosion.LedgerLookup(regFP); !ok {
+		t.Skip("control statement not registered in this tree; skipping the negative half")
+	}
+	if g := computeGaps([]finding{{pos: token.Position{Filename: "x.go", Line: 1}, sql: reg, fp: regFP}}); len(g) != 0 {
+		t.Fatalf("a registered static builder must produce no gap, got %v", g)
+	}
+}
 
 // TestRenderLedgerEntry_AllFields verifies the generator renders EVERY LedgerEntry field it is
 // given, so regeneration can't silently drop an activation/provenance field once H1/H2 begins

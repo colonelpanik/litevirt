@@ -99,6 +99,25 @@ func TestStmtFingerprint_Distinctness(t *testing.T) {
 			t.Fatalf("pair %d collided: %q vs %q", i, p[0], p[1])
 		}
 	}
+	// review 5d: conflict-shape + placeholder-position distinctness (evaluated with pk=id).
+	confPairs := [][2]string{
+		// changed placeholder position (the ? moves between cells; a literal takes the other)
+		{"INSERT INTO t (a, b) VALUES (?, 0)", "INSERT INTO t (a, b) VALUES (0, ?)"},
+		// DO NOTHING vs DO UPDATE (same conflict target)
+		{"INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
+			"INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET a=excluded.a"},
+		// different conflict TARGET
+		{"INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
+			"INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(a) DO NOTHING"},
+		// different conflict ASSIGNMENT (which column DO UPDATE sets)
+		{"INSERT INTO t (id, a, b) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET a=excluded.a",
+			"INSERT INTO t (id, a, b) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET b=excluded.b"},
+	}
+	for i, p := range confPairs {
+		if fp(p[0], []string{"id"}) == fp(p[1], []string{"id"}) {
+			t.Fatalf("conflict pair %d collided: %q vs %q", i, p[0], p[1])
+		}
+	}
 	// Identifier case is normalized (case-insensitive) ⇒ same fingerprint.
 	if fp("INSERT INTO T (A, B) VALUES (?, ?)", []string{"a"}) != fp("insert into t (a, b) values (?, ?)", []string{"a"}) {
 		t.Fatal("identifier case should normalize to the same fingerprint")

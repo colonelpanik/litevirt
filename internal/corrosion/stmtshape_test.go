@@ -181,6 +181,12 @@ func TestParse_Invalid(t *testing.T) {
 		"empty column list":       "INSERT INTO t () VALUES ()",
 		"bad OR algo":             "INSERT OR ABORT INTO t (a) VALUES (?)",
 		"BETWEEN in WHERE":        "DELETE FROM t WHERE a BETWEEN ? AND ?",
+		// review 5c: ON CONFLICT tail must be exactly one complete clause.
+		"truncated ON CONFLICT":    "INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT",
+		"second conflict clause":   "INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO NOTHING ON CONFLICT(a) DO NOTHING",
+		"incomplete DO UPDATE":     "INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO UPDATE",
+		"incomplete DO UPDATE SET": "INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET",
+		"trailing after conflict":  "INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO NOTHING garbage",
 	}
 	for name, sql := range cases {
 		t.Run(name, func(t *testing.T) { mustInvalid(t, sql, []string{"a"}) })

@@ -74,3 +74,6 @@ tmp/
 # Claude Code local config / agents / skills / settings — never published
 .claude/
 CLAUDE.local.md
+
+# Local planning artifacts (superpowers specs/plans) — not part of the repo
+docs/superpowers/

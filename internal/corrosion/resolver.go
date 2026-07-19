@@ -439,6 +439,19 @@ const (
 // the transaction commits — otherwise a later statement's rollback would leave a ghost marker (or a
 // counted tie for a change that never landed). effect is nil only on the unreachable terminal path.
 func (c *Client) resolveTie(table string, cols []string, local, incoming []interface{}, pkIdx []int, path resolveTiePath) (keepLocal, unresolved bool, effect func()) {
+	// Order-invariant equality short-circuit: if the two row images are byte-equal under the
+	// column-name-paired, type-normalized encoding (identical values regardless of physical column
+	// order or an int64-vs-float64 read path), this is not a conflict — keep local (== incoming),
+	// resolved, nothing to track. It never changes winner-selection: when the rows are equal,
+	// keeping local is byte-identical to taking incoming, so every node converges regardless of
+	// version. Falls through to the chain on any difference OR on an encode error, so a genuine tie
+	// — including a tombstone race, where deleted_at differs so the full-row compare is unequal —
+	// is still resolved by ruleTombstone / flagged by ruleUnresolved as before.
+	if a, ea := encodeRowCellsV2(cols, local); ea == nil {
+		if b, eb := encodeRowCellsV2(cols, incoming); eb == nil && a == b {
+			return true, false, nil
+		}
+	}
 	pk := pkKeyAt(incoming, pkIdx)
 	tr, ok := capabilityMap[table]
 	if !ok {

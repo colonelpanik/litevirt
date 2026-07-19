@@ -1491,6 +1491,12 @@ func monotoneIncomingValue(sh StmtShape, s Statement, col string) (string, error
 // on a peer). The whole expansion runs in the caller's transaction under the write lock, so
 // the enumerate→apply window has no concurrent local writer; any operational error propagates
 // so the caller rolls back and back-pressures.
+// testHookBulkMidExpansion, when non-nil, runs inside applyBulkPerRowLWW between enumerating
+// the matched rows and applying them — while the caller's write transaction and the Client
+// write mutex are both held. Production leaves it nil (one nil check); tests use it to verify
+// the enumerate→apply span is atomic against a concurrent local writer.
+var testHookBulkMidExpansion func()
+
 func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string) error {
 	if len(pkCols) == 0 {
 		return invalidf("bulk update on %s has no known primary key", tableName)
@@ -1560,6 +1566,13 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 		return rowsErr
 	}
 	rows.Close()
+
+	// Test seam: exercise the enumerate→apply window. Nil in production; a test sets it to
+	// prove a concurrent local write cannot interleave here (it blocks on the Client write
+	// mutex the caller holds until this expansion commits).
+	if testHookBulkMidExpansion != nil {
+		testHookBulkMidExpansion()
+	}
 
 	// 2. Per-row: apply the SET only where the incoming clock wins (skew-guarded), scoped to
 	//    the exact PK.

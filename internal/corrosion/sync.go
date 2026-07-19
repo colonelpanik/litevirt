@@ -958,7 +958,7 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 			return false, cErr
 		}
 		if rejected {
-			c.observeMergeRejected(table.Name, "ae", "identity_collapse_rejected")
+			c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "identity_collapse_rejected")
 			return false, nil // do NOT clear the fault on a rejected collapse
 		}
 		// Re-read the ACTUAL surviving row's (host, path) AFTER the column-preserving re-key: when
@@ -988,7 +988,7 @@ func (c *Client) applyMergeRow(tx *sql.Tx, insertSQL string, row []interface{}, 
 	if _, execErr := tx.Exec(insertSQL, row...); execErr != nil {
 		if class, kind := classifySQLiteError(execErr); class == classConstraint {
 			slog.Warn("sync: merge row rejected by constraint (keeping local)", "table", table, "error", execErr)
-			c.observeMergeRejected(table, "ae", string(kind)) // unique / not_null / check / foreign_key / constraint
+			c.observeMergeRejected(boundedTableLabel(table), "ae", string(kind)) // unique / not_null / check / foreign_key / constraint
 			return true, nil
 		}
 		return false, fmt.Errorf("merge row into %s: %w", table, execErr)

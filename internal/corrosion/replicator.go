@@ -1880,10 +1880,29 @@ func (r *Replicator) applyBulkUpdate(ctx context.Context, tx *sql.Tx, s Statemen
 	return invalidf("bulk update on %s has unsupported concurrency category %q", tableName, cat)
 }
 
-// pkValuesFromShape returns the primary-key values a full-PK statement binds, from the shape's
-// resolved PK parameter indices. ok=false when the shape has no full-PK identity.
+// pkValuesFromShape returns the primary-key values a full-PK statement binds. For an INSERT the PK
+// values come from InsertVals (a bound param OR a canonical literal — so a literal singleton key like
+// leader_election's 'failover' resolves); for an UPDATE/DELETE they come from the WHERE `pk = ?`
+// parameter indices. ok=false when the shape has no full-PK identity.
 func pkValuesFromShape(sh StmtShape, s Statement) ([]interface{}, bool) {
-	if !sh.HasFullPKIdentity || len(sh.PKParamIdx) == 0 {
+	if !sh.HasFullPKIdentity {
+		return nil, false
+	}
+	if sh.Kind == KindInsert {
+		_, row, okRow := insertRowFromShape(sh, s)
+		if !okRow || len(sh.PKInsertPos) == 0 {
+			return nil, false
+		}
+		vals := make([]interface{}, len(sh.PKInsertPos))
+		for i, pos := range sh.PKInsertPos {
+			if pos < 0 || pos >= len(row) {
+				return nil, false
+			}
+			vals[i] = row[pos]
+		}
+		return vals, true
+	}
+	if len(sh.PKParamIdx) == 0 {
 		return nil, false
 	}
 	vals := make([]interface{}, len(sh.PKParamIdx))

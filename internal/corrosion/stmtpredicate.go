@@ -186,15 +186,26 @@ func resolveInsertIdentity(sh *StmtShape, pkCols []string) {
 		return
 	}
 	pkParam := make([]int, len(pkCols))
+	pkPos := make([]int, len(pkCols))
 	for i, pk := range pkCols {
 		j, ok := idx[strings.ToLower(pk)]
-		if !ok || !sh.InsertVals[j].isParam() {
-			return // missing PK column, or PK bound to a literal ⇒ not a bound-param identity
+		if !ok {
+			return // missing PK column ⇒ not a full-PK identity
 		}
-		pkParam[i] = sh.InsertVals[j].ParamIndex
+		// A PK column bound to a bound param OR a canonical LITERAL is a full-PK identity: the value
+		// is exactly known either way (a literal singleton key like leader_election's 'failover'
+		// must be LWW-gatable, not back-pressured). pkParam[i] is -1 for a literal; the apply path
+		// resolves the value from InsertVals[pkPos[i]] via insertRowFromShape.
+		pkPos[i] = j
+		if sh.InsertVals[j].isParam() {
+			pkParam[i] = sh.InsertVals[j].ParamIndex
+		} else {
+			pkParam[i] = -1
+		}
 	}
 	sh.HasFullPKIdentity = true
 	sh.PKParamIdx = pkParam
+	sh.PKInsertPos = pkPos
 }
 
 // resolveUpdateIdentity fills HasFullPKIdentity / PKParamIdx (from top-level `pk = ?`

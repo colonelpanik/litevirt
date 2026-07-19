@@ -193,11 +193,15 @@ type StmtShape struct {
 
 	// Row-identity (LWW) mapping, resolved against the table's declared PK columns.
 	// HasFullPKIdentity: for INSERT, every PK column is present in InsertCols and bound
-	// to a parameter; for UPDATE, every PK column appears as a top-level `pk = ?` conjunct
-	// in WHERE. PKParamIdx/UpdatedAtParamIdx are the corresponding s.Params indices, or
-	// nil/-1 when not resolvable as direct bound parameters.
+	// to a parameter OR a canonical LITERAL (its value is exactly known — e.g. a singleton-key
+	// table like leader_election with key='failover'); for UPDATE, every PK column appears as a
+	// top-level `pk = ?` conjunct in WHERE. PKParamIdx/UpdatedAtParamIdx are the corresponding
+	// s.Params indices (or -1 for a literal-PK column / when not a bound parameter). For an INSERT,
+	// PKInsertPos holds each PK column's position in InsertCols, so the apply path resolves the PK
+	// value from InsertVals (param OR literal) via insertRowFromShape.
 	HasFullPKIdentity bool
 	PKParamIdx        []int
+	PKInsertPos       []int
 	UpdatedAtParamIdx int
 }
 

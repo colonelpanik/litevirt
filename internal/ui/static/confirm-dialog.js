@@ -46,7 +46,7 @@
 
   // htmx fires htmx:confirm for every request; detail.question is set only when
   // the element carries hx-confirm. Take over just those.
-  document.body.addEventListener("htmx:confirm", function (evt) {
+  document.addEventListener("htmx:confirm", function (evt) {
     var q = evt.detail.question;
     if (!q) return; // no hx-confirm — let htmx proceed normally
     evt.preventDefault();

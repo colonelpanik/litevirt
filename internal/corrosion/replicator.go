@@ -596,9 +596,21 @@ func entryTouchesCustomMerge(stmtsJSON string) bool {
 		return true
 	}
 	for _, s := range stmts {
+		// A LEGACY-transformer statement (v1.3.0 CRL / spent-proof GC) intentionally fails the strict
+		// parser, so it must be classified by the transformer's DECLARED table — re-parsing it would
+		// error and wrongly treat it as proof-bearing. The CRL transformer targets crl_versions
+		// (non-custom → KEEP; crl_versions is AE-excluded, so dropping it would lose the update with
+		// no repair); the spent-proof-GC transformer targets runtime_action_proofs (custom → drop).
+		if lt, ok := legacyTransformerFor(s.SQL); ok {
+			if customMergeTables[lt.table] != nil {
+				return true
+			}
+			continue
+		}
 		// Structural parse: a comment-injected fake table name cannot HIDE a real custom-merge
-		// (proof) statement from the drop filter. A statement that doesn't parse is treated as
-		// proof-bearing (conservative — drop rather than risk a partial to an unready peer).
+		// (proof) statement from the drop filter. A NON-legacy statement that doesn't parse is
+		// treated as proof-bearing (conservative — drop rather than risk a partial to an unready
+		// peer).
 		sh, err := parseStmtShape(s.SQL, nil)
 		if err != nil || customMergeTables[sh.Table] != nil {
 			return true

@@ -1799,6 +1799,21 @@ func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName st
 		return false, invalidf("cannot resolve primary key for LWW on %s", tableName)
 	}
 
+	// A table with no updated_at column has no LWW clock to compare against — apply the incoming
+	// write. Reaching this with such a table means a DispPlainInsert / DispExplicitUpsert on a
+	// no-clock table (e.g. sessions, whose id is a unique token and whose timestamped column is
+	// last_used_at, handled by the monotone path). Without this guard the SELECT below would be
+	// `SELECT updated_at FROM sessions ...` → "no such column: updated_at", back-pressuring the
+	// whole ordered WAL stream head-of-line. The INSERT upsert rewrite in applyLWWGated builds its
+	// conflict clause with hasUpdatedAt=false, so the apply preserves receiver-only columns.
+	hasUpdatedAt, uaErr := tableHasUpdatedAt(ctx, tx, tableName)
+	if uaErr != nil {
+		return false, uaErr // schema metadata unavailable ⇒ fail closed
+	}
+	if !hasUpdatedAt {
+		return false, nil
+	}
+
 	// Build a SELECT for the local row's updated_at.
 	where := ""
 	args := make([]interface{}, len(pkCols))

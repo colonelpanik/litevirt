@@ -236,6 +236,36 @@ func parseStmtShape(sql string, pkCols []string) (StmtShape, error) {
 	return sh, nil
 }
 
+// parseResolved is the correctness entry point: it derives BOTH the table and the PK metadata from
+// the STRUCTURAL parse, never from a comment-sensitive string scan. It parses in two stages —
+// (1) parse with no PK columns to obtain the validated, lexer-comment-stripped shape.Table, then
+// (2) load tablePrimaryKeys[shape.Table] and re-parse so PKParamIdx / HasFullPKIdentity resolve
+// against the RIGHT table. A comment-injected fake "INTO other_table" cannot change shape.Table, so
+// LWW gating, custom-merge classification, ledger derivation, and metric attribution all key off the
+// real target. Returns the finalized shape and its PK columns.
+func parseResolved(sql string) (StmtShape, []string, error) {
+	pre, err := parseStmtShape(sql, nil)
+	if err != nil {
+		return StmtShape{}, nil, err
+	}
+	pkCols := tablePrimaryKeys[pre.Table]
+	sh, err := parseStmtShape(sql, pkCols)
+	if err != nil {
+		return StmtShape{}, nil, err
+	}
+	return sh, pkCols, nil
+}
+
+// structuralTableLabel returns a bounded metric label for the table a statement targets, from the
+// STRUCTURAL parse (not the comment-sensitive string scan); "unknown" if it doesn't parse.
+func structuralTableLabel(sql string) string {
+	sh, err := parseStmtShape(sql, nil)
+	if err != nil {
+		return "unknown"
+	}
+	return boundedTableLabel(sh.Table)
+}
+
 // ---- parser ----
 
 type sqlParser struct {

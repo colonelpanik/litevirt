@@ -150,19 +150,15 @@ func (c *Client) clearUnresolvedFromShape(sh StmtShape, s Statement) {
 }
 
 // clearUnresolvedFromLocalStmt is the local-write counterpart: a locally-executed statement does not
-// arrive with a parsed shape, so this is the table-first structural parse entrypoint — extract and
-// validate the table, obtain tablePrimaryKeys[table], parse the shape (which finalizes the PK
-// parameter mapping), then clear via clearUnresolvedFromShape. A statement that doesn't parse to a
-// full-PK shape is simply not cleared (the tracker self-heals on the next converging write).
+// arrive with a parsed shape, so this does the two-stage structural parse (parseResolved) to get the
+// table + PK metadata from the VALIDATED parse — never a comment-sensitive string scan — then clears
+// via clearUnresolvedFromShape. A statement that doesn't parse to a full-PK shape is simply not
+// cleared (the tracker self-heals on the next converging write).
 func (c *Client) clearUnresolvedFromLocalStmt(s Statement) {
 	if !c.anyUnresolved() {
 		return
 	}
-	table := extractTableName(s.SQL)
-	if table == "" || len(tablePrimaryKeys[table]) == 0 {
-		return
-	}
-	sh, err := parseStmtShape(s.SQL, tablePrimaryKeys[table])
+	sh, _, err := parseResolved(s.SQL)
 	if err != nil {
 		return
 	}

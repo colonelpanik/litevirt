@@ -596,7 +596,11 @@ func entryTouchesCustomMerge(stmtsJSON string) bool {
 		return true
 	}
 	for _, s := range stmts {
-		if customMergeTables[extractTableName(s.SQL)] != nil {
+		// Structural parse: a comment-injected fake table name cannot HIDE a real custom-merge
+		// (proof) statement from the drop filter. A statement that doesn't parse is treated as
+		// proof-bearing (conservative — drop rather than risk a partial to an unready peer).
+		sh, err := parseStmtShape(s.SQL, nil)
+		if err != nil || customMergeTables[sh.Table] != nil {
 			return true
 		}
 	}
@@ -937,7 +941,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 		for _, s := range stmts {
 			if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 				_ = tx.Rollback()
-				r.client.observeMergeRejected(boundedTableLabel(extractTableName(s.SQL)), "wal", walRejectReason(err))
+				r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", walRejectReason(err))
 				if isSchemaMissingError(err) {
 					slog.Error("replicator: schema-missing on receiver — back-pressuring replication",
 						"sql", s.SQL, "error", err,
@@ -1057,13 +1061,15 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		return r.applyLegacy(ctx, tx, lt, s, incomingHLC)
 	}
 
-	tableName := extractTableName(s.SQL)
-	pkCols := tablePrimaryKeys[tableName]
-
-	sh, err := parseStmtShape(s.SQL, pkCols)
+	// Two-stage structural parse: table + PK metadata come from the VALIDATED parse (parseResolved),
+	// NEVER a comment-sensitive string scan. A comment-injected fake "INTO other_table" cannot change
+	// sh.Table, so the fingerprint, the LWW read, and the executed SQL all target the SAME table — a
+	// registered fingerprint can no longer be paired with a different table's PK metadata.
+	sh, pkCols, err := parseResolved(s.SQL)
 	if err != nil {
 		return err
 	}
+	tableName := sh.Table
 	if err := sh.ValidateParamArity(len(s.Params)); err != nil {
 		return err
 	}
@@ -1577,8 +1583,8 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 }
 
 // boundedTableLabel clamps a metric table label to a known replicated table or "unknown", so a
-// malformed peer statement (extractTableName accepts an arbitrary second token) can't grow the
-// Prometheus label cardinality.
+// malformed peer statement can't grow the Prometheus label cardinality. Callers pass a structurally
+// parsed table (structuralTableLabel), never a string-scanned name.
 func boundedTableLabel(table string) string {
 	if _, ok := tablePrimaryKeys[table]; ok {
 		return table

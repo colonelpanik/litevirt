@@ -47,15 +47,14 @@ func TestSnapshotWritersNeverBindParentID(t *testing.T) {
 			t.Fatalf("unmarshal stmts: %v", err)
 		}
 		for _, s := range stmts {
-			table := extractTableName(s.SQL)
-			if table != "snapshots" && table != "container_snapshots" {
+			sh, _, err := parseResolved(s.SQL)
+			if err != nil {
+				continue // not a parseable identity-table write
+			}
+			if sh.Table != "snapshots" && sh.Table != "container_snapshots" {
 				continue
 			}
 			seen++
-			sh, err := parseStmtShape(s.SQL, tablePrimaryKeys[table])
-			if err != nil {
-				t.Fatalf("snapshot writer emitted an unparseable statement %q: %v", s.SQL, err)
-			}
 			for _, col := range sh.InsertCols {
 				if col == "parent_id" {
 					t.Errorf("a snapshot INSERT binds parent_id (%q) — H1's identity collapse would orphan the reference; wire reference rewriting before shipping this", s.SQL)

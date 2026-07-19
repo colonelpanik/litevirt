@@ -140,9 +140,9 @@ func explicitPolicy(fp string) (LedgerEntry, bool) {
 // The CI guard's -emit-ledger mode calls it to generate stmtledger_generated.go. An explicit,
 // audited per-fingerprint policy (explicitPolicyDefs) overrides derivation.
 func LedgerEntryFor(sql string) (LedgerEntry, error) {
-	table := extractTableName(sql)
-	pkCols := tablePrimaryKeys[table]
-	sh, err := parseStmtShape(sql, pkCols)
+	// Table + PK metadata from the structural parse (parseResolved), never the comment-sensitive
+	// string scan — so a builder's fingerprint is always paired with its OWN table's PKs.
+	sh, _, err := parseResolved(sql)
 	if err != nil {
 		return LedgerEntry{}, err
 	}

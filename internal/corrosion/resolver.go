@@ -433,12 +433,17 @@ const (
 // trackUnresolved), and emits lww_tie_unresolved exactly once per distinct
 // (table,PK,content-pair). A converging decision (unresolved=false) lets the
 // caller clear any stale tracked entry for the PK.
-func (c *Client) resolveTie(table string, cols []string, local, incoming []interface{}, pkIdx []int, path resolveTiePath) (keepLocal, unresolved bool) {
+// resolveTie decides a tie WITHOUT mutating any shared state: it RETURNS the resolution and an
+// `effect` closure carrying the tracker/metric consequence (mark the tie unresolved, or count a
+// tie-break / tombstone). The caller MUST schedule effect via deferAfterCommit so it runs only after
+// the transaction commits — otherwise a later statement's rollback would leave a ghost marker (or a
+// counted tie for a change that never landed). effect is nil only on the unreachable terminal path.
+func (c *Client) resolveTie(table string, cols []string, local, incoming []interface{}, pkIdx []int, path resolveTiePath) (keepLocal, unresolved bool, effect func()) {
+	pk := pkKeyAt(incoming, pkIdx)
 	tr, ok := capabilityMap[table]
 	if !ok {
 		// Unreachable if the coverage test passes; fail safe (keep local + alert).
-		c.trackUnresolved(table, pkKeyAt(incoming, pkIdx), local, incoming, path, "uncategorized")
-		return true, true
+		return true, true, func() { c.trackUnresolved(table, pk, local, incoming, path, "uncategorized") }
 	}
 	rv := newRowView(cols, local, incoming)
 	for _, rule := range tr.chain {
@@ -447,19 +452,18 @@ func (c *Client) resolveTie(table string, cols []string, local, incoming []inter
 			continue
 		}
 		if d.unresolved {
-			c.trackUnresolved(table, pkKeyAt(incoming, pkIdx), local, incoming, path, d.category)
-			return true, true
+			category := d.category
+			return true, true, func() { c.trackUnresolved(table, pk, local, incoming, path, category) }
 		}
 		if d.resolver == "tombstone" {
-			c.observeTombstoneTie(table)
-		} else {
-			c.observeTieBreak(table, d.resolver, winnerLabel(d.keepLocal))
+			return d.keepLocal, false, func() { c.observeTombstoneTie(table) }
 		}
-		return d.keepLocal, false
+		resolver, keepLocal := d.resolver, d.keepLocal
+		return keepLocal, false, func() { c.observeTieBreak(table, resolver, winnerLabel(keepLocal)) }
 	}
 	// A well-formed chain always ends in a terminal rule, so this is unreachable;
-	// keep local defensively.
-	return true, true
+	// keep local defensively (no effect).
+	return true, true, nil
 }
 
 func winnerLabel(keepLocal bool) string {

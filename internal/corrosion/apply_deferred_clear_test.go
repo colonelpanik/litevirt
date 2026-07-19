@@ -96,3 +96,72 @@ func TestBulkUpdate_ClearsOnlyChangedRows(t *testing.T) {
 		t.Fatalf("exactly one marker (the skipped row) should remain, got %d", c.UnresolvedTieCount())
 	}
 }
+
+// TestWAL_UnresolvedCreationRolledBackByLaterFailure (review 2): a tie CREATED during a WAL batch
+// tracks its unresolved marker only on commit. If a later statement back-pressures, the batch rolls
+// back and NO ghost marker is created.
+func TestWAL_UnresolvedCreationRolledBackByLaterFailure(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	const ts = "2026-06-03T18:40:00Z"
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm1", HostName: "host-a", State: "running", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	forceUpdatedAt(t, c, "vms", "name", "vm1", ts)
+
+	// stmt1 is an exact-tie runtime-owned write (would track unresolved, DEFERRED); stmt2 is an
+	// unregistered shape → back-pressure → the whole batch rolls back, dropping the deferred track.
+	tie := `{"SQL":"INSERT OR REPLACE INTO vms (name, host_name, state, spec, updated_at) VALUES (?, ?, ?, ?, ?)","Params":["vm1","host-b","running","{}","2026-06-03T18:40:00Z"]}`
+	bad := `{"SQL":"INSERT INTO vms (name, bogus_col) VALUES (?, ?)","Params":["x","y"]}`
+	if _, err := r.ApplyRemoteMutations(ctx, []*pb.MutationEntry{{Seq: 1, Hlc: ts, Origin: "peer", Stmts: "[" + tie + "," + bad + "]"}}); err == nil {
+		t.Fatal("the unregistered statement must back-pressure the batch")
+	}
+	if c.UnresolvedTieCount() != 0 {
+		t.Fatalf("a rolled-back batch must NOT create a ghost unresolved marker, got %d", c.UnresolvedTieCount())
+	}
+}
+
+// TestAE_ChunkRollbackRetainsMarker (review 2): an AE merge that applies a strictly-newer row would
+// clear that PK's unresolved marker — but only on commit. A chunk that rolls back must RETAIN the
+// marker (it must not clear it for a change that never landed). The committed control clears it.
+func TestAE_ChunkRollbackRetainsMarker(t *testing.T) {
+	ctx := context.Background()
+	c := mustTestClient(t)
+	const oldTs, newTs = "1000000000000-0000-n1", "3000000000000-0000-n2"
+	if err := c.Execute(ctx,
+		`INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"img1", "old", "", "", 1, "2020-01-01T00:00:00Z", oldTs); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	c.trackUnresolved("images", pkKey([]interface{}{"img1"}), []interface{}{"a"}, []interface{}{"b"}, pathAE, "test")
+
+	newerImg1 := func() *syncPayload {
+		return &syncPayload{Tables: []syncTable{{
+			Name:    "images",
+			Columns: []string{"name", "format", "source_url", "checksum", "size_bytes", "created_at", "updated_at"},
+			Rows:    [][]interface{}{{"img1", "new", "", "", int64(1), "2020-01-01T00:00:00Z", newTs}},
+		}}}
+	}
+
+	// Forced rollback: the strictly-newer img1 applies + schedules the deferred clear, then the chunk
+	// rolls back (the merge returns the forced-rollback error, as expected) → the clear is dropped →
+	// marker retained.
+	mergeChunkFailHook = func() bool { return true }
+	if err := c.mergeStatePayloadLWW(newerImg1()); err == nil {
+		t.Fatal("the forced-rollback hook must make the merge return an error")
+	}
+	mergeChunkFailHook = nil
+	if c.UnresolvedTieCount() != 1 {
+		t.Fatalf("a rolled-back AE chunk must RETAIN the marker, got %d", c.UnresolvedTieCount())
+	}
+
+	// Committed control: the same merge now commits and clears the marker (proving the deferred
+	// clear runs on success, so the assertion above isn't passing merely because clearing broke).
+	if err := c.mergeStatePayloadLWW(newerImg1()); err != nil {
+		t.Fatalf("merge (commit): %v", err)
+	}
+	if c.UnresolvedTieCount() != 0 {
+		t.Fatalf("a committed AE merge must clear the marker, got %d", c.UnresolvedTieCount())
+	}
+}

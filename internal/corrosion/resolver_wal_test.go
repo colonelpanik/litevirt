@@ -80,6 +80,12 @@ func TestWAL_TieRuntimeOwnedKeepsLocal(t *testing.T) {
 	if !mustSkipLWW(t, r, ctx, tx, "vms", []string{"name"}, s, ts) {
 		t.Fatal("a runtime-owned host_name tie must keep local (skip the incoming)")
 	}
+	// The tracker/metric effect is DEFERRED to commit (a later statement's rollback must not leave a
+	// ghost marker). Commit + run the deferred effects, then assert.
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	c.runDeferredEffects(tx)
 	if c.UnresolvedTieCount() != 1 {
 		t.Fatalf("WAL tie must track unresolved, count=%d", c.UnresolvedTieCount())
 	}
@@ -131,7 +137,7 @@ func TestWAL_ZeroRowUpdateKeepsUnresolved(t *testing.T) {
 	}
 	forceUpdatedAt(t, c, "vms", "name", "vm1", oldTs)
 	cols := []string{"name", "host_name", "updated_at"}
-	c.resolveTie("vms", cols, []interface{}{"vm1", "host-a", oldTs}, []interface{}{"vm1", "host-b", oldTs}, []int{0}, pathAE)
+	resolveTieApply(c, "vms", cols, []interface{}{"vm1", "host-a", oldTs}, []interface{}{"vm1", "host-b", oldTs}, []int{0}, pathAE)
 	if c.UnresolvedTieCount() != 1 {
 		t.Fatalf("expected one tracked tie, got %d", c.UnresolvedTieCount())
 	}

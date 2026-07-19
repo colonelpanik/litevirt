@@ -1855,7 +1855,12 @@ func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName st
 			if !found {
 				return false, nil // no local row → apply incoming
 			}
-			keepLocal, _ := r.client.resolveTie(tableName, cols, localRow, vals, pkIdx, pathWAL)
+			keepLocal, _, effect := r.client.resolveTie(tableName, cols, localRow, vals, pkIdx, pathWAL)
+			if effect != nil {
+				// Schedule the tracker/metric consequence for AFTER commit: a later statement's
+				// rollback must not leave a ghost unresolved marker.
+				r.client.deferAfterCommit(tx, effect)
+			}
 			return keepLocal, nil
 		}
 	}

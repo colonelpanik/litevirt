@@ -478,6 +478,10 @@ var mergeApplyChunkRows = 1000
 // released). Nil in production.
 var mergeChunkHook func()
 
+// mergeChunkFailHook is a test-only seam: when set and it returns true, mergeChunk rolls the chunk
+// back after applying its rows but before commit. Nil in production.
+var mergeChunkFailHook func() bool
+
 // buildMergeUpsertSQL builds a PK-aware upsert that preserves receiver-only columns. It
 // inserts the supplied columns and, ON CONFLICT on the primary key, updates only the
 // supplied NON-PK columns (never the conflict key), so a column the sender omitted keeps
@@ -774,11 +778,16 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 							return merged, skipped, fErr
 						}
 						if found {
-							keepLocal, unresolved := c.resolveTie(table.Name, table.Columns, localRow, row, pkIdx, pathAE)
+							keepLocal, unresolved, effect := c.resolveTie(table.Name, table.Columns, localRow, row, pkIdx, pathAE)
+							// Schedule the tracker/metric consequence for AFTER the chunk commits
+							// (a later row's failure rolls the chunk back). A resolved tie also drops
+							// any stale marker — deferred for the same reason.
+							if effect != nil {
+								c.deferAfterCommit(tx, effect)
+							}
 							if !unresolved {
-								// Converged (either direction) → drop any stale
-								// unresolved/reconciled state for this PK.
-								c.clearUnresolved(table.Name, pkKeyAt(row, pkIdx))
+								pk := pkKeyAt(row, pkIdx)
+								c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
 							}
 							if keepLocal {
 								skipped++
@@ -804,12 +813,22 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// Applying a strictly-newer or resolver-chosen incoming row replaces
 		// the local value, so any unresolved tie tracked for this PK is now
 		// stale (this IS the repair path — e.g. repair-owner re-stamping with
-		// a fresh timestamp propagates here). Lock-free when nothing tracked.
+		// a fresh timestamp propagates here). Deferred to commit so a later row's
+		// failure can't clear a marker for a change that rolled back. Lock-free
+		// when nothing tracked.
 		if c.anyUnresolved() {
-			c.clearUnresolved(table.Name, pkKeyAt(row, pkIdx))
+			pk := pkKeyAt(row, pkIdx)
+			c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
 		}
 	}
 
+	// Test seam: force a chunk rollback AFTER the rows applied but BEFORE commit, so tests can prove a
+	// rolled-back chunk drops its deferred tracker/clear effects (the marker is not mutated for a
+	// change that never committed). Nil in production.
+	if mergeChunkFailHook != nil && mergeChunkFailHook() {
+		_ = tx.Rollback()
+		return 0, len(rows), fmt.Errorf("mergeChunkFailHook: forced rollback")
+	}
 	if err := tx.Commit(); err != nil {
 		slog.Error("sync: commit", "table", table.Name, "error", err)
 		return 0, skipped, fmt.Errorf("commit merge chunk for %s: %w", table.Name, err)

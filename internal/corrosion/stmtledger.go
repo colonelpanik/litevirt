@@ -42,10 +42,12 @@ const (
 type ConcurrencyCategory string
 
 const (
-	CatNone        ConcurrencyCategory = ""
-	CatMonotonic   ConcurrencyCategory = "monotonic"   // verbatim apply provably safe
-	CatPerRowLWW   ConcurrencyCategory = "per_row_lww" // receiver-side per-row LWW expansion
-	CatUnsupported ConcurrencyCategory = "unsupported" // back-pressure; builder must be row-scoped
+	CatNone      ConcurrencyCategory = ""            // non-bulk entry
+	CatPerRowLWW ConcurrencyCategory = "per_row_lww" // receiver-side per-row LWW expansion (the ONLY valid bulk category)
+	// CatUnsupported is never emitted into a ledger — deriveDisposition returns an error for an
+	// unsafe bulk update, so generation fails. It is retained only so the runtime dispatch can
+	// reject it (and any unknown category) as defense against corrupt or historical ledger data.
+	CatUnsupported ConcurrencyCategory = "unsupported"
 )
 
 // LedgerEntry is one accepted fingerprint plus its activation/version conditions.

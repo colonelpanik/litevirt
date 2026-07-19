@@ -429,12 +429,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
 	})
 	// Part H2 (preparatory infrastructure): accept a replicated canonical registry upsert once
-	// canonical_registry_v1 is DURABLY LATCHED. Wired to the latch, NOT the config flag — once latched,
-	// acceptance of an already-emitted canonical wire shape must never be revoked (a flag-off must not
-	// stall replication on an in-flight canonical entry). The flag only gates ADVERTISEMENT (opt-in to
-	// drive the latch). No writer switch, no consolidation controller — that is a deferred operator op.
+	// canonical_registry_v1 is DURABLY LATCHED (in memory AND persisted to its marker). Gating on the
+	// DURABLE latch — not Latched or the config flag — is what makes acceptance survive a restart: a
+	// node that latched only in memory would, after a reboot that reloads no marker, revert to
+	// rejecting an already-in-flight canonical entry and stall replication. The flag only gates
+	// ADVERTISEMENT (opt-in to drive the latch); no writer switch, no consolidation controller.
 	d.db.SetCanonicalRegistryAccept(func() bool {
-		return d.checker.Latched(capabilities.CanonicalRegistryV1)
+		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
 	})
 	repl.Start(ctx)
 

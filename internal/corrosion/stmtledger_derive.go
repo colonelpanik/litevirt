@@ -48,15 +48,17 @@ func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 			// no-clock shape has none, which fails the guard until one is added.
 			return "", CatNone, invalidf("no-clock full-PK update on %s requires an explicit ledger policy", sh.Table)
 		}
-		// A bulk UPDATE (no full-PK identity) is applied by per-row LWW expansion — but only
-		// when that is provably safe: it must advance a clock (SET updated_at = ?) so each
-		// matched row can be LWW-gated, and it must NOT modify a primary-key column (rekeying
-		// a PK can't be gated by that PK; those cascades are row-scoped at the source). Any
-		// other bulk shape is unsupported and back-pressures.
+		// A bulk UPDATE (no full-PK identity) is applied by per-row LWW expansion, which is safe
+		// ONLY when the statement binds updated_at (SET updated_at = ?) so each matched row can be
+		// LWW-gated. A PK rekey is fine — the expansion re-keys each row scoped to its FULL prior PK
+		// and back-pressures on a collision (see bulkUpdateIsPerRowLWWSafe). A bulk UPDATE with no
+		// bound updated_at CANNOT be replicated safely, so it is NOT admitted to the ledger: return
+		// an error (ledger GENERATION fails) rather than emitting a CatUnsupported entry into a
+		// shipped ledger. The source builder must be rewritten row-scoped with a full PK + updated_at.
 		if bulkUpdateIsPerRowLWWSafe(sh) {
 			return DispBulkUpdate, CatPerRowLWW, nil
 		}
-		return DispBulkUpdate, CatUnsupported, nil
+		return "", CatNone, invalidf("bulk update on %s has no bound updated_at, so it cannot be per-row LWW-gated; rewrite the builder row-scoped with a full PK + updated_at", sh.Table)
 	case KindDelete:
 		// A DELETE reaches the ledger only when emitted by a known replicating builder, so
 		// its presence IS the registration as a retention template.

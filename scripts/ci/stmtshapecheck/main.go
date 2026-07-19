@@ -162,7 +162,6 @@ var dispIdent = map[corrosion.Disposition]string{
 }
 
 var catIdent = map[corrosion.ConcurrencyCategory]string{
-	corrosion.CatMonotonic:   "CatMonotonic",
 	corrosion.CatPerRowLWW:   "CatPerRowLWW",
 	corrosion.CatUnsupported: "CatUnsupported",
 }

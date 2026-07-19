@@ -1126,22 +1126,15 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		return execErr
 
 	case DispBulkUpdate:
-		// Dispatch explicitly by the ledger's concurrency category — the categories are
-		// distinct contracts, not interchangeable. Only per-row-LWW is applied by expansion; a
-		// provably-monotonic bulk is safe verbatim; anything else (including a future
-		// unsupported entry) back-pressures.
-		switch entry.Category {
-		case CatPerRowLWW:
+		// The ONLY valid bulk category is per-row-LWW (applied by receiver-side expansion).
+		// Anything else — CatUnsupported or an unknown value that could only reach here via corrupt
+		// or historical ledger data — back-pressures. (Generation itself refuses to emit a
+		// non-per-row-LWW bulk entry: deriveDisposition errors, so a shipped ledger never carries
+		// one.)
+		if entry.Category == CatPerRowLWW {
 			return r.applyBulkPerRowLWW(ctx, tx, s, sh, tableName, pkCols)
-		case CatMonotonic:
-			res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
-			if execErr == nil && rowsChanged(res) {
-				r.client.clearUnresolvedFromStmt(s)
-			}
-			return execErr
-		default:
-			return invalidf("bulk update on %s has unsupported concurrency category %q", tableName, entry.Category)
 		}
+		return invalidf("bulk update on %s has unsupported concurrency category %q", tableName, entry.Category)
 
 	case DispFullPKUpdateNoClock:
 		// A full-PK UPDATE with no bound updated_at, authorized by an explicit audited policy.

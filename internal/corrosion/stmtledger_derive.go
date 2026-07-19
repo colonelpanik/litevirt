@@ -18,18 +18,12 @@ var appendOnlyTables = map[string]bool{
 // can't classify safely returns an error, which fails the CI guard (the shape must be made
 // classifiable before it can ship).
 func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
-	t := sh.Table
-	// Identity-reference invariant (H1): a builder on an identity table must NOT bind/assign a
-	// self-reference column (identityReferenceColumns, e.g. snapshots.parent_id). The identity
-	// collapse FAILS CLOSED on a non-null reference rather than rewriting it, so a writer that set
-	// one would silently invalidate that assumption. Reject at derivation so such a builder cannot be
-	// registered (ledger generation fails; the guard flags the unregistered shape) — this makes the
-	// invariant source-wide, not limited to the hand-listed writers in the integration test.
-	for _, ref := range identityReferenceColumns[t] {
-		if shapeBindsColumn(sh, ref) {
-			return "", CatNone, invalidf("builder on identity table %s binds reference column %q: H1 identity collapse fails closed on references and does NOT rewrite them — add reference rewriting to the collapse/apply paths before any writer sets %q", t, ref, ref)
-		}
+	// Non-overridable structural invariant, defense-in-depth (LedgerEntryFor also checks it BEFORE any
+	// explicit policy).
+	if err := shapeInvariantError(sh); err != nil {
+		return "", CatNone, err
 	}
+	t := sh.Table
 	// Custom-merge tables (monotone lifecycle / immutable journal) merge by their own rule
 	// regardless of statement kind.
 	if customMergeTables[t] != nil {
@@ -78,6 +72,21 @@ func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 		return DispDeleteRetention, CatNone, nil
 	}
 	return "", CatNone, invalidf("unclassifiable statement kind %s", sh.Kind)
+}
+
+// shapeInvariantError enforces NON-OVERRIDABLE structural invariants. It is checked BEFORE any
+// explicit per-fingerprint policy AND inside deriveDisposition, so neither an explicit policy nor a
+// hand-added ledger entry can authorize a shape that violates it. Currently: a builder on an identity
+// table must not bind/assign a self-reference column (identityReferenceColumns, e.g.
+// snapshots.parent_id), because the identity collapse fails closed on such references rather than
+// rewriting them — a writer that set one would silently invalidate that assumption.
+func shapeInvariantError(sh StmtShape) error {
+	for _, ref := range identityReferenceColumns[sh.Table] {
+		if shapeBindsColumn(sh, ref) {
+			return invalidf("builder on identity table %s binds reference column %q: H1 identity collapse fails closed on references and does NOT rewrite them — add reference rewriting to the collapse/apply paths before any writer sets %q", sh.Table, ref, ref)
+		}
+	}
+	return nil
 }
 
 // shapeBindsColumn reports whether the statement writes the named column — as an INSERT column or an
@@ -167,12 +176,18 @@ func explicitPolicy(fp string) (LedgerEntry, bool) {
 
 // LedgerEntryFor derives the compatibility-ledger entry for one replicated builder statement.
 // The CI guard's -emit-ledger mode calls it to generate stmtledger_generated.go. An explicit,
-// audited per-fingerprint policy (explicitPolicyDefs) overrides derivation.
+// audited per-fingerprint policy (explicitPolicyDefs) overrides DERIVATION — but NOT the
+// non-overridable structural invariants (shapeInvariantError), which are checked first so a policy
+// can never authorize a forbidden shape (e.g. a snapshots.parent_id writer).
 func LedgerEntryFor(sql string) (LedgerEntry, error) {
 	// Table + PK metadata from the structural parse (parseResolved), never the comment-sensitive
 	// string scan — so a builder's fingerprint is always paired with its OWN table's PKs.
 	sh, _, err := parseResolved(sql)
 	if err != nil {
+		return LedgerEntry{}, err
+	}
+	// Non-overridable invariants BEFORE the explicit-policy lookup.
+	if err := shapeInvariantError(sh); err != nil {
 		return LedgerEntry{}, err
 	}
 	fp := stmtFingerprint(sh)

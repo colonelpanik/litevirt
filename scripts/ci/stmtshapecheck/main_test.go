@@ -85,6 +85,64 @@ func TestGuardE2E_UnregisteredStaticBuilderGaps(t *testing.T) {
 	}
 }
 
+// TestGuardE2E_SnapshotParentIDBuilderGaps (review 3): a builder binding snapshots.parent_id parses
+// to a resolved finding, but the COMPLETE guard must fail it — LedgerEntryFor rejects the
+// non-overridable H1 reference invariant, so a fixture can't slip past even through the derivation
+// path.
+func TestGuardE2E_SnapshotParentIDBuilderGaps(t *testing.T) {
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
+		Tests: false,
+	}
+	pkgs, err := packages.Load(cfg, "./testdata/fixtures")
+	if err != nil || packages.PrintErrors(pkgs) > 0 || len(pkgs) != 1 {
+		t.Fatalf("load fixtures: %v (pkgs=%d)", err, len(pkgs))
+	}
+	var target *finding
+	for _, f := range scanPkg(pkgs[0]) {
+		if f.fn == "SnapshotParentIDWriter" {
+			ff := f
+			target = &ff
+			break
+		}
+	}
+	if target == nil {
+		t.Fatal("scanPkg did not find the SnapshotParentIDWriter builder")
+	}
+	if target.dynamic || target.parseErr != "" || target.fp == "" {
+		t.Fatalf("SnapshotParentIDWriter should classify as a resolved finding, got %+v", *target)
+	}
+	if gaps := computeGaps([]finding{*target}); len(gaps) != 1 {
+		t.Fatalf("the complete guard must FAIL a snapshots.parent_id builder, got %d gaps: %v", len(gaps), gaps)
+	}
+}
+
+// TestLedgerSafetyMismatch pins the safety-relevant field comparison used by the guard's
+// derivation-vs-ledger check.
+func TestLedgerSafetyMismatch(t *testing.T) {
+	base := corrosion.LedgerEntry{Disposition: corrosion.DispBulkUpdate, Category: corrosion.CatPerRowLWW}
+	if d := ledgerSafetyMismatch(base, base); d != "" {
+		t.Errorf("identical entries must not mismatch, got %q", d)
+	}
+	drift := base
+	drift.Disposition = corrosion.DispPlainInsert
+	if ledgerSafetyMismatch(drift, base) == "" {
+		t.Error("a disposition drift must be flagged")
+	}
+	cat := base
+	cat.Category = corrosion.CatNone
+	if ledgerSafetyMismatch(cat, base) == "" {
+		t.Error("a category drift must be flagged")
+	}
+	// Provenance/schema-window fields are NOT safety-relevant and must not be flagged.
+	prov := base
+	prov.MinSchema, prov.FirstEmitter = 99, "v9.9.9"
+	if d := ledgerSafetyMismatch(prov, base); d != "" {
+		t.Errorf("provenance/schema fields must not be treated as safety drift, got %q", d)
+	}
+}
+
 // TestRenderLedgerEntry_AllFields verifies the generator renders EVERY LedgerEntry field it is
 // given, so regeneration can't silently drop an activation/provenance field once H1/H2 begins
 // populating them (finding 3).
@@ -170,23 +228,24 @@ func TestScanPkg_Fixtures(t *testing.T) {
 	}
 
 	want := map[string]classCount{
-		"Direct":             {resolved: 1},
-		"ConstBuilder":       {resolved: 1},
-		"InlineBatch":        {resolved: 2},
-		"AppendedBatch":      {resolved: 2},
-		"HelperReturnBatch":  {resolved: 1},
-		"Guarded":            {resolved: 1},
-		"SameHelperTwice":    {resolved: 2}, // finding 4: visited set popped, both calls resolve
-		"Shadowed":           {unresolved: 1},
-		"AssignAfterCall":    {unresolved: 1}, // finding 1: post-call assignment ignored
-		"CondParam":          {unresolved: 1}, // finding 1: non-dominating param def rejected
-		"UnkeyedComposite":   {unresolved: 1}, // finding 3: non-empty keyless Statement fails closed
-		"RecursiveBatch":     {unresolved: 1},
-		"FieldMutation":      {unresolved: 1}, // escape: stmt.SQL rewritten before the call
-		"IndexedReplacement": {unresolved: 1}, // escape: stmts[i] replaced before the call
-		"HelperMutation":     {unresolved: 1}, // escape: slice passed to opaque helper
-		"DynamicBuilder":     {dynamic: 1},
-		"UnregisteredStatic": {resolved: 1}, // parses to a fp, but the shape isn't in the ledger
+		"Direct":                 {resolved: 1},
+		"ConstBuilder":           {resolved: 1},
+		"InlineBatch":            {resolved: 2},
+		"AppendedBatch":          {resolved: 2},
+		"HelperReturnBatch":      {resolved: 1},
+		"Guarded":                {resolved: 1},
+		"SameHelperTwice":        {resolved: 2}, // finding 4: visited set popped, both calls resolve
+		"Shadowed":               {unresolved: 1},
+		"AssignAfterCall":        {unresolved: 1}, // finding 1: post-call assignment ignored
+		"CondParam":              {unresolved: 1}, // finding 1: non-dominating param def rejected
+		"UnkeyedComposite":       {unresolved: 1}, // finding 3: non-empty keyless Statement fails closed
+		"RecursiveBatch":         {unresolved: 1},
+		"FieldMutation":          {unresolved: 1}, // escape: stmt.SQL rewritten before the call
+		"IndexedReplacement":     {unresolved: 1}, // escape: stmts[i] replaced before the call
+		"HelperMutation":         {unresolved: 1}, // escape: slice passed to opaque helper
+		"DynamicBuilder":         {dynamic: 1},
+		"UnregisteredStatic":     {resolved: 1}, // parses to a fp, but the shape isn't in the ledger
+		"SnapshotParentIDWriter": {resolved: 1}, // parses, but fails derivation (parent_id invariant)
 	}
 	for fn, exp := range want {
 		cc := got[fn]

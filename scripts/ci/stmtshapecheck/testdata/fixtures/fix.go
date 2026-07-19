@@ -73,6 +73,13 @@ func UnregisteredStatic(c *corrosion.Client, ctx context.Context) {
 	_ = c.Execute(ctx, "INSERT INTO images (name, bogus_extra, updated_at) VALUES (?, ?, ?)", 1, 2, 3) // want: resolved
 }
 
+// SnapshotParentIDWriter binds snapshots.parent_id — a self-reference the H1 identity collapse fails
+// closed on rather than rewriting. It parses (resolved finding), but the complete guard must FAIL it
+// because LedgerEntryFor rejects the non-overridable invariant.
+func SnapshotParentIDWriter(c *corrosion.Client, ctx context.Context) {
+	_ = c.Execute(ctx, "INSERT INTO snapshots (id, vm_name, host_name, name, parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", 1, 2, 3, 4, 5, 6, 7) // want: resolved
+}
+
 // UnkeyedComposite: a non-empty Statement without a keyed SQL field must fail closed.
 func UnkeyedComposite(c *corrosion.Client, ctx context.Context, p []interface{}) {
 	_ = c.ExecuteBatch(ctx, []corrosion.Statement{{Params: p}}) // want: unresolved

@@ -143,12 +143,44 @@ func computeGaps(findings []finding) []string {
 		case f.parseErr != "":
 			gaps = append(gaps, fmt.Sprintf("%s: replicated SQL does not parse as a supported shape (%s): %q", loc(f.pos), f.parseErr, f.sql))
 		default:
-			if _, ok := corrosion.LedgerLookup(f.fp); !ok {
-				gaps = append(gaps, fmt.Sprintf("%s: replicated statement not in the compatibility ledger (fp %s): %q", loc(f.pos), f.fp, f.sql))
+			// A resolved current-source builder: DERIVE the expected entry first (this enforces the
+			// non-overridable shape invariants and can't be bypassed by a hand-added ledger entry),
+			// then require ledger membership, then compare the safety-relevant fields — so a stale or
+			// manually-edited ledger entry that disagrees with derivation is caught.
+			want, derr := corrosion.LedgerEntryFor(f.sql)
+			switch {
+			case derr != nil:
+				gaps = append(gaps, fmt.Sprintf("%s: replicated statement fails derivation (%v): %q", loc(f.pos), derr, f.sql))
+			default:
+				got, ok := corrosion.LedgerLookup(f.fp)
+				if !ok {
+					gaps = append(gaps, fmt.Sprintf("%s: replicated statement not in the compatibility ledger (fp %s): %q", loc(f.pos), f.fp, f.sql))
+				} else if diff := ledgerSafetyMismatch(want, got); diff != "" {
+					gaps = append(gaps, fmt.Sprintf("%s: checked-in ledger entry disagrees with derivation (%s): %q", loc(f.pos), diff, f.sql))
+				}
 			}
 		}
 	}
 	return gaps
+}
+
+// ledgerSafetyMismatch returns a human-readable diff if the derived and checked-in ledger entries
+// disagree on any SAFETY-relevant field (the ones the apply path's authorization/disposition depends
+// on), or "" if they match. Provenance/schema-window fields are intentionally ignored.
+func ledgerSafetyMismatch(want, got corrosion.LedgerEntry) string {
+	switch {
+	case want.Disposition != got.Disposition:
+		return fmt.Sprintf("disposition ledger=%s derived=%s", got.Disposition, want.Disposition)
+	case want.Category != got.Category:
+		return fmt.Sprintf("category ledger=%q derived=%q", got.Category, want.Category)
+	case want.RequiresCapability != got.RequiresCapability:
+		return fmt.Sprintf("requires-capability ledger=%q derived=%q", got.RequiresCapability, want.RequiresCapability)
+	case want.DispositionAfter != got.DispositionAfter:
+		return fmt.Sprintf("disposition-after ledger=%s derived=%s", got.DispositionAfter, want.DispositionAfter)
+	case want.MonotoneColumn != got.MonotoneColumn:
+		return fmt.Sprintf("monotone-column ledger=%q derived=%q", got.MonotoneColumn, want.MonotoneColumn)
+	}
+	return ""
 }
 
 // dispIdent / catIdent map a derived disposition/category back to its Go identifier so the

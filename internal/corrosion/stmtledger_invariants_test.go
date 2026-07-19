@@ -63,6 +63,27 @@ func TestDeriveRejectsIdentityReferenceColumn(t *testing.T) {
 	}
 }
 
+// TestShapeInvariantBeatsExplicitPolicy (review 3): a non-overridable shape invariant is checked
+// BEFORE the explicit-policy lookup, so even an explicit policy that would authorize a
+// snapshots.parent_id writer cannot bypass it.
+func TestShapeInvariantBeatsExplicitPolicy(t *testing.T) {
+	const sql = `INSERT INTO snapshots (id, vm_name, host_name, name, parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+	sh, _, err := parseResolved(sql)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	fp := stmtFingerprint(sh)
+	// Inject an explicit policy that WOULD authorize this shape, then confirm the invariant still wins.
+	explicitPolicyByFP[fp] = LedgerEntry{Disposition: DispPlainInsert}
+	defer delete(explicitPolicyByFP, fp)
+	if _, ok := explicitPolicy(fp); !ok {
+		t.Fatal("precondition: the explicit policy must be registered for this test")
+	}
+	if _, err := LedgerEntryFor(sql); err == nil {
+		t.Fatal("an explicit policy must NOT authorize a snapshots.parent_id writer (invariant checked first)")
+	}
+}
+
 // TestDeriveRejectsUnsafeBulkUpdate (finding 2): ledger generation must FAIL for a bulk update with
 // no LWW-compatible updated_at (rather than emit a CatUnsupported entry). vm_disks' PK is
 // (vm_name, disk_name), so a WHERE on vm_name alone is a non-full-PK bulk update; without a bound

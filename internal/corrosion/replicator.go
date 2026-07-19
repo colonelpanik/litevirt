@@ -1126,7 +1126,7 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		// A registered retention DELETE (its presence in the ledger IS the registration).
 		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if execErr == nil && rowsChanged(res) {
-			r.client.clearUnresolvedFromShape(sh, s)
+			r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
 		}
 		return execErr
 
@@ -1143,7 +1143,7 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if execErr == nil && rowsChanged(res) {
-			r.client.clearUnresolvedFromShape(sh, s)
+			r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
 		}
 		return execErr
 
@@ -1224,8 +1224,10 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 	res, err := tx.ExecContext(ctx, applied, s.Params...)
 	if err == nil && rowsChanged(res) {
 		// A strictly-newer / resolver-chosen incoming write that actually CHANGED the row
-		// clears any stale unresolved-tie tracking. A guarded zero-row UPDATE is excluded.
-		r.client.clearUnresolvedFromShape(sh, s)
+		// clears any stale unresolved-tie tracking — but only AFTER the batch commits, so a later
+		// statement's rollback doesn't leave the safety-fault marker cleared. A guarded zero-row
+		// UPDATE is excluded.
+		r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
 	}
 	return err
 }
@@ -1445,7 +1447,7 @@ func (r *Replicator) applyMonotoneTimestamp(ctx context.Context, tx *sql.Tx, s S
 	}
 	res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 	if err == nil && rowsChanged(res) {
-		r.client.clearUnresolvedFromShape(sh, s)
+		r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
 	}
 	return err
 }
@@ -1556,7 +1558,7 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 		pkWhere[i] = c + " = ?"
 	}
 	upd := "UPDATE " + tableName + " SET " + setSQL + " WHERE " + strings.Join(pkWhere, " AND ")
-	changed := false
+	var changedPKs [][]interface{}
 	for _, m := range matches {
 		if r.client.skewQuarantinesIncoming(skewOn, m.localTS, incomingTS, now) {
 			continue
@@ -1573,11 +1575,20 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 			return execErr
 		}
 		if rowsChanged(res) {
-			changed = true
+			changedPKs = append(changedPKs, m.pk)
 		}
 	}
-	if changed {
-		r.client.clearUnresolvedFromShape(sh, s)
+	// Clear the unresolved-tie marker ONLY for the exact rows that changed, and ONLY after the batch
+	// commits (a later statement's rollback must not leave a real divergence hidden). A skipped
+	// newer/tied row keeps its marker. The original bulk shape has no full-PK identity, so a
+	// shape-based clear would be a silent no-op — clear each concrete PK instead.
+	if len(changedPKs) > 0 {
+		tbl, pks := tableName, changedPKs
+		r.client.deferAfterCommit(tx, func() {
+			for _, pk := range pks {
+				r.client.clearUnresolved(tbl, pkKey(pk))
+			}
+		})
 	}
 	return nil
 }

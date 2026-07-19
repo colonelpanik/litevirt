@@ -259,6 +259,23 @@ shape** after activation; and eventually the index contract (partial → non-par
 shipped here, and readiness for it must be recomputed synchronously at that time, not read
 from a cached flag.
 
+**Operator runbook — a concurrent-login collision.** A rare race (the same
+`(scope, owner, registry)` credential written on two nodes within the replication window)
+leaves two different live credential ids for one triple. This is **fail-closed — no
+corruption, no silent pick** — but it does not auto-resolve.
+
+- **Detect:** `litevirt_merge_apply_rejected_total{table="registry_credentials",reason="unique"}`
+  climbs, and `lv doctor divergence` reports a **stable** `registry_credentials` divergence
+  (one triple, different live ids per node). The WAL stream between the two nodes may also
+  stall (rising `litevirt_replication_peer_pending_entries` for that peer) — the colliding
+  entry sits at the head of the stream and back-pressures the batch until it ages out at
+  `MaxLogRetention` (24h). Anti-entropy keeps every other table converged in the meantime.
+- **Remediate:** soft-delete (tombstone) the divergent live credential for that triple on the
+  affected node(s) — a single `deleted_at` write per node — then have the user re-establish the
+  login, which writes one fresh credential that converges. No data is lost; the credential is
+  simply re-created. (Equivalently, once the stalled entry prunes, a fresh login converges on
+  its own.) The permanent fix is the deferred writer-activation contract above.
+
 ### The sensitive lane
 
 `--include-sensitive` also scans secret-bearing tables (2FA factors, recovery

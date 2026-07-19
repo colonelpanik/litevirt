@@ -8,9 +8,9 @@
 // function and the ledger, they cannot drift: a builder whose shape is not registered fails
 // CI here rather than silently back-pressuring at apply time.
 //
-// Dynamically-built SQL (a non-string-literal argument) cannot be fingerprinted statically;
-// such a call site must carry a `//stmtshape:policy <id>` directive naming a registered
-// parameterized policy, or the guard flags it.
+// Dynamically-built SQL (a non-string-literal argument) cannot be fingerprinted statically, so
+// the guard fails it: every replicated statement must be finite static SQL (a literal string per
+// statement) whose shape is in the ledger. There is no dynamic-policy escape hatch.
 //
 // Usage:
 //
@@ -42,7 +42,6 @@ type finding struct {
 	sql             string
 	dynamic         bool // SQL is not a compile-time constant (runtime-built)
 	unresolvedBatch bool // an ExecuteBatch arg that could not be statically enumerated
-	policy          string
 	fp              string
 	parseErr        string
 }
@@ -92,9 +91,9 @@ func main() {
 		for _, f := range findings {
 			switch {
 			case f.unresolvedBatch:
-				fmt.Printf("%s\tUNRESOLVED-BATCH\tpolicy=%q\n", loc(f.pos), f.policy)
+				fmt.Printf("%s\tUNRESOLVED-BATCH\n", loc(f.pos))
 			case f.dynamic:
-				fmt.Printf("%s\tDYNAMIC\tpolicy=%q\n", loc(f.pos), f.policy)
+				fmt.Printf("%s\tDYNAMIC\n", loc(f.pos))
 			case f.parseErr != "":
 				fmt.Printf("%s\tPARSE-ERR\t%s\t%q\n", loc(f.pos), f.parseErr, f.sql)
 			default:
@@ -116,13 +115,9 @@ func main() {
 	for _, f := range findings {
 		switch {
 		case f.unresolvedBatch:
-			if !policyOK(f.policy) {
-				gaps = append(gaps, fmt.Sprintf("%s: ExecuteBatch argument could not be statically enumerated and has no valid //stmtshape:policy", loc(f.pos)))
-			}
+			gaps = append(gaps, fmt.Sprintf("%s: ExecuteBatch argument could not be statically enumerated; rewrite it as finite static SQL (a literal string per statement) so every replicated shape is in the ledger", loc(f.pos)))
 		case f.dynamic:
-			if !policyOK(f.policy) {
-				gaps = append(gaps, fmt.Sprintf("%s: dynamically-built replicated SQL with no valid //stmtshape:policy directive", loc(f.pos)))
-			}
+			gaps = append(gaps, fmt.Sprintf("%s: dynamically-built replicated SQL; rewrite it as finite static SQL so every shape is in the ledger", loc(f.pos)))
 		case f.parseErr != "":
 			gaps = append(gaps, fmt.Sprintf("%s: replicated SQL does not parse as a supported shape (%s): %q", loc(f.pos), f.parseErr, f.sql))
 		default:
@@ -139,8 +134,9 @@ func main() {
 	for _, g := range gaps {
 		fmt.Fprintf(os.Stderr, "  %s\n", g)
 	}
-	fmt.Fprintf(os.Stderr, "\nAdd a ledger entry (run with -report to get the fingerprint) or a //stmtshape:policy\n"+
-		"directive for a dynamic builder. An unregistered shape would back-pressure at apply time.\n")
+	fmt.Fprintf(os.Stderr, "\nEvery replicated statement must be finite static SQL registered in the ledger: add a ledger entry\n"+
+		"(run with -report for the fingerprint, then regenerate with -emit-ledger), or rewrite a dynamic/\n"+
+		"unresolved builder into literal per-statement SQL. An unregistered shape would back-pressure at apply time.\n")
 	os.Exit(1)
 }
 
@@ -340,11 +336,6 @@ func emitGeneratedLedger(findings []finding) error {
 
 func scanPkg(pkg *packages.Package) []finding {
 	var out []finding
-	policyAt := harvestPolicyDirectives(pkg)
-	pol := func(n ast.Node) string {
-		return policyBetween(policyAt, pkg.Fset.Position(n.Pos()).Filename,
-			pkg.Fset.Position(n.Pos()).Line, pkg.Fset.Position(n.End()).Line)
-	}
 	// Index package funcs so a batch built by a helper can be resolved one level deep.
 	funcByName := map[string]*ast.FuncDecl{}
 	for _, file := range pkg.Syntax {
@@ -385,20 +376,20 @@ func scanPkg(pkg *packages.Package) []finding {
 				}
 				// Fresh scanner (fresh recursion-visited set) per call site; only
 				// assignments before this call may define its batch argument.
-				s := &scanner{pkg: pkg, funcByName: funcByName, pol: pol, fn: fd, callPos: call.Pos(), visited: map[*ast.FuncDecl]bool{}}
+				s := &scanner{pkg: pkg, funcByName: funcByName, fn: fd, callPos: call.Pos(), visited: map[*ast.FuncDecl]bool{}}
 				var got []finding
 				switch method {
 				case "Execute", "ExecuteRows", "ExecuteDeferred":
 					if len(call.Args) >= 2 {
-						got = []finding{resolveSQL(pkg, call.Args[1], pol(call))}
+						got = []finding{resolveSQL(pkg, call.Args[1])}
 					}
 				case "ExecuteBatch": // (ctx, stmts)
 					if len(call.Args) >= 2 {
-						got = s.resolveBatchArg(call.Args[1], pol(call))
+						got = s.resolveBatchArg(call.Args[1])
 					}
 				case "ExecuteBatchGuarded": // (ctx, guard, stmts)
 					if len(call.Args) >= 3 {
-						got = s.resolveBatchArg(call.Args[2], pol(call))
+						got = s.resolveBatchArg(call.Args[2])
 					}
 				}
 				for i := range got {
@@ -442,7 +433,6 @@ func isPlumbingMethod(pkg *packages.Package, fd *ast.FuncDecl) bool {
 type scanner struct {
 	pkg        *packages.Package
 	funcByName map[string]*ast.FuncDecl
-	pol        func(ast.Node) string
 	fn         *ast.FuncDecl
 	callPos    token.Pos              // only assignments BEFORE this position may define the batch arg
 	visited    map[*ast.FuncDecl]bool // helper-recursion guard, shared across nested scanners
@@ -478,35 +468,35 @@ func (s *scanner) isLocalDefinable(obj types.Object) bool {
 // resolveBatchArg resolves the []Statement argument of an ExecuteBatch* call to the concrete
 // statements it carries, following an inline slice literal, a local variable's assignment +
 // appends, and one level of helper return. Anything it cannot resolve fails closed.
-func (s *scanner) resolveBatchArg(arg ast.Expr, pol string) []finding {
+func (s *scanner) resolveBatchArg(arg ast.Expr) []finding {
 	switch e := arg.(type) {
 	case *ast.CompositeLit: // []Statement{ elt, elt, ... }
 		var out []finding
 		for _, elt := range e.Elts {
-			out = append(out, s.resolveStmtElt(elt, pol)...)
+			out = append(out, s.resolveStmtElt(elt)...)
 		}
 		if len(out) == 0 {
-			out = append(out, finding{pos: s.pkg.Fset.Position(e.Pos()), unresolvedBatch: true, policy: pol})
+			out = append(out, finding{pos: s.pkg.Fset.Position(e.Pos()), unresolvedBatch: true})
 		}
 		return out
 	case *ast.Ident: // a local variable built via `:= []Statement{...}` and/or append(...)
 		if obj := s.pkg.TypesInfo.ObjectOf(e); obj != nil {
-			if fs := s.resolveSliceVar(obj, pol); fs != nil {
+			if fs := s.resolveSliceVar(obj); fs != nil {
 				return fs
 			}
 		}
 	case *ast.CallExpr: // a helper returning []Statement
-		if fs := s.resolveHelperReturn(e, pol); fs != nil {
+		if fs := s.resolveHelperReturn(e); fs != nil {
 			return fs
 		}
 	}
-	return []finding{{pos: s.pkg.Fset.Position(arg.Pos()), unresolvedBatch: true, policy: pol}}
+	return []finding{{pos: s.pkg.Fset.Position(arg.Pos()), unresolvedBatch: true}}
 }
 
 // resolveStmtElt resolves one element of a []Statement literal: a Statement{SQL:...}
 // composite, a local Statement variable (traced to its assignment), or a helper call
 // returning a Statement.
-func (s *scanner) resolveStmtElt(elt ast.Expr, pol string) []finding {
+func (s *scanner) resolveStmtElt(elt ast.Expr) []finding {
 	if u, ok := elt.(*ast.UnaryExpr); ok {
 		elt = u.X
 	}
@@ -514,7 +504,7 @@ func (s *scanner) resolveStmtElt(elt ast.Expr, pol string) []finding {
 	case *ast.CompositeLit:
 		if isCorrosionStatement(s.pkg.TypesInfo.Types[e].Type) {
 			if sqlExpr := statementSQLField(e); sqlExpr != nil {
-				return []finding{resolveSQL(s.pkg, sqlExpr, pol)}
+				return []finding{resolveSQL(s.pkg, sqlExpr)}
 			}
 			// ONLY an entirely empty Statement{} is the intentional zero-value / error-path
 			// return (`return Statement{}, err`). Any other composite that lacks a
@@ -523,20 +513,20 @@ func (s *scanner) resolveStmtElt(elt ast.Expr, pol string) []finding {
 			if len(e.Elts) == 0 {
 				return []finding{}
 			}
-			return []finding{{pos: s.pkg.Fset.Position(e.Pos()), unresolvedBatch: true, policy: pol}}
+			return []finding{{pos: s.pkg.Fset.Position(e.Pos()), unresolvedBatch: true}}
 		}
 	case *ast.CallExpr:
-		if fs := s.resolveHelperReturn(e, pol); fs != nil {
+		if fs := s.resolveHelperReturn(e); fs != nil {
 			return fs
 		}
 	case *ast.Ident:
 		if obj := s.pkg.TypesInfo.ObjectOf(e); obj != nil {
-			if fs := s.resolveStmtVar(obj, pol); fs != nil {
+			if fs := s.resolveStmtVar(obj); fs != nil {
 				return fs
 			}
 		}
 	}
-	return []finding{{pos: s.pkg.Fset.Position(elt.Pos()), unresolvedBatch: true, policy: pol}}
+	return []finding{{pos: s.pkg.Fset.Position(elt.Pos()), unresolvedBatch: true}}
 }
 
 // assignsTo reports whether any LHS ident of as refers to the SAME object (not merely the
@@ -554,14 +544,14 @@ func (s *scanner) assignsTo(as *ast.AssignStmt, target types.Object) bool {
 // composite or helper call assigned to it within the enclosing function. Over-approximates
 // across branches (every assignment to the object is included); any unresolvable assignment
 // yields an unresolved finding, so the batch fails closed.
-func (s *scanner) resolveStmtVar(target types.Object, pol string) []finding {
+func (s *scanner) resolveStmtVar(target types.Object) []finding {
 	if !s.isLocalDefinable(target) {
 		return nil // param/global/result ⇒ cannot prove; caller fails closed
 	}
 	if s.escapes(target, false) {
 		// A field write (stmt.SQL=…) or address escape (&stmt) can change the executed SQL
 		// after the composite was fingerprinted ⇒ fail closed (finding: in-place mutation).
-		return []finding{{pos: s.pkg.Fset.Position(target.Pos()), unresolvedBatch: true, policy: pol}}
+		return []finding{{pos: s.pkg.Fset.Position(target.Pos()), unresolvedBatch: true}}
 	}
 	var out []finding
 	found := false
@@ -571,7 +561,7 @@ func (s *scanner) resolveStmtVar(target types.Object, pol string) []finding {
 			return true
 		}
 		found = true
-		out = append(out, s.resolveStmtElt(as.Rhs[0], pol)...)
+		out = append(out, s.resolveStmtElt(as.Rhs[0])...)
 		return true
 	})
 	if !found {
@@ -678,7 +668,7 @@ func isMutationSafeCall(x *ast.CallExpr) bool {
 
 // resolveSliceVar collects statements assigned to a []Statement local (by object identity)
 // via `:=`/`=` initialization and `append(v, …)` within the enclosing function.
-func (s *scanner) resolveSliceVar(target types.Object, pol string) []finding {
+func (s *scanner) resolveSliceVar(target types.Object) []finding {
 	if !s.isLocalDefinable(target) {
 		return nil // param/global/result ⇒ cannot prove; caller fails closed
 	}
@@ -686,7 +676,7 @@ func (s *scanner) resolveSliceVar(target types.Object, pol string) []finding {
 		// An element write (stmts[i]=…), address escape (&stmts[i]), or passing the slice —
 		// whose backing array is shared — to unknown code can change the executed SQL after
 		// the composite was fingerprinted ⇒ fail closed.
-		return []finding{{pos: s.pkg.Fset.Position(target.Pos()), unresolvedBatch: true, policy: pol}}
+		return []finding{{pos: s.pkg.Fset.Position(target.Pos()), unresolvedBatch: true}}
 	}
 	var out []finding
 	found := false
@@ -699,24 +689,24 @@ func (s *scanner) resolveSliceVar(target types.Object, pol string) []finding {
 		case *ast.CompositeLit: // v := []Statement{...}
 			found = true
 			for _, elt := range rhs.Elts {
-				out = append(out, s.resolveStmtElt(elt, pol)...)
+				out = append(out, s.resolveStmtElt(elt)...)
 			}
 		case *ast.CallExpr:
 			found = true
 			if fn, ok := rhs.Fun.(*ast.Ident); ok && fn.Name == "append" { // v = append(v, …)
 				for _, a := range rhs.Args[1:] {
-					out = append(out, s.resolveStmtElt(a, pol)...)
+					out = append(out, s.resolveStmtElt(a)...)
 				}
 			} else if fn, ok := rhs.Fun.(*ast.Ident); ok && fn.Name == "make" {
 				// v := make([]Statement, …) — an empty init; the appends carry the statements.
-			} else if fs := s.resolveHelperReturn(rhs, pol); fs != nil { // v = buildStmts()
+			} else if fs := s.resolveHelperReturn(rhs); fs != nil { // v = buildStmts()
 				out = append(out, fs...)
 			} else {
-				out = append(out, finding{pos: s.pkg.Fset.Position(rhs.Pos()), unresolvedBatch: true, policy: pol})
+				out = append(out, finding{pos: s.pkg.Fset.Position(rhs.Pos()), unresolvedBatch: true})
 			}
 		default:
 			found = true
-			out = append(out, finding{pos: s.pkg.Fset.Position(as.Rhs[0].Pos()), unresolvedBatch: true, policy: pol})
+			out = append(out, finding{pos: s.pkg.Fset.Position(as.Rhs[0].Pos()), unresolvedBatch: true})
 		}
 		return true
 	})
@@ -731,7 +721,7 @@ func (s *scanner) resolveSliceVar(target types.Object, pol string) []finding {
 
 // resolveHelperReturn resolves a call to a package-local helper that returns []Statement or
 // Statement by following its `return` expressions one level.
-func (s *scanner) resolveHelperReturn(call *ast.CallExpr, pol string) []finding {
+func (s *scanner) resolveHelperReturn(call *ast.CallExpr) []finding {
 	id, ok := call.Fun.(*ast.Ident)
 	if !ok {
 		return nil
@@ -755,7 +745,7 @@ func (s *scanner) resolveHelperReturn(call *ast.CallExpr, pol string) []finding 
 	// non-recursive helper called twice in one batch is not mistaken for recursion.
 	s.visited[fd] = true
 	defer delete(s.visited, fd)
-	inner := &scanner{pkg: s.pkg, funcByName: s.funcByName, pol: s.pol, fn: fd, visited: s.visited}
+	inner := &scanner{pkg: s.pkg, funcByName: s.funcByName, fn: fd, visited: s.visited}
 	var out []finding
 	found := false
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -770,10 +760,10 @@ func (s *scanner) resolveHelperReturn(call *ast.CallExpr, pol string) []finding 
 		switch {
 		case isCorrosionStatement(t):
 			found = true
-			out = append(out, inner.resolveStmtElt(r0, pol)...)
+			out = append(out, inner.resolveStmtElt(r0)...)
 		case isStatementSlice(t):
 			found = true
-			out = append(out, inner.resolveBatchArg(r0, pol)...)
+			out = append(out, inner.resolveBatchArg(r0)...)
 		}
 		return true
 	})
@@ -793,12 +783,13 @@ func isStatementSlice(t types.Type) bool {
 }
 
 // resolveSQL turns one SQL argument expression into a finding: a compile-time constant
-// string is fingerprinted; anything else is dynamic (authorized only via a policy).
-func resolveSQL(pkg *packages.Package, e ast.Expr, pol string) finding {
+// string is fingerprinted; anything else is dynamic (the guard fails it — rewrite it as
+// finite static SQL).
+func resolveSQL(pkg *packages.Package, e ast.Expr) finding {
 	pos := pkg.Fset.Position(e.Pos())
 	s, ok := constString(pkg, e)
 	if !ok {
-		return finding{pos: pos, dynamic: true, policy: pol}
+		return finding{pos: pos, dynamic: true}
 	}
 	f := finding{pos: pos, sql: s}
 	if fp, err := corrosion.FingerprintSQL(s); err != nil {
@@ -834,37 +825,6 @@ func isCorrosionNamed(t types.Type, name string) bool {
 	return obj != nil && obj.Name() == name && obj.Pkg() != nil && obj.Pkg().Path() == corrosionPkgPath
 }
 
-type policyDirective struct {
-	file string
-	line int
-	id   string
-}
-
-func harvestPolicyDirectives(pkg *packages.Package) []policyDirective {
-	var out []policyDirective
-	for _, file := range pkg.Syntax {
-		for _, cg := range file.Comments {
-			for _, c := range cg.List {
-				if idx := strings.Index(c.Text, "stmtshape:policy"); idx >= 0 {
-					id := strings.TrimSpace(strings.TrimPrefix(c.Text[idx:], "stmtshape:policy"))
-					p := pkg.Fset.Position(c.Slash)
-					out = append(out, policyDirective{file: p.Filename, line: p.Line, id: id})
-				}
-			}
-		}
-	}
-	return out
-}
-
-func policyBetween(dirs []policyDirective, file string, start, end int) string {
-	for _, d := range dirs {
-		if d.file == file && d.line >= start && d.line <= end {
-			return d.id
-		}
-	}
-	return ""
-}
-
 // statementSQLField extracts the SQL field value expression from a Statement{SQL: ...}
 // composite-literal element (possibly &Statement{...}); returns nil if the element is not a
 // composite with a keyed SQL field (e.g. a variable spliced into the slice).
@@ -897,34 +857,4 @@ func constString(pkg *packages.Package, e ast.Expr) (string, bool) {
 		return "", false
 	}
 	return constant.StringVal(tv.Value), true
-}
-
-// policyOK reports whether a //stmtshape:policy directive names a registered policy that is
-// nonempty and whose every declared expansion fingerprint exists in the ledger. This does
-// NOT prove the builder's dynamic expression can only produce those fingerprints — that
-// requires either refactoring the builder to finite constant statements or a structured
-// expression policy (tracked with the four dynamic builders); a bare ID is not enough.
-func policyOK(id string) bool {
-	if id == "" {
-		return false
-	}
-	fps, ok := corrosion.PolicyLookup(id)
-	return checkPolicy(fps, ok, func(fp string) bool {
-		_, has := corrosion.LedgerLookup(fp)
-		return has
-	})
-}
-
-// checkPolicy is the pure validation: a policy is acceptable only if it is registered,
-// nonempty, and every expansion fingerprint exists in the ledger. (Injectable for tests.)
-func checkPolicy(fps []string, registered bool, ledgerHas func(string) bool) bool {
-	if !registered || len(fps) == 0 {
-		return false
-	}
-	for _, fp := range fps {
-		if !ledgerHas(fp) {
-			return false
-		}
-	}
-	return true
 }

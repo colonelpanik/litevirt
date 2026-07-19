@@ -130,27 +130,43 @@ func (c *Client) clearUnresolved(table, pk string) {
 	c.tieMu.Unlock()
 }
 
-// clearUnresolvedFromStmt clears the tracked unresolved entry for the row a
-// statement mutates — the hook for the WAL apply path and local writes, so a
-// fresh/newer write (the remediation path) drops the stale tracking. Lock-free
-// when nothing is tracked.
-func (c *Client) clearUnresolvedFromStmt(s Statement) {
+// clearUnresolvedFromShape clears the tracked unresolved entry for the row a full-PK statement
+// mutates, keyed off the PARSED shape's resolved PK parameter indices (pkValuesFromShape) — NOT a
+// string heuristic. The WAL apply path passes the shape it already parsed. A fresh/newer write (the
+// remediation path) thus drops the stale tracking. Lock-free when nothing is tracked; a no-op for a
+// shape with no full-PK identity or whose bound param count doesn't match.
+func (c *Client) clearUnresolvedFromShape(sh StmtShape, s Statement) {
+	if !c.anyUnresolved() {
+		return
+	}
+	if sh.Table == "" || sh.ParamCount != len(s.Params) {
+		return
+	}
+	vals, ok := pkValuesFromShape(sh, s)
+	if !ok {
+		return
+	}
+	c.clearUnresolved(sh.Table, pkKey(vals))
+}
+
+// clearUnresolvedFromLocalStmt is the local-write counterpart: a locally-executed statement does not
+// arrive with a parsed shape, so this is the table-first structural parse entrypoint — extract and
+// validate the table, obtain tablePrimaryKeys[table], parse the shape (which finalizes the PK
+// parameter mapping), then clear via clearUnresolvedFromShape. A statement that doesn't parse to a
+// full-PK shape is simply not cleared (the tracker self-heals on the next converging write).
+func (c *Client) clearUnresolvedFromLocalStmt(s Statement) {
 	if !c.anyUnresolved() {
 		return
 	}
 	table := extractTableName(s.SQL)
-	if table == "" {
+	if table == "" || len(tablePrimaryKeys[table]) == 0 {
 		return
 	}
-	pkCols := tablePrimaryKeys[table]
-	if len(pkCols) == 0 {
+	sh, err := parseStmtShape(s.SQL, tablePrimaryKeys[table])
+	if err != nil {
 		return
 	}
-	vals := extractPKValues(table, pkCols, s)
-	if len(vals) != len(pkCols) {
-		return
-	}
-	c.clearUnresolved(table, pkKey(vals))
+	c.clearUnresolvedFromShape(sh, s)
 }
 
 // UnresolvedTieCount returns the number of distinct currently-tracked unresolved

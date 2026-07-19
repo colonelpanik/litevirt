@@ -1096,8 +1096,7 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	case DispAppendOnly:
 		// Immutable append-only INSERT (fencing_log/audit_log/mutation_log/vm_events):
 		// INSERT OR IGNORE, so it only creates the row when absent and never overwrites.
-		replaced := replaceInsertStrategy(s.SQL, "INSERT OR IGNORE")
-		_, execErr := tx.ExecContext(ctx, replaced, s.Params...)
+		_, execErr := tx.ExecContext(ctx, setInsertOrIgnore(s.SQL, sh), s.Params...)
 		return execErr
 
 	case DispCustomMerge:
@@ -1112,7 +1111,7 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		// don't advertise split_brain_gate_v1), so this receive side just stays monotone.
 		sqlStmt := s.SQL
 		if sh.Kind == KindInsert {
-			sqlStmt = replaceInsertStrategy(sqlStmt, "INSERT OR IGNORE")
+			sqlStmt = setInsertOrIgnore(sqlStmt, sh)
 		}
 		_, execErr := tx.ExecContext(ctx, sqlStmt, s.Params...)
 		return execErr
@@ -1121,7 +1120,7 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		// A registered retention DELETE (its presence in the ledger IS the registration).
 		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if execErr == nil && rowsChanged(res) {
-			r.client.clearUnresolvedFromStmt(s)
+			r.client.clearUnresolvedFromShape(sh, s)
 		}
 		return execErr
 
@@ -1146,7 +1145,7 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if execErr == nil && rowsChanged(res) {
-			r.client.clearUnresolvedFromStmt(s)
+			r.client.clearUnresolvedFromShape(sh, s)
 		}
 		return execErr
 
@@ -1228,7 +1227,7 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 	if err == nil && rowsChanged(res) {
 		// A strictly-newer / resolver-chosen incoming write that actually CHANGED the row
 		// clears any stale unresolved-tie tracking. A guarded zero-row UPDATE is excluded.
-		r.client.clearUnresolvedFromStmt(s)
+		r.client.clearUnresolvedFromShape(sh, s)
 	}
 	return err
 }
@@ -1361,7 +1360,7 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 		changed := rowsChanged(res)
 		r.client.deferAfterCommit(tx, func() {
 			if changed {
-				r.client.clearUnresolvedFromStmt(s)
+				r.client.clearUnresolvedFromShape(sh, s)
 			}
 			r.client.clearIdentityFault(tableName, incomingNat) // clear only AFTER a successful apply
 		})
@@ -1398,7 +1397,7 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 			return wErr
 		}
 		r.client.deferAfterCommit(tx, func() {
-			r.client.clearUnresolvedFromStmt(s)
+			r.client.clearUnresolvedFromShape(sh, s)
 			r.client.clearIdentityFault(tableName, incomingNat) // converged → clear only on success
 			if haveArtifact && winnerFound {
 				r.client.surfaceIdentityCollapseOrphan(tableName, localID.String, losingHost, losingPath, incomingID, winnerHost, winnerPath)
@@ -1448,7 +1447,7 @@ func (r *Replicator) applyMonotoneTimestamp(ctx context.Context, tx *sql.Tx, s S
 	}
 	res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 	if err == nil && rowsChanged(res) {
-		r.client.clearUnresolvedFromStmt(s)
+		r.client.clearUnresolvedFromShape(sh, s)
 	}
 	return err
 }
@@ -1580,7 +1579,7 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 		}
 	}
 	if changed {
-		r.client.clearUnresolvedFromStmt(s)
+		r.client.clearUnresolvedFromShape(sh, s)
 	}
 	return nil
 }
@@ -1897,17 +1896,4 @@ func insertRowFromShape(sh StmtShape, s Statement) (cols []string, vals []interf
 		}
 	}
 	return sh.InsertCols, vals, true
-}
-
-// extractPKValues attempts to extract primary key values from a Statement.
-// For UPDATE... WHERE pk = ?, it extracts from the trailing params.
-// For INSERT INTO table (cols) VALUES (...), it extracts by column position.
-func extractPKValues(tableName string, pkCols []string, s Statement) []interface{} {
-	if isInsertStatement(s.SQL) {
-		return extractPKFromInsert(s, pkCols)
-	}
-	if isUpdateStatement(s.SQL) {
-		return extractPKFromUpdate(s, pkCols)
-	}
-	return nil
 }

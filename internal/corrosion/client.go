@@ -814,7 +814,7 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 
 	if c.anyUnresolved() {
 		for _, s := range mutated {
-			c.clearUnresolvedFromStmt(s)
+			c.clearUnresolvedFromLocalStmt(s)
 		}
 	}
 	c.notifyReplicator()
@@ -879,7 +879,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// when nothing is tracked.
 	if c.anyUnresolved() {
 		for _, s := range mutated {
-			c.clearUnresolvedFromStmt(s)
+			c.clearUnresolvedFromLocalStmt(s)
 		}
 	}
 

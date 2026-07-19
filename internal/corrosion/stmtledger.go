@@ -102,17 +102,6 @@ func CurrentLedgerHas(fp string) bool {
 	return ok
 }
 
-// PolicyLookup returns a dynamic-SQL policy's finite set of allowed expansion fingerprints.
-// A genuinely runtime-built statement (whose SQL text is not a compile-time constant) is
-// authorized only via a policy: the builder's call site carries a //stmtshape:policy <id>
-// directive, the CI guard confirms the policy is registered, and at apply time the concrete
-// statement's fingerprint must be one of the policy's expansions (each of which is also a
-// ledger entry). Populated in stmtledger_entries.go alongside the ledger.
-func PolicyLookup(id string) ([]string, bool) {
-	fps, ok := stmtPolicies[id]
-	return fps, ok
-}
-
 // stmtLedger is populated in stmtledger_entries.go (generated from the builders via
 // `stmtshapecheck -report`, then annotated). Kept in a separate file so the entry list can
 // be regenerated without touching this logic.

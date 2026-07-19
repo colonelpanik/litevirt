@@ -162,6 +162,10 @@ type StmtShape struct {
 	// INSERT (stripLeadingAlgo) without a substring search. Both 0 when no algo is present.
 	LeadingAlgoStart int
 	LeadingAlgoEnd   int
+	// InsertKeywordEnd is the byte offset just past the leading "INSERT" keyword in the ORIGINAL
+	// sql, so a rewrite that SETS a conflict algorithm (setInsertOrIgnore) can splice " OR IGNORE"
+	// there structurally instead of string-searching. Zero for non-INSERT shapes.
+	InsertKeywordEnd int
 	// InsertValuesEnd is the byte offset in the ORIGINAL sql just past the VALUES tuple's
 	// closing ')'. The plain-INSERT upsert rewrite splices its ON CONFLICT tail here rather
 	// than appending to the raw string, so a trailing comment or semicolon after VALUES

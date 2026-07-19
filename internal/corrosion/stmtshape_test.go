@@ -274,6 +274,34 @@ func TestStripLeadingAlgo(t *testing.T) {
 	}
 }
 
+// TestSetInsertOrIgnore verifies the structural "INSERT OR IGNORE" rewrite (replacement for the old
+// substring replaceInsertStrategy): a plain INSERT gains OR IGNORE, an existing algo is replaced, and
+// the rest of the statement (columns, values, ON CONFLICT tail, comments) is preserved.
+func TestSetInsertOrIgnore(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"INSERT INTO t (a, b) VALUES (?, ?)", "INSERT OR IGNORE INTO t (a, b) VALUES (?, ?)"},
+		{"INSERT OR REPLACE INTO t (a) VALUES (?)", "INSERT OR IGNORE INTO t (a) VALUES (?)"},
+		{"INSERT OR IGNORE INTO t (a) VALUES (?)", "INSERT OR IGNORE INTO t (a) VALUES (?)"},
+		{"INSERT INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO NOTHING", "INSERT OR IGNORE INTO t (id, a) VALUES (?, ?) ON CONFLICT(id) DO NOTHING"},
+	}
+	for _, c := range cases {
+		got := setInsertOrIgnore(c.in, mustParse(t, c.in, []string{"id"}))
+		if got != c.want {
+			t.Errorf("setInsertOrIgnore(%q):\n  got  %q\n  want %q", c.in, got, c.want)
+		}
+		// The result must parse as a valid INSERT OR IGNORE.
+		sh, err := parseStmtShape(got, []string{"id"})
+		if err != nil {
+			t.Fatalf("rewritten %q did not parse: %v", got, err)
+		}
+		if sh.LeadingAlgo != "OR IGNORE" {
+			t.Errorf("rewritten statement has algo %q, want OR IGNORE: %q", sh.LeadingAlgo, got)
+		}
+	}
+}
+
 func TestStripLeadingAlgo_ExecuteEquivalence(t *testing.T) {
 	// The stripped plain-INSERT + ON CONFLICT must execute equivalently to the original
 	// OR REPLACE form for the common same-PK conflict.

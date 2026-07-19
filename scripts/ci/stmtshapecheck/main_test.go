@@ -128,36 +128,3 @@ func TestScanPkg_Fixtures(t *testing.T) {
 		}
 	}
 }
-
-// TestCheckPolicy covers the policy-acceptance logic (review findings 1/2): an unknown,
-// empty, or missing-ledger-expansion policy must be rejected; only a registered, nonempty
-// policy whose every expansion is in the ledger is accepted.
-func TestCheckPolicy(t *testing.T) {
-	inLedger := func(present ...string) func(string) bool {
-		set := map[string]bool{}
-		for _, p := range present {
-			set[p] = true
-		}
-		return func(fp string) bool { return set[fp] }
-	}
-	cases := []struct {
-		name       string
-		fps        []string
-		registered bool
-		ledger     func(string) bool
-		want       bool
-	}{
-		{"unknown policy", nil, false, inLedger(), false},
-		{"empty policy", []string{}, true, inLedger(), false},
-		{"expansion missing from ledger", []string{"fpA"}, true, inLedger(), false},
-		{"partially missing", []string{"fpA", "fpB"}, true, inLedger("fpA"), false},
-		{"all expansions in ledger", []string{"fpA", "fpB"}, true, inLedger("fpA", "fpB"), true},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := checkPolicy(c.fps, c.registered, c.ledger); got != c.want {
-				t.Fatalf("checkPolicy = %v, want %v", got, c.want)
-			}
-		})
-	}
-}

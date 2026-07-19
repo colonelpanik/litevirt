@@ -107,9 +107,9 @@ func (r *Replicator) applyLegacyCRLVersions(ctx context.Context, tx *sql.Tx, s S
 // tsMs CASE natively; only the structural parser can't model it). Params: deleted_at (wall),
 // updated_at (LWW clock), age cutoff.
 func (r *Replicator) applyLegacyGCReap(ctx context.Context, tx *sql.Tx, s Statement, incomingHLC string) error {
-	res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
-	if err == nil && rowsChanged(res) {
-		r.client.clearUnresolvedFromStmt(s)
-	}
+	// No unresolved-tie clear here: runtime_action_proofs merges via the custom-merge (monotone)
+	// path, never LWW/tie resolution, so it is never tracked — and this reap's tsMs CASE predicate
+	// is not structurally parseable to a shape anyway.
+	_, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 	return err
 }

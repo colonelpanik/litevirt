@@ -49,7 +49,8 @@ func (p *sqlParser) parseIdentList(what string) ([]string, error) {
 
 func (p *sqlParser) parseInsert(pkCols []string) (StmtShape, error) {
 	sh := StmtShape{Kind: KindInsert, UpdatedAtParamIdx: -1}
-	p.next() // INSERT
+	insTok := p.next() // INSERT
+	sh.InsertKeywordEnd = insTok.pos + len(insTok.text)
 	if p.peek().kind == tokIdent && strings.EqualFold(p.peek().text, "OR") {
 		orTok := p.next() // OR
 		algoTok := p.peek()
@@ -439,4 +440,20 @@ func stripLeadingAlgo(sql string, sh StmtShape) string {
 		e++
 	}
 	return sql[:s] + sql[e:]
+}
+
+// setInsertOrIgnore returns sql rewritten to "INSERT OR IGNORE INTO …" — a create-only INSERT that
+// never clobbers an existing row — by splicing at the parser-located keyword offsets. It is the
+// structural, offset-based replacement for the substring replaceInsertStrategy: it first removes any
+// existing OR REPLACE/OR IGNORE (stripLeadingAlgo, which only touches content after the INSERT
+// keyword) and then inserts " OR IGNORE" right after the INSERT keyword, leaving everything else —
+// ON CONFLICT tail, literals, comments — byte-for-byte unchanged. sh must be the parse of sql with
+// sh.Kind == KindInsert.
+func setInsertOrIgnore(sql string, sh StmtShape) string {
+	plain := stripLeadingAlgo(sql, sh)
+	kwEnd := sh.InsertKeywordEnd
+	if kwEnd <= 0 || kwEnd > len(plain) {
+		return plain
+	}
+	return plain[:kwEnd] + " OR IGNORE" + plain[kwEnd:]
 }

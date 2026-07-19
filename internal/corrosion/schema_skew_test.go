@@ -58,7 +58,7 @@ func TestApplyRemoteMutations_BackPressureOnSchemaMissing(t *testing.T) {
 		Seq:    1,
 		Hlc:    ts.String(),
 		Origin: "origin-node",
-		Stmts: `[{"SQL":"INSERT INTO service_endpoints (service_name, ip, region, weight, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)","Params":["api","10.0.0.1","ny",1,"2026-05-11T00:00:00Z","2026-05-11T00:00:00Z"]}]`,
+		Stmts:  `[{"SQL":"INSERT INTO service_endpoints (service_name, ip, region, weight, created_at, updated_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, NULL) ON CONFLICT(service_name, ip) DO UPDATE SET region = excluded.region, weight = excluded.weight, updated_at = excluded.updated_at, deleted_at = NULL","Params":["api","10.0.0.1","ny",1,"2026-05-11T00:00:00Z","2026-05-11T00:00:00Z"]}]`,
 	}}
 
 	_, err := r.ApplyRemoteMutations(ctx, entries)

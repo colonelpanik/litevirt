@@ -22,6 +22,9 @@ type AntiEntropyMetrics struct {
 	tieUnresolved        *prometheus.CounterVec
 	tombstoneTies        *prometheus.CounterVec
 	tieUnresolvedCurrent prometheus.Gauge
+	mergeRejected        *prometheus.CounterVec
+	legacyTransformed    *prometheus.CounterVec
+	identityOrphan       *prometheus.CounterVec
 }
 
 // NewAntiEntropyMetrics registers the anti-entropy timing metrics on the default
@@ -51,12 +54,24 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 		}),
 		rowsMerged: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_antientropy_rows_merged_total",
-			Help: "Rows applied (INSERT OR REPLACE) by anti-entropy full-state merges.",
+			Help: "Rows applied (PK-aware UPSERT) by anti-entropy full-state merges.",
 		}),
 		rowsSkipped: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_antientropy_rows_skipped_total",
 			Help: "Rows skipped by anti-entropy merges (LWW kept local, or malformed).",
 		}),
+		mergeRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_merge_apply_rejected_total",
+			Help: "Replicated rows/statements the apply path rejected without applying, by table, path (ae/wal), and reason (e.g. constraint). Counts attempts; alert on rate.",
+		}, []string{"table", "path", "reason"}),
+		legacyTransformed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_legacy_mutation_transformed_total",
+			Help: "Prior-release WAL statements normalized through a bounded legacy transformer, by transformer id. A nonzero rate means a not-yet-upgraded peer is still emitting a legacy shape.",
+		}, []string{"transformer"}),
+		identityOrphan: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_identity_collapse_orphaned_total",
+			Help: "Natural-key identity collapses whose losing physical row referenced a different host/artifact, potentially leaving that host's snapshot file unreferenced, by table. NOT auto-deleted; the losing id/host/path is logged (WARN) for operator cleanup. Alert on rate.",
+		}, []string{"table"}),
 		tieBreaks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_lww_tie_break_total",
 			Help: "Exact-timestamp ties a resolver converged, by table, resolver rule, and winner (local/incoming).",
@@ -74,7 +89,7 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Help: "Distinct unresolved ties this node is CURRENTLY tracking (a gauge — drops to 0 when repaired). Alert on this for 'something is divergent now'; the _total counter is monotonic and would page forever.",
 		}),
 	}
-	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent)
+	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent, m.mergeRejected, m.legacyTransformed, m.identityOrphan)
 	return m
 }
 
@@ -115,6 +130,21 @@ func (m *AntiEntropyMetrics) ObserveTieUnresolved(table, path, category string) 
 // ObserveTombstoneTie records a tie settled by a one-sided soft-delete. (Satisfies corrosion.SyncMetrics.)
 func (m *AntiEntropyMetrics) ObserveTombstoneTie(table string) {
 	m.tombstoneTies.WithLabelValues(table).Inc()
+}
+
+// ObserveMergeRejected records a replicated row/statement rejected without applying. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveMergeRejected(table, path, reason string) {
+	m.mergeRejected.WithLabelValues(table, path, reason).Inc()
+}
+
+// ObserveLegacyTransformed records a prior-release statement normalized by a legacy transformer. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveLegacyTransformed(transformer string) {
+	m.legacyTransformed.WithLabelValues(transformer).Inc()
+}
+
+// ObserveIdentityCollapseOrphan records a collapse that may have orphaned a losing host's artifact. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveIdentityCollapseOrphan(table string) {
+	m.identityOrphan.WithLabelValues(table).Inc()
 }
 
 // ObserveUnresolvedTieCurrent sets the current-unresolved-ties gauge. (Satisfies corrosion.SyncMetrics.)

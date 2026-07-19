@@ -172,6 +172,31 @@ enforcement:
                               # else both compare v1, so a mixed fleet is always safe. Enable
                               # fleet-uniformly then run `lv cluster converge --all`. See
                               # docs/diagnostics.md → "digest_v2".
+  canonical_identity: false   # resolve the natural-key identity tables (snapshots,
+                              # container_snapshots) by their UNIQUE natural key instead of the
+                              # minted random id. Two nodes can independently create DIFFERENT ids
+                              # for one logical object, whose rows then collide on the secondary
+                              # UNIQUE and back-pressure; once this latches cluster-wide the
+                              # receiver collapses each such pair to a single deterministic winner
+                              # (newer updated_at; an exact-instant tie breaks to the smaller id
+                              # ONLY when the rows' content is otherwise equal — a different-content
+                              # tie stays a surfaced fault) by RE-KEYING the surviving row in place,
+                              # so receiver-only columns are preserved. Unlike digest_v2 this is NOT
+                              # pairwise — identity resolution mutates shared state, so (like
+                              # operation_protocol) it is advertised only while this flag is on and
+                              # activates only when the flag is set AND the token has latched
+                              # fleet-wide. Enable fleet-uniformly; the flag is the reversible kill
+                              # switch.
+  canonical_registry: false   # PREPARATORY infrastructure for the canonical registry-credential
+                              # model (a deterministic-id row per (scope,owner,registry)). Setting
+                              # this only ADVERTISES canonical_registry_v1 so the cluster can latch
+                              # it; once durably latched, replicated CANONICAL upserts are accepted on
+                              # apply (permanently — the writer-activation contract emits them). It
+                              # does NOT switch the writer or run consolidation: new API writes still
+                              # use the legacy writer, so the concurrent-login collision remains open
+                              # until the deferred operator-run contract (see docs/diagnostics.md).
+                              # The flag gates advertisement/opt-in only; it does not revoke an
+                              # already-formed latch. Advertised only while on; enable fleet-uniformly.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

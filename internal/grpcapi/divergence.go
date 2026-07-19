@@ -191,7 +191,10 @@ func (s *Server) fetchPeerSnapshot(ctx context.Context, host string, opTables, s
 	for _, t := range opTables {
 		want[t] = true
 	}
-	tables, owned, err = corrosion.SnapshotFromDumpBytes(buf, want, s.db.DigestV2Enabled())
+	// Build every node's snapshot on the SCANNING node's lanes (digest_v2 + natural-key
+	// identity) so all snapshots in a run key rows identically — the natural-key lane engages
+	// only when this node's canonical_identity has latched, i.e. the fleet is uniformly upgraded.
+	tables, owned, err = corrosion.SnapshotFromDumpBytes(buf, want, s.db.DigestV2Enabled(), s.db.CanonicalIdentityEnabled())
 	if err != nil {
 		return nil, nil, false, false
 	}

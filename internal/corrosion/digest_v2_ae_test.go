@@ -150,8 +150,8 @@ func TestTableSnapshot_ColumnReorderV2(t *testing.T) {
 	colsB := []string{"name", "driver", "host_name", "updated_at"}
 	rowsB := [][]interface{}{{"pool1", "local", "host-a", "2024-01-01T00:00:00Z"}}
 
-	snapA, _ := tableSnapshotFromRows("storage_pools", colsA, rowsA, true)
-	snapB, _ := tableSnapshotFromRows("storage_pools", colsB, rowsB, true)
+	snapA, _ := tableSnapshotFromRows("storage_pools", colsA, rowsA, true, false)
+	snapB, _ := tableSnapshotFromRows("storage_pools", colsB, rowsB, true, false)
 
 	pk := "host-a" + pkSep + "pool1"
 	ma, okA := snapA.Rows[pk]

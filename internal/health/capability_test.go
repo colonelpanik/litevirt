@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -148,6 +149,65 @@ func TestEnforced_Latches(t *testing.T) {
 	}
 	if !c.Enforced(ctx, tok) {
 		t.Fatal("Enforced must LATCH on through a partition (fail closed), not revert to legacy")
+	}
+}
+
+// TestDurablyLatched_PersistRetryAndReload covers the durable-latch contract (canonical registry
+// acceptance): an in-memory latch is NOT durable until its marker persists, a failed marker write is
+// retried once the path is repaired, and a restart reloads the marker and stays durable. This is the
+// lifecycle a durable-gated wire-shape acceptance must survive so a reboot can't revert to rejecting
+// an in-flight entry.
+func TestDurablyLatched_PersistRetryAndReload(t *testing.T) {
+	const tok = capabilities.SplitBrainGateV1
+	ctx := context.Background()
+	db := testCheckHostDB(t)
+	gateHost(t, db, "host-a", "active", "worker") // self
+	gateHost(t, db, "host-b", "active", "worker")
+
+	dir := t.TempDir()
+	badParent := filepath.Join(dir, "nodir") // does not exist yet → the marker write fails
+	base := filepath.Join(badParent, "activated")
+	c := NewChecker("host-a", "/etc/litevirt/pki", db)
+	c.SetActivationMarker(base)
+	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) { return []string{tok}, nil })
+
+	// Activate: latches in memory, but the marker write fails → NOT durable, so a durable-gated
+	// contract (canonical registry acceptance) stays fail-closed.
+	if !c.Enforced(ctx, tok) {
+		t.Fatal("all members advertise the token → Enforced true (in-memory latch)")
+	}
+	if !c.Latched(tok) {
+		t.Fatal("token must be latched in memory")
+	}
+	if c.DurablyLatched(tok) {
+		t.Fatal("must NOT be durable while the marker write is failing")
+	}
+
+	// Repair the marker path; the already-latched Enforced retry must now persist it.
+	if err := os.MkdirAll(badParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	c.Enforced(ctx, tok) // already-latched path retries persistence
+	if !c.DurablyLatched(tok) {
+		t.Fatal("must be durable once the marker write succeeds")
+	}
+	if _, err := os.Stat(markerPathFor(base, tok)); err != nil {
+		t.Fatalf("marker file must exist after the retry: %v", err)
+	}
+
+	// Restart: a fresh Checker reloads the marker → durable immediately (no re-Ping).
+	c2 := NewChecker("host-a", "/etc/litevirt/pki", db)
+	c2.SetActivationMarker(base)
+	if !c2.DurablyLatched(tok) {
+		t.Fatal("a reloaded marker must be durably latched after restart")
+	}
+
+	// An unset marker base is never durable, even if the in-memory latch is set.
+	c3 := NewChecker("host-a", "/etc/litevirt/pki", db)
+	c3.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) { return []string{tok}, nil })
+	c3.Enforced(ctx, tok)
+	if c3.DurablyLatched(tok) {
+		t.Fatal("no marker base ⇒ never durable (nothing can persist)")
 	}
 }
 

@@ -1,6 +1,7 @@
 package corrosion
 
 import (
+	"database/sql"
 	"log/slog"
 	"sort"
 	"strings"
@@ -26,6 +27,43 @@ import (
 
 func unresolvedKey(table, pk string) string { return table + "\x00" + pk }
 
+// deferAfterCommit records fn to run only after the given transaction commits (via
+// runDeferredEffects). A nil tx runs fn immediately (direct callers with no commit boundary). Used
+// for tracker mutations and orphan alerts, which must not take effect if the tx later rolls back.
+func (c *Client) deferAfterCommit(tx *sql.Tx, fn func()) {
+	if tx == nil {
+		fn()
+		return
+	}
+	c.txEffectsMu.Lock()
+	if c.txEffects == nil {
+		c.txEffects = make(map[*sql.Tx][]func())
+	}
+	c.txEffects[tx] = append(c.txEffects[tx], fn)
+	c.txEffectsMu.Unlock()
+}
+
+// runDeferredEffects runs and removes every effect registered for tx — call it right AFTER a
+// successful tx.Commit(). Ordering is registration order.
+func (c *Client) runDeferredEffects(tx *sql.Tx) {
+	c.txEffectsMu.Lock()
+	fns := c.txEffects[tx]
+	delete(c.txEffects, tx)
+	c.txEffectsMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+// dropDeferredEffects discards any effects registered for tx WITHOUT running them — call it on
+// every rollback / early-return path (a deferred dropDeferredEffects is the safe default; a
+// successful runDeferredEffects empties the map first, so the deferred drop then no-ops).
+func (c *Client) dropDeferredEffects(tx *sql.Tx) {
+	c.txEffectsMu.Lock()
+	delete(c.txEffects, tx)
+	c.txEffectsMu.Unlock()
+}
+
 // contentPair returns a stable, order-independent fingerprint of the two rows'
 // content, so the same divergence (regardless of which side is "local") maps to
 // one key.
@@ -43,7 +81,14 @@ func (c *Client) anyUnresolved() bool { return c.unresolvedLen.Load() > 0 }
 // logs an alert ONCE per distinct (table,PK,content-pair); re-observing the same
 // divergence is a no-op (bounded). Safe to call with c.mu held (uses its own lock).
 func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}, path resolveTiePath, category string) {
-	pair := contentPair(local, incoming)
+	c.trackUnresolvedPair(table, pk, contentPair(local, incoming), path, category)
+}
+
+// trackUnresolvedPair is trackUnresolved with a precomputed content-pair fingerprint, so a caller
+// that needs a projection-independent / order-invariant key (identity faults, where local is the
+// full row but the incoming may be a subset/reordered statement) can supply a stable one instead
+// of the positional (local,incoming) pair.
+func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath, category string) {
 	key := unresolvedKey(table, pk)
 
 	c.tieMu.Lock()
@@ -85,27 +130,39 @@ func (c *Client) clearUnresolved(table, pk string) {
 	c.tieMu.Unlock()
 }
 
-// clearUnresolvedFromStmt clears the tracked unresolved entry for the row a
-// statement mutates — the hook for the WAL apply path and local writes, so a
-// fresh/newer write (the remediation path) drops the stale tracking. Lock-free
-// when nothing is tracked.
-func (c *Client) clearUnresolvedFromStmt(s Statement) {
+// clearUnresolvedFromShape clears the tracked unresolved entry for the row a full-PK statement
+// mutates, keyed off the PARSED shape's resolved PK parameter indices (pkValuesFromShape) — NOT a
+// string heuristic. The WAL apply path passes the shape it already parsed. A fresh/newer write (the
+// remediation path) thus drops the stale tracking. Lock-free when nothing is tracked; a no-op for a
+// shape with no full-PK identity or whose bound param count doesn't match.
+func (c *Client) clearUnresolvedFromShape(sh StmtShape, s Statement) {
 	if !c.anyUnresolved() {
 		return
 	}
-	table := extractTableName(s.SQL)
-	if table == "" {
+	if sh.Table == "" || sh.ParamCount != len(s.Params) {
 		return
 	}
-	pkCols := tablePrimaryKeys[table]
-	if len(pkCols) == 0 {
+	vals, ok := pkValuesFromShape(sh, s)
+	if !ok {
 		return
 	}
-	vals := extractPKValues(table, pkCols, s)
-	if len(vals) != len(pkCols) {
+	c.clearUnresolved(sh.Table, pkKey(vals))
+}
+
+// clearUnresolvedFromLocalStmt is the local-write counterpart: a locally-executed statement does not
+// arrive with a parsed shape, so this does the two-stage structural parse (parseResolved) to get the
+// table + PK metadata from the VALIDATED parse — never a comment-sensitive string scan — then clears
+// via clearUnresolvedFromShape. A statement that doesn't parse to a full-PK shape is simply not
+// cleared (the tracker self-heals on the next converging write).
+func (c *Client) clearUnresolvedFromLocalStmt(s Statement) {
+	if !c.anyUnresolved() {
 		return
 	}
-	c.clearUnresolved(table, pkKey(vals))
+	sh, _, err := parseResolved(s.SQL)
+	if err != nil {
+		return
+	}
+	c.clearUnresolvedFromShape(sh, s)
 }
 
 // UnresolvedTieCount returns the number of distinct currently-tracked unresolved

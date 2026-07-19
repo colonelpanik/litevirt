@@ -668,15 +668,31 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 			}
 		}
 	}
-	return c.ExecuteBatch(ctx, []Statement{
-		vmsUpdate,
-		{SQL: `UPDATE vm_interfaces SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,
-			Params: []interface{}{newName, now, oldName}},
-		{SQL: `UPDATE vm_disks SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,
-			Params: []interface{}{newName, now, oldName}},
-		{SQL: `UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,
-			Params: []interface{}{newName, now, oldName}},
-	})
+	stmts := []Statement{vmsUpdate}
+	// vm_interfaces and vm_disks key on a COMPOSITE PK (vm_name + X) whose vm_name component
+	// is being rekeyed; row-scope them to full-PK statements so each is per-row LWW-gated on
+	// apply (a bulk WHERE vm_name = ? can't be). Enumerate the other PK component locally.
+	ifaces, err := c.Query(ctx, `SELECT network_name AS pk FROM vm_interfaces WHERE vm_name = ?`, oldName)
+	if err != nil {
+		return err
+	}
+	for _, r := range ifaces {
+		stmts = append(stmts, Statement{SQL: `UPDATE vm_interfaces SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?`,
+			Params: []interface{}{newName, now, oldName, r.String("pk")}})
+	}
+	disks, err := c.Query(ctx, `SELECT disk_name AS pk FROM vm_disks WHERE vm_name = ?`, oldName)
+	if err != nil {
+		return err
+	}
+	for _, r := range disks {
+		stmts = append(stmts, Statement{SQL: `UPDATE vm_disks SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND disk_name = ?`,
+			Params: []interface{}{newName, now, oldName, r.String("pk")}})
+	}
+	// ip_allocations keys on (network, ip); vm_name is a NON-PK column here, so this stays a
+	// bulk update — per-row LWW expansion handles it safely on apply.
+	stmts = append(stmts, Statement{SQL: `UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,
+		Params: []interface{}{newName, now, oldName}})
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // UpdateVMInterfaceIP sets the IP of a VM interface.

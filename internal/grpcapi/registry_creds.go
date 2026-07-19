@@ -55,6 +55,9 @@ func (s *Server) SetRegistryCredential(ctx context.Context, req *pb.SetRegistryC
 		ID: newID(), Scope: scope, Owner: owner, Registry: registry,
 		Username: req.Username, Secret: req.Password,
 	}
+	// Uses the legacy mint-new-id writer. The canonical deterministic-id writer is preparatory
+	// infrastructure with no production caller — it is wired in only by the deferred operator-run
+	// activation contract (Part H2), so the concurrent-login collision remains open until then.
 	if err := corrosion.UpsertRegistryCredential(ctx, s.db, rc); err != nil {
 		return nil, status.Errorf(codes.Internal, "set registry credential: %v", err)
 	}

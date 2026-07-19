@@ -106,6 +106,12 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if fn.Name.Name == "applyV32DataFixes" {
 				continue
 			}
+			// HistoricalShapes GENERATES prior-release SQL strings for the compatibility
+			// ledger — it never writes to the DB, so its embedded `updated_at = ?` is a bound
+			// placeholder the apply path fills, not a value this function stamps.
+			if fn.Name.Name == "HistoricalShapes" {
+				continue
+			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])
 			if strings.Contains(body, "NowTS(") {
 				continue

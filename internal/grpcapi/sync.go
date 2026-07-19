@@ -302,10 +302,15 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	// — which is what makes a multi-version (N-step) rolling upgrade safe.
 	//
 	// Asymmetric: refuse ONLY when the sender's DB schema is strictly AHEAD of
-	// ours (its writes may reference columns we genuinely lack). sender <= local
-	// is accepted — under the additive-only invariant the sender touches a subset
-	// of our columns. The runtime back-pressure net (replicator.ApplyRemoteMutations
-	// + isSchemaMissingError) is the final guard if anything slips past this.
+	// ours (its writes may reference columns we genuinely lack). sender <= local is
+	// accepted — but NOT because "touching a subset of our columns" is inherently
+	// safe: a behind sender's INSERT omits our newer columns, and the old whole-row
+	// INSERT OR REPLACE apply RESET them to defaults/NULL (the reported data-loss
+	// bug). It is safe now because the apply path is column-preserving — a PK-aware
+	// UPSERT touches only the columns the sender supplied (replicator.applyStatementLWW
+	// / sync.buildMergeUpsertSQL), so omitted receiver-only columns keep their value.
+	// The runtime back-pressure net (ApplyRemoteMutations + fail-closed ledger +
+	// isSchemaMissingError) is the final guard if anything slips past this.
 	if req.SenderSchemaVersion != 0 {
 		localDB := s.db.EffectiveDBSchema()
 		gap := int(req.SenderSchemaVersion) - localDB

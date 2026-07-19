@@ -164,19 +164,35 @@ func MigrateLegacyNetworkNames(ctx context.Context, c *Client) error {
 		scopedName := compose.ScopedNetworkName(nr.StackName, nr.Name)
 		slog.Info("migrating legacy network name", "old", nr.Name, "new", scopedName)
 
-		// Rename across all four tables.
+		// networks.name is the single primary key, so this rename is a full-PK LWW update.
 		_ = c.Execute(ctx,
 			`UPDATE networks SET name = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
 			scopedName, now, nr.Name)
-		_ = c.Execute(ctx,
-			`UPDATE network_vteps SET network_name = ?, updated_at = ? WHERE network_name = ? AND deleted_at IS NULL`,
-			scopedName, now, nr.Name)
-		_ = c.Execute(ctx,
-			`UPDATE ip_allocations SET network = ?, updated_at = ? WHERE network = ? AND deleted_at IS NULL`,
-			scopedName, now, nr.Name)
-		_ = c.Execute(ctx,
-			`UPDATE vm_interfaces SET network_name = ?, updated_at = ? WHERE network_name = ? AND deleted_at IS NULL`,
-			scopedName, now, nr.Name)
+		// The other three tables key on a COMPOSITE PK whose network component is being
+		// rekeyed; a bulk `WHERE network_name = ?` update can't be per-row LWW-gated on a
+		// peer, so enumerate the matching rows locally and emit one full-PK statement each
+		// (a rekey that collides with an existing row on a peer then fails closed).
+		rescope := func(sel string, exec func(pk string)) {
+			rows, err := c.Query(ctx, sel, nr.Name)
+			if err != nil {
+				return
+			}
+			for _, row := range rows {
+				exec(row.String("pk"))
+			}
+		}
+		rescope(`SELECT host_name AS pk FROM network_vteps WHERE network_name = ? AND deleted_at IS NULL`,
+			func(pk string) {
+				_ = c.Execute(ctx, `UPDATE network_vteps SET network_name = ?, updated_at = ? WHERE network_name = ? AND host_name = ? AND deleted_at IS NULL`, scopedName, now, nr.Name, pk)
+			})
+		rescope(`SELECT ip AS pk FROM ip_allocations WHERE network = ? AND deleted_at IS NULL`,
+			func(pk string) {
+				_ = c.Execute(ctx, `UPDATE ip_allocations SET network = ?, updated_at = ? WHERE network = ? AND ip = ? AND deleted_at IS NULL`, scopedName, now, nr.Name, pk)
+			})
+		rescope(`SELECT vm_name AS pk FROM vm_interfaces WHERE network_name = ? AND deleted_at IS NULL`,
+			func(pk string) {
+				_ = c.Execute(ctx, `UPDATE vm_interfaces SET network_name = ?, updated_at = ? WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`, scopedName, now, pk, nr.Name)
+			})
 	}
 
 	// Migrate network names inside VM spec JSON.

@@ -84,16 +84,28 @@ func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldS
 // e.g. a stopped-VM redefine that just persisted its spec). Returns applied (a row
 // was updated), error.
 func UpdateObservedActuals(ctx context.Context, c *Client, name string, cpu, mem int, expectedOwnerEpoch, expectedSpecGen int64) (bool, error) {
-	sql := `UPDATE vms SET cpu_actual = ?, mem_actual = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`
-	params := []interface{}{cpu, mem, c.NowTS(), name}
-	if expectedOwnerEpoch >= 0 {
-		sql += ` AND vm_owner_epoch = ?`
-		params = append(params, expectedOwnerEpoch)
+	// One of four CONSTANT statements rather than SQL built by concatenation, each passed
+	// LITERALLY at its call site so the ledger/CI guard can resolve it and the apply path can
+	// structurally validate it. All four are full-PK LWW updates on vms (WHERE name = ?).
+	const (
+		base     = `UPDATE vms SET cpu_actual = ?, mem_actual = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`
+		epoch    = base + ` AND vm_owner_epoch = ?`
+		gen      = base + ` AND spec_generation = ?`
+		epochGen = base + ` AND vm_owner_epoch = ? AND spec_generation = ?`
+	)
+	ts := c.NowTS()
+	switch {
+	case expectedOwnerEpoch >= 0 && expectedSpecGen >= 0:
+		n, err := c.ExecuteRows(ctx, epochGen, cpu, mem, ts, name, expectedOwnerEpoch, expectedSpecGen)
+		return n > 0, err
+	case expectedOwnerEpoch >= 0:
+		n, err := c.ExecuteRows(ctx, epoch, cpu, mem, ts, name, expectedOwnerEpoch)
+		return n > 0, err
+	case expectedSpecGen >= 0:
+		n, err := c.ExecuteRows(ctx, gen, cpu, mem, ts, name, expectedSpecGen)
+		return n > 0, err
+	default:
+		n, err := c.ExecuteRows(ctx, base, cpu, mem, ts, name)
+		return n > 0, err
 	}
-	if expectedSpecGen >= 0 {
-		sql += ` AND spec_generation = ?`
-		params = append(params, expectedSpecGen)
-	}
-	n, err := c.ExecuteRows(ctx, sql, params...)
-	return n > 0, err
 }

@@ -138,8 +138,11 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		data, err := fetchStateDump(ctx, client)
 		if err != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
+		} else if mergeErr := ae.client.MergeStateBytesLWW(data); mergeErr != nil {
+			// Operational/commit failure during merge: this cycle's convergence is incomplete.
+			// The merge is per-row-idempotent and non-destructive, so the next cycle retries.
+			slog.Warn("anti-entropy: merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
 		} else {
-			ae.client.MergeStateBytesLWW(data)
 			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
 		}
 	}
@@ -208,7 +211,10 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		slog.Warn("anti-entropy: sensitive dump RPC error", "peer", peerName, "error", err)
 		return
 	}
-	ae.client.MergeSensitiveStateBytesLWW(data)
+	if mergeErr := ae.client.MergeSensitiveStateBytesLWW(data); mergeErr != nil {
+		slog.Warn("anti-entropy: sensitive merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
+		return
+	}
 	slog.Info("anti-entropy: sensitive merge complete", "peer", peerName, "bytes", len(data))
 }
 

@@ -145,17 +145,31 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 // then, and the consumable set — all that gates a runtime action — is already bounded here.
 func ReapSpentProofs(ctx context.Context, c *Client, tombstoneAfter time.Duration) (tombstoned int, err error) {
 	tombstoneCutoff := time.Now().UTC().Add(-tombstoneAfter).UnixMilli()
-	ts := c.NowTS()     // updated_at = LWW key
-	wall := c.NowWall() // deleted_at = wall (tombstone marker, never the HLC key)
-	n, err := c.ExecuteRows(ctx,
-		`UPDATE runtime_action_proofs
-		    SET deleted_at = ?, updated_at = ?
+	// Select the aged, terminal, not-yet-tombstoned proofs LOCALLY — the tsMs age expression
+	// is fine in a local read — then tombstone each by PK with a constant, full-PK,
+	// status-guarded statement, so the REPLICATED write is a structurally-validatable shape
+	// (the tsMs CASE expression can't be) rather than an unbounded bulk UPDATE. The status
+	// guard keeps the per-row tombstone a no-op on a peer whose proof isn't terminal.
+	rows, err := c.Query(ctx,
+		`SELECT id AS pk FROM runtime_action_proofs
 		  WHERE deleted_at IS NULL
 		    AND status IN ('completed','failed')
 		    AND `+tsMsSQL("updated_at")+` < ?`,
-		wall, ts, tombstoneCutoff)
+		tombstoneCutoff)
 	if err != nil {
-		return 0, fmt.Errorf("tombstone spent proofs: %w", err)
+		return 0, fmt.Errorf("select spent proofs: %w", err)
 	}
-	return int(n), nil
+	ts := c.NowTS()     // updated_at = LWW key
+	wall := c.NowWall() // deleted_at = wall (tombstone marker, never the HLC key)
+	for _, row := range rows {
+		n, execErr := c.ExecuteRows(ctx, reapSpentProofSQL, wall, ts, row.String("pk"))
+		if execErr != nil {
+			return tombstoned, fmt.Errorf("tombstone spent proof: %w", execErr)
+		}
+		tombstoned += int(n)
+	}
+	return tombstoned, nil
 }
+
+const reapSpentProofSQL = `UPDATE runtime_action_proofs SET deleted_at = ?, updated_at = ? ` +
+	`WHERE id = ? AND deleted_at IS NULL AND status IN ('completed','failed')`

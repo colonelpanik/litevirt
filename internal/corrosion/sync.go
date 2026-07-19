@@ -28,7 +28,7 @@ import (
 // customMergeFn merges one incoming anti-entropy row for a custom-merge table,
 // returning true to KEEP LOCAL (skip the incoming row) or false to apply it. It
 // runs under the merge tx + client lock and bypasses the LWW resolver entirely.
-type customMergeFn func(c *Client, tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool
+type customMergeFn func(c *Client, tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) (keepLocal bool, err error)
 
 // customMergeTables maps a table to its bespoke NON-LWW merge. These tables are
 // anti-entropy-repaired (present in tableNames/sensitiveTableNames) but resolved
@@ -389,31 +389,31 @@ func (c *Client) DumpSensitiveStateBytes() []byte {
 // production — so convergence relies on NTP); HLC only orders the mutation log +
 // dedup and is honored defensively when an updated_at value happens to be HLC.
 // It is the live anti-entropy merge path (AntiEntropy.checkPeer → fetchStateDump → here).
-func (c *Client) MergeStateBytesLWW(buf []byte) {
+func (c *Client) MergeStateBytesLWW(buf []byte) error {
 	if len(buf) == 0 {
-		return
+		return nil
 	}
 	payload, err := decompressPayload(buf)
 	if err != nil {
 		slog.Error("sync: decompress", "error", err)
-		return
+		return err
 	}
-	c.mergeStatePayloadLWW(payload)
+	return c.mergeStatePayloadLWW(payload)
 }
 
 // MergeSensitiveStateBytesLWW merges a peer-only sensitive state dump. It uses
 // the same LWW engine as the public merge but with a disjoint allowlist so a
 // sensitive dump cannot mutate public tables.
-func (c *Client) MergeSensitiveStateBytesLWW(buf []byte) {
+func (c *Client) MergeSensitiveStateBytesLWW(buf []byte) error {
 	if len(buf) == 0 {
-		return
+		return nil
 	}
 	payload, err := decompressPayload(buf)
 	if err != nil {
 		slog.Error("sync: decompress sensitive", "error", err)
-		return
+		return err
 	}
-	c.mergeStatePayloadLWWWithAllowlist(payload, sensitiveTableSet)
+	return c.mergeStatePayloadLWWWithAllowlist(payload, sensitiveTableSet)
 }
 
 // decompressPayload decompresses and unmarshals a gzipped sync payload.
@@ -441,21 +441,31 @@ func decompressPayload(buf []byte) (*syncPayload, error) {
 // Per table it (1) validates the peer-supplied table name and columns against
 // the local schema before building any dynamic SQL, (2) batch-prefetches the
 // existing rows' updated_at keyed by primary key, and (3) keeps the local row
-// when localWinsLWW says so, otherwise INSERT OR REPLACEs the incoming row.
-func (c *Client) mergeStatePayloadLWW(payload *syncPayload) {
-	c.mergeStatePayloadLWWWithAllowlist(payload, replicatedTableSet)
+// when localWinsLWW says so, otherwise applies the incoming row via a PK-aware UPSERT.
+func (c *Client) mergeStatePayloadLWW(payload *syncPayload) error {
+	return c.mergeStatePayloadLWWWithAllowlist(payload, replicatedTableSet)
 }
 
-func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowedTables map[string]bool) {
+// mergeStatePayloadLWWWithAllowlist merges every table in the dump. A per-table operational
+// failure is returned (after the remaining tables are still attempted, so one bad table
+// doesn't strand the rest), so the caller can surface it; the merge stays non-destructive and
+// the next cycle re-converges. Validation skips (unknown table, malformed columns) are not
+// errors.
+func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowedTables map[string]bool) error {
 	start := time.Now()
 	merged, skipped := 0, 0
+	var firstErr error
 	for _, table := range payload.Tables {
-		m, s := c.mergeTable(table, allowedTables)
+		m, s, err := c.mergeTable(table, allowedTables)
 		merged += m
 		skipped += s
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	c.observeMerge(time.Since(start), merged, skipped)
 	slog.Info("sync: merged remote state (LWW)", "tables", len(payload.Tables), "merged", merged, "skipped", skipped)
+	return firstErr
 }
 
 // mergeApplyChunkRows bounds how many rows a single merge transaction applies
@@ -468,6 +478,57 @@ var mergeApplyChunkRows = 1000
 // released). Nil in production.
 var mergeChunkHook func()
 
+// mergeChunkFailHook is a test-only seam: when set and it returns true, mergeChunk rolls the chunk
+// back after applying its rows but before commit. Nil in production.
+var mergeChunkFailHook func() bool
+
+// buildMergeUpsertSQL builds a PK-aware upsert that preserves receiver-only columns. It
+// inserts the supplied columns and, ON CONFLICT on the primary key, updates only the
+// supplied NON-PK columns (never the conflict key), so a column the sender omitted keeps
+// its local value rather than being reset by a whole-row replace. pkCols must be non-empty
+// (the caller keeps local for a PK-less table). When every supplied column is part of the
+// PK there is nothing to update, so it emits DO NOTHING.
+func buildMergeUpsertSQL(table string, columns, pkCols []string) string {
+	pkSet := lowerStringSet(pkCols)
+	sets := make([]string, 0, len(columns))
+	for _, c := range columns {
+		if pkSet[strings.ToLower(c)] {
+			continue // never reassign the conflict key
+		}
+		sets = append(sets, c+" = excluded."+c)
+	}
+	insert := "INSERT INTO " + table +
+		" (" + strings.Join(columns, ", ") + ") VALUES (" +
+		strings.Join(repeatPlaceholders(len(columns)), ", ") + ")"
+	conflict := " ON CONFLICT(" + strings.Join(pkCols, ", ") + ") "
+	if len(sets) == 0 {
+		return insert + conflict + "DO NOTHING"
+	}
+	return insert + conflict + "DO UPDATE SET " + strings.Join(sets, ", ")
+}
+
+// lowerStringSet returns a set of the lower-cased strings, for case-insensitive membership.
+func lowerStringSet(ss []string) map[string]bool {
+	m := make(map[string]bool, len(ss))
+	for _, s := range ss {
+		m[strings.ToLower(s)] = true
+	}
+	return m
+}
+
+// hasDuplicateColumnsFold reports whether cols contains a case-insensitively repeated name.
+func hasDuplicateColumnsFold(cols []string) bool {
+	seen := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		lc := strings.ToLower(c)
+		if seen[lc] {
+			return true
+		}
+		seen[lc] = true
+	}
+	return false
+}
+
 // mergeTable LWW-merges one dump table. It validates the peer-supplied
 // name/columns against the local schema once, then applies the rows in bounded
 // chunks (mergeChunk), each its own committed transaction.
@@ -478,20 +539,33 @@ var mergeChunkHook func()
 // of chunks applied. That is safe by design: LWW is per-row idempotent, so the
 // next anti-entropy cycle re-converges from wherever it stopped. The lock release
 // is the whole point — a slow merge no longer convoys other writers behind it.
-func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (merged, skipped int) {
+func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (merged, skipped int, err error) {
 	// Defense-in-depth: table.Name and table.Columns come from a peer and are
-	// interpolated into SQL. Only touch known tables/columns.
+	// interpolated into SQL. Only touch known tables/columns. These validation skips are
+	// keep-local decisions on a malformed/unknown peer dump, not operational errors, so they
+	// return a nil error (the merge stays non-destructive and the next cycle re-converges).
 	if !allowedTables[table.Name] {
 		slog.Warn("sync: skipping unknown table in dump", "table", table.Name)
-		return 0, 0
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "unknown_table")
+		return 0, len(table.Rows), nil
 	}
 	localCols, ok := c.readTableColumns(table.Name)
 	if !ok {
-		return 0, 0
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "unknown_table")
+		return 0, len(table.Rows), nil
 	}
 	if len(table.Columns) == 0 || !columnsKnown(table.Columns, localCols) {
 		slog.Warn("sync: skipping dump table with unexpected columns", "table", table.Name)
-		return 0, 0
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "unexpected_columns")
+		return 0, len(table.Rows), nil
+	}
+	// buildMergeUpsertSQL and the PK/value indexing assume a unique column list; a malformed
+	// dump with a repeated column name would produce duplicate INSERT/SET targets and
+	// misaligned indices. Reject it (keep local) rather than build inconsistent SQL.
+	if hasDuplicateColumnsFold(table.Columns) {
+		slog.Warn("sync: skipping dump table with duplicate column names", "table", table.Name)
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "duplicate_columns")
+		return 0, len(table.Rows), nil
 	}
 
 	pkCols := tablePrimaryKeys[table.Name]
@@ -501,26 +575,45 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 	// inserting PK-less rows. Normal dumps always carry every column.
 	if len(pkCols) > 0 && len(pkIdx) != len(pkCols) {
 		slog.Warn("sync: skipping dump table missing primary-key column(s)", "table", table.Name)
-		return 0, 0
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "missing_pk")
+		return 0, len(table.Rows), nil
+	}
+	// A PK-less replicated table cannot be merged non-destructively — with no key to
+	// upsert on, a whole-row replace would be the only option, and that erases any
+	// receiver-only column. Keep local and fail closed instead. No table in the
+	// replicated set lacks a PK today; this guards against one being added.
+	if len(pkCols) == 0 {
+		slog.Warn("sync: skipping dump table without a known primary key (keep local)", "table", table.Name)
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "no_pk")
+		return 0, len(table.Rows), nil
 	}
 	updatedAtIdx := indexOf(table.Columns, "updated_at")
-	if localCols["updated_at"] && len(pkCols) > 0 && updatedAtIdx < 0 {
+	if localCols["updated_at"] && updatedAtIdx < 0 {
 		slog.Warn("sync: skipping dump table missing updated_at column", "table", table.Name)
-		return 0, 0
+		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "missing_updated_at")
+		return 0, len(table.Rows), nil
 	}
 
-	insertSQL := "INSERT OR REPLACE INTO " + table.Name +
-		" (" + strings.Join(table.Columns, ", ") + ") VALUES (" +
-		strings.Join(repeatPlaceholders(len(table.Columns)), ", ") + ")"
+	// PK-aware upsert: insert the sender-supplied columns and, on a primary-key conflict,
+	// update ONLY those columns. A behind sender's dump omits columns it doesn't know
+	// about; those keep their local value instead of being reset to defaults/NULL by a
+	// whole-row INSERT OR REPLACE (the reported data-loss bug).
+	insertSQL := buildMergeUpsertSQL(table.Name, table.Columns, pkCols)
 
 	for start := 0; start < len(table.Rows); start += mergeApplyChunkRows {
 		end := start + mergeApplyChunkRows
 		if end > len(table.Rows) {
 			end = len(table.Rows)
 		}
-		m, s := c.mergeChunk(table, table.Rows[start:end], insertSQL, pkCols, pkIdx, updatedAtIdx)
+		m, s, chunkErr := c.mergeChunk(table, table.Rows[start:end], insertSQL, pkCols, pkIdx, updatedAtIdx)
 		merged += m
 		skipped += s
+		if chunkErr != nil {
+			// An operational / commit failure rolled back this chunk; stop and propagate so
+			// the caller surfaces it. Earlier chunks are already committed (per-row-idempotent
+			// LWW), so the next anti-entropy cycle re-converges from here.
+			return merged, skipped, chunkErr
+		}
 		// Test seam: fired at a chunk boundary with c.mu RELEASED. A write issued
 		// here proves the merge doesn't hold the lock across chunks (it would
 		// self-deadlock otherwise). Nil in production.
@@ -528,15 +621,15 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 			mergeChunkHook()
 		}
 	}
-	return merged, skipped
+	return merged, skipped, nil
 }
 
 // mergeChunk applies one bounded slice of a table's rows under a single
 // write-locked transaction: prefetch existing updated_at, LWW-compare, and
-// INSERT OR REPLACE the winners. Prefetch and inserts share the tx (held under
+// PK-aware UPSERT the winners (never a whole-row replace). Prefetch and inserts share the tx (held under
 // the lock), so the compare→insert decision is atomic within the chunk; the lock
 // is released on return so the next chunk doesn't monopolize it.
-func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL string, pkCols []string, pkIdx []int, updatedAtIdx int) (merged, skipped int) {
+func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL string, pkCols []string, pkIdx []int, updatedAtIdx int) (merged, skipped int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -547,25 +640,52 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	// includes the column, so this never blocks real convergence.
 	if table.Name == "runtime_action_proofs" && indexOf(table.Columns, "status") < 0 {
 		slog.Warn("sync: runtime_action_proofs dump missing status column; refusing chunk (fail-closed)", "table", table.Name)
-		return 0, len(rows)
+		return 0, len(rows), nil
 	}
 
 	tx, err := c.db.Begin()
 	if err != nil {
 		slog.Error("sync: begin tx", "table", table.Name, "error", err)
-		return 0, 0
+		return 0, 0, fmt.Errorf("begin merge tx for %s: %w", table.Name, err)
 	}
+	// Identity tracker/orphan side effects are deferred to run only after this chunk COMMITS; a
+	// rollback (a later row or the commit itself failing) drops them via this deferred cleanup.
+	defer c.dropDeferredEffects(tx)
 
 	// Batch-prefetch existing updated_at by PK so LWW needs no per-row SELECT.
 	var existing map[string]string
 	if updatedAtIdx >= 0 && len(pkCols) > 0 {
-		existing = c.prefetchUpdatedAt(tx, table.Name, pkCols, rows, pkIdx)
+		var perr error
+		existing, perr = c.prefetchUpdatedAt(tx, table.Name, pkCols, rows, pkIdx)
+		if perr != nil {
+			_ = tx.Rollback()
+			return 0, 0, perr
+		}
 	}
 
 	// Read the skew-guard state once per chunk (cheap latch read; constant for the
 	// batch) so a clock-corrupted peer's future-dated rows can be quarantined below.
 	skewGuardOn := c.hlcSkewGuardOn()
 	skewNow := time.Now()
+
+	// Natural-key identity resolution (canonical_identity_v1): resolve the identity tables by
+	// their UNIQUE natural key, not the minted random id. Column offsets computed once. If the
+	// capability is on but the dump omits an identity column, refuse the chunk (fail closed) —
+	// a well-formed peer always carries them.
+	identityOn := c.canonicalIdentityOn() && hasIdentityKey(table.Name)
+	var identityIDIdx, identityParentIdx int = -1, -1
+	var identityNatIdx []int
+	if identityOn {
+		identityIDIdx = indexOf(table.Columns, "id")
+		identityNatIdx = columnIndexes(table.Columns, tableIdentityKeys[table.Name])
+		if refs := identityReferenceColumns[table.Name]; len(refs) > 0 {
+			identityParentIdx = indexOf(table.Columns, refs[0])
+		}
+		if identityIDIdx < 0 || len(identityNatIdx) != len(tableIdentityKeys[table.Name]) || updatedAtIdx < 0 {
+			_ = tx.Rollback()
+			return 0, len(rows), fmt.Errorf("identity table %s dump missing id/natural-key/updated_at columns", table.Name)
+		}
+	}
 
 	for _, row := range rows {
 		// A peer dump whose row doesn't match the declared column count is
@@ -582,14 +702,41 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// copy resurrecting a spent proof. Handled entirely here (bypasses lwwOrder /
 		// resolveTie).
 		if mergeFn := customMergeTables[table.Name]; mergeFn != nil {
-			if mergeFn(c, tx, table, row, pkCols, pkIdx, updatedAtIdx) {
+			keepLocal, mErr := mergeFn(c, tx, table, row, pkCols, pkIdx, updatedAtIdx)
+			if mErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, mErr
+			}
+			if keepLocal {
 				skipped++
 				continue
 			}
-			if _, err := tx.Exec(insertSQL, row...); err != nil {
-				slog.Warn("sync: merge row", "table", table.Name, "error", err)
+			rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+			if execErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, execErr
+			}
+			if rejected {
+				skipped++
 			} else {
 				merged++
+			}
+			continue
+		}
+		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
+		// natural key (deterministic winner over the group), not the minted random id, so two
+		// nodes that independently created different ids for one logical object converge
+		// instead of colliding on the secondary UNIQUE. Bypasses the id-keyed LWW below.
+		if identityOn {
+			landed, idErr := c.mergeIdentityRow(tx, table, row, insertSQL, identityIDIdx, updatedAtIdx, identityNatIdx, identityParentIdx, skewGuardOn, skewNow)
+			if idErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, idErr
+			}
+			if landed {
+				merged++
+			} else {
+				skipped++
 			}
 			continue
 		}
@@ -607,7 +754,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				}
 				if c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow) {
 					slog.Warn("sync: quarantined future-skewed incoming row (not applied)",
-						"table", table.Name, "incoming_updated_at", incomingTS, "first_seen", localTS == "")
+						"table", table.Name, "reason", "future_skew", "first_seen", localTS == "")
 					skipped++
 					continue
 				}
@@ -625,13 +772,22 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 					case ord == 0:
 						// Exact tie → table-aware resolver over the local row
 						// (aligned to the incoming dump's declared columns).
-						localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+						localRow, found, fErr := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+						if fErr != nil {
+							_ = tx.Rollback()
+							return merged, skipped, fErr
+						}
 						if found {
-							keepLocal, unresolved := c.resolveTie(table.Name, table.Columns, localRow, row, pkIdx, pathAE)
+							keepLocal, unresolved, effect := c.resolveTie(table.Name, table.Columns, localRow, row, pkIdx, pathAE)
+							// Schedule the tracker/metric consequence for AFTER the chunk commits
+							// (a later row's failure rolls the chunk back). A resolved tie also drops
+							// any stale marker — deferred for the same reason.
+							if effect != nil {
+								c.deferAfterCommit(tx, effect)
+							}
 							if !unresolved {
-								// Converged (either direction) → drop any stale
-								// unresolved/reconciled state for this PK.
-								c.clearUnresolved(table.Name, pkKeyAt(row, pkIdx))
+								pk := pkKeyAt(row, pkIdx)
+								c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
 							}
 							if keepLocal {
 								skipped++
@@ -644,35 +800,213 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				}
 			}
 		}
-		if _, err := tx.Exec(insertSQL, row...); err != nil {
-			slog.Warn("sync: merge row", "table", table.Name, "error", err)
-		} else {
-			merged++
-			// Applying a strictly-newer or resolver-chosen incoming row replaces
-			// the local value, so any unresolved tie tracked for this PK is now
-			// stale (this IS the repair path — e.g. repair-owner re-stamping with
-			// a fresh timestamp propagates here). Lock-free when nothing tracked.
-			if c.anyUnresolved() {
-				c.clearUnresolved(table.Name, pkKeyAt(row, pkIdx))
-			}
+		rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+		if execErr != nil {
+			_ = tx.Rollback()
+			return merged, skipped, execErr
+		}
+		if rejected {
+			skipped++
+			continue
+		}
+		merged++
+		// Applying a strictly-newer or resolver-chosen incoming row replaces
+		// the local value, so any unresolved tie tracked for this PK is now
+		// stale (this IS the repair path — e.g. repair-owner re-stamping with
+		// a fresh timestamp propagates here). Deferred to commit so a later row's
+		// failure can't clear a marker for a change that rolled back. Lock-free
+		// when nothing tracked.
+		if c.anyUnresolved() {
+			pk := pkKeyAt(row, pkIdx)
+			c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
 		}
 	}
 
+	// Test seam: force a chunk rollback AFTER the rows applied but BEFORE commit, so tests can prove a
+	// rolled-back chunk drops its deferred tracker/clear effects (the marker is not mutated for a
+	// change that never committed). Nil in production.
+	if mergeChunkFailHook != nil && mergeChunkFailHook() {
+		_ = tx.Rollback()
+		return 0, len(rows), fmt.Errorf("mergeChunkFailHook: forced rollback")
+	}
 	if err := tx.Commit(); err != nil {
 		slog.Error("sync: commit", "table", table.Name, "error", err)
-		return 0, skipped // commit failed → nothing in this chunk landed
+		return 0, skipped, fmt.Errorf("commit merge chunk for %s: %w", table.Name, err)
 	}
-	return merged, skipped
+	c.runDeferredEffects(tx) // the chunk committed → apply the deferred tracker/orphan effects
+	return merged, skipped, nil
+}
+
+// mergeIdentityRow merges one incoming dump row of an identity table by its NATURAL key. It finds
+// the local row that shares the natural key (whatever its id) and resolves via resolveIdentity:
+// keep local, plain LWW upsert (same id), a column-preserving collapse (different id, incoming
+// wins), or — on an exact-instant tie with DIFFERENT content — an unresolved identity fault that
+// keeps local and remains divergent. A collapse re-keys the local row INTO the winning id in a
+// single atomic UPDATE (identityCollapseUpdate), so receiver-only columns are preserved and the
+// row is never left absent. It fails closed on a non-null incoming reference OR an existing child
+// referencing the losing id, and on an incoming id already bound to a different natural key. Honours
+// the skew quarantine. Returns landed=true when the row was applied/changed. All within the tx.
+func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}, insertSQL string, idIdx, updatedAtIdx int, natIdx []int, parentIdx int, skewGuardOn bool, skewNow time.Time) (landed bool, err error) {
+	incomingID := coerceString(row[idIdx])
+	incomingTS, _ := row[updatedAtIdx].(string)
+
+	// The self-reference class (snapshots.parent_id) is provably unused: a non-null value would
+	// need reference rewrite on collapse, which we don't do — fail closed rather than orphan.
+	if parentIdx >= 0 && cellNonEmpty(row[parentIdx]) {
+		return false, fmt.Errorf("identity table %s: non-null reference under canonical_identity_v1 is unsupported", table.Name)
+	}
+
+	natCols := tableIdentityKeys[table.Name]
+	incomingNat := make([]interface{}, len(natIdx))
+	for i, j := range natIdx {
+		incomingNat[i] = row[j]
+	}
+	// Fail closed if the incoming id is already bound to a DIFFERENT natural key locally —
+	// applying/collapsing would re-key an unrelated logical row.
+	if foreign, fErr := identityIDForeignNaturalKey(tx, table.Name, natCols, incomingID, incomingNat); fErr != nil {
+		return false, fErr
+	} else if foreign {
+		return false, fmt.Errorf("identity table %s: incoming id already bound to a different natural key (corruption)", table.Name)
+	}
+
+	// Local row for this natural key (any id).
+	where := make([]string, len(natCols))
+	args := make([]interface{}, len(natCols))
+	for i, col := range natCols {
+		where[i] = col + " = ?"
+		args[i] = incomingNat[i]
+	}
+	var localID, localUpdatedAt sql.NullString
+	selErr := tx.QueryRow("SELECT id, updated_at FROM "+table.Name+" WHERE "+strings.Join(where, " AND "), args...).Scan(&localID, &localUpdatedAt)
+	if selErr != nil && !errors.Is(selErr, sql.ErrNoRows) {
+		return false, fmt.Errorf("identity lookup on %s: %w", table.Name, selErr)
+	}
+	localExists := selErr == nil
+	localTS := ""
+	if localExists && localUpdatedAt.Valid {
+		localTS = localUpdatedAt.String
+	}
+
+	// Future-skew quarantine (same as the LWW path): a skewed incoming clock must not poison
+	// even a first-seen natural key.
+	if incomingTS != "" && c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow) {
+		slog.Warn("sync: quarantined future-skewed identity row (not applied)", "table", table.Name, "reason", "future_skew", "first_seen", !localExists)
+		return false, nil
+	}
+
+	// On an exact-instant tie the content must be proven equivalent over the FULL local schema
+	// (not just the sender's projection) before an id-based collapse — else keep local as a fault.
+	// The closure captures the full local row so a fault can be tracked by natural key below.
+	var localFullCols []string
+	var localFullVals []interface{}
+	contentEqual := func() (bool, error) {
+		fullCols, fullVals, found, fErr := fetchFullRowByID(tx, table.Name, localID.String)
+		if fErr != nil {
+			return false, fErr
+		}
+		if !found {
+			return false, nil
+		}
+		localFullCols, localFullVals = fullCols, fullVals
+		return identityContentEquivalent(fullCols, fullVals, table.Columns, row), nil
+	}
+	disp, dErr := resolveIdentity(localExists, localTS, localID.String, incomingTS, incomingID, contentEqual)
+	if dErr != nil {
+		return false, dErr
+	}
+	// Tracker mutations + orphan alerts are DEFERRED to run only after the chunk commits (a later
+	// row / the commit failing must not leave a cleared tracker or a false orphan alert).
+	switch disp {
+	case idContentFault:
+		slog.Warn("sync: unresolved identity fault (equal timestamp, unproven-equivalent content) — keeping local", "table", table.Name)
+		cols, vals := localFullCols, localFullVals
+		c.deferAfterCommit(tx, func() { c.trackIdentityFault(table.Name, incomingNat, cols, vals, pathAE) })
+		return false, nil
+	case idKeepLocal:
+		// An older / different-id incoming does NOT resolve a standing fault (the conflicting peer
+		// row still exists), so keep-local never clears the tracked fault.
+		return false, nil
+	case idAlreadyConverged:
+		// Same id, complete-content equivalence: the group has converged → clear any prior fault.
+		c.deferAfterCommit(tx, func() { c.clearIdentityFault(table.Name, incomingNat) })
+		return false, nil
+	case idApplyNew, idAdoptSameID:
+		rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+		if execErr != nil {
+			return false, execErr
+		}
+		if !rejected {
+			c.deferAfterCommit(tx, func() { c.clearIdentityFault(table.Name, incomingNat) })
+		}
+		return !rejected, nil
+	default: // idCollapse
+		// A collapse re-keys the losing id; an existing child referencing it would be orphaned
+		// (we do not rewrite references) → fail closed.
+		if orphan, rErr := identityHasChildReference(tx, table.Name, localID.String); rErr != nil {
+			return false, rErr
+		} else if orphan {
+			return false, fmt.Errorf("identity collapse on %s would orphan a reference to the losing id", table.Name)
+		}
+		// Capture the losing row's (host, artifact-path) BEFORE the re-key overwrites them; a
+		// lookup error fails closed (rolls back the chunk) rather than silently dropping cleanup.
+		losingHost, losingPath, haveArtifact, aErr := identityArtifact(tx, table.Name, localID.String)
+		if aErr != nil {
+			return false, aErr
+		}
+		rejected, cErr := identityCollapseUpdate(tx, table.Name, table.Columns, row, localID.String)
+		if cErr != nil {
+			return false, cErr
+		}
+		if rejected {
+			c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "identity_collapse_rejected")
+			return false, nil // do NOT clear the fault on a rejected collapse
+		}
+		// Re-read the ACTUAL surviving row's (host, path) AFTER the column-preserving re-key: when
+		// the sender omitted the path column it was PRESERVED (still referenced), so comparing the
+		// incoming projection would falsely flag a live artifact as orphaned.
+		winnerHost, winnerPath, winnerFound, wErr := identityArtifact(tx, table.Name, incomingID)
+		if wErr != nil {
+			return false, wErr
+		}
+		c.deferAfterCommit(tx, func() {
+			c.clearIdentityFault(table.Name, incomingNat) // converged → clear only on success
+			if haveArtifact && winnerFound {
+				c.surfaceIdentityCollapseOrphan(table.Name, localID.String, losingHost, losingPath, incomingID, winnerHost, winnerPath)
+			}
+		})
+		return true, nil
+	}
+}
+
+// applyMergeRow executes one winning row's upsert in an anti-entropy merge, classifying any
+// error so the caller can fail closed. A deterministic constraint violation (e.g. a
+// secondary-UNIQUE collision) is NON-fatal — the incoming row is kept local (rejected=true)
+// and the sender still holds it for the next cycle. An operational or unrecognized failure is
+// returned so the caller rolls back the whole chunk and propagates it, rather than committing
+// a partial chunk and silently dropping the error.
+func (c *Client) applyMergeRow(tx *sql.Tx, insertSQL string, row []interface{}, table string) (rejected bool, err error) {
+	if _, execErr := tx.Exec(insertSQL, row...); execErr != nil {
+		if class, kind := classifySQLiteError(execErr); class == classConstraint {
+			slog.Warn("sync: merge row rejected by constraint (keeping local)", "table", table, "error", execErr)
+			c.observeMergeRejected(boundedTableLabel(table), "ae", string(kind)) // unique / not_null / check / foreign_key / constraint
+			return true, nil
+		}
+		return false, fmt.Errorf("merge row into %s: %w", table, execErr)
+	}
+	return false, nil
 }
 
 // proofMergeKeepLocalRow is the anti-entropy monotone decision for a
 // runtime_action_proofs row: fetch the local row's status + updated_at (aligned
 // to the incoming dump columns) and compare via proofMergeKeepLocal. No local row
 // → apply the incoming (false).
-func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool {
-	localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) (bool, error) {
+	localRow, found, fErr := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if fErr != nil {
+		return false, fErr
+	}
 	if !found {
-		return false
+		return false, nil
 	}
 	statusIdx, stepIdx := -1, -1
 	for i, col := range table.Columns {
@@ -692,7 +1026,7 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 		// well-formed later dump; a well-formed peer never omits the column, so this never
 		// stalls real convergence.
 		slog.Warn("sync: runtime_action_proofs dump missing status column; keeping local (fail-closed)")
-		return true
+		return true, nil
 	}
 	localTS, _ := localRow[updatedAtIdx].(string)
 	incomingTS, _ := row[updatedAtIdx].(string)
@@ -704,7 +1038,7 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	// never silently diverge.
 	if proofRank(localStatus) == 2 && proofRank(incomingStatus) == 2 && localStatus != incomingStatus {
 		c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "runtime_owned")
-		return true
+		return true, nil
 	}
 
 	keepLocal := proofMergeKeepLocal(localStatus, localTS, incomingStatus, incomingTS)
@@ -721,19 +1055,25 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 		} else if union != ls {
 			// Local row stays, but incoming recorded a checkpoint local lacks →
 			// fold it into the local row so a later resume still sees it. No-op when
-			// local is already a superset (the common case, single-executor proofs).
-			c.updateProofStepState(tx, table.Name, pkCols, pkIdx, row, union)
+			// local is already a superset (the common case, single-executor proofs). A DB
+			// failure here must fail closed (rollback + retry), not commit the merge without
+			// the observed checkpoint.
+			if err := c.updateProofStepState(tx, table.Name, pkCols, pkIdx, row, union); err != nil {
+				return false, err
+			}
 		}
 	}
-	return keepLocal
+	return keepLocal, nil
 }
 
 // updateProofStepState folds a unioned step_state back into the surviving local row
 // (used when local wins the merge but the incoming copy carried an extra checkpoint).
-// Local-only, on the merge tx — symmetric with the incoming-row apply path.
-func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []string, pkIdx []int, incomingRow []interface{}, union string) {
+// Local-only, on the merge tx — symmetric with the incoming-row apply path. A tx.Exec failure is
+// RETURNED so the caller rolls back the merge rather than committing without the observed
+// checkpoint (which could lose a checkpoint another node has seen).
+func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []string, pkIdx []int, incomingRow []interface{}, union string) error {
 	if len(pkCols) == 0 {
-		return
+		return nil
 	}
 	where := make([]string, len(pkCols))
 	args := make([]interface{}, 0, len(pkCols)+1)
@@ -746,8 +1086,9 @@ func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []str
 	}
 	q := "UPDATE " + tableName + " SET step_state = ? WHERE " + strings.Join(where, " AND ")
 	if _, err := tx.Exec(q, args...); err != nil {
-		slog.Warn("sync: fold step_state union into local proof", "table", tableName, "error", err)
+		return fmt.Errorf("fold step_state union into local proof on %s: %w", tableName, err)
 	}
+	return nil
 }
 
 // immutableMergeKeepLocalRow is the anti-entropy merge for the v41 append-only /
@@ -763,22 +1104,25 @@ func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []str
 //     minted one operation id with different request hashes, or two executors recorded
 //     different facts for one step key): keep local AND flag it unresolved. NEVER
 //     coin-flip an immutable row.
-func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) bool {
-	localRow, found := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) (bool, error) {
+	localRow, found, fErr := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if fErr != nil {
+		return false, fErr
+	}
 	if !found {
-		return false
+		return false, nil
 	}
 	delIdx := indexOf(table.Columns, "deleted_at")
 	localDeleted := delIdx >= 0 && cellNonEmpty(localRow[delIdx])
 	incomingDeleted := delIdx >= 0 && cellNonEmpty(row[delIdx])
 	if localDeleted != incomingDeleted {
-		return localDeleted // tombstone dominates: keep whichever side is tombstoned
+		return localDeleted, nil // tombstone dominates: keep whichever side is tombstoned
 	}
 	if immutableFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
-		return true // idempotent re-delivery
+		return true, nil // idempotent re-delivery
 	}
 	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "immutable_conflict")
-	return true
+	return true, nil
 }
 
 // immutableFactsEqual reports whether two rows agree on every column except
@@ -859,7 +1203,12 @@ var mergePrefetchMaxParams = 900
 // prefetchUpdatedAt batch-loads the existing updated_at for the dump's rows,
 // keyed by canonical PK, using row-value IN queries chunked under SQLite's
 // bind-variable limit (composite PKs spend len(pkCols) params per tuple).
-func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, rows [][]interface{}, pkIdx []int) map[string]string {
+// prefetchUpdatedAt batch-reads the local updated_at for the dump's PK tuples. It fails
+// CLOSED: any query/scan/iteration error is returned so the caller rolls back and
+// back-pressures — a swallowed read would leave the PK ABSENT from the map, and an absent
+// entry is treated as "no local row", letting an incoming row bypass LWW and overwrite newer
+// local state.
+func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, rows [][]interface{}, pkIdx []int) (map[string]string, error) {
 	out := make(map[string]string)
 
 	// Collect distinct PK tuples present in the dump.
@@ -888,7 +1237,7 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 		tuples = append(tuples, vals)
 	}
 	if len(tuples) == 0 {
-		return out
+		return out, nil
 	}
 
 	chunkSize := mergePrefetchMaxParams / len(pkCols)
@@ -915,8 +1264,7 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 			" WHERE " + pkColList + " IN (" + strings.Join(valueList, ", ") + ")"
 		rs, err := tx.Query(q, args...)
 		if err != nil {
-			slog.Warn("sync: prefetch updated_at", "table", table, "error", err)
-			continue
+			return nil, fmt.Errorf("prefetch updated_at for %s: %w", table, err)
 		}
 		for rs.Next() {
 			cells := make([]interface{}, len(pkCols)+1)
@@ -925,13 +1273,18 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 				ptrs[i] = &cells[i]
 			}
 			if err := rs.Scan(ptrs...); err != nil {
-				continue
+				rs.Close()
+				return nil, fmt.Errorf("scan prefetch updated_at for %s: %w", table, err)
 			}
 			out[pkKey(cells[:len(pkCols)])] = coerceString(cells[len(pkCols)])
 		}
+		if err := rs.Err(); err != nil {
+			rs.Close()
+			return nil, fmt.Errorf("iterate prefetch updated_at for %s: %w", table, err)
+		}
 		rs.Close()
 	}
-	return out
+	return out, nil
 }
 
 // fetchLocalRowCells reads the local row for one incoming dump row's PK, scanned
@@ -940,10 +1293,12 @@ func (c *Client) prefetchUpdatedAt(tx *sql.Tx, table string, pkCols []string, ro
 // []byte → text). Without that normalization the resolver would compare a local
 // int64 against an incoming float64 of the same value and see a false difference
 // (the PR #67 read-path artifact). Only called on an exact timestamp tie, so the
-// per-row SELECT is rare. ok=false means no local row (resolver takes incoming).
-func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkIdx []int, incomingRow []interface{}) ([]interface{}, bool) {
+// per-row SELECT is rare. It fails CLOSED: only sql.ErrNoRows means "no local row" (found=false,
+// nil error); any other error is operational and is returned so the caller rolls back — a
+// swallowed read must not be mistaken for absence and let the resolver take the incoming row.
+func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkIdx []int, incomingRow []interface{}) ([]interface{}, bool, error) {
 	if len(pkCols) == 0 || len(cols) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	where := make([]string, len(pkCols))
 	args := make([]interface{}, len(pkCols))
@@ -960,7 +1315,10 @@ func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkI
 		ptrs[i] = &raw[i]
 	}
 	if err := tx.QueryRow(q, args...).Scan(ptrs...); err != nil {
-		return nil, false
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("fetch local row for %s: %w", tableName, err)
 	}
 	// Mirror dumpTable: []byte → string, then JSON round-trip so the value kinds
 	// match the post-transit incoming row exactly.
@@ -969,7 +1327,109 @@ func fetchLocalRowCells(tx *sql.Tx, tableName string, cols, pkCols []string, pkI
 			raw[i] = string(b)
 		}
 	}
-	return jsonRoundTripCells(raw), true
+	return jsonRoundTripCells(raw), true, nil
+}
+
+// fetchFullRowByID reads the ENTIRE local-schema row for the given id (SELECT *), JSON-round-
+// tripped so its value kinds match a post-transit dump row. It returns the receiver's full column
+// list so a tie-equivalence check can require a COMPLETE image (every non-id column compared).
+// Fails closed: only sql.ErrNoRows is found=false; any other error is returned.
+func fetchFullRowByID(tx *sql.Tx, tableName, idVal string) (cols []string, vals []interface{}, found bool, err error) {
+	rows, qErr := tx.Query("SELECT * FROM "+tableName+" WHERE id = ?", idVal)
+	if qErr != nil {
+		return nil, nil, false, fmt.Errorf("fetch full row for %s: %w", tableName, qErr)
+	}
+	defer rows.Close()
+	cols, cErr := rows.Columns()
+	if cErr != nil {
+		return nil, nil, false, fmt.Errorf("columns for %s: %w", tableName, cErr)
+	}
+	if !rows.Next() {
+		if rErr := rows.Err(); rErr != nil {
+			return nil, nil, false, fmt.Errorf("fetch full row for %s: %w", tableName, rErr)
+		}
+		return nil, nil, false, nil
+	}
+	raw := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range raw {
+		ptrs[i] = &raw[i]
+	}
+	if sErr := rows.Scan(ptrs...); sErr != nil {
+		return nil, nil, false, fmt.Errorf("scan full row for %s: %w", tableName, sErr)
+	}
+	for i, v := range raw {
+		if b, ok := v.([]byte); ok {
+			raw[i] = string(b)
+		}
+	}
+	return cols, jsonRoundTripCells(raw), true, nil
+}
+
+// trackIdentityFault records an exact-instant/unproven-equivalent identity fault under the
+// natural-key tracker so it feeds litevirt_lww_tie_unresolved_current / _total and dedupes per
+// logical identity (the physical-PK clear path can't cover it — the two rows have different ids).
+// The dedup pair is derived from the LOCAL full row alone, order-invariantly by column NAME
+// (encodeRowCellsV2): local is always the complete schema row, so the same logical fault dedupes
+// whether observed through a full AE dump or a subset/reordered WAL statement, and it re-alerts
+// only when the local row's content actually changes.
+func (c *Client) trackIdentityFault(table string, natVals []interface{}, localCols []string, localFull []interface{}, path resolveTiePath) {
+	pair := encodeRowCells(localFull) // positional fallback
+	if enc, err := encodeRowCellsV2(localCols, localFull); err == nil {
+		pair = enc
+	}
+	c.trackUnresolvedPair(table, identityFaultPK(natVals), pair, path, "identity_content_conflict")
+}
+
+// clearIdentityFault drops any tracked identity fault for this natural key — called on a resolved
+// disposition (a newer write or a convergent collapse) so a stale fault stops counting. Lock-free
+// when nothing is tracked.
+func (c *Client) clearIdentityFault(table string, natVals []interface{}) {
+	if !c.anyUnresolved() {
+		return
+	}
+	c.clearUnresolved(table, identityFaultPK(natVals))
+}
+
+// surfaceIdentityCollapseOrphan surfaces a collapse whose LOSING row referenced a DIFFERENT
+// physical artifact — a different (host, path) pair — than the winner, so the losing file may now
+// be unreferenced. It is NOT auto-deleted: the losing id/host/path is logged (WARN) and counted
+// (bounded per-table metric) for operator cleanup. Comparing the full (host, path) pair matters
+// because host_name is part of the container_snapshots natural key (so a collapse there is always
+// same-host — only a path change orphans a file), and a same-host snapshot collapse can still
+// overwrite vmstate_path. losing* are read BEFORE the re-key overwrote them.
+func (c *Client) surfaceIdentityCollapseOrphan(table, losingID, losingHost, losingPath, winnerID, winnerHost, winnerPath string) {
+	if losingHost == winnerHost && losingPath == winnerPath {
+		return // same physical artifact (re-keyed in place) → nothing orphaned
+	}
+	// A same-host path change orphans a file only if the losing row actually had one.
+	if losingHost == winnerHost && losingPath == "" {
+		return
+	}
+	c.observeIdentityCollapseOrphan(table)
+	slog.Warn("identity collapse orphaned a losing artifact (not auto-deleted; needs cleanup)",
+		"table", table, "losing_id", losingID, "losing_host", losingHost, "losing_path", losingPath,
+		"winner_id", winnerID, "winner_host", winnerHost, "winner_path", winnerPath)
+}
+
+// identityArtifact reads a row's (host, artifact-path) for orphan surfacing. It FAILS CLOSED: an
+// operational/schema error propagates (so the caller back-pressures / rolls back rather than
+// silently disabling the cleanup signal), and only sql.ErrNoRows is a benign found=false. A table
+// with no registered artifact columns returns found=false, nil (nothing to surface).
+func identityArtifact(tx *sql.Tx, table, id string) (host, path string, found bool, err error) {
+	art, ok := identityArtifactColumns[table]
+	if !ok {
+		return "", "", false, nil
+	}
+	var h, p sql.NullString
+	q := "SELECT " + art.host + ", COALESCE(" + art.path + ", '') FROM " + table + " WHERE id = ?"
+	if scanErr := tx.QueryRow(q, id).Scan(&h, &p); scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return "", "", false, nil
+		}
+		return "", "", false, fmt.Errorf("identity artifact lookup on %s: %w", table, scanErr)
+	}
+	return h.String, p.String, true, nil
 }
 
 // jsonRoundTripCells marshals then unmarshals a scanned row so its numeric/text

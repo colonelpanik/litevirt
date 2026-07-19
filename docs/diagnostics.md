@@ -151,6 +151,131 @@ Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to
 v1-only emission (peers then compare v1 against it). Because negotiation is by
 field presence, a mixed fleet is always safe — never a spurious v1-vs-v2 mismatch.
 
+### `canonical_identity` — natural-key identity resolution
+
+A few tables mint a **random-UUID primary key** but carry a **UNIQUE natural key**:
+`snapshots` (`vm_name`, `name`) and `container_snapshots` (`host_name`, `ct_name`,
+`name`). Two nodes can independently create the *same logical object* — the same
+snapshot name for the same VM — while each mints its **own** id. The replicated
+rows then collide on the secondary UNIQUE, and the fail-closed apply path
+**back-pressures** (keeps local, retries) rather than pick a winner, so the two ids
+persist and `lv doctor divergence` reports the natural-key group as diverging.
+
+With `enforcement.canonical_identity` enabled **and the `canonical_identity_v1`
+token latched cluster-wide**, an upgraded receiver resolves these tables by their
+**natural key**: it collapses each such pair to a single deterministic winner (newer
+`updated_at` wins; on an **exact-instant tie** the smaller id wins **only if the two
+rows' non-id content is provably equivalent** — a NULL is distinct from an empty
+string, and equivalence requires a **complete** local-schema image, so under schema
+skew an uncompared receiver-only column is treated as a fault, never assumed equal).
+The collapse **re-keys the surviving row in place** — a single column-preserving
+`UPDATE`, never a delete-then-insert — so receiver-only columns a newer-schema node
+holds are **not** erased when an older-schema winner arrives. Because identity
+resolution *mutates shared state* it is **not** negotiated pairwise like `digest_v2`,
+and — like `operation_protocol` — the token is advertised only while the flag is on,
+so the latch requires **config** uniformity: a partially-configured cluster stays
+non-destructive (nodes not yet opted in keep back-pressuring) and converges once
+every node has latched.
+
+**Fail-closed guards** (nothing is silently discarded): an exact-instant tie whose
+content is not provably equivalent is an **unresolved identity fault** — keep local,
+remain divergent, and track it in `litevirt_lww_tie_unresolved_current`
+(category `identity_content_conflict`, keyed by natural key) so it alerts. It clears
+only on genuine convergence — a successful collapse/apply, or observing the same-id,
+fully-equivalent converged row — never merely because a later observation was older.
+A collapse also fails closed if the incoming id already belongs to a **different**
+natural key locally (would destroy an unrelated row), or if an existing child
+references the losing id (`snapshots.parent_id`, unused today, would be orphaned since
+references are not rewritten). The tracker/alert side effects run only after the merge
+transaction commits, so a rollback can't leave a stale fault or a false alert.
+
+**Orphaned artifacts:** a collapse whose losing row referenced a **different physical
+artifact** — a different `(host, path)` pair — leaves the losing file unreferenced.
+The winner's pair is read back from the surviving row **after** the column-preserving
+re-key, so a path column the sender omitted (schema skew) is correctly seen as
+preserved-and-still-referenced, never falsely flagged. Orphaning covers a different
+host (the whole losing snapshot is stranded) **and** a same-host path change (e.g. a
+`vmstate_path`/`path` rewrite; because `host_name` is part of the `container_snapshots`
+natural key, its collapses are always same-host, so a path change is the only way one
+orphans a file). It is **not** auto-deleted — the losing id/host/path is logged (WARN,
+after commit) and counted in `litevirt_identity_collapse_orphaned_total` so an operator
+can reclaim the space.
+
+**Scanner lane:** while it is active fleet-wide, `lv doctor divergence` keys these
+tables by their natural key too, so a still-converging group shows as **one**
+content divergence instead of two phantom `missing_row`s; a converged group reads
+clean. The lane engages only when the scanning node has latched (uniform fleet).
+
+**Activation** mirrors `digest_v2`: ship the supporting binary everywhere (flag
+off, behavior-neutral), confirm every node is upgraded, then set
+`enforcement.canonical_identity: true` and rolling-restart. Existing divergent
+pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) — no
+separate data migration. Kill switch: set it `false` and restart (the node reverts
+to back-pressuring the collision, still non-destructive).
+
+### `canonical_registry` — registry-credential migration
+
+Registry logins mint a **new random `id` per login** and write via a tombstone+insert
+batch, so two nodes logging into the same registry concurrently produce two live rows that
+collide on the partial `UNIQUE(scope,owner,registry)`. The **canonical model** fixes this by
+deriving a **deterministic id** from `(scope,owner,registry)` — both nodes target the same
+primary key and a conflict resolves by normal LWW.
+
+**What ships today is preparatory infrastructure, not the fix.** The concurrent-login
+collision described above is **still open** — the writer is **not** switched. Every API
+write still uses the legacy random-id writer, so two concurrent logins still mint different
+ids; a replicated legacy batch can lose LWW on its by-triple tombstone and its INSERT then
+back-pressures fail-closed against the peer's live row (safe — no corruption — but it stalls
+that sender's stream to the peer until the conflicting state is remediated and the blocked
+entry successfully retries; a later WAL entry cannot supersede an ordered entry stuck ahead
+of it). This is unchanged from before the canonical work; the reversible core below does not
+resolve it.
+
+The one runtime behavior that ships is the **accept gate**: once `canonical_registry_v1` is
+**durably latched** cluster-wide, replicated **canonical** upserts are accepted on apply
+(before the latch they fail closed). The building blocks — the deterministic id, the
+canonical writer primitive (no production caller yet), the idempotent consolidation routine,
+and the `RegistryWriterReady` / `RegistryContractReady` readiness checks (computed
+on-demand, never cached) — are in place for the future operator transition, but nothing
+runs a background consolidation loop and nothing switches the writer.
+
+- **`enforcement.canonical_registry`** (config flag) gates only **advertisement** of the
+  token, so a fleet opts in and the latch forms with config uniformity. It is a reversible
+  opt-in *before* the token latches.
+- **Acceptance is permanent once latched.** The accept gate reads the *durably* latched
+  marker (in memory AND persisted), not the flag — so turning the flag off after latching does
+  **not** revoke acceptance (which would strand an in-flight canonical wire shape and stall
+  replication), and it survives a restart. Flag-off only stops **advertisement** (further
+  opt-in); it does not stop `ConsolidateRegistryCredentials`, which the future operator
+  transition can still call because it gates on the durable accept latch, not the flag.
+
+**Deferred: the writer-activation contract.** Switching writes to the canonical writer is a
+distributed-contract transition, done as ONE atomic operator-run operation: run
+consolidation while writes are quiesced; prove a durable replication-sequence **barrier**
+consumed by every admitted peer's watermark; prove registry-credential **convergence**;
+apply **node admission / reseed** rules for a node returning pre-barrier; **reject the legacy
+shape** after activation; and eventually the index contract (partial → non-partial
+`UNIQUE(scope,owner,registry)`). None of that is a config boolean — it is intentionally NOT
+shipped here, and readiness for it must be recomputed synchronously at that time, not read
+from a cached flag.
+
+**Operator runbook — a concurrent-login collision.** A rare race (the same
+`(scope, owner, registry)` credential written on two nodes within the replication window)
+leaves two different live credential ids for one triple. This is **fail-closed — no
+corruption, no silent pick** — but it does not auto-resolve.
+
+- **Detect:** `litevirt_merge_apply_rejected_total{table="registry_credentials",reason="unique"}`
+  climbs, and `lv doctor divergence` reports a **stable** `registry_credentials` divergence
+  (one triple, different live ids per node). The WAL stream between the two nodes may also
+  stall (rising `litevirt_replication_peer_pending_entries` for that peer) — the colliding
+  entry sits at the head of the stream and back-pressures the batch until it ages out at
+  `MaxLogRetention` (24h). Anti-entropy keeps every other table converged in the meantime.
+- **Remediate:** soft-delete (tombstone) the divergent live credential for that triple on the
+  affected node(s) — a single `deleted_at` write per node — then have the user re-establish the
+  login, which writes one fresh credential that converges. No data is lost; the credential is
+  simply re-created. (Equivalently, once the stalled entry prunes, a fresh login converges on
+  its own.) The permanent fix is the deferred writer-activation contract above.
+
 ### The sensitive lane
 
 `--include-sensitive` also scans secret-bearing tables (2FA factors, recovery
@@ -269,6 +394,17 @@ converge the row, so the two paths can never disagree.
   `split_brain`, `inconclusive`, `error`}. A `split_brain` is a workload running on
   two hosts at once → page; sustained `inconclusive` means a peer the repair needs
   is unreachable.
+- `litevirt_merge_apply_rejected_total{table,path,reason}` — **monotonic counter** of
+  replicated write ATTEMPTS the apply path refused (kept-local / back-pressured). `path` ∈
+  {`ae`, `wal`}; `reason` is a bounded class (never SQL text or parameters). Because it counts
+  *attempts*, a permanent fault re-increments every cycle — so alert on its **rate**, correlated
+  with replication backlog (`litevirt_replication_min_watermark_seq`) and `lv doctor
+  divergence`, **not** on its absolute value.
+- `litevirt_legacy_mutation_transformed_total{transformer}` — **monotonic counter** of prior-
+  release WAL statements this node NORMALIZED before applying (a supported historical shape, e.g.
+  a param-bound `crl_versions` rewrite). A brief rate during a rolling upgrade is expected; a
+  **continuing** rate means an old emitter is still writing or a relay is retaining pre-upgrade
+  WAL — investigate that peer/relay.
 
 ### Alerts
 
@@ -286,6 +422,9 @@ rate(litevirt_lww_tie_break_total[15m]) > 0
 rate(litevirt_lww_tombstone_tie_total[15m]) > 0   # lower severity
 # A workload running in two places at once — page immediately.
 increase(litevirt_runtime_owner_assert_total{result="split_brain"}[10m]) > 0
+# Replicated writes are being refused faster than they clear (a builder bug, a mixed-version
+# gap, or malformed input). Correlate with replication backlog + divergence, not the raw total.
+rate(litevirt_merge_apply_rejected_total[15m]) > 0
 ```
 
 The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the

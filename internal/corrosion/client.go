@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/memberlist"
 	_ "modernc.org/sqlite"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/hlc"
 )
 
@@ -28,6 +29,15 @@ type SyncMetrics interface {
 	ObserveDump(d time.Duration, bytes int)
 	ObserveDigest(d time.Duration)
 	ObserveMerge(d time.Duration, merged, skipped int)
+	// ObserveMergeRejected records a replicated row/statement the apply path rejected but did
+	// NOT apply — path ∈ {ae, wal}; reason ∈ {constraint, …}. Bounded labels only (never SQL
+	// or parameter values). Counts ATTEMPTS, so a permanent collision increments every cycle;
+	// alert on rate, not absolute value.
+	ObserveMergeRejected(table, path, reason string)
+	// ObserveLegacyTransformed records a prior-release statement the WAL apply path normalized
+	// through a bounded legacy transformer (transformer = the transformer id). A nonzero rate
+	// means a not-yet-upgraded peer is still emitting a legacy shape.
+	ObserveLegacyTransformed(transformer string)
 	// ObserveTieBreak records an exact-timestamp tie that a resolver converged:
 	// resolver ∈ {content_max, numeric_max, timestamp_max, non_null_wins,
 	// lb_generation}; winner ∈ {local, incoming}. (Tombstone ties go to
@@ -38,6 +48,11 @@ type SyncMetrics interface {
 	// {runtime_owned, opaque, tenancy, policy, control_plane, auth_factor,
 	// auth_pointer, lb_token}.
 	ObserveTieUnresolved(table, path, category string)
+	// ObserveIdentityCollapseOrphan records a natural-key identity collapse whose losing physical
+	// row referenced a DIFFERENT host/artifact than the winner, so that host's snapshot file may
+	// now be unreferenced. NOT auto-deleted — the losing id/host/path is logged (WARN) for
+	// operator cleanup; this metric (bounded, per-table) is the alert signal.
+	ObserveIdentityCollapseOrphan(table string)
 	// ObserveTombstoneTie records a tie a one-sided soft-delete settled. Tracked
 	// separately because it is a benign, expected outcome (a delete racing a
 	// write) — counting it in the tie-break series would muddy the "steady ties ⇒
@@ -139,6 +154,14 @@ type Client struct {
 	// entirely when nothing is tracked — the overwhelmingly common case.
 	unresolvedLen atomic.Int64
 
+	// txEffects holds side effects (tracker mutations, orphan alerts/metrics) that must run only
+	// AFTER a merge/apply transaction COMMITS — so a later row/statement or commit failure that
+	// rolls back the DB can't leave a cleared tracker or a false orphan alert behind. Keyed by the
+	// *sql.Tx pointer so concurrent apply transactions never mix effects; the batch/chunk driver
+	// runs (runDeferredEffects) or drops (dropDeferredEffects) its tx's effects. See deferAfterCommit.
+	txEffectsMu sync.Mutex
+	txEffects   map[*sql.Tx][]func()
+
 	// hlcSkewGuard, when non-nil and returning true, enables LWW skew quarantine:
 	// an incoming row whose updated_at is beyond hlc.MaxSkewMS into the
 	// future (relative to local wall clock) is NOT allowed to win a conflict —
@@ -168,6 +191,59 @@ type Client struct {
 	// so a node only emits v2 when locally enabled and comparison uses v2 only when both
 	// peers emitted it. Cheap in-memory read. Nil/false = v1-only emission (unchanged).
 	digestV2Enabled func() bool
+
+	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
+	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the
+	// minted random id. Gated on `enforcement.canonical_identity && CanonicalIdentityV1
+	// latched` (injected via SetCanonicalIdentity) — a CLUSTER latch, not pairwise, because
+	// identity resolution mutates shared state (a per-sender flip would be non-convergent).
+	// Nil/false = legacy behavior (a natural-key collision back-pressures). Read once per
+	// merge batch.
+	canonicalIdentity func() bool
+
+	// canonicalRegistryAccept, when non-nil and returning true, means canonical_registry_v1 is
+	// DURABLY LATCHED cluster-wide, so a replicated canonical registry-credential upsert
+	// (DispCanonicalRegistry) may be applied. This is the ONLY runtime effect of Part H2's
+	// preparatory infrastructure — the local writer is NEVER switched (see registry_creds.go). It
+	// reads the durable latch, NOT the reversible config flag: once latched, acceptance of an
+	// already-emitted canonical wire shape must never be revoked (turning the flag off would
+	// otherwise stall replication on an in-flight canonical entry). Nil/false ⇒ reject (pre-H2).
+	canonicalRegistryAccept func() bool
+}
+
+// SetCanonicalIdentity injects the predicate that enables natural-key identity resolution.
+// Wired at daemon start to `enforcement.canonical_identity && checker.Latched(CanonicalIdentityV1)`.
+// Nil-safe: an unset predicate keeps legacy behavior (a natural-key collision back-pressures).
+func (c *Client) SetCanonicalIdentity(fn func() bool) { c.canonicalIdentity = fn }
+
+// canonicalIdentityOn reports whether natural-key identity resolution is currently enforced.
+func (c *Client) canonicalIdentityOn() bool {
+	return c.canonicalIdentity != nil && c.canonicalIdentity()
+}
+
+// SetCanonicalRegistryAccept injects the predicate reporting canonical_registry_v1 DURABLY LATCHED
+// (wired to checker.Latched, NOT the reversible config flag — see the field comment). Nil-safe:
+// unset ⇒ reject the canonical shape.
+func (c *Client) SetCanonicalRegistryAccept(fn func() bool) { c.canonicalRegistryAccept = fn }
+
+// canonicalRegistryAcceptOn reports whether a replicated canonical registry upsert may be applied.
+func (c *Client) canonicalRegistryAcceptOn() bool {
+	return c.canonicalRegistryAccept != nil && c.canonicalRegistryAccept()
+}
+
+// capabilityActive reports whether a ledger-named capability (RequiresCapability) is active on THIS
+// receiver, so the apply path can resolve a capability-gated shape's effective disposition.
+// canonical_registry_v1 = the durable accept gate (apply a replicated canonical upsert). An unknown
+// capability returns false (fail closed — a gated shape stays rejected).
+func (c *Client) capabilityActive(name string) bool {
+	switch name {
+	case capabilities.CanonicalRegistryV1:
+		return c.canonicalRegistryAcceptOn()
+	case capabilities.CanonicalIdentityV1:
+		return c.canonicalIdentityOn()
+	default:
+		return false
+	}
 }
 
 // SetHLCEmit injects the predicate that switches NowTS to HLC conflict keys. Wired at
@@ -220,6 +296,24 @@ func (c *Client) observeDigest(d time.Duration) {
 func (c *Client) observeMerge(d time.Duration, merged, skipped int) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveMerge(d, merged, skipped)
+	}
+}
+
+func (c *Client) observeMergeRejected(table, path, reason string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveMergeRejected(table, path, reason)
+	}
+}
+
+func (c *Client) observeLegacyTransformed(transformer string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveLegacyTransformed(transformer)
+	}
+}
+
+func (c *Client) observeIdentityCollapseOrphan(table string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveIdentityCollapseOrphan(table)
 	}
 }
 
@@ -720,7 +814,7 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 
 	if c.anyUnresolved() {
 		for _, s := range mutated {
-			c.clearUnresolvedFromStmt(s)
+			c.clearUnresolvedFromLocalStmt(s)
 		}
 	}
 	c.notifyReplicator()
@@ -785,7 +879,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// when nothing is tracked.
 	if c.anyUnresolved() {
 		for _, s := range mutated {
-			c.clearUnresolvedFromStmt(s)
+			c.clearUnresolvedFromLocalStmt(s)
 		}
 	}
 

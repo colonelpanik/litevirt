@@ -419,6 +419,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// v2 only when locally enabled; two peers compare v2 only when both emitted it), so a
 	// non-uniform rollout only affects which node initiates a pull, never a decision.
 	d.db.SetDigestV2Enabled(func() bool { return d.cfg.Enforcement.DigestV2 })
+	// Resolve the natural-key identity tables (snapshots, container_snapshots) by their UNIQUE
+	// natural key once enforcement.canonical_identity is set AND the token has latched
+	// cluster-wide. Unlike digest_v2 this is NOT pairwise-negotiated — identity resolution
+	// mutates shared state, so a per-sender flip would be non-convergent; it must be
+	// fleet-uniform, which the cluster-wide latch guarantees. Cheap Latched read (no peer dial)
+	// on the merge/apply hot path; the config flag is the reversible kill switch.
+	d.db.SetCanonicalIdentity(func() bool {
+		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
+	})
+	// Part H2 (preparatory infrastructure): accept a replicated canonical registry upsert once
+	// canonical_registry_v1 is DURABLY LATCHED (in memory AND persisted to its marker). Gating on the
+	// DURABLE latch — not Latched or the config flag — is what makes acceptance survive a restart: a
+	// node that latched only in memory would, after a reboot that reloads no marker, revert to
+	// rejecting an already-in-flight canonical entry and stall replication. The flag only gates
+	// ADVERTISEMENT (opt-in to drive the latch); no writer switch, no consolidation controller.
+	d.db.SetCanonicalRegistryAccept(func() bool {
+		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
+	})
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
@@ -604,6 +622,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	)
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
+	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())

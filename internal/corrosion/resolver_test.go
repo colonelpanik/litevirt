@@ -8,6 +8,17 @@ import (
 	"testing"
 )
 
+// resolveTieApply calls resolveTie and applies its returned effect immediately — for unit tests that
+// assert the tracker/metric side effect synchronously, without a transaction. Production callers
+// instead schedule the effect via deferAfterCommit so it runs only after commit.
+func resolveTieApply(c *Client, table string, cols []string, local, incoming []interface{}, pkIdx []int, path resolveTiePath) (keepLocal, unresolved bool) {
+	kl, ur, eff := c.resolveTie(table, cols, local, incoming, pkIdx, path)
+	if eff != nil {
+		eff()
+	}
+	return kl, ur
+}
+
 // ───────────────────────── coverage / invariants ─────────────────────────
 
 // TestCapabilityMap_Bijection: the capability map covers EXACTLY the AE-repaired
@@ -79,7 +90,7 @@ func TestResolver_EveryChainTerminates(t *testing.T) {
 		c.SetSyncMetrics(sm)
 		local := []interface{}{"A", "T"}
 		incoming := []interface{}{"B", "T"}
-		c.resolveTie(table, cols, local, incoming, pkIdx, pathAE)
+		resolveTieApply(c, table, cols, local, incoming, pkIdx, pathAE)
 		decided := len(sm.tieBreaks) == 1 || (len(sm.tieUnresolved) == 1 && c.UnresolvedTieCount() == 1)
 		if !decided {
 			t.Errorf("table %q chain did not terminate (breaks=%v unresolved=%v) — last rule must be content_max or unresolved",
@@ -115,7 +126,7 @@ func resolve(t *testing.T, table string, cols []string, local, incoming []interf
 	c := testClient(t)
 	sm := &fakeSyncMetrics{}
 	c.SetSyncMetrics(sm)
-	keepLocal, unresolved := c.resolveTie(table, cols, local, incoming, []int{0}, pathAE)
+	keepLocal, unresolved := resolveTieApply(c, table, cols, local, incoming, []int{0}, pathAE)
 	return c, sm, keepLocal, unresolved
 }
 
@@ -261,7 +272,7 @@ func TestUnresolvedTracker_DistinctOnce(t *testing.T) {
 
 	// Same divergence observed repeatedly → counted once.
 	for i := 0; i < 5; i++ {
-		c.resolveTie("vms", cols, a, b, []int{0}, pathAE)
+		resolveTieApply(c, "vms", cols, a, b, []int{0}, pathAE)
 	}
 	if c.UnresolvedTieCount() != 1 || len(sm.tieUnresolved) != 1 {
 		t.Fatalf("re-observing the same divergence must count once, got count=%d metric=%d", c.UnresolvedTieCount(), len(sm.tieUnresolved))
@@ -273,7 +284,7 @@ func TestUnresolvedTracker_DistinctOnce(t *testing.T) {
 	// The content changes (a real new write) → re-evaluated, counted again (the
 	// monotonic counter), but it's the SAME row so the current gauge stays 1.
 	b2 := []interface{}{"db1", "node-4", "T"}
-	c.resolveTie("vms", cols, a, b2, []int{0}, pathAE)
+	resolveTieApply(c, "vms", cols, a, b2, []int{0}, pathAE)
 	if len(sm.tieUnresolved) != 2 {
 		t.Fatalf("a changed divergence must re-count, got metric=%d", len(sm.tieUnresolved))
 	}
@@ -337,7 +348,7 @@ func TestLocalWriteClearsUnresolved(t *testing.T) {
 	}
 	// Track an unresolved tie for vm1 via the real resolver path (pkKey-formatted key).
 	cols := []string{"name", "host_name", "updated_at"}
-	c.resolveTie("vms", cols, []interface{}{"vm1", "host-a", "T"}, []interface{}{"vm1", "host-b", "T"}, []int{0}, pathAE)
+	resolveTieApply(c, "vms", cols, []interface{}{"vm1", "host-a", "T"}, []interface{}{"vm1", "host-b", "T"}, []int{0}, pathAE)
 	if c.UnresolvedTieCount() != 1 {
 		t.Fatalf("expected one tracked tie, got %d", c.UnresolvedTieCount())
 	}
@@ -360,7 +371,7 @@ func TestLocalZeroRowWriteKeepsUnresolved(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 	cols := []string{"name", "host_name", "updated_at"}
-	c.resolveTie("vms", cols, []interface{}{"vm1", "host-a", "T"}, []interface{}{"vm1", "host-b", "T"}, []int{0}, pathAE)
+	resolveTieApply(c, "vms", cols, []interface{}{"vm1", "host-a", "T"}, []interface{}{"vm1", "host-b", "T"}, []int{0}, pathAE)
 	if c.UnresolvedTieCount() != 1 {
 		t.Fatalf("expected one tracked tie, got %d", c.UnresolvedTieCount())
 	}

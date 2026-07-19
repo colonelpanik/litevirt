@@ -150,6 +150,37 @@ const (
 	// StrictMTLSIdentityV1; advertised build-static (a flag-off peer is merely
 	// permissive — it just won't originate max_cpu).
 	LiveResizeV1 = "live_resize_v1"
+	// CanonicalIdentityV1 gates natural-key identity resolution for the tables that mint a
+	// random-UUID primary key but carry a UNIQUE natural key (snapshots (vm_name,name);
+	// container_snapshots (host_name,ct_name,name)). Two nodes can independently mint DIFFERENT
+	// ids for one logical object, whose replicated rows then collide on the secondary UNIQUE and
+	// back-pressure. Once this latches cluster-wide, an upgraded receiver resolves these tables by
+	// natural key (a deterministic winner over the natural-key group, collapsing the losing id
+	// into the winner via a column-preserving re-key) — NOT pairwise-negotiated per sender,
+	// because identity resolution mutates shared state and a per-sender flip would be
+	// non-convergent. A node that hasn't latched keeps the old behavior (back-pressures the
+	// collision) and converges once the whole fleet has latched.
+	//
+	// Like OperationProtocolV1, this token is advertised CONDITIONALLY on the local config flag
+	// (enforcement.canonical_identity; see Server.advertisedCapabilities): mutating shared state
+	// on a partial rollout must require CONFIG uniformity, not just a uniform build, so the
+	// latch (and thus any node collapsing rows) cannot happen until every node has opted in.
+	// Enforcement = the flag AND the latch; default-off + reversible.
+	CanonicalIdentityV1 = "canonical_identity_v1"
+	// CanonicalRegistryV1 gates the Part H2 canonical registry-credential model: one stable
+	// deterministic-id row per (scope,owner,registry) written by a single PK-keyed upsert, instead
+	// of the legacy mint-new-id tombstone+insert whose concurrent logins collide on the partial
+	// UNIQUE index. Its activation is a COORDINATED online contract (expand → converge → contract),
+	// not just a latch: latching only ACCEPTS replicated canonical writes (so the one-time
+	// legacy-row consolidation may run); the canonical WRITER is enabled — and the index contracted
+	// — only once legacy rows are consolidated to their deterministic ids, so the two writers never
+	// produce two live rows for one triple. Advertised CONDITIONALLY on enforcement.canonical_registry
+	// (like operation_protocol) so the latch requires config uniformity, not just a uniform build.
+	// The WRITER switch, drain/barrier proof, node admission/reseed, legacy-shape rejection, and the
+	// index contract are NOT part of this capability — they are a single future operator-run contract
+	// transition, not an auto-latch (deferred; see docs/diagnostics.md). Until then, local API writes
+	// stay on the legacy writer and this gate only makes consolidation's canonical writes acceptable.
+	CanonicalRegistryV1 = "canonical_registry_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -234,12 +265,14 @@ var supported = []string{
 	RBACRealmV1,
 	OperationProtocolV1,
 	LiveResizeV1,
+	CanonicalIdentityV1,
+	CanonicalRegistryV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

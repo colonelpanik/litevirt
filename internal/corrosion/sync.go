@@ -750,7 +750,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				}
 				if c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow) {
 					slog.Warn("sync: quarantined future-skewed incoming row (not applied)",
-						"table", table.Name, "incoming_updated_at", incomingTS, "first_seen", localTS == "")
+						"table", table.Name, "reason", "future_skew", "first_seen", localTS == "")
 					skipped++
 					continue
 				}
@@ -871,7 +871,7 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 	// Future-skew quarantine (same as the LWW path): a skewed incoming clock must not poison
 	// even a first-seen natural key.
 	if incomingTS != "" && c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow) {
-		slog.Warn("sync: quarantined future-skewed identity row (not applied)", "table", table.Name, "incoming_updated_at", incomingTS, "first_seen", !localExists)
+		slog.Warn("sync: quarantined future-skewed identity row (not applied)", "table", table.Name, "reason", "future_skew", "first_seen", !localExists)
 		return false, nil
 	}
 

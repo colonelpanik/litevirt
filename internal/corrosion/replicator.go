@@ -1303,7 +1303,7 @@ func (r *Replicator) applyIdentityInsert(ctx context.Context, tx *sql.Tx, s Stat
 	// even a first-seen natural key.
 	if incomingTS != "" && r.client.skewQuarantinesIncoming(r.client.hlcSkewGuardOn(), localTS, incomingTS, time.Now()) {
 		slog.Warn("replicator: quarantined future-skewed identity row (not applied)",
-			"table", tableName, "incoming_updated_at", incomingTS, "first_seen", !localExists)
+			"table", tableName, "reason", "future_skew", "first_seen", !localExists)
 		return nil
 	}
 
@@ -1800,7 +1800,7 @@ func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName st
 	// value must be dropped even for a PK this node has not seen.
 	if r.client.skewQuarantinesIncoming(r.client.hlcSkewGuardOn(), localTS, incomingTS, time.Now()) {
 		slog.Warn("replicator: quarantined future-skewed incoming statement (not applied)",
-			"table", tableName, "incoming_updated_at", incomingTS, "first_seen", localTS == "")
+			"table", tableName, "reason", "future_skew", "first_seen", localTS == "")
 		return true, nil // skip incoming
 	}
 

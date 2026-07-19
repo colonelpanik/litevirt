@@ -70,8 +70,10 @@ func classifySQLiteError(err error) (sqliteClass, constraintKind) {
 		sqlite3.SQLITE_FULL, sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_CORRUPT:
 		return classOperational, constraintNone
 	default:
-		// Any other SQLite error (SQLITE_ERROR, SQLITE_MISMATCH, …) is treated as
-		// operational for apply purposes: never silently skipped, always propagated.
+		// Any other SQLite error (SQLITE_ERROR, SQLITE_MISMATCH, …) is classOther — an
+		// unrecognized fault. Like classOperational it is never a row-level skip: the apply path
+		// treats classOther as fail-closed (WAL back-pressures; AE rolls back the chunk and
+		// propagates), so an unclassified error never silently drops a write.
 		return classOther, constraintNone
 	}
 }

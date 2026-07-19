@@ -340,13 +340,14 @@ type EnforcementConfig struct {
 	// cluster-wide (identity resolution mutates shared state, so it must be fleet-uniform, not
 	// pairwise). Default false; reversible kill switch.
 	CanonicalIdentity bool `yaml:"canonical_identity,omitempty"`
-	// CanonicalRegistry: adopt the canonical registry-credential model — one stable
-	// deterministic-id row per (scope,owner,registry) instead of the legacy mint-new-id
-	// tombstone+insert whose concurrent logins collide on the partial UNIQUE
-	// (capabilities.CanonicalRegistryV1). Setting this advertises the token so the cluster can
-	// latch it; once latched, replicated canonical writes are ACCEPTED and the one-time
-	// legacy-row consolidation may run. Switching the writer + contracting the index is gated
-	// further on convergence (the migration controller). Default false; reversible kill switch.
+	// CanonicalRegistry: opt into the Part H2 canonical registry-credential model
+	// (capabilities.CanonicalRegistryV1). This flag ONLY controls ADVERTISEMENT of the token so
+	// the cluster can latch it with config uniformity; once DURABLY latched, replicated canonical
+	// upserts are accepted on apply (permanently — flag-off does not revoke it). It does NOT switch
+	// the writer or run consolidation: there is no migration controller, and new API writes stay on
+	// the legacy writer, so the concurrent-login collision remains open until the deferred
+	// operator-run activation contract (see docs/diagnostics.md). Default false; the flag is a
+	// reversible advertisement opt-in only.
 	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
 }
 

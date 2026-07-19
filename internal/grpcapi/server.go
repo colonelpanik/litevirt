@@ -110,10 +110,12 @@ type Server struct {
 	// identity resolution mutates shared state, so it requires config uniformity, not
 	// just a uniform build.
 	enfCanonicalIdentity bool
-	// enfCanonicalRegistry is this node's kill-switch for the canonical registry-credential model
-	// (Part H2); gated by this flag AND the CanonicalRegistryV1 latch. Advertised CONDITIONALLY on
-	// this flag (like operation_protocol) so the latch — which enables accepting canonical writes,
-	// mutating shared state — requires config uniformity, not just a uniform build.
+	// enfCanonicalRegistry gates ADVERTISEMENT of canonical_registry_v1 (Part H2): the token is
+	// advertised only while this flag is set (like operation_protocol), so it can latch only once
+	// every node has opted in (config uniformity — accepting canonical writes mutates shared state).
+	// It is advertisement-only: acceptance keys off the DURABLE latch, not this flag, and there is no
+	// migration controller or post-latch acceptance switch. Flag-off stops advertising; it does not
+	// revoke an already-formed latch.
 	enfCanonicalRegistry bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of

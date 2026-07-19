@@ -119,9 +119,10 @@ func TestTableNamesCoverage(t *testing.T) {
 		}
 
 		// A full-state table that soft-deletes (has deleted_at) MUST also have
-		// updated_at: a tombstone needs a timestamp to win LWW, otherwise a stale
-		// live row from a peer blind-replaces (resurrects) it via INSERT OR REPLACE
-		// — e.g. an un-revoked token.
+		// updated_at: a tombstone needs a timestamp to win LWW. The apply path uses a
+		// PK-aware UPSERT (INSERT … ON CONFLICT(pk) DO UPDATE SET nonPK=excluded.…), so
+		// without updated_at a stale live row from a peer wins the upsert and resurrects
+		// the tombstoned row — e.g. an un-revoked token.
 		if inTableNames[tbl] && cols["deleted_at"] && !cols["updated_at"] {
 			t.Errorf("table %q is full-state synced with deleted_at but no updated_at — "+
 				"a tombstone can't win LWW, so a stale live row resurrects it", tbl)

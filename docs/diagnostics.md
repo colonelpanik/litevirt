@@ -226,8 +226,10 @@ collision described above is **still open** — the writer is **not** switched. 
 write still uses the legacy random-id writer, so two concurrent logins still mint different
 ids; a replicated legacy batch can lose LWW on its by-triple tombstone and its INSERT then
 back-pressures fail-closed against the peer's live row (safe — no corruption — but it stalls
-that sender's stream to the peer until the entry is superseded). This is unchanged from
-before the canonical work; the reversible core below does not resolve it.
+that sender's stream to the peer until the conflicting state is remediated and the blocked
+entry successfully retries; a later WAL entry cannot supersede an ordered entry stuck ahead
+of it). This is unchanged from before the canonical work; the reversible core below does not
+resolve it.
 
 The one runtime behavior that ships is the **accept gate**: once `canonical_registry_v1` is
 **durably latched** cluster-wide, replicated **canonical** upserts are accepted on apply
@@ -240,10 +242,12 @@ runs a background consolidation loop and nothing switches the writer.
 - **`enforcement.canonical_registry`** (config flag) gates only **advertisement** of the
   token, so a fleet opts in and the latch forms with config uniformity. It is a reversible
   opt-in *before* the token latches.
-- **Acceptance is permanent once latched.** The accept gate reads the *durable latch*, not
-  the flag — so turning the flag off after latching does **not** revoke acceptance (which
-  would strand an in-flight canonical wire shape and stall replication). The flag off simply
-  stops future opt-in/consolidation; already-latched acceptance stays.
+- **Acceptance is permanent once latched.** The accept gate reads the *durably* latched
+  marker (in memory AND persisted), not the flag — so turning the flag off after latching does
+  **not** revoke acceptance (which would strand an in-flight canonical wire shape and stall
+  replication), and it survives a restart. Flag-off only stops **advertisement** (further
+  opt-in); it does not stop `ConsolidateRegistryCredentials`, which the future operator
+  transition can still call because it gates on the durable accept latch, not the flag.
 
 **Deferred: the writer-activation contract.** Switching writes to the canonical writer is a
 distributed-contract transition, done as ONE atomic operator-run operation: run
@@ -373,6 +377,17 @@ converge the row, so the two paths can never disagree.
   `split_brain`, `inconclusive`, `error`}. A `split_brain` is a workload running on
   two hosts at once → page; sustained `inconclusive` means a peer the repair needs
   is unreachable.
+- `litevirt_merge_apply_rejected_total{table,path,reason}` — **monotonic counter** of
+  replicated write ATTEMPTS the apply path refused (kept-local / back-pressured). `path` ∈
+  {`ae`, `wal`}; `reason` is a bounded class (never SQL text or parameters). Because it counts
+  *attempts*, a permanent fault re-increments every cycle — so alert on its **rate**, correlated
+  with replication backlog (`litevirt_replication_min_watermark_seq`) and `lv doctor
+  divergence`, **not** on its absolute value.
+- `litevirt_legacy_mutation_transformed_total{transformer}` — **monotonic counter** of prior-
+  release WAL statements this node NORMALIZED before applying (a supported historical shape, e.g.
+  a param-bound `crl_versions` rewrite). A brief rate during a rolling upgrade is expected; a
+  **continuing** rate means an old emitter is still writing or a relay is retaining pre-upgrade
+  WAL — investigate that peer/relay.
 
 ### Alerts
 
@@ -390,6 +405,9 @@ rate(litevirt_lww_tie_break_total[15m]) > 0
 rate(litevirt_lww_tombstone_tie_total[15m]) > 0   # lower severity
 # A workload running in two places at once — page immediately.
 increase(litevirt_runtime_owner_assert_total{result="split_brain"}[10m]) > 0
+# Replicated writes are being refused faster than they clear (a builder bug, a mixed-version
+# gap, or malformed input). Correlate with replication backlog + divergence, not the raw total.
+rate(litevirt_merge_apply_rejected_total[15m]) > 0
 ```
 
 The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the

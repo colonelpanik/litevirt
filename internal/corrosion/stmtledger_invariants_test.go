@@ -42,6 +42,27 @@ func TestNoUnsupportedCategoryInLedgers(t *testing.T) {
 	}
 }
 
+// TestDeriveRejectsIdentityReferenceColumn (review 3): a builder that binds/assigns a self-reference
+// column on an identity table (snapshots.parent_id) must FAIL ledger derivation, so the guard rejects
+// it source-wide (generation errors; the shape can't be registered) — a new snapshot-chain writer
+// cannot silently invalidate H1's fail-closed reference handling. A normal identity-table write still
+// derives cleanly. Complements the integration test TestSnapshotWritersNeverBindParentID.
+func TestDeriveRejectsIdentityReferenceColumn(t *testing.T) {
+	bad := []string{
+		`INSERT INTO snapshots (id, vm_name, host_name, name, parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`UPDATE snapshots SET parent_id = ?, updated_at = ? WHERE vm_name = ? AND name = ?`,
+	}
+	for _, sql := range bad {
+		if _, err := LedgerEntryFor(sql); err == nil {
+			t.Errorf("a builder binding snapshots.parent_id must fail derivation: %q", sql)
+		}
+	}
+	ok := `INSERT OR REPLACE INTO snapshots (id, vm_name, host_name, name, state, size_bytes, type, vmstate_path, vmstate_size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	if _, err := LedgerEntryFor(ok); err != nil {
+		t.Errorf("a normal snapshot INSERT (no parent_id) must derive cleanly: %v", err)
+	}
+}
+
 // TestDeriveRejectsUnsafeBulkUpdate (finding 2): ledger generation must FAIL for a bulk update with
 // no LWW-compatible updated_at (rather than emit a CatUnsupported entry). vm_disks' PK is
 // (vm_name, disk_name), so a WHERE on vm_name alone is a non-full-PK bulk update; without a bound

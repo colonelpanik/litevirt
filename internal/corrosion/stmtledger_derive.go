@@ -1,5 +1,7 @@
 package corrosion
 
+import "strings"
+
 // appendOnlyTables are immutable append-only tables: a replicated INSERT is applied with
 // INSERT OR IGNORE and never LWW-gated, because a row never changes after creation.
 var appendOnlyTables = map[string]bool{
@@ -17,6 +19,17 @@ var appendOnlyTables = map[string]bool{
 // classifiable before it can ship).
 func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 	t := sh.Table
+	// Identity-reference invariant (H1): a builder on an identity table must NOT bind/assign a
+	// self-reference column (identityReferenceColumns, e.g. snapshots.parent_id). The identity
+	// collapse FAILS CLOSED on a non-null reference rather than rewriting it, so a writer that set
+	// one would silently invalidate that assumption. Reject at derivation so such a builder cannot be
+	// registered (ledger generation fails; the guard flags the unregistered shape) — this makes the
+	// invariant source-wide, not limited to the hand-listed writers in the integration test.
+	for _, ref := range identityReferenceColumns[t] {
+		if shapeBindsColumn(sh, ref) {
+			return "", CatNone, invalidf("builder on identity table %s binds reference column %q: H1 identity collapse fails closed on references and does NOT rewrite them — add reference rewriting to the collapse/apply paths before any writer sets %q", t, ref, ref)
+		}
+	}
 	// Custom-merge tables (monotone lifecycle / immutable journal) merge by their own rule
 	// regardless of statement kind.
 	if customMergeTables[t] != nil {
@@ -65,6 +78,22 @@ func deriveDisposition(sh StmtShape) (Disposition, ConcurrencyCategory, error) {
 		return DispDeleteRetention, CatNone, nil
 	}
 	return "", CatNone, invalidf("unclassifiable statement kind %s", sh.Kind)
+}
+
+// shapeBindsColumn reports whether the statement writes the named column — as an INSERT column or an
+// UPDATE SET target (case-insensitive, matching the parser's identifier normalization).
+func shapeBindsColumn(sh StmtShape, col string) bool {
+	for _, c := range sh.InsertCols {
+		if strings.EqualFold(c, col) {
+			return true
+		}
+	}
+	for _, a := range sh.SetAssigns {
+		if strings.EqualFold(a.Column, col) {
+			return true
+		}
+	}
+	return false
 }
 
 // bulkUpdateIsPerRowLWWSafe reports whether a bulk (non-full-PK) UPDATE can be applied by

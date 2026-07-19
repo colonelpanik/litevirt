@@ -36,10 +36,52 @@ func TestComputeGaps_UnregisteredStaticBuilderFails(t *testing.T) {
 		t.Fatalf("control statement must parse: %v", err)
 	}
 	if _, ok := corrosion.LedgerLookup(regFP); !ok {
-		t.Skip("control statement not registered in this tree; skipping the negative half")
+		t.Fatal("precondition: the control statement (a real images builder) must be registered — ledger drift must not silently weaken this test")
 	}
 	if g := computeGaps([]finding{{pos: token.Position{Filename: "x.go", Line: 1}, sql: reg, fp: regFP}}); len(g) != 0 {
 		t.Fatalf("a registered static builder must produce no gap, got %v", g)
+	}
+}
+
+// TestGuardE2E_UnregisteredStaticBuilderGaps (review 4): the true end-to-end path — SCAN a synthetic
+// static builder from the fixture package, locate its finding, and feed it through computeGaps. The
+// finding is correctly classified as resolved (it parses to a fingerprint), yet the complete guard
+// decision must FAIL it because that fingerprint is not in the ledger.
+func TestGuardE2E_UnregisteredStaticBuilderGaps(t *testing.T) {
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
+		Tests: false,
+	}
+	pkgs, err := packages.Load(cfg, "./testdata/fixtures")
+	if err != nil {
+		t.Fatalf("load fixtures: %v", err)
+	}
+	if packages.PrintErrors(pkgs) > 0 || len(pkgs) != 1 {
+		t.Fatalf("fixture package load error (pkgs=%d)", len(pkgs))
+	}
+
+	var target *finding
+	for _, f := range scanPkg(pkgs[0]) {
+		if f.fn == "UnregisteredStatic" {
+			ff := f
+			target = &ff
+			break
+		}
+	}
+	if target == nil {
+		t.Fatal("scanPkg did not find the UnregisteredStatic builder")
+	}
+	// It must be a RESOLVED finding (parsed to a fingerprint), not dynamic/unresolved/parse-error.
+	if target.dynamic || target.unresolvedBatch || target.parseErr != "" || target.fp == "" {
+		t.Fatalf("UnregisteredStatic should classify as a resolved finding, got %+v", *target)
+	}
+	// And its shape must genuinely be absent from the ledger.
+	if _, ok := corrosion.LedgerLookup(target.fp); ok {
+		t.Fatal("precondition: the fixture shape must NOT be registered")
+	}
+	if gaps := computeGaps([]finding{*target}); len(gaps) != 1 {
+		t.Fatalf("the complete guard must FAIL an unregistered static builder, got %d gaps: %v", len(gaps), gaps)
 	}
 }
 
@@ -144,6 +186,7 @@ func TestScanPkg_Fixtures(t *testing.T) {
 		"IndexedReplacement": {unresolved: 1}, // escape: stmts[i] replaced before the call
 		"HelperMutation":     {unresolved: 1}, // escape: slice passed to opaque helper
 		"DynamicBuilder":     {dynamic: 1},
+		"UnregisteredStatic": {resolved: 1}, // parses to a fp, but the shape isn't in the ledger
 	}
 	for fn, exp := range want {
 		cc := got[fn]

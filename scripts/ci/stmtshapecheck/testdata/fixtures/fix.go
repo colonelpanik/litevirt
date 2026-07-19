@@ -66,6 +66,13 @@ func DynamicBuilder(c *corrosion.Client, ctx context.Context, col string) {
 	_ = c.Execute(ctx, "UPDATE t SET "+col+" = ? WHERE id = ?", 1, 2) // want: dynamic
 }
 
+// UnregisteredStatic emits a static, parseable statement whose shape is NOT in the compatibility
+// ledger (a real table with a column no builder uses), so scanPkg classifies it as a RESOLVED
+// finding, yet the complete guard decision (computeGaps) must still FAIL it.
+func UnregisteredStatic(c *corrosion.Client, ctx context.Context) {
+	_ = c.Execute(ctx, "INSERT INTO images (name, bogus_extra, updated_at) VALUES (?, ?, ?)", 1, 2, 3) // want: resolved
+}
+
 // UnkeyedComposite: a non-empty Statement without a keyed SQL field must fail closed.
 func UnkeyedComposite(c *corrosion.Client, ctx context.Context, p []interface{}) {
 	_ = c.ExecuteBatch(ctx, []corrosion.Statement{{Params: p}}) // want: unresolved

@@ -115,12 +115,6 @@ type Daemon struct {
 	// can invoke via exit() at any time — so this needs atomic access, not a
 	// plain field. Finding 7.
 	telemetryShutdown atomic.Pointer[func(context.Context) error]
-
-	// registryConsolidated is set by the Part H2 migration controller to this node's
-	// RegistryWriterReady (no legacy live rows remain). It is a readiness DIAGNOSTIC for the deferred
-	// operator-run writer-activation contract — it feeds the RegConsolidated state name and can be
-	// surfaced to an operator; it does NOT switch the writer or gate any advertisement.
-	registryConsolidated atomic.Bool
 }
 
 // New creates a new daemon instance.
@@ -434,17 +428,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalIdentity(func() bool {
 		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
 	})
-	// Part H2: resolve the registry-credential migration phase. Phase 1 (canonical_registry_v1
-	// latched, flag on) is a REVERSIBLE accept gate — replicated canonical writes are applied and the
-	// controller consolidates legacy rows, but the local writer stays legacy. There is no auto-switch:
-	// the writer activation is a deferred operator-run contract transition. registryConsolidated is a
-	// readiness diagnostic (no behavioral effect). Cheap reads on the apply path.
-	d.db.SetRegistryMigrationState(func() corrosion.RegistryMigrationState {
-		return corrosion.ResolveRegistryMigrationState(
-			d.cfg.Enforcement.CanonicalRegistry,
-			d.checker.Latched(capabilities.CanonicalRegistryV1),
-			d.registryConsolidated.Load(),
-		)
+	// Part H2 (preparatory infrastructure): accept a replicated canonical registry upsert once
+	// canonical_registry_v1 is DURABLY LATCHED. Wired to the latch, NOT the config flag — once latched,
+	// acceptance of an already-emitted canonical wire shape must never be revoked (a flag-off must not
+	// stall replication on an in-flight canonical entry). The flag only gates ADVERTISEMENT (opt-in to
+	// drive the latch). No writer switch, no consolidation controller — that is a deferred operator op.
+	d.db.SetCanonicalRegistryAccept(func() bool {
+		return d.checker.Latched(capabilities.CanonicalRegistryV1)
 	})
 	repl.Start(ctx)
 
@@ -523,11 +513,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
-
-	// Part H2 registry-credential migration controller: once canonical_registry_v1 is latched,
-	// idempotently consolidate legacy rows to their deterministic ids and activate the canonical
-	// writer once locally converged.
-	go d.runRegistryMigrationController(ctx)
 
 	// Daily prune of this host's vm_events rows so the operational event store
 	// stays bounded (see config vm_event_*).

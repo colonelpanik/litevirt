@@ -18,57 +18,16 @@ import (
 // truth) so the ledger policy and the runtime activation check can't drift.
 const capCanonicalRegistryV1 = capabilities.CanonicalRegistryV1
 
-// RegistryMigrationState is the Part H2 registry-credential migration phase. It is intentionally
-// SMALL: the WRITER never switches automatically — the canonical writer is dormant pending a single
-// future operator-run contract transition (writer activation + drain/barrier proof + convergence
-// proof + node admission/reseed + legacy-shape rejection + index contract, done atomically). Until
-// then local API writes stay on the LEGACY writer; the only behavioral effect of this state is the
-// phase-1 ACCEPT gate (AcceptsCanonical), so consolidation's canonical writes are applied.
-type RegistryMigrationState int
-
-const (
-	// RegLegacy: pre-migration (phase-1 not latched, or the flag is off). The legacy mint-new-id
-	// writer is live; the canonical upsert shape is not yet accepted on apply.
-	RegLegacy RegistryMigrationState = iota
-	// RegPreparing: phase-1 (canonical_registry_v1) latched. Replicated canonical upserts are
-	// accepted and the controller idempotently consolidates legacy rows to their deterministic ids —
-	// but new API writes STILL use the legacy writer (no auto-switch).
-	RegPreparing
-	// RegConsolidated: phase-1 latched AND no legacy live row remains locally — a readiness DIAGNOSTIC
-	// for the future operator transition. Behaviorally identical to RegPreparing (writer stays legacy,
-	// canonical apply accepted); it exists only so the operator can see which nodes are ready.
-	RegConsolidated
-)
-
-func (s RegistryMigrationState) String() string {
-	switch s {
-	case RegLegacy:
-		return "legacy"
-	case RegPreparing:
-		return "preparing"
-	case RegConsolidated:
-		return "consolidated"
-	default:
-		return "unknown"
-	}
-}
-
-// AcceptsCanonical reports whether a replicated canonical upsert may be applied (phase-1 latched).
-func (s RegistryMigrationState) AcceptsCanonical() bool { return s != RegLegacy }
-
-// ResolveRegistryMigrationState computes the phase from the config flag, the phase-1 latch, and this
-// node's consolidation diagnostic. There is NO phase-2 / auto-switch input: the writer activation is
-// a deferred operator-run contract transition, so phase 1 is a reversible accept gate and nothing
-// here ever changes the writer.
-func ResolveRegistryMigrationState(flagOn, phase1Latched, consolidated bool) RegistryMigrationState {
-	if flagOn && phase1Latched {
-		if consolidated {
-			return RegConsolidated
-		}
-		return RegPreparing
-	}
-	return RegLegacy
-}
+// PART H2 STATUS — preparatory infrastructure only. The canonical deterministic-id model exists as
+// building blocks (RegistryCredentialID, UpsertRegistryCredentialCanonical, ConsolidateRegistry-
+// Credentials, the readiness diagnostics) plus ONE runtime behavior: once canonical_registry_v1 is
+// durably latched cluster-wide, replicated canonical upserts are ACCEPTED on apply. Nothing switches
+// the WRITER — every local API write still uses the legacy mint-new-id writer, so the concurrent-
+// login collision (two nodes minting different ids for one triple → a legacy batch loses LWW on its
+// tombstone and its INSERT back-pressures the peer stream) is NOT resolved here; it remains OPEN
+// until the deferred operator-run activation contract (writer switch + durable barrier/watermark
+// proof + convergence proof + node admission/reseed + legacy-shape rejection + index contract, done
+// as one atomic operation). See docs/diagnostics.md.
 
 // RegistryCredential is one stored OCI/Docker registry login (schema v23).
 // A row is either per-user (Scope="user", Owner=<username>) or global
@@ -249,7 +208,7 @@ func UpsertRegistryCredentialCanonical(ctx context.Context, c *Client, rc Regist
 // tombstoned for the watermark-gated GC — a local hard delete of a replicated row is union-unsafe,
 // the rule ReapSpentProofs follows.
 func ConsolidateRegistryCredentials(ctx context.Context, c *Client) (migrated int, err error) {
-	if !c.registryStateNow().AcceptsCanonical() {
+	if !c.canonicalRegistryAcceptOn() {
 		return 0, fmt.Errorf("registry consolidation requires canonical_registry_v1 latched (peers would reject the canonical writes)")
 	}
 	triples, err := c.Query(ctx,
@@ -377,16 +336,6 @@ func RegistryContractReady(ctx context.Context, c *Client) (bool, error) {
 		}
 	}
 	return true, nil
-}
-
-// UpsertRegistryCredentialAuto is the single seam a login/rotate goes through. The canonical writer
-// is DORMANT pending the deferred operator-run contract transition, so this always uses the LEGACY
-// mint-new-id writer. Colliding/duplicate rows are reconciled to their deterministic ids by the
-// phase-1 consolidation controller, and a cross-unique collision back-pressures fail-closed on apply
-// — so the canonical model converges without an in-place writer switch. (Kept as a named seam so the
-// future contract transition has one place to hook.)
-func UpsertRegistryCredentialAuto(ctx context.Context, c *Client, rc RegistryCredential) error {
-	return UpsertRegistryCredential(ctx, c, rc)
 }
 
 func scanRegistryCredentials(rows []Row) []RegistryCredential {

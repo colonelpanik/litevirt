@@ -215,44 +215,45 @@ to back-pressuring the collision, still non-destructive).
 
 ### `canonical_registry` — registry-credential migration
 
-Registry logins used to mint a **new random `id` per login** and write via a
-tombstone+insert batch, so two nodes logging into the same registry concurrently
-produced two live rows that collide on the partial `UNIQUE(scope,owner,registry)`.
-The canonical model derives a **deterministic id** from `(scope,owner,registry)`, so
-both nodes target the same primary key and a conflict resolves by normal LWW — no
-collision.
+Registry logins mint a **new random `id` per login** and write via a tombstone+insert
+batch, so two nodes logging into the same registry concurrently produce two live rows that
+collide on the partial `UNIQUE(scope,owner,registry)`. The **canonical model** fixes this by
+deriving a **deterministic id** from `(scope,owner,registry)` — both nodes target the same
+primary key and a conflict resolves by normal LWW.
 
-What ships today is the **reversible core only** — the writer is **not** switched
-automatically. The migration state is a small `legacy → preparing → consolidated`, driven
-by the single `canonical_registry_v1` capability + the `enforcement.canonical_registry`
-config flag:
+**What ships today is preparatory infrastructure, not the fix.** The concurrent-login
+collision described above is **still open** — the writer is **not** switched. Every API
+write still uses the legacy random-id writer, so two concurrent logins still mint different
+ids; a replicated legacy batch can lose LWW on its by-triple tombstone and its INSERT then
+back-pressures fail-closed against the peer's live row (safe — no corruption — but it stalls
+that sender's stream to the peer until the entry is superseded). This is unchanged from
+before the canonical work; the reversible core below does not resolve it.
 
-- **`legacy`** (flag off / not latched): logins use the legacy mint-new-id writer;
-  replicated canonical upserts are rejected on apply (fail closed).
-- **`preparing`** (flag on + `canonical_registry_v1` latched, config-uniform): replicated
-  canonical upserts are **accepted** (the phase-1 accept gate), and each node's controller
-  idempotently **consolidates** its legacy rows to their deterministic ids (tombstone the
-  exact legacy row by full-content CAS + upsert the canonical row). **New API writes still
-  use the legacy writer** — colliding/duplicate rows are reconciled by consolidation, and a
-  cross-unique collision back-pressures fail-closed, so the canonical model converges
-  without an in-place writer switch.
-- **`consolidated`**: `preparing` and no legacy live row remains locally — a **readiness
-  diagnostic** (`RegistryWriterReady`) for the future operator transition. Behaviorally
-  identical to `preparing`.
+The one runtime behavior that ships is the **accept gate**: once `canonical_registry_v1` is
+**durably latched** cluster-wide, replicated **canonical** upserts are accepted on apply
+(before the latch they fail closed). The building blocks — the deterministic id, the
+canonical writer primitive (no production caller yet), the idempotent consolidation routine,
+and the `RegistryWriterReady` / `RegistryContractReady` readiness checks (computed
+on-demand, never cached) — are in place for the future operator transition, but nothing
+runs a background consolidation loop and nothing switches the writer.
 
-The gate is a **reversible kill switch**: turn `enforcement.canonical_registry` off and the
-node returns to `legacy`. `RegistryContractReady` (no non-canonical physical row at all,
-live or tombstoned) is exposed as a stronger diagnostic.
+- **`enforcement.canonical_registry`** (config flag) gates only **advertisement** of the
+  token, so a fleet opts in and the latch forms with config uniformity. It is a reversible
+  opt-in *before* the token latches.
+- **Acceptance is permanent once latched.** The accept gate reads the *durable latch*, not
+  the flag — so turning the flag off after latching does **not** revoke acceptance (which
+  would strand an in-flight canonical wire shape and stall replication). The flag off simply
+  stops future opt-in/consolidation; already-latched acceptance stays.
 
-**Deferred: the writer-activation contract.** Actually switching new API writes to the
-canonical writer is itself a distributed-contract transition — it needs, done as one
-atomic operator-run operation: a durable replication-sequence **barrier** proven consumed
-by every admitted peer's watermark; a registry-credential **convergence** proof; **node
-admission / reseed** rules for a node that returns pre-barrier; **legacy-shape rejection**
-after activation; and eventually the index contract (partial → non-partial
-`UNIQUE(scope,owner,registry)`). None of that is a config boolean, so it is intentionally
-NOT shipped here. Until it exists the reversible core above stands on its own: the
-collision is already resolved by the deterministic id + consolidation + fail-closed apply.
+**Deferred: the writer-activation contract.** Switching writes to the canonical writer is a
+distributed-contract transition, done as ONE atomic operator-run operation: run
+consolidation while writes are quiesced; prove a durable replication-sequence **barrier**
+consumed by every admitted peer's watermark; prove registry-credential **convergence**;
+apply **node admission / reseed** rules for a node returning pre-barrier; **reject the legacy
+shape** after activation; and eventually the index contract (partial → non-partial
+`UNIQUE(scope,owner,registry)`). None of that is a config boolean — it is intentionally NOT
+shipped here, and readiness for it must be recomputed synchronously at that time, not read
+from a cached flag.
 
 ### The sensitive lane
 

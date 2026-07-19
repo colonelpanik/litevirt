@@ -187,16 +187,16 @@ enforcement:
                               # activates only when the flag is set AND the token has latched
                               # fleet-wide. Enable fleet-uniformly; the flag is the reversible kill
                               # switch.
-  canonical_registry: false   # adopt the canonical registry-credential model — a stable
-                              # deterministic-id row per (scope,owner,registry) instead of the
-                              # legacy mint-new-id tombstone+insert whose concurrent logins collide
-                              # on the partial UNIQUE. Setting this advertises canonical_registry_v1
-                              # so the cluster can latch it; once latched, replicated canonical writes
-                              # are ACCEPTED and each node consolidates its legacy rows to the
-                              # deterministic id. New API writes STILL use the legacy writer — the
-                              # writer switch is a deferred operator-run contract, not this flag (see
-                              # docs/diagnostics.md). Advertised only while this flag is on (like
-                              # operation_protocol); enable fleet-uniformly. Reversible kill switch.
+  canonical_registry: false   # PREPARATORY infrastructure for the canonical registry-credential
+                              # model (a deterministic-id row per (scope,owner,registry)). Setting
+                              # this only ADVERTISES canonical_registry_v1 so the cluster can latch
+                              # it; once durably latched, replicated CANONICAL upserts are accepted on
+                              # apply (permanently — the writer-activation contract emits them). It
+                              # does NOT switch the writer or run consolidation: new API writes still
+                              # use the legacy writer, so the concurrent-login collision remains open
+                              # until the deferred operator-run contract (see docs/diagnostics.md).
+                              # The flag gates advertisement/opt-in only; it does not revoke an
+                              # already-formed latch. Advertised only while on; enable fleet-uniformly.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

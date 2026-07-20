@@ -1359,6 +1359,26 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	return &emptypb.Empty{}, nil
 }
 
+// resolveDiskBus computes a disk's effective bus with the precedence: the
+// vm_disks.Bus column (dbBus) if set, else the bus declared for this disk's
+// name in the VM's stored spec blob (specBus, the caller's blob lookup — see
+// vmToProto's Spec.Disks projection and hardware.go's HardwareDisk assembly,
+// both of which resolve bus this same way), else the historical target-dev
+// heuristic (sd* -> scsi, else virtio). Never returns empty. dbBus is a v42
+// column not yet populated by every writer, hence the fallback chain.
+func resolveDiskBus(dbBus, specBus, targetDev string) string {
+	if dbBus != "" {
+		return dbBus
+	}
+	if specBus != "" {
+		return specBus
+	}
+	if strings.HasPrefix(targetDev, "sd") {
+		return "scsi"
+	}
+	return "virtio"
+}
+
 func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	vm, err := corrosion.GetVM(ctx, s.db, name)
 	if err != nil {
@@ -1503,17 +1523,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		} else {
 			specDisks := make([]*pb.DiskSpec, 0, len(disks))
 			for _, disk := range disks {
-				bus := disk.Bus
-				if bus == "" {
-					bus = specDiskBuses[disk.DiskName]
-				}
-				if bus == "" {
-					if strings.HasPrefix(disk.TargetDev, "sd") {
-						bus = "scsi"
-					} else {
-						bus = "virtio"
-					}
-				}
+				bus := resolveDiskBus(disk.Bus, specDiskBuses[disk.DiskName], disk.TargetDev)
 				sizeBytes := disk.SizeBytes
 				if specSize, ok := specDiskSizes[disk.DiskName]; ok && specSize > sizeBytes {
 					sizeBytes = specSize

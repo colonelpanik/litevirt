@@ -283,6 +283,18 @@ func TestGenerateDomainXML_MultipleDiskBuses(t *testing.T) {
 	}
 }
 
+func TestGenerateDomainXML_HonorsStoredTargetDev(t *testing.T) {
+	cfg := VMConfig{Name: "vm1", CPU: 1, MemoryMiB: 512,
+		Disks: []DiskConfig{{Name: "root", Path: "/x/root.qcow2", Bus: "scsi", TargetDev: "sdb"}}}
+	xml, err := GenerateDomainXML(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(xml, `dev="sdb"`) && !strings.Contains(xml, `dev='sdb'`) {
+		t.Fatalf("expected stored target sdb, got:\n%s", xml)
+	}
+}
+
 func TestGenerateDomainXML_MultipleNetworks(t *testing.T) {
 	cfg := VMConfig{
 		Name:      "multi-net-vm",

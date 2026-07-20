@@ -99,6 +99,11 @@ type DiskConfig struct {
 	// virtio-scsi. Imported guests bind their boot driver to this model, so it
 	// must be preserved; ignored for non-SCSI buses.
 	ControllerModel string
+	// TargetDev is the stored/preserved libvirt target device name (e.g.
+	// "sdb"). When empty, the generator derives it positionally via
+	// DiskDevName(Bus, index) — existing callers that never set this see no
+	// change in behavior.
+	TargetDev string
 }
 
 // NetworkConfig describes a VM network interface.
@@ -311,12 +316,16 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	bootFromCDROM := cfg.Boot == "cdrom"
 	diskBootAssigned := false
 	for i, d := range cfg.Disks {
+		targetDev := d.TargetDev
+		if targetDev == "" {
+			targetDev = DiskDevName(d.Bus, i)
+		}
 		disk := diskDevice{
 			Type:   "file",
 			Device: "disk",
 			Driver: diskDriver{Name: "qemu", Type: "qcow2", Cache: d.Cache},
 			Source: diskSource{File: d.Path},
-			Target: diskTarget{Dev: DiskDevName(d.Bus, i), Bus: d.Bus},
+			Target: diskTarget{Dev: targetDev, Bus: d.Bus},
 		}
 		if d.Cache == "" {
 			disk.Driver.Cache = "writeback"

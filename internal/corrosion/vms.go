@@ -94,6 +94,22 @@ type DiskRecord struct {
 	// of (empty for normal/full-clone disks). Used to refcount-guard the
 	// source template/snapshot and host-pin local-storage linked clones.
 	BackingDisk string
+	// Bus is the libvirt disk bus (virtio, scsi, sata, ide, usb). Empty for
+	// disks created before v42 (schema default is SQL NULL); the domain
+	// generator falls back to its historical bus-inference logic when empty.
+	Bus string
+	// DeviceKind distinguishes a disk-shaped device from a hostdev-shaped one
+	// (e.g. "disk" vs "cdrom"). Defaults to "disk" at both the DB column
+	// default and here in Go so callers that don't set it get the historical
+	// behavior.
+	DeviceKind string
+	// DeleteWithVM controls whether the backing file is removed when the VM
+	// is deleted (vs. detached-and-kept, e.g. an adopted/foreign disk).
+	DeleteWithVM bool
+	// ControllerModel is the optional libvirt controller model override for
+	// this disk's bus (e.g. "virtio-scsi"). Empty defers to libvirt/domain
+	// defaults.
+	ControllerModel string
 }
 
 // projectOrDefault normalises an empty project string to "_default"
@@ -375,7 +391,11 @@ func GetVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, er
 	rows, err := c.Query(ctx,
 		`SELECT vm_name, disk_name, host_name, path, size_bytes,
 			backing_image, storage_type, storage_volume, target_dev,
-			COALESCE(backing_disk, '') AS backing_disk
+			COALESCE(backing_disk, '') AS backing_disk,
+			COALESCE(bus, '') AS bus,
+			COALESCE(device_kind, 'disk') AS device_kind,
+			COALESCE(delete_with_vm, 1) AS delete_with_vm,
+			COALESCE(controller_model, '') AS controller_model
 		 FROM vm_disks WHERE vm_name = ? AND deleted_at IS NULL`, vmName)
 	if err != nil {
 		return nil, err
@@ -384,16 +404,20 @@ func GetVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, er
 	disks := make([]DiskRecord, len(rows))
 	for i, r := range rows {
 		disks[i] = DiskRecord{
-			VMName:        r.String("vm_name"),
-			DiskName:      r.String("disk_name"),
-			HostName:      r.String("host_name"),
-			Path:          r.String("path"),
-			SizeBytes:     r.Int64("size_bytes"),
-			BackingImage:  r.String("backing_image"),
-			StorageType:   r.String("storage_type"),
-			StorageVolume: r.String("storage_volume"),
-			TargetDev:     r.String("target_dev"),
-			BackingDisk:   r.String("backing_disk"),
+			VMName:          r.String("vm_name"),
+			DiskName:        r.String("disk_name"),
+			HostName:        r.String("host_name"),
+			Path:            r.String("path"),
+			SizeBytes:       r.Int64("size_bytes"),
+			BackingImage:    r.String("backing_image"),
+			StorageType:     r.String("storage_type"),
+			StorageVolume:   r.String("storage_volume"),
+			TargetDev:       r.String("target_dev"),
+			BackingDisk:     r.String("backing_disk"),
+			Bus:             r.String("bus"),
+			DeviceKind:      r.String("device_kind"),
+			DeleteWithVM:    r.Int("delete_with_vm") == 1,
+			ControllerModel: r.String("controller_model"),
 		}
 	}
 	return disks, nil
@@ -406,6 +430,33 @@ func SetVMTemplate(ctx context.Context, c *Client, name string, isTemplate bool)
 	return c.Execute(ctx,
 		`UPDATE vms SET is_template = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
 		boolToInt(isTemplate), now, name)
+}
+
+// SetHardwareAdoptionState updates a VM's hardware-adoption state and, when
+// blocked, the human-readable reason. errReason "" clears any prior reason
+// (e.g. on a transition back to a non-blocked state).
+func SetHardwareAdoptionState(ctx context.Context, c *Client, vmName, state, errReason string) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`UPDATE vms SET hardware_adoption_state = ?, hardware_adoption_error = ?, updated_at = ? WHERE name = ?`,
+		state, nullIfEmpty(errReason), now, vmName)
+}
+
+// GetHardwareAdoptionState returns a VM's hardware-adoption state and error
+// reason (COALESCEd to "" when unset).
+func GetHardwareAdoptionState(ctx context.Context, c *Client, vmName string) (state, errReason string, err error) {
+	rows, qerr := c.Query(ctx,
+		`SELECT hardware_adoption_state,
+			COALESCE(hardware_adoption_error, '') AS hardware_adoption_error
+		 FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName)
+	if qerr != nil {
+		return "", "", qerr
+	}
+	if len(rows) == 0 {
+		return "", "", nil
+	}
+	r := rows[0]
+	return r.String("hardware_adoption_state"), r.String("hardware_adoption_error"), nil
 }
 
 // LinkedCloneNames returns the names of VMs that have a disk which is a
@@ -707,13 +758,19 @@ func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip
 // InsertDisk adds a single disk record (used by hot-plug attach).
 func InsertDisk(ctx context.Context, c *Client, d DiskRecord) error {
 	now := c.NowTS()
+	deviceKind := d.DeviceKind
+	if deviceKind == "" {
+		deviceKind = "disk" // matches the vm_disks.device_kind column default
+	}
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO vm_disks
 		 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
-		  storage_type, storage_volume, target_dev, backing_disk, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		  storage_type, storage_volume, target_dev, backing_disk,
+		  bus, device_kind, delete_with_vm, controller_model, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		d.VMName, d.DiskName, d.HostName, d.Path, d.SizeBytes, d.BackingImage,
-		d.StorageType, d.StorageVolume, d.TargetDev, d.BackingDisk, now)
+		d.StorageType, d.StorageVolume, d.TargetDev, d.BackingDisk,
+		nullIfEmpty(d.Bus), deviceKind, boolToInt(d.DeleteWithVM), nullIfEmpty(d.ControllerModel), now)
 }
 
 // UpdateDiskHostAndPath updates the host and path for a disk after migration.

@@ -620,3 +620,119 @@ func TestUpdateVMInterfaceIP(t *testing.T) {
 		t.Errorf("unexpected IP: %+v", got)
 	}
 }
+
+// TestInsertDisk_HardwareColumns covers the v42 hardware-foundation columns
+// (bus, device_kind, delete_with_vm, controller_model) round-tripping through
+// InsertDisk/GetVMDisks.
+func TestInsertDisk_HardwareColumns(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	InsertVM(ctx, c, VMRecord{Name: "vm-hw", HostName: "h1", Spec: "{}", State: "running"}, nil, nil)
+
+	d := DiskRecord{
+		VMName:          "vm-hw",
+		DiskName:        "data",
+		HostName:        "h1",
+		Path:            "/disks/vm-hw-data.qcow2",
+		SizeBytes:       10737418240,
+		StorageType:     "local",
+		TargetDev:       "sda",
+		Bus:             "scsi",
+		DeviceKind:      "disk",
+		DeleteWithVM:    true,
+		ControllerModel: "virtio-scsi",
+	}
+	if err := InsertDisk(ctx, c, d); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+
+	disks, err := GetVMDisks(ctx, c, "vm-hw")
+	if err != nil {
+		t.Fatalf("GetVMDisks: %v", err)
+	}
+	if len(disks) != 1 {
+		t.Fatalf("expected 1 disk, got %d", len(disks))
+	}
+	got := disks[0]
+	if got.Bus != "scsi" {
+		t.Errorf("Bus = %q, want scsi", got.Bus)
+	}
+	if got.DeviceKind != "disk" {
+		t.Errorf("DeviceKind = %q, want disk", got.DeviceKind)
+	}
+	if !got.DeleteWithVM {
+		t.Errorf("DeleteWithVM = false, want true")
+	}
+	if got.ControllerModel != "virtio-scsi" {
+		t.Errorf("ControllerModel = %q, want virtio-scsi", got.ControllerModel)
+	}
+}
+
+// TestInsertDisk_HardwareColumnDefaults covers a caller that doesn't set the
+// new fields: DeviceKind must still land as 'disk' (the column default),
+// matching existing create-time callers until Phase 7 updates them.
+func TestInsertDisk_HardwareColumnDefaults(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	InsertVM(ctx, c, VMRecord{Name: "vm-hw-default", HostName: "h1", Spec: "{}", State: "running"}, nil, nil)
+
+	if err := InsertDisk(ctx, c, DiskRecord{
+		VMName:      "vm-hw-default",
+		DiskName:    "root",
+		HostName:    "h1",
+		Path:        "/disks/vm-hw-default-root.qcow2",
+		StorageType: "local",
+		TargetDev:   "vda",
+	}); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+
+	disks, err := GetVMDisks(ctx, c, "vm-hw-default")
+	if err != nil {
+		t.Fatalf("GetVMDisks: %v", err)
+	}
+	if len(disks) != 1 {
+		t.Fatalf("expected 1 disk, got %d", len(disks))
+	}
+	if disks[0].DeviceKind != "disk" {
+		t.Errorf("DeviceKind = %q, want disk (default)", disks[0].DeviceKind)
+	}
+}
+
+// TestHardwareAdoptionState covers the vms.hardware_adoption_state/
+// hardware_adoption_error accessors added for the hardware-foundation work.
+func TestHardwareAdoptionState(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	InsertVM(ctx, c, VMRecord{Name: "vm-adopt", HostName: "h1", Spec: "{}", State: "running"}, nil, nil)
+
+	// New VM rows default to 'pending' with no error (column default).
+	state, errReason, err := GetHardwareAdoptionState(ctx, c, "vm-adopt")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "pending" {
+		t.Errorf("initial state = %q, want pending", state)
+	}
+	if errReason != "" {
+		t.Errorf("initial errReason = %q, want empty", errReason)
+	}
+
+	if err := SetHardwareAdoptionState(ctx, c, "vm-adopt", "blocked", "reason"); err != nil {
+		t.Fatalf("SetHardwareAdoptionState: %v", err)
+	}
+
+	state, errReason, err = GetHardwareAdoptionState(ctx, c, "vm-adopt")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "blocked" {
+		t.Errorf("state = %q, want blocked", state)
+	}
+	if errReason != "reason" {
+		t.Errorf("errReason = %q, want reason", errReason)
+	}
+}

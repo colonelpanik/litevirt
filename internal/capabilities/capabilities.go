@@ -181,6 +181,16 @@ const (
 	// transition, not an auto-latch (deferred; see docs/diagnostics.md). Until then, local API writes
 	// stay on the legacy writer and this gate only makes consolidation's canonical writes acceptable.
 	CanonicalRegistryV1 = "canonical_registry_v1"
+	// HardwareV2 gates the source-of-truth cutover for VM hardware management (the VM
+	// Hardware Foundation effort): once enforced cluster-wide, hardware reads/writes
+	// move off the legacy representation onto the new one. This registration is the
+	// first step only — it makes the token a known, advertised name so the latch
+	// machinery can reference it by string; a later task gates advertisement on
+	// per-node readiness (so a node still migrating its hardware state doesn't
+	// advertise support before it's actually ready) and another adds the
+	// latch/enforcement machinery itself. Additive: changes no existing token's
+	// value or behavior.
+	HardwareV2 = "hardware_v2"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -267,12 +277,13 @@ var supported = []string{
 	LiveResizeV1,
 	CanonicalIdentityV1,
 	CanonicalRegistryV1,
+	HardwareV2,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

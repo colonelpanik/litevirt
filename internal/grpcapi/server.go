@@ -469,6 +469,21 @@ func (s *Server) operationProtocolActive(ctx context.Context) bool {
 	return s.enfOperationProtocol && s.gate != nil && s.gate.Enforced(ctx, capabilities.OperationProtocolV1)
 }
 
+// hardwareV2Latched reports whether the hardware_v2 source-of-truth cutover (VM
+// Hardware Foundation) may be relied upon: operation_protocol_v1 must be active
+// AND the hardware_v2 capability itself must be latched cluster-wide. Unlike the
+// other reversible tokens, hardware_v2 has no local config kill-switch of its own —
+// its activation is automatic (version/advertisement-gated via the latch) — but it
+// hard-depends on operation_protocol_v1 (hardware mutations require the crash-safe
+// operation journal), so that check is short-circuited FIRST: a missing protocol
+// always means not-latched, regardless of the hardware marker's state.
+func (s *Server) hardwareV2Latched(ctx context.Context) bool {
+	if !s.operationProtocolActive(ctx) {
+		return false
+	}
+	return s.gate != nil && s.gate.Enforced(ctx, capabilities.HardwareV2)
+}
+
 // SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
 func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
 

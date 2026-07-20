@@ -898,3 +898,59 @@ func TestGenerateDomainXML_SPICEOnly(t *testing.T) {
 		t.Errorf("expected video device for SPICE-only VM; got:\n%s", xmlOut)
 	}
 }
+
+// TestGenerateDomainXML_HostdevAlias verifies a hostdev with a stable user
+// alias set carries a <alias name="ua-..."/> child so the reconcile
+// primitive can match the node across re-resolution to a different host
+// BDF. The alias is expected to already be a full "ua-"-prefixed string;
+// the generator must emit it verbatim, not re-prefix it.
+func TestGenerateDomainXML_HostdevAlias(t *testing.T) {
+	cfg := VMConfig{
+		Name:      "hostdev-alias-vm",
+		CPU:       2,
+		MemoryMiB: 2048,
+		Firmware:  "bios",
+		Hostdevs: []HostdevConfig{
+			{Address: "0000:41:00.0", Alias: "ua-dev1-m0"},
+		},
+	}
+
+	xmlOut, err := GenerateDomainXML(cfg)
+	if err != nil {
+		t.Fatalf("GenerateDomainXML: %v", err)
+	}
+
+	if !strings.Contains(xmlOut, `<hostdev`) {
+		t.Fatalf("expected <hostdev> element; got:\n%s", xmlOut)
+	}
+	if !strings.Contains(xmlOut, `<alias name="ua-dev1-m0"`) {
+		t.Errorf("expected hostdev alias name=\"ua-dev1-m0\"; got:\n%s", xmlOut)
+	}
+}
+
+// TestGenerateDomainXML_HostdevNoAlias verifies a hostdev with no Alias set
+// omits the <alias> child entirely (no empty/blank alias element), so
+// existing callers that never populate Alias see identical output.
+func TestGenerateDomainXML_HostdevNoAlias(t *testing.T) {
+	cfg := VMConfig{
+		Name:      "hostdev-noalias-vm",
+		CPU:       2,
+		MemoryMiB: 2048,
+		Firmware:  "bios",
+		Hostdevs: []HostdevConfig{
+			{Address: "0000:41:00.0"},
+		},
+	}
+
+	xmlOut, err := GenerateDomainXML(cfg)
+	if err != nil {
+		t.Fatalf("GenerateDomainXML: %v", err)
+	}
+
+	if !strings.Contains(xmlOut, `<hostdev`) {
+		t.Fatalf("expected <hostdev> element; got:\n%s", xmlOut)
+	}
+	if strings.Contains(xmlOut, `<alias`) {
+		t.Errorf("expected no <alias> element when Alias is unset; got:\n%s", xmlOut)
+	}
+}

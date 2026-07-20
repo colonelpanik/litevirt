@@ -85,6 +85,12 @@ type NUMAPolicy struct {
 // HostdevConfig describes a PCI device to pass through to the VM.
 type HostdevConfig struct {
 	Address string // PCI address "0000:41:00.0"
+	// Alias, when set, is a stable libvirt user alias (already fully formed,
+	// e.g. "ua-<device_id>-<member_id>") emitted verbatim on the generated
+	// <hostdev> so the reconcile primitive can match this device's node
+	// across re-resolution to a different host PCI address. Empty = no
+	// <alias> child is emitted.
+	Alias string
 }
 
 // DiskConfig describes a VM disk.
@@ -477,7 +483,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	// PCI passthrough hostdevs
 	for _, hd := range cfg.Hostdevs {
 		parsed := ParsePCIAddress(hd.Address)
-		dev.Hostdevs = append(dev.Hostdevs, hostdevDevice{
+		hostdev := hostdevDevice{
 			Mode:    "subsystem",
 			Type:    "pci",
 			Managed: "yes",
@@ -489,7 +495,11 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 					Function: parsed.Function,
 				},
 			},
-		})
+		}
+		if hd.Alias != "" {
+			hostdev.Alias = &hostdevAlias{Name: hd.Alias}
+		}
+		dev.Hostdevs = append(dev.Hostdevs, hostdev)
 	}
 
 	// Emulated TPM 2.0 (G1). State is pinned at TPMStateDir (when set) so it
@@ -909,6 +919,11 @@ type hostdevDevice struct {
 	Type    string        `xml:"type,attr"`
 	Managed string        `xml:"managed,attr"`
 	Source  hostdevSource `xml:"source"`
+	Alias   *hostdevAlias `xml:"alias,omitempty"`
+}
+
+type hostdevAlias struct {
+	Name string `xml:"name,attr"`
 }
 
 type hostdevSource struct {

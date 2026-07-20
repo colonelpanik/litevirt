@@ -187,6 +187,15 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 	noop := func() {}
 	var members []ResolvedMember
 
+	// Cross-spec exclusion set: the addresses already selected by earlier specs in
+	// THIS request (primaries + IOMMU-group siblings + claimed SR-IOV VFs). The old
+	// fused loop assigned each spec inline, so a later type/vendor spec's
+	// GetAvailableDevicesByType saw a SHRINKING pool; resolving deferred assignment
+	// to acquire, so every type spec would otherwise re-select the same free
+	// device. Threading this set restores the pool-shrinking semantics PURELY — no
+	// assignment in the resolve phase, just in-memory exclusion.
+	selected := map[string]bool{}
+
 	for _, spec := range specs {
 		count := int(spec.Count)
 		if count == 0 {
@@ -197,20 +206,32 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		// and may create a VF pool on-demand (writing host sysfs) — so it cannot be
 		// part of the pure resolver and stays on this path. The claimed VFs flow into
 		// acquireDeviceLeases alongside the rest for the durable lease + vfio bind.
-		if spec.Sriov && spec.Address == "" {
+		//
+		// A resource-mapping spec is a concrete pin, not VF allocation: mapping
+		// resolution must precede the SR-IOV branch (as in the original order), so a
+		// Sriov+Mapping spec resolves the mapped device rather than allocating a VF.
+		if spec.Sriov && spec.Address == "" && spec.Mapping == "" {
 			vfAddrs, err := s.allocateSRIOVVFs(ctx, vmName, spec, count)
 			if err != nil {
 				return nil, noop, err
 			}
 			for i, a := range vfAddrs {
 				members = append(members, ResolvedMember{MemberID: fmt.Sprintf("m%d", i), Address: a, Ordinal: i})
+				selected[a] = true
 			}
 			continue
 		}
 
-		specMembers, err := s.resolveDeviceSpec(ctx, vmName, spec, "")
+		specMembers, err := s.resolveDeviceSpec(ctx, vmName, spec, "", selected)
 		if err != nil {
 			return nil, noop, err
+		}
+		// Freeze the resolved concrete BDF back onto a resource-mapping spec so
+		// CreateVM's json.Marshal(spec) persists the pinned address (behavior-
+		// preserving; making the mapping stay portable is a later phase's job). The
+		// pure resolveDeviceSpec never mutates the spec — allocateDevices does.
+		if spec.Mapping != "" && spec.Address == "" && len(specMembers) > 0 {
+			spec.Address = specMembers[0].Address
 		}
 		members = append(members, specMembers...)
 	}
@@ -236,7 +257,14 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 // hardware or inventory ownership — so it is safe to run while reconciling a
 // stopped VM. deviceID (the intent id, "" for the live-spec path) is stamped
 // onto every returned member.
-func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.DeviceSpec, deviceID string) ([]ResolvedMember, error) {
+//
+// exclude is a cross-spec working set of addresses already chosen by earlier
+// specs in the same request: type/vendor selection SKIPS any candidate in it, and
+// each address this call selects (primary + IOMMU-group siblings) is added to it,
+// so a subsequent spec sees the same shrunken pool the old inline-assign loop did.
+// It is a caller-owned scratch map (never a *pb.DeviceSpec), so mutating it keeps
+// the resolver pure w.r.t. host hardware and inventory ownership.
+func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.DeviceSpec, deviceID string, exclude map[string]bool) ([]ResolvedMember, error) {
 	count := int(spec.Count)
 	if count == 0 {
 		count = 1
@@ -270,11 +298,13 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 		}
 		members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: primary, Ordinal: ordinal})
 		ordinal++
+		exclude[primary] = true
 		groupAddrs, _ := s.iommuGroupSiblings(ctx, primary)
 		for _, a := range groupAddrs {
 			if a != primary {
 				members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: a, Ordinal: ordinal})
 				ordinal++
+				exclude[a] = true
 			}
 		}
 		return nil
@@ -293,9 +323,13 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query devices: %v", err)
 	}
-	// Filter by vendor/model if specified.
+	// Filter by vendor/model if specified, skipping any device already chosen by an
+	// earlier spec in this request (the cross-spec pool-shrinking exclusion).
 	var matched []corrosion.PCIDeviceRecord
 	for _, d := range available {
+		if exclude[d.Address] {
+			continue
+		}
 		if spec.Vendor != "" && d.VendorID != spec.Vendor {
 			continue
 		}
@@ -328,6 +362,10 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 // into this resolver is deferred to the start-path task.
 func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord) ([]ResolvedMember, error) {
 	var members []ResolvedMember
+	// Cross-intent exclusion set (see resolveDeviceSpec): a scratch map so two
+	// type/vendor intents resolve to distinct devices, exactly as the live-spec
+	// path. Local to this call — resolveDeviceIntents stays pure.
+	selected := map[string]bool{}
 	for _, intent := range intents {
 		switch intent.SelectorKind {
 		case "sriov":
@@ -338,7 +376,7 @@ func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intent
 			if intent.ExclusiveKey != nil {
 				addr = *intent.ExclusiveKey
 			}
-			specMembers, err := s.resolveDeviceSpec(ctx, vmName, &pb.DeviceSpec{Address: addr}, intent.DeviceID)
+			specMembers, err := s.resolveDeviceSpec(ctx, vmName, &pb.DeviceSpec{Address: addr}, intent.DeviceID, selected)
 			if err != nil {
 				return nil, err
 			}
@@ -348,7 +386,7 @@ func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intent
 			if err := protojson.Unmarshal([]byte(intent.SelectorPayload), spec); err != nil {
 				return nil, status.Errorf(codes.Internal, "decode selector payload for device %s: %v", intent.DeviceID, err)
 			}
-			specMembers, err := s.resolveDeviceSpec(ctx, vmName, spec, intent.DeviceID)
+			specMembers, err := s.resolveDeviceSpec(ctx, vmName, spec, intent.DeviceID, selected)
 			if err != nil {
 				return nil, err
 			}

@@ -204,6 +204,113 @@ func TestResolveDeviceIntents_PureTypeSelector(t *testing.T) {
 	}
 }
 
+// TestAllocateDevices_MultiTypeSpec_DistinctDevices pins the cross-spec
+// pool-shrinking invariant: two separate type-based specs on a host with two free
+// GPUs must resolve to two DISTINCT devices (one each), not the same device twice.
+// The old fused allocateDevices assigned each spec inline, so the second spec's
+// GetAvailableDevicesByType saw a shrunk pool; the resolve/acquire split must
+// reproduce that via a cross-spec exclusion set. A duplicate here would emit two
+// identical <hostdev> entries and fail DefineDomain on a create that used to work.
+func TestAllocateDevices_MultiTypeSpec_DistinctDevices(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+
+	// Two free GPUs, distinct IOMMU groups (no siblings).
+	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:44:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	})
+	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:45:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	})
+
+	addrs, finish, err := s.allocateDevices(ctx, "vm-2gpu", []*pb.DeviceSpec{
+		{Type: "gpu"}, {Type: "gpu"},
+	})
+	if err != nil {
+		t.Fatalf("allocateDevices: %v", err)
+	}
+	defer finish()
+
+	if len(addrs) != 2 {
+		t.Fatalf("addresses = %v, want 2", addrs)
+	}
+	if addrs[0] == addrs[1] {
+		t.Fatalf("addresses = %v, want two DISTINCT devices (second type spec re-picked the first)", addrs)
+	}
+}
+
+// TestAllocateDevices_AddressPinThenTypeSpec_NoRepick pins that an exact-address
+// spec's device is excluded from a later same-type spec's candidate pool: the type
+// spec must NOT re-pick the already-pinned BDF.
+func TestAllocateDevices_AddressPinThenTypeSpec_NoRepick(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+
+	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:44:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	})
+	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:45:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	})
+
+	addrs, finish, err := s.allocateDevices(ctx, "vm-pin-type", []*pb.DeviceSpec{
+		{Address: "0000:44:00.0"}, {Type: "gpu"},
+	})
+	if err != nil {
+		t.Fatalf("allocateDevices: %v", err)
+	}
+	defer finish()
+
+	if len(addrs) != 2 {
+		t.Fatalf("addresses = %v, want 2", addrs)
+	}
+	if addrs[0] != "0000:44:00.0" {
+		t.Fatalf("addresses[0] = %q, want the pinned 0000:44:00.0", addrs[0])
+	}
+	if addrs[1] == "0000:44:00.0" {
+		t.Fatalf("addresses = %v, type spec re-picked the pinned BDF", addrs)
+	}
+}
+
+// TestAllocateDevices_MappingSpec_FreezesAddress pins that allocateDevices writes
+// the resolved concrete BDF back onto a resource-mapping spec's Address, so
+// CreateVM's json.Marshal(spec) persists the pinned device (behavior-preserving;
+// the pure resolveDeviceSpec must NOT mutate the spec — allocateDevices does).
+func TestAllocateDevices_MappingSpec_FreezesAddress(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+
+	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:46:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	})
+	if err := corrosion.CreateResourceMapping(ctx, s.db, "gpu-map", "test mapping"); err != nil {
+		t.Fatalf("CreateResourceMapping: %v", err)
+	}
+	if err := corrosion.AddMappingDevice(ctx, s.db, "gpu-map", "test-host", "0000:46:00.0", "10de", ""); err != nil {
+		t.Fatalf("AddMappingDevice: %v", err)
+	}
+
+	spec := &pb.DeviceSpec{Mapping: "gpu-map"}
+	addrs, finish, err := s.allocateDevices(ctx, "vm-map", []*pb.DeviceSpec{spec})
+	if err != nil {
+		t.Fatalf("allocateDevices: %v", err)
+	}
+	defer finish()
+
+	if len(addrs) != 1 || addrs[0] != "0000:46:00.0" {
+		t.Fatalf("addresses = %v, want [0000:46:00.0]", addrs)
+	}
+	if spec.Address != "0000:46:00.0" {
+		t.Fatalf("spec.Address = %q after allocateDevices, want frozen 0000:46:00.0", spec.Address)
+	}
+}
+
 func TestRescanHost_WrongHost(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

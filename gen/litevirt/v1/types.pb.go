@@ -2926,13 +2926,14 @@ func (x *PCIDevice) GetLinkPeers() []string {
 }
 
 type AttachDeviceRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	Disk          *DiskSpec              `protobuf:"bytes,2,opt,name=disk,proto3" json:"disk,omitempty"`
-	Nic           *NetworkAttachment     `protobuf:"bytes,3,opt,name=nic,proto3" json:"nic,omitempty"`
-	PciDevice     *DeviceSpec            `protobuf:"bytes,4,opt,name=pci_device,json=pciDevice,proto3" json:"pci_device,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	VmName         string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	Disk           *DiskSpec              `protobuf:"bytes,2,opt,name=disk,proto3" json:"disk,omitempty"`
+	Nic            *NetworkAttachment     `protobuf:"bytes,3,opt,name=nic,proto3" json:"nic,omitempty"`
+	PciDevice      *DeviceSpec            `protobuf:"bytes,4,opt,name=pci_device,json=pciDevice,proto3" json:"pci_device,omitempty"`
+	IdempotencyKey string                 `protobuf:"bytes,5,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *AttachDeviceRequest) Reset() {
@@ -2993,14 +2994,22 @@ func (x *AttachDeviceRequest) GetPciDevice() *DeviceSpec {
 	return nil
 }
 
+func (x *AttachDeviceRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
 type DetachDeviceRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	DiskName      string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
-	NicMac        string                 `protobuf:"bytes,3,opt,name=nic_mac,json=nicMac,proto3" json:"nic_mac,omitempty"`
-	PciAddress    string                 `protobuf:"bytes,4,opt,name=pci_address,json=pciAddress,proto3" json:"pci_address,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	VmName         string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	DiskName       string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
+	NicMac         string                 `protobuf:"bytes,3,opt,name=nic_mac,json=nicMac,proto3" json:"nic_mac,omitempty"`
+	PciAddress     string                 `protobuf:"bytes,4,opt,name=pci_address,json=pciAddress,proto3" json:"pci_address,omitempty"`
+	IdempotencyKey string                 `protobuf:"bytes,5,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *DetachDeviceRequest) Reset() {
@@ -3057,6 +3066,13 @@ func (x *DetachDeviceRequest) GetNicMac() string {
 func (x *DetachDeviceRequest) GetPciAddress() string {
 	if x != nil {
 		return x.PciAddress
+	}
+	return ""
+}
+
+func (x *DetachDeviceRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
 	}
 	return ""
 }
@@ -5736,19 +5752,21 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\vlink_clique\x18\x11 \x01(\tR\n" +
 	"linkClique\x12\x1d\n" +
 	"\n" +
-	"link_peers\x18\x12 \x03(\tR\tlinkPeers\"\xc3\x01\n" +
+	"link_peers\x18\x12 \x03(\tR\tlinkPeers\"\xec\x01\n" +
 	"\x13AttachDeviceRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12)\n" +
 	"\x04disk\x18\x02 \x01(\v2\x15.litevirt.v1.DiskSpecR\x04disk\x120\n" +
 	"\x03nic\x18\x03 \x01(\v2\x1e.litevirt.v1.NetworkAttachmentR\x03nic\x126\n" +
 	"\n" +
-	"pci_device\x18\x04 \x01(\v2\x17.litevirt.v1.DeviceSpecR\tpciDevice\"\x85\x01\n" +
+	"pci_device\x18\x04 \x01(\v2\x17.litevirt.v1.DeviceSpecR\tpciDevice\x12'\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xae\x01\n" +
 	"\x13DetachDeviceRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x12\x17\n" +
 	"\anic_mac\x18\x03 \x01(\tR\x06nicMac\x12\x1f\n" +
 	"\vpci_address\x18\x04 \x01(\tR\n" +
-	"pciAddress\"\xae\x04\n" +
+	"pciAddress\x12'\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xae\x04\n" +
 	"\x02VM\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +

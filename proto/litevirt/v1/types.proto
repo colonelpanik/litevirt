@@ -377,6 +377,7 @@ message AttachDeviceRequest {
     DiskSpec          disk       = 2;
     NetworkAttachment nic        = 3;
     DeviceSpec        pci_device = 4;
+    string idempotency_key = 5;
 }
 
 message DetachDeviceRequest {
@@ -384,6 +385,7 @@ message DetachDeviceRequest {
     string disk_name   = 2;
     string nic_mac     = 3;
     string pci_address = 4;
+    string idempotency_key = 5;
 }
 
 // ═══════════ Runtime / Response Types ═══════════

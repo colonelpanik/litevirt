@@ -18,7 +18,7 @@ import (
 // shape (even one that keeps the family size) changes this digest, so the no-delete rule can't
 // silently swap out an old compatibility shape for an equal-sized replacement. Update it only
 // with a deliberate, reviewed compatibility change (e.g. a release ages out of the horizon).
-const compatibilityDigest = "fd28845a8d8bb8780b7de73750aa8cc13f0c63cfa253d205373c26b585532a0d"
+const compatibilityDigest = "a6c495cb3f8358e75200760094e98933a32bdc8836d2b929791aac454c3864ea"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -62,6 +62,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"stack_firewall_teardown_v130": 4,   // ip_sets / cluster_firewall_rules / host_firewall_rules / firewall_defaults
 	"vm_rename_v130":               3,   // vm_interfaces / vm_disks / ip_allocations
 	"network_rename_v130":          3,   // network_vteps / ip_allocations / vm_interfaces
+	"vm_disks_insert_v130":         1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

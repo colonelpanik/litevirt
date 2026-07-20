@@ -69,5 +69,14 @@ func HistoricalShapes() []HistoricalShape {
 	add("UPDATE ip_allocations SET network = ?, updated_at = ? WHERE network = ? AND deleted_at IS NULL", "network_rename_v130")
 	add("UPDATE vm_interfaces SET network_name = ?, updated_at = ? WHERE network_name = ? AND deleted_at IS NULL", "network_rename_v130")
 
+	// InsertDisk (v1.3.0..): the vm_disks hot-plug/create upsert BEFORE its column list widened
+	// to carry the per-disk hardware fields (bus, device_kind, delete_with_vm, controller_model).
+	// Supported peers still emit this narrower shape while the current tree emits the wider one, so
+	// the narrow shape is historical-only and must stay registered for the rolling-upgrade horizon.
+	add(`INSERT OR REPLACE INTO vm_disks
+		 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
+		  storage_type, storage_volume, target_dev, backing_disk, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, "vm_disks_insert_v130")
+
 	return out
 }

@@ -438,7 +438,7 @@ func SetVMTemplate(ctx context.Context, c *Client, name string, isTemplate bool)
 func SetHardwareAdoptionState(ctx context.Context, c *Client, vmName, state, errReason string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
-		`UPDATE vms SET hardware_adoption_state = ?, hardware_adoption_error = ?, updated_at = ? WHERE name = ?`,
+		`UPDATE vms SET hardware_adoption_state = ?, hardware_adoption_error = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
 		state, nullIfEmpty(errReason), now, vmName)
 }
 

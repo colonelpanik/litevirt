@@ -423,6 +423,50 @@ message VMDisk {
     string storage_volume = 7;
 }
 
+message HardwareDevice {
+  oneof device {
+    HardwareDisk disk = 1;
+    HardwareNIC  nic  = 2;
+    HardwarePCI  pci  = 3;
+  }
+}
+
+message HardwareDisk {
+  string device_id       = 1; // = disk_name
+  string target          = 2; // e.g. vdb
+  string bus             = 3; // virtio|scsi|sata
+  string controller_model = 4;
+  int64  size_bytes      = 5;
+  string storage_type    = 6; // driver: local|nfs|ceph
+  string storage_volume  = 7;
+  bool   delete_with_vm  = 8;
+  string state           = 9;
+}
+
+message HardwareNIC {
+  string mac             = 1; // stable external handle
+  string network         = 2;
+  string model           = 3;
+  int32  ordinal         = 4;
+  string security_groups = 5;
+  string state           = 6;
+}
+
+message HardwarePCIMember {
+  string member_id        = 1;
+  string resolved_address = 2;
+  string xml_alias        = 3;
+  int32  ordinal          = 4;
+}
+
+message HardwarePCI {
+  string device_id                = 1;
+  string selector_kind            = 2; // address|mapping|sriov|type
+  DeviceSpec desired              = 3;
+  repeated HardwarePCIMember members = 4;
+  string state                    = 5;
+}
+
 message Host {
     string                         name          = 1;
     string                         address       = 2;

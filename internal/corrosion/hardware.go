@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 )
 
 // NICRecord represents a single VM network interface as read from either the
@@ -147,9 +148,19 @@ func GetVMNICsRaw(ctx context.Context, c *Client, table, vmName string) ([]NICRe
 // nicKey groups vm_nics/vm_interfaces rows for the MergedVMNICs overlay. Two
 // rows describe the same physical NIC iff they share (vm_name, mac) — mac is
 // the only identifier the legacy table carries, so it is the only safe join
-// key across both tables.
+// key across both tables. mac is lower-cased before building the key (see
+// nicJoinKey) so the two tables disagreeing on MAC letter-case still join as
+// one NIC instead of emitting a duplicate; the stored/returned NICRecord.MAC
+// value itself is never mutated.
 type nicKey struct {
 	vmName, mac string
+}
+
+// nicJoinKey builds the overlay's join key for r, normalizing MAC case so
+// vm_nics/vm_interfaces rows for the same physical NIC always land in the
+// same group even if the two tables disagree on letter-case.
+func nicJoinKey(r NICRecord) nicKey {
+	return nicKey{r.VMName, strings.ToLower(r.MAC)}
 }
 
 // MergedVMNICs is the transition-time overlay reconciling the v42 vm_nics
@@ -157,12 +168,17 @@ type nicKey struct {
 // that must see a consistent view while the fleet backfills vm_nics.
 //
 // Overlay rule: gather every live-or-tombstoned row for vmName from both
-// tables, group by (vm_name, mac), and within each group pick the row with
-// the greatest updated_at. On an EXACT updated_at tie, the vm_nics row wins
-// (it is the forward-looking source of truth once a writer has touched it).
-// The winner is emitted only if its deleted_at is empty — a tombstoned
-// winner hides the NIC entirely, even if the other table has an older LIVE
-// row for the same mac (the newer tombstone is authoritative).
+// tables, group by (vm_name, mac) (case-insensitively, via nicJoinKey), and
+// within each group pick the row with the greatest updated_at, ordered via
+// lwwOrder (see sync.go) rather than a raw string compare — updated_at
+// becomes an HLC key once hlc_lww is enabled, and an HLC string sorts
+// LEXICALLY BEFORE any legacy RFC3339 string, so a plain `>` would let a
+// stale vm_interfaces row beat a chronologically newer vm_nics row. On an
+// EXACT updated_at tie (lwwOrder == 0), the vm_nics row wins (it is the
+// forward-looking source of truth once a writer has touched it). The winner
+// is emitted only if its deleted_at is empty — a tombstoned winner hides the
+// NIC entirely, even if the other table has an older LIVE row for the same
+// mac (the newer tombstone is authoritative).
 func MergedVMNICs(ctx context.Context, c *Client, vmName string) ([]NICRecord, error) {
 	nics, err := GetVMNICsRaw(ctx, c, "vm_nics", vmName)
 	if err != nil {
@@ -180,16 +196,16 @@ func MergedVMNICs(ctx context.Context, c *Client, vmName string) ([]NICRecord, e
 	best := make(map[nicKey]candidate)
 
 	consider := func(r NICRecord, fromNics bool) {
-		k := nicKey{r.VMName, r.MAC}
+		k := nicJoinKey(r)
 		cur, ok := best[k]
 		if !ok {
 			best[k] = candidate{r, fromNics}
 			return
 		}
 		switch {
-		case r.UpdatedAt > cur.rec.UpdatedAt:
+		case lwwOrder(r.UpdatedAt, cur.rec.UpdatedAt) > 0:
 			best[k] = candidate{r, fromNics}
-		case r.UpdatedAt == cur.rec.UpdatedAt && fromNics && !cur.fromNics:
+		case lwwOrder(r.UpdatedAt, cur.rec.UpdatedAt) == 0 && fromNics && !cur.fromNics:
 			// Exact tie: vm_nics wins over vm_interfaces.
 			best[k] = candidate{r, fromNics}
 		}

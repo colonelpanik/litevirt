@@ -7,10 +7,10 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// TestReleaseDeviceSet_ScopedRollback is the over-release regression: rolling
+// TestReleaseDeviceLeases_ScopedRollback is the over-release regression: rolling
 // back a FAILED allocation must release only the devices that allocation
 // claimed, never the VM's pre-existing passthrough devices.
-func TestReleaseDeviceSet_ScopedRollback(t *testing.T) {
+func TestReleaseDeviceLeases_ScopedRollback(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	// A pre-existing passthrough device (from an earlier CreateVM) + a device the
@@ -27,7 +27,7 @@ func TestReleaseDeviceSet_ScopedRollback(t *testing.T) {
 	}
 
 	// Roll back ONLY the just-claimed device.
-	s.releaseDeviceSet(ctx, "vm1", []string{"0000:02:00.0"})
+	s.releaseDeviceLeases(ctx, "vm1", []string{"0000:02:00.0"})
 
 	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	if err != nil {

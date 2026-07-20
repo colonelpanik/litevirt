@@ -294,7 +294,7 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 		if err := s.virt.AttachHostdev(vmName, addr); err != nil {
 			// Roll back only the devices THIS attach claimed (not the VM's
 			// pre-existing passthrough devices).
-			s.releaseDeviceSet(ctx, vmName, addrs)
+			s.releaseDeviceLeases(ctx, vmName, addrs)
 			return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
 		}
 		slog.Info("PCI device attached", "vm", vmName, "address", addr)

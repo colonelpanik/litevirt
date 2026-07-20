@@ -2,11 +2,13 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -158,18 +160,32 @@ func (s *Server) ListHostDevices(ctx context.Context, req *pb.ListHostDevicesReq
 	return resp, nil
 }
 
+// ResolvedMember is one concrete host device that realizes a PCI passthrough
+// request: the resolved BDF plus the intent/member identity used to key its
+// vm_pci_realizations row and its `ua-<DeviceID>-<MemberID>` hostdev alias.
+// Ordinal orders the members realizing a single request (primary = 0, then its
+// IOMMU-group siblings, then subsequent count-N devices).
+type ResolvedMember struct {
+	DeviceID string
+	MemberID string
+	Address  string
+	Ordinal  int
+}
+
 // allocateDevices resolves DeviceSpec requests against host inventory,
 // validates IOMMU group conflicts, assigns devices, binds to VFIO-PCI,
 // and returns the PCI addresses for hostdev XML.
 //
-// It returns the resolved addresses AND a finish func: the durable device-lease
-// entry (F1) is written before the vfio bind, and the CALLER must defer finish()
-// so the lease is cleared once the VM row is finalized (or on the caller's own
-// rollback). A crash before finish() runs leaves the entry for startup recovery
-// (RecoverDeviceLeases) to roll back.
+// It is a thin composition of the pure resolve phase (resolveDeviceSpec /
+// allocateSRIOVVFs) and the side-effecting acquire phase (acquireDeviceLeases):
+// existing callers see identical behavior. It returns the resolved addresses AND
+// a finish func: the durable device-lease entry (F1) is written before the vfio
+// bind, and the CALLER must defer finish() so the lease is cleared once the VM
+// row is finalized (or on the caller's own rollback). A crash before finish()
+// runs leaves the entry for startup recovery (RecoverDeviceLeases) to roll back.
 func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb.DeviceSpec) ([]string, func(), error) {
 	noop := func() {}
-	var addresses []string
+	var members []ResolvedMember
 
 	for _, spec := range specs {
 		count := int(spec.Count)
@@ -177,98 +193,192 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 			count = 1
 		}
 
-		// Resource mapping (#14): resolve a cluster-wide mapping name to the
-		// concrete PCI address registered for THIS host, then allocate it as an
-		// exact pin. This is what lets a passthrough VM land on / migrate to any
-		// host that has a device under the same mapping.
-		if spec.Mapping != "" && spec.Address == "" {
-			addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName)
-			if err != nil {
-				return nil, noop, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)
-			}
-			if addr == "" {
-				return nil, noop, status.Errorf(codes.FailedPrecondition,
-					"resource mapping %q has no device on host %s", spec.Mapping, s.hostName)
-			}
-			spec.Address = addr
-		}
-
-		// SR-IOV VF allocation: create a VF on-demand if requested.
+		// SR-IOV VF allocation is inherently side-effecting — it CAS-claims free VFs
+		// and may create a VF pool on-demand (writing host sysfs) — so it cannot be
+		// part of the pure resolver and stays on this path. The claimed VFs flow into
+		// acquireDeviceLeases alongside the rest for the durable lease + vfio bind.
 		if spec.Sriov && spec.Address == "" {
 			vfAddrs, err := s.allocateSRIOVVFs(ctx, vmName, spec, count)
 			if err != nil {
 				return nil, noop, err
 			}
-			addresses = append(addresses, vfAddrs...)
-			continue
-		}
-
-		// Exact address pinning.
-		if spec.Address != "" {
-			// Validate IOMMU group conflict before assignment.
-			if err := s.checkIOMMUConflict(ctx, spec.Address, vmName); err != nil {
-				return nil, noop, err
-			}
-
-			addresses = append(addresses, spec.Address)
-			if err := corrosion.AssignPCIDevice(ctx, s.db, s.hostName, spec.Address, vmName); err != nil {
-				slog.Warn("failed to record device assignment", "address", spec.Address, "error", err)
-			}
-
-			// Also assign IOMMU group siblings.
-			groupAddrs, _ := s.iommuGroupSiblings(ctx, spec.Address)
-			for _, a := range groupAddrs {
-				if a != spec.Address {
-					addresses = append(addresses, a)
-					corrosion.AssignPCIDevice(ctx, s.db, s.hostName, a, vmName)
-				}
+			for i, a := range vfAddrs {
+				members = append(members, ResolvedMember{MemberID: fmt.Sprintf("m%d", i), Address: a, Ordinal: i})
 			}
 			continue
 		}
 
-		// Type-based allocation.
-		available, err := corrosion.GetAvailableDevicesByType(ctx, s.db, s.hostName, spec.Type)
+		specMembers, err := s.resolveDeviceSpec(ctx, vmName, spec, "")
 		if err != nil {
-			return nil, noop, status.Errorf(codes.Internal, "query devices: %v", err)
+			return nil, noop, err
 		}
+		members = append(members, specMembers...)
+	}
 
-		// Filter by vendor/model if specified.
-		var matched []corrosion.PCIDeviceRecord
-		for _, d := range available {
-			if spec.Vendor != "" && d.VendorID != spec.Vendor {
-				continue
-			}
-			if spec.Model != "" && d.DeviceName != spec.Model {
-				continue
-			}
-			matched = append(matched, d)
+	finish, err := s.acquireDeviceLeases(ctx, vmName, members)
+	if err != nil {
+		return nil, noop, err
+	}
+	addresses := make([]string, 0, len(members))
+	for _, m := range members {
+		addresses = append(addresses, m.Address)
+	}
+	return addresses, finish, nil
+}
+
+// resolveDeviceSpec is the PURE selection/validation core shared by
+// allocateDevices (from a live *pb.DeviceSpec) and resolveDeviceIntents (from a
+// stored intent). It resolves ONE non-SR-IOV request to its concrete host
+// device(s): a resource mapping to this host's pinned address, an exact address
+// or a type/vendor/model match, each expanded to include its IOMMU-group
+// siblings and validated against IOMMU-group conflicts. It performs NO
+// AssignPCIDevice, NO VF creation and NO vfio bind — nothing that touches host
+// hardware or inventory ownership — so it is safe to run while reconciling a
+// stopped VM. deviceID (the intent id, "" for the live-spec path) is stamped
+// onto every returned member.
+func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.DeviceSpec, deviceID string) ([]ResolvedMember, error) {
+	count := int(spec.Count)
+	if count == 0 {
+		count = 1
+	}
+
+	address := spec.Address
+	// Resource mapping (#14): resolve a cluster-wide mapping name to the concrete
+	// PCI address registered for THIS host, then treat it as an exact pin. This is
+	// what lets a passthrough VM land on / migrate to any host that has a device
+	// under the same mapping. Resolve into a local var — never mutate the input spec.
+	if spec.Mapping != "" && address == "" {
+		addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)
 		}
-
-		if len(matched) < count {
-			return nil, noop, status.Errorf(codes.ResourceExhausted,
-				"need %d %s device(s) but only %d available on host %s",
-				count, spec.Type, len(matched), s.hostName)
+		if addr == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"resource mapping %q has no device on host %s", spec.Mapping, s.hostName)
 		}
+		address = addr
+	}
 
-		for i := 0; i < count; i++ {
-			d := matched[i]
-
-			// Validate IOMMU group conflict.
-			if err := s.checkIOMMUConflict(ctx, d.Address, vmName); err != nil {
-				return nil, noop, err
+	var members []ResolvedMember
+	ordinal := 0
+	// addPrimary appends primary + its IOMMU-group siblings as ordered members.
+	// The conflict check is on the primary only (a sibling shares the group, so a
+	// conflicting other-VM owner is already caught by the primary's check).
+	addPrimary := func(primary string) error {
+		if err := s.checkIOMMUConflict(ctx, primary, vmName); err != nil {
+			return err
+		}
+		members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: primary, Ordinal: ordinal})
+		ordinal++
+		groupAddrs, _ := s.iommuGroupSiblings(ctx, primary)
+		for _, a := range groupAddrs {
+			if a != primary {
+				members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: a, Ordinal: ordinal})
+				ordinal++
 			}
+		}
+		return nil
+	}
 
-			addresses = append(addresses, d.Address)
-			corrosion.AssignPCIDevice(ctx, s.db, s.hostName, d.Address, vmName)
+	// Exact address pinning (also the resolved-mapping path).
+	if address != "" {
+		if err := addPrimary(address); err != nil {
+			return nil, err
+		}
+		return members, nil
+	}
 
-			// IOMMU group siblings.
-			groupAddrs, _ := s.iommuGroupSiblings(ctx, d.Address)
-			for _, a := range groupAddrs {
-				if a != d.Address {
-					addresses = append(addresses, a)
-					corrosion.AssignPCIDevice(ctx, s.db, s.hostName, a, vmName)
-				}
+	// Type-based allocation.
+	available, err := corrosion.GetAvailableDevicesByType(ctx, s.db, s.hostName, spec.Type)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query devices: %v", err)
+	}
+	// Filter by vendor/model if specified.
+	var matched []corrosion.PCIDeviceRecord
+	for _, d := range available {
+		if spec.Vendor != "" && d.VendorID != spec.Vendor {
+			continue
+		}
+		if spec.Model != "" && d.DeviceName != spec.Model {
+			continue
+		}
+		matched = append(matched, d)
+	}
+	if len(matched) < count {
+		return nil, status.Errorf(codes.ResourceExhausted,
+			"need %d %s device(s) but only %d available on host %s",
+			count, spec.Type, len(matched), s.hostName)
+	}
+	for i := 0; i < count; i++ {
+		if err := addPrimary(matched[i].Address); err != nil {
+			return nil, err
+		}
+	}
+	return members, nil
+}
+
+// resolveDeviceIntents is the PURE resolver the topology-preserving reconcile
+// primitive uses: it maps a VM's stored vm_pci_intent rows to the concrete host
+// members they realize, touching no host hardware and no inventory ownership.
+// An "address" intent resolves via its exclusive_key BDF; portable "mapping" /
+// "type" intents decode their selector_payload (a protojson DeviceSpec) and run
+// the shared resolveDeviceSpec selection. SR-IOV intents are NOT resolved here:
+// realizing them CAS-claims and may create VFs (side effects), which belongs in
+// the acquire phase (allocateSRIOVVFs) — wiring pure SR-IOV candidate selection
+// into this resolver is deferred to the start-path task.
+func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord) ([]ResolvedMember, error) {
+	var members []ResolvedMember
+	for _, intent := range intents {
+		switch intent.SelectorKind {
+		case "sriov":
+			return nil, status.Errorf(codes.Unimplemented,
+				"SR-IOV intent %s: VF realization is side-effecting and handled by the acquire path, not the pure resolver", intent.DeviceID)
+		case "address":
+			addr := ""
+			if intent.ExclusiveKey != nil {
+				addr = *intent.ExclusiveKey
 			}
+			specMembers, err := s.resolveDeviceSpec(ctx, vmName, &pb.DeviceSpec{Address: addr}, intent.DeviceID)
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, specMembers...)
+		default: // "mapping", "type"
+			spec := &pb.DeviceSpec{}
+			if err := protojson.Unmarshal([]byte(intent.SelectorPayload), spec); err != nil {
+				return nil, status.Errorf(codes.Internal, "decode selector payload for device %s: %v", intent.DeviceID, err)
+			}
+			specMembers, err := s.resolveDeviceSpec(ctx, vmName, spec, intent.DeviceID)
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, specMembers...)
+		}
+	}
+	return members, nil
+}
+
+// acquireDeviceLeases is the side-effecting counterpart to resolveDeviceIntents:
+// it takes resolved members and records inventory ownership (AssignPCIDevice),
+// writes the durable device-lease entry (F1) BEFORE the irreversible vfio bind,
+// then binds every member to vfio-pci. On a bind failure it rolls back EXACTLY
+// the devices this call claimed (releaseDeviceLeases) and clears the lease, so a
+// crash before the VM row is finalized is recovered at startup. It returns the
+// finish func the caller must defer to clear the lease once the row is durable.
+//
+// AssignPCIDevice is idempotent for a member already owned by vmName (e.g. an
+// SR-IOV VF CAS-claimed during selection), so members from either resolve path
+// are handled uniformly.
+func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members []ResolvedMember) (func(), error) {
+	noop := func() {}
+	addresses := make([]string, 0, len(members))
+	for _, m := range members {
+		addresses = append(addresses, m.Address)
+	}
+
+	for _, addr := range addresses {
+		if err := corrosion.AssignPCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
+			slog.Warn("failed to record device assignment", "address", addr, "error", err)
 		}
 	}
 
@@ -277,22 +387,21 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 	// startup. No-op unless the operation_protocol capability is active.
 	finish := s.beginDeviceLease(ctx, vmName, addresses)
 
-	// Bind all allocated devices to vfio-pci.
 	for _, addr := range addresses {
 		prevDriver, err := vfio.Bind(addr)
 		if err != nil {
 			slog.Warn("VFIO bind failed", "address", addr, "error", err)
 			// Roll back only the devices this allocation claimed, and clear the
 			// durable lease.
-			s.releaseDeviceSet(ctx, vmName, addresses)
+			s.releaseDeviceLeases(ctx, vmName, addresses)
 			finish()
-			return nil, noop, status.Errorf(codes.Internal,
+			return noop, status.Errorf(codes.Internal,
 				"failed to bind device %s to vfio-pci: %v", addr, err)
 		}
 		slog.Info("device bound to vfio-pci", "address", addr, "previous_driver", prevDriver)
 	}
 
-	return addresses, finish, nil
+	return finish, nil
 }
 
 // releaseDevices unbinds all devices from vfio-pci and releases them in the DB.
@@ -318,12 +427,12 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) {
 	}
 }
 
-// releaseDeviceSet rolls back EXACTLY the devices an allocation claimed (unbind
+// releaseDeviceLeases rolls back EXACTLY the devices an allocation claimed (unbind
 // from vfio-pci + owner-scoped DB release), leaving the VM's pre-existing
 // passthrough devices untouched. This is the rollback primitive for a FAILED
 // allocation/attach — using the whole-VM releaseDevices there would over-release
 // every device the VM already owned.
-func (s *Server) releaseDeviceSet(ctx context.Context, vmName string, addrs []string) {
+func (s *Server) releaseDeviceLeases(ctx context.Context, vmName string, addrs []string) {
 	drivers := map[string]string{}
 	if devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); err == nil {
 		for _, d := range devices {

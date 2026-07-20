@@ -78,7 +78,7 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 		if vm == nil {
 			// Orphaned: the VM was never finalized — roll back the leaked devices.
 			slog.Warn("device-lease recovery: rolling back orphaned lease", "vm", e.ResourceID, "devices", addrs)
-			s.releaseDeviceSet(ctx, e.ResourceID, addrs)
+			s.releaseDeviceLeases(ctx, e.ResourceID, addrs)
 		} else {
 			slog.Info("device-lease recovery: allocation completed, clearing lease", "vm", e.ResourceID)
 		}

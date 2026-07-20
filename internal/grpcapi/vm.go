@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -1429,12 +1431,19 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		}
 	}
 
-	// Build a map of disk name → spec size for backfill.
+	// Build a map of disk name → spec size for backfill, and disk name → spec
+	// bus for the bus-resolution fallback below (vm_disks.bus is a v42 column
+	// not yet populated by every writer — see the Bus resolution comment in
+	// the Spec.Disks projection).
 	specDiskSizes := make(map[string]int64)
+	specDiskBuses := make(map[string]string)
 	if spec != nil {
 		for _, ds := range spec.Disks {
 			if sz := parseDiskSizeBytes(ds.Size); sz > 0 {
 				specDiskSizes[ds.Name] = sz
+			}
+			if ds.Bus != "" {
+				specDiskBuses[ds.Name] = ds.Bus
 			}
 		}
 	}
@@ -1455,12 +1464,13 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			}
 		}
 		pbVM.Disks = append(pbVM.Disks, &pb.VMDisk{
-			Name:         disk.DiskName,
-			HostName:     disk.HostName,
-			Path:         disk.Path,
-			SizeBytes:    sizeBytes,
-			BackingImage: disk.BackingImage,
-			StorageType:  disk.StorageType,
+			Name:          disk.DiskName,
+			HostName:      disk.HostName,
+			Path:          disk.Path,
+			SizeBytes:     sizeBytes,
+			BackingImage:  disk.BackingImage,
+			StorageType:   disk.StorageType,
+			StorageVolume: disk.StorageVolume,
 		})
 	}
 
@@ -1473,12 +1483,122 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		}
 	}
 
-	// Attach spec to proto (already deserialized above).
+	// Project the authoritative device tables into the spec's device
+	// sub-fields so InspectVM stops reflecting a stale spec blob for the
+	// fields those tables now own. The stored blob itself is left untouched
+	// on disk — this is a read-time projection only.
+	if spec != nil {
+		// Spec.Disks: vm_disks is authoritative for name/size. Bus is a v42
+		// column not yet populated by every writer (Task 1.3 added the
+		// column; writers land in Phase 5/7), so resolve it as: vm_disks.Bus
+		// if set, else the blob's bus for this disk name (never regress an
+		// existing disk to an empty bus), else the historical target-dev
+		// heuristic (sd* -> scsi, else virtio).
+		specDisks := make([]*pb.DiskSpec, 0, len(disks))
+		for _, disk := range disks {
+			bus := disk.Bus
+			if bus == "" {
+				bus = specDiskBuses[disk.DiskName]
+			}
+			if bus == "" {
+				if strings.HasPrefix(disk.TargetDev, "sd") {
+					bus = "scsi"
+				} else {
+					bus = "virtio"
+				}
+			}
+			sizeBytes := disk.SizeBytes
+			if specSize, ok := specDiskSizes[disk.DiskName]; ok && specSize > sizeBytes {
+				sizeBytes = specSize
+			}
+			specDisks = append(specDisks, &pb.DiskSpec{
+				Name: disk.DiskName,
+				Size: formatDiskSizeBytes(sizeBytes),
+				Bus:  bus,
+			})
+		}
+		spec.Disks = specDisks
+
+		// Spec.Network: MergedVMNICs overlays vm_nics over legacy
+		// vm_interfaces (right now vm_nics is empty fleet-wide, so this
+		// reflects the legacy rows) — always more current than the stored
+		// blob. MergedVMNICs is unordered (map-backed overlay), so sort by
+		// Ordinal for a stable, meaningful position.
+		nics, err := corrosion.MergedVMNICs(ctx, s.db, name)
+		if err != nil {
+			slog.Warn("failed to load merged NICs for spec projection", "vm", name, "error", err)
+		}
+		sort.Slice(nics, func(i, j int) bool { return nics[i].Ordinal < nics[j].Ordinal })
+		specNetwork := make([]*pb.NetworkAttachment, 0, len(nics))
+		for _, nic := range nics {
+			specNetwork = append(specNetwork, &pb.NetworkAttachment{
+				Name:  nic.NetworkName,
+				Model: nic.Model,
+				Mac:   nic.MAC,
+			})
+		}
+		spec.Network = specNetwork
+
+		// Spec.Devices: vm_pci_intent is DORMANT until Phase 6's device-
+		// request cutover populates it. Projecting unconditionally would
+		// BLANK spec.Devices for every VM today (the table is empty
+		// fleet-wide) and break the migration host-compatibility check at
+		// internal/ui/handle_vms.go, which reads vm.GetSpec().GetDevices().
+		// Only override once intents actually exist for this VM; otherwise
+		// leave the blob's Devices exactly as stored.
+		intents, err := corrosion.ListVMPCIIntents(ctx, s.db, name)
+		if err != nil {
+			slog.Warn("failed to load PCI intents for spec projection", "vm", name, "error", err)
+		}
+		if len(intents) > 0 {
+			specDevices := make([]*pb.DeviceSpec, 0, len(intents))
+			for _, intent := range intents {
+				ds := &pb.DeviceSpec{}
+				// selector_payload is protojson (per resolveDeviceIntents'
+				// decode contract), NOT encoding/json — use protojson here
+				// too so this round-trips with whatever Task 6.3/7.1 write.
+				if err := protojson.Unmarshal([]byte(intent.SelectorPayload), ds); err != nil {
+					slog.Warn("failed to decode PCI intent selector payload", "vm", name, "device_id", intent.DeviceID, "error", err)
+					continue
+				}
+				specDevices = append(specDevices, ds)
+			}
+			spec.Devices = specDevices
+		}
+	}
+
+	// Attach spec to proto (already deserialized/projected above).
 	if spec != nil {
 		pbVM.Spec = spec
 	}
 
 	return pbVM, nil
+}
+
+// formatDiskSizeBytes converts a byte count to a human-readable size string
+// (e.g. 21474836480 -> "20G"), choosing the largest unit that divides evenly
+// and falling back to a plain byte count otherwise. Mirrors
+// parseDiskSizeBytes's suffix contract so a projected DiskSpec.Size
+// round-trips through it.
+func formatDiskSizeBytes(n int64) string {
+	if n <= 0 {
+		return ""
+	}
+	const (
+		mib = 1024 * 1024
+		gib = 1024 * mib
+		tib = 1024 * gib
+	)
+	switch {
+	case n%tib == 0:
+		return fmt.Sprintf("%dT", n/tib)
+	case n%gib == 0:
+		return fmt.Sprintf("%dG", n/gib)
+	case n%mib == 0:
+		return fmt.Sprintf("%dM", n/mib)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 func vmStateToPB(s string) pb.VMState {

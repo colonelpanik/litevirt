@@ -18,13 +18,16 @@ var ErrDeviceCardinality = errors.New("libvirt: hostdev alias maps to an ambiguo
 
 // WantDisk is a desired disk in the reconciled device set. TargetDev is the
 // stable match key (libvirt target dev, e.g. "vda"); Path is the backing file.
-// Bus/Cache/ControllerModel are used only when ADDING a new disk — a matched
-// disk has only its <source> rewritten, leaving bus/cache/topology untouched.
+// Bus/Cache are used only when ADDING a new disk — a matched disk has only its
+// <source> rewritten, leaving bus/cache/topology untouched.
 type WantDisk struct {
-	TargetDev       string
-	Bus             string
-	Path            string
-	Cache           string
+	TargetDev string
+	Bus       string
+	Path      string
+	Cache     string
+	// ControllerModel is reserved for Task 3.3 (disk-controller selection); the
+	// patcher does not read or emit it yet — matched disks mutate only <source>
+	// and the add path does not render a controller model.
 	ControllerModel string
 }
 
@@ -211,14 +214,39 @@ type deviceElement struct {
 	raw   string
 }
 
+// qname is a namespace-aware element name tracked on the ancestor stack. Space
+// is the resolved XML namespace URI (or the literal prefix for an undeclared
+// prefix), and "" for the default/no-namespace libvirt elements.
+type qname struct {
+	local string
+	space string
+}
+
 // scanDeviceElements tokenizes the domain XML and returns the disk/interface/
-// hostdev elements that are direct children of <devices>, in document order,
-// plus the byte offset of the "<" in "</devices>" (-1 if absent).
+// hostdev elements that are direct children of the real <devices> container, in
+// document order, plus the byte offset of the "<" in "</devices>" (-1 if absent).
+//
+// Device detection is PATH-ANCHORED and NAMESPACE-AWARE: a candidate counts as a
+// reconciled device ONLY when its enclosing <devices> is a direct child of the
+// root <domain> (the ancestor stack is exactly ["domain","devices"]) AND both
+// those ancestors and the candidate itself are in the default (no-namespace)
+// libvirt namespace. This is load-bearing: without it, a <devices><disk>…</disk>
+// subtree — or a namespaced <lv:devices><lv:disk/></lv:devices> — nested inside
+// <metadata> would be scanned as a real device and deleted, violating the
+// "<metadata> (and all unmodeled elements) survive verbatim" guarantee.
 func scanDeviceElements(doc string) ([]deviceElement, int, error) {
 	dec := xml.NewDecoder(strings.NewReader(doc))
-	var stack []string
+	var stack []qname
 	var elems []deviceElement
 	devicesCloseOff := -1
+
+	// atDevicesPath reports whether the current ancestor stack is exactly
+	// domain > devices, both in the default (no-namespace) libvirt namespace.
+	atDevicesPath := func() bool {
+		return len(stack) == 2 &&
+			stack[0].local == "domain" && stack[0].space == "" &&
+			stack[1].local == "devices" && stack[1].space == ""
+	}
 
 	for {
 		startOff := int(dec.InputOffset())
@@ -231,12 +259,9 @@ func scanDeviceElements(doc string) ([]deviceElement, int, error) {
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			parent := ""
-			if len(stack) > 0 {
-				parent = stack[len(stack)-1]
-			}
 			name := t.Name.Local
-			if parent == "devices" && (name == "disk" || name == "interface" || name == "hostdev") {
+			if atDevicesPath() && t.Name.Space == "" &&
+				(name == "disk" || name == "interface" || name == "hostdev") {
 				// startOff sits at (or just before) the "<"; skip any leading
 				// whitespace the decoder reported as separate CharData.
 				lt := skipWSForward(doc, startOff)
@@ -255,9 +280,11 @@ func scanDeviceElements(doc string) ([]deviceElement, int, error) {
 				// Fully consumed by Skip — do not push onto the stack.
 				continue
 			}
-			stack = append(stack, name)
+			stack = append(stack, qname{local: name, space: t.Name.Space})
 		case xml.EndElement:
-			if t.Name.Local == "devices" {
+			// Record the close offset of the real domain>devices only — never a
+			// <devices> nested inside <metadata> or a foreign-namespace one.
+			if t.Name.Local == "devices" && t.Name.Space == "" && atDevicesPath() {
 				devicesCloseOff = skipWSForward(doc, startOff)
 			}
 			if len(stack) > 0 {
@@ -275,6 +302,12 @@ var (
 )
 
 // deviceKey extracts the stable match key from a device element's raw XML.
+//
+// Key/source extraction here (and in rewriteDiskSource et al.) is comment-blind:
+// a key-like fragment inside an XML comment (e.g. <!-- dev='x' -->) would drive
+// matching. This is a deliberate non-issue — libvirt's serializer never emits
+// comments inside device elements — so device raw XML is assumed comment-free
+// rather than paying for a full comment-stripping pass.
 func deviceKey(kind, raw string) string {
 	switch kind {
 	case "disk":

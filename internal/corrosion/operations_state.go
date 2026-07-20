@@ -17,6 +17,8 @@ const (
 	OpResourceUpdateStopped OperationKind = "resource_update_stopped"
 	OpDeviceLease           OperationKind = "device_lease"
 	OpRestart               OperationKind = "restart"
+	OpDeviceAttach          OperationKind = "device_attach"
+	OpDeviceDetach          OperationKind = "device_detach"
 )
 
 // Step names. The happy-path steps differ per kind; the terminal + rollback
@@ -52,6 +54,21 @@ var opHappyPath = map[OperationKind][]string{
 	OpResourceUpdateStopped: {OpStepPlanned, OpStepReserved, OpStepDesiredPersisted, OpStepConfigApplied, OpStepObserved},
 	OpDeviceLease:           {OpStepPlanned, OpStepReserved, OpStepClaimed, OpStepBound, OpStepAttached},
 	OpRestart:               {OpStepPlanned, OpStepReserved, OpStepDesiredPersisted, OpStepJournaled, OpStepStopped, OpStepRedefined, OpStepStarted, OpStepObserved},
+
+	// OpDeviceAttach mirrors OpDeviceLease's shape: reserve intent to attach a
+	// device -> claim it from inventory -> bind it to the target VM's config ->
+	// attached live/on next start.
+	OpDeviceAttach: {OpStepPlanned, OpStepReserved, OpStepClaimed, OpStepBound, OpStepAttached},
+
+	// OpDeviceDetach: plan the removal -> reserve the intent to release the
+	// existing attachment/lease (blocks a concurrent re-attach of the same
+	// device while the detach is in flight) -> the attachment row is cleared
+	// (tombstoned). Reusing the "attached" step name here (step names are
+	// kind-scoped, like every other entry in this map) marks that the live
+	// detach ran and the attach bookkeeping has been resolved/cleared, i.e. the
+	// device is confirmed detached, immediately preceding OpStepCompleted. Task
+	// 5.2 must record exactly these three step names, in order, for a detach.
+	OpDeviceDetach: {OpStepPlanned, OpStepReserved, OpStepAttached},
 }
 
 var opTerminalStates = map[string]bool{

@@ -1453,7 +1453,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	}
 
 	// Disks
-	disks, _ := corrosion.GetVMDisks(ctx, s.db, name)
+	disks, disksErr := corrosion.GetVMDisks(ctx, s.db, name)
 	for _, disk := range disks {
 		sizeBytes := disk.SizeBytes
 		// Fix missing or wrong size from the stored spec (works from any host).
@@ -1494,50 +1494,61 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		// if set, else the blob's bus for this disk name (never regress an
 		// existing disk to an empty bus), else the historical target-dev
 		// heuristic (sd* -> scsi, else virtio).
-		specDisks := make([]*pb.DiskSpec, 0, len(disks))
-		for _, disk := range disks {
-			bus := disk.Bus
-			if bus == "" {
-				bus = specDiskBuses[disk.DiskName]
-			}
-			if bus == "" {
-				if strings.HasPrefix(disk.TargetDev, "sd") {
-					bus = "scsi"
-				} else {
-					bus = "virtio"
+		// Read errors here are fail-soft: leave the blob's Spec.Disks
+		// untouched rather than overwriting it with an empty projection
+		// (a transient corrosion read error must not blank a field the
+		// stored spec already had correct data for).
+		if disksErr != nil {
+			slog.Warn("failed to load VM disks for spec projection", "vm", name, "error", disksErr)
+		} else {
+			specDisks := make([]*pb.DiskSpec, 0, len(disks))
+			for _, disk := range disks {
+				bus := disk.Bus
+				if bus == "" {
+					bus = specDiskBuses[disk.DiskName]
 				}
+				if bus == "" {
+					if strings.HasPrefix(disk.TargetDev, "sd") {
+						bus = "scsi"
+					} else {
+						bus = "virtio"
+					}
+				}
+				sizeBytes := disk.SizeBytes
+				if specSize, ok := specDiskSizes[disk.DiskName]; ok && specSize > sizeBytes {
+					sizeBytes = specSize
+				}
+				specDisks = append(specDisks, &pb.DiskSpec{
+					Name: disk.DiskName,
+					Size: formatDiskSizeBytes(sizeBytes),
+					Bus:  bus,
+				})
 			}
-			sizeBytes := disk.SizeBytes
-			if specSize, ok := specDiskSizes[disk.DiskName]; ok && specSize > sizeBytes {
-				sizeBytes = specSize
-			}
-			specDisks = append(specDisks, &pb.DiskSpec{
-				Name: disk.DiskName,
-				Size: formatDiskSizeBytes(sizeBytes),
-				Bus:  bus,
-			})
+			spec.Disks = specDisks
 		}
-		spec.Disks = specDisks
 
 		// Spec.Network: MergedVMNICs overlays vm_nics over legacy
 		// vm_interfaces (right now vm_nics is empty fleet-wide, so this
 		// reflects the legacy rows) — always more current than the stored
 		// blob. MergedVMNICs is unordered (map-backed overlay), so sort by
-		// Ordinal for a stable, meaningful position.
+		// Ordinal for a stable, meaningful position. Same fail-soft rule as
+		// Spec.Disks above: on a read error, leave the blob's Spec.Network
+		// untouched instead of blanking it.
 		nics, err := corrosion.MergedVMNICs(ctx, s.db, name)
 		if err != nil {
 			slog.Warn("failed to load merged NICs for spec projection", "vm", name, "error", err)
+		} else {
+			sort.Slice(nics, func(i, j int) bool { return nics[i].Ordinal < nics[j].Ordinal })
+			specNetwork := make([]*pb.NetworkAttachment, 0, len(nics))
+			for _, nic := range nics {
+				specNetwork = append(specNetwork, &pb.NetworkAttachment{
+					Name:  nic.NetworkName,
+					Model: nic.Model,
+					Mac:   nic.MAC,
+				})
+			}
+			spec.Network = specNetwork
 		}
-		sort.Slice(nics, func(i, j int) bool { return nics[i].Ordinal < nics[j].Ordinal })
-		specNetwork := make([]*pb.NetworkAttachment, 0, len(nics))
-		for _, nic := range nics {
-			specNetwork = append(specNetwork, &pb.NetworkAttachment{
-				Name:  nic.NetworkName,
-				Model: nic.Model,
-				Mac:   nic.MAC,
-			})
-		}
-		spec.Network = specNetwork
 
 		// Spec.Devices: vm_pci_intent is DORMANT until Phase 6's device-
 		// request cutover populates it. Projecting unconditionally would

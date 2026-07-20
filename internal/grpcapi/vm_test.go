@@ -376,6 +376,52 @@ func TestInspectVM_ProjectsDisksAndStorageVolume(t *testing.T) {
 	}
 }
 
+// TestInspectVM_PreservesSpecDisksOnDiskReadError is the fail-soft
+// counterpart to TestInspectVM_ProjectsDisksAndStorageVolume: when the
+// vm_disks read itself errors — simulated here by dropping the table via
+// the same forced-error idiom used elsewhere in this package (e.g.
+// container_failclosed_test.go's `DROP TABLE containers`) — the projection
+// must NOT overwrite Spec.Disks with an empty slice. The blob's Disks must
+// pass through untouched instead of being blanked by a transient read
+// failure.
+func TestInspectVM_PreservesSpecDisksOnDiskReadError(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	blob, err := json.Marshal(&pb.VMSpec{
+		Disks: []*pb.DiskSpec{{Name: "root", Size: "10G", Bus: "virtio"}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "disk-read-err", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Force GetVMDisks to fail: drop the table it queries, AFTER InsertVM
+	// (which itself touches vm_disks). The vms table (used by GetVM) is
+	// untouched, so InspectVM still finds the VM and reaches the projection.
+	if err := s.db.Execute(ctx, `DROP TABLE vm_disks`); err != nil {
+		t.Fatalf("DROP TABLE vm_disks: %v", err)
+	}
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "disk-read-err"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if resp.Spec == nil {
+		t.Fatal("Spec is nil")
+	}
+	if len(resp.Spec.Disks) != 1 {
+		t.Fatalf("Spec.Disks = %d, want 1 (blob untouched on read error, not blanked)", len(resp.Spec.Disks))
+	}
+	if got := resp.Spec.Disks[0]; got.Name != "root" || got.Size != "10G" || got.Bus != "virtio" {
+		t.Errorf("Spec.Disks[0] = %+v, want blob's root/10G/virtio", got)
+	}
+}
+
 // TestInspectVM_ProjectsNetworkFromLegacyOverlay covers Task 4.1's network
 // requirement in its Phase-4 dormancy state: vm_nics is empty fleet-wide, so
 // MergedVMNICs surfaces the legacy vm_interfaces row via its overlay, and
@@ -427,6 +473,52 @@ func TestInspectVM_ProjectsNetworkFromLegacyOverlay(t *testing.T) {
 		if n.Name == "stale-net" {
 			t.Errorf("stale blob network %q leaked into projected Spec.Network", n.Name)
 		}
+	}
+}
+
+// TestInspectVM_PreservesSpecNetworkOnNICReadError is the fail-soft
+// counterpart to TestInspectVM_ProjectsNetworkFromLegacyOverlay: when
+// MergedVMNICs itself errors — simulated by dropping vm_nics, which
+// GetVMNICsRaw queries before vm_interfaces so the error surfaces without
+// needing to also touch the legacy table — the projection must NOT
+// overwrite Spec.Network with an empty slice. The blob's Network must pass
+// through untouched instead of being blanked by a transient read failure.
+func TestInspectVM_PreservesSpecNetworkOnNICReadError(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	blob, err := json.Marshal(&pb.VMSpec{
+		Network: []*pb.NetworkAttachment{{Name: "lan0", Model: "e1000", Mac: "52:54:00:aa:bb:cc"}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "net-read-err", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Force MergedVMNICs to fail: drop vm_nics. InsertVM doesn't touch
+	// vm_nics (only vm_disks/vm_interfaces/vms), so this is safe to do after
+	// the insert above; the vms table (used by GetVM) is untouched, so
+	// InspectVM still finds the VM and reaches the projection.
+	if err := s.db.Execute(ctx, `DROP TABLE vm_nics`); err != nil {
+		t.Fatalf("DROP TABLE vm_nics: %v", err)
+	}
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "net-read-err"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if resp.Spec == nil {
+		t.Fatal("Spec is nil")
+	}
+	if len(resp.Spec.Network) != 1 {
+		t.Fatalf("Spec.Network = %d, want 1 (blob untouched on read error, not blanked)", len(resp.Spec.Network))
+	}
+	if got := resp.Spec.Network[0]; got.Name != "lan0" || got.Model != "e1000" || got.Mac != "52:54:00:aa:bb:cc" {
+		t.Errorf("Spec.Network[0] = %+v, want blob's lan0/e1000/52:54:00:aa:bb:cc", got)
 	}
 }
 

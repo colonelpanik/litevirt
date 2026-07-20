@@ -2467,12 +2467,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		pathByName[d.DiskName] = d.Path
 	}
 	var diskConfigs []lv.DiskConfig
+	seenDisk := make(map[string]bool)
 	if len(spec.Disks) > 0 {
 		for _, d := range spec.Disks {
 			name := d.Name
 			if name == "" {
 				name = "root"
 			}
+			seenDisk[name] = true
 			bus := d.Bus
 			if bus == "" {
 				bus = "virtio"
@@ -2491,12 +2493,43 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if d.TargetDev != "" && d.TargetDev[0] == 's' {
 				bus = "scsi"
 			}
+			seenDisk[d.DiskName] = true
 			diskConfigs = append(diskConfigs, lv.DiskConfig{
 				Name: d.DiskName,
 				Path: d.Path,
 				Bus:  bus,
 			})
 		}
+	}
+	// Disk-drop fix: a disk hot-plugged onto a running VM is written to vm_disks
+	// but NOT back into the spec blob, so rebuilding disks purely from spec.Disks
+	// silently DROPPED it on the next redefine. Append any vm_disks disk-kind row
+	// not already represented above, preserving its stored target_dev (and
+	// inferring the bus from that prefix, since attachDisk/CreateVM persist
+	// target_dev but not bus). The hot-plug target_dev is always assigned beyond
+	// the spec-disk range, so this can't collide with the positional target_dev
+	// the generator derives for the spec disks.
+	for _, d := range dbDisks {
+		if d.DeviceKind != "" && d.DeviceKind != "disk" {
+			continue
+		}
+		if seenDisk[d.DiskName] {
+			continue
+		}
+		bus := d.Bus
+		if bus == "" {
+			bus = "virtio"
+			if d.TargetDev != "" && d.TargetDev[0] == 's' {
+				bus = "scsi"
+			}
+		}
+		diskConfigs = append(diskConfigs, lv.DiskConfig{
+			Name:            d.DiskName,
+			Path:            d.Path,
+			Bus:             bus,
+			ControllerModel: d.ControllerModel,
+			TargetDev:       d.TargetDev,
+		})
 	}
 
 	// Build network configs from stored interfaces.

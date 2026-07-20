@@ -337,6 +337,15 @@ func (f *Fake) DumpXMLInactive(name string) (string, error) {
 	return f.DumpXML(name)
 }
 
+// DefinedXML returns the last XML DefineDomain captured for name, or "" if the
+// domain was never defined. A test accessor (no error) so assertions can inspect
+// the domain a reconcile/redefine produced without the DumpXML not-found error.
+func (f *Fake) DefinedXML(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.xml[name]
+}
+
 func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
 	// The fake transitions synchronously; the wait always succeeds.
 	f.mu.Lock()

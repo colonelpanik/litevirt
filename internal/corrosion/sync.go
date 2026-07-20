@@ -225,7 +225,7 @@ type syncTable struct {
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
 	"images", "image_hosts", "networks", "volumes", "stacks",
-	"vms", "vm_interfaces", "vm_disks", "snapshots",
+	"vms", "vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent", "vm_pci_realizations", "snapshots",
 	"lb_configs", "lb_backends", "users", "tokens", "dns_records",
 	"fencing_log", "audit_log",
 	"network_vteps", "bgp_peers", "ip_allocations", "security_groups", "sg_rules",

@@ -241,7 +241,10 @@ import (
 //	     replicated tier of the crash-recoverable operation journal, merged by a bespoke
 //	     non-LWW immutable-row merge (identical→idempotent, facts-conflict→unresolved+
 //	     flagged, tombstone dominates). Three ADD COLUMN + three CREATE TABLE; gap-1 from v40.
-const CurrentSchemaVersion = 41
+//	v42: hardware foundation — vm_nics, vm_pci_intent, vm_pci_realizations;
+//	     vm_disks.{bus,device_kind,delete_with_vm,controller_model};
+//	     vms.{hardware_adoption_state,hardware_adoption_error}.
+const CurrentSchemaVersion = 42
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -950,6 +953,34 @@ var schemaDDL = []string{
 		deleted_at   TEXT,
 		PRIMARY KEY (vm_name, disk_name)
 	)`,
+
+	// v42 (hardware foundation): multi-NIC support. vm_nics carries one row per
+	// VM NIC keyed by a stable id (not network_name — a VM may attach the same
+	// network more than once), superseding the single-NIC-per-network
+	// vm_interfaces table for hardware-managed VMs.
+	`CREATE TABLE IF NOT EXISTS vm_nics (
+		vm_name TEXT NOT NULL, id TEXT NOT NULL, network_name TEXT NOT NULL,
+		model TEXT NOT NULL DEFAULT 'virtio', mac TEXT NOT NULL, ordinal INTEGER NOT NULL,
+		ip TEXT, tap_device TEXT, security_groups TEXT,
+		updated_at TEXT NOT NULL, deleted_at TEXT,
+		PRIMARY KEY (vm_name, id))`,
+	// v42 (hardware foundation): declared PCI passthrough intent — what a VM
+	// wants attached (by selector, not yet a resolved device), pending
+	// realization against host_pci_devices.
+	`CREATE TABLE IF NOT EXISTS vm_pci_intent (
+		vm_name TEXT NOT NULL, device_id TEXT NOT NULL, host_name TEXT NOT NULL,
+		selector_kind TEXT NOT NULL, selector_payload TEXT NOT NULL, exclusive_key TEXT,
+		updated_at TEXT NOT NULL, deleted_at TEXT,
+		PRIMARY KEY (vm_name, device_id))`,
+	// v42 (hardware foundation): the resolved realization of a vm_pci_intent row
+	// — the concrete host device(s)/address(es) actually attached. member_id
+	// allows an intent (e.g. an SR-IOV VF-pool selector) to realize as multiple
+	// members.
+	`CREATE TABLE IF NOT EXISTS vm_pci_realizations (
+		vm_name TEXT NOT NULL, device_id TEXT NOT NULL, member_id TEXT NOT NULL,
+		host_name TEXT NOT NULL, resolved_address TEXT, xml_alias TEXT, ordinal INTEGER NOT NULL,
+		updated_at TEXT NOT NULL, deleted_at TEXT,
+		PRIMARY KEY (vm_name, device_id, member_id))`,
 
 	// ═══════════ SNAPSHOTS ═══════════
 	`CREATE TABLE IF NOT EXISTS snapshots (
@@ -1774,6 +1805,9 @@ var tablePrimaryKeys = map[string][]string{
 	"firewall_defaults":       {"scope"},
 	"backup_repos":            {"name"},
 	"replication_checkpoints": {"vm_name", "repo"},
+	"vm_nics":                 {"vm_name", "id"},
+	"vm_pci_intent":           {"vm_name", "device_id"},
+	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -1954,6 +1988,14 @@ var schemaMigrations = []string{
 	`ALTER TABLE vms ADD COLUMN vm_owner_epoch INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE vms ADD COLUMN spec_generation INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE vms ADD COLUMN active_operation_id TEXT NOT NULL DEFAULT ''`,
+	// v42: hardware foundation — vm_disks device metadata + VM hardware-adoption
+	// state (see History v42).
+	`ALTER TABLE vm_disks ADD COLUMN bus TEXT`,
+	`ALTER TABLE vm_disks ADD COLUMN device_kind TEXT NOT NULL DEFAULT 'disk'`,
+	`ALTER TABLE vm_disks ADD COLUMN delete_with_vm INTEGER NOT NULL DEFAULT 1`,
+	`ALTER TABLE vm_disks ADD COLUMN controller_model TEXT`,
+	`ALTER TABLE vms ADD COLUMN hardware_adoption_state TEXT NOT NULL DEFAULT 'pending'`,
+	`ALTER TABLE vms ADD COLUMN hardware_adoption_error TEXT`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2029,6 +2071,8 @@ var alterVersions = []int{
 	37, 37, 37, // networks.project, storage_pools.project, volumes.project
 	38,         // vms.pending_action_id
 	41, 41, 41, // vms.vm_owner_epoch, vms.spec_generation, vms.active_operation_id
+	42, 42, 42, 42, // vm_disks.bus/device_kind/delete_with_vm/controller_model
+	42, 42, // vms.hardware_adoption_state/hardware_adoption_error
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2050,6 +2094,7 @@ var createTableUnits = []struct {
 	{39, "idempotency_keys"},
 	{40, "host_fw_intent"},
 	{41, "operations"}, {41, "operation_steps"}, {41, "project_authority_epochs"},
+	{42, "vm_nics"}, {42, "vm_pci_intent"}, {42, "vm_pci_realizations"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

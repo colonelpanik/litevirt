@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // NICRecord represents a single VM network interface as read from either the
@@ -225,4 +228,220 @@ func MergedVMNICs(ctx context.Context, c *Client, vmName string) ([]NICRecord, e
 		}
 	}
 	return out, nil
+}
+
+// ═══════════ PCI PASSTHROUGH: INTENT + REALIZATION ═══════════
+//
+// vm_pci_intent declares what a VM WANTS attached, expressed as a selector
+// (not yet a resolved device); vm_pci_realizations records what actually got
+// attached once the resolver matched the selector against
+// host_pci_devices. Neither table has a legacy sibling, so — unlike
+// vm_nics/vm_interfaces above — these accessors are plain live-only reads
+// (deleted_at IS NULL), not an overlay.
+
+// ClassifyPCISelector derives a vm_pci_intent row's selector_kind from a
+// DeviceSpec by SEMANTIC PRECEDENCE — mapping → sriov → type/vendor →
+// address — never by mere field presence. exclusiveKey (the host-pinning
+// field persisted as vm_pci_intent.exclusive_key) is populated ONLY for kind
+// "address": a mapping- or type/vendor-classified spec that also carries a
+// resolved Address (e.g. copied back onto the spec by a prior realization)
+// must NOT host-pin on that address — the address there is a resolution
+// artifact, not a request, and pinning on it would wrongly force every
+// future re-resolve onto the same host/device even though the selector
+// itself is portable.
+func ClassifyPCISelector(d *pb.DeviceSpec) (kind string, exclusiveKey *string) {
+	switch {
+	case d.Mapping != "":
+		return "mapping", nil
+	case d.Sriov:
+		return "sriov", nil
+	case d.Type != "" || d.Vendor != "":
+		return "type", nil
+	default:
+		key := strings.ToLower(d.Address)
+		return "address", &key
+	}
+}
+
+// CanonicalPCISelector builds the fixed-field-order string every peer must
+// derive identically from a DeviceSpec, for use as the canonicalSelector
+// argument to DeterministicPCIIntentID. Field order is FIXED — type|vendor|
+// model|count|address|sriov|parent|mig_profile|namespace|mapping — and must
+// never change: reordering would change every existing intent's derived id on
+// the next resolve, which the replication layer would see as brand-new rows
+// rather than updates to existing ones. proto.Marshal is deliberately NOT
+// used here: wire encoding is not guaranteed byte-identical across peers or
+// proto-library versions, whereas a plain string join is.
+func CanonicalPCISelector(d *pb.DeviceSpec) string {
+	return strings.Join([]string{
+		d.Type,
+		d.Vendor,
+		d.Model,
+		strconv.Itoa(int(d.Count)),
+		d.Address,
+		strconv.FormatBool(d.Sriov),
+		d.Parent,
+		d.MigProfile,
+		strconv.Itoa(int(d.Namespace)),
+		d.Mapping,
+	}, "|")
+}
+
+// DeterministicPCIIntentID derives a stable vm_pci_intent device_id from
+// (vmName, canonicalSelector, occurrence) — the first 32 hex chars (128
+// bits) of sha256(vmName + "\x00" + canonicalSelector + "\x00" +
+// strconv.Itoa(occurrence)). occurrence disambiguates a VM requesting the
+// IDENTICAL selector more than once (e.g. two GPUs via the same
+// type-selector): without mixing it in, both attaches would hash to the same
+// device_id and collide on vm_pci_intent's (vm_name, device_id) primary key.
+// It is a pure function of its inputs so every peer synthesizes the
+// byte-identical id for the same spec + occurrence, which is required for
+// the intent to converge under replication rather than fork into duplicate
+// rows on different nodes.
+func DeterministicPCIIntentID(vmName, canonicalSelector string, occurrence int) string {
+	sum := sha256.Sum256([]byte(vmName + "\x00" + canonicalSelector + "\x00" + strconv.Itoa(occurrence)))
+	return hex.EncodeToString(sum[:])[:32]
+}
+
+// PCIIntentRecord represents a single vm_pci_intent row: declared PCI
+// passthrough intent for a VM, pending realization against
+// host_pci_devices. SelectorKind/ExclusiveKey are the classification
+// ClassifyPCISelector produces; ExclusiveKey is non-nil only when
+// SelectorKind is "address" (see ClassifyPCISelector).
+type PCIIntentRecord struct {
+	VMName          string
+	DeviceID        string
+	HostName        string
+	SelectorKind    string
+	SelectorPayload string
+	ExclusiveKey    *string
+}
+
+// UpsertPCIIntent writes a vm_pci_intent row keyed by (vm_name, device_id),
+// replacing any existing row with the same key (INSERT OR REPLACE, mirroring
+// UpsertNIC). Clears deleted_at — an upsert of a previously-tombstoned
+// device_id resurrects it.
+func UpsertPCIIntent(ctx context.Context, c *Client, r PCIIntentRecord) error {
+	now := c.NowTS()
+	var exclusiveKey interface{}
+	if r.ExclusiveKey != nil {
+		exclusiveKey = *r.ExclusiveKey
+	}
+	return c.Execute(ctx,
+		`INSERT OR REPLACE INTO vm_pci_intent
+		 (vm_name, device_id, host_name, selector_kind, selector_payload, exclusive_key, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+		r.VMName, r.DeviceID, r.HostName, r.SelectorKind, r.SelectorPayload, exclusiveKey, now)
+}
+
+// TombstonePCIIntent soft-deletes a vm_pci_intent row by (vm_name,
+// device_id). Mirrors TombstoneNIC: deleted_at is the wall-clock display
+// marker, updated_at is the monotonic LWW conflict key.
+func TombstonePCIIntent(ctx context.Context, c *Client, vmName, deviceID string) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`UPDATE vm_pci_intent SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND device_id = ?`,
+		nowRFC3339(), now, vmName, deviceID)
+}
+
+// ListVMPCIIntents returns every LIVE (deleted_at IS NULL) vm_pci_intent row
+// for vmName. vm_pci_intent has no legacy sibling — this is a plain
+// live-only accessor, not an overlay.
+func ListVMPCIIntents(ctx context.Context, c *Client, vmName string) ([]PCIIntentRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, device_id, host_name, selector_kind, selector_payload,
+		        COALESCE(exclusive_key, '') AS exclusive_key
+		 FROM vm_pci_intent WHERE vm_name = ? AND deleted_at IS NULL`, vmName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PCIIntentRecord, len(rows))
+	for i, r := range rows {
+		out[i] = PCIIntentRecord{
+			VMName:          r.String("vm_name"),
+			DeviceID:        r.String("device_id"),
+			HostName:        r.String("host_name"),
+			SelectorKind:    r.String("selector_kind"),
+			SelectorPayload: r.String("selector_payload"),
+			ExclusiveKey:    strPtrOrNil(r.String("exclusive_key")),
+		}
+	}
+	return out, nil
+}
+
+// PCIRealizationRecord represents a single vm_pci_realizations row: the
+// resolved outcome of a vm_pci_intent row — the concrete host device(s)
+// actually attached. Ordinal orders multiple members realizing the same
+// intent (e.g. an SR-IOV VF-pool selector realizing as several VFs).
+type PCIRealizationRecord struct {
+	VMName          string
+	DeviceID        string
+	MemberID        string
+	HostName        string
+	ResolvedAddress string
+	XMLAlias        string
+	Ordinal         int
+}
+
+// UpsertPCIRealization writes a vm_pci_realizations row keyed by (vm_name,
+// device_id, member_id), replacing any existing row with the same key
+// (INSERT OR REPLACE). Clears deleted_at — an upsert of a previously-
+// tombstoned member resurrects it.
+func UpsertPCIRealization(ctx context.Context, c *Client, r PCIRealizationRecord) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`INSERT OR REPLACE INTO vm_pci_realizations
+		 (vm_name, device_id, member_id, host_name, resolved_address, xml_alias, ordinal, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		r.VMName, r.DeviceID, r.MemberID, r.HostName,
+		nullIfEmpty(r.ResolvedAddress), nullIfEmpty(r.XMLAlias), r.Ordinal, now)
+}
+
+// TombstonePCIRealizations soft-deletes EVERY vm_pci_realizations row for
+// (vm_name, device_id) — every member realizing that intent, not a single
+// member_id. A re-resolve of an intent (e.g. the SR-IOV pool reassigning
+// different VFs to the same request) must retract the whole prior
+// realization set, not leave stale members mixed in alongside the new ones.
+func TombstonePCIRealizations(ctx context.Context, c *Client, vmName, deviceID string) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND device_id = ?`,
+		nowRFC3339(), now, vmName, deviceID)
+}
+
+// ListVMPCIRealizations returns every LIVE (deleted_at IS NULL)
+// vm_pci_realizations row for vmName. Like vm_pci_intent, this table has no
+// legacy sibling — a plain live-only accessor, not an overlay.
+func ListVMPCIRealizations(ctx context.Context, c *Client, vmName string) ([]PCIRealizationRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, device_id, member_id, host_name,
+		        COALESCE(resolved_address, '') AS resolved_address,
+		        COALESCE(xml_alias, '') AS xml_alias, ordinal
+		 FROM vm_pci_realizations WHERE vm_name = ? AND deleted_at IS NULL`, vmName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PCIRealizationRecord, len(rows))
+	for i, r := range rows {
+		out[i] = PCIRealizationRecord{
+			VMName:          r.String("vm_name"),
+			DeviceID:        r.String("device_id"),
+			MemberID:        r.String("member_id"),
+			HostName:        r.String("host_name"),
+			ResolvedAddress: r.String("resolved_address"),
+			XMLAlias:        r.String("xml_alias"),
+			Ordinal:         r.Int("ordinal"),
+		}
+	}
+	return out, nil
+}
+
+// strPtrOrNil returns nil for an empty string, else a pointer to s. Used to
+// turn a COALESCE(...,”)-read nullable column back into the *string shape
+// PCIIntentRecord.ExclusiveKey exposes to callers.
+func strPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

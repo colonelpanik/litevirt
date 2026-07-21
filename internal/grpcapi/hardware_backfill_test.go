@@ -496,6 +496,168 @@ func TestBackfillHardwareTables_AmbiguousPortableGrouping_Blocked(t *testing.T) 
 	}
 }
 
+// ── Test 10: multifunction GPU adopts as ONE portable intent (IOMMU-aware) ──
+
+// TestAuditVMPCICompatibility_MultifunctionGPUAdoptsAsOnePortableIntent guards the
+// COMMON default "GPU Passthrough" profile: a bare {Type:"gpu"} selector whose
+// primary is a multifunction card (GPU + HDMI-audio function share one IOMMU
+// group). At create, resolveDeviceSpec expands the primary to its IOMMU-group
+// siblings, so the persistent definition carries TWO <hostdev>s. The audit must
+// attribute BOTH members to the ONE portable intent (they are the primary + its
+// IOMMU-group sibling) and adopt — NOT block as "1 selector < 2 members".
+func TestAuditVMPCICompatibility_MultifunctionGPUAdoptsAsOnePortableIntent(t *testing.T) {
+	s, f := backfillServer(t)
+	ctx := adminCtx()
+
+	spec := &pb.VMSpec{Devices: []*pb.DeviceSpec{{Type: "gpu"}}} // default profile: bare type selector
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "mfgpu", HostName: "test-host", State: "running", Spec: specJSON(t, spec),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// GPU + its HDMI-audio function share ONE IOMMU group (the discrete-card norm).
+	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu", IOMMUGroup: 21,
+	}); err != nil {
+		t.Fatalf("ObservePCIDevice gpu: %v", err)
+	}
+	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.1", Type: "audio", IOMMUGroup: 21,
+	}); err != nil {
+		t.Fatalf("ObservePCIDevice audio: %v", err)
+	}
+	f.SetInactiveXML("mfgpu", domainXMLWith("mfgpu",
+		hostdevXML("0000:41:00.0"), hostdevXML("0000:41:00.1")))
+
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables: %v", err)
+	}
+
+	if st, reason, _ := corrosion.GetHardwareAdoptionState(ctx, s.db, "mfgpu"); st != "adopted" {
+		t.Fatalf("adoption state = %q (reason %q), want adopted (multifunction GPU is one portable intent)", st, reason)
+	}
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "mfgpu")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("got %d intents, want exactly 1 portable intent: %+v", len(intents), intents)
+	}
+	if intents[0].SelectorKind != "type" {
+		t.Errorf("selector_kind = %q, want type", intents[0].SelectorKind)
+	}
+	if intents[0].ExclusiveKey != nil {
+		t.Errorf("portable type selector must not host-pin (exclusive_key=%v)", *intents[0].ExclusiveKey)
+	}
+	// The ONE intent re-expands to primary + IOMMU-group sibling (both members).
+	members, err := s.resolveDeviceIntents(ctx, "mfgpu", intents)
+	if err != nil {
+		t.Fatalf("resolveDeviceIntents on adopted intent: %v", err)
+	}
+	got := map[string]bool{}
+	for _, m := range members {
+		got[m.Address] = true
+	}
+	if len(got) != 2 || !got["0000:41:00.0"] || !got["0000:41:00.1"] {
+		t.Fatalf("intent resolved to %v, want both 0000:41:00.0 and 0000:41:00.1", got)
+	}
+}
+
+// ── Test 11: mapping selector's IOMMU sibling absorbed, not host-pinned ─────
+
+// TestAuditVMPCICompatibility_MappingSiblingAbsorbedNotHostPinned guards the Minor:
+// a {Mapping,Address} selector resolved onto a multifunction card produces a second
+// <hostdev> for the audio sibling. That sibling belongs to the SAME (portable)
+// mapping intent — it re-expands from the mapping's resolved primary — NOT a
+// separate host-pinned concrete-address intent.
+func TestAuditVMPCICompatibility_MappingSiblingAbsorbedNotHostPinned(t *testing.T) {
+	s, f := backfillServer(t)
+	ctx := adminCtx()
+
+	spec := &pb.VMSpec{Devices: []*pb.DeviceSpec{
+		{Mapping: "gpu-pool", Address: "0000:41:00.0"}, // resolved address frozen back
+	}}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "mapsib", HostName: "test-host", State: "running", Spec: specJSON(t, spec),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu", IOMMUGroup: 21,
+	}); err != nil {
+		t.Fatalf("ObservePCIDevice gpu: %v", err)
+	}
+	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.1", Type: "audio", IOMMUGroup: 21,
+	}); err != nil {
+		t.Fatalf("ObservePCIDevice audio: %v", err)
+	}
+	f.SetInactiveXML("mapsib", domainXMLWith("mapsib",
+		hostdevXML("0000:41:00.0"), hostdevXML("0000:41:00.1")))
+
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables: %v", err)
+	}
+	if st, reason, _ := corrosion.GetHardwareAdoptionState(ctx, s.db, "mapsib"); st != "adopted" {
+		t.Fatalf("adoption state = %q (reason %q), want adopted", st, reason)
+	}
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "mapsib")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("got %d intents, want exactly 1 mapping intent (sibling absorbed): %+v", len(intents), intents)
+	}
+	if intents[0].SelectorKind != "mapping" {
+		t.Errorf("selector_kind = %q, want mapping (portable)", intents[0].SelectorKind)
+	}
+	if intents[0].ExclusiveKey != nil {
+		t.Errorf("mapping intent must not host-pin (exclusive_key=%v)", *intents[0].ExclusiveKey)
+	}
+}
+
+// ── Test 12: genuinely-ambiguous non-sibling members STILL block ────────────
+
+// TestAuditVMPCICompatibility_NonSiblingMembersStillBlock guards the preserved
+// fail-closed posture: two XML members in DIFFERENT IOMMU groups are two
+// independent passthrough units, which one portable selector cannot account for.
+// This is genuine ambiguity (not a multifunction expansion) and must still block.
+func TestAuditVMPCICompatibility_NonSiblingMembersStillBlock(t *testing.T) {
+	s, f := backfillServer(t)
+	ctx := adminCtx()
+
+	spec := &pb.VMSpec{Devices: []*pb.DeviceSpec{{Type: "gpu"}}}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "genambig", HostName: "test-host", State: "running", Spec: specJSON(t, spec),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// Two members in DISTINCT IOMMU groups: NOT a multifunction unit.
+	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu", IOMMUGroup: 21,
+	}); err != nil {
+		t.Fatalf("ObservePCIDevice gpu: %v", err)
+	}
+	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:60:00.0", Type: "nic", IOMMUGroup: 33,
+	}); err != nil {
+		t.Fatalf("ObservePCIDevice nic: %v", err)
+	}
+	f.SetInactiveXML("genambig", domainXMLWith("genambig",
+		hostdevXML("0000:41:00.0"), hostdevXML("0000:60:00.0")))
+
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables: %v", err)
+	}
+	if st, _, _ := corrosion.GetHardwareAdoptionState(ctx, s.db, "genambig"); st != "blocked" {
+		t.Errorf("adoption state = %q, want blocked (two independent IOMMU-group units, one selector)", st)
+	}
+	intents, _ := corrosion.ListVMPCIIntents(ctx, s.db, "genambig")
+	if len(intents) != 0 {
+		t.Errorf("blocked VM imported %d intents, want 0", len(intents))
+	}
+}
+
 // TestBackfillHardwareTables_ConcreteMembersNoSpec: XML members with no matching
 // rich spec (e.g. an IOMMU sibling, or an address device the blob doesn't carry)
 // import as concrete-address intents when there are no portable selectors.

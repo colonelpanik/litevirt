@@ -141,9 +141,19 @@ func (s *Server) backfillVMDiskBuses(ctx context.Context, vm *corrosion.VMRecord
 //     rich selector (classified via ClassifyPCISelector — a mapping-backed device
 //     stays "mapping"/exclusive_key=NULL, an address device pins on its BDF); an
 //     XML member with no matching rich spec imports as a concrete address.
+//   - Selector↔member attribution is IOMMU-GROUP-AWARE. A portable selector (and
+//     an addressed/mapping selector) re-expands at resolve time to its primary +
+//     the primary's IOMMU-group siblings (resolveDeviceSpec.addPrimary), so a
+//     multifunction card (GPU + its HDMI-audio function in one IOMMU group)
+//     produces several <hostdev>s in the definition but is ONE intent. Members are
+//     therefore attributed at IOMMU-GROUP granularity: an unclaimed member that is
+//     an IOMMU sibling of an already-attributed primary belongs to THAT intent, and
+//     portable selectors are matched against the count of independent IOMMU-group
+//     UNITS, not the raw member count.
 //   - Duplicate identical selectors get distinct ids via the occurrence ordinal
-//     (DeterministicPCIIntentID). When the selector↔member grouping cannot be
-//     resolved unambiguously, the VM is BLOCKED rather than coalesced.
+//     (DeterministicPCIIntentID). When the grouping is GENUINELY ambiguous —
+//     independent IOMMU-group units a selector set cannot account for — the VM is
+//     BLOCKED rather than coalesced.
 //   - No trustworthy inactive definition (DumpXMLInactive errors / no persistent
 //     def) ⇒ blocked; the caller continues to the next VM.
 //
@@ -204,7 +214,8 @@ func (s *Server) auditVMPCICompatibility(ctx context.Context, vm *corrosion.VMRe
 
 	occ := map[string]int{} // occurrence counter per canonical selector
 	var plan []corrosion.PCIIntentRecord
-	var remaining []string // XML members not claimed by an addressed spec
+	var remaining []string          // XML members not claimed by an addressed spec
+	var addressedPrimaries []string // addressed members whose intent re-expands to its IOMMU-group siblings
 
 	// Address-matched import, in document order (deterministic across peers).
 	for _, bdf := range xmlBDFs {
@@ -212,6 +223,7 @@ func (s *Server) auditVMPCICompatibility(ctx context.Context, vm *corrosion.VMRe
 		switch {
 		case len(specs) == 1:
 			plan = append(plan, s.makeAddressedIntent(vm.Name, specs[0], bdf, occ))
+			addressedPrimaries = append(addressedPrimaries, bdf)
 		case len(specs) > 1:
 			// Two specs resolve to the SAME single host member — cannot pair.
 			return s.blockAdoption(ctx, vm.Name,
@@ -221,10 +233,39 @@ func (s *Server) auditVMPCICompatibility(ctx context.Context, vm *corrosion.VMRe
 		}
 	}
 
-	// Attribute the remaining (unclaimed) XML members to portable selectors.
+	// An addressed (or mapping-with-resolved-address) intent re-expands to its
+	// primary + IOMMU-group siblings at resolve time (resolveDeviceSpec.addPrimary),
+	// so an unclaimed XML member that is a sibling of an addressed primary belongs to
+	// THAT intent's expansion — not a separate host-pinned concrete intent. Drop such
+	// siblings from `remaining` so they neither import twice nor trip the block.
+	// (Fixes a {mapping,address} selector's IOMMU sibling being imported as a
+	// separate host-pinned concrete-address intent.)
+	if len(addressedPrimaries) > 0 && len(remaining) > 0 {
+		absorbed := map[string]bool{}
+		for _, p := range addressedPrimaries {
+			for sib := range s.iommuGroupSiblingSet(ctx, p) {
+				absorbed[sib] = true
+			}
+		}
+		kept := remaining[:0:0]
+		for _, r := range remaining {
+			if absorbed[r] {
+				continue
+			}
+			kept = append(kept, r)
+		}
+		remaining = kept
+	}
+
+	// Attribute the remaining (unclaimed) XML members to portable selectors at
+	// IOMMU-GROUP granularity: each portable selector re-expands to a primary + its
+	// IOMMU-group siblings, so it accounts for ONE independent IOMMU-group unit — not
+	// one raw member. A multifunction GPU (GPU + audio in one group) is therefore one
+	// unit, one portable selector, one intent.
 	switch {
 	case len(remaining) == 0:
-		// Every member is accounted for; any portable specs are detached (not
+		// Every member is accounted for (by an addressed intent or an addressed
+		// primary's absorbed IOMMU siblings); any portable specs are detached (not
 		// present in the definition) and are correctly NOT imported.
 	case len(portable) == 0:
 		// No portable selectors: each unexplained member (an IOMMU-group sibling, or
@@ -232,30 +273,36 @@ func (s *Server) auditVMPCICompatibility(ctx context.Context, vm *corrosion.VMRe
 		for _, bdf := range remaining {
 			plan = append(plan, s.makeConcreteAddressIntent(vm.Name, bdf, occ))
 		}
-	case len(portable) == len(remaining):
-		// Clean 1:1: every portable selector is present, every member explained. The
-		// specific selector↔member pairing does not affect the intent set (a portable
-		// intent carries no BDF), so this is unambiguous.
-		for _, d := range portable {
-			plan = append(plan, s.makePortableIntent(vm.Name, d, occ))
-		}
-	case len(portable) > len(remaining):
-		// Fewer members than portable selectors ⇒ some selectors were detached.
-		// Unambiguous only when the portable selectors are interchangeable (all the
-		// same canonical selector); otherwise we cannot tell which were detached.
-		if !allSameCanonicalSelector(portable) {
+	default: // len(portable) > 0 && len(remaining) > 0
+		// Group the surviving members into independent IOMMU-group units and match
+		// against the portable-selector COUNT. The specific selector↔unit pairing does
+		// not affect the intent set (a portable intent carries no BDF).
+		units := len(s.clusterByIOMMUGroup(ctx, remaining))
+		switch {
+		case len(portable) == units:
+			// Clean: one portable selector per IOMMU-group unit (the common
+			// multifunction-GPU case: one type selector, one {GPU,audio} group).
+			for _, d := range portable {
+				plan = append(plan, s.makePortableIntent(vm.Name, d, occ))
+			}
+		case len(portable) > units:
+			// Fewer units than portable selectors ⇒ some selectors were detached.
+			// Unambiguous only when the portable selectors are interchangeable (all the
+			// same canonical selector); otherwise we cannot tell which were detached.
+			if !allSameCanonicalSelector(portable) {
+				return s.blockAdoption(ctx, vm.Name,
+					fmt.Sprintf("ambiguous PCI grouping: %d portable selectors for %d IOMMU-group unit(s)", len(portable), units))
+			}
+			for i := 0; i < units; i++ {
+				plan = append(plan, s.makePortableIntent(vm.Name, portable[i], occ))
+			}
+		default: // len(portable) < units
+			// More independent IOMMU-group units than portable selectors can explain:
+			// genuine ambiguity — block rather than guess which members belong to which
+			// selector.
 			return s.blockAdoption(ctx, vm.Name,
-				fmt.Sprintf("ambiguous PCI grouping: %d portable selectors for %d unclaimed hostdev member(s)", len(portable), len(remaining)))
+				fmt.Sprintf("ambiguous PCI grouping: %d portable selector(s) under-account for %d IOMMU-group unit(s)", len(portable), units))
 		}
-		for i := 0; i < len(remaining); i++ {
-			plan = append(plan, s.makePortableIntent(vm.Name, portable[i], occ))
-		}
-	default: // len(portable) < len(remaining), remaining > 0
-		// More unclaimed members than portable selectors can explain (count>1 /
-		// IOMMU-sibling expansion): the grouping is ambiguous — block rather than
-		// guess which members belong to which selector.
-		return s.blockAdoption(ctx, vm.Name,
-			fmt.Sprintf("ambiguous PCI grouping: %d portable selector(s) under-account for %d unclaimed hostdev member(s)", len(portable), len(remaining)))
 	}
 
 	// Commit the plan (atomic per VM: nothing was written on a block above).
@@ -356,4 +403,45 @@ func allSameCanonicalSelector(ds []*pb.DeviceSpec) bool {
 		}
 	}
 	return true
+}
+
+// iommuGroupSiblingSet returns the canonical IOMMU-group siblings of primary
+// (INCLUDING primary itself) as a set, using host_pci_devices.iommu_group — the
+// SAME topology source resolveDeviceSpec.addPrimary expands a request with. A
+// device with no known group (absent from host_pci_devices, or iommu_group < 0)
+// yields just itself, so an unknown topology never coalesces distinct members.
+func (s *Server) iommuGroupSiblingSet(ctx context.Context, primary string) map[string]bool {
+	set := map[string]bool{primary: true}
+	sibs, _ := s.iommuGroupSiblings(ctx, primary)
+	for _, sib := range sibs {
+		if bdf, ok := pci.CanonicalBDF(sib); ok {
+			set[bdf] = true
+		}
+	}
+	return set
+}
+
+// clusterByIOMMUGroup partitions members into independent IOMMU-group UNITS: two
+// members share a cluster iff they are IOMMU-group siblings (host_pci_devices.
+// iommu_group). A member with no known group is its own singleton. Each cluster is
+// exactly what ONE selector re-expands to at resolve time, so the cluster COUNT —
+// not the raw member count — is what a portable-selector set must account for.
+func (s *Server) clusterByIOMMUGroup(ctx context.Context, members []string) [][]string {
+	assigned := map[string]bool{}
+	var clusters [][]string
+	for _, m := range members {
+		if assigned[m] {
+			continue
+		}
+		sibs := s.iommuGroupSiblingSet(ctx, m)
+		var cluster []string
+		for _, n := range members {
+			if !assigned[n] && (n == m || sibs[n]) {
+				cluster = append(cluster, n)
+				assigned[n] = true
+			}
+		}
+		clusters = append(clusters, cluster)
+	}
+	return clusters
 }

@@ -33,8 +33,9 @@ import (
 // hardware_v2), executes under the VM lock with a replicated at-most-once claim,
 // journals its irreversible plan to the host-local opjournal before mutating, and
 // on any failure compensates directionally (attach rolls back, detach rolls
-// forward). The NIC and PCI paths keep their current running-only behavior and are
-// converted onto this same machinery in Task 5.2c.
+// forward). The NIC path is converted onto this same machinery in Task 5.2c, and
+// concrete-address PCI in Task 5.2d (hotplug_pci.go); SR-IOV/type/vendor/mapping
+// PCI selectors keep the legacy running-only path.
 
 // ── peer-trusted operation identity ─────────────────────────────────────────
 

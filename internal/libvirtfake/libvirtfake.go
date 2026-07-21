@@ -68,6 +68,11 @@ type Fake struct {
 	// attachNICN / detachNICN are the NIC-hotplug equivalent.
 	attachNICN int
 	detachNICN int
+	// attachHostdevN / detachHostdevN count PCI passthrough hot-plug primitive calls
+	// (both the plain and alias-carrying attach) so at-most-once tests can assert
+	// exactly one libvirt hostdev attach/detach happened per member per operation.
+	attachHostdevN int
+	detachHostdevN int
 
 	// Fail* hooks let scenarios inject failures into specific methods.
 	// Nil = default success.
@@ -88,9 +93,18 @@ type Fake struct {
 	// SkipConfigOnNICMutation is the NIC-hotplug equivalent: AttachNIC/DetachNIC
 	// update ONLY the live view (activeXML) and NOT the persistent (inactive) xml.
 	SkipConfigOnNICMutation bool
-	FailShutdownDomain      func(name string) error
-	FailUndefineDomain      func(name string, removeStorage bool) error
-	FailUndefinePreserv     func(name string) error
+	// SkipConfigOnHostdevMutation is the PCI-hostdev equivalent: AttachHostdev*/
+	// DetachHostdev update ONLY the live view (activeXML) and NOT the persistent
+	// (inactive) xml — modeling a live-succeeded-but-config-not-applied divergence
+	// so a both-state (live+persistent) hostdev verification can be exercised.
+	SkipConfigOnHostdevMutation bool
+	// FailAttachHostdev / FailDetachHostdev inject a live hostdev hot-plug primitive
+	// failure so scenarios can exercise attach-rollback / detach-forward compensation.
+	FailAttachHostdev   func(domain, pciAddress, alias string) error
+	FailDetachHostdev   func(domain, pciAddress string) error
+	FailShutdownDomain  func(name string) error
+	FailUndefineDomain  func(name string, removeStorage bool) error
+	FailUndefinePreserv func(name string) error
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -669,17 +683,129 @@ func (f *Fake) DetachNICCount() int {
 	defer f.mu.Unlock()
 	return f.detachNICN
 }
+
+// AttachHostdev hot-attaches a PCI passthrough device WITHOUT a user alias — the
+// legacy SR-IOV/type running-only path. It models the live+persistent membership
+// (keyed on the pci address for later detach) exactly like AttachHostdevWithAlias
+// with an empty alias.
 func (f *Fake) AttachHostdev(domainName, pciAddress string) error {
+	return f.AttachHostdevWithAlias(domainName, pciAddress, "")
+}
+
+// AttachHostdevWithAlias hot-attaches a PCI passthrough device carrying a stable
+// user alias (ua-<device>-<member>), tracking both the live view (activeXML —
+// always updated, mirroring a real live attach landing immediately) and, unless
+// SkipConfigOnHostdevMutation models a live-succeeded-but-config-not-applied
+// divergence, the persistent view (xml) too — the real attach applies
+// DomainDeviceModifyLive|Config.
+func (f *Fake) AttachHostdevWithAlias(domainName, pciAddress, alias string) error {
+	if f.FailAttachHostdev != nil {
+		if err := f.FailAttachHostdev(domainName, pciAddress, alias); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.record("attach-hostdev", domainName, "pci="+pciAddress)
+	f.activeXML[domainName] = insertHostdevIntoDomainXML(f.activeBaseline(domainName), domainName, pciAddress, alias)
+	if !f.SkipConfigOnHostdevMutation {
+		f.xml[domainName] = insertHostdevIntoDomainXML(f.xml[domainName], domainName, pciAddress, alias)
+	}
+	f.attachHostdevN++
+	f.record("attach-hostdev", domainName, fmt.Sprintf("pci=%s alias=%s", pciAddress, alias))
 	return nil
 }
+
+// DetachHostdev hot-detaches a PCI passthrough device by its pci address,
+// mirroring AttachHostdevWithAlias's live/persistent tracking split.
 func (f *Fake) DetachHostdev(domainName, pciAddress string) error {
+	if f.FailDetachHostdev != nil {
+		if err := f.FailDetachHostdev(domainName, pciAddress); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.activeXML[domainName] = removeHostdevFromDomainXML(f.activeBaseline(domainName), pciAddress)
+	if !f.SkipConfigOnHostdevMutation {
+		f.xml[domainName] = removeHostdevFromDomainXML(f.xml[domainName], pciAddress)
+	}
+	f.detachHostdevN++
 	f.record("detach-hostdev", domainName, "pci="+pciAddress)
 	return nil
+}
+
+// AttachHostdevCount / DetachHostdevCount return how many times the hostdev
+// hot-plug primitives have been invoked — test accessors for at-most-once
+// assertions.
+func (f *Fake) AttachHostdevCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attachHostdevN
+}
+func (f *Fake) DetachHostdevCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.detachHostdevN
+}
+
+// hostdevAliasInDomainXML reports whether a domain XML carries a <hostdev> whose
+// <alias name=...> matches alias (either quote style). Mirrors
+// grpcapi.hostdevAliasInXML — the substring the running-path hostdev membership
+// verification keys off.
+func hostdevAliasInDomainXML(domainXML, alias string) bool {
+	if domainXML == "" || alias == "" {
+		return false
+	}
+	return strings.Contains(domainXML, "name='"+alias+"'") || strings.Contains(domainXML, `name="`+alias+`"`)
+}
+
+// insertHostdevIntoDomainXML adds a <hostdev> element carrying the pci address
+// (as a data-pci attribute so DetachHostdev can match it) and, when non-empty, an
+// <alias> child, to a domain's XML — synthesizing a minimal skeleton when the
+// domain has no XML yet. Idempotent on the alias when one is set.
+func insertHostdevIntoDomainXML(domainXML, domainName, pciAddress, alias string) string {
+	if domainXML == "" {
+		domainXML = "<domain type='kvm'><name>" + domainName + "</name><devices></devices></domain>"
+	}
+	if alias != "" && hostdevAliasInDomainXML(domainXML, alias) {
+		return domainXML
+	}
+	hd := "<hostdev mode='subsystem' type='pci' managed='yes' data-pci='" + pciAddress + "'>"
+	if alias != "" {
+		hd += "<alias name='" + alias + "'/>"
+	}
+	hd += "</hostdev>"
+	if strings.Contains(domainXML, "</devices>") {
+		return strings.Replace(domainXML, "</devices>", hd+"</devices>", 1)
+	}
+	return domainXML + hd
+}
+
+// removeHostdevFromDomainXML removes the <hostdev>…</hostdev> element whose
+// data-pci attribute matches pciAddress, leaving any other hostdevs intact.
+func removeHostdevFromDomainXML(domainXML, pciAddress string) string {
+	if domainXML == "" {
+		return domainXML
+	}
+	needleA := "data-pci='" + pciAddress + "'"
+	needleB := `data-pci="` + pciAddress + `"`
+	from := 0
+	for {
+		rel := strings.Index(domainXML[from:], "<hostdev")
+		if rel < 0 {
+			return domainXML
+		}
+		start := from + rel
+		endRel := strings.Index(domainXML[start:], "</hostdev>")
+		if endRel < 0 {
+			return domainXML
+		}
+		end := start + endRel + len("</hostdev>")
+		if block := domainXML[start:end]; strings.Contains(block, needleA) || strings.Contains(block, needleB) {
+			return domainXML[:start] + domainXML[end:]
+		}
+		from = end
+	}
 }
 func (f *Fake) BlockResize(domainName, path string, sizeBytes int64) error {
 	f.mu.Lock()

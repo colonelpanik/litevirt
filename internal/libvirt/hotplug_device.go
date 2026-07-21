@@ -72,6 +72,31 @@ func (c *Client) AttachHostdev(domainName, pciAddress string) error {
 	return c.attachDeviceXML(domainName, hd)
 }
 
+// AttachHostdevWithAlias hot-attaches a PCI device to a running domain carrying a
+// stable user alias (ua-<device>-<member>), so the device is addressable by that
+// alias in the persistent definition (the topology-preserving reconcile keys
+// hostdevs by their <alias>). An empty alias behaves exactly like AttachHostdev.
+func (c *Client) AttachHostdevWithAlias(domainName, pciAddress, alias string) error {
+	parsed := ParsePCIAddress(pciAddress)
+	hd := hostdevDevice{
+		Mode:    "subsystem",
+		Type:    "pci",
+		Managed: "yes",
+		Source: hostdevSource{
+			Address: hostdevAddress{
+				Domain:   parsed.Domain,
+				Bus:      parsed.Bus,
+				Slot:     parsed.Slot,
+				Function: parsed.Function,
+			},
+		},
+	}
+	if alias != "" {
+		hd.Alias = &hostdevAlias{Name: alias}
+	}
+	return c.attachDeviceXML(domainName, hd)
+}
+
 // DetachHostdev hot-detaches a PCI device from a running domain.
 func (c *Client) DetachHostdev(domainName, pciAddress string) error {
 	parsed := ParsePCIAddress(pciAddress)

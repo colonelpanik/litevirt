@@ -29,11 +29,13 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 	if err := s.RequirePerm(ctx, vmRBACPath(vmRec), "vm.update", "operator"); err != nil {
 		return nil, err
 	}
-	// Disk and NIC attach are journaled, stopped-capable, and at-most-once (Tasks
-	// 5.2b/5.2c): each owns its forward decision, the operation_protocol_v1/
-	// hardware_v2 gates, and the crash-safe DAG, and records its own
-	// device.attached event at the owner level (not duplicated here). The PCI path
-	// below keeps its running-only behavior until Task 5.2d converts it.
+	// Disk, NIC, and CONCRETE-ADDRESS PCI attach are journaled, stopped-capable, and
+	// at-most-once (Tasks 5.2b/5.2c/5.2d): each owns its forward decision, the
+	// operation_protocol_v1/hardware_v2 gates, and the crash-safe DAG, and records
+	// its own device.attached event at the owner level. Only address-selector PCI is
+	// converted; SR-IOV/type/vendor/mapping selectors keep the legacy running-only
+	// attachPCIDevice path below (their resolve is side-effecting / Unimplemented in
+	// the pure resolver, and the foundation UI only creates concrete-address PCI).
 	if req.Disk != nil {
 		out, err := s.attachDiskEntry(ctx, req, vmRec)
 		if err != nil {
@@ -44,6 +46,12 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 	}
 	if req.Nic != nil {
 		return s.attachNICEntry(ctx, req, vmRec)
+	}
+	if req.PciDevice != nil {
+		if kind, _ := corrosion.ClassifyPCISelector(req.PciDevice); kind == "address" {
+			return s.attachPCIEntry(ctx, req, vmRec)
+		}
+		// Non-address selectors fall through to the legacy running-only path below.
 	}
 
 	if vmRec.HostName != s.hostName {
@@ -96,9 +104,12 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 	if err := s.RequirePerm(ctx, vmRBACPath(vmRec), "vm.update", "operator"); err != nil {
 		return nil, err
 	}
-	// Disk and NIC detach are journaled, stopped-capable, and at-most-once (Tasks
-	// 5.2b/5.2c); each owns its forward + gates and records its own device.detached
-	// event at the owner level. PCI keeps running-only behavior until Task 5.2d.
+	// Disk, NIC, and CONCRETE-ADDRESS PCI detach are journaled, stopped-capable, and
+	// at-most-once (Tasks 5.2b/5.2c/5.2d); each owns its forward + gates and records
+	// its own device.detached event at the owner level. A PCI address that backs a
+	// live address-kind vm_pci_intent takes the journaled path; any other PCI address
+	// (attached via the legacy SR-IOV/type path or CreateVM ownership) keeps the
+	// legacy running-only detachPCIDevice path below.
 	if req.DiskName != "" {
 		out, err := s.detachDiskEntry(ctx, req, vmRec)
 		if err != nil {
@@ -109,6 +120,16 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 	}
 	if req.NicMac != "" {
 		return s.detachNICEntry(ctx, req, vmRec)
+	}
+	if req.PciAddress != "" {
+		_, journaled, ierr := s.liveAddressIntent(ctx, vmRec.Name, req.PciAddress)
+		if ierr != nil {
+			return nil, status.Errorf(codes.Internal, "read PCI intents for %q: %v", req.VmName, ierr)
+		}
+		if journaled {
+			return s.detachPCIEntry(ctx, req, vmRec)
+		}
+		// No concrete-address intent → legacy running-only path below.
 	}
 
 	if vmRec.HostName != s.hostName {

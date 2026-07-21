@@ -51,6 +51,11 @@ type LibvirtBackend interface {
 	AttachNIC(domainName, bridge, model, mac string) error
 	DetachNIC(domainName, mac string) error
 	AttachHostdev(domainName, pciAddress string) error
+	// AttachHostdevWithAlias hot-attaches a PCI passthrough device carrying a stable
+	// user alias (ua-<device>-<member>) so the topology-preserving reconcile can key
+	// the hostdev by that alias. The journaled concrete-address PCI attach uses it;
+	// the legacy SR-IOV/type path keeps using AttachHostdev (no alias).
+	AttachHostdevWithAlias(domainName, pciAddress, alias string) error
 	DetachHostdev(domainName, pciAddress string) error
 	BlockResize(domainName, path string, sizeBytes int64) error
 	SetBootOrder(domainName, bootOrder string) error

@@ -369,6 +369,30 @@ func ListVMPCIIntents(ctx context.Context, c *Client, vmName string) ([]PCIInten
 	return out, nil
 }
 
+// PCIIntentExclusiveOwner returns the vm_name of the LIVE (deleted_at IS NULL)
+// vm_pci_intent row that already holds (hostName, exclusiveKey), or "" when none
+// does. It enforces the concrete-address passthrough exclusivity invariant: a
+// given host BDF may back at most one VM's live intent, so a second VM claiming
+// the same address is rejected before any bind. It is a plain read (no
+// replicated write), so it introduces no new statement shape. exclusiveKey is the
+// normalized BDF stored in vm_pci_intent.exclusive_key.
+func PCIIntentExclusiveOwner(ctx context.Context, c *Client, hostName, exclusiveKey string) (string, error) {
+	if exclusiveKey == "" {
+		return "", nil
+	}
+	rows, err := c.Query(ctx,
+		`SELECT vm_name FROM vm_pci_intent
+		 WHERE host_name = ? AND exclusive_key = ? AND deleted_at IS NULL
+		 LIMIT 1`, hostName, exclusiveKey)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	return rows[0].String("vm_name"), nil
+}
+
 // PCIRealizationRecord represents a single vm_pci_realizations row: the
 // resolved outcome of a vm_pci_intent row — the concrete host device(s)
 // actually attached. Ordinal orders multiple members realizing the same

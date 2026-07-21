@@ -403,7 +403,7 @@ func (s *Server) executePCIAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		// running-attach of the same BDF loses the CAS and fails. NO vfio bind, NO lease,
 		// NO realization (those happen at VM start). On failure the claim conflict / a
 		// missing-inventory BDF fails the attach; the intent write is gated by the claim.
-		release, cerr := s.claimDeviceOwnership(ctx, vm.Name, members)
+		_, release, cerr := s.claimDeviceOwnership(ctx, vm.Name, members)
 		if cerr != nil {
 			return s.failPCIAttach(ctx, rb, status.Code(cerr), fmt.Errorf("reserve device ownership: %w", cerr))
 		}

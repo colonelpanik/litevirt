@@ -1203,8 +1203,19 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		}
 	}
 
-	// Release PCI passthrough devices and unbind from vfio-pci.
-	s.releaseDevices(ctx, vm.Name)
+	// PCI passthrough on stop: under the active hardware_v2 regime a stopped VM
+	// RETAINS its device reservation (host_pci_devices ownership + vfio bind) so
+	// "assigned while off, realized while running" holds — the device stays reserved
+	// for this VM while it is off, and only detach or VM-delete releases it. FIX-9a
+	// made that ownership the shared reservation every producer contends on, so
+	// releasing it on stop would let another VM grab hardware this VM still declares
+	// (its vm_pci_intent persists). Gated on the latch: pre-latch keep the legacy
+	// unbind + clear (byte-for-behavior unchanged on the current fleet, and a
+	// mixed-version rollout degrades gracefully — an old node, or a new node pre-latch,
+	// stops-and-releases with no corruption).
+	if !s.hardwareV2Latched(ctx) {
+		s.releaseDevices(ctx, vm.Name)
+	}
 
 	// Mark as "stopped" with detail indicating operator-initiated stop. This
 	// distinguishes operator stops from crashes (#29): losing this write lets HA

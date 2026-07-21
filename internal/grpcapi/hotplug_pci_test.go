@@ -1039,7 +1039,7 @@ func TestClaimDeviceOwnership_MissingInventory_FailsClosed(t *testing.T) {
 	ctx := adminCtx()
 
 	// The BDF is NOT in host_pci_devices.
-	release, err := s.claimDeviceOwnership(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}})
+	_, release, err := s.claimDeviceOwnership(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("missing-inventory claim: code = %v, want FailedPrecondition", status.Code(err))
 	}
@@ -1070,7 +1070,7 @@ func TestClaimDeviceOwnership_IOMMUGroup_PartialClaimRollback(t *testing.T) {
 		t.Fatalf("seed sibling ownership: %v", err)
 	}
 
-	_, err := s.claimDeviceOwnership(ctx, "vm1", []ResolvedMember{
+	_, _, err := s.claimDeviceOwnership(ctx, "vm1", []ResolvedMember{
 		{Address: "0000:41:00.0"}, {Address: "0000:41:00.1"},
 	})
 	if status.Code(err) != codes.AlreadyExists {

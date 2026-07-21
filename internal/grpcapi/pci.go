@@ -411,12 +411,14 @@ func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intent
 //
 // It performs NO vfio bind and writes NO durable lease — ownership only, so it is
 // safe on the stopped-attach declare path (the bind/lease/realization stay at VM
-// start). It returns a release closure that owner-releases EXACTLY the members THIS
-// call newly claimed (owner-scoped, a no-op for a self-owned member, and a no-op if
-// another VM has since claimed the address) — the caller invokes it to undo the
-// reservation on its own later failure. On any failure WITHIN the loop it rolls
-// those back itself before returning the error.
-func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, members []ResolvedMember) (func(), error) {
+// start). It returns the addresses it NEWLY claimed and a release closure that
+// owner-releases EXACTLY those (owner-scoped, a no-op for a self-owned member, and a
+// no-op if another VM has since claimed the address) — the caller invokes release to
+// undo the reservation on its own later failure, or uses the claimed list to scope a
+// rollback so a self-owned reservation (a device reserved while the VM was off,
+// FIX-9b) is never released by a failed operation. On any failure WITHIN the loop it
+// rolls the newly-claimed members back itself before returning the error.
+func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, members []ResolvedMember) ([]string, func(), error) {
 	noop := func() {}
 
 	// Current owners on this host, read once (no new statement): distinguishes
@@ -425,14 +427,15 @@ func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, member
 	owners := map[string]string{}
 	devs, lerr := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	if lerr != nil {
-		return noop, status.Errorf(codes.Internal, "read PCI inventory: %v", lerr)
+		return nil, noop, status.Errorf(codes.Internal, "read PCI inventory: %v", lerr)
 	}
 	for _, d := range devs {
 		owners[d.Address] = d.VMName
 	}
 
 	// claimed = the addresses THIS call took; release owner-releases exactly those
-	// (never another VM's device). No vfio unbind — nothing is bound here.
+	// (never another VM's device, never a pre-existing self-owned reservation). No
+	// vfio unbind — nothing is bound here.
 	var claimed []string
 	release := func() {
 		for _, addr := range claimed {
@@ -449,32 +452,32 @@ func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, member
 			// Already ours — idempotent self-claim; not newly claimed, nothing to do.
 		case owner != "":
 			release()
-			return noop, status.Errorf(codes.AlreadyExists,
+			return nil, noop, status.Errorf(codes.AlreadyExists,
 				"PCI device %s (host %s) is already claimed by VM %q", addr, s.hostName, owner)
 		case !present:
 			// Absent / tombstoned from inventory: no claimable ownership row exists.
 			// Fail CLOSED — a real passthrough device is discovered into host_pci_devices
 			// before it can be assigned, so a missing BDF is an error, not a bind-anyway.
 			release()
-			return noop, status.Errorf(codes.FailedPrecondition,
+			return nil, noop, status.Errorf(codes.FailedPrecondition,
 				"PCI device %s is not in host %s inventory", addr, s.hostName)
 		default:
 			// Present and unowned → atomic CAS claim.
 			ok, cerr := corrosion.ClaimPCIDevice(ctx, s.db, s.hostName, addr, vmName)
 			if cerr != nil {
 				release()
-				return noop, status.Errorf(codes.Internal, "claim PCI device %s: %v", addr, cerr)
+				return nil, noop, status.Errorf(codes.Internal, "claim PCI device %s: %v", addr, cerr)
 			}
 			if !ok {
 				// Lost the CAS race — another operation claimed it between the read and here.
 				release()
-				return noop, status.Errorf(codes.AlreadyExists,
+				return nil, noop, status.Errorf(codes.AlreadyExists,
 					"PCI device %s (host %s) was claimed by another operation", addr, s.hostName)
 			}
 			claimed = append(claimed, addr)
 		}
 	}
-	return release, nil
+	return claimed, release, nil
 }
 
 // acquireDeviceLeases is the side-effecting counterpart to resolveDeviceIntents for
@@ -490,7 +493,11 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 
 	// Claim inventory ownership (fail-closed CAS) BEFORE any bind. On failure the
 	// claim rolled back its own reservations, so there is nothing to unbind here.
-	if _, cerr := s.claimDeviceOwnership(ctx, vmName, members); cerr != nil {
+	// claimed = the members THIS call newly took (a self-owned member is skipped and
+	// is NOT in the list), so the bind-failure rollback can release exactly those and
+	// never a pre-existing self-owned reservation.
+	claimed, _, cerr := s.claimDeviceOwnership(ctx, vmName, members)
+	if cerr != nil {
 		return noop, cerr
 	}
 
@@ -508,9 +515,12 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 		prevDriver, err := vfio.Bind(addr)
 		if err != nil {
 			slog.Warn("VFIO bind failed", "address", addr, "error", err)
-			// Roll back the devices this allocation owns (owner-scoped) + clear the
-			// durable lease. By here every member is owned by vmName, so release is safe.
-			s.releaseDeviceLeases(ctx, vmName, addresses)
+			// Roll back ONLY the devices THIS call newly claimed (unbind + owner-release)
+			// + clear the durable lease. A self-owned reservation (a device reserved while
+			// the VM was off, FIX-9b) is NOT in `claimed`, so a failed start-time bind
+			// retains it rather than silently dropping the reservation. When nothing is
+			// self-owned, `claimed` == every address, so this is identical to before.
+			s.releaseDeviceLeases(ctx, vmName, claimed)
 			finish()
 			return noop, status.Errorf(codes.Internal,
 				"failed to bind device %s to vfio-pci: %v", addr, err)

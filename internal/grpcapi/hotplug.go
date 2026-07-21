@@ -47,7 +47,6 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 		if err != nil {
 			return nil, err
 		}
-		s.recordVMEvent(ctx, req.VmName, "device.attached", "ok", "disk "+req.Disk.Name)
 		return out, nil
 	}
 	if req.Nic != nil {
@@ -127,7 +126,6 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 		if err != nil {
 			return nil, err
 		}
-		s.recordVMEvent(ctx, req.VmName, "device.detached", "ok", "disk "+req.DiskName)
 		return out, nil
 	}
 	if req.NicMac != "" {
@@ -222,7 +220,15 @@ func countVMDisks(ctx context.Context, db *corrosion.Client, vmName string) int 
 	return len(disks)
 }
 
-// parseDiskSize parses sizes like "20G", "100G" into GB.
+// maxDiskSizeGB is a sane upper bound on a requested disk size (in GB). It exists
+// so the later uint64(sizeGB)*1024*1024*1024 byte-size conversion can never
+// overflow — no real disk request needs a size anywhere near this cap.
+const maxDiskSizeGB = 1 << 20 // ~1 PiB
+
+// parseDiskSize parses sizes like "20G", "100G" into GB. It fails closed: a
+// non-positive magnitude, an unrecognized unit, or a magnitude that would scale
+// beyond maxDiskSizeGB are all rejected rather than silently accepted (a bare
+// unknown unit must NOT be treated as GiB).
 func parseDiskSize(size string) (int, error) {
 	if size == "" {
 		return 0, fmt.Errorf("size is required")
@@ -232,23 +238,31 @@ func parseDiskSize(size string) (int, error) {
 	_, err := fmt.Sscanf(size, "%d%s", &n, &unit)
 	if err != nil {
 		// Try plain number.
-		_, err = fmt.Sscanf(size, "%d", &n)
-		if err != nil {
+		unit = ""
+		if _, err = fmt.Sscanf(size, "%d", &n); err != nil {
 			return 0, fmt.Errorf("cannot parse %q", size)
 		}
-		return n, nil
 	}
+	if n <= 0 {
+		return 0, fmt.Errorf("size must be positive: %q", size)
+	}
+	var gb int
 	switch unit {
-	case "G", "GB", "g", "gb":
-		return n, nil
+	case "", "G", "GB", "g", "gb":
+		gb = n
 	case "T", "TB", "t", "tb":
-		return n * 1024, nil
+		gb = n * 1024
 	case "M", "MB", "m", "mb":
 		if n < 1024 {
-			return 1, nil
+			gb = 1
+		} else {
+			gb = n / 1024
 		}
-		return n / 1024, nil
 	default:
-		return n, nil
+		return 0, fmt.Errorf("unknown size unit %q", unit)
 	}
+	if gb > maxDiskSizeGB {
+		return 0, fmt.Errorf("size %q exceeds the maximum allowed disk size", size)
+	}
+	return gb, nil
 }

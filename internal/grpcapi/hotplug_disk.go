@@ -340,6 +340,12 @@ func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceReques
 	if bus == "" {
 		bus = "virtio"
 	}
+	// Bus allowlist, validated ONCE here before the op begins (any mutation or
+	// BeginVMOperation claim below): the CLI/UI only offer these three, so an
+	// arbitrary bus string is a backend validation gap, not a real request.
+	if bus != "virtio" && bus != "scsi" && bus != "sata" {
+		return nil, status.Errorf(codes.InvalidArgument, "unsupported disk bus %q", bus)
+	}
 	diskPath, err := lv.SafeDiskPath(s.dataDir, vmName, spec.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -356,12 +362,17 @@ func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceReques
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list disks for %q: %v", vmName, err)
 	}
+	occupied := make(map[string]bool, len(disks))
 	for _, d := range disks {
 		if d.DiskName == spec.Name {
 			return nil, status.Errorf(codes.AlreadyExists, "disk %q is already attached to VM %q", spec.Name, vmName)
 		}
+		occupied[d.TargetDev] = true
 	}
-	targetDev := allocateDiskTargetDev(len(disks), bus)
+	targetDev, err := allocateDiskTargetDev(occupied, bus)
+	if err != nil {
+		return nil, err
+	}
 
 	op := corrosion.OperationRecord{
 		ID:             opID,
@@ -389,15 +400,26 @@ func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceReques
 		int64(sizeGB)*1024*1024*1024, targetDev, opID, vm.OwnerEpoch, newGen, running)
 }
 
-// allocateDiskTargetDev picks the next target device name given the current disk
-// count (root is 'a'), matching the historical non-racy scheme; safe under the VM
-// lock + mutation barrier.
-func allocateDiskTargetDev(diskCount int, bus string) string {
+// allocateDiskTargetDev returns the first free target device name given the
+// OCCUPIED target-dev set of the VM's current live disks (root is normally
+// "<prefix>a"). Allocating from the occupied set — rather than the disk COUNT —
+// means a detach-then-add cycle can never recompute an in-use name: a count-based
+// scheme recomputes the same slot a disk added in between the detach and the next
+// attach already holds. Safe under the VM lock + mutation barrier (which
+// serialize allocations for a given VM), combined with the caller's own
+// duplicate-name check.
+func allocateDiskTargetDev(occupied map[string]bool, bus string) (string, error) {
 	prefix := "vd"
 	if bus == "scsi" || bus == "sata" {
 		prefix = "sd"
 	}
-	return fmt.Sprintf("%s%c", prefix, 'b'+diskCount)
+	for c := byte('a'); c <= 'z'; c++ {
+		cand := fmt.Sprintf("%s%c", prefix, c)
+		if !occupied[cand] {
+			return cand, nil
+		}
+	}
+	return "", status.Errorf(codes.ResourceExhausted, "no free %s target device slot", prefix)
 }
 
 // attachRollback carries the state needed to compensate a failed attach.

@@ -169,6 +169,44 @@ func TestParseDiskSize(t *testing.T) {
 	}
 }
 
+// TestParseDiskSize_RejectsInvalid proves the #8 fix: a non-positive size, an
+// unknown unit, or a value whose byte size would overflow the later
+// uint64(sizeGB)*1024^3 conversion are all rejected — parseDiskSize must not
+// fail open by treating an unrecognized unit as GiB or accepting a negative/zero
+// magnitude.
+func TestParseDiskSize_RejectsInvalid(t *testing.T) {
+	invalid := []string{
+		"-1G",      // negative magnitude
+		"0G",       // zero magnitude
+		"10Q",      // unknown unit — must error, not silently default to GiB
+		"9999999T", // scales to a size beyond the sane upper bound
+	}
+	for _, in := range invalid {
+		if _, err := parseDiskSize(in); err == nil {
+			t.Errorf("parseDiskSize(%q): expected an error, got none", in)
+		}
+	}
+
+	valid := []struct {
+		input  string
+		wantGB int
+	}{
+		{"20G", 20},
+		{"20", 20},
+		{"1T", 1024},
+	}
+	for _, tt := range valid {
+		got, err := parseDiskSize(tt.input)
+		if err != nil {
+			t.Errorf("parseDiskSize(%q): unexpected error: %v", tt.input, err)
+			continue
+		}
+		if got != tt.wantGB {
+			t.Errorf("parseDiskSize(%q) = %d, want %d", tt.input, got, tt.wantGB)
+		}
+	}
+}
+
 func TestCountVMDisks(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

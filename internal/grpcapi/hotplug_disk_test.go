@@ -427,7 +427,14 @@ func TestDiskAttach_CompletionCASFails_RetainsJournal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list disks: %v", err)
 	}
-	targetDev := allocateDiskTargetDev(len(disks), spec.Bus)
+	occupied := make(map[string]bool, len(disks))
+	for _, d := range disks {
+		occupied[d.TargetDev] = true
+	}
+	targetDev, err := allocateDiskTargetDev(occupied, spec.Bus)
+	if err != nil {
+		t.Fatalf("allocate target dev: %v", err)
+	}
 
 	opID := "cas-fail-disk-attach-vm1"
 	reqHash := attachDiskRequestHash("vm1", spec)
@@ -592,6 +599,168 @@ func TestAttachDevice_RunningConfigDivergenceRollsBack(t *testing.T) {
 	vm := mustGetVM(t, s, "vm1")
 	if vm.ActiveOperationID != "" {
 		t.Fatalf("mutation barrier not cleared after rollback: %q", vm.ActiveOperationID)
+	}
+}
+
+// ── #5 target-dev allocation must not collide after a detach cycle ──────────
+
+// TestAllocateDiskTargetDev_NoCollisionAfterDetachCycle proves the #5 fix: a
+// detach-then-add cycle must never recompute an in-use target-dev. The historical
+// count-based allocator computes the next slot from len(disks), so detaching a
+// disk lowers the count and a subsequent attach recomputes a target already held
+// by a disk added in between it and the detach — a live collision.
+func TestAllocateDiskTargetDev_NoCollisionAfterDetachCycle(t *testing.T) {
+	// Unit-level: the occupied-set allocator returns the first FREE slot — never a
+	// slot already occupied, even one that a count-based scheme would recompute.
+	occupied := map[string]bool{"vda": true, "vdd": true}
+	got, err := allocateDiskTargetDev(occupied, "virtio")
+	if err != nil {
+		t.Fatalf("allocateDiskTargetDev: %v", err)
+	}
+	if got != "vdb" {
+		t.Fatalf("allocateDiskTargetDev(occupied={vda,vdd}) = %q, want %q (first free slot)", got, "vdb")
+	}
+
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+
+	// RPC-level: attach A, attach B, detach A, attach C — C must not collide with
+	// B (or any other live disk).
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "disk-a", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("attach A: %v", err)
+	}
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "disk-b", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("attach B: %v", err)
+	}
+	targetB := diskTargetDev(t, ctx, s, "vm1", "disk-b")
+
+	if _, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", DiskName: "disk-a"}); err != nil {
+		t.Fatalf("detach A: %v", err)
+	}
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "disk-c", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("attach C: %v", err)
+	}
+	targetC := diskTargetDev(t, ctx, s, "vm1", "disk-c")
+
+	if targetC == targetB {
+		t.Fatalf("target-dev collision: disk-c reused disk-b's live target %q", targetC)
+	}
+	// No live disk shares disk-c's target under a different name.
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1")
+	for _, d := range disks {
+		if d.TargetDev == targetC && d.DiskName != "disk-c" {
+			t.Fatalf("target-dev collision: %q shared by disk-c and %q", targetC, d.DiskName)
+		}
+	}
+}
+
+// ── #7 the disk path must record exactly one attach/detach event ────────────
+
+// TestAttachDisk_EmitsSingleEvent proves the #7 fix: a disk attach must record
+// exactly one "device.attached" vm_event, not one at the entry RPC AND a second
+// at the owner coordinator.
+func TestAttachDisk_EmitsSingleEvent(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	evs, err := corrosion.ListVMEvents(ctx, s.db, "vm1", 0, "")
+	if err != nil {
+		t.Fatalf("ListVMEvents: %v", err)
+	}
+	n := 0
+	for _, e := range evs {
+		if e.Type == "device.attached" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("device.attached events = %d, want exactly 1 (entry + owner must not both record)", n)
+	}
+}
+
+// TestDetachDisk_EmitsSingleEvent mirrors TestAttachDisk_EmitsSingleEvent for detach.
+func TestDetachDisk_EmitsSingleEvent(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if _, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", DiskName: "data1"}); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+
+	evs, err := corrosion.ListVMEvents(ctx, s.db, "vm1", 0, "")
+	if err != nil {
+		t.Fatalf("ListVMEvents: %v", err)
+	}
+	n := 0
+	for _, e := range evs {
+		if e.Type == "device.detached" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("device.detached events = %d, want exactly 1 (entry + owner must not both record)", n)
+	}
+}
+
+// ── #8 disk-attach bus allowlist ─────────────────────────────────────────────
+
+// TestAttachDisk_RejectsInvalidBus proves the #8 fix: an unsupported bus is
+// rejected with InvalidArgument before the op begins; the three supported buses
+// (and the empty-string virtio default) are accepted.
+func TestAttachDisk_RejectsInvalidBus(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "bad-bus", Size: "5G", Bus: "ide"},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("bus=%q: code = %v, want InvalidArgument", "ide", status.Code(err))
+	}
+	// No row/operation must have been left behind by the rejected attach.
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1")
+	if hasDiskName(disks, "bad-bus") {
+		t.Fatalf("a rejected bus must not leave a disk row: %+v", disks)
+	}
+
+	okBuses := []struct{ bus, diskName string }{
+		{"virtio", "ok-virtio"},
+		{"scsi", "ok-scsi"},
+		{"sata", "ok-sata"},
+		{"", "ok-default"},
+	}
+	for _, tc := range okBuses {
+		if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+			VmName: "vm1", Disk: &pb.DiskSpec{Name: tc.diskName, Size: "5G", Bus: tc.bus},
+		}); err != nil {
+			t.Fatalf("bus=%q should be accepted: %v", tc.bus, err)
+		}
 	}
 }
 

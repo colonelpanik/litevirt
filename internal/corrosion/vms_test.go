@@ -324,6 +324,101 @@ func TestRenameVM(t *testing.T) {
 	}
 }
 
+// TestRenameVM_CarriesHardwareTables covers the v42 tables RenameVM must also
+// carry: vm_nics (id RE-DERIVES under the new name — DeterministicNICID takes
+// vmName), vm_pci_intent and vm_pci_realizations (device_id is name-independent
+// and must be PRESERVED, only vm_name rekeyed). Nothing must remain live under
+// the old name.
+func TestRenameVM_CarriesHardwareTables(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	oldName, newName := "old-name", "new-name"
+	mac := "52:54:00:aa:bb:cc"
+	addr := "0000:41:00.0"
+	exclusiveKey := addr
+	deviceID := DeterministicPCIIntentID("address|"+addr, 0)
+
+	vm := VMRecord{Name: oldName, HostName: "h1", Spec: "{}", State: "running"}
+	nics := []NICRecord{{VMName: oldName, ID: DeterministicNICID(oldName, mac), NetworkName: "default", MAC: mac, Ordinal: 0}}
+	pciIntents := []PCIIntentRecord{{
+		VMName: oldName, DeviceID: deviceID, HostName: "h1",
+		SelectorKind: "address", SelectorPayload: "{}", ExclusiveKey: &exclusiveKey,
+	}}
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, pciIntents, true); err != nil {
+		t.Fatalf("InsertVMWithHardware: %v", err)
+	}
+	realization := PCIRealizationRecord{
+		VMName: oldName, DeviceID: deviceID, MemberID: "m0",
+		HostName: "h1", ResolvedAddress: addr, XMLAlias: "hostdev0", Ordinal: 0,
+	}
+	if err := UpsertPCIRealization(ctx, c, realization); err != nil {
+		t.Fatalf("UpsertPCIRealization: %v", err)
+	}
+
+	if err := RenameVM(ctx, c, oldName, newName); err != nil {
+		t.Fatalf("RenameVM: %v", err)
+	}
+
+	// vm_nics: id RE-DERIVES under the new name; nothing live under old.
+	newNICs, err := GetVMNICsRaw(ctx, c, "vm_nics", newName)
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw(new): %v", err)
+	}
+	var liveNew []NICRecord
+	for _, n := range newNICs {
+		if n.DeletedAt == "" {
+			liveNew = append(liveNew, n)
+		}
+	}
+	if len(liveNew) != 1 {
+		t.Fatalf("got %d live vm_nics rows under new name, want 1: %+v", len(liveNew), liveNew)
+	}
+	if wantID := DeterministicNICID(newName, mac); liveNew[0].ID != wantID {
+		t.Errorf("nic id = %q, want re-derived %q", liveNew[0].ID, wantID)
+	}
+	oldNICs, _ := GetVMNICsRaw(ctx, c, "vm_nics", oldName)
+	for _, n := range oldNICs {
+		if n.DeletedAt == "" {
+			t.Errorf("live vm_nics row still under old name: %+v", n)
+		}
+	}
+
+	// vm_pci_intent: device_id PRESERVED (name-independent); nothing under old.
+	newIntents, err := ListVMPCIIntents(ctx, c, newName)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents(new): %v", err)
+	}
+	if len(newIntents) != 1 {
+		t.Fatalf("got %d vm_pci_intent rows under new name, want 1: %+v", len(newIntents), newIntents)
+	}
+	if newIntents[0].DeviceID != deviceID {
+		t.Errorf("device_id = %q, want preserved %q", newIntents[0].DeviceID, deviceID)
+	}
+	oldIntents, _ := ListVMPCIIntents(ctx, c, oldName)
+	if len(oldIntents) != 0 {
+		t.Errorf("vm_pci_intent rows still live under old name: %+v", oldIntents)
+	}
+
+	// vm_pci_realizations: device_id/member_id/xml_alias/resolved_address/ordinal preserved.
+	newRealizations, err := ListVMPCIRealizations(ctx, c, newName)
+	if err != nil {
+		t.Fatalf("ListVMPCIRealizations(new): %v", err)
+	}
+	if len(newRealizations) != 1 {
+		t.Fatalf("got %d vm_pci_realizations rows under new name, want 1: %+v", len(newRealizations), newRealizations)
+	}
+	if gotR := newRealizations[0]; gotR.DeviceID != realization.DeviceID || gotR.MemberID != realization.MemberID ||
+		gotR.XMLAlias != realization.XMLAlias || gotR.ResolvedAddress != realization.ResolvedAddress ||
+		gotR.Ordinal != realization.Ordinal {
+		t.Errorf("realization = %+v, want fields preserved from %+v", gotR, realization)
+	}
+	oldRealizations, _ := ListVMPCIRealizations(ctx, c, oldName)
+	if len(oldRealizations) != 0 {
+		t.Errorf("vm_pci_realizations rows still live under old name: %+v", oldRealizations)
+	}
+}
+
 func TestInsertDisk(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
@@ -643,6 +738,85 @@ func TestDeleteVM_WithInterfacesAndDisks(t *testing.T) {
 	gotDisks, _ := GetVMDisks(ctx, c, "vm-full")
 	if len(gotDisks) != 0 {
 		t.Errorf("expected 0 disks after delete, got %d", len(gotDisks))
+	}
+}
+
+// TestDeleteVM_TombstonesHardwareTables covers the v42 tables DeleteVM must
+// also tombstone: vm_nics, vm_pci_intent, vm_pci_realizations. It also proves
+// the concrete-address exclusive reservation is FREED once the intent is
+// tombstoned (PCIIntentExclusiveOwner filters deleted_at IS NULL), so another
+// VM could subsequently intend the same host BDF.
+func TestDeleteVM_TombstonesHardwareTables(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	name := "vm-hw"
+	mac := "52:54:00:aa:bb:dd"
+	addr := "0000:51:00.0"
+	exclusiveKey := addr
+	deviceID := DeterministicPCIIntentID("address|"+addr, 0)
+
+	vm := VMRecord{Name: name, HostName: "h1", Spec: "{}", State: "running"}
+	nics := []NICRecord{{VMName: name, ID: DeterministicNICID(name, mac), NetworkName: "default", MAC: mac, Ordinal: 0}}
+	pciIntents := []PCIIntentRecord{{
+		VMName: name, DeviceID: deviceID, HostName: "h1",
+		SelectorKind: "address", SelectorPayload: "{}", ExclusiveKey: &exclusiveKey,
+	}}
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, pciIntents, true); err != nil {
+		t.Fatalf("InsertVMWithHardware: %v", err)
+	}
+	realization := PCIRealizationRecord{
+		VMName: name, DeviceID: deviceID, MemberID: "m0",
+		HostName: "h1", ResolvedAddress: addr, XMLAlias: "hostdev0", Ordinal: 0,
+	}
+	if err := UpsertPCIRealization(ctx, c, realization); err != nil {
+		t.Fatalf("UpsertPCIRealization: %v", err)
+	}
+
+	// Reservation held before delete.
+	owner, err := PCIIntentExclusiveOwner(ctx, c, "h1", addr)
+	if err != nil {
+		t.Fatalf("PCIIntentExclusiveOwner (pre): %v", err)
+	}
+	if owner != name {
+		t.Fatalf("PCIIntentExclusiveOwner (pre) = %q, want %q", owner, name)
+	}
+
+	if err := DeleteVM(ctx, c, name); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+
+	nicsRows, err := GetVMNICsRaw(ctx, c, "vm_nics", name)
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw: %v", err)
+	}
+	if len(nicsRows) != 1 || nicsRows[0].DeletedAt == "" {
+		t.Fatalf("vm_nics row not tombstoned: %+v", nicsRows)
+	}
+
+	intentRows, err := c.Query(ctx, `SELECT device_id, deleted_at FROM vm_pci_intent WHERE vm_name = ?`, name)
+	if err != nil {
+		t.Fatalf("query vm_pci_intent: %v", err)
+	}
+	if len(intentRows) != 1 || intentRows[0].String("deleted_at") == "" {
+		t.Fatalf("vm_pci_intent row not tombstoned: %+v", intentRows)
+	}
+
+	realizationRows, err := c.Query(ctx, `SELECT device_id, member_id, deleted_at FROM vm_pci_realizations WHERE vm_name = ?`, name)
+	if err != nil {
+		t.Fatalf("query vm_pci_realizations: %v", err)
+	}
+	if len(realizationRows) != 1 || realizationRows[0].String("deleted_at") == "" {
+		t.Fatalf("vm_pci_realizations row not tombstoned: %+v", realizationRows)
+	}
+
+	// Reservation freed: another VM could now intend the same host BDF.
+	owner, err = PCIIntentExclusiveOwner(ctx, c, "h1", addr)
+	if err != nil {
+		t.Fatalf("PCIIntentExclusiveOwner (post): %v", err)
+	}
+	if owner != "" {
+		t.Errorf("PCIIntentExclusiveOwner (post) = %q, want \"\" (reservation freed)", owner)
 	}
 }
 

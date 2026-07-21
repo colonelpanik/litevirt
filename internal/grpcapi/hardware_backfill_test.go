@@ -693,6 +693,71 @@ func TestBackfillHardwareTables_ConcreteMembersNoSpec(t *testing.T) {
 	}
 }
 
+// TestRenameVM_PCIIntentAuditConverges_NoFork is the end-to-end proof of the
+// name-independent device_id design (the reason task 7.2.5 dropped vm_name from
+// its derivation): a VM adopts a single concrete-address PCI intent, gets
+// RENAMED (corrosion.RenameVM, which PRESERVES device_id and rekeys vm_name
+// only), and the audit re-runs for the renamed VM. Because
+// DeterministicPCIIntentID does not take vmName, the audit's unconditional
+// re-derive computes the IDENTICAL device_id and its UpsertPCIIntent converges
+// onto the row RenameVM already carried, rather than forking a second row under
+// the new name. If device_id were (wrongly) re-derived to a new value by the
+// rename step, this test would see TWO rows under the new name instead of one.
+func TestRenameVM_PCIIntentAuditConverges_NoFork(t *testing.T) {
+	s, f := backfillServer(t)
+	ctx := adminCtx()
+
+	oldName, newName := "pci-vm1", "pci-vm2"
+	bdf := "0000:41:00.0"
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: oldName, HostName: "test-host", State: "running", Spec: "",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	f.SetInactiveXML(oldName, domainXMLWith(oldName, hostdevXML(bdf)))
+
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables (pre-rename): %v", err)
+	}
+	before, err := corrosion.ListVMPCIIntents(ctx, s.db, oldName)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents(old): %v", err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("got %d intents before rename, want exactly 1: %+v", len(before), before)
+	}
+	deviceID := before[0].DeviceID
+
+	if err := corrosion.RenameVM(ctx, s.db, oldName, newName); err != nil {
+		t.Fatalf("RenameVM: %v", err)
+	}
+	// The fake libvirt backend is keyed by VM name; the renamed VM's persistent
+	// definition is now looked up under the new name (same BDF — nothing about
+	// the physical device changed, only the VM's name).
+	f.SetInactiveXML(newName, domainXMLWith(newName, hostdevXML(bdf)))
+
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables (post-rename): %v", err)
+	}
+
+	after, err := corrosion.ListVMPCIIntents(ctx, s.db, newName)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents(new): %v", err)
+	}
+	if len(after) != 1 {
+		t.Fatalf("got %d vm_pci_intent rows under the renamed VM, want EXACTLY 1 (no fork): %+v", len(after), after)
+	}
+	if after[0].DeviceID != deviceID {
+		t.Errorf("device_id after rename+re-audit = %q, want the preserved %q (name-independent re-derive must converge)", after[0].DeviceID, deviceID)
+	}
+
+	stale, _ := corrosion.ListVMPCIIntents(ctx, s.db, oldName)
+	if len(stale) != 0 {
+		t.Errorf("vm_pci_intent rows still live under the old name: %+v", stale)
+	}
+}
+
 // ── Bridge: continuous legacy vm_interfaces → vm_nics materialization ────────
 
 // liveNICs returns the LIVE (non-tombstoned) vm_nics rows for vm.

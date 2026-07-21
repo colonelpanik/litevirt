@@ -756,7 +756,13 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 	)
 }
 
-// DeleteVM tombstones a VM and its interfaces/disks.
+// DeleteVM tombstones a VM and its interfaces/disks, plus the v42 hardware
+// tables (vm_nics, vm_pci_intent, vm_pci_realizations) — mirroring the
+// vm_interfaces/vm_disks bulk tombstone: vm_name is not the whole PK on any of
+// these tables, so the WHERE vm_name = ? bulk form is applied by per-row LWW
+// expansion on apply (safe because each statement binds updated_at). This does
+// NOT release any host_pci_devices ownership/vfio-unbind lease — that is the
+// grpcapi DeleteVM handler's releaseDevices call, out of scope here.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()     // LWW key (updated_at)
 	wall := nowRFC3339() // deleted_at is a wall/display column, never the HLC key
@@ -764,6 +770,9 @@ func DeleteVM(ctx context.Context, c *Client, name string) error {
 		{SQL: `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{wall, now, name}},
 		{SQL: `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
 		{SQL: `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+		{SQL: `UPDATE vm_nics SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+		{SQL: `UPDATE vm_pci_intent SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+		{SQL: `UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
 	})
 }
 
@@ -804,6 +813,40 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 	for _, r := range disks {
 		stmts = append(stmts, Statement{SQL: `UPDATE vm_disks SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND disk_name = ?`,
 			Params: []interface{}{newName, now, oldName, r.String("pk")}})
+	}
+	// vm_nics keys on (vm_name, id), but unlike vm_interfaces/vm_disks its id is itself
+	// DERIVED from vm_name (DeterministicNICID(vmName, mac)) — a rename must therefore
+	// RE-DERIVE id too, not just carry the row's old id forward under the new vm_name.
+	nics, err := c.Query(ctx, `SELECT id AS pk, mac FROM vm_nics WHERE vm_name = ?`, oldName)
+	if err != nil {
+		return err
+	}
+	for _, r := range nics {
+		newID := DeterministicNICID(newName, r.String("mac"))
+		stmts = append(stmts, Statement{SQL: `UPDATE vm_nics SET vm_name = ?, id = ?, updated_at = ? WHERE vm_name = ? AND id = ?`,
+			Params: []interface{}{newName, newID, now, oldName, r.String("pk")}})
+	}
+	// vm_pci_intent keys on (vm_name, device_id); device_id is name-INDEPENDENT by design
+	// (DeterministicPCIIntentID takes no vmName) so it is PRESERVED here — only vm_name is
+	// rekeyed. This is what lets the hardware-adoption audit's unconditional re-derive
+	// converge onto this same row after a rename instead of forking a duplicate.
+	pciIntents, err := c.Query(ctx, `SELECT device_id AS pk FROM vm_pci_intent WHERE vm_name = ?`, oldName)
+	if err != nil {
+		return err
+	}
+	for _, r := range pciIntents {
+		stmts = append(stmts, Statement{SQL: `UPDATE vm_pci_intent SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND device_id = ?`,
+			Params: []interface{}{newName, now, oldName, r.String("pk")}})
+	}
+	// vm_pci_realizations keys on (vm_name, device_id, member_id); device_id/member_id are
+	// likewise name-independent, so both are PRESERVED — only vm_name is rekeyed.
+	pciRealizations, err := c.Query(ctx, `SELECT device_id, member_id FROM vm_pci_realizations WHERE vm_name = ?`, oldName)
+	if err != nil {
+		return err
+	}
+	for _, r := range pciRealizations {
+		stmts = append(stmts, Statement{SQL: `UPDATE vm_pci_realizations SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND device_id = ? AND member_id = ?`,
+			Params: []interface{}{newName, now, oldName, r.String("device_id"), r.String("member_id")}})
 	}
 	// ip_allocations keys on (network, ip); vm_name is a NON-PK column here, so this stays a
 	// bulk update — per-row LWW expansion handles it safely on apply.

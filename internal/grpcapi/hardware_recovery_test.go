@@ -15,6 +15,7 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/opjournal"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 // rootOnlyDomainXML is a minimal persistent definition carrying ONLY the root
@@ -193,6 +194,7 @@ func TestRecoverHardwareOperations_DetachRollsForward(t *testing.T) {
 	ctx := adminCtx()
 	seedDiskVM(t, s, "vm1", "running")
 	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateRunning) // live domain is up (recovery reads live state, not vm.State)
 
 	// Fully attach data1 so there is a real row + live source + persistent config.
 	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
@@ -249,6 +251,7 @@ func TestRecoverHardwareOperations_Idempotent(t *testing.T) {
 	ctx := adminCtx()
 	seedDiskVM(t, s, "vm1", "running")
 	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateRunning) // live domain is up (recovery reads live state, not vm.State)
 
 	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
 		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
@@ -292,6 +295,7 @@ func TestRecoverHardwareOperations_UnrecoverableLeftNonTerminal(t *testing.T) {
 	ctx := adminCtx()
 	seedDiskVM(t, s, "vm1", "running")
 	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateRunning) // live domain is up (recovery reads live state, not vm.State)
 
 	// The just-attached disk is live-present but the persistent config never got
 	// it (a live/config divergence) — so an attach recovery must roll BACK, and the
@@ -363,5 +367,323 @@ func TestRecoverDeviceLeases_SkipsDeviceOps(t *testing.T) {
 	}
 	if _, found, _ := j.Read("op-detach"); !found {
 		t.Fatal("RecoverDeviceLeases must NOT remove a device_detach entry")
+	}
+}
+
+// ── NIC recovery ──────────────────────────────────────────────────────────────
+
+// TestRecoverHardwareOperations_NICAttachRollsBackTombstonesLegacyAfterLatchFlip:
+// a NIC attach wedged mid-attach (authoritative vm_nics row + the pre-latch legacy
+// vm_interfaces row + live-attached) converges by ROLLING BACK. The legacy row must
+// be tombstoned based on its ACTUAL presence — even though hardware_v2 LATCHED
+// between the crash and recovery (so a latched-flag reconstruction would wrongly
+// skip it).
+func TestRecoverHardwareOperations_NICAttachRollsBackTombstonesLegacyAfterLatchFlip(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s) // LATCHED now, at recovery time
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateRunning) // live domain is up
+
+	const mac = "52:54:00:aa:bb:01"
+	nicID := corrosion.DeterministicNICID("vm1", mac)
+	// The crash left BOTH rows written (pre-latch dual-write) and the NIC live.
+	if err := corrosion.UpsertNIC(ctx, s.db, corrosion.NICRecord{
+		VMName: "vm1", ID: nicID, NetworkName: "lan", Model: "virtio", MAC: mac, Ordinal: 0,
+	}); err != nil {
+		t.Fatalf("seed vm_nics row: %v", err)
+	}
+	if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{
+		VMName: "vm1", NetworkName: "lan", Ordinal: 0, MAC: mac,
+	}); err != nil {
+		t.Fatalf("seed legacy vm_interfaces row: %v", err)
+	}
+	if err := fake.AttachNIC("vm1", "br0", "virtio", mac); err != nil {
+		t.Fatalf("seed live nic: %v", err)
+	}
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachNICRequestHash("vm1", &pb.NetworkAttachment{Name: "lan", Mac: mac}),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{"mac": mac, "network_name": "lan", "nic_id": nicID})
+
+	s.RecoverHardwareOperations(ctx)
+
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared after rollback: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
+	if nics := liveNICRows(t, ctx, s, "vm_nics", "vm1"); len(nics) != 0 {
+		t.Fatalf("rolled-back attach left a live vm_nics row: %+v", nics)
+	}
+	if legacy := liveNICRows(t, ctx, s, "vm_interfaces", "vm1"); len(legacy) != 0 {
+		t.Fatalf("rollback must tombstone the legacy vm_interfaces row despite the latch flip: %+v", legacy)
+	}
+	if live, _ := fake.DumpXML("vm1"); nicMacInXML(live, mac) {
+		t.Fatalf("live nic %s not inverse-detached on rollback", mac)
+	}
+	if _, found, _ := s.opJournal.Read(opID); found {
+		t.Fatal("journal entry must be cleared after a completed rollback")
+	}
+}
+
+// TestRecoverHardwareOperations_NICDetachRollsForward: a NIC detach wedged
+// mid-detach converges by rolling FORWARD — the NIC leaves the live domain AND the
+// persistent definition, the row is tombstoned, the op completes, and it is NEVER
+// re-attached.
+func TestRecoverHardwareOperations_NICDetachRollsForward(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	const mac = "52:54:00:aa:bb:02"
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Nic: &pb.NetworkAttachment{Name: "lan", Mac: mac},
+	}); err != nil {
+		t.Fatalf("seed attach: %v", err)
+	}
+	nicID := corrosion.DeterministicNICID("vm1", mac)
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceDetach,
+		detachNICRequestHash("vm1", mac),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{"mac": mac, "nic_id": nicID})
+
+	s.RecoverHardwareOperations(ctx)
+
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceDetach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepCompleted {
+		t.Fatalf("detach recovery state = %q, want completed", state)
+	}
+	if nics, _ := corrosion.MergedVMNICs(ctx, s.db, "vm1"); hasNICMac(nics, mac) {
+		t.Fatalf("forward detach left the NIC row: %+v", nics)
+	}
+	if live, _ := fake.DumpXML("vm1"); nicMacInXML(live, mac) {
+		t.Fatalf("nic %s still present in the live domain after forward detach", mac)
+	}
+	if inactive, _ := fake.DumpXMLInactive("vm1"); nicMacInXML(inactive, mac) {
+		t.Fatalf("nic %s still present in the persistent definition after forward detach", mac)
+	}
+	if n := fake.AttachNICCount(); n != 1 {
+		t.Fatalf("recovery must not re-attach the NIC: AttachNIC count = %d, want 1", n)
+	}
+	if _, found, _ := s.opJournal.Read(opID); found {
+		t.Fatal("journal entry must be cleared after a completed detach")
+	}
+}
+
+// ── PCI recovery ──────────────────────────────────────────────────────────────
+
+// TestRecoverHardwareOperations_PCIAttachClaimedWindowReleasesLease: a PCI attach
+// that crashed in the CLAIMED WINDOW — after acquireDeviceLeases owner-assigned the
+// device but BEFORE any vm_pci_realizations row was written — followed by a host
+// reboot (domain shut off, vm.State still "running"). Recovery reconstructs the held
+// lease from the op's own journal member_addresses artifact and RELEASES it, so the
+// device is not stranded owner-assigned to a VM not using it.
+func TestRecoverHardwareOperations_PCIAttachClaimedWindowReleasesLease(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+	fake := s.virt.(*libvirtfake.Fake)
+
+	const addr = "0000:41:00.0"
+	const deviceID = "pcidev-claimed"
+	// Lease acquired (device owner-assigned) but crash before any realization row.
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
+		t.Fatalf("assign device: %v", err)
+	}
+	// Host reboot: domain shut off while vm.State still reads "running".
+	fake.SetState("vm1", libvirtfake.StateShutdown)
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr})
+
+	s.RecoverHardwareOperations(ctx)
+
+	// The lease is released — the device is no longer owner-assigned to vm1.
+	devs, _ := corrosion.ListPCIDevices(ctx, s.db, "test-host", "")
+	for _, d := range devs {
+		if d.Address == addr && d.VMName == "vm1" {
+			t.Fatalf("claimed-window recovery must release the lease; %s still owned by vm1", addr)
+		}
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
+	if _, found, _ := s.opJournal.Read(opID); found {
+		t.Fatal("journal entry must be cleared after a completed rollback")
+	}
+}
+
+// TestRecoverHardwareOperations_PCIDetachRollsForward: a PCI detach wedged
+// mid-detach converges by rolling FORWARD — the hostdev leaves both definitions,
+// realizations + intent are tombstoned, ownership is released, the op completes, and
+// the device is NEVER re-attached.
+func TestRecoverHardwareOperations_PCIDetachRollsForward(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	const addr = "0000:41:00.0"
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: addr},
+	}); err != nil {
+		t.Fatalf("seed attach: %v", err)
+	}
+	deviceID := liveIntents(t, ctx, s, "vm1")[0].DeviceID
+	alias := pciMemberAlias(deviceID, "m0")
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceDetach,
+		detachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr})
+
+	s.RecoverHardwareOperations(ctx)
+
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceDetach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepCompleted {
+		t.Fatalf("detach recovery state = %q, want completed", state)
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 0 {
+		t.Fatalf("intent not tombstoned: %+v", in)
+	}
+	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) != 0 {
+		t.Fatalf("realizations not tombstoned: %+v", rs)
+	}
+	devs, _ := corrosion.ListPCIDevices(ctx, s.db, "test-host", "")
+	for _, d := range devs {
+		if d.VMName == "vm1" {
+			t.Fatalf("device %s still owned by vm1 after forward detach", d.Address)
+		}
+	}
+	live, _ := fake.DumpXML("vm1")
+	inactive, _ := fake.DumpXMLInactive("vm1")
+	if hostdevAliasInXML(live, alias) || hostdevAliasInXML(inactive, alias) {
+		t.Fatalf("alias %s still present after forward detach", alias)
+	}
+	if _, found, _ := s.opJournal.Read(opID); found {
+		t.Fatal("journal entry must be cleared after a completed detach")
+	}
+}
+
+// ── host reboot: live domain shut off while vm.State still "running" ─────────────
+
+// TestRecoverHardwareOperations_HostRebootAttachTakesStoppedPath: after a host
+// reboot vm.State still reads "running" but the libvirt domain is SHUT OFF. An
+// attach wedged mid-flight (data1 in the persistent definition + a committed row +
+// the op-owned file) must recover down the STOPPED path — reconciling data1 OUT of
+// the persistent definition from the authoritative tables — NOT the running path,
+// which would issue a LIVE-flagged detach a shut-off domain rejects, wedge the
+// barrier, and strand data1 orphaned in the persistent config.
+func TestRecoverHardwareOperations_HostRebootAttachTakesStoppedPath(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running") // vm.State survives a host reboot as "running"
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown) // the domain is actually shut off
+
+	fake.SetInactiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-root.qcow2'/><target dev='vda' bus='virtio'/></disk>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-data1.qcow2'/><target dev='vdb' bus='virtio'/></disk>"+
+		"</devices></domain>")
+	fake.SetDiskSource("vm1", "vdb", filepath.Join(s.dataDir, "disks", "vm1-data1.qcow2"))
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "vm1", DiskName: "data1", HostName: "test-host",
+		Path:       filepath.Join(s.dataDir, "disks", "vm1-data1.qcow2"),
+		DeviceKind: "disk", Bus: "virtio", TargetDev: "vdb", DeleteWithVM: true,
+	}); err != nil {
+		t.Fatalf("insert data1 row: %v", err)
+	}
+	diskPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte("op-owned"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	// Model libvirt rejecting a LIVE-flagged detach on a shut-off domain — the exact
+	// failure the buggy running-path rollback hits; the stopped path never issues it.
+	fake.FailDetachDisk = func(_, _ string) error {
+		return status.Error(codes.Internal, "requested operation is not valid: domain is not running")
+	}
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{
+			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+			"file_created_by_operation": diskPath,
+		})
+
+	s.RecoverHardwareOperations(ctx)
+
+	// Converged cleanly (NOT wedged on a LIVE detach): barrier cleared, op failed.
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared — recovery took the running path and wedged: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
+	// data1 reconciled OUT of the persistent definition — no orphan (the bug).
+	if inactive, _ := fake.DumpXMLInactive("vm1"); diskDevInXML(inactive, "vdb") {
+		t.Fatalf("data1 (vdb) left orphaned in the persistent definition:\n%s", inactive)
+	}
+	// Row gone and the op-owned backing file removed — file/row consistent.
+	if disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1"); hasDiskName(disks, "data1") {
+		t.Fatalf("rolled-back attach left a data1 row: %+v", disks)
+	}
+	if _, statErr := os.Stat(diskPath); !os.IsNotExist(statErr) {
+		t.Fatalf("rollback must delete the op-owned backing file (stat err=%v)", statErr)
 	}
 }

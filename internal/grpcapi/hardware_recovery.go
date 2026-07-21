@@ -161,6 +161,28 @@ func (s *Server) completeRecoveredOp(ctx context.Context, vmName string, view *c
 	slog.Info("hardware op recovery: converged", "vm", vmName, "op", view.ActiveOperationID, "kind", kind)
 }
 
+// recoveryDomainRunning reports whether the VM's libvirt domain is CURRENTLY
+// live-running — the signal that routes crash recovery down the running vs.
+// stopped compensation path. It deliberately consults the LIVE domain, NOT the
+// replicated vm.State: after a HOST REBOOT (the primary recovery trigger) a VM
+// that was "running" pre-crash still reads vm.State=="running" while its domain is
+// shut off, and driving the running rollback there would issue a LIVE-flagged
+// libvirt call (e.g. DetachDisk LIVE|CONFIG) that a shut-off domain rejects —
+// stranding a half-applied device in the persistent definition. On ANY error or
+// indeterminate state it returns false so recovery takes the STOPPED path, which
+// reconciles the persistent definition from the authoritative tables and never
+// issues a live-only mutation (the conservative, safe default; uncertainty must
+// never take the running path).
+func (s *Server) recoveryDomainRunning(vmName string) bool {
+	state, err := s.virt.DomainState(vmName)
+	if err != nil {
+		slog.Warn("hardware op recovery: live domain state unavailable — taking the stopped (reconcile-from-tables) path",
+			"vm", vmName, "error", err)
+		return false
+	}
+	return state == "running"
+}
+
 // ── ATTACH recovery (roll BACK; or COMPLETE when fully applied) ───────────────
 
 // recoverDeviceAttach converges a wedged attach. Per §7.2 the DEFAULT is to roll
@@ -181,7 +203,7 @@ func (s *Server) recoverDeviceAttach(ctx context.Context, vm *corrosion.VMRecord
 }
 
 func (s *Server) recoverDiskAttach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := vm.State == "running"
+	running := s.recoveryDomainRunning(vm.Name)
 	art := entry.Artifacts
 	targetDev := art["target_dev"]
 
@@ -229,7 +251,7 @@ func (s *Server) recoverDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 }
 
 func (s *Server) recoverNICAttach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := vm.State == "running"
+	running := s.recoveryDomainRunning(vm.Name)
 	latched := s.hardwareV2Latched(ctx)
 	art := entry.Artifacts
 	mac := art["mac"]
@@ -257,21 +279,29 @@ func (s *Server) recoverNICAttach(ctx context.Context, vm *corrosion.VMRecord, v
 		}
 	}
 	if nics, e := corrosion.MergedVMNICs(ctx, s.db, vm.Name); e == nil {
-		present := false
 		for _, n := range nics {
 			if strings.EqualFold(n.MAC, mac) {
-				present = true
+				rb.nicRowWritten = true
 				break
 			}
 		}
-		rb.nicRowWritten = present
-		rb.legacyRowWritten = present && !latched
+	}
+	// Tombstone the legacy vm_interfaces row on its ACTUAL presence, not a latched
+	// flag reconstructed at recovery time: a latch flip between crash and recovery
+	// must never strand a written legacy row un-tombstoned.
+	if legacy, e := corrosion.GetVMNICsRaw(ctx, s.db, "vm_interfaces", vm.Name); e == nil {
+		for _, r := range legacy {
+			if r.DeletedAt == "" && strings.EqualFold(r.MAC, mac) {
+				rb.legacyRowWritten = true
+				break
+			}
+		}
 	}
 	_, _ = s.failNICAttach(ctx, rb, codes.Internal, errRecoveredIncompleteAttach)
 }
 
 func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := vm.State == "running"
+	running := s.recoveryDomainRunning(vm.Name)
 	latched := s.hardwareV2Latched(ctx)
 	art := entry.Artifacts
 	deviceID := art["device_id"]
@@ -287,6 +317,26 @@ func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, v
 			}
 			members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: r.MemberID, Address: r.ResolvedAddress, Ordinal: r.Ordinal})
 			realizationsWritten = true
+		}
+	}
+
+	// Claimed-window fallback: a crash AFTER acquireDeviceLeases (vfio bind +
+	// AssignPCIDevice + beginDeviceLease) but BEFORE any vm_pci_realizations row was
+	// written leaves realizations empty even though the devices are vfio-bound and
+	// owner-assigned to this VM. RecoverDeviceLeases already ran and CLEARED the
+	// device_lease journal entry WITHOUT releasing (the VM row exists), so this op's
+	// OWN device_attach entry is the sole authority for the addresses to release —
+	// there is no double-release (device_lease is a distinct journal Kind). Reconstruct
+	// them from its member_addresses artifact, confirmed against host_pci_devices
+	// ownership so a STOPPED reserve — which resolves the same addresses into the
+	// journal but never acquires a lease — is never wrongly released.
+	leaseHeld := realizationsWritten
+	if !realizationsWritten {
+		if owned := s.pciAddrsOwnedByVM(ctx, vm.Name, splitCSVNonEmpty(art["member_addresses"])); len(owned) > 0 {
+			for i, addr := range owned {
+				members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", i), Address: addr})
+			}
+			leaseHeld = true
 		}
 	}
 
@@ -323,14 +373,48 @@ func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, v
 				}
 			}
 		}
-		rb.acquired = realizationsWritten || len(rb.attachedAddrs) > 0
 	}
+	// Release the lease on rollback whenever it was acquired — realizations written,
+	// the claimed-window journal fallback confirmed ownership, or a live hostdev is
+	// present — REGARDLESS of whether the domain is running NOW: a host reboot flips a
+	// claimed-window attach onto the stopped path, but its bound + owner-assigned
+	// devices still leak (and block re-attach via exclusivity) unless released here.
+	rb.acquired = leaseHeld || len(rb.attachedAddrs) > 0
 	if rb.dualWrite {
 		if os2, e := removePCIDeviceFromSpec(vm.Spec, normAddr); e == nil {
 			rb.origSpec = os2 // restore the spec with the pre-latch dual-write device removed
 		}
 	}
 	_, _ = s.failPCIAttach(ctx, rb, codes.Internal, errRecoveredIncompleteAttach)
+}
+
+// pciAddrsOwnedByVM returns the subset of addrs currently owner-assigned to vmName
+// in host_pci_devices — the durable ground truth that acquireDeviceLeases ran (it
+// AssignPCIDevice's each member BEFORE the vfio bind, and the assignment survives a
+// reboot). Used by the claimed-window fallback to release EXACTLY the leases this VM
+// holds, never a device a stopped reserve merely resolved or one another VM has since
+// claimed.
+func (s *Server) pciAddrsOwnedByVM(ctx context.Context, vmName string, addrs []string) []string {
+	if len(addrs) == 0 {
+		return nil
+	}
+	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return nil
+	}
+	owned := make(map[string]bool, len(devs))
+	for _, d := range devs {
+		if d.VMName == vmName {
+			owned[d.Address] = true
+		}
+	}
+	var out []string
+	for _, a := range addrs {
+		if owned[a] {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // ── DETACH recovery (roll FORWARD to completion; never re-attach) ─────────────
@@ -351,7 +435,7 @@ func (s *Server) recoverDeviceDetach(ctx context.Context, vm *corrosion.VMRecord
 }
 
 func (s *Server) recoverDiskDetach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := vm.State == "running"
+	running := s.recoveryDomainRunning(vm.Name)
 	art := entry.Artifacts
 	targetDev := art["target_dev"]
 	diskName := art["disk_name"]
@@ -387,7 +471,7 @@ func (s *Server) recoverDiskDetach(ctx context.Context, vm *corrosion.VMRecord, 
 }
 
 func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := vm.State == "running"
+	running := s.recoveryDomainRunning(vm.Name)
 	latched := s.hardwareV2Latched(ctx)
 	art := entry.Artifacts
 	mac := art["mac"]
@@ -432,7 +516,7 @@ func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, v
 }
 
 func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := vm.State == "running"
+	running := s.recoveryDomainRunning(vm.Name)
 	art := entry.Artifacts
 	deviceID := art["device_id"]
 

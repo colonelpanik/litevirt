@@ -432,6 +432,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// Prepare network interfaces
 	var netConfigs []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
+	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 
 	for i, n := range spec.Network {
 		bridge := n.Name // default: use network name as bridge
@@ -495,6 +496,23 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 			MAC:            mac,
 			IP:             n.Ip,
 			SecurityGroups: n.SecurityGroups,
+		})
+
+		// v42 dual-write: a vm_nics row alongside the legacy vm_interfaces row above,
+		// keyed by the deterministic (vmName, mac) id so it converges with what the
+		// Phase-6 backfill would derive for the same NIC. TapDevice stays empty here —
+		// unlike ifaceRecords (patched below once the domain is running), tap
+		// assignment is a start-time fact, not a create-time one.
+		nicRecords = append(nicRecords, corrosion.NICRecord{
+			VMName:         spec.Name,
+			ID:             corrosion.DeterministicNICID(spec.Name, mac),
+			NetworkName:    n.Name,
+			Model:          n.Model,
+			MAC:            mac,
+			Ordinal:        i,
+			IP:             n.Ip,
+			TapDevice:      "",
+			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
 	}
 
@@ -638,6 +656,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	}
 
 	// PCI device passthrough.
+	var pciIntents []corrosion.PCIIntentRecord
 	if len(spec.Devices) > 0 {
 		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices)
 		if devErr != nil {
@@ -649,6 +668,17 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		defer devFinish()
 		for _, addr := range pciAddrs {
 			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
+		}
+		// vm_pci_intent rows for the declared devices, built via the SAME
+		// classify/encode helper (and shared occurrence counter) the Phase-6
+		// backfill audit uses, in spec.Devices document order — so a create-time
+		// intent's device_id is byte-identical to what a later backfill pass would
+		// derive for the same selector. Built AFTER allocateDevices so a
+		// resource-mapping spec's resolved address (frozen onto spec.Address above)
+		// is captured, not the pre-resolution mapping alone.
+		occ := map[string]int{}
+		for _, d := range spec.Devices {
+			pciIntents = append(pciIntents, s.makeIntentRecord(spec.Name, d, occ))
 		}
 	}
 
@@ -749,7 +779,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		Project:   project, // tenancy label
 	}
 
-	if err := corrosion.InsertVM(ctx, s.db, vmRecord, ifaceRecords, diskRecords); err != nil {
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents); err != nil {
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	}

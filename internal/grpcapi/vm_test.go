@@ -14,6 +14,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 // testServerWithLocks returns a Server that has vmLocks and a dataDir, needed
@@ -203,6 +204,82 @@ func TestCreateVM_QuotaThenPlacementLabelsAndAntiAffinity(t *testing.T) {
 	}
 	if rec, _ := corrosion.GetVM(ctx, s.db, "api-over-quota"); rec != nil {
 		t.Errorf("over-quota VM should not be persisted: %+v", rec)
+	}
+}
+
+// TestCreateVM_PopulatesHardwareTables is task 7.1's create-path case: a CreateVM
+// with one NIC and one PCI device must land vm_nics + vm_pci_intent rows — dual-
+// written alongside the legacy vm_interfaces row, not instead of it — and mark the
+// VM's hardware-adoption state "adopted", all from the SAME call that creates it
+// (no Phase-6 backfill needed for a VM created this way).
+func TestCreateVM_PopulatesHardwareTables(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.1", State: "active", CPUTotal: 8, MemTotal: 16384,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+
+	resp, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name:      "vm1",
+		Cpu:       1,
+		MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+		Network:   []*pb.NetworkAttachment{{Name: "lo", Model: "virtio"}},
+		Devices:   []*pb.DeviceSpec{{Address: "0000:41:00.0"}},
+	}})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if resp.Name != "vm1" {
+		t.Fatalf("CreateVM resp.Name = %q, want vm1", resp.Name)
+	}
+
+	// Dual-write: the legacy vm_interfaces row is still there.
+	ifaces, err := corrosion.GetVMInterfaces(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("GetVMInterfaces: %v", err)
+	}
+	if len(ifaces) != 1 || ifaces[0].NetworkName != "lo" {
+		t.Fatalf("vm_interfaces (dual-write) = %+v, want 1 row on lo", ifaces)
+	}
+
+	nics, err := corrosion.GetVMNICsRaw(ctx, s.db, "vm_nics", "vm1")
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw: %v", err)
+	}
+	if len(nics) != 1 || nics[0].NetworkName != "lo" || nics[0].MAC != ifaces[0].MAC {
+		t.Fatalf("vm_nics = %+v, want 1 row on lo matching the vm_interfaces MAC %q", nics, ifaces[0].MAC)
+	}
+	if nics[0].TapDevice != "" {
+		t.Errorf("vm_nics[0].TapDevice = %q, want empty at create (assigned at start, not create)", nics[0].TapDevice)
+	}
+
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(intents) != 1 || intents[0].SelectorKind != "address" {
+		t.Fatalf("vm_pci_intent = %+v, want 1 address-kind row", intents)
+	}
+	if intents[0].ExclusiveKey == nil || *intents[0].ExclusiveKey != "0000:41:00.0" {
+		t.Errorf("vm_pci_intent[0].ExclusiveKey = %v, want 0000:41:00.0", intents[0].ExclusiveKey)
+	}
+
+	state, reason, err := corrosion.GetHardwareAdoptionState(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "adopted" {
+		t.Errorf("adoption state = %q, want adopted", state)
+	}
+	if reason != "" {
+		t.Errorf("adoption error = %q, want empty", reason)
 	}
 }
 

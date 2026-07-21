@@ -99,6 +99,57 @@ func TestInsertVM_WithDisks(t *testing.T) {
 	}
 }
 
+// TestInsertVMWithHardware_WritesNICsAndPCIIntents covers task 7.1: the extended
+// writer must land vm_nics + vm_pci_intent rows in the SAME atomic batch as the
+// vms/vm_interfaces row, and stamp hardware_adoption_state = "adopted" — a freshly
+// created VM never needs the Phase-6 backfill to run for it.
+func TestInsertVMWithHardware_WritesNICsAndPCIIntents(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	vm := VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "running"}
+	nics := []NICRecord{
+		{VMName: "vm1", ID: DeterministicNICID("vm1", "52:54:00:aa:bb:cc"), NetworkName: "lan0",
+			Model: "virtio", MAC: "52:54:00:aa:bb:cc", Ordinal: 0, IP: "10.0.0.5"},
+	}
+	excl := "0000:41:00.0"
+	intents := []PCIIntentRecord{
+		{VMName: "vm1", DeviceID: DeterministicPCIIntentID("vm1", "gpu", 0), HostName: "node-a",
+			SelectorKind: "address", SelectorPayload: `{"address":"0000:41:00.0"}`, ExclusiveKey: &excl},
+	}
+
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, intents); err != nil {
+		t.Fatalf("InsertVMWithHardware: %v", err)
+	}
+
+	gotNICs, err := GetVMNICsRaw(ctx, c, "vm_nics", "vm1")
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw: %v", err)
+	}
+	if len(gotNICs) != 1 || gotNICs[0].MAC != "52:54:00:aa:bb:cc" || gotNICs[0].NetworkName != "lan0" {
+		t.Fatalf("unexpected vm_nics rows: %+v", gotNICs)
+	}
+
+	gotIntents, err := ListVMPCIIntents(ctx, c, "vm1")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(gotIntents) != 1 || gotIntents[0].SelectorKind != "address" || gotIntents[0].ExclusiveKey == nil || *gotIntents[0].ExclusiveKey != excl {
+		t.Fatalf("unexpected vm_pci_intent rows: %+v", gotIntents)
+	}
+
+	state, errReason, err := GetHardwareAdoptionState(ctx, c, "vm1")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "adopted" {
+		t.Errorf("adoption state = %q, want adopted", state)
+	}
+	if errReason != "" {
+		t.Errorf("adoption error = %q, want empty", errReason)
+	}
+}
+
 func TestListVMs_Filter(t *testing.T) {
 	c, err := NewTestClient()
 	if err != nil {
@@ -709,13 +760,17 @@ func TestHardwareAdoptionState(t *testing.T) {
 
 	InsertVM(ctx, c, VMRecord{Name: "vm-adopt", HostName: "h1", Spec: "{}", State: "running"}, nil, nil)
 
-	// New VM rows default to 'pending' with no error (column default).
+	// InsertVM (via InsertVMWithHardware) now stamps 'adopted' unconditionally in
+	// the same batch as the row insert — a VM created through this path has its
+	// (possibly empty) hardware recorded atomically, so it never starts out
+	// 'pending' (the bare column default, still used only by the pre-v42
+	// migration's ADD COLUMN backfill for rows that predate this writer).
 	state, errReason, err := GetHardwareAdoptionState(ctx, c, "vm-adopt")
 	if err != nil {
 		t.Fatalf("GetHardwareAdoptionState: %v", err)
 	}
-	if state != "pending" {
-		t.Errorf("initial state = %q, want pending", state)
+	if state != "adopted" {
+		t.Errorf("initial state = %q, want adopted", state)
 	}
 	if errReason != "" {
 		t.Errorf("initial errReason = %q, want empty", errReason)

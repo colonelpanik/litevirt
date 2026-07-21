@@ -30,6 +30,12 @@ type LibvirtBackend interface {
 	UndefineDomain(name string, removeStorage bool) error
 	UndefineDomainPreservingState(name string) error // undefine keeping NVRAM/vTPM (redefine-class, G1)
 	DomainState(name string) (string, error)
+	// DomainStateReason returns the coarse State together with the normalized
+	// Reason. DomainState collapses paused / shut-off / pm-suspended all to
+	// "stopped"; crash recovery needs the reason to tell a genuinely shut-off
+	// domain (safe for destructive rollback) from a still-active paused /
+	// pm-suspended one (whose disks are attached and must not be touched).
+	DomainStateReason(name string) (libvirt.DomainStatus, error)
 	DomainExists(name string) bool
 	ListDomains() ([]string, error)
 	DumpXML(name string) (string, error)

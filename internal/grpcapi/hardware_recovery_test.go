@@ -84,6 +84,7 @@ func TestRecoverHardwareOperations_AttachRollsBack(t *testing.T) {
 	ctx := adminCtx()
 	seedDiskVM(t, s, "vm1", "stopped")
 	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown) // the domain is POSITIVELY shut off
 	fake.SetInactiveXML("vm1", rootOnlyDomainXML("vm1"))
 
 	// Partial: the op exclusively created its backing file, but crashed before
@@ -143,6 +144,7 @@ func TestRecoverHardwareOperations_AttachCompletes(t *testing.T) {
 	ctx := adminCtx()
 	seedDiskVM(t, s, "vm1", "stopped")
 	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown) // the domain is POSITIVELY shut off
 	// Full side effects: the data1 row is committed and the persistent definition
 	// carries it (target vdb).
 	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
@@ -386,8 +388,9 @@ func TestRecoverDiskAttach_UnknownDomainState_NoCompensation(t *testing.T) {
 	seedDiskVM(t, s, "vm1", "running")
 	fake := s.virt.(*libvirtfake.Fake)
 	// The live domain state is UNREADABLE — the exact condition the bug mistook for
-	// "stopped" and used to justify the destructive file-delete rollback.
-	fake.FailDomainState = func(string) error {
+	// "stopped" and used to justify the destructive file-delete rollback. Recovery
+	// classifies via DomainStateReason, so fail THAT to exercise the indeterminate path.
+	fake.FailDomainStateReason = func(string) error {
 		return status.Error(codes.Internal, "libvirt connection lost")
 	}
 
@@ -444,6 +447,106 @@ func TestRecoverDiskAttach_UnknownDomainState_NoCompensation(t *testing.T) {
 	if _, found, _ := s.opJournal.Read(opID); !found {
 		t.Fatal("journal entry must be retained while the operation is recovery-required")
 	}
+}
+
+// seedRecoverableDiskAttach reproduces a disk-attach wedged mid-attach: the data
+// disk (vdb) is present in the inactive definition + live sources, its row is
+// written, its op-owned backing file exists, and the mutation barrier points at a
+// non-terminal device_attach carrying the post-create ownership artifact. It
+// returns the backing-file path, the op id, and the owner epoch.
+func seedRecoverableDiskAttach(t *testing.T, ctx context.Context, s *Server) (diskPath, opID string, epoch int64) {
+	t.Helper()
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetInactiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-root.qcow2'/><target dev='vda' bus='virtio'/></disk>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-data1.qcow2'/><target dev='vdb' bus='virtio'/></disk>"+
+		"</devices></domain>")
+	fake.SetDiskSource("vm1", "vdb", filepath.Join(s.dataDir, "disks", "vm1-data1.qcow2"))
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "vm1", DiskName: "data1", HostName: "test-host",
+		Path:       filepath.Join(s.dataDir, "disks", "vm1-data1.qcow2"),
+		DeviceKind: "disk", Bus: "virtio", TargetDev: "vdb", DeleteWithVM: true,
+	}); err != nil {
+		t.Fatalf("insert data1 row: %v", err)
+	}
+	diskPath, _ = libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte("op-owned; a live guest may be using it"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	opID, epoch, _ = beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{
+			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+			"file_created_by_operation": diskPath,
+		})
+	return diskPath, opID, epoch
+}
+
+// assertDiskAttachDeferred asserts recovery performed NO compensation: the backing
+// file survives, the desired-state row survives, the barrier stays held, the op is
+// non-terminal, and the journal entry is retained (recovery-required, retry later).
+func assertDiskAttachDeferred(t *testing.T, ctx context.Context, s *Server, diskPath, opID string, epoch int64) {
+	t.Helper()
+	if _, statErr := os.Stat(diskPath); statErr != nil {
+		t.Fatalf("deferred recovery must NOT delete the backing file (stat err=%v)", statErr)
+	}
+	if disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1"); !hasDiskName(disks, "data1") {
+		t.Fatalf("deferred recovery must NOT tombstone the desired-state row: %+v", disks)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != opID {
+		t.Fatalf("barrier must stay held while recovery defers: active_operation_id=%q, want %q", vm.ActiveOperationID, opID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if corrosion.IsOperationTerminal(state) {
+		t.Fatalf("op must be left non-terminal when recovery defers: state=%q", state)
+	}
+	if _, found, _ := s.opJournal.Read(opID); !found {
+		t.Fatal("journal entry must be retained while the operation is recovery-required")
+	}
+}
+
+// TestRecoverDiskAttach_Paused_NoCompensation: a PAUSED domain reads coarse
+// "stopped" (DomainState collapses paused/shut-off/pm-suspended together), but it is
+// still ACTIVE with its disks attached. Recovery must NOT take the destructive
+// stopped rollback (delete backing file, tombstone row) — it must DEFER on the
+// "paused" reason and leave the op recovery-required.
+func TestRecoverDiskAttach_Paused_NoCompensation(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown) // coarse "stopped"
+	fake.SetStateReason("vm1", "paused")            // …but the domain is PAUSED (active)
+
+	diskPath, opID, epoch := seedRecoverableDiskAttach(t, ctx, s)
+	s.RecoverHardwareOperations(ctx)
+	assertDiskAttachDeferred(t, ctx, s, diskPath, opID, epoch)
+}
+
+// TestRecoverDiskAttach_PMSuspended_NoCompensation: a PM-suspended (S3) domain also
+// reads coarse "stopped" while still holding its disks. Recovery must DEFER on the
+// "pmsuspended" reason, performing no compensation.
+func TestRecoverDiskAttach_PMSuspended_NoCompensation(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown) // coarse "stopped"
+	fake.SetStateReason("vm1", "pmsuspended")       // …but the domain is PM-suspended (active)
+
+	diskPath, opID, epoch := seedRecoverableDiskAttach(t, ctx, s)
+	s.RecoverHardwareOperations(ctx)
+	assertDiskAttachDeferred(t, ctx, s, diskPath, opID, epoch)
 }
 
 // TestRecoverDiskAttach_Shutoff_RollsBack guards that the tri-state gating did NOT

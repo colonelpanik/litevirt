@@ -442,6 +442,120 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 	return finish, nil
 }
 
+// pciStartPreflight realizes a hardware_v2 VM's reserved PCI intents at start:
+// it resolves every intent to concrete host members, acquires the device leases
+// (CAS ownership + durable F1 lease + vfio bind), persists vm_pci_realizations
+// (member_id + ua-alias + resolved_address — CONTRACT g) and reconciles the aliased
+// <hostdev>s into the domain definition — everything that must be true BEFORE
+// StartDomain. It fails CLOSED: a vanished/unacquirable device, a realization write
+// failure, or a reconcile failure releases whatever was claimed and returns the
+// error (the VM does not start).
+//
+// SR-IOV routing (CONTRACT a): resolveDeviceIntents returns Unimplemented for an
+// sriov selector (VF realization is side-effecting), so an sriov intent is routed
+// through allocateSRIOVVFs (the CAS-claim / VF-create acquire path); concrete-address,
+// mapping and type intents go through the pure resolveDeviceIntents.
+//
+// On success it clears the durable F1 lease (the realization rows are the durable
+// record now) and returns a release func the caller invokes ONLY if the subsequent
+// StartDomain fails, so a failed start leaves no VM bound to devices it never used.
+func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, intents []corrosion.PCIIntentRecord) (release func(), err error) {
+	// ── Resolve every intent to concrete members (routing SR-IOV to the allocator) ──
+	var members []ResolvedMember
+	var claimedSriov []string // VFs allocateSRIOVVFs CAS-claimed (released on a resolve failure)
+	resolveFail := func(e error) (func(), error) {
+		if len(claimedSriov) > 0 {
+			s.releaseDeviceLeases(ctx, vm.Name, claimedSriov)
+		}
+		return nil, e
+	}
+	for _, in := range intents {
+		if in.SelectorKind == "sriov" {
+			spec := &pb.DeviceSpec{}
+			if uerr := protojson.Unmarshal([]byte(in.SelectorPayload), spec); uerr != nil {
+				return resolveFail(status.Errorf(codes.Internal,
+					"decode SR-IOV selector payload for device %s: %v", in.DeviceID, uerr))
+			}
+			count := int(spec.Count)
+			if count == 0 {
+				count = 1
+			}
+			vfAddrs, aerr := s.allocateSRIOVVFs(ctx, vm.Name, spec, count)
+			if aerr != nil {
+				return resolveFail(aerr)
+			}
+			for i, a := range vfAddrs {
+				members = append(members, ResolvedMember{DeviceID: in.DeviceID, MemberID: fmt.Sprintf("m%d", i), Address: a, Ordinal: i})
+				claimedSriov = append(claimedSriov, a)
+			}
+			continue
+		}
+		// address / mapping / type: the pure resolver.
+		specMembers, rerr := s.resolveDeviceIntents(ctx, vm.Name, []corrosion.PCIIntentRecord{in})
+		if rerr != nil {
+			return resolveFail(rerr)
+		}
+		members = append(members, specMembers...)
+	}
+
+	if len(members) == 0 {
+		// Intents that resolved to no members (should not happen — an intent yields ≥1
+		// member); nothing to acquire, so start proceeds from the existing definition.
+		return func() {}, nil
+	}
+
+	allAddrs := make([]string, len(members))
+	for i, m := range members {
+		allAddrs[i] = m.Address
+	}
+
+	// ── Acquire leases: CAS ownership + durable F1 lease + vfio bind ──
+	// On a bind failure acquireDeviceLeases self-cleans every device it touched
+	// (owner-scoped release covers the SR-IOV VFs claimed above too) and clears the
+	// lease, so nothing is left to release here.
+	finish, aerr := s.acquireDeviceLeases(ctx, vm.Name, members)
+	if aerr != nil {
+		return nil, aerr
+	}
+
+	// ── Persist realizations (CONTRACT g), grouped per device ──
+	byDevice := map[string][]ResolvedMember{}
+	var deviceOrder []string
+	for _, m := range members {
+		if _, seen := byDevice[m.DeviceID]; !seen {
+			deviceOrder = append(deviceOrder, m.DeviceID)
+		}
+		byDevice[m.DeviceID] = append(byDevice[m.DeviceID], m)
+	}
+	rollback := func() {
+		s.releaseDeviceLeases(ctx, vm.Name, allAddrs)
+		for _, dev := range deviceOrder {
+			if terr := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, dev); terr != nil {
+				slog.Warn("pci start-preflight: tombstone realizations on rollback", "vm", vm.Name, "device", dev, "error", terr)
+			}
+		}
+	}
+	for _, dev := range deviceOrder {
+		if werr := s.writePCIRealizations(ctx, vm.Name, dev, byDevice[dev]); werr != nil {
+			rollback()
+			finish()
+			return nil, status.Errorf(codes.Internal, "persist PCI realizations for %q: %v", vm.Name, werr)
+		}
+	}
+
+	// ── Reconcile the aliased hostdevs into the domain definition ──
+	if rerr := s.reconcileDomainDefinition(ctx, vm, members); rerr != nil {
+		rollback()
+		finish()
+		return nil, rerr
+	}
+
+	// Success: the realization rows are the durable record now — clear the F1 lease.
+	// The returned release is invoked ONLY if the caller's StartDomain then fails.
+	finish()
+	return rollback, nil
+}
+
 // releaseDevices unbinds all devices from vfio-pci and releases them in the DB.
 func (s *Server) releaseDevices(ctx context.Context, vmName string) {
 	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")

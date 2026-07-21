@@ -29,6 +29,12 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 	if err := s.RequirePerm(ctx, vmRBACPath(vmRec), "vm.update", "operator"); err != nil {
 		return nil, err
 	}
+	// Adoption gate (fail-closed): under the active hardware_v2 regime a blocked VM
+	// must not have its hardware mutated until it is repaired + re-audited. No-op
+	// pre-latch (adoption state is informational only then).
+	if err := s.hardwareAdoptionRefused(ctx, vmRec.Name); err != nil {
+		return nil, err
+	}
 	// Disk, NIC, and CONCRETE-ADDRESS PCI attach are journaled, stopped-capable, and
 	// at-most-once (Tasks 5.2b/5.2c/5.2d): each owns its forward decision, the
 	// operation_protocol_v1/hardware_v2 gates, and the crash-safe DAG, and records
@@ -102,6 +108,12 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vmRec), "vm.update", "operator"); err != nil {
+		return nil, err
+	}
+	// Adoption gate (fail-closed): under the active hardware_v2 regime a blocked VM
+	// must not have its hardware mutated until it is repaired + re-audited. No-op
+	// pre-latch (adoption state is informational only then).
+	if err := s.hardwareAdoptionRefused(ctx, vmRec.Name); err != nil {
 		return nil, err
 	}
 	// Disk, NIC, and CONCRETE-ADDRESS PCI detach are journaled, stopped-capable, and

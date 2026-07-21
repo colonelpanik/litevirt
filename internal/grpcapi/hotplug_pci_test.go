@@ -637,6 +637,136 @@ func TestAttachDevice_PCIRunningConfigDivergenceRollsBack(t *testing.T) {
 	}
 }
 
+// ── acquireDeviceLeases: physical claim is atomic + fail-closed ───────────────
+
+// TestAcquireDeviceLeases_ConflictFailsClosed proves the physical device claim is
+// exclusive: a member already owned by a DIFFERENT VM must FAIL the acquire (no
+// reassignment, no vfio bind), while a member already owned by the SAME VM is an
+// idempotent self-claim that succeeds. Before the CAS fix the blind AssignPCIDevice
+// silently reassigned the device to the second VM (fail-open) — the double-bind.
+func TestAcquireDeviceLeases_ConflictFailsClosed(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIBindFakeFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+	// Device is already owned by the incumbent VM.
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", "0000:41:00.0", "vm1"); err != nil {
+		t.Fatalf("seed ownership: %v", err)
+	}
+
+	ownerOf := func(addr string) string {
+		devs, _ := corrosion.ListPCIDevices(ctx, s.db, "test-host", "")
+		for _, d := range devs {
+			if d.Address == addr {
+				return d.VMName
+			}
+		}
+		return ""
+	}
+
+	// A different VM claiming the same BDF must FAIL, and must NOT reassign or bind.
+	if _, err := s.acquireDeviceLeases(ctx, "vm2", []ResolvedMember{{Address: "0000:41:00.0"}}); err == nil {
+		t.Fatal("acquiring a device owned by another VM must fail, got nil error")
+	}
+	if o := ownerOf("0000:41:00.0"); o != "vm1" {
+		t.Fatalf("device must stay owned by the incumbent, got owner %q", o)
+	}
+	if fs.binds != 0 {
+		t.Fatalf("a conflicting claim must NOT vfio-bind, got %d binds", fs.binds)
+	}
+
+	// The incumbent re-acquiring its own device is an idempotent self-claim → OK.
+	finish, err := s.acquireDeviceLeases(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}})
+	if err != nil {
+		t.Fatalf("idempotent self-claim must succeed, got %v", err)
+	}
+	finish()
+	if o := ownerOf("0000:41:00.0"); o != "vm1" {
+		t.Fatalf("self-claim must keep ownership, got owner %q", o)
+	}
+	if fs.binds != 1 {
+		t.Fatalf("self-claim must bind exactly once, got %d binds", fs.binds)
+	}
+}
+
+// ── concurrency: two VMs attach the same BDF, exactly one wins ────────────────
+
+// TestAttachPCI_ConcurrentSameBDF_OneWins is the #6 proof: two concurrent
+// concrete-address attaches of the same host BDF to DIFFERENT VMs (so different
+// per-VM locks, which do NOT serialize them) must resolve to EXACTLY ONE winner
+// and EXACTLY ONE live intent. The host-scoped pciReserveMu serializes the
+// exclusivity-check→intent-reserve critical section so the loser observes the
+// winner's durable intent. Run with -race. This is a concurrency test made
+// reliable by the mutex; the deterministic backstop is the sequential test below.
+func TestAttachPCI_ConcurrentSameBDF_OneWins(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "stopped")
+	seedNICVM(t, s, "vm2", "stopped")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+
+	var wg sync.WaitGroup
+	var okCount int32
+	for _, vm := range []string{"vm1", "vm2"} {
+		vm := vm
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+				VmName: vm, PciDevice: &pb.DeviceSpec{Address: "0000:41:00.0"},
+			}); err == nil {
+				atomic.AddInt32(&okCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if okCount != 1 {
+		t.Fatalf("exactly one concurrent attach of the same BDF must succeed, got %d", okCount)
+	}
+	total := len(liveIntents(t, ctx, s, "vm1")) + len(liveIntents(t, ctx, s, "vm2"))
+	if total != 1 {
+		t.Fatalf("exactly one live vm_pci_intent must exist for the BDF across both VMs, got %d", total)
+	}
+}
+
+// TestAttachPCI_SequentialSameBDF_SecondRejected is the deterministic backstop for
+// the concurrency proof: once one VM holds a live intent for a BDF, a second VM's
+// attach of the same BDF is rejected with AlreadyExists (the exclusivity read +
+// host-scoped reserve rejects the second claimant).
+func TestAttachPCI_SequentialSameBDF_SecondRejected(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "stopped")
+	seedNICVM(t, s, "vm2", "stopped")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: "0000:41:00.0"},
+	}); err != nil {
+		t.Fatalf("first attach: %v", err)
+	}
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm2", PciDevice: &pb.DeviceSpec{Address: "0000:41:00.0"},
+	})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("second VM claiming the same BDF: code = %v, want AlreadyExists", status.Code(err))
+	}
+	total := len(liveIntents(t, ctx, s, "vm1")) + len(liveIntents(t, ctx, s, "vm2"))
+	if total != 1 {
+		t.Fatalf("exactly one live intent must exist across both VMs, got %d", total)
+	}
+}
+
 // ── detach: address with no live intent uses the legacy path (NotFound here) ──
 
 func TestDetachDevice_PCINoIntentFallsToLegacy(t *testing.T) {

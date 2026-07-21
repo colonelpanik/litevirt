@@ -232,6 +232,17 @@ type Server struct {
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
 
+	// pciReserveMu serializes the concrete-address PCI attach exclusivity
+	// check→intent-reserve critical section HOST-WIDE. The per-VM lock alone is
+	// insufficient: two attaches of the same host BDF to DIFFERENT VMs take
+	// different per-VM locks, so both could read the intent as free and both
+	// persist a live intent for the same exclusive_key. A single mutex suffices —
+	// the host is always s.hostName and a concrete-address attach is forwarded to
+	// the VM's owner (in-process serialization is enough; no cross-node concern).
+	// Lock order: acquire AFTER lockVM (per-VM lock, THEN this); no path takes the
+	// two in the opposite order.
+	pciReserveMu sync.Mutex
+
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets
 	// the reconciler tell a genuinely-in-flight backup apart from a

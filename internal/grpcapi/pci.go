@@ -397,16 +397,28 @@ func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intent
 }
 
 // acquireDeviceLeases is the side-effecting counterpart to resolveDeviceIntents:
-// it takes resolved members and records inventory ownership (AssignPCIDevice),
-// writes the durable device-lease entry (F1) BEFORE the irreversible vfio bind,
-// then binds every member to vfio-pci. On a bind failure it rolls back EXACTLY
-// the devices this call claimed (releaseDeviceLeases) and clears the lease, so a
-// crash before the VM row is finalized is recovered at startup. It returns the
-// finish func the caller must defer to clear the lease once the row is durable.
+// it takes resolved members and atomically CLAIMS inventory ownership, writes the
+// durable device-lease entry (F1) BEFORE the irreversible vfio bind, then binds
+// every member to vfio-pci. On a bind failure it rolls back EXACTLY the devices
+// this call claimed (releaseDeviceLeases) and clears the lease, so a crash before
+// the VM row is finalized is recovered at startup. It returns the finish func the
+// caller must defer to clear the lease once the row is durable.
 //
-// AssignPCIDevice is idempotent for a member already owned by vmName (e.g. an
-// SR-IOV VF CAS-claimed during selection), so members from either resolve path
-// are handled uniformly.
+// The claim is exclusive and FAIL-CLOSED — the physical-double-bind guard shared by
+// every caller (concrete-address attach AND CreateVM's allocateDevices), since
+// CreateVM does NOT hold pciReserveMu. Per member the current owner is read once,
+// then:
+//   - owner == vmName → an idempotent self-claim (e.g. an SR-IOV VF CAS-claimed
+//     during selection, or a same-op retry): keep it, proceed to bind.
+//   - owner is a DIFFERENT non-empty VM → FAIL (AlreadyExists), rolling back the
+//     members THIS call already claimed, BEFORE any vfio.Bind.
+//   - unowned → corrosion.ClaimPCIDevice (CAS: assigns only if active and
+//     unassigned); a false return (lost the race) or an error FAILS the same way.
+//
+// A blind UPDATE was fail-OPEN (last-write-wins double-bind); the CAS + owner read
+// makes the claim atomic against all callers with no new statement shape. Rollback
+// touches ONLY members this call claimed (guaranteed owned by vmName) — never
+// another VM's device or its vfio binding.
 func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members []ResolvedMember) (func(), error) {
 	noop := func() {}
 	addresses := make([]string, 0, len(members))
@@ -414,9 +426,56 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 		addresses = append(addresses, m.Address)
 	}
 
+	// Current owners on this host, read once (no new statement): distinguishes
+	// self-owned (idempotent), other-owned (conflict) and unowned (CAS-claim).
+	owners := map[string]string{}
+	devs, lerr := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if lerr != nil {
+		return noop, status.Errorf(codes.Internal, "read PCI inventory: %v", lerr)
+	}
+	for _, d := range devs {
+		owners[d.Address] = d.VMName
+	}
+
+	// Atomic claim loop. claimed = the addresses THIS call took, released on any
+	// failure (never touching another VM's device, so releaseDeviceLeases' vfio
+	// unbind is always safe here).
+	var claimed []string
+	rollback := func() {
+		if len(claimed) > 0 {
+			s.releaseDeviceLeases(ctx, vmName, claimed)
+		}
+	}
 	for _, addr := range addresses {
-		if err := corrosion.AssignPCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
-			slog.Warn("failed to record device assignment", "address", addr, "error", err)
+		owner, present := owners[addr]
+		switch {
+		case owner == vmName:
+			// Already ours — idempotent self-claim; nothing to do, proceed to bind.
+		case owner != "":
+			rollback()
+			return noop, status.Errorf(codes.AlreadyExists,
+				"PCI device %s (host %s) is already claimed by VM %q", addr, s.hostName, owner)
+		case !present:
+			// Not in the live inventory — there is no ownership row to CAS. This
+			// preserves the historical behavior (the blind UPDATE matched no rows and
+			// no-op'd): an un-inventoried BDF is bound directly and its host_pci_devices
+			// row is populated by a later rescan. Exclusivity is not weakened — there
+			// was never a claimable row to double-bind here; for the concrete-address
+			// path the vm_pci_intent exclusive_key is the authoritative guard.
+		default:
+			// Present and unowned → atomic CAS claim.
+			ok, cerr := corrosion.ClaimPCIDevice(ctx, s.db, s.hostName, addr, vmName)
+			if cerr != nil {
+				rollback()
+				return noop, status.Errorf(codes.Internal, "claim PCI device %s: %v", addr, cerr)
+			}
+			if !ok {
+				// Lost the CAS race — another operation claimed it between the read and here.
+				rollback()
+				return noop, status.Errorf(codes.AlreadyExists,
+					"PCI device %s (host %s) was claimed by another operation", addr, s.hostName)
+			}
+			claimed = append(claimed, addr)
 		}
 	}
 

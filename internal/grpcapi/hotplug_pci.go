@@ -223,6 +223,17 @@ func (s *Server) attachPCIOwner(ctx context.Context, req *pb.AttachDeviceRequest
 	}
 	normAddr := *exclusiveKey
 
+	// Host-scoped serialization of the check→reserve critical section. The per-VM
+	// lock does NOT cover this: two attaches of the same host BDF to DIFFERENT VMs
+	// hold different per-VM locks, so without this both could read the intent as free
+	// and both persist a live intent for the same exclusive_key. Held from the
+	// exclusivity read THROUGH the intent write in the tail-called executePCIAttach
+	// (deliberately spanning the reserve), so a concurrent attach's exclusivity read
+	// cannot interleave before the intent is durable. Lock order: per-VM lock (above),
+	// THEN this — no path acquires them in the opposite order.
+	s.pciReserveMu.Lock()
+	defer s.pciReserveMu.Unlock()
+
 	// Exclusivity: a given host BDF may back at most one VM's live intent. A read
 	// failure must FAIL the operation fail-closed BEFORE any mutation — swallowing it
 	// would let two VMs claim the same passthrough device.

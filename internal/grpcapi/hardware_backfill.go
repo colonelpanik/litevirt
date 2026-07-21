@@ -409,11 +409,19 @@ func (s *Server) auditVMPCICompatibility(ctx context.Context, vm *corrosion.VMRe
 			if planIDs[in.DeviceID] {
 				continue // present in the plan — keep it
 			}
-			if err := corrosion.TombstonePCIIntent(ctx, s.db, vm.Name, in.DeviceID); err != nil {
-				return s.blockAdoption(ctx, vm.Name, fmt.Sprintf("failed to tombstone stale PCI intent %s: %v", in.DeviceID, err))
-			}
+			// Realizations first, intent LAST: the intent row is the durable retry
+			// anchor. If either tombstone fails, leaving the intent live means the
+			// NEXT audit's stale-set derivation (ListVMPCIIntents — live rows only)
+			// re-lists it and retries both; TombstonePCIRealizations is idempotent,
+			// so a retry after a partial success is safe. Tombstoning the intent
+			// first (the prior order) would drop it off that live-rows scan on any
+			// subsequent realization-tombstone failure, orphaning the realization
+			// rows with nothing left to revisit them.
 			if err := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, in.DeviceID); err != nil {
 				return s.blockAdoption(ctx, vm.Name, fmt.Sprintf("failed to tombstone stale PCI realizations %s: %v", in.DeviceID, err))
+			}
+			if err := corrosion.TombstonePCIIntent(ctx, s.db, vm.Name, in.DeviceID); err != nil {
+				return s.blockAdoption(ctx, vm.Name, fmt.Sprintf("failed to tombstone stale PCI intent %s: %v", in.DeviceID, err))
 			}
 		}
 	}

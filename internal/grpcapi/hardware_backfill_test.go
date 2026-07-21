@@ -830,6 +830,111 @@ func TestAudit_UnparseableMember_DoesNotTombstone(t *testing.T) {
 	}
 }
 
+// TestAudit_ReconcileFailure_LeavesIntentLiveForRetry proves the reconcile
+// order fix (review finding #5): when a stale intent's realization tombstone
+// FAILS, the audit must fail closed (blocked) WITHOUT having already
+// tombstoned the intent — otherwise the intent, the only thing the NEXT
+// audit's stale-set derivation looks at (ListVMPCIIntents, live rows only),
+// would be gone, and the orphaned realization row would never be revisited.
+// Realizations-first / intent-last makes the intent the durable retry
+// anchor: on any failure it stays live, so the next audit re-lists it and
+// retries both tombstones (TombstonePCIRealizations is idempotent).
+func TestAudit_ReconcileFailure_LeavesIntentLiveForRetry(t *testing.T) {
+	s, f := backfillServer(t)
+	ctx := adminCtx()
+
+	const name = "reconcile-retry-vm"
+	bdf := "0000:51:00.0"
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: name, HostName: "test-host", State: "running", Spec: "",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// (a) Inactive definition has one concrete-address hostdev → adopts one intent.
+	f.SetInactiveXML(name, domainXMLWith(name, hostdevXML(bdf)))
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables (initial): %v", err)
+	}
+	before, err := corrosion.ListVMPCIIntents(ctx, s.db, name)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents (initial): %v", err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("got %d intents after initial adoption, want exactly 1: %+v", len(before), before)
+	}
+	deviceID := before[0].DeviceID
+
+	// Seed the realization the resolver would have produced for it.
+	if err := corrosion.UpsertPCIRealization(ctx, s.db, corrosion.PCIRealizationRecord{
+		VMName: name, DeviceID: deviceID, MemberID: bdf, HostName: "test-host",
+		ResolvedAddress: bdf, Ordinal: 0,
+	}); err != nil {
+		t.Fatalf("UpsertPCIRealization: %v", err)
+	}
+
+	// (b) The device is detached from the definition → the next audit's plan is
+	// empty, so the surviving intent is stale and reconcile must retire it.
+	f.SetInactiveXML(name, domainXMLWith(name))
+
+	// FORCE the realization tombstone to fail by dropping the table out from
+	// under it — the pattern other fail-closed tests use (e.g. `DROP TABLE
+	// vm_disks` in vm_test.go) to force a write error deterministically.
+	if err := s.db.Execute(ctx, `DROP TABLE vm_pci_realizations`); err != nil {
+		t.Fatalf("DROP TABLE vm_pci_realizations: %v", err)
+	}
+
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables (post-detach, forced failure): %v", err)
+	}
+
+	// (a) Fail closed: the VM must be blocked, not left "adopted" on a partial
+	// reconcile.
+	if st, _, _ := corrosion.GetHardwareAdoptionState(ctx, s.db, name); st != "blocked" {
+		t.Fatalf("adoption state = %q, want blocked (realization tombstone failed)", st)
+	}
+
+	// (b) The retry anchor: the stale intent must STILL BE LIVE. Under the old
+	// intent-first order, TombstonePCIIntent would have already succeeded before
+	// the (now-failing) realization tombstone ran, so the intent would be GONE
+	// here — this assertion is what turns RED against that order.
+	after, err := corrosion.ListVMPCIIntents(ctx, s.db, name)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents (post-detach, forced failure): %v", err)
+	}
+	found := false
+	for _, in := range after {
+		if in.DeviceID == deviceID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stale intent %q was already tombstoned despite the realization tombstone failing — it is no longer a retry anchor: %+v", deviceID, after)
+	}
+
+	// (optional) Restore the table and re-audit: the retry anchor lets the
+	// SAME stale intent converge on the next pass — both tombstones succeed.
+	// InitSchema's CREATE TABLE IF NOT EXISTS recreates only what's missing.
+	if err := corrosion.InitSchema(ctx, s.db); err != nil {
+		t.Fatalf("InitSchema (restore): %v", err)
+	}
+
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables (retry): %v", err)
+	}
+	converged, err := corrosion.ListVMPCIIntents(ctx, s.db, name)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents (retry): %v", err)
+	}
+	if len(converged) != 0 {
+		t.Fatalf("stale intent survived the retry audit: got %d live intents, want 0 (tombstoned): %+v", len(converged), converged)
+	}
+	if st, _, _ := corrosion.GetHardwareAdoptionState(ctx, s.db, name); st != "adopted" {
+		t.Errorf("adoption state after retry = %q, want adopted (converged)", st)
+	}
+}
+
 // TestRenameVM_PCIIntentAuditConverges_NoFork is the end-to-end proof of the
 // name-independent device_id design (the reason task 7.2.5 dropped vm_name from
 // its derivation): a VM adopts a single concrete-address PCI intent, gets

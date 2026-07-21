@@ -559,6 +559,7 @@ lv lb enable <lb> --backend <vm>                  # Re-enable
 ## Hot-plug (attach/detach)
 
 ```bash
+lv hardware-ls <vm>                               # List a VM's disks/NICs/PCI devices
 lv attach-disk <vm> <disk> --size 50G [--bus virtio]
 lv detach-disk <vm> <disk>
 lv attach-nic <vm> <network> [--model virtio] [--mac ...]

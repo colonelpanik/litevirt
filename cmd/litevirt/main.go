@@ -93,6 +93,7 @@ func newRootCmd() *cobra.Command {
 		newTopCmd(),
 		newEventsCmd(),
 		newUICmd(),
+		newHardwareLsCmd(),
 		newAttachDiskCmd(),
 		newDetachDiskCmd(),
 		newAttachNicCmd(),

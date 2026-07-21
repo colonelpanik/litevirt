@@ -170,6 +170,22 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition, "target host %q is not active", req.TargetHost)
 	}
 
+	// PCI passthrough cannot be re-realized cross-host in this release, so refuse
+	// migrating any VM that holds PCI intent — but only once hardware_v2 is latched,
+	// so pre-latch migration behavior (incl. the legacy VF/PF/target-availability
+	// guards below) is unchanged. Fail CLOSED on a read error: if we cannot tell
+	// whether the VM holds intent, refuse rather than risk migrating a PCI VM.
+	if s.hardwareV2Latched(ctx) {
+		intents, err := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
+		if err != nil {
+			return status.Errorf(codes.Internal, "check PCI intent for %q: %v", vm.Name, err)
+		}
+		if len(intents) > 0 {
+			return status.Errorf(codes.FailedPrecondition,
+				"VM %q holds PCI passthrough intent; cross-host migration of PCI devices is not supported in this release", vm.Name)
+		}
+	}
+
 	// Split-brain gate (Phase 1), SOURCE-side: a migration is a runtime-ownership
 	// move, so the source must hold local quorum. This runs ON THE SOURCE (a
 	// non-source caller forwarded above and returned) and re-checks quorum HERE — not

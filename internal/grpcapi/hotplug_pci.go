@@ -807,13 +807,27 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			return nil, status.Errorf(codes.Internal, "pci detach for %q applied but bookkeeping incomplete; left recoverable", vm.Name)
 		}
 	} else {
-		// Release the shared inventory reservation the stopped attach claimed. A stopped
-		// reservation has NO realizations (they are written at VM start), so the members
-		// to release are resolved from the intent address — the same primary + IOMMU-group
-		// siblings the stopped attach claimed. Owner-scoped release (no vfio unbind:
-		// nothing was bound); best-effort resolve so a vanished sibling can't wedge the
-		// detach (VM delete's releaseDevices clears any residual owner by VM).
-		if members, rerr := s.resolveDeviceSpec(ctx, vm.Name, &pb.DeviceSpec{Address: normAddr}, deviceID, map[string]bool{}); rerr == nil {
+		// Stopped detach. Discriminate on realization rows (written at VM start) whether
+		// the device was ever started, and therefore bound: a latched stop RETAINS the
+		// vfio binding (FIX-9b touches PCI not at all), so a started-then-stopped device
+		// is still bound to vfio-pci at detach time.
+		if len(memberAddrs) > 0 {
+			// Realizations exist → the device was started and is (or may be) bound. It
+			// must be UNBOUND before its ownership is released, or it is left an unowned
+			// but still-vfio-bound orphan (the host driver can't reclaim it, and another
+			// VM could claim ownership of a device stuck in vfio-pci). Release via the
+			// realized addresses (vfio Unbind + owner-scoped release); no live
+			// DetachHostdev — the VM is stopped, no running domain, and the reconcile
+			// below drops the hostdev from the persistent definition.
+			s.releaseDeviceLeases(ctx, vm.Name, memberAddrs)
+		} else if members, rerr := s.resolveDeviceSpec(ctx, vm.Name, &pb.DeviceSpec{Address: normAddr}, deviceID, map[string]bool{}); rerr == nil {
+			// No realizations → a never-started, ownership-reserved-only attach (FIX-9a).
+			// Nothing was ever bound: release the shared inventory reservation the stopped
+			// attach claimed (the same primary + IOMMU-group siblings) WITHOUT any vfio
+			// unbind. vfio.Unbind must NOT run here — on a never-bound device it is not a
+			// clean no-op (it clears driver_override and attempts a driver-restore).
+			// Best-effort resolve so a vanished sibling can't wedge the detach (VM delete's
+			// releaseDevices clears any residual owner by VM).
 			for _, m := range members {
 				if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, m.Address, vm.Name); err != nil {
 					slog.Warn("pci detach: release stopped reservation", "vm", vm.Name, "address", m.Address, "error", err)

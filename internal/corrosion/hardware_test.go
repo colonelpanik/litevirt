@@ -485,3 +485,74 @@ func TestUpsertAndListPCIRealization(t *testing.T) {
 		t.Fatalf("TombstonePCIRealizations must retract every member: %v (got=%+v)", err, got)
 	}
 }
+
+// assertDistinctPCIIntentIDs fails t unless a and b — which must classify to
+// the same selector_kind, since this helper is only used to guard WITHIN-kind
+// discrimination — derive different device_ids.
+func assertDistinctPCIIntentIDs(t *testing.T, label string, a, b *pb.DeviceSpec) {
+	t.Helper()
+	idA := DeterministicPCIIntentID(CanonicalPCISelector(a), 0)
+	idB := DeterministicPCIIntentID(CanonicalPCISelector(b), 0)
+	if idA == idB {
+		t.Fatalf("%s: distinct specs collapsed onto the same device_id %q (a=%+v b=%+v) — a semantic field is missing from this kind's canonical selector", label, idA, a, b)
+	}
+}
+
+// TestCanonicalPCISelector_DiscriminatesSemanticFields pins the per-kind
+// canonical-selector field-set COMPLETENESS: within a kind, two DeviceSpecs
+// that differ ONLY by a resolution-DETERMINING field must derive DIFFERENT
+// device_ids. This is the guard the id-primitive tests above don't provide —
+// they prove a resolution ARTIFACT (Address on a portable selector) is
+// correctly EXCLUDED, but nothing previously pinned that every semantic field
+// is INCLUDED. A future edit that dropped a field from one kind's branch in
+// CanonicalPCISelector (e.g. Vendor from the type/vendor branch) would compile
+// and pass every existing test while silently collapsing two distinct devices
+// onto the same device_id — a fleet-wide id-divergence / dropped-device bug.
+//
+// Only id INEQUALITY is asserted, never the literal canonical string (the
+// scheme is deliberately not string-pinned — see CanonicalPCISelector's doc
+// comment).
+func TestCanonicalPCISelector_DiscriminatesSemanticFields(t *testing.T) {
+	t.Run("type/vendor kind", func(t *testing.T) {
+		assertDistinctPCIIntentIDs(t, "vendor",
+			&pb.DeviceSpec{Type: "gpu", Vendor: "10de"}, &pb.DeviceSpec{Type: "gpu", Vendor: "8086"})
+		assertDistinctPCIIntentIDs(t, "model",
+			&pb.DeviceSpec{Type: "gpu", Model: "a"}, &pb.DeviceSpec{Type: "gpu", Model: "b"})
+		assertDistinctPCIIntentIDs(t, "count",
+			&pb.DeviceSpec{Type: "gpu", Count: 1}, &pb.DeviceSpec{Type: "gpu", Count: 2})
+	})
+
+	t.Run("sriov kind", func(t *testing.T) {
+		assertDistinctPCIIntentIDs(t, "parent",
+			&pb.DeviceSpec{Sriov: true, Parent: "0000:41:00.0"}, &pb.DeviceSpec{Sriov: true, Parent: "0000:42:00.0"})
+		assertDistinctPCIIntentIDs(t, "type",
+			&pb.DeviceSpec{Sriov: true, Type: "nic"}, &pb.DeviceSpec{Sriov: true, Type: "gpu"})
+		assertDistinctPCIIntentIDs(t, "count",
+			&pb.DeviceSpec{Sriov: true, Count: 1}, &pb.DeviceSpec{Sriov: true, Count: 2})
+	})
+
+	t.Run("mapping kind", func(t *testing.T) {
+		assertDistinctPCIIntentIDs(t, "mapping name",
+			&pb.DeviceSpec{Mapping: "pool-a"}, &pb.DeviceSpec{Mapping: "pool-b"})
+	})
+
+	// Cross-kind: already collision-proof by construction (each branch is
+	// kind-prefixed), but locked here so a future change can't quietly erode
+	// the kind prefix and let two different kinds' selectors collide.
+	t.Run("cross-kind", func(t *testing.T) {
+		specs := map[string]*pb.DeviceSpec{
+			"mapping": {Mapping: "x"},
+			"type":    {Type: "x"},
+			"sriov":   {Sriov: true},
+			"address": {Address: "0000:41:00.0"},
+		}
+		seenBy := make(map[string]string, len(specs))
+		for kind, spec := range specs {
+			id := DeterministicPCIIntentID(CanonicalPCISelector(spec), 0)
+			if other, ok := seenBy[id]; ok {
+				t.Fatalf("cross-kind collision: kinds %q and %q share device_id %q", kind, other, id)
+			}
+			seenBy[id] = kind
+		}
+	})
+}

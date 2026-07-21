@@ -675,6 +675,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.RecoverResourceOperations(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
 
+	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
+	// nonterminal device_attach/device_detach operation (a hot-plug that crashed
+	// with the mutation barrier held) — roll an incomplete attach BACK and a detach
+	// FORWARD to a single consistent state, clearing the barrier. Runs synchronously
+	// after DB + libvirt + journal init (uses the host-local journal artifacts), and
+	// a reconciler pass retries stragglers.
+	svc.RecoverHardwareOperations(ctx)
+	go svc.RunHardwareOperationRecovery(ctx)
+
 	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
 	// for cluster-wide capability confirmation) and every reconciler/vmChecker
 	// callback is set, start the runtime loops. Launching them here — not at

@@ -341,6 +341,15 @@ func (s *Server) executePCIAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		for i, m := range members {
 			addrs[i] = m.Address
 		}
+		// FIX-13: journal the durable device MODE so recovery releases correctly. The
+		// running branch acquires leases + vfio-binds the members ("vfio_bound"); the
+		// stopped branch only claims host_pci_devices ownership, never binds
+		// ("ownership_reserved"). Recovery keys unbind-or-not on this so it never
+		// vfio-unbinds a never-bound reservation.
+		mode := "ownership_reserved"
+		if running {
+			mode = "vfio_bound"
+		}
 		entry := opjournal.Entry{
 			OperationID:    opID,
 			OwnerEpoch:     epoch,
@@ -352,6 +361,7 @@ func (s *Server) executePCIAttach(ctx context.Context, vm *corrosion.VMRecord, s
 				"device_id":              deviceID,
 				"pci_address":            normAddr,
 				"member_addresses":       strings.Join(addrs, ","),
+				"device_mode":            mode,
 				"selector_payload":       selectorPayload,
 				"prior_active_xml":       priorActive,
 				"prior_inactive_xml":     priorInactive,

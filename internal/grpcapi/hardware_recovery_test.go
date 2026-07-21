@@ -1201,6 +1201,118 @@ func TestRecoverHardwareOperations_PCIAttachClaimedWindowReleasesLease(t *testin
 	}
 }
 
+// TestRecoverPCIAttach_OwnershipReserved_ReleasesOwnershipNoUnbind (FIX-13): a
+// STOPPED PCI attach (FIX-9a reserve) that crashed after claiming host_pci_devices
+// ownership but before completing — journaled device_mode="ownership_reserved", NO
+// realizations, NEVER vfio-bound. Recovery must release OWNERSHIP ONLY (the
+// host_pci_devices owner is cleared) and must NOT invoke vfio.Unbind: Unbind on a
+// never-bound device is not a clean no-op (it clears driver_override and attempts a
+// driver-restore). RED before FIX-13 — the owned-addresses fallback set
+// leaseHeld=true → releaseDeviceLeases → vfio.Unbind fired on the reserved device.
+func TestRecoverPCIAttach_OwnershipReserved_ReleasesOwnershipNoUnbind(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "stopped")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateDefined) // positively shut off → stopped recovery path
+
+	const addr = "0000:41:00.0"
+	const deviceID = "pcidev-reserved"
+	// Stopped reserve: ownership claimed, NO vfio bind, NO realization row.
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
+		t.Fatalf("assign device: %v", err)
+	}
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr,
+			"device_mode": "ownership_reserved"})
+
+	s.RecoverHardwareOperations(ctx)
+
+	// Ownership released — the device is no longer owner-assigned to vm1.
+	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
+		t.Fatalf("reserved-mode recovery must release ownership; %s still owned by %q", addr, o)
+	}
+	// vfio.Unbind must NOT have run on a never-bound device.
+	if n := fs.unbindCount(addr); n != 0 {
+		t.Fatalf("reserved-mode recovery must NOT vfio-unbind (got %d unbinds — clears driver_override on a never-bound device)", n)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
+	if _, found, _ := s.opJournal.Read(opID); found {
+		t.Fatal("journal entry must be cleared after a completed rollback")
+	}
+}
+
+// TestRecoverPCIAttach_VfioBound_UnbindsAndReleases (FIX-13 regression): the
+// claimed-window case journaled device_mode="vfio_bound" (a RUNNING attach that
+// acquired the lease + vfio-bound the device but crashed before its realization row,
+// then a host reboot shut the domain off). Recovery must still UNBIND + release
+// (releaseDeviceLeases) — the mode gate must not divert a genuinely-bound device onto
+// the owner-only path and strand a vfio-bound orphan.
+func TestRecoverPCIAttach_VfioBound_UnbindsAndReleases(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+	fake := s.virt.(*libvirtfake.Fake)
+
+	const addr = "0000:41:00.0"
+	const deviceID = "pcidev-bound"
+	// Lease acquired (device owner-assigned) but crash before any realization row.
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
+		t.Fatalf("assign device: %v", err)
+	}
+	fake.SetState("vm1", libvirtfake.StateShutdown) // host reboot: domain shut off, vm.State still "running"
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr,
+			"device_mode": "vfio_bound"})
+
+	s.RecoverHardwareOperations(ctx)
+
+	// Ownership released AND the device was vfio-unbound (unbind + release).
+	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
+		t.Fatalf("vfio_bound recovery must release ownership; %s still owned by %q", addr, o)
+	}
+	if n := fs.unbindCount(addr); n == 0 {
+		t.Fatalf("vfio_bound recovery must vfio-unbind (0 unbinds — bound device left an orphan)")
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
+}
+
 // TestRecoverHardwareOperations_PCIDetachRollsForward: a PCI detach wedged
 // mid-detach converges by rolling FORWARD — the hostdev leaves both definitions,
 // realizations + intent are tombstoned, ownership is released, the op completes, and

@@ -391,6 +391,14 @@ func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, v
 	art := entry.Artifacts
 	deviceID := art["device_id"]
 	normAddr := strings.ToLower(art["pci_address"])
+	// FIX-13: the durable device MODE the attach journaled distinguishes a stopped
+	// RESERVE (host_pci_devices ownership claimed, NEVER vfio-bound, no realization)
+	// from a bound attach. A stopped reserve owns its addresses but must be released
+	// OWNERSHIP-ONLY — vfio.Unbind on a never-bound device is NOT a clean no-op (it
+	// clears driver_override + attempts a driver-restore). A missing device_mode only
+	// occurs for a pre-FIX-13 entry (nothing is deployed) → default to the prior bound
+	// behavior. Realizations present always mean the device was bound, overriding mode.
+	reservedMode := art["device_mode"] == "ownership_reserved"
 
 	// Realized members (concrete host devices this attach bound) + intent presence.
 	var members []ResolvedMember
@@ -405,23 +413,31 @@ func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, v
 		}
 	}
 
-	// Claimed-window fallback: a crash AFTER acquireDeviceLeases (vfio bind +
-	// AssignPCIDevice + beginDeviceLease) but BEFORE any vm_pci_realizations row was
-	// written leaves realizations empty even though the devices are vfio-bound and
-	// owner-assigned to this VM. RecoverDeviceLeases already ran and CLEARED the
-	// device_lease journal entry WITHOUT releasing (the VM row exists), so this op's
-	// OWN device_attach entry is the sole authority for the addresses to release —
-	// there is no double-release (device_lease is a distinct journal Kind). Reconstruct
-	// them from its member_addresses artifact, confirmed against host_pci_devices
-	// ownership so a STOPPED reserve — which resolves the same addresses into the
-	// journal but never acquires a lease — is never wrongly released.
+	// No realizations → reconstruct the release set from the member_addresses artifact,
+	// confirmed against host_pci_devices ownership (never release a device a stopped
+	// reserve merely resolved or another VM has since claimed). This covers two cases,
+	// discriminated by device_mode:
+	//   - vfio_bound (or a pre-FIX-13 entry): a crash AFTER acquireDeviceLeases (vfio
+	//     bind + AssignPCIDevice + beginDeviceLease) but BEFORE any realization row
+	//     leaves realizations empty though the devices are vfio-bound + owner-assigned.
+	//     RecoverDeviceLeases already ran and CLEARED the device_lease journal entry
+	//     WITHOUT releasing (the VM row exists), so this op's OWN device_attach entry is
+	//     the sole authority for the addresses to release (no double-release —
+	//     device_lease is a distinct journal Kind). leaseHeld=true → rollback UNBINDS +
+	//     releases via releaseDeviceLeases.
+	//   - ownership_reserved: a STOPPED reserve that claimed ownership but NEVER bound.
+	//     leaseHeld STAYS false so rollback releases OWNERSHIP ONLY (never
+	//     releaseDeviceLeases/vfio.Unbind); the members below are the owner-only release
+	//     set (see the ownershipRelease closure).
 	leaseHeld := realizationsWritten
 	if !realizationsWritten {
 		if owned := s.pciAddrsOwnedByVM(ctx, vm.Name, splitCSVNonEmpty(art["member_addresses"])); len(owned) > 0 {
 			for i, addr := range owned {
 				members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", i), Address: addr})
 			}
-			leaseHeld = true
+			if !reservedMode {
+				leaseHeld = true
+			}
 		}
 	}
 
@@ -465,6 +481,22 @@ func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, v
 	// claimed-window attach onto the stopped path, but its bound + owner-assigned
 	// devices still leak (and block re-attach via exclusivity) unless released here.
 	rb.acquired = leaseHeld || len(rb.attachedAddrs) > 0
+	// FIX-13: a reserved (never-bound) attach releases OWNERSHIP ONLY on rollback —
+	// mirror the stopped-reserve claimDeviceOwnership release closure. failPCIAttach
+	// invokes ownershipRelease (owner-scoped ReleasePCIDevice, NO vfio unbind); with
+	// rb.acquired=false it never routes through releaseDeviceLeases. Set only when the
+	// device was genuinely never bound (reserved mode, no realizations, no live
+	// hostdev), so a bound device still takes the unbind+release path below.
+	if reservedMode && !realizationsWritten && !rb.acquired {
+		releaseMembers := members
+		rb.ownershipRelease = func() {
+			for _, m := range releaseMembers {
+				if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, m.Address, vm.Name); err != nil {
+					slog.Warn("hardware op recovery: release stopped reservation", "vm", vm.Name, "address", m.Address, "error", err)
+				}
+			}
+		}
+	}
 	// The reconstructed members ARE the release set: realizations / the owner-confirmed
 	// claimed-window fallback establish EXACTLY the devices this incomplete attach holds
 	// and must release on rollback. failPCIAttach releases rb.acquireClaimed (scoped to

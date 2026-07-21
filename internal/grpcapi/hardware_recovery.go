@@ -266,13 +266,16 @@ func (s *Server) recoverDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 	rb := attachRollback{
 		vm: vm, opID: view.ActiveOperationID, epoch: view.OwnerEpoch, newGen: view.SpecGeneration,
 		diskName: art["disk_name"], diskPath: art["file_created_by_operation"],
+		// The op-specific staging temp of a crashed op (set at the planned stage, cleared
+		// only on completion). ALWAYS safe to delete — unique to this op → never a foreign
+		// file; failDeviceAttach removes it, tolerating ErrNotExist.
+		tempPath:  art["creating_temp"],
 		targetDev: targetDev, running: running, journaled: true,
-		// File ownership is the PRESENCE of the post-create artifact, NOT os.Stat: the
-		// artifact is written ONLY after exclusiveCreateQcow2 succeeds, so a file at this
-		// path is op-owned iff the op durably recorded creating it. A planned-stage entry
-		// (a crash before create) carries no such artifact → fileCreated=false → the
-		// rollback never deletes a file this op did not create (a foreign file at the same
-		// path survives; failDeviceAttach's os.Remove tolerates ErrNotExist).
+		// Final-path ownership is the PRESENCE of the post-publish artifact, NOT os.Stat:
+		// "file_created_by_operation" is written only AFTER staging + BEFORE publish, so a
+		// file at the final path is op-published iff the op durably recorded it. A crash
+		// before publish carries no such artifact → fileCreated=false → the rollback never
+		// deletes a foreign file at the final path (it deletes only the op-specific temp).
 		fileCreated: art["file_created_by_operation"] != "",
 	}
 	if running {

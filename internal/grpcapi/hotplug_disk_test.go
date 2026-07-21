@@ -490,6 +490,90 @@ func TestDiskAttach_CompletionCASFails_RetainsJournal(t *testing.T) {
 	}
 }
 
+// TestDiskAttach_FailBeforePublish_FinalPathReusable proves the FIX-10 reorder: the
+// backing file is staged at an op-specific temp and the FINAL path is published ONLY
+// after ownership of it is journaled. A failure in the publish step (modeled via the
+// publishQcow2Fn seam) must therefore leave the final disk name REUSABLE — the final
+// path absent, no op-temp leftover, the barrier cleared — and a later attach reusing
+// the same disk name must succeed. The seam also asserts the ordering invariant
+// directly: at publish time, ownership of the final path is ALREADY journaled (the
+// pre-fix order published the final BEFORE journaling ownership, orphaning it on a
+// crash).
+func TestDiskAttach_FailBeforePublish_FinalPathReusable(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+
+	orig := publishQcow2Fn
+	defer func() { publishQcow2Fn = orig }()
+	var publishCalled, ownershipMissingAtPublish, stagedAtPublish bool
+	publishQcow2Fn = func(tempPath, finalPath string) error {
+		publishCalled = true
+		// The backing file must exist at the op-specific temp (staged) and NOT yet at the
+		// final path (unpublished) when publish is invoked.
+		if _, err := os.Stat(tempPath); err != nil {
+			stagedAtPublish = false
+		} else {
+			stagedAtPublish = true
+		}
+		// Ownership of the FINAL path MUST already be durably journaled before publish.
+		view, ok, _ := corrosion.GetVMActiveOperation(ctx, s.db, "vm1")
+		if ok && view != nil && view.ActiveOperationID != "" {
+			entry, found, _ := s.opJournal.Read(view.ActiveOperationID)
+			if !found || entry.Artifacts["file_created_by_operation"] == "" {
+				ownershipMissingAtPublish = true
+			}
+		} else {
+			ownershipMissingAtPublish = true
+		}
+		return status.Error(codes.Internal, "forced publish failure")
+	}
+
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
+	})
+	if err == nil {
+		t.Fatal("expected the forced publish failure to surface as an RPC error")
+	}
+	if !publishCalled {
+		t.Fatal("publishQcow2 was never reached — staging/ownership ordering regressed")
+	}
+	if !stagedAtPublish {
+		t.Fatal("backing file was not staged at the op-specific temp when publish ran")
+	}
+	if ownershipMissingAtPublish {
+		t.Fatal("publish ran BEFORE ownership of the final path was journaled (the FIX-10 orphan window)")
+	}
+
+	// The FINAL path is reusable: it was never published, so it does not exist.
+	p, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+		t.Fatalf("final disk path must be absent/reusable after a pre-publish failure (stat err=%v)", statErr)
+	}
+	// No op-specific staging temp left behind.
+	matches, _ := filepath.Glob(p + ".creating.*")
+	if len(matches) != 0 {
+		t.Fatalf("rollback must delete the op-specific staging temp; leftover: %v", matches)
+	}
+	// The barrier is cleared (op reached a clean terminal failure).
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("mutation barrier not cleared after clean rollback: %q", vm.ActiveOperationID)
+	}
+
+	// Prove reusability end-to-end: a second attach with the SAME disk name succeeds.
+	publishQcow2Fn = orig // let the retry actually publish
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("second attach reusing the same disk name must succeed: %v", err)
+	}
+	if _, statErr := os.Stat(p); statErr != nil {
+		t.Fatalf("second attach must publish the backing file at %s: %v", p, statErr)
+	}
+}
+
 // ── detach preserves the backing file ────────────────────────────────────────
 
 func TestDetachDevice_PreservesBackingFile(t *testing.T) {

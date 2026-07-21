@@ -612,15 +612,16 @@ func TestRecoverDiskAttach_Shutoff_RollsBack(t *testing.T) {
 	}
 }
 
-// TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact: file ownership is keyed
-// on the PRESENCE of the post-create journal artifact, never os.Stat. executeDiskAttach
-// records "file_created_by_operation" only AFTER exclusiveCreateQcow2 succeeds, so a
-// crash-before-create leaves no ownership claim and recovery never deletes a file this
-// op did not create.
+// TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact: final-path ownership is
+// keyed on the PRESENCE of the post-publish journal artifact, never os.Stat.
+// executeDiskAttach records "file_created_by_operation" only AFTER staging succeeds and
+// BEFORE publishing, and only for a final path it verified was free, so a crash that
+// aborts before publishing leaves no ownership claim over a pre-existing/foreign file
+// and recovery never deletes it.
 func TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact(t *testing.T) {
-	// Case 1 (RED→GREEN): a crash in the create window + a FOREIGN file at the would-be
-	// path → the retained planned entry asserts NO ownership, and recovery does NOT
-	// delete the foreign file.
+	// Case 1 (RED→GREEN): a FOREIGN file already at the final path aborts the attach
+	// before it claims ownership → the retained planned entry asserts NO ownership, and
+	// recovery does NOT delete the foreign file.
 	t.Run("planned_stage_records_no_ownership_no_wrongful_delete", func(t *testing.T) {
 		s := hotplugDiskServer(t)
 		enableHardwareV2(t, s)
@@ -647,9 +648,9 @@ func TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact(t *testing.T) {
 		}
 
 		// Claim the barrier, then drive the REAL executeDiskAttach. The foreign file makes
-		// exclusiveCreateQcow2 fail (the crash-before-create window); a stale spec
-		// generation makes the terminal-failure CAS not apply, so the PLANNED journal
-		// entry + barrier are RETAINED for recovery — the state a real crash leaves.
+		// the pre-staging final-path check fail (before any ownership is journaled); a
+		// stale spec generation makes the terminal-failure CAS not apply, so the PLANNED
+		// journal entry + barrier are RETAINED for recovery — the state a real crash leaves.
 		opID := "own-vm1-attach"
 		reqHash := attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"})
 		op := corrosion.OperationRecord{
@@ -736,6 +737,74 @@ func TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact(t *testing.T) {
 			t.Fatalf("op state = %q, want failed", state)
 		}
 	})
+}
+
+// TestRecoverDiskAttach_StagedTempCleaned: a disk attach that crashed AFTER staging
+// the backing file at its op-specific temp but BEFORE publishing to the final path
+// leaves a PLANNED journal entry carrying "creating_temp" (the staged path) and NO
+// "file_created_by_operation" (ownership of the final path is never journaled before
+// publish). Recovery must delete the op-specific temp (always safe — unique to this
+// op), leave the FINAL path free (it was never published), and terminally resolve the
+// op (barrier cleared). The current code has no creating_temp handling → the staged
+// temp is leaked forever.
+func TestRecoverDiskAttach_StagedTempCleaned(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running") // vm.State survives a host reboot as "running"
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown) // the domain is POSITIVELY shut off
+	fake.SetInactiveXML("vm1", rootOnlyDomainXML("vm1"))
+
+	// The crash left the backing file only at the OP-SPECIFIC temp; the FINAL path was
+	// never published (never linked). opID is deterministic in beginWedgedDeviceOp.
+	opID := "wedged-vm1-" + string(corrosion.OpDeviceAttach)
+	finalPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	tempPath := finalPath + ".creating." + opID
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(tempPath, []byte("staged, not yet published"), 0o644); err != nil {
+		t.Fatalf("write staged temp: %v", err)
+	}
+
+	gotOpID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{
+			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+			"prior_inactive_xml": rootOnlyDomainXML("vm1"),
+			"creating_temp":      tempPath, // staged, ownership of the final NOT yet journaled
+		})
+	if gotOpID != opID {
+		t.Fatalf("opID mismatch: got %q want %q (temp-path derivation would be wrong)", gotOpID, opID)
+	}
+
+	s.RecoverHardwareOperations(ctx)
+
+	// The op-specific temp is deleted (always safe — unique to this op).
+	if _, statErr := os.Stat(tempPath); !os.IsNotExist(statErr) {
+		t.Fatalf("recovery must delete the staged op-specific temp %s (stat err=%v)", tempPath, statErr)
+	}
+	// The FINAL path is free (never published) → the disk name is reusable.
+	if _, statErr := os.Stat(finalPath); !os.IsNotExist(statErr) {
+		t.Fatalf("final path must be free after recovering an unpublished attach (stat err=%v)", statErr)
+	}
+	// The op is terminally resolved and the barrier cleared.
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared after recovery: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed (rolled back)", state)
+	}
+	if _, found, _ := s.opJournal.Read(opID); found {
+		t.Fatal("journal entry must be cleared after a completed rollback")
+	}
 }
 
 // TestRecoverDeviceLeases_SkipsDeviceOps confirms RecoverDeviceLeases leaves

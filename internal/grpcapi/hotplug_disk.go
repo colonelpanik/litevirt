@@ -200,32 +200,54 @@ func (s *Server) appendOpStepFacts(ctx context.Context, opID string, ownerEpoch 
 	}
 }
 
-// ── exclusive backing-file create ───────────────────────────────────────────
+// ── staged backing-file create + publish ────────────────────────────────────
 
-// exclusiveCreateQcow2 creates a new qcow2 at path such that a PRE-EXISTING file is
-// never modified: it fails fast if the target already exists, creates into a temp
-// file, then publishes it with a hardlink (which fails EEXIST if the final path
-// materialized in the race window), so the publish is atomic AND exclusive. Returns
-// an error without leaving a partial file on any failure.
-func exclusiveCreateQcow2(path string, sizeBytes uint64) error {
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("backing file already exists at %s; refusing to overwrite", path)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat %s: %w", path, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+// The backing file is created in TWO steps so the FINAL disk path is never occupied
+// until AFTER this operation has durably journaled that it owns it:
+//   - stageQcow2 creates the qcow2 at an OP-SPECIFIC temp path (never the final);
+//   - publishQcow2 links the staged temp onto the final path (fails EEXIST if the
+//     final materialized meanwhile) and removes the temp.
+//
+// executeDiskAttach journals "file_created_by_operation" (ownership of the final
+// path) BETWEEN these two steps, so every crash window leaves the final disk name
+// reusable: a crash before publish leaves at most the op-specific temp (which
+// recovery deletes via the "creating_temp" artifact), and a crash after publish
+// leaves the final holding the op's own — journaled-as-owned — file (which recovery
+// deletes). See executeDiskAttach for the barrier-safety argument.
+
+// stageQcow2 creates a new qcow2 at tempPath (an op-specific staging path, NOT the
+// final disk path). It does NOT stat or touch the final path. On any failure it
+// leaves no partial file at tempPath.
+func stageQcow2(tempPath string, sizeBytes uint64) error {
+	if err := os.MkdirAll(filepath.Dir(tempPath), 0o755); err != nil {
 		return fmt.Errorf("create disk dir: %w", err)
 	}
-	tmp := path + ".creating." + strconv.FormatInt(time.Now().UnixNano(), 16)
-	if err := qcow2.Create(tmp, sizeBytes, nil); err != nil {
-		os.Remove(tmp)
+	if err := qcow2.Create(tempPath, sizeBytes, nil); err != nil {
+		os.Remove(tempPath)
 		return fmt.Errorf("create backing file: %w", err)
 	}
-	if err := os.Link(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("publish backing file %s: %w", path, err)
+	return nil
+}
+
+// publishQcow2Fn is the seam through which executeDiskAttach publishes a staged
+// backing file, overridable in tests to model a crash/error in the publish step.
+var publishQcow2Fn = publishQcow2
+
+// publishQcow2 promotes a staged backing file to its final path WITHOUT modifying any
+// pre-existing file: it refuses if the final already exists, hardlinks the staged temp
+// onto the final path (os.Link also fails EEXIST if the final materialized in the race
+// window, so the publish is atomic AND exclusive), and removes the temp. On failure the
+// temp is left for the caller's rollback (failDeviceAttach) to clean.
+func publishQcow2(tempPath, finalPath string) error {
+	if _, err := os.Stat(finalPath); err == nil {
+		return fmt.Errorf("backing file already exists at %s; refusing to overwrite", finalPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", finalPath, err)
 	}
-	os.Remove(tmp)
+	if err := os.Link(tempPath, finalPath); err != nil {
+		return fmt.Errorf("publish backing file %s: %w", finalPath, err)
+	}
+	os.Remove(tempPath)
 	return nil
 }
 
@@ -430,19 +452,39 @@ type attachRollback struct {
 	newGen      int64
 	diskName    string
 	diskPath    string
+	tempPath    string // op-specific staging path (always safe to delete — unique to this op)
 	targetDev   string
 	running     bool
-	journaled   bool // durable plan recorded (file_created_by_operation added post-create)
-	fileCreated bool // this op exclusively created the backing file
+	journaled   bool // durable plan recorded (file_created_by_operation added post-stage, pre-publish)
+	fileCreated bool // this op published the backing file onto the final disk path
 	attached    bool // live attach succeeded (running path)
 	rowWritten  bool // vm_disks row inserted
 }
 
-// executeDiskAttach realizes the attach DAG under the lock: journal the plan →
-// exclusive-create the backing file → (running) live attach then commit the row, or
-// (stopped) commit the row then reconcile the inactive definition → verify terminal
-// membership → CompleteVMOperation. Any failure routes to failDeviceAttach, which
-// rolls back directionally.
+// executeDiskAttach realizes the attach DAG under the lock: journal the plan → stage
+// the backing file at an op-specific temp → journal ownership of the FINAL path →
+// publish (link temp→final) → (running) live attach then commit the row, or (stopped)
+// commit the row then reconcile the inactive definition → verify terminal membership →
+// CompleteVMOperation. Any failure routes to failDeviceAttach, which rolls back
+// directionally.
+//
+// Crash-safety invariant — the FINAL disk path is NEVER published until AFTER this op
+// has journaled that it owns it ("file_created_by_operation"). Every crash window
+// therefore leaves the final disk name reusable:
+//   - crash BEFORE publish (any point up to publishQcow2): the file exists only at the
+//     op-specific temp (or not at all); the final path is untouched → reusable.
+//     Recovery deletes the op-temp via the "creating_temp" artifact (op-specific →
+//     unambiguously safe). Ownership-of-final may already be journaled, but the final
+//     is absent → the rollback's os.Remove is a no-op.
+//   - crash AFTER publish: the final holds this op's file and ownership is journaled →
+//     recovery deletes it. Safe because the operation BARRIER (active_operation_id, set
+//     by BeginVMOperation, cleared only by recovery's terminal Complete/Fail) blocks any
+//     retry AttachDevice for this VM until recovery resolves, so no other op can have
+//     created a competing file at this VM-scoped disk path.
+//
+// This preserves FIX-2's no-wrongful-delete: a planned/unowned entry carries no
+// "file_created_by_operation" → recovery never deletes the final path, and an
+// op-specific temp can never be a foreign file.
 func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, spec *pb.DiskSpec, bus, diskPath string,
 	sizeBytes uint64, sizeBytesSigned int64, targetDev, opID string, epoch, newGen int64, running bool) (*pb.VM, error) {
 
@@ -451,12 +493,18 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepReserved)
 
+	// The backing file is staged at an op-specific temp (deterministic from opID so it
+	// can collide neither with a retry under a different opID nor with the final path)
+	// and published only after ownership of the final path is journaled (below).
+	tempPath := diskPath + ".creating." + opID
+
 	// Journal the plan BEFORE the irreversible file-create/attach so a crash recovers.
-	// The plan carries everything recovery needs to compensate EXCEPT the file-ownership
-	// assertion: "file_created_by_operation" is recorded ONLY after exclusiveCreateQcow2
-	// succeeds (below), so a crash before the create leaves no ownership claim and
-	// recovery — which keys ownership on the PRESENCE of that post-create artifact, not
-	// os.Stat — can never delete a file this op did not create.
+	// The plan records "creating_temp" (the op-specific staging path — ALWAYS safe for
+	// recovery to delete) but NOT "file_created_by_operation": ownership of the FINAL
+	// path is recorded only after staging + before publish (below), so a crash before
+	// publish leaves no ownership claim and recovery — which keys final-path ownership
+	// on the PRESENCE of that artifact, not os.Stat — can never delete a file this op
+	// did not create.
 	priorActive, _ := s.virt.DumpXML(vm.Name)
 	priorInactive, _ := s.virt.DumpXMLInactive(vm.Name)
 	entry := opjournal.Entry{
@@ -470,6 +518,7 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 			"disk_name":              spec.Name,
 			"target_dev":             targetDev,
 			"bus":                    bus,
+			"creating_temp":          tempPath,
 			"prior_active_xml":       priorActive,
 			"prior_inactive_xml":     priorInactive,
 			"member_active_before":   strconv.FormatBool(diskDevInXML(priorActive, targetDev)),
@@ -486,28 +535,49 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 		rb.journaled = true
 	}
 
-	// Exclusive-create the backing file (an existing path fails WITHOUT modifying it).
-	if err := exclusiveCreateQcow2(diskPath, sizeBytes); err != nil {
-		// Nothing op-owned to delete (pre-existing file, or create cleaned its temp).
-		return s.failDeviceAttach(ctx, rb, codes.FailedPrecondition, err)
+	// Refuse a pre-existing FINAL path before staging/claiming — the disk name is the
+	// identity, and a stat here fails fast WITHOUT touching that file. This runs AFTER
+	// the planned journal (so a crash here still leaves a retained planned entry with NO
+	// ownership → recovery never deletes the pre-existing/foreign file), and BEFORE the
+	// ownership journal (so this op never claims ownership of an already-occupied path).
+	if _, err := os.Stat(diskPath); err == nil {
+		return s.failDeviceAttach(ctx, rb, codes.FailedPrecondition,
+			fmt.Errorf("backing file already exists at %s; refusing to overwrite", diskPath))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return s.failDeviceAttach(ctx, rb, codes.Internal, fmt.Errorf("stat %s: %w", diskPath, err))
 	}
-	rb.fileCreated = true
-	// The backing file now EXISTS and is exclusively this op's — record ownership
-	// durably by re-writing the journal entry (same OperationID → opjournal.Write
-	// overwrites atomically via temp+rename). Recovery derives file ownership from the
-	// presence of this artifact, so the rollback delete only ever targets an op-created
-	// file. The window between create success and this re-write can leak a benign
-	// unclaimed file on a crash (reclaimed by the crash-safety sweep) — never a wrongful
-	// delete, the sanctioned safe direction.
+
+	// Stage the backing file at the op-specific temp (NOT the final path yet).
+	if err := stageQcow2(tempPath, sizeBytes); err != nil {
+		// Nothing published; stageQcow2 cleaned its own partial, but record the temp for
+		// rollback in case a partial survived.
+		rb.tempPath = tempPath
+		return s.failDeviceAttach(ctx, rb, codes.Internal, err)
+	}
+	rb.tempPath = tempPath
+
+	// Record ownership of the FINAL path durably by re-writing the journal entry (same
+	// OperationID → opjournal.Write overwrites atomically via temp+rename) — BEFORE the
+	// file is published there. Recovery derives final-path ownership from the presence
+	// of this artifact, so its rollback delete only ever targets a path this op
+	// published.
 	if s.opJournal != nil {
 		entry.Stage = "claimed"
 		entry.Artifacts["file_created_by_operation"] = diskPath
 		if err := s.opJournal.Write(entry); err != nil {
-			// The file was created but ownership could not be durably recorded: roll back
-			// (rb.fileCreated=true → the just-created file is deleted) and fail cleanly.
+			// The temp is staged but ownership could not be recorded: roll back (rb.tempPath
+			// deletes the staged temp; the final was never published) and fail cleanly.
 			return s.failDeviceAttach(ctx, rb, codes.Unavailable, fmt.Errorf("journal file ownership: %w", err))
 		}
 	}
+
+	// Publish the staged file onto the final path — AFTER ownership is journaled.
+	if err := publishQcow2Fn(tempPath, diskPath); err != nil {
+		// The final was not published (rb.fileCreated stays false → recovery/rollback
+		// never deletes the final); rb.tempPath cleans the staged temp.
+		return s.failDeviceAttach(ctx, rb, codes.FailedPrecondition, err)
+	}
+	rb.fileCreated = true
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 
 	rec := corrosion.DiskRecord{
@@ -576,10 +646,12 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 
 // failDeviceAttach compensates a failed attach by rolling BACK (§8): inverse
 // live-detach the just-attached disk, soft-delete any committed row, restore the
-// prior inactive definition, and delete the backing file ONLY IF this operation
-// durably recorded that it created it (never a pre-existing path). If the rollback
-// fully completes it records a terminal failure + clears the barrier; otherwise the
-// operation is left NON-TERMINAL for recovery — never force-completed.
+// prior inactive definition, delete the published backing file ONLY IF this operation
+// durably recorded that it published it onto the final path (never a pre-existing
+// path), and ALWAYS delete the op-specific staging temp (unique to this op → never a
+// foreign file). If the rollback fully completes it records a terminal failure + clears
+// the barrier; otherwise the operation is left NON-TERMINAL for recovery — never
+// force-completed.
 func (s *Server) failDeviceAttach(ctx context.Context, rb attachRollback, code codes.Code, cause error) (*pb.VM, error) {
 	rolledBack := true
 
@@ -602,10 +674,20 @@ func (s *Server) failDeviceAttach(ctx context.Context, rb attachRollback, code c
 			}
 		}
 	}
-	// Delete the op-owned backing file — only when durably recorded as ours.
+	// Delete the published backing file — only when durably recorded as published by
+	// this op onto the final path (never a pre-existing/foreign file).
 	if rb.fileCreated && rb.journaled {
 		if err := os.Remove(rb.diskPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			slog.Error("disk attach rollback: remove op-owned file failed", "path", rb.diskPath, "error", err)
+			rolledBack = false
+		}
+	}
+	// ALWAYS delete the op-specific staging temp — it is unique to this op, so it can
+	// never be a foreign file; a pre-publish crash/failure leaves the backing file only
+	// here.
+	if rb.tempPath != "" {
+		if err := os.Remove(rb.tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Error("disk attach rollback: remove staging temp failed", "path", rb.tempPath, "error", err)
 			rolledBack = false
 		}
 	}

@@ -103,6 +103,7 @@ func TestRecoverHardwareOperations_AttachRollsBack(t *testing.T) {
 		map[string]string{
 			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
 			"file_created_by_operation": diskPath,
+			"published":                 "true", // op reached the durable published stage before the crash
 			"prior_inactive_xml":        rootOnlyDomainXML("vm1"),
 		})
 
@@ -586,6 +587,7 @@ func TestRecoverDiskAttach_Shutoff_RollsBack(t *testing.T) {
 		map[string]string{
 			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
 			"file_created_by_operation": diskPath,
+			"published":                 "true", // op reached the durable published stage before the crash
 		})
 
 	s.RecoverHardwareOperations(ctx)
@@ -692,8 +694,9 @@ func TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact(t *testing.T) {
 		}
 	})
 
-	// Case 2 (guard): once the post-create ownership artifact IS present, the op-owned
-	// backing file IS deleted on rollback — the fix must not disable legitimate cleanup.
+	// Case 2 (guard): once ownership is PROVEN (the durable "published" stage), the
+	// op-owned backing file IS deleted on rollback — FIX-12 must not disable legitimate
+	// cleanup, only require proof of publication rather than the intended-final artifact alone.
 	t.Run("post_create_ownership_artifact_deletes_op_owned_file", func(t *testing.T) {
 		s := hotplugDiskServer(t)
 		enableHardwareV2(t, s)
@@ -717,7 +720,8 @@ func TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact(t *testing.T) {
 			map[string]string{
 				"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
 				"prior_inactive_xml":        rootOnlyDomainXML("vm1"),
-				"file_created_by_operation": diskPath, // ownership recorded post-create
+				"file_created_by_operation": diskPath, // intended final
+				"published":                 "true",   // durable published proof (post-FIX-12: presence alone is not ownership)
 			})
 
 		s.RecoverHardwareOperations(ctx)
@@ -737,6 +741,187 @@ func TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact(t *testing.T) {
 			t.Fatalf("op state = %q, want failed", state)
 		}
 	})
+}
+
+// TestRecoverDiskAttach_CrashBeforeLink_ForeignFileNotDeleted proves FIX-12: the mere
+// PRESENCE of "file_created_by_operation" (the INTENDED final path, journaled at the
+// claimed stage BEFORE the os.Link) is NOT proof this op published the final file. A
+// crash after that claimed journal but before the link, followed by a FOREIGN file (a
+// DIFFERENT inode) appearing at the final path, must NOT delete the foreign file: there
+// is no durable "published" stage and the op's temp is absent, so os.SameFile cannot
+// prove co-ownership. RED against the pre-fix presence heuristic (which deletes the
+// foreign file) → GREEN.
+func TestRecoverDiskAttach_CrashBeforeLink_ForeignFileNotDeleted(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running") // vm.State survives a host reboot as "running"
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown) // domain positively shut off
+	fake.SetInactiveXML("vm1", rootOnlyDomainXML("vm1"))
+
+	opID := "wedged-vm1-" + string(corrosion.OpDeviceAttach)
+	finalPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	tempPath := finalPath + ".creating." + opID
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// A FOREIGN file (a different inode than this op's never-created temp) sits at the
+	// final path. The op's temp is ABSENT — the crash happened before the link.
+	const foreign = "FOREIGN FILE — a different inode; not linked by this operation"
+	if err := os.WriteFile(finalPath, []byte(foreign), 0o644); err != nil {
+		t.Fatalf("write foreign file: %v", err)
+	}
+
+	gotOpID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{
+			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+			"prior_inactive_xml":        rootOnlyDomainXML("vm1"),
+			"creating_temp":             tempPath,  // intended staging path (op's temp — absent)
+			"file_created_by_operation": finalPath, // intended final — journaled BEFORE the link
+			// NO "published": the op crashed before the durable published stage.
+		})
+	if gotOpID != opID {
+		t.Fatalf("opID mismatch: got %q want %q", gotOpID, opID)
+	}
+
+	s.RecoverHardwareOperations(ctx)
+
+	// The foreign file MUST survive untouched — this op never proved it published final.
+	if _, statErr := os.Stat(finalPath); statErr != nil {
+		t.Fatalf("recovery wrongly deleted a foreign file at the final path (stat err=%v)", statErr)
+	}
+	if b, _ := os.ReadFile(finalPath); string(b) != foreign {
+		t.Fatalf("recovery modified/replaced the foreign file: %q", string(b))
+	}
+	// Recovery still converged the op (rolled back everything it DID own): barrier cleared,
+	// op terminally failed.
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared after recovery: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
+}
+
+// TestRecoverDiskAttach_PublishedStage_DeletesFinal: a wedged attach whose journal
+// carries the durable "published" stage (the op linked its file onto the final path and
+// recorded that proof) rolls back by DELETING the final file — the published stage is
+// conclusive ownership even after the staging temp was removed.
+func TestRecoverDiskAttach_PublishedStage_DeletesFinal(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown)
+	fake.SetInactiveXML("vm1", rootOnlyDomainXML("vm1"))
+
+	finalPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(finalPath, []byte("op-published"), 0o644); err != nil {
+		t.Fatalf("write op file: %v", err)
+	}
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{
+			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+			"prior_inactive_xml":        rootOnlyDomainXML("vm1"),
+			"file_created_by_operation": finalPath,
+			"published":                 "true", // durable published proof (temp already removed)
+		})
+
+	s.RecoverHardwareOperations(ctx)
+
+	if _, statErr := os.Stat(finalPath); !os.IsNotExist(statErr) {
+		t.Fatalf("rollback must delete the op-published final file (stat err=%v)", statErr)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
+}
+
+// TestRecoverDiskAttach_LinkedNotYetPublished_SameInode_DeletesFinal: a wedged attach
+// that linked its staged temp onto the final path (temp and final are the SAME inode)
+// but crashed BEFORE the durable "published" stage. The claimed journal carries
+// creating_temp + file_created_by_operation but no published marker; recovery proves
+// ownership via os.SameFile(temp, final) and deletes both the final and the temp.
+func TestRecoverDiskAttach_LinkedNotYetPublished_SameInode_DeletesFinal(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown)
+	fake.SetInactiveXML("vm1", rootOnlyDomainXML("vm1"))
+
+	opID := "wedged-vm1-" + string(corrosion.OpDeviceAttach)
+	finalPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	tempPath := finalPath + ".creating." + opID
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// The op staged its temp and LINKED it onto final (both are now the same inode) — the
+	// crash-window state between os.Link and the durable published journal.
+	if err := os.WriteFile(tempPath, []byte("staged+linked"), 0o644); err != nil {
+		t.Fatalf("write staged temp: %v", err)
+	}
+	if err := os.Link(tempPath, finalPath); err != nil {
+		t.Fatalf("link temp->final: %v", err)
+	}
+
+	gotOpID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{
+			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+			"prior_inactive_xml":        rootOnlyDomainXML("vm1"),
+			"creating_temp":             tempPath,
+			"file_created_by_operation": finalPath,
+			// NO "published": crashed in the link→published-journal window.
+		})
+	if gotOpID != opID {
+		t.Fatalf("opID mismatch: got %q want %q", gotOpID, opID)
+	}
+
+	s.RecoverHardwareOperations(ctx)
+
+	if _, statErr := os.Stat(finalPath); !os.IsNotExist(statErr) {
+		t.Fatalf("SameFile proof must let rollback delete the linked final (stat err=%v)", statErr)
+	}
+	if _, statErr := os.Stat(tempPath); !os.IsNotExist(statErr) {
+		t.Fatalf("rollback must also delete the op-specific staging temp (stat err=%v)", statErr)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
 }
 
 // TestRecoverDiskAttach_StagedTempCleaned: a disk attach that crashed AFTER staging
@@ -1128,6 +1313,7 @@ func TestRecoverHardwareOperations_HostRebootAttachTakesStoppedPath(t *testing.T
 		map[string]string{
 			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
 			"file_created_by_operation": diskPath,
+			"published":                 "true", // op reached the durable published stage before the crash
 		})
 
 	s.RecoverHardwareOperations(ctx)

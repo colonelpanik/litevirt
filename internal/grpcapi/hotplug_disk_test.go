@@ -574,6 +574,30 @@ func TestDiskAttach_FailBeforePublish_FinalPathReusable(t *testing.T) {
 	}
 }
 
+// TestDiskAttach_HappyPath_LeavesNoTemp: a normal successful attach publishes the final
+// backing file and, after the durable "published" journal stage, removes the op-specific
+// staging temp — so the final is present and NO ".creating.*" temp is left behind.
+func TestDiskAttach_HappyPath_LeavesNoTemp(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	p, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("successful attach must leave the final backing file present: %v", err)
+	}
+	matches, _ := filepath.Glob(p + ".creating.*")
+	if len(matches) != 0 {
+		t.Fatalf("successful attach must remove the op-specific staging temp; leftover: %v", matches)
+	}
+}
+
 // ── detach preserves the backing file ────────────────────────────────────────
 
 func TestDetachDevice_PreservesBackingFile(t *testing.T) {

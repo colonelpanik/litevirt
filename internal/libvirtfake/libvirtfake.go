@@ -51,6 +51,7 @@ type Fake struct {
 	mu          sync.Mutex
 	domains     map[string]State
 	xml         map[string]string
+	activeXML   map[string]string              // domain → live-view override (see DumpXML)
 	snapshots   map[string]map[string]struct{} // domain → snapshot names
 	diskSources map[string]map[string]string   // domain → target-dev → source file
 	stats       map[string]*libvirt.DomainStats
@@ -64,6 +65,9 @@ type Fake struct {
 	// tests can assert exactly one libvirt attach/detach happened for one operation.
 	attachDiskN int
 	detachDiskN int
+	// attachNICN / detachNICN are the NIC-hotplug equivalent.
+	attachNICN int
+	detachNICN int
 
 	// Fail* hooks let scenarios inject failures into specific methods.
 	// Nil = default success.
@@ -73,14 +77,20 @@ type Fake struct {
 	// scenarios can exercise attach-rollback / detach-forward compensation.
 	FailAttachDisk func(domain, path, targetDev, bus string) error
 	FailDetachDisk func(domain, targetDev string) error
+	// FailAttachNIC / FailDetachNIC are the NIC-hotplug equivalent.
+	FailAttachNIC func(domain, bridge, model, mac string) error
+	FailDetachNIC func(domain, mac string) error
 	// SkipConfigOnDiskMutation, when true, makes AttachDisk/DetachDisk update ONLY the
 	// live view (diskSources) and NOT the persistent (inactive) config — modeling a
 	// libvirt DomainDeviceModifyLive-succeeded-but-Config-not-applied divergence so a
 	// both-state (live+persistent) verification can be exercised.
 	SkipConfigOnDiskMutation bool
-	FailShutdownDomain       func(name string) error
-	FailUndefineDomain       func(name string, removeStorage bool) error
-	FailUndefinePreserv      func(name string) error
+	// SkipConfigOnNICMutation is the NIC-hotplug equivalent: AttachNIC/DetachNIC
+	// update ONLY the live view (activeXML) and NOT the persistent (inactive) xml.
+	SkipConfigOnNICMutation bool
+	FailShutdownDomain      func(name string) error
+	FailUndefineDomain      func(name string, removeStorage bool) error
+	FailUndefinePreserv     func(name string) error
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -104,6 +114,7 @@ func New() *Fake {
 	return &Fake{
 		domains:     make(map[string]State),
 		xml:         make(map[string]string),
+		activeXML:   make(map[string]string),
 		snapshots:   make(map[string]map[string]struct{}),
 		diskSources: make(map[string]map[string]string),
 		stats:       make(map[string]*libvirt.DomainStats),
@@ -236,6 +247,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	defer f.mu.Unlock()
 	delete(f.domains, name)
 	delete(f.xml, name)
+	delete(f.activeXML, name)
 	delete(f.snapshots, name)
 	delete(f.stats, name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
@@ -254,6 +266,7 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	defer f.mu.Unlock()
 	delete(f.domains, name)
 	delete(f.xml, name)
+	delete(f.activeXML, name)
 	delete(f.snapshots, name)
 	delete(f.stats, name)
 	f.record("undefine", name, "keep_state=true")
@@ -335,7 +348,27 @@ func (f *Fake) ListDomains() ([]string, error) {
 	return out, nil
 }
 
+// DumpXML returns the domain's LIVE view: activeXML's override when NIC hotplug (or
+// SetActiveXML) has diverged it, else the persistent xml — the fake's historical
+// "single XML per domain" default (active mirrors persistent until something
+// diverges them). Disk hotplug's live view is tracked separately (diskSources) and
+// never touches activeXML, so this default is unaffected by disk attach/detach.
 func (f *Fake) DumpXML(name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if x, ok := f.activeXML[name]; ok {
+		return x, nil
+	}
+	if x, ok := f.xml[name]; ok {
+		return x, nil
+	}
+	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
+}
+
+// DumpXMLInactive returns the domain's PERSISTENT (inactive) view — what a cold boot
+// loads. Tests that need to model a post-pivot live/persistent divergence set them
+// explicitly via SetInactiveXML/SetActiveXML.
+func (f *Fake) DumpXMLInactive(name string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if x, ok := f.xml[name]; ok {
@@ -344,11 +377,23 @@ func (f *Fake) DumpXML(name string) (string, error) {
 	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
 }
 
-// DumpXMLInactive mirrors DumpXML for the fake — it stores a single XML per domain
-// (DefineDomain captures it), so the active and inactive configs are the same. Tests
-// that need to model a post-pivot live/persistent divergence set them explicitly.
-func (f *Fake) DumpXMLInactive(name string) (string, error) {
-	return f.DumpXML(name)
+// activeBaseline returns the current live-view baseline for domain: the tracked
+// override if one exists, else the persistent config. Caller holds f.mu.
+func (f *Fake) activeBaseline(domain string) string {
+	if x, ok := f.activeXML[domain]; ok {
+		return x
+	}
+	return f.xml[domain]
+}
+
+// SetActiveXML sets a domain's LIVE (active) XML directly, independent of its
+// persistent config — the NIC-hotplug divergence-modeling counterpart to
+// SetInactiveXML. A real running domain's live view always exists; this lets a
+// scenario seed it explicitly before exercising a live/persistent divergence.
+func (f *Fake) SetActiveXML(name, xml string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activeXML[name] = xml
 }
 
 // DefinedXML returns the last XML DefineDomain captured for name, or "" if the
@@ -507,17 +552,122 @@ func (f *Fake) DetachDiskCount() int {
 	defer f.mu.Unlock()
 	return f.detachDiskN
 }
+
+// AttachNIC hot-attaches a NIC to domainName, tracking both the live view
+// (activeXML — ALWAYS updated, mirroring a real live attach landing immediately)
+// and, unless SkipConfigOnNICMutation models a live-succeeded-but-config-not-
+// applied divergence, the persistent view (xml) too — the real AttachNIC applies
+// DomainDeviceModifyLive|Config.
 func (f *Fake) AttachNIC(domainName, bridge, model, mac string) error {
+	if f.FailAttachNIC != nil {
+		if err := f.FailAttachNIC(domainName, bridge, model, mac); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.activeXML[domainName] = insertNICIntoDomainXML(f.activeBaseline(domainName), domainName, bridge, model, mac)
+	if !f.SkipConfigOnNICMutation {
+		f.xml[domainName] = insertNICIntoDomainXML(f.xml[domainName], domainName, bridge, model, mac)
+	}
+	f.attachNICN++
 	f.record("attach-nic", domainName, fmt.Sprintf("bridge=%s mac=%s", bridge, mac))
 	return nil
 }
+
+// DetachNIC hot-detaches a NIC from domainName by MAC, mirroring AttachNIC's
+// live/persistent tracking split.
 func (f *Fake) DetachNIC(domainName, mac string) error {
+	if f.FailDetachNIC != nil {
+		if err := f.FailDetachNIC(domainName, mac); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.activeXML[domainName] = removeNICFromDomainXML(f.activeBaseline(domainName), mac)
+	if !f.SkipConfigOnNICMutation {
+		f.xml[domainName] = removeNICFromDomainXML(f.xml[domainName], mac)
+	}
+	f.detachNICN++
 	f.record("detach-nic", domainName, "mac="+mac)
 	return nil
+}
+
+// nicMacInDomainXML reports whether a domain XML carries an <interface> with the
+// given MAC address (case-insensitive — real libvirt normalizes MAC case, and
+// callers may supply either). Mirrors grpcapi.nicMacInXML — the substring the
+// hotplug NIC membership verification keys off.
+func nicMacInDomainXML(domainXML, mac string) bool {
+	if domainXML == "" || mac == "" {
+		return false
+	}
+	lx := strings.ToLower(domainXML)
+	lm := strings.ToLower(mac)
+	return strings.Contains(lx, "address='"+lm+"'") || strings.Contains(lx, `address="`+lm+`"`)
+}
+
+// insertNICIntoDomainXML adds an <interface> element carrying the given MAC to a
+// domain's XML, synthesizing a minimal skeleton when the domain has no XML yet.
+// Idempotent: an already-present MAC is left untouched.
+func insertNICIntoDomainXML(domainXML, domainName, bridge, model, mac string) string {
+	if domainXML == "" {
+		domainXML = "<domain type='kvm'><name>" + domainName + "</name><devices></devices></domain>"
+	}
+	if nicMacInDomainXML(domainXML, mac) {
+		return domainXML
+	}
+	iface := "<interface type='bridge'><source bridge='" + bridge + "'/>" +
+		"<mac address='" + mac + "'/><model type='" + model + "'/></interface>"
+	if strings.Contains(domainXML, "</devices>") {
+		return strings.Replace(domainXML, "</devices>", iface+"</devices>", 1)
+	}
+	return domainXML + iface
+}
+
+// removeNICFromDomainXML removes the <interface>…</interface> element whose <mac
+// address> matches mac from a domain's XML, leaving any other interfaces intact.
+// Case-insensitive matching mirrors nicMacInDomainXML; indices are computed on a
+// lower-cased copy but sliced from the original (ASCII-only XML, so byte offsets
+// align) to preserve the original text's casing.
+func removeNICFromDomainXML(domainXML, mac string) string {
+	if domainXML == "" {
+		return domainXML
+	}
+	lm := strings.ToLower(mac)
+	needleA := "address='" + lm + "'"
+	needleB := `address="` + lm + `"`
+	lx := strings.ToLower(domainXML)
+	from := 0
+	for {
+		rel := strings.Index(lx[from:], "<interface")
+		if rel < 0 {
+			return domainXML
+		}
+		start := from + rel
+		endRel := strings.Index(lx[start:], "</interface>")
+		if endRel < 0 {
+			return domainXML
+		}
+		end := start + endRel + len("</interface>")
+		if block := lx[start:end]; strings.Contains(block, needleA) || strings.Contains(block, needleB) {
+			return domainXML[:start] + domainXML[end:]
+		}
+		from = end
+	}
+}
+
+// AttachNICCount / DetachNICCount return how many times the NIC hot-plug primitives
+// have been invoked — test accessors for at-most-once assertions.
+func (f *Fake) AttachNICCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attachNICN
+}
+func (f *Fake) DetachNICCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.detachNICN
 }
 func (f *Fake) AttachHostdev(domainName, pciAddress string) error {
 	f.mu.Lock()

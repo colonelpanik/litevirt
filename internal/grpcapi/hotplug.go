@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -10,10 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
 
@@ -33,10 +29,11 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 	if err := s.RequirePerm(ctx, vmRBACPath(vmRec), "vm.update", "operator"); err != nil {
 		return nil, err
 	}
-	// Disk attach is journaled, stopped-capable, and at-most-once (Task 5.2b): it
-	// owns its forward decision, the operation_protocol_v1/hardware_v2 gates, and
-	// the crash-safe DAG. The NIC/PCI paths below keep their running-only behavior
-	// until Task 5.2c converts them onto the same machinery.
+	// Disk and NIC attach are journaled, stopped-capable, and at-most-once (Tasks
+	// 5.2b/5.2c): each owns its forward decision, the operation_protocol_v1/
+	// hardware_v2 gates, and the crash-safe DAG, and records its own
+	// device.attached event at the owner level (not duplicated here). The PCI path
+	// below keeps its running-only behavior until Task 5.2d converts it.
 	if req.Disk != nil {
 		out, err := s.attachDiskEntry(ctx, req, vmRec)
 		if err != nil {
@@ -45,16 +42,10 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 		s.recordVMEvent(ctx, req.VmName, "device.attached", "ok", "disk "+req.Disk.Name)
 		return out, nil
 	}
-	// For a NIC attach, ensure the target network is provisioned on the VM's
-	// host *before* we plug into its bridge. CreateNetwork only provisions on
-	// the host it ran on; the network record may not have replicated to the
-	// VM's host yet. This host (where the request first landed) typically holds
-	// the record, so push a provision to the VM's host from here — otherwise
-	// attachNIC there finds no local record and the attach fails with a cryptic
-	// libvirt "Cannot get interface MTU on '<net>': No such device".
-	if req.Nic != nil && req.Nic.Name != "" && vmRec.HostName != s.hostName {
-		s.provisionNetworkOnRemote(ctx, vmRec.HostName, req.Nic.Name)
+	if req.Nic != nil {
+		return s.attachNICEntry(ctx, req, vmRec)
 	}
+
 	if vmRec.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vmRec.HostName)
 		if err != nil {
@@ -76,9 +67,6 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 		detail string
 	)
 	switch {
-	case req.Nic != nil:
-		out, err = s.attachNIC(ctx, req.VmName, req.Nic)
-		detail = "nic " + req.Nic.Name
 	case req.PciDevice != nil:
 		out, err = s.attachPCIDevice(ctx, req.VmName, req.PciDevice)
 		detail = "pci device"
@@ -108,8 +96,9 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 	if err := s.RequirePerm(ctx, vmRBACPath(vmRec), "vm.update", "operator"); err != nil {
 		return nil, err
 	}
-	// Disk detach is journaled, stopped-capable, and at-most-once (Task 5.2b); it
-	// owns its forward + gates. NIC/PCI keep running-only behavior until Task 5.2c.
+	// Disk and NIC detach are journaled, stopped-capable, and at-most-once (Tasks
+	// 5.2b/5.2c); each owns its forward + gates and records its own device.detached
+	// event at the owner level. PCI keeps running-only behavior until Task 5.2d.
 	if req.DiskName != "" {
 		out, err := s.detachDiskEntry(ctx, req, vmRec)
 		if err != nil {
@@ -118,6 +107,10 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 		s.recordVMEvent(ctx, req.VmName, "device.detached", "ok", "disk "+req.DiskName)
 		return out, nil
 	}
+	if req.NicMac != "" {
+		return s.detachNICEntry(ctx, req, vmRec)
+	}
+
 	if vmRec.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vmRec.HostName)
 		if err != nil {
@@ -139,9 +132,6 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 		detail string
 	)
 	switch {
-	case req.NicMac != "":
-		out, err = s.detachNIC(ctx, req.VmName, req.NicMac)
-		detail = "nic " + req.NicMac
 	case req.PciAddress != "":
 		out, err = s.detachPCIDevice(ctx, req.VmName, req.PciAddress)
 		detail = "pci " + req.PciAddress
@@ -153,66 +143,6 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 	}
 	s.recordVMEvent(ctx, req.VmName, "device.detached", "ok", detail)
 	return out, nil
-}
-
-func (s *Server) attachNIC(ctx context.Context, vmName string, spec *pb.NetworkAttachment) (*pb.VM, error) {
-	mac := spec.Mac
-	if mac == "" {
-		mac = libvirt.GenerateMAC()
-	}
-	bridge := resolveBridge(ctx, s.db, spec.Name)
-
-	// Ensure the bridge exists on this host — it may have been created
-	// on a different node. Provision locally if needed.
-	nr, _ := corrosion.GetNetwork(ctx, s.db, spec.Name)
-	if nr != nil && nr.Config != "" {
-		var def compose.NetworkDef
-		if json.Unmarshal([]byte(nr.Config), &def) == nil {
-			def.Type = nr.Type
-			if def.Interface == "" {
-				def.Interface = spec.Name
-			}
-			localIP := getLocalIP()
-			if _, err := network.SafeProvision(ctx, s.db, spec.Name, def, localIP, s.hostName); err != nil {
-				slog.Warn("attachNIC: failed to provision network locally", "network", spec.Name, "error", err)
-			} else if ferr := s.reconcileFirewallRequired(ctx); ferr != nil {
-				// Fail closed: don't attach a NIC onto a host-isolated network whose
-				// isolation drop hasn't applied (fail-open host reachability).
-				return nil, status.Errorf(codes.Internal,
-					"apply firewall after provisioning network %q: %v", spec.Name, ferr)
-			}
-		}
-	}
-
-	model := spec.Model
-	if model == "" {
-		model = "virtio"
-	}
-
-	if err := s.virt.AttachNIC(vmName, bridge, model, mac); err != nil {
-		return nil, status.Errorf(codes.Internal, "attach NIC: %v", err)
-	}
-
-	corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{
-		VMName:      vmName,
-		NetworkName: spec.Name,
-		MAC:         mac,
-	})
-
-	slog.Info("NIC attached", "vm", vmName, "network", spec.Name, "mac", mac)
-	s.publish("device.attached", vmName, "nic:"+mac)
-	return s.vmToProto(ctx, vmName)
-}
-
-func (s *Server) detachNIC(ctx context.Context, vmName, mac string) (*pb.VM, error) {
-	if err := s.virt.DetachNIC(vmName, mac); err != nil {
-		return nil, status.Errorf(codes.Internal, "detach NIC: %v", err)
-	}
-
-	corrosion.SoftDeleteInterfaceByMAC(ctx, s.db, vmName, mac)
-	slog.Info("NIC detached", "vm", vmName, "mac", mac)
-	s.publish("device.detached", vmName, "nic:"+mac)
-	return s.vmToProto(ctx, vmName)
 }
 
 func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.DeviceSpec) (*pb.VM, error) {

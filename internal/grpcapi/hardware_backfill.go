@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -14,6 +15,11 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/pci"
 )
+
+// hardwareBridgeInterval is how often RunHardwareBridge sweeps for legacy
+// vm_interfaces rows to materialize into vm_nics. It is a convergence net for the
+// rolling-upgrade window, not a hot path, so a coarse interval is deliberate.
+const hardwareBridgeInterval = 30 * time.Second
 
 // BackfillHardwareTables populates the v42 typed-hardware tables (vm_nics,
 // vm_disks.bus, vm_pci_intent) and the per-VM hardware-adoption state for every
@@ -50,6 +56,56 @@ func (s *Server) BackfillHardwareTables(ctx context.Context) error {
 		}
 		if adopted, reason := s.auditVMPCICompatibility(ctx, vm); !adopted {
 			slog.Info("hardware backfill: VM PCI adoption blocked", "vm", vm.Name, "reason", reason)
+		}
+	}
+	// CONTRACT h: the audit pass has classified every owned VM and populated the
+	// typed-hardware tables, so this node now reads hardware correctly across the
+	// transition. Mark it hardware_v2-advertise-ready (advertisedCapabilities gates
+	// on this via hardwareV2Ready). Set only on the success path — an early return
+	// above (the owned-VM listing failed) leaves the node not-ready, so it withholds
+	// hardware_v2 and cannot help latch it. Per-VM blocks do NOT withhold readiness:
+	// a blocked VM is recorded and fenced at its own mutation site, not a reason to
+	// keep the whole node from reading the tables it did populate.
+	s.hwV2Ready.Store(true)
+	return nil
+}
+
+// RunHardwareBridge is the continuous legacy→vm_nics bridge (CONTRACT: transition
+// convergence). On a coarse ticker it materializes vm_interfaces rows an OLD peer
+// writes during the rolling-upgrade window into vm_nics under the deterministic
+// (vm_name, mac) id, so the overlay converges toward vm_nics completeness. It is
+// strictly one-directional (never writes vm_interfaces) and therefore safe for old
+// peers, which ignore vm_nics; and idempotent/churn-free/non-regressing (see
+// corrosion.BridgeVMNICs), so running it repeatedly and on several new nodes
+// concurrently converges rather than forks. Runs until ctx is cancelled.
+func (s *Server) RunHardwareBridge(ctx context.Context) {
+	t := time.NewTicker(hardwareBridgeInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := s.hardwareBridgeOnce(ctx); err != nil {
+				slog.Warn("hardware bridge: pass failed", "error", err)
+			}
+		}
+	}
+}
+
+// hardwareBridgeOnce runs a single bridge pass over EVERY VM the node can see (not
+// just owned ones): an old peer that still writes only vm_interfaces owns its own
+// VMs, so scoping to owned VMs would defeat the bridge's purpose. Per-VM failures
+// are logged and the sweep continues (isolation); it returns an error only when the
+// VM listing itself fails. Idempotent — safe to call every tick.
+func (s *Server) hardwareBridgeOnce(ctx context.Context) error {
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return fmt.Errorf("hardware bridge: list VMs: %w", err)
+	}
+	for i := range vms {
+		if err := corrosion.BridgeVMNICs(ctx, s.db, vms[i].Name); err != nil {
+			slog.Warn("hardware bridge: NIC materialization failed", "vm", vms[i].Name, "error", err)
 		}
 	}
 	return nil

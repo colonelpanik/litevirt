@@ -341,6 +341,16 @@ type Server struct {
 	// advertisedCapabilities before the daemon wires this in, so the read must not race the
 	// write. Unset (nil) → never fenced.
 	watchdogFenced atomic.Pointer[func() bool]
+
+	// hwV2Ready is the CONTRACT h advertise-readiness flag: set at the END of a
+	// successful BackfillHardwareTables, once the audit pass has classified every
+	// owned VM and populated the typed-hardware tables. advertisedCapabilities
+	// withholds hardware_v2 until it is set (see hardwareV2Ready), so this node
+	// cannot help LATCH hardware_v2 cluster-wide before its own tables are populated
+	// — a premature latch would stop legacy dual-writes / enable stopped mutations
+	// fleet-wide while this node could still miss data. Stored atomically: the daemon
+	// sets it from the startup backfill goroutine while the Ping/HA paths read it.
+	hwV2Ready atomic.Bool
 }
 
 // SetDemotionUnfenced records whether a minority VIP demote failed with no verified
@@ -393,6 +403,16 @@ func (s *Server) advertisedCapabilities() []string {
 	}
 	if !s.enfCanonicalRegistry {
 		caps = withoutCapability(caps, capabilities.CanonicalRegistryV1)
+	}
+	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
+	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
+	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
+	// prerequisite for hardware mutations). Advertising earlier could let the fleet
+	// latch hardware_v2 — stopping legacy dual-writes / permitting stopped
+	// mutations — before this node's tables are populated, so a peer could miss
+	// data. "Advertise = this node reads correctly across the transition."
+	if !s.hardwareV2Ready() {
+		caps = withoutCapability(caps, capabilities.HardwareV2)
 	}
 	return caps
 }
@@ -482,6 +502,26 @@ func (s *Server) hardwareV2Latched(ctx context.Context) bool {
 		return false
 	}
 	return s.gate != nil && s.gate.Enforced(ctx, capabilities.HardwareV2)
+}
+
+// hardwareV2Ready reports whether this node may ADVERTISE hardware_v2 (CONTRACT h):
+// its BackfillHardwareTables audit pass has completed (hwV2Ready) AND it relies on
+// the operation_protocol_v1 prerequisite. It reads the op-protocol dependency via
+// the config kill-switch plus the CHEAP in-memory latch (gate.Latched) — never
+// gate.Enforced — because advertisedCapabilities is consulted from the Ping handler:
+// Enforced would drive an activation peer-Ping from inside a Ping, recursing through
+// advertisedCapabilities. Latched returns the SAME steady-state answer without any
+// network I/O and is strictly more conservative (true only once operation_protocol
+// has actually latched), which is the safe direction for withholding advertisement.
+// hardware_v2 has no config kill-switch of its own; readiness is its gate.
+func (s *Server) hardwareV2Ready() bool {
+	if !s.hwV2Ready.Load() {
+		return false
+	}
+	if !s.enfOperationProtocol {
+		return false
+	}
+	return s.gate != nil && s.gate.Latched(capabilities.OperationProtocolV1)
 }
 
 // SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.

@@ -230,6 +230,76 @@ func MergedVMNICs(ctx context.Context, c *Client, vmName string) ([]NICRecord, e
 	return out, nil
 }
 
+// BridgeVMNICs materializes vmName's legacy vm_interfaces rows (and their
+// tombstones) into the v42 vm_nics table, keyed by the deterministic (vm_name,
+// mac) id. It is the per-VM step of the continuous transition-window bridge (see
+// grpcapi.RunHardwareBridge): during a rolling upgrade an OLD peer still writes
+// ONLY vm_interfaces, and this mirrors those writes into vm_nics so the overlay
+// (MergedVMNICs) converges toward vm_nics completeness.
+//
+// It is strictly ONE-DIRECTIONAL (legacy → vm_nics; it NEVER writes vm_interfaces),
+// so it can never affect an old peer, which ignores vm_nics entirely.
+//
+// It is IDEMPOTENT, CHURN-FREE, and NEVER REGRESSES vm_nics: a legacy row is
+// mirrored only when the matching vm_nics row is ABSENT or STRICTLY OLDER
+// (lwwOrder < 0). Once mirrored, the newer vm_nics conflict key suppresses further
+// writes on subsequent passes, and a genuinely-newer vm_nics row (produced by a
+// hardware_v2 writer, or a later bridge pass) is left untouched. A tombstoned
+// legacy row tombstones a LIVE vm_nics counterpart; a tombstoned legacy row with no
+// live vm_nics counterpart is a no-op (nothing to converge).
+func BridgeVMNICs(ctx context.Context, c *Client, vmName string) error {
+	ifaces, err := GetVMNICsRaw(ctx, c, "vm_interfaces", vmName)
+	if err != nil {
+		return err
+	}
+	if len(ifaces) == 0 {
+		return nil
+	}
+	nics, err := GetVMNICsRaw(ctx, c, "vm_nics", vmName)
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]NICRecord, len(nics))
+	for _, n := range nics {
+		byID[n.ID] = n
+	}
+	for _, iface := range ifaces {
+		existing, have := byID[iface.ID]
+		// Never regress: a vm_nics row already at least as new as the legacy row is
+		// authoritative (a hardware_v2 writer, or a prior bridge pass) — skip.
+		if have && lwwOrder(existing.UpdatedAt, iface.UpdatedAt) >= 0 {
+			continue
+		}
+		if iface.DeletedAt == "" {
+			// Live legacy NIC → materialize into vm_nics. Fields come through
+			// GetVMNICsRaw's vm_interfaces projection (Model synthesized "virtio").
+			if err := UpsertNIC(ctx, c, NICRecord{
+				VMName:         iface.VMName,
+				ID:             iface.ID,
+				NetworkName:    iface.NetworkName,
+				Model:          iface.Model,
+				MAC:            iface.MAC,
+				Ordinal:        iface.Ordinal,
+				IP:             iface.IP,
+				TapDevice:      iface.TapDevice,
+				SecurityGroups: iface.SecurityGroups,
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		// Legacy row is a tombstone and newer than the vm_nics row: converge by
+		// tombstoning a LIVE counterpart. If none exists (or it is already
+		// tombstoned), there is nothing to converge.
+		if have && existing.DeletedAt == "" {
+			if err := TombstoneNIC(ctx, c, vmName, iface.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // ═══════════ PCI PASSTHROUGH: INTENT + REALIZATION ═══════════
 //
 // vm_pci_intent declares what a VM WANTS attached, expressed as a selector

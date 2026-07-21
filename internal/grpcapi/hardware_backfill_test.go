@@ -692,3 +692,181 @@ func TestBackfillHardwareTables_ConcreteMembersNoSpec(t *testing.T) {
 		}
 	}
 }
+
+// ── Bridge: continuous legacy vm_interfaces → vm_nics materialization ────────
+
+// liveNICs returns the LIVE (non-tombstoned) vm_nics rows for vm.
+func liveNICs(t *testing.T, s *Server, vm string) []corrosion.NICRecord {
+	t.Helper()
+	all, err := corrosion.GetVMNICsRaw(adminCtx(), s.db, "vm_nics", vm)
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw(vm_nics): %v", err)
+	}
+	var live []corrosion.NICRecord
+	for _, n := range all {
+		if n.DeletedAt == "" {
+			live = append(live, n)
+		}
+	}
+	return live
+}
+
+// TestHardwareBridge_MaterializesLegacyInterfaceIntoVMNics: an OLD peer that still
+// writes only vm_interfaces (never vm_nics) has its live NIC materialized into
+// vm_nics by one bridge pass, under the deterministic (vm_name, mac) id. The NIC is
+// already visible through the MergedVMNICs overlay BEFORE the bridge runs (the
+// overlay's job — a sanity check). The pass is idempotent: a second run rewrites
+// nothing (identical rows, same updated_at).
+func TestHardwareBridge_MaterializesLegacyInterfaceIntoVMNics(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	// A VM owned by a DIFFERENT host models an old peer's VM.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "old-peer", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	mac := "52:54:00:aa:bb:cc"
+	if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{
+		VMName: "vm1", NetworkName: "net0", Ordinal: 0, MAC: mac, IP: "10.0.0.5",
+	}); err != nil {
+		t.Fatalf("InsertInterface: %v", err)
+	}
+
+	// Sanity (late-write visibility): the overlay shows the legacy NIC even before
+	// the bridge materializes it into vm_nics.
+	pre, err := corrosion.MergedVMNICs(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("MergedVMNICs: %v", err)
+	}
+	if len(pre) != 1 || !strings.EqualFold(pre[0].MAC, mac) {
+		t.Fatalf("overlay must show the legacy NIC before materialization: %+v", pre)
+	}
+	if len(liveNICs(t, s, "vm1")) != 0 {
+		t.Fatal("vm_nics must be empty before the bridge runs")
+	}
+
+	// One bridge pass materializes it.
+	if err := s.hardwareBridgeOnce(ctx); err != nil {
+		t.Fatalf("hardwareBridgeOnce: %v", err)
+	}
+	live := liveNICs(t, s, "vm1")
+	if len(live) != 1 {
+		t.Fatalf("want 1 live vm_nics row after bridge, got %d: %+v", len(live), live)
+	}
+	if want := corrosion.DeterministicNICID("vm1", mac); live[0].ID != want {
+		t.Fatalf("vm_nics id = %q, want deterministic %q", live[0].ID, want)
+	}
+	if live[0].NetworkName != "net0" || live[0].IP != "10.0.0.5" || live[0].Model != "virtio" {
+		t.Fatalf("materialized fields mismatch: %+v", live[0])
+	}
+
+	// Idempotent: a second pass must not rewrite (same updated_at).
+	beforeTS := live[0].UpdatedAt
+	if err := s.hardwareBridgeOnce(ctx); err != nil {
+		t.Fatalf("hardwareBridgeOnce (2nd): %v", err)
+	}
+	live2 := liveNICs(t, s, "vm1")
+	if len(live2) != 1 || live2[0].UpdatedAt != beforeTS {
+		t.Fatalf("bridge not idempotent: beforeTS=%q after=%+v", beforeTS, live2)
+	}
+}
+
+// TestHardwareBridge_TombstonePropagatesToVMNics: after materialization, an old
+// peer tombstoning the vm_interfaces row (a NIC detach) is propagated to vm_nics by
+// the next bridge pass; the overlay then reports zero live NICs. Idempotent: a
+// further pass rewrites nothing (the vm_nics row is already tombstoned).
+func TestHardwareBridge_TombstonePropagatesToVMNics(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "old-peer", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	mac := "52:54:00:de:ad:be"
+	if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{
+		VMName: "vm1", NetworkName: "net0", Ordinal: 0, MAC: mac,
+	}); err != nil {
+		t.Fatalf("InsertInterface: %v", err)
+	}
+	if err := s.hardwareBridgeOnce(ctx); err != nil {
+		t.Fatalf("hardwareBridgeOnce (materialize): %v", err)
+	}
+	if len(liveNICs(t, s, "vm1")) != 1 {
+		t.Fatal("expected the NIC materialized into vm_nics")
+	}
+
+	// Old peer detaches → tombstones the legacy row only.
+	if err := corrosion.SoftDeleteInterfaceByMAC(ctx, s.db, "vm1", mac); err != nil {
+		t.Fatalf("SoftDeleteInterfaceByMAC: %v", err)
+	}
+	// Bridge propagates the tombstone to vm_nics.
+	if err := s.hardwareBridgeOnce(ctx); err != nil {
+		t.Fatalf("hardwareBridgeOnce (tombstone): %v", err)
+	}
+	if live := liveNICs(t, s, "vm1"); len(live) != 0 {
+		t.Fatalf("vm_nics NIC must be tombstoned after the legacy tombstone: %+v", live)
+	}
+	merged, err := corrosion.MergedVMNICs(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("MergedVMNICs: %v", err)
+	}
+	if len(merged) != 0 {
+		t.Fatalf("overlay must report 0 live NICs after tombstone: %+v", merged)
+	}
+
+	// Idempotent: another pass rewrites nothing.
+	rawBefore, _ := corrosion.GetVMNICsRaw(ctx, s.db, "vm_nics", "vm1")
+	if err := s.hardwareBridgeOnce(ctx); err != nil {
+		t.Fatalf("hardwareBridgeOnce (idempotent): %v", err)
+	}
+	rawAfter, _ := corrosion.GetVMNICsRaw(ctx, s.db, "vm_nics", "vm1")
+	if len(rawBefore) != 1 || len(rawAfter) != 1 || rawBefore[0].UpdatedAt != rawAfter[0].UpdatedAt {
+		t.Fatalf("tombstone bridge not idempotent: before=%+v after=%+v", rawBefore, rawAfter)
+	}
+}
+
+// TestHardwareBridge_DoesNotRegressNewerVMNics: the bridge must NEVER clobber a
+// vm_nics row that a hardware_v2 writer produced MORE RECENTLY than the legacy
+// vm_interfaces row (LWW guard). A stale legacy row must not overwrite a fresh
+// vm_nics row's fields.
+func TestHardwareBridge_DoesNotRegressNewerVMNics(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "old-peer", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	mac := "52:54:00:11:22:33"
+	// Stale legacy row (written first → older updated_at).
+	if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{
+		VMName: "vm1", NetworkName: "old-net", Ordinal: 0, MAC: mac, IP: "10.0.0.9",
+	}); err != nil {
+		t.Fatalf("InsertInterface: %v", err)
+	}
+	// A newer authoritative vm_nics row (as a hardware_v2 writer would produce),
+	// same deterministic id, different network.
+	id := corrosion.DeterministicNICID("vm1", mac)
+	if err := corrosion.UpsertNIC(ctx, s.db, corrosion.NICRecord{
+		VMName: "vm1", ID: id, NetworkName: "new-net", Model: "virtio", MAC: mac, Ordinal: 0, IP: "10.0.0.10",
+	}); err != nil {
+		t.Fatalf("UpsertNIC: %v", err)
+	}
+	beforeTS := liveNICs(t, s, "vm1")[0].UpdatedAt
+
+	if err := s.hardwareBridgeOnce(ctx); err != nil {
+		t.Fatalf("hardwareBridgeOnce: %v", err)
+	}
+	live := liveNICs(t, s, "vm1")
+	if len(live) != 1 {
+		t.Fatalf("want 1 vm_nics row, got %d: %+v", len(live), live)
+	}
+	if live[0].NetworkName != "new-net" || live[0].IP != "10.0.0.10" || live[0].UpdatedAt != beforeTS {
+		t.Fatalf("bridge regressed a newer vm_nics row with stale legacy data: %+v", live[0])
+	}
+}

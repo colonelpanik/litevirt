@@ -92,3 +92,70 @@ func TestHardwareV2Latched_NilGate(t *testing.T) {
 		t.Fatal("hardwareV2Latched must fail closed with a nil gate")
 	}
 }
+
+// TestAdvertiseHardwareV2_GatedOnBackfillReadiness (CONTRACT h): a node with
+// operation_protocol_v1 active must STILL withhold hardware_v2 from its advertised
+// capabilities until BackfillHardwareTables has completed its audit pass (the
+// hwV2Ready flag). Advertising earlier could let the fleet latch hardware_v2 — and
+// stop legacy dual-writes / permit stopped mutations — before this node's typed
+// tables are populated, so a peer could miss data.
+func TestAdvertiseHardwareV2_GatedOnBackfillReadiness(t *testing.T) {
+	s := testServer(t)
+	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}}
+	s.SetOperationProtocol(true)
+
+	// Before backfill: op-protocol active but readiness unset → NOT advertised.
+	if hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
+		t.Fatal("hardware_v2 must not be advertised before BackfillHardwareTables completes")
+	}
+	// Backfill (no owned VMs → the audit pass trivially completes) sets readiness.
+	if err := s.BackfillHardwareTables(adminCtx()); err != nil {
+		t.Fatalf("BackfillHardwareTables: %v", err)
+	}
+	if !hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
+		t.Fatal("hardware_v2 must be advertised once backfill completes with operation_protocol active")
+	}
+}
+
+// TestAdvertiseHardwareV2_RequiresOperationProtocol: readiness alone is not enough —
+// hardware_v2 hard-depends on operation_protocol_v1 (hardware mutations need the
+// crash-safe operation journal). Advertisement is withheld while the op-protocol
+// config kill-switch is off OR while op-protocol has not latched cluster-wide.
+func TestAdvertiseHardwareV2_RequiresOperationProtocol(t *testing.T) {
+	s := testServer(t)
+	if err := s.BackfillHardwareTables(adminCtx()); err != nil {
+		t.Fatalf("BackfillHardwareTables: %v", err)
+	}
+
+	// Readiness set, op-protocol LATCHED, but the config kill-switch is OFF.
+	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}}
+	if hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
+		t.Fatal("hardware_v2 must not be advertised while the operation_protocol config flag is off")
+	}
+
+	// Config on but op-protocol NOT latched cluster-wide.
+	s.SetOperationProtocol(true)
+	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: false}}
+	if hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
+		t.Fatal("hardware_v2 must not be advertised while operation_protocol is not latched")
+	}
+
+	// Both on → advertised.
+	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}}
+	if !hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
+		t.Fatal("hardware_v2 must be advertised with readiness + operation_protocol active")
+	}
+}
+
+// TestAdvertiseHardwareV2_NilGate: with a nil gate the op-protocol latch cannot be
+// confirmed, so hardware_v2 advertisement fails closed even after backfill.
+func TestAdvertiseHardwareV2_NilGate(t *testing.T) {
+	s := testServer(t)
+	if err := s.BackfillHardwareTables(adminCtx()); err != nil {
+		t.Fatalf("BackfillHardwareTables: %v", err)
+	}
+	s.SetOperationProtocol(true) // gate stays nil
+	if hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
+		t.Fatal("hardware_v2 must not be advertised with a nil gate (op-protocol unconfirmable)")
+	}
+}

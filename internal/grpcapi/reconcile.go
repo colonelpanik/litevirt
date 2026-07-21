@@ -23,10 +23,13 @@ import (
 //     hot-plugged disk is written only to vm_disks, so rebuilding from spec.Disks
 //     silently dropped it on redefine;
 //   - NICs from the vm_nics/vm_interfaces overlay (MergedVMNICs);
-//   - passthrough <hostdev>s from either the resolved PCI members the caller
-//     passes (one <hostdev> per member, aliased "ua-<device>-<member>") or, when
-//     resolved is nil, the authoritative host_pci_devices ownership rows —
-//     fail-closed on a device that has vanished from the host, mirroring UpdateVM.
+//   - passthrough <hostdev>s from the UNION of the intent-resolved PCI members
+//     (one <hostdev> per member, aliased "ua-<device>-<member>") and the
+//     ownership-only host_pci_devices rows whose BDF no intent covers (alias-less,
+//     matched by source address) — deduplicated by resolved concrete address so a
+//     device that carries both an intent AND an ownership row is emitted exactly
+//     once; fail-closed on an owned device that has vanished from the host,
+//     mirroring UpdateVM.
 //
 // Scalar config (cpu/mem/machine/firmware/SB/TPM/boot) still comes from the spec
 // blob; a scalar change is inherently a full topology regenerate and is NOT this
@@ -115,14 +118,23 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 		wantNICs = append(wantNICs, lv.WantNIC{MAC: n.MAC, Bridge: bridge, Model: model})
 	}
 
-	// ── Passthrough hostdevs ──
+	// ── Passthrough hostdevs: UNION of intent-resolved members and ownership-only ──
+	//
+	// The two device sources are NOT mutually exclusive. A VM can own a passthrough
+	// device via an OWNERSHIP row alone (CreateVM, or the legacy SR-IOV/type attach
+	// path, neither of which writes a vm_pci_intent) AND separately carry a
+	// journaled concrete-address intent for a DIFFERENT device. Resolving ONLY
+	// intents (as this path once did) silently DROPPED the ownership-only device
+	// from the persistent definition the next time an intent-branch reconcile ran —
+	// booting the guest without its GPU/NIC on the reconstruction path. So emit
+	// BOTH sets, deduplicated by resolved concrete address: a device that carries
+	// both an intent and an ownership row (the normal post-backfill state) is
+	// emitted exactly once, keeping its intent alias.
 	members := resolved
 	if members == nil {
-		// Dormant intent path: vm_pci_intent is not populated until Phase 6/7, so
-		// resolving from it now would yield an empty set and DROP every existing
-		// VM's passthrough devices. Only resolve intents when a VM actually HAS
-		// them; otherwise fall through to the ownership rows, which is the ACTIVE
-		// path this phase.
+		// vm_pci_intent is unpopulated for a VM that predates journaled attach, so
+		// resolving it would yield an empty set — only resolve when the VM actually
+		// HAS intents; otherwise the union is ownership-only (the pre-journal path).
 		intents, ierr := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
 		if ierr != nil {
 			return status.Errorf(codes.Internal, "read PCI intents for %q: %v", vm.Name, ierr)
@@ -138,7 +150,13 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 
 	var hostdevConfigs []lv.HostdevConfig
 	var wantHostdevs []lv.WantHostdev
-	ownershipHostdevs := false
+	// aliaslessHostdev records whether the emitted set includes an ownership-only
+	// (alias-less) <hostdev>; the alias-keyed patcher can't match those, so their
+	// presence forces a full regenerate below (as the pure-ownership path always did).
+	aliaslessHostdev := false
+	// coveredByIntent is the set of concrete addresses the intent members already
+	// emit, so an ownership row for the same BDF is not emitted a second time.
+	coveredByIntent := map[string]bool{}
 	if members != nil {
 		// Cardinality fail-closed: a persisted realization set whose member count no
 		// longer matches the resolver's output is hardware drift we refuse to paper
@@ -150,38 +168,46 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 			alias := "ua-" + m.DeviceID + "-" + m.MemberID
 			hostdevConfigs = append(hostdevConfigs, lv.HostdevConfig{Address: m.Address, Alias: alias})
 			wantHostdevs = append(wantHostdevs, lv.WantHostdev{Alias: alias, Address: m.Address})
-		}
-	} else {
-		// ACTIVE path: rebuild passthrough <hostdev>s from authoritative PCI
-		// ownership, fail-closed on a device the VM still owns that has vanished
-		// from the host (never boot the guest missing its passthrough hardware) —
-		// mirrors UpdateVM. These carry no user alias, matching today's redefine.
-		live, tombstoned, oerr := corrosion.VMDeviceOwnership(ctx, s.db, s.hostName, vm.Name)
-		if oerr != nil {
-			return status.Errorf(codes.Internal, "read PCI ownership for %q: %v", vm.Name, oerr)
-		}
-		if len(tombstoned) > 0 {
-			return status.Errorf(codes.FailedPrecondition,
-				"cannot redefine %q: assigned PCI device(s) %v have vanished from host %s; resolve the missing hardware before updating",
-				vm.Name, tombstoned, s.hostName)
-		}
-		ownershipHostdevs = true
-		for _, addr := range live {
-			hostdevConfigs = append(hostdevConfigs, lv.HostdevConfig{Address: addr})
-			wantHostdevs = append(wantHostdevs, lv.WantHostdev{Address: addr})
+			coveredByIntent[m.Address] = true
 		}
 	}
 
+	// Ownership-only devices: passthrough the VM owns per authoritative PCI
+	// ownership whose BDF no intent above already emits. This is the ACTIVE
+	// reconstruction path for a VM created before journaled attach AND the union
+	// member that keeps a MIXED VM (some devices owned-only, some journaled) from
+	// losing its owned-only hardware. Fail-closed on an owned device that has
+	// vanished from the host (never boot the guest missing its passthrough
+	// hardware) — mirrors UpdateVM. These carry no user alias, matching today's
+	// redefine (matched by source address, not alias).
+	live, tombstoned, oerr := corrosion.VMDeviceOwnership(ctx, s.db, s.hostName, vm.Name)
+	if oerr != nil {
+		return status.Errorf(codes.Internal, "read PCI ownership for %q: %v", vm.Name, oerr)
+	}
+	if len(tombstoned) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot redefine %q: assigned PCI device(s) %v have vanished from host %s; resolve the missing hardware before updating",
+			vm.Name, tombstoned, s.hostName)
+	}
+	for _, addr := range live {
+		if coveredByIntent[addr] {
+			continue // dedup: already emitted with its intent alias
+		}
+		hostdevConfigs = append(hostdevConfigs, lv.HostdevConfig{Address: addr})
+		wantHostdevs = append(wantHostdevs, lv.WantHostdev{Address: addr})
+		aliaslessHostdev = true
+	}
+
 	// ── Decide topology-preserving patch vs full regenerate ──
-	// PatchInactiveDevices keys hostdevs by their <alias>; ownership-derived
-	// hostdevs have none, so when such a VM already carries passthrough devices we
-	// full-regenerate (rebuilding them from ownership, exactly as UpdateVM does)
-	// rather than let the patcher delete the unmatched, alias-less <hostdev>s.
+	// PatchInactiveDevices keys hostdevs by their <alias>; ownership-only hostdevs
+	// have none, so when the emitted set includes any such device we full-regenerate
+	// (rebuilding the whole hostdev set, exactly as UpdateVM does) rather than let
+	// the alias-keyed patcher delete the unmatched, alias-less <hostdev>s.
 	priorXML := ""
 	if x, derr := s.virt.DumpXMLInactive(vm.Name); derr == nil {
 		priorXML = x
 	}
-	usePatch := priorXML != "" && !(ownershipHostdevs && len(hostdevConfigs) > 0)
+	usePatch := priorXML != "" && !aliaslessHostdev
 
 	var newXML string
 	if usePatch {

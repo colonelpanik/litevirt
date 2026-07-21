@@ -510,10 +510,11 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 	// Journal the plan BEFORE the irreversible file-create/attach so a crash recovers.
 	// The plan records "creating_temp" (the op-specific staging path — ALWAYS safe for
 	// recovery to delete) but NOT "file_created_by_operation": ownership of the FINAL
-	// path is recorded only after staging + before publish (below), so a crash before
-	// publish leaves no ownership claim and recovery — which keys final-path ownership
-	// on the PRESENCE of that artifact, not os.Stat — can never delete a file this op
-	// did not create.
+	// path is recorded only after staging + before publish (below). Recovery deletes the
+	// final path only when it can PROVE this op published it — the durable "published"
+	// stage, or the staged temp and the final path resolving to the same inode
+	// (os.SameFile) — so a crash before publish, or a foreign file later appearing at the
+	// path, is never mistaken for a file this op created.
 	priorActive, _ := s.virt.DumpXML(vm.Name)
 	priorInactive, _ := s.virt.DumpXMLInactive(vm.Name)
 	entry := opjournal.Entry{

@@ -101,8 +101,10 @@ func TestInsertVM_WithDisks(t *testing.T) {
 
 // TestInsertVMWithHardware_WritesNICsAndPCIIntents covers task 7.1: the extended
 // writer must land vm_nics + vm_pci_intent rows in the SAME atomic batch as the
-// vms/vm_interfaces row, and stamp hardware_adoption_state = "adopted" — a freshly
-// created VM never needs the Phase-6 backfill to run for it.
+// vms/vm_interfaces row, and — when the caller passes adopt=true (the CreateVM
+// path, which has just recorded this VM's complete hardware) — stamp
+// hardware_adoption_state = "adopted" so a freshly created VM never needs the
+// Phase-6 backfill to run for it.
 func TestInsertVMWithHardware_WritesNICsAndPCIIntents(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
@@ -118,7 +120,7 @@ func TestInsertVMWithHardware_WritesNICsAndPCIIntents(t *testing.T) {
 			SelectorKind: "address", SelectorPayload: `{"address":"0000:41:00.0"}`, ExclusiveKey: &excl},
 	}
 
-	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, intents); err != nil {
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, intents, true); err != nil {
 		t.Fatalf("InsertVMWithHardware: %v", err)
 	}
 
@@ -760,17 +762,18 @@ func TestHardwareAdoptionState(t *testing.T) {
 
 	InsertVM(ctx, c, VMRecord{Name: "vm-adopt", HostName: "h1", Spec: "{}", State: "running"}, nil, nil)
 
-	// InsertVM (via InsertVMWithHardware) now stamps 'adopted' unconditionally in
-	// the same batch as the row insert — a VM created through this path has its
-	// (possibly empty) hardware recorded atomically, so it never starts out
-	// 'pending' (the bare column default, still used only by the pre-v42
-	// migration's ADD COLUMN backfill for rows that predate this writer).
+	// The bare InsertVM wrapper calls InsertVMWithHardware with adopt=false: it
+	// carries no hardware (nil NICs/PCI intents), and its producer-path callers
+	// (Clone/import/promote/live-restore) may have written REAL vm_interfaces
+	// rows outside this call, so it must NOT claim 'adopted' — the column stays
+	// at its schema default 'pending' for the Phase-6 backfill audit to
+	// reconcile.
 	state, errReason, err := GetHardwareAdoptionState(ctx, c, "vm-adopt")
 	if err != nil {
 		t.Fatalf("GetHardwareAdoptionState: %v", err)
 	}
-	if state != "adopted" {
-		t.Errorf("initial state = %q, want adopted", state)
+	if state != "pending" {
+		t.Errorf("initial state = %q, want pending", state)
 	}
 	if errReason != "" {
 		t.Errorf("initial errReason = %q, want empty", errReason)
@@ -789,5 +792,36 @@ func TestHardwareAdoptionState(t *testing.T) {
 	}
 	if errReason != "reason" {
 		t.Errorf("errReason = %q, want reason", errReason)
+	}
+}
+
+// TestInsertVMWithHardware_AdoptFalseLeavesPending is the Fix 1 regression: a
+// caller that passes adopt=false must NOT get the 'adopted' stamp even when it
+// also supplies hardware rows — only the primary create path (adopt=true) may
+// claim adoption. This guards against a future edit accidentally gating on
+// "hardware present" instead of the explicit adopt flag.
+func TestInsertVMWithHardware_AdoptFalseLeavesPending(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	vm := VMRecord{Name: "vm-noadopt", HostName: "node-a", Spec: "{}", State: "running"}
+	nics := []NICRecord{
+		{VMName: "vm-noadopt", ID: DeterministicNICID("vm-noadopt", "52:54:00:aa:bb:dd"), NetworkName: "lan0",
+			Model: "virtio", MAC: "52:54:00:aa:bb:dd", Ordinal: 0, IP: "10.0.0.6"},
+	}
+
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, nil, false); err != nil {
+		t.Fatalf("InsertVMWithHardware: %v", err)
+	}
+
+	state, errReason, err := GetHardwareAdoptionState(ctx, c, "vm-noadopt")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "pending" {
+		t.Errorf("state = %q, want pending (adopt=false must not stamp adopted)", state)
+	}
+	if errReason != "" {
+		t.Errorf("errReason = %q, want empty", errReason)
 	}
 }

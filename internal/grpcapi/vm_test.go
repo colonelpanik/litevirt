@@ -283,6 +283,64 @@ func TestCreateVM_PopulatesHardwareTables(t *testing.T) {
 	}
 }
 
+// TestCreateVM_PCIIntentCanonicalizesAddress is a convergence-gap regression: a
+// device spec carrying a non-canonical concrete BDF (short-form bus, e.g.
+// "41:00.0") must still hash its vm_pci_intent.device_id off the CANONICAL BDF
+// ("0000:41:00.0") — matching what the Phase-6 backfill derives from libvirt's
+// canonicalized XML address (makeAddressedIntent). Without canonicalizing at
+// create time, CreateVM and a later backfill pass would derive two different
+// device_ids for the same physical device and fork into a divergent duplicate
+// vm_pci_intent row.
+func TestCreateVM_PCIIntentCanonicalizesAddress(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.1", State: "active", CPUTotal: 8, MemTotal: 16384,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+
+	spec := &pb.VMSpec{
+		Name:      "vm1",
+		Cpu:       1,
+		MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+		Devices:   []*pb.DeviceSpec{{Address: "41:00.0"}},
+	}
+	resp, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if resp.Name != "vm1" {
+		t.Fatalf("CreateVM resp.Name = %q, want vm1", resp.Name)
+	}
+
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("vm_pci_intent = %+v, want 1 row", intents)
+	}
+
+	wantID := corrosion.DeterministicPCIIntentID("vm1",
+		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: "0000:41:00.0"}), 0)
+	if intents[0].DeviceID != wantID {
+		t.Errorf("vm_pci_intent[0].DeviceID = %q, want %q (id derived from the canonical BDF)",
+			intents[0].DeviceID, wantID)
+	}
+
+	// The input spec passed to CreateVM must not be mutated by the
+	// canonicalization — only a clone used for the intent should change.
+	if spec.Devices[0].Address != "41:00.0" {
+		t.Errorf("input spec.Devices[0].Address = %q, want unchanged 41:00.0", spec.Devices[0].Address)
+	}
+}
+
 func TestListVMs_Empty(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

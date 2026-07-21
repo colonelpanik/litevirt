@@ -122,34 +122,35 @@ func projectOrDefault(p string) string {
 }
 
 // InsertVM creates a new VM record with its interfaces and disks. It is
-// InsertVMWithHardware with no NIC/PCI-intent rows — kept as a separate,
-// unchanged-signature entry point so the ~350 existing fixture-only callers
-// across the tree (tests that just need a VM row to exist) don't need a
-// mechanical signature-widening edit for a hardware-table concern they don't
-// exercise. Both still route through the same atomic batch, so every InsertVM
-// caller also picks up the unconditional adoption-state write below.
+// InsertVMWithHardware with no NIC/PCI-intent rows and adopt=false — kept as a
+// separate, unchanged-signature entry point so the ~350 existing fixture-only
+// callers across the tree (tests that just need a VM row to exist) don't need
+// a mechanical signature-widening edit for a hardware-table concern they don't
+// exercise. Its real producer-path callers (Clone/import/promote/live-restore)
+// pass no hardware here even though they may have written real vm_interfaces
+// rows elsewhere, so adopt=false leaves hardware_adoption_state at its schema
+// default 'pending' for the Phase-6 backfill audit to reconcile.
 func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord) error {
-	return InsertVMWithHardware(ctx, c, vm, ifaces, disks, nil, nil)
+	return InsertVMWithHardware(ctx, c, vm, ifaces, disks, nil, nil, false)
 }
 
 // InsertVMWithHardware is InsertVM extended to also write the v42 typed-hardware
-// tables (vm_nics, vm_pci_intent) and set the VM's hardware-adoption state to
-// "adopted" — all in the SAME atomic batch as the vms/vm_interfaces/vm_disks
-// inserts. CreateVM (and, as later producers migrate, Clone/Import/Promote/
-// live-restore) call this so a freshly-created VM is hardware_v2-authoritative
-// from birth and never needs the Phase-6 backfill to run for it.
+// tables (vm_nics, vm_pci_intent) and, when adopt is true, set the VM's
+// hardware-adoption state to "adopted" — all in the SAME atomic batch as the
+// vms/vm_interfaces/vm_disks inserts. CreateVM passes adopt=true: it has just
+// recorded this VM's complete hardware (possibly an empty set, which for a VM
+// with no NICs and no PCI devices IS the complete/accurate set) in this same
+// transaction, so there is nothing left for the backfill audit to reconcile.
+// Every other caller passes adopt=false and leaves hardware_adoption_state at
+// its schema default 'pending', since it either supplies no hardware at all
+// (the bare InsertVM wrapper) or is a producer path whose hardware this call
+// doesn't fully account for — the Phase-6 backfill audit reconciles those.
 //
 // The vm_nics/vm_pci_intent statements reuse the EXACT shapes UpsertNIC/
 // UpsertPCIIntent already register (see hardware.go), and the adoption update
 // reuses SetHardwareAdoptionState's exact UPDATE shape — no new replicated
 // statement shape is introduced.
-//
-// Adoption is set to "adopted" unconditionally, even when nics/pciIntents are
-// both empty: a VM inserted through this path has, by construction, just had
-// its complete hardware recorded in this same transaction (an empty set IS the
-// complete/accurate set for a VM with no NICs and no PCI devices), so there is
-// nothing left for the backfill audit to reconcile.
-func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, pciIntents []PCIIntentRecord) error {
+func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, pciIntents []PCIIntentRecord, adopt bool) error {
 	now := nowRFC3339() // created_at (bare)
 	uts := c.NowTS()    // updated_at (monotonic LWW key)
 
@@ -231,10 +232,12 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 		})
 	}
 
-	stmts = append(stmts, Statement{
-		SQL:    `UPDATE vms SET hardware_adoption_state = ?, hardware_adoption_error = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
-		Params: []interface{}{"adopted", nullIfEmpty(""), uts, vm.Name},
-	})
+	if adopt {
+		stmts = append(stmts, Statement{
+			SQL:    `UPDATE vms SET hardware_adoption_state = ?, hardware_adoption_error = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{"adopted", nullIfEmpty(""), uts, vm.Name},
+		})
+	}
 
 	return c.ExecuteBatch(ctx, stmts)
 }

@@ -29,6 +29,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/notify"
+	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -676,9 +677,24 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		// derive for the same selector. Built AFTER allocateDevices so a
 		// resource-mapping spec's resolved address (frozen onto spec.Address above)
 		// is captured, not the pre-resolution mapping alone.
+		//
+		// A concrete address is canonicalized before hashing (on a cloned spec —
+		// the shared input spec, which CreateVM later json.Marshals verbatim, is
+		// never mutated): the backfill's makeAddressedIntent normalizes to the
+		// libvirt-canonicalized XML BDF, so a create-time intent built from a
+		// non-canonical concrete BDF (e.g. "41:00.0") would otherwise hash to a
+		// different device_id than the backfill derives for the same physical
+		// device, forking into a divergent duplicate row.
 		occ := map[string]int{}
 		for _, d := range spec.Devices {
-			pciIntents = append(pciIntents, s.makeIntentRecord(spec.Name, d, occ))
+			nd := d
+			if d.Address != "" {
+				if canon, ok := pci.CanonicalBDF(d.Address); ok {
+					nd = proto.Clone(d).(*pb.DeviceSpec)
+					nd.Address = canon
+				}
+			}
+			pciIntents = append(pciIntents, s.makeIntentRecord(spec.Name, nd, occ))
 		}
 	}
 
@@ -779,7 +795,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		Project:   project, // tenancy label
 	}
 
-	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents); err != nil {
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	}

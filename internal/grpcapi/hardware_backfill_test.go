@@ -693,6 +693,143 @@ func TestBackfillHardwareTables_ConcreteMembersNoSpec(t *testing.T) {
 	}
 }
 
+// ── audit reconciles (tombstones) stale intents, not just upserts ───────────
+
+// TestAudit_TombstonesStaleIntent_AfterXMLDetach proves the reconcile (the
+// rolling-upgrade #4 hole): a VM adopts one concrete-address PCI intent from its
+// inactive definition; later an OLD peer detaches that <hostdev> from the
+// definition WITHOUT tombstoning the intent it doesn't understand. A re-audit on
+// a new owner derives an EMPTY plan, so the surviving intent is stale — the audit
+// must tombstone it (and its realizations) rather than leave it live for
+// reconcileDomainDefinition to restore the detached device at next start.
+func TestAudit_TombstonesStaleIntent_AfterXMLDetach(t *testing.T) {
+	s, f := backfillServer(t)
+	ctx := adminCtx()
+
+	const name = "reconcile-vm"
+	bdf := "0000:41:00.0"
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: name, HostName: "test-host", State: "running", Spec: "",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// (a) Inactive definition has one concrete-address hostdev → adopts one intent.
+	f.SetInactiveXML(name, domainXMLWith(name, hostdevXML(bdf)))
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables (initial): %v", err)
+	}
+	if st, _, _ := corrosion.GetHardwareAdoptionState(ctx, s.db, name); st != "adopted" {
+		t.Fatalf("adoption state = %q, want adopted", st)
+	}
+	before, err := corrosion.ListVMPCIIntents(ctx, s.db, name)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents (initial): %v", err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("got %d intents after initial adoption, want exactly 1: %+v", len(before), before)
+	}
+	deviceID := before[0].DeviceID
+
+	// Seed a realization for the adopted intent (the resolver would have produced
+	// it); the reconcile must retract it alongside the stale intent.
+	if err := corrosion.UpsertPCIRealization(ctx, s.db, corrosion.PCIRealizationRecord{
+		VMName: name, DeviceID: deviceID, MemberID: bdf, HostName: "test-host",
+		ResolvedAddress: bdf, Ordinal: 0,
+	}); err != nil {
+		t.Fatalf("UpsertPCIRealization: %v", err)
+	}
+	if r, _ := corrosion.ListVMPCIRealizations(ctx, s.db, name); len(r) != 1 {
+		t.Fatalf("seed: got %d live realizations, want 1", len(r))
+	}
+
+	// (b) An OLD peer detaches the device from the inactive definition but leaves
+	// the intent row live. Re-audit derives an EMPTY plan → the surviving intent
+	// is stale and must be tombstoned along with its realizations.
+	f.SetInactiveXML(name, domainXMLWith(name))
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables (post-detach): %v", err)
+	}
+
+	after, err := corrosion.ListVMPCIIntents(ctx, s.db, name)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents (post-detach): %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("stale intent survived the re-audit: got %d live intents, want 0 (tombstoned): %+v", len(after), after)
+	}
+	real, err := corrosion.ListVMPCIRealizations(ctx, s.db, name)
+	if err != nil {
+		t.Fatalf("ListVMPCIRealizations (post-detach): %v", err)
+	}
+	if len(real) != 0 {
+		t.Fatalf("stale realization survived the re-audit: got %d live, want 0 (tombstoned): %+v", len(real), real)
+	}
+	// The VM stays classifiable — an empty definition is a clean adoption.
+	if st, _, _ := corrosion.GetHardwareAdoptionState(ctx, s.db, name); st != "adopted" {
+		t.Errorf("adoption state = %q, want adopted (empty plan is clean)", st)
+	}
+}
+
+// TestAudit_UnparseableMember_DoesNotTombstone guards the safe-tombstoning rule:
+// if ANY hostdev source address in the inactive definition fails to parse, the
+// derived plan is incomplete, so the audit must NOT reconcile — a
+// present-but-unparseable device must never lose its intent. A pre-existing live
+// intent absent from the partial plan must SURVIVE. (With the unparseable guard
+// removed, this test fails: the reconcile would tombstone it as "stale" — dropping
+// a real device's intent, the worse outcome.)
+func TestAudit_UnparseableMember_DoesNotTombstone(t *testing.T) {
+	s, f := backfillServer(t)
+	ctx := adminCtx()
+
+	const name = "unparseable-vm"
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: name, HostName: "test-host", State: "running", Spec: "",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// A pre-existing live intent for a device NOT in the (partial) plan the audit
+	// will derive — it would be "stale" and tombstoned if the audit reconciled.
+	excl := "0000:99:00.0"
+	staleID := corrosion.DeterministicPCIIntentID(
+		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: excl}), 0)
+	if err := corrosion.UpsertPCIIntent(ctx, s.db, corrosion.PCIIntentRecord{
+		VMName: name, DeviceID: staleID, HostName: "test-host",
+		SelectorKind: "address", SelectorPayload: "{}", ExclusiveKey: &excl,
+	}); err != nil {
+		t.Fatalf("UpsertPCIIntent (pre-existing): %v", err)
+	}
+
+	// Inactive definition: one parseable hostdev + one UNPARSEABLE source address
+	// (non-hex bus) that HostdevSourcePCIAddresses returns but CanonicalBDF rejects.
+	unparseable := `<hostdev mode='subsystem' type='pci' managed='yes'><source>` +
+		`<address domain='0x0000' bus='0xzz' slot='0x00' function='0x0'/></source></hostdev>`
+	f.SetInactiveXML(name, domainXMLWith(name, hostdevXML("0000:41:00.0"), unparseable))
+
+	if err := s.BackfillHardwareTables(ctx); err != nil {
+		t.Fatalf("BackfillHardwareTables: %v", err)
+	}
+
+	// The pre-existing intent must STILL be live — reconciliation was skipped
+	// because of the unparseable member.
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, name)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	found := false
+	for _, in := range intents {
+		if in.DeviceID == staleID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pre-existing intent %q was tombstoned despite an unparseable member: %+v", staleID, intents)
+	}
+}
+
 // TestRenameVM_PCIIntentAuditConverges_NoFork is the end-to-end proof of the
 // name-independent device_id design (the reason task 7.2.5 dropped vm_name from
 // its derivation): a VM adopts a single concrete-address PCI intent, gets

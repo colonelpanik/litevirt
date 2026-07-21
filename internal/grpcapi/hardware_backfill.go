@@ -227,12 +227,18 @@ func (s *Server) auditVMPCICompatibility(ctx context.Context, vm *corrosion.VMRe
 	}
 
 	// Ordered, canonicalized set of hostdev source BDFs present in the definition.
+	// unparseable records that the definition carried a hostdev whose source
+	// address did not parse: the derived plan is then INCOMPLETE, so the
+	// stale-intent reconciliation below is skipped (a present-but-unparseable
+	// device must never have its intent dropped).
 	var xmlBDFs []string
 	seen := map[string]bool{}
+	unparseable := false
 	for _, raw := range libvirt.HostdevSourcePCIAddresses(xmlText) {
 		bdf, ok := pci.CanonicalBDF(raw)
 		if !ok {
 			slog.Warn("hardware backfill: skipping unparseable hostdev source address", "vm", vm.Name, "raw", raw)
+			unparseable = true
 			continue
 		}
 		if seen[bdf] {
@@ -361,12 +367,57 @@ func (s *Server) auditVMPCICompatibility(ctx context.Context, vm *corrosion.VMRe
 		}
 	}
 
-	// Commit the plan (atomic per VM: nothing was written on a block above).
+	// Commit the plan. On a block above nothing was written; this is the confident,
+	// complete success path, so it RECONCILES the VM's live intent set to EXACTLY
+	// the derived plan — not just upserts. A device detached from the definition
+	// AFTER a prior adoption (e.g. an old peer that removed a hostdev it didn't
+	// understand but left the intent) would otherwise leave a stale intent live,
+	// and reconcileDomainDefinition would RESTORE the detached device at next start.
+	//
+	// This is a sequential commit, not one ExecuteBatch, BY DESIGN: every write here
+	// reuses an EXISTING corrosion accessor whose statement shape is already in the
+	// ledger, so stmtshapecheck's builder-statement count is unchanged. A new in-place
+	// batch in this package would enumerate as additional builder statements (even
+	// though the shapes are already registered), changing that count. The tradeoff is
+	// a small partial-write window on a mid-commit error; we fail closed (blockAdoption)
+	// consistently there, matching the pre-existing upsert-error handling.
 	for _, rec := range plan {
 		if err := corrosion.UpsertPCIIntent(ctx, s.db, rec); err != nil {
 			return s.blockAdoption(ctx, vm.Name, fmt.Sprintf("failed to write PCI intent %s: %v", rec.DeviceID, err))
 		}
 	}
+
+	// Reconcile away stale intents: live vm_pci_intent rows whose device_id is NOT in
+	// the derived plan (their device is no longer in the definition). SKIP entirely
+	// when the definition carried an unparseable hostdev source address — the plan is
+	// incomplete and dropping a present-but-unparseable device's intent is worse than
+	// leaving a stale one. The empty-plan case (every device detached) correctly
+	// tombstones every live intent, which is exactly the rolling-upgrade scenario.
+	if unparseable {
+		slog.Warn("hardware backfill: skipping stale-intent reconciliation (unparseable hostdev source address present)", "vm", vm.Name)
+	} else {
+		planIDs := make(map[string]bool, len(plan))
+		for _, rec := range plan {
+			planIDs[rec.DeviceID] = true
+		}
+		// ListVMPCIIntents already returns only LIVE rows (deleted_at IS NULL).
+		live, err := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
+		if err != nil {
+			return s.blockAdoption(ctx, vm.Name, fmt.Sprintf("failed to list live PCI intents for reconcile: %v", err))
+		}
+		for _, in := range live {
+			if planIDs[in.DeviceID] {
+				continue // present in the plan — keep it
+			}
+			if err := corrosion.TombstonePCIIntent(ctx, s.db, vm.Name, in.DeviceID); err != nil {
+				return s.blockAdoption(ctx, vm.Name, fmt.Sprintf("failed to tombstone stale PCI intent %s: %v", in.DeviceID, err))
+			}
+			if err := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, in.DeviceID); err != nil {
+				return s.blockAdoption(ctx, vm.Name, fmt.Sprintf("failed to tombstone stale PCI realizations %s: %v", in.DeviceID, err))
+			}
+		}
+	}
+
 	if err := corrosion.SetHardwareAdoptionState(ctx, s.db, vm.Name, "adopted", ""); err != nil {
 		slog.Warn("hardware backfill: set adopted state failed", "vm", vm.Name, "error", err)
 	}

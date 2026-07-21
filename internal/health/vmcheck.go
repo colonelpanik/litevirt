@@ -51,6 +51,30 @@ type VMChecker struct {
 	// onStateWriteFail observes an authoritative state write that failed (nil-safe);
 	// wired to the litevirt_state_write_failures_total counter by the daemon.
 	onStateWriteFail func(op, class string)
+
+	// prepareHardwareForStart, when wired (the daemon passes the gRPC Server's
+	// PrepareHardwareForStart), runs the hardware_v2 adoption gate + PCI start-preflight
+	// before a health-driven auto-restart's StartDomain: it refuses a "blocked" VM and,
+	// for a passthrough VM, re-acquires + realizes + reconciles its devices so a restarted
+	// PCI VM comes back with them bound. A strict NO-OP unless hardware_v2 is latched, so a
+	// pre-latch fleet's health-restart is byte-for-behavior unchanged. nil → no-op.
+	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
+}
+
+// SetHardwareStartPreparer wires the hardware_v2 pre-start hook (adoption gate + PCI
+// start-preflight). nil-safe; unwired means every restart behaves exactly as before.
+func (v *VMChecker) SetHardwareStartPreparer(fn func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)) {
+	v.prepareHardwareForStart = fn
+}
+
+// hwPrepareStart runs the wired hardware pre-start hook (a strict no-op when unwired or
+// pre-latch), returning a release func for the caller to invoke ONLY if its StartDomain
+// then fails.
+func (v *VMChecker) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord) (func(), error) {
+	if v.prepareHardwareForStart == nil {
+		return func() {}, nil
+	}
+	return v.prepareHardwareForStart(ctx, vm)
 }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
@@ -469,7 +493,20 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 			return
 		}
 		v.virt.DestroyDomain(vm.Name)
+		// hardware_v2 pre-start (adoption gate + PCI preflight), after the destroy and
+		// before the start — matching RestartVM's destroy→startVMLocked order. No-op unless
+		// hardware_v2 is latched. A refusal is non-fatal: don't restart, flag the VM error.
+		releaseHW, hwErr := v.hwPrepareStart(ctx, fresh)
+		if hwErr != nil {
+			slog.Warn("vmcheck: hardware pre-start refused/failed restart", "vm", vm.Name, "error", hwErr)
+			v.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+			if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error", fmt.Sprintf("hardware pre-start: %v", hwErr)); werr != nil {
+				v.noteStateWriteFail(corrosion.OpVMState, werr)
+			}
+			return
+		}
 		if err := v.virt.StartDomain(vm.Name); err != nil {
+			releaseHW() // release any passthrough the preflight bound for this failed start
 			slog.Error("vmcheck: restart failed", "vm", vm.Name, "error", err)
 			if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error", fmt.Sprintf("health check restart failed: %v", err)); werr != nil {
 				v.noteStateWriteFail(corrosion.OpVMState, werr)
@@ -694,7 +731,20 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	}
 	// Ensure domain is destroyed before starting (may already be stopped).
 	_ = v.virt.DestroyDomain(vm.Name)
+	// hardware_v2 pre-start (adoption gate + PCI preflight); no-op unless latched. A
+	// refusal is non-fatal: don't restart, flag the VM error.
+	releaseHW, hwErr := v.hwPrepareStart(ctx, &vm)
+	if hwErr != nil {
+		slog.Warn("vmcheck: hardware pre-start refused/failed restart-policy start", "vm", vm.Name, "error", hwErr)
+		v.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error",
+			fmt.Sprintf("hardware pre-start: %v", hwErr)); werr != nil {
+			v.noteStateWriteFail(corrosion.OpVMState, werr)
+		}
+		return
+	}
 	if err := v.virt.StartDomain(vm.Name); err != nil {
+		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("vmcheck: restart policy start failed", "vm", vm.Name, "error", err)
 		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error",
 			fmt.Sprintf("restart policy start failed: %v", err)); werr != nil {

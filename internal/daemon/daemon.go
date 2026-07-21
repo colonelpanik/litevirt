@@ -634,9 +634,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetRealmRegistry(d.realmRegistry)
 	vmChecker.SetEventBus(svc.EventBus())
 	vmChecker.SetMigrateFunc(svc.MigrateVMForHealthCheck)
+	// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
+	// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
+	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
+	// this changes nothing on a fleet where the feature is off.
+	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
+	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB

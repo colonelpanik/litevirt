@@ -528,6 +528,20 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.InvalidArgument, "invalid promotion name %q", targetName)
 	}
 
+	// Adoption gate (fail-closed, no-op pre-latch): under the active hardware_v2 regime a
+	// "blocked" VM (hardware failed its per-VM compatibility audit) must not be brought
+	// back up. A takeover promote (same name) carries the original VM's adoption state, so
+	// refuse it BEFORE the destructive define/start below rather than resurrect a VM the
+	// operator must repair + re-audit first; a renamed promotion has no prior adoption row
+	// (→ no-op). This is the gate half of PrepareHardwareForStart applied directly: the PCI
+	// start-preflight half is deliberately NOT run on promote — promote materializes the
+	// live disk then defines-then-persists the disk/vm rows AFTER StartDomain, so the
+	// preflight's reconcile-from-authoritative-tables step would read not-yet-written rows;
+	// and a disk replica does not carry the source host's physical passthrough devices.
+	if err := s.hardwareAdoptionRefused(ctx, targetName); err != nil {
+		return err
+	}
+
 	// Crash-idempotent resume: a domain RUNNING under targetName from a prior
 	// attempt of THIS proof must never be torn down. We record "start_attempted"
 	// durably BEFORE StartDomain, so if we crash after libvirt starts the VM but

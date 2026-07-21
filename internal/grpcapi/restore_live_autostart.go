@@ -232,7 +232,25 @@ func (s *Server) autoDefineRestoredVM(
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}
+
+	// hardware_v2 pre-start (adoption gate + PCI preflight); no-op unless latched, so a
+	// fleet with the feature off restores exactly as before. A restore always targets a
+	// fresh name (name-collision is refused earlier), so it carries no reserved PCI
+	// intents → the preflight is a no-op and only the adoption gate can fire (refusing an
+	// auto-start into a name the operator has flagged blocked). release() runs only if the
+	// subsequent StartDomain fails.
+	hwSpecJSON, _ := json.Marshal(spec)
+	hwRec := &corrosion.VMRecord{
+		Name: targetName, HostName: s.hostName, Spec: string(hwSpecJSON),
+		CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib), Project: project,
+	}
+	releaseHW, hwErr := s.PrepareHardwareForStart(ctx, hwRec)
+	if hwErr != nil {
+		_ = s.virt.UndefineDomain(targetName, false)
+		return "", "", hwErr
+	}
 	if err := s.virt.StartDomain(targetName); err != nil {
+		releaseHW()
 		// Roll back the definition but KEEP the overlay + NBD so the operator can
 		// retry define/start against the still-valid source. For a firmware VM the
 		// deferred rollback additionally wipes the materialized NVRAM/swtpm.

@@ -992,16 +992,39 @@ func (s *Server) hardwareAdoptionRefused(ctx context.Context, vmName string) err
 	return status.Errorf(codes.FailedPrecondition, "%s", reason)
 }
 
-// startVMLocked brings a LOCAL VM to running. The caller MUST hold the VM lock, have
-// re-read vm under it, confirmed local ownership, and passed the split-brain gate; it
-// never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
-// coordinator's restart path) call it directly under one lock.
-func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
+// PrepareHardwareForStart runs the hardware_v2 pre-start obligations shared by EVERY
+// (re)start path — the manual RPCs (via startVMLocked) AND the automated
+// failover/reconciler/health/promote/restore paths that bypass startVMLocked. It is a
+// strict NO-OP unless hardware_v2 is latched (the adoption gate short-circuits on the
+// same latch, and the preflight block is latch-gated), so on a fleet where the feature
+// is off every caller behaves byte-for-behavior exactly as before.
+//
+// When latched it (1) applies the adoption gate — a "blocked" VM (hardware failed its
+// per-VM compatibility audit on this host) must not (re)start until the operator repairs
+// and re-audits it — and (2) runs the PCI start-preflight for a VM with reserved
+// vm_pci_intent rows: acquire leases (CAS ownership + vfio bind), persist realizations,
+// and reconcile the aliased <hostdev>s into the domain definition, all BEFORE
+// StartDomain. It fails CLOSED — a blocked VM, a vanished/unacquirable device, or a
+// realization/reconcile write failure returns the error (the caller must NOT start), and
+// the preflight self-cleans whatever it claimed. On success it returns a release func the
+// caller invokes ONLY if its subsequent StartDomain fails, so a failed start leaves no VM
+// bound to devices it never used; on the refusal/failure path release is a no-op.
+//
+// This is exported because the automated bypass paths live in other packages (the health
+// reconciler / vmchecker reach it via a daemon-wired callback); the daemon passes this
+// method as that hook.
+func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRecord) (release func(), err error) {
+	releasePreflight := func() {}
+	if vm == nil {
+		return releasePreflight, status.Errorf(codes.InvalidArgument, "prepare hardware for start: nil vm record")
+	}
+
 	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active
 	// hardware_v2 regime — this covers ALL start callers (StartVM, RestartVM, restore/
-	// autostart, the health reconciler, the resource coordinator). No-op pre-latch.
-	if err := s.hardwareAdoptionRefused(ctx, vm.Name); err != nil {
-		return nil, err
+	// autostart, the health reconciler/checker, promote, the resource coordinator).
+	// No-op pre-latch.
+	if aerr := s.hardwareAdoptionRefused(ctx, vm.Name); aerr != nil {
+		return releasePreflight, aerr
 	}
 
 	// PCI start-preflight: under the active hardware_v2 regime, a VM whose reserved
@@ -1011,20 +1034,34 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 	// the start and releases whatever was claimed. GATED on hardwareV2Latched AND the
 	// VM actually having intents, so a non-PCI or pre-latch VM's start path is
 	// byte-for-behavior unchanged (no preflight, no bind attempt).
-	releasePreflight := func() {}
 	if s.hardwareV2Latched(ctx) {
 		intents, ierr := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
 		if ierr != nil {
-			return nil, status.Errorf(codes.Internal, "read PCI intents for %q: %v", vm.Name, ierr)
+			return releasePreflight, status.Errorf(codes.Internal, "read PCI intents for %q: %v", vm.Name, ierr)
 		}
 		if len(intents) > 0 {
 			release, perr := s.pciStartPreflight(ctx, vm, intents)
 			if perr != nil {
 				// The preflight self-cleaned whatever it claimed; the VM does not start.
-				return nil, perr
+				return releasePreflight, perr
 			}
 			releasePreflight = release
 		}
+	}
+	return releasePreflight, nil
+}
+
+// startVMLocked brings a LOCAL VM to running. The caller MUST hold the VM lock, have
+// re-read vm under it, confirmed local ownership, and passed the split-brain gate; it
+// never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
+// coordinator's restart path) call it directly under one lock.
+func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
+	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
+	// No-op pre-latch, so every start behaves byte-for-behavior as before until
+	// hardware_v2 latches.
+	releasePreflight, err := s.PrepareHardwareForStart(ctx, vm)
+	if err != nil {
+		return nil, err
 	}
 
 	hspec := vmHooks(vm)

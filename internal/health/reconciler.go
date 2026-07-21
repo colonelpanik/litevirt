@@ -12,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
@@ -83,6 +86,32 @@ type Reconciler struct {
 	// enter this set, so a deliberately-stopped VM is never autostarted by the retry.
 	onbootMu      sync.Mutex
 	onbootPending map[string]corrosion.VMRecord
+
+	// prepareHardwareForStart, when wired (the daemon passes the gRPC Server's
+	// PrepareHardwareForStart), runs the hardware_v2 adoption gate + PCI start-preflight
+	// before a failover/reschedule StartDomain: it refuses a "blocked" VM (returns an
+	// error) and, for a VM with reserved passthrough intents, acquires + realizes +
+	// reconciles its devices into the domain definition so it comes back with them bound.
+	// It is a strict NO-OP unless hardware_v2 is latched, so a pre-latch fleet reconciles
+	// exactly as before. nil in tests / when unwired → treated as a no-op. The returned
+	// release func is invoked ONLY if the subsequent StartDomain fails.
+	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
+}
+
+// SetHardwareStartPreparer wires the hardware_v2 pre-start hook (adoption gate + PCI
+// start-preflight). nil-safe; unwired means every start behaves exactly as before.
+func (r *Reconciler) SetHardwareStartPreparer(fn func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)) {
+	r.prepareHardwareForStart = fn
+}
+
+// hwPrepareStart runs the wired hardware pre-start hook (a strict no-op when unwired or
+// pre-latch), returning a release func for the caller to invoke ONLY if its StartDomain
+// then fails.
+func (r *Reconciler) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord) (func(), error) {
+	if r.prepareHardwareForStart == nil {
+		return func() {}, nil
+	}
+	return r.prepareHardwareForStart(ctx, vm)
 }
 
 // runtimeGate is the subset of *Checker the reconciler needs (injectable for tests).
@@ -1000,7 +1029,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
+	// hardware_v2 pre-start (adoption gate + PCI start-preflight), between DefineDomain
+	// and StartDomain — the disk/nic rows this failover acts on already exist (replicated),
+	// so the preflight's reconcile-from-authoritative-tables step patches the just-defined
+	// domain with the aliased <hostdev>s and binds the passthrough BEFORE it boots. A strict
+	// no-op unless hardware_v2 is latched (so a pre-latch failover is byte-for-behavior
+	// unchanged). A refusal is NON-FATAL: a blocked VM / unacquirable device (FailedPrecondition)
+	// is a non-retryable operator-repair condition → terminalize the proof + set the VM error;
+	// a transient read/DB failure (Internal/Unavailable) re-arms for the next reconcile tick.
+	releaseHW, hwErr := r.hwPrepareStart(ctx, fresh)
+	if hwErr != nil {
+		slog.Warn("reconciler: hardware pre-start refused/failed — not starting VM", "vm", vm.Name, "error", hwErr)
+		r.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+		r.failPendingStart(ctx, vm.Name, proofID, hwPrepareRetryable(hwErr), fmt.Sprintf("hardware pre-start: %v", hwErr))
+		return
+	}
+
 	if err := r.virt.StartDomain(vm.Name); err != nil {
+		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("reconciler: start domain", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("start: %v", err)) // transient libvirt
 		return
@@ -1064,6 +1110,20 @@ func (r *Reconciler) failPendingStart(ctx context.Context, vmName, proofID strin
 		if werr := corrosion.UpdateVMState(ctx, r.db, vmName, "error", detail); werr != nil {
 			r.noteStateWriteFail(corrosion.OpVMState, werr)
 		}
+	}
+}
+
+// hwPrepareRetryable classifies a hardware pre-start error for the proof lifecycle: a
+// blocked adoption / unacquirable passthrough (FailedPrecondition) or a malformed record
+// (InvalidArgument) is an operator-repair condition that retrying on this host can't fix
+// → non-retryable (terminalize + set error); anything else (a transient read/DB failure,
+// Internal/Unavailable) → retryable, re-armed for the next reconcile tick.
+func hwPrepareRetryable(err error) bool {
+	switch status.Code(err) {
+	case codes.FailedPrecondition, codes.InvalidArgument:
+		return false
+	default:
+		return true
 	}
 }
 

@@ -27,19 +27,34 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	vm, err := s.grpc.InspectVM(s.uiBearerCtx(r), &pb.InspectVMRequest{Name: name})
+	ctx := s.uiBearerCtx(r)
+	vm, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name})
 	if err != nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
-	hosts, _ := s.grpc.ListHosts(s.uiBearerCtx(r), &pb.ListHostsRequest{})
-	snapshots, _ := s.grpc.ListSnapshots(s.uiBearerCtx(r), &pb.ListSnapshotsRequest{VmName: name})
+	hosts, _ := s.grpc.ListHosts(ctx, &pb.ListHostsRequest{})
+	snapshots, _ := s.grpc.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VmName: name})
 	data := s.pageData(name, "vms")
 	data["VM"] = vm
 	data["Hosts"] = hosts.GetHosts()
 	data["Snapshots"] = snapshots.GetSnapshots()
 	data["Backups"] = s.vmBackupManifests(name)
 	data["Activity"] = s.vmActivity(r, name)
+
+	// ?tab=hardware server-renders the Hardware tab body on a full page load,
+	// not only via the htmx fragment route (handleVMHardwareTab below) — it
+	// reuses that exact same fragment template so there's one source of truth
+	// for the Hardware tab markup.
+	tab := r.URL.Query().Get("tab")
+	data["Tab"] = tab
+	if tab == "hardware" {
+		if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
+			data["HardwareTab"] = s.renderHardwareTabFragment(map[string]any{
+				"VM": name, "Devices": hw.GetDevices(),
+			})
+		}
+	}
 	s.renderPage(w, "vm_detail.html", data)
 }
 
@@ -79,6 +94,22 @@ func (s *Server) handleVMDetailPartial(w http.ResponseWriter, r *http.Request) {
 	s.renderPartial(w, "vm_detail.html", "vm_detail_inner", map[string]any{
 		"VM": vm, "Snapshots": snapshots.GetSnapshots(), "Backups": s.vmBackupManifests(name),
 		"Activity": s.vmActivity(r, name), "ClusterName": s.cluster,
+	})
+}
+
+// handleVMHardwareTab renders the Hardware tab fragment (Task 8.1): the typed
+// disk/NIC/PCI device table from ListVMHardware. Mirrors handleVMDetailPartial's
+// shape. Read-only for this task — attach/detach actions land in Task 8.2.
+func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	resp, err := s.grpc.ListVMHardware(s.uiBearerCtx(r), &pb.ListVMHardwareRequest{VmName: name})
+	if err != nil {
+		http.Error(w, "VM not found", 404)
+		return
+	}
+	s.renderFragment(w, "hardware_tab.html", map[string]any{
+		"VM":      name,
+		"Devices": resp.GetDevices(),
 	})
 }
 

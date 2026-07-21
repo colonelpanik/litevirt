@@ -1,0 +1,62 @@
+<div id="vm-hardware-tab">
+  <div class="section">
+    <div class="section-header"><h2>{{icon "disk"}} Disks</h2></div>
+    <table>
+      <thead><tr><th>Target</th><th>Bus</th><th>Controller</th><th>Size</th><th>Storage</th><th>State</th></tr></thead>
+      <tbody>
+      {{range .Devices}}{{with .GetDisk}}
+      <tr>
+        <td class="mono">{{.Target}}</td>
+        <td>{{.Bus}}</td>
+        <td>{{if .ControllerModel}}{{.ControllerModel}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+        <td>{{formatBytes .SizeBytes}}</td>
+        <td>{{.StorageType}}{{if .StorageVolume}} / {{.StorageVolume}}{{end}}</td>
+        <td><span class="badge badge-gray">{{.State}}</span></td>
+      </tr>
+      {{end}}{{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h2>{{icon "network"}} Network Interfaces</h2></div>
+    <table>
+      <thead><tr><th>MAC</th><th>Network</th><th>Model</th><th>Ordinal</th><th>Security groups</th><th>State</th></tr></thead>
+      <tbody>
+      {{range .Devices}}{{with .GetNic}}
+      <tr>
+        <td class="mono">{{.Mac}}</td>
+        <td>{{.Network}}</td>
+        <td>{{.Model}}</td>
+        <td>{{.Ordinal}}</td>
+        <td>{{if .SecurityGroups}}{{.SecurityGroups}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+        <td><span class="badge badge-gray">{{.State}}</span></td>
+      </tr>
+      {{end}}{{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h2>PCI Devices</h2></div>
+    <table>
+      <thead><tr><th>Device</th><th>Selector</th><th>Members</th><th>State</th></tr></thead>
+      <tbody>
+      {{range .Devices}}{{with .GetPci}}
+      <tr>
+        <td class="mono">{{.DeviceId}}</td>
+        <td>{{.SelectorKind}}</td>
+        <td>
+          {{range .Members}}<div class="mono" style="font-size:11px">{{.ResolvedAddress}}{{if .XmlAlias}} ({{.XmlAlias}}){{end}}</div>{{else}}<span class="muted">&mdash;</span>{{end}}
+        </td>
+        <td><span class="badge badge-gray">{{.State}}</span></td>
+      </tr>
+      {{end}}{{end}}
+      </tbody>
+    </table>
+  </div>
+
+  {{if not .Devices}}
+  <div style="padding:16px"><span class="muted">No hardware devices recorded for this VM yet.</span></div>
+  {{end}}
+</div>

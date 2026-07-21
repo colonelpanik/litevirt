@@ -53,6 +53,58 @@ func TestHandler_VMDetail_NotFound(t *testing.T) {
 	assertStatus(t, w, http.StatusNotFound)
 }
 
+// TestHandler_VMHardwareTab is Task 8.1's driving test: the Hardware tab
+// fragment renders the typed disk/NIC/PCI device table from ListVMHardware.
+func TestHandler_VMHardwareTab(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{
+				DeviceId: "root", Target: "vdb", Bus: "virtio", SizeBytes: 10 << 30,
+				StorageType: "local", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Nic{Nic: &pb.HardwareNIC{
+				Mac: "52:54:00:aa:bb:cc", Network: "br0", Model: "virtio", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Members: []*pb.HardwarePCIMember{{MemberId: "m0", ResolvedAddress: "0000:41:00.0", XmlAlias: "hostdev0"}},
+			}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "vdb")
+	assertContains(t, w, "52:54:00:aa:bb:cc")
+}
+
+func TestHandler_VMHardwareTab_NotFound(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareErr = errSimulated
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusNotFound)
+}
+
+// TestHandler_VMDetail_TabHardware covers the ?tab=hardware full-page load —
+// the Hardware body must server-render, not only be reachable via htmx.
+func TestHandler_VMDetail_TabHardware(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{Target: "vdb", Bus: "virtio"}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/vms/vm1?tab=hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "vdb")
+}
+
 func TestHandler_VMsTable(t *testing.T) {
 	s := newTestUIServer(t, newDefaultMock())
 	r := withAuth(mustReq(t, "GET", "/ui/vms-table"))

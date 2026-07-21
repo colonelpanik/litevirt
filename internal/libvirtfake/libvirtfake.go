@@ -60,10 +60,19 @@ type Fake struct {
 	// Optional time source for events. Defaults to time.Now.
 	Now func() time.Time
 
+	// attachDiskN / detachDiskN count disk hot-plug primitive calls so at-most-once
+	// tests can assert exactly one libvirt attach/detach happened for one operation.
+	attachDiskN int
+	detachDiskN int
+
 	// Fail* hooks let scenarios inject failures into specific methods.
 	// Nil = default success.
-	FailDefineDomain    func(xml string) error
-	FailStartDomain     func(name string) error
+	FailDefineDomain func(xml string) error
+	FailStartDomain  func(name string) error
+	// FailAttachDisk / FailDetachDisk inject a live disk hot-plug primitive failure so
+	// scenarios can exercise attach-rollback / detach-forward compensation.
+	FailAttachDisk      func(domain, path, targetDev, bus string) error
+	FailDetachDisk      func(domain, targetDev string) error
 	FailShutdownDomain  func(name string) error
 	FailUndefineDomain  func(name string, removeStorage bool) error
 	FailUndefinePreserv func(name string) error
@@ -371,16 +380,50 @@ func (f *Fake) ConsolePTYPath(name string) (string, error) {
 // Hot-plug — record and succeed.
 
 func (f *Fake) AttachDisk(domainName, path, targetDev, bus string) error {
+	if f.FailAttachDisk != nil {
+		if err := f.FailAttachDisk(domainName, path, targetDev, bus); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Track the live disk source so DomainDiskSources reflects the attach (the
+	// authoritative check a running-attach verification uses).
+	if f.diskSources[domainName] == nil {
+		f.diskSources[domainName] = map[string]string{}
+	}
+	f.diskSources[domainName][targetDev] = path
+	f.attachDiskN++
 	f.record("attach-disk", domainName, fmt.Sprintf("path=%s target=%s bus=%s", path, targetDev, bus))
 	return nil
 }
 func (f *Fake) DetachDisk(domainName, targetDev string) error {
+	if f.FailDetachDisk != nil {
+		if err := f.FailDetachDisk(domainName, targetDev); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.diskSources[domainName] != nil {
+		delete(f.diskSources[domainName], targetDev)
+	}
+	f.detachDiskN++
 	f.record("detach-disk", domainName, "target="+targetDev)
 	return nil
+}
+
+// AttachDiskCount / DetachDiskCount return how many times the disk hot-plug
+// primitives have been invoked — test accessors for at-most-once assertions.
+func (f *Fake) AttachDiskCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attachDiskN
+}
+func (f *Fake) DetachDiskCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.detachDiskN
 }
 func (f *Fake) AttachNIC(domainName, bridge, model, mac string) error {
 	f.mu.Lock()

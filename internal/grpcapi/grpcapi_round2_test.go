@@ -43,10 +43,10 @@ func (g *flipExecGate) CapabilityActive(context.Context, string) (bool, string) 
 func (g *flipExecGate) CapabilityActiveForHealth(context.Context, string) (bool, string) {
 	return true, ""
 }
-func (g *flipExecGate) Enforced(context.Context, string) bool                   { return true }
-func (g *flipExecGate) Latched(string) bool                                     { return true }
-func (g *flipExecGate) PeerSupportsFresh(context.Context, string, string) bool  { return true }
-func (g *flipExecGate) HealthyPeers(context.Context) []string                   { return nil }
+func (g *flipExecGate) Enforced(context.Context, string) bool                  { return true }
+func (g *flipExecGate) Latched(string) bool                                    { return true }
+func (g *flipExecGate) PeerSupportsFresh(context.Context, string, string) bool { return true }
+func (g *flipExecGate) HealthyPeers(context.Context) []string                  { return nil }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -749,6 +749,7 @@ func TestCountVMDisks_None(t *testing.T) {
 
 func TestDetachDisk_DiskNotFound(t *testing.T) {
 	s := testServerR2(t)
+	setDeviceGate(s, true, false) // disk detach now requires operation_protocol_v1
 	ctx := adminCtx()
 
 	insertTestVMR2(t, ctx, s.db, "detach-disk-vm", "test-host", "running")

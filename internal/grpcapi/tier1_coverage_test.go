@@ -614,6 +614,7 @@ func TestDetachDevice_RBAC(t *testing.T) {
 
 func TestAttachDevice_WrongHost(t *testing.T) {
 	s := testServer(t)
+	setDeviceGate(s, true, false) // disk attach requires operation_protocol_v1; then it forwards
 	ctx := adminCtx()
 
 	insertTestVM(t, ctx, s.db, "remote-vm", "other-host", "running")
@@ -632,6 +633,7 @@ func TestAttachDevice_WrongHost(t *testing.T) {
 
 func TestDetachDevice_WrongHost(t *testing.T) {
 	s := testServer(t)
+	setDeviceGate(s, true, false) // disk detach requires operation_protocol_v1; then it forwards
 	ctx := adminCtx()
 
 	insertTestVM(t, ctx, s.db, "remote-vm", "other-host", "running")
@@ -649,13 +651,14 @@ func TestDetachDevice_WrongHost(t *testing.T) {
 }
 
 func TestDetachDisk_DiskNotFoundLocal(t *testing.T) {
-	s := testServerWithLocks(t)
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
 	ctx := adminCtx()
 
-	insertTestVM(t, ctx, s.db, "local-vm", "test-host", "running")
+	seedDiskVM(t, s, "local-vm", "running")
 
-	// Call detachDisk directly — the disk doesn't exist.
-	_, err := s.detachDisk(ctx, "local-vm", "nonexistent-disk")
+	// Detach a disk that doesn't exist → NotFound (resolved under the lock).
+	_, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "local-vm", DiskName: "nonexistent-disk"})
 	if err == nil {
 		t.Fatal("expected error for missing disk")
 	}
@@ -665,11 +668,12 @@ func TestDetachDisk_DiskNotFoundLocal(t *testing.T) {
 }
 
 func TestAttachDisk_InvalidSize(t *testing.T) {
-	s := testServerWithLocks(t)
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
 	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
 
-	// Call attachDisk directly with invalid size.
-	_, err := s.attachDisk(ctx, "vm1", &pb.DiskSpec{Name: "data", Size: "abc"})
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{VmName: "vm1", Disk: &pb.DiskSpec{Name: "data", Size: "abc"}})
 	if err == nil {
 		t.Fatal("expected error for invalid size")
 	}
@@ -679,10 +683,12 @@ func TestAttachDisk_InvalidSize(t *testing.T) {
 }
 
 func TestAttachDisk_EmptySize(t *testing.T) {
-	s := testServerWithLocks(t)
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
 	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
 
-	_, err := s.attachDisk(ctx, "vm1", &pb.DiskSpec{Name: "data", Size: ""})
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{VmName: "vm1", Disk: &pb.DiskSpec{Name: "data", Size: ""}})
 	if err == nil {
 		t.Fatal("expected error for empty size")
 	}

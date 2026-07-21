@@ -893,7 +893,7 @@ func TestBuildPCIIntents_CanonicalizesAddress(t *testing.T) {
 	if len(intents) != 1 {
 		t.Fatalf("buildPCIIntents = %+v, want 1 intent", intents)
 	}
-	wantID := corrosion.DeterministicPCIIntentID("vm1",
+	wantID := corrosion.DeterministicPCIIntentID(
 		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: "0000:41:00.0"}), 0)
 	if intents[0].DeviceID != wantID {
 		t.Errorf("DeviceID = %q, want %q (derived from the canonical BDF)", intents[0].DeviceID, wantID)

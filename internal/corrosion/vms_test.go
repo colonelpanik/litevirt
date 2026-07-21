@@ -116,7 +116,7 @@ func TestInsertVMWithHardware_WritesNICsAndPCIIntents(t *testing.T) {
 	}
 	excl := "0000:41:00.0"
 	intents := []PCIIntentRecord{
-		{VMName: "vm1", DeviceID: DeterministicPCIIntentID("vm1", "gpu", 0), HostName: "node-a",
+		{VMName: "vm1", DeviceID: DeterministicPCIIntentID("gpu", 0), HostName: "node-a",
 			SelectorKind: "address", SelectorPayload: `{"address":"0000:41:00.0"}`, ExclusiveKey: &excl},
 	}
 

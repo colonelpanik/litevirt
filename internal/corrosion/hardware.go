@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/pci"
 )
 
 // NICRecord represents a single VM network interface as read from either the
@@ -319,6 +320,12 @@ func BridgeVMNICs(ctx context.Context, c *Client, vmName string) error {
 // artifact, not a request, and pinning on it would wrongly force every
 // future re-resolve onto the same host/device even though the selector
 // itself is portable.
+//
+// For kind "address" the exclusiveKey is the NORMALIZED BDF
+// (canonicalPCIAddress), NOT the raw lowercased string — it must equal the
+// address branch of CanonicalPCISelector so the same physical device yields
+// both the same device_id AND the same exclusive reservation regardless of the
+// input form (short "41:00.0" vs full "0000:41:00.0", case, whitespace).
 func ClassifyPCISelector(d *pb.DeviceSpec) (kind string, exclusiveKey *string) {
 	switch {
 	case d.Mapping != "":
@@ -328,48 +335,110 @@ func ClassifyPCISelector(d *pb.DeviceSpec) (kind string, exclusiveKey *string) {
 	case d.Type != "" || d.Vendor != "":
 		return "type", nil
 	default:
-		key := strings.ToLower(d.Address)
+		key := canonicalPCIAddress(d.Address)
 		return "address", &key
 	}
 }
 
-// CanonicalPCISelector builds the fixed-field-order string every peer must
-// derive identically from a DeviceSpec, for use as the canonicalSelector
-// argument to DeterministicPCIIntentID. Field order is FIXED — type|vendor|
-// model|count|address|sriov|parent|mig_profile|namespace|mapping — and must
-// never change: reordering would change every existing intent's derived id on
-// the next resolve, which the replication layer would see as brand-new rows
-// rather than updates to existing ones. proto.Marshal is deliberately NOT
-// used here: wire encoding is not guaranteed byte-identical across peers or
-// proto-library versions, whereas a plain string join is.
+// canonicalPCIAddress normalizes a concrete PCI address to the single form
+// shared by both the address-kind exclusive_key (ClassifyPCISelector) and the
+// address branch of CanonicalPCISelector, so a physical BDF's device_id and its
+// exclusive reservation agree regardless of input form. A malformed address
+// (pci.CanonicalBDF !ok) falls back to a lowercased/trimmed form so it still
+// yields a deterministic — if unnormalized — value rather than panicking.
+func canonicalPCIAddress(addr string) string {
+	if canon, ok := pci.CanonicalBDF(addr); ok {
+		return canon
+	}
+	return strings.ToLower(strings.TrimSpace(addr))
+}
+
+// CanonicalPCISelector builds the string every peer must derive identically
+// from a DeviceSpec, for use as the canonicalSelector argument to
+// DeterministicPCIIntentID. It is SELECTOR-PRECEDENCE-AWARE, sharing
+// ClassifyPCISelector's precedence (mapping → sriov → type/vendor →
+// concrete-address): it captures ONLY the SEMANTIC request for the classified
+// kind and is prefixed by that kind so two kinds can never collide.
+//
+// This is the COMMITTED foundation scheme, being DEFINED PRE-DEPLOYMENT (no
+// live cluster yet holds vm_pci_intent rows, so there is no online migration):
+//
+//   - The id is name-INDEPENDENT — the vm_name is NOT part of the derivation
+//     (DeterministicPCIIntentID takes no vmName), so a VM rename preserves the
+//     device_id and the adoption audit's re-derive converges instead of forking.
+//   - The id is resolution-artifact-INDEPENDENT for a PORTABLE selector
+//     (mapping/sriov/type/vendor): the resolved Address (a per-host artifact
+//     copied back onto the spec by a prior realization) is DELIBERATELY EXCLUDED,
+//     so re-resolving the same selector on a different host does not change the id.
+//   - A CONCRETE-ADDRESS selector hashes the NORMALIZED BDF (canonicalPCIAddress,
+//     equal to the exclusive_key ClassifyPCISelector emits), so short/uppercase/
+//     whitespace forms all fold to one id.
+//
+// proto.Marshal is deliberately NOT used here: wire encoding is not guaranteed
+// byte-identical across peers or proto-library versions, whereas a plain string
+// join is. The per-kind field set + ordering is part of the committed scheme;
+// changing it post-deployment would require an online migration.
 func CanonicalPCISelector(d *pb.DeviceSpec) string {
-	return strings.Join([]string{
-		d.Type,
-		d.Vendor,
-		d.Model,
-		strconv.Itoa(int(d.Count)),
-		d.Address,
-		strconv.FormatBool(d.Sriov),
-		d.Parent,
-		d.MigProfile,
-		strconv.Itoa(int(d.Namespace)),
-		d.Mapping,
-	}, "|")
+	switch {
+	case d.Mapping != "":
+		// Mapping semantics: the pool name plus the request-shaping fields. The
+		// resolved Address is a per-host artifact and is EXCLUDED.
+		return strings.Join([]string{
+			"mapping",
+			d.Mapping,
+			d.MigProfile,
+			strconv.Itoa(int(d.Namespace)),
+			strconv.Itoa(int(d.Count)),
+		}, "|")
+	case d.Sriov:
+		// SR-IOV request semantics: the parent PF / vendor / type it selects from,
+		// plus request-shaping fields. Address EXCLUDED.
+		return strings.Join([]string{
+			"sriov",
+			d.Type,
+			d.Vendor,
+			d.Parent,
+			d.Model,
+			d.MigProfile,
+			strconv.Itoa(int(d.Namespace)),
+			strconv.Itoa(int(d.Count)),
+		}, "|")
+	case d.Type != "" || d.Vendor != "":
+		// Type/vendor request semantics. Address EXCLUDED.
+		return strings.Join([]string{
+			"type",
+			d.Type,
+			d.Vendor,
+			d.Model,
+			d.MigProfile,
+			strconv.Itoa(int(d.Namespace)),
+			strconv.Itoa(int(d.Count)),
+		}, "|")
+	default:
+		// Concrete address: the normalized BDF IS the request identity.
+		return strings.Join([]string{"address", canonicalPCIAddress(d.Address)}, "|")
+	}
 }
 
 // DeterministicPCIIntentID derives a stable vm_pci_intent device_id from
-// (vmName, canonicalSelector, occurrence) — the first 32 hex chars (128
-// bits) of sha256(vmName + "\x00" + canonicalSelector + "\x00" +
-// strconv.Itoa(occurrence)). occurrence disambiguates a VM requesting the
-// IDENTICAL selector more than once (e.g. two GPUs via the same
-// type-selector): without mixing it in, both attaches would hash to the same
-// device_id and collide on vm_pci_intent's (vm_name, device_id) primary key.
+// (canonicalSelector, occurrence) — the first 32 hex chars (128 bits) of
+// sha256(canonicalSelector + "\x00" + strconv.Itoa(occurrence)). occurrence
+// disambiguates a VM requesting the IDENTICAL selector more than once (e.g. two
+// GPUs via the same type-selector): without mixing it in, both attaches would
+// hash to the same device_id and collide on vm_pci_intent's (vm_name,
+// device_id) primary key.
+//
+// The vm_name is NOT part of the derivation: the (vm_name, device_id) PK
+// already scopes the row per-VM and the hostdev xml_alias is per-domain, so
+// cross-VM device_id equality is harmless — and excluding the name is what lets
+// a rename preserve the id and lets the adoption audit's unconditional
+// re-derive+upsert converge onto the same row instead of forking a duplicate.
 // It is a pure function of its inputs so every peer synthesizes the
-// byte-identical id for the same spec + occurrence, which is required for
+// byte-identical id for the same selector + occurrence, which is required for
 // the intent to converge under replication rather than fork into duplicate
 // rows on different nodes.
-func DeterministicPCIIntentID(vmName, canonicalSelector string, occurrence int) string {
-	sum := sha256.Sum256([]byte(vmName + "\x00" + canonicalSelector + "\x00" + strconv.Itoa(occurrence)))
+func DeterministicPCIIntentID(canonicalSelector string, occurrence int) string {
+	sum := sha256.Sum256([]byte(canonicalSelector + "\x00" + strconv.Itoa(occurrence)))
 	return hex.EncodeToString(sum[:])[:32]
 }
 

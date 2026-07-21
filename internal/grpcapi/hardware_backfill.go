@@ -457,7 +457,7 @@ func (s *Server) makeIntentRecord(vmName string, d *pb.DeviceSpec, occ map[strin
 	occ[canonical] = occurrence + 1
 	return corrosion.PCIIntentRecord{
 		VMName:          vmName,
-		DeviceID:        corrosion.DeterministicPCIIntentID(vmName, canonical, occurrence),
+		DeviceID:        corrosion.DeterministicPCIIntentID(canonical, occurrence),
 		HostName:        s.hostName,
 		SelectorKind:    kind,
 		SelectorPayload: string(payload),

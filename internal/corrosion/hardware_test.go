@@ -42,6 +42,24 @@ func TestClassifyPCISelector_Precedence(t *testing.T) {
 	}
 }
 
+// TestDeterministicPCIIntentID_NameIndependent proves the device_id is a pure
+// function of (canonical_selector, occurrence) and carries NO VM name: the
+// signature no longer takes one, so a VM rename (which changes only the VM
+// name) cannot change the id, and the adoption audit's unconditional
+// re-derive+upsert converges onto the same row instead of forking a duplicate.
+// The (vm_name, device_id) PK already scopes the row per-VM, so cross-VM id
+// equality is harmless. Distinct selectors must still not collide.
+func TestDeterministicPCIIntentID_NameIndependent(t *testing.T) {
+	sel := CanonicalPCISelector(&pb.DeviceSpec{Type: "gpu", Vendor: "10de"})
+	if DeterministicPCIIntentID(sel, 0) != DeterministicPCIIntentID(sel, 0) {
+		t.Fatal("id must be a stable pure function of (selector, occurrence)")
+	}
+	other := CanonicalPCISelector(&pb.DeviceSpec{Type: "nic"})
+	if DeterministicPCIIntentID(sel, 0) == DeterministicPCIIntentID(other, 0) {
+		t.Fatal("distinct selectors must not collide")
+	}
+}
+
 // TestDeterministicPCIIntentID_OccurrenceDistinct guards that the occurrence
 // ordinal is mixed into the id: two DeviceSpecs producing the identical
 // canonical selector string (e.g. a VM requesting two GPUs by the same
@@ -49,26 +67,62 @@ func TestClassifyPCISelector_Precedence(t *testing.T) {
 // diverge, or the second attach could never be represented as a distinct
 // vm_pci_intent row (same vm_name, same device_id PK).
 func TestDeterministicPCIIntentID_OccurrenceDistinct(t *testing.T) {
-	sel := "type=gpu"
-	if DeterministicPCIIntentID("vm1", sel, 0) == DeterministicPCIIntentID("vm1", sel, 1) {
+	sel := CanonicalPCISelector(&pb.DeviceSpec{Type: "gpu"})
+	if DeterministicPCIIntentID(sel, 0) == DeterministicPCIIntentID(sel, 1) {
 		t.Fatal("identical selectors at different occurrence must differ")
 	}
 }
 
-// TestDeterministicPCIIntentID_StableAndDistinct guards that the id is a pure
-// function of its inputs (required for cross-peer convergence) and that
-// distinct vm/selector inputs do not collide.
-func TestDeterministicPCIIntentID_StableAndDistinct(t *testing.T) {
-	a := DeterministicPCIIntentID("vm1", "type=gpu", 0)
-	b := DeterministicPCIIntentID("vm1", "type=gpu", 0)
+// TestCanonicalPCISelector_MappingIgnoresResolvedAddress proves a mapping
+// selector's canonical form (and thus its id) is independent of the per-host
+// resolved Address — a resolution artifact copied back onto the spec. Two
+// mapping specs for the same pool that resolved to different BDFs on different
+// hosts must derive the SAME id, or a re-resolve on another host would fork a
+// duplicate intent row.
+func TestCanonicalPCISelector_MappingIgnoresResolvedAddress(t *testing.T) {
+	a := CanonicalPCISelector(&pb.DeviceSpec{Mapping: "gpu-pool", Address: "0000:41:00.0"})
+	b := CanonicalPCISelector(&pb.DeviceSpec{Mapping: "gpu-pool", Address: "0000:42:00.0"})
 	if a != b {
-		t.Fatalf("id not stable: %q != %q", a, b)
+		t.Fatalf("mapping canonical selector must ignore the resolved Address: %q != %q", a, b)
 	}
-	if DeterministicPCIIntentID("vm2", "type=gpu", 0) == a {
-		t.Fatal("distinct vm_name collided")
+	if DeterministicPCIIntentID(a, 0) != DeterministicPCIIntentID(b, 0) {
+		t.Fatal("mapping id must not depend on the resolved Address")
 	}
-	if DeterministicPCIIntentID("vm1", "type=nic", 0) == a {
-		t.Fatal("distinct selector collided")
+}
+
+// TestCanonicalPCISelector_TypeIgnoresAddress proves a type/vendor selector's
+// canonical form ignores a resolved Address, for the same reason as mapping: a
+// portable selector's id must be stable across host re-resolution.
+func TestCanonicalPCISelector_TypeIgnoresAddress(t *testing.T) {
+	a := CanonicalPCISelector(&pb.DeviceSpec{Type: "gpu", Address: "0000:41:00.0"})
+	b := CanonicalPCISelector(&pb.DeviceSpec{Type: "gpu"})
+	if a != b {
+		t.Fatalf("type canonical selector must ignore Address: %q != %q", a, b)
+	}
+	if DeterministicPCIIntentID(a, 0) != DeterministicPCIIntentID(b, 0) {
+		t.Fatal("type id must not depend on a resolution-artifact Address")
+	}
+}
+
+// TestCanonicalPCISelector_ConcreteAddressNormalized proves a concrete-address
+// selector folds non-canonical BDF forms (short form, letter-case, whitespace)
+// to one id, and that ClassifyPCISelector's address-kind exclusive_key is the
+// SAME normalized BDF — so the same physical device yields both the same id AND
+// the same exclusive reservation regardless of the input form.
+func TestCanonicalPCISelector_ConcreteAddressNormalized(t *testing.T) {
+	short := &pb.DeviceSpec{Address: "41:00.0"}
+	full := &pb.DeviceSpec{Address: "0000:41:00.0"}
+	if CanonicalPCISelector(short) != CanonicalPCISelector(full) {
+		t.Fatalf("non-canonical BDF must canonicalize: %q != %q",
+			CanonicalPCISelector(short), CanonicalPCISelector(full))
+	}
+	if DeterministicPCIIntentID(CanonicalPCISelector(short), 0) != DeterministicPCIIntentID(CanonicalPCISelector(full), 0) {
+		t.Fatal("short and full BDF forms must derive the same id")
+	}
+	_, ekShort := ClassifyPCISelector(short)
+	_, ekFull := ClassifyPCISelector(full)
+	if ekShort == nil || ekFull == nil || *ekShort != *ekFull || *ekShort != "0000:41:00.0" {
+		t.Fatalf("address exclusive_key must be the normalized BDF for both forms: %v / %v", ekShort, ekFull)
 	}
 }
 
@@ -318,7 +372,7 @@ func TestUpsertAndListPCIIntent(t *testing.T) {
 	spec := &pb.DeviceSpec{Address: "0000:41:00.0"}
 	kind, exclusiveKey := ClassifyPCISelector(spec)
 	sel := CanonicalPCISelector(spec)
-	deviceID := DeterministicPCIIntentID(vmName, sel, 0)
+	deviceID := DeterministicPCIIntentID(sel, 0)
 
 	rec := PCIIntentRecord{
 		VMName:          vmName,
@@ -348,7 +402,7 @@ func TestUpsertAndListPCIIntent(t *testing.T) {
 	portableSpec := &pb.DeviceSpec{Type: "gpu"}
 	pKind, pKey := ClassifyPCISelector(portableSpec)
 	pSel := CanonicalPCISelector(portableSpec)
-	pDeviceID := DeterministicPCIIntentID(vmName, pSel, 0)
+	pDeviceID := DeterministicPCIIntentID(pSel, 0)
 	if err := UpsertPCIIntent(ctx, c, PCIIntentRecord{
 		VMName: vmName, DeviceID: pDeviceID, HostName: "host1",
 		SelectorKind: pKind, SelectorPayload: pSel, ExclusiveKey: pKey,

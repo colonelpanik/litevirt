@@ -282,16 +282,18 @@ func (s *Server) autoDefineRestoredVM(
 		State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 		Project: project,
 	}
-	// pciIntents: a restored spec MAY carry Devices (the source VM had PCI
-	// passthrough), built via the same canonicalized-BDF path every other
-	// producer uses. Note the restored domain XML above never attaches
-	// Hostdevs from spec.Devices — this best-effort-records the declared intent
-	// for the Phase-6 backfill audit to confirm/reconcile against the actual
-	// (device-less) inactive definition, same as adopt=false below.
-	pciIntents := s.buildPCIIntents(targetName, spec.Devices)
-	// adopt=false: best-effort-populate vm_nics/vm_pci_intent, but don't
-	// self-certify adoption — the backfill audit confirms/reconciles.
-	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, false); err != nil {
+	// PCI intents: NONE. The restored domain built above (GenerateDomainXML)
+	// emits Disks + Networks only — it never attaches Hostdevs from spec.Devices
+	// (a disk replica / NBD overlay carries no physical device to recover), exactly
+	// like promote.go. Writing a concrete-address intent here would therefore create
+	// a live exclusive_key reservation (PCIIntentExclusiveOwner ignores
+	// adoption_state) for a device the VM never attaches — a phantom cross-VM
+	// reservation blocking another VM from attaching that BDF indefinitely. Pass nil;
+	// if the source VM genuinely had passthrough, the Phase-6 backfill audit imports
+	// it from the (device-less) inactive definition, which correctly imports nothing.
+	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
+	// the backfill audit confirms/reconciles.
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the

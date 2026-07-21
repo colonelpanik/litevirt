@@ -238,7 +238,7 @@ func (s *Server) attachPCIOwner(ctx context.Context, req *pb.AttachDeviceRequest
 		return nil, status.Errorf(codes.AlreadyExists, "PCI device %s is already attached to VM %q", normAddr, vmName)
 	}
 
-	deviceID := corrosion.DeterministicPCIIntentID(vmName, corrosion.CanonicalPCISelector(spec), 0)
+	deviceID := corrosion.DeterministicPCIIntentID(corrosion.CanonicalPCISelector(spec), 0)
 	payload, perr := protojson.Marshal(spec)
 	if perr != nil {
 		return nil, status.Errorf(codes.Internal, "encode selector payload: %v", perr)

@@ -327,7 +327,7 @@ func TestCreateVM_PCIIntentCanonicalizesAddress(t *testing.T) {
 		t.Fatalf("vm_pci_intent = %+v, want 1 row", intents)
 	}
 
-	wantID := corrosion.DeterministicPCIIntentID("vm1",
+	wantID := corrosion.DeterministicPCIIntentID(
 		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: "0000:41:00.0"}), 0)
 	if intents[0].DeviceID != wantID {
 		t.Errorf("vm_pci_intent[0].DeviceID = %q, want %q (id derived from the canonical BDF)",

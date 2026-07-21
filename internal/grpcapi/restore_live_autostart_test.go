@@ -215,12 +215,15 @@ func TestRestoreLive_AutoStart_FromManifestMetadata(t *testing.T) {
 
 // TestRestoreLive_AutoStart_PopulatesHardwareTables verifies autoDefineRestoredVM
 // populates the v42 vm_nics table for its network attachment (mirroring
-// CreateVM/task 7.1) and a vm_pci_intent row for a spec that carries Devices
-// (the source VM had PCI passthrough) — even though the restored domain XML
-// never attaches a matching <hostdev> (a disk replica/NBD overlay carries no
-// physical device to recover), leaving that gap for the Phase-6 backfill audit
-// to confirm/reconcile. hardware_adoption_state stays 'pending': a live-restore
-// does not self-certify adoption.
+// CreateVM/task 7.1) but writes NO vm_pci_intent rows even when the restored spec
+// carries a concrete-address Device: the restored domain XML never attaches a
+// matching <hostdev> (a disk replica/NBD overlay carries no physical device to
+// recover), so writing a concrete-address intent would create a phantom
+// cross-VM exclusive reservation (PCIIntentExclusiveOwner ignores adoption_state)
+// blocking another VM from attaching that BDF. The gap is left for the Phase-6
+// backfill audit, which imports from the (device-less) inactive definition and
+// therefore correctly imports nothing. hardware_adoption_state stays 'pending': a
+// live-restore does not self-certify adoption.
 func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"
@@ -268,13 +271,16 @@ func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListVMPCIIntents: %v", err)
 	}
-	if len(intents) != 1 {
-		t.Fatalf("vm_pci_intent = %+v, want 1 row", intents)
+	if len(intents) != 0 {
+		t.Fatalf("vm_pci_intent = %+v, want 0 rows (a restored, device-less domain must not reserve a phantom PCI intent)", intents)
 	}
-	wantID := corrosion.DeterministicPCIIntentID("vm1",
-		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: "0000:41:00.0"}), 0)
-	if intents[0].DeviceID != wantID {
-		t.Errorf("vm_pci_intent[0].DeviceID = %q, want %q (derived from the canonical BDF)", intents[0].DeviceID, wantID)
+	// And no phantom exclusive reservation: another VM must be free to claim that BDF.
+	owner, err := corrosion.PCIIntentExclusiveOwner(ctx, s.db, s.hostName, "0000:41:00.0")
+	if err != nil {
+		t.Fatalf("PCIIntentExclusiveOwner: %v", err)
+	}
+	if owner != "" {
+		t.Errorf("PCIIntentExclusiveOwner(0000:41:00.0) = %q, want \"\" (no phantom reservation from a device-less restore)", owner)
 	}
 
 	state, _, err := corrosion.GetHardwareAdoptionState(ctx, s.db, "vm1")

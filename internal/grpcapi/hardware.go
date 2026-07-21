@@ -139,7 +139,7 @@ func diskBusesFromSpec(specJSON string) map[string]string {
 // assembleVMHardwarePCI builds the PCI HardwareDevices for vm.
 //
 // vm_pci_intent/vm_pci_realizations are the Phase-6 authoritative source, but
-// are EMPTY fleet-wide until Task 6.3's backfill runs. Building PCI hardware
+// are EMPTY fleet-wide until the backfill pass runs. Building PCI hardware
 // ONLY from intents would make ListVMHardware (and any CLI/UI built on it)
 // silently show zero PCI devices for every existing passthrough VM today —
 // an inaccurate read model, not merely an incomplete one. So: when intents

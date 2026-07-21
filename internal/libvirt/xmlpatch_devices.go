@@ -25,7 +25,7 @@ type WantDisk struct {
 	Bus       string
 	Path      string
 	Cache     string
-	// ControllerModel is reserved for Task 3.3 (disk-controller selection); the
+	// ControllerModel is reserved for future disk-controller selection; the
 	// patcher does not read or emit it yet — matched disks mutate only <source>
 	// and the add path does not render a controller model.
 	ControllerModel string

@@ -1633,8 +1633,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// on disk — this is a read-time projection only.
 	if spec != nil {
 		// Spec.Disks: vm_disks is authoritative for name/size. Bus is a v42
-		// column not yet populated by every writer (Task 1.3 added the
-		// column; writers land in Phase 5/7), so resolve it as: vm_disks.Bus
+		// column not yet populated by every writer (writers land in
+		// Phase 5/7), so resolve it as: vm_disks.Bus
 		// if set, else the blob's bus for this disk name (never regress an
 		// existing disk to an empty bus), else the historical target-dev
 		// heuristic (sd* -> scsi, else virtio).
@@ -1701,7 +1701,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 				ds := &pb.DeviceSpec{}
 				// selector_payload is protojson (per resolveDeviceIntents'
 				// decode contract), NOT encoding/json — use protojson here
-				// too so this round-trips with whatever Task 6.3/7.1 write.
+				// too so this round-trips with whatever the backfill / create path write.
 				if err := protojson.Unmarshal([]byte(intent.SelectorPayload), ds); err != nil {
 					slog.Warn("failed to decode PCI intent selector payload", "vm", name, "device_id", intent.DeviceID, "error", err)
 					continue

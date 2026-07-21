@@ -23,9 +23,9 @@ import (
 	"github.com/litevirt/litevirt/internal/opjournal"
 )
 
-// Journaled, stopped-capable, at-most-once CONCRETE-ADDRESS PCI attach/detach
-// (Task 5.2d). This is the disk/NIC machinery (Tasks 5.2b/5.2c) applied to PCI
-// passthrough, but ONLY for a selector that ClassifyPCISelector resolves to
+// Journaled, stopped-capable, at-most-once CONCRETE-ADDRESS PCI attach/detach —
+// the disk/NIC journaled machinery applied to PCI passthrough, but ONLY for a
+// selector that ClassifyPCISelector resolves to
 // selector_kind=="address": the same operation_protocol_v1/hardware_v2 gates, the
 // shared owner-side at-most-once claim (deviceOpOutcome/deviceOpFromPeer), the same
 // journal-before-mutate DAG, and directional compensation. It additionally owns the

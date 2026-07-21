@@ -25,8 +25,8 @@ import (
 	"github.com/litevirt/litevirt/internal/opjournal"
 )
 
-// Journaled, stopped-capable, at-most-once NIC attach/detach (Task 5.2c). This is
-// the disk path's machinery (Task 5.2b, hotplug_disk.go) APPLIED to NICs: the same
+// Journaled, stopped-capable, at-most-once NIC attach/detach. This is the disk
+// path's machinery (hotplug_disk.go) APPLIED to NICs: the same
 // operation_protocol_v1/hardware_v2 gates, the same owner-side at-most-once claim
 // (deviceOpOutcome/deviceOpFromPeer, shared verbatim with disk), the same
 // journal-before-mutate DAG, and the same directional compensation. It additionally
@@ -34,7 +34,7 @@ import (
 // pre-latch dual-write to legacy vm_interfaces alongside the new vm_nics (§4.2/§8),
 // gated same-network-duplicate rejection, and persisting the model/security_groups
 // that the pre-conversion attachNIC silently dropped. The PCI path keeps its
-// current running-only behavior (Task 5.2d).
+// current running-only behavior.
 
 // ── request hashes ──────────────────────────────────────────────────────────
 

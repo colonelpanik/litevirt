@@ -36,7 +36,7 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 		return nil, err
 	}
 	// Disk, NIC, and CONCRETE-ADDRESS PCI attach are journaled, stopped-capable, and
-	// at-most-once (Tasks 5.2b/5.2c/5.2d): each owns its forward decision, the
+	// at-most-once: each owns its forward decision, the
 	// operation_protocol_v1/hardware_v2 gates, and the crash-safe DAG, and records
 	// its own device.attached event at the owner level. Only address-selector PCI is
 	// converted; SR-IOV/type/vendor/mapping selectors keep the legacy running-only
@@ -117,7 +117,7 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 		return nil, err
 	}
 	// Disk, NIC, and CONCRETE-ADDRESS PCI detach are journaled, stopped-capable, and
-	// at-most-once (Tasks 5.2b/5.2c/5.2d); each owns its forward + gates and records
+	// at-most-once; each owns its forward + gates and records
 	// its own device.detached event at the owner level. A PCI address that backs a
 	// live address-kind vm_pci_intent takes the journaled path; any other PCI address
 	// (attached via the legacy SR-IOV/type path or CreateVM ownership) keeps the

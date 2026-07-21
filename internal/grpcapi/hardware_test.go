@@ -13,7 +13,7 @@ import (
 )
 
 // TestListVMHardware_OwnershipFallback is the dormancy-fallback case:
-// vm_pci_intent is empty fleet-wide (pre-Task 6.3 backfill) for a VM that DOES
+// vm_pci_intent is empty fleet-wide (pre-backfill) for a VM that DOES
 // have a real PCI device attached via the live ownership table
 // (host_pci_devices.vm_name, the same source UpdateVM/reconcile already use).
 // ListVMHardware must still surface that device instead of silently showing
@@ -157,10 +157,10 @@ func TestListVMHardware_FromIntents(t *testing.T) {
 	}
 }
 
-// TestListVMHardware_AdoptionState is Task 8.2's driving test for the
-// read-model side: ListVMHardware must surface a VM's hardware-adoption
-// state and blocked-reason (Task 8.2 Step A) so the UI's Hardware tab can
-// render a gating banner, without requiring the caller to separately query
+// TestListVMHardware_AdoptionState verifies the read-model side:
+// ListVMHardware must surface a VM's hardware-adoption state and
+// blocked-reason so the UI's Hardware tab can render a gating banner,
+// without requiring the caller to separately query
 // GetHardwareAdoptionState.
 func TestListVMHardware_AdoptionState(t *testing.T) {
 	s := testServer(t)

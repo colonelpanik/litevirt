@@ -38,7 +38,7 @@ func (c *Client) AttachNIC(domainName, bridge, model, mac string) error {
 	iface := interfaceDevice{
 		Type:   "bridge",
 		MAC:    ifaceMAC{Address: mac},
-		Source:  ifaceSource{Bridge: bridge},
+		Source: ifaceSource{Bridge: bridge},
 		Model:  ifaceModel{Type: model},
 	}
 	return c.attachDeviceXML(domainName, iface)

@@ -631,7 +631,7 @@ func (m *mockGRPC) DetachDevice(_ context.Context, in *pb.DetachDeviceRequest, _
 	return &pb.VM{Name: in.VmName}, nil
 }
 
-// ListVMHardware backs the Hardware tab (Task 8.1). A settable response
+// ListVMHardware backs the Hardware tab. A settable response
 // field lets tests inject disk/NIC/PCI devices; a settable error simulates
 // the RPC failing (e.g. VM not found) so the handler's error path is testable.
 func (m *mockGRPC) ListVMHardware(_ context.Context, in *pb.ListVMHardwareRequest, _ ...grpc.CallOption) (*pb.ListVMHardwareResponse, error) {

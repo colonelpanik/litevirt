@@ -428,7 +428,7 @@ func TestInspectVM_Found(t *testing.T) {
 	}
 }
 
-// TestInspectVM_ProjectsDisksAndStorageVolume covers Task 4.1's two disk-side
+// TestInspectVM_ProjectsDisksAndStorageVolume covers two disk-side
 // requirements: pbVM.Disks[i].StorageVolume must come through (previously
 // dropped), and pbVM.Spec.Disks must be rebuilt from the authoritative
 // vm_disks rows rather than the stale spec blob — including the bus
@@ -557,7 +557,7 @@ func TestInspectVM_PreservesSpecDisksOnDiskReadError(t *testing.T) {
 	}
 }
 
-// TestInspectVM_ProjectsNetworkFromLegacyOverlay covers Task 4.1's network
+// TestInspectVM_ProjectsNetworkFromLegacyOverlay covers the network-projection
 // requirement in its Phase-4 dormancy state: vm_nics is empty fleet-wide, so
 // MergedVMNICs surfaces the legacy vm_interfaces row via its overlay, and
 // that overlay result — not the stale spec blob — must be what
@@ -578,8 +578,8 @@ func TestInspectVM_ProjectsNetworkFromLegacyOverlay(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	// Legacy vm_interfaces row -- vm_nics is empty in this phase (backfill,
-	// Task 6.3, hasn't run yet); MergedVMNICs must still surface it.
+	// Legacy vm_interfaces row -- vm_nics is empty in this phase (the
+	// backfill hasn't run yet); MergedVMNICs must still surface it.
 	if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{
 		VMName: "net-proj", NetworkName: "lan0", Ordinal: 0,
 		MAC: "52:54:00:aa:bb:cc", IP: "10.0.0.5",

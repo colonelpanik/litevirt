@@ -27,15 +27,16 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
-// Journaled, stopped-capable, at-most-once disk attach/detach (Task 5.2b). The
-// disk path of AttachDevice/DetachDevice is rewritten onto the v41 F1 operation
-// protocol: it is gated on operation_protocol_v1 (and, for a STOPPED VM,
-// hardware_v2), executes under the VM lock with a replicated at-most-once claim,
-// journals its irreversible plan to the host-local opjournal before mutating, and
-// on any failure compensates directionally (attach rolls back, detach rolls
-// forward). The NIC path is converted onto this same machinery in Task 5.2c, and
-// concrete-address PCI in Task 5.2d (hotplug_pci.go); SR-IOV/type/vendor/mapping
-// PCI selectors keep the legacy running-only path.
+// Journaled, stopped-capable, at-most-once disk attach/detach — the journaled
+// attach/detach machinery. The disk path of AttachDevice/DetachDevice is
+// rewritten onto the v41 F1 operation protocol: it is gated on
+// operation_protocol_v1 (and, for a STOPPED VM, hardware_v2), executes under
+// the VM lock with a replicated at-most-once claim, journals its irreversible
+// plan to the host-local opjournal before mutating, and on any failure
+// compensates directionally (attach rolls back, detach rolls forward). The NIC
+// path reuses this machinery, and concrete-address PCI reuses it
+// (hotplug_pci.go); SR-IOV/type/vendor/mapping PCI selectors keep the legacy
+// running-only path.
 
 // ── peer-trusted operation identity ─────────────────────────────────────────
 

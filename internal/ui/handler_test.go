@@ -53,8 +53,8 @@ func TestHandler_VMDetail_NotFound(t *testing.T) {
 	assertStatus(t, w, http.StatusNotFound)
 }
 
-// TestHandler_VMHardwareTab is Task 8.1's driving test: the Hardware tab
-// fragment renders the typed disk/NIC/PCI device table from ListVMHardware.
+// TestHandler_VMHardwareTab verifies the Hardware tab fragment renders the
+// typed disk/NIC/PCI device table from ListVMHardware.
 func TestHandler_VMHardwareTab(t *testing.T) {
 	mock := newDefaultMock()
 	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
@@ -89,7 +89,7 @@ func TestHandler_VMHardwareTab_NotFound(t *testing.T) {
 	assertStatus(t, w, http.StatusNotFound)
 }
 
-// TestHandler_HardwareTab_BlockedBanner is Task 8.2's driving test: when a
+// TestHandler_HardwareTab_BlockedBanner verifies that when a
 // VM's PCI adoption is blocked, the Hardware tab must surface the reason in a
 // banner and omit the attach forms (read-only) rather than let an operator
 // submit a mutation the backend will independently reject.
@@ -143,8 +143,8 @@ func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
 	assertContains(t, w, "detach-pci")
 }
 
-// TestHandler_HardwareTab_NICDropdown is Task 8.3's driving test for closing
-// the NIC-dropdown parity gap: now that the edit modal's Network pane is
+// TestHandler_HardwareTab_NICDropdown verifies the fix for the NIC-dropdown
+// parity gap: now that the edit modal's Network pane is
 // retired, the tab's own NIC-attach form must offer the same networks
 // dropdown the modal used to (not a free-text bridge input).
 func TestHandler_HardwareTab_NICDropdown(t *testing.T) {
@@ -431,8 +431,8 @@ func TestHandler_MigrateModal(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
-// TestHandler_EditVMModal is Task 8.3's driving test for retiring the
-// edit-modal device panes: the Hardware tab is now the sole surface for
+// TestHandler_EditVMModal verifies the retirement of the edit-modal device
+// panes: the Hardware tab is now the sole surface for
 // disks/NICs/PCI devices, so the modal must no longer render those panes and
 // must instead point operators at the tab.
 func TestHandler_EditVMModal(t *testing.T) {

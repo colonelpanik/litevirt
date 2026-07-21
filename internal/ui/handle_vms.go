@@ -102,7 +102,7 @@ func (s *Server) handleVMDetailPartial(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleVMHardwareTab renders the Hardware tab fragment: the typed disk/NIC/PCI
-// device table from ListVMHardware, plus (Task 8.2) per-type add forms and
+// device table from ListVMHardware, plus per-type add forms and
 // per-row detach controls that POST to the existing attach/detach handlers.
 // When the VM's PCI adoption state is "blocked", the template renders a
 // banner with the reason and omits the mutation forms instead.

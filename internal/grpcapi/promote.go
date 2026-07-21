@@ -701,6 +701,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
+	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics); only persisted on the renamed (new-row) path below
 	for i, n := range spec.Network {
 		mac := n.Mac
 		if renamed || mac == "" {
@@ -716,6 +717,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: targetName, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: n.Ip,
+		})
+		nicRecords = append(nicRecords, corrosion.NICRecord{
+			VMName:         targetName,
+			ID:             corrosion.DeterministicNICID(targetName, mac),
+			NetworkName:    n.Name,
+			Model:          n.Model,
+			MAC:            mac,
+			Ordinal:        i,
+			IP:             n.Ip,
+			TapDevice:      "",
+			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
 	}
 
@@ -776,7 +788,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 			Project: vm.Project,
 		}
-		if err := corrosion.InsertVM(ctx, s.db, rec, ifaceRecords, diskRecords); err != nil {
+		// adopt=false: a promotion best-effort-populates vm_nics from its rebuilt
+		// network attachments, but does not self-certify adoption — there is no
+		// PCI passthrough to carry (a disk replica has no hostdev record, so
+		// pciIntents is always nil here), and hardware_adoption_state stays at
+		// its schema default 'pending' for the Phase-6 backfill audit to confirm.
+		if err := corrosion.InsertVMWithHardware(ctx, s.db, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 	} else {

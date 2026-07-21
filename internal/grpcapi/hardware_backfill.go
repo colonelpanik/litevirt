@@ -406,6 +406,40 @@ func (s *Server) makeConcreteAddressIntent(vmName, bdf string, occ map[string]in
 	return s.makeIntentRecord(vmName, &pb.DeviceSpec{Address: bdf}, occ)
 }
 
+// buildPCIIntents builds one vm_pci_intent row per entry in devices, in
+// document order, sharing a single occurrence counter across the whole call
+// (see makeIntentRecord) so duplicate identical selectors don't collide. This
+// is the SAME canonicalize-then-classify sequence CreateVM originally ran
+// inline; it is now the one place every VM producer with a spec.Devices list
+// builds its create-time PCI intents, so the canonicalization fix below can
+// never be reintroduced-missing in a future producer.
+//
+// A concrete address is canonicalized before hashing (on a proto.Clone of the
+// DeviceSpec — devices itself, which a caller may later json.Marshal verbatim
+// for persistence, is never mutated): the Phase-6 backfill audit's
+// makeAddressedIntent normalizes to the libvirt-canonicalized XML BDF, so an
+// intent built from a non-canonical concrete BDF (e.g. "41:00.0") would
+// otherwise hash to a different device_id than the backfill derives for the
+// same physical device, forking into a divergent duplicate row.
+//
+// Returns nil for an empty/nil devices — the common case for a producer with
+// no PCI passthrough (clone, promote).
+func (s *Server) buildPCIIntents(vmName string, devices []*pb.DeviceSpec) []corrosion.PCIIntentRecord {
+	var pciIntents []corrosion.PCIIntentRecord
+	occ := map[string]int{}
+	for _, d := range devices {
+		nd := d
+		if d.Address != "" {
+			if canon, ok := pci.CanonicalBDF(d.Address); ok {
+				nd = proto.Clone(d).(*pb.DeviceSpec)
+				nd.Address = canon
+			}
+		}
+		pciIntents = append(pciIntents, s.makeIntentRecord(vmName, nd, occ))
+	}
+	return pciIntents
+}
+
 // makeIntentRecord classifies d, protojson-encodes it as the selector payload,
 // and assigns the deterministic device_id with the per-canonical-selector
 // occurrence ordinal so duplicate identical selectors do not collide.

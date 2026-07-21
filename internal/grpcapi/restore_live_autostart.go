@@ -182,6 +182,7 @@ func (s *Server) autoDefineRestoredVM(
 	// restored VM can't collide on L2 with the still-running original.
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
+	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	for i, n := range spec.Network {
 		mac := n.Mac
 		if renamed || mac == "" {
@@ -197,6 +198,17 @@ func (s *Server) autoDefineRestoredVM(
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: targetName, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: n.Ip,
+		})
+		nicRecords = append(nicRecords, corrosion.NICRecord{
+			VMName:         targetName,
+			ID:             corrosion.DeterministicNICID(targetName, mac),
+			NetworkName:    n.Name,
+			Model:          n.Model,
+			MAC:            mac,
+			Ordinal:        i,
+			IP:             n.Ip,
+			TapDevice:      "",
+			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
 	}
 
@@ -270,7 +282,16 @@ func (s *Server) autoDefineRestoredVM(
 		State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 		Project: project,
 	}
-	if err := corrosion.InsertVM(ctx, s.db, vmRecord, ifaceRecords, diskRecords); err != nil {
+	// pciIntents: a restored spec MAY carry Devices (the source VM had PCI
+	// passthrough), built via the same canonicalized-BDF path every other
+	// producer uses. Note the restored domain XML above never attaches
+	// Hostdevs from spec.Devices — this best-effort-records the declared intent
+	// for the Phase-6 backfill audit to confirm/reconcile against the actual
+	// (device-less) inactive definition, same as adopt=false below.
+	pciIntents := s.buildPCIIntents(targetName, spec.Devices)
+	// adopt=false: best-effort-populate vm_nics/vm_pci_intent, but don't
+	// self-certify adoption — the backfill audit confirms/reconciles.
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the

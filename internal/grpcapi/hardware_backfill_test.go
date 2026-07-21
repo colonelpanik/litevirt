@@ -870,3 +870,63 @@ func TestHardwareBridge_DoesNotRegressNewerVMNics(t *testing.T) {
 		t.Fatalf("bridge regressed a newer vm_nics row with stale legacy data: %+v", live[0])
 	}
 }
+
+// ── buildPCIIntents (task 7.2's shared create-time PCI-intent builder) ─────
+//
+// buildPCIIntents is the extraction of CreateVM's inline canonicalize+classify
+// loop (task 7.1) into a helper every producer with a spec.Devices list calls,
+// so the create-time-vs-backfill device_id convergence fix can't be
+// reintroduced-missing in a future producer. TestCreateVM_PCIIntentCanonicalizesAddress
+// (vm_test.go) already covers it end-to-end through the real RPC; these tests
+// pin the helper's own contract directly.
+
+// TestBuildPCIIntents_CanonicalizesAddress mirrors
+// TestCreateVM_PCIIntentCanonicalizesAddress at the helper level: a
+// non-canonical concrete BDF must hash to the SAME device_id the Phase-6
+// backfill audit would derive for the canonical form, and the caller's
+// devices slice must not be mutated.
+func TestBuildPCIIntents_CanonicalizesAddress(t *testing.T) {
+	s := testServer(t)
+	devices := []*pb.DeviceSpec{{Address: "41:00.0"}}
+
+	intents := s.buildPCIIntents("vm1", devices)
+	if len(intents) != 1 {
+		t.Fatalf("buildPCIIntents = %+v, want 1 intent", intents)
+	}
+	wantID := corrosion.DeterministicPCIIntentID("vm1",
+		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: "0000:41:00.0"}), 0)
+	if intents[0].DeviceID != wantID {
+		t.Errorf("DeviceID = %q, want %q (derived from the canonical BDF)", intents[0].DeviceID, wantID)
+	}
+	if devices[0].Address != "41:00.0" {
+		t.Errorf("input devices[0].Address = %q, want unchanged 41:00.0 (must not mutate the caller's slice)", devices[0].Address)
+	}
+}
+
+// TestBuildPCIIntents_SharedOccurrenceCounter verifies two identical selectors
+// in one call get distinct device_ids (occurrence 0 and 1) — the same
+// disambiguation the backfill audit relies on for a VM requesting the same
+// selector twice (e.g. two GPUs via one type-selector).
+func TestBuildPCIIntents_SharedOccurrenceCounter(t *testing.T) {
+	s := testServer(t)
+	devices := []*pb.DeviceSpec{
+		{Type: "gpu", Vendor: "10de"},
+		{Type: "gpu", Vendor: "10de"},
+	}
+	intents := s.buildPCIIntents("vm1", devices)
+	if len(intents) != 2 {
+		t.Fatalf("buildPCIIntents = %+v, want 2 intents", intents)
+	}
+	if intents[0].DeviceID == intents[1].DeviceID {
+		t.Errorf("two identical selectors collided on the same device_id %q", intents[0].DeviceID)
+	}
+}
+
+// TestBuildPCIIntents_EmptyDevicesIsNil covers the common case for a producer
+// with no PCI passthrough (clone, promote): nil in, nil out.
+func TestBuildPCIIntents_EmptyDevicesIsNil(t *testing.T) {
+	s := testServer(t)
+	if got := s.buildPCIIntents("vm1", nil); got != nil {
+		t.Errorf("buildPCIIntents(nil) = %+v, want nil", got)
+	}
+}

@@ -154,6 +154,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// ── Networks: fresh MACs (don't duplicate the source's) ──────────────
 	var netConfigs []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
+	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	for i, n := range srcSpec.Network {
 		mac := lv.GenerateMAC()
 		bridge := n.Name
@@ -177,6 +178,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		}
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: req.Target, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: ip,
+		})
+		nicRecords = append(nicRecords, corrosion.NICRecord{
+			VMName:         req.Target,
+			ID:             corrosion.DeterministicNICID(req.Target, mac),
+			NetworkName:    n.Name,
+			Model:          n.Model,
+			MAC:            mac,
+			Ordinal:        i,
+			IP:             ip,
+			TapDevice:      "",
+			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
 	}
 
@@ -211,7 +223,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	mem := int(srcSpec.MemoryMib)
 	srcSpec.Name = req.Target
 	srcSpec.Project = project
-	srcSpec.Devices = nil          // v1: don't clone PCI passthrough (device may be in use)
+	srcSpec.Devices = nil           // v1: don't clone PCI passthrough (device may be in use)
 	srcSpec.Uuid = uuid.NewString() // fresh identity ⇒ fresh vTPM (never copy the source TPM secret) (G1)
 	for i := range srcSpec.Network {
 		if i < len(ifaceRecords) {
@@ -272,10 +284,16 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		state = "running"
 	}
 
-	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+	// adopt=false: the clone best-effort-populates vm_nics from its fresh network
+	// attachments, but (like every producer besides CreateVM) does not
+	// self-certify adoption — hardware_adoption_state stays at its schema
+	// default 'pending' for the Phase-6 backfill audit to confirm/reconcile.
+	// pciIntents is always nil: srcSpec.Devices was dropped above (v1 clones
+	// never carry PCI passthrough).
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, corrosion.VMRecord{
 		Name: req.Target, StackName: src.StackName, HostName: s.hostName, Spec: string(specJSON),
 		State: state, CPUActual: cpu, MemActual: mem, Project: project,
-	}, ifaceRecords, diskRecords); err != nil {
+	}, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		rollbackClone(state == "running")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
 	}

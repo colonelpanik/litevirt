@@ -213,6 +213,82 @@ func TestRestoreLive_AutoStart_FromManifestMetadata(t *testing.T) {
 	<-done
 }
 
+// TestRestoreLive_AutoStart_PopulatesHardwareTables verifies autoDefineRestoredVM
+// populates the v42 vm_nics table for its network attachment (mirroring
+// CreateVM/task 7.1) and a vm_pci_intent row for a spec that carries Devices
+// (the source VM had PCI passthrough) — even though the restored domain XML
+// never attaches a matching <hostdev> (a disk replica/NBD overlay carries no
+// physical device to recover), leaving that gap for the Phase-6 backfill audit
+// to confirm/reconcile. hardware_adoption_state stays 'pending': a live-restore
+// does not self-certify adoption.
+func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	fake := libvirtfake.New()
+	s.virt = fake
+
+	spec := &pb.VMSpec{
+		Name: "vm1", Cpu: 2, MemoryMib: 2048, Machine: "q35", Firmware: "uefi",
+		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "e1000"}},
+		Devices: []*pb.DeviceSpec{{Address: "41:00.0"}}, // non-canonical BDF, see the DeviceID assertion below
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+
+	data := make([]byte, pbsstore.ChunkSize)
+	repoDir, ts := seedLiveRepo(t, data, string(specJSON))
+	target := filepath.Join(t.TempDir(), "live.qcow2")
+
+	_, cancel, done := runRestoreLiveUntil(t, s, &pb.RestoreLiveRequest{
+		RepoPath: repoDir, VmName: "vm1", DiskName: "root", Timestamp: ts,
+		TargetPath: target, AutoStart: true,
+	}, pb.RestoreLiveProgress_STARTED)
+	defer cancel()
+
+	ctx := context.Background()
+	ifaces, err := corrosion.GetVMInterfaces(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("GetVMInterfaces: %v", err)
+	}
+	if len(ifaces) != 1 || ifaces[0].NetworkName != "lo" {
+		t.Fatalf("vm_interfaces = %+v, want 1 row on lo", ifaces)
+	}
+
+	nics, err := corrosion.GetVMNICsRaw(ctx, s.db, "vm_nics", "vm1")
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw: %v", err)
+	}
+	if len(nics) != 1 || nics[0].NetworkName != "lo" || nics[0].Model != "e1000" || nics[0].MAC != ifaces[0].MAC {
+		t.Fatalf("vm_nics = %+v, want 1 e1000 row on lo matching vm_interfaces MAC %q", nics, ifaces[0].MAC)
+	}
+
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("vm_pci_intent = %+v, want 1 row", intents)
+	}
+	wantID := corrosion.DeterministicPCIIntentID("vm1",
+		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: "0000:41:00.0"}), 0)
+	if intents[0].DeviceID != wantID {
+		t.Errorf("vm_pci_intent[0].DeviceID = %q, want %q (derived from the canonical BDF)", intents[0].DeviceID, wantID)
+	}
+
+	state, _, err := corrosion.GetHardwareAdoptionState(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "pending" {
+		t.Errorf("hardware_adoption_state = %q, want pending (live-restore does not self-certify adoption)", state)
+	}
+
+	cancel()
+	<-done
+}
+
 func TestRestoreLive_AutoStart_OperatorSuppliedSpec(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"

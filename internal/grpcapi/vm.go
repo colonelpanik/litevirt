@@ -29,7 +29,6 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/notify"
-	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -670,32 +669,14 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		for _, addr := range pciAddrs {
 			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
 		}
-		// vm_pci_intent rows for the declared devices, built via the SAME
-		// classify/encode helper (and shared occurrence counter) the Phase-6
-		// backfill audit uses, in spec.Devices document order — so a create-time
-		// intent's device_id is byte-identical to what a later backfill pass would
-		// derive for the same selector. Built AFTER allocateDevices so a
-		// resource-mapping spec's resolved address (frozen onto spec.Address above)
-		// is captured, not the pre-resolution mapping alone.
-		//
-		// A concrete address is canonicalized before hashing (on a cloned spec —
-		// the shared input spec, which CreateVM later json.Marshals verbatim, is
-		// never mutated): the backfill's makeAddressedIntent normalizes to the
-		// libvirt-canonicalized XML BDF, so a create-time intent built from a
-		// non-canonical concrete BDF (e.g. "41:00.0") would otherwise hash to a
-		// different device_id than the backfill derives for the same physical
-		// device, forking into a divergent duplicate row.
-		occ := map[string]int{}
-		for _, d := range spec.Devices {
-			nd := d
-			if d.Address != "" {
-				if canon, ok := pci.CanonicalBDF(d.Address); ok {
-					nd = proto.Clone(d).(*pb.DeviceSpec)
-					nd.Address = canon
-				}
-			}
-			pciIntents = append(pciIntents, s.makeIntentRecord(spec.Name, nd, occ))
-		}
+		// vm_pci_intent rows for the declared devices, built via the shared
+		// buildPCIIntents helper (same classify/encode/canonicalize sequence the
+		// Phase-6 backfill audit uses) — so a create-time intent's device_id is
+		// byte-identical to what a later backfill pass would derive for the same
+		// selector. Built AFTER allocateDevices so a resource-mapping spec's
+		// resolved address (frozen onto spec.Address above) is captured, not the
+		// pre-resolution mapping alone.
+		pciIntents = s.buildPCIIntents(spec.Name, spec.Devices)
 	}
 
 	domXML, err := lv.GenerateDomainXML(vmCfg)

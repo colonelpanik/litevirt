@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -225,26 +227,41 @@ func countVMDisks(ctx context.Context, db *corrosion.Client, vmName string) int 
 // overflow — no real disk request needs a size anywhere near this cap.
 const maxDiskSizeGB = 1 << 20 // ~1 PiB
 
+// diskSizeRe matches an exact disk-size string: a run of digits, optional
+// whitespace, then an optional unit suffix — and nothing else. The trailing
+// $ anchor is what makes parsing exact: any leftover characters (garbage
+// after a valid unit, a second token, a decimal point, a bare sign) fail to
+// match rather than being silently ignored.
+var diskSizeRe = regexp.MustCompile(`^([0-9]+)\s*([A-Za-z]*)$`)
+
 // parseDiskSize parses sizes like "20G", "100G" into GB. It fails closed: a
-// non-positive magnitude, an unrecognized unit, or a magnitude that would scale
-// beyond maxDiskSizeGB are all rejected rather than silently accepted (a bare
-// unknown unit must NOT be treated as GiB).
+// non-positive magnitude, an unrecognized unit, a magnitude that would scale
+// beyond maxDiskSizeGB, or any input with trailing/malformed content beyond a
+// plain "<digits><unit>" are all rejected rather than silently accepted (a
+// bare unknown unit must NOT be treated as GiB, and garbage after a valid
+// unit must NOT be truncated away).
 func parseDiskSize(size string) (int, error) {
 	if size == "" {
 		return 0, fmt.Errorf("size is required")
 	}
-	var n int
-	var unit string
-	_, err := fmt.Sscanf(size, "%d%s", &n, &unit)
-	if err != nil {
-		// Try plain number.
-		unit = ""
-		if _, err = fmt.Sscanf(size, "%d", &n); err != nil {
-			return 0, fmt.Errorf("cannot parse %q", size)
-		}
+	m := diskSizeRe.FindStringSubmatch(size)
+	if m == nil {
+		return 0, fmt.Errorf("cannot parse %q", size)
 	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, fmt.Errorf("cannot parse %q", size)
+	}
+	unit := m[2]
 	if n <= 0 {
 		return 0, fmt.Errorf("size must be positive: %q", size)
+	}
+	// Bound n before it is ever multiplied (the T/TB branch below computes
+	// n*1024): without this, a large-but-parseable n can overflow the int64
+	// multiply — wrapping to zero or negative — and slip past the final
+	// gb > maxDiskSizeGB check with a nil error.
+	if n > maxDiskSizeGB {
+		return 0, fmt.Errorf("size %q exceeds the maximum allowed disk size", size)
 	}
 	var gb int
 	switch unit {

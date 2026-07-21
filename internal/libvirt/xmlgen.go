@@ -151,6 +151,49 @@ func MaxVCPUFromXML(domXML string) int {
 	return d.VCPU.Value
 }
 
+// HostdevSourcePCIAddresses extracts the host source BDF of every PCI
+// <hostdev> (mode="subsystem" type="pci") in a domain XML, reconstructed from
+// its <source><address domain=… bus=… slot=… function=…/> into the standard
+// "dddd:bb:ss.f" form (the 0x-prefixed attribute values are stripped, not
+// re-padded — the caller canonicalizes via pci.CanonicalBDF). This is the
+// membership authority the hardware backfill audit reads: the set of PCI
+// passthrough devices actually present in the persistent (inactive) domain
+// definition, as opposed to whatever the stored VMSpec.Devices blob claims.
+// Non-PCI hostdevs (usb/scsi) and any element outside <devices> are ignored;
+// a device with no source address is skipped. Returns nil on an unparseable
+// document (the caller treats that as "no trustworthy inactive definition").
+func HostdevSourcePCIAddresses(domXML string) []string {
+	var d struct {
+		Hostdevs []struct {
+			Type   string `xml:"type,attr"`
+			Source struct {
+				Address struct {
+					Domain   string `xml:"domain,attr"`
+					Bus      string `xml:"bus,attr"`
+					Slot     string `xml:"slot,attr"`
+					Function string `xml:"function,attr"`
+				} `xml:"address"`
+			} `xml:"source"`
+		} `xml:"devices>hostdev"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return nil
+	}
+	var out []string
+	for _, h := range d.Hostdevs {
+		if h.Type != "pci" {
+			continue
+		}
+		a := h.Source.Address
+		if a.Domain == "" && a.Bus == "" && a.Slot == "" && a.Function == "" {
+			continue // no source address (e.g. a MIG/mdev hostdev) — nothing to match
+		}
+		strip := func(v string) string { return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(v)), "0x") }
+		out = append(out, strip(a.Domain)+":"+strip(a.Bus)+":"+strip(a.Slot)+"."+strip(a.Function))
+	}
+	return out
+}
+
 // isQ35Machine reports whether m is the q35 machine family, in either the
 // unversioned alias form ("q35", or "" which GenerateDomainXML defaults to q35)
 // or a pinned versioned form ("pc-q35-9.0"). Used to gate Secure Boot, which

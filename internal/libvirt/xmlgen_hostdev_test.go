@@ -48,6 +48,36 @@ func TestParsePCIAddress_Invalid(t *testing.T) {
 	}
 }
 
+func TestHostdevSourcePCIAddresses(t *testing.T) {
+	// Two PCI hostdevs (0x-prefixed attrs, reconstructed to bare BDF), plus a
+	// non-PCI (usb) hostdev that must be ignored, plus a hostdev with no source
+	// address that must be skipped.
+	domXML := `<domain type='kvm'><name>gpu</name><devices>` +
+		`<hostdev mode='subsystem' type='pci' managed='yes'><source><address domain='0x0000' bus='0x41' slot='0x00' function='0x0'/></source></hostdev>` +
+		`<hostdev mode='subsystem' type='pci' managed='yes'><source><address domain='0x0000' bus='0xB4' slot='0x02' function='0x3'/></source></hostdev>` +
+		`<hostdev mode='subsystem' type='usb'><source><vendor id='0x1234'/><product id='0x5678'/></source></hostdev>` +
+		`<hostdev mode='subsystem' type='pci'><source></source></hostdev>` +
+		`</devices></domain>`
+
+	got := HostdevSourcePCIAddresses(domXML)
+	want := []string{"0000:41:00.0", "0000:b4:02.3"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("addr[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	if r := HostdevSourcePCIAddresses("not xml <<<"); r != nil {
+		t.Errorf("unparseable XML: got %v, want nil", r)
+	}
+	if r := HostdevSourcePCIAddresses(`<domain><devices></devices></domain>`); len(r) != 0 {
+		t.Errorf("no hostdevs: got %v, want empty", r)
+	}
+}
+
 func TestGenerateDomainXML_Hostdev(t *testing.T) {
 	cfg := VMConfig{
 		Name:      "gpu-vm",

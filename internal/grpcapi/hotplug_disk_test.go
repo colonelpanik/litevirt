@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,6 +79,20 @@ func hasDiskName(disks []corrosion.DiskRecord, name string) bool {
 		}
 	}
 	return false
+}
+
+// diskTargetDev resolves the target-dev the attach allocated for a named disk (robust
+// to the historical vda/target-dev scheme instead of hard-coding "vdb").
+func diskTargetDev(t *testing.T, ctx context.Context, s *Server, vm, disk string) string {
+	t.Helper()
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, vm)
+	for _, d := range disks {
+		if d.DiskName == disk {
+			return d.TargetDev
+		}
+	}
+	t.Fatalf("disk %q row not found on %q: %+v", disk, vm, disks)
+	return ""
 }
 
 // ── attach: stopped realizes ────────────────────────────────────────────────
@@ -411,5 +426,119 @@ func TestDetachDevice_PreservesBackingFile(t *testing.T) {
 	// Backing file PRESERVED (§12 — never deleted on detach).
 	if _, err := os.Stat(p); err != nil {
 		t.Fatalf("detach must NOT delete the backing file %s: %v", p, err)
+	}
+}
+
+// ── running mutation verifies BOTH live and persistent config (§7) ────────────
+
+// TestAttachDevice_RunningVerifiesLiveAndPersistent asserts a running attach is
+// verified present in BOTH the live domain AND the persistent (inactive) definition.
+// AttachDisk applies live+config, so completing on a live-only landing would let the
+// disk silently (dis)appear on the next VM start.
+func TestAttachDevice_RunningVerifiesLiveAndPersistent(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	td := diskTargetDev(t, ctx, s, "vm1", "data1")
+
+	// Live view.
+	srcs, _ := fake.DomainDiskSources("vm1")
+	if _, ok := srcs[td]; !ok {
+		t.Fatalf("disk %s absent from the live domain: %v", td, srcs)
+	}
+	// Persistent (inactive) config.
+	inactive, err := fake.DumpXMLInactive("vm1")
+	if err != nil {
+		t.Fatalf("dump inactive: %v", err)
+	}
+	if !diskDevInXML(inactive, td) {
+		t.Fatalf("disk %s absent from the persistent definition:\n%s", td, inactive)
+	}
+}
+
+// TestAttachDevice_RunningConfigDivergenceRollsBack models a live-succeeded-but-
+// config-not-applied divergence on a running attach: the disk lands in the live domain
+// but never reaches the persistent config. The both-state verify must catch it and
+// roll the attach back to a clean state (no row, op-owned file removed, barrier
+// cleared) rather than complete an inconsistent attach.
+func TestAttachDevice_RunningConfigDivergenceRollsBack(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	// A running domain always has a persistent definition; give it one (with only the
+	// root disk) so a live-only attach is a genuine reads-succeed-but-membership-wrong
+	// divergence — not an unreadable-definition case (which is left recoverable).
+	fake.SetInactiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-root.qcow2'/><target dev='vda' bus='virtio'/></disk>"+
+		"</devices></domain>")
+	fake.SkipConfigOnDiskMutation = true // live lands, persistent config does NOT
+
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
+	})
+	if err == nil {
+		t.Fatal("a config-vs-live divergence on a running attach must fail verification, not complete")
+	}
+	// Rolled back: no committed row.
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1")
+	if hasDiskName(disks, "data1") {
+		t.Fatalf("row must not survive a rolled-back attach: %+v", disks)
+	}
+	// Op-owned backing file removed by rollback.
+	p, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+		t.Fatalf("rollback must delete the op-owned backing file %s (stat err=%v)", p, statErr)
+	}
+	// Barrier released (op reached a terminal failure via compensation).
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("mutation barrier not cleared after rollback: %q", vm.ActiveOperationID)
+	}
+}
+
+// TestDetachDevice_RunningConfigDivergenceCaught models a live-succeeded-but-config-
+// retained divergence on a running detach: the disk leaves the live domain but lingers
+// in the persistent config. The both-state verify must catch it (never
+// CompleteVMOperation) so the disk cannot silently reappear on the next VM start.
+func TestDetachDevice_RunningConfigDivergenceCaught(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	td := diskTargetDev(t, ctx, s, "vm1", "data1")
+
+	// The live detach lands but the persistent config keeps the disk.
+	fake.SkipConfigOnDiskMutation = true
+	_, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", DiskName: "data1"})
+	if err == nil {
+		t.Fatal("a config-vs-live divergence on a running detach must fail verification, not complete")
+	}
+	// The disk really did leave the live domain (forward progress) but still lingers in
+	// the persistent config — proving the both-state check, not a live-only check,
+	// caught the divergence.
+	srcs, _ := fake.DomainDiskSources("vm1")
+	if _, ok := srcs[td]; ok {
+		t.Fatalf("disk %s should be gone from the live domain: %v", td, srcs)
+	}
+	inactive, _ := fake.DumpXMLInactive("vm1")
+	if !diskDevInXML(inactive, td) {
+		t.Fatalf("test setup: persistent config should still list %s (the modeled divergence)", td)
 	}
 }

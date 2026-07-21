@@ -71,11 +71,16 @@ type Fake struct {
 	FailStartDomain  func(name string) error
 	// FailAttachDisk / FailDetachDisk inject a live disk hot-plug primitive failure so
 	// scenarios can exercise attach-rollback / detach-forward compensation.
-	FailAttachDisk      func(domain, path, targetDev, bus string) error
-	FailDetachDisk      func(domain, targetDev string) error
-	FailShutdownDomain  func(name string) error
-	FailUndefineDomain  func(name string, removeStorage bool) error
-	FailUndefinePreserv func(name string) error
+	FailAttachDisk func(domain, path, targetDev, bus string) error
+	FailDetachDisk func(domain, targetDev string) error
+	// SkipConfigOnDiskMutation, when true, makes AttachDisk/DetachDisk update ONLY the
+	// live view (diskSources) and NOT the persistent (inactive) config — modeling a
+	// libvirt DomainDeviceModifyLive-succeeded-but-Config-not-applied divergence so a
+	// both-state (live+persistent) verification can be exercised.
+	SkipConfigOnDiskMutation bool
+	FailShutdownDomain       func(name string) error
+	FailUndefineDomain       func(name string, removeStorage bool) error
+	FailUndefinePreserv      func(name string) error
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -355,6 +360,16 @@ func (f *Fake) DefinedXML(name string) string {
 	return f.xml[name]
 }
 
+// SetInactiveXML sets a domain's persistent (inactive) XML directly, without altering
+// its lifecycle state. Scenarios use it to model a RUNNING domain that already has a
+// persistent definition (which a real running domain always does) so a live-vs-config
+// divergence can be exercised. Mirrors SetDiskSource/SetState.
+func (f *Fake) SetInactiveXML(name, xml string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.xml[name] = xml
+}
+
 func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
 	// The fake transitions synchronously; the wait always succeeds.
 	f.mu.Lock()
@@ -393,6 +408,12 @@ func (f *Fake) AttachDisk(domainName, path, targetDev, bus string) error {
 		f.diskSources[domainName] = map[string]string{}
 	}
 	f.diskSources[domainName][targetDev] = path
+	// The real AttachDisk applies DomainDeviceModifyLive|Config, so the disk lands in
+	// the persistent (inactive) definition too. Reflect that in f.xml (what
+	// DumpXMLInactive reads) unless a scenario is modeling a live-only divergence.
+	if !f.SkipConfigOnDiskMutation {
+		f.xml[domainName] = insertDiskIntoDomainXML(f.xml[domainName], domainName, path, targetDev, bus)
+	}
 	f.attachDiskN++
 	f.record("attach-disk", domainName, fmt.Sprintf("path=%s target=%s bus=%s", path, targetDev, bus))
 	return nil
@@ -408,9 +429,70 @@ func (f *Fake) DetachDisk(domainName, targetDev string) error {
 	if f.diskSources[domainName] != nil {
 		delete(f.diskSources[domainName], targetDev)
 	}
+	// The real DetachDisk applies DomainDeviceModifyLive|Config, so the disk leaves the
+	// persistent (inactive) definition too — unless a scenario models a live-only
+	// divergence, in which case the config keeps the disk.
+	if !f.SkipConfigOnDiskMutation {
+		f.xml[domainName] = removeDiskFromDomainXML(f.xml[domainName], targetDev)
+	}
 	f.detachDiskN++
 	f.record("detach-disk", domainName, "target="+targetDev)
 	return nil
+}
+
+// diskDevInDomainXML reports whether a domain XML carries a <target dev='X'.../>
+// (either quote style). Mirrors grpcapi.diskDevInXML — the substring the
+// running-path membership verification keys off.
+func diskDevInDomainXML(domainXML, targetDev string) bool {
+	if domainXML == "" || targetDev == "" {
+		return false
+	}
+	return strings.Contains(domainXML, "dev='"+targetDev+"'") || strings.Contains(domainXML, `dev="`+targetDev+`"`)
+}
+
+// insertDiskIntoDomainXML adds a <disk> element carrying <target dev='X'.../> to a
+// domain's persistent XML, synthesizing a minimal skeleton when the domain has no
+// stored XML yet (a running fake VM seeded without DefineDomain). Idempotent: an
+// already-present target dev is left untouched.
+func insertDiskIntoDomainXML(domainXML, domainName, path, targetDev, bus string) string {
+	if domainXML == "" {
+		domainXML = "<domain type='kvm'><name>" + domainName + "</name><devices></devices></domain>"
+	}
+	if diskDevInDomainXML(domainXML, targetDev) {
+		return domainXML
+	}
+	disk := "<disk type='file' device='disk'><source file='" + path + "'/><target dev='" + targetDev + "' bus='" + bus + "'/></disk>"
+	if strings.Contains(domainXML, "</devices>") {
+		return strings.Replace(domainXML, "</devices>", disk+"</devices>", 1)
+	}
+	return domainXML + disk
+}
+
+// removeDiskFromDomainXML removes the <disk>…</disk> element whose <target dev>
+// matches targetDev from a domain's persistent XML, leaving any other disks intact.
+func removeDiskFromDomainXML(domainXML, targetDev string) string {
+	if domainXML == "" {
+		return domainXML
+	}
+	needleA := "dev='" + targetDev + "'"
+	needleB := `dev="` + targetDev + `"`
+	from := 0
+	for {
+		rel := strings.Index(domainXML[from:], "<disk")
+		if rel < 0 {
+			return domainXML
+		}
+		start := from + rel
+		endRel := strings.Index(domainXML[start:], "</disk>")
+		if endRel < 0 {
+			return domainXML
+		}
+		end := start + endRel + len("</disk>")
+		if block := domainXML[start:end]; strings.Contains(block, needleA) || strings.Contains(block, needleB) {
+			return domainXML[:start] + domainXML[end:]
+		}
+		from = end
+	}
 }
 
 // AttachDiskCount / DetachDiskCount return how many times the disk hot-plug

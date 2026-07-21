@@ -346,8 +346,14 @@ func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceReques
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid disk size: %v", err)
 	}
-	// The disk name is the identity — refuse a duplicate up front (under the lock).
-	disks, _ := corrosion.ListDisks(ctx, s.db, vmName)
+	// The disk name is the identity — refuse a duplicate up front (under the lock). A
+	// read failure here must FAIL the operation (fail-closed) before any mutation:
+	// swallowing it would let the duplicate-name check pass open and miscount the
+	// target-dev allocation.
+	disks, err := corrosion.ListDisks(ctx, s.db, vmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list disks for %q: %v", vmName, err)
+	}
 	for _, d := range disks {
 		if d.DiskName == spec.Name {
 			return nil, status.Errorf(codes.AlreadyExists, "disk %q is already attached to VM %q", spec.Name, vmName)
@@ -486,11 +492,21 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepBound)
 
-	// Verify terminal membership before completing (§8).
-	if err := s.verifyDiskAttached(vm.Name, targetDev, running); err != nil {
-		// Committed but unverifiable → leave NON-TERMINAL for recovery (never complete/fail).
-		slog.Error("disk attach: membership unverifiable — left recoverable", "vm", vm.Name, "op", opID, "error", err)
-		return nil, status.Errorf(codes.Internal, "disk attach for %q could not be verified; left recoverable: %v", vm.Name, err)
+	// Verify terminal membership before completing (§8). On the running path the disk
+	// must be present in BOTH the live domain AND the persistent (inactive) definition,
+	// because AttachDisk applies live+config; a config-vs-live divergence must not
+	// complete (it would surface as the disk (dis)appearing on the next VM start).
+	divergence, verr := s.verifyDiskAttached(vm.Name, targetDev, running)
+	if verr != nil {
+		if running && divergence {
+			// Reads succeeded but the disk is not in both defs — a config-vs-live
+			// divergence. Compensate (roll back) rather than complete an inconsistent attach.
+			return s.failDeviceAttach(ctx, rb, codes.Internal, fmt.Errorf("verify attach membership: %w", verr))
+		}
+		// Committed but unverifiable (a definition read failed), or the stopped-path
+		// single-def check failed → leave NON-TERMINAL for recovery (never complete/fail).
+		slog.Error("disk attach: membership unverifiable — left recoverable", "vm", vm.Name, "op", opID, "error", verr)
+		return nil, status.Errorf(codes.Internal, "disk attach for %q could not be verified; left recoverable: %v", vm.Name, verr)
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepAttached)
 
@@ -562,27 +578,39 @@ func (s *Server) failDeviceAttach(ctx context.Context, rb attachRollback, code c
 	return nil, status.Error(code, cause.Error())
 }
 
-// verifyDiskAttached asserts the disk landed in the authoritative definition after
-// an attach: the live domain (running) or the inactive definition (stopped).
-func (s *Server) verifyDiskAttached(vmName, targetDev string, running bool) error {
+// verifyDiskAttached asserts the disk landed in the authoritative definition(s) after
+// an attach. On the RUNNING path it must be present in BOTH the live domain AND the
+// persistent (inactive) definition, because AttachDisk applies live+config; on the
+// STOPPED path there is only the inactive definition. The returned divergence flag is
+// meaningful only when err != nil: divergence==true means the definition(s) were read
+// successfully but membership is wrong (a definitive divergence the caller compensates),
+// while divergence==false means a read failed (unverifiable → leave recoverable).
+func (s *Server) verifyDiskAttached(vmName, targetDev string, running bool) (divergence bool, err error) {
 	if running {
-		srcs, err := s.virt.DomainDiskSources(vmName)
-		if err != nil {
-			return fmt.Errorf("read live disks: %w", err)
+		srcs, rerr := s.virt.DomainDiskSources(vmName)
+		if rerr != nil {
+			return false, fmt.Errorf("read live disks: %w", rerr)
 		}
 		if _, ok := srcs[targetDev]; !ok {
-			return fmt.Errorf("disk %s absent from the live domain after attach", targetDev)
+			return true, fmt.Errorf("disk %s absent from the live domain after attach", targetDev)
 		}
-		return nil
+		xml, rerr := s.virt.DumpXMLInactive(vmName)
+		if rerr != nil {
+			return false, fmt.Errorf("read inactive definition: %w", rerr)
+		}
+		if !diskDevInXML(xml, targetDev) {
+			return true, fmt.Errorf("disk %s absent from the persistent definition after attach", targetDev)
+		}
+		return false, nil
 	}
-	xml, err := s.virt.DumpXMLInactive(vmName)
-	if err != nil {
-		return fmt.Errorf("read inactive definition: %w", err)
+	xml, rerr := s.virt.DumpXMLInactive(vmName)
+	if rerr != nil {
+		return false, fmt.Errorf("read inactive definition: %w", rerr)
 	}
 	if !diskDevInXML(xml, targetDev) {
-		return fmt.Errorf("disk %s absent from the inactive definition after reconcile", targetDev)
+		return true, fmt.Errorf("disk %s absent from the inactive definition after reconcile", targetDev)
 	}
-	return nil
+	return false, nil
 }
 
 // ── DETACH ──────────────────────────────────────────────────────────────────
@@ -669,7 +697,12 @@ func (s *Server) detachDiskOwner(ctx context.Context, req *pb.DetachDeviceReques
 			"stopped-VM disk detach for %q is not available until hardware_v2 is active", vmName)
 	}
 
-	disks, _ := corrosion.ListDisks(ctx, s.db, vmName)
+	// A read failure must FAIL the operation before any mutation (fail-closed):
+	// swallowing it would mis-resolve the target dev and could detach the wrong disk.
+	disks, err := corrosion.ListDisks(ctx, s.db, vmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list disks for %q: %v", vmName, err)
+	}
 	targetDev := ""
 	for _, d := range disks {
 		if d.DiskName == req.DiskName {
@@ -813,7 +846,12 @@ func (s *Server) failDeviceDetachClean(ctx context.Context, vm *corrosion.VMReco
 	return nil, status.Error(code, cause.Error())
 }
 
-// verifyDiskDetached asserts the disk is GONE from the authoritative definition.
+// verifyDiskDetached asserts the disk is GONE from the authoritative definition(s). On
+// the RUNNING path it must be absent from BOTH the live domain AND the persistent
+// (inactive) definition, because DetachDisk applies live+config; a disk still lingering
+// in the persistent config would silently reappear on the next VM start. On the STOPPED
+// path there is only the inactive definition. Any failure routes to the detach path's
+// forward compensation (leave NON-TERMINAL for recovery; never re-attach).
 func (s *Server) verifyDiskDetached(vmName, targetDev string, running bool) error {
 	if running {
 		srcs, err := s.virt.DomainDiskSources(vmName)
@@ -822,6 +860,13 @@ func (s *Server) verifyDiskDetached(vmName, targetDev string, running bool) erro
 		}
 		if _, ok := srcs[targetDev]; ok {
 			return fmt.Errorf("disk %s still present in the live domain after detach", targetDev)
+		}
+		xml, err := s.virt.DumpXMLInactive(vmName)
+		if err != nil {
+			return fmt.Errorf("read inactive definition: %w", err)
+		}
+		if diskDevInXML(xml, targetDev) {
+			return fmt.Errorf("disk %s still present in the persistent definition after detach", targetDev)
 		}
 		return nil
 	}

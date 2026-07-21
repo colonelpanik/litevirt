@@ -394,6 +394,95 @@ func TestAttachDiskOwner_AtMostOnce(t *testing.T) {
 	}
 }
 
+// TestDiskAttach_CompletionCASFails_RetainsJournal drives a disk attach whose
+// device side effects fully land (live attach + row committed + verified), but
+// whose terminal CompleteVMOperation CAS does NOT apply — modeling the VM's
+// spec_generation having moved underneath the op (a fence/migrate mid-operation).
+// The bug: the caller discarded `applied` and unconditionally removed the
+// host-local op-journal entry + reported fake success, leaving the mutation
+// barrier held with NO journal to recover it — the VM wedges forever. The fix
+// must retain the journal, keep the barrier held, and return an error (never a
+// fake success) so a later recovery pass converges it.
+func TestDiskAttach_CompletionCASFails_RetainsJournal(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+
+	vm, err := corrosion.GetVM(ctx, s.db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: err=%v nil=%v", err, vm == nil)
+	}
+	spec := &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}
+	diskPath, err := libvirt.SafeDiskPath(s.dataDir, "vm1", spec.Name)
+	if err != nil {
+		t.Fatalf("disk path: %v", err)
+	}
+	sizeGB, err := parseDiskSize(spec.Size)
+	if err != nil {
+		t.Fatalf("parse size: %v", err)
+	}
+	disks, err := corrosion.ListDisks(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("list disks: %v", err)
+	}
+	targetDev := allocateDiskTargetDev(len(disks), spec.Bus)
+
+	opID := "cas-fail-disk-attach-vm1"
+	reqHash := attachDiskRequestHash("vm1", spec)
+	op := corrosion.OperationRecord{
+		ID: opID, Method: "AttachDevice", Principal: "admin@local", Project: vm.Project,
+		ResourceKind: "vm", ResourceID: "vm1", OperationKind: string(corrosion.OpDeviceAttach),
+		RequestHash: reqHash, IdempotencyKey: "cas-fail-key",
+	}
+	applied, err := s.db.BeginVMOperation(ctx, op, vm.Spec, vm.OwnerEpoch, vm.SpecGeneration)
+	if err != nil || !applied {
+		t.Fatalf("BeginVMOperation: applied=%v err=%v", applied, err)
+	}
+	epoch := vm.OwnerEpoch
+	realNewGen := vm.SpecGeneration + 1
+	// A generation the terminal CAS will NOT match — as if a concurrent operation
+	// (or the fence/migrate path) had already advanced spec_generation past what
+	// this in-flight attach expects.
+	staleNewGen := realNewGen + 1
+
+	_, err = s.executeDiskAttach(ctx, vm, spec, spec.Bus, diskPath,
+		uint64(sizeGB)*1024*1024*1024, int64(sizeGB)*1024*1024*1024, targetDev, opID, epoch, staleNewGen, true)
+	if err == nil {
+		t.Fatal("expected an error when the terminal completion CAS does not apply — got fake success")
+	}
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal (left recoverable)", status.Code(err))
+	}
+
+	// The device side effects DID land (this is the whole point: don't lie about it).
+	if n := fake.AttachDiskCount(); n != 1 {
+		t.Fatalf("live AttachDisk called %d times, want 1 (side effect should have applied)", n)
+	}
+	gotDisks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1")
+	if !hasDiskName(gotDisks, "data1") {
+		t.Fatalf("disk row should be committed even though completion could not be committed: %+v", gotDisks)
+	}
+
+	// The op-journal entry must be RETAINED (recovery-required), never removed.
+	_, found, jerr := s.opJournal.Read(opID)
+	if jerr != nil {
+		t.Fatalf("journal read: %v", jerr)
+	}
+	if !found {
+		t.Fatal("op-journal entry must be RETAINED when the terminal CAS did not apply")
+	}
+
+	// The mutation barrier must still be held — the op is left recoverable, not
+	// force-completed.
+	got := mustGetVM(t, s, "vm1")
+	if got.ActiveOperationID != opID {
+		t.Fatalf("mutation barrier cleared despite a non-applied completion CAS: active_operation_id=%q, want %q",
+			got.ActiveOperationID, opID)
+	}
+}
+
 // ── detach preserves the backing file ────────────────────────────────────────
 
 func TestDetachDevice_PreservesBackingFile(t *testing.T) {

@@ -149,8 +149,16 @@ func deviceOpTargetKind(art map[string]string) string {
 // Caller holds the VM lock.
 func (s *Server) completeRecoveredOp(ctx context.Context, vmName string, view *corrosion.VMOperationView, kind corrosion.OperationKind) {
 	s.appendOpStep(ctx, view.ActiveOperationID, view.OwnerEpoch, kind, corrosion.OpStepAttached)
-	if _, err := s.db.CompleteVMOperation(ctx, vmName, view.ActiveOperationID, view.OwnerEpoch, view.SpecGeneration); err != nil {
+	applied, err := s.db.CompleteVMOperation(ctx, vmName, view.ActiveOperationID, view.OwnerEpoch, view.SpecGeneration)
+	if err != nil {
 		slog.Error("hardware op recovery: completing operation failed — will retry", "vm", vmName, "op", view.ActiveOperationID, "error", err)
+		return
+	}
+	if !applied {
+		// The CAS precondition no longer holds (ownership/generation moved underneath
+		// the wedged op) — do NOT remove the journal; leave it recovery-required for a
+		// later pass (or the new owner's own recovery).
+		slog.Warn("hardware op recovery: completion CAS did not apply — left recoverable", "vm", vmName, "op", view.ActiveOperationID)
 		return
 	}
 	if s.opJournal != nil {

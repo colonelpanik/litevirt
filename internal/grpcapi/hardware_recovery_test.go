@@ -184,6 +184,41 @@ func TestRecoverHardwareOperations_AttachCompletes(t *testing.T) {
 	}
 }
 
+// TestCompleteRecoveredOp_CASNotApplied_KeepsJournal calls completeRecoveredOp
+// directly with a stale owner epoch — as if ownership moved underneath the
+// wedged op between the recovery scan and this completion (a fence/migrate) —
+// so CompleteVMOperation's terminal CAS does not match the VM's real
+// (unbumped) owner_epoch and applied=false. The bug: completeRecoveredOp
+// discarded `applied` and removed the journal unconditionally whenever
+// CompleteVMOperation returned err==nil, even when applied==false, stranding
+// the VM with an active barrier and no journal to converge it. The fix must
+// retain the journal and leave the barrier held.
+func TestCompleteRecoveredOp_CASNotApplied_KeepsJournal(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "stopped")
+
+	opID, epoch, newGen := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed, corrosion.OpStepBound, corrosion.OpStepAttached},
+		map[string]string{"disk_name": "data1", "target_dev": "vdb", "bus": "virtio"})
+
+	view := &corrosion.VMOperationView{
+		VMName: "vm1", OwnerEpoch: epoch + 1, SpecGeneration: newGen, ActiveOperationID: opID,
+	}
+	s.completeRecoveredOp(ctx, "vm1", view, corrosion.OpDeviceAttach)
+
+	if _, found, err := s.opJournal.Read(opID); err != nil || !found {
+		t.Fatalf("op-journal entry must be RETAINED when the completion CAS did not apply: found=%v err=%v", found, err)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != opID {
+		t.Fatalf("mutation barrier cleared despite a non-applied completion CAS: active_operation_id=%q, want %q",
+			vm.ActiveOperationID, opID)
+	}
+}
+
 // TestRecoverHardwareOperations_DetachRollsForward: a device_detach wedged
 // mid-detach converges by rolling FORWARD — the device is removed from the live
 // domain AND the persistent definition, the row is soft-deleted, the operation

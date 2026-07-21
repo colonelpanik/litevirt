@@ -416,8 +416,14 @@ func (s *Server) executePCIAttach(ctx context.Context, vm *corrosion.VMRecord, s
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepAttached)
 
-	if _, err := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen); err != nil {
-		slog.Error("pci attach: completing operation failed — recovery will reconcile", "vm", vm.Name, "op", opID, "error", err)
+	applied, cerr := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen)
+	if cerr != nil || !applied {
+		// The device is fully attached (bound + realized), but the barrier could not be
+		// cleared — the CAS precondition no longer holds (ownership/generation moved
+		// underneath the op) or the write failed. Do NOT remove the journal, clear the
+		// device lease, or report success; leave the operation recovery-required.
+		slog.Error("pci attach: completion could not be committed — left recoverable", "vm", vm.Name, "op", opID, "applied", applied, "error", cerr)
+		return nil, status.Errorf(codes.Internal, "pci attach for %q completed but could not be committed; left recoverable: %v", vm.Name, cerr)
 	}
 	if rb.leaseFinish != nil {
 		rb.leaseFinish() // VM row is durable — clear the crash-recovery lease.
@@ -501,21 +507,29 @@ func (s *Server) failPCIAttach(ctx context.Context, rb *pciAttachRollback, code 
 	}
 
 	s.appendOpStep(ctx, rb.opID, rb.epoch, corrosion.OpDeviceAttach, corrosion.OpStepRollbackCompleted)
-	if _, err := s.db.FailVMOperation(ctx, rb.vm.Name, rb.opID, rb.epoch, rb.newGen, deviceFailureFacts(code, cause)); err != nil {
-		slog.Error("pci attach: recording terminal failure failed — recovery will reconcile", "vm", rb.vm.Name, "op", rb.opID, "error", err)
-	}
-	// Restore the pre-latch spec dual-write now that the barrier is clear (best-effort:
-	// the op is already terminally failed; a residual Devices entry only affects a
-	// pre-hardware_v2 reader and is corrected by the next reconcile).
-	if rb.dualWrite {
-		if _, _, err := corrosion.MutateDesiredSpec(ctx, s.db, rb.vm.Name, func(string) (string, error) {
-			return rb.origSpec, nil
-		}); err != nil {
-			slog.Warn("pci attach rollback: restore pre-latch spec failed", "vm", rb.vm.Name, "error", err)
+	applied, ferr := s.db.FailVMOperation(ctx, rb.vm.Name, rb.opID, rb.epoch, rb.newGen, deviceFailureFacts(code, cause))
+	switch {
+	case ferr != nil:
+		slog.Error("pci attach: recording terminal failure failed — recovery will reconcile", "vm", rb.vm.Name, "op", rb.opID, "error", ferr)
+	case !applied:
+		// The barrier was NOT cleared — ownership may have moved on. Do not touch the
+		// (possibly no-longer-ours) desired spec or the journal; leave the operation
+		// recovery-required.
+		slog.Error("pci attach: terminal-failure CAS did not apply — left recoverable", "vm", rb.vm.Name, "op", rb.opID)
+	default:
+		// Restore the pre-latch spec dual-write now that the barrier is clear (best-effort:
+		// the op is already terminally failed; a residual Devices entry only affects a
+		// pre-hardware_v2 reader and is corrected by the next reconcile).
+		if rb.dualWrite {
+			if _, _, err := corrosion.MutateDesiredSpec(ctx, s.db, rb.vm.Name, func(string) (string, error) {
+				return rb.origSpec, nil
+			}); err != nil {
+				slog.Warn("pci attach rollback: restore pre-latch spec failed", "vm", rb.vm.Name, "error", err)
+			}
 		}
-	}
-	if s.opJournal != nil {
-		_ = s.opJournal.Remove(rb.opID)
+		if s.opJournal != nil {
+			_ = s.opJournal.Remove(rb.opID)
+		}
 	}
 	s.recordVMEvent(ctx, rb.vm.Name, "device.attached", "error", "pci "+rb.pciAddress)
 	return nil, status.Error(code, cause.Error())
@@ -787,8 +801,10 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 		return nil, status.Errorf(codes.Internal, "pci detach for %q could not be verified; left recoverable: %v", vm.Name, err)
 	}
 
-	if _, err := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen); err != nil {
-		slog.Error("pci detach: completing operation failed — recovery will reconcile", "vm", vm.Name, "op", opID, "error", err)
+	applied, cerr := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen)
+	if cerr != nil || !applied {
+		slog.Error("pci detach: completion could not be committed — left recoverable", "vm", vm.Name, "op", opID, "applied", applied, "error", cerr)
+		return nil, status.Errorf(codes.Internal, "pci detach for %q completed but could not be committed; left recoverable: %v", vm.Name, cerr)
 	}
 	if s.opJournal != nil {
 		if err := s.opJournal.Remove(opID); err != nil {
@@ -822,11 +838,16 @@ func (s *Server) retryPCIRowTombstone(ctx context.Context, vmName, deviceID stri
 // tombstoned), so the VM is unchanged and mutable again. It never touches the
 // device's host inventory or backing hardware.
 func (s *Server) failPCIDetachClean(ctx context.Context, vm *corrosion.VMRecord, opID string, epoch, newGen int64, normAddr string, code codes.Code, cause error) (*pb.VM, error) {
-	if _, err := s.db.FailVMOperation(ctx, vm.Name, opID, epoch, newGen, deviceFailureFacts(code, cause)); err != nil {
-		slog.Error("pci detach: recording terminal failure failed — recovery will reconcile", "vm", vm.Name, "op", opID, "error", err)
-	}
-	if s.opJournal != nil {
-		_ = s.opJournal.Remove(opID)
+	applied, ferr := s.db.FailVMOperation(ctx, vm.Name, opID, epoch, newGen, deviceFailureFacts(code, cause))
+	switch {
+	case ferr != nil:
+		slog.Error("pci detach: recording terminal failure failed — recovery will reconcile", "vm", vm.Name, "op", opID, "error", ferr)
+	case !applied:
+		slog.Error("pci detach: terminal-failure CAS did not apply — left recoverable", "vm", vm.Name, "op", opID)
+	default:
+		if s.opJournal != nil {
+			_ = s.opJournal.Remove(opID)
+		}
 	}
 	s.recordVMEvent(ctx, vm.Name, "device.detached", "error", "pci "+normAddr)
 	return nil, status.Error(code, cause.Error())

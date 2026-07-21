@@ -512,8 +512,14 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepAttached)
 
-	if _, err := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen); err != nil {
-		slog.Error("disk attach: completing operation failed — recovery will reconcile", "vm", vm.Name, "op", opID, "error", err)
+	applied, cerr := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen)
+	if cerr != nil || !applied {
+		// The device is fully attached, but the barrier could not be cleared — the CAS
+		// precondition no longer holds (ownership/generation moved underneath the op) or
+		// the write failed. Do NOT remove the journal or report success; leave the
+		// operation recovery-required — a later recovery pass or retry completes it.
+		slog.Error("disk attach: completion could not be committed — left recoverable", "vm", vm.Name, "op", opID, "applied", applied, "error", cerr)
+		return nil, status.Errorf(codes.Internal, "disk attach for %q completed but could not be committed; left recoverable: %v", vm.Name, cerr)
 	}
 	if s.opJournal != nil {
 		if err := s.opJournal.Remove(opID); err != nil {
@@ -570,11 +576,18 @@ func (s *Server) failDeviceAttach(ctx context.Context, rb attachRollback, code c
 	}
 
 	s.appendOpStep(ctx, rb.opID, rb.epoch, corrosion.OpDeviceAttach, corrosion.OpStepRollbackCompleted)
-	if _, err := s.db.FailVMOperation(ctx, rb.vm.Name, rb.opID, rb.epoch, rb.newGen, deviceFailureFacts(code, cause)); err != nil {
-		slog.Error("disk attach: recording terminal failure failed — recovery will reconcile", "vm", rb.vm.Name, "op", rb.opID, "error", err)
-	}
-	if s.opJournal != nil {
-		_ = s.opJournal.Remove(rb.opID)
+	applied, ferr := s.db.FailVMOperation(ctx, rb.vm.Name, rb.opID, rb.epoch, rb.newGen, deviceFailureFacts(code, cause))
+	switch {
+	case ferr != nil:
+		slog.Error("disk attach: recording terminal failure failed — recovery will reconcile", "vm", rb.vm.Name, "op", rb.opID, "error", ferr)
+	case !applied:
+		// The barrier was NOT cleared (the CAS precondition no longer holds) — do not
+		// remove the journal; leave the operation recovery-required.
+		slog.Error("disk attach: terminal-failure CAS did not apply — left recoverable", "vm", rb.vm.Name, "op", rb.opID)
+	default:
+		if s.opJournal != nil {
+			_ = s.opJournal.Remove(rb.opID)
+		}
 	}
 	s.recordVMEvent(ctx, rb.vm.Name, "device.attached", "error", "disk "+rb.diskName)
 	return nil, status.Error(code, cause.Error())
@@ -809,8 +822,10 @@ func (s *Server) executeDiskDetach(ctx context.Context, vm *corrosion.VMRecord, 
 		return nil, status.Errorf(codes.Internal, "disk detach for %q could not be verified; left recoverable: %v", vm.Name, err)
 	}
 
-	if _, err := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen); err != nil {
-		slog.Error("disk detach: completing operation failed — recovery will reconcile", "vm", vm.Name, "op", opID, "error", err)
+	applied, cerr := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen)
+	if cerr != nil || !applied {
+		slog.Error("disk detach: completion could not be committed — left recoverable", "vm", vm.Name, "op", opID, "applied", applied, "error", cerr)
+		return nil, status.Errorf(codes.Internal, "disk detach for %q completed but could not be committed; left recoverable: %v", vm.Name, cerr)
 	}
 	if s.opJournal != nil {
 		if err := s.opJournal.Remove(opID); err != nil {
@@ -838,11 +853,16 @@ func (s *Server) retrySoftDeleteDisk(ctx context.Context, vmName, diskName strin
 // NOTHING was applied to the domain (the live/config detach never ran), so the VM is
 // unchanged and mutable again. It never touches the backing file.
 func (s *Server) failDeviceDetachClean(ctx context.Context, vm *corrosion.VMRecord, opID string, epoch, newGen int64, diskName string, code codes.Code, cause error) (*pb.VM, error) {
-	if _, err := s.db.FailVMOperation(ctx, vm.Name, opID, epoch, newGen, deviceFailureFacts(code, cause)); err != nil {
-		slog.Error("disk detach: recording terminal failure failed — recovery will reconcile", "vm", vm.Name, "op", opID, "error", err)
-	}
-	if s.opJournal != nil {
-		_ = s.opJournal.Remove(opID)
+	applied, ferr := s.db.FailVMOperation(ctx, vm.Name, opID, epoch, newGen, deviceFailureFacts(code, cause))
+	switch {
+	case ferr != nil:
+		slog.Error("disk detach: recording terminal failure failed — recovery will reconcile", "vm", vm.Name, "op", opID, "error", ferr)
+	case !applied:
+		slog.Error("disk detach: terminal-failure CAS did not apply — left recoverable", "vm", vm.Name, "op", opID)
+	default:
+		if s.opJournal != nil {
+			_ = s.opJournal.Remove(opID)
+		}
 	}
 	s.recordVMEvent(ctx, vm.Name, "device.detached", "error", "disk "+diskName)
 	return nil, status.Error(code, cause.Error())

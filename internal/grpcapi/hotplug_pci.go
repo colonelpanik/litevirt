@@ -304,6 +304,7 @@ type pciAttachRollback struct {
 	dualWrite           bool // this execution folded the DeviceSpec into vms.spec (pre-latch)
 	leaseFinish         func()
 	acquired            bool     // acquireDeviceLeases succeeded (vfio bound + ownership)
+	acquireClaimed      []string // running path: addresses acquire NEWLY claimed (self-owned skipped)
 	ownershipRelease    func()   // stopped path: owner-release the members THIS op newly claimed
 	attachedAddrs       []string // members whose live hostdev attach succeeded
 	intentWritten       bool
@@ -372,13 +373,17 @@ func (s *Server) executePCIAttach(ctx context.Context, vm *corrosion.VMRecord, s
 
 	if running {
 		// Acquire the durable device lease + bind every member to vfio-pci BEFORE the
-		// live attach; on failure acquire already rolled back its own binds.
-		finish, aerr := s.acquireDeviceLeases(ctx, vm.Name, members)
+		// live attach; on failure acquire already rolled back its own binds. acquireClaimed
+		// = the addresses this acquire NEWLY claimed (a self-owned re-attach skips its own
+		// device → NOT in it), so failPCIAttach releases exactly those and never a
+		// pre-existing self-owned reservation (FIX-9c).
+		finish, acquireClaimed, aerr := s.acquireDeviceLeases(ctx, vm.Name, members)
 		if aerr != nil {
 			return s.failPCIAttach(ctx, rb, status.Code(aerr), fmt.Errorf("acquire device leases: %w", aerr))
 		}
 		rb.acquired = true
 		rb.leaseFinish = finish
+		rb.acquireClaimed = acquireClaimed
 		s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 
 		for _, m := range members {
@@ -488,11 +493,11 @@ func (s *Server) failPCIAttach(ctx context.Context, rb *pciAttachRollback, code 
 		}
 	}
 	if rb.acquired {
-		addrs := make([]string, len(rb.members))
-		for i, m := range rb.members {
-			addrs[i] = m.Address
-		}
-		s.releaseDeviceLeases(ctx, rb.vm.Name, addrs)
+		// Release ONLY the addresses THIS attach newly claimed — never a pre-existing
+		// self-owned reserve-while-off reservation (FIX-9c). A self-owned re-attach that
+		// fails after acquire must retain the reservation rather than drop it to a
+		// concurrent claimant; a genuinely-new device is in acquireClaimed → still released.
+		s.releaseDeviceLeases(ctx, rb.vm.Name, rb.acquireClaimed)
 		if rb.leaseFinish != nil {
 			rb.leaseFinish()
 		}

@@ -236,7 +236,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		members = append(members, specMembers...)
 	}
 
-	finish, err := s.acquireDeviceLeases(ctx, vmName, members)
+	finish, _, err := s.acquireDeviceLeases(ctx, vmName, members)
 	if err != nil {
 		return nil, noop, err
 	}
@@ -487,8 +487,11 @@ func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, member
 // every member to vfio-pci. On a bind failure it rolls back the devices this call
 // touched (releaseDeviceLeases) and clears the lease, so a crash before the VM row
 // is finalized is recovered at startup. It returns the finish func the caller must
-// defer to clear the lease once the row is durable.
-func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members []ResolvedMember) (func(), error) {
+// defer to clear the lease once the row is durable, AND the addresses it NEWLY claimed
+// (a self-owned member is skipped → NOT in the list), so a caller's OWN post-acquire
+// rollback can release exactly the devices this start took and never a pre-existing
+// self-owned reserve-while-off reservation (FIX-9b/9c).
+func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members []ResolvedMember) (func(), []string, error) {
 	noop := func() {}
 
 	// Claim inventory ownership (fail-closed CAS) BEFORE any bind. On failure the
@@ -498,7 +501,7 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 	// never a pre-existing self-owned reservation.
 	claimed, _, cerr := s.claimDeviceOwnership(ctx, vmName, members)
 	if cerr != nil {
-		return noop, cerr
+		return noop, nil, cerr
 	}
 
 	addresses := make([]string, 0, len(members))
@@ -522,13 +525,13 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 			// self-owned, `claimed` == every address, so this is identical to before.
 			s.releaseDeviceLeases(ctx, vmName, claimed)
 			finish()
-			return noop, status.Errorf(codes.Internal,
+			return noop, nil, status.Errorf(codes.Internal,
 				"failed to bind device %s to vfio-pci: %v", addr, err)
 		}
 		slog.Info("device bound to vfio-pci", "address", addr, "previous_driver", prevDriver)
 	}
 
-	return finish, nil
+	return finish, claimed, nil
 }
 
 // pciStartPreflight realizes a hardware_v2 VM's reserved PCI intents at start:
@@ -593,18 +596,31 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 		return func() {}, nil
 	}
 
-	allAddrs := make([]string, len(members))
-	for i, m := range members {
-		allAddrs[i] = m.Address
-	}
-
 	// ── Acquire leases: CAS ownership + durable F1 lease + vfio bind ──
 	// On a bind failure acquireDeviceLeases self-cleans every device it touched
 	// (owner-scoped release covers the SR-IOV VFs claimed above too) and clears the
-	// lease, so nothing is left to release here.
-	finish, aerr := s.acquireDeviceLeases(ctx, vm.Name, members)
+	// lease, so nothing is left to release here. acquireClaimed = the addresses this
+	// acquire NEWLY claimed (a self-owned reserve-while-off device is skipped → NOT in
+	// it), so the post-acquire rollback below can release exactly what THIS start took.
+	finish, acquireClaimed, aerr := s.acquireDeviceLeases(ctx, vm.Name, members)
 	if aerr != nil {
 		return nil, aerr
+	}
+
+	// The devices freshly claimed DURING THIS START: the VFs CAS-claimed in the resolve
+	// phase (claimedSriov) ∪ the members acquire newly claimed (acquireClaimed). A
+	// pre-existing self-owned reservation is in NEITHER, so scoping the post-acquire
+	// rollback to this set releases only what this start took and RETAINS a
+	// reserve-while-off reservation across a transient post-bind failure (FIX-9c). Dedupe
+	// defensively (a VF claimed in resolve is self-owned at acquire, so acquire skips it —
+	// the sets should not overlap, but a double-release is harmless either way).
+	freshlyClaimed := make([]string, 0, len(claimedSriov)+len(acquireClaimed))
+	seenFresh := map[string]bool{}
+	for _, a := range append(append([]string{}, claimedSriov...), acquireClaimed...) {
+		if !seenFresh[a] {
+			seenFresh[a] = true
+			freshlyClaimed = append(freshlyClaimed, a)
+		}
 	}
 
 	// ── Persist realizations (CONTRACT g), grouped per device ──
@@ -617,7 +633,11 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 		byDevice[m.DeviceID] = append(byDevice[m.DeviceID], m)
 	}
 	rollback := func() {
-		s.releaseDeviceLeases(ctx, vm.Name, allAddrs)
+		// Release ONLY the devices THIS start freshly claimed — never a pre-existing
+		// self-owned reserve-while-off reservation (FIX-9c). A retained self-owned device
+		// is absent from freshlyClaimed, so it stays bound + owned = still reserved.
+		s.releaseDeviceLeases(ctx, vm.Name, freshlyClaimed)
+		// Tombstoning THIS start's realization rows is correct regardless of ownership.
 		for _, dev := range deviceOrder {
 			if terr := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, dev); terr != nil {
 				slog.Warn("pci start-preflight: tombstone realizations on rollback", "vm", vm.Name, "device", dev, "error", terr)

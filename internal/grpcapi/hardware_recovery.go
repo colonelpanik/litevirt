@@ -438,6 +438,14 @@ func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, v
 	// claimed-window attach onto the stopped path, but its bound + owner-assigned
 	// devices still leak (and block re-attach via exclusivity) unless released here.
 	rb.acquired = leaseHeld || len(rb.attachedAddrs) > 0
+	// The reconstructed members ARE the release set: realizations / the owner-confirmed
+	// claimed-window fallback establish EXACTLY the devices this incomplete attach holds
+	// and must release on rollback. failPCIAttach releases rb.acquireClaimed (scoped to
+	// what THIS op took, FIX-9c), so hand it the reconstructed addresses — recovery cannot
+	// observe the pre-op ownership, so it releases what the durable evidence says it owns.
+	for _, m := range members {
+		rb.acquireClaimed = append(rb.acquireClaimed, m.Address)
+	}
 	if rb.dualWrite {
 		if os2, e := removePCIDeviceFromSpec(vm.Spec, normAddr); e == nil {
 			rb.origSpec = os2 // restore the spec with the pre-latch dual-write device removed

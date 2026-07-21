@@ -157,6 +157,36 @@ func TestListVMHardware_FromIntents(t *testing.T) {
 	}
 }
 
+// TestListVMHardware_AdoptionState is Task 8.2's driving test for the
+// read-model side: ListVMHardware must surface a VM's hardware-adoption
+// state and blocked-reason (Task 8.2 Step A) so the UI's Hardware tab can
+// render a gating banner, without requiring the caller to separately query
+// GetHardwareAdoptionState.
+func TestListVMHardware_AdoptionState(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "hw-vm3", HostName: "test-host", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.SetHardwareAdoptionState(ctx, s.db, "hw-vm3", "blocked", "ambiguous PCI grouping"); err != nil {
+		t.Fatalf("SetHardwareAdoptionState: %v", err)
+	}
+
+	resp, err := s.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: "hw-vm3"})
+	if err != nil {
+		t.Fatalf("ListVMHardware: %v", err)
+	}
+	if resp.HardwareAdoptionState != "blocked" {
+		t.Errorf("HardwareAdoptionState = %q, want blocked", resp.HardwareAdoptionState)
+	}
+	if resp.HardwareAdoptionError != "ambiguous PCI grouping" {
+		t.Errorf("HardwareAdoptionError = %q, want %q", resp.HardwareAdoptionError, "ambiguous PCI grouping")
+	}
+}
+
 func TestListVMHardware_NotFound(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

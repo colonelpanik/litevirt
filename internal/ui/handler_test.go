@@ -89,6 +89,60 @@ func TestHandler_VMHardwareTab_NotFound(t *testing.T) {
 	assertStatus(t, w, http.StatusNotFound)
 }
 
+// TestHandler_HardwareTab_BlockedBanner is Task 8.2's driving test: when a
+// VM's PCI adoption is blocked, the Hardware tab must surface the reason in a
+// banner and omit the attach forms (read-only) rather than let an operator
+// submit a mutation the backend will independently reject.
+func TestHandler_HardwareTab_BlockedBanner(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "blocked",
+		HardwareAdoptionError: "ambiguous PCI grouping",
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "ambiguous PCI grouping")
+	if strings.Contains(w.Body.String(), "attach-disk") {
+		t.Error("blocked adoption state: response body contains an attach-disk form, want none")
+	}
+}
+
+// TestHandler_HardwareTab_AddFormsWhenAdopted asserts the converse of the
+// blocked-banner test: once adoption is resolved (or was never gated), the
+// tab renders the add/detach forms that mutate hardware via the existing
+// attach/detach handlers.
+func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "adopted",
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{
+				DeviceId: "root", Target: "vdb", Bus: "virtio", SizeBytes: 10 << 30,
+				StorageType: "local", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Nic{Nic: &pb.HardwareNIC{
+				Mac: "52:54:00:aa:bb:cc", Network: "br0", Model: "virtio", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Members: []*pb.HardwarePCIMember{{MemberId: "m0", ResolvedAddress: "0000:41:00.0", XmlAlias: "hostdev0"}},
+			}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "attach-disk")
+	assertContains(t, w, "attach-nic")
+	assertContains(t, w, "attach-pci")
+	assertContains(t, w, "detach-disk")
+	assertContains(t, w, "detach-nic")
+	assertContains(t, w, "detach-pci")
+}
+
 // TestHandler_VMDetail_TabHardware covers the ?tab=hardware full-page load —
 // the Hardware body must server-render, not only be reachable via htmx.
 func TestHandler_VMDetail_TabHardware(t *testing.T) {

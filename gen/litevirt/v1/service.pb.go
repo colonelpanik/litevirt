@@ -2020,10 +2020,12 @@ func (x *ListVMHardwareRequest) GetVmName() string {
 }
 
 type ListVMHardwareResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Devices       []*HardwareDevice      `protobuf:"bytes,1,rep,name=devices,proto3" json:"devices,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	Devices               []*HardwareDevice      `protobuf:"bytes,1,rep,name=devices,proto3" json:"devices,omitempty"`
+	HardwareAdoptionState string                 `protobuf:"bytes,2,opt,name=hardware_adoption_state,json=hardwareAdoptionState,proto3" json:"hardware_adoption_state,omitempty"` // pending | adopted | blocked
+	HardwareAdoptionError string                 `protobuf:"bytes,3,opt,name=hardware_adoption_error,json=hardwareAdoptionError,proto3" json:"hardware_adoption_error,omitempty"` // reason when blocked
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ListVMHardwareResponse) Reset() {
@@ -2061,6 +2063,20 @@ func (x *ListVMHardwareResponse) GetDevices() []*HardwareDevice {
 		return x.Devices
 	}
 	return nil
+}
+
+func (x *ListVMHardwareResponse) GetHardwareAdoptionState() string {
+	if x != nil {
+		return x.HardwareAdoptionState
+	}
+	return ""
+}
+
+func (x *ListVMHardwareResponse) GetHardwareAdoptionError() string {
+	if x != nil {
+		return x.HardwareAdoptionError
+	}
+	return ""
 }
 
 type StartVMRequest struct {
@@ -22547,9 +22563,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10InspectVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"0\n" +
 	"\x15ListVMHardwareRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"O\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xbf\x01\n" +
 	"\x16ListVMHardwareResponse\x125\n" +
-	"\adevices\x18\x01 \x03(\v2\x1b.litevirt.v1.HardwareDeviceR\adevices\"$\n" +
+	"\adevices\x18\x01 \x03(\v2\x1b.litevirt.v1.HardwareDeviceR\adevices\x126\n" +
+	"\x17hardware_adoption_state\x18\x02 \x01(\tR\x15hardwareAdoptionState\x126\n" +
+	"\x17hardware_adoption_error\x18\x03 \x01(\tR\x15hardwareAdoptionError\"$\n" +
 	"\x0eStartVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"S\n" +
 	"\rStopVMRequest\x12\x12\n" +

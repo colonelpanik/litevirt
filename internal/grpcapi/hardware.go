@@ -47,6 +47,15 @@ func (s *Server) ListVMHardware(ctx context.Context, req *pb.ListVMHardwareReque
 func (s *Server) assembleVMHardware(ctx context.Context, vm *corrosion.VMRecord) (*pb.ListVMHardwareResponse, error) {
 	resp := &pb.ListVMHardwareResponse{}
 
+	// Adoption state is UX/read-model only here — best-effort. A lookup error
+	// degrades to empty fields (no banner) rather than failing the whole read;
+	// the backend's AttachDevice/DetachDevice independently enforce the gate
+	// regardless of what this read model reports.
+	if state, errReason, err := corrosion.GetHardwareAdoptionState(ctx, s.db, vm.Name); err == nil {
+		resp.HardwareAdoptionState = state
+		resp.HardwareAdoptionError = errReason
+	}
+
 	// Disks. Bus is resolved with the same precedence InspectVM's Spec.Disks
 	// projection uses (see resolveDiskBus in vm.go): vm_disks.Bus if set,
 	// else the stored spec blob's bus for this disk name, else the

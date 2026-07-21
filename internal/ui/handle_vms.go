@@ -52,6 +52,8 @@ func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 		if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
 			data["HardwareTab"] = s.renderHardwareTabFragment(map[string]any{
 				"VM": name, "Devices": hw.GetDevices(),
+				"AdoptionState": hw.GetHardwareAdoptionState(),
+				"AdoptionError": hw.GetHardwareAdoptionError(),
 			})
 		}
 	}
@@ -97,9 +99,11 @@ func (s *Server) handleVMDetailPartial(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleVMHardwareTab renders the Hardware tab fragment (Task 8.1): the typed
-// disk/NIC/PCI device table from ListVMHardware. Mirrors handleVMDetailPartial's
-// shape. Read-only for this task — attach/detach actions land in Task 8.2.
+// handleVMHardwareTab renders the Hardware tab fragment: the typed disk/NIC/PCI
+// device table from ListVMHardware, plus (Task 8.2) per-type add forms and
+// per-row detach controls that POST to the existing attach/detach handlers.
+// When the VM's PCI adoption state is "blocked", the template renders a
+// banner with the reason and omits the mutation forms instead.
 func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	resp, err := s.grpc.ListVMHardware(s.uiBearerCtx(r), &pb.ListVMHardwareRequest{VmName: name})
@@ -108,8 +112,10 @@ func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.renderFragment(w, "hardware_tab.html", map[string]any{
-		"VM":      name,
-		"Devices": resp.GetDevices(),
+		"VM":            name,
+		"Devices":       resp.GetDevices(),
+		"AdoptionState": resp.GetHardwareAdoptionState(),
+		"AdoptionError": resp.GetHardwareAdoptionError(),
 	})
 }
 

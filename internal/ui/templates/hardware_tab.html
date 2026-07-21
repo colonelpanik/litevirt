@@ -92,7 +92,10 @@
           style="margin-top:12px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
       <div class="form-row" style="margin-bottom:0">
         <label>Bridge</label>
-        <input type="text" name="bridge" placeholder="br0" required>
+        <select name="bridge" required>
+          <option value="" disabled selected>Select network...</option>
+          {{range .Networks}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+        </select>
       </div>
       <div class="form-row" style="margin-bottom:0">
         <label>Model</label>

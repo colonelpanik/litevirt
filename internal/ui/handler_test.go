@@ -143,6 +143,26 @@ func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
 	assertContains(t, w, "detach-pci")
 }
 
+// TestHandler_HardwareTab_NICDropdown is Task 8.3's driving test for closing
+// the NIC-dropdown parity gap: now that the edit modal's Network pane is
+// retired, the tab's own NIC-attach form must offer the same networks
+// dropdown the modal used to (not a free-text bridge input).
+func TestHandler_HardwareTab_NICDropdown(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "adopted",
+	}
+	mock.listNetworksResp = &pb.ListNetworksResponse{
+		Networks: []*pb.NetworkInfo{{Name: "lan0"}},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, `<select name="bridge"`)
+	assertContains(t, w, `>lan0<`)
+}
+
 // TestHandler_VMDetail_TabHardware covers the ?tab=hardware full-page load —
 // the Hardware body must server-render, not only be reachable via htmx.
 func TestHandler_VMDetail_TabHardware(t *testing.T) {
@@ -411,11 +431,23 @@ func TestHandler_MigrateModal(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
+// TestHandler_EditVMModal is Task 8.3's driving test for retiring the
+// edit-modal device panes: the Hardware tab is now the sole surface for
+// disks/NICs/PCI devices, so the modal must no longer render those panes and
+// must instead point operators at the tab.
 func TestHandler_EditVMModal(t *testing.T) {
 	s := newTestUIServer(t, newDefaultMock())
 	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/edit-modal"))
 	w := serveRequest(s, r)
 	assertStatus(t, w, http.StatusOK)
+	body := w.Body.String()
+	for _, removed := range []string{"vmTab(this,'disks')", `data-pane="disks"`, `data-pane="devices"`} {
+		if strings.Contains(body, removed) {
+			t.Errorf("edit modal still contains retired device-pane markup %q, want it removed (Hardware tab is now the sole hardware surface)", removed)
+		}
+	}
+	assertContains(t, w, "Manage hardware")
+	assertContains(t, w, "/vms/vm1?tab=hardware")
 }
 
 func TestHandler_UpdateVMSpec(t *testing.T) {

@@ -50,10 +50,12 @@ func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 	data["Tab"] = tab
 	if tab == "hardware" {
 		if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
+			networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
 			data["HardwareTab"] = s.renderHardwareTabFragment(map[string]any{
 				"VM": name, "Devices": hw.GetDevices(),
 				"AdoptionState": hw.GetHardwareAdoptionState(),
 				"AdoptionError": hw.GetHardwareAdoptionError(),
+				"Networks":      networks.GetNetworks(),
 			})
 		}
 	}
@@ -106,16 +108,19 @@ func (s *Server) handleVMDetailPartial(w http.ResponseWriter, r *http.Request) {
 // banner with the reason and omits the mutation forms instead.
 func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	resp, err := s.grpc.ListVMHardware(s.uiBearerCtx(r), &pb.ListVMHardwareRequest{VmName: name})
+	ctx := s.uiBearerCtx(r)
+	resp, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name})
 	if err != nil {
 		http.Error(w, "VM not found", 404)
 		return
 	}
+	networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
 	s.renderFragment(w, "hardware_tab.html", map[string]any{
 		"VM":            name,
 		"Devices":       resp.GetDevices(),
 		"AdoptionState": resp.GetHardwareAdoptionState(),
 		"AdoptionError": resp.GetHardwareAdoptionError(),
+		"Networks":      networks.GetNetworks(),
 	})
 }
 
@@ -627,12 +632,11 @@ func (s *Server) handleEditVMModal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "VM not found", 404)
 		return
 	}
-	networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	// Disks/NICs/PCI are managed exclusively via the Hardware tab now (Task
+	// 8.3); the modal only needs the VM itself for its Resources/Lifecycle
+	// panes and the "Manage hardware" link.
 	s.renderFragment(w, "vm_edit_modal.html", map[string]any{
-		"VM":         vm,
-		"Disks":      vm.GetDisks(),
-		"Interfaces": vm.GetInterfaces(),
-		"Networks":   networks.GetNetworks(),
+		"VM": vm,
 	})
 }
 

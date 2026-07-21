@@ -223,20 +223,15 @@ func (s *Server) attachPCIOwner(ctx context.Context, req *pb.AttachDeviceRequest
 	}
 	normAddr := *exclusiveKey
 
-	// Host-scoped serialization of the check→reserve critical section. The per-VM
-	// lock does NOT cover this: two attaches of the same host BDF to DIFFERENT VMs
-	// hold different per-VM locks, so without this both could read the intent as free
-	// and both persist a live intent for the same exclusive_key. Held from the
-	// exclusivity read THROUGH the intent write in the tail-called executePCIAttach
-	// (deliberately spanning the reserve), so a concurrent attach's exclusivity read
-	// cannot interleave before the intent is durable. Lock order: per-VM lock (above),
-	// THEN this — no path acquires them in the opposite order.
-	s.pciReserveMu.Lock()
-	defer s.pciReserveMu.Unlock()
-
-	// Exclusivity: a given host BDF may back at most one VM's live intent. A read
-	// failure must FAIL the operation fail-closed BEFORE any mutation — swallowing it
-	// would let two VMs claim the same passthrough device.
+	// Exclusivity is enforced by the shared host_pci_devices CAS (claimDeviceOwnership),
+	// which EVERY producer — CreateVM, running attach, stopped attach — takes before it
+	// declares a device, so no host-wide mutex is needed here: two concurrent attaches of
+	// the same BDF to DIFFERENT VMs both reach the CAS and exactly one wins; the loser
+	// fails before writing its intent (the intent write is gated by a successful claim in
+	// executePCIAttach). Unlike a process-local mutex the CAS also holds across a daemon
+	// restart and against other producers. This intent-level read is a fast, friendly
+	// pre-check (a clear AlreadyExists for an already-attached device); the CAS is the
+	// authoritative boundary. A read failure fails the operation closed before any mutation.
 	owner, err := corrosion.PCIIntentExclusiveOwner(ctx, s.db, s.hostName, normAddr)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "check PCI exclusivity for %q: %v", vmName, err)
@@ -309,6 +304,7 @@ type pciAttachRollback struct {
 	dualWrite           bool // this execution folded the DeviceSpec into vms.spec (pre-latch)
 	leaseFinish         func()
 	acquired            bool     // acquireDeviceLeases succeeded (vfio bound + ownership)
+	ownershipRelease    func()   // stopped path: owner-release the members THIS op newly claimed
 	attachedAddrs       []string // members whose live hostdev attach succeeded
 	intentWritten       bool
 	realizationsWritten bool
@@ -401,13 +397,22 @@ func (s *Server) executePCIAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		}
 		rb.realizationsWritten = true
 	} else {
-		// Stopped RESERVE: intent only (no bind, no lease, no realization — those happen
-		// at VM start). reconcileDomainDefinition builds the hostdev from the intent.
+		// Stopped RESERVE: take the shared inventory reservation (claim host_pci_devices
+		// ownership via the CAS) BEFORE writing the intent — this is the exclusive
+		// declare-time reservation every producer shares, so a concurrent CreateVM /
+		// running-attach of the same BDF loses the CAS and fails. NO vfio bind, NO lease,
+		// NO realization (those happen at VM start). On failure the claim conflict / a
+		// missing-inventory BDF fails the attach; the intent write is gated by the claim.
+		release, cerr := s.claimDeviceOwnership(ctx, vm.Name, members)
+		if cerr != nil {
+			return s.failPCIAttach(ctx, rb, status.Code(cerr), fmt.Errorf("reserve device ownership: %w", cerr))
+		}
+		rb.ownershipRelease = release
+		s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 		if err := corrosion.UpsertPCIIntent(ctx, s.db, intent); err != nil {
 			return s.failPCIAttach(ctx, rb, codes.Internal, fmt.Errorf("record PCI intent: %w", err))
 		}
 		rb.intentWritten = true
-		s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 		if err := s.reconcileDomainDefinition(ctx, vm, nil); err != nil {
 			return s.failPCIAttach(ctx, rb, codes.Internal, fmt.Errorf("reconcile definition: %w", err))
 		}
@@ -491,6 +496,11 @@ func (s *Server) failPCIAttach(ctx context.Context, rb *pciAttachRollback, code 
 		if rb.leaseFinish != nil {
 			rb.leaseFinish()
 		}
+	}
+	// Stopped path: owner-release ONLY the members this op newly claimed (a self-owned
+	// re-attach claimed nothing, so this is a no-op). No vfio unbind — nothing was bound.
+	if rb.ownershipRelease != nil {
+		rb.ownershipRelease()
 	}
 	if rb.realizationsWritten {
 		if err := corrosion.TombstonePCIRealizations(ctx, s.db, rb.vm.Name, rb.deviceID); err != nil {
@@ -792,6 +802,21 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			return nil, status.Errorf(codes.Internal, "pci detach for %q applied but bookkeeping incomplete; left recoverable", vm.Name)
 		}
 	} else {
+		// Release the shared inventory reservation the stopped attach claimed. A stopped
+		// reservation has NO realizations (they are written at VM start), so the members
+		// to release are resolved from the intent address — the same primary + IOMMU-group
+		// siblings the stopped attach claimed. Owner-scoped release (no vfio unbind:
+		// nothing was bound); best-effort resolve so a vanished sibling can't wedge the
+		// detach (VM delete's releaseDevices clears any residual owner by VM).
+		if members, rerr := s.resolveDeviceSpec(ctx, vm.Name, &pb.DeviceSpec{Address: normAddr}, deviceID, map[string]bool{}); rerr == nil {
+			for _, m := range members {
+				if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, m.Address, vm.Name); err != nil {
+					slog.Warn("pci detach: release stopped reservation", "vm", vm.Name, "address", m.Address, "error", err)
+				}
+			}
+		} else {
+			slog.Warn("pci detach: resolve members to release stopped reservation", "vm", vm.Name, "address", normAddr, "error", rerr)
+		}
 		if err := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, deviceID); err != nil {
 			return s.failPCIDetachClean(ctx, vm, opID, epoch, newGen, normAddr,
 				codes.Internal, fmt.Errorf("tombstone PCI realizations: %w", err))

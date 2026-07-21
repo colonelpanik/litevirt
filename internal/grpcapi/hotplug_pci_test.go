@@ -12,9 +12,27 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
+
+// pciOwnerOf returns the vm_name that currently owns addr in host_pci_devices on
+// test-host ("" if the row is unowned or absent) — the shared CAS reservation a
+// PCI producer takes.
+func pciOwnerOf(t *testing.T, ctx context.Context, s *Server, addr string) string {
+	t.Helper()
+	devs, err := corrosion.ListPCIDevices(ctx, s.db, "test-host", "")
+	if err != nil {
+		t.Fatalf("ListPCIDevices: %v", err)
+	}
+	for _, d := range devs {
+		if d.Address == addr {
+			return d.VMName
+		}
+	}
+	return ""
+}
 
 // Concrete-address PCI hotplug tests reuse the disk suite's server/gate helpers
 // (hotplugDiskServer, setDeviceGate, enableHardwareV2, mustGetVM) and the NIC
@@ -697,10 +715,10 @@ func TestAcquireDeviceLeases_ConflictFailsClosed(t *testing.T) {
 // TestAttachPCI_ConcurrentSameBDF_OneWins is the #6 proof: two concurrent
 // concrete-address attaches of the same host BDF to DIFFERENT VMs (so different
 // per-VM locks, which do NOT serialize them) must resolve to EXACTLY ONE winner
-// and EXACTLY ONE live intent. The host-scoped pciReserveMu serializes the
-// exclusivity-check→intent-reserve critical section so the loser observes the
-// winner's durable intent. Run with -race. This is a concurrency test made
-// reliable by the mutex; the deterministic backstop is the sequential test below.
+// and EXACTLY ONE live intent. The shared host_pci_devices CAS (claimDeviceOwnership)
+// is the exclusivity boundary: exactly one attach wins the claim, and the loser fails
+// before writing its intent (the intent write is gated by a successful claim). Run
+// with -race. The deterministic backstop is the sequential test below.
 func TestAttachPCI_ConcurrentSameBDF_OneWins(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
@@ -784,5 +802,286 @@ func TestDetachDevice_PCINoIntentFallsToLegacy(t *testing.T) {
 		VmName: "vm1", PciAddress: "0000:99:00.0",
 	}); err != nil {
 		t.Fatalf("legacy detach of a non-intent address should succeed via the old path: %v", err)
+	}
+}
+
+// ── FIX-9a: the DB CAS on host_pci_devices is the ONE shared reservation ──────
+
+// pciProducerServer builds a server that can BOTH journal-attach a PCI device to a
+// stopped VM AND run CreateVM (so a cross-producer conflict is exercisable): the
+// hotplug-disk server plus an image store and an active host row for placement.
+func pciProducerServer(t *testing.T) *Server {
+	t.Helper()
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	s.images = image.NewStore(s.dataDir)
+	s.images.Init()
+	if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.1", State: "active", CPUTotal: 8, MemTotal: 16384,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	return s
+}
+
+// createVMWithBDF is CreateVM for a diskless VM whose only device is the concrete
+// BDF — the CreateVM producer in the cross-producer exclusivity tests.
+func createVMWithBDF(ctx context.Context, s *Server, name, addr string) error {
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: name, Cpu: 1, MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+		Network:   []*pb.NetworkAttachment{{Name: "lo", Model: "virtio"}},
+		Devices:   []*pb.DeviceSpec{{Address: addr}},
+	}})
+	return err
+}
+
+// TestAttachPCI_StoppedReservesInventory proves a STOPPED concrete-address attach
+// now takes the shared inventory reservation (claims host_pci_devices ownership) at
+// declare time — WITHOUT any vfio bind or realization (those stay at VM start). RED
+// before FIX-9a: the stopped reserve wrote only the intent, leaving the device
+// unowned, so a concurrent CreateVM of the same BDF could also claim it.
+func TestAttachPCI_StoppedReservesInventory(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIBindFakeFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "stopped")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: "0000:41:00.0"},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	// The shared CAS reservation: the stopped attach CLAIMS host_pci_devices ownership.
+	if o := pciOwnerOf(t, ctx, s, "0000:41:00.0"); o != "vm1" {
+		t.Fatalf("stopped attach must claim inventory ownership, got owner %q, want vm1", o)
+	}
+	// The intent is still reserved.
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("want 1 live intent, got %d", len(in))
+	}
+	// But NO vfio bind and NO realization on a stopped reserve.
+	if fs.binds != 0 {
+		t.Fatalf("stopped reserve must NOT bind vfio, got %d binds", fs.binds)
+	}
+	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) != 0 {
+		t.Fatalf("stopped reserve must NOT write realizations, got %d: %+v", len(rs), rs)
+	}
+}
+
+// TestAttachPCI_vs_CreateVM_SameBDF_OneWins proves the CAS reservation is shared
+// ACROSS producers: a stopped attach and a CreateVM racing for the same BDF resolve
+// to exactly one winner and exactly one owner. RED before FIX-9a in the
+// attach_then_create direction: the stopped attach did not claim inventory, so the
+// create's CAS still succeeded (both declared the device).
+func TestAttachPCI_vs_CreateVM_SameBDF_OneWins(t *testing.T) {
+	const bdf = "0000:41:00.0"
+
+	// Deterministic backstop A: a reserved BDF blocks a later CreateVM of it.
+	t.Run("attach_then_create", func(t *testing.T) {
+		s := pciProducerServer(t)
+		restore := vfio.SetFS(newPCIBindFakeFS())
+		defer restore()
+		ctx := adminCtx()
+		seedPCIGPU(t, s, bdf, -1)
+		seedNICVM(t, s, "vm-a", "stopped")
+
+		if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+			VmName: "vm-a", PciDevice: &pb.DeviceSpec{Address: bdf},
+		}); err != nil {
+			t.Fatalf("attach: %v", err)
+		}
+		if err := createVMWithBDF(ctx, s, "vm-b", bdf); err == nil {
+			t.Fatal("CreateVM claiming a BDF a stopped attach already reserved must fail")
+		}
+		if o := pciOwnerOf(t, ctx, s, bdf); o != "vm-a" {
+			t.Fatalf("BDF owner = %q, want vm-a (create must not steal a reserved device)", o)
+		}
+	})
+
+	// Deterministic backstop B: a CreateVM-claimed BDF blocks a later attach of it.
+	t.Run("create_then_attach", func(t *testing.T) {
+		s := pciProducerServer(t)
+		restore := vfio.SetFS(newPCIBindFakeFS())
+		defer restore()
+		ctx := adminCtx()
+		seedPCIGPU(t, s, bdf, -1)
+
+		if err := createVMWithBDF(ctx, s, "vm-b", bdf); err != nil {
+			t.Fatalf("CreateVM: %v", err)
+		}
+		seedNICVM(t, s, "vm-a", "stopped")
+		if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+			VmName: "vm-a", PciDevice: &pb.DeviceSpec{Address: bdf},
+		}); err == nil {
+			t.Fatal("attaching a BDF a CreateVM already claimed must fail")
+		}
+		if o := pciOwnerOf(t, ctx, s, bdf); o != "vm-b" {
+			t.Fatalf("BDF owner = %q, want vm-b", o)
+		}
+	})
+
+	// The concurrency proof (run with -race): exactly one producer wins.
+	t.Run("concurrent", func(t *testing.T) {
+		s := pciProducerServer(t)
+		restore := vfio.SetFS(newPCIBindFakeFS())
+		defer restore()
+		ctx := adminCtx()
+		seedPCIGPU(t, s, bdf, -1)
+		seedNICVM(t, s, "vm-a", "stopped")
+
+		var wg sync.WaitGroup
+		var okCount int32
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+				VmName: "vm-a", PciDevice: &pb.DeviceSpec{Address: bdf},
+			}); err == nil {
+				atomic.AddInt32(&okCount, 1)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := createVMWithBDF(ctx, s, "vm-b", bdf); err == nil {
+				atomic.AddInt32(&okCount, 1)
+			}
+		}()
+		wg.Wait()
+
+		if okCount != 1 {
+			t.Fatalf("exactly one of {stopped attach, CreateVM} of the same BDF must win, got %d", okCount)
+		}
+		if o := pciOwnerOf(t, ctx, s, bdf); o != "vm-a" && o != "vm-b" {
+			t.Fatalf("the BDF must be owned by exactly one winner, got owner %q", o)
+		}
+	})
+}
+
+// TestDetachPCI_ReleasesStoppedReservation proves a concrete-address detach of a
+// STOPPED-reserved device releases the shared inventory reservation the stopped
+// attach took. RED before FIX-9a: the stopped attach never claimed, so the
+// pre-detach ownership assertion could not hold; the stopped detach path also never
+// released ownership.
+func TestDetachPCI_ReleasesStoppedReservation(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "stopped")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: "0000:41:00.0"},
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if o := pciOwnerOf(t, ctx, s, "0000:41:00.0"); o != "vm1" {
+		t.Fatalf("stopped attach must claim ownership before detach, got owner %q", o)
+	}
+
+	if _, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{
+		VmName: "vm1", PciAddress: "0000:41:00.0",
+	}); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	if o := pciOwnerOf(t, ctx, s, "0000:41:00.0"); o != "" {
+		t.Fatalf("detach must release the stopped reservation, got owner %q", o)
+	}
+}
+
+// TestDeletePCI_ReleasesStoppedReservation proves deleting a VM that holds a
+// stopped PCI reservation clears its host_pci_devices ownership (releaseDevices →
+// ReleasePCIDevicesByVM covers claimed-but-unbound devices).
+func TestDeletePCI_ReleasesStoppedReservation(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	s.images = image.NewStore(s.dataDir)
+	s.images.Init()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "stopped")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: "0000:41:00.0"},
+	}); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if o := pciOwnerOf(t, ctx, s, "0000:41:00.0"); o != "vm1" {
+		t.Fatalf("stopped attach must claim ownership, got owner %q", o)
+	}
+
+	if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "vm1"}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if o := pciOwnerOf(t, ctx, s, "0000:41:00.0"); o != "" {
+		t.Fatalf("delete must release the stopped reservation, got owner %q", o)
+	}
+}
+
+// TestClaimDeviceOwnership_MissingInventory_FailsClosed proves the shared claim
+// fails CLOSED for a BDF absent from host_pci_devices: FailedPrecondition, claiming
+// nothing. RED before FIX-9a removed the "!present" bind-without-claim branch (which
+// treated an un-inventoried BDF as a silent no-op, letting concurrent producers
+// bypass the CAS during an inventory gap).
+func TestClaimDeviceOwnership_MissingInventory_FailsClosed(t *testing.T) {
+	s := hotplugDiskServer(t)
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+
+	// The BDF is NOT in host_pci_devices.
+	release, err := s.claimDeviceOwnership(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("missing-inventory claim: code = %v, want FailedPrecondition", status.Code(err))
+	}
+	// Claimed nothing — no ownership row conjured.
+	if o := pciOwnerOf(t, ctx, s, "0000:41:00.0"); o != "" {
+		t.Fatalf("a failed-closed claim must own nothing, got owner %q", o)
+	}
+	// The returned release is a safe no-op.
+	if release != nil {
+		release()
+	}
+}
+
+// TestClaimDeviceOwnership_IOMMUGroup_PartialClaimRollback proves that when a
+// multi-member claim fails partway (a later member is owned by another VM), ONLY the
+// members THIS call newly claimed are rolled back — the primary is released and the
+// other VM's device is untouched. Exercised at the claim primitive directly (the
+// public attach path rejects a same-group other-VM sibling earlier via
+// checkIOMMUConflict), so the members are constructed by hand.
+func TestClaimDeviceOwnership_IOMMUGroup_PartialClaimRollback(t *testing.T) {
+	s := hotplugDiskServer(t)
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	seedPCIGPU(t, s, "0000:41:00.0", 20) // primary — inventoried, unowned
+	seedPCIGPU(t, s, "0000:41:00.1", 20) // sibling — inventoried
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", "0000:41:00.1", "other-vm"); err != nil {
+		t.Fatalf("seed sibling ownership: %v", err)
+	}
+
+	_, err := s.claimDeviceOwnership(ctx, "vm1", []ResolvedMember{
+		{Address: "0000:41:00.0"}, {Address: "0000:41:00.1"},
+	})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("claim with an other-VM member: code = %v, want AlreadyExists", status.Code(err))
+	}
+	// The primary claim that momentarily succeeded is rolled back...
+	if o := pciOwnerOf(t, ctx, s, "0000:41:00.0"); o != "" {
+		t.Fatalf("primary must be released on partial-claim rollback, got owner %q", o)
+	}
+	// ...and the other VM's device is left untouched.
+	if o := pciOwnerOf(t, ctx, s, "0000:41:00.1"); o != "other-vm" {
+		t.Fatalf("another VM's device must be untouched, got owner %q", o)
 	}
 }

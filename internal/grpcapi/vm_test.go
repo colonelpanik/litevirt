@@ -224,6 +224,13 @@ func TestCreateVM_PopulatesHardwareTables(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
+	// The passthrough device must be in host inventory: every producer takes the shared
+	// host_pci_devices CAS reservation, and a BDF absent from inventory fails closed.
+	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	}); err != nil {
+		t.Fatalf("seed PCI device: %v", err)
+	}
 
 	resp, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
 		Name:      "vm1",
@@ -302,6 +309,14 @@ func TestCreateVM_PCIIntentCanonicalizesAddress(t *testing.T) {
 		Name: "test-host", Address: "10.0.0.1", State: "active", CPUTotal: 8, MemTotal: 16384,
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
+	}
+	// Seed inventory at the resolver's (non-canonical) address form: the shared CAS
+	// reservation claims the address the spec resolves to, and a missing BDF fails closed.
+	// The device_id derivation is canonicalized independently (asserted below).
+	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	}); err != nil {
+		t.Fatalf("seed PCI device: %v", err)
 	}
 
 	spec := &pb.VMSpec{

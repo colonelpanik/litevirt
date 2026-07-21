@@ -373,6 +373,268 @@ func TestRecoverHardwareOperations_UnrecoverableLeftNonTerminal(t *testing.T) {
 	}
 }
 
+// TestRecoverDiskAttach_UnknownDomainState_NoCompensation: when the live domain
+// state is INDETERMINATE (DomainState errors), recovery must perform NO
+// compensation this pass — it must NOT take the stopped rollback path (which would
+// delete the backing file out from under a possibly-running VM and tombstone the
+// desired-state row). The op is left recovery-required (barrier + journal intact)
+// so a later pass retries once the state is legible.
+func TestRecoverDiskAttach_UnknownDomainState_NoCompensation(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	// The live domain state is UNREADABLE — the exact condition the bug mistook for
+	// "stopped" and used to justify the destructive file-delete rollback.
+	fake.FailDomainState = func(string) error {
+		return status.Error(codes.Internal, "libvirt connection lost")
+	}
+
+	fake.SetInactiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-root.qcow2'/><target dev='vda' bus='virtio'/></disk>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-data1.qcow2'/><target dev='vdb' bus='virtio'/></disk>"+
+		"</devices></domain>")
+	fake.SetDiskSource("vm1", "vdb", filepath.Join(s.dataDir, "disks", "vm1-data1.qcow2"))
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "vm1", DiskName: "data1", HostName: "test-host",
+		Path:       filepath.Join(s.dataDir, "disks", "vm1-data1.qcow2"),
+		DeviceKind: "disk", Bus: "virtio", TargetDev: "vdb", DeleteWithVM: true,
+	}); err != nil {
+		t.Fatalf("insert data1 row: %v", err)
+	}
+	diskPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte("op-owned; a running VM may be using it"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{
+			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+			"file_created_by_operation": diskPath,
+		})
+
+	s.RecoverHardwareOperations(ctx)
+
+	// No compensation: the backing file survives, the row survives, and the op is
+	// left recovery-required (barrier held + non-terminal + journal retained).
+	if _, statErr := os.Stat(diskPath); statErr != nil {
+		t.Fatalf("indeterminate state must NOT delete the backing file (stat err=%v)", statErr)
+	}
+	if disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1"); !hasDiskName(disks, "data1") {
+		t.Fatalf("indeterminate state must NOT tombstone the desired-state row: %+v", disks)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != opID {
+		t.Fatalf("barrier must stay held while the domain state is indeterminate: active_operation_id=%q, want %q",
+			vm.ActiveOperationID, opID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if corrosion.IsOperationTerminal(state) {
+		t.Fatalf("op must be left non-terminal on an indeterminate domain state: state=%q", state)
+	}
+	if _, found, _ := s.opJournal.Read(opID); !found {
+		t.Fatal("journal entry must be retained while the operation is recovery-required")
+	}
+}
+
+// TestRecoverDiskAttach_Shutoff_RollsBack guards that the tri-state gating did NOT
+// break legitimate stopped recovery: a POSITIVELY shut-off domain still takes the
+// stopped rollback path (file deleted, row tombstoned, barrier cleared).
+func TestRecoverDiskAttach_Shutoff_RollsBack(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running") // vm.State survives a host reboot as "running"
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateShutdown) // the domain is POSITIVELY shut off
+
+	fake.SetInactiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-root.qcow2'/><target dev='vda' bus='virtio'/></disk>"+
+		"<disk type='file' device='disk'><source file='/x/vm1-data1.qcow2'/><target dev='vdb' bus='virtio'/></disk>"+
+		"</devices></domain>")
+	fake.SetDiskSource("vm1", "vdb", filepath.Join(s.dataDir, "disks", "vm1-data1.qcow2"))
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "vm1", DiskName: "data1", HostName: "test-host",
+		Path:       filepath.Join(s.dataDir, "disks", "vm1-data1.qcow2"),
+		DeviceKind: "disk", Bus: "virtio", TargetDev: "vdb", DeleteWithVM: true,
+	}); err != nil {
+		t.Fatalf("insert data1 row: %v", err)
+	}
+	diskPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte("op-owned"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+		attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+		[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+		map[string]string{
+			"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+			"file_created_by_operation": diskPath,
+		})
+
+	s.RecoverHardwareOperations(ctx)
+
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("shut-off rollback must clear the barrier: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepFailed {
+		t.Fatalf("op state = %q, want failed", state)
+	}
+	if disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1"); hasDiskName(disks, "data1") {
+		t.Fatalf("shut-off rollback must tombstone the row: %+v", disks)
+	}
+	if _, statErr := os.Stat(diskPath); !os.IsNotExist(statErr) {
+		t.Fatalf("shut-off rollback must delete the op-owned backing file (stat err=%v)", statErr)
+	}
+	if inactive, _ := fake.DumpXMLInactive("vm1"); diskDevInXML(inactive, "vdb") {
+		t.Fatalf("shut-off rollback must reconcile data1 (vdb) OUT of the persistent definition:\n%s", inactive)
+	}
+}
+
+// TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact: file ownership is keyed
+// on the PRESENCE of the post-create journal artifact, never os.Stat. executeDiskAttach
+// records "file_created_by_operation" only AFTER exclusiveCreateQcow2 succeeds, so a
+// crash-before-create leaves no ownership claim and recovery never deletes a file this
+// op did not create.
+func TestRecoverDiskAttach_FileOwnership_OnlyPostCreateArtifact(t *testing.T) {
+	// Case 1 (RED→GREEN): a crash in the create window + a FOREIGN file at the would-be
+	// path → the retained planned entry asserts NO ownership, and recovery does NOT
+	// delete the foreign file.
+	t.Run("planned_stage_records_no_ownership_no_wrongful_delete", func(t *testing.T) {
+		s := hotplugDiskServer(t)
+		enableHardwareV2(t, s)
+		ctx := adminCtx()
+		seedDiskVM(t, s, "vm1", "stopped")
+		fake := s.virt.(*libvirtfake.Fake)
+		fake.SetState("vm1", libvirtfake.StateShutdown)
+		fake.SetInactiveXML("vm1", rootOnlyDomainXML("vm1"))
+
+		vm, err := corrosion.GetVM(ctx, s.db, "vm1")
+		if err != nil || vm == nil {
+			t.Fatalf("GetVM: err=%v nil=%v", err, vm == nil)
+		}
+
+		diskPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+		if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		// A FOREIGN file materializes at the exact path the op would use — created by
+		// ANOTHER actor, NOT by this operation. It must survive recovery untouched.
+		const foreign = "FOREIGN FILE — not created by this operation"
+		if err := os.WriteFile(diskPath, []byte(foreign), 0o644); err != nil {
+			t.Fatalf("write foreign file: %v", err)
+		}
+
+		// Claim the barrier, then drive the REAL executeDiskAttach. The foreign file makes
+		// exclusiveCreateQcow2 fail (the crash-before-create window); a stale spec
+		// generation makes the terminal-failure CAS not apply, so the PLANNED journal
+		// entry + barrier are RETAINED for recovery — the state a real crash leaves.
+		opID := "own-vm1-attach"
+		reqHash := attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"})
+		op := corrosion.OperationRecord{
+			ID: opID, Method: "AttachDevice", Principal: "admin@local", Project: "_default",
+			ResourceKind: "vm", ResourceID: "vm1", OperationKind: string(corrosion.OpDeviceAttach), RequestHash: reqHash,
+		}
+		applied, err := s.db.BeginVMOperation(ctx, op, vm.Spec, vm.OwnerEpoch, vm.SpecGeneration)
+		if err != nil || !applied {
+			t.Fatalf("BeginVMOperation: applied=%v err=%v", applied, err)
+		}
+		epoch := vm.OwnerEpoch
+		staleGen := vm.SpecGeneration + 100 // never matches the real (bumped) spec_generation
+
+		_, _ = s.executeDiskAttach(ctx, vm, &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}, "virtio",
+			diskPath, 5<<30, 5<<30, "vdb", opID, epoch, staleGen, false)
+
+		// The retained PLANNED entry must NOT claim ownership of a file never created.
+		entry, found, err := s.opJournal.Read(opID)
+		if err != nil || !found {
+			t.Fatalf("planned journal entry must be retained: found=%v err=%v", found, err)
+		}
+		if got := entry.Artifacts["file_created_by_operation"]; got != "" {
+			t.Fatalf("planned journal must NOT assert file ownership before create; got %q", got)
+		}
+
+		s.RecoverHardwareOperations(ctx)
+
+		// The foreign file must survive untouched.
+		if _, statErr := os.Stat(diskPath); statErr != nil {
+			t.Fatalf("recovery wrongly deleted a file this op did not create (stat err=%v)", statErr)
+		}
+		if b, _ := os.ReadFile(diskPath); string(b) != foreign {
+			t.Fatalf("recovery modified a foreign file: %q", string(b))
+		}
+		// Recovery still converged the op (proving it ran the rollback path, not skipped).
+		vm2 := mustGetVM(t, s, "vm1")
+		if vm2.ActiveOperationID != "" {
+			t.Fatalf("recovery must clear the barrier: %q", vm2.ActiveOperationID)
+		}
+	})
+
+	// Case 2 (guard): once the post-create ownership artifact IS present, the op-owned
+	// backing file IS deleted on rollback — the fix must not disable legitimate cleanup.
+	t.Run("post_create_ownership_artifact_deletes_op_owned_file", func(t *testing.T) {
+		s := hotplugDiskServer(t)
+		enableHardwareV2(t, s)
+		ctx := adminCtx()
+		seedDiskVM(t, s, "vm1", "stopped")
+		fake := s.virt.(*libvirtfake.Fake)
+		fake.SetState("vm1", libvirtfake.StateShutdown)
+		fake.SetInactiveXML("vm1", rootOnlyDomainXML("vm1"))
+
+		diskPath, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+		if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(diskPath, []byte("op-owned"), 0o644); err != nil {
+			t.Fatalf("write op file: %v", err)
+		}
+
+		opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
+			attachDiskRequestHash("vm1", &pb.DiskSpec{Name: "data1", Size: "5G", Bus: "virtio"}),
+			[]string{corrosion.OpStepReserved, corrosion.OpStepClaimed},
+			map[string]string{
+				"disk_name": "data1", "target_dev": "vdb", "bus": "virtio",
+				"prior_inactive_xml":        rootOnlyDomainXML("vm1"),
+				"file_created_by_operation": diskPath, // ownership recorded post-create
+			})
+
+		s.RecoverHardwareOperations(ctx)
+
+		if _, statErr := os.Stat(diskPath); !os.IsNotExist(statErr) {
+			t.Fatalf("rollback must delete the op-owned backing file (stat err=%v)", statErr)
+		}
+		vm := mustGetVM(t, s, "vm1")
+		if vm.ActiveOperationID != "" {
+			t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+		}
+		state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceAttach)
+		if err != nil {
+			t.Fatalf("read op state: %v", err)
+		}
+		if state != corrosion.OpStepFailed {
+			t.Fatalf("op state = %q, want failed", state)
+		}
+	})
+}
+
 // TestRecoverDeviceLeases_SkipsDeviceOps confirms RecoverDeviceLeases leaves
 // device_attach / device_detach journal entries untouched (distinct Kind) — they
 // are recovered by RecoverHardwareOperations, not the device-lease path.

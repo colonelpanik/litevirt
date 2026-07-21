@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
@@ -169,26 +168,30 @@ func (s *Server) completeRecoveredOp(ctx context.Context, vmName string, view *c
 	slog.Info("hardware op recovery: converged", "vm", vmName, "op", view.ActiveOperationID, "kind", kind)
 }
 
-// recoveryDomainRunning reports whether the VM's libvirt domain is CURRENTLY
-// live-running — the signal that routes crash recovery down the running vs.
-// stopped compensation path. It deliberately consults the LIVE domain, NOT the
-// replicated vm.State: after a HOST REBOOT (the primary recovery trigger) a VM
-// that was "running" pre-crash still reads vm.State=="running" while its domain is
-// shut off, and driving the running rollback there would issue a LIVE-flagged
-// libvirt call (e.g. DetachDisk LIVE|CONFIG) that a shut-off domain rejects —
-// stranding a half-applied device in the persistent definition. On ANY error or
-// indeterminate state it returns false so recovery takes the STOPPED path, which
-// reconciles the persistent definition from the authoritative tables and never
-// issues a live-only mutation (the conservative, safe default; uncertainty must
-// never take the running path).
-func (s *Server) recoveryDomainRunning(vmName string) bool {
+// recoveryDomainState reports the VM's LIVE libvirt domain state as a TRI-STATE:
+// running (running=true, known=true), positively-not-running (running=false,
+// known=true — shutoff/crashed/etc.), or INDETERMINATE (known=false) when the state
+// cannot be read. It deliberately consults the LIVE domain, NOT the replicated
+// vm.State: after a HOST REBOOT (the primary recovery trigger) a VM that was
+// "running" pre-crash still reads vm.State=="running" while its domain is shut off,
+// and driving the running rollback there would issue a LIVE-flagged libvirt call
+// (e.g. DetachDisk LIVE|CONFIG) that a shut-off domain rejects — stranding a
+// half-applied device in the persistent definition.
+//
+// The THIRD state matters because the stopped compensation path is DESTRUCTIVE
+// (it deletes op-owned backing files and tombstones desired-state rows) and a
+// filesystem delete affects a running VM regardless of not issuing a live libvirt
+// call. So an unreadable state must NOT be coerced to "stopped": callers treat
+// known=false as "perform no compensation this pass; leave the op recovery-required
+// and retry once the state is legible".
+func (s *Server) recoveryDomainState(vmName string) (running, known bool) {
 	state, err := s.virt.DomainState(vmName)
 	if err != nil {
-		slog.Warn("hardware op recovery: live domain state unavailable — taking the stopped (reconcile-from-tables) path",
+		slog.Warn("hardware op recovery: live domain state indeterminate",
 			"vm", vmName, "error", err)
-		return false
+		return false, false
 	}
-	return state == "running"
+	return state == "running", true
 }
 
 // ── ATTACH recovery (roll BACK; or COMPLETE when fully applied) ───────────────
@@ -211,7 +214,11 @@ func (s *Server) recoverDeviceAttach(ctx context.Context, vm *corrosion.VMRecord
 }
 
 func (s *Server) recoverDiskAttach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := s.recoveryDomainRunning(vm.Name)
+	running, known := s.recoveryDomainState(vm.Name)
+	if !known {
+		slog.Warn("hardware op recovery: domain state indeterminate; leaving disk attach recoverable, will retry", "vm", vm.Name, "op", view.ActiveOperationID)
+		return
+	}
 	art := entry.Artifacts
 	targetDev := art["target_dev"]
 
@@ -232,6 +239,13 @@ func (s *Server) recoverDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 		vm: vm, opID: view.ActiveOperationID, epoch: view.OwnerEpoch, newGen: view.SpecGeneration,
 		diskName: art["disk_name"], diskPath: art["file_created_by_operation"],
 		targetDev: targetDev, running: running, journaled: true,
+		// File ownership is the PRESENCE of the post-create artifact, NOT os.Stat: the
+		// artifact is written ONLY after exclusiveCreateQcow2 succeeds, so a file at this
+		// path is op-owned iff the op durably recorded creating it. A planned-stage entry
+		// (a crash before create) carries no such artifact → fileCreated=false → the
+		// rollback never deletes a file this op did not create (a foreign file at the same
+		// path survives; failDeviceAttach's os.Remove tolerates ErrNotExist).
+		fileCreated: art["file_created_by_operation"] != "",
 	}
 	if running {
 		if srcs, e := s.virt.DomainDiskSources(vm.Name); e == nil {
@@ -246,11 +260,6 @@ func (s *Server) recoverDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 			}
 		}
 	}
-	if rb.diskPath != "" {
-		if _, e := os.Stat(rb.diskPath); e == nil {
-			rb.fileCreated = true // exclusive-create guarantees a present file at this path is op-owned
-		}
-	}
 	// failDeviceAttach rolls back directionally and, ONLY if the rollback completes,
 	// records the terminal failure + clears the barrier; otherwise it leaves the op
 	// NON-TERMINAL. Its returned error is the operation's reported failure (expected),
@@ -259,7 +268,11 @@ func (s *Server) recoverDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 }
 
 func (s *Server) recoverNICAttach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := s.recoveryDomainRunning(vm.Name)
+	running, known := s.recoveryDomainState(vm.Name)
+	if !known {
+		slog.Warn("hardware op recovery: domain state indeterminate; leaving nic attach recoverable, will retry", "vm", vm.Name, "op", view.ActiveOperationID)
+		return
+	}
 	latched := s.hardwareV2Latched(ctx)
 	art := entry.Artifacts
 	mac := art["mac"]
@@ -309,7 +322,11 @@ func (s *Server) recoverNICAttach(ctx context.Context, vm *corrosion.VMRecord, v
 }
 
 func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := s.recoveryDomainRunning(vm.Name)
+	running, known := s.recoveryDomainState(vm.Name)
+	if !known {
+		slog.Warn("hardware op recovery: domain state indeterminate; leaving pci attach recoverable, will retry", "vm", vm.Name, "op", view.ActiveOperationID)
+		return
+	}
 	latched := s.hardwareV2Latched(ctx)
 	art := entry.Artifacts
 	deviceID := art["device_id"]
@@ -443,7 +460,11 @@ func (s *Server) recoverDeviceDetach(ctx context.Context, vm *corrosion.VMRecord
 }
 
 func (s *Server) recoverDiskDetach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := s.recoveryDomainRunning(vm.Name)
+	running, known := s.recoveryDomainState(vm.Name)
+	if !known {
+		slog.Warn("hardware op recovery: domain state indeterminate; leaving disk detach recoverable, will retry", "vm", vm.Name, "op", view.ActiveOperationID)
+		return
+	}
 	art := entry.Artifacts
 	targetDev := art["target_dev"]
 	diskName := art["disk_name"]
@@ -479,7 +500,11 @@ func (s *Server) recoverDiskDetach(ctx context.Context, vm *corrosion.VMRecord, 
 }
 
 func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := s.recoveryDomainRunning(vm.Name)
+	running, known := s.recoveryDomainState(vm.Name)
+	if !known {
+		slog.Warn("hardware op recovery: domain state indeterminate; leaving nic detach recoverable, will retry", "vm", vm.Name, "op", view.ActiveOperationID)
+		return
+	}
 	latched := s.hardwareV2Latched(ctx)
 	art := entry.Artifacts
 	mac := art["mac"]
@@ -524,7 +549,11 @@ func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, v
 }
 
 func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, view *corrosion.VMOperationView, entry *opjournal.Entry) {
-	running := s.recoveryDomainRunning(vm.Name)
+	running, known := s.recoveryDomainState(vm.Name)
+	if !known {
+		slog.Warn("hardware op recovery: domain state indeterminate; leaving pci detach recoverable, will retry", "vm", vm.Name, "op", view.ActiveOperationID)
+		return
+	}
 	art := entry.Artifacts
 	deviceID := art["device_id"]
 

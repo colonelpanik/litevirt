@@ -410,7 +410,7 @@ type attachRollback struct {
 	diskPath    string
 	targetDev   string
 	running     bool
-	journaled   bool // durable plan (incl. file_created_by_operation) recorded
+	journaled   bool // durable plan recorded (file_created_by_operation added post-create)
 	fileCreated bool // this op exclusively created the backing file
 	attached    bool // live attach succeeded (running path)
 	rowWritten  bool // vm_disks row inserted
@@ -430,28 +430,32 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepReserved)
 
 	// Journal the plan BEFORE the irreversible file-create/attach so a crash recovers.
+	// The plan carries everything recovery needs to compensate EXCEPT the file-ownership
+	// assertion: "file_created_by_operation" is recorded ONLY after exclusiveCreateQcow2
+	// succeeds (below), so a crash before the create leaves no ownership claim and
+	// recovery — which keys ownership on the PRESENCE of that post-create artifact, not
+	// os.Stat — can never delete a file this op did not create.
 	priorActive, _ := s.virt.DumpXML(vm.Name)
 	priorInactive, _ := s.virt.DumpXMLInactive(vm.Name)
+	entry := opjournal.Entry{
+		OperationID:    opID,
+		OwnerEpoch:     epoch,
+		SpecGeneration: newGen,
+		ResourceID:     vm.Name,
+		Kind:           "device_attach",
+		Stage:          "planned",
+		Artifacts: map[string]string{
+			"disk_name":              spec.Name,
+			"target_dev":             targetDev,
+			"bus":                    bus,
+			"prior_active_xml":       priorActive,
+			"prior_inactive_xml":     priorInactive,
+			"member_active_before":   strconv.FormatBool(diskDevInXML(priorActive, targetDev)),
+			"member_inactive_before": strconv.FormatBool(diskDevInXML(priorInactive, targetDev)),
+		},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
 	if s.opJournal != nil {
-		entry := opjournal.Entry{
-			OperationID:    opID,
-			OwnerEpoch:     epoch,
-			SpecGeneration: newGen,
-			ResourceID:     vm.Name,
-			Kind:           "device_attach",
-			Stage:          "planned",
-			Artifacts: map[string]string{
-				"disk_name":                 spec.Name,
-				"target_dev":                targetDev,
-				"bus":                       bus,
-				"prior_active_xml":          priorActive,
-				"prior_inactive_xml":        priorInactive,
-				"member_active_before":      strconv.FormatBool(diskDevInXML(priorActive, targetDev)),
-				"member_inactive_before":    strconv.FormatBool(diskDevInXML(priorInactive, targetDev)),
-				"file_created_by_operation": diskPath, // this op will exclusively create it
-			},
-			CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		}
 		if err := s.opJournal.Write(entry); err != nil {
 			// Fail closed: without the durable plan we must not perform the irreversible
 			// create/attach. No side effect yet → clean terminal failure.
@@ -466,6 +470,22 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 		return s.failDeviceAttach(ctx, rb, codes.FailedPrecondition, err)
 	}
 	rb.fileCreated = true
+	// The backing file now EXISTS and is exclusively this op's — record ownership
+	// durably by re-writing the journal entry (same OperationID → opjournal.Write
+	// overwrites atomically via temp+rename). Recovery derives file ownership from the
+	// presence of this artifact, so the rollback delete only ever targets an op-created
+	// file. The window between create success and this re-write can leak a benign
+	// unclaimed file on a crash (reclaimed by the crash-safety sweep) — never a wrongful
+	// delete, the sanctioned safe direction.
+	if s.opJournal != nil {
+		entry.Stage = "claimed"
+		entry.Artifacts["file_created_by_operation"] = diskPath
+		if err := s.opJournal.Write(entry); err != nil {
+			// The file was created but ownership could not be durably recorded: roll back
+			// (rb.fileCreated=true → the just-created file is deleted) and fail cleanly.
+			return s.failDeviceAttach(ctx, rb, codes.Unavailable, fmt.Errorf("journal file ownership: %w", err))
+		}
+	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 
 	rec := corrosion.DiskRecord{

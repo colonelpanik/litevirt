@@ -14,9 +14,9 @@ import (
 // DURING THIS START, never a pre-existing self-owned reserve-while-off reservation
 // (FIX-9b). pciStartPreflight's rollback ran on a realization-write / reconcile /
 // StartDomain failure and released the WHOLE member set (allAddrs) via the owner-scoped
-// releaseDeviceLeases — which DID clear a self-owned reservation, so a transient
-// post-bind failure lost the VM's reserved device to a concurrent claimant. The fix
-// scopes the rollback to claimedSriov ∪ the set acquireDeviceLeases newly claimed.
+// release — which DID clear a self-owned reservation, so a transient post-bind failure
+// lost the VM's reserved device to a concurrent claimant. The fix scopes the rollback to
+// claimedSriov ∪ the set acquireDeviceLeases newly claimed.
 
 // TestStartVM_ReconcileFailsAfterBind_RetainsReservation: a latched VM holds a device
 // reserved-while-off (self-owned in host_pci_devices, declared by an intent). Start
@@ -76,7 +76,9 @@ func TestStartVM_ReconcileFailsAfterBind_RetainsReservation(t *testing.T) {
 func TestStartVM_FailsButFreshlyClaimedReleased(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	fs := newPCIBindFakeFS()
+	// Unbind-modeling fake: releasing the freshly-claimed device on the failed-start
+	// rollback vfio-unbinds it (ground truth) before clearing ownership.
+	fs := newPCIUnbindRecordingFS()
 	restore := vfio.SetFS(fs)
 	defer restore()
 	ctx := adminCtx()

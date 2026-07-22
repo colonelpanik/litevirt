@@ -486,8 +486,9 @@ func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, member
 // (the exclusive, fail-closed physical-double-bind guard) with the durable
 // device-lease entry (F1) written BEFORE the irreversible vfio bind, then binds
 // every member to vfio-pci. On a bind failure it rolls back the devices this call
-// touched (releaseDeviceLeases) and clears the lease, so a crash before the VM row
-// is finalized is recovered at startup. It returns the finish func the caller must
+// newly claimed (via the strict unbindAndReleaseOwnership primitive) and clears the
+// lease — unless the release could not confirm the unbind, in which case it RETAINS
+// the lease so a crash before the VM row is finalized is recovered at startup. It returns the finish func the caller must
 // defer to clear the lease once the row is durable, AND the addresses it NEWLY claimed
 // (a self-owned member is skipped → NOT in the list), so a caller's OWN post-acquire
 // rollback can release exactly the devices this start took and never a pre-existing
@@ -519,13 +520,20 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 		prevDriver, err := vfio.Bind(addr)
 		if err != nil {
 			slog.Warn("VFIO bind failed", "address", addr, "error", err)
-			// Roll back ONLY the devices THIS call newly claimed (unbind + owner-release)
-			// + clear the durable lease. A self-owned reservation (a device reserved while
-			// the VM was off, FIX-9b) is NOT in `claimed`, so a failed start-time bind
-			// retains it rather than silently dropping the reservation. When nothing is
-			// self-owned, `claimed` == every address, so this is identical to before.
-			s.releaseDeviceLeases(ctx, vmName, claimed)
-			finish()
+			// Roll back ONLY the devices THIS call newly claimed, via the strict all-or-
+			// nothing primitive (unbind bound members by vfio ground truth, then owner-
+			// release). A self-owned reservation (a device reserved while the VM was off,
+			// FIX-9b) is NOT in `claimed`, so a failed start-time bind retains it rather than
+			// silently dropping the reservation. When nothing is self-owned, `claimed` ==
+			// every address.
+			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, claimed); rerr != nil {
+				// A freshly-claimed member could not be confirmed unbound → leave it owned +
+				// bound (recoverable, never unowned + bound) and RETAIN the durable device-
+				// lease so RecoverDeviceLeases retries the release; do NOT finish().
+				slog.Error("VFIO bind rollback: release incomplete — device lease retained for recovery", "vm", vmName, "error", rerr)
+			} else {
+				finish() // release converged (or nothing to release) → clear the durable lease
+			}
 			return noop, nil, status.Errorf(codes.Internal,
 				"failed to bind device %s to vfio-pci: %v", addr, err)
 		}
@@ -558,7 +566,14 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	var claimedSriov []string // VFs allocateSRIOVVFs CAS-claimed (released on a resolve failure)
 	resolveFail := func(e error) (func(), error) {
 		if len(claimedSriov) > 0 {
-			s.releaseDeviceLeases(ctx, vm.Name, claimedSriov)
+			// The VFs were CAS-claimed but never vfio-bound (allocateSRIOVVFs binds nothing),
+			// so the strict primitive skips every unbind (IsBoundToVFIO=false) and just owner-
+			// releases them — behavior-preserving. A release-write failure is only logged: the
+			// resolve already failed and the residual owned VF converges on the next start's
+			// self-owned skip.
+			if rerr := s.unbindAndReleaseOwnership(ctx, vm.Name, claimedSriov); rerr != nil {
+				slog.Warn("sr-iov resolve rollback: release incomplete", "vm", vm.Name, "error", rerr)
+			}
 		}
 		return nil, e
 	}
@@ -633,21 +648,34 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 		}
 		byDevice[m.DeviceID] = append(byDevice[m.DeviceID], m)
 	}
-	rollback := func() {
+	rollback := func() error {
 		// Release ONLY the devices THIS start freshly claimed — never a pre-existing
 		// self-owned reserve-while-off reservation (FIX-9c). A retained self-owned device
-		// is absent from freshlyClaimed, so it stays bound + owned = still reserved.
-		s.releaseDeviceLeases(ctx, vm.Name, freshlyClaimed)
-		// Tombstoning THIS start's realization rows is correct regardless of ownership.
+		// is absent from freshlyClaimed, so it stays bound + owned = still reserved. Strict
+		// (all-or-nothing): if a freshly-claimed member cannot be confirmed unbound, release
+		// NOTHING and return the error so the caller leaves the start recovery-required (it
+		// stays owned + bound, never unowned + bound). Tombstone realizations only once the
+		// release has converged, so a recovery-required rollback keeps this start's rows.
+		if rerr := s.unbindAndReleaseOwnership(ctx, vm.Name, freshlyClaimed); rerr != nil {
+			return rerr
+		}
 		for _, dev := range deviceOrder {
 			if terr := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, dev); terr != nil {
 				slog.Warn("pci start-preflight: tombstone realizations on rollback", "vm", vm.Name, "device", dev, "error", terr)
 			}
 		}
+		return nil
 	}
 	for _, dev := range deviceOrder {
 		if werr := s.writePCIRealizations(ctx, vm.Name, dev, byDevice[dev]); werr != nil {
-			rollback()
+			if rbErr := rollback(); rbErr != nil {
+				// The release could not confirm the unbind → leave the start recovery-required:
+				// do NOT finish() the lease (retain it), propagate so startVMLocked leaves it
+				// recoverable. The freshly-claimed member stays owned + bound; retry converges.
+				slog.Error("pci start-preflight: rollback release incomplete after realization write failure — left recoverable", "vm", vm.Name, "error", rbErr)
+				return nil, status.Errorf(codes.Internal,
+					"persist PCI realizations for %q failed and rollback could not release freshly-claimed device(s); left recoverable: %v", vm.Name, werr)
+			}
 			finish()
 			return nil, status.Errorf(codes.Internal, "persist PCI realizations for %q: %v", vm.Name, werr)
 		}
@@ -655,68 +683,83 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 
 	// ── Reconcile the aliased hostdevs into the domain definition ──
 	if rerr := s.reconcileDomainDefinition(ctx, vm, members); rerr != nil {
-		rollback()
+		if rbErr := rollback(); rbErr != nil {
+			slog.Error("pci start-preflight: rollback release incomplete after reconcile failure — left recoverable", "vm", vm.Name, "error", rbErr)
+			return nil, status.Errorf(codes.Internal,
+				"reconcile domain for %q failed and rollback could not release freshly-claimed device(s); left recoverable: %v", vm.Name, rerr)
+		}
 		finish()
 		return nil, rerr
 	}
 
 	// Success: the realization rows are the durable record now — clear the F1 lease.
-	// The returned release is invoked ONLY if the caller's StartDomain then fails.
+	// The returned release is invoked ONLY if the caller's StartDomain then fails; a
+	// release that cannot confirm the unbind leaves the freshly-claimed member owned +
+	// bound (recoverable on the operator's start retry), never unowned + bound.
 	finish()
-	return rollback, nil
+	return func() {
+		if rbErr := rollback(); rbErr != nil {
+			slog.Error("pci start-preflight: post-StartDomain-failure release incomplete — freshly-claimed device(s) left owned+bound (recoverable on retry)", "vm", vm.Name, "error", rbErr)
+		}
+	}, nil
 }
 
-// releaseDevices unbinds all devices from vfio-pci and releases them in the DB.
-func (s *Server) releaseDevices(ctx context.Context, vmName string) {
+// releaseDevices is the STRICT whole-VM PCI teardown: for every device this host
+// records as owned by vmName it consults the ACTUAL vfio driver state (IsBoundToVFIO
+// ground truth) and unbinds the ones still bound to vfio-pci, then releases the VM's
+// ownership (ReleasePCIDevicesByVM) ONLY if EVERY unbind succeeded. If any unbind (or
+// bound-check) failed it releases NOTHING and returns an error — the same all-or-
+// nothing invariant unbindAndReleaseOwnership enforces per-member, applied to the whole
+// VM set — so a still-bound device is NEVER left unowned-but-vfio-bound. The two callers
+// treat the error differently: the pre-latch stop leaves the stop recoverable; VM delete
+// logs loudly and completes anyway, leaving the device owned-by-the-(being-deleted)-VM +
+// bound (a benign, cleanable stale owner row) rather than an unowned + bound orphan.
+func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	if err != nil {
-		slog.Warn("failed to list devices for release", "vm", vmName, "error", err)
-		return
+		return fmt.Errorf("list devices for release: %w", err)
 	}
 
+	var failures []error
 	for _, d := range devices {
-		if d.VMName == vmName {
-			if err := vfio.Unbind(d.Address, d.Driver); err != nil {
-				slog.Warn("VFIO unbind failed", "address", d.Address, "error", err)
-			} else {
-				slog.Info("device unbound from vfio-pci", "address", d.Address, "restored_driver", d.Driver)
-			}
+		if d.VMName != vmName {
+			continue
 		}
+		bound, berr := vfio.IsBoundToVFIO(d.Address)
+		if berr != nil {
+			// Cannot prove the binding state → fail closed (treat as an unbind failure) so
+			// ownership is never released for a device we cannot confirm is unbound.
+			failures = append(failures, fmt.Errorf("check vfio binding for %s: %w", d.Address, berr))
+			continue
+		}
+		if !bound {
+			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+		}
+		if uerr := vfio.Unbind(d.Address, d.Driver); uerr != nil {
+			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", d.Address, uerr))
+		} else {
+			slog.Info("device unbound from vfio-pci", "address", d.Address, "restored_driver", d.Driver)
+		}
+	}
+
+	if len(failures) > 0 {
+		// Release NOTHING: every device stays owned by vmName and the still-bound ones stay
+		// bound. This is the invariant that prevents an unowned-but-vfio-bound orphan.
+		return fmt.Errorf("pci release: %d device(s) for %q could not be unbound: %w",
+			len(failures), vmName, errors.Join(failures...))
 	}
 
 	if err := corrosion.ReleasePCIDevicesByVM(ctx, s.db, vmName); err != nil {
-		slog.Warn("failed to release PCI devices in DB", "vm", vmName, "error", err)
+		return fmt.Errorf("release PCI devices for %q: %w", vmName, err)
 	}
+	return nil
 }
 
-// releaseDeviceLeases rolls back EXACTLY the devices an allocation claimed (unbind
-// from vfio-pci + owner-scoped DB release), leaving the VM's pre-existing
-// passthrough devices untouched. This is the rollback primitive for a FAILED
-// allocation/attach — using the whole-VM releaseDevices there would over-release
-// every device the VM already owned.
-func (s *Server) releaseDeviceLeases(ctx context.Context, vmName string, addrs []string) {
-	drivers := map[string]string{}
-	if devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); err == nil {
-		for _, d := range devices {
-			drivers[d.Address] = d.Driver
-		}
-	}
-	for _, addr := range addrs {
-		if err := vfio.Unbind(addr, drivers[addr]); err != nil {
-			slog.Warn("VFIO unbind failed", "address", addr, "error", err)
-		}
-		// Owner-scoped: a no-op if another VM has since claimed this address.
-		if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
-			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
-		}
-	}
-}
-
-// unbindAndReleaseOwnership is the ALL-OR-NOTHING, crash-safe release primitive for a
-// STOPPED PCI detach — used identically by the live detach (executePCIDetach's stopped
-// branch) and its crash recovery (recoverPCIDetach's stopped branch). Unlike the
-// fire-and-forget releaseDeviceLeases, it discriminates bound-ness by the ACTUAL vfio
-// driver state (vfio.IsBoundToVFIO), the ground truth — NOT by realization presence,
+// unbindAndReleaseOwnership is the ALL-OR-NOTHING, crash-safe release primitive — the
+// SOLE PCI release primitive, used by every op/recovery release site (the attach/start
+// rollbacks, lease recovery, and both the live detach and its crash recovery). It
+// discriminates bound-ness by the ACTUAL vfio driver state (vfio.IsBoundToVFIO), the
+// ground truth — NOT by realization presence,
 // which lies after a FIX-9c failed-start rollback that tombstones realizations while
 // retaining the binding.
 //

@@ -76,9 +76,16 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 			continue
 		}
 		if vm == nil {
-			// Orphaned: the VM was never finalized — roll back the leaked devices.
+			// Orphaned: the VM was never finalized — roll back the leaked devices with the
+			// strict all-or-nothing primitive. If a member cannot be confirmed unbound it
+			// releases NOTHING and returns an error: RETAIN the journal entry so the next
+			// recovery pass retries, rather than removing it over a device still bound to
+			// vfio-pci (which would silently orphan it unowned-but-bound with no backstop).
 			slog.Warn("device-lease recovery: rolling back orphaned lease", "vm", e.ResourceID, "devices", addrs)
-			s.releaseDeviceLeases(ctx, e.ResourceID, addrs)
+			if rerr := s.unbindAndReleaseOwnership(ctx, e.ResourceID, addrs); rerr != nil {
+				slog.Error("device-lease recovery: release incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
+				continue // do NOT remove the entry; a later pass retries
+			}
 		} else {
 			slog.Info("device-lease recovery: allocation completed, clearing lease", "vm", e.ResourceID)
 		}

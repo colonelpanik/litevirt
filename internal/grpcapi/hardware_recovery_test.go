@@ -1209,7 +1209,7 @@ func TestRecoverHardwareOperations_PCIAttachClaimedWindowReleasesLease(t *testin
 // host_pci_devices owner is cleared) and must NOT invoke vfio.Unbind: Unbind on a
 // never-bound device is not a clean no-op (it clears driver_override and attempts a
 // driver-restore). RED before FIX-13 — the owned-addresses fallback set
-// leaseHeld=true → releaseDeviceLeases → vfio.Unbind fired on the reserved device.
+// leaseHeld=true → the unbind+release path → vfio.Unbind fired on the reserved device.
 func TestRecoverPCIAttach_OwnershipReserved_ReleasesOwnershipNoUnbind(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
@@ -1265,8 +1265,8 @@ func TestRecoverPCIAttach_OwnershipReserved_ReleasesOwnershipNoUnbind(t *testing
 // claimed-window case journaled device_mode="vfio_bound" (a RUNNING attach that
 // acquired the lease + vfio-bound the device but crashed before its realization row,
 // then a host reboot shut the domain off). Recovery must still UNBIND + release
-// (releaseDeviceLeases) — the mode gate must not divert a genuinely-bound device onto
-// the owner-only path and strand a vfio-bound orphan.
+// (unbindAndReleaseOwnership) — the mode gate must not divert a genuinely-bound device
+// onto the owner-only path and strand a vfio-bound orphan.
 func TestRecoverPCIAttach_VfioBound_UnbindsAndReleases(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
@@ -1280,10 +1280,13 @@ func TestRecoverPCIAttach_VfioBound_UnbindsAndReleases(t *testing.T) {
 
 	const addr = "0000:41:00.0"
 	const deviceID = "pcidev-bound"
-	// Lease acquired (device owner-assigned) but crash before any realization row.
+	// Lease acquired (device owner-assigned + vfio-BOUND) but crash before any realization
+	// row. The strict release discriminates by vfio ground truth, so the device must
+	// actually be bound (device_mode=vfio_bound reflects reality).
 	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
 		t.Fatalf("assign device: %v", err)
 	}
+	fs.setBound(addr)
 	fake.SetState("vm1", libvirtfake.StateShutdown) // host reboot: domain shut off, vm.State still "running"
 
 	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceAttach,
@@ -1568,8 +1571,8 @@ func TestRecoverPCIDetach_StoppedTombstoneFailsAfterRelease_LeavesRecoverable(t 
 // host binding while a live hostdev may still reference it. Recovery must leave the op
 // recovery-required — ownership retained, device still bound, intent + realizations NOT
 // tombstoned, barrier retained, op NOT completed. RED before the fix (the `if e == nil`
-// guard silently skipped the detach loop on a DumpXML error and released via
-// releaseDeviceLeases anyway).
+// guard silently skipped the detach loop on a DumpXML error and released via the old
+// fire-and-forget primitive anyway).
 func TestRecoverPCIDetach_RunningDumpXMLFails_LeavesRecoverable(t *testing.T) {
 	const addr = "0000:41:00.0"
 	s := hotplugDiskServer(t)

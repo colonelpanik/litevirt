@@ -289,8 +289,8 @@ func (s *Server) attachPCIOwner(ctx context.Context, req *pb.AttachDeviceRequest
 
 // pciAttachRollback carries the state needed to compensate a failed concrete-address
 // attach. Directional compensation rolls BACK (§8): inverse live-detach attached
-// members → releaseDeviceLeases (unbind + owner-release) → tombstone realization +
-// intent rows → restore the prior definition + (pre-latch) the prior spec.
+// members → unbindAndReleaseOwnership (strict unbind + owner-release) → tombstone
+// realization + intent rows → restore the prior definition + (pre-latch) the prior spec.
 type pciAttachRollback struct {
 	vm                  *corrosion.VMRecord
 	opID                string
@@ -487,12 +487,13 @@ func (s *Server) writePCIRealizations(ctx context.Context, vmName, deviceID stri
 }
 
 // failPCIAttach compensates a failed attach by rolling BACK (§8): inverse
-// live-detach the members this execution attached, releaseDeviceLeases (unbind
-// vfio + owner-release the devices this attach claimed, and clear the durable
-// lease), tombstone the realization + intent rows THIS execution wrote, restore the
-// prior inactive definition on the stopped path, and — pre-latch — restore the
-// prior spec. If the rollback fully completes it records a terminal failure +
-// clears the barrier; otherwise the operation is left NON-TERMINAL for recovery.
+// live-detach the members this execution attached, unbindAndReleaseOwnership (strict
+// unbind vfio + owner-release the devices this attach claimed; on success clear the
+// durable lease, on a release that cannot confirm the unbind leave it recoverable),
+// tombstone the realization + intent rows THIS execution wrote, restore the prior
+// inactive definition on the stopped path, and — pre-latch — restore the prior spec.
+// If the rollback fully completes it records a terminal failure + clears the barrier;
+// otherwise the operation is left NON-TERMINAL for recovery.
 func (s *Server) failPCIAttach(ctx context.Context, rb *pciAttachRollback, code codes.Code, cause error) (*pb.VM, error) {
 	rolledBack := true
 
@@ -507,8 +508,14 @@ func (s *Server) failPCIAttach(ctx context.Context, rb *pciAttachRollback, code 
 		// self-owned reserve-while-off reservation (FIX-9c). A self-owned re-attach that
 		// fails after acquire must retain the reservation rather than drop it to a
 		// concurrent claimant; a genuinely-new device is in acquireClaimed → still released.
-		s.releaseDeviceLeases(ctx, rb.vm.Name, rb.acquireClaimed)
-		if rb.leaseFinish != nil {
+		// Strict (all-or-nothing): if a member cannot be confirmed unbound, release NOTHING
+		// and take the rollback-incomplete path below — leave the op recovery-required (do
+		// NOT clear the lease, do NOT record a clean terminal). The member stays owned +
+		// bound (recoverable), never unowned + bound; a retry re-drives and converges.
+		if err := s.unbindAndReleaseOwnership(ctx, rb.vm.Name, rb.acquireClaimed); err != nil {
+			slog.Error("pci attach rollback: release incomplete — operation left recoverable", "vm", rb.vm.Name, "op", rb.opID, "error", err)
+			rolledBack = false
+		} else if rb.leaseFinish != nil {
 			rb.leaseFinish()
 		}
 	}

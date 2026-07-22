@@ -425,10 +425,10 @@ func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, v
 	//     WITHOUT releasing (the VM row exists), so this op's OWN device_attach entry is
 	//     the sole authority for the addresses to release (no double-release —
 	//     device_lease is a distinct journal Kind). leaseHeld=true → rollback UNBINDS +
-	//     releases via releaseDeviceLeases.
+	//     releases via the strict unbindAndReleaseOwnership primitive.
 	//   - ownership_reserved: a STOPPED reserve that claimed ownership but NEVER bound.
 	//     leaseHeld STAYS false so rollback releases OWNERSHIP ONLY (never
-	//     releaseDeviceLeases/vfio.Unbind); the members below are the owner-only release
+	//     unbindAndReleaseOwnership/vfio.Unbind); the members below are the owner-only release
 	//     set (see the ownershipRelease closure).
 	leaseHeld := realizationsWritten
 	if !realizationsWritten {
@@ -485,7 +485,7 @@ func (s *Server) recoverPCIAttach(ctx context.Context, vm *corrosion.VMRecord, v
 	// FIX-13: a reserved (never-bound) attach releases OWNERSHIP ONLY on rollback —
 	// mirror the stopped-reserve claimDeviceOwnership release closure. failPCIAttach
 	// invokes ownershipRelease (owner-scoped ReleasePCIDevice, NO vfio unbind); with
-	// rb.acquired=false it never routes through releaseDeviceLeases. Set only when the
+	// rb.acquired=false it never routes through unbindAndReleaseOwnership. Set only when the
 	// device was genuinely never bound (reserved mode, no realizations, no live
 	// hostdev), so a bound device still takes the unbind+release path below.
 	if reservedMode && !realizationsWritten && !rb.acquired {
@@ -662,6 +662,15 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 	deviceID := art["device_id"]
 	normAddr := strings.ToLower(art["pci_address"])
 
+	// The RUNNING branch derives its member set ONLY from vm_pci_realizations (no intent
+	// fallback), and that is sufficient BECAUSE of the release-before-tombstone ordering the
+	// live running detach relies on (executePCIDetach: unbindAndReleaseOwnership FIRST, then
+	// retryPCIRowTombstone). The realization rows survive until AFTER the release has
+	// converged, so whenever a running detach still needs a release the realizations are
+	// present to name its members; once they are gone the release already completed and the
+	// forward roll is pure bookkeeping. (The STOPPED branch below CAN observe realizations
+	// tombstoned while a device stays bound — a FIX-9c failed-start retained binding — so it
+	// additionally falls back to the journaled member_addresses / intent.)
 	var memberAddrs, memberAliases []string
 	if reals, e := corrosion.ListVMPCIRealizations(ctx, s.db, vm.Name); e == nil {
 		for _, r := range reals {
@@ -733,6 +742,19 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 					}
 				}
 			}
+		}
+		// Empty-set guard (mirrors executePCIDetach's FIX-16 Fix A on the recovery side): a
+		// live address intent ALWAYS resolves to >=1 member, so an empty set here means a
+		// pre-fix journal entry lacked member_addresses AND the intent re-resolution FAILED
+		// (e.g. a since-regrouped IOMMU sibling now owned by another VM trips
+		// checkIOMMUConflict on the primary) or the device vanished. Proceeding would run a
+		// no-op release then tombstone the intent + realizations while the VM may STILL own
+		// the device(s): a leak that COMPLETES. Leave the op recovery-required instead — a
+		// later pass (once the layout is readable / the conflict clears) resolves the members
+		// and releases. Mixed-version-window symmetry with the live path.
+		if len(addrs) == 0 {
+			slog.Error("hardware op recovery: pci detach could not resolve PCI members to release — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "address", normAddr)
+			return
 		}
 		// ALL-OR-NOTHING: any unbind (or bound-check) failure releases nothing and returns
 		// an error → leave the intent/realizations/barrier in place (recovery-required).

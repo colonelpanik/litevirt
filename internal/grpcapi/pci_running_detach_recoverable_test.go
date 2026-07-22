@@ -129,8 +129,8 @@ func TestDetachPCI_RunningFirstMemberDetachFails_CleanTerminal(t *testing.T) {
 // whose live DetachHostdev succeeds but whose vfio.Unbind then FAILS must leave the op
 // recovery-required — ownership retained, intent + realizations NOT tombstoned, barrier
 // retained — rather than releasing ownership + tombstoning + completing (which the old
-// releaseDeviceLeases did, leaving an unowned-but-vfio-bound orphan). RED before the fix
-// (releaseDeviceLeases logged the unbind failure then released + tombstoned + completed).
+// the old fire-and-forget release did, leaving an unowned-but-vfio-bound orphan). RED before
+// the fix (the old release logged the unbind failure then released + tombstoned + completed).
 func TestDetachPCI_RunningUnbindFails_LeavesRecoverable(t *testing.T) {
 	const addr = "0000:41:00.0"
 	s := hotplugDiskServer(t)

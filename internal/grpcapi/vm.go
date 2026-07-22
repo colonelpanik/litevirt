@@ -1214,7 +1214,14 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	// mixed-version rollout degrades gracefully — an old node, or a new node pre-latch,
 	// stops-and-releases with no corruption).
 	if !s.hardwareV2Latched(ctx) {
-		s.releaseDevices(ctx, vm.Name)
+		// Strict release: if a device cannot be confirmed unbound, releaseDevices releases
+		// NOTHING and errors — leave the stop RECOVERABLE (return before marking the VM
+		// stopped-clean) so a retry re-drives (idempotent: an already-unbound device is
+		// skipped and the release converges). Never complete a stop that left a device
+		// unowned-but-vfio-bound.
+		if err := s.releaseDevices(ctx, vm.Name); err != nil {
+			return nil, status.Errorf(codes.Internal, "stop: releasing PCI device(s) failed; left recoverable: %v", err)
+		}
 	}
 
 	// Mark as "stopped" with detail indicating operator-initiated stop. This
@@ -1408,8 +1415,19 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.virt.DestroyDomain(req.Name)
 	}
 
-	// Release PCI passthrough devices and unbind from vfio-pci.
-	s.releaseDevices(ctx, req.Name)
+	// Release PCI passthrough devices and unbind from vfio-pci. The VM row is being
+	// tombstoned, so there is no future op to leave recoverable — but the release must
+	// still NEVER produce an unowned-but-vfio-bound device (the host driver could not
+	// reclaim it and another VM could then claim its now-ownerless inventory row).
+	// releaseDevices is strict all-or-nothing: on a residual unbind failure it releases
+	// NOTHING and errors, so the device stays OWNED-by-this-(being-deleted)-VM + bound
+	// rather than unowned + bound. CHOSEN SEMANTICS: a stale owner row on a soon-to-vanish
+	// VM is a benign, operator-cleanable leak; an unowned + bound orphan is not — so we
+	// prefer the former. The delete still COMPLETES (we do NOT wedge on the residual) — we
+	// only log loudly so an operator can reset the device's driver_override by hand.
+	if err := s.releaseDevices(ctx, req.Name); err != nil {
+		slog.Error("VM delete: PCI device(s) left bound to vfio-pci; they remain owned by the deleted VM — manual driver_override reset may be needed", "vm", req.Name, "error", err)
+	}
 
 	// Undefine from libvirt. With --keep-disks, KEEP firmware state too (NVRAM is
 	// name-keyed and DomainUndefineNvram would delete it — bricking the retained

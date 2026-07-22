@@ -28,6 +28,7 @@ type pciUnbindRecordingFS struct {
 	override   map[string]bool   // address -> driver_override currently selects vfio-pci
 	unbinds    map[string]int    // address -> count of vfio.Unbind invocations
 	failUnbind map[string]bool   // address -> the .../driver/unbind write fails (models a stuck unbind)
+	failBind   map[string]bool   // address -> the vfio-pci bind never takes (models a device that won't bind)
 	binds      int               // count of vfio-pci bind writes
 	onUnbind   func(addr string) // fired once per unbind (at the driver_override clear), if set
 }
@@ -38,6 +39,7 @@ func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
 		override:   map[string]bool{},
 		unbinds:    map[string]int{},
 		failUnbind: map[string]bool{},
+		failBind:   map[string]bool{},
 	}
 }
 
@@ -56,6 +58,15 @@ func (f *pciUnbindRecordingFS) setFailUnbind(addr string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failUnbind[addr] = true
+}
+
+// setFailBind makes the vfio-pci bind for addr never take (the bind + drivers_probe
+// writes are no-ops), so vfio.Bind's own driver-symlink verify fails and Bind returns
+// an error while the device is left NOT bound (models a device that refuses to bind).
+func (f *pciUnbindRecordingFS) setFailBind(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failBind[addr] = true
 }
 
 func (f *pciUnbindRecordingFS) devAddr(path, suffix string) string {
@@ -104,9 +115,17 @@ func (f *pciUnbindRecordingFS) WriteFile(path string, data []byte, _ os.FileMode
 		// Unbind from the current (vfio-pci) driver: the device is now driverless.
 		f.bound[val] = false
 	case strings.Contains(path, "vfio-pci/bind"):
+		if f.failBind[val] {
+			// The bind never takes → the device stays unbound and vfio.Bind's verify fails.
+			break
+		}
 		f.bound[val] = true
 		f.binds++
 	case strings.Contains(path, "drivers_probe"):
+		if f.failBind[val] {
+			f.bound[val] = false
+			break
+		}
 		// The kernel reprobes: to vfio-pci only if the override still selects it,
 		// otherwise to the original driver (leaving it unbound from vfio-pci).
 		if f.override[val] {
@@ -154,8 +173,8 @@ func (f *pciUnbindRecordingFS) unbindCount(addr string) int {
 // attach → start → stop → detach lifecycle. FIX-9b makes a latched stop RETAIN the
 // vfio binding + ownership + realizations, so at detach time the stopped VM's device
 // is still bound to vfio-pci. The stopped-detach branch must therefore UNBIND it
-// (vfio Unbind + owner-release via releaseDeviceLeases) before releasing ownership —
-// discriminated by the presence of realization rows. RED before the fix (the branch
+// (vfio Unbind + owner-release via unbindAndReleaseOwnership) before releasing ownership —
+// discriminated by the ACTUAL vfio driver state. RED before the fix (the branch
 // owner-released WITHOUT unbinding, leaving an unowned but still-vfio-bound orphan).
 func TestDetachPCI_StoppedAfterStart_UnbindsAndReleases(t *testing.T) {
 	const addr = "0000:41:00.0"
@@ -297,8 +316,8 @@ func TestDetachPCI_StoppedFailedStartBoundNoRealizations_Unbinds(t *testing.T) {
 // detach whose vfio.Unbind FAILS must leave EVERYTHING recoverable — ownership
 // retained, intent + realizations NOT tombstoned, the operation barrier still set,
 // and an error returned — rather than clearing ownership anyway (which would leave an
-// unowned-but-vfio-bound orphan). RED before the fix (releaseDeviceLeases logged the
-// unbind failure then released ownership + tombstoned + completed).
+// unowned-but-vfio-bound orphan). RED before the fix (the old fire-and-forget release
+// logged the unbind failure then released ownership + tombstoned + completed).
 func TestDetachPCI_StoppedUnbindFails_LeavesRecoverable(t *testing.T) {
 	const addr = "0000:41:00.0"
 	s := hotplugDiskServer(t)

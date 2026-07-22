@@ -189,9 +189,14 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 
 	for _, addr := range addrs {
 		if err := s.virt.AttachHostdev(vmName, addr); err != nil {
-			// Roll back only the devices THIS attach claimed (not the VM's
-			// pre-existing passthrough devices).
-			s.releaseDeviceLeases(ctx, vmName, addrs)
+			// Roll back only the devices THIS attach claimed (not the VM's pre-existing
+			// passthrough devices) via the strict all-or-nothing primitive. If a member
+			// cannot be confirmed unbound it releases NOTHING and returns an error — leave
+			// it owned + bound (recoverable via retry/detach), never unowned + bound, and
+			// log loudly rather than silently dropping it.
+			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, addrs); rerr != nil {
+				slog.Error("legacy pci attach rollback: release incomplete — device(s) left owned+bound (recoverable)", "vm", vmName, "error", rerr)
+			}
 			return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
 		}
 		slog.Info("PCI device attached", "vm", vmName, "address", addr)

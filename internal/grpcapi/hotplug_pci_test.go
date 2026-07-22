@@ -555,7 +555,9 @@ func TestAttachDevice_PCISameKeyConcurrentAtMostOnce(t *testing.T) {
 func TestAttachDevice_PCIMutationErrorRollsBack(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	fs := newPCIBindFakeFS()
+	// Use the unbind-modeling fake: the strict release rollback vfio-unbinds the bound
+	// member (ground truth) before releasing ownership, so the fake must model a clean unbind.
+	fs := newPCIUnbindRecordingFS()
 	restore := vfio.SetFS(fs)
 	defer restore()
 	ctx := adminCtx()
@@ -577,7 +579,7 @@ func TestAttachDevice_PCIMutationErrorRollsBack(t *testing.T) {
 	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) != 0 {
 		t.Fatalf("realizations must not survive a failed attach: %+v", rs)
 	}
-	// Device ownership released by rollback (releaseDeviceLeases).
+	// Device ownership released by rollback (unbindAndReleaseOwnership).
 	devs, _ := corrosion.ListPCIDevices(ctx, s.db, "test-host", "")
 	for _, d := range devs {
 		if d.VMName == "vm1" {
@@ -599,7 +601,8 @@ func TestAttachDevice_PCIMutationErrorRollsBack(t *testing.T) {
 func TestAttachDevice_PCIRealizationWriteErrorRollsBack(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	restore := vfio.SetFS(newPCIBindFakeFS())
+	// Unbind-modeling fake: the strict rollback vfio-unbinds the bound member before release.
+	restore := vfio.SetFS(newPCIUnbindRecordingFS())
 	defer restore()
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")
@@ -635,7 +638,8 @@ func TestAttachDevice_PCIRealizationWriteErrorRollsBack(t *testing.T) {
 func TestAttachDevice_PCIRunningConfigDivergenceRollsBack(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	restore := vfio.SetFS(newPCIBindFakeFS())
+	// Unbind-modeling fake: the strict rollback vfio-unbinds the bound member before release.
+	restore := vfio.SetFS(newPCIUnbindRecordingFS())
 	defer restore()
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")

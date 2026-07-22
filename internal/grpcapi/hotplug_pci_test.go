@@ -805,9 +805,13 @@ func TestDetachDevice_PCINoIntentFallsToLegacy(t *testing.T) {
 	defer restore()
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")
+	// A running VM always has a live domain; seed one so the membership-aware legacy detach
+	// can read it (the address is absent from it → the guest detach is skipped, idempotent).
+	s.virt.(*libvirtfake.Fake).SetActiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices></devices></domain>")
 
-	// No vm_pci_intent for this address → legacy detachPCIDevice path. The libvirtfake
-	// DetachHostdev succeeds, so this proves the routing reached the legacy path
+	// No vm_pci_intent for this address → legacy detachPCIDevice path. The address is not a
+	// live hostdev, so the membership-aware detach skips the (idempotent) guest detach and
+	// the owner-scoped release is a no-op — proving the routing reached the legacy path
 	// (which does not consult vm_pci_intent) rather than the journaled NotFound.
 	if _, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{
 		VmName: "vm1", PciAddress: "0000:99:00.0",

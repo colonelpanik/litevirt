@@ -358,7 +358,13 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 
 	// Hot-detach SR-IOV VFs before migration.
 	for _, vf := range detachedVFs {
-		if err := s.virt.DetachHostdev(req.VmName, vf.Address); err != nil {
+		// Membership-aware (idempotent) guest detach so a retried migration converges: if a
+		// prior attempt already live-detached the VF but its release failed, the VF is gone
+		// from the guest and a bare DetachHostdev would error ("device not found") and abort
+		// before re-attempting the release. detachHostdevIfPresent skips the already-gone
+		// detach so control falls through to the idempotent release. A DumpXML error still
+		// aborts the migration (fail closed — membership cannot be confirmed).
+		if err := s.detachHostdevIfPresent(req.VmName, vf.Address); err != nil {
 			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
 		}
 		// DetachHostdev removed the guest device but the host vfio bind persists, so the

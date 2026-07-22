@@ -102,6 +102,11 @@ func TestMigrateVM_VFUnbindFails_NotUnownedBound(t *testing.T) {
 	fs.setVF(vfAddr)
 	fs.setBound(vfAddr)
 	fs.setFailUnbind(vfAddr)
+	// Place the VF hostdev in the guest so the membership-aware pre-migration detach can
+	// confirm it is present (and detach it) before the release fails.
+	if err := fake.AttachHostdev("pci-vm", vfAddr); err != nil {
+		t.Fatalf("seed VF hostdev in guest: %v", err)
+	}
 
 	stream := &mockMigrateStream{ctx: ctx}
 	err := s.MigrateVM(&pb.MigrateVMRequest{

@@ -6,13 +6,50 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/pci"
 )
+
+// detachHostdevIfPresent detaches the PCI hostdev at addr from vmName's LIVE domain
+// only if it is still a member of it, making a guest-detach idempotent so a retry
+// converges. It FAILS CLOSED on a DumpXML error (membership cannot be confirmed → do
+// NOT assume the device is already gone). When addr is absent from the live domain's
+// hostdev source addresses it returns nil (nothing to do); otherwise it delegates to
+// DetachHostdev.
+//
+// This removes the non-convergence cause on the un-journaled legacy/migration detach
+// paths: DetachHostdev (DomainDetachDeviceFlags) errors on an already-absent device, so a
+// bare retry after a failed release would error on the (already-detached) device and
+// return before it could re-attempt the release. Mirrors what recoverPCIDetach does with
+// hostdevAliasInXML on the journaled path — but keys on the source BDF, since legacy
+// hostdevs carry no user alias.
+func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
+	live, err := s.virt.DumpXML(vmName)
+	if err != nil {
+		return err
+	}
+	want, ok := pci.CanonicalBDF(addr)
+	if !ok {
+		want = strings.ToLower(strings.TrimSpace(addr))
+	}
+	for _, raw := range libvirt.HostdevSourcePCIAddresses(live) {
+		got, gok := pci.CanonicalBDF(raw)
+		if !gok {
+			got = strings.ToLower(strings.TrimSpace(raw))
+		}
+		if got == want {
+			return s.virt.DetachHostdev(vmName, addr)
+		}
+	}
+	return nil // already detached — nothing to do
+}
 
 // AttachDevice hot-attaches a disk, NIC, or PCI device to a running VM.
 func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) (*pb.VM, error) {
@@ -182,39 +219,60 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 	if err != nil {
 		return nil, err
 	}
-	// Clear the durable device lease once the attach completes (or on the
-	// rollback below); a crash before this runs is recovered at startup.
-	defer finish()
 
+	// Track the members whose live hostdev attach SUCCEEDED so a rollback can inverse-
+	// detach them from the guest BEFORE releasing (never vfio-unbind/release a device
+	// that is still attached to the live domain). NOTE: finish() (clearing the durable
+	// device lease) is called explicitly — on the success path and only when a rollback
+	// FULLY completes — never via a blanket defer, so an incomplete rollback retains the
+	// lease for RecoverDeviceLeases.
+	var attachedAddrs []string
 	for _, addr := range addrs {
 		if err := s.virt.AttachHostdev(vmName, addr); err != nil {
 			// Roll back only the devices THIS attach claimed (not the VM's pre-existing
-			// passthrough devices) via the strict all-or-nothing primitive. If a member
-			// cannot be confirmed unbound it releases NOTHING and returns an error — leave
-			// it owned + bound (recoverable via retry/detach), never unowned + bound, and
-			// log loudly rather than silently dropping it.
-			//
-			// NOTE (accepted): unlike the journaled paths, the `defer finish()` above still
-			// clears this device lease even when the rollback release is incomplete, so
-			// there is NO RecoverDeviceLeases backstop for a left-owned+bound device here
-			// (weaker than the journaled attach, which retains the lease for startup
-			// recovery). The invariant still holds — the device is owned + bound, never
-			// unowned + bound — and it converges on the operator's retry/detach; the lost
-			// backstop is accepted for this best-effort, un-journaled legacy attach path.
-			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, addrs); rerr != nil {
-				slog.Error("legacy pci attach rollback: release incomplete — device(s) left owned+bound (recoverable)", "vm", vmName, "error", rerr)
+			// passthrough devices), in the correct order:
+			//   1. inverse-detach every already-attached member from the guest (membership-
+			//      aware + idempotent). If an inverse-detach cannot be confirmed (DumpXML
+			//      error or a failed DetachHostdev), leave the op recoverable: return WITHOUT
+			//      releasing — a member still in the guest must never be unbound/released —
+			//      and RETAIN the durable lease so RecoverDeviceLeases (strict) back-stops it.
+			for _, a := range attachedAddrs {
+				if derr := s.detachHostdevIfPresent(vmName, a); derr != nil {
+					slog.Error("legacy pci attach rollback: inverse-detach failed — device(s) left owned+bound (recoverable), lease retained",
+						"vm", vmName, "address", a, "error", derr)
+					return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v (rollback inverse-detach of %s failed: %v)", addr, err, a, derr)
+				}
 			}
+			//   2. release via the strict all-or-nothing primitive. If a member cannot be
+			//      confirmed unbound it releases NOTHING and errors — leave it owned + bound
+			//      (recoverable via retry/detach), never unowned + bound — and RETAIN the
+			//      durable lease so RecoverDeviceLeases back-stops the left-owned+bound device.
+			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, addrs); rerr != nil {
+				slog.Error("legacy pci attach rollback: release incomplete — device(s) left owned+bound (recoverable), lease retained", "vm", vmName, "error", rerr)
+				return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
+			}
+			// Rollback FULLY completed (inverse-detach + strict release both clean): nothing is
+			// left owned+bound, so clear the durable device lease.
+			finish()
 			return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
 		}
+		attachedAddrs = append(attachedAddrs, addr)
 		slog.Info("PCI device attached", "vm", vmName, "address", addr)
 	}
 
+	// Success: the VM's devices are attached + owned → clear the crash-recovery lease.
+	finish()
 	s.publish("device.attached", vmName, fmt.Sprintf("pci:%v", addrs))
 	return s.vmToProto(ctx, vmName)
 }
 
 func (s *Server) detachPCIDevice(ctx context.Context, vmName, pciAddress string) (*pb.VM, error) {
-	if err := s.virt.DetachHostdev(vmName, pciAddress); err != nil {
+	// Membership-aware (idempotent) guest detach so a retry converges: if a prior attempt
+	// already live-detached the device but its release failed, the device is gone from the
+	// guest and a bare DetachHostdev would error ("device not found") and return before
+	// re-attempting the release. detachHostdevIfPresent skips the already-gone detach (and
+	// fails closed on a DumpXML error) so control falls through to the idempotent release.
+	if err := s.detachHostdevIfPresent(vmName, pciAddress); err != nil {
 		return nil, status.Errorf(codes.Internal, "detach PCI device %s: %v", pciAddress, err)
 	}
 

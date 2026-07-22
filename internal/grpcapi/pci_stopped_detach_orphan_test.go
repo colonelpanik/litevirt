@@ -62,6 +62,14 @@ func (f *pciUnbindRecordingFS) setFailUnbind(addr string) {
 	f.failUnbind[addr] = true
 }
 
+// clearFailUnbind clears a previously-injected unbind fault so a retry can converge
+// (models an operator clearing the transient condition that blocked the release).
+func (f *pciUnbindRecordingFS) clearFailUnbind(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.failUnbind, addr)
+}
+
 // setVF marks addr as an SR-IOV Virtual Function so vfio.IsVF (which probes for a
 // physfn symlink) reports true for it — used to drive the pre-migration VF-detach path.
 func (f *pciUnbindRecordingFS) setVF(addr string) {

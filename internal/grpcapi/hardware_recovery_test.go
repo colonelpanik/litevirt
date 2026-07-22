@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1320,7 +1321,10 @@ func TestRecoverPCIAttach_VfioBound_UnbindsAndReleases(t *testing.T) {
 func TestRecoverHardwareOperations_PCIDetachRollsForward(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	restore := vfio.SetFS(newPCIBindFakeFS())
+	// Running detach recovery now releases via the strict unbindAndReleaseOwnership
+	// primitive (FIX-16), which vfio-unbinds each still-bound member — use the fake that
+	// models unbind so the release converges.
+	restore := vfio.SetFS(newPCIUnbindRecordingFS())
 	defer restore()
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")
@@ -1554,6 +1558,77 @@ func TestRecoverPCIDetach_StoppedTombstoneFailsAfterRelease_LeavesRecoverable(t 
 	}
 	if state == corrosion.OpStepCompleted {
 		t.Fatal("recovery must NOT complete a detach whose post-release tombstone failed")
+	}
+}
+
+// TestRecoverPCIDetach_RunningDumpXMLFails_LeavesRecoverable is FIX-16 Fix C (recovery):
+// a RUNNING PCI detach recovery whose live-membership read (DumpXML) ERRORS must FAIL
+// CLOSED — it must NOT skip the detach loop and release anyway. Releasing (unbind +
+// owner-release) without confirming the live hostdev has left the domain would strip the
+// host binding while a live hostdev may still reference it. Recovery must leave the op
+// recovery-required — ownership retained, device still bound, intent + realizations NOT
+// tombstoned, barrier retained, op NOT completed. RED before the fix (the `if e == nil`
+// guard silently skipped the detach loop on a DumpXML error and released via
+// releaseDeviceLeases anyway).
+func TestRecoverPCIDetach_RunningDumpXMLFails_LeavesRecoverable(t *testing.T) {
+	const addr = "0000:41:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	seedPCIGPU(t, s, addr, -1)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	// Attach (running) so the device is vfio-bound + owner-assigned + realized.
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: addr},
+	}); err != nil {
+		t.Fatalf("seed attach: %v", err)
+	}
+	deviceID := liveIntents(t, ctx, s, "vm1")[0].DeviceID
+	if !fs.isBound(addr) {
+		t.Fatal("precondition: running attach must vfio-bind the device")
+	}
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceDetach,
+		detachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr})
+
+	// The live-domain read fails during recovery → recovery must fail closed.
+	fake.FailDumpXML = func(string) error { return fmt.Errorf("injected DumpXML failure") }
+
+	s.RecoverHardwareOperations(ctx)
+
+	// FAIL CLOSED: nothing released, nothing unbound, nothing tombstoned, op NOT completed.
+	if o := pciOwnerOf(t, ctx, s, addr); o != "vm1" {
+		t.Fatalf("a DumpXML read failure must NOT release ownership, got owner %q, want vm1", o)
+	}
+	if n := fs.unbindCount(addr); n != 0 {
+		t.Fatalf("a DumpXML read failure must NOT vfio-unbind, got %d unbinds", n)
+	}
+	if !fs.isBound(addr) {
+		t.Fatal("a DumpXML read failure must leave the device still bound")
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("a DumpXML read failure must NOT tombstone the intent, got %d", len(in))
+	}
+	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) != 1 {
+		t.Fatalf("a DumpXML read failure must NOT tombstone realizations, got %d", len(rs))
+	}
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID == "" {
+		t.Fatal("a DumpXML read failure must leave the operation barrier set (recovery-required)")
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceDetach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state == corrosion.OpStepCompleted {
+		t.Fatal("recovery must NOT complete a detach whose live-membership read failed")
 	}
 }
 

@@ -105,6 +105,11 @@ type Fake struct {
 	FailShutdownDomain  func(name string) error
 	FailUndefineDomain  func(name string, removeStorage bool) error
 	FailUndefinePreserv func(name string) error
+	// FailDumpXML injects a live-domain read failure so a scenario can exercise a
+	// fail-closed path that must NOT proceed when the live membership is unreadable
+	// (e.g. PCI detach recovery refusing to release without confirming the hostdev
+	// left the live domain).
+	FailDumpXML func(name string) error
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -368,6 +373,11 @@ func (f *Fake) ListDomains() ([]string, error) {
 // diverges them). Disk hotplug's live view is tracked separately (diskSources) and
 // never touches activeXML, so this default is unaffected by disk attach/detach.
 func (f *Fake) DumpXML(name string) (string, error) {
+	if f.FailDumpXML != nil {
+		if err := f.FailDumpXML(name); err != nil {
+			return "", err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if x, ok := f.activeXML[name]; ok {

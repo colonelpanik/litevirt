@@ -754,7 +754,7 @@ func (s *Server) liveAddressIntent(ctx context.Context, vmName, normAddr string)
 }
 
 // executePCIDetach realizes the detach DAG under the lock: journal the plan →
-// RUNNING: live-detach every realized member + releaseDeviceLeases + tombstone
+// RUNNING: live-detach every realized member + unbindAndReleaseOwnership + tombstone
 // realizations & intent; STOPPED: tombstone realizations & intent then reconcile →
 // verify absence → CompleteVMOperation. Compensation rolls FORWARD (§8): once the
 // live detach has run the bookkeeping is retried to completion; if it cannot
@@ -782,6 +782,7 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 		memberAddrs = append(memberAddrs, r.ResolvedAddress)
 		memberAliases = append(memberAliases, r.XMLAlias)
 	}
+	resolveFailed := false
 	if len(memberAddrs) == 0 {
 		// No realizations → resolve the member set from the intent address. Best-effort: a
 		// vanished sibling can't wedge the detach (VM delete's releaseDevices clears any
@@ -802,8 +803,24 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 				memberAliases = append(memberAliases, pciMemberAlias(deviceID, m.MemberID))
 			}
 		} else {
+			resolveFailed = true
 			slog.Warn("pci detach: resolve members from intent", "vm", vm.Name, "address", normAddr, "error", mrerr)
 		}
+	}
+
+	// FIX-16 (Fix A): a live address intent ALWAYS resolves to >=1 member, so an empty set
+	// means the resolution genuinely FAILED (e.g. a since-regrouped IOMMU sibling now owned
+	// by another VM trips checkIOMMUConflict on the primary) or the device vanished — never
+	// a legitimately-empty detach. Proceeding would journal + run a no-op release and then
+	// tombstone the intent while the VM may STILL own the device(s): a leak that COMPLETES.
+	// Leave the op RECOVERABLE instead — this runs past BeginVMOperation, so the barrier is
+	// held; return a recoverable codes.Internal without journaling, releasing, or
+	// tombstoning. The guard sits BEFORE the running/stopped split so it protects both.
+	if resolveFailed || len(memberAddrs) == 0 {
+		slog.Error("pci detach: could not resolve PCI members to detach — left recoverable",
+			"vm", vm.Name, "op", opID, "address", normAddr)
+		return nil, status.Errorf(codes.Internal,
+			"pci detach for %q could not resolve PCI members to detach; left recoverable", vm.Name)
 	}
 
 	priorActive, _ := s.virt.DumpXML(vm.Name)
@@ -832,15 +849,40 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 	}
 
 	if running {
+		// FIX-16 (Fix B): failPCIDetachClean is TERMINAL and its contract is "nothing
+		// applied". That holds ONLY until the first member's hostdev leaves the live domain.
+		// Track whether ANY member has detached: the very first member failing (nothing
+		// applied) still terminalizes cleanly; a failure AFTER any member detached must roll
+		// FORWARD (retain the barrier) so recovery re-detaches only the still-present members
+		// (idempotent — recoverPCIDetach guards each DetachHostdev with hostdevAliasInXML) —
+		// never terminalize + clear the barrier over a half-applied live domain.
+		detachedAny := false
 		for _, addr := range memberAddrs {
 			if err := s.virt.DetachHostdev(vm.Name, addr); err != nil {
-				// The irreversible step failed and nothing has committed → clean terminal fail.
-				return s.failPCIDetachClean(ctx, vm, opID, epoch, newGen, normAddr,
-					codes.Internal, fmt.Errorf("detach PCI hostdev %s: %w", addr, err))
+				if !detachedAny {
+					// Nothing has been applied to the live domain → clean terminal fail.
+					return s.failPCIDetachClean(ctx, vm, opID, epoch, newGen, normAddr,
+						codes.Internal, fmt.Errorf("detach PCI hostdev %s: %w", addr, err))
+				}
+				slog.Error("pci detach: partial live detach — left recoverable", "vm", vm.Name, "op", opID, "address", addr, "error", err)
+				return nil, status.Errorf(codes.Internal,
+					"pci detach for %q partially applied (member %s failed); left recoverable: %v", vm.Name, addr, err)
 			}
+			detachedAny = true
 		}
-		// Release the devices this VM held + retry the row bookkeeping to completion.
-		s.releaseDeviceLeases(ctx, vm.Name, memberAddrs)
+		// FIX-16 (Fix C): release with the STRICT primitive (unbind by vfio ground truth +
+		// owner-release, all-or-nothing recoverable) — the same protocol the stopped path
+		// uses. A RUNNING DetachHostdev removes the device from the guest but NOT the host
+		// vfio bind, so the members are still vfio-bound: unbindAndReleaseOwnership unbinds +
+		// releases them. The live detach already applied, so any unbind/DB-release failure
+		// rolls FORWARD — retain the barrier so retry/recovery re-releases (an already-unbound
+		// member is skipped and converges) — never failPCIDetachClean ("nothing applied" no
+		// longer holds).
+		if err := s.unbindAndReleaseOwnership(ctx, vm.Name, memberAddrs); err != nil {
+			slog.Error("pci detach: unbind/release failed after live detach — left recoverable", "vm", vm.Name, "op", opID, "error", err)
+			return nil, status.Errorf(codes.Internal,
+				"pci detach for %q live-detached but could not release its device(s); left recoverable: %v", vm.Name, err)
+		}
 		if !s.retryPCIRowTombstone(ctx, vm.Name, deviceID) {
 			slog.Error("pci detach: row tombstone failed after live detach — left recoverable", "vm", vm.Name, "op", opID)
 			return nil, status.Errorf(codes.Internal, "pci detach for %q applied but bookkeeping incomplete; left recoverable", vm.Name)

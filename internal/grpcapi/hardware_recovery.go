@@ -674,17 +674,31 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 	}
 
 	if running {
-		if live, e := s.virt.DumpXML(vm.Name); e == nil {
-			for i, addr := range memberAddrs {
-				if hostdevAliasInXML(live, memberAliases[i]) {
-					if e := s.virt.DetachHostdev(vm.Name, addr); e != nil {
-						slog.Error("hardware op recovery: pci detach live-detach failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
-						return
-					}
+		// FIX-16 (Fix C): FAIL CLOSED on a live-membership read error. A DumpXML failure must
+		// NOT silently skip the detach loop and release anyway — releasing (unbind +
+		// owner-release) without confirming the live hostdev has left the domain would strip
+		// the host binding while a live hostdev may still reference the device. Leave the op
+		// recovery-required and retry once the live view is readable.
+		live, e := s.virt.DumpXML(vm.Name)
+		if e != nil {
+			slog.Error("hardware op recovery: pci detach live read failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
+			return
+		}
+		for i, addr := range memberAddrs {
+			if hostdevAliasInXML(live, memberAliases[i]) {
+				if e := s.virt.DetachHostdev(vm.Name, addr); e != nil {
+					slog.Error("hardware op recovery: pci detach live-detach failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
+					return
 				}
 			}
 		}
-		s.releaseDeviceLeases(ctx, vm.Name, memberAddrs)
+		// Strict release (unbind by vfio ground truth + owner-release, all-or-nothing
+		// recoverable) — matches executePCIDetach's running branch. Any failure leaves the op
+		// recovery-required (a later pass re-releases, converging).
+		if err := s.unbindAndReleaseOwnership(ctx, vm.Name, memberAddrs); err != nil {
+			slog.Error("hardware op recovery: pci detach unbind/release failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
+			return
+		}
 		if !s.retryPCIRowTombstone(ctx, vm.Name, deviceID) {
 			slog.Error("hardware op recovery: pci detach row tombstone failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID)
 			return

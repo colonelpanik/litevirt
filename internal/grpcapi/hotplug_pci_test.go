@@ -247,7 +247,10 @@ func TestAttachDevice_RunningPCIAcquiresAndRealizes(t *testing.T) {
 func TestDetachDevice_RunningPCITombstonesAndReleases(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	fs := newPCIBindFakeFS()
+	// The running detach now releases via the strict unbindAndReleaseOwnership primitive
+	// (FIX-16), which vfio-unbinds each still-bound member — use the fake that models
+	// unbind (pciBindFakeFS does not) so the release converges.
+	fs := newPCIUnbindRecordingFS()
 	restore := vfio.SetFS(fs)
 	defer restore()
 	ctx := adminCtx()

@@ -1298,16 +1298,20 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	return out, nil
 }
 
-// checkNoRemotePCIOwner fails closed before a VM-delete tombstone if any host OTHER than
-// this one still holds a live host_pci_devices ownership row for vmName. DeleteVM forwards
-// to the VM's home host before doing local work, so once the local releaseDevices has run
-// (this host's rows cleared to an empty vm_name) the only ownership rows that can remain are
-// on a remote host — a stale migration artifact (a partial/failed migration that left the
-// source-host reservation). Tombstoning the vms row over it would strand that device
-// assigned to a now-deleted VM, blocking every future ClaimPCIDevice CAS on that BDF forever.
-// Fail closed → the delete is RETRYABLE once the remote host's own teardown (or a re-run
-// migration) releases the row. On the read error, also fail closed: never tombstone on an
-// unverifiable ownership state. s.hostName is defensively filtered out (already released).
+// checkNoRemotePCIOwner fails closed before a VM-delete tombstone if any LIVE host OTHER than
+// this one still holds a live host_pci_devices ownership row for vmName. DeleteVM normally
+// forwards to the VM's home host, so once the local releaseDevices has run (this host's rows
+// cleared to an empty vm_name) a surviving ownership row is a stale migration artifact (a
+// partial/failed migration that left a source-host reservation). Tombstoning the vms row over
+// a LIVE host's row would strand that device assigned to a now-deleted VM, blocking every
+// future ClaimPCIDevice CAS on that BDF forever. PCIOwnerHostsForVM already scopes to
+// non-decommissioned hosts, so a removed/dead host's inert row does NOT wedge the delete;
+// s.hostName is also defensively filtered out (already released). NOTE: on the peer-search
+// probe path (the recorded home host lacks the domain and a peer that actually holds it runs
+// the full delete), s.hostName is that peer, so the recorded-home-host row reads as "remote"
+// and correctly fails closed rather than stranding it. Fail closed → the delete is RETRYABLE
+// once the owning host releases the row. On the read error, also fail closed: never tombstone
+// on an unverifiable ownership state.
 func (s *Server) checkNoRemotePCIOwner(ctx context.Context, vmName string) error {
 	hosts, err := corrosion.PCIOwnerHostsForVM(ctx, s.db, vmName)
 	if err != nil {

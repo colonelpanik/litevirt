@@ -170,9 +170,17 @@ func VMDeviceOwnership(ctx context.Context, c *Client, hostName, vmName string) 
 // tombstone to refuse deletion while a remote host still owns the VM's PCI (which
 // would strand that device assigned to a now-deleted VM).
 func PCIOwnerHostsForVM(ctx context.Context, c *Client, vmName string) ([]string, error) {
+	// Only LIVE hosts count. A host_pci_devices row on a DECOMMISSIONED host (hosts.deleted_at
+	// set) — or on a host with no hosts row at all — is inert: no live daemon there enforces it
+	// and no future ClaimPCIDevice CAS runs against it, so it can never be a real ownership
+	// conflict. The inner JOIN drops those rows so a VM-delete guard keyed off this result is
+	// not wedged forever by a dead host's stale reservation (a partial migration whose source
+	// host was later removed).
 	rows, err := c.Query(ctx,
-		`SELECT DISTINCT host_name FROM host_pci_devices
-		 WHERE vm_name = ? AND deleted_at IS NULL ORDER BY host_name`, vmName)
+		`SELECT DISTINCT p.host_name FROM host_pci_devices p
+		 JOIN hosts h ON h.name = p.host_name
+		 WHERE p.vm_name = ? AND p.deleted_at IS NULL AND h.deleted_at IS NULL
+		 ORDER BY p.host_name`, vmName)
 	if err != nil {
 		return nil, err
 	}

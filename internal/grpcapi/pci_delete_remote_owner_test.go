@@ -43,10 +43,52 @@ func remoteOwnerOf(t *testing.T, ctx context.Context, s *Server, hostName, addr 
 // device need not be bound — the point is the surviving ownership row.
 func seedRemotePCIOwner(t *testing.T, ctx context.Context, s *Server, hostName, addr, vmName string) {
 	t.Helper()
+	// A LIVE remote owner: the host must have an active hosts row, because the guard only
+	// blocks on a live (non-decommissioned) host — a stale row on a removed/unknown host is
+	// inert and must NOT wedge the delete.
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: hostName, Address: "10.0.0.9", State: "active",
+	}); err != nil {
+		t.Fatalf("seed remote host %s: %v", hostName, err)
+	}
 	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
 		HostName: hostName, Address: addr, Type: "gpu", VendorID: "10de", VMName: vmName,
 	}); err != nil {
 		t.Fatalf("seed remote PCI owner %s@%s: %v", addr, hostName, err)
+	}
+}
+
+// TestDeleteVM_RemoteOwnerOnDecommissionedHost_Completes (FIX-31): the remote-owner guard
+// must scope to LIVE hosts. A host_pci_devices row for the VM on a DECOMMISSIONED host
+// (hosts.deleted_at set — e.g. the source host of a partial migration that was later removed)
+// is inert: that host's rows are never tombstoned by anyone, so blocking on it would wedge
+// the delete FOREVER with no operator escape (invariant (d)). The delete must COMPLETE.
+// RED before the fix: the guard blocks on any remote row regardless of host state.
+func TestDeleteVM_RemoteOwnerOnDecommissionedHost_Completes(t *testing.T) {
+	const addr = "0000:00:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	s.images = image.NewStore(s.dataDir)
+	s.images.Init()
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+
+	seedNICVM(t, s, "vm-a", "stopped")
+	s.virt.(*libvirtfake.Fake).SetState("vm-a", libvirtfake.StateDefined)
+	seedRemotePCIOwner(t, ctx, s, "other-host", addr, "vm-a")
+	// Decommission the remote host (soft-delete its hosts row).
+	if err := corrosion.DeleteHost(ctx, s.db, "other-host"); err != nil {
+		t.Fatalf("decommission other-host: %v", err)
+	}
+
+	// The delete COMPLETES: a decommissioned host's stale ownership row must not block it.
+	if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "vm-a"}); err != nil {
+		t.Fatalf("delete must complete when the only remote owner is a decommissioned host: %v", err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, s.db, "vm-a"); vm != nil {
+		t.Fatal("the vms row must be tombstoned once no LIVE host owns the VM's PCI")
 	}
 }
 

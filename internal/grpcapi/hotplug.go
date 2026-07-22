@@ -235,28 +235,29 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 			//      aware + idempotent). If an inverse-detach cannot be confirmed (DumpXML
 			//      error or a failed DetachHostdev), leave the op recoverable: return WITHOUT
 			//      releasing — a member still in the guest must never be unbound/released. The
-			//      durable lease is retained (finish() is NOT called), but note this is NOT a
-			//      RecoverDeviceLeases backstop on this legacy path: attachPCIDevice runs only
-			//      for an already-existing RUNNING VM, so the next startup recovery takes the
-			//      vm!=nil branch and CLEARS the lease WITHOUT releasing. The safety invariant
-			//      (a stuck member stays owned + bound, never unowned + bound) holds regardless;
-			//      convergence is via an operator retry/detach, not the recovery pass.
+			//      durable lease is RETAINED as a recovery anchor: it is rewritten to Stage
+			//      rollback_incomplete so the next startup recovery distinguishes it from a
+			//      completed allocation and membership-aware-reclaims the left-owned+bound
+			//      members (guest-detach FIRST, then unbind + owner-release) rather than
+			//      clearing it. The safety invariant (a stuck member stays owned + bound, never
+			//      unowned + bound) holds regardless; an operator retry/detach also converges it.
 			for _, a := range attachedAddrs {
 				if derr := s.detachHostdevIfPresent(vmName, a); derr != nil {
-					slog.Error("legacy pci attach rollback: inverse-detach failed — device(s) left owned+bound (recoverable), lease retained",
+					slog.Error("legacy pci attach rollback: inverse-detach failed — device(s) left owned+bound (recoverable), lease marked rollback_incomplete",
 						"vm", vmName, "address", a, "error", derr)
+					s.markDeviceLeaseRollbackIncomplete(vmName, addrs)
 					return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v (rollback inverse-detach of %s failed: %v)", addr, err, a, derr)
 				}
 			}
 			//   2. release via the strict all-or-nothing primitive. If a member cannot be
 			//      confirmed unbound it releases NOTHING and errors — leave it owned + bound
 			//      (recoverable via retry/detach), never unowned + bound. The durable lease is
-			//      retained (finish() not called) but, as above, does NOT serve as a recovery
-			//      backstop on this legacy path (the VM exists → the vm!=nil branch clears it
-			//      without releasing); the owned+bound invariant + operator retry/detach is what
-			//      converges the left-owned+bound device.
+			//      RETAINED as a recovery anchor (rewritten to Stage rollback_incomplete): the
+			//      next startup recovery reclaims the left-owned+bound members instead of
+			//      clearing the entry, so the leak is never silently lost.
 			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, addrs); rerr != nil {
-				slog.Error("legacy pci attach rollback: release incomplete — device(s) left owned+bound (recoverable), lease retained", "vm", vmName, "error", rerr)
+				slog.Error("legacy pci attach rollback: release incomplete — device(s) left owned+bound (recoverable), lease marked rollback_incomplete", "vm", vmName, "error", rerr)
+				s.markDeviceLeaseRollbackIncomplete(vmName, addrs)
 				return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
 			}
 			// Rollback FULLY completed (inverse-detach + strict release both clean): nothing is

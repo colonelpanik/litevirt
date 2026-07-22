@@ -15,6 +15,13 @@ import (
 // operation-recovery barrier handles).
 const deviceLeaseKind = "device_lease"
 
+// deviceLeaseStageRollbackIncomplete marks a device lease whose owning operation's
+// rollback could not complete, leaving the recorded device(s) still owned + bound.
+// It is the signal that distinguishes such a lease from a completed allocation
+// (Stage "bound"): restart recovery reclaims a rollback_incomplete lease's members
+// instead of clearing it, so the leaked owned+bound devices are never silently lost.
+const deviceLeaseStageRollbackIncomplete = "rollback_incomplete"
+
 func deviceLeaseOpID(vmName string) string { return "devlease:" + vmName }
 
 // clearDeviceLease removes any lingering durable PCI device lease for vmName. Called
@@ -61,12 +68,44 @@ func (s *Server) beginDeviceLease(ctx context.Context, vmName string, addrs []st
 	}
 }
 
+// markDeviceLeaseRollbackIncomplete rewrites vmName's durable device lease to Stage
+// rollback_incomplete when a legacy running-attach rollback could not complete, leaving
+// the recorded device(s) still owned + bound. It overwrites the existing "bound" entry
+// in place (same OperationID), so restart recovery can distinguish this real leak from a
+// completed allocation and reclaim the members instead of silently clearing the entry.
+// A write error is only logged (Warn): the in-memory return still leaves the device(s)
+// owned + bound so the safety invariant holds — only the durable recovery anchor is
+// best-effort. A no-op when the operation journal is absent (pre-latch: no lease exists).
+func (s *Server) markDeviceLeaseRollbackIncomplete(vmName string, addrs []string) {
+	if s.opJournal == nil {
+		return
+	}
+	entry := opjournal.Entry{
+		OperationID: deviceLeaseOpID(vmName),
+		ResourceID:  vmName,
+		Kind:        deviceLeaseKind,
+		Stage:       deviceLeaseStageRollbackIncomplete,
+		Artifacts:   map[string]string{"addresses": strings.Join(addrs, ",")},
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := s.opJournal.Write(entry); err != nil {
+		slog.Warn("device lease: mark rollback_incomplete failed (device left owned+bound; recovery anchor best-effort)",
+			"vm", vmName, "error", err)
+	}
+}
+
 // RecoverDeviceLeases rolls back device leases a crash orphaned. For each durable
-// device_lease journal entry: if the VM no longer exists (its allocation never
-// finalized), the recorded devices are unbound + owner-scoped-released, then the
-// entry is removed; if the VM exists (allocation completed but finish() didn't
-// run before the crash), the entry is just cleared. Runs at daemon startup,
-// before serving. Best-effort — a transient error leaves the entry for next time.
+// device_lease journal entry:
+//   - the VM no longer exists (its allocation never finalized) → the recorded devices
+//     are unbound + owner-scoped-released, then the entry is removed;
+//   - the VM exists and the lease is Stage rollback_incomplete → a legacy-attach
+//     rollback left this attach's members owned + bound, so they are membership-aware-
+//     reclaimed (guest-detach FIRST, then unbind + owner-release), then the entry removed;
+//   - the VM exists with any other stage (a completed allocation whose finish() didn't
+//     run before the crash) → the entry is just cleared, WITHOUT releasing.
+//
+// Runs at daemon startup, before serving. Best-effort — a transient error leaves the
+// entry for next time.
 func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 	if s.opJournal == nil {
 		return
@@ -104,7 +143,21 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 				slog.Error("device-lease recovery: reclaim incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
 				continue // do NOT remove the entry; a later pass retries
 			}
+		} else if e.Stage == deviceLeaseStageRollbackIncomplete {
+			// The VM exists but a legacy-attach rollback left this attach's members owned +
+			// bound (the retained recovery anchor). Reclaim them via the durable-lease-
+			// authorized primitive with vmExists=true: it membership-detaches each still-in-
+			// guest member FIRST, then unbind + owner-scoped-release. Fail closed → RETAIN the
+			// entry on any error (never remove it over a device still bound to vfio-pci); a
+			// later pass retries. A BDF a DIFFERENT live VM has since reclaimed is skipped.
+			slog.Warn("device-lease recovery: reclaiming rollback-incomplete lease", "vm", e.ResourceID, "devices", addrs)
+			if rerr := s.reclaimLeasedDevices(ctx, e.ResourceID, addrs, true); rerr != nil {
+				slog.Error("device-lease recovery: reclaim incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
+				continue // do NOT remove the entry; a later pass retries
+			}
 		} else {
+			// A completed allocation (finish() didn't run before the crash): the ownership +
+			// realization rows are the durable record now — clear the lease WITHOUT releasing.
 			slog.Info("device-lease recovery: allocation completed, clearing lease", "vm", e.ResourceID)
 		}
 		if err := s.opJournal.Remove(e.OperationID); err != nil {

@@ -90,44 +90,18 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 			continue
 		}
 		if vm == nil {
-			// Orphaned: the VM was never finalized — roll back the leaked devices. But
-			// unbindAndReleaseOwnership's UNBIND is ownership-BLIND (it unbinds any addr the
-			// vfio ground truth reports bound; only the DB release is owner-scoped), so we must
-			// FIRST partition the recorded addrs by current ownership. A lingering orphan lease
-			// whose BDF was since legitimately reclaimed + bound by a DIFFERENT live VM must NOT
-			// be unbound here — that would tear down the reclaiming VM's live passthrough. Only
-			// addrs still owned by THIS dead VM (or genuinely unowned) are ours to reclaim.
-			owners := map[string]string{}
-			if devs, lerr := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); lerr == nil {
-				for _, d := range devs {
-					owners[d.Address] = d.VMName
-				}
-			} else {
-				// Cannot prove ownership → fail closed: RETAIN the entry rather than unbind
-				// blind. A later pass retries once the read succeeds.
-				slog.Error("device-lease recovery: ownership read failed — retaining lease for retry", "vm", e.ResourceID, "error", lerr)
-				continue
-			}
-			var releasable []string
-			for _, addr := range addrs {
-				switch owner := owners[addr]; owner {
-				case e.ResourceID, "":
-					releasable = append(releasable, addr) // ours to reclaim (owned by this dead VM or unowned)
-				default:
-					// Reclaimed by another live VM — not ours to touch. Skip (leave it bound).
-					slog.Warn("device-lease recovery: BDF reclaimed by another VM — skipping unbind (not ours)",
-						"orphan_vm", e.ResourceID, "address", addr, "current_owner", owner)
-				}
-			}
-			// Release the owned subset with the strict all-or-nothing primitive. If a member
-			// cannot be confirmed unbound it releases NOTHING and returns an error: RETAIN the
-			// journal entry so the next recovery pass retries, rather than removing it over a
-			// device still bound to vfio-pci (which would silently orphan it unowned-but-bound
-			// with no backstop). An empty releasable set (everything was reclaimed by others) is
-			// a clean no-op → the entry is cleared below.
-			slog.Warn("device-lease recovery: rolling back orphaned lease", "vm", e.ResourceID, "devices", releasable)
-			if rerr := s.unbindAndReleaseOwnership(ctx, e.ResourceID, releasable); rerr != nil {
-				slog.Error("device-lease recovery: release incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
+			// Orphaned: the VM was never finalized — roll back the leaked devices via the
+			// durable-lease-authorized reclaimLeasedDevices primitive (vmExists=false: the VM
+			// row is gone, so there is no live guest to membership-detach from). The lease is
+			// the proof these leaked BDFs were this dead VM's, so the primitive may reclaim an
+			// UNOWNED addr — which the normal unbindAndReleaseOwnership must never do. The
+			// primitive fails closed on the ownership read, SKIPS any BDF a DIFFERENT live VM
+			// has since legitimately reclaimed (never unbinds another VM's passthrough), and is
+			// strict all-or-nothing: on its error RETAIN the entry so a later pass retries,
+			// rather than removing it over a device still bound to vfio-pci.
+			slog.Warn("device-lease recovery: rolling back orphaned lease", "vm", e.ResourceID, "devices", addrs)
+			if rerr := s.reclaimLeasedDevices(ctx, e.ResourceID, addrs, false); rerr != nil {
+				slog.Error("device-lease recovery: reclaim incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
 				continue // do NOT remove the entry; a later pass retries
 			}
 		} else {

@@ -94,55 +94,100 @@ func TestDeleteVM_StaleRecordWithOwnedPCI_ReleasesBeforeTombstone(t *testing.T) 
 	})
 }
 
-// FIX-22 Fix B: RecoverDeviceLeases' orphaned-lease (vm==nil) branch must NOT unbind a BDF that
-// has since been legitimately reclaimed + bound by a DIFFERENT live VM. unbindAndReleaseOwnership's
-// UNBIND is ownership-BLIND (it unbinds any vfio-bound addr; only the DB release is owner-scoped),
-// so a lingering orphan lease whose BDF was reclaimed would tear down the reclaiming VM's live
-// passthrough. The branch must partition first: only release/unbind addrs still owned by the dead
-// VM (or unowned); SKIP any owned by a different non-empty VM.
-func TestRecoverDeviceLeases_OrphanLeaseBDFReclaimed_DoesNotUnbindOtherVM(t *testing.T) {
-	const addr = "0000:41:00.0"
-	ctx := context.Background()
-	s := testServer(t)
-	j, _ := opjournal.Open(t.TempDir())
-	s.SetOpJournal(j)
+// FIX-25 Fix C (adapts FIX-22 Fix B): RecoverDeviceLeases' orphaned-lease (vm==nil) branch now
+// delegates to the durable-lease-authorized reclaimLeasedDevices primitive. It must (a) RECLAIM
+// an unowned+bound leaked BDF — after FIX-25 the normal unbindAndReleaseOwnership SKIPS an
+// unowned addr, so the orphan reclaim of a genuinely leaked unowned device MUST go through the
+// lease-authorized primitive or the leak would never be cleaned up — and (b) NOT unbind a BDF
+// since legitimately reclaimed + bound by a DIFFERENT live VM (the DoesNotUnbindOtherVM property,
+// preserved via the new primitive). In both cases the orphan lease entry is cleared.
+func TestRecoverDeviceLeases_OrphanUnownedLeaked_Reclaims(t *testing.T) {
+	// (a) The orphaned lease's BDF is UNOWNED + bound (a genuine leak by the dead VM). Recovery
+	// must reclaim it: unbind the device and clear the lease. RED before FIX-25 (the branch
+	// routed the unowned addr through unbindAndReleaseOwnership, which now skips it → leaked).
+	t.Run("unowned_leaked_reclaimed", func(t *testing.T) {
+		const addr = "0000:00:00.0"
+		ctx := context.Background()
+		s := testServer(t)
+		j, _ := opjournal.Open(t.TempDir())
+		s.SetOpJournal(j)
 
-	fs := newPCIUnbindRecordingFS()
-	restore := vfio.SetFS(fs)
-	defer restore()
+		fs := newPCIUnbindRecordingFS()
+		restore := vfio.SetFS(fs)
+		defer restore()
 
-	// The BDF was leased by orphan-vm (deleted without clearing its lease — Fix C), then
-	// legitimately reclaimed + bound by live-vm. host_pci_devices now records live-vm as owner,
-	// and the device is bound to vfio-pci for live-vm's passthrough.
-	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: s.hostName, Address: addr, Type: "gpu", VMName: "live-vm",
-	}); err != nil {
-		t.Fatalf("seed reclaimed device: %v", err)
-	}
-	fs.setBound(addr)
+		// Inventory row present but UNOWNED, and the device is still bound to vfio-pci — the
+		// leak a dead allocation left behind.
+		if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+			HostName: s.hostName, Address: addr, Type: "gpu", VMName: "",
+		}); err != nil {
+			t.Fatalf("seed unowned device: %v", err)
+		}
+		fs.setBound(addr)
 
-	// The stale orphan lease still references the BDF.
-	if err := j.Write(opjournal.Entry{OperationID: deviceLeaseOpID("orphan-vm"), ResourceID: "orphan-vm",
-		Kind: deviceLeaseKind, Artifacts: map[string]string{"addresses": addr}}); err != nil {
-		t.Fatalf("write orphan lease: %v", err)
-	}
+		if err := j.Write(opjournal.Entry{OperationID: deviceLeaseOpID("orphan-vm"), ResourceID: "orphan-vm",
+			Kind: deviceLeaseKind, Artifacts: map[string]string{"addresses": addr}}); err != nil {
+			t.Fatalf("write orphan lease: %v", err)
+		}
 
-	s.RecoverDeviceLeases(ctx)
+		s.RecoverDeviceLeases(ctx)
 
-	// The BDF must be untouched — it belongs to live-vm now, whose passthrough must survive.
-	if !fs.isBound(addr) {
-		t.Fatal("recovery must NOT unbind a BDF the orphan lease no longer owns (breaks the reclaiming VM's live device)")
-	}
-	if fs.unbindCount(addr) != 0 {
-		t.Fatalf("recovery must not invoke Unbind on the reclaimed BDF, got %d unbind(s)", fs.unbindCount(addr))
-	}
-	if o := pciOwnerOf(t, ctx, s, addr); o != "live-vm" {
-		t.Fatalf("the reclaiming VM must retain ownership, got %q", o)
-	}
-	// The stale orphan lease is still cleared (nothing of ours left to reclaim → handled).
-	if _, found, _ := j.Read(deviceLeaseOpID("orphan-vm")); found {
-		t.Fatal("orphan lease entry should be cleared after recovery (its owned subset was empty)")
-	}
+		if fs.unbindCount(addr) != 1 {
+			t.Fatalf("orphan recovery must reclaim (unbind) the unowned leaked BDF once, got %d unbind(s)", fs.unbindCount(addr))
+		}
+		if fs.isBound(addr) {
+			t.Fatal("orphan recovery must leave the reclaimed BDF unbound (no unowned+bound orphan)")
+		}
+		if _, found, _ := j.Read(deviceLeaseOpID("orphan-vm")); found {
+			t.Fatal("orphan lease entry must be cleared after a successful reclaim")
+		}
+	})
+
+	// (b) The orphaned lease's BDF was since legitimately reclaimed + bound by a DIFFERENT live
+	// VM. Recovery must NOT unbind it (the reclaiming VM's passthrough survives) and still clear
+	// the stale lease. Confirms the DoesNotUnbindOtherVM property holds via reclaimLeasedDevices.
+	t.Run("reclaimed_by_other_vm_not_unbound", func(t *testing.T) {
+		const addr = "0000:00:00.0"
+		ctx := context.Background()
+		s := testServer(t)
+		j, _ := opjournal.Open(t.TempDir())
+		s.SetOpJournal(j)
+
+		fs := newPCIUnbindRecordingFS()
+		restore := vfio.SetFS(fs)
+		defer restore()
+
+		// The BDF was leased by orphan-vm (deleted without clearing its lease), then legitimately
+		// reclaimed + bound by live-vm. host_pci_devices records live-vm as owner.
+		if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+			HostName: s.hostName, Address: addr, Type: "gpu", VMName: "live-vm",
+		}); err != nil {
+			t.Fatalf("seed reclaimed device: %v", err)
+		}
+		fs.setBound(addr)
+
+		if err := j.Write(opjournal.Entry{OperationID: deviceLeaseOpID("orphan-vm"), ResourceID: "orphan-vm",
+			Kind: deviceLeaseKind, Artifacts: map[string]string{"addresses": addr}}); err != nil {
+			t.Fatalf("write orphan lease: %v", err)
+		}
+
+		s.RecoverDeviceLeases(ctx)
+
+		// The BDF must be untouched — it belongs to live-vm now, whose passthrough must survive.
+		if !fs.isBound(addr) {
+			t.Fatal("recovery must NOT unbind a BDF the orphan lease no longer owns (breaks the reclaiming VM's live device)")
+		}
+		if fs.unbindCount(addr) != 0 {
+			t.Fatalf("recovery must not invoke Unbind on the reclaimed BDF, got %d unbind(s)", fs.unbindCount(addr))
+		}
+		if o := pciOwnerOf(t, ctx, s, addr); o != "live-vm" {
+			t.Fatalf("the reclaiming VM must retain ownership, got %q", o)
+		}
+		// The stale orphan lease is still cleared (nothing of ours left to reclaim → handled).
+		if _, found, _ := j.Read(deviceLeaseOpID("orphan-vm")); found {
+			t.Fatal("orphan lease entry should be cleared after recovery (its owned subset was empty)")
+		}
+	})
 }
 
 // FIX-22 Fix C: a successful DeleteVM must clear any lingering durable device lease for the VM,

@@ -789,14 +789,27 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 // which lies after a FIX-9c failed-start rollback that tombstones realizations while
 // retaining the binding.
 //
-// It is OWNER-SCOPED: it first reads host_pci_devices ownership (fail-closed — a read
-// error releases NOTHING and returns recoverable, since ownership can't be determined) and
-// SKIPS any addr a DIFFERENT non-empty VM owns, in BOTH the unbind and the release loops.
-// This is a no-op for every legitimate caller (they pass the VM's own realization/intent
-// members or freshly-CAS-claimed addrs → owner == vmName); it only neutralizes the buggy
-// legacy-detach-of-a-foreign-BDF case so NO caller can unbind another live VM's device.
+// It requires owner == vmName for the NORMAL contract: it first reads host_pci_devices
+// ownership (fail-closed — a read error releases NOTHING and returns recoverable, since
+// ownership can't be determined) and, in BOTH the unbind and the release loops, ACTS ONLY on
+// addrs owned by vmName, SKIPS an unowned/absent addr, and ERRORS on a foreign owner:
+//   - owner == vmName → ACT (unbind if bound, then owner-scoped release). Our own member.
+//   - owner == "" (unowned) or addr ABSENT from the owner map → SKIP (unbind nothing, release
+//     nothing). In every legitimate normal flow the caller acts on its own owned members;
+//     an unowned addr was already released (idempotent retry no-op) or was never ours, so the
+//     primitive must never unbind a device it cannot prove is vmName's. (The durable-lease-
+//     authorized reclaim of a genuinely leaked unowned device lives in the SEPARATE
+//     reclaimLeasedDevices primitive — do NOT fold that reclaim back in here.)
+//   - owner == a DIFFERENT non-empty VM (foreign) → do NOT unbind, and collect a FOREIGN
+//     failure so the whole call returns a non-nil error. A foreign BDF handed to a normal
+//     release is a caller/operator bug (e.g. a legacy detach forwarding an operator-supplied
+//     BDF), not a success — failing keeps the op recovery-required rather than reporting a
+//     bogus success, and NO caller can unbind another live VM's OR an arbitrary unowned device.
 //
-// Per (owned/unowned) member: read the vfio driver state; if the device is bound to vfio-pci,
+// This is a no-op for every current legitimate caller (detach/start-rollback/attach-rollback/
+// migrate/releaseDevices all pass the VM's own owned members → owner == vmName).
+//
+// Per owned member: read the vfio driver state; if the device is bound to vfio-pci,
 // unbind it (restoring the host driver from host_pci_devices.Driver). A device that is NOT
 // bound is skipped — vfio.Unbind on a never-bound device is not a clean no-op (it clears
 // driver_override and reprobes). A bound-check FS error counts as a failure.
@@ -834,13 +847,21 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 
 	var failures []error
 	for _, addr := range addrs {
-		// Owner-scope the unbind: NEVER touch an addr a DIFFERENT non-empty VM owns — that
-		// would tear down its live passthrough. Only addrs owned by vmName (or genuinely
-		// unowned) are ours to act on. This makes the primitive structurally safe for EVERY
-		// caller, including the legacy detach that forwards an operator-supplied BDF.
-		if owner := owners[addr]; owner != "" && owner != vmName {
-			slog.Warn("pci release: skipping addr owned by another VM (not ours to unbind)",
-				"caller_vm", vmName, "address", addr, "owner", owner)
+		// Require owner == vmName. An unowned/absent addr is SKIPPED (nothing proven ours);
+		// a foreign owner is a FOREIGN failure (fail the whole call). This makes the primitive
+		// structurally safe for EVERY caller: it never unbinds another live VM's device NOR an
+		// arbitrary unowned device, and a legacy detach that forwards a foreign operator-
+		// supplied BDF now errors instead of silently reporting success.
+		switch owner := owners[addr]; {
+		case owner == vmName:
+			// ours — fall through to the vfio act below.
+		case owner == "":
+			slog.Debug("pci release: skipping unowned/absent addr (not proven ours to unbind)",
+				"caller_vm", vmName, "address", addr)
+			continue
+		default:
+			failures = append(failures,
+				fmt.Errorf("refusing to release %s: owned by %q, not %q", addr, owner, vmName))
 			continue
 		}
 		bound, berr := vfio.IsBoundToVFIO(addr)
@@ -867,10 +888,10 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 
 	var relFailures []error
 	for _, addr := range addrs {
-		// Same owner-scope on the release: skip an addr owned by another VM (the owner-scoped
-		// ReleasePCIDevice would no-op on it anyway, but skip explicitly to avoid a spurious
-		// relFailure and to keep the two loops' acted-on subset identical).
-		if owner := owners[addr]; owner != "" && owner != vmName {
+		// Release ONLY addrs owned by vmName — the same subset the unbind loop acted on. An
+		// unowned/absent addr has no ownership row of ours to release (skip); a foreign owner
+		// can't reach here (it would have short-circuited via failures above).
+		if owners[addr] != vmName {
 			continue
 		}
 		if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
@@ -884,6 +905,109 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 		// converges: unbound members are skipped and owner-scoped re-release is a no-op.
 		return fmt.Errorf("pci release: %d of %d member(s) could not be released in DB: %w",
 			len(relFailures), len(addrs), errors.Join(relFailures...))
+	}
+	return nil
+}
+
+// reclaimLeasedDevices is the durable-lease-authorized RECOVERY primitive — the ONLY
+// primitive permitted to reclaim an UNOWNED (owner == "") device. That authorization comes
+// SOLELY from its addrs originating in a durable device-lease journal entry: the lease is the
+// proof that a dead/rolled-back allocation for vmName leaked these BDFs, so an
+// unowned-and-leased addr is a leak this reclaim must clean up. This is exactly what
+// unbindAndReleaseOwnership (the NORMAL primitive) must NEVER do — it cannot prove an
+// arbitrary unowned addr is anyone's, so it skips it. The two primitives are DELIBERATELY
+// separate; do NOT "simplify" them back together, or the normal release paths would regain a
+// hole that lets a raw BDF unbind an arbitrary unowned device.
+//
+// vmExists tells the primitive whether a live domain still exists for vmName: when true it
+// MUST first membership-detach the device from the guest; when false (the orphan-lease case,
+// the VM row is gone) there is no domain to DumpXML, so the guest detach is skipped.
+//
+// Per addr (owner read from a fail-closed host_pci_devices read — a read error reclaims
+// NOTHING and returns recoverable):
+//   - owner == vmName OR owner == "" (unowned/absent) → RECLAIMABLE (ours, or an unowned leak
+//     the lease authorizes us to reclaim).
+//   - owner == a DIFFERENT non-empty VM → SKIP (the BDF was legitimately reclaimed by another
+//     live VM after the lease was written; never touch its passthrough).
+//
+// For each RECLAIMABLE addr: if vmExists, FIRST detachHostdevIfPresent (membership-aware,
+// fail-closed on a DumpXML error → return the error so the caller RETAINS the lease and
+// retries; never unbind a device still in a live guest). Then unbind-if-bound by the vfio
+// ground truth (all-or-nothing: any unbind/bound-check failure reclaims NOTHING and returns
+// recoverable) and, ONLY for addrs owned by vmName, owner-scoped ReleasePCIDevice (an unowned
+// addr has no ownership row to release — unbinding it is the whole reclaim).
+func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs []string, vmExists bool) error {
+	// Fail-closed ownership read: the ONLY signal for which leased addrs are still ours (or
+	// unowned) vs since-reclaimed by another VM. On error, reclaim NOTHING (recoverable).
+	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return fmt.Errorf("pci reclaim: read device ownership for %q: %w", vmName, err)
+	}
+	drivers := map[string]string{}
+	owners := map[string]string{}
+	for _, d := range devices {
+		drivers[d.Address] = d.Driver
+		owners[d.Address] = d.VMName
+	}
+
+	// Partition: only addrs owned by this VM (or unowned — the lease authorizes the reclaim)
+	// are ours. An addr a DIFFERENT non-empty VM owns was legitimately reclaimed — skip it.
+	var reclaimable []string
+	for _, addr := range addrs {
+		if owner := owners[addr]; owner != "" && owner != vmName {
+			slog.Warn("pci reclaim: skipping addr reclaimed by another VM — not ours",
+				"lease_vm", vmName, "address", addr, "current_owner", owner)
+			continue
+		}
+		reclaimable = append(reclaimable, addr)
+	}
+
+	// Guest detach FIRST (only when a live domain still exists). Fail closed on a DumpXML
+	// error and BEFORE any unbind: a device still in a live guest must never be unbound.
+	// Retaining the lease (via the caller's error path) lets a later pass retry.
+	if vmExists {
+		for _, addr := range reclaimable {
+			if derr := s.detachHostdevIfPresent(vmName, addr); derr != nil {
+				return fmt.Errorf("pci reclaim: guest-detach %s from %q: %w", addr, vmName, derr)
+			}
+		}
+	}
+
+	var failures []error
+	for _, addr := range reclaimable {
+		bound, berr := vfio.IsBoundToVFIO(addr)
+		if berr != nil {
+			failures = append(failures, fmt.Errorf("check vfio binding for %s: %w", addr, berr))
+			continue
+		}
+		if !bound {
+			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+		}
+		if uerr := vfio.Unbind(addr, drivers[addr]); uerr != nil {
+			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", addr, uerr))
+		}
+	}
+	if len(failures) > 0 {
+		// All-or-nothing: release NOTHING so a still-bound member stays reclaimable on retry.
+		return fmt.Errorf("pci reclaim: %d of %d leased member(s) could not be unbound: %w",
+			len(failures), len(reclaimable), errors.Join(failures...))
+	}
+
+	var relFailures []error
+	for _, addr := range reclaimable {
+		// Owner-scoped release ONLY for addrs owned by vmName. An unowned leak has no
+		// ownership row to release — the unbind above was the whole reclaim.
+		if owners[addr] != vmName {
+			continue
+		}
+		if rerr := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); rerr != nil {
+			slog.Warn("pci reclaim: failed to release PCI device in DB", "vm", vmName, "address", addr, "error", rerr)
+			relFailures = append(relFailures, fmt.Errorf("release %s ownership: %w", addr, rerr))
+		}
+	}
+	if len(relFailures) > 0 {
+		return fmt.Errorf("pci reclaim: %d leased member(s) for %q could not be released in DB: %w",
+			len(relFailures), vmName, errors.Join(relFailures...))
 	}
 	return nil
 }

@@ -762,7 +762,13 @@ func (s *Server) liveAddressIntent(ctx context.Context, vmName, normAddr string)
 func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, normAddr, deviceID, opID string, epoch, newGen int64, running bool) (*pb.VM, error) {
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepReserved)
 
-	// The realized members are the concrete host devices to live-detach + release.
+	// The concrete host devices to live-detach + release. When the device was started,
+	// vm_pci_realizations carries them (member id, resolved address, alias). When it was
+	// NEVER started — a FIX-9a stopped reserve, or a FIX-9c failed-start rollback that
+	// tombstoned realizations while RETAINING the vfio binding — the realizations are
+	// gone, so resolve the members from the INTENT (the same primary + IOMMU-group
+	// siblings reconcile builds; the intent persists). Journaling THIS complete set (not
+	// the possibly-empty realization set) lets crash recovery release the right devices.
 	realizations, rerr := corrosion.ListVMPCIRealizations(ctx, s.db, vm.Name)
 	if rerr != nil {
 		return s.failPCIDetachClean(ctx, vm, opID, epoch, newGen, normAddr,
@@ -775,6 +781,19 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 		}
 		memberAddrs = append(memberAddrs, r.ResolvedAddress)
 		memberAliases = append(memberAliases, r.XMLAlias)
+	}
+	if len(memberAddrs) == 0 {
+		// No realizations → resolve the member set from the intent address. Best-effort: a
+		// vanished sibling can't wedge the detach (VM delete's releaseDevices clears any
+		// residual owner-by-VM).
+		if members, mrerr := s.resolveDeviceSpec(ctx, vm.Name, &pb.DeviceSpec{Address: normAddr}, deviceID, map[string]bool{}); mrerr == nil {
+			for _, m := range members {
+				memberAddrs = append(memberAddrs, m.Address)
+				memberAliases = append(memberAliases, pciMemberAlias(deviceID, m.MemberID))
+			}
+		} else {
+			slog.Warn("pci detach: resolve members from intent", "vm", vm.Name, "address", normAddr, "error", mrerr)
+		}
 	}
 
 	priorActive, _ := s.virt.DumpXML(vm.Name)
@@ -817,34 +836,22 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			return nil, status.Errorf(codes.Internal, "pci detach for %q applied but bookkeeping incomplete; left recoverable", vm.Name)
 		}
 	} else {
-		// Stopped detach. Discriminate on realization rows (written at VM start) whether
-		// the device was ever started, and therefore bound: a latched stop RETAINS the
-		// vfio binding (FIX-9b touches PCI not at all), so a started-then-stopped device
-		// is still bound to vfio-pci at detach time.
-		if len(memberAddrs) > 0 {
-			// Realizations exist → the device was started and is (or may be) bound. It
-			// must be UNBOUND before its ownership is released, or it is left an unowned
-			// but still-vfio-bound orphan (the host driver can't reclaim it, and another
-			// VM could claim ownership of a device stuck in vfio-pci). Release via the
-			// realized addresses (vfio Unbind + owner-scoped release); no live
-			// DetachHostdev — the VM is stopped, no running domain, and the reconcile
-			// below drops the hostdev from the persistent definition.
-			s.releaseDeviceLeases(ctx, vm.Name, memberAddrs)
-		} else if members, rerr := s.resolveDeviceSpec(ctx, vm.Name, &pb.DeviceSpec{Address: normAddr}, deviceID, map[string]bool{}); rerr == nil {
-			// No realizations → a never-started, ownership-reserved-only attach (FIX-9a).
-			// Nothing was ever bound: release the shared inventory reservation the stopped
-			// attach claimed (the same primary + IOMMU-group siblings) WITHOUT any vfio
-			// unbind. vfio.Unbind must NOT run here — on a never-bound device it is not a
-			// clean no-op (it clears driver_override and attempts a driver-restore).
-			// Best-effort resolve so a vanished sibling can't wedge the detach (VM delete's
-			// releaseDevices clears any residual owner by VM).
-			for _, m := range members {
-				if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, m.Address, vm.Name); err != nil {
-					slog.Warn("pci detach: release stopped reservation", "vm", vm.Name, "address", m.Address, "error", err)
-				}
-			}
-		} else {
-			slog.Warn("pci detach: resolve members to release stopped reservation", "vm", vm.Name, "address", normAddr, "error", rerr)
+		// Stopped detach. Release by the ACTUAL vfio driver state (ground truth), NOT by
+		// realization presence: a FIX-9c failed-start RETAINS the vfio binding while
+		// tombstoning its realizations, so a realization-presence discriminator would
+		// wrongly take a "never bound" branch and release WITHOUT unbinding → an unowned-
+		// but-vfio-bound orphan (the host driver can't reclaim it, and another VM could
+		// claim ownership of a device stuck in vfio-pci). unbindAndReleaseOwnership unbinds
+		// only the members currently bound to vfio-pci and is ALL-OR-NOTHING: any unbind
+		// (or bound-check) failure releases NOTHING and returns an error. No live
+		// DetachHostdev — the VM is stopped; the reconcile below drops the hostdev from the
+		// persistent definition.
+		if err := s.unbindAndReleaseOwnership(ctx, vm.Name, memberAddrs); err != nil {
+			// Leave the intent/realizations/barrier in place — the op stays recovery-
+			// required and a later retry (live or via recovery) re-checks vfio state.
+			slog.Error("pci detach: unbind/release failed — left recoverable", "vm", vm.Name, "op", opID, "error", err)
+			return nil, status.Errorf(codes.Internal,
+				"pci detach for %q could not release its device(s); left recoverable: %v", vm.Name, err)
 		}
 		if err := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, deviceID); err != nil {
 			return s.failPCIDetachClean(ctx, vm, opID, epoch, newGen, normAddr,

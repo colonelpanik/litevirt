@@ -1377,6 +1377,124 @@ func TestRecoverHardwareOperations_PCIDetachRollsForward(t *testing.T) {
 	}
 }
 
+// TestRecoverPCIDetach_Stopped_UnbindsAndReleases is FIX-14 bug #2: a STOPPED PCI
+// detach that crashed after journaling the plan but before the live release. The
+// device is still vfio-BOUND + owner-assigned, and its realizations were already gone
+// (a FIX-9c retained binding, or the crash landed after the live tombstone). Recovery
+// must UNBIND (by vfio ground truth) and RELEASE ownership using the JOURNALED member
+// set — not merely tombstone + reconcile, which would leak the binding + reservation
+// while completing the op. RED before the fix (the stopped recovery branch only
+// tombstoned + reconciled → device left bound + owned).
+func TestRecoverPCIDetach_Stopped_UnbindsAndReleases(t *testing.T) {
+	const addr = "0000:41:00.0"
+	const deviceID = "pcidev-detach"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+
+	seedNICVM(t, s, "vm1", "stopped")
+	fake.SetState("vm1", libvirtfake.StateDefined) // positively shut off → stopped recovery path
+	seedPCIGPU(t, s, addr, -1)
+	seedAddressIntent(t, s, "vm1", deviceID, addr)
+	// Still owner-assigned + vfio-bound; realizations already gone.
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
+		t.Fatalf("assign device: %v", err)
+	}
+	fs.setBound(addr)
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceDetach,
+		detachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr})
+
+	s.RecoverHardwareOperations(ctx)
+
+	if n := fs.unbindCount(addr); n == 0 {
+		t.Fatalf("stopped detach recovery must vfio-unbind the bound device (0 unbinds — leaked binding)")
+	}
+	if fs.isBound(addr) {
+		t.Fatal("stopped detach recovery left the device bound to vfio-pci (orphan)")
+	}
+	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
+		t.Fatalf("stopped detach recovery must release ownership; %s still owned by %q", addr, o)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("barrier not cleared: %q", vm.ActiveOperationID)
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceDetach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state != corrosion.OpStepCompleted {
+		t.Fatalf("detach recovery state = %q, want completed", state)
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 0 {
+		t.Fatalf("intent not tombstoned: %+v", in)
+	}
+	if _, found, _ := s.opJournal.Read(opID); found {
+		t.Fatal("journal entry must be cleared after a completed detach")
+	}
+}
+
+// TestRecoverPCIDetach_StoppedUnbindFails_LeavesRecoverable is the FIX-14 bug #2
+// recoverable variant: if recovery's vfio.Unbind fails, it must RELEASE NOTHING, leave
+// the barrier set (recovery-required) and NOT complete — never clearing ownership or
+// tombstoning while the device is still bound.
+func TestRecoverPCIDetach_StoppedUnbindFails_LeavesRecoverable(t *testing.T) {
+	const addr = "0000:41:00.0"
+	const deviceID = "pcidev-detach"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+
+	seedNICVM(t, s, "vm1", "stopped")
+	fake.SetState("vm1", libvirtfake.StateDefined)
+	seedPCIGPU(t, s, addr, -1)
+	seedAddressIntent(t, s, "vm1", deviceID, addr)
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
+		t.Fatalf("assign device: %v", err)
+	}
+	fs.setBound(addr)
+	fs.setFailUnbind(addr) // vfio unbind cannot complete
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceDetach,
+		detachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr})
+
+	s.RecoverHardwareOperations(ctx)
+
+	// Nothing released, barrier retained, op NOT completed.
+	if o := pciOwnerOf(t, ctx, s, addr); o != "vm1" {
+		t.Fatalf("unbind failure must RETAIN ownership, got owner %q, want vm1", o)
+	}
+	if !fs.isBound(addr) {
+		t.Fatal("a failed unbind must leave the device still bound")
+	}
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID == "" {
+		t.Fatal("unbind failure must leave the operation barrier set (recovery-required)")
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("unbind failure must NOT tombstone the intent, got %d", len(in))
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceDetach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state == corrosion.OpStepCompleted {
+		t.Fatal("recovery must NOT complete a detach whose unbind failed")
+	}
+}
+
 // ── host reboot: live domain shut off while vm.State still "running" ─────────────
 
 // TestRecoverHardwareOperations_HostRebootAttachTakesStoppedPath: after a host

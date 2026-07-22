@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/opjournal"
 )
@@ -659,6 +660,7 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 	running := disp == dispRunning
 	art := entry.Artifacts
 	deviceID := art["device_id"]
+	normAddr := strings.ToLower(art["pci_address"])
 
 	var memberAddrs, memberAliases []string
 	if reals, e := corrosion.ListVMPCIRealizations(ctx, s.db, vm.Name); e == nil {
@@ -688,6 +690,34 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 			return
 		}
 	} else {
+		// Stopped detach recovery: release by vfio ground truth (unbindAndReleaseOwnership),
+		// driven by the JOURNALED member set — so a device whose realizations were
+		// tombstoned but whose vfio binding was retained (FIX-9c), or one whose live
+		// release never ran before the crash, is still UNBOUND + released rather than left
+		// bound + owned (FIX-14 #2). Prefer the journaled addresses; fall back to resolving
+		// from the intent for a pre-fix entry that lacks member_addresses. Derive the
+		// aliases the same way for the absence verify when realizations are already gone.
+		addrs := splitCSVNonEmpty(art["member_addresses"])
+		if len(addrs) == 0 || len(memberAliases) == 0 {
+			if members, e := s.resolveDeviceSpec(ctx, vm.Name, &pb.DeviceSpec{Address: normAddr}, deviceID, map[string]bool{}); e == nil {
+				if len(addrs) == 0 {
+					for _, m := range members {
+						addrs = append(addrs, m.Address)
+					}
+				}
+				if len(memberAliases) == 0 {
+					for _, m := range members {
+						memberAliases = append(memberAliases, pciMemberAlias(deviceID, m.MemberID))
+					}
+				}
+			}
+		}
+		// ALL-OR-NOTHING: any unbind (or bound-check) failure releases nothing and returns
+		// an error → leave the intent/realizations/barrier in place (recovery-required).
+		if err := s.unbindAndReleaseOwnership(ctx, vm.Name, addrs); err != nil {
+			slog.Error("hardware op recovery: pci detach unbind/release failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
+			return
+		}
 		if err := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, deviceID); err != nil {
 			slog.Error("hardware op recovery: pci detach tombstone realizations failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 			return

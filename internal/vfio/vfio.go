@@ -153,6 +153,26 @@ func Unbind(address, restoreDriver string) error {
 	return nil
 }
 
+// IsBoundToVFIO reports whether the PCI device at address is CURRENTLY bound to the
+// vfio-pci driver, read from the device's driver symlink. This is the GROUND-TRUTH
+// "is this device claimed by vfio right now" signal — as opposed to inferring
+// boundness from bookkeeping such as vm_pci_realizations rows, which can lie after a
+// crash or a rollback that tombstoned the rows while retaining the binding. It mirrors
+// the readlink pattern Bind/Unbind use: bound iff the driver link's basename is
+// "vfio-pci". A device with NO driver bound (the link is absent → a not-exist error)
+// is reported false, nil; an UNEXPECTED filesystem error (anything other than
+// not-exist) is returned so a caller can fail closed rather than assume "unbound".
+func IsBoundToVFIO(address string) (bool, error) {
+	link, err := sysfs.Readlink(filepath.Join(sysDevices, address, "driver"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return filepath.Base(link) == "vfio-pci", nil
+}
+
 // IsVF returns true if the PCI device at the given address is an SR-IOV Virtual Function.
 // VFs have a "physfn" symlink pointing to their parent Physical Function.
 func IsVF(address string) bool {

@@ -23,19 +23,38 @@ import (
 // ORIGINAL driver (not vfio-pci), so an unbound device stays unbound and Unbind's own
 // verify passes.
 type pciUnbindRecordingFS struct {
-	mu       sync.Mutex
-	bound    map[string]bool // address -> bound to vfio-pci
-	override map[string]bool // address -> driver_override currently selects vfio-pci
-	unbinds  map[string]int  // address -> count of vfio.Unbind invocations
-	binds    int             // count of vfio-pci bind writes
+	mu         sync.Mutex
+	bound      map[string]bool // address -> bound to vfio-pci
+	override   map[string]bool // address -> driver_override currently selects vfio-pci
+	unbinds    map[string]int  // address -> count of vfio.Unbind invocations
+	failUnbind map[string]bool // address -> the .../driver/unbind write fails (models a stuck unbind)
+	binds      int             // count of vfio-pci bind writes
 }
 
 func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
 	return &pciUnbindRecordingFS{
-		bound:    map[string]bool{},
-		override: map[string]bool{},
-		unbinds:  map[string]int{},
+		bound:      map[string]bool{},
+		override:   map[string]bool{},
+		unbinds:    map[string]int{},
+		failUnbind: map[string]bool{},
 	}
+}
+
+// setBound marks a device as currently bound to vfio-pci WITHOUT running a bind (used
+// to construct a "device is vfio-bound" ground-truth state directly in a test).
+func (f *pciUnbindRecordingFS) setBound(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bound[addr] = true
+	f.override[addr] = true
+}
+
+// setFailUnbind makes the .../driver/unbind write for addr fail, so vfio.Unbind
+// returns an error and the device stays bound (models a stuck/failed unbind).
+func (f *pciUnbindRecordingFS) setFailUnbind(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failUnbind[addr] = true
 }
 
 func (f *pciUnbindRecordingFS) devAddr(path, suffix string) string {
@@ -71,6 +90,10 @@ func (f *pciUnbindRecordingFS) WriteFile(path string, data []byte, _ os.FileMode
 			f.unbinds[a]++
 		}
 	case strings.HasSuffix(path, "/driver/unbind"):
+		if f.failUnbind[val] {
+			// Model a stuck unbind: the write fails and the device stays bound.
+			return fmt.Errorf("pciUnbindRecordingFS: injected unbind failure for %s", val)
+		}
 		// Unbind from the current (vfio-pci) driver: the device is now driverless.
 		f.bound[val] = false
 	case strings.Contains(path, "vfio-pci/bind"):
@@ -97,7 +120,9 @@ func (f *pciUnbindRecordingFS) Readlink(path string) (string, error) {
 		if f.bound[f.devAddr(path, "/driver")] {
 			return "/sys/bus/pci/drivers/vfio-pci", nil
 		}
-		return "", fmt.Errorf("pciUnbindRecordingFS: no driver for %s", path)
+		// No driver bound → model real sysfs (ENOENT); IsBoundToVFIO reads this as
+		// "not bound" (false, nil), not an unexpected FS error.
+		return "", os.ErrNotExist
 	}
 	return "", fmt.Errorf("pciUnbindRecordingFS: no link %s", path)
 }
@@ -198,6 +223,170 @@ func TestDetachPCI_StoppedAfterStart_UnbindsAndReleases(t *testing.T) {
 	}
 	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 0 {
 		t.Fatalf("intent not tombstoned: %+v", in)
+	}
+}
+
+// TestDetachPCI_StoppedFailedStartBoundNoRealizations_Unbinds is FIX-14 bug #3:
+// FIX-9c's failed-start rollback RETAINS a self-owned device's vfio binding but
+// TOMBSTONES its realization rows. A later stopped detach must NOT key its
+// unbind-or-not decision on realization presence (which now lies) — it must consult
+// the ACTUAL vfio driver state. Here the device is owned + vfio-BOUND but has NO
+// realization rows: the detach must UNBIND it (ground truth) before releasing
+// ownership, never leave an unowned-but-vfio-bound orphan. RED before the fix (the
+// realization-presence discriminator took the "never bound" branch → owner-release
+// WITHOUT unbind → still bound).
+func TestDetachPCI_StoppedFailedStartBoundNoRealizations_Unbinds(t *testing.T) {
+	const addr = "0000:41:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+
+	seedNICVM(t, s, "vm1", "stopped")
+	s.virt.(*libvirtfake.Fake).SetState("vm1", libvirtfake.StateDefined)
+	seedPCIGPU(t, s, addr, -1)
+
+	// Stopped reserve: claims ownership + intent, reconciles the hostdev into the def,
+	// NO bind, NO realization.
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: addr},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) != 0 {
+		t.Fatalf("a reserve must have NO realizations, got %d", len(rs))
+	}
+	// FIX-9c state: a failed start bound the device to vfio-pci but its rollback
+	// tombstoned the realization rows while RETAINING the binding.
+	fs.setBound(addr)
+	if !fs.isBound(addr) {
+		t.Fatal("precondition: device must be vfio-bound")
+	}
+
+	// Detach while stopped: must UNBIND by ground truth, then release + tombstone.
+	if _, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{
+		VmName: "vm1", PciAddress: addr,
+	}); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+
+	if n := fs.unbindCount(addr); n == 0 {
+		t.Fatalf("detach of a bound-but-realization-less device must vfio-unbind it (0 unbinds — the orphan bug)")
+	}
+	if fs.isBound(addr) {
+		t.Fatal("detach left the device bound to vfio-pci (unowned + vfio-bound orphan)")
+	}
+	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
+		t.Fatalf("detach must release ownership, got owner %q", o)
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 0 {
+		t.Fatalf("intent not tombstoned: %+v", in)
+	}
+}
+
+// TestDetachPCI_StoppedUnbindFails_LeavesRecoverable is FIX-14 bug #1: a stopped
+// detach whose vfio.Unbind FAILS must leave EVERYTHING recoverable — ownership
+// retained, intent + realizations NOT tombstoned, the operation barrier still set,
+// and an error returned — rather than clearing ownership anyway (which would leave an
+// unowned-but-vfio-bound orphan). RED before the fix (releaseDeviceLeases logged the
+// unbind failure then released ownership + tombstoned + completed).
+func TestDetachPCI_StoppedUnbindFails_LeavesRecoverable(t *testing.T) {
+	const addr = "0000:41:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+
+	seedNICVM(t, s, "vm1", "stopped")
+	fake.SetState("vm1", libvirtfake.StateDefined)
+	seedPCIGPU(t, s, addr, -1)
+
+	// attach → start → stop leaves the device vfio-bound + owned + realized + intent.
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: addr},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "vm1"}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !fs.isBound(addr) {
+		t.Fatal("precondition: start must bind the device")
+	}
+	if _, err := s.StopVM(ctx, &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	fake.SetState("vm1", libvirtfake.StateDefined)
+
+	// Force the vfio unbind to fail.
+	fs.setFailUnbind(addr)
+
+	_, derr := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: addr})
+	if derr == nil {
+		t.Fatal("a failed vfio unbind must fail the detach (recoverable), not report success")
+	}
+
+	// Ownership RETAINED (not released despite the unbind failure).
+	if o := pciOwnerOf(t, ctx, s, addr); o != "vm1" {
+		t.Fatalf("unbind failure must RETAIN ownership, got owner %q, want vm1", o)
+	}
+	// Nothing tombstoned.
+	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) != 1 {
+		t.Fatalf("unbind failure must NOT tombstone realizations, got %d", len(rs))
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("unbind failure must NOT tombstone the intent, got %d", len(in))
+	}
+	// Barrier still set → the operation is recovery-required.
+	if op := mustGetVM(t, s, "vm1").ActiveOperationID; op == "" {
+		t.Fatal("unbind failure must leave the operation barrier set (recovery-required)")
+	}
+	// The device is still vfio-bound (the unbind never succeeded) — owned + bound is safe.
+	if !fs.isBound(addr) {
+		t.Fatal("a failed unbind must leave the device still bound (owned + bound, recoverable)")
+	}
+}
+
+// TestDetachPCI_StoppedNeverStartedReserve_ReleasesNoUnbind is the FIX-11 regression
+// under the ground-truth protocol: a never-started reserve (owned, NOT vfio-bound, no
+// realizations) detaches by releasing ownership and must NOT call vfio.Unbind —
+// IsBoundToVFIO=false so no unbind is attempted (Unbind on a never-bound device clears
+// driver_override + reprobes, which is not a clean no-op).
+func TestDetachPCI_StoppedNeverStartedReserve_ReleasesNoUnbind(t *testing.T) {
+	const addr = "0000:41:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+
+	seedNICVM(t, s, "vm1", "stopped")
+	s.virt.(*libvirtfake.Fake).SetState("vm1", libvirtfake.StateDefined)
+	seedPCIGPU(t, s, addr, -1)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: addr},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	if _, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: addr}); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
+		t.Fatalf("detach must release the stopped reservation, got owner %q", o)
+	}
+	if n := fs.unbindCount(addr); n != 0 {
+		t.Fatalf("a never-bound reserve must NOT be vfio-unbound, got %d unbinds", n)
+	}
+	if fs.binds != 0 {
+		t.Fatalf("a never-started reserve must never have been bound, got %d binds", fs.binds)
 	}
 }
 

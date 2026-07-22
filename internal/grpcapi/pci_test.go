@@ -65,7 +65,9 @@ func (f *pciBindFakeFS) Readlink(path string) (string, error) {
 		if f.bound[f.addrFromDriverPath(path)] {
 			return "/sys/bus/pci/drivers/vfio-pci", nil
 		}
-		return "", fmt.Errorf("pciBindFakeFS: no driver for %s", path)
+		// No driver bound → model real sysfs (ENOENT), which IsBoundToVFIO reads as
+		// "not bound" (false, nil) rather than an unexpected FS error.
+		return "", os.ErrNotExist
 	}
 	return "", fmt.Errorf("pciBindFakeFS: no link %s", path)
 }

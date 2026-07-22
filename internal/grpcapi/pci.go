@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -709,6 +710,68 @@ func (s *Server) releaseDeviceLeases(ctx context.Context, vmName string, addrs [
 			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
 		}
 	}
+}
+
+// unbindAndReleaseOwnership is the ALL-OR-NOTHING, crash-safe release primitive for a
+// STOPPED PCI detach — used identically by the live detach (executePCIDetach's stopped
+// branch) and its crash recovery (recoverPCIDetach's stopped branch). Unlike the
+// fire-and-forget releaseDeviceLeases, it discriminates bound-ness by the ACTUAL vfio
+// driver state (vfio.IsBoundToVFIO), the ground truth — NOT by realization presence,
+// which lies after a FIX-9c failed-start rollback that tombstones realizations while
+// retaining the binding.
+//
+// Per member: read the vfio driver state; if the device is bound to vfio-pci, unbind it
+// (restoring the host driver from host_pci_devices.Driver). A device that is NOT bound
+// is skipped — vfio.Unbind on a never-bound device is not a clean no-op (it clears
+// driver_override and reprobes). A bound-check FS error counts as a failure.
+//
+//   - If ANY member's unbind (or bound-check) failed → RELEASE NOTHING (no
+//     ReleasePCIDevice) and return the error. Every member stays owned, and the still-
+//     bound ones stay bound, so the caller can leave the operation recovery-required. A
+//     retry re-reads vfio state: a since-unbound member is skipped and the release
+//     converges — never leaving a device unowned-but-vfio-bound.
+//   - If every bound member unbound cleanly → owner-release ALL addrs (owner-scoped, a
+//     no-op for a device another VM has since claimed) and return nil. A member that
+//     unbound but whose DB release then errored stays owned+unbound, which is safe (the
+//     whole-VM releaseDevices at VM delete clears any residual ownership).
+func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, addrs []string) error {
+	drivers := map[string]string{}
+	if devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); err == nil {
+		for _, d := range devices {
+			drivers[d.Address] = d.Driver
+		}
+	}
+
+	var failures []error
+	for _, addr := range addrs {
+		bound, berr := vfio.IsBoundToVFIO(addr)
+		if berr != nil {
+			// Cannot prove the device's binding state → fail closed (treat as an unbind
+			// failure) so we never release a device we can't confirm is unbound.
+			failures = append(failures, fmt.Errorf("check vfio binding for %s: %w", addr, berr))
+			continue
+		}
+		if !bound {
+			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+		}
+		if uerr := vfio.Unbind(addr, drivers[addr]); uerr != nil {
+			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", addr, uerr))
+		}
+	}
+
+	if len(failures) > 0 {
+		// Release NOTHING: a still-bound member stays owned + bound (recoverable). This is
+		// the invariant that prevents an unowned-but-vfio-bound orphan.
+		return fmt.Errorf("pci release: %d of %d member(s) could not be unbound: %w",
+			len(failures), len(addrs), errors.Join(failures...))
+	}
+
+	for _, addr := range addrs {
+		if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
+			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
+		}
+	}
+	return nil
 }
 
 // checkIOMMUConflict verifies that no device in the same IOMMU group

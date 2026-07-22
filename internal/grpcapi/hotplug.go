@@ -51,6 +51,35 @@ func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
 	return nil // already detached — nothing to do
 }
 
+// detachHostdevConfigIfPresent is the CONFIG-only counterpart to detachHostdevIfPresent,
+// for a SHUT-OFF domain: it removes the PCI hostdev at addr from the PERSISTENT definition
+// only if that definition still carries it. For a shut-off defined domain DumpXML returns
+// the persistent/inactive config, so the same by-source-BDF membership check correctly
+// finds a persisted-but-not-live hostdev (and skips a member that was never persisted). It
+// FAILS CLOSED on a DumpXML error (membership cannot be confirmed → do NOT assume the
+// device is already gone) and delegates to DetachHostdevConfig, which never touches a
+// (nonexistent) live domain — the live-flagged DetachHostdev a shut-off domain rejects.
+func (s *Server) detachHostdevConfigIfPresent(vmName, addr string) error {
+	live, err := s.virt.DumpXML(vmName)
+	if err != nil {
+		return err
+	}
+	want, ok := pci.CanonicalBDF(addr)
+	if !ok {
+		want = strings.ToLower(strings.TrimSpace(addr))
+	}
+	for _, raw := range libvirt.HostdevSourcePCIAddresses(live) {
+		got, gok := pci.CanonicalBDF(raw)
+		if !gok {
+			got = strings.ToLower(strings.TrimSpace(raw))
+		}
+		if got == want {
+			return s.virt.DetachHostdevConfig(vmName, addr)
+		}
+	}
+	return nil // not in the persistent definition — nothing to do
+}
+
 // AttachDevice hot-attaches a disk, NIC, or PCI device to a running VM.
 func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

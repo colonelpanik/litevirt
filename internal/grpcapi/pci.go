@@ -916,6 +916,22 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 	return nil
 }
 
+// reclaimGuestMode selects how reclaimLeasedDevices detaches a leased device from the
+// guest before unbinding it — chosen by the caller from the VM's live-domain disposition.
+type reclaimGuestMode int
+
+const (
+	// reclaimNoDomain: the VM row is gone (orphan lease) → no live domain to touch; skip
+	// the guest detach and go straight to unbind + owner-scoped release.
+	reclaimNoDomain reclaimGuestMode = iota
+	// reclaimLive: the domain is running → LIVE|CONFIG membership detach.
+	reclaimLive
+	// reclaimConfig: the domain is POSITIVELY shut off → CONFIG-only membership detach
+	// (the persistent definition), since a live-flagged detach on a shut-off domain is
+	// rejected by libvirt.
+	reclaimConfig
+)
+
 // reclaimLeasedDevices is the durable-lease-authorized RECOVERY primitive — the ONLY
 // primitive permitted to reclaim an UNOWNED (owner == "") device. That authorization comes
 // SOLELY from its addrs originating in a durable device-lease journal entry: the lease is the
@@ -926,9 +942,14 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 // separate; do NOT "simplify" them back together, or the normal release paths would regain a
 // hole that lets a raw BDF unbind an arbitrary unowned device.
 //
-// vmExists tells the primitive whether a live domain still exists for vmName: when true it
-// MUST first membership-detach the device from the guest; when false (the orphan-lease case,
-// the VM row is gone) there is no domain to DumpXML, so the guest detach is skipped.
+// mode tells the primitive which guest-detach to run FIRST, keyed on the live-domain
+// DISPOSITION (not merely "the vm row exists"):
+//   - reclaimNoDomain (orphan lease, the VM row is gone): no domain to DumpXML → skip the
+//     guest detach entirely.
+//   - reclaimLive (domain running): LIVE|CONFIG membership detach (detachHostdevIfPresent).
+//   - reclaimConfig (domain shut off): CONFIG-only membership detach
+//     (detachHostdevConfigIfPresent) — a live-flagged detach a shut-off domain rejects
+//     would error and wedge the reclaim.
 //
 // Per addr (owner read from a fail-closed host_pci_devices read — a read error reclaims
 // NOTHING and returns recoverable):
@@ -937,13 +958,13 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 //   - owner == a DIFFERENT non-empty VM → SKIP (the BDF was legitimately reclaimed by another
 //     live VM after the lease was written; never touch its passthrough).
 //
-// For each RECLAIMABLE addr: if vmExists, FIRST detachHostdevIfPresent (membership-aware,
-// fail-closed on a DumpXML error → return the error so the caller RETAINS the lease and
-// retries; never unbind a device still in a live guest). Then unbind-if-bound by the vfio
+// For each RECLAIMABLE addr the guest detach (when a domain exists) is membership-aware and
+// FAIL-CLOSED on a DumpXML error → return the error so the caller RETAINS the lease and
+// retries; never unbind a device still in a live guest. Then unbind-if-bound by the vfio
 // ground truth (all-or-nothing: any unbind/bound-check failure reclaims NOTHING and returns
 // recoverable) and, ONLY for addrs owned by vmName, owner-scoped ReleasePCIDevice (an unowned
 // addr has no ownership row to release — unbinding it is the whole reclaim).
-func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs []string, vmExists bool) error {
+func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs []string, mode reclaimGuestMode) error {
 	// Fail-closed ownership read: the ONLY signal for which leased addrs are still ours (or
 	// unowned) vs since-reclaimed by another VM. On error, reclaim NOTHING (recoverable).
 	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
@@ -969,13 +990,22 @@ func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs 
 		reclaimable = append(reclaimable, addr)
 	}
 
-	// Guest detach FIRST (only when a live domain still exists). Fail closed on a DumpXML
-	// error and BEFORE any unbind: a device still in a live guest must never be unbound.
-	// Retaining the lease (via the caller's error path) lets a later pass retry.
-	if vmExists {
+	// Guest detach FIRST (only when a domain still exists), keyed on disposition. Fail
+	// closed on a DumpXML error and BEFORE any unbind: a device still in a live guest must
+	// never be unbound. A shut-off domain uses the CONFIG-only detach — a live-flagged
+	// detach it would reject. Retaining the lease (via the caller's error path) lets a
+	// later pass retry.
+	switch mode {
+	case reclaimLive:
 		for _, addr := range reclaimable {
 			if derr := s.detachHostdevIfPresent(vmName, addr); derr != nil {
 				return fmt.Errorf("pci reclaim: guest-detach %s from %q: %w", addr, vmName, derr)
+			}
+		}
+	case reclaimConfig:
+		for _, addr := range reclaimable {
+			if derr := s.detachHostdevConfigIfPresent(vmName, addr); derr != nil {
+				return fmt.Errorf("pci reclaim: config-detach %s from %q: %w", addr, vmName, derr)
 			}
 		}
 	}

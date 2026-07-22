@@ -138,7 +138,11 @@ func (s *Server) markDeviceLeaseRollbackIncomplete(vmName string, addrs []string
 //     during the bind or guest-attach loop) or its rollback could not complete
 //     (rollback_incomplete: the refined stage), leaving this attach's members owned +
 //     bound. They are membership-aware-reclaimed (guest-detach FIRST, then unbind +
-//     owner-release), then the entry removed;
+//     owner-release), then the entry removed — but the guest-detach is chosen by the
+//     LIVE-domain DISPOSITION: a running domain gets a LIVE detach, a POSITIVELY shut-off
+//     domain a CONFIG-only detach (a live-flagged detach a shut-off domain rejects would
+//     wedge the lease), and an indeterminate / paused / pm-suspended domain DEFERS (the
+//     entry is retained, reclaimed nothing, retried next pass);
 //   - the VM exists with any other stage (Stage "bound" — a completed allocation whose
 //     finish() didn't run before the crash) → the entry is just cleared, WITHOUT releasing.
 //
@@ -168,8 +172,8 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 		}
 		if vm == nil {
 			// Orphaned: the VM was never finalized — roll back the leaked devices via the
-			// durable-lease-authorized reclaimLeasedDevices primitive (vmExists=false: the VM
-			// row is gone, so there is no live guest to membership-detach from). The lease is
+			// durable-lease-authorized reclaimLeasedDevices primitive (reclaimNoDomain: the VM
+			// row is gone, so there is no domain to membership-detach from). The lease is
 			// the proof these leaked BDFs were this dead VM's, so the primitive may reclaim an
 			// UNOWNED addr — which the normal unbindAndReleaseOwnership must never do. The
 			// primitive fails closed on the ownership read, SKIPS any BDF a DIFFERENT live VM
@@ -177,7 +181,7 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 			// strict all-or-nothing: on its error RETAIN the entry so a later pass retries,
 			// rather than removing it over a device still bound to vfio-pci.
 			slog.Warn("device-lease recovery: rolling back orphaned lease", "vm", e.ResourceID, "devices", addrs)
-			if rerr := s.reclaimLeasedDevices(ctx, e.ResourceID, addrs, false); rerr != nil {
+			if rerr := s.reclaimLeasedDevices(ctx, e.ResourceID, addrs, reclaimNoDomain); rerr != nil {
 				slog.Error("device-lease recovery: reclaim incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
 				continue // do NOT remove the entry; a later pass retries
 			}
@@ -185,14 +189,29 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 			// The VM exists but a legacy running-attach crashed mid-flight (in_progress: the
 			// initial stage — the crash hit during the vfio bind or the guest-attach loop) or
 			// its rollback could not complete (rollback_incomplete: the refined stage), leaving
-			// this attach's members owned + bound. Both are handled IDENTICALLY: reclaim them
-			// via the durable-lease-authorized primitive with vmExists=true (mirroring the
-			// rollback_incomplete branch), so it membership-detaches each still-in-guest member
-			// FIRST, then unbind + owner-scoped-release. Fail closed → RETAIN the entry on any
-			// error (never remove it over a device still bound to vfio-pci); a later pass
-			// retries. A BDF a DIFFERENT live VM has since reclaimed is skipped.
+			// this attach's members owned + bound. The reclaim membership-detaches each
+			// still-in-guest member FIRST, then unbind + owner-scoped-release — but WHICH detach
+			// depends on the LIVE-domain DISPOSITION, not merely "the vm row exists". After a
+			// host reboot the vm row still says the VM exists while its domain is SHUT OFF: a
+			// live-flagged detach then fails and wedges the lease forever, so a shut-off domain
+			// must be CONFIG-detached (persistent definition) instead. An indeterminate / paused
+			// / pm-suspended domain DEFERS — reclaiming it could tear a device out of a
+			// still-active or unknown-state guest — so the entry is RETAINED for a later pass.
+			// Fail closed → RETAIN the entry on any error; a BDF a DIFFERENT live VM has since
+			// reclaimed is skipped.
+			var mode reclaimGuestMode
+			switch disp := s.recoveryDomainDisposition(e.ResourceID); disp {
+			case dispRunning:
+				mode = reclaimLive
+			case dispShutoff:
+				mode = reclaimConfig
+			default: // dispDefer: indeterminate / paused / pm-suspended → retain, retry next pass
+				slog.Warn("device-lease recovery: domain not definitively running or shut off — deferring reclaim, retaining lease",
+					"vm", e.ResourceID, "stage", e.Stage, "devices", addrs)
+				continue // do NOT reclaim and do NOT clear; a later pass retries once the state is definite
+			}
 			slog.Warn("device-lease recovery: reclaiming in-progress/rollback-incomplete lease", "vm", e.ResourceID, "stage", e.Stage, "devices", addrs)
-			if rerr := s.reclaimLeasedDevices(ctx, e.ResourceID, addrs, true); rerr != nil {
+			if rerr := s.reclaimLeasedDevices(ctx, e.ResourceID, addrs, mode); rerr != nil {
 				slog.Error("device-lease recovery: reclaim incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
 				continue // do NOT remove the entry; a later pass retries
 			}

@@ -35,7 +35,7 @@ func TestReclaimLeasedDevices_UnownedLeaked_Reclaims(t *testing.T) {
 	seedPCIGPU(t, s, addr, -1)
 	fs.setBound(addr)
 
-	if err := s.reclaimLeasedDevices(ctx, "vm-a", []string{addr}, false); err != nil {
+	if err := s.reclaimLeasedDevices(ctx, "vm-a", []string{addr}, reclaimNoDomain); err != nil {
 		t.Fatalf("reclaim of an unowned leaked device must succeed, got %v", err)
 	}
 	if n := fs.unbindCount(addr); n != 1 {
@@ -64,7 +64,7 @@ func TestReclaimLeasedDevices_ForeignOwned_Skips(t *testing.T) {
 	}
 	fs.setBound(addr)
 
-	if err := s.reclaimLeasedDevices(ctx, "vm-a", []string{addr}, false); err != nil {
+	if err := s.reclaimLeasedDevices(ctx, "vm-a", []string{addr}, reclaimNoDomain); err != nil {
 		t.Fatalf("reclaim skipping a foreign-owned addr must be a clean no-op, got %v", err)
 	}
 	if n := fs.unbindCount(addr); n != 0 {
@@ -111,7 +111,7 @@ func TestReclaimLeasedDevices_VMExists_DetachesFromGuestFirst(t *testing.T) {
 		var detachAtUnbind int
 		fs.onUnbind = func(string) { detachAtUnbind = fake.DetachHostdevCount() }
 
-		if err := s.reclaimLeasedDevices(ctx, "vm-a", []string{addr}, true); err != nil {
+		if err := s.reclaimLeasedDevices(ctx, "vm-a", []string{addr}, reclaimLive); err != nil {
 			t.Fatalf("reclaim with a live guest member must succeed, got %v", err)
 		}
 		if fake.DetachHostdevCount() != 1 {
@@ -147,7 +147,7 @@ func TestReclaimLeasedDevices_VMExists_DetachesFromGuestFirst(t *testing.T) {
 		// Membership can't be confirmed — DumpXML errors.
 		fake.FailDumpXML = func(string) error { return errDumpXMLBoom }
 
-		if err := s.reclaimLeasedDevices(ctx, "vm-a", []string{addr}, true); err == nil {
+		if err := s.reclaimLeasedDevices(ctx, "vm-a", []string{addr}, reclaimLive); err == nil {
 			t.Fatal("a DumpXML error during the guest detach must fail closed (return an error), got nil")
 		}
 		if n := fs.unbindCount(addr); n != 0 {

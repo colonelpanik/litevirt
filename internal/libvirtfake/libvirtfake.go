@@ -73,6 +73,9 @@ type Fake struct {
 	// exactly one libvirt hostdev attach/detach happened per member per operation.
 	attachHostdevN int
 	detachHostdevN int
+	// detachHostdevConfigN counts CONFIG-only hostdev detaches (DetachHostdevConfig) so a
+	// test can prove the shut-off reclaim took the config path, NOT the live one.
+	detachHostdevConfigN int
 
 	// Fail* hooks let scenarios inject failures into specific methods.
 	// Nil = default success.
@@ -100,11 +103,14 @@ type Fake struct {
 	SkipConfigOnHostdevMutation bool
 	// FailAttachHostdev / FailDetachHostdev inject a live hostdev hot-plug primitive
 	// failure so scenarios can exercise attach-rollback / detach-forward compensation.
-	FailAttachHostdev   func(domain, pciAddress, alias string) error
-	FailDetachHostdev   func(domain, pciAddress string) error
-	FailShutdownDomain  func(name string) error
-	FailUndefineDomain  func(name string, removeStorage bool) error
-	FailUndefinePreserv func(name string) error
+	FailAttachHostdev func(domain, pciAddress, alias string) error
+	FailDetachHostdev func(domain, pciAddress string) error
+	// FailDetachHostdevConfig injects a CONFIG-only hostdev detach failure (the
+	// shut-off reclaim path), symmetric with FailDetachHostdev for the live path.
+	FailDetachHostdevConfig func(domain, pciAddress string) error
+	FailShutdownDomain      func(name string) error
+	FailUndefineDomain      func(name string, removeStorage bool) error
+	FailUndefinePreserv     func(name string) error
 	// FailDumpXML injects a live-domain read failure so a scenario can exercise a
 	// fail-closed path that must NOT proceed when the live membership is unreadable
 	// (e.g. PCI detach recovery refusing to release without confirming the hostdev
@@ -744,6 +750,25 @@ func (f *Fake) DetachHostdev(domainName, pciAddress string) error {
 	return nil
 }
 
+// DetachHostdevConfig removes a PCI passthrough device from the PERSISTENT (inactive)
+// view ONLY — the config-only detach a shut-off domain requires. Unlike DetachHostdev it
+// never touches the live view (activeXML): there is no live instance to modify. It counts
+// separately (detachHostdevConfigN) so a test can assert the config path (not the live
+// one) was used on a shut-off domain.
+func (f *Fake) DetachHostdevConfig(domainName, pciAddress string) error {
+	if f.FailDetachHostdevConfig != nil {
+		if err := f.FailDetachHostdevConfig(domainName, pciAddress); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.xml[domainName] = removeHostdevFromDomainXML(f.xml[domainName], pciAddress)
+	f.detachHostdevConfigN++
+	f.record("detach-hostdev-config", domainName, "pci="+pciAddress)
+	return nil
+}
+
 // AttachHostdevCount / DetachHostdevCount return how many times the hostdev
 // hot-plug primitives have been invoked — test accessors for at-most-once
 // assertions.
@@ -756,6 +781,14 @@ func (f *Fake) DetachHostdevCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.detachHostdevN
+}
+
+// DetachHostdevConfigCount returns how many times the CONFIG-only hostdev detach has been
+// invoked — the shut-off reclaim path's at-most-once / config-vs-live test accessor.
+func (f *Fake) DetachHostdevConfigCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.detachHostdevConfigN
 }
 
 // hostdevAliasInDomainXML reports whether a domain XML carries a <hostdev> whose

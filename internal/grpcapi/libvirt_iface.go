@@ -63,6 +63,10 @@ type LibvirtBackend interface {
 	// the legacy SR-IOV/type path keeps using AttachHostdev (no alias).
 	AttachHostdevWithAlias(domainName, pciAddress, alias string) error
 	DetachHostdev(domainName, pciAddress string) error
+	// DetachHostdevConfig removes a PCI hostdev from a domain's PERSISTENT definition
+	// ONLY (config-flagged, no live modify) — used to reclaim a device from a SHUT-OFF
+	// domain, whose nonexistent live instance would reject a live-flagged DetachHostdev.
+	DetachHostdevConfig(domainName, pciAddress string) error
 	BlockResize(domainName, path string, sizeBytes int64) error
 	SetBootOrder(domainName, bootOrder string) error
 

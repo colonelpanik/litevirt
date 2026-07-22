@@ -116,6 +116,29 @@ func (c *Client) DetachHostdev(domainName, pciAddress string) error {
 	return c.detachDeviceXML(domainName, hd)
 }
 
+// DetachHostdevConfig removes a PCI device from a domain's PERSISTENT definition ONLY
+// (DomainDeviceModifyConfig, no Live flag). It is the counterpart to DetachHostdev for a
+// SHUT-OFF domain, whose nonexistent live instance would reject a Live-flagged modify:
+// this detaches the hostdev from the config a cold boot loads without touching a live
+// domain. Same device XML as DetachHostdev — only the modify flags differ.
+func (c *Client) DetachHostdevConfig(domainName, pciAddress string) error {
+	parsed := ParsePCIAddress(pciAddress)
+	hd := hostdevDevice{
+		Mode:    "subsystem",
+		Type:    "pci",
+		Managed: "yes",
+		Source: hostdevSource{
+			Address: hostdevAddress{
+				Domain:   parsed.Domain,
+				Bus:      parsed.Bus,
+				Slot:     parsed.Slot,
+				Function: parsed.Function,
+			},
+		},
+	}
+	return c.detachDeviceXMLConfig(domainName, hd)
+}
+
 // attachDeviceXML marshals a device to XML and attaches it via libvirt API (live + persistent).
 func (c *Client) attachDeviceXML(domainName string, device any) error {
 	dom, err := c.virt.DomainLookupByName(domainName)
@@ -146,6 +169,25 @@ func (c *Client) detachDeviceXML(domainName string, device any) error {
 	flags := uint32(golibvirt.DomainDeviceModifyLive | golibvirt.DomainDeviceModifyConfig)
 	if err := c.virt.DomainDetachDeviceFlags(dom, string(data), flags); err != nil {
 		return fmt.Errorf("detach device from %s: %w", domainName, err)
+	}
+	return nil
+}
+
+// detachDeviceXMLConfig marshals a device to XML and detaches it from a domain's
+// PERSISTENT definition ONLY (DomainDeviceModifyConfig, no Live flag) — the shut-off-safe
+// detach that never touches a live domain.
+func (c *Client) detachDeviceXMLConfig(domainName string, device any) error {
+	dom, err := c.virt.DomainLookupByName(domainName)
+	if err != nil {
+		return fmt.Errorf("lookup domain %s: %w", domainName, err)
+	}
+	data, err := xml.MarshalIndent(device, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal device XML: %w", err)
+	}
+	flags := uint32(golibvirt.DomainDeviceModifyConfig)
+	if err := c.virt.DomainDetachDeviceFlags(dom, string(data), flags); err != nil {
+		return fmt.Errorf("detach device from %s config: %w", domainName, err)
 	}
 	return nil
 }

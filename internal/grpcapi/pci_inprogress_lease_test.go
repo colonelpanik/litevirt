@@ -99,6 +99,7 @@ func TestRecoverDeviceLeases_InProgressVMExists_Reclaims(t *testing.T) {
 		t.Fatalf("assign addr to vm-a: %v", err)
 	}
 	fs.setBound(addr)
+	fake.SetState("vm-a", libvirtfake.StateRunning) // live domain running → dispRunning → LIVE reclaim
 	fake.SetActiveXML("vm-a", "<domain><name>vm-a</name><devices>"+
 		"<hostdev mode='subsystem' type='pci'><source>"+
 		"<address domain='0x0000' bus='0x00' slot='0x00' function='0x0'/></source></hostdev>"+
@@ -168,6 +169,7 @@ func TestRecoverDeviceLeases_InProgressReclaimedEvenIfMarkNeverRan(t *testing.T)
 		t.Fatalf("assign addr to vm-a: %v", err)
 	}
 	fs.setBound(addr)
+	fake.SetState("vm-a", libvirtfake.StateRunning) // live domain running → dispRunning → LIVE reclaim
 	fake.SetActiveXML("vm-a", "<domain><name>vm-a</name><devices></devices></domain>")
 
 	// The raw initial lease: Stage in_progress, never upgraded to rollback_incomplete.

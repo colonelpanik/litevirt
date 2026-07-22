@@ -175,13 +175,14 @@ func assertLeaseRollbackIncomplete(t *testing.T, s *Server, vmName string) {
 	}
 }
 
-// TestRecoverDeviceLeases_RollbackIncompleteVMExists_Reclaims (Fix B): an existing VM
-// with a rollback_incomplete lease recording a device it still owns + has bound + still
-// carries in its live guest must, at startup recovery, have that device FIRST
-// membership-detached from the guest, THEN unbound + owner-released, and the lease entry
-// removed. RED against current code: the vm!=nil branch clears the entry WITHOUT
-// releasing, so the device stays owned + bound (leaked).
-func TestRecoverDeviceLeases_RollbackIncompleteVMExists_Reclaims(t *testing.T) {
+// TestRecoverDeviceLeases_RollbackIncompleteRunning_StillLiveReclaims (FIX-30 regression,
+// adapts the FIX-29 vm-exists reclaim to the disposition enum): an existing VM whose live
+// domain is RUNNING, with a rollback_incomplete lease recording a device it still owns +
+// has bound + still carries in its live guest, must at startup recovery still take the LIVE
+// path — the device is FIRST membership-detached from the live guest, THEN unbound +
+// owner-released, and the lease entry removed. The CONFIG-only detach (the shut-off path)
+// must NOT be used for a running domain.
+func TestRecoverDeviceLeases_RollbackIncompleteRunning_StillLiveReclaims(t *testing.T) {
 	const addr = "0000:00:00.0"
 	s := hotplugDiskServer(t)
 	fs := newPCIUnbindRecordingFS()
@@ -202,6 +203,7 @@ func TestRecoverDeviceLeases_RollbackIncompleteVMExists_Reclaims(t *testing.T) {
 		t.Fatalf("assign addr to vm-a: %v", err)
 	}
 	fs.setBound(addr)
+	fake.SetState("vm-a", libvirtfake.StateRunning) // live domain running → dispRunning → LIVE reclaim
 	fake.SetActiveXML("vm-a", "<domain><name>vm-a</name><devices>"+
 		"<hostdev mode='subsystem' type='pci'><source>"+
 		"<address domain='0x0000' bus='0x00' slot='0x00' function='0x0'/></source></hostdev>"+
@@ -222,6 +224,9 @@ func TestRecoverDeviceLeases_RollbackIncompleteVMExists_Reclaims(t *testing.T) {
 
 	if fake.DetachHostdevCount() != 1 {
 		t.Fatalf("recovery must membership-detach the device from the live guest, got %d", fake.DetachHostdevCount())
+	}
+	if fake.DetachHostdevConfigCount() != 0 {
+		t.Fatalf("a running domain must use the LIVE detach, NOT the config-only path, got %d config detaches", fake.DetachHostdevConfigCount())
 	}
 	if detachAtUnbind != 1 {
 		t.Fatal("the guest detach must run BEFORE the vfio unbind (never unbind a device still in a live guest)")

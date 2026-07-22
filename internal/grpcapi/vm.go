@@ -1386,11 +1386,26 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 			// NotFound/unreachable on this peer — keep trying.
 		}
-		// No peer had it either. Clean up the stale Corrosion record.
+		// No peer had it either. Clean up the stale Corrosion record — but FIRST release any
+		// PCI devices this host still records as owned by the (now domain-less) VM. The domain
+		// can be gone out-of-band (crash mid-teardown, admin `virsh undefine`) while
+		// host_pci_devices ownership persisted; tombstoning the vms row while a device still
+		// points at this VM would leave a stale owner of a now-deleted VM — blocking every
+		// future ClaimPCIDevice CAS on that BDF forever (the exact class the main-path FIX-21
+		// gate fixed). releaseDevices is strict all-or-nothing and safe here: the domain is gone
+		// so there is no live guest — it just unbinds any still-bound host vfio + releases
+		// ownership, and is a no-op when the host owns no devices for the VM. FAIL BEFORE the
+		// tombstone on its error (retryable; never leave a stale owner or an unowned-but-bound
+		// device).
 		slog.Warn("DeleteVM: domain not found on any host — cleaning up stale record", "vm", req.Name)
+		if err := s.releaseDevices(ctx, req.Name); err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cannot clean up stale VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
+		}
 		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
 			slog.Error("failed to clean up stale VM record", "vm", req.Name, "error", err)
 		}
+		s.clearDeviceLease(req.Name)
 		return &emptypb.Empty{}, nil
 	}
 
@@ -1435,6 +1450,9 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		return nil, status.Errorf(codes.Internal,
 			"cannot delete VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
 	}
+	// Devices released → clear any lingering durable device lease so a deleted VM's
+	// devlease:<vm> entry can't linger to drive a cross-VM unbind on recovery (FIX-22).
+	s.clearDeviceLease(req.Name)
 
 	// Undefine from libvirt. With --keep-disks, KEEP firmware state too (NVRAM is
 	// name-keyed and DomainUndefineNvram would delete it — bricking the retained

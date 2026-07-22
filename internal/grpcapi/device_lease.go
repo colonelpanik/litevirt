@@ -17,6 +17,20 @@ const deviceLeaseKind = "device_lease"
 
 func deviceLeaseOpID(vmName string) string { return "devlease:" + vmName }
 
+// clearDeviceLease removes any lingering durable PCI device lease for vmName. Called
+// after a VM's devices have been released on delete so a deleted VM's devlease:<vm> entry
+// can never linger and later drive RecoverDeviceLeases to unbind a BDF the VM's address
+// has since been legitimately reclaimed for. Tolerant of a missing entry / absent journal
+// (opJournal.Remove is a no-op for a not-found entry).
+func (s *Server) clearDeviceLease(vmName string) {
+	if s.opJournal == nil {
+		return
+	}
+	if err := s.opJournal.Remove(deviceLeaseOpID(vmName)); err != nil {
+		slog.Warn("device lease: clear on delete", "vm", vmName, "error", err)
+	}
+}
+
 // beginDeviceLease durably records the devices an allocation has claimed for
 // vmName, BEFORE the irreversible vfio bind, so a crash before the VM row is
 // finalized can be rolled back at startup (RecoverDeviceLeases). It is gated by
@@ -76,13 +90,43 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 			continue
 		}
 		if vm == nil {
-			// Orphaned: the VM was never finalized — roll back the leaked devices with the
-			// strict all-or-nothing primitive. If a member cannot be confirmed unbound it
-			// releases NOTHING and returns an error: RETAIN the journal entry so the next
-			// recovery pass retries, rather than removing it over a device still bound to
-			// vfio-pci (which would silently orphan it unowned-but-bound with no backstop).
-			slog.Warn("device-lease recovery: rolling back orphaned lease", "vm", e.ResourceID, "devices", addrs)
-			if rerr := s.unbindAndReleaseOwnership(ctx, e.ResourceID, addrs); rerr != nil {
+			// Orphaned: the VM was never finalized — roll back the leaked devices. But
+			// unbindAndReleaseOwnership's UNBIND is ownership-BLIND (it unbinds any addr the
+			// vfio ground truth reports bound; only the DB release is owner-scoped), so we must
+			// FIRST partition the recorded addrs by current ownership. A lingering orphan lease
+			// whose BDF was since legitimately reclaimed + bound by a DIFFERENT live VM must NOT
+			// be unbound here — that would tear down the reclaiming VM's live passthrough. Only
+			// addrs still owned by THIS dead VM (or genuinely unowned) are ours to reclaim.
+			owners := map[string]string{}
+			if devs, lerr := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); lerr == nil {
+				for _, d := range devs {
+					owners[d.Address] = d.VMName
+				}
+			} else {
+				// Cannot prove ownership → fail closed: RETAIN the entry rather than unbind
+				// blind. A later pass retries once the read succeeds.
+				slog.Error("device-lease recovery: ownership read failed — retaining lease for retry", "vm", e.ResourceID, "error", lerr)
+				continue
+			}
+			var releasable []string
+			for _, addr := range addrs {
+				switch owner := owners[addr]; owner {
+				case e.ResourceID, "":
+					releasable = append(releasable, addr) // ours to reclaim (owned by this dead VM or unowned)
+				default:
+					// Reclaimed by another live VM — not ours to touch. Skip (leave it bound).
+					slog.Warn("device-lease recovery: BDF reclaimed by another VM — skipping unbind (not ours)",
+						"orphan_vm", e.ResourceID, "address", addr, "current_owner", owner)
+				}
+			}
+			// Release the owned subset with the strict all-or-nothing primitive. If a member
+			// cannot be confirmed unbound it releases NOTHING and returns an error: RETAIN the
+			// journal entry so the next recovery pass retries, rather than removing it over a
+			// device still bound to vfio-pci (which would silently orphan it unowned-but-bound
+			// with no backstop). An empty releasable set (everything was reclaimed by others) is
+			// a clean no-op → the entry is cleared below.
+			slog.Warn("device-lease recovery: rolling back orphaned lease", "vm", e.ResourceID, "devices", releasable)
+			if rerr := s.unbindAndReleaseOwnership(ctx, e.ResourceID, releasable); rerr != nil {
 				slog.Error("device-lease recovery: release incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
 				continue // do NOT remove the entry; a later pass retries
 			}

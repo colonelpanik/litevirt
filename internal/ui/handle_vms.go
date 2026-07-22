@@ -27,19 +27,38 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	vm, err := s.grpc.InspectVM(s.uiBearerCtx(r), &pb.InspectVMRequest{Name: name})
+	ctx := s.uiBearerCtx(r)
+	vm, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name})
 	if err != nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
-	hosts, _ := s.grpc.ListHosts(s.uiBearerCtx(r), &pb.ListHostsRequest{})
-	snapshots, _ := s.grpc.ListSnapshots(s.uiBearerCtx(r), &pb.ListSnapshotsRequest{VmName: name})
+	hosts, _ := s.grpc.ListHosts(ctx, &pb.ListHostsRequest{})
+	snapshots, _ := s.grpc.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VmName: name})
 	data := s.pageData(name, "vms")
 	data["VM"] = vm
 	data["Hosts"] = hosts.GetHosts()
 	data["Snapshots"] = snapshots.GetSnapshots()
 	data["Backups"] = s.vmBackupManifests(name)
 	data["Activity"] = s.vmActivity(r, name)
+
+	// ?tab=hardware server-renders the Hardware tab body on a full page load,
+	// not only via the htmx fragment route (handleVMHardwareTab below) — it
+	// reuses that exact same fragment template so there's one source of truth
+	// for the Hardware tab markup.
+	tab := r.URL.Query().Get("tab")
+	data["Tab"] = tab
+	if tab == "hardware" {
+		if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
+			networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+			data["HardwareTab"] = s.renderHardwareTabFragment(map[string]any{
+				"VM": name, "Devices": hw.GetDevices(),
+				"AdoptionState": hw.GetHardwareAdoptionState(),
+				"AdoptionError": hw.GetHardwareAdoptionError(),
+				"Networks":      networks.GetNetworks(),
+			})
+		}
+	}
 	s.renderPage(w, "vm_detail.html", data)
 }
 
@@ -79,6 +98,29 @@ func (s *Server) handleVMDetailPartial(w http.ResponseWriter, r *http.Request) {
 	s.renderPartial(w, "vm_detail.html", "vm_detail_inner", map[string]any{
 		"VM": vm, "Snapshots": snapshots.GetSnapshots(), "Backups": s.vmBackupManifests(name),
 		"Activity": s.vmActivity(r, name), "ClusterName": s.cluster,
+	})
+}
+
+// handleVMHardwareTab renders the Hardware tab fragment: the typed disk/NIC/PCI
+// device table from ListVMHardware, plus per-type add forms and
+// per-row detach controls that POST to the existing attach/detach handlers.
+// When the VM's PCI adoption state is "blocked", the template renders a
+// banner with the reason and omits the mutation forms instead.
+func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ctx := s.uiBearerCtx(r)
+	resp, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name})
+	if err != nil {
+		http.Error(w, "VM not found", 404)
+		return
+	}
+	networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	s.renderFragment(w, "hardware_tab.html", map[string]any{
+		"VM":            name,
+		"Devices":       resp.GetDevices(),
+		"AdoptionState": resp.GetHardwareAdoptionState(),
+		"AdoptionError": resp.GetHardwareAdoptionError(),
+		"Networks":      networks.GetNetworks(),
 	})
 }
 
@@ -590,12 +632,11 @@ func (s *Server) handleEditVMModal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "VM not found", 404)
 		return
 	}
-	networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	// Disks/NICs/PCI are managed exclusively via the Hardware tab now (Task
+	// 8.3); the modal only needs the VM itself for its Resources/Lifecycle
+	// panes and the "Manage hardware" link.
 	s.renderFragment(w, "vm_edit_modal.html", map[string]any{
-		"VM":         vm,
-		"Disks":      vm.GetDisks(),
-		"Interfaces": vm.GetInterfaces(),
-		"Networks":   networks.GetNetworks(),
+		"VM": vm,
 	})
 }
 

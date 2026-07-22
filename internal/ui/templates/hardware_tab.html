@@ -1,0 +1,176 @@
+<div id="vm-hardware-tab">
+  {{if eq .AdoptionState "blocked"}}
+  <div class="alert alert-error">
+    <strong>Hardware changes disabled</strong> &mdash; PCI adoption is blocked: {{.AdoptionError}}
+  </div>
+  {{end}}
+
+  <div class="section">
+    <div class="section-header"><h2>{{icon "disk"}} Disks</h2></div>
+    <table>
+      <thead><tr><th>Target</th><th>Bus</th><th>Controller</th><th>Size</th><th>Storage</th><th>State</th>{{if ne .AdoptionState "blocked"}}<th></th>{{end}}</tr></thead>
+      <tbody>
+      {{range .Devices}}{{with .GetDisk}}
+      <tr>
+        <td class="mono">{{.Target}}</td>
+        <td>{{.Bus}}</td>
+        <td>{{if .ControllerModel}}{{.ControllerModel}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+        <td>{{formatBytes .SizeBytes}}</td>
+        <td>{{.StorageType}}{{if .StorageVolume}} / {{.StorageVolume}}{{end}}</td>
+        <td><span class="badge badge-gray">{{.State}}</span></td>
+        {{if ne $.AdoptionState "blocked"}}
+        <td>
+          <form hx-post="/ui/vms/{{$.VM}}/detach-disk" hx-swap="none"
+                hx-on::after-request="if(event.detail.successful){htmx.ajax('GET','/ui/vms/{{$.VM}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}"
+                hx-confirm="Detach disk {{.DeviceId}}?">
+            <input type="hidden" name="disk_name" value="{{.DeviceId}}">
+            <button type="submit" class="btn btn-sm btn-danger">Detach</button>
+          </form>
+        </td>
+        {{end}}
+      </tr>
+      {{end}}{{end}}
+      </tbody>
+    </table>
+
+    {{if ne .AdoptionState "blocked"}}
+    <form hx-post="/ui/vms/{{.VM}}/attach-disk" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){htmx.ajax('GET','/ui/vms/{{.VM}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}"
+          style="margin-top:12px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <div class="form-row" style="margin-bottom:0">
+        <label>Name</label>
+        <input type="text" name="name" placeholder="data0" required>
+      </div>
+      <div class="form-row" style="margin-bottom:0">
+        <label>Size (GiB)</label>
+        <input type="number" name="size_gib" value="10" min="1" required>
+      </div>
+      <div class="form-row" style="margin-bottom:0">
+        <label>Bus</label>
+        <select name="bus">
+          <option value="virtio">virtio</option>
+          <option value="scsi">scsi</option>
+          <option value="sata">sata</option>
+        </select>
+      </div>
+      <button type="submit" class="btn btn-sm">Attach Disk</button>
+    </form>
+    {{end}}
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h2>{{icon "network"}} Network Interfaces</h2></div>
+    <table>
+      <thead><tr><th>MAC</th><th>Network</th><th>Model</th><th>Ordinal</th><th>Security groups</th><th>State</th>{{if ne .AdoptionState "blocked"}}<th></th>{{end}}</tr></thead>
+      <tbody>
+      {{range .Devices}}{{with .GetNic}}
+      <tr>
+        <td class="mono">{{.Mac}}</td>
+        <td>{{.Network}}</td>
+        <td>{{.Model}}</td>
+        <td>{{.Ordinal}}</td>
+        <td>{{if .SecurityGroups}}{{.SecurityGroups}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+        <td><span class="badge badge-gray">{{.State}}</span></td>
+        {{if ne $.AdoptionState "blocked"}}
+        <td>
+          <form hx-post="/ui/vms/{{$.VM}}/detach-nic" hx-swap="none"
+                hx-on::after-request="if(event.detail.successful){htmx.ajax('GET','/ui/vms/{{$.VM}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}"
+                hx-confirm="Detach NIC {{.Mac}}?">
+            <input type="hidden" name="nic_mac" value="{{.Mac}}">
+            <button type="submit" class="btn btn-sm btn-danger">Detach</button>
+          </form>
+        </td>
+        {{end}}
+      </tr>
+      {{end}}{{end}}
+      </tbody>
+    </table>
+
+    {{if ne .AdoptionState "blocked"}}
+    <form hx-post="/ui/vms/{{.VM}}/attach-nic" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){htmx.ajax('GET','/ui/vms/{{.VM}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}"
+          style="margin-top:12px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <div class="form-row" style="margin-bottom:0">
+        <label>Bridge</label>
+        <select name="bridge" required>
+          <option value="" disabled selected>Select network...</option>
+          {{range .Networks}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+        </select>
+      </div>
+      <div class="form-row" style="margin-bottom:0">
+        <label>Model</label>
+        <select name="model">
+          <option value="virtio">virtio</option>
+          <option value="e1000">e1000</option>
+          <option value="rtl8139">rtl8139</option>
+        </select>
+      </div>
+      <button type="submit" class="btn btn-sm">Attach NIC</button>
+    </form>
+    {{end}}
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h2>PCI Devices</h2></div>
+    <table>
+      <thead><tr><th>Device</th><th>Selector</th><th>Members</th><th>State</th>{{if ne .AdoptionState "blocked"}}<th></th>{{end}}</tr></thead>
+      <tbody>
+      {{range .Devices}}{{with .GetPci}}
+      <tr>
+        <td class="mono">{{.DeviceId}}</td>
+        <td>{{.SelectorKind}}</td>
+        <td>
+          {{if .Members}}{{range .Members}}<div class="mono" style="font-size:11px">{{.ResolvedAddress}}{{if .XmlAlias}} ({{.XmlAlias}}){{end}}</div>{{end}}{{else}}{{with .Desired}}{{if .Address}}<div class="mono" style="font-size:11px">{{.Address}} <span class="muted">(reserved)</span></div>{{else}}<span class="muted">&mdash;</span>{{end}}{{else}}<span class="muted">&mdash;</span>{{end}}{{end}}
+        </td>
+        <td><span class="badge {{if eq .State "reserved"}}badge-blue{{else}}badge-gray{{end}}">{{.State}}</span></td>
+        {{if ne $.AdoptionState "blocked"}}
+        <td>
+          {{/* One detach action per PCI device, keyed by the intent's primary
+               address (Desired.Address == the ExclusiveKey detach matches, see
+               liveAddressIntent). Falls back to the first realized member when
+               Desired carries no address (e.g. an undecodable selector payload).
+               Rendered OUTSIDE the members loop so a 0-member reserved device is
+               still detachable and an IOMMU group shows exactly one button, not
+               one-per-member (sibling addresses do not match the intent). */}}
+          {{$detachAddr := ""}}{{with .Desired}}{{$detachAddr = .Address}}{{end}}{{if not $detachAddr}}{{range .Members}}{{if not $detachAddr}}{{$detachAddr = .ResolvedAddress}}{{end}}{{end}}{{end}}
+          {{if $detachAddr}}
+          <form hx-post="/ui/vms/{{$.VM}}/detach-pci" hx-swap="none"
+                hx-on::after-request="if(event.detail.successful){htmx.ajax('GET','/ui/vms/{{$.VM}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}"
+                hx-confirm="Detach PCI device {{$detachAddr}}?">
+            <input type="hidden" name="pci_address" value="{{$detachAddr}}">
+            <button type="submit" class="btn btn-sm btn-danger">Detach</button>
+          </form>
+          {{end}}
+        </td>
+        {{end}}
+      </tr>
+      {{end}}{{end}}
+      </tbody>
+    </table>
+
+    {{if ne .AdoptionState "blocked"}}
+    <form hx-post="/ui/vms/{{.VM}}/attach-pci" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){htmx.ajax('GET','/ui/vms/{{.VM}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}"
+          style="margin-top:12px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <div class="form-row" style="margin-bottom:0">
+        <label>Type</label>
+        <select name="type">
+          <option value="gpu">GPU</option>
+          <option value="nic">NIC</option>
+          <option value="nvme">NVMe</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="form-row" style="margin-bottom:0">
+        <label>Address</label>
+        <input type="text" name="address" placeholder="0000:41:00.0" required>
+      </div>
+      <button type="submit" class="btn btn-sm">Attach PCI Device</button>
+    </form>
+    {{end}}
+  </div>
+
+  {{if not .Devices}}
+  <div style="padding:16px"><span class="muted">No hardware devices recorded for this VM yet.</span></div>
+  {{end}}
+</div>

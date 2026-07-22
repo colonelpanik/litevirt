@@ -94,6 +94,22 @@ type DiskRecord struct {
 	// of (empty for normal/full-clone disks). Used to refcount-guard the
 	// source template/snapshot and host-pin local-storage linked clones.
 	BackingDisk string
+	// Bus is the libvirt disk bus (virtio, scsi, sata, ide, usb). Empty for
+	// disks created before v42 (schema default is SQL NULL); the domain
+	// generator falls back to its historical bus-inference logic when empty.
+	Bus string
+	// DeviceKind distinguishes a disk-shaped device from a hostdev-shaped one
+	// (e.g. "disk" vs "cdrom"). Defaults to "disk" at both the DB column
+	// default and here in Go so callers that don't set it get the historical
+	// behavior.
+	DeviceKind string
+	// DeleteWithVM controls whether the backing file is removed when the VM
+	// is deleted (vs. detached-and-kept, e.g. an adopted/foreign disk).
+	DeleteWithVM bool
+	// ControllerModel is the optional libvirt controller model override for
+	// this disk's bus (e.g. "virtio-scsi"). Empty defers to libvirt/domain
+	// defaults.
+	ControllerModel string
 }
 
 // projectOrDefault normalises an empty project string to "_default"
@@ -105,8 +121,36 @@ func projectOrDefault(p string) string {
 	return p
 }
 
-// InsertVM creates a new VM record with its interfaces and disks.
+// InsertVM creates a new VM record with its interfaces and disks. It is
+// InsertVMWithHardware with no NIC/PCI-intent rows and adopt=false — kept as a
+// separate, unchanged-signature entry point so the ~350 existing fixture-only
+// callers across the tree (tests that just need a VM row to exist) don't need
+// a mechanical signature-widening edit for a hardware-table concern they don't
+// exercise. Its real producer-path callers (Clone/import/promote/live-restore)
+// pass no hardware here even though they may have written real vm_interfaces
+// rows elsewhere, so adopt=false leaves hardware_adoption_state at its schema
+// default 'pending' for the Phase-6 backfill audit to reconcile.
 func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord) error {
+	return InsertVMWithHardware(ctx, c, vm, ifaces, disks, nil, nil, false)
+}
+
+// InsertVMWithHardware is InsertVM extended to also write the v42 typed-hardware
+// tables (vm_nics, vm_pci_intent) and, when adopt is true, set the VM's
+// hardware-adoption state to "adopted" — all in the SAME atomic batch as the
+// vms/vm_interfaces/vm_disks inserts. CreateVM passes adopt=true: it has just
+// recorded this VM's complete hardware (possibly an empty set, which for a VM
+// with no NICs and no PCI devices IS the complete/accurate set) in this same
+// transaction, so there is nothing left for the backfill audit to reconcile.
+// Every other caller passes adopt=false and leaves hardware_adoption_state at
+// its schema default 'pending', since it either supplies no hardware at all
+// (the bare InsertVM wrapper) or is a producer path whose hardware this call
+// doesn't fully account for — the Phase-6 backfill audit reconciles those.
+//
+// The vm_nics/vm_pci_intent statements reuse the EXACT shapes UpsertNIC/
+// UpsertPCIIntent already register (see hardware.go), and the adoption update
+// reuses SetHardwareAdoptionState's exact UPDATE shape — no new replicated
+// statement shape is introduced.
+func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, pciIntents []PCIIntentRecord, adopt bool) error {
 	now := nowRFC3339() // created_at (bare)
 	uts := c.NowTS()    // updated_at (monotonic LWW key)
 
@@ -154,6 +198,44 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 				disk.VMName, disk.DiskName, disk.HostName, disk.Path, disk.SizeBytes,
 				disk.BackingImage, disk.StorageType, disk.StorageVolume, disk.TargetDev, nullIfEmpty(disk.BackingDisk), uts,
 			},
+		})
+	}
+
+	for _, nic := range nics {
+		model := nic.Model
+		if model == "" {
+			model = "virtio"
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT OR REPLACE INTO vm_nics
+			 (vm_name, id, network_name, model, mac, ordinal, ip, tap_device, security_groups, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			Params: []interface{}{
+				nic.VMName, nic.ID, nic.NetworkName, model, nic.MAC, nic.Ordinal,
+				nullIfEmpty(nic.IP), nullIfEmpty(nic.TapDevice), nullIfEmpty(nic.SecurityGroups), uts,
+			},
+		})
+	}
+
+	for _, in := range pciIntents {
+		var exclusiveKey interface{}
+		if in.ExclusiveKey != nil {
+			exclusiveKey = *in.ExclusiveKey
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT OR REPLACE INTO vm_pci_intent
+			 (vm_name, device_id, host_name, selector_kind, selector_payload, exclusive_key, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+			Params: []interface{}{
+				in.VMName, in.DeviceID, in.HostName, in.SelectorKind, in.SelectorPayload, exclusiveKey, uts,
+			},
+		})
+	}
+
+	if adopt {
+		stmts = append(stmts, Statement{
+			SQL:    `UPDATE vms SET hardware_adoption_state = ?, hardware_adoption_error = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{"adopted", nullIfEmpty(""), uts, vm.Name},
 		})
 	}
 
@@ -375,7 +457,11 @@ func GetVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, er
 	rows, err := c.Query(ctx,
 		`SELECT vm_name, disk_name, host_name, path, size_bytes,
 			backing_image, storage_type, storage_volume, target_dev,
-			COALESCE(backing_disk, '') AS backing_disk
+			COALESCE(backing_disk, '') AS backing_disk,
+			COALESCE(bus, '') AS bus,
+			COALESCE(device_kind, 'disk') AS device_kind,
+			COALESCE(delete_with_vm, 1) AS delete_with_vm,
+			COALESCE(controller_model, '') AS controller_model
 		 FROM vm_disks WHERE vm_name = ? AND deleted_at IS NULL`, vmName)
 	if err != nil {
 		return nil, err
@@ -384,16 +470,20 @@ func GetVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, er
 	disks := make([]DiskRecord, len(rows))
 	for i, r := range rows {
 		disks[i] = DiskRecord{
-			VMName:        r.String("vm_name"),
-			DiskName:      r.String("disk_name"),
-			HostName:      r.String("host_name"),
-			Path:          r.String("path"),
-			SizeBytes:     r.Int64("size_bytes"),
-			BackingImage:  r.String("backing_image"),
-			StorageType:   r.String("storage_type"),
-			StorageVolume: r.String("storage_volume"),
-			TargetDev:     r.String("target_dev"),
-			BackingDisk:   r.String("backing_disk"),
+			VMName:          r.String("vm_name"),
+			DiskName:        r.String("disk_name"),
+			HostName:        r.String("host_name"),
+			Path:            r.String("path"),
+			SizeBytes:       r.Int64("size_bytes"),
+			BackingImage:    r.String("backing_image"),
+			StorageType:     r.String("storage_type"),
+			StorageVolume:   r.String("storage_volume"),
+			TargetDev:       r.String("target_dev"),
+			BackingDisk:     r.String("backing_disk"),
+			Bus:             r.String("bus"),
+			DeviceKind:      r.String("device_kind"),
+			DeleteWithVM:    r.Int("delete_with_vm") == 1,
+			ControllerModel: r.String("controller_model"),
 		}
 	}
 	return disks, nil
@@ -406,6 +496,33 @@ func SetVMTemplate(ctx context.Context, c *Client, name string, isTemplate bool)
 	return c.Execute(ctx,
 		`UPDATE vms SET is_template = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
 		boolToInt(isTemplate), now, name)
+}
+
+// SetHardwareAdoptionState updates a VM's hardware-adoption state and, when
+// blocked, the human-readable reason. errReason "" clears any prior reason
+// (e.g. on a transition back to a non-blocked state).
+func SetHardwareAdoptionState(ctx context.Context, c *Client, vmName, state, errReason string) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`UPDATE vms SET hardware_adoption_state = ?, hardware_adoption_error = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
+		state, nullIfEmpty(errReason), now, vmName)
+}
+
+// GetHardwareAdoptionState returns a VM's hardware-adoption state and error
+// reason (COALESCEd to "" when unset).
+func GetHardwareAdoptionState(ctx context.Context, c *Client, vmName string) (state, errReason string, err error) {
+	rows, qerr := c.Query(ctx,
+		`SELECT hardware_adoption_state,
+			COALESCE(hardware_adoption_error, '') AS hardware_adoption_error
+		 FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName)
+	if qerr != nil {
+		return "", "", qerr
+	}
+	if len(rows) == 0 {
+		return "", "", nil
+	}
+	r := rows[0]
+	return r.String("hardware_adoption_state"), r.String("hardware_adoption_error"), nil
 }
 
 // LinkedCloneNames returns the names of VMs that have a disk which is a
@@ -639,7 +756,13 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 	)
 }
 
-// DeleteVM tombstones a VM and its interfaces/disks.
+// DeleteVM tombstones a VM and its interfaces/disks, plus the v42 hardware
+// tables (vm_nics, vm_pci_intent, vm_pci_realizations) — mirroring the
+// vm_interfaces/vm_disks bulk tombstone: vm_name is not the whole PK on any of
+// these tables, so the WHERE vm_name = ? bulk form is applied by per-row LWW
+// expansion on apply (safe because each statement binds updated_at). This does
+// NOT release any host_pci_devices ownership/vfio-unbind lease — that is the
+// grpcapi DeleteVM handler's releaseDevices call, out of scope here.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()     // LWW key (updated_at)
 	wall := nowRFC3339() // deleted_at is a wall/display column, never the HLC key
@@ -647,6 +770,9 @@ func DeleteVM(ctx context.Context, c *Client, name string) error {
 		{SQL: `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{wall, now, name}},
 		{SQL: `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
 		{SQL: `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+		{SQL: `UPDATE vm_nics SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+		{SQL: `UPDATE vm_pci_intent SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+		{SQL: `UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
 	})
 }
 
@@ -688,6 +814,40 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 		stmts = append(stmts, Statement{SQL: `UPDATE vm_disks SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND disk_name = ?`,
 			Params: []interface{}{newName, now, oldName, r.String("pk")}})
 	}
+	// vm_nics keys on (vm_name, id), but unlike vm_interfaces/vm_disks its id is itself
+	// DERIVED from vm_name (DeterministicNICID(vmName, mac)) — a rename must therefore
+	// RE-DERIVE id too, not just carry the row's old id forward under the new vm_name.
+	nics, err := c.Query(ctx, `SELECT id AS pk, mac FROM vm_nics WHERE vm_name = ?`, oldName)
+	if err != nil {
+		return err
+	}
+	for _, r := range nics {
+		newID := DeterministicNICID(newName, r.String("mac"))
+		stmts = append(stmts, Statement{SQL: `UPDATE vm_nics SET vm_name = ?, id = ?, updated_at = ? WHERE vm_name = ? AND id = ?`,
+			Params: []interface{}{newName, newID, now, oldName, r.String("pk")}})
+	}
+	// vm_pci_intent keys on (vm_name, device_id); device_id is name-INDEPENDENT by design
+	// (DeterministicPCIIntentID takes no vmName) so it is PRESERVED here — only vm_name is
+	// rekeyed. This is what lets the hardware-adoption audit's unconditional re-derive
+	// converge onto this same row after a rename instead of forking a duplicate.
+	pciIntents, err := c.Query(ctx, `SELECT device_id AS pk FROM vm_pci_intent WHERE vm_name = ?`, oldName)
+	if err != nil {
+		return err
+	}
+	for _, r := range pciIntents {
+		stmts = append(stmts, Statement{SQL: `UPDATE vm_pci_intent SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND device_id = ?`,
+			Params: []interface{}{newName, now, oldName, r.String("pk")}})
+	}
+	// vm_pci_realizations keys on (vm_name, device_id, member_id); device_id/member_id are
+	// likewise name-independent, so both are PRESERVED — only vm_name is rekeyed.
+	pciRealizations, err := c.Query(ctx, `SELECT device_id, member_id FROM vm_pci_realizations WHERE vm_name = ?`, oldName)
+	if err != nil {
+		return err
+	}
+	for _, r := range pciRealizations {
+		stmts = append(stmts, Statement{SQL: `UPDATE vm_pci_realizations SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND device_id = ? AND member_id = ?`,
+			Params: []interface{}{newName, now, oldName, r.String("device_id"), r.String("member_id")}})
+	}
 	// ip_allocations keys on (network, ip); vm_name is a NON-PK column here, so this stays a
 	// bulk update — per-row LWW expansion handles it safely on apply.
 	stmts = append(stmts, Statement{SQL: `UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,
@@ -707,13 +867,19 @@ func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip
 // InsertDisk adds a single disk record (used by hot-plug attach).
 func InsertDisk(ctx context.Context, c *Client, d DiskRecord) error {
 	now := c.NowTS()
+	deviceKind := d.DeviceKind
+	if deviceKind == "" {
+		deviceKind = "disk" // matches the vm_disks.device_kind column default
+	}
 	return c.Execute(ctx,
 		`INSERT OR REPLACE INTO vm_disks
 		 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
-		  storage_type, storage_volume, target_dev, backing_disk, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		  storage_type, storage_volume, target_dev, backing_disk,
+		  bus, device_kind, delete_with_vm, controller_model, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		d.VMName, d.DiskName, d.HostName, d.Path, d.SizeBytes, d.BackingImage,
-		d.StorageType, d.StorageVolume, d.TargetDev, d.BackingDisk, now)
+		d.StorageType, d.StorageVolume, d.TargetDev, d.BackingDisk,
+		nullIfEmpty(d.Bus), deviceKind, boolToInt(d.DeleteWithVM), nullIfEmpty(d.ControllerModel), now)
 }
 
 // UpdateDiskHostAndPath updates the host and path for a disk after migration.

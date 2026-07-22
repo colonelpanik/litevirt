@@ -82,6 +82,12 @@ message ListVMsRequest   { string stack_name = 1; string host_name = 2;
     int32 page_size = 4; string page_token = 5; }
 message ListVMsResponse  { repeated VM vms = 1; string next_page_token = 2; }
 message InspectVMRequest { string name = 1; }
+message ListVMHardwareRequest  { string vm_name = 1; }
+message ListVMHardwareResponse {
+    repeated HardwareDevice devices = 1;
+    string hardware_adoption_state = 2;  // pending | adopted | blocked
+    string hardware_adoption_error = 3;  // reason when blocked
+}
 message StartVMRequest   { string name = 1; }
 message StopVMRequest    { string name = 1; bool force = 2; int32 timeout = 3; }
 message RestartVMRequest { string name = 1; }
@@ -1752,6 +1758,7 @@ service LiteVirt {
     rpc CreateVM(CreateVMRequest)     returns (VM);
     rpc ListVMs(ListVMsRequest)       returns (ListVMsResponse);
     rpc InspectVM(InspectVMRequest)   returns (VM);
+    rpc ListVMHardware(ListVMHardwareRequest) returns (ListVMHardwareResponse);
     rpc StartVM(StartVMRequest)       returns (VM);
     rpc StopVM(StopVMRequest)         returns (VM);
     rpc RestartVM(RestartVMRequest)   returns (VM);

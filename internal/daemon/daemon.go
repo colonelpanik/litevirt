@@ -634,9 +634,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetRealmRegistry(d.realmRegistry)
 	vmChecker.SetEventBus(svc.EventBus())
 	vmChecker.SetMigrateFunc(svc.MigrateVMForHealthCheck)
+	// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
+	// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
+	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
+	// this changes nothing on a fleet where the feature is off.
+	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
+	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
@@ -674,6 +680,33 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// retries stragglers.
 	svc.RecoverResourceOperations(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
+
+	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
+	// nonterminal device_attach/device_detach operation (a hot-plug that crashed
+	// with the mutation barrier held) — roll an incomplete attach BACK and a detach
+	// FORWARD to a single consistent state, clearing the barrier. Runs synchronously
+	// after DB + libvirt + journal init (uses the host-local journal artifacts), and
+	// a reconciler pass retries stragglers.
+	svc.RecoverHardwareOperations(ctx)
+	go svc.RunHardwareOperationRecovery(ctx)
+
+	// v42 hardware foundation (CONTRACT h): backfill the typed-hardware tables
+	// (vm_nics, vm_disks.bus, vm_pci_intent) and record each owned VM's adoption
+	// verdict, THEN mark this node hardware_v2-advertise-ready. Runs SYNCHRONOUSLY
+	// here — AFTER the schema is applied (InitSchema, above) and the
+	// operation-protocol config/latch is wired (hardware mutations depend on the
+	// crash-safe operation journal), and BEFORE the gRPC server begins serving Ping
+	// (below) — so no peer can read this node's advertised capabilities until the
+	// backfill has set the readiness flag advertisedCapabilities gates hardware_v2
+	// on. A backfill error DEGRADES (logged; the node simply keeps withholding
+	// hardware_v2 until a later attempt succeeds) rather than crashing the daemon.
+	if err := svc.BackfillHardwareTables(ctx); err != nil {
+		slog.Error("hardware backfill failed; node will not advertise hardware_v2 until it succeeds", "error", err)
+	}
+	// Continuous legacy→vm_nics bridge: mirrors vm_interfaces writes an OLD peer
+	// makes during the rolling-upgrade window into vm_nics (one-directional; old
+	// peers ignore vm_nics), converging the read overlay toward vm_nics completeness.
+	go svc.RunHardwareBridge(ctx)
 
 	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
 	// for cluster-wide capability confirmation) and every reconciler/vmChecker

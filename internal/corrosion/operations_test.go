@@ -43,6 +43,14 @@ func TestReduceOperationState(t *testing.T) {
 		{"rollback completed, no terminal", OpDeviceLease,
 			[]string{OpStepPlanned, OpStepReserved, OpStepRollbackCompleted}, OpStepRollbackCompleted, false},
 		{"empty", OpRestart, nil, "", false},
+		{"device_attach furthest happy-path", OpDeviceAttach,
+			[]string{OpStepPlanned, OpStepReserved, OpStepClaimed, OpStepBound, OpStepAttached}, OpStepAttached, false},
+		{"device_attach completed dominates", OpDeviceAttach,
+			[]string{OpStepPlanned, OpStepReserved, OpStepClaimed, OpStepBound, OpStepAttached, OpStepCompleted}, OpStepCompleted, false},
+		{"device_detach furthest happy-path", OpDeviceDetach,
+			[]string{OpStepPlanned, OpStepReserved, OpStepAttached}, OpStepAttached, false},
+		{"device_detach completed dominates", OpDeviceDetach,
+			[]string{OpStepPlanned, OpStepReserved, OpStepAttached, OpStepCompleted}, OpStepCompleted, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -63,6 +71,21 @@ func TestIsLegalStep(t *testing.T) {
 	}
 	if !IsLegalStep(OpResourceUpdateRunning, OpStepFailed) {
 		t.Error("failed is a legal terminal for any kind")
+	}
+	if !IsLegalStep(OpDeviceAttach, OpStepAttached) {
+		t.Error("attached is legal for device_attach")
+	}
+	if !IsLegalStep(OpDeviceDetach, OpStepAttached) {
+		t.Error("attached is legal for device_detach")
+	}
+	if IsLegalStep(OpDeviceDetach, OpStepBound) {
+		t.Error("bound is NOT a device_detach step")
+	}
+	if !IsOperationKind(OpDeviceAttach) {
+		t.Error("device_attach must be a recognized operation kind")
+	}
+	if !IsOperationKind(OpDeviceDetach) {
+		t.Error("device_detach must be a recognized operation kind")
 	}
 }
 

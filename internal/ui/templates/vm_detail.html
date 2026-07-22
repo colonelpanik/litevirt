@@ -77,6 +77,14 @@
   </div>
   {{end}}
 
+  <div class="tabs">
+    <a href="/vms/{{.VM.Name}}" class="tab {{if ne .Tab "hardware"}}active{{end}}">Overview</a>
+    <a href="/vms/{{.VM.Name}}?tab=hardware" class="tab {{if eq .Tab "hardware"}}active{{end}}"
+       hx-get="/ui/vms/{{.VM.Name}}/tab/hardware" hx-target="#vm-hardware-tab-region" hx-swap="innerHTML"
+       hx-push-url="/vms/{{.VM.Name}}?tab=hardware">Hardware</a>
+  </div>
+  <div id="vm-hardware-tab-region">{{if .HardwareTab}}{{.HardwareTab}}{{end}}</div>
+
   {{template "vm_detail_inner" .}}
 </div>
 {{end}}

@@ -34,12 +34,20 @@ VMs can be started, stopped, restarted, and deleted directly from the UI.
 
 ### Editing VMs
 
-An edit modal is accessible from the VM detail page. It has four tabs:
+An edit modal is accessible from the VM detail page for resource and lifecycle
+settings -- **Resources** (CPU, memory, disable VNC; requires the VM to be
+stopped) and **Lifecycle & Boot** (restart policy, onboot, startup order, boot
+order). It links to the VM's **Hardware** tab for disks, NICs, and PCI
+devices rather than editing them itself.
 
-- **Resources** (CPU, memory, disable VNC) -- requires the VM to be stopped.
-- **Disks** -- add or remove disks. Hotplug works on running VMs.
-- **NICs** -- add or remove network interfaces. Hotplug works on running VMs.
-- **PCI devices** -- add or remove PCI passthrough devices. The type selector loads available devices from the selected host.
+### Hardware Tab
+
+The per-VM Hardware tab (`/vms/{name}?tab=hardware`) is the single place to
+add, remove, or inspect disks, NICs, and PCI passthrough devices, on running
+and stopped VMs alike. Hotplug works for disks and NICs on running VMs. This
+tab replaces the Disks/Network/Devices panes that used to live in the VM
+Edit modal. If PCI adoption for the VM is blocked, the tab shows the reason
+and hides the add/detach forms until it resolves.
 
 ## VNC Console
 

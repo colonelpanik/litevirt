@@ -85,6 +85,12 @@ type NUMAPolicy struct {
 // HostdevConfig describes a PCI device to pass through to the VM.
 type HostdevConfig struct {
 	Address string // PCI address "0000:41:00.0"
+	// Alias, when set, is a stable libvirt user alias (already fully formed,
+	// e.g. "ua-<device_id>-<member_id>") emitted verbatim on the generated
+	// <hostdev> so the reconcile primitive can match this device's node
+	// across re-resolution to a different host PCI address. Empty = no
+	// <alias> child is emitted.
+	Alias string
 }
 
 // DiskConfig describes a VM disk.
@@ -99,6 +105,11 @@ type DiskConfig struct {
 	// virtio-scsi. Imported guests bind their boot driver to this model, so it
 	// must be preserved; ignored for non-SCSI buses.
 	ControllerModel string
+	// TargetDev is the stored/preserved libvirt target device name (e.g.
+	// "sdb"). When empty, the generator derives it positionally via
+	// DiskDevName(Bus, index) — existing callers that never set this see no
+	// change in behavior.
+	TargetDev string
 }
 
 // NetworkConfig describes a VM network interface.
@@ -138,6 +149,49 @@ func MaxVCPUFromXML(domXML string) int {
 		return 0
 	}
 	return d.VCPU.Value
+}
+
+// HostdevSourcePCIAddresses extracts the host source BDF of every PCI
+// <hostdev> (mode="subsystem" type="pci") in a domain XML, reconstructed from
+// its <source><address domain=… bus=… slot=… function=…/> into the standard
+// "dddd:bb:ss.f" form (the 0x-prefixed attribute values are stripped, not
+// re-padded — the caller canonicalizes via pci.CanonicalBDF). This is the
+// membership authority the hardware backfill audit reads: the set of PCI
+// passthrough devices actually present in the persistent (inactive) domain
+// definition, as opposed to whatever the stored VMSpec.Devices blob claims.
+// Non-PCI hostdevs (usb/scsi) and any element outside <devices> are ignored;
+// a device with no source address is skipped. Returns nil on an unparseable
+// document (the caller treats that as "no trustworthy inactive definition").
+func HostdevSourcePCIAddresses(domXML string) []string {
+	var d struct {
+		Hostdevs []struct {
+			Type   string `xml:"type,attr"`
+			Source struct {
+				Address struct {
+					Domain   string `xml:"domain,attr"`
+					Bus      string `xml:"bus,attr"`
+					Slot     string `xml:"slot,attr"`
+					Function string `xml:"function,attr"`
+				} `xml:"address"`
+			} `xml:"source"`
+		} `xml:"devices>hostdev"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return nil
+	}
+	var out []string
+	for _, h := range d.Hostdevs {
+		if h.Type != "pci" {
+			continue
+		}
+		a := h.Source.Address
+		if a.Domain == "" && a.Bus == "" && a.Slot == "" && a.Function == "" {
+			continue // no source address (e.g. a MIG/mdev hostdev) — nothing to match
+		}
+		strip := func(v string) string { return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(v)), "0x") }
+		out = append(out, strip(a.Domain)+":"+strip(a.Bus)+":"+strip(a.Slot)+"."+strip(a.Function))
+	}
+	return out
 }
 
 // isQ35Machine reports whether m is the q35 machine family, in either the
@@ -311,12 +365,16 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	bootFromCDROM := cfg.Boot == "cdrom"
 	diskBootAssigned := false
 	for i, d := range cfg.Disks {
+		targetDev := d.TargetDev
+		if targetDev == "" {
+			targetDev = DiskDevName(d.Bus, i)
+		}
 		disk := diskDevice{
 			Type:   "file",
 			Device: "disk",
 			Driver: diskDriver{Name: "qemu", Type: "qcow2", Cache: d.Cache},
 			Source: diskSource{File: d.Path},
-			Target: diskTarget{Dev: DiskDevName(d.Bus, i), Bus: d.Bus},
+			Target: diskTarget{Dev: targetDev, Bus: d.Bus},
 		}
 		if d.Cache == "" {
 			disk.Driver.Cache = "writeback"
@@ -468,7 +526,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	// PCI passthrough hostdevs
 	for _, hd := range cfg.Hostdevs {
 		parsed := ParsePCIAddress(hd.Address)
-		dev.Hostdevs = append(dev.Hostdevs, hostdevDevice{
+		hostdev := hostdevDevice{
 			Mode:    "subsystem",
 			Type:    "pci",
 			Managed: "yes",
@@ -480,7 +538,11 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 					Function: parsed.Function,
 				},
 			},
-		})
+		}
+		if hd.Alias != "" {
+			hostdev.Alias = &hostdevAlias{Name: hd.Alias}
+		}
+		dev.Hostdevs = append(dev.Hostdevs, hostdev)
 	}
 
 	// Emulated TPM 2.0 (G1). State is pinned at TPMStateDir (when set) so it
@@ -900,6 +962,11 @@ type hostdevDevice struct {
 	Type    string        `xml:"type,attr"`
 	Managed string        `xml:"managed,attr"`
 	Source  hostdevSource `xml:"source"`
+	Alias   *hostdevAlias `xml:"alias,omitempty"`
+}
+
+type hostdevAlias struct {
+	Name string `xml:"name,attr"`
 }
 
 type hostdevSource struct {

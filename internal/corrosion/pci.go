@@ -165,20 +165,38 @@ func VMDeviceOwnership(ctx context.Context, c *Client, hostName, vmName string) 
 	return live, tombstoned, nil
 }
 
+// PCIOwnerHostsForVM returns the distinct host names that still hold a LIVE
+// host_pci_devices ownership row for vmName (any host). Used before a VM-delete
+// tombstone to refuse deletion while a remote host still owns the VM's PCI (which
+// would strand that device assigned to a now-deleted VM).
+func PCIOwnerHostsForVM(ctx context.Context, c *Client, vmName string) ([]string, error) {
+	// Only LIVE hosts count. A host_pci_devices row on a DECOMMISSIONED host (hosts.deleted_at
+	// set) — or on a host with no hosts row at all — is inert: no live daemon there enforces it
+	// and no future ClaimPCIDevice CAS runs against it, so it can never be a real ownership
+	// conflict. The inner JOIN drops those rows so a VM-delete guard keyed off this result is
+	// not wedged forever by a dead host's stale reservation (a partial migration whose source
+	// host was later removed).
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT p.host_name FROM host_pci_devices p
+		 JOIN hosts h ON h.name = p.host_name
+		 WHERE p.vm_name = ? AND p.deleted_at IS NULL AND h.deleted_at IS NULL
+		 ORDER BY p.host_name`, vmName)
+	if err != nil {
+		return nil, err
+	}
+	var hosts []string
+	for _, r := range rows {
+		hosts = append(hosts, r.String("host_name"))
+	}
+	return hosts, nil
+}
+
 // AssignPCIDevice marks a PCI device as assigned to a VM.
 func AssignPCIDevice(ctx context.Context, c *Client, hostName, address, vmName string) error {
 	return c.Execute(ctx,
 		`UPDATE host_pci_devices SET vm_name = ?, updated_at = ?
 		 WHERE host_name = ? AND address = ?`,
 		vmName, c.NowTS(), hostName, address)
-}
-
-// ReleasePCIDevicesByVM clears all device assignments for a given VM.
-func ReleasePCIDevicesByVM(ctx context.Context, c *Client, vmName string) error {
-	return c.Execute(ctx,
-		`UPDATE host_pci_devices SET vm_name = NULL, updated_at = ?
-		 WHERE vm_name = ?`,
-		c.NowTS(), vmName)
 }
 
 // ClaimPCIDevice atomically assigns a device to a VM, but ONLY if it is active

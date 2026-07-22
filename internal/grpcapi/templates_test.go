@@ -83,6 +83,70 @@ func TestCloneVM_LinkedAndFull(t *testing.T) {
 	}
 }
 
+// TestCloneVM_PopulatesHardwareTables verifies a clone populates the v42
+// vm_nics table for its (fresh-MAC) network attachment — mirroring CreateVM
+// (task 7.1) — and deliberately carries NO vm_pci_intent rows: v1 clones never
+// bring PCI passthrough along (the source's device may still be in use by the
+// still-running original), so srcSpec.Devices is dropped (templates.go:214)
+// before the clone's spec is persisted.
+func TestCloneVM_PopulatesHardwareTables(t *testing.T) {
+	s := testServerWithLocks(t)
+	s.virt = libvirtfake.New()
+	s.images = image.NewStore(s.dataDir)
+	ctx := adminCtx()
+
+	srcDisk := s.images.DiskPath("tpl", "root")
+	if err := os.MkdirAll(filepath.Dir(srcDisk), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.Create(srcDisk, 64*1024*1024, nil); err != nil {
+		t.Fatalf("create source qcow2: %v", err)
+	}
+	specJSON, _ := json.Marshal(&pb.VMSpec{
+		Name: "tpl", Cpu: 2, MemoryMib: 2048,
+		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "e1000"}},
+		Devices: []*pb.DeviceSpec{{Address: "0000:41:00.0"}}, // must NOT survive into the clone
+	})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "tpl", HostName: "test-host", State: "stopped", IsTemplate: true, Spec: string(specJSON)},
+		nil,
+		[]corrosion.DiskRecord{{VMName: "tpl", DiskName: "root", HostName: "test-host", Path: srcDisk, SizeBytes: 64 * 1024 * 1024, StorageType: "local"}},
+	); err != nil {
+		t.Fatalf("InsertVM tpl: %v", err)
+	}
+
+	if _, err := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "tpl", Target: "clone1", Mode: "linked"}); err != nil {
+		t.Fatalf("CloneVM: %v", err)
+	}
+
+	ifaces, err := corrosion.GetVMInterfaces(ctx, s.db, "clone1")
+	if err != nil {
+		t.Fatalf("GetVMInterfaces: %v", err)
+	}
+	if len(ifaces) != 1 || ifaces[0].NetworkName != "lo" {
+		t.Fatalf("vm_interfaces = %+v, want 1 row on lo", ifaces)
+	}
+
+	nics, err := corrosion.GetVMNICsRaw(ctx, s.db, "vm_nics", "clone1")
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw: %v", err)
+	}
+	if len(nics) != 1 || nics[0].NetworkName != "lo" || nics[0].Model != "e1000" || nics[0].MAC != ifaces[0].MAC {
+		t.Fatalf("vm_nics = %+v, want 1 e1000 row on lo matching vm_interfaces MAC %q", nics, ifaces[0].MAC)
+	}
+	if nics[0].Ordinal != 0 {
+		t.Errorf("vm_nics[0].Ordinal = %d, want 0", nics[0].Ordinal)
+	}
+
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "clone1")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(intents) != 0 {
+		t.Fatalf("vm_pci_intent = %+v, want 0 rows (v1 clones drop PCI passthrough)", intents)
+	}
+}
+
 func diskBacking(d []corrosion.DiskRecord) string {
 	if len(d) == 0 {
 		return "<none>"
@@ -186,8 +250,8 @@ func TestCloneMode(t *testing.T) {
 	}{
 		{"linked", false, "linked"},
 		{"full", true, "full"},
-		{"", true, "linked"},  // auto + shared → linked
-		{"", false, "full"},   // auto + any-local → full (avoid host-pin)
+		{"", true, "linked"}, // auto + shared → linked
+		{"", false, "full"},  // auto + any-local → full (avoid host-pin)
 		{"auto", true, "linked"},
 		{"auto", false, "full"},
 	} {

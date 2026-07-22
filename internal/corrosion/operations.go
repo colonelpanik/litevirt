@@ -448,6 +448,45 @@ func (c *Client) AbortVMOperation(ctx context.Context, vmName, operationID strin
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
 
+// FailVMOperation records an operation's TERMINAL failure and clears the VM's
+// mutation barrier atomically, but ONLY if this operation still holds it at the
+// expected owner epoch + spec generation (a stale/superseded caller cannot clear a
+// newer op's barrier). It records a 'failed' step carrying the canonical outcome
+// facts (the gRPC code + a stable message) so a later same-key retry replays the
+// SAME deterministic failure instead of re-executing. Use this only after any
+// directional compensation has run to completion (the caller records
+// 'rollback_completed' first); if compensation could not complete, leave the op
+// NON-TERMINAL for recovery instead — do NOT call this. Returns applied=false when
+// the CAS no longer matches. The two statements are shape-identical to
+// AbortVMOperation's (vms barrier-clear UPDATE + facts-bearing operation_steps
+// INSERT), so no new replicated statement shape is introduced.
+func (c *Client) FailVMOperation(ctx context.Context, vmName, operationID string, ownerEpoch, specGen int64, facts string) (bool, error) {
+	now := c.NowTS()
+	guard := func(tx *sql.Tx) (bool, error) {
+		var oe, sg int64
+		var active string
+		err := tx.QueryRowContext(ctx,
+			`SELECT vm_owner_epoch, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`,
+			vmName).Scan(&oe, &sg, &active)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return active == operationID && oe == ownerEpoch && sg == specGen, nil
+	}
+	stmts := []Statement{
+		{SQL: `UPDATE vms SET active_operation_id = '', updated_at = ?
+		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`,
+			Params: []interface{}{now, vmName, operationID, ownerEpoch, specGen}},
+		{SQL: `INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
+		       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+			Params: []interface{}{operationID, ownerEpoch, OpStepFailed, facts, nowRFC3339(), now}},
+	}
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
 // ListVMsWithActiveOperation returns every locally-owned VM whose mutation barrier
 // is held (a non-empty active_operation_id), with the columns the resource-update
 // recovery pass needs. Used at startup and on a reconciler tick to find resize operations

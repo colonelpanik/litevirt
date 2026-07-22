@@ -39,6 +39,7 @@ const (
 	LiteVirt_CreateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/CreateVM"
 	LiteVirt_ListVMs_FullMethodName                    = "/litevirt.v1.LiteVirt/ListVMs"
 	LiteVirt_InspectVM_FullMethodName                  = "/litevirt.v1.LiteVirt/InspectVM"
+	LiteVirt_ListVMHardware_FullMethodName             = "/litevirt.v1.LiteVirt/ListVMHardware"
 	LiteVirt_StartVM_FullMethodName                    = "/litevirt.v1.LiteVirt/StartVM"
 	LiteVirt_StopVM_FullMethodName                     = "/litevirt.v1.LiteVirt/StopVM"
 	LiteVirt_RestartVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestartVM"
@@ -276,6 +277,7 @@ type LiteVirtClient interface {
 	CreateVM(ctx context.Context, in *CreateVMRequest, opts ...grpc.CallOption) (*VM, error)
 	ListVMs(ctx context.Context, in *ListVMsRequest, opts ...grpc.CallOption) (*ListVMsResponse, error)
 	InspectVM(ctx context.Context, in *InspectVMRequest, opts ...grpc.CallOption) (*VM, error)
+	ListVMHardware(ctx context.Context, in *ListVMHardwareRequest, opts ...grpc.CallOption) (*ListVMHardwareResponse, error)
 	StartVM(ctx context.Context, in *StartVMRequest, opts ...grpc.CallOption) (*VM, error)
 	StopVM(ctx context.Context, in *StopVMRequest, opts ...grpc.CallOption) (*VM, error)
 	RestartVM(ctx context.Context, in *RestartVMRequest, opts ...grpc.CallOption) (*VM, error)
@@ -798,6 +800,16 @@ func (c *liteVirtClient) InspectVM(ctx context.Context, in *InspectVMRequest, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VM)
 	err := c.cc.Invoke(ctx, LiteVirt_InspectVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListVMHardware(ctx context.Context, in *ListVMHardwareRequest, opts ...grpc.CallOption) (*ListVMHardwareResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListVMHardwareResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListVMHardware_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3070,6 +3082,7 @@ type LiteVirtServer interface {
 	CreateVM(context.Context, *CreateVMRequest) (*VM, error)
 	ListVMs(context.Context, *ListVMsRequest) (*ListVMsResponse, error)
 	InspectVM(context.Context, *InspectVMRequest) (*VM, error)
+	ListVMHardware(context.Context, *ListVMHardwareRequest) (*ListVMHardwareResponse, error)
 	StartVM(context.Context, *StartVMRequest) (*VM, error)
 	StopVM(context.Context, *StopVMRequest) (*VM, error)
 	RestartVM(context.Context, *RestartVMRequest) (*VM, error)
@@ -3431,6 +3444,9 @@ func (UnimplementedLiteVirtServer) ListVMs(context.Context, *ListVMsRequest) (*L
 }
 func (UnimplementedLiteVirtServer) InspectVM(context.Context, *InspectVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method InspectVM not implemented")
+}
+func (UnimplementedLiteVirtServer) ListVMHardware(context.Context, *ListVMHardwareRequest) (*ListVMHardwareResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListVMHardware not implemented")
 }
 func (UnimplementedLiteVirtServer) StartVM(context.Context, *StartVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartVM not implemented")
@@ -4354,6 +4370,24 @@ func _LiteVirt_InspectVM_Handler(srv interface{}, ctx context.Context, dec func(
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).InspectVM(ctx, req.(*InspectVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListVMHardware_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListVMHardwareRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListVMHardware(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListVMHardware_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListVMHardware(ctx, req.(*ListVMHardwareRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7821,6 +7855,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InspectVM",
 			Handler:    _LiteVirt_InspectVM_Handler,
+		},
+		{
+			MethodName: "ListVMHardware",
+			Handler:    _LiteVirt_ListVMHardware_Handler,
 		},
 		{
 			MethodName: "StartVM",

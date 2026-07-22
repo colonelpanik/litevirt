@@ -18,7 +18,7 @@ import (
 // mutation barrier or the generation counter. If you add a legitimate new writer,
 // add it here WITH a comment justifying why it can't use the sanctioned APIs.
 var sanctionedSpecWriters = map[string]string{
-	"InsertVM":                  "creates the row",
+	"InsertVMWithHardware":      "creates the row (InsertVM delegates here with nics/pciIntents nil)",
 	"RenameVM":                  "structural rename — changes the primary key, can't use a name-keyed CAS",
 	"BeginVMOperation":          "F1 op-start: sets desired spec + bumps generation + claims the barrier atomically",
 	"MutateDesiredSpec":         "THE sanctioned desired-spec writer",

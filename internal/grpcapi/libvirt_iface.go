@@ -30,6 +30,12 @@ type LibvirtBackend interface {
 	UndefineDomain(name string, removeStorage bool) error
 	UndefineDomainPreservingState(name string) error // undefine keeping NVRAM/vTPM (redefine-class, G1)
 	DomainState(name string) (string, error)
+	// DomainStateReason returns the coarse State together with the normalized
+	// Reason. DomainState collapses paused / shut-off / pm-suspended all to
+	// "stopped"; crash recovery needs the reason to tell a genuinely shut-off
+	// domain (safe for destructive rollback) from a still-active paused /
+	// pm-suspended one (whose disks are attached and must not be touched).
+	DomainStateReason(name string) (libvirt.DomainStatus, error)
 	DomainExists(name string) bool
 	ListDomains() ([]string, error)
 	DumpXML(name string) (string, error)
@@ -51,7 +57,16 @@ type LibvirtBackend interface {
 	AttachNIC(domainName, bridge, model, mac string) error
 	DetachNIC(domainName, mac string) error
 	AttachHostdev(domainName, pciAddress string) error
+	// AttachHostdevWithAlias hot-attaches a PCI passthrough device carrying a stable
+	// user alias (ua-<device>-<member>) so the topology-preserving reconcile can key
+	// the hostdev by that alias. The journaled concrete-address PCI attach uses it;
+	// the legacy SR-IOV/type path keeps using AttachHostdev (no alias).
+	AttachHostdevWithAlias(domainName, pciAddress, alias string) error
 	DetachHostdev(domainName, pciAddress string) error
+	// DetachHostdevConfig removes a PCI hostdev from a domain's PERSISTENT definition
+	// ONLY (config-flagged, no live modify) — used to reclaim a device from a SHUT-OFF
+	// domain, whose nonexistent live instance would reject a live-flagged DetachHostdev.
+	DetachHostdevConfig(domainName, pciAddress string) error
 	BlockResize(domainName, path string, sizeBytes int64) error
 	SetBootOrder(domainName, bootOrder string) error
 

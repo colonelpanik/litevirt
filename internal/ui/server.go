@@ -195,6 +195,26 @@ func (s *Server) renderFragment(w http.ResponseWriter, tmplFile string, data any
 	_, _ = w.Write(buf.Bytes())
 }
 
+// renderHardwareTabFragment renders hardware_tab.html to an HTML string for
+// embedding directly into a full vm_detail.html page load (?tab=hardware —
+// see handleVMDetail). It parses the exact same fragment template the htmx
+// route (handleVMHardwareTab) renders via renderFragment, so there is one
+// source of truth for the Hardware tab markup instead of a duplicated block.
+// Returns "" on a render error; the caller falls back to omitting the tab
+// body rather than failing the whole page.
+func (s *Server) renderHardwareTabFragment(data any) template.HTML {
+	t, err := template.New("").Funcs(s.funcMap).ParseFS(templateFS, "templates/hardware_tab.html")
+	var buf bytes.Buffer
+	if err == nil {
+		err = t.ExecuteTemplate(&buf, "hardware_tab.html", data)
+	}
+	if err != nil {
+		slog.Error("render hardware tab fragment", "error", err)
+		return ""
+	}
+	return template.HTML(buf.String())
+}
+
 // writeRenderError emits a small visible error for a failed HTMX swap. Returns
 // 200 so htmx swaps it into the target (htmx skips the swap on non-2xx), making
 // the failure visible instead of leaving a blank region.
@@ -315,6 +335,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /ui/vms-table", s.requireAuthFunc(s.handleVMsTable))
 	mux.HandleFunc("GET /ui/vms/new-modal", s.requireAuthFunc(s.handleNewVMModal))
 	mux.HandleFunc("GET /ui/vms/{name}/detail", s.requireAuthFunc(s.handleVMDetailPartial))
+	mux.HandleFunc("GET /ui/vms/{name}/tab/hardware", s.requireAuthFunc(s.handleVMHardwareTab))
 	mux.HandleFunc("GET /ui/vms/{name}/snapshot-modal", s.requireAuthFunc(s.handleSnapshotModal))
 	mux.HandleFunc("GET /ui/vms/{name}/migrate-modal", s.requireAuthFunc(s.handleMigrateModal))
 	mux.HandleFunc("GET /ui/vms/{name}/stats", s.requireAuthFunc(s.handleVMStatsPartial))

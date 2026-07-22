@@ -78,7 +78,8 @@ const (
 	ReasonVIPReleaseUnconfirmed = "vip_release_unconfirmed"
 	ReasonStorageUnverified     = "storage_unverified"
 	ReasonWarmup                = "warmup"
-	ReasonSelfFenced            = "self_fenced" // this node self-fenced; refuses decide/execute until it reboots
+	ReasonSelfFenced            = "self_fenced"      // this node self-fenced; refuses decide/execute until it reboots
+	ReasonHardwareBlocked       = "hardware_blocked" // hardware_v2 pre-start refused an automated (re)start (blocked adoption / unacquirable passthrough)
 )
 
 // GateResult is the outcome of a gate check. Reason is set (from the closed

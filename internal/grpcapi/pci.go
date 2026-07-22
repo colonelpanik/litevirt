@@ -2,11 +2,14 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -158,18 +161,44 @@ func (s *Server) ListHostDevices(ctx context.Context, req *pb.ListHostDevicesReq
 	return resp, nil
 }
 
+// ResolvedMember is one concrete host device that realizes a PCI passthrough
+// request: the resolved BDF plus the intent/member identity used to key its
+// vm_pci_realizations row and its `ua-<DeviceID>-<MemberID>` hostdev alias.
+// Ordinal orders the members realizing a single request (primary = 0, then its
+// IOMMU-group siblings, then subsequent count-N devices).
+type ResolvedMember struct {
+	DeviceID string
+	MemberID string
+	Address  string
+	Ordinal  int
+}
+
 // allocateDevices resolves DeviceSpec requests against host inventory,
 // validates IOMMU group conflicts, assigns devices, binds to VFIO-PCI,
 // and returns the PCI addresses for hostdev XML.
 //
-// It returns the resolved addresses AND a finish func: the durable device-lease
-// entry (F1) is written before the vfio bind, and the CALLER must defer finish()
-// so the lease is cleared once the VM row is finalized (or on the caller's own
-// rollback). A crash before finish() runs leaves the entry for startup recovery
-// (RecoverDeviceLeases) to roll back.
-func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb.DeviceSpec) ([]string, func(), error) {
+// It is a thin composition of the pure resolve phase (resolveDeviceSpec /
+// allocateSRIOVVFs) and the side-effecting acquire phase (acquireDeviceLeases):
+// existing callers see identical behavior. It returns the resolved addresses AND
+// a finish func: the durable device-lease entry (F1) is written before the vfio
+// bind, and the CALLER must defer finish() so the lease is cleared once the VM
+// row is finalized (or on the caller's own rollback). A crash before finish()
+// runs leaves the entry for startup recovery (RecoverDeviceLeases) to roll back.
+//
+// stage is the initial durable device-lease stage (see beginDeviceLease): CreateVM passes
+// deviceLeaseStageBound; the legacy running-attach passes deviceLeaseStageInProgress.
+func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb.DeviceSpec, stage string) ([]string, func(), error) {
 	noop := func() {}
-	var addresses []string
+	var members []ResolvedMember
+
+	// Cross-spec exclusion set: the addresses already selected by earlier specs in
+	// THIS request (primaries + IOMMU-group siblings + claimed SR-IOV VFs). The old
+	// fused loop assigned each spec inline, so a later type/vendor spec's
+	// GetAvailableDevicesByType saw a SHRINKING pool; resolving deferred assignment
+	// to acquire, so every type spec would otherwise re-select the same free
+	// device. Threading this set restores the pool-shrinking semantics PURELY — no
+	// assignment in the resolve phase, just in-memory exclusion.
+	selected := map[string]bool{}
 
 	for _, spec := range specs {
 		count := int(spec.Count)
@@ -177,168 +206,857 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 			count = 1
 		}
 
-		// Resource mapping (#14): resolve a cluster-wide mapping name to the
-		// concrete PCI address registered for THIS host, then allocate it as an
-		// exact pin. This is what lets a passthrough VM land on / migrate to any
-		// host that has a device under the same mapping.
-		if spec.Mapping != "" && spec.Address == "" {
-			addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName)
-			if err != nil {
-				return nil, noop, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)
-			}
-			if addr == "" {
-				return nil, noop, status.Errorf(codes.FailedPrecondition,
-					"resource mapping %q has no device on host %s", spec.Mapping, s.hostName)
-			}
-			spec.Address = addr
-		}
-
-		// SR-IOV VF allocation: create a VF on-demand if requested.
-		if spec.Sriov && spec.Address == "" {
+		// SR-IOV VF allocation is inherently side-effecting — it CAS-claims free VFs
+		// and may create a VF pool on-demand (writing host sysfs) — so it cannot be
+		// part of the pure resolver and stays on this path. The claimed VFs flow into
+		// acquireDeviceLeases alongside the rest for the durable lease + vfio bind.
+		//
+		// A resource-mapping spec is a concrete pin, not VF allocation: mapping
+		// resolution must precede the SR-IOV branch (as in the original order), so a
+		// Sriov+Mapping spec resolves the mapped device rather than allocating a VF.
+		if spec.Sriov && spec.Address == "" && spec.Mapping == "" {
 			vfAddrs, err := s.allocateSRIOVVFs(ctx, vmName, spec, count)
 			if err != nil {
 				return nil, noop, err
 			}
-			addresses = append(addresses, vfAddrs...)
-			continue
-		}
-
-		// Exact address pinning.
-		if spec.Address != "" {
-			// Validate IOMMU group conflict before assignment.
-			if err := s.checkIOMMUConflict(ctx, spec.Address, vmName); err != nil {
-				return nil, noop, err
-			}
-
-			addresses = append(addresses, spec.Address)
-			if err := corrosion.AssignPCIDevice(ctx, s.db, s.hostName, spec.Address, vmName); err != nil {
-				slog.Warn("failed to record device assignment", "address", spec.Address, "error", err)
-			}
-
-			// Also assign IOMMU group siblings.
-			groupAddrs, _ := s.iommuGroupSiblings(ctx, spec.Address)
-			for _, a := range groupAddrs {
-				if a != spec.Address {
-					addresses = append(addresses, a)
-					corrosion.AssignPCIDevice(ctx, s.db, s.hostName, a, vmName)
-				}
+			for i, a := range vfAddrs {
+				members = append(members, ResolvedMember{MemberID: fmt.Sprintf("m%d", i), Address: a, Ordinal: i})
+				selected[a] = true
 			}
 			continue
 		}
 
-		// Type-based allocation.
-		available, err := corrosion.GetAvailableDevicesByType(ctx, s.db, s.hostName, spec.Type)
+		specMembers, err := s.resolveDeviceSpec(ctx, vmName, spec, "", selected)
 		if err != nil {
-			return nil, noop, status.Errorf(codes.Internal, "query devices: %v", err)
+			return nil, noop, err
 		}
-
-		// Filter by vendor/model if specified.
-		var matched []corrosion.PCIDeviceRecord
-		for _, d := range available {
-			if spec.Vendor != "" && d.VendorID != spec.Vendor {
-				continue
-			}
-			if spec.Model != "" && d.DeviceName != spec.Model {
-				continue
-			}
-			matched = append(matched, d)
+		// Freeze the resolved concrete BDF back onto a resource-mapping spec so
+		// CreateVM's json.Marshal(spec) persists the pinned address (behavior-
+		// preserving; making the mapping stay portable is a later phase's job). The
+		// pure resolveDeviceSpec never mutates the spec — allocateDevices does.
+		if spec.Mapping != "" && spec.Address == "" && len(specMembers) > 0 {
+			spec.Address = specMembers[0].Address
 		}
+		members = append(members, specMembers...)
+	}
 
-		if len(matched) < count {
-			return nil, noop, status.Errorf(codes.ResourceExhausted,
-				"need %d %s device(s) but only %d available on host %s",
-				count, spec.Type, len(matched), s.hostName)
+	finish, _, err := s.acquireDeviceLeases(ctx, vmName, members, stage)
+	if err != nil {
+		return nil, noop, err
+	}
+	addresses := make([]string, 0, len(members))
+	for _, m := range members {
+		addresses = append(addresses, m.Address)
+	}
+	return addresses, finish, nil
+}
+
+// resolveDeviceSpec is the PURE selection/validation core shared by
+// allocateDevices (from a live *pb.DeviceSpec) and resolveDeviceIntents (from a
+// stored intent). It resolves ONE non-SR-IOV request to its concrete host
+// device(s): a resource mapping to this host's pinned address, an exact address
+// or a type/vendor/model match, each expanded to include its IOMMU-group
+// siblings and validated against IOMMU-group conflicts. It performs NO
+// AssignPCIDevice, NO VF creation and NO vfio bind — nothing that touches host
+// hardware or inventory ownership — so it is safe to run while reconciling a
+// stopped VM. deviceID (the intent id, "" for the live-spec path) is stamped
+// onto every returned member.
+//
+// exclude is a cross-spec working set of addresses already chosen by earlier
+// specs in the same request: type/vendor selection SKIPS any candidate in it, and
+// each address this call selects (primary + IOMMU-group siblings) is added to it,
+// so a subsequent spec sees the same shrunken pool the old inline-assign loop did.
+// It is a caller-owned scratch map (never a *pb.DeviceSpec), so mutating it keeps
+// the resolver pure w.r.t. host hardware and inventory ownership.
+func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.DeviceSpec, deviceID string, exclude map[string]bool) ([]ResolvedMember, error) {
+	count := int(spec.Count)
+	if count == 0 {
+		count = 1
+	}
+
+	address := spec.Address
+	// Resource mapping (#14): resolve a cluster-wide mapping name to the concrete
+	// PCI address registered for THIS host, then treat it as an exact pin. This is
+	// what lets a passthrough VM land on / migrate to any host that has a device
+	// under the same mapping. Resolve into a local var — never mutate the input spec.
+	if spec.Mapping != "" && address == "" {
+		addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)
 		}
+		if addr == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"resource mapping %q has no device on host %s", spec.Mapping, s.hostName)
+		}
+		address = addr
+	}
 
-		for i := 0; i < count; i++ {
-			d := matched[i]
-
-			// Validate IOMMU group conflict.
-			if err := s.checkIOMMUConflict(ctx, d.Address, vmName); err != nil {
-				return nil, noop, err
-			}
-
-			addresses = append(addresses, d.Address)
-			corrosion.AssignPCIDevice(ctx, s.db, s.hostName, d.Address, vmName)
-
-			// IOMMU group siblings.
-			groupAddrs, _ := s.iommuGroupSiblings(ctx, d.Address)
-			for _, a := range groupAddrs {
-				if a != d.Address {
-					addresses = append(addresses, a)
-					corrosion.AssignPCIDevice(ctx, s.db, s.hostName, a, vmName)
-				}
+	var members []ResolvedMember
+	ordinal := 0
+	// addPrimary appends primary + its IOMMU-group siblings as ordered members.
+	// The conflict check is on the primary only (a sibling shares the group, so a
+	// conflicting other-VM owner is already caught by the primary's check).
+	addPrimary := func(primary string) error {
+		if err := s.checkIOMMUConflict(ctx, primary, vmName); err != nil {
+			return err
+		}
+		members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: primary, Ordinal: ordinal})
+		ordinal++
+		exclude[primary] = true
+		groupAddrs, _ := s.iommuGroupSiblings(ctx, primary)
+		for _, a := range groupAddrs {
+			if a != primary {
+				members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: a, Ordinal: ordinal})
+				ordinal++
+				exclude[a] = true
 			}
 		}
+		return nil
+	}
+
+	// Exact address pinning (also the resolved-mapping path).
+	if address != "" {
+		if err := addPrimary(address); err != nil {
+			return nil, err
+		}
+		return members, nil
+	}
+
+	// Type-based allocation.
+	available, err := corrosion.GetAvailableDevicesByType(ctx, s.db, s.hostName, spec.Type)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query devices: %v", err)
+	}
+	// Filter by vendor/model if specified, skipping any device already chosen by an
+	// earlier spec in this request (the cross-spec pool-shrinking exclusion).
+	var matched []corrosion.PCIDeviceRecord
+	for _, d := range available {
+		if exclude[d.Address] {
+			continue
+		}
+		if spec.Vendor != "" && d.VendorID != spec.Vendor {
+			continue
+		}
+		if spec.Model != "" && d.DeviceName != spec.Model {
+			continue
+		}
+		matched = append(matched, d)
+	}
+	if len(matched) < count {
+		return nil, status.Errorf(codes.ResourceExhausted,
+			"need %d %s device(s) but only %d available on host %s",
+			count, spec.Type, len(matched), s.hostName)
+	}
+	for i := 0; i < count; i++ {
+		if err := addPrimary(matched[i].Address); err != nil {
+			return nil, err
+		}
+	}
+	return members, nil
+}
+
+// resolveDeviceIntents is the PURE resolver the topology-preserving reconcile
+// primitive uses: it maps a VM's stored vm_pci_intent rows to the concrete host
+// members they realize, touching no host hardware and no inventory ownership.
+// An "address" intent resolves via its exclusive_key BDF; portable "mapping" /
+// "type" intents decode their selector_payload (a protojson DeviceSpec) and run
+// the shared resolveDeviceSpec selection. SR-IOV intents are NOT resolved here:
+// realizing them CAS-claims and may create VFs (side effects), which belongs in
+// the acquire phase (allocateSRIOVVFs) — wiring pure SR-IOV candidate selection
+// into this resolver is deferred to the start-path task.
+func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord) ([]ResolvedMember, error) {
+	var members []ResolvedMember
+	// Cross-intent exclusion set (see resolveDeviceSpec): a scratch map so two
+	// type/vendor intents resolve to distinct devices, exactly as the live-spec
+	// path. Local to this call — resolveDeviceIntents stays pure.
+	selected := map[string]bool{}
+	for _, intent := range intents {
+		switch intent.SelectorKind {
+		case "sriov":
+			return nil, status.Errorf(codes.Unimplemented,
+				"SR-IOV intent %s: VF realization is side-effecting and handled by the acquire path, not the pure resolver", intent.DeviceID)
+		case "address":
+			addr := ""
+			if intent.ExclusiveKey != nil {
+				addr = *intent.ExclusiveKey
+			}
+			specMembers, err := s.resolveDeviceSpec(ctx, vmName, &pb.DeviceSpec{Address: addr}, intent.DeviceID, selected)
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, specMembers...)
+		default: // "mapping", "type"
+			spec := &pb.DeviceSpec{}
+			if err := protojson.Unmarshal([]byte(intent.SelectorPayload), spec); err != nil {
+				return nil, status.Errorf(codes.Internal, "decode selector payload for device %s: %v", intent.DeviceID, err)
+			}
+			specMembers, err := s.resolveDeviceSpec(ctx, vmName, spec, intent.DeviceID, selected)
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, specMembers...)
+		}
+	}
+	return members, nil
+}
+
+// claimDeviceOwnership is the ONE shared, fail-closed inventory reservation used by
+// EVERY PCI producer — CreateVM's allocateDevices, the running attach, AND the
+// stopped concrete-address attach. It reads the current owner of each member once
+// (no new statement), then per member:
+//   - owner == vmName → an idempotent self-claim (e.g. an SR-IOV VF CAS-claimed
+//     during selection, or a same-op retry / re-attach): keep it, NOT newly claimed.
+//   - owner is a DIFFERENT non-empty VM → FAIL (AlreadyExists), rolling back the
+//     members THIS call already claimed.
+//   - present and unowned → corrosion.ClaimPCIDevice (CAS: assigns only if active
+//     and unassigned); a false return (lost the race) or an error FAILS the same way.
+//   - absent / tombstoned from inventory → FAIL CLOSED (FailedPrecondition): there
+//     is no claimable ownership row, so we refuse rather than reserve nothing.
+//
+// It performs NO vfio bind and writes NO durable lease — ownership only, so it is
+// safe on the stopped-attach declare path (the bind/lease/realization stay at VM
+// start). It returns the addresses it NEWLY claimed and a release closure that
+// owner-releases EXACTLY those (owner-scoped, a no-op for a self-owned member, and a
+// no-op if another VM has since claimed the address) — the caller invokes release to
+// undo the reservation on its own later failure, or uses the claimed list to scope a
+// rollback so a self-owned reservation (a device reserved while the VM was off,
+// FIX-9b) is never released by a failed operation. On any failure WITHIN the loop it
+// rolls the newly-claimed members back itself before returning the error.
+func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, members []ResolvedMember) ([]string, func(), error) {
+	noop := func() {}
+
+	// Current owners on this host, read once (no new statement): distinguishes
+	// self-owned (idempotent), other-owned (conflict), present+unowned (CAS-claim)
+	// and absent (fail closed).
+	owners := map[string]string{}
+	devs, lerr := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if lerr != nil {
+		return nil, noop, status.Errorf(codes.Internal, "read PCI inventory: %v", lerr)
+	}
+	for _, d := range devs {
+		owners[d.Address] = d.VMName
+	}
+
+	// claimed = the addresses THIS call took; release owner-releases exactly those
+	// (never another VM's device, never a pre-existing self-owned reservation). No
+	// vfio unbind — nothing is bound here.
+	var claimed []string
+	release := func() {
+		for _, addr := range claimed {
+			if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
+				slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
+			}
+		}
+	}
+	for _, m := range members {
+		addr := m.Address
+		owner, present := owners[addr]
+		switch {
+		case owner == vmName:
+			// Already ours — idempotent self-claim; not newly claimed, nothing to do.
+		case owner != "":
+			release()
+			return nil, noop, status.Errorf(codes.AlreadyExists,
+				"PCI device %s (host %s) is already claimed by VM %q", addr, s.hostName, owner)
+		case !present:
+			// Absent / tombstoned from inventory: no claimable ownership row exists.
+			// Fail CLOSED — a real passthrough device is discovered into host_pci_devices
+			// before it can be assigned, so a missing BDF is an error, not a bind-anyway.
+			release()
+			return nil, noop, status.Errorf(codes.FailedPrecondition,
+				"PCI device %s is not in host %s inventory", addr, s.hostName)
+		default:
+			// Present and unowned → atomic CAS claim.
+			ok, cerr := corrosion.ClaimPCIDevice(ctx, s.db, s.hostName, addr, vmName)
+			if cerr != nil {
+				release()
+				return nil, noop, status.Errorf(codes.Internal, "claim PCI device %s: %v", addr, cerr)
+			}
+			if !ok {
+				// Lost the CAS race — another operation claimed it between the read and here.
+				release()
+				return nil, noop, status.Errorf(codes.AlreadyExists,
+					"PCI device %s (host %s) was claimed by another operation", addr, s.hostName)
+			}
+			claimed = append(claimed, addr)
+		}
+	}
+	return claimed, release, nil
+}
+
+// acquireDeviceLeases is the side-effecting counterpart to resolveDeviceIntents for
+// the RUNNING / start path: it composes the shared claimDeviceOwnership reservation
+// (the exclusive, fail-closed physical-double-bind guard) with the durable
+// device-lease entry (F1) written BEFORE the irreversible vfio bind, then binds
+// every member to vfio-pci. On a bind failure it rolls back the devices this call
+// newly claimed (via the strict unbindAndReleaseOwnership primitive) and clears the
+// lease — unless the release could not confirm the unbind, in which case it RETAINS
+// the lease so a crash before the VM row is finalized is recovered at startup. It returns the finish func the caller must
+// defer to clear the lease once the row is durable, AND the addresses it NEWLY claimed
+// (a self-owned member is skipped → NOT in the list), so a caller's OWN post-acquire
+// rollback can release exactly the devices this start took and never a pre-existing
+// self-owned reserve-while-off reservation (FIX-9b/9c).
+//
+// stage is the initial durable device-lease stage (see beginDeviceLease): every caller
+// passes deviceLeaseStageBound EXCEPT the unjournaled legacy running-attach, which passes
+// deviceLeaseStageInProgress so a mid-attach crash is reclaimed, not cleared.
+func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members []ResolvedMember, stage string) (func(), []string, error) {
+	noop := func() {}
+
+	// Claim inventory ownership (fail-closed CAS) BEFORE any bind. On failure the
+	// claim rolled back its own reservations, so there is nothing to unbind here.
+	// claimed = the members THIS call newly took (a self-owned member is skipped and
+	// is NOT in the list), so the bind-failure rollback can release exactly those and
+	// never a pre-existing self-owned reservation.
+	claimed, _, cerr := s.claimDeviceOwnership(ctx, vmName, members)
+	if cerr != nil {
+		return noop, nil, cerr
+	}
+
+	addresses := make([]string, 0, len(members))
+	for _, m := range members {
+		addresses = append(addresses, m.Address)
 	}
 
 	// Durably record the claimed devices (F1 device lease) BEFORE the irreversible
 	// vfio bind, so a crash before the VM row is finalized is rolled back at
 	// startup. No-op unless the operation_protocol capability is active.
-	finish := s.beginDeviceLease(ctx, vmName, addresses)
+	finish, lerr := s.beginDeviceLease(ctx, vmName, addresses, stage)
+	if lerr != nil {
+		// Could not durably record the pre-bind crash anchor → we must NOT bind (a crash would
+		// leave an owned, vfio-bound device with no recovery record). Release the claims made
+		// (nothing is bound yet → the strict primitive skips every unbind and just owner-
+		// releases them) and abort BEFORE the bind loop.
+		if rerr := s.unbindAndReleaseOwnership(ctx, vmName, claimed); rerr != nil {
+			slog.Error("device-lease begin failed; claim rollback incomplete (owned, not yet bound)", "vm", vmName, "error", rerr)
+		}
+		return noop, nil, status.Errorf(codes.Internal, "record device lease for %q: %v", vmName, lerr)
+	}
 
-	// Bind all allocated devices to vfio-pci.
 	for _, addr := range addresses {
 		prevDriver, err := vfio.Bind(addr)
 		if err != nil {
 			slog.Warn("VFIO bind failed", "address", addr, "error", err)
-			// Roll back only the devices this allocation claimed, and clear the
-			// durable lease.
-			s.releaseDeviceSet(ctx, vmName, addresses)
-			finish()
-			return nil, noop, status.Errorf(codes.Internal,
+			// Roll back ONLY the devices THIS call newly claimed, via the strict all-or-
+			// nothing primitive (unbind bound members by vfio ground truth, then owner-
+			// release). A self-owned reservation (a device reserved while the VM was off,
+			// FIX-9b) is NOT in `claimed`, so a failed start-time bind retains it rather than
+			// silently dropping the reservation. When nothing is self-owned, `claimed` ==
+			// every address.
+			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, claimed); rerr != nil {
+				// A freshly-claimed member could not be confirmed unbound → leave it owned +
+				// bound (recoverable, never unowned + bound) and RETAIN the durable device-
+				// lease so RecoverDeviceLeases retries the release; do NOT finish().
+				slog.Error("VFIO bind rollback: release incomplete — device lease retained for recovery", "vm", vmName, "error", rerr)
+			} else {
+				finish() // release converged (or nothing to release) → clear the durable lease
+			}
+			return noop, nil, status.Errorf(codes.Internal,
 				"failed to bind device %s to vfio-pci: %v", addr, err)
 		}
 		slog.Info("device bound to vfio-pci", "address", addr, "previous_driver", prevDriver)
 	}
 
-	return addresses, finish, nil
+	return finish, claimed, nil
 }
 
-// releaseDevices unbinds all devices from vfio-pci and releases them in the DB.
-func (s *Server) releaseDevices(ctx context.Context, vmName string) {
-	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
-	if err != nil {
-		slog.Warn("failed to list devices for release", "vm", vmName, "error", err)
-		return
+// pciStartPreflight realizes a hardware_v2 VM's reserved PCI intents at start:
+// it resolves every intent to concrete host members, acquires the device leases
+// (CAS ownership + durable F1 lease + vfio bind), persists vm_pci_realizations
+// (member_id + ua-alias + resolved_address — CONTRACT g) and reconciles the aliased
+// <hostdev>s into the domain definition — everything that must be true BEFORE
+// StartDomain. It fails CLOSED: a vanished/unacquirable device, a realization write
+// failure, or a reconcile failure releases whatever was claimed and returns the
+// error (the VM does not start).
+//
+// SR-IOV routing (CONTRACT a): resolveDeviceIntents returns Unimplemented for an
+// sriov selector (VF realization is side-effecting), so an sriov intent is routed
+// through allocateSRIOVVFs (the CAS-claim / VF-create acquire path); concrete-address,
+// mapping and type intents go through the pure resolveDeviceIntents.
+//
+// On success it clears the durable F1 lease (the realization rows are the durable
+// record now) and returns a release func the caller invokes ONLY if the subsequent
+// StartDomain fails, so a failed start leaves no VM bound to devices it never used.
+func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, intents []corrosion.PCIIntentRecord) (release func(), err error) {
+	// ── Resolve every intent to concrete members (routing SR-IOV to the allocator) ──
+	var members []ResolvedMember
+	var claimedSriov []string // VFs allocateSRIOVVFs CAS-claimed (released on a resolve failure)
+	resolveFail := func(e error) (func(), error) {
+		if len(claimedSriov) > 0 {
+			// The VFs were CAS-claimed but never vfio-bound (allocateSRIOVVFs binds nothing),
+			// so the strict primitive skips every unbind (IsBoundToVFIO=false) and just owner-
+			// releases them — behavior-preserving. A release-write failure is only logged: the
+			// resolve already failed and the residual owned VF converges on the next start's
+			// self-owned skip.
+			if rerr := s.unbindAndReleaseOwnership(ctx, vm.Name, claimedSriov); rerr != nil {
+				slog.Warn("sr-iov resolve rollback: release incomplete", "vm", vm.Name, "error", rerr)
+			}
+		}
+		return nil, e
+	}
+	for _, in := range intents {
+		if in.SelectorKind == "sriov" {
+			spec := &pb.DeviceSpec{}
+			if uerr := protojson.Unmarshal([]byte(in.SelectorPayload), spec); uerr != nil {
+				return resolveFail(status.Errorf(codes.Internal,
+					"decode SR-IOV selector payload for device %s: %v", in.DeviceID, uerr))
+			}
+			count := int(spec.Count)
+			if count == 0 {
+				count = 1
+			}
+			vfAddrs, aerr := s.allocateSRIOVVFs(ctx, vm.Name, spec, count)
+			if aerr != nil {
+				return resolveFail(aerr)
+			}
+			for i, a := range vfAddrs {
+				members = append(members, ResolvedMember{DeviceID: in.DeviceID, MemberID: fmt.Sprintf("m%d", i), Address: a, Ordinal: i})
+				claimedSriov = append(claimedSriov, a)
+			}
+			continue
+		}
+		// address / mapping / type: the pure resolver.
+		specMembers, rerr := s.resolveDeviceIntents(ctx, vm.Name, []corrosion.PCIIntentRecord{in})
+		if rerr != nil {
+			return resolveFail(rerr)
+		}
+		members = append(members, specMembers...)
 	}
 
+	if len(members) == 0 {
+		// Intents that resolved to no members (should not happen — an intent yields ≥1
+		// member); nothing to acquire, so start proceeds from the existing definition.
+		return func() {}, nil
+	}
+
+	// ── Acquire leases: CAS ownership + durable F1 lease + vfio bind ──
+	// On a bind failure acquireDeviceLeases self-cleans every device it touched
+	// (owner-scoped release covers the SR-IOV VFs claimed above too) and clears the
+	// lease, so nothing is left to release here. acquireClaimed = the addresses this
+	// acquire NEWLY claimed (a self-owned reserve-while-off device is skipped → NOT in
+	// it), so the post-acquire rollback below can release exactly what THIS start took.
+	finish, acquireClaimed, aerr := s.acquireDeviceLeases(ctx, vm.Name, members, deviceLeaseStageBound)
+	if aerr != nil {
+		return nil, aerr
+	}
+
+	// The devices freshly claimed DURING THIS START: the VFs CAS-claimed in the resolve
+	// phase (claimedSriov) ∪ the members acquire newly claimed (acquireClaimed). A
+	// pre-existing self-owned reservation is in NEITHER, so scoping the post-acquire
+	// rollback to this set releases only what this start took and RETAINS a
+	// reserve-while-off reservation across a transient post-bind failure (FIX-9c). Dedupe
+	// defensively (a VF claimed in resolve is self-owned at acquire, so acquire skips it —
+	// the sets should not overlap, but a double-release is harmless either way).
+	freshlyClaimed := make([]string, 0, len(claimedSriov)+len(acquireClaimed))
+	seenFresh := map[string]bool{}
+	for _, a := range append(append([]string{}, claimedSriov...), acquireClaimed...) {
+		if !seenFresh[a] {
+			seenFresh[a] = true
+			freshlyClaimed = append(freshlyClaimed, a)
+		}
+	}
+
+	// ── Persist realizations (CONTRACT g), grouped per device ──
+	byDevice := map[string][]ResolvedMember{}
+	var deviceOrder []string
+	for _, m := range members {
+		if _, seen := byDevice[m.DeviceID]; !seen {
+			deviceOrder = append(deviceOrder, m.DeviceID)
+		}
+		byDevice[m.DeviceID] = append(byDevice[m.DeviceID], m)
+	}
+	rollback := func() error {
+		// Release ONLY the devices THIS start freshly claimed — never a pre-existing
+		// self-owned reserve-while-off reservation (FIX-9c). A retained self-owned device
+		// is absent from freshlyClaimed, so it stays bound + owned = still reserved. Strict
+		// (all-or-nothing): if a freshly-claimed member cannot be confirmed unbound, release
+		// NOTHING and return the error so the caller leaves the start recovery-required (it
+		// stays owned + bound, never unowned + bound). Tombstone realizations only once the
+		// release has converged, so a recovery-required rollback keeps this start's rows.
+		if rerr := s.unbindAndReleaseOwnership(ctx, vm.Name, freshlyClaimed); rerr != nil {
+			return rerr
+		}
+		for _, dev := range deviceOrder {
+			if terr := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, dev); terr != nil {
+				slog.Warn("pci start-preflight: tombstone realizations on rollback", "vm", vm.Name, "device", dev, "error", terr)
+			}
+		}
+		return nil
+	}
+	for _, dev := range deviceOrder {
+		if werr := s.writePCIRealizations(ctx, vm.Name, dev, byDevice[dev]); werr != nil {
+			if rbErr := rollback(); rbErr != nil {
+				// The release could not confirm the unbind → leave the start recovery-required:
+				// do NOT finish() the lease (retain it), propagate so startVMLocked leaves it
+				// recoverable. The freshly-claimed member stays owned + bound; retry converges.
+				slog.Error("pci start-preflight: rollback release incomplete after realization write failure — left recoverable", "vm", vm.Name, "error", rbErr)
+				return nil, status.Errorf(codes.Internal,
+					"persist PCI realizations for %q failed and rollback could not release freshly-claimed device(s); left recoverable: %v", vm.Name, werr)
+			}
+			finish()
+			return nil, status.Errorf(codes.Internal, "persist PCI realizations for %q: %v", vm.Name, werr)
+		}
+	}
+
+	// ── Reconcile the aliased hostdevs into the domain definition ──
+	if rerr := s.reconcileDomainDefinition(ctx, vm, members); rerr != nil {
+		if rbErr := rollback(); rbErr != nil {
+			slog.Error("pci start-preflight: rollback release incomplete after reconcile failure — left recoverable", "vm", vm.Name, "error", rbErr)
+			return nil, status.Errorf(codes.Internal,
+				"reconcile domain for %q failed and rollback could not release freshly-claimed device(s); left recoverable: %v", vm.Name, rerr)
+		}
+		finish()
+		return nil, rerr
+	}
+
+	// Success: the realization rows are the durable record now — clear the F1 lease.
+	// The returned release is invoked ONLY if the caller's StartDomain then fails; a
+	// release that cannot confirm the unbind leaves the freshly-claimed member owned +
+	// bound (recoverable on the operator's start retry), never unowned + bound.
+	finish()
+	return func() {
+		if rbErr := rollback(); rbErr != nil {
+			slog.Error("pci start-preflight: post-StartDomain-failure release incomplete — freshly-claimed device(s) left owned+bound (recoverable on retry)", "vm", vm.Name, "error", rbErr)
+		}
+	}, nil
+}
+
+// releaseDevices is the STRICT, HOST-SCOPED whole-VM PCI teardown: for every device
+// THIS host records as owned by vmName it consults the ACTUAL vfio driver state
+// (IsBoundToVFIO ground truth) and unbinds the ones still bound to vfio-pci, then
+// releases ownership PER DEVICE and owner-scoped (ReleasePCIDevice) ONLY if EVERY unbind
+// succeeded. If any unbind (or bound-check) failed it releases NOTHING and returns an
+// error — the same all-or-nothing invariant unbindAndReleaseOwnership enforces per-member,
+// applied to the whole VM set — so a still-bound device is NEVER left unowned-but-vfio-
+// bound. A release-WRITE failure after a clean unbind is likewise recoverable: it returns
+// the joined error so the caller does not complete over a leaked ownership row (a retry
+// converges — an owner-scoped re-release of an already-released row is a 0-row no-op and an
+// already-unbound device reads IsBoundToVFIO=false).
+//
+// It is HOST-SCOPED: it clears ONLY this host's ownership rows (the ones it just unbound).
+// A device a stale/migrated VM still owns on a DIFFERENT host is left for THAT host's own
+// teardown to release — clearing it here would leave the remote device unowned-but-vfio-
+// bound, since this host cannot unbind on the remote host. Cross-host cleanup is each
+// involved host's own responsibility.
+//
+// Both callers treat the error the same: they do NOT proceed past it. The pre-latch stop
+// leaves the stop recoverable; VM delete FAILS before tombstoning the vms row (so it never
+// leaves a stale owner of a deleted VM — which would block every future claim on that BDF),
+// leaving the delete retryable once the operator resolves the stuck device.
+func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
+	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return fmt.Errorf("list devices for release: %w", err)
+	}
+
+	var owned []string // THIS host's devices owned by vmName — the exact set to release
+	var failures []error
 	for _, d := range devices {
-		if d.VMName == vmName {
-			if err := vfio.Unbind(d.Address, d.Driver); err != nil {
-				slog.Warn("VFIO unbind failed", "address", d.Address, "error", err)
-			} else {
-				slog.Info("device unbound from vfio-pci", "address", d.Address, "restored_driver", d.Driver)
+		if d.VMName != vmName {
+			continue
+		}
+		owned = append(owned, d.Address)
+		bound, berr := vfio.IsBoundToVFIO(d.Address)
+		if berr != nil {
+			// Cannot prove the binding state → fail closed (treat as an unbind failure) so
+			// ownership is never released for a device we cannot confirm is unbound.
+			failures = append(failures, fmt.Errorf("check vfio binding for %s: %w", d.Address, berr))
+			continue
+		}
+		if !bound {
+			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+		}
+		if uerr := vfio.Unbind(d.Address, d.Driver); uerr != nil {
+			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", d.Address, uerr))
+		} else {
+			slog.Info("device unbound from vfio-pci", "address", d.Address, "restored_driver", d.Driver)
+		}
+	}
+
+	if len(failures) > 0 {
+		// Release NOTHING: every device stays owned by vmName and the still-bound ones stay
+		// bound. This is the invariant that prevents an unowned-but-vfio-bound orphan.
+		return fmt.Errorf("pci release: %d device(s) for %q could not be unbound: %w",
+			len(failures), vmName, errors.Join(failures...))
+	}
+
+	// Every unbind succeeded → release ONLY this host's ownership rows, per device and
+	// owner-scoped, so a remote host's rows are never touched. A release-write failure is
+	// recoverable (see the doc comment): return the joined error rather than complete over
+	// a leaked ownership row.
+	var relFailures []error
+	for _, addr := range owned {
+		if rerr := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); rerr != nil {
+			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", rerr)
+			relFailures = append(relFailures, fmt.Errorf("release %s ownership: %w", addr, rerr))
+		}
+	}
+	if len(relFailures) > 0 {
+		return fmt.Errorf("pci release: %d device(s) for %q could not be released in DB: %w",
+			len(relFailures), vmName, errors.Join(relFailures...))
+	}
+	return nil
+}
+
+// unbindAndReleaseOwnership is the ALL-OR-NOTHING, crash-safe release primitive — the
+// SOLE PCI release primitive, used by every op/recovery release site (the attach/start
+// rollbacks, lease recovery, and both the live detach and its crash recovery). It
+// discriminates bound-ness by the ACTUAL vfio driver state (vfio.IsBoundToVFIO), the
+// ground truth — NOT by realization presence,
+// which lies after a FIX-9c failed-start rollback that tombstones realizations while
+// retaining the binding.
+//
+// It requires owner == vmName for the NORMAL contract: it first reads host_pci_devices
+// ownership (fail-closed — a read error releases NOTHING and returns recoverable, since
+// ownership can't be determined) and, in BOTH the unbind and the release loops, ACTS ONLY on
+// addrs owned by vmName, SKIPS an unowned/absent addr, and ERRORS on a foreign owner:
+//   - owner == vmName → ACT (unbind if bound, then owner-scoped release). Our own member.
+//   - owner == "" (unowned) or addr ABSENT from the owner map → SKIP (unbind nothing, release
+//     nothing). In every legitimate normal flow the caller acts on its own owned members;
+//     an unowned addr was already released (idempotent retry no-op) or was never ours, so the
+//     primitive must never unbind a device it cannot prove is vmName's. (The durable-lease-
+//     authorized reclaim of a genuinely leaked unowned device lives in the SEPARATE
+//     reclaimLeasedDevices primitive — do NOT fold that reclaim back in here.)
+//   - owner == a DIFFERENT non-empty VM (foreign) → do NOT unbind, and collect a FOREIGN
+//     failure so the whole call returns a non-nil error. A foreign BDF handed to a normal
+//     release is a caller/operator bug (e.g. a legacy detach forwarding an operator-supplied
+//     BDF), not a success — failing keeps the op recovery-required rather than reporting a
+//     bogus success, and NO caller can unbind another live VM's OR an arbitrary unowned device.
+//
+// This is a no-op for every current legitimate caller (detach/start-rollback/attach-rollback/
+// migrate/releaseDevices all pass the VM's own owned members → owner == vmName).
+//
+// Per owned member: read the vfio driver state; if the device is bound to vfio-pci,
+// unbind it (restoring the host driver from host_pci_devices.Driver). A device that is NOT
+// bound is skipped — vfio.Unbind on a never-bound device is not a clean no-op (it clears
+// driver_override and reprobes). A bound-check FS error counts as a failure.
+//
+//   - If ANY member's unbind (or bound-check) failed → RELEASE NOTHING (no
+//     ReleasePCIDevice) and return the error. Every member stays owned, and the still-
+//     bound ones stay bound, so the caller can leave the operation recovery-required. A
+//     retry re-reads vfio state: a since-unbound member is skipped and the release
+//     converges — never leaving a device unowned-but-vfio-bound.
+//   - If every bound member unbound cleanly → owner-release ALL addrs (owner-scoped, a
+//     no-op for a device another VM has since claimed). If any release WRITE errors,
+//     attempt the rest anyway (a partial release is safe — owner-scoped release is
+//     idempotent) and RETURN the joined error so the caller leaves the op recovery-
+//     required rather than completing over a leaked, unclaimable ownership row. A retry
+//     re-reads vfio state: the already-unbound members are skipped (IsBoundToVFIO=false)
+//     and the owner-scoped re-release of an already-released device is a 0-row no-op, so
+//     the release converges.
+func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, addrs []string) error {
+	// Read host PCI ownership + the host-driver map. This read is the ONLY signal for which of
+	// the passed addrs are actually vmName's, so it is fail-closed: if it ERRORS we cannot
+	// determine ownership and must NOT act — release NOTHING and return a recoverable error
+	// rather than proceed on an empty map and risk unbinding a device another VM owns. (An
+	// operator-driven legacy detach forwards a raw BDF straight to this primitive; this
+	// ownership scope is what stops it from tearing down a DIFFERENT live VM's passthrough.)
+	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return fmt.Errorf("pci release: read device ownership for %q: %w", vmName, err)
+	}
+	drivers := map[string]string{}
+	owners := map[string]string{}
+	for _, d := range devices {
+		drivers[d.Address] = d.Driver
+		owners[d.Address] = d.VMName
+	}
+
+	var failures []error
+	for _, addr := range addrs {
+		// Require owner == vmName. An unowned/absent addr is SKIPPED (nothing proven ours);
+		// a foreign owner is a FOREIGN failure (fail the whole call). This makes the primitive
+		// structurally safe for EVERY caller: it never unbinds another live VM's device NOR an
+		// arbitrary unowned device, and a legacy detach that forwards a foreign operator-
+		// supplied BDF now errors instead of silently reporting success.
+		switch owner := owners[addr]; {
+		case owner == vmName:
+			// ours — fall through to the vfio act below.
+		case owner == "":
+			slog.Debug("pci release: skipping unowned/absent addr (not proven ours to unbind)",
+				"caller_vm", vmName, "address", addr)
+			continue
+		default:
+			failures = append(failures,
+				fmt.Errorf("refusing to release %s: owned by %q, not %q", addr, owner, vmName))
+			continue
+		}
+		bound, berr := vfio.IsBoundToVFIO(addr)
+		if berr != nil {
+			// Cannot prove the device's binding state → fail closed (treat as an unbind
+			// failure) so we never release a device we can't confirm is unbound.
+			failures = append(failures, fmt.Errorf("check vfio binding for %s: %w", addr, berr))
+			continue
+		}
+		if !bound {
+			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+		}
+		if uerr := vfio.Unbind(addr, drivers[addr]); uerr != nil {
+			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", addr, uerr))
+		}
+	}
+
+	if len(failures) > 0 {
+		// Release NOTHING: a still-bound member stays owned + bound (recoverable). This is
+		// the invariant that prevents an unowned-but-vfio-bound orphan.
+		return fmt.Errorf("pci release: %d of %d member(s) could not be unbound: %w",
+			len(failures), len(addrs), errors.Join(failures...))
+	}
+
+	var relFailures []error
+	for _, addr := range addrs {
+		// Release ONLY addrs owned by vmName — the same subset the unbind loop acted on. An
+		// unowned/absent addr has no ownership row of ours to release (skip); a foreign owner
+		// can't reach here (it would have short-circuited via failures above).
+		if owners[addr] != vmName {
+			continue
+		}
+		if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
+			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
+			relFailures = append(relFailures, fmt.Errorf("release %s ownership: %w", addr, err))
+		}
+	}
+	if len(relFailures) > 0 {
+		// The unbind already succeeded but a release WRITE failed → return recoverable so
+		// the caller does NOT tombstone/complete over a leaked ownership row. The retry
+		// converges: unbound members are skipped and owner-scoped re-release is a no-op.
+		return fmt.Errorf("pci release: %d of %d member(s) could not be released in DB: %w",
+			len(relFailures), len(addrs), errors.Join(relFailures...))
+	}
+	return nil
+}
+
+// reclaimGuestMode selects how reclaimLeasedDevices detaches a leased device from the
+// guest before unbinding it — chosen by the caller from the VM's live-domain disposition.
+type reclaimGuestMode int
+
+const (
+	// reclaimNoDomain: the VM row is gone (orphan lease) → no live domain to touch; skip
+	// the guest detach and go straight to unbind + owner-scoped release.
+	reclaimNoDomain reclaimGuestMode = iota
+	// reclaimLive: the domain is running → LIVE|CONFIG membership detach.
+	reclaimLive
+	// reclaimConfig: the domain is POSITIVELY shut off → CONFIG-only membership detach
+	// (the persistent definition), since a live-flagged detach on a shut-off domain is
+	// rejected by libvirt.
+	reclaimConfig
+)
+
+// reclaimLeasedDevices is the durable-lease-authorized RECOVERY primitive — the ONLY
+// primitive permitted to reclaim an UNOWNED (owner == "") device. That authorization comes
+// SOLELY from its addrs originating in a durable device-lease journal entry: the lease is the
+// proof that a dead/rolled-back allocation for vmName leaked these BDFs, so an
+// unowned-and-leased addr is a leak this reclaim must clean up. This is exactly what
+// unbindAndReleaseOwnership (the NORMAL primitive) must NEVER do — it cannot prove an
+// arbitrary unowned addr is anyone's, so it skips it. The two primitives are DELIBERATELY
+// separate; do NOT "simplify" them back together, or the normal release paths would regain a
+// hole that lets a raw BDF unbind an arbitrary unowned device.
+//
+// mode tells the primitive which guest-detach to run FIRST, keyed on the live-domain
+// DISPOSITION (not merely "the vm row exists"):
+//   - reclaimNoDomain (orphan lease, the VM row is gone): no domain to DumpXML → skip the
+//     guest detach entirely.
+//   - reclaimLive (domain running): LIVE|CONFIG membership detach (detachHostdevIfPresent).
+//   - reclaimConfig (domain shut off): CONFIG-only membership detach
+//     (detachHostdevConfigIfPresent) — a live-flagged detach a shut-off domain rejects
+//     would error and wedge the reclaim.
+//
+// Per addr (owner read from a fail-closed host_pci_devices read — a read error reclaims
+// NOTHING and returns recoverable):
+//   - owner == vmName OR owner == "" (unowned/absent) → RECLAIMABLE (ours, or an unowned leak
+//     the lease authorizes us to reclaim).
+//   - owner == a DIFFERENT non-empty VM → SKIP (the BDF was legitimately reclaimed by another
+//     live VM after the lease was written; never touch its passthrough).
+//
+// For each RECLAIMABLE addr the guest detach (when a domain exists) is membership-aware and
+// FAIL-CLOSED on a DumpXML error → return the error so the caller RETAINS the lease and
+// retries; never unbind a device still in a live guest. Then unbind-if-bound by the vfio
+// ground truth (all-or-nothing: any unbind/bound-check failure reclaims NOTHING and returns
+// recoverable) and, ONLY for addrs owned by vmName, owner-scoped ReleasePCIDevice (an unowned
+// addr has no ownership row to release — unbinding it is the whole reclaim).
+func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs []string, mode reclaimGuestMode) error {
+	// Fail-closed ownership read: the ONLY signal for which leased addrs are still ours (or
+	// unowned) vs since-reclaimed by another VM. On error, reclaim NOTHING (recoverable).
+	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return fmt.Errorf("pci reclaim: read device ownership for %q: %w", vmName, err)
+	}
+	drivers := map[string]string{}
+	owners := map[string]string{}
+	for _, d := range devices {
+		drivers[d.Address] = d.Driver
+		owners[d.Address] = d.VMName
+	}
+
+	// Partition: only addrs owned by this VM (or unowned — the lease authorizes the reclaim)
+	// are ours. An addr a DIFFERENT non-empty VM owns was legitimately reclaimed — skip it.
+	var reclaimable []string
+	for _, addr := range addrs {
+		if owner := owners[addr]; owner != "" && owner != vmName {
+			slog.Warn("pci reclaim: skipping addr reclaimed by another VM — not ours",
+				"lease_vm", vmName, "address", addr, "current_owner", owner)
+			continue
+		}
+		reclaimable = append(reclaimable, addr)
+	}
+
+	// Guest detach FIRST (only when a domain still exists), keyed on disposition. Fail
+	// closed on a DumpXML error and BEFORE any unbind: a device still in a live guest must
+	// never be unbound. A shut-off domain uses the CONFIG-only detach — a live-flagged
+	// detach it would reject. Retaining the lease (via the caller's error path) lets a
+	// later pass retry.
+	switch mode {
+	case reclaimLive:
+		for _, addr := range reclaimable {
+			if derr := s.detachHostdevIfPresent(vmName, addr); derr != nil {
+				return fmt.Errorf("pci reclaim: guest-detach %s from %q: %w", addr, vmName, derr)
+			}
+		}
+	case reclaimConfig:
+		for _, addr := range reclaimable {
+			if derr := s.detachHostdevConfigIfPresent(vmName, addr); derr != nil {
+				return fmt.Errorf("pci reclaim: config-detach %s from %q: %w", addr, vmName, derr)
 			}
 		}
 	}
 
-	if err := corrosion.ReleasePCIDevicesByVM(ctx, s.db, vmName); err != nil {
-		slog.Warn("failed to release PCI devices in DB", "vm", vmName, "error", err)
+	var failures []error
+	for _, addr := range reclaimable {
+		bound, berr := vfio.IsBoundToVFIO(addr)
+		if berr != nil {
+			failures = append(failures, fmt.Errorf("check vfio binding for %s: %w", addr, berr))
+			continue
+		}
+		if !bound {
+			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+		}
+		if uerr := vfio.Unbind(addr, drivers[addr]); uerr != nil {
+			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", addr, uerr))
+		}
 	}
-}
+	if len(failures) > 0 {
+		// All-or-nothing: release NOTHING so a still-bound member stays reclaimable on retry.
+		return fmt.Errorf("pci reclaim: %d of %d leased member(s) could not be unbound: %w",
+			len(failures), len(reclaimable), errors.Join(failures...))
+	}
 
-// releaseDeviceSet rolls back EXACTLY the devices an allocation claimed (unbind
-// from vfio-pci + owner-scoped DB release), leaving the VM's pre-existing
-// passthrough devices untouched. This is the rollback primitive for a FAILED
-// allocation/attach — using the whole-VM releaseDevices there would over-release
-// every device the VM already owned.
-func (s *Server) releaseDeviceSet(ctx context.Context, vmName string, addrs []string) {
-	drivers := map[string]string{}
-	if devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); err == nil {
-		for _, d := range devices {
-			drivers[d.Address] = d.Driver
+	var relFailures []error
+	for _, addr := range reclaimable {
+		// Owner-scoped release ONLY for addrs owned by vmName. An unowned leak has no
+		// ownership row to release — the unbind above was the whole reclaim.
+		if owners[addr] != vmName {
+			continue
+		}
+		if rerr := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); rerr != nil {
+			slog.Warn("pci reclaim: failed to release PCI device in DB", "vm", vmName, "address", addr, "error", rerr)
+			relFailures = append(relFailures, fmt.Errorf("release %s ownership: %w", addr, rerr))
 		}
 	}
-	for _, addr := range addrs {
-		if err := vfio.Unbind(addr, drivers[addr]); err != nil {
-			slog.Warn("VFIO unbind failed", "address", addr, "error", err)
-		}
-		// Owner-scoped: a no-op if another VM has since claimed this address.
-		if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
-			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
-		}
+	if len(relFailures) > 0 {
+		return fmt.Errorf("pci reclaim: %d leased member(s) for %q could not be released in DB: %w",
+			len(relFailures), vmName, errors.Join(relFailures...))
 	}
+	return nil
 }
 
 // checkIOMMUConflict verifies that no device in the same IOMMU group

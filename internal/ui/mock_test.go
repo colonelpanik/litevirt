@@ -71,6 +71,8 @@ type mockGRPC struct {
 	poolContentsResp     *pb.ListStoragePoolContentsResponse
 	poolContentsErr      error
 	lastPoolContentsReq  *pb.ListStoragePoolContentsRequest
+	listVMHardwareResp   *pb.ListVMHardwareResponse
+	listVMHardwareErr    error
 	uploadStream         *fakeUploadStream
 	uploadStreamErr      error
 
@@ -627,6 +629,19 @@ func (m *mockGRPC) DetachDevice(_ context.Context, in *pb.DetachDeviceRequest, _
 		return nil, m.detachDeviceErr
 	}
 	return &pb.VM{Name: in.VmName}, nil
+}
+
+// ListVMHardware backs the Hardware tab. A settable response
+// field lets tests inject disk/NIC/PCI devices; a settable error simulates
+// the RPC failing (e.g. VM not found) so the handler's error path is testable.
+func (m *mockGRPC) ListVMHardware(_ context.Context, in *pb.ListVMHardwareRequest, _ ...grpc.CallOption) (*pb.ListVMHardwareResponse, error) {
+	if m.listVMHardwareErr != nil {
+		return nil, m.listVMHardwareErr
+	}
+	if m.listVMHardwareResp == nil {
+		return &pb.ListVMHardwareResponse{}, nil
+	}
+	return m.listVMHardwareResp, nil
 }
 
 func (m *mockGRPC) ResizeDisk(_ context.Context, in *pb.ResizeDiskRequest, _ ...grpc.CallOption) (*pb.VM, error) {

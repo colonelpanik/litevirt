@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -430,6 +432,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// Prepare network interfaces
 	var netConfigs []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
+	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 
 	for i, n := range spec.Network {
 		bridge := n.Name // default: use network name as bridge
@@ -493,6 +496,23 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 			MAC:            mac,
 			IP:             n.Ip,
 			SecurityGroups: n.SecurityGroups,
+		})
+
+		// v42 dual-write: a vm_nics row alongside the legacy vm_interfaces row above,
+		// keyed by the deterministic (vmName, mac) id so it converges with what the
+		// Phase-6 backfill would derive for the same NIC. TapDevice stays empty here —
+		// unlike ifaceRecords (patched below once the domain is running), tap
+		// assignment is a start-time fact, not a create-time one.
+		nicRecords = append(nicRecords, corrosion.NICRecord{
+			VMName:         spec.Name,
+			ID:             corrosion.DeterministicNICID(spec.Name, mac),
+			NetworkName:    n.Name,
+			Model:          n.Model,
+			MAC:            mac,
+			Ordinal:        i,
+			IP:             n.Ip,
+			TapDevice:      "",
+			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
 	}
 
@@ -636,8 +656,9 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	}
 
 	// PCI device passthrough.
+	var pciIntents []corrosion.PCIIntentRecord
 	if len(spec.Devices) > 0 {
-		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices)
+		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices, deviceLeaseStageBound)
 		if devErr != nil {
 			cleanupDisks()
 			return nil, devErr
@@ -648,6 +669,14 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		for _, addr := range pciAddrs {
 			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
 		}
+		// vm_pci_intent rows for the declared devices, built via the shared
+		// buildPCIIntents helper (same classify/encode/canonicalize sequence the
+		// Phase-6 backfill audit uses) — so a create-time intent's device_id is
+		// byte-identical to what a later backfill pass would derive for the same
+		// selector. Built AFTER allocateDevices so a resource-mapping spec's
+		// resolved address (frozen onto spec.Address above) is captured, not the
+		// pre-resolution mapping alone.
+		pciIntents = s.buildPCIIntents(spec.Name, spec.Devices)
 	}
 
 	domXML, err := lv.GenerateDomainXML(vmCfg)
@@ -747,7 +776,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		Project:   project, // tenancy label
 	}
 
-	if err := corrosion.InsertVM(ctx, s.db, vmRecord, ifaceRecords, diskRecords); err != nil {
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	}
@@ -964,11 +993,104 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	return s.startVMLocked(ctx, vm)
 }
 
+// hardwareAdoptionRefused fails closed when the active hardware_v2 regime finds a VM
+// in the "blocked" adoption state — its hardware failed the per-VM compatibility
+// audit, so a mutation or (re)start must be refused until the operator repairs and
+// re-audits it. The check is INTENTIONALLY gated on hardwareV2Latched: pre-latch the
+// adoption state is informational only, so a blocked VM must keep running and stay
+// startable exactly as today (gating it before the feature is active would regress
+// start/hotplug for every audited-but-not-yet-latched VM). The returned error carries
+// the stored hardware_adoption_error so the caller sees the remediation reason.
+func (s *Server) hardwareAdoptionRefused(ctx context.Context, vmName string) error {
+	if !s.hardwareV2Latched(ctx) {
+		return nil
+	}
+	state, reason, err := corrosion.GetHardwareAdoptionState(ctx, s.db, vmName)
+	if err != nil {
+		// Fail closed: a read failure must not let a possibly-blocked VM mutate/start.
+		return status.Errorf(codes.Internal, "check hardware adoption state for %q: %v", vmName, err)
+	}
+	if state != "blocked" {
+		return nil
+	}
+	if reason == "" {
+		reason = "hardware adoption is blocked; repair and re-audit the VM's hardware before mutating or starting it"
+	}
+	return status.Errorf(codes.FailedPrecondition, "%s", reason)
+}
+
+// PrepareHardwareForStart runs the hardware_v2 pre-start obligations shared by EVERY
+// (re)start path — the manual RPCs (via startVMLocked) AND the automated
+// failover/reconciler/health/promote/restore paths that bypass startVMLocked. It is a
+// strict NO-OP unless hardware_v2 is latched (the adoption gate short-circuits on the
+// same latch, and the preflight block is latch-gated), so on a fleet where the feature
+// is off every caller behaves byte-for-behavior exactly as before.
+//
+// When latched it (1) applies the adoption gate — a "blocked" VM (hardware failed its
+// per-VM compatibility audit on this host) must not (re)start until the operator repairs
+// and re-audits it — and (2) runs the PCI start-preflight for a VM with reserved
+// vm_pci_intent rows: acquire leases (CAS ownership + vfio bind), persist realizations,
+// and reconcile the aliased <hostdev>s into the domain definition, all BEFORE
+// StartDomain. It fails CLOSED — a blocked VM, a vanished/unacquirable device, or a
+// realization/reconcile write failure returns the error (the caller must NOT start), and
+// the preflight self-cleans whatever it claimed. On success it returns a release func the
+// caller invokes ONLY if its subsequent StartDomain fails, so a failed start leaves no VM
+// bound to devices it never used; on the refusal/failure path release is a no-op.
+//
+// This is exported because the automated bypass paths live in other packages (the health
+// reconciler / vmchecker reach it via a daemon-wired callback); the daemon passes this
+// method as that hook.
+func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRecord) (release func(), err error) {
+	releasePreflight := func() {}
+	if vm == nil {
+		return releasePreflight, status.Errorf(codes.InvalidArgument, "prepare hardware for start: nil vm record")
+	}
+
+	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active
+	// hardware_v2 regime — this covers ALL start callers (StartVM, RestartVM, restore/
+	// autostart, the health reconciler/checker, promote, the resource coordinator).
+	// No-op pre-latch.
+	if aerr := s.hardwareAdoptionRefused(ctx, vm.Name); aerr != nil {
+		return releasePreflight, aerr
+	}
+
+	// PCI start-preflight: under the active hardware_v2 regime, a VM whose reserved
+	// vm_pci_intent rows are not yet realized must have its passthrough acquired
+	// (leases + vfio bind), realized (vm_pci_realizations), and reconciled into the
+	// domain XML BEFORE StartDomain. Fail-closed: a vanished/unacquirable device fails
+	// the start and releases whatever was claimed. GATED on hardwareV2Latched AND the
+	// VM actually having intents, so a non-PCI or pre-latch VM's start path is
+	// byte-for-behavior unchanged (no preflight, no bind attempt).
+	if s.hardwareV2Latched(ctx) {
+		intents, ierr := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
+		if ierr != nil {
+			return releasePreflight, status.Errorf(codes.Internal, "read PCI intents for %q: %v", vm.Name, ierr)
+		}
+		if len(intents) > 0 {
+			release, perr := s.pciStartPreflight(ctx, vm, intents)
+			if perr != nil {
+				// The preflight self-cleaned whatever it claimed; the VM does not start.
+				return releasePreflight, perr
+			}
+			releasePreflight = release
+		}
+	}
+	return releasePreflight, nil
+}
+
 // startVMLocked brings a LOCAL VM to running. The caller MUST hold the VM lock, have
 // re-read vm under it, confirmed local ownership, and passed the split-brain gate; it
 // never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
 // coordinator's restart path) call it directly under one lock.
 func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
+	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
+	// No-op pre-latch, so every start behaves byte-for-behavior as before until
+	// hardware_v2 latches.
+	releasePreflight, err := s.PrepareHardwareForStart(ctx, vm)
+	if err != nil {
+		return nil, err
+	}
+
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, pbVM, hspec)
@@ -990,6 +1112,10 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 			hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
 			return s.vmToProto(ctx, vm.Name)
 		}
+		// The start genuinely failed (not an already-running desync): release the PCI
+		// leases this start's preflight acquired so a failed start leaves no VM bound to
+		// devices it never used. A no-op unless a preflight ran.
+		releasePreflight()
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
 
@@ -1077,8 +1203,26 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		}
 	}
 
-	// Release PCI passthrough devices and unbind from vfio-pci.
-	s.releaseDevices(ctx, vm.Name)
+	// PCI passthrough on stop: under the active hardware_v2 regime a stopped VM
+	// RETAINS its device reservation (host_pci_devices ownership + vfio bind) so
+	// "assigned while off, realized while running" holds — the device stays reserved
+	// for this VM while it is off, and only detach or VM-delete releases it. FIX-9a
+	// made that ownership the shared reservation every producer contends on, so
+	// releasing it on stop would let another VM grab hardware this VM still declares
+	// (its vm_pci_intent persists). Gated on the latch: pre-latch keep the legacy
+	// unbind + clear (byte-for-behavior unchanged on the current fleet, and a
+	// mixed-version rollout degrades gracefully — an old node, or a new node pre-latch,
+	// stops-and-releases with no corruption).
+	if !s.hardwareV2Latched(ctx) {
+		// Strict release: if a device cannot be confirmed unbound, releaseDevices releases
+		// NOTHING and errors — leave the stop RECOVERABLE (return before marking the VM
+		// stopped-clean) so a retry re-drives (idempotent: an already-unbound device is
+		// skipped and the release converges). Never complete a stop that left a device
+		// unowned-but-vfio-bound.
+		if err := s.releaseDevices(ctx, vm.Name); err != nil {
+			return nil, status.Errorf(codes.Internal, "stop: releasing PCI device(s) failed; left recoverable: %v", err)
+		}
+	}
 
 	// Mark as "stopped" with detail indicating operator-initiated stop. This
 	// distinguishes operator stops from crashes (#29): losing this write lets HA
@@ -1152,6 +1296,44 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	}
 	s.recordVMEvent(ctx, vm.Name, "vm.restarted", "ok", "")
 	return out, nil
+}
+
+// checkNoRemotePCIOwner fails closed before a VM-delete tombstone if any LIVE host OTHER than
+// this one still holds a live host_pci_devices ownership row for vmName. DeleteVM normally
+// forwards to the VM's home host, so once the local releaseDevices has run (this host's rows
+// cleared to an empty vm_name) a surviving ownership row is a stale migration artifact (a
+// partial/failed migration that left a source-host reservation). Tombstoning the vms row over
+// a LIVE host's row would strand that device assigned to a now-deleted VM, blocking every
+// future ClaimPCIDevice CAS on that BDF forever. PCIOwnerHostsForVM already scopes to
+// non-decommissioned hosts, so a removed/dead host's inert row does NOT wedge the delete;
+// s.hostName is also defensively filtered out (already released). NOTE: on the peer-search
+// probe path (the recorded home host lacks the domain and a peer that actually holds it runs
+// the full delete), s.hostName is that peer, so the recorded-home-host row reads as "remote"
+// and correctly fails closed rather than stranding it. Fail closed → the delete is RETRYABLE
+// once the owning host releases the row. On the read error, also fail closed: never tombstone
+// on an unverifiable ownership state.
+func (s *Server) checkNoRemotePCIOwner(ctx context.Context, vmName string) error {
+	hosts, err := corrosion.PCIOwnerHostsForVM(ctx, s.db, vmName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "cannot delete VM %q: check remote PCI ownership: %v", vmName, err)
+	}
+	if remote := without(hosts, s.hostName); len(remote) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot delete VM %q: host(s) %s still own its PCI device(s); release them on those host(s) and retry",
+			vmName, strings.Join(remote, ", "))
+	}
+	return nil
+}
+
+// without returns ss with every occurrence of drop removed (order preserved).
+func without(ss []string, drop string) []string {
+	var out []string
+	for _, v := range ss {
+		if v != drop {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // deleteLocalOnly reports whether this DeleteVM call is a peer-search probe
@@ -1242,11 +1424,33 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 			// NotFound/unreachable on this peer — keep trying.
 		}
-		// No peer had it either. Clean up the stale Corrosion record.
+		// No peer had it either. Clean up the stale Corrosion record — but FIRST release any
+		// PCI devices this host still records as owned by the (now domain-less) VM. The domain
+		// can be gone out-of-band (crash mid-teardown, admin `virsh undefine`) while
+		// host_pci_devices ownership persisted; tombstoning the vms row while a device still
+		// points at this VM would leave a stale owner of a now-deleted VM — blocking every
+		// future ClaimPCIDevice CAS on that BDF forever (the exact class the main-path FIX-21
+		// gate fixed). releaseDevices is strict all-or-nothing and safe here: the domain is gone
+		// so there is no live guest — it just unbinds any still-bound host vfio + releases
+		// ownership, and is a no-op when the host owns no devices for the VM. FAIL BEFORE the
+		// tombstone on its error (retryable; never leave a stale owner or an unowned-but-bound
+		// device).
 		slog.Warn("DeleteVM: domain not found on any host — cleaning up stale record", "vm", req.Name)
+		if err := s.releaseDevices(ctx, req.Name); err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cannot clean up stale VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
+		}
+		// FIX-28: after the local release, a REMOTE host may still own this VM's PCI (a
+		// stale source-host reservation from a partial migration). Fail closed before the
+		// tombstone — otherwise that device is stranded on a now-deleted VM (same stale-owner
+		// class the local FIX-21/22 release guards against, one host over).
+		if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
+			return nil, err
+		}
 		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
 			slog.Error("failed to clean up stale VM record", "vm", req.Name, "error", err)
 		}
+		s.clearDeviceLease(req.Name)
 		return &emptypb.Empty{}, nil
 	}
 
@@ -1271,8 +1475,39 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.virt.DestroyDomain(req.Name)
 	}
 
-	// Release PCI passthrough devices and unbind from vfio-pci.
-	s.releaseDevices(ctx, req.Name)
+	// Release PCI passthrough devices and unbind from vfio-pci. releaseDevices is strict
+	// all-or-nothing: on a residual unbind (or bound-check) failure it releases NOTHING and
+	// errors, so the device stays OWNED-by-this-VM + bound rather than unowned + bound (the
+	// host driver could not reclaim it and another VM could then claim its ownerless row).
+	//
+	// FAIL BEFORE TOMBSTONING on that error. Tombstoning the vms row here while
+	// host_pci_devices.vm_name still points at this VM would leave a stale owner of a
+	// now-deleted VM — which blocks every future ClaimPCIDevice CAS on that BDF forever (a
+	// manual driver_override reset does NOT clear the DB ownership); it is not a benign,
+	// operator-cleanable leak. Returning now leaves the VM destroyed-but-defined with its row
+	// + device ownership intact, so the delete is fully RETRYABLE: the only prior destructive
+	// step is the DestroyDomain above (the VM is stopped), which a retry tolerates. The
+	// operator resolves the stuck device and retries; releaseDevices then succeeds (an
+	// already-unbound device reads IsBoundToVFIO=false → skip → release) and the delete
+	// proceeds. No stale owner row is ever created, and no unowned-but-vfio-bound device
+	// either. Applies equally to a --keep-disks delete (device release is disk-independent).
+	//
+	// FIX-28: releaseDevices touches only THIS host's rows. If a DIFFERENT host still owns
+	// the VM's PCI (a stale source-host reservation left by a partial migration), the local
+	// release leaves it — and tombstoning over it strands that device on a now-deleted VM
+	// (the same stale-owner class, one host over). So after the local release succeeds, and
+	// BEFORE the tombstone, fail closed on any surviving remote owner (retryable once that
+	// host releases its row; fail closed on the ownership-read error too).
+	if err := s.releaseDevices(ctx, req.Name); err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot delete VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
+	}
+	if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
+		return nil, err
+	}
+	// Devices released → clear any lingering durable device lease so a deleted VM's
+	// devlease:<vm> entry can't linger to drive a cross-VM unbind on recovery (FIX-22).
+	s.clearDeviceLease(req.Name)
 
 	// Undefine from libvirt. With --keep-disks, KEEP firmware state too (NVRAM is
 	// name-keyed and DomainUndefineNvram would delete it — bricking the retained
@@ -1357,6 +1592,26 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	return &emptypb.Empty{}, nil
 }
 
+// resolveDiskBus computes a disk's effective bus with the precedence: the
+// vm_disks.Bus column (dbBus) if set, else the bus declared for this disk's
+// name in the VM's stored spec blob (specBus, the caller's blob lookup — see
+// vmToProto's Spec.Disks projection and hardware.go's HardwareDisk assembly,
+// both of which resolve bus this same way), else the historical target-dev
+// heuristic (sd* -> scsi, else virtio). Never returns empty. dbBus is a v42
+// column not yet populated by every writer, hence the fallback chain.
+func resolveDiskBus(dbBus, specBus, targetDev string) string {
+	if dbBus != "" {
+		return dbBus
+	}
+	if specBus != "" {
+		return specBus
+	}
+	if strings.HasPrefix(targetDev, "sd") {
+		return "scsi"
+	}
+	return "virtio"
+}
+
 func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	vm, err := corrosion.GetVM(ctx, s.db, name)
 	if err != nil {
@@ -1429,12 +1684,19 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		}
 	}
 
-	// Build a map of disk name → spec size for backfill.
+	// Build a map of disk name → spec size for backfill, and disk name → spec
+	// bus for the bus-resolution fallback below (vm_disks.bus is a v42 column
+	// not yet populated by every writer — see the Bus resolution comment in
+	// the Spec.Disks projection).
 	specDiskSizes := make(map[string]int64)
+	specDiskBuses := make(map[string]string)
 	if spec != nil {
 		for _, ds := range spec.Disks {
 			if sz := parseDiskSizeBytes(ds.Size); sz > 0 {
 				specDiskSizes[ds.Name] = sz
+			}
+			if ds.Bus != "" {
+				specDiskBuses[ds.Name] = ds.Bus
 			}
 		}
 	}
@@ -1444,7 +1706,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	}
 
 	// Disks
-	disks, _ := corrosion.GetVMDisks(ctx, s.db, name)
+	disks, disksErr := corrosion.GetVMDisks(ctx, s.db, name)
 	for _, disk := range disks {
 		sizeBytes := disk.SizeBytes
 		// Fix missing or wrong size from the stored spec (works from any host).
@@ -1455,12 +1717,13 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			}
 		}
 		pbVM.Disks = append(pbVM.Disks, &pb.VMDisk{
-			Name:         disk.DiskName,
-			HostName:     disk.HostName,
-			Path:         disk.Path,
-			SizeBytes:    sizeBytes,
-			BackingImage: disk.BackingImage,
-			StorageType:  disk.StorageType,
+			Name:          disk.DiskName,
+			HostName:      disk.HostName,
+			Path:          disk.Path,
+			SizeBytes:     sizeBytes,
+			BackingImage:  disk.BackingImage,
+			StorageType:   disk.StorageType,
+			StorageVolume: disk.StorageVolume,
 		})
 	}
 
@@ -1473,12 +1736,123 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		}
 	}
 
-	// Attach spec to proto (already deserialized above).
+	// Project the authoritative device tables into the spec's device
+	// sub-fields so InspectVM stops reflecting a stale spec blob for the
+	// fields those tables now own. The stored blob itself is left untouched
+	// on disk — this is a read-time projection only.
+	if spec != nil {
+		// Spec.Disks: vm_disks is authoritative for name/size. Bus is a v42
+		// column not yet populated by every writer (writers land in
+		// Phase 5/7), so resolve it as: vm_disks.Bus
+		// if set, else the blob's bus for this disk name (never regress an
+		// existing disk to an empty bus), else the historical target-dev
+		// heuristic (sd* -> scsi, else virtio).
+		// Read errors here are fail-soft: leave the blob's Spec.Disks
+		// untouched rather than overwriting it with an empty projection
+		// (a transient corrosion read error must not blank a field the
+		// stored spec already had correct data for).
+		if disksErr != nil {
+			slog.Warn("failed to load VM disks for spec projection", "vm", name, "error", disksErr)
+		} else {
+			specDisks := make([]*pb.DiskSpec, 0, len(disks))
+			for _, disk := range disks {
+				bus := resolveDiskBus(disk.Bus, specDiskBuses[disk.DiskName], disk.TargetDev)
+				sizeBytes := disk.SizeBytes
+				if specSize, ok := specDiskSizes[disk.DiskName]; ok && specSize > sizeBytes {
+					sizeBytes = specSize
+				}
+				specDisks = append(specDisks, &pb.DiskSpec{
+					Name: disk.DiskName,
+					Size: formatDiskSizeBytes(sizeBytes),
+					Bus:  bus,
+				})
+			}
+			spec.Disks = specDisks
+		}
+
+		// Spec.Network: MergedVMNICs overlays vm_nics over legacy
+		// vm_interfaces (right now vm_nics is empty fleet-wide, so this
+		// reflects the legacy rows) — always more current than the stored
+		// blob. MergedVMNICs is unordered (map-backed overlay), so sort by
+		// Ordinal for a stable, meaningful position. Same fail-soft rule as
+		// Spec.Disks above: on a read error, leave the blob's Spec.Network
+		// untouched instead of blanking it.
+		nics, err := corrosion.MergedVMNICs(ctx, s.db, name)
+		if err != nil {
+			slog.Warn("failed to load merged NICs for spec projection", "vm", name, "error", err)
+		} else {
+			sort.Slice(nics, func(i, j int) bool { return nics[i].Ordinal < nics[j].Ordinal })
+			specNetwork := make([]*pb.NetworkAttachment, 0, len(nics))
+			for _, nic := range nics {
+				specNetwork = append(specNetwork, &pb.NetworkAttachment{
+					Name:  nic.NetworkName,
+					Model: nic.Model,
+					Mac:   nic.MAC,
+				})
+			}
+			spec.Network = specNetwork
+		}
+
+		// Spec.Devices: vm_pci_intent is DORMANT until Phase 6's device-
+		// request cutover populates it. Projecting unconditionally would
+		// BLANK spec.Devices for every VM today (the table is empty
+		// fleet-wide) and break the migration host-compatibility check at
+		// internal/ui/handle_vms.go, which reads vm.GetSpec().GetDevices().
+		// Only override once intents actually exist for this VM; otherwise
+		// leave the blob's Devices exactly as stored.
+		intents, err := corrosion.ListVMPCIIntents(ctx, s.db, name)
+		if err != nil {
+			slog.Warn("failed to load PCI intents for spec projection", "vm", name, "error", err)
+		}
+		if len(intents) > 0 {
+			specDevices := make([]*pb.DeviceSpec, 0, len(intents))
+			for _, intent := range intents {
+				ds := &pb.DeviceSpec{}
+				// selector_payload is protojson (per resolveDeviceIntents'
+				// decode contract), NOT encoding/json — use protojson here
+				// too so this round-trips with whatever the backfill / create path write.
+				if err := protojson.Unmarshal([]byte(intent.SelectorPayload), ds); err != nil {
+					slog.Warn("failed to decode PCI intent selector payload", "vm", name, "device_id", intent.DeviceID, "error", err)
+					continue
+				}
+				specDevices = append(specDevices, ds)
+			}
+			spec.Devices = specDevices
+		}
+	}
+
+	// Attach spec to proto (already deserialized/projected above).
 	if spec != nil {
 		pbVM.Spec = spec
 	}
 
 	return pbVM, nil
+}
+
+// formatDiskSizeBytes converts a byte count to a human-readable size string
+// (e.g. 21474836480 -> "20G"), choosing the largest unit that divides evenly
+// and falling back to a plain byte count otherwise. Mirrors
+// parseDiskSizeBytes's suffix contract so a projected DiskSpec.Size
+// round-trips through it.
+func formatDiskSizeBytes(n int64) string {
+	if n <= 0 {
+		return ""
+	}
+	const (
+		mib = 1024 * 1024
+		gib = 1024 * mib
+		tib = 1024 * gib
+	)
+	switch {
+	case n%tib == 0:
+		return fmt.Sprintf("%dT", n/tib)
+	case n%gib == 0:
+		return fmt.Sprintf("%dG", n/gib)
+	case n%mib == 0:
+		return fmt.Sprintf("%dM", n/mib)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 func vmStateToPB(s string) pb.VMState {
@@ -2467,12 +2841,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		pathByName[d.DiskName] = d.Path
 	}
 	var diskConfigs []lv.DiskConfig
+	seenDisk := make(map[string]bool)
 	if len(spec.Disks) > 0 {
 		for _, d := range spec.Disks {
 			name := d.Name
 			if name == "" {
 				name = "root"
 			}
+			seenDisk[name] = true
 			bus := d.Bus
 			if bus == "" {
 				bus = "virtio"
@@ -2491,12 +2867,43 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if d.TargetDev != "" && d.TargetDev[0] == 's' {
 				bus = "scsi"
 			}
+			seenDisk[d.DiskName] = true
 			diskConfigs = append(diskConfigs, lv.DiskConfig{
 				Name: d.DiskName,
 				Path: d.Path,
 				Bus:  bus,
 			})
 		}
+	}
+	// Disk-drop fix: a disk hot-plugged onto a running VM is written to vm_disks
+	// but NOT back into the spec blob, so rebuilding disks purely from spec.Disks
+	// silently DROPPED it on the next redefine. Append any vm_disks disk-kind row
+	// not already represented above, preserving its stored target_dev (and
+	// inferring the bus from that prefix, since attachDisk/CreateVM persist
+	// target_dev but not bus). The hot-plug target_dev is always assigned beyond
+	// the spec-disk range, so this can't collide with the positional target_dev
+	// the generator derives for the spec disks.
+	for _, d := range dbDisks {
+		if d.DeviceKind != "" && d.DeviceKind != "disk" {
+			continue
+		}
+		if seenDisk[d.DiskName] {
+			continue
+		}
+		bus := d.Bus
+		if bus == "" {
+			bus = "virtio"
+			if d.TargetDev != "" && d.TargetDev[0] == 's' {
+				bus = "scsi"
+			}
+		}
+		diskConfigs = append(diskConfigs, lv.DiskConfig{
+			Name:            d.DiskName,
+			Path:            d.Path,
+			Bus:             bus,
+			ControllerModel: d.ControllerModel,
+			TargetDev:       d.TargetDev,
+		})
 	}
 
 	// Build network configs from stored interfaces.

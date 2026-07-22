@@ -131,6 +131,100 @@ func TestMigrateVM_TargetNotActive(t *testing.T) {
 	}
 }
 
+// PCI passthrough cannot be re-realized cross-host in this release: once
+// hardware_v2 is latched, a VM holding PCI intent must be refused early —
+// before the split-brain gate / any target-side provisioning — with a clear
+// FailedPrecondition, not a confusing failure deep in migration machinery.
+func TestMigrateVM_RejectsPCIIntentWhenLatched(t *testing.T) {
+	s := testServerWithLocks(t)
+	ctx := adminCtx()
+	stream := &mockMigrateStream{ctx: ctx}
+
+	insertTestVM(t, ctx, s.db, "pci-vm", "test-host", "running")
+	insertTestHost(t, ctx, s.db, "active-host", "active")
+	addr := "0000:41:00.0"
+	if err := corrosion.UpsertPCIIntent(ctx, s.db, corrosion.PCIIntentRecord{
+		VMName:          "pci-vm",
+		DeviceID:        corrosion.DeterministicPCIIntentID("address|"+addr, 0),
+		HostName:        "test-host",
+		SelectorKind:    "address",
+		SelectorPayload: "{}",
+		ExclusiveKey:    &addr,
+	}); err != nil {
+		t.Fatalf("UpsertPCIIntent: %v", err)
+	}
+	enableHardwareV2(t, s)
+
+	err := s.MigrateVM(&pb.MigrateVMRequest{
+		VmName:     "pci-vm",
+		TargetHost: "active-host",
+	}, stream)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if c := status.Code(err); c != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", c)
+	}
+	if !strings.Contains(err.Error(), "PCI passthrough intent") {
+		t.Errorf("error = %q, want it to mention PCI passthrough intent", err.Error())
+	}
+}
+
+// Dormancy / no-regression proof: CreateVM now writes vm_pci_intent rows
+// unconditionally, even pre-latch, so the reject-gate must stay dormant until
+// hardware_v2 is latched — otherwise this ships as an instant regression for
+// the current fleet's PCI-VM migration. Later machinery may still fail for an
+// unrelated reason in this unit env; only the PCI-intent message must be absent.
+func TestMigrateVM_AllowsPCIIntentWhenNotLatched(t *testing.T) {
+	s := testServerWithLocks(t)
+	ctx := adminCtx()
+	stream := &mockMigrateStream{ctx: ctx}
+
+	insertTestVM(t, ctx, s.db, "pci-vm", "test-host", "running")
+	insertTestHost(t, ctx, s.db, "active-host", "active")
+	addr := "0000:41:00.0"
+	if err := corrosion.UpsertPCIIntent(ctx, s.db, corrosion.PCIIntentRecord{
+		VMName:          "pci-vm",
+		DeviceID:        corrosion.DeterministicPCIIntentID("address|"+addr, 0),
+		HostName:        "test-host",
+		SelectorKind:    "address",
+		SelectorPayload: "{}",
+		ExclusiveKey:    &addr,
+	}); err != nil {
+		t.Fatalf("UpsertPCIIntent: %v", err)
+	}
+	// hardware_v2 is deliberately NOT latched here.
+
+	err := s.MigrateVM(&pb.MigrateVMRequest{
+		VmName:     "pci-vm",
+		TargetHost: "active-host",
+	}, stream)
+	if err != nil && strings.Contains(err.Error(), "PCI passthrough intent") {
+		t.Errorf("PCI-intent rejection fired while hardware_v2 is not latched: %v", err)
+	}
+}
+
+// Control: the gate fires only on intent PRESENCE, not merely on the latch
+// being active — a latched VM with no vm_pci_intent rows must migrate past
+// this gate untouched.
+func TestMigrateVM_AllowsNoPCIIntentWhenLatched(t *testing.T) {
+	s := testServerWithLocks(t)
+	ctx := adminCtx()
+	stream := &mockMigrateStream{ctx: ctx}
+
+	insertTestVM(t, ctx, s.db, "plain-vm", "test-host", "running")
+	insertTestHost(t, ctx, s.db, "active-host", "active")
+	enableHardwareV2(t, s)
+
+	err := s.MigrateVM(&pb.MigrateVMRequest{
+		VmName:     "plain-vm",
+		TargetHost: "active-host",
+	}, stream)
+	if err != nil && strings.Contains(err.Error(), "PCI passthrough intent") {
+		t.Errorf("PCI-intent rejection fired for a VM with no PCI intent: %v", err)
+	}
+}
+
 // A migration is refused at the source when enforcement is latched and the source
 // lacks local quorum (ExecutionGate) — the split-brain recheck at the irreversible
 // step, covering the loss-of-quorum window and explicit operator migrations. The VM

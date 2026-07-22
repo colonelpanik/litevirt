@@ -2,16 +2,19 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 // testServerWithLocks returns a Server that has vmLocks and a dataDir, needed
@@ -204,6 +207,155 @@ func TestCreateVM_QuotaThenPlacementLabelsAndAntiAffinity(t *testing.T) {
 	}
 }
 
+// TestCreateVM_PopulatesHardwareTables is task 7.1's create-path case: a CreateVM
+// with one NIC and one PCI device must land vm_nics + vm_pci_intent rows — dual-
+// written alongside the legacy vm_interfaces row, not instead of it — and mark the
+// VM's hardware-adoption state "adopted", all from the SAME call that creates it
+// (no Phase-6 backfill needed for a VM created this way).
+func TestCreateVM_PopulatesHardwareTables(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.1", State: "active", CPUTotal: 8, MemTotal: 16384,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// The passthrough device must be in host inventory: every producer takes the shared
+	// host_pci_devices CAS reservation, and a BDF absent from inventory fails closed.
+	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	}); err != nil {
+		t.Fatalf("seed PCI device: %v", err)
+	}
+
+	resp, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name:      "vm1",
+		Cpu:       1,
+		MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+		Network:   []*pb.NetworkAttachment{{Name: "lo", Model: "virtio"}},
+		Devices:   []*pb.DeviceSpec{{Address: "0000:41:00.0"}},
+	}})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if resp.Name != "vm1" {
+		t.Fatalf("CreateVM resp.Name = %q, want vm1", resp.Name)
+	}
+
+	// Dual-write: the legacy vm_interfaces row is still there.
+	ifaces, err := corrosion.GetVMInterfaces(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("GetVMInterfaces: %v", err)
+	}
+	if len(ifaces) != 1 || ifaces[0].NetworkName != "lo" {
+		t.Fatalf("vm_interfaces (dual-write) = %+v, want 1 row on lo", ifaces)
+	}
+
+	nics, err := corrosion.GetVMNICsRaw(ctx, s.db, "vm_nics", "vm1")
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw: %v", err)
+	}
+	if len(nics) != 1 || nics[0].NetworkName != "lo" || nics[0].MAC != ifaces[0].MAC {
+		t.Fatalf("vm_nics = %+v, want 1 row on lo matching the vm_interfaces MAC %q", nics, ifaces[0].MAC)
+	}
+	if nics[0].TapDevice != "" {
+		t.Errorf("vm_nics[0].TapDevice = %q, want empty at create (assigned at start, not create)", nics[0].TapDevice)
+	}
+
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(intents) != 1 || intents[0].SelectorKind != "address" {
+		t.Fatalf("vm_pci_intent = %+v, want 1 address-kind row", intents)
+	}
+	if intents[0].ExclusiveKey == nil || *intents[0].ExclusiveKey != "0000:41:00.0" {
+		t.Errorf("vm_pci_intent[0].ExclusiveKey = %v, want 0000:41:00.0", intents[0].ExclusiveKey)
+	}
+
+	state, reason, err := corrosion.GetHardwareAdoptionState(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "adopted" {
+		t.Errorf("adoption state = %q, want adopted", state)
+	}
+	if reason != "" {
+		t.Errorf("adoption error = %q, want empty", reason)
+	}
+}
+
+// TestCreateVM_PCIIntentCanonicalizesAddress is a convergence-gap regression: a
+// device spec carrying a non-canonical concrete BDF (short-form bus, e.g.
+// "41:00.0") must still hash its vm_pci_intent.device_id off the CANONICAL BDF
+// ("0000:41:00.0") — matching what the Phase-6 backfill derives from libvirt's
+// canonicalized XML address (makeAddressedIntent). Without canonicalizing at
+// create time, CreateVM and a later backfill pass would derive two different
+// device_ids for the same physical device and fork into a divergent duplicate
+// vm_pci_intent row.
+func TestCreateVM_PCIIntentCanonicalizesAddress(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.1", State: "active", CPUTotal: 8, MemTotal: 16384,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Seed inventory at the resolver's (non-canonical) address form: the shared CAS
+	// reservation claims the address the spec resolves to, and a missing BDF fails closed.
+	// The device_id derivation is canonicalized independently (asserted below).
+	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	}); err != nil {
+		t.Fatalf("seed PCI device: %v", err)
+	}
+
+	spec := &pb.VMSpec{
+		Name:      "vm1",
+		Cpu:       1,
+		MemoryMib: 512,
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+		Devices:   []*pb.DeviceSpec{{Address: "41:00.0"}},
+	}
+	resp, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if resp.Name != "vm1" {
+		t.Fatalf("CreateVM resp.Name = %q, want vm1", resp.Name)
+	}
+
+	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("vm_pci_intent = %+v, want 1 row", intents)
+	}
+
+	wantID := corrosion.DeterministicPCIIntentID(
+		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: "0000:41:00.0"}), 0)
+	if intents[0].DeviceID != wantID {
+		t.Errorf("vm_pci_intent[0].DeviceID = %q, want %q (id derived from the canonical BDF)",
+			intents[0].DeviceID, wantID)
+	}
+
+	// The input spec passed to CreateVM must not be mutated by the
+	// canonicalization — only a clone used for the intent should change.
+	if spec.Devices[0].Address != "41:00.0" {
+		t.Errorf("input spec.Devices[0].Address = %q, want unchanged 41:00.0", spec.Devices[0].Address)
+	}
+}
+
 func TestListVMs_Empty(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()
@@ -288,6 +440,320 @@ func TestInspectVM_Found(t *testing.T) {
 	}
 	if vm.State != pb.VMState_VM_RUNNING {
 		t.Errorf("State = %v, want RUNNING", vm.State)
+	}
+}
+
+// TestInspectVM_ProjectsDisksAndStorageVolume covers two disk-side
+// requirements: pbVM.Disks[i].StorageVolume must come through (previously
+// dropped), and pbVM.Spec.Disks must be rebuilt from the authoritative
+// vm_disks rows rather than the stale spec blob — including the bus
+// resolution fallback chain (vm_disks.Bus -> blob bus by name -> target-dev
+// heuristic) since vm_disks.bus is not yet persisted by every writer.
+func TestInspectVM_ProjectsDisksAndStorageVolume(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	blob, err := json.Marshal(&pb.VMSpec{
+		Disks: []*pb.DiskSpec{
+			{Name: "root", Size: "10G", Bus: "scsi"}, // stale: DB below says 20G, no bus yet
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "disk-proj", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// "root": vm_disks.bus is empty (not yet persisted) -> must fall back to
+	// the blob's bus for this disk name ("scsi"), not go empty.
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "disk-proj", DiskName: "root", HostName: "other-host",
+		Path: "/var/lib/litevirt/disk-proj/root.qcow2", SizeBytes: 20 * 1024 * 1024 * 1024,
+		StorageType: "dir", StorageVolume: "pool0/vol1", TargetDev: "vda",
+	}); err != nil {
+		t.Fatalf("InsertDisk(root): %v", err)
+	}
+	// "data": vm_disks.bus is empty AND this disk name isn't in the blob at
+	// all -> must fall back to the target-dev heuristic (sd* -> scsi).
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "disk-proj", DiskName: "data", HostName: "other-host",
+		Path: "/var/lib/litevirt/disk-proj/data.qcow2", SizeBytes: 5 * 1024 * 1024 * 1024,
+		StorageType: "dir", StorageVolume: "pool1/vol2", TargetDev: "sdb",
+	}); err != nil {
+		t.Fatalf("InsertDisk(data): %v", err)
+	}
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "disk-proj"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+
+	if len(resp.Disks) != 2 {
+		t.Fatalf("Disks = %d, want 2", len(resp.Disks))
+	}
+	byName := map[string]*pb.VMDisk{}
+	for _, d := range resp.Disks {
+		byName[d.Name] = d
+	}
+	if got := byName["root"].StorageVolume; got != "pool0/vol1" {
+		t.Errorf("root StorageVolume = %q, want pool0/vol1", got)
+	}
+	if got := byName["data"].StorageVolume; got != "pool1/vol2" {
+		t.Errorf("data StorageVolume = %q, want pool1/vol2", got)
+	}
+
+	if resp.Spec == nil {
+		t.Fatal("Spec is nil")
+	}
+	specByName := map[string]*pb.DiskSpec{}
+	for _, ds := range resp.Spec.Disks {
+		specByName[ds.Name] = ds
+	}
+	if len(specByName) != 2 {
+		t.Fatalf("Spec.Disks = %d, want 2", len(specByName))
+	}
+	if got := specByName["root"].Size; got != "20G" {
+		t.Errorf("root Spec.Disks size = %q, want 20G (vm_disks authoritative, blob's 10G is stale)", got)
+	}
+	if got := specByName["root"].Bus; got != "scsi" {
+		t.Errorf("root Spec.Disks bus = %q, want scsi (fallback to blob bus; vm_disks.bus not persisted)", got)
+	}
+	if got := specByName["data"].Bus; got != "scsi" {
+		t.Errorf("data Spec.Disks bus = %q, want scsi (target-dev heuristic for sdb; not in blob)", got)
+	}
+}
+
+// TestInspectVM_PreservesSpecDisksOnDiskReadError is the fail-soft
+// counterpart to TestInspectVM_ProjectsDisksAndStorageVolume: when the
+// vm_disks read itself errors — simulated here by dropping the table via
+// the same forced-error idiom used elsewhere in this package (e.g.
+// container_failclosed_test.go's `DROP TABLE containers`) — the projection
+// must NOT overwrite Spec.Disks with an empty slice. The blob's Disks must
+// pass through untouched instead of being blanked by a transient read
+// failure.
+func TestInspectVM_PreservesSpecDisksOnDiskReadError(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	blob, err := json.Marshal(&pb.VMSpec{
+		Disks: []*pb.DiskSpec{{Name: "root", Size: "10G", Bus: "virtio"}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "disk-read-err", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Force GetVMDisks to fail: drop the table it queries, AFTER InsertVM
+	// (which itself touches vm_disks). The vms table (used by GetVM) is
+	// untouched, so InspectVM still finds the VM and reaches the projection.
+	if err := s.db.Execute(ctx, `DROP TABLE vm_disks`); err != nil {
+		t.Fatalf("DROP TABLE vm_disks: %v", err)
+	}
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "disk-read-err"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if resp.Spec == nil {
+		t.Fatal("Spec is nil")
+	}
+	if len(resp.Spec.Disks) != 1 {
+		t.Fatalf("Spec.Disks = %d, want 1 (blob untouched on read error, not blanked)", len(resp.Spec.Disks))
+	}
+	if got := resp.Spec.Disks[0]; got.Name != "root" || got.Size != "10G" || got.Bus != "virtio" {
+		t.Errorf("Spec.Disks[0] = %+v, want blob's root/10G/virtio", got)
+	}
+}
+
+// TestInspectVM_ProjectsNetworkFromLegacyOverlay covers the network-projection
+// requirement in its Phase-4 dormancy state: vm_nics is empty fleet-wide, so
+// MergedVMNICs surfaces the legacy vm_interfaces row via its overlay, and
+// that overlay result — not the stale spec blob — must be what
+// resp.Spec.Network reflects.
+func TestInspectVM_ProjectsNetworkFromLegacyOverlay(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	blob, err := json.Marshal(&pb.VMSpec{
+		Network: []*pb.NetworkAttachment{{Name: "stale-net", Model: "e1000", Mac: "00:00:00:00:00:00"}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "net-proj", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Legacy vm_interfaces row -- vm_nics is empty in this phase (the
+	// backfill hasn't run yet); MergedVMNICs must still surface it.
+	if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{
+		VMName: "net-proj", NetworkName: "lan0", Ordinal: 0,
+		MAC: "52:54:00:aa:bb:cc", IP: "10.0.0.5",
+	}); err != nil {
+		t.Fatalf("InsertInterface: %v", err)
+	}
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "net-proj"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if resp.Spec == nil {
+		t.Fatal("Spec is nil")
+	}
+	if len(resp.Spec.Network) != 1 {
+		t.Fatalf("Spec.Network = %d, want 1 (overlay result, not the blob)", len(resp.Spec.Network))
+	}
+	nic := resp.Spec.Network[0]
+	if nic.Name != "lan0" || nic.Mac != "52:54:00:aa:bb:cc" {
+		t.Errorf("Spec.Network[0] = %+v, want lan0/52:54:00:aa:bb:cc", nic)
+	}
+	if nic.Model != "virtio" {
+		t.Errorf("Spec.Network[0].Model = %q, want virtio (legacy vm_interfaces synthesized default)", nic.Model)
+	}
+	for _, n := range resp.Spec.Network {
+		if n.Name == "stale-net" {
+			t.Errorf("stale blob network %q leaked into projected Spec.Network", n.Name)
+		}
+	}
+}
+
+// TestInspectVM_PreservesSpecNetworkOnNICReadError is the fail-soft
+// counterpart to TestInspectVM_ProjectsNetworkFromLegacyOverlay: when
+// MergedVMNICs itself errors — simulated by dropping vm_nics, which
+// GetVMNICsRaw queries before vm_interfaces so the error surfaces without
+// needing to also touch the legacy table — the projection must NOT
+// overwrite Spec.Network with an empty slice. The blob's Network must pass
+// through untouched instead of being blanked by a transient read failure.
+func TestInspectVM_PreservesSpecNetworkOnNICReadError(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	blob, err := json.Marshal(&pb.VMSpec{
+		Network: []*pb.NetworkAttachment{{Name: "lan0", Model: "e1000", Mac: "52:54:00:aa:bb:cc"}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "net-read-err", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Force MergedVMNICs to fail: drop vm_nics. InsertVM doesn't touch
+	// vm_nics (only vm_disks/vm_interfaces/vms), so this is safe to do after
+	// the insert above; the vms table (used by GetVM) is untouched, so
+	// InspectVM still finds the VM and reaches the projection.
+	if err := s.db.Execute(ctx, `DROP TABLE vm_nics`); err != nil {
+		t.Fatalf("DROP TABLE vm_nics: %v", err)
+	}
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "net-read-err"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if resp.Spec == nil {
+		t.Fatal("Spec is nil")
+	}
+	if len(resp.Spec.Network) != 1 {
+		t.Fatalf("Spec.Network = %d, want 1 (blob untouched on read error, not blanked)", len(resp.Spec.Network))
+	}
+	if got := resp.Spec.Network[0]; got.Name != "lan0" || got.Model != "e1000" || got.Mac != "52:54:00:aa:bb:cc" {
+		t.Errorf("Spec.Network[0] = %+v, want blob's lan0/e1000/52:54:00:aa:bb:cc", got)
+	}
+}
+
+// TestInspectVM_DevicesDormantWithoutPCIIntents is the dormancy guard: Task
+// 4.1 runs before Phase 6 populates vm_pci_intent, so the table is empty for
+// every VM today. Projecting spec.Devices unconditionally would blank it for
+// every VM and break the migration host-compatibility check at
+// internal/ui/handle_vms.go (vm.GetSpec().GetDevices()). With zero intent
+// rows, the blob's Devices must pass through untouched.
+func TestInspectVM_DevicesDormantWithoutPCIIntents(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	blob, err := json.Marshal(&pb.VMSpec{
+		Devices: []*pb.DeviceSpec{{Type: "gpu", Vendor: "10de", Count: 1}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "dev-dormant", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// Deliberately NO vm_pci_intent rows inserted.
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "dev-dormant"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if resp.Spec == nil {
+		t.Fatal("Spec is nil")
+	}
+	if len(resp.Spec.Devices) != 1 {
+		t.Fatalf("Spec.Devices = %d, want 1 (blob untouched; no PCI intents yet)", len(resp.Spec.Devices))
+	}
+	if got := resp.Spec.Devices[0]; got.Type != "gpu" || got.Vendor != "10de" || got.Count != 1 {
+		t.Errorf("Spec.Devices[0] = %+v, want blob's gpu/10de/1", got)
+	}
+}
+
+// TestInspectVM_ProjectsDevicesFromPCIIntents is the positive counterpart to
+// the dormancy guard above: once vm_pci_intent rows exist for a VM (Phase 6+),
+// spec.Devices must be rebuilt from them (protojson-decoded selector_payload,
+// matching resolveDeviceIntents' decode contract) instead of the stale blob.
+func TestInspectVM_ProjectsDevicesFromPCIIntents(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	blob, err := json.Marshal(&pb.VMSpec{
+		Devices: []*pb.DeviceSpec{{Type: "stale", Vendor: "0000", Count: 9}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "dev-proj", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	payload, err := protojson.Marshal(&pb.DeviceSpec{Type: "gpu", Vendor: "10de", Count: 2})
+	if err != nil {
+		t.Fatalf("protojson.Marshal: %v", err)
+	}
+	if err := corrosion.UpsertPCIIntent(ctx, s.db, corrosion.PCIIntentRecord{
+		VMName: "dev-proj", DeviceID: "dev0", HostName: "other-host",
+		SelectorKind: "type", SelectorPayload: string(payload),
+	}); err != nil {
+		t.Fatalf("UpsertPCIIntent: %v", err)
+	}
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "dev-proj"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if resp.Spec == nil {
+		t.Fatal("Spec is nil")
+	}
+	if len(resp.Spec.Devices) != 1 {
+		t.Fatalf("Spec.Devices = %d, want 1 (projected from vm_pci_intent, blob replaced)", len(resp.Spec.Devices))
+	}
+	got := resp.Spec.Devices[0]
+	if got.Type != "gpu" || got.Vendor != "10de" || got.Count != 2 {
+		t.Errorf("Spec.Devices[0] = %+v, want gpu/10de/2 (from intent, not stale blob)", got)
 	}
 }
 

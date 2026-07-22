@@ -119,28 +119,6 @@ func TestAssignPCIDevice(t *testing.T) {
 	}
 }
 
-func TestReleasePCIDevicesByVM(t *testing.T) {
-	c := testClient(t)
-	ctx := context.Background()
-
-	UpsertPCIDevice(ctx, c, PCIDeviceRecord{HostName: "node1", Address: "0000:41:00.0", Type: "gpu", VendorID: "10de", DeviceID: "2236"})
-	UpsertPCIDevice(ctx, c, PCIDeviceRecord{HostName: "node1", Address: "0000:42:00.0", Type: "gpu", VendorID: "10de", DeviceID: "2237"})
-
-	AssignPCIDevice(ctx, c, "node1", "0000:41:00.0", "vm1")
-	AssignPCIDevice(ctx, c, "node1", "0000:42:00.0", "vm1")
-
-	if err := ReleasePCIDevicesByVM(ctx, c, "vm1"); err != nil {
-		t.Fatalf("ReleasePCIDevicesByVM: %v", err)
-	}
-
-	devices, _ := ListPCIDevices(ctx, c, "node1", "")
-	for _, d := range devices {
-		if d.VMName != "" {
-			t.Errorf("device %s still assigned to %q after release", d.Address, d.VMName)
-		}
-	}
-}
-
 func TestSoftDeletePCIDevice(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()

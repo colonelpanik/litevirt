@@ -393,13 +393,23 @@ var capabilityMap = map[string]tableResolver{
 		}, "control_plane"),
 		ruleContentMax(),
 	}},
-	"host_labels":             {category: "content", chain: contentDefaultChain()},
-	"host_health":             {category: "content", chain: contentDefaultChain()},
-	"images":                  {category: "content", chain: contentDefaultChain()},
-	"image_hosts":             {category: "content", chain: contentDefaultChain()},
-	"stacks":                  {category: "content", chain: contentOpaqueChain("spec", "compose_yaml")},
-	"vm_interfaces":           {category: "content", chain: contentDefaultChain()},
-	"vm_disks":                {category: "content", chain: contentDefaultChain()},
+	"host_labels":   {category: "content", chain: contentDefaultChain()},
+	"host_health":   {category: "content", chain: contentDefaultChain()},
+	"images":        {category: "content", chain: contentDefaultChain()},
+	"image_hosts":   {category: "content", chain: contentDefaultChain()},
+	"stacks":        {category: "content", chain: contentOpaqueChain("spec", "compose_yaml")},
+	"vm_interfaces": {category: "content", chain: contentDefaultChain()},
+	"vm_disks":      {category: "content", chain: contentDefaultChain()},
+	// v42 hardware foundation: vm_nics is the multi-NIC successor to
+	// vm_interfaces — same shape, same treatment.
+	"vm_nics": {category: "content", chain: contentDefaultChain()},
+	// v42 hardware foundation: vm_pci_intent's selector_payload is a workload
+	// DEFINITION (what device the VM wants attached), like vms.spec — never
+	// content-max it. vm_pci_realizations is the RESOLVED/computed outcome of an
+	// intent (concrete address/alias), like vm_disks/host_pci_devices — plain
+	// content-default.
+	"vm_pci_intent":           {category: "content", chain: contentOpaqueChain("selector_payload")},
+	"vm_pci_realizations":     {category: "content", chain: contentDefaultChain()},
 	"snapshots":               {category: "content", chain: contentDefaultChain()},
 	"dns_records":             {category: "content", chain: contentDefaultChain()},
 	"fencing_log":             {category: "content", chain: contentDefaultChain()},

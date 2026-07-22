@@ -182,6 +182,7 @@ func (s *Server) autoDefineRestoredVM(
 	// restored VM can't collide on L2 with the still-running original.
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
+	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	for i, n := range spec.Network {
 		mac := n.Mac
 		if renamed || mac == "" {
@@ -197,6 +198,17 @@ func (s *Server) autoDefineRestoredVM(
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: targetName, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: n.Ip,
+		})
+		nicRecords = append(nicRecords, corrosion.NICRecord{
+			VMName:         targetName,
+			ID:             corrosion.DeterministicNICID(targetName, mac),
+			NetworkName:    n.Name,
+			Model:          n.Model,
+			MAC:            mac,
+			Ordinal:        i,
+			IP:             n.Ip,
+			TapDevice:      "",
+			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
 	}
 
@@ -232,7 +244,25 @@ func (s *Server) autoDefineRestoredVM(
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}
+
+	// hardware_v2 pre-start (adoption gate + PCI preflight); no-op unless latched, so a
+	// fleet with the feature off restores exactly as before. A restore always targets a
+	// fresh name (name-collision is refused earlier), so it carries no reserved PCI
+	// intents → the preflight is a no-op and only the adoption gate can fire (refusing an
+	// auto-start into a name the operator has flagged blocked). release() runs only if the
+	// subsequent StartDomain fails.
+	hwSpecJSON, _ := json.Marshal(spec)
+	hwRec := &corrosion.VMRecord{
+		Name: targetName, HostName: s.hostName, Spec: string(hwSpecJSON),
+		CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib), Project: project,
+	}
+	releaseHW, hwErr := s.PrepareHardwareForStart(ctx, hwRec)
+	if hwErr != nil {
+		_ = s.virt.UndefineDomain(targetName, false)
+		return "", "", hwErr
+	}
 	if err := s.virt.StartDomain(targetName); err != nil {
+		releaseHW()
 		// Roll back the definition but KEEP the overlay + NBD so the operator can
 		// retry define/start against the still-valid source. For a firmware VM the
 		// deferred rollback additionally wipes the materialized NVRAM/swtpm.
@@ -252,7 +282,18 @@ func (s *Server) autoDefineRestoredVM(
 		State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 		Project: project,
 	}
-	if err := corrosion.InsertVM(ctx, s.db, vmRecord, ifaceRecords, diskRecords); err != nil {
+	// PCI intents: NONE. The restored domain built above (GenerateDomainXML)
+	// emits Disks + Networks only — it never attaches Hostdevs from spec.Devices
+	// (a disk replica / NBD overlay carries no physical device to recover), exactly
+	// like promote.go. Writing a concrete-address intent here would therefore create
+	// a live exclusive_key reservation (PCIIntentExclusiveOwner ignores
+	// adoption_state) for a device the VM never attaches — a phantom cross-VM
+	// reservation blocking another VM from attaching that BDF indefinitely. Pass nil;
+	// if the source VM genuinely had passthrough, the Phase-6 backfill audit imports
+	// it from the (device-less) inactive definition, which correctly imports nothing.
+	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
+	// the backfill audit confirms/reconciles.
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the

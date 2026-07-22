@@ -53,6 +53,193 @@ func TestHandler_VMDetail_NotFound(t *testing.T) {
 	assertStatus(t, w, http.StatusNotFound)
 }
 
+// TestHandler_VMHardwareTab verifies the Hardware tab fragment renders the
+// typed disk/NIC/PCI device table from ListVMHardware.
+func TestHandler_VMHardwareTab(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{
+				DeviceId: "root", Target: "vdb", Bus: "virtio", SizeBytes: 10 << 30,
+				StorageType: "local", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Nic{Nic: &pb.HardwareNIC{
+				Mac: "52:54:00:aa:bb:cc", Network: "br0", Model: "virtio", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Members: []*pb.HardwarePCIMember{{MemberId: "m0", ResolvedAddress: "0000:41:00.0", XmlAlias: "hostdev0"}},
+			}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "vdb")
+	assertContains(t, w, "52:54:00:aa:bb:cc")
+}
+
+func TestHandler_VMHardwareTab_NotFound(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareErr = errSimulated
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusNotFound)
+}
+
+// TestHandler_HardwareTab_BlockedBanner verifies that when a
+// VM's PCI adoption is blocked, the Hardware tab must surface the reason in a
+// banner and omit the attach forms (read-only) rather than let an operator
+// submit a mutation the backend will independently reject.
+func TestHandler_HardwareTab_BlockedBanner(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "blocked",
+		HardwareAdoptionError: "ambiguous PCI grouping",
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "ambiguous PCI grouping")
+	if strings.Contains(w.Body.String(), "attach-disk") {
+		t.Error("blocked adoption state: response body contains an attach-disk form, want none")
+	}
+}
+
+// TestHandler_HardwareTab_AddFormsWhenAdopted asserts the converse of the
+// blocked-banner test: once adoption is resolved (or was never gated), the
+// tab renders the add/detach forms that mutate hardware via the existing
+// attach/detach handlers.
+func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "adopted",
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{
+				DeviceId: "root", Target: "vdb", Bus: "virtio", SizeBytes: 10 << 30,
+				StorageType: "local", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Nic{Nic: &pb.HardwareNIC{
+				Mac: "52:54:00:aa:bb:cc", Network: "br0", Model: "virtio", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Members: []*pb.HardwarePCIMember{{MemberId: "m0", ResolvedAddress: "0000:41:00.0", XmlAlias: "hostdev0"}},
+			}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "attach-disk")
+	assertContains(t, w, "attach-nic")
+	assertContains(t, w, "attach-pci")
+	assertContains(t, w, "detach-disk")
+	assertContains(t, w, "detach-nic")
+	assertContains(t, w, "detach-pci")
+}
+
+// TestHandler_HardwareTab_ReservedPCIDetachable verifies a reserved (0-member)
+// PCI device — the reserve-at-attach state of a stopped VM — renders its
+// reserved address (not a blank cell) and exactly one detach control. The bug:
+// detach forms lived inside the members loop, so a 0-member device had no detach
+// button and an empty address.
+func TestHandler_HardwareTab_ReservedPCIDetachable(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "adopted",
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "reserved",
+				Desired: &pb.DeviceSpec{Address: "0000:99:00.0"},
+				// No Members — reserved, not yet realized.
+			}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "0000:99:00.0")         // reserved address shown, not "—"
+	assertContains(t, w, "reserved")             // state badge / label
+	assertContains(t, w, `value="0000:99:00.0"`) // detach keyed by desired address
+	if n := strings.Count(w.Body.String(), `name="pci_address"`); n != 1 {
+		t.Errorf("got %d detach forms, want exactly 1 for a reserved device", n)
+	}
+}
+
+// TestHandler_HardwareTab_IOMMUGroupSingleDetach verifies a multi-member
+// (IOMMU-group) PCI device renders exactly one detach control keyed by the
+// primary/desired address — not one-per-member (a sibling address does not match
+// the intent's ExclusiveKey and its detach would fail).
+func TestHandler_HardwareTab_IOMMUGroupSingleDetach(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "adopted",
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Desired: &pb.DeviceSpec{Address: "0000:41:00.0"},
+				Members: []*pb.HardwarePCIMember{
+					{MemberId: "m0", ResolvedAddress: "0000:41:00.0"},
+					{MemberId: "m1", ResolvedAddress: "0000:41:00.1"},
+				},
+			}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	if n := strings.Count(w.Body.String(), `name="pci_address"`); n != 1 {
+		t.Errorf("got %d detach forms, want exactly 1 for an IOMMU group", n)
+	}
+	assertContains(t, w, `value="0000:41:00.0"`) // keyed by primary
+	if strings.Contains(w.Body.String(), `value="0000:41:00.1"`) {
+		t.Error("detach form keyed by a sibling member address (0000:41:00.1); want primary only")
+	}
+}
+
+// TestHandler_HardwareTab_NICDropdown verifies the fix for the NIC-dropdown
+// parity gap: now that the edit modal's Network pane is
+// retired, the tab's own NIC-attach form must offer the same networks
+// dropdown the modal used to (not a free-text bridge input).
+func TestHandler_HardwareTab_NICDropdown(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "adopted",
+	}
+	mock.listNetworksResp = &pb.ListNetworksResponse{
+		Networks: []*pb.NetworkInfo{{Name: "lan0"}},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, `<select name="bridge"`)
+	assertContains(t, w, `>lan0<`)
+}
+
+// TestHandler_VMDetail_TabHardware covers the ?tab=hardware full-page load —
+// the Hardware body must server-render, not only be reachable via htmx.
+func TestHandler_VMDetail_TabHardware(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{Target: "vdb", Bus: "virtio"}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/vms/vm1?tab=hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "vdb")
+}
+
 func TestHandler_VMsTable(t *testing.T) {
 	s := newTestUIServer(t, newDefaultMock())
 	r := withAuth(mustReq(t, "GET", "/ui/vms-table"))
@@ -305,11 +492,23 @@ func TestHandler_MigrateModal(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
+// TestHandler_EditVMModal verifies the retirement of the edit-modal device
+// panes: the Hardware tab is now the sole surface for
+// disks/NICs/PCI devices, so the modal must no longer render those panes and
+// must instead point operators at the tab.
 func TestHandler_EditVMModal(t *testing.T) {
 	s := newTestUIServer(t, newDefaultMock())
 	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/edit-modal"))
 	w := serveRequest(s, r)
 	assertStatus(t, w, http.StatusOK)
+	body := w.Body.String()
+	for _, removed := range []string{"vmTab(this,'disks')", `data-pane="disks"`, `data-pane="devices"`} {
+		if strings.Contains(body, removed) {
+			t.Errorf("edit modal still contains retired device-pane markup %q, want it removed (Hardware tab is now the sole hardware surface)", removed)
+		}
+	}
+	assertContains(t, w, "Manage hardware")
+	assertContains(t, w, "/vms/vm1?tab=hardware")
 }
 
 func TestHandler_UpdateVMSpec(t *testing.T) {

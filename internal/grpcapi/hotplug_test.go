@@ -169,6 +169,81 @@ func TestParseDiskSize(t *testing.T) {
 	}
 }
 
+// TestParseDiskSize_RejectsInvalid proves the #8 fix: a non-positive size, an
+// unknown unit, or a value whose byte size would overflow the later
+// uint64(sizeGB)*1024^3 conversion are all rejected — parseDiskSize must not
+// fail open by treating an unrecognized unit as GiB or accepting a negative/zero
+// magnitude.
+func TestParseDiskSize_RejectsInvalid(t *testing.T) {
+	invalid := []string{
+		"-1G",      // negative magnitude
+		"0G",       // zero magnitude
+		"10Q",      // unknown unit — must error, not silently default to GiB
+		"9999999T", // scales to a size beyond the sane upper bound
+	}
+	for _, in := range invalid {
+		if _, err := parseDiskSize(in); err == nil {
+			t.Errorf("parseDiskSize(%q): expected an error, got none", in)
+		}
+	}
+
+	valid := []struct {
+		input  string
+		wantGB int
+	}{
+		{"20G", 20},
+		{"20", 20},
+		{"1T", 1024},
+	}
+	for _, tt := range valid {
+		got, err := parseDiskSize(tt.input)
+		if err != nil {
+			t.Errorf("parseDiskSize(%q): unexpected error: %v", tt.input, err)
+			continue
+		}
+		if got != tt.wantGB {
+			t.Errorf("parseDiskSize(%q) = %d, want %d", tt.input, got, tt.wantGB)
+		}
+	}
+}
+
+// TestParseDiskSize_OverflowRejected proves FIX-6 part 1: the T/TB branch
+// must bound the parsed magnitude BEFORE multiplying by 1024, not after —
+// otherwise a sufficiently large magnitude overflows int64 during the
+// multiply (wrapping to zero or negative) and slips past the final
+// gb > maxDiskSizeGB check with a nil error.
+func TestParseDiskSize_OverflowRejected(t *testing.T) {
+	overflowing := []string{
+		"18014398509481984T", // n*1024 wraps to 0 in int64 arithmetic
+		"9007199254740992T",  // n*1024 wraps negative in int64 arithmetic
+		"2000000T",           // fits in int64 but exceeds the sane upper bound
+	}
+	for _, in := range overflowing {
+		got, err := parseDiskSize(in)
+		if err == nil {
+			t.Errorf("parseDiskSize(%q) = (%d, nil), want an error", in, got)
+		}
+	}
+}
+
+// TestParseDiskSize_RejectsTrailingInput proves FIX-6 part 2: parsing must be
+// exact. Trailing garbage after a recognized number/unit, an embedded space
+// followed by more input, a decimal point, or a bare unit with no magnitude
+// must all be rejected instead of silently truncated/accepted.
+func TestParseDiskSize_RejectsTrailingInput(t *testing.T) {
+	invalid := []string{
+		"10Gjunk", // trailing garbage after a valid unit
+		"10 20G",  // trailing input after the first parsed number
+		"1.5G",    // fractional magnitude is not supported
+		"G",       // unit with no magnitude
+	}
+	for _, in := range invalid {
+		if got, err := parseDiskSize(in); err == nil {
+			t.Errorf("parseDiskSize(%q) = (%d, nil), want an error", in, got)
+		}
+	}
+}
+
 func TestCountVMDisks(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

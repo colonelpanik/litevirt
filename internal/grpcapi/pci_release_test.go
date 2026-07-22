@@ -5,14 +5,18 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
-// TestReleaseDeviceSet_ScopedRollback is the over-release regression: rolling
-// back a FAILED allocation must release only the devices that allocation
-// claimed, never the VM's pre-existing passthrough devices.
-func TestReleaseDeviceSet_ScopedRollback(t *testing.T) {
+// TestUnbindAndReleaseOwnership_ScopedRelease is the over-release regression: rolling
+// back a FAILED allocation must release only the devices that allocation claimed, never
+// the VM's pre-existing passthrough devices. unbindAndReleaseOwnership is owner-scoped and
+// acts ONLY on the addresses handed to it.
+func TestUnbindAndReleaseOwnership_ScopedRelease(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
+	restore := vfio.SetFS(newPCIBindFakeFS()) // devices unbound → IsBoundToVFIO=false → release only
+	defer restore()
 	// A pre-existing passthrough device (from an earlier CreateVM) + a device the
 	// current, now-failed attach just claimed — both owned by vm1.
 	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
@@ -27,7 +31,9 @@ func TestReleaseDeviceSet_ScopedRollback(t *testing.T) {
 	}
 
 	// Roll back ONLY the just-claimed device.
-	s.releaseDeviceSet(ctx, "vm1", []string{"0000:02:00.0"})
+	if err := s.unbindAndReleaseOwnership(ctx, "vm1", []string{"0000:02:00.0"}); err != nil {
+		t.Fatalf("unbindAndReleaseOwnership: %v", err)
+	}
 
 	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	if err != nil {

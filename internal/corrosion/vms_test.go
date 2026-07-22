@@ -99,6 +99,59 @@ func TestInsertVM_WithDisks(t *testing.T) {
 	}
 }
 
+// TestInsertVMWithHardware_WritesNICsAndPCIIntents covers task 7.1: the extended
+// writer must land vm_nics + vm_pci_intent rows in the SAME atomic batch as the
+// vms/vm_interfaces row, and — when the caller passes adopt=true (the CreateVM
+// path, which has just recorded this VM's complete hardware) — stamp
+// hardware_adoption_state = "adopted" so a freshly created VM never needs the
+// Phase-6 backfill to run for it.
+func TestInsertVMWithHardware_WritesNICsAndPCIIntents(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	vm := VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "running"}
+	nics := []NICRecord{
+		{VMName: "vm1", ID: DeterministicNICID("vm1", "52:54:00:aa:bb:cc"), NetworkName: "lan0",
+			Model: "virtio", MAC: "52:54:00:aa:bb:cc", Ordinal: 0, IP: "10.0.0.5"},
+	}
+	excl := "0000:41:00.0"
+	intents := []PCIIntentRecord{
+		{VMName: "vm1", DeviceID: DeterministicPCIIntentID("gpu", 0), HostName: "node-a",
+			SelectorKind: "address", SelectorPayload: `{"address":"0000:41:00.0"}`, ExclusiveKey: &excl},
+	}
+
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, intents, true); err != nil {
+		t.Fatalf("InsertVMWithHardware: %v", err)
+	}
+
+	gotNICs, err := GetVMNICsRaw(ctx, c, "vm_nics", "vm1")
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw: %v", err)
+	}
+	if len(gotNICs) != 1 || gotNICs[0].MAC != "52:54:00:aa:bb:cc" || gotNICs[0].NetworkName != "lan0" {
+		t.Fatalf("unexpected vm_nics rows: %+v", gotNICs)
+	}
+
+	gotIntents, err := ListVMPCIIntents(ctx, c, "vm1")
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents: %v", err)
+	}
+	if len(gotIntents) != 1 || gotIntents[0].SelectorKind != "address" || gotIntents[0].ExclusiveKey == nil || *gotIntents[0].ExclusiveKey != excl {
+		t.Fatalf("unexpected vm_pci_intent rows: %+v", gotIntents)
+	}
+
+	state, errReason, err := GetHardwareAdoptionState(ctx, c, "vm1")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "adopted" {
+		t.Errorf("adoption state = %q, want adopted", state)
+	}
+	if errReason != "" {
+		t.Errorf("adoption error = %q, want empty", errReason)
+	}
+}
+
 func TestListVMs_Filter(t *testing.T) {
 	c, err := NewTestClient()
 	if err != nil {
@@ -268,6 +321,101 @@ func TestRenameVM(t *testing.T) {
 	}
 	if gotDisks[0].VMName != "new-name" {
 		t.Errorf("disk VMName = %q, want new-name", gotDisks[0].VMName)
+	}
+}
+
+// TestRenameVM_CarriesHardwareTables covers the v42 tables RenameVM must also
+// carry: vm_nics (id RE-DERIVES under the new name — DeterministicNICID takes
+// vmName), vm_pci_intent and vm_pci_realizations (device_id is name-independent
+// and must be PRESERVED, only vm_name rekeyed). Nothing must remain live under
+// the old name.
+func TestRenameVM_CarriesHardwareTables(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	oldName, newName := "old-name", "new-name"
+	mac := "52:54:00:aa:bb:cc"
+	addr := "0000:41:00.0"
+	exclusiveKey := addr
+	deviceID := DeterministicPCIIntentID("address|"+addr, 0)
+
+	vm := VMRecord{Name: oldName, HostName: "h1", Spec: "{}", State: "running"}
+	nics := []NICRecord{{VMName: oldName, ID: DeterministicNICID(oldName, mac), NetworkName: "default", MAC: mac, Ordinal: 0}}
+	pciIntents := []PCIIntentRecord{{
+		VMName: oldName, DeviceID: deviceID, HostName: "h1",
+		SelectorKind: "address", SelectorPayload: "{}", ExclusiveKey: &exclusiveKey,
+	}}
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, pciIntents, true); err != nil {
+		t.Fatalf("InsertVMWithHardware: %v", err)
+	}
+	realization := PCIRealizationRecord{
+		VMName: oldName, DeviceID: deviceID, MemberID: "m0",
+		HostName: "h1", ResolvedAddress: addr, XMLAlias: "hostdev0", Ordinal: 0,
+	}
+	if err := UpsertPCIRealization(ctx, c, realization); err != nil {
+		t.Fatalf("UpsertPCIRealization: %v", err)
+	}
+
+	if err := RenameVM(ctx, c, oldName, newName); err != nil {
+		t.Fatalf("RenameVM: %v", err)
+	}
+
+	// vm_nics: id RE-DERIVES under the new name; nothing live under old.
+	newNICs, err := GetVMNICsRaw(ctx, c, "vm_nics", newName)
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw(new): %v", err)
+	}
+	var liveNew []NICRecord
+	for _, n := range newNICs {
+		if n.DeletedAt == "" {
+			liveNew = append(liveNew, n)
+		}
+	}
+	if len(liveNew) != 1 {
+		t.Fatalf("got %d live vm_nics rows under new name, want 1: %+v", len(liveNew), liveNew)
+	}
+	if wantID := DeterministicNICID(newName, mac); liveNew[0].ID != wantID {
+		t.Errorf("nic id = %q, want re-derived %q", liveNew[0].ID, wantID)
+	}
+	oldNICs, _ := GetVMNICsRaw(ctx, c, "vm_nics", oldName)
+	for _, n := range oldNICs {
+		if n.DeletedAt == "" {
+			t.Errorf("live vm_nics row still under old name: %+v", n)
+		}
+	}
+
+	// vm_pci_intent: device_id PRESERVED (name-independent); nothing under old.
+	newIntents, err := ListVMPCIIntents(ctx, c, newName)
+	if err != nil {
+		t.Fatalf("ListVMPCIIntents(new): %v", err)
+	}
+	if len(newIntents) != 1 {
+		t.Fatalf("got %d vm_pci_intent rows under new name, want 1: %+v", len(newIntents), newIntents)
+	}
+	if newIntents[0].DeviceID != deviceID {
+		t.Errorf("device_id = %q, want preserved %q", newIntents[0].DeviceID, deviceID)
+	}
+	oldIntents, _ := ListVMPCIIntents(ctx, c, oldName)
+	if len(oldIntents) != 0 {
+		t.Errorf("vm_pci_intent rows still live under old name: %+v", oldIntents)
+	}
+
+	// vm_pci_realizations: device_id/member_id/xml_alias/resolved_address/ordinal preserved.
+	newRealizations, err := ListVMPCIRealizations(ctx, c, newName)
+	if err != nil {
+		t.Fatalf("ListVMPCIRealizations(new): %v", err)
+	}
+	if len(newRealizations) != 1 {
+		t.Fatalf("got %d vm_pci_realizations rows under new name, want 1: %+v", len(newRealizations), newRealizations)
+	}
+	if gotR := newRealizations[0]; gotR.DeviceID != realization.DeviceID || gotR.MemberID != realization.MemberID ||
+		gotR.XMLAlias != realization.XMLAlias || gotR.ResolvedAddress != realization.ResolvedAddress ||
+		gotR.Ordinal != realization.Ordinal {
+		t.Errorf("realization = %+v, want fields preserved from %+v", gotR, realization)
+	}
+	oldRealizations, _ := ListVMPCIRealizations(ctx, c, oldName)
+	if len(oldRealizations) != 0 {
+		t.Errorf("vm_pci_realizations rows still live under old name: %+v", oldRealizations)
 	}
 }
 
@@ -593,6 +741,85 @@ func TestDeleteVM_WithInterfacesAndDisks(t *testing.T) {
 	}
 }
 
+// TestDeleteVM_TombstonesHardwareTables covers the v42 tables DeleteVM must
+// also tombstone: vm_nics, vm_pci_intent, vm_pci_realizations. It also proves
+// the concrete-address exclusive reservation is FREED once the intent is
+// tombstoned (PCIIntentExclusiveOwner filters deleted_at IS NULL), so another
+// VM could subsequently intend the same host BDF.
+func TestDeleteVM_TombstonesHardwareTables(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	name := "vm-hw"
+	mac := "52:54:00:aa:bb:dd"
+	addr := "0000:51:00.0"
+	exclusiveKey := addr
+	deviceID := DeterministicPCIIntentID("address|"+addr, 0)
+
+	vm := VMRecord{Name: name, HostName: "h1", Spec: "{}", State: "running"}
+	nics := []NICRecord{{VMName: name, ID: DeterministicNICID(name, mac), NetworkName: "default", MAC: mac, Ordinal: 0}}
+	pciIntents := []PCIIntentRecord{{
+		VMName: name, DeviceID: deviceID, HostName: "h1",
+		SelectorKind: "address", SelectorPayload: "{}", ExclusiveKey: &exclusiveKey,
+	}}
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, pciIntents, true); err != nil {
+		t.Fatalf("InsertVMWithHardware: %v", err)
+	}
+	realization := PCIRealizationRecord{
+		VMName: name, DeviceID: deviceID, MemberID: "m0",
+		HostName: "h1", ResolvedAddress: addr, XMLAlias: "hostdev0", Ordinal: 0,
+	}
+	if err := UpsertPCIRealization(ctx, c, realization); err != nil {
+		t.Fatalf("UpsertPCIRealization: %v", err)
+	}
+
+	// Reservation held before delete.
+	owner, err := PCIIntentExclusiveOwner(ctx, c, "h1", addr)
+	if err != nil {
+		t.Fatalf("PCIIntentExclusiveOwner (pre): %v", err)
+	}
+	if owner != name {
+		t.Fatalf("PCIIntentExclusiveOwner (pre) = %q, want %q", owner, name)
+	}
+
+	if err := DeleteVM(ctx, c, name); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+
+	nicsRows, err := GetVMNICsRaw(ctx, c, "vm_nics", name)
+	if err != nil {
+		t.Fatalf("GetVMNICsRaw: %v", err)
+	}
+	if len(nicsRows) != 1 || nicsRows[0].DeletedAt == "" {
+		t.Fatalf("vm_nics row not tombstoned: %+v", nicsRows)
+	}
+
+	intentRows, err := c.Query(ctx, `SELECT device_id, deleted_at FROM vm_pci_intent WHERE vm_name = ?`, name)
+	if err != nil {
+		t.Fatalf("query vm_pci_intent: %v", err)
+	}
+	if len(intentRows) != 1 || intentRows[0].String("deleted_at") == "" {
+		t.Fatalf("vm_pci_intent row not tombstoned: %+v", intentRows)
+	}
+
+	realizationRows, err := c.Query(ctx, `SELECT device_id, member_id, deleted_at FROM vm_pci_realizations WHERE vm_name = ?`, name)
+	if err != nil {
+		t.Fatalf("query vm_pci_realizations: %v", err)
+	}
+	if len(realizationRows) != 1 || realizationRows[0].String("deleted_at") == "" {
+		t.Fatalf("vm_pci_realizations row not tombstoned: %+v", realizationRows)
+	}
+
+	// Reservation freed: another VM could now intend the same host BDF.
+	owner, err = PCIIntentExclusiveOwner(ctx, c, "h1", addr)
+	if err != nil {
+		t.Fatalf("PCIIntentExclusiveOwner (post): %v", err)
+	}
+	if owner != "" {
+		t.Errorf("PCIIntentExclusiveOwner (post) = %q, want \"\" (reservation freed)", owner)
+	}
+}
+
 func TestUpdateVMInterfaceIP(t *testing.T) {
 	c, err := NewTestClient()
 	if err != nil {
@@ -618,5 +845,157 @@ func TestUpdateVMInterfaceIP(t *testing.T) {
 	got, _ := GetVMInterfaces(ctx, c, "vm-ip")
 	if len(got) != 1 || got[0].IP != "10.0.0.5" {
 		t.Errorf("unexpected IP: %+v", got)
+	}
+}
+
+// TestInsertDisk_HardwareColumns covers the v42 hardware-foundation columns
+// (bus, device_kind, delete_with_vm, controller_model) round-tripping through
+// InsertDisk/GetVMDisks.
+func TestInsertDisk_HardwareColumns(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	InsertVM(ctx, c, VMRecord{Name: "vm-hw", HostName: "h1", Spec: "{}", State: "running"}, nil, nil)
+
+	d := DiskRecord{
+		VMName:          "vm-hw",
+		DiskName:        "data",
+		HostName:        "h1",
+		Path:            "/disks/vm-hw-data.qcow2",
+		SizeBytes:       10737418240,
+		StorageType:     "local",
+		TargetDev:       "sda",
+		Bus:             "scsi",
+		DeviceKind:      "disk",
+		DeleteWithVM:    true,
+		ControllerModel: "virtio-scsi",
+	}
+	if err := InsertDisk(ctx, c, d); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+
+	disks, err := GetVMDisks(ctx, c, "vm-hw")
+	if err != nil {
+		t.Fatalf("GetVMDisks: %v", err)
+	}
+	if len(disks) != 1 {
+		t.Fatalf("expected 1 disk, got %d", len(disks))
+	}
+	got := disks[0]
+	if got.Bus != "scsi" {
+		t.Errorf("Bus = %q, want scsi", got.Bus)
+	}
+	if got.DeviceKind != "disk" {
+		t.Errorf("DeviceKind = %q, want disk", got.DeviceKind)
+	}
+	if !got.DeleteWithVM {
+		t.Errorf("DeleteWithVM = false, want true")
+	}
+	if got.ControllerModel != "virtio-scsi" {
+		t.Errorf("ControllerModel = %q, want virtio-scsi", got.ControllerModel)
+	}
+}
+
+// TestInsertDisk_HardwareColumnDefaults covers a caller that doesn't set the
+// new fields: DeviceKind must still land as 'disk' (the column default),
+// matching existing create-time callers until Phase 7 updates them.
+func TestInsertDisk_HardwareColumnDefaults(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	InsertVM(ctx, c, VMRecord{Name: "vm-hw-default", HostName: "h1", Spec: "{}", State: "running"}, nil, nil)
+
+	if err := InsertDisk(ctx, c, DiskRecord{
+		VMName:      "vm-hw-default",
+		DiskName:    "root",
+		HostName:    "h1",
+		Path:        "/disks/vm-hw-default-root.qcow2",
+		StorageType: "local",
+		TargetDev:   "vda",
+	}); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+
+	disks, err := GetVMDisks(ctx, c, "vm-hw-default")
+	if err != nil {
+		t.Fatalf("GetVMDisks: %v", err)
+	}
+	if len(disks) != 1 {
+		t.Fatalf("expected 1 disk, got %d", len(disks))
+	}
+	if disks[0].DeviceKind != "disk" {
+		t.Errorf("DeviceKind = %q, want disk (default)", disks[0].DeviceKind)
+	}
+}
+
+// TestHardwareAdoptionState covers the vms.hardware_adoption_state/
+// hardware_adoption_error accessors added for the hardware-foundation work.
+func TestHardwareAdoptionState(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	InsertVM(ctx, c, VMRecord{Name: "vm-adopt", HostName: "h1", Spec: "{}", State: "running"}, nil, nil)
+
+	// The bare InsertVM wrapper calls InsertVMWithHardware with adopt=false: it
+	// carries no hardware (nil NICs/PCI intents), and its producer-path callers
+	// (Clone/import/promote/live-restore) may have written REAL vm_interfaces
+	// rows outside this call, so it must NOT claim 'adopted' — the column stays
+	// at its schema default 'pending' for the Phase-6 backfill audit to
+	// reconcile.
+	state, errReason, err := GetHardwareAdoptionState(ctx, c, "vm-adopt")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "pending" {
+		t.Errorf("initial state = %q, want pending", state)
+	}
+	if errReason != "" {
+		t.Errorf("initial errReason = %q, want empty", errReason)
+	}
+
+	if err := SetHardwareAdoptionState(ctx, c, "vm-adopt", "blocked", "reason"); err != nil {
+		t.Fatalf("SetHardwareAdoptionState: %v", err)
+	}
+
+	state, errReason, err = GetHardwareAdoptionState(ctx, c, "vm-adopt")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "blocked" {
+		t.Errorf("state = %q, want blocked", state)
+	}
+	if errReason != "reason" {
+		t.Errorf("errReason = %q, want reason", errReason)
+	}
+}
+
+// TestInsertVMWithHardware_AdoptFalseLeavesPending is the Fix 1 regression: a
+// caller that passes adopt=false must NOT get the 'adopted' stamp even when it
+// also supplies hardware rows — only the primary create path (adopt=true) may
+// claim adoption. This guards against a future edit accidentally gating on
+// "hardware present" instead of the explicit adopt flag.
+func TestInsertVMWithHardware_AdoptFalseLeavesPending(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	vm := VMRecord{Name: "vm-noadopt", HostName: "node-a", Spec: "{}", State: "running"}
+	nics := []NICRecord{
+		{VMName: "vm-noadopt", ID: DeterministicNICID("vm-noadopt", "52:54:00:aa:bb:dd"), NetworkName: "lan0",
+			Model: "virtio", MAC: "52:54:00:aa:bb:dd", Ordinal: 0, IP: "10.0.0.6"},
+	}
+
+	if err := InsertVMWithHardware(ctx, c, vm, nil, nil, nics, nil, false); err != nil {
+		t.Fatalf("InsertVMWithHardware: %v", err)
+	}
+
+	state, errReason, err := GetHardwareAdoptionState(ctx, c, "vm-noadopt")
+	if err != nil {
+		t.Fatalf("GetHardwareAdoptionState: %v", err)
+	}
+	if state != "pending" {
+		t.Errorf("state = %q, want pending (adopt=false must not stamp adopted)", state)
+	}
+	if errReason != "" {
+		t.Errorf("errReason = %q, want empty", errReason)
 	}
 }

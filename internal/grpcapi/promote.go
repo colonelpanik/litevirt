@@ -528,6 +528,20 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.InvalidArgument, "invalid promotion name %q", targetName)
 	}
 
+	// Adoption gate (fail-closed, no-op pre-latch): under the active hardware_v2 regime a
+	// "blocked" VM (hardware failed its per-VM compatibility audit) must not be brought
+	// back up. A takeover promote (same name) carries the original VM's adoption state, so
+	// refuse it BEFORE the destructive define/start below rather than resurrect a VM the
+	// operator must repair + re-audit first; a renamed promotion has no prior adoption row
+	// (→ no-op). This is the gate half of PrepareHardwareForStart applied directly: the PCI
+	// start-preflight half is deliberately NOT run on promote — promote materializes the
+	// live disk then defines-then-persists the disk/vm rows AFTER StartDomain, so the
+	// preflight's reconcile-from-authoritative-tables step would read not-yet-written rows;
+	// and a disk replica does not carry the source host's physical passthrough devices.
+	if err := s.hardwareAdoptionRefused(ctx, targetName); err != nil {
+		return err
+	}
+
 	// Crash-idempotent resume: a domain RUNNING under targetName from a prior
 	// attempt of THIS proof must never be torn down. We record "start_attempted"
 	// durably BEFORE StartDomain, so if we crash after libvirt starts the VM but
@@ -687,6 +701,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
+	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics); only persisted on the renamed (new-row) path below
 	for i, n := range spec.Network {
 		mac := n.Mac
 		if renamed || mac == "" {
@@ -702,6 +717,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: targetName, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: n.Ip,
+		})
+		nicRecords = append(nicRecords, corrosion.NICRecord{
+			VMName:         targetName,
+			ID:             corrosion.DeterministicNICID(targetName, mac),
+			NetworkName:    n.Name,
+			Model:          n.Model,
+			MAC:            mac,
+			Ordinal:        i,
+			IP:             n.Ip,
+			TapDevice:      "",
+			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
 	}
 
@@ -762,7 +788,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 			Project: vm.Project,
 		}
-		if err := corrosion.InsertVM(ctx, s.db, rec, ifaceRecords, diskRecords); err != nil {
+		// adopt=false: a promotion best-effort-populates vm_nics from its rebuilt
+		// network attachments, but does not self-certify adoption — there is no
+		// PCI passthrough to carry (a disk replica has no hostdev record, so
+		// pciIntents is always nil here), and hardware_adoption_state stays at
+		// its schema default 'pending' for the Phase-6 backfill audit to confirm.
+		if err := corrosion.InsertVMWithHardware(ctx, s.db, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 	} else {

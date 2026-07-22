@@ -35,13 +35,14 @@ type mockClient struct {
 	pb.LiteVirtClient
 
 	// Canned responses
-	vms       []*pb.VM
-	hosts     []*pb.Host
-	images    []*pb.Image
-	snapshots []*pb.Snapshot
-	users     []*pb.User
-	devices   []*pb.PCIDevice
-	status    *pb.ClusterStatus
+	vms          []*pb.VM
+	hosts        []*pb.Host
+	images       []*pb.Image
+	snapshots    []*pb.Snapshot
+	users        []*pb.User
+	devices      []*pb.PCIDevice
+	status       *pb.ClusterStatus
+	hardwareResp *pb.ListVMHardwareResponse
 
 	// Track mutations
 	createdVM     *pb.VMSpec
@@ -190,6 +191,9 @@ func (m *mockClient) InspectVM(_ context.Context, in *pb.InspectVMRequest, _ ...
 		}
 	}
 	return m.vms[0], nil
+}
+func (m *mockClient) ListVMHardware(_ context.Context, in *pb.ListVMHardwareRequest, _ ...grpc.CallOption) (*pb.ListVMHardwareResponse, error) {
+	return m.hardwareResp, nil
 }
 func (m *mockClient) StartVM(_ context.Context, in *pb.StartVMRequest, _ ...grpc.CallOption) (*pb.VM, error) {
 	m.startedVM = in.Name
@@ -1235,6 +1239,36 @@ func TestE2E_HotplugOperations(t *testing.T) {
 		t.Fatalf("detach-pci: %v", err)
 	}
 	assertContains(t, out, "web-1")
+}
+
+func TestHardwareLs(t *testing.T) {
+	mock := newMockClient()
+	mock.hardwareResp = &pb.ListVMHardwareResponse{
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{
+				DeviceId: "data", Target: "vdb", Bus: "virtio",
+				SizeBytes: 50 << 30, StorageType: "local", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Nic{Nic: &pb.HardwareNIC{
+				Mac: "52:54:00:aa:bb:cc", Network: "mgmt", Model: "virtio", State: "attached",
+			}}},
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Members: []*pb.HardwarePCIMember{
+					{MemberId: "gpu0-0", ResolvedAddress: "0000:41:00.0"},
+				},
+			}}},
+		},
+		HardwareAdoptionState: "adopted",
+	}
+
+	out, _, err := runCmd(t, mock, "hardware-ls", "vm1")
+	if err != nil {
+		t.Fatalf("hardware-ls: %v", err)
+	}
+	assertContains(t, out, "vdb")
+	assertContains(t, out, "52:54:00:aa:bb:cc")
+	assertContains(t, out, "0000:41:00.0")
 }
 
 func (m *mockClient) CreateNotificationTarget(_ context.Context, in *pb.CreateNotificationTargetRequest, _ ...grpc.CallOption) (*pb.NotificationTarget, error) {

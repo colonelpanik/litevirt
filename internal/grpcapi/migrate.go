@@ -170,6 +170,22 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition, "target host %q is not active", req.TargetHost)
 	}
 
+	// PCI passthrough cannot be re-realized cross-host in this release, so refuse
+	// migrating any VM that holds PCI intent — but only once hardware_v2 is latched,
+	// so pre-latch migration behavior (incl. the legacy VF/PF/target-availability
+	// guards below) is unchanged. Fail CLOSED on a read error: if we cannot tell
+	// whether the VM holds intent, refuse rather than risk migrating a PCI VM.
+	if s.hardwareV2Latched(ctx) {
+		intents, err := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
+		if err != nil {
+			return status.Errorf(codes.Internal, "check PCI intent for %q: %v", vm.Name, err)
+		}
+		if len(intents) > 0 {
+			return status.Errorf(codes.FailedPrecondition,
+				"VM %q holds PCI passthrough intent; cross-host migration of PCI devices is not supported in this release", vm.Name)
+		}
+	}
+
 	// Split-brain gate (Phase 1), SOURCE-side: a migration is a runtime-ownership
 	// move, so the source must hold local quorum. This runs ON THE SOURCE (a
 	// non-source caller forwarded above and returned) and re-checks quorum HERE — not
@@ -342,13 +358,24 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 
 	// Hot-detach SR-IOV VFs before migration.
 	for _, vf := range detachedVFs {
-		if err := s.virt.DetachHostdev(req.VmName, vf.Address); err != nil {
+		// Membership-aware (idempotent) guest detach so a retried migration converges: if a
+		// prior attempt already live-detached the VF but its release failed, the VF is gone
+		// from the guest and a bare DetachHostdev would error ("device not found") and abort
+		// before re-attempting the release. detachHostdevIfPresent skips the already-gone
+		// detach so control falls through to the idempotent release. A DumpXML error still
+		// aborts the migration (fail closed — membership cannot be confirmed).
+		if err := s.detachHostdevIfPresent(req.VmName, vf.Address); err != nil {
 			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
 		}
-		if err := vfio.Unbind(vf.Address, ""); err != nil {
-			slog.Warn("VFIO unbind failed during migration", "address", vf.Address, "error", err)
+		// DetachHostdev removed the guest device but the host vfio bind persists, so the
+		// VF is still bound. Release ownership only through the strict all-or-nothing
+		// primitive: if the unbind cannot be confirmed it releases NOTHING and errors,
+		// leaving the VF owned + bound on the source (recoverable) — never unowned +
+		// bound. ABORT the migration: a VF stuck bound on the source must not be silently
+		// released, and the move must not proceed leaving an orphan.
+		if err := s.unbindAndReleaseOwnership(ctx, req.VmName, []string{vf.Address}); err != nil {
+			return status.Errorf(codes.Internal, "release VF %s before migration: %v", vf.Address, err)
 		}
-		corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, vf.Address, req.VmName)
 		slog.Info("VF detached for migration", "vm", req.VmName, "address", vf.Address)
 	}
 

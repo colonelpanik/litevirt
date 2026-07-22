@@ -693,7 +693,7 @@ func TestAcquireDeviceLeases_ConflictFailsClosed(t *testing.T) {
 	}
 
 	// A different VM claiming the same BDF must FAIL, and must NOT reassign or bind.
-	if _, _, err := s.acquireDeviceLeases(ctx, "vm2", []ResolvedMember{{Address: "0000:41:00.0"}}); err == nil {
+	if _, _, err := s.acquireDeviceLeases(ctx, "vm2", []ResolvedMember{{Address: "0000:41:00.0"}}, deviceLeaseStageBound); err == nil {
 		t.Fatal("acquiring a device owned by another VM must fail, got nil error")
 	}
 	if o := ownerOf("0000:41:00.0"); o != "vm1" {
@@ -705,7 +705,7 @@ func TestAcquireDeviceLeases_ConflictFailsClosed(t *testing.T) {
 
 	// The incumbent re-acquiring its own device is an idempotent self-claim → OK, and
 	// claims NOTHING new (self-owned → skipped), so the returned freshly-claimed set is empty.
-	finish, claimed, err := s.acquireDeviceLeases(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}})
+	finish, claimed, err := s.acquireDeviceLeases(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}}, deviceLeaseStageBound)
 	if err != nil {
 		t.Fatalf("idempotent self-claim must succeed, got %v", err)
 	}

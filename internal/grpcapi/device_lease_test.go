@@ -18,7 +18,7 @@ func TestBeginDeviceLease_Gating(t *testing.T) {
 	off := testServer(t)
 	joff, _ := opjournal.Open(t.TempDir())
 	off.SetOpJournal(joff)
-	off.beginDeviceLease(ctx, "vm1", []string{"0000:01:00.0"})()
+	off.beginDeviceLease(ctx, "vm1", []string{"0000:01:00.0"}, deviceLeaseStageBound)()
 	if _, found, _ := joff.Read(deviceLeaseOpID("vm1")); found {
 		t.Fatal("device lease must NOT be written while operation_protocol is inactive")
 	}
@@ -29,7 +29,7 @@ func TestBeginDeviceLease_Gating(t *testing.T) {
 	on.SetOpJournal(jon)
 	on.SetOperationProtocol(true)
 	on.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}})
-	finish := on.beginDeviceLease(ctx, "vm1", []string{"0000:01:00.0"})
+	finish := on.beginDeviceLease(ctx, "vm1", []string{"0000:01:00.0"}, deviceLeaseStageBound)
 	if _, found, _ := jon.Read(deviceLeaseOpID("vm1")); !found {
 		t.Fatal("device lease should be written when operation_protocol is active")
 	}

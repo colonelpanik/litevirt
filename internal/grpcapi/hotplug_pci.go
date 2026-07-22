@@ -387,7 +387,7 @@ func (s *Server) executePCIAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		// = the addresses this acquire NEWLY claimed (a self-owned re-attach skips its own
 		// device → NOT in it), so failPCIAttach releases exactly those and never a
 		// pre-existing self-owned reservation (FIX-9c).
-		finish, acquireClaimed, aerr := s.acquireDeviceLeases(ctx, vm.Name, members)
+		finish, acquireClaimed, aerr := s.acquireDeviceLeases(ctx, vm.Name, members, deviceLeaseStageBound)
 		if aerr != nil {
 			return s.failPCIAttach(ctx, rb, status.Code(aerr), fmt.Errorf("acquire device leases: %w", aerr))
 		}

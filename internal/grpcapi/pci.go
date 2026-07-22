@@ -184,7 +184,10 @@ type ResolvedMember struct {
 // bind, and the CALLER must defer finish() so the lease is cleared once the VM
 // row is finalized (or on the caller's own rollback). A crash before finish()
 // runs leaves the entry for startup recovery (RecoverDeviceLeases) to roll back.
-func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb.DeviceSpec) ([]string, func(), error) {
+//
+// stage is the initial durable device-lease stage (see beginDeviceLease): CreateVM passes
+// deviceLeaseStageBound; the legacy running-attach passes deviceLeaseStageInProgress.
+func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb.DeviceSpec, stage string) ([]string, func(), error) {
 	noop := func() {}
 	var members []ResolvedMember
 
@@ -237,7 +240,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		members = append(members, specMembers...)
 	}
 
-	finish, _, err := s.acquireDeviceLeases(ctx, vmName, members)
+	finish, _, err := s.acquireDeviceLeases(ctx, vmName, members, stage)
 	if err != nil {
 		return nil, noop, err
 	}
@@ -493,7 +496,11 @@ func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, member
 // (a self-owned member is skipped → NOT in the list), so a caller's OWN post-acquire
 // rollback can release exactly the devices this start took and never a pre-existing
 // self-owned reserve-while-off reservation (FIX-9b/9c).
-func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members []ResolvedMember) (func(), []string, error) {
+//
+// stage is the initial durable device-lease stage (see beginDeviceLease): every caller
+// passes deviceLeaseStageBound EXCEPT the unjournaled legacy running-attach, which passes
+// deviceLeaseStageInProgress so a mid-attach crash is reclaimed, not cleared.
+func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members []ResolvedMember, stage string) (func(), []string, error) {
 	noop := func() {}
 
 	// Claim inventory ownership (fail-closed CAS) BEFORE any bind. On failure the
@@ -514,7 +521,7 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 	// Durably record the claimed devices (F1 device lease) BEFORE the irreversible
 	// vfio bind, so a crash before the VM row is finalized is rolled back at
 	// startup. No-op unless the operation_protocol capability is active.
-	finish := s.beginDeviceLease(ctx, vmName, addresses)
+	finish := s.beginDeviceLease(ctx, vmName, addresses, stage)
 
 	for _, addr := range addresses {
 		prevDriver, err := vfio.Bind(addr)
@@ -618,7 +625,7 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	// lease, so nothing is left to release here. acquireClaimed = the addresses this
 	// acquire NEWLY claimed (a self-owned reserve-while-off device is skipped → NOT in
 	// it), so the post-acquire rollback below can release exactly what THIS start took.
-	finish, acquireClaimed, aerr := s.acquireDeviceLeases(ctx, vm.Name, members)
+	finish, acquireClaimed, aerr := s.acquireDeviceLeases(ctx, vm.Name, members, deviceLeaseStageBound)
 	if aerr != nil {
 		return nil, aerr
 	}

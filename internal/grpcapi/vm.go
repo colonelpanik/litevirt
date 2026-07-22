@@ -658,7 +658,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// PCI device passthrough.
 	var pciIntents []corrosion.PCIIntentRecord
 	if len(spec.Devices) > 0 {
-		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices)
+		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices, deviceLeaseStageBound)
 		if devErr != nil {
 			cleanupDisks()
 			return nil, devErr

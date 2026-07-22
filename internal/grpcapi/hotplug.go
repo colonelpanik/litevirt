@@ -215,7 +215,12 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 }
 
 func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.DeviceSpec) (*pb.VM, error) {
-	addrs, finish, err := s.allocateDevices(ctx, vmName, []*pb.DeviceSpec{spec})
+	// The device lease begins at Stage in_progress: this legacy running-attach path is
+	// UNJOURNALED (the lease is its ONLY crash anchor) and the VM ALWAYS already exists, so
+	// a crash during the vfio bind or the guest AttachHostdev loop below would otherwise
+	// leave a "bound" lease + existing VM that recovery misreads as a completed allocation
+	// and clears — leaking the owned + bound device. in_progress makes recovery reclaim it.
+	addrs, finish, err := s.allocateDevices(ctx, vmName, []*pb.DeviceSpec{spec}, deviceLeaseStageInProgress)
 	if err != nil {
 		return nil, err
 	}

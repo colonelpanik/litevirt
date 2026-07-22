@@ -95,7 +95,7 @@ func TestAllocateDevices_AddressSpec_ResolvesBDFAndSiblings(t *testing.T) {
 		HostName: "test-host", Address: "0000:41:00.1", Type: "gpu", VendorID: "10de", IOMMUGroup: 20,
 	})
 
-	addrs, finish, err := s.allocateDevices(ctx, "vm-gpu", []*pb.DeviceSpec{{Address: "0000:41:00.0"}})
+	addrs, finish, err := s.allocateDevices(ctx, "vm-gpu", []*pb.DeviceSpec{{Address: "0000:41:00.0"}}, deviceLeaseStageBound)
 	if err != nil {
 		t.Fatalf("allocateDevices: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestAllocateDevices_MultiTypeSpec_DistinctDevices(t *testing.T) {
 
 	addrs, finish, err := s.allocateDevices(ctx, "vm-2gpu", []*pb.DeviceSpec{
 		{Type: "gpu"}, {Type: "gpu"},
-	})
+	}, deviceLeaseStageBound)
 	if err != nil {
 		t.Fatalf("allocateDevices: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestAllocateDevices_AddressPinThenTypeSpec_NoRepick(t *testing.T) {
 
 	addrs, finish, err := s.allocateDevices(ctx, "vm-pin-type", []*pb.DeviceSpec{
 		{Address: "0000:44:00.0"}, {Type: "gpu"},
-	})
+	}, deviceLeaseStageBound)
 	if err != nil {
 		t.Fatalf("allocateDevices: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestAllocateDevices_MappingSpec_FreezesAddress(t *testing.T) {
 	}
 
 	spec := &pb.DeviceSpec{Mapping: "gpu-map"}
-	addrs, finish, err := s.allocateDevices(ctx, "vm-map", []*pb.DeviceSpec{spec})
+	addrs, finish, err := s.allocateDevices(ctx, "vm-map", []*pb.DeviceSpec{spec}, deviceLeaseStageBound)
 	if err != nil {
 		t.Fatalf("allocateDevices: %v", err)
 	}

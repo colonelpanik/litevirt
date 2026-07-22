@@ -361,10 +361,15 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		if err := s.virt.DetachHostdev(req.VmName, vf.Address); err != nil {
 			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
 		}
-		if err := vfio.Unbind(vf.Address, ""); err != nil {
-			slog.Warn("VFIO unbind failed during migration", "address", vf.Address, "error", err)
+		// DetachHostdev removed the guest device but the host vfio bind persists, so the
+		// VF is still bound. Release ownership only through the strict all-or-nothing
+		// primitive: if the unbind cannot be confirmed it releases NOTHING and errors,
+		// leaving the VF owned + bound on the source (recoverable) — never unowned +
+		// bound. ABORT the migration: a VF stuck bound on the source must not be silently
+		// released, and the move must not proceed leaving an orphan.
+		if err := s.unbindAndReleaseOwnership(ctx, req.VmName, []string{vf.Address}); err != nil {
+			return status.Errorf(codes.Internal, "release VF %s before migration: %v", vf.Address, err)
 		}
-		corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, vf.Address, req.VmName)
 		slog.Info("VF detached for migration", "vm", req.VmName, "address", vf.Address)
 	}
 

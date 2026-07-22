@@ -12,7 +12,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 // AttachDevice hot-attaches a disk, NIC, or PCI device to a running VM.
@@ -194,6 +193,14 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 			// cannot be confirmed unbound it releases NOTHING and returns an error — leave
 			// it owned + bound (recoverable via retry/detach), never unowned + bound, and
 			// log loudly rather than silently dropping it.
+			//
+			// NOTE (accepted): unlike the journaled paths, the `defer finish()` above still
+			// clears this device lease even when the rollback release is incomplete, so
+			// there is NO RecoverDeviceLeases backstop for a left-owned+bound device here
+			// (weaker than the journaled attach, which retains the lease for startup
+			// recovery). The invariant still holds — the device is owned + bound, never
+			// unowned + bound — and it converges on the operator's retry/detach; the lost
+			// backstop is accepted for this best-effort, un-journaled legacy attach path.
 			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, addrs); rerr != nil {
 				slog.Error("legacy pci attach rollback: release incomplete — device(s) left owned+bound (recoverable)", "vm", vmName, "error", rerr)
 			}
@@ -211,11 +218,16 @@ func (s *Server) detachPCIDevice(ctx context.Context, vmName, pciAddress string)
 		return nil, status.Errorf(codes.Internal, "detach PCI device %s: %v", pciAddress, err)
 	}
 
-	if err := vfio.Unbind(pciAddress, ""); err != nil {
-		slog.Warn("VFIO unbind after detach failed", "address", pciAddress, "error", err)
+	// DetachHostdev removed the GUEST device but the HOST vfio bind persists, so this
+	// device is still vfio-bound. Release ownership only through the strict all-or-
+	// nothing primitive: if the unbind cannot be confirmed it releases NOTHING and
+	// errors, leaving the device owned + bound (recoverable) — NEVER unowned + bound.
+	// The legacy running-detach path is un-journaled, so "recoverable" is simply
+	// failing the RPC: the operator retries and a since-unbound member (IsBoundToVFIO
+	// = false) is skipped, so the release converges.
+	if err := s.unbindAndReleaseOwnership(ctx, vmName, []string{pciAddress}); err != nil {
+		return nil, status.Errorf(codes.Internal, "release PCI device %s after detach: %v", pciAddress, err)
 	}
-
-	corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, pciAddress, vmName)
 	slog.Info("PCI device detached", "vm", vmName, "address", pciAddress)
 	s.publish("device.detached", vmName, "pci:"+pciAddress)
 	return s.vmToProto(ctx, vmName)

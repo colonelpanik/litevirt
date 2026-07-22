@@ -29,6 +29,7 @@ type pciUnbindRecordingFS struct {
 	unbinds    map[string]int    // address -> count of vfio.Unbind invocations
 	failUnbind map[string]bool   // address -> the .../driver/unbind write fails (models a stuck unbind)
 	failBind   map[string]bool   // address -> the vfio-pci bind never takes (models a device that won't bind)
+	vf         map[string]bool   // address -> device is an SR-IOV VF (has a physfn symlink)
 	binds      int               // count of vfio-pci bind writes
 	onUnbind   func(addr string) // fired once per unbind (at the driver_override clear), if set
 }
@@ -40,6 +41,7 @@ func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
 		unbinds:    map[string]int{},
 		failUnbind: map[string]bool{},
 		failBind:   map[string]bool{},
+		vf:         map[string]bool{},
 	}
 }
 
@@ -58,6 +60,14 @@ func (f *pciUnbindRecordingFS) setFailUnbind(addr string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failUnbind[addr] = true
+}
+
+// setVF marks addr as an SR-IOV Virtual Function so vfio.IsVF (which probes for a
+// physfn symlink) reports true for it — used to drive the pre-migration VF-detach path.
+func (f *pciUnbindRecordingFS) setVF(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vf[addr] = true
 }
 
 // setFailBind makes the vfio-pci bind for addr never take (the bind + drivers_probe
@@ -148,6 +158,14 @@ func (f *pciUnbindRecordingFS) Readlink(path string) (string, error) {
 		}
 		// No driver bound → model real sysfs (ENOENT); IsBoundToVFIO reads this as
 		// "not bound" (false, nil), not an unexpected FS error.
+		return "", os.ErrNotExist
+	}
+	if strings.HasSuffix(path, "/physfn") {
+		// A VF has a physfn symlink to its parent PF; a PF (or a plain device) does
+		// not → ENOENT, which vfio.IsVF reads as "not a VF".
+		if f.vf[f.devAddr(path, "/physfn")] {
+			return "/sys/bus/pci/devices/0000:00:00.0", nil
+		}
 		return "", os.ErrNotExist
 	}
 	return "", fmt.Errorf("pciUnbindRecordingFS: no link %s", path)

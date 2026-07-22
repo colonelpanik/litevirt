@@ -67,6 +67,12 @@ func (e Entry) checksum() string {
 type Journal struct {
 	dir string
 	mu  sync.Mutex
+
+	// Test-only failure injection. When set, Write/Remove consult it FIRST and return
+	// its error (nil ⇒ proceed), so a test can exercise a durable-record failure without
+	// a real I/O fault. Production never sets these (mirrors seams like vfio.SetFS).
+	FailWrite  func(opID string) error
+	FailRemove func(opID string) error
 }
 
 // Open creates (0700) and returns a journal rooted at dir.
@@ -96,6 +102,11 @@ func (j *Journal) path(opID string) string { return filepath.Join(j.dir, sanitiz
 // It is fail-closed: any I/O error is returned so the caller does NOT begin the
 // external mutation the entry was meant to protect.
 func (j *Journal) Write(e Entry) error {
+	if j.FailWrite != nil {
+		if err := j.FailWrite(e.OperationID); err != nil {
+			return err
+		}
+	}
 	e.Version = entryVersion
 	e.Checksum = e.checksum()
 	b, err := json.Marshal(e)
@@ -177,6 +188,11 @@ func readFile(path string) (*Entry, bool, error) {
 // Remove deletes opID's entry (used after the operation completes or is
 // superseded). A missing entry is not an error.
 func (j *Journal) Remove(opID string) error {
+	if j.FailRemove != nil {
+		if err := j.FailRemove(opID); err != nil {
+			return err
+		}
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if err := os.Remove(j.path(opID)); err != nil && !errors.Is(err, os.ErrNotExist) {

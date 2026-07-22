@@ -1,6 +1,7 @@
 package opjournal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -91,6 +92,65 @@ func TestJournal_RemoveAndList(t *testing.T) {
 	// Removing a missing entry is not an error.
 	if err := j.Remove("op-abc123"); err != nil {
 		t.Fatalf("Remove(missing): %v", err)
+	}
+}
+
+// TestJournal_FailWriteHook: the injected FailWrite hook makes Write return the
+// injected error (and never persist the entry) — the failure-injection seam callers
+// use to exercise a durable-record write fault.
+func TestJournal_FailWriteHook(t *testing.T) {
+	j, _ := Open(t.TempDir())
+	injected := errors.New("injected write failure")
+	j.FailWrite = func(opID string) error {
+		if opID == "op-abc123" {
+			return injected
+		}
+		return nil
+	}
+	if err := j.Write(sampleEntry()); !errors.Is(err, injected) {
+		t.Fatalf("FailWrite hook must make Write return the injected error, got %v", err)
+	}
+	if _, found, _ := j.Read("op-abc123"); found {
+		t.Fatal("a failed write must not persist the entry")
+	}
+	// A nil-returning hook lets the write proceed.
+	j.FailWrite = func(string) error { return nil }
+	if err := j.Write(sampleEntry()); err != nil {
+		t.Fatalf("Write must proceed when the hook returns nil, got %v", err)
+	}
+	if _, found, _ := j.Read("op-abc123"); !found {
+		t.Fatal("Write should persist once the hook allows it")
+	}
+}
+
+// TestJournal_FailRemoveHook: the injected FailRemove hook makes Remove return the
+// injected error and leaves the entry in place (the hook is consulted before any FS
+// mutation), so a test can model a best-effort removal that could not complete.
+func TestJournal_FailRemoveHook(t *testing.T) {
+	j, _ := Open(t.TempDir())
+	if err := j.Write(sampleEntry()); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	injected := errors.New("injected remove failure")
+	j.FailRemove = func(opID string) error {
+		if opID == "op-abc123" {
+			return injected
+		}
+		return nil
+	}
+	if err := j.Remove("op-abc123"); !errors.Is(err, injected) {
+		t.Fatalf("FailRemove hook must make Remove return the injected error, got %v", err)
+	}
+	if _, found, _ := j.Read("op-abc123"); !found {
+		t.Fatal("a failed remove must leave the entry in place")
+	}
+	// A nil-returning hook lets the remove proceed.
+	j.FailRemove = func(string) error { return nil }
+	if err := j.Remove("op-abc123"); err != nil {
+		t.Fatalf("Remove must proceed when the hook returns nil, got %v", err)
+	}
+	if _, found, _ := j.Read("op-abc123"); found {
+		t.Fatal("Remove should delete the entry once the hook allows it")
 	}
 }
 

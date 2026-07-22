@@ -521,7 +521,17 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 	// Durably record the claimed devices (F1 device lease) BEFORE the irreversible
 	// vfio bind, so a crash before the VM row is finalized is rolled back at
 	// startup. No-op unless the operation_protocol capability is active.
-	finish := s.beginDeviceLease(ctx, vmName, addresses, stage)
+	finish, lerr := s.beginDeviceLease(ctx, vmName, addresses, stage)
+	if lerr != nil {
+		// Could not durably record the pre-bind crash anchor → we must NOT bind (a crash would
+		// leave an owned, vfio-bound device with no recovery record). Release the claims made
+		// (nothing is bound yet → the strict primitive skips every unbind and just owner-
+		// releases them) and abort BEFORE the bind loop.
+		if rerr := s.unbindAndReleaseOwnership(ctx, vmName, claimed); rerr != nil {
+			slog.Error("device-lease begin failed; claim rollback incomplete (owned, not yet bound)", "vm", vmName, "error", rerr)
+		}
+		return noop, nil, status.Errorf(codes.Internal, "record device lease for %q: %v", vmName, lerr)
+	}
 
 	for _, addr := range addresses {
 		prevDriver, err := vfio.Bind(addr)

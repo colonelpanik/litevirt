@@ -195,6 +195,14 @@ func (f *pciUnbindRecordingFS) unbindCount(addr string) int {
 	return f.unbinds[addr]
 }
 
+// bindCount returns the total number of vfio-pci bind writes observed (the FS models
+// binds globally). A test asserts 0 to prove no device was bound.
+func (f *pciUnbindRecordingFS) bindCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.binds
+}
+
 // TestDetachPCI_StoppedAfterStart_UnbindsAndReleases is the FIX-11 regression: the
 // attach → start → stop → detach lifecycle. FIX-9b makes a latched stop RETAIN the
 // vfio binding + ownership + realizations, so at detach time the stopped VM's device

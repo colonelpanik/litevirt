@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -61,14 +62,20 @@ func (s *Server) clearDeviceLease(vmName string) {
 // inactive it is a no-op and only the in-memory scoped rollback applies. Returns
 // a finish func the caller defers to clear the lease once the VM row is durable.
 //
+// It is FAIL-CLOSED: the durable pre-bind crash anchor is a precondition of binding,
+// so a journal write error returns a non-nil error and the caller MUST NOT bind — a
+// crash after a bind with no recovery record is exactly the owned+bound leak this
+// lease exists to prevent. The gated no-op case returns (func(){}, nil): pre-latch no
+// lease is EXPECTED, so it is not an error.
+//
 // stage is the INITIAL durable stage: deviceLeaseStageBound for every caller whose
 // completion produces its own durable record (CreateVM, start, journaled attach), and
 // deviceLeaseStageInProgress ONLY for the unjournaled legacy running-attach, whose lease
 // is its sole crash anchor and whose VM already exists — so a mid-attach crash must be
 // reclaimed by recovery, not misread as a completed allocation and cleared.
-func (s *Server) beginDeviceLease(ctx context.Context, vmName string, addrs []string, stage string) func() {
+func (s *Server) beginDeviceLease(ctx context.Context, vmName string, addrs []string, stage string) (func(), error) {
 	if s.opJournal == nil || len(addrs) == 0 || !s.operationProtocolActive(ctx) {
-		return func() {}
+		return func() {}, nil
 	}
 	entry := opjournal.Entry{
 		OperationID: deviceLeaseOpID(vmName),
@@ -79,14 +86,39 @@ func (s *Server) beginDeviceLease(ctx context.Context, vmName string, addrs []st
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := s.opJournal.Write(entry); err != nil {
-		slog.Warn("device lease: durable journal write failed (in-memory rollback still applies)",
-			"vm", vmName, "error", err)
-		return func() {}
+		return nil, fmt.Errorf("device lease: durable journal write for %q: %w", vmName, err)
 	}
 	return func() {
 		if err := s.opJournal.Remove(deviceLeaseOpID(vmName)); err != nil {
 			slog.Warn("device lease: clear journal entry", "vm", vmName, "error", err)
 		}
+	}, nil
+}
+
+// completeDeviceLease durably marks a successful allocation's lease COMPLETED (Stage bound)
+// before best-effort removal. Recovery clears a bound lease WITHOUT reclamation, so even if
+// the subsequent Remove fails the successfully-attached device is NOT torn down on restart.
+// Only needed by the legacy attach (its lease is in_progress, a reclaim trigger); the other
+// callers' leases are already bound. No-op when no lease exists (pre-latch).
+func (s *Server) completeDeviceLease(vmName string) {
+	if s.opJournal == nil {
+		return
+	}
+	existing, found, err := s.opJournal.Read(deviceLeaseOpID(vmName))
+	if err != nil || !found {
+		return
+	}
+	if existing.Stage != deviceLeaseStageBound {
+		existing.Stage = deviceLeaseStageBound
+		if werr := s.opJournal.Write(*existing); werr != nil {
+			// Could not durably record completion → fall back to removing the entry entirely
+			// (recovery then has nothing to reclaim). Only a DOUBLE journal failure (this
+			// Write AND the Remove below) leaves in_progress → a degraded-host edge.
+			slog.Error("device lease: mark completed failed — falling back to removal", "vm", vmName, "error", werr)
+		}
+	}
+	if rerr := s.opJournal.Remove(deviceLeaseOpID(vmName)); rerr != nil {
+		slog.Warn("device lease: remove after completion (best-effort; recovery clears a bound entry)", "vm", vmName, "error", rerr)
 	}
 }
 

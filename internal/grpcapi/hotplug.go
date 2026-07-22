@@ -256,10 +256,11 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 
 	// Track the members whose live hostdev attach SUCCEEDED so a rollback can inverse-
 	// detach them from the guest BEFORE releasing (never vfio-unbind/release a device
-	// that is still attached to the live domain). NOTE: finish() (clearing the durable
-	// device lease) is called explicitly — on the success path and only when a rollback
-	// FULLY completes — never via a blanket defer, so an incomplete rollback retains the
-	// lease for RecoverDeviceLeases.
+	// that is still attached to the live domain). NOTE: the durable device lease is
+	// resolved explicitly — the SUCCESS path records completion (completeDeviceLease:
+	// transition to bound, THEN best-effort remove) and a FULLY-completed rollback
+	// clears it via finish() — never via a blanket defer, so an incomplete rollback
+	// retains the lease for RecoverDeviceLeases.
 	var attachedAddrs []string
 	for _, addr := range addrs {
 		if err := s.virt.AttachHostdev(vmName, addr); err != nil {
@@ -303,8 +304,11 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 		slog.Info("PCI device attached", "vm", vmName, "address", addr)
 	}
 
-	// Success: the VM's devices are attached + owned → clear the crash-recovery lease.
-	finish()
+	// Success: the VM's devices are attached + owned. Durably transition the in_progress
+	// lease to bound BEFORE removing it, so a failed best-effort removal leaves a lease
+	// recovery CLEARS (not one it reclaims) — the successfully-attached device is never
+	// torn down on restart.
+	s.completeDeviceLease(vmName)
 	s.publish("device.attached", vmName, fmt.Sprintf("pci:%v", addrs))
 	return s.vmToProto(ctx, vmName)
 }

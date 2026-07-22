@@ -1298,6 +1298,40 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	return out, nil
 }
 
+// checkNoRemotePCIOwner fails closed before a VM-delete tombstone if any host OTHER than
+// this one still holds a live host_pci_devices ownership row for vmName. DeleteVM forwards
+// to the VM's home host before doing local work, so once the local releaseDevices has run
+// (this host's rows cleared to an empty vm_name) the only ownership rows that can remain are
+// on a remote host — a stale migration artifact (a partial/failed migration that left the
+// source-host reservation). Tombstoning the vms row over it would strand that device
+// assigned to a now-deleted VM, blocking every future ClaimPCIDevice CAS on that BDF forever.
+// Fail closed → the delete is RETRYABLE once the remote host's own teardown (or a re-run
+// migration) releases the row. On the read error, also fail closed: never tombstone on an
+// unverifiable ownership state. s.hostName is defensively filtered out (already released).
+func (s *Server) checkNoRemotePCIOwner(ctx context.Context, vmName string) error {
+	hosts, err := corrosion.PCIOwnerHostsForVM(ctx, s.db, vmName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "cannot delete VM %q: check remote PCI ownership: %v", vmName, err)
+	}
+	if remote := without(hosts, s.hostName); len(remote) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot delete VM %q: host(s) %s still own its PCI device(s); release them on those host(s) and retry",
+			vmName, strings.Join(remote, ", "))
+	}
+	return nil
+}
+
+// without returns ss with every occurrence of drop removed (order preserved).
+func without(ss []string, drop string) []string {
+	var out []string
+	for _, v := range ss {
+		if v != drop {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // deleteLocalOnly reports whether this DeleteVM call is a peer-search probe
 // (carries the x-lv-delete-local-only header), meaning it must act on the local
 // host only and never proxy or fan out to peers.
@@ -1402,6 +1436,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, status.Errorf(codes.Internal,
 				"cannot clean up stale VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
 		}
+		// FIX-28: after the local release, a REMOTE host may still own this VM's PCI (a
+		// stale source-host reservation from a partial migration). Fail closed before the
+		// tombstone — otherwise that device is stranded on a now-deleted VM (same stale-owner
+		// class the local FIX-21/22 release guards against, one host over).
+		if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
+			return nil, err
+		}
 		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
 			slog.Error("failed to clean up stale VM record", "vm", req.Name, "error", err)
 		}
@@ -1446,9 +1487,19 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// already-unbound device reads IsBoundToVFIO=false → skip → release) and the delete
 	// proceeds. No stale owner row is ever created, and no unowned-but-vfio-bound device
 	// either. Applies equally to a --keep-disks delete (device release is disk-independent).
+	//
+	// FIX-28: releaseDevices touches only THIS host's rows. If a DIFFERENT host still owns
+	// the VM's PCI (a stale source-host reservation left by a partial migration), the local
+	// release leaves it — and tombstoning over it strands that device on a now-deleted VM
+	// (the same stale-owner class, one host over). So after the local release succeeds, and
+	// BEFORE the tombstone, fail closed on any surviving remote owner (retryable once that
+	// host releases its row; fail closed on the ownership-read error too).
 	if err := s.releaseDevices(ctx, req.Name); err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"cannot delete VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
+	}
+	if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
+		return nil, err
 	}
 	// Devices released → clear any lingering durable device lease so a deleted VM's
 	// devlease:<vm> entry can't linger to drive a cross-VM unbind on recovery (FIX-22).

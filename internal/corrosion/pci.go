@@ -165,6 +165,24 @@ func VMDeviceOwnership(ctx context.Context, c *Client, hostName, vmName string) 
 	return live, tombstoned, nil
 }
 
+// PCIOwnerHostsForVM returns the distinct host names that still hold a LIVE
+// host_pci_devices ownership row for vmName (any host). Used before a VM-delete
+// tombstone to refuse deletion while a remote host still owns the VM's PCI (which
+// would strand that device assigned to a now-deleted VM).
+func PCIOwnerHostsForVM(ctx context.Context, c *Client, vmName string) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT host_name FROM host_pci_devices
+		 WHERE vm_name = ? AND deleted_at IS NULL ORDER BY host_name`, vmName)
+	if err != nil {
+		return nil, err
+	}
+	var hosts []string
+	for _, r := range rows {
+		hosts = append(hosts, r.String("host_name"))
+	}
+	return hosts, nil
+}
+
 // AssignPCIDevice marks a PCI device as assigned to a VM.
 func AssignPCIDevice(ctx context.Context, c *Client, hostName, address, vmName string) error {
 	return c.Execute(ctx,

@@ -536,13 +536,13 @@ func TestDetachPCI_StoppedReleaseWriteFails_LeavesRecoverable(t *testing.T) {
 	}
 	fake.SetState("vm1", libvirtfake.StateDefined)
 
-	// Force the DB release to fail: drop the inventory table out from under
-	// ReleasePCIDevice (the fail-closed pattern other tests use). The unbind still
-	// succeeds (vfio state lives in the FS fake), so this exercises the post-unbind
-	// release-write failure specifically.
-	if err := s.db.Execute(ctx, `DROP TABLE host_pci_devices`); err != nil {
-		t.Fatalf("DROP TABLE host_pci_devices: %v", err)
-	}
+	// Force ONLY the post-unbind DB release WRITE to fail — not the primitive's ownership
+	// read. The onUnbind hook fires after the vfio unbind has flipped the device unbound but
+	// before the ReleasePCIDevice loop, so dropping the inventory table there leaves the
+	// primitive's fail-closed ownership read (which runs first, before the unbind) intact
+	// while the release UPDATE hits a missing table. The unbind still succeeds (vfio state
+	// lives in the FS fake), exercising the post-unbind release-write failure specifically.
+	fs.onUnbind = func(string) { _ = s.db.Execute(ctx, `DROP TABLE host_pci_devices`) }
 
 	_, derr := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: addr})
 	if derr == nil {

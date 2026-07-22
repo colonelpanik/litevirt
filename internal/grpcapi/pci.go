@@ -764,9 +764,16 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 // which lies after a FIX-9c failed-start rollback that tombstones realizations while
 // retaining the binding.
 //
-// Per member: read the vfio driver state; if the device is bound to vfio-pci, unbind it
-// (restoring the host driver from host_pci_devices.Driver). A device that is NOT bound
-// is skipped — vfio.Unbind on a never-bound device is not a clean no-op (it clears
+// It is OWNER-SCOPED: it first reads host_pci_devices ownership (fail-closed — a read
+// error releases NOTHING and returns recoverable, since ownership can't be determined) and
+// SKIPS any addr a DIFFERENT non-empty VM owns, in BOTH the unbind and the release loops.
+// This is a no-op for every legitimate caller (they pass the VM's own realization/intent
+// members or freshly-CAS-claimed addrs → owner == vmName); it only neutralizes the buggy
+// legacy-detach-of-a-foreign-BDF case so NO caller can unbind another live VM's device.
+//
+// Per (owned/unowned) member: read the vfio driver state; if the device is bound to vfio-pci,
+// unbind it (restoring the host driver from host_pci_devices.Driver). A device that is NOT
+// bound is skipped — vfio.Unbind on a never-bound device is not a clean no-op (it clears
 // driver_override and reprobes). A bound-check FS error counts as a failure.
 //
 //   - If ANY member's unbind (or bound-check) failed → RELEASE NOTHING (no
@@ -783,15 +790,34 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 //     and the owner-scoped re-release of an already-released device is a 0-row no-op, so
 //     the release converges.
 func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, addrs []string) error {
+	// Read host PCI ownership + the host-driver map. This read is the ONLY signal for which of
+	// the passed addrs are actually vmName's, so it is fail-closed: if it ERRORS we cannot
+	// determine ownership and must NOT act — release NOTHING and return a recoverable error
+	// rather than proceed on an empty map and risk unbinding a device another VM owns. (An
+	// operator-driven legacy detach forwards a raw BDF straight to this primitive; this
+	// ownership scope is what stops it from tearing down a DIFFERENT live VM's passthrough.)
+	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return fmt.Errorf("pci release: read device ownership for %q: %w", vmName, err)
+	}
 	drivers := map[string]string{}
-	if devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); err == nil {
-		for _, d := range devices {
-			drivers[d.Address] = d.Driver
-		}
+	owners := map[string]string{}
+	for _, d := range devices {
+		drivers[d.Address] = d.Driver
+		owners[d.Address] = d.VMName
 	}
 
 	var failures []error
 	for _, addr := range addrs {
+		// Owner-scope the unbind: NEVER touch an addr a DIFFERENT non-empty VM owns — that
+		// would tear down its live passthrough. Only addrs owned by vmName (or genuinely
+		// unowned) are ours to act on. This makes the primitive structurally safe for EVERY
+		// caller, including the legacy detach that forwards an operator-supplied BDF.
+		if owner := owners[addr]; owner != "" && owner != vmName {
+			slog.Warn("pci release: skipping addr owned by another VM (not ours to unbind)",
+				"caller_vm", vmName, "address", addr, "owner", owner)
+			continue
+		}
 		bound, berr := vfio.IsBoundToVFIO(addr)
 		if berr != nil {
 			// Cannot prove the device's binding state → fail closed (treat as an unbind
@@ -816,6 +842,12 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 
 	var relFailures []error
 	for _, addr := range addrs {
+		// Same owner-scope on the release: skip an addr owned by another VM (the owner-scoped
+		// ReleasePCIDevice would no-op on it anyway, but skip explicitly to avoid a spurious
+		// relFailure and to keep the two loops' acted-on subset identical).
+		if owner := owners[addr]; owner != "" && owner != vmName {
+			continue
+		}
 		if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
 			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
 			relFailures = append(relFailures, fmt.Errorf("release %s ownership: %w", addr, err))

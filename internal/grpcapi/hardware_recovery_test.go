@@ -1635,6 +1635,81 @@ func TestRecoverPCIDetach_RunningDumpXMLFails_LeavesRecoverable(t *testing.T) {
 	}
 }
 
+// TestRecoverPCIDetach_RunningRealizationReadFails_LeavesRecoverable is FIX-19 Fix B: a
+// RUNNING PCI detach recovery whose realization read (ListVMPCIRealizations) ERRORS must
+// FAIL CLOSED. The running branch derives its member set ONLY from the realizations, so a
+// swallowed read error yields an EMPTY member set → recovery detaches nothing, releases
+// nothing, tombstones the rows and COMPLETES while the live hostdev is still attached + the
+// device still bound + owned (a leak that terminalizes). Recovery must instead leave the op
+// recovery-required — ownership retained, device still bound, intent NOT tombstoned, barrier
+// retained, op NOT completed — and retry once the read succeeds. RED before the fix
+// (`if reals, e := …; e == nil` discarded the read error → empty set → tombstoned + completed
+// while bound).
+func TestRecoverPCIDetach_RunningRealizationReadFails_LeavesRecoverable(t *testing.T) {
+	const addr = "0000:41:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	seedPCIGPU(t, s, addr, -1)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	// Attach (running) so the device is vfio-bound + owner-assigned + realized.
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: addr},
+	}); err != nil {
+		t.Fatalf("seed attach: %v", err)
+	}
+	deviceID := liveIntents(t, ctx, s, "vm1")[0].DeviceID
+	if !fs.isBound(addr) {
+		t.Fatal("precondition: running attach must vfio-bind the device")
+	}
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceDetach,
+		detachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr})
+
+	// Force the realization READ to fail WITHOUT breaking the tombstone UPDATE: drop the
+	// SELECT-only `ordinal` column. ListVMPCIRealizations SELECTs `ordinal` (now errors),
+	// while TombstonePCIRealizations' UPDATE touches only deleted_at/updated_at (still
+	// succeeds) — so without the fix the running branch swallows the read error, tombstones,
+	// and completes while the device stays bound.
+	if err := s.db.Execute(ctx, `ALTER TABLE vm_pci_realizations DROP COLUMN ordinal`); err != nil {
+		t.Fatalf("drop ordinal column: %v", err)
+	}
+
+	s.RecoverHardwareOperations(ctx)
+
+	// FAIL CLOSED: nothing released, nothing unbound, nothing tombstoned, op NOT completed.
+	if o := pciOwnerOf(t, ctx, s, addr); o != "vm1" {
+		t.Fatalf("a realization read failure must NOT release ownership, got owner %q, want vm1", o)
+	}
+	if n := fs.unbindCount(addr); n != 0 {
+		t.Fatalf("a realization read failure must NOT vfio-unbind, got %d unbinds", n)
+	}
+	if !fs.isBound(addr) {
+		t.Fatal("a realization read failure must leave the device still bound")
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("a realization read failure must NOT tombstone the intent, got %d", len(in))
+	}
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID == "" {
+		t.Fatal("a realization read failure must leave the operation barrier set (recovery-required)")
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceDetach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state == corrosion.OpStepCompleted {
+		t.Fatal("recovery must NOT complete a detach whose realization read failed")
+	}
+}
+
 // ── host reboot: live domain shut off while vm.State still "running" ─────────────
 
 // TestRecoverHardwareOperations_HostRebootAttachTakesStoppedPath: after a host

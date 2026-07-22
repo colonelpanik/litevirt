@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -186,15 +189,20 @@ func TestDetachPCI_RunningUnbindFails_LeavesRecoverable(t *testing.T) {
 	}
 }
 
-// TestDetachPCI_EmptyMemberSet_LeavesRecoverable is FIX-16 Fix A: a detach whose member
-// set cannot be resolved (no realizations, and the intent-resolve fails — here a
-// since-regrouped IOMMU sibling now owned by ANOTHER VM trips checkIOMMUConflict on the
-// primary) must leave the op recovery-required — the intent is NOT tombstoned and the
-// VM's ownership is NOT touched — rather than journaling + running a no-op release and
-// tombstoning the intent while the device stays owned (a leak that COMPLETES). The guard
-// sits BEFORE the running/stopped split so it protects both paths. RED before the fix
-// (an empty member set completed: the intent was tombstoned while ownership leaked).
-func TestDetachPCI_EmptyMemberSet_LeavesRecoverable(t *testing.T) {
+// TestDetachPCI_UnresolvableMembers_CleanTerminalNotWedge is FIX-19 Fix A (supersedes the
+// old FIX-16 "empty member set leaves recoverable" expectation). The live-detach empty/
+// unresolvable-member guard runs AFTER BeginVMOperation (barrier held) but BEFORE any
+// journal entry / DetachHostdev / release — so NOTHING has been mutated. Returning a
+// RECOVERABLE error there permanently WEDGES the VM: the barrier stays held with no journal,
+// and crash recovery REFUSES to act on a wedged op that has no journal entry
+// (recoverPCIDetach needs the journal to reconstruct the member set → `if !found { … return }`).
+// So "recoverable" here means the barrier is held forever, no future op can run, and recovery
+// can never clear it. Because nothing was applied, the guard must instead TERMINALLY fail via
+// failPCIDetachClean — its "nothing applied" contract holds pre-journal/pre-mutation — which
+// CLEARS the barrier so the operator/client can retry cleanly. RED before the fix (recoverable
+// → barrier held → a follow-up op sees "an operation is in progress" and recovery finds no
+// journal to clear it → permanent wedge).
+func TestDetachPCI_UnresolvableMembers_CleanTerminalNotWedge(t *testing.T) {
 	const primary = "0000:41:00.0"
 	const sibling = "0000:41:00.1"
 	const deviceID = "pcidev-empty"
@@ -223,21 +231,38 @@ func TestDetachPCI_EmptyMemberSet_LeavesRecoverable(t *testing.T) {
 
 	_, derr := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: primary})
 	if derr == nil {
-		t.Fatal("an unresolvable member set must fail the detach (recoverable), not complete")
+		t.Fatal("an unresolvable member set must fail the detach")
 	}
 
-	// LEFT RECOVERABLE: the intent is NOT tombstoned and vm1 still owns the primary.
-	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
-		t.Fatalf("an empty member set must NOT tombstone the intent, got %d", len(in))
+	// CLEAN TERMINAL (NOT recoverable): the barrier is CLEARED so the VM is mutable again.
+	// A recoverable return here would wedge forever — the guard is pre-journal, so recovery
+	// would find no journal entry and refuse to clear the barrier.
+	if op := mustGetVM(t, s, "vm1").ActiveOperationID; op != "" {
+		t.Fatalf("an unresolvable member set must terminalize cleanly (barrier cleared), got %q", op)
 	}
+	// No journal entry was ever written (the guard runs BEFORE the plan is journaled) — the
+	// "nothing applied" contract that makes clean-terminal safe.
+	if entries, _, err := s.opJournal.List(); err != nil {
+		t.Fatalf("journal list: %v", err)
+	} else if len(entries) != 0 {
+		t.Fatalf("the pre-journal guard must NOT write a journal entry, got %d", len(entries))
+	}
+	// failPCIDetachClean never touches host inventory/hardware: ownership retained, no unbind,
+	// intent NOT tombstoned.
 	if o := pciOwnerOf(t, ctx, s, primary); o != "vm1" {
-		t.Fatalf("an empty member set must NOT touch ownership, primary owner = %q, want vm1", o)
+		t.Fatalf("clean-terminal detach must NOT touch ownership, primary owner = %q, want vm1", o)
 	}
 	if n := fs.unbindCount(primary); n != 0 {
-		t.Fatalf("an empty member set must NOT vfio-unbind, got %d unbinds", n)
+		t.Fatalf("clean-terminal detach must NOT vfio-unbind, got %d unbinds", n)
 	}
-	// Barrier still set → the operation is recovery-required (it runs past BeginVMOperation).
-	if op := mustGetVM(t, s, "vm1").ActiveOperationID; op == "" {
-		t.Fatal("an empty member set must leave the operation barrier set (recovery-required)")
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("clean-terminal detach must NOT tombstone the intent, got %d", len(in))
+	}
+	// The barrier is clear → a subsequent op on the VM is NOT blocked by "an operation is in
+	// progress" (it reaches the guard again and fails clean with code Internal — never
+	// FailedPrecondition, which is the wedge symptom).
+	_, derr2 := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: primary})
+	if status.Code(derr2) == codes.FailedPrecondition {
+		t.Fatalf("a subsequent op must NOT be blocked by the barrier (wedge), got %v", derr2)
 	}
 }

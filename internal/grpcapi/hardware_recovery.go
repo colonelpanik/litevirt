@@ -671,15 +671,26 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 	// forward roll is pure bookkeeping. (The STOPPED branch below CAN observe realizations
 	// tombstoned while a device stays bound — a FIX-9c failed-start retained binding — so it
 	// additionally falls back to the journaled member_addresses / intent.)
+	//
+	// FIX-19 (Fix B): FAIL CLOSED on a realization READ ERROR. A discarded error would leave
+	// memberAddrs EMPTY, and an empty set is indistinguishable from "already released": the
+	// running branch would detach/release nothing, tombstone the rows and COMPLETE while the
+	// live hostdev is still attached + the device still bound + owned; the stopped branch would
+	// fall through to a possibly-wrong set. An empty RESULT with no error is the legitimate
+	// already-released case (handled below) — but a read error is not, so leave the op
+	// recovery-required and retry once the read succeeds. This shared read guards both branches.
+	reals, e := corrosion.ListVMPCIRealizations(ctx, s.db, vm.Name)
+	if e != nil {
+		slog.Error("hardware op recovery: pci detach realization read failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
+		return
+	}
 	var memberAddrs, memberAliases []string
-	if reals, e := corrosion.ListVMPCIRealizations(ctx, s.db, vm.Name); e == nil {
-		for _, r := range reals {
-			if r.DeviceID != deviceID {
-				continue
-			}
-			memberAddrs = append(memberAddrs, r.ResolvedAddress)
-			memberAliases = append(memberAliases, r.XMLAlias)
+	for _, r := range reals {
+		if r.DeviceID != deviceID {
+			continue
 		}
+		memberAddrs = append(memberAddrs, r.ResolvedAddress)
+		memberAliases = append(memberAliases, r.XMLAlias)
 	}
 
 	if running {

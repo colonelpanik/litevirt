@@ -815,19 +815,30 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 		}
 	}
 
-	// FIX-16 (Fix A): a live address intent ALWAYS resolves to >=1 member, so an empty set
+	// FIX-19 (Fix A): a live address intent ALWAYS resolves to >=1 member, so an empty set
 	// means the resolution genuinely FAILED (e.g. a since-regrouped IOMMU sibling now owned
 	// by another VM trips checkIOMMUConflict on the primary) or the device vanished — never
 	// a legitimately-empty detach. Proceeding would journal + run a no-op release and then
 	// tombstone the intent while the VM may STILL own the device(s): a leak that COMPLETES.
-	// Leave the op RECOVERABLE instead — this runs past BeginVMOperation, so the barrier is
-	// held; return a recoverable codes.Internal without journaling, releasing, or
-	// tombstoning. The guard sits BEFORE the running/stopped split so it protects both.
+	//
+	// This guard is PRE-JOURNAL and PRE-MUTATION: nothing has been written to the op journal
+	// and nothing (DetachHostdev / unbind / owner-release) has been applied. So it must fail
+	// CLEAN-TERMINAL, not "recoverable" — the two are NOT interchangeable here:
+	//   • recoverable = keep the barrier held so recovery re-drives from the journal. But
+	//     crash recovery REFUSES to act on a wedged op with NO journal entry
+	//     (recoverPCIDetach needs the journal to reconstruct the member set; RunHardware-
+	//     OperationRecovery: `if !found { … "no journal entry" … return }`). With no journal,
+	//     "recoverable" here means the barrier is held FOREVER — a permanent WEDGE (no future
+	//     op can run, recovery can never clear it).
+	//   • clean-terminal (failPCIDetachClean) records a terminal failure + CLEARS the barrier.
+	//     Its "nothing applied — never touches host inventory/hardware" contract HOLDS exactly
+	//     because this guard is pre-journal/pre-mutation, so the operator/client can retry
+	//     cleanly. (The post-journal/post-mutation branches below correctly stay recoverable —
+	//     there a journal exists for recovery to re-drive from.)
+	// The guard sits BEFORE the running/stopped split so it protects both.
 	if resolveFailed || len(memberAddrs) == 0 {
-		slog.Error("pci detach: could not resolve PCI members to detach — left recoverable",
-			"vm", vm.Name, "op", opID, "address", normAddr)
-		return nil, status.Errorf(codes.Internal,
-			"pci detach for %q could not resolve PCI members to detach; left recoverable", vm.Name)
+		return s.failPCIDetachClean(ctx, vm, opID, epoch, newGen, normAddr,
+			codes.Internal, fmt.Errorf("could not resolve PCI members to detach for %q", vm.Name))
 	}
 
 	priorActive, _ := s.virt.DumpXML(vm.Name)

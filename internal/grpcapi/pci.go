@@ -704,28 +704,41 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	}, nil
 }
 
-// releaseDevices is the STRICT whole-VM PCI teardown: for every device this host
-// records as owned by vmName it consults the ACTUAL vfio driver state (IsBoundToVFIO
-// ground truth) and unbinds the ones still bound to vfio-pci, then releases the VM's
-// ownership (ReleasePCIDevicesByVM) ONLY if EVERY unbind succeeded. If any unbind (or
-// bound-check) failed it releases NOTHING and returns an error — the same all-or-
-// nothing invariant unbindAndReleaseOwnership enforces per-member, applied to the whole
-// VM set — so a still-bound device is NEVER left unowned-but-vfio-bound. Both callers treat
-// the error the same: they do NOT proceed past it. The pre-latch stop leaves the stop
-// recoverable; VM delete FAILS before tombstoning the vms row (so it never leaves a stale
-// owner of a deleted VM — which would block every future claim on that BDF), leaving the
-// delete retryable once the operator resolves the stuck device.
+// releaseDevices is the STRICT, HOST-SCOPED whole-VM PCI teardown: for every device
+// THIS host records as owned by vmName it consults the ACTUAL vfio driver state
+// (IsBoundToVFIO ground truth) and unbinds the ones still bound to vfio-pci, then
+// releases ownership PER DEVICE and owner-scoped (ReleasePCIDevice) ONLY if EVERY unbind
+// succeeded. If any unbind (or bound-check) failed it releases NOTHING and returns an
+// error — the same all-or-nothing invariant unbindAndReleaseOwnership enforces per-member,
+// applied to the whole VM set — so a still-bound device is NEVER left unowned-but-vfio-
+// bound. A release-WRITE failure after a clean unbind is likewise recoverable: it returns
+// the joined error so the caller does not complete over a leaked ownership row (a retry
+// converges — an owner-scoped re-release of an already-released row is a 0-row no-op and an
+// already-unbound device reads IsBoundToVFIO=false).
+//
+// It is HOST-SCOPED: it clears ONLY this host's ownership rows (the ones it just unbound).
+// A device a stale/migrated VM still owns on a DIFFERENT host is left for THAT host's own
+// teardown to release — clearing it here would leave the remote device unowned-but-vfio-
+// bound, since this host cannot unbind on the remote host. Cross-host cleanup is each
+// involved host's own responsibility.
+//
+// Both callers treat the error the same: they do NOT proceed past it. The pre-latch stop
+// leaves the stop recoverable; VM delete FAILS before tombstoning the vms row (so it never
+// leaves a stale owner of a deleted VM — which would block every future claim on that BDF),
+// leaving the delete retryable once the operator resolves the stuck device.
 func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	if err != nil {
 		return fmt.Errorf("list devices for release: %w", err)
 	}
 
+	var owned []string // THIS host's devices owned by vmName — the exact set to release
 	var failures []error
 	for _, d := range devices {
 		if d.VMName != vmName {
 			continue
 		}
+		owned = append(owned, d.Address)
 		bound, berr := vfio.IsBoundToVFIO(d.Address)
 		if berr != nil {
 			// Cannot prove the binding state → fail closed (treat as an unbind failure) so
@@ -750,8 +763,20 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 			len(failures), vmName, errors.Join(failures...))
 	}
 
-	if err := corrosion.ReleasePCIDevicesByVM(ctx, s.db, vmName); err != nil {
-		return fmt.Errorf("release PCI devices for %q: %w", vmName, err)
+	// Every unbind succeeded → release ONLY this host's ownership rows, per device and
+	// owner-scoped, so a remote host's rows are never touched. A release-write failure is
+	// recoverable (see the doc comment): return the joined error rather than complete over
+	// a leaked ownership row.
+	var relFailures []error
+	for _, addr := range owned {
+		if rerr := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); rerr != nil {
+			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", rerr)
+			relFailures = append(relFailures, fmt.Errorf("release %s ownership: %w", addr, rerr))
+		}
+	}
+	if len(relFailures) > 0 {
+		return fmt.Errorf("pci release: %d device(s) for %q could not be released in DB: %w",
+			len(relFailures), vmName, errors.Join(relFailures...))
 	}
 	return nil
 }

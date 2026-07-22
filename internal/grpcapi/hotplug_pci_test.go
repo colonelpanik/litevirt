@@ -1012,8 +1012,8 @@ func TestDetachPCI_ReleasesStoppedReservation(t *testing.T) {
 }
 
 // TestDeletePCI_ReleasesStoppedReservation proves deleting a VM that holds a
-// stopped PCI reservation clears its host_pci_devices ownership (releaseDevices →
-// ReleasePCIDevicesByVM covers claimed-but-unbound devices).
+// stopped PCI reservation clears its host_pci_devices ownership (releaseDevices's
+// per-device owner-scoped release covers claimed-but-unbound devices).
 func TestDeletePCI_ReleasesStoppedReservation(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)

@@ -78,5 +78,12 @@ func HistoricalShapes() []HistoricalShape {
 		  storage_type, storage_volume, target_dev, backing_disk, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, "vm_disks_insert_v130")
 
+	// ReleasePCIDevicesByVM (pre-branch): cluster-wide clear of a VM's PCI ownership by
+	// vm_name. The current tree releases per-device host+owner-scoped (ReleasePCIDevice) so a
+	// whole-VM teardown never clears a remote host's ownership without unbinding there.
+	// Supported peers still emit the cluster-wide shape, so it stays historical-only for the
+	// rolling-upgrade horizon.
+	add("UPDATE host_pci_devices SET vm_name = NULL, updated_at = ? WHERE vm_name = ?", "pci_release_by_vm_v130")
+
 	return out
 }

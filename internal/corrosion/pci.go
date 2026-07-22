@@ -173,14 +173,6 @@ func AssignPCIDevice(ctx context.Context, c *Client, hostName, address, vmName s
 		vmName, c.NowTS(), hostName, address)
 }
 
-// ReleasePCIDevicesByVM clears all device assignments for a given VM.
-func ReleasePCIDevicesByVM(ctx context.Context, c *Client, vmName string) error {
-	return c.Execute(ctx,
-		`UPDATE host_pci_devices SET vm_name = NULL, updated_at = ?
-		 WHERE vm_name = ?`,
-		c.NowTS(), vmName)
-}
-
 // ClaimPCIDevice atomically assigns a device to a VM, but ONLY if it is active
 // (not tombstoned) AND currently unassigned. Returns true when the claim
 // succeeds, false on a CAS miss (already assigned, or gone). This is the

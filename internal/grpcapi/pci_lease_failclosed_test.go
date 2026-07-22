@@ -154,3 +154,40 @@ func TestRecoverDeviceLeases_SurvivedCompletedLease_ClearsNoReclaim(t *testing.T
 		t.Fatal("recovery must clear the completed (bound) lease entry")
 	}
 }
+
+// TestCompleteDeviceLease_ReadFails_RemovesLeaseNotInProgress (FIX-33): completeDeviceLease's
+// initial Read is best-effort — a SINGLE transient read fault must NOT early-return and leave
+// the in_progress lease (a reclaim trigger) to survive, or startup recovery would tear the
+// successfully-attached device out of the running VM. On a read error the helper falls through
+// to a best-effort removal (recovery then has nothing to reclaim). RED before the fix: the
+// helper early-returned on the read error, leaving the in_progress entry intact.
+func TestCompleteDeviceLease_ReadFails_RemovesLeaseNotInProgress(t *testing.T) {
+	const addr = "0000:00:00.0"
+	s := hotplugDiskServer(t)
+	restore := vfio.SetFS(newPCIUnbindRecordingFS())
+	defer restore()
+
+	// A surviving in_progress lease (a successful legacy attach reached completeDeviceLease).
+	if err := s.opJournal.Write(opjournal.Entry{
+		OperationID: deviceLeaseOpID("vm-a"), ResourceID: "vm-a", Kind: deviceLeaseKind,
+		Stage: deviceLeaseStageInProgress, Artifacts: map[string]string{"addresses": addr},
+	}); err != nil {
+		t.Fatalf("write in_progress lease: %v", err)
+	}
+
+	// The completion Read hits a transient (non-corruption) fault.
+	s.opJournal.FailRead = func(opID string) error {
+		if opID == deviceLeaseOpID("vm-a") {
+			return errors.New("injected transient read fault")
+		}
+		return nil
+	}
+	s.completeDeviceLease("vm-a")
+	s.opJournal.FailRead = nil // let the assertion read succeed
+
+	// The in_progress entry must NOT survive: either transitioned+removed or (read-faulted)
+	// removed via the fall-through. A surviving in_progress would be reclaimed on restart.
+	if e, found, _ := s.opJournal.Read(deviceLeaseOpID("vm-a")); found {
+		t.Fatalf("a read fault in completeDeviceLease must not leave the in_progress lease (stage %q) to be reclaimed", e.Stage)
+	}
+}

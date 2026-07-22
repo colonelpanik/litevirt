@@ -68,9 +68,10 @@ type Journal struct {
 	dir string
 	mu  sync.Mutex
 
-	// Test-only failure injection. When set, Write/Remove consult it FIRST and return
+	// Test-only failure injection. When set, Read/Write/Remove consult it FIRST and return
 	// its error (nil ⇒ proceed), so a test can exercise a durable-record failure without
 	// a real I/O fault. Production never sets these (mirrors seams like vfio.SetFS).
+	FailRead   func(opID string) error
 	FailWrite  func(opID string) error
 	FailRemove func(opID string) error
 }
@@ -162,6 +163,11 @@ func (j *Journal) syncDir() error {
 // A checksum/parse failure returns ErrCorrupt (the entry is not silently
 // dropped) so the caller can fail closed.
 func (j *Journal) Read(opID string) (e *Entry, found bool, err error) {
+	if j.FailRead != nil {
+		if ferr := j.FailRead(opID); ferr != nil {
+			return nil, false, ferr
+		}
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return readFile(j.path(opID))

@@ -104,20 +104,25 @@ func (s *Server) completeDeviceLease(vmName string) {
 	if s.opJournal == nil {
 		return
 	}
-	existing, found, err := s.opJournal.Read(deviceLeaseOpID(vmName))
-	if err != nil || !found {
-		return
+	opID := deviceLeaseOpID(vmName)
+	existing, found, err := s.opJournal.Read(opID)
+	if err == nil && !found {
+		return // no lease (pre-latch / already gone) — nothing to complete
 	}
-	if existing.Stage != deviceLeaseStageBound {
+	// On a successful read of a not-yet-bound lease, durably transition it to bound FIRST
+	// (recovery clears a bound lease WITHOUT reclamation). On a READ error we cannot transition,
+	// so we must NOT early-return: the surviving in_progress entry is a reclaim trigger that
+	// would tear down the working device on restart. Fall straight through to removal instead —
+	// clearing the entry leaves recovery nothing to reclaim (the ownership row + live domain XML
+	// are the durable record of the successful attach). Only a read/transition failure AND the
+	// removal below BOTH failing leaves in_progress → a genuine double-fault, degraded-host edge.
+	if err == nil && existing.Stage != deviceLeaseStageBound {
 		existing.Stage = deviceLeaseStageBound
 		if werr := s.opJournal.Write(*existing); werr != nil {
-			// Could not durably record completion → fall back to removing the entry entirely
-			// (recovery then has nothing to reclaim). Only a DOUBLE journal failure (this
-			// Write AND the Remove below) leaves in_progress → a degraded-host edge.
 			slog.Error("device lease: mark completed failed — falling back to removal", "vm", vmName, "error", werr)
 		}
 	}
-	if rerr := s.opJournal.Remove(deviceLeaseOpID(vmName)); rerr != nil {
+	if rerr := s.opJournal.Remove(opID); rerr != nil {
 		slog.Warn("device lease: remove after completion (best-effort; recovery clears a bound entry)", "vm", vmName, "error", rerr)
 	}
 }

@@ -120,16 +120,24 @@
         <td class="mono">{{.DeviceId}}</td>
         <td>{{.SelectorKind}}</td>
         <td>
-          {{range .Members}}<div class="mono" style="font-size:11px">{{.ResolvedAddress}}{{if .XmlAlias}} ({{.XmlAlias}}){{end}}</div>{{else}}<span class="muted">&mdash;</span>{{end}}
+          {{if .Members}}{{range .Members}}<div class="mono" style="font-size:11px">{{.ResolvedAddress}}{{if .XmlAlias}} ({{.XmlAlias}}){{end}}</div>{{end}}{{else}}{{with .Desired}}{{if .Address}}<div class="mono" style="font-size:11px">{{.Address}} <span class="muted">(reserved)</span></div>{{else}}<span class="muted">&mdash;</span>{{end}}{{else}}<span class="muted">&mdash;</span>{{end}}{{end}}
         </td>
-        <td><span class="badge badge-gray">{{.State}}</span></td>
+        <td><span class="badge {{if eq .State "reserved"}}badge-blue{{else}}badge-gray{{end}}">{{.State}}</span></td>
         {{if ne $.AdoptionState "blocked"}}
         <td>
-          {{range .Members}}
+          {{/* One detach action per PCI device, keyed by the intent's primary
+               address (Desired.Address == the ExclusiveKey detach matches, see
+               liveAddressIntent). Falls back to the first realized member when
+               Desired carries no address (e.g. an undecodable selector payload).
+               Rendered OUTSIDE the members loop so a 0-member reserved device is
+               still detachable and an IOMMU group shows exactly one button, not
+               one-per-member (sibling addresses do not match the intent). */}}
+          {{$detachAddr := ""}}{{with .Desired}}{{$detachAddr = .Address}}{{end}}{{if not $detachAddr}}{{range .Members}}{{if not $detachAddr}}{{$detachAddr = .ResolvedAddress}}{{end}}{{end}}{{end}}
+          {{if $detachAddr}}
           <form hx-post="/ui/vms/{{$.VM}}/detach-pci" hx-swap="none"
                 hx-on::after-request="if(event.detail.successful){htmx.ajax('GET','/ui/vms/{{$.VM}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}"
-                hx-confirm="Detach PCI device {{.ResolvedAddress}}?">
-            <input type="hidden" name="pci_address" value="{{.ResolvedAddress}}">
+                hx-confirm="Detach PCI device {{$detachAddr}}?">
+            <input type="hidden" name="pci_address" value="{{$detachAddr}}">
             <button type="submit" class="btn btn-sm btn-danger">Detach</button>
           </form>
           {{end}}

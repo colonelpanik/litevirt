@@ -44,6 +44,12 @@ func newHardwareLsCmd() *cobra.Command {
 							}
 							addrs += mem.GetResolvedAddress()
 						}
+						// A reserved device has no realized members yet; show its
+						// desired (claimed) address so the row isn't blank. The STATE
+						// column ("reserved" vs "attached") distinguishes the two.
+						if addrs == "" {
+							addrs = p.GetDesired().GetAddress()
+						}
 						fmt.Fprintf(w, "pci\t%s\tselector=%s addr=%s\t%s\n",
 							p.GetDeviceId(), p.GetSelectorKind(), addrs, p.GetState())
 					}

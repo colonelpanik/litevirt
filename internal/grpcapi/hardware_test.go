@@ -187,6 +187,87 @@ func TestListVMHardware_AdoptionState(t *testing.T) {
 	}
 }
 
+// TestListVMHardware_ReservedPCIState verifies a claimed-but-not-yet-realized
+// PCI device (a vm_pci_intent with NO vm_pci_realizations — the reserve-at-attach
+// state of a stopped VM) is reported as "reserved" with its Desired address and
+// zero members, and flips to "attached" once a realization exists. This is the
+// read-model half of the reserved-device fix (empty address / undetachable
+// reserved device in the CLI + UI).
+func TestListVMHardware_ReservedPCIState(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "hw-reserved", HostName: "test-host", State: "stopped",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	addr := "0000:99:00.0"
+	payload, err := protojson.Marshal(&pb.DeviceSpec{Address: addr})
+	if err != nil {
+		t.Fatalf("protojson.Marshal: %v", err)
+	}
+	if err := corrosion.UpsertPCIIntent(ctx, s.db, corrosion.PCIIntentRecord{
+		VMName: "hw-reserved", DeviceID: "dev0", HostName: "test-host",
+		SelectorKind: "address", SelectorPayload: string(payload), ExclusiveKey: &addr,
+	}); err != nil {
+		t.Fatalf("UpsertPCIIntent: %v", err)
+	}
+	// Deliberately NO realization row — the reserved state.
+
+	resp, err := s.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: "hw-reserved"})
+	if err != nil {
+		t.Fatalf("ListVMHardware: %v", err)
+	}
+	pci := onlyPCI(t, resp)
+	if pci.State != "reserved" {
+		t.Errorf("reserved device State = %q, want reserved", pci.State)
+	}
+	if pci.Desired == nil || pci.Desired.Address != addr {
+		t.Errorf("reserved desired = %+v, want address %s", pci.Desired, addr)
+	}
+	if len(pci.Members) != 0 {
+		t.Errorf("reserved members = %+v, want none (unrealized)", pci.Members)
+	}
+
+	// Realize it — now it must report attached with its member.
+	if err := corrosion.UpsertPCIRealization(ctx, s.db, corrosion.PCIRealizationRecord{
+		VMName: "hw-reserved", DeviceID: "dev0", MemberID: "m0", HostName: "test-host",
+		ResolvedAddress: addr, XMLAlias: "hostdev0",
+	}); err != nil {
+		t.Fatalf("UpsertPCIRealization: %v", err)
+	}
+	resp, err = s.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: "hw-reserved"})
+	if err != nil {
+		t.Fatalf("ListVMHardware (post-realize): %v", err)
+	}
+	pci = onlyPCI(t, resp)
+	if pci.State != "attached" {
+		t.Errorf("realized device State = %q, want attached", pci.State)
+	}
+	if len(pci.Members) != 1 || pci.Members[0].ResolvedAddress != addr {
+		t.Errorf("realized members = %+v, want one member %s", pci.Members, addr)
+	}
+}
+
+// onlyPCI returns the single PCI device in resp, failing if there is not exactly one.
+func onlyPCI(t *testing.T, resp *pb.ListVMHardwareResponse) *pb.HardwarePCI {
+	t.Helper()
+	var pci *pb.HardwarePCI
+	n := 0
+	for _, d := range resp.Devices {
+		if p := d.GetPci(); p != nil {
+			pci = p
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("got %d PCI devices, want exactly 1: %+v", n, resp.Devices)
+	}
+	return pci
+}
+
 func TestListVMHardware_NotFound(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

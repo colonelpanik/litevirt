@@ -217,13 +217,25 @@ func (s *Server) assembleVMHardwarePCIFromIntents(ctx context.Context, vmName st
 				desired = nil
 			}
 		}
+		// An intent with no realization rows is CLAIMED but not yet vfio-bound —
+		// the reserve-at-attach state of a stopped VM (ownership + inactive-XML
+		// hostdev recorded, realization deferred to VM start). Report it as
+		// "reserved" so the CLI/UI can show the reserved address and offer a
+		// detach, rather than an empty-member "attached" device. Realization is
+		// all-or-nothing per device (writePCIRealizations writes every member
+		// together; detach tombstones all), so member-count is a clean binary.
+		members := membersByDevice[intent.DeviceID]
+		state := "attached"
+		if len(members) == 0 {
+			state = "reserved"
+		}
 		devices = append(devices, &pb.HardwareDevice{
 			Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
 				DeviceId:     intent.DeviceID,
 				SelectorKind: intent.SelectorKind,
 				Desired:      desired,
-				Members:      membersByDevice[intent.DeviceID],
-				State:        "attached",
+				Members:      members,
+				State:        state,
 			}},
 		})
 	}

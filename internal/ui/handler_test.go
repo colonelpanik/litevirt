@@ -143,6 +143,67 @@ func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
 	assertContains(t, w, "detach-pci")
 }
 
+// TestHandler_HardwareTab_ReservedPCIDetachable verifies a reserved (0-member)
+// PCI device — the reserve-at-attach state of a stopped VM — renders its
+// reserved address (not a blank cell) and exactly one detach control. The bug:
+// detach forms lived inside the members loop, so a 0-member device had no detach
+// button and an empty address.
+func TestHandler_HardwareTab_ReservedPCIDetachable(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "adopted",
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "reserved",
+				Desired: &pb.DeviceSpec{Address: "0000:99:00.0"},
+				// No Members — reserved, not yet realized.
+			}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	assertContains(t, w, "0000:99:00.0")         // reserved address shown, not "—"
+	assertContains(t, w, "reserved")             // state badge / label
+	assertContains(t, w, `value="0000:99:00.0"`) // detach keyed by desired address
+	if n := strings.Count(w.Body.String(), `name="pci_address"`); n != 1 {
+		t.Errorf("got %d detach forms, want exactly 1 for a reserved device", n)
+	}
+}
+
+// TestHandler_HardwareTab_IOMMUGroupSingleDetach verifies a multi-member
+// (IOMMU-group) PCI device renders exactly one detach control keyed by the
+// primary/desired address — not one-per-member (a sibling address does not match
+// the intent's ExclusiveKey and its detach would fail).
+func TestHandler_HardwareTab_IOMMUGroupSingleDetach(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
+		HardwareAdoptionState: "adopted",
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{
+				DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Desired: &pb.DeviceSpec{Address: "0000:41:00.0"},
+				Members: []*pb.HardwarePCIMember{
+					{MemberId: "m0", ResolvedAddress: "0000:41:00.0"},
+					{MemberId: "m1", ResolvedAddress: "0000:41:00.1"},
+				},
+			}}},
+		},
+	}
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	if n := strings.Count(w.Body.String(), `name="pci_address"`); n != 1 {
+		t.Errorf("got %d detach forms, want exactly 1 for an IOMMU group", n)
+	}
+	assertContains(t, w, `value="0000:41:00.0"`) // keyed by primary
+	if strings.Contains(w.Body.String(), `value="0000:41:00.1"`) {
+		t.Error("detach form keyed by a sibling member address (0000:41:00.1); want primary only")
+	}
+}
+
 // TestHandler_HardwareTab_NICDropdown verifies the fix for the NIC-dropdown
 // parity gap: now that the edit modal's Network pane is
 // retired, the tab's own NIC-attach form must offer the same networks

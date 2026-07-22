@@ -1415,18 +1415,25 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.virt.DestroyDomain(req.Name)
 	}
 
-	// Release PCI passthrough devices and unbind from vfio-pci. The VM row is being
-	// tombstoned, so there is no future op to leave recoverable — but the release must
-	// still NEVER produce an unowned-but-vfio-bound device (the host driver could not
-	// reclaim it and another VM could then claim its now-ownerless inventory row).
-	// releaseDevices is strict all-or-nothing: on a residual unbind failure it releases
-	// NOTHING and errors, so the device stays OWNED-by-this-(being-deleted)-VM + bound
-	// rather than unowned + bound. CHOSEN SEMANTICS: a stale owner row on a soon-to-vanish
-	// VM is a benign, operator-cleanable leak; an unowned + bound orphan is not — so we
-	// prefer the former. The delete still COMPLETES (we do NOT wedge on the residual) — we
-	// only log loudly so an operator can reset the device's driver_override by hand.
+	// Release PCI passthrough devices and unbind from vfio-pci. releaseDevices is strict
+	// all-or-nothing: on a residual unbind (or bound-check) failure it releases NOTHING and
+	// errors, so the device stays OWNED-by-this-VM + bound rather than unowned + bound (the
+	// host driver could not reclaim it and another VM could then claim its ownerless row).
+	//
+	// FAIL BEFORE TOMBSTONING on that error. Tombstoning the vms row here while
+	// host_pci_devices.vm_name still points at this VM would leave a stale owner of a
+	// now-deleted VM — which blocks every future ClaimPCIDevice CAS on that BDF forever (a
+	// manual driver_override reset does NOT clear the DB ownership); it is not a benign,
+	// operator-cleanable leak. Returning now leaves the VM destroyed-but-defined with its row
+	// + device ownership intact, so the delete is fully RETRYABLE: the only prior destructive
+	// step is the DestroyDomain above (the VM is stopped), which a retry tolerates. The
+	// operator resolves the stuck device and retries; releaseDevices then succeeds (an
+	// already-unbound device reads IsBoundToVFIO=false → skip → release) and the delete
+	// proceeds. No stale owner row is ever created, and no unowned-but-vfio-bound device
+	// either. Applies equally to a --keep-disks delete (device release is disk-independent).
 	if err := s.releaseDevices(ctx, req.Name); err != nil {
-		slog.Error("VM delete: PCI device(s) left bound to vfio-pci; they remain owned by the deleted VM — manual driver_override reset may be needed", "vm", req.Name, "error", err)
+		return nil, status.Errorf(codes.Internal,
+			"cannot delete VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
 	}
 
 	// Undefine from libvirt. With --keep-disks, KEEP firmware state too (NVRAM is

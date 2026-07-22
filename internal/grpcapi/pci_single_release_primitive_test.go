@@ -217,50 +217,10 @@ func TestReleaseDevices_StopUnbindFails_Recoverable(t *testing.T) {
 	}
 }
 
-// TestReleaseDevices_DeleteUnbindFails_NoUnownedBound (Part 2, VM-delete caller): a VM delete
-// whose whole-VM release cannot unbind a residual device must NEVER produce an unowned-but-
-// vfio-bound device. The VM row is going away (no future op to be recoverable against), so the
-// chosen semantics are: leave the device OWNED-by-the-(deleted)-VM + bound (a benign, operator-
-// cleanable stale owner row) over unowned + bound, log loudly, and let the delete COMPLETE
-// (never wedge). RED before the fix (releaseDevices released ownership despite the failed
-// unbind → the device was left unowned + bound after the VM record vanished).
-func TestReleaseDevices_DeleteUnbindFails_NoUnownedBound(t *testing.T) {
-	const addr = "0000:41:00.0"
-	s := hotplugDiskServer(t)
-	enableHardwareV2(t, s)
-	fs := newPCIUnbindRecordingFS()
-	restore := vfio.SetFS(fs)
-	defer restore()
-	ctx := adminCtx()
-
-	seedNICVM(t, s, "vm1", "stopped")
-	s.virt.(*libvirtfake.Fake).SetState("vm1", libvirtfake.StateDefined)
-	seedPCIGPU(t, s, addr, -1)
-	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
-		t.Fatalf("seed ownership: %v", err)
-	}
-	fs.setBound(addr)
-	fs.setFailUnbind(addr)
-
-	// The delete still COMPLETES despite the stuck unbind (never wedges). KeepDisks avoids
-	// the disk-store teardown (unrelated to the PCI release exercised here).
-	if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "vm1", KeepDisks: true}); err != nil {
-		t.Fatalf("delete must complete even when a residual device cannot be unbound: %v", err)
-	}
-
-	// THE INVARIANT: the device is NEVER unowned-but-bound. It stays owned by the (deleted)
-	// VM + bound — the chosen "prefer owned+bound over unowned+bound" semantics.
-	if !fs.isBound(addr) {
-		t.Fatal("a failed unbind must leave the device still bound")
-	}
-	if o := pciOwnerOf(t, ctx, s, addr); o != "vm1" {
-		t.Fatalf("a residual unbind failure must leave the device OWNED by the deleted VM (never unowned+bound), got owner %q", o)
-	}
-	// The delete completed: the VM record is gone.
-	if vm, _ := corrosion.GetVM(ctx, s.db, "vm1"); vm != nil {
-		t.Fatal("delete must remove the VM record")
-	}
-}
+// The VM-delete caller's residual-unbind-failure behavior is exercised by the FIX-21 suite
+// in pci_delete_tombstone_test.go: FIX-21 supersedes FIX-17's "delete completes over a benign
+// stale owner row" semantics — the delete now FAILS before tombstoning (no stale owner of a
+// deleted VM), and releaseDevices remains strict all-or-nothing (never unowned-but-vfio-bound).
 
 // TestRecoverPCIDetach_StoppedEmptySet_Recoverable (Part 3): a pre-fix-shaped stopped-detach
 // recovery journal entry (no member_addresses) whose intent re-resolution yields an EMPTY set

@@ -710,10 +710,11 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 // ownership (ReleasePCIDevicesByVM) ONLY if EVERY unbind succeeded. If any unbind (or
 // bound-check) failed it releases NOTHING and returns an error — the same all-or-
 // nothing invariant unbindAndReleaseOwnership enforces per-member, applied to the whole
-// VM set — so a still-bound device is NEVER left unowned-but-vfio-bound. The two callers
-// treat the error differently: the pre-latch stop leaves the stop recoverable; VM delete
-// logs loudly and completes anyway, leaving the device owned-by-the-(being-deleted)-VM +
-// bound (a benign, cleanable stale owner row) rather than an unowned + bound orphan.
+// VM set — so a still-bound device is NEVER left unowned-but-vfio-bound. Both callers treat
+// the error the same: they do NOT proceed past it. The pre-latch stop leaves the stop
+// recoverable; VM delete FAILS before tombstoning the vms row (so it never leaves a stale
+// owner of a deleted VM — which would block every future claim on that BDF), leaving the
+// delete retryable once the operator resolves the stuck device.
 func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	if err != nil {

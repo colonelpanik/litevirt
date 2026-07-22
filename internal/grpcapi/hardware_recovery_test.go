@@ -1495,6 +1495,68 @@ func TestRecoverPCIDetach_StoppedUnbindFails_LeavesRecoverable(t *testing.T) {
 	}
 }
 
+// TestRecoverPCIDetach_StoppedTombstoneFailsAfterRelease_LeavesRecoverable is the
+// FIX-15 Fix B recovery analog: once recovery's unbindAndReleaseOwnership SUCCEEDS (the
+// device is unbound + released), a TombstonePCIRealizations/intent failure must leave
+// the op recovery-required — barrier retained, op NOT completed — so a later recovery
+// pass re-tombstones (idempotent) and converges. It must NEVER complete/terminalize a
+// post-release tombstone failure (that would clear the barrier while the rows survive
+// pointing at an already-released device). This guards the stopped recovery branch,
+// which mirrors the live path's roll-forward.
+func TestRecoverPCIDetach_StoppedTombstoneFailsAfterRelease_LeavesRecoverable(t *testing.T) {
+	const addr = "0000:41:00.0"
+	const deviceID = "pcidev-detach"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+
+	seedNICVM(t, s, "vm1", "stopped")
+	fake.SetState("vm1", libvirtfake.StateDefined) // positively shut off → stopped recovery path
+	seedPCIGPU(t, s, addr, -1)
+	seedAddressIntent(t, s, "vm1", deviceID, addr)
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
+		t.Fatalf("assign device: %v", err)
+	}
+	fs.setBound(addr)
+	// Unbind SUCCEEDS, release SUCCEEDS, then the realization tombstone fails: drop the
+	// table from the unbind hook (host_pci_devices is untouched so the release still
+	// commits).
+	fs.onUnbind = func(string) { _ = s.db.Execute(ctx, `DROP TABLE vm_pci_realizations`) }
+
+	opID, epoch, _ := beginWedgedDeviceOp(t, ctx, s, "vm1", corrosion.OpDeviceDetach,
+		detachPCIRequestHash("vm1", addr),
+		[]string{corrosion.OpStepReserved},
+		map[string]string{"device_id": deviceID, "pci_address": addr, "member_addresses": addr})
+
+	s.RecoverHardwareOperations(ctx)
+
+	// The release DID happen (post-release failure): ownership cleared, device unbound.
+	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
+		t.Fatalf("release should have completed before the tombstone failure, got owner %q", o)
+	}
+	if fs.isBound(addr) {
+		t.Fatal("the unbind should have completed before the tombstone failure")
+	}
+	// LEFT RECOVERABLE: barrier retained + op NOT completed (never terminalized).
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID == "" {
+		t.Fatal("a post-release tombstone failure must leave the barrier set (recovery-required)")
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("intent should survive a failed tombstone (a later pass re-tombstones), got %d", len(in))
+	}
+	state, _, err := corrosion.OperationCurrentState(ctx, s.db, opID, epoch, corrosion.OpDeviceDetach)
+	if err != nil {
+		t.Fatalf("read op state: %v", err)
+	}
+	if state == corrosion.OpStepCompleted {
+		t.Fatal("recovery must NOT complete a detach whose post-release tombstone failed")
+	}
+}
+
 // ── host reboot: live domain shut off while vm.State still "running" ─────────────
 
 // TestRecoverHardwareOperations_HostRebootAttachTakesStoppedPath: after a host

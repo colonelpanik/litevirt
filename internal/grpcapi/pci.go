@@ -731,9 +731,13 @@ func (s *Server) releaseDeviceLeases(ctx context.Context, vmName string, addrs [
 //     retry re-reads vfio state: a since-unbound member is skipped and the release
 //     converges — never leaving a device unowned-but-vfio-bound.
 //   - If every bound member unbound cleanly → owner-release ALL addrs (owner-scoped, a
-//     no-op for a device another VM has since claimed) and return nil. A member that
-//     unbound but whose DB release then errored stays owned+unbound, which is safe (the
-//     whole-VM releaseDevices at VM delete clears any residual ownership).
+//     no-op for a device another VM has since claimed). If any release WRITE errors,
+//     attempt the rest anyway (a partial release is safe — owner-scoped release is
+//     idempotent) and RETURN the joined error so the caller leaves the op recovery-
+//     required rather than completing over a leaked, unclaimable ownership row. A retry
+//     re-reads vfio state: the already-unbound members are skipped (IsBoundToVFIO=false)
+//     and the owner-scoped re-release of an already-released device is a 0-row no-op, so
+//     the release converges.
 func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, addrs []string) error {
 	drivers := map[string]string{}
 	if devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); err == nil {
@@ -766,10 +770,19 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 			len(failures), len(addrs), errors.Join(failures...))
 	}
 
+	var relFailures []error
 	for _, addr := range addrs {
 		if err := corrosion.ReleasePCIDevice(ctx, s.db, s.hostName, addr, vmName); err != nil {
 			slog.Warn("failed to release PCI device in DB", "vm", vmName, "address", addr, "error", err)
+			relFailures = append(relFailures, fmt.Errorf("release %s ownership: %w", addr, err))
 		}
+	}
+	if len(relFailures) > 0 {
+		// The unbind already succeeded but a release WRITE failed → return recoverable so
+		// the caller does NOT tombstone/complete over a leaked ownership row. The retry
+		// converges: unbound members are skipped and owner-scoped re-release is a no-op.
+		return fmt.Errorf("pci release: %d of %d member(s) could not be released in DB: %w",
+			len(relFailures), len(addrs), errors.Join(relFailures...))
 	}
 	return nil
 }

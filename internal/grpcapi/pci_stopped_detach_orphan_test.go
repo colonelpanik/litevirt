@@ -24,11 +24,12 @@ import (
 // verify passes.
 type pciUnbindRecordingFS struct {
 	mu         sync.Mutex
-	bound      map[string]bool // address -> bound to vfio-pci
-	override   map[string]bool // address -> driver_override currently selects vfio-pci
-	unbinds    map[string]int  // address -> count of vfio.Unbind invocations
-	failUnbind map[string]bool // address -> the .../driver/unbind write fails (models a stuck unbind)
-	binds      int             // count of vfio-pci bind writes
+	bound      map[string]bool   // address -> bound to vfio-pci
+	override   map[string]bool   // address -> driver_override currently selects vfio-pci
+	unbinds    map[string]int    // address -> count of vfio.Unbind invocations
+	failUnbind map[string]bool   // address -> the .../driver/unbind write fails (models a stuck unbind)
+	binds      int               // count of vfio-pci bind writes
+	onUnbind   func(addr string) // fired once per unbind (at the driver_override clear), if set
 }
 
 func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
@@ -88,6 +89,12 @@ func (f *pciUnbindRecordingFS) WriteFile(path string, data []byte, _ os.FileMode
 			// vfio.Unbind clears the override on EVERY call → the unbind signal.
 			f.override[a] = false
 			f.unbinds[a]++
+			if f.onUnbind != nil {
+				// Fires AFTER the .../driver/unbind write already flipped the device
+				// unbound but BEFORE the caller's post-unbind ReleasePCIDevice loop — lets a
+				// test model a fault that appears only once the hardware mutation is done.
+				f.onUnbind(a)
+			}
 		}
 	case strings.HasSuffix(path, "/driver/unbind"):
 		if f.failUnbind[val] {
@@ -440,5 +447,145 @@ func TestDetachPCI_StoppedNeverStarted_ReleasesOwnershipOnly(t *testing.T) {
 	}
 	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 0 {
 		t.Fatalf("intent not tombstoned: %+v", in)
+	}
+}
+
+// TestDetachPCI_StoppedReleaseWriteFails_LeavesRecoverable is FIX-15 Fix A: after a
+// clean vfio unbind, if the ReleasePCIDevice DB write FAILS the detach must leave the
+// operation recovery-required — an error is returned, the barrier is retained, and the
+// intent + realizations are NOT tombstoned — rather than swallowing the write error and
+// completing (which would leave a host_pci_devices row still owned by the VM with no
+// intent/realization referencing it: an unclaimable leak until VM delete). RED before
+// the fix (unbindAndReleaseOwnership only slog.Warn'd the release failure and returned
+// nil → the caller tombstoned + completed). The retry converges: the member is already
+// unbound (IsBoundToVFIO=false → skip unbind) and the owner-scoped re-release is a
+// 0-row no-op.
+func TestDetachPCI_StoppedReleaseWriteFails_LeavesRecoverable(t *testing.T) {
+	const addr = "0000:41:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+
+	seedNICVM(t, s, "vm1", "stopped")
+	fake.SetState("vm1", libvirtfake.StateDefined)
+	seedPCIGPU(t, s, addr, -1)
+
+	// attach → start → stop leaves the device vfio-bound + owned + realized + intent.
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: addr},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "vm1"}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !fs.isBound(addr) {
+		t.Fatal("precondition: start must bind the device")
+	}
+	if _, err := s.StopVM(ctx, &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	fake.SetState("vm1", libvirtfake.StateDefined)
+
+	// Force the DB release to fail: drop the inventory table out from under
+	// ReleasePCIDevice (the fail-closed pattern other tests use). The unbind still
+	// succeeds (vfio state lives in the FS fake), so this exercises the post-unbind
+	// release-write failure specifically.
+	if err := s.db.Execute(ctx, `DROP TABLE host_pci_devices`); err != nil {
+		t.Fatalf("DROP TABLE host_pci_devices: %v", err)
+	}
+
+	_, derr := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: addr})
+	if derr == nil {
+		t.Fatal("a failed DB release must fail the detach (recoverable), not complete with a leaked ownership row")
+	}
+
+	// The device WAS unbound (the unbind succeeded before the release write failed).
+	if fs.isBound(addr) {
+		t.Fatal("the unbind should have succeeded before the release write failed")
+	}
+	// LEFT RECOVERABLE: the intent + realizations are NOT tombstoned (a retry re-runs
+	// the owner-scoped release, which converges).
+	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) != 1 {
+		t.Fatalf("release failure must NOT tombstone realizations, got %d", len(rs))
+	}
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("release failure must NOT tombstone the intent, got %d", len(in))
+	}
+	// Barrier still set → the operation is recovery-required.
+	if op := mustGetVM(t, s, "vm1").ActiveOperationID; op == "" {
+		t.Fatal("release failure must leave the operation barrier set (recovery-required)")
+	}
+}
+
+// TestDetachPCI_StoppedTombstoneFailsAfterRelease_LeavesRecoverable is FIX-15 Fix B:
+// once unbindAndReleaseOwnership SUCCEEDS (the device is already unbound + released),
+// a TombstonePCIRealizations/TombstonePCIIntent failure must leave the operation
+// recovery-required (recoverable error, barrier retained), NOT be routed to
+// failPCIDetachClean — whose contract is a terminal failure when NOTHING was applied.
+// Sending a post-release failure there marks the op terminal + clears the barrier while
+// the realization/intent rows survive pointing at an already-released device, with no
+// recovery. RED before the fix (terminal via failPCIDetachClean → barrier cleared). The
+// retry re-tombstones (idempotent) and converges.
+func TestDetachPCI_StoppedTombstoneFailsAfterRelease_LeavesRecoverable(t *testing.T) {
+	const addr = "0000:41:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+
+	seedNICVM(t, s, "vm1", "stopped")
+	fake.SetState("vm1", libvirtfake.StateDefined)
+	seedPCIGPU(t, s, addr, -1)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: addr},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "vm1"}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !fs.isBound(addr) {
+		t.Fatal("precondition: start must bind the device")
+	}
+	if _, err := s.StopVM(ctx, &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	fake.SetState("vm1", libvirtfake.StateDefined)
+
+	// Drop the realizations table AFTER executePCIDetach has read it (line ~772) and
+	// AFTER the unbind + release succeed, but BEFORE the tombstone: fire the drop from
+	// the unbind hook so ReleasePCIDevice (host_pci_devices, untouched) still succeeds
+	// and only TombstonePCIRealizations fails.
+	fs.onUnbind = func(string) { _ = s.db.Execute(ctx, `DROP TABLE vm_pci_realizations`) }
+
+	_, derr := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: addr})
+	if derr == nil {
+		t.Fatal("a post-release tombstone failure must fail the detach (recoverable), not complete")
+	}
+
+	// The release DID happen (post-release failure): ownership cleared, device unbound.
+	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
+		t.Fatalf("release should have completed before the tombstone failure, got owner %q", o)
+	}
+	if fs.isBound(addr) {
+		t.Fatal("the unbind should have completed before the tombstone failure")
+	}
+	// LEFT RECOVERABLE (NOT terminal via failPCIDetachClean): the barrier is retained,
+	// so recovery/retry re-tombstones. failPCIDetachClean would have cleared it.
+	if op := mustGetVM(t, s, "vm1").ActiveOperationID; op == "" {
+		t.Fatal("a post-release tombstone failure must leave the barrier set (recovery-required), not terminalize via failPCIDetachClean")
+	}
+	// The intent survives (roll-forward incomplete) — a retry re-tombstones it.
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 1 {
+		t.Fatalf("intent should survive a failed tombstone (retry re-tombstones), got %d", len(in))
 	}
 }

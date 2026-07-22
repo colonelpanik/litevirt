@@ -786,6 +786,16 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 		// No realizations → resolve the member set from the intent address. Best-effort: a
 		// vanished sibling can't wedge the detach (VM delete's releaseDevices clears any
 		// residual owner-by-VM).
+		//
+		// NOTE: this set is re-resolved against the CURRENT IOMMU grouping, so if the host's
+		// ACS/IOMMU layout changed since the device was bound the resolved set can differ
+		// from what was actually bound. Both drift modes are SAFE: a sibling that dropped out
+		// of the group stays owned+bound and is reclaimed at VM delete (a leak, never an
+		// unowned-but-bound orphan); a sibling that was regrouped UNDER another VM makes
+		// resolveDeviceSpec's addPrimary trip checkIOMMUConflict on the PRIMARY (addPrimary
+		// conflict-checks only the primary — siblings are added unchecked, safe precisely
+		// because a same-group other-VM sibling trips the primary's group check) → the
+		// resolve ERRORS → this detach releases nothing (a leak, never a cross-VM yank).
 		if members, mrerr := s.resolveDeviceSpec(ctx, vm.Name, &pb.DeviceSpec{Address: normAddr}, deviceID, map[string]bool{}); mrerr == nil {
 			for _, m := range members {
 				memberAddrs = append(memberAddrs, m.Address)
@@ -853,13 +863,18 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			return nil, status.Errorf(codes.Internal,
 				"pci detach for %q could not release its device(s); left recoverable: %v", vm.Name, err)
 		}
+		// The device is already unbound + released (a host mutation was applied), so a
+		// tombstone failure must NOT go through failPCIDetachClean — its contract is a
+		// terminal "nothing applied" failure. Roll FORWARD instead: leave the op
+		// recovery-required (barrier retained) so recovery/retry re-tombstones (idempotent),
+		// matching the reconcile-failure branch below.
 		if err := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, deviceID); err != nil {
-			return s.failPCIDetachClean(ctx, vm, opID, epoch, newGen, normAddr,
-				codes.Internal, fmt.Errorf("tombstone PCI realizations: %w", err))
+			slog.Error("pci detach: realization tombstone failed after release — left recoverable", "vm", vm.Name, "op", opID, "error", err)
+			return nil, status.Errorf(codes.Internal, "pci detach for %q released its device(s) but realization bookkeeping incomplete; left recoverable: %v", vm.Name, err)
 		}
 		if err := corrosion.TombstonePCIIntent(ctx, s.db, vm.Name, deviceID); err != nil {
-			return s.failPCIDetachClean(ctx, vm, opID, epoch, newGen, normAddr,
-				codes.Internal, fmt.Errorf("tombstone PCI intent: %w", err))
+			slog.Error("pci detach: intent tombstone failed after release — left recoverable", "vm", vm.Name, "op", opID, "error", err)
+			return nil, status.Errorf(codes.Internal, "pci detach for %q released its device(s) but intent bookkeeping incomplete; left recoverable: %v", vm.Name, err)
 		}
 		if err := s.reconcileDomainDefinition(ctx, vm, nil); err != nil {
 			slog.Error("pci detach: reconcile after tombstone failed — left recoverable", "vm", vm.Name, "op", opID, "error", err)

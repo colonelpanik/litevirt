@@ -699,6 +699,14 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 		// aliases the same way for the absence verify when realizations are already gone.
 		addrs := splitCSVNonEmpty(art["member_addresses"])
 		if len(addrs) == 0 || len(memberAliases) == 0 {
+			// Fallback for a pre-fix entry with no journaled member_addresses: re-resolve
+			// against the CURRENT IOMMU grouping. A since-changed host ACS/IOMMU layout can
+			// yield a set differing from what was bound, but both drift modes are safe — a
+			// dropped sibling stays owned+bound (reclaimed at VM delete, a leak), and a
+			// sibling regrouped under another VM trips checkIOMMUConflict on the PRIMARY
+			// (addPrimary conflict-checks only the primary; siblings ride the primary's group
+			// check) → the resolve errors → recovery releases nothing (a leak, never a
+			// cross-VM yank).
 			if members, e := s.resolveDeviceSpec(ctx, vm.Name, &pb.DeviceSpec{Address: normAddr}, deviceID, map[string]bool{}); e == nil {
 				if len(addrs) == 0 {
 					for _, m := range members {

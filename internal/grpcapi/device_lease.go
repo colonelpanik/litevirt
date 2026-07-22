@@ -80,17 +80,24 @@ func (s *Server) markDeviceLeaseRollbackIncomplete(vmName string, addrs []string
 	if s.opJournal == nil {
 		return
 	}
-	entry := opjournal.Entry{
-		OperationID: deviceLeaseOpID(vmName),
-		ResourceID:  vmName,
-		Kind:        deviceLeaseKind,
-		Stage:       deviceLeaseStageRollbackIncomplete,
-		Artifacts:   map[string]string{"addresses": strings.Join(addrs, ",")},
-		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+	// Only OVERWRITE an EXISTING lease — never CREATE one. Pre-latch (operation protocol
+	// inactive), beginDeviceLease is a no-op, so no lease was ever written; opJournal is still
+	// wired unconditionally at startup, so opJournal!=nil && no-lease is a normal reachable
+	// state. Fabricating a rollback_incomplete anchor here would make restart recovery
+	// (RecoverDeviceLeases) reclaim — guest-detach + unbind + release — a device that a
+	// subsequent successful attach retry has since made live, ripping working passthrough out
+	// of a running VM (a recovery pass acting over a NON-leak). The device left owned+bound by
+	// an incomplete rollback still converges via operator retry/detach; we simply never invent
+	// an anchor that did not already exist.
+	existing, found, err := s.opJournal.Read(deviceLeaseOpID(vmName))
+	if err != nil || !found {
+		return
 	}
-	if err := s.opJournal.Write(entry); err != nil {
+	existing.Stage = deviceLeaseStageRollbackIncomplete
+	existing.Artifacts = map[string]string{"addresses": strings.Join(addrs, ",")}
+	if werr := s.opJournal.Write(*existing); werr != nil {
 		slog.Warn("device lease: mark rollback_incomplete failed (device left owned+bound; recovery anchor best-effort)",
-			"vm", vmName, "error", err)
+			"vm", vmName, "error", werr)
 	}
 }
 

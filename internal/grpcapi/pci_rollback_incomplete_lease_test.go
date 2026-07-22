@@ -105,6 +105,56 @@ func TestAttachPCI_LegacyRollbackIncomplete_MarksLeaseRollbackIncomplete(t *test
 
 // assertLeaseRollbackIncomplete reads vmName's durable device lease back and asserts it
 // is still present and now carries Stage rollback_incomplete.
+// TestAttachPCI_LegacyRollbackIncomplete_PreLatch_NoSpuriousLease (FIX-27): pre-latch
+// (operation protocol INACTIVE) beginDeviceLease is a no-op, so NO device lease is ever
+// written. An incomplete legacy-attach rollback must NOT fabricate a rollback_incomplete
+// lease — the mark helper may only OVERWRITE an existing lease. A spurious anchor would
+// make restart recovery reclaim (guest-detach + unbind + release) a device that a later
+// successful attach retry has since made live, ripping working passthrough out of a running
+// VM (a recovery pass acting over a NON-leak). opJournal is wired unconditionally at
+// startup, independent of the (default-off) capability, so opJournal!=nil && !active is a
+// normal reachable state. RED against current code: the mark writes a lease anyway.
+func TestAttachPCI_LegacyRollbackIncomplete_PreLatch_NoSpuriousLease(t *testing.T) {
+	const primary = "0000:00:00.0"
+	const sibling = "0000:00:00.1"
+
+	s := hotplugDiskServer(t) // opJournal wired, but NO enableHardwareV2 → protocol INACTIVE
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+
+	seedNICVM(t, s, "vm-a", "running")
+	fake.SetState("vm-a", libvirtfake.StateRunning)
+	seedPCIGPU(t, s, primary, 20)
+	seedPCIGPU(t, s, sibling, 20)
+
+	// Second member's attach fails and neither bound member can be confirmed unbound → the
+	// strict release fails → the incomplete-rollback return that marks the lease.
+	attachN := 0
+	fake.FailAttachHostdev = func(_, _, _ string) error {
+		attachN++
+		if attachN == 1 {
+			return nil
+		}
+		return errors.New("injected second-member attach failure")
+	}
+	fs.setFailUnbind(primary)
+	fs.setFailUnbind(sibling)
+
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm-a", PciDevice: &pb.DeviceSpec{Type: "gpu"},
+	}); err == nil {
+		t.Fatal("a later-member attach failure with a failed release must fail the attach")
+	}
+
+	// No lease was ever written pre-latch; the incomplete rollback must NOT have fabricated one.
+	if _, found, _ := s.opJournal.Read(deviceLeaseOpID("vm-a")); found {
+		t.Fatal("pre-latch: no device lease existed; an incomplete rollback must NOT fabricate a rollback_incomplete anchor (restart recovery would tear down a since-re-attached live device)")
+	}
+}
+
 func assertLeaseRollbackIncomplete(t *testing.T, s *Server, vmName string) {
 	t.Helper()
 	entries, _, err := s.opJournal.List()

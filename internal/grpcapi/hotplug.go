@@ -243,6 +243,50 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 	return out, nil
 }
 
+// rollbackLegacyPCIAttach inverse-detaches the attached members from the live guest, then
+// strict-releases all claimed addrs. On a partial rollback (an inverse-detach or the release
+// cannot be confirmed) it marks the lease rollback_incomplete and returns an error (the
+// left-owned+bound members are reclaimed by startup recovery). Returns nil when FULLY rolled
+// back (nothing left owned+bound); the caller then clears the lease as appropriate.
+//
+// Ordering matters: inverse-detach FIRST (never vfio-unbind/release a device still attached
+// to the live domain), then release. It touches libvirt/vfio/corrosion — NOT the journal —
+// so it works even when the journal is degraded. attachedAddrs is the subset already in the
+// guest (== addrs on the success path); addrs is every member THIS attach claimed.
+func (s *Server) rollbackLegacyPCIAttach(ctx context.Context, vmName string, attachedAddrs, addrs []string) error {
+	//   1. inverse-detach every already-attached member from the guest (membership-aware +
+	//      idempotent). If an inverse-detach cannot be confirmed (DumpXML error or a failed
+	//      DetachHostdev), leave the op recoverable: return WITHOUT releasing — a member still
+	//      in the guest must never be unbound/released. The durable lease is RETAINED as a
+	//      recovery anchor: it is rewritten to Stage rollback_incomplete so the next startup
+	//      recovery distinguishes it from a completed allocation and membership-aware-reclaims
+	//      the left-owned+bound members (guest-detach FIRST, then unbind + owner-release)
+	//      rather than clearing it. The safety invariant (a stuck member stays owned + bound,
+	//      never unowned + bound) holds regardless; an operator retry/detach also converges it.
+	for _, a := range attachedAddrs {
+		if derr := s.detachHostdevIfPresent(vmName, a); derr != nil {
+			slog.Error("legacy pci attach rollback: inverse-detach failed — device(s) left owned+bound (recoverable), lease marked rollback_incomplete",
+				"vm", vmName, "address", a, "error", derr)
+			s.markDeviceLeaseRollbackIncomplete(vmName, addrs)
+			return fmt.Errorf("rollback inverse-detach of %s failed: %w", a, derr)
+		}
+	}
+	//   2. release via the strict all-or-nothing primitive. If a member cannot be confirmed
+	//      unbound it releases NOTHING and errors — leave it owned + bound (recoverable via
+	//      retry/detach), never unowned + bound. The durable lease is RETAINED as a recovery
+	//      anchor (rewritten to Stage rollback_incomplete): the next startup recovery reclaims
+	//      the left-owned+bound members instead of clearing the entry, so the leak is never
+	//      silently lost.
+	if rerr := s.unbindAndReleaseOwnership(ctx, vmName, addrs); rerr != nil {
+		slog.Error("legacy pci attach rollback: release incomplete — device(s) left owned+bound (recoverable), lease marked rollback_incomplete", "vm", vmName, "error", rerr)
+		s.markDeviceLeaseRollbackIncomplete(vmName, addrs)
+		return rerr
+	}
+	// Rollback FULLY completed (inverse-detach + strict release both clean): nothing is left
+	// owned + bound.
+	return nil
+}
+
 func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.DeviceSpec) (*pb.VM, error) {
 	// The device lease begins at Stage in_progress: this legacy running-attach path is
 	// UNJOURNALED (the lease is its ONLY crash anchor) and the VM ALWAYS already exists, so
@@ -265,38 +309,11 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 	for _, addr := range addrs {
 		if err := s.virt.AttachHostdev(vmName, addr); err != nil {
 			// Roll back only the devices THIS attach claimed (not the VM's pre-existing
-			// passthrough devices), in the correct order:
-			//   1. inverse-detach every already-attached member from the guest (membership-
-			//      aware + idempotent). If an inverse-detach cannot be confirmed (DumpXML
-			//      error or a failed DetachHostdev), leave the op recoverable: return WITHOUT
-			//      releasing — a member still in the guest must never be unbound/released. The
-			//      durable lease is RETAINED as a recovery anchor: it is rewritten to Stage
-			//      rollback_incomplete so the next startup recovery distinguishes it from a
-			//      completed allocation and membership-aware-reclaims the left-owned+bound
-			//      members (guest-detach FIRST, then unbind + owner-release) rather than
-			//      clearing it. The safety invariant (a stuck member stays owned + bound, never
-			//      unowned + bound) holds regardless; an operator retry/detach also converges it.
-			for _, a := range attachedAddrs {
-				if derr := s.detachHostdevIfPresent(vmName, a); derr != nil {
-					slog.Error("legacy pci attach rollback: inverse-detach failed — device(s) left owned+bound (recoverable), lease marked rollback_incomplete",
-						"vm", vmName, "address", a, "error", derr)
-					s.markDeviceLeaseRollbackIncomplete(vmName, addrs)
-					return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v (rollback inverse-detach of %s failed: %v)", addr, err, a, derr)
-				}
+			// passthrough devices): inverse-detach the attached members, then strict-release.
+			if rbErr := s.rollbackLegacyPCIAttach(ctx, vmName, attachedAddrs, addrs); rbErr != nil {
+				return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v (%v)", addr, err, rbErr)
 			}
-			//   2. release via the strict all-or-nothing primitive. If a member cannot be
-			//      confirmed unbound it releases NOTHING and errors — leave it owned + bound
-			//      (recoverable via retry/detach), never unowned + bound. The durable lease is
-			//      RETAINED as a recovery anchor (rewritten to Stage rollback_incomplete): the
-			//      next startup recovery reclaims the left-owned+bound members instead of
-			//      clearing the entry, so the leak is never silently lost.
-			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, addrs); rerr != nil {
-				slog.Error("legacy pci attach rollback: release incomplete — device(s) left owned+bound (recoverable), lease marked rollback_incomplete", "vm", vmName, "error", rerr)
-				s.markDeviceLeaseRollbackIncomplete(vmName, addrs)
-				return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
-			}
-			// Rollback FULLY completed (inverse-detach + strict release both clean): nothing is
-			// left owned+bound, so clear the durable device lease.
+			// Rollback FULLY completed: nothing is left owned+bound, so clear the durable lease.
 			finish()
 			return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
 		}
@@ -304,11 +321,22 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 		slog.Info("PCI device attached", "vm", vmName, "address", addr)
 	}
 
-	// Success: the VM's devices are attached + owned. Durably transition the in_progress
-	// lease to bound BEFORE removing it, so a failed best-effort removal leaves a lease
-	// recovery CLEARS (not one it reclaims) — the successfully-attached device is never
-	// torn down on restart.
-	s.completeDeviceLease(vmName)
+	// Success: the VM's devices are attached + owned. Durably record completion (transition the
+	// in_progress lease to bound, then best-effort remove) — and REQUIRE a durable safe outcome.
+	if cerr := s.completeDeviceLease(vmName); cerr != nil {
+		// The journal is degraded — completion is not durable, so the surviving in_progress lease
+		// would make startup recovery reclaim this device. Do NOT acknowledge success. Roll the
+		// attach back now (at success, attachedAddrs == addrs), so the returned error matches
+		// reality; the surviving in_progress lease is then a harmless no-op reclaim (the devices
+		// are already unbound + unowned). If the rollback itself cannot confirm a clean release,
+		// it is left recoverable (the in_progress lease already drives the reclaim). The rollback
+		// uses libvirt/vfio/corrosion (NOT the journal), so it works even with a degraded journal;
+		// do NOT call finish() here (that write would fail too, and the surviving lease is benign).
+		if rbErr := s.rollbackLegacyPCIAttach(ctx, vmName, attachedAddrs, addrs); rbErr != nil {
+			return nil, status.Errorf(codes.Internal, "attach PCI device: completion unrecordable for %q (%v) and rollback incomplete: %v", vmName, cerr, rbErr)
+		}
+		return nil, status.Errorf(codes.Internal, "attach PCI device: could not durably record completion for %q (journal degraded); attach rolled back: %v", vmName, cerr)
+	}
 	s.publish("device.attached", vmName, fmt.Sprintf("pci:%v", addrs))
 	return s.vmToProto(ctx, vmName)
 }

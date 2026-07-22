@@ -95,36 +95,60 @@ func (s *Server) beginDeviceLease(ctx context.Context, vmName string, addrs []st
 	}, nil
 }
 
-// completeDeviceLease durably marks a successful allocation's lease COMPLETED (Stage bound)
-// before best-effort removal. Recovery clears a bound lease WITHOUT reclamation, so even if
-// the subsequent Remove fails the successfully-attached device is NOT torn down on restart.
-// Only needed by the legacy attach (its lease is in_progress, a reclaim trigger); the other
-// callers' leases are already bound. No-op when no lease exists (pre-latch).
-func (s *Server) completeDeviceLease(vmName string) {
+// completeDeviceLease durably records that a successful allocation's lease reached a SAFE
+// outcome, and REPORTS whether it did. It transitions the lease to Stage bound (recovery
+// clears a bound lease WITHOUT reclamation) then best-effort removes it. Only needed by the
+// legacy attach (its lease is in_progress, a reclaim trigger); the other callers' leases are
+// already bound. No-op (nil) when no lease exists (pre-latch / already gone).
+//
+// The two journal ops (the bound-transition Write and the Remove) are NOT independent: ONE
+// persistent filesystem fault — ENOSPC, a read-only remount, a journal-dir I/O error —
+// naturally fails BOTH. A "safe outcome" is either state startup recovery treats
+// non-destructively: (i) the lease is durably bound (recovery clears it, no reclaim), OR
+// (ii) the lease is durably removed (recovery has nothing). It returns nil iff at least one
+// was established (boundPersisted || removed); only when NEITHER did does the surviving
+// in_progress lease become a reclaim trigger for the just-attached device — so the caller
+// MUST NOT acknowledge success, and completeDeviceLease returns an error to force that.
+func (s *Server) completeDeviceLease(vmName string) error {
 	if s.opJournal == nil {
-		return
+		return nil
 	}
 	opID := deviceLeaseOpID(vmName)
 	existing, found, err := s.opJournal.Read(opID)
 	if err == nil && !found {
-		return // no lease (pre-latch / already gone) — nothing to complete
+		return nil // no lease (pre-latch / already gone) — nothing to complete
 	}
-	// On a successful read of a not-yet-bound lease, durably transition it to bound FIRST
-	// (recovery clears a bound lease WITHOUT reclamation). On a READ error we cannot transition,
-	// so we must NOT early-return: the surviving in_progress entry is a reclaim trigger that
-	// would tear down the working device on restart. Fall straight through to removal instead —
-	// clearing the entry leaves recovery nothing to reclaim (the ownership row + live domain XML
-	// are the durable record of the successful attach). Only a read/transition failure AND the
-	// removal below BOTH failing leaves in_progress → a genuine double-fault, degraded-host edge.
-	if err == nil && existing.Stage != deviceLeaseStageBound {
+	// boundPersisted: the lease is durably in Stage bound (already bound, or the transition
+	// Write succeeded). removed: the best-effort Remove succeeded. Either is a safe outcome.
+	var boundPersisted, removed bool
+	if err == nil && existing.Stage == deviceLeaseStageBound {
+		boundPersisted = true // already bound (a prior partial completion persisted the transition)
+	} else if err == nil {
+		// A cleanly-read, not-yet-bound lease: durably transition it to bound FIRST (recovery
+		// clears a bound lease WITHOUT reclamation). A Write error leaves it un-persisted.
 		existing.Stage = deviceLeaseStageBound
 		if werr := s.opJournal.Write(*existing); werr != nil {
 			slog.Error("device lease: mark completed failed — falling back to removal", "vm", vmName, "error", werr)
+		} else {
+			boundPersisted = true
 		}
 	}
+	// FIX-33: on a READ error we cannot transition (existing is nil), so we must NOT
+	// early-return — the surviving in_progress entry is a reclaim trigger. Fall straight
+	// through to the removal: clearing the entry leaves recovery nothing to reclaim (the
+	// ownership row + live domain XML are the durable record of the successful attach).
 	if rerr := s.opJournal.Remove(opID); rerr != nil {
 		slog.Warn("device lease: remove after completion (best-effort; recovery clears a bound entry)", "vm", vmName, "error", rerr)
+	} else {
+		removed = true
 	}
+	// NEITHER safe outcome persisted (the bound-transition Write AND the Remove both failed —
+	// the single-root-cause degraded-journal fault): the in_progress lease survives and
+	// recovery would reclaim the just-attached device. Report it so the caller does not ACK.
+	if !boundPersisted && !removed {
+		return fmt.Errorf("device lease: could not durably record completion for %q (journal degraded)", vmName)
+	}
+	return nil
 }
 
 // markDeviceLeaseRollbackIncomplete rewrites vmName's durable device lease to Stage

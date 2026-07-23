@@ -1,12 +1,15 @@
 package ui
 
 import (
+	"context"
 	"html/template"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // ── Cluster ──────────────────────────────────────────────────────────────────
@@ -111,8 +114,8 @@ func TestHandler_HardwareTab_BlockedBanner(t *testing.T) {
 
 // TestHandler_HardwareTab_AddFormsWhenAdopted asserts the converse of the
 // blocked-banner test: once adoption is resolved (or was never gated), the
-// tab renders the add/detach forms that mutate hardware via the existing
-// attach/detach handlers.
+// tab renders the section-header Add buttons (hx-get modal routes) and the
+// per-row detach forms that mutate hardware via the existing detach handlers.
 func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
 	mock := newDefaultMock()
 	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
@@ -135,9 +138,9 @@ func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
 	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
 	w := serveRequest(s, r)
 	assertStatus(t, w, http.StatusOK)
-	assertContains(t, w, "attach-disk")
-	assertContains(t, w, "attach-nic")
-	assertContains(t, w, "attach-pci")
+	assertContains(t, w, "add-disk-modal")
+	assertContains(t, w, "add-nic-modal")
+	assertContains(t, w, "add-pci-modal")
 	assertContains(t, w, "detach-disk")
 	assertContains(t, w, "detach-nic")
 	assertContains(t, w, "detach-pci")
@@ -204,24 +207,74 @@ func TestHandler_HardwareTab_IOMMUGroupSingleDetach(t *testing.T) {
 	}
 }
 
-// TestHandler_HardwareTab_NICDropdown verifies the fix for the NIC-dropdown
-// parity gap: now that the edit modal's Network pane is
-// retired, the tab's own NIC-attach form must offer the same networks
-// dropdown the modal used to (not a free-text bridge input).
-func TestHandler_HardwareTab_NICDropdown(t *testing.T) {
+// TestHandler_HardwareTab_HeaderActionsAndRowResize verifies the redesigned
+// tab layout: Add actions live in the section headers (hx-get to the modal
+// routes added by a later task), disk rows carry a Resize action, and PCI
+// rows carry a device-class chip. It also verifies the old inline attach-pci
+// form (free-text address input) is gone now that attach is modal-driven.
+func TestHandler_HardwareTab_HeaderActionsAndRowResize(t *testing.T) {
 	mock := newDefaultMock()
 	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
 		HardwareAdoptionState: "adopted",
-	}
-	mock.listNetworksResp = &pb.ListNetworksResponse{
-		Networks: []*pb.NetworkInfo{{Name: "lan0"}},
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{DeviceId: "vda", Target: "vda", Bus: "virtio", SizeBytes: 32212254720, StorageType: "local", State: "attached"}}},
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Desired: &pb.DeviceSpec{Type: "gpu"}, Members: []*pb.HardwarePCIMember{{ResolvedAddress: "0000:41:00.0", XmlAlias: "ua-gpu-0"}}}}},
+		},
 	}
 	s := newTestUIServer(t, mock)
-	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm-a/tab/hardware"))
 	w := serveRequest(s, r)
 	assertStatus(t, w, http.StatusOK)
-	assertContains(t, w, `<select name="bridge"`)
-	assertContains(t, w, `>lan0<`)
+	body := w.Body.String()
+	// Add actions live in the section headers, hx-get the modal routes.
+	for _, want := range []string{
+		`hx-get="/ui/vms/vm-a/add-disk-modal"`,
+		`hx-get="/ui/vms/vm-a/add-nic-modal"`,
+		`hx-get="/ui/vms/vm-a/add-pci-modal"`,
+		`+ Add disk`, `+ Add NIC`, `+ Add PCI device`,
+		`resize-disk-modal?disk=vda`, // disk row Resize action
+		`dev-chip dev-gpu`,           // PCI row device-class chip
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("hardware tab missing %q", want)
+		}
+	}
+	// The old inline add-forms are gone.
+	if strings.Contains(body, `hx-post="/ui/vms/vm-a/attach-pci"`) && strings.Contains(body, `placeholder="0000:41:00.0"`) {
+		t.Error("old inline PCI attach form should be removed (now a modal)")
+	}
+}
+
+// TestHandler_HardwareTab_EmptyPCIShowsEmptyState verifies an empty PCI
+// section renders the shared .empty-state invitation (with its own Add
+// button), not a flat catch-all sentence.
+func TestHandler_HardwareTab_EmptyPCIShowsEmptyState(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{HardwareAdoptionState: "adopted"} // no devices
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm-a/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	body := w.Body.String()
+	if !strings.Contains(body, "empty-state") || !strings.Contains(body, "No passthrough devices attached") {
+		t.Error("empty PCI section must render the .empty-state invitation, not a flat sentence")
+	}
+	if strings.Contains(body, "No hardware devices recorded") {
+		t.Error("the old catch-all empty block should be removed")
+	}
+}
+
+// TestDevChip verifies the devChip funcMap helper maps each known PCI
+// DeviceSpec.type value to its chip class + label, with an "other" fallback
+// for anything unrecognized (including the empty string).
+func TestDevChip(t *testing.T) {
+	cases := map[string]string{"gpu": "dev-gpu\">GPU", "network": "dev-nic\">NIC", "nvme": "dev-nvme\">NVMe", "": "dev-other\">PCI"}
+	for in, want := range cases {
+		if got := string(devChip(in)); !strings.Contains(got, want) {
+			t.Errorf("devChip(%q)=%q, want substring %q", in, got, want)
+		}
+	}
 }
 
 // TestHandler_VMDetail_TabHardware covers the ?tab=hardware full-page load —
@@ -238,6 +291,26 @@ func TestHandler_VMDetail_TabHardware(t *testing.T) {
 	w := serveRequest(s, r)
 	assertStatus(t, w, http.StatusOK)
 	assertContains(t, w, "vdb")
+}
+
+// TestHandler_HardwareTab_RendersWithoutNetworksFetch verifies fix (2): with
+// the dead .Networks threading removed (hardwareTabData no longer takes a
+// nets param, and neither tab-render call site fetches ListNetworks), both
+// the htmx fragment route and the ?tab=hardware full-page route still render
+// the Hardware tab's devices correctly.
+func TestHandler_HardwareTab_RendersWithoutNetworksFetch(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{Devices: []*pb.HardwareDevice{
+		{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{Target: "vdb", Bus: "virtio"}}},
+	}}
+	s := newTestUIServer(t, mock)
+
+	if body := doGET(t, s, "/ui/vms/vm1/tab/hardware"); !strings.Contains(body, "vdb") {
+		t.Error("hardware fragment route must still render devices with Networks gone")
+	}
+	if body := doGET(t, s, "/vms/vm1?tab=hardware"); !strings.Contains(body, "vdb") {
+		t.Error("?tab=hardware full-page route must still render devices with Networks gone")
+	}
 }
 
 func TestHandler_VMsTable(t *testing.T) {
@@ -544,6 +617,74 @@ func TestHandler_AttachDisk(t *testing.T) {
 	}
 }
 
+// TestHandler_AddDiskModal_PrefillsNextName verifies the Add-disk modal
+// (opened via the Hardware tab's "+ Add disk" header action) prefills the
+// name field with the next free dataN slot, derived from the VM's existing
+// disks, and renders inside the shared form-modal shell with a primary
+// submit button.
+func TestHandler_AddDiskModal_PrefillsNextName(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{Devices: []*pb.HardwareDevice{
+		{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{DeviceId: "data0"}}},
+	}}
+	s := newTestUIServer(t, mock)
+	s.SetCorrosionDB(newCorrosionForUITest(t))
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm-a/add-disk-modal"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	body := w.Body.String()
+	if !strings.Contains(body, `value="data1"`) {
+		t.Error("Add-disk modal must prefill the next free dataN name (data1)")
+	}
+	if !strings.Contains(body, "fm-foot") || !strings.Contains(body, "btn-primary") {
+		t.Error("modal must use the form-modal shell with a primary submit")
+	}
+}
+
+// TestHandler_AddDiskModal_NilDB_NoPanic verifies handleAddDiskModal guards
+// s.db before resolving the VM's host via corrosion.GetVM — corrosion.Client.Query
+// panics on a nil receiver, so a server with no Corrosion DB wired in (s.db ==
+// nil) must still render the modal instead of crashing the request.
+func TestHandler_AddDiskModal_NilDB_NoPanic(t *testing.T) {
+	mock := newDefaultMock()
+	s := newTestUIServer(t, mock) // no SetCorrosionDB call — s.db stays nil
+	body := doGET(t, s, "/ui/vms/vm-a/add-disk-modal")
+	if !strings.Contains(body, "add-disk-modal") {
+		t.Error("Add-disk modal must render even without a corrosion DB wired in")
+	}
+}
+
+// TestHandler_AttachDisk_PassesStoragePool verifies the operator's chosen
+// storage pool (from the Add-disk modal's pool dropdown) reaches the
+// AttachDevice RPC's DiskSpec, alongside the existing name/size/bus fields.
+func TestHandler_AttachDisk_PassesStoragePool(t *testing.T) {
+	mock := newDefaultMock()
+	s := newTestUIServer(t, mock)
+	form := url.Values{"name": {"data1"}, "size_gib": {"20"}, "bus": {"virtio"}, "storage": {"fast-nvme"}}
+	doPOSTForm(t, s, "/ui/vms/vm-a/attach-disk", form)
+	if mock.lastAttachDeviceReq.GetDisk().GetStorage() != "fast-nvme" {
+		t.Errorf("Storage = %q, want fast-nvme", mock.lastAttachDeviceReq.GetDisk().GetStorage())
+	}
+	if mock.lastAttachDeviceReq.GetDisk().GetSize() != "20G" {
+		t.Errorf("Size = %q, want 20G", mock.lastAttachDeviceReq.GetDisk().GetSize())
+	}
+}
+
+// TestNextDiskName verifies the dataN name-generation helper: it fills the
+// lowest unused slot (not just appends), ignores non-dataN disk names
+// (e.g. "root"), and starts at data0 for a VM with no disks yet.
+func TestNextDiskName(t *testing.T) {
+	if got := nextDiskName([]string{"data0", "data2"}); got != "data1" {
+		t.Errorf("nextDiskName gap = %q, want data1", got)
+	}
+	if got := nextDiskName([]string{"root", "data0", "data1"}); got != "data2" {
+		t.Errorf("nextDiskName = %q, want data2", got)
+	}
+	if got := nextDiskName(nil); got != "data0" {
+		t.Errorf("nextDiskName empty = %q, want data0", got)
+	}
+}
+
 func TestHandler_DetachDisk(t *testing.T) {
 	mock := newDefaultMock()
 	s := newTestUIServer(t, mock)
@@ -589,6 +730,75 @@ func TestHandler_AttachNIC(t *testing.T) {
 	}
 }
 
+// newHardwareTestServer creates a UI test server with a corrosion test DB
+// wired in and two security groups seeded ("web", "ssh"), for the Add-NIC
+// modal tests below — the SG multiselect renders nothing without a DB.
+func newHardwareTestServer(t *testing.T) (*Server, *mockGRPC) {
+	t.Helper()
+	mock := newDefaultMock()
+	s := newTestUIServer(t, mock)
+	db := newCorrosionForUITest(t)
+	s.SetCorrosionDB(db)
+	for _, name := range []string{"web", "ssh"} {
+		if err := corrosion.InsertSecurityGroup(context.Background(), db, corrosion.SecurityGroup{ID: name, Name: name}); err != nil {
+			t.Fatalf("InsertSecurityGroup(%s): %v", name, err)
+		}
+	}
+	return s, mock
+}
+
+// seedVM inserts a minimal VM row into the test corrosion DB so
+// corrosion.GetVM(ctx, s.db, name) resolves a HostName for handlers (like the
+// Add-PCI modal) that need to scope a host-local lookup to the VM's host.
+func seedVM(t *testing.T, db *corrosion.Client, name, host string) {
+	t.Helper()
+	if err := corrosion.InsertVM(context.Background(), db, corrosion.VMRecord{
+		Name: name, HostName: host, Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("seedVM(%s, %s): %v", name, host, err)
+	}
+}
+
+// TestHandler_AddNICModal_RelabelsNetwork verifies the Add-NIC modal offers a
+// managed-network / custom-bridge toggle, labels the managed field "Network"
+// (never "Bridge" — the field can point at any managed network, not just an
+// L2 bridge), lists the security groups available to attach, and populates
+// the network dropdown from ListNetworks.
+func TestHandler_AddNICModal_RelabelsNetwork(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	m.listNetworksResp = &pb.ListNetworksResponse{Networks: []*pb.NetworkInfo{{Name: "lab-net", Type: "bridge", Subnet: "10.20.0.0/24", Dhcp: true}}}
+	body := doGET(t, s, "/ui/vms/vm-a/add-nic-modal")
+	for _, want := range []string{"Network", "Custom bridge", "Security groups", `name="mode"`, "lab-net"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("Add-NIC modal missing %q", want)
+		}
+	}
+	if strings.Contains(body, ">Bridge<") {
+		t.Error(`the managed-network field must be labeled "Network", not "Bridge"`)
+	}
+}
+
+// TestHandler_AttachNIC_CustomBridgeAndSGs verifies the custom-bridge mode
+// (bridge_custom overrides the managed "bridge" field) and the security
+// groups / static IP / gateway fields all reach the AttachDevice RPC's
+// NetworkAttachment.
+func TestHandler_AttachNIC_CustomBridgeAndSGs(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	form := url.Values{"mode": {"custom"}, "bridge_custom": {"br0"}, "model": {"virtio"},
+		"security_groups": {"web", "ssh"}, "ip": {"10.20.0.5"}, "gateway": {"10.20.0.1"}}
+	doPOSTForm(t, s, "/ui/vms/vm-a/attach-nic", form)
+	nic := m.lastAttachDeviceReq.GetNic()
+	if nic.GetName() != "br0" {
+		t.Errorf("Name = %q, want br0 (custom bridge)", nic.GetName())
+	}
+	if strings.Join(nic.GetSecurityGroups(), ",") != "web,ssh" {
+		t.Errorf("SecurityGroups = %v, want [web ssh]", nic.GetSecurityGroups())
+	}
+	if nic.GetIp() != "10.20.0.5" || nic.GetGateway() != "10.20.0.1" {
+		t.Errorf("static IP/gw not passed: ip=%q gw=%q", nic.GetIp(), nic.GetGateway())
+	}
+}
+
 func TestHandler_DetachNIC(t *testing.T) {
 	mock := newDefaultMock()
 	s := newTestUIServer(t, mock)
@@ -631,6 +841,72 @@ func TestHandler_DetachPCI(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	if mock.lastDetachDeviceReq == nil {
 		t.Fatal("DetachDevice (PCI) was not called")
+	}
+}
+
+// TestHandler_AddPCIModal_GroupsUnownedByType verifies the Add-PCI modal scans
+// the VM's host (resolved via corrosion.GetVM) for host devices, groups the
+// UNASSIGNED ones by class (GPU/NIC/NVMe/Other) into optgroups, and excludes
+// any device already assigned to another VM from the picker entirely.
+func TestHandler_AddPCIModal_GroupsUnownedByType(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	seedVM(t, s.db, "vm-a", "host-1") // insert a VM row so GetVM(host)="host-1"
+	m.listHostDevicesResp = &pb.ListHostDevicesResponse{Devices: []*pb.PCIDevice{
+		{Address: "0000:41:00.0", Type: "gpu", VendorName: "NVIDIA", DeviceName: "L40S", IommuGroup: 34, VmName: ""},
+		{Address: "0000:31:00.1", Type: "network", VendorName: "Intel", DeviceName: "E810", IommuGroup: 18, VmName: "vm-b"}, // owned → excluded
+	}}
+	body := doGET(t, s, "/ui/vms/vm-a/add-pci-modal")
+	if !strings.Contains(body, "0000:41:00.0") || !strings.Contains(body, "NVIDIA") {
+		t.Error("scanned unowned GPU must be listed")
+	}
+	if strings.Contains(body, "0000:31:00.1") {
+		t.Error("a device owned by another VM must be excluded from the picker")
+	}
+	if !strings.Contains(body, "<optgroup label=\"GPU\"") {
+		t.Error("devices must be grouped by class")
+	}
+}
+
+// TestHandler_AddPCIModal_NoDevices_EmptyState verifies that when a host has
+// no unassigned passthrough devices in any of the four ByType groups (GPU/
+// NIC/NVMe/Other), the scanned block renders explanatory copy instead of an
+// empty <select> the operator could submit with nothing chosen (spec §5).
+func TestHandler_AddPCIModal_NoDevices_EmptyState(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	seedVM(t, s.db, "vm-a", "host-1")
+	m.listHostDevicesResp = &pb.ListHostDevicesResponse{} // no scanned devices at all
+	body := doGET(t, s, "/ui/vms/vm-a/add-pci-modal")
+	if !strings.Contains(body, "No unassigned passthrough devices on this host.") {
+		t.Error("empty scanned devices must render the no-devices copy, not an empty select")
+	}
+}
+
+// TestHandler_AddPCIModal_NoMappings_RadioDisabled verifies that when no
+// cluster-wide resource mappings exist, the "Resource mapping" radio is
+// disabled so an operator can't select an option with nothing behind it
+// (spec §5: shown/enabled only when mappings exist; scanned stays default).
+func TestHandler_AddPCIModal_NoMappings_RadioDisabled(t *testing.T) {
+	s, _ := newHardwareTestServer(t)
+	seedVM(t, s.db, "vm-a", "host-1") // ListResourceMappings mock default is empty
+	body := doGET(t, s, "/ui/vms/vm-a/add-pci-modal")
+	if !strings.Contains(body, `value="mapping" onclick="pciMode()" disabled`) {
+		t.Error(`the "Resource mapping" radio must be disabled when no mappings exist`)
+	}
+}
+
+// TestHandler_AttachPCI_MappingMode verifies mode=mapping sends the chosen
+// resource-mapping name via DeviceSpec.Mapping and leaves Address empty,
+// distinct from the scanned/custom address-based modes.
+func TestHandler_AttachPCI_MappingMode(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	form := url.Values{"mode": {"mapping"}, "mapping": {"gpu-pool"}}
+	doPOSTForm(t, s, "/ui/vms/vm-a/attach-pci", form)
+	pci := m.lastAttachDeviceReq.GetPciDevice()
+	if pci.GetMapping() != "gpu-pool" {
+		t.Errorf("Mapping = %q, want gpu-pool", pci.GetMapping())
+	}
+	if pci.GetAddress() != "" {
+		t.Errorf("Address must be empty in mapping mode, got %q", pci.GetAddress())
 	}
 }
 

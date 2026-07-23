@@ -556,3 +556,15 @@ table.table tbody tr:hover td { background: var(--color-surface-hover); }
 .cp-results .search-result.cp-selected, .cp-results .search-result.cp-selected span, .cp-results .search-result.cp-selected .badge { color: #fff !important; }
 .cp-hint { border-top: 1px solid var(--border); padding: 7px 14px; font-size: 11px; color: var(--muted); }
 .cp-hint kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; font-size: 10px; font-family: var(--font-family-monospace); }
+
+/* VM hardware tab: compact 2-col field pairing + device-class chips */
+.field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 480px) { .field-grid { grid-template-columns: 1fr; } }
+.dev-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: var(--radii-full); font-size: 11px; font-weight: 600; }
+.dev-chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.dev-gpu { background: color-mix(in srgb, var(--color-misc-purple) 16%, transparent); color: var(--color-misc-purple); }
+.dev-nic { background: var(--color-surface-info); color: var(--color-text-info); }
+.dev-nvme { background: var(--color-surface-success); color: var(--color-text-success); }
+.dev-other { background: var(--color-surface-sunken); color: var(--muted); }
+.section-header .btn { flex: none; }
+.pick-cap { font-size: 12px; color: var(--muted); margin-top: 6px; }

@@ -114,6 +114,7 @@ func NewServer(client pb.LiteVirtClient, clusterName string) (*Server, error) {
 			return int(used * 100 / total)
 		},
 		"driverBadge": driverBadge,
+		"devChip":     devChip,
 		"icon":        iconHelper,
 		"relTime":     relTimeHelper,
 		"humanCron":   humanCronHelper,
@@ -465,11 +466,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/projects", s.requireAuthFunc(s.handleCreateProject))
 	mux.HandleFunc("DELETE /ui/projects", s.requireAuthFunc(s.handleDeleteProject))
 	mux.HandleFunc("POST /ui/projects/quota", s.requireAuthFunc(s.handleSetProjectQuota))
+	mux.HandleFunc("GET /ui/vms/{name}/add-disk-modal", s.requireAuthFunc(s.handleAddDiskModal))
 	mux.HandleFunc("POST /ui/vms/{name}/attach-disk", s.requireAuthFunc(s.handleAttachDisk))
 	mux.HandleFunc("POST /ui/vms/{name}/resize-disk", s.requireAuthFunc(s.handleResizeDisk))
 	mux.HandleFunc("POST /ui/vms/{name}/detach-disk", s.requireAuthFunc(s.handleDetachDisk))
+	mux.HandleFunc("GET /ui/vms/{name}/add-nic-modal", s.requireAuthFunc(s.handleAddNICModal))
 	mux.HandleFunc("POST /ui/vms/{name}/attach-nic", s.requireAuthFunc(s.handleAttachNIC))
 	mux.HandleFunc("POST /ui/vms/{name}/detach-nic", s.requireAuthFunc(s.handleDetachNIC))
+	mux.HandleFunc("GET /ui/vms/{name}/add-pci-modal", s.requireAuthFunc(s.handleAddPCIModal))
 	mux.HandleFunc("POST /ui/vms/{name}/attach-pci", s.requireAuthFunc(s.handleAttachPCI))
 	mux.HandleFunc("POST /ui/vms/{name}/detach-pci", s.requireAuthFunc(s.handleDetachPCI))
 
@@ -636,6 +640,21 @@ func driverBadge(driver string) template.HTML {
 	default:
 		return `<span class="badge badge-gray">local</span>`
 	}
+}
+
+// devChip renders a device-class chip for a PCI DeviceSpec.type value. Fixed enum
+// input (no user data) → safe to emit as template.HTML.
+func devChip(pciType string) template.HTML {
+	cls, label := "dev-other", "PCI"
+	switch pciType {
+	case "gpu":
+		cls, label = "dev-gpu", "GPU"
+	case "network":
+		cls, label = "dev-nic", "NIC"
+	case "nvme":
+		cls, label = "dev-nvme", "NVMe"
+	}
+	return template.HTML(`<span class="dev-chip ` + cls + `">` + label + `</span>`)
 }
 
 func firstIP(ifaces []*pb.VMInterface) string {

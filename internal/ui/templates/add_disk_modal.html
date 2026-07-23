@@ -1,0 +1,24 @@
+<div class="modal-overlay" id="add-disk-modal">
+  <div class="modal form-modal">
+    <form hx-post="/ui/vms/{{.VMName}}/attach-disk" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('add-disk-modal').remove();htmx.ajax('GET','/ui/vms/{{.VMName}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}">
+      <div class="fm-head"><h3>Add disk</h3>
+        <button type="button" class="fm-x" aria-label="Close" onclick="document.getElementById('add-disk-modal').remove()">&times;</button></div>
+      <div class="fm-body">
+        <div class="form-row"><label>Name</label><input type="text" name="name" value="{{.DefaultName}}" required autofocus></div>
+        <div class="field-grid">
+          <div class="form-row" style="margin-bottom:0"><label>Size (GiB)</label><input type="number" name="size_gib" value="10" min="1" required></div>
+          <div class="form-row" style="margin-bottom:0"><label>Bus</label>
+            <select name="bus"><option value="virtio">virtio</option><option value="scsi">scsi</option><option value="sata">sata</option></select></div>
+        </div>
+        <div class="form-row" style="margin-top:12px"><label>Storage pool</label>
+          <select name="storage"><option value="">local (default)</option>{{range .Pools}}<option value="{{.}}">{{.}}</option>{{end}}</select></div>
+      </div>
+      <div class="fm-foot"><span class="hint">Grows a new data disk on this VM's host.</span>
+        <div class="fm-actions">
+          <button type="button" class="btn" onclick="document.getElementById('add-disk-modal').remove()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Attach</button>
+        </div></div>
+    </form>
+  </div>
+</div>

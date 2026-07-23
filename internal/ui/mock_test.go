@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1184,6 +1186,18 @@ func mustReq(t *testing.T, method, path string) *http.Request {
 		t.Fatalf("http.NewRequest(%s %s): %v", method, path, err)
 	}
 	return r
+}
+
+// doPOSTForm submits an application/x-www-form-urlencoded POST through the
+// server's handler (with a valid auth cookie) and returns the response.
+func doPOSTForm(t *testing.T, s *Server, path string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	r, err := http.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("http.NewRequest(POST %s): %v", path, err)
+	}
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return serveRequest(s, withAuth(r))
 }
 
 // errorf is a helper for tests that need a formatted error.

@@ -466,6 +466,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/projects", s.requireAuthFunc(s.handleCreateProject))
 	mux.HandleFunc("DELETE /ui/projects", s.requireAuthFunc(s.handleDeleteProject))
 	mux.HandleFunc("POST /ui/projects/quota", s.requireAuthFunc(s.handleSetProjectQuota))
+	mux.HandleFunc("GET /ui/vms/{name}/add-disk-modal", s.requireAuthFunc(s.handleAddDiskModal))
 	mux.HandleFunc("POST /ui/vms/{name}/attach-disk", s.requireAuthFunc(s.handleAttachDisk))
 	mux.HandleFunc("POST /ui/vms/{name}/resize-disk", s.requireAuthFunc(s.handleResizeDisk))
 	mux.HandleFunc("POST /ui/vms/{name}/detach-disk", s.requireAuthFunc(s.handleDetachDisk))

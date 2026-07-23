@@ -3,6 +3,7 @@ package ui
 import (
 	"html/template"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -591,6 +592,61 @@ func TestHandler_AttachDisk(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	if mock.lastAttachDeviceReq == nil {
 		t.Fatal("AttachDevice was not called")
+	}
+}
+
+// TestHandler_AddDiskModal_PrefillsNextName verifies the Add-disk modal
+// (opened via the Hardware tab's "+ Add disk" header action) prefills the
+// name field with the next free dataN slot, derived from the VM's existing
+// disks, and renders inside the shared form-modal shell with a primary
+// submit button.
+func TestHandler_AddDiskModal_PrefillsNextName(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{Devices: []*pb.HardwareDevice{
+		{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{DeviceId: "data0"}}},
+	}}
+	s := newTestUIServer(t, mock)
+	s.SetCorrosionDB(newCorrosionForUITest(t))
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm-a/add-disk-modal"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	body := w.Body.String()
+	if !strings.Contains(body, `value="data1"`) {
+		t.Error("Add-disk modal must prefill the next free dataN name (data1)")
+	}
+	if !strings.Contains(body, "fm-foot") || !strings.Contains(body, "btn-primary") {
+		t.Error("modal must use the form-modal shell with a primary submit")
+	}
+}
+
+// TestHandler_AttachDisk_PassesStoragePool verifies the operator's chosen
+// storage pool (from the Add-disk modal's pool dropdown) reaches the
+// AttachDevice RPC's DiskSpec, alongside the existing name/size/bus fields.
+func TestHandler_AttachDisk_PassesStoragePool(t *testing.T) {
+	mock := newDefaultMock()
+	s := newTestUIServer(t, mock)
+	form := url.Values{"name": {"data1"}, "size_gib": {"20"}, "bus": {"virtio"}, "storage": {"fast-nvme"}}
+	doPOSTForm(t, s, "/ui/vms/vm-a/attach-disk", form)
+	if mock.lastAttachDeviceReq.GetDisk().GetStorage() != "fast-nvme" {
+		t.Errorf("Storage = %q, want fast-nvme", mock.lastAttachDeviceReq.GetDisk().GetStorage())
+	}
+	if mock.lastAttachDeviceReq.GetDisk().GetSize() != "20G" {
+		t.Errorf("Size = %q, want 20G", mock.lastAttachDeviceReq.GetDisk().GetSize())
+	}
+}
+
+// TestNextDiskName verifies the dataN name-generation helper: it fills the
+// lowest unused slot (not just appends), ignores non-dataN disk names
+// (e.g. "root"), and starts at data0 for a VM with no disks yet.
+func TestNextDiskName(t *testing.T) {
+	if got := nextDiskName([]string{"data0", "data2"}); got != "data1" {
+		t.Errorf("nextDiskName gap = %q, want data1", got)
+	}
+	if got := nextDiskName([]string{"root", "data0", "data1"}); got != "data2" {
+		t.Errorf("nextDiskName = %q, want data2", got)
+	}
+	if got := nextDiskName(nil); got != "data0" {
+		t.Errorf("nextDiskName empty = %q, want data0", got)
 	}
 }
 

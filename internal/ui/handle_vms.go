@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -775,9 +776,10 @@ func (s *Server) handleAttachDisk(w http.ResponseWriter, r *http.Request) {
 	_, err := s.grpc.AttachDevice(s.uiBearerCtx(r), &pb.AttachDeviceRequest{
 		VmName: name,
 		Disk: &pb.DiskSpec{
-			Name: r.FormValue("name"),
-			Size: fmt.Sprintf("%dG", sizeGiB),
-			Bus:  r.FormValue("bus"),
+			Name:    r.FormValue("name"),
+			Size:    fmt.Sprintf("%dG", sizeGiB),
+			Bus:     r.FormValue("bus"),
+			Storage: r.FormValue("storage"),
 		},
 	})
 	if err != nil {
@@ -787,6 +789,53 @@ func (s *Server) handleAttachDisk(w http.ResponseWriter, r *http.Request) {
 	}
 	sendToast(w, "Disk attached", "success")
 	w.WriteHeader(http.StatusOK)
+}
+
+// nextDiskName returns the lowest-numbered "dataN" name not already in use,
+// so the Add-disk modal can prefill a sensible default instead of leaving
+// the operator to invent one. Non-dataN names (e.g. "root") are ignored.
+func nextDiskName(existing []string) string {
+	used := make(map[string]bool, len(existing))
+	for _, n := range existing {
+		used[n] = true
+	}
+	for i := 0; ; i++ {
+		if cand := fmt.Sprintf("data%d", i); !used[cand] {
+			return cand
+		}
+	}
+}
+
+// handleAddDiskModal renders the Add-disk modal for a VM: the name field
+// prefilled with the next free dataN slot (from the VM's current disks via
+// ListVMHardware) and a storage-pool dropdown scoped to the VM's host (via a
+// local Corrosion read, when available — an empty host lists every pool).
+func (s *Server) handleAddDiskModal(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ctx := s.uiBearerCtx(r)
+	var existing []string
+	if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
+		for _, d := range hw.GetDevices() {
+			if disk := d.GetDisk(); disk != nil {
+				existing = append(existing, disk.GetDeviceId())
+			}
+		}
+	}
+	host := ""
+	if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
+		host = vm.HostName
+	}
+	var pools []string
+	if resp, err := s.grpc.ListStoragePools(ctx, &pb.ListStoragePoolsRequest{}); err == nil {
+		for _, p := range resp.GetPools() {
+			if host == "" || p.GetHost() == host {
+				pools = append(pools, p.GetName())
+			}
+		}
+	}
+	s.renderFragment(w, "add_disk_modal.html", map[string]any{
+		"VMName": name, "DefaultName": nextDiskName(existing), "Pools": pools,
+	})
 }
 
 func (s *Server) handleResizeDiskModal(w http.ResponseWriter, r *http.Request) {

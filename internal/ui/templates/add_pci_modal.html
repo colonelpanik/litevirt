@@ -1,0 +1,63 @@
+<div class="modal-overlay" id="add-pci-modal">
+  <div class="modal form-modal">
+    <form hx-post="/ui/vms/{{.VMName}}/attach-pci" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('add-pci-modal').remove();htmx.ajax('GET','/ui/vms/{{.VMName}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}">
+      <div class="fm-head"><h3>Add PCI device</h3>
+        <button type="button" class="fm-x" aria-label="Close" onclick="document.getElementById('add-pci-modal').remove()">&times;</button></div>
+      <div class="fm-body">
+        <div class="form-row" style="margin-bottom:8px">
+          <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;margin-right:16px"><input type="radio" name="mode" value="scanned" checked onclick="pciMode()"> Scanned device</label>
+          <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;margin-right:16px"><input type="radio" name="mode" value="mapping" onclick="pciMode()"> Resource mapping</label>
+          <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400"><input type="radio" name="mode" value="custom" onclick="pciMode()"> Custom address</label>
+        </div>
+
+        <div id="pci-scanned">
+          <div class="form-row"><label>Device on host <span class="mono muted">{{.Host}}</span></label>
+            <select name="address" size="7" style="height:auto">
+              {{$g := index .ByType "gpu"}}{{if $g}}<optgroup label="GPU">{{range $g}}<option value="{{.Address}}">{{.VendorName}} {{.DeviceName}} — {{.Address}}{{if .IommuGroup}} (IOMMU {{.IommuGroup}}){{end}}</option>{{end}}</optgroup>{{end}}
+              {{$n := index .ByType "network"}}{{if $n}}<optgroup label="NIC">{{range $n}}<option value="{{.Address}}">{{.VendorName}} {{.DeviceName}} — {{.Address}}{{if .IommuGroup}} (IOMMU {{.IommuGroup}}){{end}}</option>{{end}}</optgroup>{{end}}
+              {{$v := index .ByType "nvme"}}{{if $v}}<optgroup label="NVMe">{{range $v}}<option value="{{.Address}}">{{.VendorName}} {{.DeviceName}} — {{.Address}}{{if .IommuGroup}} (IOMMU {{.IommuGroup}}){{end}}</option>{{end}}</optgroup>{{end}}
+              {{$o := index .ByType "other"}}{{if $o}}<optgroup label="Other">{{range $o}}<option value="{{.Address}}">{{.VendorName}} {{.DeviceName}} — {{.Address}}{{if .IommuGroup}} (IOMMU {{.IommuGroup}}){{end}}</option>{{end}}</optgroup>{{end}}
+            </select>
+            <div class="pick-cap">Attaching a device brings its whole IOMMU group. Only devices unassigned on this host are listed.</div>
+          </div>
+        </div>
+
+        <div id="pci-mapping" style="display:none">
+          <div class="form-row"><label>Resource mapping</label>
+            {{if .Mappings}}<select name="mapping" disabled>{{range .Mappings}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+            <div class="pick-cap">Portable across hosts — resolves to an equivalent device at start/migration.</div>
+            {{else}}<div class="muted">No resource mappings defined.</div>{{end}}</div>
+        </div>
+
+        <div id="pci-custom" style="display:none">
+          <div class="field-grid">
+            <div class="form-row" style="margin-bottom:0"><label>Type</label>
+              <select name="type" disabled><option value="gpu">GPU</option><option value="network">NIC</option><option value="nvme">NVMe</option><option value="other">Other</option></select></div>
+            <div class="form-row" style="margin-bottom:0"><label>Address</label><input type="text" name="address_custom" placeholder="0000:41:00.0" disabled></div>
+          </div>
+        </div>
+      </div>
+      <div class="fm-foot"><span class="hint">Reserved now; bound to vfio-pci at start.</span>
+        <div class="fm-actions">
+          <button type="button" class="btn" onclick="document.getElementById('add-pci-modal').remove()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Attach</button>
+        </div></div>
+    </form>
+  </div>
+</div>
+<script>
+function pciMode(){
+  var m = document.querySelector('#add-pci-modal input[name=mode]:checked').value;
+  document.getElementById('pci-scanned').style.display = m==='scanned' ? '' : 'none';
+  document.getElementById('pci-mapping').style.display = m==='mapping' ? '' : 'none';
+  document.getElementById('pci-custom').style.display  = m==='custom'  ? '' : 'none';
+  var scanned = document.querySelector('#pci-scanned select[name=address]');
+  if (scanned) scanned.disabled = (m!=='scanned');
+  var mapping = document.querySelector('#pci-mapping select[name=mapping]');
+  if (mapping) mapping.disabled = (m!=='mapping');
+  document.querySelector('#pci-custom select[name=type]').disabled = (m!=='custom');
+  document.querySelector('#pci-custom input[name=address_custom]').disabled = (m!=='custom');
+}
+pciMode();
+</script>

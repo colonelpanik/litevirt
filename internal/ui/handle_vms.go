@@ -1222,18 +1222,66 @@ func (s *Server) handleDetachNIC(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleAddPCIModal renders the Add-PCI modal: unassigned devices scanned from
+// the VM's host (via ListHostDevices, resolving the host through a local
+// Corrosion read like handleAddDiskModal) grouped into GPU/NIC/NVMe/Other
+// optgroups, plus the cluster-wide resource mappings available as a
+// host-portable alternative to a raw scanned address.
+func (s *Server) handleAddPCIModal(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ctx := s.uiBearerCtx(r)
+	host := ""
+	if s.db != nil {
+		if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
+			host = vm.HostName
+		}
+	}
+	byType := map[string][]*pb.PCIDevice{}
+	if host != "" {
+		if resp, err := s.grpc.ListHostDevices(ctx, &pb.ListHostDevicesRequest{Name: host}); err == nil {
+			for _, d := range resp.GetDevices() {
+				if d.GetVmName() != "" {
+					continue // only unassigned devices are attachable
+				}
+				t := d.GetType()
+				if t != "gpu" && t != "network" && t != "nvme" {
+					t = "other"
+				}
+				byType[t] = append(byType[t], d)
+			}
+		}
+	}
+	var mappings []string
+	if resp, err := s.grpc.ListResourceMappings(ctx, &pb.ListResourceMappingsRequest{}); err == nil {
+		for _, mp := range resp.GetMappings() {
+			mappings = append(mappings, mp.GetName())
+		}
+	}
+	s.renderFragment(w, "add_pci_modal.html", map[string]any{
+		"VMName": name, "Host": host, "ByType": byType, "Mappings": mappings,
+	})
+}
+
 func (s *Server) handleAttachPCI(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", 400)
 		return
 	}
+	spec := &pb.DeviceSpec{}
+	switch r.FormValue("mode") {
+	case "mapping":
+		spec.Mapping = r.FormValue("mapping")
+	case "custom":
+		spec.Type = r.FormValue("type")
+		spec.Address = r.FormValue("address_custom")
+	default: // "scanned"
+		spec.Type = r.FormValue("type")
+		spec.Address = r.FormValue("address")
+	}
 	_, err := s.grpc.AttachDevice(s.uiBearerCtx(r), &pb.AttachDeviceRequest{
-		VmName: name,
-		PciDevice: &pb.DeviceSpec{
-			Type:    r.FormValue("type"),
-			Address: r.FormValue("address"),
-		},
+		VmName:    name,
+		PciDevice: spec,
 	})
 	if err != nil {
 		sendToast(w, "Attach PCI failed: "+err.Error(), "error")

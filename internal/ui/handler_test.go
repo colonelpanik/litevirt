@@ -714,6 +714,18 @@ func newHardwareTestServer(t *testing.T) (*Server, *mockGRPC) {
 	return s, mock
 }
 
+// seedVM inserts a minimal VM row into the test corrosion DB so
+// corrosion.GetVM(ctx, s.db, name) resolves a HostName for handlers (like the
+// Add-PCI modal) that need to scope a host-local lookup to the VM's host.
+func seedVM(t *testing.T, db *corrosion.Client, name, host string) {
+	t.Helper()
+	if err := corrosion.InsertVM(context.Background(), db, corrosion.VMRecord{
+		Name: name, HostName: host, Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("seedVM(%s, %s): %v", name, host, err)
+	}
+}
+
 // TestHandler_AddNICModal_RelabelsNetwork verifies the Add-NIC modal offers a
 // managed-network / custom-bridge toggle, labels the managed field "Network"
 // (never "Bridge" — the field can point at any managed network, not just an
@@ -796,6 +808,45 @@ func TestHandler_DetachPCI(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	if mock.lastDetachDeviceReq == nil {
 		t.Fatal("DetachDevice (PCI) was not called")
+	}
+}
+
+// TestHandler_AddPCIModal_GroupsUnownedByType verifies the Add-PCI modal scans
+// the VM's host (resolved via corrosion.GetVM) for host devices, groups the
+// UNASSIGNED ones by class (GPU/NIC/NVMe/Other) into optgroups, and excludes
+// any device already assigned to another VM from the picker entirely.
+func TestHandler_AddPCIModal_GroupsUnownedByType(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	seedVM(t, s.db, "vm-a", "host-1") // insert a VM row so GetVM(host)="host-1"
+	m.listHostDevicesResp = &pb.ListHostDevicesResponse{Devices: []*pb.PCIDevice{
+		{Address: "0000:41:00.0", Type: "gpu", VendorName: "NVIDIA", DeviceName: "L40S", IommuGroup: 34, VmName: ""},
+		{Address: "0000:31:00.1", Type: "network", VendorName: "Intel", DeviceName: "E810", IommuGroup: 18, VmName: "vm-b"}, // owned → excluded
+	}}
+	body := doGET(t, s, "/ui/vms/vm-a/add-pci-modal")
+	if !strings.Contains(body, "0000:41:00.0") || !strings.Contains(body, "NVIDIA") {
+		t.Error("scanned unowned GPU must be listed")
+	}
+	if strings.Contains(body, "0000:31:00.1") {
+		t.Error("a device owned by another VM must be excluded from the picker")
+	}
+	if !strings.Contains(body, "<optgroup label=\"GPU\"") {
+		t.Error("devices must be grouped by class")
+	}
+}
+
+// TestHandler_AttachPCI_MappingMode verifies mode=mapping sends the chosen
+// resource-mapping name via DeviceSpec.Mapping and leaves Address empty,
+// distinct from the scanned/custom address-based modes.
+func TestHandler_AttachPCI_MappingMode(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	form := url.Values{"mode": {"mapping"}, "mapping": {"gpu-pool"}}
+	doPOSTForm(t, s, "/ui/vms/vm-a/attach-pci", form)
+	pci := m.lastAttachDeviceReq.GetPciDevice()
+	if pci.GetMapping() != "gpu-pool" {
+		t.Errorf("Mapping = %q, want gpu-pool", pci.GetMapping())
+	}
+	if pci.GetAddress() != "" {
+		t.Errorf("Address must be empty in mapping mode, got %q", pci.GetAddress())
 	}
 }
 

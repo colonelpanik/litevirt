@@ -473,6 +473,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /ui/vms/{name}/add-nic-modal", s.requireAuthFunc(s.handleAddNICModal))
 	mux.HandleFunc("POST /ui/vms/{name}/attach-nic", s.requireAuthFunc(s.handleAttachNIC))
 	mux.HandleFunc("POST /ui/vms/{name}/detach-nic", s.requireAuthFunc(s.handleDetachNIC))
+	mux.HandleFunc("GET /ui/vms/{name}/add-pci-modal", s.requireAuthFunc(s.handleAddPCIModal))
 	mux.HandleFunc("POST /ui/vms/{name}/attach-pci", s.requireAuthFunc(s.handleAttachPCI))
 	mux.HandleFunc("POST /ui/vms/{name}/detach-pci", s.requireAuthFunc(s.handleDetachPCI))
 

@@ -11,7 +11,7 @@
           <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400"><input type="radio" name="mode" value="custom" onclick="nicMode()"> Custom bridge</label>
         </div>
         <div class="form-row" id="nic-managed"><label>Network</label>
-          <select name="bridge">
+          <select name="bridge" required>
             <option value="" disabled selected>Select a network…</option>
             {{range .Networks}}<option value="{{.Name}}">{{.Name}}{{if .Type}} — {{.Type}}{{end}}{{if .Subnet}} · {{.Subnet}}{{end}}{{if .Dhcp}} · DHCP{{end}}</option>{{end}}
           </select></div>

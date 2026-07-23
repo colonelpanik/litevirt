@@ -7,12 +7,13 @@
       <div class="fm-body">
         <div class="form-row" style="margin-bottom:8px">
           <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;margin-right:16px"><input type="radio" name="mode" value="scanned" checked onclick="pciMode()"> Scanned device</label>
-          <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;margin-right:16px"><input type="radio" name="mode" value="mapping" onclick="pciMode()"> Resource mapping</label>
+          <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;margin-right:16px"><input type="radio" name="mode" value="mapping" onclick="pciMode()" {{if not .Mappings}}disabled{{end}}> Resource mapping</label>
           <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400"><input type="radio" name="mode" value="custom" onclick="pciMode()"> Custom address</label>
         </div>
 
         <div id="pci-scanned">
           <div class="form-row"><label>Device on host <span class="mono muted">{{.Host}}</span></label>
+            {{if or (index .ByType "gpu") (index .ByType "network") (index .ByType "nvme") (index .ByType "other")}}
             <select name="address" size="7" style="height:auto">
               {{$g := index .ByType "gpu"}}{{if $g}}<optgroup label="GPU">{{range $g}}<option value="{{.Address}}">{{.VendorName}} {{.DeviceName}} — {{.Address}}{{if .IommuGroup}} (IOMMU {{.IommuGroup}}){{end}}</option>{{end}}</optgroup>{{end}}
               {{$n := index .ByType "network"}}{{if $n}}<optgroup label="NIC">{{range $n}}<option value="{{.Address}}">{{.VendorName}} {{.DeviceName}} — {{.Address}}{{if .IommuGroup}} (IOMMU {{.IommuGroup}}){{end}}</option>{{end}}</optgroup>{{end}}
@@ -20,6 +21,9 @@
               {{$o := index .ByType "other"}}{{if $o}}<optgroup label="Other">{{range $o}}<option value="{{.Address}}">{{.VendorName}} {{.DeviceName}} — {{.Address}}{{if .IommuGroup}} (IOMMU {{.IommuGroup}}){{end}}</option>{{end}}</optgroup>{{end}}
             </select>
             <div class="pick-cap">Attaching a device brings its whole IOMMU group. Only devices unassigned on this host are listed.</div>
+            {{else}}
+            <div class="muted">No unassigned passthrough devices on this host.</div>
+            {{end}}
           </div>
         </div>
 

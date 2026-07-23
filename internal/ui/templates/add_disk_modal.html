@@ -3,7 +3,7 @@
     <form hx-post="/ui/vms/{{.VMName}}/attach-disk" hx-swap="none"
           hx-on::after-request="if(event.detail.successful){document.getElementById('add-disk-modal').remove();htmx.ajax('GET','/ui/vms/{{.VMName}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}">
       <div class="fm-head"><h3>Add disk</h3>
-        <button type="button" class="fm-x" onclick="document.getElementById('add-disk-modal').remove()">&times;</button></div>
+        <button type="button" class="fm-x" aria-label="Close" onclick="document.getElementById('add-disk-modal').remove()">&times;</button></div>
       <div class="fm-body">
         <div class="form-row"><label>Name</label><input type="text" name="name" value="{{.DefaultName}}" required autofocus></div>
         <div class="field-grid">

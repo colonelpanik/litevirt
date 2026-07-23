@@ -51,8 +51,7 @@ func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 	data["Tab"] = tab
 	if tab == "hardware" {
 		if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
-			networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
-			data["HardwareTab"] = s.renderHardwareTabFragment(hardwareTabData(name, hw, networks.GetNetworks()))
+			data["HardwareTab"] = s.renderHardwareTabFragment(hardwareTabData(name, hw))
 		}
 	}
 	s.renderPage(w, "vm_detail.html", data)
@@ -111,13 +110,12 @@ func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "VM not found", 404)
 		return
 	}
-	nets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
-	s.renderFragment(w, "hardware_tab.html", hardwareTabData(name, resp, nets.GetNetworks()))
+	s.renderFragment(w, "hardware_tab.html", hardwareTabData(name, resp))
 }
 
 // hardwareTabData partitions a VM's hardware devices into per-section slices so the
 // Hardware tab can render each section (and its empty state) independently.
-func hardwareTabData(name string, resp *pb.ListVMHardwareResponse, nets []*pb.NetworkInfo) map[string]any {
+func hardwareTabData(name string, resp *pb.ListVMHardwareResponse) map[string]any {
 	var disks, nics, pcis []*pb.HardwareDevice
 	for _, d := range resp.GetDevices() {
 		switch {
@@ -133,7 +131,6 @@ func hardwareTabData(name string, resp *pb.ListVMHardwareResponse, nets []*pb.Ne
 		"VM": name, "Disks": disks, "Nics": nics, "Pcis": pcis,
 		"AdoptionState": resp.GetHardwareAdoptionState(),
 		"AdoptionError": resp.GetHardwareAdoptionError(),
-		"Networks":      nets,
 	}
 }
 
@@ -822,8 +819,10 @@ func (s *Server) handleAddDiskModal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	host := ""
-	if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
-		host = vm.HostName
+	if s.db != nil {
+		if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
+			host = vm.HostName
+		}
 	}
 	var pools []string
 	if resp, err := s.grpc.ListStoragePools(ctx, &pb.ListStoragePoolsRequest{}); err == nil {

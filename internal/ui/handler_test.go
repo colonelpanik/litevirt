@@ -293,6 +293,26 @@ func TestHandler_VMDetail_TabHardware(t *testing.T) {
 	assertContains(t, w, "vdb")
 }
 
+// TestHandler_HardwareTab_RendersWithoutNetworksFetch verifies fix (2): with
+// the dead .Networks threading removed (hardwareTabData no longer takes a
+// nets param, and neither tab-render call site fetches ListNetworks), both
+// the htmx fragment route and the ?tab=hardware full-page route still render
+// the Hardware tab's devices correctly.
+func TestHandler_HardwareTab_RendersWithoutNetworksFetch(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{Devices: []*pb.HardwareDevice{
+		{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{Target: "vdb", Bus: "virtio"}}},
+	}}
+	s := newTestUIServer(t, mock)
+
+	if body := doGET(t, s, "/ui/vms/vm1/tab/hardware"); !strings.Contains(body, "vdb") {
+		t.Error("hardware fragment route must still render devices with Networks gone")
+	}
+	if body := doGET(t, s, "/vms/vm1?tab=hardware"); !strings.Contains(body, "vdb") {
+		t.Error("?tab=hardware full-page route must still render devices with Networks gone")
+	}
+}
+
 func TestHandler_VMsTable(t *testing.T) {
 	s := newTestUIServer(t, newDefaultMock())
 	r := withAuth(mustReq(t, "GET", "/ui/vms-table"))
@@ -621,6 +641,19 @@ func TestHandler_AddDiskModal_PrefillsNextName(t *testing.T) {
 	}
 }
 
+// TestHandler_AddDiskModal_NilDB_NoPanic verifies handleAddDiskModal guards
+// s.db before resolving the VM's host via corrosion.GetVM — corrosion.Client.Query
+// panics on a nil receiver, so a server with no Corrosion DB wired in (s.db ==
+// nil) must still render the modal instead of crashing the request.
+func TestHandler_AddDiskModal_NilDB_NoPanic(t *testing.T) {
+	mock := newDefaultMock()
+	s := newTestUIServer(t, mock) // no SetCorrosionDB call — s.db stays nil
+	body := doGET(t, s, "/ui/vms/vm-a/add-disk-modal")
+	if !strings.Contains(body, "add-disk-modal") {
+		t.Error("Add-disk modal must render even without a corrosion DB wired in")
+	}
+}
+
 // TestHandler_AttachDisk_PassesStoragePool verifies the operator's chosen
 // storage pool (from the Add-disk modal's pool dropdown) reaches the
 // AttachDevice RPC's DiskSpec, alongside the existing name/size/bus fields.
@@ -831,6 +864,33 @@ func TestHandler_AddPCIModal_GroupsUnownedByType(t *testing.T) {
 	}
 	if !strings.Contains(body, "<optgroup label=\"GPU\"") {
 		t.Error("devices must be grouped by class")
+	}
+}
+
+// TestHandler_AddPCIModal_NoDevices_EmptyState verifies that when a host has
+// no unassigned passthrough devices in any of the four ByType groups (GPU/
+// NIC/NVMe/Other), the scanned block renders explanatory copy instead of an
+// empty <select> the operator could submit with nothing chosen (spec §5).
+func TestHandler_AddPCIModal_NoDevices_EmptyState(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	seedVM(t, s.db, "vm-a", "host-1")
+	m.listHostDevicesResp = &pb.ListHostDevicesResponse{} // no scanned devices at all
+	body := doGET(t, s, "/ui/vms/vm-a/add-pci-modal")
+	if !strings.Contains(body, "No unassigned passthrough devices on this host.") {
+		t.Error("empty scanned devices must render the no-devices copy, not an empty select")
+	}
+}
+
+// TestHandler_AddPCIModal_NoMappings_RadioDisabled verifies that when no
+// cluster-wide resource mappings exist, the "Resource mapping" radio is
+// disabled so an operator can't select an option with nothing behind it
+// (spec §5: shown/enabled only when mappings exist; scanned stays default).
+func TestHandler_AddPCIModal_NoMappings_RadioDisabled(t *testing.T) {
+	s, _ := newHardwareTestServer(t)
+	seedVM(t, s.db, "vm-a", "host-1") // ListResourceMappings mock default is empty
+	body := doGET(t, s, "/ui/vms/vm-a/add-pci-modal")
+	if !strings.Contains(body, `value="mapping" onclick="pciMode()" disabled`) {
+		t.Error(`the "Resource mapping" radio must be disabled when no mappings exist`)
 	}
 }
 

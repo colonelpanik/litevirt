@@ -1152,17 +1152,46 @@ func (s *Server) handleDetachDisk(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleAddNICModal renders the "Add network interface" modal: a
+// managed-network/custom-bridge toggle populated from ListNetworks, plus the
+// security groups available to attach and optional static IP/gateway
+// fields. A failed or empty security-group read renders no SG control
+// (fail-safe — never blocks attaching a NIC).
+func (s *Server) handleAddNICModal(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ctx := s.uiBearerCtx(r)
+	nets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	var sgs []string
+	if s.db != nil {
+		if groups, err := corrosion.ListSecurityGroups(ctx, s.db, ""); err == nil {
+			for _, g := range groups {
+				sgs = append(sgs, g.Name)
+			}
+		}
+	}
+	s.renderFragment(w, "add_nic_modal.html", map[string]any{
+		"VMName": name, "Networks": nets.GetNetworks(), "SecurityGroups": sgs,
+	})
+}
+
 func (s *Server) handleAttachNIC(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", 400)
 		return
 	}
+	bridge := r.FormValue("bridge")
+	if r.FormValue("mode") == "custom" {
+		bridge = r.FormValue("bridge_custom")
+	}
 	_, err := s.grpc.AttachDevice(s.uiBearerCtx(r), &pb.AttachDeviceRequest{
 		VmName: name,
 		Nic: &pb.NetworkAttachment{
-			Name:  r.FormValue("bridge"),
-			Model: r.FormValue("model"),
+			Name:           bridge,
+			Model:          r.FormValue("model"),
+			Ip:             r.FormValue("ip"),
+			Gateway:        r.FormValue("gateway"),
+			SecurityGroups: r.Form["security_groups"],
 		},
 	})
 	if err != nil {

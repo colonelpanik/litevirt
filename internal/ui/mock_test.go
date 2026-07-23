@@ -1200,6 +1200,13 @@ func doPOSTForm(t *testing.T, s *Server, path string, form url.Values) *httptest
 	return serveRequest(s, withAuth(r))
 }
 
+// doGET issues an authenticated GET through the server's handler and returns
+// the response body as a string.
+func doGET(t *testing.T, s *Server, path string) string {
+	t.Helper()
+	return serveRequest(s, withAuth(mustReq(t, "GET", path))).Body.String()
+}
+
 // errorf is a helper for tests that need a formatted error.
 var errSimulated = fmt.Errorf("simulated error")
 

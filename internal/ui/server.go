@@ -470,6 +470,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/vms/{name}/attach-disk", s.requireAuthFunc(s.handleAttachDisk))
 	mux.HandleFunc("POST /ui/vms/{name}/resize-disk", s.requireAuthFunc(s.handleResizeDisk))
 	mux.HandleFunc("POST /ui/vms/{name}/detach-disk", s.requireAuthFunc(s.handleDetachDisk))
+	mux.HandleFunc("GET /ui/vms/{name}/add-nic-modal", s.requireAuthFunc(s.handleAddNICModal))
 	mux.HandleFunc("POST /ui/vms/{name}/attach-nic", s.requireAuthFunc(s.handleAttachNIC))
 	mux.HandleFunc("POST /ui/vms/{name}/detach-nic", s.requireAuthFunc(s.handleDetachNIC))
 	mux.HandleFunc("POST /ui/vms/{name}/attach-pci", s.requireAuthFunc(s.handleAttachPCI))

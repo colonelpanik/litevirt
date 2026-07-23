@@ -1,0 +1,52 @@
+<div class="modal-overlay" id="add-nic-modal">
+  <div class="modal form-modal">
+    <form hx-post="/ui/vms/{{.VMName}}/attach-nic" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('add-nic-modal').remove();htmx.ajax('GET','/ui/vms/{{.VMName}}/tab/hardware',{target:'#vm-hardware-tab-region',swap:'innerHTML'})}">
+      <div class="fm-head"><h3>Add network interface</h3>
+        <button type="button" class="fm-x" aria-label="Close" onclick="document.getElementById('add-nic-modal').remove()">&times;</button></div>
+      <div class="fm-body">
+        <div class="fm-group" style="margin-top:0;padding-top:0;border-top:none">Connection</div>
+        <div class="form-row" style="margin-bottom:8px">
+          <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;margin-right:16px"><input type="radio" name="mode" value="managed" checked onclick="nicMode()"> Network</label>
+          <label style="display:inline-flex;gap:6px;align-items:center;font-weight:400"><input type="radio" name="mode" value="custom" onclick="nicMode()"> Custom bridge</label>
+        </div>
+        <div class="form-row" id="nic-managed"><label>Network</label>
+          <select name="bridge">
+            <option value="" disabled selected>Select a network…</option>
+            {{range .Networks}}<option value="{{.Name}}">{{.Name}}{{if .Type}} — {{.Type}}{{end}}{{if .Subnet}} · {{.Subnet}}{{end}}{{if .Dhcp}} · DHCP{{end}}</option>{{end}}
+          </select></div>
+        <div class="form-row" id="nic-custom" style="display:none"><label>Bridge name</label>
+          <input type="text" name="bridge_custom" placeholder="br0" disabled><div class="pick-cap">Plugs into a host bridge that isn't a managed network.</div></div>
+        <div class="field-grid" style="margin-top:12px">
+          <div class="form-row" style="margin-bottom:0"><label>Model</label>
+            <select name="model"><option value="virtio">virtio</option><option value="e1000">e1000</option><option value="rtl8139">rtl8139</option></select></div>
+          <div class="form-row" style="margin-bottom:0"></div>
+        </div>
+        <div class="fm-group">Security &amp; addressing</div>
+        {{if .SecurityGroups}}
+        <div class="form-row"><label>Security groups</label>
+          <select name="security_groups" multiple size="4">{{range .SecurityGroups}}<option value="{{.}}">{{.}}</option>{{end}}</select></div>
+        {{end}}
+        <div class="field-grid">
+          <div class="form-row" style="margin-bottom:0"><label>Static IP (optional)</label><input type="text" name="ip" placeholder="leave blank for DHCP"></div>
+          <div class="form-row" style="margin-bottom:0"><label>Gateway (optional)</label><input type="text" name="gateway"></div>
+        </div>
+      </div>
+      <div class="fm-foot"><span class="hint">Blank IP uses the network's managed addressing / DHCP.</span>
+        <div class="fm-actions">
+          <button type="button" class="btn" onclick="document.getElementById('add-nic-modal').remove()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Attach</button>
+        </div></div>
+    </form>
+  </div>
+</div>
+<script>
+function nicMode(){
+  var custom = document.querySelector('#add-nic-modal input[name=mode][value=custom]').checked;
+  document.getElementById('nic-managed').style.display = custom ? 'none' : '';
+  document.getElementById('nic-custom').style.display  = custom ? '' : 'none';
+  document.querySelector('#nic-managed select').disabled = custom;
+  document.querySelector('#nic-custom input').disabled = !custom;
+}
+nicMode();
+</script>

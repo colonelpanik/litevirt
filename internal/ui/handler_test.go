@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"html/template"
 	"net/http"
 	"net/url"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // ── Cluster ──────────────────────────────────────────────────────────────────
@@ -692,6 +694,63 @@ func TestHandler_AttachNIC(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	if mock.lastAttachDeviceReq == nil {
 		t.Fatal("AttachDevice (NIC) was not called")
+	}
+}
+
+// newHardwareTestServer creates a UI test server with a corrosion test DB
+// wired in and two security groups seeded ("web", "ssh"), for the Add-NIC
+// modal tests below — the SG multiselect renders nothing without a DB.
+func newHardwareTestServer(t *testing.T) (*Server, *mockGRPC) {
+	t.Helper()
+	mock := newDefaultMock()
+	s := newTestUIServer(t, mock)
+	db := newCorrosionForUITest(t)
+	s.SetCorrosionDB(db)
+	for _, name := range []string{"web", "ssh"} {
+		if err := corrosion.InsertSecurityGroup(context.Background(), db, corrosion.SecurityGroup{ID: name, Name: name}); err != nil {
+			t.Fatalf("InsertSecurityGroup(%s): %v", name, err)
+		}
+	}
+	return s, mock
+}
+
+// TestHandler_AddNICModal_RelabelsNetwork verifies the Add-NIC modal offers a
+// managed-network / custom-bridge toggle, labels the managed field "Network"
+// (never "Bridge" — the field can point at any managed network, not just an
+// L2 bridge), lists the security groups available to attach, and populates
+// the network dropdown from ListNetworks.
+func TestHandler_AddNICModal_RelabelsNetwork(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	m.listNetworksResp = &pb.ListNetworksResponse{Networks: []*pb.NetworkInfo{{Name: "lab-net", Type: "bridge", Subnet: "10.20.0.0/24", Dhcp: true}}}
+	body := doGET(t, s, "/ui/vms/vm-a/add-nic-modal")
+	for _, want := range []string{"Network", "Custom bridge", "Security groups", `name="mode"`, "lab-net"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("Add-NIC modal missing %q", want)
+		}
+	}
+	if strings.Contains(body, ">Bridge<") {
+		t.Error(`the managed-network field must be labeled "Network", not "Bridge"`)
+	}
+}
+
+// TestHandler_AttachNIC_CustomBridgeAndSGs verifies the custom-bridge mode
+// (bridge_custom overrides the managed "bridge" field) and the security
+// groups / static IP / gateway fields all reach the AttachDevice RPC's
+// NetworkAttachment.
+func TestHandler_AttachNIC_CustomBridgeAndSGs(t *testing.T) {
+	s, m := newHardwareTestServer(t)
+	form := url.Values{"mode": {"custom"}, "bridge_custom": {"br0"}, "model": {"virtio"},
+		"security_groups": {"web", "ssh"}, "ip": {"10.20.0.5"}, "gateway": {"10.20.0.1"}}
+	doPOSTForm(t, s, "/ui/vms/vm-a/attach-nic", form)
+	nic := m.lastAttachDeviceReq.GetNic()
+	if nic.GetName() != "br0" {
+		t.Errorf("Name = %q, want br0 (custom bridge)", nic.GetName())
+	}
+	if strings.Join(nic.GetSecurityGroups(), ",") != "web,ssh" {
+		t.Errorf("SecurityGroups = %v, want [web ssh]", nic.GetSecurityGroups())
+	}
+	if nic.GetIp() != "10.20.0.5" || nic.GetGateway() != "10.20.0.1" {
+		t.Errorf("static IP/gw not passed: ip=%q gw=%q", nic.GetIp(), nic.GetGateway())
 	}
 }
 

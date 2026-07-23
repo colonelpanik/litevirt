@@ -51,12 +51,7 @@ func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 	if tab == "hardware" {
 		if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
 			networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
-			data["HardwareTab"] = s.renderHardwareTabFragment(map[string]any{
-				"VM": name, "Devices": hw.GetDevices(),
-				"AdoptionState": hw.GetHardwareAdoptionState(),
-				"AdoptionError": hw.GetHardwareAdoptionError(),
-				"Networks":      networks.GetNetworks(),
-			})
+			data["HardwareTab"] = s.renderHardwareTabFragment(hardwareTabData(name, hw, networks.GetNetworks()))
 		}
 	}
 	s.renderPage(w, "vm_detail.html", data)
@@ -101,11 +96,12 @@ func (s *Server) handleVMDetailPartial(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleVMHardwareTab renders the Hardware tab fragment: the typed disk/NIC/PCI
-// device table from ListVMHardware, plus per-type add forms and
-// per-row detach controls that POST to the existing attach/detach handlers.
-// When the VM's PCI adoption state is "blocked", the template renders a
-// banner with the reason and omits the mutation forms instead.
+// handleVMHardwareTab renders the Hardware tab fragment: per-section (disk/
+// NIC/PCI) tables from ListVMHardware, each with its own empty state and
+// header Add action, plus per-row detach controls that POST to the existing
+// detach handlers. When the VM's PCI adoption state is "blocked", the
+// template renders a banner with the reason and omits the mutation controls
+// instead.
 func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	ctx := s.uiBearerCtx(r)
@@ -114,14 +110,30 @@ func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "VM not found", 404)
 		return
 	}
-	networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
-	s.renderFragment(w, "hardware_tab.html", map[string]any{
-		"VM":            name,
-		"Devices":       resp.GetDevices(),
+	nets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	s.renderFragment(w, "hardware_tab.html", hardwareTabData(name, resp, nets.GetNetworks()))
+}
+
+// hardwareTabData partitions a VM's hardware devices into per-section slices so the
+// Hardware tab can render each section (and its empty state) independently.
+func hardwareTabData(name string, resp *pb.ListVMHardwareResponse, nets []*pb.NetworkInfo) map[string]any {
+	var disks, nics, pcis []*pb.HardwareDevice
+	for _, d := range resp.GetDevices() {
+		switch {
+		case d.GetDisk() != nil:
+			disks = append(disks, d)
+		case d.GetNic() != nil:
+			nics = append(nics, d)
+		case d.GetPci() != nil:
+			pcis = append(pcis, d)
+		}
+	}
+	return map[string]any{
+		"VM": name, "Disks": disks, "Nics": nics, "Pcis": pcis,
 		"AdoptionState": resp.GetHardwareAdoptionState(),
 		"AdoptionError": resp.GetHardwareAdoptionError(),
-		"Networks":      networks.GetNetworks(),
-	})
+		"Networks":      nets,
+	}
 }
 
 // handleVMPagePartial renders header + detail (for action button responses).

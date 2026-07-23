@@ -111,8 +111,8 @@ func TestHandler_HardwareTab_BlockedBanner(t *testing.T) {
 
 // TestHandler_HardwareTab_AddFormsWhenAdopted asserts the converse of the
 // blocked-banner test: once adoption is resolved (or was never gated), the
-// tab renders the add/detach forms that mutate hardware via the existing
-// attach/detach handlers.
+// tab renders the section-header Add buttons (hx-get modal routes) and the
+// per-row detach forms that mutate hardware via the existing detach handlers.
 func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
 	mock := newDefaultMock()
 	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
@@ -135,9 +135,9 @@ func TestHandler_HardwareTab_AddFormsWhenAdopted(t *testing.T) {
 	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
 	w := serveRequest(s, r)
 	assertStatus(t, w, http.StatusOK)
-	assertContains(t, w, "attach-disk")
-	assertContains(t, w, "attach-nic")
-	assertContains(t, w, "attach-pci")
+	assertContains(t, w, "add-disk-modal")
+	assertContains(t, w, "add-nic-modal")
+	assertContains(t, w, "add-pci-modal")
 	assertContains(t, w, "detach-disk")
 	assertContains(t, w, "detach-nic")
 	assertContains(t, w, "detach-pci")
@@ -204,24 +204,74 @@ func TestHandler_HardwareTab_IOMMUGroupSingleDetach(t *testing.T) {
 	}
 }
 
-// TestHandler_HardwareTab_NICDropdown verifies the fix for the NIC-dropdown
-// parity gap: now that the edit modal's Network pane is
-// retired, the tab's own NIC-attach form must offer the same networks
-// dropdown the modal used to (not a free-text bridge input).
-func TestHandler_HardwareTab_NICDropdown(t *testing.T) {
+// TestHandler_HardwareTab_HeaderActionsAndRowResize verifies the redesigned
+// tab layout: Add actions live in the section headers (hx-get to the modal
+// routes added by a later task), disk rows carry a Resize action, and PCI
+// rows carry a device-class chip. It also verifies the old inline attach-pci
+// form (free-text address input) is gone now that attach is modal-driven.
+func TestHandler_HardwareTab_HeaderActionsAndRowResize(t *testing.T) {
 	mock := newDefaultMock()
 	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{
 		HardwareAdoptionState: "adopted",
-	}
-	mock.listNetworksResp = &pb.ListNetworksResponse{
-		Networks: []*pb.NetworkInfo{{Name: "lan0"}},
+		Devices: []*pb.HardwareDevice{
+			{Device: &pb.HardwareDevice_Disk{Disk: &pb.HardwareDisk{DeviceId: "vda", Target: "vda", Bus: "virtio", SizeBytes: 32212254720, StorageType: "local", State: "attached"}}},
+			{Device: &pb.HardwareDevice_Pci{Pci: &pb.HardwarePCI{DeviceId: "gpu0", SelectorKind: "address", State: "attached",
+				Desired: &pb.DeviceSpec{Type: "gpu"}, Members: []*pb.HardwarePCIMember{{ResolvedAddress: "0000:41:00.0", XmlAlias: "ua-gpu-0"}}}}},
+		},
 	}
 	s := newTestUIServer(t, mock)
-	r := withAuth(mustReq(t, "GET", "/ui/vms/vm1/tab/hardware"))
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm-a/tab/hardware"))
 	w := serveRequest(s, r)
 	assertStatus(t, w, http.StatusOK)
-	assertContains(t, w, `<select name="bridge"`)
-	assertContains(t, w, `>lan0<`)
+	body := w.Body.String()
+	// Add actions live in the section headers, hx-get the modal routes.
+	for _, want := range []string{
+		`hx-get="/ui/vms/vm-a/add-disk-modal"`,
+		`hx-get="/ui/vms/vm-a/add-nic-modal"`,
+		`hx-get="/ui/vms/vm-a/add-pci-modal"`,
+		`+ Add disk`, `+ Add NIC`, `+ Add PCI device`,
+		`resize-disk-modal?disk=vda`, // disk row Resize action
+		`dev-chip dev-gpu`,           // PCI row device-class chip
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("hardware tab missing %q", want)
+		}
+	}
+	// The old inline add-forms are gone.
+	if strings.Contains(body, `hx-post="/ui/vms/vm-a/attach-pci"`) && strings.Contains(body, `placeholder="0000:41:00.0"`) {
+		t.Error("old inline PCI attach form should be removed (now a modal)")
+	}
+}
+
+// TestHandler_HardwareTab_EmptyPCIShowsEmptyState verifies an empty PCI
+// section renders the shared .empty-state invitation (with its own Add
+// button), not a flat catch-all sentence.
+func TestHandler_HardwareTab_EmptyPCIShowsEmptyState(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listVMHardwareResp = &pb.ListVMHardwareResponse{HardwareAdoptionState: "adopted"} // no devices
+	s := newTestUIServer(t, mock)
+	r := withAuth(mustReq(t, "GET", "/ui/vms/vm-a/tab/hardware"))
+	w := serveRequest(s, r)
+	assertStatus(t, w, http.StatusOK)
+	body := w.Body.String()
+	if !strings.Contains(body, "empty-state") || !strings.Contains(body, "No passthrough devices attached") {
+		t.Error("empty PCI section must render the .empty-state invitation, not a flat sentence")
+	}
+	if strings.Contains(body, "No hardware devices recorded") {
+		t.Error("the old catch-all empty block should be removed")
+	}
+}
+
+// TestDevChip verifies the devChip funcMap helper maps each known PCI
+// DeviceSpec.type value to its chip class + label, with an "other" fallback
+// for anything unrecognized (including the empty string).
+func TestDevChip(t *testing.T) {
+	cases := map[string]string{"gpu": "dev-gpu\">GPU", "network": "dev-nic\">NIC", "nvme": "dev-nvme\">NVMe", "": "dev-other\">PCI"}
+	for in, want := range cases {
+		if got := string(devChip(in)); !strings.Contains(got, want) {
+			t.Errorf("devChip(%q)=%q, want substring %q", in, got, want)
+		}
+	}
 }
 
 // TestHandler_VMDetail_TabHardware covers the ?tab=hardware full-page load —

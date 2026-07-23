@@ -114,6 +114,7 @@ func NewServer(client pb.LiteVirtClient, clusterName string) (*Server, error) {
 			return int(used * 100 / total)
 		},
 		"driverBadge": driverBadge,
+		"devChip":     devChip,
 		"icon":        iconHelper,
 		"relTime":     relTimeHelper,
 		"humanCron":   humanCronHelper,
@@ -636,6 +637,21 @@ func driverBadge(driver string) template.HTML {
 	default:
 		return `<span class="badge badge-gray">local</span>`
 	}
+}
+
+// devChip renders a device-class chip for a PCI DeviceSpec.type value. Fixed enum
+// input (no user data) → safe to emit as template.HTML.
+func devChip(pciType string) template.HTML {
+	cls, label := "dev-other", "PCI"
+	switch pciType {
+	case "gpu":
+		cls, label = "dev-gpu", "GPU"
+	case "network":
+		cls, label = "dev-nic", "NIC"
+	case "nvme":
+		cls, label = "dev-nvme", "NVMe"
+	}
+	return template.HTML(`<span class="dev-chip ` + cls + `">` + label + `</span>`)
 }
 
 func firstIP(ifaces []*pb.VMInterface) string {

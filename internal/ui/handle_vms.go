@@ -72,9 +72,11 @@ func (s *Server) handleNewVMModal(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
 	images, _ := s.grpc.ListImages(ctx, &emptypb.Empty{})
 	hosts, _ := s.grpc.ListHosts(ctx, &pb.ListHostsRequest{})
+	nets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
 	s.renderFragment(w, "vm_new_modal.html", map[string]any{
-		"Images": images.GetImages(),
-		"Hosts":  hosts.GetHosts(),
+		"Images":   images.GetImages(),
+		"Hosts":    hosts.GetHosts(),
+		"Networks": nets.GetNetworks(),
 	})
 }
 
@@ -226,20 +228,39 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 		spec.CloudInit = &pb.CloudInitSpec{Userdata: ci}
 	}
 
-	// Networks — parallel arrays net_bridge[] and net_model[].
+	// Networks — one row per NIC, submitted as index-aligned parallel arrays.
+	// Iterate net_bridge[] and read the rest defensively: a stale/legacy modal
+	// submits only net_bridge[]/net_model[], so a missing secondary array (or a
+	// short one) must default to "" rather than panic. This keeps a cached old
+	// form working against the new handler during a rolling upgrade.
 	bridges := r.Form["net_bridge[]"]
+	customs := r.Form["net_bridge_custom[]"]
 	models := r.Form["net_model[]"]
-	for i, br := range bridges {
-		if br == "" {
+	ips := r.Form["net_ip[]"]
+	gateways := r.Form["net_gateway[]"]
+	at := func(a []string, i int) string {
+		if i < len(a) {
+			return a[i]
+		}
+		return ""
+	}
+	for i := range bridges {
+		bridge := strings.TrimSpace(at(bridges, i))
+		if bridge == "__custom__" {
+			bridge = strings.TrimSpace(at(customs, i))
+		}
+		if bridge == "" {
 			continue
 		}
 		model := "virtio"
-		if i < len(models) && models[i] != "" {
-			model = models[i]
+		if m := at(models, i); m != "" {
+			model = m
 		}
 		spec.Network = append(spec.Network, &pb.NetworkAttachment{
-			Name:  br,
-			Model: model,
+			Name:    bridge,
+			Model:   model,
+			Ip:      strings.TrimSpace(at(ips, i)),
+			Gateway: strings.TrimSpace(at(gateways, i)),
 		})
 	}
 
@@ -1189,7 +1210,6 @@ func (s *Server) handleAttachNIC(w http.ResponseWriter, r *http.Request) {
 			Name:           bridge,
 			Model:          r.FormValue("model"),
 			Ip:             r.FormValue("ip"),
-			Gateway:        r.FormValue("gateway"),
 			SecurityGroups: r.Form["security_groups"],
 		},
 	})

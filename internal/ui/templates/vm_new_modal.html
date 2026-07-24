@@ -202,22 +202,48 @@
         <!-- NETWORK & DEVICES -->
         <div class="tab-pane" data-pane="net" hidden>
           <div class="fm-group">Networks</div>
-          <div id="network-list">
-            <div class="network-row grid-2" style="gap:8px;margin-bottom:8px">
-              <div class="form-row" style="margin-bottom:0">
-                <label style="font-size:12px">Bridge</label>
-                <input type="text" name="net_bridge[]" value="virbr0" placeholder="virbr0">
+          <div id="network-list"></div>
+          <button type="button" class="btn btn-sm" onclick="addNetworkRow()">+ Add Network</button>
+          <p class="hint" style="margin-top:8px">Static IP is applied at first boot by cloud-init-capable images. Leave blank for DHCP or guest-managed addressing.</p>
+
+          <!-- One complete NIC row. Both the initial row and every "+ Add Network"
+               clone this template, so removing the last row never leaves nothing to
+               clone from. Controls stay enabled + present so the five parallel
+               arrays (net_bridge[], net_bridge_custom[], net_model[], net_ip[],
+               net_gateway[]) submit index-aligned. -->
+          <template id="network-row-tpl">
+            <div class="network-row" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">
+              <div style="display:flex;gap:8px;align-items:flex-end">
+                <div class="form-row" style="margin-bottom:0;flex:1">
+                  <label style="font-size:12px">Network</label>
+                  <select name="net_bridge[]" onchange="netRowMode(this)">
+                    <option value="" selected>Select a network…</option>
+                    {{range .Networks}}<option value="{{.Name}}">{{.Name}}{{if .Type}} — {{.Type}}{{end}}{{if .Subnet}} · {{.Subnet}}{{end}}{{if .Dhcp}} · DHCP{{end}}</option>{{end}}
+                    <option value="__custom__">Custom bridge…</option>
+                  </select>
+                </div>
+                <button type="button" class="btn btn-sm" style="flex:none" onclick="this.closest('.network-row').remove()" aria-label="Remove network" title="Remove network">&times;</button>
               </div>
-              <div class="form-row" style="margin-bottom:0">
-                <label style="font-size:12px">Model</label>
-                <select name="net_model[]">
-                  <option value="virtio" selected>virtio</option>
-                  <option value="e1000">e1000</option>
-                </select>
+              <input type="text" name="net_bridge_custom[]" placeholder="br0 (custom host bridge)" style="display:none;margin-top:8px;width:100%">
+              <div class="field-grid" style="margin-top:8px">
+                <div class="form-row" style="margin-bottom:0">
+                  <label style="font-size:12px">Model</label>
+                  <select name="net_model[]"><option value="virtio" selected>virtio</option><option value="e1000">e1000</option></select>
+                </div>
+                <div class="form-row" style="margin-bottom:0">
+                  <label style="font-size:12px">Static IP <span style="color:var(--muted)">(optional)</span></label>
+                  <input type="text" name="net_ip[]" placeholder="e.g. 10.0.1.50">
+                </div>
+              </div>
+              <div class="field-grid" style="margin-top:8px">
+                <div class="form-row" style="margin-bottom:0">
+                  <label style="font-size:12px">Gateway <span style="color:var(--muted)">(optional)</span></label>
+                  <input type="text" name="net_gateway[]">
+                </div>
+                <div class="form-row" style="margin-bottom:0"></div>
               </div>
             </div>
-          </div>
-          <button type="button" class="btn btn-sm" onclick="addNetworkRow()">+ Add Network</button>
+          </template>
 
           <div class="fm-group">PCI Devices</div>
           <div id="device-list"></div>
@@ -284,12 +310,17 @@ function markCustomProfile() {
 }
 
 function addNetworkRow() {
-  var row = document.createElement('div');
-  row.className = 'network-row grid-2';
-  row.style.cssText = 'gap:8px;margin-bottom:8px';
-  row.innerHTML = '<div class="form-row" style="margin-bottom:0"><label style="font-size:12px">Bridge</label><input type="text" name="net_bridge[]" placeholder="br-name"></div>' +
-    '<div class="form-row" style="margin-bottom:0"><label style="font-size:12px">Model</label><select name="net_model[]"><option value="virtio" selected>virtio</option><option value="e1000">e1000</option></select></div>';
-  document.getElementById('network-list').appendChild(row);
+  var tpl = document.getElementById('network-row-tpl');
+  document.getElementById('network-list').appendChild(tpl.content.cloneNode(true));
+}
+
+// Row-scoped: show the custom-bridge input only when this row's select is on
+// "Custom bridge…". Scoped via closest('.network-row') so it works for any row
+// (no element IDs — rows repeat).
+function netRowMode(sel) {
+  var row = sel.closest('.network-row');
+  var custom = row.querySelector('input[name="net_bridge_custom[]"]');
+  if (custom) custom.style.display = (sel.value === '__custom__') ? '' : 'none';
 }
 
 function addDeviceRow(presetType) {
@@ -351,4 +382,7 @@ function hostChanged() {
     if (typeSel) reloadDeviceAddresses(typeSel);
   });
 }
+
+// Seed the first NIC row on load (from the same template "+ Add Network" uses).
+addNetworkRow();
 </script>

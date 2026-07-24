@@ -346,6 +346,103 @@ func TestHandler_CreateVM(t *testing.T) {
 	}
 }
 
+// TestHandler_NewVMModal_NetworkPicker verifies the create modal offers a
+// network picker populated from ListNetworks plus a static IP + gateway field,
+// no longer defaults the NIC to the NAT bridge (virbr0), and states the
+// cloud-init dependency for static addressing.
+func TestHandler_NewVMModal_NetworkPicker(t *testing.T) {
+	m := newDefaultMock()
+	m.listNetworksResp = &pb.ListNetworksResponse{Networks: []*pb.NetworkInfo{{Name: "lab-net", Type: "bridge", Subnet: "10.20.0.0/24", Dhcp: true}}}
+	s := newTestUIServer(t, m)
+	body := doGET(t, s, "/ui/vms/new-modal")
+	for _, want := range []string{
+		"lab-net", "Select a network", `name="net_ip[]"`, `name="net_gateway[]"`, `name="net_bridge_custom[]"`,
+		"Static IP is applied at first boot by cloud-init-capable images. Leave blank for DHCP or guest-managed addressing.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("New-VM modal missing %q", want)
+		}
+	}
+	if strings.Contains(body, `value="virbr0"`) {
+		t.Error("create modal must not default the NIC to the NAT bridge virbr0")
+	}
+}
+
+// TestHandler_CreateVM_StaticIPRows verifies the repeating network rows map to
+// NetworkAttachments in order — a managed row, an untouched empty placeholder
+// row (yields no attachment and does not shift indices), and a custom-bridge
+// row — each keeping its own IP/gateway.
+func TestHandler_CreateVM_StaticIPRows(t *testing.T) {
+	m := newDefaultMock()
+	s := newTestUIServer(t, m)
+	form := url.Values{
+		"name": {"net-vm"}, "image": {"ubuntu"}, "cpu": {"2"}, "memory": {"2048"},
+		"net_bridge[]":        {"lan", "", "__custom__"},
+		"net_bridge_custom[]": {"", "", "br5"},
+		"net_model[]":         {"virtio", "virtio", "e1000"},
+		"net_ip[]":            {"10.0.1.50", "", "10.0.2.9"},
+		"net_gateway[]":       {"10.0.1.1", "", "10.0.2.1"},
+	}
+	doPOSTForm(t, s, "/ui/vms", form)
+	if m.lastCreateVMReq == nil {
+		t.Fatal("CreateVM was not called")
+	}
+	nets := m.lastCreateVMReq.Spec.Network
+	if len(nets) != 2 {
+		t.Fatalf("Network len = %d, want 2 (empty middle row skipped)", len(nets))
+	}
+	if n := nets[0]; n.Name != "lan" || n.Model != "virtio" || n.Ip != "10.0.1.50" || n.Gateway != "10.0.1.1" {
+		t.Errorf("row0 = %+v, want lan/virtio/10.0.1.50/10.0.1.1", n)
+	}
+	if n := nets[1]; n.Name != "br5" || n.Model != "e1000" || n.Ip != "10.0.2.9" || n.Gateway != "10.0.2.1" {
+		t.Errorf("row1 = %+v, want br5/e1000/10.0.2.9/10.0.2.1", n)
+	}
+}
+
+// TestHandler_CreateVM_LegacyNetworkForm verifies a stale/old modal submitting
+// only net_bridge[]+net_model[] (no IP/gateway/custom arrays) still creates a VM
+// without panicking — the bounds-safe secondary-array reads matter mid rolling
+// upgrade when a cached form hits the new handler.
+func TestHandler_CreateVM_LegacyNetworkForm(t *testing.T) {
+	m := newDefaultMock()
+	s := newTestUIServer(t, m)
+	form := url.Values{
+		"name": {"legacy-vm"}, "image": {"ubuntu"}, "cpu": {"1"}, "memory": {"1024"},
+		"net_bridge[]": {"br0"}, "net_model[]": {"virtio"},
+	}
+	doPOSTForm(t, s, "/ui/vms", form)
+	if m.lastCreateVMReq == nil {
+		t.Fatal("CreateVM was not called")
+	}
+	nets := m.lastCreateVMReq.Spec.Network
+	if len(nets) != 1 || nets[0].Name != "br0" || nets[0].Model != "virtio" {
+		t.Fatalf("Network = %+v, want one {br0, virtio}", nets)
+	}
+	if nets[0].Ip != "" || nets[0].Gateway != "" {
+		t.Errorf("legacy form must leave IP/gateway empty, got ip=%q gw=%q", nets[0].Ip, nets[0].Gateway)
+	}
+}
+
+// TestHandler_CreateVM_NetworkTrimsWhitespace verifies bridge/IP/gateway values
+// are trimmed before reaching the NetworkAttachment.
+func TestHandler_CreateVM_NetworkTrimsWhitespace(t *testing.T) {
+	m := newDefaultMock()
+	s := newTestUIServer(t, m)
+	form := url.Values{
+		"name": {"trim-vm"}, "image": {"ubuntu"}, "cpu": {"1"}, "memory": {"1024"},
+		"net_bridge[]": {"  lan  "}, "net_model[]": {"virtio"},
+		"net_ip[]": {"  10.0.1.5  "}, "net_gateway[]": {" 10.0.1.1 "},
+	}
+	doPOSTForm(t, s, "/ui/vms", form)
+	nets := m.lastCreateVMReq.Spec.Network
+	if len(nets) != 1 {
+		t.Fatalf("Network len = %d, want 1", len(nets))
+	}
+	if nets[0].Name != "lan" || nets[0].Ip != "10.0.1.5" || nets[0].Gateway != "10.0.1.1" {
+		t.Errorf("not trimmed: %+v", nets[0])
+	}
+}
+
 func TestHandler_CreateVM_WithResourceTuning(t *testing.T) {
 	mock := newDefaultMock()
 	s := newTestUIServer(t, mock)
@@ -768,7 +865,8 @@ func TestHandler_AddNICModal_RelabelsNetwork(t *testing.T) {
 	s, m := newHardwareTestServer(t)
 	m.listNetworksResp = &pb.ListNetworksResponse{Networks: []*pb.NetworkInfo{{Name: "lab-net", Type: "bridge", Subnet: "10.20.0.0/24", Dhcp: true}}}
 	body := doGET(t, s, "/ui/vms/vm-a/add-nic-modal")
-	for _, want := range []string{"Network", "Custom bridge", "Security groups", `name="mode"`, "lab-net"} {
+	for _, want := range []string{"Network", "Custom bridge", "Security groups", `name="mode"`, "lab-net",
+		"Recorded IP", "does not configure the guest"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("Add-NIC modal missing %q", want)
 		}
@@ -776,12 +874,16 @@ func TestHandler_AddNICModal_RelabelsNetwork(t *testing.T) {
 	if strings.Contains(body, ">Bridge<") {
 		t.Error(`the managed-network field must be labeled "Network", not "Bridge"`)
 	}
+	if strings.Contains(body, `name="gateway"`) {
+		t.Error("Add-NIC modal must not offer a Gateway field — hot-attach does not apply it")
+	}
 }
 
 // TestHandler_AttachNIC_CustomBridgeAndSGs verifies the custom-bridge mode
-// (bridge_custom overrides the managed "bridge" field) and the security
-// groups / static IP / gateway fields all reach the AttachDevice RPC's
-// NetworkAttachment.
+// (bridge_custom overrides the managed "bridge" field), the security groups and
+// the recorded IP reach the AttachDevice RPC's NetworkAttachment — and that a
+// stray gateway value is ignored (hot-attach does not apply a gateway, so the
+// modal field was removed).
 func TestHandler_AttachNIC_CustomBridgeAndSGs(t *testing.T) {
 	s, m := newHardwareTestServer(t)
 	form := url.Values{"mode": {"custom"}, "bridge_custom": {"br0"}, "model": {"virtio"},
@@ -794,8 +896,11 @@ func TestHandler_AttachNIC_CustomBridgeAndSGs(t *testing.T) {
 	if strings.Join(nic.GetSecurityGroups(), ",") != "web,ssh" {
 		t.Errorf("SecurityGroups = %v, want [web ssh]", nic.GetSecurityGroups())
 	}
-	if nic.GetIp() != "10.20.0.5" || nic.GetGateway() != "10.20.0.1" {
-		t.Errorf("static IP/gw not passed: ip=%q gw=%q", nic.GetIp(), nic.GetGateway())
+	if nic.GetIp() != "10.20.0.5" {
+		t.Errorf("recorded IP not passed: ip=%q", nic.GetIp())
+	}
+	if nic.GetGateway() != "" {
+		t.Errorf("gateway must be ignored (field removed), got %q", nic.GetGateway())
 	}
 }
 

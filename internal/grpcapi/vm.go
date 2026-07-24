@@ -542,29 +542,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		}
 
 		// Determine subnet prefix and gateway from network def or attachment.
-		gateway := n.Gateway
-		address := ip
-		if netDef != nil && netDef.Subnet != "" {
-			gw, _, _, _, err := network.SubnetRange(netDef.Subnet)
-			if err == nil {
-				if gateway == "" {
-					gateway = gw
-				}
-				parts := splitCIDR(netDef.Subnet)
-				if parts[1] != "" {
-					address = ip + "/" + parts[1]
-				}
-			}
-		} else if !strings.Contains(address, "/") {
-			// No subnet in network def — pick a sensible default based on
-			// address family. /24 for v4, /64 for v6 (the standard host
-			// prefix for end-user assignments).
-			if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
-				address = ip + "/64"
-			} else {
-				address = ip + "/24"
-			}
-		}
+		address, gateway := staticIfaceGatewayAddress(ip, n.Gateway, netDef)
 		var dnsServers []string
 		if netDef != nil {
 			dnsServers = netDef.DNS
@@ -2090,6 +2068,39 @@ type isolatedIface struct {
 
 // splitCIDR splits "10.0.0.0/24" into ["10.0.0.0", "24"].
 // Returns ["ip", ""] if no prefix is present.
+// staticIfaceGatewayAddress derives the cloud-init network-config address (with
+// CIDR prefix) and gateway for a NIC's static IP. An explicit gateway wins; when
+// the network has a subnet the gateway defaults to the subnet's first host and
+// the address takes the subnet's prefix — but only when the caller did NOT
+// already supply a prefix, so a submitted "10.0.1.50/24" is preserved rather
+// than doubled to "10.0.1.50/24/24". With no subnet def, a bare address gets a
+// family default (/64 for IPv6, /24 for IPv4).
+func staticIfaceGatewayAddress(ip, gateway string, netDef *compose.NetworkDef) (string, string) {
+	address := ip
+	if netDef != nil && netDef.Subnet != "" {
+		gw, _, _, _, err := network.SubnetRange(netDef.Subnet)
+		if err == nil {
+			if gateway == "" {
+				gateway = gw
+			}
+			parts := splitCIDR(netDef.Subnet)
+			if parts[1] != "" && !strings.Contains(ip, "/") {
+				address = ip + "/" + parts[1]
+			}
+		}
+	} else if !strings.Contains(address, "/") {
+		// No subnet in network def — pick a sensible default based on address
+		// family. /24 for v4, /64 for v6 (the standard host prefix for end-user
+		// assignments).
+		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+			address = ip + "/64"
+		} else {
+			address = ip + "/24"
+		}
+	}
+	return address, gateway
+}
+
 func splitCIDR(cidr string) [2]string {
 	for i := range cidr {
 		if cidr[i] == '/' {

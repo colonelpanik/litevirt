@@ -75,6 +75,7 @@ func TestC4_ConvertedCommandsRun(t *testing.T) {
 		{"spice", []string{"spice", "vm1"}, "URI:"},
 		// vmconfig.go
 		{"config boot", []string{"config", "vm1", "--boot", "disk"}, "boot order set"},
+		{"config ip", []string{"config", "vm1", "--ip", "10.0.1.50", "--network", "lan"}, "Recorded IP"},
 		// snapshot.go
 		{"snapshot create", []string{"snapshot", "create", "vm1", "s1"}, "created"},
 		{"snapshot ls", []string{"snapshot", "ls", "vm1"}, ""},

@@ -163,13 +163,23 @@ For VMs that need to handle multiple VLANs (e.g., virtual routers):
         trunk: [100, 101, 200]
 ```
 
-## IP allocation
+## VM IP addressing
 
-litevirt tracks IP allocations in the cluster state store. When a subnet is defined on a network, IPs are allocated from the pool and persisted.
+How a VM gets its address depends on when and how you set it:
 
-Set a VM's IP after creation:
+- **Static IP at create.** Set a per-NIC IP (and optional gateway) when creating the VM. For a cloud image, litevirt writes a cloud-init NoCloud `network-config` (attached as a read-only cdrom) so the guest applies the static address at first boot. This requires a cloud-init-capable guest image; it is not applied to images that do not run cloud-init.
+- **DHCP.** Leave the IP blank to use the network's addressing. On a DHCP-enabled managed network the guest gets a dynamic lease; litevirt then observes the address (ARP / DHCP leases) and records it back for display.
+- **Recorded (post-create) IP.** `lv config <vm> --ip <ip>` records the IP in inventory and, when a DNS domain is configured, publishes a DNS record. It does **not** reconfigure a running guest, take a DHCP reservation, or change the guest's actual address — to change a running VM's IP, reconfigure it in the guest (or recreate it with the desired static IP).
+
+```yaml
+# Static IP at create (cloud image), via the compose spec or the web UI:
+    network:
+      - name: "lan"
+        ip: "10.0.1.50"       # optional: gateway, ipv6
+```
 
 ```bash
+# Record an IP for an existing VM (inventory / DNS only — does not touch the guest):
 lv config my-vm --ip 10.0.1.50 --network lan
 ```
 

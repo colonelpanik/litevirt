@@ -117,7 +117,7 @@ lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 ## VM configuration
 
 ```bash
-lv config <vm> --ip <ip> --network <net>     # Set VM IP address
+lv config <vm> --ip <ip> --network <net>     # Record VM IP in inventory (+ DNS if configured); does NOT reconfigure the guest
 lv config <vm> --boot disk|cdrom|network     # Set boot order
 
 # lv update reconfigures an existing VM. Restart policy, autostart and startup

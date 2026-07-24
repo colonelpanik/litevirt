@@ -12,9 +12,10 @@ import (
 // the network's prefix, or a family default when the network has no subnet.
 func TestStaticIfaceGatewayAddress(t *testing.T) {
 	net24 := &compose.NetworkDef{Subnet: "10.0.1.0/24"}
-	// SubnetRange returns the gateway WITH the prefix ("10.0.1.1/24"); that is
-	// the existing (unchanged) behavior — this test pins it, it does not fix it.
-	const derivedGw = "10.0.1.1/24"
+	// SubnetRange returns the gateway with a prefix ("10.0.1.1/24"); the
+	// network-config gateway must be a bare host address, so a derived gateway
+	// is stripped to "10.0.1.1" (netplan/ENI reject a gateway carrying a prefix).
+	const derivedGw = "10.0.1.1"
 	cases := []struct {
 		name             string
 		ip, gateway      string

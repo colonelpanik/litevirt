@@ -2066,13 +2066,12 @@ type isolatedIface struct {
 	Gateway6 string
 }
 
-// splitCIDR splits "10.0.0.0/24" into ["10.0.0.0", "24"].
-// Returns ["ip", ""] if no prefix is present.
 // staticIfaceGatewayAddress derives the cloud-init network-config address (with
-// CIDR prefix) and gateway for a NIC's static IP. An explicit gateway wins; when
-// the network has a subnet the gateway defaults to the subnet's first host and
-// the address takes the subnet's prefix — but only when the caller did NOT
-// already supply a prefix, so a submitted "10.0.1.50/24" is preserved rather
+// CIDR prefix) and the gateway for a NIC's static IP. An explicit gateway wins;
+// when the network has a subnet, the gateway defaults to the subnet's first host
+// as a BARE address — SubnetRange returns it with a prefix, which netplan/ENI
+// reject — and the address takes the subnet's prefix, but only when the caller
+// did NOT already supply one, so a submitted "10.0.1.50/24" is preserved rather
 // than doubled to "10.0.1.50/24/24". With no subnet def, a bare address gets a
 // family default (/64 for IPv6, /24 for IPv4).
 func staticIfaceGatewayAddress(ip, gateway string, netDef *compose.NetworkDef) (string, string) {
@@ -2081,7 +2080,10 @@ func staticIfaceGatewayAddress(ip, gateway string, netDef *compose.NetworkDef) (
 		gw, _, _, _, err := network.SubnetRange(netDef.Subnet)
 		if err == nil {
 			if gateway == "" {
-				gateway = gw
+				// SubnetRange returns the gateway WITH a prefix (10.0.1.1/24);
+				// the network-config gateway must be a bare host address, else
+				// netplan/ENI/sysconfig reject it and static addressing fails.
+				gateway = splitCIDR(gw)[0]
 			}
 			parts := splitCIDR(netDef.Subnet)
 			if parts[1] != "" && !strings.Contains(ip, "/") {
@@ -2101,6 +2103,8 @@ func staticIfaceGatewayAddress(ip, gateway string, netDef *compose.NetworkDef) (
 	return address, gateway
 }
 
+// splitCIDR splits "10.0.0.0/24" into ["10.0.0.0", "24"].
+// Returns ["ip", ""] if no prefix is present.
 func splitCIDR(cidr string) [2]string {
 	for i := range cidr {
 		if cidr[i] == '/' {

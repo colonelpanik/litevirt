@@ -542,29 +542,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		}
 
 		// Determine subnet prefix and gateway from network def or attachment.
-		gateway := n.Gateway
-		address := ip
-		if netDef != nil && netDef.Subnet != "" {
-			gw, _, _, _, err := network.SubnetRange(netDef.Subnet)
-			if err == nil {
-				if gateway == "" {
-					gateway = gw
-				}
-				parts := splitCIDR(netDef.Subnet)
-				if parts[1] != "" {
-					address = ip + "/" + parts[1]
-				}
-			}
-		} else if !strings.Contains(address, "/") {
-			// No subnet in network def — pick a sensible default based on
-			// address family. /24 for v4, /64 for v6 (the standard host
-			// prefix for end-user assignments).
-			if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
-				address = ip + "/64"
-			} else {
-				address = ip + "/24"
-			}
-		}
+		address, gateway := staticIfaceGatewayAddress(ip, n.Gateway, netDef)
 		var dnsServers []string
 		if netDef != nil {
 			dnsServers = netDef.DNS
@@ -2086,6 +2064,43 @@ type isolatedIface struct {
 	DNS      []string
 	Address6 string // IPv6 CIDR, e.g. "2001:db8::10/64"; empty = no static v6 (SLAAC/RA)
 	Gateway6 string
+}
+
+// staticIfaceGatewayAddress derives the cloud-init network-config address (with
+// CIDR prefix) and the gateway for a NIC's static IP. An explicit gateway wins;
+// when the network has a subnet, the gateway defaults to the subnet's first host
+// as a BARE address — SubnetRange returns it with a prefix, which netplan/ENI
+// reject — and the address takes the subnet's prefix, but only when the caller
+// did NOT already supply one, so a submitted "10.0.1.50/24" is preserved rather
+// than doubled to "10.0.1.50/24/24". With no subnet def, a bare address gets a
+// family default (/64 for IPv6, /24 for IPv4).
+func staticIfaceGatewayAddress(ip, gateway string, netDef *compose.NetworkDef) (string, string) {
+	address := ip
+	if netDef != nil && netDef.Subnet != "" {
+		gw, _, _, _, err := network.SubnetRange(netDef.Subnet)
+		if err == nil {
+			if gateway == "" {
+				// SubnetRange returns the gateway WITH a prefix (10.0.1.1/24);
+				// the network-config gateway must be a bare host address, else
+				// netplan/ENI/sysconfig reject it and static addressing fails.
+				gateway = splitCIDR(gw)[0]
+			}
+			parts := splitCIDR(netDef.Subnet)
+			if parts[1] != "" && !strings.Contains(ip, "/") {
+				address = ip + "/" + parts[1]
+			}
+		}
+	} else if !strings.Contains(address, "/") {
+		// No subnet in network def — pick a sensible default based on address
+		// family. /24 for v4, /64 for v6 (the standard host prefix for end-user
+		// assignments).
+		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+			address = ip + "/64"
+		} else {
+			address = ip + "/24"
+		}
+	}
+	return address, gateway
 }
 
 // splitCIDR splits "10.0.0.0/24" into ["10.0.0.0", "24"].

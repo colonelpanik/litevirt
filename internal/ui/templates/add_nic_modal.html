@@ -28,11 +28,12 @@
           <select name="security_groups" multiple size="4">{{range .SecurityGroups}}<option value="{{.}}">{{.}}</option>{{end}}</select></div>
         {{end}}
         <div class="field-grid">
-          <div class="form-row" style="margin-bottom:0"><label>Static IP (optional)</label><input type="text" name="ip" placeholder="leave blank for DHCP"></div>
-          <div class="form-row" style="margin-bottom:0"><label>Gateway (optional)</label><input type="text" name="gateway"></div>
+          <div class="form-row" style="margin-bottom:0"><label>Recorded IP (optional)</label><input type="text" name="ip" placeholder="leave blank">
+            <div class="pick-cap">Recorded in inventory only; does not configure the guest.</div></div>
+          <div class="form-row" style="margin-bottom:0"></div>
         </div>
       </div>
-      <div class="fm-foot"><span class="hint">Blank IP uses the network's managed addressing / DHCP.</span>
+      <div class="fm-foot"><span class="hint">A running guest keeps its address — set a static IP at create (cloud-init) or in the guest.</span>
         <div class="fm-actions">
           <button type="button" class="btn" onclick="document.getElementById('add-nic-modal').remove()">Cancel</button>
           <button type="submit" class="btn btn-primary">Attach</button>

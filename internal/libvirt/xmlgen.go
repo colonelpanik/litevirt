@@ -1004,3 +1004,29 @@ func ParsePCIAddress(addr string) ParsedPCIAddr {
 		Function: "0x" + fn,
 	}
 }
+
+// InterfaceSourceByMAC returns the type and <source> of the interface carrying
+// mac, so a detach can be built from what the domain ACTUALLY has. DetachNIC
+// otherwise has only the MAC and marshals `type="bridge"` with an EMPTY
+// <source>, which libvirt rejects with "Missing required attribute 'bridge' in
+// element 'source'" — an error that names nothing an operator can act on. Returns
+// ok=false when no interface carries the MAC or the document is unparseable.
+func InterfaceSourceByMAC(domXML, mac string) (ifaceType string, src ifaceSource, ok bool) {
+	var d struct {
+		Interfaces []struct {
+			Type   string      `xml:"type,attr"`
+			MAC    ifaceMAC    `xml:"mac"`
+			Source ifaceSource `xml:"source"`
+		} `xml:"devices>interface"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return "", ifaceSource{}, false
+	}
+	want := strings.ToLower(strings.TrimSpace(mac))
+	for _, i := range d.Interfaces {
+		if strings.ToLower(strings.TrimSpace(i.MAC.Address)) == want {
+			return i.Type, i.Source, true
+		}
+	}
+	return "", ifaceSource{}, false
+}

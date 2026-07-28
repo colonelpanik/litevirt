@@ -281,6 +281,7 @@ func waitVMGone(t *testing.T, name string, timeout time.Duration) {
 // requireHosts ensures we have at least n hosts discovered.
 func requireHosts(t *testing.T, n int) {
 	t.Helper()
+	ensureTopology(t)
 	if len(hostNames) < n {
 		t.Skipf("need %d hosts, have %d", n, len(hostNames))
 	}
@@ -289,6 +290,7 @@ func requireHosts(t *testing.T, n int) {
 // requireImage skips if no test image is available.
 func requireImage(t *testing.T) {
 	t.Helper()
+	ensureTopology(t)
 	if testImage == "" {
 		t.Skip("no test image available (pull one or set E2E_IMAGE)")
 	}
@@ -313,7 +315,33 @@ func uniqueName(prefix string) string {
 // Setup — discover cluster topology
 // ═══════════════════════════════════════════════════════════════════════════
 
+// setupOnce guards topology discovery so it happens exactly once per run.
+var setupOnce sync.Once
+
+// ensureTopology discovers the cluster if it hasn't been already.
+//
+// Discovery used to live only in TestSetup, which made it depend on `go test`
+// running that function first — true only because every test needing it lived in
+// this file, which sorts after nothing. A new test FILE sorting before
+// "e2e_test.go" ran with hostNames still empty and skipped with "need 2 hosts,
+// have 0", which reads like a broken cluster rather than a test-ordering bug.
+// Discovery is idempotent, so making it lazy costs nothing and removes the trap.
+func ensureTopology(t *testing.T) {
+	t.Helper()
+	setupOnce.Do(func() { discoverTopology(t) })
+}
+
+// TestSetup keeps discovery visible as an explicit, first-class check with the
+// summary log operators expect at the top of a run.
 func TestSetup(t *testing.T) {
+	ensureTopology(t)
+	t.Logf("Cluster: %d hosts %v", len(hostNames), hostNames)
+	t.Logf("Local host: %s (local mode: %v)", localHost, localMode)
+	t.Logf("REST URL: %s", restURL)
+	t.Logf("Test image: %s", testImage)
+}
+
+func discoverTopology(t *testing.T) {
 	// Discover hosts.
 	if envHosts := os.Getenv("E2E_HOSTS"); envHosts != "" {
 		hostNames = strings.Split(envHosts, ",")
@@ -384,11 +412,6 @@ func TestSetup(t *testing.T) {
 			}
 		}
 	}
-
-	t.Logf("Cluster: %d hosts %v", len(hostNames), hostNames)
-	t.Logf("Local host: %s (local mode: %v)", localHost, localMode)
-	t.Logf("REST URL: %s", restURL)
-	t.Logf("Test image: %s", testImage)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

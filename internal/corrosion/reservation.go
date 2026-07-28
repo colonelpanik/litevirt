@@ -124,8 +124,9 @@ func ProjectReserved(ctx context.Context, c *Client, project string) (cpu, memMi
 
 // HostFreeCapacity reports a host's free CPU and memory (MiB): ALLOCATABLE (see
 // HostAllocatable — physical, adjusted by overcommit ratios and host reserves)
-// minus committed running-VM actuals, per-VM qemu overhead, and in-flight
-// nonterminal reservations. Negative values are clamped to 0 (an overcommitted
+// minus committed running-VM actuals, running-container memory, per-VM qemu
+// overhead, and in-flight nonterminal reservations. Negative values are
+// clamped to 0 (an overcommitted
 // host has no free capacity). Returns ok=false when the host is unknown.
 //
 // Uses the DEFAULT cluster policy. Callers that carry a configured one should use

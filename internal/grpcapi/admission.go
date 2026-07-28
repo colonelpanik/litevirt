@@ -61,7 +61,16 @@ func (s *Server) checkResourceAdmission(ctx context.Context, host, project strin
 	if err := s.checkHostCapacity(ctx, host, cpuDelta, memMiBDelta); err != nil {
 		return err
 	}
+	return s.checkProjectQuota(ctx, project, cpuDelta, memMiBDelta)
+}
 
+// checkProjectQuota verifies a proposed CPU/memory GROW against the project's
+// quota alone. Split out so --allow-overcommit paths can skip the HOST check
+// (a physical judgment call) while still enforcing quota (a tenancy limit).
+func (s *Server) checkProjectQuota(ctx context.Context, project string, cpuDelta, memMiBDelta int) error {
+	if cpuDelta <= 0 && memMiBDelta <= 0 {
+		return nil
+	}
 	// Project quota: committed usage + in-flight reservations + this grow.
 	q, err := corrosion.GetProjectQuota(ctx, s.db, project)
 	if err != nil {

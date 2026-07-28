@@ -54,7 +54,7 @@ func TestNFSTeardown_UnmountsWhenMounted(t *testing.T) {
 // NFS Teardown is a no-op when the path is not mounted (mountpoint -q fails).
 func TestNFSTeardown_NoOpWhenNotMounted(t *testing.T) {
 	run, calls := stubRunner(func(sub string) ([]byte, error) {
-		return nil, errors.New("not a mountpoint") // mountpoint -q non-zero
+		return nil, exitStatusError(32) // mountpoint -q reports not a mountpoint
 	})
 	d := &nfsDriver{source: "srv:/export", mountBase: "/var/mnt", run: run}
 	if err := d.Teardown(context.Background()); err != nil {

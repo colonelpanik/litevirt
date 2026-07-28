@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -27,7 +28,7 @@ type nfsDriver struct {
 	targetOverride string            // explicit mount point from pool config
 	opts           map[string]string // mount options et al.
 	mountDir       string            // resolved by Prepare()
-	run            cmdRunner         // mountpoint/umount seam (Teardown); tests inject a fake
+	run            cmdRunner         // mountpoint, mount, and umount seam; tests inject a fake
 }
 
 func (d *nfsDriver) String() string { return "nfs" }
@@ -58,7 +59,10 @@ func (d *nfsDriver) Teardown(ctx context.Context) error {
 		if commandCtx.Err() != nil {
 			return nfsCommandError("check nfs mountpoint", d.source, commandCtx.Err(), out)
 		}
-		return nil // not mounted → nothing to undo
+		if mountpointNotMounted(err) {
+			return nil
+		}
+		return nfsCommandError("check nfs mountpoint", mountDir, err, out)
 	}
 	if out, err := run(commandCtx, "umount", mountDir); err != nil {
 		if commandCtx.Err() != nil {
@@ -122,14 +126,25 @@ func (d *nfsDriver) Prepare(ctx context.Context) error {
 func (d *nfsDriver) commandContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	timeout := defaultNFSCommandTimeout
 	if configured, ok := d.opts["command_timeout"]; ok {
-		parsed, err := time.ParseDuration(configured)
-		if err != nil || parsed <= 0 {
-			return nil, nil, fmt.Errorf("invalid NFS command_timeout %q: must be a positive duration", configured)
+		configured = strings.TrimSpace(configured)
+		if configured != "" {
+			parsed, err := time.ParseDuration(configured)
+			if err != nil || parsed <= 0 {
+				return nil, nil, fmt.Errorf("invalid NFS command_timeout %q: must be a positive duration", configured)
+			}
+			timeout = parsed
 		}
-		timeout = parsed
 	}
 	commandCtx, cancel := context.WithTimeout(ctx, timeout)
 	return commandCtx, cancel, nil
+}
+
+// mountpoint -q exits 32 when its target is not a mountpoint. Other failures
+// (including a missing binary or permission error) are probe failures and must
+// not be treated as an idempotent teardown success.
+func mountpointNotMounted(err error) bool {
+	var exitCode interface{ ExitCode() int }
+	return errors.As(err, &exitCode) && exitCode.ExitCode() == 32
 }
 
 func nfsCommandError(operation, target string, err error, out []byte) error {

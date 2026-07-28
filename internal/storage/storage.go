@@ -77,7 +77,8 @@ type Config struct {
 	Source string // driver-specific (NFS server:/path, Ceph pool, ZFS dataset, …)
 	Target string // local mount/path override; empty = derive
 	// Options holds driver-specific key/value options. NFS accepts "options"
-	// for mount flags and "command_timeout" as a positive Go duration.
+	// for mount flags and "command_timeout" as a positive Go duration. A blank
+	// command_timeout uses the default control-command timeout.
 	Options map[string]string
 }
 

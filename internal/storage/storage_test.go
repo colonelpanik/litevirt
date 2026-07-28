@@ -157,7 +157,7 @@ func TestNFSPrepareUsesRunnerAndTimeout(t *testing.T) {
 }
 
 func TestNFSPrepareRejectsInvalidCommandTimeout(t *testing.T) {
-	for _, timeout := range []string{"", "0s", "-1s", "not-a-duration"} {
+	for _, timeout := range []string{"0s", "-1s", "not-a-duration"} {
 		t.Run(timeout, func(t *testing.T) {
 			called := false
 			d := &nfsDriver{

@@ -9,6 +9,31 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// checkHostCapacity verifies a proposed CPU/memory GROW (positive deltas, MiB)
+// fits the target host's free capacity. This is the START-TIME check: a stopped
+// workload's allocation is already counted in project-quota usage ("an
+// allocation counts whether running or stopped"), so re-admitting its full size
+// against the quota would double-count and refuse a legal restart. Host
+// capacity is different — a stopped workload consumes none, so starting truly
+// moves it from 0 to full and the full size is the right host delta.
+func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, memMiBDelta int) error {
+	if cpuDelta <= 0 && memMiBDelta <= 0 {
+		return nil
+	}
+	// Host capacity (owner-serialized). HostFreeCapacity already nets out committed
+	// running-VM actuals and in-flight reservations.
+	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityWithPolicy(ctx, s.db, host, s.capacity)
+	if err != nil {
+		return status.Errorf(codes.Internal, "check host capacity: %v", err)
+	}
+	if ok && (cpuDelta > freeCPU || memMiBDelta > freeMem) {
+		return status.Errorf(codes.ResourceExhausted,
+			"host %s has insufficient free capacity for +%d vCPU/+%d MiB (free: %d vCPU/%d MiB)",
+			host, cpuDelta, memMiBDelta, freeCPU, freeMem)
+	}
+	return nil
+}
+
 // checkResourceAdmission verifies a proposed CPU/memory GROW (positive deltas, MiB)
 // fits BOTH the target host's free capacity AND the project's quota, counting
 // in-flight reservations from nonterminal operations — not just committed usage — so
@@ -24,16 +49,8 @@ func (s *Server) checkResourceAdmission(ctx context.Context, host, project strin
 		return nil
 	}
 
-	// Host capacity (owner-serialized). HostFreeCapacity already nets out committed
-	// running-VM actuals and in-flight reservations.
-	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityWithPolicy(ctx, s.db, host, s.capacity)
-	if err != nil {
-		return status.Errorf(codes.Internal, "check host capacity: %v", err)
-	}
-	if ok && (cpuDelta > freeCPU || memMiBDelta > freeMem) {
-		return status.Errorf(codes.ResourceExhausted,
-			"host %s has insufficient free capacity for +%d vCPU/+%d MiB (free: %d vCPU/%d MiB)",
-			host, cpuDelta, memMiBDelta, freeCPU, freeMem)
+	if err := s.checkHostCapacity(ctx, host, cpuDelta, memMiBDelta); err != nil {
+		return err
 	}
 
 	// Project quota: committed usage + in-flight reservations + this grow.

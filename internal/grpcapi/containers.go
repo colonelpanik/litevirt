@@ -243,7 +243,7 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// and starting them all. Skipped when already running (adds nothing) and when
 	// uncapped (nothing to admit).
 	if rec.State != "running" && rec.MemMiB > 0 {
-		if err := s.checkResourceAdmission(ctx, s.hostName, rec.Project, 0, rec.MemMiB); err != nil {
+		if err := s.checkHostCapacity(ctx, s.hostName, 0, rec.MemMiB); err != nil {
 			return nil, err
 		}
 	}

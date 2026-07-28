@@ -52,7 +52,7 @@ func makeVM(name, host string, cpu, mem int, state string) corrosion.VMRecord {
 
 func TestSelectBatch_SingleVM(t *testing.T) {
 	hosts := makeHosts("node1")
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", CPUNeeded: 2, MemMiBNeeded: 1024},
 	})
 	if err != nil {
@@ -70,7 +70,7 @@ func TestSelectBatch_MultipleVMs_BinPacking(t *testing.T) {
 	// the same host (the first vm raises that host's pressure, and bin-pack
 	// scoring prefers higher pressure).
 	hosts := makeHosts("node1", "node2")
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", CPUNeeded: 2, MemMiBNeeded: 1024, Policy: PolicyBinPack},
 		{VMName: "vm2", CPUNeeded: 2, MemMiBNeeded: 1024, Policy: PolicyBinPack},
 	})
@@ -87,7 +87,7 @@ func TestSelectBatch_MultipleVMs_BalanceDefault(t *testing.T) {
 	// With the new balance default (no Policy specified), two consecutive
 	// placements on equally-sized hosts should split across them.
 	hosts := makeHosts("node1", "node2")
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", CPUNeeded: 2, MemMiBNeeded: 1024},
 		{VMName: "vm2", CPUNeeded: 2, MemMiBNeeded: 1024},
 	})
@@ -112,7 +112,7 @@ func TestSelectBatch_ResourceTracking(t *testing.T) {
 		{"node2", 4, 65536},
 	})
 
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", CPUNeeded: 3},
 		{VMName: "vm2", CPUNeeded: 3}, // node1 only has 1 CPU left, must go to node2
 	})
@@ -132,7 +132,7 @@ func TestSelectBatch_NoEligibleHost(t *testing.T) {
 	}{
 		{"small", 2, 4096},
 	})
-	_, err := SelectBatch(hosts, nil, nil, []Request{
+	_, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", CPUNeeded: 8},
 	})
 	if err == nil {
@@ -145,7 +145,7 @@ func TestSelectBatch_InactiveHostSkipped(t *testing.T) {
 		{Name: "offline", State: "offline", CPUTotal: 64, MemTotal: 131072},
 		{Name: "active", State: "active", CPUTotal: 8, MemTotal: 16384},
 	}
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", CPUNeeded: 2},
 	})
 	if err != nil {
@@ -160,7 +160,7 @@ func TestSelectBatch_InactiveHostSkipped(t *testing.T) {
 
 func TestSelectBatch_PinnedHost(t *testing.T) {
 	hosts := makeHosts("node1", "node2")
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", PinHost: "node2"},
 	})
 	if err != nil {
@@ -173,7 +173,7 @@ func TestSelectBatch_PinnedHost(t *testing.T) {
 
 func TestSelectBatch_PinnedHost_NotFound(t *testing.T) {
 	hosts := makeHosts("node1")
-	_, err := SelectBatch(hosts, nil, nil, []Request{
+	_, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", PinHost: "missing"},
 	})
 	if err == nil {
@@ -185,7 +185,7 @@ func TestSelectBatch_PinnedHost_Inactive(t *testing.T) {
 	hosts := []corrosion.HostRecord{
 		{Name: "drain", State: "draining", CPUTotal: 32, MemTotal: 65536},
 	}
-	_, err := SelectBatch(hosts, nil, nil, []Request{
+	_, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", PinHost: "drain"},
 	})
 	if err == nil {
@@ -200,7 +200,7 @@ func TestSelectBatch_AntiAffinity_ExistingVMs(t *testing.T) {
 	existingVMs := []corrosion.VMRecord{
 		makeVM("web-1", "node1", 2, 1024, "running"),
 	}
-	results, err := SelectBatch(hosts, existingVMs, nil, []Request{
+	results, err := SelectBatch(hosts, existingVMs, nil, nil, []Request{
 		{VMName: "web-2", CPUNeeded: 2, AntiAffinity: []string{"web-1"}},
 	})
 	if err != nil {
@@ -215,7 +215,7 @@ func TestSelectBatch_AntiAffinity_BatchAware(t *testing.T) {
 	// Two VMs with mutual anti-affinity placed in the same batch.
 	// The second VM should see the first VM's placement.
 	hosts := makeHosts("node1", "node2")
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "web-1", CPUNeeded: 2},
 		{VMName: "web-2", CPUNeeded: 2, AntiAffinity: []string{"web-1"}},
 	})
@@ -233,7 +233,7 @@ func TestSelectBatch_AntiAffinity_Impossible(t *testing.T) {
 	existingVMs := []corrosion.VMRecord{
 		makeVM("web-1", "node1", 2, 1024, "running"),
 	}
-	_, err := SelectBatch(hosts, existingVMs, nil, []Request{
+	_, err := SelectBatch(hosts, existingVMs, nil, nil, []Request{
 		{VMName: "web-2", AntiAffinity: []string{"web-1"}},
 	})
 	if err == nil {
@@ -248,7 +248,7 @@ func TestSelectBatch_MaxPerNode(t *testing.T) {
 	existingVMs := []corrosion.VMRecord{
 		makeVM("web-1", "node1", 1, 512, "running"),
 	}
-	results, err := SelectBatch(hosts, existingVMs, nil, []Request{
+	results, err := SelectBatch(hosts, existingVMs, nil, nil, []Request{
 		{VMName: "web-2", MaxPerNode: 1, VMBaseName: "web"},
 	})
 	if err != nil {
@@ -263,7 +263,7 @@ func TestSelectBatch_MaxPerNode(t *testing.T) {
 func TestSelectBatch_MaxPerNode_BatchAware(t *testing.T) {
 	// Place 3 replicas across 2 hosts with max-per-node=2.
 	hosts := makeHosts("node1", "node2")
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "web-1", MaxPerNode: 2, VMBaseName: "web"},
 		{VMName: "web-2", MaxPerNode: 2, VMBaseName: "web"},
 		{VMName: "web-3", MaxPerNode: 2, VMBaseName: "web"},
@@ -287,7 +287,7 @@ func TestSelectBatch_MaxPerNode_BatchAware(t *testing.T) {
 
 func TestSelectBatch_Spread(t *testing.T) {
 	hosts := makeHosts("node1", "node2", "node3")
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", Spread: true},
 		{VMName: "vm2", Spread: true},
 		{VMName: "vm3", Spread: true},
@@ -313,7 +313,7 @@ func TestSelectBatch_Affinity(t *testing.T) {
 	existingVMs := []corrosion.VMRecord{
 		makeVM("db-1", "node2", 4, 8192, "running"),
 	}
-	results, err := SelectBatch(hosts, existingVMs, nil, []Request{
+	results, err := SelectBatch(hosts, existingVMs, nil, nil, []Request{
 		{VMName: "app-1", Affinity: []string{"db-1"}},
 	})
 	if err != nil {
@@ -331,7 +331,7 @@ func TestSelectBatch_RequireLabels(t *testing.T) {
 		{Name: "node1", State: "active", CPUTotal: 32, MemTotal: 65536, Labels: map[string]string{"zone": "us-east"}},
 		{Name: "node2", State: "active", CPUTotal: 32, MemTotal: 65536, Labels: map[string]string{"zone": "eu-west"}},
 	}
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", RequireLabels: map[string]string{"zone": "eu-west"}},
 	})
 	if err != nil {
@@ -344,7 +344,7 @@ func TestSelectBatch_RequireLabels(t *testing.T) {
 
 func TestSelectBatch_RequireLabels_NoneMatch(t *testing.T) {
 	hosts := makeHosts("node1")
-	_, err := SelectBatch(hosts, nil, nil, []Request{
+	_, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", RequireLabels: map[string]string{"gpu": "true"}},
 	})
 	if err == nil {
@@ -359,7 +359,7 @@ func TestSelectBatch_PreferLabels(t *testing.T) {
 		{Name: "node1", State: "active", CPUTotal: 32, MemTotal: 65536, Labels: map[string]string{}},
 		{Name: "node2", State: "active", CPUTotal: 32, MemTotal: 65536, Labels: map[string]string{"tier": "high"}},
 	}
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", PreferLabels: map[string]string{"tier": "high"}},
 	})
 	if err != nil {
@@ -376,7 +376,7 @@ func TestSelectBatch_SRIOVNetworkPenalty(t *testing.T) {
 	// SR-IOV network without device requirements gets a score penalty.
 	// The test verifies that the penalty doesn't cause a crash and placement still works.
 	hosts := makeHosts("node1")
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", Networks: []NetworkReq{{Name: "sriov-net", Type: "sriov"}}},
 	})
 	if err != nil {
@@ -406,7 +406,7 @@ func TestSelectBatch_IgnoresStoppedVMs(t *testing.T) {
 	existingVMs := []corrosion.VMRecord{
 		makeVM("old-vm", "node1", 2, 4096, "stopped"), // stopped — should be ignored
 	}
-	results, err := SelectBatch(hosts, existingVMs, nil, []Request{
+	results, err := SelectBatch(hosts, existingVMs, nil, nil, []Request{
 		{VMName: "vm1", CPUNeeded: 2, MemMiBNeeded: 4096},
 	})
 	if err != nil {
@@ -422,7 +422,7 @@ func TestSelectBatch_IgnoresStoppedVMs(t *testing.T) {
 func TestSelectBatch_TieBreak_ByVMCount_ThenName(t *testing.T) {
 	hosts := makeHosts("node-b", "node-a")
 	// Equal score, equal VM count → alphabetical name wins.
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", Spread: true},
 	})
 	if err != nil {
@@ -559,7 +559,7 @@ func TestSelectBatch_WithDevices(t *testing.T) {
 			{Address: "0000:03:00.0", Type: "gpu", VMName: "", VendorName: "NVIDIA"},
 		},
 	}
-	results, err := SelectBatch(hosts, nil, devices, []Request{
+	results, err := SelectBatch(hosts, nil, devices, nil, []Request{
 		{VMName: "vm1", Devices: []DeviceRequest{{Type: "gpu", Count: 1}}},
 	})
 	if err != nil {
@@ -581,7 +581,7 @@ func TestSelectBatch_DevicePoolDepleted(t *testing.T) {
 			{Address: "0000:03:00.0", Type: "gpu", VMName: ""},
 		},
 	}
-	_, err := SelectBatch(hosts, nil, devices, []Request{
+	_, err := SelectBatch(hosts, nil, devices, nil, []Request{
 		{VMName: "vm1", Devices: []DeviceRequest{{Type: "gpu", Count: 1}}},
 		{VMName: "vm2", Devices: []DeviceRequest{{Type: "gpu", Count: 1}}},
 	})
@@ -598,7 +598,7 @@ func TestSelectBatch_LargeBatch_Spread(t *testing.T) {
 	for i := range reqs {
 		reqs[i] = Request{VMName: "vm-" + string(rune('a'+i)), Spread: true}
 	}
-	results, err := SelectBatch(hosts, nil, nil, reqs)
+	results, err := SelectBatch(hosts, nil, nil, nil, reqs)
 	if err != nil {
 		t.Fatalf("SelectBatch: %v", err)
 	}
@@ -624,7 +624,7 @@ func TestSelectBatch_MemoryTracking(t *testing.T) {
 		{"node1", 32, 4096},
 		{"node2", 32, 4096},
 	})
-	results, err := SelectBatch(hosts, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
 		{VMName: "vm1", MemMiBNeeded: 3000},
 		{VMName: "vm2", MemMiBNeeded: 3000}, // node1 only has ~1096 left
 	})
@@ -677,5 +677,34 @@ func TestScoreHostDevices_SRIOV(t *testing.T) {
 	plain := []corrosion.PCIDeviceRecord{{Address: "0000:03:00.0", Type: "gpu", SRIOVCapable: false}}
 	if ok, _ := scoreHostDevices(plain, []DeviceRequest{{Type: "network", Sriov: true}}); ok {
 		t.Error("host without an SR-IOV-capable network PF must not be eligible")
+	}
+}
+
+// Container memory must count against host capacity in batch placement exactly
+// as it does in the single-VM Select path (BuildSnapshot + AddContainerMemory)
+// and in admission (HostFreeCapacityWithPolicy) — otherwise a compose deploy
+// plans onto a container-packed host and then fails at CreateVM.
+func TestSelectBatch_ContainerMemoryCountsAgainstHosts(t *testing.T) {
+	hosts := makeHostsWithResources([]struct {
+		name string
+		cpu  int
+		mem  int
+	}{
+		{"ct-host", 8, 4096},
+	})
+	// Default policy: allocatable = 4096 - max(1024, 5%) = 3072 MiB. A running
+	// 2800 MiB container leaves 272 — the 2048 MiB VM must not fit.
+	_, err := SelectBatch(hosts, nil, nil, map[string]int{"ct-host": 2800}, []Request{
+		{VMName: "vm1", CPUNeeded: 1, MemMiBNeeded: 2048},
+	})
+	if err == nil {
+		t.Fatal("expected error: container memory must count against host capacity in batch placement")
+	}
+
+	// Without the container the same request fits fine.
+	if _, err := SelectBatch(hosts, nil, nil, nil, []Request{
+		{VMName: "vm1", CPUNeeded: 1, MemMiBNeeded: 2048},
+	}); err != nil {
+		t.Fatalf("without container memory the VM must place: %v", err)
 	}
 }

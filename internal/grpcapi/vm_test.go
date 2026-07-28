@@ -68,6 +68,79 @@ func TestCreateVM_NilSpec(t *testing.T) {
 	}
 }
 
+func TestCreateVM_OmittedResourcesPersistNormalizedDefaults(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	resp, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "defaults"}})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if resp.CpuActual != 2 || resp.MemActualMib != 4096 {
+		t.Fatalf("CreateVM response resources = cpu=%d memory_mib=%d, want 2/4096", resp.CpuActual, resp.MemActualMib)
+	}
+
+	rec, err := corrosion.GetVM(ctx, s.db, "defaults")
+	if err != nil || rec == nil {
+		t.Fatalf("GetVM(defaults) = %v, %v", rec, err)
+	}
+	if rec.CPUActual != 2 || rec.MemActual != 4096 {
+		t.Fatalf("persisted resources = cpu=%d memory_mib=%d, want 2/4096", rec.CPUActual, rec.MemActual)
+	}
+	stored := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(rec.Spec), stored); err != nil {
+		t.Fatalf("unmarshal stored spec: %v", err)
+	}
+	if stored.Cpu != 2 || stored.MemoryMib != 4096 || stored.Machine != "q35" || stored.Firmware != "uefi" {
+		t.Fatalf("stored spec = %+v, want normalized defaults", stored)
+	}
+}
+
+func TestCreateVM_OmittedResourcesUseDefaultsForAdmission(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "/acme", Display: "Acme"}); err != nil {
+		t.Fatalf("InsertProject: %v", err)
+	}
+	if err := corrosion.UpsertProjectQuota(ctx, s.db, corrosion.ProjectQuotaRecord{
+		ProjectName: "/acme", VCPULimit: 1, MemMiBLimit: 4095,
+	}); err != nil {
+		t.Fatalf("UpsertProjectQuota: %v", err)
+	}
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "over-quota-defaults", Project: "/acme"}})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("status code = %v, want ResourceExhausted (err = %v)", got, err)
+	}
+	if s.virt.DomainExists("over-quota-defaults") {
+		t.Fatal("runtime was called for a request rejected by admission")
+	}
+}
+
+func TestCreateVM_RejectsNegativeResourcesBeforeRuntime(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "negative-resources", Cpu: -1, MemoryMib: 512,
+	}})
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("status code = %v, want InvalidArgument (err = %v)", got, err)
+	}
+	if s.virt.DomainExists("negative-resources") {
+		t.Fatal("runtime was called for an invalid request")
+	}
+}
+
 func TestCreateVM_EmptyName(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

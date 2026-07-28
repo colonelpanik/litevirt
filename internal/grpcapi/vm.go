@@ -66,10 +66,15 @@ func validateSpecNames(spec *pb.VMSpec) error {
 }
 
 func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *pb.VM, retErr error) {
-	spec := req.Spec
-	if spec == nil {
-		return nil, status.Error(codes.InvalidArgument, "spec required")
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
+	spec, err := normalizeCreateVMSpec(req.GetSpec())
+	if err != nil {
+		return nil, err
+	}
+	req = proto.Clone(req).(*pb.CreateVMRequest)
+	req.Spec = spec
 	if spec.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "VM name required")
 	}
@@ -282,13 +287,6 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
 
-	// Defaults
-	if spec.Machine == "" {
-		spec.Machine = "q35"
-	}
-	if spec.Firmware == "" {
-		spec.Firmware = "uefi"
-	}
 	// Stable domain identity (G1): persisted in the spec so libvirt's default
 	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
 	// life — letting vTPM state be located + carried without an explicit <source>.
@@ -296,12 +294,6 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// supplied value, so a client can't bind a new VM to existing swtpm state.
 	// Restore/migrate set the preserved UUID via their own record-building paths.
 	spec.Uuid = uuid.NewString()
-	if spec.Cpu == 0 {
-		spec.Cpu = 2
-	}
-	if spec.MemoryMib == 0 {
-		spec.MemoryMib = 4096
-	}
 
 	// Prepare disks — track created paths for cleanup on failure.
 	var diskConfigs []lv.DiskConfig

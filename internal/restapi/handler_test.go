@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -42,6 +44,7 @@ type mockGRPC struct {
 
 	// VM action responses
 	createVMResp *pb.VM
+	createVMErr  error
 	updateVMResp *pb.VM
 	vmStatsResp  *pb.VMStats
 	execVMResp   *pb.ExecVMResponse
@@ -229,7 +232,7 @@ func (m *mockGRPC) ListStacks(ctx context.Context, in *emptypb.Empty, opts ...gr
 // Stub out remaining interface methods.
 func (m *mockGRPC) CreateVM(_ context.Context, in *pb.CreateVMRequest, _ ...grpc.CallOption) (*pb.VM, error) {
 	m.lastCreateVMReq = in
-	return m.createVMResp, nil
+	return m.createVMResp, m.createVMErr
 }
 func (m *mockGRPC) ExecVM(_ context.Context, in *pb.ExecVMRequest, _ ...grpc.CallOption) (*pb.ExecVMResponse, error) {
 	m.lastExecVMReq = in
@@ -1806,6 +1809,53 @@ func TestVMCreate(t *testing.T) {
 	}
 	if mock.lastCreateVMReq == nil {
 		t.Fatal("CreateVM was not called")
+	}
+}
+
+func TestVMCreate_OmittedResourcesReturnsNormalizedDefaults(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.createVMResp = &pb.VM{Name: "defaults", CpuActual: 2, MemActualMib: 4096}
+	body := strings.NewReader(`{"spec":{"name":"defaults"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/vms/defaults", body)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	if mock.lastCreateVMReq == nil || mock.lastCreateVMReq.Spec == nil {
+		t.Fatal("CreateVM was not called with a spec")
+	}
+	if mock.lastCreateVMReq.Spec.Cpu != 0 || mock.lastCreateVMReq.Spec.MemoryMib != 0 {
+		t.Fatalf("REST request resources = cpu=%d memory_mib=%d, want omitted values forwarded to gRPC", mock.lastCreateVMReq.Spec.Cpu, mock.lastCreateVMReq.Spec.MemoryMib)
+	}
+	got := &pb.VM{}
+	if err := protojson.Unmarshal(rec.Body.Bytes(), got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.CpuActual != 2 || got.MemActualMib != 4096 {
+		t.Fatalf("REST response resources = cpu=%d memory_mib=%d, want 2/4096", got.CpuActual, got.MemActualMib)
+	}
+}
+
+func TestVMCreate_NegativeResourcesReturnsBadRequest(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.createVMErr = status.Error(codes.InvalidArgument, "cpu and memory_mib must be non-negative")
+	body := strings.NewReader(`{"spec":{"name":"negative","cpu":-1,"memory_mib":512}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/vms/negative", body)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if mock.lastCreateVMReq == nil || mock.lastCreateVMReq.Spec == nil {
+		t.Fatal("CreateVM was not called with a spec")
+	}
+	if mock.lastCreateVMReq.Spec.Cpu != -1 || mock.lastCreateVMReq.Spec.MemoryMib != 512 {
+		t.Fatalf("gRPC request resources = cpu=%d memory_mib=%d, want -1/512", mock.lastCreateVMReq.Spec.Cpu, mock.lastCreateVMReq.Spec.MemoryMib)
 	}
 }
 

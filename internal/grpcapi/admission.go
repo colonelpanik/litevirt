@@ -19,12 +19,8 @@ func (s *Server) requireOvercommit(ctx context.Context, path string) error {
 }
 
 // checkHostCapacity verifies a proposed CPU/memory GROW (positive deltas, MiB)
-// fits the target host's free capacity. This is the START-TIME check: a stopped
-// workload's allocation is already counted in project-quota usage ("an
-// allocation counts whether running or stopped"), so re-admitting its full size
-// against the quota would double-count and refuse a legal restart. Host
-// capacity is different — a stopped workload consumes none, so starting truly
-// moves it from 0 to full and the full size is the right host delta.
+// fits the target host's free capacity — quota-free, for start-time paths
+// where the allocation is already counted in project usage (see StartVM).
 func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, memMiBDelta int) error {
 	if cpuDelta <= 0 && memMiBDelta <= 0 {
 		return nil
@@ -54,10 +50,6 @@ func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, m
 // a shrink/no-op (deltas ≤ 0 never need capacity). An unbounded project (no quota
 // row) skips the quota check; an unknown host skips the host-capacity check.
 func (s *Server) checkResourceAdmission(ctx context.Context, host, project string, cpuDelta, memMiBDelta int) error {
-	if cpuDelta <= 0 && memMiBDelta <= 0 {
-		return nil
-	}
-
 	if err := s.checkHostCapacity(ctx, host, cpuDelta, memMiBDelta); err != nil {
 		return err
 	}

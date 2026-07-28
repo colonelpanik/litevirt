@@ -164,6 +164,8 @@ func (p CapacityPolicy) MemOverheadFor(n int) int {
 // is a real limitation, not an oversight: litevirt knows the cap, not the actual
 // footprint, and inventing a number for an unbounded container would be a guess
 // dressed as accounting. Cap containers if you want them accounted.
+// The counting rule (running, capped, non-deleted) is shared with the
+// in-memory ContainerMemoryByHost — keep the two in lockstep.
 func SumContainerMemoryByHost(ctx context.Context, c *Client) (map[string]int, error) {
 	rows, err := c.Query(ctx,
 		`SELECT host_name, COALESCE(SUM(memory_mib),0) AS mem
@@ -178,4 +180,18 @@ func SumContainerMemoryByHost(ctx context.Context, c *Client) (map[string]int, e
 		out[r.String("host_name")] = r.Int("mem")
 	}
 	return out, nil
+}
+
+// ContainerMemoryByHost is the in-memory equivalent of SumContainerMemoryByHost
+// for callers that already hold the container records (the compose planner works
+// off a snapshot, not live queries). Same counting rule: running, capped
+// (MemMiB > 0); deletion filtering is the lister's job.
+func ContainerMemoryByHost(cts []ContainerRecord) map[string]int {
+	out := make(map[string]int)
+	for _, ct := range cts {
+		if ct.State == "running" && ct.MemMiB > 0 {
+			out[ct.HostName] += ct.MemMiB
+		}
+	}
+	return out
 }

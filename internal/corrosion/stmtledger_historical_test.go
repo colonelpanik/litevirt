@@ -291,11 +291,8 @@ func TestHistoricalLedgerKeepsFixedConfigureHostShape(t *testing.T) {
 		`region = COALESCE(?, region), ` +
 		`updated_at = ? ` +
 		`WHERE name = ?`
-	fp, err := FingerprintSQL(oldSQL)
-	if err != nil {
-		t.Fatalf("FingerprintSQL: %v", err)
-	}
-	if _, ok := LedgerLookup(fp); !ok {
-		t.Fatalf("pre-v43 fixed ConfigureHost shape %s not in ledger — a rolling-upgrade peer's ConfigureHost would be rejected", fp)
-	}
+	// SQL intentionally restated verbatim (not dereferenced from HistoricalShapes)
+	// so a typo in the registered entry cannot self-certify — the package's
+	// established shape-retention pattern (see release_corpus_test.go).
+	mustResolve(t, "pre-v43 fixed ConfigureHost", oldSQL)
 }

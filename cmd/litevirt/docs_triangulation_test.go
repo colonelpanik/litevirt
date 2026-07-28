@@ -5,12 +5,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/litevirt/litevirt/internal/daemon"
 )
 
 // This file is the claim-vs-code triangulation guard: it makes CI fail when the
@@ -179,6 +182,77 @@ func TestDocsDocumentEveryCLICommand(t *testing.T) {
 // undocumentedCommands lists command paths intentionally absent from the docs.
 // Each must say why; remove the entry when the command is documented.
 var undocumentedCommands = map[string]string{}
+
+// TestDocsDocumentEveryConfigKey is the config-file analogue of the CLI checks:
+// every yaml key an operator can set must appear somewhere in README.md or
+// docs/*.md. The CLI guards walk the cobra tree and so cannot see config keys —
+// which is exactly how advertise_address shipped undocumented, a key whose
+// absence silently prevents a multi-homed cluster from ever converging.
+//
+// Membership, not prose quality: a key that appears anywhere in the docs passes.
+// That is enough to catch the real failure — adding a knob and never mentioning it.
+func TestDocsDocumentEveryConfigKey(t *testing.T) {
+	rootDir := repoRoot(t)
+	var docs strings.Builder
+	for _, f := range docFiles(t, rootDir) {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		docs.Write(b)
+	}
+	text := docs.String()
+
+	keys := configYAMLKeys(reflect.TypeOf(daemon.Config{}), map[reflect.Type]bool{})
+	if len(keys) == 0 {
+		t.Fatal("found no yaml keys on daemon.Config — reflection path wrong?")
+	}
+
+	var missing []string
+	for _, k := range keys {
+		if _, ok := undocumentedConfigKeys[k]; ok {
+			continue
+		}
+		if !strings.Contains(text, k) {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Errorf("%d config key(s) are not mentioned anywhere in README.md or docs/*.md:\n  %s\n\n"+
+			"Document the key (docs/configuration.md is the reference), or add it to "+
+			"undocumentedConfigKeys (with a reason).",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
+// undocumentedConfigKeys lists yaml keys intentionally absent from the docs.
+// Each must say why; remove the entry when the key is documented.
+var undocumentedConfigKeys = map[string]string{}
+
+// configYAMLKeys collects every yaml tag reachable from a config struct,
+// descending through nested structs, pointers, slices, and maps so keys inside
+// blocks like `auth:` and `enforcement:` are covered too. seen guards against a
+// recursive type looping forever.
+func configYAMLKeys(rt reflect.Type, seen map[reflect.Type]bool) []string {
+	for rt.Kind() == reflect.Pointer || rt.Kind() == reflect.Slice || rt.Kind() == reflect.Map {
+		rt = rt.Elem()
+	}
+	if rt.Kind() != reflect.Struct || seen[rt] {
+		return nil
+	}
+	seen[rt] = true
+
+	var keys []string
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if tag := strings.Split(f.Tag.Get("yaml"), ",")[0]; tag != "" && tag != "-" {
+			keys = append(keys, tag)
+		}
+		keys = append(keys, configYAMLKeys(f.Type, seen)...)
+	}
+	return keys
+}
 
 // commandPath is a command's full path with the binary name stripped —
 // "host upgrade" for `lv host upgrade`, "" for the root itself.
@@ -419,13 +493,13 @@ func TestValidateInvocation(t *testing.T) {
 	}{
 		{[]string{"ls"}, ""},
 		{[]string{"run", "--name", "web", "--image", "ubuntu"}, ""},
-		{[]string{"start", "<vm>"}, ""},      // placeholder arg to a leaf
-		{[]string{"host", "upgrade"}, ""},    // real nested subcommand
+		{[]string{"start", "<vm>"}, ""},   // placeholder arg to a leaf
+		{[]string{"host", "upgrade"}, ""}, // real nested subcommand
 		{[]string{"compose", "up", "-f", "x.yml"}, ""},
-		{[]string{"help"}, ""},               // cobra built-in
-		{[]string{"host", "help"}, ""},       // cobra built-in under a group
-		{[]string{"frobnicate"}, "frobnicate"},          // bogus top-level command
-		{[]string{"host", "frobnicate"}, "frobnicate"},  // bogus subcommand of a group
+		{[]string{"help"}, ""},                         // cobra built-in
+		{[]string{"host", "help"}, ""},                 // cobra built-in under a group
+		{[]string{"frobnicate"}, "frobnicate"},         // bogus top-level command
+		{[]string{"host", "frobnicate"}, "frobnicate"}, // bogus subcommand of a group
 	}
 	for _, tc := range cases {
 		if got := validateInvocation(root, tc.args); got != tc.bad {
@@ -472,8 +546,8 @@ func TestCheckIdentifier(t *testing.T) {
 	}{
 		{"litevirt_foo_total", true},
 		{"litevirt_bar", false},
-		{"litevirt_foo_*", true}, // glob prefix in prose
-		{"litevirt_label_", true}, // trailing-underscore prefix
+		{"litevirt_foo_*", true},                        // glob prefix in prose
+		{"litevirt_label_", true},                       // trailing-underscore prefix
 		{"litevirt_audit_chain_last_verified_ok", true}, // allowlisted roadmap metric
 	}
 	for _, tc := range cases {

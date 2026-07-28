@@ -364,3 +364,58 @@ func TestNormalizeTelemetry_SampleRate(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadConfig_AdvertiseAddress: the key parses, and its absence leaves the
+// field empty so the daemon falls back to auto-detection (the pre-existing
+// single-homed behaviour).
+func TestLoadConfig_AdvertiseAddress(t *testing.T) {
+	write := func(t *testing.T, yaml string) Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", path)
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		return *cfg
+	}
+
+	cfg := write(t, "host_name: \"h\"\nadvertise_address: \"10.77.0.11\"\n")
+	if cfg.AdvertiseAddress != "10.77.0.11" {
+		t.Errorf("AdvertiseAddress = %q, want 10.77.0.11", cfg.AdvertiseAddress)
+	}
+
+	// Omitted ⇒ empty ⇒ auto-detect. A non-empty default would silently pin
+	// every existing single-homed deployment to one heuristic.
+	cfg = write(t, "host_name: \"h\"\n")
+	if cfg.AdvertiseAddress != "" {
+		t.Errorf("AdvertiseAddress = %q with the key omitted, want empty (auto-detect)", cfg.AdvertiseAddress)
+	}
+}
+
+// TestHostAddress_PrefersAdvertiseAddress: the host record a daemon
+// self-registers must use the configured advertise address, because that is the
+// address peers dial AND the same value gossip advertises. If this fell back to
+// getOutboundIP while gossip used the configured value (or vice versa), peers
+// would dial an address the host certificate does not cover.
+func TestHostAddress_PrefersAdvertiseAddress(t *testing.T) {
+	d := &Daemon{cfg: &Config{AdvertiseAddress: "10.77.0.11"}}
+	if got := d.hostAddress(); got != "10.77.0.11" {
+		t.Fatalf("hostAddress() = %q, want the configured advertise address 10.77.0.11", got)
+	}
+
+	// Unset ⇒ fall back to auto-detection. Assert only that it does NOT return
+	// the configured-address sentinel and is non-empty: the detected value
+	// depends on the host's routing table.
+	d = &Daemon{cfg: &Config{}}
+	got := d.hostAddress()
+	if got == "" {
+		t.Fatal("hostAddress() is empty with no advertise address; auto-detect must still yield something")
+	}
+	if got == "10.77.0.11" {
+		t.Fatalf("hostAddress() = %q with no advertise address configured — value leaked from config", got)
+	}
+}

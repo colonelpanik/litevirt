@@ -44,6 +44,24 @@ anti_entropy_interval_sec: 0
 # Cluster membership port (used for peer discovery).
 gossip_port: 7946
 
+# Address peers reach this host on. Sets BOTH the gossip advertise address and
+# the host record this daemon self-registers — they must agree, or peers dial an
+# address the host certificate does not cover and every replication push fails
+# the TLS hostname check.
+#
+# Empty (default) auto-detects, which is only safe on an unambiguously
+# single-homed host: the host record takes the source IP toward the DEFAULT
+# ROUTE, while gossip takes the first private IP by INTERFACE ENUMERATION ORDER.
+# Those are different heuristics and can pick different interfaces.
+#
+# SET THIS on any host with more than one network — a separate management NIC, a
+# NAT'd or container fabric, a storage network. The failure is quiet and
+# confusing when the auto-detected address is identical on every node (e.g. a
+# NAT'd 10.0.2.15): gossip membership looks healthy and every node lists its
+# peers by name, but each one dials ITSELF, so the cluster never converges and
+# the logs show "certificate is valid for <real ip>, not <wrong ip>".
+advertise_address: ""
+
 # Path to TLS certificates (CA, host cert/key).
 pki_dir: "/etc/litevirt/pki"
 

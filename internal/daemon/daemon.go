@@ -1182,15 +1182,7 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 		serial = "unknown"
 	}
 
-	// Get host address. The configured advertise address wins when set: peers
-	// dial the host record's address, so it must agree with what gossip
-	// advertises. getOutboundIP only reports the source IP toward the default
-	// route, which is the wrong answer on a multi-homed host whose cluster
-	// network is not the default one.
-	addr := d.cfg.AdvertiseAddress
-	if addr == "" {
-		addr = getOutboundIP()
-	}
+	addr := d.hostAddress()
 
 	return corrosion.InsertHost(ctx, d.db, corrosion.HostRecord{
 		Name:          d.cfg.HostName,
@@ -1348,6 +1340,19 @@ func fileBasedPoolDriver(driver string) bool {
 		return true
 	}
 	return false
+}
+
+// hostAddress is the address this daemon registers itself at — the address peers
+// will dial. The configured advertise address wins when set: it is the SAME
+// value handed to gossip, and the two must agree or peers dial an address the
+// host certificate does not cover. Falling back to getOutboundIP only reports
+// the source IP toward the default route, which is the wrong answer on a
+// multi-homed host whose cluster network is not the default one.
+func (d *Daemon) hostAddress() string {
+	if d.cfg.AdvertiseAddress != "" {
+		return d.cfg.AdvertiseAddress
+	}
+	return getOutboundIP()
 }
 
 func getOutboundIP() string {

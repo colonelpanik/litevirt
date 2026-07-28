@@ -107,7 +107,7 @@ ci-guards:
 	go run ./scripts/ci/stmtshapecheck -root .
 	go test ./scripts/ci/stmtshapecheck/
 	go test ./internal/corrosion/ -run 'TestSchemaHistoryDocumentsCurrentVersion|TestHistoricalLedgerComplete|TestHistoricalLedgerNonEmpty|TestSupportedReleaseFamilyManifest|TestLegacyTransformerManifest|TestCompatibilityDigestFrozen'
-	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestDocsDocumentEveryCLICommand|TestValidateInvocation|TestResolveInvocation|TestCheckIdentifier|TestExtractInvocations'
+	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestDocsDocumentEvery|TestValidateInvocation|TestResolveInvocation|TestCheckIdentifier|TestExtractInvocations'
 
 build-e2e:
 	CGO_ENABLED=0 go test -c -ldflags="$(LDFLAGS)" -o bin/e2e-test ./tests/e2e/

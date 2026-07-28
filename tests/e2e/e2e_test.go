@@ -302,7 +302,11 @@ func uniqueName(prefix string) string {
 	nameMu.Lock()
 	defer nameMu.Unlock()
 	nameSeq++
-	return fmt.Sprintf("e2e-%s-%d", prefix, nameSeq)
+	// The PID matters: a bare sequence restarts at 1 every run, so any resource
+	// surviving an interrupted run (a VM the cleanup could not remove, a stopped
+	// VM left behind by a failure) collides with the next run and fails it with
+	// AlreadyExists — a failure that looks like a product bug and is not.
+	return fmt.Sprintf("e2e-%s-%d-%d", prefix, os.Getpid(), nameSeq)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -26,7 +26,7 @@ func (s *Server) checkResourceAdmission(ctx context.Context, host, project strin
 
 	// Host capacity (owner-serialized). HostFreeCapacity already nets out committed
 	// running-VM actuals and in-flight reservations.
-	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacity(ctx, s.db, host)
+	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityWithPolicy(ctx, s.db, host, s.capacity)
 	if err != nil {
 		return status.Errorf(codes.Internal, "check host capacity: %v", err)
 	}

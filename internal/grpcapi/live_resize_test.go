@@ -142,7 +142,15 @@ func TestUpdateVM_LiveCPUGrow_Coordinated(t *testing.T) {
 func TestUpdateVM_LiveCPUGrow_HostCapacity(t *testing.T) {
 	s := liveResizeServer(t)
 	ctx := adminCtx()
-	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "test-host", CPUTotal: 8, MemTotal: 65536, State: "HOST_ACTIVE"}); err != nil {
+	// CPUOvercommit 1.0 + zero reserve pins this host to raw physical capacity, so
+	// the test asserts the ADMISSION path rather than the cluster's overcommit
+	// ratio (which defaults to 4x — vCPU is time-sliced — and would legitimately
+	// make a grow to 10 fit on 8 cores).
+	zero := 0
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", CPUTotal: 8, MemTotal: 65536, State: "HOST_ACTIVE",
+		CPUOvercommit: 1.0, CPUReserve: &zero,
+	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{

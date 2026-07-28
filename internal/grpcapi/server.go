@@ -285,6 +285,10 @@ type Server struct {
 	// unbounded admission + no billing.
 	tenancy *tenancy.Engine
 
+	// capacity is the cluster-wide capacity policy (overcommit ratios + host
+	// reserves). Zero value normalizes to the built-in defaults.
+	capacity corrosion.CapacityPolicy
+
 	// containerRuntime executes LXC ops on this host.
 	// nil = container RPCs return Unavailable. Tests inject a fake.
 	containerRuntime ContainerRuntime
@@ -932,6 +936,10 @@ func (s *Server) SetTenancyEngine(t *tenancy.Engine) { s.tenancy = t }
 // SetContainerRuntime wires the LXC/OCI runtime so the Containers
 // RPCs can act on this host. nil = container RPCs return Unavailable.
 func (s *Server) SetContainerRuntime(r ContainerRuntime) { s.containerRuntime = r }
+
+// SetCapacityPolicy wires the cluster-wide capacity policy (overcommit ratios and
+// host reserves) used by admission and placement.
+func (s *Server) SetCapacityPolicy(p corrosion.CapacityPolicy) { s.capacity = p }
 
 // SetLiveMover wires the libvirt blockdev-mirror driver. Daemon
 // constructs a real one from internal/libvirt; tests inject a fake.

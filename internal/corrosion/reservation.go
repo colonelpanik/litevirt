@@ -122,11 +122,20 @@ func ProjectReserved(ctx context.Context, c *Client, project string) (cpu, memMi
 	return cpu, memMiB, nil
 }
 
-// HostFreeCapacity reports a host's free CPU and memory (MiB): total minus committed
-// running-VM actuals minus in-flight nonterminal reservations. Negative values are
-// clamped to 0 (an overcommitted host has no free capacity). Returns ok=false when
-// the host is unknown.
+// HostFreeCapacity reports a host's free CPU and memory (MiB): ALLOCATABLE (see
+// HostAllocatable — physical, adjusted by overcommit ratios and host reserves)
+// minus committed running-VM actuals, per-VM qemu overhead, and in-flight
+// nonterminal reservations. Negative values are clamped to 0 (an overcommitted
+// host has no free capacity). Returns ok=false when the host is unknown.
+//
+// Uses the DEFAULT cluster policy. Callers that carry a configured one should use
+// HostFreeCapacityWithPolicy so a cluster's configuration is actually honoured.
 func HostFreeCapacity(ctx context.Context, c *Client, host string) (freeCPU, freeMemMiB int, ok bool, err error) {
+	return HostFreeCapacityWithPolicy(ctx, c, host, DefaultCapacityPolicy())
+}
+
+// HostFreeCapacityWithPolicy is HostFreeCapacity under an explicit cluster policy.
+func HostFreeCapacityWithPolicy(ctx context.Context, c *Client, host string, policy CapacityPolicy) (freeCPU, freeMemMiB int, ok bool, err error) {
 	h, err := GetHost(ctx, c, host)
 	if err != nil {
 		return 0, 0, false, err
@@ -142,9 +151,10 @@ func HostFreeCapacity(ctx context.Context, c *Client, host string) (freeCPU, fre
 	if err != nil {
 		return 0, 0, false, err
 	}
+	allocCPU, allocMem := HostAllocatable(*h, policy)
 	u := usage[host]
-	freeCPU = h.CPUTotal - u.CpuUsed - resCPU
-	freeMemMiB = h.MemTotal - u.MemUsedMiB - resMem
+	freeCPU = allocCPU - u.CpuUsed - resCPU
+	freeMemMiB = allocMem - u.MemUsedMiB - resMem - policy.MemOverheadFor(u.VMCount)
 	if freeCPU < 0 {
 		freeCPU = 0
 	}

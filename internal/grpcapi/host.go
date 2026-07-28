@@ -711,6 +711,32 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		args = append(args, f)
 		provided++
 	}
+	// Capacity overrides are numeric, so "" cannot mean unset — they are proto
+	// `optional` and a nil pointer is what leaves the column alone. A ratio of 0
+	// and a NEGATIVE reserve both mean "clear back to the cluster default"; a
+	// reserve of exactly 0 is a real setting (hand guests everything), which is
+	// why it could not double as the unset sentinel.
+	if v := req.CpuOvercommit; v != nil {
+		args, provided = append(args, *v), provided+1
+	} else {
+		args = append(args, nil)
+	}
+	if v := req.MemOvercommit; v != nil {
+		args, provided = append(args, *v), provided+1
+	} else {
+		args = append(args, nil)
+	}
+	if v := req.CpuReserve; v != nil {
+		args, provided = append(args, int(*v)), provided+1
+	} else {
+		args = append(args, nil)
+	}
+	if v := req.MemReserveMib; v != nil {
+		args, provided = append(args, int(*v)), provided+1
+	} else {
+		args = append(args, nil)
+	}
+
 	if provided == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no fields to update")
 	}
@@ -737,6 +763,10 @@ const configureHostSQL = `UPDATE hosts SET ` +
 	`watchdog_dev = COALESCE(?, watchdog_dev), ` +
 	`role = COALESCE(?, role), ` +
 	`region = COALESCE(?, region), ` +
+	`cpu_overcommit = COALESCE(?, cpu_overcommit), ` +
+	`mem_overcommit = COALESCE(?, mem_overcommit), ` +
+	`cpu_reserve = COALESCE(?, cpu_reserve), ` +
+	`mem_reserve_mib = COALESCE(?, mem_reserve_mib), ` +
 	`updated_at = ? ` +
 	`WHERE name = ?`
 

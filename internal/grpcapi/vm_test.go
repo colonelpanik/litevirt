@@ -1169,3 +1169,51 @@ func TestLockVM_Concurrent(t *testing.T) {
 	unlock2 := s.lockVM("test-vm")
 	unlock2()
 }
+
+// TestCreateVM_PinnedHostRespectsCapacity: pinning a host must not bypass host
+// capacity admission.
+//
+// placement.Select only scores capacity when it CHOOSES a host; a pin makes it
+// validate the host is active and return it, so a pinned create previously had no
+// capacity check at all. Demonstrated on a real 4-node cluster: three 1 GiB VMs
+// pinned to a ~3 GiB host were all accepted, the cluster reported 3072/2971 MiB,
+// and the node thrashed until sshd stopped answering. Meanwhile RESIZING a VM
+// into the same host was correctly refused — the two paths disagreed.
+func TestCreateVM_PinnedHostRespectsCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable is 4096 - 1024 (default host reserve) = 3072 MiB; 2560 of it is
+	// already in use by a running VM, leaving 512 free.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "sitting", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 2560,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "too-big", Cpu: 1, MemoryMib: 1024, // 1024 > 512 free
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("pinned create exceeding host memory: got %v, want ResourceExhausted", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, s.db, "too-big"); rec != nil {
+		t.Errorf("VM refused for capacity must not be persisted: %+v", rec)
+	}
+
+	// A VM that DOES fit must still be accepted — the check must not simply
+	// refuse every pinned create.
+	if _, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "fits", Cpu: 1, MemoryMib: 256,
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}}); err != nil {
+		t.Fatalf("pinned create that fits was refused: %v", err)
+	}
+}

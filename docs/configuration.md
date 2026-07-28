@@ -437,6 +437,46 @@ The sweep is local-only and deterministic (each node prunes its own copy; it
 never touches a current-active-set or current-generation row), so it is safe on a
 live cluster.
 
+## Capacity and overcommit
+
+How much of a host litevirt is willing to hand to workloads. Cluster-wide
+defaults live here; per-host overrides (`lv host config --cpu-overcommit …`) win
+where set.
+
+```yaml
+capacity:
+  cpu_overcommit_ratio: 4.0        # default 4.0
+  mem_overcommit_ratio: 1.0        # default 1.0
+  host_cpu_reserve: 1              # default 1
+  host_memory_reserve_mib: 1024    # default 1024
+  host_memory_reserve_pct: 5       # default 5
+  vm_memory_overhead_mib: 128      # default 128
+```
+
+**CPU and memory are deliberately different.** vCPU is time-sliced: running more
+vCPUs than cores is normal and the guests simply share, so the default
+oversubscribes 4×. Memory is not — without ballooning, KSM or swap a guest's RAM
+is either backed or the kernel starts reclaiming — so `mem_overcommit_ratio`
+defaults to exactly `1.0`. Raise it only where something makes the promise real.
+
+**The reserve matters more than either ratio.** At ratio 1.0 with no reserve,
+guests are offered 100% of RAM and nothing is left for the kernel, page cache,
+qemu's per-VM overhead or litevirtd itself — the host thrashes and, in the case
+that prompted this, stops answering SSH. The effective memory reserve is the
+**larger** of `host_memory_reserve_mib` and `host_memory_reserve_pct`, so the
+fixed floor protects small nodes while the percentage scales with large ones.
+
+`vm_memory_overhead_mib` is charged per running VM on top of its configured
+memory, covering qemu's own footprint (device models, video, page tables).
+Ignoring it under-counts usage, and by more the denser the host.
+
+These apply to **both** placement and admission — VM create (including a pinned
+`--host`) and live resize all consult the same numbers, so the scheduler and the
+admission check cannot disagree.
+
+To exceed them deliberately for one VM, pass `lv run --allow-overcommit`; the
+host check is skipped (project quota still applies) and the bypass is audited.
+
 ## Ports summary
 
 | Setting | Default | Protocol | Purpose |

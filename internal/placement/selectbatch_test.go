@@ -398,11 +398,16 @@ func TestSelectBatch_IgnoresStoppedVMs(t *testing.T) {
 	}{
 		{"node1", 4, 8192},
 	})
+	// Sized to fit within ALLOCATABLE capacity (physical minus the host reserve),
+	// not raw physical: a VM exactly equal to host RAM is refused now, correctly —
+	// handing guests 100% of memory leaves the host nothing. The discrimination is
+	// unchanged: if the stopped VM were counted, 4096 used of 7168 allocatable
+	// leaves 3072, and this request for 4096 would fail.
 	existingVMs := []corrosion.VMRecord{
-		makeVM("old-vm", "node1", 4, 8192, "stopped"), // stopped — should be ignored
+		makeVM("old-vm", "node1", 2, 4096, "stopped"), // stopped — should be ignored
 	}
 	results, err := SelectBatch(hosts, existingVMs, nil, []Request{
-		{VMName: "vm1", CPUNeeded: 4, MemMiBNeeded: 8192},
+		{VMName: "vm1", CPUNeeded: 2, MemMiBNeeded: 4096},
 	})
 	if err != nil {
 		t.Fatalf("SelectBatch: %v", err)

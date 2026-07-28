@@ -18,7 +18,14 @@ import (
 // shape (even one that keeps the family size) changes this digest, so the no-delete rule can't
 // silently swap out an old compatibility shape for an equal-sized replacement. Update it only
 // with a deliberate, reviewed compatibility change (e.g. a release ages out of the horizon).
-const compatibilityDigest = "419231f91af91686a2f8395a47f99b46276aebca60e55e93e5c545add8a8d56c"
+//
+// Updated for v43 (per-host capacity policy): InsertHost gained four columns, so the
+// tree stopped emitting v1.3.0's narrower INSERT. The old shape was ADDED to the
+// historical families (insert_host_v130) rather than dropped — a v1.3.0 peer still
+// emits it, and an upgraded receiver that no longer recognised it would back-pressure
+// a valid statement and stall that peer's stream. This digest change is that addition;
+// no existing shape's identity changed.
+const compatibilityDigest = "434613d6ec745eaae08fe802c5578256d496df36e9e10a9f3f37015ca4987fda"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -63,6 +70,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"vm_rename_v130":               3,   // vm_interfaces / vm_disks / ip_allocations
 	"network_rename_v130":          3,   // network_vteps / ip_allocations / vm_interfaces
 	"vm_disks_insert_v130":         1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
+	"insert_host_v130":             1,   // pre-capacity-policy hosts insert (narrower column list)
 	"pci_release_by_vm_v130":       1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
 }
 

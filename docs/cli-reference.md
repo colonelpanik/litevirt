@@ -556,6 +556,24 @@ lv lb disable <lb> --backend <vm>                 # Hard disable
 lv lb enable <lb> --backend <vm>                  # Re-enable
 ```
 
+## Capacity and overcommit
+
+```bash
+# Per-host overrides (cluster defaults come from `capacity:` in the daemon config)
+lv host config node-1 --cpu-overcommit 2.0     # 0 = inherit the cluster default
+lv host config node-1 --mem-overcommit 1.5     # only with ballooning/KSM/swap behind it
+lv host config node-1 --mem-reserve 2048       # MiB held back for the host; negative = inherit
+lv host config node-1 --cpu-reserve 2          # vCPUs held back; negative = inherit
+
+# Deliberate density for one VM — skips the HOST capacity check, audited.
+# Project quota still applies.
+lv run --name db --image ubuntu --memory 4096 --host node-1 --allow-overcommit
+```
+
+A `--mem-reserve 0` is a real setting meaning "hand guests every last MiB", which
+is why *inherit* is a negative value rather than zero. Placement and admission use
+the same numbers, so a pinned `--host` create is checked exactly like a resize.
+
 ## Hot-plug (attach/detach)
 
 **Requires `enforcement.operation_protocol`.** These commands are journaled and

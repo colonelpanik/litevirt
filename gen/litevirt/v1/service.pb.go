@@ -2130,10 +2130,13 @@ func (x *ListVMHardwareResponse) GetHardwareAdoptionError() string {
 }
 
 type StartVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// allow_overcommit skips HOST capacity admission for this start (project quota
+	// still applies). Same escape hatch as CreateVMRequest; the bypass is audited.
+	AllowOvercommit bool `protobuf:"varint,2,opt,name=allow_overcommit,json=allowOvercommit,proto3" json:"allow_overcommit,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *StartVMRequest) Reset() {
@@ -2171,6 +2174,13 @@ func (x *StartVMRequest) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *StartVMRequest) GetAllowOvercommit() bool {
+	if x != nil {
+		return x.AllowOvercommit
+	}
+	return false
 }
 
 type StopVMRequest struct {
@@ -22628,9 +22638,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x16ListVMHardwareResponse\x125\n" +
 	"\adevices\x18\x01 \x03(\v2\x1b.litevirt.v1.HardwareDeviceR\adevices\x126\n" +
 	"\x17hardware_adoption_state\x18\x02 \x01(\tR\x15hardwareAdoptionState\x126\n" +
-	"\x17hardware_adoption_error\x18\x03 \x01(\tR\x15hardwareAdoptionError\"$\n" +
+	"\x17hardware_adoption_error\x18\x03 \x01(\tR\x15hardwareAdoptionError\"O\n" +
 	"\x0eStartVMRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"S\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12)\n" +
+	"\x10allow_overcommit\x18\x02 \x01(\bR\x0fallowOvercommit\"S\n" +
 	"\rStopVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05force\x18\x02 \x01(\bR\x05force\x12\x18\n" +

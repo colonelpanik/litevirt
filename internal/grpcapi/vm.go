@@ -994,6 +994,38 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.FailedPrecondition, "start refused: %s", reason)
 	}
 
+	// Host capacity admission. Starting is where memory is actually CONSUMED —
+	// usage counts running VMs only, so a stopped VM contributes nothing until
+	// now. Without this, create-time admission is trivially sidestepped: create a
+	// pile of VMs (each fitting at the time), then start them all.
+	//
+	// Deliberately on the OPERATOR RPC, not inside startVMLocked. The automated
+	// failover / reconciler / health-restart paths bypass startVMLocked (see
+	// PrepareHardwareForStart), and they must stay unblocked: after a host reboot
+	// every VM is stopped and restarted at once, so an admission check there would
+	// let the first few start and then strand the rest — turning a clean recovery
+	// into a partial one. Recovery restores what was already accounted for; only a
+	// human asking for something NEW is admitted.
+	//
+	// Skipped when the VM is already running: `lv start` on a running VM is a
+	// no-op that adds nothing, and must not be refused for capacity it already
+	// occupies.
+	if vm.State != "running" {
+		spec := &pb.VMSpec{}
+		if vm.Spec != "" {
+			if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+				return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
+			}
+		}
+		if req.AllowOvercommit {
+			s.audit(ctx, "vm.start", vm.Name,
+				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
+					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+		} else if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+			return nil, err
+		}
+	}
+
 	return s.startVMLocked(ctx, vm)
 }
 

@@ -19,3 +19,15 @@ func TestHardwareV2Registered(t *testing.T) {
 		t.Fatalf("All() = %v, want it to contain %q", All(), HardwareV2)
 	}
 }
+
+func TestCapacityAdmissionV1Registered(t *testing.T) {
+	if CapacityAdmissionV1 != "capacity_admission_v1" {
+		t.Fatalf("CapacityAdmissionV1 = %q, want %q", CapacityAdmissionV1, "capacity_admission_v1")
+	}
+	if !slices.Contains(Supported(), CapacityAdmissionV1) {
+		t.Fatalf("Supported() = %v, want it to contain %q", Supported(), CapacityAdmissionV1)
+	}
+	if !slices.Contains(All(), CapacityAdmissionV1) {
+		t.Fatalf("All() = %v, want it to contain %q", All(), CapacityAdmissionV1)
+	}
+}

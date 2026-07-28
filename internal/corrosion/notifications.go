@@ -16,11 +16,13 @@ type NotificationTarget struct {
 // NotificationRoute selects which event patterns (at which min severity) go to
 // a target.
 type NotificationRoute struct {
-	ID           string
-	EventPattern string
-	TargetID     string
-	MinSeverity  string // info | warn | error
-	Enabled      bool
+	ID             string
+	EventPattern   string
+	SubjectPattern string
+	Project        string
+	TargetID       string
+	MinSeverity    string // info | warn | error
+	Enabled        bool
 }
 
 func InsertNotificationTarget(ctx context.Context, c *Client, t NotificationTarget) error {
@@ -67,23 +69,27 @@ func InsertNotificationRoute(ctx context.Context, c *Client, r NotificationRoute
 	if r.MinSeverity == "" {
 		r.MinSeverity = "info"
 	}
+	if r.SubjectPattern == "" {
+		r.SubjectPattern = "*"
+	}
 	return c.Execute(ctx,
-		`INSERT OR REPLACE INTO notification_routes (id, event_pattern, target_id, min_severity, enabled, created_at, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
-		r.ID, r.EventPattern, r.TargetID, r.MinSeverity, en, nowRFC3339(), now,
+		`INSERT OR REPLACE INTO notification_routes (id, event_pattern, subject_pattern, project, target_id, min_severity, enabled, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		r.ID, r.EventPattern, r.SubjectPattern, r.Project, r.TargetID, r.MinSeverity, en, nowRFC3339(), now,
 	)
 }
 
 func ListNotificationRoutes(ctx context.Context, c *Client) ([]NotificationRoute, error) {
 	rows, err := c.Query(ctx,
-		`SELECT id, event_pattern, target_id, min_severity, enabled FROM notification_routes WHERE deleted_at IS NULL ORDER BY event_pattern`)
+		`SELECT id, event_pattern, subject_pattern, project, target_id, min_severity, enabled FROM notification_routes WHERE deleted_at IS NULL ORDER BY event_pattern`)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]NotificationRoute, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, NotificationRoute{
-			ID: r.String("id"), EventPattern: r.String("event_pattern"), TargetID: r.String("target_id"),
+			ID: r.String("id"), EventPattern: r.String("event_pattern"),
+			SubjectPattern: r.String("subject_pattern"), Project: r.String("project"), TargetID: r.String("target_id"),
 			MinSeverity: r.String("min_severity"), Enabled: r.Int64("enabled") != 0,
 		})
 	}

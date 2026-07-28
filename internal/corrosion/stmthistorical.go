@@ -78,6 +78,36 @@ func HistoricalShapes() []HistoricalShape {
 		`updated_at = ? `+
 		`WHERE name = ?`, "configure_host_fixed_v130")
 
+	// Schema v44 widened these three builders with receiver-visible lifecycle
+	// and routing columns. Keep the v1.3.0 shapes accepted for the supported
+	// rolling-upgrade/WAL-retention horizon; receiver-only v44 columns retain
+	// their defaults or existing values through the column-preserving apply.
+	add(`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(host_name, name) DO UPDATE SET
+		   state = excluded.state,
+		   image = excluded.image,
+		   cpu_limit = excluded.cpu_limit,
+		   memory_mib = excluded.memory_mib,
+		   labels = excluded.labels,
+		   restart_policy = excluded.restart_policy,
+		   state_detail = excluded.state_detail,
+		   project = excluded.project,
+		   is_template = excluded.is_template,
+		   on_host_failure = excluded.on_host_failure,
+		   -- Keep an existing create_spec when the caller didn't supply one, so a
+		   -- generic upsert can't wipe the create-time intent (it's "current
+		   -- intent", forward-only).
+		   create_spec = CASE WHEN excluded.create_spec <> '' THEN excluded.create_spec ELSE create_spec END,
+		   relocate_token = excluded.relocate_token,
+		   updated_at = excluded.updated_at,
+		   deleted_at = NULL`, "containers_upsert_v130")
+	add(`INSERT OR REPLACE INTO containers
+		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, "containers_rekey_v130")
+	add(`INSERT OR REPLACE INTO notification_routes (id, event_pattern, target_id, min_severity, enabled, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`, "notification_routes_insert_v130")
+
 	// DeleteStackFirewall (v1.3.0): one bulk tombstone per firewall table by stack_name.
 	for _, tbl := range []string{"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
 		add("UPDATE "+tbl+" SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL", "stack_firewall_teardown_v130")

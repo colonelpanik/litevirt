@@ -19,14 +19,12 @@ import (
 // silently swap out an old compatibility shape for an equal-sized replacement. Update it only
 // with a deliberate, reviewed compatibility change (e.g. a release ages out of the horizon).
 //
-// Updated for v43 (per-host capacity policy): InsertHost AND the fixed-shape
-// ConfigureHost UPDATE each gained four capacity columns, so the tree stopped
-// emitting the prior release's narrower shapes. Both old shapes were ADDED to the
-// historical families (insert_host_v130, configure_host_fixed_v130) rather than
-// dropped — a prior-release peer still emits them, and an upgraded receiver that no
-// longer recognised them would back-pressure valid statements and stall that peer's
-// stream. This digest change is those additions; no existing shape's identity changed.
-const compatibilityDigest = "ca716aa29983ccb82fe3beb7175398319218d48af082ccfc38952bfef02860a1"
+// Updated for v44 (workload lifecycle + scoped notification routing): the
+// containers upsert/re-key and notification-route insert gained additive columns.
+// Their v1.3.0 shapes were ADDED to the historical families rather than dropped,
+// so supported peers and retained WAL continue to apply. No existing historical
+// identity was removed or changed.
+const compatibilityDigest = "eb487e6a2fc553b3edc2263648a968808cef3a287c8cf15ce5121e50b0d88377"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -66,14 +64,17 @@ func TestCompatibilityDigestFrozen(t *testing.T) {
 // upgrade/WAL-retention horizon (a deliberate act). Counts are the raw HistoricalShapes
 // expansion (before dedup against the current ledger).
 var supportedReleaseFamilyManifest = map[string]int{
-	"configure_host_v130":          127, // 2^7-1 non-empty subsets of the 7 ConfigureHost fields
-	"stack_firewall_teardown_v130": 4,   // ip_sets / cluster_firewall_rules / host_firewall_rules / firewall_defaults
-	"vm_rename_v130":               3,   // vm_interfaces / vm_disks / ip_allocations
-	"network_rename_v130":          3,   // network_vteps / ip_allocations / vm_interfaces
-	"vm_disks_insert_v130":         1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
-	"insert_host_v130":             1,   // pre-capacity-policy hosts insert (narrower column list)
-	"configure_host_fixed_v130":    1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
-	"pci_release_by_vm_v130":       1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
+	"configure_host_v130":             127, // 2^7-1 non-empty subsets of the 7 ConfigureHost fields
+	"stack_firewall_teardown_v130":    4,   // ip_sets / cluster_firewall_rules / host_firewall_rules / firewall_defaults
+	"vm_rename_v130":                  3,   // vm_interfaces / vm_disks / ip_allocations
+	"network_rename_v130":             3,   // network_vteps / ip_allocations / vm_interfaces
+	"vm_disks_insert_v130":            1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
+	"insert_host_v130":                1,   // pre-capacity-policy hosts insert (narrower column list)
+	"configure_host_fixed_v130":       1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
+	"containers_upsert_v130":          1,   // pre-v44 container upsert without lifecycle fencing columns
+	"containers_rekey_v130":           1,   // pre-v44 container re-key without lifecycle fencing columns
+	"notification_routes_insert_v130": 1,   // pre-v44 route insert without subject/project selectors
+	"pci_release_by_vm_v130":          1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

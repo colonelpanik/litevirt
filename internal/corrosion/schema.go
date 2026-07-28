@@ -250,7 +250,12 @@ import (
 //	     and reserve -1 mean "inherit the cluster default"; 0 is a MEANINGFUL
 //	     reserve (hand guests everything), so absence had to be a distinct value.
 //	     Four ADD COLUMN.
-const CurrentSchemaVersion = 43
+//	v44: workload lifecycle + scoped notification routing — containers gains
+//	     owner_epoch/spec_generation/active_operation_id, hosts gains the
+//	     capacity-policy fingerprint used by admission compatibility checks, and
+//	     notification_routes gains subject_pattern/project selectors. Six
+//	     additive columns with legacy-compatible defaults.
+const CurrentSchemaVersion = 44
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -604,6 +609,7 @@ var schemaDDL = []string{
 		mem_overcommit  REAL NOT NULL DEFAULT 0,
 		cpu_reserve     INTEGER NOT NULL DEFAULT -1,
 		mem_reserve_mib INTEGER NOT NULL DEFAULT -1,
+		capacity_policy_hash TEXT NOT NULL DEFAULT '',
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT
@@ -1044,6 +1050,8 @@ var schemaDDL = []string{
 	`CREATE TABLE IF NOT EXISTS notification_routes (
 		id            TEXT PRIMARY KEY,
 		event_pattern TEXT NOT NULL,         -- glob, e.g. "backup.*", "*"
+		subject_pattern TEXT NOT NULL DEFAULT '*',
+		project       TEXT NOT NULL DEFAULT '',
 		target_id     TEXT NOT NULL,
 		min_severity  TEXT NOT NULL DEFAULT 'info', -- info | warn | error
 		enabled       INTEGER NOT NULL DEFAULT 1,
@@ -1427,6 +1435,9 @@ var schemaDDL = []string{
 		on_host_failure TEXT,                             -- host-loss policy: ''/'none' | 'image-recreate' (v28); v34 prefers restore-from-backup, then image-recreate
 		create_spec     TEXT,                             -- JSON create-time intent (template/distro/release/arch/networks) for faithful relocation/restore (v34)
 		relocate_token  TEXT,                             -- attempt token a restore-relocation stamps so the coordinator can prove a target row is ITS restore (v34)
+		owner_epoch        INTEGER NOT NULL DEFAULT 0,     -- ownership incarnation for ABA-proof recovery (v44)
+		spec_generation    INTEGER NOT NULL DEFAULT 0,     -- monotonic desired-spec generation (v44)
+		active_operation_id TEXT NOT NULL DEFAULT '',      -- workload-wide mutation barrier (v44)
 		created_at     TEXT NOT NULL,
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT,
@@ -2012,6 +2023,14 @@ var schemaMigrations = []string{
 	`ALTER TABLE hosts ADD COLUMN mem_overcommit REAL NOT NULL DEFAULT 0`,
 	`ALTER TABLE hosts ADD COLUMN cpu_reserve INTEGER NOT NULL DEFAULT -1`,
 	`ALTER TABLE hosts ADD COLUMN mem_reserve_mib INTEGER NOT NULL DEFAULT -1`,
+	// v44: container lifecycle fencing, per-host admission policy fingerprint,
+	// and scoped notification routes (see History v44).
+	`ALTER TABLE containers ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE containers ADD COLUMN spec_generation INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE containers ADD COLUMN active_operation_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE hosts ADD COLUMN capacity_policy_hash TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE notification_routes ADD COLUMN subject_pattern TEXT NOT NULL DEFAULT '*'`,
+	`ALTER TABLE notification_routes ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2090,6 +2109,9 @@ var alterVersions = []int{
 	42, 42, 42, 42, // vm_disks.bus/device_kind/delete_with_vm/controller_model
 	42, 42, // vms.hardware_adoption_state/hardware_adoption_error
 	43, 43, 43, 43, // hosts.cpu_overcommit/mem_overcommit/cpu_reserve/mem_reserve_mib
+	44, 44, 44, // containers.owner_epoch/spec_generation/active_operation_id
+	44,     // hosts.capacity_policy_hash
+	44, 44, // notification_routes.subject_pattern/project
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

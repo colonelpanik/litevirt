@@ -328,12 +328,14 @@ type EnforcementConfig struct {
 	// local-disk transfer keeps today's gate. Changes live failover behavior for
 	// shared-disk VMs, so enable fleet-uniformly after every node is on the build.
 	SharedStorageFence bool `yaml:"shared_storage_fence,omitempty"`
-	// OperationProtocol: rely on the v41 F1 operation protocol (operations journal,
-	// per-VM epoch/generation, active_operation_id mutation barrier). When true
-	// (and the operation_protocol_v1 capability is latched cluster-wide), an
+	// OperationProtocol: rely on the operation journal and VM/container
+	// epoch/generation/active-operation barriers. When true (and both
+	// operation_protocol_v1 and its dependent capacity_admission_v1 capability
+	// are latched cluster-wide), an
 	// incompatible peer is quarantined from mutating endpoints + replication
 	// sessions (reseed-on-rejoin). The per-host PCI observation/ownership fixes are
-	// unaffected. Default false; the flag is the reversible kill switch.
+	// unaffected. capacity_admission_v1 intentionally has no separate public flag;
+	// this field drives both tokens. Default false; this is the reversible kill switch.
 	OperationProtocol bool `yaml:"operation_protocol,omitempty"`
 	// LiveResize: allow TRUE live CPU hot-add + balloon-memory resize (setting a
 	// max_cpu vCPU-hotplug ceiling). Refused until the live_resize_v1 capability is

@@ -446,3 +446,48 @@ func TestResolver_HostsControlPlaneUnresolved(t *testing.T) {
 		t.Fatalf("a benign-only host tie should converge by content-max, got unresolved=%v breaks=%v", unres2, sm2.tieBreaks)
 	}
 }
+
+func TestResolver_ContainerLifecycleControlFields(t *testing.T) {
+	counterCols := []string{
+		"host_name", "name", "owner_epoch", "spec_generation",
+		"active_operation_id", "updated_at",
+	}
+	_, sm, keepLocal, unresolved := resolve(t, "containers", counterCols,
+		[]interface{}{"h1", "ct1", "7", "9", "op-1", "T"},
+		[]interface{}{"h1", "ct1", "8", "9", "op-1", "T"})
+	if keepLocal || unresolved || len(sm.tieBreaks) != 1 ||
+		sm.tieBreaks[0] != "containers/numeric_max/incoming" {
+		t.Fatalf("higher container owner_epoch must win by numeric max, got keep=%v unresolved=%v breaks=%v",
+			keepLocal, unresolved, sm.tieBreaks)
+	}
+
+	_, sm, keepLocal, unresolved = resolve(t, "containers", counterCols,
+		[]interface{}{"h1", "ct1", "8", "10", "op-1", "T"},
+		[]interface{}{"h1", "ct1", "8", "9", "op-1", "T"})
+	if !keepLocal || unresolved || len(sm.tieBreaks) != 1 ||
+		sm.tieBreaks[0] != "containers/numeric_max/local" {
+		t.Fatalf("higher container spec_generation must remain local by numeric max, got keep=%v unresolved=%v breaks=%v",
+			keepLocal, unresolved, sm.tieBreaks)
+	}
+
+	_, sm, keepLocal, unresolved = resolve(t, "containers", counterCols,
+		[]interface{}{"h1", "ct1", "8", "10", "op-1", "T"},
+		[]interface{}{"h1", "ct1", "8", "10", "op-2", "T"})
+	if !keepLocal || !unresolved || len(sm.tieUnresolved) != 1 ||
+		sm.tieUnresolved[0] != "containers/ae/runtime_owned" {
+		t.Fatalf("different container active-operation pointers must be unresolved, got keep=%v unresolved=%v track=%v",
+			keepLocal, unresolved, sm.tieUnresolved)
+	}
+}
+
+func TestResolver_HostCapacityPolicyHashUnresolved(t *testing.T) {
+	cols := []string{"name", "capacity_policy_hash", "updated_at"}
+	_, sm, keepLocal, unresolved := resolve(t, "hosts", cols,
+		[]interface{}{"h1", "sha256:a", "T"},
+		[]interface{}{"h1", "sha256:b", "T"})
+	if !keepLocal || !unresolved || len(sm.tieUnresolved) != 1 ||
+		sm.tieUnresolved[0] != "hosts/ae/control_plane" {
+		t.Fatalf("different capacity-policy hashes must be unresolved, got keep=%v unresolved=%v track=%v",
+			keepLocal, unresolved, sm.tieUnresolved)
+	}
+}

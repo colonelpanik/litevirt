@@ -11,13 +11,12 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
-
-const testCapacityAdmissionCapability = "capacity_admission_v1"
 
 type createForwardClient struct {
 	pb.LiteVirtClient
@@ -666,8 +665,10 @@ func TestCreateVMForwardCompatibilityCutover(t *testing.T) {
 		s.hostName = "entry"
 		insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
 		insertPlacementExecutorHost(t, s, "target", 8, 16384, nil)
+		s.SetOperationProtocol(true)
 		s.SetGate(fakeServerGate{enforcedTok: map[string]bool{
-			testCapacityAdmissionCapability: latched,
+			capabilities.OperationProtocolV1: latched,
+			capabilities.CapacityAdmissionV1: latched,
 		}})
 		s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 			return peer, func() {}, nil

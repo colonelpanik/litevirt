@@ -83,8 +83,13 @@ type ContainerRecord struct {
 	// aren't cluster-unique — before tombstoning the source. '' for normal
 	// containers. Schema v34.
 	RelocateToken string
-	CreatedAt     string
-	UpdatedAt     string
+	// OwnerEpoch, SpecGeneration, and ActiveOperationID are the v44 workload
+	// operation-protocol fields, mirroring the VM lifecycle fencing columns.
+	OwnerEpoch        int64
+	SpecGeneration    int64
+	ActiveOperationID string
+	CreatedAt         string
+	UpdatedAt         string
 }
 
 // ContainerCreateSpec captures a container's create-time intent so host-loss
@@ -175,8 +180,8 @@ func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
 	return Statement{
-		SQL: `INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		SQL: `INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, owner_epoch, spec_generation, active_operation_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
 		   image = excluded.image,
@@ -193,11 +198,15 @@ func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 		   -- intent", forward-only).
 		   create_spec = CASE WHEN excluded.create_spec <> '' THEN excluded.create_spec ELSE create_spec END,
 		   relocate_token = excluded.relocate_token,
+		   owner_epoch = excluded.owner_epoch,
+		   spec_generation = excluded.spec_generation,
+		   active_operation_id = excluded.active_operation_id,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		Params: []interface{}{
 			r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
-			labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken, r.CreatedAt, now,
+			labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken,
+			r.OwnerEpoch, r.SpecGeneration, r.ActiveOperationID, r.CreatedAt, now,
 		},
 	}, nil
 }
@@ -461,12 +470,13 @@ func rekeyContainerStmt(c *Client, src ContainerRecord, toHost, now string) (Sta
 	}
 	return Statement{
 		SQL: `INSERT OR REPLACE INTO containers
-		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at, deleted_at)
-		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, owner_epoch, spec_generation, active_operation_id, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		Params: []interface{}{
 			toHost, src.Name, src.Image, src.CPULimit, src.MemMiB, labelsJSON,
 			src.RestartPolicy, ContainerRuntimeRekeyDetail, src.Project, boolToInt(src.IsTemplate),
-			src.OnHostFailure, src.CreateSpec, src.RelocateToken, createdAt, now,
+			src.OnHostFailure, src.CreateSpec, src.RelocateToken,
+			src.OwnerEpoch, src.SpecGeneration, src.ActiveOperationID, createdAt, now,
 		},
 	}, nil
 }
@@ -620,6 +630,7 @@ func GetContainer(ctx context.Context, c *Client, hostName, name string) (*Conta
 		        COALESCE(on_host_failure, '') AS on_host_failure,
 		        COALESCE(create_spec, '') AS create_spec,
 		        COALESCE(relocate_token, '') AS relocate_token,
+		        owner_epoch, spec_generation, active_operation_id,
 		        created_at, updated_at
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		hostName, name)
@@ -645,6 +656,7 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 		   COALESCE(on_host_failure, '') AS on_host_failure,
 		   COALESCE(create_spec, '') AS create_spec,
 		   COALESCE(relocate_token, '') AS relocate_token,
+		   owner_epoch, spec_generation, active_operation_id,
 		   created_at, updated_at
 		FROM containers WHERE deleted_at IS NULL`
 	var params []interface{}
@@ -679,6 +691,7 @@ func ListContainersPage(ctx context.Context, c *Client, hostName, afterHost, aft
 		   COALESCE(on_host_failure, '') AS on_host_failure,
 		   COALESCE(create_spec, '') AS create_spec,
 		   COALESCE(relocate_token, '') AS relocate_token,
+		   owner_epoch, spec_generation, active_operation_id,
 		   created_at, updated_at
 		FROM containers WHERE deleted_at IS NULL`
 	var params []interface{}
@@ -716,12 +729,15 @@ func scanContainer(r Row) ContainerRecord {
 		CPULimit: r.Int("cpu_limit"), MemMiB: r.Int("memory_mib"),
 		Labels:        decodeContainerLabels(r.String("labels")),
 		RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
-		Project:       r.String("project"),
-		IsTemplate:    r.Int("is_template") == 1,
-		OnHostFailure: r.String("on_host_failure"),
-		CreateSpec:    r.String("create_spec"),
-		RelocateToken: r.String("relocate_token"),
-		CreatedAt:     r.String("created_at"), UpdatedAt: r.String("updated_at"),
+		Project:           r.String("project"),
+		IsTemplate:        r.Int("is_template") == 1,
+		OnHostFailure:     r.String("on_host_failure"),
+		CreateSpec:        r.String("create_spec"),
+		RelocateToken:     r.String("relocate_token"),
+		OwnerEpoch:        r.Int64("owner_epoch"),
+		SpecGeneration:    r.Int64("spec_generation"),
+		ActiveOperationID: r.String("active_operation_id"),
+		CreatedAt:         r.String("created_at"), UpdatedAt: r.String("updated_at"),
 	}
 }
 

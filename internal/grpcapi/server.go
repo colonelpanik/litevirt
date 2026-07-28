@@ -402,6 +402,7 @@ func (s *Server) advertisedCapabilities() []string {
 	// opted in.
 	if !s.enfOperationProtocol {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
+		caps = withoutCapability(caps, capabilities.CapacityAdmissionV1)
 	}
 	// canonical_identity_v1 is likewise advertised CONDITIONALLY on its config flag: identity
 	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
@@ -582,6 +583,8 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.RBACRealmV1:
 		return s.rbacRealm
 	case capabilities.OperationProtocolV1:
+		return s.enfOperationProtocol
+	case capabilities.CapacityAdmissionV1:
 		return s.enfOperationProtocol
 	case capabilities.LiveResizeV1:
 		return s.enfLiveResize

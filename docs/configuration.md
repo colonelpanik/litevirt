@@ -171,12 +171,14 @@ enforcement:
                               # best-effort SSH fence is rejected. Local-disk transfers keep
                               # today's gate. Enable fleet-uniformly (changes failover behavior).
                               # See docs/migration-failover.md → "Shared-disk fence gating".
-  operation_protocol: false   # rely on the v41 F1 operation protocol (operations journal, per-VM
-                              # epoch/generation, active_operation_id mutation barrier, durable
-                              # device-lease recovery). Advertised CONDITIONALLY on this flag, so the
-                              # cluster-wide latch only forms once EVERY node has it enabled — the
-                              # barrier is never relied upon until the whole fleet has opted in. Enable
-                              # fleet-uniformly; the flag is the reversible kill switch.
+  operation_protocol: false   # rely on the operation journal, VM/container
+                              # epoch/generation + active_operation_id barriers, durable
+                              # device-lease recovery, and operation-backed capacity admission.
+                              # Both operation_protocol_v1 and capacity_admission_v1 are advertised
+                              # CONDITIONALLY on this flag, so their cluster-wide latches only form
+                              # once EVERY node has opted in. capacity_admission_v1 deliberately has
+                              # no standalone user flag. Enable fleet-uniformly; this flag is the
+                              # reversible kill switch.
                               #
                               # REQUIRED FOR HOTPLUG. Device attach/detach — disk, NIC, and
                               # concrete-address PCI — refuse while this is off, because each

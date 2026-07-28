@@ -13,15 +13,11 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/placement"
 )
-
-// Task 4 registers and advertises this token. Keeping the decision site here
-// makes this build mixed-version safe before that registration exists: the
-// capability cannot latch yet, so legacy forwarding remains active.
-const capacityAdmissionCapability = "capacity_admission_v1"
 
 const createVMForwardHopMetadata = "x-litevirt-create-hop"
 
@@ -181,7 +177,9 @@ func (s *Server) capacityPolicyFingerprint(ctx context.Context) (string, error) 
 }
 
 func (s *Server) capacityAdmissionLatched() bool {
-	return s.gate != nil && s.gate.Latched(capacityAdmissionCapability)
+	return s.enfOperationProtocol && s.gate != nil &&
+		s.gate.Latched(capabilities.OperationProtocolV1) &&
+		s.gate.Latched(capabilities.CapacityAdmissionV1)
 }
 
 func (s *Server) forwardCreateVM(ctx context.Context, req *pb.CreateVMRequest, targetHost string) (*pb.VM, error) {

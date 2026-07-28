@@ -323,10 +323,20 @@ var capabilityMap = map[string]tableResolver{
 		ruleContentMax(),
 	}},
 	// containers: host_name is part of the PK (an ownership split is two distinct
-	// rows the per-PK resolver can't see — Phase 4 runtime re-key handles it), so
-	// only the tenancy column needs a carve-out here. create_spec is the
-	// relocation-critical definition blob → opaque.
-	"containers": {category: "tenancy-content", chain: tenancyOpaqueChain("project", "create_spec")},
+	// rows the per-PK resolver can't see — Phase 4 runtime re-key handles it).
+	// Within one PK, v44 lifecycle counters/pointers mirror the VM rules:
+	// monotonic counters take max, while conflicting active-operation pointers
+	// are a surfaced runtime-ownership fault. The tenancy and opaque create-spec
+	// carve-outs remain ahead of benign content convergence.
+	"containers": {category: "runtime-owned", chain: []tieRule{
+		ruleColUnresolved("project", "tenancy"),
+		ruleNumericMax("owner_epoch"),
+		ruleNumericMax("spec_generation"),
+		ruleColUnresolved("active_operation_id", "runtime_owned"),
+		ruleTombstone(),
+		ruleAnyColUnresolved([]string{"create_spec"}, "opaque"),
+		ruleContentMax(),
+	}},
 
 	// Tenancy-bearing, otherwise content-default. config is the resource
 	// definition blob → opaque (storage_pools has only scalar columns).
@@ -389,7 +399,7 @@ var capabilityMap = map[string]tableResolver{
 		ruleAnyColUnresolved([]string{
 			"state", "address", "ssh_user", "ssh_port", "grpc_port", "cert_serial",
 			"ipmi_address", "ipmi_user", "ipmi_pass", "watchdog_dev", "fence_strategy",
-			"role", "schema_version",
+			"role", "schema_version", "capacity_policy_hash",
 		}, "control_plane"),
 		ruleContentMax(),
 	}},

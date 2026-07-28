@@ -618,6 +618,7 @@ lv sg rm <id>
 lv sg rule-add <sg-id> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
 lv sg rule-ls <sg-id>
+lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
   # --network matches the compose network name on the NIC; --sg is repeatable
   # (an empty --sg list clears the bindings).

@@ -236,6 +236,9 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		// the HOST capacity check is bypassed. Audited so it is never silent — an
 		// oversubscribed host that later thrashes should be traceable to the
 		// decision that put it there.
+		if err := s.requireOvercommit(ctx, vmRBACPathFor(spec.Project, spec.Name)); err != nil {
+			return nil, err
+		}
 		s.audit(ctx, "vm.create", spec.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
@@ -1018,6 +1021,9 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			}
 		}
 		if req.AllowOvercommit {
+			if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
+				return nil, err
+			}
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
@@ -2824,6 +2830,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 			cpuGrow, memGrow := posOnly(int(wantCPU-spec.Cpu)), posOnly(int(wantMem-spec.MemoryMib))
 			if req.AllowOvercommit {
+				if err := s.requireOvercommit(ctx, vmRBACPath(fresh)); err != nil {
+					return nil, err
+				}
 				if cpuGrow > 0 || memGrow > 0 {
 					s.audit(ctx, "vm.update", req.Name,
 						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",

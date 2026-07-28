@@ -9,6 +9,15 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// requireOvercommit gates the --allow-overcommit capacity bypass. Skipping the
+// host capacity check is an operator-level judgment call, not a routine
+// lifecycle action: a binding that grants only lifecycle verbs (vm.start,
+// vm.create, …) must not carry it. Wildcard grants (Operator's vm.*) do; in
+// the legacy no-bindings model every operator keeps it, unchanged.
+func (s *Server) requireOvercommit(ctx context.Context, path string) error {
+	return s.RequirePerm(ctx, path, "vm.overcommit", "operator")
+}
+
 // checkHostCapacity verifies a proposed CPU/memory GROW (positive deltas, MiB)
 // fits the target host's free capacity. This is the START-TIME check: a stopped
 // workload's allocation is already counted in project-quota usage ("an

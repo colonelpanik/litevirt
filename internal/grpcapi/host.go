@@ -596,11 +596,24 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		s.publish("host.fence-confirmed", req.Name, "manual")
 		s.audit(ctx, "host.fence-confirm", req.Name,
 			"operator confirmed manual fence", "manual-confirmed")
+		// Deliberately narrow wording. This unblocks the flow where the COORDINATOR
+		// fenced (manual / best-effort strategy) and is waiting on confirmation
+		// before it reschedules. It does NOT make an operator-initiated fence
+		// reschedule anything: FenceHost never enumerates workloads, and the
+		// coordinator skips hosts already in offline/fenced/maintenance
+		// (failover/coordinator.go:364) — so promising a reschedule here would be
+		// false in exactly the case an operator is most likely to be in.
+		//
+		// A genuinely failed host does not need this: peers observe it by health
+		// quorum and the coordinator runs the whole fence-and-relocate sequence
+		// itself. For PLANNED removal, `lv host drain` is the tool — it migrates
+		// workloads off before the host goes away.
 		return &pb.FenceResult{
 			HostName: req.Name,
 			Method:   "manual",
 			Result:   "manual-confirmed",
-			Detail:   "operator confirmation recorded; coordinator may now reschedule",
+			Detail: "operator confirmation recorded; a coordinator waiting on this confirmation may now reschedule. " +
+				"This does not itself move workloads — for planned removal use `lv host drain " + req.Name + "` first",
 		}, nil
 	}
 
@@ -663,11 +676,20 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	}
 
 	// Validate fence strategy if provided.
+	//
+	// The set must match what internal/fence actually implements. It did not:
+	// "manual" and "best-effort" are both real strategies (fence.Execute
+	// dispatches them, and the failover coordinator has explicit handling for
+	// each), but ConfigureHost rejected them — so the ONE strategy whose whole
+	// purpose is operator-confirmed rescheduling could not be configured through
+	// the CLI at all, and "best-effort" (the default for hosts created before this
+	// field existed) could not be restored once changed away from.
 	if req.FenceStrategy != "" {
 		switch req.FenceStrategy {
-		case "ssh", "ipmi", "watchdog":
+		case "ssh", "ipmi", "watchdog", "manual", "best-effort":
 		default:
-			return nil, status.Errorf(codes.InvalidArgument, "invalid fence strategy %q (valid: ssh, ipmi, watchdog)", req.FenceStrategy)
+			return nil, status.Errorf(codes.InvalidArgument,
+				"invalid fence strategy %q (valid: ssh, ipmi, watchdog, manual, best-effort)", req.FenceStrategy)
 		}
 	}
 

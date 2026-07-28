@@ -205,6 +205,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		if count == 0 {
 			count = 1
 		}
+		selectorKind, _ := corrosion.ClassifyPCISelector(spec)
 
 		// SR-IOV VF allocation is inherently side-effecting — it CAS-claims free VFs
 		// and may create a VF pool on-demand (writing host sysfs) — so it cannot be
@@ -214,7 +215,7 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		// A resource-mapping spec is a concrete pin, not VF allocation: mapping
 		// resolution must precede the SR-IOV branch (as in the original order), so a
 		// Sriov+Mapping spec resolves the mapped device rather than allocating a VF.
-		if spec.Sriov && spec.Address == "" && spec.Mapping == "" {
+		if selectorKind == "sriov" {
 			vfAddrs, err := s.allocateSRIOVVFs(ctx, vmName, spec, count)
 			if err != nil {
 				return nil, noop, err
@@ -275,14 +276,16 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 		count = 1
 	}
 
-	address := spec.Address
-	// Resource mapping (#14): resolve a cluster-wide mapping name to the concrete
-	// PCI address registered for THIS host, then treat it as an exact pin. This is
-	// what lets a passthrough VM land on / migrate to any host that has a device
-	// under the same mapping. Mapping outranks a frozen Address artifact, matching
-	// ClassifyPCISelector and CanonicalPCISelector. Resolve into a local var —
-	// never mutate the input spec.
-	if spec.Mapping != "" {
+	selectorKind, _ := corrosion.ClassifyPCISelector(spec)
+	address := ""
+	switch selectorKind {
+	case "mapping":
+		// Resource mapping (#14): resolve a cluster-wide mapping name to the concrete
+		// PCI address registered for THIS host, then treat it as an exact pin. This is
+		// what lets a passthrough VM land on / migrate to any host that has a device
+		// under the same mapping. Mapping outranks a frozen Address artifact, matching
+		// ClassifyPCISelector and CanonicalPCISelector. Resolve into a local var —
+		// never mutate the input spec.
 		addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)
@@ -292,6 +295,11 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 				"resource mapping %q has no device on host %s", spec.Mapping, s.hostName)
 		}
 		address = addr
+	case "address":
+		address = spec.Address
+	case "sriov":
+		return nil, status.Error(codes.FailedPrecondition,
+			"SR-IOV selector must be resolved by the SR-IOV allocator")
 	}
 
 	var members []ResolvedMember

@@ -179,7 +179,7 @@ func scoreHostDevicesForHost(
 		// SR-IOV: gate on an SR-IOV-capable PF (matching type/vendor/parent) being
 		// present — VFs are created or reused on-demand by the owner's allocator, so a
 		// currently-empty managed PF (no unassigned VF rows yet) must still qualify.
-		// A free VF already in inventory also qualifies. Placement never pins a VF here.
+		// Placement never infers VF identity from an ordinary free device or pins a VF.
 		if req.Sriov {
 			if !sriovHostEligible(devices, req) {
 				return false, 0
@@ -236,10 +236,11 @@ func exactDeviceEligible(devices []corrosion.PCIDeviceRecord, address string) bo
 	return true
 }
 
-// sriovHostEligible reports whether the host can satisfy an SR-IOV request: it has an
-// SR-IOV-capable PF of the requested type (matching vendor + parent when specified),
-// or an existing free VF of that type. The authoritative capacity/managed-PF decision
-// happens at allocation time on the owner; this is a best-effort host gate.
+// sriovHostEligible reports whether the host can satisfy an SR-IOV request: it
+// requires an SR-IOV-capable PF of the requested type (matching vendor, model,
+// and parent when specified). Inventory has no authoritative VF-to-PF relation,
+// so an ordinary unassigned device never proves VF eligibility. The final
+// managed-PF/create-or-reuse decision happens at allocation time on the owner.
 func sriovHostEligible(devices []corrosion.PCIDeviceRecord, req DeviceRequest) bool {
 	count := req.Count
 	if count <= 0 {

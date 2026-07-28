@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -151,10 +152,24 @@ func placementDeviceRequest(dev *pb.DeviceSpec) placement.DeviceRequest {
 }
 
 func placementValidationError(err error) error {
-	if placement.IsInfrastructureError(err) {
-		return status.Errorf(codes.Internal, "revalidate resolved placement: %v", err)
+	return placementStatusError("resolved placement is no longer eligible", err)
+}
+
+func placementSelectionError(err error) error {
+	return placementStatusError("placement failed", err)
+}
+
+func placementStatusError(message string, err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return status.Errorf(codes.Canceled, "%s: %v", message, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Errorf(codes.DeadlineExceeded, "%s: %v", message, err)
 	}
-	return status.Errorf(codes.ResourceExhausted, "resolved placement is no longer eligible: %v", err)
+	if placement.IsInfrastructureError(err) {
+		return status.Errorf(codes.Internal, "%s: %v", message, err)
+	}
+	return status.Errorf(codes.ResourceExhausted, "%s: %v", message, err)
 }
 
 func (s *Server) capacityPolicyFingerprint(ctx context.Context) (string, error) {

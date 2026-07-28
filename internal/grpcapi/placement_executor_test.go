@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -270,8 +271,26 @@ func TestPlacementValidationErrorDistinguishesInfrastructure(t *testing.T) {
 	if got := status.Code(placementValidationError(err)); got != codes.Internal {
 		t.Fatalf("code = %v, want Internal (err=%v)", got, err)
 	}
-	if got := status.Code(placementValidationError(context.Canceled)); got != codes.ResourceExhausted {
-		t.Fatalf("eligibility code = %v, want ResourceExhausted", got)
+	if got := status.Code(placementValidationError(fmt.Errorf("wrapped: %w", context.Canceled))); got != codes.Canceled {
+		t.Fatalf("cancellation code = %v, want Canceled", got)
+	}
+	if got := status.Code(placementValidationError(fmt.Errorf("wrapped: %w", context.DeadlineExceeded))); got != codes.DeadlineExceeded {
+		t.Fatalf("deadline code = %v, want DeadlineExceeded", got)
+	}
+}
+
+func TestCreateVMPlacementInfrastructureFailureIsInternal(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	if err := s.db.Execute(context.Background(), `DROP TABLE hosts`); err != nil {
+		t.Fatalf("DROP TABLE hosts: %v", err)
+	}
+
+	_, err := s.CreateVM(adminCtx(), &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{Name: "backend-down"},
+	})
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code = %v, want Internal for placement backend failure (err=%v)", got, err)
 	}
 }
 
@@ -387,6 +406,133 @@ func TestExecuteCreateVMMappingOnly(t *testing.T) {
 	}
 	if vm.GetHostName() != "test-host" {
 		t.Fatalf("host = %q, want test-host", vm.GetHostName())
+	}
+}
+
+func invokeDeviceSelectorCreate(t *testing.T, s *Server, execute bool, spec *pb.VMSpec) {
+	t.Helper()
+	if !execute {
+		if _, err := s.CreateVM(adminCtx(), &pb.CreateVMRequest{Spec: spec}); err != nil {
+			t.Fatalf("CreateVM: %v", err)
+		}
+		return
+	}
+	if _, err := s.ExecuteCreateVM(mtlsAdminCtx("entry"), &pb.ExecuteCreateVMRequest{
+		Request:              &pb.CreateVMRequest{Spec: spec},
+		ResolvedHost:         "test-host",
+		PlacementFingerprint: capacityFingerprintForServer(t, s),
+		HopCount:             1,
+	}); err != nil {
+		t.Fatalf("ExecuteCreateVM: %v", err)
+	}
+}
+
+func assertOnlyOwnedPCIAddress(t *testing.T, s *Server, vmName, want string) {
+	t.Helper()
+	devices, err := corrosion.ListPCIDevices(context.Background(), s.db, s.hostName, "")
+	if err != nil {
+		t.Fatalf("ListPCIDevices: %v", err)
+	}
+	var owned []string
+	for _, device := range devices {
+		if device.VMName == vmName {
+			owned = append(owned, device.Address)
+		}
+	}
+	if len(owned) != 1 || owned[0] != want {
+		t.Fatalf("PCI addresses owned by %q = %v, want [%s]", vmName, owned, want)
+	}
+}
+
+func TestCreateAndExecuteSRIOVSelectorIgnoreFrozenAddress(t *testing.T) {
+	for _, execute := range []bool{false, true} {
+		name := "CreateVM"
+		if execute {
+			name = "ExecuteCreateVM"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := testServerR2(t)
+			s.virt = libvirtfake.New()
+			restore := vfio.SetFS(newPCIBindFakeFS())
+			defer restore()
+			insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
+			insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
+
+			pf := "0000:41:00.0"
+			vfs := fakeSysfsPF(t, pf, 8, 1)
+			seedPCIDevice(t, context.Background(), s, pf, true)
+			seedPCIDevice(t, context.Background(), s, vfs[0], false)
+			// This is a valid, claimable BDF so the old address-first allocator
+			// succeeds with the wrong device instead of merely erroring.
+			stale := "0000:42:00.0"
+			seedPCIDevice(t, context.Background(), s, stale, false)
+
+			vmName := "sriov-create"
+			if execute {
+				vmName = "sriov-execute"
+			}
+			invokeDeviceSelectorCreate(t, s, execute, &pb.VMSpec{
+				Name: vmName,
+				Placement: &pb.PlacementSpec{
+					Host: "test-host",
+				},
+				Devices: []*pb.DeviceSpec{{
+					Sriov: true, Type: "network", Parent: pf,
+					Address: stale,
+				}},
+			})
+			assertOnlyOwnedPCIAddress(t, s, vmName, vfs[0])
+		})
+	}
+}
+
+func TestCreateAndExecuteTypeModelSelectorIgnoreFrozenAddress(t *testing.T) {
+	for _, execute := range []bool{false, true} {
+		name := "CreateVM"
+		if execute {
+			name = "ExecuteCreateVM"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := testServerR2(t)
+			s.virt = libvirtfake.New()
+			restore := vfio.SetFS(newPCIBindFakeFS())
+			defer restore()
+			insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
+			insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
+
+			stale := "0000:41:00.0"
+			matched := "0000:42:00.0"
+			for _, device := range []corrosion.PCIDeviceRecord{
+				{
+					HostName: "test-host", Address: stale, Type: "gpu",
+					VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+				},
+				{
+					HostName: "test-host", Address: matched, Type: "gpu",
+					VendorID: "10de", DeviceName: "H100", IOMMUGroup: -1,
+				},
+			} {
+				if err := corrosion.UpsertPCIDevice(context.Background(), s.db, device); err != nil {
+					t.Fatalf("UpsertPCIDevice(%s): %v", device.Address, err)
+				}
+			}
+
+			vmName := "type-create"
+			if execute {
+				vmName = "type-execute"
+			}
+			invokeDeviceSelectorCreate(t, s, execute, &pb.VMSpec{
+				Name: vmName,
+				Placement: &pb.PlacementSpec{
+					Host: "test-host",
+				},
+				Devices: []*pb.DeviceSpec{{
+					Type: "gpu", Vendor: "10de", Model: "H100",
+					Address: stale,
+				}},
+			})
+			assertOnlyOwnedPCIAddress(t, s, vmName, matched)
+		})
 	}
 }
 

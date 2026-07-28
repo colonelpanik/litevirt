@@ -190,7 +190,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	} else {
 		targetHost, err = placement.Select(ctx, s.db, placementReq)
 		if err != nil {
-			return nil, status.Errorf(codes.ResourceExhausted, "placement failed: %v", err)
+			return nil, placementSelectionError(err)
 		}
 	}
 	// Host capacity admission. Placement now runs pinned and unpinned candidates

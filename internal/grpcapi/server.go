@@ -149,6 +149,11 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// bridgeEnsure is a test seam for host bridge availability and provisioning.
+	// Production leaves it nil, preserving the net.InterfaceByName +
+	// network.EnsureBridge validation path.
+	bridgeEnsure func(name string) error
+
 	// probeHolder is a test seam for the Phase-2 VIP takeover check: when non-nil it
 	// replaces the real fresh-probe of a peer holder's (reachable, supports, assigned)
 	// state. Production leaves it nil.

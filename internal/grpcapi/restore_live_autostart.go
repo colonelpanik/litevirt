@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"net"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,7 +13,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
@@ -189,11 +187,9 @@ func (s *Server) autoDefineRestoredVM(
 			mac = lv.GenerateMAC()
 		}
 		bridge := n.Name
-		if _, err := net.InterfaceByName(bridge); err != nil {
-			if err := network.EnsureBridge(bridge); err != nil {
-				return "", "", status.Errorf(codes.FailedPrecondition,
-					"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
-			}
+		if err := s.ensureBridge(bridge); err != nil {
+			return "", "", status.Errorf(codes.FailedPrecondition,
+				"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
 		}
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{

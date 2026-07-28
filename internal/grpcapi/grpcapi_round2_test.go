@@ -71,6 +71,9 @@ func testServerR2(t *testing.T) *Server {
 		images:   store,
 		events:   events.NewBus(),
 		vmLocks:  make(map[string]*sync.Mutex),
+		bridgeEnsure: func(string) error {
+			return nil
+		},
 	}
 }
 

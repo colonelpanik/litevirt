@@ -35,6 +35,9 @@ func testServerWithLocks(t *testing.T) *Server {
 		db:       db,
 		events:   events.NewBus(),
 		vmLocks:  make(map[string]*sync.Mutex),
+		bridgeEnsure: func(string) error {
+			return nil
+		},
 	}
 }
 

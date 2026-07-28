@@ -503,12 +503,9 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		} else {
 			// Bridge preflight: ensure the bridge exists on this host.
 			// For plain bridges, auto-create if missing.
-			if _, err := net.InterfaceByName(bridge); err != nil {
-				if err := network.EnsureBridge(bridge); err != nil {
-					return nil, status.Errorf(codes.FailedPrecondition,
-						"network bridge %q not found on host %s and auto-create failed: %v", bridge, s.hostName, err)
-				}
-				slog.Info("auto-created bridge", "bridge", bridge, "host", s.hostName)
+			if err := s.ensureBridge(bridge); err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"network bridge %q not found on host %s and auto-create failed: %v", bridge, s.hostName, err)
 			}
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Bridge: bridge,

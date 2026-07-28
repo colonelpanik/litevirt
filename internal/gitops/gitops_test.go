@@ -2,6 +2,7 @@ package gitops
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,16 @@ import (
 // the real `git` binary because the controller does too.
 func initRemoteRepo(t *testing.T) (remoteURL, workTree string) {
 	t.Helper()
+	// Isolate from the developer's global/system git config before running any
+	// git. A machine that signs commits by default (commit.gpgsign=true) but
+	// resolves user.signingkey through a path-scoped includeIf makes `git commit`
+	// fail outright here: these tempdir repos live outside that path, so they
+	// inherit "sign everything" with no key to sign with. The controller under
+	// test shells out to git too and inherits this env, so both sides of the
+	// fixture stay hermetic.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+
 	root := t.TempDir()
 	bare := filepath.Join(root, "remote.git")
 	work := filepath.Join(root, "scratch")

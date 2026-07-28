@@ -983,7 +983,7 @@ func (s *Server) executeDiskDetach(ctx context.Context, vm *corrosion.VMRecord, 
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepAttached)
 
-	if err := s.verifyDiskDetached(vm.Name, targetDev, running); err != nil {
+	if err := s.verifyDiskDetached(ctx, vm.Name, targetDev, running); err != nil {
 		slog.Error("disk detach: absence unverifiable — left recoverable", "vm", vm.Name, "op", opID, "error", err)
 		return nil, status.Errorf(codes.Internal, "disk detach for %q could not be verified; left recoverable: %v", vm.Name, err)
 	}
@@ -1040,14 +1040,24 @@ func (s *Server) failDeviceDetachClean(ctx context.Context, vm *corrosion.VMReco
 // in the persistent config would silently reappear on the next VM start. On the STOPPED
 // path there is only the inactive definition. Any failure routes to the detach path's
 // forward compensation (leave NON-TERMINAL for recovery; never re-attach).
-func (s *Server) verifyDiskDetached(vmName, targetDev string, running bool) error {
+func (s *Server) verifyDiskDetached(ctx context.Context, vmName, targetDev string, running bool) error {
 	if running {
-		srcs, err := s.virt.DomainDiskSources(vmName)
-		if err != nil {
-			return fmt.Errorf("read live disks: %w", err)
-		}
-		if _, ok := srcs[targetDev]; ok {
+		// The live read WAITS: a successful DetachDisk only requested the unplug
+		// (see hotplug_unplug_wait.go). Reading once here reports a guest that has
+		// not yet acknowledged as a detach that failed.
+		err := waitDeviceGone(ctx, func() (bool, error) {
+			srcs, rerr := s.virt.DomainDiskSources(vmName)
+			if rerr != nil {
+				return false, fmt.Errorf("read live disks: %w", rerr)
+			}
+			_, present := srcs[targetDev]
+			return !present, nil
+		})
+		switch {
+		case errors.Is(err, errUnplugTimeout):
 			return fmt.Errorf("disk %s still present in the live domain after detach", targetDev)
+		case err != nil:
+			return err
 		}
 		xml, err := s.virt.DumpXMLInactive(vmName)
 		if err != nil {

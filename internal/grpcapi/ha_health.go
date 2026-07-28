@@ -136,11 +136,18 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) bool {
 	// map read); the rest latch over subsequent cycles.
 	drove := false
 	for _, tok := range capabilities.Supported() {
-		if !s.tokenEnabled(tok) {
+		// An ALREADY-latched token is driven regardless of its config flag: Enforced's cheap
+		// already-path RETRIES a marker write that hasn't yet persisted, and that retry must not
+		// stop just because the operator disabled the flag after the token latched. Otherwise a
+		// token latched in memory but not on disk would never become DurablyLatched, and a
+		// durable-gated contract (canonical registry acceptance) would fail closed forever.
+		if s.gate.Latched(tok) {
+			s.gate.Enforced(ctx, tok) // cheap already-path; keeps retrying marker persistence
 			continue
 		}
-		if s.gate.Latched(tok) {
-			s.gate.Enforced(ctx, tok) // cheap already-path; keeps the marker persisted
+		// UNLATCHED activation depends on the config flag: advertised ≠ enforcing, so a config-off
+		// token is not driven and never latches.
+		if !s.tokenEnabled(tok) {
 			continue
 		}
 		if drove {

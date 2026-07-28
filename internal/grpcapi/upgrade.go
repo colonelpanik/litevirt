@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -184,8 +185,12 @@ Description=litevirt daemon
 After=network-online.target libvirtd.service
 Wants=network-online.target
 Wants=libvirtd.service
-StartLimitBurst=3
-StartLimitIntervalSec=600
+# A burst of external restarts (e.g. a package manager's needrestart during an apt
+# run) must NOT trip the start limit — that would fire OnFailure=litevirt-rollback
+# and downgrade a HEALTHY binary. Generous window; genuine upgrade-time crash loops
+# are caught by the sentinel-gated rollback below + the in-process health watchdog.
+StartLimitBurst=10
+StartLimitIntervalSec=300
 OnFailure=litevirt-rollback.service
 
 [Service]
@@ -203,19 +208,31 @@ WantedBy=multi-user.target
 
 // litevirtRollbackUnit is the companion oneshot that systemd fires when
 // the main litevirtd unit enters a failed state (i.e. StartLimitBurst
-// exceeded). It restores `.old` over the current binary, clears the
-// failed state, and restarts the main service.
+// exceeded). It restores `.old` over the current binary ONLY when an
+// upgrade is actually in progress (the .upgrade-pending sentinel is
+// present); otherwise it must NOT touch the binary.
+//
+// The sentinel gate is essential: without it, ANY failed-state — e.g. an
+// external restart storm that trips the start limit while the binary is
+// perfectly healthy — would downgrade a good binary and could burn the
+// only `.old`, taking the node down (the 2026-07-15 docker004 outage).
+// This mirrors the in-process health watchdog, which also only acts while
+// the sentinel is present.
 //
 // The journal-tagged log line is intentionally loud — operators should
 // notice in `journalctl -u litevirt-rollback` that something rolled back.
 const litevirtRollbackUnit = `[Unit]
-Description=litevirt daemon rollback (auto-restore previous binary on failed upgrade)
+Description=litevirt daemon rollback (auto-restore previous binary on a failed upgrade)
 
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c '\
+  if [ ! -f /usr/local/bin/litevirt.upgrade-pending ]; then \
+    logger -t litevirt-rollback "litevirt entered a failed state but no upgrade is in progress (no sentinel) — NOT rolling back the binary; leaving it for systemd/operator"; \
+    exit 0; \
+  fi; \
   if [ -f /usr/local/bin/litevirt.old ]; then \
-    logger -t litevirt-rollback "RESTORING previous litevirt binary after failed upgrade"; \
+    logger -t litevirt-rollback "RESTORING previous litevirt binary after a failed upgrade"; \
     mv /usr/local/bin/litevirt.old /usr/local/bin/litevirt; \
     systemctl reset-failed litevirt.service; \
     systemctl start litevirt.service; \
@@ -228,6 +245,17 @@ ExecStart=/bin/sh -c '\
 const rollbackUnitPath = "/etc/systemd/system/litevirt-rollback.service"
 
 const unitPath = "/etc/systemd/system/litevirt.service"
+
+// needrestartDropin tells needrestart (run by unattended-upgrades after a library
+// upgrade) to NEVER auto-restart litevirt. A stateful orchestrator daemon must not be
+// bounced mid-operation, and a restart storm can trip the start limit (2026-07-15
+// docker004 outage). Installed idempotently alongside the systemd units.
+const needrestartDropinPath = "/etc/needrestart/conf.d/99-litevirt.conf"
+const needrestartDropin = `# Managed by litevirt. Never let needrestart auto-restart the orchestrator daemon on
+# a library upgrade — a mid-operation restart is disruptive and a restart storm can
+# trip systemd's start limit + the rollback unit.
+push @{$nrconf{blacklist_rc}}, qr(^litevirt\.service$);
+`
 
 // updateSystemdUnit writes the current unit file templates (main + rollback
 // companion) and reloads systemd if anything changed on disk. Best-effort —
@@ -249,6 +277,21 @@ func updateSystemdUnit() {
 			changed = true
 		}
 	}
+	// Install the needrestart exclusion when needrestart is present. Not a systemd
+	// unit, so it never gates the daemon-reload below; best-effort.
+	if _, err := os.Stat("/etc/needrestart"); err == nil {
+		if existing, err := os.ReadFile(needrestartDropinPath); err != nil || string(existing) != needrestartDropin {
+			if err := os.WriteFile(needrestartDropinPath, []byte(needrestartDropin), 0644); err != nil {
+				slog.Warn("failed to write needrestart drop-in", "error", err)
+			} else {
+				slog.Info("installed needrestart exclusion for litevirt")
+			}
+		}
+	}
+	// Remove the deprecated litevirt PCI udev rule left by an older host-init — but
+	// ONLY when its contents are the known litevirt rule, so a hand-edited or foreign
+	// file at that path is never deleted (warn + leave instead).
+	removeStaleUdevRule()
 	if !changed {
 		return
 	}
@@ -257,6 +300,45 @@ func updateSystemdUnit() {
 		return
 	}
 	slog.Info("systemd units updated (main + rollback)")
+}
+
+// litevirtUdevRulePath is the deprecated PCI udev rule an older host-init installed.
+const litevirtUdevRulePath = "/etc/udev/rules.d/99-litevirt-pci.rules"
+
+// isLitevirtUdevRule reports whether the file contents are recognizably the litevirt
+// PCI udev rule (an ownership marker), so a stale-rule cleanup never deletes a foreign
+// or hand-edited file at that path.
+func isLitevirtUdevRule(contents string) bool {
+	return strings.Contains(contents, "litevirt") &&
+		strings.Contains(contents, "/api/v1/hosts/rescan") &&
+		strings.Contains(contents, `SUBSYSTEM=="pci"`)
+}
+
+// removeStaleUdevRule deletes the deprecated litevirt PCI udev rule on upgrade.
+func removeStaleUdevRule() {
+	if removeStaleUdevRuleAt(litevirtUdevRulePath) {
+		_, _ = exec.Command("udevadm", "control", "--reload-rules").CombinedOutput()
+	}
+}
+
+// removeStaleUdevRuleAt removes the file at path ONLY when its contents match the
+// known litevirt rule; a foreign/edited file is left in place with a warning. Returns
+// true if a rule was actually removed. Best-effort.
+func removeStaleUdevRuleAt(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false // absent (or unreadable) — nothing to do
+	}
+	if !isLitevirtUdevRule(string(b)) {
+		slog.Warn("leaving unrecognized file at the litevirt udev-rule path untouched", "path", path)
+		return false
+	}
+	if err := os.Remove(path); err != nil {
+		slog.Warn("failed to remove deprecated litevirt udev rule", "path", path, "error", err)
+		return false
+	}
+	slog.Info("removed deprecated litevirt PCI udev rule", "path", path)
+	return true
 }
 
 // countBlocking returns how many findings are severity="block".

@@ -100,6 +100,7 @@ vms:
     iso: "/path/to/boot.iso"  # Boot from ISO instead of image
     kind: "vm"                # vm (default) | lxc | oci — see "Workloads" below
     cpu: 2                    # vCPUs (default 2)
+    max-cpu: 8                # vCPU hotplug ceiling (> cpu); with live_resize, cpu grows live up to it
     cpu-mode: "host-model"    # host-passthrough | host-model | custom
     memory: "4G"              # Memory: "4G", "4096M", or 4096 (MiB) — boot allocation
     min-memory: "1G"          # Ballooning floor the host may reclaim to (0 = none)
@@ -164,7 +165,9 @@ hosts that advertise the container runtime, so they never land on a node that
 can't run them. Image forms: `kind: lxc` takes a download template (`image:
 "alpine:3.21"`) or a rootfs path; an OCI **registry ref** must be pre-pulled
 today (`lv ct pull <ref> --dest <rootfs-dir>`, then set `image:` to that rootfs
-path). Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
+path). Each container is given its own copy of the rootfs, so one pull backs any
+number of containers and `compose down` leaves the pulled template untouched.
+Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
 (cpu/mem changes recreate the container rather than live-tuning); and full
 network/IPAM/security-group provisioning for container NICs (a container sharing
 a stack network with a VM uses the bridge the VM path provisions).
@@ -570,14 +573,18 @@ Control how VMs are updated when a compose file changes. The strategy determines
 
 Strategies:
 
-- `recreate` — (default) Delete then create each VM sequentially. Simple but has downtime.
+- `recreate` — (default) Delete then create each VM sequentially. Simple but has downtime. Deleting a VM destroys its disks.
 - `rolling` / `stop-first` — Update VMs one at a time: stop old, create new, wait for health check, continue.
 - `start-first` — Create new VM first, wait for health check, then stop old. Minimizes downtime.
-- `all-at-once` — Recreate all VMs simultaneously. Fast but risky. Supports `rollback-on-failure`.
+- `all-at-once` — Recreate all VMs simultaneously. Fast but risky.
 - `blue-green` — Create a parallel set of new VMs ("-green" suffix), verify health, then cut over.
-- `in-place` — Try live CPU/memory hot-add without restart. Falls back to recreate for non-hot-modifiable changes.
+- `in-place` — **Live-or-fail: it applies live changes only and NEVER deletes a VM.** A cpu grow (within the `max-cpu` hotplug ceiling) and a memory change (within the `[min-memory, max-memory]` balloon band) are applied to the running VM with no restart; live-metadata changes (restart policy, onboot, ordering, labels, placement, migrate) are patched into the spec. Any change that would need a restart (max-cpu / mem-bounds / cpu-mode / machine / firmware / graphics / secure-boot / tpm / passthrough devices / health-check / hooks / stop-grace / a cpu shrink or grow beyond the ceiling / an out-of-band memory target) or a recreate (image / iso / disk or network topology / cloud-init) is **refused with a clear error — nothing is deleted or partially applied.** Use `recreate` (or stop the VM and `lv update`) for those.
 
-During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last.
+`in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. A destructive recreate happens only under the explicit `recreate` / `all-at-once` / `blue-green` / `snapshot-and-replace` strategies.
+
+During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last. A rolling update fails fast: if any VM update errors, the deploy stops **before** the scale-down step and the stack's stored desired state is left unchanged, so a failed update never deletes a VM the change didn't intend to and never records a half-applied stack.
+
+> Mixed-version note: `in-place`'s non-destructive behavior is enforced by the entry node serving the deploy. Do not rely on the `in-place` strategy until every mutation-serving node in the cluster runs a build that supports it.
 
 ## Migration policy
 
@@ -625,9 +632,17 @@ still take ad-hoc snapshots via `lv backup`. See [`docs/backups.md`](backups.md)
         count: 1
       - type: "network"
         sriov: true
-        parent: "eth1"
+        parent: "0000:41:00.0"      # SR-IOV: PF PCI address (BDF) to draw a VF from
       - mapping: "gpu-a100"         # cluster-wide resource mapping (see below)
 ```
+
+An `sriov: true` device requests an SR-IOV virtual function. Placement only requires
+the target host to have a matching SR-IOV-capable PF (optionally the one named by
+`parent`); the actual VF is **allocated on-demand at create time** — reused if one is
+free, or created on an adopted PF per the host's `pci.sriov` policy (see
+[pci-passthrough.md](pci-passthrough.md#sr-iov-virtual-functions)). It is never pinned
+to a fixed VF address at plan time. `parent` is a PF **PCI address (BDF)**, not a
+NIC name. The same is available ad-hoc via `lv attach-pci <vm> --sriov --parent <BDF>`.
 
 A `mapping` references a cluster-wide **resource mapping** (`lv mapping`) — a named
 alias for an equivalent passthrough device registered on one or more hosts. At

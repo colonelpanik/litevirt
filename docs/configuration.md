@@ -86,15 +86,25 @@ pci:
   # How often to rescan PCI devices. "0" disables periodic rescan.
   rescan_interval: "5m"
 
-  # Install udev rule for real-time PCI hotplug events.
-  udev_hook: true
+  # DEPRECATED: no longer installs a udev rule. Real-time PCI events are covered by
+  # rescan_interval. Setting it true only logs a warning; remove any leftover
+  # /etc/udev/rules.d/99-litevirt-pci.rules (an upgrade cleans up the litevirt one).
+  udev_hook: false
 
   # SR-IOV configuration.
   sriov:
-    # false: operator creates VFs manually. true: litevirt manages VF lifecycle.
+    # false: operators provision VFs (litevirt reuses free VFs on any PF, but never
+    # writes sriov_numvfs). true: litevirt may CREATE the VF pool on an adopted PF.
     managed: false
-    # Maximum VFs per physical function (only when managed: true).
+    # VF pool size litevirt creates on a managed, EMPTY, adopted PF (default 8),
+    # clamped to the PF's hardware sriov_totalvfs. litevirt creates the pool ONCE; it
+    # never grows, shrinks, or destroys a pool.
     max_vfs_per_pf: 8
+    # Allowlist of PF PCI addresses litevirt may create VFs on when managed: true.
+    # Entries are canonicalized (a malformed BDF is warned about + ignored). An empty
+    # list with managed: true adopts no PF (reuse-only). A PF NOT in this list is
+    # never written to — VFs there can still be reused if the operator created them.
+    managed_pfs: ["0000:41:00.0"]
 
 # Host-level storage pools (created as libvirt pools on startup).
 # See storage.md for driver details. Operators may also add pools at
@@ -128,8 +138,65 @@ enforcement:
   safe_fence_default: false   # a best-effort (unconfirmable) fence must carry an operator
                               # proof (`lv host fence-confirm`) before reschedule/promote
   lww_skew_guard: false       # quarantine an incoming LWW row >5 min future-skewed (future-skew only)
+  hlc_lww: false              # emit HLC conflict keys for updated_at (fixes the backward-clock
+                              # lost-update: a wall-clock step-back can otherwise mint older-sorting
+                              # keys that lose cluster-wide). The persisted monotonic clock
+                              # (nowts.hwm) is ALWAYS on; this flips only the KEY FORMAT and is a
+                              # real kill switch — per-node rollback is safe (the comparator orders
+                              # HLC and RFC3339 by instant). Enable fleet-uniformly, AFTER every
+                              # node is on the build.
   vip_self_demote: false      # a minority node releases its VIPs on sustained quorum loss
   vip_proof_reclaim: false    # majority refuses a VIP takeover without a release/fence proof
+  shared_storage_fence: false # a cross-host transfer (auto-promote/reschedule) of a VM with a
+                              # writable SHARED disk (nfs/ceph/rbd/iscsi) requires a proof-grade
+                              # fence of the old owner (IPMI or `lv host fence-confirm`); a
+                              # best-effort SSH fence is rejected. Local-disk transfers keep
+                              # today's gate. Enable fleet-uniformly (changes failover behavior).
+                              # See docs/migration-failover.md → "Shared-disk fence gating".
+  operation_protocol: false   # rely on the v41 F1 operation protocol (operations journal, per-VM
+                              # epoch/generation, active_operation_id mutation barrier, durable
+                              # device-lease recovery). Advertised CONDITIONALLY on this flag, so the
+                              # cluster-wide latch only forms once EVERY node has it enabled — the
+                              # barrier is never relied upon until the whole fleet has opted in. Enable
+                              # fleet-uniformly; the flag is the reversible kill switch.
+  live_resize: false          # allow TRUE live CPU hot-add + balloon-memory resize. Setting a VM's
+                              # max_cpu vCPU-hotplug ceiling is refused until this latches cluster-wide
+                              # (an old peer could drop max_cpu from a spec it rewrites), after which
+                              # `lv update --cpu` grows a running VM's vCPUs live up to its ceiling.
+                              # Enable fleet-uniformly; the flag is the reversible kill switch.
+  digest_v2: false            # emit the order-invariant anti-entropy row digest (digest_v2), which
+                              # pairs each value with its column NAME instead of hashing values in
+                              # physical column order — so a fresh-CREATE vs ALTER-upgraded node stop
+                              # showing a permanent column-order divergence. Negotiated PAIRWISE by
+                              # field presence (no latch): two peers compare v2 only when both emit it,
+                              # else both compare v1, so a mixed fleet is always safe. Enable
+                              # fleet-uniformly then run `lv cluster converge --all`. See
+                              # docs/diagnostics.md → "digest_v2".
+  canonical_identity: false   # resolve the natural-key identity tables (snapshots,
+                              # container_snapshots) by their UNIQUE natural key instead of the
+                              # minted random id. Two nodes can independently create DIFFERENT ids
+                              # for one logical object, whose rows then collide on the secondary
+                              # UNIQUE and back-pressure; once this latches cluster-wide the
+                              # receiver collapses each such pair to a single deterministic winner
+                              # (newer updated_at; an exact-instant tie breaks to the smaller id
+                              # ONLY when the rows' content is otherwise equal — a different-content
+                              # tie stays a surfaced fault) by RE-KEYING the surviving row in place,
+                              # so receiver-only columns are preserved. Unlike digest_v2 this is NOT
+                              # pairwise — identity resolution mutates shared state, so (like
+                              # operation_protocol) it is advertised only while this flag is on and
+                              # activates only when the flag is set AND the token has latched
+                              # fleet-wide. Enable fleet-uniformly; the flag is the reversible kill
+                              # switch.
+  canonical_registry: false   # PREPARATORY infrastructure for the canonical registry-credential
+                              # model (a deterministic-id row per (scope,owner,registry)). Setting
+                              # this only ADVERTISES canonical_registry_v1 so the cluster can latch
+                              # it; once durably latched, replicated CANONICAL upserts are accepted on
+                              # apply (permanently — the writer-activation contract emits them). It
+                              # does NOT switch the writer or run consolidation: new API writes still
+                              # use the legacy writer, so the concurrent-login collision remains open
+                              # until the deferred operator-run contract (see docs/diagnostics.md).
+                              # The flag gates advertisement/opt-in only; it does not revoke an
+                              # already-formed latch. Advertised only while on; enable fleet-uniformly.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and
@@ -153,6 +220,12 @@ auth:
   # bearer and runs RBAC + audit as the real user instead of the peer=admin
   # trusted-forward. Default false.
   forwarded_identity: false
+  # Realm-aware role bindings: when true (and the rbac_realm_v1 capability is
+  # active cluster-wide), a bare `user:<name>` grant is rejected pre-latch and
+  # resolved to `user:<name>@<realm>` once latched, so this node stops minting
+  # inert legacy bare bindings. Default false; the flag is the reversible kill
+  # switch. See docs/auth.md.
+  rbac_realm: false
   realms:
     - name: corp                          # realm short name; users login as alice@corp
       kind: oidc

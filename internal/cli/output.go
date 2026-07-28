@@ -18,7 +18,29 @@ func PrintHostInspect(ctx context.Context, c pb.LiteVirtClient, name string) err
 	if err != nil {
 		return fmt.Errorf("inspect host: %w", err)
 	}
-	return printJSON(host)
+	if err := printJSON(host); err != nil {
+		return err
+	}
+	// Ops-visibility hint (stderr — leaves the JSON on stdout intact): a host whose
+	// fence strategy can't PROVE a power-off (anything but IPMI) gives its shared-disk
+	// VMs manual-confirm-only automated failover once shared-storage fencing is
+	// enforced — a per-host implication that is otherwise invisible until an incident.
+	switch host.GetFenceStrategy() {
+	case "ipmi":
+	default:
+		fmt.Fprintf(os.Stderr,
+			"note: fence strategy %q cannot prove a power-off; shared-disk VMs on %q require IPMI or `lv host fence-confirm %s` for automated failover under shared-storage fencing\n",
+			fenceStrategyOrDefault(host.GetFenceStrategy()), name, name)
+	}
+	return nil
+}
+
+// fenceStrategyOrDefault renders "" as its effective default for the hint.
+func fenceStrategyOrDefault(s string) string {
+	if s == "" {
+		return "best-effort"
+	}
+	return s
 }
 
 // PrintVMInspect prints detailed VM info as JSON.

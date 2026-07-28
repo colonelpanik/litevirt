@@ -192,11 +192,11 @@ type Config struct {
 // environment contract (see internal/obs). Every field is optional; an empty
 // OTLPEndpoint leaves OTLP export off (local structured logging only).
 type TelemetryConfig struct {
-	OTLPEndpoint string  `yaml:"otlp_endpoint,omitempty"` // OTLP HTTP endpoint URL, e.g. "http://otel-collector:4318"; http://|https://, no URL userinfo (use LITEVIRT_OTEL_HEADERS for auth); empty = export disabled
-	Environment  string  `yaml:"environment,omitempty"`   // deployment env label, e.g. "prod"/"homelab"
-	SampleRate   *float64 `yaml:"sample_rate,omitempty"`  // trace sample rate 0.0–1.0; unset = library default (100%), 0 = disabled (0%)
-	LogLevel     string  `yaml:"log_level,omitempty"`     // TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO; note WARNING, not WARN)
-	LogFormat    string  `yaml:"log_format,omitempty"`    // json|console|pretty (default console — human text; set json for structured export)
+	OTLPEndpoint string   `yaml:"otlp_endpoint,omitempty"` // OTLP HTTP endpoint URL, e.g. "http://otel-collector:4318"; http://|https://, no URL userinfo (use LITEVIRT_OTEL_HEADERS for auth); empty = export disabled
+	Environment  string   `yaml:"environment,omitempty"`   // deployment env label, e.g. "prod"/"homelab"
+	SampleRate   *float64 `yaml:"sample_rate,omitempty"`   // trace sample rate 0.0–1.0; unset = library default (100%), 0 = disabled (0%)
+	LogLevel     string   `yaml:"log_level,omitempty"`     // TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO; note WARNING, not WARN)
+	LogFormat    string   `yaml:"log_format,omitempty"`    // json|console|pretty (default console — human text; set json for structured export)
 }
 
 // ACMEConfig configures autocert for the web UI (#13). directory_url points at
@@ -265,6 +265,14 @@ type AuthConfig struct {
 	// ForwardedIdentityV1 capability active cluster-wide gate the owner-side
 	// promotion. Default false; the flag is the enforcement + kill switch.
 	ForwardedIdentity bool `yaml:"forwarded_identity,omitempty"`
+	// RBACRealm, when true, opts this node into realm-aware role-binding grammar.
+	// With it on, GrantRole stops minting inert legacy bare bindings: while the
+	// RBACRealmV1 capability is not yet latched cluster-wide it REJECTS a bare
+	// user:<name> grant (require an explicit realm); once latched it RESOLVES a
+	// bare grant to the target user's realm and stores it canonically. Default
+	// false (bare grants accepted as-is, legacy behavior); the flag is the
+	// reversible kill switch.
+	RBACRealm bool `yaml:"rbac_realm,omitempty"`
 }
 
 // EnforcementConfig holds the per-node kill-switches for the split-brain-family
@@ -283,6 +291,11 @@ type EnforcementConfig struct {
 	// skew only — the backward-clock case is a separate, deferred token. Changes
 	// merge behavior, so enable fleet-uniformly.
 	LWWSkewGuard bool `yaml:"lww_skew_guard,omitempty"`
+	// HLCLww: emit the LWW conflict key (updated_at) as an HLC string instead of
+	// RFC3339Nano (capabilities.HLCLwwV1) — the backward-clock fix. Emission activates
+	// only when this flag is set AND the token has latched cluster-wide; the comparator
+	// is instant-based so a per-node canary and a flag-off rollback are both safe.
+	HLCLww bool `yaml:"hlc_lww,omitempty"`
 	// VIPSelfDemote: on sustained local quorum loss, a minority node stops
 	// keepalived + releases its VIPs so it can't serve a VIP the majority may bring
 	// up (capabilities.VIPDemoteV1).
@@ -292,6 +305,50 @@ type EnforcementConfig struct {
 	// release/fence proof (capabilities.VIPReleaseProbeV1). Named for the behavior
 	// it gates, not the release-probe RPC (which still serves when this is off).
 	VIPProofReclaim bool `yaml:"vip_proof_reclaim,omitempty"`
+	// SharedStorageFence: a cross-host ownership TRANSFER start (auto-promote /
+	// reschedule) of a VM with a writable SHARED disk (nfs/ceph/rbd/iscsi) requires
+	// a proof-grade fence of the old owner — confirmed power-off (IPMI) or operator
+	// manual-confirm, carried in the proof's fence_epoch (capabilities.
+	// SharedStorageFenceV1). A best-effort SSH fence is rejected for such a VM; a
+	// local-disk transfer keeps today's gate. Changes live failover behavior for
+	// shared-disk VMs, so enable fleet-uniformly after every node is on the build.
+	SharedStorageFence bool `yaml:"shared_storage_fence,omitempty"`
+	// OperationProtocol: rely on the v41 F1 operation protocol (operations journal,
+	// per-VM epoch/generation, active_operation_id mutation barrier). When true
+	// (and the operation_protocol_v1 capability is latched cluster-wide), an
+	// incompatible peer is quarantined from mutating endpoints + replication
+	// sessions (reseed-on-rejoin). The per-host PCI observation/ownership fixes are
+	// unaffected. Default false; the flag is the reversible kill switch.
+	OperationProtocol bool `yaml:"operation_protocol,omitempty"`
+	// LiveResize: allow TRUE live CPU hot-add + balloon-memory resize (setting a
+	// max_cpu vCPU-hotplug ceiling). Refused until the live_resize_v1 capability is
+	// latched cluster-wide (every peer must support it, else the field could be
+	// dropped by an old peer's spec rewrite). Default false; reversible kill switch.
+	LiveResize bool `yaml:"live_resize,omitempty"`
+	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
+	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
+	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
+	// presence (no cluster latch): a node emits v2 only when this is on, and two peers
+	// compare v2 only when both emitted it — so a non-uniform rollout is safe. Default
+	// false; reversible kill switch.
+	DigestV2 bool `yaml:"digest_v2,omitempty"`
+	// CanonicalIdentity: resolve the natural-key identity tables (snapshots,
+	// container_snapshots) by their UNIQUE natural key instead of the minted random id
+	// (capabilities.CanonicalIdentityV1), so two nodes' independently-minted ids for one
+	// logical object collapse to a single deterministic winner instead of back-pressuring on
+	// the secondary UNIQUE. Enabled only when this flag is set AND the token has latched
+	// cluster-wide (identity resolution mutates shared state, so it must be fleet-uniform, not
+	// pairwise). Default false; reversible kill switch.
+	CanonicalIdentity bool `yaml:"canonical_identity,omitempty"`
+	// CanonicalRegistry: opt into the Part H2 canonical registry-credential model
+	// (capabilities.CanonicalRegistryV1). This flag ONLY controls ADVERTISEMENT of the token so
+	// the cluster can latch it with config uniformity; once DURABLY latched, replicated canonical
+	// upserts are accepted on apply (permanently — flag-off does not revoke it). It does NOT switch
+	// the writer or run consolidation: there is no migration controller, and new API writes stay on
+	// the legacy writer, so the concurrent-login collision remains open until the deferred
+	// operator-run activation contract (see docs/diagnostics.md). Default false; the flag is a
+	// reversible advertisement opt-in only.
+	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.
@@ -321,8 +378,16 @@ type PCIConfig struct {
 
 // SRIOVConfig holds SR-IOV settings.
 type SRIOVConfig struct {
-	Managed     bool `yaml:"managed"`        // false = operator creates VFs; true = litevirtd manages
-	MaxVFsPerPF int  `yaml:"max_vfs_per_pf"` // only used when managed=true (default 8)
+	Managed bool `yaml:"managed"` // false = operator provisions VFs; true = litevirtd may create the VF pool on an adopted PF
+	// MaxVFsPerPF caps the VF pool litevirtd creates on a managed PF (default 8),
+	// clamped to the PF's hardware sriov_totalvfs. litevirtd creates a pool of this
+	// size ONCE on an empty adopted PF; it never grows, shrinks, or destroys a pool.
+	MaxVFsPerPF int `yaml:"max_vfs_per_pf"`
+	// ManagedPFs is the allowlist of PF PCI addresses (BDFs) litevirtd may create
+	// VFs on when managed=true. Entries are canonicalized (lowercase, domain-padded)
+	// on load; a malformed entry is warned about and ignored. An empty list with
+	// managed=true means "adopt no PF" — reuse-only.
+	ManagedPFs []string `yaml:"managed_pfs"`
 }
 
 // LoadConfig reads the daemon config from file.

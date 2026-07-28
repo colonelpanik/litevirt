@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -15,6 +16,12 @@ import (
 	"github.com/litevirt/litevirt/internal/pki"
 )
 
+// antiEntropyCooldown debounces manual/scheduled triggers: a pass won't start if one ran
+// within this window. Well under the default 60s interval (so a scheduled tick is never
+// debounced) and well above a hammer loop (so `lv cluster converge --all` in a tight loop
+// can't turn into a self-inflicted SQLite-lock load test).
+const antiEntropyCooldown = 12 * time.Second
+
 // AntiEntropy periodically compares state digests with peers and triggers
 // a full state merge when drift is detected. This is a safety net — the
 // primary replication path is the WAL-based Replicator.
@@ -22,6 +29,13 @@ type AntiEntropy struct {
 	client   *Client
 	pkiDir   string
 	interval time.Duration
+
+	// mu guards the trigger decision only (not the pass itself): a pass no-ops when one is
+	// already running or ran within antiEntropyCooldown. It never bypasses checkPeers's
+	// per-table digest-gating (merge only on mismatch) — it just decides whether to run.
+	mu         sync.Mutex
+	inProgress bool
+	lastRan    time.Time
 }
 
 // NewAntiEntropy creates an anti-entropy checker.
@@ -47,9 +61,32 @@ func (ae *AntiEntropy) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ae.checkPeers(ctx)
+			ae.RunOnce(ctx) // debounced; scheduled ticks share the trigger guard
 		}
 	}
+}
+
+// RunOnce runs a single anti-entropy pass now, unless one is already in progress or ran
+// within antiEntropyCooldown, in which case it no-ops. Returns true iff a pass actually ran.
+// It blocks until the pass completes, so a caller (e.g. `lv cluster converge`) can read
+// digests afterward knowing convergence was attempted. It ONLY schedules the existing pass —
+// checkPeers still merges a table only on a digest mismatch.
+func (ae *AntiEntropy) RunOnce(ctx context.Context) bool {
+	ae.mu.Lock()
+	if ae.inProgress || (!ae.lastRan.IsZero() && time.Since(ae.lastRan) < antiEntropyCooldown) {
+		ae.mu.Unlock()
+		return false
+	}
+	ae.inProgress = true
+	ae.mu.Unlock()
+
+	ae.checkPeers(ctx)
+
+	ae.mu.Lock()
+	ae.inProgress = false
+	ae.lastRan = time.Now()
+	ae.mu.Unlock()
+	return true
 }
 
 func (ae *AntiEntropy) checkPeers(ctx context.Context) {
@@ -101,8 +138,11 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		data, err := fetchStateDump(ctx, client)
 		if err != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
+		} else if mergeErr := ae.client.MergeStateBytesLWW(data); mergeErr != nil {
+			// Operational/commit failure during merge: this cycle's convergence is incomplete.
+			// The merge is per-row-idempotent and non-destructive, so the next cycle retries.
+			slog.Warn("anti-entropy: merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
 		} else {
-			ae.client.MergeStateBytesLWW(data)
 			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
 		}
 	}
@@ -115,15 +155,27 @@ func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string
 	var out []string
 	for _, r := range remote {
 		local, exists := localMap[r.Name]
-		if exists && local.Count == int(r.Count) && local.Hash == r.Hash {
+		if !exists {
+			slog.Info("anti-entropy: drift detected", "peer", peer, "table", r.Name, "local_hash", "", "remote_hash", r.Hash)
+			out = append(out, r.Name)
+			continue
+		}
+		// Pairwise negotiation: compare the order-invariant v2 hash ONLY when BOTH sides
+		// supplied it (⇒ both have digest_v2 enabled); otherwise compare the positional v1
+		// hash. Count is always compared.
+		useV2 := local.HashV2 != "" && r.GetHashV2() != ""
+		var lh, rh string
+		if useV2 {
+			lh, rh = local.HashV2, r.GetHashV2()
+		} else {
+			lh, rh = local.Hash, r.Hash
+		}
+		if local.Count == int(r.Count) && lh == rh {
 			continue // in sync
 		}
-		lh := ""
-		if exists {
-			lh = local.Hash
-		}
 		slog.Info("anti-entropy: drift detected",
-			"peer", peer, "table", r.Name, "local_hash", lh, "remote_hash", r.Hash)
+			"peer", peer, "table", r.Name, "digest", map[bool]string{true: "v2", false: "v1"}[useV2],
+			"local_hash", lh, "remote_hash", rh)
 		out = append(out, r.Name)
 	}
 	return out
@@ -159,7 +211,10 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		slog.Warn("anti-entropy: sensitive dump RPC error", "peer", peerName, "error", err)
 		return
 	}
-	ae.client.MergeSensitiveStateBytesLWW(data)
+	if mergeErr := ae.client.MergeSensitiveStateBytesLWW(data); mergeErr != nil {
+		slog.Warn("anti-entropy: sensitive merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
+		return
+	}
 	slog.Info("anti-entropy: sensitive merge complete", "peer", peerName, "bytes", len(data))
 }
 

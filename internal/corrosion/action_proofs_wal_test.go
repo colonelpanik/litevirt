@@ -40,10 +40,16 @@ func TestWAL_ActionProofMonotone(t *testing.T) {
 	if err := r.applyStatementLWW(ctx, tx, ins, newer); err != nil {
 		t.Fatalf("apply insert: %v", err)
 	}
+	// The REAL, ledger-registered in_progress transition (ClaimActionProof).
 	upd := Statement{
-		SQL: `UPDATE runtime_action_proofs SET status='in_progress', updated_at=? ` +
-			`WHERE id=? AND deleted_at IS NULL AND status IN ('prepared','in_progress')`,
-		Params: []interface{}{newer, "p1"},
+		SQL: `UPDATE runtime_action_proofs
+		    SET status = 'in_progress',
+		        executor_host = ?,
+		        started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+		        updated_at = ?
+		  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')
+		    AND (executor_host = '' OR executor_host = ?)`,
+		Params: []interface{}{"h", newer, newer, "p1", "h"},
 	}
 	if err := r.applyStatementLWW(ctx, tx, upd, newer); err != nil {
 		t.Fatalf("apply update: %v", err)
@@ -91,7 +97,10 @@ func TestProofMergeKeepLocalRow_NoStatusColumnFailsClosed(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback()
-	keepLocal := c.proofMergeKeepLocalRow(tx, tbl, row, []string{"id"}, []int{0}, 1)
+	keepLocal, mErr := c.proofMergeKeepLocalRow(tx, tbl, row, []string{"id"}, []int{0}, 1)
+	if mErr != nil {
+		t.Fatalf("proofMergeKeepLocalRow: %v", mErr)
+	}
 	if !keepLocal {
 		t.Fatal("no-status dump: keepLocal=false; want true — a status-less proof dump must fail closed, not LWW-resurrect a terminal proof")
 	}
@@ -104,12 +113,15 @@ func TestMergeChunk_RefusesStatuslessProofDump(t *testing.T) {
 	ctx := context.Background()
 	c := testClient(t)
 
-	merged, skipped := c.mergeChunk(
+	merged, skipped, mergeErr := c.mergeChunk(
 		syncTable{Name: "runtime_action_proofs", Columns: []string{"id", "updated_at"}},
 		[][]interface{}{{"ghost", "2999-01-01T00:00:00Z"}},
 		"INSERT OR REPLACE INTO runtime_action_proofs (id, updated_at) VALUES (?, ?)",
 		[]string{"id"}, []int{0}, 1,
 	)
+	if mergeErr != nil {
+		t.Fatalf("mergeChunk: %v", mergeErr)
+	}
 	if merged != 0 || skipped != 1 {
 		t.Fatalf("status-less proof dump: merged=%d skipped=%d; want 0/1 (chunk refused)", merged, skipped)
 	}
@@ -206,10 +218,11 @@ func TestWAL_ActionProofForwardConverges(t *testing.T) {
 
 	const t1 = "2027-01-01T00:00:00Z"
 	tx, _ := c.db.Begin()
+	// The REAL, ledger-registered guarded completed transition.
 	upd := Statement{
-		SQL: `UPDATE runtime_action_proofs SET status='completed', completed_at=?, updated_at=? ` +
-			`WHERE id=? AND deleted_at IS NULL AND status IN ('prepared','in_progress')`,
-		Params: []interface{}{t1, t1, "p1"},
+		SQL: `UPDATE runtime_action_proofs SET status = 'completed', executor_host = ?, completed_at = ?, updated_at = ?
+		  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')`,
+		Params: []interface{}{"h", t1, t1, "p1"},
 	}
 	if err := r.applyStatementLWW(ctx, tx, upd, t1); err != nil {
 		t.Fatalf("apply: %v", err)

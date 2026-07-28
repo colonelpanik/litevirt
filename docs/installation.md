@@ -180,7 +180,7 @@ Upgrading litevirt is safe and non-disruptive:
 - **Pre-flight gate**: `lv host upgrade` runs `PreflightUpgrade` first and refuses on blocking conditions (in-flight migrations or backups, leader-lease holdings with pending fences, replication backlog, clock skew, witness-host risk). Pass `--force` to override.
 - **`upgrading` host state**: the host marks itself `upgrading` in the cluster state before the binary swap. Failover coordinators on peer hosts skip fence candidacy for `upgrading` hosts, so the restart window can't trigger a destructive false-positive failover.
 - **Automatic rollback**: if the new binary panic-loops past `StartLimitBurst=3` within 10 minutes (systemd's threshold), the `litevirt-rollback.service` companion unit fires, restores the previous binary from `litevirt.old`, and restarts. Operator sees a `litevirt-rollback` tagged entry in `journalctl`.
-- **Cluster version-skew check**: peer Crescent handshakes carry the sender's schema version. Peers more than one minor version apart refuse to apply mutations from each other, so a runaway upgrade can't corrupt downstream replicas.
+- **Cluster version-skew check**: each `PushMutations` push carries the sender's DB-applied schema version. A receiver refuses the push whenever the sender's schema is strictly ahead of its own (any gap ≥ 1), so a node missing migrations can't be corrupted by a newer peer. The check is one-directional — a sender that is *behind* the receiver is still accepted.
 
 No drain is needed for typical upgrades. The upgrade flow per host is:
 preflight gate → mark `upgrading` → copy binary → checksum → backup `.old`
@@ -366,7 +366,7 @@ During a rolling upgrade, hosts temporarily run different versions. This is safe
 - **WAL replication streams data mutations, not schema.** Each host applies its own DDL on startup.
 - **Schema changes are always additive** (new columns, tables, indexes). Columns are never removed or renamed.
 - **Schema-version pin**: the daemon refuses to start if the DB has been forward-migrated by a newer binary (`schema_state.version > CurrentSchemaVersion`). This catches the "old binary onto new DB" footgun.
-- **Skew tolerance**: peer Crescent handshakes carry sender's `schema_version`. Peers more than 1 minor version apart refuse to apply mutations from each other (logged at WARN; surfaces in metrics).
+- **Skew guard (asymmetric)**: each push carries the sender's DB-applied `schema_version`. A receiver whose schema is *behind* the sender's rejects the push with a `FailedPrecondition` error (logged at WARN); a sender that is behind the receiver is accepted (logged at INFO). It is a hard reject of the push, not warn-and-continue.
 - **Proto3 forward compat**: the gRPC API handles unknown fields gracefully in both directions, but the schema-skew check above provides the actual safety guarantee.
 
 Recommended practice: keep version skew to one release within the cluster. The CLI's rolling-upgrade command sequences hosts serially so the skew window is bounded by your network bandwidth + restart time per host (typically a few minutes for the whole cluster).

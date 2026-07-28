@@ -270,7 +270,7 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 			return nil, err
 		}
 		if ok {
-			return r.createFromRootfs(opts, rootfs)
+			return r.createFromRootfs(ctx, opts, rootfs)
 		}
 	}
 	args := []string{"-n", opts.Name, "-t", opts.Template}
@@ -305,7 +305,13 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 // by writing <lxcpath>/<name>/config — no lxc-create. The config mirrors what
 // the download template produces (common.conf + apparmor + a veth NIC) so the
 // container starts identically.
-func (r *LxcRunner) createFromRootfs(opts CreateOpts, rootfs string) (*Container, error) {
+//
+// The template rootfs is COPIED per container into <lxcpath>/<name>/rootfs (the
+// canonical RootfsPath). This is essential: lxc.rootfs.path points at the copy, so
+// lxc-destroy (which removes the rootfs its config references) only ever removes the
+// container's own copy — the pulled OCI/rootfs template stays intact and reusable
+// for N containers. Sharing the template by reference let `lv ct rm` gut it.
+func (r *LxcRunner) createFromRootfs(ctx context.Context, opts CreateOpts, rootfs string) (*Container, error) {
 	containerDir := filepath.Join(r.lxcpath(), opts.Name)
 	configPath := filepath.Join(containerDir, "config")
 	if _, err := os.Stat(configPath); err == nil {
@@ -314,17 +320,28 @@ func (r *LxcRunner) createFromRootfs(opts CreateOpts, rootfs string) (*Container
 	if err := os.MkdirAll(containerDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create container dir %s: %w", containerDir, err)
 	}
-	if err := os.WriteFile(configPath, []byte(renderBaseRootfsConfig(opts.Name, rootfs)), 0o644); err != nil {
+	// Own copy of the rootfs (== RootfsPath(r.lxcpath(), opts.Name)), so destroy
+	// never touches the template. copyTree wraps failures + cleans up on error.
+	dstRootfs := filepath.Join(containerDir, "rootfs")
+	if err := copyTree(ctx, rootfs, dstRootfs); err != nil {
+		_ = os.RemoveAll(containerDir)
+		return nil, fmt.Errorf("copy template rootfs for %q: %w", opts.Name, err)
+	}
+	if err := os.WriteFile(configPath, []byte(renderBaseRootfsConfig(opts.Name, dstRootfs)), 0o644); err != nil {
+		_ = os.RemoveAll(containerDir)
 		return nil, fmt.Errorf("write lxc config %s: %w", configPath, err)
 	}
 	// Apply network (explicit --network or the lxcbr0 default) and cgroup limits.
+	// finalizeContainerConfig reads lxc.rootfs.path back to locate the rootfs for the
+	// guest /etc/network/interfaces write, so that write lands in the copy — the
+	// template is never mutated.
 	if err := r.finalizeContainerConfig(opts); err != nil {
 		return nil, fmt.Errorf("apply container network/resource config for %q: %w", opts.Name, err)
 	}
 	return &Container{
 		Name:      opts.Name,
 		State:     StateStopped,
-		RootFS:    rootfs,
+		RootFS:    dstRootfs,
 		CPULimit:  opts.CPULimit,
 		MemoryMiB: opts.MemoryMiB,
 		Network:   opts.Network,
@@ -715,13 +732,8 @@ func (r *LxcRunner) CloneContainer(ctx context.Context, src, dst string) error {
 	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
 		return fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err)
 	}
-	// `cp -a` preserves perms/owners/symlinks/timestamps — an archive copy.
-	cmd := exec.CommandContext(ctx, "cp", "-a", srcDir, dstDir)
-	stderr := strings.Builder{}
-	cmd.Stderr = stringWriter{&stderr}
-	if err := cmd.Run(); err != nil {
-		_ = os.RemoveAll(dstDir)
-		return fmt.Errorf("cp -a %s %s: %w: %s", srcDir, dstDir, err, stderr.String())
+	if err := copyTree(ctx, srcDir, dstDir); err != nil {
+		return err
 	}
 	if err := r.cloneFreshIdentity(dst); err != nil {
 		_ = os.RemoveAll(dstDir)
@@ -1028,6 +1040,21 @@ func splitCIDR(s string) (addr, netmask string) {
 // default.conf provides, so a plain container still gets connectivity.
 func defaultNetConfig() string {
 	return "lxc.net.0.type = veth\nlxc.net.0.link = lxcbr0\nlxc.net.0.flags = up\n"
+}
+
+// copyTree archive-copies src to dst with `cp -a` — preserving perms, owners,
+// symlinks, and timestamps (including a umoci rootless-unpacked rootfs's ownership).
+// dst MUST NOT already exist (callers ensure a fresh container dir); on failure dst
+// is removed. Shared by the rootfs-template create path and CloneContainer.
+func copyTree(ctx context.Context, src, dst string) error {
+	cmd := exec.CommandContext(ctx, "cp", "-a", src, dst)
+	stderr := strings.Builder{}
+	cmd.Stderr = stringWriter{&stderr}
+	if err := cmd.Run(); err != nil {
+		_ = os.RemoveAll(dst)
+		return fmt.Errorf("cp -a %s %s: %w: %s", src, dst, err, stderr.String())
+	}
+	return nil
 }
 
 func isDir(p string) bool { fi, err := os.Stat(p); return err == nil && fi.IsDir() }

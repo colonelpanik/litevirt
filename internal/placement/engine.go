@@ -82,6 +82,12 @@ type DeviceRequest struct {
 	Vendor   string // optional vendor filter
 	Clique   string // prefer specific NVLink/xGMI clique
 	SameNUMA bool   // require all devices on same NUMA node
+	// Sriov marks an SR-IOV VF request. Placement only gates host eligibility on an
+	// SR-IOV-capable PF (VFs are created/reused on-demand by the owner's allocator);
+	// it never pins a concrete VF address, so the on-demand SR-IOV path is reached.
+	Sriov bool
+	// Parent optionally restricts the SR-IOV request to a specific PF BDF.
+	Parent string
 }
 
 // hostCandidate is an evaluated host during selection.
@@ -440,6 +446,13 @@ func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, 
 	var assigned []BatchDevice
 
 	for _, req := range reqs {
+		// SR-IOV requests are resolved on-demand by the owner's allocator (create or
+		// reuse a VF); placement neither pins a concrete VF address nor consumes one
+		// from the pool. Eligibility was already gated in scoreHostDevices.
+		if req.Sriov {
+			continue
+		}
+
 		count := req.Count
 		if count <= 0 {
 			count = 1

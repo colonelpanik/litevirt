@@ -28,6 +28,7 @@ func (s *Server) SetVMMemory(ctx context.Context, req *pb.SetVMMemoryRequest) (*
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.update", "operator"); err != nil {
 		return nil, err
 	}
+	// Forward to the owner BEFORE taking the local lock.
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -39,6 +40,39 @@ func (s *Server) SetVMMemory(ctx context.Context, req *pb.SetVMMemoryRequest) (*
 
 	if req.TargetMib <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "target_mib must be positive")
+	}
+
+	// Post-latch: route the balloon through the SAME atomic F1 path as a live resize
+	// (BeginVMOperation commits the desired memory_mib + claims the barrier), so a
+	// balloon and a coordinated resize can't race and the change is crash-recoverable.
+	// The coordinator owns the VM lock, re-reads under it, and enforces the band.
+	if s.operationProtocolActive(ctx) {
+		if err := s.resizeVMLive(ctx, req.Name, &pb.VMSpec{MemoryMib: req.TargetMib}, req.IdempotencyKey); err != nil {
+			return nil, err
+		}
+		return s.vmToProto(ctx, req.Name)
+	}
+
+	// Pre-latch: the direct balloon + mem_actual path.
+	unlock := s.lockVM(req.Name)
+	defer unlock()
+	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil || vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm.HostName != s.hostName {
+		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+	// Mutation barrier: don't balloon a VM while a resource operation holds it.
+	if vm.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot set memory for %q: an operation is in progress", req.Name)
+	}
+	// Ballooning drives the LIVE virtio balloon — it only applies to a running VM.
+	// Change a stopped VM's boot allocation with `lv update --memory` instead.
+	if vm.State != "running" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q must be running to balloon memory (current: %s); use `lv update --memory` to set boot memory on a stopped VM", req.Name, vm.State)
 	}
 
 	var spec pb.VMSpec
@@ -58,11 +92,19 @@ func (s *Server) SetVMMemory(ctx context.Context, req *pb.SetVMMemoryRequest) (*
 			"target %d MiB is below the VM's minimum %d MiB", req.TargetMib, spec.MinMemoryMib)
 	}
 
-	if err := s.virt.SetMemory(req.Name, int(req.TargetMib)); err != nil {
+	if err := s.virt.SetMemory(vm.Name, int(req.TargetMib)); err != nil {
 		return nil, status.Errorf(codes.Internal, "set memory: %v", err)
 	}
 
-	slog.Info("vm memory ballooned", "vm", req.Name, "target_mib", req.TargetMib)
-	s.recordVMEvent(ctx, req.Name, "vm.memory", "ok", fmt.Sprintf("balloon target %d MiB", req.TargetMib))
-	return s.vmToProto(ctx, req.Name)
+	// Persist the new live balloon target as the observed actual so accounting and
+	// placement (which sum mem_actual) reflect reclaimed/added guest RAM. The balloon
+	// has already been driven; a lost write is healed on the next observe, so log
+	// loudly rather than fail an applied resize.
+	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, vm.Name, vm.CPUActual, int(req.TargetMib), vm.OwnerEpoch, -1); err != nil {
+		slog.Error("SetVMMemory: persisting mem_actual failed — accounting will lag until reconciled", "vm", vm.Name, "error", err)
+	}
+
+	slog.Info("vm memory ballooned", "vm", vm.Name, "target_mib", req.TargetMib)
+	s.recordVMEvent(ctx, vm.Name, "vm.memory", "ok", fmt.Sprintf("balloon target %d MiB", req.TargetMib))
+	return s.vmToProto(ctx, vm.Name)
 }

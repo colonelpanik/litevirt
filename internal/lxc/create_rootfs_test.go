@@ -92,7 +92,8 @@ func TestCreateFromRootfs_WritesConfig(t *testing.T) {
 		t.Fatalf("config not written: %v", err)
 	}
 	cfg := string(raw)
-	wantRootfs := "lxc.rootfs.path = dir:" + filepath.Join(bundle, "rootfs")
+	// rootfs is the per-container COPY inside the container dir, not the template.
+	wantRootfs := "lxc.rootfs.path = dir:" + filepath.Join(lxcpath, "web", "rootfs")
 	for _, want := range []string{
 		wantRootfs,
 		"lxc.uts.name = web",
@@ -107,6 +108,66 @@ func TestCreateFromRootfs_WritesConfig(t *testing.T) {
 	// Creating again must refuse rather than clobber an existing container.
 	if _, err := r.Create(context.Background(), CreateOpts{Name: "web", Template: bundle}); err == nil {
 		t.Error("expected error creating an already-existing container")
+	}
+}
+
+// TestCreateFromRootfs_CopiesRootfs_TemplateSurvives is the regression guard: a
+// container created from a pulled OCI/rootfs template must get its OWN copy of the
+// rootfs under <lxcpath>/<name>/rootfs, so destroying the container (lxc-destroy
+// removes the rootfs its config points at) can't gut the shared template — and N
+// containers can be created off one pull.
+func TestCreateFromRootfs_CopiesRootfs_TemplateSurvives(t *testing.T) {
+	tmp := t.TempDir()
+	lxcpath := filepath.Join(tmp, "lxc")
+	bundle := filepath.Join(tmp, "img")
+	mkRootfs(t, filepath.Join(bundle, "rootfs"))
+	sentinel := filepath.Join(bundle, "rootfs", "etc", "sentinel")
+	if err := os.WriteFile(sentinel, []byte("template"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &LxcRunner{Lxcpath: lxcpath}
+	if _, err := r.Create(context.Background(), CreateOpts{Name: "c1", Template: bundle}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The config must point INSIDE the container dir (the invariant that makes
+	// destroy safe) — never back at the template.
+	cfg, err := os.ReadFile(filepath.Join(lxcpath, "c1", "config"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	wantPath := "lxc.rootfs.path = dir:" + filepath.Join(lxcpath, "c1", "rootfs")
+	if !strings.Contains(string(cfg), wantPath) {
+		t.Errorf("config rootfs.path not the per-container copy; want %q\n%s", wantPath, cfg)
+	}
+
+	// The copy is a real, distinct tree.
+	copySentinel := filepath.Join(lxcpath, "c1", "rootfs", "etc", "sentinel")
+	if _, err := os.Stat(copySentinel); err != nil {
+		t.Fatalf("rootfs not copied into the container dir: %v", err)
+	}
+	if err := os.WriteFile(copySentinel, []byte("mutated-copy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(sentinel); string(b) != "template" {
+		t.Errorf("writing the copy mutated the template (shared tree): got %q", b)
+	}
+
+	// Simulate lxc-destroy removing the whole container dir.
+	if err := os.RemoveAll(filepath.Join(lxcpath, "c1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("destroying the container gutted the template rootfs: %v", err)
+	}
+
+	// A second container off the same template succeeds with its own copy.
+	if _, err := r.Create(context.Background(), CreateOpts{Name: "c2", Template: bundle}); err != nil {
+		t.Fatalf("second Create off the same template: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(lxcpath, "c2", "rootfs", "etc", "sentinel")); err != nil {
+		t.Errorf("second container did not get its own rootfs copy: %v", err)
 	}
 }
 
@@ -215,9 +276,13 @@ func TestCreateFromRootfs_WritesGuestStaticIP(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	raw, err := os.ReadFile(filepath.Join(rootfs, "etc", "network", "interfaces"))
+	// The guest interfaces write must land in the per-container COPY, never the template.
+	raw, err := os.ReadFile(filepath.Join(lxcpath, "sip", "rootfs", "etc", "network", "interfaces"))
 	if err != nil {
-		t.Fatalf("guest interfaces not written: %v", err)
+		t.Fatalf("guest interfaces not written to the copy: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootfs, "etc", "network", "interfaces")); err == nil {
+		t.Error("guest interfaces written into the TEMPLATE rootfs — must only touch the copy")
 	}
 	s := string(raw)
 	for _, want := range []string{"iface eth0 inet static", "address 10.0.3.78", "netmask 255.255.255.0"} {
@@ -239,7 +304,7 @@ func TestCreateFromRootfs_NoStaticIP_NoGuestConfig(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rootfs, "etc", "network", "interfaces")); err == nil {
+	if _, err := os.Stat(filepath.Join(lxcpath, "nosip", "rootfs", "etc", "network", "interfaces")); err == nil {
 		t.Error("guest interfaces must NOT be written when no static IP is requested")
 	}
 }

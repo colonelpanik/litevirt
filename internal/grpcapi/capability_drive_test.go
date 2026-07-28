@@ -76,7 +76,7 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 	// one-unlatched-per-cycle bound means lww latches only by cycle 2.
 	g2 := &recordingGate{}
 	s2 := &Server{gate: g2}
-	s2.SetEnforcementConfig(false /*safeFence*/, true /*lww*/, false /*vipSelfDemote*/, false /*vipProofReclaim*/)
+	s2.SetEnforcementConfig(false /*safeFence*/, true /*lww*/, false /*hlcLww*/, false /*vipSelfDemote*/, false /*vipProofReclaim*/, false /*sharedStorageFence*/)
 
 	s2.driveCapabilityActivation(context.Background())
 	if !g2.Latched(capabilities.SplitBrainGateV1) {
@@ -88,5 +88,25 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 	s2.driveCapabilityActivation(context.Background())
 	if !g2.Latched(capabilities.LWWSkewGuardV1) {
 		t.Error("lww should latch by cycle 2 (one interval per unlatched token)")
+	}
+}
+
+// TestDriveCapabilityActivation_LatchedRetriesDespiteFlagOff proves the reorder that makes canonical
+// registry acceptance become DURABLE: an ALREADY-latched token is driven (Enforced → retry marker
+// persistence) even when its config flag is now OFF, so a marker that hasn't persisted yet still
+// sticks. An UNlatched flag-off token is still never driven.
+func TestDriveCapabilityActivation_LatchedRetriesDespiteFlagOff(t *testing.T) {
+	// canonical_registry_v1 already latched in memory; its config flag is OFF.
+	g := &recordingGate{latched: map[string]bool{capabilities.CanonicalRegistryV1: true}}
+	s := &Server{gate: g} // enfCanonicalRegistry defaults false ⇒ tokenEnabled(canonical_registry_v1)=false
+	for i := 0; i < 3; i++ {
+		s.driveCapabilityActivation(context.Background())
+	}
+	got := g.drivenUnique()
+	if !got[capabilities.CanonicalRegistryV1] {
+		t.Error("an already-latched token must be driven (retry persist) even with its flag off")
+	}
+	if got[capabilities.CanonicalIdentityV1] {
+		t.Error("an unlatched flag-off token must not be driven")
 	}
 }

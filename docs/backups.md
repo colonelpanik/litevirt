@@ -402,7 +402,7 @@ vms:
   postgres-1:
     image: ubuntu-24.04
     disks:
-      data: { size: 200G, volume: hot }
+      data: { size: 200G, storage: hot }
     backup:
       repo: main
       schedule: "15 2 * * *"        # cron

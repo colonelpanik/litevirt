@@ -88,7 +88,7 @@ func StatusAll(ctx context.Context, db *corrosion.Client) ([]Status, error) {
 		if h.State == "active" {
 			st.ActiveHosts++
 		}
-		if t, err := time.Parse(time.RFC3339, h.UpdatedAt); err == nil && t.After(st.LastUpdated) {
+		if t, ok := corrosion.ParseUpdatedAt(h.UpdatedAt); ok && t.After(st.LastUpdated) {
 			st.LastUpdated = t
 		}
 	}

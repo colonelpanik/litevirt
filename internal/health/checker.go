@@ -200,10 +200,14 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 		}
 		c.mu.Unlock()
 		if changed {
+			// Bind the timestamp instead of datetime('now'): the receiver-evaluated
+			// function is non-deterministic across nodes (each would stamp its own wall
+			// clock into the LWW key on apply) and can't be structurally validated. NowTS()
+			// is the monotonic LWW clock the rest of the replicated writes use.
 			c.db.ExecuteDeferred(ctx,
 				`INSERT OR REPLACE INTO crl_versions (host, version, updated_at)
-				 VALUES (?, ?, datetime('now'))`,
-				c.hostName, localCRLVersion)
+				 VALUES (?, ?, ?)`,
+				c.hostName, localCRLVersion, c.db.NowTS())
 		}
 	}
 
@@ -322,10 +326,12 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 
 	now := c.db.NowTS()
 	if healthy {
+		// last_seen is a wall/display column (read as wall time via parseTimestamp), so
+		// it must use NowWall, NOT NowTS — NowTS is the LWW key and becomes an HLC string.
 		c.db.ExecuteDeferred(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, ?, 0, ?, ?)`,
-			c.hostName, host.Name, "healthy", now, now,
+			c.hostName, host.Name, "healthy", c.db.NowWall(), now,
 		)
 	} else {
 		c.db.ExecuteDeferred(ctx,

@@ -238,13 +238,15 @@ func TestSetupScriptContent_HasPCISection(t *testing.T) {
 		"max_vfs_per_pf",
 		"vfio-pci",
 		"modprobe",
-		"udevadm",
-		"99-litevirt-pci.rules",
 	}
 	for _, s := range required {
 		if !strings.Contains(setupScriptContent, s) {
 			t.Errorf("setupScriptContent missing %q", s)
 		}
+	}
+	// The deprecated udev rule is no longer installed by the setup script.
+	if strings.Contains(setupScriptContent, "99-litevirt-pci.rules") {
+		t.Error("setup script still installs the deprecated litevirt PCI udev rule")
 	}
 }
 

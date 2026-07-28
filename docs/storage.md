@@ -85,8 +85,8 @@ vms:
   web-1:
     image: ubuntu-24.04
     disks:
-      root: { size: 40G, volume: hot }
-      data: { size: 200G, volume: warm }
+      root: { size: 40G, storage: hot }
+      data: { size: 200G, storage: warm }
 ```
 
 ## Storage motion

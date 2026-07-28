@@ -99,14 +99,21 @@ func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash s
 }
 
 // DeleteUser tombstones a user and CASCADES the tombstone to its 2FA factors,
-// recovery codes, and both active-set pointers — all in one batch sharing a
-// single updated_at, so the whole set converges coherently under LWW. Tombstoning
-// the pointers is what makes the delete resurrection-proof: a factor or code a
-// partitioned peer still holds (one this node never saw, hence couldn't tombstone
-// individually) lands on a now-inactive epoch/set and can never validate.
+// recovery codes, both active-set pointers, AND its role bindings — all in one
+// batch sharing a single updated_at, so the whole set converges coherently
+// under LWW. Tombstoning the pointers is what makes the delete
+// resurrection-proof: a factor or code a partitioned peer still holds (one this
+// node never saw, hence couldn't tombstone individually) lands on a now-inactive
+// epoch/set and can never validate. Role bindings are tombstoned so a deleted
+// user cannot retain access through a lingering (path, role) binding — both the
+// canonical realm-qualified principal and the legacy bare form are removed.
+// (Local users authenticate through the "local" realm; external OIDC/LDAP group
+// bindings are out of scope — they are not session-persisted yet.)
 func DeleteUser(ctx context.Context, c *Client, username string) error {
 	now := c.NowTS()
 	marker := nowRFC3339()
+	barePrincipal := "user:" + username
+	localPrincipal := barePrincipal + "@local"
 	return c.ExecuteBatch(ctx, []Statement{
 		{SQL: `UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
 			Params: []interface{}{marker, now, username}},
@@ -118,6 +125,8 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 			Params: []interface{}{marker, now, username}},
 		{SQL: `UPDATE recovery_code_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
 			Params: []interface{}{marker, now, username}},
+		{SQL: `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`,
+			Params: []interface{}{marker, now, barePrincipal, localPrincipal}},
 	})
 }
 

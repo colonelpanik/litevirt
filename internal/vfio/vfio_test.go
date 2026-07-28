@@ -10,21 +10,23 @@ import (
 
 // memFS is an in-memory SysFS implementation for testing.
 type memFS struct {
-	mu       sync.Mutex
-	files    map[string][]byte
-	links    map[string]string // path → symlink target
-	dirs     map[string][]os.DirEntry
-	writeErr map[string]error // inject write failures by path substring
-	written  map[string][]byte
+	mu          sync.Mutex
+	files       map[string][]byte
+	links       map[string]string // path → symlink target
+	dirs        map[string][]os.DirEntry
+	writeErr    map[string]error // inject write failures by path substring
+	readlinkErr map[string]error // inject readlink failures by path substring
+	written     map[string][]byte
 }
 
 func newMemFS() *memFS {
 	return &memFS{
-		files:    map[string][]byte{},
-		links:    map[string]string{},
-		dirs:     map[string][]os.DirEntry{},
-		writeErr: map[string]error{},
-		written:  map[string][]byte{},
+		files:       map[string][]byte{},
+		links:       map[string]string{},
+		dirs:        map[string][]os.DirEntry{},
+		writeErr:    map[string]error{},
+		readlinkErr: map[string]error{},
+		written:     map[string][]byte{},
 	}
 }
 
@@ -54,9 +56,17 @@ func (m *memFS) WriteFile(path string, data []byte, _ os.FileMode) error {
 func (m *memFS) Readlink(path string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for substr, err := range m.readlinkErr {
+		if strings.Contains(path, substr) {
+			return "", err
+		}
+	}
 	target, ok := m.links[path]
 	if !ok {
-		return "", fmt.Errorf("memFS: link not found: %s", path)
+		// Model real sysfs: a missing symlink is a not-exist error (os.Readlink returns
+		// a *PathError wrapping ENOENT), which os.IsNotExist recognizes — distinct from
+		// an unexpected FS error. IsBoundToVFIO relies on this distinction.
+		return "", os.ErrNotExist
 	}
 	return target, nil
 }
@@ -390,6 +400,39 @@ func TestUnbind_NotBoundToVFIO(t *testing.T) {
 	err := Unbind(addr, "")
 	if err != nil {
 		t.Fatalf("Unbind() error: %v", err)
+	}
+}
+
+// ── IsBoundToVFIO tests ──
+
+// TestVfio_IsBoundToVFIO covers the ground-truth "currently bound to vfio-pci"
+// signal: the driver symlink pointing at vfio-pci ⇒ true; at another driver ⇒ false;
+// an absent driver link (no driver bound) ⇒ false + nil; and an UNEXPECTED filesystem
+// error ⇒ false + a non-nil error (so callers fail closed rather than assume unbound).
+func TestVfio_IsBoundToVFIO(t *testing.T) {
+	fs := newMemFS()
+	addr := "0000:01:00.0"
+	fs.addDevice(addr, "0x10de", "0x2204", "vfio-pci")
+	restore := SetFS(fs)
+	defer restore()
+
+	if bound, err := IsBoundToVFIO(addr); err != nil || !bound {
+		t.Fatalf("vfio-pci driver: bound=%v err=%v, want true, nil", bound, err)
+	}
+
+	fs.setDriver(addr, "nvidia")
+	if bound, err := IsBoundToVFIO(addr); err != nil || bound {
+		t.Fatalf("nvidia driver: bound=%v err=%v, want false, nil", bound, err)
+	}
+
+	fs.setDriver(addr, "") // no driver link at all
+	if bound, err := IsBoundToVFIO(addr); err != nil || bound {
+		t.Fatalf("absent driver link: bound=%v err=%v, want false, nil", bound, err)
+	}
+
+	fs.readlinkErr["/driver"] = fmt.Errorf("permission denied")
+	if bound, err := IsBoundToVFIO(addr); err == nil || bound {
+		t.Fatalf("unexpected FS error: bound=%v err=%v, want false, non-nil error", bound, err)
 	}
 }
 

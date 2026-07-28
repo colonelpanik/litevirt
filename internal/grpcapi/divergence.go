@@ -191,7 +191,10 @@ func (s *Server) fetchPeerSnapshot(ctx context.Context, host string, opTables, s
 	for _, t := range opTables {
 		want[t] = true
 	}
-	tables, owned, err = corrosion.SnapshotFromDumpBytes(buf, want)
+	// Build every node's snapshot on the SCANNING node's lanes (digest_v2 + natural-key
+	// identity) so all snapshots in a run key rows identically — the natural-key lane engages
+	// only when this node's canonical_identity has latched, i.e. the fleet is uniformly upgraded.
+	tables, owned, err = corrosion.SnapshotFromDumpBytes(buf, want, s.db.DigestV2Enabled(), s.db.CanonicalIdentityEnabled())
 	if err != nil {
 		return nil, nil, false, false
 	}
@@ -225,7 +228,7 @@ func (s *Server) ScanSensitiveDivergence(ctx context.Context, req *pb.ScanSensit
 	out := &pb.ScanSensitiveResponse{HostName: s.hostName, Rows: make([]*pb.SensitiveRowMetaPB, 0, len(rows))}
 	for _, r := range rows {
 		out.Rows = append(out.Rows, &pb.SensitiveRowMetaPB{
-			Table: r.Table, PkLabel: r.PKLabel, RowHash: r.RowHash, UpdatedAt: r.UpdatedAt, Deleted: r.Deleted,
+			Table: r.Table, PkLabel: r.PKLabel, RowHash: r.RowHash, RowHashV2: r.RowHashV2, UpdatedAt: r.UpdatedAt, Deleted: r.Deleted,
 		})
 	}
 	return out, nil
@@ -376,7 +379,7 @@ func sensitivePBToSnapshot(rows []*pb.SensitiveRowMetaPB) map[string]corrosion.T
 	conv := make([]corrosion.SensitiveRow, 0, len(rows))
 	for _, r := range rows {
 		conv = append(conv, corrosion.SensitiveRow{
-			Table: r.GetTable(), PKLabel: r.GetPkLabel(), RowHash: r.GetRowHash(),
+			Table: r.GetTable(), PKLabel: r.GetPkLabel(), RowHash: r.GetRowHash(), RowHashV2: r.GetRowHashV2(),
 			UpdatedAt: r.GetUpdatedAt(), Deleted: r.GetDeleted(),
 		})
 	}

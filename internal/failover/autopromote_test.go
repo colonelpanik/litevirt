@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -238,14 +241,20 @@ func TestCoordinator_NoAutoPromote_NormalReschedule(t *testing.T) {
 // dbPromoter is a test ReplicaPromoter that re-homes the VM record (mimicking a
 // real promotion) unless fail is set.
 type dbPromoter struct {
-	db       *corrosion.Client
-	target   string
-	fail     bool
-	promoted []string
+	db              *corrosion.Client
+	target          string
+	fail            bool
+	failUnavailable bool // return a retryable grpc Unavailable (fence_epoch row not yet replicated)
+	promoted        []string
+	fenceEpochs     []string // fence_epoch passed for each promote (bind-to-fence assertion)
 }
 
-func (p *dbPromoter) AutoPromoteReplica(ctx context.Context, vmName string) error {
+func (p *dbPromoter) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error {
 	p.promoted = append(p.promoted, vmName)
+	p.fenceEpochs = append(p.fenceEpochs, fenceEpoch)
+	if p.failUnavailable {
+		return status.Error(codes.Unavailable, "fence_epoch row not yet replicated")
+	}
 	if p.fail {
 		return context.DeadlineExceeded
 	}

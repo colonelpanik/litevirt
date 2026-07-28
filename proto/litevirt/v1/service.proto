@@ -82,6 +82,12 @@ message ListVMsRequest   { string stack_name = 1; string host_name = 2;
     int32 page_size = 4; string page_token = 5; }
 message ListVMsResponse  { repeated VM vms = 1; string next_page_token = 2; }
 message InspectVMRequest { string name = 1; }
+message ListVMHardwareRequest  { string vm_name = 1; }
+message ListVMHardwareResponse {
+    repeated HardwareDevice devices = 1;
+    string hardware_adoption_state = 2;  // pending | adopted | blocked
+    string hardware_adoption_error = 3;  // reason when blocked
+}
 message StartVMRequest   { string name = 1; }
 message StopVMRequest    { string name = 1; bool force = 2; int32 timeout = 3; }
 message RestartVMRequest { string name = 1; }
@@ -147,6 +153,25 @@ message CheckLBPresentResponse { bool present = 1; }
 message CheckContainerRuntimeRequest  { string name = 1; }
 message CheckContainerRuntimeResponse { string state = 1; }
 
+// ReportRuntime returns the responding host's LOCAL ground-truth runtime snapshot for
+// the leader-gated dual-run detector: VMs that are active DISK-HOLDERS (a domain in a
+// disk-writing state — RUNNING or BLOCKED), running containers, VIP addresses assigned
+// on this host's KERNEL (not a keepalived-pid signal), and the count of unresolved LWW
+// ties this node is currently tracking. Peer-only (host-cert mTLS); never consults the
+// cluster DB — the detector cross-references the DB itself.
+message ReportRuntimeRequest {}
+message ReportRuntimeResponse {
+    repeated string disk_holder_vms      = 1;
+    repeated string running_containers   = 2;
+    repeated string kernel_assigned_vips = 3;
+    int32           unresolved_tie_count = 4;
+    // partial is true when ANY local runtime probe errored (libvirt list/state, container
+    // list/state, LB-config read, or the kernel `ip` dump). The positive holders reported
+    // are still real, but the ABSENCE of a workload is NOT reliable — the leader must not
+    // use a partial snapshot as "probed and absent" proof, and raises a coverage gap for it.
+    bool            partial              = 5;
+}
+
 // CloneVM creates a new VM from a template or an existing VM (optionally a
 // snapshot of it). mode "" → storage-aware auto (linked on shared storage,
 // full on local); "linked" / "full" force a mode. The clone gets a fresh
@@ -197,11 +222,15 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     optional bool  secure_boot     = 16;
     optional bool  tpm             = 17;
     bool           force           = 18;  // allow toggling secure_boot/tpm even when firmware state exists
+    string         idempotency_key = 19;  // cross-entry-node dedup of a retried update (D4 semantics)
+    optional int32 max_cpu         = 20;  // set the vCPU hotplug ceiling (live_resize; latched)
+    optional bool  allow_restart   = 21;  // permit a stop→redefine→start for a change that can't apply live
 }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
 // ballooned via virtio without a redefine.
-message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2; }
+message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2;
+    string idempotency_key = 3; }  // cross-entry-node dedup of a retried balloon (D4 semantics)
 // SetVMLabelsRequest replaces the full label set (the request is authoritative —
 // an empty map clears all tags).
 message SetVMLabelsRequest  { string name = 1; map<string, string> labels = 2; }
@@ -1001,6 +1030,49 @@ message RevokeRoleResponse {}
 message ListRoleBindingsRequest  { string principal = 1; } // empty = all
 message ListRoleBindingsResponse { repeated RoleBinding bindings = 1; }
 
+// NormalizeRoleBindings rewrites legacy bare `user:<name>` bindings to the
+// canonical realm-qualified form (`user:<name>@<realm>`) so they enforce. It is
+// a deliberate, idempotent one-time admin job — run once after auth.rbac_realm
+// is enabled fleet-wide and the rbac_realm_v1 capability has latched.
+message NormalizeRoleBindingsRequest {
+    bool dry_run = 1; // when true, report what WOULD change without writing
+}
+message NormalizeRoleBindingsResponse {
+    int32 normalized = 1; // bare bindings rewritten to canonical form
+    int32 skipped    = 2; // bare bindings whose realm could not be resolved
+}
+
+// GetVMOperation / AbortVMOperation are the F1 admin recovery surface for an
+// operation wedged on a VM's mutation barrier (active_operation_id). Inspect
+// shows the operation + reduced state; abort force-clears the barrier via the
+// owner/generation CAS so the VM is mutable again (deliberate, admin-only).
+message GetVMOperationRequest { string vm_name = 1; }
+message OperationStepInfo {
+    string step_name  = 1;
+    int64  owner_epoch = 2;
+    string created_at = 3;
+}
+message GetVMOperationResponse {
+    bool   has_active      = 1;
+    string operation_id    = 2;
+    string operation_kind  = 3;
+    string current_state   = 4;
+    bool   faulted         = 5; // conflicting terminals recorded — a safety fault
+    int64  vm_owner_epoch  = 6;
+    int64  spec_generation = 7;
+    bool   header_missing  = 8; // barrier points at a GC'd/absent operation header
+    repeated OperationStepInfo steps = 9;
+}
+message AbortVMOperationRequest {
+    string vm_name = 1;
+    bool   force   = 2; // required — an abort is never implicit
+}
+message AbortVMOperationResponse {
+    bool   aborted               = 1;
+    string previous_operation_id = 2;
+    string detail                = 3;
+}
+
 // Live restore from backup. The handler:
 //
 //   1. Opens the manifest's chunk reader.
@@ -1324,6 +1396,13 @@ message RuntimeActionProof {
     int32  quorum_live      = 9;
     int32  quorum_needed    = 10;
     string relocation_token = 11;
+    // fence_epoch binds an auto-promote/reschedule proof to the SPECIFIC fence of
+    // the old owner that authorizes the cross-host transfer, so the executor can
+    // re-verify a proof-grade power-off (never a stale hosts.state=="fenced").
+    // Format: "host=<old-owner>;fence_id=<fencing_log id>;ts=<rfc3339>". Empty on
+    // a proof minted by a pre-fence_epoch node ⇒ a new executor fails a shared-disk
+    // transfer closed. Additive/wire-compatible.
+    string fence_epoch      = 12;
 }
 
 message PromoteReplicaRequest {
@@ -1463,11 +1542,40 @@ message TableDigest {
     string name  = 1;
     int32  count = 2;
     string hash  = 3;
+    // unresolved_ties is the number of equal-timestamp LWW ties this host is currently
+    // tracking for this table with no applicable resolver rule — deliberate, safety-fault
+    // divergence (NOT drift). A cross-host hash mismatch on a table with unresolved_ties > 0
+    // is expected until `lv doctor repair-owner`; the verify report must not count it as drift.
+    int32  unresolved_ties = 4;
+    // hash_v2 is the order-invariant digest_v2 table hash. Emitted only when the sender
+    // has digest_v2 enabled; compared only when BOTH peers supply it (pairwise negotiation),
+    // else the peers fall back to the positional `hash`.
+    string hash_v2 = 5;
 }
 
 message StateDigestResponse {
     string host_name                = 1;
     repeated TableDigest tables     = 2;
+}
+
+// TriggerAntiEntropy kicks an immediate anti-entropy pass (rather than waiting for the
+// periodic tick), debounced per node. With all=true the connected host also relays the
+// trigger to each active peer (one level, no recursion). Operator- or peer-callable.
+message TriggerAntiEntropyRequest { bool all = 1; }
+message TriggerAntiEntropyResponse {
+    repeated string triggered   = 1; // hosts where a pass ran this call
+    repeated string debounced   = 2; // hosts where a pass was skipped (in progress / within cooldown)
+    repeated string unreachable = 3; // peers that could not be reached (all=true)
+    repeated string unsupported = 4; // peers on an older binary without this RPC (all=true)
+}
+
+// GetClusterStateDigest fans GetStateDigest + GetSensitiveStateDigest out to every active
+// host (self locally, peers via host-cert relay) so an operator connected to ONE node sees
+// cross-host convergence. Operator- or peer-callable.
+message ClusterStateDigestResponse {
+    repeated StateDigestResponse hosts = 1; // per-host merged (public + sensitive) table digests
+    repeated string unreachable        = 2; // active hosts that could not be reached
+    repeated string unsupported        = 3; // active hosts on an older binary without this RPC
 }
 
 message StateDumpResponse {
@@ -1544,9 +1652,13 @@ message ScanSensitiveRequest {
 message SensitiveRowMetaPB {
     string table      = 1;
     string pk_label   = 2; // HMAC(scan_key, "pk\0"+table+"\0"+pk)
-    string row_hash   = 3; // HMAC(scan_key, "row\0"+table+"\0"+encoding)
+    string row_hash   = 3; // HMAC(scan_key, "row\0"+table+"\0"+v1 encoding)
     string updated_at = 4;
     bool   deleted    = 5;
+    // row_hash_v2 is the order-invariant digest_v2 HMAC (over the v2 row encoding). Emitted
+    // only when the sender has digest_v2 enabled; the orchestrator compares v2 only when
+    // both sides supply it, else falls back to row_hash.
+    string row_hash_v2 = 6;
 }
 message ScanSensitiveResponse {
     string                      host_name = 1;
@@ -1646,6 +1758,7 @@ service LiteVirt {
     rpc CreateVM(CreateVMRequest)     returns (VM);
     rpc ListVMs(ListVMsRequest)       returns (ListVMsResponse);
     rpc InspectVM(InspectVMRequest)   returns (VM);
+    rpc ListVMHardware(ListVMHardwareRequest) returns (ListVMHardwareResponse);
     rpc StartVM(StartVMRequest)       returns (VM);
     rpc StopVM(StopVMRequest)         returns (VM);
     rpc RestartVM(RestartVMRequest)   returns (VM);
@@ -1653,6 +1766,7 @@ service LiteVirt {
     rpc RepairVMOwner(RepairVMOwnerRequest) returns (RepairVMOwnerResponse);
     rpc CheckVMRuntime(CheckVMRuntimeRequest) returns (CheckVMRuntimeResponse);
     rpc CheckContainerRuntime(CheckContainerRuntimeRequest) returns (CheckContainerRuntimeResponse);
+    rpc ReportRuntime(ReportRuntimeRequest) returns (ReportRuntimeResponse);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);
@@ -1757,6 +1871,9 @@ service LiteVirt {
     rpc GrantRole(GrantRoleRequest)               returns (GrantRoleResponse);
     rpc RevokeRole(RevokeRoleRequest)             returns (RevokeRoleResponse);
     rpc ListRoleBindings(ListRoleBindingsRequest) returns (ListRoleBindingsResponse);
+    rpc NormalizeRoleBindings(NormalizeRoleBindingsRequest) returns (NormalizeRoleBindingsResponse);
+    rpc GetVMOperation(GetVMOperationRequest) returns (GetVMOperationResponse);
+    rpc AbortVMOperation(AbortVMOperationRequest) returns (AbortVMOperationResponse);
     rpc BeginWebAuthnRegistration(BeginWebAuthnRegistrationRequest)   returns (BeginWebAuthnRegistrationResponse);
     rpc FinishWebAuthnRegistration(FinishWebAuthnRegistrationRequest) returns (FinishWebAuthnRegistrationResponse);
     rpc BeginWebAuthnLogin(BeginWebAuthnLoginRequest)                 returns (BeginWebAuthnLoginResponse);
@@ -1882,6 +1999,10 @@ service LiteVirt {
     // operator or REST surface.
     rpc GetSensitiveStateDigest(SensitiveStateRequest) returns (StateDigestResponse);
     rpc StreamSensitiveStateDump(SensitiveStateRequest) returns (stream StateDumpChunk);
+    // TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
+    // fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
+    rpc TriggerAntiEntropy(TriggerAntiEntropyRequest) returns (TriggerAntiEntropyResponse);
+    rpc GetClusterStateDigest(google.protobuf.Empty) returns (ClusterStateDigestResponse);
 
     // ── Divergence scanner (Phase 0) ──
     // DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out

@@ -324,13 +324,46 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 			return err
 		}
 	}
+	// Row-scope the tombstones: a single bulk `UPDATE … WHERE stack_name = ?` is not full-PK,
+	// so on the replication apply path it can't be LWW-gated per row (a concurrently-newer
+	// row on a peer would be wrongly tombstoned). Enumerate the matching rows locally, then
+	// emit one full-PK, LWW-gated tombstone per row. Each replicating Execute carries its
+	// statement as a LITERAL constant (via forEachStackRow's callback) so the ledger/CI guard
+	// can resolve it; the local SELECT is not replicated, so its SQL may vary.
 	now := c.NowTS()
-	for _, tbl := range []string{"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
-		if err := c.Execute(ctx,
-			fmt.Sprintf(`UPDATE %s SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL`, tbl),
-			nowRFC3339(), now, stack); err != nil {
+	wall := nowRFC3339()
+	tomb := func(sel string, exec func(pk string) error) error {
+		rows, err := c.Query(ctx, sel, stack)
+		if err != nil {
 			return err
 		}
+		for _, row := range rows {
+			if err := exec(row.String("pk")); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	return nil
+	if err := tomb(`SELECT id AS pk FROM ip_sets WHERE stack_name = ? AND deleted_at IS NULL`,
+		func(pk string) error {
+			return c.Execute(ctx, `UPDATE ip_sets SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, wall, now, pk)
+		}); err != nil {
+		return err
+	}
+	if err := tomb(`SELECT id AS pk FROM cluster_firewall_rules WHERE stack_name = ? AND deleted_at IS NULL`,
+		func(pk string) error {
+			return c.Execute(ctx, `UPDATE cluster_firewall_rules SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, wall, now, pk)
+		}); err != nil {
+		return err
+	}
+	if err := tomb(`SELECT id AS pk FROM host_firewall_rules WHERE stack_name = ? AND deleted_at IS NULL`,
+		func(pk string) error {
+			return c.Execute(ctx, `UPDATE host_firewall_rules SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, wall, now, pk)
+		}); err != nil {
+		return err
+	}
+	return tomb(`SELECT scope AS pk FROM firewall_defaults WHERE stack_name = ? AND deleted_at IS NULL`,
+		func(pk string) error {
+			return c.Execute(ctx, `UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ? AND deleted_at IS NULL`, wall, now, pk)
+		})
 }

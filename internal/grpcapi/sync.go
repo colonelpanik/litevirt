@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -14,6 +15,158 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// Per-peer timeouts for the cluster-wide fan-outs (operator commands, so generous). A
+// trigger relay blocks on the peer's whole anti-entropy pass; a digest fetch is quick.
+const (
+	aeTriggerFanoutTimeout = 30 * time.Second
+	aeDigestFanoutTimeout  = 10 * time.Second
+)
+
+// activeStatePeers returns the active hosts other than self (the convergence fan-out set,
+// mirroring DiagnoseDivergence's active-host filter).
+func (s *Server) activeStatePeers(ctx context.Context) []string {
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, h := range hosts {
+		if h.Name != s.hostName && h.State == "active" {
+			out = append(out, h.Name)
+		}
+	}
+	return out
+}
+
+// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass on this host, and with
+// all=true relays the trigger to each active peer (one level — the relayed calls set all=false
+// so there is no recursion), surfacing unreachable and older-binary peers. Operator- or
+// peer-callable. It ONLY schedules the existing pass; convergence still merges a table only on
+// a digest mismatch, and each node's own debounce prevents a `--all` loop from hammering it.
+func (s *Server) TriggerAntiEntropy(ctx context.Context, req *pb.TriggerAntiEntropyRequest) (*pb.TriggerAntiEntropyResponse, error) {
+	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
+		return nil, err
+	}
+	resp := &pb.TriggerAntiEntropyResponse{}
+	if s.antiEntropy != nil {
+		if s.antiEntropy.RunOnce(ctx) {
+			resp.Triggered = append(resp.Triggered, s.hostName)
+		} else {
+			resp.Debounced = append(resp.Debounced, s.hostName)
+		}
+	}
+	if !req.GetAll() {
+		return resp, nil
+	}
+	peers := s.activeStatePeers(ctx)
+	type result struct {
+		host  string
+		r     *pb.TriggerAntiEntropyResponse
+		err   error
+		unsup bool
+	}
+	results := make([]result, len(peers))
+	var wg sync.WaitGroup
+	for i, h := range peers {
+		wg.Add(1)
+		go func(i int, host string) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, aeTriggerFanoutTimeout)
+			defer cancel()
+			client, conn, err := s.peerClient(pctx, host)
+			if err != nil {
+				results[i] = result{host: host, err: err}
+				return
+			}
+			defer conn.Close()
+			r, err := client.TriggerAntiEntropy(pctx, &pb.TriggerAntiEntropyRequest{All: false})
+			results[i] = result{host: host, r: r, err: err, unsup: status.Code(err) == codes.Unimplemented}
+		}(i, h)
+	}
+	wg.Wait()
+	for _, x := range results {
+		switch {
+		case x.err == nil:
+			resp.Triggered = append(resp.Triggered, x.r.GetTriggered()...)
+			resp.Debounced = append(resp.Debounced, x.r.GetDebounced()...)
+		case x.unsup:
+			resp.Unsupported = append(resp.Unsupported, x.host)
+		default:
+			resp.Unreachable = append(resp.Unreachable, x.host)
+		}
+	}
+	return resp, nil
+}
+
+// GetClusterStateDigest fans the public + sensitive digests out to every active host (self
+// locally, peers via host-cert relay) so an operator connected to ONE node sees cross-host
+// convergence — surfacing unreachable and older-binary peers explicitly. Operator- or
+// peer-callable. Digests are hashes, not secrets.
+func (s *Server) GetClusterStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.ClusterStateDigestResponse, error) {
+	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
+		return nil, err
+	}
+	resp := &pb.ClusterStateDigestResponse{}
+
+	// Self: merge public + sensitive, annotated with per-table unresolved-tie counts.
+	ties := s.db.UnresolvedTieTables()
+	self := &pb.StateDigestResponse{HostName: s.hostName}
+	if pub, err := s.db.StateDigest(ctx); err == nil {
+		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, pub, ties).Tables...)
+	}
+	if sens, err := s.db.SensitiveStateDigest(ctx); err == nil {
+		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, sens, ties).Tables...)
+	}
+	resp.Hosts = append(resp.Hosts, self)
+
+	peers := s.activeStatePeers(ctx)
+	type result struct {
+		host  string
+		resp  *pb.StateDigestResponse
+		err   error
+		unsup bool
+	}
+	results := make([]result, len(peers))
+	var wg sync.WaitGroup
+	for i, h := range peers {
+		wg.Add(1)
+		go func(i int, host string) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, aeDigestFanoutTimeout)
+			defer cancel()
+			client, conn, err := s.peerClient(pctx, host)
+			if err != nil {
+				results[i] = result{host: host, err: err}
+				return
+			}
+			defer conn.Close()
+			pub, err := client.GetStateDigest(pctx, &emptypb.Empty{})
+			if err != nil {
+				results[i] = result{host: host, err: err, unsup: status.Code(err) == codes.Unimplemented}
+				return
+			}
+			merged := &pb.StateDigestResponse{HostName: host, Tables: pub.GetTables()}
+			// Sensitive lane is peer-only (Sender-gated); relayed with this host's cert.
+			if sens, serr := client.GetSensitiveStateDigest(pctx, &pb.SensitiveStateRequest{Sender: s.hostName}); serr == nil {
+				merged.Tables = append(merged.Tables, sens.GetTables()...)
+			}
+			results[i] = result{host: host, resp: merged}
+		}(i, h)
+	}
+	wg.Wait()
+	for _, x := range results {
+		switch {
+		case x.err == nil:
+			resp.Hosts = append(resp.Hosts, x.resp)
+		case x.unsup:
+			resp.Unsupported = append(resp.Unsupported, x.host)
+		default:
+			resp.Unreachable = append(resp.Unreachable, x.host)
+		}
+	}
+	return resp, nil
+}
 
 // GetStateDigest returns a lightweight fingerprint of each replicated table
 // on this host. Callers can compare digests across hosts to detect drift.
@@ -28,25 +181,18 @@ func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.Stat
 	if err != nil {
 		return nil, err
 	}
-
-	resp := &pb.StateDigestResponse{HostName: s.hostName}
-	for _, d := range digests {
-		resp.Tables = append(resp.Tables, &pb.TableDigest{
-			Name:  d.Name,
-			Count: int32(d.Count),
-			Hash:  d.Hash,
-		})
-	}
-	return resp, nil
+	return stateDigestResponse(s.hostName, digests, s.db.UnresolvedTieTables()), nil
 }
 
-func stateDigestResponse(hostName string, digests []corrosion.TableDigest) *pb.StateDigestResponse {
+func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties map[string]int) *pb.StateDigestResponse {
 	resp := &pb.StateDigestResponse{HostName: hostName}
 	for _, d := range digests {
 		resp.Tables = append(resp.Tables, &pb.TableDigest{
-			Name:  d.Name,
-			Count: int32(d.Count),
-			Hash:  d.Hash,
+			Name:           d.Name,
+			Count:          int32(d.Count),
+			Hash:           d.Hash,
+			HashV2:         d.HashV2, // empty unless digest_v2 is enabled locally
+			UnresolvedTies: int32(ties[d.Name]),
 		})
 	}
 	return resp
@@ -120,7 +266,7 @@ func (s *Server) GetSensitiveStateDigest(ctx context.Context, req *pb.SensitiveS
 	if err != nil {
 		return nil, err
 	}
-	return stateDigestResponse(s.hostName, digests), nil
+	return stateDigestResponse(s.hostName, digests, s.db.UnresolvedTieTables()), nil
 }
 
 // StreamSensitiveStateDump streams the peer-only sensitive repair dump. It must
@@ -156,10 +302,15 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	// — which is what makes a multi-version (N-step) rolling upgrade safe.
 	//
 	// Asymmetric: refuse ONLY when the sender's DB schema is strictly AHEAD of
-	// ours (its writes may reference columns we genuinely lack). sender <= local
-	// is accepted — under the additive-only invariant the sender touches a subset
-	// of our columns. The runtime back-pressure net (replicator.ApplyRemoteMutations
-	// + isSchemaMissingError) is the final guard if anything slips past this.
+	// ours (its writes may reference columns we genuinely lack). sender <= local is
+	// accepted — but NOT because "touching a subset of our columns" is inherently
+	// safe: a behind sender's INSERT omits our newer columns, and the old whole-row
+	// INSERT OR REPLACE apply RESET them to defaults/NULL (the reported data-loss
+	// bug). It is safe now because the apply path is column-preserving — a PK-aware
+	// UPSERT touches only the columns the sender supplied (replicator.applyStatementLWW
+	// / sync.buildMergeUpsertSQL), so omitted receiver-only columns keep their value.
+	// The runtime back-pressure net (ApplyRemoteMutations + fail-closed ledger +
+	// isSchemaMissingError) is the final guard if anything slips past this.
 	if req.SenderSchemaVersion != 0 {
 		localDB := s.db.EffectiveDBSchema()
 		gap := int(req.SenderSchemaVersion) - localDB

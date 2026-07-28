@@ -48,14 +48,14 @@
 
   document.addEventListener('DOMContentLoaded', function () { wire(document); });
   // HTMX replaces sub-trees on every poll/post; rewire after each swap.
-  document.body.addEventListener('htmx:afterSwap', function (e) { wire(e.target || document); });
+  document.addEventListener('htmx:afterSwap', function (e) { wire(e.target || document); });
 
   // Pause interval polling while a bulk selection is active — otherwise the
   // every-5s refresh swaps the table out and clears the user's checkboxes
   // mid-selection. Only gates the polling container (hx-trigger "every …")
   // that actually holds checked rows; filters, actions, and unrelated polls
   // (stats charts) are untouched. Polling resumes on the next tick once cleared.
-  document.body.addEventListener('htmx:beforeRequest', function (e) {
+  document.addEventListener('htmx:beforeRequest', function (e) {
     var elt = e.detail && e.detail.elt;
     if (!elt || !elt.getAttribute) return;
     var trig = elt.getAttribute('hx-trigger') || '';

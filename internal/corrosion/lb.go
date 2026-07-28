@@ -82,7 +82,7 @@ func ListLBConfigs(ctx context.Context, c *Client) ([]LBConfigRecord, error) {
 }
 
 // ClaimLBHolderIfUnowned records hostsJSON as an LB's holder set ONLY while it
-// currently has none (hosts '' or '[]'), returning whether THIS call wrote it.
+// currently has none (hosts ” or '[]'), returning whether THIS call wrote it.
 // It's the migration write for explicit LBs persisted before durable holders; the
 // CALLER decides the correct holder (via the cluster-wide participant probe) — this
 // guard only avoids clobbering a holder that another node already established.
@@ -110,7 +110,7 @@ func SoftDeleteLBConfig(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE lb_configs SET deleted_at = ?, updated_at = ?, enabled = 0 WHERE name = ?`,
-		now, now, name)
+		nowRFC3339(), now, name)
 }
 
 // ── LB Backends ──────────────────────────────────────────────────────────────
@@ -171,7 +171,7 @@ func lbBackendTombstoneStmt(lbName, backendName, now string) Statement {
 			   deleted_at = excluded.deleted_at,
 			   updated_at = excluded.updated_at,
 			   enabled = 0`,
-		Params: []interface{}{lbName, backendName, now, now},
+		Params: []interface{}{lbName, backendName, now, nowRFC3339()}, // updated_at=now(LWW key), deleted_at=wall
 	}
 }
 
@@ -187,7 +187,7 @@ func SoftDeleteLBBackends(ctx context.Context, c *Client, lbName string) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE lb_backends SET deleted_at = ?, updated_at = ?, enabled = 0 WHERE lb_name = ?`,
-		now, now, lbName)
+		nowRFC3339(), now, lbName)
 }
 
 // PersistLBFull writes an LB config plus its COMPLETE backend set as ONE
@@ -205,7 +205,7 @@ func PersistLBFull(ctx context.Context, c *Client, cfg LBConfigRecord, backends 
 	// backends) is un-tombstoned by its upsert below (later stmt wins in-tx).
 	stmts = append(stmts, Statement{
 		SQL:    `UPDATE lb_backends SET deleted_at = ?, updated_at = ?, enabled = 0 WHERE lb_name = ? AND deleted_at IS NULL`,
-		Params: []interface{}{now, now, cfg.Name},
+		Params: []interface{}{nowRFC3339(), now, cfg.Name},
 	})
 	stmts = append(stmts, lbConfigUpsertStmt(cfg, now))
 	for _, b := range backends {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -18,6 +19,18 @@ func TestE2E_BackupCreate(t *testing.T) {
 		t.Fatalf("backup create errored: %v (stderr=%s)", err, stderr)
 	}
 	assertContains(t, stdout, "Backup complete")
+}
+
+// TestVMConfigIP_HonestFlagHelp pins the record-only honesty wording on the
+// --ip flag help so it can't silently regress into implying it configures the
+// guest. The command output is pinned by the "config ip" table case below.
+func TestVMConfigIP_HonestFlagHelp(t *testing.T) {
+	usage := newVMConfigCmd().Flags().Lookup("ip").Usage
+	for _, want := range []string{"does not reconfigure a running guest", "inventory"} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("--ip flag help missing %q; got %q", want, usage)
+		}
+	}
 }
 
 // C4 refactor verification: every command converted to the withClient helper
@@ -62,7 +75,8 @@ func TestC4_ConvertedCommandsRun(t *testing.T) {
 		{"status", []string{"status"}, ""},
 		// cluster.go
 		{"cluster digest", []string{"cluster", "digest"}, ""},
-		{"cluster sync", []string{"cluster", "sync"}, "Received state dump"},
+		{"cluster converge", []string{"cluster", "converge"}, "Anti-entropy pass"},
+		{"cluster sync", []string{"cluster", "sync"}, "Anti-entropy pass"}, // deprecated alias of converge
 		// firewall.go
 		{"firewall reload", []string{"firewall", "reload"}, "Reloaded"},
 		// rebuild.go
@@ -74,6 +88,7 @@ func TestC4_ConvertedCommandsRun(t *testing.T) {
 		{"spice", []string{"spice", "vm1"}, "URI:"},
 		// vmconfig.go
 		{"config boot", []string{"config", "vm1", "--boot", "disk"}, "boot order set"},
+		{"config ip", []string{"config", "vm1", "--ip", "10.0.1.50", "--network", "lan"}, "does not reconfigure a running guest"},
 		// snapshot.go
 		{"snapshot create", []string{"snapshot", "create", "vm1", "s1"}, "created"},
 		{"snapshot ls", []string{"snapshot", "ls", "vm1"}, ""},

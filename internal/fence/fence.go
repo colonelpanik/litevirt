@@ -42,7 +42,8 @@ type HostConfig struct {
 //	"best-effort"  – try SSH poweroff; succeed regardless (never blocks failover)
 //	"ssh"          – SSH poweroff; report failure if unreachable
 //	"ipmi"         – IPMI/BMC power off via ipmitool; must succeed
-//	"manual"       – log an alert and return success immediately (human confirms)
+//	"manual"       – log an alert and return Success=false; the coordinator will NOT
+//	                 reschedule until an operator confirms via `lv host fence-confirm`
 //	"watchdog"     – write to /dev/watchdog to stop heartbeat (self-fencing, caller is local)
 //	""             – treated as "best-effort"
 func Execute(ctx context.Context, h HostConfig) Result {

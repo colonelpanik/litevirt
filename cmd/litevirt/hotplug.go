@@ -117,6 +117,7 @@ func newAttachPciCmd() *cobra.Command {
 		vendor  string
 		count   int32
 		sriov   bool
+		parent  string
 	)
 	cmd := &cobra.Command{
 		Use:   "attach-pci <vm>",
@@ -131,6 +132,7 @@ func newAttachPciCmd() *cobra.Command {
 						Vendor: vendor,
 						Count:  count,
 						Sriov:  sriov,
+						Parent: parent,
 					},
 				})
 				if err != nil {
@@ -146,6 +148,7 @@ func newAttachPciCmd() *cobra.Command {
 	cmd.Flags().StringVar(&vendor, "vendor", "", "PCI vendor ID (e.g. 10de)")
 	cmd.Flags().Int32Var(&count, "count", 1, "Number of devices to attach")
 	cmd.Flags().BoolVar(&sriov, "sriov", false, "Request SR-IOV VF instead of PF")
+	cmd.Flags().StringVar(&parent, "parent", "", "SR-IOV: allocate the VF from this PF BDF (e.g. 0000:41:00.0)")
 	return cmd
 }
 

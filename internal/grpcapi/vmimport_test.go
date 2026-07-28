@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/vmimport"
 )
@@ -112,9 +113,9 @@ func TestSniffImportFormat(t *testing.T) {
 	tarb := make([]byte, 512)
 	copy(tarb[257:], []byte("ustar"))
 	cases := map[string]string{
-		write("a.vma", vma):                                "vma",
-		write("a.tar", tarb):                               "ova",
-		write("a.ovf", []byte("<?xml version='1.0'?><Envelope>")): "ovf",
+		write("a.vma", vma):  "vma",
+		write("a.tar", tarb): "ova",
+		write("a.ovf", []byte("<?xml version='1.0'?><Envelope>")):      "ovf",
 		write("a.conf", []byte("cores: 2\nscsihw: virtio-scsi-pci\n")): "proxmox",
 	}
 	for path, want := range cases {
@@ -143,5 +144,39 @@ func TestApplyImportNetworks_DupNICRejected(t *testing.T) {
 		if n.MAC == "" {
 			t.Errorf("NIC %d got no generated MAC", i)
 		}
+	}
+}
+
+// TestImportRecords_BuildsNICRecords covers the level ImportVM is actually
+// unit-drivable at: importRecords is the pure helper that builds the rows
+// ImportVM passes into corrosion.InsertVMWithHardware. A vm_nics row must be
+// built alongside each legacy vm_interfaces row, carrying the foreign NIC's
+// tracked model (nicModel/ForeignVM.Normalize already default it to "virtio"
+// when the source declared none) and the deterministic (vmName, mac) id the
+// Phase-6 backfill would derive for the same legacy NIC.
+func TestImportRecords_BuildsNICRecords(t *testing.T) {
+	fv := &vmimport.ForeignVM{
+		NICs: []vmimport.ForeignNIC{
+			{Network: "br0", Model: "e1000", MAC: "52:54:00:aa:bb:cc"},
+		},
+	}
+	_, ifaces, nics := importRecords(fv, "vm1", "host-a")
+	if len(ifaces) != 1 || ifaces[0].MAC != "52:54:00:aa:bb:cc" || ifaces[0].NetworkName != "br0" {
+		t.Fatalf("ifaces = %+v", ifaces)
+	}
+	if len(nics) != 1 {
+		t.Fatalf("nics = %+v, want 1", nics)
+	}
+	n := nics[0]
+	if n.VMName != "vm1" || n.NetworkName != "br0" || n.Model != "e1000" ||
+		n.MAC != "52:54:00:aa:bb:cc" || n.Ordinal != 0 {
+		t.Errorf("nics[0] = %+v, want VMName=vm1 NetworkName=br0 Model=e1000 MAC=52:54:00:aa:bb:cc Ordinal=0", n)
+	}
+	wantID := corrosion.DeterministicNICID("vm1", "52:54:00:aa:bb:cc")
+	if n.ID != wantID {
+		t.Errorf("nics[0].ID = %q, want %q (deterministic id, converges with a later backfill pass)", n.ID, wantID)
+	}
+	if n.TapDevice != "" {
+		t.Errorf("nics[0].TapDevice = %q, want empty at import (assigned at start, not import)", n.TapDevice)
 	}
 }

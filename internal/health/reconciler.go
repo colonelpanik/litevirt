@@ -12,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
@@ -62,6 +65,12 @@ type Reconciler struct {
 	// and validates/claims the linked runtime_action_proofs row before starting.
 	// nil disables gating (tests that don't exercise it). See SetGate.
 	gate runtimeGate
+	// sharedStorageFenceEnforce is the config kill-switch for the shared-disk
+	// ownership-transfer fence gate (enforcement.shared_storage_fence). With it AND
+	// SharedStorageFenceV1 latched, an ownership-transfer start of a VM with a
+	// writable shared disk requires a proof-grade fence of the old owner (carried in
+	// the proof's fence_epoch). See SetSharedStorageFenceEnforce.
+	sharedStorageFenceEnforce bool
 	// onGateRefused observes each gate/proof refusal (action, reason from the
 	// closed vocab) — nil-safe; the daemon wires it to the refusal metric.
 	onGateRefused func(action, reason string)
@@ -77,6 +86,32 @@ type Reconciler struct {
 	// enter this set, so a deliberately-stopped VM is never autostarted by the retry.
 	onbootMu      sync.Mutex
 	onbootPending map[string]corrosion.VMRecord
+
+	// prepareHardwareForStart, when wired (the daemon passes the gRPC Server's
+	// PrepareHardwareForStart), runs the hardware_v2 adoption gate + PCI start-preflight
+	// before a failover/reschedule StartDomain: it refuses a "blocked" VM (returns an
+	// error) and, for a VM with reserved passthrough intents, acquires + realizes +
+	// reconciles its devices into the domain definition so it comes back with them bound.
+	// It is a strict NO-OP unless hardware_v2 is latched, so a pre-latch fleet reconciles
+	// exactly as before. nil in tests / when unwired → treated as a no-op. The returned
+	// release func is invoked ONLY if the subsequent StartDomain fails.
+	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
+}
+
+// SetHardwareStartPreparer wires the hardware_v2 pre-start hook (adoption gate + PCI
+// start-preflight). nil-safe; unwired means every start behaves exactly as before.
+func (r *Reconciler) SetHardwareStartPreparer(fn func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)) {
+	r.prepareHardwareForStart = fn
+}
+
+// hwPrepareStart runs the wired hardware pre-start hook (a strict no-op when unwired or
+// pre-latch), returning a release func for the caller to invoke ONLY if its StartDomain
+// then fails.
+func (r *Reconciler) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord) (func(), error) {
+	if r.prepareHardwareForStart == nil {
+		return func() {}, nil
+	}
+	return r.prepareHardwareForStart(ctx, vm)
 }
 
 // runtimeGate is the subset of *Checker the reconciler needs (injectable for tests).
@@ -101,6 +136,10 @@ func selfFenceHardGate(g runtimeGate) bool { return g != nil && g.SelfFenced() }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
+
+// SetSharedStorageFenceEnforce sets the config kill-switch for the shared-disk
+// ownership-transfer fence gate (enforcement.shared_storage_fence).
+func (r *Reconciler) SetSharedStorageFenceEnforce(v bool) { r.sharedStorageFenceEnforce = v }
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (r *Reconciler) SetGateRefusedObserver(fn func(action, reason string)) { r.onGateRefused = fn }
@@ -475,32 +514,40 @@ func (r *Reconciler) maybePinMachineType(ctx context.Context, vm corrosion.VMRec
 	if !lv.IsPinnedMachineType(resolved) {
 		return // libvirt gave no concrete type; leave the alias untouched
 	}
-	// Surgical edit: round-trip the raw object and replace only "machine" so no
-	// other spec field is dropped or reordered.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(vm.Spec), &raw); err != nil {
-		return
-	}
-	mj, err := json.Marshal(resolved)
-	if err != nil {
-		return
-	}
-	raw["machine"] = mj
-	out, err := json.Marshal(raw)
-	if err != nil {
-		return
-	}
-	// Compare-and-swap on the spec column keyed by the exact spec we based the edit
-	// on: if a concurrent user UpdateVM changed the spec since this reconcile pass
-	// read it, the write no-ops (applied=false) rather than clobbering that edit
-	// with our stale-plus-machine copy — the next tick re-reads and retries.
-	applied, err := corrosion.UpdateVMSpecIfUnchanged(ctx, r.db, vm.Name, vm.Spec, string(out))
+	// Surgical edit through the sanctioned barrier-respecting writer: MutateDesiredSpec
+	// re-reads the FRESH spec and replaces only "machine" (no other field dropped or
+	// reordered), so a concurrent user UpdateVM isn't clobbered — if the spec moved
+	// underneath us the CAS misses and we retry next tick. It also defers (applied=
+	// false) while an operation holds the VM's mutation barrier — a pin must not race
+	// an in-flight resource update.
+	applied, _, err := corrosion.MutateDesiredSpec(ctx, r.db, vm.Name, func(old string) (string, error) {
+		var freshM struct {
+			Machine string `json:"machine"`
+		}
+		if err := json.Unmarshal([]byte(old), &freshM); err == nil && lv.IsPinnedMachineType(freshM.Machine) {
+			return old, nil // already pinned in the fresh spec → no-op (no generation bump)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(old), &raw); err != nil {
+			return "", err
+		}
+		mj, err := json.Marshal(resolved)
+		if err != nil {
+			return "", err
+		}
+		raw["machine"] = mj
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	})
 	if err != nil {
 		slog.Warn("reconciler: pin machine type failed", "vm", vm.Name, "machine", resolved, "error", err)
 		return
 	}
 	if !applied {
-		return // spec changed underneath us; retry next tick off the fresh value
+		return // spec changed underneath us / operation active; retry next tick off the fresh value
 	}
 	slog.Info("reconciler: pinned machine type (one-shot backfill)", "vm", vm.Name, "from", cur.Machine, "to", resolved)
 }
@@ -676,6 +723,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
+	var proofFenceEpoch string // the validated proof's fence_epoch (shared-disk gate below)
 	if proofID != "" {
 		// The proof must actually authorize THIS start: a reschedule proof whose
 		// target/dest is this VM on this host. A mismatched id (stale pointer,
@@ -700,6 +748,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			r.noteGateRefused(corrosion.ActionReschedule, ReasonProofConflict)
 			return
 		}
+		proofFenceEpoch = pr.FenceEpoch
 		if err := corrosion.ClaimActionProof(ctx, r.db, proofID, r.hostName); err != nil {
 			if errors.Is(err, corrosion.ErrProofSpent) {
 				slog.Warn("reconciler: pending proof terminal/missing, refusing start",
@@ -768,6 +817,35 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		slog.Error("reconciler: list disks", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("list disks: %v", err)) // transient DB
 		return
+	}
+
+	// Shared-disk split-brain gate: an ownership TRANSFER (a pending row carrying a
+	// coordinator proof) of a VM with a writable SHARED disk (nfs/ceph/rbd/iscsi) may
+	// start only once the old owner is PROVEN powered off — carried in the proof's
+	// fence_epoch and re-verified against the append-only fencing_log. A local-disk
+	// transfer keeps the proof/quorum gate above (its disk is host-local; no
+	// shared-write hazard). Fail closed once enforced; the kill-switch restores legacy.
+	// host_name was re-pointed to this target, so we trust the proof-protected
+	// fence_epoch.Host as the old owner (oldOwner "").
+	if proofID != "" && r.sharedStorageFenceEnforce && r.gate != nil &&
+		r.gate.Enforced(ctx, capabilities.SharedStorageFenceV1) &&
+		corrosion.VMHasWritableSharedDisk(diskRecords) {
+		switch verdict, detail := corrosion.CheckProofGradeFence(ctx, r.db, proofFenceEpoch, "", corrosion.SharedDiskFenceWindow); verdict {
+		case corrosion.FenceOK:
+			// proof-grade fence verified — proceed.
+		case corrosion.FenceRetry:
+			// The fencing_log row rides the same replication as the proof; the proof was
+			// already single-use-claimed, so re-mint on the next failover cycle if needed.
+			slog.Warn("reconciler: shared-disk transfer fence not yet verifiable, retrying",
+				"vm", vm.Name, "detail", detail)
+			return
+		default: // FenceReject
+			slog.Error("reconciler: shared-disk transfer refused — no proof-grade fence of old owner (storage_unverified)",
+				"vm", vm.Name, "detail", detail)
+			r.noteGateRefused(corrosion.ActionReschedule, ReasonStorageUnverified)
+			r.failPendingStart(ctx, vm.Name, proofID, false, "shared-disk transfer refused: "+detail)
+			return
+		}
 	}
 
 	var diskConfigs []lv.DiskConfig
@@ -951,7 +1029,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
+	// hardware_v2 pre-start (adoption gate + PCI start-preflight), between DefineDomain
+	// and StartDomain — the disk/nic rows this failover acts on already exist (replicated),
+	// so the preflight's reconcile-from-authoritative-tables step patches the just-defined
+	// domain with the aliased <hostdev>s and binds the passthrough BEFORE it boots. A strict
+	// no-op unless hardware_v2 is latched (so a pre-latch failover is byte-for-behavior
+	// unchanged). A refusal is NON-FATAL: a blocked VM / unacquirable device (FailedPrecondition)
+	// is a non-retryable operator-repair condition → terminalize the proof + set the VM error;
+	// a transient read/DB failure (Internal/Unavailable) re-arms for the next reconcile tick.
+	releaseHW, hwErr := r.hwPrepareStart(ctx, fresh)
+	if hwErr != nil {
+		slog.Warn("reconciler: hardware pre-start refused/failed — not starting VM", "vm", vm.Name, "error", hwErr)
+		r.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+		r.failPendingStart(ctx, vm.Name, proofID, hwPrepareRetryable(hwErr), fmt.Sprintf("hardware pre-start: %v", hwErr))
+		return
+	}
+
 	if err := r.virt.StartDomain(vm.Name); err != nil {
+		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("reconciler: start domain", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("start: %v", err)) // transient libvirt
 		return
@@ -1015,6 +1110,20 @@ func (r *Reconciler) failPendingStart(ctx context.Context, vmName, proofID strin
 		if werr := corrosion.UpdateVMState(ctx, r.db, vmName, "error", detail); werr != nil {
 			r.noteStateWriteFail(corrosion.OpVMState, werr)
 		}
+	}
+}
+
+// hwPrepareRetryable classifies a hardware pre-start error for the proof lifecycle: a
+// blocked adoption / unacquirable passthrough (FailedPrecondition) or a malformed record
+// (InvalidArgument) is an operator-repair condition that retrying on this host can't fix
+// → non-retryable (terminalize + set error); anything else (a transient read/DB failure,
+// Internal/Unavailable) → retryable, re-armed for the next reconcile tick.
+func hwPrepareRetryable(err error) bool {
+	switch status.Code(err) {
+	case codes.FailedPrecondition, codes.InvalidArgument:
+		return false
+	default:
+		return true
 	}
 }
 

@@ -3165,12 +3165,9 @@ func TestParseDiskSize_SmallMBValue(t *testing.T) {
 }
 
 func TestParseDiskSize_UnknownUnitFallback(t *testing.T) {
-	n, err := parseDiskSize("10X")
-	if err != nil {
-		t.Fatalf("parseDiskSize: %v", err)
-	}
-	if n != 10 {
-		t.Errorf("n = %d, want 10", n)
+	// An unrecognized unit must be rejected, not silently treated as GiB.
+	if _, err := parseDiskSize("10X"); err == nil {
+		t.Fatal("parseDiskSize(\"10X\"): expected an error for an unknown unit, got none")
 	}
 }
 
@@ -3746,12 +3743,9 @@ func TestParseDiskSize_SmallMB(t *testing.T) {
 }
 
 func TestParseDiskSize_UnknownUnit(t *testing.T) {
-	n, err := parseDiskSize("10X")
-	if err != nil {
-		t.Fatalf("parseDiskSize: %v", err)
-	}
-	if n != 10 {
-		t.Errorf("n = %d, want 10 (fallback to plain number)", n)
+	// An unrecognized unit must be rejected, not silently treated as GiB.
+	if _, err := parseDiskSize("10X"); err == nil {
+		t.Fatal("parseDiskSize(\"10X\"): expected an error for an unknown unit, got none")
 	}
 }
 

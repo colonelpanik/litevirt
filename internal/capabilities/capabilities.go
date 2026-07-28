@@ -32,6 +32,16 @@ const (
 	// may advertise one of {VIPDemoteV1, VIPReleaseProbeV1} without the other; the two flip
 	// together as the Phase-2 pair. Also a software capability (no watchdog).
 	VIPReleaseProbeV1 = "vip_release_probe_v1"
+	// SharedStorageFenceV1 gates proof-grade fencing for a cross-host ownership
+	// TRANSFER start of a VM with a writable SHARED disk (nfs/ceph/rbd/iscsi). Once
+	// enforced cluster-wide, auto-promote / reschedule of such a VM requires a
+	// proof-grade fence of the old owner — a confirmed power-off (IPMI) or an
+	// operator manual-confirm — carried in the proof's fence_epoch; a best-effort
+	// SSH "success" (never confirms power-off) is rejected. A local-disk transfer
+	// (a replica is a different image; no shared-write hazard) keeps today's gate.
+	// Host-fence-gated, NOT storage-level exclusivity. Gated (config kill-switch +
+	// latch) because it changes live failover behavior for shared-disk VMs.
+	SharedStorageFenceV1 = "shared_storage_fence_v1"
 	// FenceEpochV1 gates Phase-5 fence-epoch staleness enforcement.
 	FenceEpochV1 = "fence_epoch_v1"
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
@@ -50,15 +60,24 @@ const (
 	// fast-clock peer can't dominate last-writer-wins. Gated because a mixed-version
 	// cluster must not start quarantining before every node enforces it.
 	//
-	// SCOPE — this is NOT a full HLC LWW fix. updated_at is STILL stamped from
-	// per-process wall-clock RFC3339 (see corrosion.Client.NowTS), so this token does
-	// NOT address the BACKWARD-clock case (a restart after a wall-clock step-back can
-	// still emit older conflict keys → lost updates). Do not flip this thinking
-	// split-brain item 2 is fully solved. The remaining work — persist the monotonic
-	// timestamp high-water and/or emit HLC (a separately-validated conflict-key
-	// migration) — is deliberately deferred to its own token, so this one is named for
-	// exactly what it does (skew guard), leaving "hlc_lww_v1" free for the real flip.
+	// SCOPE — this is NOT a full HLC LWW fix. It only guards FUTURE skew; the
+	// backward-clock case (a restart after a wall-clock step-back emitting older
+	// conflict keys) is addressed separately: the monotonic-high-water persistence
+	// (always-on) plus HLCLwwV1 below, which flips the conflict-key ENCODING to HLC.
 	LWWSkewGuardV1 = "lww_skew_guard_v1"
+	// HLCLwwV1 gates emitting the LWW conflict key (updated_at, via Client.NowTS) as
+	// an HLC string instead of RFC3339Nano — the real backward-clock fix: an HLC key
+	// carries a monotonic (physical-ms, logical, node-id) rank that a wall-clock
+	// step-back can't undercut, and it breaks cross-node equal-instant ties
+	// deterministically by node-id (killing the keep-local infinite-resync tie class).
+	// Gated + config-flagged (enforcement.hlc_lww) because it changes the conflict-key
+	// encoding: emission activates only once every node ADVERTISES the token (so every
+	// receiver's lwwOrder can parse+instant-compare HLC — shipped ahead of emission)
+	// AND the local flag is set AND the token has latched. The comparator is
+	// instant-based, so a per-node canary and a flag-off rollback are both safe (a
+	// fresh RFC3339 write never loses to an older HLC one). NOT a full clock rewrite:
+	// updated_at is the only column that becomes HLC; wall/display columns keep RFC3339.
+	HLCLwwV1 = "hlc_lww_v1"
 	// StrictMTLSIdentityV1 gates the strict mTLS-identity auth model: a bearerless
 	// client certificate (a distributable lv-cli cert, an unknown/empty CN, or a
 	// removed host's CN) is no longer treated as admin — it must present a session
@@ -90,6 +109,88 @@ const (
 	// on but forward-compatible: with enforcement off, no owner promotes, so the relayed
 	// header is ignored.)
 	ForwardedIdentityV1 = "forwarded_identity_v1"
+	// RBACRealmV1 gates realm-aware role-binding grammar. Role bindings enforce
+	// against realm-qualified principals (user:<name>@<realm>), so a legacy bare
+	// grant (user:<name>) is inert. Once this token is enforced, a new daemon
+	// stops minting bare bindings: it either REJECTS a bare grant (config on, not
+	// yet latched fleet-wide — the safe pre-uniformity state) or RESOLVES it to
+	// the target user's realm and stores it canonically (config on AND latched).
+	// Gating on the latch is what keeps this mixed-version-safe: while any peer
+	// still mints bare bindings, we refuse rather than canonicalize.
+	//
+	// ADVERTISED (in `supported`), enforcement default-off (see StrictMTLSIdentityV1) —
+	// inert until auth.rbac_realm is set; the config flag is the reversible kill switch.
+	RBACRealmV1 = "rbac_realm_v1"
+	// OperationProtocolV1 gates the v41 F1 operation protocol (the operations/
+	// operation_steps journal, the per-VM vm_owner_epoch/spec_generation, and the
+	// active_operation_id mutation barrier). The per-host PCI observation/ownership
+	// fixes activate independently, but the OPERATION protocol is only safe to rely
+	// on once EVERY mutation-serving peer supports it — an old peer would direct-
+	// write a spec without honoring the barrier/generations. Once latched, an
+	// incompatible peer is quarantined from mutating endpoints + replication
+	// sessions (with reseed-on-rejoin). Config-gated (enforcement.operation_protocol)
+	// + reversible like StrictMTLSIdentityV1.
+	//
+	// Unlike the other reversible tokens (advertised build-static; a flag-off peer
+	// is merely permissive), a peer NOT enforcing the F1 mutation barrier would
+	// CORRUPT an in-flight operation — so this token is advertised CONDITIONALLY on
+	// the local config flag (see Server.advertisedCapabilities). Withholding
+	// advertisement when the flag is off keeps the cluster-wide latch (and thus any
+	// reliance on the barrier) from happening until EVERY node has opted in —
+	// enforcing the "require fleet uniformity before latching" rule. Enforcement is
+	// default-off and the flag is the reversible kill switch.
+	OperationProtocolV1 = "operation_protocol_v1"
+	// LiveResizeV1 gates TRUE live CPU hot-add and balloon-memory resize (the
+	// max_cpu vCPU-hotplug ceiling and the <vcpu current=N>MAX</vcpu> XML it needs).
+	// Setting max_cpu is refused until this latches, because an old peer could drop
+	// the field via a typed spec rewrite (labels/health reconciliation) or relay a
+	// mutation that loses it — so the whole fleet must support it first. Once latched,
+	// an incompatible peer is fenced from mutating/membership/replication sessions
+	// (D3). Config-gated (enforcement.live_resize) + reversible like
+	// StrictMTLSIdentityV1; advertised build-static (a flag-off peer is merely
+	// permissive — it just won't originate max_cpu).
+	LiveResizeV1 = "live_resize_v1"
+	// CanonicalIdentityV1 gates natural-key identity resolution for the tables that mint a
+	// random-UUID primary key but carry a UNIQUE natural key (snapshots (vm_name,name);
+	// container_snapshots (host_name,ct_name,name)). Two nodes can independently mint DIFFERENT
+	// ids for one logical object, whose replicated rows then collide on the secondary UNIQUE and
+	// back-pressure. Once this latches cluster-wide, an upgraded receiver resolves these tables by
+	// natural key (a deterministic winner over the natural-key group, collapsing the losing id
+	// into the winner via a column-preserving re-key) — NOT pairwise-negotiated per sender,
+	// because identity resolution mutates shared state and a per-sender flip would be
+	// non-convergent. A node that hasn't latched keeps the old behavior (back-pressures the
+	// collision) and converges once the whole fleet has latched.
+	//
+	// Like OperationProtocolV1, this token is advertised CONDITIONALLY on the local config flag
+	// (enforcement.canonical_identity; see Server.advertisedCapabilities): mutating shared state
+	// on a partial rollout must require CONFIG uniformity, not just a uniform build, so the
+	// latch (and thus any node collapsing rows) cannot happen until every node has opted in.
+	// Enforcement = the flag AND the latch; default-off + reversible.
+	CanonicalIdentityV1 = "canonical_identity_v1"
+	// CanonicalRegistryV1 gates the Part H2 canonical registry-credential model: one stable
+	// deterministic-id row per (scope,owner,registry) written by a single PK-keyed upsert, instead
+	// of the legacy mint-new-id tombstone+insert whose concurrent logins collide on the partial
+	// UNIQUE index. Its activation is a COORDINATED online contract (expand → converge → contract),
+	// not just a latch: latching only ACCEPTS replicated canonical writes (so the one-time
+	// legacy-row consolidation may run); the canonical WRITER is enabled — and the index contracted
+	// — only once legacy rows are consolidated to their deterministic ids, so the two writers never
+	// produce two live rows for one triple. Advertised CONDITIONALLY on enforcement.canonical_registry
+	// (like operation_protocol) so the latch requires config uniformity, not just a uniform build.
+	// The WRITER switch, drain/barrier proof, node admission/reseed, legacy-shape rejection, and the
+	// index contract are NOT part of this capability — they are a single future operator-run contract
+	// transition, not an auto-latch (deferred; see docs/diagnostics.md). Until then, local API writes
+	// stay on the legacy writer and this gate only makes consolidation's canonical writes acceptable.
+	CanonicalRegistryV1 = "canonical_registry_v1"
+	// HardwareV2 gates the source-of-truth cutover for VM hardware management (the VM
+	// Hardware Foundation effort): once enforced cluster-wide, hardware reads/writes
+	// move off the legacy representation onto the new one. This registration is the
+	// first step only — it makes the token a known, advertised name so the latch
+	// machinery can reference it by string; a later task gates advertisement on
+	// per-node readiness (so a node still migrating its hardware state doesn't
+	// advertise support before it's actually ready) and another adds the
+	// latch/enforcement machinery itself. Additive: changes no existing token's
+	// value or behavior.
+	HardwareV2 = "hardware_v2"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -165,16 +266,24 @@ var supported = []string{
 	// currently enforcing it".
 	SafeFenceDefaultV1,
 	LWWSkewGuardV1,
+	HLCLwwV1,
 	VIPDemoteV1,
 	VIPReleaseProbeV1,
 	StrictMTLSIdentityV1,
 	ForwardedIdentityV1,
+	SharedStorageFenceV1,
+	RBACRealmV1,
+	OperationProtocolV1,
+	LiveResizeV1,
+	CanonicalIdentityV1,
+	CanonicalRegistryV1,
+	HardwareV2,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, StrictMTLSIdentityV1, ForwardedIdentityV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

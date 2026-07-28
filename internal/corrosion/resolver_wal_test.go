@@ -2,8 +2,24 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 )
+
+// mustSkipLWW parses the statement's shape (as the apply path does) and calls shouldSkipLWW,
+// failing the test on any parse/LWW error.
+func mustSkipLWW(t *testing.T, r *Replicator, ctx context.Context, tx *sql.Tx, table string, pkCols []string, s Statement, ts string) bool {
+	t.Helper()
+	sh, err := parseStmtShape(s.SQL, pkCols)
+	if err != nil {
+		t.Fatalf("parse shape: %v", err)
+	}
+	skip, err := r.shouldSkipLWW(ctx, tx, table, pkCols, s, sh, ts)
+	if err != nil {
+		t.Fatalf("shouldSkipLWW: %v", err)
+	}
+	return skip
+}
 
 // The WAL (replicator) path resolves a full-image-INSERT tie through the SAME
 // engine anti-entropy uses, so the two paths never disagree. Numeric params on
@@ -33,7 +49,7 @@ func TestWAL_TieResolvesFullImageInsert(t *testing.T) {
 		SQL:    `INSERT OR REPLACE INTO images (name, format, size_bytes, updated_at) VALUES (?, ?, ?, ?)`,
 		Params: []interface{}{"img", "zzz", float64(5000000000), ts},
 	}
-	if r.shouldSkipLWW(ctx, tx, "images", []string{"name"}, s, ts) {
+	if mustSkipLWW(t, r, ctx, tx, "images", []string{"name"}, s, ts) {
 		t.Fatal("content-max must take the lexically-greater incoming row (zzz), not skip it")
 	}
 }
@@ -61,9 +77,15 @@ func TestWAL_TieRuntimeOwnedKeepsLocal(t *testing.T) {
 		SQL:    `INSERT OR REPLACE INTO vms (name, host_name, state, spec, updated_at) VALUES (?, ?, ?, ?, ?)`,
 		Params: []interface{}{"vm1", "host-b", "running", "{}", ts},
 	}
-	if !r.shouldSkipLWW(ctx, tx, "vms", []string{"name"}, s, ts) {
+	if !mustSkipLWW(t, r, ctx, tx, "vms", []string{"name"}, s, ts) {
 		t.Fatal("a runtime-owned host_name tie must keep local (skip the incoming)")
 	}
+	// The tracker/metric effect is DEFERRED to commit (a later statement's rollback must not leave a
+	// ghost marker). Commit + run the deferred effects, then assert.
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	c.runDeferredEffects(tx)
 	if c.UnresolvedTieCount() != 1 {
 		t.Fatalf("WAL tie must track unresolved, count=%d", c.UnresolvedTieCount())
 	}
@@ -95,7 +117,7 @@ func TestWAL_TiePartialUpdateKeepsLocal(t *testing.T) {
 		SQL:    `UPDATE images SET format = ?, updated_at = ? WHERE name = ?`,
 		Params: []interface{}{"zzz", ts, "img"},
 	}
-	if !r.shouldSkipLWW(ctx, tx, "images", []string{"name"}, s, ts) {
+	if !mustSkipLWW(t, r, ctx, tx, "images", []string{"name"}, s, ts) {
 		t.Fatal("a tied partial UPDATE must keep local (defer convergence to anti-entropy)")
 	}
 }
@@ -115,7 +137,7 @@ func TestWAL_ZeroRowUpdateKeepsUnresolved(t *testing.T) {
 	}
 	forceUpdatedAt(t, c, "vms", "name", "vm1", oldTs)
 	cols := []string{"name", "host_name", "updated_at"}
-	c.resolveTie("vms", cols, []interface{}{"vm1", "host-a", oldTs}, []interface{}{"vm1", "host-b", oldTs}, []int{0}, pathAE)
+	resolveTieApply(c, "vms", cols, []interface{}{"vm1", "host-a", oldTs}, []interface{}{"vm1", "host-b", oldTs}, []int{0}, pathAE)
 	if c.UnresolvedTieCount() != 1 {
 		t.Fatalf("expected one tracked tie, got %d", c.UnresolvedTieCount())
 	}
@@ -126,10 +148,11 @@ func TestWAL_ZeroRowUpdateKeepsUnresolved(t *testing.T) {
 	}
 	defer tx.Rollback()
 
-	// Newer timestamp (so LWW would apply) but the guard matches 0 rows (vm1 live).
+	// A registered vms UpdateObservedActuals CAS shape with a newer timestamp (so LWW would
+	// apply) but a wrong vm_owner_epoch guard, so it matches 0 rows (CAS miss on a live vm1).
 	s := Statement{
-		SQL:    `UPDATE vms SET state = 'x', updated_at = ? WHERE name = ? AND deleted_at IS NOT NULL`,
-		Params: []interface{}{newTs, "vm1"},
+		SQL:    `UPDATE vms SET cpu_actual = ?, mem_actual = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		Params: []interface{}{4, 8, newTs, "vm1", 999},
 	}
 	if err := r.applyStatementLWW(ctx, tx, s, newTs); err != nil {
 		t.Fatalf("applyStatementLWW: %v", err)

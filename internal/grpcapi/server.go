@@ -25,6 +25,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -78,6 +79,11 @@ type Server struct {
 	// Default false; the flag is the kill switch.
 	forwardedIdentity bool
 
+	// rbacRealm, when true, opts this node into realm-aware role-binding grammar
+	// (reject/resolve bare grants). Gated by this flag AND the RBACRealmV1 latch;
+	// the flag is the reversible kill switch. Default false. See rbacRealmActive.
+	rbacRealm bool
+
 	// enfSafeFence / enfLWWSkew / enfVIPSelfDemote / enfVIPProofReclaim mirror the
 	// split-brain-family enforcement kill-switches (config.Enforcement) so the HA
 	// monitor can drive the right tokens' latches (mandatory ∪ configured-on) and
@@ -85,10 +91,45 @@ type Server struct {
 	// advertisement. The actual enforcement predicates live on the consumers
 	// (Coordinator, daemon closures, vipGateActive); the daemon wires both from one
 	// config source. See SetEnforcementConfig / tokenEnabled. All default false.
-	enfSafeFence       bool
-	enfLWWSkew         bool
-	enfVIPSelfDemote   bool
-	enfVIPProofReclaim bool
+	enfSafeFence          bool
+	enfLWWSkew            bool
+	enfHLCLww             bool
+	enfVIPSelfDemote      bool
+	enfVIPProofReclaim    bool
+	enfSharedStorageFence bool
+	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
+	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
+	enfOperationProtocol bool
+	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
+	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
+	enfLiveResize bool
+	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
+	// resolution (snapshots/container_snapshots); gated by this flag AND the
+	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like
+	// operation_protocol) so the token can only latch once every node has opted in —
+	// identity resolution mutates shared state, so it requires config uniformity, not
+	// just a uniform build.
+	enfCanonicalIdentity bool
+	// enfCanonicalRegistry gates ADVERTISEMENT of canonical_registry_v1 (Part H2): the token is
+	// advertised only while this flag is set (like operation_protocol), so it can latch only once
+	// every node has opted in (config uniformity — accepting canonical writes mutates shared state).
+	// It is advertisement-only: acceptance keys off the DURABLE latch, not this flag, and there is no
+	// migration controller or post-latch acceptance switch. Flag-off stops advertising; it does not
+	// revoke an already-formed latch.
+	enfCanonicalRegistry bool
+
+	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
+	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
+	// pool. pfLocks serializes the inventory→create→observe→claim critical section
+	// per PF. sriovDegraded tracks per-PF degraded reasons for the aggregated gauge.
+	sriovManaged    bool
+	sriovMaxVFs     int
+	sriovManagedPFs map[string]bool
+	pfLocks         map[string]*sync.Mutex
+	pfLocksMu       sync.Mutex
+	sriovMetrics    *metrics.SRIOVMetrics
+	sriovDegradedMu sync.Mutex
+	sriovDegraded   map[string]map[string]bool // canonical PF BDF → reason → active
 
 	// capHealthLast records the most recent bounded freshness-check result per
 	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
@@ -168,6 +209,15 @@ type Server struct {
 	migrationMetrics *metrics.MigrationMetrics
 	lbMetrics        *metrics.LBMetrics
 	haMetrics        *metrics.HAHealthMetrics
+	dualRunMetrics   *metrics.DualRunMetrics
+
+	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
+	// gather (self-local + peer ReportRuntime): when non-nil it replaces the real probes,
+	// returning the snapshot per successfully-gathered host, the hosts that could not be
+	// reached this pass (a coverage gap), and the hosts on an older binary that does not
+	// implement ReportRuntime (surfaced but NOT paged as a coverage gap — expected during
+	// a rolling upgrade).
+	gatherRuntimeOverride func(ctx context.Context, hosts []string) (snaps map[string]runtimeSnapshot, unreachable, unsupported []string)
 
 	// storagePools holds host-level pool refs (name → ref) used to resolve
 	// move/replicate/compose volume targets. Seeded from daemon config at
@@ -207,6 +257,13 @@ type Server struct {
 	// falls back to the legacy admin/operator/viewer roleLevel comparison.
 	authEngine *auth.Engine
 
+	// opJournal is the host-local operation journal, wired at daemon startup. The
+	// device-lease path durably records claimed/bound devices here (gated by the
+	// operation_protocol capability) so a crash mid-allocation is recoverable; nil
+	// in tests / when unwired (durable recovery disabled, in-memory rollback still
+	// applies).
+	opJournal *opjournal.Journal
+
 	// realmRegistry is consulted by Login to dispatch authentication
 	// to the right realm by name. Always contains "local"; OIDC/LDAP
 	// realms are added from daemon config at startup. nil = legacy path
@@ -217,6 +274,11 @@ type Server struct {
 	// ReloadFirewall calls Reconcile(ctx) on it synchronously to give
 	// `lv firewall reload` push semantics rather than a 30s wait.
 	fwReconciler FirewallReconciler
+
+	// antiEntropy is the daemon's anti-entropy loop. TriggerAntiEntropy calls RunOnce on
+	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
+	// for the periodic tick. Same synchronous-push pattern as fwReconciler.
+	antiEntropy AntiEntropyTrigger
 
 	// tenancy gates CreateVM/stack admission against project quotas
 	// and emits metered billing events. Optional — nil means
@@ -279,6 +341,16 @@ type Server struct {
 	// advertisedCapabilities before the daemon wires this in, so the read must not race the
 	// write. Unset (nil) → never fenced.
 	watchdogFenced atomic.Pointer[func() bool]
+
+	// hwV2Ready is the CONTRACT h advertise-readiness flag: set at the END of a
+	// successful BackfillHardwareTables, once the audit pass has classified every
+	// owned VM and populated the typed-hardware tables. advertisedCapabilities
+	// withholds hardware_v2 until it is set (see hardwareV2Ready), so this node
+	// cannot help LATCH hardware_v2 cluster-wide before its own tables are populated
+	// — a premature latch would stop legacy dual-writes / enable stopped mutations
+	// fleet-wide while this node could still miss data. Stored atomically: the daemon
+	// sets it from the startup backfill goroutine while the Ping/HA paths read it.
+	hwV2Ready atomic.Bool
 }
 
 // SetDemotionUnfenced records whether a minority VIP demote failed with no verified
@@ -310,7 +382,49 @@ func (s *Server) advertisedCapabilities() []string {
 	if s.selfFenced() {
 		return []string{}
 	}
-	return capabilities.Supported()
+	caps := capabilities.Supported()
+	// operation_protocol_v1 is advertised CONDITIONALLY on the local config flag,
+	// unlike the other reversible tokens. Those are additive safety checks where a
+	// flag-off peer is merely permissive; but a peer that isn't enforcing the F1
+	// mutation barrier would CORRUPT an in-flight operation, so the fleet-wide
+	// latch (and thus operationProtocolActive) must require CONFIG uniformity, not
+	// just a uniform build. Withholding advertisement when the flag is off keeps
+	// the cluster from latching — and relying on the barrier — until every node has
+	// opted in.
+	if !s.enfOperationProtocol {
+		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
+	}
+	// canonical_identity_v1 is likewise advertised CONDITIONALLY on its config flag: identity
+	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
+	// require CONFIG uniformity, not just a uniform build. Withholding advertisement while the
+	// flag is off keeps the cluster from latching until every node has opted in.
+	if !s.enfCanonicalIdentity {
+		caps = withoutCapability(caps, capabilities.CanonicalIdentityV1)
+	}
+	if !s.enfCanonicalRegistry {
+		caps = withoutCapability(caps, capabilities.CanonicalRegistryV1)
+	}
+	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
+	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
+	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
+	// prerequisite for hardware mutations). Advertising earlier could let the fleet
+	// latch hardware_v2 — stopping legacy dual-writes / permitting stopped
+	// mutations — before this node's tables are populated, so a peer could miss
+	// data. "Advertise = this node reads correctly across the transition."
+	if !s.hardwareV2Ready() {
+		caps = withoutCapability(caps, capabilities.HardwareV2)
+	}
+	return caps
+}
+
+func withoutCapability(caps []string, drop string) []string {
+	out := caps[:0:0] // fresh backing array; never mutate capabilities.Supported()'s slice
+	for _, c := range caps {
+		if c != drop {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // serverGate is the subset of *health.Checker the gRPC server consults.
@@ -347,11 +461,87 @@ func (s *Server) SetGate(g serverGate) { s.gate = g }
 
 // SetEnforcementConfig records the split-brain-family kill-switch flags so the HA
 // monitor drives/gates the right tokens. Wired once from config.Enforcement.
-func (s *Server) SetEnforcementConfig(safeFence, lwwSkew, vipSelfDemote, vipProofReclaim bool) {
+func (s *Server) SetEnforcementConfig(safeFence, lwwSkew, hlcLww, vipSelfDemote, vipProofReclaim, sharedStorageFence bool) {
 	s.enfSafeFence = safeFence
 	s.enfLWWSkew = lwwSkew
+	s.enfHLCLww = hlcLww
 	s.enfVIPSelfDemote = vipSelfDemote
 	s.enfVIPProofReclaim = vipProofReclaim
+	s.enfSharedStorageFence = sharedStorageFence
+}
+
+// sharedStorageFenceActive reports whether this node ENFORCES the shared-storage
+// fence gate: the config kill-switch AND the cluster-wide latch. Mirrors the
+// family's `flag && Enforced` model (strictMTLSActive / forwardedIdentityActive).
+func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
+	return s.enfSharedStorageFence && s.gate != nil && s.gate.Enforced(ctx, capabilities.SharedStorageFenceV1)
+}
+
+// SetOperationProtocol sets this node's kill-switch for relying on the v41 F1
+// operation protocol. The flag is the reversible kill switch; enforcement is this
+// flag AND the OperationProtocolV1 latch (see operationProtocolActive).
+func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+
+// operationProtocolActive reports whether this node relies on + enforces the v41
+// operation protocol: the config flag AND the cluster-wide latch. Same
+// `flag && Enforced` model as the rest of the family.
+func (s *Server) operationProtocolActive(ctx context.Context) bool {
+	return s.enfOperationProtocol && s.gate != nil && s.gate.Enforced(ctx, capabilities.OperationProtocolV1)
+}
+
+// hardwareV2Latched reports whether the hardware_v2 source-of-truth cutover (VM
+// Hardware Foundation) may be relied upon: operation_protocol_v1 must be active
+// AND the hardware_v2 capability itself must be latched cluster-wide. Unlike the
+// other reversible tokens, hardware_v2 has no local config kill-switch of its own —
+// its activation is automatic (version/advertisement-gated via the latch) — but it
+// hard-depends on operation_protocol_v1 (hardware mutations require the crash-safe
+// operation journal), so that check is short-circuited FIRST: a missing protocol
+// always means not-latched, regardless of the hardware marker's state.
+func (s *Server) hardwareV2Latched(ctx context.Context) bool {
+	if !s.operationProtocolActive(ctx) {
+		return false
+	}
+	return s.gate != nil && s.gate.Enforced(ctx, capabilities.HardwareV2)
+}
+
+// hardwareV2Ready reports whether this node may ADVERTISE hardware_v2 (CONTRACT h):
+// its BackfillHardwareTables audit pass has completed (hwV2Ready) AND it relies on
+// the operation_protocol_v1 prerequisite. It reads the op-protocol dependency via
+// the config kill-switch plus the CHEAP in-memory latch (gate.Latched) — never
+// gate.Enforced — because advertisedCapabilities is consulted from the Ping handler:
+// Enforced would drive an activation peer-Ping from inside a Ping, recursing through
+// advertisedCapabilities. Latched returns the SAME steady-state answer without any
+// network I/O and is strictly more conservative (true only once operation_protocol
+// has actually latched), which is the safe direction for withholding advertisement.
+// hardware_v2 has no config kill-switch of its own; readiness is its gate.
+func (s *Server) hardwareV2Ready() bool {
+	if !s.hwV2Ready.Load() {
+		return false
+	}
+	if !s.enfOperationProtocol {
+		return false
+	}
+	return s.gate != nil && s.gate.Latched(capabilities.OperationProtocolV1)
+}
+
+// SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
+func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
+
+// SetCanonicalIdentityEnforce sets this node's kill-switch for natural-key identity
+// resolution (enforcement.canonical_identity). Enforcement is this flag AND the
+// CanonicalIdentityV1 cluster-wide latch; advertisement is withheld while it is off.
+func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity = on }
+
+// SetCanonicalRegistryEnforce sets this node's kill-switch for the canonical registry-credential
+// model (enforcement.canonical_registry). Advertisement is withheld while it is off, so the latch
+// (and thus acceptance of canonical writes) can't happen until every node has opted in.
+func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry = on }
+
+// liveResizeActive reports whether this node may originate live-resize behavior
+// (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
+// old peer can't have max_cpu dropped from a spec it later rewrites.
+func (s *Server) liveResizeActive(ctx context.Context) bool {
+	return s.enfLiveResize && s.gate != nil && s.gate.Enforced(ctx, capabilities.LiveResizeV1)
 }
 
 // tokenEnabled reports whether this node is configured to ENFORCE token — the
@@ -368,6 +558,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfSafeFence
 	case capabilities.LWWSkewGuardV1:
 		return s.enfLWWSkew
+	case capabilities.HLCLwwV1:
+		return s.enfHLCLww
 	case capabilities.VIPDemoteV1:
 		return s.enfVIPSelfDemote
 	case capabilities.VIPReleaseProbeV1:
@@ -376,6 +568,18 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.strictMTLSIdentity
 	case capabilities.ForwardedIdentityV1:
 		return s.forwardedIdentity
+	case capabilities.SharedStorageFenceV1:
+		return s.enfSharedStorageFence
+	case capabilities.RBACRealmV1:
+		return s.rbacRealm
+	case capabilities.OperationProtocolV1:
+		return s.enfOperationProtocol
+	case capabilities.LiveResizeV1:
+		return s.enfLiveResize
+	case capabilities.CanonicalIdentityV1:
+		return s.enfCanonicalIdentity
+	case capabilities.CanonicalRegistryV1:
+		return s.enfCanonicalRegistry
 	default:
 		return false
 	}
@@ -523,6 +727,20 @@ func (s *Server) destSupportsGate(ctx context.Context, dest string) bool {
 	return s.gate.PeerSupportsFresh(ctx, dest, capabilities.SplitBrainGateV1)
 }
 
+// destSupportsSharedStorageFence fresh-Pings dest to confirm it advertises
+// shared_storage_fence_v1 before this node stamps a proof whose shared-disk
+// proof-grade requirement the dest must honor on execute. Self-aware + fail
+// closed, mirroring destSupportsGate.
+func (s *Server) destSupportsSharedStorageFence(ctx context.Context, dest string) bool {
+	if s.gate == nil {
+		return false
+	}
+	if dest == s.hostName {
+		return capabilities.Has(s.advertisedCapabilities(), capabilities.SharedStorageFenceV1)
+	}
+	return s.gate.PeerSupportsFresh(ctx, dest, capabilities.SharedStorageFenceV1)
+}
+
 // lbGateRefused is the markerless execute-gate at the LB-apply chokepoint.
 func (s *Server) lbGateRefused(ctx context.Context) (string, bool) { return s.execGateRefused(ctx) }
 
@@ -533,6 +751,13 @@ type FirewallReconciler interface {
 	Reconcile(ctx context.Context) error
 	LastError() error
 	LastTick() time.Time
+}
+
+// AntiEntropyTrigger runs a single debounced anti-entropy pass (corrosion.AntiEntropy).
+// RunOnce returns true iff a pass actually ran (false = debounced: already running or
+// within cooldown).
+type AntiEntropyTrigger interface {
+	RunOnce(ctx context.Context) bool
 }
 
 // ContainerRuntime is the subset of internal/lxc.Runtime the gRPC
@@ -641,6 +866,12 @@ func (s *Server) SetAuthEngine(e *auth.Engine) {
 	s.authEngine = e
 }
 
+// SetOpJournal wires the host-local operation journal so the device-lease path
+// can durably record claimed/bound devices (F1). nil-safe (tests leave it nil,
+// which disables durable device-lease recovery — the in-memory scoped rollback
+// still applies).
+func (s *Server) SetOpJournal(j *opjournal.Journal) { s.opJournal = j }
+
 // SetRealmRegistry wires the multi-realm authentication registry. The
 // daemon constructs it from the auth.realms YAML block and calls this
 // before serving begins. When nil, Login falls back to a hard-coded
@@ -656,6 +887,10 @@ func (s *Server) RealmRegistry() *auth.Registry { return s.realmRegistry }
 // SetFirewallReconciler wires the daemon's firewall reconciler so the
 // ReloadFirewall RPC can drive a synchronous Reconcile.
 func (s *Server) SetFirewallReconciler(r FirewallReconciler) { s.fwReconciler = r }
+
+// SetAntiEntropy wires the daemon's anti-entropy loop so TriggerAntiEntropy can drive an
+// immediate (debounced) pass for `lv cluster converge`.
+func (s *Server) SetAntiEntropy(a AntiEntropyTrigger) { s.antiEntropy = a }
 
 // reconcileFirewall applies the firewall ruleset now, best-effort. Callers use it
 // after writing/deleting host_fw_intent (NAT/SNAT/isolation) so the change takes
@@ -768,6 +1003,11 @@ func (s *Server) SetLBMetrics(m *metrics.LBMetrics) {
 // SetHAHealthMetrics attaches the persistent HA-degraded gauge (Phase 2 H1).
 func (s *Server) SetHAHealthMetrics(m *metrics.HAHealthMetrics) {
 	s.haMetrics = m
+}
+
+// SetDualRunMetrics attaches the leader-gated dual-run detector gauges.
+func (s *Server) SetDualRunMetrics(m *metrics.DualRunMetrics) {
+	s.dualRunMetrics = m
 }
 
 // recordLBKeepalived publishes whether this host's keepalived for lbName is

@@ -150,5 +150,5 @@
   }
 
   document.addEventListener('DOMContentLoaded', function() { initAll(); });
-  document.body.addEventListener('htmx:afterSettle', function(e) { initAll(e.detail.target); });
+  document.addEventListener('htmx:afterSettle', function(e) { initAll(e.detail.target); });
 })();

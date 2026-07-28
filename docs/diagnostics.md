@@ -5,6 +5,23 @@ scanner** (`lv doctor divergence`) is strictly read-only — it never writes or
 merges state. **Repair commands** under `lv doctor` (e.g. `repair-owner`,
 below) are intentionally mutating and audited; each is called out as such.
 
+## Operation recovery (`lv operation`)
+
+Each mutating VM operation holds a per-VM **mutation barrier**
+(`active_operation_id`); other mutations defer while it is set. A crash mid-
+operation is normally cleared by the owner's startup recovery, but a wedged
+operation can be inspected and force-cleared manually:
+
+```
+lv operation show <vm>            # inspect the operation holding the barrier + its steps
+lv operation abort <vm> --force   # force-clear the barrier so the VM is mutable again
+```
+
+`show` is read-only. `abort` is admin-only, requires `--force`, is audited, and
+clears the barrier only via the exact owner-epoch + spec-generation
+compare-and-swap — so it can never clear a newer operation's barrier, and an
+ordinary mutation's `--force` never bypasses the barrier.
+
 ## `lv doctor divergence`
 
 Read-only.
@@ -36,7 +53,7 @@ compares per-row metadata, and returns a classified report.
 | `missing_row` | Present on some nodes, absent on others. |
 | `tombstone_vs_live` | Tombstoned (soft-deleted) on some nodes, live on others. |
 | `terminal_vs_live` | A workload terminal (stopped/error) on some nodes, running on others. |
-| `schema_shape_mismatch` | The table's column set differs across nodes. |
+| `schema_shape_mismatch` | The table's column **set** differs across nodes (a missing or extra column). Column *order* alone is ignored — a fresh `CREATE TABLE` vs an upgraded `ALTER ADD COLUMN` no longer trips this. |
 
 A divergence is reported **only when it persists across two samples** with
 unchanged per-node content hashes — an in-flight replication delta changes between
@@ -60,6 +77,204 @@ illegal:
 > the runtime-repair phases; until then `lv doctor divergence` checks only the
 > DB-level invariants above. A clean report does **not** yet prove the DB agrees
 > with runtime truth.
+
+### Remediating a persistent `schema_shape_mismatch`
+
+`schema_shape_mismatch` fires only on a real column-**set** difference, not a pure
+column reorder. A genuine mismatch means one node's table was created with a
+different column set than another's — usually an interrupted or skipped migration.
+The scanner is read-only; clearing it is a one-time, **quiesced**, per-node
+operation on the offending node:
+
+1. **Make it safe.** Move any workload the table backs off the node (e.g. relocate
+   the load balancer / VIP) so the node can be taken out of service.
+2. **Stop the daemon** and take a **SQLite-consistent backup** (the `.backup` API,
+   or copy the DB after a WAL checkpoint, including the `-wal`/`-shm` files).
+3. In a `BEGIN IMMEDIATE` transaction, **recreate the table from the canonical
+   schema of the node's current version**, copy and validate rows, drop/rename,
+   then **recreate named indexes and triggers** (they don't survive the drop).
+4. **Validate structurally** with pragmas — `foreign_key_check`, `integrity_check`,
+   `table_info`, `index_list`/`index_xinfo`, `foreign_key_list`, triggers,
+   constraints/defaults/collations, table options (`STRICT`/`WITHOUT ROWID`), and
+   `user_version` — compared against a known-good node (not raw `sqlite_master`
+   text). `COMMIT`.
+5. **Restart**, run `foreign_key_check` again after reopening, then confirm the
+   workload listing is unchanged and `lv doctor divergence` (and the cluster
+   digest) have converged.
+
+> A pure column-order skew that previously mis-reported here classifies as
+> row-content divergence when the positional (v1) digest is in force. The
+> order-invariant **digest_v2** (below) makes that skew hash identically across
+> nodes, preventing the recurrence entirely — enable it fleet-wide instead of
+> repeatedly running the data remediation above for a column-order-only skew.
+
+### `digest_v2` — the order-invariant table/row digest
+
+The default (v1) content digest hashes each row's cell **values in physical column
+order**, so a fresh `CREATE TABLE` node and an `ALTER ADD COLUMN`-upgraded node
+compute different table/row hashes for logically identical data. The merge is
+column-**name**-safe, so this never corrupts data — but the hashes stay different
+every cycle, causing perpetual no-op anti-entropy pulls and a standing
+`lv doctor divergence` / `lv cluster digest` mismatch on the reordered tables.
+
+**digest_v2** pairs each value with its column name, sorts by name, and hashes a
+canonical, order-invariant encoding — so column order stops mattering. It is
+negotiated **pairwise by field presence**: a node emits the v2 hash only when its
+own `enforcement.digest_v2` flag is on, and any two peers compare v2 **only when
+both supply it**, otherwise both compare v1. There is no capability latch — the
+digest only *detects*, and each node compares independently, so a non-uniform
+rollout only affects which node pulls, never data. `lv cluster digest` /
+`lv cluster converge` print a `VER` column showing which version was compared per
+table.
+
+**Activation (do it fleet-uniformly, after every node runs a build that supports it):**
+
+1. **Ship** the supporting binary to every node with `enforcement.digest_v2: false`
+   (the default). Flag off ⇒ v1-only emission; behavior is unchanged.
+2. **Converge** — confirm every node is upgraded (`lv host ls`).
+3. **Activate** — set `enforcement.digest_v2: true` in each node's config and
+   rolling-restart the fleet (the same procedure as any other `enforcement.*`
+   flag). Nodes now emit and compare v2 pairwise.
+4. **Controlled resync** — `lv cluster converge --all` (one anti-entropy pass).
+   Precise outcome:
+   - Column-order-only tables **stop pulling** and read converged (`VER v2`).
+   - Strictly-newer LWW drift **may** heal (normal LWW), as always.
+   - Genuine **equal-timestamp safety faults still require explicit remediation** —
+     LWW never auto-heals a tie. `lv doctor repair-owner` restamps **VM-owned rows
+     only** (the `vms` table); other tables (e.g. `lb_configs`) need the quiesced
+     table-remediation procedure above or a table-specific restamp — `repair-owner`
+     cannot repair them, and `lv cluster converge` labels them accordingly.
+   - **In-memory unresolved-tie records do not auto-clear** just because a table's
+     v2 digest now matches; they clear on the next daemon restart.
+
+Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to
+v1-only emission (peers then compare v1 against it). Because negotiation is by
+field presence, a mixed fleet is always safe — never a spurious v1-vs-v2 mismatch.
+
+### `canonical_identity` — natural-key identity resolution
+
+A few tables mint a **random-UUID primary key** but carry a **UNIQUE natural key**:
+`snapshots` (`vm_name`, `name`) and `container_snapshots` (`host_name`, `ct_name`,
+`name`). Two nodes can independently create the *same logical object* — the same
+snapshot name for the same VM — while each mints its **own** id. The replicated
+rows then collide on the secondary UNIQUE, and the fail-closed apply path
+**back-pressures** (keeps local, retries) rather than pick a winner, so the two ids
+persist and `lv doctor divergence` reports the natural-key group as diverging.
+
+With `enforcement.canonical_identity` enabled **and the `canonical_identity_v1`
+token latched cluster-wide**, an upgraded receiver resolves these tables by their
+**natural key**: it collapses each such pair to a single deterministic winner (newer
+`updated_at` wins; on an **exact-instant tie** the smaller id wins **only if the two
+rows' non-id content is provably equivalent** — a NULL is distinct from an empty
+string, and equivalence requires a **complete** local-schema image, so under schema
+skew an uncompared receiver-only column is treated as a fault, never assumed equal).
+The collapse **re-keys the surviving row in place** — a single column-preserving
+`UPDATE`, never a delete-then-insert — so receiver-only columns a newer-schema node
+holds are **not** erased when an older-schema winner arrives. Because identity
+resolution *mutates shared state* it is **not** negotiated pairwise like `digest_v2`,
+and — like `operation_protocol` — the token is advertised only while the flag is on,
+so the latch requires **config** uniformity: a partially-configured cluster stays
+non-destructive (nodes not yet opted in keep back-pressuring) and converges once
+every node has latched.
+
+**Fail-closed guards** (nothing is silently discarded): an exact-instant tie whose
+content is not provably equivalent is an **unresolved identity fault** — keep local,
+remain divergent, and track it in `litevirt_lww_tie_unresolved_current`
+(category `identity_content_conflict`, keyed by natural key) so it alerts. It clears
+only on genuine convergence — a successful collapse/apply, or observing the same-id,
+fully-equivalent converged row — never merely because a later observation was older.
+A collapse also fails closed if the incoming id already belongs to a **different**
+natural key locally (would destroy an unrelated row), or if an existing child
+references the losing id (`snapshots.parent_id`, unused today, would be orphaned since
+references are not rewritten). The tracker/alert side effects run only after the merge
+transaction commits, so a rollback can't leave a stale fault or a false alert.
+
+**Orphaned artifacts:** a collapse whose losing row referenced a **different physical
+artifact** — a different `(host, path)` pair — leaves the losing file unreferenced.
+The winner's pair is read back from the surviving row **after** the column-preserving
+re-key, so a path column the sender omitted (schema skew) is correctly seen as
+preserved-and-still-referenced, never falsely flagged. Orphaning covers a different
+host (the whole losing snapshot is stranded) **and** a same-host path change (e.g. a
+`vmstate_path`/`path` rewrite; because `host_name` is part of the `container_snapshots`
+natural key, its collapses are always same-host, so a path change is the only way one
+orphans a file). It is **not** auto-deleted — the losing id/host/path is logged (WARN,
+after commit) and counted in `litevirt_identity_collapse_orphaned_total` so an operator
+can reclaim the space.
+
+**Scanner lane:** while it is active fleet-wide, `lv doctor divergence` keys these
+tables by their natural key too, so a still-converging group shows as **one**
+content divergence instead of two phantom `missing_row`s; a converged group reads
+clean. The lane engages only when the scanning node has latched (uniform fleet).
+
+**Activation** mirrors `digest_v2`: ship the supporting binary everywhere (flag
+off, behavior-neutral), confirm every node is upgraded, then set
+`enforcement.canonical_identity: true` and rolling-restart. Existing divergent
+pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) — no
+separate data migration. Kill switch: set it `false` and restart (the node reverts
+to back-pressuring the collision, still non-destructive).
+
+### `canonical_registry` — registry-credential migration
+
+Registry logins mint a **new random `id` per login** and write via a tombstone+insert
+batch, so two nodes logging into the same registry concurrently produce two live rows that
+collide on the partial `UNIQUE(scope,owner,registry)`. The **canonical model** fixes this by
+deriving a **deterministic id** from `(scope,owner,registry)` — both nodes target the same
+primary key and a conflict resolves by normal LWW.
+
+**What ships today is preparatory infrastructure, not the fix.** The concurrent-login
+collision described above is **still open** — the writer is **not** switched. Every API
+write still uses the legacy random-id writer, so two concurrent logins still mint different
+ids; a replicated legacy batch can lose LWW on its by-triple tombstone and its INSERT then
+back-pressures fail-closed against the peer's live row (safe — no corruption — but it stalls
+that sender's stream to the peer until the conflicting state is remediated and the blocked
+entry successfully retries; a later WAL entry cannot supersede an ordered entry stuck ahead
+of it). This is unchanged from before the canonical work; the reversible core below does not
+resolve it.
+
+The one runtime behavior that ships is the **accept gate**: once `canonical_registry_v1` is
+**durably latched** cluster-wide, replicated **canonical** upserts are accepted on apply
+(before the latch they fail closed). The building blocks — the deterministic id, the
+canonical writer primitive (no production caller yet), the idempotent consolidation routine,
+and the `RegistryWriterReady` / `RegistryContractReady` readiness checks (computed
+on-demand, never cached) — are in place for the future operator transition, but nothing
+runs a background consolidation loop and nothing switches the writer.
+
+- **`enforcement.canonical_registry`** (config flag) gates only **advertisement** of the
+  token, so a fleet opts in and the latch forms with config uniformity. It is a reversible
+  opt-in *before* the token latches.
+- **Acceptance is permanent once latched.** The accept gate reads the *durably* latched
+  marker (in memory AND persisted), not the flag — so turning the flag off after latching does
+  **not** revoke acceptance (which would strand an in-flight canonical wire shape and stall
+  replication), and it survives a restart. Flag-off only stops **advertisement** (further
+  opt-in); it does not stop `ConsolidateRegistryCredentials`, which the future operator
+  transition can still call because it gates on the durable accept latch, not the flag.
+
+**Deferred: the writer-activation contract.** Switching writes to the canonical writer is a
+distributed-contract transition, done as ONE atomic operator-run operation: run
+consolidation while writes are quiesced; prove a durable replication-sequence **barrier**
+consumed by every admitted peer's watermark; prove registry-credential **convergence**;
+apply **node admission / reseed** rules for a node returning pre-barrier; **reject the legacy
+shape** after activation; and eventually the index contract (partial → non-partial
+`UNIQUE(scope,owner,registry)`). None of that is a config boolean — it is intentionally NOT
+shipped here, and readiness for it must be recomputed synchronously at that time, not read
+from a cached flag.
+
+**Operator runbook — a concurrent-login collision.** A rare race (the same
+`(scope, owner, registry)` credential written on two nodes within the replication window)
+leaves two different live credential ids for one triple. This is **fail-closed — no
+corruption, no silent pick** — but it does not auto-resolve.
+
+- **Detect:** `litevirt_merge_apply_rejected_total{table="registry_credentials",reason="unique"}`
+  climbs, and `lv doctor divergence` reports a **stable** `registry_credentials` divergence
+  (one triple, different live ids per node). The WAL stream between the two nodes may also
+  stall (rising `litevirt_replication_peer_pending_entries` for that peer) — the colliding
+  entry sits at the head of the stream and back-pressures the batch until it ages out at
+  `MaxLogRetention` (24h). Anti-entropy keeps every other table converged in the meantime.
+- **Remediate:** soft-delete (tombstone) the divergent live credential for that triple on the
+  affected node(s) — a single `deleted_at` write per node — then have the user re-establish the
+  login, which writes one fresh credential that converges. No data is lost; the credential is
+  simply re-created. (Equivalently, once the stalled entry prunes, a fresh login converges on
+  its own.) The permanent fix is the deferred writer-activation contract above.
 
 ### The sensitive lane
 
@@ -93,6 +308,32 @@ outright rather than scanning nothing.
 Human-readable table by default; `--json` for the full structured report (node
 lists incl. `sensitive_unreachable`, per-row per-node `updated_at`/hash, `stable`,
 and violations). `--table` restricts the scan to specific tables.
+
+## Persisted LWW clock & backward-clock protection
+
+The `updated_at` conflict key is minted from a **monotonic** clock whose high-water
+mark is persisted to `<dataDir>/nowts.hwm`, so a wall-clock step-back or a restart
+can't mint an older-sorting key that silently loses cluster-wide. This protection is
+**always on** (no flag). Enabling `enforcement.hlc_lww` additionally flips the key
+*format* to HLC (see [configuration.md](configuration.md)); the persisted clock works
+the same either way.
+
+Operational notes:
+
+- **Sticky future-skew.** If a node's clock jumps far into the future, the persisted
+  high-water stays ahead even after the clock is corrected — the node keeps emitting at
+  the old ceiling until wall time catches up, and (with `lww_skew_guard`) peers may
+  quarantine its writes in the meantime. **Recovery:** correct the clock (NTP) and wait
+  it out. As a last resort, stop the daemon and delete `<dataDir>/nowts.hwm` to reset the
+  ceiling — this re-opens the backward-regression window until wall time passes the old
+  ceiling, so only do it when the skew was large and you understand the trade-off.
+- **Re-image / dataDir wipe.** A node whose `dataDir` is wiped loses its high-water and
+  regains the regression window until its wall clock passes the pre-wipe ceiling. Ensure
+  NTP is healthy before rejoining.
+- **Persistence failure is fail-closed.** If the daemon cannot persist a higher ceiling
+  and its in-memory headroom is exhausted, it **exits** rather than emit a key below the
+  last durable ceiling. Because the state DB shares the `dataDir` filesystem, a full disk
+  already fails writes; the crash surfaces it loudly. Recovery = free space.
 
 ## Equal-timestamp tie resolution
 
@@ -153,6 +394,17 @@ converge the row, so the two paths can never disagree.
   `split_brain`, `inconclusive`, `error`}. A `split_brain` is a workload running on
   two hosts at once → page; sustained `inconclusive` means a peer the repair needs
   is unreachable.
+- `litevirt_merge_apply_rejected_total{table,path,reason}` — **monotonic counter** of
+  replicated write ATTEMPTS the apply path refused (kept-local / back-pressured). `path` ∈
+  {`ae`, `wal`}; `reason` is a bounded class (never SQL text or parameters). Because it counts
+  *attempts*, a permanent fault re-increments every cycle — so alert on its **rate**, correlated
+  with replication backlog (`litevirt_replication_min_watermark_seq`) and `lv doctor
+  divergence`, **not** on its absolute value.
+- `litevirt_legacy_mutation_transformed_total{transformer}` — **monotonic counter** of prior-
+  release WAL statements this node NORMALIZED before applying (a supported historical shape, e.g.
+  a param-bound `crl_versions` rewrite). A brief rate during a rolling upgrade is expected; a
+  **continuing** rate means an old emitter is still writing or a relay is retaining pre-upgrade
+  WAL — investigate that peer/relay.
 
 ### Alerts
 
@@ -170,6 +422,9 @@ rate(litevirt_lww_tie_break_total[15m]) > 0
 rate(litevirt_lww_tombstone_tie_total[15m]) > 0   # lower severity
 # A workload running in two places at once — page immediately.
 increase(litevirt_runtime_owner_assert_total{result="split_brain"}[10m]) > 0
+# Replicated writes are being refused faster than they clear (a builder bug, a mixed-version
+# gap, or malformed input). Correlate with replication backlog + divergence, not the raw total.
+rate(litevirt_merge_apply_rejected_total[15m]) > 0
 ```
 
 The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the

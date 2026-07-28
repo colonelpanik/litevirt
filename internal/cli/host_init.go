@@ -626,18 +626,9 @@ pci:
     max_vfs_per_pf: ${SRIOV_MAX_VFS:-8}
 CONF
 
-# Install udev rule for PCI hot-plug events (if enabled).
-if [ "${PCI_UDEV_HOOK:-false}" = "true" ]; then
-    echo "Installing litevirt PCI udev rule"
-    cat > /etc/udev/rules.d/99-litevirt-pci.rules << 'UDEV'
-# litevirt: notify daemon on PCI device add/remove events.
-# This triggers a rescan so the device inventory stays current.
-ACTION=="add", SUBSYSTEM=="pci", RUN+="/usr/bin/curl -s -X POST http://127.0.0.1:7446/api/v1/hosts/rescan || true"
-ACTION=="remove", SUBSYSTEM=="pci", RUN+="/usr/bin/curl -s -X POST http://127.0.0.1:7446/api/v1/hosts/rescan || true"
-UDEV
-    udevadm control --reload-rules
-    echo "udev rule installed at /etc/udev/rules.d/99-litevirt-pci.rules"
-fi
+# pci.udev_hook is deprecated: real-time PCI events are covered by
+# pci.rescan_interval, and the old curl-to-REST udev rule was unreliable. This
+# installer no longer writes a udev rule; the daemon warns if the flag is set.
 
 # Load vfio-pci kernel module (needed for PCI passthrough).
 modprobe vfio-pci 2>/dev/null || true

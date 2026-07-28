@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -63,7 +64,11 @@ type Fencer func(ctx context.Context, h fence.HostConfig) fence.Result
 // host's local storage can resume from its replica instead of failing to start
 // for want of a disk. Optional — nil disables auto-promotion.
 type ReplicaPromoter interface {
-	AutoPromoteReplica(ctx context.Context, vmName string) error
+	// fenceEpoch binds the promote proof to the specific proof-grade fence of the
+	// old owner that authorizes this cross-host transfer (see proofGradeFenceRef);
+	// "" when no proof-grade fence exists (a best-effort/SSH fence), which the
+	// executor treats as fail-closed for a shared-disk VM.
+	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error
 }
 
 // ContainerRestorer restores a container onto a survivor host from its latest
@@ -126,6 +131,15 @@ type Coordinator struct {
 	// legacy proceed-anyway behavior, so a hand-built Coordinator / test is unaffected
 	// until explicitly enabled. Wired by the daemon.
 	SafeFenceEnforce bool
+	// SharedStorageFenceEnforce is the per-node kill-switch for the shared-disk
+	// ownership-transfer fence gate (config.Enforcement.SharedStorageFence).
+	// Enforcement is this flag AND the SharedStorageFenceV1 capability latch. When
+	// enforced, the coordinator refuses to CREATE a cross-host transfer of a VM with
+	// a writable shared disk unless it has a proof-grade fence of the old owner
+	// (a non-empty fence_epoch) — failing closed at the SOURCE so a config-skewed or
+	// regressed target can never receive an unfenced shared-disk transfer. Wired by
+	// the daemon.
+	SharedStorageFenceEnforce bool
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
@@ -279,28 +293,50 @@ func (c *Coordinator) run(ctx context.Context) {
 	// the failure threshold. The freshness predicate prevents stale rows from
 	// dead observers from satisfying quorum.
 	//
-	// host_health.updated_at is RFC3339; the cutoff must be RFC3339 too, NOT
-	// datetime('now', …) — a string compare against datetime()'s space text is
-	// always true once the date matches ('T' > ' '), which would let a DEAD
-	// observer's stale "suspect" row still count toward fencing quorum
-	// (defeating the freshness gate — a false-positive-fence safety hole).
-	freshCutoff := c.now().Add(-healthFreshness).UTC().Format(time.RFC3339)
-	rows, err := c.db.Query(ctx,
-		`SELECT target, COUNT(DISTINCT observer) AS observer_count
+	// Freshness is filtered in GO via corrosion.ParseUpdatedAt, NOT a SQL
+	// `updated_at > cutoff` string compare: updated_at is the LWW key, which becomes
+	// an HLC string ("<physms>-…") once hlc_lww is enabled, and a lexical/text compare
+	// can't span the RFC3339 and HLC forms (an HLC row would sort below an RFC3339
+	// cutoff and read as permanently stale — silently killing fencing quorum). Both
+	// forms decode to a wall instant, so the DISTINCT-observer-per-target quorum
+	// aggregation is done here too. An unparseable/stale row simply doesn't count.
+	freshCutoff := c.now().Add(-healthFreshness)
+	hh, err := c.db.Query(ctx,
+		`SELECT target, observer, updated_at
 		 FROM host_health
 		 WHERE target != ?
-		   AND consecutive_failures >= ?
-		   AND updated_at > ?
-		 GROUP BY target
-		 HAVING observer_count >= ?`,
-		c.hostName, offlineThreshold, freshCutoff, quorum)
+		   AND consecutive_failures >= ?`,
+		c.hostName, offlineThreshold)
 	if err != nil {
 		slog.Error("failover: query host_health", "error", err)
 		c.mAttempt(PhaseHealth, ResultError, ErrDBError)
 		return
 	}
+	freshObservers := map[string]map[string]struct{}{}
+	for _, r := range hh {
+		inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok || !inst.After(freshCutoff) {
+			continue // stale or unparseable → does not count toward quorum
+		}
+		t := r.String("target")
+		if freshObservers[t] == nil {
+			freshObservers[t] = map[string]struct{}{}
+		}
+		freshObservers[t][r.String("observer")] = struct{}{}
+	}
+	type fenceCandidate struct {
+		target    string
+		observers int
+	}
+	var candidates []fenceCandidate
+	for t, obs := range freshObservers {
+		if len(obs) >= quorum {
+			candidates = append(candidates, fenceCandidate{t, len(obs)})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].target < candidates[j].target })
 
-	for _, r := range rows {
+	for _, cand := range candidates {
 		// Re-validate lease before each destructive action: long fence runs
 		// (IPMI verify up to 15 s) can outlast the lease without renewal.
 		if !c.holdLease(ctx) {
@@ -309,7 +345,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			return
 		}
 
-		target := r.String("target")
+		target := cand.target
 		if c.fenced[target] {
 			continue
 		}
@@ -339,8 +375,8 @@ func (c *Coordinator) run(ctx context.Context) {
 		// stranded — so we only skip while it's within upgradingTimeout. On a
 		// timestamp parse error we err on the safe side and keep skipping.
 		if h.State == "upgrading" {
-			upd, perr := time.Parse(time.RFC3339, h.UpdatedAt)
-			if perr != nil || c.now().Sub(upd) < upgradingTimeout {
+			upd, ok := corrosion.ParseUpdatedAt(h.UpdatedAt)
+			if !ok || c.now().Sub(upd) < upgradingTimeout {
 				slog.Info("failover: target is upgrading, skipping fence", "host", target)
 				c.mAttempt(PhaseSkip, ResultSkipped, ErrUpgrading)
 				continue
@@ -360,7 +396,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		}
 
 		slog.Warn("failover: quorum reached — host exceeded failure threshold",
-			"host", target, "observers", r.Int("observer_count"), "quorum", quorum)
+			"host", target, "observers", cand.observers, "quorum", quorum)
 
 		c.failover(ctx, h)
 	}
@@ -436,7 +472,7 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 		return
 	}
-	freshCutoff := c.now().Add(-healthFreshness).UTC().Format(time.RFC3339)
+	freshCutoff := c.now().Add(-healthFreshness)
 	for _, h := range hosts {
 		switch h.State {
 		case "offline":
@@ -452,13 +488,14 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 			continue
 		}
 
+		// Freshness filtered in Go (both-format updated_at); see the fence-quorum
+		// query above for why a SQL string compare can't span RFC3339 + HLC.
 		rows, err := c.db.Query(ctx,
-			`SELECT COUNT(DISTINCT observer) AS n
+			`SELECT observer, updated_at
 			 FROM host_health
 			 WHERE target = ?
-			   AND consecutive_failures = 0
-			   AND updated_at > ?`,
-			h.Name, freshCutoff)
+			   AND consecutive_failures = 0`,
+			h.Name)
 		if err != nil {
 			// A query error would otherwise be indistinguishable from "not enough
 			// healthy observers" and silently suppress recovery.
@@ -466,7 +503,13 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 			c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 			continue
 		}
-		if len(rows) == 0 || rows[0].Int("n") < quorum {
+		fresh := map[string]struct{}{}
+		for _, r := range rows {
+			if inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at")); ok && inst.After(freshCutoff) {
+				fresh[r.String("observer")] = struct{}{}
+			}
+		}
+		if len(fresh) < quorum {
 			continue // not enough fresh healthy observers to recover
 		}
 		if err := corrosion.UpdateHostState(ctx, c.db, h.Name, "active"); err != nil {
@@ -624,6 +667,14 @@ func (c *Coordinator) safeFenceRequiresProof(ctx context.Context, h *corrosion.H
 	return h == nil || h.Labels[corrosion.LabelUnsafeAutoFailover] != "true"
 }
 
+// sharedStorageFenceEnforced reports whether this coordinator enforces the
+// shared-disk ownership-transfer fence gate: the config kill-switch AND the
+// SharedStorageFenceV1 cluster-wide latch. Mirrors safeFenceRequiresProof's
+// flag-short-circuits-latch model — a nil Gate (tests) is not enforcing.
+func (c *Coordinator) sharedStorageFenceEnforced(ctx context.Context) bool {
+	return c.SharedStorageFenceEnforce && c.Gate != nil && c.Gate.Enforced(ctx, capabilities.SharedStorageFenceV1)
+}
+
 // fenceWithinWindow reports whether host has a fencing_log row with an accepted
 // result newer than now-recentFenceWindow. manualOnly restricts the accepted
 // result to "manual-confirmed".
@@ -662,6 +713,39 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 		}
 	}
 	return false
+}
+
+// proofGradeFenceRef returns the fence_epoch binding for the newest PROOF-GRADE
+// fence of host within recentFenceWindow, or "" when none exists (a best-effort /
+// SSH fence, or no fence yet). A shared-disk cross-host transfer executor re-reads
+// FenceID from fencing_log and re-verifies it (never a stale hosts.state). The
+// recency filter mirrors fenceWithinWindow (Go-side, RFC3339). An IPMI fence
+// finds the row this cycle just inserted; a manual fence finds the operator's
+// "manual-confirmed" row (the fence-time "manual"/"partial" row is not proof-grade).
+func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) string {
+	rows, err := c.db.Query(ctx,
+		`SELECT id, method, result, timestamp FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		slog.Warn("failover: fencing_log read for fence_epoch failed", "host", host, "error", err)
+		return ""
+	}
+	cutoff := c.now().Add(-recentFenceWindow)
+	var best time.Time
+	var bestRef corrosion.FenceEpochRef
+	for _, r := range rows {
+		if !corrosion.FenceProofGrade(r.String("method"), r.String("result")) {
+			continue
+		}
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil || !ts.After(cutoff) {
+			continue
+		}
+		if bestRef.FenceID == "" || ts.After(best) {
+			best = ts
+			bestRef = corrosion.FenceEpochRef{Host: host, FenceID: r.String("id"), TS: r.String("timestamp")}
+		}
+	}
+	return bestRef.String()
 }
 
 // autoPromoteEnabled reports whether vmName has a replication schedule with
@@ -837,6 +921,13 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		}
 	}
 
+	// Bind cross-host transfer proofs to THIS fence: for a VM with a writable
+	// shared disk the executor requires a proof-grade power-off of the old owner
+	// (SharedStorageFenceV1), re-verified from fencing_log via this reference. ""
+	// when the fence wasn't proof-grade (best-effort/SSH) — the executor then fails
+	// a shared-disk transfer closed while a local-disk transfer still proceeds.
+	fenceEpoch := c.proofGradeFenceRef(ctx, h.Name)
+
 	// Step 3: Find VMs that should be restarted.
 	vms, err := corrosion.ListVMs(ctx, c.db, "", h.Name)
 	if err != nil {
@@ -877,6 +968,28 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			continue
 		}
 
+		// Shared-disk split-brain gate (decide site): if this coordinator enforces
+		// the shared-storage fence and the VM has a writable shared disk, a cross-host
+		// transfer needs a PROOF-GRADE fence of the old owner. fenceEpoch is non-empty
+		// ONLY when proofGradeFenceRef found one (IPMI / manual-confirmed); a
+		// best-effort fence yields "". Refuse to CREATE the transfer (auto-promote OR
+		// reschedule) at the SOURCE when there's no proof-grade fence — so a
+		// config-skewed / regressed target can never receive (and ungated-start) a
+		// shared-disk transfer lacking a proven power-off. When a proof-grade fence
+		// DOES exist the transfer proceeds and even an unenforcing target starts
+		// safely (the owner is provably down). The executor re-verifies as
+		// defense-in-depth. Operator remediation: `lv host fence-confirm` (or an IPMI
+		// fence strategy) makes fenceEpoch proof-grade on the next cycle.
+		if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) {
+			if disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name); derr == nil && corrosion.VMHasWritableSharedDisk(disks) {
+				slog.Error("failover: shared-disk VM transfer refused — no proof-grade fence of old owner (storage_unverified); run 'lv host fence-confirm' or set an IPMI fence strategy",
+					"vm", vm.Name, "old_owner", h.Name)
+				c.noteGateRefused(corrosion.ActionReschedule, health.ReasonStorageUnverified)
+				c.mVM(ActionReschedule, ResultError, ErrStorageUnverified)
+				continue
+			}
+		}
+
 		// Auto-promotion is an explicit per-schedule DR opt-in, so it takes
 		// precedence over the VM's on_host_failure policy (which defaults to
 		// "none" for `lv run` VMs). A VM on the fenced host's local storage has
@@ -898,7 +1011,17 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 					continue
 				}
 			}
-			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name); err != nil {
+			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch); err != nil {
+				// Fall through to the reschedule path on ANY promote error, including a
+				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
+				// replicated to the replica host yet). This is NOT a downgrade to a
+				// weaker path: the reschedule now carries the same fence_epoch, and the
+				// TARGET reconciler re-enforces the shared-disk proof-grade gate before
+				// starting — and, unlike this once-per-fenced-host loop, the reconciler
+				// genuinely retries a not-yet-replicated fence on its next tick. A bare
+				// `continue` here would strand the VM, since a fenced host is processed
+				// only once (c.fenced / state=="fenced" / recentlyFenced all short-circuit
+				// later cycles until the host recovers).
 				slog.Warn("failover: auto-promote failed, falling back to reschedule",
 					"vm", vm.Name, "error", err)
 				c.mVM(ActionPromote, ResultError, ErrPromoteFailed)
@@ -1011,7 +1134,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				ID: newID(), Action: corrosion.ActionReschedule, TargetKind: "vm",
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
-				QuorumLive: live, QuorumNeeded: needed,
+				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -1333,8 +1456,8 @@ func (c *Coordinator) markerFresh(ct corrosion.ContainerRecord) bool {
 	if to <= 0 {
 		to = defaultRelocateRestoreTimeout
 	}
-	t, err := time.Parse(time.RFC3339, ct.UpdatedAt)
-	if err != nil {
+	t, ok := corrosion.ParseUpdatedAt(ct.UpdatedAt)
+	if !ok {
 		return true // unparseable → conservatively treat as fresh (avoid double-restore)
 	}
 	return c.now().Sub(t) < to

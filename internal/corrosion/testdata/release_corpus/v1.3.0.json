@@ -1,0 +1,846 @@
+[
+  {
+    "fingerprint": "stmtshape/v1:004d45c86f1d3a7f376ee96f374688ea068f826323f4456a45ccf43de8573224",
+    "sql": "DELETE FROM container_restarts WHERE host_name = ? AND name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:01b7a6f0df0d2405f27fd8aebf11ce5fd3b5230396842a0c1c5738fc7969716b",
+    "sql": "UPDATE operation_steps SET deleted_at = ?, updated_at = ? WHERE operation_id = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:025e0ef4943d9c34fc711fc349de23185d0e58add227ba8618cbd50e890580ae",
+    "sql": "INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:02d2e27272be2595994cbd8a1f62ae7327eaa0a19dd9628f03df71ce7b0bae39",
+    "sql": "UPDATE storage_pools SET deleted_at = ?, updated_at = ?\n\t\t WHERE host_name = ? AND name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:03e7c13b104ec1b338dfb0935958756020bd827bf85b9cc4e799e28f85445b96",
+    "sql": "UPDATE tokens SET last_used_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:049d8da7fb3022f04381e467e0596d5413e4b9aa12d5c84fd9bdd51b56fa95ab",
+    "sql": "UPDATE hosts SET role = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:052588e516b2d241fe71c98c08227ec18a394deffc738ae6c039a1443a70a6f0",
+    "sql": "INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at, epoch)\n\t\t\t VALUES (?, ?, ?, ?, ?, ?, ?)\n\t\t\t ON CONFLICT(username, method, label) DO UPDATE\n\t\t\t   SET secret = excluded.secret, updated_at = excluded.updated_at,\n\t\t\t       deleted_at = NULL, last_step = 0, epoch = excluded.epoch"
+  },
+  {
+    "fingerprint": "stmtshape/v1:07d4ada0a2d50d1791b883d914672d194d316c2aab1bb953097a3507b8e7aef4",
+    "sql": "INSERT OR REPLACE INTO notification_routes (id, event_pattern, target_id, min_severity, enabled, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:08466628cf756f91302d16efdd3740bdc8d02b4636fa925e72c9cfbc1441d31c",
+    "sql": "INSERT INTO lb_backends (lb_name, name, address, is_vm, vm_name, enabled, updated_at, generation)\n\t\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n\t\t\t ON CONFLICT(lb_name, name) DO UPDATE SET\n\t\t\t   address = excluded.address,\n\t\t\t   is_vm = excluded.is_vm,\n\t\t\t   vm_name = excluded.vm_name,\n\t\t\t   enabled = excluded.enabled,\n\t\t\t   updated_at = excluded.updated_at,\n\t\t\t   generation = COALESCE(NULLIF(excluded.generation, ''), lb_backends.generation),\n\t\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:085cac889fec9062592f3b30a5b3980cce8bc0955b99d0d8bf484a91c8375ea0",
+    "sql": "UPDATE hosts SET labels = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:14d5b6df1d7029359e798ecc856004778724a3c92e3b6a8039a9fdc9607548d9",
+    "sql": "INSERT INTO sessions\n\t\t (id, username, realm, ip, user_agent, created_at, last_used_at, expires_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:15e6f4bdf6c407aca41f88142f45a34c7190288d6f2de8452e76446d2148818d",
+    "sql": "INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail)\n\t\t VALUES (?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:1647565e2a4948d497f211f88154b2f87c3fe908b63456a5eee68ab57b7102df",
+    "sql": "UPDATE hosts SET version = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:1769031b8cd3a108bc4463f42d100760905f7ba126ed240425bbeb34196313b7",
+    "sql": "INSERT INTO vm_backups (vm_name, disk_name, repo, total_bytes, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?)\n\t\t ON CONFLICT(vm_name, disk_name, repo) DO UPDATE SET\n\t\t   total_bytes = excluded.total_bytes,\n\t\t   updated_at  = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:1901471ee2afb04f3668a190ce37c245b7d8912d67a674e66ce12630412ce5e8",
+    "sql": "UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:197f5e060f1f80adcba8478a1e1294753e2801d8efa7c78ecbc52feef9154625",
+    "sql": "INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,\n\t\t\tcpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:1b4f681bb8a2533cb7d52d9d17f608f331a49d00f4ec7418b13eb9dcd22ed312",
+    "sql": "UPDATE hosts SET cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ?\n\t\t WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:1b5675be5268d184a0173d32d86c897363756db8b233591aca6242ad0f05f9e3",
+    "sql": "UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:1cb84176a16144b2744c8cd609d4e5da99cdbb1ea9a7b15e958fdf87d8f4096a",
+    "sql": "UPDATE replication_checkpoints SET deleted_at = ?, updated_at = ?\n\t\t\t WHERE vm_name = ? AND repo = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:1f926c8f9fa0fefc72b42ee848ae16d8d6aeab9ce5b66e61cd54dfc9af248cc4",
+    "sql": "UPDATE host_firewall_rules SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:234d3042fc15ab831821178e8b49b5337577f09ed551cc105e6fc5651d41736c",
+    "sql": "INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)\n\t\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n\t\t\t ON CONFLICT(network, ip) DO UPDATE SET\n\t\t\t   mac = excluded.mac, vm_name = excluded.vm_name, owner_kind = excluded.owner_kind,\n\t\t\t   owner_host = excluded.owner_host, allocated_at = excluded.allocated_at,\n\t\t\t   updated_at = excluded.updated_at, deleted_at = NULL\n\t\t\t WHERE ip_allocations.deleted_at IS NOT NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:249379e73590ab6841a6d89ae957983f736393dfb7f4cc39532037879dc4533f",
+    "sql": "UPDATE user_2fa SET deleted_at = ?, updated_at = ?\n\t\t\t WHERE username = ? AND method = ? AND COALESCE(label,'') = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:24fa23b631b1488801c985cfa0801d14e39a0f35b4d05314c5b2a5763a0b1dbe",
+    "sql": "UPDATE image_hosts SET progress_pct = ?, updated_at = ? WHERE image_name = ? AND host_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:253921a1ed48c83c43726ce19d95c6fefe362b31bf34475bb25518c3bf8127b0",
+    "sql": "UPDATE recovery_code_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:280b3e84bacc37cb5ab999a68d0602b3f2a7e22289f2e6878684312c94e8f999",
+    "sql": "UPDATE recovery_codes SET deleted_at = ?, updated_at = ?\n\t\t\t WHERE username = ? AND used_at IS NULL AND set_id != ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:28c6e49aed00c9fdba1c7db299695289a3d08cb6250a25d9ddfcda591a854cd9",
+    "sql": "INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:2b9dbe3d1e9402d589c7fa3baec021d59453cac9f96991e6a7fbed234e97de69",
+    "sql": "INSERT INTO role_bindings (id, path, role, principal, propagate, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:2c1457bf46b5c048f9a986625fe26d9a07e884cb74b47e63754973f288459547",
+    "sql": "INSERT INTO host_runtime_usage (host_name, disk_iops, net_mbps, updated_at)\n\t\t VALUES (?, ?, ?, ?)\n\t\t ON CONFLICT(host_name) DO UPDATE SET\n\t\t   disk_iops = excluded.disk_iops,\n\t\t   net_mbps = excluded.net_mbps,\n\t\t   updated_at = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:2f676b4a3511daf0656676d03f5e0d456753cf1d714aa0f5c3c9a1ae74460833",
+    "sql": "INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n\t\t ON CONFLICT(host_name, name) DO UPDATE SET\n\t\t   state = excluded.state,\n\t\t   image = excluded.image,\n\t\t   cpu_limit = excluded.cpu_limit,\n\t\t   memory_mib = excluded.memory_mib,\n\t\t   labels = excluded.labels,\n\t\t   restart_policy = excluded.restart_policy,\n\t\t   state_detail = excluded.state_detail,\n\t\t   project = excluded.project,\n\t\t   is_template = excluded.is_template,\n\t\t   on_host_failure = excluded.on_host_failure,\n\t\t   -- Keep an existing create_spec when the caller didn't supply one, so a\n\t\t   -- generic upsert can't wipe the create-time intent (it's \"current\n\t\t   -- intent\", forward-only).\n\t\t   create_spec = CASE WHEN excluded.create_spec \u003c\u003e '' THEN excluded.create_spec ELSE create_spec END,\n\t\t   relocate_token = excluded.relocate_token,\n\t\t   updated_at = excluded.updated_at,\n\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:30d369e8b76f7a88fde45540b581a8c0f6c72a9ed8dfe1583721fafa19769451",
+    "sql": "INSERT INTO user_2fa_sets (username, active_epoch, updated_at)\n\t\t\t\t VALUES (?, ?, ?)\n\t\t\t\t ON CONFLICT(username) DO UPDATE SET\n\t\t\t\t   active_epoch = excluded.active_epoch,\n\t\t\t\t   updated_at = excluded.updated_at,\n\t\t\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:3142134ac00bffd1e79e497eba833183d658228af4a9f1455fec56d1967b5054",
+    "sql": "INSERT INTO registry_credentials\n\t\t\t       (id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at)\n\t\t\t       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:33e18de94c0ea7107145bec4b510610f06524f360e84449cf413a7abf28cc642",
+    "sql": "UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:33eac4196d884d190ff4a75bddddec9f676389b21d1d00d591a079d5f5b44e9c",
+    "sql": "UPDATE snapshots SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:35408081aa7f687a31e12b55fc5d8d991f9850eb356f9dd7e6df028cf0dc3008",
+    "sql": "UPDATE hosts SET region = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:35747d10ea89aeab1febfa9362931a41d8b1f744b22627a2ca27e0a4197dca02",
+    "sql": "INSERT OR IGNORE INTO operations (id, method, principal, project, resource_kind, resource_id,\n\toperation_kind, request_hash, idempotency_key, reservation_json, desired_ref,\n\tvm_owner_epoch, created_at, updated_at, deleted_at)\n\t\t       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:35e3b69d8bf1fecc7b8d254d56b05c50f7337d25e071c196902f363049b4b2a0",
+    "sql": "UPDATE sessions SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:364b566fd917af286bd2be2a72a5dc3d2e417ae2fba674b669e36c72bf6f3225",
+    "sql": "UPDATE resource_mappings SET deleted_at = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:3831e4bcc8513e11373c8841bfb67fc9b7e2ecb52fb8706253b317c3faa4dab4",
+    "sql": "UPDATE vm_interfaces SET network_name = ?, updated_at = ? WHERE network_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:3849918d354698781226bca92df63e4ab05267f6b33211b5c4a6c7536814b631",
+    "sql": "UPDATE vm_interfaces SET vm_name = ?, updated_at = ? WHERE vm_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:39235aa160ef4569270d236fddce458e54d5ed31951e04331e8d92092f99999f",
+    "sql": "UPDATE containers SET state = ?, updated_at = ?\n\t\t WHERE host_name = ? AND name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:3b1720263165f9a15c6075d660efdb7f50aa6c551d4e42eb986bf92069a0fcdf",
+    "sql": "UPDATE runtime_action_proofs SET status = 'failed', result_code = ?, result_detail = ?,\n\t\t        completed_at = ?, updated_at = ?\n\t\t        WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')"
+  },
+  {
+    "fingerprint": "stmtshape/v1:3b4d180e58771578150d5abc77e1aed0ececb9d661a579493ff13441c413a050",
+    "sql": "UPDATE vm_disks SET host_name = ?, path = ?, updated_at = ?\n\t\t WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:3ecc15d43aa2708186c066a9b4a8957f95f90d1533615d6fba732f455bef0981",
+    "sql": "UPDATE service_endpoints SET deleted_at = ?, updated_at = ?\n\t\t WHERE service_name = ? AND ip = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:40349d1097399ca31e5d81817cb459bfc82a5dd6fce52b58e4b484fcafdd0b7d",
+    "sql": "UPDATE backup_schedules\n\t\t SET deleted_at = ?, updated_at = ?\n\t\t WHERE vm_name = ? AND repo = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:42e68d6dac19dda7d49adcb6fd7cc413d08aac2c9fbc69f00165a56ebe33b135",
+    "sql": "INSERT INTO firewall_defaults (scope, default_deny, stack_name, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, NULL)\n\t\t ON CONFLICT(scope) DO UPDATE SET default_deny = excluded.default_deny,\n\t\t   stack_name = excluded.stack_name, updated_at = excluded.updated_at, deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:4368a4ae90798a0f6862bb7f6e10210a2007a7e04ea8f22984fa2dc581e01726",
+    "sql": "UPDATE vms SET name = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:45b7bdf2716cdcfd084ab8908484f3a1c5695e98e232081314bec4398e0a9034",
+    "sql": "UPDATE runtime_action_proofs\n\t\t    SET status = 'completed', executor_host = ?, completed_at = ?, updated_at = ?\n\t\t  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')"
+  },
+  {
+    "fingerprint": "stmtshape/v1:482824bae18f2a970d2b5b4fa7812ace89893beb353ce9e62360d63653bba837",
+    "sql": "INSERT INTO vm_restarts (vm_name, attempt_count, window_start, last_restart, updated_at)\n\t\t VALUES (?, 0, ?, NULL, ?)\n\t\t ON CONFLICT(vm_name) DO UPDATE SET\n\t\t   attempt_count = 0,\n\t\t   window_start = excluded.window_start,\n\t\t   last_restart = NULL,\n\t\t   updated_at = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:482e6b552840c3a57374d1e34a2f49f2ca4385207b52ac4eccd70d77715db0fa",
+    "sql": "UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?\n\t\t        WHERE name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:48cba90e9dc15b12bb8bcba4ce2f41c0aa4ca13e4b0a057ac20e3fdde27964b8",
+    "sql": "INSERT INTO host_firewall_rules\n\t\t   (id, host_name, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:48ddedd2a2cb0d4260ecd95f79db9f223fcb37e335bce291bdb9fae20188f3d5",
+    "sql": "UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND disk_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:49a23848e21211f4ac968f6e400dc361f61cdaa629076ae104b8848ab3cbb06b",
+    "sql": "INSERT INTO cluster_firewall_rules\n\t\t   (id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:4a40c4e438100d43268eb07a9864fef74558c80c8964a92e0f9f326e64a6007c",
+    "sql": "UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?,\n\t\t\t\tcpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:4e4118f416b5964a3fa466001e28610a3ca13b66c72a5ec878893a854346c271",
+    "sql": "INSERT OR IGNORE INTO project_authority_epochs\n\t\t      (project, authority_epoch, holder, transfer_kind, fence_proof_ref, created_at, updated_at, deleted_at)\n\t\t      VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:4fca031b1dda8ca91ae0d43899168e02adc68fd13d2828916d12387fa0875620",
+    "sql": "UPDATE registry_credentials SET deleted_at = ?, updated_at = ?\n\t\t WHERE scope = ? AND owner = ? AND registry = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5031c0a7129a02cf99acd9b2a28776e85b4ed93c590c366eb596163e0e6ca677",
+    "sql": "UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE vm_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:512750962f5a32bb61c636dd5779a5c12962490de1c08d9e0d7099da638c5ff8",
+    "sql": "INSERT INTO lb_backends (lb_name, name, address, enabled, updated_at, deleted_at)\n\t\t\t VALUES (?, ?, '', 0, ?, ?)\n\t\t\t ON CONFLICT(lb_name, name) DO UPDATE SET\n\t\t\t   deleted_at = excluded.deleted_at,\n\t\t\t   updated_at = excluded.updated_at,\n\t\t\t   enabled = 0"
+  },
+  {
+    "fingerprint": "stmtshape/v1:569c6b9c41b03935e58b7e4b56ee6add0e5867c7814a34acc0eb8e4e4004f520",
+    "sql": "DELETE FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:56e186f3acb11c27b52cc8a4e89f16c2514ac3f360176974b36e9534708e3401",
+    "sql": "UPDATE resource_mappings SET deleted_at = ?, updated_at = ? WHERE name = ? AND host_name = ? AND address = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:573923592662137edff68fa3c4292a9031ec7377affae19a26d1a5dfce993720",
+    "sql": "UPDATE stacks SET state = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:57d1d1583796b3199702f177df113096a7c83bda927020f2417cd0922011dd28",
+    "sql": "INSERT INTO vm_restarts (vm_name, attempt_count, window_start, last_restart, updated_at)\n\t\t VALUES (?, 1, ?, ?, ?)\n\t\t ON CONFLICT(vm_name) DO UPDATE SET\n\t\t   attempt_count = vm_restarts.attempt_count + 1,\n\t\t   last_restart = excluded.last_restart,\n\t\t   updated_at = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5819e3ea304cf8e4e460f1b9f4631f32f65a3f0087dd700694b10e6b45899342",
+    "sql": "INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,\n\t\t\t\tcpu_actual, mem_actual, project, is_template, created_at, updated_at)\n\t\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:583fbef5c74f1cbb7c5c70ccc2e9bdd84ffa3748e11750f588fb2636f861305d",
+    "sql": "UPDATE rebalance_proposals SET status='failed', detail='execution timed out', updated_at=?\n\t\t WHERE status='applying' AND updated_at \u003c ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:59918a82156e2109a5827084f3c0780cd6c55a71e100c070664d21e07b839556",
+    "sql": "INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)\n\t\t       VALUES (?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5a040b8d54ba30fa3f60a81bf41b63b68e357213472990e36361e865c6539000",
+    "sql": "UPDATE ip_allocations SET deleted_at = ?, updated_at = ?\n\t\t WHERE network = ? AND vm_name = ? AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5a27c8c976f5e6f5e9f736999085e926853594ba86a060fb2d30eaec7031a0ba",
+    "sql": "DELETE FROM vm_events WHERE host_name = ? AND result = 'error' AND ts \u003c ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5aca9342af6226b57975deb1006126ea645d5ef713b6f0ae1748405455626933",
+    "sql": "UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5c1bf43f674b9a61316e05be315c2bef0a791a9ba61113832b21fbf45beba467",
+    "sql": "UPDATE rebalance_proposals SET status='approved', updated_at=? WHERE id=? AND status='pending'"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5ca7bdf238139160c05cffbe485fd12bd8a614498565f95f613116cb6a322eb3",
+    "sql": "UPDATE containers SET is_template = ?, updated_at = ?\n\t\t WHERE host_name = ? AND name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5cf582f15c906a010716351f9084eb14130ed7fd6d17863e165ab5234a2390ad",
+    "sql": "INSERT INTO networks (name, stack_name, type, config, project, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?)\n\t\t ON CONFLICT(name) DO UPDATE SET\n\t\t   stack_name = excluded.stack_name,\n\t\t   type = excluded.type,\n\t\t   config = excluded.config,\n\t\t   project = excluded.project,\n\t\t   updated_at = excluded.updated_at,\n\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5d45fbae9b0bdd7dd75a80ce9b523d2d0b172e212cc2827faa46ea4313f3e1e0",
+    "sql": "UPDATE recovery_codes SET used_at = ?, updated_at = ?\n\t\t WHERE username = ? AND code_hash = ? AND used_at IS NULL AND deleted_at IS NULL\n\t\t   AND set_id = (SELECT active_set_id FROM recovery_code_sets\n\t\t                 WHERE username = ? AND deleted_at IS NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:5e65bab310f59a198803147148c3ce84d6d392bd574bd1cc77d442ed2714ef4a",
+    "sql": "INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)\n\t\t\t VALUES (?, ?, ?, 0, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:6134ad08dc8d1f95546c78565ff69d442901354fe0826a42862e8b8dbd033824",
+    "sql": "UPDATE backup_repos SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:613cd6526d4c6540aa7ad0a096cba9d9010a8f09e53d82acfbb5a6f0c1ab0a7d",
+    "sql": "INSERT OR IGNORE INTO vm_events\n\t\t   (id, vm_name, host_name, type, result, severity, detail, username, ts)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:63f750189cb9e6d50e3dff7b3a911e237b68d9357aa1416991d194a78a88503a",
+    "sql": "UPDATE lb_backends SET deleted_at = ?, updated_at = ?, enabled = 0 WHERE lb_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:648a72e731b073cc783b8cbe42c0e1afab8580dbd652b1c49186550e63f12829",
+    "sql": "UPDATE containers SET state = ?, state_detail = ?, updated_at = ?\n\t\t WHERE host_name = ? AND name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:678becc900f42ed974144788602bef91b9a45c068c89147ff12fc968bab8e4cf",
+    "sql": "UPDATE vm_disks SET host_name = ?, updated_at = ?\n\t\t\t      WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:68cc10751358a2f5f98a1b5b0d35b3a5eee180ad4251fa04fe89d497777ba2fa",
+    "sql": "UPDATE host_health SET deleted_at = ?, updated_at = ? WHERE observer = ? OR target = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:68dc71a70d9ad09e29c456c5cd9105ee827ee8e163cb213357e3a1b1f3c3d319",
+    "sql": "UPDATE vms SET active_operation_id = '', updated_at = ?\n\t\t       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:69f8a1c3bf2583176ef126acb6c7db47fd931ab38ec70ae6d6c2b88af2c6c4f7",
+    "sql": "UPDATE vm_interfaces SET ip = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:6c31ceefd592c1053b71b39ca621b342c21b764eac7e8c0d44e0217aded676a8",
+    "sql": "INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, 'ct', ?, ?, ?)\n\t\t ON CONFLICT(network, ip) DO UPDATE SET\n\t\t   mac = excluded.mac, vm_name = excluded.vm_name, owner_kind = excluded.owner_kind,\n\t\t   owner_host = excluded.owner_host, updated_at = excluded.updated_at, deleted_at = NULL\n\t\t WHERE ip_allocations.deleted_at IS NOT NULL\n\t\t    OR (ip_allocations.owner_kind = 'ct'\n\t\t        AND ip_allocations.vm_name = excluded.vm_name\n\t\t        AND ip_allocations.owner_host = excluded.owner_host)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:6d02e26bb280f4d8bd41d449cbf20622b54d8ef6d5e3523679ff0692cfeaf3cf",
+    "sql": "UPDATE network_vteps SET deleted_at = ?, updated_at = ? WHERE host_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:6e3b47324499442af65e1ad58c6e06609e3d27662e55233b05e5a02b3cb54937",
+    "sql": "UPDATE dns_records SET deleted_at = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:6fad2054eea0becdae5c80c70ffbeb78e122dee5ab14fc9967848d62178c8011",
+    "sql": "UPDATE ip_allocations SET network = ?, updated_at = ? WHERE network = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:703f8cae8b9eddee8592eccb9216d62c58d9df549fd7fbe4693f7164a7956aed",
+    "sql": "UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ?\n\t\t\t WHERE username = ? AND deleted_at IS NULL\n\t\t\t   AND NOT EXISTS (SELECT 1 FROM user_2fa f\n\t\t\t                   WHERE f.username = user_2fa_sets.username\n\t\t\t                     AND f.deleted_at IS NULL\n\t\t\t                     AND f.epoch = user_2fa_sets.active_epoch)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:7078dfa31836fa1fa8de4c700c1455ff672795b298374877fb8232bfb4641262",
+    "sql": "INSERT OR IGNORE INTO project_authority_epochs\n\t\t      (project, authority_epoch, holder, transfer_kind, fence_proof_ref, created_at, updated_at, deleted_at)\n\t\t      VALUES (?, 1, ?, 'initial', '', ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:70803dd51799212f5ebcc6e5faf29a092ae7a4a18c1665e47804cecd4d2eb6de",
+    "sql": "UPDATE recovery_codes SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:7131e89b32b5fd4d147444adcdc315557b253f40b6ac4ebf1a5793dc23bed292",
+    "sql": "UPDATE lb_configs SET hosts = ?, updated_at = ?\n\t\t WHERE name = ? AND deleted_at IS NULL AND (hosts IS NULL OR hosts IN ('', '[]', 'null'))"
+  },
+  {
+    "fingerprint": "stmtshape/v1:74ed6ab5c319d06be0b7f00a2c5b03e632b0c1984ef0632ad7ff4101595d27b8",
+    "sql": "INSERT OR REPLACE INTO resource_mappings (name, host_name, address, description, created_at, updated_at, deleted_at)\n\t\t VALUES (?, '', '', ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:75d49db0558c6aa672bed29ce7daba63216fb09e2ae5860504ed4340ae0e33b5",
+    "sql": "INSERT INTO leader_election (key, holder, expires_at, updated_at)\n\t\t VALUES ('failover', ?, ?, ?)\n\t\t ON CONFLICT(key) DO UPDATE\n\t\t   SET holder = excluded.holder,\n\t\t       expires_at = excluded.expires_at,\n\t\t       updated_at = excluded.updated_at\n\t\t   WHERE leader_election.expires_at \u003c ?\n\t\t      OR leader_election.holder = excluded.holder"
+  },
+  {
+    "fingerprint": "stmtshape/v1:75fb78542b5289384c905984984d845a91ef079d15e12bd8097e67c89aea7759",
+    "sql": "UPDATE rebalance_proposals\n\t\t SET status = 'rejected', detail = ?, updated_at = ?\n\t\t WHERE id = ? AND status = 'pending'"
+  },
+  {
+    "fingerprint": "stmtshape/v1:76e557acca0da1ccda9ee920c8a1cac2706cd78160f14ab6d9ae51faa30662f5",
+    "sql": "INSERT INTO vm_disks (vm_name, disk_name, host_name, path, size_bytes,\n\t\t\t\tbacking_image, storage_type, storage_volume, target_dev, backing_disk, updated_at)\n\t\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:778d50ed157926041572c3a86fa01b63b77b82f43888f19361749a069d5c3098",
+    "sql": "UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:79348955a86c59eef0a8e1e9de94522ce99ee2beee2d43c2cbcb6a7f68bd8b28",
+    "sql": "INSERT OR REPLACE INTO image_hosts (image_name, host_name, path, status, pulled_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:79f13311e114d51e7bb60c46ed1013ef60dc376de5498eb07834e8fb9842f704",
+    "sql": "UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE sg_id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:7c77ec1b74a9e7e61f52f0fa7b2f6acce2d46e68c122a33e94b37b049884cfa8",
+    "sql": "UPDATE rebalance_proposals SET status='failed', detail=?, updated_at=? WHERE id=?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:7d83b774cb13f512920e194c425c39a108dc1b294fcaaacd02ea7529c47813a9",
+    "sql": "UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:7e9efb5f4069d637cb08432c30ceae23f265e254e0772ff699a0769cbd319a69",
+    "sql": "UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?\n\t\t        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:7f693674bf25506fe828e90311ab46d6f9f51ffac451cd2fd86392e114de7be8",
+    "sql": "INSERT INTO stacks (name, compose_hash, compose_yaml, state, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?)\n\t\t ON CONFLICT(name) DO UPDATE SET\n\t\t   compose_hash = excluded.compose_hash,\n\t\t   compose_yaml = excluded.compose_yaml,\n\t\t   state        = excluded.state,\n\t\t   updated_at   = excluded.updated_at,\n\t\t   deleted_at   = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:7f88926ecbdfc0a7e006033d975736cfd36f18c840f3f8000548a23c21dc8f6a",
+    "sql": "UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, updated_at = ?\n\t\t\t WHERE name = ? AND spec_generation = ? AND active_operation_id = '' AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:7fa95d2a6fc18c5ac62e66d0aa4af8ec1b7ef0d3d7de27e34ea12ee88f25c588",
+    "sql": "UPDATE user_2fa SET last_step = ?, last_used_at = ?, updated_at = ?\n\t\t WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND secret = ?\n\t\t   AND last_step \u003c ? AND deleted_at IS NULL\n\t\t   AND epoch = (SELECT active_epoch FROM user_2fa_sets\n\t\t                WHERE username = ? AND deleted_at IS NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:80ec2c6cf76c42c88b5d29f1f33691e727585ecce1f82c57599e04d3869d905e",
+    "sql": "UPDATE host_pci_devices SET vm_name = NULL, updated_at = ?\n\t\t WHERE vm_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:82b79a5a2f8f1c370514b75337c032141355c8caccaa5f87207ab12dd51612d7",
+    "sql": "INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)\n\t\t       VALUES (?, ?, ?, '', ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:83877c887a5a2388ff79b4d8b73fb96ba042bfb5970eb278f84f652fed511b85",
+    "sql": "INSERT INTO host_pci_devices\n\t\t   (host_name, address, vendor_id, device_id, vendor_name, device_name,\n\t\t    type, iommu_group, sriov_capable, sriov_vfs_total, sriov_vfs_free,\n\t\t    driver, vm_name, numa_node, pcie_root_port, pcie_bridge, link_clique,\n\t\t    link_peers, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, NULL)\n\t\t ON CONFLICT(host_name, address) DO UPDATE SET\n\t\t    vendor_id       = excluded.vendor_id,\n\t\t    device_id       = excluded.device_id,\n\t\t    vendor_name     = excluded.vendor_name,\n\t\t    device_name     = excluded.device_name,\n\t\t    type            = excluded.type,\n\t\t    iommu_group     = excluded.iommu_group,\n\t\t    sriov_capable   = excluded.sriov_capable,\n\t\t    sriov_vfs_total = excluded.sriov_vfs_total,\n\t\t    sriov_vfs_free  = excluded.sriov_vfs_free,\n\t\t    driver          = excluded.driver,\n\t\t    numa_node       = excluded.numa_node,\n\t\t    pcie_root_port  = excluded.pcie_root_port,\n\t\t    pcie_bridge     = excluded.pcie_bridge,\n\t\t    link_clique     = excluded.link_clique,\n\t\t    link_peers      = excluded.link_peers,\n\t\t    updated_at      = excluded.updated_at,\n\t\t    deleted_at      = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:862b6abad7c87193a487118a1555057f2fd6aded859c2671f16b916d6dd4c8c2",
+    "sql": "INSERT OR REPLACE INTO host_pci_devices\n\t\t (host_name, address, vendor_id, device_id, vendor_name, device_name,\n\t\t  type, iommu_group, sriov_capable, sriov_vfs_total, sriov_vfs_free,\n\t\t  driver, vm_name, numa_node, pcie_root_port, pcie_bridge, link_clique,\n\t\t  link_peers, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:8651277361fc9432376fe5b92f8aa28387e31e234b5a002ce98975bba1944edc",
+    "sql": "UPDATE tokens SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:86855e96a40917dd832e7c37b55afe4c54b023eafa654cef33758c7a374d7719",
+    "sql": "UPDATE host_pci_devices SET vm_name = ?, updated_at = ?\n\t\t WHERE host_name = ? AND address = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:86e94ec28a36322bfa50b2585a5bc0b39b04ac06af3381504f92999acb373a84",
+    "sql": "UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:88d888adaadcdb778d2706d7b9e72292b84e4fcae48a987599e63e6a2473f156",
+    "sql": "INSERT OR IGNORE INTO audit_log\n\t\t   (id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:89e8def5b2ee7ced8e980752a6763843a452843e0d0c9b0e30863dbc6fdc3693",
+    "sql": "INSERT INTO vm_interfaces (vm_name, network_name, ordinal, mac, ip, tap_device, security_groups, updated_at)\n\t\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:8a7c99d1ab1f6efa3a1db91e603501c2b761b325881be6ef2e185616f6c2817b",
+    "sql": "INSERT INTO container_backups (ct_name, repo, total_bytes, updated_at)\n\t\t VALUES (?, ?, ?, ?)\n\t\t ON CONFLICT(ct_name, repo) DO UPDATE SET\n\t\t   total_bytes = excluded.total_bytes,\n\t\t   updated_at  = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:8d56d105095a13e75ab1ae681ea70fa23a957272a2791fae40e8def5ba0a04a9",
+    "sql": "INSERT OR REPLACE INTO container_snapshots\n\t\t   (id, ct_name, host_name, name, state, size_bytes, type, path, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:8ef67a72c3d725fd8a4498e41417c4b979c4d3494d552305cec623b9f00d9739",
+    "sql": "UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:8ef739151b3e8973a290b3d30f4a5aedab06e2f472bc9cbf7776907ef069b4de",
+    "sql": "INSERT INTO leader_election (key, holder, expires_at, updated_at)\n\t\t VALUES (?, ?, ?, ?)\n\t\t ON CONFLICT(key) DO UPDATE\n\t\t   SET holder = excluded.holder,\n\t\t       expires_at = excluded.expires_at,\n\t\t       updated_at = excluded.updated_at\n\t\t   WHERE leader_election.expires_at \u003c ?\n\t\t      OR leader_election.holder = excluded.holder"
+  },
+  {
+    "fingerprint": "stmtshape/v1:8f70204f697fbd890255ad5d7d9c0289c85c7d9557e2aea13ea728790a9e6f0d",
+    "sql": "UPDATE vm_disks SET host_name = ?, path = ?, storage_type = ?, storage_volume = ?, updated_at = ?\n\t\t WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:8fb6f967ecab68003fb91869d9c995d09aec0d673dfd168b2148c5d6150fd68e",
+    "sql": "INSERT OR REPLACE INTO storage_pools\n\t\t\t(host_name, name, driver, source, target, options, project, total_bytes, used_bytes, state, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:93f834713a1925aafb5a806deacbafd86b5a11a2dec6dcd48f0bb28567c0d1d7",
+    "sql": "UPDATE lb_configs SET deleted_at = ?, updated_at = ?, enabled = 0 WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:9536b3ac6caa1338282dc98224fb6d34b6fb3eec149ec69a7f64f496a64c45c8",
+    "sql": "DELETE FROM vm_locks WHERE vm_name = ? AND holder = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:970e485b562aa819a6a2568e81ed6169d296f442b8e8aa75b9aa554fd1ebaa48",
+    "sql": "UPDATE user_2fa SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:980b9619f6a61b17ad4128aa14200d643e3f8fa386053a7b5f51832801376de2",
+    "sql": "UPDATE container_interfaces SET ip = ?, updated_at = ?\n\t\t WHERE host_name = ? AND ct_name = ? AND ordinal = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:98d412e3e8e24c9e553144534cc269d5df28eb04ce15e55839812b74c1c2630f",
+    "sql": "UPDATE runtime_action_proofs\n\t\t    SET status = 'in_progress',\n\t\t        executor_host = ?,\n\t\t        started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,\n\t\t        updated_at = ?\n\t\t  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')\n\t\t    AND (executor_host = '' OR executor_host = ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:99d8a5689b31e282073755cc027c7e568f437234ce74a4ad36908cd16d89090a",
+    "sql": "INSERT INTO replication_checkpoints (vm_name, repo, checkpoint, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, NULL)\n\t\t ON CONFLICT(vm_name, repo) DO UPDATE SET checkpoint = excluded.checkpoint,\n\t\t   updated_at = excluded.updated_at, deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:9ad7cbba079c4a54f965ff8447987da031d19beec1df463527625f68e1bf4142",
+    "sql": "INSERT INTO roles (name, verbs, description, built_in, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?)\n\t\t ON CONFLICT(name) DO UPDATE\n\t\t   SET verbs = excluded.verbs,\n\t\t       description = excluded.description,\n\t\t       built_in = excluded.built_in,\n\t\t       updated_at = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:9baef385560bb093786ee9cef530d603116c72102d7aa59401749dc851de0c17",
+    "sql": "UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND mac = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:9c759cc571a5cd542f21d5ed2f1b078d8097695d87db2583047ad5492cf72d87",
+    "sql": "UPDATE vm_disks SET size_bytes = ?, updated_at = ?\n\t\t WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:9ee654d226c7b8a32ab1354fd9a9ece80a271b959fdcd2b6551a044dfe86a5aa",
+    "sql": "DELETE FROM vm_events WHERE id IN (\n\t\t\t   SELECT id FROM (\n\t\t\t     SELECT id, ROW_NUMBER() OVER (PARTITION BY vm_name ORDER BY ts DESC, id DESC) AS rn\n\t\t\t     FROM vm_events WHERE host_name = ?\n\t\t\t   ) WHERE rn \u003e ?\n\t\t\t )"
+  },
+  {
+    "fingerprint": "stmtshape/v1:9f685e1c30d82c0a189ea68da3611624e06636b3a2863373b405aa2a37367013",
+    "sql": "DELETE FROM vm_events WHERE host_name = ? AND result != 'error' AND ts \u003c ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:a33312845bc7c3ddb6056d1d61d168ac527353af60a02fa8cc2525287a563b8f",
+    "sql": "INSERT INTO rebalance_proposals\n\t\t\t(id, vm_name, src_host, dst_host, policy, expected_gain, status,\n\t\t\t proposed_at, expires_at, detail, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:a3697bfbeadcf8522f2c2bacdf6df2fddd884b8d2a0acf7c98e96b55e898da67",
+    "sql": "DELETE FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NOT NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:a4f1c22ef53906bc7e76c6d1b9e5034c21b2dc54750986773cdf0b386ad47227",
+    "sql": "INSERT OR REPLACE INTO vm_interfaces\n\t\t (vm_name, network_name, ordinal, mac, ip, tap_device, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:a914d3e0c3e4c7e6a437e2d60530e5e74e390fc9df7ae775f71e1bc999873c8c",
+    "sql": "UPDATE lb_backends SET deleted_at = ?, updated_at = ?, enabled = 0 WHERE lb_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:a9f5ab3fbb9bd006f106d0d7ee56029263ccb79444323054d6c94de5bf6f273a",
+    "sql": "INSERT OR REPLACE INTO containers\n\t\t (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:aa23731d0862f4deff54abeeecb26f206ca7f03a307b5354e49760e81811cede",
+    "sql": "UPDATE images SET deleted_at = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:aa49a07f56a9969f49d13d32d2bb8d374a37fb603675e1939590ad77b1df12dd",
+    "sql": "INSERT INTO backup_schedules\n\t\t   (vm_name, pool_name, project_name, scope, repo, cron, keep_last, keep_daily, keep_weekly, keep_monthly, keep_yearly, enabled, type, target_pool, target_host, keep_replicas, incremental, auto_promote, last_checkpoint, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)\n\t\t ON CONFLICT(vm_name, repo) DO UPDATE SET\n\t\t   pool_name = excluded.pool_name,\n\t\t   project_name = excluded.project_name,\n\t\t   scope = excluded.scope,\n\t\t   cron = excluded.cron,\n\t\t   keep_last = excluded.keep_last,\n\t\t   keep_daily = excluded.keep_daily,\n\t\t   keep_weekly = excluded.keep_weekly,\n\t\t   keep_monthly = excluded.keep_monthly,\n\t\t   keep_yearly = excluded.keep_yearly,\n\t\t   enabled = excluded.enabled,\n\t\t   type = excluded.type,\n\t\t   target_pool = excluded.target_pool,\n\t\t   target_host = excluded.target_host,\n\t\t   keep_replicas = excluded.keep_replicas,\n\t\t   incremental = excluded.incremental,\n\t\t   auto_promote = excluded.auto_promote,\n\t\t   updated_at = excluded.updated_at,\n\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:aa7166c1956dd004078a7825e6789d85a0158c077d81f521fd0dbfe4ff715091",
+    "sql": "UPDATE vm_disks SET storage_type = ?, storage_volume = ?, updated_at = ?\n\t\t WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:aaa198564d4faae4439415dd32b9fad8c068d9753af08f2fbc55c6c965327f41",
+    "sql": "UPDATE host_pci_devices SET deleted_at = ?, updated_at = ?\n\t\t WHERE host_name = ? AND address = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ab79a002b9b0f8f996b05d79046508bb3639fbb4381192fc3a04c9c9ea76dfbe",
+    "sql": "UPDATE containers SET deleted_at = ?, updated_at = ?\n\t\t WHERE host_name = ? AND name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ac9fdaacda2307a8c8f7ae8a31c7e1b864fcd93b8d0c170fb4cd23961327738e",
+    "sql": "INSERT INTO vm_locks (vm_name, holder, expires_at, updated_at)\n\t\t VALUES (?, ?, ?, ?)\n\t\t ON CONFLICT(vm_name) DO UPDATE\n\t\t   SET holder = excluded.holder,\n\t\t       expires_at = excluded.expires_at,\n\t\t       updated_at = excluded.updated_at\n\t\t   WHERE vm_locks.expires_at \u003c ?\n\t\t      OR vm_locks.holder = excluded.holder"
+  },
+  {
+    "fingerprint": "stmtshape/v1:b25771ace1982c07eed4d0ac6f01b876a32b794134c03087448fda50190460a2",
+    "sql": "UPDATE backup_schedules\n\t\t SET last_run_at = ?, last_run_err = ?, updated_at = ?\n\t\t WHERE vm_name = ? AND repo = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:b522b1255bedc2b2fc98fede028af7bbef5e81f61a3071e01f717b55402e5ef1",
+    "sql": "UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:b53f7535a68ca1628438db47f84d8de0337ddbe75e0721ce8552fc466ec636ea",
+    "sql": "INSERT OR IGNORE INTO runtime_action_proofs\n\t(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,\n\t quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token,\n\t status, step_state, result_code, result_detail, started_at, completed_at, executor_host,\n\t created_at, updated_at)\n\tVALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:b53f9759db79bec18e0ca884759efd69ab20a00c2a845520329627fa0fc1285b",
+    "sql": "UPDATE notification_routes SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:b5e97c0223fae3133c2e61dbb466ba88c7c376e7d27befe108b900b51eb9f752",
+    "sql": "UPDATE networks SET name = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:b5fcb0254d2d3da9d8da44561218edd158639431f5e3ad30ef2797179f1421af",
+    "sql": "INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)\n\t\t\t VALUES (?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:b96fab10a95336d7296035a97a11334254d81b9756b78ec39a7813346b63b604",
+    "sql": "INSERT INTO backup_repos (name, path, stack_name, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, NULL)\n\t\t ON CONFLICT(name) DO UPDATE SET path = excluded.path,\n\t\t   stack_name = excluded.stack_name, updated_at = excluded.updated_at, deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:b9c0c1f4fa0c38d5264e2865bebfa5c4d836e1f08c7dc22cc28d9c4045457dcb",
+    "sql": "UPDATE security_groups SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:bc591417f0498cd3d01fad106d9db2261a9745aa2650a34dbcf53a5512645d49",
+    "sql": "UPDATE vm_disks SET path = ?, updated_at = ?\n\t\t WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:bc5ccc1dbfb05583e2356c5596e025ad1e04a8ac1c789334b4c60d1a2cb2bc2e",
+    "sql": "UPDATE roles SET deleted_at = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:bd490dc7b2d608f2832df4b3b1d345ae7ec73e92cdf0a38c8d79fc781a5bdbd9",
+    "sql": "UPDATE image_hosts SET deleted_at = ?, updated_at = ? WHERE image_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:be26f1aed275c97fe9239fe5ffb5a4cd09a1b1f857f92a83841df3eba6f71a25",
+    "sql": "UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c073189fd016b0310c596a1e92ccdc550bdca99622d6bc5d0faa4f9554e2e239",
+    "sql": "UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c3916144cb9801243d78d880000ab35447eebf246307777193a0e25102e5d499",
+    "sql": "UPDATE ip_allocations SET owner_host = ?, allocated_at = ?, updated_at = ?\n\t\t WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c60948ade7a3c94cd3b9a2fe4cc3290f8c18416b7547c5b0e26177521a798b05",
+    "sql": "DELETE FROM vm_restarts WHERE vm_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c62e7940e46d61b47bdc620144b7729eb2bc96cc315bf70a040eac6f93256b6e",
+    "sql": "UPDATE ip_allocations SET deleted_at = ?, updated_at = ?\n\t\t WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c74d54cf67f5acc70b8edaec7bf9380905cc9aaa16862f3871e212de6052f4e1",
+    "sql": "UPDATE container_snapshots SET deleted_at = ?, updated_at = ?\n\t\t WHERE host_name = ? AND ct_name = ? AND name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c78f7a0aaa0eea95bec8a369c888820fb6872b09af922e90ff6a2debfd902e89",
+    "sql": "UPDATE host_pci_devices SET vm_name = '', updated_at = ?\n\t\t WHERE host_name = ? AND address = ? AND vm_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c82328a1d8ebaa04500e900eaff4ae7f178ccf87555194746b0a1906b437deb5",
+    "sql": "UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c84742b3492af14d145fcf25c51127e6f684322b89672ad0e939d16ba120926d",
+    "sql": "INSERT INTO lb_configs (name, stack_name, vip, algorithm, hosts, ports, enabled, updated_at, generation)\n\t\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)\n\t\t\t ON CONFLICT(name) DO UPDATE SET\n\t\t\t   stack_name = excluded.stack_name,\n\t\t\t   vip = excluded.vip,\n\t\t\t   algorithm = excluded.algorithm,\n\t\t\t   hosts = excluded.hosts,\n\t\t\t   ports = excluded.ports,\n\t\t\t   enabled = excluded.enabled,\n\t\t\t   updated_at = excluded.updated_at,\n\t\t\t   generation = COALESCE(NULLIF(excluded.generation, ''), lb_configs.generation),\n\t\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:c96c86d6a532b930bfb73086443ffd958e26e809d69f93bfd51322f37e161a7c",
+    "sql": "UPDATE operations SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ca098db3ad1406b3e5647bf4ab52b6bc84305ddea7444f00d4823328f787547a",
+    "sql": "INSERT INTO container_restarts (host_name, name, attempt_count, window_start, last_restart, updated_at)\n\t\t VALUES (?, ?, 0, ?, NULL, ?)\n\t\t ON CONFLICT(host_name, name) DO UPDATE SET\n\t\t   attempt_count = 0,\n\t\t   window_start = excluded.window_start,\n\t\t   last_restart = NULL,\n\t\t   updated_at = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:cc902802ef38707f49b637f83a8c7003dcfbab1b842d65f962d2623cc9508f54",
+    "sql": "INSERT OR REPLACE INTO vm_disks\n\t\t (vm_name, disk_name, host_name, path, size_bytes, backing_image,\n\t\t  storage_type, storage_volume, target_dev, backing_disk, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ccea1d4d780805eea130f2a70f3b138e73bb78f2729917b97813740285a57527",
+    "sql": "UPDATE cluster_firewall_rules SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:cda1c0bbbc6a48a909864bc66c5ef94dc3e277afea836cec5358de21b25ba14f",
+    "sql": "INSERT OR REPLACE INTO container_interfaces\n\t\t (host_name, ct_name, network_name, ordinal, mac, ip, veth_device, security_groups, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:cffd3089156f91980dccb40f0cfd27842bbce91617732f62dc167caff9c6b91d",
+    "sql": "UPDATE network_vteps SET network_name = ?, updated_at = ? WHERE network_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:d186b89748e961005a8d823f643b505b76331eff6f5cdec31f5f0fd5e19be764",
+    "sql": "UPDATE rebalance_proposals SET status='applying', updated_at=?\n\t\t WHERE id=? AND status='approved'"
+  },
+  {
+    "fingerprint": "stmtshape/v1:d1d2d7b3d5b255e2879843d2dc4fade3a77898642bb4633c78ffb0340d34ef76",
+    "sql": "UPDATE vm_disks SET vm_name = ?, updated_at = ? WHERE vm_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:d2147b4cb5d7dd9ac7eaf1a45ce7321f8daf930676d0e96eb90e198ca4593993",
+    "sql": "INSERT INTO recovery_codes (username, code_hash, created_at, set_id, updated_at)\n\t\t\t VALUES (?, ?, ?, ?, ?)\n\t\t\t ON CONFLICT(username, code_hash) DO UPDATE SET\n\t\t\t   set_id = excluded.set_id, used_at = NULL,\n\t\t\t   deleted_at = NULL, updated_at = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:d69ed31050f84ae78fda85c8aad700fe4fe6347612c04dd0e7ad25dabab666ba",
+    "sql": "INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:d7a68f836005fc703d51f64926b6959b5acbdac8593c650a1d29c32821adde54",
+    "sql": "UPDATE user_2fa SET last_used_at = ?, updated_at = ?\n\t\t WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND deleted_at IS NULL\n\t\t   AND epoch = (SELECT active_epoch FROM user_2fa_sets\n\t\t                WHERE username = ? AND deleted_at IS NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:d90063362bf0f3751a2bc78e7512d8e9bf649965e70128ed9d66bb9f6df7a8a5",
+    "sql": "INSERT OR REPLACE INTO snapshots (id, vm_name, host_name, name, state, size_bytes, type, vmstate_path, vmstate_size_bytes, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:dc34b65fa236d197cd3c2d978a6d820484736566d49f90872c8f34afac6a82ee",
+    "sql": "DELETE FROM vms WHERE name = ? AND deleted_at IS NOT NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:dcee10e614c65363718bbb6a3a44d8c30e557ebf002b5e11ca4faed14004c7dc",
+    "sql": "UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, active_operation_id = ?, updated_at = ?\n\t\t       WHERE name = ? AND active_operation_id = '' AND vm_owner_epoch = ? AND spec_generation = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:dcf2d30622a03e1cf4d356251132ab6350c071bb2959595d0547a8efdd63042d",
+    "sql": "UPDATE notification_targets SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:dd95eeb5411e0b0c01f30b0d9d9f3a2ffd69ef7026f31334b7f7cce141e54819",
+    "sql": "INSERT OR REPLACE INTO notification_targets (id, name, type, config, enabled, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ddc56888a6d6c6e9f6f399c63f3b37e1267c713c0993222b27849736a6e7aa23",
+    "sql": "UPDATE containers SET deleted_at = ?, updated_at = ?\n\t\t WHERE host_name = ? AND name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ddfce3e7b705b4a8cce65091a3142f8a122217391ee3ac9ea21a5475ecf7ab5e",
+    "sql": "UPDATE vms SET state = 'error', state_detail = ?, pending_action_id = '', updated_at = ?\n\t\t\t       WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:df2389853b098216252e9c51217976fc66020317e90a8df6af74daa766b833b7",
+    "sql": "INSERT INTO projects (name, display, parent_name, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e136d75a246ba07dfcab402651e78b512a3a55934645deaf25729aea88a87c67",
+    "sql": "UPDATE container_interfaces SET deleted_at = ?, updated_at = ? WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e241e7a371d2f59242efbf1120a6b89b50b456c7861f00f07a26038476bbfe4e",
+    "sql": "INSERT OR REPLACE INTO clock_skew (observer, target, skew_seconds, updated_at)\n\t\t\t VALUES (?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e35719bf1c8765e2324a418c8d469bd7904baba6efa6d0c9699c387daf65c5d9",
+    "sql": "UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e427448008d8887e196aee4646ad44c89c36c4e3693218012f2a95f119c157b4",
+    "sql": "UPDATE image_hosts SET status = ?, updated_at = ? WHERE image_name = ? AND host_name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e46e9f18db8ba2cdcf247ffcaa7afd39aa65142e53d904c6f7d345703198ddd9",
+    "sql": "INSERT INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e59177a32d73a1838283574a819b1039d3a6cfa4589a5b4994cbd933487d00e4",
+    "sql": "INSERT INTO recovery_code_sets (username, active_set_id, updated_at)\n\t\t\t VALUES (?, ?, ?)\n\t\t\t ON CONFLICT(username) DO UPDATE SET\n\t\t\t   active_set_id = excluded.active_set_id,\n\t\t\t   updated_at = excluded.updated_at,\n\t\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e602f7b1f3e61923aeb2f861149e92e4613a6733a2f31863e179547772dec55e",
+    "sql": "UPDATE rebalance_proposals SET status='applied', applied_at=?, updated_at=?\n\t\t WHERE id=? AND status='applying'"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e604ad221360f11ea0365f523a7b1fd3c3ab1aad24f148d5cdcb66db305ed725",
+    "sql": "UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e6b9a87d1945e8c7b6c980110407d6d9a707c6dd031e9c57605d1393c561f2e9",
+    "sql": "INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e71c830bd3cc0a080a7e90c17929cb6b902d7d7c20a2062807610286486804a6",
+    "sql": "UPDATE runtime_action_proofs\n\t\t    SET step_state = TRIM(COALESCE(step_state,'') || ' ' || ?), updated_at = ?\n\t\t  WHERE id = ? AND deleted_at IS NULL\n\t\t    AND status NOT IN ('completed','failed')\n\t\t    AND instr(' ' || COALESCE(step_state,'') || ' ', ' ' || ? || ' ') = 0"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e7aa6470f440e7bd96c8bddb71e61bad2c33f0dc9002770ab059e915376fa721",
+    "sql": "INSERT INTO network_vteps (network_name, host_name, vtep_ip, vni, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?)\n\t\t ON CONFLICT(network_name, host_name) DO UPDATE SET\n\t\t   vtep_ip = excluded.vtep_ip,\n\t\t   vni = excluded.vni,\n\t\t   updated_at = excluded.updated_at,\n\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:e8f29316a0d67627d98445491447b591b40666fef0eb698c8f2712889bfbbb8b",
+    "sql": "UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ebb51650c48edd75019206cfeda880e158c17c4cebcc57a852186dc4d96b8563",
+    "sql": "UPDATE ip_sets SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:edc62b1bd524ed46e12795a486aa99cfba5afe295bc08879da6059aec998c2df",
+    "sql": "UPDATE users SET role = ?, password_hash = ?, deleted_at = NULL, updated_at = ? WHERE username = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:edd747877708cc2e01f96e1d4922ed6fa5861f6163bc9fbeb72771ac928cb0d5",
+    "sql": "INSERT INTO project_quotas\n\t\t   (project_name, vcpu_limit, mem_mib_limit, disk_gib_limit,\n\t\t    nic_limit, public_ip_limit, backup_gib_limit, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n\t\t ON CONFLICT(project_name) DO UPDATE SET\n\t\t   vcpu_limit       = excluded.vcpu_limit,\n\t\t   mem_mib_limit    = excluded.mem_mib_limit,\n\t\t   disk_gib_limit   = excluded.disk_gib_limit,\n\t\t   nic_limit        = excluded.nic_limit,\n\t\t   public_ip_limit  = excluded.public_ip_limit,\n\t\t   backup_gib_limit = excluded.backup_gib_limit,\n\t\t   updated_at       = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:edfd936011d71fd21d26e702573bc9e27c1ad0c930db498ea849dea28b76697e",
+    "sql": "UPDATE vm_interfaces SET security_groups = ?, updated_at = ?\n\t\t WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ee49496464b831b13c3d8266e74eea1b461576fa819fa1783a72cfad8e378592",
+    "sql": "INSERT OR REPLACE INTO resource_mappings (name, host_name, address, vendor, device, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:f16db0ec6f902f5628abc3bc0b0e94f34d5a1f1d799684a738dc4cdfca9e7245",
+    "sql": "INSERT INTO service_endpoints (service_name, ip, region, weight, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, NULL)\n\t\t ON CONFLICT(service_name, ip) DO UPDATE SET\n\t\t   region     = excluded.region,\n\t\t   weight     = excluded.weight,\n\t\t   updated_at = excluded.updated_at,\n\t\t   deleted_at = NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:f39fb6219d94eea389e1cbf32c927e1b12e4acec305af1da69a5b6b73f32a734",
+    "sql": "UPDATE rebalance_proposals\n\t\t SET status = 'expired', updated_at = ?\n\t\t WHERE status = 'pending' AND expires_at \u003c ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:f482c12b18914bc31475e16189556102cf8f917591a47865d05691cb1825d0ec",
+    "sql": "INSERT INTO security_groups (id, name, stack_name, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:f5be240b1407a45df8c4f887b5925be666bfe73d86b68ebf6ff9e28d392e365d",
+    "sql": "INSERT INTO container_restarts (host_name, name, attempt_count, window_start, last_restart, updated_at)\n\t\t VALUES (?, ?, 1, ?, ?, ?)\n\t\t ON CONFLICT(host_name, name) DO UPDATE SET\n\t\t   attempt_count = container_restarts.attempt_count + 1,\n\t\t   last_restart = excluded.last_restart,\n\t\t   updated_at = excluded.updated_at"
+  },
+  {
+    "fingerprint": "stmtshape/v1:f5cb9ecd1da9dddf3c713e29690f6251db89a5a784ab00a5c198b139e331e334",
+    "sql": "UPDATE stacks SET deleted_at = ?, updated_at = ?, state = 'deleted' WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:f5f794237674eeec804236e4bd5b1e219772035060adbe847061478687a219a2",
+    "sql": "UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:f694a04aaccee189fca583eee9001599d26b82dacd7237a8202e71eba3f9730f",
+    "sql": "UPDATE networks SET deleted_at = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:f891f1f5636d76dfdf7fe2f1186926fe65969f41d97dd360e2f0e8ad1027c4ae",
+    "sql": "INSERT INTO operations (id, method, principal, project, resource_kind, resource_id,\n\toperation_kind, request_hash, idempotency_key, reservation_json, desired_ref,\n\tvm_owner_epoch, created_at, updated_at, deleted_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:fa77580748647ee37f68bb5dfd69258522fdcbb73c40164511720e83acfd75d4",
+    "sql": "INSERT INTO dns_records (name, type, value, source, updated_at)\n\t\t VALUES (?, 'A', ?, 'auto', ?)\n\t\t ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, deleted_at=NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:fa9b9a9ff858c7dfcbc5bbe1d1b9daa8e26e62ec0a6273dbf691efd0e62afd2e",
+    "sql": "INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  },
+  {
+    "fingerprint": "stmtshape/v1:fc1c095519d19c6371d029033d2e822749fe444b813f72a9004f38b564c7420d",
+    "sql": "UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:fc646a1149e1bee8e983193166d54f615dd30955b6f984d4f3c6a1ece6cf1838",
+    "sql": "UPDATE runtime_action_proofs SET status = 'completed', executor_host = ?, completed_at = ?, updated_at = ?\n\t\t        WHERE id = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:fd4911126d5afb053db7bd57de904377b795b535fcc0aae7b8d1ce4e37789173",
+    "sql": "UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:fdb2197c9e1e92d051368098bc74fb0fcd72334caefaf962e49e6515a14f3c7f",
+    "sql": "UPDATE vms SET name = ?, spec = ?, updated_at = ? WHERE name = ?"
+  },
+  {
+    "fingerprint": "stmtshape/v1:fdd8a5d74a576fe075d87baf681d92b091195326464df7fcd1c4d6c660db59fe",
+    "sql": "UPDATE host_pci_devices SET vm_name = ?, updated_at = ?\n\t\t WHERE host_name = ? AND address = ? AND deleted_at IS NULL\n\t\t   AND (vm_name IS NULL OR vm_name = '')"
+  },
+  {
+    "fingerprint": "stmtshape/v1:feafde303d4c0cbe17e238b68c5c8b44c4d3f4529aeb9e5d832d4dbb6f8ae6ec",
+    "sql": "UPDATE vms SET is_template = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL"
+  },
+  {
+    "fingerprint": "stmtshape/v1:ff736f87916aa42100f2d0530ba9b6956df52733645bba98b30e84ffce8d75fa",
+    "sql": "UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?, updated_at = ? WHERE name = ?"
+  }
+]

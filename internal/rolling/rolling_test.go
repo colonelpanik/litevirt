@@ -4,31 +4,74 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// mockOps records calls for assertion in tests.
+// mockOps records calls for assertion and can inject per-VM failures.
 type mockOps struct {
-	mu           sync.Mutex
-	recreated    []string
-	stopped      []string
-	started      []string
-	created      []string // -next VMs created via CreateNextVM
-	failOn       string   // VM name that should fail RecreateVM
-	healthFailOn string   // VM name that should fail WaitHealthy
-	createFailOn string   // VM name that should fail CreateNextVM
+	mu        sync.Mutex
+	recreated []string
+	stopped   []string
+	started   []string
+	created   []string // -next VMs via CreateNextVM
+	deleted   []string
+	resized   []string
+	metadata  map[string][]string
+
+	failRecreateOn   string
+	failResizeOn     string
+	failHealthOn     string
+	failCreateNextOn string
+	onRecreate       func()
 }
 
-func (m *mockOps) RecreateVM(_ context.Context, name string, _ *compose.File) error {
-	if m.failOn == name {
-		return fmt.Errorf("simulated failure for %s", name)
+func (m *mockOps) RecreateVM(_ context.Context, name string, _ *pb.VMSpec) error {
+	if m.onRecreate != nil {
+		m.onRecreate()
+	}
+	if m.failRecreateOn == name {
+		return fmt.Errorf("simulated recreate failure for %s", name)
 	}
 	m.mu.Lock()
 	m.recreated = append(m.recreated, name)
+	m.mu.Unlock()
+	return nil
+}
+func (m *mockOps) ResizeVMLive(_ context.Context, name string, _ *pb.VMSpec) error {
+	if m.failResizeOn == name {
+		return fmt.Errorf("simulated resize failure for %s", name)
+	}
+	m.mu.Lock()
+	m.resized = append(m.resized, name)
+	m.mu.Unlock()
+	return nil
+}
+func (m *mockOps) ApplyLiveMetadata(_ context.Context, name string, _ *pb.VMSpec, fields []string) error {
+	m.mu.Lock()
+	if m.metadata == nil {
+		m.metadata = map[string][]string{}
+	}
+	m.metadata[name] = fields
+	m.mu.Unlock()
+	return nil
+}
+func (m *mockOps) CreateNextVM(_ context.Context, name string, _ *pb.VMSpec) error {
+	if m.failCreateNextOn == name {
+		return fmt.Errorf("simulated create-next failure for %s", name)
+	}
+	m.mu.Lock()
+	m.created = append(m.created, name+"-next")
+	m.mu.Unlock()
+	return nil
+}
+func (m *mockOps) DeleteVM(_ context.Context, name string) error {
+	m.mu.Lock()
+	m.deleted = append(m.deleted, name)
 	m.mu.Unlock()
 	return nil
 }
@@ -44,330 +87,390 @@ func (m *mockOps) StartVM(_ context.Context, name string) error {
 	m.mu.Unlock()
 	return nil
 }
-func (m *mockOps) HotModifyVM(_ context.Context, _ string, _ int, _ int) error { return nil }
-func (m *mockOps) CreateNextVM(_ context.Context, name string, _ *compose.File) error {
-	nextName := name + "-next"
-	if m.createFailOn == name {
-		return fmt.Errorf("simulated failure for %s", nextName)
-	}
-	m.mu.Lock()
-	m.created = append(m.created, nextName)
-	m.mu.Unlock()
-	return nil
-}
 func (m *mockOps) WaitHealthy(_ context.Context, name string, _ time.Duration) error {
-	if m.healthFailOn == name {
+	if m.failHealthOn == name {
 		return fmt.Errorf("health check failed for %s", name)
 	}
 	return nil
 }
 
-func newTestDB(t *testing.T) *corrosion.Client {
-	t.Helper()
-	c, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
-	if err := corrosion.InitSchema(context.Background(), c); err != nil {
-		t.Fatalf("InitSchema: %v", err)
-	}
-	return c
-}
+var _ Ops = (*mockOps)(nil)
 
-func insertTestVMs(t *testing.T, db *corrosion.Client, ctx context.Context, stack string, names ...string) {
-	t.Helper()
-	for _, name := range names {
-		if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
-			Name:      name,
-			StackName: stack,
-			HostName:  "h1",
-			Spec:      "{}",
-			State:     "running",
-		}, nil, nil); err != nil {
-			t.Fatalf("InsertVM %s: %v", name, err)
-		}
+// act builds a VMAction with the given strategy + plan.
+func act(name, strategy string, plan compose.ChangePlan) VMAction {
+	return VMAction{
+		Name:     name,
+		Strategy: compose.UpdateDef{Strategy: strategy},
+		Plan:     plan,
+		Desired:  &pb.VMSpec{Name: name},
 	}
 }
 
-func parseTestFile(strategy string) *compose.File {
-	yaml := fmt.Sprintf(`
-name: teststack
-vms:
-  web:
-    image: ubuntu
-    cpu: 1
-    memory: 512
-    update:
-      strategy: %s
-`, strategy)
-	f, _ := compose.ParseBytes([]byte(yaml))
-	return f
+func recreatePlan() compose.ChangePlan {
+	return compose.ChangePlan{RecreateReasons: []string{"image change recreates"}}
+}
+func restartPlan() compose.ChangePlan {
+	return compose.ChangePlan{RestartReasons: []string{"max_cpu needs a redefine"}}
+}
+func livePlan() compose.ChangePlan {
+	return compose.ChangePlan{ResourceChanges: []compose.Delta{{Field: "cpu", Old: "2", New: "4"}}}
+}
+func metaPlan() compose.ChangePlan {
+	return compose.ChangePlan{MetadataChanges: []compose.Delta{{Field: "labels"}}}
 }
 
-func collectProgress(ch <-chan Progress) []Progress {
+func collect() (func(Progress), *[]Progress) {
 	var out []Progress
-	for p := range ch {
+	var mu sync.Mutex
+	return func(p Progress) {
+		mu.Lock()
 		out = append(out, p)
-	}
-	return out
+		mu.Unlock()
+	}, &out
 }
 
-func TestUpdate_Recreate(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
-	ops := &mockOps{}
-
-	insertTestVMs(t, db, ctx, "teststack", "teststack-web-1")
-
-	f := parseTestFile("recreate")
-	ch := Update(ctx, db, ops, "teststack", f, "")
-	progress := collectProgress(ch)
-
-	if len(ops.recreated) != 1 || ops.recreated[0] != "teststack-web-1" {
-		t.Errorf("expected web-1 recreated, got: %v", ops.recreated)
-	}
-	// Should have a done progress entry.
-	found := false
-	for _, p := range progress {
-		if p.Phase == "done" {
-			found = true
+func hasPhase(ps []Progress, phase string) bool {
+	for _, p := range ps {
+		if p.Phase == phase {
+			return true
 		}
 	}
-	if !found {
-		t.Errorf("expected 'done' progress, got: %+v", progress)
+	return false
+}
+
+// ── in-place: LIVE-OR-FAIL ──
+
+func TestInPlace_LiveResize_NoRecreate(t *testing.T) {
+	ops := &mockOps{}
+	fn, _ := collect()
+	if err := Run(context.Background(), ops, "s", []VMAction{act("web", "in-place", livePlan())}, fn); err != nil {
+		t.Fatalf("live in-place: %v", err)
+	}
+	if len(ops.resized) != 1 || ops.resized[0] != "web" {
+		t.Errorf("expected web resized live, got %v", ops.resized)
+	}
+	if len(ops.recreated) != 0 || len(ops.deleted) != 0 {
+		t.Errorf("in-place live must not recreate/delete: recreated=%v deleted=%v", ops.recreated, ops.deleted)
 	}
 }
 
-func TestUpdate_AllAtOnce(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
+func TestInPlace_LiveMetadata_Applied(t *testing.T) {
 	ops := &mockOps{}
+	fn, _ := collect()
+	if err := Run(context.Background(), ops, "s", []VMAction{act("web", "in-place", metaPlan())}, fn); err != nil {
+		t.Fatalf("live metadata: %v", err)
+	}
+	if got := ops.metadata["web"]; len(got) != 1 || got[0] != "labels" {
+		t.Errorf("expected labels metadata applied, got %v", got)
+	}
+	if len(ops.recreated) != 0 || len(ops.resized) != 0 {
+		t.Errorf("metadata-only update should not resize/recreate")
+	}
+}
 
-	insertTestVMs(t, db, ctx, "mystack", "mystack-web-1", "mystack-web-2", "mystack-db-1")
+func TestInPlace_Restart_FailsWithoutDeleting(t *testing.T) {
+	ops := &mockOps{}
+	fn, ps := collect()
+	err := Run(context.Background(), ops, "s", []VMAction{act("web", "in-place", restartPlan())}, fn)
+	if err == nil {
+		t.Fatal("in-place of a restart-class change must fail")
+	}
+	if len(ops.recreated) != 0 || len(ops.deleted) != 0 || len(ops.resized) != 0 {
+		t.Errorf("in-place restart-class must not mutate: recreated=%v deleted=%v resized=%v", ops.recreated, ops.deleted, ops.resized)
+	}
+	if !hasPhase(*ps, "error") {
+		t.Error("expected an error progress entry")
+	}
+}
 
-	f := parseTestFile("all-at-once")
-	f.Name = "mystack"
-	ch := Update(ctx, db, ops, "mystack", f, "")
-	collectProgress(ch)
+func TestInPlace_Recreate_FailsNeverDeletes(t *testing.T) {
+	ops := &mockOps{}
+	fn, _ := collect()
+	err := Run(context.Background(), ops, "s", []VMAction{act("web", "in-place", recreatePlan())}, fn)
+	if err == nil {
+		t.Fatal("in-place of a recreate-class change must fail")
+	}
+	if len(ops.deleted) != 0 || len(ops.recreated) != 0 {
+		t.Errorf("in-place must NEVER delete/recreate: deleted=%v recreated=%v", ops.deleted, ops.recreated)
+	}
+}
 
+func TestInPlace_ResizeError_Propagates(t *testing.T) {
+	ops := &mockOps{failResizeOn: "web"}
+	fn, _ := collect()
+	if err := Run(context.Background(), ops, "s", []VMAction{act("web", "in-place", livePlan())}, fn); err == nil {
+		t.Fatal("a live resize error must propagate from Run")
+	}
+}
+
+// ── recreate-class strategies ──
+
+func TestRecreate_Strategy(t *testing.T) {
+	ops := &mockOps{}
+	fn, ps := collect()
+	if err := Run(context.Background(), ops, "s", []VMAction{act("web", "recreate", recreatePlan())}, fn); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	if len(ops.recreated) != 1 || ops.recreated[0] != "web" {
+		t.Errorf("expected web recreated, got %v", ops.recreated)
+	}
+	if !hasPhase(*ps, "done") {
+		t.Error("expected a done progress entry")
+	}
+}
+
+func TestRecreate_FailFast(t *testing.T) {
+	ops := &mockOps{failRecreateOn: "web-1"}
+	fn, ps := collect()
+	err := Run(context.Background(), ops, "s", []VMAction{act("web-1", "recreate", recreatePlan())}, fn)
+	if err == nil {
+		t.Fatal("recreate failure must return an error")
+	}
+	if !hasPhase(*ps, "error") {
+		t.Error("expected error progress")
+	}
+}
+
+func TestAllAtOnce_All(t *testing.T) {
+	ops := &mockOps{}
+	fn, _ := collect()
+	actions := []VMAction{
+		act("web-1", "all-at-once", recreatePlan()),
+		act("web-2", "all-at-once", recreatePlan()),
+		act("db-1", "all-at-once", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err != nil {
+		t.Fatalf("all-at-once: %v", err)
+	}
 	if len(ops.recreated) != 3 {
-		t.Errorf("expected 3 VMs recreated, got %d: %v", len(ops.recreated), ops.recreated)
+		t.Errorf("expected 3 recreated, got %d: %v", len(ops.recreated), ops.recreated)
 	}
 }
 
-func TestUpdate_FailureNoRollback(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
-	ops := &mockOps{failOn: "teststack-web-1"}
+func TestAllAtOnce_FailFast(t *testing.T) {
+	ops := &mockOps{failRecreateOn: "web-1"}
+	fn, _ := collect()
+	actions := []VMAction{
+		act("web-1", "all-at-once", recreatePlan()),
+		act("web-2", "all-at-once", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err == nil {
+		t.Fatal("all-at-once with a failure must return an error (no rollback)")
+	}
+}
 
-	insertTestVMs(t, db, ctx, "teststack", "teststack-web-1")
+// ── ordered batching ──
 
-	f := parseTestFile("recreate")
-	ch := Update(ctx, db, ops, "teststack", f, "")
-	progress := collectProgress(ch)
+func TestOrdered_AbortOnRecreateFailure(t *testing.T) {
+	ops := &mockOps{failRecreateOn: "web-2"}
+	fn, ps := collect()
+	actions := []VMAction{
+		act("web-1", "stop-first", recreatePlan()),
+		act("web-2", "stop-first", recreatePlan()),
+		act("web-3", "stop-first", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err == nil {
+		t.Fatal("expected an error when a VM fails mid-sequence")
+	}
+	if len(ops.recreated) != 1 || ops.recreated[0] != "web-1" {
+		t.Errorf("expected only web-1 recreated before abort, got %v", ops.recreated)
+	}
+	if !hasPhase(*ps, "error") {
+		t.Error("expected error progress")
+	}
+}
 
-	found := false
-	for _, p := range progress {
-		if p.Phase == "error" {
-			found = true
+func TestOrdered_AbortOnHealthFailure(t *testing.T) {
+	ops := &mockOps{failHealthOn: "web-1"}
+	fn, _ := collect()
+	actions := []VMAction{
+		act("web-1", "stop-first", recreatePlan()),
+		act("web-2", "stop-first", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err == nil {
+		t.Fatal("expected an error on health-check failure")
+	}
+	for _, n := range ops.recreated {
+		if n == "web-2" {
+			t.Error("web-2 must not be recreated after web-1's health abort")
 		}
 	}
-	if !found {
-		t.Error("expected error progress entry on failure")
-	}
 }
 
-func TestUpdate_AllAtOnce_RollbackOnFailure(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
-	ops := &mockOps{failOn: "mystack-web-1"}
-
-	insertTestVMs(t, db, ctx, "mystack", "mystack-web-1")
-
-	oldYAML := `
-name: mystack
-vms:
-  web:
-    image: ubuntu-old
-    cpu: 1
-    memory: 512
-`
-	f := parseTestFile("all-at-once")
-	// Set rollback flag via a VM update def.
-	f.Name = "mystack"
-	f.VMs["web"] = compose.VMDef{
-		Image:  "ubuntu-new",
-		Update: &compose.UpdateDef{Strategy: "all-at-once", RollbackOnFailure: true},
-	}
-
-	ch := Update(ctx, db, ops, "mystack", f, oldYAML)
-	progress := collectProgress(ch)
-
-	foundRollback := false
-	for _, p := range progress {
-		if p.Phase == "rollback" {
-			foundRollback = true
+func TestOrdered_MaxUnavailableBatching(t *testing.T) {
+	var peak, cur atomic.Int32
+	ops := &mockOps{onRecreate: func() {
+		c := cur.Add(1)
+		for {
+			old := peak.Load()
+			if c <= old || peak.CompareAndSwap(old, c) {
+				break
+			}
 		}
-	}
-	if !foundRollback {
-		t.Error("expected rollback progress on failure with rollback_on_failure=true")
-	}
-}
-
-func TestResolveUpdateGroups_Default(t *testing.T) {
-	f := &compose.File{VMs: map[string]compose.VMDef{
-		"web": {Image: "ubuntu"},
+		time.Sleep(5 * time.Millisecond)
+		cur.Add(-1)
 	}}
-	groups := resolveUpdateGroups(f, []string{"web"})
-	if len(groups) != 1 {
-		t.Fatalf("expected 1 group, got %d", len(groups))
+	var actions []VMAction
+	for i := 1; i <= 6; i++ {
+		a := act(fmt.Sprintf("web-%d", i), "stop-first", recreatePlan())
+		a.Strategy.MaxUnavailable = 3
+		actions = append(actions, a)
 	}
-	if groups[0].ud.Strategy != "recreate" {
-		t.Errorf("expected default strategy 'recreate', got %q", groups[0].ud.Strategy)
+	fn, _ := collect()
+	if err := Run(context.Background(), ops, "s", actions, fn); err != nil {
+		t.Fatalf("batched: %v", err)
+	}
+	if len(ops.recreated) != 6 {
+		t.Errorf("expected 6 recreated, got %d", len(ops.recreated))
+	}
+	if peak.Load() < 2 {
+		t.Errorf("expected peak concurrency >= 2 with max-unavailable=3, got %d", peak.Load())
+	}
+}
+
+func TestOrdered_StartFirst(t *testing.T) {
+	ops := &mockOps{}
+	a := act("web-1", "start-first", recreatePlan())
+	fn, _ := collect()
+	if err := Run(context.Background(), ops, "s", []VMAction{a}, fn); err != nil {
+		t.Fatalf("start-first: %v", err)
+	}
+	if len(ops.started) != 1 || len(ops.stopped) != 1 || len(ops.recreated) != 1 {
+		t.Errorf("start-first should start, stop, then recreate: started=%v stopped=%v recreated=%v", ops.started, ops.stopped, ops.recreated)
+	}
+}
+
+func TestRolling_StopFirst_NoStart(t *testing.T) {
+	ops := &mockOps{}
+	a := VMAction{Name: "web-1", Strategy: compose.UpdateDef{Strategy: "rolling", Order: "stop-first"}, Plan: recreatePlan(), Desired: &pb.VMSpec{Name: "web-1"}}
+	fn, _ := collect()
+	if err := Run(context.Background(), ops, "s", []VMAction{a}, fn); err != nil {
+		t.Fatalf("rolling stop-first: %v", err)
+	}
+	if len(ops.started) != 0 {
+		t.Errorf("stop-first must not StartVM, got %v", ops.started)
+	}
+	if len(ops.recreated) != 1 {
+		t.Errorf("expected 1 recreate, got %v", ops.recreated)
+	}
+}
+
+// ── snapshot-and-replace ──
+
+func TestSnapshotAndReplace(t *testing.T) {
+	ops := &mockOps{}
+	fn, ps := collect()
+	actions := []VMAction{
+		act("web-1", "snapshot-and-replace", recreatePlan()),
+		act("web-2", "snapshot-and-replace", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err != nil {
+		t.Fatalf("snapshot-and-replace: %v", err)
+	}
+	if len(ops.created) != 2 {
+		t.Errorf("expected 2 -next VMs, got %v", ops.created)
+	}
+	if len(ops.recreated) != 0 {
+		t.Errorf("cutover is manual — nothing recreated, got %v", ops.recreated)
+	}
+	foundCutover := false
+	for _, p := range *ps {
+		if p.Phase == "done" && len(p.Detail) > 0 && contains(p.Detail, "lv cutover") {
+			foundCutover = true
+		}
+	}
+	if !foundCutover {
+		t.Error("expected cutover instructions in progress")
+	}
+}
+
+func TestSnapshotAndReplace_FailureContinues(t *testing.T) {
+	ops := &mockOps{failCreateNextOn: "web-1"}
+	fn, _ := collect()
+	actions := []VMAction{
+		act("web-1", "snapshot-and-replace", recreatePlan()),
+		act("web-2", "snapshot-and-replace", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err != nil {
+		t.Fatalf("no rollback-on-failure → continues, got %v", err)
+	}
+	if len(ops.created) != 1 {
+		t.Errorf("expected 1 -next VM (web-2), got %v", ops.created)
+	}
+}
+
+// ── blue-green ──
+
+func TestBlueGreen(t *testing.T) {
+	ops := &mockOps{}
+	fn, _ := collect()
+	actions := []VMAction{
+		act("web-1", "blue-green", recreatePlan()),
+		act("web-2", "blue-green", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err != nil {
+		t.Fatalf("blue-green: %v", err)
+	}
+	green := map[string]bool{}
+	for _, n := range ops.recreated {
+		green[n] = true
+	}
+	if !green["web-1-green"] || !green["web-2-green"] {
+		t.Errorf("expected -green instances recreated, got %v", ops.recreated)
+	}
+	// Cutover deletes the blue instances.
+	if len(ops.deleted) != 2 {
+		t.Errorf("expected 2 blue deletes, got %v", ops.deleted)
+	}
+}
+
+func TestBlueGreen_FailureRollsBackGreens(t *testing.T) {
+	ops := &mockOps{failRecreateOn: "web-2-green"}
+	fn, _ := collect()
+	actions := []VMAction{
+		act("web-1", "blue-green", recreatePlan()),
+		act("web-2", "blue-green", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err == nil {
+		t.Fatal("blue-green failure must return an error")
+	}
+	// The already-created green (web-1-green) is cleaned up; blue instances untouched.
+	if len(ops.deleted) != 1 || ops.deleted[0] != "web-1-green" {
+		t.Errorf("expected the created green rolled back, got deleted=%v", ops.deleted)
+	}
+}
+
+// ── grouping + helpers ──
+
+func TestResolveGroups_MixedStrategies(t *testing.T) {
+	actions := []VMAction{
+		act("web", "start-first", recreatePlan()),
+		act("db", "stop-first", recreatePlan()),
+		act("cache", "start-first", recreatePlan()),
+	}
+	groups := resolveGroups(actions)
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(groups))
 	}
 }
 
 func TestParseDuration(t *testing.T) {
 	if got := parseDuration("5s", 0); got != 5*time.Second {
-		t.Errorf("expected 5s, got %v", got)
+		t.Errorf("5s → %v", got)
 	}
 	if got := parseDuration("", 10*time.Second); got != 10*time.Second {
-		t.Errorf("expected default 10s, got %v", got)
+		t.Errorf("default → %v", got)
 	}
-	if got := parseDuration("invalid", 3*time.Second); got != 3*time.Second {
-		t.Errorf("expected default 3s for invalid, got %v", got)
-	}
-}
-
-func TestUpdate_OrderedAbortOnRecreateFailure(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
-	ops := &mockOps{failOn: "teststack-web-2"}
-
-	insertTestVMs(t, db, ctx, "teststack", "teststack-web-1", "teststack-web-2", "teststack-web-3")
-
-	f := parseTestFile("stop-first")
-	ch := Update(ctx, db, ops, "teststack", f, "")
-	progress := collectProgress(ch)
-
-	// Only the 1st VM should have been recreated.
-	if len(ops.recreated) != 1 || ops.recreated[0] != "teststack-web-1" {
-		t.Errorf("expected only teststack-web-1 recreated, got: %v", ops.recreated)
-	}
-	// The 3rd VM must NOT have been recreated.
-	for _, name := range ops.recreated {
-		if name == "teststack-web-3" {
-			t.Error("teststack-web-3 should not have been recreated after abort")
-		}
-	}
-	// Progress must contain an error entry.
-	found := false
-	for _, p := range progress {
-		if p.Phase == "error" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected 'error' progress entry, got: %+v", progress)
+	if got := parseDuration("bad", 3*time.Second); got != 3*time.Second {
+		t.Errorf("invalid default → %v", got)
 	}
 }
 
-func TestUpdate_OrderedAbortOnHealthCheckFailure(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
-	ops := &mockOps{healthFailOn: "teststack-web-1"}
-
-	insertTestVMs(t, db, ctx, "teststack", "teststack-web-1", "teststack-web-2")
-
-	f := parseTestFile("stop-first")
-	ch := Update(ctx, db, ops, "teststack", f, "")
-	progress := collectProgress(ch)
-
-	// The 1st VM should have been recreated (RecreateVM succeeds, WaitHealthy fails).
-	found1 := false
-	for _, name := range ops.recreated {
-		if name == "teststack-web-1" {
-			found1 = true
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
 		}
 	}
-	if !found1 {
-		t.Errorf("expected teststack-web-1 to be recreated, got: %v", ops.recreated)
-	}
-	// The 2nd VM must NOT have been recreated (aborted after health check failure).
-	for _, name := range ops.recreated {
-		if name == "teststack-web-2" {
-			t.Error("teststack-web-2 should not have been recreated after health check abort")
-		}
-	}
-	// Progress must contain an error entry mentioning "health check".
-	foundErr := false
-	for _, p := range progress {
-		if p.Phase == "error" && p.Detail != "" {
-			if len(p.Detail) >= len("health check") && p.Detail[:len("health check")] == "health check" {
-				foundErr = true
-			}
-		}
-	}
-	if !foundErr {
-		t.Errorf("expected 'error' progress entry about health check, got: %+v", progress)
-	}
-}
-
-func TestUpdate_OrderedSkipsDrainingHosts(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
-	ops := &mockOps{}
-
-	// Insert host records: h1 active, h2 draining.
-	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "h1", State: "active"}); err != nil {
-		t.Fatalf("InsertHost h1: %v", err)
-	}
-	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "h2", State: "draining"}); err != nil {
-		t.Fatalf("InsertHost h2: %v", err)
-	}
-
-	// Insert one VM on the active host and one on the draining host.
-	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
-		Name:      "teststack-web-1",
-		StackName: "teststack",
-		HostName:  "h1",
-		Spec:      "{}",
-		State:     "running",
-	}, nil, nil); err != nil {
-		t.Fatalf("InsertVM teststack-web-1: %v", err)
-	}
-	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
-		Name:      "teststack-web-2",
-		StackName: "teststack",
-		HostName:  "h2",
-		Spec:      "{}",
-		State:     "running",
-	}, nil, nil); err != nil {
-		t.Fatalf("InsertVM teststack-web-2: %v", err)
-	}
-
-	f := parseTestFile("stop-first")
-	ch := Update(ctx, db, ops, "teststack", f, "")
-	progress := collectProgress(ch)
-
-	// Only the VM on the active host should have been recreated.
-	if len(ops.recreated) != 1 || ops.recreated[0] != "teststack-web-1" {
-		t.Errorf("expected only teststack-web-1 recreated, got: %v", ops.recreated)
-	}
-	// The VM on the draining host must NOT appear in recreated.
-	for _, name := range ops.recreated {
-		if name == "teststack-web-2" {
-			t.Error("teststack-web-2 (draining host) should have been skipped")
-		}
-	}
-	// A "done" progress entry with "skipped" detail should be present for the draining VM.
-	foundSkip := false
-	for _, p := range progress {
-		if p.VMName == "teststack-web-2" && p.Phase == "done" {
-			foundSkip = true
-		}
-	}
-	if !foundSkip {
-		t.Errorf("expected skipped progress for teststack-web-2, got: %+v", progress)
-	}
+	return len(sub) == 0
 }

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
 	"testing"
 
@@ -71,6 +73,8 @@ type mockGRPC struct {
 	poolContentsResp     *pb.ListStoragePoolContentsResponse
 	poolContentsErr      error
 	lastPoolContentsReq  *pb.ListStoragePoolContentsRequest
+	listVMHardwareResp   *pb.ListVMHardwareResponse
+	listVMHardwareErr    error
 	uploadStream         *fakeUploadStream
 	uploadStreamErr      error
 
@@ -629,6 +633,19 @@ func (m *mockGRPC) DetachDevice(_ context.Context, in *pb.DetachDeviceRequest, _
 	return &pb.VM{Name: in.VmName}, nil
 }
 
+// ListVMHardware backs the Hardware tab. A settable response
+// field lets tests inject disk/NIC/PCI devices; a settable error simulates
+// the RPC failing (e.g. VM not found) so the handler's error path is testable.
+func (m *mockGRPC) ListVMHardware(_ context.Context, in *pb.ListVMHardwareRequest, _ ...grpc.CallOption) (*pb.ListVMHardwareResponse, error) {
+	if m.listVMHardwareErr != nil {
+		return nil, m.listVMHardwareErr
+	}
+	if m.listVMHardwareResp == nil {
+		return &pb.ListVMHardwareResponse{}, nil
+	}
+	return m.listVMHardwareResp, nil
+}
+
 func (m *mockGRPC) ResizeDisk(_ context.Context, in *pb.ResizeDiskRequest, _ ...grpc.CallOption) (*pb.VM, error) {
 	m.lastResizeDiskReq = in
 	if m.resizeDiskErr != nil {
@@ -1169,6 +1186,25 @@ func mustReq(t *testing.T, method, path string) *http.Request {
 		t.Fatalf("http.NewRequest(%s %s): %v", method, path, err)
 	}
 	return r
+}
+
+// doPOSTForm submits an application/x-www-form-urlencoded POST through the
+// server's handler (with a valid auth cookie) and returns the response.
+func doPOSTForm(t *testing.T, s *Server, path string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	r, err := http.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("http.NewRequest(POST %s): %v", path, err)
+	}
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return serveRequest(s, withAuth(r))
+}
+
+// doGET issues an authenticated GET through the server's handler and returns
+// the response body as a string.
+func doGET(t *testing.T, s *Server, path string) string {
+	t.Helper()
+	return serveRequest(s, withAuth(mustReq(t, "GET", path))).Body.String()
 }
 
 // errorf is a helper for tests that need a formatted error.

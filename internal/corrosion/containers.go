@@ -159,7 +159,7 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 	now := c.NowTS()
 	if r.CreatedAt == "" {
-		r.CreatedAt = now
+		r.CreatedAt = nowRFC3339() // created_at is wall/display, never the HLC key
 	}
 	if r.Project == "" {
 		r.Project = "_default"
@@ -395,14 +395,14 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 		// (1) tombstone the source container row.
 		{
 			SQL:    `UPDATE containers SET deleted_at = ?, updated_at = ? WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-			Params: []interface{}{now, now, src.HostName, src.Name},
+			Params: []interface{}{nowRFC3339(), now, src.HostName, src.Name},
 		},
 		// (2) re-key the row onto the new host.
 		rk,
 		// (3) tombstone the source's managed interface rows.
 		{
 			SQL:    `UPDATE container_interfaces SET deleted_at = ?, updated_at = ? WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`,
-			Params: []interface{}{now, now, src.HostName, src.Name},
+			Params: []interface{}{nowRFC3339(), now, src.HostName, src.Name},
 		},
 	}
 	// (4) rebuild the managed interface rows on the new host from create_spec.
@@ -457,7 +457,7 @@ func rekeyContainerStmt(c *Client, src ContainerRecord, toHost, now string) (Sta
 	}
 	createdAt := src.CreatedAt
 	if createdAt == "" {
-		createdAt = now
+		createdAt = nowRFC3339() // created_at is wall/display, never the HLC key
 	}
 	return Statement{
 		SQL: `INSERT OR REPLACE INTO containers

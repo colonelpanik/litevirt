@@ -43,8 +43,9 @@ lv top [--interval 3s]             # Live resource dashboard
 lv ui [--open]                     # Show web UI URL
 lv mcp [--max-list-items N] [--allow-write]  # Run the stdio MCP server for operator assistants
 lv version                         # Print version
-lv cluster digest                  # Per-table state digest for each host
-lv cluster sync                    # Pull full state from connected host and merge
+lv cluster digest                  # Per-table state digest for every host (fanned out server-side)
+lv cluster converge [--all]        # Kick an immediate anti-entropy pass + report cross-host convergence
+                                   #   (`lv cluster sync` is a deprecated alias)
 lv health                          # Cluster health matrix
 ```
 
@@ -116,7 +117,7 @@ lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 ## VM configuration
 
 ```bash
-lv config <vm> --ip <ip> --network <net>     # Set VM IP address
+lv config <vm> --ip <ip> --network <net>     # Record VM IP in inventory (+ DNS if configured); does NOT reconfigure the guest
 lv config <vm> --boot disk|cdrom|network     # Set boot order
 
 # lv update reconfigures an existing VM. Restart policy, autostart and startup
@@ -129,6 +130,9 @@ lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--disable-vnc]
   [--machine q35] [--firmware uefi|bios] [--guest-agent]
   [--min-mem N] [--max-mem N]
+  [--max-cpu N]                              # vCPU hotplug ceiling (needs live_resize);
+                                             # with it set, --cpu grows a RUNNING VM's
+                                             # vCPUs live up to the ceiling
   [--secure-boot] [--tpm] [--force]          # toggle Secure Boot / vTPM (stopped).
                                              # Once firmware state exists, --force is
                                              # required to change them (enabling SB can
@@ -555,6 +559,7 @@ lv lb enable <lb> --backend <vm>                  # Re-enable
 ## Hot-plug (attach/detach)
 
 ```bash
+lv hardware-ls <vm>                               # List a VM's disks/NICs/PCI devices
 lv attach-disk <vm> <disk> --size 50G [--bus virtio]
 lv detach-disk <vm> <disk>
 lv attach-nic <vm> <network> [--model virtio] [--mac ...]

@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -53,6 +54,10 @@ type VMAction struct {
 	// delete/no-change ops too — where the workload may be gone from the compose
 	// file, so FindVMDef can't classify it.
 	IsContainer bool
+	// Plan classifies an OpUpdate VM change (desired vs stored) into live / restart /
+	// recreate buckets so the rolling engine can apply it without deleting a VM that
+	// only needs a live resize. Empty (Max()==NoChange) for non-update / container ops.
+	Plan compose.ChangePlan
 }
 
 // DeviceAssignment is a pre-resolved PCI device allocation.
@@ -130,6 +135,15 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	// so anti-affinity references like "web" expand to ["web-1", "web-2", "web-3"].
 	composeInstances := buildComposeInstanceMap(f)
 
+	// Current host per existing VM instance — so a VM UPDATE pins to its current host
+	// instead of re-running placement (which could move it).
+	currentHostByVM := map[string]string{}
+	for _, c := range current {
+		if c.HostName != "" {
+			currentHostByVM[c.Name] = c.HostName
+		}
+	}
+
 	for _, op := range vmPlan.Ops {
 		if op.Kind != OpCreate && op.Kind != OpUpdate {
 			continue
@@ -162,6 +176,14 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 					req.PinHost = h
 				}
 			}
+		} else if op.Kind == OpUpdate {
+			// A VM UPDATE stays on its current host — re-running placement could pick a
+			// different node, which for in-place is a misleading plan (the live change
+			// forwards to the owner anyway) and for a recreate-strategy update would
+			// actually move the VM (and its SR-IOV VF / local disk) off its host.
+			if h := currentHostByVM[op.VMName]; h != "" {
+				req.PinHost = h
+			}
 		}
 		placementReqs = append(placementReqs, req)
 		placementVMNames = append(placementVMNames, op.VMName)
@@ -170,6 +192,20 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	placements, err := placement.SelectBatch(state.Hosts, state.VMs, state.Devices, placementReqs)
 	if err != nil {
 		return nil, fmt.Errorf("batch placement failed: %w", err)
+	}
+
+	// Stored specs for this stack's VMs (for classifying in-place updates). Built
+	// from the snapshot — no extra queries.
+	storedSpecByVM := map[string]*pb.VMSpec{}
+	for i := range state.VMs {
+		vm := &state.VMs[i]
+		if vm.StackName != f.Name || vm.Spec == "" {
+			continue
+		}
+		ss := &pb.VMSpec{}
+		if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
+			storedSpecByVM[vm.Name] = ss
+		}
 	}
 
 	// Step 4: Build VMActions with resolved hosts and devices.
@@ -182,6 +218,14 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			DependsOn:   op.DependsOn,
 			Warning:     op.Warning,
 			IsContainer: isContainerWorkload(f, op.VMName, ctHost),
+		}
+
+		// Classify a VM update (desired vs stored) so the rolling engine can route it
+		// live/restart/recreate. Containers are recreated by their own path.
+		if op.Kind == OpUpdate && !action.IsContainer {
+			if stored := storedSpecByVM[op.VMName]; stored != nil {
+				action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
+			}
 		}
 
 		if op.Kind == OpCreate || op.Kind == OpUpdate {
@@ -666,6 +710,8 @@ func buildPlacementRequest(spec *pb.VMSpec) placement.Request {
 			Type:   dev.Type,
 			Count:  int(dev.Count),
 			Vendor: dev.Vendor,
+			Sriov:  dev.Sriov,
+			Parent: dev.Parent,
 		})
 	}
 	return req

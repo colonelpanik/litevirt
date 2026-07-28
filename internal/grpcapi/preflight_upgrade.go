@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -124,6 +125,18 @@ func (s *Server) PreflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeR
 			add("warn", "clock-skew",
 				fmt.Sprintf("skew with peer %s: %d seconds (HLC reset on restart could land badly)",
 					r.String("target"), r.Int("skew_seconds")))
+		}
+	}
+
+	// 6a. Deprecated litevirt PCI udev rule present — the upgrade will remove it (when
+	// it matches the known litevirt rule). Read-only advisory; never blocks.
+	if b, err := os.ReadFile(litevirtUdevRulePath); err == nil {
+		if isLitevirtUdevRule(string(b)) {
+			add("warn", "udev-rule-deprecated",
+				"a deprecated litevirt PCI udev rule is present; the upgrade will remove it (rescan_interval replaces it)")
+		} else {
+			add("warn", "udev-rule-foreign",
+				"an unrecognized file exists at the litevirt udev-rule path; the upgrade will leave it untouched")
 		}
 	}
 

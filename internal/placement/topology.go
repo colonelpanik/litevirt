@@ -151,6 +151,17 @@ func scoreHostDevices(devices []corrosion.PCIDeviceRecord, reqs []DeviceRequest)
 			count = 1
 		}
 
+		// SR-IOV: gate on an SR-IOV-capable PF (matching type/vendor/parent) being
+		// present — VFs are created or reused on-demand by the owner's allocator, so a
+		// currently-empty managed PF (no unassigned VF rows yet) must still qualify.
+		// A free VF already in inventory also qualifies. Placement never pins a VF here.
+		if req.Sriov {
+			if !sriovHostEligible(devices, req) {
+				return false, 0
+			}
+			continue
+		}
+
 		// Filter devices by type.
 		var typed []corrosion.PCIDeviceRecord
 		for _, d := range devices {
@@ -166,4 +177,31 @@ func scoreHostDevices(devices []corrosion.PCIDeviceRecord, reqs []DeviceRequest)
 		bonus += s
 	}
 	return true, bonus
+}
+
+// sriovHostEligible reports whether the host can satisfy an SR-IOV request: it has an
+// SR-IOV-capable PF of the requested type (matching vendor + parent when specified),
+// or an existing free VF of that type. The authoritative capacity/managed-PF decision
+// happens at allocation time on the owner; this is a best-effort host gate.
+func sriovHostEligible(devices []corrosion.PCIDeviceRecord, req DeviceRequest) bool {
+	for _, d := range devices {
+		if d.Type != req.Type {
+			continue
+		}
+		if req.Vendor != "" && d.VendorID != req.Vendor && d.VendorName != req.Vendor {
+			continue
+		}
+		// SR-IOV-capable PF (matching the requested parent, if any).
+		if d.SRIOVCapable {
+			if req.Parent == "" || d.Address == req.Parent {
+				return true
+			}
+			continue
+		}
+		// A free VF already present in inventory (parent unknown here — accept any).
+		if d.VMName == "" && req.Parent == "" {
+			return true
+		}
+	}
+	return false
 }

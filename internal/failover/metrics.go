@@ -62,6 +62,7 @@ const (
 	ErrDBError           = "db_error"
 	ErrFenceLogWrite     = "fence_log_write_failed"
 	ErrPromoteFailed     = "promote_failed"
+	ErrStorageUnverified = "storage_unverified" // shared-disk transfer with no proof-grade fence
 	ErrRelocateFailed    = "relocate_failed"
 	ErrRestoreUnknown    = "restore_unknown"
 )

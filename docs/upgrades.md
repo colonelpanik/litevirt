@@ -57,9 +57,15 @@ Six guarantees the upgrade pipeline enforces:
    rows.
 
 5. **Schema-skew check in CRDT replication.** Every `PushMutations`
-   request carries the sender's schema version. Receivers refuse if the
-   sender is more than 1 minor version ahead — mid-upgrade drift cannot
-   silently corrupt downstream replicas.
+   request carries the sender's DB-applied schema version. A receiver
+   refuses the push (`FailedPrecondition`) whenever the sender's schema is
+   *strictly ahead* of its own — even by one — because the sender's writes
+   may reference columns the receiver lacks. The check is asymmetric: a
+   sender that is *behind* is accepted (additive-only migrations mean it
+   touches a subset of the receiver's columns). Multi-version (N-step)
+   rolling upgrades stay safe because the pre-stage pass equalizes every
+   node's schema before any binary swap, so the live gap is 0 — not because
+   of any version tolerance.
 
 6. **Pre-flight gate.** `lv host upgrade` runs `PreflightUpgrade` and
    refuses on blocking conditions (in-flight migrations, leader-lease

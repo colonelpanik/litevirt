@@ -208,9 +208,17 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 
 	specJSON, _ := json.Marshal(spec)
-	diskRecords, ifaceRecords := importRecords(fv, name, s.hostName)
+	diskRecords, ifaceRecords, nicRecords := importRecords(fv, name, s.hostName)
+	// pciIntents: the mapped spec's Devices, if the source format ever declares
+	// any (none do today — ForeignVM carries no PCI passthrough — but this keeps
+	// import on the same canonicalized-BDF path as every other producer with a
+	// spec.Devices list, per the shared buildPCIIntents helper).
+	pciIntents := s.buildPCIIntents(name, spec.Devices)
 
-	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+	// adopt=false: best-effort-populate vm_nics/vm_pci_intent, but don't
+	// self-certify adoption — the Phase-6 backfill audit confirms/reconciles
+	// against the just-defined inactive domain.
+	if err := corrosion.InsertVMWithHardware(ctx, s.db, corrosion.VMRecord{
 		Name:      name,
 		HostName:  s.hostName,
 		Spec:      string(specJSON),
@@ -218,7 +226,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		CPUActual: fv.CPUs,
 		MemActual: fv.MemoryMiB,
 		Project:   project,
-	}, ifaceRecords, diskRecords); err != nil {
+	}, ifaceRecords, diskRecords, nicRecords, pciIntents, false); err != nil {
 		_ = s.virt.UndefineDomain(name, false)
 		if fwImport {
 			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
@@ -564,7 +572,15 @@ func (s *Server) sendImportInspect(stream pb.LiteVirt_ImportVMServer, fv *vmimpo
 	})
 }
 
-func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskRecord, []corrosion.InterfaceRecord) {
+// importRecords builds the disk/interface/NIC rows ImportVM persists via
+// corrosion.InsertVMWithHardware. A vm_nics row is built alongside each legacy
+// vm_interfaces row (v42 dual-write, mirroring CreateVM/task 7.1), carrying
+// the foreign NIC's tracked model (ForeignVM.Normalize defaults an unset one
+// to "virtio" before this runs) and the deterministic (vmName, mac) id so it
+// converges with what the Phase-6 backfill audit would derive for the same
+// legacy NIC. TapDevice stays empty — tap assignment is a start-time fact, not
+// an import-time one.
+func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskRecord, []corrosion.InterfaceRecord, []corrosion.NICRecord) {
 	var disks []corrosion.DiskRecord
 	di := 0
 	for _, d := range fv.Disks {
@@ -583,6 +599,7 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 		di++
 	}
 	var ifaces []corrosion.InterfaceRecord
+	var nics []corrosion.NICRecord
 	for i, n := range fv.NICs {
 		ifaces = append(ifaces, corrosion.InterfaceRecord{
 			VMName:      name,
@@ -590,8 +607,17 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 			Ordinal:     i,
 			MAC:         n.MAC,
 		})
+		nics = append(nics, corrosion.NICRecord{
+			VMName:      name,
+			ID:          corrosion.DeterministicNICID(name, n.MAC),
+			NetworkName: n.Network,
+			Model:       n.Model,
+			MAC:         n.MAC,
+			Ordinal:     i,
+			TapDevice:   "",
+		})
 	}
-	return disks, ifaces
+	return disks, ifaces, nics
 }
 
 // ── disk conversion ──

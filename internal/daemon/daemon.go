@@ -40,6 +40,7 @@ import (
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/obs"
+	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/restapi"
@@ -67,8 +68,13 @@ type Daemon struct {
 	metrics *metrics.Server
 
 	// authEngine is wired into the gRPC server below; kept on the daemon
-	// struct so the realm-sync / binding-reload loop can refresh it later.
+	// struct so the backstop reload loop (runAuthEngineReload) can refresh it.
 	authEngine *auth.Engine
+
+	// opJournal is the host-local tier of the F1 operation journal (durable
+	// artifacts only this host can restore); the startup recovery barrier reduces
+	// it against replicated state before runtime loops + API serving start.
+	opJournal *opjournal.Journal
 
 	// realmRegistry holds Local + every configured OIDC/LDAP realm.
 	// Login dispatches by name through this registry.
@@ -289,9 +295,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// seed the built-in RBAC roles (Admin, Operator, Viewer,
 	// Auditor, BackupOperator, NetworkAdmin, VMOperator, NoAccess) and
-	// initialize the auth engine. The engine reloads on every daemon
-	// start; mid-run it picks up new bindings via explicit Reload calls
-	//.
+	// initialize the auth engine. The engine reloads on daemon start, then
+	// mid-run: local grants reload synchronously, local revokes/deletes apply
+	// in-memory deltas, and runAuthEngineReload (below) is the ~30s backstop
+	// that picks up peer-replicated mutations.
 	if err := auth.SeedBuiltinRoles(ctx, d.db); err != nil {
 		slog.Warn("failed to seed built-in roles", "error", err)
 	}
@@ -400,6 +407,36 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// off any peer dial.
 		return d.cfg.Enforcement.LWWSkewGuard && d.checker.Latched(capabilities.LWWSkewGuardV1)
 	})
+	// Emit the LWW conflict key (updated_at) as HLC instead of RFC3339Nano once
+	// enforcement.hlc_lww is set AND the token has latched cluster-wide (the HA monitor
+	// drives the latch while healthy). Cheap Latched read on the per-write path; the
+	// instant-based comparator makes the RFC3339↔HLC switch and a flag-off rollback safe.
+	d.db.SetHLCEmit(func() bool {
+		return d.cfg.Enforcement.HLCLww && d.checker.Latched(capabilities.HLCLwwV1)
+	})
+	// Emit the order-invariant digest_v2 hashes once enforcement.digest_v2 is set. No
+	// capability latch: v2 is negotiated PAIRWISE by wire-field presence (each node emits
+	// v2 only when locally enabled; two peers compare v2 only when both emitted it), so a
+	// non-uniform rollout only affects which node initiates a pull, never a decision.
+	d.db.SetDigestV2Enabled(func() bool { return d.cfg.Enforcement.DigestV2 })
+	// Resolve the natural-key identity tables (snapshots, container_snapshots) by their UNIQUE
+	// natural key once enforcement.canonical_identity is set AND the token has latched
+	// cluster-wide. Unlike digest_v2 this is NOT pairwise-negotiated — identity resolution
+	// mutates shared state, so a per-sender flip would be non-convergent; it must be
+	// fleet-uniform, which the cluster-wide latch guarantees. Cheap Latched read (no peer dial)
+	// on the merge/apply hot path; the config flag is the reversible kill switch.
+	d.db.SetCanonicalIdentity(func() bool {
+		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
+	})
+	// Part H2 (preparatory infrastructure): accept a replicated canonical registry upsert once
+	// canonical_registry_v1 is DURABLY LATCHED (in memory AND persisted to its marker). Gating on the
+	// DURABLE latch — not Latched or the config flag — is what makes acceptance survive a restart: a
+	// node that latched only in memory would, after a reboot that reloads no marker, revert to
+	// rejecting an already-in-flight canonical entry and stall replication. The flag only gates
+	// ADVERTISEMENT (opt-in to drive the latch); no writer switch, no consolidation controller.
+	d.db.SetCanonicalRegistryAccept(func() bool {
+		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
+	})
 	repl.Start(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
@@ -476,6 +513,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetGate(d.checker)
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
 
 	// Daily prune of this host's vm_events rows so the operational event store
 	// stays bounded (see config vm_event_*).
@@ -488,6 +526,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
 	// placement engine's DiskIOPS/NetBW dimensions.
 	go d.runRuntimeUsageSampler(ctx)
+
+	// Backstop reload of the RBAC engine so peer-replicated role/binding
+	// mutations take effect without a restart (local grants/revokes already
+	// apply synchronously via reload/delta in the handlers).
+	go d.runAuthEngineReload(ctx)
 
 	// Start embedded DNS server, and tell the network layer to chain per-bridge
 	// dnsmasq instances to it for the litevirt domain so guests can resolve
@@ -535,6 +578,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetGate(d.checker)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
+	// cap, and the degraded gauge. Validate the allowlist against live hardware now,
+	// and re-validate on the rescan cadence.
+	svc.SetSRIOVMetrics(metrics.NewSRIOVMetrics())
+	svc.SetSRIOVPolicy(d.cfg.PCI.SRIOV.Managed, d.cfg.PCI.SRIOV.MaxVFsPerPF, d.cfg.PCI.SRIOV.ManagedPFs)
+	svc.ValidateSRIOVPolicy()
+	if d.cfg.PCI.SRIOV.Managed {
+		go svc.RunSRIOVValidation(ctx, d.parsePCIRescanInterval())
+	}
+	// The udev_hook is deprecated: real-time PCI events are covered by the rescan
+	// interval. Warn (don't fail) so operators migrate off the broken curl-to-REST rule.
+	if d.cfg.PCI.UdevHook {
+		slog.Warn("pci.udev_hook is deprecated and no longer installs a udev rule; rely on pci.rescan_interval instead. Remove any /etc/udev/rules.d/99-litevirt-pci.rules left from an older install.")
+	}
 	// Target the upgrade swap at the binary we're actually running (re-exec uses
 	// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
 	if exe, err := os.Executable(); err == nil {
@@ -550,6 +607,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
+	svc.SetRBACRealm(d.cfg.Auth.RBACRealm)
 	// Split-brain-family enforcement kill-switches — so the HA monitor drives the
 	// right tokens' latches (mandatory ∪ configured-on) and gates degraded/paging on
 	// config intent. The actual enforcement predicates live on the consumers
@@ -557,21 +615,34 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetEnforcementConfig(
 		d.cfg.Enforcement.SafeFenceDefault,
 		d.cfg.Enforcement.LWWSkewGuard,
+		d.cfg.Enforcement.HLCLww,
 		d.cfg.Enforcement.VIPSelfDemote,
 		d.cfg.Enforcement.VIPProofReclaim,
+		d.cfg.Enforcement.SharedStorageFence,
 	)
+	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
+	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
+	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
+	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	svc.SetReplicator(repl)
 	svc.SetAuthEngine(d.authEngine)
 	svc.SetRealmRegistry(d.realmRegistry)
 	vmChecker.SetEventBus(svc.EventBus())
 	vmChecker.SetMigrateFunc(svc.MigrateVMForHealthCheck)
+	// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
+	// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
+	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
+	// this changes nothing on a fleet where the feature is off.
+	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
+	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
@@ -588,6 +659,54 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// outcomes → litevirt_runtime_owner_assert_total.
 	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
 	reconciler.SetOwnerAssertObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("vm", result) })
+
+	// F1 startup recovery barrier: reduce the host-local operation journal against
+	// replicated state BEFORE any runtime loop or API mutation runs — DB +
+	// capability latch + membership are all wired by this point.
+	if j, err := opjournal.Open(filepath.Join(d.cfg.DataDir, "opjournal")); err != nil {
+		slog.Error("operation journal: open failed; skipping recovery", "error", err)
+	} else {
+		d.opJournal = j
+		svc.SetOpJournal(j) // so the device-lease path can durably record allocations
+		d.runOperationRecovery(ctx)
+		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
+	}
+
+	// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
+	// resource_update_running operation (a live resize that crashed after committing its
+	// desired spec) — converge it to the committed spec + clear the barrier so a partial
+	// failure never wedges active_operation_id. Uses replicated operation state (not the
+	// host-local journal), so it runs regardless of the journal above. A reconciler pass
+	// retries stragglers.
+	svc.RecoverResourceOperations(ctx)
+	go svc.RunResourceOperationRecovery(ctx)
+
+	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
+	// nonterminal device_attach/device_detach operation (a hot-plug that crashed
+	// with the mutation barrier held) — roll an incomplete attach BACK and a detach
+	// FORWARD to a single consistent state, clearing the barrier. Runs synchronously
+	// after DB + libvirt + journal init (uses the host-local journal artifacts), and
+	// a reconciler pass retries stragglers.
+	svc.RecoverHardwareOperations(ctx)
+	go svc.RunHardwareOperationRecovery(ctx)
+
+	// v42 hardware foundation (CONTRACT h): backfill the typed-hardware tables
+	// (vm_nics, vm_disks.bus, vm_pci_intent) and record each owned VM's adoption
+	// verdict, THEN mark this node hardware_v2-advertise-ready. Runs SYNCHRONOUSLY
+	// here — AFTER the schema is applied (InitSchema, above) and the
+	// operation-protocol config/latch is wired (hardware mutations depend on the
+	// crash-safe operation journal), and BEFORE the gRPC server begins serving Ping
+	// (below) — so no peer can read this node's advertised capabilities until the
+	// backfill has set the readiness flag advertisedCapabilities gates hardware_v2
+	// on. A backfill error DEGRADES (logged; the node simply keeps withholding
+	// hardware_v2 until a later attempt succeeds) rather than crashing the daemon.
+	if err := svc.BackfillHardwareTables(ctx); err != nil {
+		slog.Error("hardware backfill failed; node will not advertise hardware_v2 until it succeeds", "error", err)
+	}
+	// Continuous legacy→vm_nics bridge: mirrors vm_interfaces writes an OLD peer
+	// makes during the rolling-upgrade window into vm_nics (one-directional; old
+	// peers ignore vm_nics), converging the read overlay toward vm_nics completeness.
+	go svc.RunHardwareBridge(ctx)
 
 	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
 	// for cluster-wide capability confirmation) and every reconciler/vmChecker
@@ -671,6 +790,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.
 	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
+	// Leader-gated dual-run detector: alert-only cross-check that no workload/VIP runs on
+	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
+	// the work so the fleet pages once, not N times.
+	go svc.RunDualRunDetector(ctx, 60*time.Second)
 
 	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
 	ipScanner := grpcapi.NewIPScanner(svc)
@@ -688,6 +811,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// masquerade + `inet litevirt` chains) a prior binary left for it.
 	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
 	svc.SetFirewallReconciler(d.fwReconciler)
+	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
 	d.fwReconciler.Start(ctx)
 
 	// tenancy + billing engine. The webhook URL is empty
@@ -810,9 +934,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Promoter = svc // *grpcapi.Server implements failover.ReplicaPromoter
 	fc.Restorer = svc // implements failover.ContainerRestorer (tier-2 relocate-from-backup)
 	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
-	fc.OnFence = svc.NotifyHostFenced                        // operator notification on fence (#5)
-	fc.Metrics = metrics.NewFailoverMetrics()                // structured failover counters (U9)
-	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault // safe-fence kill-switch (config AND SafeFenceDefaultV1)
+	fc.OnFence = svc.NotifyHostFenced                                   // operator notification on fence (#5)
+	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
+	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
+	fc.SharedStorageFenceEnforce = d.cfg.Enforcement.SharedStorageFence // decide-side shared-disk fence kill-switch (config AND SharedStorageFenceV1)
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is
@@ -1236,7 +1361,7 @@ func (d *Daemon) runPCIScan(ctx context.Context) {
 
 	interesting := pci.FilterInteresting(devices)
 	for _, dev := range interesting {
-		if err := corrosion.UpsertPCIDevice(ctx, d.db, corrosion.PCIDeviceRecord{
+		if err := corrosion.ObservePCIDevice(ctx, d.db, corrosion.PCIDeviceRecord{
 			HostName:      d.cfg.HostName,
 			Address:       dev.Address,
 			VendorID:      dev.VendorID,
@@ -1466,6 +1591,97 @@ func (d *Daemon) runVMEventPrune(ctx context.Context) {
 	}
 }
 
+// runOperationRecovery is the F1 startup recovery barrier: it reduces the
+// host-local operation journal against replicated state before runtime loops and
+// API serving begin. Cleanup/supersede entries are removed; a resume entry is
+// logged for the resource coordinator; a corrupt journal is logged loudly (the
+// host is degraded for the affected mutations). Best-effort and defensive — it
+// never blocks startup on a transient error.
+func (d *Daemon) runOperationRecovery(ctx context.Context) {
+	if d.opJournal == nil {
+		return
+	}
+	lookup := func(opID string) (bool, int64, bool, error) {
+		op, err := corrosion.GetOperation(ctx, d.db, opID)
+		if err != nil {
+			return false, 0, false, err
+		}
+		if op == nil {
+			return false, 0, false, nil // GC'd → supersede
+		}
+		epoch, ok, err := corrosion.GetVMOwnerEpoch(ctx, d.db, op.ResourceID)
+		if err != nil {
+			return false, 0, false, err
+		}
+		if !ok {
+			return false, 0, false, nil // VM gone → not owned → supersede
+		}
+		state, _, err := corrosion.OperationCurrentState(ctx, d.db, opID, op.VMOwnerEpoch, corrosion.OperationKind(op.OperationKind))
+		if err != nil {
+			return false, 0, false, err
+		}
+		return true, epoch, corrosion.IsOperationTerminal(state), nil
+	}
+	plan, corrupt, err := d.opJournal.PlanRecovery(lookup)
+	if err != nil {
+		slog.Error("operation recovery: plan failed", "error", err)
+		return
+	}
+	if len(corrupt) > 0 {
+		slog.Error("operation recovery: CORRUPT journal entries — host degraded for affected mutations", "files", corrupt)
+	}
+	for _, p := range plan {
+		// device_lease entries are not operation-table ops; they're recovered
+		// (with device rollback) by grpcapi.RecoverDeviceLeases, not here.
+		if p.Entry.Kind == "device_lease" {
+			continue
+		}
+		switch p.Action {
+		case opjournal.RecoveryCleanup, opjournal.RecoverySupersede:
+			if err := d.opJournal.Remove(p.Entry.OperationID); err != nil {
+				slog.Warn("operation recovery: remove entry", "op", p.Entry.OperationID, "action", p.Action.String(), "error", err)
+			} else {
+				slog.Info("operation recovery", "op", p.Entry.OperationID, "action", p.Action.String())
+			}
+		case opjournal.RecoveryResume:
+			slog.Warn("operation recovery: needs resume (deferred to resource coordinator)",
+				"op", p.Entry.OperationID, "vm", p.Entry.ResourceID, "stage", p.Entry.Stage)
+		}
+	}
+}
+
+// authEngineReloadInterval is the backstop cadence for refreshing the RBAC
+// engine from replicated state. Local grants reload synchronously and local
+// revokes apply as in-memory deltas, so this backstop exists to pick up
+// peer-originated mutations (which arrive via WAL/AE) and to recover from any
+// missed local reload. The effective bound on a peer mutation taking effect is
+// one successful interval AFTER it becomes locally visible — not 30s from the
+// original mutation (replication lag and a failed-reload gap both add latency).
+const authEngineReloadInterval = 30 * time.Second
+
+// runAuthEngineReload periodically reloads the RBAC engine so peer-replicated
+// role/binding mutations take effect without a restart. On failure it logs and
+// retains the prior snapshot (Reload only swaps on success); the next tick
+// retries. A stalled reload service is observable via the engine's
+// last-successful-reload timestamp.
+func (d *Daemon) runAuthEngineReload(ctx context.Context) {
+	if d.authEngine == nil {
+		return
+	}
+	ticker := time.NewTicker(authEngineReloadInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := d.authEngine.Reload(ctx); err != nil {
+				slog.Warn("auth engine periodic reload failed; retaining prior snapshot", "error", err)
+			}
+		}
+	}
+}
+
 // runSupersededGC periodically hard-deletes provably-inert superseded/orphaned
 // auth + LB rows (local-only, deterministic per node — see
 // corrosion.GCSupersededRows). Hourly, with an initial delay after startup.
@@ -1498,6 +1714,16 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 			slog.Warn("proof reaper", "error", perr)
 		} else if tombstoned > 0 {
 			slog.Info("proof reaper", "tombstoned", tombstoned)
+		}
+		// F1 operation journal (v41): tombstone terminal operations + their steps
+		// once past the core retention (which exceeds the WAL/AE repair horizon) and
+		// no VM barrier still references them. Replicated monotone tombstone —
+		// tombstone-dominance in the immutable merge keeps a delayed copy from
+		// resurrecting a reaped operation.
+		if reaped, perr := corrosion.ReapTerminalOperations(ctx, d.db, core); perr != nil {
+			slog.Warn("operation reaper", "error", perr)
+		} else if reaped > 0 {
+			slog.Info("operation reaper", "reaped", reaped)
 		}
 		// Idempotency keys: hard-delete records past their TTL (v39). Ephemeral +
 		// bounded by expires_at; a resurrected expired copy never matches, so a

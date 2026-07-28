@@ -246,6 +246,13 @@ func (e *RebalanceExecutor) markFailed(ctx context.Context, id, reason string) {
 
 // reapStale fails `applying` rows whose goroutine never recorded a terminal
 // status within StaleTimeout (e.g. the daemon was killed mid-migration).
+//
+// The lexical `updated_at < ?` (RFC3339-vs-RFC3339) compare is valid ONLY because
+// rebalance_proposals stamps updated_at as WALL RFC3339 (leader-gated single-writer;
+// see recordProposal). It is NOT an HLC LWW key here. If those writers ever move to
+// NowLWW/HLC, this MUST switch to the tsMsSQL both-format helper first, else an HLC
+// "175…" sorts below every RFC3339 cutoff and every in-flight row insta-times-out.
+// Allowlisted in updated_at_consumer_guard_test.go.
 func (e *RebalanceExecutor) reapStale(ctx context.Context) {
 	cutoff := e.now().Add(-e.StaleTimeout).UTC().Format(time.RFC3339)
 	now := e.now().UTC().Format(time.RFC3339)

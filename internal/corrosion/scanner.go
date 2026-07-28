@@ -43,15 +43,31 @@ func cellString(v interface{}) string {
 	return coerceString(v)
 }
 
-// pkLabel composes the PK label for a row from the table's declared PK columns.
-// Returns "" if the table has no known PK or a PK column is missing from cols.
-func pkLabel(table string, idx map[string]int, vals []interface{}) string {
-	pkCols := tablePrimaryKeys[table]
-	if len(pkCols) == 0 {
+// labelColumns picks the columns that identify a row for cross-node comparison. Normally the
+// table's declared PRIMARY KEY. On the natural-key lane (identityLane), an identity table
+// (snapshots/container_snapshots) is keyed by its UNIQUE natural key instead of the minted random
+// id, so two nodes' independently-minted ids for one logical object group under ONE label rather
+// than reading as two phantom rows. The lane must be uniform across every compared node — the
+// scanner drives it off a single node's canonical_identity latch (see ScanLocalTables) so all
+// snapshots in a run use the same lane.
+func labelColumns(table string, identityLane bool) []string {
+	if identityLane {
+		if nat, ok := tableIdentityKeys[table]; ok {
+			return nat
+		}
+	}
+	return tablePrimaryKeys[table]
+}
+
+// pkLabel composes the row label from the table's identifying columns (see labelColumns).
+// Returns "" if the table has no known key or a key column is missing from cols.
+func pkLabel(table string, idx map[string]int, vals []interface{}, identityLane bool) string {
+	keyCols := labelColumns(table, identityLane)
+	if len(keyCols) == 0 {
 		return ""
 	}
-	parts := make([]string, len(pkCols))
-	for i, c := range pkCols {
+	parts := make([]string, len(keyCols))
+	for i, c := range keyCols {
 		j, ok := idx[c]
 		if !ok || j >= len(vals) {
 			return ""
@@ -61,11 +77,19 @@ func pkLabel(table string, idx map[string]int, vals []interface{}) string {
 	return strings.Join(parts, pkSep)
 }
 
-// rowMeta builds the operator-safe per-row metadata: a SHA-256 of the canonical
-// row encoding plus the updated_at / deleted_at / state markers (read by name).
-func rowMeta(idx map[string]int, vals []interface{}) RowMeta {
+// rowMeta builds the operator-safe per-row metadata: a SHA-256 of the canonical row
+// encoding (v1 positional, always) plus — when v2 is on — the order-invariant digest_v2
+// hash, and the updated_at / deleted_at / state markers (read by name). A v2 encode error
+// (dup-name / unexpected type) simply leaves RowHashV2 empty (v1 fallback for that row).
+func rowMeta(cols []string, idx map[string]int, vals []interface{}, v2 bool) RowMeta {
 	sum := sha256.Sum256([]byte(encodeRowCells(vals)))
 	m := RowMeta{RowHash: hex.EncodeToString(sum[:])}
+	if v2 {
+		if enc, err := encodeRowCellsV2(cols, vals); err == nil {
+			s2 := sha256.Sum256([]byte(enc))
+			m.RowHashV2 = hex.EncodeToString(s2[:])
+		}
+	}
 	if j, ok := idx["updated_at"]; ok && j < len(vals) {
 		m.UpdatedAt = cellString(vals[j])
 	}
@@ -81,7 +105,7 @@ func rowMeta(idx map[string]int, vals []interface{}) RowMeta {
 // tableSnapshotFromRows builds a TableSnapshot (and, for semantic tables, owned
 // rows) from a table's columns + rows. labelKey wraps the PK label so the
 // sensitive lane can substitute an HMAC; pass nil for the operator-safe identity.
-func tableSnapshotFromRows(table string, cols []string, rows [][]interface{}) (TableSnapshot, []OwnedRow) {
+func tableSnapshotFromRows(table string, cols []string, rows [][]interface{}, v2, identityLane bool) (TableSnapshot, []OwnedRow) {
 	idx := colIndex(cols)
 	ts := TableSnapshot{Columns: cols, Rows: make(map[string]RowMeta, len(rows))}
 	var owned []OwnedRow
@@ -89,11 +113,11 @@ func tableSnapshotFromRows(table string, cols []string, rows [][]interface{}) (T
 		if len(vals) != len(cols) {
 			continue // malformed dump row
 		}
-		label := pkLabel(table, idx, vals)
+		label := pkLabel(table, idx, vals, identityLane)
 		if label == "" {
 			continue
 		}
-		ts.Rows[label] = rowMeta(idx, vals)
+		ts.Rows[label] = rowMeta(cols, idx, vals, v2)
 		if semanticTables[table] {
 			if o, ok := ownedRow(table, idx, vals); ok {
 				owned = append(owned, o)
@@ -160,12 +184,28 @@ func (c *Client) ScanLocalTables(_ context.Context, tables []string) (map[string
 	for _, t := range tables {
 		want[t] = true
 	}
-	return SnapshotFromDumpBytes(c.DumpStateBytes(), want)
+	return SnapshotFromDumpBytes(c.DumpStateBytes(), want, c.digestV2On(), c.canonicalIdentityOn())
 }
 
+// DigestV2Enabled reports whether digest_v2 emission is enabled on this node — so the
+// scanner orchestrator can build BOTH the local and the peer snapshot with the same
+// version (v2 is compared only when both snapshots carry it). Nil-safe.
+func (c *Client) DigestV2Enabled() bool { return c.digestV2On() }
+
+// CanonicalIdentityEnabled reports whether this node resolves the identity tables by natural key
+// (enforcement.canonical_identity AND the token latched). The scanner orchestrator uses ONE
+// node's value to build every node's snapshot so the whole run keys identity tables on the same
+// lane — natural-key only when the fleet is uniformly upgraded (the latch guarantees that), else
+// physical id. Nil-safe.
+func (c *Client) CanonicalIdentityEnabled() bool { return c.canonicalIdentityOn() }
+
 // SnapshotFromDumpBytes parses a peer's gzipped operator-safe state dump into
-// per-table snapshots + owned rows, restricted to the requested tables.
-func SnapshotFromDumpBytes(buf []byte, want map[string]bool) (map[string]TableSnapshot, []OwnedRow, error) {
+// per-table snapshots + owned rows, restricted to the requested tables. When v2 is true it
+// also fills each row's order-invariant RowHashV2 (from the same decoded values as v1, so
+// the v1 hash + the merge decode are byte-for-byte unaffected). When identityLane is true the
+// identity tables are keyed by their natural key instead of the physical id (see labelColumns);
+// the caller passes ONE node's lane for every node so a run keys rows uniformly.
+func SnapshotFromDumpBytes(buf []byte, want map[string]bool, v2, identityLane bool) (map[string]TableSnapshot, []OwnedRow, error) {
 	payload, err := decompressPayload(buf)
 	if err != nil {
 		return nil, nil, err
@@ -176,7 +216,7 @@ func SnapshotFromDumpBytes(buf []byte, want map[string]bool) (map[string]TableSn
 		if want != nil && !want[t.Name] {
 			continue
 		}
-		ts, o := tableSnapshotFromRows(t.Name, t.Columns, t.Rows)
+		ts, o := tableSnapshotFromRows(t.Name, t.Columns, t.Rows, v2, identityLane)
 		out[t.Name] = ts
 		owned = append(owned, o...)
 	}
@@ -188,7 +228,8 @@ func SnapshotFromDumpBytes(buf []byte, want map[string]bool) (map[string]TableSn
 type SensitiveRow struct {
 	Table     string
 	PKLabel   string // HMAC(key, "pk\0"+table+"\0"+pk)
-	RowHash   string // HMAC(key, "row\0"+table+"\0"+encoding)
+	RowHash   string // HMAC(key, "row\0"+table+"\0"+v1 encoding)
+	RowHashV2 string // HMAC over the order-invariant v2 encoding; "" unless enabled
 	UpdatedAt string
 	Deleted   bool
 }
@@ -197,6 +238,7 @@ type SensitiveRow struct {
 // HMACs (domain-separated) — never raw PKs or row content. key is the per-scan
 // HMAC secret shared across nodes over peer-mTLS.
 func (c *Client) ScanLocalSensitive(ctx context.Context, key []byte, tables []string) ([]SensitiveRow, error) {
+	v2 := c.digestV2On()
 	var out []SensitiveRow
 	for _, table := range tables {
 		rows, err := c.Query(ctx, "SELECT * FROM "+table)
@@ -205,18 +247,24 @@ func (c *Client) ScanLocalSensitive(ctx context.Context, key []byte, tables []st
 		}
 		for _, r := range rows {
 			idx := colIndex(r.Columns)
-			label := pkLabel(table, idx, r.Values)
+			label := pkLabel(table, idx, r.Values, false) // sensitive tables have no natural-key lane
 			if label == "" {
 				continue
 			}
-			m := rowMeta(idx, r.Values) // we reuse updated_at/deleted, discard the plain hash
-			out = append(out, SensitiveRow{
+			m := rowMeta(r.Columns, idx, r.Values, false) // reuse updated_at/deleted; HMAC hashes below
+			sr := SensitiveRow{
 				Table:     table,
 				PKLabel:   ScanPKLabel(key, table, label),
 				RowHash:   ScanRowHash(key, table, encodeRowCells(r.Values)),
 				UpdatedAt: m.UpdatedAt,
 				Deleted:   m.Deleted,
-			})
+			}
+			if v2 {
+				if enc, eerr := encodeRowCellsV2(r.Columns, r.Values); eerr == nil {
+					sr.RowHashV2 = ScanRowHash(key, table, enc)
+				}
+			}
+			out = append(out, sr)
 		}
 	}
 	return out, nil
@@ -231,7 +279,7 @@ func SensitiveRowsToSnapshot(rows []SensitiveRow) map[string]TableSnapshot {
 		if !ok {
 			ts = TableSnapshot{Rows: map[string]RowMeta{}}
 		}
-		ts.Rows[r.PKLabel] = RowMeta{UpdatedAt: r.UpdatedAt, RowHash: r.RowHash, Deleted: r.Deleted}
+		ts.Rows[r.PKLabel] = RowMeta{UpdatedAt: r.UpdatedAt, RowHash: r.RowHash, RowHashV2: r.RowHashV2, Deleted: r.Deleted}
 		out[r.Table] = ts
 	}
 	return out

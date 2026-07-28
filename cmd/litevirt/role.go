@@ -30,6 +30,7 @@ func newRoleCmd() *cobra.Command {
 		newRoleGrantCmd(),
 		newRoleRevokeCmd(),
 		newRoleListCmd(),
+		newRoleNormalizeCmd(),
 	)
 	return cmd
 }
@@ -96,6 +97,40 @@ func newRoleRevokeCmd() *cobra.Command {
 			})
 		},
 	}
+}
+
+func newRoleNormalizeCmd() *cobra.Command {
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "normalize",
+		Short: "Rewrite legacy bare user bindings to realm-qualified form",
+		Long: `Rewrite legacy bare 'user:<name>' role bindings to the canonical
+realm-qualified form ('user:<name>@<realm>') so they enforce. This is a
+deliberate, idempotent one-time migration: run it once after enabling
+auth.rbac_realm fleet-wide and waiting for the rbac_realm_v1 capability to
+latch cluster-wide. A bare binding whose realm can't be resolved (not a known
+local user) is left untouched and reported as skipped.
+
+Use --dry-run to preview counts without writing.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.NormalizeRoleBindings(ctx, &pb.NormalizeRoleBindingsRequest{DryRun: dryRun})
+				if err != nil {
+					return fmt.Errorf("normalize role bindings: %w", err)
+				}
+				verb := "normalized"
+				if dryRun {
+					verb = "would normalize"
+				}
+				fmt.Printf("%s %d binding(s); skipped %d (unresolvable realm)\n",
+					verb, resp.Normalized, resp.Skipped)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview counts without writing")
+	return cmd
 }
 
 func newRoleListCmd() *cobra.Command {

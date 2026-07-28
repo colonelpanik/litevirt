@@ -114,6 +114,12 @@ func (s *Server) SetStrictMTLSIdentity(on bool) { s.strictMTLSIdentity = on }
 // session bearer is authenticated as the real user. The flag is the kill switch.
 func (s *Server) SetForwardedIdentity(on bool) { s.forwardedIdentity = on }
 
+// SetRBACRealm sets this node's opt-in for realm-aware role-binding grammar.
+// The flag is the reversible kill switch; realm enforcement in GrantRole is
+// gated by this flag AND the RBACRealmV1 latch (see rbacRealmConfigured /
+// rbacRealmLatched).
+func (s *Server) SetRBACRealm(on bool) { s.rbacRealm = on }
+
 // skipAuth lists RPC methods that bypass authentication.
 var skipAuth = map[string]bool{
 	"/litevirt.v1.LiteVirt/Ping":       true,
@@ -302,6 +308,20 @@ func (s *Server) strictMTLSEnforced(ctx context.Context) bool {
 // strict mTLS — the flag is the kill switch, short-circuiting the gate.
 func (s *Server) forwardedIdentityEnforced(ctx context.Context) bool {
 	return s.forwardedIdentity && s.gate != nil && s.gate.Enforced(ctx, capabilities.ForwardedIdentityV1)
+}
+
+// rbacRealmConfigured reports whether the operator has opted this node into
+// realm-aware role-binding grammar (the auth.rbac_realm kill switch). When
+// false the node keeps legacy behavior: a bare user:<name> grant is accepted
+// as-is (inert, but preserved for mixed-version compatibility).
+func (s *Server) rbacRealmConfigured() bool { return s.rbacRealm }
+
+// rbacRealmLatched reports whether realm-aware grammar is FULLY active: the
+// config flag AND the RBACRealmV1 capability latched cluster-wide. Only then is
+// it safe to auto-resolve a bare grant to canonical form — while any peer might
+// still mint bare bindings (pre-latch), we refuse rather than canonicalize.
+func (s *Server) rbacRealmLatched(ctx context.Context) bool {
+	return s.rbacRealm && s.gate != nil && s.gate.Enforced(ctx, capabilities.RBACRealmV1)
 }
 
 // fwdBearerFromCtx returns the forwarded user bearer relayed by an entry node
@@ -550,7 +570,7 @@ func (s *Server) RequirePerm(ctx context.Context, path, verb, fallbackRole strin
 	}
 
 	if s != nil && s.authEngine != nil {
-		principalIDs := principalsForCaller(user, role)
+		principalIDs := principalsForCaller(user, role, callerRealm(ctx))
 		if s.authEngine.HasAnyBinding(principalIDs) {
 			if s.authEngine.Allowed(principalIDs, verb, path) {
 				return nil
@@ -582,7 +602,7 @@ func (s *Server) requirePermPrecheck(ctx context.Context, fallbackRole string) e
 		return status.Error(codes.Unauthenticated, "no authenticated principal")
 	}
 	if s != nil && s.authEngine != nil {
-		principalIDs := principalsForCaller(user, callerRole(ctx))
+		principalIDs := principalsForCaller(user, callerRole(ctx), callerRealm(ctx))
 		if s.authEngine.HasAnyBinding(principalIDs) {
 			// Binding-holder: defer to the per-path check after fetch.
 			return nil
@@ -644,21 +664,26 @@ func canonicalScopePath(p string) string {
 	return p
 }
 
-// principalsForCaller is the canonical mapping from (user, legacy-role)
-// to the principal IDs the auth engine evaluates against. Always emits
-// `user:<u>@local` (since today's only realm is local), and a synthetic
-// `group:<role>@local` so legacy roles can be granted via role-bindings:
+// principalsForCaller is the canonical mapping from (user, legacy-role, realm)
+// to the principal IDs the auth engine evaluates against. Emits the
+// realm-qualified `user:<u>@<realm>` and a synthetic `group:<role>@<realm>` so
+// legacy roles can be granted via role-bindings:
 //
 //	# Grant Admin to all admins:
 //	lv role grant Admin group:admin@local --path /
 //
-// When OIDC/LDAP land, this helper learns to accept the realm-aware
-// Principal struct in context and emit `user:<sub>@<realm>` plus
-// `group:<g>@<realm>` for each remote group.
-func principalsForCaller(user, role string) []string {
-	out := []string{"user:" + user + "@local"}
+// realm is the caller's authenticated realm (callerRealm); it defaults to
+// "local" so local users and callers without a realm in context behave exactly
+// as before. External OIDC/LDAP GROUP bindings still do not work — Principal
+// groups are not session-persisted yet (documented follow-up) — but the USER
+// principal is now realm-correct for every realm.
+func principalsForCaller(user, role, realm string) []string {
+	if realm == "" {
+		realm = "local"
+	}
+	out := []string{"user:" + user + "@" + realm}
 	if role != "" {
-		out = append(out, "group:"+role+"@local")
+		out = append(out, "group:"+role+"@"+realm)
 	}
 	return out
 }

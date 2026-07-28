@@ -39,6 +39,7 @@ const (
 	LiteVirt_CreateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/CreateVM"
 	LiteVirt_ListVMs_FullMethodName                    = "/litevirt.v1.LiteVirt/ListVMs"
 	LiteVirt_InspectVM_FullMethodName                  = "/litevirt.v1.LiteVirt/InspectVM"
+	LiteVirt_ListVMHardware_FullMethodName             = "/litevirt.v1.LiteVirt/ListVMHardware"
 	LiteVirt_StartVM_FullMethodName                    = "/litevirt.v1.LiteVirt/StartVM"
 	LiteVirt_StopVM_FullMethodName                     = "/litevirt.v1.LiteVirt/StopVM"
 	LiteVirt_RestartVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestartVM"
@@ -46,6 +47,7 @@ const (
 	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
 	LiteVirt_CheckVMRuntime_FullMethodName             = "/litevirt.v1.LiteVirt/CheckVMRuntime"
 	LiteVirt_CheckContainerRuntime_FullMethodName      = "/litevirt.v1.LiteVirt/CheckContainerRuntime"
+	LiteVirt_ReportRuntime_FullMethodName              = "/litevirt.v1.LiteVirt/ReportRuntime"
 	LiteVirt_CheckVIPParticipant_FullMethodName        = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
 	LiteVirt_RelayCheckVIPParticipant_FullMethodName   = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
 	LiteVirt_CheckLBPresent_FullMethodName             = "/litevirt.v1.LiteVirt/CheckLBPresent"
@@ -121,6 +123,9 @@ const (
 	LiteVirt_GrantRole_FullMethodName                  = "/litevirt.v1.LiteVirt/GrantRole"
 	LiteVirt_RevokeRole_FullMethodName                 = "/litevirt.v1.LiteVirt/RevokeRole"
 	LiteVirt_ListRoleBindings_FullMethodName           = "/litevirt.v1.LiteVirt/ListRoleBindings"
+	LiteVirt_NormalizeRoleBindings_FullMethodName      = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
+	LiteVirt_GetVMOperation_FullMethodName             = "/litevirt.v1.LiteVirt/GetVMOperation"
+	LiteVirt_AbortVMOperation_FullMethodName           = "/litevirt.v1.LiteVirt/AbortVMOperation"
 	LiteVirt_BeginWebAuthnRegistration_FullMethodName  = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
 	LiteVirt_FinishWebAuthnRegistration_FullMethodName = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
 	LiteVirt_BeginWebAuthnLogin_FullMethodName         = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
@@ -203,6 +208,8 @@ const (
 	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
 	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
 	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
+	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
+	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
 	LiteVirt_DiagnoseDivergence_FullMethodName         = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
 	LiteVirt_ScanSensitiveDivergence_FullMethodName    = "/litevirt.v1.LiteVirt/ScanSensitiveDivergence"
 	LiteVirt_PushMutations_FullMethodName              = "/litevirt.v1.LiteVirt/PushMutations"
@@ -270,6 +277,7 @@ type LiteVirtClient interface {
 	CreateVM(ctx context.Context, in *CreateVMRequest, opts ...grpc.CallOption) (*VM, error)
 	ListVMs(ctx context.Context, in *ListVMsRequest, opts ...grpc.CallOption) (*ListVMsResponse, error)
 	InspectVM(ctx context.Context, in *InspectVMRequest, opts ...grpc.CallOption) (*VM, error)
+	ListVMHardware(ctx context.Context, in *ListVMHardwareRequest, opts ...grpc.CallOption) (*ListVMHardwareResponse, error)
 	StartVM(ctx context.Context, in *StartVMRequest, opts ...grpc.CallOption) (*VM, error)
 	StopVM(ctx context.Context, in *StopVMRequest, opts ...grpc.CallOption) (*VM, error)
 	RestartVM(ctx context.Context, in *RestartVMRequest, opts ...grpc.CallOption) (*VM, error)
@@ -277,6 +285,7 @@ type LiteVirtClient interface {
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
 	CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeRequest, opts ...grpc.CallOption) (*CheckVMRuntimeResponse, error)
 	CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error)
+	ReportRuntime(ctx context.Context, in *ReportRuntimeRequest, opts ...grpc.CallOption) (*ReportRuntimeResponse, error)
 	CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error)
@@ -372,6 +381,9 @@ type LiteVirtClient interface {
 	GrantRole(ctx context.Context, in *GrantRoleRequest, opts ...grpc.CallOption) (*GrantRoleResponse, error)
 	RevokeRole(ctx context.Context, in *RevokeRoleRequest, opts ...grpc.CallOption) (*RevokeRoleResponse, error)
 	ListRoleBindings(ctx context.Context, in *ListRoleBindingsRequest, opts ...grpc.CallOption) (*ListRoleBindingsResponse, error)
+	NormalizeRoleBindings(ctx context.Context, in *NormalizeRoleBindingsRequest, opts ...grpc.CallOption) (*NormalizeRoleBindingsResponse, error)
+	GetVMOperation(ctx context.Context, in *GetVMOperationRequest, opts ...grpc.CallOption) (*GetVMOperationResponse, error)
+	AbortVMOperation(ctx context.Context, in *AbortVMOperationRequest, opts ...grpc.CallOption) (*AbortVMOperationResponse, error)
 	BeginWebAuthnRegistration(ctx context.Context, in *BeginWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(ctx context.Context, in *FinishWebAuthnRegistrationRequest, opts ...grpc.CallOption) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(ctx context.Context, in *BeginWebAuthnLoginRequest, opts ...grpc.CallOption) (*BeginWebAuthnLoginResponse, error)
@@ -482,6 +494,10 @@ type LiteVirtClient interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error)
+	// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
+	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
+	TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error)
+	GetClusterStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ClusterStateDigestResponse, error)
 	// ── Divergence scanner (Phase 0) ──
 	// DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
 	// and returns a classified cross-node divergence report. ScanSensitiveDivergence:
@@ -790,6 +806,16 @@ func (c *liteVirtClient) InspectVM(ctx context.Context, in *InspectVMRequest, op
 	return out, nil
 }
 
+func (c *liteVirtClient) ListVMHardware(ctx context.Context, in *ListVMHardwareRequest, opts ...grpc.CallOption) (*ListVMHardwareResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListVMHardwareResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListVMHardware_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) StartVM(ctx context.Context, in *StartVMRequest, opts ...grpc.CallOption) (*VM, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VM)
@@ -854,6 +880,16 @@ func (c *liteVirtClient) CheckContainerRuntime(ctx context.Context, in *CheckCon
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckContainerRuntimeResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_CheckContainerRuntime_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReportRuntime(ctx context.Context, in *ReportRuntimeRequest, opts ...grpc.CallOption) (*ReportRuntimeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportRuntimeResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReportRuntime_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1709,6 +1745,36 @@ func (c *liteVirtClient) ListRoleBindings(ctx context.Context, in *ListRoleBindi
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListRoleBindingsResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ListRoleBindings_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) NormalizeRoleBindings(ctx context.Context, in *NormalizeRoleBindingsRequest, opts ...grpc.CallOption) (*NormalizeRoleBindingsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NormalizeRoleBindingsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_NormalizeRoleBindings_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetVMOperation(ctx context.Context, in *GetVMOperationRequest, opts ...grpc.CallOption) (*GetVMOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetVMOperationResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetVMOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) AbortVMOperation(ctx context.Context, in *AbortVMOperationRequest, opts ...grpc.CallOption) (*AbortVMOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AbortVMOperationResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_AbortVMOperation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2625,6 +2691,26 @@ func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *Sensi
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
+func (c *liteVirtClient) TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TriggerAntiEntropyResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_TriggerAntiEntropy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetClusterStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ClusterStateDigestResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClusterStateDigestResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetClusterStateDigest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) DiagnoseDivergence(ctx context.Context, in *DiagnoseDivergenceRequest, opts ...grpc.CallOption) (*DivergenceReport, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DivergenceReport)
@@ -2996,6 +3082,7 @@ type LiteVirtServer interface {
 	CreateVM(context.Context, *CreateVMRequest) (*VM, error)
 	ListVMs(context.Context, *ListVMsRequest) (*ListVMsResponse, error)
 	InspectVM(context.Context, *InspectVMRequest) (*VM, error)
+	ListVMHardware(context.Context, *ListVMHardwareRequest) (*ListVMHardwareResponse, error)
 	StartVM(context.Context, *StartVMRequest) (*VM, error)
 	StopVM(context.Context, *StopVMRequest) (*VM, error)
 	RestartVM(context.Context, *RestartVMRequest) (*VM, error)
@@ -3003,6 +3090,7 @@ type LiteVirtServer interface {
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
 	CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error)
 	CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error)
+	ReportRuntime(context.Context, *ReportRuntimeRequest) (*ReportRuntimeResponse, error)
 	CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error)
@@ -3098,6 +3186,9 @@ type LiteVirtServer interface {
 	GrantRole(context.Context, *GrantRoleRequest) (*GrantRoleResponse, error)
 	RevokeRole(context.Context, *RevokeRoleRequest) (*RevokeRoleResponse, error)
 	ListRoleBindings(context.Context, *ListRoleBindingsRequest) (*ListRoleBindingsResponse, error)
+	NormalizeRoleBindings(context.Context, *NormalizeRoleBindingsRequest) (*NormalizeRoleBindingsResponse, error)
+	GetVMOperation(context.Context, *GetVMOperationRequest) (*GetVMOperationResponse, error)
+	AbortVMOperation(context.Context, *AbortVMOperationRequest) (*AbortVMOperationResponse, error)
 	BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error)
 	FinishWebAuthnRegistration(context.Context, *FinishWebAuthnRegistrationRequest) (*FinishWebAuthnRegistrationResponse, error)
 	BeginWebAuthnLogin(context.Context, *BeginWebAuthnLoginRequest) (*BeginWebAuthnLoginResponse, error)
@@ -3208,6 +3299,10 @@ type LiteVirtServer interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(context.Context, *SensitiveStateRequest) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error
+	// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
+	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
+	TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error)
+	GetClusterStateDigest(context.Context, *emptypb.Empty) (*ClusterStateDigestResponse, error)
 	// ── Divergence scanner (Phase 0) ──
 	// DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
 	// and returns a classified cross-node divergence report. ScanSensitiveDivergence:
@@ -3350,6 +3445,9 @@ func (UnimplementedLiteVirtServer) ListVMs(context.Context, *ListVMsRequest) (*L
 func (UnimplementedLiteVirtServer) InspectVM(context.Context, *InspectVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method InspectVM not implemented")
 }
+func (UnimplementedLiteVirtServer) ListVMHardware(context.Context, *ListVMHardwareRequest) (*ListVMHardwareResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListVMHardware not implemented")
+}
 func (UnimplementedLiteVirtServer) StartVM(context.Context, *StartVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartVM not implemented")
 }
@@ -3370,6 +3468,9 @@ func (UnimplementedLiteVirtServer) CheckVMRuntime(context.Context, *CheckVMRunti
 }
 func (UnimplementedLiteVirtServer) CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckContainerRuntime not implemented")
+}
+func (UnimplementedLiteVirtServer) ReportRuntime(context.Context, *ReportRuntimeRequest) (*ReportRuntimeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportRuntime not implemented")
 }
 func (UnimplementedLiteVirtServer) CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckVIPParticipant not implemented")
@@ -3595,6 +3696,15 @@ func (UnimplementedLiteVirtServer) RevokeRole(context.Context, *RevokeRoleReques
 }
 func (UnimplementedLiteVirtServer) ListRoleBindings(context.Context, *ListRoleBindingsRequest) (*ListRoleBindingsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListRoleBindings not implemented")
+}
+func (UnimplementedLiteVirtServer) NormalizeRoleBindings(context.Context, *NormalizeRoleBindingsRequest) (*NormalizeRoleBindingsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method NormalizeRoleBindings not implemented")
+}
+func (UnimplementedLiteVirtServer) GetVMOperation(context.Context, *GetVMOperationRequest) (*GetVMOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetVMOperation not implemented")
+}
+func (UnimplementedLiteVirtServer) AbortVMOperation(context.Context, *AbortVMOperationRequest) (*AbortVMOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbortVMOperation not implemented")
 }
 func (UnimplementedLiteVirtServer) BeginWebAuthnRegistration(context.Context, *BeginWebAuthnRegistrationRequest) (*BeginWebAuthnRegistrationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BeginWebAuthnRegistration not implemented")
@@ -3841,6 +3951,12 @@ func (UnimplementedLiteVirtServer) GetSensitiveStateDigest(context.Context, *Sen
 }
 func (UnimplementedLiteVirtServer) StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error {
 	return status.Error(codes.Unimplemented, "method StreamSensitiveStateDump not implemented")
+}
+func (UnimplementedLiteVirtServer) TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TriggerAntiEntropy not implemented")
+}
+func (UnimplementedLiteVirtServer) GetClusterStateDigest(context.Context, *emptypb.Empty) (*ClusterStateDigestResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetClusterStateDigest not implemented")
 }
 func (UnimplementedLiteVirtServer) DiagnoseDivergence(context.Context, *DiagnoseDivergenceRequest) (*DivergenceReport, error) {
 	return nil, status.Error(codes.Unimplemented, "method DiagnoseDivergence not implemented")
@@ -4258,6 +4374,24 @@ func _LiteVirt_InspectVM_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ListVMHardware_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListVMHardwareRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListVMHardware(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListVMHardware_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListVMHardware(ctx, req.(*ListVMHardwareRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_StartVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StartVMRequest)
 	if err := dec(in); err != nil {
@@ -4380,6 +4514,24 @@ func _LiteVirt_CheckContainerRuntime_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, req.(*CheckContainerRuntimeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReportRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportRuntimeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReportRuntime(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReportRuntime_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReportRuntime(ctx, req.(*ReportRuntimeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -5605,6 +5757,60 @@ func _LiteVirt_ListRoleBindings_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ListRoleBindings(ctx, req.(*ListRoleBindingsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_NormalizeRoleBindings_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NormalizeRoleBindingsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).NormalizeRoleBindings(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_NormalizeRoleBindings_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).NormalizeRoleBindings(ctx, req.(*NormalizeRoleBindingsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetVMOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetVMOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetVMOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetVMOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetVMOperation(ctx, req.(*GetVMOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_AbortVMOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbortVMOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AbortVMOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AbortVMOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AbortVMOperation(ctx, req.(*AbortVMOperationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -6989,6 +7195,42 @@ func _LiteVirt_StreamSensitiveStateDump_Handler(srv interface{}, stream grpc.Ser
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpServer = grpc.ServerStreamingServer[StateDumpChunk]
 
+func _LiteVirt_TriggerAntiEntropy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TriggerAntiEntropyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).TriggerAntiEntropy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_TriggerAntiEntropy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).TriggerAntiEntropy(ctx, req.(*TriggerAntiEntropyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetClusterStateDigest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetClusterStateDigest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetClusterStateDigest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetClusterStateDigest(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_DiagnoseDivergence_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DiagnoseDivergenceRequest)
 	if err := dec(in); err != nil {
@@ -7615,6 +7857,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_InspectVM_Handler,
 		},
 		{
+			MethodName: "ListVMHardware",
+			Handler:    _LiteVirt_ListVMHardware_Handler,
+		},
+		{
 			MethodName: "StartVM",
 			Handler:    _LiteVirt_StartVM_Handler,
 		},
@@ -7641,6 +7887,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckContainerRuntime",
 			Handler:    _LiteVirt_CheckContainerRuntime_Handler,
+		},
+		{
+			MethodName: "ReportRuntime",
+			Handler:    _LiteVirt_ReportRuntime_Handler,
 		},
 		{
 			MethodName: "CheckVIPParticipant",
@@ -7881,6 +8131,18 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListRoleBindings",
 			Handler:    _LiteVirt_ListRoleBindings_Handler,
+		},
+		{
+			MethodName: "NormalizeRoleBindings",
+			Handler:    _LiteVirt_NormalizeRoleBindings_Handler,
+		},
+		{
+			MethodName: "GetVMOperation",
+			Handler:    _LiteVirt_GetVMOperation_Handler,
+		},
+		{
+			MethodName: "AbortVMOperation",
+			Handler:    _LiteVirt_AbortVMOperation_Handler,
 		},
 		{
 			MethodName: "BeginWebAuthnRegistration",
@@ -8161,6 +8423,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSensitiveStateDigest",
 			Handler:    _LiteVirt_GetSensitiveStateDigest_Handler,
+		},
+		{
+			MethodName: "TriggerAntiEntropy",
+			Handler:    _LiteVirt_TriggerAntiEntropy_Handler,
+		},
+		{
+			MethodName: "GetClusterStateDigest",
+			Handler:    _LiteVirt_GetClusterStateDigest_Handler,
 		},
 		{
 			MethodName: "DiagnoseDivergence",

@@ -124,8 +124,10 @@ func TestFleet_AntiEntropyLWWConflict(t *testing.T) {
 	// Conflict 1: pure HLC — B's write is newer.
 	seed(a, "wl", "10.0.0.1", hlcOld)
 	seed(b, "wl", "10.0.0.2", hlcNew)
-	// Conflict 2: mixed format — A has a (lexically huge) RFC3339, B has HLC.
-	seed(a, "wl2", "10.0.0.1", "2099-01-01T00:00:00Z")
+	// Conflict 2: mixed format — A has a legacy RFC3339 that sorts lexically ABOVE any
+	// HLC but is an OLDER instant than B's HLC (hlcNew ≈ 2033); instant-based ordering
+	// must let the fresher HLC win.
+	seed(a, "wl2", "10.0.0.1", "2020-01-01T00:00:00Z")
 	seed(b, "wl2", "10.0.0.2", hlcNew)
 
 	// Bidirectional anti-entropy: merge each node's dump into the other.

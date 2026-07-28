@@ -32,7 +32,7 @@ type SGRule struct {
 func InsertSecurityGroup(ctx context.Context, c *Client, sg SecurityGroup) error {
 	now := c.NowTS()
 	if sg.CreatedAt == "" {
-		sg.CreatedAt = now
+		sg.CreatedAt = nowRFC3339() // created_at is wall/display, never the HLC key
 	}
 	return c.Execute(ctx,
 		`INSERT INTO security_groups (id, name, stack_name, created_at, updated_at)

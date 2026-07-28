@@ -164,7 +164,7 @@ func DeleteContainerInterfaces(ctx context.Context, c *Client, hostName, ctName 
 	return c.Execute(ctx,
 		`UPDATE container_interfaces SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`,
-		now, now, hostName, ctName)
+		nowRFC3339(), now, hostName, ctName)
 }
 
 // UpdateContainerInterfaceIP records a discovered (e.g. DHCP) address on a NIC.

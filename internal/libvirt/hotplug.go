@@ -6,8 +6,11 @@ import (
 	golibvirt "github.com/digitalocean/go-libvirt"
 )
 
-// SetVCPUs hot-adds or reduces vCPUs on a running domain.
-// Only increases are supported on most hypervisors; reductions require guest cooperation.
+// SetVCPUs sets a domain's vCPU count, PERSISTENT config first (so a lost/failed
+// config write is surfaced BEFORE any live change — a live-only grow that doesn't
+// survive a reboot is worse than a refused resize), then the live count when the
+// domain is running, and finally verifies both views match the target. Only
+// increases are reliable live; reductions require guest cooperation.
 func (c *Client) SetVCPUs(name string, count int) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -16,31 +19,34 @@ func (c *Client) SetVCPUs(name string, count int) error {
 	if err != nil {
 		return fmt.Errorf("lookup domain %s: %w", name, err)
 	}
-	if err := c.virt.DomainSetVcpusFlags(dom, uint32(count), uint32(golibvirt.DomainAffectLive)); err != nil {
-		return fmt.Errorf("setvcpus %s to %d (live): %w", name, count, err)
+	// CONFIG first — propagate the error so a resize never applies live on top of a
+	// persistent-config write that didn't take.
+	if err := c.virt.DomainSetVcpusFlags(dom, uint32(count), uint32(golibvirt.DomainAffectConfig)); err != nil {
+		return fmt.Errorf("setvcpus %s to %d (config): %w", name, count, err)
 	}
-	// Also update the config so it persists across reboots.
-	c.virt.DomainSetVcpusFlags(dom, uint32(count), uint32(golibvirt.DomainAffectConfig)) //nolint:errcheck
+	running := c.domainRunning(dom)
+	if running {
+		if err := c.virt.DomainSetVcpusFlags(dom, uint32(count), uint32(golibvirt.DomainAffectLive)); err != nil {
+			return fmt.Errorf("setvcpus %s to %d (live): %w", name, count, err)
+		}
+	}
+	// Verify both views converged (config always; live only when running).
+	if got, gerr := c.virt.DomainGetVcpusFlags(dom, uint32(golibvirt.DomainAffectConfig)); gerr == nil && int(got) != count {
+		return fmt.Errorf("setvcpus %s: config view is %d after setting %d", name, got, count)
+	}
+	if running {
+		if got, gerr := c.virt.DomainGetVcpusFlags(dom, uint32(golibvirt.DomainAffectLive)); gerr == nil && int(got) != count {
+			return fmt.Errorf("setvcpus %s: live view is %d after setting %d", name, got, count)
+		}
+	}
 	return nil
 }
 
-// SetMemoryMiB hot-adds memory to a running domain.
-// Memory can only be increased up to the max memory configured at domain creation.
-func (c *Client) SetMemoryMiB(name string, mib int) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	dom, err := c.virt.DomainLookupByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-	kib := uint64(mib) * 1024
-	if err := c.virt.DomainSetMemoryFlags(dom, kib, uint32(golibvirt.DomainMemLive)); err != nil {
-		return fmt.Errorf("setmem %s to %d MiB (live): %w", name, mib, err)
-	}
-	// Also update the config so it persists across reboots.
-	c.virt.DomainSetMemoryFlags(dom, kib, uint32(golibvirt.DomainMemConfig)) //nolint:errcheck
-	return nil
+// domainRunning reports whether dom is in the running state (best-effort: an
+// introspection error is treated as not-running so a config-only apply is used).
+func (c *Client) domainRunning(dom golibvirt.Domain) bool {
+	state, _, err := c.virt.DomainGetState(dom, 0)
+	return err == nil && state == int32(golibvirt.DomainRunning)
 }
 
 // BlockResize live-resizes a block device on a running domain.

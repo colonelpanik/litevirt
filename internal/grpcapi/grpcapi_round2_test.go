@@ -43,10 +43,10 @@ func (g *flipExecGate) CapabilityActive(context.Context, string) (bool, string) 
 func (g *flipExecGate) CapabilityActiveForHealth(context.Context, string) (bool, string) {
 	return true, ""
 }
-func (g *flipExecGate) Enforced(context.Context, string) bool                   { return true }
-func (g *flipExecGate) Latched(string) bool                                     { return true }
-func (g *flipExecGate) PeerSupportsFresh(context.Context, string, string) bool  { return true }
-func (g *flipExecGate) HealthyPeers(context.Context) []string                   { return nil }
+func (g *flipExecGate) Enforced(context.Context, string) bool                  { return true }
+func (g *flipExecGate) Latched(string) bool                                    { return true }
+func (g *flipExecGate) PeerSupportsFresh(context.Context, string, string) bool { return true }
+func (g *flipExecGate) HealthyPeers(context.Context) []string                  { return nil }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -390,9 +390,9 @@ func TestAllocateDevices_TypeBased_NotEnough(t *testing.T) {
 		VendorID: "10de",
 	})
 
-	_, err := s.allocateDevices(ctx, "test-vm", []*pb.DeviceSpec{
+	_, _, err := s.allocateDevices(ctx, "test-vm", []*pb.DeviceSpec{
 		{Type: "gpu", Count: 2},
-	})
+	}, deviceLeaseStageBound)
 	if err == nil {
 		t.Fatal("expected error for insufficient devices")
 	}
@@ -420,9 +420,9 @@ func TestAllocateDevices_TypeBased_VendorFilter(t *testing.T) {
 	})
 
 	// Request 2 nvidia GPUs — only 1 available.
-	_, err := s.allocateDevices(ctx, "vendor-vm", []*pb.DeviceSpec{
+	_, _, err := s.allocateDevices(ctx, "vendor-vm", []*pb.DeviceSpec{
 		{Type: "gpu", Vendor: "10de", Count: 2},
-	})
+	}, deviceLeaseStageBound)
 	if err == nil {
 		t.Fatal("expected error for insufficient vendor-matched devices")
 	}
@@ -444,9 +444,9 @@ func TestAllocateDevices_ZeroCount_DefaultsToOne(t *testing.T) {
 
 	// Count=0 should default to 1 device.
 	// Will fail at vfio.Bind (no real sysfs), but validates allocation logic.
-	_, err := s.allocateDevices(ctx, "zero-cnt-vm", []*pb.DeviceSpec{
+	_, _, err := s.allocateDevices(ctx, "zero-cnt-vm", []*pb.DeviceSpec{
 		{Type: "nic", Count: 0},
-	})
+	}, deviceLeaseStageBound)
 	// If it errors, it should be Internal (vfio bind), not ResourceExhausted.
 	if err != nil {
 		if c := status.Code(err); c == codes.ResourceExhausted {
@@ -749,6 +749,7 @@ func TestCountVMDisks_None(t *testing.T) {
 
 func TestDetachDisk_DiskNotFound(t *testing.T) {
 	s := testServerR2(t)
+	setDeviceGate(s, true, false) // disk detach now requires operation_protocol_v1
 	ctx := adminCtx()
 
 	insertTestVMR2(t, ctx, s.db, "detach-disk-vm", "test-host", "running")

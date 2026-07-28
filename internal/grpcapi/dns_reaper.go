@@ -79,7 +79,8 @@ func (s *Server) ReapOrphanDNSRecords(ctx context.Context) {
 			continue
 		}
 		// Skip records too fresh to be sure they're orphans (replication lag).
-		if ts, perr := time.Parse(time.RFC3339, r.String("updated_at")); perr == nil && ts.After(cutoff) {
+		// updated_at is the LWW key (RFC3339 or HLC) — parse via the both-format helper.
+		if ts, ok := corrosion.ParseUpdatedAt(r.String("updated_at")); ok && ts.After(cutoff) {
 			continue
 		}
 		if err := dns.DeleteRecord(ctx, s.db, name); err != nil {

@@ -80,6 +80,37 @@ func TestClassifyTable_SchemaShapeMismatch(t *testing.T) {
 	}
 }
 
+// A pure column-ORDER difference (a fresh CREATE TABLE order vs an upgraded
+// ALTER ADD COLUMN that appends) must NOT be classified as a schema-shape
+// mismatch — the column SET is identical. Regression for the spurious
+// lb_configs schema_shape_mismatch.
+func TestClassifyTable_ColumnReorderNotShapeMismatch(t *testing.T) {
+	nodes := []string{"a", "b"}
+	snaps := map[string]NodeSnapshot{
+		"a": snap("a", "lb_configs", []string{"name", "updated_at", "project"}, map[string]RowMeta{"lb1": {RowHash: "h1"}}),
+		"b": snap("b", "lb_configs", []string{"name", "project", "updated_at"}, map[string]RowMeta{"lb1": {RowHash: "h1"}}),
+	}
+	for _, d := range ClassifyTable("lb_configs", nodes, snaps) {
+		if d.Class == ClassSchemaShapeMismatch {
+			t.Fatalf("column reorder must not be a schema_shape_mismatch, got %+v", d)
+		}
+	}
+}
+
+// A real column-SET difference (missing/extra column) is still flagged, even
+// when the shared columns are in a different order.
+func TestClassifyTable_MissingColumnStillFlagged(t *testing.T) {
+	nodes := []string{"a", "b"}
+	snaps := map[string]NodeSnapshot{
+		"a": snap("a", "vms", []string{"updated_at", "name"}, map[string]RowMeta{"vm1": {RowHash: "h1"}}),
+		"b": snap("b", "vms", []string{"name", "updated_at", "project"}, map[string]RowMeta{"vm1": {RowHash: "h1"}}),
+	}
+	ds := ClassifyTable("vms", nodes, snaps)
+	if len(ds) != 1 || ds[0].Class != ClassSchemaShapeMismatch {
+		t.Fatalf("want one schema_shape_mismatch for a differing column set, got %+v", ds)
+	}
+}
+
 // equal-content rows do not appear even when present on every node.
 func TestClassifyTable_ConvergedOmitted(t *testing.T) {
 	nodes := []string{"a", "b", "c"}

@@ -260,7 +260,7 @@ func DeleteBackupSchedule(ctx context.Context, c *Client, vmName, repo string) e
 		`UPDATE backup_schedules
 		 SET deleted_at = ?, updated_at = ?
 		 WHERE vm_name = ? AND repo = ?`,
-		now, now, vmName, repo)
+		nowRFC3339(), now, vmName, repo)
 }
 
 // MarkBackupScheduleRun records the outcome of a scheduled run; runErr
@@ -290,7 +290,7 @@ func SetReplicationCheckpoint(ctx context.Context, c *Client, vmName, repo, chec
 		// Reset: tombstone the row so the next run re-bases (parent = "").
 		return c.Execute(ctx,
 			`UPDATE replication_checkpoints SET deleted_at = ?, updated_at = ?
-			 WHERE vm_name = ? AND repo = ?`, now, now, vmName, repo)
+			 WHERE vm_name = ? AND repo = ?`, nowRFC3339(), now, vmName, repo)
 	}
 	return c.Execute(ctx,
 		`INSERT INTO replication_checkpoints (vm_name, repo, checkpoint, updated_at, deleted_at)

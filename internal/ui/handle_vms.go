@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -27,19 +28,32 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	vm, err := s.grpc.InspectVM(s.uiBearerCtx(r), &pb.InspectVMRequest{Name: name})
+	ctx := s.uiBearerCtx(r)
+	vm, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name})
 	if err != nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
-	hosts, _ := s.grpc.ListHosts(s.uiBearerCtx(r), &pb.ListHostsRequest{})
-	snapshots, _ := s.grpc.ListSnapshots(s.uiBearerCtx(r), &pb.ListSnapshotsRequest{VmName: name})
+	hosts, _ := s.grpc.ListHosts(ctx, &pb.ListHostsRequest{})
+	snapshots, _ := s.grpc.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VmName: name})
 	data := s.pageData(name, "vms")
 	data["VM"] = vm
 	data["Hosts"] = hosts.GetHosts()
 	data["Snapshots"] = snapshots.GetSnapshots()
 	data["Backups"] = s.vmBackupManifests(name)
 	data["Activity"] = s.vmActivity(r, name)
+
+	// ?tab=hardware server-renders the Hardware tab body on a full page load,
+	// not only via the htmx fragment route (handleVMHardwareTab below) — it
+	// reuses that exact same fragment template so there's one source of truth
+	// for the Hardware tab markup.
+	tab := r.URL.Query().Get("tab")
+	data["Tab"] = tab
+	if tab == "hardware" {
+		if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
+			data["HardwareTab"] = s.renderHardwareTabFragment(hardwareTabData(name, hw))
+		}
+	}
 	s.renderPage(w, "vm_detail.html", data)
 }
 
@@ -58,9 +72,11 @@ func (s *Server) handleNewVMModal(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
 	images, _ := s.grpc.ListImages(ctx, &emptypb.Empty{})
 	hosts, _ := s.grpc.ListHosts(ctx, &pb.ListHostsRequest{})
+	nets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
 	s.renderFragment(w, "vm_new_modal.html", map[string]any{
-		"Images": images.GetImages(),
-		"Hosts":  hosts.GetHosts(),
+		"Images":   images.GetImages(),
+		"Hosts":    hosts.GetHosts(),
+		"Networks": nets.GetNetworks(),
 	})
 }
 
@@ -80,6 +96,44 @@ func (s *Server) handleVMDetailPartial(w http.ResponseWriter, r *http.Request) {
 		"VM": vm, "Snapshots": snapshots.GetSnapshots(), "Backups": s.vmBackupManifests(name),
 		"Activity": s.vmActivity(r, name), "ClusterName": s.cluster,
 	})
+}
+
+// handleVMHardwareTab renders the Hardware tab fragment: per-section (disk/
+// NIC/PCI) tables from ListVMHardware, each with its own empty state and
+// header Add action, plus per-row detach controls that POST to the existing
+// detach handlers. When the VM's PCI adoption state is "blocked", the
+// template renders a banner with the reason and omits the mutation controls
+// instead.
+func (s *Server) handleVMHardwareTab(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ctx := s.uiBearerCtx(r)
+	resp, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name})
+	if err != nil {
+		http.Error(w, "VM not found", 404)
+		return
+	}
+	s.renderFragment(w, "hardware_tab.html", hardwareTabData(name, resp))
+}
+
+// hardwareTabData partitions a VM's hardware devices into per-section slices so the
+// Hardware tab can render each section (and its empty state) independently.
+func hardwareTabData(name string, resp *pb.ListVMHardwareResponse) map[string]any {
+	var disks, nics, pcis []*pb.HardwareDevice
+	for _, d := range resp.GetDevices() {
+		switch {
+		case d.GetDisk() != nil:
+			disks = append(disks, d)
+		case d.GetNic() != nil:
+			nics = append(nics, d)
+		case d.GetPci() != nil:
+			pcis = append(pcis, d)
+		}
+	}
+	return map[string]any{
+		"VM": name, "Disks": disks, "Nics": nics, "Pcis": pcis,
+		"AdoptionState": resp.GetHardwareAdoptionState(),
+		"AdoptionError": resp.GetHardwareAdoptionError(),
+	}
 }
 
 // handleVMPagePartial renders header + detail (for action button responses).
@@ -174,20 +228,39 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 		spec.CloudInit = &pb.CloudInitSpec{Userdata: ci}
 	}
 
-	// Networks — parallel arrays net_bridge[] and net_model[].
+	// Networks — one row per NIC, submitted as index-aligned parallel arrays.
+	// Iterate net_bridge[] and read the rest defensively: a stale/legacy modal
+	// submits only net_bridge[]/net_model[], so a missing secondary array (or a
+	// short one) must default to "" rather than panic. This keeps a cached old
+	// form working against the new handler during a rolling upgrade.
 	bridges := r.Form["net_bridge[]"]
+	customs := r.Form["net_bridge_custom[]"]
 	models := r.Form["net_model[]"]
-	for i, br := range bridges {
-		if br == "" {
+	ips := r.Form["net_ip[]"]
+	gateways := r.Form["net_gateway[]"]
+	at := func(a []string, i int) string {
+		if i < len(a) {
+			return a[i]
+		}
+		return ""
+	}
+	for i := range bridges {
+		bridge := strings.TrimSpace(at(bridges, i))
+		if bridge == "__custom__" {
+			bridge = strings.TrimSpace(at(customs, i))
+		}
+		if bridge == "" {
 			continue
 		}
 		model := "virtio"
-		if i < len(models) && models[i] != "" {
-			model = models[i]
+		if m := at(models, i); m != "" {
+			model = m
 		}
 		spec.Network = append(spec.Network, &pb.NetworkAttachment{
-			Name:  br,
-			Model: model,
+			Name:    bridge,
+			Model:   model,
+			Ip:      strings.TrimSpace(at(ips, i)),
+			Gateway: strings.TrimSpace(at(gateways, i)),
 		})
 	}
 
@@ -590,12 +663,11 @@ func (s *Server) handleEditVMModal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "VM not found", 404)
 		return
 	}
-	networks, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	// Disks/NICs/PCI are managed exclusively via the Hardware tab now (Task
+	// 8.3); the modal only needs the VM itself for its Resources/Lifecycle
+	// panes and the "Manage hardware" link.
 	s.renderFragment(w, "vm_edit_modal.html", map[string]any{
-		"VM":         vm,
-		"Disks":      vm.GetDisks(),
-		"Interfaces": vm.GetInterfaces(),
-		"Networks":   networks.GetNetworks(),
+		"VM": vm,
 	})
 }
 
@@ -722,9 +794,10 @@ func (s *Server) handleAttachDisk(w http.ResponseWriter, r *http.Request) {
 	_, err := s.grpc.AttachDevice(s.uiBearerCtx(r), &pb.AttachDeviceRequest{
 		VmName: name,
 		Disk: &pb.DiskSpec{
-			Name: r.FormValue("name"),
-			Size: fmt.Sprintf("%dG", sizeGiB),
-			Bus:  r.FormValue("bus"),
+			Name:    r.FormValue("name"),
+			Size:    fmt.Sprintf("%dG", sizeGiB),
+			Bus:     r.FormValue("bus"),
+			Storage: r.FormValue("storage"),
 		},
 	})
 	if err != nil {
@@ -734,6 +807,55 @@ func (s *Server) handleAttachDisk(w http.ResponseWriter, r *http.Request) {
 	}
 	sendToast(w, "Disk attached", "success")
 	w.WriteHeader(http.StatusOK)
+}
+
+// nextDiskName returns the lowest-numbered "dataN" name not already in use,
+// so the Add-disk modal can prefill a sensible default instead of leaving
+// the operator to invent one. Non-dataN names (e.g. "root") are ignored.
+func nextDiskName(existing []string) string {
+	used := make(map[string]bool, len(existing))
+	for _, n := range existing {
+		used[n] = true
+	}
+	for i := 0; ; i++ {
+		if cand := fmt.Sprintf("data%d", i); !used[cand] {
+			return cand
+		}
+	}
+}
+
+// handleAddDiskModal renders the Add-disk modal for a VM: the name field
+// prefilled with the next free dataN slot (from the VM's current disks via
+// ListVMHardware) and a storage-pool dropdown scoped to the VM's host (via a
+// local Corrosion read, when available — an empty host lists every pool).
+func (s *Server) handleAddDiskModal(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ctx := s.uiBearerCtx(r)
+	var existing []string
+	if hw, err := s.grpc.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: name}); err == nil {
+		for _, d := range hw.GetDevices() {
+			if disk := d.GetDisk(); disk != nil {
+				existing = append(existing, disk.GetDeviceId())
+			}
+		}
+	}
+	host := ""
+	if s.db != nil {
+		if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
+			host = vm.HostName
+		}
+	}
+	var pools []string
+	if resp, err := s.grpc.ListStoragePools(ctx, &pb.ListStoragePoolsRequest{}); err == nil {
+		for _, p := range resp.GetPools() {
+			if host == "" || p.GetHost() == host {
+				pools = append(pools, p.GetName())
+			}
+		}
+	}
+	s.renderFragment(w, "add_disk_modal.html", map[string]any{
+		"VMName": name, "DefaultName": nextDiskName(existing), "Pools": pools,
+	})
 }
 
 func (s *Server) handleResizeDiskModal(w http.ResponseWriter, r *http.Request) {
@@ -1050,17 +1172,45 @@ func (s *Server) handleDetachDisk(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleAddNICModal renders the "Add network interface" modal: a
+// managed-network/custom-bridge toggle populated from ListNetworks, plus the
+// security groups available to attach and optional static IP/gateway
+// fields. A failed or empty security-group read renders no SG control
+// (fail-safe — never blocks attaching a NIC).
+func (s *Server) handleAddNICModal(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ctx := s.uiBearerCtx(r)
+	nets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	var sgs []string
+	if s.db != nil {
+		if groups, err := corrosion.ListSecurityGroups(ctx, s.db, ""); err == nil {
+			for _, g := range groups {
+				sgs = append(sgs, g.Name)
+			}
+		}
+	}
+	s.renderFragment(w, "add_nic_modal.html", map[string]any{
+		"VMName": name, "Networks": nets.GetNetworks(), "SecurityGroups": sgs,
+	})
+}
+
 func (s *Server) handleAttachNIC(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", 400)
 		return
 	}
+	bridge := r.FormValue("bridge")
+	if r.FormValue("mode") == "custom" {
+		bridge = r.FormValue("bridge_custom")
+	}
 	_, err := s.grpc.AttachDevice(s.uiBearerCtx(r), &pb.AttachDeviceRequest{
 		VmName: name,
 		Nic: &pb.NetworkAttachment{
-			Name:  r.FormValue("bridge"),
-			Model: r.FormValue("model"),
+			Name:           bridge,
+			Model:          r.FormValue("model"),
+			Ip:             r.FormValue("ip"),
+			SecurityGroups: r.Form["security_groups"],
 		},
 	})
 	if err != nil {
@@ -1091,18 +1241,66 @@ func (s *Server) handleDetachNIC(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleAddPCIModal renders the Add-PCI modal: unassigned devices scanned from
+// the VM's host (via ListHostDevices, resolving the host through a local
+// Corrosion read like handleAddDiskModal) grouped into GPU/NIC/NVMe/Other
+// optgroups, plus the cluster-wide resource mappings available as a
+// host-portable alternative to a raw scanned address.
+func (s *Server) handleAddPCIModal(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	ctx := s.uiBearerCtx(r)
+	host := ""
+	if s.db != nil {
+		if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
+			host = vm.HostName
+		}
+	}
+	byType := map[string][]*pb.PCIDevice{}
+	if host != "" {
+		if resp, err := s.grpc.ListHostDevices(ctx, &pb.ListHostDevicesRequest{Name: host}); err == nil {
+			for _, d := range resp.GetDevices() {
+				if d.GetVmName() != "" {
+					continue // only unassigned devices are attachable
+				}
+				t := d.GetType()
+				if t != "gpu" && t != "network" && t != "nvme" {
+					t = "other"
+				}
+				byType[t] = append(byType[t], d)
+			}
+		}
+	}
+	var mappings []string
+	if resp, err := s.grpc.ListResourceMappings(ctx, &pb.ListResourceMappingsRequest{}); err == nil {
+		for _, mp := range resp.GetMappings() {
+			mappings = append(mappings, mp.GetName())
+		}
+	}
+	s.renderFragment(w, "add_pci_modal.html", map[string]any{
+		"VMName": name, "Host": host, "ByType": byType, "Mappings": mappings,
+	})
+}
+
 func (s *Server) handleAttachPCI(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", 400)
 		return
 	}
+	spec := &pb.DeviceSpec{}
+	switch r.FormValue("mode") {
+	case "mapping":
+		spec.Mapping = r.FormValue("mapping")
+	case "custom":
+		spec.Type = r.FormValue("type")
+		spec.Address = r.FormValue("address_custom")
+	default: // "scanned"
+		spec.Type = r.FormValue("type")
+		spec.Address = r.FormValue("address")
+	}
 	_, err := s.grpc.AttachDevice(s.uiBearerCtx(r), &pb.AttachDeviceRequest{
-		VmName: name,
-		PciDevice: &pb.DeviceSpec{
-			Type:    r.FormValue("type"),
-			Address: r.FormValue("address"),
-		},
+		VmName:    name,
+		PciDevice: spec,
 	})
 	if err != nil {
 		sendToast(w, "Attach PCI failed: "+err.Error(), "error")

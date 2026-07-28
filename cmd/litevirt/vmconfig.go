@@ -40,7 +40,8 @@ func newVMConfigCmd() *cobra.Command {
 					if err != nil {
 						return fmt.Errorf("set VM IP: %w", err)
 					}
-					fmt.Printf("VM %s IP set to %s on network %s\n", vm.Name, ip, network)
+					fmt.Printf("Recorded IP %s for VM %s on network %s (inventory; DNS publication attempted when a DNS domain is configured). This does not reconfigure a running guest — set a static IP at create time (cloud-init) or in the guest.\n",
+						ip, vm.Name, network)
 				}
 
 				if bootOrder != "" {
@@ -63,7 +64,7 @@ func newVMConfigCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&ip, "ip", "", "IP address to assign to the VM interface")
+	cmd.Flags().StringVar(&ip, "ip", "", "Record the VM interface's IP in inventory (DNS publication attempted when configured); does not reconfigure a running guest")
 	cmd.Flags().StringVar(&network, "network", "production", "Network name for the IP assignment")
 	cmd.Flags().StringVar(&bootOrder, "boot", "", "Boot order (disk|cdrom|network)")
 

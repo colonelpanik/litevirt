@@ -311,6 +311,13 @@ var capabilityMap = map[string]tableResolver{
 		// runtime_action_proofs row. On an exact-ts tie a differing pointer has no
 		// safe winner (content-max could pick a stale/other proof) → unresolved.
 		ruleColUnresolved("pending_action_id", "runtime_owned"),
+		// v41: monotonic per-VM counters — the higher value is authoritative (a newer
+		// ownership transfer / spec mutation), so an exact-ts tie converges to the max
+		// rather than coin-flipping content. active_operation_id is a control-plane
+		// pointer to the in-flight operations row → unresolved on a differing tie.
+		ruleNumericMax("vm_owner_epoch"),
+		ruleNumericMax("spec_generation"),
+		ruleColUnresolved("active_operation_id", "runtime_owned"),
 		ruleTombstone(),
 		ruleAnyColUnresolved([]string{"spec"}, "opaque"), // never content-max the VM definition
 		ruleContentMax(),
@@ -386,13 +393,23 @@ var capabilityMap = map[string]tableResolver{
 		}, "control_plane"),
 		ruleContentMax(),
 	}},
-	"host_labels":             {category: "content", chain: contentDefaultChain()},
-	"host_health":             {category: "content", chain: contentDefaultChain()},
-	"images":                  {category: "content", chain: contentDefaultChain()},
-	"image_hosts":             {category: "content", chain: contentDefaultChain()},
-	"stacks":                  {category: "content", chain: contentOpaqueChain("spec", "compose_yaml")},
-	"vm_interfaces":           {category: "content", chain: contentDefaultChain()},
-	"vm_disks":                {category: "content", chain: contentDefaultChain()},
+	"host_labels":   {category: "content", chain: contentDefaultChain()},
+	"host_health":   {category: "content", chain: contentDefaultChain()},
+	"images":        {category: "content", chain: contentDefaultChain()},
+	"image_hosts":   {category: "content", chain: contentDefaultChain()},
+	"stacks":        {category: "content", chain: contentOpaqueChain("spec", "compose_yaml")},
+	"vm_interfaces": {category: "content", chain: contentDefaultChain()},
+	"vm_disks":      {category: "content", chain: contentDefaultChain()},
+	// v42 hardware foundation: vm_nics is the multi-NIC successor to
+	// vm_interfaces — same shape, same treatment.
+	"vm_nics": {category: "content", chain: contentDefaultChain()},
+	// v42 hardware foundation: vm_pci_intent's selector_payload is a workload
+	// DEFINITION (what device the VM wants attached), like vms.spec — never
+	// content-max it. vm_pci_realizations is the RESOLVED/computed outcome of an
+	// intent (concrete address/alias), like vm_disks/host_pci_devices — plain
+	// content-default.
+	"vm_pci_intent":           {category: "content", chain: contentOpaqueChain("selector_payload")},
+	"vm_pci_realizations":     {category: "content", chain: contentDefaultChain()},
 	"snapshots":               {category: "content", chain: contentDefaultChain()},
 	"dns_records":             {category: "content", chain: contentDefaultChain()},
 	"fencing_log":             {category: "content", chain: contentDefaultChain()},
@@ -426,12 +443,30 @@ const (
 // trackUnresolved), and emits lww_tie_unresolved exactly once per distinct
 // (table,PK,content-pair). A converging decision (unresolved=false) lets the
 // caller clear any stale tracked entry for the PK.
-func (c *Client) resolveTie(table string, cols []string, local, incoming []interface{}, pkIdx []int, path resolveTiePath) (keepLocal, unresolved bool) {
+// resolveTie decides a tie WITHOUT mutating any shared state: it RETURNS the resolution and an
+// `effect` closure carrying the tracker/metric consequence (mark the tie unresolved, or count a
+// tie-break / tombstone). The caller MUST schedule effect via deferAfterCommit so it runs only after
+// the transaction commits — otherwise a later statement's rollback would leave a ghost marker (or a
+// counted tie for a change that never landed). effect is nil only on the unreachable terminal path.
+func (c *Client) resolveTie(table string, cols []string, local, incoming []interface{}, pkIdx []int, path resolveTiePath) (keepLocal, unresolved bool, effect func()) {
+	// Order-invariant equality short-circuit: if the two row images are byte-equal under the
+	// column-name-paired, type-normalized encoding (identical values regardless of physical column
+	// order or an int64-vs-float64 read path), this is not a conflict — keep local (== incoming),
+	// resolved, nothing to track. It never changes winner-selection: when the rows are equal,
+	// keeping local is byte-identical to taking incoming, so every node converges regardless of
+	// version. Falls through to the chain on any difference OR on an encode error, so a genuine tie
+	// — including a tombstone race, where deleted_at differs so the full-row compare is unequal —
+	// is still resolved by ruleTombstone / flagged by ruleUnresolved as before.
+	if a, ea := encodeRowCellsV2(cols, local); ea == nil {
+		if b, eb := encodeRowCellsV2(cols, incoming); eb == nil && a == b {
+			return true, false, nil
+		}
+	}
+	pk := pkKeyAt(incoming, pkIdx)
 	tr, ok := capabilityMap[table]
 	if !ok {
 		// Unreachable if the coverage test passes; fail safe (keep local + alert).
-		c.trackUnresolved(table, pkKeyAt(incoming, pkIdx), local, incoming, path, "uncategorized")
-		return true, true
+		return true, true, func() { c.trackUnresolved(table, pk, local, incoming, path, "uncategorized") }
 	}
 	rv := newRowView(cols, local, incoming)
 	for _, rule := range tr.chain {
@@ -440,19 +475,18 @@ func (c *Client) resolveTie(table string, cols []string, local, incoming []inter
 			continue
 		}
 		if d.unresolved {
-			c.trackUnresolved(table, pkKeyAt(incoming, pkIdx), local, incoming, path, d.category)
-			return true, true
+			category := d.category
+			return true, true, func() { c.trackUnresolved(table, pk, local, incoming, path, category) }
 		}
 		if d.resolver == "tombstone" {
-			c.observeTombstoneTie(table)
-		} else {
-			c.observeTieBreak(table, d.resolver, winnerLabel(d.keepLocal))
+			return d.keepLocal, false, func() { c.observeTombstoneTie(table) }
 		}
-		return d.keepLocal, false
+		resolver, keepLocal := d.resolver, d.keepLocal
+		return keepLocal, false, func() { c.observeTieBreak(table, resolver, winnerLabel(keepLocal)) }
 	}
 	// A well-formed chain always ends in a terminal rule, so this is unreachable;
-	// keep local defensively.
-	return true, true
+	// keep local defensively (no effect).
+	return true, true, nil
 }
 
 func winnerLabel(keepLocal bool) string {

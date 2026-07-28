@@ -150,9 +150,24 @@ type Fake struct {
 	// distinguish a verifier that waits from one that does not.
 	DeferLiveUnplug bool
 
+	// HonorUnplugOnRequest models a guest that IGNORES the first N-1 unplug requests
+	// and honors the Nth — the real behaviour behind the disk-detach failure found on
+	// hardware. A guest that has not yet enumerated a just-hot-added device never
+	// answers the ACPI/PCI eject, so the request is DROPPED rather than queued: no
+	// amount of waiting clears it, and only a re-request does. Measured on a 4-node
+	// lab, the device was still present 120s after the first request and left within
+	// 5s of the second.
+	//
+	// Requires DeferLiveUnplug. 0 means "never honor without an explicit
+	// AckLiveUnplug". Counted per domain across ALL device kinds, since it stands in
+	// for one guest's readiness rather than one device's.
+	HonorUnplugOnRequest int
+
 	// pendingUnplug holds live-view removals that a deferred unplug has requested but
 	// the guest has not yet acknowledged, per domain, in request order.
 	pendingUnplug map[string][]func()
+	// unplugRequests counts detach requests per domain, for HonorUnplugOnRequest.
+	unplugRequests map[string]int
 }
 
 // New returns a Fake ready to use. Safe for concurrent use.
@@ -166,20 +181,39 @@ func New() *Fake {
 		stats:       make(map[string]*libvirt.DomainStats),
 		reasons:     make(map[string]string),
 
-		pendingUnplug: make(map[string][]func()),
+		pendingUnplug:  make(map[string][]func()),
+		unplugRequests: make(map[string]int),
 
 		Now: time.Now,
 	}
 }
 
 // applyLiveUnplug performs a live-view removal now, or parks it for AckLiveUnplug
-// when DeferLiveUnplug models an unacknowledged guest. Caller holds f.mu.
+// when DeferLiveUnplug models an unacknowledged guest. With HonorUnplugOnRequest
+// set, the Nth request is honored immediately and every earlier one is DROPPED —
+// parked removals from ignored requests are discarded, because a guest that never
+// saw the eject has nothing queued to deliver later. Caller holds f.mu.
 func (f *Fake) applyLiveUnplug(domain string, remove func()) {
 	if !f.DeferLiveUnplug {
 		remove()
 		return
 	}
+	f.unplugRequests[domain]++
+	if n := f.HonorUnplugOnRequest; n > 0 && f.unplugRequests[domain] >= n {
+		delete(f.pendingUnplug, domain)
+		remove()
+		f.record("unplug-honored", domain, "request="+strconv.Itoa(f.unplugRequests[domain]))
+		return
+	}
 	f.pendingUnplug[domain] = append(f.pendingUnplug[domain], remove)
+}
+
+// UnplugRequests reports how many detach requests domain has received — the
+// assertion that a verifier really did RE-REQUEST rather than only poll.
+func (f *Fake) UnplugRequests(domain string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.unplugRequests[domain]
 }
 
 // AckLiveUnplug is the guest acknowledging every unplug requested so far on domain:

@@ -1042,17 +1042,21 @@ func (s *Server) failDeviceDetachClean(ctx context.Context, vm *corrosion.VMReco
 // forward compensation (leave NON-TERMINAL for recovery; never re-attach).
 func (s *Server) verifyDiskDetached(ctx context.Context, vmName, targetDev string, running bool) error {
 	if running {
-		// The live read WAITS: a successful DetachDisk only requested the unplug
-		// (see hotplug_unplug_wait.go). Reading once here reports a guest that has
-		// not yet acknowledged as a detach that failed.
-		err := waitDeviceGone(ctx, func() (bool, error) {
+		// The live read WAITS, and re-requests the detach while it waits: a
+		// successful DetachDisk only requested the unplug, and a guest that had not
+		// yet enumerated the device never answers the first request at all (see
+		// hotplug_unplug_wait.go).
+		st, err := waitDeviceGone(ctx, func() (bool, error) {
 			srcs, rerr := s.virt.DomainDiskSources(vmName)
 			if rerr != nil {
 				return false, fmt.Errorf("read live disks: %w", rerr)
 			}
 			_, present := srcs[targetDev]
 			return !present, nil
+		}, func() error {
+			return s.virt.DetachDisk(vmName, targetDev)
 		})
+		logUnplugWait("disk", vmName, targetDev, st, err)
 		switch {
 		case errors.Is(err, errUnplugTimeout):
 			return fmt.Errorf("disk %s still present in the live domain after detach", targetDev)

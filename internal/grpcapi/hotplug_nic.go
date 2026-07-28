@@ -793,15 +793,19 @@ func (s *Server) failNICDetachClean(ctx context.Context, vm *corrosion.VMRecord,
 // mirroring verifyDiskDetached.
 func (s *Server) verifyNICDetached(ctx context.Context, vmName, mac string, running bool) error {
 	if running {
-		// Waits for the same reason verifyDiskDetached does — NIC unplug is just as
-		// asynchronous; it simply tends to win the race that disk unplug loses.
-		err := waitDeviceGone(ctx, func() (bool, error) {
+		// Waits and re-requests for the same reason verifyDiskDetached does — NIC
+		// unplug is just as asynchronous; it simply tends to win the race that disk
+		// unplug loses.
+		st, err := waitDeviceGone(ctx, func() (bool, error) {
 			live, rerr := s.virt.DumpXML(vmName)
 			if rerr != nil {
 				return false, fmt.Errorf("read live domain: %w", rerr)
 			}
 			return !nicMacInXML(live, mac), nil
+		}, func() error {
+			return s.virt.DetachNIC(vmName, mac)
 		})
+		logUnplugWait("nic", vmName, mac, st, err)
 		switch {
 		case errors.Is(err, errUnplugTimeout):
 			return fmt.Errorf("nic %s still present in the live domain after detach", mac)

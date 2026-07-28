@@ -786,7 +786,7 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 			return
 		}
 	}
-	if err := s.verifyPCIDetached(ctx, vm.Name, memberAliases, running); err != nil {
+	if err := s.verifyPCIDetached(ctx, vm.Name, memberAliases, memberAddrs, running); err != nil {
 		slog.Error("hardware op recovery: pci detach absence unverifiable — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 		return
 	}

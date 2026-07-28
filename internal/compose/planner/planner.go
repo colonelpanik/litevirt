@@ -189,14 +189,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		placementVMNames = append(placementVMNames, op.VMName)
 	}
 
-	// Per-host running-container memory, mirroring corrosion.SumContainerMemoryByHost
-	// (state.Containers already excludes deleted rows).
-	ctMem := make(map[string]int)
-	for _, ct := range state.Containers {
-		if ct.State == "running" && ct.MemMiB > 0 {
-			ctMem[ct.HostName] += ct.MemMiB
-		}
-	}
+	ctMem := corrosion.ContainerMemoryByHost(state.Containers)
 	placements, err := placement.SelectBatch(state.Hosts, state.VMs, state.Devices, ctMem, placementReqs)
 	if err != nil {
 		return nil, fmt.Errorf("batch placement failed: %w", err)

@@ -85,8 +85,9 @@ func BuildSnapshot(ctx context.Context, db *corrosion.Client) (*ClusterSnapshot,
 }
 
 // AddContainerMemory folds per-host container memory (MiB) into MemUsed. Kept
-// separate from the constructors because the in-memory paths (SelectBatch, tests)
-// build from already-fetched slices and have no container data to pass.
+// separate from the constructors so callers that hold per-host container memory
+// (BuildSnapshot, SelectBatch) fold it in, and slice-only test constructors
+// need not.
 func (s *ClusterSnapshot) AddContainerMemory(byHost map[string]int) {
 	for host, mem := range byHost {
 		s.MemUsed[host] += mem

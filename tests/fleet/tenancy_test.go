@@ -16,8 +16,11 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-func TestFleet_TenancyQuotaAdmission(t *testing.T) {
-	c := New(t, Options{Nodes: 1})
+// seedQuotaProject is the single-node preamble shared by the tenancy-quota
+// tests: a usable image named "test" plus project "/acme" capped at the given
+// quota. Returns the node and its client.
+func seedQuotaProject(t *testing.T, c *Cluster, vcpuLimit, memMiBLimit int32) (*Node, pb.LiteVirtClient) {
+	t.Helper()
 	ctx := context.Background()
 	node := c.Nodes[0]
 	client := c.SelfClient(node)
@@ -31,8 +34,6 @@ func TestFleet_TenancyQuotaAdmission(t *testing.T) {
 	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
 		t.Fatalf("stage image file: %v", err)
 	}
-
-	// Create a project with a tight quota: 4 vCPU, 4 GiB RAM.
 	if _, err := client.CreateProject(ctx, &pb.CreateProjectRequest{
 		Name: "/acme", Display: "Acme Co",
 	}); err != nil {
@@ -40,11 +41,19 @@ func TestFleet_TenancyQuotaAdmission(t *testing.T) {
 	}
 	if _, err := client.SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
 		Quota: &pb.ProjectQuota{
-			ProjectName: "/acme", VcpuLimit: 4, MemMibLimit: 4096,
+			ProjectName: "/acme", VcpuLimit: vcpuLimit, MemMibLimit: memMiBLimit,
 		},
 	}); err != nil {
 		t.Fatalf("SetProjectQuota: %v", err)
 	}
+	return node, client
+}
+
+func TestFleet_TenancyQuotaAdmission(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	// Tight quota: 4 vCPU, 4 GiB RAM.
+	node, client := seedQuotaProject(t, c, 4, 4096)
 
 	// Under quota: 2 vCPU / 2 GiB. Must succeed.
 	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
@@ -149,25 +158,7 @@ func TestFleet_TenancyDefaultProjectUnbounded(t *testing.T) {
 func TestFleet_TenancyQuota_StopStartStaysWithinQuota(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	ctx := context.Background()
-	node := c.Nodes[0]
-	client := c.SelfClient(node)
-
-	if err := node.DB.Execute(ctx,
-		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
-		t.Fatalf("seed image: %v", err)
-	}
-	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
-		t.Fatalf("stage image file: %v", err)
-	}
-	if _, err := client.CreateProject(ctx, &pb.CreateProjectRequest{Name: "/acme", Display: "Acme Co"}); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	if _, err := client.SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
-		Quota: &pb.ProjectQuota{ProjectName: "/acme", VcpuLimit: 4, MemMibLimit: 4096},
-	}); err != nil {
-		t.Fatalf("SetProjectQuota: %v", err)
-	}
+	node, client := seedQuotaProject(t, c, 4, 4096)
 
 	// 3000 MiB fits the 4096 quota at create — but is over half of it, so a
 	// double-counting start-time check would compute 3000+3000 > 4096.
@@ -194,25 +185,7 @@ func TestFleet_TenancyQuota_StopStartStaysWithinQuota(t *testing.T) {
 func TestFleet_TenancyQuota_AllowOvercommitStillEnforcesQuota(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	ctx := context.Background()
-	node := c.Nodes[0]
-	client := c.SelfClient(node)
-
-	if err := node.DB.Execute(ctx,
-		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
-		t.Fatalf("seed image: %v", err)
-	}
-	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
-		t.Fatalf("stage image file: %v", err)
-	}
-	if _, err := client.CreateProject(ctx, &pb.CreateProjectRequest{Name: "/acme", Display: "Acme Co"}); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	if _, err := client.SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
-		Quota: &pb.ProjectQuota{ProjectName: "/acme", VcpuLimit: 4, MemMibLimit: 4096},
-	}); err != nil {
-		t.Fatalf("SetProjectQuota: %v", err)
-	}
+	node, client := seedQuotaProject(t, c, 4, 4096)
 
 	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
 		Spec: &pb.VMSpec{
@@ -248,25 +221,7 @@ func TestFleet_TenancyQuota_AllowOvercommitStillEnforcesQuota(t *testing.T) {
 func TestFleet_TenancyQuota_UpdateAllowOvercommitStillEnforcesQuota(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	ctx := context.Background()
-	node := c.Nodes[0]
-	client := c.SelfClient(node)
-
-	if err := node.DB.Execute(ctx,
-		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
-		t.Fatalf("seed image: %v", err)
-	}
-	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
-		t.Fatalf("stage image file: %v", err)
-	}
-	if _, err := client.CreateProject(ctx, &pb.CreateProjectRequest{Name: "/acme", Display: "Acme Co"}); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	if _, err := client.SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
-		Quota: &pb.ProjectQuota{ProjectName: "/acme", VcpuLimit: 8, MemMibLimit: 4096},
-	}); err != nil {
-		t.Fatalf("SetProjectQuota: %v", err)
-	}
+	node, client := seedQuotaProject(t, c, 8, 4096)
 	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
 		Spec: &pb.VMSpec{
 			Name: "grower", Image: "test", Cpu: 1, MemoryMib: 2048,

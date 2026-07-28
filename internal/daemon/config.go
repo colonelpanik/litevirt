@@ -641,27 +641,28 @@ type CapacityConfig struct {
 	VMMemoryOverheadMiB int `yaml:"vm_memory_overhead_mib,omitempty"`
 }
 
-// Policy converts the config into the corrosion capacity policy. A wholly unset
-// section yields the built-in defaults rather than a zeroed policy that would
-// make every host look full.
+// Policy converts the config into the corrosion capacity policy. Every
+// zero/unset field falls back to its built-in default individually, so a
+// partial capacity block (say, only cpu_overcommit_ratio) never silently
+// zeroes the host headroom. YAML omitempty cannot distinguish "wrote 0" from
+// "unset", so cluster-wide zero reserves are not expressible here — the
+// per-host override on the host record covers that rare case.
 func (c CapacityConfig) Policy() corrosion.CapacityPolicy {
-	if c == (CapacityConfig{}) {
-		return corrosion.DefaultCapacityPolicy()
-	}
 	d := corrosion.DefaultCapacityPolicy()
-	p := corrosion.CapacityPolicy{
-		CPUOvercommit:    c.CPUOvercommitRatio,
-		MemOvercommit:    c.MemOvercommitRatio,
-		CPUReserve:       c.HostCPUReserve,
-		MemReserveMiB:    c.HostMemoryReserveMiB,
-		MemReservePct:    c.HostMemoryReservePct,
-		VMMemOverheadMiB: c.VMMemoryOverheadMiB,
+	return corrosion.CapacityPolicy{
+		CPUOvercommit:    orDefault(c.CPUOvercommitRatio, d.CPUOvercommit),
+		MemOvercommit:    orDefault(c.MemOvercommitRatio, d.MemOvercommit),
+		CPUReserve:       orDefault(c.HostCPUReserve, d.CPUReserve),
+		MemReserveMiB:    orDefault(c.HostMemoryReserveMiB, d.MemReserveMiB),
+		MemReservePct:    orDefault(c.HostMemoryReservePct, d.MemReservePct),
+		VMMemOverheadMiB: orDefault(c.VMMemoryOverheadMiB, d.VMMemOverheadMiB),
 	}
-	if p.CPUOvercommit <= 0 {
-		p.CPUOvercommit = d.CPUOvercommit
+}
+
+// orDefault returns v, or d when v is zero/negative (i.e. unset in YAML).
+func orDefault[T interface{ ~int | ~float64 }](v, d T) T {
+	if v <= 0 {
+		return d
 	}
-	if p.MemOvercommit <= 0 {
-		p.MemOvercommit = d.MemOvercommit
-	}
-	return p
+	return v
 }

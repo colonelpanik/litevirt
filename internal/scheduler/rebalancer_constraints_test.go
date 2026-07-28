@@ -192,3 +192,18 @@ func TestRebalancer_NoMigrateOptsOut(t *testing.T) {
 func fName(i int) string {
 	return "filler-" + string(rune('a'+i))
 }
+
+// The rebalancer must score candidates under the cluster's configured capacity
+// policy — not the built-in defaults — or it will propose moves onto hosts
+// that admission (which uses the configured policy) then refuses.
+func TestBuildPlacementRequest_CarriesCapacityPolicy(t *testing.T) {
+	pol := corrosion.CapacityPolicy{
+		CPUOvercommit: 2.0, MemOvercommit: 1.0,
+		CPUReserve: 2, MemReserveMiB: 8192, MemReservePct: 10, VMMemOverheadMiB: 256,
+	}
+	vm := corrosion.VMRecord{Name: "vm1", CPUActual: 1, MemActual: 1024}
+	req := buildPlacementRequest(vm, nil, vmPolicy{}, pol)
+	if req.Capacity != pol {
+		t.Errorf("req.Capacity = %+v, want the configured policy %+v", req.Capacity, pol)
+	}
+}

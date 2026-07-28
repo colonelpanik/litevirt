@@ -244,38 +244,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 	var drainJobs []drainJob
 	for _, vm := range toMigrate {
-		placementReq := placement.Request{
-			VMName:       vm.Name,
-			CPUNeeded:    vm.CPUActual,
-			MemMiBNeeded: vm.MemActual,
-		}
-
-		// Extract placement constraints from stored VM spec.
-		if vm.Spec != "" {
-			spec := &pb.VMSpec{}
-			if err := json.Unmarshal([]byte(vm.Spec), spec); err == nil {
-				if p := spec.Placement; p != nil {
-					// Override PinHost — cannot pin to the host being drained.
-					if p.Host != "" && p.Host != req.Name {
-						placementReq.PinHost = p.Host
-					}
-					placementReq.AntiAffinity = p.AntiAffinity
-					placementReq.Affinity = p.Affinity
-					placementReq.RequireLabels = p.Require
-					placementReq.PreferLabels = p.Prefer
-					placementReq.Spread = p.Spread
-				}
-				for _, dev := range spec.Devices {
-					placementReq.Devices = append(placementReq.Devices, placement.DeviceRequest{
-						Type:   dev.Type,
-						Count:  int(dev.Count),
-						Vendor: dev.Vendor,
-					})
-				}
-				// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
-				addCapabilityLabels(&placementReq, spec)
-			}
-		}
+		placementReq := buildDrainPlacementRequest(vm, req.Name, s.capacity)
 
 		// Ensure the drained host is excluded via anti-affinity on itself.
 		// placement.Select() excludes non-active hosts, and we already set the host to "draining".
@@ -357,6 +326,46 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 
 	return nil
+}
+
+// buildDrainPlacementRequest constructs a placement request for a VM leaving
+// drainHost, honoring the constraints in its stored spec. A spec pin to the
+// draining host itself is dropped — the VM has to leave.
+func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacity corrosion.CapacityPolicy) placement.Request {
+	placementReq := placement.Request{
+		VMName:       vm.Name,
+		CPUNeeded:    vm.CPUActual,
+		MemMiBNeeded: vm.MemActual,
+		Capacity:     capacity,
+	}
+	if vm.Spec == "" {
+		return placementReq
+	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+		return placementReq
+	}
+	if p := spec.Placement; p != nil {
+		// Override PinHost — cannot pin to the host being drained.
+		if p.Host != "" && p.Host != drainHost {
+			placementReq.PinHost = p.Host
+		}
+		placementReq.AntiAffinity = p.AntiAffinity
+		placementReq.Affinity = p.Affinity
+		placementReq.RequireLabels = p.Require
+		placementReq.PreferLabels = p.Prefer
+		placementReq.Spread = p.Spread
+	}
+	for _, dev := range spec.Devices {
+		placementReq.Devices = append(placementReq.Devices, placement.DeviceRequest{
+			Type:   dev.Type,
+			Count:  int(dev.Count),
+			Vendor: dev.Vendor,
+		})
+	}
+	// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
+	addCapabilityLabels(&placementReq, spec)
+	return placementReq
 }
 
 // drainOneVM migrates a single VM to the target host. Returns progress message.

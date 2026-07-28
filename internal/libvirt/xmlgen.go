@@ -1030,3 +1030,35 @@ func InterfaceSourceByMAC(domXML, mac string) (ifaceType string, src ifaceSource
 	}
 	return "", ifaceSource{}, false
 }
+
+// DiskSourceByTarget returns the type and <source> of the disk whose <target dev>
+// is targetDev, so a detach carries what the domain ACTUALLY has. It is the disk
+// counterpart of InterfaceSourceByMAC and exists for the reason libvirt states:
+//
+//	The supplied XML description of the device should be as specific as its
+//	definition in the domain XML. [...] Using a partial definition, or attempting
+//	to detach a device that is not present in the domain XML, but shares some
+//	specific attributes with one that is present, may lead to unexpected results.
+//
+// DetachDisk otherwise sends `type="file"` with an EMPTY <source>, which matches
+// on target-dev alone and relies on no other disk sharing it. Returns ok=false
+// when no disk carries the target or the document is unparseable.
+func DiskSourceByTarget(domXML, targetDev string) (diskType string, src diskSource, ok bool) {
+	var d struct {
+		Disks []struct {
+			Type   string     `xml:"type,attr"`
+			Source diskSource `xml:"source"`
+			Target diskTarget `xml:"target"`
+		} `xml:"devices>disk"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return "", diskSource{}, false
+	}
+	want := strings.TrimSpace(targetDev)
+	for _, disk := range d.Disks {
+		if strings.TrimSpace(disk.Target.Dev) == want {
+			return disk.Type, disk.Source, true
+		}
+	}
+	return "", diskSource{}, false
+}

@@ -943,7 +943,7 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepAttached)
 
-	if err := s.verifyPCIDetached(ctx, vm.Name, memberAliases, running); err != nil {
+	if err := s.verifyPCIDetached(ctx, vm.Name, memberAliases, memberAddrs, running); err != nil {
 		slog.Error("pci detach: absence unverifiable — left recoverable", "vm", vm.Name, "op", opID, "error", err)
 		return nil, status.Errorf(codes.Internal, "pci detach for %q could not be verified; left recoverable: %v", vm.Name, err)
 	}
@@ -1004,7 +1004,7 @@ func (s *Server) failPCIDetachClean(ctx context.Context, vm *corrosion.VMRecord,
 // authoritative definition(s), mirroring verifyDiskDetached. On the RUNNING path
 // each alias must be absent from BOTH the live domain AND the persistent (inactive)
 // definition; on the STOPPED path only the inactive definition.
-func (s *Server) verifyPCIDetached(ctx context.Context, vmName string, memberAliases []string, running bool) error {
+func (s *Server) verifyPCIDetached(ctx context.Context, vmName string, memberAliases, memberAddrs []string, running bool) error {
 	inactive, ierr := s.virt.DumpXMLInactive(vmName)
 	if ierr != nil {
 		return fmt.Errorf("read inactive definition: %w", ierr)
@@ -1015,7 +1015,7 @@ func (s *Server) verifyPCIDetached(ctx context.Context, vmName string, memberAli
 		// aliases to leave; whichever is still there when the timeout expires is the
 		// one reported.
 		var lingering string
-		err := waitDeviceGone(ctx, func() (bool, error) {
+		st, err := waitDeviceGone(ctx, func() (bool, error) {
 			live, rerr := s.virt.DumpXML(vmName)
 			if rerr != nil {
 				return false, fmt.Errorf("read live domain: %w", rerr)
@@ -1028,7 +1028,18 @@ func (s *Server) verifyPCIDetached(ctx context.Context, vmName string, memberAli
 				}
 			}
 			return true, nil
+		}, func() error {
+			// Re-request every member: a multi-function device unplugs as a unit,
+			// and the first eject may have been dropped for any of them.
+			var firstErr error
+			for _, addr := range memberAddrs {
+				if rerr := s.virt.DetachHostdev(vmName, addr); rerr != nil && firstErr == nil {
+					firstErr = rerr
+				}
+			}
+			return firstErr
 		})
+		logUnplugWait("pci", vmName, strings.Join(memberAliases, ","), st, err)
 		switch {
 		case errors.Is(err, errUnplugTimeout):
 			return fmt.Errorf("hostdev %s still present in the live domain after detach", lingering)

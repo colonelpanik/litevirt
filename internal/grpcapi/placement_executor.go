@@ -77,6 +77,9 @@ func (s *Server) createVMPlacementRequest(ctx context.Context, spec *pb.VMSpec, 
 		req.RequireLabels = p.Require
 		req.PreferLabels = p.Prefer
 		req.Spread = p.Spread
+		if policy := placement.Policy(p.Policy); policy.Valid() {
+			req.Policy = policy
+		}
 		if p.MaxPerNode > 0 {
 			req.MaxPerNode = int(p.MaxPerNode)
 			req.VMBaseName = vmBaseName(spec.Name)

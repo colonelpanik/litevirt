@@ -123,6 +123,66 @@ func TestExecuteCreateVMRevalidatesHardConstraints(t *testing.T) {
 	}
 }
 
+func TestCreateVMPinnedPolicySpreadStrictRejectsPressure(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	s.capacity = corrosion.CapacityPolicy{
+		CPUOvercommit: 1, MemOvercommit: 1,
+		CPUReserve: 0, MemReserveMiB: 0, MemReservePct: 0,
+		VMMemOverheadMiB: 0,
+	}
+	insertPlacementExecutorHost(t, s, "test-host", 8, 8192, nil)
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
+		Name: "busy", HostName: "test-host", State: "running",
+		CPUActual: 4, MemActual: 4096,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM(busy): %v", err)
+	}
+
+	_, err := s.CreateVM(adminCtx(), &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "vm1", Cpu: 1, MemoryMib: 512,
+		Placement: &pb.PlacementSpec{
+			Host: "test-host", Policy: "spread-strict",
+		},
+	}})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("code = %v, want ResourceExhausted from protobuf spread-strict policy (err=%v)", got, err)
+	}
+}
+
+func TestExecuteCreateVMRevalidatesProtobufSpreadStrictPolicy(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	s.capacity = corrosion.CapacityPolicy{
+		CPUOvercommit: 1, MemOvercommit: 1,
+		CPUReserve: 0, MemReserveMiB: 0, MemReservePct: 0,
+		VMMemOverheadMiB: 0,
+	}
+	insertPlacementExecutorHost(t, s, "test-host", 8, 8192, nil)
+	insertPlacementExecutorHost(t, s, "entry", 8, 8192, nil)
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
+		Name: "busy", HostName: "test-host", State: "running",
+		CPUActual: 4, MemActual: 4096,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM(busy): %v", err)
+	}
+
+	_, err := s.ExecuteCreateVM(mtlsAdminCtx("entry"), &pb.ExecuteCreateVMRequest{
+		Request: &pb.CreateVMRequest{Spec: &pb.VMSpec{
+			Name: "vm1", Cpu: 1, MemoryMib: 512,
+			Placement: &pb.PlacementSpec{
+				Host: "test-host", Policy: "spread-strict",
+			},
+		}},
+		ResolvedHost:         "test-host",
+		PlacementFingerprint: capacityFingerprintForServer(t, s),
+		HopCount:             1,
+	})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("code = %v, want ResourceExhausted from executor spread-strict revalidation (err=%v)", got, err)
+	}
+}
+
 func TestExecuteCreateVMUsesResolvedHostWithoutGlobalRescoring(t *testing.T) {
 	s := testServerR2(t)
 	s.virt = libvirtfake.New()

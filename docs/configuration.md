@@ -177,6 +177,18 @@ enforcement:
                               # cluster-wide latch only forms once EVERY node has it enabled — the
                               # barrier is never relied upon until the whole fleet has opted in. Enable
                               # fleet-uniformly; the flag is the reversible kill switch.
+                              #
+                              # REQUIRED FOR HOTPLUG. Device attach/detach — disk, NIC, and
+                              # concrete-address PCI — refuse while this is off, because each
+                              # is journaled and at-most-once and has no un-journaled path:
+                              #   Error: attach disk: disk attach requires the
+                              #   operation_protocol_v1 capability to be active
+                              # A cluster left at the default therefore has no working
+                              # `lv attach-disk` / `lv detach-disk` / `lv attach-nic` /
+                              # `lv detach-nic`. That is deliberate, but the error names only
+                              # the capability, so see this flag. Note the capability activates
+                              # only once EVERY node has the flag on AND the token has latched
+                              # cluster-wide: enabling it on one node changes nothing.
   live_resize: false          # allow TRUE live CPU hot-add + balloon-memory resize. Setting a VM's
                               # max_cpu vCPU-hotplug ceiling is refused until this latches cluster-wide
                               # (an old peer could drop max_cpu from a spec it rewrites), after which

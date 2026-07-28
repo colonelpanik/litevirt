@@ -558,6 +558,18 @@ lv lb enable <lb> --backend <vm>                  # Re-enable
 
 ## Hot-plug (attach/detach)
 
+**Requires `enforcement.operation_protocol`.** These commands are journaled and
+at-most-once, and refuse while the `operation_protocol_v1` capability is
+inactive — which is the default:
+
+```
+Error: attach disk: disk attach requires the operation_protocol_v1 capability to be active
+```
+
+The capability activates only once **every** node has `enforcement.operation_protocol: true`
+and the token has latched cluster-wide, so enabling it on one host changes nothing.
+See docs/configuration.md.
+
 ```bash
 lv hardware-ls <vm>                               # List a VM's disks/NICs/PCI devices
 lv attach-disk <vm> <disk> --size 50G [--bus virtio]

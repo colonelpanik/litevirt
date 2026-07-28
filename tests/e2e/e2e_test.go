@@ -1706,12 +1706,16 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 		t.Error("attached NIC not in inspect output")
 	}
 
-	// Detach by MAC.
+	// Detach by MAC. This used to run only `if len(macs) >= 2`, which meant a run
+	// that parsed fewer MACs skipped the detach and still passed — the half of
+	// this test with the actual risk in it, silently opted out of. If the MACs
+	// can't be found the attach assertion above was already wrong, so fail.
 	macRe := regexp.MustCompile(`52:54:00:[0-9a-f:]+`)
 	macs := macRe.FindAllString(out, -1)
-	if len(macs) >= 2 {
-		lv(t, "detach-nic", vmName, macs[len(macs)-1])
+	if len(macs) < 2 {
+		t.Fatalf("expected at least 2 MACs in inspect after attaching a NIC, found %d (%v)", len(macs), macs)
 	}
+	lv(t, "detach-nic", vmName, macs[len(macs)-1])
 
 	lv(t, "rm", vmName, "--force")
 	lv(t, "network", "rm", netName, "--force")

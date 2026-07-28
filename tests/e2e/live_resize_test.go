@@ -33,30 +33,30 @@ func virshAvailable() bool {
 	return err == nil
 }
 
-// hostWithFreeVCPU returns a host with at least need free vCPUs, PREFERRING the
-// local one so the virsh assertions apply. It skips the test when the cluster
-// is full rather than failing: "no spare capacity" is a lab state, not a defect,
-// and it otherwise surfaces as a confusing ResourceExhausted mid-test.
+// hostWithCapacity returns a host with at least the requested free vCPUs AND
+// free memory, PREFERRING the local one so virsh assertions apply. It skips
+// rather than fails when the cluster is full: "no spare capacity" is a lab
+// state, not a defect, and it otherwise surfaces mid-test as a confusing
+// ResourceExhausted.
 //
-// A live GROW consumes fresh capacity, so a test needs headroom beyond the VM's
-// initial size — blindly using hostNames[0] fails on whichever node happens to
-// be carrying the cluster's other workloads.
-func hostWithFreeVCPU(t *testing.T, need int) string {
+// Memory is checked, not just vCPUs, because that is the limit that actually
+// bites. A lab node with 4 vCPUs but ~3 GiB of RAM accepts three 1 GiB VMs on
+// vCPU count alone and then thrashes itself to death — I wedged a node exactly
+// that way, hard enough that sshd stopped answering.
+func hostWithCapacity(t *testing.T, vcpu, memMiB int) string {
 	t.Helper()
-	// `lv host ls` rows: NAME ADDRESS STATE CPU MEMORY VMs VERSION, CPU as "1/4".
+	// `lv host ls` rows: NAME ADDRESS STATE CPU MEMORY VMs VERSION,
+	// CPU as "1/4" and MEMORY as "1024/2971 MiB".
 	var best string
 	for _, line := range strings.Split(lv(t, "host", "ls"), "\n") {
 		f := strings.Fields(line)
-		if len(f) < 4 || !strings.Contains(f[3], "/") {
+		if len(f) < 5 || !strings.Contains(f[3], "/") || !strings.Contains(f[4], "/") {
 			continue
 		}
-		used, total, ok := strings.Cut(f[3], "/")
-		if !ok {
-			continue
+		if !strings.Contains(line, "ACTIVE") {
+			continue // draining/fenced hosts are not placement targets
 		}
-		u, err1 := strconv.Atoi(used)
-		tot, err2 := strconv.Atoi(total)
-		if err1 != nil || err2 != nil || tot-u < need {
+		if free(t, f[3]) < vcpu || free(t, f[4]) < memMiB {
 			continue
 		}
 		if f[0] == localHost {
@@ -67,9 +67,24 @@ func hostWithFreeVCPU(t *testing.T, need int) string {
 		}
 	}
 	if best == "" {
-		t.Skipf("no host has %d free vCPUs; cluster is at capacity", need)
+		t.Skipf("no host has %d free vCPUs and %d MiB free memory; cluster is at capacity", vcpu, memMiB)
 	}
 	return best
+}
+
+// free parses a "used/total" cell and returns total-used, or -1 if unparseable.
+func free(t *testing.T, cell string) int {
+	t.Helper()
+	used, total, ok := strings.Cut(cell, "/")
+	if !ok {
+		return -1
+	}
+	u, err1 := strconv.Atoi(strings.TrimSpace(used))
+	tot, err2 := strconv.Atoi(strings.TrimSpace(total))
+	if err1 != nil || err2 != nil {
+		return -1
+	}
+	return tot - u
 }
 
 // virshVCPUs returns a domain's LIVE current vCPU count as libvirt sees it.
@@ -113,7 +128,7 @@ func qemuPID(domain string) string {
 func TestVM_LiveCPUGrow_WithinCeiling(t *testing.T) {
 	requireImage(t)
 	name := uniqueName("live")
-	host := hostWithFreeVCPU(t, 2) // 1 to boot with, 1 for the grow
+	host := hostWithCapacity(t, 2, 1024) // 1 vCPU to boot with, 1 for the grow
 	cleanup(t, func() { lvErr(t, "rm", name, "--force") })
 
 	lv(t, "run", "--name", name, "--image", testImage,
@@ -170,7 +185,7 @@ func TestVM_LiveCPUGrow_WithinCeiling(t *testing.T) {
 func TestVM_LiveCPUGrow_BeyondCeilingRefused(t *testing.T) {
 	requireImage(t)
 	name := uniqueName("live")
-	host := hostWithFreeVCPU(t, 2) // 1 to boot with, 1 for the grow
+	host := hostWithCapacity(t, 2, 1024) // 1 vCPU to boot with, 1 for the grow
 	cleanup(t, func() { lvErr(t, "rm", name, "--force") })
 
 	lv(t, "run", "--name", name, "--image", testImage,
@@ -207,7 +222,7 @@ func TestVM_CPUShrinkOnRunningVMRefused(t *testing.T) {
 
 	lv(t, "run", "--name", name, "--image", testImage,
 		"--cpu", "2", "--memory", "1024", "--disk", "5G",
-		"--host", hostWithFreeVCPU(t, 2))
+		"--host", hostWithCapacity(t, 2, 1024))
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
 	out, err := lvErr(t, "update", name, "--cpu", "1")

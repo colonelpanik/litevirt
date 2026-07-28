@@ -114,11 +114,16 @@ func TestFleet_TenancyDefaultProjectUnbounded(t *testing.T) {
 		t.Fatalf("stage image file: %v", err)
 	}
 
-	// No project field — should default to _default and skip the quota check.
+	// No project field — should default to _default and skip the QUOTA check.
+	//
+	// Large enough that any real project quota would reject it, but still within
+	// the host's allocatable capacity: host admission is a separate check that now
+	// runs on create too, and truly absurd values (1024 vCPU / 999999 MiB) would
+	// be refused for capacity — proving nothing about quotas.
 	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
 		Spec: &pb.VMSpec{
 			Name: "untenanted", Image: "test",
-			Cpu: 1024, MemoryMib: 999999, // absurd values, should still pass
+			Cpu: 200, MemoryMib: 200000,
 			Placement: &pb.PlacementSpec{Host: node.Name},
 		},
 	}); err != nil {

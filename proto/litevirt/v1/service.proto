@@ -61,6 +61,17 @@ message ConfigureHostRequest {
     // Region: failure-domain label (DC/rack/AZ). federation.
     // Default "default"; explicitly setting to "" is normalized to default.
     string region = 8;
+    // Per-host capacity policy overrides. All optional: unset leaves the host's
+    // current value alone, and clears back to the cluster default via a negative
+    // reserve / zero ratio.
+    //
+    // A ratio of 0 means "inherit the cluster default" (a 0 ratio is never
+    // meaningful). Reserves are optional because 0 IS meaningful — "hand guests
+    // every last MiB" — and must stay distinguishable from "not configured".
+    optional double cpu_overcommit = 9;
+    optional double mem_overcommit = 10;
+    optional int32 cpu_reserve = 11;
+    optional int32 mem_reserve_mib = 12;
 }
 
 // ── VMs ──
@@ -72,7 +83,11 @@ message CreateVMRequest  { VMSpec spec = 1;
     // on a different node relies on resource-name uniqueness as a best-effort
     // backstop, which is not linearizable in this masterless design. Reusing a key
     // with a different request is a client bug (→ 409).
-    string idempotency_key = 2; }
+    string idempotency_key = 2;
+    // allow_overcommit skips HOST capacity admission for this create (project
+    // quota still applies). For deliberate density on a host the operator knows
+    // can take it; the bypass is audited so it is never silent.
+    bool allow_overcommit = 3; }
 message ListVMsRequest   { string stack_name = 1; string host_name = 2;
     map<string, string> label_filter = 3;
     // Keyset pagination (additive; mixed-version safe — an old server ignores these

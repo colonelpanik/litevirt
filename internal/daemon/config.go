@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/obs"
 )
@@ -73,6 +74,11 @@ type Config struct {
 	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
+
+	// Capacity is the cluster-wide default for how much of a host may be handed
+	// to workloads. Per-host overrides live on the host record (`lv host config`)
+	// and win where set.
+	Capacity CapacityConfig `yaml:"capacity"`
 
 	// BackupRepos maps a logical repo name (referenced from compose
 	// `vms.<name>.backup.repo:`) to an on-disk path the snapshot
@@ -600,4 +606,62 @@ func normalizeTelemetry(t *TelemetryConfig) {
 // list. Empty when nothing is configured (the default → no network guard).
 func (c *Config) ImagePullBlockedPrefixes() ([]netip.Prefix, error) {
 	return image.ParseBlockPolicy(c.ImagePullBlockedCIDRs, c.ImagePullBlockMetadata, c.ImagePullBlockPrivate)
+}
+
+// CapacityConfig is the cluster-wide capacity policy: overcommit ratios and the
+// headroom held back for the host itself.
+//
+// CPU and memory deliberately differ. vCPU is time-sliced, so running more vCPUs
+// than cores is normal and the default oversubscribes. Memory is not — without
+// ballooning/KSM/swap a guest's RAM is either backed or the host starts
+// reclaiming — so the memory ratio defaults to exactly 1.
+//
+// The reserve matters more than either ratio: at ratio 1.0 with no reserve,
+// guests are offered 100% of RAM and the kernel, page cache, qemu's per-VM
+// overhead and litevirtd itself get nothing.
+//
+// Zero/unset fields fall back to the built-in defaults
+// (corrosion.DefaultCapacityPolicy).
+type CapacityConfig struct {
+	// CPUOvercommitRatio multiplies physical vCPUs. Default 4.0.
+	CPUOvercommitRatio float64 `yaml:"cpu_overcommit_ratio,omitempty"`
+	// MemOvercommitRatio multiplies physical memory. Default 1.0. Raise it only
+	// where ballooning/KSM/swap make the promise real.
+	MemOvercommitRatio float64 `yaml:"mem_overcommit_ratio,omitempty"`
+	// HostCPUReserve is vCPUs withheld for the host itself. Default 1.
+	HostCPUReserve int `yaml:"host_cpu_reserve,omitempty"`
+	// HostMemoryReserveMiB / HostMemoryReservePct withhold memory for the host;
+	// the effective reserve is the LARGER of the two, so the fixed floor protects
+	// small nodes while the percentage scales with large ones.
+	// Defaults 1024 and 5.
+	HostMemoryReserveMiB int `yaml:"host_memory_reserve_mib,omitempty"`
+	HostMemoryReservePct int `yaml:"host_memory_reserve_pct,omitempty"`
+	// VMMemoryOverheadMiB is charged per running VM on top of its configured
+	// memory for qemu's own footprint. Default 128.
+	VMMemoryOverheadMiB int `yaml:"vm_memory_overhead_mib,omitempty"`
+}
+
+// Policy converts the config into the corrosion capacity policy. A wholly unset
+// section yields the built-in defaults rather than a zeroed policy that would
+// make every host look full.
+func (c CapacityConfig) Policy() corrosion.CapacityPolicy {
+	if c == (CapacityConfig{}) {
+		return corrosion.DefaultCapacityPolicy()
+	}
+	d := corrosion.DefaultCapacityPolicy()
+	p := corrosion.CapacityPolicy{
+		CPUOvercommit:    c.CPUOvercommitRatio,
+		MemOvercommit:    c.MemOvercommitRatio,
+		CPUReserve:       c.HostCPUReserve,
+		MemReserveMiB:    c.HostMemoryReserveMiB,
+		MemReservePct:    c.HostMemoryReservePct,
+		VMMemOverheadMiB: c.VMMemoryOverheadMiB,
+	}
+	if p.CPUOvercommit <= 0 {
+		p.CPUOvercommit = d.CPUOvercommit
+	}
+	if p.MemOvercommit <= 0 {
+		p.MemOvercommit = d.MemOvercommit
+	}
+	return p
 }

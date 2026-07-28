@@ -244,7 +244,13 @@ import (
 //	v42: hardware foundation — vm_nics, vm_pci_intent, vm_pci_realizations;
 //	     vm_disks.{bus,device_kind,delete_with_vm,controller_model};
 //	     vms.{hardware_adoption_state,hardware_adoption_error}.
-const CurrentSchemaVersion = 42
+//	v43: per-host capacity policy — hosts.{cpu_overcommit,mem_overcommit,
+//	     cpu_reserve,mem_reserve_mib}. Overrides the cluster-wide default so a
+//	     host with swap/KSM can overcommit memory while its peers do not. Ratio 0
+//	     and reserve -1 mean "inherit the cluster default"; 0 is a MEANINGFUL
+//	     reserve (hand guests everything), so absence had to be a distinct value.
+//	     Four ADD COLUMN.
+const CurrentSchemaVersion = 43
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -594,6 +600,10 @@ var schemaDDL = []string{
 		labels       TEXT,
 		role         TEXT NOT NULL DEFAULT 'worker',
 		schema_version INTEGER NOT NULL DEFAULT 0,
+		cpu_overcommit  REAL NOT NULL DEFAULT 0,
+		mem_overcommit  REAL NOT NULL DEFAULT 0,
+		cpu_reserve     INTEGER NOT NULL DEFAULT -1,
+		mem_reserve_mib INTEGER NOT NULL DEFAULT -1,
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT
@@ -1996,6 +2006,12 @@ var schemaMigrations = []string{
 	`ALTER TABLE vm_disks ADD COLUMN controller_model TEXT`,
 	`ALTER TABLE vms ADD COLUMN hardware_adoption_state TEXT NOT NULL DEFAULT 'pending'`,
 	`ALTER TABLE vms ADD COLUMN hardware_adoption_error TEXT`,
+	// v43: per-host capacity policy. 0 / -1 mean "inherit the cluster default"
+	// (a real 0 reserve is meaningful, so absence is -1, not 0).
+	`ALTER TABLE hosts ADD COLUMN cpu_overcommit REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN mem_overcommit REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN cpu_reserve INTEGER NOT NULL DEFAULT -1`,
+	`ALTER TABLE hosts ADD COLUMN mem_reserve_mib INTEGER NOT NULL DEFAULT -1`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2073,6 +2089,7 @@ var alterVersions = []int{
 	41, 41, 41, // vms.vm_owner_epoch, vms.spec_generation, vms.active_operation_id
 	42, 42, 42, 42, // vm_disks.bus/device_kind/delete_with_vm/controller_model
 	42, 42, // vms.hardware_adoption_state/hardware_adoption_error
+	43, 43, 43, 43, // hosts.cpu_overcommit/mem_overcommit/cpu_reserve/mem_reserve_mib
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

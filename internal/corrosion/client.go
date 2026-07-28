@@ -1049,6 +1049,25 @@ func (r Row) Int(col string) int {
 	}
 }
 
+// Float reads a REAL column. Absent/NULL reads as 0, which capacity policy
+// treats as "inherit the cluster default".
+func (r Row) Float(col string) float64 {
+	v := r.get(col)
+	if v == nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int64:
+		return float64(n)
+	case int:
+		return float64(n)
+	default:
+		return 0
+	}
+}
+
 func (r Row) Int64(col string) int64 {
 	v := r.get(col)
 	if v == nil {

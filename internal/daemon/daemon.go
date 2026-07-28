@@ -623,6 +623,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	)
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
+	// overrides live on the host record and win where set.
+	svc.SetCapacityPolicy(d.cfg.Capacity.Policy())
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())

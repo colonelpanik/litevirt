@@ -176,6 +176,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		VMName:       spec.Name,
 		CPUNeeded:    int(spec.Cpu),
 		MemMiBNeeded: int(spec.MemoryMib),
+		Capacity:     s.capacity,
 	}
 	if p := spec.Placement; p != nil {
 		placementReq.PinHost = p.Host
@@ -216,6 +217,31 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	targetHost, err := placement.Select(ctx, s.db, placementReq)
 	if err != nil {
 		return nil, status.Errorf(codes.ResourceExhausted, "placement failed: %v", err)
+	}
+	// Host capacity admission. When placement CHOOSES a host it already scores
+	// capacity, but a PINNED host (`--host` / spec.placement.host) skips scoring
+	// entirely — Select only checks the host exists, is active, and isn't a witness
+	// — so a pinned create had no capacity check at all. Three 1 GiB VMs pinned to a
+	// ~3 GiB host were all accepted, the cluster reported 3072/2971 MiB, and the node
+	// thrashed until sshd stopped answering. A too-large single VM reached qemu and
+	// came back as a raw "cannot set up guest memory" error.
+	//
+	// This is the same check the resize path has used all along (resize.go:116), so
+	// growing a VM into a host was refused while creating one there was not. The
+	// spec (and therefore the pin) travels with a forwarded request, so this runs on
+	// the entry node to fail fast AND again on the owning host, where it is
+	// serialized against concurrent creates.
+	if req.AllowOvercommit {
+		// Deliberate density on a host the operator judges can take it. Project
+		// quota still applies (that is a tenancy limit, not a physical one); only
+		// the HOST capacity check is bypassed. Audited so it is never silent — an
+		// oversubscribed host that later thrashes should be traceable to the
+		// decision that put it there.
+		s.audit(ctx, "vm.create", spec.Name,
+			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
+				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+		return nil, err
 	}
 	// Project isolation (storage): pools are HOST-scoped, so admit each disk's pool
 	// against the SELECTED target host — not the entry host (which may hold a

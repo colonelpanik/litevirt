@@ -54,6 +54,13 @@ func HistoricalShapes() []HistoricalShape {
 		add("UPDATE hosts SET "+strings.Join(sets, ", ")+" WHERE name = ?", "configure_host_v130")
 	}
 
+	// InsertHost (v1.3.0): the column list before per-host capacity policy (v43)
+	// added cpu_overcommit/mem_overcommit/cpu_reserve/mem_reserve_mib. A v1.3.0
+	// peer still emits the shorter INSERT, and an upgraded receiver that no longer
+	// recognises it would back-pressure a perfectly valid statement and stall that
+	// peer's stream.
+	add("INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,\n\t\t\tcpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "insert_host_v130")
+
 	// DeleteStackFirewall (v1.3.0): one bulk tombstone per firewall table by stack_name.
 	for _, tbl := range []string{"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
 		add("UPDATE "+tbl+" SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL", "stack_firewall_teardown_v130")

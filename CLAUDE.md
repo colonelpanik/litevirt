@@ -30,6 +30,14 @@ whose failure mode is *multi-node* belongs here, because a single-package test
 structurally cannot reach it. See `tests/fleet/cluster.go` for the harness and
 `hardware_v2_latch_test.go` for the shape.
 
+Each node gets two in-process backends: `n.Virt` (`internal/libvirtfake`) for VMs
+and `n.CT` (`tests/fleet/ctfake.go`) for containers. `CTFake` keeps a real
+on-disk container dir per node and does a real tar export/import, so a container
+migrate genuinely moves bytes between two directories over gRPC — assert on
+`n.CT.Payload(name)` and a migration that moved nothing cannot pass. It also has
+an `OnExport` hook that runs mid-archive, which is the only way to reach the
+target-side failures a source preflight would otherwise catch first.
+
 `tests/e2e/` needs two variables that are easy to miss — without them it prints
 one line and exits 0, which reads like a pass:
 

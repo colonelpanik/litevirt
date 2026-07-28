@@ -12,6 +12,8 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/placement"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 const testCapacityAdmissionCapability = "capacity_admission_v1"
@@ -205,6 +207,257 @@ func TestExecuteCreateVMUsesResolvedHostWithoutGlobalRescoring(t *testing.T) {
 	record, err := corrosion.GetVM(context.Background(), s.db, "vm1")
 	if err != nil || record == nil || record.HostName != "test-host" {
 		t.Fatalf("persisted VM = %+v, err=%v; want test-host", record, err)
+	}
+}
+
+func TestPlacementDeviceRequestPreservesSelectorPrecedence(t *testing.T) {
+	tests := []struct {
+		name string
+		spec *pb.DeviceSpec
+		want placement.DeviceRequest
+	}{
+		{
+			name: "mapping outranks sriov type and frozen address",
+			spec: &pb.DeviceSpec{
+				Mapping: "accelerator", Sriov: true, Type: "network",
+				Vendor: "15b3", Model: "ConnectX", Address: "0000:41:00.0", Count: 2,
+			},
+			want: placement.DeviceRequest{Mapping: "accelerator", Count: 2},
+		},
+		{
+			name: "sriov outranks frozen address",
+			spec: &pb.DeviceSpec{
+				Sriov: true, Type: "network", Vendor: "15b3", Model: "ConnectX",
+				Parent: "41:00.0", Address: "0000:42:00.0", Count: 3,
+			},
+			want: placement.DeviceRequest{
+				Type: "network", Vendor: "15b3", Model: "ConnectX",
+				Parent: "41:00.0", Sriov: true, Count: 3,
+			},
+		},
+		{
+			name: "type preserves model and outranks frozen address",
+			spec: &pb.DeviceSpec{
+				Type: "gpu", Vendor: "10de", Model: "H100",
+				Address: "0000:43:00.0",
+			},
+			want: placement.DeviceRequest{Type: "gpu", Vendor: "10de", Model: "H100"},
+		},
+		{
+			name: "exact address canonicalized",
+			spec: &pb.DeviceSpec{Address: "41:00.0"},
+			want: placement.DeviceRequest{Address: "0000:41:00.0"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := placementDeviceRequest(tt.spec); got != tt.want {
+				t.Fatalf("placementDeviceRequest() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPlacementValidationErrorDistinguishesInfrastructure(t *testing.T) {
+	// A closed backend makes ValidatePinned fail before it can evaluate host
+	// eligibility and therefore must not be surfaced as ResourceExhausted.
+	s := testServerR2(t)
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	err := placement.ValidatePinned(context.Background(), s.db, placement.Request{VMName: "vm1"}, "test-host")
+	if got := status.Code(placementValidationError(err)); got != codes.Internal {
+		t.Fatalf("code = %v, want Internal (err=%v)", got, err)
+	}
+	if got := status.Code(placementValidationError(context.Canceled)); got != codes.ResourceExhausted {
+		t.Fatalf("eligibility code = %v, want ResourceExhausted", got)
+	}
+}
+
+func TestCreateVMMappingOnlySelectsMappedHost(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+
+	insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
+	insertPlacementExecutorHost(t, s, "unmapped", 64, 131072, nil)
+	for _, host := range []string{"test-host", "unmapped"} {
+		if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+			HostName: host, Address: "0000:41:00.0", Type: "gpu",
+			VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+		}); err != nil {
+			t.Fatalf("UpsertPCIDevice(%s): %v", host, err)
+		}
+	}
+	if err := corrosion.CreateResourceMapping(ctx, s.db, "accelerator", "test"); err != nil {
+		t.Fatalf("CreateResourceMapping: %v", err)
+	}
+	if err := corrosion.AddMappingDevice(ctx, s.db, "accelerator", "test-host", "0000:41:00.0", "10de", "A100"); err != nil {
+		t.Fatalf("AddMappingDevice: %v", err)
+	}
+
+	vm, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name:    "mapped-vm",
+		Devices: []*pb.DeviceSpec{{Mapping: "accelerator"}},
+	}})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if vm.GetHostName() != "test-host" {
+		t.Fatalf("host = %q, want mapped host test-host", vm.GetHostName())
+	}
+}
+
+func TestExecuteCreateVMMappingOutranksSRIOV(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
+	insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
+	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu",
+		VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+	}); err != nil {
+		t.Fatalf("UpsertPCIDevice: %v", err)
+	}
+	if err := corrosion.CreateResourceMapping(ctx, s.db, "accelerator", "test"); err != nil {
+		t.Fatalf("CreateResourceMapping: %v", err)
+	}
+	if err := corrosion.AddMappingDevice(ctx, s.db, "accelerator", "test-host", "0000:41:00.0", "10de", "A100"); err != nil {
+		t.Fatalf("AddMappingDevice: %v", err)
+	}
+
+	vm, err := s.ExecuteCreateVM(mtlsAdminCtx("entry"), &pb.ExecuteCreateVMRequest{
+		Request: &pb.CreateVMRequest{Spec: &pb.VMSpec{
+			Name: "mapped-exec",
+			Devices: []*pb.DeviceSpec{{
+				Mapping: "accelerator", Sriov: true, Type: "network",
+				Address: "0000:99:00.0",
+			}},
+		}},
+		ResolvedHost:         "test-host",
+		PlacementFingerprint: capacityFingerprintForServer(t, s),
+		HopCount:             1,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteCreateVM: %v", err)
+	}
+	if vm.GetHostName() != "test-host" {
+		t.Fatalf("host = %q, want test-host", vm.GetHostName())
+	}
+}
+
+func TestExecuteCreateVMMappingOnly(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	restore := vfio.SetFS(newPCIBindFakeFS())
+	defer restore()
+	ctx := adminCtx()
+	insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
+	insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
+	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu",
+		VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+	}); err != nil {
+		t.Fatalf("UpsertPCIDevice: %v", err)
+	}
+	if err := corrosion.CreateResourceMapping(ctx, s.db, "accelerator", "test"); err != nil {
+		t.Fatalf("CreateResourceMapping: %v", err)
+	}
+	if err := corrosion.AddMappingDevice(ctx, s.db, "accelerator", "test-host", "0000:41:00.0", "10de", "A100"); err != nil {
+		t.Fatalf("AddMappingDevice: %v", err)
+	}
+
+	vm, err := s.ExecuteCreateVM(mtlsAdminCtx("entry"), &pb.ExecuteCreateVMRequest{
+		Request: &pb.CreateVMRequest{Spec: &pb.VMSpec{
+			Name:    "mapping-only-exec",
+			Devices: []*pb.DeviceSpec{{Mapping: "accelerator"}},
+		}},
+		ResolvedHost:         "test-host",
+		PlacementFingerprint: capacityFingerprintForServer(t, s),
+		HopCount:             1,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteCreateVM: %v", err)
+	}
+	if vm.GetHostName() != "test-host" {
+		t.Fatalf("host = %q, want test-host", vm.GetHostName())
+	}
+}
+
+func TestCreateAndExecuteRejectWrongDeviceModel(t *testing.T) {
+	newServer := func(t *testing.T) *Server {
+		t.Helper()
+		s := testServerR2(t)
+		s.virt = libvirtfake.New()
+		insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
+		if err := corrosion.UpsertPCIDevice(context.Background(), s.db, corrosion.PCIDeviceRecord{
+			HostName: "test-host", Address: "0000:41:00.0", Type: "gpu",
+			VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+		}); err != nil {
+			t.Fatalf("UpsertPCIDevice: %v", err)
+		}
+		return s
+	}
+	spec := func(name string) *pb.VMSpec {
+		return &pb.VMSpec{
+			Name: name, Placement: &pb.PlacementSpec{Host: "test-host"},
+			Devices: []*pb.DeviceSpec{{Type: "gpu", Model: "H100"}},
+		}
+	}
+
+	t.Run("CreateVM", func(t *testing.T) {
+		s := newServer(t)
+		_, err := s.CreateVM(adminCtx(), &pb.CreateVMRequest{Spec: spec("wrong-model-create")})
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("code = %v, want ResourceExhausted (err=%v)", got, err)
+		}
+	})
+	t.Run("ExecuteCreateVM", func(t *testing.T) {
+		s := newServer(t)
+		insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
+		_, err := s.ExecuteCreateVM(mtlsAdminCtx("entry"), &pb.ExecuteCreateVMRequest{
+			Request:              &pb.CreateVMRequest{Spec: spec("wrong-model-exec")},
+			ResolvedHost:         "test-host",
+			PlacementFingerprint: capacityFingerprintForServer(t, s),
+			HopCount:             1,
+		})
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("code = %v, want ResourceExhausted (err=%v)", got, err)
+		}
+	})
+}
+
+func TestExecuteCreateVMRejectsExactAddressIOMMUConflictDuringPlacement(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
+	insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
+	for _, device := range []corrosion.PCIDeviceRecord{
+		{HostName: "test-host", Address: "0000:41:00.0", Type: "gpu", IOMMUGroup: 9},
+		{HostName: "test-host", Address: "0000:41:00.1", Type: "network", IOMMUGroup: 9, VMName: "other-vm"},
+	} {
+		if err := corrosion.UpsertPCIDevice(context.Background(), s.db, device); err != nil {
+			t.Fatalf("UpsertPCIDevice(%s): %v", device.Address, err)
+		}
+	}
+
+	_, err := s.ExecuteCreateVM(mtlsAdminCtx("entry"), &pb.ExecuteCreateVMRequest{
+		Request: &pb.CreateVMRequest{Spec: &pb.VMSpec{
+			Name:    "iommu-conflict",
+			Devices: []*pb.DeviceSpec{{Address: "0000:41:00.0"}},
+		}},
+		ResolvedHost:         "test-host",
+		PlacementFingerprint: capacityFingerprintForServer(t, s),
+		HopCount:             1,
+	})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("code = %v, want placement ResourceExhausted (err=%v)", got, err)
 	}
 }
 

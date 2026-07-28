@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/placement"
 )
 
@@ -87,10 +88,7 @@ func (s *Server) createVMPlacementRequest(ctx context.Context, spec *pb.VMSpec, 
 	}
 	addCapabilityLabels(&req, spec)
 	for _, dev := range spec.Devices {
-		req.Devices = append(req.Devices, placement.DeviceRequest{
-			Type: dev.Type, Count: int(dev.Count), Vendor: dev.Vendor,
-			Address: dev.Address, Sriov: dev.Sriov, Parent: dev.Parent,
-		})
+		req.Devices = append(req.Devices, placementDeviceRequest(dev))
 	}
 	for _, nic := range spec.Network {
 		if nic.Name == "" {
@@ -106,6 +104,57 @@ func (s *Server) createVMPlacementRequest(ctx context.Context, spec *pb.VMSpec, 
 		})
 	}
 	return req
+}
+
+// placementDeviceRequest converts one protobuf device request into the exact
+// selector semantics the allocator will use. In particular, Address can be a
+// frozen resolution artifact on a portable mapping/SR-IOV/type selector; it
+// must not outrank that selector during placement revalidation.
+func placementDeviceRequest(dev *pb.DeviceSpec) placement.DeviceRequest {
+	if dev == nil {
+		return placement.DeviceRequest{}
+	}
+	count := int(dev.Count)
+	kind, _ := corrosion.ClassifyPCISelector(dev)
+	switch kind {
+	case "mapping":
+		return placement.DeviceRequest{
+			Mapping: dev.Mapping,
+			Count:   count,
+		}
+	case "sriov":
+		return placement.DeviceRequest{
+			Type:   dev.Type,
+			Count:  count,
+			Vendor: dev.Vendor,
+			Model:  dev.Model,
+			Sriov:  true,
+			Parent: dev.Parent,
+		}
+	case "type":
+		return placement.DeviceRequest{
+			Type:   dev.Type,
+			Count:  count,
+			Vendor: dev.Vendor,
+			Model:  dev.Model,
+		}
+	default:
+		address := dev.Address
+		if canonical, ok := pci.CanonicalBDF(address); ok {
+			address = canonical
+		}
+		return placement.DeviceRequest{
+			Count:   count,
+			Address: address,
+		}
+	}
+}
+
+func placementValidationError(err error) error {
+	if placement.IsInfrastructureError(err) {
+		return status.Errorf(codes.Internal, "revalidate resolved placement: %v", err)
+	}
+	return status.Errorf(codes.ResourceExhausted, "resolved placement is no longer eligible: %v", err)
 }
 
 func (s *Server) capacityPolicyFingerprint(ctx context.Context) (string, error) {
@@ -210,7 +259,7 @@ func (s *Server) ExecuteCreateVM(ctx context.Context, envelope *pb.ExecuteCreate
 	}
 	placementReq := s.createVMPlacementRequest(ctx, spec, envelope.Request.AllowOvercommit)
 	if err := placement.ValidatePinned(ctx, s.db, placementReq, envelope.ResolvedHost); err != nil {
-		return nil, status.Errorf(codes.ResourceExhausted, "resolved placement is no longer eligible: %v", err)
+		return nil, placementValidationError(err)
 	}
 
 	localRequest := proto.Clone(envelope.Request).(*pb.CreateVMRequest)

@@ -4,6 +4,7 @@ package placement
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -86,6 +87,8 @@ type DeviceRequest struct {
 	Type     string // gpu | network | nvme | infiniband
 	Count    int
 	Vendor   string // optional vendor filter
+	Model    string // optional device model/name filter
+	Mapping  string // optional cluster-wide resource mapping
 	Address  string // optional exact PCI address
 	Clique   string // prefer specific NVLink/xGMI clique
 	SameNUMA bool   // require all devices on same NUMA node
@@ -95,6 +98,30 @@ type DeviceRequest struct {
 	Sriov bool
 	// Parent optionally restricts the SR-IOV request to a specific PF BDF.
 	Parent string
+}
+
+// InfrastructureError marks a placement failure caused by inability to read
+// authoritative cluster state. Callers must not report these as ordinary
+// ineligibility/resource exhaustion.
+type InfrastructureError struct {
+	err error
+}
+
+func (e *InfrastructureError) Error() string { return e.err.Error() }
+func (e *InfrastructureError) Unwrap() error { return e.err }
+
+func infrastructureError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &InfrastructureError{err: err}
+}
+
+// IsInfrastructureError reports whether err means placement could not read
+// authoritative backend state.
+func IsInfrastructureError(err error) bool {
+	var target *InfrastructureError
+	return errors.As(err, &target)
 }
 
 // hostCandidate is an evaluated host during selection.
@@ -164,15 +191,40 @@ func ValidatePinned(ctx context.Context, db *corrosion.Client, req Request, host
 func snapshotForRequest(ctx context.Context, db *corrosion.Client, req *Request) (*ClusterSnapshot, error) {
 	snap, err := BuildSnapshot(ctx, db)
 	if err != nil {
-		return nil, err
+		return nil, infrastructureError(err)
 	}
 	if len(req.Devices) > 0 {
 		snap.Devices = make(map[string][]corrosion.PCIDeviceRecord)
 		for _, host := range snap.HostsBy {
-			devices, loadErr := corrosion.GetAvailableDevicesWithTopology(ctx, db, host.Name, "")
-			if loadErr == nil {
-				snap.Devices[host.Name] = devices
+			// Load the complete inventory, not only unassigned rows: exact and
+			// mapping selectors must see an assigned IOMMU sibling and reject the
+			// host before execution.
+			devices, loadErr := corrosion.ListPCIDevices(ctx, db, host.Name, "")
+			if loadErr != nil {
+				return nil, infrastructureError(fmt.Errorf("list PCI devices on %s: %w", host.Name, loadErr))
 			}
+			snap.Devices[host.Name] = devices
+		}
+
+		snap.MappingDevices = make(map[string]map[string][]string)
+		for _, device := range req.Devices {
+			if device.Mapping == "" {
+				continue
+			}
+			if _, loaded := snap.MappingDevices[device.Mapping]; loaded {
+				continue
+			}
+			mapping, loadErr := corrosion.GetResourceMapping(ctx, db, device.Mapping)
+			if loadErr != nil {
+				return nil, infrastructureError(fmt.Errorf("get resource mapping %q: %w", device.Mapping, loadErr))
+			}
+			byHost := make(map[string][]string)
+			if mapping != nil {
+				for _, mapped := range mapping.Devices {
+					byHost[mapped.HostName] = append(byHost[mapped.HostName], mapped.Address)
+				}
+			}
+			snap.MappingDevices[device.Mapping] = byHost
 		}
 	}
 	if req.MaxPerNode > 0 {
@@ -268,7 +320,7 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		var deviceBonus int
 		if len(req.Devices) > 0 {
 			pool := snap.Devices[h.Name]
-			ok, bonus := scoreHostDevices(pool, req.Devices)
+			ok, bonus := scoreHostDevicesForHost(pool, req.Devices, snap.MappingDevices, h.Name)
 			if !ok {
 				continue
 			}

@@ -48,6 +48,10 @@ type ClusterSnapshot struct {
 	// Per-host PCI device pool — used by Devices dimension and topology
 	// scoring. Optional; lazily loaded by Select if Devices > 0.
 	Devices map[string][]corrosion.PCIDeviceRecord
+	// MappingDevices resolves a portable resource-mapping selector to the
+	// concrete addresses registered on each candidate host.
+	// mapping name → host name → PCI addresses.
+	MappingDevices map[string]map[string][]string
 
 	// Replica counts grouped by base name (for MaxPerNode).
 	ReplicasByBase map[string]map[string]int // baseName → host → count

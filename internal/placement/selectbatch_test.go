@@ -678,6 +678,23 @@ func TestScoreHostDevices_SRIOV(t *testing.T) {
 	if ok, _ := scoreHostDevices(plain, []DeviceRequest{{Type: "network", Sriov: true}}); ok {
 		t.Error("host without an SR-IOV-capable network PF must not be eligible")
 	}
+
+	// An ordinary, unassigned device of the requested type is not authoritative
+	// evidence that it is a VF.
+	plainNIC := []corrosion.PCIDeviceRecord{{Address: "0000:03:00.0", Type: "network"}}
+	if ok, _ := scoreHostDevices(plainNIC, []DeviceRequest{{Type: "network", Sriov: true}}); ok {
+		t.Error("ordinary free NIC must not be treated as an SR-IOV VF")
+	}
+
+	// Parent matching is canonical across short/full BDF spellings.
+	if ok, _ := scoreHostDevices(pfHost, []DeviceRequest{{Type: "network", Sriov: true, Parent: "41:00.0"}}); !ok {
+		t.Error("canonical-equivalent parent PF must be eligible")
+	}
+
+	// Hardware total is an authoritative upper bound when present.
+	if ok, _ := scoreHostDevices(pfHost, []DeviceRequest{{Type: "network", Sriov: true, Count: 8}}); ok {
+		t.Error("request larger than PF VF capacity must not be eligible")
+	}
 }
 
 // Container memory must count against host capacity in batch placement exactly

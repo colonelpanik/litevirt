@@ -231,10 +231,11 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 			return nil, noop, err
 		}
 		// Freeze the resolved concrete BDF back onto a resource-mapping spec so
-		// CreateVM's json.Marshal(spec) persists the pinned address (behavior-
-		// preserving; making the mapping stay portable is a later phase's job). The
-		// pure resolveDeviceSpec never mutates the spec — allocateDevices does.
-		if spec.Mapping != "" && spec.Address == "" && len(specMembers) > 0 {
+		// CreateVM's json.Marshal(spec) records the current realization. Mapping
+		// remains the authoritative portable selector; Address is only its cached
+		// per-host artifact. The pure resolveDeviceSpec never mutates the spec —
+		// allocateDevices does.
+		if spec.Mapping != "" && len(specMembers) > 0 {
 			spec.Address = specMembers[0].Address
 		}
 		members = append(members, specMembers...)
@@ -278,8 +279,10 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 	// Resource mapping (#14): resolve a cluster-wide mapping name to the concrete
 	// PCI address registered for THIS host, then treat it as an exact pin. This is
 	// what lets a passthrough VM land on / migrate to any host that has a device
-	// under the same mapping. Resolve into a local var — never mutate the input spec.
-	if spec.Mapping != "" && address == "" {
+	// under the same mapping. Mapping outranks a frozen Address artifact, matching
+	// ClassifyPCISelector and CanonicalPCISelector. Resolve into a local var —
+	// never mutate the input spec.
+	if spec.Mapping != "" {
 		addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)

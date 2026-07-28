@@ -994,3 +994,42 @@ func TestInterfaceSourceByMAC(t *testing.T) {
 		t.Fatal("unparseable document reported as found")
 	}
 }
+
+// TestDiskSourceByTarget pins the lookup DetachDisk depends on — the disk
+// counterpart of TestInterfaceSourceByMAC. libvirt asks that a detach element be
+// "as specific as its definition in the domain XML" and warns that a partial one
+// "may lead to unexpected results"; sending target-dev alone matches on that
+// attribute and nothing else.
+func TestDiskSourceByTarget(t *testing.T) {
+	const dom = `<domain type='kvm'><devices>
+	  <disk type='file' device='disk'>
+	    <source file='/var/lib/litevirt/disks/vm1-root.qcow2'/>
+	    <target dev='vda' bus='virtio'/>
+	  </disk>
+	  <disk type='block' device='disk'>
+	    <source file='/dev/mapper/data'/>
+	    <target dev='vdb' bus='virtio'/>
+	  </disk>
+	</devices></domain>`
+
+	typ, src, ok := DiskSourceByTarget(dom, "vda")
+	if !ok {
+		t.Fatal("file disk not found by target dev")
+	}
+	if typ != "file" || src.File != "/var/lib/litevirt/disks/vm1-root.qcow2" {
+		t.Fatalf("got type=%q file=%q, want file//var/lib/litevirt/disks/vm1-root.qcow2", typ, src.File)
+	}
+
+	// A non-file disk must report its OWN type, for the same reason a non-bridge
+	// interface does: describing it as a file sends an element that does not match.
+	if typ, _, ok := DiskSourceByTarget(dom, "vdb"); !ok || typ != "block" {
+		t.Fatalf("got type=%q ok=%v, want block/true", typ, ok)
+	}
+
+	if _, _, ok := DiskSourceByTarget(dom, "vdz"); ok {
+		t.Fatal("absent target dev reported as found")
+	}
+	if _, _, ok := DiskSourceByTarget("not xml", "vda"); ok {
+		t.Fatal("unparseable document reported as found")
+	}
+}

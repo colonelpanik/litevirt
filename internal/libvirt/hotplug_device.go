@@ -21,11 +21,28 @@ func (c *Client) AttachDisk(domainName string, path, targetDev, bus string) erro
 }
 
 // DetachDisk hot-detaches a disk from a running domain by target device name.
+//
+// The device element carries the disk's REAL type and source, read from the live
+// domain, for the reason libvirt gives: the supplied description "should be as
+// specific as its definition in the domain XML", and a partial one "may lead to
+// unexpected results" — the same trap DetachNIC fell into. Falls back to the
+// target-only shape when the disk cannot be found, where the detach is a no-op
+// anyway.
+//
+// Note this only makes the REQUEST specific. The unplug itself is asynchronous and
+// needs the guest's cooperation, so a nil return means "requested", not "gone";
+// callers verify absence by waiting (see grpcapi's verifyDiskDetached).
 func (c *Client) DetachDisk(domainName, targetDev string) error {
 	disk := diskDevice{
 		Type:   "file",
 		Device: "disk",
 		Target: diskTarget{Dev: targetDev},
+	}
+	if xmlText, err := c.DumpXML(domainName); err == nil {
+		if typ, src, ok := DiskSourceByTarget(xmlText, targetDev); ok {
+			disk.Type = typ
+			disk.Source = src
+		}
 	}
 	return c.detachDeviceXML(domainName, disk)
 }

@@ -1217,3 +1217,72 @@ func TestCreateVM_PinnedHostRespectsCapacity(t *testing.T) {
 		t.Fatalf("pinned create that fits was refused: %v", err)
 	}
 }
+
+// TestStartVM_RespectsHostCapacity: starting is where memory is actually
+// consumed — usage counts running VMs only — so create-time admission alone is
+// trivially sidestepped by creating VMs that each fit and then starting them all.
+func TestStartVM_RespectsHostCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable 4096-1024 = 3072; 2560 in use leaves 512 free.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "sitting", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 2560,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM sitting: %v", err)
+	}
+	// A stopped VM contributes nothing to usage until it starts — which is exactly
+	// the hole this closes.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "waiting", HostName: "test-host", State: "stopped",
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "waiting", Cpu: 1, MemoryMib: 1024}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM waiting: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>waiting</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "waiting"}); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("start exceeding host memory: got %v, want ResourceExhausted", err)
+	}
+
+	// The audited escape hatch still lets an operator through.
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "waiting", AllowOvercommit: true}); err != nil {
+		t.Fatalf("start with --allow-overcommit: %v", err)
+	}
+}
+
+// TestStartVM_AlreadyRunningIsNotRefusedForCapacity: `lv start` on a running VM
+// adds nothing, so it must not be refused for capacity the VM already occupies.
+func TestStartVM_AlreadyRunningIsNotRefusedForCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 2048,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Already running and larger than the host's remaining headroom.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "big", HostName: "test-host", State: "running", CPUActual: 2, MemActual: 4096,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "big", Cpu: 2, MemoryMib: 4096}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>big</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "big"}); status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("start of an already-running VM was refused for capacity it already holds: %v", err)
+	}
+}

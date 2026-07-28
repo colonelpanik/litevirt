@@ -103,7 +103,10 @@ message ListVMHardwareResponse {
     string hardware_adoption_state = 2;  // pending | adopted | blocked
     string hardware_adoption_error = 3;  // reason when blocked
 }
-message StartVMRequest   { string name = 1; }
+message StartVMRequest   { string name = 1;
+    // allow_overcommit skips HOST capacity admission for this start (project quota
+    // still applies). Same escape hatch as CreateVMRequest; the bypass is audited.
+    bool allow_overcommit = 2; }
 message StopVMRequest    { string name = 1; bool force = 2; int32 timeout = 3; }
 message RestartVMRequest { string name = 1; }
 message DeleteVMRequest    { string name = 1; bool keep_disks = 2; }

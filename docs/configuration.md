@@ -481,8 +481,16 @@ These apply to **both** placement and admission — VM create (including a pinne
 `--host`) and live resize all consult the same numbers, so the scheduler and the
 admission check cannot disagree.
 
-To exceed them deliberately for one VM, pass `lv run --allow-overcommit`; the
-host check is skipped (project quota still applies) and the bypass is audited.
+Admission runs on VM **create** and on **start** — usage counts running VMs, so a
+stopped VM consumes nothing until it starts, and checking only at create time
+would be sidestepped by creating VMs that each fit and then starting them all.
+Automated recovery is deliberately exempt: the failover/reconciler restart paths
+are not admitted, because after a host reboot every VM starts at once and
+refusing there would strand the ones that lost the race.
+
+To exceed the policy deliberately for one VM, pass `--allow-overcommit` to
+`lv run` or `lv start`; the host check is skipped (project quota still applies)
+and the bypass is audited.
 
 ## Ports summary
 

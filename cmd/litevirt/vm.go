@@ -164,13 +164,16 @@ func newInspectCmd() *cobra.Command {
 }
 
 func newStartCmd() *cobra.Command {
-	return &cobra.Command{
+	var allowOvercommit bool
+	cmd := &cobra.Command{
 		Use:   "start <vm>",
 		Short: "Start a stopped VM",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				vm, err := c.StartVM(ctx, &pb.StartVMRequest{Name: args[0]})
+				vm, err := c.StartVM(ctx, &pb.StartVMRequest{
+					Name: args[0], AllowOvercommit: allowOvercommit,
+				})
 				if err != nil {
 					return fmt.Errorf("start VM: %w", err)
 				}
@@ -179,6 +182,9 @@ func newStartCmd() *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
+		"Skip the host capacity check for this start (project quota still applies). The bypass is audited.")
+	return cmd
 }
 
 func newStopCmd() *cobra.Command {

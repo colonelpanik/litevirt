@@ -486,7 +486,8 @@ func newHostConfigCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&fenceStrategy, "fence-strategy", "", "Fencing strategy (ssh, ipmi, watchdog)")
+	cmd.Flags().StringVar(&fenceStrategy, "fence-strategy", "",
+		"Fencing strategy: ssh | ipmi | watchdog | manual | best-effort. 'manual' never powers the host off — it records the intent and waits for `lv host fence-confirm`.")
 	cmd.Flags().StringVar(&ipmiAddr, "ipmi-address", "", "IPMI BMC address")
 	cmd.Flags().StringVar(&ipmiUser, "ipmi-user", "", "IPMI username")
 	cmd.Flags().StringVar(&ipmiPass, "ipmi-pass", "", "IPMI password")

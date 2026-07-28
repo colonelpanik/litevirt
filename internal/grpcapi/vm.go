@@ -2803,6 +2803,37 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if fresh.ActiveOperationID != "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "cannot reconfigure %q: an operation is in progress", req.Name)
 			}
+
+			// Host capacity admission for a reconfigure that GROWS the VM.
+			//
+			// Placed BEFORE the stop, deliberately. This path is stop → redefine →
+			// start, so admitting anywhere later means refusing after the redefine has
+			// already succeeded — leaving the VM stopped, resized, and unable to come
+			// back, which is a worse outcome than the overcommit. Refusing here costs
+			// nothing: the VM is still running on its old spec and nothing has changed.
+			//
+			// The delta is target MINUS current, not the full new size: the VM is
+			// running and already counted at its current actuals, so only the growth
+			// consumes anything. A shrink is a no-op (posOnly), and a stopped VM never
+			// reaches here — its capacity is admitted by StartVM when it starts.
+			wantCPU, wantMem := spec.Cpu, spec.MemoryMib
+			if req.Cpu > 0 {
+				wantCPU = req.Cpu
+			}
+			if req.MemoryMib > 0 {
+				wantMem = req.MemoryMib
+			}
+			cpuGrow, memGrow := posOnly(int(wantCPU-spec.Cpu)), posOnly(int(wantMem-spec.MemoryMib))
+			if req.AllowOvercommit {
+				if cpuGrow > 0 || memGrow > 0 {
+					s.audit(ctx, "vm.update", req.Name,
+						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",
+							fresh.HostName, cpuGrow, memGrow), "allow-overcommit")
+				}
+			} else if err := s.checkResourceAdmission(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow); err != nil {
+				return nil, err
+			}
+
 			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
 				return nil, serr
 			}

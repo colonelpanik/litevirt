@@ -243,6 +243,10 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     string         idempotency_key = 19;  // cross-entry-node dedup of a retried update (D4 semantics)
     optional int32 max_cpu         = 20;  // set the vCPU hotplug ceiling (live_resize; latched)
     optional bool  allow_restart   = 21;  // permit a stop→redefine→start for a change that can't apply live
+
+    // allow_overcommit skips HOST capacity admission for a --restart-if-needed
+    // reconfigure that GROWS the VM (project quota still applies). Audited.
+    bool allow_overcommit = 22;
 }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is

@@ -49,9 +49,11 @@ type RebalanceExecutor struct {
 
 // NewRebalanceExecutor builds an executor sharing the rebalancer leader lease.
 func NewRebalanceExecutor(svc *Server, hostName string, db *corrosion.Client) *RebalanceExecutor {
+	rb := scheduler.NewRebalancer(hostName, db)
+	rb.SetCapacityPolicy(svc.capacity)
 	return &RebalanceExecutor{
 		svc:          svc,
-		rb:           scheduler.NewRebalancer(hostName, db),
+		rb:           rb,
 		db:           db,
 		Interval:     30 * time.Second,
 		StaleTimeout: 30 * time.Minute,

@@ -21,10 +21,16 @@ type ClusterState struct {
 	LBs        []corrosion.LBConfigRecord
 	Devices    map[string][]corrosion.PCIDeviceRecord // host → available devices
 	ImageHosts map[string][]string                    // imageName → hosts that have it (status=ready)
+
+	// Capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
+	Capacity corrosion.CapacityPolicy
 }
 
 // LoadClusterState queries Corrosion once and builds an immutable snapshot.
-func LoadClusterState(ctx context.Context, db *corrosion.Client) (*ClusterState, error) {
+// capacity is the cluster-wide capacity policy — a parameter (not loaded here)
+// because it comes from daemon config, not Corrosion; requiring it keeps any
+// new caller from silently planning under default capacity.
+func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corrosion.CapacityPolicy) (*ClusterState, error) {
 	hosts, err := corrosion.ListHosts(ctx, db)
 	if err != nil {
 		return nil, err
@@ -89,5 +95,6 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client) (*ClusterState,
 		LBs:        lbs,
 		Devices:    devices,
 		ImageHosts: imageHosts,
+		Capacity:   capacity,
 	}, nil
 }

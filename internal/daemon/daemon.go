@@ -457,13 +457,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start the host health checker (created above, before the replicator).
 	go d.checker.Start(ctx)
 
+	// One capacity policy shared by admission (svc below), failover, and the
+	// rebalancer, so placement and admission can never disagree.
+	capacity := d.cfg.Capacity.Policy()
+
 	// Create the failover coordinator; started after the gRPC server is built
 	// so its replica-promoter (auto_promote recovery) can be wired first.
 	fc := failover.NewCoordinator(d.cfg.HostName, d.db)
+	fc.SetCapacityPolicy(capacity)
 
 	// Start rebalance coordinator. Leader-gated; safe to start on
 	// every host. Defaults to dry-run on every VM unless compose says otherwise.
 	rc := scheduler.NewRebalancer(d.cfg.HostName, d.db)
+	rc.SetCapacityPolicy(capacity)
 	go rc.Start(ctx)
 
 	// Start snapshot scheduler. Leader-gated like the
@@ -625,7 +631,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
 	// overrides live on the host record and win where set.
-	svc.SetCapacityPolicy(d.cfg.Capacity.Policy())
+	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())

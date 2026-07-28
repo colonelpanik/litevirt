@@ -79,6 +79,9 @@ type Rebalancer struct {
 	hostName string
 	db       *corrosion.Client
 
+	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
+	capacity corrosion.CapacityPolicy
+
 	// Tunables — overridable per cluster.
 	PollInterval time.Duration
 	ProposalTTL  time.Duration
@@ -104,6 +107,9 @@ func NewRebalancer(hostName string, db *corrosion.Client) *Rebalancer {
 		Now:          func() time.Time { return time.Now() },
 	}
 }
+
+// SetCapacityPolicy wires the cluster-wide capacity policy.
+func (r *Rebalancer) SetCapacityPolicy(p corrosion.CapacityPolicy) { r.capacity = p }
 
 // now is the rebalancer's clock.
 func (r *Rebalancer) now() time.Time {
@@ -279,7 +285,7 @@ func (r *Rebalancer) bestMove(snap *placement.ClusterSnapshot, vm corrosion.VMRe
 
 	// Build the FULL placement request from the VM's stored spec — not just
 	// CPU/Mem — so destination eligibility honors every hard constraint.
-	req := buildPlacementRequest(vm, spec, pol)
+	req := buildPlacementRequest(vm, spec, pol, r.capacity)
 
 	// Score against a snapshot with THIS VM removed from its source: the source
 	// is then scored as "VM placed here as a newcomer" on identical footing with
@@ -353,13 +359,14 @@ func (r *Rebalancer) bestMove(snap *placement.ClusterSnapshot, vm corrosion.VMRe
 // buildPlacementRequest constructs a placement.Request from a VM's stored spec
 // so candidate scoring honors every hard constraint the VM was admitted under.
 // A nil spec yields a CPU/Mem-only request (best effort for legacy rows).
-func buildPlacementRequest(vm corrosion.VMRecord, spec *pb.VMSpec, pol vmPolicy) placement.Request {
+func buildPlacementRequest(vm corrosion.VMRecord, spec *pb.VMSpec, pol vmPolicy, capacity corrosion.CapacityPolicy) placement.Request {
 	req := placement.Request{
 		VMName:       vm.Name,
 		CPUNeeded:    vm.CPUActual,
 		MemMiBNeeded: vm.MemActual,
 		Policy:       pol.Policy,
 		VMBaseName:   vmBaseName(vm.Name),
+		Capacity:     capacity,
 	}
 	if spec == nil {
 		return req

@@ -474,9 +474,11 @@ These apply to **both** placement and admission — VM create (including a pinne
 `--host`) and live resize all consult the same numbers, so the scheduler and the
 admission check cannot disagree.
 
-Admission runs on VM **create** and on **start** — usage counts running VMs, so a
-stopped VM consumes nothing until it starts, and checking only at create time
-would be sidestepped by creating VMs that each fit and then starting them all.
+Admission runs wherever a host's usage can GROW: VM **create**, **start**, live
+**resize**, and a `--restart-if-needed` **reconfigure** that grows the VM. Usage
+counts running VMs, so a stopped VM consumes nothing until it starts — checking
+only at create time would be sidestepped by creating VMs that each fit and then
+starting them all. A shrink never consumes anything and is never refused.
 Automated recovery is deliberately exempt: the failover/reconciler restart paths
 are not admitted, because after a host reboot every VM starts at once and
 refusing there would strand the ones that lost the race.

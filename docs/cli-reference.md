@@ -568,8 +568,9 @@ lv host config node-1 --cpu-reserve 2          # vCPUs held back; negative = inh
 # Deliberate density for one VM — skips the HOST capacity check, audited.
 # Project quota still applies. Available on both create and start, because
 # starting a stopped VM is when its memory is actually consumed.
-lv run   --name db --image ubuntu --memory 4096 --host node-1 --allow-overcommit
-lv start db --allow-overcommit
+lv run    --name db --image ubuntu --memory 4096 --host node-1 --allow-overcommit
+lv start  db --allow-overcommit
+lv update db --memory 8192 --restart-if-needed --allow-overcommit
 ```
 
 A `--mem-reserve 0` is a real setting meaning "hand guests every last MiB", which

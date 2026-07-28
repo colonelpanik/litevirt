@@ -3635,8 +3635,11 @@ type UpdateVMRequest struct {
 	IdempotencyKey string                 `protobuf:"bytes,19,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`  // cross-entry-node dedup of a retried update (D4 semantics)
 	MaxCpu         *int32                 `protobuf:"varint,20,opt,name=max_cpu,json=maxCpu,proto3,oneof" json:"max_cpu,omitempty"`                   // set the vCPU hotplug ceiling (live_resize; latched)
 	AllowRestart   *bool                  `protobuf:"varint,21,opt,name=allow_restart,json=allowRestart,proto3,oneof" json:"allow_restart,omitempty"` // permit a stop→redefine→start for a change that can't apply live
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// allow_overcommit skips HOST capacity admission for a --restart-if-needed
+	// reconfigure that GROWS the VM (project quota still applies). Audited.
+	AllowOvercommit bool `protobuf:"varint,22,opt,name=allow_overcommit,json=allowOvercommit,proto3" json:"allow_overcommit,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *UpdateVMRequest) Reset() {
@@ -3812,6 +3815,13 @@ func (x *UpdateVMRequest) GetMaxCpu() int32 {
 func (x *UpdateVMRequest) GetAllowRestart() bool {
 	if x != nil && x.AllowRestart != nil {
 		return *x.AllowRestart
+	}
+	return false
+}
+
+func (x *UpdateVMRequest) GetAllowOvercommit() bool {
+	if x != nil {
+		return x.AllowOvercommit
 	}
 	return false
 }
@@ -22722,7 +22732,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10RebuildVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"+\n" +
 	"\x10CutoverVMRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\x8d\a\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xb8\a\n" +
 	"\x0fUpdateVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03cpu\x18\x02 \x01(\x05R\x03cpu\x12\x1d\n" +
@@ -22750,7 +22760,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fidempotency_key\x18\x13 \x01(\tR\x0eidempotencyKey\x12\x1c\n" +
 	"\amax_cpu\x18\x14 \x01(\x05H\tR\x06maxCpu\x88\x01\x01\x12(\n" +
 	"\rallow_restart\x18\x15 \x01(\bH\n" +
-	"R\fallowRestart\x88\x01\x01B\t\n" +
+	"R\fallowRestart\x88\x01\x01\x12)\n" +
+	"\x10allow_overcommit\x18\x16 \x01(\bR\x0fallowOvercommitB\t\n" +
 	"\a_onbootB\x10\n" +
 	"\x0e_startup_orderB\x12\n" +
 	"\x10_start_delay_secB\x11\n" +

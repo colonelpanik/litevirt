@@ -35,6 +35,7 @@ func newUpdateCmd() *cobra.Command {
 		tpm             bool
 		force           bool
 		restartIfNeeded bool
+		allowOvercommit bool
 	)
 	cmd := &cobra.Command{
 		Use:   "update <vm>",
@@ -99,6 +100,7 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 			}
 			if f.Changed("restart-if-needed") {
 				req.AllowRestart = &restartIfNeeded
+				req.AllowOvercommit = allowOvercommit
 			}
 			if f.Changed("secure-boot") {
 				req.SecureBoot = &secureBoot
@@ -164,5 +166,7 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 	cmd.Flags().BoolVar(&tpm, "tpm", false, "Enable/disable the emulated TPM 2.0 (VM must be stopped; --force if TPM state exists)")
 	cmd.Flags().BoolVar(&force, "force", false, "Allow toggling secure-boot/tpm even when firmware state exists")
 	cmd.Flags().BoolVar(&restartIfNeeded, "restart-if-needed", false, "Permit a stop→redefine→start for a change that can't apply live (cpu shrink, machine/firmware, beyond the vCPU ceiling)")
+	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
+		"Skip the host capacity check when --restart-if-needed grows the VM (project quota still applies). The bypass is audited.")
 	return cmd
 }

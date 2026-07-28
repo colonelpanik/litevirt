@@ -86,6 +86,7 @@ type DeviceRequest struct {
 	Type     string // gpu | network | nvme | infiniband
 	Count    int
 	Vendor   string // optional vendor filter
+	Address  string // optional exact PCI address
 	Clique   string // prefer specific NVLink/xGMI clique
 	SameNUMA bool   // require all devices on same NUMA node
 	// Sriov marks an SR-IOV VF request. Placement only gates host eligibility on an
@@ -124,39 +125,14 @@ const strictSpreadPressureCap = 0.5
 // LOW pressure (spread); bin-pack prefers HIGH pressure (concentrate).
 // cost-aware divides the final score by the host's `cost.hourly` label.
 func Select(ctx context.Context, db *corrosion.Client, req Request) (string, error) {
-	// Pinned to a specific host — just validate it exists and is active.
-	if req.PinHost != "" {
-		h, err := corrosion.GetHost(ctx, db, req.PinHost)
-		if err != nil || h == nil {
-			return "", fmt.Errorf("pinned host %q not found", req.PinHost)
-		}
-		if h.State != "active" {
-			return "", fmt.Errorf("pinned host %q is not active (state: %s)", req.PinHost, h.State)
-		}
-		if h.IsWitness() {
-			return "", fmt.Errorf("pinned host %q is a witness; witnesses do not host workloads", req.PinHost)
-		}
-		return req.PinHost, nil
-	}
-
-	snap, err := BuildSnapshot(ctx, db)
+	snap, err := snapshotForRequest(ctx, db, &req)
 	if err != nil {
 		return "", err
 	}
-
-	// Optional device pool load (only when a device is requested).
-	if len(req.Devices) > 0 {
-		snap.Devices = make(map[string][]corrosion.PCIDeviceRecord)
-		for _, h := range snap.HostsBy {
-			devs, err := corrosion.GetAvailableDevicesWithTopology(ctx, db, h.Name, "")
-			if err == nil {
-				snap.Devices[h.Name] = devs
-			}
+	if req.PinHost != "" {
+		if err := restrictToPinnedHost(snap, req.PinHost); err != nil {
+			return "", err
 		}
-	}
-
-	if req.MaxPerNode > 0 {
-		snap.SeedReplicasForBase(req.VMBaseName)
 	}
 
 	candidates, err := scoreCandidates(snap, &req, false)
@@ -165,6 +141,61 @@ func Select(ctx context.Context, db *corrosion.Client, req Request) (string, err
 	}
 
 	return pickBest(candidates), nil
+}
+
+// ValidatePinned checks one already-resolved host through the same snapshot and
+// hard-filter pipeline as Select. It does not perform cluster-wide scoring.
+func ValidatePinned(ctx context.Context, db *corrosion.Client, req Request, host string) error {
+	if host == "" {
+		return fmt.Errorf("resolved host is required")
+	}
+	req.PinHost = host
+	snap, err := snapshotForRequest(ctx, db, &req)
+	if err != nil {
+		return err
+	}
+	if err := restrictToPinnedHost(snap, host); err != nil {
+		return err
+	}
+	_, err = scoreCandidates(snap, &req, false)
+	return err
+}
+
+func snapshotForRequest(ctx context.Context, db *corrosion.Client, req *Request) (*ClusterSnapshot, error) {
+	snap, err := BuildSnapshot(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	if len(req.Devices) > 0 {
+		snap.Devices = make(map[string][]corrosion.PCIDeviceRecord)
+		for _, host := range snap.HostsBy {
+			devices, loadErr := corrosion.GetAvailableDevicesWithTopology(ctx, db, host.Name, "")
+			if loadErr == nil {
+				snap.Devices[host.Name] = devices
+			}
+		}
+	}
+	if req.MaxPerNode > 0 {
+		snap.SeedReplicasForBase(req.VMBaseName)
+	}
+	return snap, nil
+}
+
+func restrictToPinnedHost(snap *ClusterSnapshot, host string) error {
+	record, ok := snap.Hosts[host]
+	if !ok {
+		return fmt.Errorf("pinned host %q not found", host)
+	}
+	if record.State != "active" {
+		return fmt.Errorf("pinned host %q is not active (state: %s)", host, record.State)
+	}
+	if record.IsWitness() {
+		return fmt.Errorf("pinned host %q is a witness; witnesses do not host workloads", host)
+	}
+	// A pin restricts the candidate set; it does not bypass eligibility. The
+	// singleton still traverses the exact hard-filter pipeline.
+	snap.HostsBy = []corrosion.HostRecord{record}
+	return nil
 }
 
 // scoreCandidates runs hard filters + soft scoring against snapshot.
@@ -420,25 +451,21 @@ func SelectBatch(
 	results := make(map[string]BatchResult, len(requests))
 
 	for _, req := range requests {
-		// Pinned host — validate and skip scoring.
+		evalSnap := snap
 		if req.PinHost != "" {
-			found := false
-			for _, h := range hosts {
-				if h.Name == req.PinHost && h.State == "active" && !h.IsWitness() {
-					found = true
-					break
-				}
-			}
-			if !found {
+			h, ok := snap.Hosts[req.PinHost]
+			if !ok || h.State != "active" || h.IsWitness() {
 				return nil, fmt.Errorf("pinned host %q not found, not active, or is a witness for VM %q", req.PinHost, req.VMName)
 			}
-			devAssign := assignDevices(snap.Devices, req.PinHost, req.Devices)
-			results[req.VMName] = BatchResult{Host: req.PinHost, Devices: devAssign}
-			snap.CommitPlacement(req.PinHost, req.VMName, req.VMBaseName, req.CPUNeeded, req.MemMiBNeeded)
-			continue
+			// Shallow-copy the snapshot and restrict only its stable candidate
+			// slice. The resource, replica, affinity, and device maps stay shared
+			// with the mutable batch snapshot and therefore remain batch-aware.
+			pinnedSnap := *snap
+			pinnedSnap.HostsBy = []corrosion.HostRecord{h}
+			evalSnap = &pinnedSnap
 		}
 
-		candidates, err := scoreCandidates(snap, &req, true)
+		candidates, err := scoreCandidates(evalSnap, &req, true)
 		if err != nil {
 			return nil, err
 		}

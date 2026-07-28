@@ -1747,6 +1747,15 @@ message UninstallHostResponse {
     string status    = 2;
 }
 
+// Internal owner-side create envelope. The entry node resolves placement once;
+// the selected owner validates the decision and executes it without forwarding.
+message ExecuteCreateVMRequest {
+    CreateVMRequest request = 1;
+    string resolved_host = 2;
+    string placement_fingerprint = 3;
+    uint32 hop_count = 4;
+}
+
 // ═══════════ Service ═══════════
 
 service LiteVirt {
@@ -2111,6 +2120,9 @@ service LiteVirt {
     rpc SetProjectQuota(SetProjectQuotaRequest)     returns (ProjectQuota);
     rpc GetProjectQuota(GetProjectQuotaRequest)     returns (ProjectQuota);
     rpc GetProjectUsage(GetProjectUsageRequest)     returns (ProjectUsage);
+
+    // Internal owner-side endpoint appended for wire-order stability.
+    rpc ExecuteCreateVM(ExecuteCreateVMRequest) returns (VM);
 }
 
 // Pre-flight check before `lv host upgrade`. Surfaces in-flight work,

@@ -242,6 +242,7 @@ const (
 	LiteVirt_SetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/SetProjectQuota"
 	LiteVirt_GetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectQuota"
 	LiteVirt_GetProjectUsage_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectUsage"
+	LiteVirt_ExecuteCreateVM_FullMethodName            = "/litevirt.v1.LiteVirt/ExecuteCreateVM"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -573,6 +574,8 @@ type LiteVirtClient interface {
 	SetProjectQuota(ctx context.Context, in *SetProjectQuotaRequest, opts ...grpc.CallOption) (*ProjectQuota, error)
 	GetProjectQuota(ctx context.Context, in *GetProjectQuotaRequest, opts ...grpc.CallOption) (*ProjectQuota, error)
 	GetProjectUsage(ctx context.Context, in *GetProjectUsageRequest, opts ...grpc.CallOption) (*ProjectUsage, error)
+	// Internal owner-side endpoint appended for wire-order stability.
+	ExecuteCreateVM(ctx context.Context, in *ExecuteCreateVMRequest, opts ...grpc.CallOption) (*VM, error)
 }
 
 type liteVirtClient struct {
@@ -3049,6 +3052,16 @@ func (c *liteVirtClient) GetProjectUsage(ctx context.Context, in *GetProjectUsag
 	return out, nil
 }
 
+func (c *liteVirtClient) ExecuteCreateVM(ctx context.Context, in *ExecuteCreateVMRequest, opts ...grpc.CallOption) (*VM, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VM)
+	err := c.cc.Invoke(ctx, LiteVirt_ExecuteCreateVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -3378,6 +3391,8 @@ type LiteVirtServer interface {
 	SetProjectQuota(context.Context, *SetProjectQuotaRequest) (*ProjectQuota, error)
 	GetProjectQuota(context.Context, *GetProjectQuotaRequest) (*ProjectQuota, error)
 	GetProjectUsage(context.Context, *GetProjectUsageRequest) (*ProjectUsage, error)
+	// Internal owner-side endpoint appended for wire-order stability.
+	ExecuteCreateVM(context.Context, *ExecuteCreateVMRequest) (*VM, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -4053,6 +4068,9 @@ func (UnimplementedLiteVirtServer) GetProjectQuota(context.Context, *GetProjectQ
 }
 func (UnimplementedLiteVirtServer) GetProjectUsage(context.Context, *GetProjectUsageRequest) (*ProjectUsage, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetProjectUsage not implemented")
+}
+func (UnimplementedLiteVirtServer) ExecuteCreateVM(context.Context, *ExecuteCreateVMRequest) (*VM, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExecuteCreateVM not implemented")
 }
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
@@ -7793,6 +7811,24 @@ func _LiteVirt_GetProjectUsage_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ExecuteCreateVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExecuteCreateVMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ExecuteCreateVM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ExecuteCreateVM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ExecuteCreateVM(ctx, req.(*ExecuteCreateVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -8551,6 +8587,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetProjectUsage",
 			Handler:    _LiteVirt_GetProjectUsage_Handler,
+		},
+		{
+			MethodName: "ExecuteCreateVM",
+			Handler:    _LiteVirt_ExecuteCreateVM_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

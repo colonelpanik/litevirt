@@ -156,6 +156,117 @@ func TestSelect_PinHost_Inactive(t *testing.T) {
 	}
 }
 
+func TestSelect_PinnedHostStillEnforcesHardConstraints(t *testing.T) {
+	strictCapacity := corrosion.CapacityPolicy{
+		CPUOvercommit:    1,
+		MemOvercommit:    1,
+		CPUReserve:       0,
+		MemReserveMiB:    0,
+		MemReservePct:    0,
+		VMMemOverheadMiB: 0,
+	}
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *corrosion.Client)
+		req   Request
+	}{
+		{
+			name: "required label",
+			setup: func(t *testing.T, db *corrosion.Client) {
+				insertHost(t, db, corrosion.HostRecord{
+					Name: "node1", Address: "10.0.0.1", State: "active",
+					CPUTotal: 8, MemTotal: 8192,
+					Labels: map[string]string{"zone": "west"},
+				})
+			},
+			req: Request{
+				VMName: "vm1", PinHost: "node1",
+				RequireLabels: map[string]string{"zone": "east"},
+			},
+		},
+		{
+			name: "anti-affinity",
+			setup: func(t *testing.T, db *corrosion.Client) {
+				insertHost(t, db, corrosion.HostRecord{
+					Name: "node1", Address: "10.0.0.1", State: "active",
+					CPUTotal: 8, MemTotal: 8192,
+				})
+				if err := corrosion.InsertVM(context.Background(), db, corrosion.VMRecord{
+					Name: "peer", HostName: "node1", State: "running",
+					CPUActual: 1, MemActual: 512,
+				}, nil, nil); err != nil {
+					t.Fatalf("InsertVM: %v", err)
+				}
+			},
+			req: Request{
+				VMName: "vm1", PinHost: "node1",
+				AntiAffinity: []string{"peer"},
+			},
+		},
+		{
+			name: "max per node",
+			setup: func(t *testing.T, db *corrosion.Client) {
+				insertHost(t, db, corrosion.HostRecord{
+					Name: "node1", Address: "10.0.0.1", State: "active",
+					CPUTotal: 8, MemTotal: 8192,
+				})
+				if err := corrosion.InsertVM(context.Background(), db, corrosion.VMRecord{
+					Name: "web-1", HostName: "node1", State: "running",
+					CPUActual: 1, MemActual: 512,
+				}, nil, nil); err != nil {
+					t.Fatalf("InsertVM: %v", err)
+				}
+			},
+			req: Request{
+				VMName: "web-2", VMBaseName: "web", PinHost: "node1",
+				MaxPerNode: 1,
+			},
+		},
+		{
+			name: "strict spread",
+			setup: func(t *testing.T, db *corrosion.Client) {
+				insertHost(t, db, corrosion.HostRecord{
+					Name: "node1", Address: "10.0.0.1", State: "active",
+					CPUTotal: 4, MemTotal: 4096,
+				})
+				if err := corrosion.InsertVM(context.Background(), db, corrosion.VMRecord{
+					Name: "busy", HostName: "node1", State: "running",
+					CPUActual: 2, MemActual: 2048,
+				}, nil, nil); err != nil {
+					t.Fatalf("InsertVM: %v", err)
+				}
+			},
+			req: Request{
+				VMName: "vm1", PinHost: "node1", Policy: PolicySpreadStrict,
+				CPUNeeded: 1, MemMiBNeeded: 512, Capacity: strictCapacity,
+			},
+		},
+		{
+			name: "insufficient capacity",
+			setup: func(t *testing.T, db *corrosion.Client) {
+				insertHost(t, db, corrosion.HostRecord{
+					Name: "node1", Address: "10.0.0.1", State: "active",
+					CPUTotal: 2, MemTotal: 2048,
+				})
+			},
+			req: Request{
+				VMName: "vm1", PinHost: "node1",
+				CPUNeeded: 3, MemMiBNeeded: 1024, Capacity: strictCapacity,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testDB(t)
+			tt.setup(t, db)
+			if _, err := Select(context.Background(), db, tt.req); err == nil {
+				t.Fatalf("pinned host bypassed %s hard constraint", tt.name)
+			}
+		})
+	}
+}
+
 func TestSelect_RequireLabels(t *testing.T) {
 	db := testDB(t)
 	// node1 has no labels, node2 has zone=us-east

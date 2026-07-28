@@ -145,6 +145,8 @@ message CloudInitSpec {
 }
 
 message PlacementSpec {
+    // A host pin restricts candidate selection but never bypasses hard
+    // constraints (capacity, labels, devices, anti-affinity, or replica caps).
     string                 host          = 1;
     repeated string        anti_affinity = 2;
     repeated string        affinity      = 3;

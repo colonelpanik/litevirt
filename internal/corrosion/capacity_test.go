@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"maps"
 	"testing"
 )
 
@@ -114,6 +115,108 @@ func TestCapacityPolicy_ZeroValueDoesNotStarveEveryHost(t *testing.T) {
 	cpu, mem := HostAllocatable(labHost(), CapacityPolicy{})
 	if cpu <= 0 || mem <= 0 {
 		t.Fatalf("zero-value policy yields (%d cpu, %d mem) — an unconfigured cluster would refuse everything", cpu, mem)
+	}
+}
+
+func TestCapacityPolicyFingerprintNormalizesDefaults(t *testing.T) {
+	zero, err := CapacityPolicyFingerprint(CapacityPolicy{}, nil)
+	if err != nil {
+		t.Fatalf("zero fingerprint: %v", err)
+	}
+	defaults, err := CapacityPolicyFingerprint(DefaultCapacityPolicy(), map[string]HostCapacityOverride{})
+	if err != nil {
+		t.Fatalf("default fingerprint: %v", err)
+	}
+	if zero != defaults {
+		t.Fatalf("zero policy fingerprint %q != normalized defaults %q", zero, defaults)
+	}
+}
+
+func TestCapacityPolicyFingerprintIncludesEveryCapacityField(t *testing.T) {
+	base := DefaultCapacityPolicy()
+	baseFingerprint, err := CapacityPolicyFingerprint(base, nil)
+	if err != nil {
+		t.Fatalf("base fingerprint: %v", err)
+	}
+	variants := []CapacityPolicy{
+		func() CapacityPolicy { p := base; p.CPUOvercommit++; return p }(),
+		func() CapacityPolicy { p := base; p.MemOvercommit++; return p }(),
+		func() CapacityPolicy { p := base; p.CPUReserve++; return p }(),
+		func() CapacityPolicy { p := base; p.MemReserveMiB++; return p }(),
+		func() CapacityPolicy { p := base; p.MemReservePct++; return p }(),
+		func() CapacityPolicy { p := base; p.VMMemOverheadMiB++; return p }(),
+	}
+	for i, variant := range variants {
+		got, err := CapacityPolicyFingerprint(variant, nil)
+		if err != nil {
+			t.Fatalf("variant %d: %v", i, err)
+		}
+		if got == baseFingerprint {
+			t.Errorf("capacity field variant %d did not change fingerprint", i)
+		}
+	}
+}
+
+func TestCapacityPolicyFingerprintCanonicalizesHostOverrides(t *testing.T) {
+	cpuZero, memZero := 0, 0
+	overridesA := map[string]HostCapacityOverride{
+		"node-b": {CPUOvercommit: 2, MemOvercommit: 1.25},
+		"node-a": {CPUReserve: &cpuZero, MemReserveMiB: &memZero},
+	}
+	overridesB := map[string]HostCapacityOverride{}
+	overridesB["node-a"] = overridesA["node-a"]
+	overridesB["node-b"] = overridesA["node-b"]
+
+	a, err := CapacityPolicyFingerprint(DefaultCapacityPolicy(), overridesA)
+	if err != nil {
+		t.Fatalf("fingerprint A: %v", err)
+	}
+	b, err := CapacityPolicyFingerprint(DefaultCapacityPolicy(), overridesB)
+	if err != nil {
+		t.Fatalf("fingerprint B: %v", err)
+	}
+	if a != b {
+		t.Fatalf("map insertion order changed fingerprint: %q != %q", a, b)
+	}
+
+	changed := maps.Clone(overridesA)
+	changed["node-b"] = HostCapacityOverride{CPUOvercommit: 3, MemOvercommit: 1.25}
+	c, err := CapacityPolicyFingerprint(DefaultCapacityPolicy(), changed)
+	if err != nil {
+		t.Fatalf("changed fingerprint: %v", err)
+	}
+	if c == a {
+		t.Fatal("host override change did not change fingerprint")
+	}
+}
+
+func TestHostCapacityOverridesPreserveExplicitZeroAndIgnoreUnrelatedFields(t *testing.T) {
+	zero := 0
+	hosts := []HostRecord{
+		{
+			Name: "node-b", Labels: map[string]string{"zone": "west"},
+			CPUOvercommit: 2,
+		},
+		{
+			Name: "node-a", Address: "10.0.0.1",
+			CPUReserve: &zero, MemReserveMiB: &zero,
+		},
+	}
+	got := HostCapacityOverrides(hosts)
+	if got["node-a"].CPUReserve == nil || *got["node-a"].CPUReserve != 0 {
+		t.Fatalf("explicit zero CPU reserve lost: %+v", got["node-a"])
+	}
+	if got["node-a"].MemReserveMiB == nil || *got["node-a"].MemReserveMiB != 0 {
+		t.Fatalf("explicit zero memory reserve lost: %+v", got["node-a"])
+	}
+
+	changedUnrelated := append([]HostRecord(nil), hosts...)
+	changedUnrelated[0].Labels = map[string]string{"zone": "east"}
+	changedUnrelated[1].Address = "10.0.0.99"
+	a, _ := CapacityPolicyFingerprint(DefaultCapacityPolicy(), got)
+	b, _ := CapacityPolicyFingerprint(DefaultCapacityPolicy(), HostCapacityOverrides(changedUnrelated))
+	if a != b {
+		t.Fatal("non-capacity host fields changed capacity-policy fingerprint")
 	}
 }
 

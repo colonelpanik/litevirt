@@ -135,6 +135,23 @@ func TestSelect_DeviceRequirement_SkipsAssigned(t *testing.T) {
 	}
 }
 
+func TestSelect_PinnedHostRejectsUnavailableDevice(t *testing.T) {
+	db := testDB(t)
+	insertHost(t, db, corrosion.HostRecord{
+		Name: "node1", Address: "10.0.0.1", State: "active",
+		CPUTotal: 32, MemTotal: 65536,
+	})
+
+	_, err := Select(context.Background(), db, Request{
+		VMName:  "vm1",
+		PinHost: "node1",
+		Devices: []DeviceRequest{{Type: "gpu", Count: 1}},
+	})
+	if err == nil {
+		t.Fatal("pinned host bypassed unavailable-device hard constraint")
+	}
+}
+
 func TestSelect_DeviceWithOtherConstraints(t *testing.T) {
 	db := testDB(t)
 	insertHost(t, db, corrosion.HostRecord{

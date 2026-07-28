@@ -9,10 +9,10 @@ import (
 
 // Topology scoring bonuses (per device pair).
 const (
-	bonusLinkClique  = 40 // same NVLink/xGMI clique
-	bonusPCIeBridge  = 25 // same PCIe switch/bridge
-	bonusPCIeRoot    = 15 // same PCIe root complex
-	bonusNUMANode    = 8  // same NUMA node, different root
+	bonusLinkClique = 40 // same NVLink/xGMI clique
+	bonusPCIeBridge = 25 // same PCIe switch/bridge
+	bonusPCIeRoot   = 15 // same PCIe root complex
+	bonusNUMANode   = 8  // same NUMA node, different root
 )
 
 // TopologyScore evaluates how well a set of candidate devices satisfies a
@@ -149,6 +149,27 @@ func scoreHostDevices(devices []corrosion.PCIDeviceRecord, reqs []DeviceRequest)
 		count := req.Count
 		if count <= 0 {
 			count = 1
+		}
+
+		if req.Address != "" {
+			found := false
+			for _, device := range devices {
+				if device.Address != req.Address || device.VMName != "" {
+					continue
+				}
+				if req.Type != "" && device.Type != req.Type {
+					continue
+				}
+				if req.Vendor != "" && device.VendorID != req.Vendor && device.VendorName != req.Vendor {
+					continue
+				}
+				found = true
+				break
+			}
+			if !found || count != 1 {
+				return false, 0
+			}
+			continue
 		}
 
 		// SR-IOV: gate on an SR-IOV-capable PF (matching type/vendor/parent) being

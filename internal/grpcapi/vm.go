@@ -65,7 +65,14 @@ func validateSpecNames(spec *pb.VMSpec) error {
 	return nil
 }
 
-func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *pb.VM, retErr error) {
+func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM, error) {
+	if err := validateCreateVMForwardHop(ctx); err != nil {
+		return nil, err
+	}
+	return s.createVM(ctx, req, nil)
+}
+
+func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision *resolvedCreateVMDecision) (resp *pb.VM, retErr error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
@@ -176,65 +183,25 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	}
 
 	// Placement: determine which host should run this VM.
-	placementReq := placement.Request{
-		VMName:       spec.Name,
-		CPUNeeded:    int(spec.Cpu),
-		MemMiBNeeded: int(spec.MemoryMib),
-		Capacity:     s.capacity,
-	}
-	if p := spec.Placement; p != nil {
-		placementReq.PinHost = p.Host
-		placementReq.AntiAffinity = p.AntiAffinity
-		placementReq.Affinity = p.Affinity
-		placementReq.RequireLabels = p.Require
-		placementReq.PreferLabels = p.Prefer
-		placementReq.Spread = p.Spread
-		if p.MaxPerNode > 0 {
-			placementReq.MaxPerNode = int(p.MaxPerNode)
-			placementReq.VMBaseName = vmBaseName(spec.Name)
+	placementReq := s.createVMPlacementRequest(ctx, spec, req.AllowOvercommit)
+	targetHost := ""
+	if decision != nil {
+		targetHost = decision.resolvedHost
+	} else {
+		targetHost, err = placement.Select(ctx, s.db, placementReq)
+		if err != nil {
+			return nil, status.Errorf(codes.ResourceExhausted, "placement failed: %v", err)
 		}
 	}
-	addCapabilityLabels(&placementReq, spec) // vTPM/Secure Boot → capable hosts only (G1)
-	for _, dev := range spec.Devices {
-		placementReq.Devices = append(placementReq.Devices, placement.DeviceRequest{
-			Type:   dev.Type,
-			Count:  int(dev.Count),
-			Vendor: dev.Vendor,
-		})
-	}
-	// Populate network requirements for placement scoring.
-	for _, nic := range spec.Network {
-		if nic.Name == "" {
-			continue
-		}
-		nr, _ := corrosion.GetNetwork(ctx, s.db, nic.Name)
-		ntype := "bridge"
-		if nr != nil {
-			ntype = nr.Type
-		}
-		placementReq.Networks = append(placementReq.Networks, placement.NetworkReq{
-			Name: nic.Name,
-			Type: ntype,
-		})
-	}
-
-	targetHost, err := placement.Select(ctx, s.db, placementReq)
-	if err != nil {
-		return nil, status.Errorf(codes.ResourceExhausted, "placement failed: %v", err)
-	}
-	// Host capacity admission. When placement CHOOSES a host it already scores
-	// capacity, but a PINNED host (`--host` / spec.placement.host) skips scoring
-	// entirely — Select only checks the host exists, is active, and isn't a witness
-	// — so a pinned create had no capacity check at all. Three 1 GiB VMs pinned to a
-	// ~3 GiB host were all accepted, the cluster reported 3072/2971 MiB, and the node
-	// thrashed until sshd stopped answering. A too-large single VM reached qemu and
-	// came back as a raw "cannot set up guest memory" error.
+	// Host capacity admission. Placement now runs pinned and unpinned candidates
+	// through the same capacity filter; this explicit admission remains the
+	// write-side recheck, including on the owner after a remote decision arrives.
+	// Before pinned filtering was fixed, three 1 GiB VMs could be pinned to a
+	// ~3 GiB host and accepted until the node thrashed.
 	//
 	// This is the same check the resize path has used all along (resize.go:116), so
 	// growing a VM into a host was refused while creating one there was not. The
-	// spec (and therefore the pin) travels with a forwarded request, so this runs on
-	// the entry node to fail fast AND again on the owning host, where it is
-	// serialized against concurrent creates.
+	// This runs on the entry node to fail fast and again on the owning host.
 	if req.AllowOvercommit {
 		// Deliberate density on a host the operator judges can take it. Project
 		// quota still applies (that is a tenancy limit, not a physical one); only
@@ -260,29 +227,11 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		}
 	}
 	if targetHost != s.hostName {
-		slog.Info("forwarding CreateVM to target host", "vm", spec.Name, "target", targetHost)
-		client, conn, err := s.peerClient(ctx, targetHost)
-		if err != nil {
-			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", targetHost, err)
+		if decision != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"resolved create owner %q does not match local host %q", targetHost, s.hostName)
 		}
-		defer conn.Close()
-		// The entry node owns the idempotency claim. Strip the key from the
-		// forwarded copy so the executor does NOT re-enter the idempotency path and
-		// self-conflict on the same key — otherwise the entry's claim either aborts
-		// the forward (if it replicated first) or the executor races a duplicate
-		// claim on the same row.
-		fwd := req
-		if req.IdempotencyKey != "" {
-			fwd = proto.Clone(req).(*pb.CreateVMRequest)
-			fwd.IdempotencyKey = ""
-		}
-		out, err := client.CreateVM(ctx, fwd)
-		if err != nil {
-			return nil, err
-		}
-		// The remote host's mutation_log entry will be replicated to us
-		// via the WAL-based replicator. No need to manually sync.
-		return out, nil
+		return s.forwardCreateVM(ctx, req, targetHost)
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)

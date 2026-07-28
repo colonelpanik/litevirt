@@ -983,17 +983,19 @@ func (x *CloudInitSpec) GetNetworkconfig() string {
 }
 
 type PlacementSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
-	AntiAffinity  []string               `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
-	Affinity      []string               `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
-	Require       map[string]string      `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Prefer        map[string]string      `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Spread        bool                   `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
-	MaxPerNode    int32                  `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
-	Policy        string                 `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
-	Rebalance     *RebalanceSpec         `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
-	NoMigrate     bool                   `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A host pin restricts candidate selection but never bypasses hard
+	// constraints (capacity, labels, devices, anti-affinity, or replica caps).
+	Host          string            `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
+	AntiAffinity  []string          `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
+	Affinity      []string          `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
+	Require       map[string]string `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Prefer        map[string]string `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Spread        bool              `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
+	MaxPerNode    int32             `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
+	Policy        string            `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
+	Rebalance     *RebalanceSpec    `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
+	NoMigrate     bool              `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

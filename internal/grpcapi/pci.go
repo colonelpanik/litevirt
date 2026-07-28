@@ -333,8 +333,18 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 		return members, nil
 	}
 
-	// Type-based allocation.
-	available, err := corrosion.GetAvailableDevicesByType(ctx, s.db, s.hostName, spec.Type)
+	// Type/vendor allocation. A vendor-only selector is classified as type-kind
+	// even when Type is empty, so it must search the whole unassigned inventory;
+	// querying GetAvailableDevicesByType with "" would incorrectly require a
+	// literal empty device type. Preserve the narrower indexed query whenever a
+	// concrete type is present.
+	var available []corrosion.PCIDeviceRecord
+	var err error
+	if spec.Type == "" {
+		available, err = corrosion.GetAvailableDevicesWithTopology(ctx, s.db, s.hostName, "")
+	} else {
+		available, err = corrosion.GetAvailableDevicesByType(ctx, s.db, s.hostName, spec.Type)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query devices: %v", err)
 	}

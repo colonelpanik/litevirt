@@ -536,6 +536,58 @@ func TestCreateAndExecuteTypeModelSelectorIgnoreFrozenAddress(t *testing.T) {
 	}
 }
 
+func TestCreateAndExecuteVendorOnlySelectorAcrossDeviceTypes(t *testing.T) {
+	for _, execute := range []bool{false, true} {
+		name := "CreateVM"
+		if execute {
+			name = "ExecuteCreateVM"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := testServerR2(t)
+			s.virt = libvirtfake.New()
+			restore := vfio.SetFS(newPCIBindFakeFS())
+			defer restore()
+			insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
+			insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
+
+			stale := "0000:41:00.0"
+			matched := "0000:43:00.0"
+			for _, device := range []corrosion.PCIDeviceRecord{
+				{
+					HostName: "test-host", Address: stale, Type: "gpu",
+					VendorID: "1002", DeviceName: "stale-amd", IOMMUGroup: -1,
+				},
+				{
+					HostName: "test-host", Address: "0000:42:00.0", Type: "network",
+					VendorID: "8086", DeviceName: "unrelated-nic", IOMMUGroup: -1,
+				},
+				{
+					HostName: "test-host", Address: matched, Type: "nvme",
+					VendorID: "10de", DeviceName: "vendor-match", IOMMUGroup: -1,
+				},
+			} {
+				if err := corrosion.UpsertPCIDevice(context.Background(), s.db, device); err != nil {
+					t.Fatalf("UpsertPCIDevice(%s): %v", device.Address, err)
+				}
+			}
+
+			vmName := "vendor-create"
+			if execute {
+				vmName = "vendor-execute"
+			}
+			invokeDeviceSelectorCreate(t, s, execute, &pb.VMSpec{
+				Name:      vmName,
+				Placement: &pb.PlacementSpec{Host: "test-host"},
+				Devices: []*pb.DeviceSpec{{
+					Vendor:  "10de",
+					Address: stale,
+				}},
+			})
+			assertOnlyOwnedPCIAddress(t, s, vmName, matched)
+		})
+	}
+}
+
 func TestCreateAndExecuteRejectWrongDeviceModel(t *testing.T) {
 	newServer := func(t *testing.T) *Server {
 		t.Helper()

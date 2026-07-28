@@ -68,11 +68,20 @@ type SyncMetrics interface {
 
 // Config holds configuration for the embedded state store.
 type Config struct {
-	HostName  string   // identity of this node
-	DataDir   string   // SQLite file at DataDir/state.db
-	BindAddr  string   // gossip bind address (default "0.0.0.0")
-	BindPort  int      // gossip port (default 7946)
-	JoinPeers []string // initial peers to join
+	HostName string // identity of this node
+	DataDir  string // SQLite file at DataDir/state.db
+	BindAddr string // gossip bind address (default "0.0.0.0")
+	// AdvertiseAddr is the address peers should reach this node on. Empty ⇒
+	// memberlist auto-detects, which picks the first private IP by INTERFACE
+	// ENUMERATION ORDER — not by routing. On a multi-homed host whose cluster
+	// network is not the first interface, auto-detection advertises the wrong
+	// address and peers dial somewhere else entirely (or, when the wrong address
+	// happens to be identical on every node — a NAT'd lab, a container fabric —
+	// each node dials itself and TLS fails on the SAN mismatch). Set it whenever
+	// the cluster network is not unambiguous.
+	AdvertiseAddr string
+	BindPort      int      // gossip port (default 7946)
+	JoinPeers     []string // initial peers to join
 }
 
 // Client is the embedded state store with WAL-based replication.
@@ -597,6 +606,9 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 	mlCfg.BindAddr = cfg.BindAddr
 	mlCfg.BindPort = cfg.BindPort
 	mlCfg.AdvertisePort = cfg.BindPort
+	// Empty leaves memberlist's auto-detection in place (see Config.AdvertiseAddr
+	// for why that is only safe on an unambiguously single-homed host).
+	mlCfg.AdvertiseAddr = cfg.AdvertiseAddr
 	mlCfg.LogOutput = &slogWriter{}
 
 	del := &delegate{client: c}

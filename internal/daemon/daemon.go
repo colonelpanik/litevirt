@@ -124,10 +124,11 @@ func New(cfg *Config) (*Daemon, error) {
 
 	// Open embedded state store and join gossip cluster
 	db, err := corrosion.NewClient(corrosion.Config{
-		HostName:  cfg.HostName,
-		DataDir:   cfg.DataDir,
-		BindPort:  cfg.GossipPort,
-		JoinPeers: cfg.JoinPeers,
+		HostName:      cfg.HostName,
+		DataDir:       cfg.DataDir,
+		BindPort:      cfg.GossipPort,
+		AdvertiseAddr: cfg.AdvertiseAddress,
+		JoinPeers:     cfg.JoinPeers,
 	}, clock)
 	if err != nil {
 		return nil, fmt.Errorf("state store: %w", err)
@@ -1181,8 +1182,15 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 		serial = "unknown"
 	}
 
-	// Get host address
-	addr := getOutboundIP()
+	// Get host address. The configured advertise address wins when set: peers
+	// dial the host record's address, so it must agree with what gossip
+	// advertises. getOutboundIP only reports the source IP toward the default
+	// route, which is the wrong answer on a multi-homed host whose cluster
+	// network is not the default one.
+	addr := d.cfg.AdvertiseAddress
+	if addr == "" {
+		addr = getOutboundIP()
+	}
 
 	return corrosion.InsertHost(ctx, d.db, corrosion.HostRecord{
 		Name:          d.cfg.HostName,

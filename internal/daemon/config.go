@@ -21,13 +21,22 @@ const defaultConfigPath = "/etc/litevirt/config.yaml"
 
 // Config holds litevirtd configuration.
 type Config struct {
-	HostName         string   `yaml:"host_name"`
-	GRPCPort         int      `yaml:"grpc_port"`
-	MetricsPort      int      `yaml:"metrics_port"`
-	MetricsBind      string   `yaml:"metrics_bind"` // listen address for /metrics (default "" = all interfaces; set "127.0.0.1" to restrict)
-	PKIDir           string   `yaml:"pki_dir"`
-	DataDir          string   `yaml:"data_dir"`
-	GossipPort       int      `yaml:"gossip_port"`
+	HostName    string `yaml:"host_name"`
+	GRPCPort    int    `yaml:"grpc_port"`
+	MetricsPort int    `yaml:"metrics_port"`
+	MetricsBind string `yaml:"metrics_bind"` // listen address for /metrics (default "" = all interfaces; set "127.0.0.1" to restrict)
+	PKIDir      string `yaml:"pki_dir"`
+	DataDir     string `yaml:"data_dir"`
+	GossipPort  int    `yaml:"gossip_port"`
+	// AdvertiseAddress is the address peers reach this host on — used BOTH for the
+	// gossip advertise address and for the host record this daemon self-registers,
+	// which must agree or peers dial an address the host's certificate does not
+	// cover. Empty ⇒ auto-detect (memberlist picks the first private IP by
+	// interface enumeration order; the host record uses the default-route source
+	// IP). Those two heuristics can disagree with each other and with reality on a
+	// multi-homed host, so set this explicitly whenever the node has more than one
+	// network.
+	AdvertiseAddress string   `yaml:"advertise_address,omitempty"`
 	JoinPeers        []string `yaml:"join_peers"`
 	UIPort           int      `yaml:"ui_port"`
 	UIBind           string   `yaml:"ui_bind"`            // listen address for web UI (default "127.0.0.1")

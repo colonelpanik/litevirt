@@ -1022,7 +1022,7 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-		} else if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+		} else if err := s.checkHostCapacity(ctx, vm.HostName, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
 			return nil, err
 		}
 	}

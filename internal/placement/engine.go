@@ -392,9 +392,13 @@ func SelectBatch(
 	hosts []corrosion.HostRecord,
 	vms []corrosion.VMRecord,
 	devices map[string][]corrosion.PCIDeviceRecord,
+	containerMemMiB map[string]int,
 	requests []Request,
 ) (map[string]BatchResult, error) {
 	snap := BuildSnapshotFrom(hosts, vms)
+	// Containers hold host memory as surely as VMs do; fold them in exactly
+	// like the single-VM Select path (BuildSnapshot) does.
+	snap.AddContainerMemory(containerMemMiB)
 
 	// Deep-copy device pools so the scoring loop can mutate them as we
 	// place each VM.

@@ -140,3 +140,50 @@ func TestFleet_TenancyDefaultProjectUnbounded(t *testing.T) {
 		t.Errorf("expected project=_default, got %+v", rows)
 	}
 }
+
+// A stopped workload is still counted in project-quota usage ("an allocation
+// counts whether running or stopped"), so restarting it must NOT admit its
+// full size against the quota a second time — start-time admission is about
+// HOST capacity only. Regression: stop→start of a VM sized above ~50% of its
+// project quota was refused with "quota exceeded".
+func TestFleet_TenancyQuota_StopStartStaysWithinQuota(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	node := c.Nodes[0]
+	client := c.SelfClient(node)
+
+	if err := node.DB.Execute(ctx,
+		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+		t.Fatalf("seed image: %v", err)
+	}
+	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
+		t.Fatalf("stage image file: %v", err)
+	}
+	if _, err := client.CreateProject(ctx, &pb.CreateProjectRequest{Name: "/acme", Display: "Acme Co"}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if _, err := client.SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
+		Quota: &pb.ProjectQuota{ProjectName: "/acme", VcpuLimit: 4, MemMibLimit: 4096},
+	}); err != nil {
+		t.Fatalf("SetProjectQuota: %v", err)
+	}
+
+	// 3000 MiB fits the 4096 quota at create — but is over half of it, so a
+	// double-counting start-time check would compute 3000+3000 > 4096.
+	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "big-half", Image: "test", Cpu: 2, MemoryMib: 3000,
+			Project:   "/acme",
+			Placement: &pb.PlacementSpec{Host: node.Name},
+		},
+	}); err != nil {
+		t.Fatalf("under-quota CreateVM: %v", err)
+	}
+	if _, err := client.StopVM(ctx, &pb.StopVMRequest{Name: "big-half"}); err != nil {
+		t.Fatalf("StopVM: %v", err)
+	}
+	if _, err := client.StartVM(ctx, &pb.StartVMRequest{Name: "big-half"}); err != nil {
+		t.Fatalf("StartVM of a stopped VM within quota: %v — start must not count the allocation against its own quota again", err)
+	}
+}

@@ -133,6 +133,21 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 	}
 
+	// Host capacity admission — MEMORY only.
+	//
+	// A container's cpu_limit is CPU *shares* (a relative cgroup weight), not a
+	// vCPU reservation, so it cannot be added to a host's vCPU total; only its
+	// memory cap is comparable to a VM's. An UNCAPPED container (memory 0)
+	// reserves nothing here, matching how it is accounted.
+	//
+	// Placed after tenancy and before any runtime or IPAM work, so a refusal
+	// leaves no partial state to unwind.
+	if req.MemoryMib > 0 {
+		if err := s.checkResourceAdmission(ctx, s.hostName, req.Project, 0, int(req.MemoryMib)); err != nil {
+			return nil, err
+		}
+	}
+
 	// Resolve the requested NICs into runtime attachments + managed-interface rows
 	// + create-spec intent, ALLOCATING each managed NIC's IPAM lease as it goes
 	// (managed network vs legacy raw bridge). On any later failure we release this
@@ -221,6 +236,16 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	}
 	if rec.IsTemplate {
 		return nil, status.Errorf(codes.FailedPrecondition, "%q is a template and cannot be started; clone it instead", req.Name)
+	}
+	// Host capacity admission — memory only (see CreateContainer). Starting is when
+	// the memory is actually taken: a stopped container is accounted as nothing, so
+	// checking only at create would be sidestepped by creating several that each fit
+	// and starting them all. Skipped when already running (adds nothing) and when
+	// uncapped (nothing to admit).
+	if rec.State != "running" && rec.MemMiB > 0 {
+		if err := s.checkResourceAdmission(ctx, s.hostName, rec.Project, 0, rec.MemMiB); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")

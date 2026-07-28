@@ -1,6 +1,9 @@
 package corrosion
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // The lab node that started this: 4 vCPU, 2971 MiB. Under the OLD arithmetic it
 // advertised all 2971 MiB to guests, three 1 GiB VMs were accepted, and it
@@ -111,5 +114,63 @@ func TestCapacityPolicy_ZeroValueDoesNotStarveEveryHost(t *testing.T) {
 	cpu, mem := HostAllocatable(labHost(), CapacityPolicy{})
 	if cpu <= 0 || mem <= 0 {
 		t.Fatalf("zero-value policy yields (%d cpu, %d mem) — an unconfigured cluster would refuse everything", cpu, mem)
+	}
+}
+
+// TestHostFreeCapacity_CountsRunningContainers is the hole this closes: host
+// usage came from the vms table alone, so a host packed with containers reported
+// 100% of its memory free and VMs were admitted on top of memory already held.
+func TestHostFreeCapacity_CountsRunningContainers(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := InsertHost(ctx, db, HostRecord{Name: "h1", CPUTotal: 8, MemTotal: 8192, State: "HOST_ACTIVE"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	_, baseline, ok, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil || !ok {
+		t.Fatalf("HostFreeCapacity: ok=%v err=%v", ok, err)
+	}
+
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "h1", Name: "ct1", State: "running", MemMiB: 2048,
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+
+	_, withCT, _, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil {
+		t.Fatalf("HostFreeCapacity: %v", err)
+	}
+	if want := baseline - 2048; withCT != want {
+		t.Errorf("free memory with a running 2048 MiB container = %d, want %d — containers hold host memory and must be counted",
+			withCT, want)
+	}
+}
+
+// TestSumContainerMemoryByHost_OnlyRunningAndCapped: a stopped container holds
+// nothing, and an UNCAPPED one (memory 0) cannot be accounted — litevirt knows
+// the cap, not the footprint, and inventing a number would be a guess dressed as
+// accounting.
+func TestSumContainerMemoryByHost_OnlyRunningAndCapped(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	for _, ct := range []ContainerRecord{
+		{HostName: "h1", Name: "running-capped", State: "running", MemMiB: 512},
+		{HostName: "h1", Name: "stopped-capped", State: "stopped", MemMiB: 4096},
+		{HostName: "h1", Name: "running-uncapped", State: "running", MemMiB: 0},
+	} {
+		if err := UpsertContainer(ctx, db, ct); err != nil {
+			t.Fatalf("UpsertContainer %s: %v", ct.Name, err)
+		}
+	}
+
+	got, err := SumContainerMemoryByHost(ctx, db)
+	if err != nil {
+		t.Fatalf("SumContainerMemoryByHost: %v", err)
+	}
+	if got["h1"] != 512 {
+		t.Errorf("h1 container memory = %d, want 512 (running+capped only; stopped holds nothing, uncapped is unknowable)", got["h1"])
 	}
 }

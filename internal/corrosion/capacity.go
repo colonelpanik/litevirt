@@ -1,5 +1,7 @@
 package corrosion
 
+import "context"
+
 // Capacity policy: how much of a host litevirt is willing to hand to workloads.
 //
 // This is the SINGLE place that answer is computed. It used to be three: the
@@ -144,4 +146,36 @@ func HostAllocatable(h HostRecord, cluster CapacityPolicy) (cpu, memMiB int) {
 // MemOverheadFor returns the qemu overhead to charge for n running VMs.
 func (p CapacityPolicy) MemOverheadFor(n int) int {
 	return p.normalize().VMMemOverheadMiB * n
+}
+
+// SumContainerMemoryByHost returns per-host memory (MiB) committed to RUNNING
+// containers.
+//
+// Containers were entirely absent from host capacity accounting: usage came from
+// the vms table alone, so a host packed with containers still reported 100% of
+// its memory free and VMs were admitted onto memory containers already held.
+//
+// MEMORY ONLY, deliberately. A container's cpu_limit is CPU *shares* — a
+// relative cgroup weight, not a reservation — so adding it to a vCPU total would
+// be meaningless arithmetic (a container with the conventional 1024 shares is not
+// 1024 vCPUs). Container CPU therefore stays uncounted rather than counted wrong.
+//
+// A container with memory_mib = 0 is UNCAPPED and contributes nothing here. That
+// is a real limitation, not an oversight: litevirt knows the cap, not the actual
+// footprint, and inventing a number for an unbounded container would be a guess
+// dressed as accounting. Cap containers if you want them accounted.
+func SumContainerMemoryByHost(ctx context.Context, c *Client) (map[string]int, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, COALESCE(SUM(memory_mib),0) AS mem
+		   FROM containers
+		  WHERE deleted_at IS NULL AND state = 'running' AND memory_mib > 0
+		  GROUP BY host_name`)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int, len(rows))
+	for _, r := range rows {
+		out[r.String("host_name")] = r.Int("mem")
+	}
+	return out, nil
 }

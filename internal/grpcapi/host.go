@@ -610,7 +610,9 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		// before it reschedules. It does NOT make an operator-initiated fence
 		// reschedule anything: FenceHost never enumerates workloads, and the
 		// coordinator skips hosts already in offline/fenced/maintenance
-		// (failover/coordinator.go:364) — so promising a reschedule here would be
+		// (failover/coordinator.go, the offline/maintenance/fenced filter in
+		// Coordinator.run's fence loop) — so
+		// promising a reschedule here would be
 		// false in exactly the case an operator is most likely to be in.
 		//
 		// A genuinely failed host does not need this: peers observe it by health

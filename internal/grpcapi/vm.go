@@ -2833,6 +2833,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				if err := s.requireOvercommit(ctx, vmRBACPath(fresh)); err != nil {
 					return nil, err
 				}
+				// Only the HOST check is bypassed; quota is a tenancy limit.
+				if err := s.checkProjectQuota(ctx, fresh.Project, cpuGrow, memGrow); err != nil {
+					return nil, err
+				}
 				if cpuGrow > 0 || memGrow > 0 {
 					s.audit(ctx, "vm.update", req.Name,
 						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",

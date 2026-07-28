@@ -187,3 +187,106 @@ func TestFleet_TenancyQuota_StopStartStaysWithinQuota(t *testing.T) {
 		t.Fatalf("StartVM of a stopped VM within quota: %v — start must not count the allocation against its own quota again", err)
 	}
 }
+
+// --allow-overcommit bypasses the HOST capacity check only. Project quota is a
+// tenancy limit, not a physical one — the flag must not sidestep it (the code
+// comment and proto doc both promise "project quota still applies").
+func TestFleet_TenancyQuota_AllowOvercommitStillEnforcesQuota(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	node := c.Nodes[0]
+	client := c.SelfClient(node)
+
+	if err := node.DB.Execute(ctx,
+		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+		t.Fatalf("seed image: %v", err)
+	}
+	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
+		t.Fatalf("stage image file: %v", err)
+	}
+	if _, err := client.CreateProject(ctx, &pb.CreateProjectRequest{Name: "/acme", Display: "Acme Co"}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if _, err := client.SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
+		Quota: &pb.ProjectQuota{ProjectName: "/acme", VcpuLimit: 4, MemMibLimit: 4096},
+	}); err != nil {
+		t.Fatalf("SetProjectQuota: %v", err)
+	}
+
+	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "first", Image: "test", Cpu: 2, MemoryMib: 3000,
+			Project:   "/acme",
+			Placement: &pb.PlacementSpec{Host: node.Name},
+		},
+	}); err != nil {
+		t.Fatalf("under-quota CreateVM: %v", err)
+	}
+
+	// Second VM pushes memory to 6000 > 4096. --allow-overcommit may skip the
+	// host check, never the quota.
+	_, err := client.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "second", Image: "test", Cpu: 1, MemoryMib: 3000,
+			Project:   "/acme",
+			Placement: &pb.PlacementSpec{Host: node.Name},
+		},
+		AllowOvercommit: true,
+	})
+	if err == nil {
+		t.Fatal("over-quota CreateVM with --allow-overcommit must still be refused by project quota")
+	}
+	if !strings.Contains(err.Error(), "quota exceeded") {
+		t.Errorf("want quota-exceeded error, got %v", err)
+	}
+}
+
+// UpdateVM growth under --allow-overcommit: the flag skips only the HOST
+// capacity check. Project quota must still refuse a grow past the limit
+// (proto doc: "project quota still applies").
+func TestFleet_TenancyQuota_UpdateAllowOvercommitStillEnforcesQuota(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	node := c.Nodes[0]
+	client := c.SelfClient(node)
+
+	if err := node.DB.Execute(ctx,
+		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+		t.Fatalf("seed image: %v", err)
+	}
+	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
+		t.Fatalf("stage image file: %v", err)
+	}
+	if _, err := client.CreateProject(ctx, &pb.CreateProjectRequest{Name: "/acme", Display: "Acme Co"}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if _, err := client.SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
+		Quota: &pb.ProjectQuota{ProjectName: "/acme", VcpuLimit: 8, MemMibLimit: 4096},
+	}); err != nil {
+		t.Fatalf("SetProjectQuota: %v", err)
+	}
+	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "grower", Image: "test", Cpu: 1, MemoryMib: 2048,
+			Project:   "/acme",
+			Placement: &pb.PlacementSpec{Host: node.Name},
+		},
+	}); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+
+	allowRestart := true
+	_, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "grower", MemoryMib: 6000, // grow to 6000 > 4096 quota
+		AllowRestart:    &allowRestart,
+		AllowOvercommit: true,
+	})
+	if err == nil {
+		t.Fatal("over-quota UpdateVM grow with --allow-overcommit must still be refused by project quota")
+	}
+	if !strings.Contains(err.Error(), "quota exceeded") {
+		t.Errorf("want quota-exceeded error, got %v", err)
+	}
+}

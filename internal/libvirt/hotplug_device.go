@@ -70,7 +70,9 @@ func (c *Client) AttachNIC(domainName, bridge, model, mac string) error {
 // anything the operator did. Reading the live domain and reusing the
 // interface's own type/source keeps the element valid (and correct for a
 // non-bridge source). Falls back to the MAC-only shape when the interface
-// cannot be found, where the detach is a no-op anyway.
+// cannot be found in the live domain — callers guard against that case first
+// (see detachNICIfPresent), so the fallback exists only for callers that skip
+// the guard, and libvirt's validation error is the honest outcome there.
 func (c *Client) DetachNIC(domainName, mac string) error {
 	iface := interfaceDevice{
 		Type: "bridge",

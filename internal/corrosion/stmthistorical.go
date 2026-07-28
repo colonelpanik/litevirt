@@ -61,6 +61,23 @@ func HistoricalShapes() []HistoricalShape {
 	// peer's stream.
 	add("INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,\n\t\t\tcpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "insert_host_v130")
 
+	// ConfigureHost fixed shape (pre-v43): the single COALESCE UPDATE before the
+	// per-host capacity policy added cpu_overcommit/mem_overcommit/cpu_reserve/
+	// mem_reserve_mib. Same hazard as insert_host_v130: a prior-release peer
+	// still emits the 7-column shape, and an upgraded receiver that no longer
+	// recognises it would back-pressure a valid ConfigureHost and stall that
+	// peer's stream.
+	add(`UPDATE hosts SET `+
+		`fence_strategy = COALESCE(?, fence_strategy), `+
+		`ipmi_address = COALESCE(?, ipmi_address), `+
+		`ipmi_user = COALESCE(?, ipmi_user), `+
+		`ipmi_pass = COALESCE(?, ipmi_pass), `+
+		`watchdog_dev = COALESCE(?, watchdog_dev), `+
+		`role = COALESCE(?, role), `+
+		`region = COALESCE(?, region), `+
+		`updated_at = ? `+
+		`WHERE name = ?`, "configure_host_fixed_v130")
+
 	// DeleteStackFirewall (v1.3.0): one bulk tombstone per firewall table by stack_name.
 	for _, tbl := range []string{"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
 		add("UPDATE "+tbl+" SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL", "stack_firewall_teardown_v130")

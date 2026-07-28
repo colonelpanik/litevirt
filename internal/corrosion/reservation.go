@@ -151,10 +151,15 @@ func HostFreeCapacityWithPolicy(ctx context.Context, c *Client, host string, pol
 	if err != nil {
 		return 0, 0, false, err
 	}
+	// Containers consume host memory too, and were absent from this sum entirely.
+	ctMem, err := SumContainerMemoryByHost(ctx, c)
+	if err != nil {
+		return 0, 0, false, err
+	}
 	allocCPU, allocMem := HostAllocatable(*h, policy)
 	u := usage[host]
 	freeCPU = allocCPU - u.CpuUsed - resCPU
-	freeMemMiB = allocMem - u.MemUsedMiB - resMem - policy.MemOverheadFor(u.VMCount)
+	freeMemMiB = allocMem - u.MemUsedMiB - ctMem[host] - resMem - policy.MemOverheadFor(u.VMCount)
 	if freeCPU < 0 {
 		freeCPU = 0
 	}

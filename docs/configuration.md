@@ -477,6 +477,14 @@ fixed floor protects small nodes while the percentage scales with large ones.
 memory, covering qemu's own footprint (device models, video, page tables).
 Ignoring it under-counts usage, and by more the denser the host.
 
+**Containers count too, for memory.** A running container's memory cap is
+subtracted from host capacity exactly like a VM's, and `lv ct create` / `lv ct
+start` are admitted against it. Container CPU is *not* counted: `--cpu` on a
+container is cgroup **shares** — a relative weight, not a vCPU reservation — so
+adding it to a vCPU total would be meaningless. An **uncapped** container
+(`--memory 0`) is not accounted at all: litevirt knows the cap, not the
+footprint. Cap your containers if you want them to count.
+
 These apply to **both** placement and admission — VM create (including a pinned
 `--host`) and live resize all consult the same numbers, so the scheduler and the
 admission check cannot disagree.

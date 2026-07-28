@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -65,6 +66,77 @@ func TestCreateVM_NilSpec(t *testing.T) {
 	}
 	if c := status.Code(err); c != codes.InvalidArgument {
 		t.Errorf("code = %v, want InvalidArgument", c)
+	}
+}
+
+func TestCreateVM_NilRequest(t *testing.T) {
+	s := testServer(t)
+
+	_, err := s.CreateVM(adminCtx(), nil)
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("status code = %v, want InvalidArgument (err = %v)", got, err)
+	}
+}
+
+func TestCreateVM_DoesNotMutateCallerRequest(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	req := &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name:  "caller-request",
+		Uuid:  "caller-supplied-uuid",
+		Disks: []*pb.DiskSpec{{Name: "root", Size: "1M"}},
+	}}
+	want := proto.Clone(req).(*pb.CreateVMRequest)
+
+	if _, err := s.CreateVM(ctx, req); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	record, err := corrosion.GetVM(ctx, s.db, "caller-request")
+	if err != nil || record == nil {
+		t.Fatalf("GetVM(caller-request) = %v, %v", record, err)
+	}
+	stored := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(record.Spec), stored); err != nil {
+		t.Fatalf("unmarshal stored spec: %v", err)
+	}
+	if stored.Uuid == "" || stored.Uuid == req.Spec.Uuid ||
+		stored.Cpu != 2 || stored.MemoryMib != 4096 ||
+		stored.Machine != "q35" || stored.Firmware != "uefi" ||
+		len(stored.Disks) != 1 || stored.Disks[0].Bus != "virtio" {
+		t.Fatalf("locally executed spec was not fully mutated: %+v", stored)
+	}
+	if !proto.Equal(req, want) {
+		t.Fatalf("caller request mutated: got %+v, want %+v", req, want)
+	}
+}
+
+func TestCreateVM_IdempotencyTreatsImplicitAndExplicitDefaultsAsEquivalent(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	first, err := s.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec:           &pb.VMSpec{Name: "idempotent-defaults"},
+		IdempotencyKey: "implicit-defaults-key",
+	})
+	if err != nil {
+		t.Fatalf("first CreateVM: %v", err)
+	}
+	retry, err := s.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "idempotent-defaults", Cpu: 2, MemoryMib: 4096, Machine: "q35", Firmware: "uefi",
+		},
+		IdempotencyKey: "implicit-defaults-key",
+	})
+	if err != nil {
+		t.Fatalf("retry CreateVM: %v", err)
+	}
+	if !proto.Equal(retry, first) {
+		t.Fatalf("retry response = %+v, want replay %+v", retry, first)
 	}
 }
 

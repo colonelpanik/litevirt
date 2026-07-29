@@ -268,7 +268,7 @@ import (
 //	     certificate has to stay resolvable for as long as any row it signed
 //	     exists, or rotating a key would make the history it signed
 //	     unverifiable. Two additive columns.
-//	v47: audit_key_retirements — retirement moves out of the mutable columns
+//	v47: audit_key_lifecycle — a key's signing contract moves out of the mutable columns
 //	     v46 put on audit_signing_keys and into its own append-only table,
 //	     carrying a SIGNATURE. Those columns were plain replicated data any peer
 //	     could write, so a forged retirement replicated cluster-wide and could
@@ -277,7 +277,10 @@ import (
 //	     key itself (a voluntary stop), by a successor key of the same host (a
 //	     rotation), or by the cluster CA (a host that can no longer speak for
 //	     itself). Append-only means deleting one locally is repaired by ordinary
-//	     anti-entropy rather than needing a bespoke merge rule. One new table.
+//	     anti-entropy rather than needing a bespoke merge rule. Adoption is
+//	     recorded the same way, because the certificate alone cannot say WHEN a
+//	     host committed — without that, publishing one retroactively puts a
+//	     cluster's entire history under the contract. One new table.
 const CurrentSchemaVersion = 47
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -1358,18 +1361,30 @@ var schemaDDL = []string{
 	// APPEND-ONLY, and that is what makes it self-repairing: a row deleted
 	// locally has no local copy to conflict with, so ordinary anti-entropy
 	// re-inserts it from any peer. No bespoke merge rule, and no force-apply.
-	`CREATE TABLE IF NOT EXISTS audit_key_retirements (
-		host_name         TEXT NOT NULL,
-		retired_key_id    TEXT NOT NULL,
-		-- The last sequence the retired key was entitled to sign. A row from it
-		-- above this is a finding.
-		retired_at_seq    INTEGER NOT NULL DEFAULT 0,
-		retired_by_key_id TEXT NOT NULL DEFAULT '',
-		signature         TEXT NOT NULL DEFAULT '',
-		created_at        TEXT NOT NULL,
-		updated_at        TEXT NOT NULL,
-		deleted_at        TEXT,
-		PRIMARY KEY (host_name, retired_key_id)
+	`CREATE TABLE IF NOT EXISTS audit_key_lifecycle (
+		host_name  TEXT NOT NULL,
+		key_id     TEXT NOT NULL,
+		-- 'adopted' or 'retired'. A key's signing contract runs between them.
+		--
+		-- Adoption is signed for the same reason retirement is, and it answers a
+		-- question the certificate alone cannot: WHEN the host committed. Without
+		-- it, publishing a certificate retroactively puts every row the host ever
+		-- wrote under the contract, so the first verify after enabling signing
+		-- reports a cluster's entire history as tampering.
+		event      TEXT NOT NULL,
+		-- For 'adopted', the sequence the chain had reached when the key took
+		-- effect: rows at or below it predate the commitment. For 'retired', the
+		-- last sequence the key was entitled to sign; a row from it above this is
+		-- a finding.
+		at_seq     INTEGER NOT NULL DEFAULT 0,
+		-- Who asserted it. The signature is checked against this key's published
+		-- certificate, which must chain to the cluster CA and name the host.
+		by_key_id  TEXT NOT NULL DEFAULT '',
+		signature  TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
+		PRIMARY KEY (host_name, key_id, event)
 	)`,
 
 	// Per-VM operational event store (v13). Durable, CRDT-replicated,
@@ -1947,7 +1962,7 @@ var tablePrimaryKeys = map[string][]string{
 	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
 	"audit_signing_keys":      {"key_id"},
 	"audit_chain_heads":       {"host_name", "epoch", "seq"},
-	"audit_key_retirements":   {"host_name", "retired_key_id"},
+	"audit_key_lifecycle":     {"host_name", "key_id", "event"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2265,7 +2280,7 @@ var createTableUnits = []struct {
 	{41, "operations"}, {41, "operation_steps"}, {41, "project_authority_epochs"},
 	{42, "vm_nics"}, {42, "vm_pci_intent"}, {42, "vm_pci_realizations"},
 	{45, "audit_signing_keys"}, {45, "audit_chain_heads"},
-	{47, "audit_key_retirements"},
+	{47, "audit_key_lifecycle"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

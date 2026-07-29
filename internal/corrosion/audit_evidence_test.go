@@ -349,8 +349,8 @@ func headSyncTable() syncTable {
 }
 
 func retirementSyncTable() syncTable {
-	return syncTable{Name: "audit_key_retirements", Columns: []string{
-		"host_name", "retired_key_id", "retired_at_seq", "retired_by_key_id",
+	return syncTable{Name: "audit_key_lifecycle", Columns: []string{
+		"host_name", "key_id", "event", "at_seq", "by_key_id",
 		"signature", "created_at", "updated_at", "deleted_at",
 	}}
 }
@@ -468,10 +468,10 @@ func TestRetirement_ForgedOneIsIgnored(t *testing.T) {
 	// that every row it has signed falls past the boundary. They have no key, so
 	// the signature is junk.
 	if err := c.Execute(context.Background(),
-		`INSERT INTO audit_key_retirements
-		   (host_name, retired_key_id, retired_at_seq, retired_by_key_id, signature,
+		`INSERT INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature,
 		    created_at, updated_at, deleted_at)
-		 VALUES ('node-0', ?, 0, ?, 'deadbeef', ?, ?, NULL)`,
+		 VALUES ('node-0', ?, 'retired', 0, ?, 'deadbeef', ?, ?, NULL)`,
 		kr.KeyID(), kr.KeyID(), "2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("insert the forged retirement: %v", err)
 	}
@@ -495,7 +495,7 @@ func TestRetirement_SignedOneIsHonoured(t *testing.T) {
 	rotateTo(t, c, dir, "node-0")
 
 	if n := countRows(t, c,
-		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldKR.KeyID()+`'`); n != 1 {
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`); n != 1 {
 		t.Fatalf("a genuine rotation recorded no retirement; the retired-key finding would " +
 			"never fire again")
 	}
@@ -514,17 +514,17 @@ func TestRetirement_PeerCannotRewriteOne(t *testing.T) {
 	rotateTo(t, c, dir, "node-0")
 
 	oldID := oldKR.KeyID()
-	sig := oneCol(t, c, `SELECT signature FROM audit_key_retirements WHERE retired_key_id = '`+oldID+`'`)
-	by := oneCol(t, c, `SELECT retired_by_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldID+`'`)
+	sig := oneCol(t, c, `SELECT signature FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldID+`'`)
+	by := oneCol(t, c, `SELECT by_key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldID+`'`)
 
 	incoming := []interface{}{
-		"node-0", oldID, int64(9999), by, sig,
+		"node-0", oldID, "retired", int64(9999), by, sig,
 		"2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z", nil,
 	}
-	mergeOne(t, c, retirementSyncTable(), []string{"host_name", "retired_key_id"}, []int{0, 1}, incoming)
+	mergeOne(t, c, retirementSyncTable(), []string{"host_name", "key_id", "event"}, []int{0, 1, 2}, incoming)
 
 	if got := oneCol(t, c,
-		`SELECT retired_at_seq FROM audit_key_retirements WHERE retired_key_id = '`+oldID+`'`); got == "9999" {
+		`SELECT at_seq FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldID+`'`); got == "9999" {
 		t.Fatalf("a peer moved a signed retirement boundary to seq 9999; every row the key "+
 			"signed below it is silently re-authorised")
 	}
@@ -615,7 +615,7 @@ func TestRetirement_CannotBeRecordedWithoutAKey(t *testing.T) {
 			"taking a host's key away would then be a way to end its signing contract")
 	}
 	if n := countRows(t, c,
-		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+kr.KeyID()+`'`); n != 0 {
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+kr.KeyID()+`'`); n != 0 {
 		t.Fatalf("an unsigned retirement row was written anyway (%d rows)", n)
 	}
 }

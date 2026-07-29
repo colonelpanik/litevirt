@@ -442,7 +442,7 @@ var capabilityMap = map[string]tableResolver{
 	// rather than leaving the cluster divergent.
 	"audit_signing_keys":      {category: "content", chain: contentDefaultChain()},
 	"audit_chain_heads":       {category: "content", chain: contentDefaultChain()},
-	"audit_key_retirements":   {category: "content", chain: contentDefaultChain()},
+	"audit_key_lifecycle":   {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

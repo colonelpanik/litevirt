@@ -94,7 +94,7 @@ func TestRotation_CompletesWithEnforcementOff(t *testing.T) {
 	}
 
 	if n := auditCount(t, d.db,
-		`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`,
+		`SELECT count(*) AS n FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = ?`,
 		leaked); n != 1 {
 		t.Fatalf("the leaked key %s was not retired on a host with enforcement off\n"+
 			"the command reported the incident closed; it was not", leaked)
@@ -298,7 +298,7 @@ func TestRollback_SigningItselfOffIsRecordedNotReportedAsTampering(t *testing.T)
 	d.retireOwnAuditKeyOnRollback(ctx)
 
 	if n := auditCount(t, d.db,
-		`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`, keyID); n != 1 {
+		`SELECT count(*) AS n FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = ?`, keyID); n != 1 {
 		t.Fatalf("turning signing off recorded no retirement (%d rows)\n"+
 			"the certificate is still live, so every row from here on is reported as "+
 			"tampering on every node — permanently, for a supported operator action", n)
@@ -350,7 +350,7 @@ func TestRollback_WithoutTheKeyTheContractStaysInForce(t *testing.T) {
 	d.retireOwnAuditKeyOnRollback(ctx)
 
 	if n := auditCount(t, d.db,
-		`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`, keyID); n != 0 {
+		`SELECT count(*) AS n FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = ?`, keyID); n != 0 {
 		t.Fatalf("a host that cannot sign produced a retirement anyway\n" +
 			"then taking a host's key away would be a way to switch its contract off")
 	}

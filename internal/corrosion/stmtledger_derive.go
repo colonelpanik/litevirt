@@ -18,7 +18,7 @@ var appendOnlyTables = map[string]bool{
 	// later revision, and append-only is what makes it self-repairing: a row
 	// deleted locally has nothing to conflict with, so anti-entropy re-inserts
 	// it from a peer without any bespoke merge rule.
-	"audit_key_retirements": true,
+	"audit_key_lifecycle": true,
 }
 
 // deriveDisposition classifies a parsed replicated statement into the disposition the apply

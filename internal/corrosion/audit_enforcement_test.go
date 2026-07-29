@@ -329,3 +329,69 @@ func TestEnforcement_LegacyRowsAreNotASequenceGap(t *testing.T) {
 		t.Fatalf("an untouched legacy log reports tampering: %+v", res)
 	}
 }
+
+// TestEnforcement_HistoryBeforeTheContractIsNotTampering.
+//
+// Found on the lab, immediately after the certificate contract shipped. Every
+// cluster that turns signing on has history behind it, and publishing a
+// certificate said nothing about WHEN — so the contract reached backwards over
+// all of it and the first verify reported hundreds of rows as tampering on a log
+// nobody had touched.
+//
+// That is the fastest way to teach an operator to ignore the command, which
+// makes it worse than the hole it was closing. Adoption is a signed record with
+// a sequence, so the contract has a start.
+func TestEnforcement_HistoryBeforeTheContractIsNotTampering(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	// Pre-enforcement history, written with no keyring at all.
+	for _, id := range []string{"r1", "r2", "r3"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+
+	// The operator turns signing on: the daemon loads a keyring, publishes, and
+	// records where the contract begins.
+	dir := testPKI(t, "node-0")
+	kr, err := LoadAuditKeyring(dir, "node-0")
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	if _, err := AdoptAuditKey(ctx, c, kr, "node-0"); err != nil {
+		t.Fatalf("AdoptAuditKey: %v", err)
+	}
+	ins(t, c, "r4", "node-0", "2026-07-29T10:00:04Z") // signed
+
+	res := verify(t, c)
+	if len(res.UnsignedAfterSigned) > 0 {
+		t.Fatalf("pre-contract history was reported as tampering: %v\n"+
+			"a certificate says a host commits, not when — without the start, enabling "+
+			"signing accuses the operator of editing their own log", res.UnsignedAfterSigned)
+	}
+	if res.Tampered() {
+		t.Fatalf("an untouched log reports tampering after enabling signing: %+v", res)
+	}
+	if res.Unsigned != 3 {
+		t.Errorf("want the 3 pre-contract rows still COUNTED as unsigned, got %d", res.Unsigned)
+	}
+
+	// And the contract still bites for anything written after it.
+	prev := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r4'`)
+	rec := AuditRecord{
+		ID: "forged", Timestamp: "2026-07-29T10:00:05Z", Username: "root", HostName: "node-0",
+		Action: "user.grant", Target: "mallory:admin", Result: "success", PrevHash: prev,
+	}
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+		                        result, prev_hash, content_hash, key_id, signature, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, '', '', 0)`,
+		rec.ID, rec.Timestamp, rec.Username, rec.HostName, rec.Action, rec.Target,
+		rec.Result, rec.PrevHash, HashAuditRow(rec)); err != nil {
+		t.Fatalf("insert the forged row: %v", err)
+	}
+	if res := verify(t, c); len(res.UnsignedAfterSigned) == 0 {
+		t.Fatalf("a row appended after the contract started was excused: %+v\n"+
+			"giving the contract a start must not give an attacker one too", res)
+	}
+}

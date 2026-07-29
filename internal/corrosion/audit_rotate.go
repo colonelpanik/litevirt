@@ -39,7 +39,7 @@ import (
 // the old key past its boundary, which is what happens when rotation is done but
 // the old key is still installed somewhere.
 //
-// A retirement is itself SIGNED (audit_key_retirements, v47). It has to be. It
+// A retirement is itself SIGNED (audit_key_lifecycle, v47). It has to be. It
 // began as two mutable columns on audit_signing_keys, and as plain replicated
 // data those were writable by anyone: forging a retirement put every row a host
 // had ever signed past a boundary on every node at once, with no way back, and
@@ -79,11 +79,27 @@ func isRetired(retired map[string]int64, keyID string) bool {
 	return ok
 }
 
-// hostsUnderSigningContract returns the hosts whose rows must be signed.
+// signingContract is the sequence range a host's rows must be signed over.
+type signingContract struct {
+	// startSeq is the last sequence written BEFORE the host committed. Rows at
+	// or below it predate the contract and are not expected to be signed.
+	startSeq int64
+}
+
+// hostsUnderSigningContract returns each host whose rows must be signed, and the
+// sequence its commitment began at.
 //
-// Publishing a signing certificate IS the contract: it is a replicated,
-// CA-signed, per-host declaration that this host's rows carry a signature from
-// here on. Nothing but a signed retirement takes it back.
+// Publishing a signing certificate IS the contract: a replicated, CA-signed,
+// per-host declaration that this host's rows carry a signature from here on.
+// Nothing but a signed retirement takes it back.
+//
+// The START matters as much as the fact. A certificate says a host commits, not
+// WHEN — and without the when, publishing one retroactively claims every row the
+// host ever wrote, so the first verify after enabling signing reports a
+// cluster's entire history as tampering. That is the fastest possible way to
+// teach an operator to ignore this command. The signed 'adopted' record supplies
+// it; a host with a certificate but no adoption record predates that mechanism
+// and is treated as committing from its first row.
 //
 // This is deliberately a fact about replicated state rather than about a node's
 // own config or its own log:
@@ -97,15 +113,28 @@ func isRetired(retired map[string]int64, keyID string) bool {
 //
 // It is per host, so a gradual rollout cannot false-fire: a host that has not
 // published yet is simply pre-enforcement.
-func hostsUnderSigningContract(ctx context.Context, c *Client, retired map[string]int64) (map[string]bool, error) {
+func hostsUnderSigningContract(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]signingContract, error) {
+	lifecycle, err := auditKeyLifecycle(ctx, c, keyring)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := c.Query(ctx, `SELECT host_name, key_id FROM audit_signing_keys`)
 	if err != nil {
 		return nil, fmt.Errorf("list audit signing certificates: %w", err)
 	}
-	out := make(map[string]bool, len(rows))
+	out := map[string]signingContract{}
 	for _, r := range rows {
-		if !isRetired(retired, r.String("key_id")) {
-			out[r.String("host_name")] = true
+		host, keyID := r.String("host_name"), r.String("key_id")
+		events := lifecycle[keyID]
+		if _, retired := events[auditLifecycleRetired]; retired {
+			continue // this key's contract has been closed out
+		}
+		start := events[auditLifecycleAdopted] // 0 when the record predates adoption
+		// A host with several live keys is under the EARLIEST of their contracts:
+		// the obligation begins the first time it committed, and a later key
+		// cannot excuse rows written after an earlier one took effect.
+		if cur, seen := out[host]; !seen || start < cur.startSeq {
+			out[host] = signingContract{startSeq: start}
 		}
 	}
 	return out, nil
@@ -133,6 +162,16 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	}
 	if err := keyring.PublishSigningKey(ctx, c); err != nil {
 		return "", err
+	}
+	// Record WHEN this key's contract begins, before anything else can write a
+	// row under it. INSERT OR IGNORE, so the first adoption stands and a restart
+	// cannot walk the start forward over rows the host has since signed.
+	startSeq, err := HostTailSeq(ctx, c, hostName)
+	if err != nil {
+		return "", err
+	}
+	if err := AdoptAuditKeyContract(ctx, c, keyring, hostName, startSeq); err != nil {
+		return "", fmt.Errorf("record the signing contract start: %w", err)
 	}
 
 	superseded, err := supersededAuditKeys(ctx, c, keyring, hostName, keyring.KeyID())
@@ -243,6 +282,26 @@ func supersededAuditKeys(ctx context.Context, c *Client, keyring *AuditKeyring, 
 	return out, nil
 }
 
+// auditLifecycleAdopted / auditLifecycleRetired are the two events in a key's
+// signing contract. Both are signed; the pair tells the verifier which rows a
+// key was responsible for.
+const (
+	auditLifecycleAdopted = "adopted"
+	auditLifecycleRetired = "retired"
+)
+
+// AdoptAuditKeyContract records a SIGNED assertion that hostName's key takes
+// effect at seq — everything at or below it predates the commitment.
+//
+// This is what gives the contract a START. Without it, publishing a certificate
+// retroactively claims every row the host ever wrote, so the first verify after
+// enabling signing reports a cluster's entire history as tampering — and an
+// operator who sees that turns the feature off, which is the failure this design
+// is most vulnerable to.
+func AdoptAuditKeyContract(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string, seq int64) error {
+	return writeAuditLifecycle(ctx, c, keyring, hostName, keyring.KeyID(), auditLifecycleAdopted, seq)
+}
+
 // RetireAuditKey records a SIGNED assertion that hostName's key retiredKeyID
 // signed nothing valid past seq, attributed to the keyring making the claim.
 //
@@ -256,56 +315,82 @@ func supersededAuditKeys(ctx context.Context, c *Client, keyring *AuditKeyring, 
 // forging one put every row a host had signed past a boundary on every node at
 // once, and clearing a genuine one was just as cheap. Neither needed a key.
 func RetireAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostName, retiredKeyID string, seq int64) error {
+	return writeAuditLifecycle(ctx, c, keyring, hostName, retiredKeyID, auditLifecycleRetired, seq)
+}
+
+func writeAuditLifecycle(ctx context.Context, c *Client, keyring *AuditKeyring, hostName, keyID, event string, seq int64) error {
 	if !keyring.CanSign() {
-		return fmt.Errorf("cannot retire key %s: no signing key to attribute the retirement to", retiredKeyID)
+		return fmt.Errorf("cannot record %s for key %s: no signing key to attribute it to", event, keyID)
 	}
-	sig, err := keyring.SignRetirement(hostName, retiredKeyID, seq)
+	sig, err := keyring.SignLifecycle(hostName, keyID, event, seq)
 	if err != nil {
-		return fmt.Errorf("sign retirement of %s: %w", retiredKeyID, err)
+		return fmt.Errorf("sign %s of %s: %w", event, keyID, err)
 	}
-	// INSERT OR IGNORE: a retirement is a fixed assertion about (host, key), so
-	// the FIRST one recorded stands. Re-running a rotation cannot move a
+	// INSERT OR IGNORE: each event is a fixed assertion about (host, key, event),
+	// so the FIRST one recorded stands. Re-running a rotation cannot move a
 	// boundary, and neither can anyone else.
 	return c.Execute(ctx,
-		`INSERT OR IGNORE INTO audit_key_retirements
-		   (host_name, retired_key_id, retired_at_seq, retired_by_key_id, signature,
-		    created_at, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
-		hostName, retiredKeyID, seq, keyring.KeyID(), sig, c.NowWall(), c.NowTS())
+		`INSERT OR IGNORE INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		hostName, keyID, event, seq, keyring.KeyID(), sig, c.NowWall(), c.NowTS())
+}
+
+// auditKeyLifecycle reads every VERIFIED lifecycle event, as
+// key_id → event → sequence.
+//
+// Only verified rows are returned. An unsigned or unverifiable one is ignored
+// entirely rather than trusted or reported: the table is replicated, so anyone
+// can put a row in it, and the signature is the only thing separating a real
+// assertion from an attempt to invalidate a host's whole live chain.
+//
+// deleted_at is deliberately not filtered. Tombstoning an event must not erase
+// it — and because the table is append-only, a row deleted outright is simply
+// re-inserted from a peer by ordinary anti-entropy.
+func auditKeyLifecycle(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]map[string]int64, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, key_id, event, at_seq, by_key_id, signature FROM audit_key_lifecycle`)
+	if err != nil {
+		return nil, fmt.Errorf("list audit key lifecycle: %w", err)
+	}
+	out := map[string]map[string]int64{}
+	for _, r := range rows {
+		host, keyID, event := r.String("host_name"), r.String("key_id"), r.String("event")
+		seq := r.Int64("at_seq")
+		if err := keyring.VerifyLifecycle(ctx, c, host, keyID, event,
+			seq, r.String("by_key_id"), r.String("signature")); err != nil {
+			slog.Warn("ignoring an audit key lifecycle record that does not verify; it proves "+
+				"nothing about the key it names and is not treated as one",
+				"host", host, "key", keyID, "event", event, "error", err)
+			continue
+		}
+		if out[keyID] == nil {
+			out[keyID] = map[string]int64{}
+		}
+		// The strictest verified value wins: the LATEST adoption (the contract
+		// starts as late as anyone can prove) and the EARLIEST retirement. Nothing
+		// legitimate writes two of either.
+		prev, seen := out[keyID][event]
+		switch {
+		case !seen,
+			event == auditLifecycleAdopted && seq > prev,
+			event == auditLifecycleRetired && seq < prev:
+			out[keyID][event] = seq
+		}
+	}
+	return out, nil
 }
 
 // auditKeyRetirements maps key id → the last sequence that key was entitled to
 // sign. A key absent from the map is still active.
-//
-// Only VERIFIED retirements are returned. An unsigned or unverifiable row is
-// ignored entirely rather than trusted or reported: the table is replicated, so
-// anyone can put a row in it, and the signature is the only thing separating a
-// real retirement from an attempt to invalidate a host's whole live chain.
-//
-// deleted_at is deliberately not filtered. Tombstoning a retirement must not
-// erase it — and because the table is append-only, a row deleted outright is
-// simply re-inserted from a peer by ordinary anti-entropy.
 func auditKeyRetirements(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]int64, error) {
-	rows, err := c.Query(ctx,
-		`SELECT host_name, retired_key_id, retired_at_seq, retired_by_key_id, signature
-		 FROM audit_key_retirements`)
+	lifecycle, err := auditKeyLifecycle(ctx, c, keyring)
 	if err != nil {
-		return nil, fmt.Errorf("list retired audit keys: %w", err)
+		return nil, err
 	}
-	out := make(map[string]int64, len(rows))
-	for _, r := range rows {
-		host, keyID := r.String("host_name"), r.String("retired_key_id")
-		seq := r.Int64("retired_at_seq")
-		if err := keyring.VerifyRetirement(ctx, c, host, keyID,
-			seq, r.String("retired_by_key_id"), r.String("signature")); err != nil {
-			slog.Warn("ignoring an audit key retirement that does not verify; it proves nothing "+
-				"about the key it names and is not treated as one",
-				"host", host, "retired_key", keyID, "error", err)
-			continue
-		}
-		// The earliest verified boundary wins, so a second signed assertion can
-		// only ever tighten. Nothing legitimate writes two.
-		if prev, seen := out[keyID]; !seen || seq < prev {
+	out := make(map[string]int64, len(lifecycle))
+	for keyID, events := range lifecycle {
+		if seq, ok := events[auditLifecycleRetired]; ok {
 			out[keyID] = seq
 		}
 	}

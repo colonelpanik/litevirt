@@ -312,18 +312,21 @@ func auditHeadDigestV1(hostName string, epoch, seq int64, headHash, keyID string
 	return h.Sum(nil)
 }
 
-// auditRetireDigest is what a retirement signature covers: which host's key is
-// being retired, at what sequence, and who says so.
+// auditLifecycleDigest is what a lifecycle signature covers: which host's key,
+// which event, at what sequence, and who says so.
 //
-// retiredByKeyID is signed rather than merely recorded, so a signature made by
-// one signer cannot be re-filed under another's name.
-func auditRetireDigest(hostName, retiredKeyID string, seq int64, retiredByKeyID string) []byte {
+// event is inside the payload so an adoption cannot be replayed as a retirement,
+// which would otherwise turn "this key starts here" into "this key ends here".
+// byKeyID is signed rather than merely recorded, so a signature made by one
+// signer cannot be re-filed under another's name.
+func auditLifecycleDigest(hostName, keyID, event string, seq int64, byKeyID string) []byte {
 	h := sha256.New()
 	writeField(h, auditRetireDomain)
 	writeField(h, hostName)
-	writeField(h, retiredKeyID)
+	writeField(h, keyID)
+	writeField(h, event)
 	writeField(h, strconv.FormatInt(seq, 10))
-	writeField(h, retiredByKeyID)
+	writeField(h, byKeyID)
 	return h.Sum(nil)
 }
 
@@ -351,17 +354,17 @@ func (k *AuditKeyring) SignHead(hostName string, epoch, seq int64, headHash, cre
 	return k.sign(auditHeadDigest(hostName, epoch, seq, headHash, k.keyID, createdAt))
 }
 
-// SignRetirement asserts that hostName's key retiredKeyID signed nothing valid
-// past seq. The assertion is attributed to THIS keyring.
-func (k *AuditKeyring) SignRetirement(hostName, retiredKeyID string, seq int64) (string, error) {
+// SignLifecycle asserts one event in a key's signing contract, attributed to
+// THIS keyring.
+func (k *AuditKeyring) SignLifecycle(hostName, keyID, event string, seq int64) (string, error) {
 	if !k.CanSign() {
 		return "", nil
 	}
-	return k.sign(auditRetireDigest(hostName, retiredKeyID, seq, k.keyID))
+	return k.sign(auditLifecycleDigest(hostName, keyID, event, seq, k.keyID))
 }
 
-// VerifyRetirement checks a retirement's signature against the published
-// certificate for retiredByKeyID.
+// VerifyLifecycle checks a lifecycle record's signature against the published
+// certificate for byKeyID.
 //
 // One rule covers every legitimate signer: the signing certificate must chain
 // to the cluster CA and its CN must be hostName. That admits exactly the parties
@@ -373,15 +376,15 @@ func (k *AuditKeyring) SignRetirement(hostName, retiredKeyID string, seq int64) 
 // and signs with it, and the key never has to be installed anywhere.
 //
 // Someone who has merely broken into a node has none of these.
-func (k *AuditKeyring) VerifyRetirement(ctx context.Context, c *Client, hostName, retiredKeyID string, seq int64, retiredByKeyID, sigHex string) error {
+func (k *AuditKeyring) VerifyLifecycle(ctx context.Context, c *Client, hostName, keyID, event string, seq int64, byKeyID, sigHex string) error {
 	if k == nil {
 		return fmt.Errorf("no audit keyring loaded")
 	}
-	if retiredByKeyID == "" || sigHex == "" {
-		return fmt.Errorf("retirement of key %s carries no signature", retiredKeyID)
+	if byKeyID == "" || sigHex == "" {
+		return fmt.Errorf("%s of key %s carries no signature", event, keyID)
 	}
-	return k.verifySig(ctx, c, hostName, retiredByKeyID, sigHex, func(id string) []byte {
-		return auditRetireDigest(hostName, retiredKeyID, seq, id)
+	return k.verifySig(ctx, c, hostName, byKeyID, sigHex, func(id string) []byte {
+		return auditLifecycleDigest(hostName, keyID, event, seq, id)
 	})
 }
 
@@ -563,7 +566,7 @@ type auditEvidenceGuard func(tx *sql.Tx, table syncTable, row []interface{}, pkC
 var auditEvidenceGuards = map[string]auditEvidenceGuard{
 	"audit_log":             signedAuditRowIsImmutable,
 	"audit_chain_heads":     auditEvidenceIsImmutable,
-	"audit_key_retirements": auditEvidenceIsImmutable,
+	"audit_key_lifecycle": auditEvidenceIsImmutable,
 }
 
 // signedAuditRowIsImmutable reports whether an incoming anti-entropy copy of an

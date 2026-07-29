@@ -255,7 +255,7 @@ var tableNames = []string{
 	// assertion about a log an operator can already read. They belong in the
 	// operator-visible dump precisely so a peer — or a human with a state
 	// dump — can check a host's chain without that host's cooperation.
-	"audit_signing_keys", "audit_chain_heads", "audit_key_retirements",
+	"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

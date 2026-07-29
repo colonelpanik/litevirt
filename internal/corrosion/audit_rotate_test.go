@@ -58,7 +58,7 @@ func TestRotation_OldKeyCannotSignNewRows(t *testing.T) {
 
 	// The old key must be recorded as retired, and its certificate must still be
 	// present — the rows it already signed depend on it.
-	if n := countRows(t, c, `SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldKeyID+`'`); n != 1 {
+	if n := countRows(t, c, `SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKeyID+`'`); n != 1 {
 		t.Fatalf("old key %s is not marked retired (%d matching rows)", oldKeyID, n)
 	}
 
@@ -184,7 +184,7 @@ func TestRotation_IsIdempotent(t *testing.T) {
 				"the key the node is actually using", i, retiredKey)
 		}
 	}
-	if n := countRows(t, c, `SELECT retired_key_id FROM audit_key_retirements`); n != 0 {
+	if n := countRows(t, c, `SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired'`); n != 0 {
 		t.Errorf("%d keys retired without a rotation", n)
 	}
 	if n := countRows(t, c, `SELECT host_name FROM audit_chain_heads`); n != 0 {
@@ -324,14 +324,14 @@ func TestRotation_ARetiredKeyCannotUnrotateItsSuccessor(t *testing.T) {
 	}
 
 	if n := countRows(t, c,
-		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+newKR.KeyID()+`'`); n != 0 {
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+newKR.KeyID()+`'`); n != 0 {
 		t.Fatalf("booting with the RETIRED key retired its successor %s\n"+
 			"every row the legitimate key signs is now past a retirement boundary, so the "+
 			"whole live chain reads as tampered on every node — while the leaked key signs",
 			newKR.KeyID())
 	}
 	if n := countRows(t, c,
-		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldKR.KeyID()+`'`); n != 1 {
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`); n != 1 {
 		t.Fatalf("the old key un-retired itself by being republished")
 	}
 }
@@ -344,7 +344,7 @@ func TestRotation_StillRetiresAGenuinelySupersededKey(t *testing.T) {
 	rotateTo(t, c, dir, "node-0")
 
 	if n := countRows(t, c,
-		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldKR.KeyID()+`'`); n != 1 {
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`); n != 1 {
 		t.Fatalf("a genuine rotation did not retire the key it superseded; the whole "+
 			"retired-key finding would never fire")
 	}
@@ -384,7 +384,7 @@ func TestRotation_AStaleTailCannotPinTheBoundaryLow(t *testing.T) {
 	rotateTo(t, c, dir, "node-0")
 
 	got := oneCol(t, c,
-		`SELECT retired_at_seq FROM audit_key_retirements WHERE retired_key_id = '`+oldKR.KeyID()+`'`)
+		`SELECT at_seq FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`)
 	if got != "4" {
 		t.Fatalf("retirement boundary is %q, want 4 — the sequence this host's own signed head "+
 			"attests to\na node restored from a snapshot would otherwise put rows 3-4, which "+

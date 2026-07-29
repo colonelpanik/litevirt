@@ -82,7 +82,7 @@ func TestFleet_RotationIsVisibleAndEnforcedOnPeers(t *testing.T) {
 			}
 		}
 		if n := rowCount(t, peer,
-			`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`, oldKey); n != 1 {
+			`SELECT count(*) AS n FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = ?`, oldKey); n != 1 {
 			t.Errorf("%s does not see key %s as retired; it would accept new rows signed with it",
 				peer.Name, oldKey)
 		}

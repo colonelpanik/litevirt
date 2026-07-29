@@ -369,7 +369,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	// timestamp older than the host's first real row, arrived while the latch
 	// was still false, and escaped every check. A fact read up front from
 	// replicated state cannot be reordered into being false.
-	contracted, err := hostsUnderSigningContract(ctx, c, retired)
+	contracted, err := hostsUnderSigningContract(ctx, c, keyring)
 	if err != nil {
 		return res, err
 	}
@@ -399,7 +399,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			// row backdated ahead of the host's real history would otherwise
 			// arrive before any latch could be set. Such a row is reported, and
 			// crucially does NOT reset the tail.
-			if hashedByHost[host] || contracted[host] {
+			if _, underContract := contracted[host]; hashedByHost[host] || underContract {
 				res.Laundered = append(res.Laundered, r.String("id"))
 				continue
 			}
@@ -459,7 +459,22 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			// Keyed to the contract rather than to the host's own history, which
 			// the attacker controls: a host that has never managed to sign at all
 			// is exactly the case a history-based rule cannot see.
-			if contracted[host] {
+			// Only rows written AFTER the host committed. Everything at or below
+			// the contract start predates the certificate, and flagging it would
+			// report a whole cluster's pre-enforcement history as tampering the
+			// day signing is switched on.
+			//
+			// A row with NO sequence is placed by where it sits in the chain
+			// instead. seq 0 is what every pre-v45 row carries, so an attacker
+			// appending one would otherwise sit below any contract start and be
+			// excused for free — and to place it below the start honestly they
+			// would have to link it into the legacy region, which breaks the hash
+			// of every row after it.
+			pos := seq
+			if pos == 0 {
+				pos = seqByHost[host]
+			}
+			if contract, underContract := contracted[host]; underContract && pos > contract.startSeq {
 				res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
 					"%s: row %s carries no signature, but this host has a published signing "+
 						"certificate and no retirement", host, rec.ID))

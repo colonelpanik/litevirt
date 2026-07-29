@@ -79,6 +79,38 @@ func isRetired(retired map[string]int64, keyID string) bool {
 	return ok
 }
 
+// hostsUnderSigningContract returns the hosts whose rows must be signed.
+//
+// Publishing a signing certificate IS the contract: it is a replicated,
+// CA-signed, per-host declaration that this host's rows carry a signature from
+// here on. Nothing but a signed retirement takes it back.
+//
+// This is deliberately a fact about replicated state rather than about a node's
+// own config or its own log:
+//
+//   - A node-local flag would let a compromised node declare itself exempt and
+//     report its log clean, and peers disagreeing about the same rows destroys
+//     the only mechanism that makes cross-node verification worth anything.
+//   - The host's own history — "has it signed before?" — is walked in an order
+//     the attacker chooses, and says nothing at all about a host that has never
+//     managed to sign, which is precisely the interesting case.
+//
+// It is per host, so a gradual rollout cannot false-fire: a host that has not
+// published yet is simply pre-enforcement.
+func hostsUnderSigningContract(ctx context.Context, c *Client, retired map[string]int64) (map[string]bool, error) {
+	rows, err := c.Query(ctx, `SELECT host_name, key_id FROM audit_signing_keys`)
+	if err != nil {
+		return nil, fmt.Errorf("list audit signing certificates: %w", err)
+	}
+	out := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if !isRetired(retired, r.String("key_id")) {
+			out[r.String("host_name")] = true
+		}
+	}
+	return out, nil
+}
+
 // AdoptAuditKey publishes this host's certificate and, if the host was
 // previously signing with a DIFFERENT key, completes the rotation.
 //

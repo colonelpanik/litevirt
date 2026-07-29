@@ -257,11 +257,12 @@ type AuditVerifyResult struct {
 	// Unsigned counts rows carrying no signature: written before v45, or while
 	// enforcement.audit_signature was off. They are chain-checked only.
 	Unsigned int
-	// UnsignedAfterSigned lists unsigned rows that appear AFTER the authoring
-	// host's first signed row. Those are not old, they are anomalous: a host
-	// that has begun signing has no legitimate way to stop, so an unsigned row
-	// past that point is either a fabricated entry inserted straight into the
-	// table or a node that lost its key and kept writing.
+	// UnsignedAfterSigned lists unsigned rows written by a host that is under a
+	// signing contract — it has a published certificate and no signed
+	// retirement. Those are not old, they are anomalous: the contract says the
+	// host's rows carry a signature, so an unsigned one is either a fabricated
+	// entry inserted straight into the table or a node that lost its key and
+	// kept writing.
 	UnsignedAfterSigned []string
 	// Unverifiable counts signed rows this verifier had no keyring to check.
 	Unverifiable int
@@ -306,13 +307,16 @@ type AuditVerifyResult struct {
 // noise gets switched off.
 //
 // UnsignedAfterSigned is different, and it is why the bare count does not need
-// to be. The boundary is per host and derived from the log itself rather than
-// from the cluster latch: once a host has produced one signed row it cannot
-// legitimately produce an unsigned one, whatever the latch says and whenever it
-// formed. That closes the hole the latch was supposed to close — appending a
-// fabricated unsigned row with a recomputed hash, which verified clean because
-// the hash is unkeyed and the seq check only ran for signed rows — without
-// accusing anyone of tampering with their own pre-enforcement history.
+// to be. It is keyed to the host's published signing CERTIFICATE — a replicated,
+// CA-signed declaration that this host's rows are signed from here on, revoked
+// only by a signed retirement. That closes the hole the latch was supposed to
+// close (a fabricated unsigned row with a recomputed hash verified clean,
+// because the hash is unkeyed) without accusing anyone of tampering with their
+// own pre-enforcement history.
+//
+// The rule deliberately does not read the host's own log. An earlier version
+// asked "has this host signed before?", which is walked in an order the attacker
+// chooses and is blind to a host that never managed to sign at all.
 func (r AuditVerifyResult) Tampered() bool {
 	return r.BrokenAt != "" || len(r.BadSignature) > 0 || len(r.UnknownKeyID) > 0 ||
 		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0 ||
@@ -341,10 +345,21 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	if err != nil {
 		return res, err
 	}
+	// Which hosts are under a signing contract, computed BEFORE the walk.
+	//
+	// This used to be a latch set as the walk went — "has this host produced a
+	// signed row yet" — and the walk is ordered by (host, timestamp, id) over
+	// timestamps the writer chooses. So a fabricated row simply carried a
+	// timestamp older than the host's first real row, arrived while the latch
+	// was still false, and escaped every check. A fact read up front from
+	// replicated state cannot be reordered into being false.
+	contracted, err := hostsUnderSigningContract(ctx, c, retired)
+	if err != nil {
+		return res, err
+	}
 	prevByHost := map[string]string{} // per-host running tail
-	seqByHost := map[string]int64{}   // per-host last signed seq
+	seqByHost := map[string]int64{}   // per-host last seq seen
 	hashedByHost := map[string]bool{} // has this host produced a hashed row yet?
-	signedByHost := map[string]bool{} // has this host produced a SIGNED row yet?
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
@@ -360,12 +375,15 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		}
 		if stored == "" {
 			// A blank hash means "written before the chain existed" and resets
-			// the running tail. That is only credible BEFORE the host's first
-			// hashed row — afterwards it is the cheapest possible attack:
-			// blank one row's hash and every row after it is re-based against
-			// an empty tail, so an edited history verifies clean. Such a row
-			// is reported, and crucially does NOT reset the tail.
-			if hashedByHost[host] {
+			// the running tail. That is credible only for a host with no signing
+			// contract, and only before its first hashed row. Otherwise it is the
+			// cheapest possible attack: blank one row's hash and every row after
+			// it is re-based against an empty tail, so an edited history verifies
+			// clean. The contract test is what closes the PREPEND — a fabricated
+			// row backdated ahead of the host's real history would otherwise
+			// arrive before any latch could be set. Such a row is reported, and
+			// crucially does NOT reset the tail.
+			if hashedByHost[host] || contracted[host] {
 				res.Laundered = append(res.Laundered, r.String("id"))
 				continue
 			}
@@ -391,29 +409,39 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		prevByHost[host] = stored
 
 		sig, keyID, seq := r.String("signature"), r.String("key_id"), r.Int64("seq")
-		if sig == "" {
-			res.Unsigned++
-			// Unsigned is ordinary before a host starts signing and impossible
-			// after. A host cannot un-adopt a key, so a row here is either
-			// inserted straight into the table — the cheapest forgery, since
-			// HashAuditRow is unkeyed and the seq check below runs only for
-			// signed rows — or a node that lost its key and kept writing, which
-			// is the same evidence seen from the other side.
-			if signedByHost[host] {
-				res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
-					"%s: row %s carries no signature, but this host has already signed rows",
-					host, rec.ID))
-			}
-			continue
-		}
-		signedByHost[host] = true
-		// Sequence numbers are only meaningful once signed: an unsigned row
-		// carries seq 0 and renumbering it costs nothing.
+
+		// Sequence numbers are tracked for EVERY row, signed or not.
+		// InsertAuditLog assigns seq = tail+1 before it signs, and loadHostTail
+		// takes MAX(seq) across all rows, so a run of unsigned rows still
+		// consumes numbers. Counting only signed ones made the next signed row
+		// look like it had jumped — reporting a deletion that never happened
+		// against a node whose only fault was a few writes it could not sign.
 		if last, seen := seqByHost[host]; seen && seq != last+1 {
 			res.SeqGaps = append(res.SeqGaps,
 				fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
 		}
 		seqByHost[host] = seq
+
+		if sig == "" {
+			res.Unsigned++
+			// A host under a signing contract has no legitimate way to produce an
+			// unsigned row: it published a certificate saying its rows are signed
+			// from that point, and nothing but a signed retirement takes that
+			// back. So this is either a fabricated row inserted straight into the
+			// table — the cheapest forgery, since HashAuditRow is unkeyed — or a
+			// node that lost its key and kept writing, which is the same evidence
+			// seen from the other side.
+			//
+			// Keyed to the contract rather than to the host's own history, which
+			// the attacker controls: a host that has never managed to sign at all
+			// is exactly the case a history-based rule cannot see.
+			if contracted[host] {
+				res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
+					"%s: row %s carries no signature, but this host has a published signing "+
+						"certificate and no retirement", host, rec.ID))
+			}
+			continue
+		}
 
 		// A retired key signing past its boundary. The signature itself will
 		// verify — the attacker has the key, that is the whole problem — so the

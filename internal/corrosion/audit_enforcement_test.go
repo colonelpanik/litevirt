@@ -167,3 +167,121 @@ func TestEnforcement_LegacyHistoryIsNotTampering(t *testing.T) {
 		t.Errorf("want the 3 legacy rows still COUNTED as unsigned, got %d", res.Unsigned)
 	}
 }
+
+// TestEnforcement_APrependedRowCannotEscapeTheContract.
+//
+// The verdict used to latch on the host's own history — "has this host signed a
+// row yet?" — accumulated as the walk went. The walk is ordered by (host,
+// timestamp, id), and the timestamp is whatever the writer put there. So the
+// fabricated row did not have to defeat the check; it just had to sort ahead of
+// it.
+//
+// Worse, a blank content_hash reads as a pre-chain reset point, which the walk
+// accepted before the host's first hashed row. Backdate a row, blank its hash,
+// and it was not counted as unsigned, not reported as laundered, and did not
+// break the chain — while sitting in `lv audit log` output looking exactly like
+// a genuine record.
+func TestEnforcement_APrependedRowCannotEscapeTheContract(t *testing.T) {
+	ctx := context.Background()
+	c, _, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	// Prepended: timestamp older than anything real, blank hash, no signature.
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+		                        result, prev_hash, content_hash, key_id, signature, seq)
+		 VALUES ('prepended', '2020-01-01T00:00:00Z', 'root', 'node-0', 'user.grant',
+		         'mallory:admin', '', 'success', '', '', '', '', 0)`); err != nil {
+		t.Fatalf("insert the prepended row: %v", err)
+	}
+
+	res := verify(t, c)
+	if !res.Tampered() {
+		t.Fatalf("a row backdated ahead of the host's history verified CLEAN: %+v\n"+
+			"the fabricated row never had to defeat the check, only to sort before it", res)
+	}
+}
+
+// TestEnforcement_AHostThatNeverSignedIsStillCovered.
+//
+// The case a history-based rule structurally cannot see. A node joins a cluster
+// that is already signing, its key is unreadable on the very first start, and it
+// therefore never produces a single signed row. Asking "has this host signed
+// before?" answers no forever, so every row it writes was pre-enforcement
+// history as far as the verifier was concerned — an entire node's audit log
+// unsigned, freely rewritable, and reported clean on every peer.
+//
+// The published certificate is what covers it: the host declared the contract
+// even though it could not then honour it.
+func TestEnforcement_AHostThatNeverSignedIsStillCovered(t *testing.T) {
+	ctx := context.Background()
+	c, kr, dir := signedClient(t, "node-0")
+
+	// The contract exists — the certificate is published — but this node cannot
+	// sign, so it never produces a signed row at all.
+	if kr.KeyID() == "" {
+		t.Fatal("no certificate published; the contract under test does not exist")
+	}
+	verifier, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(verifier)
+	requireSigning(c)
+
+	if err := InsertAuditLog(ctx, c, AuditRecord{
+		ID: "r1", Username: "root", HostName: "node-0",
+		Action: "vm.delete", Target: "prod-db", Result: "success",
+		Timestamp: "2026-07-29T10:00:01Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog: %v", err)
+	}
+	if n := countRows(t, c, `SELECT id FROM audit_log WHERE signature <> ''`); n != 0 {
+		t.Fatalf("this host signed something; the never-signed case is not under test")
+	}
+
+	res := verify(t, c)
+	if len(res.UnsignedAfterSigned) == 0 {
+		t.Fatalf("a host with a published certificate wrote an unsigned row and nothing was "+
+			"reported: %+v\nit never signed anything, so a rule keyed to its own history "+
+			"could never fire — which is the whole case", res)
+	}
+}
+
+// TestEnforcement_ADegradedWindowIsNotASequenceGap.
+//
+// A node loses read access to its key for a few writes and recovers. Those rows
+// still consume sequence numbers, because InsertAuditLog assigns seq before it
+// signs. Counting only SIGNED rows made the next signed row look like it had
+// jumped — reported under SeqGaps, a category documented as evidence that rows
+// were deleted and renumbered to hide it. Nobody had touched a thing.
+func TestEnforcement_ADegradedWindowIsNotASequenceGap(t *testing.T) {
+	c, kr, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	// Key unreadable for two writes.
+	verifier, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(verifier)
+	requireSigning(c)
+	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
+	ins(t, c, "r3", "node-0", "2026-07-29T10:00:03Z")
+
+	// Recovered.
+	c.SetAuditKeyring(kr)
+	ins(t, c, "r4", "node-0", "2026-07-29T10:00:04Z")
+
+	res := verify(t, c)
+	if len(res.SeqGaps) > 0 {
+		t.Fatalf("a degraded write window was reported as a sequence gap: %v\n"+
+			"seq is assigned before signing, so unsigned rows consume numbers too — "+
+			"the verifier has to count the same way the writer does", res.SeqGaps)
+	}
+	// The degradation itself must still be reported, or this test would pass by
+	// the verifier having gone blind.
+	if len(res.UnsignedAfterSigned) != 2 {
+		t.Fatalf("want the 2 unsignable rows reported, got %v", res.UnsignedAfterSigned)
+	}
+}

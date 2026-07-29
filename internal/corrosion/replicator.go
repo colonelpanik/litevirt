@@ -1427,6 +1427,15 @@ type legacyContainerRekeyEnvelope struct {
 	target     Statement
 }
 
+func validLegacyWallTimestamp(v interface{}) bool {
+	raw := coerceString(v)
+	if raw == "" {
+		return false
+	}
+	_, err := time.Parse(time.RFC3339, raw)
+	return err == nil
+}
+
 func validateLegacyContainerRekeyEnvelope(
 	stmts []Statement, fps []string,
 ) (legacyContainerRekeyEnvelope, error) {
@@ -1462,10 +1471,15 @@ func validateLegacyContainerRekeyEnvelope(
 		return legacyContainerRekeyEnvelope{},
 			invalidf("legacy container rekey has an unexpected identity binding")
 	}
+	if !validLegacyWallTimestamp(parent.Params[0]) ||
+		!validLegacyWallTimestamp(target.Params[13]) ||
+		!validLegacyWallTimestamp(cleanup.Params[0]) ||
+		!validLegacyWallTimestamp(lease.Params[1]) {
+		return legacyContainerRekeyEnvelope{},
+			invalidf("legacy container rekey has an invalid wall timestamp")
+	}
 	if clock == "" ||
-		coerceString(parent.Params[0]) != clock ||
 		coerceString(target.Params[14]) != clock ||
-		coerceString(cleanup.Params[0]) != clock ||
 		coerceString(cleanup.Params[1]) != clock ||
 		coerceString(lease.Params[2]) != clock {
 		return legacyContainerRekeyEnvelope{},
@@ -1474,10 +1488,13 @@ func validateLegacyContainerRekeyEnvelope(
 	for i := 3; i < len(stmts)-1; i++ {
 		if fps[i] != expectedInterface || len(stmts[i].Params) != 9 ||
 			coerceString(stmts[i].Params[0]) != targetHost ||
-			coerceString(stmts[i].Params[1]) != name ||
-			coerceString(stmts[i].Params[8]) == "" {
+			coerceString(stmts[i].Params[1]) != name {
 			return legacyContainerRekeyEnvelope{},
 				invalidf("legacy container rekey has an unexpected target interface")
+		}
+		if coerceString(stmts[i].Params[8]) != clock {
+			return legacyContainerRekeyEnvelope{},
+				invalidf("legacy container rekey does not share its parent clock")
 		}
 	}
 	return legacyContainerRekeyEnvelope{

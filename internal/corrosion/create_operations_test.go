@@ -2472,7 +2472,12 @@ func TestRetainedAndCurrentContainerRekeyDeletesCannotCrossRecreate(t *testing.T
 
 func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T) {
 	ctx := context.Background()
-	const high = "9000000000000-0000-retained-rekey"
+	const (
+		high        = "9000000000000-0000-retained-rekey"
+		parentWall  = "2026-07-28T12:00:00Z"
+		cleanupWall = "2026-07-28T12:00:01Z"
+		leaseWall   = "2026-07-28T12:00:02Z"
+	)
 
 	seedLegacySource := func(t *testing.T, c *Client) ContainerRecord {
 		t.Helper()
@@ -2493,7 +2498,7 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 			{
 				SQL: legacyContainerStrictDeleteSQL,
 				Params: []interface{}{
-					high, high, "h1", "ct1",
+					parentWall, high, "h1", "ct1",
 				},
 			},
 			{
@@ -2507,7 +2512,7 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 			{
 				SQL: containerRekeyInterfaceCleanupSQL,
 				Params: []interface{}{
-					high, high, "h1", "ct1",
+					cleanupWall, high, "h1", "ct1",
 				},
 			},
 			{
@@ -2520,7 +2525,7 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 			{
 				SQL: containerRekeyLeaseSQL,
 				Params: []interface{}{
-					"h2", high, high, "h1", "ct1",
+					"h2", leaseWall, high, "h1", "ct1",
 				},
 			},
 		}
@@ -2615,6 +2620,26 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 			},
 			"lease target misbound": func(stmts []Statement) []Statement {
 				stmts[len(stmts)-1].Params[0] = "other"
+				return stmts
+			},
+			"parent wall timestamp malformed": func(stmts []Statement) []Statement {
+				stmts[0].Params[0] = "not-rfc3339"
+				return stmts
+			},
+			"target wall timestamp malformed": func(stmts []Statement) []Statement {
+				stmts[1].Params[13] = "not-rfc3339"
+				return stmts
+			},
+			"cleanup wall timestamp malformed": func(stmts []Statement) []Statement {
+				stmts[2].Params[0] = "not-rfc3339"
+				return stmts
+			},
+			"lease wall timestamp malformed": func(stmts []Statement) []Statement {
+				stmts[len(stmts)-1].Params[1] = "not-rfc3339"
+				return stmts
+			},
+			"updated_at clock misbound": func(stmts []Statement) []Statement {
+				stmts[3].Params[8] = "8000000000000-0000-other-clock"
 				return stmts
 			},
 			"extra registered role": func(stmts []Statement) []Statement {

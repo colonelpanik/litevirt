@@ -31,14 +31,22 @@ func (d *Daemon) setupAuditSigning(ctx context.Context) error {
 		return err
 	}
 	d.db.SetAuditKeyring(keyring)
-	if err := keyring.PublishSigningKey(ctx, d.db); err != nil {
+
+	// AdoptAuditKey publishes the certificate AND completes a rotation if this
+	// host is now holding a different key than the one it last published. Doing
+	// it here rather than in a rotate RPC is deliberate: a host is the only
+	// party that can know which key it actually holds, and the only one that can
+	// sign the chain head that seals what the superseded key wrote. So rotation
+	// is "replace the files, restart" with no coordination at all.
+	if _, err := corrosion.AdoptAuditKey(ctx, d.db, d.cfg.HostName); err != nil {
 		// Signing still works; peers just cannot verify until this lands. Worth
 		// an error rather than a warning, because a chain nobody else can check
 		// is the failure mode this whole design exists to avoid.
 		slog.Error("audit signing key could not be published; peers cannot verify this "+
 			"host's chain until it is", "error", err)
 	}
-	slog.Info("audit signing enabled", "host", d.cfg.HostName, "key_id", keyring.KeyID())
+	slog.Info("audit signing enabled", "host", d.cfg.HostName, "key_id", keyring.KeyID(),
+		"dedicated_key", corrosion.UsesDedicatedAuditKey(d.cfg.PKIDir))
 	return nil
 }
 
@@ -118,6 +126,8 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			"seq_gap":       len(res.SeqGaps),
 			"laundered":     len(res.Laundered),
 			"truncated":     len(res.TruncatedHosts),
+			"retired_key":   len(res.RetiredKeyUse),
+			"head_mismatch": len(res.HeadMismatch),
 			"unsigned":      res.Unsigned,
 		})
 		if res.Tampered() {
@@ -127,6 +137,7 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 				"rows", res.RowsChecked, "broken_at", res.BrokenAt,
 				"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
 				"seq_gaps", len(res.SeqGaps), "laundered", len(res.Laundered),
+				"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
 				"truncated_hosts", res.TruncatedHosts)
 		}
 	}

@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // Audit tamper-evidence.
@@ -38,13 +40,21 @@ import (
 // certificate gives cross-node verification AND per-host forgery resistance:
 // node B can prove node A's log is intact without ever being able to write it.
 //
-// The key is the host's EXISTING cluster identity (pkiDir/host.key), not a new
-// one. Every node already has it, it is already signed by the cluster CA with
-// the host name as its CN, and it is already the credential that says "I am
-// this host". Minting a second key would need the CA private key, which lives
-// only on whichever node ran `lv host init` — so a fresh node could not sign
-// its own log at all. Reuse is made safe by domain separation: the payload
-// below is prefixed with a string no TLS handshake ever signs.
+// BOOTSTRAP uses the host's EXISTING cluster identity (pkiDir/host.key). Every
+// node already has it, it is already signed by the cluster CA with the host
+// name as its CN, and it is already the credential that says "I am this host".
+// Minting anything new needs the CA private key, which lives only on whichever
+// node ran `lv host init`, so a fresh node could not otherwise sign its own log
+// at all. Reuse is made safe by domain separation: the payload below is
+// prefixed with a string no TLS handshake ever signs.
+//
+// ROTATION moves the host onto a DEDICATED audit signing pair (see
+// auditSigningPaths). It has to be a separate identity, because replacing
+// host.crt/host.key on a running node changes the certificate the gRPC listener
+// serves and the one the health checker dials peers with — both built once at
+// boot and never reloaded — plus the target of the libvirt symlinks that
+// qemu+tls:// migration follows. Rotating the audit key must not put quorum or
+// a live migration at risk.
 
 // auditSigDomain separates audit-row signatures from every other use of the
 // host key. Without it, a signature produced for one protocol could in
@@ -80,33 +90,33 @@ func LoadAuditKeyring(pkiDir, hostName string) (*AuditKeyring, error) {
 	if err != nil {
 		return nil, err
 	}
-	certPEM, err := os.ReadFile(filepath.Join(pkiDir, "host.crt"))
+	certPath, keyPath := auditSigningPaths(pkiDir)
+	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
-		return nil, fmt.Errorf("read host cert: %w", err)
+		return nil, fmt.Errorf("read audit signing cert: %w", err)
 	}
 	cert, err := parseCertPEM(certPEM)
 	if err != nil {
 		return nil, err
 	}
 	if cert.Subject.CommonName != hostName {
-		return nil, fmt.Errorf("host certificate CN is %q but this host is %q; audit signatures "+
+		return nil, fmt.Errorf("audit signing certificate CN is %q but this host is %q; signatures "+
 			"would be attributed to the wrong host", cert.Subject.CommonName, hostName)
 	}
-	keyPath := filepath.Join(pkiDir, "host.key")
 	if err := tightenKeyMode(keyPath); err != nil {
 		return nil, err
 	}
 	keyPEM, err := os.ReadFile(keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("read host key: %w", err)
+		return nil, fmt.Errorf("read audit signing key: %w", err)
 	}
 	block, _ := pem.Decode(keyPEM)
 	if block == nil {
-		return nil, fmt.Errorf("no PEM block in host key")
+		return nil, fmt.Errorf("no PEM block in %s", keyPath)
 	}
 	priv, err := x509.ParseECPrivateKey(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("parse host key: %w", err)
+		return nil, fmt.Errorf("parse audit signing key: %w", err)
 	}
 	id, err := AuditKeyID(cert)
 	if err != nil {
@@ -114,6 +124,41 @@ func LoadAuditKeyring(pkiDir, hostName string) (*AuditKeyring, error) {
 	}
 	k.hostName, k.keyID, k.certPEM, k.key = hostName, id, string(certPEM), priv
 	return k, nil
+}
+
+// auditSigningPaths picks the identity this host signs audit rows with: a
+// DEDICATED audit signing pair if one has been installed, otherwise the host's
+// TLS identity.
+//
+// The fallback is what makes the feature work at all on an existing cluster.
+// Minting anything new needs the CA private key, which lives only on the node
+// that ran `lv host init`, so a node cannot give itself a dedicated key —
+// every node already has host.key, and that is enough to start signing today.
+//
+// Rotation, which needs the CA anyway, installs the dedicated pair and the node
+// moves onto it. From then on the audit identity is independent of the TLS
+// identity, so replacing it never touches the certificate the gRPC listener
+// serves, the one the health checker dials peers with, or the libvirt symlinks
+// that qemu+tls:// migration follows — none of which reload without a restart.
+func auditSigningPaths(pkiDir string) (certPath, keyPath string) {
+	certPath = filepath.Join(pkiDir, pki.AuditSigningCertName)
+	keyPath = filepath.Join(pkiDir, pki.AuditSigningKeyName)
+	if fileExists(certPath) && fileExists(keyPath) {
+		return certPath, keyPath
+	}
+	return filepath.Join(pkiDir, "host.crt"), filepath.Join(pkiDir, "host.key")
+}
+
+// UsesDedicatedAuditKey reports whether pkiDir holds a dedicated audit signing
+// pair, i.e. whether this host has been rotated off its TLS identity.
+func UsesDedicatedAuditKey(pkiDir string) bool {
+	return fileExists(filepath.Join(pkiDir, pki.AuditSigningCertName)) &&
+		fileExists(filepath.Join(pkiDir, pki.AuditSigningKeyName))
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // tightenKeyMode makes the signing key unreadable to anyone but its owner,
@@ -139,8 +184,8 @@ func tightenKeyMode(keyPath string) error {
 			"could not be tightened: %w", keyPath, fi.Mode().Perm(), err)
 	}
 	slog.Warn("audit signing key was readable by other local users; tightened to 0600. "+
-		"Anyone who read it while it was exposed can still impersonate this host — "+
-		"rotate the host certificate if that is a possibility",
+		"Tightening does not undo a copy already taken: anyone who read it can still sign "+
+		"rows as this host, so rotate with `lv host rotate-audit-key` if that is possible",
 		"path", keyPath, "was", fmt.Sprintf("%04o", fi.Mode().Perm()))
 	return nil
 }

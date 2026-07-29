@@ -2401,6 +2401,17 @@ message VerifyAuditChainResponse {
     // True when any finding is evidence of deliberate interference, so a
     // client does not have to re-derive that rule and get it wrong.
     bool tampered = 12;
+    // Rows signed by a key past the sequence at which it was retired.
+    // Rotation happens precisely when a key may be in someone else's hands,
+    // so a signature from it after that boundary is either an attacker or a
+    // node still running with the superseded key installed.
+    repeated string retired_key_use = 13;
+    // Hosts whose chain does not hash to what their own signed head says.
+    // This is what catches a row rewritten and re-signed by someone holding
+    // a key that has since been rotated out: the signature verifies and the
+    // sequence numbers are untouched, and only the head — signed by the
+    // successor key they do not have — disagrees.
+    repeated string head_mismatch = 14;
 }
 
 message ExportAuditChainRequest {

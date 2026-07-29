@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -126,6 +127,20 @@ func latestAuditHeads(ctx context.Context, c *Client) (map[string]AuditChainHead
 	return out, nil
 }
 
+// chainHashAt returns the content hash of a host's row at a given sequence
+// number, or "" if there is none.
+func chainHashAt(ctx context.Context, c *Client, hostName string, seq int64) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT content_hash FROM audit_log WHERE host_name = ? AND seq = ? LIMIT 1`, hostName, seq)
+	if err != nil {
+		return "", fmt.Errorf("read chain hash for %s at seq %d: %w", hostName, seq, err)
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	return rows[0].String("content_hash"), nil
+}
+
 // verifyChainHeads compares each host's highest signed head against the rows
 // actually present, and reports a host whose log is shorter than its own head
 // says it should be.
@@ -145,6 +160,24 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 				continue
 			}
 		}
+		// The head asserts a HASH as well as a length, and the hash is the half
+		// that matters after a rotation. Someone holding a retired key can
+		// rewrite a row it signed and re-sign it perfectly: the signature
+		// verifies, the sequence numbers are untouched, and the row count is
+		// unchanged. Only the recorded chain hash — signed by the successor key
+		// they do not have — contradicts them.
+		if h.Seq > 0 && h.HeadHash != "" && observedSeq[host] >= h.Seq {
+			actual, err := chainHashAt(ctx, c, host, h.Seq)
+			if err != nil {
+				return err
+			}
+			if actual != "" && !strings.EqualFold(actual, h.HeadHash) {
+				res.HeadMismatch = append(res.HeadMismatch, fmt.Sprintf(
+					"%s: signed head says the chain hashed to %s at seq %d, but it hashes to %s — "+
+						"a row at or before that point was rewritten", host, h.HeadHash, h.Seq, actual))
+			}
+		}
+
 		if observedSeq[host] >= h.Seq {
 			continue
 		}

@@ -262,7 +262,13 @@ import (
 //	     audit_chain_heads (append-only signed heads, which is the only way to
 //	     detect truncation — a hash chain links backward and cannot notice that
 //	     its own tail was removed). Three additive columns, two new tables.
-const CurrentSchemaVersion = 45
+//	v46: audit signing key rotation — audit_signing_keys gains retired_at and
+//	     retired_at_seq, the sequence number past which a key must no longer
+//	     appear. Retirement is a validity WINDOW, never a deletion: the
+//	     certificate has to stay resolvable for as long as any row it signed
+//	     exists, or rotating a key would make the history it signed
+//	     unverifiable. Two additive columns.
+const CurrentSchemaVersion = 46
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1285,6 +1291,16 @@ var schemaDDL = []string{
 		key_id     TEXT PRIMARY KEY,
 		host_name  TEXT NOT NULL,
 		cert_pem   TEXT NOT NULL,
+		-- v46 rotation. retired_at marks when this key stopped being the host's
+		-- active signer; retired_at_seq is the last row sequence it was entitled
+		-- to sign. A row signed by this key beyond that point is a finding.
+		--
+		-- Retirement never deletes the row. A retired certificate must stay
+		-- resolvable for as long as any row it signed still exists, or rotating
+		-- would silently destroy the verifiability of everything the old key
+		-- wrote — turning a security improvement into history loss.
+		retired_at     TEXT,
+		retired_at_seq INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT
@@ -2099,6 +2115,9 @@ var schemaMigrations = []string{
 	`ALTER TABLE audit_log ADD COLUMN key_id TEXT`,
 	`ALTER TABLE audit_log ADD COLUMN signature TEXT`,
 	`ALTER TABLE audit_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
+	// v46: audit signing key rotation (see History v46).
+	`ALTER TABLE audit_signing_keys ADD COLUMN retired_at TEXT`,
+	`ALTER TABLE audit_signing_keys ADD COLUMN retired_at_seq INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2181,6 +2200,7 @@ var alterVersions = []int{
 	44,     // hosts.capacity_policy_hash
 	44, 44, // notification_routes.subject_pattern/project
 	45, 45, 45, // audit_log.key_id/signature/seq
+	46, 46, // audit_signing_keys.retired_at/retired_at_seq
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

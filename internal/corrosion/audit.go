@@ -259,9 +259,20 @@ type AuditVerifyResult struct {
 	// Unattributed counts rows with no host name. They belong to no sub-chain
 	// and so cannot be chain-verified at all.
 	Unattributed int
+	// RetiredKeyUse lists rows signed by a key past the sequence at which it was
+	// retired. Rotation is done precisely when a key may be in someone else's
+	// hands, so a signature from it after the boundary is either an attacker or
+	// a node still running with the superseded key installed.
+	RetiredKeyUse []string
 	// TruncatedHosts lists hosts whose signed chain head attests to more rows
 	// than the log actually holds.
 	TruncatedHosts []string
+	// HeadMismatch lists hosts whose chain does not hash to what their own
+	// signed head says it should. This is what catches a row REWRITTEN and
+	// re-signed by someone holding a key that has since been rotated out: the
+	// signature verifies, the sequence numbers are untouched, and only the head
+	// — signed by the successor key they do not have — disagrees.
+	HeadMismatch []string
 }
 
 // Tampered reports whether anything found is evidence of deliberate
@@ -269,7 +280,8 @@ type AuditVerifyResult struct {
 // NOT tampering: they are what a cluster looks like before enforcement.
 func (r AuditVerifyResult) Tampered() bool {
 	return r.BrokenAt != "" || len(r.BadSignature) > 0 || len(r.UnknownKeyID) > 0 ||
-		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0
+		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0 ||
+		len(r.RetiredKeyUse) > 0 || len(r.HeadMismatch) > 0
 }
 
 // VerifyAuditChain walks every host's sub-chain and reports what it finds.
@@ -289,9 +301,13 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		return res, fmt.Errorf("list audit_log: %w", err)
 	}
 	keyring := c.AuditKeyringOf()
-	prevByHost := map[string]string{}  // per-host running tail
-	seqByHost := map[string]int64{}    // per-host last signed seq
-	hashedByHost := map[string]bool{}  // has this host produced a hashed row yet?
+	retired, err := auditKeyRetirements(ctx, c)
+	if err != nil {
+		return res, err
+	}
+	prevByHost := map[string]string{} // per-host running tail
+	seqByHost := map[string]int64{}   // per-host last signed seq
+	hashedByHost := map[string]bool{} // has this host produced a hashed row yet?
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
@@ -349,6 +365,17 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 				fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
 		}
 		seqByHost[host] = seq
+
+		// A retired key signing past its boundary. The signature itself will
+		// verify — the attacker has the key, that is the whole problem — so the
+		// only thing that can flag it is the retirement record, which they
+		// cannot rewrite without also defeating the head signed by the
+		// successor key.
+		if boundary, isRetired := retired[keyID]; isRetired && seq > boundary {
+			res.RetiredKeyUse = append(res.RetiredKeyUse, fmt.Sprintf(
+				"%s: row %s has seq %d, signed by key %s which was retired at seq %d",
+				host, rec.ID, seq, keyID, boundary))
+		}
 
 		if keyring == nil {
 			res.Unverifiable++

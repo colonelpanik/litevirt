@@ -21880,7 +21880,18 @@ type VerifyAuditChainResponse struct {
 	TruncatedHosts []string `protobuf:"bytes,11,rep,name=truncated_hosts,json=truncatedHosts,proto3" json:"truncated_hosts,omitempty"`
 	// True when any finding is evidence of deliberate interference, so a
 	// client does not have to re-derive that rule and get it wrong.
-	Tampered      bool `protobuf:"varint,12,opt,name=tampered,proto3" json:"tampered,omitempty"`
+	Tampered bool `protobuf:"varint,12,opt,name=tampered,proto3" json:"tampered,omitempty"`
+	// Rows signed by a key past the sequence at which it was retired.
+	// Rotation happens precisely when a key may be in someone else's hands,
+	// so a signature from it after that boundary is either an attacker or a
+	// node still running with the superseded key installed.
+	RetiredKeyUse []string `protobuf:"bytes,13,rep,name=retired_key_use,json=retiredKeyUse,proto3" json:"retired_key_use,omitempty"`
+	// Hosts whose chain does not hash to what their own signed head says.
+	// This is what catches a row rewritten and re-signed by someone holding
+	// a key that has since been rotated out: the signature verifies and the
+	// sequence numbers are untouched, and only the head — signed by the
+	// successor key they do not have — disagrees.
+	HeadMismatch  []string `protobuf:"bytes,14,rep,name=head_mismatch,json=headMismatch,proto3" json:"head_mismatch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -21997,6 +22008,20 @@ func (x *VerifyAuditChainResponse) GetTampered() bool {
 		return x.Tampered
 	}
 	return false
+}
+
+func (x *VerifyAuditChainResponse) GetRetiredKeyUse() []string {
+	if x != nil {
+		return x.RetiredKeyUse
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetHeadMismatch() []string {
+	if x != nil {
+		return x.HeadMismatch
+	}
+	return nil
 }
 
 type ExportAuditChainRequest struct {
@@ -24594,7 +24619,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"targetPool\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tpool_name\x18\x04 \x01(\tR\bpoolName\x12!\n" +
-	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xbd\x03\n" +
+	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\x8a\x04\n" +
 	"\x18VerifyAuditChainResponse\x12!\n" +
 	"\frows_checked\x18\x01 \x01(\x05R\vrowsChecked\x12 \n" +
 	"\fbroken_at_id\x18\x02 \x01(\tR\n" +
@@ -24609,7 +24634,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x11unattributed_rows\x18\n" +
 	" \x01(\x05R\x10unattributedRows\x12'\n" +
 	"\x0ftruncated_hosts\x18\v \x03(\tR\x0etruncatedHosts\x12\x1a\n" +
-	"\btampered\x18\f \x01(\bR\btampered\"E\n" +
+	"\btampered\x18\f \x01(\bR\btampered\x12&\n" +
+	"\x0fretired_key_use\x18\r \x03(\tR\rretiredKeyUse\x12#\n" +
+	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\"E\n" +
 	"\x17ExportAuditChainRequest\x12\x14\n" +
 	"\x05since\x18\x01 \x01(\tR\x05since\x12\x14\n" +
 	"\x05until\x18\x02 \x01(\tR\x05until\"K\n" +

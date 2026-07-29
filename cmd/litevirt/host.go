@@ -37,6 +37,7 @@ func newHostCmd() *cobra.Command {
 		newHostPreflightUpgradeCmd(),
 		newHostStatsCmd(),
 		newHostCephCmd(),
+		newHostRotateAuditKeyCmd(),
 	)
 
 	return cmd
@@ -613,6 +614,39 @@ func countBlockingCLI(findings []*pb.PreflightFinding) int {
 		}
 	}
 	return n
+}
+
+// newHostRotateAuditKeyCmd replaces the key a host signs audit rows with. It
+// is SSH + a restart, not an RPC: only the host holds its new private key, so
+// only the host can sign the chain head that seals what the old key wrote.
+func newHostRotateAuditKeyCmd() *cobra.Command {
+	var sshTarget string
+	cmd := &cobra.Command{
+		Use:   "rotate-audit-key <host>",
+		Short: "Replace a host's audit signing key",
+		Long: `Mint a new audit signing certificate for a host and install it.
+
+Run this when the host's signing key may have been exposed — notably on any node
+provisioned before the fix that pushed /etc/litevirt/pki/host.key mode 0644.
+Tightening the mode does not undo a copy someone already took.
+
+Must run from the node that holds the cluster CA private key (the one that ran
+'lv host init'): there is no CSR flow, so nowhere else can sign a certificate.
+
+The host's TLS identity (host.crt / host.key) is NOT touched — peer mTLS and
+qemu+tls:// live migration are unaffected. The target's daemon is restarted,
+because the signing keyring is loaded once at boot.
+
+  lv host rotate-audit-key host-b
+  lv host rotate-audit-key host-b --ssh root@10.0.50.11`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cli.HostRotateAuditKey(cmd.Context(), args[0], sshTarget)
+		},
+	}
+	cmd.Flags().StringVar(&sshTarget, "ssh", "",
+		"SSH target for the host (default root@<host>) — needed when the litevirt host name is not the address you reach it on")
+	return cmd
 }
 
 func newHostDevicesCmd() *cobra.Command {

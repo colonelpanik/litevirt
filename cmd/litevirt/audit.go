@@ -126,6 +126,8 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		{"unknown key (no trustworthy published certificate for the signer):", resp.UnknownKeyId},
 		{"sequence gap (rows deleted from a host's chain):", resp.SeqGaps},
 		{"laundered (row blanked its own hash to fake a chain reset):", resp.Laundered},
+		{"retired key used (signed after the key was rotated out):", resp.RetiredKeyUse},
+		{"chain head mismatch (a row covered by a signed head was rewritten):", resp.HeadMismatch},
 	} {
 		if len(g.rows) == 0 {
 			continue

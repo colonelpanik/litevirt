@@ -232,3 +232,70 @@ func randomSerial() (*big.Int, error) {
 	}
 	return serial, nil
 }
+
+// AuditSigningCertName / AuditSigningKeyName are the dedicated audit signing
+// identity, separate from the host's TLS identity.
+const (
+	AuditSigningCertName = "audit-signing.crt"
+	AuditSigningKeyName  = "audit-signing.key"
+)
+
+// GenerateAuditSigningCert creates a CA-signed certificate used ONLY to sign
+// audit rows, with hostName as its CN.
+//
+// It is deliberately not the host's TLS certificate. Audit signing bootstraps
+// on host.key because every node already has one and minting anything new needs
+// the CA private key, which lives only on the node that ran `lv host init`.
+// ROTATION already requires that node, so it can mint a dedicated key — and
+// doing so keeps rotation off the TLS path entirely.
+//
+// That separation is the whole point. Replacing host.crt/host.key on a running
+// node changes the identity the gRPC listener serves (built once at boot and
+// never reloaded), the client identity the health checker dials peers with
+// (likewise), and the target of the libvirt TLS symlinks that qemu+tls://
+// migration reads. Rotating the audit key must not risk any of that: an
+// operator restoring audit integrity should not be gambling with quorum or a
+// live migration.
+//
+// No IP SANs and no ExtKeyUsage: this certificate must never be usable for TLS.
+// Its only job is to say "this public key belongs to this host".
+func GenerateAuditSigningCert(caCertPath, caKeyPath, certPath, keyPath, hostName string) error {
+	caCert, caKey, err := loadCA(caCertPath, caKeyPath)
+	if err != nil {
+		return fmt.Errorf("load CA: %w", err)
+	}
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate audit signing key: %w", err)
+	}
+
+	serial, err := randomSerial()
+	if err != nil {
+		return err
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{"litevirt"},
+			CommonName:   hostName,
+		},
+		NotBefore: time.Now().Add(-5 * time.Minute),
+		NotAfter:  time.Now().Add(5 * 365 * 24 * time.Hour),
+		KeyUsage:  x509.KeyUsageDigitalSignature,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		return fmt.Errorf("create audit signing cert: %w", err)
+	}
+	if err := writePEM(certPath, "CERTIFICATE", certDER); err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return fmt.Errorf("marshal audit signing key: %w", err)
+	}
+	return writePEM(keyPath, "EC PRIVATE KEY", keyDER)
+}

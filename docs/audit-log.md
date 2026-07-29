@@ -104,6 +104,44 @@ poll it periodically. The REST route always emits every field, including
 `tampered: false` — so an alert can key on the field's value and never confuse
 a clean chain with a daemon too old to report one.
 
+## Rotating a host's signing key
+
+```bash
+lv host rotate-audit-key host-b
+lv host rotate-audit-key host-b --ssh root@10.0.50.11   # name isn't the address
+```
+
+Rotate when a host's signing key **may have been exposed** — most concretely, any
+node provisioned by an `lv host init` old enough to have pushed
+`/etc/litevirt/pki/host.key` mode 0644, which any local user could read. The
+daemon tightens the mode to 0600 when it finds it loose, but tightening does not
+undo a copy already taken: whoever has one can still sign rows as that host.
+
+The command **must run from the node that holds the cluster CA private key** (the
+one that ran `lv host init`). There is no CSR flow, so no other machine can have
+a certificate signed — for itself or anyone else. It mints the pair locally into
+a temp dir, pushes `audit-signing.crt` (0644) and `audit-signing.key` (0600), and
+**restarts litevirt on the target**, because the signing keyring is loaded once
+at boot. `host.crt` / `host.key` are not touched: those are the identity the gRPC
+listener serves, the one the health checker dials peers with, and the target of
+the libvirt symlinks `qemu+tls://` migration follows — none of which reload
+without a restart, so rotating them would put quorum and any in-flight migration
+at risk. That separation is the reason the audit key is its own certificate.
+
+On the next start the daemon publishes the new certificate, retires the old key
+at the sequence its chain has reached, and signs a chain head **with the new key**
+over the whole existing log. That last step is what rotation is for: from then on,
+altering any row the old key wrote contradicts a head whoever holds that key
+cannot forge. What it cannot do is repair a log that was already forged before
+anyone noticed — no scheme can.
+
+Rows signed by the retired key **stay verifiable forever**. The retired
+certificate is marked retired, never deleted, so `lv audit verify` can still
+resolve it — deleting it would make every row it signed unverifiable, and a
+rotation performed to improve integrity would destroy the history it was
+protecting. What retirement adds is a boundary: use of the old key past the
+sequence it was retired at is itself a finding.
+
 ## WORM export
 
 ```bash

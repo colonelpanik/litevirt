@@ -45,6 +45,11 @@ type ContainerChecker struct {
 	// onRekey observes each runtime re-key decision (result ∈ rekeyed /
 	// split_brain / inconclusive / error) — nil-safe; tests assert on it.
 	onRekey func(name, result string)
+	// guardedContainerRekeyActive reports whether the operation/capacity
+	// protocol is configured and latched cluster-wide, so emitting guarded v44
+	// re-key shapes is safe during a rolling upgrade. nil/false fails closed for
+	// modern authority while pre-authority rows keep the v1.3 envelope.
+	guardedContainerRekeyActive func() bool
 
 	// gate is the split-brain safety gate (Phase 1). When set + enforced, a
 	// container re-key additionally requires local quorum (ExecutionGate). See
@@ -73,6 +78,12 @@ func NewContainerChecker(hostName string, db *corrosion.Client, runtime lxc.Runt
 
 // SetEventBus sets the event bus for publishing container lifecycle events.
 func (c *ContainerChecker) SetEventBus(bus *events.Bus) { c.bus = bus }
+
+// SetGuardedContainerRekeyActive injects the cheap configured+latch decision
+// used to select modern guarded re-key WAL shapes.
+func (c *ContainerChecker) SetGuardedContainerRekeyActive(fn func() bool) {
+	c.guardedContainerRekeyActive = fn
+}
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (c *ContainerChecker) SetGate(g runtimeGate) { c.gate = g }

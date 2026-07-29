@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,6 +91,153 @@ func TestCtRekey_NoneRunningReclaims(t *testing.T) {
 	if n := auditCount(t, db, "ct.runtime-owner-rekey"); n != 1 {
 		t.Fatalf("want 1 rekey audit row, got %d", n)
 	}
+}
+
+func TestCtRekey_ProductionDispatchUsesCompatibleEnvelope(t *testing.T) {
+	ctx := context.Background()
+	mutationSeq := func(t *testing.T, db *corrosion.Client) int64 {
+		t.Helper()
+		rows, err := db.Query(ctx, `SELECT COALESCE(MAX(seq), 0) AS seq FROM mutation_log`)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("mutation seq: rows=%v err=%v", rows, err)
+		}
+		return rows[0].Int64("seq")
+	}
+	rekeyEnvelopeAfter := func(t *testing.T, db *corrosion.Client, after int64) []corrosion.Statement {
+		t.Helper()
+		rows, err := db.Query(ctx,
+			`SELECT stmts FROM mutation_log WHERE seq > ? ORDER BY seq`, after)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			var stmts []corrosion.Statement
+			if err := json.Unmarshal([]byte(row.String("stmts")), &stmts); err != nil {
+				t.Fatal(err)
+			}
+			for _, stmt := range stmts {
+				if strings.Contains(stmt.SQL, "INSERT OR REPLACE INTO containers") {
+					for _, p := range stmt.Params {
+						if fmt.Sprint(p) == corrosion.ContainerRuntimeRekeyDetail {
+							return stmts
+						}
+					}
+				}
+			}
+		}
+		t.Fatal("container rekey envelope not found")
+		return nil
+	}
+	replaceSource := func(
+		t *testing.T, db *corrosion.Client, opID string, commit bool,
+	) (corrosion.OperationRecord, corrosion.ContainerRecord) {
+		t.Helper()
+		if err := corrosion.DeleteContainer(ctx, db, "node-b", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		op := corrosion.OperationRecord{
+			ID: opID, Method: "Createcontainer", Principal: "alice", Project: "p1",
+			ResourceKind: "container", ResourceID: "ct1",
+			OperationKind: string(corrosion.OpWorkloadCreate), RequestHash: "hash",
+			IdempotencyKey: opID, VMOwnerEpoch: 3,
+		}
+		rec := corrosion.ContainerRecord{
+			HostName: "node-b", Name: "ct1", Image: "modern", Project: "p1",
+			OwnerEpoch: 3, SpecGeneration: 5,
+		}
+		if applied, err := db.BeginContainerCreateOperation(ctx, op, rec); err != nil || !applied {
+			t.Fatalf("modern begin: applied=%v err=%v", applied, err)
+		}
+		if commit {
+			if applied, err := db.CommitContainerCreateOperation(
+				ctx, op.ID, rec.OwnerEpoch, rec, nil,
+			); err != nil || !applied {
+				t.Fatalf("modern commit: applied=%v err=%v", applied, err)
+			}
+		}
+		got, err := corrosion.GetContainer(ctx, db, rec.HostName, rec.Name)
+		if err != nil || got == nil {
+			t.Fatalf("modern source: got=%+v err=%v", got, err)
+		}
+		return op, *got
+	}
+
+	t.Run("preauthority uses legacy envelope", func(t *testing.T) {
+		c, db, _, results := ctRekeyFixture(t)
+		source := liveCt(t, db, "node-b", "ct1")
+		before := mutationSeq(t, db)
+		c.tryRekey(ctx, source.Name, *source, nil)
+		if results[source.Name] != "rekeyed" {
+			t.Fatalf("preauthority result=%q", results[source.Name])
+		}
+		stmts := rekeyEnvelopeAfter(t, db, before)
+		for i, stmt := range stmts {
+			if stmt.Guard != nil {
+				t.Fatalf("legacy production statement %d carries guarded shape", i)
+			}
+		}
+	})
+
+	t.Run("modern post latch uses guarded envelope", func(t *testing.T) {
+		c, db, _, results := ctRekeyFixture(t)
+		_, source := replaceSource(t, db, "op-health-modern-latched", true)
+		c.SetGuardedContainerRekeyActive(func() bool { return true })
+		before := mutationSeq(t, db)
+		c.tryRekey(ctx, source.Name, source, nil)
+		if results[source.Name] != "rekeyed" {
+			t.Fatalf("post-latch modern result=%q", results[source.Name])
+		}
+		got := liveCt(t, db, "node-a", source.Name)
+		if got == nil || got.OwnerEpoch != 3 || got.SpecGeneration != 5 {
+			t.Fatalf("post-latch guarded target: %+v", got)
+		}
+		stmts := rekeyEnvelopeAfter(t, db, before)
+		for i, stmt := range stmts {
+			if stmt.Guard == nil {
+				t.Fatalf("modern production statement %d lacks guarded shape", i)
+			}
+		}
+	})
+
+	t.Run("modern pre latch fails closed without WAL", func(t *testing.T) {
+		c, db, _, results := ctRekeyFixture(t)
+		_, source := replaceSource(t, db, "op-health-modern-prelatch", true)
+		c.SetGuardedContainerRekeyActive(func() bool { return false })
+		before := mutationSeq(t, db)
+		c.tryRekey(ctx, source.Name, source, nil)
+		if results[source.Name] != "inconclusive" {
+			t.Fatalf("pre-latch modern result=%q", results[source.Name])
+		}
+		if after := mutationSeq(t, db); after != before {
+			t.Fatalf("pre-latch modern rekey appended WAL: before=%d after=%d", before, after)
+		}
+		if got := liveCt(t, db, "node-b", source.Name); got == nil ||
+			got.OwnerEpoch != 3 || got.SpecGeneration != 5 {
+			t.Fatalf("pre-latch modern source changed: %+v", got)
+		}
+		if got := liveCt(t, db, "node-a", source.Name); got != nil {
+			t.Fatalf("pre-latch modern rekey manufactured target: %+v", got)
+		}
+	})
+
+	t.Run("active barrier fails closed without WAL", func(t *testing.T) {
+		c, db, _, results := ctRekeyFixture(t)
+		op, source := replaceSource(t, db, "op-health-active-barrier", false)
+		c.SetGuardedContainerRekeyActive(func() bool { return true })
+		before := mutationSeq(t, db)
+		c.tryRekey(ctx, source.Name, source, nil)
+		if results[source.Name] != "inconclusive" {
+			t.Fatalf("active-barrier result=%q", results[source.Name])
+		}
+		if after := mutationSeq(t, db); after != before {
+			t.Fatalf("active-barrier rekey appended WAL: before=%d after=%d", before, after)
+		}
+		if applied, err := db.RollbackContainerCreateOperation(
+			ctx, source.HostName, source.Name, op.ID, source.OwnerEpoch, "cancelled",
+		); err != nil || !applied {
+			t.Fatalf("rollback after health decline: applied=%v err=%v", applied, err)
+		}
+	})
 }
 
 // Re-key must move the WHOLE ownership footprint: the container_interfaces rows

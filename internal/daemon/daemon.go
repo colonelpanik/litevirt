@@ -888,6 +888,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// whose only live DB row points elsewhere against every workload-capable peer
 	// before reclaiming it (a PK re-key).
 	ctChecker.SetPeerContainerRuntimeChecker(svc.CheckPeerContainerRuntime)
+	// Guarded v44 re-key WAL is emitted only after the operation protocol's
+	// config kill-switch is on and both the operation + dependent capacity
+	// capabilities have latched cluster-wide. Until then modern authority fails
+	// closed; pre-authority rows retain the exact v1.3 envelope.
+	ctChecker.SetGuardedContainerRekeyActive(func() bool {
+		return d.cfg.Enforcement.OperationProtocol &&
+			d.checker.Latched(capabilities.OperationProtocolV1) &&
+			d.checker.Latched(capabilities.CapacityAdmissionV1)
+	})
 	ctChecker.SetContainerRekeyObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("ct", result) })
 	// Split-brain safety gate (Phase 1): a container re-key needs local quorum once
 	// enforced — wired before the container reconcile loop starts.

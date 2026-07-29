@@ -467,21 +467,54 @@ func containerRekeyPreflight(
 ) (bool, error) {
 	// (a) source row still live, unchanged since observed, and outside any
 	// relocation/migration state machine.
-	var state, detail, token, activeOperationID, updatedAt string
+	var current ContainerRecord
+	var currentLabels string
+	var currentTemplate int
 	err := tx.QueryRowContext(ctx,
-		`SELECT state, COALESCE(state_detail,''), COALESCE(relocate_token,''),
-		        active_operation_id, updated_at
+		`SELECT host_name, name, COALESCE(image, ''), cpu_limit, memory_mib,
+		        COALESCE(labels, ''), COALESCE(restart_policy, ''),
+		        COALESCE(project, '_default'), COALESCE(is_template, 0),
+		        COALESCE(on_host_failure, ''), COALESCE(create_spec, ''),
+		        COALESCE(relocate_token, ''), owner_epoch, spec_generation,
+		        active_operation_id, state, COALESCE(state_detail, ''),
+		        created_at, updated_at
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		src.HostName, src.Name).
-		Scan(&state, &detail, &token, &activeOperationID, &updatedAt)
+		Scan(&current.HostName, &current.Name, &current.Image,
+			&current.CPULimit, &current.MemMiB, &currentLabels,
+			&current.RestartPolicy, &current.Project, &currentTemplate,
+			&current.OnHostFailure, &current.CreateSpec, &current.RelocateToken,
+			&current.OwnerEpoch, &current.SpecGeneration,
+			&current.ActiveOperationID, &current.State, &current.StateDetail,
+			&current.CreatedAt, &current.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if updatedAt != src.UpdatedAt ||
-		!containerRekeySourceSafe(state, detail, token, activeOperationID) {
+	current.IsTemplate = currentTemplate != 0
+	callerLabels, err := encodeContainerLabels(src.Labels)
+	if err != nil {
+		return false, err
+	}
+	if current.UpdatedAt != src.UpdatedAt ||
+		current.CreatedAt != src.CreatedAt ||
+		current.OwnerEpoch != src.OwnerEpoch ||
+		current.SpecGeneration != src.SpecGeneration ||
+		current.ActiveOperationID != src.ActiveOperationID ||
+		containerCreateIdentityHash(current, currentLabels) !=
+			containerCreateIdentityHash(src, callerLabels) ||
+		!containerRekeySourceSafe(
+			current.State, current.StateDetail,
+			current.RelocateToken, current.ActiveOperationID,
+		) {
+		return false, nil
+	}
+	if legacyEnvelope &&
+		(current.OwnerEpoch != 0 ||
+			current.SpecGeneration != 0 ||
+			current.ActiveOperationID != "") {
 		return false, nil
 	}
 	// (b) no live target row may exist. The ordinary v1.3 envelope may replace
@@ -506,7 +539,7 @@ func containerRekeyPreflight(
 		return false, nil
 	}
 	// (c) source must own the live IPAM lease for every managed NIC.
-	for _, nic := range managedNICIPs(src) {
+	for _, nic := range managedNICIPs(current) {
 		var ln int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM ip_allocations

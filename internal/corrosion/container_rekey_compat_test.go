@@ -477,6 +477,84 @@ func TestOrdinaryRekeyLocalTargetAuthority(t *testing.T) {
 	})
 }
 
+func TestOrdinaryRekeyCannotForgePreauthoritySource(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-modern-source-forged-legacy", "container", "ct1", "hash", "", 3)
+	rec := ContainerRecord{
+		HostName: "h1", Name: "ct1", Image: "modern", Project: "p1",
+		OwnerEpoch: 3, SpecGeneration: 5,
+	}
+	if applied, err := c.BeginContainerCreateOperation(ctx, op, rec); err != nil || !applied {
+		t.Fatalf("begin modern source: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.CommitContainerCreateOperation(
+		ctx, op.ID, rec.OwnerEpoch, rec, nil,
+	); err != nil || !applied {
+		t.Fatalf("commit modern source: applied=%v err=%v", applied, err)
+	}
+	fresh, err := GetContainer(ctx, c, rec.HostName, rec.Name)
+	if err != nil || fresh == nil {
+		t.Fatalf("fresh modern source: got=%+v err=%v", fresh, err)
+	}
+	if _, err := c.db.Exec(
+		`INSERT INTO container_interfaces
+		 (host_name, ct_name, network_name, ordinal, mac, updated_at)
+		 VALUES ('h1', 'ct1', 'sentinel', 0, '52:54:00:00:00:01', 'sentinel')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.Exec(
+		`INSERT INTO ip_allocations
+		 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+		 VALUES ('sentinel', '10.0.0.10', '52:54:00:00:00:01',
+		         'ct1', 'ct', 'h1', 'sentinel', 'sentinel')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	forged := *fresh
+	forged.OwnerEpoch = 0
+	forged.SpecGeneration = 0
+	forged.ActiveOperationID = ""
+	rowsBefore := containerRowsSnapshot(t, c, rec.Name)
+	footprintBefore := containerOwnershipFootprintSnapshot(t, c, rec.Name)
+	var mutationsBefore int64
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM mutation_log`).Scan(&mutationsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := RekeyContainerOwner(ctx, c, forged, "h2"); err != nil || applied {
+		t.Fatalf("forged legacy rekey: applied=%v err=%v", applied, err)
+	}
+	if rowsAfter := containerRowsSnapshot(t, c, rec.Name); rowsAfter != rowsBefore {
+		t.Fatalf("forged legacy rekey changed container rows:\nbefore=%s\nafter=%s",
+			rowsBefore, rowsAfter)
+	}
+	if footprintAfter := containerOwnershipFootprintSnapshot(
+		t, c, rec.Name,
+	); footprintAfter != footprintBefore {
+		t.Fatalf("forged legacy rekey changed footprint:\nbefore=%s\nafter=%s",
+			footprintBefore, footprintAfter)
+	}
+	var mutationsAfter int64
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM mutation_log`).Scan(&mutationsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if mutationsAfter != mutationsBefore {
+		t.Fatalf("forged legacy rekey appended WAL: before=%d after=%d",
+			mutationsBefore, mutationsAfter)
+	}
+
+	if applied, err := RekeyContainerOwnerGuarded(ctx, c, *fresh, "h2"); err != nil || !applied {
+		t.Fatalf("fresh guarded rekey: applied=%v err=%v", applied, err)
+	}
+	got, err := GetContainer(ctx, c, "h2", rec.Name)
+	if err != nil || got == nil || got.OwnerEpoch != rec.OwnerEpoch ||
+		got.SpecGeneration != rec.SpecGeneration {
+		t.Fatalf("guarded target authority: got=%+v err=%v", got, err)
+	}
+}
+
 func containerRowsSnapshot(t *testing.T, c *Client, name string) string {
 	t.Helper()
 	rows, err := c.Query(context.Background(),

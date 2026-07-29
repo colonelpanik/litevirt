@@ -1485,16 +1485,35 @@ func validateLegacyContainerRekeyEnvelope(
 		return legacyContainerRekeyEnvelope{},
 			invalidf("legacy container rekey does not share its parent clock")
 	}
+	expectedInterfaces := BuildContainerInterfacesFromSpec(
+		targetHost, name, DecodeCreateSpec(coerceString(target.Params[11])),
+	)
+	if len(expectedInterfaces) != len(stmts)-4 {
+		return legacyContainerRekeyEnvelope{},
+			invalidf("legacy container rekey has unexpected target interface content")
+	}
 	for i := 3; i < len(stmts)-1; i++ {
+		expected := expectedInterfaces[i-3]
+		securityGroups, err := encodeSGs(expected.SecurityGroups)
+		if err != nil {
+			return legacyContainerRekeyEnvelope{},
+				invalidf("legacy container rekey has invalid target interface content")
+		}
 		if fps[i] != expectedInterface || len(stmts[i].Params) != 9 ||
 			coerceString(stmts[i].Params[0]) != targetHost ||
-			coerceString(stmts[i].Params[1]) != name {
+			coerceString(stmts[i].Params[1]) != name ||
+			coerceString(stmts[i].Params[2]) != expected.NetworkName ||
+			coerceInt64(stmts[i].Params[3]) != int64(expected.Ordinal) ||
+			coerceString(stmts[i].Params[4]) != expected.MAC ||
+			coerceString(stmts[i].Params[5]) != expected.IP ||
+			coerceString(stmts[i].Params[6]) != expected.VethDevice ||
+			coerceString(stmts[i].Params[7]) != securityGroups {
 			return legacyContainerRekeyEnvelope{},
 				invalidf("legacy container rekey has an unexpected target interface")
 		}
-		if coerceString(stmts[i].Params[8]) != clock {
+		if _, ok := hlc.Parse(coerceString(stmts[i].Params[8])); !ok {
 			return legacyContainerRekeyEnvelope{},
-				invalidf("legacy container rekey does not share its parent clock")
+				invalidf("legacy container rekey has an invalid target interface clock")
 		}
 	}
 	return legacyContainerRekeyEnvelope{

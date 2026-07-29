@@ -2474,16 +2474,30 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 	ctx := context.Background()
 	const (
 		high        = "9000000000000-0000-retained-rekey"
+		ifaceClock0 = "9000000000001-0000-retained-iface-0"
+		ifaceClock1 = "9000000000002-0000-retained-iface-1"
 		parentWall  = "2026-07-28T12:00:00Z"
 		cleanupWall = "2026-07-28T12:00:01Z"
 		leaseWall   = "2026-07-28T12:00:02Z"
 	)
+	createSpec := EncodeCreateSpec(ContainerCreateSpec{
+		Networks: []ContainerNetwork{
+			{
+				Name: "eth0", NetworkName: "net1", IP: "10.0.0.10",
+				MAC: "52:54:00:00:00:01", SecurityGroups: []string{"web"},
+			},
+			{
+				Name: "eth1", NetworkName: "net2",
+				MAC: "52:54:00:00:00:02",
+			},
+		},
+	})
 
 	seedLegacySource := func(t *testing.T, c *Client) ContainerRecord {
 		t.Helper()
 		if err := UpsertContainer(ctx, c, ContainerRecord{
 			HostName: "h1", Name: "ct1", State: "running", Image: "legacy",
-			Project: "p1",
+			Project: "p1", CreateSpec: createSpec,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -2505,7 +2519,7 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 				SQL: legacyContainerRekeySQL,
 				Params: []interface{}{
 					"h2", "ct1", "legacy", 0, 0, "", "",
-					ContainerRuntimeRekeyDetail, "p1", 0, "", "", "",
+					ContainerRuntimeRekeyDetail, "p1", 0, "", createSpec, "",
 					createdAt, high,
 				},
 			},
@@ -2518,8 +2532,15 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 			{
 				SQL: containerCreateInterfaceSQL,
 				Params: []interface{}{
-					"h2", "ct1", "net1", 0, "52:54:00:00:00:01", "",
-					"veth-retained", "", high,
+					"h2", "ct1", "net1", 0, "52:54:00:00:00:01", "10.0.0.10",
+					ContainerVethName("ct1", 0), `["web"]`, ifaceClock0,
+				},
+			},
+			{
+				SQL: containerCreateInterfaceSQL,
+				Params: []interface{}{
+					"h2", "ct1", "net2", 1, "52:54:00:00:00:02", "",
+					ContainerVethName("ct1", 1), "", ifaceClock1,
 				},
 			},
 			{
@@ -2594,6 +2615,15 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 				got.State != "running" || got.StateDetail != ContainerRuntimeRekeyDetail {
 				t.Fatalf("safe retained target: got=%+v err=%v", got, err)
 			}
+			ifaces, err := GetContainerInterfaces(ctx, receiver, "h2", "ct1")
+			if err != nil || len(ifaces) != 2 ||
+				ifaces[0].NetworkName != "net1" || ifaces[0].IP != "10.0.0.10" ||
+				ifaces[0].VethDevice != ContainerVethName("ct1", 0) ||
+				len(ifaces[0].SecurityGroups) != 1 || ifaces[0].SecurityGroups[0] != "web" ||
+				ifaces[1].NetworkName != "net2" ||
+				ifaces[1].VethDevice != ContainerVethName("ct1", 1) {
+				t.Fatalf("safe retained interfaces: got=%+v err=%v", ifaces, err)
+			}
 		}
 		assertTarget()
 		applyMutationEntry(t, receiver, entry(t, "retained-v130-replay", stmts))
@@ -2618,6 +2648,10 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 				stmts[3].Params[0] = "other"
 				return stmts
 			},
+			"target interface content misbound": func(stmts []Statement) []Statement {
+				stmts[3].Params[2] = "other"
+				return stmts
+			},
 			"lease target misbound": func(stmts []Statement) []Statement {
 				stmts[len(stmts)-1].Params[0] = "other"
 				return stmts
@@ -2638,8 +2672,12 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 				stmts[len(stmts)-1].Params[1] = "not-rfc3339"
 				return stmts
 			},
-			"updated_at clock misbound": func(stmts []Statement) []Statement {
-				stmts[3].Params[8] = "8000000000000-0000-other-clock"
+			"interface clock malformed": func(stmts []Statement) []Statement {
+				stmts[3].Params[8] = "not-an-hlc"
+				return stmts
+			},
+			"interface clock empty": func(stmts []Statement) []Statement {
+				stmts[3].Params[8] = ""
 				return stmts
 			},
 			"extra registered role": func(stmts []Statement) []Statement {

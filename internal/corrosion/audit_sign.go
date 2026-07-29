@@ -64,6 +64,9 @@ const auditSigDomain = "litevirt-audit-row-v1"
 // be interchangeable with a row.
 const auditHeadDomain = "litevirt-audit-head-v1"
 
+// auditRetireDomain separates a retirement assertion from a row and a head.
+const auditRetireDomain = "litevirt-audit-retire-v1"
+
 // AuditKeyring signs this host's audit rows and verifies any host's.
 //
 // A nil *AuditKeyring is usable and means "unsigned": Sign returns empty and
@@ -239,6 +242,21 @@ func auditHeadDigest(hostName string, epoch, seq int64, headHash, keyID string) 
 	return h.Sum(nil)
 }
 
+// auditRetireDigest is what a retirement signature covers: which host's key is
+// being retired, at what sequence, and who says so.
+//
+// retiredByKeyID is signed rather than merely recorded, so a signature made by
+// one signer cannot be re-filed under another's name.
+func auditRetireDigest(hostName, retiredKeyID string, seq int64, retiredByKeyID string) []byte {
+	h := sha256.New()
+	writeField(h, auditRetireDomain)
+	writeField(h, hostName)
+	writeField(h, retiredKeyID)
+	writeField(h, strconv.FormatInt(seq, 10))
+	writeField(h, retiredByKeyID)
+	return h.Sum(nil)
+}
+
 // writeField appends a NUL-terminated field, so a value containing the
 // separator cannot be split to forge a different field boundary.
 func writeField(h interface{ Write([]byte) (int, error) }, s string) {
@@ -261,6 +279,40 @@ func (k *AuditKeyring) SignHead(hostName string, epoch, seq int64, headHash stri
 		return "", nil
 	}
 	return k.sign(auditHeadDigest(hostName, epoch, seq, headHash, k.keyID))
+}
+
+// SignRetirement asserts that hostName's key retiredKeyID signed nothing valid
+// past seq. The assertion is attributed to THIS keyring.
+func (k *AuditKeyring) SignRetirement(hostName, retiredKeyID string, seq int64) (string, error) {
+	if !k.CanSign() {
+		return "", nil
+	}
+	return k.sign(auditRetireDigest(hostName, retiredKeyID, seq, k.keyID))
+}
+
+// VerifyRetirement checks a retirement's signature against the published
+// certificate for retiredByKeyID.
+//
+// One rule covers every legitimate signer: the signing certificate must chain
+// to the cluster CA and its CN must be hostName. That admits exactly the parties
+// entitled to speak for the host — the retired key itself (a voluntary stop), a
+// successor key (a rotation), and a certificate the CA holder minted for that
+// host in order to retire it on its behalf (a lost key, a decommission). The
+// third needs no special case here: minting a certificate with a chosen CN is
+// already what holding the CA means, so `lv host retire-audit-key` publishes one
+// and signs with it, and the key never has to be installed anywhere.
+//
+// Someone who has merely broken into a node has none of these.
+func (k *AuditKeyring) VerifyRetirement(ctx context.Context, c *Client, hostName, retiredKeyID string, seq int64, retiredByKeyID, sigHex string) error {
+	if k == nil {
+		return fmt.Errorf("no audit keyring loaded")
+	}
+	if retiredByKeyID == "" || sigHex == "" {
+		return fmt.Errorf("retirement of key %s carries no signature", retiredKeyID)
+	}
+	return k.verifySig(ctx, c, hostName, retiredByKeyID, sigHex, func(id string) []byte {
+		return auditRetireDigest(hostName, retiredKeyID, seq, id)
+	})
 }
 
 func (k *AuditKeyring) sign(digest []byte) (string, error) {
@@ -329,8 +381,13 @@ func (k *AuditKeyring) certFor(ctx context.Context, c *Client, keyID string) (*x
 	if cert != nil {
 		return cert, nil
 	}
+	// deleted_at is deliberately NOT filtered. A retired certificate must stay
+	// resolvable for as long as any row it signed still exists, so tombstoning
+	// one cannot be allowed to make that history unverifiable — which would read
+	// as mass tampering rather than as the erasure it is. Ignoring the column
+	// makes the move inert instead of needing a merge rule to refuse it.
 	rows, err := c.Query(ctx,
-		`SELECT cert_pem FROM audit_signing_keys WHERE key_id = ? AND deleted_at IS NULL`, keyID)
+		`SELECT cert_pem FROM audit_signing_keys WHERE key_id = ?`, keyID)
 	if err != nil {
 		return nil, fmt.Errorf("look up signing key %s: %w", keyID, err)
 	}
@@ -388,46 +445,29 @@ func (k *AuditKeyring) PublishSigningKey(ctx context.Context, c *Client) error {
 		k.keyID, k.hostName, k.certPEM, now, now)
 }
 
-// auditEvidenceDecision is what the merge does with one incoming row of audit
-// tamper-evidence.
-type auditEvidenceDecision int
-
-const (
-	// auditEvidencePassThrough: nothing special about this row; let the normal
-	// identity/LWW handling below decide.
-	auditEvidencePassThrough auditEvidenceDecision = iota
-	// auditEvidenceKeepLocal: the incoming row would destroy evidence. Refuse it
-	// whatever clock it carries.
-	auditEvidenceKeepLocal
-	// auditEvidenceHeal: the LOCAL row is the damaged one and the incoming copy
-	// is intact. Apply it, bypassing LWW.
-	//
-	// Refusing damage must not mean freezing it. Whoever tombstoned a head or a
-	// certificate wrote the clock on their own row too, so under LWW the damaged
-	// node would keep its own copy forever and never recover from a peer that
-	// still holds the real one — the guard would have converted a spreading
-	// problem into a permanent local one.
-	auditEvidenceHeal
-)
-
-// auditEvidenceGuard decides what to do with one incoming anti-entropy row of
-// audit tamper-evidence, plus a short, bounded reason used as a metric label and
-// in the warning.
-type auditEvidenceGuard func(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (auditEvidenceDecision, string, error)
+// auditEvidenceGuard decides whether one incoming anti-entropy row of audit
+// tamper-evidence must be refused, plus a short, bounded reason used as a metric
+// label and in the warning. It can only ever REFUSE — see auditEvidenceIsImmutable.
+type auditEvidenceGuard func(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error)
 
 // auditEvidenceGuards are the anti-entropy floors under the three tables the
 // audit verifier derives its conclusions from.
 //
-// Everything in these tables is either an immutable signed assertion or a
-// monotone marker, so ordinary LWW convergence is not merely unnecessary — it is
-// the attack. The clock on an incoming row is written by whoever sent it, so
-// "newest wins" means "the compromised node wins", and anti-entropy would then
-// carry the erasure to every peer. These guards make the losing move
-// unavailable regardless of clock.
+// Every row in them is an immutable signed assertion, so ordinary LWW
+// convergence is not merely unnecessary — it is the attack. The clock on an
+// incoming row is written by whoever sent it, so "newest wins" means "the
+// compromised node wins", and anti-entropy would carry the rewrite to every
+// peer.
+//
+// audit_signing_keys is deliberately absent. Its rows are certificates, which
+// certFor re-validates against the cluster CA and re-derives the key id from on
+// every use, so a swapped one is rejected where it is read rather than where it
+// arrives — and the retirement that used to live on it, the part that genuinely
+// needed protecting, is now its own signed table.
 var auditEvidenceGuards = map[string]auditEvidenceGuard{
-	"audit_log":          signedAuditRowIsImmutable,
-	"audit_chain_heads":  auditChainHeadIsImmutable,
-	"audit_signing_keys": auditSigningKeyIsMonotone,
+	"audit_log":             signedAuditRowIsImmutable,
+	"audit_chain_heads":     auditEvidenceIsImmutable,
+	"audit_key_retirements": auditEvidenceIsImmutable,
 }
 
 // signedAuditRowIsImmutable reports whether an incoming anti-entropy copy of an
@@ -439,123 +479,51 @@ var auditEvidenceGuards = map[string]auditEvidenceGuard{
 // the local one is what this node has already published a chain head over.
 // Keeping it and raising the divergence leaves both versions discoverable — the
 // peer still holds its own — where silently taking one erases the other.
-func signedAuditRowIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (auditEvidenceDecision, string, error) {
+func signedAuditRowIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
 	if indexOf(table.Columns, "signature") < 0 {
 		// A dump from a pre-v45 peer carries no signature column at all. It can
 		// only be describing unsigned rows, so there is nothing to protect.
-		return auditEvidencePassThrough, "", nil
+		return false, "", nil
 	}
 	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
 	if err != nil || !found {
-		return auditEvidencePassThrough, "", err
+		return false, "", err
 	}
 	if cellStr(localRow, columnIndexMap(table.Columns), "signature") == "" {
-		return auditEvidencePassThrough, "", nil // legacy row: keep converging as before
+		return false, "", nil // legacy row: keep converging as before
 	}
 	if encodeRowCells(localRow) != encodeRowCells(row) {
-		return auditEvidenceKeepLocal, "signed_audit_row", nil
+		return true, "signed_audit_row", nil
 	}
-	return auditEvidencePassThrough, "", nil
+	return false, "", nil
 }
 
-// auditChainHeadIsImmutable refuses any anti-entropy row that would change or
-// remove a published chain head.
+// auditEvidenceIsImmutable refuses an anti-entropy row that would change a
+// published chain head or a signed retirement.
 //
-// A head is a signed statement about a fixed (host, epoch, seq). There is no
-// such thing as a later revision of one, so a differing body for the same key is
-// corruption or forgery either way — and a head is the ONLY construct that can
-// detect a truncated tail, which makes deleting one the cheapest way to disable
-// truncation detection cluster-wide. The table is documented append-only and the
-// statement lane enforces that, but anti-entropy ships whole rows including
-// deleted_at, so the same rule has to exist here.
-func auditChainHeadIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (auditEvidenceDecision, string, error) {
-	idx := columnIndexMap(table.Columns)
-	// Refused whether or not this node already holds the head. Accepting a
-	// tombstone for an unseen key would pre-poison the slot, so the genuine head
-	// could never land afterwards — a truncation hidden before it happened.
-	if cellStr(row, idx, "deleted_at") != "" {
-		return auditEvidenceKeepLocal, "audit_head_tombstone", nil
-	}
+// Both are fixed assertions about a fixed key — a head about (host, epoch, seq),
+// a retirement about (host, retired key). Neither has a later revision, so a
+// differing body is corruption or forgery either way, and taking it would
+// overwrite the copy that disagrees with whoever sent it.
+//
+// Note what this does NOT do. It does not refuse tombstones, and it does not
+// repair anything. Both of those are handled by the shape of the data instead:
+// the verifier ignores deleted_at on these tables, so a tombstone accomplishes
+// nothing; and both tables are append-only, so a row deleted outright has no
+// local copy to conflict with and is simply re-inserted from a peer. Trying to
+// solve either here is what produced a force-apply path that could carry an
+// arbitrary column rewrite past LWW.
+func auditEvidenceIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
 	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
 	if err != nil || !found {
-		return auditEvidencePassThrough, "", err
-	}
-	// The incoming copy is live, so a local tombstone is the damaged side and a
-	// peer is offering the repair. Take it: nothing legitimately deletes a head,
-	// and under LWW the node that tombstoned its own would keep that clock
-	// forever.
-	if cellStr(localRow, idx, "deleted_at") != "" {
-		return auditEvidenceHeal, "audit_head_untombstone", nil
+		return false, "", err
 	}
 	if encodeRowCells(localRow) != encodeRowCells(row) {
-		return auditEvidenceKeepLocal, "audit_head_rewrite", nil
+		return true, "audit_evidence_rewrite", nil
 	}
-	return auditEvidencePassThrough, "", nil
+	return false, "", nil
 }
 
-// auditSigningKeyIsMonotone keeps a key's retirement from being walked back.
-//
-// Retirement is the record that says "this key is loose; anything it signs past
-// sequence N is somebody else". Clearing retired_at, or moving retired_at_seq
-// forward, retroactively authorises exactly the rows the local copy already
-// flagged — and under plain LWW that edit replicates from the compromised node
-// to every peer, taking the finding with it. Deleting the row is worse still:
-// the certificate must stay resolvable for as long as any row it signed exists,
-// so a tombstone does not hide those rows, it makes them unverifiable, which
-// reads as mass tampering rather than as the erasure it is.
-func auditSigningKeyIsMonotone(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (auditEvidenceDecision, string, error) {
-	idx := columnIndexMap(table.Columns)
-	if cellStr(row, idx, "deleted_at") != "" {
-		return auditEvidenceKeepLocal, "audit_key_tombstone", nil
-	}
-	if indexOf(table.Columns, "retired_at") < 0 {
-		return auditEvidencePassThrough, "", nil // pre-v46 dump: no retirement to weaken
-	}
-	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
-	if err != nil || !found {
-		return auditEvidencePassThrough, "", err
-	}
-	// Retirement is monotone in BOTH directions of the merge, and it has to be.
-	// Refusing a weakening only makes the local copy sticky; the node that
-	// cleared its own retired_at wrote the clock on that row too, so under LWW it
-	// would keep the un-retired version forever and go on accepting the leaked
-	// key's signatures while every peer reported them. Strictly-more-retired
-	// therefore WINS regardless of clock, in whichever direction it arrives. The
-	// EARLIER boundary is the strict one, so a later one is a weakening even
-	// though both rows look retired.
-	localRetired, incomingRetired := cellStr(localRow, idx, "retired_at"), cellStr(row, idx, "retired_at")
-	switch {
-	case localRetired != "" && incomingRetired == "":
-		return auditEvidenceKeepLocal, "audit_key_unretire", nil
-	case localRetired == "" && incomingRetired != "":
-		return auditEvidenceHeal, "audit_key_retirement_learned", nil
-	case localRetired != "" && incomingRetired != "":
-		switch li, ri := cellInt64(localRow, idx, "retired_at_seq"), cellInt64(row, idx, "retired_at_seq"); {
-		case ri > li:
-			return auditEvidenceKeepLocal, "audit_key_boundary_raised", nil
-		case ri < li:
-			return auditEvidenceHeal, "audit_key_boundary_tightened", nil
-		}
-	}
-	// The incoming copy is live and does not weaken anything. If the LOCAL row is
-	// tombstoned, this is the repair for a certificate somebody deleted — without
-	// which every row that key signed stays unverifiable on this node forever.
-	if cellStr(localRow, idx, "deleted_at") != "" {
-		return auditEvidenceHeal, "audit_key_untombstone", nil
-	}
-	return auditEvidencePassThrough, "", nil
-}
-
-// cellInt64 reads a numeric cell. A dump round-trips through JSON, so the same
-// column arrives as float64 from a peer and int64 from SQLite; both render
-// through coerceString and parse back the same way.
-func cellInt64(row []interface{}, idx map[string]int, col string) int64 {
-	f, err := strconv.ParseFloat(cellStr(row, idx, col), 64)
-	if err != nil {
-		return 0
-	}
-	return int64(f)
-}
 
 // columnIndexMap builds the name→offset map cellStr needs.
 func columnIndexMap(cols []string) map[string]int {

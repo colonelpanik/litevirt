@@ -277,10 +277,10 @@ func headSyncTable() syncTable {
 	}}
 }
 
-func keySyncTable() syncTable {
-	return syncTable{Name: "audit_signing_keys", Columns: []string{
-		"key_id", "host_name", "cert_pem", "retired_at", "retired_at_seq",
-		"created_at", "updated_at", "deleted_at",
+func retirementSyncTable() syncTable {
+	return syncTable{Name: "audit_key_retirements", Columns: []string{
+		"host_name", "retired_key_id", "retired_at_seq", "retired_by_key_id",
+		"signature", "created_at", "updated_at", "deleted_at",
 	}}
 }
 
@@ -296,341 +296,232 @@ func mergeOne(t *testing.T, c *Client, table syncTable, pkCols []string, pkIdx [
 	}
 }
 
-// TestAuditMerge_PeerCannotTombstoneAChainHead.
+// TestAuditEvidence_ATombstoneIsInert.
 //
-// A chain head is the ONLY construct that can detect a truncated tail: a hash
+// A chain head is the only construct that can detect a truncated tail: a hash
 // chain links backward, so cutting the last N rows leaves every surviving link
-// verifying. Heads are declared append-only and the statement lane enforces it —
-// but anti-entropy ships whole rows, deleted_at included, and merges them by
-// plain LWW. So a node could tombstone its own heads with a fresh updated_at,
-// have anti-entropy carry the tombstones to every peer, and truncate its log
-// with nothing left anywhere to notice.
-func TestAuditMerge_PeerCannotTombstoneAChainHead(t *testing.T) {
+// verifying. Deleting the heads is therefore the efficient attack, and for a
+// while the answer here was a merge rule that refused tombstones and a
+// force-apply that repaired them.
+//
+// Both were the wrong layer. The verifier simply does not filter on deleted_at,
+// so setting it accomplishes nothing at all — no rule to get right, no repair to
+// perform, and no force-apply path that could carry an unrelated column rewrite
+// along with it.
+func TestAuditEvidence_ATombstoneIsInert(t *testing.T) {
 	ctx := context.Background()
-	c, kr, _ := signedClient(t, "node-0")
+	c, _, dir := signedClient(t, "node-0")
 	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
 	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
 		t.Fatalf("PublishAuditChainHead: %v", err)
 	}
-	if n := countRows(t, c, `SELECT host_name FROM audit_chain_heads WHERE deleted_at IS NULL`); n != 1 {
-		t.Fatalf("expected one live head to attack, got %d", n)
-	}
-	head := oneCol(t, c, `SELECT head_hash FROM audit_chain_heads WHERE host_name = 'node-0'`)
-
-	table := keyedHeadRow(c, kr.KeyID(), head, "2999-01-01T00:00:00Z")
-	mergeOne(t, c, headSyncTable(), []string{"host_name", "epoch", "seq"}, []int{0, 1, 2}, table)
-
-	if n := countRows(t, c, `SELECT host_name FROM audit_chain_heads WHERE deleted_at IS NULL`); n != 1 {
-		t.Fatalf("a peer's tombstone deleted a signed chain head (%d live heads left)\n"+
-			"truncation detection is gone cluster-wide the moment that replicates, and a "+
-			"hash chain cannot see a missing tail on its own", n)
-	}
-}
-
-// keyedHeadRow builds an incoming anti-entropy copy of node-0's only head,
-// carrying a tombstone and a far-future clock — the shape a compromised node
-// would send to erase it everywhere.
-func keyedHeadRow(c *Client, keyID, headHash, clock string) []interface{} {
-	return []interface{}{
-		"node-0", int64(0), int64(1), headHash, keyID, "sig",
-		"2026-07-29T10:00:01Z", clock, clock,
-	}
-}
-
-// TestAuditMerge_PeerCannotUnretireASigningKey.
-//
-// retired_at is the entire basis of the RetiredKeyUse finding — the detector for
-// "the rotated-out key is still in someone's hands and still signing". It lives
-// in an ordinary LWW-merged table, so clearing it locally with a fresh clock
-// removes the finding on every peer at once. The clock on an incoming row is
-// written by whoever sent it, which makes "newest wins" mean "the compromised
-// node wins".
-func TestAuditMerge_PeerCannotUnretireASigningKey(t *testing.T) {
-	c, oldKR, dir := signedClient(t, "node-0")
-	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
-	rotateTo(t, c, dir, "node-0")
-
-	oldID := oldKR.KeyID()
-	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+oldID+`'`)
-	if n := countRows(t, c,
-		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldID+`' AND retired_at IS NOT NULL`); n != 1 {
-		t.Fatalf("the old key is not retired to begin with; nothing to protect")
+	if before := verify(t, c); before.Tampered() {
+		t.Fatalf("baseline is not clean: %+v", before)
 	}
 
-	// The peer offers the same key with retirement cleared and a far-future clock.
-	incoming := []interface{}{
-		oldID, "node-0", cert, nil, int64(0),
-		"2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z", nil,
-	}
-	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
-
-	if n := countRows(t, c,
-		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldID+`' AND retired_at IS NOT NULL`); n != 1 {
-		t.Fatalf("a peer un-retired a rotated-out signing key\n"+
-			"every row that key signs past its boundary stops being reported, on this node "+
-			"and on every other one anti-entropy reaches")
-	}
-}
-
-// TestAuditMerge_PeerCannotRaiseARetirementBoundary.
-//
-// The subtler version: leave the key retired, but move retired_at_seq forward so
-// the rows already flagged fall back inside the window. It looks like ordinary
-// convergence — both copies say "retired" — and it re-authorises exactly the
-// signatures the boundary existed to reject.
-func TestAuditMerge_PeerCannotRaiseARetirementBoundary(t *testing.T) {
-	c, oldKR, dir := signedClient(t, "node-0")
-	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
-	rotateTo(t, c, dir, "node-0")
-
-	oldID := oldKR.KeyID()
-	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+oldID+`'`)
-	retiredAt := oneCol(t, c, `SELECT retired_at FROM audit_signing_keys WHERE key_id = '`+oldID+`'`)
-
-	incoming := []interface{}{
-		oldID, "node-0", cert, retiredAt, int64(9999),
-		"2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z", nil,
-	}
-	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
-
-	if got := oneCol(t, c,
-		`SELECT retired_at_seq FROM audit_signing_keys WHERE key_id = '`+oldID+`'`); got == "9999" {
-		t.Fatalf("a peer moved a retirement boundary forward to seq 9999\n"+
-			"the key stays nominally retired, and every row it signs below that point is "+
-			"silently re-authorised on every node")
-	}
-}
-
-// TestAuditMerge_PeerCannotTombstoneASigningCertificate.
-//
-// Deleting a retired certificate does not hide the rows it signed — it makes
-// them UNVERIFIABLE, which reads as mass tampering rather than as the erasure it
-// is. A retired certificate has to stay resolvable for as long as any row it
-// signed exists, which is why retirement is a validity window and never a
-// delete.
-func TestAuditMerge_PeerCannotTombstoneASigningCertificate(t *testing.T) {
-	c, kr, _ := signedClient(t, "node-0")
-	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
-
-	id := kr.KeyID()
-	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+id+`'`)
-	incoming := []interface{}{
-		id, "node-0", cert, nil, int64(0),
-		"2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z",
-	}
-	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
-
-	if res := verify(t, c); len(res.UnknownKeyID) > 0 {
-		t.Fatalf("a peer's tombstone removed the certificate for key %s, and every row it "+
-			"signed is now unverifiable: %v\n"+
-			"a rotation performed to improve integrity would read as mass tampering",
-			id, res.UnknownKeyID)
-	}
-}
-
-// TestAuditMerge_ARetirementStillPropagates keeps the guards from being a wall.
-//
-// Monotone means one-way, not frozen: a peer that learns of a retirement before
-// this node does must still be able to deliver it, or a rotation would never
-// reach the cluster and the guards would have replaced one silent failure with
-// another.
-func TestAuditMerge_ARetirementStillPropagates(t *testing.T) {
-	c, kr, _ := signedClient(t, "node-0")
-	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
-
-	id := kr.KeyID()
-	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+id+`'`)
-	incoming := []interface{}{
-		id, "node-0", cert, "2026-07-29T11:00:00Z", int64(1),
-		"2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z", nil,
-	}
-	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
-
-	if n := countRows(t, c,
-		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+id+`' AND retired_at IS NOT NULL`); n != 1 {
-		t.Fatalf("a retirement learned from a peer did not land; a rotation performed on one "+
-			"node would never become visible to the rest of the cluster")
-	}
-}
-
-// TestAuditMerge_HealsALocallyTombstonedChainHead is the other half of the
-// tombstone rule, and the lab is what asked for it.
-//
-// Refusing a tombstone stops the erasure spreading. It does nothing for the node
-// the erasure happened ON: that node wrote the clock on its own row, so under
-// LWW its tombstone beats every peer's live copy forever. The compromised node
-// then verifies clean locally while its neighbours hold the head — the guard
-// would have converted a spreading problem into a permanent local one, and a
-// node damaged by plain corruption could never recover at all.
-func TestAuditMerge_HealsALocallyTombstonedChainHead(t *testing.T) {
-	ctx := context.Background()
-	c, kr, _ := signedClient(t, "node-0")
-	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
-	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
-		t.Fatalf("PublishAuditChainHead: %v", err)
-	}
-	head := oneCol(t, c, `SELECT head_hash FROM audit_chain_heads WHERE host_name = 'node-0'`)
-	created := oneCol(t, c, `SELECT created_at FROM audit_chain_heads WHERE host_name = 'node-0'`)
-	sig := oneCol(t, c, `SELECT signature FROM audit_chain_heads WHERE host_name = 'node-0'`)
-
-	// The head is deleted here, with a clock no peer's honest write can beat.
-	if err := c.Execute(ctx,
+	// Tombstone every piece of evidence this node holds, with a clock no honest
+	// write can beat.
+	for _, q := range []string{
 		`UPDATE audit_chain_heads SET deleted_at = ?, updated_at = ? WHERE host_name = 'node-0'`,
-		"2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
-		t.Fatalf("tombstone: %v", err)
+		`UPDATE audit_signing_keys SET deleted_at = ?, updated_at = ? WHERE host_name = 'node-0'`,
+	} {
+		if err := c.Execute(ctx, q, "2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+			t.Fatalf("tombstone: %v", err)
+		}
 	}
 
-	// A peer offers its intact copy, carrying the ORIGINAL — and therefore much
-	// older — clock. Ordinary LWW would discard it.
+	// A FRESH keyring, because certFor caches every certificate it resolves.
+	// Reusing the warm one would answer from the cache and never reach the query
+	// whose deleted_at filter is the thing under test — which is also the real
+	// shape of the attack: the node that matters is the one starting up after the
+	// tombstone replicated to it.
+	verifier, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(verifier)
+
+	after := verify(t, c)
+	if len(after.UnknownKeyID) > 0 {
+		t.Fatalf("a tombstoned certificate stopped resolving: %v\n"+
+			"deleting it does not hide the rows it signed, it makes them unverifiable — "+
+			"which reads as mass tampering rather than as the erasure it is", after.UnknownKeyID)
+	}
+	if after.Tampered() {
+		t.Fatalf("tombstoning the evidence changed the verdict: %+v", after)
+	}
+}
+
+// TestAuditEvidence_PeerCannotRewriteAChainHead keeps the half that still
+// matters. A head is a fixed assertion about (host, epoch, seq); there is no
+// later revision of one, so a differing body is corruption or forgery and taking
+// it would overwrite the copy that disagrees with whoever sent it.
+func TestAuditEvidence_PeerCannotRewriteAChainHead(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	original := oneCol(t, c, `SELECT head_hash FROM audit_chain_heads WHERE host_name = 'node-0'`)
+
 	incoming := []interface{}{
-		"node-0", int64(0), int64(1), head, kr.KeyID(), sig, created, created, nil,
+		"node-0", int64(0), int64(1), "forged-head-hash", kr.KeyID(), "sig",
+		"2026-07-29T10:00:01Z", "2999-01-01T00:00:00Z", nil,
 	}
 	mergeOne(t, c, headSyncTable(), []string{"host_name", "epoch", "seq"}, []int{0, 1, 2}, incoming)
 
-	if n := countRows(t, c,
-		`SELECT host_name FROM audit_chain_heads WHERE host_name = 'node-0' AND deleted_at IS NULL`); n != 1 {
-		t.Fatalf("a locally deleted chain head was not restored from a peer's intact copy "+
-			"(%d live heads)\nthe node that deleted it wrote the newest clock, so under LWW "+
-			"it keeps the tombstone forever and truncation detection stays off here", n)
+	if got := oneCol(t, c, `SELECT head_hash FROM audit_chain_heads WHERE host_name = 'node-0'`); got != original {
+		t.Fatalf("a peer rewrote a published chain head (%s -> %s); the head is what "+
+			"contradicts a rewritten chain, so overwriting it is the whole attack", original, got)
 	}
 }
 
-// TestAuditMerge_HealsALocallyTombstonedCertificate is the same rule for the
-// certificate table, where the consequence is louder: a deleted certificate does
-// not hide the rows that key signed, it makes them unverifiable.
-func TestAuditMerge_HealsALocallyTombstonedCertificate(t *testing.T) {
-	ctx := context.Background()
+// ─────────────────── signed retirement ───────────────────
+
+// TestRetirement_ForgedOneIsIgnored is the v47 shape's reason for existing.
+//
+// v46 kept retirement in two mutable columns on audit_signing_keys. Any peer
+// could write them, so setting retired_at on a host's LIVE key put every row
+// that host had ever signed past a boundary — on every node, permanently, with
+// no key required and no way back.
+//
+// A retirement is now an assertion someone had to sign. One that does not verify
+// is not a weaker retirement, it is not a retirement at all.
+func TestRetirement_ForgedOneIsIgnored(t *testing.T) {
 	c, kr, _ := signedClient(t, "node-0")
 	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
 
-	id := kr.KeyID()
-	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+id+`'`)
-	created := oneCol(t, c, `SELECT created_at FROM audit_signing_keys WHERE key_id = '`+id+`'`)
-	if err := c.Execute(ctx,
-		`UPDATE audit_signing_keys SET deleted_at = ?, updated_at = ? WHERE key_id = ?`,
-		"2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z", id); err != nil {
-		t.Fatalf("tombstone: %v", err)
-	}
-	if res := verify(t, c); len(res.UnknownKeyID) == 0 {
-		t.Fatalf("deleting the certificate did not make its rows unverifiable, so this test " +
-			"is not measuring the damage it claims to repair")
+	// The attacker writes a retirement for the host's ACTIVE key, at seq 0, so
+	// that every row it has signed falls past the boundary. They have no key, so
+	// the signature is junk.
+	if err := c.Execute(context.Background(),
+		`INSERT INTO audit_key_retirements
+		   (host_name, retired_key_id, retired_at_seq, retired_by_key_id, signature,
+		    created_at, updated_at, deleted_at)
+		 VALUES ('node-0', ?, 0, ?, 'deadbeef', ?, ?, NULL)`,
+		kr.KeyID(), kr.KeyID(), "2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert the forged retirement: %v", err)
 	}
 
-	incoming := []interface{}{
-		id, "node-0", cert, nil, int64(0), created, created, nil,
+	res := verify(t, c)
+	if len(res.RetiredKeyUse) > 0 {
+		t.Fatalf("a forged retirement invalidated the host's live chain: %v\n"+
+			"anyone able to write the table could put every row a host ever signed past a "+
+			"boundary, on every node, without holding any key", res.RetiredKeyUse)
 	}
-	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
-
-	if res := verify(t, c); len(res.UnknownKeyID) > 0 {
-		t.Fatalf("a locally deleted certificate was not restored from a peer's intact copy: %v\n"+
-			"every row that key signed stays unverifiable on this node forever", res.UnknownKeyID)
+	if res.Tampered() {
+		t.Fatalf("a forged retirement made the log read as tampered: %+v", res)
 	}
 }
 
-// TestAuditMerge_HealingDoesNotUnretireAKey.
-//
-// Healing must not become a back door. A peer's copy that is live AND
-// un-retired, arriving at a node whose row is tombstoned and retired, would
-// repair the tombstone and drop the retirement in the same write — so the
-// monotone rule is checked first and wins.
-func TestAuditMerge_HealingDoesNotUnretireAKey(t *testing.T) {
-	ctx := context.Background()
+// TestRetirement_SignedOneIsHonoured is the other direction: the mechanism has
+// to still work, or the fix above is just "never retire anything".
+func TestRetirement_SignedOneIsHonoured(t *testing.T) {
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	rotateTo(t, c, dir, "node-0")
+
+	if n := countRows(t, c,
+		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldKR.KeyID()+`'`); n != 1 {
+		t.Fatalf("a genuine rotation recorded no retirement; the retired-key finding would " +
+			"never fire again")
+	}
+	forgeRowWithKey(t, c, oldKR, "forged", 2)
+	if res := verify(t, c); len(res.RetiredKeyUse) == 0 {
+		t.Fatalf("a row signed by the retired key past its boundary was accepted: %+v", res)
+	}
+}
+
+// TestRetirement_PeerCannotRewriteOne. The boundary is part of the signed
+// payload, so moving it invalidates the signature — but the merge must refuse
+// the rewrite anyway rather than let a peer replace the row that still verifies.
+func TestRetirement_PeerCannotRewriteOne(t *testing.T) {
 	c, oldKR, dir := signedClient(t, "node-0")
 	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
 	rotateTo(t, c, dir, "node-0")
 
 	oldID := oldKR.KeyID()
-	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+oldID+`'`)
-	if err := c.Execute(ctx,
-		`UPDATE audit_signing_keys SET deleted_at = ? WHERE key_id = ?`,
-		"2999-01-01T00:00:00Z", oldID); err != nil {
-		t.Fatalf("tombstone: %v", err)
-	}
+	sig := oneCol(t, c, `SELECT signature FROM audit_key_retirements WHERE retired_key_id = '`+oldID+`'`)
+	by := oneCol(t, c, `SELECT retired_by_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldID+`'`)
 
 	incoming := []interface{}{
-		oldID, "node-0", cert, nil, int64(0),
+		"node-0", oldID, int64(9999), by, sig,
 		"2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z", nil,
 	}
-	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
-
-	if n := countRows(t, c,
-		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldID+`' AND retired_at IS NOT NULL`); n != 1 {
-		t.Fatalf("healing a tombstone also cleared the key's retirement\n" +
-			"deleting the row would then be a way to launder an un-retirement past the " +
-			"monotone check")
-	}
-}
-
-// TestAuditMerge_LearnsARetirementOverAnUnbeatableLocalClock is the same lesson
-// the tombstone taught, applied to retirement — and again the lab is what asked.
-//
-// On the live cluster node-2 cleared its own retired_at with a year-2999 clock.
-// Every peer refused the erasure and kept the retirement, which is the point of
-// the monotone rule. But node-2 kept its un-retired copy: it wrote that clock, so
-// nothing a peer could honestly send would ever outrank it. The compromised node
-// went on accepting the leaked key's signatures while every neighbour reported
-// them.
-//
-// Sticky is not monotone. Strictly-more-retired has to WIN, in whichever
-// direction of the merge it arrives.
-func TestAuditMerge_LearnsARetirementOverAnUnbeatableLocalClock(t *testing.T) {
-	ctx := context.Background()
-	c, kr, _ := signedClient(t, "node-0")
-	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
-
-	id := kr.KeyID()
-	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+id+`'`)
-	// This node's row is un-retired and carries a clock no honest peer can beat.
-	if err := c.Execute(ctx,
-		`UPDATE audit_signing_keys SET updated_at = ? WHERE key_id = ?`,
-		"2999-01-01T00:00:00Z", id); err != nil {
-		t.Fatalf("stamp the local clock: %v", err)
-	}
-
-	// A peer that knows about the retirement, speaking with an ordinary clock.
-	incoming := []interface{}{
-		id, "node-0", cert, "2026-07-29T11:00:00Z", int64(1),
-		"2026-07-29T10:00:00Z", "2026-07-29T11:00:00Z", nil,
-	}
-	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
-
-	if n := countRows(t, c,
-		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+id+`' AND retired_at IS NOT NULL`); n != 1 {
-		t.Fatalf("a retirement known to a peer never reached this node, because the local row " +
-			"carried a newer clock\nthe node that cleared its own retired_at wrote that clock, " +
-			"so refusing the weakening is not enough — the retirement has to win outright")
-	}
-}
-
-// TestAuditMerge_TakesTheStricterBoundary.
-//
-// Two nodes can disagree about where a key's boundary sits. The earlier sequence
-// is the strict one: it flags every row the later one would have re-authorised,
-// so it is the only safe direction to converge in.
-func TestAuditMerge_TakesTheStricterBoundary(t *testing.T) {
-	ctx := context.Background()
-	c, oldKR, dir := signedClient(t, "node-0")
-	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
-	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
-	rotateTo(t, c, dir, "node-0") // retires the old key at seq 2
-
-	oldID := oldKR.KeyID()
-	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+oldID+`'`)
-	if err := c.Execute(ctx,
-		`UPDATE audit_signing_keys SET updated_at = ? WHERE key_id = ?`,
-		"2999-01-01T00:00:00Z", oldID); err != nil {
-		t.Fatalf("stamp the local clock: %v", err)
-	}
-
-	incoming := []interface{}{
-		oldID, "node-0", cert, "2026-07-29T11:00:00Z", int64(1),
-		"2026-07-29T10:00:00Z", "2026-07-29T11:00:00Z", nil,
-	}
-	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
+	mergeOne(t, c, retirementSyncTable(), []string{"host_name", "retired_key_id"}, []int{0, 1}, incoming)
 
 	if got := oneCol(t, c,
-		`SELECT retired_at_seq FROM audit_signing_keys WHERE key_id = '`+oldID+`'`); got != "1" {
-		t.Fatalf("retired_at_seq is %q, want the stricter boundary 1; a node holding the looser "+
-			"one keeps accepting signatures every peer already flags", got)
+		`SELECT retired_at_seq FROM audit_key_retirements WHERE retired_key_id = '`+oldID+`'`); got == "9999" {
+		t.Fatalf("a peer moved a signed retirement boundary to seq 9999; every row the key "+
+			"signed below it is silently re-authorised")
+	}
+}
+
+// forgeRowWithKey appends a correctly chained, correctly signed row using the
+// given key — the move a retirement boundary exists to catch.
+func forgeRowWithKey(t *testing.T, c *Client, kr *AuditKeyring, id string, seq int64) {
+	t.Helper()
+	ctx := context.Background()
+	prev := oneCol(t, c,
+		`SELECT content_hash FROM audit_log WHERE host_name = 'node-0' ORDER BY timestamp DESC, id DESC LIMIT 1`)
+	rec := AuditRecord{
+		ID: id, Timestamp: "2026-07-30T12:00:00Z", Username: "root", HostName: "node-0",
+		Action: "user.delete", Target: "alice", Result: "success", PrevHash: prev, Seq: seq,
+	}
+	rec.ContentHash = HashAuditRow(rec)
+	sig, err := kr.SignRow(rec.ContentHash, rec.Seq)
+	if err != nil {
+		t.Fatalf("SignRow: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail, result,
+		                        prev_hash, content_hash, key_id, signature, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)`,
+		rec.ID, rec.Timestamp, rec.Username, rec.HostName, rec.Action, rec.Target,
+		rec.Result, rec.PrevHash, rec.ContentHash, kr.KeyID(), sig, rec.Seq); err != nil {
+		t.Fatalf("insert the forged row: %v", err)
+	}
+}
+
+// TestAuditEvidence_ATombstonedHeadStillDetectsTruncation is the half of the
+// inert-tombstone rule that carries the real weight.
+//
+// A certificate that stops resolving is loud — every row it signed turns into an
+// UnknownKeyID finding. A head that stops counting is SILENT: the log simply
+// looks shorter than nothing in particular, and truncation is the one thing a
+// backward-linking hash chain cannot notice on its own. So the tombstone has to
+// be inert here specifically, not merely survive in the table.
+func TestAuditEvidence_ATombstonedHeadStillDetectsTruncation(t *testing.T) {
+	ctx := context.Background()
+	c, _, _ := signedClient(t, "node-0")
+	for _, id := range []string{"r1", "r2", "r3"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	// Older than headSettleWindow, so a shortfall is not read as replication lag.
+	if err := c.Execute(ctx,
+		`UPDATE audit_chain_heads SET created_at = ? WHERE host_name = 'node-0'`,
+		time.Now().Add(-2*headSettleWindow).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("age the head: %v", err)
+	}
+
+	// Cut the tail off, then delete the head that would have noticed.
+	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('r2','r3')`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`UPDATE audit_chain_heads SET deleted_at = ?, updated_at = ? WHERE host_name = 'node-0'`,
+		"2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("tombstone the head: %v", err)
+	}
+
+	if res := verify(t, c); len(res.TruncatedHosts) == 0 {
+		t.Fatalf("a tombstoned chain head stopped detecting a truncated log: %+v\n"+
+			"deleting the head is the cheapest way to hide missing rows, so setting "+
+			"deleted_at must accomplish nothing at all", res)
 	}
 }

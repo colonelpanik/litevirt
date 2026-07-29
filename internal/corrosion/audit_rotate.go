@@ -35,24 +35,48 @@ import (
 // retroactively protect a log that was already forged before anyone noticed —
 // no scheme can, and claiming otherwise would be worse than saying so.
 //
-// The retirement marker (retired_at + retired_at_seq) catches the naive case on
-// top of that: continued use of the old key past its boundary, which is what
-// happens when rotation is done but the old key is still installed somewhere.
+// The retirement record catches the naive case on top of that: continued use of
+// the old key past its boundary, which is what happens when rotation is done but
+// the old key is still installed somewhere.
+//
+// A retirement is itself SIGNED (audit_key_retirements, v47). It has to be. It
+// began as two mutable columns on audit_signing_keys, and as plain replicated
+// data those were writable by anyone: forging a retirement put every row a host
+// had ever signed past a boundary on every node at once, with no way back, and
+// clearing a genuine one was equally free. The detector for "somebody else has
+// this key" cannot itself be something somebody else can write.
 
 // ActiveAuditKeyID returns the key id a host is currently signing with — its
-// one published, non-retired key. ok is false when the host has never published.
-func ActiveAuditKeyID(ctx context.Context, c *Client, hostName string) (string, bool, error) {
+// one published key with no verified retirement. ok is false when the host has
+// no signing contract: it has never published, or every key it published has
+// been retired.
+//
+// This is the predicate the verifier's whole unsigned-row rule rests on, so it
+// reads retirement through auditKeyRetirements (signatures checked) rather than
+// from a column anyone can write.
+func ActiveAuditKeyID(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (string, bool, error) {
+	retired, err := auditKeyRetirements(ctx, c, keyring)
+	if err != nil {
+		return "", false, err
+	}
 	rows, err := c.Query(ctx,
 		`SELECT key_id FROM audit_signing_keys
-		 WHERE host_name = ? AND deleted_at IS NULL AND retired_at IS NULL
-		 ORDER BY created_at DESC, key_id ASC LIMIT 1`, hostName)
+		 WHERE host_name = ? ORDER BY created_at DESC, key_id ASC`, hostName)
 	if err != nil {
 		return "", false, fmt.Errorf("read active audit key for %s: %w", hostName, err)
 	}
-	if len(rows) == 0 {
-		return "", false, nil
+	for _, r := range rows {
+		if id := r.String("key_id"); !isRetired(retired, id) {
+			return id, true, nil
+		}
 	}
-	return rows[0].String("key_id"), true, nil
+	return "", false, nil
+}
+
+// isRetired reports whether a key has a verified retirement.
+func isRetired(retired map[string]int64, keyID string) bool {
+	_, ok := retired[keyID]
+	return ok
 }
 
 // AdoptAuditKey publishes this host's certificate and, if the host was
@@ -79,7 +103,7 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 		return "", err
 	}
 
-	superseded, err := supersededAuditKeys(ctx, c, hostName, keyring.KeyID())
+	superseded, err := supersededAuditKeys(ctx, c, keyring, hostName, keyring.KeyID())
 	if err != nil || len(superseded) == 0 {
 		return "", err
 	}
@@ -100,7 +124,7 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	c.auditChain.mu.Unlock()
 
 	for _, old := range superseded {
-		if err := retireAuditKey(ctx, c, old, seq); err != nil {
+		if err := RetireAuditKey(ctx, c, keyring, hostName, old, seq); err != nil {
 			return "", err
 		}
 	}
@@ -132,20 +156,17 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 // was undoable by the party it was performed against: start the daemon once with
 // the old key back in place — a restored backup, a second instance, or whoever
 // kept the copy that prompted the rotation — and "every other non-retired key"
-// selects the key that just REPLACED it. PublishSigningKey re-inserts the old
-// row without clearing retired_at, so the old key stays retired and, in the same
-// breath, retires its successor at the tail seq of the moment. From then on
+// selects the key that just REPLACED it. The old key stays retired and, in the
+// same breath, retires its successor at the tail seq of the moment. From then on
 // every row the legitimate key signs is past a retirement boundary,
 // `lv audit verify` reports the whole live chain as tampered on every node, and
 // the leaked key is the one doing the signing.
-func supersededAuditKeys(ctx context.Context, c *Client, hostName, currentKeyID string) ([]string, error) {
-	retiredNow, err := c.Query(ctx,
-		`SELECT retired_at FROM audit_signing_keys
-		 WHERE key_id = ? AND deleted_at IS NULL AND retired_at IS NOT NULL`, currentKeyID)
+func supersededAuditKeys(ctx context.Context, c *Client, keyring *AuditKeyring, hostName, currentKeyID string) ([]string, error) {
+	retired, err := auditKeyRetirements(ctx, c, keyring)
 	if err != nil {
-		return nil, fmt.Errorf("check retirement of audit key %s: %w", currentKeyID, err)
+		return nil, err
 	}
-	if len(retiredNow) > 0 {
+	if isRetired(retired, currentKeyID) {
 		slog.Error("this host is holding an audit signing key that has already been RETIRED; "+
 			"it will not be treated as a rotation and will retire nothing. Every row signed "+
 			"with it is reported as retired-key use on every node. If this node was restored "+
@@ -156,44 +177,85 @@ func supersededAuditKeys(ctx context.Context, c *Client, hostName, currentKeyID 
 	}
 	rows, err := c.Query(ctx,
 		`SELECT key_id FROM audit_signing_keys
-		 WHERE host_name = ? AND deleted_at IS NULL AND retired_at IS NULL AND key_id <> ?
-		 ORDER BY key_id ASC`, hostName, currentKeyID)
+		 WHERE host_name = ? AND key_id <> ? ORDER BY key_id ASC`, hostName, currentKeyID)
 	if err != nil {
 		return nil, fmt.Errorf("list superseded audit keys for %s: %w", hostName, err)
 	}
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {
+		if isRetired(retired, r.String("key_id")) {
+			continue
+		}
 		out = append(out, r.String("key_id"))
 	}
 	return out, nil
 }
 
-// retireAuditKey marks a key retired at a sequence boundary.
+// RetireAuditKey records a SIGNED assertion that hostName's key retiredKeyID
+// signed nothing valid past seq, attributed to the keyring making the claim.
 //
-// It deliberately does NOT tombstone the row. The certificate must stay
-// resolvable for as long as any row it signed still exists — deleting it would
-// make every one of those rows unverifiable, so a rotation performed to
-// IMPROVE integrity would destroy the history it was protecting.
-func retireAuditKey(ctx context.Context, c *Client, keyID string, seq int64) error {
-	now := c.NowTS()
+// It deliberately does NOT tombstone the certificate. That must stay resolvable
+// for as long as any row it signed still exists — deleting it would make every
+// one of those rows unverifiable, so a rotation performed to IMPROVE integrity
+// would destroy the history it was protecting.
+//
+// The signature is the whole point of the v47 shape. v46 wrote retirement into
+// two mutable columns on audit_signing_keys, which any peer could set or clear:
+// forging one put every row a host had signed past a boundary on every node at
+// once, and clearing a genuine one was just as cheap. Neither needed a key.
+func RetireAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostName, retiredKeyID string, seq int64) error {
+	if !keyring.CanSign() {
+		return fmt.Errorf("cannot retire key %s: no signing key to attribute the retirement to", retiredKeyID)
+	}
+	sig, err := keyring.SignRetirement(hostName, retiredKeyID, seq)
+	if err != nil {
+		return fmt.Errorf("sign retirement of %s: %w", retiredKeyID, err)
+	}
+	// INSERT OR IGNORE: a retirement is a fixed assertion about (host, key), so
+	// the FIRST one recorded stands. Re-running a rotation cannot move a
+	// boundary, and neither can anyone else.
 	return c.Execute(ctx,
-		`UPDATE audit_signing_keys SET retired_at = ?, retired_at_seq = ?, updated_at = ?
-		 WHERE key_id = ? AND retired_at IS NULL`,
-		now, seq, now, keyID)
+		`INSERT OR IGNORE INTO audit_key_retirements
+		   (host_name, retired_key_id, retired_at_seq, retired_by_key_id, signature,
+		    created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+		hostName, retiredKeyID, seq, keyring.KeyID(), sig, c.NowWall(), c.NowTS())
 }
 
 // auditKeyRetirements maps key id → the last sequence that key was entitled to
 // sign. A key absent from the map is still active.
-func auditKeyRetirements(ctx context.Context, c *Client) (map[string]int64, error) {
+//
+// Only VERIFIED retirements are returned. An unsigned or unverifiable row is
+// ignored entirely rather than trusted or reported: the table is replicated, so
+// anyone can put a row in it, and the signature is the only thing separating a
+// real retirement from an attempt to invalidate a host's whole live chain.
+//
+// deleted_at is deliberately not filtered. Tombstoning a retirement must not
+// erase it — and because the table is append-only, a row deleted outright is
+// simply re-inserted from a peer by ordinary anti-entropy.
+func auditKeyRetirements(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]int64, error) {
 	rows, err := c.Query(ctx,
-		`SELECT key_id, retired_at_seq FROM audit_signing_keys
-		 WHERE deleted_at IS NULL AND retired_at IS NOT NULL`)
+		`SELECT host_name, retired_key_id, retired_at_seq, retired_by_key_id, signature
+		 FROM audit_key_retirements`)
 	if err != nil {
 		return nil, fmt.Errorf("list retired audit keys: %w", err)
 	}
 	out := make(map[string]int64, len(rows))
 	for _, r := range rows {
-		out[r.String("key_id")] = r.Int64("retired_at_seq")
+		host, keyID := r.String("host_name"), r.String("retired_key_id")
+		seq := r.Int64("retired_at_seq")
+		if err := keyring.VerifyRetirement(ctx, c, host, keyID,
+			seq, r.String("retired_by_key_id"), r.String("signature")); err != nil {
+			slog.Warn("ignoring an audit key retirement that does not verify; it proves nothing "+
+				"about the key it names and is not treated as one",
+				"host", host, "retired_key", keyID, "error", err)
+			continue
+		}
+		// The earliest verified boundary wins, so a second signed assertion can
+		// only ever tighten. Nothing legitimate writes two.
+		if prev, seen := out[keyID]; !seen || seq < prev {
+			out[keyID] = seq
+		}
 	}
 	return out, nil
 }

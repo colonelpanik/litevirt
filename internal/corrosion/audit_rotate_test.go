@@ -58,7 +58,7 @@ func TestRotation_OldKeyCannotSignNewRows(t *testing.T) {
 
 	// The old key must be recorded as retired, and its certificate must still be
 	// present — the rows it already signed depend on it.
-	if n := countRows(t, c, `SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldKeyID+`' AND retired_at IS NOT NULL`); n != 1 {
+	if n := countRows(t, c, `SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldKeyID+`'`); n != 1 {
 		t.Fatalf("old key %s is not marked retired (%d matching rows)", oldKeyID, n)
 	}
 
@@ -184,7 +184,7 @@ func TestRotation_IsIdempotent(t *testing.T) {
 				"the key the node is actually using", i, retiredKey)
 		}
 	}
-	if n := countRows(t, c, `SELECT key_id FROM audit_signing_keys WHERE retired_at IS NOT NULL`); n != 0 {
+	if n := countRows(t, c, `SELECT retired_key_id FROM audit_key_retirements`); n != 0 {
 		t.Errorf("%d keys retired without a rotation", n)
 	}
 	if n := countRows(t, c, `SELECT host_name FROM audit_chain_heads`); n != 0 {
@@ -299,7 +299,7 @@ func regenHostCert(dir, hostName string) error {
 // control — used to select "any other non-retired key for this host" as
 // superseded, which after a rotation is the key that REPLACED it.
 //
-// PublishSigningKey re-inserts the old row without clearing retired_at, so the
+// The old key's retirement is a signed row that republishing cannot clear, so
 // old key stayed retired and, in the same breath, retired its successor at the
 // tail seq of the moment. Every row the legitimate key then signed sat past a
 // retirement boundary: `lv audit verify` reported the live chain as tampered on
@@ -324,14 +324,14 @@ func TestRotation_ARetiredKeyCannotUnrotateItsSuccessor(t *testing.T) {
 	}
 
 	if n := countRows(t, c,
-		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+newKR.KeyID()+`' AND retired_at IS NOT NULL`); n != 0 {
+		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+newKR.KeyID()+`'`); n != 0 {
 		t.Fatalf("booting with the RETIRED key retired its successor %s\n"+
 			"every row the legitimate key signs is now past a retirement boundary, so the "+
 			"whole live chain reads as tampered on every node — while the leaked key signs",
 			newKR.KeyID())
 	}
 	if n := countRows(t, c,
-		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldKR.KeyID()+`' AND retired_at IS NOT NULL`); n != 1 {
+		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldKR.KeyID()+`'`); n != 1 {
 		t.Fatalf("the old key un-retired itself by being republished")
 	}
 }
@@ -344,7 +344,7 @@ func TestRotation_StillRetiresAGenuinelySupersededKey(t *testing.T) {
 	rotateTo(t, c, dir, "node-0")
 
 	if n := countRows(t, c,
-		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldKR.KeyID()+`' AND retired_at IS NOT NULL`); n != 1 {
+		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+oldKR.KeyID()+`'`); n != 1 {
 		t.Fatalf("a genuine rotation did not retire the key it superseded; the whole "+
 			"retired-key finding would never fire")
 	}

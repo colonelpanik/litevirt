@@ -132,10 +132,9 @@ func latestAuditHeadsByKey(ctx context.Context, c *Client) (map[string][]AuditCh
 		`SELECT h.host_name, h.epoch, h.seq, h.head_hash, h.key_id, h.signature, h.created_at
 		 FROM audit_chain_heads h
 		 JOIN (SELECT host_name, key_id, MAX(seq) AS max_seq
-		       FROM audit_chain_heads WHERE deleted_at IS NULL
+		       FROM audit_chain_heads
 		       GROUP BY host_name, key_id) m
 		   ON m.host_name = h.host_name AND m.key_id = h.key_id AND m.max_seq = h.seq
-		 WHERE h.deleted_at IS NULL
 		 ORDER BY h.host_name ASC, h.key_id ASC, h.epoch ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list audit chain heads: %w", err)

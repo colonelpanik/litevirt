@@ -268,7 +268,17 @@ import (
 //	     certificate has to stay resolvable for as long as any row it signed
 //	     exists, or rotating a key would make the history it signed
 //	     unverifiable. Two additive columns.
-const CurrentSchemaVersion = 46
+//	v47: audit_key_retirements — retirement moves out of the mutable columns
+//	     v46 put on audit_signing_keys and into its own append-only table,
+//	     carrying a SIGNATURE. Those columns were plain replicated data any peer
+//	     could write, so a forged retirement replicated cluster-wide and could
+//	     not be walked back, and clearing a real one locally was equally cheap.
+//	     A retirement is now an assertion somebody had to sign: by the retired
+//	     key itself (a voluntary stop), by a successor key of the same host (a
+//	     rotation), or by the cluster CA (a host that can no longer speak for
+//	     itself). Append-only means deleting one locally is repaired by ordinary
+//	     anti-entropy rather than needing a bespoke merge rule. One new table.
+const CurrentSchemaVersion = 47
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1291,14 +1301,11 @@ var schemaDDL = []string{
 		key_id     TEXT PRIMARY KEY,
 		host_name  TEXT NOT NULL,
 		cert_pem   TEXT NOT NULL,
-		-- v46 rotation. retired_at marks when this key stopped being the host's
-		-- active signer; retired_at_seq is the last row sequence it was entitled
-		-- to sign. A row signed by this key beyond that point is a finding.
-		--
-		-- Retirement never deletes the row. A retired certificate must stay
-		-- resolvable for as long as any row it signed still exists, or rotating
-		-- would silently destroy the verifiability of everything the old key
-		-- wrote — turning a security improvement into history loss.
+		-- SUPERSEDED at v47 by audit_key_retirements. Retained so an upgrade is
+		-- additive, but nothing reads them: as plain replicated columns they were
+		-- writable by any peer, so a forged retirement spread cluster-wide and a
+		-- real one could be cleared just as cheaply. A retirement now has to be
+		-- signed. Do not reintroduce reads of these.
 		retired_at     TEXT,
 		retired_at_seq INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL,
@@ -1330,6 +1337,39 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT,
 		PRIMARY KEY (host_name, epoch, seq)
+	)`,
+
+	// Signed audit key retirements (v47). "Host H's key K signed nothing valid
+	// past sequence N, and here is a signature saying so."
+	//
+	// v46 kept this as two mutable columns on audit_signing_keys, which was the
+	// wrong shape twice over. They were plain replicated data, so any peer could
+	// write a retirement for anyone — forging one put every row a host signed
+	// past a boundary, cluster-wide, with no way back — and clearing a genuine
+	// one locally cost nothing. Neither move required a key.
+	//
+	// retired_by_key_id names who is asserting it, and the signature is checked
+	// against that key's published certificate. Only three parties can produce
+	// one: the retired key itself (a host voluntarily stopping), a successor key
+	// of the same host (a rotation), or the cluster CA (a host that has lost its
+	// key or is being decommissioned). Someone who merely broke into a node
+	// cannot.
+	//
+	// APPEND-ONLY, and that is what makes it self-repairing: a row deleted
+	// locally has no local copy to conflict with, so ordinary anti-entropy
+	// re-inserts it from any peer. No bespoke merge rule, and no force-apply.
+	`CREATE TABLE IF NOT EXISTS audit_key_retirements (
+		host_name         TEXT NOT NULL,
+		retired_key_id    TEXT NOT NULL,
+		-- The last sequence the retired key was entitled to sign. A row from it
+		-- above this is a finding.
+		retired_at_seq    INTEGER NOT NULL DEFAULT 0,
+		retired_by_key_id TEXT NOT NULL DEFAULT '',
+		signature         TEXT NOT NULL DEFAULT '',
+		created_at        TEXT NOT NULL,
+		updated_at        TEXT NOT NULL,
+		deleted_at        TEXT,
+		PRIMARY KEY (host_name, retired_key_id)
 	)`,
 
 	// Per-VM operational event store (v13). Durable, CRDT-replicated,
@@ -1907,6 +1947,7 @@ var tablePrimaryKeys = map[string][]string{
 	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
 	"audit_signing_keys":      {"key_id"},
 	"audit_chain_heads":       {"host_name", "epoch", "seq"},
+	"audit_key_retirements":   {"host_name", "retired_key_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2224,6 +2265,7 @@ var createTableUnits = []struct {
 	{41, "operations"}, {41, "operation_steps"}, {41, "project_authority_epochs"},
 	{42, "vm_nics"}, {42, "vm_pci_intent"}, {42, "vm_pci_realizations"},
 	{45, "audit_signing_keys"}, {45, "audit_chain_heads"},
+	{47, "audit_key_retirements"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

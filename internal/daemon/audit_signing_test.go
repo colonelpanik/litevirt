@@ -93,7 +93,7 @@ func TestRotation_CompletesWithEnforcementOff(t *testing.T) {
 	}
 
 	if n := auditCount(t, d.db,
-		`SELECT count(*) AS n FROM audit_signing_keys WHERE key_id = ? AND retired_at IS NOT NULL`,
+		`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`,
 		leaked); n != 1 {
 		t.Fatalf("the leaked key %s was not retired on a host with enforcement off\n"+
 			"the command reported the incident closed; it was not", leaked)

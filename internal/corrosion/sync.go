@@ -255,7 +255,7 @@ var tableNames = []string{
 	// assertion about a log an operator can already read. They belong in the
 	// operator-visible dump precisely so a peer — or a human with a state
 	// dump — can check a host's chain without that host's cooperation.
-	"audit_signing_keys", "audit_chain_heads",
+	"audit_signing_keys", "audit_chain_heads", "audit_key_retirements",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS
@@ -806,58 +806,33 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// permanent disagreement — protection that only produces noise gets
 		// turned off.
 		//
-		// The two tables the verifier DERIVES its authority from get the same
-		// treatment, for the same reason and by the same route. Both carry
-		// updated_at, so unlike audit_log they do reach the LWW path — and plain
-		// LWW is exactly wrong for them, because the attacker chooses the clock.
-		// A tombstone on a chain head erases the only thing that can detect a
-		// truncated tail; clearing a key's retired_at erases the only thing that
-		// can detect the rotated-out key still signing. Both would replicate
-		// cluster-wide from a single compromised node, taking every peer's good
-		// copy with them.
+		// The evidence tables the verifier derives its authority from get the same
+		// treatment: a published chain head and a signed retirement are fixed
+		// assertions, and a differing body for the same key is corruption or
+		// forgery either way.
 		//
-		// Anti-entropy is the whole hole here: the STATEMENT path already refuses
-		// these moves (audit_chain_heads is append-only, so INSERT OR IGNORE is
-		// the only shape that exists for it, and no builder deletes a signing key
-		// or clears a retirement). Nothing legitimate writes what these guards
-		// refuse, so they cost nothing when the cluster is healthy.
+		// The guard only ever REFUSES. An earlier version could also force-apply a
+		// peer's row past LWW, to repair a node that had deleted its own evidence
+		// — and that was a hole, not a repair: the decision was made on one field
+		// while buildMergeUpsertSQL writes every column, so a corrupt cert_pem
+		// could ride along on a row that merely looked stricter. Repair now comes
+		// from the shape of the data instead. Both tables are append-only, so a
+		// row deleted locally has nothing to conflict with and anti-entropy simply
+		// re-inserts it; and a tombstone is inert because the verifier does not
+		// filter on deleted_at at all.
 		if guard := auditEvidenceGuards[table.Name]; guard != nil {
-			decision, reason, kErr := guard(tx, table, row, pkCols, pkIdx)
+			keepLocal, reason, kErr := guard(tx, table, row, pkCols, pkIdx)
 			if kErr != nil {
 				_ = tx.Rollback()
 				return merged, skipped, kErr
 			}
-			pk, tbl := pkKeyAt(row, pkIdx), table.Name
-			switch decision {
-			case auditEvidenceKeepLocal:
+			if keepLocal {
 				skipped++
+				pk, tbl := pkKeyAt(row, pkIdx), table.Name
 				c.deferAfterCommit(tx, func() {
 					c.observeMergeRejected(boundedTableLabel(tbl), "ae", reason)
 					slog.Warn("anti-entropy: refused a peer's copy of audit tamper-evidence; keeping "+
 						"local. One of the two nodes has been altered — run `lv audit verify` on both",
-						"table", tbl, "pk", pk, "reason", reason)
-				})
-				continue
-			case auditEvidenceHeal:
-				// Bypasses LWW deliberately. Whoever deleted the local copy wrote
-				// its clock too, so under LWW the damaged node would keep its own
-				// tombstone forever and never recover from a peer that still holds
-				// the real row — refusing damage would have frozen it in place.
-				rejected, execErr := c.applyMergeRow(tx, insertSQL, row, tbl)
-				if execErr != nil {
-					_ = tx.Rollback()
-					return merged, skipped, execErr
-				}
-				if rejected {
-					skipped++
-				} else {
-					merged++
-				}
-				c.deferAfterCommit(tx, func() {
-					slog.Warn("anti-entropy: took a peer's stricter copy of audit tamper-evidence "+
-						"over the local one, ignoring clock order. The local copy was weaker — "+
-						"deleted, un-retired, or retired at a looser boundary — and nothing in "+
-						"litevirt produces that state",
 						"table", tbl, "pk", pk, "reason", reason)
 				})
 				continue

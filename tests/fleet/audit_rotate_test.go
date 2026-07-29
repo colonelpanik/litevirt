@@ -57,7 +57,7 @@ func TestFleet_RotationIsVisibleAndEnforcedOnPeers(t *testing.T) {
 
 	auditRow(t, a, "a1", "vm.create", "vm1")
 	auditRow(t, a, "a2", "user.delete", "alice")
-	oldKey, _, err := corrosion.ActiveAuditKeyID(context.Background(), a.DB, a.Name)
+	oldKey, _, err := corrosion.ActiveAuditKeyID(context.Background(), a.DB, a.DB.AuditKeyringOf(), a.Name)
 	if err != nil || oldKey == "" {
 		t.Fatalf("no active key for %s before rotation: %v", a.Name, err)
 	}
@@ -82,7 +82,7 @@ func TestFleet_RotationIsVisibleAndEnforcedOnPeers(t *testing.T) {
 			}
 		}
 		if n := rowCount(t, peer,
-			`SELECT count(*) AS n FROM audit_signing_keys WHERE key_id = ? AND retired_at IS NOT NULL`, oldKey); n != 1 {
+			`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`, oldKey); n != 1 {
 			t.Errorf("%s does not see key %s as retired; it would accept new rows signed with it",
 				peer.Name, oldKey)
 		}

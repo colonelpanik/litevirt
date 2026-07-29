@@ -50,7 +50,7 @@ func TestFleet_PeerKeepsRetirementAfterAbsorbingTheCompromisedNodesDump(t *testi
 	// undo, not merely avoid creating.
 	b.DB.MergeStateBytesLWW(pullDump(t, c, a))
 	if n := rowCount(t, b,
-		`SELECT count(*) AS n FROM audit_signing_keys WHERE key_id = ? AND retired_at IS NOT NULL`,
+		`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`,
 		oldKR.KeyID()); n != 1 {
 		t.Fatalf("%s never saw the retirement, so the erasure below would prove nothing", b.Name)
 	}
@@ -59,15 +59,14 @@ func TestFleet_PeerKeepsRetirementAfterAbsorbingTheCompromisedNodesDump(t *testi
 
 	// The erasure: retirement cleared, with a clock no honest write can beat.
 	if err := a.DB.Execute(ctx,
-		`UPDATE audit_signing_keys SET retired_at = NULL, retired_at_seq = 0, updated_at = ?
-		 WHERE key_id = ?`, "2999-01-01T00:00:00Z", oldKR.KeyID()); err != nil {
+		`DELETE FROM audit_key_retirements WHERE retired_key_id = ?`, oldKR.KeyID()); err != nil {
 		t.Fatalf("clear the retirement on %s: %v", a.Name, err)
 	}
 
 	b.DB.MergeStateBytesLWW(pullDump(t, c, a))
 
 	if n := rowCount(t, b,
-		`SELECT count(*) AS n FROM audit_signing_keys WHERE key_id = ? AND retired_at IS NOT NULL`,
+		`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`,
 		oldKR.KeyID()); n != 1 {
 		t.Fatalf("%s dropped the retirement of key %s because %s said so with a newer clock\n"+
 			"the sender writes that clock, so 'newest wins' means 'the compromised node wins'",

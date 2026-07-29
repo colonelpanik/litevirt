@@ -337,7 +337,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		return res, fmt.Errorf("list audit_log: %w", err)
 	}
 	keyring := c.AuditKeyringOf()
-	retired, err := auditKeyRetirements(ctx, c)
+	retired, err := auditKeyRetirements(ctx, c, keyring)
 	if err != nil {
 		return res, err
 	}

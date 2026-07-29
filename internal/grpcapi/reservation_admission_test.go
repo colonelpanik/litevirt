@@ -132,3 +132,47 @@ func TestAdmitWithReservation_ReleaseFreesTheCapacity(t *testing.T) {
 		t.Errorf("reserved vCPU = %d after release, want %d — the reservation leaked and permanently consumes capacity", after, before)
 	}
 }
+
+// TestAdmitHostWithReservation_DoesNotChargeProjectQuota: the start paths reserve
+// HOST capacity only.
+//
+// A project allocation counts whether the workload is running or stopped, so a
+// start grows nothing at the project level. Reserving against the project too
+// would make two concurrent starts look like they were each consuming quota
+// neither is growing — and would refuse a plain stop/start of any workload sized
+// over half its quota, which is the regression the split exists to prevent.
+func TestAdmitHostWithReservation_DoesNotChargeProjectQuota(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	admissionHost(t, s)
+
+	beforeCPU, beforeMem, err := corrosion.ProjectReserved(ctx, s.db, "_default")
+	if err != nil {
+		t.Fatalf("ProjectReserved: %v", err)
+	}
+
+	lease, err := s.admitHostWithReservation(ctx, "StartVM", "test-host", "_default", 1, 1024)
+	if err != nil {
+		t.Fatalf("host-only admission: %v", err)
+	}
+	defer lease.release(ctx)
+
+	// The HOST reservation must be visible…
+	hostCPU, _, err := corrosion.HostReserved(ctx, s.db, "test-host")
+	if err != nil {
+		t.Fatalf("HostReserved: %v", err)
+	}
+	if hostCPU != 1 {
+		t.Errorf("host reserved vCPU = %d, want 1 — a concurrent start cannot see this demand", hostCPU)
+	}
+
+	// …while the PROJECT reservation must not move.
+	afterCPU, afterMem, err := corrosion.ProjectReserved(ctx, s.db, "_default")
+	if err != nil {
+		t.Fatalf("ProjectReserved: %v", err)
+	}
+	if afterCPU != beforeCPU || afterMem != beforeMem {
+		t.Errorf("project reserved moved to (%d,%d) from (%d,%d) — a start grows no project allocation and must not charge quota",
+			afterCPU, afterMem, beforeCPU, beforeMem)
+	}
+}

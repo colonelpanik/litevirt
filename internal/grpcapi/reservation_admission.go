@@ -79,13 +79,35 @@ func (l *reservationLease) release(ctx context.Context) {
 func (s *Server) admitWithReservation(
 	ctx context.Context, method, host, project string, cpuDelta, memDelta int,
 ) (*reservationLease, error) {
+	return s.admitReserved(ctx, method, host, project, cpuDelta, memDelta, true)
+}
+
+// admitHostWithReservation is admitWithReservation for paths that must NOT charge
+// project quota — the start paths, where the allocation is already counted in
+// project usage whether the workload is running or stopped, so charging it again
+// would refuse a plain stop/start of any workload over half its quota.
+func (s *Server) admitHostWithReservation(
+	ctx context.Context, method, host, project string, cpuDelta, memDelta int,
+) (*reservationLease, error) {
+	return s.admitReserved(ctx, method, host, project, cpuDelta, memDelta, false)
+}
+
+func (s *Server) admitReserved(
+	ctx context.Context, method, host, project string, cpuDelta, memDelta int, withQuota bool,
+) (*reservationLease, error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
 	}
 
 	rv := corrosion.ReservationVector{
-		Project: project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
 		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
+	}
+	if withQuota {
+		// Only a quota-charging admission reserves against the PROJECT. A start
+		// reserves host capacity alone: its allocation is already in project usage,
+		// so publishing a project reservation too would make concurrent starts
+		// appear to double-consume a quota neither of them is growing.
+		rv.Project, rv.ProjectCPU, rv.ProjectMemMiB = project, cpuDelta, memDelta
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -113,9 +135,11 @@ func (s *Server) admitWithReservation(
 		lease.release(ctx)
 		return nil, err
 	}
-	if err := s.checkProjectQuotaBefore(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
-		lease.release(ctx)
-		return nil, err
+	if withQuota {
+		if err := s.checkProjectQuotaBefore(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
+			lease.release(ctx)
+			return nil, err
+		}
 	}
 	return lease, nil
 }

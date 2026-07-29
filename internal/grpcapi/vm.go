@@ -1061,8 +1061,15 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-		} else if err := s.checkHostCapacity(ctx, vm.HostName, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
-			return nil, err
+		} else {
+			// Reserve-then-verify (F2): publish this start's demand before deciding,
+			// so a concurrent start on another node sees it instead of both reading a
+			// view containing neither.
+			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib))
+			if aerr != nil {
+				return nil, aerr
+			}
+			defer lease.release(ctx)
 		}
 	}
 
@@ -2876,8 +2883,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",
 							fresh.HostName, cpuGrow, memGrow), "allow-overcommit")
 				}
-			} else if err := s.checkResourceAdmission(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow); err != nil {
-				return nil, err
+			} else {
+				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, cpuGrow, memGrow)
+				if aerr != nil {
+					return nil, aerr
+				}
+				defer lease.release(ctx)
 			}
 
 			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {

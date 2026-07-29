@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -161,34 +160,15 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// tightenKeyMode makes the signing key unreadable to anyone but its owner,
-// repairing it in place if it is not.
+// tightenKeyMode repairs the mode of the key about to be loaded.
 //
-// Existing clusters need the repair, not just a warning. `lv host init
-// root@<host>` pushed this key 0644 on every node it provisioned — CopyFile's
-// default mode, invisible at the call site — and a signature is worth exactly
-// the secrecy of the key behind it. A node that keeps signing with a
-// world-readable key offers tamper-evidence that any local user can defeat, so
-// this fixes it on the spot and says so rather than leaving an operator to
-// notice a warning.
-func tightenKeyMode(keyPath string) error {
-	fi, err := os.Stat(keyPath)
-	if err != nil {
-		return fmt.Errorf("stat host key: %w", err)
-	}
-	if fi.Mode().Perm()&0o077 == 0 {
-		return nil
-	}
-	if err := os.Chmod(keyPath, 0o600); err != nil {
-		return fmt.Errorf("host key %s is mode %04o and readable by other local users, and it "+
-			"could not be tightened: %w", keyPath, fi.Mode().Perm(), err)
-	}
-	slog.Warn("audit signing key was readable by other local users; tightened to 0600. "+
-		"Tightening does not undo a copy already taken: anyone who read it can still sign "+
-		"rows as this host, so rotate with `lv host rotate-audit-key` if that is possible",
-		"path", keyPath, "was", fmt.Sprintf("%04o", fi.Mode().Perm()))
-	return nil
-}
+// The primitive lives in internal/pki and runs unconditionally at daemon start
+// (pki.TightenPrivateKeys) — reaching it only from here meant reaching it only
+// when enforcement.audit_signature was on, a flag that defaults to false, so the
+// world-readable host.key that `lv host init` shipped went unrepaired on exactly
+// the clusters that had not opted in. This call stays because loading a key is
+// the last moment before it is used.
+func tightenKeyMode(keyPath string) error { return pki.TightenKeyMode(keyPath) }
 
 // LoadAuditVerifier loads a verify-only keyring — the cluster CA and nothing
 // else. Verification deliberately needs no private key: an auditor with a state

@@ -66,16 +66,32 @@ func thisHost(t *testing.T) string {
 // — the certificate chains to the cluster CA and the CN matches, so nothing
 // downstream has any reason to object. This is the one property of the whole
 // design that lives in the filesystem rather than the code.
+// It also covers every private key the node holds, not just the one that
+// shipped loose: ca.key can mint an identity for any host in the cluster, and
+// audit-signing.key is what a rotation installs precisely because the key it
+// replaced was exposed. The repair runs at every daemon start regardless of
+// enforcement.audit_signature — it used to hang off that flag, which defaults to
+// false, so an operator who upgraded specifically for this fix and left the
+// default got no repair at all. Only a live node can show that, because a file
+// mode is invisible to a harness that mints its own PKI in a temp dir.
 func TestAuditSigningKeyIsNotReadableByOthers(t *testing.T) {
 	requireLocalNode(t)
-	keyPath := filepath.Join(auditPKIDir, "host.key")
-	fi, err := os.Stat(keyPath)
-	if err != nil {
-		t.Skipf("no host key at %s: %v", keyPath, err)
+	var checked int
+	for _, name := range []string{"ca.key", "host.key", "audit-signing.key"} {
+		keyPath := filepath.Join(auditPKIDir, name)
+		fi, err := os.Stat(keyPath)
+		if err != nil {
+			continue // ca.key lives on one node; audit-signing.key only on rotated ones
+		}
+		checked++
+		if mode := fi.Mode().Perm(); mode&0o077 != 0 {
+			t.Errorf("%s is mode %04o; group/other can read it, so any local user can act as "+
+				"this host — signing audit rows every peer accepts, and for host.key, "+
+				"impersonating it over peer mTLS", keyPath, mode)
+		}
 	}
-	if mode := fi.Mode().Perm(); mode&0o077 != 0 {
-		t.Fatalf("%s is mode %04o; group/other can read the audit signing key, so any local "+
-			"user can forge audit rows for this host and every peer will accept them", keyPath, mode)
+	if checked == 0 {
+		t.Skipf("no private keys found under %s", auditPKIDir)
 	}
 }
 

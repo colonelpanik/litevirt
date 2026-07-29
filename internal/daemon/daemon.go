@@ -347,6 +347,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 			"host", d.cfg.HostName, "rows", n)
 	}
 
+	// Repair any private key this node holds that other local users can read.
+	//
+	// Unconditional, because the damage was: `lv host init root@<host>` pushed
+	// host.key mode 0644 on every node it provisioned, and host.key is the
+	// peer-mTLS identity — any local user on such a node could impersonate it to
+	// the cluster. The push path is fixed, but nobody re-provisions an existing
+	// cluster, so a repair at start is the only thing that reaches one. It used
+	// to hang off enforcement.audit_signature, which defaults to false, so an
+	// operator who upgraded specifically for this fix got neither the repair nor
+	// a warning.
+	if err := pki.TightenPrivateKeys(d.cfg.PKIDir); err != nil {
+		slog.Error("a private key in the PKI directory is readable by other local users and "+
+			"could not be tightened", "error", err)
+	}
+
 	// Set up libvirt TLS symlinks so qemu+tls:// migration works
 	// using our existing PKI certs. Best-effort — log warning if it fails.
 	if err := pki.SetupLibvirtTLS(d.cfg.PKIDir); err != nil {

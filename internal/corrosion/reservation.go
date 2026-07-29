@@ -81,7 +81,8 @@ func reservationStepFacts(facts *ReservationFacts, project string) (string, erro
 // count on top of committed running-VM actuals.
 func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVector, error) {
 	orows, err := c.Query(ctx,
-		`SELECT id, project, operation_kind, reservation_json, vm_owner_epoch
+		`SELECT id, project, resource_kind, resource_id, operation_kind,
+		        reservation_json, desired_ref, vm_owner_epoch
 		 FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
 	if err != nil {
 		return nil, err
@@ -114,6 +115,20 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 	for _, r := range orows {
 		id := r.String("id")
 		kind := OperationKind(r.String("operation_kind"))
+		if kind == OpWorkloadCreate && r.Int64("vm_owner_epoch") != 0 {
+			current, err := operationOwnsCurrentWorkload(ctx, c,
+				id, r.String("resource_kind"), r.String("resource_id"),
+				r.String("desired_ref"), r.Int64("vm_owner_epoch"))
+			if err != nil {
+				return nil, err
+			}
+			if !current {
+				// The immutable header remains journal-visible, but a superseded
+				// v44 workload owner must not make it an authoritative capacity
+				// claim. Epoch-zero legacy journals retain their old behavior.
+				continue
+			}
+		}
 		key := fmt.Sprintf("%s\x00%d", id, r.Int64("vm_owner_epoch"))
 		state, _ := ReduceOperationState(kind, stepsByOpEpoch[key])
 		if IsOperationTerminal(state) {
@@ -153,6 +168,36 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 		out = append(out, rv)
 	}
 	return out, nil
+}
+
+func operationOwnsCurrentWorkload(ctx context.Context, c *Client, operationID, resourceKind, resourceID, desiredRef string, ownerEpoch int64) (bool, error) {
+	var rows []Row
+	var err error
+	switch resourceKind {
+	case "vm":
+		rows, err = c.Query(ctx,
+			`SELECT 1 FROM vms
+			 WHERE name = ? AND vm_owner_epoch = ? AND active_operation_id = ?
+			   AND deleted_at IS NULL`,
+			resourceID, ownerEpoch, operationID)
+	case "container":
+		host, name, ok := parseContainerCreateDesiredRef(desiredRef)
+		if !ok || name != resourceID {
+			return false, nil
+		}
+		rows, err = c.Query(ctx,
+			`SELECT 1 FROM containers
+			 WHERE host_name = ? AND name = ? AND owner_epoch = ?
+			   AND active_operation_id = ? AND deleted_at IS NULL`,
+			host, name, ownerEpoch, operationID)
+	default:
+		// Reservations are currently defined only for workload operations.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(rows) != 0, nil
 }
 
 // HostReserved sums the target-host reservation deltas of all NONTERMINAL operations

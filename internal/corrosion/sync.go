@@ -217,6 +217,9 @@ type syncTable struct {
 	Name    string          `json:"name"`
 	Columns []string        `json:"cols"`
 	Rows    [][]interface{} `json:"rows"`
+	// authority is receiver-local merge metadata derived from the complete
+	// payload. It is never serialized.
+	authority *mergeAuthorityManifest
 }
 
 // tableNames are the operator-safe tables carried by the public full-state
@@ -455,7 +458,8 @@ func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowed
 	start := time.Now()
 	merged, skipped := 0, 0
 	var firstErr error
-	for _, table := range payload.Tables {
+	tables := authorityOrderedMergeTables(payload)
+	for _, table := range tables {
 		m, s, err := c.mergeTable(table, allowedTables)
 		merged += m
 		skipped += s
@@ -694,6 +698,17 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		if len(row) != len(table.Columns) {
 			slog.Warn("sync: skipping malformed row (column count mismatch)",
 				"table", table.Name, "want", len(table.Columns), "got", len(row))
+			skipped++
+			continue
+		}
+		// Workload create commits carry child rows whose schemas predate owner
+		// epochs. Fence them against the source workload identity captured from
+		// this payload and the authority that actually landed locally. This runs
+		// before both first-seen insertion and every conflict resolver.
+		if keepLocal, guardErr := c.antiEntropyAuthorityKeepsLocal(tx, table, row); guardErr != nil {
+			_ = tx.Rollback()
+			return merged, skipped, guardErr
+		} else if keepLocal {
 			skipped++
 			continue
 		}

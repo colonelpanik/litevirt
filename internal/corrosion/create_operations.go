@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // BeginVMCreateOperation atomically persists a create claim, its capacity
@@ -393,6 +395,32 @@ func compareContainerCreateRetryInTx(ctx context.Context, tx *sql.Tx, opID strin
 
 func containerCreateDesiredRef(hostName, name string) string {
 	return fmt.Sprintf("container/%d:%s/%d:%s", len(hostName), hostName, len(name), name)
+}
+
+func parseContainerCreateDesiredRef(ref string) (hostName, name string, ok bool) {
+	const prefix = "container/"
+	if !strings.HasPrefix(ref, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(ref, prefix)
+	read := func(s string) (value, tail string, valid bool) {
+		colon := strings.IndexByte(s, ':')
+		if colon <= 0 {
+			return "", "", false
+		}
+		n, err := strconv.Atoi(s[:colon])
+		if err != nil || n < 0 || len(s[colon+1:]) < n {
+			return "", "", false
+		}
+		value = s[colon+1 : colon+1+n]
+		return value, s[colon+1+n:], true
+	}
+	hostName, rest, ok = read(rest)
+	if !ok || !strings.HasPrefix(rest, "/") {
+		return "", "", false
+	}
+	name, rest, ok = read(strings.TrimPrefix(rest, "/"))
+	return hostName, name, ok && rest == ""
 }
 
 func validateReservationProject(raw, operationProject string) error {

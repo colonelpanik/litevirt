@@ -584,6 +584,378 @@ func TestReplicatedCreateRollbackIsSelfGuarded(t *testing.T) {
 	})
 }
 
+func TestCreateOperationAntiEntropyFencesStaleWorkloadAuthority(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("vm commit hardware and steps", func(t *testing.T) {
+		source := testClient(t)
+		reservation, _ := (ReservationVector{
+			Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+		}).Encode()
+		op := createOp("op-ae-vm", "vm", "vm1", "hash", reservation, 1)
+		vm := VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		exclusive := "0000:01:00.0"
+		if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 1, vm,
+			[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+			[]DiskRecord{{DiskName: "root", HostName: "h1", Path: "/vm1.img"}},
+			[]NICRecord{{ID: "nic1", NetworkName: "net1"}},
+			[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h1", SelectorKind: "address", SelectorPayload: exclusive, ExclusiveKey: &exclusive}},
+		); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+
+		receiver := testClient(t)
+		if err := InsertVM(ctx, receiver, VMRecord{
+			Name: "vm1", HostName: "h2", Project: "p1", Spec: `{"cpu":8}`,
+			State: "running", OwnerEpoch: 2, SpecGeneration: 2,
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := receiver.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`,
+			"9000000000000-0000-newer", "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+				t.Errorf("stale anti-entropy commit wrote %s: %v", table, rows)
+			}
+		}
+		assertNoOperationSteps(t, receiver, op.ID)
+		if got, _ := GetOperation(ctx, receiver, op.ID); got == nil {
+			t.Fatal("immutable operation header was not retained")
+		}
+		if cpu, _, err := HostReserved(ctx, receiver, "h1"); err != nil || cpu != 0 {
+			t.Fatalf("stale header reserved capacity: cpu=%d err=%v", cpu, err)
+		}
+	})
+
+	t.Run("container commit hardware and steps", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-ct", "container", "ct1", "hash", "", 1)
+		ct := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+			CreateSpec: `{"template":"alpine"}`, OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 1, ct,
+			[]ContainerInterfaceRecord{{NetworkName: "net1", MAC: "52:00:00:00:00:01"}}); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+
+		receiver := testClient(t)
+		if err := UpsertContainer(ctx, receiver, ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "debian", Project: "p1",
+			State: "running", OwnerEpoch: 2, SpecGeneration: 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := receiver.db.Exec(
+			`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`,
+			"h1", "ct1"); len(rows) != 0 {
+			t.Errorf("stale anti-entropy commit wrote container interfaces: %v", rows)
+		}
+		assertNoOperationSteps(t, receiver, op.ID)
+	})
+
+	for _, kind := range []string{"vm", "container"} {
+		t.Run(kind+" rollback steps", func(t *testing.T) {
+			source := testClient(t)
+			op := createOp("op-ae-"+kind+"-rollback", kind, "workload1", "hash", "", 1)
+			if kind == "vm" {
+				if applied, err := source.BeginVMCreateOperation(ctx, op,
+					VMRecord{Name: "workload1", HostName: "h1", Project: "p1", OwnerEpoch: 1}); err != nil || !applied {
+					t.Fatalf("source begin: applied=%v err=%v", applied, err)
+				}
+				if applied, err := source.RollbackVMCreateOperation(ctx, "workload1", op.ID, 1, "cleanup"); err != nil || !applied {
+					t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+				}
+			} else {
+				if applied, err := source.BeginContainerCreateOperation(ctx, op,
+					ContainerRecord{HostName: "h1", Name: "workload1", Project: "p1", OwnerEpoch: 1}); err != nil || !applied {
+					t.Fatalf("source begin: applied=%v err=%v", applied, err)
+				}
+				if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", "workload1", op.ID, 1, "cleanup"); err != nil || !applied {
+					t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+				}
+			}
+
+			receiver := testClient(t)
+			if kind == "vm" {
+				if err := InsertVM(ctx, receiver, VMRecord{
+					Name: "workload1", HostName: "h2", Project: "p1", State: "running",
+					OwnerEpoch: 2, SpecGeneration: 2,
+				}, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				_, _ = receiver.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`,
+					"9000000000000-0000-newer", "workload1")
+			} else {
+				if err := UpsertContainer(ctx, receiver, ContainerRecord{
+					HostName: "h1", Name: "workload1", Project: "p1", State: "running",
+					OwnerEpoch: 2, SpecGeneration: 2,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				_, _ = receiver.db.Exec(
+					`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
+					"9000000000000-0000-newer", "h1", "workload1")
+			}
+			if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+				t.Fatal(err)
+			}
+			assertNoOperationSteps(t, receiver, op.ID)
+		})
+	}
+}
+
+func TestCreateOperationAntiEntropyCurrentAuthorityConverges(t *testing.T) {
+	ctx := context.Background()
+	t.Run("vm commit in reversed payload order", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-valid", "vm", "vm1", "hash", "", 4)
+		vm := VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+			OwnerEpoch: 4, SpecGeneration: 3,
+		}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 4, vm,
+			[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+			[]DiskRecord{{DiskName: "root", HostName: "h1", Path: "/vm1.img"}},
+			[]NICRecord{{ID: "nic1", NetworkName: "net1"}},
+			[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h1", SelectorKind: "vendor", SelectorPayload: "1234"}},
+		); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+		receiver := testClient(t)
+		payload, err := decompressPayload(source.DumpStateBytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for left, right := 0, len(payload.Tables)-1; left < right; left, right = left+1, right-1 {
+			payload.Tables[left], payload.Tables[right] = payload.Tables[right], payload.Tables[left]
+		}
+		if err := receiver.mergeStatePayloadLWW(payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 1 {
+				t.Errorf("valid anti-entropy repair did not converge %s: %v", table, rows)
+			}
+		}
+		steps, err := ListOperationSteps(ctx, receiver, op.ID, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps)); state != OpStepCompleted || faulted {
+			t.Fatalf("valid repaired operation state=%q faulted=%v steps=%v", state, faulted, stepNames(steps))
+		}
+	})
+
+	t.Run("container commit", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-valid-ct", "container", "ct1", "hash", "", 5)
+		ct := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+			OwnerEpoch: 5, SpecGeneration: 2,
+		}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 5, ct,
+			[]ContainerInterfaceRecord{{NetworkName: "net1"}}); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`,
+			"h1", "ct1"); len(rows) != 1 {
+			t.Fatalf("valid container interface repair did not converge: %v", rows)
+		}
+		steps, err := ListOperationSteps(ctx, receiver, op.ID, 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps)); state != OpStepCompleted || faulted {
+			t.Fatalf("valid container state=%q faulted=%v steps=%v", state, faulted, stepNames(steps))
+		}
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-valid-rollback", "vm", "vm1", "hash", "", 6)
+		if applied, err := source.BeginVMCreateOperation(ctx, op,
+			VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 6}); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.RollbackVMCreateOperation(ctx, "vm1", op.ID, 6, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		steps, err := ListOperationSteps(ctx, receiver, op.ID, 6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps)); state != OpStepFailed || faulted {
+			t.Fatalf("valid rollback state=%q faulted=%v steps=%v", state, faulted, stepNames(steps))
+		}
+	})
+}
+
+func TestWorkloadAuthorityAntiEntropyCompatibility(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ordinary hardware still converges", func(t *testing.T) {
+		source := testClient(t)
+		if err := InsertVM(ctx, source, VMRecord{
+			Name: "legacy-vm", HostName: "h1", Project: "p1", State: "running",
+		}, []InterfaceRecord{{VMName: "legacy-vm", NetworkName: "net1"}}, []DiskRecord{{
+			VMName: "legacy-vm", DiskName: "root", HostName: "h1", Path: "/legacy.img",
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "legacy-vm"); len(rows) != 1 {
+				t.Errorf("ordinary anti-entropy repair did not converge %s: %v", table, rows)
+			}
+		}
+	})
+
+	t.Run("non-create journal still converges", func(t *testing.T) {
+		source := testClient(t)
+		insertOp(t, source, "op-update", "hash", "2026-06-03T18:40:00Z", "")
+		if err := AppendOperationStep(ctx, source, OperationStepRecord{
+			OperationID: "op-update", OwnerEpoch: 1, StepName: OpStepPlanned,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		steps, err := ListOperationSteps(ctx, receiver, "op-update", 1)
+		if err != nil || len(steps) != 1 {
+			t.Fatalf("non-create journal repair steps=%v err=%v", steps, err)
+		}
+	})
+
+	t.Run("child without source authority fails closed", func(t *testing.T) {
+		source := testClient(t)
+		if err := InsertVM(ctx, source, VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", State: "running",
+		}, []InterfaceRecord{{VMName: "vm1", NetworkName: "net1"}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		payload, err := decompressPayload(source.DumpStateBytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		filtered := payload.Tables[:0]
+		for _, table := range payload.Tables {
+			if table.Name != "vms" {
+				filtered = append(filtered, table)
+			}
+		}
+		payload.Tables = filtered
+
+		receiver := testClient(t)
+		if err := InsertVM(ctx, receiver, VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", State: "running",
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := receiver.mergeStatePayloadLWW(payload); err != nil {
+			t.Fatal(err)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+			t.Fatalf("authority-less child payload merged: %v", rows)
+		}
+	})
+
+	t.Run("provisional parent cannot authorize commit hardware", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-split-snapshot", "vm", "vm1", "hash", "", 1)
+		vm := VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 1, vm,
+			[]InterfaceRecord{{NetworkName: "net1"}}, nil, nil, nil); err != nil || !applied {
+			t.Fatalf("commit: applied=%v err=%v", applied, err)
+		}
+		payload, err := decompressPayload(source.DumpStateBytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for tableIdx := range payload.Tables {
+			table := &payload.Tables[tableIdx]
+			if table.Name != "vms" {
+				continue
+			}
+			stateIdx := indexOf(table.Columns, "state")
+			activeIdx := indexOf(table.Columns, "active_operation_id")
+			for rowIdx := range table.Rows {
+				table.Rows[rowIdx][stateIdx] = "creating"
+				table.Rows[rowIdx][activeIdx] = op.ID
+			}
+		}
+		receiver := testClient(t)
+		if err := receiver.mergeStatePayloadLWW(payload); err != nil {
+			t.Fatal(err)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+			t.Fatalf("provisional parent authorized commit hardware: %v", rows)
+		}
+	})
+}
+
+func assertNoOperationSteps(t *testing.T, c *Client, opID string) {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT step_name FROM operation_steps WHERE operation_id = ? AND deleted_at IS NULL`, opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("stale anti-entropy steps merged: %v", rows)
+	}
+}
+
 func TestBeginContainerCreateOperationRollsBackAndPreservesLiveRow(t *testing.T) {
 	ctx := context.Background()
 	t.Run("statement failure", func(t *testing.T) {

@@ -155,6 +155,26 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	seq, hash := tail.seq, tail.hash
 	c.auditChain.mu.Unlock()
 
+	// The LOCAL tail can be behind. AdoptAuditKey runs early in daemon startup,
+	// well before the replicator and anti-entropy come up, so a node restored
+	// from an older snapshot sees a shorter log than the cluster holds. Retiring
+	// at that number would put every row between the two under a boundary the key
+	// legitimately signed — and because the earliest verified retirement wins, it
+	// could never be raised again.
+	//
+	// A signed head is the cluster's own record of how far this host's chain has
+	// been, and it is not something a stale replica can talk down. Take whichever
+	// is further along.
+	if attested, aerr := highestAttestedSeq(ctx, c, keyring, hostName); aerr != nil {
+		return "", aerr
+	} else if attested > seq {
+		slog.Warn("this host's local audit log is behind what its own signed chain heads "+
+			"attest to; retiring at the attested sequence so a stale replica cannot pin the "+
+			"boundary below rows the key legitimately signed",
+			"host", hostName, "local_tail", seq, "attested", attested)
+		seq = attested
+	}
+
 	for _, old := range superseded {
 		if err := RetireAuditKey(ctx, c, keyring, hostName, old, seq); err != nil {
 			return "", err

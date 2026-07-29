@@ -78,7 +78,8 @@ func PublishAuditChainHead(ctx context.Context, c *Client, hostName string) erro
 }
 
 func insertAuditChainHead(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string, epoch, seq int64, hash string) error {
-	sig, err := keyring.SignHead(hostName, epoch, seq, hash)
+	createdAt := c.NowWall()
+	sig, err := keyring.SignHead(hostName, epoch, seq, hash, createdAt)
 	if err != nil {
 		return fmt.Errorf("sign audit chain head: %w", err)
 	}
@@ -92,7 +93,7 @@ func insertAuditChainHead(ctx context.Context, c *Client, keyring *AuditKeyring,
 		`INSERT OR IGNORE INTO audit_chain_heads
 		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		hostName, epoch, seq, hash, keyring.KeyID(), sig, c.NowWall(), c.NowTS())
+		hostName, epoch, seq, hash, keyring.KeyID(), sig, createdAt, c.NowTS())
 }
 
 // currentAuditEpoch is the highest epoch this host has published a head for.
@@ -214,7 +215,7 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 		var attestedSeq int64
 		for _, h := range heads[host] {
 			if keyring != nil {
-				if err := keyring.VerifyHead(ctx, c, host, h.Epoch, h.Seq, h.HeadHash, h.KeyID, h.Signature); err != nil {
+				if err := keyring.VerifyHead(ctx, c, host, h.Epoch, h.Seq, h.HeadHash, h.KeyID, h.Signature, h.CreatedAt); err != nil {
 					// A head that does not verify is itself a finding: someone
 					// either forged one to cover a truncation or damaged the real
 					// one to stop it being checked.
@@ -254,7 +255,14 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 				}
 			}
 
-			if h.Seq > attestedSeq && headHasSettled(h) {
+			// A head whose created_at the signature does NOT cover (a v1 head, or
+			// one whose column was edited) gets the conservative reading: treated
+			// as settled, so a shortfall is reported. That is the only safe
+			// direction — the alternative silently switches truncation detection
+			// off for exactly the heads someone tampered with.
+			trusted := keyring != nil &&
+				keyring.HeadTimestampIsSigned(ctx, c, host, h.Epoch, h.Seq, h.HeadHash, h.KeyID, h.Signature, h.CreatedAt)
+			if h.Seq > attestedSeq && headHasSettled(h, trusted) {
 				attestedSeq = h.Seq
 			}
 		}
@@ -271,22 +279,57 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 // headHasSettled reports whether a head is old enough that a shortfall behind
 // it cannot be explained by replication lag.
 //
-// created_at is stamped with NowWall, not NowTS. NowTS becomes an HLC string
-// the moment hlc_lww latches, and the parse failure that produced used to skip
-// the window entirely — turning every freshly published head into a truncation
+// created_at is stamped with NowWall, not NowTS. NowTS becomes an HLC string the
+// moment hlc_lww latches, and reading an HLC value as wall time skipped the
+// window entirely — turning every freshly published head into a truncation
 // report on any peer that had not yet received the rows behind it, which is the
-// ordinary eventually-consistent case the window exists for.
+// ordinary eventually-consistent case the window exists for. Both formats are
+// read, because heads already written with an HLC created_at are on disk.
 //
-// Both formats are read, because heads already written with an HLC created_at
-// are on disk and their truncation detection must not stay switched off. A
-// timestamp in neither format counts as NOT settled: an unreadable clock should
-// produce silence, never an accusation of tampering.
-func headHasSettled(h AuditChainHead) bool {
+// trusted says whether the signature covers created_at. When it does not, or
+// when the value parses as neither format, the head counts as SETTLED — the
+// conservative reading. Suppressing the finding instead would mean an attacker
+// could truncate a log and then scribble in created_at to keep anyone from
+// saying so, which is a silent failure where this one is merely a loud
+// investigable state.
+func headHasSettled(h AuditChainHead, trusted bool) bool {
+	if !trusted {
+		return true
+	}
 	if created, err := time.Parse(time.RFC3339Nano, h.CreatedAt); err == nil {
 		return time.Since(created) >= headSettleWindow
 	}
 	if ts, ok := hlc.Parse(h.CreatedAt); ok {
 		return time.Since(time.UnixMilli(ts.PhysicalMS)) >= headSettleWindow
 	}
-	return false
+	return true
+}
+
+// highestAttestedSeq is the furthest sequence any VERIFIED chain head says this
+// host's chain has reached.
+//
+// It is the cluster's own record of the host's progress, signed, and therefore
+// not something a stale local replica can talk down. Rotation uses it as a floor
+// on the retirement boundary: AdoptAuditKey runs early in daemon startup, before
+// replication is up, so a node restored from an older snapshot would otherwise
+// pin the boundary below rows its key legitimately signed — permanently, since
+// the earliest verified retirement is the one that stands.
+func highestAttestedSeq(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (int64, error) {
+	heads, err := latestAuditHeadsByKey(ctx, c)
+	if err != nil {
+		return 0, err
+	}
+	var best int64
+	for _, h := range heads[hostName] {
+		if keyring != nil {
+			if err := keyring.VerifyHead(ctx, c, hostName, h.Epoch, h.Seq,
+				h.HeadHash, h.KeyID, h.Signature, h.CreatedAt); err != nil {
+				continue // an unverifiable head asserts nothing
+			}
+		}
+		if h.Seq > best {
+			best = h.Seq
+		}
+	}
+	return best, nil
 }

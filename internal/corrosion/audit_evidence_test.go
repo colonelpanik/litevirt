@@ -142,54 +142,125 @@ func rewriteTailRowWithRetiredKey(t *testing.T, c *Client, kr *AuditKeyring, id 
 //
 // created_at is a wall time the settle window is measured against, but it used
 // to be stamped with NowTS — the LWW conflict key, which starts emitting HLC
-// strings the moment hlc_lww latches. The RFC3339 parse then failed, the window
-// was skipped entirely, and a head that had simply arrived before the rows
-// behind it was reported as a truncated log. That is the ordinary
+// strings the moment hlc_lww latches. Reading an HLC value as wall time skipped
+// the window entirely, and a head that had simply arrived before the rows behind
+// it was reported as a truncated log. That is the ordinary
 // eventually-consistent case, so on an HLC cluster every publish produced a
 // tampering alert seconds later.
-//
-// Both directions matter: a fresh head must not accuse, and a genuinely old one
-// must still be able to.
 func TestAuditHeads_AnHLCTimestampDoesNotFakeATruncation(t *testing.T) {
 	ctx := context.Background()
 	c, kr, _ := signedClient(t, "node-0")
 	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
 
 	// A head attesting to rows this node has not received yet, stamped the way
-	// an HLC-emitting node stamps it: now, in HLC form.
+	// an HLC-emitting node stamps it: now, in HLC form — and SIGNED over that
+	// value, which is what makes the window trustworthy enough to honour.
 	hlcNow := hlc.Timestamp{PhysicalMS: time.Now().UnixMilli(), NodeID: "node-0"}.String()
-	sig, err := kr.SignHead("node-0", 0, 9, "aabb")
-	if err != nil {
-		t.Fatalf("SignHead: %v", err)
-	}
-	if err := c.Execute(ctx,
-		`INSERT INTO audit_chain_heads
-		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
-		 VALUES ('node-0', 0, 9, 'aabb', ?, ?, ?, ?, NULL)`,
-		kr.KeyID(), sig, hlcNow, hlcNow); err != nil {
-		t.Fatalf("insert head: %v", err)
-	}
+	insertSignedHead(t, c, kr, 0, 9, "aabb", hlcNow)
 
 	if res := verify(t, c); len(res.TruncatedHosts) > 0 {
 		t.Fatalf("a head published seconds ago was read as a truncated log: %v\n"+
 			"the settle window exists because a peer can hold a head before the rows it "+
-			"attests to; an unreadable timestamp must not skip it", res.TruncatedHosts)
+			"attests to", res.TruncatedHosts)
 	}
 
-	// Same head, now genuinely older than the window: the shortfall is real.
+	// Same head, genuinely older than the window: the shortfall is real.
 	old := hlc.Timestamp{
 		PhysicalMS: time.Now().Add(-2 * headSettleWindow).UnixMilli(), NodeID: "node-0",
 	}.String()
-	if err := c.Execute(ctx,
-		`UPDATE audit_chain_heads SET created_at = ? WHERE host_name = 'node-0' AND seq = 9`,
-		old); err != nil {
-		t.Fatalf("age the head: %v", err)
+	if err := c.Execute(ctx, `DELETE FROM audit_chain_heads WHERE seq = 9`); err != nil {
+		t.Fatalf("clear: %v", err)
 	}
+	insertSignedHead(t, c, kr, 0, 9, "aabb", old)
 	if res := verify(t, c); len(res.TruncatedHosts) == 0 {
 		t.Fatalf("a head older than the settle window attests to seq 9 over a log that ends "+
-			"at 1, and nothing was reported: %+v\n"+
-			"treating an unreadable clock as 'not settled' must not switch truncation "+
-			"detection off for heads already written in HLC form", res)
+			"at 1, and nothing was reported: %+v", res)
+	}
+}
+
+// TestAuditHeads_AnEditedTimestampCannotSilenceTruncation.
+//
+// created_at was outside the signed payload, and the verifier measures the
+// settle window against it. So an attacker could truncate a log and then scribble
+// in created_at on their own heads — an unparseable value meant "not settled",
+// which meant no finding at all. A silent off switch for the one check a
+// backward-linking hash chain cannot perform for itself.
+//
+// Two shapes now close it, and the test covers both. On a head signed over its
+// timestamp (payload v2) the edit breaks the signature, which is louder than the
+// truncation would have been. On a head published before the column moved inside
+// the payload, the signature still verifies — so an unverifiable timestamp gets
+// the conservative reading, settled, and the shortfall is reported.
+func TestAuditHeads_AnEditedTimestampCannotSilenceTruncation(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	for _, id := range []string{"r1", "r2", "r3"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('r2','r3')`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`UPDATE audit_chain_heads SET created_at = 'not-a-timestamp' WHERE host_name = 'node-0'`); err != nil {
+		t.Fatalf("edit created_at: %v", err)
+	}
+
+	res := verify(t, c)
+	if !res.Tampered() {
+		t.Fatalf("editing a head's created_at silenced the truncation it attests to: %+v\n"+
+			"the settle window is measured against that column, so leaving it outside the "+
+			"signature made it an off switch for the check", res)
+	}
+	if len(res.BadSignature) == 0 {
+		t.Errorf("want the edit reported against the head's signature, got %+v", res)
+	}
+
+	// A head from before created_at moved inside the payload: the signature still
+	// verifies over the edited value, so only the conservative reading catches it.
+	if err := c.Execute(ctx, `DELETE FROM audit_chain_heads`); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	insertV1Head(t, c, kr, 0, 3, "aabb", "not-a-timestamp")
+	res = verify(t, c)
+	if len(res.TruncatedHosts) == 0 {
+		t.Fatalf("a legacy head with an unreadable timestamp stopped detecting a truncation: "+
+			"%+v\nan unverifiable clock must not be able to suppress the finding", res)
+	}
+}
+
+// insertV1Head writes a head signed with the pre-created_at payload, as one
+// published before the upgrade would be.
+func insertV1Head(t *testing.T, c *Client, kr *AuditKeyring, epoch, seq int64, hash, createdAt string) {
+	t.Helper()
+	sig, err := kr.sign(auditHeadDigestV1("node-0", epoch, seq, hash, kr.KeyID()))
+	if err != nil {
+		t.Fatalf("sign v1 head: %v", err)
+	}
+	if err := c.Execute(context.Background(),
+		`INSERT INTO audit_chain_heads
+		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-0', ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		epoch, seq, hash, kr.KeyID(), sig, createdAt, createdAt); err != nil {
+		t.Fatalf("insert v1 head: %v", err)
+	}
+}
+
+// insertSignedHead writes a head with a chosen created_at, signed over it.
+func insertSignedHead(t *testing.T, c *Client, kr *AuditKeyring, epoch, seq int64, hash, createdAt string) {
+	t.Helper()
+	sig, err := kr.SignHead("node-0", epoch, seq, hash, createdAt)
+	if err != nil {
+		t.Fatalf("SignHead: %v", err)
+	}
+	if err := c.Execute(context.Background(),
+		`INSERT INTO audit_chain_heads
+		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-0', ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		epoch, seq, hash, kr.KeyID(), sig, createdAt, createdAt); err != nil {
+		t.Fatalf("insert head: %v", err)
 	}
 }
 
@@ -495,19 +566,15 @@ func forgeRowWithKey(t *testing.T, c *Client, kr *AuditKeyring, id string, seq i
 // be inert here specifically, not merely survive in the table.
 func TestAuditEvidence_ATombstonedHeadStillDetectsTruncation(t *testing.T) {
 	ctx := context.Background()
-	c, _, _ := signedClient(t, "node-0")
+	c, kr, _ := signedClient(t, "node-0")
 	for _, id := range []string{"r1", "r2", "r3"} {
 		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
 	}
-	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
-		t.Fatalf("PublishAuditChainHead: %v", err)
-	}
-	// Older than headSettleWindow, so a shortfall is not read as replication lag.
-	if err := c.Execute(ctx,
-		`UPDATE audit_chain_heads SET created_at = ? WHERE host_name = 'node-0'`,
-		time.Now().Add(-2*headSettleWindow).UTC().Format(time.RFC3339)); err != nil {
-		t.Fatalf("age the head: %v", err)
-	}
+	// Older than headSettleWindow, so a shortfall is not read as replication lag —
+	// and SIGNED over that timestamp, since created_at is inside the payload.
+	tail := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r3'`)
+	insertSignedHead(t, c, kr, 0, 3, tail,
+		time.Now().Add(-2*headSettleWindow).UTC().Format(time.RFC3339))
 
 	// Cut the tail off, then delete the head that would have noticed.
 	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('r2','r3')`); err != nil {

@@ -341,19 +341,17 @@ func TestAuditVerify_BlankingAHashDoesNotLaunderTheChain(t *testing.T) {
 // The signed chain head is the only thing that notices.
 func TestAuditVerify_DetectsTruncation(t *testing.T) {
 	ctx := context.Background()
-	c, _, _ := signedClient(t, "node-0")
+	c, kr, _ := signedClient(t, "node-0")
 	for _, id := range []string{"r1", "r2", "r3", "r4"} {
 		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
 	}
-	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
-		t.Fatalf("PublishAuditChainHead: %v", err)
-	}
-	// Backdate the head past the replication settle window, so the shortfall is
-	// read as missing data rather than a peer that has not caught up yet.
-	if err := c.Execute(ctx,
-		`UPDATE audit_chain_heads SET created_at = '2026-01-01T00:00:00Z' WHERE host_name = 'node-0'`); err != nil {
-		t.Fatalf("backdate head: %v", err)
-	}
+	// A head from before the replication settle window, so a shortfall reads as
+	// missing data rather than a peer that has not caught up. Published signed
+	// over that timestamp — created_at is inside the payload, so editing it
+	// afterwards is a bad signature, not a backdated head.
+	tail := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r4'`)
+	insertSignedHead(t, c, kr, 0, 4, tail, "2026-01-01T00:00:00Z")
+	_ = ctx
 
 	if res := verify(t, c); res.Tampered() {
 		t.Fatalf("clean chain with a head reports tampering: %+v", res)

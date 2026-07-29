@@ -131,19 +131,31 @@ func HostRotateAuditKey(ctx context.Context, hostName, sshTarget string) error {
 // answer. Claiming "signing is on" when it is off is how the previous version of
 // this command closed an incident that was still open.
 func reportRemoteSigningState(sc *ssh.Client, hostName string) {
+	// No `|| true`. It made the command exit 0 whatever happened, and RunOutput
+	// only errors on a non-zero exit and returns stdout alone — so a missing or
+	// unreadable config produced err == nil and empty output, which fell through
+	// to the "signing is on" branch. An operator closing a key-compromise
+	// incident was told the replacement key was protecting rows that were in fact
+	// being written unsigned.
+	//
+	// grep exits 0 when it matches, 1 when it does not, and 2 on an error it
+	// could not read past. Only the first two are answers.
 	out, err := sc.RunOutput(
-		`grep -cE '^[[:space:]]+audit_signature:[[:space:]]*true' /etc/litevirt/config.yaml || true`)
-	switch {
+		`grep -qE '^[[:space:]]+audit_signature:[[:space:]]*true' /etc/litevirt/config.yaml; echo $?`)
+	switch code := strings.TrimSpace(string(out)); {
 	case err != nil:
-		fmt.Printf("  could not read enforcement.audit_signature on %s; check whether new rows "+
-			"are being signed there\n", hostName)
-	case strings.TrimSpace(string(out)) == "0":
+		fmt.Printf("  could not read enforcement.audit_signature on %s (%v); check by hand "+
+			"whether rows written there are being signed\n", hostName, err)
+	case code == "0":
+		fmt.Println("  enforcement.audit_signature is on, so rows written from here are signed with")
+		fmt.Println("  the new key")
+	case code == "1":
 		fmt.Println("  NOTE: enforcement.audit_signature is OFF on this host, so new rows are still")
 		fmt.Println("  written UNSIGNED. The rotation sealed what the old key wrote, but the new key")
 		fmt.Println("  is not protecting anything yet — enable the flag fleet-wide to change that")
 	default:
-		fmt.Println("  enforcement.audit_signature is on, so rows written from here are signed with")
-		fmt.Println("  the new key")
+		fmt.Printf("  could not read enforcement.audit_signature on %s (grep exit %q); check by "+
+			"hand whether rows written there are being signed\n", hostName, code)
 	}
 }
 

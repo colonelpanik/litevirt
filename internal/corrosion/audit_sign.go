@@ -62,7 +62,14 @@ const auditSigDomain = "litevirt-audit-row-v1"
 
 // auditHeadDomain is the same idea for chain-head signatures — a head must not
 // be interchangeable with a row.
+//
+// v2 adds created_at to the signed payload. It was outside the signature and the
+// verifier reads it back to decide whether a head is old enough for a shortfall
+// to count as truncation — so it was an attacker-writable off switch for
+// truncation detection. v1 heads are still accepted, or upgrading would report
+// every existing head as a bad signature.
 const auditHeadDomain = "litevirt-audit-head-v1"
+const auditHeadDomainV2 = "litevirt-audit-head-v2"
 
 // auditRetireDomain separates a retirement assertion from a row and a head.
 const auditRetireDomain = "litevirt-audit-retire-v1"
@@ -276,7 +283,25 @@ func auditRowDigest(contentHash, keyID string, seq int64) []byte {
 }
 
 // auditHeadDigest is the same for a chain head: host, epoch, seq, tail hash.
-func auditHeadDigest(hostName string, epoch, seq int64, headHash, keyID string) []byte {
+//
+// createdAt is included (v2). The verifier measures the settle window against
+// it, so leaving it outside the signature let anyone edit the column and decide
+// whether their own head counted — see headHasSettled.
+func auditHeadDigest(hostName string, epoch, seq int64, headHash, keyID, createdAt string) []byte {
+	h := sha256.New()
+	writeField(h, auditHeadDomainV2)
+	writeField(h, hostName)
+	writeField(h, strconv.FormatInt(epoch, 10))
+	writeField(h, strconv.FormatInt(seq, 10))
+	writeField(h, headHash)
+	writeField(h, keyID)
+	writeField(h, createdAt)
+	return h.Sum(nil)
+}
+
+// auditHeadDigestV1 is the pre-created_at payload, kept so heads already
+// published stay verifiable through the upgrade.
+func auditHeadDigestV1(hostName string, epoch, seq int64, headHash, keyID string) []byte {
 	h := sha256.New()
 	writeField(h, auditHeadDomain)
 	writeField(h, hostName)
@@ -319,11 +344,11 @@ func (k *AuditKeyring) SignRow(contentHash string, seq int64) (string, error) {
 }
 
 // SignHead returns the hex ECDSA signature over a chain head's digest.
-func (k *AuditKeyring) SignHead(hostName string, epoch, seq int64, headHash string) (string, error) {
+func (k *AuditKeyring) SignHead(hostName string, epoch, seq int64, headHash, createdAt string) (string, error) {
 	if !k.CanSign() {
 		return "", nil
 	}
-	return k.sign(auditHeadDigest(hostName, epoch, seq, headHash, k.keyID))
+	return k.sign(auditHeadDigest(hostName, epoch, seq, headHash, k.keyID, createdAt))
 }
 
 // SignRetirement asserts that hostName's key retiredKeyID signed nothing valid
@@ -377,11 +402,31 @@ func (k *AuditKeyring) VerifyRow(ctx context.Context, c *Client, hostName, keyID
 	})
 }
 
-// VerifyHead checks a chain head's signature.
-func (k *AuditKeyring) VerifyHead(ctx context.Context, c *Client, hostName string, epoch, seq int64, headHash, keyID, sigHex string) error {
-	return k.verifySig(ctx, c, hostName, keyID, sigHex, func(id string) []byte {
-		return auditHeadDigest(hostName, epoch, seq, headHash, id)
+// VerifyHead checks a chain head's signature, accepting either payload version.
+//
+// A v1 head does not cover created_at, so headHasSettled treats one as
+// unverified-timestamp and falls back to the conservative reading. Trying v2
+// first means a head published today cannot be downgraded by stripping its
+// created_at.
+func (k *AuditKeyring) VerifyHead(ctx context.Context, c *Client, hostName string, epoch, seq int64, headHash, keyID, sigHex, createdAt string) error {
+	err := k.verifySig(ctx, c, hostName, keyID, sigHex, func(id string) []byte {
+		return auditHeadDigest(hostName, epoch, seq, headHash, id, createdAt)
 	})
+	if err == nil || isUnknownKeyErr(err) {
+		return err
+	}
+	return k.verifySig(ctx, c, hostName, keyID, sigHex, func(id string) []byte {
+		return auditHeadDigestV1(hostName, epoch, seq, headHash, id)
+	})
+}
+
+// HeadTimestampIsSigned reports whether a head's created_at is covered by its
+// signature — true for v2 heads, false for ones published before the column
+// moved inside the payload.
+func (k *AuditKeyring) HeadTimestampIsSigned(ctx context.Context, c *Client, hostName string, epoch, seq int64, headHash, keyID, sigHex, createdAt string) bool {
+	return k.verifySig(ctx, c, hostName, keyID, sigHex, func(id string) []byte {
+		return auditHeadDigest(hostName, epoch, seq, headHash, id, createdAt)
+	}) == nil
 }
 
 func (k *AuditKeyring) verifySig(ctx context.Context, c *Client, hostName, keyID, sigHex string, digest func(string) []byte) error {

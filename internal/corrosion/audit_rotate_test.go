@@ -349,3 +349,45 @@ func TestRotation_StillRetiresAGenuinelySupersededKey(t *testing.T) {
 			"retired-key finding would never fire")
 	}
 }
+
+// TestRotation_AStaleTailCannotPinTheBoundaryLow.
+//
+// AdoptAuditKey runs early in daemon startup — before the replicator and
+// anti-entropy come up — so it reads whatever the LOCAL audit_log happens to
+// hold. A node restored from an older snapshot sees a shorter chain than the
+// cluster does, and retiring at that number puts every row in between under a
+// boundary the key legitimately signed.
+//
+// That is not self-correcting: the earliest verified retirement is the one that
+// stands, so a routine restore-then-rotate would leave the whole cluster's audit
+// verdict red with no way to raise it back.
+//
+// A signed chain head is the cluster's own record of how far the chain has been,
+// and a stale replica cannot talk it down.
+func TestRotation_AStaleTailCannotPinTheBoundaryLow(t *testing.T) {
+	ctx := context.Background()
+	c, oldKR, dir := signedClient(t, "node-0")
+	for _, id := range []string{"r1", "r2", "r3", "r4"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+	// The cluster has a head attesting to seq 4.
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+
+	// This replica is behind: it holds only the first two rows.
+	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('r3','r4')`); err != nil {
+		t.Fatalf("simulate a stale replica: %v", err)
+	}
+	c.ResetAuditChainForTests()
+
+	rotateTo(t, c, dir, "node-0")
+
+	got := oneCol(t, c,
+		`SELECT retired_at_seq FROM audit_key_retirements WHERE retired_key_id = '`+oldKR.KeyID()+`'`)
+	if got != "4" {
+		t.Fatalf("retirement boundary is %q, want 4 — the sequence this host's own signed head "+
+			"attests to\na node restored from a snapshot would otherwise put rows 3-4, which "+
+			"its key legitimately signed, permanently past the boundary", got)
+	}
+}

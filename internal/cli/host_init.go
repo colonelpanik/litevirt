@@ -15,6 +15,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/ssh"
+	"github.com/litevirt/litevirt/internal/systemdunit"
 )
 
 var (
@@ -633,42 +634,18 @@ CONF
 # Load vfio-pci kernel module (needed for PCI passthrough).
 modprobe vfio-pci 2>/dev/null || true
 
-# Install systemd unit file for litevirtd.
-# Mirror of internal/grpcapi/upgrade.go's litevirtdUnit + rollback unit —
-# both should drift together.
-cat > /etc/systemd/system/litevirt.service << 'UNIT'
-[Unit]
-Description=litevirt daemon
-After=network-online.target libvirtd.service
-Wants=network-online.target
-Wants=libvirtd.service
-StartLimitBurst=3
-StartLimitIntervalSec=600
-OnFailure=litevirt-rollback.service
+# Install the systemd units. The text comes from internal/systemdunit so this
+# script and the upgrade path cannot disagree; they previously drifted, leaving
+# this copy with a tight start limit and a rollback with NO sentinel gate.
+cat > ` + systemdunit.MainPath + ` << 'UNIT'
+` + systemdunit.Main + `UNIT
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/litevirt daemon
-KillMode=process
-Delegate=no
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
+cat > ` + systemdunit.RollbackPath + ` << 'UNIT'
+` + systemdunit.Rollback + `UNIT
 
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# Rollback companion: fires when litevirtd hits StartLimitBurst (a bad
-# upgrade panicking on every start). Restores .old binary and restarts.
-cat > /etc/systemd/system/litevirt-rollback.service << 'UNIT'
-[Unit]
-Description=litevirt daemon rollback (auto-restore previous binary on failed upgrade)
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'if [ -f /usr/local/bin/litevirt.old ]; then logger -t litevirt-rollback "RESTORING previous litevirtd binary after failed upgrade"; mv /usr/local/bin/litevirt.old /usr/local/bin/litevirt; systemctl reset-failed litevirt.service; systemctl start litevirt.service; else logger -t litevirt-rollback "no .old binary to roll back to; leaving litevirtd in failed state"; exit 1; fi'
-UNIT
+mkdir -p "$(dirname ` + systemdunit.NeedrestartPath + `)"
+cat > ` + systemdunit.NeedrestartPath + ` << 'DROPIN'
+` + systemdunit.Needrestart + `DROPIN
 systemctl daemon-reload
 systemctl enable litevirt.service
 systemctl restart litevirt.service

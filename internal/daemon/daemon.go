@@ -1121,6 +1121,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Handle shutdown, re-exec, and uninstall signals.
 	shutdownDone := make(chan struct{})
 	reexecRequested := false
+	uninstalled := false
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -1138,6 +1139,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			reexecRequested = true
 		case <-svc.ShutdownCh:
 			slog.Info("shutdown requested by uninstall")
+			uninstalled = true
 		}
 		done := make(chan struct{})
 		go func() {
@@ -1175,6 +1177,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if reexecRequested {
 		return ErrReExec
 	}
+	// Uninstall has already removed the unit files and the binary. Under
+	// Restart=always systemd would restart a unit whose ExecStart no longer
+	// exists, so this exit has to be distinguishable from an ordinary one — the
+	// unit's RestartPreventExitStatus pins the status the caller exits with.
+	if uninstalled {
+		return ErrUninstalled
+	}
 
 	// Serve returns ErrServerStopped on graceful shutdown — not a real error.
 	if serveErr != nil && serveErr != grpc.ErrServerStopped {
@@ -1186,6 +1195,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 // ErrReExec is returned by Run when the daemon should re-exec itself
 // after a binary upgrade.
 var ErrReExec = fmt.Errorf("re-exec requested")
+
+// ErrUninstalled is returned by Run after an uninstall removed this node. The
+// caller must exit with systemdunit.UninstallExitCode so Restart=always does not
+// restart a unit that no longer has a binary to run.
+var ErrUninstalled = fmt.Errorf("uninstalled")
 
 func (d *Daemon) registerHost(ctx context.Context) error {
 	// Get system resources from libvirt

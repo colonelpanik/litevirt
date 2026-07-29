@@ -85,6 +85,27 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		_ = json.Unmarshal([]byte(src.Spec), &srcSpec)
 	}
 
+	// Capacity + quota admission. A clone is a full-sized VM — same vCPU, same
+	// memory, its own disks — so it consumes exactly what CreateVM would, and
+	// skipping this let a clone walk past both the host's capacity and the
+	// project's quota. Cloning a template in a loop was an unbounded way to
+	// overfill a host with every other create path refusing correctly.
+	//
+	// It runs HERE, after the forward to the source's host, for the same reason
+	// CreateVM admits only on the owning node: reserving on both nodes counts one
+	// clone twice and the forwarded half then refuses itself. It is also before
+	// any disk is written, so a refusal costs no I/O.
+	//
+	// The figures come from srcSpec, which is what the clone's VM record will
+	// report as its usage — admitting a different number than the row we go on to
+	// write would leave the accounting permanently off by the difference.
+	lease, aerr := s.admitWithReservation(
+		ctx, "CloneVM", s.hostName, project, "vm:"+req.Target, int(srcSpec.Cpu), int(srcSpec.MemoryMib))
+	if aerr != nil {
+		return nil, aerr
+	}
+	defer lease.release(ctx)
+
 	mode := cloneMode(req.Mode, allDisksShared(srcDisks))
 
 	// Preserve disk bus + SCSI controller model from the source spec (a Windows

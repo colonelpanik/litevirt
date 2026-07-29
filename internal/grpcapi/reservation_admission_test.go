@@ -1,0 +1,134 @@
+package grpcapi
+
+import (
+	"context"
+	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+// The tie-break, pinned DETERMINISTICALLY rather than by racing two goroutines.
+//
+// A concurrency test that fires two creates and counts winners is only as good as
+// its timing: once the window narrows, it passes whether or not the mechanism
+// works (it did exactly that here — a check-then-write mutation survived it). So
+// the ordering guarantee is asserted directly, by planting a competing reservation
+// with a known id and observing which way the decision goes.
+//
+// Operation ids are globally unique, giving a TOTAL order every node computes
+// identically. An admission yields to reservations sorting BEFORE it and ignores
+// those sorting after — which is what produces exactly one winner instead of two
+// refusals.
+
+// plantReservation inserts a nonterminal operation holding a capacity reservation
+// under a chosen id, standing in for a concurrent admission on another node.
+func plantReservation(t *testing.T, s *Server, id, host, project string, cpu, mem int) {
+	t.Helper()
+	rv := corrosion.ReservationVector{
+		Project: project, ProjectCPU: cpu, ProjectMemMiB: mem,
+		TargetHost: host, TargetCPU: cpu, TargetMemMiB: mem,
+	}
+	enc, err := rv.Encode()
+	if err != nil {
+		t.Fatalf("encode reservation: %v", err)
+	}
+	if err := corrosion.InsertOperation(context.Background(), s.db, corrosion.OperationRecord{
+		ID: id, Method: "CreateVM", Project: project, ResourceKind: "capacity",
+		OperationKind: string(corrosion.OpResourceUpdateRunning), ReservationJSON: enc,
+	}); err != nil {
+		t.Fatalf("plant reservation %s: %v", id, err)
+	}
+}
+
+// admissionHost seeds a host with exactly enough headroom for ONE of two competing
+// 1024 MiB admissions.
+func admissionHost(t *testing.T, s *Server) {
+	t.Helper()
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 16, MemTotal: 2560,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable = 2560 - 1024 reserve = 1536 → room for ONE 1024, not two.
+}
+
+// TestAdmitWithReservation_YieldsToAnEarlierClaimant: a competing reservation that
+// sorts BEFORE ours holds the capacity, so we must stand down.
+func TestAdmitWithReservation_YieldsToAnEarlierClaimant(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	admissionHost(t, s)
+
+	// "0000…" sorts before any minted id.
+	plantReservation(t, s, "00000000-earlier", "test-host", "_default", 1, 1024)
+
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", 1, 1024)
+	if status.Code(err) != codes.ResourceExhausted {
+		if lease != nil {
+			lease.release(ctx)
+		}
+		t.Fatalf("admission against an EARLIER claimant: got %v, want ResourceExhausted", err)
+	}
+}
+
+// TestAdmitWithReservation_IgnoresALaterClaimant: a competing reservation that
+// sorts AFTER ours will yield to us, so we proceed. Without this the two racers
+// would both refuse and nobody would get in.
+func TestAdmitWithReservation_IgnoresALaterClaimant(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	admissionHost(t, s)
+
+	// "zzzz…" sorts after any minted id.
+	plantReservation(t, s, "zzzzzzzz-later", "test-host", "_default", 1, 1024)
+
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", 1, 1024)
+	if err != nil {
+		t.Fatalf("admission against a LATER claimant was refused: %v — later racers yield, or both sides deadlock and nobody is admitted", err)
+	}
+	lease.release(ctx)
+}
+
+// TestAdmitWithReservation_ReleaseFreesTheCapacity: a lease that is not released
+// permanently consumes capacity no workload is using, so release is as
+// load-bearing as reserve.
+//
+// Asserted on HostReserved directly rather than by attempting a second admission.
+// That indirect version was 50/50: ids come from newID(), so whether a leaked
+// reservation is even VISIBLE to the next admission depends on which id sorts
+// first — and a mutation that never released survived it half the time.
+func TestAdmitWithReservation_ReleaseFreesTheCapacity(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	admissionHost(t, s)
+
+	before, _, err := corrosion.HostReserved(ctx, s.db, "test-host")
+	if err != nil {
+		t.Fatalf("HostReserved: %v", err)
+	}
+
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", 1, 1024)
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	held, _, err := corrosion.HostReserved(ctx, s.db, "test-host")
+	if err != nil {
+		t.Fatalf("HostReserved: %v", err)
+	}
+	if held != before+1 {
+		t.Fatalf("reserved vCPU = %d while the lease is held, want %d — the reservation is not visible to anyone else", held, before+1)
+	}
+
+	lease.release(ctx)
+
+	after, _, err := corrosion.HostReserved(ctx, s.db, "test-host")
+	if err != nil {
+		t.Fatalf("HostReserved: %v", err)
+	}
+	if after != before {
+		t.Errorf("reserved vCPU = %d after release, want %d — the reservation leaked and permanently consumes capacity", after, before)
+	}
+}

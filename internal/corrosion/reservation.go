@@ -89,6 +89,75 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 	return out, nil
 }
 
+// ReservedBefore sums the NONTERMINAL reservation deltas of operations whose id
+// sorts strictly BEFORE opID — the claimants this admission must yield to.
+//
+// Operation ids are globally unique, so ordering them lexically is a TOTAL order
+// every node computes identically. Reserve-then-verify counts only these: our own
+// reservation must not be subtracted from the headroom we are about to compare our
+// own request against (that double-counts), and later claimants yield to us, which
+// is what makes exactly one racer win instead of both refusing.
+//
+// Counting earlier-only rather than crediting back is deliberate. Headroom clamps
+// at zero, so "subtract everything then add ours back" silently over-credits once
+// the host is oversubscribed — a bug this shape had until a test caught it.
+func ReservedBefore(ctx context.Context, c *Client, host, project, opID string) (hostCPU, hostMem, projCPU, projMem int, err error) {
+	rvs, err := nonterminalReservationsWithIDs(ctx, c)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	for id, rv := range rvs {
+		if id >= opID {
+			continue // ourselves, or a LATER claimant that yields to us
+		}
+		if host != "" && rv.TargetHost == host {
+			hostCPU += rv.TargetCPU
+			hostMem += rv.TargetMemMiB
+		}
+		if project != "" && rv.Project == project {
+			projCPU += rv.ProjectCPU
+			projMem += rv.ProjectMemMiB
+		}
+	}
+	return hostCPU, hostMem, projCPU, projMem, nil
+}
+
+// nonterminalReservationsWithIDs is nonterminalReservations keyed by operation id,
+// for the orderings reserve-then-verify needs.
+func nonterminalReservationsWithIDs(ctx context.Context, c *Client) (map[string]ReservationVector, error) {
+	orows, err := c.Query(ctx,
+		`SELECT id, operation_kind, reservation_json FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
+	if err != nil {
+		return nil, err
+	}
+	if len(orows) == 0 {
+		return nil, nil
+	}
+	srows, err := c.Query(ctx, `SELECT operation_id, step_name FROM operation_steps WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	stepsByOp := make(map[string][]string, len(orows))
+	for _, r := range srows {
+		id := r.String("operation_id")
+		stepsByOp[id] = append(stepsByOp[id], r.String("step_name"))
+	}
+	out := make(map[string]ReservationVector, len(orows))
+	for _, r := range orows {
+		id := r.String("id")
+		state, _ := ReduceOperationState(OperationKind(r.String("operation_kind")), stepsByOp[id])
+		if IsOperationTerminal(state) {
+			continue
+		}
+		rv, derr := DecodeReservation(r.String("reservation_json"))
+		if derr != nil {
+			return nil, derr
+		}
+		out[id] = rv
+	}
+	return out, nil
+}
+
 // HostReserved sums the target-host reservation deltas of all NONTERMINAL operations
 // targeting host — the in-flight capacity not yet reflected in running-VM actuals.
 func HostReserved(ctx context.Context, c *Client, host string) (cpu, memMiB int, err error) {
@@ -135,20 +204,37 @@ func HostFreeCapacity(ctx context.Context, c *Client, host string) (freeCPU, fre
 	return HostFreeCapacityWithPolicy(ctx, c, host, DefaultCapacityPolicy())
 }
 
+// HostFreeCapacityBefore is HostFreeCapacityWithPolicy counting only reservations
+// from operations that sort BEFORE opID. Used by reserve-then-verify so an
+// admission compares its request against headroom that excludes its own
+// provisional reservation.
+func HostFreeCapacityBefore(ctx context.Context, c *Client, host string, policy CapacityPolicy, opID string) (freeCPU, freeMemMiB int, ok bool, err error) {
+	resCPU, resMem, _, _, err := ReservedBefore(ctx, c, host, "", opID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return hostFreeWithReserved(ctx, c, host, policy, resCPU, resMem)
+}
+
 // HostFreeCapacityWithPolicy is HostFreeCapacity under an explicit cluster policy.
 func HostFreeCapacityWithPolicy(ctx context.Context, c *Client, host string, policy CapacityPolicy) (freeCPU, freeMemMiB int, ok bool, err error) {
-	h, err := GetHost(ctx, c, host)
+	resCPU, resMem, err := HostReserved(ctx, c, host)
 	if err != nil {
 		return 0, 0, false, err
 	}
-	if h == nil {
-		return 0, 0, false, nil
+	return hostFreeWithReserved(ctx, c, host, policy, resCPU, resMem)
+}
+
+// hostFreeWithReserved is the shared tail of the host-headroom calculation, taking
+// the reservation totals to subtract. Split out so reserve-then-verify can supply a
+// FILTERED total (earlier claimants only) instead of re-deriving the arithmetic —
+// and so the clamp below lives in exactly one place.
+func hostFreeWithReserved(ctx context.Context, c *Client, host string, policy CapacityPolicy, resCPU, resMem int) (freeCPU, freeMemMiB int, ok bool, err error) {
+	h, err := GetHost(ctx, c, host)
+	if err != nil || h == nil {
+		return 0, 0, false, err
 	}
 	usage, err := SumVMResourcesByHost(ctx, c)
-	if err != nil {
-		return 0, 0, false, err
-	}
-	resCPU, resMem, err := HostReserved(ctx, c, host)
 	if err != nil {
 		return 0, 0, false, err
 	}

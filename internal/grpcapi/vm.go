@@ -243,6 +243,11 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
+		// rejects the hopeless case before we forward. The authoritative
+		// reserve-then-verify runs on the OWNING node below — reserving here too
+		// would count this create's demand twice, once per node, and the forwarded
+		// half would refuse itself.
 		return nil, err
 	}
 	// Project isolation (storage): pools are HOST-scoped, so admit each disk's pool
@@ -288,6 +293,25 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		// The remote host's mutation_log entry will be replicated to us
 		// via the WAL-based replicator. No need to manually sync.
 		return out, nil
+	}
+
+	// Authoritative admission, on the OWNING node only (everything above either
+	// returned or forwarded). Reserve THEN verify: checking first and writing after
+	// is what let two concurrent same-project admissions on different hosts both
+	// pass against a view containing neither. The lease publishes this create's
+	// demand so a racer sees it, and is released on every exit path — a leaked one
+	// permanently consumes capacity nothing is using.
+	//
+	// Doing this ONLY here matters: reserving on the entry node as well would count
+	// the same create twice, and the forwarded half would then refuse itself. That
+	// bug was intermittent (it depended on which operation id sorted first) and was
+	// caught by the per-host-override fleet test, not by reasoning.
+	if !req.AllowOvercommit {
+		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, int(spec.Cpu), int(spec.MemoryMib))
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)

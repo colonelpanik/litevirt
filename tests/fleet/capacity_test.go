@@ -22,6 +22,7 @@ package fleet
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -237,5 +238,91 @@ func TestFleet_Capacity_HostListingReportsContainerMemory(t *testing.T) {
 	}
 	if got, want := memOf(n.Name), before+2048; got != want {
 		t.Errorf("host memory reported as %d with a STOPPED container present, want %d unchanged", got, want)
+	}
+}
+
+// TestFleet_Capacity_ConcurrentSameProjectAdmissions is the cross-node test the F2
+// item names: two concurrent admissions for the SAME project, entering DIFFERENT
+// nodes, where the project quota fits either one but not both.
+//
+// Before reserve-then-verify, both read a headroom view containing neither and both
+// persisted — the cluster ends up over its own quota with neither request having
+// done anything wrong. The fix reserves first, so the loser sees the winner's
+// reservation and stands down; operation ids give a total order, so the winner is
+// the same on every node rather than whoever happened to read last.
+//
+// This is a SMOKE test and is timing-dependent by nature: it demonstrated the race
+// (a check-then-write mutation produced 2 winners) but once the window narrowed it
+// stopped reliably distinguishing the two implementations. The ordering guarantee
+// itself is pinned deterministically by TestAdmitWithReservation_* in
+// internal/grpcapi, which plants a competing reservation with a known id instead of
+// racing goroutines. Do not treat a green run here as proof the mechanism works.
+func TestFleet_Capacity_ConcurrentSameProjectAdmissions(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	a, b := c.Nodes[0], c.Nodes[1]
+
+	setHostCapacity(t, c, a.Name, 64, 65536, nil)
+	setHostCapacity(t, c, b.Name, 64, 65536, nil)
+
+	// Quota fits ONE 4 GiB VM, not two.
+	if _, err := c.SelfClient(a).CreateProject(ctx, &pb.CreateProjectRequest{
+		Name: "/tight", Display: "Tight",
+	}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if _, err := c.SelfClient(a).SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
+		Quota: &pb.ProjectQuota{ProjectName: "/tight", VcpuLimit: 8, MemMibLimit: 6144},
+	}); err != nil {
+		t.Fatalf("SetProjectQuota: %v", err)
+	}
+
+	// Fire both at once, each entering a different node and pinned to that node —
+	// so neither is serialized behind the other by a shared host lock.
+	type res struct {
+		name string
+		err  error
+	}
+	out := make(chan res, 2)
+	var wg sync.WaitGroup
+	for _, tc := range []struct {
+		node *Node
+		name string
+	}{{a, "first"}, {b, "second"}} {
+		wg.Add(1)
+		go func(n *Node, name string) {
+			defer wg.Done()
+			_, err := c.SelfClient(n).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+				Name: name, Cpu: 2, MemoryMib: 4096, Project: "/tight",
+				Placement: &pb.PlacementSpec{Host: n.Name},
+			}})
+			out <- res{name, err}
+		}(tc.node, tc.name)
+	}
+	wg.Wait()
+	close(out)
+
+	var okCount int
+	for r := range out {
+		if r.err == nil {
+			okCount++
+			continue
+		}
+		if status.Code(r.err) != codes.ResourceExhausted {
+			t.Errorf("%s failed for an unexpected reason: %v", r.name, r.err)
+		}
+	}
+	if okCount != 1 {
+		t.Fatalf("%d of 2 concurrent same-project admissions succeeded, want exactly 1 — "+
+			"two winners means the quota was breached; zero means the racers deadlocked each other", okCount)
+	}
+
+	// And the survivor is genuinely within quota.
+	usage, err := c.SelfClient(a).GetProjectUsage(ctx, &pb.GetProjectUsageRequest{ProjectName: "/tight"})
+	if err != nil {
+		t.Fatalf("GetProjectUsage: %v", err)
+	}
+	if usage.MemMibUsed > 6144 {
+		t.Errorf("project memory used = %d MiB, over the 6144 quota", usage.MemMibUsed)
 	}
 }

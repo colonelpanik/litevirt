@@ -26,6 +26,11 @@ const (
 	DispDeleteRetention     Disposition = "delete_retention"       // hard delete on a registered retention table
 	DispAppendOnly          Disposition = "append_only"            // INSERT OR IGNORE, no LWW
 	DispCustomMerge         Disposition = "custom_merge"           // runtime_action_proofs / operations / …
+	// DispCreateBegin applies one of the exact, audited workload-create
+	// resurrection UPSERTs verbatim after workload_create_begin_v1 matches.
+	// Their owner/generation WHERE is the ordering rule; an unrelated receiver
+	// clock must not override that semantic ABA fence.
+	DispCreateBegin Disposition = "create_begin"
 	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
 	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
 	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.

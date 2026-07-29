@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -38,7 +39,8 @@ func TestSpecWritersAreSanctioned(t *testing.T) {
 		t.Fatalf("read package dir: %v", err)
 	}
 
-	found := map[string]bool{}
+	var files []*ast.File
+	sqlConstants := map[string]string{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -48,18 +50,45 @@ func TestSpecWritersAreSanctioned(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		files = append(files, f)
+		for _, decl := range f.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
+					continue
+				}
+				lit, ok := value.Values[0].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				if decoded, err := strconv.Unquote(lit.Value); err == nil {
+					sqlConstants[value.Names[0].Name] = decoded
+				}
+			}
+		}
+	}
+
+	found := map[string]bool{}
+	for _, f := range files {
 		for _, decl := range f.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok {
 				continue
 			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				lit, ok := n.(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					return true
-				}
-				if writesVMSpecColumns(lit.Value) {
-					found[fn.Name.Name] = true
+				switch value := n.(type) {
+				case *ast.BasicLit:
+					if value.Kind == token.STRING && writesVMSpecColumns(value.Value) {
+						found[fn.Name.Name] = true
+					}
+				case *ast.Ident:
+					if writesVMSpecColumns(sqlConstants[value.Name]) {
+						found[fn.Name.Name] = true
+					}
 				}
 				return true
 			})

@@ -132,6 +132,12 @@ type explicitPolicyDef struct {
 }
 
 var explicitPolicyDefs = []explicitPolicyDef{
+	// Create-begin resurrection is ordered by its strictly increasing
+	// owner_epoch + spec_generation predicate, not by unrelated node clocks.
+	// The receiver additionally requires workload_create_begin_v1 before the
+	// exact statement is applied.
+	{SQL: vmCreateBeginSQL, Disposition: DispCreateBegin},
+	{SQL: containerCreateBeginSQL, Disposition: DispCreateBegin},
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes) → verbatim.
 	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock},
 	// session revoke: a guarded one-shot terminal transition (WHERE revoked_at IS NULL) → verbatim.

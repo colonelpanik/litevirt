@@ -1142,6 +1142,22 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		_, execErr := tx.ExecContext(ctx, sqlStmt, s.Params...)
 		return execErr
 
+	case DispCreateBegin:
+		if s.Guard == nil || s.Guard.Protocol != workloadCreateBeginGuardV1 {
+			return invalidf("create-begin statement missing workload_create_begin_v1 guard")
+		}
+		if err := validateCreateBeginStatement(s, sh); err != nil {
+			return err
+		}
+		// The exact registered UPSERT repeats the guard's strict owner/generation
+		// ordering in SQL. Apply it verbatim: generic timestamp LWW would wrongly
+		// let an unrelated receiver clock defeat a semantically newer ABA epoch.
+		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if execErr == nil && rowsChanged(res) {
+			r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
+		}
+		return execErr
+
 	case DispDeleteRetention:
 		// A registered retention DELETE (its presence in the ledger IS the registration).
 		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
@@ -1151,6 +1167,11 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		return execErr
 
 	case DispBulkUpdate:
+		if cleanup, cleanupErr := isClaimedCreateCleanup(s, sh); cleanupErr != nil {
+			return cleanupErr
+		} else if cleanup {
+			return r.applyBulkPerRowCreateCleanup(ctx, tx, s, sh, tableName, pkCols)
+		}
 		return r.applyBulkUpdate(ctx, tx, s, sh, tableName, pkCols, entry.Category)
 
 	case DispFullPKUpdateNoClock:
@@ -1171,6 +1192,106 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		return r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 	}
 	return invalidf("unhandled disposition %q for %s", disp, tableName)
+}
+
+func validateCreateBeginStatement(s Statement, sh StmtShape) error {
+	g := s.Guard
+	boolParam := func(v interface{}) string {
+		if raw := strings.ToLower(coerceString(v)); raw != "" && raw != "0" && raw != "false" {
+			return "true"
+		}
+		return "false"
+	}
+	switch sh.Table {
+	case "vms":
+		if len(s.Params) != 14 || g.ResourceKind != "vm" ||
+			coerceString(s.Params[0]) != g.ResourceID ||
+			coerceString(s.Params[2]) != g.HostName ||
+			coerceString(s.Params[9]) != fmt.Sprintf("%d", g.OwnerEpoch) ||
+			coerceString(s.Params[10]) != fmt.Sprintf("%d", g.SpecGeneration) ||
+			coerceString(s.Params[11]) != g.OperationID {
+			return invalidf("VM create-begin statement identity does not match mutation guard")
+		}
+		gotHash := hashIdentity(
+			coerceString(s.Params[0]), coerceString(s.Params[1]),
+			coerceString(s.Params[2]), coerceString(s.Params[3]),
+			projectOrDefault(coerceString(s.Params[7])), boolParam(s.Params[8]),
+		)
+		if g.IdentityHash == "" || gotHash != g.IdentityHash {
+			return invalidf("VM create-begin statement content does not match mutation guard")
+		}
+	case "containers":
+		if len(s.Params) != 18 || g.ResourceKind != "container" ||
+			coerceString(s.Params[0]) != g.HostName ||
+			coerceString(s.Params[1]) != g.ResourceID ||
+			coerceString(s.Params[13]) != fmt.Sprintf("%d", g.OwnerEpoch) ||
+			coerceString(s.Params[14]) != fmt.Sprintf("%d", g.SpecGeneration) ||
+			coerceString(s.Params[15]) != g.OperationID {
+			return invalidf("container create-begin statement identity does not match mutation guard")
+		}
+		gotHash := hashIdentity(
+			coerceString(s.Params[0]), coerceString(s.Params[1]),
+			coerceString(s.Params[2]), coerceString(s.Params[3]),
+			coerceString(s.Params[4]), coerceString(s.Params[5]),
+			coerceString(s.Params[6]), projectOrDefault(coerceString(s.Params[8])),
+			boolParam(s.Params[9]),
+			coerceString(s.Params[10]), coerceString(s.Params[11]),
+			coerceString(s.Params[12]),
+		)
+		if g.IdentityHash == "" || gotHash != g.IdentityHash {
+			return invalidf("container create-begin statement content does not match mutation guard")
+		}
+	default:
+		return invalidf("create-begin disposition on unexpected table %s", sh.Table)
+	}
+	return nil
+}
+
+var createCleanupFingerprints = func() map[string]struct{} {
+	out := make(map[string]struct{}, 6)
+	for _, stmt := range []string{
+		vmInterfacesCreateCleanupSQL,
+		vmDisksCreateCleanupSQL,
+		vmNICsCreateCleanupSQL,
+		vmPCIIntentCreateCleanupSQL,
+		vmPCIRealCreateCleanupSQL,
+		containerCreateCleanupSQL,
+	} {
+		fp, err := FingerprintSQL(stmt)
+		if err != nil {
+			panic("invalid create-cleanup statement: " + err.Error())
+		}
+		out[fp] = struct{}{}
+	}
+	return out
+}()
+
+// isClaimedCreateCleanup recognizes only the six exact child-tombstone shapes
+// emitted by Begin*CreateOperation, and binds their WHERE identity back to the
+// already-matched workload guard. Ordinary DeleteVM/container-interface writes
+// share some SQL fingerprints but carry no claim guard and keep normal LWW.
+func isClaimedCreateCleanup(s Statement, sh StmtShape) (bool, error) {
+	if _, ok := createCleanupFingerprints[stmtFingerprint(sh)]; !ok {
+		return false, nil
+	}
+	g := s.Guard
+	if g == nil || g.Protocol != workloadCreateGuardV1 || !g.RequireOperation {
+		return false, nil
+	}
+	switch sh.Table {
+	case "container_interfaces":
+		if g.ResourceKind != "container" || len(s.Params) != 4 ||
+			coerceString(s.Params[2]) != g.HostName ||
+			coerceString(s.Params[3]) != g.ResourceID {
+			return false, invalidf("container create cleanup identity does not match mutation guard")
+		}
+	default:
+		if g.ResourceKind != "vm" || len(s.Params) != 3 ||
+			coerceString(s.Params[2]) != g.ResourceID {
+			return false, invalidf("VM create cleanup identity does not match mutation guard")
+		}
+	}
+	return true, nil
 }
 
 // applyCanonicalRegistry applies the Part H2 canonical registry-credential upsert AFTER verifying
@@ -1506,6 +1627,20 @@ func monotoneIncomingValue(sh StmtShape, s Statement, col string) (string, error
 var testHookBulkMidExpansion func()
 
 func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string) error {
+	return r.applyBulkPerRow(ctx, tx, s, sh, tableName, pkCols, false)
+}
+
+// applyBulkPerRowCreateCleanup is the authority-ordered variant used only for
+// an exact child-tombstone shape whose claimed workload guard already matched.
+// It must retract stale children even when their receiver-local clock is later
+// than the sender's new ownership claim. In that case it retains the later
+// local updated_at while applying deleted_at, so delayed live state cannot win
+// merely because cleanup regressed the row clock.
+func (r *Replicator) applyBulkPerRowCreateCleanup(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string) error {
+	return r.applyBulkPerRow(ctx, tx, s, sh, tableName, pkCols, true)
+}
+
+func (r *Replicator) applyBulkPerRow(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string, forceClaimedCleanup bool) error {
 	if len(pkCols) == 0 {
 		return invalidf("bulk update on %s has no known primary key", tableName)
 	}
@@ -1593,15 +1728,26 @@ func (r *Replicator) applyBulkPerRowLWW(ctx context.Context, tx *sql.Tx, s State
 	upd := "UPDATE " + tableName + " SET " + setSQL + " WHERE " + strings.Join(pkWhere, " AND ")
 	var changedPKs [][]interface{}
 	for _, m := range matches {
-		if r.client.skewQuarantinesIncoming(skewOn, m.localTS, incomingTS, now) {
-			continue
+		effectiveSetParams := setParams
+		if forceClaimedCleanup {
+			effectiveSetParams = append([]interface{}(nil), setParams...)
+			if sh.UpdatedAtParamIdx >= len(effectiveSetParams) {
+				return invalidf("create cleanup on %s has updated_at outside SET params", tableName)
+			}
+			if m.localTS != "" && lwwOrder(m.localTS, incomingTS) > 0 {
+				effectiveSetParams[sh.UpdatedAtParamIdx] = m.localTS
+			}
+		} else {
+			if r.client.skewQuarantinesIncoming(skewOn, m.localTS, incomingTS, now) {
+				continue
+			}
+			if m.localTS != "" && lwwOrder(m.localTS, incomingTS) >= 0 {
+				continue // local newer OR an exact tie → keep local (a bulk SET is a partial
+				// projection, not a full row image, so an equal-clock write must not overwrite)
+			}
 		}
-		if m.localTS != "" && lwwOrder(m.localTS, incomingTS) >= 0 {
-			continue // local newer OR an exact tie → keep local (a bulk SET is a partial
-			// projection, not a full row image, so an equal-clock write must not overwrite)
-		}
-		params := make([]interface{}, 0, len(setParams)+len(m.pk))
-		params = append(params, setParams...)
+		params := make([]interface{}, 0, len(effectiveSetParams)+len(m.pk))
+		params = append(params, effectiveSetParams...)
 		params = append(params, m.pk...)
 		res, execErr := tx.ExecContext(ctx, upd, params...)
 		if execErr != nil {

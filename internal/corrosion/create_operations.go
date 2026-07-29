@@ -10,6 +10,75 @@ import (
 	"strings"
 )
 
+const vmCreateBeginSQL = `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
+				cpu_actual, mem_actual, project, is_template, vm_owner_epoch,
+				spec_generation, active_operation_id, created_at, updated_at,
+				deleted_at, pending_action_id, hardware_adoption_state,
+				hardware_adoption_error)
+			 VALUES (?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			         NULL, '', 'pending', NULL)
+			 ON CONFLICT(name) DO UPDATE SET
+			   stack_name = excluded.stack_name,
+			   host_name = excluded.host_name,
+			   spec = excluded.spec,
+			   state = excluded.state,
+			   state_detail = excluded.state_detail,
+			   cpu_actual = excluded.cpu_actual,
+			   mem_actual = excluded.mem_actual,
+			   project = excluded.project,
+			   is_template = excluded.is_template,
+			   vm_owner_epoch = excluded.vm_owner_epoch,
+			   spec_generation = excluded.spec_generation,
+			   active_operation_id = excluded.active_operation_id,
+			   created_at = excluded.created_at,
+			   updated_at = excluded.updated_at,
+			   deleted_at = excluded.deleted_at,
+			   pending_action_id = excluded.pending_action_id,
+			   hardware_adoption_state = excluded.hardware_adoption_state,
+			   hardware_adoption_error = excluded.hardware_adoption_error
+			 WHERE vms.deleted_at IS NOT NULL
+			   AND excluded.vm_owner_epoch > vms.vm_owner_epoch
+			   AND excluded.spec_generation > vms.spec_generation`
+
+const containerCreateBeginSQL = `INSERT INTO containers
+			 (host_name, name, state, image, cpu_limit, memory_mib, labels,
+			  restart_policy, state_detail, project, is_template, on_host_failure,
+			  create_spec, relocate_token, owner_epoch, spec_generation,
+			  active_operation_id, created_at, updated_at, deleted_at)
+			 VALUES (?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+			 ON CONFLICT(host_name, name) DO UPDATE SET
+			   state = excluded.state,
+			   image = excluded.image,
+			   cpu_limit = excluded.cpu_limit,
+			   memory_mib = excluded.memory_mib,
+			   labels = excluded.labels,
+			   restart_policy = excluded.restart_policy,
+			   state_detail = excluded.state_detail,
+			   project = excluded.project,
+			   is_template = excluded.is_template,
+			   on_host_failure = excluded.on_host_failure,
+			   create_spec = excluded.create_spec,
+			   relocate_token = excluded.relocate_token,
+			   owner_epoch = excluded.owner_epoch,
+			   spec_generation = excluded.spec_generation,
+			   active_operation_id = excluded.active_operation_id,
+			   created_at = excluded.created_at,
+			   updated_at = excluded.updated_at,
+			   deleted_at = excluded.deleted_at
+			 WHERE containers.deleted_at IS NOT NULL
+			   AND excluded.owner_epoch > containers.owner_epoch
+			   AND excluded.spec_generation > containers.spec_generation`
+
+const (
+	vmInterfacesCreateCleanupSQL = `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
+	vmDisksCreateCleanupSQL      = `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
+	vmNICsCreateCleanupSQL       = `UPDATE vm_nics SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
+	vmPCIIntentCreateCleanupSQL  = `UPDATE vm_pci_intent SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
+	vmPCIRealCreateCleanupSQL    = `UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
+	containerCreateCleanupSQL    = `UPDATE container_interfaces SET deleted_at = ?, updated_at = ?
+			 WHERE host_name = ? AND ct_name = ?`
+)
+
 // BeginVMCreateOperation atomically persists a create claim, its capacity
 // reservation, and a provisional VM row. applied is true only for the first
 // successful claim; an identical retry returns false without changing state.
@@ -41,6 +110,7 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 	if err != nil {
 		return false, err
 	}
+	beginGuard := vmCreateBeginMutationGuard(op.ID, op.VMOwnerEpoch, vm)
 	claimedGuard := *provisionalGuard
 	claimedGuard.RequireOperation = true
 	now, wall := c.NowTS(), nowRFC3339()
@@ -55,25 +125,44 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 			}
 			return false, compareReservedStepInTx(ctx, tx, op.ID, op.VMOwnerEpoch, reservedFacts)
 		}
-		var n int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM vms WHERE name = ?`, vm.Name).Scan(&n); err != nil {
-			return false, err
-		}
-		return n == 0, nil
+		return c.mutationGuardMatches(ctx, tx, beginGuard)
 	}
 	stmts := []Statement{
 		{
-			SQL: `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
-				cpu_actual, mem_actual, project, is_template, vm_owner_epoch,
-				spec_generation, active_operation_id, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			SQL: vmCreateBeginSQL,
 			Params: []interface{}{
 				vm.Name, vm.StackName, vm.HostName, vm.Spec, vm.StateDetail,
 				vm.CPUActual, vm.MemActual, vm.Project, boolToInt(vm.IsTemplate),
 				vm.OwnerEpoch, vm.SpecGeneration, op.ID, wall, now,
 			},
+			Guard: beginGuard,
 		},
 		operationInsertStatement(op, wall, now, provisionalGuard),
+		{
+			SQL:    vmInterfacesCreateCleanupSQL,
+			Params: []interface{}{wall, now, vm.Name},
+			Guard:  &claimedGuard,
+		},
+		{
+			SQL:    vmDisksCreateCleanupSQL,
+			Params: []interface{}{wall, now, vm.Name},
+			Guard:  &claimedGuard,
+		},
+		{
+			SQL:    vmNICsCreateCleanupSQL,
+			Params: []interface{}{wall, now, vm.Name},
+			Guard:  &claimedGuard,
+		},
+		{
+			SQL:    vmPCIIntentCreateCleanupSQL,
+			Params: []interface{}{wall, now, vm.Name},
+			Guard:  &claimedGuard,
+		},
+		{
+			SQL:    vmPCIRealCreateCleanupSQL,
+			Params: []interface{}{wall, now, vm.Name},
+			Guard:  &claimedGuard,
+		},
 		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepPlanned, "", wall, now, &claimedGuard),
 		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepReserved, reservedFacts, wall, now, &claimedGuard),
 		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepDesiredPersisted, "", wall, now, &claimedGuard),
@@ -180,6 +269,7 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 	if err != nil {
 		return false, err
 	}
+	beginGuard := containerCreateBeginMutationGuard(op.ID, op.VMOwnerEpoch, ct, labels)
 	claimedGuard := *provisionalGuard
 	claimedGuard.RequireOperation = true
 	now, wall := c.NowTS(), nowRFC3339()
@@ -197,30 +287,25 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 			}
 			return false, compareContainerCreateRetryInTx(ctx, tx, op.ID, ct)
 		}
-		var n int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM containers WHERE host_name = ? AND name = ?`,
-			ct.HostName, ct.Name).Scan(&n); err != nil {
-			return false, err
-		}
-		return n == 0, nil
+		return c.mutationGuardMatches(ctx, tx, beginGuard)
 	}
 	return c.ExecuteBatchGuarded(ctx, guard, []Statement{
 		{
-			SQL: `INSERT INTO containers
-			 (host_name, name, state, image, cpu_limit, memory_mib, labels,
-			  restart_policy, state_detail, project, is_template, on_host_failure,
-			  create_spec, relocate_token, owner_epoch, spec_generation,
-			  active_operation_id, created_at, updated_at)
-			 VALUES (?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			SQL: containerCreateBeginSQL,
 			Params: []interface{}{
 				ct.HostName, ct.Name, ct.Image, ct.CPULimit, ct.MemMiB, labels,
 				ct.RestartPolicy, ct.StateDetail, ct.Project, boolToInt(ct.IsTemplate),
 				ct.OnHostFailure, ct.CreateSpec, ct.RelocateToken, ct.OwnerEpoch,
 				ct.SpecGeneration, op.ID, wall, now,
 			},
+			Guard: beginGuard,
 		},
 		operationInsertStatement(op, wall, now, provisionalGuard),
+		{
+			SQL:    containerCreateCleanupSQL,
+			Params: []interface{}{wall, now, ct.HostName, ct.Name},
+			Guard:  &claimedGuard,
+		},
 		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepPlanned, "", wall, now, &claimedGuard),
 		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepReserved, reservedFacts, wall, now, &claimedGuard),
 		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepDesiredPersisted, "", wall, now, &claimedGuard),

@@ -260,3 +260,122 @@ func TestSigning_AnUnreadableKeyStillPublishesTheContract(t *testing.T) {
 		t.Fatalf("an unsigned row from a host under contract was not reported: %+v", res)
 	}
 }
+
+// TestRollback_SigningItselfOffIsRecordedNotReportedAsTampering.
+//
+// enforcement.audit_signature is documented as a reversible kill switch, but the
+// published certificate is a cluster-wide declaration that this host's rows are
+// signed — and a config edit on one machine cannot silently revoke it. Left
+// standing, every row written after the rollback is reported as evidence on
+// every node, permanently, for what was a legitimate operator action.
+//
+// So the rollback signs for itself. That is exactly the distinction the verifier
+// needs and cannot otherwise make: a host that stopped deliberately still holds
+// its key and can say so; a host whose key was taken away cannot. Both stop
+// signing; only one can explain it.
+func TestRollback_SigningItselfOffIsRecordedNotReportedAsTampering(t *testing.T) {
+	ctx := context.Background()
+	const host = "node-0"
+	dir := auditPKIDir(t, host)
+	d := auditTestDaemon(t, dir, host)
+
+	// Signing on: a contract and some signed history.
+	if err := d.setupAuditSigning(ctx); err != nil {
+		t.Fatalf("setupAuditSigning: %v", err)
+	}
+	keyID := d.db.AuditKeyringOf().KeyID()
+	for _, id := range []string{"r1", "r2"} {
+		if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
+			ID: id, Username: "admin", HostName: host,
+			Action: "vm.create", Target: "vm1", Result: "success",
+			Timestamp: "2026-07-29T10:00:0" + id[1:] + "Z",
+		}); err != nil {
+			t.Fatalf("InsertAuditLog %s: %v", id, err)
+		}
+	}
+
+	// The operator turns the flag off and restarts.
+	d.retireOwnAuditKeyOnRollback(ctx)
+
+	if n := auditCount(t, d.db,
+		`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`, keyID); n != 1 {
+		t.Fatalf("turning signing off recorded no retirement (%d rows)\n"+
+			"the certificate is still live, so every row from here on is reported as "+
+			"tampering on every node — permanently, for a supported operator action", n)
+	}
+
+	// Rows written after the rollback are unsigned and must NOT be evidence.
+	d.db.SetAuditKeyring(mustVerifier(t, dir))
+	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
+		ID: "r3", Username: "admin", HostName: host,
+		Action: "vm.start", Target: "vm1", Result: "success",
+		Timestamp: "2026-07-29T10:00:03Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog after rollback: %v", err)
+	}
+	res, err := corrosion.VerifyAuditChain(ctx, d.db)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if res.Tampered() {
+		t.Fatalf("a signed rollback still reads as tampering: %+v\n"+
+			"the operator turned a documented kill switch off; the log must record that, "+
+			"not accuse them of editing it", res)
+	}
+	// The history the key DID sign stays verifiable — retirement is a window,
+	// never a deletion.
+	if len(res.UnknownKeyID) > 0 || res.RowsChecked != 3 {
+		t.Fatalf("rows signed before the rollback stopped verifying: %+v", res)
+	}
+}
+
+// TestRollback_WithoutTheKeyTheContractStaysInForce is the case the whole
+// distinction exists for. A host that cannot sign a retirement cannot claim to
+// have stopped deliberately — which is exactly the position an attacker who took
+// the key away puts it in.
+func TestRollback_WithoutTheKeyTheContractStaysInForce(t *testing.T) {
+	ctx := context.Background()
+	const host = "node-0"
+	dir := auditPKIDir(t, host)
+	d := auditTestDaemon(t, dir, host)
+	if err := d.setupAuditSigning(ctx); err != nil {
+		t.Fatalf("setupAuditSigning: %v", err)
+	}
+	keyID := d.db.AuditKeyringOf().KeyID()
+
+	// The key is taken away, then the flag goes off.
+	if err := os.WriteFile(filepath.Join(dir, "host.key"), []byte("not a key\n"), 0o600); err != nil {
+		t.Fatalf("corrupt the key: %v", err)
+	}
+	d.retireOwnAuditKeyOnRollback(ctx)
+
+	if n := auditCount(t, d.db,
+		`SELECT count(*) AS n FROM audit_key_retirements WHERE retired_key_id = ?`, keyID); n != 0 {
+		t.Fatalf("a host that cannot sign produced a retirement anyway\n" +
+			"then taking a host's key away would be a way to switch its contract off")
+	}
+	d.db.SetAuditKeyring(mustVerifier(t, dir))
+	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
+		ID: "r1", Username: "root", HostName: host,
+		Action: "vm.delete", Target: "prod-db", Result: "success",
+		Timestamp: "2026-07-29T10:00:01Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog: %v", err)
+	}
+	res, err := corrosion.VerifyAuditChain(ctx, d.db)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if len(res.UnsignedAfterSigned) == 0 {
+		t.Fatalf("a host whose key was removed went quiet without a finding: %+v", res)
+	}
+}
+
+func mustVerifier(t *testing.T, dir string) *corrosion.AuditKeyring {
+	t.Helper()
+	kr, err := corrosion.LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	return kr
+}

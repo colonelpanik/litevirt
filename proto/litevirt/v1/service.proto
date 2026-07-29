@@ -2128,6 +2128,7 @@ service LiteVirt {
     // an immutable tape vault.
     rpc VerifyAuditChain(google.protobuf.Empty)         returns (VerifyAuditChainResponse);
     rpc ExportAuditChain(ExportAuditChainRequest)       returns (ExportAuditChainResponse);
+    rpc RetireAuditKey(RetireAuditKeyRequest)           returns (RetireAuditKeyResponse);
 
     // ── tenancy ──
     // Projects are hierarchical buckets for VMs / volumes / etc.
@@ -2418,6 +2419,29 @@ message VerifyAuditChainResponse {
     // into the table — the cheapest forgery, since the content hash is unkeyed
     // — or written by a node that lost its key and kept going.
     repeated string unsigned_after_signed = 15;
+}
+
+// RetireAuditKey retires a host's audit signing key ON ITS BEHALF.
+//
+// The daemon signs its own retirement whenever an operator turns
+// enforcement.audit_signature off, so the routine rollback needs no RPC. This is
+// for a host that cannot speak for itself: its key is lost or unreadable, the
+// machine is gone, or it is being decommissioned. Left alone, such a host keeps
+// a published certificate declaring its rows are signed, and every unsigned row
+// it wrote is reported as evidence on every node with no way to close it out.
+//
+// Must be sent to the node holding the cluster CA private key: signing on
+// another host's behalf means minting a certificate with that host's CN, which
+// is precisely what holding the CA authorises.
+message RetireAuditKeyRequest {
+    string host_name = 1;
+}
+message RetireAuditKeyResponse {
+    // The key that was retired, and the sequence it was retired at. Rows the key
+    // signed up to there stay verifiable — retirement is a validity window, never
+    // a deletion.
+    string retired_key_id = 1;
+    int64  retired_at_seq = 2;
 }
 
 message ExportAuditChainRequest {

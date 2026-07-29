@@ -187,6 +187,22 @@ func loadHostTail(ctx context.Context, c *Client, hostName string, tail *chainTa
 	return nil
 }
 
+// HostTailSeq returns the highest sequence number hostName has issued, which is
+// the boundary a retirement is recorded at: everything up to here was written
+// under the key being retired.
+func HostTailSeq(ctx context.Context, c *Client, hostName string) (int64, error) {
+	c.auditChain.mu.Lock()
+	defer c.auditChain.mu.Unlock()
+	tail := c.auditChain.tail(hostName)
+	if !tail.known {
+		if err := loadHostTail(ctx, c, hostName, tail); err != nil {
+			return 0, err
+		}
+		tail.known = true
+	}
+	return tail.seq, nil
+}
+
 // HostHasSignedAuditRows reports whether hostName has written any signed row.
 //
 // It is the switch between repairing and verifying. A host whose chain is

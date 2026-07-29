@@ -235,6 +235,7 @@ const (
 	LiteVirt_PromoteReplica_FullMethodName             = "/litevirt.v1.LiteVirt/PromoteReplica"
 	LiteVirt_VerifyAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/VerifyAuditChain"
 	LiteVirt_ExportAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/ExportAuditChain"
+	LiteVirt_RetireAuditKey_FullMethodName             = "/litevirt.v1.LiteVirt/RetireAuditKey"
 	LiteVirt_CreateProject_FullMethodName              = "/litevirt.v1.LiteVirt/CreateProject"
 	LiteVirt_ListProjects_FullMethodName               = "/litevirt.v1.LiteVirt/ListProjects"
 	LiteVirt_GetProject_FullMethodName                 = "/litevirt.v1.LiteVirt/GetProject"
@@ -579,6 +580,7 @@ type LiteVirtClient interface {
 	// an immutable tape vault.
 	VerifyAuditChain(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VerifyAuditChainResponse, error)
 	ExportAuditChain(ctx context.Context, in *ExportAuditChainRequest, opts ...grpc.CallOption) (*ExportAuditChainResponse, error)
+	RetireAuditKey(ctx context.Context, in *RetireAuditKeyRequest, opts ...grpc.CallOption) (*RetireAuditKeyResponse, error)
 	// ── tenancy ──
 	// Projects are hierarchical buckets for VMs / volumes / etc.
 	// Quotas gate VM admission against (vcpu, mem, disk, nics).
@@ -3011,6 +3013,16 @@ func (c *liteVirtClient) ExportAuditChain(ctx context.Context, in *ExportAuditCh
 	return out, nil
 }
 
+func (c *liteVirtClient) RetireAuditKey(ctx context.Context, in *RetireAuditKeyRequest, opts ...grpc.CallOption) (*RetireAuditKeyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RetireAuditKeyResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RetireAuditKey_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CreateProject(ctx context.Context, in *CreateProjectRequest, opts ...grpc.CallOption) (*Project, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Project)
@@ -3443,6 +3455,7 @@ type LiteVirtServer interface {
 	// an immutable tape vault.
 	VerifyAuditChain(context.Context, *emptypb.Empty) (*VerifyAuditChainResponse, error)
 	ExportAuditChain(context.Context, *ExportAuditChainRequest) (*ExportAuditChainResponse, error)
+	RetireAuditKey(context.Context, *RetireAuditKeyRequest) (*RetireAuditKeyResponse, error)
 	// ── tenancy ──
 	// Projects are hierarchical buckets for VMs / volumes / etc.
 	// Quotas gate VM admission against (vcpu, mem, disk, nics).
@@ -4123,6 +4136,9 @@ func (UnimplementedLiteVirtServer) VerifyAuditChain(context.Context, *emptypb.Em
 }
 func (UnimplementedLiteVirtServer) ExportAuditChain(context.Context, *ExportAuditChainRequest) (*ExportAuditChainResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExportAuditChain not implemented")
+}
+func (UnimplementedLiteVirtServer) RetireAuditKey(context.Context, *RetireAuditKeyRequest) (*RetireAuditKeyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetireAuditKey not implemented")
 }
 func (UnimplementedLiteVirtServer) CreateProject(context.Context, *CreateProjectRequest) (*Project, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateProject not implemented")
@@ -7767,6 +7783,24 @@ func _LiteVirt_ExportAuditChain_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_RetireAuditKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RetireAuditKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RetireAuditKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RetireAuditKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RetireAuditKey(ctx, req.(*RetireAuditKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_CreateProject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateProjectRequest)
 	if err := dec(in); err != nil {
@@ -8677,6 +8711,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ExportAuditChain",
 			Handler:    _LiteVirt_ExportAuditChain_Handler,
+		},
+		{
+			MethodName: "RetireAuditKey",
+			Handler:    _LiteVirt_RetireAuditKey_Handler,
 		},
 		{
 			MethodName: "CreateProject",

@@ -88,11 +88,22 @@ type AuditKeyring struct {
 // a row's signature is only meaningful if the certificate that validates it
 // names the host the row claims to come from.
 func LoadAuditKeyring(pkiDir, hostName string) (*AuditKeyring, error) {
+	certPath, keyPath := auditSigningPaths(pkiDir)
+	return LoadAuditKeyringFromPaths(pkiDir, certPath, keyPath, hostName)
+}
+
+// LoadAuditKeyringFromPaths is LoadAuditKeyring with the identity read from an
+// explicit pair rather than the host's installed one.
+//
+// `lv host retire-audit-key` uses it to sign one assertion with a certificate
+// minted into a temp dir and destroyed immediately afterwards — the key is never
+// installed, because a second live copy of a host's signing identity is the
+// thing this whole feature exists to avoid.
+func LoadAuditKeyringFromPaths(pkiDir, certPath, keyPath, hostName string) (*AuditKeyring, error) {
 	k, err := loadAuditRoots(pkiDir)
 	if err != nil {
 		return nil, err
 	}
-	certPath, keyPath := auditSigningPaths(pkiDir)
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
 		return nil, fmt.Errorf("read audit signing cert: %w", err)

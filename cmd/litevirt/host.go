@@ -38,6 +38,7 @@ func newHostCmd() *cobra.Command {
 		newHostStatsCmd(),
 		newHostCephCmd(),
 		newHostRotateAuditKeyCmd(),
+		newHostRetireAuditKeyCmd(),
 	)
 
 	return cmd
@@ -646,6 +647,56 @@ because the signing keyring is loaded once at boot.
 	}
 	cmd.Flags().StringVar(&sshTarget, "ssh", "",
 		"SSH target for the host (default root@<host>) — needed when the litevirt host name is not the address you reach it on")
+	return cmd
+}
+
+// newHostRetireAuditKeyCmd ends a host's audit signing contract when the host
+// cannot end it itself.
+//
+// The daemon signs its own retirement whenever enforcement.audit_signature is
+// turned off, so an ordinary rollback needs no command at all. This is for a
+// host that has lost its key, is gone, or is being decommissioned.
+func newHostRetireAuditKeyCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "retire-audit-key <host>",
+		Short: "Retire a host's audit signing key on its behalf",
+		Long: `End a host's audit signing contract when the host cannot end it itself.
+
+Publishing a signing certificate declares that a host's audit rows are signed
+from that point on. A host that stops signing while that declaration stands has
+every unsigned row reported as tampering on every node — which is correct when
+someone took its key away, and wrong when the machine is simply gone.
+
+You do not need this for a normal rollback: turning enforcement.audit_signature
+off makes the daemon sign its own retirement on the next start. Use it when the
+host cannot sign one — key lost or unreadable, machine destroyed, decommission.
+
+Send it to the node holding the cluster CA private key (the one that ran
+'lv host init'): signing on another host's behalf means minting a certificate
+carrying that host's name, which is exactly what holding the CA authorises.
+
+Rows the retired key signed stay verifiable forever — retirement is a validity
+window, never a deletion.
+
+  lv host retire-audit-key host-b`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.RetireAuditKey(ctx, &pb.RetireAuditKeyRequest{HostName: args[0]})
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Retired %s's audit signing key %s at sequence %d\n",
+					args[0], resp.RetiredKeyId, resp.RetiredAtSeq)
+				fmt.Println("  rows it signed up to there stay verifiable; the certificate is kept")
+				fmt.Println("  rows above that sequence signed by that key are now reported as")
+				fmt.Println("  retired-key use on every node")
+				fmt.Println("  unsigned rows from this host are no longer treated as evidence")
+				fmt.Println("  Confirm with: lv audit verify")
+				return nil
+			})
+		},
+	}
 	return cmd
 }
 

@@ -525,3 +525,30 @@ func TestAuditEvidence_ATombstonedHeadStillDetectsTruncation(t *testing.T) {
 			"deleted_at must accomplish nothing at all", res)
 	}
 }
+
+// TestRetirement_CannotBeRecordedWithoutAKey.
+//
+// The last line of defence under both rollback paths. A retirement is what
+// distinguishes "this host stopped deliberately" from "someone took this host's
+// key away" — and the only thing that can make that distinction is whether a
+// signature could be produced. If an unsigned retirement could be written, then
+// removing a host's key would BE a way to end its signing contract, which is
+// exactly backwards.
+func TestRetirement_CannotBeRecordedWithoutAKey(t *testing.T) {
+	ctx := context.Background()
+	c, kr, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	verifier, err := LoadAuditVerifier(dir) // CA only: can verify, cannot sign
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	if err := RetireAuditKey(ctx, c, verifier, "node-0", kr.KeyID(), 1); err == nil {
+		t.Fatal("a retirement was recorded by a party that cannot sign one\n" +
+			"taking a host's key away would then be a way to end its signing contract")
+	}
+	if n := countRows(t, c,
+		`SELECT retired_key_id FROM audit_key_retirements WHERE retired_key_id = '`+kr.KeyID()+`'`); n != 0 {
+		t.Fatalf("an unsigned retirement row was written anyway (%d rows)", n)
+	}
+}

@@ -61,6 +61,57 @@ func (d *Daemon) setupAuditSigning(ctx context.Context) error {
 	return nil
 }
 
+// retireOwnAuditKeyOnRollback records a SIGNED retirement when this host is no
+// longer configured to sign but still has a live signing contract.
+//
+// Turning enforcement.audit_signature off is a supported operator action — the
+// docs call the flag a reversible kill switch — but the published certificate is
+// a cluster-wide declaration that this host's rows are signed, and a config edit
+// on one machine cannot silently revoke it. Left standing, every row the host
+// writes afterwards is reported as evidence on every node, permanently, for what
+// was a legitimate rollback.
+//
+// So the rollback signs for itself. That is the whole distinction the verifier
+// needs: a host that STOPPED deliberately still holds its key and can say so; a
+// host whose key was taken away cannot. Both stop signing, and only one leaves a
+// signature explaining it — which is also why an attacker cannot use this to go
+// quiet, since producing the retirement means holding the key and publishing a
+// permanent, replicated statement of when they stopped.
+func (d *Daemon) retireOwnAuditKeyOnRollback(ctx context.Context) {
+	keyring, err := corrosion.LoadAuditKeyring(d.cfg.PKIDir, d.cfg.HostName)
+	if err != nil {
+		// Cannot sign a retirement without the key. That is the case the contract
+		// is FOR, so it stays in force and the unsigned rows are reported.
+		slog.Warn("enforcement.audit_signature is off but this host's signing key cannot be "+
+			"loaded, so its retirement cannot be signed. Its published certificate stays "+
+			"live and its unsigned rows are reported as evidence — retire it from the CA "+
+			"node with `lv host retire-audit-key`", "host", d.cfg.HostName, "error", err)
+		return
+	}
+	active, ok, err := corrosion.ActiveAuditKeyID(ctx, d.db, keyring, d.cfg.HostName)
+	if err != nil {
+		slog.Warn("could not check this host's signing contract", "error", err)
+		return
+	}
+	if !ok || active != keyring.KeyID() {
+		return // no live contract for the key we hold; nothing to retire
+	}
+	seq, err := corrosion.HostTailSeq(ctx, d.db, d.cfg.HostName)
+	if err != nil {
+		slog.Warn("could not read this host's audit tail", "error", err)
+		return
+	}
+	if err := corrosion.RetireAuditKey(ctx, d.db, keyring, d.cfg.HostName, keyring.KeyID(), seq); err != nil {
+		slog.Error("could not record this host's audit signing rollback; its unsigned rows "+
+			"will be reported as evidence until it is retired", "error", err)
+		return
+	}
+	slog.Warn("enforcement.audit_signature is off: this host's signing key has been RETIRED at "+
+		"the sequence its chain had reached. Rows it wrote up to there stay verifiable; rows "+
+		"from here on are unsigned and are no longer treated as evidence",
+		"host", d.cfg.HostName, "key_id", keyring.KeyID(), "retired_at_seq", seq)
+}
+
 // shouldCompleteAuditKeyRotation reports whether a starting daemon must adopt a
 // dedicated audit signing pair even though it is not configured to sign.
 //

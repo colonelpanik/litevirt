@@ -156,6 +156,35 @@ altering any row the old key wrote contradicts a head whoever holds that key
 cannot forge. What it cannot do is repair a log that was already forged before
 anyone noticed — no scheme can.
 
+## Turning signing back off
+
+Publishing a signing certificate declares that a host's rows are signed from that
+point on. It is replicated and CA-signed, so a config edit on one machine cannot
+quietly revoke it — a host that stops signing while that declaration stands has
+every unsigned row reported as tampering on every node.
+
+That is correct when someone took the key away, and wrong when the operator
+simply changed their mind. The two are told apart by who can still sign:
+
+- **Ordinary rollback** — set `enforcement.audit_signature: false` and restart.
+  The daemon signs its own retirement at the sequence its chain had reached.
+  Rows up to there stay verifiable; rows after it are unsigned and are no longer
+  treated as evidence. No command needed.
+- **The host cannot sign one** — key lost or unreadable, machine destroyed,
+  decommission:
+
+```bash
+lv host retire-audit-key host-b
+```
+
+Run it against the node holding the cluster CA private key. Signing on another
+host's behalf means minting a certificate carrying that host's name, which is
+exactly what holding the CA authorises and nothing else does.
+
+An attacker cannot use either path to go quiet: producing a retirement means
+holding the key and publishing a permanent, replicated statement of when signing
+stopped.
+
 Rows signed by the retired key **stay verifiable forever**. The retired
 certificate is marked retired, never deleted, so `lv audit verify` can still
 resolve it — deleting it would make every row it signed unverifiable, and a

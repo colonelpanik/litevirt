@@ -312,12 +312,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Error("audit signing could not be enabled; rows will be written unsigned",
 				"error", err)
 		}
-	} else if shouldCompleteAuditKeyRotation(d.cfg) {
-		if err := d.completeAuditKeyRotation(ctx); err != nil {
-			slog.Error("a dedicated audit signing key is installed but could not be adopted; "+
-				"the key it replaced has NOT been retired and the history it wrote is NOT sealed",
-				"error", err)
+	} else {
+		if shouldCompleteAuditKeyRotation(d.cfg) {
+			if err := d.completeAuditKeyRotation(ctx); err != nil {
+				slog.Error("a dedicated audit signing key is installed but could not be adopted; "+
+					"the key it replaced has NOT been retired and the history it wrote is NOT sealed",
+					"error", err)
+			}
 		}
+		// The flag is off. If this host still has a live signing contract, record
+		// a signed retirement so the rollback is an explicit, dated fact rather
+		// than a permanent tamper verdict on every node.
+		d.retireOwnAuditKeyOnRollback(ctx)
 	}
 
 	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is

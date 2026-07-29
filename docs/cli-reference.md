@@ -97,6 +97,7 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
   --host <name>         # Target host (auto-placed if omitted)
+  --project <name>      # Tenancy project to create in (default _default); charges its quota
   --secure-boot         # UEFI Secure Boot (MS keys; q35 + UEFI). Windows 11 ready
   --tpm                 # Attach a TPM 2.0 emulator (vTPM) — required for Win11/BitLocker
 

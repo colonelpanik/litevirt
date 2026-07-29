@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -59,27 +61,49 @@ type reservationLease struct {
 	quotaLease   string
 }
 
+// releaseTimeout bounds the detached release below. Long enough to absorb a brief
+// DB or peer stall, short enough that a shutdown is not held up by a lease whose
+// capacity the stale-lease sweep would collect anyway.
+const releaseTimeout = 10 * time.Second
+
 // release marks the reservation's operation terminal, freeing the capacity.
 // Idempotent, and safe on the empty lease returned for a no-op admission.
+//
+// It runs on a bounded DETACHED context, NOT the caller's. A release is cleanup,
+// and cleanup that only happens while the caller is still listening is not
+// cleanup. The case that proves it is a streaming migrate: it holds the lease
+// across the whole transfer and releases it with defer, and by then the stream
+// context is routinely already cancelled — the client has its result and has hung
+// up. On the lab, a perfectly successful migration left its reservation open, so
+// the target held 1536 MiB against nothing until the stale-lease sweep collected
+// it up to an hour later. finalizeMigrationOwnership detaches its own commit for
+// exactly this reason and says so; this sat beside it with the same exposure.
 func (l *reservationLease) release(ctx context.Context) {
 	if l == nil || l.s == nil {
 		return
 	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+
 	if id := l.quotaLease; id != "" {
 		l.quotaLease = ""
-		l.s.releaseProjectQuota(ctx, l.quotaHolder, l.quotaProject, id)
+		l.s.releaseProjectQuota(rctx, l.quotaHolder, l.quotaProject, id)
 	}
 	if l.id == "" {
 		return
 	}
 	id := l.id
 	l.id = ""
-	if err := corrosion.AppendOperationStep(ctx, l.s.db, corrosion.OperationStepRecord{
+	if err := corrosion.AppendOperationStep(rctx, l.s.db, corrosion.OperationStepRecord{
 		OperationID: id, StepName: corrosion.OpStepCompleted,
 	}); err != nil {
-		// A failed release leaks the reservation until the operation ages out.
-		// Surfaced rather than swallowed: it shows up later as capacity pressure
-		// with no workload behind it, which is miserable to diagnose from scratch.
+		// A failed release leaks the reservation until the sweep ages it out. Log
+		// it as well as counting it: noteStateWriteFail only feeds a metric, and a
+		// silent leak shows up later as capacity pressure with no workload behind
+		// it — which is miserable to diagnose from scratch. The lab leak above was
+		// invisible in the journal for precisely this reason.
+		slog.Error("capacity reservation was not released; the host will hold it until the "+
+			"stale-lease sweep collects it", "operation", id, "error", err)
 		l.s.noteStateWriteFail(string(corrosion.OpResourceUpdateRunning), err)
 	}
 }

@@ -186,17 +186,20 @@ func ledgerSafetyMismatch(want, got corrosion.LedgerEntry) string {
 // dispIdent / catIdent map a derived disposition/category back to its Go identifier so the
 // generated ledger references the exported constants rather than opaque string values.
 var dispIdent = map[corrosion.Disposition]string{
-	corrosion.DispPlainInsert:         "DispPlainInsert",
-	corrosion.DispExplicitUpsert:      "DispExplicitUpsert",
-	corrosion.DispFullPKUpdate:        "DispFullPKUpdate",
-	corrosion.DispFullPKUpdateNoClock: "DispFullPKUpdateNoClock",
-	corrosion.DispBulkUpdate:          "DispBulkUpdate",
-	corrosion.DispDeleteRetention:     "DispDeleteRetention",
-	corrosion.DispAppendOnly:          "DispAppendOnly",
-	corrosion.DispCustomMerge:         "DispCustomMerge",
-	corrosion.DispCreateBegin:         "DispCreateBegin",
-	corrosion.DispReject:              "DispReject",
-	corrosion.DispCanonicalRegistry:   "DispCanonicalRegistry",
+	corrosion.DispPlainInsert:          "DispPlainInsert",
+	corrosion.DispExplicitUpsert:       "DispExplicitUpsert",
+	corrosion.DispFullPKUpdate:         "DispFullPKUpdate",
+	corrosion.DispFullPKUpdateNoClock:  "DispFullPKUpdateNoClock",
+	corrosion.DispBulkUpdate:           "DispBulkUpdate",
+	corrosion.DispDeleteRetention:      "DispDeleteRetention",
+	corrosion.DispAppendOnly:           "DispAppendOnly",
+	corrosion.DispCustomMerge:          "DispCustomMerge",
+	corrosion.DispCreateBegin:          "DispCreateBegin",
+	corrosion.DispGuardedTransition:    "DispGuardedTransition",
+	corrosion.DispWorkloadDelete:       "DispWorkloadDelete",
+	corrosion.DispLegacyWorkloadDelete: "DispLegacyWorkloadDelete",
+	corrosion.DispReject:               "DispReject",
+	corrosion.DispCanonicalRegistry:    "DispCanonicalRegistry",
 }
 
 var catIdent = map[corrosion.ConcurrencyCategory]string{

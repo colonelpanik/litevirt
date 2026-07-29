@@ -30,11 +30,21 @@ type operationMergeAuthority struct {
 	valid bool
 }
 
+type mergeAuthorityDecision uint8
+
+const (
+	mergeAuthorityNormal mergeAuthorityDecision = iota
+	mergeAuthorityKeepLocal
+	mergeAuthorityApplyIncoming
+	mergeAuthorityApplyIncomingAndSweep
+)
+
 var vmAuthorityChildTables = map[string]bool{
-	"vm_interfaces": true,
-	"vm_disks":      true,
-	"vm_nics":       true,
-	"vm_pci_intent": true,
+	"vm_interfaces":       true,
+	"vm_disks":            true,
+	"vm_nics":             true,
+	"vm_pci_intent":       true,
+	"vm_pci_realizations": true,
 }
 
 // authorityOrderedMergeTables derives one immutable manifest before any row is
@@ -59,7 +69,7 @@ func mergeDependencyRank(table string) int {
 	case "operations":
 		return 1
 	case "vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent",
-		"container_interfaces", "operation_steps":
+		"vm_pci_realizations", "container_interfaces", "operation_steps":
 		return 3
 	default:
 		return 2
@@ -249,40 +259,170 @@ func coerceInt64OK(v interface{}) (int64, bool) {
 	}
 }
 
-func (c *Client) antiEntropyAuthorityKeepsLocal(tx *sql.Tx, table syncTable, row []interface{}) (bool, error) {
+func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuthorityDecision, error) {
 	m := table.authority
 	if m == nil {
-		return false, nil
+		return mergeAuthorityNormal, nil
 	}
 	switch {
-	case vmAuthorityChildTables[table.Name]:
-		idx := indexOf(table.Columns, "vm_name")
+	case table.Name == "vms":
+		idx := indexOf(table.Columns, "name")
 		if idx < 0 {
-			return true, nil
+			return mergeAuthorityKeepLocal, nil
 		}
 		a, ok := m.vms[coerceString(row[idx])]
-		if !ok || !a.valid || a.deleted || provisionalWorkloadBarrier(a) {
-			return true, nil
+		if !ok {
+			// A pre-authority sender omits owner/generation columns entirely;
+			// preserve its historical column-preserving LWW behavior.
+			return mergeAuthorityNormal, nil
 		}
-		matches, err := localWorkloadMatchesMergeAuthority(tx, a)
-		return !matches, err
-	case table.Name == "container_interfaces":
-		hostIdx, nameIdx := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "ct_name")
+		if !a.valid {
+			return mergeAuthorityKeepLocal, nil
+		}
+		return workloadParentAuthorityDecision(tx, a)
+	case table.Name == "containers":
+		hostIdx, nameIdx := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "name")
 		if hostIdx < 0 || nameIdx < 0 {
-			return true, nil
+			return mergeAuthorityKeepLocal, nil
 		}
 		key := containerCreateDesiredRef(coerceString(row[hostIdx]), coerceString(row[nameIdx]))
 		a, ok := m.containers[key]
-		if !ok || !a.valid || a.deleted || provisionalWorkloadBarrier(a) {
-			return true, nil
+		if !ok {
+			return mergeAuthorityNormal, nil
+		}
+		if !a.valid {
+			return mergeAuthorityKeepLocal, nil
+		}
+		return workloadParentAuthorityDecision(tx, a)
+	case vmAuthorityChildTables[table.Name]:
+		idx := indexOf(table.Columns, "vm_name")
+		if idx < 0 {
+			return mergeAuthorityKeepLocal, nil
+		}
+		a, ok := m.vms[coerceString(row[idx])]
+		if !ok || !a.valid || provisionalWorkloadBarrier(a) ||
+			a.deleted && !mergeRowIsDeleted(table, row) {
+			return mergeAuthorityKeepLocal, nil
 		}
 		matches, err := localWorkloadMatchesMergeAuthority(tx, a)
-		return !matches, err
+		if !matches {
+			return mergeAuthorityKeepLocal, err
+		}
+		return mergeAuthorityNormal, err
+	case table.Name == "container_interfaces":
+		hostIdx, nameIdx := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "ct_name")
+		if hostIdx < 0 || nameIdx < 0 {
+			return mergeAuthorityKeepLocal, nil
+		}
+		key := containerCreateDesiredRef(coerceString(row[hostIdx]), coerceString(row[nameIdx]))
+		a, ok := m.containers[key]
+		if !ok || !a.valid || provisionalWorkloadBarrier(a) ||
+			a.deleted && !mergeRowIsDeleted(table, row) {
+			return mergeAuthorityKeepLocal, nil
+		}
+		matches, err := localWorkloadMatchesMergeAuthority(tx, a)
+		if !matches {
+			return mergeAuthorityKeepLocal, err
+		}
+		return mergeAuthorityNormal, err
 	case table.Name == "operation_steps":
-		return c.operationStepAuthorityKeepsLocal(tx, table, row, m)
+		keep, err := c.operationStepAuthorityKeepsLocal(tx, table, row, m)
+		if keep {
+			return mergeAuthorityKeepLocal, err
+		}
+		return mergeAuthorityNormal, err
 	default:
-		return false, nil
+		return mergeAuthorityNormal, nil
 	}
+}
+
+func mergeRowIsDeleted(table syncTable, row []interface{}) bool {
+	idx := indexOf(table.Columns, "deleted_at")
+	return idx >= 0 && idx < len(row) && cellNonEmpty(row[idx])
+}
+
+func workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMergeAuthority) (mergeAuthorityDecision, error) {
+	var localOwner, localGeneration int64
+	var err error
+	switch incoming.kind {
+	case "vm":
+		err = tx.QueryRow(`SELECT vm_owner_epoch, spec_generation FROM vms WHERE name = ?`,
+			incoming.name).Scan(&localOwner, &localGeneration)
+	case "container":
+		err = tx.QueryRow(`SELECT owner_epoch, spec_generation FROM containers
+			WHERE host_name = ? AND name = ?`, incoming.host, incoming.name).
+			Scan(&localOwner, &localGeneration)
+	default:
+		return mergeAuthorityKeepLocal, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		if incoming.deleted {
+			return mergeAuthorityApplyIncomingAndSweep, nil
+		}
+		return mergeAuthorityNormal, nil
+	}
+	if err != nil {
+		return mergeAuthorityKeepLocal, err
+	}
+	switch {
+	case localOwner == incoming.ownerEpoch && localGeneration == incoming.generation:
+		if incoming.deleted {
+			return mergeAuthorityApplyIncomingAndSweep, nil
+		}
+		return mergeAuthorityNormal, nil
+	case incoming.ownerEpoch >= localOwner && incoming.generation >= localGeneration:
+		if incoming.deleted {
+			return mergeAuthorityApplyIncomingAndSweep, nil
+		}
+		return mergeAuthorityApplyIncoming, nil
+	case localOwner >= incoming.ownerEpoch && localGeneration >= incoming.generation:
+		return mergeAuthorityKeepLocal, nil
+	default:
+		// Crossed authority axes are not comparable. Fail closed rather than
+		// allowing a timestamp to choose an ABA-sensitive workload identity.
+		return mergeAuthorityKeepLocal, nil
+	}
+}
+
+func antiEntropySweepDeletedWorkloadChildren(
+	tx *sql.Tx, table syncTable, row []interface{}, deletedAt, now string,
+) error {
+	deletedIdx, updatedIdx := indexOf(table.Columns, "deleted_at"), indexOf(table.Columns, "updated_at")
+	if deletedIdx < 0 || updatedIdx < 0 || deletedAt == "" || now == "" {
+		return invalidf("authority sweep requires a deleted workload parent")
+	}
+	switch table.Name {
+	case "vms":
+		nameIdx := indexOf(table.Columns, "name")
+		if nameIdx < 0 {
+			return invalidf("VM authority sweep missing name")
+		}
+		for _, child := range []string{
+			"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent", "vm_pci_realizations",
+		} {
+			if _, err := tx.Exec(
+				`UPDATE `+child+` SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`,
+				deletedAt, now, row[nameIdx],
+			); err != nil {
+				return fmt.Errorf("anti-entropy sweep %s: %w", child, err)
+			}
+		}
+	case "containers":
+		hostIdx, nameIdx := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "name")
+		if hostIdx < 0 || nameIdx < 0 {
+			return invalidf("container authority sweep missing identity")
+		}
+		if _, err := tx.Exec(
+			`UPDATE container_interfaces SET deleted_at = ?, updated_at = ?
+			 WHERE host_name = ? AND ct_name = ?`,
+			deletedAt, now, row[hostIdx], row[nameIdx],
+		); err != nil {
+			return fmt.Errorf("anti-entropy sweep container interfaces: %w", err)
+		}
+	default:
+		return invalidf("authority sweep on unexpected table %s", table.Name)
+	}
+	return nil
 }
 
 func provisionalWorkloadBarrier(a workloadMergeAuthority) bool {

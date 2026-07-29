@@ -797,11 +797,29 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 	}
 	var mutated []Statement
 	for _, s := range stmts {
+		if s.Guard != nil {
+			matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
+			if err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, fmt.Errorf("statement guard: %w", err)
+			}
+			if !matches {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, nil
+			}
+		}
 		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return false, fmt.Errorf("exec guarded batch: %w", err)
+		}
+		if isGuardedTransitionSQL(s.SQL) && !rowsChanged(res) {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, invalidf("guarded workload transition matched authority but changed no row")
 		}
 		if n, e := res.RowsAffected(); e == nil && n > 0 {
 			mutated = append(mutated, s)
@@ -837,6 +855,19 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 	}
 	c.notifyReplicator()
 	return true, nil
+}
+
+func isGuardedTransitionSQL(sql string) bool {
+	fp, err := FingerprintSQL(sql)
+	if err != nil {
+		return false
+	}
+	return fp == mustStatementFingerprint(vmCreateCommitSQL) ||
+		fp == mustStatementFingerprint(vmCreateRollbackSQL) ||
+		fp == mustStatementFingerprint(containerCreateCommitSQL) ||
+		fp == mustStatementFingerprint(containerCreateRollbackSQL) ||
+		fp == mustStatementFingerprint(vmDeleteSQL) ||
+		fp == mustStatementFingerprint(containerDeleteSQL)
 }
 
 func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify bool) (int64, error) {

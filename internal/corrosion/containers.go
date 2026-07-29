@@ -586,11 +586,31 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 // "container vanished from gossip" can be distinguished from "host
 // crashed and we just haven't heard yet" in audit views.
 func DeleteContainer(ctx context.Context, c *Client, hostName, name string) error {
+	_, err := deleteContainerGuarded(ctx, c, hostName, name)
+	return err
+}
+
+func deleteContainerGuarded(ctx context.Context, c *Client, hostName, name string) (bool, error) {
+	ct, err := GetContainer(ctx, c, hostName, name)
+	if err != nil || ct == nil {
+		return false, err
+	}
+	guard, err := containerDeleteMutationGuard(*ct)
+	if err != nil {
+		return false, err
+	}
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE containers SET deleted_at = ?, updated_at = ?
-		 WHERE host_name = ? AND name = ?`,
-		nowRFC3339(), now, hostName, name)
+	wall := nowRFC3339()
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		return c.mutationGuardMatches(ctx, tx, guard)
+	}, []Statement{
+		// Fence managed interfaces while the matching parent is still live,
+		// then tombstone the parent last as the semantic barrier.
+		{SQL: containerCreateCleanupSQL, Params: []interface{}{wall, now, hostName, name}, Guard: guard},
+		{SQL: containerDeleteSQL, Params: []interface{}{
+			wall, now, hostName, name, ct.OwnerEpoch, ct.SpecGeneration,
+		}, Guard: guard},
+	})
 }
 
 // DeleteContainerStrict soft-deletes a LIVE row (WHERE deleted_at IS NULL) and
@@ -600,15 +620,11 @@ func DeleteContainer(ctx context.Context, c *Client, hostName, name string) erro
 // caller can treat as success. (Plain DeleteContainer lacks the deleted_at guard,
 // so it would "affect one row" re-deleting a tombstone and hide that case.)
 func DeleteContainerStrict(ctx context.Context, c *Client, hostName, name string) error {
-	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
-		`UPDATE containers SET deleted_at = ?, updated_at = ?
-		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-		nowRFC3339(), now, hostName, name)
+	applied, err := deleteContainerGuarded(ctx, c, hostName, name)
 	if err != nil {
 		return err
 	}
-	if n == 0 {
+	if !applied {
 		return ErrNoRowsAffected
 	}
 	return nil

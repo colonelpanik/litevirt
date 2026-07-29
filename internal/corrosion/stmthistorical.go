@@ -91,6 +91,13 @@ func HistoricalShapes() []HistoricalShape {
 	// and routing columns. Keep the v1.3.0 shapes accepted for the supported
 	// rolling-upgrade/WAL-retention horizon; receiver-only v44 columns retain
 	// their defaults or existing values through the column-preserving apply.
+	add(`INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
+				cpu_actual, mem_actual, project, is_template, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "insert_vm_pre_authority")
+	// Workload deletes became owner/generation guarded. Older retained WAL
+	// entries remain valid ordinary LWW tombstones during the support horizon.
+	add(legacyVMDeleteSQL, "delete_vm_pre_authority")
+	add(legacyContainerDeleteSQL, "delete_container_pre_authority")
 	add(`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET

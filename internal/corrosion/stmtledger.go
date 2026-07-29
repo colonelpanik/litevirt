@@ -31,6 +31,19 @@ const (
 	// Their owner/generation WHERE is the ordering rule; an unrelated receiver
 	// clock must not override that semantic ABA fence.
 	DispCreateBegin Disposition = "create_begin"
+	// DispGuardedTransition applies an exact, authority-guarded workload
+	// terminal transition verbatim. The workload guard is the ordering rule;
+	// unrelated receiver clocks must not split the transition from the
+	// hardware/journal statements earlier in the same transaction.
+	DispGuardedTransition Disposition = "guarded_transition"
+	// DispWorkloadDelete applies an exact authority-fenced parent tombstone
+	// verbatim. The workload owner/generation guard prevents delayed deletes
+	// from crossing a recreate epoch; equal-authority deletes remain valid.
+	DispWorkloadDelete Disposition = "workload_delete"
+	// DispLegacyWorkloadDelete accepts retained pre-authority delete shapes only
+	// for rows whose owner/generation axes are still both zero. The old wire
+	// shape cannot prove authority, so it must never cross into a v44 identity.
+	DispLegacyWorkloadDelete Disposition = "legacy_workload_delete"
 	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
 	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
 	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.

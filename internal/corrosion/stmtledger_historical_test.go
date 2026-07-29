@@ -25,8 +25,10 @@ import (
 // Their v1.3.0 shapes were ADDED to the historical families rather than dropped,
 // so supported peers and retained WAL continue to apply. No existing historical
 // identity was removed or changed. The immediate schema-v43 InsertHost shape was
-// subsequently added after v44 appended capacity_policy_hash.
-const compatibilityDigest = "0a988af828aae56f316eb53c296bc0bb3ee8c882b204dd8cd9a03f70281223af"
+// subsequently added after v44 appended capacity_policy_hash. The authority-
+// fenced workload writers also retain their immediately preceding VM insert and
+// VM/container delete shapes for rolling upgrades and retained WAL.
+const compatibilityDigest = "a42525c2f8808b01b88b119d2be312c45944ee0a8b55819e0bcdf61531592262"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -77,6 +79,9 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"containers_upsert_v130":          1,   // pre-v44 container upsert without lifecycle fencing columns
 	"containers_rekey_v130":           1,   // pre-v44 container re-key without lifecycle fencing columns
 	"notification_routes_insert_v130": 1,   // pre-v44 route insert without subject/project selectors
+	"insert_vm_pre_authority":         1,   // VM insert before owner/generation columns were carried
+	"delete_vm_pre_authority":         1,   // VM tombstone before authority guard columns
+	"delete_container_pre_authority":  1,   // container tombstone before authority guard columns
 	"pci_release_by_vm_v130":          1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
 }
 

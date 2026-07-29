@@ -27,6 +27,17 @@ var sanctionedSpecWriters = map[string]string{
 	"MutateDesiredSpec":         "THE sanctioned desired-spec writer",
 	"UpdateObservedActuals":     "THE sanctioned cpu_actual/mem_actual writer",
 	"migrateVMSpecNetworkNames": "one-time schema migration, runs before serving (no barrier to honor)",
+	"isGuardedTransitionSQL":    "fingerprints audited transition constants; it does not execute a write",
+	"validateGuardedTransitionStatement": "validates replicated transition params against their guard; " +
+		"it does not execute a write",
+	"validateGuardedMutationEntry": "fingerprints the final guarded transition to validate batch protocol completeness; " +
+		"it does not execute a write",
+	"guardedEntryRoleAllowed": "fingerprints audited guarded-entry roles to reject statement smuggling; " +
+		"it does not execute a write",
+	"validateGuardedCreateBeginEntry": "fingerprints the exact create-begin batch envelope; " +
+		"it does not execute a write",
+	"HistoricalShapes": "enumerates retained SQL strings for compatibility-ledger generation; " +
+		"it does not execute a write",
 }
 
 // TestSpecWritersAreSanctioned fails if any function in the corrosion package

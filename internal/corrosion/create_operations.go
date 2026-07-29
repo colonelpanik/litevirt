@@ -70,6 +70,23 @@ const containerCreateBeginSQL = `INSERT INTO containers
 			   AND excluded.spec_generation > containers.spec_generation`
 
 const (
+	vmCreateCommitSQL = `UPDATE vms SET state = 'running', state_detail = ?,
+				cpu_actual = ?, mem_actual = ?,
+				hardware_adoption_state = 'adopted', hardware_adoption_error = NULL,
+				active_operation_id = '', updated_at = ?
+			 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
+			   AND vm_owner_epoch = ? AND spec_generation = ? AND deleted_at IS NULL`
+	vmCreateRollbackSQL = `UPDATE vms SET active_operation_id = '', deleted_at = ?, updated_at = ?
+			 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
+			   AND vm_owner_epoch = ? AND deleted_at IS NULL`
+	containerCreateCommitSQL = `UPDATE containers SET state = 'running', state_detail = ?,
+				active_operation_id = '', updated_at = ?
+			 WHERE host_name = ? AND name = ? AND state = 'creating'
+			   AND active_operation_id = ? AND owner_epoch = ? AND spec_generation = ?
+			   AND deleted_at IS NULL`
+	containerCreateRollbackSQL = `UPDATE containers SET active_operation_id = '', deleted_at = ?, updated_at = ?
+			 WHERE host_name = ? AND name = ? AND state = 'creating'
+			   AND active_operation_id = ? AND owner_epoch = ? AND deleted_at IS NULL`
 	vmInterfacesCreateCleanupSQL = `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
 	vmDisksCreateCleanupSQL      = `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
 	vmNICsCreateCleanupSQL       = `UPDATE vm_nics SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
@@ -77,6 +94,9 @@ const (
 	vmPCIRealCreateCleanupSQL    = `UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`
 	containerCreateCleanupSQL    = `UPDATE container_interfaces SET deleted_at = ?, updated_at = ?
 			 WHERE host_name = ? AND ct_name = ?`
+	containerCreateInterfaceSQL = `INSERT OR REPLACE INTO container_interfaces
+			 (host_name, ct_name, network_name, ordinal, mac, ip, veth_device, security_groups, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
 )
 
 // BeginVMCreateOperation atomically persists a create claim, its capacity
@@ -102,6 +122,9 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 	if err := validateReservationProject(op.ReservationJSON, op.Project); err != nil {
 		return false, err
 	}
+	if err := validateCreateReservationBinding(op.ReservationJSON, vm.HostName); err != nil {
+		return false, err
+	}
 	reservedFacts, err := reservationStepFacts(op.ReservationFacts, op.Project)
 	if err != nil {
 		return false, err
@@ -123,7 +146,10 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 			if err := compareOperationClaim(*existing, op); err != nil {
 				return false, err
 			}
-			return false, compareReservedStepInTx(ctx, tx, op.ID, op.VMOwnerEpoch, reservedFacts)
+			if err := compareReservedStepInTx(ctx, tx, op.ID, op.VMOwnerEpoch, reservedFacts); err != nil {
+				return false, err
+			}
+			return false, compareVMCreateRetryInTx(ctx, tx, vm)
 		}
 		return c.mutationGuardMatches(ctx, tx, beginGuard)
 	}
@@ -193,12 +219,7 @@ func (c *Client) CommitVMCreateOperation(ctx context.Context, opID string, owner
 		operationStepInsertStatement(opID, ownerEpoch, OpStepObserved, "", wall, now, commitGuard),
 		operationStepInsertStatement(opID, ownerEpoch, OpStepCompleted, "", wall, now, commitGuard),
 		Statement{
-			SQL: `UPDATE vms SET state = 'running', state_detail = ?,
-				cpu_actual = ?, mem_actual = ?,
-				hardware_adoption_state = 'adopted', hardware_adoption_error = NULL,
-				active_operation_id = '', updated_at = ?
-			 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
-			   AND vm_owner_epoch = ? AND spec_generation = ? AND deleted_at IS NULL`,
+			SQL: vmCreateCommitSQL,
 			Params: []interface{}{
 				vm.StateDetail, vm.CPUActual, vm.MemActual, now, vm.Name, opID,
 				ownerEpoch, vm.SpecGeneration,
@@ -222,9 +243,7 @@ func (c *Client) RollbackVMCreateOperation(ctx context.Context, name, opID strin
 		operationStepInsertStatement(opID, ownerEpoch, OpStepRollbackCompleted, facts, wall, now, rollbackGuard),
 		operationStepInsertStatement(opID, ownerEpoch, OpStepFailed, facts, wall, now, rollbackGuard),
 		Statement{
-			SQL: `UPDATE vms SET active_operation_id = '', deleted_at = ?, updated_at = ?
-			 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
-			   AND vm_owner_epoch = ? AND deleted_at IS NULL`,
+			SQL:    vmCreateRollbackSQL,
 			Params: []interface{}{wall, now, name, opID, ownerEpoch},
 			Guard:  rollbackGuard,
 		},
@@ -257,6 +276,9 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 	if err := validateReservationProject(op.ReservationJSON, op.Project); err != nil {
 		return false, err
 	}
+	if err := validateCreateReservationBinding(op.ReservationJSON, ct.HostName); err != nil {
+		return false, err
+	}
 	reservedFacts, err := reservationStepFacts(op.ReservationFacts, op.Project)
 	if err != nil {
 		return false, err
@@ -285,7 +307,7 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 			if err := compareReservedStepInTx(ctx, tx, op.ID, op.VMOwnerEpoch, reservedFacts); err != nil {
 				return false, err
 			}
-			return false, compareContainerCreateRetryInTx(ctx, tx, op.ID, ct)
+			return false, compareContainerCreateRetryInTx(ctx, tx, ct, labels)
 		}
 		return c.mutationGuardMatches(ctx, tx, beginGuard)
 	}
@@ -331,9 +353,7 @@ func (c *Client) CommitContainerCreateOperation(ctx context.Context, opID string
 			return false, err
 		}
 		stmts = append(stmts, Statement{
-			SQL: `INSERT OR REPLACE INTO container_interfaces
-			 (host_name, ct_name, network_name, ordinal, mac, ip, veth_device, security_groups, updated_at, deleted_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			SQL: containerCreateInterfaceSQL,
 			Params: []interface{}{
 				ifc.HostName, ifc.CtName, ifc.NetworkName, ifc.Ordinal, ifc.MAC,
 				ifc.IP, ifc.VethDevice, sgs, now,
@@ -347,11 +367,7 @@ func (c *Client) CommitContainerCreateOperation(ctx context.Context, opID string
 		operationStepInsertStatement(opID, ownerEpoch, OpStepObserved, "", wall, now, commitGuard),
 		operationStepInsertStatement(opID, ownerEpoch, OpStepCompleted, "", wall, now, commitGuard),
 		Statement{
-			SQL: `UPDATE containers SET state = 'running', state_detail = ?,
-				active_operation_id = '', updated_at = ?
-			 WHERE host_name = ? AND name = ? AND state = 'creating'
-			   AND active_operation_id = ? AND owner_epoch = ? AND spec_generation = ?
-			   AND deleted_at IS NULL`,
+			SQL: containerCreateCommitSQL,
 			Params: []interface{}{
 				ct.StateDetail, now, ct.HostName, ct.Name, opID, ownerEpoch, ct.SpecGeneration,
 			},
@@ -373,9 +389,7 @@ func (c *Client) RollbackContainerCreateOperation(ctx context.Context, hostName,
 		operationStepInsertStatement(opID, ownerEpoch, OpStepRollbackCompleted, facts, wall, now, rollbackGuard),
 		operationStepInsertStatement(opID, ownerEpoch, OpStepFailed, facts, wall, now, rollbackGuard),
 		Statement{
-			SQL: `UPDATE containers SET active_operation_id = '', deleted_at = ?, updated_at = ?
-			 WHERE host_name = ? AND name = ? AND state = 'creating'
-			   AND active_operation_id = ? AND owner_epoch = ? AND deleted_at IS NULL`,
+			SQL:    containerCreateRollbackSQL,
 			Params: []interface{}{wall, now, hostName, name, opID, ownerEpoch},
 			Guard:  rollbackGuard,
 		},
@@ -396,6 +410,22 @@ func normalizeCreateIdentity(op *OperationRecord, resourceID, resourceKind strin
 	}
 	if op.VMOwnerEpoch == 0 {
 		op.VMOwnerEpoch = ownerEpoch
+	}
+	return nil
+}
+
+func validateCreateReservationBinding(raw, workloadHost string) error {
+	rv, err := DecodeReservation(raw)
+	if err != nil {
+		return err
+	}
+	if rv.TargetHost != "" && rv.TargetHost != workloadHost {
+		return fmt.Errorf("%w: reservation target host %q does not match workload host %q",
+			ErrOperationIdentityConflict, rv.TargetHost, workloadHost)
+	}
+	if rv.SourceHost != "" {
+		return fmt.Errorf("%w: create reservation cannot bind source host %q",
+			ErrOperationIdentityConflict, rv.SourceHost)
 	}
 	return nil
 }
@@ -470,19 +500,77 @@ func compareReservedStepInTx(ctx context.Context, tx *sql.Tx, opID string, owner
 	return nil
 }
 
-func compareContainerCreateRetryInTx(ctx context.Context, tx *sql.Tx, opID string, requested ContainerRecord) error {
-	var hostName, name string
+func compareVMCreateRetryInTx(ctx context.Context, tx *sql.Tx, requested VMRecord) error {
+	var stored VMRecord
+	var template int
 	err := tx.QueryRowContext(ctx,
-		`SELECT host_name, name FROM containers
-		 WHERE active_operation_id = ? AND deleted_at IS NULL LIMIT 1`, opID).
-		Scan(&hostName, &name)
+		`SELECT name, stack_name, host_name, spec, state_detail, cpu_actual,
+		        mem_actual, project, is_template, vm_owner_epoch, spec_generation
+		 FROM vms WHERE name = ?`, requested.Name).
+		Scan(&stored.Name, &stored.StackName, &stored.HostName, &stored.Spec,
+			&stored.StateDetail, &stored.CPUActual, &stored.MemActual,
+			&stored.Project, &template, &stored.OwnerEpoch, &stored.SpecGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+		return ErrOperationIdentityConflict
 	}
 	if err != nil {
 		return err
 	}
-	if hostName != requested.HostName || name != requested.Name {
+	stored.IsTemplate = template != 0
+	if stored.Name != requested.Name ||
+		stored.StackName != requested.StackName ||
+		stored.HostName != requested.HostName ||
+		stored.Spec != requested.Spec ||
+		stored.StateDetail != requested.StateDetail ||
+		stored.CPUActual != requested.CPUActual ||
+		stored.MemActual != requested.MemActual ||
+		projectOrDefault(stored.Project) != projectOrDefault(requested.Project) ||
+		stored.IsTemplate != requested.IsTemplate ||
+		stored.OwnerEpoch != requested.OwnerEpoch ||
+		stored.SpecGeneration != requested.SpecGeneration {
+		return ErrOperationIdentityConflict
+	}
+	return nil
+}
+
+func compareContainerCreateRetryInTx(ctx context.Context, tx *sql.Tx, requested ContainerRecord, requestedLabels string) error {
+	var stored ContainerRecord
+	var storedLabels string
+	var template int
+	err := tx.QueryRowContext(ctx,
+		`SELECT host_name, name, image, cpu_limit, memory_mib, labels,
+		        restart_policy, state_detail, project, is_template,
+		        on_host_failure, create_spec, relocate_token, owner_epoch,
+		        spec_generation
+		 FROM containers WHERE host_name = ? AND name = ?`,
+		requested.HostName, requested.Name).
+		Scan(&stored.HostName, &stored.Name, &stored.Image, &stored.CPULimit,
+			&stored.MemMiB, &storedLabels, &stored.RestartPolicy,
+			&stored.StateDetail, &stored.Project, &template,
+			&stored.OnHostFailure, &stored.CreateSpec, &stored.RelocateToken,
+			&stored.OwnerEpoch, &stored.SpecGeneration)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrOperationIdentityConflict
+	}
+	if err != nil {
+		return err
+	}
+	stored.IsTemplate = template != 0
+	if stored.HostName != requested.HostName ||
+		stored.Name != requested.Name ||
+		stored.Image != requested.Image ||
+		stored.CPULimit != requested.CPULimit ||
+		stored.MemMiB != requested.MemMiB ||
+		storedLabels != requestedLabels ||
+		stored.RestartPolicy != requested.RestartPolicy ||
+		stored.StateDetail != requested.StateDetail ||
+		projectOrDefault(stored.Project) != projectOrDefault(requested.Project) ||
+		stored.IsTemplate != requested.IsTemplate ||
+		stored.OnHostFailure != requested.OnHostFailure ||
+		stored.CreateSpec != requested.CreateSpec ||
+		stored.RelocateToken != requested.RelocateToken ||
+		stored.OwnerEpoch != requested.OwnerEpoch ||
+		stored.SpecGeneration != requested.SpecGeneration {
 		return ErrOperationIdentityConflict
 	}
 	return nil
@@ -523,14 +611,17 @@ func validateReservationProject(raw, operationProject string) error {
 	if err != nil {
 		return fmt.Errorf("decode reservation: %w", err)
 	}
-	if rv.Project != "" && projectOrDefault(rv.Project) != projectOrDefault(operationProject) {
+	if raw == "" || rv == (ReservationVector{}) {
+		return nil
+	}
+	// A pre-project operation header cannot prove a binding. Preserve those
+	// genuinely legacy rows; every modern nonempty project is exact.
+	if operationProject == "" {
+		return nil
+	}
+	if rv.Project != operationProject {
 		return fmt.Errorf("%w: reservation project %q does not match operation project %q",
 			ErrOperationIdentityConflict, rv.Project, operationProject)
-	}
-	if (rv.ProjectCPU != 0 || rv.ProjectMemMiB != 0) && rv.Project == "" &&
-		projectOrDefault(operationProject) != DefaultProject {
-		return fmt.Errorf("%w: project reservation is missing its non-default project",
-			ErrOperationIdentityConflict)
 	}
 	return nil
 }
@@ -568,15 +659,28 @@ func encodeContainerLabels(labels map[string]string) (string, error) {
 
 func vmCreateHardwareStatements(vmName string, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, intents []PCIIntentRecord, now string, guard *MutationGuard) ([]Statement, error) {
 	stmts := make([]Statement, 0, len(ifaces)+len(disks)+len(nics)+len(intents))
+	ifaceKeys := make(map[string]struct{}, len(ifaces))
 	for _, iface := range ifaces {
+		if _, duplicate := ifaceKeys[iface.NetworkName]; duplicate {
+			return nil, fmt.Errorf("duplicate VM interface network %q", iface.NetworkName)
+		}
+		ifaceKeys[iface.NetworkName] = struct{}{}
 		sgs, err := encodeSGs(iface.SecurityGroups)
 		if err != nil {
 			return nil, err
 		}
 		stmts = append(stmts, Statement{
 			SQL: `INSERT INTO vm_interfaces
-			 (vm_name, network_name, ordinal, mac, ip, tap_device, security_groups, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			 (vm_name, network_name, ordinal, mac, ip, tap_device, security_groups, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+			 ON CONFLICT(vm_name, network_name) DO UPDATE SET
+			   ordinal = excluded.ordinal,
+			   mac = excluded.mac,
+			   ip = excluded.ip,
+			   tap_device = excluded.tap_device,
+			   security_groups = excluded.security_groups,
+			   updated_at = excluded.updated_at,
+			   deleted_at = NULL`,
 			Params: []interface{}{
 				vmName, iface.NetworkName, iface.Ordinal, iface.MAC, iface.IP,
 				iface.TapDevice, sgs, now,
@@ -584,7 +688,12 @@ func vmCreateHardwareStatements(vmName string, ifaces []InterfaceRecord, disks [
 			Guard: guard,
 		})
 	}
+	diskKeys := make(map[string]struct{}, len(disks))
 	for _, disk := range disks {
+		if _, duplicate := diskKeys[disk.DiskName]; duplicate {
+			return nil, fmt.Errorf("duplicate VM disk %q", disk.DiskName)
+		}
+		diskKeys[disk.DiskName] = struct{}{}
 		deviceKind := disk.DeviceKind
 		if deviceKind == "" {
 			deviceKind = "disk"
@@ -593,8 +702,23 @@ func vmCreateHardwareStatements(vmName string, ifaces []InterfaceRecord, disks [
 			SQL: `INSERT INTO vm_disks
 			 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
 			  storage_type, storage_volume, target_dev, backing_disk, bus,
-			  device_kind, delete_with_vm, controller_model, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			  device_kind, delete_with_vm, controller_model, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+			 ON CONFLICT(vm_name, disk_name) DO UPDATE SET
+			   host_name = excluded.host_name,
+			   path = excluded.path,
+			   size_bytes = excluded.size_bytes,
+			   backing_image = excluded.backing_image,
+			   storage_type = excluded.storage_type,
+			   storage_volume = excluded.storage_volume,
+			   target_dev = excluded.target_dev,
+			   backing_disk = excluded.backing_disk,
+			   bus = excluded.bus,
+			   device_kind = excluded.device_kind,
+			   delete_with_vm = excluded.delete_with_vm,
+			   controller_model = excluded.controller_model,
+			   updated_at = excluded.updated_at,
+			   deleted_at = NULL`,
 			Params: []interface{}{
 				vmName, disk.DiskName, disk.HostName, disk.Path, disk.SizeBytes,
 				disk.BackingImage, disk.StorageType, disk.StorageVolume,
@@ -605,7 +729,12 @@ func vmCreateHardwareStatements(vmName string, ifaces []InterfaceRecord, disks [
 			Guard: guard,
 		})
 	}
+	nicKeys := make(map[string]struct{}, len(nics))
 	for _, nic := range nics {
+		if _, duplicate := nicKeys[nic.ID]; duplicate {
+			return nil, fmt.Errorf("duplicate VM NIC %q", nic.ID)
+		}
+		nicKeys[nic.ID] = struct{}{}
 		model := nic.Model
 		if model == "" {
 			model = "virtio"
@@ -623,7 +752,12 @@ func vmCreateHardwareStatements(vmName string, ifaces []InterfaceRecord, disks [
 			Guard: guard,
 		})
 	}
+	intentKeys := make(map[string]struct{}, len(intents))
 	for _, in := range intents {
+		if _, duplicate := intentKeys[in.DeviceID]; duplicate {
+			return nil, fmt.Errorf("duplicate VM PCI intent %q", in.DeviceID)
+		}
+		intentKeys[in.DeviceID] = struct{}{}
 		var exclusive interface{}
 		if in.ExclusiveKey != nil {
 			exclusive = *in.ExclusiveKey

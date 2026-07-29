@@ -138,6 +138,19 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// exact statement is applied.
 	{SQL: vmCreateBeginSQL, Disposition: DispCreateBegin},
 	{SQL: containerCreateBeginSQL, Disposition: DispCreateBegin},
+	// The terminal workload transition is the commit barrier for the preceding
+	// hardware/journal statements in the same mutation-log transaction. Its
+	// structured authority guard, not an unrelated receiver clock, orders it.
+	{SQL: vmCreateCommitSQL, Disposition: DispGuardedTransition},
+	{SQL: vmCreateRollbackSQL, Disposition: DispGuardedTransition},
+	{SQL: containerCreateCommitSQL, Disposition: DispGuardedTransition},
+	{SQL: containerCreateRollbackSQL, Disposition: DispGuardedTransition},
+	{SQL: vmDeleteSQL, Disposition: DispWorkloadDelete},
+	{SQL: containerDeleteSQL, Disposition: DispWorkloadDelete},
+	// Pre-v44 deletes carry no authority axes. Retain wire compatibility, but
+	// only let them tombstone rows that are themselves still pre-authority.
+	{SQL: legacyVMDeleteSQL, Disposition: DispLegacyWorkloadDelete},
+	{SQL: legacyContainerDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes) → verbatim.
 	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock},
 	// session revoke: a guarded one-shot terminal transition (WHERE revoked_at IS NULL) → verbatim.

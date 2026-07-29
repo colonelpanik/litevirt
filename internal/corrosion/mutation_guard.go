@@ -12,6 +12,16 @@ import (
 const (
 	workloadCreateGuardV1      = "workload_create_v1"
 	workloadCreateBeginGuardV1 = "workload_create_begin_v1"
+	workloadDeleteGuardV1      = "workload_delete_v1"
+	legacyVMDeleteSQL          = `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`
+	legacyContainerDeleteSQL   = `UPDATE containers SET deleted_at = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ?`
+	vmDeleteSQL = `UPDATE vms SET deleted_at = ?, updated_at = ?
+		 WHERE name = ? AND vm_owner_epoch = ? AND spec_generation = ?
+		   AND deleted_at IS NULL`
+	containerDeleteSQL = `UPDATE containers SET deleted_at = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND owner_epoch = ?
+		   AND spec_generation = ? AND deleted_at IS NULL`
 )
 
 // MutationGuard carries the local create-operation transaction predicate over
@@ -85,9 +95,34 @@ func containerRollbackMutationGuard(hostName, name, opID string, ownerEpoch int6
 	}
 }
 
+func vmDeleteMutationGuard(vm VMRecord) *MutationGuard {
+	return &MutationGuard{
+		Protocol: workloadDeleteGuardV1, ResourceKind: "vm", ResourceID: vm.Name,
+		HostName: vm.HostName, OwnerEpoch: vm.OwnerEpoch,
+		SpecGeneration: vm.SpecGeneration, CheckSpecGeneration: true,
+		IdentityHash: vmCreateIdentityHash(vm),
+	}
+}
+
+func containerDeleteMutationGuard(ct ContainerRecord) (*MutationGuard, error) {
+	labels, err := encodeContainerLabels(ct.Labels)
+	if err != nil {
+		return nil, err
+	}
+	return &MutationGuard{
+		Protocol: workloadDeleteGuardV1, ResourceKind: "container", ResourceID: ct.Name,
+		HostName: ct.HostName, OwnerEpoch: ct.OwnerEpoch,
+		SpecGeneration: ct.SpecGeneration, CheckSpecGeneration: true,
+		IdentityHash: containerCreateIdentityHash(ct, labels),
+	}, nil
+}
+
 func (c *Client) mutationGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationGuard) (bool, error) {
 	if guard == nil {
 		return true, nil
+	}
+	if guard.Protocol == workloadDeleteGuardV1 {
+		return workloadDeleteGuardMatches(ctx, tx, guard)
 	}
 	if guard.OperationID == "" || guard.ResourceID == "" {
 		return false, fmt.Errorf("invalid mutation guard protocol or identity")
@@ -211,6 +246,65 @@ func (c *Client) mutationGuardMatches(ctx context.Context, tx *sql.Tx, guard *Mu
 		return false, nil
 	}
 	return true, nil
+}
+
+func workloadDeleteGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationGuard) (bool, error) {
+	if guard.ResourceID == "" || guard.OwnerEpoch < 0 || !guard.CheckSpecGeneration ||
+		guard.SpecGeneration < 0 || guard.IdentityHash == "" {
+		return false, fmt.Errorf("invalid workload delete guard")
+	}
+	switch guard.ResourceKind {
+	case "vm":
+		var vm VMRecord
+		var isTemplate int
+		err := tx.QueryRowContext(ctx,
+			`SELECT name, COALESCE(stack_name, ''), host_name, spec,
+			        COALESCE(project, '_default'), COALESCE(is_template, 0),
+			        vm_owner_epoch, spec_generation
+			 FROM vms WHERE name = ? AND deleted_at IS NULL`, guard.ResourceID).
+			Scan(&vm.Name, &vm.StackName, &vm.HostName, &vm.Spec,
+				&vm.Project, &isTemplate, &vm.OwnerEpoch, &vm.SpecGeneration)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		vm.IsTemplate = isTemplate != 0
+		return vm.HostName == guard.HostName &&
+			vm.OwnerEpoch == guard.OwnerEpoch &&
+			vm.SpecGeneration == guard.SpecGeneration &&
+			vmCreateIdentityHash(vm) == guard.IdentityHash, nil
+	case "container":
+		var ct ContainerRecord
+		var labels string
+		var isTemplate int
+		err := tx.QueryRowContext(ctx,
+			`SELECT host_name, name, COALESCE(image, ''), cpu_limit, memory_mib,
+			        COALESCE(labels, ''), COALESCE(restart_policy, ''),
+			        COALESCE(project, '_default'), COALESCE(is_template, 0),
+			        COALESCE(on_host_failure, ''), COALESCE(create_spec, ''),
+			        COALESCE(relocate_token, ''), owner_epoch, spec_generation
+			 FROM containers
+			 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			guard.HostName, guard.ResourceID).
+			Scan(&ct.HostName, &ct.Name, &ct.Image, &ct.CPULimit, &ct.MemMiB,
+				&labels, &ct.RestartPolicy, &ct.Project, &isTemplate,
+				&ct.OnHostFailure, &ct.CreateSpec, &ct.RelocateToken,
+				&ct.OwnerEpoch, &ct.SpecGeneration)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		ct.IsTemplate = isTemplate != 0
+		return ct.OwnerEpoch == guard.OwnerEpoch &&
+			ct.SpecGeneration == guard.SpecGeneration &&
+			containerCreateIdentityHash(ct, labels) == guard.IdentityHash, nil
+	default:
+		return false, fmt.Errorf("invalid workload delete guard resource kind %q", guard.ResourceKind)
+	}
 }
 
 // createBeginGuardMatches authorizes the one statement that establishes a

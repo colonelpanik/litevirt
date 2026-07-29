@@ -705,11 +705,48 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// epochs. Fence them against the source workload identity captured from
 		// this payload and the authority that actually landed locally. This runs
 		// before both first-seen insertion and every conflict resolver.
-		if keepLocal, guardErr := c.antiEntropyAuthorityKeepsLocal(tx, table, row); guardErr != nil {
+		authorityDecision, guardErr := c.antiEntropyAuthorityDecision(tx, table, row)
+		if guardErr != nil {
 			_ = tx.Rollback()
 			return merged, skipped, guardErr
-		} else if keepLocal {
+		}
+		if authorityDecision == mergeAuthorityKeepLocal {
 			skipped++
+			continue
+		}
+		if authorityDecision == mergeAuthorityApplyIncoming ||
+			authorityDecision == mergeAuthorityApplyIncomingAndSweep {
+			// Workload owner/generation is the semantic ABA order. A higher
+			// authority applies even when an unrelated local wall/HLC clock is
+			// larger; children later in the payload are fenced against the
+			// authority that actually landed.
+			rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+			if execErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, execErr
+			}
+			if rejected {
+				skipped++
+			} else {
+				merged++
+				if authorityDecision == mergeAuthorityApplyIncomingAndSweep {
+					deletedIdx, updatedIdx := indexOf(table.Columns, "deleted_at"), indexOf(table.Columns, "updated_at")
+					if deletedIdx < 0 || updatedIdx < 0 {
+						_ = tx.Rollback()
+						return merged, skipped, fmt.Errorf("authority sweep parent is missing timestamps")
+					}
+					if sweepErr := antiEntropySweepDeletedWorkloadChildren(
+						tx, table, row, coerceString(row[deletedIdx]), coerceString(row[updatedIdx]),
+					); sweepErr != nil {
+						_ = tx.Rollback()
+						return merged, skipped, sweepErr
+					}
+				}
+				if c.anyUnresolved() {
+					pk := pkKeyAt(row, pkIdx)
+					c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
+				}
+			}
 			continue
 		}
 		// Custom monotone merge (runtime_action_proofs): decide by lifecycle rank,

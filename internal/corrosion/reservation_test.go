@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -377,5 +378,75 @@ func TestBeginVMOperationRejectsInvalidReservation(t *testing.T) {
 	}
 	if got, err := GetOperation(ctx, c, op.ID); err != nil || got != nil {
 		t.Fatalf("invalid operation persisted: op=%+v err=%v", got, err)
+	}
+}
+
+func TestReservationProjectBindingPreservesOnlyUnknownLegacyOperations(t *testing.T) {
+	ctx := context.Background()
+	newVM := func(t *testing.T) *Client {
+		t.Helper()
+		c := newTestDB(t)
+		if err := InsertVM(ctx, c, VMRecord{
+			Name: "vm1", HostName: "h1", State: "running", Spec: "{}",
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	t.Run("empty operation project is legacy unknown", func(t *testing.T) {
+		c := newVM(t)
+		raw, _ := (ReservationVector{
+			Project: "p1", TargetHost: "h1", TargetCPU: 1,
+		}).Encode()
+		op := OperationRecord{
+			ID: "op-legacy-project", Method: "ResizeVM", ResourceKind: "vm",
+			ResourceID: "vm1", OperationKind: string(OpResourceUpdateRunning),
+			RequestHash: "hash", ReservationJSON: raw,
+		}
+		if applied, err := c.BeginVMOperation(ctx, op, `{"cpu":2}`, 0, 0); err != nil || !applied {
+			t.Fatalf("legacy begin: applied=%v err=%v", applied, err)
+		}
+	})
+	for _, tc := range []struct {
+		name    string
+		project string
+	}{
+		{name: "named project", project: "p1"},
+		{name: "explicit default project", project: DefaultProject},
+	} {
+		t.Run(tc.name+" rejects missing vector project", func(t *testing.T) {
+			c := newVM(t)
+			raw, _ := (ReservationVector{TargetHost: "h1", TargetCPU: 1}).Encode()
+			op := OperationRecord{
+				ID: "op-strict-project", Method: "ResizeVM", Project: tc.project,
+				ResourceKind: "vm", ResourceID: "vm1",
+				OperationKind: string(OpResourceUpdateRunning),
+				RequestHash:   "hash", ReservationJSON: raw,
+			}
+			if applied, err := c.BeginVMOperation(ctx, op, `{"cpu":2}`, 0, 0); !errors.Is(err, ErrOperationIdentityConflict) || applied {
+				t.Fatalf("strict begin: applied=%v err=%v", applied, err)
+			}
+		})
+	}
+}
+
+func TestReservationAggregationAcceptsNoncanonicalZeroObject(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	if err := InsertOperation(ctx, c, OperationRecord{
+		ID: "op-zero-object", Method: "ResizeVM", Project: "p1",
+		ResourceKind: "vm", ResourceID: "vm1",
+		OperationKind: string(OpResourceUpdateRunning),
+		RequestHash:   "hash", ReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendOperationStep(ctx, c, OperationStepRecord{
+		OperationID: "op-zero-object", StepName: OpStepPlanned,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cpu, mem, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 0 || mem != 0 {
+		t.Fatalf("zero object aggregation: cpu=%d mem=%d err=%v", cpu, mem, err)
 	}
 }

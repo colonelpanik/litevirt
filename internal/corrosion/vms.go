@@ -165,11 +165,13 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 		{SQL: `DELETE FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}},              // full-state-delete-ok
 		{
 			SQL: `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
-				cpu_actual, mem_actual, project, is_template, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				cpu_actual, mem_actual, project, is_template, vm_owner_epoch,
+				spec_generation, active_operation_id, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			Params: []interface{}{
 				vm.Name, vm.StackName, vm.HostName, vm.Spec, vm.State, vm.StateDetail,
-				vm.CPUActual, vm.MemActual, projectOrDefault(vm.Project), boolToInt(vm.IsTemplate), now, uts,
+				vm.CPUActual, vm.MemActual, projectOrDefault(vm.Project), boolToInt(vm.IsTemplate),
+				vm.OwnerEpoch, vm.SpecGeneration, vm.ActiveOperationID, now, uts,
 			},
 		},
 	}
@@ -770,16 +772,28 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 // NOT release any host_pci_devices ownership/vfio-unbind lease — that is the
 // grpcapi DeleteVM handler's releaseDevices call, out of scope here.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
+	vm, err := GetVM(ctx, c, name)
+	if err != nil || vm == nil {
+		return err
+	}
+	guard := vmDeleteMutationGuard(*vm)
 	now := c.NowTS()     // LWW key (updated_at)
 	wall := nowRFC3339() // deleted_at is a wall/display column, never the HLC key
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_nics SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_pci_intent SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+	_, err = c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		return c.mutationGuardMatches(ctx, tx, guard)
+	}, []Statement{
+		// Children are fenced while the parent is still live; the parent
+		// tombstone is the final semantic commit barrier.
+		{SQL: vmInterfacesCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmDisksCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmNICsCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmPCIIntentCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmPCIRealCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmDeleteSQL, Params: []interface{}{
+			wall, now, name, vm.OwnerEpoch, vm.SpecGeneration,
+		}, Guard: guard},
 	})
+	return err
 }
 
 // RenameVM changes a VM's name across all tables, including the name embedded in

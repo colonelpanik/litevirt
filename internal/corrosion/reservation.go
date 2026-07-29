@@ -203,8 +203,8 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 		if err != nil {
 			return nil, err
 		}
-		if operationProject := r.String("project"); operationProject != "" {
-			if projectOrDefault(rv.Project) != projectOrDefault(operationProject) {
+		if operationProject := r.String("project"); operationProject != "" && rv != (ReservationVector{}) {
+			if rv.Project != operationProject {
 				return nil, fmt.Errorf(
 					"reservation %s project %q does not match operation project %q",
 					id, rv.Project, operationProject)

@@ -16,6 +16,11 @@ import (
 // not a success). Mirrors the zero-row-consume-guard used for single-use tokens.
 var ErrNoRowsAffected = errors.New("no rows affected")
 
+// ErrGuardedContainerRekeyRequired prevents a pre-authority re-key envelope from
+// silently dropping modern workload authority. Callers holding a container with
+// any v44 lifecycle axis must use RekeyContainerOwnerGuarded.
+var ErrGuardedContainerRekeyRequired = errors.New("guarded container rekey required")
+
 // Reserved labels litevirt uses to manage compose-deployed containers. They
 // live here (the lowest layer) so corrosion, compose, grpcapi, and the daemon
 // can all reference them without an import cycle.
@@ -322,7 +327,49 @@ const ContainerRelocateRecreateDetail = "relocate-recreate"
 // relocate_token is preserved if already present and NEVER minted by this path.
 const ContainerRuntimeRekeyDetail = "runtime-owner-rekey"
 
-// RekeyContainerOwner atomically re-homes a container's ENTIRE ownership
+// RekeyContainerOwner emits the retained v1.3 re-key envelope. Keeping this
+// ordinary entry point wire-compatible lets a newly upgraded sender re-key a
+// pre-authority container while older receivers are still in the cluster.
+// Modern authority must use RekeyContainerOwnerGuarded instead: encoding it in
+// the historical envelope would silently discard its fencing axes.
+func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, toHost string) (bool, error) {
+	if src.OwnerEpoch != 0 || src.SpecGeneration != 0 || src.ActiveOperationID != "" {
+		return false, ErrGuardedContainerRekeyRequired
+	}
+	now := c.NowTS()
+	rk, err := legacyRekeyContainerStmt(src, toHost, now)
+	if err != nil {
+		return false, err
+	}
+	guard := func(tx *sql.Tx) (bool, error) {
+		return containerRekeyPreflight(ctx, tx, src, toHost)
+	}
+	stmts := []Statement{
+		{
+			SQL:    legacyContainerStrictDeleteSQL,
+			Params: []interface{}{nowRFC3339(), now, src.HostName, src.Name},
+		},
+		rk,
+		{
+			SQL:    containerRekeyInterfaceCleanupSQL,
+			Params: []interface{}{nowRFC3339(), now, src.HostName, src.Name},
+		},
+	}
+	for _, ifc := range BuildContainerInterfacesFromSpec(toHost, src.Name, DecodeCreateSpec(src.CreateSpec)) {
+		s, err := containerInterfaceStmt(c, ifc)
+		if err != nil {
+			return false, err
+		}
+		stmts = append(stmts, s)
+	}
+	stmts = append(stmts, Statement{
+		SQL:    containerRekeyLeaseSQL,
+		Params: []interface{}{toHost, nowRFC3339(), now, src.HostName, src.Name},
+	})
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// RekeyContainerOwnerGuarded atomically re-homes a container's ENTIRE ownership
 // footprint from src.HostName to toHost — the container's first-class identity
 // after PR 2a is the row PLUS its managed interface rows PLUS its IPAM leases, so
 // moving only the row would strand the NICs/leases on the old host and break
@@ -350,7 +397,7 @@ const ContainerRuntimeRekeyDetail = "runtime-owner-rekey"
 // managed NIC IP the source doesn't actually hold the lease for — aborts the
 // re-key WITHOUT writing anything. Returns applied=false (no error) on a declined
 // guard; the caller skips and retries next sweep.
-func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, toHost string) (bool, error) {
+func RekeyContainerOwnerGuarded(ctx context.Context, c *Client, src ContainerRecord, toHost string) (bool, error) {
 	now := c.NowTS()
 	rk, err := rekeyContainerStmt(c, src, toHost, now)
 	if err != nil {
@@ -360,52 +407,8 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 	if err != nil {
 		return false, err
 	}
-	managedIPs := managedNICIPs(src)
 	guard := func(tx *sql.Tx) (bool, error) {
-		// (a) source row still live, unchanged since observed, not relocating.
-		var state, detail, token, updatedAt string
-		err := tx.QueryRowContext(ctx,
-			`SELECT state, COALESCE(state_detail,''), COALESCE(relocate_token,''), updated_at
-			 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-			src.HostName, src.Name).Scan(&state, &detail, &token, &updatedAt)
-		if err == sql.ErrNoRows {
-			return false, nil // source vanished
-		}
-		if err != nil {
-			return false, err
-		}
-		if updatedAt != src.UpdatedAt || token != "" ||
-			state == "migrating" || state == "relocating" || state == "pending" {
-			return false, nil // changed / now under relocation
-		}
-		// (b) no LIVE target row may exist (only a soft-deleted one may be replaced).
-		var n int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-			toHost, src.Name).Scan(&n); err != nil {
-			return false, err
-		}
-		if n > 0 {
-			return false, nil // a real local row appeared — abort, never clobber it
-		}
-		// (c) source must own the live IPAM lease for every managed NIC (network, ip)
-		// we are about to assert on the target (mirror the migrate
-		// ContainerLeasesOwnedBy invariant) — matched on BOTH network and ip, since
-		// ip_allocations is keyed by (network, ip) and the rebuilt interface row
-		// claims a specific network. Never claim an address IPAM doesn't back.
-		for _, nic := range managedIPs {
-			var ln int
-			if err := tx.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM ip_allocations
-				 WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND network = ? AND ip = ? AND deleted_at IS NULL`,
-				src.HostName, src.Name, nic.network, nic.ip).Scan(&ln); err != nil {
-				return false, err
-			}
-			if ln == 0 {
-				return false, nil // a managed (network, ip) with no source lease — refuse
-			}
-		}
-		return true, nil
+		return containerRekeyPreflight(ctx, tx, src, toHost)
 	}
 
 	stmts := []Statement{
@@ -447,6 +450,59 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 		Guard: rekeyGuard,
 	})
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+func containerRekeySourceSafe(state, detail, relocateToken string) bool {
+	if relocateToken != "" ||
+		state == "pending" || state == "migrating" || state == "relocating" {
+		return false
+	}
+	return !strings.HasPrefix(detail, ContainerRelocateRestorePrefix)
+}
+
+func containerRekeyPreflight(
+	ctx context.Context, tx *sql.Tx, src ContainerRecord, toHost string,
+) (bool, error) {
+	// (a) source row still live, unchanged since observed, and outside any
+	// relocation/migration state machine.
+	var state, detail, token, updatedAt string
+	err := tx.QueryRowContext(ctx,
+		`SELECT state, COALESCE(state_detail,''), COALESCE(relocate_token,''), updated_at
+		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		src.HostName, src.Name).Scan(&state, &detail, &token, &updatedAt)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if updatedAt != src.UpdatedAt || !containerRekeySourceSafe(state, detail, token) {
+		return false, nil
+	}
+	// (b) no LIVE target row may exist (only a soft-deleted one may be replaced).
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		toHost, src.Name).Scan(&n); err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return false, nil
+	}
+	// (c) source must own the live IPAM lease for every managed NIC.
+	for _, nic := range managedNICIPs(src) {
+		var ln int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM ip_allocations
+			 WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND network = ? AND ip = ? AND deleted_at IS NULL`,
+			src.HostName, src.Name, nic.network, nic.ip).Scan(&ln); err != nil {
+			return false, err
+		}
+		if ln == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // managedNICIP is a managed NIC's (network, ip) — the FULL IPAM key. The lease
@@ -493,6 +549,29 @@ func rekeyContainerStmt(c *Client, src ContainerRecord, toHost, now string) (Sta
 			src.RestartPolicy, ContainerRuntimeRekeyDetail, src.Project, boolToInt(src.IsTemplate),
 			src.OnHostFailure, src.CreateSpec, src.RelocateToken,
 			src.OwnerEpoch, src.SpecGeneration, src.ActiveOperationID, createdAt, now,
+		},
+	}, nil
+}
+
+func legacyRekeyContainerStmt(src ContainerRecord, toHost, now string) (Statement, error) {
+	labelsJSON := ""
+	if len(src.Labels) > 0 {
+		b, err := json.Marshal(src.Labels)
+		if err != nil {
+			return Statement{}, err
+		}
+		labelsJSON = string(b)
+	}
+	createdAt := src.CreatedAt
+	if createdAt == "" {
+		createdAt = nowRFC3339()
+	}
+	return Statement{
+		SQL: legacyContainerRekeySQL,
+		Params: []interface{}{
+			toHost, src.Name, src.Image, src.CPULimit, src.MemMiB, labelsJSON,
+			src.RestartPolicy, ContainerRuntimeRekeyDetail, src.Project, boolToInt(src.IsTemplate),
+			src.OnHostFailure, src.CreateSpec, src.RelocateToken, createdAt, now,
 		},
 	}, nil
 }

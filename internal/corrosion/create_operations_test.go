@@ -2405,7 +2405,7 @@ func TestRetainedAndCurrentContainerRekeyDeletesCannotCrossRecreate(t *testing.T
 		if err != nil || observed == nil {
 			t.Fatalf("source container: got=%+v err=%v", observed, err)
 		}
-		if applied, err := RekeyContainerOwner(ctx, source, *observed, "h2"); err != nil || !applied {
+		if applied, err := RekeyContainerOwnerGuarded(ctx, source, *observed, "h2"); err != nil || !applied {
 			t.Fatalf("source rekey: applied=%v err=%v", applied, err)
 		}
 		rekeyEntry := latestMutationEntry(t, source, "current-rekey-source", 1)
@@ -2565,6 +2565,72 @@ func TestRetainedAndCurrentContainerRekeyDeletesCannotCrossRecreate(t *testing.T
 					if targetAfter := rowSnapshot(t, receiver, "h2"); targetAfter != targetBefore {
 						t.Fatalf("declined rekey changed tombstoned target:\nbefore=%s\nafter=%s",
 							targetBefore, targetAfter)
+					}
+				})
+			}
+		})
+
+		t.Run("unsafe source declines atomically", func(t *testing.T) {
+			cases := []struct {
+				name    string
+				state   string
+				detail  string
+				token   string
+				deleted bool
+			}{
+				{name: "tombstoned", state: "running", deleted: true},
+				{name: "pending", state: "pending", detail: ContainerRelocateRecreateDetail},
+				{name: "migrating", state: "migrating"},
+				{name: "relocating", state: "relocating", detail: RelocateRestoreDetail("h2", "tok")},
+				{name: "relocation detail", state: "running", detail: RelocateRestoreDetail("h2", "tok")},
+				{name: "relocation token", state: "running", token: "tok"},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					receiver := testClient(t)
+					seedSourceReplica(t, receiver)
+					deletedAt := interface{}(nil)
+					if tc.deleted {
+						deletedAt = "2026-07-28T15:00:00Z"
+					}
+					if _, err := receiver.db.Exec(
+						`UPDATE containers
+						 SET state = ?, state_detail = ?, relocate_token = ?, deleted_at = ?
+						 WHERE host_name = ? AND name = ?`,
+						tc.state, tc.detail, tc.token, deletedAt, "h1", "ct1",
+					); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := receiver.db.Exec(
+						`INSERT INTO container_interfaces
+						 (host_name, ct_name, network_name, ordinal, mac, updated_at)
+						 VALUES ('h1', 'ct1', 'sentinel', 0, '52:54:00:00:00:01', 'sentinel')`,
+					); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := receiver.db.Exec(
+						`INSERT INTO ip_allocations
+						 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+						 VALUES ('sentinel', '10.0.0.10', '52:54:00:00:00:01',
+						         'ct1', 'ct', 'h1', 'sentinel', 'sentinel')`,
+					); err != nil {
+						t.Fatal(err)
+					}
+					sourceBefore := rowSnapshot(t, receiver, "h1")
+					footprintBefore := containerOwnershipFootprintSnapshot(t, receiver, "ct1")
+					applyMutationEntry(t, receiver, delayedRekey)
+					if sourceAfter := rowSnapshot(t, receiver, "h1"); sourceAfter != sourceBefore {
+						t.Fatalf("declined rekey changed unsafe source:\nbefore=%s\nafter=%s",
+							sourceBefore, sourceAfter)
+					}
+					if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got != nil {
+						t.Fatalf("declined rekey manufactured target: %+v", got)
+					}
+					if footprintAfter := containerOwnershipFootprintSnapshot(
+						t, receiver, "ct1",
+					); footprintAfter != footprintBefore {
+						t.Fatalf("declined rekey changed interface/lease footprint:\nbefore=%s\nafter=%s",
+							footprintBefore, footprintAfter)
 					}
 				})
 			}
@@ -2773,6 +2839,94 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 				assertTarget()
 				applyMutationEntry(t, receiver, entry(t, "retained-v130-replay-"+name, stmts))
 				assertTarget()
+			})
+		}
+	})
+
+	t.Run("unsafe legacy source declines whole envelope", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			state   string
+			detail  string
+			token   string
+			deleted bool
+		}{
+			{name: "tombstoned", state: "running", deleted: true},
+			{name: "pending", state: "pending", detail: ContainerRelocateRecreateDetail},
+			{name: "migrating", state: "migrating"},
+			{name: "relocating", state: "relocating", detail: RelocateRestoreDetail("h2", "tok")},
+			{name: "relocation detail", state: "running", detail: RelocateRestoreDetail("h2", "tok")},
+			{name: "relocation token", state: "running", token: "tok"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				receiver := testClient(t)
+				source := seedLegacySource(t, receiver)
+				deletedAt := interface{}(nil)
+				if tc.deleted {
+					deletedAt = "2026-07-28T15:00:00Z"
+				}
+				if _, err := receiver.db.Exec(
+					`UPDATE containers
+					 SET state = ?, state_detail = ?, relocate_token = ?, deleted_at = ?
+					 WHERE host_name = ? AND name = ?`,
+					tc.state, tc.detail, tc.token, deletedAt, "h1", "ct1",
+				); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := receiver.db.Exec(
+					`INSERT INTO container_interfaces
+					 (host_name, ct_name, network_name, ordinal, mac, updated_at)
+					 VALUES ('h1', 'ct1', 'sentinel', 9, '52:54:00:00:00:09', 'sentinel')`,
+				); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := receiver.db.Exec(
+					`INSERT INTO ip_allocations
+					 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+					 VALUES ('sentinel', '10.0.0.99', '52:54:00:00:00:09',
+					         'ct1', 'ct', 'h1', 'sentinel', 'sentinel')`,
+				); err != nil {
+					t.Fatal(err)
+				}
+				stmts := retainedBatch(source.CreatedAt, ifaceRFC0, ifaceRFC1)
+				stmts[1].Params[12] = tc.token
+				before, err := receiver.Query(ctx,
+					`SELECT * FROM containers WHERE name = ? ORDER BY host_name`, "ct1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeJSON, err := json.Marshal(before)
+				if err != nil {
+					t.Fatal(err)
+				}
+				footprintBefore := containerOwnershipFootprintSnapshot(t, receiver, "ct1")
+				applyMutationEntry(t, receiver,
+					entry(t, "retained-v130-unsafe-"+tc.name, stmts))
+				after, err := receiver.Query(ctx,
+					`SELECT * FROM containers WHERE name = ? ORDER BY host_name`, "ct1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				afterJSON, err := json.Marshal(after)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(afterJSON) != string(beforeJSON) {
+					t.Fatalf("declined retained rekey changed container rows:\nbefore=%s\nafter=%s",
+						beforeJSON, afterJSON)
+				}
+				ifaces, err := GetContainerInterfaces(ctx, receiver, "h2", "ct1")
+				if err != nil || len(ifaces) != 0 {
+					t.Fatalf("declined retained rekey changed target interfaces: got=%+v err=%v",
+						ifaces, err)
+				}
+				if footprintAfter := containerOwnershipFootprintSnapshot(
+					t, receiver, "ct1",
+				); footprintAfter != footprintBefore {
+					t.Fatalf("declined retained rekey changed interface/lease footprint:\nbefore=%s\nafter=%s",
+						footprintBefore, footprintAfter)
+				}
 			})
 		}
 	})
@@ -3540,4 +3694,29 @@ func applyMutationEntry(t *testing.T, c *Client, entry *pb.MutationEntry) {
 		context.Background(), []*pb.MutationEntry{entry}); err != nil {
 		t.Fatalf("apply mutation seq=%d: %v", entry.Seq, err)
 	}
+}
+
+func containerOwnershipFootprintSnapshot(t *testing.T, c *Client, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	ifaces, err := c.Query(ctx,
+		`SELECT * FROM container_interfaces
+		 WHERE ct_name = ? ORDER BY host_name, ordinal`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leases, err := c.Query(ctx,
+		`SELECT * FROM ip_allocations
+		 WHERE owner_kind = 'ct' AND vm_name = ? ORDER BY network, ip`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(struct {
+		Interfaces []Row
+		Leases     []Row
+	}{Interfaces: ifaces, Leases: leases})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }

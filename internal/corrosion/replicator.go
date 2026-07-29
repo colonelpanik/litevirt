@@ -1527,27 +1527,32 @@ func legacyContainerRekeySafe(
 ) (bool, error) {
 	p := envelope.target.Params
 	var image, labels, restartPolicy, project, onHostFailure, createSpec string
-	var relocateToken, createdAt, activeOperationID string
+	var relocateToken, createdAt, activeOperationID, sourceState, sourceDetail string
 	var cpuLimit, memoryMiB, isTemplate int64
 	var ownerEpoch, generation int64
+	var sourceDeleted sql.NullString
 	err := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(image, ''), cpu_limit, memory_mib, COALESCE(labels, ''),
 		        COALESCE(restart_policy, ''), COALESCE(project, '_default'),
 		        COALESCE(is_template, 0), COALESCE(on_host_failure, ''),
 		        COALESCE(create_spec, ''), COALESCE(relocate_token, ''),
-		        created_at, owner_epoch, spec_generation, active_operation_id
+		        created_at, owner_epoch, spec_generation, active_operation_id,
+		        state, COALESCE(state_detail, ''), deleted_at
 		 FROM containers WHERE host_name = ? AND name = ?`,
 		envelope.sourceHost, envelope.name).
 		Scan(&image, &cpuLimit, &memoryMiB, &labels, &restartPolicy, &project,
 			&isTemplate, &onHostFailure, &createSpec, &relocateToken,
-			&createdAt, &ownerEpoch, &generation, &activeOperationID)
+			&createdAt, &ownerEpoch, &generation, &activeOperationID,
+			&sourceState, &sourceDetail, &sourceDeleted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if ownerEpoch != 0 || generation != 0 || activeOperationID != "" ||
+	if sourceDeleted.Valid && sourceDeleted.String != "" ||
+		!containerRekeySourceSafe(sourceState, sourceDetail, relocateToken) ||
+		ownerEpoch != 0 || generation != 0 || activeOperationID != "" ||
 		image != coerceString(p[2]) ||
 		cpuLimit != coerceInt64(p[3]) ||
 		memoryMiB != coerceInt64(p[4]) ||

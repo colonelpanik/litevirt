@@ -282,21 +282,23 @@ func workloadRekeyGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationG
 		return false, fmt.Errorf("invalid workload rekey guard")
 	}
 	var ct ContainerRecord
-	var labels string
+	var labels, sourceState, sourceDetail string
 	var isTemplate int
+	var sourceDeleted sql.NullString
 	err := tx.QueryRowContext(ctx,
 		`SELECT host_name, name, COALESCE(image, ''), cpu_limit, memory_mib,
 		        COALESCE(labels, ''), COALESCE(restart_policy, ''),
 		        COALESCE(project, '_default'), COALESCE(is_template, 0),
 		        COALESCE(on_host_failure, ''), COALESCE(create_spec, ''),
 		        COALESCE(relocate_token, ''), owner_epoch, spec_generation,
-		        active_operation_id
+		        active_operation_id, state, COALESCE(state_detail, ''), deleted_at
 		 FROM containers WHERE host_name = ? AND name = ?`,
 		guard.HostName, guard.ResourceID).
 		Scan(&ct.HostName, &ct.Name, &ct.Image, &ct.CPULimit, &ct.MemMiB,
 			&labels, &ct.RestartPolicy, &ct.Project, &isTemplate,
 			&ct.OnHostFailure, &ct.CreateSpec, &ct.RelocateToken,
-			&ct.OwnerEpoch, &ct.SpecGeneration, &ct.ActiveOperationID)
+			&ct.OwnerEpoch, &ct.SpecGeneration, &ct.ActiveOperationID,
+			&sourceState, &sourceDetail, &sourceDeleted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -304,7 +306,9 @@ func workloadRekeyGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationG
 		return false, err
 	}
 	ct.IsTemplate = isTemplate != 0
-	if ct.OwnerEpoch != guard.OwnerEpoch ||
+	if sourceDeleted.Valid && sourceDeleted.String != "" ||
+		!containerRekeySourceSafe(sourceState, sourceDetail, ct.RelocateToken) ||
+		ct.OwnerEpoch != guard.OwnerEpoch ||
 		ct.SpecGeneration != guard.SpecGeneration ||
 		ct.ActiveOperationID != guard.OperationID ||
 		containerCreateIdentityHash(ct, labels) != guard.IdentityHash {

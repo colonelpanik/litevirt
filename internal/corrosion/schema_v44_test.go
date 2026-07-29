@@ -248,7 +248,7 @@ func TestSchemaV44RecordRoundTripsPreserveFields(t *testing.T) {
 		gotCT.OwnerEpoch != 7 || gotCT.SpecGeneration != 9 || gotCT.ActiveOperationID != "op-1" {
 		t.Fatalf("container update lost lifecycle fields: got=%v err=%v", gotCT, err)
 	}
-	applied, err := RekeyContainerOwner(ctx, c, *gotCT, "h2")
+	applied, err := RekeyContainerOwnerGuarded(ctx, c, *gotCT, "h2")
 	if err != nil || !applied {
 		t.Fatalf("re-key container: applied=%v err=%v", applied, err)
 	}

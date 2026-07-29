@@ -253,6 +253,16 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		if err := s.admitPoolAttach(ctx, project, targetHost, d.Storage); err != nil {
 			return nil, err
 		}
+		// …and that it will actually FIT. Same loop, same pool lookup, same
+		// fail-closed posture — a full pool is worse than a full host, because
+		// qcow2 images cannot grow and guests take I/O errors rather than merely
+		// thrashing. Unparseable sizes are left to the create path's own
+		// validation rather than guessed at here.
+		if sz, perr := qcow2.ParseSize(d.Size); perr == nil {
+			if err := s.admitPoolCapacity(ctx, targetHost, d.Storage, int64(sz)); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if targetHost != s.hostName {
 		slog.Info("forwarding CreateVM to target host", "vm", spec.Name, "target", targetHost)

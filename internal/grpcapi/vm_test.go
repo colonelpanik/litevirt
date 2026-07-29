@@ -1431,3 +1431,67 @@ func TestStartVMLocked_RecoveryPathIsNotAdmitted(t *testing.T) {
 		t.Fatalf("startVMLocked refused a recovery start: %v — the automated restart paths must not be admitted, or a host reboot strands every VM after the first few", err)
 	}
 }
+
+// TestCreateVM_RefusesADiskThatWillNotFitItsPool: disk was tracked and displayed
+// but never admitted. A full pool is worse than a full host — qcow2 images cannot
+// grow, so guests take I/O errors rather than merely thrashing.
+func TestCreateVM_RefusesADiskThatWillNotFitItsPool(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 65536,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// 10 GiB pool, 9 GiB actually used → ~0.5 GiB free after the 5% reserve.
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "tank", Driver: "dir", Target: "/tank",
+		TotalBytes: 10 << 30, UsedBytes: 9 << 30, State: "active",
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+
+	// 100 GiB declared → ~33 GiB after the thin ratio, far beyond what is free.
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "toobig", Cpu: 1, MemoryMib: 1024,
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "100G", Storage: "tank"}},
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("disk exceeding its pool: got %v, want ResourceExhausted", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, s.db, "toobig"); rec != nil {
+		t.Errorf("refused VM was persisted anyway: %+v", rec)
+	}
+}
+
+// TestCreateVM_UnsampledPoolDoesNotBlockCreates: a pool with no statfs sample is
+// UNKNOWN, not full. Refusing there would break every cluster whose pools have
+// not been sampled yet — the opposite of safe.
+func TestCreateVM_UnsampledPoolDoesNotBlockCreates(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 65536,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "fresh", Driver: "dir", Target: "/fresh",
+		TotalBytes: 0, UsedBytes: 0, State: "active", // never sampled
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+
+	if _, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "ok", Cpu: 1, MemoryMib: 1024,
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "500G", Storage: "fresh"}},
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}}); status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("an unsampled pool refused a create: %v — missing telemetry means unknown, not full", err)
+	}
+}

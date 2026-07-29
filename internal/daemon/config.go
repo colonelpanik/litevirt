@@ -591,6 +591,14 @@ type CapacityConfig struct {
 	// VMMemoryOverheadMiB is charged per running VM on top of its configured
 	// memory for qemu's own footprint. Default 128.
 	VMMemoryOverheadMiB int `yaml:"vm_memory_overhead_mib,omitempty"`
+	// DiskOvercommitRatio divides a new disk's DECLARED size before it is compared
+	// to its pool's ACTUAL free space. Thin provisioning is the norm, so >1 is the
+	// safe default here — the opposite of memory, for the same reason: count what
+	// is really taken. Default 3.0.
+	DiskOvercommitRatio float64 `yaml:"disk_overcommit_ratio,omitempty"`
+	// PoolReservePct is the share of each storage pool held back so it can never be
+	// driven to zero. Default 5.
+	PoolReservePct int `yaml:"pool_reserve_pct,omitempty"`
 }
 
 // Policy converts the config into the corrosion capacity policy. Every
@@ -608,6 +616,8 @@ func (c CapacityConfig) Policy() corrosion.CapacityPolicy {
 		MemReserveMiB:    orDefault(c.HostMemoryReserveMiB, d.MemReserveMiB),
 		MemReservePct:    orDefault(c.HostMemoryReservePct, d.MemReservePct),
 		VMMemOverheadMiB: orDefault(c.VMMemoryOverheadMiB, d.VMMemOverheadMiB),
+		DiskOvercommit:   orDefault(c.DiskOvercommitRatio, d.DiskOvercommit),
+		PoolReservePct:   orDefault(c.PoolReservePct, d.PoolReservePct),
 	}
 }
 

@@ -121,3 +121,42 @@ func (s *Server) admitPoolAttach(ctx context.Context, wlProject, host, poolName 
 	}
 	return nil
 }
+
+// admitPoolCapacity refuses a disk that will not fit its storage pool.
+//
+// Pool-level, not host-level, and that is the whole point. hosts.disk_total is
+// the wrong denominator for anything shared — a Ceph or NFS pool's capacity has
+// nothing to do with the host's local disk — while every managed pool carries its
+// own statfs-sampled total/used. Comparing against the pool answers the question
+// that actually matters for both local and shared storage.
+//
+// Charged against ACTUAL free space, with the declared size divided by the
+// thin-provisioning ratio first. Admitting a declared 100 GiB qcow2 against real
+// free space at 1:1 would refuse ordinary practice, since it may occupy 2 GiB.
+//
+// Skips silently when the pool is unmanaged or carries no capacity sample.
+// Missing telemetry means UNKNOWN, never full: refusing there would break every
+// cluster whose pools have not been sampled, which is the opposite of safe.
+func (s *Server) admitPoolCapacity(ctx context.Context, host, poolName string, declaredBytes int64) error {
+	if poolName == "" || declaredBytes <= 0 {
+		return nil
+	}
+	pool, ok, err := corrosion.GetStoragePool(ctx, s.db, host, poolName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "pool capacity lookup %q: %v", poolName, err)
+	}
+	if !ok {
+		return nil // not a managed pool here — nothing to admit against
+	}
+	free, known := corrosion.PoolFreeBytes(pool.TotalBytes, pool.UsedBytes, s.capacity)
+	if !known {
+		return nil // never sampled — unknown, not full
+	}
+	need := corrosion.DiskNeedBytes(declaredBytes, s.capacity)
+	if need > free {
+		return status.Errorf(codes.ResourceExhausted,
+			"storage pool %q on %s has insufficient free space for a %d GiB disk (needs ~%d GiB after thin-provisioning, %d GiB free after reserve)",
+			poolName, host, declaredBytes>>30, need>>30, free>>30)
+	}
+	return nil
+}

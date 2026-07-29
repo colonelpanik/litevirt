@@ -211,3 +211,39 @@ func TestHostFreeCapacity_ContainerCPUIsNotCountedAsVCPU(t *testing.T) {
 			baselineCPU, afterCPU)
 	}
 }
+
+// TestPoolFreeBytes_UnsampledPoolIsUnknownNotFull is the safety property for the
+// disk dimension: a pool with no capacity sample must NOT read as full.
+//
+// Pool usage is statfs-sampled by the daemon. A pool never sampled — or a driver
+// reporting nothing — has total 0, and treating that as "no space" would refuse
+// every disk on every un-sampled cluster. Unknown means skip the check, not deny.
+func TestPoolFreeBytes_UnsampledPoolIsUnknownNotFull(t *testing.T) {
+	if _, ok := PoolFreeBytes(0, 0, DefaultCapacityPolicy()); ok {
+		t.Error("an unsampled pool (total 0) reported a known free figure — callers would treat it as full and refuse every disk")
+	}
+	free, ok := PoolFreeBytes(100<<30, 50<<30, DefaultCapacityPolicy())
+	if !ok {
+		t.Fatal("a sampled pool should report a known free figure")
+	}
+	// 100 GiB total, 50 used, 5% reserve = 5 GiB → 45 GiB free.
+	if want := int64(45) << 30; free != want {
+		t.Errorf("free = %d, want %d (total - used - 5%% reserve)", free, want)
+	}
+}
+
+// TestDiskNeedBytes_ThinProvisioningIsNotChargedInFull: charging a declared disk
+// at 1:1 against ACTUAL free space would refuse ordinary practice, since a
+// declared 100 GiB qcow2 may occupy 2 GiB.
+func TestDiskNeedBytes_ThinProvisioningIsNotChargedInFull(t *testing.T) {
+	declared := int64(100) << 30
+	need := DiskNeedBytes(declared, DefaultCapacityPolicy())
+	if need >= declared {
+		t.Errorf("a %d GiB declared disk is charged %d GiB — thin provisioning means the declared size is not what it takes",
+			declared>>30, need>>30)
+	}
+	// Default ratio 3.0.
+	if want := declared / 3; need != want {
+		t.Errorf("need = %d, want %d (declared / 3.0)", need, want)
+	}
+}

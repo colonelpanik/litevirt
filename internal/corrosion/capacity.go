@@ -43,6 +43,16 @@ type CapacityPolicy struct {
 	// covering qemu's own footprint (device models, video, page tables). Ignoring
 	// it systematically under-counts usage, by more the denser the host.
 	VMMemOverheadMiB int
+	// DiskOvercommit divides a new disk's DECLARED size before it is compared to a
+	// pool's ACTUAL free space. Thin provisioning is the norm — a declared 100 GiB
+	// qcow2 may occupy 2 GiB — so admitting declared-against-actual at 1.0 would
+	// refuse ordinary practice. >1 is therefore the safe default here, the opposite
+	// of memory, for the same underlying reason: only count what is really taken.
+	DiskOvercommit float64
+	// PoolReservePct is the share of a storage pool held back so it can never be
+	// driven to zero. A full pool is worse than a full host: qcow2 images cannot
+	// grow, and guests take I/O errors rather than merely thrashing.
+	PoolReservePct int
 }
 
 // DefaultCapacityPolicy is what a cluster gets with nothing configured.
@@ -58,6 +68,8 @@ func DefaultCapacityPolicy() CapacityPolicy {
 		MemReserveMiB:    1024,
 		MemReservePct:    5,
 		VMMemOverheadMiB: 128,
+		DiskOvercommit:   3.0,
+		PoolReservePct:   5,
 	}
 }
 
@@ -117,7 +129,44 @@ func (p CapacityPolicy) normalize() CapacityPolicy {
 	if p.VMMemOverheadMiB < 0 {
 		p.VMMemOverheadMiB = 0
 	}
+	if p.DiskOvercommit <= 0 {
+		p.DiskOvercommit = d.DiskOvercommit
+	}
+	if p.PoolReservePct < 0 {
+		p.PoolReservePct = 0
+	}
 	return p
+}
+
+// PoolFreeBytes is a storage pool's ACTUAL free space, less the reserve.
+//
+// Actual, not allocated: pool used_bytes is statfs-sampled by the daemon
+// (daemon.go:1265), so this compares against what the filesystem really has
+// rather than the sum of declared disk sizes — which under thin provisioning is
+// wildly larger than reality and would refuse ordinary practice.
+//
+// ok=false when the pool carries no capacity sample (total 0 — never sampled, or
+// a driver that reports nothing). Callers must treat that as "unknown, do not
+// admit", never as "full": refusing on missing telemetry would break every
+// cluster whose pools have not been sampled yet.
+func PoolFreeBytes(total, used int64, policy CapacityPolicy) (free int64, ok bool) {
+	if total <= 0 {
+		return 0, false
+	}
+	p := policy.normalize()
+	reserve := total * int64(p.PoolReservePct) / 100
+	free = total - used - reserve
+	if free < 0 {
+		free = 0
+	}
+	return free, true
+}
+
+// DiskNeedBytes is how much of a pool a newly declared disk should be charged,
+// after the thin-provisioning ratio.
+func DiskNeedBytes(declared int64, policy CapacityPolicy) int64 {
+	p := policy.normalize()
+	return int64(float64(declared) / p.DiskOvercommit)
 }
 
 // HostAllocatable reports how much of a host may be handed to workloads, after

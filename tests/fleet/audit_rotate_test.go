@@ -162,3 +162,89 @@ func oneString(t *testing.T, n *Node, query string) string {
 	}
 	return ""
 }
+
+// TestFleet_PeerCatchesARewriteSealedByTheRotationHead is the case a retirement
+// boundary cannot reach, checked from a peer rather than in one process.
+//
+// The attacker holds only the retired key. They rewrite a row that key was
+// entitled to sign, re-sign it correctly, and pick the LAST row so nothing links
+// forward to contradict them. Every ordinary check passes: the chain links, the
+// signature verifies against a published certificate, the sequence numbers are
+// untouched, and the key was within its boundary.
+//
+// The only thing left is the chain head published at rotation, which records the
+// hash the chain had at that sequence and is signed by the successor key the
+// attacker does not have. Isolating this on the live lab is not practical —
+// anti-entropy keeps repairing the tampered node from its peers, which is
+// correct behaviour but removes the evidence mid-test.
+func TestFleet_PeerCatchesARewriteSealedByTheRotationHead(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2})
+	a, b := c.Node("node-0"), c.Node("node-1")
+	signNode(t, a)
+	signNode(t, b)
+
+	auditRow(t, a, "a1", "vm.create", "vm1")
+	auditRow(t, a, "a2", "user.delete", "alice")
+	oldKR := a.DB.AuditKeyringOf()
+
+	rotateNode(t, c, a) // publishes a head over a1+a2, signed with the NEW key
+
+	// Rewrite the tail row and re-sign it with the retired key — a complete,
+	// internally consistent forgery.
+	if err := a.DB.Execute(ctx,
+		`UPDATE audit_log SET target = 'bob', username = 'system' WHERE id = 'a2'`); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+	rows, err := a.DB.Query(ctx,
+		`SELECT id, timestamp, username, host_name, action, target, detail, result, prev_hash, seq
+		 FROM audit_log WHERE id = 'a2'`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read a2: %v (rows=%d)", err, len(rows))
+	}
+	r := rows[0]
+	rec := corrosion.AuditRecord{
+		ID: r.String("id"), Timestamp: r.String("timestamp"), Username: r.String("username"),
+		HostName: r.String("host_name"), Action: r.String("action"), Target: r.String("target"),
+		Detail: r.String("detail"), Result: r.String("result"),
+		PrevHash: r.String("prev_hash"), Seq: r.Int64("seq"),
+	}
+	rec.ContentHash = corrosion.HashAuditRow(rec)
+	sig, err := oldKR.SignRow(rec.ContentHash, rec.Seq)
+	if err != nil {
+		t.Fatalf("SignRow with the retired key: %v", err)
+	}
+	if err := a.DB.Execute(ctx,
+		`UPDATE audit_log SET content_hash = ?, signature = ?, key_id = ? WHERE id = 'a2'`,
+		rec.ContentHash, sig, oldKR.KeyID()); err != nil {
+		t.Fatalf("re-sign a2: %v", err)
+	}
+
+	// Sanity: the forgery really does defeat every other check, or this test
+	// would be proving something easier than it claims.
+	onA := verifyOn(t, a)
+	if onA.BrokenAt != "" {
+		t.Fatalf("the forged chain does not link (broke at %q); the point is a rewrite that "+
+			"only the head can see", onA.BrokenAt)
+	}
+	if len(onA.BadSignature) > 0 || len(onA.RetiredKeyUse) > 0 {
+		t.Fatalf("the forgery was caught by an easier check (bad_sig=%v retired=%v); it is "+
+			"supposed to be signature-valid and inside the retired key's boundary",
+			onA.BadSignature, onA.RetiredKeyUse)
+	}
+	if len(onA.HeadMismatch) == 0 {
+		t.Fatalf("the node itself did not catch the rewrite: %+v", onA)
+	}
+
+	// And the peer reaches the same conclusion from replicated state alone.
+	b.DB.MergeStateBytesLWW(pullDump(t, c, a))
+	onB := verifyOn(t, b)
+	if len(onB.HeadMismatch) == 0 {
+		t.Fatalf("%s did not catch a rewrite sealed by %s's rotation head: %+v\n"+
+			"the head is the only remaining witness once the signature verifies and the "+
+			"sequence numbers are intact", b.Name, a.Name, onB)
+	}
+	if !strings.Contains(strings.Join(onB.HeadMismatch, " "), a.Name) {
+		t.Errorf("findings %v do not name the affected host", onB.HeadMismatch)
+	}
+}

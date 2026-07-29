@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -152,6 +153,61 @@ func TestSchemaV44MigratesV43AndPreservesRows(t *testing.T) {
 	}
 }
 
+func TestSchemaV44FreshAndUpgradedColumnOrderMatch(t *testing.T) {
+	ctx := context.Background()
+	fresh := newTestDB(t)
+	upgraded := newTestDB(t)
+
+	for _, column := range []string{"owner_epoch", "spec_generation", "active_operation_id"} {
+		if err := upgraded.execLocal(ctx, `ALTER TABLE containers DROP COLUMN `+column); err != nil {
+			t.Fatalf("simulate v43 drop containers.%s: %v", column, err)
+		}
+	}
+	if err := upgraded.execLocal(ctx, `ALTER TABLE hosts DROP COLUMN capacity_policy_hash`); err != nil {
+		t.Fatalf("simulate v43 drop hosts.capacity_policy_hash: %v", err)
+	}
+	for _, column := range []string{"subject_pattern", "project"} {
+		if err := upgraded.execLocal(ctx, `ALTER TABLE notification_routes DROP COLUMN `+column); err != nil {
+			t.Fatalf("simulate v43 drop notification_routes.%s: %v", column, err)
+		}
+	}
+	for _, m := range schemaMigrationLedger {
+		if m.Version == 44 {
+			if err := upgraded.execLocal(ctx, `DELETE FROM applied_migrations WHERE id = ?`, m.ID); err != nil {
+				t.Fatalf("remove v44 ledger %s: %v", m.ID, err)
+			}
+		}
+	}
+	if err := upgraded.execLocal(ctx, `UPDATE schema_state SET version = 43 WHERE id = 1`); err != nil {
+		t.Fatalf("stamp v43: %v", err)
+	}
+	if err := InitSchema(ctx, upgraded); err != nil {
+		t.Fatalf("migrate v43 to v44: %v", err)
+	}
+
+	for _, table := range []string{"containers", "hosts", "notification_routes"} {
+		freshColumns := tableColumnOrder(t, fresh, table)
+		upgradedColumns := tableColumnOrder(t, upgraded, table)
+		if !reflect.DeepEqual(freshColumns, upgradedColumns) {
+			t.Errorf("%s column order differs:\nfresh:    %v\nupgraded: %v",
+				table, freshColumns, upgradedColumns)
+		}
+	}
+}
+
+func tableColumnOrder(t *testing.T, c *Client, table string) []string {
+	t.Helper()
+	rows, err := c.Query(context.Background(), `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		t.Fatalf("read %s column order: %v", table, err)
+	}
+	columns := make([]string, 0, len(rows))
+	for _, row := range rows {
+		columns = append(columns, row.String("name"))
+	}
+	return columns
+}
+
 func TestSchemaV44RecordRoundTripsPreserveFields(t *testing.T) {
 	c := newTestDB(t)
 	ctx := context.Background()
@@ -218,6 +274,66 @@ func TestSchemaV44RecordRoundTripsPreserveFields(t *testing.T) {
 	if err != nil || len(routes) != 1 ||
 		routes[0].SubjectPattern != "vm:*" || routes[0].Project != "acme" {
 		t.Fatalf("route scope fields: routes=%v err=%v", routes, err)
+	}
+}
+
+func TestUpsertContainerPreservesLifecycleFieldsOnConflict(t *testing.T) {
+	c := newTestDB(t)
+	ctx := context.Background()
+
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName:          "h1",
+		Name:              "ct1",
+		State:             "pending",
+		Image:             "debian:12",
+		OwnerEpoch:        7,
+		SpecGeneration:    9,
+		ActiveOperationID: "op-current",
+	}); err != nil {
+		t.Fatalf("seed container: %v", err)
+	}
+
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName:          "h1",
+		Name:              "ct1",
+		State:             "running",
+		Image:             "debian:13",
+		OwnerEpoch:        1,
+		SpecGeneration:    2,
+		ActiveOperationID: "op-stale",
+	}); err != nil {
+		t.Fatalf("ordinary update with stale lifecycle fields: %v", err)
+	}
+	got, err := GetContainer(ctx, c, "h1", "ct1")
+	if err != nil || got == nil {
+		t.Fatalf("get container after stale update: got=%v err=%v", got, err)
+	}
+	if got.State != "running" || got.Image != "debian:13" {
+		t.Fatalf("ordinary fields not updated: state=%q image=%q", got.State, got.Image)
+	}
+	if got.OwnerEpoch != 7 || got.SpecGeneration != 9 || got.ActiveOperationID != "op-current" {
+		t.Fatalf("stale update changed lifecycle fields: got=(%d,%d,%q), want=(7,9,op-current)",
+			got.OwnerEpoch, got.SpecGeneration, got.ActiveOperationID)
+	}
+
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName: "h1",
+		Name:     "ct1",
+		State:    "stopped",
+		Image:    "debian:14",
+	}); err != nil {
+		t.Fatalf("ordinary update with omitted lifecycle fields: %v", err)
+	}
+	got, err = GetContainer(ctx, c, "h1", "ct1")
+	if err != nil || got == nil {
+		t.Fatalf("get container after omitted update: got=%v err=%v", got, err)
+	}
+	if got.State != "stopped" || got.Image != "debian:14" {
+		t.Fatalf("ordinary fields not updated after omitted lifecycle fields: state=%q image=%q", got.State, got.Image)
+	}
+	if got.OwnerEpoch != 7 || got.SpecGeneration != 9 || got.ActiveOperationID != "op-current" {
+		t.Fatalf("omitted update changed lifecycle fields: got=(%d,%d,%q), want=(7,9,op-current)",
+			got.OwnerEpoch, got.SpecGeneration, got.ActiveOperationID)
 	}
 }
 

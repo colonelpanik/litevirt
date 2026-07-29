@@ -609,10 +609,12 @@ var schemaDDL = []string{
 		mem_overcommit  REAL NOT NULL DEFAULT 0,
 		cpu_reserve     INTEGER NOT NULL DEFAULT -1,
 		mem_reserve_mib INTEGER NOT NULL DEFAULT -1,
-		capacity_policy_hash TEXT NOT NULL DEFAULT '',
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
-		deleted_at   TEXT
+		deleted_at   TEXT,
+		version      TEXT DEFAULT '',
+		region       TEXT NOT NULL DEFAULT 'default',
+		capacity_policy_hash TEXT NOT NULL DEFAULT ''
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS host_labels (
@@ -1050,14 +1052,14 @@ var schemaDDL = []string{
 	`CREATE TABLE IF NOT EXISTS notification_routes (
 		id            TEXT PRIMARY KEY,
 		event_pattern TEXT NOT NULL,         -- glob, e.g. "backup.*", "*"
-		subject_pattern TEXT NOT NULL DEFAULT '*',
-		project       TEXT NOT NULL DEFAULT '',
 		target_id     TEXT NOT NULL,
 		min_severity  TEXT NOT NULL DEFAULT 'info', -- info | warn | error
 		enabled       INTEGER NOT NULL DEFAULT 1,
 		created_at    TEXT NOT NULL,
 		updated_at    TEXT NOT NULL,
-		deleted_at    TEXT
+		deleted_at    TEXT,
+		subject_pattern TEXT NOT NULL DEFAULT '*',
+		project       TEXT NOT NULL DEFAULT ''
 	)`,
 
 	// ═══════════ LOAD BALANCERS ═══════════
@@ -1435,12 +1437,12 @@ var schemaDDL = []string{
 		on_host_failure TEXT,                             -- host-loss policy: ''/'none' | 'image-recreate' (v28); v34 prefers restore-from-backup, then image-recreate
 		create_spec     TEXT,                             -- JSON create-time intent (template/distro/release/arch/networks) for faithful relocation/restore (v34)
 		relocate_token  TEXT,                             -- attempt token a restore-relocation stamps so the coordinator can prove a target row is ITS restore (v34)
-		owner_epoch        INTEGER NOT NULL DEFAULT 0,     -- ownership incarnation for ABA-proof recovery (v44)
-		spec_generation    INTEGER NOT NULL DEFAULT 0,     -- monotonic desired-spec generation (v44)
-		active_operation_id TEXT NOT NULL DEFAULT '',      -- workload-wide mutation barrier (v44)
 		created_at     TEXT NOT NULL,
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT,
+		owner_epoch        INTEGER NOT NULL DEFAULT 0,     -- ownership incarnation for ABA-proof recovery (v44)
+		spec_generation    INTEGER NOT NULL DEFAULT 0,     -- monotonic desired-spec generation (v44)
+		active_operation_id TEXT NOT NULL DEFAULT '',      -- workload-wide mutation barrier (v44)
 		PRIMARY KEY (host_name, name)
 	)`,
 

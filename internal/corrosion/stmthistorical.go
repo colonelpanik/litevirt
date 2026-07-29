@@ -61,6 +61,15 @@ func HistoricalShapes() []HistoricalShape {
 	// peer's stream.
 	add("INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,\n\t\t\tcpu_total, mem_total, disk_total, fence_strategy, version, role, created_at, updated_at)\n\t\t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", "insert_host_v130")
 
+	// InsertHost (schema v43): the intermediate shape after per-host capacity
+	// overrides were added and before v44 appended capacity_policy_hash. Peers
+	// running that schema still emit this statement during a rolling upgrade.
+	add(`INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
+			cpu_total, mem_total, disk_total, fence_strategy, version, role,
+			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
+			created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "insert_host_v43")
+
 	// ConfigureHost fixed shape (pre-v43): the single COALESCE UPDATE before the
 	// per-host capacity policy added cpu_overcommit/mem_overcommit/cpu_reserve/
 	// mem_reserve_mib. Same hazard as insert_host_v130: a prior-release peer

@@ -198,9 +198,6 @@ func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 		   -- intent", forward-only).
 		   create_spec = CASE WHEN excluded.create_spec <> '' THEN excluded.create_spec ELSE create_spec END,
 		   relocate_token = excluded.relocate_token,
-		   owner_epoch = excluded.owner_epoch,
-		   spec_generation = excluded.spec_generation,
-		   active_operation_id = excluded.active_operation_id,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		Params: []interface{}{

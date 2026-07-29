@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -23,8 +24,9 @@ import (
 // containers upsert/re-key and notification-route insert gained additive columns.
 // Their v1.3.0 shapes were ADDED to the historical families rather than dropped,
 // so supported peers and retained WAL continue to apply. No existing historical
-// identity was removed or changed.
-const compatibilityDigest = "eb487e6a2fc553b3edc2263648a968808cef3a287c8cf15ce5121e50b0d88377"
+// identity was removed or changed. The immediate schema-v43 InsertHost shape was
+// subsequently added after v44 appended capacity_policy_hash.
+const compatibilityDigest = "0a988af828aae56f316eb53c296bc0bb3ee8c882b204dd8cd9a03f70281223af"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -70,6 +72,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"network_rename_v130":             3,   // network_vteps / ip_allocations / vm_interfaces
 	"vm_disks_insert_v130":            1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
 	"insert_host_v130":                1,   // pre-capacity-policy hosts insert (narrower column list)
+	"insert_host_v43":                 1,   // capacity overrides present, before v44 capacity-policy fingerprint
 	"configure_host_fixed_v130":       1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
 	"containers_upsert_v130":          1,   // pre-v44 container upsert without lifecycle fencing columns
 	"containers_rekey_v130":           1,   // pre-v44 container re-key without lifecycle fencing columns
@@ -296,4 +299,70 @@ func TestHistoricalLedgerKeepsFixedConfigureHostShape(t *testing.T) {
 	// so a typo in the registered entry cannot self-certify — the package's
 	// established shape-retention pattern (see release_corpus_test.go).
 	mustResolve(t, "pre-v43 fixed ConfigureHost", oldSQL)
+}
+
+func TestHistoricalLedgerKeepsV43InsertHostShapeAndReceiverFields(t *testing.T) {
+	const oldSQL = `INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
+			cpu_total, mem_total, disk_total, fence_strategy, version, role,
+			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
+			created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	fp, err := FingerprintSQL(oldSQL)
+	if err != nil {
+		t.Fatalf("fingerprint v43 InsertHost: %v", err)
+	}
+	const wantFingerprint = "stmtshape/v1:d383c54470d1d0692c38cdb7a55624d4ec6828dd7ff533ff5757e824f7fffd11"
+	if fp != wantFingerprint {
+		t.Fatalf("v43 InsertHost fingerprint = %q, want %q", fp, wantFingerprint)
+	}
+	if _, ok := LedgerLookup(fp); !ok {
+		t.Fatalf("v43 InsertHost shape %s is not registered", fp)
+	}
+
+	const oldTS = "1000000000000-0000-n1"
+	const newTS = "3000000000000-0000-n2"
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`INSERT INTO hosts
+		 (name, address, ssh_user, cert_serial, capacity_policy_hash, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"h1", "10.0.0.1", "root", "serial", "sha256:receiver-policy",
+		"2020-01-01T00:00:00Z", oldTS); err != nil {
+		t.Fatalf("seed receiver host: %v", err)
+	}
+
+	stmts, err := json.Marshal([]Statement{{
+		SQL: oldSQL,
+		Params: []interface{}{
+			"h1", "10.0.0.2", "admin", 2222, 7444, "active", "serial-2",
+			8, 16384, 1024, "strict", "v43", "worker",
+			1.5, 1.25, 2, 1024,
+			"2020-01-01T00:00:00Z", newTS,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("marshal v43 InsertHost mutation: %v", err)
+	}
+	r := NewReplicator(c, "", RelayConfig{})
+	if _, err := r.ApplyRemoteMutations(ctx, []*pb.MutationEntry{{
+		Seq: 1, Hlc: newTS, Origin: "v43-peer", Stmts: string(stmts),
+	}}); err != nil {
+		t.Fatalf("v43 InsertHost historical shape must apply: %v", err)
+	}
+
+	rows, err := c.Query(ctx,
+		`SELECT address, ssh_user, cpu_overcommit, mem_overcommit,
+		        cpu_reserve, mem_reserve_mib, capacity_policy_hash
+		 FROM hosts WHERE name = ?`, "h1")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read updated receiver host: rows=%d err=%v", len(rows), err)
+	}
+	if rows[0].String("address") != "10.0.0.2" || rows[0].String("ssh_user") != "admin" ||
+		rows[0].Float("cpu_overcommit") != 1.5 || rows[0].Float("mem_overcommit") != 1.25 ||
+		rows[0].Int("cpu_reserve") != 2 || rows[0].Int("mem_reserve_mib") != 1024 ||
+		rows[0].String("capacity_policy_hash") != "sha256:receiver-policy" {
+		t.Fatalf("v43 host apply lost current or receiver-only fields: %#v", rows[0])
+	}
 }

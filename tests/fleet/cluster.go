@@ -430,11 +430,15 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 }
 
-// replicationMethods are the gRPC method names (final path segment) the
-// partition gate drops. It covers BOTH lanes — public and sensitive — and both
-// the digest and the dump/push/ack steps; omitting the sensitive lane would let
-// it converge during a "partition".
-var replicationMethods = map[string]bool{
+// partitionedMethods are the gRPC method names (final path segment) the partition
+// gate drops — the peer-to-peer traffic a severed link would actually take out.
+//
+// Replication covers BOTH lanes, public and sensitive, and both the digest and the
+// dump/push/ack steps; omitting the sensitive lane would let a "partition" converge.
+// Delegated project admission is peer traffic over the same link, so a partition must
+// drop it too — otherwise a scenario that partitions the authority holder would still
+// reach it and prove nothing about the unreachable-holder path.
+var partitionedMethods = map[string]bool{
 	"PushMutations":            true,
 	"AckMutations":             true,
 	"GetStateDigest":           true,
@@ -442,6 +446,8 @@ var replicationMethods = map[string]bool{
 	"StreamStateDump":          true,
 	"GetSensitiveStateDigest":  true,
 	"StreamSensitiveStateDump": true,
+	"ReserveProjectCapacity":   true,
+	"ReleaseProjectCapacity":   true,
 }
 
 // methodName returns the final segment of a gRPC full-method string
@@ -467,10 +473,10 @@ func peerCertCN(ctx context.Context) string {
 	return tlsInfo.State.PeerCertificates[0].Subject.CommonName
 }
 
-// blocked reports whether a replication RPC from the given caller is currently
+// blocked reports whether a peer RPC from the given caller is currently
 // partitioned away from this node.
 func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
-	if !replicationMethods[methodName(fullMethod)] {
+	if !partitionedMethods[methodName(fullMethod)] {
 		return false
 	}
 	caller := peerCertCN(ctx)

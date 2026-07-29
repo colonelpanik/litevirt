@@ -364,6 +364,18 @@ type EnforcementConfig struct {
 	// operator-run activation contract (see docs/diagnostics.md). Default false; the flag is a
 	// reversible advertisement opt-in only.
 	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
+	// ProjectAuthority: route the PROJECT-QUOTA half of an admission to the project's
+	// D1 authority holder instead of deciding from this node's replica
+	// (capabilities.ProjectAuthorityV1). One decider per project closes the window
+	// where two nodes that have not yet exchanged operation rows both admit and
+	// together exceed the quota. Host capacity is unaffected — it is already
+	// serialized by the target host's owner.
+	//
+	// Enforced only when this flag is set AND the token has latched cluster-wide, so a
+	// node cannot serialize against a decider its peers are still bypassing. An
+	// unreachable holder fails the admission CLOSED. Default false; reversible kill
+	// switch.
+	ProjectAuthority bool `yaml:"project_authority,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

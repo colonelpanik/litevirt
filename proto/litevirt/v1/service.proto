@@ -2117,6 +2117,19 @@ service LiteVirt {
     rpc SetProjectQuota(SetProjectQuotaRequest)     returns (ProjectQuota);
     rpc GetProjectQuota(GetProjectQuotaRequest)     returns (ProjectQuota);
     rpc GetProjectUsage(GetProjectUsageRequest)     returns (ProjectUsage);
+
+    // ── project admission authority (F2 second half / D1) ──
+    // PEER-ONLY. Reserve-then-verify makes two concurrent admissions agree only
+    // once both reservations are VISIBLE to both deciders; corrosion is eventually
+    // consistent, so two nodes that have not yet exchanged operation rows can still
+    // both admit. These route the PROJECT-QUOTA half of an admission to the
+    // project's authority holder, so every quota decision for one project is made
+    // by ONE node against a view that already contains its own grants.
+    //
+    // Host capacity is NOT delegated: it is already serialized by the target host's
+    // owner, which is the only node that reserves against it.
+    rpc ReserveProjectCapacity(ReserveProjectCapacityRequest) returns (ReserveProjectCapacityResponse);
+    rpc ReleaseProjectCapacity(ReleaseProjectCapacityRequest) returns (google.protobuf.Empty);
 }
 
 // Pre-flight check before `lv host upgrade`. Surfaces in-flight work,
@@ -2384,3 +2397,29 @@ message ProjectUsage {
     int32  backup_gib_used = 8; // summed manifest size across the project's VMs
 }
 message GetProjectUsageRequest { string project_name = 1; }
+
+// Delegated project-quota admission (peer-only). The caller sends the epoch it
+// believes is current; the holder refuses a request stamped with a stale epoch
+// rather than deciding under an authority it no longer holds, so a fenced
+// ex-holder's in-flight admissions cannot slip through after a takeover.
+message ReserveProjectCapacityRequest {
+    string project         = 1;
+    string method          = 2;  // originating RPC name, recorded in the journal
+    int32  cpu_delta       = 3;  // positive grow only; ≤0 needs no reservation
+    int32  mem_mib_delta   = 4;
+    int64  authority_epoch = 5;  // epoch the CALLER believes is current
+    string principal       = 6;  // originating end-user, preserved for audit
+    // What this admission is about to create, as "vm:<name>" / "ct:<name>". The
+    // holder keeps a RELEASED lease counted until this resource is visible in its
+    // own replica — the winner commits on its own node, so without that the holder
+    // under-counts until replication catches up and hands the same quota out twice.
+    string resource_id     = 7;
+}
+message ReserveProjectCapacityResponse {
+    string lease_id        = 1;  // holder-local operation id, passed back to release
+    int64  authority_epoch = 2;  // epoch the grant was actually made under
+}
+message ReleaseProjectCapacityRequest {
+    string project  = 1;
+    string lease_id = 2;
+}

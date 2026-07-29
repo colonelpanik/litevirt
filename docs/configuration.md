@@ -227,6 +227,21 @@ enforcement:
                               # until the deferred operator-run contract (see docs/diagnostics.md).
                               # The flag gates advertisement/opt-in only; it does not revoke an
                               # already-formed latch. Advertised only while on; enable fleet-uniformly.
+  project_authority: false    # route the PROJECT-QUOTA half of an admission to the project's
+                              # admission-authority holder instead of deciding from this node's
+                              # replica. Admission counts in-flight reservations, but two nodes
+                              # that have not yet exchanged those rows each see only their own
+                              # and can both admit — together exceeding the quota. One decider
+                              # per project closes that window; HOST capacity is unaffected
+                              # (only the target host's owner reserves against it, so it is
+                              # already serialized). A holder that cannot be reached REFUSES the
+                              # admission rather than falling back to the stale local view, so
+                              # enabling this trades a little availability for the guarantee.
+                              # Advertised only while on (like operation_protocol) and active
+                              # only once the flag is set AND project_authority_v1 has latched
+                              # fleet-wide — a peer still deciding locally would bypass the
+                              # single decider entirely. Enable fleet-uniformly; the flag is the
+                              # reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

@@ -242,6 +242,8 @@ const (
 	LiteVirt_SetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/SetProjectQuota"
 	LiteVirt_GetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectQuota"
 	LiteVirt_GetProjectUsage_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectUsage"
+	LiteVirt_ReserveProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReserveProjectCapacity"
+	LiteVirt_ReleaseProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseProjectCapacity"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -573,6 +575,18 @@ type LiteVirtClient interface {
 	SetProjectQuota(ctx context.Context, in *SetProjectQuotaRequest, opts ...grpc.CallOption) (*ProjectQuota, error)
 	GetProjectQuota(ctx context.Context, in *GetProjectQuotaRequest, opts ...grpc.CallOption) (*ProjectQuota, error)
 	GetProjectUsage(ctx context.Context, in *GetProjectUsageRequest, opts ...grpc.CallOption) (*ProjectUsage, error)
+	// ── project admission authority (F2 second half / D1) ──
+	// PEER-ONLY. Reserve-then-verify makes two concurrent admissions agree only
+	// once both reservations are VISIBLE to both deciders; corrosion is eventually
+	// consistent, so two nodes that have not yet exchanged operation rows can still
+	// both admit. These route the PROJECT-QUOTA half of an admission to the
+	// project's authority holder, so every quota decision for one project is made
+	// by ONE node against a view that already contains its own grants.
+	//
+	// Host capacity is NOT delegated: it is already serialized by the target host's
+	// owner, which is the only node that reserves against it.
+	ReserveProjectCapacity(ctx context.Context, in *ReserveProjectCapacityRequest, opts ...grpc.CallOption) (*ReserveProjectCapacityResponse, error)
+	ReleaseProjectCapacity(ctx context.Context, in *ReleaseProjectCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type liteVirtClient struct {
@@ -3049,6 +3063,26 @@ func (c *liteVirtClient) GetProjectUsage(ctx context.Context, in *GetProjectUsag
 	return out, nil
 }
 
+func (c *liteVirtClient) ReserveProjectCapacity(ctx context.Context, in *ReserveProjectCapacityRequest, opts ...grpc.CallOption) (*ReserveProjectCapacityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReserveProjectCapacityResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReserveProjectCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseProjectCapacity(ctx context.Context, in *ReleaseProjectCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseProjectCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -3378,6 +3412,18 @@ type LiteVirtServer interface {
 	SetProjectQuota(context.Context, *SetProjectQuotaRequest) (*ProjectQuota, error)
 	GetProjectQuota(context.Context, *GetProjectQuotaRequest) (*ProjectQuota, error)
 	GetProjectUsage(context.Context, *GetProjectUsageRequest) (*ProjectUsage, error)
+	// ── project admission authority (F2 second half / D1) ──
+	// PEER-ONLY. Reserve-then-verify makes two concurrent admissions agree only
+	// once both reservations are VISIBLE to both deciders; corrosion is eventually
+	// consistent, so two nodes that have not yet exchanged operation rows can still
+	// both admit. These route the PROJECT-QUOTA half of an admission to the
+	// project's authority holder, so every quota decision for one project is made
+	// by ONE node against a view that already contains its own grants.
+	//
+	// Host capacity is NOT delegated: it is already serialized by the target host's
+	// owner, which is the only node that reserves against it.
+	ReserveProjectCapacity(context.Context, *ReserveProjectCapacityRequest) (*ReserveProjectCapacityResponse, error)
+	ReleaseProjectCapacity(context.Context, *ReleaseProjectCapacityRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -4053,6 +4099,12 @@ func (UnimplementedLiteVirtServer) GetProjectQuota(context.Context, *GetProjectQ
 }
 func (UnimplementedLiteVirtServer) GetProjectUsage(context.Context, *GetProjectUsageRequest) (*ProjectUsage, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetProjectUsage not implemented")
+}
+func (UnimplementedLiteVirtServer) ReserveProjectCapacity(context.Context, *ReserveProjectCapacityRequest) (*ReserveProjectCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReserveProjectCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseProjectCapacity(context.Context, *ReleaseProjectCapacityRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseProjectCapacity not implemented")
 }
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
@@ -7793,6 +7845,42 @@ func _LiteVirt_GetProjectUsage_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ReserveProjectCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReserveProjectCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReserveProjectCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReserveProjectCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReserveProjectCapacity(ctx, req.(*ReserveProjectCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseProjectCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseProjectCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseProjectCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseProjectCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseProjectCapacity(ctx, req.(*ReleaseProjectCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -8551,6 +8639,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetProjectUsage",
 			Handler:    _LiteVirt_GetProjectUsage_Handler,
+		},
+		{
+			MethodName: "ReserveProjectCapacity",
+			Handler:    _LiteVirt_ReserveProjectCapacity_Handler,
+		},
+		{
+			MethodName: "ReleaseProjectCapacity",
+			Handler:    _LiteVirt_ReleaseProjectCapacity_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

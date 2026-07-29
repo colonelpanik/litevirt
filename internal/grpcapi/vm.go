@@ -307,7 +307,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// bug was intermittent (it depended on which operation id sorted first) and was
 	// caught by the per-host-override fleet test, not by reasoning.
 	if !req.AllowOvercommit {
-		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, int(spec.Cpu), int(spec.MemoryMib))
+		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -2884,7 +2884,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 							fresh.HostName, cpuGrow, memGrow), "allow-overcommit")
 				}
 			} else {
-				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, cpuGrow, memGrow)
+				// No resource id: a GROW's row is already visible everywhere, so a
+			// visibility signal would free the delegated lease immediately while the
+			// holder's usage still reflects the OLD size — under-counting exactly the
+			// amount being added. A grow leans on the settle grace instead.
+			lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow)
 				if aerr != nil {
 					return nil, aerr
 				}

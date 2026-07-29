@@ -143,7 +143,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// Placed after tenancy and before any runtime or IPAM work, so a refusal
 	// leaves no partial state to unwind.
 	if req.MemoryMib > 0 {
-		lease, aerr := s.admitWithReservation(ctx, "CreateContainer", s.hostName, req.Project, 0, int(req.MemoryMib))
+		lease, aerr := s.admitWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib))
 		if aerr != nil {
 			return nil, aerr
 		}

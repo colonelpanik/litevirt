@@ -51,12 +51,25 @@ import (
 type reservationLease struct {
 	s  *Server
 	id string
+	// The PROJECT-QUOTA half may be held on another node — the project's admission
+	// authority holder — so it is tracked separately from the local host reservation
+	// and released wherever it actually lives.
+	quotaHolder  string
+	quotaProject string
+	quotaLease   string
 }
 
 // release marks the reservation's operation terminal, freeing the capacity.
 // Idempotent, and safe on the empty lease returned for a no-op admission.
 func (l *reservationLease) release(ctx context.Context) {
-	if l == nil || l.s == nil || l.id == "" {
+	if l == nil || l.s == nil {
+		return
+	}
+	if id := l.quotaLease; id != "" {
+		l.quotaLease = ""
+		l.s.releaseProjectQuota(ctx, l.quotaHolder, l.quotaProject, id)
+	}
+	if l.id == "" {
 		return
 	}
 	id := l.id
@@ -74,12 +87,16 @@ func (l *reservationLease) release(ctx context.Context) {
 // admitWithReservation reserves cpuDelta/memDelta against host and project, verifies
 // the reservation still fits, and returns a lease the caller must release.
 //
+// resourceID names what is being admitted ("vm:<name>" / "ct:<name>"). It travels with
+// a DELEGATED quota lease so the authority holder can tell when the admission it
+// granted has actually landed in its replica, instead of guessing from a clock.
+//
 // A zero/negative delta consumes nothing and takes the cheap path — no operation
 // row, no lease — so a shrink never queues behind anything.
 func (s *Server) admitWithReservation(
-	ctx context.Context, method, host, project string, cpuDelta, memDelta int,
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, method, host, project, cpuDelta, memDelta, true)
+	return s.admitReserved(ctx, method, host, project, resourceID, cpuDelta, memDelta, true)
 }
 
 // admitHostWithReservation is admitWithReservation for paths that must NOT charge
@@ -89,20 +106,25 @@ func (s *Server) admitWithReservation(
 func (s *Server) admitHostWithReservation(
 	ctx context.Context, method, host, project string, cpuDelta, memDelta int,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, method, host, project, cpuDelta, memDelta, false)
+	return s.admitReserved(ctx, method, host, project, "", cpuDelta, memDelta, false)
 }
 
 func (s *Server) admitReserved(
-	ctx context.Context, method, host, project string, cpuDelta, memDelta int, withQuota bool,
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, withQuota bool,
 ) (*reservationLease, error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
 	}
 
+	// When the project-quota decision is DELEGATED, its reservation is published by
+	// the authority holder, not here — recording it locally too would charge the
+	// project twice for one admission.
+	delegated := withQuota && s.projectAuthorityActive(ctx)
+
 	rv := corrosion.ReservationVector{
 		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
 	}
-	if withQuota {
+	if withQuota && !delegated {
 		// Only a quota-charging admission reserves against the PROJECT. A start
 		// reserves host capacity alone: its allocation is already in project usage,
 		// so publishing a project reservation too would make concurrent starts
@@ -136,10 +158,21 @@ func (s *Server) admitReserved(
 		return nil, err
 	}
 	if withQuota {
-		if err := s.checkProjectQuotaBefore(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
-			lease.release(ctx)
-			return nil, err
+		if !delegated {
+			if err := s.checkProjectQuotaBefore(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
+				lease.release(ctx)
+				return nil, err
+			}
+			return lease, nil
 		}
+		// Host capacity is settled first because it is the cheap, local half: an
+		// admission that cannot fit the host never needs to bother the holder.
+		holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, project, resourceID, cpuDelta, memDelta)
+		if qerr != nil {
+			lease.release(ctx)
+			return nil, qerr
+		}
+		lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, project, quotaLease
 	}
 	return lease, nil
 }

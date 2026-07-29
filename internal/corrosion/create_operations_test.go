@@ -2467,6 +2467,143 @@ func TestRetainedAndCurrentContainerRekeyDeletesCannotCrossRecreate(t *testing.T
 			got.OwnerEpoch != 1 || got.SpecGeneration != 1 {
 			t.Fatalf("declined target-conflicting rekey tombstoned source: %+v", got)
 		}
+
+		var delayedStmts []Statement
+		if err := json.Unmarshal([]byte(rekeyEntry.Stmts), &delayedStmts); err != nil {
+			t.Fatal(err)
+		}
+		for i := range delayedStmts {
+			shape, _, err := parseResolved(delayedStmts[i].SQL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shape.UpdatedAtParamIdx < 0 ||
+				shape.UpdatedAtParamIdx >= len(delayedStmts[i].Params) {
+				t.Fatalf("rekey statement %d has no updated_at binding", i)
+			}
+			delayedStmts[i].Params[shape.UpdatedAtParamIdx] = delayed
+		}
+		delayedRaw, err := json.Marshal(delayedStmts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		delayedRekey := &pb.MutationEntry{
+			Seq: 1, Hlc: delayed, Origin: "delayed-current-rekey",
+			Stmts: string(delayedRaw),
+		}
+		seedSourceReplica := func(t *testing.T, receiver *Client) {
+			t.Helper()
+			op := createOp("op-current-rekey-source-"+t.Name(),
+				"container", "ct1", "old", "", 1)
+			if applied, err := receiver.BeginContainerCreateOperation(
+				ctx, op, oldCT,
+			); err != nil || !applied {
+				t.Fatalf("source replica begin: applied=%v err=%v", applied, err)
+			}
+			if applied, err := receiver.CommitContainerCreateOperation(
+				ctx, op.ID, 1, oldCT, nil,
+			); err != nil || !applied {
+				t.Fatalf("source replica commit: applied=%v err=%v", applied, err)
+			}
+		}
+		rowSnapshot := func(t *testing.T, receiver *Client, host string) string {
+			t.Helper()
+			rows, err := receiver.Query(ctx,
+				`SELECT * FROM containers WHERE host_name = ? AND name = ?`,
+				host, "ct1")
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("container snapshot %s: rows=%v err=%v", host, rows, err)
+			}
+			raw, err := json.Marshal(rows[0].Values)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(raw)
+		}
+
+		t.Run("tombstoned target authority declines atomically", func(t *testing.T) {
+			cases := []struct {
+				name       string
+				ownerEpoch int64
+				generation int64
+			}{
+				{name: "newer axes", ownerEpoch: 2, generation: 2},
+				{name: "owner axis only", ownerEpoch: 2, generation: 1},
+				{name: "generation axis only", ownerEpoch: 1, generation: 2},
+				{name: "equal axes different identity", ownerEpoch: 1, generation: 1},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					receiver := testClient(t)
+					seedSourceReplica(t, receiver)
+					targetOp := createOp("op-current-rekey-tombstone-"+t.Name(),
+						"container", "ct1", "target-new", "", tc.ownerEpoch)
+					target := ContainerRecord{
+						HostName: "h2", Name: "ct1", Image: "target-new", Project: "p1",
+						OwnerEpoch: tc.ownerEpoch, SpecGeneration: tc.generation,
+					}
+					if applied, err := receiver.BeginContainerCreateOperation(
+						ctx, targetOp, target,
+					); err != nil || !applied {
+						t.Fatalf("target begin: applied=%v err=%v", applied, err)
+					}
+					if applied, err := receiver.CommitContainerCreateOperation(
+						ctx, targetOp.ID, tc.ownerEpoch, target, nil,
+					); err != nil || !applied {
+						t.Fatalf("target commit: applied=%v err=%v", applied, err)
+					}
+					if err := DeleteContainer(ctx, receiver, "h2", "ct1"); err != nil {
+						t.Fatal(err)
+					}
+					sourceBefore := rowSnapshot(t, receiver, "h1")
+					targetBefore := rowSnapshot(t, receiver, "h2")
+					applyMutationEntry(t, receiver, delayedRekey)
+					if sourceAfter := rowSnapshot(t, receiver, "h1"); sourceAfter != sourceBefore {
+						t.Fatalf("declined rekey changed source:\nbefore=%s\nafter=%s",
+							sourceBefore, sourceAfter)
+					}
+					if targetAfter := rowSnapshot(t, receiver, "h2"); targetAfter != targetBefore {
+						t.Fatalf("declined rekey changed tombstoned target:\nbefore=%s\nafter=%s",
+							targetBefore, targetAfter)
+					}
+				})
+			}
+		})
+
+		t.Run("exact live result permits idempotent completion", func(t *testing.T) {
+			receiver := testClient(t)
+			seedSourceReplica(t, receiver)
+			source, err := GetContainer(ctx, receiver, "h1", "ct1")
+			if err != nil || source == nil {
+				t.Fatalf("source before exact replay: got=%+v err=%v", source, err)
+			}
+			exactTarget := *source
+			exactTarget.HostName = "h2"
+			exactTarget.State = "running"
+			exactTarget.StateDetail = ContainerRuntimeRekeyDetail
+			exactOp := createOp("op-current-rekey-exact-target",
+				"container", "ct1", "old", "", 1)
+			if applied, err := receiver.BeginContainerCreateOperation(
+				ctx, exactOp, exactTarget,
+			); err != nil || !applied {
+				t.Fatalf("exact target begin: applied=%v err=%v", applied, err)
+			}
+			if applied, err := receiver.CommitContainerCreateOperation(
+				ctx, exactOp.ID, 1, exactTarget, nil,
+			); err != nil || !applied {
+				t.Fatalf("exact target commit: applied=%v err=%v", applied, err)
+			}
+			applyMutationEntry(t, receiver, delayedRekey)
+			if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got != nil {
+				t.Fatalf("exact target completion left source live: %+v", got)
+			}
+			if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got == nil ||
+				got.OwnerEpoch != 1 || got.SpecGeneration != 1 ||
+				got.Image != "old" || got.State != "running" ||
+				got.StateDetail != ContainerRuntimeRekeyDetail {
+				t.Fatalf("exact target did not complete safely: %+v", got)
+			}
+		})
 	})
 }
 

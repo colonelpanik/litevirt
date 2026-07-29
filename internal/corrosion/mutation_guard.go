@@ -312,27 +312,30 @@ func workloadRekeyGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationG
 	}
 
 	// A remote replay cannot use the local optimistic preflight, so bind the
-	// destination as well: absent/tombstoned is safe, and an already-live target
-	// is safe only when it is the exact idempotent result of this same re-key.
+	// destination as well. Absence is safe. A pre-authority tombstone is the
+	// explicitly replaceable legacy case; a modern tombstone is still an
+	// authority decision and must not be resurrected. A live target is safe only
+	// when it is the exact idempotent result of this same re-key.
 	var target ContainerRecord
 	var targetLabels, targetState, targetDetail string
 	var targetTemplate int
+	var targetDeleted sql.NullString
 	err = tx.QueryRowContext(ctx,
 		`SELECT host_name, name, COALESCE(image, ''), cpu_limit, memory_mib,
 		        COALESCE(labels, ''), COALESCE(restart_policy, ''),
 		        COALESCE(project, '_default'), COALESCE(is_template, 0),
 		        COALESCE(on_host_failure, ''), COALESCE(create_spec, ''),
 		        COALESCE(relocate_token, ''), owner_epoch, spec_generation,
-		        active_operation_id, state, COALESCE(state_detail, '')
+		        active_operation_id, state, COALESCE(state_detail, ''), deleted_at
 		 FROM containers
-		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		 WHERE host_name = ? AND name = ?`,
 		guard.TargetHostName, guard.ResourceID).
 		Scan(&target.HostName, &target.Name, &target.Image,
 			&target.CPULimit, &target.MemMiB, &targetLabels,
 			&target.RestartPolicy, &target.Project, &targetTemplate,
 			&target.OnHostFailure, &target.CreateSpec, &target.RelocateToken,
 			&target.OwnerEpoch, &target.SpecGeneration, &target.ActiveOperationID,
-			&targetState, &targetDetail)
+			&targetState, &targetDetail, &targetDeleted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
@@ -340,6 +343,11 @@ func workloadRekeyGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationG
 		return false, err
 	}
 	target.IsTemplate = targetTemplate != 0
+	if targetDeleted.Valid && targetDeleted.String != "" {
+		return target.OwnerEpoch == 0 &&
+			target.SpecGeneration == 0 &&
+			target.ActiveOperationID == "", nil
+	}
 	expectedTarget := ct
 	expectedTarget.HostName = guard.TargetHostName
 	return target.OwnerEpoch == guard.OwnerEpoch &&

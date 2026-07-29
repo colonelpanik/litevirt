@@ -805,20 +805,36 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// re-bases a legacy chain, so refusing those would strand them in
 		// permanent disagreement — protection that only produces noise gets
 		// turned off.
-		if table.Name == "audit_log" {
-			keepLocal, kErr := signedAuditRowIsImmutable(tx, table, row, pkCols, pkIdx)
+		//
+		// The two tables the verifier DERIVES its authority from get the same
+		// treatment, for the same reason and by the same route. Both carry
+		// updated_at, so unlike audit_log they do reach the LWW path — and plain
+		// LWW is exactly wrong for them, because the attacker chooses the clock.
+		// A tombstone on a chain head erases the only thing that can detect a
+		// truncated tail; clearing a key's retired_at erases the only thing that
+		// can detect the rotated-out key still signing. Both would replicate
+		// cluster-wide from a single compromised node, taking every peer's good
+		// copy with them.
+		//
+		// Anti-entropy is the whole hole here: the STATEMENT path already refuses
+		// these moves (audit_chain_heads is append-only, so INSERT OR IGNORE is
+		// the only shape that exists for it, and no builder deletes a signing key
+		// or clears a retirement). Nothing legitimate writes what these guards
+		// refuse, so they cost nothing when the cluster is healthy.
+		if guard := auditEvidenceGuards[table.Name]; guard != nil {
+			keepLocal, reason, kErr := guard(tx, table, row, pkCols, pkIdx)
 			if kErr != nil {
 				_ = tx.Rollback()
 				return merged, skipped, kErr
 			}
 			if keepLocal {
 				skipped++
-				pk := pkKeyAt(row, pkIdx)
+				pk, tbl := pkKeyAt(row, pkIdx), table.Name
 				c.deferAfterCommit(tx, func() {
-					c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "signed_audit_row")
-					slog.Warn("anti-entropy: a peer's copy of a signed audit row differs from the "+
-						"local one; keeping local. One of the two has been altered — run "+
-						"`lv audit verify` on both nodes", "table", table.Name, "pk", pk)
+					c.observeMergeRejected(boundedTableLabel(tbl), "ae", reason)
+					slog.Warn("anti-entropy: refused a peer's copy of audit tamper-evidence; keeping "+
+						"local. One of the two nodes has been altered — run `lv audit verify` on both",
+						"table", tbl, "pk", pk, "reason", reason)
 				})
 				continue
 			}

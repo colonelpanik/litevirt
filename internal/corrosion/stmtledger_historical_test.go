@@ -42,11 +42,20 @@ import (
 // row — the guard lives in the SQL because that statement applies verbatim by
 // primary key on every peer, and without it a tampering node's reseal would
 // replicate over everyone else's good copies. Both pre-v45 shapes were ADDED as
-// audit_log_insert_v44 / audit_reseal_v44 rather than dropped. Retaining the
-// narrow reseal is safe: on a v45 receiver it can only reach rows that carry no
-// signature, and a sender old enough to emit it has none. No existing
+// audit_log_insert_v44 / audit_reseal_v44 rather than dropped. No existing
 // historical identity was removed or changed.
-const compatibilityDigest = "b5f71b931daf9f72527d8e21156e733911f6ffe25d0b03f1812739eec0e99eeb"
+//
+// Updated once more to move audit_reseal_v44 from DispFullPKUpdateNoClock to
+// DispAuditReseal. The v45 reasoning above was wrong on one point, and it is the
+// point that mattered: the retained pre-v45 reseal has NO signature predicate,
+// and DispFullPKUpdateNoClock applies a statement verbatim by primary key. A
+// node that rewrote its own signed rows could therefore emit the legacy shape
+// and have every peer overwrite its good content_hash — the guard that was added
+// to the v45 shape was bypassable by simply sending the older one. The shape
+// stays accepted, and its identity is otherwise unchanged; DispAuditReseal makes
+// the receiver execute the GUARDED form regardless of which shape arrived, so a
+// legacy sender still works and a signed row is unreachable by any reseal.
+const compatibilityDigest = "abe10ef483dd134ab022f98210ca576b27847f1ca9e9950cc6ecf62401745226"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.

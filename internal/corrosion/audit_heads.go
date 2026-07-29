@@ -3,8 +3,11 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // Signed audit chain heads.
@@ -79,12 +82,17 @@ func insertAuditChainHead(ctx context.Context, c *Client, keyring *AuditKeyring,
 	if err != nil {
 		return fmt.Errorf("sign audit chain head: %w", err)
 	}
-	now := c.NowTS()
+	// created_at is a WALL time that verifyChainHeads reads back and compares
+	// against headSettleWindow; updated_at is the LWW conflict key. They must
+	// not share a source: NowTS starts emitting HLC strings the moment hlc_lww
+	// latches, and an HLC value in created_at fails the RFC3339 parse, skipping
+	// the settle window and reporting every freshly published head as a
+	// truncated log on any peer still catching up.
 	return c.Execute(ctx,
 		`INSERT OR IGNORE INTO audit_chain_heads
 		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		hostName, epoch, seq, hash, keyring.KeyID(), sig, now, now)
+		hostName, epoch, seq, hash, keyring.KeyID(), sig, c.NowWall(), c.NowTS())
 }
 
 // currentAuditEpoch is the highest epoch this host has published a head for.
@@ -101,16 +109,38 @@ func currentAuditEpoch(ctx context.Context, c *Client, hostName string) (int64, 
 	return rows[0].Int64("max_epoch"), nil
 }
 
-// latestAuditHeads returns each host's highest head, ordered by (epoch, seq).
-func latestAuditHeads(ctx context.Context, c *Client) (map[string]AuditChainHead, error) {
+// latestAuditHeadsByKey returns each host's highest head PER SIGNING KEY.
+//
+// Per key, not per host, and selected by seq rather than epoch. Both details
+// are load-bearing.
+//
+// epoch is chosen by whoever writes the head, and the table is INSERT OR
+// IGNORE, so picking the authority by "highest epoch" hands the choice to an
+// attacker: someone holding a rotated-out key could rewrite the last row that
+// key signed, re-sign it, and then publish a head at epoch+5 — signed with the
+// same retired key, over their own tail hash — which would become the single
+// head this function returned and would agree with the forgery. The head that
+// contradicts them, signed by the successor key they do not have, was silently
+// discarded by being at a lower epoch.
+//
+// Keying by (host, key_id) means a new key's assertion can never be displaced
+// by an old key's, whatever epoch it claims. It also keeps the result bounded
+// by the number of signing identities a host has ever had, rather than by the
+// number of heads it has published.
+func latestAuditHeadsByKey(ctx context.Context, c *Client) (map[string][]AuditChainHead, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, epoch, seq, head_hash, key_id, signature, created_at
-		 FROM audit_chain_heads WHERE deleted_at IS NULL
-		 ORDER BY host_name ASC, epoch ASC, seq ASC`)
+		`SELECT h.host_name, h.epoch, h.seq, h.head_hash, h.key_id, h.signature, h.created_at
+		 FROM audit_chain_heads h
+		 JOIN (SELECT host_name, key_id, MAX(seq) AS max_seq
+		       FROM audit_chain_heads WHERE deleted_at IS NULL
+		       GROUP BY host_name, key_id) m
+		   ON m.host_name = h.host_name AND m.key_id = h.key_id AND m.max_seq = h.seq
+		 WHERE h.deleted_at IS NULL
+		 ORDER BY h.host_name ASC, h.key_id ASC, h.epoch ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list audit chain heads: %w", err)
 	}
-	out := map[string]AuditChainHead{}
+	byKey := map[string]map[string]AuditChainHead{}
 	for _, r := range rows {
 		h := AuditChainHead{
 			HostName:  r.String("host_name"),
@@ -121,8 +151,24 @@ func latestAuditHeads(ctx context.Context, c *Client) (map[string]AuditChainHead
 			Signature: r.String("signature"),
 			CreatedAt: r.String("created_at"),
 		}
-		// Ordered ascending, so the last one seen for a host is its highest.
-		out[h.HostName] = h
+		if byKey[h.HostName] == nil {
+			byKey[h.HostName] = map[string]AuditChainHead{}
+		}
+		// Ordered by epoch ascending, so the last one seen for a key wins a tie
+		// on seq: a reseal opens a new epoch at the same position and its head
+		// describes the re-based hash.
+		byKey[h.HostName][h.KeyID] = h
+	}
+	out := make(map[string][]AuditChainHead, len(byKey))
+	for host, keys := range byKey {
+		ids := make([]string, 0, len(keys))
+		for id := range keys {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids) // deterministic finding order
+		for _, id := range ids {
+			out[host] = append(out[host], keys[id])
+		}
 	}
 	return out, nil
 }
@@ -141,55 +187,107 @@ func chainHashAt(ctx context.Context, c *Client, hostName string, seq int64) (st
 	return rows[0].String("content_hash"), nil
 }
 
-// verifyChainHeads compares each host's highest signed head against the rows
-// actually present, and reports a host whose log is shorter than its own head
-// says it should be.
-func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, observedSeq map[string]int64, res *AuditVerifyResult) error {
-	heads, err := latestAuditHeads(ctx, c)
+// verifyChainHeads compares each host's signed heads against the rows actually
+// present, and reports a host whose log is shorter — or hashes differently —
+// than its own heads say it should.
+//
+// retired maps key id → the last sequence that key was entitled to sign. It is
+// consulted here for the same reason it is consulted for rows: a head is a
+// signed assertion, and a key that has been rotated out has no standing to make
+// one about anything past its boundary. Without that check the head machinery
+// is self-defeating — the party a rotation is performed against would be able to
+// publish the very assertion that certifies their rewrite.
+func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, observedSeq map[string]int64, retired map[string]int64, res *AuditVerifyResult) error {
+	heads, err := latestAuditHeadsByKey(ctx, c)
 	if err != nil {
 		return err
 	}
-	for host, h := range heads {
-		if keyring != nil {
-			if err := keyring.VerifyHead(ctx, c, host, h.Epoch, h.Seq, h.HeadHash, h.KeyID, h.Signature); err != nil {
-				// A head that does not verify is itself a finding: someone
-				// either forged one to cover a truncation or damaged the real
-				// one to stop it being checked.
-				res.BadSignature = append(res.BadSignature,
-					fmt.Sprintf("chain head %s/%d/%d: %v", host, h.Epoch, h.Seq, err))
+	hosts := make([]string, 0, len(heads))
+	for host := range heads {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+
+	for _, host := range hosts {
+		// attestedSeq is the highest position any head this node is willing to
+		// trust claims the log reached, counting only heads old enough that
+		// replication lag cannot explain a shortfall.
+		var attestedSeq int64
+		for _, h := range heads[host] {
+			if keyring != nil {
+				if err := keyring.VerifyHead(ctx, c, host, h.Epoch, h.Seq, h.HeadHash, h.KeyID, h.Signature); err != nil {
+					// A head that does not verify is itself a finding: someone
+					// either forged one to cover a truncation or damaged the real
+					// one to stop it being checked.
+					res.BadSignature = append(res.BadSignature,
+						fmt.Sprintf("chain head %s/%d/%d: %v", host, h.Epoch, h.Seq, err))
+					continue
+				}
+			}
+			// A retired key's head is credible only up to that key's boundary.
+			// Beyond it the signature still verifies — the holder has the key,
+			// which is why the rotation happened — so the retirement record is
+			// the only thing that can say this head is not the host speaking.
+			// Reported, and given no authority over anything below.
+			if boundary, isRetired := retired[h.KeyID]; isRetired && h.Seq > boundary {
+				res.RetiredKeyUse = append(res.RetiredKeyUse, fmt.Sprintf(
+					"%s: chain head at seq %d is signed by key %s, which was retired at seq %d — "+
+						"a rotated-out key cannot attest to the chain past its boundary",
+					host, h.Seq, h.KeyID, boundary))
 				continue
 			}
-		}
-		// The head asserts a HASH as well as a length, and the hash is the half
-		// that matters after a rotation. Someone holding a retired key can
-		// rewrite a row it signed and re-sign it perfectly: the signature
-		// verifies, the sequence numbers are untouched, and the row count is
-		// unchanged. Only the recorded chain hash — signed by the successor key
-		// they do not have — contradicts them.
-		if h.Seq > 0 && h.HeadHash != "" && observedSeq[host] >= h.Seq {
-			actual, err := chainHashAt(ctx, c, host, h.Seq)
-			if err != nil {
-				return err
+
+			// The head asserts a HASH as well as a length, and the hash is the
+			// half that matters after a rotation. Someone holding a retired key
+			// can rewrite a row it signed and re-sign it perfectly: the
+			// signature verifies, the sequence numbers are untouched, and the
+			// row count is unchanged. Only the recorded chain hash — signed by
+			// the successor key they do not have — contradicts them.
+			if h.Seq > 0 && h.HeadHash != "" && observedSeq[host] >= h.Seq {
+				actual, err := chainHashAt(ctx, c, host, h.Seq)
+				if err != nil {
+					return err
+				}
+				if actual != "" && !strings.EqualFold(actual, h.HeadHash) {
+					res.HeadMismatch = append(res.HeadMismatch, fmt.Sprintf(
+						"%s: signed head says the chain hashed to %s at seq %d, but it hashes to %s — "+
+							"a row at or before that point was rewritten", host, h.HeadHash, h.Seq, actual))
+				}
 			}
-			if actual != "" && !strings.EqualFold(actual, h.HeadHash) {
-				res.HeadMismatch = append(res.HeadMismatch, fmt.Sprintf(
-					"%s: signed head says the chain hashed to %s at seq %d, but it hashes to %s — "+
-						"a row at or before that point was rewritten", host, h.HeadHash, h.Seq, actual))
+
+			if h.Seq > attestedSeq && headHasSettled(h) {
+				attestedSeq = h.Seq
 			}
 		}
 
-		if observedSeq[host] >= h.Seq {
-			continue
+		if attestedSeq > observedSeq[host] {
+			res.TruncatedHosts = append(res.TruncatedHosts, fmt.Sprintf(
+				"%s: signed head attests seq %d but the log ends at %d (%d rows missing)",
+				host, attestedSeq, observedSeq[host], attestedSeq-observedSeq[host]))
 		}
-		// Give replication time to deliver rows this node has not seen yet.
-		if created, perr := time.Parse(time.RFC3339Nano, h.CreatedAt); perr == nil {
-			if time.Since(created) < headSettleWindow {
-				continue
-			}
-		}
-		res.TruncatedHosts = append(res.TruncatedHosts, fmt.Sprintf(
-			"%s: signed head attests seq %d but the log ends at %d (%d rows missing)",
-			host, h.Seq, observedSeq[host], h.Seq-observedSeq[host]))
 	}
 	return nil
+}
+
+// headHasSettled reports whether a head is old enough that a shortfall behind
+// it cannot be explained by replication lag.
+//
+// created_at is stamped with NowWall, not NowTS. NowTS becomes an HLC string
+// the moment hlc_lww latches, and the parse failure that produced used to skip
+// the window entirely — turning every freshly published head into a truncation
+// report on any peer that had not yet received the rows behind it, which is the
+// ordinary eventually-consistent case the window exists for.
+//
+// Both formats are read, because heads already written with an HLC created_at
+// are on disk and their truncation detection must not stay switched off. A
+// timestamp in neither format counts as NOT settled: an unreadable clock should
+// produce silence, never an accusation of tampering.
+func headHasSettled(h AuditChainHead) bool {
+	if created, err := time.Parse(time.RFC3339Nano, h.CreatedAt); err == nil {
+		return time.Since(created) >= headSettleWindow
+	}
+	if ts, ok := hlc.Parse(h.CreatedAt); ok {
+		return time.Since(time.UnixMilli(ts.PhysicalMS)) >= headSettleWindow
+	}
+	return false
 }

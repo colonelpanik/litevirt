@@ -157,20 +157,21 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	{SQL: legacyVMDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	{SQL: legacyContainerDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	{SQL: legacyContainerStrictDeleteSQL, Disposition: DispLegacyWorkloadDelete},
-	// audit_log hash-chain reseal: idempotent (recomputes the same hashes) → verbatim.
+	// audit_log hash-chain reseal: idempotent (recomputes the same hashes), and
+	// applied through the signature-guarded form on the receiver.
 	//
-	// The signature guard is part of the STATEMENT, not just the caller, and it
-	// has to be. This shape applies verbatim by primary key with no clock
-	// compare, so without the guard a node that resealed its own tampered rows
-	// would have every peer overwrite their good copies with the forged ones —
-	// replication would do the attacker's work across the whole cluster. With
-	// it, a signed row is unreachable by any reseal, local or replicated.
-	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ?
-				 WHERE id = ? AND (signature IS NULL OR signature = '')`, Disposition: DispFullPKUpdateNoClock},
-	// Pre-v45 shape, retained for the upgrade horizon (stmthistorical.go). Safe
-	// on a v45 receiver for the same reason: a sender old enough to emit it has
-	// no signed rows to protect.
-	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock},
+	// BOTH shapes carry DispAuditReseal, which is what makes the pre-v45 one
+	// safe. That shape has no signature predicate; applied verbatim it would let
+	// a node that rewrote its own signed rows emit the old form and have every
+	// peer overwrite its good content_hash by primary key, with no clock compare
+	// and no recovery — reseal refuses to touch signed rows, so the correct hash
+	// could never be restored. The disposition rewrites it to the guarded form
+	// on arrival, so a legacy sender keeps working (its rows carry no signature,
+	// which is everything the guard could ever exclude) while a signed row is
+	// unreachable by any reseal, local or replicated.
+	{SQL: auditResealGuardedSQL, Disposition: DispAuditReseal},
+	// Pre-v45 shape, retained for the upgrade horizon (stmthistorical.go).
+	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispAuditReseal},
 	// session revoke: a guarded one-shot terminal transition (WHERE revoked_at IS NULL) → verbatim.
 	{SQL: `UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, Disposition: DispFullPKUpdateNoClock},
 	// session touch: last_used_at must only advance (align with AE's timestamp-max merge).

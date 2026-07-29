@@ -1254,6 +1254,17 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		return r.applyBulkUpdate(ctx, tx, s, sh, tableName, pkCols, entry.Category)
 
+	case DispAuditReseal:
+		// Both registered reseal shapes bind exactly (prev_hash, content_hash,
+		// id) in that order and differ only in whether the WHERE clause carries
+		// the signature guard, so the guarded form can be executed with the
+		// incoming params whichever shape arrived.
+		res, execErr := tx.ExecContext(ctx, auditResealGuardedSQL, s.Params...)
+		if execErr == nil && rowsChanged(res) {
+			r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
+		}
+		return execErr
+
 	case DispFullPKUpdateNoClock:
 		// A full-PK UPDATE with no bound updated_at, authorized by an explicit audited policy.
 		// A monotonic-timestamp update is applied with a guard so it only ADVANCES the column

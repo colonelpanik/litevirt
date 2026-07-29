@@ -390,7 +390,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		}
 	}
 
-	if err := verifyChainHeads(ctx, c, keyring, seqByHost, &res); err != nil {
+	if err := verifyChainHeads(ctx, c, keyring, seqByHost, retired, &res); err != nil {
 		return res, err
 	}
 	return res, nil
@@ -465,6 +465,20 @@ func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, err
 	return resealed, nil
 }
 
+// auditResealGuardedSQL is the ONLY statement in the tree that may rewrite an
+// audit row's chain hashes, and the only one a receiver ever executes for a
+// reseal — DispAuditReseal runs it in place of whatever shape arrived.
+//
+// The guard is in the SQL, not just in the caller, because this statement
+// replicates and peers apply it by primary key with no clock comparison.
+// Without the WHERE clause a tampering node could reseal its own rows and have
+// every peer overwrite their good copies with the forged ones; replication
+// would do the attacker's work across the whole cluster, and since reseal
+// refuses to touch signed rows, nothing could restore the correct hash
+// afterwards.
+const auditResealGuardedSQL = `UPDATE audit_log SET prev_hash = ?, content_hash = ?
+	 WHERE id = ? AND (signature IS NULL OR signature = '')`
+
 // resealHostChainLocked walks hostName's rows oldest-first, recomputes the
 // per-host prev_hash/content_hash chain, and UPDATEs any row whose stored
 // content_hash differs. Returns the resealed tail hash + rows rewritten.
@@ -507,15 +521,7 @@ func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (str
 		}
 		newHash := HashAuditRow(rec)
 		if !strings.EqualFold(newHash, r.String("content_hash")) {
-			// The guard is repeated in the SQL, not just in the loop above,
-			// because this statement replicates: peers apply it verbatim by
-			// primary key with no clock comparison. Without the WHERE clause a
-			// tampering node could reseal its own rows and have every peer
-			// overwrite their good copies with the forged ones.
-			if err := c.Execute(ctx,
-				`UPDATE audit_log SET prev_hash = ?, content_hash = ?
-				 WHERE id = ? AND (signature IS NULL OR signature = '')`,
-				prev, newHash, rec.ID); err != nil {
+			if err := c.Execute(ctx, auditResealGuardedSQL, prev, newHash, rec.ID); err != nil {
 				return "", resealed, fmt.Errorf("reseal row %s: %w", rec.ID, err)
 			}
 			resealed++

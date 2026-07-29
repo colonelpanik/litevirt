@@ -125,11 +125,16 @@ func HistoricalShapes() []HistoricalShape {
 
 	// Pre-v45 audit_log writes, from before rows carried a signature.
 	//
-	// Both shapes stay accepted for the upgrade horizon, and both are SAFE to
-	// keep: the INSERT is append-only (INSERT OR IGNORE, never overwrites), and
-	// the narrow reseal UPDATE can only reach rows that have no signature —
-	// which, on a v45 receiver, is exactly the legacy rows it was always for.
-	// A sender old enough to emit it cannot have signed anything.
+	// Both shapes stay accepted for the upgrade horizon. The INSERT is
+	// append-only (INSERT OR IGNORE, never overwrites).
+	//
+	// The reseal UPDATE has NO signature predicate — that is the whole
+	// difference from the v45 shape — so it is safe only because its ledger
+	// entry carries DispAuditReseal, which makes the receiver execute the
+	// guarded form instead of this one. Applied verbatim it would reach signed
+	// rows by primary key with no clock compare, which is a cluster-wide eraser
+	// for exactly the evidence signing exists to produce. Do not "simplify" that
+	// entry back to DispFullPKUpdateNoClock.
 	add(`INSERT OR IGNORE INTO audit_log
 		   (id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "audit_log_insert_v44")

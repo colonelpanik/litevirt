@@ -194,6 +194,7 @@ var dispIdent = map[corrosion.Disposition]string{
 	corrosion.DispDeleteRetention:      "DispDeleteRetention",
 	corrosion.DispAppendOnly:           "DispAppendOnly",
 	corrosion.DispCustomMerge:          "DispCustomMerge",
+	corrosion.DispAuditReseal:          "DispAuditReseal",
 	corrosion.DispCreateBegin:          "DispCreateBegin",
 	corrosion.DispGuardedTransition:    "DispGuardedTransition",
 	corrosion.DispWorkloadDelete:       "DispWorkloadDelete",

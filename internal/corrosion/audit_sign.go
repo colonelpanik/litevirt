@@ -408,6 +408,26 @@ func (k *AuditKeyring) PublishSigningKey(ctx context.Context, c *Client) error {
 		k.keyID, k.hostName, k.certPEM, now, now)
 }
 
+// auditEvidenceGuard decides whether one incoming anti-entropy row must be
+// refused to keep this node's tamper-evidence intact. It returns keepLocal plus
+// a short, bounded reason used as a metric label and in the warning.
+type auditEvidenceGuard func(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error)
+
+// auditEvidenceGuards are the anti-entropy floors under the three tables the
+// audit verifier derives its conclusions from.
+//
+// Everything in these tables is either an immutable signed assertion or a
+// monotone marker, so ordinary LWW convergence is not merely unnecessary — it is
+// the attack. The clock on an incoming row is written by whoever sent it, so
+// "newest wins" means "the compromised node wins", and anti-entropy would then
+// carry the erasure to every peer. These guards make the losing move
+// unavailable regardless of clock.
+var auditEvidenceGuards = map[string]auditEvidenceGuard{
+	"audit_log":          signedAuditRowIsImmutable,
+	"audit_chain_heads":  auditChainHeadIsImmutable,
+	"audit_signing_keys": auditSigningKeyIsMonotone,
+}
+
 // signedAuditRowIsImmutable reports whether an incoming anti-entropy copy of an
 // audit row must be refused because the LOCAL row is signed and differs.
 //
@@ -417,20 +437,98 @@ func (k *AuditKeyring) PublishSigningKey(ctx context.Context, c *Client) error {
 // the local one is what this node has already published a chain head over.
 // Keeping it and raising the divergence leaves both versions discoverable — the
 // peer still holds its own — where silently taking one erases the other.
-func signedAuditRowIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, error) {
+func signedAuditRowIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
 	if indexOf(table.Columns, "signature") < 0 {
 		// A dump from a pre-v45 peer carries no signature column at all. It can
 		// only be describing unsigned rows, so there is nothing to protect.
-		return false, nil
+		return false, "", nil
 	}
 	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
 	if err != nil || !found {
-		return false, err
+		return false, "", err
 	}
 	if cellStr(localRow, columnIndexMap(table.Columns), "signature") == "" {
-		return false, nil // legacy row: keep converging as before
+		return false, "", nil // legacy row: keep converging as before
 	}
-	return encodeRowCells(localRow) != encodeRowCells(row), nil
+	if encodeRowCells(localRow) != encodeRowCells(row) {
+		return true, "signed_audit_row", nil
+	}
+	return false, "", nil
+}
+
+// auditChainHeadIsImmutable refuses any anti-entropy row that would change or
+// remove a published chain head.
+//
+// A head is a signed statement about a fixed (host, epoch, seq). There is no
+// such thing as a later revision of one, so a differing body for the same key is
+// corruption or forgery either way — and a head is the ONLY construct that can
+// detect a truncated tail, which makes deleting one the cheapest way to disable
+// truncation detection cluster-wide. The table is documented append-only and the
+// statement lane enforces that, but anti-entropy ships whole rows including
+// deleted_at, so the same rule has to exist here.
+func auditChainHeadIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
+	idx := columnIndexMap(table.Columns)
+	// Refused whether or not this node already holds the head. Accepting a
+	// tombstone for an unseen key would pre-poison the slot, so the genuine head
+	// could never land afterwards — a truncation hidden before it happened.
+	if cellStr(row, idx, "deleted_at") != "" {
+		return true, "audit_head_tombstone", nil
+	}
+	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if err != nil || !found {
+		return false, "", err
+	}
+	if encodeRowCells(localRow) != encodeRowCells(row) {
+		return true, "audit_head_rewrite", nil
+	}
+	return false, "", nil
+}
+
+// auditSigningKeyIsMonotone keeps a key's retirement from being walked back.
+//
+// Retirement is the record that says "this key is loose; anything it signs past
+// sequence N is somebody else". Clearing retired_at, or moving retired_at_seq
+// forward, retroactively authorises exactly the rows the local copy already
+// flagged — and under plain LWW that edit replicates from the compromised node
+// to every peer, taking the finding with it. Deleting the row is worse still:
+// the certificate must stay resolvable for as long as any row it signed exists,
+// so a tombstone does not hide those rows, it makes them unverifiable, which
+// reads as mass tampering rather than as the erasure it is.
+func auditSigningKeyIsMonotone(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
+	idx := columnIndexMap(table.Columns)
+	if cellStr(row, idx, "deleted_at") != "" {
+		return true, "audit_key_tombstone", nil
+	}
+	if indexOf(table.Columns, "retired_at") < 0 {
+		return false, "", nil // pre-v46 dump: carries no retirement to weaken
+	}
+	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if err != nil || !found {
+		return false, "", err
+	}
+	if cellStr(localRow, idx, "retired_at") == "" {
+		return false, "", nil // not retired here; an incoming retirement may land
+	}
+	if cellStr(row, idx, "retired_at") == "" {
+		return true, "audit_key_unretire", nil
+	}
+	// Both retired: the EARLIER boundary is the strict one, so a later one is a
+	// weakening even though both rows look retired.
+	if cellInt64(row, idx, "retired_at_seq") > cellInt64(localRow, idx, "retired_at_seq") {
+		return true, "audit_key_boundary_raised", nil
+	}
+	return false, "", nil
+}
+
+// cellInt64 reads a numeric cell. A dump round-trips through JSON, so the same
+// column arrives as float64 from a peer and int64 from SQLite; both render
+// through coerceString and parse back the same way.
+func cellInt64(row []interface{}, idx map[string]int, col string) int64 {
+	f, err := strconv.ParseFloat(cellStr(row, idx, col), 64)
+	if err != nil {
+		return 0
+	}
+	return int64(f)
 }
 
 // columnIndexMap builds the name→offset map cellStr needs.

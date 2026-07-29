@@ -244,6 +244,22 @@ enforcement:
                               # fleet-wide — a peer still deciding locally would bypass the
                               # single decider entirely. Enable fleet-uniformly; the flag is the
                               # reversible kill switch.
+  audit_signature: false      # sign every audit row this host writes with its cluster key
+                              # (the same host.key that identifies it on the wire, under a
+                              # separate signing domain). The pre-v45 chain is an UNKEYED
+                              # hash: anyone who can write the database can edit a row,
+                              # recompute the hashes after it, and `lv audit verify` comes
+                              # back clean. A signature makes that require the host's private
+                              # key instead of just the algorithm, and any OTHER node can
+                              # check it — a compromised host can no longer certify its own
+                              # rewritten history. Setting this flag turns SIGNING on by
+                              # itself (signed rows are backward-compatible; old peers
+                              # replicate the new columns untouched). The token is advertised
+                              # only while the flag is on, and once it latches fleet-wide an
+                              # audit write this node CANNOT sign fails instead of landing
+                              # unsigned — until then unsigned rows are still normal, so they
+                              # cannot be read as evidence. Enable fleet-uniformly; the flag
+                              # is the reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

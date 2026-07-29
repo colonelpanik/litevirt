@@ -436,6 +436,12 @@ var capabilityMap = map[string]tableResolver{
 	"vm_backups":              {category: "content", chain: contentDefaultChain()},
 	"container_backups":       {category: "content", chain: contentDefaultChain()},
 	"container_snapshots":     {category: "content", chain: contentDefaultChain()},
+	// v45 audit tamper-evidence. Both are append-only and their rows never
+	// legitimately differ for one primary key, so a tie here already means
+	// something is wrong; the default chain settles it deterministically
+	// rather than leaving the cluster divergent.
+	"audit_signing_keys":      {category: "content", chain: contentDefaultChain()},
+	"audit_chain_heads":       {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

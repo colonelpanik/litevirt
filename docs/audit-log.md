@@ -67,22 +67,42 @@ Use cases:
 
 ```bash
 lv audit verify
-# OK: verified 12,847 rows; first broken=<none>
+# audit chain intact: 12847 rows verified, all signed
 ```
 
 `verify` walks **each host's sub-chain** (rows ordered by `host_name`, then
-timestamp, then id), recomputes each row's hash against the previous same-host
-row, and stops at the first mismatch. If it returns a broken row id, that host's
-audit sub-chain has been tampered with at or before that row. Common causes:
+timestamp, then id) and recomputes each row's hash against the previous
+same-host row. On top of that it checks each row's signature, its per-host
+sequence number, and the signed chain heads — a hash can be recomputed by
+whoever edited the row, a signature cannot.
 
-- A row was deleted (the next same-host row's `prev_hash` no longer matches).
-- A row was edited (its own `content_hash` no longer matches).
-- A schema migration replayed the table without rebuilding hashes
-  (operator error — re-run audit-log import with the chain rebuilder).
+It does **not** stop at the first problem. One broken id says nothing about
+whether the rest of the log was rewritten too, so every finding is printed,
+grouped by what it means:
+
+- **hash mismatch** — a row was edited, or a row before it was deleted, or a
+  migration replayed the table without rebuilding hashes (operator error).
+- **bad signature** — the row was edited by someone without the authoring
+  host's key. This is the finding that survives a reseal.
+- **unknown key** — the signer has no published certificate that chains to the
+  cluster CA.
+- **sequence gap** — a run of rows was deleted from one host's chain.
+- **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
+- **truncated** — a host's signed chain head attests to more rows than exist.
+
+Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`.
+
+**Unsigned rows are not tampering.** Rows written before signing was switched on
+carry no signature; they are chain-checked only, reported as a count on the
+clean line, and exit 0. Same for rows this daemon had no keyring to check and
+rows carrying no host name — both mean part of the log went unchecked, not that
+it was altered.
 
 The verify check is also exposed as the `VerifyAuditChain` gRPC RPC
 and the `/api/v1/audit/verify` REST route, so a monitoring system can
-poll it periodically.
+poll it periodically. The REST route always emits every field, including
+`tampered: false` — so an alert can key on the field's value and never confuse
+a clean chain with a daemon too old to report one.
 
 ## WORM export
 
@@ -123,6 +143,13 @@ sign the resulting JSON with a separate signing key.
 - A clock skew that violates HLC's `MaxSkewMS` is clamped, so a wildly
   wrong host clock cannot reorder audit rows in a way that breaks the
   chain.
-- Verification is O(N) over chain length. For long-running clusters,
-  consider running `verify` on a schedule and storing the result as a
-  metric — `litevirt_audit_chain_last_verified_ok` is on the roadmap.
+- Verification is O(N) over chain length, and the daemon runs it hourly on
+  its own rather than waiting to be asked: a check that only happens when an
+  operator types `lv audit verify` finds an intrusion after whatever prompted
+  them to look. The outcome is published as
+  `litevirt_audit_chain_last_verified_ok` (1 when the last check found no
+  evidence of tampering), with a per-kind breakdown in
+  `litevirt_audit_chain_findings` and a
+  `litevirt_audit_chain_heads_published_total` counter. Alert on the first
+  going to 0; a stalled head counter means truncation detection has quietly
+  stopped.

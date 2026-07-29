@@ -298,17 +298,47 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("failed to migrate legacy network names", "error", err)
 	}
 
-	// Re-base THIS host's audit sub-chain at startup. Rows written under the
-	// old global-chain model can't verify per-host, so this heals them eagerly
-	// (idempotent — a consistent chain rewrites nothing) and seeds the
-	// in-process tail. Doing it here, not lazily on the first audit write, means
-	// the chain is verifiable right after a rolling upgrade even on a node that
-	// performs no audited action for a while. Each daemon heals only the
-	// sub-chain it authored, so the cluster self-heals with no coordination.
-	if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
+	// Audit signing identity. The signing key IS the host's cluster key: it is
+	// already CA-signed with this host's name as its CN, already present on
+	// every node, and already the credential that says "I am this host".
+	// Minting a separate one would need the CA private key, which lives only on
+	// whichever node ran `lv host init`, so a fresh node could not sign its own
+	// log at all.
+	if d.cfg.Enforcement.AuditSignature {
+		if err := d.setupAuditSigning(ctx); err != nil {
+			// Non-fatal: refusing to start would turn a PKI problem into an
+			// outage. The node keeps running with unsigned rows, which
+			// `lv audit verify` reports as unsigned — visible, not silent.
+			slog.Error("audit signing could not be enabled; rows will be written unsigned",
+				"error", err)
+		}
+	}
+
+	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
+	// still entirely unsigned.
+	//
+	// This used to run unconditionally, and that was the single biggest hole in
+	// the audit log's tamper-evidence: reseal recomputes hashes from whatever
+	// the rows currently say, so an attacker with database write access could
+	// edit a row, wait for (or cause) a restart, and have the daemon itself
+	// rewrite the chain around the edit. `lv audit verify` then came back clean.
+	//
+	// Reseal now exists solely to heal rows written under the old global-chain
+	// model, which were never tamper-evident to begin with. Once a host has any
+	// signed row, its chain is verified rather than repaired: a hash that does
+	// not recompute is a FINDING, and rewriting it would destroy the only
+	// evidence that anything happened. resealHostChainLocked enforces the same
+	// rule per row, in the SQL as well as in Go, because the statement
+	// replicates.
+	if signed, err := corrosion.HostHasSignedAuditRows(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Warn("could not determine audit chain signing state", "error", err)
+	} else if signed {
+		slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
+	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
 		slog.Warn("audit chain reseal at startup failed", "error", err)
 	} else if n > 0 {
-		slog.Info("audit: re-based own-host chain at startup", "host", d.cfg.HostName, "rows", n)
+		slog.Info("audit: re-based legacy unsigned rows at startup",
+			"host", d.cfg.HostName, "rows", n)
 	}
 
 	// Set up libvirt TLS symlinks so qemu+tls:// migration works
@@ -567,6 +597,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// apply synchronously via reload/delta in the handlers).
 	go d.runAuthEngineReload(ctx)
 
+	// Publish this host's signed audit chain head periodically and at shutdown.
+	// Nothing else can detect a truncated tail: the hash chain links backward,
+	// so removing the last N rows leaves every surviving link verifying.
+	go d.runAuditChainHeads(ctx)
+
+	// Verify this node's view of the audit chain on a schedule and publish the
+	// result. A check that only runs when an operator asks for it finds an
+	// intrusion after the incident that prompted them to look.
+	go d.runAuditChainVerify(ctx)
+
 	// Start embedded DNS server, and tell the network layer to chain per-bridge
 	// dnsmasq instances to it for the litevirt domain so guests can resolve
 	// VM/container/anycast names (SetLocalResolver must precede network provisioning).
@@ -665,6 +705,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
+	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)      // drives the latch + conditional advertisement
+	// Once the whole cluster has latched audit_signature_v1, a node that cannot
+	// sign must FAIL the audit write rather than append an unsigned row. Without
+	// that, tamper-evidence is removable by making the key unreadable — the log
+	// would quietly revert to the state this exists to fix. Latched, not
+	// Enforced: this is read on the audit write path, which must not ping peers.
+	d.db.SetAuditSignatureRequired(func() bool {
+		return d.cfg.Enforcement.AuditSignature && d.checker.Latched(capabilities.AuditSignatureV1)
+	})
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())

@@ -7,8 +7,10 @@ import (
 )
 
 func TestSchemaV44FreshColumnsAndDefaults(t *testing.T) {
-	if CurrentSchemaVersion != 44 {
-		t.Fatalf("CurrentSchemaVersion = %d, want 44", CurrentSchemaVersion)
+	// v44's columns must survive every later version, so this pins a floor
+	// rather than an exact match — a bump is not supposed to break v44.
+	if CurrentSchemaVersion < 44 {
+		t.Fatalf("CurrentSchemaVersion = %d, want >= 44", CurrentSchemaVersion)
 	}
 	c := newTestDB(t)
 	ctx := context.Background()
@@ -123,8 +125,8 @@ func TestSchemaV44MigratesV43AndPreservesRows(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("migrate v43 to v44: %v", err)
 	}
-	if got := storedVersion(t, c); got != 44 {
-		t.Fatalf("schema version after migration = %d, want 44", got)
+	if got := storedVersion(t, c); got != CurrentSchemaVersion {
+		t.Fatalf("schema version after migration = %d, want %d", got, CurrentSchemaVersion)
 	}
 	rows, err := c.Query(ctx,
 		`SELECT state, image, cpu_limit, memory_mib, owner_epoch, spec_generation, active_operation_id

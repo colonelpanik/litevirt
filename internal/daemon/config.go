@@ -378,6 +378,16 @@ type EnforcementConfig struct {
 	// unreachable holder fails the admission CLOSED. Default false; reversible kill
 	// switch.
 	ProjectAuthority bool `yaml:"project_authority,omitempty"`
+	// AuditSignature: sign every audit row this node writes with the host's cluster
+	// key (capabilities.AuditSignatureV1). Signing follows this flag ALONE — a signed
+	// row is backward-compatible, so there is nothing to wait for. The cluster-wide
+	// latch gates only the refusal: with the flag set AND the token latched, an audit
+	// write this node cannot sign FAILS instead of landing unsigned, which is what
+	// stops an attacker with database write access from appending unsigned history and
+	// still passing `lv audit verify`. Enable fleet-uniformly (a node with the flag off
+	// keeps emitting unsigned rows, so the token is advertised only while it is on).
+	// Default false; reversible kill switch.
+	AuditSignature bool `yaml:"audit_signature,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

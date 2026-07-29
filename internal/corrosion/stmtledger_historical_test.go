@@ -35,7 +35,18 @@ import (
 // epochs). The schema-v41 literal shape was ADDED as claim_project_authority_v41,
 // not dropped, so a peer on the older shape still applies. No existing historical
 // identity was removed or changed.
-const compatibilityDigest = "3820e7dae614bb8916774c38da9cf17f7b2bf22fa7bce6c1862032d91e09ca4f"
+//
+// Updated again for v45 (audit tamper-evidence). The audit_log INSERT gained
+// key_id/signature/seq, and the hash-chain reseal UPDATE gained a
+// `signature IS NULL OR signature = ''` guard so it can never rewrite a signed
+// row — the guard lives in the SQL because that statement applies verbatim by
+// primary key on every peer, and without it a tampering node's reseal would
+// replicate over everyone else's good copies. Both pre-v45 shapes were ADDED as
+// audit_log_insert_v44 / audit_reseal_v44 rather than dropped. Retaining the
+// narrow reseal is safe: on a v45 receiver it can only reach rows that carry no
+// signature, and a sender old enough to emit it has none. No existing
+// historical identity was removed or changed.
+const compatibilityDigest = "b5f71b931daf9f72527d8e21156e733911f6ffe25d0b03f1812739eec0e99eeb"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -92,6 +103,8 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"delete_container_strict_pre_authority": 1,   // strict live-container tombstone before authority guard columns
 	"pci_release_by_vm_v130":                1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
 	"claim_project_authority_v41":           1,   // initial authority claim when the epoch was the literal 1
+	"audit_log_insert_v44":                  1,   // audit insert before key_id/signature/seq
+	"audit_reseal_v44":                      1,   // audit reseal before it refused to touch a signed row
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

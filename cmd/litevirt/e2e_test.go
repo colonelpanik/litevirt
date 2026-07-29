@@ -688,8 +688,11 @@ func (m *mockClient) GetProjectUsage(_ context.Context, _ *pb.GetProjectUsageReq
 }
 
 // audit chain mocks.
+// A clean, fully-signed chain. Stated explicitly rather than left at the zero
+// value so the "all signed" branch of `lv audit verify` is the one exercised —
+// a bare response also has UnsignedRows 0, which would pass either way.
 func (m *mockClient) VerifyAuditChain(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (*pb.VerifyAuditChainResponse, error) {
-	return &pb.VerifyAuditChainResponse{}, nil
+	return &pb.VerifyAuditChainResponse{RowsChecked: 3, Tampered: false}, nil
 }
 func (m *mockClient) ExportAuditChain(_ context.Context, _ *pb.ExportAuditChainRequest, _ ...grpc.CallOption) (*pb.ExportAuditChainResponse, error) {
 	return &pb.ExportAuditChainResponse{Json: `{"rows":[]}`}, nil

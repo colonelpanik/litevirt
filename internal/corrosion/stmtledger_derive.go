@@ -9,6 +9,11 @@ var appendOnlyTables = map[string]bool{
 	"audit_log":    true,
 	"mutation_log": true,
 	"vm_events":    true,
+	// A chain head is a signed assertion about a fixed (host, epoch, seq); it
+	// has no later revision. Append-only is what stops a replayed older head
+	// from displacing a newer one on a peer, which is exactly the move that
+	// would hide a truncation.
+	"audit_chain_heads": true,
 }
 
 // deriveDisposition classifies a parsed replicated statement into the disposition the apply
@@ -153,6 +158,18 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	{SQL: legacyContainerDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	{SQL: legacyContainerStrictDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes) → verbatim.
+	//
+	// The signature guard is part of the STATEMENT, not just the caller, and it
+	// has to be. This shape applies verbatim by primary key with no clock
+	// compare, so without the guard a node that resealed its own tampered rows
+	// would have every peer overwrite their good copies with the forged ones —
+	// replication would do the attacker's work across the whole cluster. With
+	// it, a signed row is unreachable by any reseal, local or replicated.
+	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ?
+				 WHERE id = ? AND (signature IS NULL OR signature = '')`, Disposition: DispFullPKUpdateNoClock},
+	// Pre-v45 shape, retained for the upgrade horizon (stmthistorical.go). Safe
+	// on a v45 receiver for the same reason: a sender old enough to emit it has
+	// no signed rows to protect.
 	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock},
 	// session revoke: a guarded one-shot terminal transition (WHERE revoked_at IS NULL) → verbatim.
 	{SQL: `UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, Disposition: DispFullPKUpdateNoClock},

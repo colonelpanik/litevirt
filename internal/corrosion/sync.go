@@ -250,6 +250,12 @@ var tableNames = []string{
 	// v41 F1 operation journal — control-plane metadata (no plaintext secrets); the
 	// non-LWW immutable merge runs regardless of lane (customMergeTables).
 	"operations", "operation_steps", "project_authority_epochs",
+	// v45 audit tamper-evidence. Both are public by design: a verification
+	// certificate is meant to be handed out, and a chain head is a signed
+	// assertion about a log an operator can already read. They belong in the
+	// operator-visible dump precisely so a peer — or a human with a state
+	// dump — can check a host's chain without that host's cooperation.
+	"audit_signing_keys", "audit_chain_heads",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS
@@ -777,6 +783,45 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				merged++
 			}
 			continue
+		}
+		// A SIGNED audit row is immutable, and anti-entropy must not overwrite it.
+		//
+		// audit_log carries no updated_at, so the LWW-and-tie block below never
+		// runs for it: `existing` is only prefetched when updatedAtIdx >= 0, and
+		// with nothing to compare, every incoming row fell straight through to
+		// the upsert. The last peer to sync won unconditionally — the
+		// capabilityMap chain for the table was never consulted at all.
+		//
+		// For an append-only log that is wrong however the conflict arose. Two
+		// nodes only hold different content for one row id if something is
+		// wrong, and the possibilities are corruption and tampering. Taking the
+		// incoming copy destroys the good version of the record AND spreads the
+		// bad one: a node that edits its own history would have anti-entropy
+		// carry the edit to every peer, which is precisely the outcome signing
+		// exists to prevent.
+		//
+		// Scoped to rows that actually carry a signature. Pre-v45 rows were
+		// never tamper-evident and their hashes legitimately change when a node
+		// re-bases a legacy chain, so refusing those would strand them in
+		// permanent disagreement — protection that only produces noise gets
+		// turned off.
+		if table.Name == "audit_log" {
+			keepLocal, kErr := signedAuditRowIsImmutable(tx, table, row, pkCols, pkIdx)
+			if kErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, kErr
+			}
+			if keepLocal {
+				skipped++
+				pk := pkKeyAt(row, pkIdx)
+				c.deferAfterCommit(tx, func() {
+					c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "signed_audit_row")
+					slog.Warn("anti-entropy: a peer's copy of a signed audit row differs from the "+
+						"local one; keeping local. One of the two has been altered — run "+
+						"`lv audit verify` on both nodes", "table", table.Name, "pk", pk)
+				})
+				continue
+			}
 		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
 		// natural key (deterministic winner over the group), not the minted random id, so two

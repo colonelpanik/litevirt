@@ -2610,8 +2610,10 @@ func (m *mockGRPC) GetProjectUsage(context.Context, *pb.GetProjectUsageRequest, 
 }
 
 // audit chain mocks.
+// A clean, fully-signed chain — the route marshals every field regardless, so
+// the zero values here are as much part of the response as RowsChecked.
 func (m *mockGRPC) VerifyAuditChain(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.VerifyAuditChainResponse, error) {
-	return &pb.VerifyAuditChainResponse{}, nil
+	return &pb.VerifyAuditChainResponse{RowsChecked: 3, Tampered: false}, nil
 }
 func (m *mockGRPC) ExportAuditChain(context.Context, *pb.ExportAuditChainRequest, ...grpc.CallOption) (*pb.ExportAuditChainResponse, error) {
 	return &pb.ExportAuditChainResponse{Json: `{"rows":[]}`}, nil

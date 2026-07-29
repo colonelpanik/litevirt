@@ -123,6 +123,14 @@ type Server struct {
 	// its own replica would bypass the single decider entirely, so serializing against
 	// one is worthless until every node has opted in.
 	enfProjectAuthority bool
+	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
+	// It alone turns SIGNING on (a signed row is backward-compatible, so nothing has
+	// to wait); combined with the AuditSignatureV1 latch it also makes an UNSIGNABLE
+	// audit write refuse rather than land unsigned. Advertised CONDITIONALLY on the
+	// flag (like operation_protocol): a peer with it off keeps writing unsigned rows,
+	// which are exactly what a forgery looks like, so the latch must require config
+	// uniformity.
+	enfAuditSignature bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -452,6 +460,14 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfProjectAuthority {
 		caps = withoutCapability(caps, capabilities.ProjectAuthorityV1)
 	}
+	// audit_signature_v1 is likewise advertised CONDITIONALLY on its config flag. A
+	// node with the flag off writes unsigned audit rows into the same replicated
+	// table, and an unsigned row is precisely the shape a forgery takes — so no node
+	// may start REFUSING unsignable writes (and treating "unsigned" as evidence)
+	// until every node has opted in. Config uniformity, not just a uniform build.
+	if !s.enfAuditSignature {
+		caps = withoutCapability(caps, capabilities.AuditSignatureV1)
+	}
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -590,11 +606,27 @@ func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry =
 // ProjectAuthorityV1 cluster-wide latch; advertisement is withheld while it is off.
 func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = on }
 
+// SetAuditSignatureEnforce sets this node's kill-switch for tamper-evident audit
+// logging (enforcement.audit_signature). This flag alone enables SIGNING; refusing
+// an unsignable audit write additionally requires the AuditSignatureV1 latch, and
+// advertisement is withheld while the flag is off.
+func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
+
 // projectAuthorityActive reports whether this node routes project-quota admissions
 // through the project's authority holder: the config flag AND the cluster-wide latch.
 // Same `flag && Enforced` model as the rest of the family.
 func (s *Server) projectAuthorityActive(ctx context.Context) bool {
 	return s.enfProjectAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectAuthorityV1)
+}
+
+// auditSignatureActive reports whether an audit write this node cannot sign must
+// FAIL rather than land unsigned: the config flag AND the cluster-wide latch. Not
+// the same question as "does this node sign" — that is the flag alone, since a
+// signed row is backward-compatible. Only the refusal needs fleet uniformity,
+// because a cluster still producing legitimate unsigned rows cannot treat an
+// unsigned row as evidence of tampering.
+func (s *Server) auditSignatureActive(ctx context.Context) bool {
+	return s.enfAuditSignature && s.gate != nil && s.gate.Enforced(ctx, capabilities.AuditSignatureV1)
 }
 
 // liveResizeActive reports whether this node may originate live-resize behavior
@@ -644,6 +676,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfCanonicalRegistry
 	case capabilities.ProjectAuthorityV1:
 		return s.enfProjectAuthority
+	case capabilities.AuditSignatureV1:
+		return s.enfAuditSignature
 	default:
 		return false
 	}

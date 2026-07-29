@@ -255,7 +255,14 @@ import (
 //	     capacity-policy fingerprint used by admission compatibility checks, and
 //	     notification_routes gains subject_pattern/project selectors. Six
 //	     additive columns with legacy-compatible defaults.
-const CurrentSchemaVersion = 44
+//	v45: audit tamper-evidence — audit_log gains key_id/signature/seq so a row
+//	     carries an ECDSA signature over its content hash, chain position and
+//	     sequence number, plus audit_signing_keys (the per-host verification
+//	     certificate, replicated so any node can check any host's chain) and
+//	     audit_chain_heads (append-only signed heads, which is the only way to
+//	     detect truncation — a hash chain links backward and cannot notice that
+//	     its own tail was removed). Three additive columns, two new tables.
+const CurrentSchemaVersion = 45
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1255,7 +1262,58 @@ var schemaDDL = []string{
 		-- pre-3.4 rows; the verifier treats absent values as a
 		-- chain reset point.
 		prev_hash    TEXT,
-		content_hash TEXT
+		content_hash TEXT,
+		-- v45 tamper-evidence: content_hash alone is an UNKEYED digest, so
+		-- anyone able to write the table can edit a row and recompute the
+		-- chain. key_id/signature bind the row to the private key of the host
+		-- that authored it; seq is that host's position counter, signed
+		-- alongside, so rows cannot be renumbered or silently dropped.
+		-- Nullable/zero for rows written before v45: those are chain-verified
+		-- but NOT tamper-evident, and the verifier reports them as such.
+		key_id       TEXT,
+		signature    TEXT,
+		seq          INTEGER NOT NULL DEFAULT 0
+	)`,
+
+	// Per-host audit verification certificates. Public material by definition —
+	// a certificate is meant to be handed out — so this replicates on the
+	// ordinary lane rather than the sensitive one. It exists so ANY node can
+	// verify ANY host's sub-chain: peers hold the cluster CA but do not store
+	// each other's leaf certificates, and cross-node verification is the whole
+	// point (a host that tampers with its own log is caught by its neighbours).
+	`CREATE TABLE IF NOT EXISTS audit_signing_keys (
+		key_id     TEXT PRIMARY KEY,
+		host_name  TEXT NOT NULL,
+		cert_pem   TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
+
+	// Signed audit chain heads. A hash chain links each row backward to its
+	// predecessor, which catches edits and mid-chain deletions but is blind to
+	// truncation: cut the last N rows and every surviving link still verifies,
+	// because nothing points forward. A periodically published head — signed,
+	// carrying the host's last seq and tail hash — is what makes the missing
+	// rows visible.
+	//
+	// APPEND-ONLY, with seq in the primary key. A head that could be updated in
+	// place would let an attacker replay an older legitimately-signed head to
+	// match a truncated log; with every head retained, the highest one still
+	// exists on every peer and the truncation shows up as a seq shortfall.
+	// epoch increments on reseal, so a reseal is a visible event in the record
+	// instead of an invisible rewrite.
+	`CREATE TABLE IF NOT EXISTS audit_chain_heads (
+		host_name  TEXT NOT NULL,
+		epoch      INTEGER NOT NULL DEFAULT 0,
+		seq        INTEGER NOT NULL DEFAULT 0,
+		head_hash  TEXT NOT NULL DEFAULT '',
+		key_id     TEXT NOT NULL DEFAULT '',
+		signature  TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
+		PRIMARY KEY (host_name, epoch, seq)
 	)`,
 
 	// Per-VM operational event store (v13). Durable, CRDT-replicated,
@@ -1831,6 +1889,8 @@ var tablePrimaryKeys = map[string][]string{
 	"vm_nics":                 {"vm_name", "id"},
 	"vm_pci_intent":           {"vm_name", "device_id"},
 	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
+	"audit_signing_keys":      {"key_id"},
+	"audit_chain_heads":       {"host_name", "epoch", "seq"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2033,6 +2093,12 @@ var schemaMigrations = []string{
 	`ALTER TABLE hosts ADD COLUMN capacity_policy_hash TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE notification_routes ADD COLUMN subject_pattern TEXT NOT NULL DEFAULT '*'`,
 	`ALTER TABLE notification_routes ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+	// v45: audit tamper-evidence (see History v45). key_id/signature stay
+	// nullable — absent means "written before signing", which the verifier
+	// reports rather than treats as a break.
+	`ALTER TABLE audit_log ADD COLUMN key_id TEXT`,
+	`ALTER TABLE audit_log ADD COLUMN signature TEXT`,
+	`ALTER TABLE audit_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2114,6 +2180,7 @@ var alterVersions = []int{
 	44, 44, 44, // containers.owner_epoch/spec_generation/active_operation_id
 	44,     // hosts.capacity_policy_hash
 	44, 44, // notification_routes.subject_pattern/project
+	45, 45, 45, // audit_log.key_id/signature/seq
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2136,6 +2203,7 @@ var createTableUnits = []struct {
 	{40, "host_fw_intent"},
 	{41, "operations"}, {41, "operation_steps"}, {41, "project_authority_epochs"},
 	{42, "vm_nics"}, {42, "vm_pci_intent"}, {42, "vm_pci_realizations"},
+	{45, "audit_signing_keys"}, {45, "audit_chain_heads"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

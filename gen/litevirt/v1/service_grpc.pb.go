@@ -555,10 +555,25 @@ type LiteVirtClient interface {
 	// it, then localizes via blockpull. Disaster recovery after host loss.
 	PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error)
 	// ── tamper-evident audit log ──
-	// VerifyAuditChain walks every audit_log row from the oldest
-	// forward and confirms each content_hash matches the
-	// SHA-256(prev_hash || canonical(row)) recomputation. Returns
-	// the first ID that fails (or "" for a clean run).
+	// VerifyAuditChain walks each host's audit sub-chain (a row's
+	// prev_hash links to the previous row from the SAME host, because
+	// N daemons appending concurrently can never form one linear
+	// chain) and confirms each content_hash matches the
+	// SHA-256(prev_hash || canonical(row)) recomputation.
+	//
+	// It also checks what a hash alone cannot: the ECDSA signature
+	// over each row, its host sequence number, and the signed chain
+	// heads. A hash break is corruption or a crude edit; a bad
+	// signature is an edit by someone without the host's key and
+	// survives a reseal; a seq gap is a deleted run of rows; a
+	// truncated host is a tail that was cut off entirely.
+	//
+	// It does not stop at the first problem — one id says nothing
+	// about whether the rest of the log was rewritten too — so every
+	// finding is reported and `tampered` summarises whether any of
+	// them is evidence of interference. Unsigned rows are NOT: every
+	// cluster upgrading to signing has a log full of them.
+	//
 	// ExportAuditChain emits a JSON blob containing the rows in a
 	// time-range — suitable for WORM offload to S3 Object Lock /
 	// an immutable tape vault.
@@ -3404,10 +3419,25 @@ type LiteVirtServer interface {
 	// it, then localizes via blockpull. Disaster recovery after host loss.
 	PromoteReplica(*PromoteReplicaRequest, grpc.ServerStreamingServer[PromoteReplicaProgress]) error
 	// ── tamper-evident audit log ──
-	// VerifyAuditChain walks every audit_log row from the oldest
-	// forward and confirms each content_hash matches the
-	// SHA-256(prev_hash || canonical(row)) recomputation. Returns
-	// the first ID that fails (or "" for a clean run).
+	// VerifyAuditChain walks each host's audit sub-chain (a row's
+	// prev_hash links to the previous row from the SAME host, because
+	// N daemons appending concurrently can never form one linear
+	// chain) and confirms each content_hash matches the
+	// SHA-256(prev_hash || canonical(row)) recomputation.
+	//
+	// It also checks what a hash alone cannot: the ECDSA signature
+	// over each row, its host sequence number, and the signed chain
+	// heads. A hash break is corruption or a crude edit; a bad
+	// signature is an edit by someone without the host's key and
+	// survives a reseal; a seq gap is a deleted run of rows; a
+	// truncated host is a tail that was cut off entirely.
+	//
+	// It does not stop at the first problem — one id says nothing
+	// about whether the rest of the log was rewritten too — so every
+	// finding is reported and `tampered` summarises whether any of
+	// them is evidence of interference. Unsigned rows are NOT: every
+	// cluster upgrading to signing has a log full of them.
+	//
 	// ExportAuditChain emits a JSON blob containing the rows in a
 	// time-range — suitable for WORM offload to S3 Object Lock /
 	// an immutable tape vault.

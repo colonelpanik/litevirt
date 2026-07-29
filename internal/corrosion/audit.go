@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -26,25 +25,61 @@ type AuditRecord struct {
 	// write side and use them only when reading via ListAuditLogChain.
 	PrevHash    string
 	ContentHash string
+	// KeyID + Signature are the v45 tamper-evidence: an ECDSA signature by the
+	// authoring host's cluster key over ContentHash, KeyID and Seq. Empty on
+	// rows written before signing was enabled — those are chain-checked but not
+	// tamper-evident, and the verifier says so rather than implying otherwise.
+	KeyID     string
+	Signature string
+	// Seq is the authoring host's monotonic row counter. Signed alongside the
+	// content hash so rows cannot be renumbered, and the value a chain head
+	// attests to so a truncated tail is detectable.
+	Seq int64
 }
 
-// chainState tracks the in-flight tail hash for THIS host's audit
-// sub-chain. The audit_log is a multi-writer table — every daemon
-// appends its own rows and they all replicate via Crescent — so a
-// single global hash-chain can never stay linear (two hosts writing
-// concurrently interleave by timestamp and fork the chain). Instead
-// each host maintains its OWN per-host sub-chain: a row's prev_hash
-// links to the previous row written by the SAME host. A daemon only
-// ever authors rows for its own host, so this sub-chain is fully local
-// and unaffected by cross-host interleaving or replication ordering.
+// chainState tracks the in-flight tail hash of each audit sub-chain this
+// client is appending to. The audit_log is a multi-writer table — every daemon
+// appends its own rows and they all replicate via Crescent — so a single global
+// hash-chain can never stay linear (two hosts writing concurrently interleave by
+// timestamp and fork the chain). Instead each host maintains its OWN per-host
+// sub-chain: a row's prev_hash links to the previous row written by the SAME
+// host. A daemon only ever authors rows for its own host, so this sub-chain is
+// fully local and unaffected by cross-host interleaving or replication ordering.
 // VerifyAuditChain validates each host's sub-chain independently.
+//
+// The state is keyed by host_name and hangs off the Client rather than being a
+// package global. A global is correct only while exactly one Client exists per
+// process, which is true of a daemon and false of tests/fleet, where N daemons
+// share one `go test` process — there, the first node's insert set the global
+// `known` flag and the second node's first row linked its prev_hash to a tail
+// from another node's database. Keying by host also removes the need to pretend
+// a reset stands in for "a separate process": one client can legitimately hold
+// several sub-chains, and each advances independently.
 type chainState struct {
-	mu       sync.Mutex
-	tailHash string
-	known    bool // true once we've read the tail from disk at startup
+	mu    sync.Mutex
+	tails map[string]*chainTail
 }
 
-var auditChainState chainState
+// chainTail is one host's in-flight sub-chain position.
+type chainTail struct {
+	hash  string
+	seq   int64 // highest seq this host has written; the next row is seq+1
+	known bool  // true once the tail has been read back from the DB
+}
+
+// tail returns hostName's tail state, creating it on first use.
+// Caller must hold cs.mu.
+func (cs *chainState) tail(hostName string) *chainTail {
+	if cs.tails == nil {
+		cs.tails = map[string]*chainTail{}
+	}
+	t := cs.tails[hostName]
+	if t == nil {
+		t = &chainTail{}
+		cs.tails[hostName] = t
+	}
+	return t
+}
 
 // InsertAuditLog appends an entry to the audit_log table and stamps
 // the prev_hash / content_hash chain fields. Idempotent on ID: if
@@ -59,42 +94,98 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 		// the secondary id-sort doesn't match insert order.
 		r.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	auditChainState.mu.Lock()
-	defer auditChainState.mu.Unlock()
+	c.auditChain.mu.Lock()
+	defer c.auditChain.mu.Unlock()
+	tail := c.auditChain.tail(r.HostName)
 
-	if !auditChainState.known {
-		// First insert in this process — bootstrap THIS host's sub-chain.
-		// re-base any legacy rows that were written under the old global
-		// chain (prev_hash linking across hosts) into a clean per-host
-		// chain, returning the resealed tail. Idempotent: once a host's
-		// rows are consistent, this makes no writes and just reads the tail.
-		tail, resealed, err := resealHostChainLocked(ctx, c, r.HostName)
-		if err == nil {
-			auditChainState.tailHash = tail
-			if resealed > 0 {
-				slog.Info("audit: re-based legacy rows into per-host chain",
-					"host", r.HostName, "rows", resealed)
-			}
+	if !tail.known {
+		// First insert for this host on this client — bootstrap its sub-chain
+		// from what this host has already written.
+		if err := loadHostTail(ctx, c, r.HostName, tail); err != nil {
+			return err
 		}
-		auditChainState.known = true
+		tail.known = true
 	}
 
-	prev := auditChainState.tailHash
-	r.PrevHash = prev
+	r.PrevHash = tail.hash
+	r.Seq = tail.seq + 1
 	r.ContentHash = HashAuditRow(r)
+
+	// Sign before writing, and fail the insert if signing fails. An audit row
+	// that silently degrades to unsigned whenever the key is unreadable would
+	// hand an attacker a way to turn tamper-evidence off: make the key
+	// unavailable and every subsequent row loses its protection with only a
+	// log line to show for it.
+	keyring := c.AuditKeyringOf()
+	sig, err := keyring.SignRow(r.ContentHash, r.Seq)
+	if err != nil {
+		return fmt.Errorf("sign audit row %s: %w", r.ID, err)
+	}
+	r.Signature, r.KeyID = sig, ""
+	if sig != "" {
+		r.KeyID = keyring.KeyID()
+	} else if c.auditSignatureRequiredNow() {
+		return fmt.Errorf("audit signing is enforced cluster-wide but this node has no signing "+
+			"key; refusing to append an unsigned row for %s", r.Action)
+	}
 
 	if err := c.Execute(ctx,
 		`INSERT OR IGNORE INTO audit_log
-		   (id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		   (id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash, key_id, signature, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.Timestamp, r.Username, r.HostName,
 		r.Action, r.Target, r.Detail, r.Result,
-		r.PrevHash, r.ContentHash,
+		r.PrevHash, r.ContentHash, r.KeyID, r.Signature, r.Seq,
 	); err != nil {
 		return err
 	}
-	auditChainState.tailHash = r.ContentHash
+	tail.hash, tail.seq = r.ContentHash, r.Seq
 	return nil
+}
+
+// loadHostTail reads back hostName's current chain position: the content hash
+// of its last row and the highest seq it has issued.
+//
+// Ordering matches the verifier's (timestamp, id), so the tail this returns is
+// the row the verifier will also treat as last. seq is taken as a MAX rather
+// than from that row, because a legacy row carries seq 0 and must not drag the
+// counter backwards onto a value already in use.
+func loadHostTail(ctx context.Context, c *Client, hostName string, tail *chainTail) error {
+	rows, err := c.Query(ctx,
+		`SELECT content_hash FROM audit_log WHERE host_name = ?
+		 ORDER BY timestamp DESC, id DESC LIMIT 1`, hostName)
+	if err != nil {
+		return fmt.Errorf("read audit chain tail for %s: %w", hostName, err)
+	}
+	if len(rows) == 1 {
+		tail.hash = rows[0].String("content_hash")
+	}
+	seqRows, err := c.Query(ctx,
+		`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM audit_log WHERE host_name = ?`, hostName)
+	if err != nil {
+		return fmt.Errorf("read audit seq for %s: %w", hostName, err)
+	}
+	if len(seqRows) == 1 {
+		tail.seq = seqRows[0].Int64("max_seq")
+	}
+	return nil
+}
+
+// HostHasSignedAuditRows reports whether hostName has written any signed row.
+//
+// It is the switch between repairing and verifying. A host whose chain is
+// entirely unsigned was never tamper-evident, so re-basing its hashes loses
+// nothing and heals rows written under the old global-chain model. The moment
+// one signed row exists, the chain carries evidence, and a reseal would erase
+// exactly the mismatch that proves an edit occurred.
+func HostHasSignedAuditRows(ctx context.Context, c *Client, hostName string) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT id FROM audit_log
+		 WHERE host_name = ? AND signature IS NOT NULL AND signature <> '' LIMIT 1`, hostName)
+	if err != nil {
+		return false, fmt.Errorf("check signed audit rows for %s: %w", hostName, err)
+	}
+	return len(rows) > 0, nil
 }
 
 // HashAuditRow returns the canonical SHA-256 of one audit row, mixed
@@ -137,31 +228,98 @@ func HashAuditRow(r AuditRecord) string {
 // can't stay linear when N daemons append concurrently, but each host's
 // own sub-chain is linear and tamper-evident.
 //
-// Returns (rowsChecked, brokenAt, err). brokenAt is the ID of the
-// first row whose hash does not match; "" when every chain is intact.
-func VerifyAuditChain(ctx context.Context, c *Client) (int, string, error) {
+// The result distinguishes the ways a log can be wrong, because the responses
+// differ: a hash break is corruption or a crude edit, a bad signature is an
+// edit by someone without the host's key, an unsigned row is simply older than
+// enforcement, and a truncated tail leaves nothing behind at all.
+type AuditVerifyResult struct {
+	// RowsChecked counts every row examined.
+	RowsChecked int
+	// BrokenAt is the first row whose content hash does not match a
+	// recomputation. Empty when every chain links correctly.
+	BrokenAt string
+	// Unsigned counts rows carrying no signature: written before v45, or while
+	// enforcement.audit_signature was off. They are chain-checked only.
+	Unsigned int
+	// Unverifiable counts signed rows this verifier had no keyring to check.
+	Unverifiable int
+	// BadSignature lists rows whose signature failed against the published
+	// certificate for their key. This is the tamper signal that survives a
+	// reseal: rewriting the hash cannot produce a matching signature.
+	BadSignature []string
+	// UnknownKeyID lists rows whose key has no usable published certificate —
+	// either never published, or one that does not chain to the cluster CA.
+	UnknownKeyID []string
+	// SeqGaps lists breaks in a host's sequence numbering, which is how the
+	// deletion of a whole run of rows shows up.
+	SeqGaps []string
+	// Laundered lists rows that blanked their own hash to pose as a pre-chain
+	// reset point, which used to silently re-base everything after them.
+	Laundered []string
+	// Unattributed counts rows with no host name. They belong to no sub-chain
+	// and so cannot be chain-verified at all.
+	Unattributed int
+	// TruncatedHosts lists hosts whose signed chain head attests to more rows
+	// than the log actually holds.
+	TruncatedHosts []string
+}
+
+// Tampered reports whether anything found is evidence of deliberate
+// interference rather than age. Unsigned/Unverifiable rows are deliberately
+// NOT tampering: they are what a cluster looks like before enforcement.
+func (r AuditVerifyResult) Tampered() bool {
+	return r.BrokenAt != "" || len(r.BadSignature) > 0 || len(r.UnknownKeyID) > 0 ||
+		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0
+}
+
+// VerifyAuditChain walks every host's sub-chain and reports what it finds.
+//
+// Unlike the pre-v45 version it does NOT stop at the first problem. Stopping
+// hid the shape of an attack: one broken row said nothing about whether the
+// rest of the log had been rewritten too, and an operator staring at a single
+// id could not tell a disk error from a targeted edit.
+func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error) {
+	var res AuditVerifyResult
 	rows, err := c.Query(ctx,
-		`SELECT id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash
+		`SELECT id, timestamp, username, host_name, action, target, detail, result,
+		        prev_hash, content_hash, key_id, signature, seq
 		 FROM audit_log
 		 ORDER BY host_name ASC, timestamp ASC, id ASC`)
 	if err != nil {
-		return 0, "", fmt.Errorf("list audit_log: %w", err)
+		return res, fmt.Errorf("list audit_log: %w", err)
 	}
-	prevByHost := map[string]string{} // per-host running tail
-	checked := 0
+	keyring := c.AuditKeyringOf()
+	prevByHost := map[string]string{}  // per-host running tail
+	seqByHost := map[string]int64{}    // per-host last signed seq
+	hashedByHost := map[string]bool{}  // has this host produced a hashed row yet?
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
-		if stored == "" || host == "" {
-			// Reset point: a NULL content_hash (rows predating the chain) OR a
-			// row with no host identity (audit writes from a background context
-			// that has no host — e.g. the failover coordinator). Such rows
-			// belong to no host's authored sub-chain, so they're accepted
-			// without a linkage check rather than breaking a host's chain.
-			prevByHost[host] = ""
-			checked++
+		res.RowsChecked++
+
+		if host == "" {
+			// A row with no host identity belongs to no authored sub-chain, so
+			// there is nothing to link it to. Historically these came from
+			// background contexts with no host (the failover coordinator);
+			// every live caller now stamps one. Counted, not trusted.
+			res.Unattributed++
 			continue
 		}
+		if stored == "" {
+			// A blank hash means "written before the chain existed" and resets
+			// the running tail. That is only credible BEFORE the host's first
+			// hashed row — afterwards it is the cheapest possible attack:
+			// blank one row's hash and every row after it is re-based against
+			// an empty tail, so an edited history verifies clean. Such a row
+			// is reported, and crucially does NOT reset the tail.
+			if hashedByHost[host] {
+				res.Laundered = append(res.Laundered, r.String("id"))
+				continue
+			}
+			prevByHost[host] = ""
+			continue
+		}
+
 		rec := AuditRecord{
 			ID:        r.String("id"),
 			Timestamp: r.String("timestamp"),
@@ -173,14 +331,54 @@ func VerifyAuditChain(ctx context.Context, c *Client) (int, string, error) {
 			Result:    r.String("result"),
 			PrevHash:  prevByHost[host],
 		}
-		expect := HashAuditRow(rec)
-		if !strings.EqualFold(expect, stored) {
-			return checked, rec.ID, nil
+		if expect := HashAuditRow(rec); !strings.EqualFold(expect, stored) && res.BrokenAt == "" {
+			res.BrokenAt = rec.ID
 		}
+		hashedByHost[host] = true
 		prevByHost[host] = stored
-		checked++
+
+		sig, keyID, seq := r.String("signature"), r.String("key_id"), r.Int64("seq")
+		if sig == "" {
+			res.Unsigned++
+			continue
+		}
+		// Sequence numbers are only meaningful once signed: an unsigned row
+		// carries seq 0 and renumbering it costs nothing.
+		if last, seen := seqByHost[host]; seen && seq != last+1 {
+			res.SeqGaps = append(res.SeqGaps,
+				fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
+		}
+		seqByHost[host] = seq
+
+		if keyring == nil {
+			res.Unverifiable++
+			continue
+		}
+		if err := keyring.VerifyRow(ctx, c, host, keyID, stored, seq, sig); err != nil {
+			if isUnknownKeyErr(err) {
+				res.UnknownKeyID = append(res.UnknownKeyID, rec.ID+": "+err.Error())
+			} else {
+				res.BadSignature = append(res.BadSignature, rec.ID+": "+err.Error())
+			}
+		}
 	}
-	return checked, "", nil
+
+	if err := verifyChainHeads(ctx, c, keyring, seqByHost, &res); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// isUnknownKeyErr separates "we could not obtain a trustworthy public key" from
+// "we had the key and the signature was wrong". Both are findings, but only the
+// second says someone edited a row.
+func isUnknownKeyErr(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "no published certificate") ||
+		strings.Contains(s, "does not chain to the cluster CA") ||
+		strings.Contains(s, "actually has id") ||
+		strings.Contains(s, "carries no key id") ||
+		strings.Contains(s, "not an ECDSA key")
 }
 
 // ResealAuditChain re-bases one host's audit rows into a clean per-host
@@ -192,18 +390,51 @@ func VerifyAuditChain(ctx context.Context, c *Client) (int, string, error) {
 // coordination — each node fixes the sub-chain it authored.
 //
 // Re-sealing rewrites tamper-evidence hashes, so it re-bases trust to the
-// current state. That's sound here because the global chain it replaces is
-// already unverifiable; the per-host chain it produces is tamper-evident
-// for every write from this point forward.
+// current state. That is sound ONLY for rows that were never tamper-evident —
+// the unsigned ones — and resealHostChainLocked refuses to touch anything
+// carrying a signature. Without that refusal a reseal is an eraser: edit a row,
+// reseal, and the recomputed hash matches the edited content.
+//
+// A reseal that actually rewrites rows is recorded, not silent. It opens a new
+// chain epoch and publishes a signed head for it, so the fact that hashes were
+// re-based at a particular moment is itself part of the permanent record. An
+// operator reading `lv audit verify` can see that it happened and when; the
+// pre-v45 behaviour left no trace at all.
 func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, error) {
-	auditChainState.mu.Lock()
-	defer auditChainState.mu.Unlock()
-	tail, resealed, err := resealHostChainLocked(ctx, c, hostName)
+	c.auditChain.mu.Lock()
+	hash, resealed, err := resealHostChainLocked(ctx, c, hostName)
 	if err != nil {
+		c.auditChain.mu.Unlock()
 		return 0, err
 	}
-	auditChainState.tailHash = tail
-	auditChainState.known = true
+	tail := c.auditChain.tail(hostName)
+	// Pick up this host's seq (the reseal itself does not change it) before
+	// overwriting the tail hash with the freshly re-based one.
+	if !tail.known {
+		if lerr := loadHostTail(ctx, c, hostName, tail); lerr != nil {
+			c.auditChain.mu.Unlock()
+			return resealed, lerr
+		}
+		tail.known = true
+	}
+	tail.hash = hash
+	seq := tail.seq
+	c.auditChain.mu.Unlock()
+
+	if resealed == 0 {
+		return 0, nil
+	}
+	keyring := c.AuditKeyringOf()
+	if !keyring.CanSign() || seq == 0 {
+		return resealed, nil
+	}
+	epoch, err := currentAuditEpoch(ctx, c, hostName)
+	if err != nil {
+		return resealed, err
+	}
+	if err := insertAuditChainHead(ctx, c, keyring, hostName, epoch+1, seq, hash); err != nil {
+		return resealed, fmt.Errorf("record reseal epoch: %w", err)
+	}
 	return resealed, nil
 }
 
@@ -215,7 +446,7 @@ func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, err
 // restart (replication only brings OTHER hosts' rows).
 func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (string, int, error) {
 	rows, err := c.Query(ctx,
-		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash
+		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash, signature
 		 FROM audit_log
 		 WHERE host_name = ?
 		 ORDER BY timestamp ASC, id ASC`, hostName)
@@ -225,6 +456,17 @@ func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (str
 	prev := ""
 	resealed := 0
 	for _, r := range rows {
+		// A SIGNED row is never resealed. Its hash is covered by a signature
+		// this process may not even be able to reproduce, so rewriting it
+		// cannot repair anything — it can only destroy the evidence that the
+		// row was altered. If a signed row's hash looks wrong, that is a
+		// finding for the verifier to report, not damage for the reseal to
+		// paper over. Reseal exists solely to re-base rows written before
+		// signing, which were never tamper-evident to begin with.
+		if r.String("signature") != "" {
+			prev = r.String("content_hash")
+			continue
+		}
 		rec := AuditRecord{
 			ID:        r.String("id"),
 			Timestamp: r.String("timestamp"),
@@ -238,8 +480,14 @@ func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (str
 		}
 		newHash := HashAuditRow(rec)
 		if !strings.EqualFold(newHash, r.String("content_hash")) {
+			// The guard is repeated in the SQL, not just in the loop above,
+			// because this statement replicates: peers apply it verbatim by
+			// primary key with no clock comparison. Without the WHERE clause a
+			// tampering node could reseal its own rows and have every peer
+			// overwrite their good copies with the forged ones.
 			if err := c.Execute(ctx,
-				`UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`,
+				`UPDATE audit_log SET prev_hash = ?, content_hash = ?
+				 WHERE id = ? AND (signature IS NULL OR signature = '')`,
 				prev, newHash, rec.ID); err != nil {
 				return "", resealed, fmt.Errorf("reseal row %s: %w", rec.ID, err)
 			}
@@ -250,14 +498,18 @@ func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (str
 	return prev, resealed, nil
 }
 
-// ResetChainStateForTests forgets the cached tail so a test can
-// re-initialise the in-memory chain pointer against a freshly-
-// truncated audit_log. Test-only.
-func ResetChainStateForTests() {
-	auditChainState.mu.Lock()
-	defer auditChainState.mu.Unlock()
-	auditChainState.tailHash = ""
-	auditChainState.known = false
+// ResetAuditChainForTests forgets this client's cached tails so a test can
+// re-initialise them against a freshly-truncated audit_log. Test-only.
+//
+// It is a method, not a package function: the state it clears belongs to one
+// client. The package-level version had to be called between two hosts' writes
+// to stand in for "a separate daemon process" — keying the tails by host_name
+// removes that need, since one client can hold several sub-chains and each
+// advances on its own.
+func (c *Client) ResetAuditChainForTests() {
+	c.auditChain.mu.Lock()
+	defer c.auditChain.mu.Unlock()
+	c.auditChain.tails = nil
 }
 
 // FenceLogRecord is a single fencing event.

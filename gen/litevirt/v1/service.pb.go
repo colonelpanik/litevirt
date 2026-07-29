@@ -21847,10 +21847,40 @@ func (x *DeleteReplicationScheduleRequest) GetProjectName() string {
 }
 
 type VerifyAuditChainResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RowsChecked   int32                  `protobuf:"varint,1,opt,name=rows_checked,json=rowsChecked,proto3" json:"rows_checked,omitempty"`
-	BrokenAtId    string                 `protobuf:"bytes,2,opt,name=broken_at_id,json=brokenAtId,proto3" json:"broken_at_id,omitempty"` // empty if chain intact
-	Error         string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`                               // non-empty if the verify itself failed
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	RowsChecked int32                  `protobuf:"varint,1,opt,name=rows_checked,json=rowsChecked,proto3" json:"rows_checked,omitempty"`
+	BrokenAtId  string                 `protobuf:"bytes,2,opt,name=broken_at_id,json=brokenAtId,proto3" json:"broken_at_id,omitempty"` // empty if chain intact
+	Error       string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`                               // non-empty if the verify itself failed
+	// Rows carrying no signature: written before signing existed, or while
+	// enforcement.audit_signature was off. Chain-checked only, and NOT
+	// tampering — reporting them as such on every upgraded cluster would
+	// train operators to ignore this command.
+	UnsignedRows int32 `protobuf:"varint,4,opt,name=unsigned_rows,json=unsignedRows,proto3" json:"unsigned_rows,omitempty"`
+	// Signed rows this verifier had no keyring to check. Not a finding
+	// about the rows, a gap in what the verifier could see.
+	UnverifiableRows int32 `protobuf:"varint,5,opt,name=unverifiable_rows,json=unverifiableRows,proto3" json:"unverifiable_rows,omitempty"`
+	// Signatures that failed against the published certificate for their
+	// key. The signal that survives a reseal: rewriting a row's hash
+	// cannot produce a matching signature.
+	BadSignature []string `protobuf:"bytes,6,rep,name=bad_signature,json=badSignature,proto3" json:"bad_signature,omitempty"`
+	// Rows whose key has no trustworthy published certificate — never
+	// published, or one that does not chain to the cluster CA.
+	UnknownKeyId []string `protobuf:"bytes,7,rep,name=unknown_key_id,json=unknownKeyId,proto3" json:"unknown_key_id,omitempty"`
+	// Breaks in a host's sequence numbering, which is how the deletion of
+	// a whole run of rows shows up.
+	SeqGaps []string `protobuf:"bytes,8,rep,name=seq_gaps,json=seqGaps,proto3" json:"seq_gaps,omitempty"`
+	// Rows that blanked their own content_hash to pose as a pre-chain
+	// reset point, which used to silently re-base everything after them.
+	Laundered []string `protobuf:"bytes,9,rep,name=laundered,proto3" json:"laundered,omitempty"`
+	// Rows with no host name. They belong to no sub-chain and so cannot
+	// be chain-verified at all.
+	UnattributedRows int32 `protobuf:"varint,10,opt,name=unattributed_rows,json=unattributedRows,proto3" json:"unattributed_rows,omitempty"`
+	// Hosts whose signed chain head attests to more rows than the log
+	// holds — the tail was cut off.
+	TruncatedHosts []string `protobuf:"bytes,11,rep,name=truncated_hosts,json=truncatedHosts,proto3" json:"truncated_hosts,omitempty"`
+	// True when any finding is evidence of deliberate interference, so a
+	// client does not have to re-derive that rule and get it wrong.
+	Tampered      bool `protobuf:"varint,12,opt,name=tampered,proto3" json:"tampered,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -21904,6 +21934,69 @@ func (x *VerifyAuditChainResponse) GetError() string {
 		return x.Error
 	}
 	return ""
+}
+
+func (x *VerifyAuditChainResponse) GetUnsignedRows() int32 {
+	if x != nil {
+		return x.UnsignedRows
+	}
+	return 0
+}
+
+func (x *VerifyAuditChainResponse) GetUnverifiableRows() int32 {
+	if x != nil {
+		return x.UnverifiableRows
+	}
+	return 0
+}
+
+func (x *VerifyAuditChainResponse) GetBadSignature() []string {
+	if x != nil {
+		return x.BadSignature
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetUnknownKeyId() []string {
+	if x != nil {
+		return x.UnknownKeyId
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetSeqGaps() []string {
+	if x != nil {
+		return x.SeqGaps
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetLaundered() []string {
+	if x != nil {
+		return x.Laundered
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetUnattributedRows() int32 {
+	if x != nil {
+		return x.UnattributedRows
+	}
+	return 0
+}
+
+func (x *VerifyAuditChainResponse) GetTruncatedHosts() []string {
+	if x != nil {
+		return x.TruncatedHosts
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetTampered() bool {
+	if x != nil {
+		return x.Tampered
+	}
+	return false
 }
 
 type ExportAuditChainRequest struct {
@@ -24501,12 +24594,22 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"targetPool\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tpool_name\x18\x04 \x01(\tR\bpoolName\x12!\n" +
-	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"u\n" +
+	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xbd\x03\n" +
 	"\x18VerifyAuditChainResponse\x12!\n" +
 	"\frows_checked\x18\x01 \x01(\x05R\vrowsChecked\x12 \n" +
 	"\fbroken_at_id\x18\x02 \x01(\tR\n" +
 	"brokenAtId\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"E\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12#\n" +
+	"\runsigned_rows\x18\x04 \x01(\x05R\funsignedRows\x12+\n" +
+	"\x11unverifiable_rows\x18\x05 \x01(\x05R\x10unverifiableRows\x12#\n" +
+	"\rbad_signature\x18\x06 \x03(\tR\fbadSignature\x12$\n" +
+	"\x0eunknown_key_id\x18\a \x03(\tR\funknownKeyId\x12\x19\n" +
+	"\bseq_gaps\x18\b \x03(\tR\aseqGaps\x12\x1c\n" +
+	"\tlaundered\x18\t \x03(\tR\tlaundered\x12+\n" +
+	"\x11unattributed_rows\x18\n" +
+	" \x01(\x05R\x10unattributedRows\x12'\n" +
+	"\x0ftruncated_hosts\x18\v \x03(\tR\x0etruncatedHosts\x12\x1a\n" +
+	"\btampered\x18\f \x01(\bR\btampered\"E\n" +
 	"\x17ExportAuditChainRequest\x12\x14\n" +
 	"\x05since\x18\x01 \x01(\tR\x05since\x12\x14\n" +
 	"\x05until\x18\x02 \x01(\tR\x05until\"K\n" +

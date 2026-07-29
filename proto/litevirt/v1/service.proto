@@ -2104,10 +2104,25 @@ service LiteVirt {
     rpc PromoteReplica(PromoteReplicaRequest) returns (stream PromoteReplicaProgress);
 
     // ── tamper-evident audit log ──
-    // VerifyAuditChain walks every audit_log row from the oldest
-    // forward and confirms each content_hash matches the
-    // SHA-256(prev_hash || canonical(row)) recomputation. Returns
-    // the first ID that fails (or "" for a clean run).
+    // VerifyAuditChain walks each host's audit sub-chain (a row's
+    // prev_hash links to the previous row from the SAME host, because
+    // N daemons appending concurrently can never form one linear
+    // chain) and confirms each content_hash matches the
+    // SHA-256(prev_hash || canonical(row)) recomputation.
+    //
+    // It also checks what a hash alone cannot: the ECDSA signature
+    // over each row, its host sequence number, and the signed chain
+    // heads. A hash break is corruption or a crude edit; a bad
+    // signature is an edit by someone without the host's key and
+    // survives a reseal; a seq gap is a deleted run of rows; a
+    // truncated host is a tail that was cut off entirely.
+    //
+    // It does not stop at the first problem — one id says nothing
+    // about whether the rest of the log was rewritten too — so every
+    // finding is reported and `tampered` summarises whether any of
+    // them is evidence of interference. Unsigned rows are NOT: every
+    // cluster upgrading to signing has a log full of them.
+    //
     // ExportAuditChain emits a JSON blob containing the rows in a
     // time-range — suitable for WORM offload to S3 Object Lock /
     // an immutable tape vault.
@@ -2351,6 +2366,41 @@ message VerifyAuditChainResponse {
     int32  rows_checked = 1;
     string broken_at_id = 2;   // empty if chain intact
     string error        = 3;   // non-empty if the verify itself failed
+
+    // Signature-level findings, appended so a pre-v45 client still reads
+    // fields 1-3 and still reports a hash break — it just cannot see these.
+    // The list entries are "rowid: reason", one per affected row.
+
+    // Rows carrying no signature: written before signing existed, or while
+    // enforcement.audit_signature was off. Chain-checked only, and NOT
+    // tampering — reporting them as such on every upgraded cluster would
+    // train operators to ignore this command.
+    int32 unsigned_rows = 4;
+    // Signed rows this verifier had no keyring to check. Not a finding
+    // about the rows, a gap in what the verifier could see.
+    int32 unverifiable_rows = 5;
+    // Signatures that failed against the published certificate for their
+    // key. The signal that survives a reseal: rewriting a row's hash
+    // cannot produce a matching signature.
+    repeated string bad_signature = 6;
+    // Rows whose key has no trustworthy published certificate — never
+    // published, or one that does not chain to the cluster CA.
+    repeated string unknown_key_id = 7;
+    // Breaks in a host's sequence numbering, which is how the deletion of
+    // a whole run of rows shows up.
+    repeated string seq_gaps = 8;
+    // Rows that blanked their own content_hash to pose as a pre-chain
+    // reset point, which used to silently re-base everything after them.
+    repeated string laundered = 9;
+    // Rows with no host name. They belong to no sub-chain and so cannot
+    // be chain-verified at all.
+    int32 unattributed_rows = 10;
+    // Hosts whose signed chain head attests to more rows than the log
+    // holds — the tail was cut off.
+    repeated string truncated_hosts = 11;
+    // True when any finding is evidence of deliberate interference, so a
+    // client does not have to re-derive that rule and get it wrong.
+    bool tampered = 12;
 }
 
 message ExportAuditChainRequest {

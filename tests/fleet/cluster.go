@@ -115,10 +115,10 @@ func New(t *testing.T, opts Options) *Cluster {
 		opts.Nodes = 3
 	}
 
-	// Reset the global audit-chain pointer so a test running after
-	// another in the same process doesn't inherit a tail hash from
-	// a different (now-closed) DB. Cheap, idempotent.
-	corrosion.ResetChainStateForTests()
+	// The audit-chain tail used to be process-global, so this had to reset it
+	// between tests — and, worse, every node in a cluster shared one tail, so
+	// node B's first audit row linked to node A's. The state now hangs off each
+	// Client and is keyed by host_name, which is correct by construction here.
 	c := &Cluster{t: t, tmpRoot: t.TempDir()}
 	c.mintCA()
 

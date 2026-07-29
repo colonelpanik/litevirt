@@ -123,6 +123,18 @@ func HistoricalShapes() []HistoricalShape {
 	add(`INSERT OR REPLACE INTO notification_routes (id, event_pattern, target_id, min_severity, enabled, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`, "notification_routes_insert_v130")
 
+	// Pre-v45 audit_log writes, from before rows carried a signature.
+	//
+	// Both shapes stay accepted for the upgrade horizon, and both are SAFE to
+	// keep: the INSERT is append-only (INSERT OR IGNORE, never overwrites), and
+	// the narrow reseal UPDATE can only reach rows that have no signature —
+	// which, on a v45 receiver, is exactly the legacy rows it was always for.
+	// A sender old enough to emit it cannot have signed anything.
+	add(`INSERT OR IGNORE INTO audit_log
+		   (id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "audit_log_insert_v44")
+	add(`UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, "audit_reseal_v44")
+
 	// DeleteStackFirewall (v1.3.0): one bulk tombstone per firewall table by stack_name.
 	for _, tbl := range []string{"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
 		add("UPDATE "+tbl+" SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL", "stack_firewall_teardown_v130")

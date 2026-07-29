@@ -219,6 +219,23 @@ type Client struct {
 	// otherwise stall replication on an in-flight canonical entry). Nil/false ⇒ reject (pre-H2).
 	canonicalRegistryAccept func() bool
 
+	// auditChain holds the in-flight tail of each audit sub-chain this client
+	// appends to, keyed by host_name. Per-client, not package-global: a global
+	// is only correct while one Client exists per process, which is false in
+	// tests/fleet where N daemons share a process. See audit.go.
+	auditChain chainState
+
+	// auditKeyring signs this host's audit rows and verifies any host's. Nil ⇒
+	// rows are written unsigned (the pre-v45 behaviour, and what a cluster does
+	// until enforcement.audit_signature is turned on). Guarded by mu.
+	auditKeyring *AuditKeyring
+
+	// auditSignatureRequired reports whether the cluster has latched
+	// audit_signature_v1 with this node's flag on. When it does, an audit write
+	// that cannot be signed FAILS instead of degrading to an unsigned row.
+	// Guarded by mu.
+	auditSignatureRequired func() bool
+
 	// writeQuarantine, when set and returning a non-empty reason, makes every
 	// REPLICATED write refuse. Wired at daemon start to the capability-rollback
 	// self-check: a node running a binary below a token it already latched must

@@ -196,6 +196,23 @@ const (
 	// latch/enforcement machinery itself. Additive: changes no existing token's
 	// value or behavior.
 	HardwareV2 = "hardware_v2"
+	// ProjectAuthorityV1 gates DELEGATED project-quota admission: a node that does not
+	// hold a project's D1 admission authority asks the holder to decide, instead of
+	// deciding from its own replica. Reserve-then-verify alone makes two racers agree
+	// only once both reservations are VISIBLE to both; corrosion is eventually
+	// consistent, so two nodes that have not yet exchanged operation rows can still
+	// both admit. One decider per project closes that window.
+	//
+	// Advertised CONDITIONALLY on the local config flag (enforcement.project_authority),
+	// like OperationProtocolV1 — a peer that is not delegating still admits from its own
+	// replica, so a delegating node would be serializing against a decider its peers
+	// bypass, which is no serialization at all. Withholding advertisement makes the latch
+	// require CONFIG uniformity, so nobody starts trusting the single decider until every
+	// node routes through it.
+	//
+	// A holder that cannot be reached fails the admission CLOSED (the repo-wide partition
+	// rule). Default-off, and the flag is the reversible kill switch.
+	ProjectAuthorityV1 = "project_authority_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -284,12 +301,13 @@ var supported = []string{
 	CanonicalIdentityV1,
 	CanonicalRegistryV1,
 	HardwareV2,
+	ProjectAuthorityV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

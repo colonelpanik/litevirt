@@ -636,6 +636,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
+	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
@@ -1757,6 +1758,17 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 			slog.Warn("operation reaper", "error", perr)
 		} else if reaped > 0 {
 			slog.Info("operation reaper", "reaped", reaped)
+		}
+		// Orphaned admission leases (F2). A reserve-then-verify lease lives for one
+		// RPC, so anything this old is a crash between reserve and release — which
+		// the terminal reaper above can never collect, because an abandoned lease
+		// never becomes terminal and would consume headroom forever. Scoped to
+		// capacity leases so it can never expire a long resize/migration whose
+		// reservation IS backed by a committed spec.
+		if expired, perr := corrosion.ExpireStaleCapacityReservations(ctx, d.db, capacityLeaseMaxAge); perr != nil {
+			slog.Warn("capacity lease expiry", "error", perr)
+		} else if expired > 0 {
+			slog.Warn("capacity lease expiry: released orphaned admission leases", "count", expired)
 		}
 		// Idempotency keys: hard-delete records past their TTL (v39). Ephemeral +
 		// bounded by expires_at; a resurrected expired copy never matches, so a

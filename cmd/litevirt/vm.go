@@ -183,7 +183,7 @@ func newStartCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
-		"Skip the host capacity check for this start (project quota still applies). The bypass is audited.")
+		"Skip the host capacity check for this start. Requires the vm.overcommit verb; the bypass is audited. (Start never charges project quota — the allocation already counts whether running or stopped.)")
 	return cmd
 }
 

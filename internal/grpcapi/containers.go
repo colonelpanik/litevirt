@@ -143,9 +143,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// Placed after tenancy and before any runtime or IPAM work, so a refusal
 	// leaves no partial state to unwind.
 	if req.MemoryMib > 0 {
-		if err := s.checkResourceAdmission(ctx, s.hostName, req.Project, 0, int(req.MemoryMib)); err != nil {
-			return nil, err
+		lease, aerr := s.admitWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib))
+		if aerr != nil {
+			return nil, aerr
 		}
+		defer lease.release(ctx)
 	}
 
 	// Resolve the requested NICs into runtime attachments + managed-interface rows
@@ -243,9 +245,11 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// and starting them all. Skipped when already running (adds nothing) and when
 	// uncapped (nothing to admit).
 	if rec.State != "running" && rec.MemMiB > 0 {
-		if err := s.checkHostCapacity(ctx, s.hostName, 0, rec.MemMiB); err != nil {
-			return nil, err
+		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, 0, rec.MemMiB)
+		if aerr != nil {
+			return nil, aerr
 		}
+		defer lease.release(ctx)
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")

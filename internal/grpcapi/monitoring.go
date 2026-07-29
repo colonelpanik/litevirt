@@ -27,8 +27,8 @@ func (s *Server) GetClusterStatus(ctx context.Context, _ *emptypb.Empty) (*pb.Cl
 
 	// Single query for per-host VM counts instead of N+1.
 	vmCounts, _ := corrosion.CountVMsByHost(ctx, s.db)
-	// Aggregate CPU/memory/disk allocated to running VMs per host.
-	resUsage, _ := corrosion.SumVMResourcesByHost(ctx, s.db)
+	// Aggregate CPU/memory/disk allocated per host, containers included.
+	resUsage := s.hostUsageWithContainers(ctx)
 
 	cs := &pb.ClusterStatus{
 		HostsTotal: int32(len(hosts)),

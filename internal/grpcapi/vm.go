@@ -215,6 +215,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
+		// rejects the hopeless case before we forward. The authoritative
+		// reserve-then-verify runs on the OWNING node below — reserving here too
+		// would count this create's demand twice, once per node, and the forwarded
+		// half would refuse itself.
 		return nil, err
 	}
 	// Project isolation (storage): pools are HOST-scoped, so admit each disk's pool
@@ -225,6 +230,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		if err := s.admitPoolAttach(ctx, project, targetHost, d.Storage); err != nil {
 			return nil, err
 		}
+		// …and that it will actually FIT. Same loop, same pool lookup, same
+		// fail-closed posture — a full pool is worse than a full host, because
+		// qcow2 images cannot grow and guests take I/O errors rather than merely
+		// thrashing. Unparseable sizes are left to the create path's own
+		// validation rather than guessed at here.
+		if sz, perr := qcow2.ParseSize(d.Size); perr == nil {
+			if err := s.admitPoolCapacity(ctx, targetHost, d.Storage, int64(sz)); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if targetHost != s.hostName {
 		if decision != nil {
@@ -232,6 +247,25 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				"resolved create owner %q does not match local host %q", targetHost, s.hostName)
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
+	}
+
+	// Authoritative admission, on the OWNING node only (everything above either
+	// returned or forwarded). Reserve THEN verify: checking first and writing after
+	// is what let two concurrent same-project admissions on different hosts both
+	// pass against a view containing neither. The lease publishes this create's
+	// demand so a racer sees it, and is released on every exit path — a leaked one
+	// permanently consumes capacity nothing is using.
+	//
+	// Doing this ONLY here matters: reserving on the entry node as well would count
+	// the same create twice, and the forwarded half would then refuse itself. That
+	// bug was intermittent (it depended on which operation id sorted first) and was
+	// caught by the per-host-override fleet test, not by reasoning.
+	if !req.AllowOvercommit {
+		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
@@ -965,8 +999,15 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-		} else if err := s.checkHostCapacity(ctx, vm.HostName, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
-			return nil, err
+		} else {
+			// Reserve-then-verify (F2): publish this start's demand before deciding,
+			// so a concurrent start on another node sees it instead of both reading a
+			// view containing neither.
+			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib))
+			if aerr != nil {
+				return nil, aerr
+			}
+			defer lease.release(ctx)
 		}
 	}
 
@@ -2780,8 +2821,16 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",
 							fresh.HostName, cpuGrow, memGrow), "allow-overcommit")
 				}
-			} else if err := s.checkResourceAdmission(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow); err != nil {
-				return nil, err
+			} else {
+				// No resource id: a GROW's row is already visible everywhere, so a
+			// visibility signal would free the delegated lease immediately while the
+			// holder's usage still reflects the OLD size — under-counting exactly the
+			// amount being added. A grow leans on the settle grace instead.
+			lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow)
+				if aerr != nil {
+					return nil, aerr
+				}
+				defer lease.release(ctx)
 			}
 
 			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {

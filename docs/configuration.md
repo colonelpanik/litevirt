@@ -229,6 +229,21 @@ enforcement:
                               # until the deferred operator-run contract (see docs/diagnostics.md).
                               # The flag gates advertisement/opt-in only; it does not revoke an
                               # already-formed latch. Advertised only while on; enable fleet-uniformly.
+  project_authority: false    # route the PROJECT-QUOTA half of an admission to the project's
+                              # admission-authority holder instead of deciding from this node's
+                              # replica. Admission counts in-flight reservations, but two nodes
+                              # that have not yet exchanged those rows each see only their own
+                              # and can both admit — together exceeding the quota. One decider
+                              # per project closes that window; HOST capacity is unaffected
+                              # (only the target host's owner reserves against it, so it is
+                              # already serialized). A holder that cannot be reached REFUSES the
+                              # admission rather than falling back to the stale local view, so
+                              # enabling this trades a little availability for the guarantee.
+                              # Advertised only while on (like operation_protocol) and active
+                              # only once the flag is set AND project_authority_v1 has latched
+                              # fleet-wide — a peer still deciding locally would bypass the
+                              # single decider entirely. Enable fleet-uniformly; the flag is the
+                              # reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and
@@ -453,6 +468,8 @@ capacity:
   host_memory_reserve_mib: 1024    # default 1024
   host_memory_reserve_pct: 5       # default 5
   vm_memory_overhead_mib: 128      # default 128
+  disk_overcommit_ratio: 3.0       # default 3.0
+  pool_reserve_pct: 5              # default 5
 ```
 
 **CPU and memory are deliberately different.** vCPU is time-sliced: running more
@@ -471,6 +488,22 @@ fixed floor protects small nodes while the percentage scales with large ones.
 `vm_memory_overhead_mib` is charged per running VM on top of its configured
 memory, covering qemu's own footprint (device models, video, page tables).
 Ignoring it under-counts usage, and by more the denser the host.
+
+**Disk is admitted per POOL, not per host.** `hosts.disk_total` is the wrong
+denominator for anything shared — a Ceph or NFS pool's capacity has nothing to do
+with the host's local disk — while every managed pool carries its own
+statfs-sampled total and used. A new disk is charged against its pool's **actual**
+free space, less `pool_reserve_pct`, after dividing the declared size by
+`disk_overcommit_ratio`.
+
+That ratio defaults above 1 for the opposite reason memory's defaults to exactly
+1: thin provisioning is the norm, so a declared 100 GiB qcow2 may occupy 2 GiB,
+and charging it in full against real free space would refuse ordinary practice.
+Both knobs count what is really taken.
+
+A pool with **no capacity sample** (total 0 — never sampled, or a driver that
+reports nothing) is treated as UNKNOWN and skipped, never as full. Refusing on
+missing telemetry would break every cluster whose pools have not been sampled yet.
 
 **Containers count too, for memory.** A running container's memory cap is
 subtracted from host capacity exactly like a VM's, and `lv ct create` / `lv ct

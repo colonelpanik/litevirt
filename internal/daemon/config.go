@@ -366,6 +366,18 @@ type EnforcementConfig struct {
 	// operator-run activation contract (see docs/diagnostics.md). Default false; the flag is a
 	// reversible advertisement opt-in only.
 	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
+	// ProjectAuthority: route the PROJECT-QUOTA half of an admission to the project's
+	// D1 authority holder instead of deciding from this node's replica
+	// (capabilities.ProjectAuthorityV1). One decider per project closes the window
+	// where two nodes that have not yet exchanged operation rows both admit and
+	// together exceed the quota. Host capacity is unaffected — it is already
+	// serialized by the target host's owner.
+	//
+	// Enforced only when this flag is set AND the token has latched cluster-wide, so a
+	// node cannot serialize against a decider its peers are still bypassing. An
+	// unreachable holder fails the admission CLOSED. Default false; reversible kill
+	// switch.
+	ProjectAuthority bool `yaml:"project_authority,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.
@@ -593,6 +605,14 @@ type CapacityConfig struct {
 	// VMMemoryOverheadMiB is charged per running VM on top of its configured
 	// memory for qemu's own footprint. Default 128.
 	VMMemoryOverheadMiB int `yaml:"vm_memory_overhead_mib,omitempty"`
+	// DiskOvercommitRatio divides a new disk's DECLARED size before it is compared
+	// to its pool's ACTUAL free space. Thin provisioning is the norm, so >1 is the
+	// safe default here — the opposite of memory, for the same reason: count what
+	// is really taken. Default 3.0.
+	DiskOvercommitRatio float64 `yaml:"disk_overcommit_ratio,omitempty"`
+	// PoolReservePct is the share of each storage pool held back so it can never be
+	// driven to zero. Default 5.
+	PoolReservePct int `yaml:"pool_reserve_pct,omitempty"`
 }
 
 // Policy converts the config into the corrosion capacity policy. Every
@@ -610,6 +630,8 @@ func (c CapacityConfig) Policy() corrosion.CapacityPolicy {
 		MemReserveMiB:    orDefault(c.HostMemoryReserveMiB, d.MemReserveMiB),
 		MemReservePct:    orDefault(c.HostMemoryReservePct, d.MemReservePct),
 		VMMemOverheadMiB: orDefault(c.VMMemoryOverheadMiB, d.VMMemOverheadMiB),
+		DiskOvercommit:   orDefault(c.DiskOvercommitRatio, d.DiskOvercommit),
+		PoolReservePct:   orDefault(c.PoolReservePct, d.PoolReservePct),
 	}
 }
 

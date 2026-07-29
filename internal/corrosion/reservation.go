@@ -145,6 +145,25 @@ func reservationStepFacts(facts *ReservationFacts, project string) (string, erro
 // reduced state is NOT terminal — the in-flight capacity claims admission must
 // count on top of committed running-VM actuals.
 func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVector, error) {
+	byID, err := nonterminalReservationsByID(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ReservationVector, 0, len(byID))
+	for _, rv := range byID {
+		out = append(out, rv)
+	}
+	return out, nil
+}
+
+// nonterminalReservationsByID is the single validated scan behind every capacity
+// aggregate, keyed by operation id for the orderings reserve-then-verify needs.
+//
+// Keeping ONE scan matters more than it looks: an unvalidated id-keyed duplicate
+// used to sit beside this, so ReservedBefore counted claims that HostReserved had
+// already fenced as stale, and admission could disagree with itself about the same
+// reservation depending on which aggregate asked.
+func nonterminalReservationsByID(ctx context.Context, c *Client) (map[string]ReservationVector, error) {
 	orows, err := c.Query(ctx,
 		`SELECT id, project, resource_kind, resource_id, operation_kind,
 		        reservation_json, desired_ref, vm_owner_epoch
@@ -176,7 +195,7 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 		}
 	}
 
-	var out []ReservationVector
+	out := make(map[string]ReservationVector, len(orows))
 	for _, r := range orows {
 		id := r.String("id")
 		kind := OperationKind(r.String("operation_kind"))
@@ -240,7 +259,7 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 				return nil, fmt.Errorf("reservation %s has invalid current-authority facts", id)
 			}
 		}
-		out = append(out, rv)
+		out[id] = rv
 	}
 	return out, nil
 }
@@ -273,6 +292,39 @@ func operationOwnsCurrentWorkload(ctx context.Context, c *Client, operationID, r
 		return false, err
 	}
 	return len(rows) != 0, nil
+}
+
+// ReservedBefore sums the NONTERMINAL reservation deltas of operations whose id
+// sorts strictly BEFORE opID — the claimants this admission must yield to.
+//
+// Operation ids are globally unique, so ordering them lexically is a TOTAL order
+// every node computes identically. Reserve-then-verify counts only these: our own
+// reservation must not be subtracted from the headroom we are about to compare our
+// own request against (that double-counts), and later claimants yield to us, which
+// is what makes exactly one racer win instead of both refusing.
+//
+// Counting earlier-only rather than crediting back is deliberate. Headroom clamps
+// at zero, so "subtract everything then add ours back" silently over-credits once
+// the host is oversubscribed — a bug this shape had until a test caught it.
+func ReservedBefore(ctx context.Context, c *Client, host, project, opID string) (hostCPU, hostMem, projCPU, projMem int, err error) {
+	rvs, err := nonterminalReservationsByID(ctx, c)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	for id, rv := range rvs {
+		if id >= opID {
+			continue // ourselves, or a LATER claimant that yields to us
+		}
+		if host != "" && rv.TargetHost == host {
+			hostCPU += rv.TargetCPU
+			hostMem += rv.TargetMemMiB
+		}
+		if project != "" && rv.Project == project {
+			projCPU += rv.ProjectCPU
+			projMem += rv.ProjectMemMiB
+		}
+	}
+	return hostCPU, hostMem, projCPU, projMem, nil
 }
 
 // HostReserved sums the target-host reservation deltas of all NONTERMINAL operations
@@ -333,20 +385,37 @@ func HostFreeCapacity(ctx context.Context, c *Client, host string) (freeCPU, fre
 	return HostFreeCapacityWithPolicy(ctx, c, host, DefaultCapacityPolicy())
 }
 
+// HostFreeCapacityBefore is HostFreeCapacityWithPolicy counting only reservations
+// from operations that sort BEFORE opID. Used by reserve-then-verify so an
+// admission compares its request against headroom that excludes its own
+// provisional reservation.
+func HostFreeCapacityBefore(ctx context.Context, c *Client, host string, policy CapacityPolicy, opID string) (freeCPU, freeMemMiB int, ok bool, err error) {
+	resCPU, resMem, _, _, err := ReservedBefore(ctx, c, host, "", opID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return hostFreeWithReserved(ctx, c, host, policy, resCPU, resMem)
+}
+
 // HostFreeCapacityWithPolicy is HostFreeCapacity under an explicit cluster policy.
 func HostFreeCapacityWithPolicy(ctx context.Context, c *Client, host string, policy CapacityPolicy) (freeCPU, freeMemMiB int, ok bool, err error) {
-	h, err := GetHost(ctx, c, host)
+	resCPU, resMem, err := HostReserved(ctx, c, host)
 	if err != nil {
 		return 0, 0, false, err
 	}
-	if h == nil {
-		return 0, 0, false, nil
+	return hostFreeWithReserved(ctx, c, host, policy, resCPU, resMem)
+}
+
+// hostFreeWithReserved is the shared tail of the host-headroom calculation, taking
+// the reservation totals to subtract. Split out so reserve-then-verify can supply a
+// FILTERED total (earlier claimants only) instead of re-deriving the arithmetic —
+// and so the clamp below lives in exactly one place.
+func hostFreeWithReserved(ctx context.Context, c *Client, host string, policy CapacityPolicy, resCPU, resMem int) (freeCPU, freeMemMiB int, ok bool, err error) {
+	h, err := GetHost(ctx, c, host)
+	if err != nil || h == nil {
+		return 0, 0, false, err
 	}
 	usage, err := SumVMResourcesByHost(ctx, c)
-	if err != nil {
-		return 0, 0, false, err
-	}
-	resCPU, resMem, err := HostReserved(ctx, c, host)
 	if err != nil {
 		return 0, 0, false, err
 	}
@@ -367,4 +436,33 @@ func HostFreeCapacityWithPolicy(ctx context.Context, c *Client, host string, pol
 		return 0, 0, false, fmt.Errorf("calculate host %q free memory: %w", host, err)
 	}
 	return freeCPU, freeMemMiB, true, nil
+}
+
+// AppendReservationFacts records the `reserved` step proving WHICH authority epoch
+// admitted a reservation.
+//
+// This is not optional bookkeeping. Once a project has an authority epoch, the
+// aggregation above refuses to count a reservation that cannot be attributed to the
+// CURRENT one — so a mint that skips this step silently stops consuming capacity and
+// the same headroom gets handed out twice. Every live reservation writer must call it.
+//
+// facts==nil is the genuine pre-authority case (no epoch exists yet): the step is
+// written empty, and aggregation keeps counting the claim as a legacy one.
+func AppendReservationFacts(ctx context.Context, c *Client, opID string, ownerEpoch int64, project string, facts *ReservationFacts) error {
+	encoded, err := reservationStepFacts(facts, project)
+	if err != nil {
+		return err
+	}
+	return AppendOperationStep(ctx, c, OperationStepRecord{
+		OperationID: opID, OwnerEpoch: ownerEpoch, StepName: OpStepReserved, Facts: encoded,
+	})
+}
+
+// ReservationFactsFor builds the authority facts for a reservation minted under the
+// project's current authority, or nil when the project has none yet.
+func ReservationFactsFor(project string, epoch int64, holder string) *ReservationFacts {
+	if epoch <= 0 || holder == "" {
+		return nil
+	}
+	return &ReservationFacts{Project: projectOrDefault(project), AuthorityEpoch: epoch, AuthorityHost: holder}
 }

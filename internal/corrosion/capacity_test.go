@@ -277,3 +277,76 @@ func TestSumContainerMemoryByHost_OnlyRunningAndCapped(t *testing.T) {
 		t.Errorf("h1 container memory = %d, want 512 (running+capped only; stopped holds nothing, uncapped is unknowable)", got["h1"])
 	}
 }
+
+// TestHostFreeCapacity_ContainerCPUIsNotCountedAsVCPU pins a DELIBERATE
+// exclusion that had no guard.
+//
+// A container's cpu_limit is CPU *shares* — a relative cgroup weight — not a vCPU
+// reservation. A container with the conventional 1024 shares is not 1024 vCPUs,
+// so folding it into a host's vCPU total would be meaningless arithmetic that
+// instantly makes every host look full. The decision was documented and tested
+// nowhere: adding cpu_limit to the sum would have broken nothing.
+func TestHostFreeCapacity_ContainerCPUIsNotCountedAsVCPU(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := InsertHost(ctx, db, HostRecord{Name: "h1", CPUTotal: 8, MemTotal: 8192, State: "HOST_ACTIVE"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	baselineCPU, _, ok, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil || !ok {
+		t.Fatalf("HostFreeCapacity: ok=%v err=%v", ok, err)
+	}
+
+	// A running container with a large CPU-shares value and no memory cap.
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "h1", Name: "sharesy", State: "running", CPULimit: 1024, MemMiB: 0,
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+
+	afterCPU, _, _, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil {
+		t.Fatalf("HostFreeCapacity: %v", err)
+	}
+	if afterCPU != baselineCPU {
+		t.Errorf("free vCPU went %d -> %d after a container with cpu_limit=1024 — shares are a cgroup weight, not a vCPU reservation, and counting them makes every host look full",
+			baselineCPU, afterCPU)
+	}
+}
+
+// TestPoolFreeBytes_UnsampledPoolIsUnknownNotFull is the safety property for the
+// disk dimension: a pool with no capacity sample must NOT read as full.
+//
+// Pool usage is statfs-sampled by the daemon. A pool never sampled — or a driver
+// reporting nothing — has total 0, and treating that as "no space" would refuse
+// every disk on every un-sampled cluster. Unknown means skip the check, not deny.
+func TestPoolFreeBytes_UnsampledPoolIsUnknownNotFull(t *testing.T) {
+	if _, ok := PoolFreeBytes(0, 0, DefaultCapacityPolicy()); ok {
+		t.Error("an unsampled pool (total 0) reported a known free figure — callers would treat it as full and refuse every disk")
+	}
+	free, ok := PoolFreeBytes(100<<30, 50<<30, DefaultCapacityPolicy())
+	if !ok {
+		t.Fatal("a sampled pool should report a known free figure")
+	}
+	// 100 GiB total, 50 used, 5% reserve = 5 GiB → 45 GiB free.
+	if want := int64(45) << 30; free != want {
+		t.Errorf("free = %d, want %d (total - used - 5%% reserve)", free, want)
+	}
+}
+
+// TestDiskNeedBytes_ThinProvisioningIsNotChargedInFull: charging a declared disk
+// at 1:1 against ACTUAL free space would refuse ordinary practice, since a
+// declared 100 GiB qcow2 may occupy 2 GiB.
+func TestDiskNeedBytes_ThinProvisioningIsNotChargedInFull(t *testing.T) {
+	declared := int64(100) << 30
+	need := DiskNeedBytes(declared, DefaultCapacityPolicy())
+	if need >= declared {
+		t.Errorf("a %d GiB declared disk is charged %d GiB — thin provisioning means the declared size is not what it takes",
+			declared>>30, need>>30)
+	}
+	// Default ratio 3.0.
+	if want := declared / 3; need != want {
+		t.Errorf("need = %d, want %d (declared / 3.0)", need, want)
+	}
+}

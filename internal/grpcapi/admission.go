@@ -113,10 +113,19 @@ func quotaWouldExceed(limit, used, reserved, delta int) bool {
 }
 
 // ensureProjectAuthority makes sure the project has a D1 admission-authority epoch,
-// claiming the initial one (this node) if none exists. Best-effort establishment;
-// the returned authority is the current one (for recording in an operation's reserved
-// step). A concurrent claim on another node is fine — exactly one wins the guarded
-// initial claim, and this node reads the winner back.
+// minting the initial one if none exists. Best-effort establishment; the returned
+// authority is the current one (for recording in an operation's reserved step).
+//
+// The initial holder is DERIVED from the project name over the cluster's hosts, not
+// set to this node. Claiming for self is the obvious move and it defeats the purpose:
+// every node serves its own creates, so every node would become the holder of its own
+// replica, every admission would stay local, and delegation would never fire. It also
+// mints conflicting rows — one epoch, two holders. Deriving instead means two nodes
+// racing the claim write the SAME row, so the race stops being a conflict.
+//
+// With no host list to derive from, this node claims for itself: a cluster whose hosts
+// cannot be read has bigger problems, and refusing to establish authority at all would
+// block admission entirely.
 func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (corrosion.ProjectAuthority, error) {
 	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
 	if err != nil {
@@ -125,9 +134,53 @@ func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (co
 	if ok {
 		return cur, nil
 	}
-	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, s.hostName); err != nil {
+	holder := s.derivedProjectHolder(ctx, project)
+	if holder == "" {
+		holder = s.hostName
+	}
+	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, holder); err != nil {
 		return corrosion.ProjectAuthority{}, err
 	}
 	cur, _, err = corrosion.CurrentProjectAuthority(ctx, s.db, project)
 	return cur, err
+}
+
+// derivedProjectHolder computes who SHOULD hold a project's initial authority from
+// this node's view of cluster membership. Returns "" when no hosts can be read.
+//
+// Both the minting node and the holder run this independently, which is what makes
+// bootstrap work: the claim is written on the CALLER's replica, so the holder does not
+// yet have the row naming it. Rather than wait for replication — during which the
+// admission would fail — the holder re-derives and confirms the answer for itself.
+func (s *Server) derivedProjectHolder(ctx context.Context, project string) string {
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil || len(hosts) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		names = append(names, h.Name)
+	}
+	return corrosion.DeriveProjectAuthorityHolder(project, names)
+}
+
+// stampReservationAuthority records which authority epoch admitted a reservation.
+//
+// Capacity aggregation will not count a reservation it cannot attribute to a
+// project's CURRENT authority once one exists (corrosion.nonterminalReservationsByID).
+// A mint that skips this therefore holds no capacity at all — the lease looks live in
+// the journal while the headroom it should be protecting is handed to the next
+// admission. Every reservation writer calls this immediately after inserting.
+//
+// A project with no authority yet stamps empty facts, which aggregation treats as a
+// legacy claim and keeps counting.
+func (s *Server) stampReservationAuthority(ctx context.Context, opID, project string) error {
+	var facts *corrosion.ReservationFacts
+	if cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project); err == nil && ok {
+		facts = corrosion.ReservationFactsFor(project, cur.Epoch, cur.Holder)
+	}
+	if err := corrosion.AppendReservationFacts(ctx, s.db, opID, 0, project, facts); err != nil {
+		return status.Errorf(codes.Internal, "record reservation authority: %v", err)
+	}
+	return nil
 }

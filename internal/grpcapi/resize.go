@@ -218,6 +218,13 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	if !applied {
 		return status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress or the VM changed underneath", vm.Name)
 	}
+	// Attribute the reservation to the authority established above. Without this the
+	// resize holds NO capacity: aggregation will not count a reservation it cannot
+	// attribute once the project has an epoch — and this path mints one two dozen
+	// lines earlier, so it was fencing out its own claim.
+	if err := s.stampReservationAuthority(ctx, op.ID, vm.Project); err != nil {
+		return err
+	}
 	newGen := vm.SpecGeneration + 1
 	return s.driveResourceUpdate(ctx, vm, op.ID, vm.OwnerEpoch, newGen, target, stored, obsCPU, obsMem)
 }

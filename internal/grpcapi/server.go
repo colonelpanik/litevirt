@@ -117,6 +117,12 @@ type Server struct {
 	// migration controller or post-latch acceptance switch. Flag-off stops advertising; it does not
 	// revoke an already-formed latch.
 	enfCanonicalRegistry bool
+	// enfProjectAuthority is this node's kill-switch for DELEGATED project-quota
+	// admission; gated by this flag AND the ProjectAuthorityV1 latch. Advertised
+	// CONDITIONALLY on the flag (like operation_protocol): a peer still admitting from
+	// its own replica would bypass the single decider entirely, so serializing against
+	// one is worthless until every node has opted in.
+	enfProjectAuthority bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -414,6 +420,13 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfCanonicalRegistry {
 		caps = withoutCapability(caps, capabilities.CanonicalRegistryV1)
 	}
+	// project_authority_v1 is likewise advertised CONDITIONALLY on its config flag. A
+	// single decider only serializes admissions that all ROUTE through it; a peer with
+	// the flag off keeps deciding from its own replica and races the holder anyway. So
+	// the latch must require CONFIG uniformity, not just a uniform build.
+	if !s.enfProjectAuthority {
+		caps = withoutCapability(caps, capabilities.ProjectAuthorityV1)
+	}
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -547,6 +560,18 @@ func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity =
 // (and thus acceptance of canonical writes) can't happen until every node has opted in.
 func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry = on }
 
+// SetProjectAuthorityEnforce sets this node's kill-switch for delegated project-quota
+// admission (enforcement.project_authority). Enforcement is this flag AND the
+// ProjectAuthorityV1 cluster-wide latch; advertisement is withheld while it is off.
+func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = on }
+
+// projectAuthorityActive reports whether this node routes project-quota admissions
+// through the project's authority holder: the config flag AND the cluster-wide latch.
+// Same `flag && Enforced` model as the rest of the family.
+func (s *Server) projectAuthorityActive(ctx context.Context) bool {
+	return s.enfProjectAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectAuthorityV1)
+}
+
 // liveResizeActive reports whether this node may originate live-resize behavior
 // (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
 // old peer can't have max_cpu dropped from a spec it later rewrites.
@@ -592,6 +617,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfCanonicalIdentity
 	case capabilities.CanonicalRegistryV1:
 		return s.enfCanonicalRegistry
+	case capabilities.ProjectAuthorityV1:
+		return s.enfProjectAuthority
 	default:
 		return false
 	}

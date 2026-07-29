@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"sort"
 )
 
 // D1 — project-admission authority. Project quota is a HARD admission guarantee, so
@@ -18,6 +20,36 @@ import (
 // ErrFenceProofRequired is returned when an unplanned ("fenced") takeover is
 // attempted without a proof reference for the prior holder's fence.
 var ErrFenceProofRequired = errors.New("corrosion: a fenced project-authority takeover requires a fence_proof_ref")
+
+// DeriveProjectAuthorityHolder picks a project's INITIAL authority holder from the
+// eligible hosts, deterministically.
+//
+// Every node claiming authority for ITSELF looks reasonable and is useless: each node
+// serves its own creates, so each becomes the holder of its own replica, every
+// admission stays local, and delegation never happens. Worse, the claims then collide
+// — one epoch, two holders — and the cluster is back to two deciders while believing
+// it has one. That is not a hypothetical: the lab produced exactly it, with node-1 and
+// node-2 each holding /qa at epoch 1.
+//
+// Choosing by hash of the project name over the SORTED host list makes concurrent
+// claimants mint an IDENTICAL row instead of competing ones, so the race stops
+// mattering: the rows converge because they agree. It also spreads different projects
+// across different hosts rather than piling every project onto one.
+//
+// Membership is itself eventually consistent, so two nodes with different views of the
+// host list can still choose differently. That window is far narrower than claiming for
+// self (which collides every single time) and heals the same way — the losing claim's
+// node sees FailedPrecondition and retries against the winner.
+func DeriveProjectAuthorityHolder(project string, candidates []string) string {
+	eligible := append([]string(nil), candidates...)
+	sort.Strings(eligible)
+	if len(eligible) == 0 {
+		return ""
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(projectOrDefault(project)))
+	return eligible[int(h.Sum32()%uint32(len(eligible)))]
+}
 
 // ProjectAuthority is a project's admission-authority record. The CURRENT authority
 // is the row with the maximum live authority_epoch for the project.

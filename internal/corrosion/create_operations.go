@@ -11,6 +11,8 @@ import (
 // BeginVMCreateOperation atomically persists a create claim, its capacity
 // reservation, and a provisional VM row. applied is true only for the first
 // successful claim; an identical retry returns false without changing state.
+// Callers may use this replicated protocol only after capacity_admission_v1 is
+// latched cluster-wide; pre-latch peers do not understand Statement.Guard.
 func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord, vm VMRecord) (bool, error) {
 	if err := normalizeCreateIdentity(&op, vm.Name, "vm", vm.OwnerEpoch); err != nil {
 		return false, err
@@ -33,6 +35,12 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 	if err != nil {
 		return false, err
 	}
+	provisionalGuard, err := vmCreateMutationGuard(op.ID, op.VMOwnerEpoch, vm, false)
+	if err != nil {
+		return false, err
+	}
+	claimedGuard := *provisionalGuard
+	claimedGuard.RequireOperation = true
 	now, wall := c.NowTS(), nowRFC3339()
 	guard := func(tx *sql.Tx) (bool, error) {
 		existing, err := operationInTx(ctx, tx, op.ID)
@@ -52,10 +60,6 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 		return n == 0, nil
 	}
 	stmts := []Statement{
-		operationInsertStatement(op, wall, now),
-		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepPlanned, "", wall, now),
-		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepReserved, reservedFacts, wall, now),
-		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepDesiredPersisted, "", wall, now),
 		{
 			SQL: `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
 				cpu_actual, mem_actual, project, is_template, vm_owner_epoch,
@@ -67,53 +71,49 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 				vm.OwnerEpoch, vm.SpecGeneration, op.ID, wall, now,
 			},
 		},
+		operationInsertStatement(op, wall, now, provisionalGuard),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepPlanned, "", wall, now, &claimedGuard),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepReserved, reservedFacts, wall, now, &claimedGuard),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepDesiredPersisted, "", wall, now, &claimedGuard),
 	}
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
 
 // CommitVMCreateOperation atomically installs the complete persisted hardware,
 // marks the provisional VM running, clears its operation barrier, and terminates
-// the journal. A stale owner, generation, or operation id is a no-op.
+// the journal. A stale owner, generation, operation id, or immutable provisional
+// identity is a no-op.
 func (c *Client) CommitVMCreateOperation(ctx context.Context, opID string, ownerEpoch int64, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, intents []PCIIntentRecord) (bool, error) {
 	now, wall := c.NowTS(), nowRFC3339()
-	guard := func(tx *sql.Tx) (bool, error) {
-		var oe, generation int64
-		var active, state string
-		err := tx.QueryRowContext(ctx,
-			`SELECT vm_owner_epoch, spec_generation, active_operation_id, state
-			 FROM vms WHERE name = ? AND deleted_at IS NULL`, vm.Name).
-			Scan(&oe, &generation, &active, &state)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return state == "creating" && active == opID && oe == ownerEpoch &&
-			generation == vm.SpecGeneration, nil
+	commitGuard, err := vmCreateMutationGuard(opID, ownerEpoch, vm, true)
+	if err != nil {
+		return false, err
 	}
-	stmts, err := vmCreateHardwareStatements(c, vm.Name, ifaces, disks, nics, intents, now)
+	guard := func(tx *sql.Tx) (bool, error) {
+		return c.mutationGuardMatches(ctx, tx, commitGuard)
+	}
+	stmts, err := vmCreateHardwareStatements(vm.Name, ifaces, disks, nics, intents, now, commitGuard)
 	if err != nil {
 		return false, err
 	}
 	stmts = append(stmts,
+		operationStepInsertStatement(opID, ownerEpoch, OpStepPrepared, "", wall, now, commitGuard),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepRuntimeStarted, "", wall, now, commitGuard),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepObserved, "", wall, now, commitGuard),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepCompleted, "", wall, now, commitGuard),
 		Statement{
-			SQL: `UPDATE vms SET stack_name = ?, host_name = ?, spec = ?, state = 'running',
-				state_detail = ?, cpu_actual = ?, mem_actual = ?, project = ?, is_template = ?,
+			SQL: `UPDATE vms SET state = 'running', state_detail = ?,
+				cpu_actual = ?, mem_actual = ?,
 				hardware_adoption_state = 'adopted', hardware_adoption_error = NULL,
 				active_operation_id = '', updated_at = ?
 			 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
 			   AND vm_owner_epoch = ? AND spec_generation = ? AND deleted_at IS NULL`,
 			Params: []interface{}{
-				vm.StackName, vm.HostName, vm.Spec, vm.StateDetail, vm.CPUActual, vm.MemActual,
-				projectOrDefault(vm.Project), boolToInt(vm.IsTemplate), now, vm.Name, opID,
+				vm.StateDetail, vm.CPUActual, vm.MemActual, now, vm.Name, opID,
 				ownerEpoch, vm.SpecGeneration,
 			},
+			Guard: commitGuard,
 		},
-		operationStepInsertStatement(opID, ownerEpoch, OpStepPrepared, "", wall, now),
-		operationStepInsertStatement(opID, ownerEpoch, OpStepRuntimeStarted, "", wall, now),
-		operationStepInsertStatement(opID, ownerEpoch, OpStepObserved, "", wall, now),
-		operationStepInsertStatement(opID, ownerEpoch, OpStepCompleted, "", wall, now),
 	)
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
@@ -123,30 +123,20 @@ func (c *Client) CommitVMCreateOperation(ctx context.Context, opID string, owner
 // or a row now owned by a different operation/epoch.
 func (c *Client) RollbackVMCreateOperation(ctx context.Context, name, opID string, ownerEpoch int64, facts string) (bool, error) {
 	now, wall := c.NowTS(), nowRFC3339()
+	rollbackGuard := vmRollbackMutationGuard(name, opID, ownerEpoch)
 	guard := func(tx *sql.Tx) (bool, error) {
-		var oe int64
-		var active, state string
-		err := tx.QueryRowContext(ctx,
-			`SELECT vm_owner_epoch, active_operation_id, state
-			 FROM vms WHERE name = ? AND deleted_at IS NULL`, name).
-			Scan(&oe, &active, &state)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return state == "creating" && active == opID && oe == ownerEpoch, nil
+		return c.mutationGuardMatches(ctx, tx, rollbackGuard)
 	}
 	return c.ExecuteBatchGuarded(ctx, guard, []Statement{
-		{
+		operationStepInsertStatement(opID, ownerEpoch, OpStepRollbackCompleted, facts, wall, now, rollbackGuard),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepFailed, facts, wall, now, rollbackGuard),
+		Statement{
 			SQL: `UPDATE vms SET active_operation_id = '', deleted_at = ?, updated_at = ?
 			 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
 			   AND vm_owner_epoch = ? AND deleted_at IS NULL`,
 			Params: []interface{}{wall, now, name, opID, ownerEpoch},
+			Guard:  rollbackGuard,
 		},
-		operationStepInsertStatement(opID, ownerEpoch, OpStepRollbackCompleted, facts, wall, now),
-		operationStepInsertStatement(opID, ownerEpoch, OpStepFailed, facts, wall, now),
 	})
 }
 
@@ -157,6 +147,11 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 	if err := normalizeCreateIdentity(&op, ct.Name, "container", ct.OwnerEpoch); err != nil {
 		return false, err
 	}
+	desiredRef := containerCreateDesiredRef(ct.HostName, ct.Name)
+	if op.DesiredRef != "" && op.DesiredRef != desiredRef {
+		return false, fmt.Errorf("%w: container desired_ref does not match host/name", ErrOperationIdentityConflict)
+	}
+	op.DesiredRef = desiredRef
 	ct.OwnerEpoch = op.VMOwnerEpoch
 	if ct.Project == "" {
 		ct.Project = projectOrDefault(op.Project)
@@ -179,6 +174,12 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 	if err != nil {
 		return false, err
 	}
+	provisionalGuard, err := containerCreateMutationGuard(op.ID, op.VMOwnerEpoch, ct, false)
+	if err != nil {
+		return false, err
+	}
+	claimedGuard := *provisionalGuard
+	claimedGuard.RequireOperation = true
 	now, wall := c.NowTS(), nowRFC3339()
 	guard := func(tx *sql.Tx) (bool, error) {
 		existing, err := operationInTx(ctx, tx, op.ID)
@@ -189,7 +190,10 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 			if err := compareOperationClaim(*existing, op); err != nil {
 				return false, err
 			}
-			return false, compareReservedStepInTx(ctx, tx, op.ID, op.VMOwnerEpoch, reservedFacts)
+			if err := compareReservedStepInTx(ctx, tx, op.ID, op.VMOwnerEpoch, reservedFacts); err != nil {
+				return false, err
+			}
+			return false, compareContainerCreateRetryInTx(ctx, tx, op.ID, ct)
 		}
 		var n int
 		if err := tx.QueryRowContext(ctx,
@@ -200,10 +204,6 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 		return n == 0, nil
 	}
 	return c.ExecuteBatchGuarded(ctx, guard, []Statement{
-		operationInsertStatement(op, wall, now),
-		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepPlanned, "", wall, now),
-		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepReserved, reservedFacts, wall, now),
-		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepDesiredPersisted, "", wall, now),
 		{
 			SQL: `INSERT INTO containers
 			 (host_name, name, state, image, cpu_limit, memory_mib, labels,
@@ -218,62 +218,58 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 				ct.SpecGeneration, op.ID, wall, now,
 			},
 		},
+		operationInsertStatement(op, wall, now, provisionalGuard),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepPlanned, "", wall, now, &claimedGuard),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepReserved, reservedFacts, wall, now, &claimedGuard),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepDesiredPersisted, "", wall, now, &claimedGuard),
 	})
 }
 
 // CommitContainerCreateOperation atomically persists the container's complete
 // managed-interface set and commits its provisional row.
 func (c *Client) CommitContainerCreateOperation(ctx context.Context, opID string, ownerEpoch int64, ct ContainerRecord, ifaces []ContainerInterfaceRecord) (bool, error) {
-	labels, err := encodeContainerLabels(ct.Labels)
+	commitGuard, err := containerCreateMutationGuard(opID, ownerEpoch, ct, true)
 	if err != nil {
 		return false, err
 	}
 	now, wall := c.NowTS(), nowRFC3339()
 	guard := func(tx *sql.Tx) (bool, error) {
-		var oe, generation int64
-		var active, state string
-		err := tx.QueryRowContext(ctx,
-			`SELECT owner_epoch, spec_generation, active_operation_id, state
-			 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-			ct.HostName, ct.Name).Scan(&oe, &generation, &active, &state)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return state == "creating" && active == opID && oe == ownerEpoch &&
-			generation == ct.SpecGeneration, nil
+		return c.mutationGuardMatches(ctx, tx, commitGuard)
 	}
 	stmts := make([]Statement, 0, len(ifaces)+5)
 	for _, ifc := range ifaces {
 		ifc.HostName, ifc.CtName = ct.HostName, ct.Name
-		stmt, err := containerInterfaceStmtAt(ifc, now)
+		sgs, err := encodeSGs(ifc.SecurityGroups)
 		if err != nil {
 			return false, err
 		}
-		stmts = append(stmts, stmt)
+		stmts = append(stmts, Statement{
+			SQL: `INSERT OR REPLACE INTO container_interfaces
+			 (host_name, ct_name, network_name, ordinal, mac, ip, veth_device, security_groups, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			Params: []interface{}{
+				ifc.HostName, ifc.CtName, ifc.NetworkName, ifc.Ordinal, ifc.MAC,
+				ifc.IP, ifc.VethDevice, sgs, now,
+			},
+			Guard: commitGuard,
+		})
 	}
 	stmts = append(stmts,
+		operationStepInsertStatement(opID, ownerEpoch, OpStepPrepared, "", wall, now, commitGuard),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepRuntimeStarted, "", wall, now, commitGuard),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepObserved, "", wall, now, commitGuard),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepCompleted, "", wall, now, commitGuard),
 		Statement{
-			SQL: `UPDATE containers SET state = 'running', image = ?, cpu_limit = ?,
-				memory_mib = ?, labels = ?, restart_policy = ?, state_detail = ?,
-				project = ?, is_template = ?, on_host_failure = ?, create_spec = ?,
-				relocate_token = ?, active_operation_id = '', updated_at = ?
+			SQL: `UPDATE containers SET state = 'running', state_detail = ?,
+				active_operation_id = '', updated_at = ?
 			 WHERE host_name = ? AND name = ? AND state = 'creating'
 			   AND active_operation_id = ? AND owner_epoch = ? AND spec_generation = ?
 			   AND deleted_at IS NULL`,
 			Params: []interface{}{
-				ct.Image, ct.CPULimit, ct.MemMiB, labels, ct.RestartPolicy,
-				ct.StateDetail, projectOrDefault(ct.Project), boolToInt(ct.IsTemplate),
-				ct.OnHostFailure, ct.CreateSpec, ct.RelocateToken, now, ct.HostName,
-				ct.Name, opID, ownerEpoch, ct.SpecGeneration,
+				ct.StateDetail, now, ct.HostName, ct.Name, opID, ownerEpoch, ct.SpecGeneration,
 			},
+			Guard: commitGuard,
 		},
-		operationStepInsertStatement(opID, ownerEpoch, OpStepPrepared, "", wall, now),
-		operationStepInsertStatement(opID, ownerEpoch, OpStepRuntimeStarted, "", wall, now),
-		operationStepInsertStatement(opID, ownerEpoch, OpStepObserved, "", wall, now),
-		operationStepInsertStatement(opID, ownerEpoch, OpStepCompleted, "", wall, now),
 	)
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
@@ -282,30 +278,20 @@ func (c *Client) CommitContainerCreateOperation(ctx context.Context, opID string
 // RollbackVMCreateOperation.
 func (c *Client) RollbackContainerCreateOperation(ctx context.Context, hostName, name, opID string, ownerEpoch int64, facts string) (bool, error) {
 	now, wall := c.NowTS(), nowRFC3339()
+	rollbackGuard := containerRollbackMutationGuard(hostName, name, opID, ownerEpoch)
 	guard := func(tx *sql.Tx) (bool, error) {
-		var oe int64
-		var active, state string
-		err := tx.QueryRowContext(ctx,
-			`SELECT owner_epoch, active_operation_id, state FROM containers
-			 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`, hostName, name).
-			Scan(&oe, &active, &state)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return state == "creating" && active == opID && oe == ownerEpoch, nil
+		return c.mutationGuardMatches(ctx, tx, rollbackGuard)
 	}
 	return c.ExecuteBatchGuarded(ctx, guard, []Statement{
-		{
+		operationStepInsertStatement(opID, ownerEpoch, OpStepRollbackCompleted, facts, wall, now, rollbackGuard),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepFailed, facts, wall, now, rollbackGuard),
+		Statement{
 			SQL: `UPDATE containers SET active_operation_id = '', deleted_at = ?, updated_at = ?
 			 WHERE host_name = ? AND name = ? AND state = 'creating'
 			   AND active_operation_id = ? AND owner_epoch = ? AND deleted_at IS NULL`,
 			Params: []interface{}{wall, now, hostName, name, opID, ownerEpoch},
+			Guard:  rollbackGuard,
 		},
-		operationStepInsertStatement(opID, ownerEpoch, OpStepRollbackCompleted, facts, wall, now),
-		operationStepInsertStatement(opID, ownerEpoch, OpStepFailed, facts, wall, now),
 	})
 }
 
@@ -387,6 +373,28 @@ func compareReservedStepInTx(ctx context.Context, tx *sql.Tx, opID string, owner
 	return nil
 }
 
+func compareContainerCreateRetryInTx(ctx context.Context, tx *sql.Tx, opID string, requested ContainerRecord) error {
+	var hostName, name string
+	err := tx.QueryRowContext(ctx,
+		`SELECT host_name, name FROM containers
+		 WHERE active_operation_id = ? AND deleted_at IS NULL LIMIT 1`, opID).
+		Scan(&hostName, &name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if hostName != requested.HostName || name != requested.Name {
+		return ErrOperationIdentityConflict
+	}
+	return nil
+}
+
+func containerCreateDesiredRef(hostName, name string) string {
+	return fmt.Sprintf("container/%d:%s/%d:%s", len(hostName), hostName, len(name), name)
+}
+
 func validateReservationProject(raw, operationProject string) error {
 	rv, err := DecodeReservation(raw)
 	if err != nil {
@@ -404,7 +412,7 @@ func validateReservationProject(raw, operationProject string) error {
 	return nil
 }
 
-func operationInsertStatement(op OperationRecord, wall, now string) Statement {
+func operationInsertStatement(op OperationRecord, wall, now string, guard *MutationGuard) Statement {
 	return Statement{
 		SQL: `INSERT INTO operations (` + operationCols + `)
 		     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
@@ -413,15 +421,17 @@ func operationInsertStatement(op OperationRecord, wall, now string) Statement {
 			op.OperationKind, op.RequestHash, op.IdempotencyKey, op.ReservationJSON,
 			op.DesiredRef, op.VMOwnerEpoch, wall, now,
 		},
+		Guard: guard,
 	}
 }
 
-func operationStepInsertStatement(opID string, ownerEpoch int64, step, facts, wall, now string) Statement {
+func operationStepInsertStatement(opID string, ownerEpoch int64, step, facts, wall, now string, guard *MutationGuard) Statement {
 	return Statement{
 		SQL: `INSERT INTO operation_steps
 		     (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
 		     VALUES (?, ?, ?, ?, ?, ?, NULL)`,
 		Params: []interface{}{opID, ownerEpoch, step, facts, wall, now},
+		Guard:  guard,
 	}
 }
 
@@ -433,23 +443,7 @@ func encodeContainerLabels(labels map[string]string) (string, error) {
 	return string(b), err
 }
 
-func containerInterfaceStmtAt(r ContainerInterfaceRecord, now string) (Statement, error) {
-	sgs, err := encodeSGs(r.SecurityGroups)
-	if err != nil {
-		return Statement{}, err
-	}
-	return Statement{
-		SQL: `INSERT OR REPLACE INTO container_interfaces
-		 (host_name, ct_name, network_name, ordinal, mac, ip, veth_device, security_groups, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		Params: []interface{}{
-			r.HostName, r.CtName, r.NetworkName, r.Ordinal, r.MAC, r.IP,
-			r.VethDevice, sgs, now,
-		},
-	}, nil
-}
-
-func vmCreateHardwareStatements(c *Client, vmName string, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, intents []PCIIntentRecord, now string) ([]Statement, error) {
+func vmCreateHardwareStatements(vmName string, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, intents []PCIIntentRecord, now string, guard *MutationGuard) ([]Statement, error) {
 	stmts := make([]Statement, 0, len(ifaces)+len(disks)+len(nics)+len(intents))
 	for _, iface := range ifaces {
 		sgs, err := encodeSGs(iface.SecurityGroups)
@@ -464,6 +458,7 @@ func vmCreateHardwareStatements(c *Client, vmName string, ifaces []InterfaceReco
 				vmName, iface.NetworkName, iface.Ordinal, iface.MAC, iface.IP,
 				iface.TapDevice, sgs, now,
 			},
+			Guard: guard,
 		})
 	}
 	for _, disk := range disks {
@@ -484,6 +479,7 @@ func vmCreateHardwareStatements(c *Client, vmName string, ifaces []InterfaceReco
 				deviceKind, boolToInt(disk.DeleteWithVM),
 				nullIfEmpty(disk.ControllerModel), now,
 			},
+			Guard: guard,
 		})
 	}
 	for _, nic := range nics {
@@ -501,6 +497,7 @@ func vmCreateHardwareStatements(c *Client, vmName string, ifaces []InterfaceReco
 				nullIfEmpty(nic.IP), nullIfEmpty(nic.TapDevice),
 				nullIfEmpty(nic.SecurityGroups), now,
 			},
+			Guard: guard,
 		})
 	}
 	for _, in := range intents {
@@ -517,6 +514,7 @@ func vmCreateHardwareStatements(c *Client, vmName string, ifaces []InterfaceReco
 				vmName, in.DeviceID, in.HostName, in.SelectorKind,
 				in.SelectorPayload, exclusive, now,
 			},
+			Guard: guard,
 		})
 	}
 	return stmts, nil

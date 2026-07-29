@@ -1103,11 +1103,19 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	if entry.RequiresCapability != "" && entry.DispositionAfter != "" && r.client.capabilityActive(entry.RequiresCapability) {
 		disp = entry.DispositionAfter
 	}
+	if disp == DispReject {
+		return invalidf("replicated statement shape not authorized in current state (requires capability %q): table %s", entry.RequiresCapability, tableName)
+	}
+
+	guardMatches, err := r.client.mutationGuardMatches(ctx, tx, s.Guard)
+	if err != nil {
+		return fmt.Errorf("mutation guard: %w", err)
+	}
+	if !guardMatches {
+		return nil
+	}
 
 	switch disp {
-	case DispReject:
-		return invalidf("replicated statement shape not authorized in current state (requires capability %q): table %s", entry.RequiresCapability, tableName)
-
 	case DispCanonicalRegistry:
 		return r.applyCanonicalRegistry(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 

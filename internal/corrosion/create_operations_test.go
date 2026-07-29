@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 func createOp(id, resourceKind, resourceID, requestHash, reservation string, ownerEpoch int64) OperationRecord {
@@ -205,6 +207,50 @@ func TestCommitVMCreateOperationHardwareFailureRollsBackEverything(t *testing.T)
 	}
 }
 
+func TestCommitVMCreateOperationRejectsAdmissionIdentityDrift(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		mutate func(*VMRecord)
+	}{
+		{"host", func(vm *VMRecord) { vm.HostName = "h2" }},
+		{"project", func(vm *VMRecord) { vm.Project = "p2" }},
+		{"spec", func(vm *VMRecord) { vm.Spec = `{"cpu":8}` }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testClient(t)
+			reservation, _ := (ReservationVector{
+				Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+			}).Encode()
+			op := createOp("op-drift-"+tc.name, "vm", "vm1", "hash", reservation, 3)
+			vm := VMRecord{
+				Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+				State: "creating", OwnerEpoch: 3, SpecGeneration: 1,
+			}
+			if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+				t.Fatalf("begin: applied=%v err=%v", applied, err)
+			}
+			drifted := vm
+			tc.mutate(&drifted)
+			applied, err := c.CommitVMCreateOperation(ctx, op.ID, 3, drifted,
+				[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+				nil, nil, nil)
+			if err != nil || applied {
+				t.Fatalf("drifted commit: applied=%v err=%v", applied, err)
+			}
+			got, _ := GetVM(ctx, c, "vm1")
+			if got == nil || got.HostName != "h1" || got.Project != "p1" ||
+				got.Spec != `{"cpu":2}` || got.ActiveOperationID != op.ID {
+				t.Fatalf("provisional VM mutated: %+v", got)
+			}
+			if rows, _ := c.Query(ctx, `SELECT 1 FROM vm_interfaces WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+				t.Fatalf("drifted commit wrote hardware: %v", rows)
+			}
+			assertNoCreateTerminalSteps(t, c, op.ID, 3)
+		})
+	}
+}
+
 func TestVMCreateOperationStaleCommitAndRollbackAreNoOps(t *testing.T) {
 	ctx := context.Background()
 	c := testClient(t)
@@ -299,6 +345,243 @@ func TestContainerCreateOperationAtomicCommitAndFencing(t *testing.T) {
 	if err != nil || len(ifaces) != 1 {
 		t.Fatalf("container interfaces = %+v err=%v", ifaces, err)
 	}
+}
+
+func TestCommitContainerCreateOperationRejectsAdmissionIdentityDrift(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ContainerRecord)
+	}{
+		{"host", func(ct *ContainerRecord) { ct.HostName = "h2" }},
+		{"project", func(ct *ContainerRecord) { ct.Project = "p2" }},
+		{"create_spec", func(ct *ContainerRecord) { ct.CreateSpec = `{"template":"other"}` }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testClient(t)
+			reservation, _ := (ReservationVector{
+				Project: "p1", ProjectCPU: 1, TargetHost: "h1", TargetCPU: 1,
+			}).Encode()
+			op := createOp("op-ct-drift-"+tc.name, "container", "ct1", "hash", reservation, 2)
+			ct := ContainerRecord{
+				HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+				CreateSpec: `{"template":"alpine"}`, OwnerEpoch: 2, SpecGeneration: 1,
+			}
+			if applied, err := c.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+				t.Fatalf("begin: applied=%v err=%v", applied, err)
+			}
+			drifted := ct
+			tc.mutate(&drifted)
+			applied, err := c.CommitContainerCreateOperation(ctx, op.ID, 2, drifted,
+				[]ContainerInterfaceRecord{{NetworkName: "net1"}})
+			if err != nil || applied {
+				t.Fatalf("drifted commit: applied=%v err=%v", applied, err)
+			}
+			got, _ := GetContainer(ctx, c, "h1", "ct1")
+			if got == nil || got.Project != "p1" || got.CreateSpec != `{"template":"alpine"}` ||
+				got.ActiveOperationID != op.ID {
+				t.Fatalf("provisional container mutated: %+v", got)
+			}
+			if rows, _ := c.Query(ctx, `SELECT 1 FROM container_interfaces WHERE ct_name = ?`, "ct1"); len(rows) != 0 {
+				t.Fatalf("drifted commit wrote interfaces: %v", rows)
+			}
+			assertNoCreateTerminalSteps(t, c, op.ID, 2)
+		})
+	}
+}
+
+func TestBeginContainerCreateOperationRetryOnDifferentHostConflicts(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-ct-host", "container", "ct1", "hash", "", 1)
+	ct := ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1}
+	if applied, err := c.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	ct.HostName = "h2"
+	if _, err := c.BeginContainerCreateOperation(ctx, op, ct); !errors.Is(err, ErrOperationIdentityConflict) {
+		t.Fatalf("different-host retry error = %v, want identity conflict", err)
+	}
+	if got, _ := GetContainer(ctx, c, "h2", "ct1"); got != nil {
+		t.Fatalf("different-host retry created a row: %+v", got)
+	}
+	ct.HostName = "h1"
+	if applied, err := c.CommitContainerCreateOperation(ctx, op.ID, 1, ct, nil); err != nil || !applied {
+		t.Fatalf("commit original host: applied=%v err=%v", applied, err)
+	}
+	ct.HostName = "h2"
+	if _, err := c.BeginContainerCreateOperation(ctx, op, ct); !errors.Is(err, ErrOperationIdentityConflict) {
+		t.Fatalf("different-host retry after commit error = %v, want identity conflict", err)
+	}
+}
+
+func TestReplicatedVMCreateCommitIsSelfGuarded(t *testing.T) {
+	ctx := context.Background()
+	source := testClient(t)
+	op := createOp("op-repl-vm", "vm", "vm1", "hash", "", 1)
+	vm := VMRecord{
+		Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+		OwnerEpoch: 1, SpecGeneration: 1,
+	}
+	if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("source begin: applied=%v err=%v", applied, err)
+	}
+	beginEntry := latestMutationEntry(t, source, "source-vm", 1)
+	if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 1, vm,
+		[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+		[]DiskRecord{{DiskName: "root", HostName: "h1", Path: "/vm1.img"}},
+		[]NICRecord{{ID: "nic1", NetworkName: "net1"}},
+		[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h1", SelectorKind: "vendor", SelectorPayload: "1234"}},
+	); err != nil || !applied {
+		t.Fatalf("source commit: applied=%v err=%v", applied, err)
+	}
+	commitEntry := latestMutationEntry(t, source, "source-vm", 2)
+
+	t.Run("stale receiver", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET state = 'running', active_operation_id = 'new-op',
+			 vm_owner_epoch = 2, spec_generation = 2, updated_at = ?
+			 WHERE name = ?`, "9000000000000-0000-newer", "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetVM(ctx, receiver, "vm1")
+		if got == nil || got.ActiveOperationID != "new-op" || got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("stale commit changed newer VM: %+v", got)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+				t.Fatalf("stale commit wrote %s: %v", table, rows)
+			}
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+	})
+	t.Run("valid receiver", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetVM(ctx, receiver, "vm1")
+		if got == nil || got.State != "running" || got.ActiveOperationID != "" {
+			t.Fatalf("valid commit did not apply: %+v", got)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 1 {
+				t.Fatalf("valid commit %s rows = %v", table, rows)
+			}
+		}
+	})
+}
+
+func TestReplicatedContainerCreateCommitIsSelfGuarded(t *testing.T) {
+	ctx := context.Background()
+	source := testClient(t)
+	op := createOp("op-repl-ct", "container", "ct1", "hash", "", 1)
+	ct := ContainerRecord{
+		HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+		CreateSpec: `{"template":"alpine"}`, OwnerEpoch: 1, SpecGeneration: 1,
+	}
+	if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+		t.Fatalf("source begin: applied=%v err=%v", applied, err)
+	}
+	beginEntry := latestMutationEntry(t, source, "source-ct", 1)
+	if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 1, ct,
+		[]ContainerInterfaceRecord{{NetworkName: "net1", MAC: "52:00:00:00:00:01"}}); err != nil || !applied {
+		t.Fatalf("source commit: applied=%v err=%v", applied, err)
+	}
+	commitEntry := latestMutationEntry(t, source, "source-ct", 2)
+
+	t.Run("stale receiver", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE containers SET state = 'running', active_operation_id = 'new-op',
+			 owner_epoch = 2, spec_generation = 2, updated_at = ?
+			 WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetContainer(ctx, receiver, "h1", "ct1")
+		if got == nil || got.ActiveOperationID != "new-op" || got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("stale commit changed newer container: %+v", got)
+		}
+		if rows, _ := receiver.Query(ctx, `SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`, "h1", "ct1"); len(rows) != 0 {
+			t.Fatalf("stale commit wrote interfaces: %v", rows)
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+	})
+	t.Run("valid receiver", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetContainer(ctx, receiver, "h1", "ct1")
+		if got == nil || got.State != "running" || got.ActiveOperationID != "" {
+			t.Fatalf("valid commit did not apply: %+v", got)
+		}
+		if rows, _ := receiver.Query(ctx, `SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`, "h1", "ct1"); len(rows) != 1 {
+			t.Fatalf("valid commit interface rows = %v", rows)
+		}
+	})
+}
+
+func TestReplicatedCreateRollbackIsSelfGuarded(t *testing.T) {
+	ctx := context.Background()
+	t.Run("vm", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-repl-vm-rollback", "vm", "vm1", "hash", "", 1)
+		vm := VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		beginEntry := latestMutationEntry(t, source, "source-vm-rollback", 1)
+		if applied, err := source.RollbackVMCreateOperation(ctx, "vm1", op.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		rollbackEntry := latestMutationEntry(t, source, "source-vm-rollback", 2)
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET state = 'running', active_operation_id = 'new-op',
+			 vm_owner_epoch = 2, updated_at = ? WHERE name = ?`,
+			"9000000000000-0000-newer", "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, rollbackEntry)
+		got, _ := GetVM(ctx, receiver, "vm1")
+		if got == nil || got.ActiveOperationID != "new-op" || got.OwnerEpoch != 2 {
+			t.Fatalf("stale rollback changed newer VM: %+v", got)
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+	})
+	t.Run("container", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-repl-ct-rollback", "container", "ct1", "hash", "", 1)
+		ct := ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		beginEntry := latestMutationEntry(t, source, "source-ct-rollback", 1)
+		if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", "ct1", op.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		rollbackEntry := latestMutationEntry(t, source, "source-ct-rollback", 2)
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE containers SET state = 'running', active_operation_id = 'new-op',
+			 owner_epoch = 2, updated_at = ? WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, rollbackEntry)
+		got, _ := GetContainer(ctx, receiver, "h1", "ct1")
+		if got == nil || got.ActiveOperationID != "new-op" || got.OwnerEpoch != 2 {
+			t.Fatalf("stale rollback changed newer container: %+v", got)
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+	})
 }
 
 func TestBeginContainerCreateOperationRollsBackAndPreservesLiveRow(t *testing.T) {
@@ -463,4 +746,39 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func assertNoCreateTerminalSteps(t *testing.T, c *Client, opID string, ownerEpoch int64) {
+	t.Helper()
+	steps, err := ListOperationSteps(context.Background(), c, opID, ownerEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range steps {
+		switch step.StepName {
+		case OpStepPrepared, OpStepRuntimeStarted, OpStepObserved, OpStepCompleted,
+			OpStepRollbackCompleted, OpStepFailed:
+			t.Fatalf("unexpected create terminal/progress step after refused mutation: %s", step.StepName)
+		}
+	}
+}
+
+func latestMutationEntry(t *testing.T, c *Client, origin string, seq int64) *pb.MutationEntry {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT hlc, stmts FROM mutation_log ORDER BY seq DESC LIMIT 1`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("latest mutation: rows=%v err=%v", rows, err)
+	}
+	return &pb.MutationEntry{
+		Seq: seq, Hlc: rows[0].String("hlc"), Origin: origin, Stmts: rows[0].String("stmts"),
+	}
+}
+
+func applyMutationEntry(t *testing.T, c *Client, entry *pb.MutationEntry) {
+	t.Helper()
+	if _, err := NewReplicator(c, "", RelayConfig{}).ApplyRemoteMutations(
+		context.Background(), []*pb.MutationEntry{entry}); err != nil {
+		t.Fatalf("apply mutation seq=%d: %v", entry.Seq, err)
+	}
 }

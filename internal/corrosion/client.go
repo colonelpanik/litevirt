@@ -690,6 +690,12 @@ type Row struct {
 type Statement struct {
 	SQL    string
 	Params []interface{}
+	// Guard is additive replication metadata for operation-protocol mutations
+	// whose local ExecuteBatchGuarded closure cannot travel in the WAL. A
+	// receiver evaluates this fixed, structured predicate inside its apply
+	// transaction before executing the statement. Nil preserves the historical
+	// statement wire format and behavior.
+	Guard *MutationGuard `json:",omitempty"`
 }
 
 // Query executes a read query against the local SQLite database.

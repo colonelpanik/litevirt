@@ -340,6 +340,143 @@ func TestContainerRekeySourceSafetyAxes(t *testing.T) {
 	}
 }
 
+func TestOrdinaryRekeyLocalTargetAuthority(t *testing.T) {
+	ctx := context.Background()
+	seedLegacySource := func(t *testing.T, c *Client) ContainerRecord {
+		t.Helper()
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "h1", Name: "ct1", State: "running", Image: "source",
+			Project: "p1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := GetContainer(ctx, c, "h1", "ct1")
+		if err != nil || got == nil {
+			t.Fatalf("legacy source: got=%+v err=%v", got, err)
+		}
+		return *got
+	}
+	seedSourceFootprint := func(t *testing.T, c *Client) {
+		t.Helper()
+		if _, err := c.db.Exec(
+			`INSERT INTO container_interfaces
+			 (host_name, ct_name, network_name, ordinal, mac, updated_at)
+			 VALUES ('h1', 'ct1', 'sentinel', 0, '52:54:00:00:00:01', 'sentinel')`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.db.Exec(
+			`INSERT INTO ip_allocations
+			 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+			 VALUES ('sentinel', '10.0.0.10', '52:54:00:00:00:01',
+			         'ct1', 'ct', 'h1', 'sentinel', 'sentinel')`,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mutationCount := func(t *testing.T, c *Client) int64 {
+		t.Helper()
+		var count int64
+		if err := c.db.QueryRow(`SELECT COUNT(*) FROM mutation_log`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	t.Run("modern tombstone declines without WAL", func(t *testing.T) {
+		c := testClient(t)
+		source := seedLegacySource(t, c)
+		seedSourceFootprint(t, c)
+		targetOp := createOp("op-modern-tombstone-target", "container", "ct1", "hash", "", 3)
+		target := ContainerRecord{
+			HostName: "h2", Name: "ct1", Image: "modern", Project: "p1",
+			OwnerEpoch: 3, SpecGeneration: 4,
+		}
+		if applied, err := c.BeginContainerCreateOperation(
+			ctx, targetOp, target,
+		); err != nil || !applied {
+			t.Fatalf("target begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := c.CommitContainerCreateOperation(
+			ctx, targetOp.ID, target.OwnerEpoch, target, nil,
+		); err != nil || !applied {
+			t.Fatalf("target commit: applied=%v err=%v", applied, err)
+		}
+		if err := DeleteContainer(ctx, c, target.HostName, target.Name); err != nil {
+			t.Fatal(err)
+		}
+
+		rowsBefore := containerRowsSnapshot(t, c, source.Name)
+		footprintBefore := containerOwnershipFootprintSnapshot(t, c, source.Name)
+		mutationsBefore := mutationCount(t, c)
+		if applied, err := RekeyContainerOwner(ctx, c, source, target.HostName); err != nil || applied {
+			t.Fatalf("ordinary rekey over modern tombstone: applied=%v err=%v", applied, err)
+		}
+		if rowsAfter := containerRowsSnapshot(t, c, source.Name); rowsAfter != rowsBefore {
+			t.Fatalf("declined ordinary rekey changed container rows:\nbefore=%s\nafter=%s",
+				rowsBefore, rowsAfter)
+		}
+		if footprintAfter := containerOwnershipFootprintSnapshot(
+			t, c, source.Name,
+		); footprintAfter != footprintBefore {
+			t.Fatalf("declined ordinary rekey changed footprint:\nbefore=%s\nafter=%s",
+				footprintBefore, footprintAfter)
+		}
+		if mutationsAfter := mutationCount(t, c); mutationsAfter != mutationsBefore {
+			t.Fatalf("declined ordinary rekey appended WAL: before=%d after=%d",
+				mutationsBefore, mutationsAfter)
+		}
+	})
+
+	t.Run("preauthority tombstone remains replaceable", func(t *testing.T) {
+		c := testClient(t)
+		source := seedLegacySource(t, c)
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "h2", Name: "ct1", State: "stopped", Image: "stale",
+			Project: "p1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := DeleteContainer(ctx, c, "h2", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		if applied, err := RekeyContainerOwner(ctx, c, source, "h2"); err != nil || !applied {
+			t.Fatalf("ordinary rekey over preauthority tombstone: applied=%v err=%v", applied, err)
+		}
+		if got, _ := GetContainer(ctx, c, "h1", "ct1"); got != nil {
+			t.Fatalf("successful ordinary rekey left source live: %+v", got)
+		}
+		if got, err := GetContainer(ctx, c, "h2", "ct1"); err != nil || got == nil ||
+			got.Image != "source" || got.OwnerEpoch != 0 || got.SpecGeneration != 0 {
+			t.Fatalf("replacement target: got=%+v err=%v", got, err)
+		}
+	})
+
+	t.Run("live target still declines", func(t *testing.T) {
+		c := testClient(t)
+		source := seedLegacySource(t, c)
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "h2", Name: "ct1", State: "running", Image: "target",
+			Project: "p1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rowsBefore := containerRowsSnapshot(t, c, source.Name)
+		mutationsBefore := mutationCount(t, c)
+		if applied, err := RekeyContainerOwner(ctx, c, source, "h2"); err != nil || applied {
+			t.Fatalf("ordinary rekey over live target: applied=%v err=%v", applied, err)
+		}
+		if rowsAfter := containerRowsSnapshot(t, c, source.Name); rowsAfter != rowsBefore {
+			t.Fatalf("declined live-target rekey changed rows:\nbefore=%s\nafter=%s",
+				rowsBefore, rowsAfter)
+		}
+		if mutationsAfter := mutationCount(t, c); mutationsAfter != mutationsBefore {
+			t.Fatalf("declined live-target rekey appended WAL: before=%d after=%d",
+				mutationsBefore, mutationsAfter)
+		}
+	})
+}
+
 func containerRowsSnapshot(t *testing.T, c *Client, name string) string {
 	t.Helper()
 	rows, err := c.Query(context.Background(),

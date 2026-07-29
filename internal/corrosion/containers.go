@@ -342,7 +342,7 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 		return false, err
 	}
 	guard := func(tx *sql.Tx) (bool, error) {
-		return containerRekeyPreflight(ctx, tx, src, toHost)
+		return containerRekeyPreflight(ctx, tx, src, toHost, true)
 	}
 	stmts := []Statement{
 		{
@@ -408,7 +408,7 @@ func RekeyContainerOwnerGuarded(ctx context.Context, c *Client, src ContainerRec
 		return false, err
 	}
 	guard := func(tx *sql.Tx) (bool, error) {
-		return containerRekeyPreflight(ctx, tx, src, toHost)
+		return containerRekeyPreflight(ctx, tx, src, toHost, false)
 	}
 
 	stmts := []Statement{
@@ -463,6 +463,7 @@ func containerRekeySourceSafe(state, detail, relocateToken, activeOperationID st
 
 func containerRekeyPreflight(
 	ctx context.Context, tx *sql.Tx, src ContainerRecord, toHost string,
+	legacyEnvelope bool,
 ) (bool, error) {
 	// (a) source row still live, unchanged since observed, and outside any
 	// relocation/migration state machine.
@@ -483,14 +484,25 @@ func containerRekeyPreflight(
 		!containerRekeySourceSafe(state, detail, token, activeOperationID) {
 		return false, nil
 	}
-	// (b) no LIVE target row may exist (only a soft-deleted one may be replaced).
-	var n int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-		toHost, src.Name).Scan(&n); err != nil {
+	// (b) no live target row may exist. The ordinary v1.3 envelope may replace
+	// only a pre-authority tombstone; a modern tombstone is an authority decision
+	// and the legacy INSERT OR REPLACE would otherwise erase its fencing axes.
+	var targetOwnerEpoch, targetGeneration int64
+	var targetActiveOperationID string
+	var targetDeleted sql.NullString
+	err = tx.QueryRowContext(ctx,
+		`SELECT owner_epoch, spec_generation, active_operation_id, deleted_at
+		 FROM containers WHERE host_name = ? AND name = ?`,
+		toHost, src.Name).
+		Scan(&targetOwnerEpoch, &targetGeneration, &targetActiveOperationID, &targetDeleted)
+	if err != nil && err != sql.ErrNoRows {
 		return false, err
 	}
-	if n > 0 {
+	if err == nil && (!targetDeleted.Valid || targetDeleted.String == "") {
+		return false, nil
+	}
+	if err == nil && legacyEnvelope &&
+		(targetOwnerEpoch != 0 || targetGeneration != 0 || targetActiveOperationID != "") {
 		return false, nil
 	}
 	// (c) source must own the live IPAM lease for every managed NIC.

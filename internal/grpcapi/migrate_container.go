@@ -70,6 +70,29 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			"container %q already exists on target host %q", req.Name, req.TargetHost)
 	}
 
+	// Capacity admission on the TARGET, MEMORY only — a container's cpu_limit is a
+	// cgroup weight, not a vCPU reservation, so only its memory cap is comparable
+	// to a VM's (mirrors CreateContainer). An uncapped container reserves nothing,
+	// matching how it is accounted.
+	//
+	// HOST-only: the migrate MOVES an allocation the project's quota already counts
+	// (the source row outlives the transfer and is removed only once the target
+	// lands), so charging quota again would refuse the migration of any container
+	// over half its quota.
+	//
+	// It runs HERE — before the cold-transfer stop — so a target that cannot hold
+	// the container never causes an outage on the source. The lease is held for the
+	// whole migrate, and the target's RestoreContainer recognises a verified
+	// peer-migrate and does NOT admit again (backup_container.go), so one move
+	// reserves exactly once instead of demanding twice the container's memory.
+	if rec.MemMiB > 0 {
+		lease, aerr := s.admitHostWithReservation(ctx, "MigrateContainer", req.TargetHost, project, 0, rec.MemMiB)
+		if aerr != nil {
+			return aerr
+		}
+		defer lease.release(ctx)
+	}
+
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 

@@ -536,6 +536,11 @@ func TestClassifyRestoreError(t *testing.T) {
 	beforeRow := []codes.Code{
 		codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument,
 		codes.PermissionDenied, codes.Unimplemented, codes.AlreadyExists,
+		// ResourceExhausted: the target's capacity/quota admission runs before any
+		// import or row write, so a refusal is conclusive. Classified as
+		// indeterminate it would make a coordinator defer on a full target instead
+		// of falling back, and park a cold migrate instead of rolling it back.
+		codes.ResourceExhausted,
 	}
 	for _, code := range beforeRow {
 		if got := classifyRestoreError(status.Error(code, "x")); got != corrosion.RestoreFailedBeforeRow {

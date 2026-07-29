@@ -1551,7 +1551,9 @@ func legacyContainerRekeySafe(
 		return false, err
 	}
 	if sourceDeleted.Valid && sourceDeleted.String != "" ||
-		!containerRekeySourceSafe(sourceState, sourceDetail, relocateToken) ||
+		!containerRekeySourceSafe(
+			sourceState, sourceDetail, relocateToken, activeOperationID,
+		) ||
 		ownerEpoch != 0 || generation != 0 || activeOperationID != "" ||
 		image != coerceString(p[2]) ||
 		cpuLimit != coerceInt64(p[3]) ||

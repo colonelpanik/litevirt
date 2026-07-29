@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 func TestRekeyContainerOwnerRollingCompatibility(t *testing.T) {
@@ -147,4 +149,207 @@ func TestRekeyContainerOwnerRollingCompatibility(t *testing.T) {
 			t.Fatalf("guarded modern rekey: applied=%v err=%v", applied, err)
 		}
 	})
+}
+
+func TestGuardedRekeyRefusesProvisionalContainerCreate(t *testing.T) {
+	ctx := context.Background()
+	const delayed = "9900000000000-0000-provisional-rekey"
+
+	begin := func(t *testing.T, suffix string) (*Client, OperationRecord, ContainerRecord) {
+		t.Helper()
+		c := testClient(t)
+		op := createOp("op-provisional-rekey-"+suffix, "container", "ct1", "hash", "", 4)
+		rec := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+			OwnerEpoch: 4, SpecGeneration: 2,
+		}
+		if applied, err := c.BeginContainerCreateOperation(ctx, op, rec); err != nil || !applied {
+			t.Fatalf("begin provisional create: applied=%v err=%v", applied, err)
+		}
+		got, err := GetContainer(ctx, c, rec.HostName, rec.Name)
+		if err != nil || got == nil || got.State != "creating" ||
+			got.ActiveOperationID != op.ID {
+			t.Fatalf("provisional row: got=%+v err=%v", got, err)
+		}
+		return c, op, rec
+	}
+	seedFootprint := func(t *testing.T, c *Client) {
+		t.Helper()
+		if _, err := c.db.Exec(
+			`INSERT INTO container_interfaces
+			 (host_name, ct_name, network_name, ordinal, mac, updated_at)
+			 VALUES ('h1', 'ct1', 'sentinel', 0, '52:54:00:00:00:01', 'sentinel')`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.db.Exec(
+			`INSERT INTO ip_allocations
+			 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+			 VALUES ('sentinel', '10.0.0.10', '52:54:00:00:00:01',
+			         'ct1', 'ct', 'h1', 'sentinel', 'sentinel')`,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish := func(t *testing.T, c *Client, op OperationRecord, rec ContainerRecord, action string) {
+		t.Helper()
+		switch action {
+		case "commit":
+			if applied, err := c.CommitContainerCreateOperation(
+				ctx, op.ID, rec.OwnerEpoch, rec, nil,
+			); err != nil || !applied {
+				t.Fatalf("commit after refused rekey: applied=%v err=%v", applied, err)
+			}
+			got, err := GetContainer(ctx, c, rec.HostName, rec.Name)
+			if err != nil || got == nil || got.State != "running" ||
+				got.ActiveOperationID != "" {
+				t.Fatalf("committed row: got=%+v err=%v", got, err)
+			}
+		case "rollback":
+			if applied, err := c.RollbackContainerCreateOperation(
+				ctx, rec.HostName, rec.Name, op.ID, rec.OwnerEpoch, "cancelled",
+			); err != nil || !applied {
+				t.Fatalf("rollback after refused rekey: applied=%v err=%v", applied, err)
+			}
+			if got, _ := GetContainer(ctx, c, rec.HostName, rec.Name); got != nil {
+				t.Fatalf("rollback left provisional row live: %+v", got)
+			}
+		default:
+			t.Fatalf("unknown terminal action %q", action)
+		}
+	}
+
+	t.Run("local preflight", func(t *testing.T) {
+		for _, action := range []string{"commit", "rollback"} {
+			t.Run(action, func(t *testing.T) {
+				c, op, rec := begin(t, "local-"+action)
+				seedFootprint(t, c)
+				src, err := GetContainer(ctx, c, rec.HostName, rec.Name)
+				if err != nil || src == nil {
+					t.Fatalf("source: got=%+v err=%v", src, err)
+				}
+				rowsBefore := containerRowsSnapshot(t, c, rec.Name)
+				footprintBefore := containerOwnershipFootprintSnapshot(t, c, rec.Name)
+				if applied, err := RekeyContainerOwnerGuarded(ctx, c, *src, "h2"); err != nil || applied {
+					t.Fatalf("provisional local rekey: applied=%v err=%v", applied, err)
+				}
+				if rowsAfter := containerRowsSnapshot(t, c, rec.Name); rowsAfter != rowsBefore {
+					t.Fatalf("refused local rekey changed container rows:\nbefore=%s\nafter=%s",
+						rowsBefore, rowsAfter)
+				}
+				if footprintAfter := containerOwnershipFootprintSnapshot(
+					t, c, rec.Name,
+				); footprintAfter != footprintBefore {
+					t.Fatalf("refused local rekey changed footprint:\nbefore=%s\nafter=%s",
+						footprintBefore, footprintAfter)
+				}
+				finish(t, c, op, rec, action)
+			})
+		}
+	})
+
+	t.Run("delayed guarded replay", func(t *testing.T) {
+		for _, action := range []string{"commit", "rollback"} {
+			t.Run(action, func(t *testing.T) {
+				c, op, rec := begin(t, "remote-"+action)
+				seedFootprint(t, c)
+				src, err := GetContainer(ctx, c, rec.HostName, rec.Name)
+				if err != nil || src == nil {
+					t.Fatalf("source: got=%+v err=%v", src, err)
+				}
+				guard, err := containerRekeyMutationGuard(*src, "h2")
+				if err != nil {
+					t.Fatal(err)
+				}
+				target, err := rekeyContainerStmt(c, *src, "h2", delayed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stmts := []Statement{
+					{SQL: target.SQL, Params: target.Params, Guard: guard},
+					{
+						SQL: containerRekeyInterfaceCleanupSQL,
+						Params: []interface{}{
+							"2026-07-29T12:00:00Z", delayed, src.HostName, src.Name,
+						},
+						Guard: guard,
+					},
+					{
+						SQL: containerRekeyLeaseSQL,
+						Params: []interface{}{
+							"h2", "2026-07-29T12:00:00Z", delayed, src.HostName, src.Name,
+						},
+						Guard: guard,
+					},
+					{
+						SQL: containerDeleteSQL,
+						Params: []interface{}{
+							"2026-07-29T12:00:00Z", delayed, src.HostName, src.Name,
+							src.OwnerEpoch, src.SpecGeneration,
+						},
+						Guard: guard,
+					},
+				}
+				raw, err := json.Marshal(stmts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rowsBefore := containerRowsSnapshot(t, c, rec.Name)
+				footprintBefore := containerOwnershipFootprintSnapshot(t, c, rec.Name)
+				applyMutationEntry(t, c, &pb.MutationEntry{
+					Seq: 1, Hlc: delayed, Origin: "provisional-rekey-" + action,
+					Stmts: string(raw),
+				})
+				if rowsAfter := containerRowsSnapshot(t, c, rec.Name); rowsAfter != rowsBefore {
+					t.Fatalf("declined replay changed container rows:\nbefore=%s\nafter=%s",
+						rowsBefore, rowsAfter)
+				}
+				if footprintAfter := containerOwnershipFootprintSnapshot(
+					t, c, rec.Name,
+				); footprintAfter != footprintBefore {
+					t.Fatalf("declined replay changed footprint:\nbefore=%s\nafter=%s",
+						footprintBefore, footprintAfter)
+				}
+				finish(t, c, op, rec, action)
+			})
+		}
+	})
+}
+
+func TestContainerRekeySourceSafetyAxes(t *testing.T) {
+	cases := []struct {
+		name              string
+		state             string
+		activeOperationID string
+		want              bool
+	}{
+		{name: "safe running source", state: "running", want: true},
+		{name: "creating without barrier", state: "creating"},
+		{name: "provisional without barrier", state: "provisional"},
+		{name: "running with active barrier", state: "running", activeOperationID: "op-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := containerRekeySourceSafe(
+				tc.state, "", "", tc.activeOperationID,
+			); got != tc.want {
+				t.Fatalf("containerRekeySourceSafe(%q, active=%q)=%v, want %v",
+					tc.state, tc.activeOperationID, got, tc.want)
+			}
+		})
+	}
+}
+
+func containerRowsSnapshot(t *testing.T, c *Client, name string) string {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT * FROM containers WHERE name = ? ORDER BY host_name`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }

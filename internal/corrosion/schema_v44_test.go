@@ -249,12 +249,27 @@ func TestSchemaV44RecordRoundTripsPreserveFields(t *testing.T) {
 		t.Fatalf("container update lost lifecycle fields: got=%v err=%v", gotCT, err)
 	}
 	applied, err := RekeyContainerOwnerGuarded(ctx, c, *gotCT, "h2")
+	if err != nil || applied {
+		t.Fatalf("re-key container with active operation: applied=%v err=%v", applied, err)
+	}
+	if _, err := c.db.Exec(
+		`UPDATE containers SET active_operation_id = ''
+		 WHERE host_name = ? AND name = ?`,
+		gotCT.HostName, gotCT.Name,
+	); err != nil {
+		t.Fatalf("clear completed operation barrier: %v", err)
+	}
+	gotCT, err = GetContainer(ctx, c, "h1", "ct1")
+	if err != nil || gotCT == nil {
+		t.Fatalf("get re-keyable container: got=%v err=%v", gotCT, err)
+	}
+	applied, err = RekeyContainerOwnerGuarded(ctx, c, *gotCT, "h2")
 	if err != nil || !applied {
-		t.Fatalf("re-key container: applied=%v err=%v", applied, err)
+		t.Fatalf("re-key container after clearing operation: applied=%v err=%v", applied, err)
 	}
 	gotCT, err = GetContainer(ctx, c, "h2", "ct1")
 	if err != nil || gotCT == nil ||
-		gotCT.OwnerEpoch != 7 || gotCT.SpecGeneration != 9 || gotCT.ActiveOperationID != "op-1" {
+		gotCT.OwnerEpoch != 7 || gotCT.SpecGeneration != 9 || gotCT.ActiveOperationID != "" {
 		t.Fatalf("container re-key lost lifecycle fields: got=%v err=%v", gotCT, err)
 	}
 

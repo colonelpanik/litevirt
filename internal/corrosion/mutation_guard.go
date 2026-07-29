@@ -307,7 +307,9 @@ func workloadRekeyGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationG
 	}
 	ct.IsTemplate = isTemplate != 0
 	if sourceDeleted.Valid && sourceDeleted.String != "" ||
-		!containerRekeySourceSafe(sourceState, sourceDetail, ct.RelocateToken) ||
+		!containerRekeySourceSafe(
+			sourceState, sourceDetail, ct.RelocateToken, ct.ActiveOperationID,
+		) ||
 		ct.OwnerEpoch != guard.OwnerEpoch ||
 		ct.SpecGeneration != guard.SpecGeneration ||
 		ct.ActiveOperationID != guard.OperationID ||

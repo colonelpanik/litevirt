@@ -452,8 +452,9 @@ func RekeyContainerOwnerGuarded(ctx context.Context, c *Client, src ContainerRec
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
 
-func containerRekeySourceSafe(state, detail, relocateToken string) bool {
-	if relocateToken != "" ||
+func containerRekeySourceSafe(state, detail, relocateToken, activeOperationID string) bool {
+	if relocateToken != "" || activeOperationID != "" ||
+		state == "creating" || state == "provisional" ||
 		state == "pending" || state == "migrating" || state == "relocating" {
 		return false
 	}
@@ -465,18 +466,21 @@ func containerRekeyPreflight(
 ) (bool, error) {
 	// (a) source row still live, unchanged since observed, and outside any
 	// relocation/migration state machine.
-	var state, detail, token, updatedAt string
+	var state, detail, token, activeOperationID, updatedAt string
 	err := tx.QueryRowContext(ctx,
-		`SELECT state, COALESCE(state_detail,''), COALESCE(relocate_token,''), updated_at
+		`SELECT state, COALESCE(state_detail,''), COALESCE(relocate_token,''),
+		        active_operation_id, updated_at
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-		src.HostName, src.Name).Scan(&state, &detail, &token, &updatedAt)
+		src.HostName, src.Name).
+		Scan(&state, &detail, &token, &activeOperationID, &updatedAt)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if updatedAt != src.UpdatedAt || !containerRekeySourceSafe(state, detail, token) {
+	if updatedAt != src.UpdatedAt ||
+		!containerRekeySourceSafe(state, detail, token, activeOperationID) {
 		return false, nil
 	}
 	// (b) no LIVE target row may exist (only a soft-deleted one may be replaced).

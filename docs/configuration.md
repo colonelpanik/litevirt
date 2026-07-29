@@ -550,6 +550,7 @@ and the bypass is audited.
 | `LV_HOST` | CLI: default remote gRPC/mTLS target (`host` or `host:port`; a legacy `user@host` prefix is ignored) |
 | `LV_TOKEN` | CLI: bearer token to authenticate gRPC calls. Overrides the credential stored by `lv login`. |
 | `LITEVIRT_UNSAFE_NO_KILLMODE_CHECK` | Skip startup `KillMode=process` self-check (development / non-systemd hosts only). Default check protects against unit-file regressions that would kill child QEMU processes on daemon stop. |
+| `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK` | Skip the startup capability-rollback self-check. That check looks for durable activation markers naming tokens this binary has never heard of — proof a newer binary ran here — and puts the node under WAL quarantine: it stays up and reachable but emits no replicated writes and advertises no capabilities, so peers see it degraded and nothing new latches across it. Set this only after reseeding the node's state, or to start a rolled-back binary deliberately. |
 | `LITEVIRT_OTEL_ENDPOINT` | Telemetry: OTLP endpoint; turns logs+traces export on. Overrides `telemetry.otlp_endpoint`. |
 | `LITEVIRT_OTEL_HEADERS` | Telemetry: OTLP headers, e.g. `Authorization=Basic <b64>` (collector auth — keep in env, not the config file). |
 | `LITEVIRT_LOG_LEVEL` | Telemetry: log level `TRACE`\|`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`\|`CRITICAL`. |

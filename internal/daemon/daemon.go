@@ -96,6 +96,13 @@ type Daemon struct {
 	// flip on confirm). Set once in startUpgradeWatchdog, read in Run.
 	upgradePending bool
 
+	// rolledBackTokens names capability tokens this node already latched that this
+	// binary has never heard of — i.e. this binary is a rollback below them. Set at
+	// startup by preflightCapabilityRollback. Non-empty puts the node under WAL
+	// quarantine: it stays UP and reachable, so peers can see it and an operator can
+	// reseed it, but it emits no replicated writes.
+	rolledBackTokens []string
+
 	// exitFunc terminates the process on a watchdog rollback. Defaults to os.Exit;
 	// overridable in tests.
 	exitFunc func(int)
@@ -259,6 +266,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := preflightWatchdog(d.cfg.WatchdogDev); err != nil {
 		return fmt.Errorf("preflight: %w", err)
 	}
+	// Pre-flight: detect that this binary is a rollback below a capability token
+	// this node already latched. Deliberately NOT fatal. Exiting non-zero here
+	// would, under the unit's OnFailure rollback, be a rollback loop; and the node
+	// has to stay up anyway so peers can see it degraded and an operator can reseed
+	// it. Fail-closed happens at the write path instead, wired below.
+	if toks := preflightCapabilityRollback(d.cfg.DataDir); len(toks) > 0 {
+		d.rolledBackTokens = toks
+		slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
+			"already latched; entering WAL quarantine — no replicated writes will be emitted "+
+			"until this node is upgraded again or reseeded by an operator",
+			"tokens", toks)
+	}
+	// Install the quarantine before InitSchema so nothing this daemon does can
+	// emit. Local-only execs (schema DDL, replication apply) stay open by design,
+	// so a reseed still works.
+	d.db.SetWriteQuarantine(func() string {
+		if len(d.rolledBackTokens) == 0 {
+			return ""
+		}
+		return "rolled back below latched token(s): " + strings.Join(d.rolledBackTokens, ",")
+	})
 
 	// Initialize corrosion schema
 	if err := corrosion.InitSchema(ctx, d.db); err != nil {
@@ -799,6 +827,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// advertisedCapabilities, which reads this predicate. (Storage is atomic, so a late wire
 	// is race-free regardless, but wiring first means a self-fence is honored immediately.)
 	svc.SetWatchdogFenced(watchdogCtrl.Fenced)
+	// A rolled-back node stops advertising capabilities, so the cluster cannot
+	// latch anything further across a member that could not honour it, and peers
+	// raise ha_degraded against it.
+	svc.SetWALQuarantined(func() bool { return len(d.rolledBackTokens) > 0 })
 	go vipDemoter.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.

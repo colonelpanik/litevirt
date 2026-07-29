@@ -356,6 +356,8 @@ type Server struct {
 	// advertisedCapabilities before the daemon wires this in, so the read must not race the
 	// write. Unset (nil) → never fenced.
 	watchdogFenced atomic.Pointer[func() bool]
+	// walQuarantined reports a rollback below an already-latched capability token.
+	walQuarantined atomic.Pointer[func() bool]
 
 	// hwV2Ready is the CONTRACT h advertise-readiness flag: set at the END of a
 	// successful BackfillHardwareTables, once the audit pass has classified every
@@ -376,6 +378,20 @@ func (s *Server) SetDemotionUnfenced(on bool) { s.demotionUnfenced.Store(on) }
 // SetWatchdogFenced injects the self-fenced predicate (Phase 2 defense-in-depth).
 func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced.Store(&fn) }
 
+// SetWALQuarantined injects the predicate reporting that this node is under WAL
+// quarantine — it is running a binary rolled back below a capability token it had
+// already latched, so it emits no replicated writes. Nil-safe: unset ⇒ not
+// quarantined, which is every healthy node.
+func (s *Server) SetWALQuarantined(fn func() bool) { s.walQuarantined.Store(&fn) }
+
+// walQuarantinedNow reports whether this node is currently WAL-quarantined.
+func (s *Server) walQuarantinedNow() bool {
+	if fn := s.walQuarantined.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return false
+}
+
 // advertisedCapabilities is Supported() as-is — vip_demote_v1 is a SOFTWARE capability
 // advertised by every new-binary node regardless of any hardware watchdog (the decouple:
 // self-demotion runs without one; the watchdog is only an optional self-fence backstop).
@@ -395,6 +411,15 @@ func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced.Store(&fn)
 // fence proof, never on the token, and peers already latched keep enforcing regardless.
 func (s *Server) advertisedCapabilities() []string {
 	if s.selfFenced() {
+		return []string{}
+	}
+	// A WAL-quarantined node is a rollback below something this cluster already
+	// latched. It advertises NOTHING, for the same reason a self-fenced node does:
+	// presenting as a healthy participant would let the cluster latch further
+	// tokens across a member that cannot honour them. Peers see the gap and raise
+	// ha_degraded; every peer already latched keeps enforcing, because the latch is
+	// monotone. That is exactly the bounded state this is meant to produce.
+	if s.walQuarantinedNow() {
 		return []string{}
 	}
 	caps := capabilities.Supported()

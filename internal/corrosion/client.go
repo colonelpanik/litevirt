@@ -218,6 +218,38 @@ type Client struct {
 	// already-emitted canonical wire shape must never be revoked (turning the flag off would
 	// otherwise stall replication on an in-flight canonical entry). Nil/false ⇒ reject (pre-H2).
 	canonicalRegistryAccept func() bool
+
+	// writeQuarantine, when set and returning a non-empty reason, makes every
+	// REPLICATED write refuse. Wired at daemon start to the capability-rollback
+	// self-check: a node running a binary below a token it already latched must
+	// stop emitting, because the rest of the cluster has moved past it. Nil ⇒ no
+	// quarantine, which is every healthy node.
+	writeQuarantine func() string
+}
+
+// SetWriteQuarantine injects the predicate that refuses replicated writes, returning
+// the reason to report or "" to allow them. Nil-safe: unset means no quarantine.
+//
+// It gates the two REPLICATED batch writers only. The local-only exec helpers stay
+// open on purpose — they carry incoming replication and a reseed, and a node that
+// cannot receive could never be repaired, only rebuilt.
+func (c *Client) SetWriteQuarantine(fn func() string) { c.writeQuarantine = fn }
+
+// quarantineReason returns why replicated writes are currently refused, or "".
+func (c *Client) quarantineReason() string {
+	if c.writeQuarantine == nil {
+		return ""
+	}
+	return c.writeQuarantine()
+}
+
+// errQuarantined is the refusal both replicated writers return. It fails the WHOLE
+// write rather than just suppressing the mutation-log row: committing the
+// application statements while dropping the log entry would leave this node
+// carrying changes no peer will ever see, which is the precise failure the
+// quarantine exists to prevent.
+func errQuarantined(reason string) error {
+	return fmt.Errorf("write refused: node is under WAL quarantine (%s); operator reseed required", reason)
 }
 
 // SetCanonicalIdentity injects the predicate that enables natural-key identity resolution.
@@ -778,6 +810,9 @@ func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
 // the writes. Returns applied=false (no error) when the guard declines, so the
 // caller treats that as "preconditions no longer hold — skip and retry later".
 func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx) (bool, error), stmts []Statement) (bool, error) {
+	if reason := c.quarantineReason(); reason != "" {
+		return false, errQuarantined(reason)
+	}
 	c.mu.Lock()
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -871,6 +906,9 @@ func isGuardedTransitionSQL(sql string) bool {
 }
 
 func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify bool) (int64, error) {
+	if reason := c.quarantineReason(); reason != "" {
+		return 0, errQuarantined(reason)
+	}
 	c.mu.Lock()
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {

@@ -515,17 +515,26 @@ func auditSigningKeyIsMonotone(tx *sql.Tx, table syncTable, row []interface{}, p
 	if err != nil || !found {
 		return auditEvidencePassThrough, "", err
 	}
-	if cellStr(localRow, idx, "retired_at") != "" {
-		// Retirement is monotone. Un-retiring a key, or moving its boundary
-		// forward, is the one edit that makes the RetiredKeyUse finding disappear
-		// on every peer at once — refused regardless of how new the incoming
-		// clock claims to be. The EARLIER boundary is the strict one, so a later
-		// one is a weakening even though both rows look retired.
-		if cellStr(row, idx, "retired_at") == "" {
-			return auditEvidenceKeepLocal, "audit_key_unretire", nil
-		}
-		if cellInt64(row, idx, "retired_at_seq") > cellInt64(localRow, idx, "retired_at_seq") {
+	// Retirement is monotone in BOTH directions of the merge, and it has to be.
+	// Refusing a weakening only makes the local copy sticky; the node that
+	// cleared its own retired_at wrote the clock on that row too, so under LWW it
+	// would keep the un-retired version forever and go on accepting the leaked
+	// key's signatures while every peer reported them. Strictly-more-retired
+	// therefore WINS regardless of clock, in whichever direction it arrives. The
+	// EARLIER boundary is the strict one, so a later one is a weakening even
+	// though both rows look retired.
+	localRetired, incomingRetired := cellStr(localRow, idx, "retired_at"), cellStr(row, idx, "retired_at")
+	switch {
+	case localRetired != "" && incomingRetired == "":
+		return auditEvidenceKeepLocal, "audit_key_unretire", nil
+	case localRetired == "" && incomingRetired != "":
+		return auditEvidenceHeal, "audit_key_retirement_learned", nil
+	case localRetired != "" && incomingRetired != "":
+		switch li, ri := cellInt64(localRow, idx, "retired_at_seq"), cellInt64(row, idx, "retired_at_seq"); {
+		case ri > li:
 			return auditEvidenceKeepLocal, "audit_key_boundary_raised", nil
+		case ri < li:
+			return auditEvidenceHeal, "audit_key_boundary_tightened", nil
 		}
 	}
 	// The incoming copy is live and does not weaken anything. If the LOCAL row is

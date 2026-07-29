@@ -854,9 +854,11 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 					merged++
 				}
 				c.deferAfterCommit(tx, func() {
-					slog.Warn("anti-entropy: restored audit tamper-evidence that was deleted "+
-						"locally, from a peer's copy. Something removed it on this node — "+
-						"nothing in litevirt does", "table", tbl, "pk", pk, "reason", reason)
+					slog.Warn("anti-entropy: took a peer's stricter copy of audit tamper-evidence "+
+						"over the local one, ignoring clock order. The local copy was weaker — "+
+						"deleted, un-retired, or retired at a looser boundary — and nothing in "+
+						"litevirt produces that state",
+						"table", tbl, "pk", pk, "reason", reason)
 				})
 				continue
 			}

@@ -560,3 +560,77 @@ func TestAuditMerge_HealingDoesNotUnretireAKey(t *testing.T) {
 			"monotone check")
 	}
 }
+
+// TestAuditMerge_LearnsARetirementOverAnUnbeatableLocalClock is the same lesson
+// the tombstone taught, applied to retirement — and again the lab is what asked.
+//
+// On the live cluster node-2 cleared its own retired_at with a year-2999 clock.
+// Every peer refused the erasure and kept the retirement, which is the point of
+// the monotone rule. But node-2 kept its un-retired copy: it wrote that clock, so
+// nothing a peer could honestly send would ever outrank it. The compromised node
+// went on accepting the leaked key's signatures while every neighbour reported
+// them.
+//
+// Sticky is not monotone. Strictly-more-retired has to WIN, in whichever
+// direction of the merge it arrives.
+func TestAuditMerge_LearnsARetirementOverAnUnbeatableLocalClock(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	id := kr.KeyID()
+	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+id+`'`)
+	// This node's row is un-retired and carries a clock no honest peer can beat.
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET updated_at = ? WHERE key_id = ?`,
+		"2999-01-01T00:00:00Z", id); err != nil {
+		t.Fatalf("stamp the local clock: %v", err)
+	}
+
+	// A peer that knows about the retirement, speaking with an ordinary clock.
+	incoming := []interface{}{
+		id, "node-0", cert, "2026-07-29T11:00:00Z", int64(1),
+		"2026-07-29T10:00:00Z", "2026-07-29T11:00:00Z", nil,
+	}
+	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
+
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+id+`' AND retired_at IS NOT NULL`); n != 1 {
+		t.Fatalf("a retirement known to a peer never reached this node, because the local row " +
+			"carried a newer clock\nthe node that cleared its own retired_at wrote that clock, " +
+			"so refusing the weakening is not enough — the retirement has to win outright")
+	}
+}
+
+// TestAuditMerge_TakesTheStricterBoundary.
+//
+// Two nodes can disagree about where a key's boundary sits. The earlier sequence
+// is the strict one: it flags every row the later one would have re-authorised,
+// so it is the only safe direction to converge in.
+func TestAuditMerge_TakesTheStricterBoundary(t *testing.T) {
+	ctx := context.Background()
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
+	rotateTo(t, c, dir, "node-0") // retires the old key at seq 2
+
+	oldID := oldKR.KeyID()
+	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+oldID+`'`)
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET updated_at = ? WHERE key_id = ?`,
+		"2999-01-01T00:00:00Z", oldID); err != nil {
+		t.Fatalf("stamp the local clock: %v", err)
+	}
+
+	incoming := []interface{}{
+		oldID, "node-0", cert, "2026-07-29T11:00:00Z", int64(1),
+		"2026-07-29T10:00:00Z", "2026-07-29T11:00:00Z", nil,
+	}
+	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
+
+	if got := oneCol(t, c,
+		`SELECT retired_at_seq FROM audit_signing_keys WHERE key_id = '`+oldID+`'`); got != "1" {
+		t.Fatalf("retired_at_seq is %q, want the stricter boundary 1; a node holding the looser "+
+			"one keeps accepting signatures every peer already flags", got)
+	}
+}

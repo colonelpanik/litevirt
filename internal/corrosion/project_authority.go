@@ -163,6 +163,45 @@ func RetireProjectAuthority(ctx context.Context, c *Client, project string) erro
 		nowRFC3339(), c.NowTS(), projectOrDefault(project))
 }
 
+// ReconcileOrphanedProjectAuthority retires authority still held by projects that
+// no longer exist, returning how many it retired.
+//
+// Retiring on delete only helps projects deleted from now on. Every project
+// deleted before that landed still holds live authority, and nothing else will
+// ever collect it: the operation reaper only touches terminal operations, and an
+// authority row never becomes terminal on its own. So these rows sit live
+// indefinitely for names that are gone, which is how a lab ended up with five.
+//
+// _default is excluded explicitly. It is treated as always existing even when no
+// row lists it, and retiring its authority would leave every untenanted admission
+// in the cluster with no decider.
+//
+// Idempotent by construction — the scan only matches live authority for a
+// tombstoned project — so the hourly GC that calls it does no work once clean.
+func ReconcileOrphanedProjectAuthority(ctx context.Context, c *Client) (int, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT a.project AS project
+		 FROM project_authority_epochs a
+		 JOIN projects p ON p.name = a.project
+		 WHERE a.deleted_at IS NULL AND p.deleted_at IS NOT NULL AND a.project <> ?`,
+		DefaultProject)
+	if err != nil {
+		return 0, err
+	}
+	retired := 0
+	for _, r := range rows {
+		project := r.String("project")
+		if project == "" {
+			continue
+		}
+		if rerr := RetireProjectAuthority(ctx, c, project); rerr != nil {
+			return retired, fmt.Errorf("retire authority for deleted project %q: %w", project, rerr)
+		}
+		retired++
+	}
+	return retired, nil
+}
+
 // TakeoverProjectAuthority mints epoch = expectedPrevEpoch+1 with the new holder.
 // transferKind must be "planned" (an explicit relinquish/handoff) or "fenced" (an
 // unplanned takeover, which REQUIRES fenceProofRef — proof the prior holder was

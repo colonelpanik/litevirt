@@ -1805,6 +1805,15 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 		} else if reaped > 0 {
 			slog.Info("operation reaper", "reaped", reaped)
 		}
+		// Authority still held by projects that no longer exist. Retiring on delete
+		// is forward-only, so anything deleted before that landed keeps live
+		// authority forever — nothing else collects it, because an authority row
+		// never becomes terminal on its own. A recreated name would inherit it.
+		if retired, perr := corrosion.ReconcileOrphanedProjectAuthority(ctx, d.db); perr != nil {
+			slog.Warn("orphaned project-authority reconcile", "error", perr)
+		} else if retired > 0 {
+			slog.Info("retired authority held by deleted projects", "count", retired)
+		}
 		// Orphaned admission leases (F2). A reserve-then-verify lease lives for one
 		// RPC, so anything this old is a crash between reserve and release — which
 		// the terminal reaper above can never collect, because an abandoned lease

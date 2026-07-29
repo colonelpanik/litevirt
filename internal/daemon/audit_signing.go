@@ -31,23 +31,78 @@ func (d *Daemon) setupAuditSigning(ctx context.Context) error {
 		return err
 	}
 	d.db.SetAuditKeyring(keyring)
+	adoptAuditKey(ctx, d, keyring)
+	slog.Info("audit signing enabled", "host", d.cfg.HostName, "key_id", keyring.KeyID(),
+		"dedicated_key", corrosion.UsesDedicatedAuditKey(d.cfg.PKIDir))
+	return nil
+}
 
-	// AdoptAuditKey publishes the certificate AND completes a rotation if this
-	// host is now holding a different key than the one it last published. Doing
-	// it here rather than in a rotate RPC is deliberate: a host is the only
-	// party that can know which key it actually holds, and the only one that can
-	// sign the chain head that seals what the superseded key wrote. So rotation
-	// is "replace the files, restart" with no coordination at all.
-	if _, err := corrosion.AdoptAuditKey(ctx, d.db, d.cfg.HostName); err != nil {
+// shouldCompleteAuditKeyRotation reports whether a starting daemon must adopt a
+// dedicated audit signing pair even though it is not configured to sign.
+//
+// The pair only gets onto a host one way — `lv host rotate-audit-key` — and that
+// command is only run for one reason: a signing key that may be in someone
+// else's hands. Gating the adoption on enforcement.audit_signature meant that on
+// a default-configured host the rotation did nothing at all while reporting
+// success, so the leaked key stayed the only published signing identity.
+func shouldCompleteAuditKeyRotation(cfg *Config) bool {
+	return !cfg.Enforcement.AuditSignature && corrosion.UsesDedicatedAuditKey(cfg.PKIDir)
+}
+
+// completeAuditKeyRotation adopts a dedicated audit signing pair on a host that
+// is NOT configured to sign.
+//
+// `lv host rotate-audit-key` exists to answer a key that may have leaked, and it
+// told the operator their old key had been retired and the history it wrote
+// sealed. On a host with enforcement.audit_signature off — the default, and the
+// state of any cluster that has not opted in — none of that happened: the whole
+// adoption path hung off the flag, so the restart published nothing, retired
+// nothing and sealed nothing, and the command still exited 0 with the success
+// text. An operator rotating because the key was world-readable closed the
+// incident on a promise that was not kept.
+//
+// Adoption is therefore unconditional once the pair is on disk: installing it is
+// an explicit operator act, and sealing the superseded key's history is exactly
+// what the rotation was for. The flag keeps its meaning — this host still does
+// not sign new rows — so the keyring wired onto the client is VERIFY-ONLY.
+//
+// That also gives a non-enforcing node a working `lv audit verify`, which the
+// rotation command tells the operator to run. A node with no keyring at all
+// reports every signed row as unverifiable, which is not a confirmation of
+// anything.
+func (d *Daemon) completeAuditKeyRotation(ctx context.Context) error {
+	keyring, err := corrosion.LoadAuditKeyring(d.cfg.PKIDir, d.cfg.HostName)
+	if err != nil {
+		return err
+	}
+	verifier, err := corrosion.LoadAuditVerifier(d.cfg.PKIDir)
+	if err != nil {
+		return err
+	}
+	d.db.SetAuditKeyring(verifier)
+	adoptAuditKey(ctx, d, keyring)
+	slog.Warn("adopted a dedicated audit signing key, but enforcement.audit_signature is off: "+
+		"the previous key is retired and its history sealed, and NEW rows are still written "+
+		"unsigned. Turn the flag on fleet-wide to make them tamper-evident",
+		"host", d.cfg.HostName, "key_id", keyring.KeyID())
+	return nil
+}
+
+// adoptAuditKey publishes the certificate AND completes a rotation if this host
+// is now holding a different key than the one it last published.
+//
+// Doing it in the daemon rather than in a rotate RPC is deliberate: a host is
+// the only party that can know which key it actually holds, and the only one
+// that can sign the chain head that seals what the superseded key wrote. So
+// rotation is "replace the files, restart" with no coordination at all.
+func adoptAuditKey(ctx context.Context, d *Daemon, keyring *corrosion.AuditKeyring) {
+	if _, err := corrosion.AdoptAuditKey(ctx, d.db, keyring, d.cfg.HostName); err != nil {
 		// Signing still works; peers just cannot verify until this lands. Worth
 		// an error rather than a warning, because a chain nobody else can check
 		// is the failure mode this whole design exists to avoid.
 		slog.Error("audit signing key could not be published; peers cannot verify this "+
 			"host's chain until it is", "error", err)
 	}
-	slog.Info("audit signing enabled", "host", d.cfg.HostName, "key_id", keyring.KeyID(),
-		"dedicated_key", corrosion.UsesDedicatedAuditKey(d.cfg.PKIDir))
-	return nil
 }
 
 // runAuditChainHeads periodically publishes this host's signed chain head.

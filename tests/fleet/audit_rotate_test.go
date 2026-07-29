@@ -41,7 +41,7 @@ func rotateNode(t *testing.T, c *Cluster, n *Node) *corrosion.AuditKeyring {
 		t.Fatalf("LoadAuditKeyring after rotation on %s: %v", n.Name, err)
 	}
 	n.DB.SetAuditKeyring(kr)
-	if _, err := corrosion.AdoptAuditKey(context.Background(), n.DB, n.Name); err != nil {
+	if _, err := corrosion.AdoptAuditKey(context.Background(), n.DB, kr, n.Name); err != nil {
 		t.Fatalf("AdoptAuditKey on %s: %v", n.Name, err)
 	}
 	return kr

@@ -146,7 +146,12 @@ at risk. That separation is the reason the audit key is its own certificate.
 
 On the next start the daemon publishes the new certificate, retires the old key
 at the sequence its chain has reached, and signs a chain head **with the new key**
-over the whole existing log. That last step is what rotation is for: from then on,
+over the whole existing log. That happens **whether or not
+`enforcement.audit_signature` is on** — the flag decides whether new rows get
+signed, not whether a rotation completes, and a rotation that quietly did nothing
+on a default-configured host would leave the leaked key as the only published
+identity while the command reported the incident closed. The command tells you
+which of the two states the host is in. That last step is what rotation is for: from then on,
 altering any row the old key wrote contradicts a head whoever holds that key
 cannot forge. What it cannot do is repair a log that was already forged before
 anyone noticed — no scheme can.

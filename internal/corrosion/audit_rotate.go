@@ -64,8 +64,14 @@ func ActiveAuditKeyID(ctx context.Context, c *Client, hostName string) (string, 
 // the head that seals what the old key wrote.
 //
 // Returns the key id retired by this call, or "" if nothing was rotated.
-func AdoptAuditKey(ctx context.Context, c *Client, hostName string) (string, error) {
-	keyring := c.AuditKeyringOf()
+// The keyring is passed in rather than read off the client, because adoption is
+// not the same decision as signing. A host that has been handed a dedicated
+// audit signing pair must complete the rotation — publish, retire, seal —
+// whether or not enforcement.audit_signature is on, since leaving the key it
+// replaced un-retired is the failure the operator ran the rotation to avoid.
+// Whether the host then SIGNS with it is the flag's business, and the flag's
+// alone.
+func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (string, error) {
 	if !keyring.CanSign() {
 		return "", nil
 	}
@@ -121,7 +127,33 @@ func AdoptAuditKey(ctx context.Context, c *Client, hostName string) (string, err
 
 // supersededAuditKeys lists this host's published, non-retired keys other than
 // the one it now holds.
+//
+// A key that is ITSELF retired supersedes nothing. Without that rule, rotation
+// was undoable by the party it was performed against: start the daemon once with
+// the old key back in place — a restored backup, a second instance, or whoever
+// kept the copy that prompted the rotation — and "every other non-retired key"
+// selects the key that just REPLACED it. PublishSigningKey re-inserts the old
+// row without clearing retired_at, so the old key stays retired and, in the same
+// breath, retires its successor at the tail seq of the moment. From then on
+// every row the legitimate key signs is past a retirement boundary,
+// `lv audit verify` reports the whole live chain as tampered on every node, and
+// the leaked key is the one doing the signing.
 func supersededAuditKeys(ctx context.Context, c *Client, hostName, currentKeyID string) ([]string, error) {
+	retiredNow, err := c.Query(ctx,
+		`SELECT retired_at FROM audit_signing_keys
+		 WHERE key_id = ? AND deleted_at IS NULL AND retired_at IS NOT NULL`, currentKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("check retirement of audit key %s: %w", currentKeyID, err)
+	}
+	if len(retiredNow) > 0 {
+		slog.Error("this host is holding an audit signing key that has already been RETIRED; "+
+			"it will not be treated as a rotation and will retire nothing. Every row signed "+
+			"with it is reported as retired-key use on every node. If this node was restored "+
+			"from a backup, install the current key; if it was not, the key that was rotated "+
+			"away is in use on this machine",
+			"host", hostName, "key_id", currentKeyID)
+		return nil, nil
+	}
 	rows, err := c.Query(ctx,
 		`SELECT key_id FROM audit_signing_keys
 		 WHERE host_name = ? AND deleted_at IS NULL AND retired_at IS NULL AND key_id <> ?

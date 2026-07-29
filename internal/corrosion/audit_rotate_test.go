@@ -33,7 +33,7 @@ func rotateTo(t *testing.T, c *Client, dir, hostName string) *AuditKeyring {
 		t.Fatalf("LoadAuditKeyring after rotation: %v", err)
 	}
 	c.SetAuditKeyring(kr)
-	if _, err := AdoptAuditKey(context.Background(), c, hostName); err != nil {
+	if _, err := AdoptAuditKey(context.Background(), c, kr, hostName); err != nil {
 		t.Fatalf("AdoptAuditKey: %v", err)
 	}
 	return kr
@@ -175,7 +175,7 @@ func TestRotation_IsIdempotent(t *testing.T) {
 	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
 
 	for i := 0; i < 3; i++ {
-		retiredKey, err := AdoptAuditKey(ctx, c, "node-0")
+		retiredKey, err := AdoptAuditKey(ctx, c, c.AuditKeyringOf(), "node-0")
 		if err != nil {
 			t.Fatalf("AdoptAuditKey pass %d: %v", i, err)
 		}
@@ -289,4 +289,63 @@ func regenHostCert(dir, hostName string) error {
 		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
 		filepath.Join(dir, pki.AuditSigningCertName), filepath.Join(dir, pki.AuditSigningKeyName),
 		hostName)
+}
+
+// TestRotation_ARetiredKeyCannotUnrotateItsSuccessor.
+//
+// The one who kept a copy of the old key is the reason rotation exists, so they
+// are the party the mechanism has to survive. Booting a daemon with the old key
+// back in place — a restored backup, a second instance, or a machine they still
+// control — used to select "any other non-retired key for this host" as
+// superseded, which after a rotation is the key that REPLACED it.
+//
+// PublishSigningKey re-inserts the old row without clearing retired_at, so the
+// old key stayed retired and, in the same breath, retired its successor at the
+// tail seq of the moment. Every row the legitimate key then signed sat past a
+// retirement boundary: `lv audit verify` reported the live chain as tampered on
+// every node, litevirt_audit_chain_last_verified_ok went to 0 cluster-wide, and
+// the leaked key was the one still signing. Rotation was undoable by exactly the
+// party it was performed against.
+func TestRotation_ARetiredKeyCannotUnrotateItsSuccessor(t *testing.T) {
+	ctx := context.Background()
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	newKR := rotateTo(t, c, dir, "node-0")
+	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
+	if res := verify(t, c); res.Tampered() {
+		t.Fatalf("the log is not clean after a legitimate rotation: %+v", res)
+	}
+
+	// The attacker puts the old key back and starts the daemon.
+	c.SetAuditKeyring(oldKR)
+	if _, err := AdoptAuditKey(ctx, c, oldKR, "node-0"); err != nil {
+		t.Fatalf("AdoptAuditKey with the retired key: %v", err)
+	}
+
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+newKR.KeyID()+`' AND retired_at IS NOT NULL`); n != 0 {
+		t.Fatalf("booting with the RETIRED key retired its successor %s\n"+
+			"every row the legitimate key signs is now past a retirement boundary, so the "+
+			"whole live chain reads as tampered on every node — while the leaked key signs",
+			newKR.KeyID())
+	}
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldKR.KeyID()+`' AND retired_at IS NOT NULL`); n != 1 {
+		t.Fatalf("the old key un-retired itself by being republished")
+	}
+}
+
+// TestRotation_StillRetiresAGenuinelySupersededKey is the guard against fixing
+// the above by simply never retiring anything.
+func TestRotation_StillRetiresAGenuinelySupersededKey(t *testing.T) {
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	rotateTo(t, c, dir, "node-0")
+
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldKR.KeyID()+`' AND retired_at IS NOT NULL`); n != 1 {
+		t.Fatalf("a genuine rotation did not retire the key it superseded; the whole "+
+			"retired-key finding would never fire")
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/ssh"
@@ -109,8 +110,41 @@ func HostRotateAuditKey(ctx context.Context, hostName, sshTarget string) error {
 	fmt.Println("  seals every row the old key wrote — altering one now contradicts a head the holder")
 	fmt.Println("  of the old key cannot forge")
 	fmt.Println("  the retired certificate is kept, so rows it signed stay verifiable")
+
+	// The line above used to be printed unconditionally, and on a host with
+	// enforcement.audit_signature off it was simply false: adoption hung off the
+	// flag, so the restart published nothing and retired nothing. That is fixed
+	// on the daemon side, but the flag still decides whether NEW rows are signed
+	// — and an operator who rotates because a key leaked needs to know that the
+	// replacement is not yet protecting anything. Read it from the target rather
+	// than guessing.
+	reportRemoteSigningState(sc, hostName)
+
 	fmt.Println("  Confirm with: lv audit verify")
 	return nil
+}
+
+// reportRemoteSigningState says whether the rotated host will actually SIGN with
+// the new key, read from its own config rather than assumed.
+//
+// Best-effort: an unreadable config is reported as unknown, never as either
+// answer. Claiming "signing is on" when it is off is how the previous version of
+// this command closed an incident that was still open.
+func reportRemoteSigningState(sc *ssh.Client, hostName string) {
+	out, err := sc.RunOutput(
+		`grep -cE '^[[:space:]]+audit_signature:[[:space:]]*true' /etc/litevirt/config.yaml || true`)
+	switch {
+	case err != nil:
+		fmt.Printf("  could not read enforcement.audit_signature on %s; check whether new rows "+
+			"are being signed there\n", hostName)
+	case strings.TrimSpace(string(out)) == "0":
+		fmt.Println("  NOTE: enforcement.audit_signature is OFF on this host, so new rows are still")
+		fmt.Println("  written UNSIGNED. The rotation sealed what the old key wrote, but the new key")
+		fmt.Println("  is not protecting anything yet — enable the flag fleet-wide to change that")
+	default:
+		fmt.Println("  enforcement.audit_signature is on, so rows written from here are signed with")
+		fmt.Println("  the new key")
+	}
 }
 
 // mintAuditSigningPair generates a new audit signing pair for hostName into a

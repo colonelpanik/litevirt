@@ -66,6 +66,21 @@ func (s *Server) ReserveProjectCapacity(ctx context.Context, req *pb.ReserveProj
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read project authority: %v", err)
 	}
+	// Bootstrap. The caller minted the initial authority on ITS replica, so the row
+	// naming us has not reached us yet — waiting for replication would fail the very
+	// first admission of every project. We do not have to take the caller's word for
+	// it either: the initial holder is DERIVED, so we re-derive and confirm
+	// independently. A peer cannot talk us into holding an authority our own view of
+	// membership does not assign us.
+	if !ok && req.AuthorityEpoch == 1 && s.derivedProjectHolder(ctx, req.Project) == s.hostName {
+		if _, cerr := corrosion.ClaimInitialProjectAuthority(ctx, s.db, req.Project, s.hostName); cerr != nil {
+			return nil, status.Errorf(codes.Internal, "establish project authority: %v", cerr)
+		}
+		cur, ok, err = corrosion.CurrentProjectAuthority(ctx, s.db, req.Project)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read project authority: %v", err)
+		}
+	}
 	// Refuse unless we are CURRENTLY the holder at the epoch the caller addressed.
 	// Answering under a newer epoch would be just as wrong as answering under an
 	// older one: the caller's peer may have already been told a different holder is

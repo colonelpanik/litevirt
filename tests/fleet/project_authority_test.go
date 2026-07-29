@@ -205,6 +205,54 @@ func TestFleet_ProjectAuthority_UnreachableHolderRefuses(t *testing.T) {
 	}
 }
 
+// TestFleet_ProjectAuthority_BootstrapsWithoutWaitingForReplication covers the very
+// first admission of a project, which has no authority record anywhere yet.
+//
+// The minting node writes the claim to ITS replica, so the node it names as holder
+// does not have that row when the delegated request arrives a moment later. Waiting
+// for replication would fail every project's first create. Instead both sides DERIVE
+// the initial holder from membership, so the holder confirms the claim independently
+// rather than taking the caller's word for it.
+//
+// Nothing is seeded here on purpose: authority is minted by the code path under test,
+// and the assertion is simply that a create works at all.
+func TestFleet_ProjectAuthority_BootstrapsWithoutWaitingForReplication(t *testing.T) {
+	c := New(t, Options{Nodes: 3})
+	defer c.Stop()
+	gates := gateAll(t, c)
+	roomyHosts(t, c)
+	seedTenantQuota(t, c, "tenant", 8)
+	latchProjectAuthority(t, c, gates)
+
+	// Enter at each node in turn. Whichever one derivation picks as holder, at least
+	// one of these is a genuine cross-node delegation into a node that has never seen
+	// the authority row.
+	for i, n := range c.Nodes {
+		name := "boot-vm-" + string(rune('a'+i))
+		if _, err := runProjectVM(t, c, n, name, n.Name, 1, 512, "tenant"); err != nil {
+			t.Fatalf("create entering %s failed on a project with no replicated authority record: %v — "+
+				"the holder must confirm the derived claim itself instead of waiting for replication", n.Name, err)
+		}
+	}
+
+	// And every node must have landed on the SAME holder; disagreement here means two
+	// deciders, which is the state the mechanism exists to prevent.
+	ctx := context.Background()
+	var first string
+	for _, n := range c.Nodes {
+		cur, ok, err := corrosion.CurrentProjectAuthority(ctx, n.DB, "tenant")
+		if err != nil || !ok {
+			t.Fatalf("%s has no authority record after admitting: ok=%v err=%v", n.Name, ok, err)
+		}
+		if first == "" {
+			first = cur.Holder
+		} else if cur.Holder != first {
+			t.Errorf("%s thinks %q holds the project but another node thinks %q — two holders at one epoch",
+				n.Name, cur.Holder, first)
+		}
+	}
+}
+
 // TestFleet_ProjectAuthority_HolderGrantsWithinQuota guards the other direction: the
 // single decider must still ADMIT what genuinely fits. A mechanism that refuses
 // everything would pass every scenario above.

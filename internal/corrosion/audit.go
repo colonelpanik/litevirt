@@ -426,17 +426,25 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 
 		sig, keyID, seq := r.String("signature"), r.String("key_id"), r.Int64("seq")
 
-		// Sequence numbers are tracked for EVERY row, signed or not.
+		// Sequence numbers are tracked for every row that HAS one, signed or not.
 		// InsertAuditLog assigns seq = tail+1 before it signs, and loadHostTail
-		// takes MAX(seq) across all rows, so a run of unsigned rows still
-		// consumes numbers. Counting only signed ones made the next signed row
-		// look like it had jumped — reporting a deletion that never happened
-		// against a node whose only fault was a few writes it could not sign.
-		if last, seen := seqByHost[host]; seen && seq != last+1 {
-			res.SeqGaps = append(res.SeqGaps,
-				fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
+		// takes MAX(seq) across all rows, so a run of unsigned rows still consumes
+		// numbers. Counting only signed ones made the next signed row look like it
+		// had jumped — reporting a deletion that never happened against a node
+		// whose only fault was a few writes it could not sign.
+		//
+		// seq 0 is the "no sequence" sentinel: every pre-v45 row carries it,
+		// because the column was added with DEFAULT 0. Those are not a numbering
+		// at all, so comparing them produces one "seq 0 after 0" per legacy row —
+		// hundreds of them on the first verify after an upgrade, under a heading
+		// that says rows were deleted. Skipped rather than compared.
+		if seq > 0 {
+			if last, seen := seqByHost[host]; seen && seq != last+1 {
+				res.SeqGaps = append(res.SeqGaps,
+					fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
+			}
+			seqByHost[host] = seq
 		}
-		seqByHost[host] = seq
 
 		if sig == "" {
 			res.Unsigned++

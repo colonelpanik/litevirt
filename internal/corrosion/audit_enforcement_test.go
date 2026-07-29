@@ -285,3 +285,47 @@ func TestEnforcement_ADegradedWindowIsNotASequenceGap(t *testing.T) {
 		t.Fatalf("want the 2 unsignable rows reported, got %v", res.UnsignedAfterSigned)
 	}
 }
+
+// TestEnforcement_LegacyRowsAreNotASequenceGap.
+//
+// Found on the lab, not in any unit test. seq was added at v45 with DEFAULT 0,
+// so every row written before then carries 0 — that is a "no sequence"
+// sentinel, not a numbering. Once the verifier started comparing seq on every
+// row rather than only signed ones, each legacy row produced a "seq 0 after 0"
+// finding, under a heading that says rows were deleted from the chain.
+//
+// On the four-node lab that was several hundred findings on the first verify
+// after upgrading, on a log nobody had touched.
+func TestEnforcement_LegacyRowsAreNotASequenceGap(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	// Pre-v45 rows: hashed, unsigned, seq 0 — what an upgraded cluster holds.
+	prev := ""
+	for _, id := range []string{"r1", "r2", "r3", "r4"} {
+		rec := AuditRecord{
+			ID: id, Timestamp: "2026-07-29T10:00:0" + id[1:] + "Z", Username: "u",
+			HostName: "node-0", Action: "vm.start", Target: "x", Result: "ok", PrevHash: prev,
+		}
+		rec.ContentHash = HashAuditRow(rec)
+		if err := c.Execute(ctx,
+			`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+			                        result, prev_hash, content_hash, key_id, signature, seq)
+			 VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, '', '', 0)`,
+			rec.ID, rec.Timestamp, rec.Username, rec.HostName, rec.Action, rec.Target,
+			rec.Result, rec.PrevHash, rec.ContentHash); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+		prev = rec.ContentHash
+	}
+
+	res := verify(t, c)
+	if len(res.SeqGaps) > 0 {
+		t.Fatalf("pre-v45 rows were reported as deleted-and-renumbered: %v\n"+
+			"seq 0 is the sentinel every legacy row carries, so comparing it produces one "+
+			"finding per row on the first verify after an upgrade", res.SeqGaps)
+	}
+	if res.Tampered() {
+		t.Fatalf("an untouched legacy log reports tampering: %+v", res)
+	}
+}

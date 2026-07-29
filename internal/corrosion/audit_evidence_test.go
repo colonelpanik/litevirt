@@ -452,3 +452,111 @@ func TestAuditMerge_ARetirementStillPropagates(t *testing.T) {
 			"node would never become visible to the rest of the cluster")
 	}
 }
+
+// TestAuditMerge_HealsALocallyTombstonedChainHead is the other half of the
+// tombstone rule, and the lab is what asked for it.
+//
+// Refusing a tombstone stops the erasure spreading. It does nothing for the node
+// the erasure happened ON: that node wrote the clock on its own row, so under
+// LWW its tombstone beats every peer's live copy forever. The compromised node
+// then verifies clean locally while its neighbours hold the head — the guard
+// would have converted a spreading problem into a permanent local one, and a
+// node damaged by plain corruption could never recover at all.
+func TestAuditMerge_HealsALocallyTombstonedChainHead(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	head := oneCol(t, c, `SELECT head_hash FROM audit_chain_heads WHERE host_name = 'node-0'`)
+	created := oneCol(t, c, `SELECT created_at FROM audit_chain_heads WHERE host_name = 'node-0'`)
+	sig := oneCol(t, c, `SELECT signature FROM audit_chain_heads WHERE host_name = 'node-0'`)
+
+	// The head is deleted here, with a clock no peer's honest write can beat.
+	if err := c.Execute(ctx,
+		`UPDATE audit_chain_heads SET deleted_at = ?, updated_at = ? WHERE host_name = 'node-0'`,
+		"2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("tombstone: %v", err)
+	}
+
+	// A peer offers its intact copy, carrying the ORIGINAL — and therefore much
+	// older — clock. Ordinary LWW would discard it.
+	incoming := []interface{}{
+		"node-0", int64(0), int64(1), head, kr.KeyID(), sig, created, created, nil,
+	}
+	mergeOne(t, c, headSyncTable(), []string{"host_name", "epoch", "seq"}, []int{0, 1, 2}, incoming)
+
+	if n := countRows(t, c,
+		`SELECT host_name FROM audit_chain_heads WHERE host_name = 'node-0' AND deleted_at IS NULL`); n != 1 {
+		t.Fatalf("a locally deleted chain head was not restored from a peer's intact copy "+
+			"(%d live heads)\nthe node that deleted it wrote the newest clock, so under LWW "+
+			"it keeps the tombstone forever and truncation detection stays off here", n)
+	}
+}
+
+// TestAuditMerge_HealsALocallyTombstonedCertificate is the same rule for the
+// certificate table, where the consequence is louder: a deleted certificate does
+// not hide the rows that key signed, it makes them unverifiable.
+func TestAuditMerge_HealsALocallyTombstonedCertificate(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	id := kr.KeyID()
+	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+id+`'`)
+	created := oneCol(t, c, `SELECT created_at FROM audit_signing_keys WHERE key_id = '`+id+`'`)
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET deleted_at = ?, updated_at = ? WHERE key_id = ?`,
+		"2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z", id); err != nil {
+		t.Fatalf("tombstone: %v", err)
+	}
+	if res := verify(t, c); len(res.UnknownKeyID) == 0 {
+		t.Fatalf("deleting the certificate did not make its rows unverifiable, so this test " +
+			"is not measuring the damage it claims to repair")
+	}
+
+	incoming := []interface{}{
+		id, "node-0", cert, nil, int64(0), created, created, nil,
+	}
+	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
+
+	if res := verify(t, c); len(res.UnknownKeyID) > 0 {
+		t.Fatalf("a locally deleted certificate was not restored from a peer's intact copy: %v\n"+
+			"every row that key signed stays unverifiable on this node forever", res.UnknownKeyID)
+	}
+}
+
+// TestAuditMerge_HealingDoesNotUnretireAKey.
+//
+// Healing must not become a back door. A peer's copy that is live AND
+// un-retired, arriving at a node whose row is tombstoned and retired, would
+// repair the tombstone and drop the retirement in the same write — so the
+// monotone rule is checked first and wins.
+func TestAuditMerge_HealingDoesNotUnretireAKey(t *testing.T) {
+	ctx := context.Background()
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	rotateTo(t, c, dir, "node-0")
+
+	oldID := oldKR.KeyID()
+	cert := oneCol(t, c, `SELECT cert_pem FROM audit_signing_keys WHERE key_id = '`+oldID+`'`)
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET deleted_at = ? WHERE key_id = ?`,
+		"2999-01-01T00:00:00Z", oldID); err != nil {
+		t.Fatalf("tombstone: %v", err)
+	}
+
+	incoming := []interface{}{
+		oldID, "node-0", cert, nil, int64(0),
+		"2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z", nil,
+	}
+	mergeOne(t, c, keySyncTable(), []string{"key_id"}, []int{0}, incoming)
+
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_signing_keys WHERE key_id = '`+oldID+`' AND retired_at IS NOT NULL`); n != 1 {
+		t.Fatalf("healing a tombstone also cleared the key's retirement\n" +
+			"deleting the row would then be a way to launder an un-retirement past the " +
+			"monotone check")
+	}
+}

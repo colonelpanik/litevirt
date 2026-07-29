@@ -822,19 +822,41 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// or clears a retirement). Nothing legitimate writes what these guards
 		// refuse, so they cost nothing when the cluster is healthy.
 		if guard := auditEvidenceGuards[table.Name]; guard != nil {
-			keepLocal, reason, kErr := guard(tx, table, row, pkCols, pkIdx)
+			decision, reason, kErr := guard(tx, table, row, pkCols, pkIdx)
 			if kErr != nil {
 				_ = tx.Rollback()
 				return merged, skipped, kErr
 			}
-			if keepLocal {
+			pk, tbl := pkKeyAt(row, pkIdx), table.Name
+			switch decision {
+			case auditEvidenceKeepLocal:
 				skipped++
-				pk, tbl := pkKeyAt(row, pkIdx), table.Name
 				c.deferAfterCommit(tx, func() {
 					c.observeMergeRejected(boundedTableLabel(tbl), "ae", reason)
 					slog.Warn("anti-entropy: refused a peer's copy of audit tamper-evidence; keeping "+
 						"local. One of the two nodes has been altered — run `lv audit verify` on both",
 						"table", tbl, "pk", pk, "reason", reason)
+				})
+				continue
+			case auditEvidenceHeal:
+				// Bypasses LWW deliberately. Whoever deleted the local copy wrote
+				// its clock too, so under LWW the damaged node would keep its own
+				// tombstone forever and never recover from a peer that still holds
+				// the real row — refusing damage would have frozen it in place.
+				rejected, execErr := c.applyMergeRow(tx, insertSQL, row, tbl)
+				if execErr != nil {
+					_ = tx.Rollback()
+					return merged, skipped, execErr
+				}
+				if rejected {
+					skipped++
+				} else {
+					merged++
+				}
+				c.deferAfterCommit(tx, func() {
+					slog.Warn("anti-entropy: restored audit tamper-evidence that was deleted "+
+						"locally, from a peer's copy. Something removed it on this node — "+
+						"nothing in litevirt does", "table", tbl, "pk", pk, "reason", reason)
 				})
 				continue
 			}

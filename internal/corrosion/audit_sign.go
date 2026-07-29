@@ -388,10 +388,32 @@ func (k *AuditKeyring) PublishSigningKey(ctx context.Context, c *Client) error {
 		k.keyID, k.hostName, k.certPEM, now, now)
 }
 
-// auditEvidenceGuard decides whether one incoming anti-entropy row must be
-// refused to keep this node's tamper-evidence intact. It returns keepLocal plus
-// a short, bounded reason used as a metric label and in the warning.
-type auditEvidenceGuard func(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error)
+// auditEvidenceDecision is what the merge does with one incoming row of audit
+// tamper-evidence.
+type auditEvidenceDecision int
+
+const (
+	// auditEvidencePassThrough: nothing special about this row; let the normal
+	// identity/LWW handling below decide.
+	auditEvidencePassThrough auditEvidenceDecision = iota
+	// auditEvidenceKeepLocal: the incoming row would destroy evidence. Refuse it
+	// whatever clock it carries.
+	auditEvidenceKeepLocal
+	// auditEvidenceHeal: the LOCAL row is the damaged one and the incoming copy
+	// is intact. Apply it, bypassing LWW.
+	//
+	// Refusing damage must not mean freezing it. Whoever tombstoned a head or a
+	// certificate wrote the clock on their own row too, so under LWW the damaged
+	// node would keep its own copy forever and never recover from a peer that
+	// still holds the real one — the guard would have converted a spreading
+	// problem into a permanent local one.
+	auditEvidenceHeal
+)
+
+// auditEvidenceGuard decides what to do with one incoming anti-entropy row of
+// audit tamper-evidence, plus a short, bounded reason used as a metric label and
+// in the warning.
+type auditEvidenceGuard func(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (auditEvidenceDecision, string, error)
 
 // auditEvidenceGuards are the anti-entropy floors under the three tables the
 // audit verifier derives its conclusions from.
@@ -417,23 +439,23 @@ var auditEvidenceGuards = map[string]auditEvidenceGuard{
 // the local one is what this node has already published a chain head over.
 // Keeping it and raising the divergence leaves both versions discoverable — the
 // peer still holds its own — where silently taking one erases the other.
-func signedAuditRowIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
+func signedAuditRowIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (auditEvidenceDecision, string, error) {
 	if indexOf(table.Columns, "signature") < 0 {
 		// A dump from a pre-v45 peer carries no signature column at all. It can
 		// only be describing unsigned rows, so there is nothing to protect.
-		return false, "", nil
+		return auditEvidencePassThrough, "", nil
 	}
 	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
 	if err != nil || !found {
-		return false, "", err
+		return auditEvidencePassThrough, "", err
 	}
 	if cellStr(localRow, columnIndexMap(table.Columns), "signature") == "" {
-		return false, "", nil // legacy row: keep converging as before
+		return auditEvidencePassThrough, "", nil // legacy row: keep converging as before
 	}
 	if encodeRowCells(localRow) != encodeRowCells(row) {
-		return true, "signed_audit_row", nil
+		return auditEvidenceKeepLocal, "signed_audit_row", nil
 	}
-	return false, "", nil
+	return auditEvidencePassThrough, "", nil
 }
 
 // auditChainHeadIsImmutable refuses any anti-entropy row that would change or
@@ -446,22 +468,29 @@ func signedAuditRowIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, p
 // truncation detection cluster-wide. The table is documented append-only and the
 // statement lane enforces that, but anti-entropy ships whole rows including
 // deleted_at, so the same rule has to exist here.
-func auditChainHeadIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
+func auditChainHeadIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (auditEvidenceDecision, string, error) {
 	idx := columnIndexMap(table.Columns)
 	// Refused whether or not this node already holds the head. Accepting a
 	// tombstone for an unseen key would pre-poison the slot, so the genuine head
 	// could never land afterwards — a truncation hidden before it happened.
 	if cellStr(row, idx, "deleted_at") != "" {
-		return true, "audit_head_tombstone", nil
+		return auditEvidenceKeepLocal, "audit_head_tombstone", nil
 	}
 	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
 	if err != nil || !found {
-		return false, "", err
+		return auditEvidencePassThrough, "", err
+	}
+	// The incoming copy is live, so a local tombstone is the damaged side and a
+	// peer is offering the repair. Take it: nothing legitimately deletes a head,
+	// and under LWW the node that tombstoned its own would keep that clock
+	// forever.
+	if cellStr(localRow, idx, "deleted_at") != "" {
+		return auditEvidenceHeal, "audit_head_untombstone", nil
 	}
 	if encodeRowCells(localRow) != encodeRowCells(row) {
-		return true, "audit_head_rewrite", nil
+		return auditEvidenceKeepLocal, "audit_head_rewrite", nil
 	}
-	return false, "", nil
+	return auditEvidencePassThrough, "", nil
 }
 
 // auditSigningKeyIsMonotone keeps a key's retirement from being walked back.
@@ -474,30 +503,38 @@ func auditChainHeadIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, p
 // the certificate must stay resolvable for as long as any row it signed exists,
 // so a tombstone does not hide those rows, it makes them unverifiable, which
 // reads as mass tampering rather than as the erasure it is.
-func auditSigningKeyIsMonotone(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
+func auditSigningKeyIsMonotone(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (auditEvidenceDecision, string, error) {
 	idx := columnIndexMap(table.Columns)
 	if cellStr(row, idx, "deleted_at") != "" {
-		return true, "audit_key_tombstone", nil
+		return auditEvidenceKeepLocal, "audit_key_tombstone", nil
 	}
 	if indexOf(table.Columns, "retired_at") < 0 {
-		return false, "", nil // pre-v46 dump: carries no retirement to weaken
+		return auditEvidencePassThrough, "", nil // pre-v46 dump: no retirement to weaken
 	}
 	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
 	if err != nil || !found {
-		return false, "", err
+		return auditEvidencePassThrough, "", err
 	}
-	if cellStr(localRow, idx, "retired_at") == "" {
-		return false, "", nil // not retired here; an incoming retirement may land
+	if cellStr(localRow, idx, "retired_at") != "" {
+		// Retirement is monotone. Un-retiring a key, or moving its boundary
+		// forward, is the one edit that makes the RetiredKeyUse finding disappear
+		// on every peer at once — refused regardless of how new the incoming
+		// clock claims to be. The EARLIER boundary is the strict one, so a later
+		// one is a weakening even though both rows look retired.
+		if cellStr(row, idx, "retired_at") == "" {
+			return auditEvidenceKeepLocal, "audit_key_unretire", nil
+		}
+		if cellInt64(row, idx, "retired_at_seq") > cellInt64(localRow, idx, "retired_at_seq") {
+			return auditEvidenceKeepLocal, "audit_key_boundary_raised", nil
+		}
 	}
-	if cellStr(row, idx, "retired_at") == "" {
-		return true, "audit_key_unretire", nil
+	// The incoming copy is live and does not weaken anything. If the LOCAL row is
+	// tombstoned, this is the repair for a certificate somebody deleted — without
+	// which every row that key signed stays unverifiable on this node forever.
+	if cellStr(localRow, idx, "deleted_at") != "" {
+		return auditEvidenceHeal, "audit_key_untombstone", nil
 	}
-	// Both retired: the EARLIER boundary is the strict one, so a later one is a
-	// weakening even though both rows look retired.
-	if cellInt64(row, idx, "retired_at_seq") > cellInt64(localRow, idx, "retired_at_seq") {
-		return true, "audit_key_boundary_raised", nil
-	}
-	return false, "", nil
+	return auditEvidencePassThrough, "", nil
 }
 
 // cellInt64 reads a numeric cell. A dump round-trips through JSON, so the same

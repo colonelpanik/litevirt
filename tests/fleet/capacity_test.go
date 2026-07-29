@@ -189,3 +189,53 @@ func TestFleet_Capacity_ContainersCountAgainstVMs(t *testing.T) {
 		t.Fatalf("VM create onto a host filled by a CONTAINER: got %v, want ResourceExhausted — containers hold host memory too", err)
 	}
 }
+
+// TestFleet_Capacity_HostListingReportsContainerMemory: the operator-facing view
+// must agree with admission.
+//
+// Admission counts container memory against host capacity. When `lv host ls`
+// counted only VMs, a host could display plenty of free memory and still refuse a
+// VM — indistinguishable, from the operator's side, from a bug in litevirt. This
+// pins the two together.
+func TestFleet_Capacity_HostListingReportsContainerMemory(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	n := c.Nodes[0]
+
+	memOf := func(host string) int32 {
+		t.Helper()
+		resp, err := c.SelfClient(n).ListHosts(ctx, &pb.ListHostsRequest{})
+		if err != nil {
+			t.Fatalf("ListHosts: %v", err)
+		}
+		for _, h := range resp.Hosts {
+			if h.Name == host {
+				return h.MemUsedMib
+			}
+		}
+		t.Fatalf("host %q absent from ListHosts", host)
+		return 0
+	}
+
+	before := memOf(n.Name)
+	if err := corrosion.UpsertContainer(ctx, n.DB, corrosion.ContainerRecord{
+		HostName: n.Name, Name: "ct-visible", State: "running", MemMiB: 2048,
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+
+	if got, want := memOf(n.Name), before+2048; got != want {
+		t.Errorf("host memory reported as %d after a running 2048 MiB container, want %d — the listing disagrees with what admission charges",
+			got, want)
+	}
+
+	// A STOPPED container holds nothing, so it must not inflate the display either.
+	if err := corrosion.UpsertContainer(ctx, n.DB, corrosion.ContainerRecord{
+		HostName: n.Name, Name: "ct-stopped", State: "stopped", MemMiB: 4096,
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	if got, want := memOf(n.Name), before+2048; got != want {
+		t.Errorf("host memory reported as %d with a STOPPED container present, want %d unchanged", got, want)
+	}
+}

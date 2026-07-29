@@ -2132,8 +2132,14 @@ func (x *ListVMHardwareResponse) GetHardwareAdoptionError() string {
 type StartVMRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// allow_overcommit skips HOST capacity admission for this start (project quota
-	// still applies). Same escape hatch as CreateVMRequest; the bypass is audited.
+	// allow_overcommit skips HOST capacity admission for this start. Requires the
+	// vm.overcommit verb; the bypass is audited.
+	//
+	// Unlike CreateVMRequest this says nothing about project quota, because start
+	// does not evaluate quota at all: a project allocation counts whether the
+	// workload is running or stopped, so charging it again on start would refuse a
+	// simple stop/start of any VM over half its quota. There is no quota check
+	// here to bypass.
 	AllowOvercommit bool `protobuf:"varint,2,opt,name=allow_overcommit,json=allowOvercommit,proto3" json:"allow_overcommit,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache

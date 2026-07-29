@@ -104,8 +104,14 @@ message ListVMHardwareResponse {
     string hardware_adoption_error = 3;  // reason when blocked
 }
 message StartVMRequest   { string name = 1;
-    // allow_overcommit skips HOST capacity admission for this start (project quota
-    // still applies). Same escape hatch as CreateVMRequest; the bypass is audited.
+    // allow_overcommit skips HOST capacity admission for this start. Requires the
+    // vm.overcommit verb; the bypass is audited.
+    //
+    // Unlike CreateVMRequest this says nothing about project quota, because start
+    // does not evaluate quota at all: a project allocation counts whether the
+    // workload is running or stopped, so charging it again on start would refuse a
+    // simple stop/start of any VM over half its quota. There is no quota check
+    // here to bypass.
     bool allow_overcommit = 2; }
 message StopVMRequest    { string name = 1; bool force = 2; int32 timeout = 3; }
 message RestartVMRequest { string name = 1; }

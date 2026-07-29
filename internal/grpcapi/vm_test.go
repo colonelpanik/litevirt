@@ -1373,3 +1373,61 @@ func TestUpdateVM_RestartIfNeededShrinkIsNotRefused(t *testing.T) {
 		t.Fatalf("a SHRINK was refused for capacity: %v — only growth consumes anything", err)
 	}
 }
+
+// TestStartVMLocked_RecoveryPathIsNotAdmitted pins the load-bearing design
+// decision behind start-time capacity admission: it lives on the StartVM RPC,
+// NOT in the shared start primitive.
+//
+// The automated failover / reconciler / health-restart paths reach a VM through
+// startVMLocked (via PrepareHardwareForStart), never through the RPC. They must
+// stay unadmitted: after a host reboot every VM starts at once, and admitting
+// there would let the first few through and strand the rest — a clean recovery
+// turned into a partial one, which is worse than the overcommit it prevents.
+//
+// This was verified on real hardware (a restart=always VM destroyed behind
+// litevirt's back came back while the host had less free memory than the VM's own
+// size) but had no test. Moving the check into startVMLocked would break nothing
+// otherwise.
+func TestStartVMLocked_RecoveryPathIsNotAdmitted(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 2048,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// The host is already over its allocatable headroom (2048 - 1024 reserve =
+	// 1024, with 2000 MiB of running VM on it), so the RPC would refuse this.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "ballast", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 2000,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM ballast: %v", err)
+	}
+	vmRec := corrosion.VMRecord{
+		Name: "recovered", HostName: "test-host", State: "stopped",
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "recovered", Cpu: 1, MemoryMib: 1024}),
+	}
+	if err := corrosion.InsertVM(ctx, s.db, vmRec, nil, nil); err != nil {
+		t.Fatalf("InsertVM recovered: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>recovered</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	// Sanity: the operator RPC DOES refuse it, so the host really is over capacity
+	// and the recovery assertion below is not passing for a trivial reason.
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "recovered"}); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("precondition: operator StartVM should be refused here, got %v", err)
+	}
+
+	// The recovery primitive must start it regardless.
+	fresh, err := corrosion.GetVM(ctx, s.db, "recovered")
+	if err != nil || fresh == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if _, err := s.startVMLocked(ctx, fresh); err != nil {
+		t.Fatalf("startVMLocked refused a recovery start: %v — the automated restart paths must not be admitted, or a host reboot strands every VM after the first few", err)
+	}
+}

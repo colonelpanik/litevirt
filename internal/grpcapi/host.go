@@ -32,8 +32,8 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 
 	// Single query for all VM counts instead of per-host N+1.
 	vmCounts, _ := corrosion.CountVMsByHost(ctx, s.db)
-	// Aggregate CPU/memory allocated to running VMs per host.
-	resUsage, _ := corrosion.SumVMResourcesByHost(ctx, s.db)
+	// Aggregate CPU/memory allocated per host, containers included.
+	resUsage := s.hostUsageWithContainers(ctx)
 
 	resp := &pb.ListHostsResponse{}
 	for _, h := range hosts {

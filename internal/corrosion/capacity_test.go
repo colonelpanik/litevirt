@@ -174,3 +174,40 @@ func TestSumContainerMemoryByHost_OnlyRunningAndCapped(t *testing.T) {
 		t.Errorf("h1 container memory = %d, want 512 (running+capped only; stopped holds nothing, uncapped is unknowable)", got["h1"])
 	}
 }
+
+// TestHostFreeCapacity_ContainerCPUIsNotCountedAsVCPU pins a DELIBERATE
+// exclusion that had no guard.
+//
+// A container's cpu_limit is CPU *shares* — a relative cgroup weight — not a vCPU
+// reservation. A container with the conventional 1024 shares is not 1024 vCPUs,
+// so folding it into a host's vCPU total would be meaningless arithmetic that
+// instantly makes every host look full. The decision was documented and tested
+// nowhere: adding cpu_limit to the sum would have broken nothing.
+func TestHostFreeCapacity_ContainerCPUIsNotCountedAsVCPU(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := InsertHost(ctx, db, HostRecord{Name: "h1", CPUTotal: 8, MemTotal: 8192, State: "HOST_ACTIVE"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	baselineCPU, _, ok, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil || !ok {
+		t.Fatalf("HostFreeCapacity: ok=%v err=%v", ok, err)
+	}
+
+	// A running container with a large CPU-shares value and no memory cap.
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "h1", Name: "sharesy", State: "running", CPULimit: 1024, MemMiB: 0,
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+
+	afterCPU, _, _, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil {
+		t.Fatalf("HostFreeCapacity: %v", err)
+	}
+	if afterCPU != baselineCPU {
+		t.Errorf("free vCPU went %d -> %d after a container with cpu_limit=1024 — shares are a cgroup weight, not a vCPU reservation, and counting them makes every host look full",
+			baselineCPU, afterCPU)
+	}
+}

@@ -87,14 +87,21 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 		return fmt.Errorf("create remote PKI dir: %w", err)
 	}
 
-	filesToPush := map[string]string{
-		caPath:       filepath.Join(remotePKIDir, "ca.crt"),
-		hostCertPath: filepath.Join(remotePKIDir, "host.crt"),
-		hostKeyPath:  filepath.Join(remotePKIDir, "host.key"),
-	}
-	for local, remote := range filesToPush {
-		if err := sc.CopyFile(local, remote); err != nil {
-			return fmt.Errorf("push %s: %w", filepath.Base(local), err)
+	// The host KEY is 0600. It is the node's entire cluster identity: peer mTLS
+	// authenticates with it and audit rows are signed with it, so a local user
+	// who can read it can both impersonate the host to every peer and forge its
+	// audit history. It shipped 0644 because CopyFile's default mode was
+	// invisible at the call site.
+	for _, f := range []struct {
+		local, remote string
+		mode          os.FileMode
+	}{
+		{caPath, filepath.Join(remotePKIDir, "ca.crt"), 0644},
+		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0644},
+		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0600},
+	} {
+		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
+			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
 		}
 	}
 
@@ -186,14 +193,21 @@ func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers [
 		return fmt.Errorf("create remote PKI dir: %w", err)
 	}
 
-	filesToPush := map[string]string{
-		caPath:       filepath.Join(remotePKIDir, "ca.crt"),
-		hostCertPath: filepath.Join(remotePKIDir, "host.crt"),
-		hostKeyPath:  filepath.Join(remotePKIDir, "host.key"),
-	}
-	for local, remote := range filesToPush {
-		if err := sc.CopyFile(local, remote); err != nil {
-			return fmt.Errorf("push %s: %w", filepath.Base(local), err)
+	// The host KEY is 0600. It is the node's entire cluster identity: peer mTLS
+	// authenticates with it and audit rows are signed with it, so a local user
+	// who can read it can both impersonate the host to every peer and forge its
+	// audit history. It shipped 0644 because CopyFile's default mode was
+	// invisible at the call site.
+	for _, f := range []struct {
+		local, remote string
+		mode          os.FileMode
+	}{
+		{caPath, filepath.Join(remotePKIDir, "ca.crt"), 0644},
+		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0644},
+		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0600},
+	} {
+		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
+			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
 		}
 	}
 
@@ -371,6 +385,12 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 		}
 		if err := os.WriteFile(dst, data, 0600); err != nil {
 			return fmt.Errorf("write %s: %w", filepath.Base(dst), err)
+		}
+		// WriteFile only applies its mode when it CREATES the file, so a
+		// re-init over an existing loose-permissioned key would silently keep
+		// the old mode.
+		if err := os.Chmod(dst, 0600); err != nil {
+			return fmt.Errorf("chmod %s: %w", filepath.Base(dst), err)
 		}
 	}
 

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -91,7 +92,11 @@ func LoadAuditKeyring(pkiDir, hostName string) (*AuditKeyring, error) {
 		return nil, fmt.Errorf("host certificate CN is %q but this host is %q; audit signatures "+
 			"would be attributed to the wrong host", cert.Subject.CommonName, hostName)
 	}
-	keyPEM, err := os.ReadFile(filepath.Join(pkiDir, "host.key"))
+	keyPath := filepath.Join(pkiDir, "host.key")
+	if err := tightenKeyMode(keyPath); err != nil {
+		return nil, err
+	}
+	keyPEM, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("read host key: %w", err)
 	}
@@ -109,6 +114,35 @@ func LoadAuditKeyring(pkiDir, hostName string) (*AuditKeyring, error) {
 	}
 	k.hostName, k.keyID, k.certPEM, k.key = hostName, id, string(certPEM), priv
 	return k, nil
+}
+
+// tightenKeyMode makes the signing key unreadable to anyone but its owner,
+// repairing it in place if it is not.
+//
+// Existing clusters need the repair, not just a warning. `lv host init
+// root@<host>` pushed this key 0644 on every node it provisioned — CopyFile's
+// default mode, invisible at the call site — and a signature is worth exactly
+// the secrecy of the key behind it. A node that keeps signing with a
+// world-readable key offers tamper-evidence that any local user can defeat, so
+// this fixes it on the spot and says so rather than leaving an operator to
+// notice a warning.
+func tightenKeyMode(keyPath string) error {
+	fi, err := os.Stat(keyPath)
+	if err != nil {
+		return fmt.Errorf("stat host key: %w", err)
+	}
+	if fi.Mode().Perm()&0o077 == 0 {
+		return nil
+	}
+	if err := os.Chmod(keyPath, 0o600); err != nil {
+		return fmt.Errorf("host key %s is mode %04o and readable by other local users, and it "+
+			"could not be tightened: %w", keyPath, fi.Mode().Perm(), err)
+	}
+	slog.Warn("audit signing key was readable by other local users; tightened to 0600. "+
+		"Anyone who read it while it was exposed can still impersonate this host — "+
+		"rotate the host certificate if that is a possibility",
+		"path", keyPath, "was", fmt.Sprintf("%04o", fi.Mode().Perm()))
+	return nil
 }
 
 // LoadAuditVerifier loads a verify-only keyring — the cluster CA and nothing

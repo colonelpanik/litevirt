@@ -65,6 +65,14 @@ func (d *Daemon) runAuditChainHeads(ctx context.Context) {
 		metrics.AuditChainHeadPublished()
 	}
 
+	// Publish once immediately. Waiting for the first tick leaves every row
+	// written since the last head outside any signed assertion, and a node that
+	// restarts more often than the interval would never publish at all — the
+	// shutdown publish cannot be relied on to win the race against process
+	// exit, which is exactly what the lab showed (heads_published_total stayed
+	// at 0 across four restarts).
+	publish("startup")
+
 	t := time.NewTicker(auditHeadInterval)
 	defer t.Stop()
 	for {

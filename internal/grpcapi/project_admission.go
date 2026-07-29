@@ -138,8 +138,17 @@ func (s *Server) admitPoolAttach(ctx context.Context, wlProject, host, poolName 
 // Missing telemetry means UNKNOWN, never full: refusing there would break every
 // cluster whose pools have not been sampled, which is the opposite of safe.
 func (s *Server) admitPoolCapacity(ctx context.Context, host, poolName string, declaredBytes int64) error {
-	if poolName == "" || declaredBytes <= 0 {
+	if declaredBytes <= 0 {
 		return nil
+	}
+	// An UNNAMED disk is the primary path — `lv run --disk 20G` sets no storage at
+	// all — and it lands in the host's default pool (the same "" → "default"
+	// mapping poolLabel already uses). Skipping empty made this check dead for
+	// every ordinary create: a 200 GiB disk was accepted onto a 38 GiB filesystem
+	// on real hardware, because qcow2 is sparse and nothing objected until the
+	// guest eventually hit ENOSPC.
+	if poolName == "" {
+		poolName = "default"
 	}
 	pool, ok, err := corrosion.GetStoragePool(ctx, s.db, host, poolName)
 	if err != nil {

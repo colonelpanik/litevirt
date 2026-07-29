@@ -1495,3 +1495,38 @@ func TestCreateVM_UnsampledPoolDoesNotBlockCreates(t *testing.T) {
 		t.Fatalf("an unsampled pool refused a create: %v — missing telemetry means unknown, not full", err)
 	}
 }
+
+// TestCreateVM_UnnamedDiskIsAdmittedAgainstTheDefaultPool: an unnamed disk is the
+// PRIMARY path (`lv run --disk 20G` sets no storage), and skipping it made pool
+// admission dead for every ordinary create.
+//
+// Caught on real hardware, not here: a 200 GiB disk was accepted onto a 38 GiB
+// filesystem, because qcow2 is sparse so nothing objects until the guest hits
+// ENOSPC. The original unit test passed Storage explicitly and sailed past it.
+func TestCreateVM_UnnamedDiskIsAdmittedAgainstTheDefaultPool(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 65536,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "default", Driver: "dir", Target: "/var/lib/litevirt/disks",
+		TotalBytes: 10 << 30, UsedBytes: 9 << 30, State: "active",
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+
+	// No Storage field — exactly what `lv run --disk` produces.
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "unnamed", Cpu: 1, MemoryMib: 1024,
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "200G", Bus: "virtio"}},
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("unnamed 200G disk on a nearly-full default pool: got %v, want ResourceExhausted", err)
+	}
+}

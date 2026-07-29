@@ -235,6 +235,9 @@ func ListOperationSteps(ctx context.Context, c *Client, operationID string, owne
 // After a successful first claim the VM's spec_generation is expectedSpecGen+1;
 // use that (with ownerEpoch) for CompleteVMOperation.
 func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desiredSpec string, expectedOwnerEpoch, expectedSpecGen int64) (bool, error) {
+	if err := validateReservationProject(op.ReservationJSON, op.Project); err != nil {
+		return false, err
+	}
 	now := c.NowTS()
 	guard := func(tx *sql.Tx) (bool, error) {
 		var ownerEpoch, specGen int64

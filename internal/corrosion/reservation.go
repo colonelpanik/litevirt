@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 )
 
 // ReservationVector is the capacity an in-flight operation has reserved, persisted
@@ -36,9 +37,36 @@ type ReservationFacts struct {
 	AuthorityHost  string `json:"authority_host"`
 }
 
+// Validate rejects reservation vectors that could reduce capacity accounting or
+// cannot be attributed to a host. Empty project names remain the canonical
+// default-project representation for compatibility with legacy reservations.
+func (r ReservationVector) Validate() error {
+	values := []struct {
+		field string
+		value int
+	}{
+		{field: "project_cpu", value: r.ProjectCPU},
+		{field: "project_mem_mib", value: r.ProjectMemMiB},
+		{field: "target_cpu", value: r.TargetCPU},
+		{field: "target_mem_mib", value: r.TargetMemMiB},
+	}
+	for _, value := range values {
+		if value.value < 0 {
+			return fmt.Errorf("reservation %s must be non-negative", value.field)
+		}
+	}
+	if r.TargetHost == "" && (r.TargetCPU != 0 || r.TargetMemMiB != 0) {
+		return fmt.Errorf("reservation target_host is required for target capacity")
+	}
+	return nil
+}
+
 // Encode serializes the vector for the operations.reservation_json column. A zero
 // vector encodes to "" (no reservation).
 func (r ReservationVector) Encode() (string, error) {
+	if err := r.Validate(); err != nil {
+		return "", err
+	}
 	if r == (ReservationVector{}) {
 		return "", nil
 	}
@@ -53,8 +81,45 @@ func DecodeReservation(s string) (ReservationVector, error) {
 	if s == "" {
 		return r, nil
 	}
-	err := json.Unmarshal([]byte(s), &r)
-	return r, err
+	var decoded *ReservationVector
+	if err := json.Unmarshal([]byte(s), &decoded); err != nil {
+		return ReservationVector{}, err
+	}
+	if decoded == nil {
+		return ReservationVector{}, fmt.Errorf("reservation must be a JSON object")
+	}
+	r = *decoded
+	if err := r.Validate(); err != nil {
+		return ReservationVector{}, err
+	}
+	return r, nil
+}
+
+func checkedReservationAdd(total, delta int) (int, error) {
+	if total < 0 || delta < 0 {
+		return 0, fmt.Errorf("reservation total cannot be negative")
+	}
+	if delta > math.MaxInt-total {
+		return 0, fmt.Errorf("reservation total overflow")
+	}
+	return total + delta, nil
+}
+
+func remainingCapacity(allocatable int, consumed ...int) (int, error) {
+	if allocatable < 0 {
+		return 0, fmt.Errorf("allocatable capacity cannot be negative")
+	}
+	remaining := allocatable
+	for _, amount := range consumed {
+		if amount < 0 {
+			return 0, fmt.Errorf("consumed capacity cannot be negative")
+		}
+		if amount >= remaining {
+			return 0, nil
+		}
+		remaining -= amount
+	}
+	return remaining, nil
 }
 
 func reservationStepFacts(facts *ReservationFacts, project string) (string, error) {
@@ -138,6 +203,16 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 		if err != nil {
 			return nil, err
 		}
+		if operationProject := r.String("project"); operationProject != "" {
+			if projectOrDefault(rv.Project) != projectOrDefault(operationProject) {
+				return nil, fmt.Errorf(
+					"reservation %s project %q does not match operation project %q",
+					id, rv.Project, operationProject)
+			}
+			if err := validateReservationProject(r.String("reservation_json"), operationProject); err != nil {
+				return nil, fmt.Errorf("reservation %s has invalid project binding: %w", id, err)
+			}
+		}
 		authority, ok, err := CurrentProjectAuthority(ctx, c, r.String("project"))
 		if err != nil {
 			return nil, err
@@ -209,8 +284,14 @@ func HostReserved(ctx context.Context, c *Client, host string) (cpu, memMiB int,
 	}
 	for _, rv := range rvs {
 		if rv.TargetHost == host {
-			cpu += rv.TargetCPU
-			memMiB += rv.TargetMemMiB
+			cpu, err = checkedReservationAdd(cpu, rv.TargetCPU)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sum host %q CPU reservations: %w", host, err)
+			}
+			memMiB, err = checkedReservationAdd(memMiB, rv.TargetMemMiB)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sum host %q memory reservations: %w", host, err)
+			}
 		}
 	}
 	return cpu, memMiB, nil
@@ -226,8 +307,14 @@ func ProjectReserved(ctx context.Context, c *Client, project string) (cpu, memMi
 	}
 	for _, rv := range rvs {
 		if projectOrDefault(rv.Project) == project {
-			cpu += rv.ProjectCPU
-			memMiB += rv.ProjectMemMiB
+			cpu, err = checkedReservationAdd(cpu, rv.ProjectCPU)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sum project %q CPU reservations: %w", project, err)
+			}
+			memMiB, err = checkedReservationAdd(memMiB, rv.ProjectMemMiB)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sum project %q memory reservations: %w", project, err)
+			}
 		}
 	}
 	return cpu, memMiB, nil
@@ -270,13 +357,14 @@ func HostFreeCapacityWithPolicy(ctx context.Context, c *Client, host string, pol
 	}
 	allocCPU, allocMem := HostAllocatable(*h, policy)
 	u := usage[host]
-	freeCPU = allocCPU - u.CpuUsed - resCPU
-	freeMemMiB = allocMem - u.MemUsedMiB - ctMem[host] - resMem - policy.MemOverheadFor(u.VMCount)
-	if freeCPU < 0 {
-		freeCPU = 0
+	freeCPU, err = remainingCapacity(allocCPU, u.CpuUsed, resCPU)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("calculate host %q free CPU: %w", host, err)
 	}
-	if freeMemMiB < 0 {
-		freeMemMiB = 0
+	freeMemMiB, err = remainingCapacity(
+		allocMem, u.MemUsedMiB, ctMem[host], resMem, policy.MemOverheadFor(u.VMCount))
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("calculate host %q free memory: %w", host, err)
 	}
 	return freeCPU, freeMemMiB, true, nil
 }

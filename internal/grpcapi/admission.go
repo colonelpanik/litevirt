@@ -79,17 +79,37 @@ func (s *Server) checkProjectQuota(ctx context.Context, project string, cpuDelta
 	if err != nil {
 		return status.Errorf(codes.Internal, "sum project reservations: %v", err)
 	}
-	if q.VCPULimit > 0 && u.VCPUUsed+rCPU+cpuDelta > q.VCPULimit {
+	if quotaWouldExceed(q.VCPULimit, u.VCPUUsed, rCPU, cpuDelta) {
 		return status.Errorf(codes.ResourceExhausted,
 			"project %q vCPU quota exceeded (used %d + reserved %d + new %d > limit %d)",
 			project, u.VCPUUsed, rCPU, cpuDelta, q.VCPULimit)
 	}
-	if q.MemMiBLimit > 0 && u.MemMiBUsed+rMem+memMiBDelta > q.MemMiBLimit {
+	if quotaWouldExceed(q.MemMiBLimit, u.MemMiBUsed, rMem, memMiBDelta) {
 		return status.Errorf(codes.ResourceExhausted,
 			"project %q memory quota exceeded (used %d + reserved %d + new %d > limit %d)",
 			project, u.MemMiBUsed, rMem, memMiBDelta, q.MemMiBLimit)
 	}
 	return nil
+}
+
+func quotaWouldExceed(limit, used, reserved, delta int) bool {
+	if limit <= 0 {
+		return false
+	}
+	if used < 0 || reserved < 0 {
+		return true
+	}
+	if delta < 0 {
+		delta = 0
+	}
+	remaining := limit
+	for _, amount := range []int{used, reserved, delta} {
+		if amount > remaining {
+			return true
+		}
+		remaining -= amount
+	}
+	return false
 }
 
 // ensureProjectAuthority makes sure the project has a D1 admission-authority epoch,

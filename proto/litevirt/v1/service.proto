@@ -2412,6 +2412,12 @@ message VerifyAuditChainResponse {
     // sequence numbers are untouched, and only the head — signed by the
     // successor key they do not have — disagrees.
     repeated string head_mismatch = 14;
+    // Unsigned rows appearing AFTER the authoring host's first signed row.
+    // Distinct from unsigned_rows, which is ordinary pre-enforcement history:
+    // a host cannot un-adopt a key, so a row here was either inserted straight
+    // into the table — the cheapest forgery, since the content hash is unkeyed
+    // — or written by a node that lost its key and kept going.
+    repeated string unsigned_after_signed = 15;
 }
 
 message ExportAuditChainRequest {

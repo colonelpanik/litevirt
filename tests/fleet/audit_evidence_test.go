@@ -162,3 +162,62 @@ func forgeRowWithRetiredKey(t *testing.T, n *Node, kr *corrosion.AuditKeyring, i
 		t.Fatalf("insert the forged row: %v", err)
 	}
 }
+
+// TestFleet_PeerReportsARowTheAuthoringNodeCouldNotSign.
+//
+// The scenario the enforcement latch was built for, played out the way it
+// actually happens. node-0's signing key becomes unreadable — one chmod, or a
+// rotation that left a certificate whose CN no longer matches — and the daemon
+// keeps running, because refusing to run would take the host down over an audit
+// key.
+//
+// What must NOT happen is the two failure modes the first design offered: the
+// operation proceeding with no record (refusing the write, whose error every
+// caller discards), or the record landing unsigned and verifying clean forever
+// (Unsigned excluded from Tampered unconditionally). The row has to exist AND
+// the degradation has to be visible from another node, because a host reporting
+// on its own log is the arrangement a compromised host defeats.
+func TestFleet_PeerReportsARowTheAuthoringNodeCouldNotSign(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2})
+	a, b := c.Node("node-0"), c.Node("node-1")
+	signNode(t, a)
+	signNode(t, b)
+
+	auditRow(t, a, "a1", "vm.create", "vm1")
+
+	// The private key goes away; the cluster CA does not, so the node can still
+	// verify — it simply cannot sign.
+	verifier, err := corrosion.LoadAuditVerifier(a.PKIDir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	a.DB.SetAuditKeyring(verifier)
+	a.DB.SetAuditSignatureRequired(func() bool { return true })
+
+	if err := corrosion.InsertAuditLog(ctx, a.DB, corrosion.AuditRecord{
+		ID: "a2", Username: "root", HostName: a.Name,
+		Action: "vm.delete", Target: "prod-db", Result: "success",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog after the key became unreadable: %v\n"+
+			"the VM was still deleted; failing the write only removes the record", err)
+	}
+	if n := rowCount(t, a, `SELECT count(*) AS n FROM audit_log WHERE id = 'a2'`); n != 1 {
+		t.Fatalf("%s executed a vm.delete and wrote no audit row for it", a.Name)
+	}
+
+	b.DB.MergeStateBytesLWW(pullDump(t, c, a))
+
+	res := verifyOn(t, b)
+	if !res.Tampered() {
+		t.Fatalf("%s reports %s's log as intact after it wrote a row it could not sign: %+v\n"+
+			"making one file unreadable would switch tamper-evidence off cluster-wide",
+			b.Name, a.Name, res)
+	}
+	if len(res.UnsignedAfterSigned) == 0 {
+		t.Fatalf("%s did not report the unsignable row: %+v", b.Name, res)
+	}
+	if !strings.Contains(strings.Join(res.UnsignedAfterSigned, " "), "a2") {
+		t.Errorf("findings %v do not name the row", res.UnsignedAfterSigned)
+	}
+}

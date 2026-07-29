@@ -29,7 +29,7 @@ func auditInit() {
 			Name: "litevirt_audit_chain_findings",
 			Help: "Count of audit chain findings from the last verification, by kind " +
 				"(broken_hash, bad_signature, unknown_key, seq_gap, laundered, truncated, " +
-				"retired_key, head_mismatch, unsigned).",
+				"retired_key, head_mismatch, unsigned, unsigned_after_signed).",
 		}, []string{"kind"})
 		auditHeadTotal = prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_audit_chain_heads_published_total",

@@ -45,7 +45,10 @@ func (s *Server) VerifyAuditChain(ctx context.Context, _ *emptypb.Empty) (*pb.Ve
 		TruncatedHosts:   res.TruncatedHosts,
 		RetiredKeyUse:    res.RetiredKeyUse,
 		HeadMismatch:     res.HeadMismatch,
-		Tampered:         res.Tampered(),
+
+		UnsignedAfterSigned: res.UnsignedAfterSigned,
+
+		Tampered: res.Tampered(),
 	}
 	if err != nil {
 		resp.Error = err.Error()

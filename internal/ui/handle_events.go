@@ -154,6 +154,13 @@ func auditTamperSummary(resp *pb.VerifyAuditChainResponse) string {
 		{"sequence gap", len(resp.SeqGaps)},
 		{"laundered row", len(resp.Laundered)},
 		{"truncated host", len(resp.TruncatedHosts)},
+		// The categories a rotation produces. Without them a log rewritten by
+		// someone holding a rotated-out key — the case the whole rotation
+		// mechanism exists to catch — reached the operator as "unspecified
+		// finding", which is the least actionable thing this toast can say.
+		{"retired key use", len(resp.RetiredKeyUse)},
+		{"chain head mismatch", len(resp.HeadMismatch)},
+		{"unsigned row after signing began", len(resp.UnsignedAfterSigned)},
 	} {
 		if c.n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s(s)", c.n, c.label))

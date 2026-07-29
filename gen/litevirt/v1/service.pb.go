@@ -21891,9 +21891,15 @@ type VerifyAuditChainResponse struct {
 	// a key that has since been rotated out: the signature verifies and the
 	// sequence numbers are untouched, and only the head — signed by the
 	// successor key they do not have — disagrees.
-	HeadMismatch  []string `protobuf:"bytes,14,rep,name=head_mismatch,json=headMismatch,proto3" json:"head_mismatch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	HeadMismatch []string `protobuf:"bytes,14,rep,name=head_mismatch,json=headMismatch,proto3" json:"head_mismatch,omitempty"`
+	// Unsigned rows appearing AFTER the authoring host's first signed row.
+	// Distinct from unsigned_rows, which is ordinary pre-enforcement history:
+	// a host cannot un-adopt a key, so a row here was either inserted straight
+	// into the table — the cheapest forgery, since the content hash is unkeyed
+	// — or written by a node that lost its key and kept going.
+	UnsignedAfterSigned []string `protobuf:"bytes,15,rep,name=unsigned_after_signed,json=unsignedAfterSigned,proto3" json:"unsigned_after_signed,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *VerifyAuditChainResponse) Reset() {
@@ -22020,6 +22026,13 @@ func (x *VerifyAuditChainResponse) GetRetiredKeyUse() []string {
 func (x *VerifyAuditChainResponse) GetHeadMismatch() []string {
 	if x != nil {
 		return x.HeadMismatch
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetUnsignedAfterSigned() []string {
+	if x != nil {
+		return x.UnsignedAfterSigned
 	}
 	return nil
 }
@@ -24619,7 +24632,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"targetPool\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tpool_name\x18\x04 \x01(\tR\bpoolName\x12!\n" +
-	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\x8a\x04\n" +
+	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xbe\x04\n" +
 	"\x18VerifyAuditChainResponse\x12!\n" +
 	"\frows_checked\x18\x01 \x01(\x05R\vrowsChecked\x12 \n" +
 	"\fbroken_at_id\x18\x02 \x01(\tR\n" +
@@ -24636,7 +24649,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0ftruncated_hosts\x18\v \x03(\tR\x0etruncatedHosts\x12\x1a\n" +
 	"\btampered\x18\f \x01(\bR\btampered\x12&\n" +
 	"\x0fretired_key_use\x18\r \x03(\tR\rretiredKeyUse\x12#\n" +
-	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\"E\n" +
+	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\x122\n" +
+	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\"E\n" +
 	"\x17ExportAuditChainRequest\x12\x14\n" +
 	"\x05since\x18\x01 \x01(\tR\x05since\x12\x14\n" +
 	"\x05until\x18\x02 \x01(\tR\x05until\"K\n" +

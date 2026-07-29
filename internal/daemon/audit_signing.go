@@ -129,6 +129,11 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			"retired_key":   len(res.RetiredKeyUse),
 			"head_mismatch": len(res.HeadMismatch),
 			"unsigned":      res.Unsigned,
+			// Distinct from "unsigned", which is ordinary pre-enforcement
+			// history and must stay alertable-on separately: this one is a
+			// tamper finding, and it is what a node writing rows it cannot sign
+			// leaves behind.
+			"unsigned_after_signed": len(res.UnsignedAfterSigned),
 		})
 		if res.Tampered() {
 			// Error, not warn: this is the one finding in the daemon that means

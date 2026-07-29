@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -111,11 +112,7 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	r.Seq = tail.seq + 1
 	r.ContentHash = HashAuditRow(r)
 
-	// Sign before writing, and fail the insert if signing fails. An audit row
-	// that silently degrades to unsigned whenever the key is unreadable would
-	// hand an attacker a way to turn tamper-evidence off: make the key
-	// unavailable and every subsequent row loses its protection with only a
-	// log line to show for it.
+	// Sign before writing, and fail the insert if signing itself errors.
 	keyring := c.AuditKeyringOf()
 	sig, err := keyring.SignRow(r.ContentHash, r.Seq)
 	if err != nil {
@@ -125,8 +122,27 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	if sig != "" {
 		r.KeyID = keyring.KeyID()
 	} else if c.auditSignatureRequiredNow() {
-		return fmt.Errorf("audit signing is enforced cluster-wide but this node has no signing "+
-			"key; refusing to append an unsigned row for %s", r.Action)
+		// The row is written UNSIGNED, not refused.
+		//
+		// Refusing was the original design, and it was wrong in the one way that
+		// matters: every caller of InsertAuditLog discards the error (the gRPC
+		// audit helper warns, failover and the health assertions assign it to
+		// `_`). So a node whose key became unreadable under a latched cluster did
+		// not fail the operation — it executed the delete, the migrate, the fence,
+		// and wrote NO row at all. A silent, total audit gap is strictly worse
+		// than the unsigned row the refusal was meant to avoid, and `lv audit
+		// verify` reported the log intact because nothing was missing to see.
+		//
+		// Degrading is only acceptable because it is loud in three independent
+		// places: this line, the SeqGaps-style UnsignedAfterSigned finding the
+		// verifier raises for any unsigned row following a host's first signed
+		// one, and the metric that finding drives. An attacker who makes the key
+		// unreadable no longer switches tamper-evidence off; they leave a trail of
+		// findings on every node that reads the log.
+		slog.Error("audit signing is enforced cluster-wide but this node has no signing key; "+
+			"the row is being written UNSIGNED and will be reported as evidence by "+
+			"`lv audit verify` on every node until the key is restored",
+			"action", r.Action, "target", r.Target, "host", r.HostName, "id", r.ID)
 	}
 
 	if err := c.Execute(ctx,
@@ -241,6 +257,12 @@ type AuditVerifyResult struct {
 	// Unsigned counts rows carrying no signature: written before v45, or while
 	// enforcement.audit_signature was off. They are chain-checked only.
 	Unsigned int
+	// UnsignedAfterSigned lists unsigned rows that appear AFTER the authoring
+	// host's first signed row. Those are not old, they are anomalous: a host
+	// that has begun signing has no legitimate way to stop, so an unsigned row
+	// past that point is either a fabricated entry inserted straight into the
+	// table or a node that lost its key and kept writing.
+	UnsignedAfterSigned []string
 	// Unverifiable counts signed rows this verifier had no keyring to check.
 	Unverifiable int
 	// BadSignature lists rows whose signature failed against the published
@@ -276,12 +298,26 @@ type AuditVerifyResult struct {
 }
 
 // Tampered reports whether anything found is evidence of deliberate
-// interference rather than age. Unsigned/Unverifiable rows are deliberately
-// NOT tampering: they are what a cluster looks like before enforcement.
+// interference rather than age.
+//
+// A bare Unsigned count is deliberately NOT tampering: it is what a cluster
+// looks like before enforcement, and flagging it would put a permanent tamper
+// verdict on every cluster with any history — protection that only produces
+// noise gets switched off.
+//
+// UnsignedAfterSigned is different, and it is why the bare count does not need
+// to be. The boundary is per host and derived from the log itself rather than
+// from the cluster latch: once a host has produced one signed row it cannot
+// legitimately produce an unsigned one, whatever the latch says and whenever it
+// formed. That closes the hole the latch was supposed to close — appending a
+// fabricated unsigned row with a recomputed hash, which verified clean because
+// the hash is unkeyed and the seq check only ran for signed rows — without
+// accusing anyone of tampering with their own pre-enforcement history.
 func (r AuditVerifyResult) Tampered() bool {
 	return r.BrokenAt != "" || len(r.BadSignature) > 0 || len(r.UnknownKeyID) > 0 ||
 		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0 ||
-		len(r.RetiredKeyUse) > 0 || len(r.HeadMismatch) > 0
+		len(r.RetiredKeyUse) > 0 || len(r.HeadMismatch) > 0 ||
+		len(r.UnsignedAfterSigned) > 0
 }
 
 // VerifyAuditChain walks every host's sub-chain and reports what it finds.
@@ -308,6 +344,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	prevByHost := map[string]string{} // per-host running tail
 	seqByHost := map[string]int64{}   // per-host last signed seq
 	hashedByHost := map[string]bool{} // has this host produced a hashed row yet?
+	signedByHost := map[string]bool{} // has this host produced a SIGNED row yet?
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
@@ -356,8 +393,20 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		sig, keyID, seq := r.String("signature"), r.String("key_id"), r.Int64("seq")
 		if sig == "" {
 			res.Unsigned++
+			// Unsigned is ordinary before a host starts signing and impossible
+			// after. A host cannot un-adopt a key, so a row here is either
+			// inserted straight into the table — the cheapest forgery, since
+			// HashAuditRow is unkeyed and the seq check below runs only for
+			// signed rows — or a node that lost its key and kept writing, which
+			// is the same evidence seen from the other side.
+			if signedByHost[host] {
+				res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
+					"%s: row %s carries no signature, but this host has already signed rows",
+					host, rec.ID))
+			}
 			continue
 		}
+		signedByHost[host] = true
 		// Sequence numbers are only meaningful once signed: an unsigned row
 		// carries seq 0 and renumbering it costs nothing.
 		if last, seen := seqByHost[host]; seen && seq != last+1 {

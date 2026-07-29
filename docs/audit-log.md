@@ -89,14 +89,30 @@ grouped by what it means:
 - **sequence gap** — a run of rows was deleted from one host's chain.
 - **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
 - **truncated** — a host's signed chain head attests to more rows than exist.
+- **retired key used** — a row signed by a key past the sequence at which it was
+  rotated out.
+- **chain head mismatch** — a row covered by a signed head was rewritten.
+- **unsigned after signed** — a host that had begun signing produced a row with
+  no signature.
 
 Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`.
 
-**Unsigned rows are not tampering.** Rows written before signing was switched on
-carry no signature; they are chain-checked only, reported as a count on the
-clean line, and exit 0. Same for rows this daemon had no keyring to check and
-rows carrying no host name — both mean part of the log went unchecked, not that
-it was altered.
+**Unsigned rows are not tampering — until the host has signed one.** Rows
+written before signing was switched on carry no signature; they are chain-checked
+only, reported as a count on the clean line, and exit 0. Flagging them would put
+a permanent tamper verdict on every cluster with any history, which is how a
+check gets ignored.
+
+The boundary is per host and comes from the log rather than from the cluster
+latch: a host cannot un-adopt a key, so once it has produced one signed row, an
+unsigned row from it afterwards is **unsigned after signed** and is tampering.
+That covers both a fabricated row inserted straight into the table — the content
+hash is unkeyed, so recomputing it costs an attacker nothing, and the absence of
+a signature is the only thing that distinguishes it — and a node that lost its
+key and kept writing.
+
+Rows this daemon had no keyring to check and rows carrying no host name are
+neither: both mean part of the log went unchecked, not that it was altered.
 
 The verify check is also exposed as the `VerifyAuditChain` gRPC RPC
 and the `/api/v1/audit/verify` REST route, so a monitoring system can

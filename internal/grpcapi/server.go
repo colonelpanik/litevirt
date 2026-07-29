@@ -619,15 +619,10 @@ func (s *Server) projectAuthorityActive(ctx context.Context) bool {
 	return s.enfProjectAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectAuthorityV1)
 }
 
-// auditSignatureActive reports whether an audit write this node cannot sign must
-// FAIL rather than land unsigned: the config flag AND the cluster-wide latch. Not
-// the same question as "does this node sign" — that is the flag alone, since a
-// signed row is backward-compatible. Only the refusal needs fleet uniformity,
-// because a cluster still producing legitimate unsigned rows cannot treat an
-// unsigned row as evidence of tampering.
-func (s *Server) auditSignatureActive(ctx context.Context) bool {
-	return s.enfAuditSignature && s.gate != nil && s.gate.Enforced(ctx, capabilities.AuditSignatureV1)
-}
+// The audit-signature latch is consulted on the corrosion client (see
+// SetAuditSignatureRequired in daemon.go), not here. It used to have a mirror
+// predicate on the server that nothing ever called — a gate for a refusal that
+// the write path had already stopped performing.
 
 // liveResizeActive reports whether this node may originate live-resize behavior
 // (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an

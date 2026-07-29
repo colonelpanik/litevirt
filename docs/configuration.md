@@ -255,10 +255,13 @@ enforcement:
                               # rewritten history. Setting this flag turns SIGNING on by
                               # itself (signed rows are backward-compatible; old peers
                               # replicate the new columns untouched). The token is advertised
-                              # only while the flag is on, and once it latches fleet-wide an
-                              # audit write this node CANNOT sign fails instead of landing
-                              # unsigned — until then unsigned rows are still normal, so they
-                              # cannot be read as evidence. Enable fleet-uniformly; the flag
+                              # only while the flag is on, and once it latches fleet-wide a
+                              # write this node cannot sign is logged as an error and still
+                              # RECORDED — dropping the row would lose the record of an
+                              # operation that happened, which is the outcome an attacker
+                              # would pick. It is caught instead by the verifier: once a host
+                              # has signed one row, a later unsigned row from it is reported
+                              # as tampering on every node. Enable fleet-uniformly; the flag
                               # is the reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt

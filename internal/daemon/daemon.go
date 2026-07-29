@@ -706,11 +706,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
 	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)      // drives the latch + conditional advertisement
-	// Once the whole cluster has latched audit_signature_v1, a node that cannot
-	// sign must FAIL the audit write rather than append an unsigned row. Without
-	// that, tamper-evidence is removable by making the key unreadable — the log
-	// would quietly revert to the state this exists to fix. Latched, not
-	// Enforced: this is read on the audit write path, which must not ping peers.
+	// Once the whole cluster has latched audit_signature_v1, a write this node
+	// cannot sign is an error-level event rather than a normal one.
+	//
+	// It is NOT a refusal. Refusing was the first design and it lost the record
+	// of operations that had already happened, because every caller of
+	// InsertAuditLog discards its error — so the delete or the fence went ahead
+	// with no audit row at all, which is exactly what an attacker would arrange
+	// by making one file unreadable. The row is written unsigned and the
+	// verifier reports it: a host that has signed once cannot legitimately stop,
+	// so every such row is tampering on every node that reads the log.
+	//
+	// Latched, not Enforced: this is read on the audit write path, which must
+	// not ping peers.
 	d.db.SetAuditSignatureRequired(func() bool {
 		return d.cfg.Enforcement.AuditSignature && d.checker.Latched(capabilities.AuditSignatureV1)
 	})

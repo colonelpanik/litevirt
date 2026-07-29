@@ -128,6 +128,7 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		{"laundered (row blanked its own hash to fake a chain reset):", resp.Laundered},
 		{"retired key used (signed after the key was rotated out):", resp.RetiredKeyUse},
 		{"chain head mismatch (a row covered by a signed head was rewritten):", resp.HeadMismatch},
+		{"unsigned after signed (a host that had begun signing produced an unsigned row):", resp.UnsignedAfterSigned},
 	} {
 		if len(g.rows) == 0 {
 			continue

@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 )
 
 // ReservationVector is the capacity an in-flight operation has reserved, persisted
@@ -26,6 +27,15 @@ type ReservationVector struct {
 	SourceHost    string `json:"source_host,omitempty"`
 }
 
+// ReservationFacts is persisted on the reserved operation step. It is kept
+// separate from the requested capacity vector because it proves who authorized
+// that request, and therefore participates in authority-epoch validation.
+type ReservationFacts struct {
+	Project        string `json:"project"`
+	AuthorityEpoch int64  `json:"authority_epoch"`
+	AuthorityHost  string `json:"authority_host"`
+}
+
 // Encode serializes the vector for the operations.reservation_json column. A zero
 // vector encodes to "" (no reservation).
 func (r ReservationVector) Encode() (string, error) {
@@ -47,12 +57,32 @@ func DecodeReservation(s string) (ReservationVector, error) {
 	return r, err
 }
 
+func reservationStepFacts(facts *ReservationFacts, project string) (string, error) {
+	if facts == nil {
+		return "", nil // backward-compatible pre-authority reservation
+	}
+	if facts.AuthorityEpoch <= 0 || facts.AuthorityHost == "" {
+		return "", fmt.Errorf("invalid reservation authority facts")
+	}
+	if projectOrDefault(facts.Project) != projectOrDefault(project) {
+		return "", fmt.Errorf("reservation project does not match operation project")
+	}
+	normalized := ReservationFacts{
+		Project:        projectOrDefault(project),
+		AuthorityEpoch: facts.AuthorityEpoch,
+		AuthorityHost:  facts.AuthorityHost,
+	}
+	b, err := json.Marshal(normalized)
+	return string(b), err
+}
+
 // nonterminalReservations returns the reservation vector of every operation whose
 // reduced state is NOT terminal — the in-flight capacity claims admission must
 // count on top of committed running-VM actuals.
 func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVector, error) {
 	orows, err := c.Query(ctx,
-		`SELECT id, operation_kind, reservation_json FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
+		`SELECT id, project, operation_kind, reservation_json, vm_owner_epoch
+		 FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
 	if err != nil {
 		return nil, err
 	}
@@ -60,29 +90,65 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 		return nil, nil
 	}
 
-	// Bulk-load steps once, grouped by operation id (arbitrary owner epoch — the
-	// reducer only needs the set of step names to decide terminality).
-	srows, err := c.Query(ctx, `SELECT operation_id, step_name FROM operation_steps WHERE deleted_at IS NULL`)
+	// Bulk-load steps once, grouped by operation id + the immutable header's
+	// owner epoch. A terminal written by a stale owner must not release the
+	// current owner's reservation.
+	srows, err := c.Query(ctx,
+		`SELECT operation_id, owner_epoch, step_name, facts
+		 FROM operation_steps WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
-	stepsByOp := make(map[string][]string, len(orows))
+	stepsByOpEpoch := make(map[string][]string, len(orows))
+	reservationFactsByOpEpoch := make(map[string]string, len(orows))
 	for _, r := range srows {
 		id := r.String("operation_id")
-		stepsByOp[id] = append(stepsByOp[id], r.String("step_name"))
+		key := fmt.Sprintf("%s\x00%d", id, r.Int64("owner_epoch"))
+		stepsByOpEpoch[key] = append(stepsByOpEpoch[key], r.String("step_name"))
+		if r.String("step_name") == OpStepReserved {
+			reservationFactsByOpEpoch[key] = r.String("facts")
+		}
 	}
 
 	var out []ReservationVector
 	for _, r := range orows {
 		id := r.String("id")
 		kind := OperationKind(r.String("operation_kind"))
-		state, _ := ReduceOperationState(kind, stepsByOp[id])
+		key := fmt.Sprintf("%s\x00%d", id, r.Int64("vm_owner_epoch"))
+		state, _ := ReduceOperationState(kind, stepsByOpEpoch[key])
 		if IsOperationTerminal(state) {
 			continue
 		}
 		rv, err := DecodeReservation(r.String("reservation_json"))
 		if err != nil {
 			return nil, err
+		}
+		authority, ok, err := CurrentProjectAuthority(ctx, c, r.String("project"))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			rawFacts := reservationFactsByOpEpoch[key]
+			if rawFacts == "" {
+				// A pre-authority reservation cannot be attributed to the
+				// current authority. It remains journal-visible but does not
+				// consume capacity after an authority epoch is established.
+				continue
+			}
+			var facts ReservationFacts
+			if err := json.Unmarshal([]byte(rawFacts), &facts); err != nil {
+				return nil, fmt.Errorf("reservation %s has malformed authority facts: %w", id, err)
+			}
+			if facts.Project == "" || facts.AuthorityEpoch <= 0 || facts.AuthorityHost == "" {
+				return nil, fmt.Errorf("reservation %s has malformed authority facts", id)
+			}
+			if facts.AuthorityEpoch != authority.Epoch {
+				continue // reservation minted by a fenced/stale authority
+			}
+			if projectOrDefault(facts.Project) != authority.Project ||
+				facts.AuthorityHost != authority.Holder {
+				return nil, fmt.Errorf("reservation %s has invalid current-authority facts", id)
+			}
 		}
 		out = append(out, rv)
 	}

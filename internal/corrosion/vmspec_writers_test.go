@@ -19,6 +19,8 @@ import (
 // add it here WITH a comment justifying why it can't use the sanctioned APIs.
 var sanctionedSpecWriters = map[string]string{
 	"InsertVMWithHardware":      "creates the row (InsertVM delegates here with nics/pciIntents nil)",
+	"BeginVMCreateOperation":    "creates the provisional row with its operation barrier in the same transaction",
+	"CommitVMCreateOperation":   "commits the provisional row's desired/observed fields under operation+owner+generation fencing",
 	"RenameVM":                  "structural rename — changes the primary key, can't use a name-keyed CAS",
 	"BeginVMOperation":          "F1 op-start: sets desired spec + bumps generation + claims the barrier atomically",
 	"MutateDesiredSpec":         "THE sanctioned desired-spec writer",

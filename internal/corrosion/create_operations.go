@@ -1,0 +1,506 @@
+package corrosion
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+)
+
+// BeginVMCreateOperation atomically persists a create claim, its capacity
+// reservation, and a provisional VM row. applied is true only for the first
+// successful claim; an identical retry returns false without changing state.
+func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord, vm VMRecord) (bool, error) {
+	if err := normalizeCreateIdentity(&op, vm.Name, "vm", vm.OwnerEpoch); err != nil {
+		return false, err
+	}
+	vm.OwnerEpoch = op.VMOwnerEpoch
+	if vm.Project == "" {
+		vm.Project = projectOrDefault(op.Project)
+	} else {
+		vm.Project = projectOrDefault(vm.Project)
+	}
+	if vm.Project != projectOrDefault(op.Project) {
+		return false, fmt.Errorf("%w: operation project %q does not match VM project %q",
+			ErrOperationIdentityConflict, op.Project, vm.Project)
+	}
+	op.Project = vm.Project
+	if _, err := DecodeReservation(op.ReservationJSON); err != nil {
+		return false, fmt.Errorf("decode reservation: %w", err)
+	}
+	reservedFacts, err := reservationStepFacts(op.ReservationFacts, op.Project)
+	if err != nil {
+		return false, err
+	}
+	now, wall := c.NowTS(), nowRFC3339()
+	guard := func(tx *sql.Tx) (bool, error) {
+		existing, err := operationInTx(ctx, tx, op.ID)
+		if err != nil {
+			return false, err
+		}
+		if existing != nil {
+			if err := compareOperationClaim(*existing, op); err != nil {
+				return false, err
+			}
+			return false, compareReservedStepInTx(ctx, tx, op.ID, op.VMOwnerEpoch, reservedFacts)
+		}
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM vms WHERE name = ?`, vm.Name).Scan(&n); err != nil {
+			return false, err
+		}
+		return n == 0, nil
+	}
+	stmts := []Statement{
+		operationInsertStatement(op, wall, now),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepPlanned, "", wall, now),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepReserved, reservedFacts, wall, now),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepDesiredPersisted, "", wall, now),
+		{
+			SQL: `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
+				cpu_actual, mem_actual, project, is_template, vm_owner_epoch,
+				spec_generation, active_operation_id, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			Params: []interface{}{
+				vm.Name, vm.StackName, vm.HostName, vm.Spec, vm.StateDetail,
+				vm.CPUActual, vm.MemActual, vm.Project, boolToInt(vm.IsTemplate),
+				vm.OwnerEpoch, vm.SpecGeneration, op.ID, wall, now,
+			},
+		},
+	}
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// CommitVMCreateOperation atomically installs the complete persisted hardware,
+// marks the provisional VM running, clears its operation barrier, and terminates
+// the journal. A stale owner, generation, or operation id is a no-op.
+func (c *Client) CommitVMCreateOperation(ctx context.Context, opID string, ownerEpoch int64, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, intents []PCIIntentRecord) (bool, error) {
+	now, wall := c.NowTS(), nowRFC3339()
+	guard := func(tx *sql.Tx) (bool, error) {
+		var oe, generation int64
+		var active, state string
+		err := tx.QueryRowContext(ctx,
+			`SELECT vm_owner_epoch, spec_generation, active_operation_id, state
+			 FROM vms WHERE name = ? AND deleted_at IS NULL`, vm.Name).
+			Scan(&oe, &generation, &active, &state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return state == "creating" && active == opID && oe == ownerEpoch &&
+			generation == vm.SpecGeneration, nil
+	}
+	stmts, err := vmCreateHardwareStatements(c, vm.Name, ifaces, disks, nics, intents, now)
+	if err != nil {
+		return false, err
+	}
+	stmts = append(stmts,
+		Statement{
+			SQL: `UPDATE vms SET stack_name = ?, host_name = ?, spec = ?, state = 'running',
+				state_detail = ?, cpu_actual = ?, mem_actual = ?, project = ?, is_template = ?,
+				hardware_adoption_state = 'adopted', hardware_adoption_error = NULL,
+				active_operation_id = '', updated_at = ?
+			 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
+			   AND vm_owner_epoch = ? AND spec_generation = ? AND deleted_at IS NULL`,
+			Params: []interface{}{
+				vm.StackName, vm.HostName, vm.Spec, vm.StateDetail, vm.CPUActual, vm.MemActual,
+				projectOrDefault(vm.Project), boolToInt(vm.IsTemplate), now, vm.Name, opID,
+				ownerEpoch, vm.SpecGeneration,
+			},
+		},
+		operationStepInsertStatement(opID, ownerEpoch, OpStepPrepared, "", wall, now),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepRuntimeStarted, "", wall, now),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepObserved, "", wall, now),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepCompleted, "", wall, now),
+	)
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// RollbackVMCreateOperation tombstones only the matching provisional row and
+// terminalizes the operation after compensation. It cannot affect a running VM
+// or a row now owned by a different operation/epoch.
+func (c *Client) RollbackVMCreateOperation(ctx context.Context, name, opID string, ownerEpoch int64, facts string) (bool, error) {
+	now, wall := c.NowTS(), nowRFC3339()
+	guard := func(tx *sql.Tx) (bool, error) {
+		var oe int64
+		var active, state string
+		err := tx.QueryRowContext(ctx,
+			`SELECT vm_owner_epoch, active_operation_id, state
+			 FROM vms WHERE name = ? AND deleted_at IS NULL`, name).
+			Scan(&oe, &active, &state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return state == "creating" && active == opID && oe == ownerEpoch, nil
+	}
+	return c.ExecuteBatchGuarded(ctx, guard, []Statement{
+		{
+			SQL: `UPDATE vms SET active_operation_id = '', deleted_at = ?, updated_at = ?
+			 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
+			   AND vm_owner_epoch = ? AND deleted_at IS NULL`,
+			Params: []interface{}{wall, now, name, opID, ownerEpoch},
+		},
+		operationStepInsertStatement(opID, ownerEpoch, OpStepRollbackCompleted, facts, wall, now),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepFailed, facts, wall, now),
+	})
+}
+
+// BeginContainerCreateOperation is the container equivalent of
+// BeginVMCreateOperation. Container identity includes its host because v44 keeps
+// the historical (host_name,name) primary key.
+func (c *Client) BeginContainerCreateOperation(ctx context.Context, op OperationRecord, ct ContainerRecord) (bool, error) {
+	if err := normalizeCreateIdentity(&op, ct.Name, "container", ct.OwnerEpoch); err != nil {
+		return false, err
+	}
+	ct.OwnerEpoch = op.VMOwnerEpoch
+	if ct.Project == "" {
+		ct.Project = projectOrDefault(op.Project)
+	} else {
+		ct.Project = projectOrDefault(ct.Project)
+	}
+	if ct.Project != projectOrDefault(op.Project) {
+		return false, fmt.Errorf("%w: operation project %q does not match container project %q",
+			ErrOperationIdentityConflict, op.Project, ct.Project)
+	}
+	op.Project = ct.Project
+	if _, err := DecodeReservation(op.ReservationJSON); err != nil {
+		return false, fmt.Errorf("decode reservation: %w", err)
+	}
+	reservedFacts, err := reservationStepFacts(op.ReservationFacts, op.Project)
+	if err != nil {
+		return false, err
+	}
+	labels, err := encodeContainerLabels(ct.Labels)
+	if err != nil {
+		return false, err
+	}
+	now, wall := c.NowTS(), nowRFC3339()
+	guard := func(tx *sql.Tx) (bool, error) {
+		existing, err := operationInTx(ctx, tx, op.ID)
+		if err != nil {
+			return false, err
+		}
+		if existing != nil {
+			if err := compareOperationClaim(*existing, op); err != nil {
+				return false, err
+			}
+			return false, compareReservedStepInTx(ctx, tx, op.ID, op.VMOwnerEpoch, reservedFacts)
+		}
+		var n int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM containers WHERE host_name = ? AND name = ?`,
+			ct.HostName, ct.Name).Scan(&n); err != nil {
+			return false, err
+		}
+		return n == 0, nil
+	}
+	return c.ExecuteBatchGuarded(ctx, guard, []Statement{
+		operationInsertStatement(op, wall, now),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepPlanned, "", wall, now),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepReserved, reservedFacts, wall, now),
+		operationStepInsertStatement(op.ID, op.VMOwnerEpoch, OpStepDesiredPersisted, "", wall, now),
+		{
+			SQL: `INSERT INTO containers
+			 (host_name, name, state, image, cpu_limit, memory_mib, labels,
+			  restart_policy, state_detail, project, is_template, on_host_failure,
+			  create_spec, relocate_token, owner_epoch, spec_generation,
+			  active_operation_id, created_at, updated_at)
+			 VALUES (?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			Params: []interface{}{
+				ct.HostName, ct.Name, ct.Image, ct.CPULimit, ct.MemMiB, labels,
+				ct.RestartPolicy, ct.StateDetail, ct.Project, boolToInt(ct.IsTemplate),
+				ct.OnHostFailure, ct.CreateSpec, ct.RelocateToken, ct.OwnerEpoch,
+				ct.SpecGeneration, op.ID, wall, now,
+			},
+		},
+	})
+}
+
+// CommitContainerCreateOperation atomically persists the container's complete
+// managed-interface set and commits its provisional row.
+func (c *Client) CommitContainerCreateOperation(ctx context.Context, opID string, ownerEpoch int64, ct ContainerRecord, ifaces []ContainerInterfaceRecord) (bool, error) {
+	labels, err := encodeContainerLabels(ct.Labels)
+	if err != nil {
+		return false, err
+	}
+	now, wall := c.NowTS(), nowRFC3339()
+	guard := func(tx *sql.Tx) (bool, error) {
+		var oe, generation int64
+		var active, state string
+		err := tx.QueryRowContext(ctx,
+			`SELECT owner_epoch, spec_generation, active_operation_id, state
+			 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			ct.HostName, ct.Name).Scan(&oe, &generation, &active, &state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return state == "creating" && active == opID && oe == ownerEpoch &&
+			generation == ct.SpecGeneration, nil
+	}
+	stmts := make([]Statement, 0, len(ifaces)+5)
+	for _, ifc := range ifaces {
+		ifc.HostName, ifc.CtName = ct.HostName, ct.Name
+		stmt, err := containerInterfaceStmtAt(ifc, now)
+		if err != nil {
+			return false, err
+		}
+		stmts = append(stmts, stmt)
+	}
+	stmts = append(stmts,
+		Statement{
+			SQL: `UPDATE containers SET state = 'running', image = ?, cpu_limit = ?,
+				memory_mib = ?, labels = ?, restart_policy = ?, state_detail = ?,
+				project = ?, is_template = ?, on_host_failure = ?, create_spec = ?,
+				relocate_token = ?, active_operation_id = '', updated_at = ?
+			 WHERE host_name = ? AND name = ? AND state = 'creating'
+			   AND active_operation_id = ? AND owner_epoch = ? AND spec_generation = ?
+			   AND deleted_at IS NULL`,
+			Params: []interface{}{
+				ct.Image, ct.CPULimit, ct.MemMiB, labels, ct.RestartPolicy,
+				ct.StateDetail, projectOrDefault(ct.Project), boolToInt(ct.IsTemplate),
+				ct.OnHostFailure, ct.CreateSpec, ct.RelocateToken, now, ct.HostName,
+				ct.Name, opID, ownerEpoch, ct.SpecGeneration,
+			},
+		},
+		operationStepInsertStatement(opID, ownerEpoch, OpStepPrepared, "", wall, now),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepRuntimeStarted, "", wall, now),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepObserved, "", wall, now),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepCompleted, "", wall, now),
+	)
+	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// RollbackContainerCreateOperation is the fenced container counterpart of
+// RollbackVMCreateOperation.
+func (c *Client) RollbackContainerCreateOperation(ctx context.Context, hostName, name, opID string, ownerEpoch int64, facts string) (bool, error) {
+	now, wall := c.NowTS(), nowRFC3339()
+	guard := func(tx *sql.Tx) (bool, error) {
+		var oe int64
+		var active, state string
+		err := tx.QueryRowContext(ctx,
+			`SELECT owner_epoch, active_operation_id, state FROM containers
+			 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`, hostName, name).
+			Scan(&oe, &active, &state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return state == "creating" && active == opID && oe == ownerEpoch, nil
+	}
+	return c.ExecuteBatchGuarded(ctx, guard, []Statement{
+		{
+			SQL: `UPDATE containers SET active_operation_id = '', deleted_at = ?, updated_at = ?
+			 WHERE host_name = ? AND name = ? AND state = 'creating'
+			   AND active_operation_id = ? AND owner_epoch = ? AND deleted_at IS NULL`,
+			Params: []interface{}{wall, now, hostName, name, opID, ownerEpoch},
+		},
+		operationStepInsertStatement(opID, ownerEpoch, OpStepRollbackCompleted, facts, wall, now),
+		operationStepInsertStatement(opID, ownerEpoch, OpStepFailed, facts, wall, now),
+	})
+}
+
+func normalizeCreateIdentity(op *OperationRecord, resourceID, resourceKind string, ownerEpoch int64) error {
+	if op.ID == "" || resourceID == "" {
+		return fmt.Errorf("%w: operation and resource ids must be non-empty", ErrOperationIdentityConflict)
+	}
+	if op.ResourceID != resourceID || op.ResourceKind != resourceKind ||
+		OperationKind(op.OperationKind) != OpWorkloadCreate {
+		return fmt.Errorf("%w: got kind=%q resource=%q operation_kind=%q",
+			ErrOperationIdentityConflict, op.ResourceKind, op.ResourceID, op.OperationKind)
+	}
+	if op.VMOwnerEpoch != 0 && ownerEpoch != 0 && op.VMOwnerEpoch != ownerEpoch {
+		return fmt.Errorf("%w: owner epoch mismatch", ErrOperationIdentityConflict)
+	}
+	if op.VMOwnerEpoch == 0 {
+		op.VMOwnerEpoch = ownerEpoch
+	}
+	return nil
+}
+
+func operationInTx(ctx context.Context, tx *sql.Tx, id string) (*OperationRecord, error) {
+	var op OperationRecord
+	var deleted sql.NullString
+	err := tx.QueryRowContext(ctx,
+		`SELECT id, method, principal, project, resource_kind, resource_id,
+		        operation_kind, request_hash, idempotency_key, reservation_json,
+		        desired_ref, vm_owner_epoch, created_at, updated_at, deleted_at
+		 FROM operations WHERE id = ?`, id).
+		Scan(&op.ID, &op.Method, &op.Principal, &op.Project, &op.ResourceKind,
+			&op.ResourceID, &op.OperationKind, &op.RequestHash, &op.IdempotencyKey,
+			&op.ReservationJSON, &op.DesiredRef, &op.VMOwnerEpoch, &op.CreatedAt,
+			&op.UpdatedAt, &deleted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if deleted.Valid {
+		op.DeletedAt = deleted.String
+	}
+	return &op, nil
+}
+
+func compareOperationClaim(existing, requested OperationRecord) error {
+	if existing.RequestHash != requested.RequestHash {
+		return ErrOperationHashConflict
+	}
+	if existing.Method != requested.Method || existing.Principal != requested.Principal ||
+		projectOrDefault(existing.Project) != projectOrDefault(requested.Project) ||
+		existing.ResourceKind != requested.ResourceKind ||
+		existing.ResourceID != requested.ResourceID ||
+		existing.OperationKind != requested.OperationKind ||
+		existing.IdempotencyKey != requested.IdempotencyKey ||
+		existing.ReservationJSON != requested.ReservationJSON ||
+		existing.DesiredRef != requested.DesiredRef ||
+		existing.VMOwnerEpoch != requested.VMOwnerEpoch {
+		return ErrOperationIdentityConflict
+	}
+	return nil
+}
+
+func compareReservedStepInTx(ctx context.Context, tx *sql.Tx, opID string, ownerEpoch int64, requestedFacts string) error {
+	var existingFacts string
+	err := tx.QueryRowContext(ctx,
+		`SELECT facts FROM operation_steps
+		 WHERE operation_id = ? AND owner_epoch = ? AND step_name = ? AND deleted_at IS NULL`,
+		opID, ownerEpoch, OpStepReserved).Scan(&existingFacts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrOperationStepConflict
+	}
+	if err != nil {
+		return err
+	}
+	if existingFacts != requestedFacts {
+		return ErrOperationStepConflict
+	}
+	return nil
+}
+
+func operationInsertStatement(op OperationRecord, wall, now string) Statement {
+	return Statement{
+		SQL: `INSERT INTO operations (` + operationCols + `)
+		     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		Params: []interface{}{
+			op.ID, op.Method, op.Principal, op.Project, op.ResourceKind, op.ResourceID,
+			op.OperationKind, op.RequestHash, op.IdempotencyKey, op.ReservationJSON,
+			op.DesiredRef, op.VMOwnerEpoch, wall, now,
+		},
+	}
+}
+
+func operationStepInsertStatement(opID string, ownerEpoch int64, step, facts, wall, now string) Statement {
+	return Statement{
+		SQL: `INSERT INTO operation_steps
+		     (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
+		     VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+		Params: []interface{}{opID, ownerEpoch, step, facts, wall, now},
+	}
+}
+
+func encodeContainerLabels(labels map[string]string) (string, error) {
+	if len(labels) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(labels)
+	return string(b), err
+}
+
+func containerInterfaceStmtAt(r ContainerInterfaceRecord, now string) (Statement, error) {
+	sgs, err := encodeSGs(r.SecurityGroups)
+	if err != nil {
+		return Statement{}, err
+	}
+	return Statement{
+		SQL: `INSERT OR REPLACE INTO container_interfaces
+		 (host_name, ct_name, network_name, ordinal, mac, ip, veth_device, security_groups, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		Params: []interface{}{
+			r.HostName, r.CtName, r.NetworkName, r.Ordinal, r.MAC, r.IP,
+			r.VethDevice, sgs, now,
+		},
+	}, nil
+}
+
+func vmCreateHardwareStatements(c *Client, vmName string, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, intents []PCIIntentRecord, now string) ([]Statement, error) {
+	stmts := make([]Statement, 0, len(ifaces)+len(disks)+len(nics)+len(intents))
+	for _, iface := range ifaces {
+		sgs, err := encodeSGs(iface.SecurityGroups)
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT INTO vm_interfaces
+			 (vm_name, network_name, ordinal, mac, ip, tap_device, security_groups, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			Params: []interface{}{
+				vmName, iface.NetworkName, iface.Ordinal, iface.MAC, iface.IP,
+				iface.TapDevice, sgs, now,
+			},
+		})
+	}
+	for _, disk := range disks {
+		deviceKind := disk.DeviceKind
+		if deviceKind == "" {
+			deviceKind = "disk"
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT INTO vm_disks
+			 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
+			  storage_type, storage_volume, target_dev, backing_disk, bus,
+			  device_kind, delete_with_vm, controller_model, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			Params: []interface{}{
+				vmName, disk.DiskName, disk.HostName, disk.Path, disk.SizeBytes,
+				disk.BackingImage, disk.StorageType, disk.StorageVolume,
+				disk.TargetDev, nullIfEmpty(disk.BackingDisk), nullIfEmpty(disk.Bus),
+				deviceKind, boolToInt(disk.DeleteWithVM),
+				nullIfEmpty(disk.ControllerModel), now,
+			},
+		})
+	}
+	for _, nic := range nics {
+		model := nic.Model
+		if model == "" {
+			model = "virtio"
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT OR REPLACE INTO vm_nics
+			 (vm_name, id, network_name, model, mac, ordinal, ip, tap_device,
+			  security_groups, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			Params: []interface{}{
+				vmName, nic.ID, nic.NetworkName, model, nic.MAC, nic.Ordinal,
+				nullIfEmpty(nic.IP), nullIfEmpty(nic.TapDevice),
+				nullIfEmpty(nic.SecurityGroups), now,
+			},
+		})
+	}
+	for _, in := range intents {
+		var exclusive interface{}
+		if in.ExclusiveKey != nil {
+			exclusive = *in.ExclusiveKey
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT OR REPLACE INTO vm_pci_intent
+			 (vm_name, device_id, host_name, selector_kind, selector_payload,
+			  exclusive_key, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+			Params: []interface{}{
+				vmName, in.DeviceID, in.HostName, in.SelectorKind,
+				in.SelectorPayload, exclusive, now,
+			},
+		})
+	}
+	return stmts, nil
+}

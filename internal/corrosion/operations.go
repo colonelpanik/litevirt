@@ -25,6 +25,11 @@ var (
 	// ErrOperationStepConflict: the same step key already exists with DIFFERENT
 	// facts — corruption (two executors recorded conflicting facts for one step).
 	ErrOperationStepConflict = errors.New("operation step already exists with different facts")
+	// ErrOperationIdentityConflict means a deterministic operation id was reused
+	// for a different immutable request identity. Request hash equality alone is
+	// insufficient: a buggy caller must not redirect an existing claim to a
+	// different method, project, resource, or operation kind.
+	ErrOperationIdentityConflict = errors.New("operation id already exists with a different identity")
 )
 
 // OperationRecord is the immutable operations header. It holds only the REQUESTED
@@ -41,11 +46,15 @@ type OperationRecord struct {
 	RequestHash     string
 	IdempotencyKey  string
 	ReservationJSON string
-	DesiredRef      string
-	VMOwnerEpoch    int64
-	CreatedAt       string
-	UpdatedAt       string
-	DeletedAt       string
+	// ReservationFacts is transient input to workload-operation begin helpers.
+	// It is persisted on the reserved operation step, not in the immutable
+	// operations header (and therefore is nil on records read from storage).
+	ReservationFacts *ReservationFacts
+	DesiredRef       string
+	VMOwnerEpoch     int64
+	CreatedAt        string
+	UpdatedAt        string
+	DeletedAt        string
 }
 
 // OperationStepRecord is one append-only step of an operation.

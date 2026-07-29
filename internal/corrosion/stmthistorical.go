@@ -119,9 +119,7 @@ func HistoricalShapes() []HistoricalShape {
 		   relocate_token = excluded.relocate_token,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`, "containers_upsert_v130")
-	add(`INSERT OR REPLACE INTO containers
-		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at, deleted_at)
-		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, "containers_rekey_v130")
+	add(legacyContainerRekeySQL, "containers_rekey_v130")
 	add(`INSERT OR REPLACE INTO notification_routes (id, event_pattern, target_id, min_severity, enabled, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`, "notification_routes_insert_v130")
 

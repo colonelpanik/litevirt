@@ -1401,19 +1401,182 @@ func legacyWorkloadDeleteEntryDecision(
 			return true, false, invalidf("legacy container delete entry has an unexpected statement sequence")
 		}
 	case mustStatementFingerprint(legacyContainerStrictDeleteSQL):
-		// Retained RekeyContainerOwner batches begin with this strict source
-		// tombstone and then carry the target row/interfaces/lease transfer.
-		// Classifying the first statement makes an authority mismatch skip the
-		// entire transaction; the remaining registered statements are still
-		// independently parsed and authorized when the pre-authority source is safe.
 		if legacyIndex != 0 || len(parent.Params) != 4 {
 			return true, false, invalidf("legacy strict container delete has an unexpected binding")
+		}
+		if len(stmts) > 1 {
+			envelope, envelopeErr := validateLegacyContainerRekeyEnvelope(stmts, fps)
+			if envelopeErr != nil {
+				return true, false, envelopeErr
+			}
+			allowed, safeErr := legacyContainerRekeySafe(ctx, tx, envelope)
+			return true, allowed, safeErr
 		}
 	default:
 		return true, false, invalidf("unexpected legacy workload delete fingerprint")
 	}
 	allowed, matchErr := legacyWorkloadDeleteMatchesPreAuthority(ctx, tx, parent, parentShape)
 	return true, allowed, matchErr
+}
+
+type legacyContainerRekeyEnvelope struct {
+	sourceHost string
+	name       string
+	targetHost string
+	clock      string
+	target     Statement
+}
+
+func validateLegacyContainerRekeyEnvelope(
+	stmts []Statement, fps []string,
+) (legacyContainerRekeyEnvelope, error) {
+	if len(stmts) < 4 || len(fps) != len(stmts) {
+		return legacyContainerRekeyEnvelope{},
+			invalidf("legacy container rekey has an incomplete statement sequence")
+	}
+	expectedParent := mustStatementFingerprint(legacyContainerStrictDeleteSQL)
+	expectedTarget := mustStatementFingerprint(legacyContainerRekeySQL)
+	expectedCleanup := mustStatementFingerprint(containerRekeyInterfaceCleanupSQL)
+	expectedInterface := mustStatementFingerprint(containerCreateInterfaceSQL)
+	expectedLease := mustStatementFingerprint(containerRekeyLeaseSQL)
+	parent, target, cleanup := stmts[0], stmts[1], stmts[2]
+	lease := stmts[len(stmts)-1]
+	if fps[0] != expectedParent || fps[1] != expectedTarget ||
+		fps[2] != expectedCleanup || fps[len(stmts)-1] != expectedLease ||
+		len(parent.Params) != 4 || len(target.Params) != 15 ||
+		len(cleanup.Params) != 4 || len(lease.Params) != 5 {
+		return legacyContainerRekeyEnvelope{},
+			invalidf("legacy container rekey has an unexpected statement role")
+	}
+	sourceHost, name := coerceString(parent.Params[2]), coerceString(parent.Params[3])
+	targetHost := coerceString(target.Params[0])
+	clock := coerceString(parent.Params[1])
+	if sourceHost == "" || targetHost == "" || name == "" || sourceHost == targetHost ||
+		coerceString(target.Params[1]) != name ||
+		coerceString(target.Params[7]) != ContainerRuntimeRekeyDetail ||
+		coerceString(cleanup.Params[2]) != sourceHost ||
+		coerceString(cleanup.Params[3]) != name ||
+		coerceString(lease.Params[0]) != targetHost ||
+		coerceString(lease.Params[3]) != sourceHost ||
+		coerceString(lease.Params[4]) != name {
+		return legacyContainerRekeyEnvelope{},
+			invalidf("legacy container rekey has an unexpected identity binding")
+	}
+	if clock == "" ||
+		coerceString(parent.Params[0]) != clock ||
+		coerceString(target.Params[14]) != clock ||
+		coerceString(cleanup.Params[0]) != clock ||
+		coerceString(cleanup.Params[1]) != clock ||
+		coerceString(lease.Params[2]) != clock {
+		return legacyContainerRekeyEnvelope{},
+			invalidf("legacy container rekey does not share its parent clock")
+	}
+	for i := 3; i < len(stmts)-1; i++ {
+		if fps[i] != expectedInterface || len(stmts[i].Params) != 9 ||
+			coerceString(stmts[i].Params[0]) != targetHost ||
+			coerceString(stmts[i].Params[1]) != name ||
+			coerceString(stmts[i].Params[8]) == "" {
+			return legacyContainerRekeyEnvelope{},
+				invalidf("legacy container rekey has an unexpected target interface")
+		}
+	}
+	return legacyContainerRekeyEnvelope{
+		sourceHost: sourceHost, name: name, targetHost: targetHost,
+		clock: clock, target: target,
+	}, nil
+}
+
+func legacyContainerRekeySafe(
+	ctx context.Context, tx *sql.Tx, envelope legacyContainerRekeyEnvelope,
+) (bool, error) {
+	p := envelope.target.Params
+	var image, labels, restartPolicy, project, onHostFailure, createSpec string
+	var relocateToken, createdAt, activeOperationID string
+	var cpuLimit, memoryMiB, isTemplate int64
+	var ownerEpoch, generation int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(image, ''), cpu_limit, memory_mib, COALESCE(labels, ''),
+		        COALESCE(restart_policy, ''), COALESCE(project, '_default'),
+		        COALESCE(is_template, 0), COALESCE(on_host_failure, ''),
+		        COALESCE(create_spec, ''), COALESCE(relocate_token, ''),
+		        created_at, owner_epoch, spec_generation, active_operation_id
+		 FROM containers WHERE host_name = ? AND name = ?`,
+		envelope.sourceHost, envelope.name).
+		Scan(&image, &cpuLimit, &memoryMiB, &labels, &restartPolicy, &project,
+			&isTemplate, &onHostFailure, &createSpec, &relocateToken,
+			&createdAt, &ownerEpoch, &generation, &activeOperationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if ownerEpoch != 0 || generation != 0 || activeOperationID != "" ||
+		image != coerceString(p[2]) ||
+		cpuLimit != coerceInt64(p[3]) ||
+		memoryMiB != coerceInt64(p[4]) ||
+		labels != coerceString(p[5]) ||
+		restartPolicy != coerceString(p[6]) ||
+		project != coerceString(p[8]) ||
+		isTemplate != coerceInt64(p[9]) ||
+		onHostFailure != coerceString(p[10]) ||
+		createSpec != coerceString(p[11]) ||
+		relocateToken != coerceString(p[12]) ||
+		createdAt != coerceString(p[13]) {
+		return false, nil
+	}
+
+	var targetState, targetImage, targetLabels, targetRestart, targetDetail string
+	var targetProject, targetFailure, targetSpec, targetToken, targetCreated string
+	var targetActive string
+	var targetCPU, targetMemory, targetTemplate int64
+	var targetOwner, targetGeneration int64
+	var targetDeleted sql.NullString
+	err = tx.QueryRowContext(ctx,
+		`SELECT state, COALESCE(image, ''), cpu_limit, memory_mib,
+		        COALESCE(labels, ''), COALESCE(restart_policy, ''),
+		        COALESCE(state_detail, ''), COALESCE(project, '_default'),
+		        COALESCE(is_template, 0), COALESCE(on_host_failure, ''),
+		        COALESCE(create_spec, ''), COALESCE(relocate_token, ''),
+		        created_at, owner_epoch, spec_generation, active_operation_id,
+		        deleted_at
+		 FROM containers WHERE host_name = ? AND name = ?`,
+		envelope.targetHost, envelope.name).
+		Scan(&targetState, &targetImage, &targetCPU, &targetMemory,
+			&targetLabels, &targetRestart, &targetDetail, &targetProject,
+			&targetTemplate, &targetFailure, &targetSpec, &targetToken,
+			&targetCreated, &targetOwner, &targetGeneration, &targetActive,
+			&targetDeleted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// Modern authority is never replaceable, even when its row is tombstoned.
+	if targetOwner != 0 || targetGeneration != 0 || targetActive != "" {
+		return false, nil
+	}
+	// The v1.3 local preflight explicitly allowed replacing a soft-deleted
+	// pre-authority target.
+	if targetDeleted.Valid && targetDeleted.String != "" {
+		return true, nil
+	}
+	// A live target is safe only when it is the exact idempotent result of this
+	// retained re-key. Any differing immutable identity declines the whole batch.
+	return targetState == "running" &&
+		targetImage == coerceString(p[2]) &&
+		targetCPU == coerceInt64(p[3]) &&
+		targetMemory == coerceInt64(p[4]) &&
+		targetLabels == coerceString(p[5]) &&
+		targetRestart == coerceString(p[6]) &&
+		targetDetail == ContainerRuntimeRekeyDetail &&
+		targetProject == coerceString(p[8]) &&
+		targetTemplate == coerceInt64(p[9]) &&
+		targetFailure == coerceString(p[10]) &&
+		targetSpec == coerceString(p[11]) &&
+		targetToken == coerceString(p[12]) &&
+		targetCreated == coerceString(p[13]), nil
 }
 
 func validateGuardedMutationEntry(stmts []Statement) error {

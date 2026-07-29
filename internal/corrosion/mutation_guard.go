@@ -19,6 +19,9 @@ const (
 		 WHERE host_name = ? AND name = ?`
 	legacyContainerStrictDeleteSQL = `UPDATE containers SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`
+	legacyContainerRekeySQL = `INSERT OR REPLACE INTO containers
+		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
 	vmDeleteSQL = `UPDATE vms SET deleted_at = ?, updated_at = ?
 		 WHERE name = ? AND vm_owner_epoch = ? AND spec_generation = ?
 		   AND deleted_at IS NULL`

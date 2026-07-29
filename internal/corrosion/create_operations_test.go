@@ -2470,6 +2470,179 @@ func TestRetainedAndCurrentContainerRekeyDeletesCannotCrossRecreate(t *testing.T
 	})
 }
 
+func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T) {
+	ctx := context.Background()
+	const high = "9000000000000-0000-retained-rekey"
+
+	seedLegacySource := func(t *testing.T, c *Client) ContainerRecord {
+		t.Helper()
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "h1", Name: "ct1", State: "running", Image: "legacy",
+			Project: "p1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := GetContainer(ctx, c, "h1", "ct1")
+		if err != nil || got == nil {
+			t.Fatalf("legacy source: got=%+v err=%v", got, err)
+		}
+		return *got
+	}
+	retainedBatch := func(createdAt string) []Statement {
+		return []Statement{
+			{
+				SQL: legacyContainerStrictDeleteSQL,
+				Params: []interface{}{
+					high, high, "h1", "ct1",
+				},
+			},
+			{
+				SQL: legacyContainerRekeySQL,
+				Params: []interface{}{
+					"h2", "ct1", "legacy", 0, 0, "", "",
+					ContainerRuntimeRekeyDetail, "p1", 0, "", "", "",
+					createdAt, high,
+				},
+			},
+			{
+				SQL: containerRekeyInterfaceCleanupSQL,
+				Params: []interface{}{
+					high, high, "h1", "ct1",
+				},
+			},
+			{
+				SQL: containerCreateInterfaceSQL,
+				Params: []interface{}{
+					"h2", "ct1", "net1", 0, "52:54:00:00:00:01", "",
+					"veth-retained", "", high,
+				},
+			},
+			{
+				SQL: containerRekeyLeaseSQL,
+				Params: []interface{}{
+					"h2", high, high, "h1", "ct1",
+				},
+			},
+		}
+	}
+	entry := func(t *testing.T, origin string, stmts []Statement) *pb.MutationEntry {
+		t.Helper()
+		raw, err := json.Marshal(stmts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &pb.MutationEntry{
+			Seq: 1, Hlc: high, Origin: origin, Stmts: string(raw),
+		}
+	}
+
+	t.Run("modern target declines whole retained batch", func(t *testing.T) {
+		receiver := testClient(t)
+		source := seedLegacySource(t, receiver)
+		targetOp := createOp("op-retained-v130-modern-target", "container", "ct1", "modern", "", 2)
+		target := ContainerRecord{
+			HostName: "h2", Name: "ct1", State: "running", Image: "modern",
+			Project: "p1", OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := receiver.BeginContainerCreateOperation(
+			ctx, targetOp, target,
+		); err != nil || !applied {
+			t.Fatalf("modern target begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := receiver.CommitContainerCreateOperation(
+			ctx, targetOp.ID, 2, target, nil,
+		); err != nil || !applied {
+			t.Fatalf("modern target commit: applied=%v err=%v", applied, err)
+		}
+		targetBefore, err := GetContainer(ctx, receiver, "h2", "ct1")
+		if err != nil || targetBefore == nil {
+			t.Fatalf("modern target before replay: got=%+v err=%v", targetBefore, err)
+		}
+
+		applyMutationEntry(t, receiver,
+			entry(t, "retained-v130-modern-target", retainedBatch(source.CreatedAt)))
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
+			got.OwnerEpoch != 0 || got.SpecGeneration != 0 || got.Image != "legacy" ||
+			got.State != source.State || got.UpdatedAt != source.UpdatedAt {
+			t.Fatalf("declined retained rekey changed legacy source: %+v", got)
+		}
+		if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.SpecGeneration != 2 || got.Image != "modern" ||
+			got.State != targetBefore.State || got.UpdatedAt != targetBefore.UpdatedAt {
+			t.Fatalf("retained rekey clobbered modern target: %+v", got)
+		}
+	})
+
+	t.Run("safe legacy apply and idempotent replay", func(t *testing.T) {
+		receiver := testClient(t)
+		source := seedLegacySource(t, receiver)
+		stmts := retainedBatch(source.CreatedAt)
+		applyMutationEntry(t, receiver, entry(t, "retained-v130-safe", stmts))
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got != nil {
+			t.Fatalf("safe retained rekey left source live: %+v", got)
+		}
+		assertTarget := func() {
+			t.Helper()
+			got, err := GetContainer(ctx, receiver, "h2", "ct1")
+			if err != nil || got == nil || got.OwnerEpoch != 0 ||
+				got.SpecGeneration != 0 || got.Image != "legacy" ||
+				got.State != "running" || got.StateDetail != ContainerRuntimeRekeyDetail {
+				t.Fatalf("safe retained target: got=%+v err=%v", got, err)
+			}
+		}
+		assertTarget()
+		applyMutationEntry(t, receiver, entry(t, "retained-v130-replay", stmts))
+		assertTarget()
+	})
+
+	t.Run("malformed registered envelopes are rejected", func(t *testing.T) {
+		cases := map[string]func([]Statement) []Statement{
+			"reordered roles": func(stmts []Statement) []Statement {
+				stmts[1], stmts[2] = stmts[2], stmts[1]
+				return stmts
+			},
+			"target name misbound": func(stmts []Statement) []Statement {
+				stmts[1].Params[1] = "other"
+				return stmts
+			},
+			"source cleanup misbound": func(stmts []Statement) []Statement {
+				stmts[2].Params[2] = "other"
+				return stmts
+			},
+			"target interface misbound": func(stmts []Statement) []Statement {
+				stmts[3].Params[0] = "other"
+				return stmts
+			},
+			"lease target misbound": func(stmts []Statement) []Statement {
+				stmts[len(stmts)-1].Params[0] = "other"
+				return stmts
+			},
+			"extra registered role": func(stmts []Statement) []Statement {
+				return append(stmts, stmts[len(stmts)-1])
+			},
+		}
+		for name, mutate := range cases {
+			t.Run(name, func(t *testing.T) {
+				receiver := testClient(t)
+				source := seedLegacySource(t, receiver)
+				stmts := mutate(retainedBatch(source.CreatedAt))
+				if _, err := NewReplicator(receiver, "", RelayConfig{}).
+					ApplyRemoteMutations(ctx, []*pb.MutationEntry{
+						entry(t, "retained-v130-malformed-"+name, stmts),
+					}); err == nil {
+					t.Fatal("malformed retained rekey applied")
+				}
+				if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil {
+					t.Fatal("malformed retained rekey changed source")
+				}
+				if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got != nil {
+					t.Fatalf("malformed retained rekey manufactured target: %+v", got)
+				}
+			})
+		}
+	})
+}
+
 func TestAntiEntropyEqualAuthorityTombstoneRequiresExactIdentity(t *testing.T) {
 	ctx := context.Background()
 

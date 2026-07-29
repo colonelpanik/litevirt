@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/litevirt/litevirt/internal/metrics"
 )
 
 // clockCleanExitSignals are the signals systemd counts as a CLEAN termination.
@@ -52,6 +54,7 @@ func drainIgnoredSignals(ctx context.Context) <-chan os.Signal {
 				slog.Warn("ignoring signal: the daemon neither terminates nor reloads on it; "+
 					"dying here would look like a clean exit to systemd and leave this node down",
 					"signal", sig.String())
+				metrics.SignalIgnored(sig.String())
 				select {
 				case observed <- sig:
 				default:

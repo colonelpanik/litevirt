@@ -450,9 +450,23 @@ past a retention floor (`tombstone_gc_retention_hours` /
 `tombstone_gc_orphan_retention_hours` in the reference above); the count is exported
 as `litevirt_gc_rows_deleted_total` (labeled by `table`).
 
+The same hourly sweep retires admission authority still held by projects that no
+longer exist, and expires capacity leases abandoned by a crash between reserve and
+release. Both are reported in the journal when they find anything.
+
 The sweep is local-only and deterministic (each node prunes its own copy; it
 never touches a current-active-set or current-generation row), so it is safe on a
 live cluster.
+
+### Signals the daemon ignores
+
+The daemon deliberately does not terminate on `SIGHUP` or `SIGPIPE`, and does not
+treat `SIGHUP` as a config reload. systemd counts death by either as a *clean*
+exit, so a `SIGHUP` from `needrestart` or `unattended-upgrades` would leave the
+node down with the unit reporting success. Each ignored signal is logged and
+counted as `litevirt_signal_ignored_total` (labeled by `signal`) — a rising count
+means something on the host keeps trying to bounce the orchestrator, which is
+worth chasing even though the daemon now survives it.
 
 ## Capacity and overcommit
 

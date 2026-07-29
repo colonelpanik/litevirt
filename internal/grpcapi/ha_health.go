@@ -16,9 +16,10 @@ const (
 	haDemotionUnfenced  = "demotion_unfenced"       // a minority node's VIP demote FAILED and it has no verified self-fence — the majority holds in the safe gap (VIP outage until repaired / a fence is provided)
 	haVIPNoHolder       = "vip_no_holder"           // a configured VIP is served by nobody
 	haStrandedPending   = "legacy_pending_stranded" // a markerless pending VM refused proof_missing forever
+	haRolledBackLatch   = "rolled_back_latch"       // this binary is below a capability token this node already latched — WAL-quarantined, needs an operator reseed
 )
 
-var haReasons = []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending}
+var haReasons = []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch}
 
 // capabilityDegradedReason maps a configured-to-enforce token's latch state (ok = latched)
 // to an HA-degraded reason, or "" if it's fine. vip_demote_v1 is a software capability (no
@@ -243,6 +244,14 @@ func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 	// row no longer carries the source host, so an automatic safe re-mint isn't derivable.)
 	if s.gate != nil && s.gate.Enforced(ctx, capabilities.SplitBrainGateV1) && s.anyStrandedPending(ctx) {
 		out[haStrandedPending] = true
+	}
+	// This binary is a rollback below a token this node already latched, so it is
+	// WAL-quarantined: up and reachable, but emitting no replicated writes and
+	// advertising nothing. Peers raise haUnsupportedMember about it; this is the
+	// node's own report, which is what tells an operator that the fix is a reseed
+	// (or an upgrade back) rather than a network problem at the other end.
+	if s.walQuarantinedNow() {
+		out[haRolledBackLatch] = true
 	}
 	return out
 }

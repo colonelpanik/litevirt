@@ -93,6 +93,17 @@ func TestBeginVMCreateOperationIdempotencyAndConflicts(t *testing.T) {
 	if got, _ := GetVM(ctx, c, "vm2"); got != nil {
 		t.Fatalf("conflicting identity created vm2: %+v", got)
 	}
+	wrongProjectReservation, _ := (ReservationVector{
+		Project: "other", ProjectCPU: 1,
+	}).Encode()
+	wrongProject := createOp("op-wrong-project", "vm", "vm3", "hash", wrongProjectReservation, 1)
+	if _, err := c.BeginVMCreateOperation(ctx, wrongProject,
+		VMRecord{Name: "vm3", HostName: "h1", Project: "p1", OwnerEpoch: 1}); !errors.Is(err, ErrOperationIdentityConflict) {
+		t.Fatalf("wrong reservation project error = %v", err)
+	}
+	if got, _ := GetVM(ctx, c, "vm3"); got != nil {
+		t.Fatalf("wrong-project reservation created vm3: %+v", got)
+	}
 }
 
 func TestBeginVMCreateOperationNeverOverwritesLiveVM(t *testing.T) {

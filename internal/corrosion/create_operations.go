@@ -26,8 +26,8 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 			ErrOperationIdentityConflict, op.Project, vm.Project)
 	}
 	op.Project = vm.Project
-	if _, err := DecodeReservation(op.ReservationJSON); err != nil {
-		return false, fmt.Errorf("decode reservation: %w", err)
+	if err := validateReservationProject(op.ReservationJSON, op.Project); err != nil {
+		return false, err
 	}
 	reservedFacts, err := reservationStepFacts(op.ReservationFacts, op.Project)
 	if err != nil {
@@ -168,8 +168,8 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 			ErrOperationIdentityConflict, op.Project, ct.Project)
 	}
 	op.Project = ct.Project
-	if _, err := DecodeReservation(op.ReservationJSON); err != nil {
-		return false, fmt.Errorf("decode reservation: %w", err)
+	if err := validateReservationProject(op.ReservationJSON, op.Project); err != nil {
+		return false, err
 	}
 	reservedFacts, err := reservationStepFacts(op.ReservationFacts, op.Project)
 	if err != nil {
@@ -383,6 +383,23 @@ func compareReservedStepInTx(ctx context.Context, tx *sql.Tx, opID string, owner
 	}
 	if existingFacts != requestedFacts {
 		return ErrOperationStepConflict
+	}
+	return nil
+}
+
+func validateReservationProject(raw, operationProject string) error {
+	rv, err := DecodeReservation(raw)
+	if err != nil {
+		return fmt.Errorf("decode reservation: %w", err)
+	}
+	if rv.Project != "" && projectOrDefault(rv.Project) != projectOrDefault(operationProject) {
+		return fmt.Errorf("%w: reservation project %q does not match operation project %q",
+			ErrOperationIdentityConflict, rv.Project, operationProject)
+	}
+	if (rv.ProjectCPU != 0 || rv.ProjectMemMiB != 0) && rv.Project == "" &&
+		projectOrDefault(operationProject) != DefaultProject {
+		return fmt.Errorf("%w: project reservation is missing its non-default project",
+			ErrOperationIdentityConflict)
 	}
 	return nil
 }

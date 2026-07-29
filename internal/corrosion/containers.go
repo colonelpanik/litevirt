@@ -44,7 +44,14 @@ const (
 	// balancer backend cluster-wide (containers have no vm_interfaces table).
 	// Set from a static compose NIC address at create; the LB host re-discovers
 	// a DHCP address locally via lxc-info when this is empty.
-	LabelIP = "litevirt.ip"
+	LabelIP                 = "litevirt.ip"
+	containerRekeyInsertSQL = `INSERT OR REPLACE INTO containers
+		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, owner_epoch, spec_generation, active_operation_id, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+	containerRekeyInterfaceCleanupSQL = `UPDATE container_interfaces SET deleted_at = ?, updated_at = ?
+		      WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`
+	containerRekeyLeaseSQL = `UPDATE ip_allocations SET owner_host = ?, allocated_at = ?, updated_at = ?
+		      WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL`
 )
 
 // ContainerRecord is one LXC/OCI container's cluster-state row.
@@ -180,8 +187,8 @@ func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
 	return Statement{
-		SQL: `INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, owner_epoch, spec_generation, active_operation_id, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		SQL: `INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
 		   image = excluded.image,
@@ -203,7 +210,7 @@ func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 		Params: []interface{}{
 			r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
 			labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken,
-			r.OwnerEpoch, r.SpecGeneration, r.ActiveOperationID, r.CreatedAt, now,
+			r.CreatedAt, now,
 		},
 	}, nil
 }
@@ -349,6 +356,10 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 	if err != nil {
 		return false, err
 	}
+	rekeyGuard, err := containerRekeyMutationGuard(src, toHost)
+	if err != nil {
+		return false, err
+	}
 	managedIPs := managedNICIPs(src)
 	guard := func(tx *sql.Tx) (bool, error) {
 		// (a) source row still live, unchanged since observed, not relocating.
@@ -398,17 +409,13 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 	}
 
 	stmts := []Statement{
-		// (1) tombstone the source container row.
-		{
-			SQL:    `UPDATE containers SET deleted_at = ?, updated_at = ? WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-			Params: []interface{}{nowRFC3339(), now, src.HostName, src.Name},
-		},
 		// (2) re-key the row onto the new host.
-		rk,
+		{SQL: containerRekeyInsertSQL, Params: rk.Params, Guard: rekeyGuard},
 		// (3) tombstone the source's managed interface rows.
 		{
-			SQL:    `UPDATE container_interfaces SET deleted_at = ?, updated_at = ? WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`,
+			SQL:    containerRekeyInterfaceCleanupSQL,
 			Params: []interface{}{nowRFC3339(), now, src.HostName, src.Name},
+			Guard:  rekeyGuard,
 		},
 	}
 	// (4) rebuild the managed interface rows on the new host from create_spec.
@@ -417,13 +424,27 @@ func RekeyContainerOwner(ctx context.Context, c *Client, src ContainerRecord, to
 		if err != nil {
 			return false, err
 		}
-		stmts = append(stmts, s)
+		s.Params[8] = now
+		stmts = append(stmts, Statement{
+			SQL: containerCreateInterfaceSQL, Params: s.Params, Guard: rekeyGuard,
+		})
 	}
 	// (5) transfer the IPAM leases (owner_host src→toHost), resetting allocated_at.
 	stmts = append(stmts, Statement{
-		SQL: `UPDATE ip_allocations SET owner_host = ?, allocated_at = ?, updated_at = ?
-		      WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL`,
+		SQL:    containerRekeyLeaseSQL,
 		Params: []interface{}{toHost, nowRFC3339(), now, src.HostName, src.Name},
+		Guard:  rekeyGuard,
+	})
+	// (1) is deliberately the final semantic barrier on the wire: every receiver
+	// proves the exact source authority before applying the target footprint,
+	// then tombstones that same source generation last.
+	stmts = append(stmts, Statement{
+		SQL: containerDeleteSQL,
+		Params: []interface{}{
+			nowRFC3339(), now, src.HostName, src.Name,
+			src.OwnerEpoch, src.SpecGeneration,
+		},
+		Guard: rekeyGuard,
 	})
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
 }
@@ -466,9 +487,7 @@ func rekeyContainerStmt(c *Client, src ContainerRecord, toHost, now string) (Sta
 		createdAt = nowRFC3339() // created_at is wall/display, never the HLC key
 	}
 	return Statement{
-		SQL: `INSERT OR REPLACE INTO containers
-		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, owner_epoch, spec_generation, active_operation_id, created_at, updated_at, deleted_at)
-		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		SQL: containerRekeyInsertSQL,
 		Params: []interface{}{
 			toHost, src.Name, src.Image, src.CPULimit, src.MemMiB, labelsJSON,
 			src.RestartPolicy, ContainerRuntimeRekeyDetail, src.Project, boolToInt(src.IsTemplate),
@@ -586,8 +605,8 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 // "container vanished from gossip" can be distinguished from "host
 // crashed and we just haven't heard yet" in audit views.
 func DeleteContainer(ctx context.Context, c *Client, hostName, name string) error {
-	_, err := deleteContainerGuarded(ctx, c, hostName, name)
-	return err
+	now := c.NowTS()
+	return c.Execute(ctx, legacyContainerDeleteSQL, nowRFC3339(), now, hostName, name)
 }
 
 func deleteContainerGuarded(ctx context.Context, c *Client, hostName, name string) (bool, error) {
@@ -620,11 +639,13 @@ func deleteContainerGuarded(ctx context.Context, c *Client, hostName, name strin
 // caller can treat as success. (Plain DeleteContainer lacks the deleted_at guard,
 // so it would "affect one row" re-deleting a tombstone and hide that case.)
 func DeleteContainerStrict(ctx context.Context, c *Client, hostName, name string) error {
-	applied, err := deleteContainerGuarded(ctx, c, hostName, name)
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx, legacyContainerStrictDeleteSQL,
+		nowRFC3339(), now, hostName, name)
 	if err != nil {
 		return err
 	}
-	if !applied {
+	if n == 0 {
 		return ErrNoRowsAffected
 	}
 	return nil

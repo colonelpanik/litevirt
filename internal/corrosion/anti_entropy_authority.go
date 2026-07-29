@@ -279,7 +279,7 @@ func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row [
 		if !a.valid {
 			return mergeAuthorityKeepLocal, nil
 		}
-		return workloadParentAuthorityDecision(tx, a)
+		return c.workloadParentAuthorityDecision(tx, a)
 	case table.Name == "containers":
 		hostIdx, nameIdx := indexOf(table.Columns, "host_name"), indexOf(table.Columns, "name")
 		if hostIdx < 0 || nameIdx < 0 {
@@ -293,7 +293,7 @@ func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row [
 		if !a.valid {
 			return mergeAuthorityKeepLocal, nil
 		}
-		return workloadParentAuthorityDecision(tx, a)
+		return c.workloadParentAuthorityDecision(tx, a)
 	case vmAuthorityChildTables[table.Name]:
 		idx := indexOf(table.Columns, "vm_name")
 		if idx < 0 {
@@ -341,7 +341,7 @@ func mergeRowIsDeleted(table syncTable, row []interface{}) bool {
 	return idx >= 0 && idx < len(row) && cellNonEmpty(row[idx])
 }
 
-func workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMergeAuthority) (mergeAuthorityDecision, error) {
+func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMergeAuthority) (mergeAuthorityDecision, error) {
 	var localOwner, localGeneration int64
 	var err error
 	switch incoming.kind {
@@ -367,6 +367,23 @@ func workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMergeAuthority
 	switch {
 	case localOwner == incoming.ownerEpoch && localGeneration == incoming.generation:
 		if incoming.deleted {
+			localHash, ok, hashErr := localWorkloadIdentityHash(tx, incoming)
+			if hashErr != nil {
+				return mergeAuthorityKeepLocal, hashErr
+			}
+			if !ok || localHash != incoming.identityHash {
+				table, key := "vms", pkKey([]interface{}{incoming.name})
+				if incoming.kind == "container" {
+					table = "containers"
+					key = pkKey([]interface{}{incoming.host, incoming.name})
+				}
+				c.deferAfterCommit(tx, func() {
+					c.trackUnresolved(table, key,
+						[]interface{}{localHash}, []interface{}{incoming.identityHash},
+						pathAE, "workload_identity_conflict")
+				})
+				return mergeAuthorityKeepLocal, nil
+			}
 			return mergeAuthorityApplyIncomingAndSweep, nil
 		}
 		return mergeAuthorityNormal, nil
@@ -381,6 +398,52 @@ func workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMergeAuthority
 		// Crossed authority axes are not comparable. Fail closed rather than
 		// allowing a timestamp to choose an ABA-sensitive workload identity.
 		return mergeAuthorityKeepLocal, nil
+	}
+}
+
+func localWorkloadIdentityHash(tx *sql.Tx, want workloadMergeAuthority) (string, bool, error) {
+	switch want.kind {
+	case "vm":
+		var vm VMRecord
+		var isTemplate int
+		err := tx.QueryRow(
+			`SELECT name, COALESCE(stack_name, ''), host_name, spec,
+			        COALESCE(project, '_default'), COALESCE(is_template, 0)
+			 FROM vms WHERE name = ?`, want.name).
+			Scan(&vm.Name, &vm.StackName, &vm.HostName, &vm.Spec,
+				&vm.Project, &isTemplate)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		vm.IsTemplate = isTemplate != 0
+		return vmCreateIdentityHash(vm), true, nil
+	case "container":
+		var ct ContainerRecord
+		var labels string
+		var isTemplate int
+		err := tx.QueryRow(
+			`SELECT host_name, name, COALESCE(image, ''), cpu_limit, memory_mib,
+			        COALESCE(labels, ''), COALESCE(restart_policy, ''),
+			        COALESCE(project, '_default'), COALESCE(is_template, 0),
+			        COALESCE(on_host_failure, ''), COALESCE(create_spec, ''),
+			        COALESCE(relocate_token, '')
+			 FROM containers WHERE host_name = ? AND name = ?`, want.host, want.name).
+			Scan(&ct.HostName, &ct.Name, &ct.Image, &ct.CPULimit, &ct.MemMiB,
+				&labels, &ct.RestartPolicy, &ct.Project, &isTemplate,
+				&ct.OnHostFailure, &ct.CreateSpec, &ct.RelocateToken)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		ct.IsTemplate = isTemplate != 0
+		return containerCreateIdentityHash(ct, labels), true, nil
+	default:
+		return "", false, nil
 	}
 }
 

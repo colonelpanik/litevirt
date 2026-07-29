@@ -745,8 +745,8 @@ func TestRecreatedVMCommitRevivesTombstonedHardwareKeysLocallyAndOnReceiver(t *t
 	); err != nil || !applied {
 		t.Fatalf("old commit: applied=%v err=%v", applied, err)
 	}
-	if err := DeleteVM(ctx, source, "vm1"); err != nil {
-		t.Fatal(err)
+	if applied, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || !applied {
+		t.Fatalf("guarded old delete: applied=%v err=%v", applied, err)
 	}
 	newOp := createOp("op-hw-new", "vm", "vm1", "new", "", 2)
 	newVM := VMRecord{
@@ -825,8 +825,8 @@ func TestRecreatedWorkloadRejectsHigherClockOldDeleteWALAndAntiEntropy(t *testin
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if err := DeleteVM(ctx, source, "vm1"); err != nil {
-			t.Fatal(err)
+		if applied, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || !applied {
+			t.Fatalf("guarded old delete: applied=%v err=%v", applied, err)
 		}
 		deleteEntry := latestMutationEntry(t, source, "delayed-old-vm-delete", 1)
 		var deleteStatements []Statement
@@ -960,8 +960,8 @@ func TestRecreatedWorkloadRejectsHigherClockOldDeleteWALAndAntiEntropy(t *testin
 			t.Fatalf("old commit: applied=%v err=%v", applied, err)
 		}
 		commitEntry := latestMutationEntry(t, source, "old-ct-source", 2)
-		if err := DeleteContainer(ctx, source, "h1", "ct1"); err != nil {
-			t.Fatal(err)
+		if applied, err := deleteContainerGuarded(ctx, source, "h1", "ct1"); err != nil || !applied {
+			t.Fatalf("guarded old delete: applied=%v err=%v", applied, err)
 		}
 		deleteEntry := latestMutationEntry(t, source, "delayed-old-ct-delete", 1)
 		var deleteStatements []Statement
@@ -1093,6 +1093,12 @@ func TestLegacyWorkloadDeleteCannotCrossAuthorityBoundary(t *testing.T) {
 		}}, nil); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := recreated.db.Exec(
+			`UPDATE vms SET vm_owner_epoch = 2, spec_generation = 2 WHERE name = ?`,
+			"vm1",
+		); err != nil {
+			t.Fatal(err)
+		}
 		applyMutationEntry(t, recreated, legacyVMDeleteBatch(t, "legacy-vm-new"))
 		if got, _ := GetVM(ctx, recreated, "vm1"); got == nil ||
 			got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
@@ -1124,6 +1130,13 @@ func TestLegacyWorkloadDeleteCannotCrossAuthorityBoundary(t *testing.T) {
 			HostName: "h2", Name: "ct1", Project: "p1", State: "running",
 			OwnerEpoch: 2, SpecGeneration: 2,
 		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recreated.db.Exec(
+			`UPDATE containers SET owner_epoch = 2, spec_generation = 2
+			 WHERE host_name = ? AND name = ?`,
+			"h2", "ct1",
+		); err != nil {
 			t.Fatal(err)
 		}
 		applyMutationEntry(t, recreated, entry(t, "legacy-ct-new",
@@ -1602,8 +1615,10 @@ func TestReplicatedCreateRollbackIsSelfGuarded(t *testing.T) {
 		rollbackEntry := latestMutationEntry(t, source, "source-vm-rollback-clock", 2)
 		receiver := testClient(t)
 		applyMutationEntry(t, receiver, beginEntry)
-		if _, err := receiver.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`,
-			"9000000000000-0000-newer", "vm1"); err != nil {
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET updated_at = ? WHERE name = ?`,
+			"9000000000000-0000-newer", "vm1",
+		); err != nil {
 			t.Fatal(err)
 		}
 		applyMutationEntry(t, receiver, rollbackEntry)
@@ -1627,7 +1642,8 @@ func TestReplicatedCreateRollbackIsSelfGuarded(t *testing.T) {
 		applyMutationEntry(t, receiver, beginEntry)
 		if _, err := receiver.db.Exec(
 			`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
-			"9000000000000-0000-newer", "h1", "ct1"); err != nil {
+			"9000000000000-0000-newer", "h1", "ct1",
+		); err != nil {
 			t.Fatal(err)
 		}
 		applyMutationEntry(t, receiver, rollbackEntry)
@@ -1809,8 +1825,8 @@ func TestReplicatedGuardedEntryRejectsReorderedBarrierAndMisbinding(t *testing.T
 		assertNoCreateTerminalSteps(t, receiver, rollbackOp.ID, 1)
 	})
 	t.Run("delete cleanup sequence is required", func(t *testing.T) {
-		if err := DeleteVM(ctx, source, "vm1"); err != nil {
-			t.Fatal(err)
+		if applied, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || !applied {
+			t.Fatalf("guarded delete: applied=%v err=%v", applied, err)
 		}
 		deleteEntry := latestMutationEntry(t, source, "entry-delete-source", 3)
 		var stmts []Statement
@@ -1895,8 +1911,11 @@ func TestCreateOperationAntiEntropyFencesStaleWorkloadAuthority(t *testing.T) {
 		}, nil, nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := receiver.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`,
-			"9000000000000-0000-newer", "vm1"); err != nil {
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET vm_owner_epoch = 2, spec_generation = 2, updated_at = ?
+			 WHERE name = ?`,
+			"9000000000000-0000-newer", "vm1",
+		); err != nil {
 			t.Fatal(err)
 		}
 		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
@@ -1939,8 +1958,11 @@ func TestCreateOperationAntiEntropyFencesStaleWorkloadAuthority(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := receiver.db.Exec(
-			`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
-			"9000000000000-0000-newer", "h1", "ct1"); err != nil {
+			`UPDATE containers
+			 SET owner_epoch = 2, spec_generation = 2, updated_at = ?
+			 WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1",
+		); err != nil {
 			t.Fatal(err)
 		}
 		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
@@ -1984,8 +2006,12 @@ func TestCreateOperationAntiEntropyFencesStaleWorkloadAuthority(t *testing.T) {
 				}, nil, nil); err != nil {
 					t.Fatal(err)
 				}
-				_, _ = receiver.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`,
-					"9000000000000-0000-newer", "workload1")
+				_, _ = receiver.db.Exec(
+					`UPDATE vms
+					 SET vm_owner_epoch = 2, spec_generation = 2, updated_at = ?
+					 WHERE name = ?`,
+					"9000000000000-0000-newer", "workload1",
+				)
 			} else {
 				if err := UpsertContainer(ctx, receiver, ContainerRecord{
 					HostName: "h1", Name: "workload1", Project: "p1", State: "running",
@@ -1994,8 +2020,11 @@ func TestCreateOperationAntiEntropyFencesStaleWorkloadAuthority(t *testing.T) {
 					t.Fatal(err)
 				}
 				_, _ = receiver.db.Exec(
-					`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
-					"9000000000000-0000-newer", "h1", "workload1")
+					`UPDATE containers
+					 SET owner_epoch = 2, spec_generation = 2, updated_at = ?
+					 WHERE host_name = ? AND name = ?`,
+					"9000000000000-0000-newer", "h1", "workload1",
+				)
 			}
 			if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
 				t.Fatal(err)
@@ -2326,6 +2355,481 @@ func TestCreateOperationWALBindsCompleteImmutableHeader(t *testing.T) {
 				state, faulted, stepNames(steps))
 		}
 	})
+}
+
+func TestRetainedAndCurrentContainerRekeyDeletesCannotCrossRecreate(t *testing.T) {
+	ctx := context.Background()
+	const delayed = "8000000000000-0000-delayed"
+
+	t.Run("retained strict tombstone", func(t *testing.T) {
+		receiver := testClient(t)
+		op := createOp("op-retained-strict-recreate", "container", "ct1", "new", "", 2)
+		ct := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "new", Project: "p1",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := receiver.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("receiver begin: applied=%v err=%v", applied, err)
+		}
+		raw, err := json.Marshal([]Statement{{
+			SQL: `UPDATE containers SET deleted_at = ?, updated_at = ?
+			 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{delayed, delayed, "h1", "ct1"},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, &pb.MutationEntry{
+			Seq: 1, Hlc: delayed, Origin: "retained-strict-delete", Stmts: string(raw),
+		})
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("retained strict tombstone crossed recreated authority: %+v", got)
+		}
+	})
+
+	t.Run("current rekey batch", func(t *testing.T) {
+		source := testClient(t)
+		oldOp := createOp("op-current-rekey-old", "container", "ct1", "old", "", 1)
+		oldCT := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "old", Project: "p1",
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := source.BeginContainerCreateOperation(ctx, oldOp, oldCT); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitContainerCreateOperation(ctx, oldOp.ID, 1, oldCT, nil); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+		observed, err := GetContainer(ctx, source, "h1", "ct1")
+		if err != nil || observed == nil {
+			t.Fatalf("source container: got=%+v err=%v", observed, err)
+		}
+		if applied, err := RekeyContainerOwner(ctx, source, *observed, "h2"); err != nil || !applied {
+			t.Fatalf("source rekey: applied=%v err=%v", applied, err)
+		}
+		rekeyEntry := latestMutationEntry(t, source, "current-rekey-source", 1)
+
+		receiver := testClient(t)
+		newOp := createOp("op-current-rekey-new", "container", "ct1", "new", "", 2)
+		newCT := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "new", Project: "p1",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := receiver.BeginContainerCreateOperation(ctx, newOp, newCT); err != nil || !applied {
+			t.Fatalf("receiver begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := receiver.CommitContainerCreateOperation(ctx, newOp.ID, 2, newCT, nil); err != nil || !applied {
+			t.Fatalf("receiver commit: applied=%v err=%v", applied, err)
+		}
+		applyMutationEntry(t, receiver, rekeyEntry)
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.Image != "new" {
+			t.Fatalf("delayed current rekey crossed recreated authority: %+v", got)
+		}
+		if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got != nil {
+			t.Fatalf("declined delayed rekey manufactured target: %+v", got)
+		}
+
+		targetRecreated := testClient(t)
+		sourceReplicaOp := createOp("op-current-rekey-source-replica", "container", "ct1", "old", "", 1)
+		if applied, err := targetRecreated.BeginContainerCreateOperation(
+			ctx, sourceReplicaOp, oldCT,
+		); err != nil || !applied {
+			t.Fatalf("receiver source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := targetRecreated.CommitContainerCreateOperation(
+			ctx, sourceReplicaOp.ID, 1, oldCT, nil,
+		); err != nil || !applied {
+			t.Fatalf("receiver source commit: applied=%v err=%v", applied, err)
+		}
+		targetOp := createOp("op-current-rekey-target-new", "container", "ct1", "target-new", "", 2)
+		targetCT := ContainerRecord{
+			HostName: "h2", Name: "ct1", Image: "target-new", Project: "p1",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := targetRecreated.BeginContainerCreateOperation(
+			ctx, targetOp, targetCT,
+		); err != nil || !applied {
+			t.Fatalf("receiver target begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := targetRecreated.CommitContainerCreateOperation(
+			ctx, targetOp.ID, 2, targetCT, nil,
+		); err != nil || !applied {
+			t.Fatalf("receiver target commit: applied=%v err=%v", applied, err)
+		}
+		applyMutationEntry(t, targetRecreated, rekeyEntry)
+		if got, _ := GetContainer(ctx, targetRecreated, "h2", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.SpecGeneration != 2 || got.Image != "target-new" {
+			t.Fatalf("delayed rekey clobbered recreated target authority: %+v", got)
+		}
+		if got, _ := GetContainer(ctx, targetRecreated, "h1", "ct1"); got == nil ||
+			got.OwnerEpoch != 1 || got.SpecGeneration != 1 {
+			t.Fatalf("declined target-conflicting rekey tombstoned source: %+v", got)
+		}
+	})
+}
+
+func TestAntiEntropyEqualAuthorityTombstoneRequiresExactIdentity(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("vm", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-vm-identity", "vm", "vm1", "hash", "", 4)
+		vm := VMRecord{
+			Name: "vm1", HostName: "h1", Spec: `{"cpu":2}`, Project: "p1",
+			OwnerEpoch: 4, SpecGeneration: 6,
+		}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.RollbackVMCreateOperation(ctx, vm.Name, op.ID, 4, "failed"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+
+		conflict := testClient(t)
+		if applied, err := conflict.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("conflict begin: applied=%v err=%v", applied, err)
+		}
+		if _, err := conflict.db.Exec(`UPDATE vms SET spec = ? WHERE name = ?`, `{"cpu":9}`, vm.Name); err != nil {
+			t.Fatal(err)
+		}
+		if err := InsertInterface(ctx, conflict, InterfaceRecord{VMName: vm.Name, NetworkName: "keep"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := conflict.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetVM(ctx, conflict, vm.Name); got == nil || got.Spec != `{"cpu":9}` {
+			t.Fatalf("conflicting same-axis VM tombstone applied: %+v", got)
+		}
+		if rows, _ := conflict.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`,
+			vm.Name, "keep"); len(rows) != 1 {
+			t.Fatalf("conflicting VM tombstone swept children: %v", rows)
+		}
+		if conflict.UnresolvedTieCount() == 0 {
+			t.Fatal("conflicting same-axis VM identity was not surfaced")
+		}
+
+		exact := testClient(t)
+		if applied, err := exact.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("exact begin: applied=%v err=%v", applied, err)
+		}
+		if err := InsertInterface(ctx, exact, InterfaceRecord{VMName: vm.Name, NetworkName: "sweep"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := exact.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetVM(ctx, exact, vm.Name); got != nil {
+			t.Fatalf("exact same-axis VM tombstone did not converge: %+v", got)
+		}
+		if rows, _ := exact.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NULL`, vm.Name); len(rows) != 0 {
+			t.Fatalf("exact VM tombstone did not sweep children: %v", rows)
+		}
+	})
+
+	t.Run("container", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-ct-identity", "container", "ct1", "hash", "", 4)
+		ct := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "debian", Project: "p1",
+			OwnerEpoch: 4, SpecGeneration: 6,
+		}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", "ct1", op.ID, 4, "failed"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+
+		conflict := testClient(t)
+		if applied, err := conflict.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("conflict begin: applied=%v err=%v", applied, err)
+		}
+		if _, err := conflict.db.Exec(
+			`UPDATE containers SET image = ? WHERE host_name = ? AND name = ?`,
+			"alpine", "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := UpsertContainerInterface(ctx, conflict, ContainerInterfaceRecord{
+			HostName: "h1", CtName: "ct1", NetworkName: "keep",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := conflict.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetContainer(ctx, conflict, "h1", "ct1"); got == nil || got.Image != "alpine" {
+			t.Fatalf("conflicting same-axis container tombstone applied: %+v", got)
+		}
+		if rows, _ := conflict.Query(ctx,
+			`SELECT 1 FROM container_interfaces
+			 WHERE host_name = ? AND ct_name = ? AND network_name = ? AND deleted_at IS NULL`,
+			"h1", "ct1", "keep"); len(rows) != 1 {
+			t.Fatalf("conflicting container tombstone swept children: %v", rows)
+		}
+		if conflict.UnresolvedTieCount() == 0 {
+			t.Fatal("conflicting same-axis container identity was not surfaced")
+		}
+
+		exact := testClient(t)
+		if applied, err := exact.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("exact begin: applied=%v err=%v", applied, err)
+		}
+		if err := UpsertContainerInterface(ctx, exact, ContainerInterfaceRecord{
+			HostName: "h1", CtName: "ct1", NetworkName: "sweep",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := exact.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetContainer(ctx, exact, "h1", "ct1"); got != nil {
+			t.Fatalf("exact same-axis container tombstone did not converge: %+v", got)
+		}
+		if rows, _ := exact.Query(ctx,
+			`SELECT 1 FROM container_interfaces
+			 WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`, "h1", "ct1"); len(rows) != 0 {
+			t.Fatalf("exact container tombstone did not sweep children: %v", rows)
+		}
+	})
+}
+
+func TestOrdinaryWorkloadWritersRetainV43WireShapes(t *testing.T) {
+	ctx := context.Background()
+	decodeLatest := func(t *testing.T, c *Client) []Statement {
+		t.Helper()
+		entry := latestMutationEntry(t, c, "ordinary-writer", 1)
+		var stmts []Statement
+		if err := json.Unmarshal([]byte(entry.Stmts), &stmts); err != nil {
+			t.Fatal(err)
+		}
+		return stmts
+	}
+	assertUnguarded := func(t *testing.T, stmts []Statement) {
+		t.Helper()
+		for _, stmt := range stmts {
+			if stmt.Guard != nil {
+				t.Fatalf("ordinary writer emitted v44 guard: %+v", stmt.Guard)
+			}
+		}
+	}
+
+	t.Run("VM insert and delete", func(t *testing.T) {
+		c := testClient(t)
+		if err := InsertVM(ctx, c, VMRecord{
+			Name: "vm1", HostName: "h1", State: "running", Project: "p1",
+			OwnerEpoch: 9, SpecGeneration: 11, ActiveOperationID: "must-not-emit",
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		insert := decodeLatest(t, c)
+		assertUnguarded(t, insert)
+		found := false
+		for _, stmt := range insert {
+			sh, _, err := parseResolved(stmt.SQL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sh.Table == "vms" && sh.Kind == KindInsert {
+				found = true
+				for _, forbidden := range []string{"vm_owner_epoch", "spec_generation", "active_operation_id"} {
+					if indexOf(sh.InsertCols, forbidden) >= 0 {
+						t.Errorf("ordinary VM insert emitted v44 column %s", forbidden)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatal("ordinary VM insert entry has no VM parent")
+		}
+		if err := DeleteVM(ctx, c, "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		deleted := decodeLatest(t, c)
+		assertUnguarded(t, deleted)
+		parent, _, err := parseResolved(deleted[0].SQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stmtFingerprint(parent) != mustStatementFingerprint(legacyVMDeleteSQL) {
+			t.Fatalf("ordinary VM delete emitted non-v43 parent: %s", deleted[0].SQL)
+		}
+	})
+
+	t.Run("container insert and delete", func(t *testing.T) {
+		c := testClient(t)
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "h1", Name: "ct1", State: "running", Project: "p1",
+			OwnerEpoch: 9, SpecGeneration: 11, ActiveOperationID: "must-not-emit",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		insert := decodeLatest(t, c)
+		assertUnguarded(t, insert)
+		sh, _, err := parseResolved(insert[0].SQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{"owner_epoch", "spec_generation", "active_operation_id"} {
+			if indexOf(sh.InsertCols, forbidden) >= 0 {
+				t.Errorf("ordinary container insert emitted v44 column %s", forbidden)
+			}
+		}
+		if err := DeleteContainer(ctx, c, "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		deleted := decodeLatest(t, c)
+		assertUnguarded(t, deleted)
+		parent, _, err := parseResolved(deleted[0].SQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stmtFingerprint(parent) != mustStatementFingerprint(legacyContainerDeleteSQL) {
+			t.Fatalf("ordinary container delete emitted non-v43 parent: %s", deleted[0].SQL)
+		}
+	})
+}
+
+func TestGuardedSemanticWorkloadClockNeverRegresses(t *testing.T) {
+	ctx := context.Background()
+	const (
+		middle = "7000000000000-0000-stale"
+		future = "9000000000000-0000-receiver"
+	)
+	for _, kind := range []string{"vm", "container"} {
+		for _, action := range []string{"commit", "rollback", "delete"} {
+			t.Run(kind+" "+action, func(t *testing.T) {
+				source := testClient(t)
+				receiver := testClient(t)
+				stale := testClient(t)
+				op := createOp("op-clock-"+kind+"-"+action, kind, kind+"1", "hash", "", 5)
+				var initial []*pb.MutationEntry
+				var terminal *pb.MutationEntry
+				switch kind {
+				case "vm":
+					vm := VMRecord{
+						Name: "vm1", HostName: "h1", Spec: `{"cpu":2}`, Project: "p1",
+						OwnerEpoch: 5, SpecGeneration: 7,
+					}
+					if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+						t.Fatalf("begin: applied=%v err=%v", applied, err)
+					}
+					initial = append(initial, latestMutationEntry(t, source, "clock-source", 1))
+					if action == "delete" {
+						if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 5, vm, nil, nil, nil, nil); err != nil || !applied {
+							t.Fatalf("prepare running: applied=%v err=%v", applied, err)
+						}
+						initial = append(initial, latestMutationEntry(t, source, "clock-source", 2))
+					}
+					for _, c := range []*Client{receiver, stale} {
+						for _, entry := range initial {
+							applyMutationEntry(t, c, entry)
+						}
+					}
+					switch action {
+					case "commit":
+						if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 5, vm, nil, nil, nil, nil); err != nil || !applied {
+							t.Fatalf("commit: applied=%v err=%v", applied, err)
+						}
+					case "rollback":
+						if applied, err := source.RollbackVMCreateOperation(ctx, vm.Name, op.ID, 5, "failed"); err != nil || !applied {
+							t.Fatalf("rollback: applied=%v err=%v", applied, err)
+						}
+					case "delete":
+						if applied, err := deleteVMGuarded(ctx, source, vm.Name); err != nil || !applied {
+							t.Fatalf("delete: applied=%v err=%v", applied, err)
+						}
+					}
+					terminal = latestMutationEntry(t, source, "clock-terminal", 3)
+					if _, err := receiver.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`, future, vm.Name); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := stale.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`, middle, vm.Name); err != nil {
+						t.Fatal(err)
+					}
+				case "container":
+					ct := ContainerRecord{
+						HostName: "h1", Name: "container1", Image: "debian", Project: "p1",
+						OwnerEpoch: 5, SpecGeneration: 7,
+					}
+					op.ResourceID = ct.Name
+					if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+						t.Fatalf("begin: applied=%v err=%v", applied, err)
+					}
+					initial = append(initial, latestMutationEntry(t, source, "clock-source", 1))
+					if action == "delete" {
+						if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 5, ct, nil); err != nil || !applied {
+							t.Fatalf("prepare running: applied=%v err=%v", applied, err)
+						}
+						initial = append(initial, latestMutationEntry(t, source, "clock-source", 2))
+					}
+					for _, c := range []*Client{receiver, stale} {
+						for _, entry := range initial {
+							applyMutationEntry(t, c, entry)
+						}
+					}
+					switch action {
+					case "commit":
+						if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 5, ct, nil); err != nil || !applied {
+							t.Fatalf("commit: applied=%v err=%v", applied, err)
+						}
+					case "rollback":
+						if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", ct.Name, op.ID, 5, "failed"); err != nil || !applied {
+							t.Fatalf("rollback: applied=%v err=%v", applied, err)
+						}
+					case "delete":
+						if applied, err := deleteContainerGuarded(ctx, source, "h1", ct.Name); err != nil || !applied {
+							t.Fatalf("delete: applied=%v err=%v", applied, err)
+						}
+					}
+					terminal = latestMutationEntry(t, source, "clock-terminal", 3)
+					if _, err := receiver.db.Exec(
+						`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
+						future, "h1", ct.Name); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := stale.db.Exec(
+						`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
+						middle, "h1", ct.Name); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				applyMutationEntry(t, receiver, terminal)
+				table, where, args := "vms", "name = ?", []interface{}{"vm1"}
+				if kind == "container" {
+					table, where, args = "containers", "host_name = ? AND name = ?",
+						[]interface{}{"h1", "container1"}
+				}
+				rows, err := receiver.Query(ctx,
+					`SELECT state, updated_at, COALESCE(deleted_at, '') AS deleted_at FROM `+table+` WHERE `+where,
+					args...)
+				if err != nil || len(rows) != 1 || rows[0].String("updated_at") != future {
+					t.Fatalf("semantic %s clock regressed: rows=%v err=%v", action, rows, err)
+				}
+				if err := receiver.MergeStateBytesLWW(stale.DumpStateBytes()); err != nil {
+					t.Fatal(err)
+				}
+				rows, err = receiver.Query(ctx,
+					`SELECT state, updated_at, COALESCE(deleted_at, '') AS deleted_at FROM `+table+` WHERE `+where,
+					args...)
+				if err != nil || len(rows) != 1 || rows[0].String("updated_at") != future {
+					t.Fatalf("delayed live replay defeated semantic %s: rows=%v err=%v", action, rows, err)
+				}
+				if action == "commit" {
+					if rows[0].String("state") != "running" || rows[0].String("deleted_at") != "" {
+						t.Fatalf("delayed live replay regressed commit: %v", rows)
+					}
+				} else if rows[0].String("deleted_at") == "" {
+					t.Fatalf("delayed live replay resurrected %s: %v", action, rows)
+				}
+			})
+		}
+	}
 }
 
 func TestWorkloadAuthorityAntiEntropyCompatibility(t *testing.T) {

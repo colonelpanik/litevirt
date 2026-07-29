@@ -223,6 +223,14 @@ func TestSchemaV44RecordRoundTripsPreserveFields(t *testing.T) {
 	if err := UpsertContainer(ctx, c, ct); err != nil {
 		t.Fatalf("upsert container: %v", err)
 	}
+	if _, err := c.db.Exec(
+		`UPDATE containers
+		 SET owner_epoch = ?, spec_generation = ?, active_operation_id = ?
+		 WHERE host_name = ? AND name = ?`,
+		ct.OwnerEpoch, ct.SpecGeneration, ct.ActiveOperationID, ct.HostName, ct.Name,
+	); err != nil {
+		t.Fatalf("seed receiver-only lifecycle fields: %v", err)
+	}
 	gotCT, err := GetContainer(ctx, c, "h1", "ct1")
 	if err != nil || gotCT == nil {
 		t.Fatalf("get container: got=%v err=%v", gotCT, err)
@@ -291,6 +299,14 @@ func TestUpsertContainerPreservesLifecycleFieldsOnConflict(t *testing.T) {
 		ActiveOperationID: "op-current",
 	}); err != nil {
 		t.Fatalf("seed container: %v", err)
+	}
+	if _, err := c.db.Exec(
+		`UPDATE containers
+		 SET owner_epoch = 7, spec_generation = 9, active_operation_id = 'op-current'
+		 WHERE host_name = ? AND name = ?`,
+		"h1", "ct1",
+	); err != nil {
+		t.Fatalf("seed receiver-only lifecycle fields: %v", err)
 	}
 
 	if err := UpsertContainer(ctx, c, ContainerRecord{

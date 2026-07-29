@@ -1190,6 +1190,10 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		if err := validateGuardedTransitionStatement(s, sh); err != nil {
 			return err
 		}
+		s, err = retainSemanticMaxUpdatedAt(ctx, tx, s, sh, tableName, pkCols)
+		if err != nil {
+			return err
+		}
 		// This statement is deliberately last in its mutation entry. A matched
 		// workload authority guard is the semantic ordering rule, so execute the
 		// exact audited CAS verbatim instead of timestamp-LWW gating it. If the
@@ -1207,6 +1211,10 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 
 	case DispWorkloadDelete:
 		if err := validateWorkloadDeleteStatement(s, sh); err != nil {
+			return err
+		}
+		s, err = retainSemanticMaxUpdatedAt(ctx, tx, s, sh, tableName, pkCols)
+		if err != nil {
 			return err
 		}
 		// The authority guard is evaluated while the parent is live and binds
@@ -1266,6 +1274,40 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	return invalidf("unhandled disposition %q for %s", disp, tableName)
 }
 
+func retainSemanticMaxUpdatedAt(
+	ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape,
+	tableName string, pkCols []string,
+) (Statement, error) {
+	if sh.UpdatedAtParamIdx < 0 || sh.UpdatedAtParamIdx >= len(s.Params) {
+		return Statement{}, invalidf("semantic workload mutation does not bind updated_at")
+	}
+	pkValues, ok := pkValuesFromShape(sh, s)
+	if !ok || len(pkValues) != len(pkCols) {
+		return Statement{}, invalidf("semantic workload mutation has no complete primary key")
+	}
+	where := make([]string, len(pkCols))
+	for i, column := range pkCols {
+		where[i] = column + " = ?"
+	}
+	var local string
+	err := tx.QueryRowContext(ctx,
+		`SELECT updated_at FROM `+tableName+` WHERE `+strings.Join(where, " AND "),
+		pkValues...).Scan(&local)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s, nil
+	}
+	if err != nil {
+		return Statement{}, err
+	}
+	incoming := coerceString(s.Params[sh.UpdatedAtParamIdx])
+	if local != "" && lwwOrder(local, incoming) > 0 {
+		params := append([]interface{}(nil), s.Params...)
+		params[sh.UpdatedAtParamIdx] = local
+		s.Params = params
+	}
+	return s, nil
+}
+
 func legacyWorkloadDeleteMatchesPreAuthority(
 	ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape,
 ) (bool, error) {
@@ -1282,7 +1324,8 @@ func legacyWorkloadDeleteMatchesPreAuthority(
 			return false, nil
 		}
 		return owner == 0 && generation == 0, err
-	case mustStatementFingerprint(legacyContainerDeleteSQL):
+	case mustStatementFingerprint(legacyContainerDeleteSQL),
+		mustStatementFingerprint(legacyContainerStrictDeleteSQL):
 		if len(s.Params) != 4 {
 			return false, invalidf("legacy container delete has invalid parameters")
 		}
@@ -1312,7 +1355,8 @@ func legacyWorkloadDeleteEntryDecision(
 		}
 		fps[i] = stmtFingerprint(sh)
 		if fps[i] == mustStatementFingerprint(legacyVMDeleteSQL) ||
-			fps[i] == mustStatementFingerprint(legacyContainerDeleteSQL) {
+			fps[i] == mustStatementFingerprint(legacyContainerDeleteSQL) ||
+			fps[i] == mustStatementFingerprint(legacyContainerStrictDeleteSQL) {
 			if legacyIndex >= 0 {
 				return true, false, invalidf("legacy workload delete entry has multiple parent tombstones")
 			}
@@ -1356,6 +1400,15 @@ func legacyWorkloadDeleteEntryDecision(
 		if legacyIndex != 0 || len(stmts) != 1 || len(parent.Params) != 4 {
 			return true, false, invalidf("legacy container delete entry has an unexpected statement sequence")
 		}
+	case mustStatementFingerprint(legacyContainerStrictDeleteSQL):
+		// Retained RekeyContainerOwner batches begin with this strict source
+		// tombstone and then carry the target row/interfaces/lease transfer.
+		// Classifying the first statement makes an authority mismatch skip the
+		// entire transaction; the remaining registered statements are still
+		// independently parsed and authorized when the pre-authority source is safe.
+		if legacyIndex != 0 || len(parent.Params) != 4 {
+			return true, false, invalidf("legacy strict container delete has an unexpected binding")
+		}
 	default:
 		return true, false, invalidf("unexpected legacy workload delete fingerprint")
 	}
@@ -1364,6 +1417,11 @@ func legacyWorkloadDeleteEntryDecision(
 }
 
 func validateGuardedMutationEntry(stmts []Statement) error {
+	for _, s := range stmts {
+		if s.Guard != nil && s.Guard.Protocol == workloadRekeyGuardV1 {
+			return validateGuardedContainerRekeyEntry(stmts)
+		}
+	}
 	barrierIndex, barrierCount := -1, 0
 	needsCreateBarrier, needsDeleteBarrier := false, false
 	terminalSteps := make(map[string]int)
@@ -1478,6 +1536,90 @@ func validateGuardedMutationEntry(stmts []Statement) error {
 		}
 	}
 	return nil
+}
+
+func validateGuardedContainerRekeyEntry(stmts []Statement) error {
+	if len(stmts) < 4 {
+		return invalidf("guarded container rekey has an incomplete statement sequence")
+	}
+	base := stmts[0].Guard
+	if base == nil || base.Protocol != workloadRekeyGuardV1 ||
+		base.ResourceKind != "container" || base.ResourceID == "" ||
+		base.HostName == "" || base.TargetHostName == "" ||
+		base.HostName == base.TargetHostName || base.IdentityHash == "" ||
+		!base.CheckSpecGeneration {
+		return invalidf("guarded container rekey has an invalid authority guard")
+	}
+	for _, s := range stmts {
+		if s.Guard == nil || *s.Guard != *base {
+			return invalidf("guarded container rekey mixes or omits authority guards")
+		}
+	}
+	rekeyStmt, err := rekeyContainerStmt(nil, ContainerRecord{}, "", "")
+	if err != nil {
+		return err
+	}
+	fingerprint := func(index int) (string, error) {
+		sh, _, parseErr := parseResolved(stmts[index].SQL)
+		if parseErr != nil {
+			return "", parseErr
+		}
+		return stmtFingerprint(sh), nil
+	}
+	firstFP, err := fingerprint(0)
+	if err != nil {
+		return err
+	}
+	cleanupFP := mustStatementFingerprint(containerRekeyInterfaceCleanupSQL)
+	leaseFP := mustStatementFingerprint(containerRekeyLeaseSQL)
+	parentFP := mustStatementFingerprint(containerDeleteSQL)
+	if firstFP != mustStatementFingerprint(rekeyStmt.SQL) ||
+		len(stmts[0].Params) < 2 ||
+		coerceString(stmts[0].Params[0]) != base.TargetHostName ||
+		coerceString(stmts[0].Params[1]) != base.ResourceID {
+		return invalidf("guarded container rekey has an invalid target parent")
+	}
+	secondFP, err := fingerprint(1)
+	if err != nil {
+		return err
+	}
+	if secondFP != cleanupFP || len(stmts[1].Params) != 4 ||
+		coerceString(stmts[1].Params[2]) != base.HostName ||
+		coerceString(stmts[1].Params[3]) != base.ResourceID {
+		return invalidf("guarded container rekey has an invalid source cleanup")
+	}
+	for i := 2; i < len(stmts)-2; i++ {
+		fp, parseErr := fingerprint(i)
+		if parseErr != nil {
+			return parseErr
+		}
+		if fp != mustStatementFingerprint(containerCreateInterfaceSQL) {
+			return invalidf("guarded container rekey has an invalid target interface role")
+		}
+	}
+	leaseIndex, parentIndex := len(stmts)-2, len(stmts)-1
+	gotLeaseFP, err := fingerprint(leaseIndex)
+	if err != nil {
+		return err
+	}
+	if gotLeaseFP != leaseFP || len(stmts[leaseIndex].Params) != 5 ||
+		coerceString(stmts[leaseIndex].Params[0]) != base.TargetHostName ||
+		coerceString(stmts[leaseIndex].Params[3]) != base.HostName ||
+		coerceString(stmts[leaseIndex].Params[4]) != base.ResourceID {
+		return invalidf("guarded container rekey has an invalid lease transfer")
+	}
+	gotParentFP, err := fingerprint(parentIndex)
+	if err != nil {
+		return err
+	}
+	if gotParentFP != parentFP {
+		return invalidf("guarded container rekey is missing its final source barrier")
+	}
+	if err := validateWorkloadDeleteStatement(stmts[parentIndex],
+		mustParseGuardedShape(stmts[parentIndex].SQL)); err != nil {
+		return err
+	}
+	return validateGuardedEntryClocks(stmts, parentIndex, false)
 }
 
 func validateGuardedCreateBeginEntry(stmts []Statement) error {
@@ -1749,13 +1891,21 @@ func validateGuardedStatementBinding(s Statement, sh StmtShape) error {
 		if sh.Kind == KindInsert {
 			host, okHost := field("host_name")
 			name, okName := field("ct_name")
+			expectedHost := g.HostName
+			if g.Protocol == workloadRekeyGuardV1 {
+				expectedHost = g.TargetHostName
+			}
 			if !okHost || !okName || g.ResourceKind != "container" ||
-				host != g.HostName || name != g.ResourceID {
+				host != expectedHost || name != g.ResourceID {
 				return invalidf("guarded container interface identity does not match mutation guard")
 			}
 			return nil
 		}
-		if _, ok := createCleanupFingerprints[stmtFingerprint(sh)]; !ok ||
+		fp := stmtFingerprint(sh)
+		_, createCleanup := createCleanupFingerprints[fp]
+		rekeyCleanup := g.Protocol == workloadRekeyGuardV1 &&
+			fp == mustStatementFingerprint(containerRekeyInterfaceCleanupSQL)
+		if (!createCleanup && !rekeyCleanup) ||
 			g.ResourceKind != "container" || len(s.Params) != 4 ||
 			coerceString(s.Params[2]) != g.HostName ||
 			coerceString(s.Params[3]) != g.ResourceID {
@@ -1892,7 +2042,9 @@ func guardedInsertField(sh StmtShape, s Statement, name string) (interface{}, bo
 
 func validateWorkloadDeleteStatement(s Statement, sh StmtShape) error {
 	g := s.Guard
-	if g == nil || g.Protocol != workloadDeleteGuardV1 || g.ResourceID == "" ||
+	if g == nil ||
+		(g.Protocol != workloadDeleteGuardV1 && g.Protocol != workloadRekeyGuardV1) ||
+		g.ResourceID == "" ||
 		g.IdentityHash == "" || !g.CheckSpecGeneration {
 		return invalidf("workload delete missing workload_delete_v1 authority guard")
 	}

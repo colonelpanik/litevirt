@@ -98,6 +98,7 @@ func HistoricalShapes() []HistoricalShape {
 	// entries remain valid ordinary LWW tombstones during the support horizon.
 	add(legacyVMDeleteSQL, "delete_vm_pre_authority")
 	add(legacyContainerDeleteSQL, "delete_container_pre_authority")
+	add(legacyContainerStrictDeleteSQL, "delete_container_strict_pre_authority")
 	add(`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET

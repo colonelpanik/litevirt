@@ -151,6 +151,7 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// only let them tombstone rows that are themselves still pre-authority.
 	{SQL: legacyVMDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	{SQL: legacyContainerDeleteSQL, Disposition: DispLegacyWorkloadDelete},
+	{SQL: legacyContainerStrictDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes) → verbatim.
 	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock},
 	// session revoke: a guarded one-shot terminal transition (WHERE revoked_at IS NULL) → verbatim.

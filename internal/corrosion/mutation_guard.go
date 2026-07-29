@@ -13,9 +13,12 @@ const (
 	workloadCreateGuardV1      = "workload_create_v1"
 	workloadCreateBeginGuardV1 = "workload_create_begin_v1"
 	workloadDeleteGuardV1      = "workload_delete_v1"
+	workloadRekeyGuardV1       = "workload_rekey_v1"
 	legacyVMDeleteSQL          = `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`
 	legacyContainerDeleteSQL   = `UPDATE containers SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ?`
+	legacyContainerStrictDeleteSQL = `UPDATE containers SET deleted_at = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`
 	vmDeleteSQL = `UPDATE vms SET deleted_at = ?, updated_at = ?
 		 WHERE name = ? AND vm_owner_epoch = ? AND spec_generation = ?
 		   AND deleted_at IS NULL`
@@ -33,6 +36,7 @@ type MutationGuard struct {
 	ResourceKind        string `json:"resource_kind"`
 	ResourceID          string `json:"resource_id"`
 	HostName            string `json:"host_name,omitempty"`
+	TargetHostName      string `json:"target_host_name,omitempty"`
 	OperationID         string `json:"operation_id"`
 	OwnerEpoch          int64  `json:"owner_epoch"`
 	SpecGeneration      int64  `json:"spec_generation,omitempty"`
@@ -118,12 +122,29 @@ func containerDeleteMutationGuard(ct ContainerRecord) (*MutationGuard, error) {
 	}, nil
 }
 
+func containerRekeyMutationGuard(src ContainerRecord, targetHost string) (*MutationGuard, error) {
+	labels, err := encodeContainerLabels(src.Labels)
+	if err != nil {
+		return nil, err
+	}
+	return &MutationGuard{
+		Protocol: workloadRekeyGuardV1, ResourceKind: "container",
+		ResourceID: src.Name, HostName: src.HostName, TargetHostName: targetHost,
+		OperationID: src.ActiveOperationID,
+		OwnerEpoch:  src.OwnerEpoch, SpecGeneration: src.SpecGeneration,
+		CheckSpecGeneration: true, IdentityHash: containerCreateIdentityHash(src, labels),
+	}, nil
+}
+
 func (c *Client) mutationGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationGuard) (bool, error) {
 	if guard == nil {
 		return true, nil
 	}
 	if guard.Protocol == workloadDeleteGuardV1 {
 		return workloadDeleteGuardMatches(ctx, tx, guard)
+	}
+	if guard.Protocol == workloadRekeyGuardV1 {
+		return workloadRekeyGuardMatches(ctx, tx, guard)
 	}
 	if guard.OperationID == "" || guard.ResourceID == "" {
 		return false, fmt.Errorf("invalid mutation guard protocol or identity")
@@ -247,6 +268,84 @@ func (c *Client) mutationGuardMatches(ctx context.Context, tx *sql.Tx, guard *Mu
 		return false, nil
 	}
 	return true, nil
+}
+
+func workloadRekeyGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationGuard) (bool, error) {
+	if guard.ResourceKind != "container" || guard.ResourceID == "" ||
+		guard.HostName == "" || guard.TargetHostName == "" ||
+		guard.HostName == guard.TargetHostName || guard.OwnerEpoch < 0 ||
+		!guard.CheckSpecGeneration || guard.SpecGeneration < 0 ||
+		guard.IdentityHash == "" {
+		return false, fmt.Errorf("invalid workload rekey guard")
+	}
+	var ct ContainerRecord
+	var labels string
+	var isTemplate int
+	err := tx.QueryRowContext(ctx,
+		`SELECT host_name, name, COALESCE(image, ''), cpu_limit, memory_mib,
+		        COALESCE(labels, ''), COALESCE(restart_policy, ''),
+		        COALESCE(project, '_default'), COALESCE(is_template, 0),
+		        COALESCE(on_host_failure, ''), COALESCE(create_spec, ''),
+		        COALESCE(relocate_token, ''), owner_epoch, spec_generation,
+		        active_operation_id
+		 FROM containers WHERE host_name = ? AND name = ?`,
+		guard.HostName, guard.ResourceID).
+		Scan(&ct.HostName, &ct.Name, &ct.Image, &ct.CPULimit, &ct.MemMiB,
+			&labels, &ct.RestartPolicy, &ct.Project, &isTemplate,
+			&ct.OnHostFailure, &ct.CreateSpec, &ct.RelocateToken,
+			&ct.OwnerEpoch, &ct.SpecGeneration, &ct.ActiveOperationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	ct.IsTemplate = isTemplate != 0
+	if ct.OwnerEpoch != guard.OwnerEpoch ||
+		ct.SpecGeneration != guard.SpecGeneration ||
+		ct.ActiveOperationID != guard.OperationID ||
+		containerCreateIdentityHash(ct, labels) != guard.IdentityHash {
+		return false, nil
+	}
+
+	// A remote replay cannot use the local optimistic preflight, so bind the
+	// destination as well: absent/tombstoned is safe, and an already-live target
+	// is safe only when it is the exact idempotent result of this same re-key.
+	var target ContainerRecord
+	var targetLabels, targetState, targetDetail string
+	var targetTemplate int
+	err = tx.QueryRowContext(ctx,
+		`SELECT host_name, name, COALESCE(image, ''), cpu_limit, memory_mib,
+		        COALESCE(labels, ''), COALESCE(restart_policy, ''),
+		        COALESCE(project, '_default'), COALESCE(is_template, 0),
+		        COALESCE(on_host_failure, ''), COALESCE(create_spec, ''),
+		        COALESCE(relocate_token, ''), owner_epoch, spec_generation,
+		        active_operation_id, state, COALESCE(state_detail, '')
+		 FROM containers
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		guard.TargetHostName, guard.ResourceID).
+		Scan(&target.HostName, &target.Name, &target.Image,
+			&target.CPULimit, &target.MemMiB, &targetLabels,
+			&target.RestartPolicy, &target.Project, &targetTemplate,
+			&target.OnHostFailure, &target.CreateSpec, &target.RelocateToken,
+			&target.OwnerEpoch, &target.SpecGeneration, &target.ActiveOperationID,
+			&targetState, &targetDetail)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	target.IsTemplate = targetTemplate != 0
+	expectedTarget := ct
+	expectedTarget.HostName = guard.TargetHostName
+	return target.OwnerEpoch == guard.OwnerEpoch &&
+		target.SpecGeneration == guard.SpecGeneration &&
+		target.ActiveOperationID == guard.OperationID &&
+		targetState == "running" &&
+		targetDetail == ContainerRuntimeRekeyDetail &&
+		containerCreateIdentityHash(target, targetLabels) ==
+			containerCreateIdentityHash(expectedTarget, labels), nil
 }
 
 func workloadDeleteGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationGuard) (bool, error) {

@@ -27,8 +27,9 @@ import (
 // identity was removed or changed. The immediate schema-v43 InsertHost shape was
 // subsequently added after v44 appended capacity_policy_hash. The authority-
 // fenced workload writers also retain their immediately preceding VM insert and
-// VM/container delete shapes for rolling upgrades and retained WAL.
-const compatibilityDigest = "a42525c2f8808b01b88b119d2be312c45944ee0a8b55819e0bcdf61531592262"
+// VM/container delete shapes for rolling upgrades and retained WAL, including
+// the strict live-container tombstone emitted by DeleteContainerStrict.
+const compatibilityDigest = "b9e5e9477d362f4f373b2ede27852cfca0e8c1800d09870a0b8e2b10380b5598"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -68,21 +69,22 @@ func TestCompatibilityDigestFrozen(t *testing.T) {
 // upgrade/WAL-retention horizon (a deliberate act). Counts are the raw HistoricalShapes
 // expansion (before dedup against the current ledger).
 var supportedReleaseFamilyManifest = map[string]int{
-	"configure_host_v130":             127, // 2^7-1 non-empty subsets of the 7 ConfigureHost fields
-	"stack_firewall_teardown_v130":    4,   // ip_sets / cluster_firewall_rules / host_firewall_rules / firewall_defaults
-	"vm_rename_v130":                  3,   // vm_interfaces / vm_disks / ip_allocations
-	"network_rename_v130":             3,   // network_vteps / ip_allocations / vm_interfaces
-	"vm_disks_insert_v130":            1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
-	"insert_host_v130":                1,   // pre-capacity-policy hosts insert (narrower column list)
-	"insert_host_v43":                 1,   // capacity overrides present, before v44 capacity-policy fingerprint
-	"configure_host_fixed_v130":       1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
-	"containers_upsert_v130":          1,   // pre-v44 container upsert without lifecycle fencing columns
-	"containers_rekey_v130":           1,   // pre-v44 container re-key without lifecycle fencing columns
-	"notification_routes_insert_v130": 1,   // pre-v44 route insert without subject/project selectors
-	"insert_vm_pre_authority":         1,   // VM insert before owner/generation columns were carried
-	"delete_vm_pre_authority":         1,   // VM tombstone before authority guard columns
-	"delete_container_pre_authority":  1,   // container tombstone before authority guard columns
-	"pci_release_by_vm_v130":          1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
+	"configure_host_v130":                   127, // 2^7-1 non-empty subsets of the 7 ConfigureHost fields
+	"stack_firewall_teardown_v130":          4,   // ip_sets / cluster_firewall_rules / host_firewall_rules / firewall_defaults
+	"vm_rename_v130":                        3,   // vm_interfaces / vm_disks / ip_allocations
+	"network_rename_v130":                   3,   // network_vteps / ip_allocations / vm_interfaces
+	"vm_disks_insert_v130":                  1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
+	"insert_host_v130":                      1,   // pre-capacity-policy hosts insert (narrower column list)
+	"insert_host_v43":                       1,   // capacity overrides present, before v44 capacity-policy fingerprint
+	"configure_host_fixed_v130":             1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
+	"containers_upsert_v130":                1,   // pre-v44 container upsert without lifecycle fencing columns
+	"containers_rekey_v130":                 1,   // pre-v44 container re-key without lifecycle fencing columns
+	"notification_routes_insert_v130":       1,   // pre-v44 route insert without subject/project selectors
+	"insert_vm_pre_authority":               1,   // VM insert before owner/generation columns were carried
+	"delete_vm_pre_authority":               1,   // VM tombstone before authority guard columns
+	"delete_container_pre_authority":        1,   // container tombstone before authority guard columns
+	"delete_container_strict_pre_authority": 1,   // strict live-container tombstone before authority guard columns
+	"pci_release_by_vm_v130":                1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

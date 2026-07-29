@@ -29,7 +29,13 @@ import (
 // fenced workload writers also retain their immediately preceding VM insert and
 // VM/container delete shapes for rolling upgrades and retained WAL, including
 // the strict live-container tombstone emitted by DeleteContainerStrict.
-const compatibilityDigest = "b9e5e9477d362f4f373b2ede27852cfca0e8c1800d09870a0b8e2b10380b5598"
+//
+// Updated again when ClaimInitialProjectAuthority stopped minting the literal
+// epoch 1 (it now binds the epoch so it can mint above a project's retired
+// epochs). The schema-v41 literal shape was ADDED as claim_project_authority_v41,
+// not dropped, so a peer on the older shape still applies. No existing historical
+// identity was removed or changed.
+const compatibilityDigest = "3820e7dae614bb8916774c38da9cf17f7b2bf22fa7bce6c1862032d91e09ca4f"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -85,6 +91,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"delete_container_pre_authority":        1,   // container tombstone before authority guard columns
 	"delete_container_strict_pre_authority": 1,   // strict live-container tombstone before authority guard columns
 	"pci_release_by_vm_v130":                1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
+	"claim_project_authority_v41":           1,   // initial authority claim when the epoch was the literal 1
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

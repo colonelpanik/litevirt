@@ -39,9 +39,12 @@ var customMergeTables = map[string]customMergeFn{
 	// idempotently, a genuine facts-conflict for one PK is left unresolved + flagged
 	// (never coin-flipped), and a tombstone (GC of a terminal op past its horizon)
 	// dominates a delayed live copy. See immutableMergeKeepLocalRow.
-	"operations":               (*Client).immutableMergeKeepLocalRow,
-	"operation_steps":          (*Client).immutableMergeKeepLocalRow,
-	"project_authority_epochs": (*Client).immutableMergeKeepLocalRow,
+	"operations":      (*Client).immutableMergeKeepLocalRow,
+	"operation_steps": (*Client).immutableMergeKeepLocalRow,
+	// project_authority_epochs is immutable too, but its PK is one several nodes
+	// legitimately mint at once, so it converges deterministically instead of
+	// freezing a conflict. See authorityMergeRow.
+	"project_authority_epochs": (*Client).authorityMergeRow,
 }
 
 // proofRank orders the runtime_action_proofs lifecycle so a terminal state can
@@ -1165,29 +1168,53 @@ func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []i
 		return false, nil
 	}
 	delIdx := indexOf(table.Columns, "deleted_at")
-	localDeleted := delIdx >= 0 && cellNonEmpty(localRow[delIdx])
-	incomingDeleted := delIdx >= 0 && cellNonEmpty(row[delIdx])
-	if localDeleted != incomingDeleted {
-		return localDeleted, nil // tombstone dominates: keep whichever side is tombstoned
+	if keepLocal, decided := tombstoneDominates(localRow, row, delIdx); decided {
+		return keepLocal, nil
 	}
-	if immutableFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
+	if rowFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
 		return true, nil // idempotent re-delivery
 	}
 	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "immutable_conflict")
 	return true, nil
 }
 
-// immutableFactsEqual reports whether two rows agree on every column except
-// updated_at and deleted_at (the only mutable metadata on an immutable row). It
-// reuses the byte-frozen row encoder for a canonical, type-normalized compare.
-func immutableFactsEqual(cols []string, a, b []interface{}, updatedAtIdx, deletedAtIdx int) bool {
+// tombstoneDominates is the shared first question every immutable-row merge asks:
+// when exactly one side is tombstoned, that side wins regardless of timestamps (a
+// terminal/GC'd row must beat a delayed live copy). decided is false when both
+// sides agree on liveness, leaving the decision to the caller's own rule.
+func tombstoneDominates(localRow, row []interface{}, deletedAtIdx int) (keepLocal, decided bool) {
+	localDeleted := deletedAtIdx >= 0 && cellNonEmpty(localRow[deletedAtIdx])
+	incomingDeleted := deletedAtIdx >= 0 && cellNonEmpty(row[deletedAtIdx])
+	if localDeleted == incomingDeleted {
+		return false, false
+	}
+	return localDeleted, true
+}
+
+// rowFactsEqual reports whether two rows agree on every column except the skipped
+// indexes — the metadata a given table does not count as one of the row's facts.
+// It reuses the byte-frozen row encoder for a canonical, type-normalized compare.
+//
+// Which columns are metadata is per-table, which is why the skip set is a
+// parameter: an operation journal treats only updated_at/deleted_at as mutable,
+// while a row two nodes can legitimately mint concurrently must also discount the
+// per-node wall clock in created_at (see authorityMergeRow).
+func rowFactsEqual(cols []string, a, b []interface{}, skip ...int) bool {
 	if len(a) != len(cols) || len(b) != len(cols) {
+		return false
+	}
+	skipped := func(i int) bool {
+		for _, s := range skip {
+			if i == s {
+				return true
+			}
+		}
 		return false
 	}
 	fa := make([]interface{}, 0, len(cols))
 	fb := make([]interface{}, 0, len(cols))
 	for i := range cols {
-		if i == updatedAtIdx || i == deletedAtIdx {
+		if skipped(i) {
 			continue
 		}
 		fa = append(fa, a[i])

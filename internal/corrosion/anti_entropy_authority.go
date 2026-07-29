@@ -26,9 +26,8 @@ type workloadMergeAuthority struct {
 }
 
 type operationMergeAuthority struct {
-	id, project, resourceKind, resourceID, operationKind, desiredRef string
-	ownerEpoch                                                       int64
-	deleted, valid                                                   bool
+	OperationRecord
+	valid bool
 }
 
 var vmAuthorityChildTables = map[string]bool{
@@ -92,10 +91,10 @@ func buildMergeAuthorityManifest(payload *syncPayload) *mergeAuthorityManifest {
 			case "operations":
 				a, ok := operationAuthorityFromDump(table.Columns, row)
 				if ok {
-					if _, duplicate := m.operations[a.id]; duplicate {
+					if _, duplicate := m.operations[a.ID]; duplicate {
 						a.valid = false
 					}
-					m.operations[a.id] = a
+					m.operations[a.ID] = a
 				}
 			}
 		}
@@ -185,8 +184,9 @@ func containerAuthorityFromDump(cols []string, row []interface{}) (workloadMerge
 
 func operationAuthorityFromDump(cols []string, row []interface{}) (operationMergeAuthority, bool) {
 	required := []string{
-		"id", "project", "resource_kind", "resource_id", "operation_kind",
-		"desired_ref", "vm_owner_epoch", "deleted_at",
+		"id", "method", "principal", "project", "resource_kind", "resource_id",
+		"operation_kind", "request_hash", "idempotency_key",
+		"reservation_json", "desired_ref", "vm_owner_epoch", "deleted_at",
 	}
 	idx, ok := requiredColumnIndexes(cols, required)
 	if !ok {
@@ -194,16 +194,23 @@ func operationAuthorityFromDump(cols []string, row []interface{}) (operationMerg
 	}
 	ownerEpoch, ownerOK := coerceInt64OK(row[idx["vm_owner_epoch"]])
 	a := operationMergeAuthority{
-		id:            coerceString(row[idx["id"]]),
-		project:       projectOrDefault(coerceString(row[idx["project"]])),
-		resourceKind:  coerceString(row[idx["resource_kind"]]),
-		resourceID:    coerceString(row[idx["resource_id"]]),
-		operationKind: coerceString(row[idx["operation_kind"]]),
-		desiredRef:    coerceString(row[idx["desired_ref"]]),
-		ownerEpoch:    ownerEpoch,
-		deleted:       cellNonEmpty(row[idx["deleted_at"]]),
+		OperationRecord: OperationRecord{
+			ID:              coerceString(row[idx["id"]]),
+			Method:          coerceString(row[idx["method"]]),
+			Principal:       coerceString(row[idx["principal"]]),
+			Project:         projectOrDefault(coerceString(row[idx["project"]])),
+			ResourceKind:    coerceString(row[idx["resource_kind"]]),
+			ResourceID:      coerceString(row[idx["resource_id"]]),
+			OperationKind:   coerceString(row[idx["operation_kind"]]),
+			RequestHash:     coerceString(row[idx["request_hash"]]),
+			IdempotencyKey:  coerceString(row[idx["idempotency_key"]]),
+			ReservationJSON: coerceString(row[idx["reservation_json"]]),
+			DesiredRef:      coerceString(row[idx["desired_ref"]]),
+			VMOwnerEpoch:    ownerEpoch,
+			DeletedAt:       coerceString(row[idx["deleted_at"]]),
+		},
 	}
-	a.valid = a.id != "" && a.resourceID != "" && ownerOK
+	a.valid = a.ID != "" && a.ResourceID != "" && ownerOK
 	return a, true
 }
 
@@ -292,29 +299,30 @@ func (c *Client) operationStepAuthorityKeepsLocal(tx *sql.Tx, table syncTable, r
 	sourceOp, inManifest := m.operations[id]
 
 	var local operationMergeAuthority
-	var deletedAt sql.NullString
 	err := tx.QueryRow(
-		`SELECT id, project, resource_kind, resource_id, operation_kind,
-		        desired_ref, vm_owner_epoch, deleted_at
+		`SELECT id, method, principal, project, resource_kind, resource_id,
+		        operation_kind, request_hash, idempotency_key, reservation_json,
+		        desired_ref, vm_owner_epoch, COALESCE(deleted_at, '')
 		 FROM operations WHERE id = ?`, id).
-		Scan(&local.id, &local.project, &local.resourceKind, &local.resourceID,
-			&local.operationKind, &local.desiredRef, &local.ownerEpoch, &deletedAt)
+		Scan(&local.ID, &local.Method, &local.Principal, &local.Project,
+			&local.ResourceKind, &local.ResourceID, &local.OperationKind,
+			&local.RequestHash, &local.IdempotencyKey, &local.ReservationJSON,
+			&local.DesiredRef, &local.VMOwnerEpoch, &local.DeletedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("anti-entropy operation-step authority lookup: %w", err)
 	}
-	local.project = projectOrDefault(local.project)
-	local.deleted = deletedAt.Valid && deletedAt.String != ""
-	local.valid = local.id != "" && local.resourceID != ""
+	local.Project = projectOrDefault(local.Project)
+	local.valid = local.ID != "" && local.ResourceID != ""
 
 	// Non-create journals retain their existing immutable merge behavior.
-	if local.operationKind != string(OpWorkloadCreate) {
+	if local.OperationKind != string(OpWorkloadCreate) {
 		return false, nil
 	}
-	if !inManifest || !sourceOp.valid || sourceOp.deleted || local.deleted ||
-		incomingEpoch != sourceOp.ownerEpoch ||
+	if !inManifest || !sourceOp.valid || sourceOp.DeletedAt != "" || local.DeletedAt != "" ||
+		incomingEpoch != sourceOp.VMOwnerEpoch ||
 		!sameOperationMergeAuthority(local, sourceOp) {
 		return true, nil
 	}
@@ -327,26 +335,20 @@ func (c *Client) operationStepAuthorityKeepsLocal(tx *sql.Tx, table syncTable, r
 }
 
 func sameOperationMergeAuthority(a, b operationMergeAuthority) bool {
-	return a.id == b.id &&
-		a.project == b.project &&
-		a.resourceKind == b.resourceKind &&
-		a.resourceID == b.resourceID &&
-		a.operationKind == b.operationKind &&
-		a.desiredRef == b.desiredRef &&
-		a.ownerEpoch == b.ownerEpoch
+	return sameOperationClaim(a.OperationRecord, b.OperationRecord)
 }
 
 func sourceOperationWorkloadAuthority(op operationMergeAuthority, m *mergeAuthorityManifest) (workloadMergeAuthority, bool) {
-	switch op.resourceKind {
+	switch op.ResourceKind {
 	case "vm":
-		a, ok := m.vms[op.resourceID]
-		return a, ok && a.ownerEpoch == op.ownerEpoch &&
-			a.name == op.resourceID && a.project == op.project
+		a, ok := m.vms[op.ResourceID]
+		return a, ok && a.ownerEpoch == op.VMOwnerEpoch &&
+			a.name == op.ResourceID && a.project == op.Project
 	case "container":
-		a, ok := m.containers[op.desiredRef]
-		return a, ok && a.ownerEpoch == op.ownerEpoch &&
-			a.name == op.resourceID && a.project == op.project &&
-			op.desiredRef == containerCreateDesiredRef(a.host, a.name)
+		a, ok := m.containers[op.DesiredRef]
+		return a, ok && a.ownerEpoch == op.VMOwnerEpoch &&
+			a.name == op.ResourceID && a.project == op.Project &&
+			op.DesiredRef == containerCreateDesiredRef(a.host, a.name)
 	default:
 		return workloadMergeAuthority{}, false
 	}

@@ -828,6 +828,70 @@ func TestCreateOperationAntiEntropyCurrentAuthorityConverges(t *testing.T) {
 	})
 }
 
+func TestCreateOperationAntiEntropyRejectsStepsFromConflictingImmutableHeader(t *testing.T) {
+	ctx := context.Background()
+	localReservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+	}).Encode()
+	otherReservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 9, TargetHost: "h1", TargetCPU: 9,
+	}).Encode()
+
+	tests := []struct {
+		name   string
+		mutate func(*OperationRecord)
+	}{
+		{"method", func(op *OperationRecord) { op.Method = "CreateVM-v2" }},
+		{"principal", func(op *OperationRecord) { op.Principal = "bob" }},
+		{"request hash", func(op *OperationRecord) { op.RequestHash = "other-hash" }},
+		{"idempotency key", func(op *OperationRecord) { op.IdempotencyKey = "other-key" }},
+		{"reservation", func(op *OperationRecord) { op.ReservationJSON = otherReservation }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			local := testClient(t)
+			source := testClient(t)
+			op := createOp("op-conflicting-header", "vm", "vm1", "hash", localReservation, 1)
+			vm := VMRecord{
+				Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+				OwnerEpoch: 1, SpecGeneration: 1,
+			}
+			if applied, err := local.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+				t.Fatalf("local begin: applied=%v err=%v", applied, err)
+			}
+			incoming := op
+			tc.mutate(&incoming)
+			if applied, err := source.BeginVMCreateOperation(ctx, incoming, vm); err != nil || !applied {
+				t.Fatalf("source begin: applied=%v err=%v", applied, err)
+			}
+			for _, step := range []string{OpStepCompleted, OpStepRollbackCompleted, OpStepFailed} {
+				if err := AppendOperationStep(ctx, source, OperationStepRecord{
+					OperationID: incoming.ID, OwnerEpoch: 1, StepName: step,
+				}); err != nil {
+					t.Fatalf("append %s: %v", step, err)
+				}
+			}
+
+			if err := local.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+				t.Fatal(err)
+			}
+			steps, err := ListOperationSteps(ctx, local, op.ID, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, step := range steps {
+				switch step.StepName {
+				case OpStepCompleted, OpStepRollbackCompleted, OpStepFailed:
+					t.Errorf("terminal step %q from conflicting header was admitted", step.StepName)
+				}
+			}
+			if cpu, _, err := HostReserved(ctx, local, "h1"); err != nil || cpu != 2 {
+				t.Fatalf("local reservation after conflicting repair: cpu=%d err=%v", cpu, err)
+			}
+		})
+	}
+}
+
 func TestWorkloadAuthorityAntiEntropyCompatibility(t *testing.T) {
 	ctx := context.Background()
 

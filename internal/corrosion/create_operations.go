@@ -343,18 +343,28 @@ func compareOperationClaim(existing, requested OperationRecord) error {
 	if existing.RequestHash != requested.RequestHash {
 		return ErrOperationHashConflict
 	}
-	if existing.Method != requested.Method || existing.Principal != requested.Principal ||
-		projectOrDefault(existing.Project) != projectOrDefault(requested.Project) ||
-		existing.ResourceKind != requested.ResourceKind ||
-		existing.ResourceID != requested.ResourceID ||
-		existing.OperationKind != requested.OperationKind ||
-		existing.IdempotencyKey != requested.IdempotencyKey ||
-		existing.ReservationJSON != requested.ReservationJSON ||
-		existing.DesiredRef != requested.DesiredRef ||
-		existing.VMOwnerEpoch != requested.VMOwnerEpoch {
+	if !sameOperationClaim(existing, requested) {
 		return ErrOperationIdentityConflict
 	}
 	return nil
+}
+
+// sameOperationClaim compares the complete immutable request identity of an
+// operation header. Storage timestamps and the GC tombstone are metadata, not
+// claim identity. Project is canonicalized exactly as begin/idempotency does.
+func sameOperationClaim(a, b OperationRecord) bool {
+	return a.ID == b.ID &&
+		a.Method == b.Method &&
+		a.Principal == b.Principal &&
+		projectOrDefault(a.Project) == projectOrDefault(b.Project) &&
+		a.ResourceKind == b.ResourceKind &&
+		a.ResourceID == b.ResourceID &&
+		a.OperationKind == b.OperationKind &&
+		a.RequestHash == b.RequestHash &&
+		a.IdempotencyKey == b.IdempotencyKey &&
+		a.ReservationJSON == b.ReservationJSON &&
+		a.DesiredRef == b.DesiredRef &&
+		a.VMOwnerEpoch == b.VMOwnerEpoch
 }
 
 func compareReservedStepInTx(ctx context.Context, tx *sql.Tx, opID string, ownerEpoch int64, requestedFacts string) error {

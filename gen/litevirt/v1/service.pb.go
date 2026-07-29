@@ -22049,9 +22049,27 @@ func (x *VerifyAuditChainResponse) GetUnsignedAfterSigned() []string {
 // Must be sent to the node holding the cluster CA private key: signing on
 // another host's behalf means minting a certificate with that host's CN, which
 // is precisely what holding the CA authorises.
+// Two-phase, because the cluster CA private key lives in the OPERATOR's config
+// directory (~/.config/litevirt/pki), not in a daemon's PKI directory. A daemon
+// therefore cannot mint a certificate to sign with, and — more to the point —
+// should not have to: the CA never needs to be on a node at all.
+//
+// Phase 1 sends host_name alone. The daemon answers with the key that would be
+// retired and the sequence to retire it at, and writes nothing.
+// Phase 2 sends the certificate the operator minted for that host plus two
+// signatures over exactly those values. The daemon verifies them against the
+// cluster CA and records the result; it never sees a private key.
 type RetireAuditKeyRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	HostName      string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	HostName string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	// PEM of a certificate minted by the CA holder with this host's CN.
+	CertPem string `protobuf:"bytes,2,opt,name=cert_pem,json=certPem,proto3" json:"cert_pem,omitempty"`
+	// Signature retiring the host's key at the sequence phase 1 reported.
+	Signature string `protobuf:"bytes,3,opt,name=signature,proto3" json:"signature,omitempty"`
+	// Signature retiring the minted certificate itself, at the same sequence.
+	// Without it the certificate created to END a signing contract would stand
+	// as a new one, claiming the host signs with a key nobody holds.
+	SelfSignature string `protobuf:"bytes,4,opt,name=self_signature,json=selfSignature,proto3" json:"self_signature,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22089,6 +22107,27 @@ func (*RetireAuditKeyRequest) Descriptor() ([]byte, []int) {
 func (x *RetireAuditKeyRequest) GetHostName() string {
 	if x != nil {
 		return x.HostName
+	}
+	return ""
+}
+
+func (x *RetireAuditKeyRequest) GetCertPem() string {
+	if x != nil {
+		return x.CertPem
+	}
+	return ""
+}
+
+func (x *RetireAuditKeyRequest) GetSignature() string {
+	if x != nil {
+		return x.Signature
+	}
+	return ""
+}
+
+func (x *RetireAuditKeyRequest) GetSelfSignature() string {
+	if x != nil {
+		return x.SelfSignature
 	}
 	return ""
 }
@@ -24761,9 +24800,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\btampered\x18\f \x01(\bR\btampered\x12&\n" +
 	"\x0fretired_key_use\x18\r \x03(\tR\rretiredKeyUse\x12#\n" +
 	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\x122\n" +
-	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\"4\n" +
+	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\"\x94\x01\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
-	"\thost_name\x18\x01 \x01(\tR\bhostName\"d\n" +
+	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
+	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +
+	"\tsignature\x18\x03 \x01(\tR\tsignature\x12%\n" +
+	"\x0eself_signature\x18\x04 \x01(\tR\rselfSignature\"d\n" +
 	"\x16RetireAuditKeyResponse\x12$\n" +
 	"\x0eretired_key_id\x18\x01 \x01(\tR\fretiredKeyId\x12$\n" +
 	"\x0eretired_at_seq\x18\x02 \x01(\x03R\fretiredAtSeq\"E\n" +

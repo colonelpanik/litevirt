@@ -396,3 +396,72 @@ func auditKeyRetirements(ctx context.Context, c *Client, keyring *AuditKeyring) 
 	}
 	return out, nil
 }
+
+// RecordSignedRetirement records a retirement the CALLER signed, after checking
+// it against the cluster CA.
+//
+// The split exists because the CA private key lives in the operator's config
+// directory, not on any node — so a daemon cannot mint a certificate to sign
+// with, and should not have to. The operator mints and signs; this verifies and
+// stores. The CA never has to be present on a cluster node at all.
+//
+// certPEM must chain to the cluster CA and name hostName, the same rule every
+// other signer is held to. Both signatures must cover exactly the key and
+// sequence passed in, so a stale or substituted answer to the first phase cannot
+// be replayed against a different boundary.
+//
+// selfSig retires the minted certificate itself. Without it, the certificate
+// created to END a signing contract would stand as a new one — claiming the host
+// signs with a key nobody holds, and putting every unsigned row it writes from
+// then on back under a contract.
+func RecordSignedRetirement(ctx context.Context, c *Client, pkiDir, hostName, retiredKeyID string, seq int64, certPEM, sig, selfSig string) error {
+	verifier, err := LoadAuditVerifier(pkiDir)
+	if err != nil {
+		return fmt.Errorf("load cluster CA: %w", err)
+	}
+	cert, err := parseCertPEM([]byte(certPEM))
+	if err != nil {
+		return fmt.Errorf("retirement certificate: %w", err)
+	}
+	if cert.Subject.CommonName != hostName {
+		return fmt.Errorf("retirement certificate names %q, not %q",
+			cert.Subject.CommonName, hostName)
+	}
+	byKeyID, err := AuditKeyID(cert)
+	if err != nil {
+		return err
+	}
+	// Publish before verifying: certFor resolves the signer from the table, and
+	// it is checked against the CA there. Publishing an unusable certificate
+	// achieves nothing on its own.
+	pub := &AuditKeyring{hostName: hostName, keyID: byKeyID, certPEM: certPEM}
+	if err := pub.publishCert(ctx, c); err != nil {
+		return fmt.Errorf("publish the retirement certificate: %w", err)
+	}
+	for _, r := range []struct {
+		keyID, sig, what string
+	}{
+		{retiredKeyID, sig, "retirement"},
+		{byKeyID, selfSig, "self-retirement of the retirement certificate"},
+	} {
+		if err := verifier.VerifyLifecycle(ctx, c, hostName, r.keyID,
+			auditLifecycleRetired, seq, byKeyID, r.sig); err != nil {
+			return fmt.Errorf("%s does not verify: %w", r.what, err)
+		}
+	}
+	for _, keyID := range []string{retiredKeyID, byKeyID} {
+		s := sig
+		if keyID == byKeyID {
+			s = selfSig
+		}
+		if err := c.Execute(ctx,
+			`INSERT OR IGNORE INTO audit_key_lifecycle
+			   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			hostName, keyID, auditLifecycleRetired, seq, byKeyID, s,
+			c.NowWall(), c.NowTS()); err != nil {
+			return fmt.Errorf("record retirement of %s: %w", keyID, err)
+		}
+	}
+	return nil
+}

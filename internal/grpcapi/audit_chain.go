@@ -14,8 +14,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -23,7 +21,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/pki"
 )
 
 func (s *Server) VerifyAuditChain(ctx context.Context, _ *emptypb.Empty) (*pb.VerifyAuditChainResponse, error) {
@@ -157,44 +154,19 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 
-	caCert := filepath.Join(s.pkiDir, "ca.crt")
-	caKey := filepath.Join(s.pkiDir, "ca.key")
-	if _, statErr := os.Stat(caKey); statErr != nil {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"this node does not hold the cluster CA private key (%s): retiring a key on another "+
-				"host's behalf means minting a certificate with that host's name, and only the "+
-				"node that ran `lv host init` can do that", caKey)
+	// Phase 1: report what would be retired. The operator holds the CA, so they
+	// mint and sign; this node only ever verifies.
+	if req.GetSignature() == "" {
+		return &pb.RetireAuditKeyResponse{RetiredKeyId: active, RetiredAtSeq: seq}, nil
 	}
-	tmpDir, err := os.MkdirTemp("", "litevirt-audit-retire-")
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "create temp dir: %v", err)
-	}
-	// The retiring key signs and is gone. Removing it is the point, not tidiness:
-	// a second live copy of a signing identity for this host is the thing the
-	// whole feature exists to avoid.
-	defer os.RemoveAll(tmpDir)
-	if err := os.Chmod(tmpDir, 0o700); err != nil {
-		return nil, status.Errorf(codes.Internal, "tighten temp dir: %v", err)
-	}
-	certPath := filepath.Join(tmpDir, pki.AuditSigningCertName)
-	keyPath := filepath.Join(tmpDir, pki.AuditSigningKeyName)
-	if err := pki.GenerateAuditSigningCert(caCert, caKey, certPath, keyPath, host); err != nil {
-		return nil, status.Errorf(codes.Internal, "mint the retirement certificate: %v", err)
-	}
-	keyring, err := corrosion.LoadAuditKeyringFromPaths(s.pkiDir, certPath, keyPath, host)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "load the retirement key: %v", err)
-	}
-	if err := keyring.PublishSigningKey(ctx, s.db); err != nil {
-		return nil, status.Errorf(codes.Internal, "publish the retirement certificate: %v", err)
-	}
-	if err := corrosion.RetireAuditKey(ctx, s.db, keyring, host, active, seq); err != nil {
-		return nil, status.Errorf(codes.Internal, "record the retirement: %v", err)
-	}
-	// The certificate minted to END a contract must not become a new one: left
-	// live it would claim the host is signing again, with a key nobody holds.
-	if err := corrosion.RetireAuditKey(ctx, s.db, keyring, host, keyring.KeyID(), seq); err != nil {
-		return nil, status.Errorf(codes.Internal, "retire the retirement certificate: %v", err)
+
+	// Phase 2. The certificate must chain to the cluster CA and name this host —
+	// the same rule every other signer is held to — and the signatures must cover
+	// exactly the key and sequence reported above, so a stale or substituted
+	// phase-1 answer cannot be replayed against a different boundary.
+	if err := corrosion.RecordSignedRetirement(ctx, s.db, s.pkiDir, host, active, seq,
+		req.GetCertPem(), req.GetSignature(), req.GetSelfSignature()); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	s.auditAs(ctx, callerUsername(ctx), "audit.key.retire", host,

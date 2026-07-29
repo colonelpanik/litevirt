@@ -2433,8 +2433,26 @@ message VerifyAuditChainResponse {
 // Must be sent to the node holding the cluster CA private key: signing on
 // another host's behalf means minting a certificate with that host's CN, which
 // is precisely what holding the CA authorises.
+// Two-phase, because the cluster CA private key lives in the OPERATOR's config
+// directory (~/.config/litevirt/pki), not in a daemon's PKI directory. A daemon
+// therefore cannot mint a certificate to sign with, and — more to the point —
+// should not have to: the CA never needs to be on a node at all.
+//
+// Phase 1 sends host_name alone. The daemon answers with the key that would be
+// retired and the sequence to retire it at, and writes nothing.
+// Phase 2 sends the certificate the operator minted for that host plus two
+// signatures over exactly those values. The daemon verifies them against the
+// cluster CA and records the result; it never sees a private key.
 message RetireAuditKeyRequest {
     string host_name = 1;
+    // PEM of a certificate minted by the CA holder with this host's CN.
+    string cert_pem = 2;
+    // Signature retiring the host's key at the sequence phase 1 reported.
+    string signature = 3;
+    // Signature retiring the minted certificate itself, at the same sequence.
+    // Without it the certificate created to END a signing contract would stand
+    // as a new one, claiming the host signs with a key nobody holds.
+    string self_signature = 4;
 }
 message RetireAuditKeyResponse {
     // The key that was retired, and the sequence it was retired at. Rows the key

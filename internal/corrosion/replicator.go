@@ -1511,7 +1511,7 @@ func validateLegacyContainerRekeyEnvelope(
 			return legacyContainerRekeyEnvelope{},
 				invalidf("legacy container rekey has an unexpected target interface")
 		}
-		if _, ok := hlc.Parse(coerceString(stmts[i].Params[8])); !ok {
+		if _, ok := ParseUpdatedAt(coerceString(stmts[i].Params[8])); !ok {
 			return legacyContainerRekeyEnvelope{},
 				invalidf("legacy container rekey has an invalid target interface clock")
 		}

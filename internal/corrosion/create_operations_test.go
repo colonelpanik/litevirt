@@ -2474,8 +2474,9 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 	ctx := context.Background()
 	const (
 		high        = "9000000000000-0000-retained-rekey"
-		ifaceClock0 = "9000000000001-0000-retained-iface-0"
-		ifaceClock1 = "9000000000002-0000-retained-iface-1"
+		ifaceRFC0   = "2026-07-28T12:00:03.000000001Z"
+		ifaceRFC1   = "2026-07-28T12:00:03.000000002Z"
+		ifaceHLC1   = "9000000000002-0000-retained-iface-1"
 		parentWall  = "2026-07-28T12:00:00Z"
 		cleanupWall = "2026-07-28T12:00:01Z"
 		leaseWall   = "2026-07-28T12:00:02Z"
@@ -2507,7 +2508,7 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 		}
 		return *got
 	}
-	retainedBatch := func(createdAt string) []Statement {
+	retainedBatch := func(createdAt, interfaceClock0, interfaceClock1 string) []Statement {
 		return []Statement{
 			{
 				SQL: legacyContainerStrictDeleteSQL,
@@ -2533,14 +2534,14 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 				SQL: containerCreateInterfaceSQL,
 				Params: []interface{}{
 					"h2", "ct1", "net1", 0, "52:54:00:00:00:01", "10.0.0.10",
-					ContainerVethName("ct1", 0), `["web"]`, ifaceClock0,
+					ContainerVethName("ct1", 0), `["web"]`, interfaceClock0,
 				},
 			},
 			{
 				SQL: containerCreateInterfaceSQL,
 				Params: []interface{}{
 					"h2", "ct1", "net2", 1, "52:54:00:00:00:02", "",
-					ContainerVethName("ct1", 1), "", ifaceClock1,
+					ContainerVethName("ct1", 1), "", interfaceClock1,
 				},
 			},
 			{
@@ -2586,7 +2587,8 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 		}
 
 		applyMutationEntry(t, receiver,
-			entry(t, "retained-v130-modern-target", retainedBatch(source.CreatedAt)))
+			entry(t, "retained-v130-modern-target",
+				retainedBatch(source.CreatedAt, ifaceRFC0, ifaceRFC1)))
 		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
 			got.OwnerEpoch != 0 || got.SpecGeneration != 0 || got.Image != "legacy" ||
 			got.State != source.State || got.UpdatedAt != source.UpdatedAt {
@@ -2600,34 +2602,42 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 	})
 
 	t.Run("safe legacy apply and idempotent replay", func(t *testing.T) {
-		receiver := testClient(t)
-		source := seedLegacySource(t, receiver)
-		stmts := retainedBatch(source.CreatedAt)
-		applyMutationEntry(t, receiver, entry(t, "retained-v130-safe", stmts))
-		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got != nil {
-			t.Fatalf("safe retained rekey left source live: %+v", got)
+		cases := map[string][2]string{
+			"legacy rfc3339 clocks":        {ifaceRFC0, ifaceRFC1},
+			"mixed rfc3339 and hlc clocks": {ifaceRFC0, ifaceHLC1},
 		}
-		assertTarget := func() {
-			t.Helper()
-			got, err := GetContainer(ctx, receiver, "h2", "ct1")
-			if err != nil || got == nil || got.OwnerEpoch != 0 ||
-				got.SpecGeneration != 0 || got.Image != "legacy" ||
-				got.State != "running" || got.StateDetail != ContainerRuntimeRekeyDetail {
-				t.Fatalf("safe retained target: got=%+v err=%v", got, err)
-			}
-			ifaces, err := GetContainerInterfaces(ctx, receiver, "h2", "ct1")
-			if err != nil || len(ifaces) != 2 ||
-				ifaces[0].NetworkName != "net1" || ifaces[0].IP != "10.0.0.10" ||
-				ifaces[0].VethDevice != ContainerVethName("ct1", 0) ||
-				len(ifaces[0].SecurityGroups) != 1 || ifaces[0].SecurityGroups[0] != "web" ||
-				ifaces[1].NetworkName != "net2" ||
-				ifaces[1].VethDevice != ContainerVethName("ct1", 1) {
-				t.Fatalf("safe retained interfaces: got=%+v err=%v", ifaces, err)
-			}
+		for name, clocks := range cases {
+			t.Run(name, func(t *testing.T) {
+				receiver := testClient(t)
+				source := seedLegacySource(t, receiver)
+				stmts := retainedBatch(source.CreatedAt, clocks[0], clocks[1])
+				applyMutationEntry(t, receiver, entry(t, "retained-v130-safe-"+name, stmts))
+				if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got != nil {
+					t.Fatalf("safe retained rekey left source live: %+v", got)
+				}
+				assertTarget := func() {
+					t.Helper()
+					got, err := GetContainer(ctx, receiver, "h2", "ct1")
+					if err != nil || got == nil || got.OwnerEpoch != 0 ||
+						got.SpecGeneration != 0 || got.Image != "legacy" ||
+						got.State != "running" || got.StateDetail != ContainerRuntimeRekeyDetail {
+						t.Fatalf("safe retained target: got=%+v err=%v", got, err)
+					}
+					ifaces, err := GetContainerInterfaces(ctx, receiver, "h2", "ct1")
+					if err != nil || len(ifaces) != 2 ||
+						ifaces[0].NetworkName != "net1" || ifaces[0].IP != "10.0.0.10" ||
+						ifaces[0].VethDevice != ContainerVethName("ct1", 0) ||
+						len(ifaces[0].SecurityGroups) != 1 || ifaces[0].SecurityGroups[0] != "web" ||
+						ifaces[1].NetworkName != "net2" ||
+						ifaces[1].VethDevice != ContainerVethName("ct1", 1) {
+						t.Fatalf("safe retained interfaces: got=%+v err=%v", ifaces, err)
+					}
+				}
+				assertTarget()
+				applyMutationEntry(t, receiver, entry(t, "retained-v130-replay-"+name, stmts))
+				assertTarget()
+			})
 		}
-		assertTarget()
-		applyMutationEntry(t, receiver, entry(t, "retained-v130-replay", stmts))
-		assertTarget()
 	})
 
 	t.Run("malformed registered envelopes are rejected", func(t *testing.T) {
@@ -2688,7 +2698,7 @@ func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T)
 			t.Run(name, func(t *testing.T) {
 				receiver := testClient(t)
 				source := seedLegacySource(t, receiver)
-				stmts := mutate(retainedBatch(source.CreatedAt))
+				stmts := mutate(retainedBatch(source.CreatedAt, ifaceRFC0, ifaceRFC1))
 				if _, err := NewReplicator(receiver, "", RelayConfig{}).
 					ApplyRemoteMutations(ctx, []*pb.MutationEntry{
 						entry(t, "retained-v130-malformed-"+name, stmts),

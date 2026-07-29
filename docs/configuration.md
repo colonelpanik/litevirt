@@ -44,6 +44,24 @@ anti_entropy_interval_sec: 0
 # Cluster membership port (used for peer discovery).
 gossip_port: 7946
 
+# Address peers reach this host on. Sets BOTH the gossip advertise address and
+# the host record this daemon self-registers — they must agree, or peers dial an
+# address the host certificate does not cover and every replication push fails
+# the TLS hostname check.
+#
+# Empty (default) auto-detects, which is only safe on an unambiguously
+# single-homed host: the host record takes the source IP toward the DEFAULT
+# ROUTE, while gossip takes the first private IP by INTERFACE ENUMERATION ORDER.
+# Those are different heuristics and can pick different interfaces.
+#
+# SET THIS on any host with more than one network — a separate management NIC, a
+# NAT'd or container fabric, a storage network. The failure is quiet and
+# confusing when the auto-detected address is identical on every node (e.g. a
+# NAT'd 10.0.2.15): gossip membership looks healthy and every node lists its
+# peers by name, but each one dials ITSELF, so the cluster never converges and
+# the logs show "certificate is valid for <real ip>, not <wrong ip>".
+advertise_address: ""
+
 # Path to TLS certificates (CA, host cert/key).
 pki_dir: "/etc/litevirt/pki"
 
@@ -159,6 +177,18 @@ enforcement:
                               # cluster-wide latch only forms once EVERY node has it enabled — the
                               # barrier is never relied upon until the whole fleet has opted in. Enable
                               # fleet-uniformly; the flag is the reversible kill switch.
+                              #
+                              # REQUIRED FOR HOTPLUG. Device attach/detach — disk, NIC, and
+                              # concrete-address PCI — refuse while this is off, because each
+                              # is journaled and at-most-once and has no un-journaled path:
+                              #   Error: attach disk: disk attach requires the
+                              #   operation_protocol_v1 capability to be active
+                              # A cluster left at the default therefore has no working
+                              # `lv attach-disk` / `lv detach-disk` / `lv attach-nic` /
+                              # `lv detach-nic`. That is deliberate, but the error names only
+                              # the capability, so see this flag. Note the capability activates
+                              # only once EVERY node has the flag on AND the token has latched
+                              # cluster-wide: enabling it on one node changes nothing.
   live_resize: false          # allow TRUE live CPU hot-add + balloon-memory resize. Setting a VM's
                               # max_cpu vCPU-hotplug ceiling is refused until this latches cluster-wide
                               # (an old peer could drop max_cpu from a spec it rewrites), after which
@@ -406,6 +436,64 @@ as `litevirt_gc_rows_deleted_total` (labeled by `table`).
 The sweep is local-only and deterministic (each node prunes its own copy; it
 never touches a current-active-set or current-generation row), so it is safe on a
 live cluster.
+
+## Capacity and overcommit
+
+How much of a host litevirt is willing to hand to workloads. Cluster-wide
+defaults live here; per-host overrides (`lv host config --cpu-overcommit …`) win
+where set.
+
+```yaml
+capacity:
+  cpu_overcommit_ratio: 4.0        # default 4.0
+  mem_overcommit_ratio: 1.0        # default 1.0
+  host_cpu_reserve: 1              # default 1
+  host_memory_reserve_mib: 1024    # default 1024
+  host_memory_reserve_pct: 5       # default 5
+  vm_memory_overhead_mib: 128      # default 128
+```
+
+**CPU and memory are deliberately different.** vCPU is time-sliced: running more
+vCPUs than cores is normal and the guests simply share, so the default
+oversubscribes 4×. Memory is not — without ballooning, KSM or swap a guest's RAM
+is either backed or the kernel starts reclaiming — so `mem_overcommit_ratio`
+defaults to exactly `1.0`. Raise it only where something makes the promise real.
+
+**The reserve matters more than either ratio.** At ratio 1.0 with no reserve,
+guests are offered 100% of RAM and nothing is left for the kernel, page cache,
+qemu's per-VM overhead or litevirtd itself — the host thrashes and, in the case
+that prompted this, stops answering SSH. The effective memory reserve is the
+**larger** of `host_memory_reserve_mib` and `host_memory_reserve_pct`, so the
+fixed floor protects small nodes while the percentage scales with large ones.
+
+`vm_memory_overhead_mib` is charged per running VM on top of its configured
+memory, covering qemu's own footprint (device models, video, page tables).
+Ignoring it under-counts usage, and by more the denser the host.
+
+**Containers count too, for memory.** A running container's memory cap is
+subtracted from host capacity exactly like a VM's, and `lv ct create` / `lv ct
+start` are admitted against it. Container CPU is *not* counted: `--cpu` on a
+container is cgroup **shares** — a relative weight, not a vCPU reservation — so
+adding it to a vCPU total would be meaningless. An **uncapped** container
+(`--memory 0`) is not accounted at all: litevirt knows the cap, not the
+footprint. Cap your containers if you want them to count.
+
+These apply to **both** placement and admission — VM create (including a pinned
+`--host`) and live resize all consult the same numbers, so the scheduler and the
+admission check cannot disagree.
+
+Admission runs wherever a host's usage can GROW: VM **create**, **start**, live
+**resize**, and a `--restart-if-needed` **reconfigure** that grows the VM. Usage
+counts running VMs, so a stopped VM consumes nothing until it starts — checking
+only at create time would be sidestepped by creating VMs that each fit and then
+starting them all. A shrink never consumes anything and is never refused.
+Automated recovery is deliberately exempt: the failover/reconciler restart paths
+are not admitted, because after a host reboot every VM starts at once and
+refusing there would strand the ones that lost the race.
+
+To exceed the policy deliberately for one VM, pass `--allow-overcommit` to
+`lv run` or `lv start`; the host check is skipped (project quota still applies)
+and the bypass is audited.
 
 ## Ports summary
 

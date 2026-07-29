@@ -102,12 +102,13 @@ test-fuzz-telemetry:
 # BASE_REF overrides what the schema-growth check diffs against (default origin/main).
 ci-guards:
 	./scripts/ci/check-schema-bump.sh
+	./scripts/ci/check-ledger-drift.sh
 	go run ./scripts/ci/writecheck -root .
 	go test ./scripts/ci/writecheck/
 	go run ./scripts/ci/stmtshapecheck -root .
 	go test ./scripts/ci/stmtshapecheck/
 	go test ./internal/corrosion/ -run 'TestSchemaHistoryDocumentsCurrentVersion|TestHistoricalLedgerComplete|TestHistoricalLedgerNonEmpty|TestSupportedReleaseFamilyManifest|TestLegacyTransformerManifest|TestCompatibilityDigestFrozen'
-	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestValidateInvocation|TestCheckIdentifier|TestExtractInvocations'
+	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestDocsDocumentEvery|TestValidateInvocation|TestResolveInvocation|TestCheckIdentifier|TestExtractInvocations'
 
 build-e2e:
 	CGO_ENABLED=0 go test -c -ldflags="$(LDFLAGS)" -o bin/e2e-test ./tests/e2e/

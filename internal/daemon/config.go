@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/obs"
 )
@@ -21,13 +22,22 @@ const defaultConfigPath = "/etc/litevirt/config.yaml"
 
 // Config holds litevirtd configuration.
 type Config struct {
-	HostName         string   `yaml:"host_name"`
-	GRPCPort         int      `yaml:"grpc_port"`
-	MetricsPort      int      `yaml:"metrics_port"`
-	MetricsBind      string   `yaml:"metrics_bind"` // listen address for /metrics (default "" = all interfaces; set "127.0.0.1" to restrict)
-	PKIDir           string   `yaml:"pki_dir"`
-	DataDir          string   `yaml:"data_dir"`
-	GossipPort       int      `yaml:"gossip_port"`
+	HostName    string `yaml:"host_name"`
+	GRPCPort    int    `yaml:"grpc_port"`
+	MetricsPort int    `yaml:"metrics_port"`
+	MetricsBind string `yaml:"metrics_bind"` // listen address for /metrics (default "" = all interfaces; set "127.0.0.1" to restrict)
+	PKIDir      string `yaml:"pki_dir"`
+	DataDir     string `yaml:"data_dir"`
+	GossipPort  int    `yaml:"gossip_port"`
+	// AdvertiseAddress is the address peers reach this host on — used BOTH for the
+	// gossip advertise address and for the host record this daemon self-registers,
+	// which must agree or peers dial an address the host's certificate does not
+	// cover. Empty ⇒ auto-detect (memberlist picks the first private IP by
+	// interface enumeration order; the host record uses the default-route source
+	// IP). Those two heuristics can disagree with each other and with reality on a
+	// multi-homed host, so set this explicitly whenever the node has more than one
+	// network.
+	AdvertiseAddress string   `yaml:"advertise_address,omitempty"`
 	JoinPeers        []string `yaml:"join_peers"`
 	UIPort           int      `yaml:"ui_port"`
 	UIBind           string   `yaml:"ui_bind"`            // listen address for web UI (default "127.0.0.1")
@@ -64,6 +74,11 @@ type Config struct {
 	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
+
+	// Capacity is the cluster-wide default for how much of a host may be handed
+	// to workloads. Per-host overrides live on the host record (`lv host config`)
+	// and win where set.
+	Capacity CapacityConfig `yaml:"capacity"`
 
 	// BackupRepos maps a logical repo name (referenced from compose
 	// `vms.<name>.backup.repo:`) to an on-disk path the snapshot
@@ -543,4 +558,63 @@ func normalizeTelemetry(t *TelemetryConfig) {
 // list. Empty when nothing is configured (the default → no network guard).
 func (c *Config) ImagePullBlockedPrefixes() ([]netip.Prefix, error) {
 	return image.ParseBlockPolicy(c.ImagePullBlockedCIDRs, c.ImagePullBlockMetadata, c.ImagePullBlockPrivate)
+}
+
+// CapacityConfig is the cluster-wide capacity policy: overcommit ratios and the
+// headroom held back for the host itself.
+//
+// CPU and memory deliberately differ. vCPU is time-sliced, so running more vCPUs
+// than cores is normal and the default oversubscribes. Memory is not — without
+// ballooning/KSM/swap a guest's RAM is either backed or the host starts
+// reclaiming — so the memory ratio defaults to exactly 1.
+//
+// The reserve matters more than either ratio: at ratio 1.0 with no reserve,
+// guests are offered 100% of RAM and the kernel, page cache, qemu's per-VM
+// overhead and litevirtd itself get nothing.
+//
+// Zero/unset fields fall back to the built-in defaults
+// (corrosion.DefaultCapacityPolicy).
+type CapacityConfig struct {
+	// CPUOvercommitRatio multiplies physical vCPUs. Default 4.0.
+	CPUOvercommitRatio float64 `yaml:"cpu_overcommit_ratio,omitempty"`
+	// MemOvercommitRatio multiplies physical memory. Default 1.0. Raise it only
+	// where ballooning/KSM/swap make the promise real.
+	MemOvercommitRatio float64 `yaml:"mem_overcommit_ratio,omitempty"`
+	// HostCPUReserve is vCPUs withheld for the host itself. Default 1.
+	HostCPUReserve int `yaml:"host_cpu_reserve,omitempty"`
+	// HostMemoryReserveMiB / HostMemoryReservePct withhold memory for the host;
+	// the effective reserve is the LARGER of the two, so the fixed floor protects
+	// small nodes while the percentage scales with large ones.
+	// Defaults 1024 and 5.
+	HostMemoryReserveMiB int `yaml:"host_memory_reserve_mib,omitempty"`
+	HostMemoryReservePct int `yaml:"host_memory_reserve_pct,omitempty"`
+	// VMMemoryOverheadMiB is charged per running VM on top of its configured
+	// memory for qemu's own footprint. Default 128.
+	VMMemoryOverheadMiB int `yaml:"vm_memory_overhead_mib,omitempty"`
+}
+
+// Policy converts the config into the corrosion capacity policy. Every
+// zero/unset field falls back to its built-in default individually, so a
+// partial capacity block (say, only cpu_overcommit_ratio) never silently
+// zeroes the host headroom. YAML omitempty cannot distinguish "wrote 0" from
+// "unset", so cluster-wide zero reserves are not expressible here — the
+// per-host override on the host record covers that rare case.
+func (c CapacityConfig) Policy() corrosion.CapacityPolicy {
+	d := corrosion.DefaultCapacityPolicy()
+	return corrosion.CapacityPolicy{
+		CPUOvercommit:    orDefault(c.CPUOvercommitRatio, d.CPUOvercommit),
+		MemOvercommit:    orDefault(c.MemOvercommitRatio, d.MemOvercommit),
+		CPUReserve:       orDefault(c.HostCPUReserve, d.CPUReserve),
+		MemReserveMiB:    orDefault(c.HostMemoryReserveMiB, d.MemReserveMiB),
+		MemReservePct:    orDefault(c.HostMemoryReservePct, d.MemReservePct),
+		VMMemOverheadMiB: orDefault(c.VMMemoryOverheadMiB, d.VMMemOverheadMiB),
+	}
+}
+
+// orDefault returns v, or d when v is zero/negative (i.e. unset in YAML).
+func orDefault[T interface{ ~int | ~float64 }](v, d T) T {
+	if v <= 0 {
+		return d
+	}
+	return v
 }

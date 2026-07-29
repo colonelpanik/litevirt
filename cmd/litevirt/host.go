@@ -440,6 +440,8 @@ workloads) before running this command.`,
 
 func newHostConfigCmd() *cobra.Command {
 	var fenceStrategy, ipmiAddr, ipmiUser, ipmiPass, watchdogDev, role, region string
+	var cpuOvercommit, memOvercommit float64
+	var cpuReserve, memReserveMiB int
 
 	cmd := &cobra.Command{
 		Use:   "config <host>",
@@ -447,7 +449,7 @@ func newHostConfigCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				h, err := c.ConfigureHost(ctx, &pb.ConfigureHostRequest{
+				out := &pb.ConfigureHostRequest{
 					Name:          args[0],
 					FenceStrategy: fenceStrategy,
 					IpmiAddress:   ipmiAddr,
@@ -456,7 +458,25 @@ func newHostConfigCmd() *cobra.Command {
 					WatchdogDev:   watchdogDev,
 					Role:          role,
 					Region:        region,
-				})
+				}
+				// Send capacity overrides only when the operator actually passed the
+				// flag: an omitted numeric flag is 0, which for a reserve is a REAL
+				// value ("hand guests everything"), so silence has to mean silence.
+				if cmd.Flags().Changed("cpu-overcommit") {
+					out.CpuOvercommit = &cpuOvercommit
+				}
+				if cmd.Flags().Changed("mem-overcommit") {
+					out.MemOvercommit = &memOvercommit
+				}
+				if cmd.Flags().Changed("cpu-reserve") {
+					v := int32(cpuReserve)
+					out.CpuReserve = &v
+				}
+				if cmd.Flags().Changed("mem-reserve") {
+					v := int32(memReserveMiB)
+					out.MemReserveMib = &v
+				}
+				h, err := c.ConfigureHost(ctx, out)
 				if err != nil {
 					return fmt.Errorf("configure host: %w", err)
 				}
@@ -466,7 +486,8 @@ func newHostConfigCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&fenceStrategy, "fence-strategy", "", "Fencing strategy (ssh, ipmi, watchdog)")
+	cmd.Flags().StringVar(&fenceStrategy, "fence-strategy", "",
+		"Fencing strategy: ssh | ipmi | watchdog | manual | best-effort. 'manual' never powers the host off — it records the intent and waits for `lv host fence-confirm`.")
 	cmd.Flags().StringVar(&ipmiAddr, "ipmi-address", "", "IPMI BMC address")
 	cmd.Flags().StringVar(&ipmiUser, "ipmi-user", "", "IPMI username")
 	cmd.Flags().StringVar(&ipmiPass, "ipmi-pass", "", "IPMI password")
@@ -475,6 +496,14 @@ func newHostConfigCmd() *cobra.Command {
 		"Role: 'worker' (run VMs + vote) or 'witness' (vote-only tiebreaker for even-N clusters). Host must have no VMs to be promoted to witness.")
 	cmd.Flags().StringVar(&region, "region", "",
 		"Region label (failure domain — DC, rack, AZ). Default 'default'. Used by `lv region status` and cross-region migration.")
+	cmd.Flags().Float64Var(&cpuOvercommit, "cpu-overcommit", 0,
+		"vCPU oversubscription ratio for this host (0 = inherit the cluster default). vCPU is time-sliced, so >1 is normal.")
+	cmd.Flags().Float64Var(&memOvercommit, "mem-overcommit", 0,
+		"Memory oversubscription ratio for this host (0 = inherit). Raise above 1 only with ballooning/KSM/swap to back it.")
+	cmd.Flags().IntVar(&cpuReserve, "cpu-reserve", 0,
+		"vCPUs held back for the host itself (negative = inherit the cluster default).")
+	cmd.Flags().IntVar(&memReserveMiB, "mem-reserve", 0,
+		"MiB held back for the host itself (negative = inherit). 0 means hand guests every last MiB — the host gets no headroom.")
 
 	return cmd
 }

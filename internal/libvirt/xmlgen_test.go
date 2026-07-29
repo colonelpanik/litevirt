@@ -954,3 +954,82 @@ func TestGenerateDomainXML_HostdevNoAlias(t *testing.T) {
 		t.Errorf("expected no <alias> element when Alias is unset; got:\n%s", xmlOut)
 	}
 }
+
+// TestInterfaceSourceByMAC pins the lookup DetachNIC depends on. Without it the
+// detach element is `type="bridge"` with an EMPTY <source>, which libvirt
+// rejects — "Missing required attribute 'bridge' in element 'source'" —
+// describing the XML we sent rather than anything the operator did. Reproduced
+// on a live cluster detaching a NIC from an isolated-network bridge.
+func TestInterfaceSourceByMAC(t *testing.T) {
+	const dom = `<domain type='kvm'><devices>
+	  <interface type='bridge'>
+	    <mac address='52:54:00:AA:BB:CC'/>
+	    <source bridge='br-iso-net'/>
+	  </interface>
+	  <interface type='network'>
+	    <mac address='52:54:00:11:22:33'/>
+	    <source network='default'/>
+	  </interface>
+	</devices></domain>`
+
+	// Matched case-insensitively — domain XML casing varies by source.
+	typ, src, ok := InterfaceSourceByMAC(dom, "52:54:00:aa:bb:cc")
+	if !ok {
+		t.Fatal("bridge NIC not found by MAC")
+	}
+	if typ != "bridge" || src.Bridge != "br-iso-net" {
+		t.Fatalf("got type=%q bridge=%q, want bridge/br-iso-net", typ, src.Bridge)
+	}
+
+	// A non-bridge interface must report its OWN type: describing it as a bridge
+	// would send an element that does not match the device.
+	if typ, _, ok := InterfaceSourceByMAC(dom, "52:54:00:11:22:33"); !ok || typ != "network" {
+		t.Fatalf("got type=%q ok=%v, want network/true", typ, ok)
+	}
+
+	if _, _, ok := InterfaceSourceByMAC(dom, "52:54:00:de:ad:00"); ok {
+		t.Fatal("absent MAC reported as found")
+	}
+	if _, _, ok := InterfaceSourceByMAC("not xml", "52:54:00:aa:bb:cc"); ok {
+		t.Fatal("unparseable document reported as found")
+	}
+}
+
+// TestDiskSourceByTarget pins the lookup DetachDisk depends on — the disk
+// counterpart of TestInterfaceSourceByMAC. libvirt asks that a detach element be
+// "as specific as its definition in the domain XML" and warns that a partial one
+// "may lead to unexpected results"; sending target-dev alone matches on that
+// attribute and nothing else.
+func TestDiskSourceByTarget(t *testing.T) {
+	const dom = `<domain type='kvm'><devices>
+	  <disk type='file' device='disk'>
+	    <source file='/var/lib/litevirt/disks/vm1-root.qcow2'/>
+	    <target dev='vda' bus='virtio'/>
+	  </disk>
+	  <disk type='block' device='disk'>
+	    <source file='/dev/mapper/data'/>
+	    <target dev='vdb' bus='virtio'/>
+	  </disk>
+	</devices></domain>`
+
+	typ, src, ok := DiskSourceByTarget(dom, "vda")
+	if !ok {
+		t.Fatal("file disk not found by target dev")
+	}
+	if typ != "file" || src.File != "/var/lib/litevirt/disks/vm1-root.qcow2" {
+		t.Fatalf("got type=%q file=%q, want file//var/lib/litevirt/disks/vm1-root.qcow2", typ, src.File)
+	}
+
+	// A non-file disk must report its OWN type, for the same reason a non-bridge
+	// interface does: describing it as a file sends an element that does not match.
+	if typ, _, ok := DiskSourceByTarget(dom, "vdb"); !ok || typ != "block" {
+		t.Fatalf("got type=%q ok=%v, want block/true", typ, ok)
+	}
+
+	if _, _, ok := DiskSourceByTarget(dom, "vdz"); ok {
+		t.Fatal("absent target dev reported as found")
+	}
+	if _, _, ok := DiskSourceByTarget("not xml", "vda"); ok {
+		t.Fatal("unparseable document reported as found")
+	}
+}

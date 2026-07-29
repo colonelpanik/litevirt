@@ -81,6 +81,7 @@ type Node struct {
 	DB       *corrosion.Client
 	Server   *grpcapi.Server
 	Virt     *libvirtfake.Fake // in-process libvirt fake; scenarios assert on its Events
+	CT       *CTFake           // in-process container runtime; real on-disk rootfs + tar export/import
 	GRPCSrv  *grpc.Server
 	Listener net.Listener
 	// peerConn caches a self-loopback client for scenario assertions
@@ -335,6 +336,12 @@ func (c *Cluster) crossRegisterHosts() {
 				CertSerial:    "fleet",
 				State:         "active",
 				FenceStrategy: "best-effort",
+				// Real capacity. Host admission now runs on CREATE as well as resize,
+				// and a host record with zero CPU/memory reads as "full" — every
+				// scenario that places a workload would be refused. Generous on
+				// purpose: capacity is not what these scenarios are testing.
+				CPUTotal: 64,
+				MemTotal: 262144,
 			}
 			if err := corrosion.InsertHost(ctx, target.DB, rec); err != nil {
 				// "UNIQUE constraint" is fine — already registered.
@@ -369,6 +376,14 @@ func (c *Cluster) buildServer(n *Node) {
 		DB:       n.DB,
 		Virt:     n.Virt,
 	})
+
+	// Container runtime: the LXC analogue of n.Virt. Wired unconditionally so
+	// container RPCs run on every node instead of returning "container runtime
+	// not wired on this host"; scenarios that don't touch containers never
+	// observe it. Rooted per-node so a migrate's export/import moves bytes
+	// between two genuinely separate directories.
+	n.CT = NewCTFake(filepath.Join(c.tmpRoot, n.Name, "lxc"))
+	n.Server.SetContainerRuntime(n.CT)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. Its background push loop is deliberately NOT started: it

@@ -175,6 +175,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		VMName:       spec.Name,
 		CPUNeeded:    int(spec.Cpu),
 		MemMiBNeeded: int(spec.MemoryMib),
+		Capacity:     s.capacity,
 	}
 	if p := spec.Placement; p != nil {
 		placementReq.PinHost = p.Host
@@ -215,6 +216,34 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	targetHost, err := placement.Select(ctx, s.db, placementReq)
 	if err != nil {
 		return nil, status.Errorf(codes.ResourceExhausted, "placement failed: %v", err)
+	}
+	// Host capacity admission. When placement CHOOSES a host it already scores
+	// capacity, but a PINNED host (`--host` / spec.placement.host) skips scoring
+	// entirely — Select only checks the host exists, is active, and isn't a witness
+	// — so a pinned create had no capacity check at all. Three 1 GiB VMs pinned to a
+	// ~3 GiB host were all accepted, the cluster reported 3072/2971 MiB, and the node
+	// thrashed until sshd stopped answering. A too-large single VM reached qemu and
+	// came back as a raw "cannot set up guest memory" error.
+	//
+	// This is the same check the resize path has used all along (resize.go:116), so
+	// growing a VM into a host was refused while creating one there was not. The
+	// spec (and therefore the pin) travels with a forwarded request, so this runs on
+	// the entry node to fail fast AND again on the owning host, where it is
+	// serialized against concurrent creates.
+	if req.AllowOvercommit {
+		// Deliberate density on a host the operator judges can take it. Project
+		// quota still applies (that is a tenancy limit, not a physical one); only
+		// the HOST capacity check is bypassed. Audited so it is never silent — an
+		// oversubscribed host that later thrashes should be traceable to the
+		// decision that put it there.
+		if err := s.requireOvercommit(ctx, vmRBACPathFor(spec.Project, spec.Name)); err != nil {
+			return nil, err
+		}
+		s.audit(ctx, "vm.create", spec.Name,
+			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
+				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+		return nil, err
 	}
 	// Project isolation (storage): pools are HOST-scoped, so admit each disk's pool
 	// against the SELECTED target host — not the entry host (which may hold a
@@ -966,6 +995,41 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if reason, refused := s.execGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return nil, status.Errorf(codes.FailedPrecondition, "start refused: %s", reason)
+	}
+
+	// Host capacity admission. Starting is where memory is actually CONSUMED —
+	// usage counts running VMs only, so a stopped VM contributes nothing until
+	// now. Without this, create-time admission is trivially sidestepped: create a
+	// pile of VMs (each fitting at the time), then start them all.
+	//
+	// Deliberately on the OPERATOR RPC, not inside startVMLocked. The automated
+	// failover / reconciler / health-restart paths bypass startVMLocked (see
+	// PrepareHardwareForStart), and they must stay unblocked: after a host reboot
+	// every VM is stopped and restarted at once, so an admission check there would
+	// let the first few start and then strand the rest — turning a clean recovery
+	// into a partial one. Recovery restores what was already accounted for; only a
+	// human asking for something NEW is admitted.
+	//
+	// Skipped when the VM is already running: `lv start` on a running VM is a
+	// no-op that adds nothing, and must not be refused for capacity it already
+	// occupies.
+	if vm.State != "running" {
+		spec := &pb.VMSpec{}
+		if vm.Spec != "" {
+			if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+				return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
+			}
+		}
+		if req.AllowOvercommit {
+			if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
+				return nil, err
+			}
+			s.audit(ctx, "vm.start", vm.Name,
+				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
+					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+		} else if err := s.checkHostCapacity(ctx, vm.HostName, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
+			return nil, err
+		}
 	}
 
 	return s.startVMLocked(ctx, vm)
@@ -2744,6 +2808,44 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if fresh.ActiveOperationID != "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "cannot reconfigure %q: an operation is in progress", req.Name)
 			}
+
+			// Host capacity admission for a reconfigure that GROWS the VM.
+			//
+			// Placed BEFORE the stop, deliberately. This path is stop → redefine →
+			// start, so admitting anywhere later means refusing after the redefine has
+			// already succeeded — leaving the VM stopped, resized, and unable to come
+			// back, which is a worse outcome than the overcommit. Refusing here costs
+			// nothing: the VM is still running on its old spec and nothing has changed.
+			//
+			// The delta is target MINUS current, not the full new size: the VM is
+			// running and already counted at its current actuals, so only the growth
+			// consumes anything. A shrink is a no-op (posOnly), and a stopped VM never
+			// reaches here — its capacity is admitted by StartVM when it starts.
+			wantCPU, wantMem := spec.Cpu, spec.MemoryMib
+			if req.Cpu > 0 {
+				wantCPU = req.Cpu
+			}
+			if req.MemoryMib > 0 {
+				wantMem = req.MemoryMib
+			}
+			cpuGrow, memGrow := posOnly(int(wantCPU-spec.Cpu)), posOnly(int(wantMem-spec.MemoryMib))
+			if req.AllowOvercommit {
+				if err := s.requireOvercommit(ctx, vmRBACPath(fresh)); err != nil {
+					return nil, err
+				}
+				// Only the HOST check is bypassed; quota is a tenancy limit.
+				if err := s.checkProjectQuota(ctx, fresh.Project, cpuGrow, memGrow); err != nil {
+					return nil, err
+				}
+				if cpuGrow > 0 || memGrow > 0 {
+					s.audit(ctx, "vm.update", req.Name,
+						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",
+							fresh.HostName, cpuGrow, memGrow), "allow-overcommit")
+				}
+			} else if err := s.checkResourceAdmission(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow); err != nil {
+				return nil, err
+			}
+
 			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
 				return nil, serr
 			}

@@ -420,3 +420,60 @@ func TestContainerCheck_RelocateRecreate_RebuildsNetworking(t *testing.T) {
 		t.Fatalf("recreated NIC = %+v, want bridge=br0 ip=10.1.2.3", n)
 	}
 }
+
+// TestContainerCheck_RelocateRecreate_UsesCreateSpecTemplate pins the template a
+// host-loss recreate actually hands the runtime.
+//
+// ct.Image is a DISPLAY label — "alpine:3.21" for a container built from the
+// lxc download template — not a template name. Passing it to lxc-create fails
+// with `bad template: alpine:3.21`, and because the reconciler retries forever
+// the container never returns on the survivor. Found on a real 4-node cluster;
+// invisible to the older test above, whose fake accepts any template string and
+// never looks at what it was given.
+func TestContainerCheck_RelocateRecreate_UsesCreateSpecTemplate(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "alpine:3.21", CPULimit: 1, MemMiB: 128,
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+			Template: "download", Distro: "alpine", Release: "3.21", Arch: "amd64",
+		}),
+	})
+
+	c := NewContainerChecker("node1", db, rt)
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if got := rt.lastCreate.Template; got != "download" {
+		t.Errorf("recreate used template %q, want %q — a display label is not a template and lxc-create rejects it", got, "download")
+	}
+	if rt.lastCreate.Distro != "alpine" || rt.lastCreate.Release != "3.21" || rt.lastCreate.Arch != "amd64" {
+		t.Errorf("download template needs distro/release/arch, got %q/%q/%q",
+			rt.lastCreate.Distro, rt.lastCreate.Release, rt.lastCreate.Arch)
+	}
+}
+
+// TestContainerCheck_RelocateRecreate_OCIFallsBackToImage: an OCI container has
+// no create-spec template, and there ct.Image IS the pullable reference — so the
+// fallback must stay.
+func TestContainerCheck_RelocateRecreate_OCIFallsBackToImage(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "docker.io/library/nginx:1.25", CPULimit: 1, MemMiB: 128,
+	})
+
+	c := NewContainerChecker("node1", db, rt)
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if got := rt.lastCreate.Template; got != "docker.io/library/nginx:1.25" {
+		t.Errorf("recreate used template %q, want the image reference", got)
+	}
+}

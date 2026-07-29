@@ -16,8 +16,11 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-func TestFleet_TenancyQuotaAdmission(t *testing.T) {
-	c := New(t, Options{Nodes: 1})
+// seedQuotaProject is the single-node preamble shared by the tenancy-quota
+// tests: a usable image named "test" plus project "/acme" capped at the given
+// quota. Returns the node and its client.
+func seedQuotaProject(t *testing.T, c *Cluster, vcpuLimit, memMiBLimit int32) (*Node, pb.LiteVirtClient) {
+	t.Helper()
 	ctx := context.Background()
 	node := c.Nodes[0]
 	client := c.SelfClient(node)
@@ -31,8 +34,6 @@ func TestFleet_TenancyQuotaAdmission(t *testing.T) {
 	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
 		t.Fatalf("stage image file: %v", err)
 	}
-
-	// Create a project with a tight quota: 4 vCPU, 4 GiB RAM.
 	if _, err := client.CreateProject(ctx, &pb.CreateProjectRequest{
 		Name: "/acme", Display: "Acme Co",
 	}); err != nil {
@@ -40,11 +41,19 @@ func TestFleet_TenancyQuotaAdmission(t *testing.T) {
 	}
 	if _, err := client.SetProjectQuota(ctx, &pb.SetProjectQuotaRequest{
 		Quota: &pb.ProjectQuota{
-			ProjectName: "/acme", VcpuLimit: 4, MemMibLimit: 4096,
+			ProjectName: "/acme", VcpuLimit: vcpuLimit, MemMibLimit: memMiBLimit,
 		},
 	}); err != nil {
 		t.Fatalf("SetProjectQuota: %v", err)
 	}
+	return node, client
+}
+
+func TestFleet_TenancyQuotaAdmission(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	// Tight quota: 4 vCPU, 4 GiB RAM.
+	node, client := seedQuotaProject(t, c, 4, 4096)
 
 	// Under quota: 2 vCPU / 2 GiB. Must succeed.
 	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
@@ -114,11 +123,16 @@ func TestFleet_TenancyDefaultProjectUnbounded(t *testing.T) {
 		t.Fatalf("stage image file: %v", err)
 	}
 
-	// No project field — should default to _default and skip the quota check.
+	// No project field — should default to _default and skip the QUOTA check.
+	//
+	// Large enough that any real project quota would reject it, but still within
+	// the host's allocatable capacity: host admission is a separate check that now
+	// runs on create too, and truly absurd values (1024 vCPU / 999999 MiB) would
+	// be refused for capacity — proving nothing about quotas.
 	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
 		Spec: &pb.VMSpec{
 			Name: "untenanted", Image: "test",
-			Cpu: 1024, MemoryMib: 999999, // absurd values, should still pass
+			Cpu: 200, MemoryMib: 200000,
 			Placement: &pb.PlacementSpec{Host: node.Name},
 		},
 	}); err != nil {
@@ -133,5 +147,101 @@ func TestFleet_TenancyDefaultProjectUnbounded(t *testing.T) {
 	rows, _ := node.DB.Query(ctx, "SELECT project FROM vms WHERE name = 'untenanted'")
 	if len(rows) == 0 || rows[0].String("project") != corrosion.DefaultProject {
 		t.Errorf("expected project=_default, got %+v", rows)
+	}
+}
+
+// A stopped workload is still counted in project-quota usage ("an allocation
+// counts whether running or stopped"), so restarting it must NOT admit its
+// full size against the quota a second time — start-time admission is about
+// HOST capacity only. Regression: stop→start of a VM sized above ~50% of its
+// project quota was refused with "quota exceeded".
+func TestFleet_TenancyQuota_StopStartStaysWithinQuota(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	node, client := seedQuotaProject(t, c, 4, 4096)
+
+	// 3000 MiB fits the 4096 quota at create — but is over half of it, so a
+	// double-counting start-time check would compute 3000+3000 > 4096.
+	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "big-half", Image: "test", Cpu: 2, MemoryMib: 3000,
+			Project:   "/acme",
+			Placement: &pb.PlacementSpec{Host: node.Name},
+		},
+	}); err != nil {
+		t.Fatalf("under-quota CreateVM: %v", err)
+	}
+	if _, err := client.StopVM(ctx, &pb.StopVMRequest{Name: "big-half"}); err != nil {
+		t.Fatalf("StopVM: %v", err)
+	}
+	if _, err := client.StartVM(ctx, &pb.StartVMRequest{Name: "big-half"}); err != nil {
+		t.Fatalf("StartVM of a stopped VM within quota: %v — start must not count the allocation against its own quota again", err)
+	}
+}
+
+// --allow-overcommit bypasses the HOST capacity check only. Project quota is a
+// tenancy limit, not a physical one — the flag must not sidestep it (the code
+// comment and proto doc both promise "project quota still applies").
+func TestFleet_TenancyQuota_AllowOvercommitStillEnforcesQuota(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	node, client := seedQuotaProject(t, c, 4, 4096)
+
+	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "first", Image: "test", Cpu: 2, MemoryMib: 3000,
+			Project:   "/acme",
+			Placement: &pb.PlacementSpec{Host: node.Name},
+		},
+	}); err != nil {
+		t.Fatalf("under-quota CreateVM: %v", err)
+	}
+
+	// Second VM pushes memory to 6000 > 4096. --allow-overcommit may skip the
+	// host check, never the quota.
+	_, err := client.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "second", Image: "test", Cpu: 1, MemoryMib: 3000,
+			Project:   "/acme",
+			Placement: &pb.PlacementSpec{Host: node.Name},
+		},
+		AllowOvercommit: true,
+	})
+	if err == nil {
+		t.Fatal("over-quota CreateVM with --allow-overcommit must still be refused by project quota")
+	}
+	if !strings.Contains(err.Error(), "quota exceeded") {
+		t.Errorf("want quota-exceeded error, got %v", err)
+	}
+}
+
+// UpdateVM growth under --allow-overcommit: the flag skips only the HOST
+// capacity check. Project quota must still refuse a grow past the limit
+// (proto doc: "project quota still applies").
+func TestFleet_TenancyQuota_UpdateAllowOvercommitStillEnforcesQuota(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	node, client := seedQuotaProject(t, c, 8, 4096)
+	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "grower", Image: "test", Cpu: 1, MemoryMib: 2048,
+			Project:   "/acme",
+			Placement: &pb.PlacementSpec{Host: node.Name},
+		},
+	}); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+
+	allowRestart := true
+	_, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "grower", MemoryMib: 6000, // grow to 6000 > 4096 quota
+		AllowRestart:    &allowRestart,
+		AllowOvercommit: true,
+	})
+	if err == nil {
+		t.Fatal("over-quota UpdateVM grow with --allow-overcommit must still be refused by project quota")
+	}
+	if !strings.Contains(err.Error(), "quota exceeded") {
+		t.Errorf("want quota-exceeded error, got %v", err)
 	}
 }

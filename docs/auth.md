@@ -28,6 +28,43 @@ Roles map to *principal IDs*: `user:<subject>@<realm>` and
 `group:<name>@<realm>`. Bind a role to a principal in the engine and the
 caller gets the role's verbs at the binding's path.
 
+### OIDC realm keys
+
+Under `auth.realms[].oidc:`. `issuer_url`, `client_id`, and `redirect_url` are
+required; prefer `client_secret_file` (checked for 0600 at load) over inlining
+`client_secret`.
+
+| Key | Purpose |
+|---|---|
+| `scopes` | Extra scopes to request beyond the defaults. |
+| `groups_claim` | Token claim carrying group membership; each value becomes a `group:<name>@<realm>` principal. |
+| `subject_claim` | Claim used as the stable subject — the `user:<subject>@<realm>` principal. Override when `sub` is an opaque id and you want a readable, stable alternative. |
+| `email_claim` | Claim read as the user's email address. |
+| `name_claim` | Claim read as the user's display name. |
+
+The claim overrides exist because IdPs disagree on claim names. Changing
+`subject_claim` on a live realm re-keys every principal id, so existing role
+bindings stop matching — rebind before switching it.
+
+### LDAP / AD realm keys
+
+Under `auth.realms[].ldap:`. `url` and `user_base_dn` are required; prefer
+`bind_password_file` over inlining `bind_password`.
+
+| Key | Purpose |
+|---|---|
+| `user_filter` | LDAP filter selecting user entries (e.g. `(objectClass=person)`). |
+| `group_base_dn` | Subtree searched for groups. |
+| `group_filter` | LDAP filter selecting group entries. |
+| `user_name_attr` | Attribute read as the login/subject name. |
+| `user_mail_attr` | Attribute read as the email address. |
+| `user_group_attr` | Attribute on the user entry listing group membership (typically `memberOf`). |
+| `group_name_attr` | Attribute on a group entry holding its name. |
+| `skip_tls_verify` | Disables certificate verification on the LDAPS connection. **Leave off outside a lab** — it makes directory traffic, including bind credentials, trivially interceptable. |
+
+As with OIDC, changing `user_name_attr` or `group_name_attr` re-keys principal
+ids and invalidates existing role bindings.
+
 ## Path-based RBAC
 
 Resources live under a tree:
@@ -64,6 +101,12 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 | BackupOperator | `backup.*`, `snapshot.*`, `vm.read` |
 | NetworkAdmin | `network.*`, `lb.*`, `sg.*` |
 | NoAccess | (none) |
+
+`--allow-overcommit` (CreateVM/StartVM/UpdateVM) additionally requires
+`vm.overcommit`: bypassing the host capacity check is an operator-level
+judgment call, so a binding granting only lifecycle verbs (e.g. VMOperator)
+cannot invoke it. Wildcard grants (`vm.*`, `*`) carry it; clusters on the
+legacy role model (no bindings) are unchanged — any operator may pass it.
 
 A *binding* attaches a role to a principal at a path. With
 `--propagate` the binding applies to that path and all descendants —

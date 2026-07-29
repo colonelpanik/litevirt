@@ -32,6 +32,8 @@ func newRunCmd() *cobra.Command {
 		restartWin   string
 		secureBoot   bool
 		tpm          bool
+
+		allowOvercommit bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -70,7 +72,7 @@ func newRunCmd() *cobra.Command {
 					}
 				}
 
-				vm, err := c.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+				vm, err := c.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec, AllowOvercommit: allowOvercommit})
 				if err != nil {
 					return fmt.Errorf("create VM: %w", err)
 				}
@@ -98,6 +100,8 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&restartWin, "restart-window", "", "Attempt-count window (e.g. 1h; default 1h)")
 	cmd.Flags().BoolVar(&secureBoot, "secure-boot", false, "Enable UEFI Secure Boot (q35; Windows 11 / signed-boot guests)")
 	cmd.Flags().BoolVar(&tpm, "tpm", false, "Attach an emulated TPM 2.0 device (Windows 11 / BitLocker)")
+	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
+		"Skip the host capacity check for this VM (project quota still applies). For deliberate density on a host you know can take it; the bypass is audited.")
 	cmd.MarkFlagRequired("name")
 	return cmd
 }
@@ -160,13 +164,16 @@ func newInspectCmd() *cobra.Command {
 }
 
 func newStartCmd() *cobra.Command {
-	return &cobra.Command{
+	var allowOvercommit bool
+	cmd := &cobra.Command{
 		Use:   "start <vm>",
 		Short: "Start a stopped VM",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				vm, err := c.StartVM(ctx, &pb.StartVMRequest{Name: args[0]})
+				vm, err := c.StartVM(ctx, &pb.StartVMRequest{
+					Name: args[0], AllowOvercommit: allowOvercommit,
+				})
 				if err != nil {
 					return fmt.Errorf("start VM: %w", err)
 				}
@@ -175,6 +182,9 @@ func newStartCmd() *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
+		"Skip the host capacity check for this start (project quota still applies). The bypass is audited.")
+	return cmd
 }
 
 func newStopCmd() *cobra.Command {

@@ -556,7 +556,40 @@ lv lb disable <lb> --backend <vm>                 # Hard disable
 lv lb enable <lb> --backend <vm>                  # Re-enable
 ```
 
+## Capacity and overcommit
+
+```bash
+# Per-host overrides (cluster defaults come from `capacity:` in the daemon config)
+lv host config node-1 --cpu-overcommit 2.0     # 0 = inherit the cluster default
+lv host config node-1 --mem-overcommit 1.5     # only with ballooning/KSM/swap behind it
+lv host config node-1 --mem-reserve 2048       # MiB held back for the host; negative = inherit
+lv host config node-1 --cpu-reserve 2          # vCPUs held back; negative = inherit
+
+# Deliberate density for one VM — skips the HOST capacity check, audited.
+# Project quota still applies. Available on both create and start, because
+# starting a stopped VM is when its memory is actually consumed.
+lv run    --name db --image ubuntu --memory 4096 --host node-1 --allow-overcommit
+lv start  db --allow-overcommit
+lv update db --memory 8192 --restart-if-needed --allow-overcommit
+```
+
+A `--mem-reserve 0` is a real setting meaning "hand guests every last MiB", which
+is why *inherit* is a negative value rather than zero. Placement and admission use
+the same numbers, so a pinned `--host` create is checked exactly like a resize.
+
 ## Hot-plug (attach/detach)
+
+**Requires `enforcement.operation_protocol`.** These commands are journaled and
+at-most-once, and refuse while the `operation_protocol_v1` capability is
+inactive — which is the default:
+
+```
+Error: attach disk: disk attach requires the operation_protocol_v1 capability to be active
+```
+
+The capability activates only once **every** node has `enforcement.operation_protocol: true`
+and the token has latched cluster-wide, so enabling it on one host changes nothing.
+See docs/configuration.md.
 
 ```bash
 lv hardware-ls <vm>                               # List a VM's disks/NICs/PCI devices
@@ -618,6 +651,7 @@ lv sg rm <id>
 lv sg rule-add <sg-id> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
 lv sg rule-ls <sg-id>
+lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
   # --network matches the compose network name on the NIC; --sg is repeatable
   # (an empty --sg list clears the bindings).

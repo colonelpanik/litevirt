@@ -1004,3 +1004,61 @@ func ParsePCIAddress(addr string) ParsedPCIAddr {
 		Function: "0x" + fn,
 	}
 }
+
+// InterfaceSourceByMAC returns the type and <source> of the interface carrying
+// mac, so a detach can be built from what the domain ACTUALLY has. DetachNIC
+// otherwise has only the MAC and marshals `type="bridge"` with an EMPTY
+// <source>, which libvirt rejects with "Missing required attribute 'bridge' in
+// element 'source'" — an error that names nothing an operator can act on. Returns
+// ok=false when no interface carries the MAC or the document is unparseable.
+func InterfaceSourceByMAC(domXML, mac string) (ifaceType string, src ifaceSource, ok bool) {
+	var d struct {
+		Interfaces []struct {
+			Type   string      `xml:"type,attr"`
+			MAC    ifaceMAC    `xml:"mac"`
+			Source ifaceSource `xml:"source"`
+		} `xml:"devices>interface"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return "", ifaceSource{}, false
+	}
+	want := strings.ToLower(strings.TrimSpace(mac))
+	for _, i := range d.Interfaces {
+		if strings.ToLower(strings.TrimSpace(i.MAC.Address)) == want {
+			return i.Type, i.Source, true
+		}
+	}
+	return "", ifaceSource{}, false
+}
+
+// DiskSourceByTarget returns the type and <source> of the disk whose <target dev>
+// is targetDev, so a detach carries what the domain ACTUALLY has. It is the disk
+// counterpart of InterfaceSourceByMAC and exists for the reason libvirt states:
+//
+//	The supplied XML description of the device should be as specific as its
+//	definition in the domain XML. [...] Using a partial definition, or attempting
+//	to detach a device that is not present in the domain XML, but shares some
+//	specific attributes with one that is present, may lead to unexpected results.
+//
+// DetachDisk otherwise sends `type="file"` with an EMPTY <source>, which matches
+// on target-dev alone and relies on no other disk sharing it. Returns ok=false
+// when no disk carries the target or the document is unparseable.
+func DiskSourceByTarget(domXML, targetDev string) (diskType string, src diskSource, ok bool) {
+	var d struct {
+		Disks []struct {
+			Type   string     `xml:"type,attr"`
+			Source diskSource `xml:"source"`
+			Target diskTarget `xml:"target"`
+		} `xml:"devices>disk"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return "", diskSource{}, false
+	}
+	want := strings.TrimSpace(targetDev)
+	for _, disk := range d.Disks {
+		if strings.TrimSpace(disk.Target.Dev) == want {
+			return disk.Type, disk.Source, true
+		}
+	}
+	return "", diskSource{}, false
+}

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +133,41 @@ type Fake struct {
 	// "no job in progress" (Found=false), i.e. the pull is already done —
 	// the simplest happy path for the live-restore blockpull poll.
 	BlockJobStatusFn func(domain, disk string) (libvirt.BlockJobStatus, error)
+
+	// DeferLiveUnplug models libvirt's ASYNCHRONOUS device unplug, which the default
+	// (immediate) behavior does NOT: a real DetachDisk/DetachNIC/DetachHostdev returns
+	// success once the unplug has been REQUESTED, and the device leaves the LIVE domain
+	// only when the guest acknowledges — possibly much later, possibly never. The
+	// PERSISTENT definition is unaffected; a config change applies synchronously.
+	//
+	// With this set, a detach removes the device from the inactive view immediately and
+	// parks the live-view removal until AckLiveUnplug is called.
+	//
+	// This exists because the fake's default synchronous removal defines away the exact
+	// window a caller has to wait through: verification that reads the live domain once,
+	// straight after the detach, passes here for every backend that removes the device
+	// inside the call and fails against real qemu. A test that does not set this cannot
+	// distinguish a verifier that waits from one that does not.
+	DeferLiveUnplug bool
+
+	// HonorUnplugOnRequest models a guest that IGNORES the first N-1 unplug requests
+	// and honors the Nth — the real behaviour behind the disk-detach failure found on
+	// hardware. A guest that has not yet enumerated a just-hot-added device never
+	// answers the ACPI/PCI eject, so the request is DROPPED rather than queued: no
+	// amount of waiting clears it, and only a re-request does. Measured on a 4-node
+	// lab, the device was still present 120s after the first request and left within
+	// 5s of the second.
+	//
+	// Requires DeferLiveUnplug. 0 means "never honor without an explicit
+	// AckLiveUnplug". Counted per domain across ALL device kinds, since it stands in
+	// for one guest's readiness rather than one device's.
+	HonorUnplugOnRequest int
+
+	// pendingUnplug holds live-view removals that a deferred unplug has requested but
+	// the guest has not yet acknowledged, per domain, in request order.
+	pendingUnplug map[string][]func()
+	// unplugRequests counts detach requests per domain, for HonorUnplugOnRequest.
+	unplugRequests map[string]int
 }
 
 // New returns a Fake ready to use. Safe for concurrent use.
@@ -144,8 +180,67 @@ func New() *Fake {
 		diskSources: make(map[string]map[string]string),
 		stats:       make(map[string]*libvirt.DomainStats),
 		reasons:     make(map[string]string),
-		Now:         time.Now,
+
+		pendingUnplug:  make(map[string][]func()),
+		unplugRequests: make(map[string]int),
+
+		Now: time.Now,
 	}
+}
+
+// applyLiveUnplug performs a live-view removal now, or parks it for AckLiveUnplug
+// when DeferLiveUnplug models an unacknowledged guest. With HonorUnplugOnRequest
+// set, the Nth request is honored immediately and every earlier one is DROPPED —
+// parked removals from ignored requests are discarded, because a guest that never
+// saw the eject has nothing queued to deliver later. Caller holds f.mu.
+func (f *Fake) applyLiveUnplug(domain string, remove func()) {
+	if !f.DeferLiveUnplug {
+		remove()
+		return
+	}
+	f.unplugRequests[domain]++
+	if n := f.HonorUnplugOnRequest; n > 0 && f.unplugRequests[domain] >= n {
+		delete(f.pendingUnplug, domain)
+		remove()
+		f.record("unplug-honored", domain, "request="+strconv.Itoa(f.unplugRequests[domain]))
+		return
+	}
+	f.pendingUnplug[domain] = append(f.pendingUnplug[domain], remove)
+}
+
+// UnplugRequests reports how many detach requests domain has received — the
+// assertion that a verifier really did RE-REQUEST rather than only poll.
+func (f *Fake) UnplugRequests(domain string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.unplugRequests[domain]
+}
+
+// AckLiveUnplug is the guest acknowledging every unplug requested so far on domain:
+// it applies the parked live-view removals in request order and returns how many.
+// A no-op when nothing is pending, so a test can call it unconditionally.
+func (f *Fake) AckLiveUnplug(domain string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pending := f.pendingUnplug[domain]
+	for _, remove := range pending {
+		remove()
+	}
+	delete(f.pendingUnplug, domain)
+	if n := len(pending); n > 0 {
+		f.record("ack-live-unplug", domain, "applied="+strconv.Itoa(n))
+		return n
+	}
+	return 0
+}
+
+// PendingUnplugs reports how many requested-but-unacknowledged live removals domain
+// is carrying — the assertion that a detach really did leave the device in the live
+// view rather than removing it synchronously.
+func (f *Fake) PendingUnplugs(domain string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.pendingUnplug[domain])
 }
 
 // Events returns a copy of the event log (safe to read while
@@ -501,9 +596,11 @@ func (f *Fake) DetachDisk(domainName, targetDev string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.diskSources[domainName] != nil {
-		delete(f.diskSources[domainName], targetDev)
-	}
+	f.applyLiveUnplug(domainName, func() {
+		if f.diskSources[domainName] != nil {
+			delete(f.diskSources[domainName], targetDev)
+		}
+	})
 	// The real DetachDisk applies DomainDeviceModifyLive|Config, so the disk leaves the
 	// persistent (inactive) definition too — unless a scenario models a live-only
 	// divergence, in which case the config keeps the disk.
@@ -615,7 +712,9 @@ func (f *Fake) DetachNIC(domainName, mac string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.activeXML[domainName] = removeNICFromDomainXML(f.activeBaseline(domainName), mac)
+	f.applyLiveUnplug(domainName, func() {
+		f.activeXML[domainName] = removeNICFromDomainXML(f.activeBaseline(domainName), mac)
+	})
 	if !f.SkipConfigOnNICMutation {
 		f.xml[domainName] = removeNICFromDomainXML(f.xml[domainName], mac)
 	}
@@ -741,7 +840,9 @@ func (f *Fake) DetachHostdev(domainName, pciAddress string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.activeXML[domainName] = removeHostdevFromDomainXML(f.activeBaseline(domainName), pciAddress)
+	f.applyLiveUnplug(domainName, func() {
+		f.activeXML[domainName] = removeHostdevFromDomainXML(f.activeBaseline(domainName), pciAddress)
+	})
 	if !f.SkipConfigOnHostdevMutation {
 		f.xml[domainName] = removeHostdevFromDomainXML(f.xml[domainName], pciAddress)
 	}

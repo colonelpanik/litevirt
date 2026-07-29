@@ -451,7 +451,7 @@ func (s *Server) failNICAttach(ctx context.Context, rb *nicAttachRollback, code 
 	rolledBack := true
 
 	if rb.attached {
-		if err := s.virt.DetachNIC(rb.vm.Name, rb.mac); err != nil {
+		if err := s.detachNICIfPresent(rb.vm.Name, rb.mac); err != nil {
 			slog.Error("nic attach rollback: inverse-detach failed", "vm", rb.vm.Name, "mac", rb.mac, "error", err)
 			rolledBack = false
 		}
@@ -698,7 +698,7 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, m
 	}
 
 	if running {
-		if err := s.virt.DetachNIC(vm.Name, mac); err != nil {
+		if err := s.detachNICIfPresent(vm.Name, mac); err != nil {
 			// The irreversible step failed and nothing changed → clean terminal fail.
 			return s.failNICDetachClean(ctx, vm, opID, epoch, newGen, mac,
 				codes.Internal, fmt.Errorf("detach nic: %w", err))
@@ -730,7 +730,7 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, m
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepAttached)
 
-	if err := s.verifyNICDetached(vm.Name, mac, running); err != nil {
+	if err := s.verifyNICDetached(ctx, vm.Name, mac, running); err != nil {
 		slog.Error("nic detach: absence unverifiable — left recoverable", "vm", vm.Name, "op", opID, "error", err)
 		return nil, status.Errorf(codes.Internal, "nic detach for %q could not be verified; left recoverable: %v", vm.Name, err)
 	}
@@ -791,14 +791,26 @@ func (s *Server) failNICDetachClean(ctx context.Context, vm *corrosion.VMRecord,
 
 // verifyNICDetached asserts the NIC is GONE from the authoritative definition(s),
 // mirroring verifyDiskDetached.
-func (s *Server) verifyNICDetached(vmName, mac string, running bool) error {
+func (s *Server) verifyNICDetached(ctx context.Context, vmName, mac string, running bool) error {
 	if running {
-		live, err := s.virt.DumpXML(vmName)
-		if err != nil {
-			return fmt.Errorf("read live domain: %w", err)
-		}
-		if nicMacInXML(live, mac) {
+		// Waits and re-requests for the same reason verifyDiskDetached does — NIC
+		// unplug is just as asynchronous; it simply tends to win the race that disk
+		// unplug loses.
+		st, err := waitDeviceGone(ctx, func() (bool, error) {
+			live, rerr := s.virt.DumpXML(vmName)
+			if rerr != nil {
+				return false, fmt.Errorf("read live domain: %w", rerr)
+			}
+			return !nicMacInXML(live, mac), nil
+		}, func() error {
+			return s.virt.DetachNIC(vmName, mac)
+		})
+		logUnplugWait("nic", vmName, mac, st, err)
+		switch {
+		case errors.Is(err, errUnplugTimeout):
 			return fmt.Errorf("nic %s still present in the live domain after detach", mac)
+		case err != nil:
+			return err
 		}
 		xml, err := s.virt.DumpXMLInactive(vmName)
 		if err != nil {

@@ -1648,7 +1648,18 @@ type ConfigureHostRequest struct {
 	Role string `protobuf:"bytes,7,opt,name=role,proto3" json:"role,omitempty"`
 	// Region: failure-domain label (DC/rack/AZ). federation.
 	// Default "default"; explicitly setting to "" is normalized to default.
-	Region        string `protobuf:"bytes,8,opt,name=region,proto3" json:"region,omitempty"`
+	Region string `protobuf:"bytes,8,opt,name=region,proto3" json:"region,omitempty"`
+	// Per-host capacity policy overrides. All optional: unset leaves the host's
+	// current value alone, and clears back to the cluster default via a negative
+	// reserve / zero ratio.
+	//
+	// A ratio of 0 means "inherit the cluster default" (a 0 ratio is never
+	// meaningful). Reserves are optional because 0 IS meaningful — "hand guests
+	// every last MiB" — and must stay distinguishable from "not configured".
+	CpuOvercommit *float64 `protobuf:"fixed64,9,opt,name=cpu_overcommit,json=cpuOvercommit,proto3,oneof" json:"cpu_overcommit,omitempty"`
+	MemOvercommit *float64 `protobuf:"fixed64,10,opt,name=mem_overcommit,json=memOvercommit,proto3,oneof" json:"mem_overcommit,omitempty"`
+	CpuReserve    *int32   `protobuf:"varint,11,opt,name=cpu_reserve,json=cpuReserve,proto3,oneof" json:"cpu_reserve,omitempty"`
+	MemReserveMib *int32   `protobuf:"varint,12,opt,name=mem_reserve_mib,json=memReserveMib,proto3,oneof" json:"mem_reserve_mib,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1739,6 +1750,34 @@ func (x *ConfigureHostRequest) GetRegion() string {
 	return ""
 }
 
+func (x *ConfigureHostRequest) GetCpuOvercommit() float64 {
+	if x != nil && x.CpuOvercommit != nil {
+		return *x.CpuOvercommit
+	}
+	return 0
+}
+
+func (x *ConfigureHostRequest) GetMemOvercommit() float64 {
+	if x != nil && x.MemOvercommit != nil {
+		return *x.MemOvercommit
+	}
+	return 0
+}
+
+func (x *ConfigureHostRequest) GetCpuReserve() int32 {
+	if x != nil && x.CpuReserve != nil {
+		return *x.CpuReserve
+	}
+	return 0
+}
+
+func (x *ConfigureHostRequest) GetMemReserveMib() int32 {
+	if x != nil && x.MemReserveMib != nil {
+		return *x.MemReserveMib
+	}
+	return 0
+}
+
 // ── VMs ──
 type CreateVMRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -1751,8 +1790,12 @@ type CreateVMRequest struct {
 	// backstop, which is not linearizable in this masterless design. Reusing a key
 	// with a different request is a client bug (→ 409).
 	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// allow_overcommit skips HOST capacity admission for this create (project
+	// quota still applies). For deliberate density on a host the operator knows
+	// can take it; the bypass is audited so it is never silent.
+	AllowOvercommit bool `protobuf:"varint,3,opt,name=allow_overcommit,json=allowOvercommit,proto3" json:"allow_overcommit,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CreateVMRequest) Reset() {
@@ -1797,6 +1840,13 @@ func (x *CreateVMRequest) GetIdempotencyKey() string {
 		return x.IdempotencyKey
 	}
 	return ""
+}
+
+func (x *CreateVMRequest) GetAllowOvercommit() bool {
+	if x != nil {
+		return x.AllowOvercommit
+	}
+	return false
 }
 
 type ListVMsRequest struct {
@@ -2080,10 +2130,13 @@ func (x *ListVMHardwareResponse) GetHardwareAdoptionError() string {
 }
 
 type StartVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// allow_overcommit skips HOST capacity admission for this start (project quota
+	// still applies). Same escape hatch as CreateVMRequest; the bypass is audited.
+	AllowOvercommit bool `protobuf:"varint,2,opt,name=allow_overcommit,json=allowOvercommit,proto3" json:"allow_overcommit,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *StartVMRequest) Reset() {
@@ -2121,6 +2174,13 @@ func (x *StartVMRequest) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *StartVMRequest) GetAllowOvercommit() bool {
+	if x != nil {
+		return x.AllowOvercommit
+	}
+	return false
 }
 
 type StopVMRequest struct {
@@ -3575,8 +3635,11 @@ type UpdateVMRequest struct {
 	IdempotencyKey string                 `protobuf:"bytes,19,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`  // cross-entry-node dedup of a retried update (D4 semantics)
 	MaxCpu         *int32                 `protobuf:"varint,20,opt,name=max_cpu,json=maxCpu,proto3,oneof" json:"max_cpu,omitempty"`                   // set the vCPU hotplug ceiling (live_resize; latched)
 	AllowRestart   *bool                  `protobuf:"varint,21,opt,name=allow_restart,json=allowRestart,proto3,oneof" json:"allow_restart,omitempty"` // permit a stop→redefine→start for a change that can't apply live
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// allow_overcommit skips HOST capacity admission for a --restart-if-needed
+	// reconfigure that GROWS the VM (project quota still applies). Audited.
+	AllowOvercommit bool `protobuf:"varint,22,opt,name=allow_overcommit,json=allowOvercommit,proto3" json:"allow_overcommit,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *UpdateVMRequest) Reset() {
@@ -3752,6 +3815,13 @@ func (x *UpdateVMRequest) GetMaxCpu() int32 {
 func (x *UpdateVMRequest) GetAllowRestart() bool {
 	if x != nil && x.AllowRestart != nil {
 		return *x.AllowRestart
+	}
+	return false
+}
+
+func (x *UpdateVMRequest) GetAllowOvercommit() bool {
+	if x != nil {
+		return x.AllowOvercommit
 	}
 	return false
 }
@@ -22533,7 +22603,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vtype_filter\x18\x02 \x01(\tR\n" +
 	"typeFilter\"K\n" +
 	"\x17ListHostDevicesResponse\x120\n" +
-	"\adevices\x18\x01 \x03(\v2\x16.litevirt.v1.PCIDeviceR\adevices\"\xfd\x01\n" +
+	"\adevices\x18\x01 \x03(\v2\x16.litevirt.v1.PCIDeviceR\adevices\"\xf2\x03\n" +
 	"\x14ConfigureHostRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12%\n" +
 	"\x0efence_strategy\x18\x02 \x01(\tR\rfenceStrategy\x12!\n" +
@@ -22542,10 +22612,21 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\tipmi_pass\x18\x05 \x01(\tR\bipmiPass\x12!\n" +
 	"\fwatchdog_dev\x18\x06 \x01(\tR\vwatchdogDev\x12\x12\n" +
 	"\x04role\x18\a \x01(\tR\x04role\x12\x16\n" +
-	"\x06region\x18\b \x01(\tR\x06region\"c\n" +
+	"\x06region\x18\b \x01(\tR\x06region\x12*\n" +
+	"\x0ecpu_overcommit\x18\t \x01(\x01H\x00R\rcpuOvercommit\x88\x01\x01\x12*\n" +
+	"\x0emem_overcommit\x18\n" +
+	" \x01(\x01H\x01R\rmemOvercommit\x88\x01\x01\x12$\n" +
+	"\vcpu_reserve\x18\v \x01(\x05H\x02R\n" +
+	"cpuReserve\x88\x01\x01\x12+\n" +
+	"\x0fmem_reserve_mib\x18\f \x01(\x05H\x03R\rmemReserveMib\x88\x01\x01B\x11\n" +
+	"\x0f_cpu_overcommitB\x11\n" +
+	"\x0f_mem_overcommitB\x0e\n" +
+	"\f_cpu_reserveB\x12\n" +
+	"\x10_mem_reserve_mib\"\x8e\x01\n" +
 	"\x0fCreateVMRequest\x12'\n" +
 	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\x12'\n" +
-	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\"\x99\x02\n" +
+	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\x12)\n" +
+	"\x10allow_overcommit\x18\x03 \x01(\bR\x0fallowOvercommit\"\x99\x02\n" +
 	"\x0eListVMsRequest\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\x01 \x01(\tR\tstackName\x12\x1b\n" +
@@ -22567,9 +22648,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x16ListVMHardwareResponse\x125\n" +
 	"\adevices\x18\x01 \x03(\v2\x1b.litevirt.v1.HardwareDeviceR\adevices\x126\n" +
 	"\x17hardware_adoption_state\x18\x02 \x01(\tR\x15hardwareAdoptionState\x126\n" +
-	"\x17hardware_adoption_error\x18\x03 \x01(\tR\x15hardwareAdoptionError\"$\n" +
+	"\x17hardware_adoption_error\x18\x03 \x01(\tR\x15hardwareAdoptionError\"O\n" +
 	"\x0eStartVMRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"S\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12)\n" +
+	"\x10allow_overcommit\x18\x02 \x01(\bR\x0fallowOvercommit\"S\n" +
 	"\rStopVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05force\x18\x02 \x01(\bR\x05force\x12\x18\n" +
@@ -22650,7 +22732,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10RebuildVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"+\n" +
 	"\x10CutoverVMRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\x8d\a\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xb8\a\n" +
 	"\x0fUpdateVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03cpu\x18\x02 \x01(\x05R\x03cpu\x12\x1d\n" +
@@ -22678,7 +22760,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fidempotency_key\x18\x13 \x01(\tR\x0eidempotencyKey\x12\x1c\n" +
 	"\amax_cpu\x18\x14 \x01(\x05H\tR\x06maxCpu\x88\x01\x01\x12(\n" +
 	"\rallow_restart\x18\x15 \x01(\bH\n" +
-	"R\fallowRestart\x88\x01\x01B\t\n" +
+	"R\fallowRestart\x88\x01\x01\x12)\n" +
+	"\x10allow_overcommit\x18\x16 \x01(\bR\x0fallowOvercommitB\t\n" +
 	"\a_onbootB\x10\n" +
 	"\x0e_startup_orderB\x12\n" +
 	"\x10_start_delay_secB\x11\n" +
@@ -25413,6 +25496,7 @@ func file_litevirt_v1_service_proto_init() {
 		return
 	}
 	file_litevirt_v1_types_proto_init()
+	file_litevirt_v1_service_proto_msgTypes[18].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[53].OneofWrappers = []any{}
 	file_litevirt_v1_service_proto_msgTypes[130].OneofWrappers = []any{
 		(*PushBackupFrame_Header)(nil),

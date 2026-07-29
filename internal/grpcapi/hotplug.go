@@ -80,6 +80,40 @@ func (s *Server) detachHostdevConfigIfPresent(vmName, addr string) error {
 	return nil // not in the persistent definition — nothing to do
 }
 
+// detachNICIfPresent detaches the interface with the given MAC from vmName's LIVE
+// domain only if it is still a member of it, making a guest-detach idempotent so a
+// retry converges. It FAILS CLOSED on a DumpXML error (membership cannot be
+// confirmed → do NOT assume the NIC is already gone). This is the NIC counterpart
+// to detachHostdevIfPresent, and it exists for the same non-convergence reason
+// plus a second, NIC-specific one.
+//
+// DetachNIC marshals `<interface type="bridge">` with an EMPTY `<source>` — it has
+// only the MAC to work from. libvirt matches an interface by MAC before it
+// validates the device element, so that malformed source is never examined while
+// the MAC is present. When the MAC is ABSENT the match fails, libvirt falls
+// through to validation, and the caller gets
+//
+//	XML error: Missing required attribute 'bridge' in element 'source'
+//
+// which says nothing about the actual problem — the NIC is not there. The
+// pre-existing guard against that is a lookup in the DATABASE, so it only catches
+// a MAC litevirt never recorded; it passes whenever the row exists but the live
+// domain disagrees. That drift is exactly the post-crash / failed-prior-detach /
+// manual-virsh state an operator is recovering from, and it is non-convergent:
+// every retry produces the same misleading error because nothing clears it.
+// Checking LIVE membership first turns that case into a no-op, which is what it
+// is.
+func (s *Server) detachNICIfPresent(vmName, mac string) error {
+	live, err := s.virt.DumpXML(vmName)
+	if err != nil {
+		return err
+	}
+	if !nicMacInXML(live, mac) {
+		return nil // already detached — nothing to do
+	}
+	return s.virt.DetachNIC(vmName, mac)
+}
+
 // AttachDevice hot-attaches a disk, NIC, or PCI device to a running VM.
 func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

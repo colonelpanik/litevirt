@@ -16,6 +16,12 @@ type Request struct {
 	CPUNeeded    int
 	MemMiBNeeded int
 
+	// Capacity is the cluster capacity policy (overcommit ratios + host reserves).
+	// Named Capacity, not Policy: Policy already means the SCORING strategy here.
+	// The zero value normalizes to corrosion.DefaultCapacityPolicy(), so a caller
+	// that does not set it gets sane behaviour rather than a starved cluster.
+	Capacity corrosion.CapacityPolicy
+
 	// Policy chooses the scoring strategy. Empty = balance.
 	Policy Policy
 
@@ -194,9 +200,15 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 			continue
 		}
 
-		// Hard: resources fit.
-		freeCPU := h.CPUTotal - snap.CPUUsed[h.Name]
-		freeMem := h.MemTotal - snap.MemUsed[h.Name]
+		// Hard: resources fit. ALLOCATABLE (physical adjusted by the cluster's
+		// overcommit ratios and host reserves), not raw physical — the same
+		// corrosion.HostAllocatable the admission check uses. When placement and
+		// admission each did their own `total - used`, they disagreed: a pinned
+		// create bypassed admission entirely while a resize into the same host was
+		// refused. One function, one answer.
+		allocCPU, allocMem := corrosion.HostAllocatable(h, req.Capacity)
+		freeCPU := allocCPU - snap.CPUUsed[h.Name]
+		freeMem := allocMem - snap.MemUsed[h.Name] - req.Capacity.MemOverheadFor(snap.VMCount[h.Name])
 		if req.CPUNeeded > 0 && freeCPU < req.CPUNeeded {
 			continue
 		}
@@ -380,9 +392,13 @@ func SelectBatch(
 	hosts []corrosion.HostRecord,
 	vms []corrosion.VMRecord,
 	devices map[string][]corrosion.PCIDeviceRecord,
+	containerMemMiB map[string]int,
 	requests []Request,
 ) (map[string]BatchResult, error) {
 	snap := BuildSnapshotFrom(hosts, vms)
+	// Containers hold host memory as surely as VMs do; fold them in exactly
+	// like the single-VM Select path (BuildSnapshot) does.
+	snap.AddContainerMemory(containerMemMiB)
 
 	// Deep-copy device pools so the scoring loop can mutate them as we
 	// place each VM.

@@ -124,10 +124,11 @@ func New(cfg *Config) (*Daemon, error) {
 
 	// Open embedded state store and join gossip cluster
 	db, err := corrosion.NewClient(corrosion.Config{
-		HostName:  cfg.HostName,
-		DataDir:   cfg.DataDir,
-		BindPort:  cfg.GossipPort,
-		JoinPeers: cfg.JoinPeers,
+		HostName:      cfg.HostName,
+		DataDir:       cfg.DataDir,
+		BindPort:      cfg.GossipPort,
+		AdvertiseAddr: cfg.AdvertiseAddress,
+		JoinPeers:     cfg.JoinPeers,
 	}, clock)
 	if err != nil {
 		return nil, fmt.Errorf("state store: %w", err)
@@ -456,13 +457,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start the host health checker (created above, before the replicator).
 	go d.checker.Start(ctx)
 
+	// One capacity policy shared by admission (svc below), failover, and the
+	// rebalancer, so placement and admission can never disagree.
+	capacity := d.cfg.Capacity.Policy()
+
 	// Create the failover coordinator; started after the gRPC server is built
 	// so its replica-promoter (auto_promote recovery) can be wired first.
 	fc := failover.NewCoordinator(d.cfg.HostName, d.db)
+	fc.SetCapacityPolicy(capacity)
 
 	// Start rebalance coordinator. Leader-gated; safe to start on
 	// every host. Defaults to dry-run on every VM unless compose says otherwise.
 	rc := scheduler.NewRebalancer(d.cfg.HostName, d.db)
+	rc.SetCapacityPolicy(capacity)
 	go rc.Start(ctx)
 
 	// Start snapshot scheduler. Leader-gated like the
@@ -622,6 +629,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	)
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
+	// overrides live on the host record and win where set.
+	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
@@ -1181,8 +1191,7 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 		serial = "unknown"
 	}
 
-	// Get host address
-	addr := getOutboundIP()
+	addr := d.hostAddress()
 
 	return corrosion.InsertHost(ctx, d.db, corrosion.HostRecord{
 		Name:          d.cfg.HostName,
@@ -1340,6 +1349,19 @@ func fileBasedPoolDriver(driver string) bool {
 		return true
 	}
 	return false
+}
+
+// hostAddress is the address this daemon registers itself at — the address peers
+// will dial. The configured advertise address wins when set: it is the SAME
+// value handed to gossip, and the two must agree or peers dial an address the
+// host certificate does not cover. Falling back to getOutboundIP only reports
+// the source IP toward the default route, which is the wrong answer on a
+// multi-homed host whose cluster network is not the default one.
+func (d *Daemon) hostAddress() string {
+	if d.cfg.AdvertiseAddress != "" {
+		return d.cfg.AdvertiseAddress
+	}
+	return getOutboundIP()
 }
 
 func getOutboundIP() string {

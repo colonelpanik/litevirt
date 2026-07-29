@@ -71,7 +71,27 @@ func BuildSnapshot(ctx context.Context, db *corrosion.Client) (*ClusterSnapshot,
 	// on error the maps stay empty (those dims are then skipped, like a host with
 	// no capacity label) rather than failing placement.
 	usage, _ := corrosion.ListHostRuntimeUsage(ctx, db)
-	return BuildSnapshotFromUsage(hosts, vms, usage), nil
+	snap := BuildSnapshotFromUsage(hosts, vms, usage)
+
+	// Containers hold host memory as surely as VMs do, and were missing from this
+	// entirely — a host packed with containers advertised all of its memory as
+	// free, and placement put VMs on top of it. Best-effort: on a read error the
+	// snapshot degrades to VM-only usage (today's behaviour) rather than failing
+	// placement outright.
+	if ctMem, cerr := corrosion.SumContainerMemoryByHost(ctx, db); cerr == nil {
+		snap.AddContainerMemory(ctMem)
+	}
+	return snap, nil
+}
+
+// AddContainerMemory folds per-host container memory (MiB) into MemUsed. Kept
+// separate from the constructors so callers that hold per-host container memory
+// (BuildSnapshot, SelectBatch) fold it in, and slice-only test constructors
+// need not.
+func (s *ClusterSnapshot) AddContainerMemory(byHost map[string]int) {
+	for host, mem := range byHost {
+		s.MemUsed[host] += mem
+	}
 }
 
 // BuildSnapshotFrom constructs a snapshot from already-fetched slices, with no

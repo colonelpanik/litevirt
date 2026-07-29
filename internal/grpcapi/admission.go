@@ -9,6 +9,36 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// requireOvercommit gates the --allow-overcommit capacity bypass. Skipping the
+// host capacity check is an operator-level judgment call, not a routine
+// lifecycle action: a binding that grants only lifecycle verbs (vm.start,
+// vm.create, …) must not carry it. Wildcard grants (Operator's vm.*) do; in
+// the legacy no-bindings model every operator keeps it, unchanged.
+func (s *Server) requireOvercommit(ctx context.Context, path string) error {
+	return s.RequirePerm(ctx, path, "vm.overcommit", "operator")
+}
+
+// checkHostCapacity verifies a proposed CPU/memory GROW (positive deltas, MiB)
+// fits the target host's free capacity — quota-free, for start-time paths
+// where the allocation is already counted in project usage (see StartVM).
+func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, memMiBDelta int) error {
+	if cpuDelta <= 0 && memMiBDelta <= 0 {
+		return nil
+	}
+	// Host capacity (owner-serialized). HostFreeCapacity already nets out committed
+	// running-VM actuals and in-flight reservations.
+	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityWithPolicy(ctx, s.db, host, s.capacity)
+	if err != nil {
+		return status.Errorf(codes.Internal, "check host capacity: %v", err)
+	}
+	if ok && (cpuDelta > freeCPU || memMiBDelta > freeMem) {
+		return status.Errorf(codes.ResourceExhausted,
+			"host %s has insufficient free capacity for +%d vCPU/+%d MiB (free: %d vCPU/%d MiB)",
+			host, cpuDelta, memMiBDelta, freeCPU, freeMem)
+	}
+	return nil
+}
+
 // checkResourceAdmission verifies a proposed CPU/memory GROW (positive deltas, MiB)
 // fits BOTH the target host's free capacity AND the project's quota, counting
 // in-flight reservations from nonterminal operations — not just committed usage — so
@@ -20,22 +50,19 @@ import (
 // a shrink/no-op (deltas ≤ 0 never need capacity). An unbounded project (no quota
 // row) skips the quota check; an unknown host skips the host-capacity check.
 func (s *Server) checkResourceAdmission(ctx context.Context, host, project string, cpuDelta, memMiBDelta int) error {
+	if err := s.checkHostCapacity(ctx, host, cpuDelta, memMiBDelta); err != nil {
+		return err
+	}
+	return s.checkProjectQuota(ctx, project, cpuDelta, memMiBDelta)
+}
+
+// checkProjectQuota verifies a proposed CPU/memory GROW against the project's
+// quota alone. Split out so --allow-overcommit paths can skip the HOST check
+// (a physical judgment call) while still enforcing quota (a tenancy limit).
+func (s *Server) checkProjectQuota(ctx context.Context, project string, cpuDelta, memMiBDelta int) error {
 	if cpuDelta <= 0 && memMiBDelta <= 0 {
 		return nil
 	}
-
-	// Host capacity (owner-serialized). HostFreeCapacity already nets out committed
-	// running-VM actuals and in-flight reservations.
-	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacity(ctx, s.db, host)
-	if err != nil {
-		return status.Errorf(codes.Internal, "check host capacity: %v", err)
-	}
-	if ok && (cpuDelta > freeCPU || memMiBDelta > freeMem) {
-		return status.Errorf(codes.ResourceExhausted,
-			"host %s has insufficient free capacity for +%d vCPU/+%d MiB (free: %d vCPU/%d MiB)",
-			host, cpuDelta, memMiBDelta, freeCPU, freeMem)
-	}
-
 	// Project quota: committed usage + in-flight reservations + this grow.
 	q, err := corrosion.GetProjectQuota(ctx, s.db, project)
 	if err != nil {

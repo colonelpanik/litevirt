@@ -207,9 +207,25 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	// managed IP up front so the on-disk config never names an address we don't own
 	// (a NIC we can't claim is rendered without an IP → DHCP/re-discovery). Legacy
 	// raw-bridge NICs pass through with no managed state.
+	// Rebuild with the SAME template intent the original create used. ct.Image is a
+	// display label ("alpine:3.21" for an lxc-template container), not a template
+	// name, so handing it to lxc-create fails with
+	//
+	//	bad template: alpine:3.21 — Template "alpine:3.21" not found
+	//
+	// and the relocation retries forever: the container never comes back on the
+	// survivor. That is exactly what create_spec exists to prevent ("so host-loss
+	// relocation / restore can rebuild this container faithfully, not as a bare
+	// image recreate" — containers.go:158), and it is already decoded just below
+	// for the NICs. An OCI container has no spec template, and there ct.Image IS
+	// the pullable reference, so it stays the fallback.
 	opts := lxc.CreateOpts{
 		Name: ct.Name, Template: ct.Image,
 		CPULimit: ct.CPULimit, MemoryMiB: ct.MemMiB, Labels: ct.Labels,
+	}
+	if spec.Template != "" {
+		opts.Template = spec.Template
+		opts.Distro, opts.Release, opts.Arch = spec.Distro, spec.Release, spec.Arch
 	}
 	var ifs []corrosion.ContainerInterfaceRecord
 	for i, n := range spec.Networks {

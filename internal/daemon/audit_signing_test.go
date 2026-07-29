@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -207,5 +208,55 @@ func TestShouldCompleteAuditKeyRotation(t *testing.T) {
 				t.Errorf("shouldCompleteAuditKeyRotation = %v, want %v — %s", got, tc.want, tc.why)
 			}
 		})
+	}
+}
+
+// TestSigning_AnUnreadableKeyStillPublishesTheContract.
+//
+// The worst of the three possible outcomes was the one that used to happen. A
+// host configured to sign, whose private key will not load, published NOTHING —
+// so it looked exactly like a host that was never meant to sign, and its entire
+// audit log read as ordinary pre-enforcement history: unsigned, freely
+// rewritable, and clean on every peer.
+//
+// "The key is unreadable" is precisely the state an attacker arranges with one
+// chmod, so it is the state that must not go unnoticed. The certificate is
+// public and does not need the key, so publishing it puts the host under
+// contract and every unsigned row it writes becomes evidence.
+func TestSigning_AnUnreadableKeyStillPublishesTheContract(t *testing.T) {
+	ctx := context.Background()
+	const host = "node-0"
+	dir := auditPKIDir(t, host)
+	d := auditTestDaemon(t, dir, host)
+
+	// Corrupt the private key, leaving the certificate intact.
+	if err := os.WriteFile(filepath.Join(dir, "host.key"), []byte("not a key\n"), 0o600); err != nil {
+		t.Fatalf("corrupt the key: %v", err)
+	}
+
+	if err := d.setupAuditSigning(ctx); err == nil {
+		t.Fatal("setupAuditSigning reported success with an unloadable key")
+	}
+
+	if n := auditCount(t, d.db, `SELECT count(*) AS n FROM audit_signing_keys WHERE host_name = ?`, host); n != 1 {
+		t.Fatalf("no certificate was published for a host that is configured to sign (%d rows)\n"+
+			"without it the host's unsigned rows are indistinguishable from a cluster that "+
+			"never enabled signing at all", n)
+	}
+
+	// And the contract bites: a row written now is reported, not excused.
+	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
+		ID: "r1", Username: "root", HostName: host,
+		Action: "vm.delete", Target: "prod-db", Result: "success",
+		Timestamp: "2026-07-29T10:00:01Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog: %v", err)
+	}
+	res, err := corrosion.VerifyAuditChain(ctx, d.db)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if len(res.UnsignedAfterSigned) == 0 {
+		t.Fatalf("an unsigned row from a host under contract was not reported: %+v", res)
 	}
 }

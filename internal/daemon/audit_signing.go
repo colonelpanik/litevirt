@@ -28,6 +28,30 @@ const auditHeadInterval = 5 * time.Minute
 func (d *Daemon) setupAuditSigning(ctx context.Context) error {
 	keyring, err := corrosion.LoadAuditKeyring(d.cfg.PKIDir, d.cfg.HostName)
 	if err != nil {
+		// The private key is unreadable, but the CERTIFICATE is public and this
+		// host is configured to sign — so publish the certificate anyway. That
+		// row is the signing contract, and every unsigned row this host now
+		// writes is reported as evidence on every node that reads the log.
+		//
+		// Publishing nothing is what used to happen, and it is the worst of the
+		// three outcomes: the host looks like one that was never meant to sign,
+		// so its entire audit log reads as ordinary pre-enforcement history —
+		// unsigned, freely rewritable, and clean on every peer. "The key is
+		// unreadable" is precisely the state an attacker arranges, so it must not
+		// be the state that goes unnoticed.
+		if id, perr := corrosion.PublishSigningCertOnly(ctx, d.db, d.cfg.PKIDir, d.cfg.HostName); perr != nil {
+			slog.Error("audit signing key could not be loaded AND its certificate could not be "+
+				"published; this host's unsigned rows will look like ordinary pre-enforcement "+
+				"history to every peer", "error", err, "publish_error", perr)
+		} else {
+			slog.Error("audit signing key could not be loaded; the certificate is published so "+
+				"every row this host writes unsigned is reported as evidence cluster-wide. "+
+				"Fix the key, or retire it deliberately with `lv host retire-audit-key`",
+				"error", err, "key_id", id)
+		}
+		if verifier, verr := corrosion.LoadAuditVerifier(d.cfg.PKIDir); verr == nil {
+			d.db.SetAuditKeyring(verifier) // can still check everyone else's chain
+		}
 		return err
 	}
 	d.db.SetAuditKeyring(keyring)

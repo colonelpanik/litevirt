@@ -178,6 +178,40 @@ func tightenKeyMode(keyPath string) error { return pki.TightenKeyMode(keyPath) }
 // dump and the CA certificate can check every host's chain offline.
 func LoadAuditVerifier(pkiDir string) (*AuditKeyring, error) { return loadAuditRoots(pkiDir) }
 
+// PublishSigningCertOnly records this host's verification certificate WITHOUT
+// needing the private key to be loadable.
+//
+// The certificate is public, and publishing it is what puts the host under a
+// signing contract — the declaration that its rows carry a signature from here
+// on. That declaration must not be conditional on the key being readable,
+// because "the key is unreadable" is exactly the state an attacker arranges and
+// exactly the state that must not go unnoticed. A host that publishes and then
+// cannot sign has every unsigned row reported on every node; a host that
+// publishes nothing has, until now, been indistinguishable from one that was
+// never meant to sign at all.
+//
+// Returns the key id it published.
+func PublishSigningCertOnly(ctx context.Context, c *Client, pkiDir, hostName string) (string, error) {
+	certPath, _ := auditSigningPaths(pkiDir)
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return "", fmt.Errorf("read audit signing cert: %w", err)
+	}
+	cert, err := parseCertPEM(certPEM)
+	if err != nil {
+		return "", err
+	}
+	if cert.Subject.CommonName != hostName {
+		return "", fmt.Errorf("audit signing certificate CN is %q but this host is %q", cert.Subject.CommonName, hostName)
+	}
+	id, err := AuditKeyID(cert)
+	if err != nil {
+		return "", err
+	}
+	k := &AuditKeyring{hostName: hostName, keyID: id, certPEM: string(certPEM)}
+	return id, k.publishCert(ctx, c)
+}
+
 func loadAuditRoots(pkiDir string) (*AuditKeyring, error) {
 	caPEM, err := os.ReadFile(filepath.Join(pkiDir, "ca.crt"))
 	if err != nil {
@@ -433,6 +467,12 @@ func (k *AuditKeyring) PublishSigningKey(ctx context.Context, c *Client) error {
 	if !k.CanSign() {
 		return nil
 	}
+	return k.publishCert(ctx, c)
+}
+
+// publishCert writes the certificate row. Split out because publishing does not
+// require the private key — see PublishSigningCertOnly.
+func (k *AuditKeyring) publishCert(ctx context.Context, c *Client) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO audit_signing_keys (key_id, host_name, cert_pem, created_at, updated_at, deleted_at)

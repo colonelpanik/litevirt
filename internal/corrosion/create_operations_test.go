@@ -85,6 +85,7 @@ func TestExecuteBatchGuardedEvaluatesStructuredGuardsSequentially(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	good.OperationClaimHash = operationClaimHash(op)
 	bad := *good
 	bad.IdentityHash = "not-the-provisional-identity"
 	applied, err := c.ExecuteBatchGuarded(ctx, func(*sql.Tx) (bool, error) {
@@ -2167,6 +2168,164 @@ func TestCreateOperationAntiEntropyRejectsStepsFromConflictingImmutableHeader(t 
 			}
 		})
 	}
+}
+
+func TestCreateOperationWALBindsCompleteImmutableHeader(t *testing.T) {
+	ctx := context.Background()
+	reservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+	}).Encode()
+	otherReservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 9, TargetHost: "h1", TargetCPU: 9,
+	}).Encode()
+	op := createOp("op-wal-immutable-header", "vm", "vm1", "request-hash", reservation, 7)
+	op.DesiredRef = "desired/vm1"
+	vm := VMRecord{
+		Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+		OwnerEpoch: 7, SpecGeneration: 3,
+	}
+	source := testClient(t)
+	if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("source begin: applied=%v err=%v", applied, err)
+	}
+	beginEntry := latestMutationEntry(t, source, "immutable-header-source", 1)
+	if applied, err := source.CommitVMCreateOperation(ctx, op.ID, op.VMOwnerEpoch, vm,
+		[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+		nil, nil, nil); err != nil || !applied {
+		t.Fatalf("source commit: applied=%v err=%v", applied, err)
+	}
+	commitEntry := latestMutationEntry(t, source, "immutable-header-source", 2)
+
+	tests := []struct {
+		name        string
+		column      string
+		incoming    interface{}
+		mutateLocal func(*OperationRecord)
+	}{
+		{"id", "id", "other-op", nil},
+		{"method", "method", "CreateVM-v2", func(got *OperationRecord) { got.Method = "CreateVM-v2" }},
+		{"principal", "principal", "bob", func(got *OperationRecord) { got.Principal = "bob" }},
+		{"project", "project", "p2", func(got *OperationRecord) { got.Project = "p2" }},
+		{"resource kind", "resource_kind", "container", func(got *OperationRecord) { got.ResourceKind = "container" }},
+		{"resource id", "resource_id", "vm2", func(got *OperationRecord) { got.ResourceID = "vm2" }},
+		{"operation kind", "operation_kind", "resize", func(got *OperationRecord) { got.OperationKind = "resize" }},
+		{"request hash", "request_hash", "other-hash", func(got *OperationRecord) { got.RequestHash = "other-hash" }},
+		{"idempotency key", "idempotency_key", "other-key", func(got *OperationRecord) { got.IdempotencyKey = "other-key" }},
+		{"reservation", "reservation_json", otherReservation, func(got *OperationRecord) { got.ReservationJSON = otherReservation }},
+		{"desired ref", "desired_ref", "desired/vm2", func(got *OperationRecord) { got.DesiredRef = "desired/vm2" }},
+		{"owner epoch", "vm_owner_epoch", int64(8), func(got *OperationRecord) { got.VMOwnerEpoch++ }},
+	}
+	for _, tc := range tests {
+		t.Run("incoming "+tc.name, func(t *testing.T) {
+			var stmts []Statement
+			if err := json.Unmarshal([]byte(beginEntry.Stmts), &stmts); err != nil {
+				t.Fatal(err)
+			}
+			changed := false
+			for i := range stmts {
+				sh, _, err := parseResolved(stmts[i].SQL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sh.Table != "operations" {
+					continue
+				}
+				for columnIndex, column := range sh.InsertCols {
+					if column == tc.column && sh.InsertVals[columnIndex].isParam() {
+						stmts[i].Params[sh.InsertVals[columnIndex].ParamIndex] = tc.incoming
+						changed = true
+					}
+				}
+			}
+			if !changed {
+				t.Fatalf("operation insert did not bind %q", tc.column)
+			}
+			encoded, err := json.Marshal(stmts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tampered := &pb.MutationEntry{
+				Seq: beginEntry.Seq, Hlc: beginEntry.Hlc, Origin: beginEntry.Origin,
+				Stmts: string(encoded),
+			}
+			receiver := testClient(t)
+			replicator := NewReplicator(receiver, "", RelayConfig{})
+			for _, entry := range []*pb.MutationEntry{tampered, commitEntry} {
+				if _, err := replicator.ApplyRemoteMutations(ctx, []*pb.MutationEntry{entry}); err == nil {
+					t.Errorf("WAL seq=%d accepted a differing incoming %s", entry.Seq, tc.name)
+				}
+			}
+			if got, err := GetVM(ctx, receiver, vm.Name); err != nil || got != nil {
+				t.Fatalf("tampered incoming header created VM: got=%+v err=%v", got, err)
+			}
+		})
+
+		if tc.mutateLocal == nil {
+			continue
+		}
+		t.Run("conflicting "+tc.name, func(t *testing.T) {
+			receiver := testClient(t)
+			conflicting := op
+			tc.mutateLocal(&conflicting)
+			if err := InsertOperation(ctx, receiver, conflicting); err != nil {
+				t.Fatalf("insert conflicting local header: %v", err)
+			}
+			beforeCPU, beforeMem, err := HostReserved(ctx, receiver, vm.HostName)
+			if err != nil {
+				t.Fatalf("reservation before conflicting WAL: %v", err)
+			}
+			replicator := NewReplicator(receiver, "", RelayConfig{})
+			for _, entry := range []*pb.MutationEntry{beginEntry, commitEntry} {
+				if _, err := replicator.ApplyRemoteMutations(ctx, []*pb.MutationEntry{entry}); err == nil {
+					t.Errorf("WAL seq=%d accepted a conflicting %s header", entry.Seq, tc.name)
+				}
+			}
+			if got, err := GetVM(ctx, receiver, vm.Name); err != nil || got != nil {
+				t.Fatalf("conflicting WAL created VM: got=%+v err=%v", got, err)
+			}
+			if cpu, mem, err := HostReserved(ctx, receiver, vm.HostName); err != nil || cpu != beforeCPU || mem != beforeMem {
+				t.Fatalf("conflicting WAL changed reservations: before=(%d,%d) after=(%d,%d) err=%v",
+					beforeCPU, beforeMem, cpu, mem, err)
+			}
+			got, err := GetOperation(ctx, receiver, op.ID)
+			if err != nil || got == nil || !sameOperationClaim(*got, conflicting) {
+				t.Fatalf("local immutable header changed: got=%+v err=%v", got, err)
+			}
+		})
+	}
+
+	t.Run("exact header converges and replays idempotently", func(t *testing.T) {
+		receiver := testClient(t)
+		if err := InsertOperation(ctx, receiver, op); err != nil {
+			t.Fatalf("insert exact local header: %v", err)
+		}
+		for replay := 0; replay < 2; replay++ {
+			for _, entry := range []*pb.MutationEntry{beginEntry, commitEntry} {
+				if _, err := NewReplicator(receiver, "", RelayConfig{}).
+					ApplyRemoteMutations(ctx, []*pb.MutationEntry{entry}); err != nil {
+					t.Fatalf("replay %d WAL seq=%d: %v", replay, entry.Seq, err)
+				}
+			}
+		}
+		got, err := GetVM(ctx, receiver, vm.Name)
+		if err != nil || got == nil || got.State != "running" || got.ActiveOperationID != "" {
+			t.Fatalf("exact immutable header did not converge: got=%+v err=%v", got, err)
+		}
+		if rows, err := receiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces
+			 WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`,
+			vm.Name, "net1"); err != nil || len(rows) != 1 {
+			t.Fatalf("exact immutable header hardware did not converge: rows=%v err=%v", rows, err)
+		}
+		steps, err := ListOperationSteps(ctx, receiver, op.ID, op.VMOwnerEpoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps)); state != OpStepCompleted || faulted {
+			t.Fatalf("exact immutable header state=%q faulted=%v steps=%v",
+				state, faulted, stepNames(steps))
+		}
+	})
 }
 
 func TestWorkloadAuthorityAntiEntropyCompatibility(t *testing.T) {

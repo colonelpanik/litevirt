@@ -38,6 +38,7 @@ type MutationGuard struct {
 	SpecGeneration      int64  `json:"spec_generation,omitempty"`
 	CheckSpecGeneration bool   `json:"check_spec_generation,omitempty"`
 	IdentityHash        string `json:"identity_hash,omitempty"`
+	OperationClaimHash  string `json:"operation_claim_hash,omitempty"`
 	RequireOperation    bool   `json:"require_operation,omitempty"`
 }
 
@@ -127,6 +128,9 @@ func (c *Client) mutationGuardMatches(ctx context.Context, tx *sql.Tx, guard *Mu
 	if guard.OperationID == "" || guard.ResourceID == "" {
 		return false, fmt.Errorf("invalid mutation guard protocol or identity")
 	}
+	if guard.OperationClaimHash == "" {
+		return false, fmt.Errorf("mutation guard is missing immutable operation claim")
+	}
 	if guard.Protocol == workloadCreateBeginGuardV1 {
 		return createBeginGuardMatches(ctx, tx, guard)
 	}
@@ -211,31 +215,28 @@ func (c *Client) mutationGuardMatches(ctx context.Context, tx *sql.Tx, guard *Mu
 	if !guard.RequireOperation {
 		return true, nil
 	}
-	var opProject, resourceKind, resourceID, operationKind, reservationJSON, desiredRef string
-	var opOwnerEpoch int64
-	err := tx.QueryRowContext(ctx,
-		`SELECT project, resource_kind, resource_id, operation_kind,
-		        reservation_json, desired_ref, vm_owner_epoch
-		 FROM operations WHERE id = ? AND deleted_at IS NULL`, guard.OperationID).
-		Scan(&opProject, &resourceKind, &resourceID, &operationKind,
-			&reservationJSON, &desiredRef, &opOwnerEpoch)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	op, err := operationInTx(ctx, tx, guard.OperationID)
 	if err != nil {
 		return false, err
 	}
+	if op == nil || op.DeletedAt != "" {
+		return false, nil
+	}
+	if operationClaimHash(*op) != guard.OperationClaimHash {
+		return false, fmt.Errorf("%w: guarded immutable operation claim does not match local header",
+			ErrOperationIdentityConflict)
+	}
 	if guard.ResourceKind == "container" &&
-		desiredRef != containerCreateDesiredRef(workloadHost, guard.ResourceID) {
+		op.DesiredRef != containerCreateDesiredRef(workloadHost, guard.ResourceID) {
 		return false, nil
 	}
-	if resourceKind != guard.ResourceKind || resourceID != guard.ResourceID ||
-		OperationKind(operationKind) != OpWorkloadCreate ||
-		projectOrDefault(opProject) != projectOrDefault(workloadProject) ||
-		opOwnerEpoch != guard.OwnerEpoch {
+	if op.ResourceKind != guard.ResourceKind || op.ResourceID != guard.ResourceID ||
+		OperationKind(op.OperationKind) != OpWorkloadCreate ||
+		projectOrDefault(op.Project) != projectOrDefault(workloadProject) ||
+		op.VMOwnerEpoch != guard.OwnerEpoch {
 		return false, nil
 	}
-	reservation, err := DecodeReservation(reservationJSON)
+	reservation, err := DecodeReservation(op.ReservationJSON)
 	if err != nil {
 		return false, fmt.Errorf("guard reservation: %w", err)
 	}

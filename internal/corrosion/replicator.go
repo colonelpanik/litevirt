@@ -949,6 +949,12 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 			return 0, fmt.Errorf("validate guarded mutation entry (origin=%s seq=%d): %w",
 				entry.Origin, entry.Seq, err)
 		}
+		if err := validateGuardedOperationClaim(ctx, tx, stmts); err != nil {
+			_ = tx.Rollback()
+			r.client.observeMergeRejected("operations", "wal", "guard")
+			return 0, fmt.Errorf("validate guarded operation claim (origin=%s seq=%d): %w",
+				entry.Origin, entry.Seq, err)
+		}
 		legacyDelete, applyLegacy, err := legacyWorkloadDeleteEntryDecision(ctx, tx, stmts)
 		if err != nil {
 			_ = tx.Rollback()
@@ -1569,7 +1575,8 @@ func sameGuardWorkloadIdentity(a, b *MutationGuard) bool {
 		a.OwnerEpoch == b.OwnerEpoch &&
 		a.SpecGeneration == b.SpecGeneration &&
 		a.CheckSpecGeneration == b.CheckSpecGeneration &&
-		a.IdentityHash == b.IdentityHash
+		a.IdentityHash == b.IdentityHash &&
+		a.OperationClaimHash == b.OperationClaimHash
 }
 
 func validateGuardedEntryClocks(stmts []Statement, anchorIndex int, bindDeleted bool) error {
@@ -1705,13 +1712,11 @@ func validateGuardedStatementBinding(s Statement, sh StmtShape) error {
 	}
 	switch sh.Table {
 	case "operations":
-		id, okID := field("id")
-		kind, okKind := field("resource_kind")
-		resource, okResource := field("resource_id")
-		owner, okOwner := field("vm_owner_epoch")
-		if !okID || !okKind || !okResource || !okOwner ||
-			id != g.OperationID || kind != g.ResourceKind ||
-			resource != g.ResourceID || owner != fmt.Sprintf("%d", g.OwnerEpoch) {
+		op, ok := guardedOperationClaim(s, sh)
+		if !ok || op.ID != g.OperationID || op.ResourceKind != g.ResourceKind ||
+			op.ResourceID != g.ResourceID || op.VMOwnerEpoch != g.OwnerEpoch ||
+			g.OperationClaimHash == "" ||
+			operationClaimHash(op) != g.OperationClaimHash {
 			return invalidf("guarded operation header identity does not match mutation guard")
 		}
 	case "operation_steps":
@@ -1756,6 +1761,115 @@ func validateGuardedStatementBinding(s Statement, sh StmtShape) error {
 			coerceString(s.Params[3]) != g.ResourceID {
 			return invalidf("guarded container cleanup identity does not match mutation guard")
 		}
+	}
+	return nil
+}
+
+func guardedOperationClaim(s Statement, sh StmtShape) (OperationRecord, bool) {
+	if sh.Table != "operations" || sh.Kind != KindInsert {
+		return OperationRecord{}, false
+	}
+	field := func(name string) (interface{}, bool) {
+		return guardedInsertField(sh, s, name)
+	}
+	stringField := func(name string) (string, bool) {
+		value, ok := field(name)
+		return coerceString(value), ok
+	}
+	var op OperationRecord
+	var ok bool
+	if op.ID, ok = stringField("id"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.Method, ok = stringField("method"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.Principal, ok = stringField("principal"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.Project, ok = stringField("project"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.ResourceKind, ok = stringField("resource_kind"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.ResourceID, ok = stringField("resource_id"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.OperationKind, ok = stringField("operation_kind"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.RequestHash, ok = stringField("request_hash"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.IdempotencyKey, ok = stringField("idempotency_key"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.ReservationJSON, ok = stringField("reservation_json"); !ok {
+		return OperationRecord{}, false
+	}
+	if op.DesiredRef, ok = stringField("desired_ref"); !ok {
+		return OperationRecord{}, false
+	}
+	owner, ok := field("vm_owner_epoch")
+	if !ok {
+		return OperationRecord{}, false
+	}
+	op.VMOwnerEpoch, ok = coerceInt64OK(owner)
+	return op, ok
+}
+
+// validateGuardedOperationClaim runs before any entry statement. It proves that
+// the complete immutable claim carried by the guards matches both the operation
+// header in a begin entry and an already-landed INSERT OR IGNORE header. This
+// makes a same-ID conflicting header abort the whole replicated transaction
+// instead of leaving a provisional workload or admitting terminal mutations.
+func validateGuardedOperationClaim(ctx context.Context, tx *sql.Tx, stmts []Statement) error {
+	var operationID, claimHash string
+	hasCreateGuard, hasHeader := false, false
+	for _, s := range stmts {
+		if s.Guard == nil ||
+			(s.Guard.Protocol != workloadCreateGuardV1 &&
+				s.Guard.Protocol != workloadCreateBeginGuardV1) {
+			continue
+		}
+		hasCreateGuard = true
+		if s.Guard.OperationID == "" || s.Guard.OperationClaimHash == "" {
+			return invalidf("guarded create entry is missing immutable operation claim")
+		}
+		if operationID == "" {
+			operationID, claimHash = s.Guard.OperationID, s.Guard.OperationClaimHash
+		} else if operationID != s.Guard.OperationID || claimHash != s.Guard.OperationClaimHash {
+			return invalidf("guarded create entry mixes immutable operation claims")
+		}
+		sh, _, err := parseResolved(s.SQL)
+		if err != nil {
+			return err
+		}
+		if sh.Table == "operations" {
+			op, ok := guardedOperationClaim(s, sh)
+			if !ok || operationClaimHash(op) != claimHash {
+				return invalidf("guarded create header does not match immutable operation claim")
+			}
+			hasHeader = true
+		}
+	}
+	if !hasCreateGuard {
+		return nil
+	}
+	local, err := operationInTx(ctx, tx, operationID)
+	if err != nil {
+		return err
+	}
+	if local == nil {
+		if hasHeader {
+			return nil
+		}
+		return invalidf("guarded create transition has no local immutable operation header")
+	}
+	if local.DeletedAt != "" || operationClaimHash(*local) != claimHash {
+		return fmt.Errorf("%w: replicated immutable operation claim conflicts with local header",
+			ErrOperationIdentityConflict)
 	}
 	return nil
 }

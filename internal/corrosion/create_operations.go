@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -134,6 +136,9 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 		return false, err
 	}
 	beginGuard := vmCreateBeginMutationGuard(op.ID, op.VMOwnerEpoch, vm)
+	claimHash := operationClaimHash(op)
+	provisionalGuard.OperationClaimHash = claimHash
+	beginGuard.OperationClaimHash = claimHash
 	claimedGuard := *provisionalGuard
 	claimedGuard.RequireOperation = true
 	now, wall := c.NowTS(), nowRFC3339()
@@ -201,11 +206,16 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 // the journal. A stale owner, generation, operation id, or immutable provisional
 // identity is a no-op.
 func (c *Client) CommitVMCreateOperation(ctx context.Context, opID string, ownerEpoch int64, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, intents []PCIIntentRecord) (bool, error) {
+	claimHash, ok, err := c.liveOperationClaimHash(ctx, opID)
+	if err != nil || !ok {
+		return false, err
+	}
 	now, wall := c.NowTS(), nowRFC3339()
 	commitGuard, err := vmCreateMutationGuard(opID, ownerEpoch, vm, true)
 	if err != nil {
 		return false, err
 	}
+	commitGuard.OperationClaimHash = claimHash
 	guard := func(tx *sql.Tx) (bool, error) {
 		return c.mutationGuardMatches(ctx, tx, commitGuard)
 	}
@@ -234,8 +244,13 @@ func (c *Client) CommitVMCreateOperation(ctx context.Context, opID string, owner
 // terminalizes the operation after compensation. It cannot affect a running VM
 // or a row now owned by a different operation/epoch.
 func (c *Client) RollbackVMCreateOperation(ctx context.Context, name, opID string, ownerEpoch int64, facts string) (bool, error) {
+	claimHash, ok, err := c.liveOperationClaimHash(ctx, opID)
+	if err != nil || !ok {
+		return false, err
+	}
 	now, wall := c.NowTS(), nowRFC3339()
 	rollbackGuard := vmRollbackMutationGuard(name, opID, ownerEpoch)
+	rollbackGuard.OperationClaimHash = claimHash
 	guard := func(tx *sql.Tx) (bool, error) {
 		return c.mutationGuardMatches(ctx, tx, rollbackGuard)
 	}
@@ -292,6 +307,9 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 		return false, err
 	}
 	beginGuard := containerCreateBeginMutationGuard(op.ID, op.VMOwnerEpoch, ct, labels)
+	claimHash := operationClaimHash(op)
+	provisionalGuard.OperationClaimHash = claimHash
+	beginGuard.OperationClaimHash = claimHash
 	claimedGuard := *provisionalGuard
 	claimedGuard.RequireOperation = true
 	now, wall := c.NowTS(), nowRFC3339()
@@ -337,10 +355,15 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 // CommitContainerCreateOperation atomically persists the container's complete
 // managed-interface set and commits its provisional row.
 func (c *Client) CommitContainerCreateOperation(ctx context.Context, opID string, ownerEpoch int64, ct ContainerRecord, ifaces []ContainerInterfaceRecord) (bool, error) {
+	claimHash, ok, err := c.liveOperationClaimHash(ctx, opID)
+	if err != nil || !ok {
+		return false, err
+	}
 	commitGuard, err := containerCreateMutationGuard(opID, ownerEpoch, ct, true)
 	if err != nil {
 		return false, err
 	}
+	commitGuard.OperationClaimHash = claimHash
 	now, wall := c.NowTS(), nowRFC3339()
 	guard := func(tx *sql.Tx) (bool, error) {
 		return c.mutationGuardMatches(ctx, tx, commitGuard)
@@ -380,8 +403,13 @@ func (c *Client) CommitContainerCreateOperation(ctx context.Context, opID string
 // RollbackContainerCreateOperation is the fenced container counterpart of
 // RollbackVMCreateOperation.
 func (c *Client) RollbackContainerCreateOperation(ctx context.Context, hostName, name, opID string, ownerEpoch int64, facts string) (bool, error) {
+	claimHash, ok, err := c.liveOperationClaimHash(ctx, opID)
+	if err != nil || !ok {
+		return false, err
+	}
 	now, wall := c.NowTS(), nowRFC3339()
 	rollbackGuard := containerRollbackMutationGuard(hostName, name, opID, ownerEpoch)
+	rollbackGuard.OperationClaimHash = claimHash
 	guard := func(tx *sql.Tx) (bool, error) {
 		return c.mutationGuardMatches(ctx, tx, rollbackGuard)
 	}
@@ -464,22 +492,57 @@ func compareOperationClaim(existing, requested OperationRecord) error {
 	return nil
 }
 
+// canonicalOperationClaim is the single canonicalization boundary for immutable
+// operation identity. Keep sameOperationClaim and the replicated guard
+// fingerprint on this exact representation so they cannot drift.
+type canonicalOperationClaim struct {
+	ID              string `json:"id"`
+	Method          string `json:"method"`
+	Principal       string `json:"principal"`
+	Project         string `json:"project"`
+	ResourceKind    string `json:"resource_kind"`
+	ResourceID      string `json:"resource_id"`
+	OperationKind   string `json:"operation_kind"`
+	RequestHash     string `json:"request_hash"`
+	IdempotencyKey  string `json:"idempotency_key"`
+	ReservationJSON string `json:"reservation_json"`
+	DesiredRef      string `json:"desired_ref"`
+	VMOwnerEpoch    int64  `json:"vm_owner_epoch"`
+}
+
+func canonicalizeOperationClaim(op OperationRecord) canonicalOperationClaim {
+	return canonicalOperationClaim{
+		ID: op.ID, Method: op.Method, Principal: op.Principal,
+		Project: projectOrDefault(op.Project), ResourceKind: op.ResourceKind,
+		ResourceID: op.ResourceID, OperationKind: op.OperationKind,
+		RequestHash: op.RequestHash, IdempotencyKey: op.IdempotencyKey,
+		ReservationJSON: op.ReservationJSON, DesiredRef: op.DesiredRef,
+		VMOwnerEpoch: op.VMOwnerEpoch,
+	}
+}
+
 // sameOperationClaim compares the complete immutable request identity of an
 // operation header. Storage timestamps and the GC tombstone are metadata, not
 // claim identity. Project is canonicalized exactly as begin/idempotency does.
 func sameOperationClaim(a, b OperationRecord) bool {
-	return a.ID == b.ID &&
-		a.Method == b.Method &&
-		a.Principal == b.Principal &&
-		projectOrDefault(a.Project) == projectOrDefault(b.Project) &&
-		a.ResourceKind == b.ResourceKind &&
-		a.ResourceID == b.ResourceID &&
-		a.OperationKind == b.OperationKind &&
-		a.RequestHash == b.RequestHash &&
-		a.IdempotencyKey == b.IdempotencyKey &&
-		a.ReservationJSON == b.ReservationJSON &&
-		a.DesiredRef == b.DesiredRef &&
-		a.VMOwnerEpoch == b.VMOwnerEpoch
+	return canonicalizeOperationClaim(a) == canonicalizeOperationClaim(b)
+}
+
+func operationClaimHash(op OperationRecord) string {
+	encoded, err := json.Marshal(canonicalizeOperationClaim(op))
+	if err != nil {
+		panic("marshal canonical operation claim: " + err.Error())
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func (c *Client) liveOperationClaimHash(ctx context.Context, opID string) (string, bool, error) {
+	op, err := GetOperation(ctx, c, opID)
+	if err != nil || op == nil {
+		return "", false, err
+	}
+	return operationClaimHash(*op), true, nil
 }
 
 func compareReservedStepInTx(ctx context.Context, tx *sql.Tx, opID string, ownerEpoch int64, requestedFacts string) error {

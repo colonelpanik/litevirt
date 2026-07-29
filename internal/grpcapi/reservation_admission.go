@@ -119,7 +119,7 @@ func (s *Server) admitReserved(
 		Method:          method,
 		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
 		Project:         project,
-		ResourceKind:    "capacity",
+		ResourceKind:    corrosion.CapacityResourceKind,
 		OperationKind:   string(corrosion.OpResourceUpdateRunning),
 		ReservationJSON: resJSON,
 	}

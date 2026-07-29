@@ -1747,6 +1747,17 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 		} else if reaped > 0 {
 			slog.Info("operation reaper", "reaped", reaped)
 		}
+		// Orphaned admission leases (F2). A reserve-then-verify lease lives for one
+		// RPC, so anything this old is a crash between reserve and release — which
+		// the terminal reaper above can never collect, because an abandoned lease
+		// never becomes terminal and would consume headroom forever. Scoped to
+		// capacity leases so it can never expire a long resize/migration whose
+		// reservation IS backed by a committed spec.
+		if expired, perr := corrosion.ExpireStaleCapacityReservations(ctx, d.db, capacityLeaseMaxAge); perr != nil {
+			slog.Warn("capacity lease expiry", "error", perr)
+		} else if expired > 0 {
+			slog.Warn("capacity lease expiry: released orphaned admission leases", "count", expired)
+		}
 		// Idempotency keys: hard-delete records past their TTL (v39). Ephemeral +
 		// bounded by expires_at; a resurrected expired copy never matches, so a
 		// plain local delete is safe.

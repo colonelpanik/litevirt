@@ -259,10 +259,16 @@ enforcement:
                               # write this node cannot sign is logged as an error and still
                               # RECORDED — dropping the row would lose the record of an
                               # operation that happened, which is the outcome an attacker
-                              # would pick. It is caught instead by the verifier: once a host
-                              # has signed one row, a later unsigned row from it is reported
-                              # as tampering on every node. Enable fleet-uniformly; the flag
-                              # is the reversible kill switch.
+                              # would pick. It is caught instead by the verifier: while a
+                              # host's published signing certificate stands, an unsigned row
+                              # from it is reported as tampering on every node.
+                              # Turning the flag back OFF is a real rollback, not a silent
+                              # one: on the next start the daemon signs a retirement of its
+                              # own key at the sequence its chain had reached, so rows after
+                              # it are unsigned and expected. A host that cannot sign that
+                              # retirement keeps its contract — that is the case it exists
+                              # for — and `lv host retire-audit-key` closes it out from the
+                              # machine holding the cluster CA. Enable fleet-uniformly.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

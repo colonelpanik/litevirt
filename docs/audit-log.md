@@ -20,6 +20,30 @@ The chain logic lives in `internal/corrosion/audit.go` (`InsertAuditLog`,
 `internal/corrosion/schema.go`. Operator surface is `lv audit ls / verify /
 export` plus the matching gRPC + REST RPCs.
 
+**Signatures, not just hashes.** A hash chain proves nothing against an attacker:
+`HashAuditRow` is deterministic and takes no secret, so anyone who can write the
+table can edit a row and recompute every hash after it. Each row therefore also
+carries an ECDSA signature by the authoring host's key. Three replicated tables
+hold the evidence the verifier reasons over, and every row in all three is signed:
+
+| Table | Holds |
+|---|---|
+| `audit_signing_keys` | each host's verification certificate, so any node can check any host's chain |
+| `audit_chain_heads` | periodic signed "host H had written seq S, chain hashed to X" — the only thing that can detect a truncated tail, since a hash chain links backward and cannot notice its own end was cut |
+| `audit_key_lifecycle` | signed `adopted` / `retired` events bounding each key's signing contract |
+
+All three are append-only, and the verifier ignores `deleted_at` on them: a
+retired certificate has to stay resolvable for as long as any row it signed
+exists, so tombstoning evidence accomplishes nothing rather than needing a rule to
+refuse it. A row deleted outright is re-inserted from a peer by ordinary
+anti-entropy.
+
+The keys are asymmetric rather than an HMAC on purpose. A host-local HMAC key
+means only the host that wrote a row can check it, so a compromised host verifies
+its own edited history and its neighbours cannot contradict it — and neighbours
+noticing is the entire mechanism. A cluster-shared key means any one compromised
+node can forge any other host's chain.
+
 ## Schema
 
 Two columns join the audit row to the chain:
@@ -37,10 +61,18 @@ stamped with the host going forward) are treated as **chain-reset points** —
 verification accepts them without a linkage check and continues. So audit logs
 migrated from older binaries don't reject; they just have unverified gaps.
 
-Each daemon **re-bases its own host's sub-chain at startup** (idempotent): rows
-written under the pre-v1.0.16 global-chain model are re-linked per host the first
-time the upgraded daemon runs, so `verify` passes right after a rolling upgrade
-without operator action.
+A daemon re-bases its own host's sub-chain at startup **only while that sub-chain
+is entirely unsigned**: rows written under the pre-v1.0.16 global-chain model are
+re-linked per host the first time the upgraded daemon runs, so `verify` passes
+after a rolling upgrade without operator action.
+
+The moment one signed row exists, the reseal stops touching that host. It used to
+run unconditionally, and that was the single largest hole in the whole design —
+reseal recomputes hashes from whatever the rows currently say, so an attacker with
+database write access could edit a row, wait for a restart, and have the daemon
+itself rewrite the chain around the edit. `verify` then came back clean. A signed
+row is never resealed, locally or via replication, and the guard lives in the SQL
+as well as the caller because peers apply that statement by primary key.
 
 Timestamps are RFC3339 with nanosecond precision so same-second
 inserts sort deterministically. Without nanoseconds, two events
@@ -92,27 +124,58 @@ grouped by what it means:
 - **retired key used** — a row signed by a key past the sequence at which it was
   rotated out.
 - **chain head mismatch** — a row covered by a signed head was rewritten.
-- **unsigned after signed** — a host that had begun signing produced a row with
-  no signature.
+- **unsigned after signed** — a host under a signing contract (see below)
+  produced a row with no signature.
 
 Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`.
 
-**Unsigned rows are not tampering — until the host has signed one.** Rows
-written before signing was switched on carry no signature; they are chain-checked
-only, reported as a count on the clean line, and exit 0. Flagging them would put
-a permanent tamper verdict on every cluster with any history, which is how a
-check gets ignored.
-
-The boundary is per host and comes from the log rather than from the cluster
-latch: a host cannot un-adopt a key, so once it has produced one signed row, an
-unsigned row from it afterwards is **unsigned after signed** and is tampering.
-That covers both a fabricated row inserted straight into the table — the content
-hash is unkeyed, so recomputing it costs an attacker nothing, and the absence of
-a signature is the only thing that distinguishes it — and a node that lost its
-key and kept writing.
+**Unsigned rows on their own are not tampering.** Rows written before signing was
+switched on carry no signature; they are chain-checked, reported as a count on the
+clean line, and exit 0. Flagging them would put a permanent tamper verdict on
+every cluster with any history, which is how a check gets ignored.
 
 Rows this daemon had no keyring to check and rows carrying no host name are
-neither: both mean part of the log went unchecked, not that it was altered.
+neither a finding nor a pass: both mean part of the log went unchecked, not that
+it was altered.
+
+### The signing contract
+
+Whether an unsigned row is evidence is decided by one replicated fact: **the
+host's published signing certificate.** Publishing one is a CA-signed, per-host
+declaration that this host's rows carry a signature from here on.
+
+| State | An unsigned row from that host |
+|---|---|
+| certificate published, not retired | **tampering** (`unsigned after signed`) |
+| certificate retired (signed) | expected — the host stopped, and said so |
+| no certificate | pre-enforcement — counted, not flagged |
+
+Three properties matter, and each closes a specific hole:
+
+- **It is per host**, so a gradual rollout cannot false-fire. A host that has not
+  published yet is simply not signing yet.
+- **It has a start.** A certificate says a host commits, not *when* — and without
+  the when, publishing one retroactively claims every row the host ever wrote, so
+  the first `verify` after enabling signing reports a cluster's whole history as
+  tampering. A signed `adopted` record carries the sequence the chain had reached
+  when the key took effect; rows at or below it predate the commitment.
+- **It is not derived from the host's own config or its own log.** A node-local
+  flag would let a compromised node declare itself exempt and report clean, and
+  two nodes disagreeing about the same replicated rows would destroy the only
+  reason to believe either. Asking "has this host signed before?" is worse still:
+  the walk is ordered by attacker-chosen timestamps, and the question says nothing
+  at all about a host that never managed to sign — which is exactly the case that
+  matters.
+
+That last point is why a host configured to sign publishes its certificate **even
+when its private key will not load.** "The key is unreadable" is what an attacker
+arranges with one `chmod`; it must not also be what makes a host look like one
+that was never meant to sign.
+
+The contract covers both the fabricated row inserted straight into the table — the
+content hash is unkeyed, so recomputing it costs an attacker nothing, and the
+missing signature is the only thing that distinguishes it — and a node that lost
+its key and kept writing.
 
 The verify check is also exposed as the `VerifyAuditChain` gRPC RPC
 and the `/api/v1/audit/verify` REST route, so a monitoring system can
@@ -144,17 +207,21 @@ the libvirt symlinks `qemu+tls://` migration follows — none of which reload
 without a restart, so rotating them would put quorum and any in-flight migration
 at risk. That separation is the reason the audit key is its own certificate.
 
-On the next start the daemon publishes the new certificate, retires the old key
-at the sequence its chain has reached, and signs a chain head **with the new key**
-over the whole existing log. That happens **whether or not
-`enforcement.audit_signature` is on** — the flag decides whether new rows get
-signed, not whether a rotation completes, and a rotation that quietly did nothing
-on a default-configured host would leave the leaked key as the only published
-identity while the command reported the incident closed. The command tells you
-which of the two states the host is in. That last step is what rotation is for: from then on,
-altering any row the old key wrote contradicts a head whoever holds that key
-cannot forge. What it cannot do is repair a log that was already forged before
-anyone noticed — no scheme can.
+On the next start the daemon publishes the new certificate, records a signed
+retirement of the old key at the sequence its chain has reached, and signs a chain
+head **with the new key** over the whole existing log.
+
+That head is what rotation is for: from then on, altering any row the old key
+wrote contradicts an assertion whoever holds that key cannot forge. What rotation
+cannot do is repair a log that was already forged before anyone noticed — no
+scheme can, and claiming otherwise would be worse than saying so.
+
+All of it happens **whether or not `enforcement.audit_signature` is on.** The flag
+decides whether new rows get signed, not whether a rotation completes — a rotation
+that quietly did nothing on a default-configured host would leave the leaked key
+as the only published identity while the command reported the incident closed. The
+command reads the flag off the target and tells you which of the two states the
+host is in.
 
 ## Turning signing back off
 
@@ -177,20 +244,34 @@ simply changed their mind. The two are told apart by who can still sign:
 lv host retire-audit-key host-b
 ```
 
-Run it against the node holding the cluster CA private key. Signing on another
-host's behalf means minting a certificate carrying that host's name, which is
-exactly what holding the CA authorises and nothing else does.
+Run it where the cluster CA private key is — the machine that ran
+`lv host init`, which is normally an operator workstation rather than a cluster
+member. Signing on another host's behalf means minting a certificate carrying that
+host's name, which is exactly what holding the CA authorises and nothing else
+does.
+
+The signing happens **locally**, in two phases: the daemon reports which key would
+be retired and at which sequence, writing nothing; the command mints, signs, and
+submits; the daemon verifies against the cluster CA and records the result. The CA
+private key is never sent to a node and never has to live on one.
 
 An attacker cannot use either path to go quiet: producing a retirement means
 holding the key and publishing a permanent, replicated statement of when signing
 stopped.
 
-Rows signed by the retired key **stay verifiable forever**. The retired
-certificate is marked retired, never deleted, so `lv audit verify` can still
-resolve it — deleting it would make every row it signed unverifiable, and a
-rotation performed to improve integrity would destroy the history it was
-protecting. What retirement adds is a boundary: use of the old key past the
-sequence it was retired at is itself a finding.
+Rows signed by the retired key **stay verifiable forever**. The certificate is
+never deleted, so `lv audit verify` can still resolve it — deleting it would make
+every row it signed unverifiable, and a rotation performed to improve integrity
+would destroy the history it was protecting. What retirement adds is a boundary:
+use of the old key past the sequence it was retired at is itself a finding.
+
+A retirement is itself **signed**, and stored append-only in
+`audit_key_lifecycle`. That is not decoration. It began as two ordinary columns on
+the certificate row, and as plain replicated data either could be set or cleared
+by any peer: forging a retirement put every row a host had ever signed past a
+boundary, on every node, with no key required — and clearing a genuine one was
+just as cheap. The detector for "somebody else has this key" cannot itself be
+something somebody else can write.
 
 ## WORM export
 

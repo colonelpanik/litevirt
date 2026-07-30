@@ -100,7 +100,13 @@ func (c *crlChecker) refreshLocked() {
 		m[e.SerialNumber.Text(16)] = true
 	}
 	c.revoked = m
-	slog.Info("CRL loaded and verified", "path", c.crlPath, "revoked_count", len(m))
+	// Debug, not Info. A checker is built per TLS config and a peer dial builds one
+	// per call, so a successful load is a per-connection event, not a cluster event —
+	// at Info it emitted several lines a second on every node the moment CRLs started
+	// actually existing. The event worth an operator's attention is the CRL CHANGING,
+	// and corrosion.SyncClusterCRL reports that where it happens. Failures below stay
+	// loud: they mean revocation is not being enforced.
+	slog.Debug("CRL loaded and verified", "path", c.crlPath, "revoked_count", len(m))
 }
 
 // parseCACert extracts the first certificate from a PEM blob, or nil.

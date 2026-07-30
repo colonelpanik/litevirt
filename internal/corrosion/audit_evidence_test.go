@@ -834,3 +834,59 @@ func TestAuditHeads_ANodeWithNoKeyringAccusesNobody(t *testing.T) {
 		t.Fatalf("a node that can verify nothing reported tampering: %+v", res)
 	}
 }
+
+// TestSchema_TheLifecyclePKRepairReachesAnExistingDatabase.
+//
+// Widening the CREATE statement fixes new databases and does nothing whatever for
+// existing ones — CREATE TABLE IF NOT EXISTS is a no-op when the table is already
+// there. So the squatting fix shipped without reaching a single cluster already
+// running this branch, and the lab proved it: inserting the second row still
+// failed with a UNIQUE constraint error long after the fix was committed.
+func TestSchema_TheLifecyclePKRepairReachesAnExistingDatabase(t *testing.T) {
+	ctx := context.Background()
+	c, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	// A database created under the NARROW key, as an existing v47 cluster has.
+	if err := c.execLocal(ctx, `CREATE TABLE audit_key_lifecycle (
+		host_name TEXT NOT NULL, key_id TEXT NOT NULL, event TEXT NOT NULL,
+		at_seq INTEGER NOT NULL DEFAULT 0, by_key_id TEXT NOT NULL DEFAULT '',
+		signature TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL, deleted_at TEXT,
+		PRIMARY KEY (host_name, key_id, event))`); err != nil {
+		t.Fatalf("seed the narrow table: %v", err)
+	}
+	if err := c.execLocal(ctx,
+		`INSERT INTO audit_key_lifecycle (host_name,key_id,event,at_seq,by_key_id,signature,created_at,updated_at)
+		 VALUES ('node-0','k1','adopted',7,'k1','realsig','2026-07-29T10:00:00Z','2026-07-29T10:00:00Z')`); err != nil {
+		t.Fatalf("seed a genuine record: %v", err)
+	}
+
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	// The genuine record survives the rebuild, with its own timestamps.
+	got := oneCol(t, c, `SELECT at_seq FROM audit_key_lifecycle WHERE key_id = 'k1' AND event = 'adopted'`)
+	if got != "7" {
+		t.Fatalf("the rebuild lost the existing record (at_seq = %q)", got)
+	}
+	if ts := oneCol(t, c,
+		`SELECT updated_at FROM audit_key_lifecycle WHERE key_id = 'k1'`); ts != "2026-07-29T10:00:00Z" {
+		t.Fatalf("the rebuild restamped updated_at to %q; a migrated row would then win LWW "+
+			"against every later real write", ts)
+	}
+	// And a second signer can now coexist, which is the whole point.
+	if err := c.execLocal(ctx,
+		`INSERT INTO audit_key_lifecycle (host_name,key_id,event,at_seq,by_key_id,signature,created_at,updated_at)
+		 VALUES ('node-0','k1','adopted',0,'squatter','garbage','2026-07-29T11:00:00Z','2026-07-29T11:00:00Z')`); err != nil {
+		t.Fatalf("a squatter still collides with the genuine record after the repair: %v\n"+
+			"the narrow key is what let an unverifiable row block a real one permanently", err)
+	}
+	if n := countRows(t, c, `SELECT key_id FROM audit_key_lifecycle WHERE event = 'adopted'`); n != 2 {
+		t.Fatalf("want both records present after the repair, got %d", n)
+	}
+}

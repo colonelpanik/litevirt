@@ -106,6 +106,13 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if fn.Name.Name == "applyV32DataFixes" {
 				continue
 			}
+			// repairAuditKeyLifecyclePK rebuilds a table to widen its primary key and
+			// COPIES each row's existing updated_at through. Stamping a fresh NowTS
+			// would be the bug, not the fix: every migrated row would then win LWW
+			// against later real writes from other nodes. Exempt by name.
+			if fn.Name.Name == "repairAuditKeyLifecyclePK" {
+				continue
+			}
 			// HistoricalShapes GENERATES prior-release SQL strings for the compatibility
 			// ledger — it never writes to the DB, so its embedded `updated_at = ?` is a bound
 			// placeholder the apply path fills, not a value this function stamps.

@@ -134,3 +134,31 @@ func TestPeerTrust_AnEmptyCNIsRefused(t *testing.T) {
 		t.Fatal("an empty common name was accepted as a peer")
 	}
 }
+
+// TestPeerTrust_AnUnreadableHostRowRefusesThePeer.
+//
+// Absent and unreadable are not the same, and only one of them may fall through to
+// the certificate.
+//
+// Removal is enforced by the tombstone in the hosts table and by nothing else —
+// RemoveHost soft-deletes the row and logs the cert serial, but no CRL entry is
+// issued, so a decommissioned node keeps a certificate that still chains to the
+// cluster CA. If a read error let the check fall through to that certificate, a
+// removed host would be re-admitted by the one failure mode nobody can see.
+//
+// The bootstrap fix only needs the fallback when the row is DEFINITELY not there.
+// An error means we cannot rule out a removal, and the original code failed closed
+// on that path — discarding the GetHost error and returning false. This keeps it.
+func TestPeerTrust_AnUnreadableHostRowRefusesThePeer(t *testing.T) {
+	s := trustFixture(t)
+	// Drop the table so the lookup errors rather than returning no rows.
+	if err := s.db.Execute(context.Background(), `DROP TABLE hosts`); err != nil {
+		t.Fatalf("drop hosts: %v", err)
+	}
+	ctx := certCtx("node-7", x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth)
+	if s.isTrustedHostCN(ctx, "node-7") {
+		t.Fatal("an unreadable hosts table admitted a peer on its certificate alone\n" +
+			"removal is enforced only by the tombstone — no CRL entry is issued — so " +
+			"falling through here re-admits a decommissioned node whenever the read fails")
+	}
+}

@@ -297,13 +297,18 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 	}
 	rows, err := s.db.Query(ctx, `SELECT deleted_at FROM hosts WHERE name = ?`, cn)
 	if err != nil {
-		// Unreadable state is not evidence of removal, and failing closed here would
-		// let one transient DB error partition this node from every peer at once. The
-		// certificate has already been verified against the cluster CA by the
-		// handshake, so falling through is not the same as trusting anyone.
-		slog.Warn("could not read the host row for a peer; deciding on its certificate alone",
-			"cn", cn, "error", err)
-	} else if len(rows) > 0 {
+		// ABSENT may fall through to the certificate; UNREADABLE may not. An error
+		// cannot rule out a removal, and removal is enforced by the tombstone and
+		// nothing else — RemoveHost soft-deletes the row and logs the serial, but
+		// issues no CRL entry, so a decommissioned node keeps a certificate that
+		// still chains to the cluster CA. Falling through here would re-admit it on
+		// the one failure nobody watches. The pre-bootstrap code discarded this error
+		// and returned false; that direction was right.
+		slog.Error("could not read the host row for a peer; refusing it, because an "+
+			"unreadable row cannot rule out a removal", "cn", cn, "error", err)
+		return false
+	}
+	if len(rows) > 0 {
 		return rows[0].String("deleted_at") == ""
 	}
 	return callerCertHasServerAuth(ctx)

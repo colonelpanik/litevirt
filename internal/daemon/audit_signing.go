@@ -387,6 +387,10 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			// tamper finding, and it is what a node writing rows it cannot sign
 			// leaves behind.
 			"unsigned_after_signed": len(res.UnsignedAfterSigned),
+			// A host that declares it signs and demonstrably cannot. Its own
+			// node cannot raise this — it has no keyring to verify with — so the
+			// alert has to come from the peers that can.
+			"never_adopted": len(res.NeverAdopted),
 		})
 		if res.Tampered() {
 			// Error, not warn: this is the one finding in the daemon that means
@@ -396,6 +400,7 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 				"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
 				"seq_gaps", len(res.SeqGaps), "laundered", len(res.Laundered),
 				"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
+				"never_adopted", res.NeverAdopted,
 				"truncated_hosts", res.TruncatedHosts)
 		}
 	}

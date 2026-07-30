@@ -129,6 +129,7 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		{"retired key used (signed after the key was rotated out):", resp.RetiredKeyUse},
 		{"chain head mismatch (a row covered by a signed head was rewritten):", resp.HeadMismatch},
 		{"unsigned after signed (a host that had begun signing produced an unsigned row):", resp.UnsignedAfterSigned},
+		{"never adopted (a host declares its rows are signed but cannot sign):", resp.NeverAdopted},
 	} {
 		if len(g.rows) == 0 {
 			continue

@@ -21898,8 +21898,18 @@ type VerifyAuditChainResponse struct {
 	// into the table — the cheapest forgery, since the content hash is unkeyed
 	// — or written by a node that lost its key and kept going.
 	UnsignedAfterSigned []string `protobuf:"bytes,15,rep,name=unsigned_after_signed,json=unsignedAfterSigned,proto3" json:"unsigned_after_signed,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Hosts holding a published signing certificate that never recorded an
+	// adoption, long enough ago that a starting daemon would have.
+	//
+	// This is what reports a host that cannot read its own signing key. Such a
+	// host publishes its CERTIFICATE on purpose, so its unsigned rows read as
+	// evidence rather than as ordinary history — but it cannot SIGN the adoption
+	// record a contract requires, so it fell between the two rules and its rows
+	// were reported clean everywhere. A key that cannot be read is the state an
+	// attacker arranges, which is why it must not be the quiet one.
+	NeverAdopted  []string `protobuf:"bytes,16,rep,name=never_adopted,json=neverAdopted,proto3" json:"never_adopted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VerifyAuditChainResponse) Reset() {
@@ -22033,6 +22043,13 @@ func (x *VerifyAuditChainResponse) GetHeadMismatch() []string {
 func (x *VerifyAuditChainResponse) GetUnsignedAfterSigned() []string {
 	if x != nil {
 		return x.UnsignedAfterSigned
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetNeverAdopted() []string {
+	if x != nil {
+		return x.NeverAdopted
 	}
 	return nil
 }
@@ -24825,7 +24842,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"targetPool\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tpool_name\x18\x04 \x01(\tR\bpoolName\x12!\n" +
-	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xbe\x04\n" +
+	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xe3\x04\n" +
 	"\x18VerifyAuditChainResponse\x12!\n" +
 	"\frows_checked\x18\x01 \x01(\x05R\vrowsChecked\x12 \n" +
 	"\fbroken_at_id\x18\x02 \x01(\tR\n" +
@@ -24843,7 +24860,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\btampered\x18\f \x01(\bR\btampered\x12&\n" +
 	"\x0fretired_key_use\x18\r \x03(\tR\rretiredKeyUse\x12#\n" +
 	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\x122\n" +
-	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\"\xd1\x01\n" +
+	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\x12#\n" +
+	"\rnever_adopted\x18\x10 \x03(\tR\fneverAdopted\"\xd1\x01\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +

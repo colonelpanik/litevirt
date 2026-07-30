@@ -238,6 +238,39 @@ as the only published identity while the command reported the incident closed. T
 command reads the flag off the target and tells you which of the two states the
 host is in.
 
+## A host that cannot sign at all
+
+A host whose signing key is unreadable publishes its **certificate** anyway. That
+is deliberate: publishing nothing would make it look like a host that was never
+meant to sign, so its whole log would read as ordinary pre-enforcement history —
+unsigned, freely rewritable, and clean on every peer. "The key is unreadable" is
+precisely the state an attacker arranges, so it must not be the quiet one.
+
+But such a host cannot sign an *adoption* record either, and a signing contract
+requires one. So it fell between the two rules: certificate published, no contract,
+unsigned rows, and `lv audit verify` reporting the cluster intact.
+
+`never adopted` closes that. A published certificate with no adoption record, older
+than the window a starting daemon needs, is a finding in its own right:
+
+```
+never adopted (a host declares its rows are signed but cannot sign):
+  node-3: published signing certificate 4b6c… at 2026-07-30T05:12:44Z but never
+  recorded an adoption — the host declares its rows are signed and cannot sign, so
+  nothing it writes is tamper-evident
+```
+
+It names a **host**, not rows. There is no contract and so no start sequence, and
+inventing one is what would condemn the host's entire pre-enforcement history — the
+false alarm that made contracts need a start in the first place. Saying the host
+cannot sign is true regardless of which rows predate what.
+
+Three things deliberately do *not* trigger it: a daemon that has just started and
+has not reached its deferred adoption yet; a certificate minted by
+`lv host retire-audit-key`, which self-retires and never adopts; and a host that
+adopted before its key broke — that one is already covered by `unsigned after
+signed`, which can name the individual rows because a contract start exists.
+
 ## Turning signing back off
 
 Publishing a signing certificate declares that a host's rows are signed from that

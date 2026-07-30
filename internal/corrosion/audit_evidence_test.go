@@ -876,3 +876,176 @@ func TestSchema_TheLifecyclePKAdmitsTwoSigners(t *testing.T) {
 		t.Fatalf("want both records present, got %d", n)
 	}
 }
+
+// ─────────────────── a host that cannot sign at all ───────────────────
+
+// publishCertOnlyAged puts a host in the state setupAuditSigning reaches when
+// LoadAuditKeyring fails: certificate published, no adoption record, no key. The
+// certificate is backdated past the settle window, because the thing under test is
+// a host that never adopts — not one that has not adopted yet.
+func publishCertOnlyAged(t *testing.T, c *Client, dir, host string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := c.Execute(ctx, `DELETE FROM audit_key_lifecycle`); err != nil {
+		t.Fatalf("clear lifecycle: %v", err)
+	}
+	if err := c.Execute(ctx, `DELETE FROM audit_signing_keys`); err != nil {
+		t.Fatalf("clear certs: %v", err)
+	}
+	c.SetAuditKeyring(nil)
+	if _, err := PublishSigningCertOnly(ctx, c, dir, host); err != nil {
+		t.Fatalf("PublishSigningCertOnly: %v", err)
+	}
+	old := time.Now().Add(-2 * adoptionSettleWindow).UTC().Format(time.RFC3339Nano)
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET created_at = ? WHERE host_name = ?`, old, host); err != nil {
+		t.Fatalf("age the certificate: %v", err)
+	}
+}
+
+// TestNeverAdopted_AHostThatCannotSignIsReported.
+//
+// The false NEGATIVE a whole-branch read found, and the only one this session:
+// every other finding was a legitimate action wrongly reported as tampering.
+//
+// setupAuditSigning publishes a host's certificate even when the private key
+// cannot be read, on the stated grounds that publishing nothing is the worst
+// outcome — the host would "look like one that was never meant to sign, so its
+// entire audit log reads as ordinary pre-enforcement history", and "the key is
+// unreadable is precisely the state an attacker arranges, so it must not be the
+// state that goes unnoticed".
+//
+// Requiring an adoption record for a contract made that comment false: a host that
+// cannot read its key cannot SIGN an adoption either, so the cert-only path put it
+// under no contract and its unsigned rows were reported clean on every node.
+func TestNeverAdopted_AHostThatCannotSignIsReported(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+	publishCertOnlyAged(t, c, dir, "node-0")
+
+	for _, id := range []string{"u1", "u2", "u3"} {
+		ins(t, c, id, "node-0", "2026-07-29T11:00:0"+id[1:]+"Z")
+	}
+
+	kr, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if len(res.NeverAdopted) == 0 {
+		t.Fatalf("a host with a published certificate and no adoption wrote %d unsigned rows "+
+			"and nothing was reported: %+v\nmaking the key unreadable would switch tamper-"+
+			"evidence off silently, which is the one outcome the cert-only publish exists to "+
+			"prevent", res.Unsigned, res)
+	}
+	if !res.Tampered() {
+		t.Errorf("NeverAdopted is not part of the verdict, so `lv audit verify` still exits 0")
+	}
+}
+
+// TestNeverAdopted_AStartingDaemonIsNotReported.
+//
+// The daemon publishes its certificate immediately and defers adoption by
+// auditLifecycleSettle, so between the two every host in the cluster is briefly in
+// exactly the shape above. Reporting it would put a tamper verdict on every node
+// for the first minute after any restart — the kind of false alarm that gets the
+// whole feature switched off.
+func TestNeverAdopted_AStartingDaemonIsNotReported(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+	publishCertOnlyAged(t, c, dir, "node-0")
+
+	// Same state, except the certificate was published just now.
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET created_at = ? WHERE host_name = 'node-0'`,
+		time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("restamp: %v", err)
+	}
+	kr, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if len(res.NeverAdopted) > 0 {
+		t.Fatalf("a certificate published seconds ago was reported as never adopted: %v\n"+
+			"the daemon defers adoption on purpose, so this fires on every host on every "+
+			"restart", res.NeverAdopted)
+	}
+}
+
+// TestNeverAdopted_ARetiredKeyIsNotReported.
+//
+// `lv host retire-audit-key` mints a certificate, publishes it, and retires it in
+// the same breath — so it has a retirement and deliberately no adoption. A rule
+// keyed on "no adoption" alone would report every retirement the command performs
+// as evidence of a host that cannot sign.
+func TestNeverAdopted_ARetiredKeyIsNotReported(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	seq, err := HostTailSeq(ctx, c, "node-0")
+	if err != nil {
+		t.Fatalf("HostTailSeq: %v", err)
+	}
+	if err := RetireAuditKey(ctx, c, kr, "node-0", kr.KeyID(), seq); err != nil {
+		t.Fatalf("RetireAuditKey: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`DELETE FROM audit_key_lifecycle WHERE event = 'adopted'`); err != nil {
+		t.Fatalf("drop the adoption: %v", err)
+	}
+	old := time.Now().Add(-2 * adoptionSettleWindow).UTC().Format(time.RFC3339Nano)
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET created_at = ?`, old); err != nil {
+		t.Fatalf("age the certificate: %v", err)
+	}
+
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if len(res.NeverAdopted) > 0 {
+		t.Fatalf("a retired certificate was reported as never adopted: %v\n"+
+			"retire-audit-key publishes a certificate that self-retires and never adopts, so "+
+			"this would fire on every deliberate retirement", res.NeverAdopted)
+	}
+}
+
+// TestNeverAdopted_TheCertificateStampIsAWallTime.
+//
+// The age of a certificate is the only thing separating "this host is still
+// starting up" from "this host cannot sign". publishCert stamped created_at with
+// NowTS, which becomes an HLC string once hlc_lww latches — and an HLC value read
+// as wall time parses as nothing, so on a latched cluster no certificate could ever
+// be aged and the finding could never fire. The chain heads had this exact bug.
+//
+// SetHLCEmit is what makes this real: without it NowTS still returns RFC3339, the
+// wrong stamp parses fine, and the test passes with the fix removed.
+func TestNeverAdopted_TheCertificateStampIsAWallTime(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	c.SetHLCEmit(func() bool { return true })
+
+	if err := c.Execute(ctx, `DELETE FROM audit_signing_keys`); err != nil {
+		t.Fatalf("clear certs: %v", err)
+	}
+	if err := kr.PublishSigningKey(ctx, c); err != nil {
+		t.Fatalf("PublishSigningKey: %v", err)
+	}
+
+	stamped := oneCol(t, c, `SELECT created_at FROM audit_signing_keys WHERE host_name = 'node-0'`)
+	if _, err := time.Parse(time.RFC3339Nano, stamped); err != nil {
+		t.Fatalf("created_at was stamped as %q, which cannot be parsed as a wall time: %v\n"+
+			"a certificate that cannot be aged can never be reported as never-adopted, so a "+
+			"host whose key is unreadable stays silent on every node", stamped, err)
+	}
+}

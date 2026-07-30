@@ -327,6 +327,21 @@ type AuditVerifyResult struct {
 	// entry inserted straight into the table or a node that lost its key and
 	// kept writing.
 	UnsignedAfterSigned []string
+	// NeverAdopted lists hosts holding a published signing certificate that never
+	// recorded an adoption, long enough ago that a starting daemon would have.
+	//
+	// It is the only thing that reports a host which cannot read its own signing
+	// key. That host publishes its CERTIFICATE — deliberately, so its unsigned rows
+	// are evidence rather than ordinary history — but it cannot SIGN the adoption
+	// record a contract requires, so it fell into the gap between the two rules and
+	// its rows were reported clean on every node. "The key is unreadable" is the
+	// state an attacker arranges, which is exactly why it cannot be the quiet one.
+	//
+	// A host, not a row. There is no contract and therefore no start sequence, so
+	// there is nothing to say about which individual rows are anomalous — and that
+	// is the point: claiming a start would condemn the host's whole pre-enforcement
+	// history, which is the false alarm that made the contract need a start at all.
+	NeverAdopted []string
 	// Unverifiable counts signed rows this verifier had no keyring to check.
 	Unverifiable int
 	// BadSignature lists rows whose signature failed against the published
@@ -384,7 +399,7 @@ func (r AuditVerifyResult) Tampered() bool {
 	return r.BrokenAt != "" || len(r.BadSignature) > 0 || len(r.UnknownKeyID) > 0 ||
 		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0 ||
 		len(r.RetiredKeyUse) > 0 || len(r.HeadMismatch) > 0 ||
-		len(r.UnsignedAfterSigned) > 0
+		len(r.UnsignedAfterSigned) > 0 || len(r.NeverAdopted) > 0
 }
 
 // VerifyAuditChain walks every host's sub-chain and reports what it finds.
@@ -416,9 +431,16 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	// timestamp older than the host's first real row, arrived while the latch
 	// was still false, and escaped every check. A fact read up front from
 	// replicated state cannot be reordered into being false.
-	contracted, err := hostsUnderSigningContract(ctx, c, keyring)
+	contracted, unadopted, err := signingContracts(ctx, c, keyring)
 	if err != nil {
 		return res, err
+	}
+	for _, u := range unadopted {
+		res.NeverAdopted = append(res.NeverAdopted, fmt.Sprintf(
+			"%s: published signing certificate %s at %s but never recorded an adoption — "+
+				"the host declares its rows are signed and cannot sign, so nothing it writes "+
+				"is tamper-evident (a key that cannot be read cannot sign the adoption either)",
+			u.host, u.keyID, u.publishedAt))
 	}
 	prevByHost := map[string]string{} // per-host running tail
 	seqByHost := map[string]int64{}   // per-host last seq seen

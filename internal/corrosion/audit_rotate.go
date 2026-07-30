@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 // Audit signing key rotation.
@@ -136,16 +137,60 @@ type signingContract struct {
 //
 // It is per host, so a gradual rollout cannot false-fire: a host that has not
 // published yet is simply pre-enforcement.
+// unadoptedCert is a published certificate that never recorded an adoption: the
+// host declared it signs, and then could not say from when.
+type unadoptedCert struct {
+	host, keyID, publishedAt string
+}
+
+// adoptionSettleWindow is how long a published certificate may go without an
+// adoption record before that is treated as a finding rather than a startup.
+//
+// The daemon defers adoption by auditLifecycleSettle (45s) so it does not pin a
+// permanent sequence boundary from a local tail that is behind the cluster, and
+// the record then has to replicate. This is far longer than either needs, because
+// the state it detects is permanent: a host that cannot read its key will never
+// adopt, and there is nothing to gain by calling it five minutes sooner.
+const adoptionSettleWindow = 10 * time.Minute
+
 func hostsUnderSigningContract(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]signingContract, error) {
+	contracts, _, err := signingContracts(ctx, c, keyring)
+	return contracts, err
+}
+
+// signingContracts returns the hosts whose rows must be signed, and separately the
+// published certificates that never recorded an adoption.
+//
+// The second return value is the one that closes a false NEGATIVE, and it is the
+// half a rule keyed only on adoption cannot express. setupAuditSigning publishes a
+// host's certificate even when its private key cannot be read, on the stated
+// grounds that publishing nothing is the worst outcome — the host then "looks like
+// one that was never meant to sign, so its entire audit log reads as ordinary
+// pre-enforcement history", and "the key is unreadable is precisely the state an
+// attacker arranges, so it must not be the state that goes unnoticed".
+//
+// Requiring an adoption record for a contract made that comment false. A host that
+// cannot read its key cannot SIGN an adoption record either — writeAuditLifecycle
+// refuses without a signing key — so the cert-only path put nobody under contract
+// and the attacker's state became the silent one. Verified: three unsigned rows
+// from a host with a published certificate returned Tampered=false.
+//
+// Reporting the certificate rather than resurrecting a contract is what keeps both
+// halves. A contract needs a START, and guessing "from row 0" is what condemned a
+// cluster's entire pre-enforcement history — 659 legacy rows per node on the lab.
+// This needs no start: it says the host declared it signs and demonstrably cannot,
+// which is true regardless of which rows predate what.
+func signingContracts(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]signingContract, []unadoptedCert, error) {
 	lifecycle, err := auditKeyLifecycle(ctx, c, keyring)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	rows, err := c.Query(ctx, `SELECT host_name, key_id FROM audit_signing_keys`)
+	rows, err := c.Query(ctx, `SELECT host_name, key_id, created_at FROM audit_signing_keys`)
 	if err != nil {
-		return nil, fmt.Errorf("list audit signing certificates: %w", err)
+		return nil, nil, fmt.Errorf("list audit signing certificates: %w", err)
 	}
 	out := map[string]signingContract{}
+	var unadopted []unadoptedCert
 	for _, r := range rows {
 		host, keyID := r.String("host_name"), r.String("key_id")
 		// The row's own host_name column is not evidence of anything — this table
@@ -169,6 +214,20 @@ func hostsUnderSigningContract(ctx context.Context, c *Client, keyring *AuditKey
 		// node-to-node verdict split at once. A certificate with no adoption is
 		// simply not a contract.
 		if !adopted {
+			// Not a contract — but not nothing either. Once the certificate is old
+			// enough that a starting daemon would have adopted, the absence is the
+			// finding: this host published a declaration it cannot back.
+			//
+			// An unparseable created_at is NOT reported. It cannot be aged, and the
+			// only thing that produced one was a revision that stamped this column
+			// with NowTS; guessing would put a permanent finding on a host for a
+			// timestamp bug rather than for anything it did.
+			if published, perr := time.Parse(time.RFC3339Nano, r.String("created_at")); perr == nil &&
+				time.Since(published) >= adoptionSettleWindow {
+				unadopted = append(unadopted, unadoptedCert{
+					host: host, keyID: keyID, publishedAt: r.String("created_at"),
+				})
+			}
 			continue
 		}
 		// A host with several live keys is under the EARLIEST of their contracts:
@@ -178,7 +237,7 @@ func hostsUnderSigningContract(ctx context.Context, c *Client, keyring *AuditKey
 			out[host] = signingContract{startSeq: start}
 		}
 	}
-	return out, nil
+	return out, unadopted, nil
 }
 
 // AdoptAuditKey publishes this host's certificate and, if the host was

@@ -563,7 +563,16 @@ func (k *AuditKeyring) PublishSigningKey(ctx context.Context, c *Client) error {
 // publishCert writes the certificate row. Split out because publishing does not
 // require the private key — see PublishSigningCertOnly.
 func (k *AuditKeyring) publishCert(ctx context.Context, c *Client) error {
-	now := c.NowTS()
+	// created_at is a WALL time, updated_at is the LWW conflict key. They cannot
+	// share a source: NowTS starts emitting HLC strings the moment hlc_lww latches,
+	// and the verifier measures a certificate's age against created_at to decide
+	// whether a missing adoption record is a host still starting up or one that
+	// cannot sign at all. Reading an HLC value as wall time answers neither. The
+	// chain heads had this same bug and it is the same fix.
+	//
+	// created_at is deliberately NOT refreshed on conflict: it is when this key was
+	// FIRST published, and a daemon that republishes on every start would otherwise
+	// reset the window each time and never look old enough to judge.
 	return c.Execute(ctx,
 		`INSERT INTO audit_signing_keys (key_id, host_name, cert_pem, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, NULL)
@@ -572,7 +581,7 @@ func (k *AuditKeyring) publishCert(ctx context.Context, c *Client) error {
 		   cert_pem = excluded.cert_pem,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		k.keyID, k.hostName, k.certPEM, now, now)
+		k.keyID, k.hostName, k.certPEM, c.NowWall(), c.NowTS())
 }
 
 // auditEvidenceGuard decides whether one incoming anti-entropy row of audit

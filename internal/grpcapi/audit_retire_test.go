@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -195,4 +196,49 @@ func countRows(t *testing.T, s *Server, q string) int {
 		t.Fatalf("query %q: %v", q, err)
 	}
 	return len(rows)
+}
+
+// TestRetireAuditKey_RefusesFromALaggingReplica.
+//
+// Found on the lab, and it is the finding the floor was supposed to have closed.
+// Retiring node-3 from a node whose copy of node-3's log ended at seq 5 — while
+// node-3 had genuinely signed through 8 — recorded the boundary at 5. Anti-entropy
+// then delivered rows 6, 7 and 8, and all three became permanent RetiredKeyUse
+// findings on every node in the cluster.
+//
+// The floor cannot help: a host's heads are signed by its own keys, and retiring
+// the current one excludes exactly the heads that would prove how far the chain
+// has come. So the only safe move is to notice and refuse.
+func TestRetireAuditKey_RefusesFromALaggingReplica(t *testing.T) {
+	ctx := context.Background()
+	s, dir, keyID := retireFixture(t, "node-1")
+	_ = dir
+
+	// The host's own chain head says it reached seq 9; this node holds nothing.
+	kr, err := corrosion.LoadAuditKeyring(s.pkiDir, "node-1")
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring: %v", err)
+	}
+	created := "2026-07-29T10:00:00Z"
+	sig, err := kr.SignHead("node-1", 0, 9, "aabb", created)
+	if err != nil {
+		t.Fatalf("SignHead: %v", err)
+	}
+	if err := s.db.Execute(ctx,
+		`INSERT INTO audit_chain_heads
+		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-1', 0, 9, 'aabb', ?, ?, ?, ?, NULL)`,
+		kr.KeyID(), sig, created, created); err != nil {
+		t.Fatalf("insert head: %v", err)
+	}
+
+	_, err = s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{HostName: "node-1"})
+	if err == nil {
+		t.Fatalf("retiring succeeded from a replica that is 9 rows behind\n"+
+			"the boundary would be pinned below every row key %s legitimately signed, "+
+			"permanently, and anti-entropy would then report each of them", keyID)
+	}
+	if !strings.Contains(err.Error(), "attests to") {
+		t.Errorf("the refusal does not explain that the replica is behind: %v", err)
+	}
 }

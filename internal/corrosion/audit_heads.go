@@ -397,3 +397,43 @@ func FlooredHostTailSeq(ctx context.Context, c *Client, keyring *AuditKeyring, h
 	}
 	return seq, nil
 }
+
+// AuditReplicaIsBehind reports the sequence some VERIFIED head claims this host's
+// chain reached, when that is beyond what this node's own copy of the log holds.
+// ok is false when the local copy is at least as far along as any head.
+//
+// This is the safe use of a head signed by the key being retired. RAISING a
+// boundary from one is not safe — whoever holds a leaked key publishes a head at
+// 10^9 and sets their own boundary, which is why hostChainFloor excludes them.
+// But using one to notice the local replica is BEHIND and refuse to act is
+// fail-closed in both directions: an attacker who inflates a head causes a
+// refusal, not a bad boundary, and a genuinely lagging replica stops instead of
+// pinning a permanent boundary below rows that were legitimately signed.
+//
+// It matters because the floor cannot help here. A host's heads are signed by its
+// own keys, so retiring the current one excludes the very heads that would prove
+// how far the chain has come — leaving the local tail as the only input, exactly
+// when it is the thing in doubt.
+func AuditReplicaIsBehind(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (int64, bool, error) {
+	heads, err := latestAuditHeadsByKey(ctx, c)
+	if err != nil {
+		return 0, false, err
+	}
+	local, err := HostTailSeq(ctx, c, hostName)
+	if err != nil {
+		return 0, false, err
+	}
+	var best int64
+	for _, h := range heads[hostName] {
+		if keyring != nil {
+			if err := keyring.VerifyHead(ctx, c, hostName, h.Epoch, h.Seq,
+				h.HeadHash, h.KeyID, h.Signature, h.CreatedAt); err != nil {
+				continue
+			}
+		}
+		if h.Seq > best {
+			best = h.Seq
+		}
+	}
+	return best, best > local, nil
+}

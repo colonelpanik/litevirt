@@ -190,7 +190,54 @@ func loadHostTail(ctx context.Context, c *Client, hostName string, tail *chainTa
 // HostTailSeq returns the highest sequence number hostName has issued, which is
 // the boundary a retirement is recorded at: everything up to here was written
 // under the key being retired.
+//
+// It re-reads the log rather than trusting the cached tail, because the cache is
+// a WRITE-path structure: it exists so an append can chain onto the previous row
+// without a query, and it advances only when THIS node appends. Nothing
+// invalidates it when replication delivers rows for another host. So the cached
+// tail for a remote host is a snapshot of whenever it was first asked for, and
+// every caller here is asking about a remote host at exactly the moment its
+// position matters.
+//
+// The lab caught this: node-1's cache said node-3's chain ended at 5, corrosion
+// then delivered 6, 7 and 8, and the cache still said 5 — so a retirement run
+// from node-1 kept computing a boundary three rows below reality, and kept doing
+// so after replication had caught up, because only a daemon restart could clear
+// it.
+//
+// max(fresh, cached) rather than the fresh read alone. The two can only disagree
+// the other way inside InsertAuditLog, which advances the cache after its
+// Execute returns; taking the larger keeps the value monotone either way, and a
+// boundary must never move backwards.
 func HostTailSeq(ctx context.Context, c *Client, hostName string) (int64, error) {
+	fresh, err := freshHostTailSeq(ctx, c, hostName)
+	if err != nil {
+		return 0, err
+	}
+	cached, err := cachedHostTailSeq(ctx, c, hostName)
+	if err != nil {
+		return 0, err
+	}
+	if cached > fresh {
+		return cached, nil
+	}
+	return fresh, nil
+}
+
+// freshHostTailSeq reads hostName's highest issued sequence straight from the log.
+func freshHostTailSeq(ctx context.Context, c *Client, hostName string) (int64, error) {
+	rows, err := c.Query(ctx,
+		`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM audit_log WHERE host_name = ?`, hostName)
+	if err != nil {
+		return 0, fmt.Errorf("read audit seq for %s: %w", hostName, err)
+	}
+	if len(rows) != 1 {
+		return 0, nil
+	}
+	return rows[0].Int64("max_seq"), nil
+}
+
+func cachedHostTailSeq(ctx context.Context, c *Client, hostName string) (int64, error) {
 	c.auditChain.mu.Lock()
 	defer c.auditChain.mu.Unlock()
 	tail := c.auditChain.tail(hostName)

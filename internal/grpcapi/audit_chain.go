@@ -169,6 +169,25 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
+	// Refuse outright if this node's copy of the host's log is demonstrably
+	// behind. A retirement boundary is permanent — records are append-only and the
+	// earliest verified one stands — so pinning it from a lagging replica condemns
+	// rows the key legitimately signed, with no way to raise it again.
+	//
+	// The floor cannot catch this on its own: a host's heads are signed by its own
+	// keys, and retiring the current one excludes exactly the heads that would
+	// prove how far the chain has come. Reading them to REFUSE is safe where
+	// reading them to raise the boundary is not — an inflated head from a leaked
+	// key produces a refusal here, never a bad boundary.
+	if attested, behind, berr := corrosion.AuditReplicaIsBehind(ctx, s.db, verifier, host); berr != nil {
+		return nil, status.Errorf(codes.Internal, "%v", berr)
+	} else if behind {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this node's copy of %s's audit log ends at %d but a signed chain head attests to "+
+				"%d; retiring now would put %d legitimately signed rows past the boundary, "+
+				"permanently. Wait for replication to catch up, or run this from a node that "+
+				"is current", host, seq, attested, attested-seq)
+	}
 
 	// Phase 1: report what would be retired. The operator holds the CA, so they
 	// mint and sign; this node only ever verifies.

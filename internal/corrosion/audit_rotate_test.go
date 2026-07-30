@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -346,7 +347,7 @@ func TestRotation_StillRetiresAGenuinelySupersededKey(t *testing.T) {
 
 	if n := countRows(t, c,
 		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`); n != 1 {
-		t.Fatalf("a genuine rotation did not retire the key it superseded; the whole "+
+		t.Fatalf("a genuine rotation did not retire the key it superseded; the whole " +
 			"retired-key finding would never fire")
 	}
 }
@@ -494,5 +495,55 @@ func TestRotation_APreV47RetirementKeepsItsBoundary(t *testing.T) {
 		t.Fatalf("the pre-v47 boundary was re-derived as %q instead of 2\n"+
 			"every row the retired key signed between 2 and the current tail is silently "+
 			"legitimised — the exact window the rotation was performed to close", got)
+	}
+}
+
+// TestHostTailSeq_SeesRowsThatArrivedByReplication.
+//
+// The tail cache is a write-path structure: it advances when THIS node appends,
+// and nothing invalidates it when corrosion delivers rows written elsewhere. Every
+// boundary decision — adoption start, retirement boundary, the lagging-replica
+// refusal — asks for a REMOTE host's tail, so reading the cache means reading a
+// snapshot taken at some arbitrary earlier moment.
+//
+// The lab hit exactly this: node-1's cache said node-3 ended at 5, replication
+// delivered 6, 7 and 8, and the cache still said 5 until the daemon restarted.
+func TestHostTailSeq_SeesRowsThatArrivedByReplication(t *testing.T) {
+	ctx := context.Background()
+	c, _, _ := signedClient(t, "node-0")
+
+	// Ask about the peer first, which is what populates the cache — here with the
+	// honest answer that this node holds nothing of node-9's chain.
+	before, err := HostTailSeq(ctx, c, "node-9")
+	if err != nil {
+		t.Fatalf("HostTailSeq: %v", err)
+	}
+	if before != 0 {
+		t.Fatalf("this node should hold none of node-9's chain, got tail %d", before)
+	}
+
+	// Replication delivers three of node-9's rows. It does not go through
+	// InsertAuditLog, so the cache learns nothing.
+	for i, seq := range []int64{6, 7, 8} {
+		if err := c.Execute(ctx,
+			`INSERT INTO audit_log
+			   (id, timestamp, username, host_name, action, target, detail, result,
+			    prev_hash, content_hash, key_id, signature, seq)
+			 VALUES (?, ?, 'root', 'node-9', 'vm.start', 'vm1', '', 'ok', '', ?, '', '', ?)`,
+			fmt.Sprintf("replicated-%d", i),
+			fmt.Sprintf("2026-07-29T11:00:0%dZ", i),
+			fmt.Sprintf("hash%d", seq), seq); err != nil {
+			t.Fatalf("simulate replicated row: %v", err)
+		}
+	}
+
+	after, err := HostTailSeq(ctx, c, "node-9")
+	if err != nil {
+		t.Fatalf("HostTailSeq: %v", err)
+	}
+	if after != 8 {
+		t.Fatalf("node-9's tail reads %d after replication delivered rows 6, 7 and 8\n"+
+			"a retirement computed from this pins a permanent boundary %d rows below what "+
+			"the host legitimately signed", after, 8-after)
 	}
 }

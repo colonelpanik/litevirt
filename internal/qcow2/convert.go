@@ -240,24 +240,48 @@ func (img *chainImage) l2Table(offset, clusterSize uint64) ([]byte, error) {
 func openChain(src string) ([]*chainImage, error) {
 	var chain []*chainImage
 	path := src
+	seen := make(map[string]struct{})
 
 	for {
+		canonical, err := filepath.Abs(path)
+		if err != nil {
+			closeChain(chain)
+			return nil, fmt.Errorf("resolve backing path %s: %w", path, err)
+		}
+		canonical = filepath.Clean(canonical)
+		if _, ok := seen[canonical]; ok {
+			closeChain(chain)
+			return nil, fmt.Errorf("qcow2 backing chain cycle at %s", canonical)
+		}
+		if len(chain) >= 64 {
+			closeChain(chain)
+			return nil, fmt.Errorf("qcow2 backing chain exceeds maximum depth 64")
+		}
+		seen[canonical] = struct{}{}
+		path = canonical
+
 		f, err := os.Open(path)
 		if err != nil {
-			// Close already opened files.
-			for _, img := range chain {
-				img.f.Close()
-			}
+			closeChain(chain)
 			return nil, fmt.Errorf("open %s: %w", path, err)
 		}
 
 		h, err := readHeader(f)
 		if err != nil {
 			f.Close()
-			for _, img := range chain {
-				img.f.Close()
-			}
+			closeChain(chain)
 			return nil, fmt.Errorf("read header %s: %w", path, err)
+		}
+		st, err := f.Stat()
+		if err != nil {
+			f.Close()
+			closeChain(chain)
+			return nil, fmt.Errorf("stat %s: %w", path, err)
+		}
+		if err := validateHeaderRanges(h, st.Size()); err != nil {
+			f.Close()
+			closeChain(chain)
+			return nil, fmt.Errorf("validate header %s: %w", path, err)
 		}
 
 		img := &chainImage{f: f, h: h, l2cache: make(map[uint64][]byte)}
@@ -297,6 +321,12 @@ func openChain(src string) ([]*chainImage, error) {
 	}
 
 	return chain, nil
+}
+
+func closeChain(chain []*chainImage) {
+	for _, img := range chain {
+		_ = img.f.Close()
+	}
 }
 
 // readChainCluster reads a cluster from the backing chain, checking each layer

@@ -23,6 +23,11 @@ const (
 	// Header extension types.
 	ExtBackingFormat uint32 = 0xE2792ACA
 	ExtEndOfArea     uint32 = 0x00000000
+
+	// maxL1TableBytes bounds the only whole-table allocation in the native
+	// reader. At the minimum 512-byte cluster size this still addresses 256 GiB;
+	// normal 64 KiB images need only a tiny fraction of this limit.
+	maxL1TableBytes uint64 = 64 << 20
 )
 
 // Options allows callers to override format defaults.
@@ -122,8 +127,61 @@ func readHeader(r io.ReaderAt) (*Header, error) {
 	if h.Version < 2 || h.Version > 3 {
 		return nil, fmt.Errorf("unsupported qcow2 version %d", h.Version)
 	}
+	if h.ClusterBits < 9 || h.ClusterBits > 21 {
+		return nil, fmt.Errorf("invalid cluster_bits %d (must be 9..21)", h.ClusterBits)
+	}
+	clusterSize := h.ClusterSize()
+	if h.BackingFileSize > 0 {
+		end := h.BackingFileOffset + uint64(h.BackingFileSize)
+		if h.BackingFileOffset == 0 || end < h.BackingFileOffset || end > clusterSize {
+			return nil, fmt.Errorf("backing file path range [%d,%d) is outside the first cluster", h.BackingFileOffset, end)
+		}
+	}
+	if uint64(h.L1Size)*8 > maxL1TableBytes {
+		return nil, fmt.Errorf("L1 table size %d exceeds maximum %d", uint64(h.L1Size)*8, maxL1TableBytes)
+	}
+	if h.Size > 0 {
+		l2Coverage := clusterSize * (clusterSize / 8)
+		requiredL1 := h.Size / l2Coverage
+		if h.Size%l2Coverage != 0 {
+			requiredL1++
+		}
+		if requiredL1 > uint64(^uint32(0)) || uint64(h.L1Size) < requiredL1 {
+			return nil, fmt.Errorf("invalid l1_size %d for virtual size %d (need at least %d)", h.L1Size, h.Size, requiredL1)
+		}
+	}
 
 	return &h, nil
+}
+
+// validateHeaderRanges checks every header-controlled allocation/read used by
+// the native reader against the actual file. It must run before allocating an
+// L1 table or backing-file path.
+func validateHeaderRanges(h *Header, fileSize int64) error {
+	if fileSize < 0 {
+		return fmt.Errorf("invalid file size %d", fileSize)
+	}
+	checkRange := func(name string, off, size uint64) error {
+		end := off + size
+		if end < off || off > uint64(fileSize) || end > uint64(fileSize) {
+			return fmt.Errorf("%s range [%d,%d) exceeds file size %d", name, off, end, fileSize)
+		}
+		return nil
+	}
+	if h.BackingFileSize > 0 {
+		if err := checkRange("backing file path", h.BackingFileOffset, uint64(h.BackingFileSize)); err != nil {
+			return err
+		}
+	}
+	if h.L1Size > 0 {
+		if h.L1TableOffset == 0 {
+			return fmt.Errorf("l1_size is %d but l1_table_offset is zero", h.L1Size)
+		}
+		if err := checkRange("L1 table", h.L1TableOffset, uint64(h.L1Size)*8); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeHeader serialises the header to w at offset 0.

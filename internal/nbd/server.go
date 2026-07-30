@@ -192,6 +192,12 @@ const (
 // request's allocation so it can't OOM the daemon.
 const maxRequestLen int64 = 32 << 20
 
+// maxOptionLen bounds the attacker-controlled negotiation payload before it is
+// allocated. OPT_GO only carries an export name and a short list of info IDs;
+// 64 KiB leaves ample interoperability headroom without allowing a client to
+// make the daemon allocate gigabytes during an unauthenticated handshake.
+const maxOptionLen uint32 = 64 << 10
+
 func (s *Server) handleConn(conn net.Conn) error {
 	defer conn.Close()
 	if err := s.handshake(conn); err != nil {
@@ -233,6 +239,9 @@ func (s *Server) handshake(conn net.Conn) error {
 		}
 		if err := binary.Read(conn, binary.BigEndian, &dataLen); err != nil {
 			return err
+		}
+		if dataLen > maxOptionLen {
+			return fmt.Errorf("nbd: option payload length %d exceeds max %d", dataLen, maxOptionLen)
 		}
 		data := make([]byte, dataLen)
 		if _, err := io.ReadFull(conn, data); err != nil {

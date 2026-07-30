@@ -661,11 +661,28 @@ type auditEvidenceGuard func(tx *sql.Tx, table syncTable, row []interface{}, pkC
 // every use, so a swapped one is rejected where it is read rather than where it
 // arrives — and the retirement that used to live on it, the part that genuinely
 // needed protecting, is now its own signed table.
-var auditEvidenceGuards = map[string]auditEvidenceGuard{
-	"audit_log":           signedAuditRowIsImmutable,
-	"audit_chain_heads":   auditEvidenceIsImmutable,
-	"audit_key_lifecycle": auditEvidenceIsImmutable,
+var auditEvidenceGuards = map[string]mergeFloor{
+	"audit_log":           {signedAuditRowIsImmutable, auditDivergenceAdvice},
+	"audit_chain_heads":   {auditEvidenceIsImmutable, auditDivergenceAdvice},
+	"audit_key_lifecycle": {auditEvidenceIsImmutable, auditDivergenceAdvice},
+	// The cluster CRL gets the same floor for the same reason. Its rows are keyed
+	// by CRL number and every one of them is CA-signed, so a differing body for a
+	// number this node already holds is a forgery attempt — and taking it would
+	// replace a genuine revocation with whatever the sender preferred.
+	"cluster_crl": {auditEvidenceIsImmutable,
+		"A revocation cannot be rewritten — one of the two nodes is presenting a CRL it was not given"},
 }
+
+// mergeFloor pairs the refusal rule for one table with what an operator should do
+// about it. The rule is the same shape for every table; the advice is not, and
+// telling an operator to run `lv audit verify` over a certificate revocation would
+// send them looking in the wrong place.
+type mergeFloor struct {
+	refuse auditEvidenceGuard
+	advice string
+}
+
+const auditDivergenceAdvice = "One of the two nodes has been altered — run `lv audit verify` on both"
 
 // signedAuditRowIsImmutable reports whether an incoming anti-entropy copy of an
 // audit row must be refused because the LOCAL row is signed and differs.

@@ -36,6 +36,13 @@ message FenceHostRequest   {
     bool confirm_manual_only = 3;
 }
 message RemoveHostRequest  { string name = 1; bool force = 2; }
+message PublishCRLRequest  { string crl_pem = 1; }
+// version is the published CRL's number, echoed back because the daemon has
+// verified it by then and the caller has not. Whether the answering node had to
+// install it is deliberately absent: `lv host rm` usually runs on a box that
+// shares a pki directory with its daemon, so that answer would be "no" in the
+// ordinary case and mean nothing about the cluster.
+message PublishCRLResponse { int64 version = 1; }
 message FenceResult        { string host_name = 1; string method = 2;
     string result = 3; string detail = 4; }
 message HostHealthMatrix   { repeated HostHealthEntry entries = 1; }
@@ -1775,6 +1782,16 @@ service LiteVirt {
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetHostHealth(google.protobuf.Empty)   returns (HostHealthMatrix);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
+    // PublishCRL hands the cluster a CA-signed certificate revocation list, which
+    // replication then carries to every node. `lv host rm` calls it after revoking
+    // the removed host's certificate — revocation needs the CA private key, which
+    // lives with the operator, so the CRL is minted there and published here.
+    //
+    // The daemon verifies it against the cluster CA before storing it. That check
+    // is not a formality: the list is what decides whether a certificate still
+    // opens a peer connection, and an unverified one would let a caller un-revoke
+    // themselves by publishing a CRL that simply omits their serial.
+    rpc PublishCRL(PublishCRLRequest)          returns (PublishCRLResponse);
     rpc RescanHost(RescanHostRequest)          returns (RescanHostResponse);
     rpc ListHostDevices(ListHostDevicesRequest) returns (ListHostDevicesResponse);
     rpc UpgradeHost(stream UpgradeHostRequest) returns (UpgradeHostResponse);

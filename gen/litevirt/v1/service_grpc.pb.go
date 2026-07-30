@@ -29,6 +29,7 @@ const (
 	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
 	LiteVirt_GetHostHealth_FullMethodName              = "/litevirt.v1.LiteVirt/GetHostHealth"
 	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
+	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
 	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
 	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
 	LiteVirt_UpgradeHost_FullMethodName                = "/litevirt.v1.LiteVirt/UpgradeHost"
@@ -262,6 +263,16 @@ type LiteVirtClient interface {
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
 	GetHostHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HostHealthMatrix, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
+	// replication then carries to every node. `lv host rm` calls it after revoking
+	// the removed host's certificate — revocation needs the CA private key, which
+	// lives with the operator, so the CRL is minted there and published here.
+	//
+	// The daemon verifies it against the cluster CA before storing it. That check
+	// is not a formality: the list is what decides whether a certificate still
+	// opens a peer connection, and an unverified one would let a caller un-revoke
+	// themselves by publishing a CRL that simply omits their serial.
+	PublishCRL(ctx context.Context, in *PublishCRLRequest, opts ...grpc.CallOption) (*PublishCRLResponse, error)
 	RescanHost(ctx context.Context, in *RescanHostRequest, opts ...grpc.CallOption) (*RescanHostResponse, error)
 	ListHostDevices(ctx context.Context, in *ListHostDevicesRequest, opts ...grpc.CallOption) (*ListHostDevicesResponse, error)
 	UpgradeHost(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpgradeHostRequest, UpgradeHostResponse], error)
@@ -719,6 +730,16 @@ func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_RemoveHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PublishCRL(ctx context.Context, in *PublishCRLRequest, opts ...grpc.CallOption) (*PublishCRLResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishCRLResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PublishCRL_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3137,6 +3158,16 @@ type LiteVirtServer interface {
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
 	GetHostHealth(context.Context, *emptypb.Empty) (*HostHealthMatrix, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
+	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
+	// replication then carries to every node. `lv host rm` calls it after revoking
+	// the removed host's certificate — revocation needs the CA private key, which
+	// lives with the operator, so the CRL is minted there and published here.
+	//
+	// The daemon verifies it against the cluster CA before storing it. That check
+	// is not a formality: the list is what decides whether a certificate still
+	// opens a peer connection, and an unverified one would let a caller un-revoke
+	// themselves by publishing a CRL that simply omits their serial.
+	PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error)
 	RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error)
 	ListHostDevices(context.Context, *ListHostDevicesRequest) (*ListHostDevicesResponse, error)
 	UpgradeHost(grpc.ClientStreamingServer[UpgradeHostRequest, UpgradeHostResponse]) error
@@ -3518,6 +3549,9 @@ func (UnimplementedLiteVirtServer) GetHostHealth(context.Context, *emptypb.Empty
 }
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
+}
+func (UnimplementedLiteVirtServer) PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishCRL not implemented")
 }
 func (UnimplementedLiteVirtServer) RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RescanHost not implemented")
@@ -4335,6 +4369,24 @@ func _LiteVirt_RemoveHost_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RemoveHost(ctx, req.(*RemoveHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PublishCRL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PublishCRLRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PublishCRL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PublishCRL_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PublishCRL(ctx, req.(*PublishCRLRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8015,6 +8067,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveHost",
 			Handler:    _LiteVirt_RemoveHost_Handler,
+		},
+		{
+			MethodName: "PublishCRL",
+			Handler:    _LiteVirt_PublishCRL_Handler,
 		},
 		{
 			MethodName: "RescanHost",

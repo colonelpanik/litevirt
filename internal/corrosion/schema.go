@@ -277,7 +277,16 @@ import (
 //	     because the certificate alone cannot say WHEN a host committed —
 //	     without that, publishing one retroactively puts a cluster's entire
 //	     history under the contract. One new table.
-const CurrentSchemaVersion = 46
+//
+//	v47: cluster_crl — the CA-signed certificate revocation list, replicated so a
+//	     revocation reaches every node the way every other cluster fact does.
+//	     Previously nothing wrote a CRL at all, and removing a host was enforced
+//	     solely by the tombstone on its `hosts` row; a node that never received
+//	     that tombstone went on accepting the removed host's certificate. Safe to
+//	     replicate in the clear because a CRL is signed by the cluster CA — a peer
+//	     can write the row but cannot forge one that verifies, and every reader
+//	     checks the signature before installing it. One new table.
+const CurrentSchemaVersion = 47
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -682,6 +691,48 @@ var schemaDDL = []string{
 		host         TEXT PRIMARY KEY,
 		version      INTEGER NOT NULL,
 		updated_at   TEXT NOT NULL
+	)`,
+
+	// The cluster CRL itself (v47), replicated so a revocation reaches every node
+	// the way every other cluster fact does. crl_versions above only REPORTS what
+	// each host has; this is the thing it was reporting on, and until now nothing
+	// carried it — an operator copied crl.pem between machines by hand.
+	//
+	// Distribution over SSH was considered and rejected. SSH is the BOOTSTRAP
+	// channel — host init, host add, rotate-audit-key — used when a node is not yet
+	// a cluster member and there is no authenticated path to it. A revocation goes
+	// to nodes that are already mutually authenticated peers with a replicated store
+	// built for exactly this, and an SSH fan-out is best-effort with a list of hosts
+	// it failed to reach, where replication converges and crl_versions already
+	// reports whether it has.
+	//
+	// Safe to replicate because the CRL is CA-SIGNED and therefore self-authenticating:
+	// a peer can write this row, but cannot produce a CRL that verifies against the
+	// cluster CA, and every reader checks the signature before installing it. That is
+	// the same reason audit signing certificates are replicated in the clear.
+	//
+	// APPEND-ONLY, and keyed by the SHA-256 of the CRL itself.
+	//
+	// Every other choice of key was tried and each one handed a hostile peer a way
+	// to stop a revocation. A singleton row is overwritable. A row keyed by CRL
+	// NUMBER is squattable, because the number is a wall-clock second and therefore
+	// predictable: insert rows for the next hour's worth of numbers and the genuine
+	// INSERT loses to INSERT OR IGNORE on every peer. Keying on the content hash
+	// removes the choice from the writer entirely — occupying the genuine row's key
+	// means producing its exact bytes, signature included.
+	//
+	// There is deliberately NO version column. The number that orders one CRL
+	// against another lives inside the signed PEM, where the CA covers it; a column
+	// beside it is written by whoever inserted the row and covered by nothing, and a
+	// reader that trusts it can be pinned to an old CRL forever. Readers parse and
+	// verify every row and take the highest number they can VERIFY, so a hostile row
+	// costs one signature check and nothing else.
+	`CREATE TABLE IF NOT EXISTS cluster_crl (
+		id           TEXT PRIMARY KEY,
+		crl_pem      TEXT NOT NULL,
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT
 	)`,
 
 	// Local schema version pin. NOT CRDT-replicated — each host's row
@@ -1895,6 +1946,7 @@ var tablePrimaryKeys = map[string][]string{
 	"host_runtime_usage":       {"host_name"},
 	"clock_skew":               {"observer", "target"},
 	"crl_versions":             {"host"},
+	"cluster_crl":              {"id"},
 	"leader_election":          {"key"},
 	"vm_locks":                 {"vm_name"},
 	"runtime_action_proofs":    {"id"},
@@ -2279,6 +2331,7 @@ var createTableUnits = []struct {
 	{42, "vm_nics"}, {42, "vm_pci_intent"}, {42, "vm_pci_realizations"},
 	{45, "audit_signing_keys"}, {45, "audit_chain_heads"},
 	{46, "audit_key_lifecycle"},
+	{47, "cluster_crl"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

@@ -443,6 +443,9 @@ var capabilityMap = map[string]tableResolver{
 	"audit_signing_keys":  {category: "content", chain: contentDefaultChain()},
 	"audit_chain_heads":   {category: "content", chain: contentDefaultChain()},
 	"audit_key_lifecycle": {category: "content", chain: contentDefaultChain()},
+	// v47 cluster CRL. Same shape: append-only, keyed by a number the CA signed
+	// over, so two rows for one number can only disagree if one is forged.
+	"cluster_crl": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

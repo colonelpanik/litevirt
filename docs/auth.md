@@ -309,10 +309,24 @@ error cannot rule out a removal.
 certificate serial to the cluster CRL, so removal does not rest solely on the
 tombstone reaching every node. It needs the CA private key, so run it from the
 machine that ran `lv host init`; if it cannot, the command says so rather than
-skipping revocation silently. Copy the updated `crl.pem` to
-`/etc/litevirt/pki/crl.pem` on the remaining hosts — each daemon reloads it when
-the file changes, and the health check warns for as long as any peer's CRL version
+skipping revocation silently.
+
+The CRL is then **replicated**, not copied around by hand. `lv host rm` publishes
+it to the cluster, every node installs it within about half a minute, and each
+daemon reloads `crl.pem` when the file changes. Two things make that safe to send
+over a channel any peer can write to: a CRL is signed by the cluster CA, and every
+node verifies that signature against its own `ca.crt` before the file is touched —
+so a host publishing a CRL that omits its own serial is refused rather than
+believed. Nodes install only a CRL numbered above the one they hold, and the table
+is append-only and keyed by that number, so an unsignable row cannot displace or
+bury a genuine one. `lv health` warns for as long as any peer's CRL version
 is behind another's.
+
+Distribution deliberately does **not** go over SSH. SSH is the bootstrap channel —
+`host init`, `host add`, `rotate-audit-key` — for reaching a machine that is not
+yet a cluster member. A revocation goes to nodes that are already mutually
+authenticated peers with a replicated store built for exactly this, where an SSH
+fan-out would be best-effort with a list of hosts it failed to reach.
 
 **Threat model.** The daemon runs as root against the local libvirt socket and a
 replicated state DB, so root on a node is already full local + cluster power —

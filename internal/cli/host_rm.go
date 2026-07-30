@@ -29,7 +29,12 @@ import (
 // The CRL is that second mechanism and every piece of it already existed —
 // pki.AppendToCRL, a crl.pem each daemon re-reads when its mtime changes, and a
 // health check that publishes every node's CRL version and warns on a mismatch.
-// Nothing called them.
+// Nothing called them, and nothing carried the CRL between nodes.
+//
+// It is carried by replication now, like every other cluster fact. Minting it
+// still happens here because it has to: revoking a certificate means signing with
+// the cluster CA's private key, which lives with the operator and never on a
+// daemon. So this command produces the CRL and PublishCRL hands it to the cluster.
 func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force bool) error {
 	// Read the serial BEFORE the removal: afterwards the row is tombstoned and
 	// ListHosts no longer returns it.
@@ -54,11 +59,35 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	if serial == "" || serial == "unknown" {
 		return nil
 	}
-	fmt.Printf("  revoked certificate %s in %s\n", serial, filepath.Join(PKIDir(), "crl.pem"))
-	fmt.Println("  copy that crl.pem to /etc/litevirt/pki/crl.pem on the remaining hosts —")
-	fmt.Println("  each daemon reloads it when the file changes, and the health check warns")
-	fmt.Println("  for as long as any peer's CRL version is behind another's")
+	fmt.Printf("  revoked certificate %s\n", serial)
+
+	// Publishing is reported separately from revoking. They fail for unrelated
+	// reasons — one needs the CA key, the other needs the cluster — and an operator
+	// who is told "revoked" when only half of that happened will not go looking.
+	version, err := publishClusterCRL(ctx, c, PKIDir())
+	if err != nil {
+		fmt.Printf("  WARNING: the revocation was NOT published to the cluster: %v\n", err)
+		fmt.Printf("  %s is correct on this machine and nowhere else. Re-run `lv host rm %s`\n",
+			filepath.Join(PKIDir(), "crl.pem"), hostName)
+		fmt.Println("  once the cluster is reachable — revoking an already-revoked serial is a no-op")
+		return nil
+	}
+	fmt.Printf("  published CRL %d to the cluster; each daemon installs it within a minute\n", version)
+	fmt.Println("  `lv health` warns for as long as any peer's CRL version is behind another's")
 	return nil
+}
+
+// publishClusterCRL hands the freshly-minted CRL to the cluster to replicate.
+func publishClusterCRL(ctx context.Context, c pb.LiteVirtClient, pkiDir string) (int64, error) {
+	crlPEM, err := os.ReadFile(filepath.Join(pkiDir, "crl.pem"))
+	if err != nil {
+		return 0, fmt.Errorf("read the CRL just written: %w", err)
+	}
+	resp, err := c.PublishCRL(ctx, &pb.PublishCRLRequest{CrlPem: string(crlPEM)})
+	if err != nil {
+		return 0, err
+	}
+	return resp.Version, nil
 }
 
 // hostCertSerial reads a host's certificate serial, best-effort: a removal must not

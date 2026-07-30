@@ -19,6 +19,11 @@ var appendOnlyTables = map[string]bool{
 	// deleted locally has nothing to conflict with, so anti-entropy re-inserts
 	// it from a peer without any bespoke merge rule.
 	"audit_key_lifecycle": true,
+	// A CRL is a CA-signed assertion about a fixed revision number, so the row for
+	// a given number has no later revision either. Append-only is what makes the
+	// table safe to let any peer write to: a hostile row can only ever be a NEW
+	// number, never a rewrite of the one carrying the revocation a reader wants.
+	"cluster_crl": true,
 }
 
 // deriveDisposition classifies a parsed replicated statement into the disposition the apply

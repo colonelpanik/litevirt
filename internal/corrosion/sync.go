@@ -256,6 +256,9 @@ var tableNames = []string{
 	// operator-visible dump precisely so a peer — or a human with a state
 	// dump — can check a host's chain without that host's cooperation.
 	"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
+	// v47 cluster CRL — a revocation list is published to be read, and a node that
+	// missed the replicated write is exactly the node that must repair from a peer.
+	"cluster_crl",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS
@@ -820,20 +823,19 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// row deleted locally has nothing to conflict with and anti-entropy simply
 		// re-inserts it; and a tombstone is inert because the verifier does not
 		// filter on deleted_at at all.
-		if guard := auditEvidenceGuards[table.Name]; guard != nil {
-			keepLocal, reason, kErr := guard(tx, table, row, pkCols, pkIdx)
+		if floor, ok := auditEvidenceGuards[table.Name]; ok {
+			keepLocal, reason, kErr := floor.refuse(tx, table, row, pkCols, pkIdx)
 			if kErr != nil {
 				_ = tx.Rollback()
 				return merged, skipped, kErr
 			}
 			if keepLocal {
 				skipped++
-				pk, tbl := pkKeyAt(row, pkIdx), table.Name
+				pk, tbl, advice := pkKeyAt(row, pkIdx), table.Name, floor.advice
 				c.deferAfterCommit(tx, func() {
 					c.observeMergeRejected(boundedTableLabel(tbl), "ae", reason)
-					slog.Warn("anti-entropy: refused a peer's copy of audit tamper-evidence; keeping "+
-						"local. One of the two nodes has been altered — run `lv audit verify` on both",
-						"table", tbl, "pk", pk, "reason", reason)
+					slog.Warn("anti-entropy: refused a peer's copy of an immutable signed row; keeping "+
+						"local. "+advice, "table", tbl, "pk", pk, "reason", reason)
 				})
 				continue
 			}

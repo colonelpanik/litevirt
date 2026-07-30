@@ -641,6 +641,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// apply synchronously via reload/delta in the handlers).
 	go d.runAuthEngineReload(ctx)
 
+	// Install any cluster CRL this node is missing. Removing a host revokes its
+	// certificate, and a revocation that never arrives is a decommissioned node
+	// still holding a working peer credential.
+	go d.runCRLSync(ctx)
+
 	// Publish this host's signed audit chain head periodically and at shutdown.
 	// Nothing else can detect a truncated tail: the hash chain links backward,
 	// so removing the last N rows leaves every surviving link verifying.

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 )
 
@@ -263,26 +262,22 @@ import (
 //	     audit_chain_heads (append-only signed heads, which is the only way to
 //	     detect truncation — a hash chain links backward and cannot notice that
 //	     its own tail was removed). Three additive columns, two new tables.
-//	v46: audit signing key rotation — audit_signing_keys gains retired_at and
-//	     retired_at_seq, the sequence number past which a key must no longer
-//	     appear. Retirement is a validity WINDOW, never a deletion: the
+//	v46: audit signing key rotation — audit_key_lifecycle, an append-only table
+//	     of SIGNED 'adopted' and 'retired' events bounding each key's signing
+//	     contract. Retirement is a validity WINDOW, never a deletion: the
 //	     certificate has to stay resolvable for as long as any row it signed
 //	     exists, or rotating a key would make the history it signed
-//	     unverifiable. Two additive columns.
-//	v47: audit_key_lifecycle — a key's signing contract moves out of the mutable columns
-//	     v46 put on audit_signing_keys and into its own append-only table,
-//	     carrying a SIGNATURE. Those columns were plain replicated data any peer
-//	     could write, so a forged retirement replicated cluster-wide and could
-//	     not be walked back, and clearing a real one locally was equally cheap.
-//	     A retirement is now an assertion somebody had to sign: by the retired
-//	     key itself (a voluntary stop), by a successor key of the same host (a
-//	     rotation), or by the cluster CA (a host that can no longer speak for
-//	     itself). Append-only means deleting one locally is repaired by ordinary
-//	     anti-entropy rather than needing a bespoke merge rule. Adoption is
-//	     recorded the same way, because the certificate alone cannot say WHEN a
-//	     host committed — without that, publishing one retroactively puts a
-//	     cluster's entire history under the contract. One new table.
-const CurrentSchemaVersion = 47
+//	     unverifiable. It carries a signature because the detector for "somebody
+//	     else has this key" cannot itself be something somebody else can write —
+//	     a retirement is an assertion by the retired key itself (a voluntary
+//	     stop), by a successor key of the same host (a rotation), or by the
+//	     cluster CA (a host that can no longer speak for itself). Append-only
+//	     means deleting one locally is repaired by ordinary anti-entropy rather
+//	     than needing a bespoke merge rule. Adoption is recorded the same way,
+//	     because the certificate alone cannot say WHEN a host committed —
+//	     without that, publishing one retroactively puts a cluster's entire
+//	     history under the contract. One new table.
+const CurrentSchemaVersion = 46
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -319,12 +314,6 @@ func InitSchema(ctx context.Context, c *Client) error {
 		if err := c.execLocal(ctx, ddl); err != nil {
 			return fmt.Errorf("schema init: %w", err)
 		}
-	}
-
-	// CREATE TABLE IF NOT EXISTS cannot change a table that already exists, so a
-	// primary key that had to be widened needs an explicit rebuild.
-	if err := repairAuditKeyLifecyclePK(ctx, c); err != nil {
-		return fmt.Errorf("schema init: %w", err)
 	}
 
 	// The ledger meta-table itself.
@@ -606,46 +595,6 @@ func containsFold(s, sub string) bool {
 	}
 	return false
 }
-
-// auditKeyLifecycleDDL is named so the primary-key repair in
-// repairAuditKeyLifecyclePK creates exactly the table schemaDDL does.
-const auditKeyLifecycleDDL = `CREATE TABLE IF NOT EXISTS audit_key_lifecycle (
-		host_name  TEXT NOT NULL,
-		key_id     TEXT NOT NULL,
-		-- 'adopted' or 'retired'. A key's signing contract runs between them.
-		--
-		-- Adoption is signed for the same reason retirement is, and it answers a
-		-- question the certificate alone cannot: WHEN the host committed. Without
-		-- it, publishing a certificate retroactively puts every row the host ever
-		-- wrote under the contract, so the first verify after enabling signing
-		-- reports a cluster's entire history as tampering.
-		event      TEXT NOT NULL,
-		-- For 'adopted', the sequence the chain had reached when the key took
-		-- effect: rows at or below it predate the commitment. For 'retired', the
-		-- last sequence the key was entitled to sign; a row from it above this is
-		-- a finding.
-		at_seq     INTEGER NOT NULL DEFAULT 0,
-		-- Who asserted it. The signature is checked against this key's published
-		-- certificate, which must chain to the cluster CA and name the host.
-		by_key_id  TEXT NOT NULL DEFAULT '',
-		signature  TEXT NOT NULL DEFAULT '',
-		created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL,
-		deleted_at TEXT,
-		-- by_key_id is IN the primary key, and that is what makes the slot
-		-- unsquattable. With (host, key, event) alone the table was first-write-
-		-- wins on data any peer can write: an attacker inserting an unverifiable
-		-- 'adopted' row got it ignored by the reader AND blocked the host from
-		-- ever recording its real one, so every pre-enforcement row that host
-		-- wrote became evidence, permanently. Keying by the signer puts a forged
-		-- row in a different slot from the genuine one; squatting would require
-		-- forging under the host's own key.
-		--
-		-- Several VERIFIED records per (host, key, event) are expected and
-		-- correct: a rotation and an operator retire-audit-key run both retire
-		-- the same key with different signers. The reader keeps the strictest.
-		PRIMARY KEY (host_name, key_id, event, by_key_id)
-	)`
 
 var schemaDDL = []string{
 	// ═══════════ CLUSTER ═══════════
@@ -1351,13 +1300,6 @@ var schemaDDL = []string{
 		key_id     TEXT PRIMARY KEY,
 		host_name  TEXT NOT NULL,
 		cert_pem   TEXT NOT NULL,
-		-- SUPERSEDED at v47 by audit_key_retirements. Retained so an upgrade is
-		-- additive, but nothing reads them: as plain replicated columns they were
-		-- writable by any peer, so a forged retirement spread cluster-wide and a
-		-- real one could be cleared just as cheaply. A retirement now has to be
-		-- signed. Do not reintroduce reads of these.
-		retired_at     TEXT,
-		retired_at_seq INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT
@@ -1389,7 +1331,7 @@ var schemaDDL = []string{
 		PRIMARY KEY (host_name, epoch, seq)
 	)`,
 
-	// Signed audit key retirements (v47). "Host H's key K signed nothing valid
+	// Signed audit key retirements (v46). "Host H's key K signed nothing valid
 	// past sequence N, and here is a signature saying so."
 	//
 	// v46 kept this as two mutable columns on audit_signing_keys, which was the
@@ -1408,8 +1350,43 @@ var schemaDDL = []string{
 	// APPEND-ONLY, and that is what makes it self-repairing: a row deleted
 	// locally has no local copy to conflict with, so ordinary anti-entropy
 	// re-inserts it from any peer. No bespoke merge rule, and no force-apply.
-	auditKeyLifecycleDDL,
-
+	`CREATE TABLE IF NOT EXISTS audit_key_lifecycle (
+		host_name  TEXT NOT NULL,
+		key_id     TEXT NOT NULL,
+		-- 'adopted' or 'retired'. A key's signing contract runs between them.
+		--
+		-- Adoption is signed for the same reason retirement is, and it answers a
+		-- question the certificate alone cannot: WHEN the host committed. Without
+		-- it, publishing a certificate retroactively puts every row the host ever
+		-- wrote under the contract, so the first verify after enabling signing
+		-- reports a cluster's entire history as tampering.
+		event      TEXT NOT NULL,
+		-- For 'adopted', the sequence the chain had reached when the key took
+		-- effect: rows at or below it predate the commitment. For 'retired', the
+		-- last sequence the key was entitled to sign; a row from it above this is
+		-- a finding.
+		at_seq     INTEGER NOT NULL DEFAULT 0,
+		-- Who asserted it. The signature is checked against this key's published
+		-- certificate, which must chain to the cluster CA and name the host.
+		by_key_id  TEXT NOT NULL DEFAULT '',
+		signature  TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
+		-- by_key_id is IN the primary key, and that is what makes the slot
+		-- unsquattable. With (host, key, event) alone the table was first-write-
+		-- wins on data any peer can write: an attacker inserting an unverifiable
+		-- 'adopted' row got it ignored by the reader AND blocked the host from
+		-- ever recording its real one, so every pre-enforcement row that host
+		-- wrote became evidence, permanently. Keying by the signer puts a forged
+		-- row in a different slot from the genuine one; squatting would require
+		-- forging under the host's own key.
+		--
+		-- Several VERIFIED records per (host, key, event) are expected and
+		-- correct: a rotation and an operator retire-audit-key run both retire
+		-- the same key with different signers. The reader keeps the strictest.
+		PRIMARY KEY (host_name, key_id, event, by_key_id)
+	)`,
 
 	// Per-VM operational event store (v13). Durable, CRDT-replicated,
 	// append-only, and PRUNABLE — distinct from the tamper-evident
@@ -2195,9 +2172,6 @@ var schemaMigrations = []string{
 	`ALTER TABLE audit_log ADD COLUMN key_id TEXT`,
 	`ALTER TABLE audit_log ADD COLUMN signature TEXT`,
 	`ALTER TABLE audit_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
-	// v46: audit signing key rotation (see History v46).
-	`ALTER TABLE audit_signing_keys ADD COLUMN retired_at TEXT`,
-	`ALTER TABLE audit_signing_keys ADD COLUMN retired_at_seq INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2280,7 +2254,6 @@ var alterVersions = []int{
 	44,     // hosts.capacity_policy_hash
 	44, 44, // notification_routes.subject_pattern/project
 	45, 45, 45, // audit_log.key_id/signature/seq
-	46, 46, // audit_signing_keys.retired_at/retired_at_seq
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2304,7 +2277,7 @@ var createTableUnits = []struct {
 	{41, "operations"}, {41, "operation_steps"}, {41, "project_authority_epochs"},
 	{42, "vm_nics"}, {42, "vm_pci_intent"}, {42, "vm_pci_realizations"},
 	{45, "audit_signing_keys"}, {45, "audit_chain_heads"},
-	{47, "audit_key_lifecycle"},
+	{46, "audit_key_lifecycle"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn
@@ -2338,51 +2311,4 @@ func init() {
 			Target:  ct.table,
 		})
 	}
-}
-
-
-// repairAuditKeyLifecyclePK widens audit_key_lifecycle's primary key to include
-// by_key_id on a database that already has the narrower one.
-//
-// The narrow key — (host_name, key_id, event) — made the table first-write-wins
-// on data any peer can write: an unverifiable row placed in the slot was ignored
-// by every reader AND blocked the host from ever recording the genuine record, so
-// a host's entire pre-enforcement history became evidence, permanently.
-//
-// Widening the CREATE statement fixes new databases and does nothing for existing
-// ones, because CREATE TABLE IF NOT EXISTS is a no-op when the table is there.
-// This is the reason no released version is affected — v45, v46 and v47 all ship
-// together, so no shipped cluster ever saw the narrow shape — but any cluster
-// already running this branch has it, and there the vulnerability is live. Found
-// exactly that way: the lab still refused the second row with a UNIQUE constraint
-// error after the fix had supposedly shipped.
-//
-// Data is preserved. A row that only existed because it squatted the slot is
-// still ignored by the reader on its own merits, so copying it across changes
-// nothing.
-func repairAuditKeyLifecyclePK(ctx context.Context, c *Client) error {
-	rows, err := c.Query(ctx,
-		`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_key_lifecycle'`)
-	if err != nil || len(rows) == 0 {
-		return err // absent on a fresh database; schemaDDL has just created it correctly
-	}
-	if strings.Contains(rows[0].String("sql"), "by_key_id)") {
-		return nil // already wide
-	}
-	slog.Warn("rebuilding audit_key_lifecycle to widen its primary key; the narrow key let an " +
-		"unverifiable row block a genuine adoption or retirement permanently")
-	for _, stmt := range []string{
-		`ALTER TABLE audit_key_lifecycle RENAME TO audit_key_lifecycle_narrow`,
-		auditKeyLifecycleDDL,
-		`INSERT OR IGNORE INTO audit_key_lifecycle
-		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
-		 SELECT host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at
-		 FROM audit_key_lifecycle_narrow`,
-		`DROP TABLE audit_key_lifecycle_narrow`,
-	} {
-		if err := c.execLocal(ctx, stmt); err != nil {
-			return fmt.Errorf("rebuild audit_key_lifecycle: %w", err)
-		}
-	}
-	return nil
 }

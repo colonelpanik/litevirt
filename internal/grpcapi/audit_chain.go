@@ -182,11 +182,25 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	if attested, behind, berr := corrosion.AuditReplicaIsBehind(ctx, s.db, verifier, host); berr != nil {
 		return nil, status.Errorf(codes.Internal, "%v", berr)
 	} else if behind {
+		// Naming rotate-audit-key matters. This check counts heads signed by the key
+		// being retired — that is deliberate, since a host's heads are signed by its
+		// own keys and excluding them is what let a lagging replica pin a boundary
+		// three rows low on the lab. The cost is that whoever holds a leaked key can
+		// publish one head at an absurd sequence and make this refuse on every node
+		// forever: heads are append-only, tombstones are inert, and the anti-entropy
+		// guard refuses rewrites, so the poison cannot be cleared. Rotation is not
+		// blocked — AdoptAuditKey floors with the suspect key excluded — so an
+		// operator locked out of retirement still has a way to seal the old key's
+		// history and move signing to a new one.
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"this node's copy of %s's audit log ends at %d but a signed chain head attests to "+
 				"%d; retiring now would put %d legitimately signed rows past the boundary, "+
-				"permanently. Wait for replication to catch up, or run this from a node that "+
-				"is current", host, seq, attested, attested-seq)
+				"permanently. Wait for replication to catch up, or run this from a node that is "+
+				"current. If no node is ever current — a head signed by the key you are retiring "+
+				"can claim any sequence at all, and cannot be withdrawn — then that head is the "+
+				"problem and retirement cannot get past it: run `lv host rotate-audit-key %s` "+
+				"instead, which seals what the old key wrote without needing this boundary",
+			host, seq, attested, attested-seq, host)
 	}
 
 	// Phase 1: report what would be retired. The operator holds the CA, so they

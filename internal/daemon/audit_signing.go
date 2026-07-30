@@ -110,7 +110,18 @@ func (d *Daemon) finishAuditKeyLifecycle(ctx context.Context) {
 		return
 	case <-time.After(auditLifecycleSettle):
 	}
+	d.recordAuditKeyLifecycle(ctx)
+}
 
+// recordAuditKeyLifecycle is finishAuditKeyLifecycle without the settle wait.
+//
+// Split so tests drive the REAL branching instead of a copy of it. They used to
+// call a test-only reimplementation, and a mutation proved what that costs:
+// deleting the `if !rotated` guard below — reintroducing the bug where rotating a
+// default-configured host retired the key the rotation had just adopted — left
+// both the daemon and fleet suites green, because the guard the tests exercised
+// was the duplicate.
+func (d *Daemon) recordAuditKeyLifecycle(ctx context.Context) {
 	if d.cfg.Enforcement.AuditSignature {
 		keyring := d.db.AuditKeyringOf()
 		if !keyring.CanSign() {

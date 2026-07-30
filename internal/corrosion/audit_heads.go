@@ -7,8 +7,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // Signed audit chain heads.
@@ -256,23 +254,12 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 				}
 			}
 
-			// A head whose created_at the signature does NOT cover (a v1 head, or
-			// one whose column was edited) gets the conservative reading: treated
-			// as settled, so a shortfall is reported. That is the only safe
-			// direction — the alternative silently switches truncation detection
-			// off for exactly the heads someone tampered with.
 			// A node with NO keyring has verified nothing about this head — not its
 			// signature, not its timestamp. Treating that as "settled" made such a
 			// node report every peer as truncated during ordinary replication lag
 			// while every other node called the same log clean, which is the one
 			// outcome this design cannot tolerate. It reports nothing instead.
-			//
-			// A node that DOES hold a keyring but finds the timestamp outside the
-			// signature (a v1 head) still treats it as settled: there the fail-loud
-			// reading is right, because an unverifiable clock must not be able to
-			// suppress a truncation finding.
-			trusted := keyring.HeadTimestampIsSigned(ctx, c, host, h.Epoch, h.Seq, h.HeadHash, h.KeyID, h.Signature, h.CreatedAt)
-			if h.Seq > attestedSeq && headHasSettled(h, keyring != nil, trusted) {
+			if h.Seq > attestedSeq && headHasSettled(h, keyring != nil) {
 				attestedSeq = h.Seq
 			}
 		}
@@ -293,29 +280,24 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 // moment hlc_lww latches, and reading an HLC value as wall time skipped the
 // window entirely — turning every freshly published head into a truncation
 // report on any peer that had not yet received the rows behind it, which is the
-// ordinary eventually-consistent case the window exists for. Both formats are
-// read, because heads already written with an HLC created_at are on disk.
+// ordinary eventually-consistent case the window exists for.
 //
-// haveKeyring says whether this node can verify anything at all; trusted says
-// whether the signature covers created_at. With no keyring the head asserts
-// nothing here — a node that cannot check a signature has no business calling a
-// peer truncated. With a keyring but an unsigned timestamp, or a value in neither
-// format, the head counts as SETTLED — the conservative reading. Suppressing the finding instead would mean an attacker
-// could truncate a log and then scribble in created_at to keep anyone from
-// saying so, which is a silent failure where this one is merely a loud
-// investigable state.
-func headHasSettled(h AuditChainHead, haveKeyring, trusted bool) bool {
+// haveKeyring says whether this node can verify anything at all. With no keyring
+// the head asserts nothing here — a node that cannot check a signature has no
+// business calling a peer truncated. The caller has already verified the
+// signature, and created_at is inside it, so the timestamp is as trustworthy as
+// the head itself.
+//
+// A created_at in neither format counts as SETTLED, so the shortfall is reported.
+// That is the conservative direction: suppressing it would mean an attacker could
+// truncate a log and then scribble in created_at to stop anyone saying so, which
+// is a silent failure where this is a loud investigable one.
+func headHasSettled(h AuditChainHead, haveKeyring bool) bool {
 	if !haveKeyring {
 		return false // verified nothing; assert nothing
 	}
-	if !trusted {
-		return true
-	}
 	if created, err := time.Parse(time.RFC3339Nano, h.CreatedAt); err == nil {
 		return time.Since(created) >= headSettleWindow
-	}
-	if ts, ok := hlc.Parse(h.CreatedAt); ok {
-		return time.Since(time.UnixMilli(ts.PhysicalMS)) >= headSettleWindow
 	}
 	return true
 }

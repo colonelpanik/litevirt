@@ -5,24 +5,12 @@ import "context"
 // finishAuditKeyLifecycleNow runs the deferred lifecycle step without its settle
 // wait.
 //
-// Test-only, and in a _test.go file so it cannot be reached from production. The
-// wait exists so a restarted node sees its own replicated history before it
-// records a permanent sequence boundary, which is not a thing a single-process
-// test can be behind on.
+// It calls the production function, so a test that goes through it exercises the
+// real branching. An earlier version restated that branching here instead, and
+// mutation showed the cost: the guard stopping a rotation from being undone by the
+// rollback retirement could be deleted from production with every test still
+// green. The wait is all that is skipped — a single-process test cannot be behind
+// on its own replicated history, which is the only thing the wait is for.
 func (d *Daemon) finishAuditKeyLifecycleNow(ctx context.Context) {
-	if d.cfg.Enforcement.AuditSignature {
-		if keyring := d.db.AuditKeyringOf(); keyring.CanSign() {
-			adoptAuditKey(ctx, d, keyring)
-		}
-		return
-	}
-	rotated := false
-	if shouldCompleteAuditKeyRotation(d.cfg) {
-		if err := d.completeAuditKeyRotation(ctx); err == nil {
-			rotated = true
-		}
-	}
-	if !rotated {
-		d.retireOwnAuditKeyOnRollback(ctx)
-	}
+	d.recordAuditKeyLifecycle(ctx)
 }

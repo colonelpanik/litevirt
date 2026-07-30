@@ -121,8 +121,8 @@ type signingContract struct {
 // host ever wrote, so the first verify after enabling signing reports a
 // cluster's entire history as tampering. That is the fastest possible way to
 // teach an operator to ignore this command. The signed 'adopted' record supplies
-// it; a host with a certificate but no adoption record predates that mechanism
-// and is treated as committing from its first row.
+// it, and a certificate WITHOUT one is not a contract at all — see the comment on
+// the !adopted branch below, which is where that rule lives.
 //
 // This is deliberately a fact about replicated state rather than about a node's
 // own config or its own log:
@@ -261,25 +261,7 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	}
 
 	for _, old := range superseded {
-		// A key already retired under v46 keeps ITS boundary, not today's tail.
-		//
-		// v46 recorded retirement in two columns that v47 stops reading, and
-		// nothing backfills them — so on the first v47 start the old key looks
-		// unretired and gets retired again at the CURRENT tail. That silently
-		// widens the window: every row the leaked key signed between the original
-		// boundary and now becomes legitimate, which is exactly the window the
-		// operator rotated to close. Reading the old column here is the whole
-		// migration.
-		at := boundarySeq
-		if legacy, ok, lerr := legacyRetiredAtSeq(ctx, c, old); lerr != nil {
-			return "", lerr
-		} else if ok {
-			slog.Warn("carrying a pre-v47 retirement boundary forward; the key was already "+
-				"retired under the previous schema and its original window is preserved",
-				"host", hostName, "key_id", old, "at_seq", legacy)
-			at = legacy
-		}
-		if err := RetireAuditKey(ctx, c, keyring, hostName, old, at); err != nil {
+		if err := RetireAuditKey(ctx, c, keyring, hostName, old, boundarySeq); err != nil {
 			return "", err
 		}
 	}
@@ -575,24 +557,4 @@ func KeyIsRetired(ctx context.Context, c *Client, keyring *AuditKeyring, hostNam
 		return false, err
 	}
 	return isRetired(retired, hostName, keyID), nil
-}
-
-// legacyRetiredAtSeq reads a v46 retirement boundary off audit_signing_keys.
-//
-// Those columns are dead — v47 moved retirement into a signed append-only record
-// and nothing else reads them — but they are the only surviving evidence of a
-// rotation performed before the upgrade, and dropping it would quietly re-open
-// the window the rotation existed to close. This is the one reader, and it exists
-// solely to carry the boundary across.
-func legacyRetiredAtSeq(ctx context.Context, c *Client, keyID string) (int64, bool, error) {
-	rows, err := c.Query(ctx,
-		`SELECT retired_at_seq FROM audit_signing_keys
-		 WHERE key_id = ? AND retired_at IS NOT NULL AND retired_at <> ''`, keyID)
-	if err != nil {
-		return 0, false, fmt.Errorf("read pre-v47 retirement for %s: %w", keyID, err)
-	}
-	if len(rows) == 0 {
-		return 0, false, nil
-	}
-	return rows[0].Int64("retired_at_seq"), true, nil
 }

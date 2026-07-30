@@ -536,7 +536,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// node the moment anti-entropy delivered it.
 	go d.finishAuditKeyLifecycle(ctx)
 
-
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
 	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
 	// default inside NewAntiEntropy. (P2-2)
@@ -744,7 +743,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
-	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)      // drives the latch + conditional advertisement
+	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)       // drives the latch + conditional advertisement
 	// Once the whole cluster has latched audit_signature_v1, a write this node
 	// cannot sign is an error-level event rather than a normal one.
 	//

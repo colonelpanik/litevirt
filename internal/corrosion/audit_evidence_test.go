@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/pki"
 )
 
@@ -142,39 +141,58 @@ func rewriteTailRowWithRetiredKey(t *testing.T, c *Client, kr *AuditKeyring, id 
 	return rec.ContentHash
 }
 
-// TestAuditHeads_AnHLCTimestampDoesNotFakeATruncation.
+// TestAuditHeads_AFreshHeadIsInsideTheSettleWindow.
 //
-// created_at is a wall time the settle window is measured against, but it used
-// to be stamped with NowTS — the LWW conflict key, which starts emitting HLC
-// strings the moment hlc_lww latches. Reading an HLC value as wall time skipped
-// the window entirely, and a head that had simply arrived before the rows behind
-// it was reported as a truncated log. That is the ordinary
-// eventually-consistent case, so on an HLC cluster every publish produced a
-// tampering alert seconds later.
-func TestAuditHeads_AnHLCTimestampDoesNotFakeATruncation(t *testing.T) {
+// created_at is the wall time the settle window is measured against, and it must
+// be stamped with NowWall. It was once stamped with NowTS — the LWW conflict key,
+// which starts emitting HLC strings the moment hlc_lww latches — and an HLC value
+// read as wall time parses as nothing, so every freshly published head counted as
+// settled and any peer that had not yet received the rows behind it reported a
+// truncated log. On an HLC cluster that meant a tampering alert seconds after
+// every publish.
+//
+// The fix is the stamp, not a second format to parse. Asserting through the real
+// publish path is what pins it: if the stamp goes back to NowTS the value stops
+// parsing, the head counts as settled, and the shortfall below is reported.
+func TestAuditHeads_AFreshHeadIsInsideTheSettleWindow(t *testing.T) {
 	ctx := context.Background()
 	c, kr, _ := signedClient(t, "node-0")
 	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
 
-	// A head attesting to rows this node has not received yet, stamped the way
-	// an HLC-emitting node stamps it: now, in HLC form — and SIGNED over that
-	// value, which is what makes the window trustworthy enough to honour.
-	hlcNow := hlc.Timestamp{PhysicalMS: time.Now().UnixMilli(), NodeID: "node-0"}.String()
-	insertSignedHead(t, c, kr, 0, 9, "aabb", hlcNow)
+	// Latch HLC conflict-key emission. Without this NowTS still returns RFC3339, so
+	// the wrong stamp would parse fine and this test would pass with the fix
+	// removed — the switch is exactly what made the original bug reachable only on
+	// a cluster that had latched hlc_lww.
+	c.SetHLCEmit(func() bool { return true })
 
+	// Publish through the production path, then move the head above the local tail
+	// so a shortfall exists for the window to suppress.
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	if err := c.Execute(ctx, `UPDATE audit_chain_heads SET seq = 9 WHERE host_name = 'node-0'`); err != nil {
+		t.Fatalf("raise the head above the tail: %v", err)
+	}
+	stamped := oneCol(t, c, `SELECT created_at FROM audit_chain_heads WHERE host_name = 'node-0'`)
+	if _, err := time.Parse(time.RFC3339Nano, stamped); err != nil {
+		t.Fatalf("created_at was stamped as %q, which the settle window cannot parse: %v\n"+
+			"an unparseable value counts as settled, so every freshly published head becomes "+
+			"a truncation report on any peer still receiving the rows behind it", stamped, err)
+	}
+
+	// seq was edited after signing, so the head no longer verifies — which is its
+	// own finding. The one thing that must NOT appear is the truncation.
 	if res := verify(t, c); len(res.TruncatedHosts) > 0 {
 		t.Fatalf("a head published seconds ago was read as a truncated log: %v\n"+
 			"the settle window exists because a peer can hold a head before the rows it "+
 			"attests to", res.TruncatedHosts)
 	}
 
-	// Same head, genuinely older than the window: the shortfall is real.
-	old := hlc.Timestamp{
-		PhysicalMS: time.Now().Add(-2 * headSettleWindow).UnixMilli(), NodeID: "node-0",
-	}.String()
-	if err := c.Execute(ctx, `DELETE FROM audit_chain_heads WHERE seq = 9`); err != nil {
+	// The same shortfall, genuinely older than the window: now it is real.
+	if err := c.Execute(ctx, `DELETE FROM audit_chain_heads`); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
+	old := time.Now().Add(-2 * headSettleWindow).UTC().Format(time.RFC3339Nano)
 	insertSignedHead(t, c, kr, 0, 9, "aabb", old)
 	if res := verify(t, c); len(res.TruncatedHosts) == 0 {
 		t.Fatalf("a head older than the settle window attests to seq 9 over a log that ends "+
@@ -190,11 +208,10 @@ func TestAuditHeads_AnHLCTimestampDoesNotFakeATruncation(t *testing.T) {
 // which meant no finding at all. A silent off switch for the one check a
 // backward-linking hash chain cannot perform for itself.
 //
-// Two shapes now close it, and the test covers both. On a head signed over its
-// timestamp (payload v2) the edit breaks the signature, which is louder than the
-// truncation would have been. On a head published before the column moved inside
-// the payload, the signature still verifies — so an unverifiable timestamp gets
-// the conservative reading, settled, and the shortfall is reported.
+// Moving created_at inside the signed payload closes it: the edit breaks the
+// signature, which is louder than the truncation would have been. A value the
+// window cannot parse — signed, so the head itself is genuine — gets the
+// conservative reading, settled, and the shortfall is reported.
 func TestAuditHeads_AnEditedTimestampCannotSilenceTruncation(t *testing.T) {
 	ctx := context.Background()
 	c, kr, _ := signedClient(t, "node-0")
@@ -222,33 +239,18 @@ func TestAuditHeads_AnEditedTimestampCannotSilenceTruncation(t *testing.T) {
 		t.Errorf("want the edit reported against the head's signature, got %+v", res)
 	}
 
-	// A head from before created_at moved inside the payload: the signature still
-	// verifies over the edited value, so only the conservative reading catches it.
+	// A created_at the settle window cannot parse, but which the signature DOES
+	// cover, so the head itself is genuine. It must count as settled and report the
+	// truncation: the alternative is that writing garbage into the column suppresses
+	// the finding, and an attacker who can truncate a log can certainly do that.
 	if err := c.Execute(ctx, `DELETE FROM audit_chain_heads`); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
-	insertV1Head(t, c, kr, 0, 3, "aabb", "not-a-timestamp")
+	insertSignedHead(t, c, kr, 0, 3, "aabb", "not-a-timestamp")
 	res = verify(t, c)
 	if len(res.TruncatedHosts) == 0 {
-		t.Fatalf("a legacy head with an unreadable timestamp stopped detecting a truncation: "+
-			"%+v\nan unverifiable clock must not be able to suppress the finding", res)
-	}
-}
-
-// insertV1Head writes a head signed with the pre-created_at payload, as one
-// published before the upgrade would be.
-func insertV1Head(t *testing.T, c *Client, kr *AuditKeyring, epoch, seq int64, hash, createdAt string) {
-	t.Helper()
-	sig, err := kr.sign(auditHeadDigestV1("node-0", epoch, seq, hash, kr.KeyID()))
-	if err != nil {
-		t.Fatalf("sign v1 head: %v", err)
-	}
-	if err := c.Execute(context.Background(),
-		`INSERT INTO audit_chain_heads
-		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
-		 VALUES ('node-0', ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		epoch, seq, hash, kr.KeyID(), sig, createdAt, createdAt); err != nil {
-		t.Fatalf("insert v1 head: %v", err)
+		t.Fatalf("a head with an unparseable timestamp stopped detecting a truncation: "+
+			"%+v\nan unreadable clock must not be able to suppress the finding", res)
 	}
 }
 
@@ -272,7 +274,7 @@ func insertSignedHead(t *testing.T, c *Client, kr *AuditKeyring, epoch, seq int6
 
 // TestWAL_LegacyResealCannotRewriteASignedRow.
 //
-// The v45 reseal builder grew a `signature IS NULL OR signature = ''` guard
+// The v45 reseal builder grew a `signature IS NULL OR signature = ”` guard
 // precisely because the statement replicates and peers apply it verbatim by
 // primary key with no clock compare. But the PRE-v45 shape — the same UPDATE
 // without the guard — stayed registered for the rolling-upgrade horizon, and a
@@ -454,12 +456,14 @@ func TestAuditEvidence_PeerCannotRewriteAChainHead(t *testing.T) {
 
 // ─────────────────── signed retirement ───────────────────
 
-// TestRetirement_ForgedOneIsIgnored is the v47 shape's reason for existing.
+// TestRetirement_ForgedOneIsIgnored is the signed table's reason for existing.
 //
-// v46 kept retirement in two mutable columns on audit_signing_keys. Any peer
-// could write them, so setting retired_at on a host's LIVE key put every row
-// that host had ever signed past a boundary — on every node, permanently, with
-// no key required and no way back.
+// An earlier revision of this branch kept retirement in two mutable columns on
+// audit_signing_keys. That table is replicated and LWW, so any peer could write
+// them: setting a retirement on a host's LIVE key put every row that host had
+// ever signed past a boundary — on every node, permanently, with no key required
+// and no way back. The columns are gone, along with the only reader they ever
+// had, so this test now guards the property rather than the migration.
 //
 // A retirement is now an assertion someone had to sign. One that does not verify
 // is not a weaker retirement, it is not a retirement at all.
@@ -529,7 +533,7 @@ func TestRetirement_PeerCannotRewriteOne(t *testing.T) {
 
 	if got := oneCol(t, c,
 		`SELECT at_seq FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldID+`'`); got == "9999" {
-		t.Fatalf("a peer moved a signed retirement boundary to seq 9999; every row the key "+
+		t.Fatalf("a peer moved a signed retirement boundary to seq 9999; every row the key " +
 			"signed below it is silently re-authorised")
 	}
 }
@@ -835,58 +839,40 @@ func TestAuditHeads_ANodeWithNoKeyringAccusesNobody(t *testing.T) {
 	}
 }
 
-// TestSchema_TheLifecyclePKRepairReachesAnExistingDatabase.
+// TestSchema_TheLifecyclePKAdmitsTwoSigners.
 //
-// Widening the CREATE statement fixes new databases and does nothing whatever for
-// existing ones — CREATE TABLE IF NOT EXISTS is a no-op when the table is already
-// there. So the squatting fix shipped without reaching a single cluster already
-// running this branch, and the lab proved it: inserting the second row still
-// failed with a UNIQUE constraint error long after the fix was committed.
-func TestSchema_TheLifecyclePKRepairReachesAnExistingDatabase(t *testing.T) {
+// The primary key is (host_name, key_id, event, by_key_id), and by_key_id is in it
+// on purpose. Without it the table was first-write-wins on data any peer can
+// write: an unverifiable row placed in the slot was ignored by every reader AND
+// blocked the host from ever recording the genuine record, so a host's entire
+// pre-enforcement history became evidence, permanently.
+//
+// Two VERIFIED records for one (host, key, event) are also the legitimate case — a
+// rotation and an operator retire-audit-key retire the same key with different
+// signers — so the reader keeps the strictest rather than the first.
+func TestSchema_TheLifecyclePKAdmitsTwoSigners(t *testing.T) {
 	ctx := context.Background()
 	c, err := NewTestClient()
 	if err != nil {
 		t.Fatalf("NewTestClient: %v", err)
 	}
 	t.Cleanup(func() { c.Close() })
-
-	// A database created under the NARROW key, as an existing v47 cluster has.
-	if err := c.execLocal(ctx, `CREATE TABLE audit_key_lifecycle (
-		host_name TEXT NOT NULL, key_id TEXT NOT NULL, event TEXT NOT NULL,
-		at_seq INTEGER NOT NULL DEFAULT 0, by_key_id TEXT NOT NULL DEFAULT '',
-		signature TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL, deleted_at TEXT,
-		PRIMARY KEY (host_name, key_id, event))`); err != nil {
-		t.Fatalf("seed the narrow table: %v", err)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema: %v", err)
 	}
+
 	if err := c.execLocal(ctx,
 		`INSERT INTO audit_key_lifecycle (host_name,key_id,event,at_seq,by_key_id,signature,created_at,updated_at)
 		 VALUES ('node-0','k1','adopted',7,'k1','realsig','2026-07-29T10:00:00Z','2026-07-29T10:00:00Z')`); err != nil {
 		t.Fatalf("seed a genuine record: %v", err)
 	}
-
-	if err := InitSchema(ctx, c); err != nil {
-		t.Fatalf("InitSchema: %v", err)
-	}
-
-	// The genuine record survives the rebuild, with its own timestamps.
-	got := oneCol(t, c, `SELECT at_seq FROM audit_key_lifecycle WHERE key_id = 'k1' AND event = 'adopted'`)
-	if got != "7" {
-		t.Fatalf("the rebuild lost the existing record (at_seq = %q)", got)
-	}
-	if ts := oneCol(t, c,
-		`SELECT updated_at FROM audit_key_lifecycle WHERE key_id = 'k1'`); ts != "2026-07-29T10:00:00Z" {
-		t.Fatalf("the rebuild restamped updated_at to %q; a migrated row would then win LWW "+
-			"against every later real write", ts)
-	}
-	// And a second signer can now coexist, which is the whole point.
 	if err := c.execLocal(ctx,
 		`INSERT INTO audit_key_lifecycle (host_name,key_id,event,at_seq,by_key_id,signature,created_at,updated_at)
 		 VALUES ('node-0','k1','adopted',0,'squatter','garbage','2026-07-29T11:00:00Z','2026-07-29T11:00:00Z')`); err != nil {
-		t.Fatalf("a squatter still collides with the genuine record after the repair: %v\n"+
-			"the narrow key is what let an unverifiable row block a real one permanently", err)
+		t.Fatalf("a second signer collides with the genuine record: %v\n"+
+			"a narrow key is what let an unverifiable row block a real one permanently", err)
 	}
 	if n := countRows(t, c, `SELECT key_id FROM audit_key_lifecycle WHERE event = 'adopted'`); n != 2 {
-		t.Fatalf("want both records present after the repair, got %d", n)
+		t.Fatalf("want both records present, got %d", n)
 	}
 }

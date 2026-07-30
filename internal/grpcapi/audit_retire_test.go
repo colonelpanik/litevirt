@@ -242,3 +242,97 @@ func TestRetireAuditKey_RefusesFromALaggingReplica(t *testing.T) {
 		t.Errorf("the refusal does not explain that the replica is behind: %v", err)
 	}
 }
+
+// TestRetireAuditKey_AtSeqOverridesAPoisonedHead.
+//
+// The lagging-replica refusal counts heads signed by the key being retired, which
+// is deliberate — a host's heads are signed by its own keys, so excluding them is
+// what let a stale replica pin a boundary below rows that were legitimately
+// signed. The cost is that whoever holds the leaked key publishes ONE head at an
+// absurd sequence and retirement then refuses on every node forever: heads are
+// append-only, tombstones are inert, and anti-entropy refuses rewrites, so the
+// claim cannot be withdrawn.
+//
+// Without --at-seq the leaked key disables the command that retires it.
+func TestRetireAuditKey_AtSeqOverridesAPoisonedHead(t *testing.T) {
+	ctx := context.Background()
+	s, dir, keyID := retireFixture(t, "node-1")
+
+	// The attacker, holding the key about to be retired, claims the chain reached a
+	// sequence no replica can ever match.
+	kr, err := corrosion.LoadAuditKeyring(dir, "node-1")
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring: %v", err)
+	}
+	created := "2026-07-29T10:00:00Z"
+	sig, err := kr.SignHead("node-1", 0, 1_000_000_000, "aabb", created)
+	if err != nil {
+		t.Fatalf("SignHead: %v", err)
+	}
+	if err := s.db.Execute(ctx,
+		`INSERT INTO audit_chain_heads
+		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-1', 0, 1000000000, 'aabb', ?, ?, ?, ?, NULL)`,
+		kr.KeyID(), sig, created, created); err != nil {
+		t.Fatalf("insert the poisoned head: %v", err)
+	}
+
+	// Without the override the command is dead.
+	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{HostName: "node-1"}); err == nil {
+		t.Fatal("a head at seq 1e9 did not block retirement; the refusal is not doing its job")
+	}
+
+	// With it, the operator names the boundary and phase 1 answers.
+	plan, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", AtSeq: 7,
+	})
+	if err != nil {
+		t.Fatalf("--at-seq did not get past the poisoned head: %v\n"+
+			"the key that leaked would then be permanently un-retirable, because the head "+
+			"it published cannot be withdrawn", err)
+	}
+	if plan.RetiredAtSeq != 7 {
+		t.Fatalf("phase 1 reports boundary %d, not the requested 7; the CLI signs over the "+
+			"reported value, so a mismatch here means the signatures cannot match", plan.RetiredAtSeq)
+	}
+
+	// And phase 2 records it at exactly that sequence.
+	certPEM, rsig, selfSig := mintRetirement(t, dir, "node-1", keyID, 7)
+	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", CertPem: certPEM, Signature: rsig, SelfSignature: selfSig, AtSeq: 7,
+	}); err != nil {
+		t.Fatalf("phase 2 with the override: %v", err)
+	}
+	rows, err := s.db.Query(ctx, `SELECT at_seq FROM audit_key_lifecycle
+	     WHERE host_name = 'node-1' AND event = 'retired' AND key_id = ?`, keyID)
+	if err != nil {
+		t.Fatalf("read the recorded boundary: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Int64("at_seq") != 7 {
+		t.Fatalf("want one retirement recorded at 7, got %d row(s): %v", len(rows), rows)
+	}
+}
+
+// TestRetireAuditKey_AtSeqStillVerifiesTheSignatures.
+//
+// The override skips the boundary derivation and the lagging-replica check. It must
+// not skip anything else — it is reachable by any admin caller, and the property
+// that makes it safe to expose is that completing a retirement still needs a
+// certificate minted with the cluster CA private key.
+func TestRetireAuditKey_AtSeqStillVerifiesTheSignatures(t *testing.T) {
+	s, dir, keyID := retireFixture(t, "node-1")
+
+	// Signatures made for sequence 7, submitted against a claimed boundary of 9.
+	certPEM, sig, selfSig := mintRetirement(t, dir, "node-1", keyID, 7)
+	_, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig, AtSeq: 9,
+	})
+	if err == nil {
+		t.Fatal("--at-seq accepted signatures made over a different sequence\n" +
+			"the boundary would then be operator-chosen AND unauthenticated, so anyone who " +
+			"could reach the RPC could retire any key at any sequence")
+	}
+	if n := countRows(t, s, `SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired'`); n != 0 {
+		t.Errorf("a rejected override still recorded %d retirement(s)", n)
+	}
+}

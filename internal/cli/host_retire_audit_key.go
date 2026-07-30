@@ -22,15 +22,49 @@ import (
 // the operator's config directory and never has to be present on a cluster
 // member — so the daemon reports what would be retired, this mints and signs,
 // and the daemon verifies and records. A private key is never sent anywhere.
-func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName string) error {
+//
+// --at-seq names the boundary instead of letting the daemon derive it, and is the
+// escape hatch for a poisoned chain head. The daemon refuses to retire from a
+// replica a signed head says is behind, and it counts heads signed by the key being
+// retired on purpose — excluding them is what let a stale replica pin a boundary
+// below rows that were legitimately signed. The cost is that whoever holds a leaked
+// key can publish one head at any sequence and make retirement refuse everywhere,
+// permanently: heads are append-only, tombstones are inert, and anti-entropy
+// refuses rewrites, so the claim cannot be withdrawn. That would leave the leaked
+// key blocking the command that retires it.
+//
+// The flag is safe to expose because it grants nothing new. Completing a retirement
+// already requires minting a certificate with the cluster CA private key, so the
+// only party who can pass --at-seq is the only party who could retire the key at
+// all, and both signatures cover the value — a substituted one cannot be replayed.
+// It is still the sharpest tool here: set it below what the host really signed and
+// those rows are reported as retired-key use on every node, permanently.
+// atSeq overrides the boundary the daemon derives. Zero means derive it, which is
+// the normal path — see the --at-seq guidance in HostRetireAuditKey's body.
+func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName string, atSeq int64) error {
 	if hostName == "" {
 		return fmt.Errorf("host name required")
 	}
+	if atSeq < 0 {
+		return fmt.Errorf("--at-seq must be a sequence number, not %d", atSeq)
+	}
 	// Phase 1: ask which key would be retired, and at what sequence. Nothing is
 	// written by this call.
-	plan, err := c.RetireAuditKey(ctx, &pb.RetireAuditKeyRequest{HostName: hostName})
+	//
+	// atSeq goes in here too. Phase 1 is where the daemon decides the boundary and
+	// where it refuses a lagging replica, so an override that only appeared in phase
+	// 2 would be signed over a sequence phase 1 never agreed to — and phase 1 would
+	// still refuse before the operator ever got the chance to override it.
+	plan, err := c.RetireAuditKey(ctx, &pb.RetireAuditKeyRequest{
+		HostName: hostName,
+		AtSeq:    atSeq,
+	})
 	if err != nil {
 		return err
+	}
+	if atSeq > 0 && plan.RetiredAtSeq != atSeq {
+		return fmt.Errorf("asked to retire at sequence %d but the daemon reports %d; "+
+			"the signatures below would not match the boundary it records", atSeq, plan.RetiredAtSeq)
 	}
 
 	tmpDir, certPath, keyPath, err := mintAuditSigningPair(PKIDir(), hostName)
@@ -68,6 +102,7 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 		CertPem:       string(certPEM),
 		Signature:     sig,
 		SelfSignature: selfSig,
+		AtSeq:         atSeq,
 	}); err != nil {
 		return err
 	}
@@ -78,6 +113,11 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 	fmt.Println("  rows above that sequence signed by that key are now reported as")
 	fmt.Println("  retired-key use on every node")
 	fmt.Println("  unsigned rows from this host are no longer treated as evidence")
+	if atSeq > 0 {
+		fmt.Println("  the boundary was supplied with --at-seq, so neither the sequence the")
+		fmt.Println("  cluster derives nor its lagging-replica check applied — if it was set too")
+		fmt.Println("  low, the rows above it are reported as retired-key use permanently")
+	}
 	fmt.Println("  Confirm with: lv audit verify")
 	return nil
 }

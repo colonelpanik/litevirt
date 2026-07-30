@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -169,38 +170,43 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	// Refuse outright if this node's copy of the host's log is demonstrably
-	// behind. A retirement boundary is permanent — records are append-only and the
-	// earliest verified one stands — so pinning it from a lagging replica condemns
-	// rows the key legitimately signed, with no way to raise it again.
+	// An operator-chosen boundary replaces the derived one, and skips the
+	// lagging-replica refusal below.
 	//
-	// The floor cannot catch this on its own: a host's heads are signed by its own
-	// keys, and retiring the current one excludes exactly the heads that would
-	// prove how far the chain has come. Reading them to REFUSE is safe where
-	// reading them to raise the boundary is not — an inflated head from a leaked
-	// key produces a refusal here, never a bad boundary.
-	if attested, behind, berr := corrosion.AuditReplicaIsBehind(ctx, s.db, verifier, host); berr != nil {
+	// It has to exist. That refusal counts heads signed by the key being retired,
+	// deliberately — a host's heads are signed by its own keys, so excluding them is
+	// what let a stale replica pin a boundary three rows low on the lab. The cost is
+	// that whoever holds a leaked key publishes one head at any sequence they like
+	// and retirement then refuses on every node forever: heads are append-only,
+	// tombstones are inert, and the anti-entropy guard refuses rewrites, so the
+	// claim cannot be withdrawn. Without an override the leaked key disables the
+	// command that exists to retire it.
+	//
+	// Handing the decision to the CA holder is the honest resolution. They are
+	// already the only party who can complete a retirement at all — phase 2 needs a
+	// certificate minted with the CA private key, which lives on no node — and both
+	// signatures cover this exact sequence, so a substituted value cannot be
+	// replayed. Nobody who could not already retire the key gains anything.
+	if override := req.GetAtSeq(); override > 0 {
+		slog.Warn("retiring an audit signing key at an operator-supplied boundary; the derived "+
+			"one and the lagging-replica check are both bypassed. Rows this host signed above "+
+			"the boundary will be reported as retired-key use on every node, permanently",
+			"host", host, "key_id", active, "at_seq", override, "derived_seq", seq)
+		seq = override
+	} else if attested, behind, berr := corrosion.AuditReplicaIsBehind(ctx, s.db, verifier, host); berr != nil {
 		return nil, status.Errorf(codes.Internal, "%v", berr)
 	} else if behind {
-		// Naming rotate-audit-key matters. This check counts heads signed by the key
-		// being retired — that is deliberate, since a host's heads are signed by its
-		// own keys and excluding them is what let a lagging replica pin a boundary
-		// three rows low on the lab. The cost is that whoever holds a leaked key can
-		// publish one head at an absurd sequence and make this refuse on every node
-		// forever: heads are append-only, tombstones are inert, and the anti-entropy
-		// guard refuses rewrites, so the poison cannot be cleared. Rotation is not
-		// blocked — AdoptAuditKey floors with the suspect key excluded — so an
-		// operator locked out of retirement still has a way to seal the old key's
-		// history and move signing to a new one.
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"this node's copy of %s's audit log ends at %d but a signed chain head attests to "+
 				"%d; retiring now would put %d legitimately signed rows past the boundary, "+
 				"permanently. Wait for replication to catch up, or run this from a node that is "+
-				"current. If no node is ever current — a head signed by the key you are retiring "+
-				"can claim any sequence at all, and cannot be withdrawn — then that head is the "+
-				"problem and retirement cannot get past it: run `lv host rotate-audit-key %s` "+
-				"instead, which seals what the old key wrote without needing this boundary",
-			host, seq, attested, attested-seq, host)
+				"current. If no node can ever be current — a head signed by the key you are "+
+				"retiring can claim any sequence at all and cannot be withdrawn, so a leaked key "+
+				"can block this indefinitely — then either run `lv host rotate-audit-key %s`, "+
+				"which seals what the old key wrote without needing a boundary, or name the "+
+				"boundary yourself with --at-seq once you have established how far %s's chain "+
+				"actually reached",
+			host, seq, attested, attested-seq, host, host)
 	}
 
 	// Phase 1: report what would be retired. The operator holds the CA, so they

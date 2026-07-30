@@ -275,6 +275,40 @@ be retired and at which sequence, writing nothing; the command mints, signs, and
 submits; the daemon verifies against the cluster CA and records the result. The CA
 private key is never sent to a node and never has to live on one.
 
+### When the boundary itself is contested — `--at-seq`
+
+The boundary is permanent. Lifecycle records are append-only and the earliest
+verified retirement is the one that stands, so a boundary pinned below rows the key
+legitimately signed reports those rows as retired-key use on every node forever,
+with no way to raise it again.
+
+So the command refuses to run from a node whose copy of the host's log a signed
+chain head says is behind. That check counts heads signed by **the key being
+retired**, deliberately: a host's chain heads are signed by its own keys, so
+excluding them leaves the local tail as the only input at exactly the moment the
+local tail is what is in doubt.
+
+The cost is that whoever holds a leaked key can publish one head claiming any
+sequence at all. It verifies — the leaked key's certificate still chains to the CA
+and names the host — and it cannot be withdrawn, because heads are append-only,
+tombstones are inert, and anti-entropy refuses rewrites. Left there, the leaked key
+blocks the command that retires it.
+
+Two ways past it:
+
+```bash
+lv host rotate-audit-key host-b            # seals the old key's history; needs no boundary
+lv host retire-audit-key host-b --at-seq 4210
+```
+
+`--at-seq` names the boundary instead of deriving it, and skips the
+lagging-replica refusal. It grants nothing new: completing a retirement already
+requires minting a certificate with the cluster CA private key, so the only party
+who can pass it is the only party who could retire the key at all, and both phase-2
+signatures cover the value — a substituted one cannot be replayed. Establish how
+far the chain actually reached before using it. A value below what the host really
+signed is not recoverable.
+
 An attacker cannot use either path to go quiet: producing a retirement means
 holding the key and publishing a permanent, replicated statement of when signing
 stopped.

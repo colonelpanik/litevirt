@@ -2453,6 +2453,21 @@ message RetireAuditKeyRequest {
     // Without it the certificate created to END a signing contract would stand
     // as a new one, claiming the host signs with a key nobody holds.
     string self_signature = 4;
+    // Operator-chosen retirement boundary, overriding the one the server derives.
+    //
+    // The escape hatch for a poisoned chain head. The server refuses to retire from
+    // a replica that a signed head says is behind, and it counts heads signed by the
+    // key being retired on purpose — a host's heads are signed by its own keys, so
+    // excluding them is what let a stale replica pin a boundary below rows that were
+    // legitimately signed. The cost is that whoever holds a leaked key can publish
+    // one head at any sequence and make retirement refuse on every node forever:
+    // heads are append-only, tombstones are inert, and the anti-entropy guard
+    // refuses rewrites, so the claim cannot be withdrawn.
+    //
+    // Only the CA holder can set this, because only they can mint the certificate
+    // the phase-2 signatures are made with, and both signatures must cover this
+    // exact value. Zero means "derive it", which is the normal path.
+    int64 at_seq = 5;
 }
 message RetireAuditKeyResponse {
     // The key that was retired, and the sequence it was retired at. Rows the key

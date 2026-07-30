@@ -22070,6 +22070,21 @@ type RetireAuditKeyRequest struct {
 	// Without it the certificate created to END a signing contract would stand
 	// as a new one, claiming the host signs with a key nobody holds.
 	SelfSignature string `protobuf:"bytes,4,opt,name=self_signature,json=selfSignature,proto3" json:"self_signature,omitempty"`
+	// Operator-chosen retirement boundary, overriding the one the server derives.
+	//
+	// The escape hatch for a poisoned chain head. The server refuses to retire from
+	// a replica that a signed head says is behind, and it counts heads signed by the
+	// key being retired on purpose — a host's heads are signed by its own keys, so
+	// excluding them is what let a stale replica pin a boundary below rows that were
+	// legitimately signed. The cost is that whoever holds a leaked key can publish
+	// one head at any sequence and make retirement refuse on every node forever:
+	// heads are append-only, tombstones are inert, and the anti-entropy guard
+	// refuses rewrites, so the claim cannot be withdrawn.
+	//
+	// Only the CA holder can set this, because only they can mint the certificate
+	// the phase-2 signatures are made with, and both signatures must cover this
+	// exact value. Zero means "derive it", which is the normal path.
+	AtSeq         int64 `protobuf:"varint,5,opt,name=at_seq,json=atSeq,proto3" json:"at_seq,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22130,6 +22145,13 @@ func (x *RetireAuditKeyRequest) GetSelfSignature() string {
 		return x.SelfSignature
 	}
 	return ""
+}
+
+func (x *RetireAuditKeyRequest) GetAtSeq() int64 {
+	if x != nil {
+		return x.AtSeq
+	}
+	return 0
 }
 
 type RetireAuditKeyResponse struct {
@@ -24800,12 +24822,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\btampered\x18\f \x01(\bR\btampered\x12&\n" +
 	"\x0fretired_key_use\x18\r \x03(\tR\rretiredKeyUse\x12#\n" +
 	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\x122\n" +
-	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\"\x94\x01\n" +
+	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\"\xab\x01\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +
 	"\tsignature\x18\x03 \x01(\tR\tsignature\x12%\n" +
-	"\x0eself_signature\x18\x04 \x01(\tR\rselfSignature\"d\n" +
+	"\x0eself_signature\x18\x04 \x01(\tR\rselfSignature\x12\x15\n" +
+	"\x06at_seq\x18\x05 \x01(\x03R\x05atSeq\"d\n" +
 	"\x16RetireAuditKeyResponse\x12$\n" +
 	"\x0eretired_key_id\x18\x01 \x01(\tR\fretiredKeyId\x12$\n" +
 	"\x0eretired_at_seq\x18\x02 \x01(\x03R\fretiredAtSeq\"E\n" +

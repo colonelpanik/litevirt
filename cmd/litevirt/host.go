@@ -657,6 +657,7 @@ because the signing keyring is loaded once at boot.
 // turned off, so an ordinary rollback needs no command at all. This is for a
 // host that has lost its key, is gone, or is being decommissioned.
 func newHostRetireAuditKeyCmd() *cobra.Command {
+	var atSeq int64
 	cmd := &cobra.Command{
 		Use:   "retire-audit-key <host>",
 		Short: "Retire a host's audit signing key on its behalf",
@@ -679,14 +680,27 @@ locally — the CA key is never sent to a node, and the daemon only verifies.
 Rows the retired key signed stay verifiable forever — retirement is a validity
 window, never a deletion.
 
-  lv host retire-audit-key host-b`,
+The boundary is derived from replicated state, and the command refuses to run from
+a node whose copy of the host's log a signed chain head says is behind: pinning a
+boundary below rows the key legitimately signed cannot be undone. Use --at-seq only
+when that refusal cannot be satisfied, because a head signed by the key you are
+retiring can claim any sequence at all and cannot be withdrawn — a leaked key can
+block this command indefinitely. Establish how far the chain really reached first;
+naming a boundary too low reports every row above it as retired-key use on every
+node, permanently.
+
+  lv host retire-audit-key host-b
+  lv host retire-audit-key host-b --at-seq 4210`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				return cli.HostRetireAuditKey(ctx, c, args[0])
+				return cli.HostRetireAuditKey(ctx, c, args[0], atSeq)
 			})
 		},
 	}
+	cmd.Flags().Int64Var(&atSeq, "at-seq", 0,
+		"retire at this sequence instead of the one the cluster derives (bypasses the "+
+			"lagging-replica refusal; a value below what the host really signed is permanent)")
 	return cmd
 }
 

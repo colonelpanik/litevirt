@@ -454,3 +454,45 @@ func newKeyID(t *testing.T, c *Client, host string) string {
 	}
 	return id
 }
+
+// TestRotation_APreV47RetirementKeepsItsBoundary.
+//
+// v46 recorded retirement in two columns on audit_signing_keys. v47 moved it into
+// a signed append-only record and stopped reading them — with no backfill, so on
+// the first v47 start an already-retired key looks live, gets retired again, and
+// lands at TODAY's tail instead of its original boundary.
+//
+// That is not a cosmetic drift. Every row the leaked key signed between the
+// original boundary and now becomes legitimate: the window the operator rotated
+// to close is silently re-opened, and the RetiredKeyUse detection that was
+// covering it reports nothing.
+func TestRotation_APreV47RetirementKeepsItsBoundary(t *testing.T) {
+	ctx := context.Background()
+	c, oldKR, dir := signedClient(t, "node-0")
+	for _, id := range []string{"r1", "r2", "r3", "r4", "r5"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+
+	// The v46 state: retirement recorded in the old columns at seq 2, and no
+	// lifecycle record at all.
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET retired_at = ?, retired_at_seq = 2 WHERE key_id = ?`,
+		"2026-07-29T09:00:00Z", oldKR.KeyID()); err != nil {
+		t.Fatalf("seed the v46 retirement: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`DELETE FROM audit_key_lifecycle WHERE key_id = ?`, oldKR.KeyID()); err != nil {
+		t.Fatalf("clear v47 records: %v", err)
+	}
+
+	// First start on v47: the operator rotates.
+	rotateTo(t, c, dir, "node-0")
+
+	got := oneCol(t, c,
+		`SELECT at_seq FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`)
+	if got != "2" {
+		t.Fatalf("the pre-v47 boundary was re-derived as %q instead of 2\n"+
+			"every row the retired key signed between 2 and the current tail is silently "+
+			"legitimised — the exact window the rotation was performed to close", got)
+	}
+}

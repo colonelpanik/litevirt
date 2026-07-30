@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -375,13 +376,19 @@ func TestRotation_AStaleTailCannotPinTheBoundaryLow(t *testing.T) {
 		t.Fatalf("PublishAuditChainHead: %v", err)
 	}
 
-	// This replica is behind: it holds only the first two rows.
+	// This replica is behind: it holds only the first two rows. Keep what it is
+	// missing, because anti-entropy will hand it back — and the half of this that
+	// only shows up AFTER it does is the half that shipped broken.
+	missing := rowsByID(t, c, "r3", "r4")
 	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('r3','r4')`); err != nil {
 		t.Fatalf("simulate a stale replica: %v", err)
 	}
 	c.ResetAuditChainForTests()
 
 	rotateTo(t, c, dir, "node-0")
+
+	// The peers catch this node up.
+	restoreRows(t, c, missing)
 
 	got := oneCol(t, c,
 		`SELECT at_seq FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`)
@@ -390,4 +397,92 @@ func TestRotation_AStaleTailCannotPinTheBoundaryLow(t *testing.T) {
 			"attests to\na node restored from a snapshot would otherwise put rows 3-4, which "+
 			"its key legitimately signed, permanently past the boundary", got)
 	}
+
+	// And the SEALING HEAD must still describe one real row. Raising the boundary
+	// to the attested sequence while leaving the hash at the stale local tail
+	// publishes "at seq 4 the chain hashed to <row 2's hash>" — false by
+	// construction, permanent because heads are append-only, and reported as a
+	// chain head mismatch on every node forever. The lab produced exactly that.
+	for _, h := range headsFor(t, c, "node-0") {
+		if h.KeyID != newKeyID(t, c, "node-0") {
+			continue
+		}
+		actual, err := chainHashAt(ctx, c, "node-0", h.Seq)
+		if err != nil {
+			t.Fatalf("chainHashAt: %v", err)
+		}
+		if actual != "" && !strings.EqualFold(actual, h.HeadHash) {
+			t.Fatalf("the sealing head claims seq %d hashed to %s, but that row hashes to %s\n"+
+				"a head quotes ONE row's position and hash; taking the seq from the cluster "+
+				"and the hash from a stale local tail is a permanent false finding",
+				h.Seq, h.HeadHash, actual)
+		}
+	}
+	if res := verify(t, c); res.Tampered() {
+		t.Fatalf("rotating on a stale tail left the log reported as tampered: %+v", res)
+	}
+}
+
+// rowsByID snapshots whole audit rows so a test can hand them back the way
+// anti-entropy would.
+func rowsByID(t *testing.T, c *Client, ids ...string) []map[string]string {
+	t.Helper()
+	out := make([]map[string]string, 0, len(ids))
+	for _, id := range ids {
+		rows, err := c.Query(context.Background(),
+			`SELECT id, timestamp, username, host_name, action, target, detail, result,
+			        prev_hash, content_hash, key_id, signature, seq
+			 FROM audit_log WHERE id = ?`, id)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("read %s: %v (rows=%d)", id, err, len(rows))
+		}
+		r := rows[0]
+		out = append(out, map[string]string{
+			"id": r.String("id"), "timestamp": r.String("timestamp"),
+			"username": r.String("username"), "host_name": r.String("host_name"),
+			"action": r.String("action"), "target": r.String("target"),
+			"detail": r.String("detail"), "result": r.String("result"),
+			"prev_hash": r.String("prev_hash"), "content_hash": r.String("content_hash"),
+			"key_id": r.String("key_id"), "signature": r.String("signature"),
+			"seq": strconv.FormatInt(r.Int64("seq"), 10),
+		})
+	}
+	return out
+}
+
+func restoreRows(t *testing.T, c *Client, rows []map[string]string) {
+	t.Helper()
+	for _, r := range rows {
+		seq, _ := strconv.ParseInt(r["seq"], 10, 64)
+		if err := c.Execute(context.Background(),
+			`INSERT OR IGNORE INTO audit_log (id, timestamp, username, host_name, action, target,
+			                                  detail, result, prev_hash, content_hash, key_id,
+			                                  signature, seq)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r["id"], r["timestamp"], r["username"], r["host_name"], r["action"], r["target"],
+			r["detail"], r["result"], r["prev_hash"], r["content_hash"], r["key_id"],
+			r["signature"], seq); err != nil {
+			t.Fatalf("restore %s: %v", r["id"], err)
+		}
+	}
+}
+
+// headsFor returns every chain head recorded for a host.
+func headsFor(t *testing.T, c *Client, host string) []AuditChainHead {
+	t.Helper()
+	byKey, err := latestAuditHeadsByKey(context.Background(), c)
+	if err != nil {
+		t.Fatalf("latestAuditHeadsByKey: %v", err)
+	}
+	return byKey[host]
+}
+
+// newKeyID is the key a host currently signs with.
+func newKeyID(t *testing.T, c *Client, host string) string {
+	t.Helper()
+	id, _, err := ActiveAuditKeyID(context.Background(), c, c.AuditKeyringOf(), host)
+	if err != nil {
+		t.Fatalf("ActiveAuditKeyID: %v", err)
+	}
+	return id
 }

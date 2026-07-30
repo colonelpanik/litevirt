@@ -191,9 +191,16 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 		}
 		tail.known = true
 	}
-	seq, hash := tail.seq, tail.hash
+	// sealSeq/sealHash are ONE row's position and hash and must stay paired: a
+	// head is the assertion "at seq S this chain hashed to X", so quoting a seq
+	// from one row and a hash from another publishes a statement that is false by
+	// construction — and permanently, since heads are append-only.
+	sealSeq, sealHash := tail.seq, tail.hash
 	c.auditChain.mu.Unlock()
 
+	// The retirement boundary is a different question from the seal, and takes a
+	// different answer.
+	//
 	// The LOCAL tail can be behind. AdoptAuditKey runs early in daemon startup,
 	// well before the replicator and anti-entropy come up, so a node restored
 	// from an older snapshot sees a shorter log than the cluster holds. Retiring
@@ -202,20 +209,23 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	// could never be raised again.
 	//
 	// A signed head is the cluster's own record of how far this host's chain has
-	// been, and it is not something a stale replica can talk down. Take whichever
-	// is further along.
+	// been, and it is not something a stale replica can talk down. So the BOUNDARY
+	// takes whichever is further along — but the SEAL keeps the local pair, because
+	// this node cannot vouch for the hash at a position it has not seen.
+	boundarySeq := sealSeq
 	if attested, aerr := highestAttestedSeq(ctx, c, keyring, hostName); aerr != nil {
 		return "", aerr
-	} else if attested > seq {
+	} else if attested > boundarySeq {
 		slog.Warn("this host's local audit log is behind what its own signed chain heads "+
 			"attest to; retiring at the attested sequence so a stale replica cannot pin the "+
-			"boundary below rows the key legitimately signed",
-			"host", hostName, "local_tail", seq, "attested", attested)
-		seq = attested
+			"boundary below rows the key legitimately signed. The sealing head stays at the "+
+			"local tail, which is the furthest position this node can actually vouch for",
+			"host", hostName, "local_tail", sealSeq, "attested", attested)
+		boundarySeq = attested
 	}
 
 	for _, old := range superseded {
-		if err := RetireAuditKey(ctx, c, keyring, hostName, old, seq); err != nil {
+		if err := RetireAuditKey(ctx, c, keyring, hostName, old, boundarySeq); err != nil {
 			return "", err
 		}
 	}
@@ -224,19 +234,19 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	// This is the part that actually matters: without it, rotation would swap
 	// which key signs future rows and leave every past row rewritable by
 	// whoever holds the old one.
-	if seq > 0 {
+	if sealSeq > 0 {
 		epoch, eerr := currentAuditEpoch(ctx, c, hostName)
 		if eerr != nil {
 			return "", eerr
 		}
-		if err := insertAuditChainHead(ctx, c, keyring, hostName, epoch+1, seq, hash); err != nil {
+		if err := insertAuditChainHead(ctx, c, keyring, hostName, epoch+1, sealSeq, sealHash); err != nil {
 			return "", fmt.Errorf("seal the retired key's history: %w", err)
 		}
 	}
 
 	slog.Warn("audit signing key rotated; the previous key can no longer sign valid rows "+
 		"and the history it wrote is sealed under the new key",
-		"host", hostName, "retired", superseded, "new_key", keyring.KeyID(), "sealed_through_seq", seq)
+		"host", hostName, "retired", superseded, "new_key", keyring.KeyID(), "retired_at_seq", boundarySeq, "sealed_through_seq", sealSeq)
 	return superseded[0], nil
 }
 

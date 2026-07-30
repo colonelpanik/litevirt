@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"github.com/litevirt/litevirt/internal/netutil"
 	"log/slog"
 	"net"
 	"os"
@@ -2159,12 +2160,10 @@ func splitCIDR(cidr string) [2]string {
 
 // getLocalIP returns the outbound IP of this host.
 func getLocalIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
+	if ip := netutil.OutboundIP(); ip != "" {
+		return ip
 	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	return "127.0.0.1"
 }
 
 // SetVMIP updates the IP address of a VM interface in the state store.
@@ -2823,10 +2822,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				}
 			} else {
 				// No resource id: a GROW's row is already visible everywhere, so a
-			// visibility signal would free the delegated lease immediately while the
-			// holder's usage still reflects the OLD size — under-counting exactly the
-			// amount being added. A grow leans on the settle grace instead.
-			lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow)
+				// visibility signal would free the delegated lease immediately while the
+				// holder's usage still reflects the OLD size — under-counting exactly the
+				// amount being added. A grow leans on the settle grace instead.
+				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow)
 				if aerr != nil {
 					return nil, aerr
 				}

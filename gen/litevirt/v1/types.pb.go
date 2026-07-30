@@ -3851,6 +3851,11 @@ type Host struct {
 	IpmiAddress   string                 `protobuf:"bytes,18,opt,name=ipmi_address,json=ipmiAddress,proto3" json:"ipmi_address,omitempty"`
 	WatchdogDev   string                 `protobuf:"bytes,19,opt,name=watchdog_dev,json=watchdogDev,proto3" json:"watchdog_dev,omitempty"`
 	Region        string                 `protobuf:"bytes,20,opt,name=region,proto3" json:"region,omitempty"` // federation: failure-domain label
+	// Serial of the host's mTLS certificate. Not secret — it is the public
+	// identifier of a public certificate — and `lv host rm` needs it to revoke that
+	// certificate at the moment of removal, after which the row is tombstoned and
+	// the serial is no longer readable.
+	CertSerial    string `protobuf:"bytes,21,opt,name=cert_serial,json=certSerial,proto3" json:"cert_serial,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4021,6 +4026,13 @@ func (x *Host) GetWatchdogDev() string {
 func (x *Host) GetRegion() string {
 	if x != nil {
 		return x.Region
+	}
+	return ""
+}
+
+func (x *Host) GetCertSerial() string {
+	if x != nil {
+		return x.CertSerial
 	}
 	return ""
 }
@@ -5842,7 +5854,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rselector_kind\x18\x02 \x01(\tR\fselectorKind\x121\n" +
 	"\adesired\x18\x03 \x01(\v2\x17.litevirt.v1.DeviceSpecR\adesired\x128\n" +
 	"\amembers\x18\x04 \x03(\v2\x1e.litevirt.v1.HardwarePCIMemberR\amembers\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\xc4\x06\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\xe5\x06\n" +
 	"\x04Host\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12,\n" +
@@ -5868,7 +5880,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x0efence_strategy\x18\x11 \x01(\tR\rfenceStrategy\x12!\n" +
 	"\fipmi_address\x18\x12 \x01(\tR\vipmiAddress\x12!\n" +
 	"\fwatchdog_dev\x18\x13 \x01(\tR\vwatchdogDev\x12\x16\n" +
-	"\x06region\x18\x14 \x01(\tR\x06region\x1a9\n" +
+	"\x06region\x18\x14 \x01(\tR\x06region\x12\x1f\n" +
+	"\vcert_serial\x18\x15 \x01(\tR\n" +
+	"certSerial\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x99\x02\n" +

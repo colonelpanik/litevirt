@@ -173,14 +173,14 @@ const adoptionSettleWindow = 10 * time.Minute
 // cluster's entire pre-enforcement history — 659 legacy rows per node on the lab.
 // This needs no start: it says the host declared it signs and demonstrably cannot,
 // which is true regardless of which rows predate what.
-func signingContracts(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]signingContract, []unadoptedCert, error) {
+func signingContracts(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]signingContract, []unadoptedCert, map[lifecycleKey]map[string]int64, error) {
 	lifecycle, err := auditKeyLifecycle(ctx, c, keyring)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	rows, err := c.Query(ctx, `SELECT host_name, key_id, created_at FROM audit_signing_keys`)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list audit signing certificates: %w", err)
+		return nil, nil, nil, fmt.Errorf("list audit signing certificates: %w", err)
 	}
 	out := map[string]signingContract{}
 	var unadopted []unadoptedCert
@@ -230,7 +230,7 @@ func signingContracts(ctx context.Context, c *Client, keyring *AuditKeyring) (ma
 			out[host] = signingContract{startSeq: start}
 		}
 	}
-	return out, unadopted, nil
+	return out, unadopted, lifecycle, nil
 }
 
 // AdoptAuditKey publishes this host's certificate and, if the host was
@@ -512,13 +512,23 @@ func auditKeyRetirements(ctx context.Context, c *Client, keyring *AuditKeyring) 
 	if err != nil {
 		return nil, err
 	}
+	return retirementsFrom(lifecycle), nil
+}
+
+// retirementsFrom projects an already-read lifecycle map, for callers that need
+// both views and should not pay for the table twice.
+//
+// auditKeyLifecycle is not a cheap read: it scans the table unfiltered and does an
+// ECDSA verify plus an ownership check per row. VerifyAuditChain wants retirements
+// AND contracts, and used to take that cost twice for one verify.
+func retirementsFrom(lifecycle map[lifecycleKey]map[string]int64) map[lifecycleKey]int64 {
 	out := make(map[lifecycleKey]int64, len(lifecycle))
 	for lk, events := range lifecycle {
 		if seq, ok := events[auditLifecycleRetired]; ok {
 			out[lk] = seq
 		}
 	}
-	return out, nil
+	return out
 }
 
 // RecordSignedRetirement records a retirement the CALLER signed, after checking

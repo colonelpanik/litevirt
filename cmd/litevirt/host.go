@@ -276,15 +276,7 @@ func newHostRmCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{
-					Name:  args[0],
-					Force: force,
-				})
-				if err != nil {
-					return fmt.Errorf("remove host: %w", err)
-				}
-				fmt.Printf("Host %s removed from cluster.\n", args[0])
-				return nil
+				return cli.HostRemove(ctx, c, args[0], force)
 			})
 		},
 	}

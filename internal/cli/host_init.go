@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"github.com/litevirt/litevirt/internal/netutil"
 	"log/slog"
 	"net"
 	"os"
@@ -372,7 +373,7 @@ func mintLocalHostCert(pkiDir, hostName, addr string) error {
 	caPath := filepath.Join(pkiDir, "ca.crt")
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
 	if addr == "" {
-		addr = outboundIP()
+		addr = netutil.OutboundIP()
 	}
 	ip := net.ParseIP(addr)
 	if ip == nil {
@@ -387,18 +388,6 @@ func mintLocalHostCert(pkiDir, hostName, addr string) error {
 	return pki.GenerateHostCert(caPath, caKeyPath,
 		filepath.Join(pkiDir, hostName+".crt"), filepath.Join(pkiDir, hostName+".key"),
 		hostName, ip)
-}
-
-// outboundIP is the source address toward the default route. Correct on a
-// single-homed box and wrong on any host whose cluster network is not the default
-// one — which is what --address is for.
-func outboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
 func HostInitLocal(ctx context.Context, hostName, advertiseAddr string) error {

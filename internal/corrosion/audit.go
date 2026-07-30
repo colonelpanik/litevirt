@@ -419,10 +419,6 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		return res, fmt.Errorf("list audit_log: %w", err)
 	}
 	keyring := c.AuditKeyringOf()
-	retired, err := auditKeyRetirements(ctx, c, keyring)
-	if err != nil {
-		return res, err
-	}
 	// Which hosts are under a signing contract, computed BEFORE the walk.
 	//
 	// This used to be a latch set as the walk went — "has this host produced a
@@ -431,10 +427,15 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	// timestamp older than the host's first real row, arrived while the latch
 	// was still false, and escaped every check. A fact read up front from
 	// replicated state cannot be reordered into being false.
-	contracted, unadopted, err := signingContracts(ctx, c, keyring)
+	//
+	// The lifecycle map comes back with it: retirements are a projection of the same
+	// rows, and reading them separately meant scanning the table and re-verifying
+	// every signature on it twice per verify.
+	contracted, unadopted, lifecycle, err := signingContracts(ctx, c, keyring)
 	if err != nil {
 		return res, err
 	}
+	retired := retirementsFrom(lifecycle)
 	for _, u := range unadopted {
 		res.NeverAdopted = append(res.NeverAdopted, fmt.Sprintf(
 			"%s: published signing certificate %s at %s but never recorded an adoption — "+

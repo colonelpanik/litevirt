@@ -53,6 +53,7 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 			Version:      h.Version,
 			StoragePools: pools,
 			Region:       h.Region,
+			CertSerial:   h.CertSerial,
 			CreatedAt:    parseTimestamp(h.CreatedAt),
 			UpdatedAt:    parseTimestamp(h.UpdatedAt),
 		}
@@ -97,6 +98,7 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 		IpmiAddress:   h.IPMIAddress,
 		WatchdogDev:   h.WatchdogDev,
 		Region:        h.Region,
+		CertSerial:    h.CertSerial,
 		CreatedAt:     parseTimestamp(h.CreatedAt),
 		UpdatedAt:     parseTimestamp(h.UpdatedAt),
 	}, nil

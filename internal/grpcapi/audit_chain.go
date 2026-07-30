@@ -252,7 +252,7 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	// exactly the key and sequence reported above, so a stale or substituted
 	// phase-1 answer cannot be replayed against a different boundary.
 	if err := corrosion.RecordSignedRetirement(ctx, s.db, s.pkiDir, host, active, seq,
-		req.GetCertPem(), req.GetSignature(), req.GetSelfSignature()); err != nil {
+		req.GetCertPem(), req.GetSignature(), req.GetSelfSignature(), req.GetCaSignature()); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 

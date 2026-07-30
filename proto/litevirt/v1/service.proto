@@ -2483,6 +2483,16 @@ message RetireAuditKeyRequest {
     // from the moment it was minted — and a plain int64 could not tell that apart
     // from "not supplied".
     optional int64 at_seq = 5;
+    // The retirement, signed with the cluster CA PRIVATE KEY.
+    //
+    // This is what carries standing. A lifecycle record is honoured only from the key
+    // itself or from the cluster CA — anything else is a signer speaking about a key
+    // that is not its own, which is how a leaked, already-retired key could retire its
+    // own successor and silently switch a host's tamper-evidence off. Retiring a host
+    // that cannot sign for itself is exactly what holding ca.key authorises, so the CA
+    // says so directly rather than through a minted leaf that has to be argued into
+    // standing.
+    string ca_signature = 7;
     // Permit an at_seq BELOW the boundary the server derives.
     //
     // Lowering a boundary is the unrecoverable direction: lifecycle records are

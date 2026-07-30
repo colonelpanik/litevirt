@@ -440,9 +440,9 @@ var capabilityMap = map[string]tableResolver{
 	// legitimately differ for one primary key, so a tie here already means
 	// something is wrong; the default chain settles it deterministically
 	// rather than leaving the cluster divergent.
-	"audit_signing_keys":      {category: "content", chain: contentDefaultChain()},
-	"audit_chain_heads":       {category: "content", chain: contentDefaultChain()},
-	"audit_key_lifecycle":   {category: "content", chain: contentDefaultChain()},
+	"audit_signing_keys":  {category: "content", chain: contentDefaultChain()},
+	"audit_chain_heads":   {category: "content", chain: contentDefaultChain()},
+	"audit_key_lifecycle": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

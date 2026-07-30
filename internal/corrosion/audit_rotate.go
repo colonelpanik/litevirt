@@ -270,6 +270,20 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	if err != nil {
 		return "", err
 	}
+	// Strictly above every adoption this host has already recorded.
+	//
+	// Standing is ordered by first adoption — a successor may retire its predecessor,
+	// a predecessor may never retire its successor — and that ordering only holds if
+	// adoptions cannot TIE. They otherwise do, routinely: a rotation adopts at the
+	// sequence the chain has reached, so on a host that has written nothing since the
+	// previous adoption both keys land on the same number and neither can be shown to
+	// be the successor. Raising the start by one row is the conservative direction
+	// anyway (it excuses one more pre-contract row, never condemns one).
+	if prior, perr := highestAdoption(ctx, c, keyring, hostName); perr != nil {
+		return "", perr
+	} else if startSeq <= prior {
+		startSeq = prior + 1
+	}
 	if err := AdoptAuditKeyContract(ctx, c, keyring, hostName, startSeq); err != nil {
 		return "", fmt.Errorf("record the signing contract start: %w", err)
 	}
@@ -466,7 +480,7 @@ func auditKeyLifecycle(ctx context.Context, c *Client, keyring *AuditKeyring) (m
 	if err != nil {
 		return nil, fmt.Errorf("list audit key lifecycle: %w", err)
 	}
-	out := map[lifecycleKey]map[string]int64{}
+	var verified []lifecycleRow
 	for _, r := range rows {
 		host, keyID, event := r.String("host_name"), r.String("key_id"), r.String("event")
 		seq := r.Int64("at_seq")
@@ -483,26 +497,115 @@ func auditKeyLifecycle(ctx context.Context, c *Client, keyring *AuditKeyring) (m
 				"host", host, "key", keyID, "event", event)
 			continue
 		}
-		lk := lifecycleKey{host: host, keyID: keyID}
+		verified = append(verified, lifecycleRow{
+			host: host, keyID: keyID, event: event, seq: seq, byKeyID: r.String("by_key_id"),
+		})
+	}
+	return reduceLifecycle(verified), nil
+}
+
+// lifecycleRow is one record that passed signature and ownership checks. Standing —
+// whether its SIGNER was entitled to say it — is decided afterwards, because that
+// needs every adoption in hand.
+type lifecycleRow struct {
+	host, keyID, event, byKeyID string
+	seq                         int64
+}
+
+// reduceLifecycle applies the signer-standing rule and folds the survivors.
+//
+// The missing rule, and the worst hole on this branch: a record was admitted if its
+// signature verified and the SUBJECT key belonged to the host. Nothing asked whether
+// the SIGNER still had standing — and certFor deliberately keeps retired
+// certificates resolvable, so a key that had already been rotated out and retired
+// still verified. A leaked key could therefore sign a retirement for its own
+// SUCCESSOR: the host then stopped signing (setupAuditSigning refuses a retired
+// key), left every signing contract, and `lv audit verify` reported the log CLEAN
+// while its rows were unsigned and freely rewritable. Unrecoverable — rotating again
+// just produced another successor to retire, retirements are append-only, and the
+// earliest one wins. Reproduced before fixing.
+//
+// Standing has exactly two sources:
+//
+//   - the key ITSELF (by_key_id == key_id) — a voluntary stop, and the shape a
+//     rotation's own adoption always takes;
+//   - the CLUSTER CA (by_key_id == auditCASigner) — the operator, speaking for a
+//     host that cannot speak for itself, which is precisely what holding ca.key
+//     authorises. Producing that signature requires the CA private key, which lives
+//     in the operator's config directory and on no node.
+//
+// An earlier attempt ordered standing by adoption sequence — "only a key adopted
+// later may retire you". It is unsound twice over: adoption takes the LATEST record,
+// so a key's holder can inflate their own adoption at will, and on a quiet host a
+// rotation adopts the new key at the same sequence as the old one, so the two cannot
+// be ordered at all. Neither problem exists once the CA says so directly.
+func reduceLifecycle(rows []lifecycleRow) map[lifecycleKey]map[string]int64 {
+	// Pass 1: EARLIEST self-signed adoption per key. Earliest, not latest, precisely
+	// because standing is decided from it — a key's holder can always append another
+	// adoption record, so the latest is theirs to inflate, while the first one ever
+	// written is not. (The contract START still takes the latest, below: the two
+	// questions want opposite ends and conflating them is what made this exploitable.)
+	firstAdopted := map[lifecycleKey]int64{}
+	for _, r := range rows {
+		if r.event != auditLifecycleAdopted || r.byKeyID != r.keyID {
+			continue
+		}
+		lk := lifecycleKey{host: r.host, keyID: r.keyID}
+		if cur, seen := firstAdopted[lk]; !seen || r.seq < cur {
+			firstAdopted[lk] = r.seq
+		}
+	}
+
+	out := map[lifecycleKey]map[string]int64{}
+	for _, r := range rows {
+		lk := lifecycleKey{host: r.host, keyID: r.keyID}
+		if r.byKeyID != r.keyID && r.byKeyID != auditCASigner {
+			// A SUCCESSOR may retire its predecessor — that is what a rotation is, and
+			// the daemon performing it has no access to the CA. Ordered by first
+			// adoption, which is strictly increasing per host (AdoptAuditKey refuses to
+			// tie), so a predecessor can never turn around and retire its successor.
+			signerAdopted, ok := firstAdopted[lifecycleKey{host: r.host, keyID: r.byKeyID}]
+			if r.event != auditLifecycleRetired || !ok || signerAdopted <= firstAdopted[lk] {
+				slog.Warn("ignoring an audit key lifecycle record whose signer has no standing "+
+					"over the key it names; only the key itself, a later-adopted key of the same "+
+					"host, or the cluster CA may speak for it",
+					"host", r.host, "key", r.keyID, "event", r.event, "signed_by", r.byKeyID)
+				continue
+			}
+		}
 		if out[lk] == nil {
 			out[lk] = map[string]int64{}
 		}
-		// The strictest verified value wins: the LATEST adoption (the contract
-		// starts as late as anyone can prove) and the EARLIEST retirement.
-		//
-		// Several verified records for one (host, key, event) are expected now
-		// that by_key_id is part of the primary key — a rotation and an operator
-		// `lv host retire-audit-key` legitimately retire the same key with
-		// different signers.
-		prev, seen := out[lk][event]
+		// The strictest verified value wins: the LATEST adoption (the contract starts
+		// as late as anyone can prove) and the EARLIEST retirement.
+		prev, seen := out[lk][r.event]
 		switch {
 		case !seen,
-			event == auditLifecycleAdopted && seq > prev,
-			event == auditLifecycleRetired && seq < prev:
-			out[lk][event] = seq
+			r.event == auditLifecycleAdopted && r.seq > prev,
+			r.event == auditLifecycleRetired && r.seq < prev:
+			out[lk][r.event] = r.seq
 		}
 	}
-	return out, nil
+	return out
+}
+
+// highestAdoption is the largest verified adoption sequence recorded for a host,
+// or -1 when it has none.
+func highestAdoption(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (int64, error) {
+	lifecycle, err := auditKeyLifecycle(ctx, c, keyring)
+	if err != nil {
+		return 0, err
+	}
+	best := int64(-1)
+	for lk, events := range lifecycle {
+		if lk.host != hostName {
+			continue
+		}
+		if seq, ok := events[auditLifecycleAdopted]; ok && seq > best {
+			best = seq
+		}
+	}
+	return best, nil
 }
 
 // auditKeyRetirements maps (host, key) → the last sequence that key was entitled
@@ -548,7 +651,7 @@ func retirementsFrom(lifecycle map[lifecycleKey]map[string]int64) map[lifecycleK
 // created to END a signing contract would stand as a new one — claiming the host
 // signs with a key nobody holds, and putting every unsigned row it writes from
 // then on back under a contract.
-func RecordSignedRetirement(ctx context.Context, c *Client, pkiDir, hostName, retiredKeyID string, seq int64, certPEM, sig, selfSig string) error {
+func RecordSignedRetirement(ctx context.Context, c *Client, pkiDir, hostName, retiredKeyID string, seq int64, certPEM, sig, selfSig, caSig string) error {
 	verifier, err := LoadAuditVerifier(pkiDir)
 	if err != nil {
 		return fmt.Errorf("load cluster CA: %w", err)
@@ -590,15 +693,31 @@ func RecordSignedRetirement(ctx context.Context, c *Client, pkiDir, hostName, re
 			return fmt.Errorf("%s does not verify: %w", r.what, err)
 		}
 	}
+	// The CA signature is the one that carries standing. The minted certificate's own
+	// two signatures bind the operation and retire the certificate itself, but a
+	// leaf — even a CA-signed one — has no authority over another key, or a leaked
+	// key could retire its successor. Only the CA does.
+	if err := verifier.VerifyLifecycle(ctx, c, hostName, retiredKeyID,
+		auditLifecycleRetired, seq, auditCASigner, caSig); err != nil {
+		return fmt.Errorf("the cluster CA's retirement signature does not verify: %w", err)
+	}
 	pub := &AuditKeyring{hostName: hostName, keyID: byKeyID, certPEM: certPEM}
 	if err := pub.publishCert(ctx, c); err != nil {
 		return fmt.Errorf("publish the retirement certificate: %w", err)
 	}
-	for _, keyID := range []string{retiredKeyID, byKeyID} {
-		s := sig
-		if keyID == byKeyID {
-			s = selfSig
-		}
+	// The subject's retirement is recorded under the CA, which is what every reader
+	// checks standing against; the minted certificate self-retires under its own key.
+	if err := c.Execute(ctx,
+		`INSERT OR IGNORE INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		hostName, retiredKeyID, auditLifecycleRetired, seq, auditCASigner, caSig,
+		c.NowWall(), c.NowTS()); err != nil {
+		return fmt.Errorf("record the CA retirement of %s: %w", retiredKeyID, err)
+	}
+	for _, keyID := range []string{byKeyID} {
+		s := selfSig
+		_ = sig
 		if err := c.Execute(ctx,
 			`INSERT OR IGNORE INTO audit_key_lifecycle
 			   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)

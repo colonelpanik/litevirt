@@ -86,6 +86,7 @@ type AuditKeyring struct {
 	certPEM  string
 	key      *ecdsa.PrivateKey // nil ⇒ verify-only keyring
 	roots    *x509.CertPool
+	caCert   *x509.Certificate
 
 	mu     sync.RWMutex
 	verify map[string]*x509.Certificate // key_id → CA-verified certificate
@@ -231,6 +232,50 @@ func PublishSigningCertOnly(ctx context.Context, c *Client, pkiDir, hostName str
 	return id, k.publishCert(ctx, c)
 }
 
+// SignLifecycleWithCA signs a lifecycle assertion with the cluster CA private key.
+//
+// Only the operator can call it — ca.key lives in their config directory and on no
+// cluster node — and it is what gives a retirement standing over a key whose holder
+// cannot or will not sign it themselves.
+func SignLifecycleWithCA(pkiDir, hostName, keyID, event string, seq int64) (string, error) {
+	keyPEM, err := os.ReadFile(filepath.Join(pkiDir, "ca.key"))
+	if err != nil {
+		return "", fmt.Errorf("read cluster CA private key: %w", err)
+	}
+	blk, _ := pem.Decode(keyPEM)
+	if blk == nil {
+		return "", fmt.Errorf("cluster CA private key has no PEM block")
+	}
+	key, err := x509.ParseECPrivateKey(blk.Bytes)
+	if err != nil {
+		k8, err8 := x509.ParsePKCS8PrivateKey(blk.Bytes)
+		if err8 != nil {
+			return "", fmt.Errorf("parse cluster CA private key: %w", err)
+		}
+		ec, ok := k8.(*ecdsa.PrivateKey)
+		if !ok {
+			return "", fmt.Errorf("cluster CA private key is not ECDSA")
+		}
+		key = ec
+	}
+	sig, err := ecdsa.SignASN1(rand.Reader, key,
+		auditLifecycleDigest(hostName, keyID, event, seq, auditCASigner))
+	if err != nil {
+		return "", fmt.Errorf("sign %s of %s with the cluster CA: %w", event, keyID, err)
+	}
+	return hex.EncodeToString(sig), nil
+}
+
+// auditCASigner is the reserved by_key_id of a lifecycle record signed with the
+// cluster CA private key itself.
+//
+// The CA is the root of trust every node already holds, and it is the only party
+// entitled to speak about a host that cannot speak for itself. Making that explicit
+// is what lets the standing rule below be simple: everyone else may retire only
+// their own key, and the operator — who must hold ca.key to complete a retirement
+// anyway — is not squeezed through an ordering rule that cannot express them.
+const auditCASigner = "cluster-ca"
+
 func loadAuditRoots(pkiDir string) (*AuditKeyring, error) {
 	caPEM, err := os.ReadFile(filepath.Join(pkiDir, "ca.crt"))
 	if err != nil {
@@ -240,7 +285,11 @@ func loadAuditRoots(pkiDir string) (*AuditKeyring, error) {
 	if !roots.AppendCertsFromPEM(caPEM) {
 		return nil, fmt.Errorf("cluster CA at %s contains no usable certificate", pkiDir)
 	}
-	return &AuditKeyring{roots: roots, verify: map[string]*x509.Certificate{}}, nil
+	caCert, err := parseCertPEM(caPEM)
+	if err != nil {
+		return nil, fmt.Errorf("cluster CA at %s: %w", pkiDir, err)
+	}
+	return &AuditKeyring{roots: roots, caCert: caCert, verify: map[string]*x509.Certificate{}}, nil
 }
 
 // AuditKeyID is the stable identifier of a signing certificate: the SHA-256 of
@@ -417,7 +466,11 @@ func (k *AuditKeyring) verifySig(ctx context.Context, c *Client, hostName, keyID
 	// The certificate names the host, so a signature can only ever attest to
 	// rows for the host that owns the key. Without this a compromised node
 	// could sign rows claiming to come from any other host in the cluster.
-	if cert.Subject.CommonName != hostName {
+	//
+	// The cluster CA is the exception, and deliberately: speaking for a host that
+	// cannot speak for itself is exactly what holding the CA authorises, and its CN
+	// is the CA's own name rather than any host's.
+	if keyID != auditCASigner && cert.Subject.CommonName != hostName {
 		return fmt.Errorf("key %s belongs to host %q but signed a row for %q",
 			keyID, cert.Subject.CommonName, hostName)
 	}
@@ -441,6 +494,12 @@ func (k *AuditKeyring) verifySig(ctx context.Context, c *Client, hostName, keyID
 func (k *AuditKeyring) certFor(ctx context.Context, c *Client, keyID string) (*x509.Certificate, error) {
 	if keyID == "" {
 		return nil, fmt.Errorf("row carries no key id")
+	}
+	if keyID == auditCASigner {
+		if k.caCert == nil {
+			return nil, fmt.Errorf("no cluster CA certificate loaded")
+		}
+		return k.caCert, nil
 	}
 	k.mu.RLock()
 	cert := k.verify[keyID]

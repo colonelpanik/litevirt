@@ -22107,6 +22107,16 @@ type RetireAuditKeyRequest struct {
 	// from the moment it was minted — and a plain int64 could not tell that apart
 	// from "not supplied".
 	AtSeq *int64 `protobuf:"varint,5,opt,name=at_seq,json=atSeq,proto3,oneof" json:"at_seq,omitempty"`
+	// The retirement, signed with the cluster CA PRIVATE KEY.
+	//
+	// This is what carries standing. A lifecycle record is honoured only from the key
+	// itself or from the cluster CA — anything else is a signer speaking about a key
+	// that is not its own, which is how a leaked, already-retired key could retire its
+	// own successor and silently switch a host's tamper-evidence off. Retiring a host
+	// that cannot sign for itself is exactly what holding ca.key authorises, so the CA
+	// says so directly rather than through a minted leaf that has to be argued into
+	// standing.
+	CaSignature string `protobuf:"bytes,7,opt,name=ca_signature,json=caSignature,proto3" json:"ca_signature,omitempty"`
 	// Permit an at_seq BELOW the boundary the server derives.
 	//
 	// Lowering a boundary is the unrecoverable direction: lifecycle records are
@@ -22183,6 +22193,13 @@ func (x *RetireAuditKeyRequest) GetAtSeq() int64 {
 		return *x.AtSeq
 	}
 	return 0
+}
+
+func (x *RetireAuditKeyRequest) GetCaSignature() string {
+	if x != nil {
+		return x.CaSignature
+	}
+	return ""
 }
 
 func (x *RetireAuditKeyRequest) GetForce() bool {
@@ -24861,13 +24878,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fretired_key_use\x18\r \x03(\tR\rretiredKeyUse\x12#\n" +
 	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\x122\n" +
 	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\x12#\n" +
-	"\rnever_adopted\x18\x10 \x03(\tR\fneverAdopted\"\xd1\x01\n" +
+	"\rnever_adopted\x18\x10 \x03(\tR\fneverAdopted\"\xf4\x01\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +
 	"\tsignature\x18\x03 \x01(\tR\tsignature\x12%\n" +
 	"\x0eself_signature\x18\x04 \x01(\tR\rselfSignature\x12\x1a\n" +
-	"\x06at_seq\x18\x05 \x01(\x03H\x00R\x05atSeq\x88\x01\x01\x12\x14\n" +
+	"\x06at_seq\x18\x05 \x01(\x03H\x00R\x05atSeq\x88\x01\x01\x12!\n" +
+	"\fca_signature\x18\a \x01(\tR\vcaSignature\x12\x14\n" +
 	"\x05force\x18\x06 \x01(\bR\x05forceB\t\n" +
 	"\a_at_seq\"d\n" +
 	"\x16RetireAuditKeyResponse\x12$\n" +

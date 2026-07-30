@@ -57,7 +57,7 @@ func retireFixture(t *testing.T, host string) (*Server, string, string) {
 }
 
 // mintRetirement produces what a real `lv host retire-audit-key` sends in phase 2.
-func mintRetirement(t *testing.T, caDir, host string, retiredKeyID string, seq int64) (certPEM, sig, selfSig string) {
+func mintRetirement(t *testing.T, caDir, host string, retiredKeyID string, seq int64) (certPEM, sig, selfSig, adoptSig string) {
 	t.Helper()
 	tmp := t.TempDir()
 	certPath := filepath.Join(tmp, pki.AuditSigningCertName)
@@ -79,11 +79,17 @@ func mintRetirement(t *testing.T, caDir, host string, retiredKeyID string, seq i
 	if err != nil {
 		t.Fatalf("SignLifecycle self: %v", err)
 	}
+	// The CA signature is what carries standing over the key being retired — a leaf,
+	// even a CA-signed one, has authority over nobody but itself. See reduceLifecycle.
+	s3, err := corrosion.SignLifecycleWithCA(caDir, host, retiredKeyID, "retired", seq)
+	if err != nil {
+		t.Fatalf("SignLifecycleWithCA: %v", err)
+	}
 	b, err := os.ReadFile(certPath)
 	if err != nil {
 		t.Fatalf("read cert: %v", err)
 	}
-	return string(b), s1, s2
+	return string(b), s1, s2, s3
 }
 
 // TestRetireAuditKey_PhaseOneWritesNothing. Phase 1 answers what would be
@@ -123,14 +129,14 @@ func TestRetireAuditKey_PhaseTwoRejectsBadSubmissions(t *testing.T) {
 			if err := pki.GenerateCA(filepath.Join(other, "ca.crt"), filepath.Join(other, "ca.key")); err != nil {
 				t.Fatalf("GenerateCA: %v", err)
 			}
-			c, _, _ := mintRetirement(t, other, "node-1", "x", 0)
+			c, _, _, _ := mintRetirement(t, other, "node-1", "x", 0)
 			return c, sig, self
 		}},
 		{"certificate names a different host", func(_, sig, self string) (string, string, string) {
 			// Minted from the RIGHT CA but for the wrong host.
 			s2, dir2, k2 := retireFixture(t, "node-other")
 			_ = s2
-			c, _, _ := mintRetirement(t, dir2, "node-other", k2, 0)
+			c, _, _, _ := mintRetirement(t, dir2, "node-other", k2, 0)
 			return c, sig, self
 		}},
 		{"retirement signature is wrong", func(cert, _, self string) (string, string, string) {
@@ -146,11 +152,11 @@ func TestRetireAuditKey_PhaseTwoRejectsBadSubmissions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("phase 1: %v", err)
 			}
-			cert, sig, self := mintRetirement(t, dir, "node-1", keyID, plan.RetiredAtSeq)
+			cert, sig, self, adopt := mintRetirement(t, dir, "node-1", keyID, plan.RetiredAtSeq)
 			cert, sig, self = tc.breakIt(cert, sig, self)
 
 			if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-				HostName: "node-1", CertPem: cert, Signature: sig, SelfSignature: self,
+				HostName: "node-1", CertPem: cert, Signature: sig, SelfSignature: self, CaSignature: adopt,
 			}); err == nil {
 				t.Fatal("phase 2 accepted a submission it should have refused")
 			}
@@ -177,10 +183,10 @@ func TestRetireAuditKey_PhaseTwoSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("phase 1: %v", err)
 	}
-	cert, sig, self := mintRetirement(t, dir, "node-1", keyID, plan.RetiredAtSeq)
+	cert, sig, self, adopt := mintRetirement(t, dir, "node-1", keyID, plan.RetiredAtSeq)
 
 	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-		HostName: "node-1", CertPem: cert, Signature: sig, SelfSignature: self,
+		HostName: "node-1", CertPem: cert, Signature: sig, SelfSignature: self, CaSignature: adopt,
 	}); err != nil {
 		t.Fatalf("phase 2 refused a well-formed submission: %v", err)
 	}
@@ -302,9 +308,9 @@ func TestRetireAuditKey_AtSeqOverridesAPoisonedHead(t *testing.T) {
 	}
 
 	// And phase 2 records it at exactly that sequence.
-	certPEM, rsig, selfSig := mintRetirement(t, dir, "node-1", keyID, 7)
+	certPEM, rsig, selfSig, adoptSig := mintRetirement(t, dir, "node-1", keyID, 7)
 	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-		HostName: "node-1", CertPem: certPEM, Signature: rsig, SelfSignature: selfSig, AtSeq: at(7),
+		HostName: "node-1", CertPem: certPEM, Signature: rsig, SelfSignature: selfSig, CaSignature: adoptSig, AtSeq: at(7),
 	}); err != nil {
 		t.Fatalf("phase 2 with the override: %v", err)
 	}
@@ -328,9 +334,9 @@ func TestRetireAuditKey_AtSeqStillVerifiesTheSignatures(t *testing.T) {
 	s, dir, keyID := retireFixture(t, "node-1")
 
 	// Signatures made for sequence 7, submitted against a claimed boundary of 9.
-	certPEM, sig, selfSig := mintRetirement(t, dir, "node-1", keyID, 7)
+	certPEM, sig, selfSig, adoptSig := mintRetirement(t, dir, "node-1", keyID, 7)
 	_, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig, AtSeq: at(9), Force: true,
+		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig, CaSignature: adoptSig, AtSeq: at(9), Force: true,
 	})
 	if err == nil {
 		t.Fatal("--at-seq accepted signatures made over a different sequence\n" +
@@ -407,9 +413,9 @@ func TestRetireAuditKey_AtSeqBelowTheDerivedBoundaryNeedsForce(t *testing.T) {
 	}
 
 	// With --force, the operator gets what they asked for.
-	certPEM, sig, selfSig := mintRetirement(t, dir, "node-1", keyID, 1)
+	certPEM, sig, selfSig, adoptSig := mintRetirement(t, dir, "node-1", keyID, 1)
 	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig,
+		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig, CaSignature: adoptSig,
 		AtSeq: at(1), Force: true,
 	}); err != nil {
 		t.Fatalf("--force did not permit a deliberate lower boundary: %v", err)
@@ -444,9 +450,9 @@ func TestRetireAuditKey_TheAuditRecordNamesAnOverride(t *testing.T) {
 	ctx := context.Background()
 	s, dir, keyID := retireFixture(t, "node-1")
 
-	certPEM, sig, selfSig := mintRetirement(t, dir, "node-1", keyID, 9)
+	certPEM, sig, selfSig, adoptSig := mintRetirement(t, dir, "node-1", keyID, 9)
 	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig,
+		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig, CaSignature: adoptSig,
 		AtSeq: at(9),
 	}); err != nil {
 		t.Fatalf("retire with an override: %v", err)

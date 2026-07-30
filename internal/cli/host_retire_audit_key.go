@@ -97,6 +97,15 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 	if err != nil {
 		return fmt.Errorf("sign the certificate's own retirement: %w", err)
 	}
+	// The retirement that actually carries standing, signed with the cluster CA key.
+	// A lifecycle record is honoured only from the key itself or from the CA, because
+	// a signer speaking about someone else's key is how a leaked, already-retired key
+	// could retire its own successor and switch a host's tamper-evidence off.
+	caSig, err := corrosion.SignLifecycleWithCA(PKIDir(), hostName, plan.RetiredKeyId,
+		"retired", plan.RetiredAtSeq)
+	if err != nil {
+		return fmt.Errorf("sign the retirement with the cluster CA: %w", err)
+	}
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
 		return fmt.Errorf("read the retirement certificate: %w", err)
@@ -109,6 +118,7 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 		CertPem:       string(certPEM),
 		Signature:     sig,
 		SelfSignature: selfSig,
+		CaSignature:   caSig,
 		AtSeq:         atSeq,
 		Force:         force,
 	}); err != nil {

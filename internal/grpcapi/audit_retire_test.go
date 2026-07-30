@@ -477,3 +477,69 @@ func TestRetireAuditKey_TheAuditRecordNamesAnOverride(t *testing.T) {
 			"that value is the evidence the two disagreed", detail)
 	}
 }
+
+// TestRetireAuditKey_KeyIDSelectsAmongSeveralLiveKeys.
+//
+// A host with two live keys could not be retired AT ALL. The handler refused with
+// "retire them one at a time" and the RPC took only a host name, so there was no
+// way to name one — and two live keys is exactly what a rotation that never
+// completed leaves behind, which is the state this command exists for.
+func TestRetireAuditKey_KeyIDSelectsAmongSeveralLiveKeys(t *testing.T) {
+	s, dir, firstKey := retireFixture(t, "node-1")
+
+	// A second live key for the same host: mint another signing pair, publish and
+	// adopt it, without retiring the first.
+	second := t.TempDir()
+	if err := pki.GenerateAuditSigningCert(
+		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
+		filepath.Join(second, pki.AuditSigningCertName),
+		filepath.Join(second, pki.AuditSigningKeyName),
+		"node-1"); err != nil {
+		t.Fatalf("mint the second signing cert: %v", err)
+	}
+	if err := copyFile(filepath.Join(dir, "ca.crt"), filepath.Join(second, "ca.crt")); err != nil {
+		t.Fatalf("stage the CA for the second keyring: %v", err)
+	}
+	kr2, err := corrosion.LoadAuditKeyring(second, "node-1")
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring(second): %v", err)
+	}
+	if err := kr2.PublishSigningKey(context.Background(), s.db); err != nil {
+		t.Fatalf("publish the second certificate: %v", err)
+	}
+	// AdoptAuditKeyContract, not AdoptAuditKey: the latter IS a rotation and would
+	// retire the first key, which is the state this test needs to not be in.
+	if err := corrosion.AdoptAuditKeyContract(context.Background(), s.db, kr2, "node-1", 1); err != nil {
+		t.Fatalf("adopt the second key: %v", err)
+	}
+	if kr2.KeyID() == firstKey {
+		t.Fatal("the second key has the same id as the first; the test would pass vacuously")
+	}
+
+	// Without a selector: refused, and the message has to name the flag that works.
+	_, err = s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{HostName: "node-1"})
+	if err == nil {
+		t.Fatal("retired one of two live keys without being told which")
+	}
+	if !strings.Contains(err.Error(), "--key-id") {
+		t.Errorf("the refusal does not say how to proceed: %v", err)
+	}
+
+	// With one: a plan for exactly that key.
+	plan, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", KeyId: kr2.KeyID(),
+	})
+	if err != nil {
+		t.Fatalf("RetireAuditKey with --key-id: %v", err)
+	}
+	if plan.RetiredKeyId != kr2.KeyID() {
+		t.Fatalf("planned to retire %s, asked for %s", plan.RetiredKeyId, kr2.KeyID())
+	}
+
+	// A key that is not live is refused rather than silently retiring something else.
+	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", KeyId: "0000000000000000",
+	}); err == nil {
+		t.Error("accepted a key id the host does not have live")
+	}
+}

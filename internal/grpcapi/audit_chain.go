@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -146,9 +147,26 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	// Every live key, not just the newest. A host is under contract while ANY of
 	// its keys is unretired, so closing one and reporting success left the
 	// contract standing and every node still reporting TAMPERED.
-	if len(live) > 1 {
+	//
+	// The caller names which one. Retiring several in one call would give them a
+	// single boundary, and they do not have one — a rotation that half-completed
+	// leaves two keys whose chains reached different sequences, and the whole point
+	// of the boundary is that it is per key. Refusing without a selector, which is
+	// what this did, was worse still: an operator was told to "retire them one at a
+	// time" by a command that gave them no way to name one, so a host with two live
+	// keys could not be retired at all. That state is not exotic — it is what a
+	// failed rotation leaves, which is precisely when this command gets run.
+	if selected := req.GetKeyId(); selected != "" {
+		if !slices.Contains(live, selected) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"host %q has no live signing certificate %q; live keys are %v (an already-retired "+
+					"key needs no retiring, and one that was never published cannot be named here)",
+				host, selected, live)
+		}
+		live = []string{selected}
+	} else if len(live) > 1 {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"host %q has %d live signing certificates (%v); retire them one at a time and "+
+			"host %q has %d live signing certificates (%v); pass --key-id to retire one, and "+
 				"re-run until none remain, or the contract stays open", host, len(live), live)
 	}
 	active, ok := "", len(live) == 1

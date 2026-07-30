@@ -22180,6 +22180,14 @@ type RetireAuditKeyRequest struct {
 	// Without it the certificate created to END a signing contract would stand
 	// as a new one, claiming the host signs with a key nobody holds.
 	SelfSignature string `protobuf:"bytes,4,opt,name=self_signature,json=selfSignature,proto3" json:"self_signature,omitempty"`
+	// Which of the host's live signing keys to retire.
+	//
+	// Required only when it has more than one, which happens whenever a rotation
+	// could not complete — and that is exactly when an operator needs this
+	// command. Without a selector the server refused ("retire them one at a
+	// time") while offering no way to name one, so the only documented remedy
+	// for a stuck host was unreachable.
+	KeyId string `protobuf:"bytes,8,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
 	// Operator-chosen retirement boundary, overriding the one the server derives.
 	//
 	// The escape hatch for a poisoned chain head. The server refuses to retire from
@@ -22277,6 +22285,13 @@ func (x *RetireAuditKeyRequest) GetSignature() string {
 func (x *RetireAuditKeyRequest) GetSelfSignature() string {
 	if x != nil {
 		return x.SelfSignature
+	}
+	return ""
+}
+
+func (x *RetireAuditKeyRequest) GetKeyId() string {
+	if x != nil {
+		return x.KeyId
 	}
 	return ""
 }
@@ -24975,12 +24990,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fretired_key_use\x18\r \x03(\tR\rretiredKeyUse\x12#\n" +
 	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\x122\n" +
 	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\x12#\n" +
-	"\rnever_adopted\x18\x10 \x03(\tR\fneverAdopted\"\xf4\x01\n" +
+	"\rnever_adopted\x18\x10 \x03(\tR\fneverAdopted\"\x8b\x02\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +
 	"\tsignature\x18\x03 \x01(\tR\tsignature\x12%\n" +
-	"\x0eself_signature\x18\x04 \x01(\tR\rselfSignature\x12\x1a\n" +
+	"\x0eself_signature\x18\x04 \x01(\tR\rselfSignature\x12\x15\n" +
+	"\x06key_id\x18\b \x01(\tR\x05keyId\x12\x1a\n" +
 	"\x06at_seq\x18\x05 \x01(\x03H\x00R\x05atSeq\x88\x01\x01\x12!\n" +
 	"\fca_signature\x18\a \x01(\tR\vcaSignature\x12\x14\n" +
 	"\x05force\x18\x06 \x01(\bR\x05forceB\t\n" +

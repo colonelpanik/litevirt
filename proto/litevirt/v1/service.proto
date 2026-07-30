@@ -2480,6 +2480,14 @@ message RetireAuditKeyRequest {
     // Without it the certificate created to END a signing contract would stand
     // as a new one, claiming the host signs with a key nobody holds.
     string self_signature = 4;
+    // Which of the host's live signing keys to retire.
+    //
+    // Required only when it has more than one, which happens whenever a rotation
+    // could not complete — and that is exactly when an operator needs this
+    // command. Without a selector the server refused ("retire them one at a
+    // time") while offering no way to name one, so the only documented remedy
+    // for a stuck host was unreachable.
+    string key_id = 8;
     // Operator-chosen retirement boundary, overriding the one the server derives.
     //
     // The escape hatch for a poisoned chain head. The server refuses to retire from

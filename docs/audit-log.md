@@ -320,10 +320,16 @@ simply changed their mind. The two are told apart by who can still sign:
 lv host retire-audit-key host-b
 ```
 
-If a host somehow has more than one live certificate — a rotation that failed
-part-way, or a spurious row filed under its name — the command refuses rather than
-closing one and reporting success while the contract stays open. Retire them one
-at a time until none remain.
+If a host has more than one live certificate — a rotation that failed part-way, or
+a spurious row filed under its name — the command refuses rather than closing one
+and reporting success while the contract stays open. Each key carries its own
+boundary, so name the one you mean and repeat until none remain:
+
+```bash
+lv host retire-audit-key host-b --key-id 96a1bc89...
+```
+
+The refusal lists the live key ids.
 
 Run it where the cluster CA private key is — the machine that ran
 `lv host init`, which is normally an operator workstation rather than a cluster

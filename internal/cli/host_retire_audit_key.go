@@ -43,7 +43,7 @@ import (
 // given — a pointer rather than a zero sentinel because 0 is a meaningful boundary.
 // force permits an atSeq below the boundary the daemon derives, which is the
 // unrecoverable direction. See the --at-seq guidance in the doc comment above.
-func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName string, atSeq *int64, force bool) error {
+func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName, keyID string, atSeq *int64, force bool) error {
 	if hostName == "" {
 		return fmt.Errorf("host name required")
 	}
@@ -63,6 +63,7 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 	// still refuse before the operator ever got the chance to override it.
 	plan, err := c.RetireAuditKey(ctx, &pb.RetireAuditKeyRequest{
 		HostName: hostName,
+		KeyId:    keyID,
 		AtSeq:    atSeq,
 		Force:    force,
 	})
@@ -114,7 +115,12 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 	// Phase 2: hand over the certificate and the signatures. The daemon checks
 	// both against the cluster CA before recording anything.
 	if _, err := c.RetireAuditKey(ctx, &pb.RetireAuditKeyRequest{
-		HostName:      hostName,
+		HostName: hostName,
+		// Phase 2 re-enters the same handler, so it re-runs the live-key selection
+		// and would hit the same "more than one live key" refusal without this.
+		// plan.RetiredKeyId, not the caller's flag: phase 1 is what decided, and
+		// the signatures below are over that decision.
+		KeyId:         plan.RetiredKeyId,
 		CertPem:       string(certPEM),
 		Signature:     sig,
 		SelfSignature: selfSig,

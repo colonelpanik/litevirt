@@ -669,6 +669,7 @@ because the signing keyring is loaded once at boot.
 func newHostRetireAuditKeyCmd() *cobra.Command {
 	var atSeq int64
 	var force bool
+	var keyID string
 	cmd := &cobra.Command{
 		Use:   "retire-audit-key <host>",
 		Short: "Retire a host's audit signing key on its behalf",
@@ -702,7 +703,12 @@ An --at-seq at or above what this node can already see is accepted; a lower one 
 refused unless you add --force, because lowering the boundary is the direction that
 cannot be walked back and a typo looks exactly like a decision.
 
+A host with more than one live key — what a rotation that never completed leaves
+behind — needs --key-id, because each key has its own boundary. The refusal lists
+the live key ids; retire them one at a time until none remain.
+
   lv host retire-audit-key host-b
+  lv host retire-audit-key host-b --key-id 96a1bc89...     # one of several live keys
   lv host retire-audit-key host-b --at-seq 4210
   lv host retire-audit-key host-b --at-seq 100 --force   # key known to have leaked at row 100`,
 		Args: cobra.ExactArgs(1),
@@ -715,7 +721,7 @@ cannot be walked back and a typo looks exactly like a decision.
 				at = &atSeq
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				return cli.HostRetireAuditKey(ctx, c, args[0], at, force)
+				return cli.HostRetireAuditKey(ctx, c, args[0], keyID, at, force)
 			})
 		},
 	}
@@ -725,6 +731,9 @@ cannot be walked back and a typo looks exactly like a decision.
 	cmd.Flags().BoolVar(&force, "force", false,
 		"with --at-seq, permit a boundary BELOW the one the cluster derives — the "+
 			"unrecoverable direction, since rows above it become permanent findings")
+	cmd.Flags().StringVar(&keyID, "key-id", "",
+		"which live signing key to retire; required when the host has more than one, "+
+			"since each carries its own boundary")
 	return cmd
 }
 

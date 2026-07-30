@@ -243,12 +243,21 @@ func openChain(src string) ([]*chainImage, error) {
 	seen := make(map[string]struct{})
 
 	for {
+		// Abs+Clean is lexical and does NOT resolve symlinks, and that is sufficient
+		// here — worth stating, because it looks like a gap and is not one. Each file
+		// always yields the same backing name, so the graph of names mirrors the graph
+		// of files: a cycle among files is necessarily a cycle among names, and gets
+		// caught below. A link only costs an extra step before the repeat shows up.
+		// EvalSymlinks would key `seen` on file identity instead of spelling, which is
+		// tighter but changes no outcome, and it fails on a chain whose backing file is
+		// simply missing — a case that must keep producing the open error below.
 		canonical, err := filepath.Abs(path)
 		if err != nil {
 			closeChain(chain)
 			return nil, fmt.Errorf("resolve backing path %s: %w", path, err)
 		}
 		canonical = filepath.Clean(canonical)
+
 		if _, ok := seen[canonical]; ok {
 			closeChain(chain)
 			return nil, fmt.Errorf("qcow2 backing chain cycle at %s", canonical)

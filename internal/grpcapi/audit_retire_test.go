@@ -2,11 +2,16 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -284,7 +289,7 @@ func TestRetireAuditKey_AtSeqOverridesAPoisonedHead(t *testing.T) {
 
 	// With it, the operator names the boundary and phase 1 answers.
 	plan, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-		HostName: "node-1", AtSeq: 7,
+		HostName: "node-1", AtSeq: at(7),
 	})
 	if err != nil {
 		t.Fatalf("--at-seq did not get past the poisoned head: %v\n"+
@@ -299,7 +304,7 @@ func TestRetireAuditKey_AtSeqOverridesAPoisonedHead(t *testing.T) {
 	// And phase 2 records it at exactly that sequence.
 	certPEM, rsig, selfSig := mintRetirement(t, dir, "node-1", keyID, 7)
 	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-		HostName: "node-1", CertPem: certPEM, Signature: rsig, SelfSignature: selfSig, AtSeq: 7,
+		HostName: "node-1", CertPem: certPEM, Signature: rsig, SelfSignature: selfSig, AtSeq: at(7),
 	}); err != nil {
 		t.Fatalf("phase 2 with the override: %v", err)
 	}
@@ -325,7 +330,7 @@ func TestRetireAuditKey_AtSeqStillVerifiesTheSignatures(t *testing.T) {
 	// Signatures made for sequence 7, submitted against a claimed boundary of 9.
 	certPEM, sig, selfSig := mintRetirement(t, dir, "node-1", keyID, 7)
 	_, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
-		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig, AtSeq: 9,
+		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig, AtSeq: at(9), Force: true,
 	})
 	if err == nil {
 		t.Fatal("--at-seq accepted signatures made over a different sequence\n" +
@@ -334,5 +339,135 @@ func TestRetireAuditKey_AtSeqStillVerifiesTheSignatures(t *testing.T) {
 	}
 	if n := countRows(t, s, `SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired'`); n != 0 {
 		t.Errorf("a rejected override still recorded %d retirement(s)", n)
+	}
+}
+
+// insAudit appends one signed row to the host's chain, so the derived boundary has
+// somewhere above zero to sit.
+func insAudit(t *testing.T, s *Server, host string) {
+	t.Helper()
+	if err := corrosion.InsertAuditLog(context.Background(), s.db, corrosion.AuditRecord{
+		ID: fmt.Sprintf("row-%d-%s", time.Now().UnixNano(), host), Username: "root",
+		HostName: host, Action: "vm.start", Target: "vm1", Result: "ok",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog: %v", err)
+	}
+}
+
+// at is the presence-carrying form of an --at-seq value. A pointer rather than a
+// zero sentinel because 0 is a meaningful boundary: "this key signed nothing valid".
+func at(seq int64) *int64 { return &seq }
+
+// TestRetireAuditKey_AtSeqBelowTheDerivedBoundaryNeedsForce.
+//
+// Raising a boundary and lowering one are not the same operation. Rows ABOVE the
+// boundary are the finding, so a higher boundary forgives more and cannot condemn
+// anything; a lower one is unrecoverable, because lifecycle records are append-only
+// and the earliest verified retirement is the one that stands.
+//
+// The derived sequence is the one number that can tell the two apart, and it is
+// sitting in a local variable when the override is applied. A mistyped --at-seq 42
+// for 4210 otherwise reads exactly like a deliberate decision.
+func TestRetireAuditKey_AtSeqBelowTheDerivedBoundaryNeedsForce(t *testing.T) {
+	s, dir, keyID := retireFixture(t, "node-1")
+	for i := 0; i < 6; i++ {
+		insAudit(t, s, "node-1")
+	}
+	plan, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{HostName: "node-1"})
+	if err != nil {
+		t.Fatalf("phase 1: %v", err)
+	}
+	derived := plan.RetiredAtSeq
+	if derived < 2 {
+		t.Fatalf("need a derived boundary above 1 to have room below it, got %d", derived)
+	}
+
+	// Below the derived boundary, without --force.
+	_, err = s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", AtSeq: at(1),
+	})
+	if err == nil {
+		t.Fatalf("accepted a boundary of 1 when this node can already see the chain reaching "+
+			"%d\nevery row in between becomes a permanent retired-key finding on every node, "+
+			"and a typo is indistinguishable from a decision", derived)
+	}
+	if !strings.Contains(err.Error(), "--force") {
+		t.Errorf("the refusal does not say how to proceed deliberately: %v", err)
+	}
+
+	// At the derived boundary, and above it: both are the safe direction.
+	for _, seq := range []int64{derived, derived + 100} {
+		if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+			HostName: "node-1", AtSeq: at(seq),
+		}); err != nil {
+			t.Fatalf("refused a boundary of %d with the derived one at %d: %v\n"+
+				"raising a boundary cannot condemn a row, and at-or-above is the legitimate "+
+				"way past a chain head claiming more than the log holds", seq, derived, err)
+		}
+	}
+
+	// With --force, the operator gets what they asked for.
+	certPEM, sig, selfSig := mintRetirement(t, dir, "node-1", keyID, 1)
+	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig,
+		AtSeq: at(1), Force: true,
+	}); err != nil {
+		t.Fatalf("--force did not permit a deliberate lower boundary: %v", err)
+	}
+}
+
+// TestRetireAuditKey_ANegativeAtSeqIsRefused.
+//
+// A `> 0` gate treated a negative sequence as "not supplied", so a client that
+// believed it was pinning a boundary got the derived one back with a success
+// response and no sign its input had been discarded.
+func TestRetireAuditKey_ANegativeAtSeqIsRefused(t *testing.T) {
+	s, _, _ := retireFixture(t, "node-1")
+	_, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", AtSeq: at(-5),
+	})
+	if err == nil {
+		t.Fatal("a negative at_seq was accepted; a malformed sequence must be refused, not " +
+			"silently replaced by the derived boundary")
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("want InvalidArgument for a malformed sequence, got %v", status.Code(err))
+	}
+}
+
+// TestRetireAuditKey_TheAuditRecordNamesAnOverride.
+//
+// This is the audit log of the audit system. A retirement that bypassed the
+// lagging-replica protection must not read the same as one that did not, or the only
+// record of it is a slog line on whichever node happened to serve the RPC.
+func TestRetireAuditKey_TheAuditRecordNamesAnOverride(t *testing.T) {
+	ctx := context.Background()
+	s, dir, keyID := retireFixture(t, "node-1")
+
+	certPEM, sig, selfSig := mintRetirement(t, dir, "node-1", keyID, 9)
+	if _, err := s.RetireAuditKey(adminCtx(), &pb.RetireAuditKeyRequest{
+		HostName: "node-1", CertPem: certPEM, Signature: sig, SelfSignature: selfSig,
+		AtSeq: at(9),
+	}); err != nil {
+		t.Fatalf("retire with an override: %v", err)
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT detail FROM audit_log WHERE action = 'audit.key.retire' ORDER BY seq DESC LIMIT 1`)
+	if err != nil {
+		t.Fatalf("read the audit record: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("no audit record was written for the retirement")
+	}
+	detail := rows[0].String("detail")
+	if !strings.Contains(detail, "operator-supplied") {
+		t.Errorf("the audit record does not say the boundary was supplied rather than derived: %q\n"+
+			"an investigation into why a host's rows are all retired-key findings has no way to "+
+			"tell that a safety check was skipped", detail)
+	}
+	if !strings.Contains(detail, "derived") {
+		t.Errorf("the audit record does not name the sequence this node derived: %q\n"+
+			"that value is the evidence the two disagreed", detail)
 	}
 }

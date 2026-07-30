@@ -305,9 +305,28 @@ lv host retire-audit-key host-b --at-seq 4210
 lagging-replica refusal. It grants nothing new: completing a retirement already
 requires minting a certificate with the cluster CA private key, so the only party
 who can pass it is the only party who could retire the key at all, and both phase-2
-signatures cover the value — a substituted one cannot be replayed. Establish how
-far the chain actually reached before using it. A value below what the host really
-signed is not recoverable.
+signatures cover the value — a substituted one cannot be replayed.
+
+**Raising a boundary and lowering one are not the same operation.** Rows *above*
+the boundary are the finding, so a higher boundary forgives more and cannot condemn
+anything. A lower one is unrecoverable. So a `--at-seq` at or above what the node
+can already see is accepted, and a lower one is refused unless you add `--force`:
+
+```bash
+lv host retire-audit-key host-b --at-seq 100 --force   # key known to have leaked at row 100
+```
+
+That is a real thing to want — a key compromised partway through its life should
+have everything after that point flagged — but it is also what a mistyped sequence
+looks like, and the two are otherwise indistinguishable. Sequence `0` is meaningful
+and expressible: it means the key signed nothing valid, which is the right answer for
+a key believed leaked from the moment it was minted.
+
+Either way the audit record says which happened. A retirement at an
+operator-supplied boundary records that it was supplied, names the sequence the node
+derived, and notes whether `--force` was used — so a later investigation into why a
+host's rows are all retired-key findings can see that a check was bypassed rather
+than having to infer it.
 
 An attacker cannot use either path to go quiet: producing a retirement means
 holding the key and publishing a permanent, replicated statement of when signing

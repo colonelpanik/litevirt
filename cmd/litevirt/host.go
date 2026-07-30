@@ -658,6 +658,7 @@ because the signing keyring is loaded once at boot.
 // host that has lost its key, is gone, or is being decommissioned.
 func newHostRetireAuditKeyCmd() *cobra.Command {
 	var atSeq int64
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "retire-audit-key <host>",
 		Short: "Retire a host's audit signing key on its behalf",
@@ -685,22 +686,35 @@ a node whose copy of the host's log a signed chain head says is behind: pinning 
 boundary below rows the key legitimately signed cannot be undone. Use --at-seq only
 when that refusal cannot be satisfied, because a head signed by the key you are
 retiring can claim any sequence at all and cannot be withdrawn — a leaked key can
-block this command indefinitely. Establish how far the chain really reached first;
-naming a boundary too low reports every row above it as retired-key use on every
-node, permanently.
+block this command indefinitely.
+
+An --at-seq at or above what this node can already see is accepted; a lower one is
+refused unless you add --force, because lowering the boundary is the direction that
+cannot be walked back and a typo looks exactly like a decision.
 
   lv host retire-audit-key host-b
-  lv host retire-audit-key host-b --at-seq 4210`,
+  lv host retire-audit-key host-b --at-seq 4210
+  lv host retire-audit-key host-b --at-seq 100 --force   # key known to have leaked at row 100`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Changed(), not a zero check: 0 is a meaningful boundary — "this key
+			// signed nothing valid" — and must not be indistinguishable from the flag
+			// being absent.
+			var at *int64
+			if cmd.Flags().Changed("at-seq") {
+				at = &atSeq
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				return cli.HostRetireAuditKey(ctx, c, args[0], atSeq)
+				return cli.HostRetireAuditKey(ctx, c, args[0], at, force)
 			})
 		},
 	}
 	cmd.Flags().Int64Var(&atSeq, "at-seq", 0,
 		"retire at this sequence instead of the one the cluster derives (bypasses the "+
 			"lagging-replica refusal; a value below what the host really signed is permanent)")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"with --at-seq, permit a boundary BELOW the one the cluster derives — the "+
+			"unrecoverable direction, since rows above it become permanent findings")
 	return cmd
 }
 

@@ -39,14 +39,20 @@ import (
 // all, and both signatures cover the value — a substituted one cannot be replayed.
 // It is still the sharpest tool here: set it below what the host really signed and
 // those rows are reported as retired-key use on every node, permanently.
-// atSeq overrides the boundary the daemon derives. Zero means derive it, which is
-// the normal path — see the --at-seq guidance in HostRetireAuditKey's body.
-func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName string, atSeq int64) error {
+// atSeq overrides the boundary the daemon derives, and is nil when --at-seq was not
+// given — a pointer rather than a zero sentinel because 0 is a meaningful boundary.
+// force permits an atSeq below the boundary the daemon derives, which is the
+// unrecoverable direction. See the --at-seq guidance in the doc comment above.
+func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName string, atSeq *int64, force bool) error {
 	if hostName == "" {
 		return fmt.Errorf("host name required")
 	}
-	if atSeq < 0 {
-		return fmt.Errorf("--at-seq must be a sequence number, not %d", atSeq)
+	if atSeq != nil && *atSeq < 0 {
+		return fmt.Errorf("--at-seq must be a sequence number, not %d", *atSeq)
+	}
+	if force && atSeq == nil {
+		return fmt.Errorf("--force only means anything with --at-seq: it permits a boundary " +
+			"below the one the cluster derives, and there is no boundary to permit without one")
 	}
 	// Phase 1: ask which key would be retired, and at what sequence. Nothing is
 	// written by this call.
@@ -58,13 +64,14 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 	plan, err := c.RetireAuditKey(ctx, &pb.RetireAuditKeyRequest{
 		HostName: hostName,
 		AtSeq:    atSeq,
+		Force:    force,
 	})
 	if err != nil {
 		return err
 	}
-	if atSeq > 0 && plan.RetiredAtSeq != atSeq {
+	if atSeq != nil && plan.RetiredAtSeq != *atSeq {
 		return fmt.Errorf("asked to retire at sequence %d but the daemon reports %d; "+
-			"the signatures below would not match the boundary it records", atSeq, plan.RetiredAtSeq)
+			"the signatures below would not match the boundary it records", *atSeq, plan.RetiredAtSeq)
 	}
 
 	tmpDir, certPath, keyPath, err := mintAuditSigningPair(PKIDir(), hostName)
@@ -103,6 +110,7 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 		Signature:     sig,
 		SelfSignature: selfSig,
 		AtSeq:         atSeq,
+		Force:         force,
 	}); err != nil {
 		return err
 	}
@@ -113,10 +121,11 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 	fmt.Println("  rows above that sequence signed by that key are now reported as")
 	fmt.Println("  retired-key use on every node")
 	fmt.Println("  unsigned rows from this host are no longer treated as evidence")
-	if atSeq > 0 {
+	if atSeq != nil {
 		fmt.Println("  the boundary was supplied with --at-seq, so neither the sequence the")
 		fmt.Println("  cluster derives nor its lagging-replica check applied — if it was set too")
 		fmt.Println("  low, the rows above it are reported as retired-key use permanently")
+		fmt.Println("  the audit record says so, naming this and the sequence the cluster derived")
 	}
 	fmt.Println("  Confirm with: lv audit verify")
 	return nil

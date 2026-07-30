@@ -22081,10 +22081,24 @@ type RetireAuditKeyRequest struct {
 	// heads are append-only, tombstones are inert, and the anti-entropy guard
 	// refuses rewrites, so the claim cannot be withdrawn.
 	//
-	// Only the CA holder can set this, because only they can mint the certificate
-	// the phase-2 signatures are made with, and both signatures must cover this
-	// exact value. Zero means "derive it", which is the normal path.
-	AtSeq         int64 `protobuf:"varint,5,opt,name=at_seq,json=atSeq,proto3" json:"at_seq,omitempty"`
+	// Completing a retirement still requires a certificate minted with the cluster
+	// CA private key, and both phase-2 signatures must cover this exact value, so
+	// setting it grants nobody a capability they did not already have.
+	//
+	// optional, for presence rather than a zero sentinel: 0 is a meaningful boundary
+	// — "this key signed nothing valid", the right answer for a key believed leaked
+	// from the moment it was minted — and a plain int64 could not tell that apart
+	// from "not supplied".
+	AtSeq *int64 `protobuf:"varint,5,opt,name=at_seq,json=atSeq,proto3,oneof" json:"at_seq,omitempty"`
+	// Permit an at_seq BELOW the boundary the server derives.
+	//
+	// Lowering a boundary is the unrecoverable direction: lifecycle records are
+	// append-only and the earliest verified retirement stands, so every row between
+	// the supplied sequence and the real extent of the chain becomes a permanent
+	// retired-key finding on every node. Raising one cannot condemn anything. The
+	// two are not the same operation and are not confirmed the same way — a
+	// mistyped sequence is otherwise indistinguishable from a deliberate one.
+	Force         bool `protobuf:"varint,6,opt,name=force,proto3" json:"force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22148,10 +22162,17 @@ func (x *RetireAuditKeyRequest) GetSelfSignature() string {
 }
 
 func (x *RetireAuditKeyRequest) GetAtSeq() int64 {
-	if x != nil {
-		return x.AtSeq
+	if x != nil && x.AtSeq != nil {
+		return *x.AtSeq
 	}
 	return 0
+}
+
+func (x *RetireAuditKeyRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 type RetireAuditKeyResponse struct {
@@ -24822,13 +24843,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\btampered\x18\f \x01(\bR\btampered\x12&\n" +
 	"\x0fretired_key_use\x18\r \x03(\tR\rretiredKeyUse\x12#\n" +
 	"\rhead_mismatch\x18\x0e \x03(\tR\fheadMismatch\x122\n" +
-	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\"\xab\x01\n" +
+	"\x15unsigned_after_signed\x18\x0f \x03(\tR\x13unsignedAfterSigned\"\xd1\x01\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +
 	"\tsignature\x18\x03 \x01(\tR\tsignature\x12%\n" +
-	"\x0eself_signature\x18\x04 \x01(\tR\rselfSignature\x12\x15\n" +
-	"\x06at_seq\x18\x05 \x01(\x03R\x05atSeq\"d\n" +
+	"\x0eself_signature\x18\x04 \x01(\tR\rselfSignature\x12\x1a\n" +
+	"\x06at_seq\x18\x05 \x01(\x03H\x00R\x05atSeq\x88\x01\x01\x12\x14\n" +
+	"\x05force\x18\x06 \x01(\bR\x05forceB\t\n" +
+	"\a_at_seq\"d\n" +
 	"\x16RetireAuditKeyResponse\x12$\n" +
 	"\x0eretired_key_id\x18\x01 \x01(\tR\fretiredKeyId\x12$\n" +
 	"\x0eretired_at_seq\x18\x02 \x01(\x03R\fretiredAtSeq\"E\n" +
@@ -26147,6 +26170,7 @@ func file_litevirt_v1_service_proto_init() {
 		(*PushBackupFrame_Chunk)(nil),
 		(*PushBackupFrame_Manifest)(nil),
 	}
+	file_litevirt_v1_service_proto_msgTypes[338].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

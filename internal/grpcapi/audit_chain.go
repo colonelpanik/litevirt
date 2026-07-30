@@ -182,17 +182,48 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	// claim cannot be withdrawn. Without an override the leaked key disables the
 	// command that exists to retire it.
 	//
-	// Handing the decision to the CA holder is the honest resolution. They are
-	// already the only party who can complete a retirement at all — phase 2 needs a
-	// certificate minted with the CA private key, which lives on no node — and both
-	// signatures cover this exact sequence, so a substituted value cannot be
-	// replayed. Nobody who could not already retire the key gains anything.
-	if override := req.GetAtSeq(); override > 0 {
+	// Handing the decision to the CA holder is the honest resolution for the WRITE:
+	// phase 2 needs a certificate minted with the CA private key, which lives on no
+	// node, and both signatures cover this exact sequence, so a substituted value
+	// cannot be replayed. Phase 1 is reachable by any admin caller, but it writes
+	// nothing.
+	derivedSeq, overridden := seq, false
+	if req.AtSeq != nil {
+		override := req.GetAtSeq()
+		// Presence, not a zero sentinel, so 0 stays expressible — "this key signed
+		// nothing valid" is the right boundary for a key believed leaked from the
+		// moment it was minted. A negative sequence is malformed, and must be refused
+		// rather than quietly falling through to the derived path with a success
+		// response, which is what a `> 0` gate did.
+		if override < 0 {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"at_seq must be a sequence number, got %d", override)
+		}
+		// Raising a boundary and lowering one are not the same operation, and this is
+		// the only place that can tell them apart. Raising cannot condemn anything:
+		// rows above the boundary are the finding, so a higher boundary forgives more.
+		// Lowering is unrecoverable — append-only records, earliest retirement wins —
+		// so every row between the supplied sequence and the chain's real extent
+		// becomes a permanent finding on every node. A mistyped sequence is otherwise
+		// indistinguishable from a deliberate one, and the legitimate reason to go
+		// lower is real (a key known to have leaked partway through its life), so this
+		// asks rather than refuses.
+		if override < derivedSeq && !req.GetForce() {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"refusing to retire %s's key at sequence %d: this node can already see its "+
+					"chain reaching %d, so %d row(s) it signed would become retired-key use "+
+					"findings on every node, permanently and with no way to raise the boundary "+
+					"again. If that is what you mean — the key is known to have leaked partway "+
+					"through its life — pass --force. If you meant to get past a chain head that "+
+					"claims more than the log holds, the boundary you want is at or above %d",
+				host, override, derivedSeq, derivedSeq-override, derivedSeq)
+		}
 		slog.Warn("retiring an audit signing key at an operator-supplied boundary; the derived "+
 			"one and the lagging-replica check are both bypassed. Rows this host signed above "+
 			"the boundary will be reported as retired-key use on every node, permanently",
-			"host", host, "key_id", active, "at_seq", override, "derived_seq", seq)
-		seq = override
+			"host", host, "key_id", active, "at_seq", override, "derived_seq", derivedSeq,
+			"forced", req.GetForce())
+		seq, overridden = override, true
 	} else if attested, behind, berr := corrosion.AuditReplicaIsBehind(ctx, s.db, verifier, host); berr != nil {
 		return nil, status.Errorf(codes.Internal, "%v", berr)
 	} else if behind {
@@ -224,7 +255,15 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
-	s.auditAs(ctx, callerUsername(ctx), "audit.key.retire", host,
-		fmt.Sprintf("retired key %s at seq %d", active, seq), "success")
+	// The detail says whether the boundary was derived or supplied, and what the
+	// derived value was. This is the audit log of the audit system: a retirement that
+	// bypassed the lagging-replica protection must not read the same as one that did
+	// not, or the only record of it is a slog line on whichever node served the RPC.
+	detail := fmt.Sprintf("retired key %s at seq %d (derived)", active, seq)
+	if overridden {
+		detail = fmt.Sprintf("retired key %s at seq %d (operator-supplied; this node derived %d; "+
+			"lagging-replica check bypassed; force=%t)", active, seq, derivedSeq, req.GetForce())
+	}
+	s.auditAs(ctx, callerUsername(ctx), "audit.key.retire", host, detail, "success")
 	return &pb.RetireAuditKeyResponse{RetiredKeyId: active, RetiredAtSeq: seq}, nil
 }

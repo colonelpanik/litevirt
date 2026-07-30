@@ -263,7 +263,13 @@ func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers [
 		peersYAML += "]"
 	}
 
-	if err := sc.Run(fmt.Sprintf("HOST_NAME=%s JOIN_PEERS='%s' bash /tmp/litevirt-setup.sh", hostName, peersYAML)); err != nil {
+	// hostAddr is the address this command just put in the certificate SAN and the
+	// address peers were told to dial, so it is also the address the node must
+	// advertise. Leaving the daemon to auto-detect meant it registered with its
+	// default-route source IP — a different interface on a multi-homed host — and
+	// that value was then copied into the join_peers of every host added after it.
+	if err := sc.Run(fmt.Sprintf("HOST_NAME=%s JOIN_PEERS='%s' ADVERTISE_ADDRESS=%s bash /tmp/litevirt-setup.sh",
+		hostName, peersYAML, hostAddr)); err != nil {
 		return fmt.Errorf("run setup script: %w", err)
 	}
 
@@ -477,14 +483,7 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 	}
 
 	cmd := execCommand("bash", scriptPath)
-	cmd.Env = append(os.Environ(),
-		"HOST_NAME="+hostName,
-		"JOIN_PEERS=[]",
-		"PCI_RESCAN_INTERVAL=0",
-		"PCI_UDEV_HOOK=false",
-		"SRIOV_MANAGED=false",
-		"SRIOV_MAX_VFS=8",
-	)
+	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, localAdvertiseAddr, "[]")...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -633,6 +632,38 @@ func resolveHost(host string) (string, error) {
 	return addrs[0], nil
 }
 
+// setupScriptEnv is the environment the setup script reads to write the daemon
+// config. One place, so the local and remote paths cannot disagree about it —
+// they already had, which is how the local path shipped with no advertise_address.
+func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
+	return []string{
+		"HOST_NAME=" + hostName,
+		// The address that just went into the certificate SAN. Without it the daemon
+		// auto-detects, registers with its default-route source IP — the wrong
+		// interface on a multi-homed host — and the operator has to notice and
+		// correct it, which needed a genuine RESTART, because init leaves the daemon
+		// running and `systemctl start` is then a no-op.
+		"ADVERTISE_ADDRESS=" + advertiseAddr,
+		"JOIN_PEERS=" + joinPeers,
+		"PCI_RESCAN_INTERVAL=0",
+		"PCI_UDEV_HOOK=false",
+		"SRIOV_MANAGED=false",
+		"SRIOV_MAX_VFS=8",
+	}
+}
+
+// renderAdvertiseLine is the ADVERTISE_ADDRESS value handed to the setup script.
+//
+// Empty when there is nothing to say, because the script omits the key entirely in
+// that case and lets the daemon auto-detect. Writing an empty advertise_address
+// would be worse than writing none: it overrides auto-detection with nothing.
+func renderAdvertiseLine(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	return fmt.Sprintf("advertise_address: %q", addr)
+}
+
 func getSetupScript() (string, error) {
 	// Try to read from embedded or local path
 	// For now, return the script inline
@@ -704,6 +735,7 @@ metrics_port: 7444
 gossip_port: 7946
 pki_dir: /etc/litevirt/pki
 data_dir: /var/lib/litevirt
+${ADVERTISE_ADDRESS:+advertise_address: "${ADVERTISE_ADDRESS}"}
 join_peers: ${JOIN_PEERS:-[]}
 pci:
   rescan_interval: "${PCI_RESCAN_INTERVAL:-0}"

@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -103,4 +104,63 @@ func hostNames(ctx context.Context, db *corrosion.Client) ([]string, error) {
 		out = append(out, r.String("name"))
 	}
 	return out, nil
+}
+
+// TestPeerBootstrap_OutboundPeerRPCsWorkBeforeConvergence.
+//
+// The inbound half of peer trust was fixed without the outbound half. Accepting an
+// RPC from a peer whose row has not replicated is only useful if you can also DIAL
+// one: grpcapi's peerClient did a bare GetHost and gave up with "host %q not found
+// in cluster state", so on a genuinely fresh cluster every outbound grpcapi peer
+// call still failed — self-upgrade version pings, cluster-state digest fanout,
+// anti-entropy triggers, backup sink pushes, console forwarding.
+//
+// corrosion already solved this: resolvePeerTarget falls back to the gossip
+// membership address, and its doc comment names this exact case, which is why the
+// replicator and anti-entropy were never deadlocked. grpcapi held a second,
+// half-implemented copy of the same lookup.
+//
+// The harness pre-seeds every host row (crossRegisterHosts), which is what hid both
+// halves; this deletes that head start to reach the real starting state.
+func TestPeerBootstrap_OutboundPeerRPCsWorkBeforeConvergence(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2})
+	defer c.Stop()
+	a, b := c.Nodes[0], c.Nodes[1]
+
+	// a has never heard of b — no replicated row, only gossip membership, which is
+	// what a node actually has for a peer that has just been provisioned.
+	if err := a.DB.Execute(ctx, `DELETE FROM hosts WHERE name = ?`, b.Name); err != nil {
+		t.Fatalf("un-register %s on %s: %v", b.Name, a.Name, err)
+	}
+	a.DB.SetMembersForTests(func() []corrosion.PeerInfo {
+		return []corrosion.PeerInfo{{Name: b.Name, Addr: fmt.Sprintf("%s:7946", b.Address)}}
+	})
+
+	_, conn, err := a.Server.PeerClientForTests(ctx, b.Name)
+	if err != nil {
+		t.Fatalf("dialling a peer whose row has not replicated failed: %v\n"+
+			"the inbound side accepts this peer, so refusing to dial it leaves the fix "+
+			"half-done: every outbound grpcapi peer RPC fails until the hosts table "+
+			"converges, on exactly the fresh cluster that cannot converge without them", err)
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// TestPeerBootstrap_DiallingAnEntirelyUnknownPeerStillFails — the fallback is to
+// gossip, not to guesswork. A name in neither the hosts table nor the membership
+// has no address, and must still be an error rather than a dial to nowhere.
+func TestPeerBootstrap_DiallingAnEntirelyUnknownPeerStillFails(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 1})
+	defer c.Stop()
+
+	if _, conn, err := c.Nodes[0].Server.PeerClientForTests(ctx, "ghost-node"); err == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("dialling a peer that is in neither cluster state nor gossip succeeded")
+	}
 }

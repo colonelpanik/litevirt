@@ -1259,21 +1259,26 @@ func (s *Server) dialPeerAddr(target string) (*grpc.ClientConn, error) {
 // peerClient creates a gRPC client connection to a remote host's daemon.
 // The caller must close the returned connection when done.
 func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
-	host, err := corrosion.GetHost(ctx, s.db, hostName)
+	// corrosion.ResolvePeerTarget, not a GetHost here: it falls back to the gossip
+	// membership address for a peer whose hosts row has not replicated yet, and this
+	// used to fail closed on exactly that. Peer TRUST was taught to accept such a
+	// peer without peer DIALLING being taught to reach one, so on a freshly
+	// provisioned cluster every outbound grpcapi peer RPC failed with "not found in
+	// cluster state" — self-upgrade pings, cluster-state digest fanout, anti-entropy
+	// triggers, backup sink pushes, console forwarding. The replicator was never
+	// affected because it already used this resolver.
+	//
+	// It still errors for a name in neither cluster state nor gossip: the fallback is
+	// to membership, not to guesswork, and grpc.NewClient would otherwise not reject
+	// an empty address until the first RPC — console and VNC forwarders need the
+	// reason now, not later.
+	target, err := corrosion.ResolvePeerTarget(ctx, s.db, hostName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("look up host %q: %w", hostName, err)
-	}
-	if host == nil {
-		return nil, nil, fmt.Errorf("host %q not found in cluster state", hostName)
-	}
-	if host.Address == "" {
-		// grpc.NewClient won't reject this until first RPC; fail fast with a
-		// clear reason so console/VNC forwarders can report it to the user.
-		return nil, nil, fmt.Errorf("host %q has no address in cluster state", hostName)
+		return nil, nil, err
 	}
 	// dialPeer always attaches obs trace-context options (injects W3C trace context
 	// on the outbound peer RPC when tracing is active; nil otherwise).
-	conn, err := s.dialPeerAddr(peerTarget(host.Address, host.GRPCPort))
+	conn, err := s.dialPeerAddr(target)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial host %s: %w", hostName, err)
 	}

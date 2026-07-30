@@ -18,6 +18,16 @@ const defaultPeerGRPCPort = 7443
 // address for a peer that has not yet received the hosts table (bootstrap, when
 // a new node joins before replication catches up). The port defaults to 7443.
 // The target is built with net.JoinHostPort so IPv6 addresses are bracketed.
+// ResolvePeerTarget is resolvePeerTarget for callers outside this package.
+//
+// grpcapi held its own half of this lookup — GetHost with no fallback — so it
+// failed closed on a peer whose row had not replicated yet, which is every peer on
+// a cluster that has just been provisioned. That is the case the fallback below
+// exists for, and there is no reason for two answers to it.
+func ResolvePeerTarget(ctx context.Context, c *Client, peerName string) (string, error) {
+	return resolvePeerTarget(ctx, c, peerName)
+}
+
 func resolvePeerTarget(ctx context.Context, c *Client, peerName string) (string, error) {
 	var addr string
 	var port int

@@ -86,12 +86,17 @@ type Config struct {
 
 // Client is the embedded state store with WAL-based replication.
 type Client struct {
-	db       *sql.DB
-	mu       sync.RWMutex
-	list     *memberlist.Memberlist
-	hostName string
-	clock    *hlc.Clock
-	version  string // local litevirtd binary version, for skew checks
+	db   *sql.DB
+	mu   sync.RWMutex
+	list *memberlist.Memberlist
+	// membersForTests overrides gossip membership. Test seam only: the gossip
+	// fallback in ResolvePeerTarget is what lets a node dial a peer whose hosts row
+	// has not replicated yet — the bootstrap case — and it had no test at all,
+	// because a harness without a real memberlist can never reach that branch.
+	membersForTests func() []PeerInfo
+	hostName        string
+	clock           *hlc.Clock
+	version         string // local litevirtd binary version, for skew checks
 
 	// dataDir is where the durable monotonic-clock high-water lives
 	// (<dataDir>/nowts.hwm). Empty ⇒ no persistence (in-memory monotonic only:
@@ -1082,6 +1087,9 @@ func (c *Client) MembershipChanged() <-chan struct{} {
 }
 
 func (c *Client) Members() []PeerInfo {
+	if fn := c.membersForTests; fn != nil {
+		return fn()
+	}
 	if c.list == nil {
 		return nil
 	}
@@ -1094,6 +1102,10 @@ func (c *Client) Members() []PeerInfo {
 	}
 	return peers
 }
+
+// SetMembersForTests injects gossip membership. Test-only; production membership
+// comes from memberlist.
+func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
 
 // PeerInfo holds basic peer identity from memberlist.
 type PeerInfo struct {

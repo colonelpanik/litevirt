@@ -77,6 +77,31 @@ func (d *Daemon) setupAuditSigning(ctx context.Context) error {
 // signature explaining it — which is also why an attacker cannot use this to go
 // quiet, since producing the retirement means holding the key and publishing a
 // permanent, replicated statement of when they stopped.
+// installAuditVerifier gives a NON-SIGNING node the cluster CA, so it can still
+// check everyone else's chain.
+//
+// Without it such a node has no keyring at all, and a keyring is what verifies a
+// lifecycle record — so every adoption and retirement in the cluster fails to
+// verify, is ignored, and the node reports peers' legitimately rolled-back hosts
+// as tampering while every signing node calls the same log clean. Found on the
+// lab exactly that way: three nodes clean, the one non-signing node accusing a
+// fourth.
+//
+// Verification deliberately needs no private key, so there is nothing to gate
+// this on.
+func (d *Daemon) installAuditVerifier() {
+	if d.db.AuditKeyringOf() != nil {
+		return // already holding one (signing, or a rotation installed it)
+	}
+	verifier, err := corrosion.LoadAuditVerifier(d.cfg.PKIDir)
+	if err != nil {
+		slog.Warn("no cluster CA available to verify audit chains; this node will report every "+
+			"signed row as unverifiable", "error", err)
+		return
+	}
+	d.db.SetAuditKeyring(verifier)
+}
+
 func (d *Daemon) retireOwnAuditKeyOnRollback(ctx context.Context) {
 	keyring, err := corrosion.LoadAuditKeyring(d.cfg.PKIDir, d.cfg.HostName)
 	if err != nil {

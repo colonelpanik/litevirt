@@ -44,6 +44,27 @@ func auditPKIDir(t *testing.T, hostName string) string {
 	return dir
 }
 
+// peerPKIDir gives another host its own key pair under the SAME cluster CA.
+func peerPKIDir(t *testing.T, caDir, hostName string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, f := range []string{"ca.crt", "ca.key"} {
+		b, err := os.ReadFile(filepath.Join(caDir, f))
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, f), b, 0o600); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+	if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
+		filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"),
+		hostName, net.IPv4(127, 0, 0, 1)); err != nil {
+		t.Fatalf("GenerateHostCert(%s): %v", hostName, err)
+	}
+	return dir
+}
+
 func auditTestDaemon(t *testing.T, pkiDir, hostName string) *Daemon {
 	t.Helper()
 	db, err := corrosion.NewTestClient()
@@ -378,4 +399,67 @@ func mustVerifier(t *testing.T, dir string) *corrosion.AuditKeyring {
 		t.Fatalf("LoadAuditVerifier: %v", err)
 	}
 	return kr
+}
+
+// TestVerifier_ANonSigningNodeCanStillVerify.
+//
+// Found on the lab: three signing nodes called the log clean while the one
+// non-signing node reported a peer's legitimately rolled-back host as tampering.
+//
+// A keyring is what verifies a lifecycle record, and a node with the flag off and
+// no dedicated key was given no keyring at all. So every adoption and retirement
+// in the cluster failed to verify, was ignored, and every host that had rolled
+// back looked like one still under contract writing unsigned rows.
+//
+// Peers disagreeing about the same replicated rows is the one outcome this design
+// cannot tolerate — it is the whole basis for believing any node's verdict.
+func TestVerifier_ANonSigningNodeCanStillVerify(t *testing.T) {
+	ctx := context.Background()
+	const host = "node-0"
+	dir := auditPKIDir(t, host)
+	d := auditTestDaemon(t, dir, host)
+
+	// A peer that signs, rolls back, and records the retirement. It shares the
+	// cluster CA, as every real node does — that is what lets one node verify
+	// another's certificate at all.
+	signer := auditTestDaemon(t, peerPKIDir(t, dir, "peer-1"), "peer-1")
+	signer.db = d.db
+	if err := signer.setupAuditSigning(ctx); err != nil {
+		t.Fatalf("peer setupAuditSigning: %v", err)
+	}
+	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
+		ID: "p1", Username: "admin", HostName: "peer-1",
+		Action: "vm.create", Target: "vm1", Result: "success",
+		Timestamp: "2026-07-29T10:00:01Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog: %v", err)
+	}
+	signer.retireOwnAuditKeyOnRollback(ctx)
+	// Rows after the rollback are unsigned and expected.
+	signer.db.SetAuditKeyring(mustVerifier(t, signer.cfg.PKIDir))
+	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
+		ID: "p2", Username: "admin", HostName: "peer-1",
+		Action: "vm.start", Target: "vm1", Result: "success",
+		Timestamp: "2026-07-29T10:00:02Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog: %v", err)
+	}
+
+	// This node does not sign at all. It must still be able to read the peer's
+	// signed retirement, or it will accuse them.
+	d.db.SetAuditKeyring(nil)
+	d.installAuditVerifier()
+	if d.db.AuditKeyringOf() == nil {
+		t.Fatal("a non-signing node was left with no keyring, so it can verify nothing")
+	}
+
+	res, err := corrosion.VerifyAuditChain(ctx, d.db)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if res.Tampered() {
+		t.Fatalf("a non-signing node reports a peer's rolled-back host as tampered: %+v\n"+
+			"it could not verify the retirement, so it treated the rollback as if it had "+
+			"never happened — and disagreed with every signing node about the same rows", res)
+	}
 }

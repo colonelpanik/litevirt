@@ -324,6 +324,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// a signed retirement so the rollback is an explicit, dated fact rather
 		// than a permanent tamper verdict on every node.
 		d.retireOwnAuditKeyOnRollback(ctx)
+		// And it still needs the cluster CA: a keyring is what verifies a
+		// lifecycle record, so a node without one ignores every adoption and
+		// retirement in the cluster and reports peers' rolled-back hosts as
+		// tampering.
+		d.installAuditVerifier()
 	}
 
 	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is

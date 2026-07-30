@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // HostRetireAuditKey ends a host's audit signing contract on its behalf.
@@ -82,10 +80,4 @@ func HostRetireAuditKey(ctx context.Context, c pb.LiteVirtClient, hostName strin
 	fmt.Println("  unsigned rows from this host are no longer treated as evidence")
 	fmt.Println("  Confirm with: lv audit verify")
 	return nil
-}
-
-// mintRetirementCertPaths names the on-disk shape mintAuditSigningPair produces,
-// so the retirement and rotation paths cannot drift on where they look.
-func mintRetirementCertPaths(dir string) (certPath, keyPath string) {
-	return filepath.Join(dir, pki.AuditSigningCertName), filepath.Join(dir, pki.AuditSigningKeyName)
 }

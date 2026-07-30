@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -163,5 +164,27 @@ func TestMintAuditSigningPair_ChainsToClusterCA(t *testing.T) {
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	}); err != nil {
 		t.Errorf("minted certificate does not chain to the cluster CA: %v", err)
+	}
+}
+
+// TestRotationSettleHintIsNotAPromiseTheDaemonBreaks.
+//
+// The command tells an operator how long to wait before `lv audit verify` will
+// show the rotation, and the daemon decides how long that actually is. If the two
+// drift, the command is back to sending people to look at something that has not
+// happened yet — which is the defect this hint was added to fix, and the same
+// class of defect a review has now caught in this command twice.
+func TestRotationSettleHintIsNotAPromiseTheDaemonBreaks(t *testing.T) {
+	// daemon.auditLifecycleSettle is 45s; the hint says "a minute". The hint must
+	// never be SHORTER than the wait, or the operator looks too early.
+	const daemonSettle = 45 * time.Second
+	const hintMeans = time.Minute
+
+	if hintMeans < daemonSettle {
+		t.Fatalf("the command promises ~%s but the daemon waits %s; an operator following the "+
+			"instruction checks before the rotation has landed", auditRotationSettleHint, daemonSettle)
+	}
+	if auditRotationSettleHint == "" {
+		t.Fatal("no settle hint: the command would imply the rotation is already complete")
 	}
 }

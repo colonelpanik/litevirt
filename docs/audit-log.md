@@ -215,9 +215,16 @@ the libvirt symlinks `qemu+tls://` migration follows — none of which reload
 without a restart, so rotating them would put quorum and any in-flight migration
 at risk. That separation is the reason the audit key is its own certificate.
 
-On the next start the daemon publishes the new certificate, records a signed
-retirement of the old key at the sequence its chain has reached, and signs a chain
-head **with the new key** over the whole existing log.
+On the next start the daemon publishes the new certificate, then waits for
+replication — about a minute — before recording a signed retirement of the old key
+at the sequence its chain has reached and signing a chain head **with the new key**
+over the whole existing log.
+
+The wait is deliberate. Adoption and retirement are permanent sequence boundaries:
+records are append-only and the strictest value wins, so one taken from a local
+log that is still behind the cluster condemns rows the old key legitimately signed
+and can never be raised again. `lv audit verify` will not show the rotation until
+that has happened, and the command says so.
 
 That head is what rotation is for: from then on, altering any row the old key
 wrote contradicts an assertion whoever holds that key cannot forge. What rotation
@@ -251,6 +258,11 @@ simply changed their mind. The two are told apart by who can still sign:
 ```bash
 lv host retire-audit-key host-b
 ```
+
+If a host somehow has more than one live certificate — a rotation that failed
+part-way, or a spurious row filed under its name — the command refuses rather than
+closing one and reporting success while the contract stays open. Retire them one
+at a time until none remain.
 
 Run it where the cluster CA private key is — the machine that ran
 `lv host init`, which is normally an operator workstation rather than a cluster

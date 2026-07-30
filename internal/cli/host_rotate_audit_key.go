@@ -30,6 +30,12 @@ import (
 // at those files, which qemu+tls:// follows mid-migration. Replacing the TLS
 // identity of a running node is a much larger operation — an operator restoring
 // audit integrity must not be gambling with quorum or a live migration.
+
+// auditRotationSettleHint is how long the target's daemon waits for replication
+// before recording the rotation. Kept in step with daemon.auditLifecycleSettle by
+// TestRotationSettleHintMatchesTheDaemon.
+const auditRotationSettleHint = "a minute"
+
 func HostRotateAuditKey(ctx context.Context, hostName, sshTarget string) error {
 	if hostName == "" {
 		return fmt.Errorf("host name required")
@@ -105,22 +111,29 @@ func HostRotateAuditKey(ctx context.Context, hostName, sshTarget string) error {
 	fmt.Printf("  installed %s/%s (0644) and %s (0600)\n",
 		remotePKIDir, pki.AuditSigningCertName, pki.AuditSigningKeyName)
 	fmt.Println("  host.crt / host.key are unchanged — peer mTLS and qemu+tls:// migration are untouched")
-	fmt.Println("  on restart the daemon published the new certificate, retired the previous key at")
-	fmt.Println("  the sequence its chain had reached, and signed a chain head with the new key that")
-	fmt.Println("  seals every row the old key wrote — altering one now contradicts a head the holder")
-	fmt.Println("  of the old key cannot forge")
+	// Future tense, and the delay named. The daemon deliberately waits for
+	// replication before recording any of this: adoption and retirement are
+	// permanent sequence boundaries, and one taken from a local tail that is
+	// behind the cluster condemns rows that were legitimately signed. Claiming it
+	// in the past tense — which this command did, twice — sends an operator to
+	// `lv audit verify` a second later to find nothing there.
+	fmt.Printf("  within about %s the daemon will publish the new certificate, retire the\n",
+		auditRotationSettleHint)
+	fmt.Println("  previous key at the sequence its chain has reached, and sign a chain head with")
+	fmt.Println("  the new key sealing every row the old key wrote — after which altering one")
+	fmt.Println("  contradicts a head the holder of the old key cannot forge")
+	fmt.Println("  it waits that long on purpose: those are permanent sequence boundaries, and")
+	fmt.Println("  taking one before replication has caught up would condemn rows the old key")
+	fmt.Println("  legitimately signed, with no way to raise it again")
 	fmt.Println("  the retired certificate is kept, so rows it signed stay verifiable")
 
-	// The line above used to be printed unconditionally, and on a host with
-	// enforcement.audit_signature off it was simply false: adoption hung off the
-	// flag, so the restart published nothing and retired nothing. That is fixed
-	// on the daemon side, but the flag still decides whether NEW rows are signed
-	// — and an operator who rotates because a key leaked needs to know that the
-	// replacement is not yet protecting anything. Read it from the target rather
-	// than guessing.
+	// Whether the host will SIGN with the new key is a separate question from
+	// whether the rotation completes, and an operator who rotates because a key
+	// leaked needs to know the replacement is not yet protecting anything. Read it
+	// from the target rather than guessing.
 	reportRemoteSigningState(sc, hostName)
 
-	fmt.Println("  Confirm with: lv audit verify")
+	fmt.Printf("  Confirm with: lv audit verify (after ~%s)\n", auditRotationSettleHint)
 	return nil
 }
 

@@ -1384,7 +1384,19 @@ var schemaDDL = []string{
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT,
-		PRIMARY KEY (host_name, key_id, event)
+		-- by_key_id is IN the primary key, and that is what makes the slot
+		-- unsquattable. With (host, key, event) alone the table was first-write-
+		-- wins on data any peer can write: an attacker inserting an unverifiable
+		-- 'adopted' row got it ignored by the reader AND blocked the host from
+		-- ever recording its real one, so every pre-enforcement row that host
+		-- wrote became evidence, permanently. Keying by the signer puts a forged
+		-- row in a different slot from the genuine one; squatting would require
+		-- forging under the host's own key.
+		--
+		-- Several VERIFIED records per (host, key, event) are expected and
+		-- correct: a rotation and an operator retire-audit-key run both retire
+		-- the same key with different signers. The reader keeps the strictest.
+		PRIMARY KEY (host_name, key_id, event, by_key_id)
 	)`,
 
 	// Per-VM operational event store (v13). Durable, CRDT-replicated,
@@ -1962,7 +1974,7 @@ var tablePrimaryKeys = map[string][]string{
 	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
 	"audit_signing_keys":      {"key_id"},
 	"audit_chain_heads":       {"host_name", "epoch", "seq"},
-	"audit_key_lifecycle":     {"host_name", "key_id", "event"},
+	"audit_key_lifecycle":     {"host_name", "key_id", "event", "by_key_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.

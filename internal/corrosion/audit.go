@@ -487,7 +487,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		// only thing that can flag it is the retirement record, which they
 		// cannot rewrite without also defeating the head signed by the
 		// successor key.
-		if boundary, isRetired := retired[keyID]; isRetired && seq > boundary {
+		if boundary, isRetired := retired[lifecycleKey{host: host, keyID: keyID}]; isRetired && seq > boundary {
 			res.RetiredKeyUse = append(res.RetiredKeyUse, fmt.Sprintf(
 				"%s: row %s has seq %d, signed by key %s which was retired at seq %d",
 				host, rec.ID, seq, keyID, boundary))

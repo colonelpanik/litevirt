@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -197,7 +198,7 @@ func chainHashAt(ctx context.Context, c *Client, hostName string, seq int64) (st
 // one about anything past its boundary. Without that check the head machinery
 // is self-defeating — the party a rotation is performed against would be able to
 // publish the very assertion that certifies their rewrite.
-func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, observedSeq map[string]int64, retired map[string]int64, res *AuditVerifyResult) error {
+func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, observedSeq map[string]int64, retired map[lifecycleKey]int64, res *AuditVerifyResult) error {
 	heads, err := latestAuditHeadsByKey(ctx, c)
 	if err != nil {
 		return err
@@ -229,7 +230,7 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 			// which is why the rotation happened — so the retirement record is
 			// the only thing that can say this head is not the host speaking.
 			// Reported, and given no authority over anything below.
-			if boundary, isRetired := retired[h.KeyID]; isRetired && h.Seq > boundary {
+			if boundary, isRetired := retired[lifecycleKey{host: host, keyID: h.KeyID}]; isRetired && h.Seq > boundary {
 				res.RetiredKeyUse = append(res.RetiredKeyUse, fmt.Sprintf(
 					"%s: chain head at seq %d is signed by key %s, which was retired at seq %d — "+
 						"a rotated-out key cannot attest to the chain past its boundary",
@@ -260,9 +261,18 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 			// as settled, so a shortfall is reported. That is the only safe
 			// direction — the alternative silently switches truncation detection
 			// off for exactly the heads someone tampered with.
-			trusted := keyring != nil &&
-				keyring.HeadTimestampIsSigned(ctx, c, host, h.Epoch, h.Seq, h.HeadHash, h.KeyID, h.Signature, h.CreatedAt)
-			if h.Seq > attestedSeq && headHasSettled(h, trusted) {
+			// A node with NO keyring has verified nothing about this head — not its
+			// signature, not its timestamp. Treating that as "settled" made such a
+			// node report every peer as truncated during ordinary replication lag
+			// while every other node called the same log clean, which is the one
+			// outcome this design cannot tolerate. It reports nothing instead.
+			//
+			// A node that DOES hold a keyring but finds the timestamp outside the
+			// signature (a v1 head) still treats it as settled: there the fail-loud
+			// reading is right, because an unverifiable clock must not be able to
+			// suppress a truncation finding.
+			trusted := keyring.HeadTimestampIsSigned(ctx, c, host, h.Epoch, h.Seq, h.HeadHash, h.KeyID, h.Signature, h.CreatedAt)
+			if h.Seq > attestedSeq && headHasSettled(h, keyring != nil, trusted) {
 				attestedSeq = h.Seq
 			}
 		}
@@ -286,13 +296,18 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 // ordinary eventually-consistent case the window exists for. Both formats are
 // read, because heads already written with an HLC created_at are on disk.
 //
-// trusted says whether the signature covers created_at. When it does not, or
-// when the value parses as neither format, the head counts as SETTLED — the
-// conservative reading. Suppressing the finding instead would mean an attacker
+// haveKeyring says whether this node can verify anything at all; trusted says
+// whether the signature covers created_at. With no keyring the head asserts
+// nothing here — a node that cannot check a signature has no business calling a
+// peer truncated. With a keyring but an unsigned timestamp, or a value in neither
+// format, the head counts as SETTLED — the conservative reading. Suppressing the finding instead would mean an attacker
 // could truncate a log and then scribble in created_at to keep anyone from
 // saying so, which is a silent failure where this one is merely a loud
 // investigable state.
-func headHasSettled(h AuditChainHead, trusted bool) bool {
+func headHasSettled(h AuditChainHead, haveKeyring, trusted bool) bool {
+	if !haveKeyring {
+		return false // verified nothing; assert nothing
+	}
 	if !trusted {
 		return true
 	}
@@ -305,22 +320,43 @@ func headHasSettled(h AuditChainHead, trusted bool) bool {
 	return true
 }
 
-// highestAttestedSeq is the furthest sequence any VERIFIED chain head says this
-// host's chain has reached.
+// hostChainFloor is the furthest sequence a host's chain can be PROVED to have
+// reached, from signed heads this node is willing to trust.
 //
-// It is the cluster's own record of the host's progress, signed, and therefore
-// not something a stale local replica can talk down. Rotation uses it as a floor
-// on the retirement boundary: AdoptAuditKey runs early in daemon startup, before
-// replication is up, so a node restored from an older snapshot would otherwise
-// pin the boundary below rows its key legitimately signed — permanently, since
-// the earliest verified retirement is the one that stands.
-func highestAttestedSeq(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (int64, error) {
+// It exists because AdoptAuditKey and the retire paths run against whatever the
+// LOCAL audit_log happens to hold, early in daemon startup and before replication
+// is up. A node restored from an older snapshot sees a shorter log than the
+// cluster does, and a boundary or contract start taken from that stale tail is
+// wrong in the direction that creates permanent findings — the earliest verified
+// retirement is the one that stands, so it could never be raised again.
+//
+// excludeKeys names keys whose heads must NOT count. That is not tidiness: the
+// caller is usually about to retire one of them, and a head signed by the key
+// being retired is an assertion by the very party the retirement is aimed at.
+// Without the exclusion, whoever holds a leaked key publishes a head for that
+// host at seq 1_000_000_000 — it verifies, because the leaked key's certificate
+// is still resolvable and names the host — and the rotation then retires it at
+// that number instead of the real tail, so every row it forges afterwards falls
+// below the boundary and the RetiredKeyUse detection rotation exists to provide
+// never fires. An already-retired key is excluded for the same reason.
+func hostChainFloor(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string, excludeKeys ...string) (int64, error) {
 	heads, err := latestAuditHeadsByKey(ctx, c)
 	if err != nil {
 		return 0, err
 	}
+	retired, err := auditKeyRetirements(ctx, c, keyring)
+	if err != nil {
+		return 0, err
+	}
+	skip := make(map[string]bool, len(excludeKeys))
+	for _, k := range excludeKeys {
+		skip[k] = true
+	}
 	var best int64
 	for _, h := range heads[hostName] {
+		if skip[h.KeyID] || isRetired(retired, hostName, h.KeyID) {
+			continue
+		}
 		if keyring != nil {
 			if err := keyring.VerifyHead(ctx, c, hostName, h.Epoch, h.Seq,
 				h.HeadHash, h.KeyID, h.Signature, h.CreatedAt); err != nil {
@@ -332,4 +368,32 @@ func highestAttestedSeq(ctx context.Context, c *Client, keyring *AuditKeyring, h
 		}
 	}
 	return best, nil
+}
+
+// FlooredHostTailSeq is the sequence every boundary and contract start is taken
+// from: the local tail, raised to whatever a trustworthy signed head proves the
+// chain already reached.
+//
+// Raising is the safe direction for both uses. A higher retirement boundary
+// cannot retroactively condemn rows the key legitimately signed; a higher
+// contract start cannot retroactively claim history written before the host
+// committed. Both mistakes are permanent once made, because the records are
+// append-only and the strictest value wins.
+func FlooredHostTailSeq(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string, excludeKeys ...string) (int64, error) {
+	seq, err := HostTailSeq(ctx, c, hostName)
+	if err != nil {
+		return 0, err
+	}
+	attested, err := hostChainFloor(ctx, c, keyring, hostName, excludeKeys...)
+	if err != nil {
+		return 0, err
+	}
+	if attested > seq {
+		slog.Warn("this host's local audit log is behind what its own signed chain heads "+
+			"attest to; using the attested sequence so a stale replica cannot pin a boundary "+
+			"below rows that were legitimately signed",
+			"host", hostName, "local_tail", seq, "attested", attested)
+		return attested, nil
+	}
+	return seq, nil
 }

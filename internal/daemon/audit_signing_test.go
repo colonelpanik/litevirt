@@ -65,6 +65,19 @@ func peerPKIDir(t *testing.T, caDir, hostName string) string {
 	return dir
 }
 
+// adoptNow records the lifecycle facts a signing daemon would record once
+// replication is up. Split from startup in production (finishAuditKeyLifecycle)
+// because every one of those facts is a permanent sequence boundary and the
+// local tail is not trustworthy until the replicator has run.
+func adoptNow(t *testing.T, d *Daemon) {
+	t.Helper()
+	kr := d.db.AuditKeyringOf()
+	if !kr.CanSign() {
+		t.Fatal("adoptNow on a daemon with no signing key")
+	}
+	adoptAuditKey(context.Background(), d, kr)
+}
+
 func auditTestDaemon(t *testing.T, pkiDir, hostName string) *Daemon {
 	t.Helper()
 	db, err := corrosion.NewTestClient()
@@ -90,6 +103,7 @@ func TestRotation_CompletesWithEnforcementOff(t *testing.T) {
 	if err := d.setupAuditSigning(ctx); err != nil {
 		t.Fatalf("setupAuditSigning: %v", err)
 	}
+	adoptNow(t, d)
 	leaked := d.db.AuditKeyringOf().KeyID()
 	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
 		ID: "r1", Username: "admin", HostName: host,
@@ -250,14 +264,26 @@ func TestSigning_AnUnreadableKeyStillPublishesTheContract(t *testing.T) {
 	dir := auditPKIDir(t, host)
 	d := auditTestDaemon(t, dir, host)
 
-	// Corrupt the private key, leaving the certificate intact.
+	// The host signs first, so a contract exists on the record. That ordering is
+	// the realistic one and it is load-bearing: a contract needs a SIGNED adoption
+	// saying when it began, and a host whose key never once worked cannot produce
+	// one. What must not happen is a host that WAS under contract escaping it by
+	// having its key taken away.
+	if err := d.setupAuditSigning(ctx); err != nil {
+		t.Fatalf("setupAuditSigning: %v", err)
+	}
+	adoptNow(t, d)
+
+	// Now the private key is taken away, leaving the certificate intact.
 	if err := os.WriteFile(filepath.Join(dir, "host.key"), []byte("not a key\n"), 0o600); err != nil {
 		t.Fatalf("corrupt the key: %v", err)
 	}
-
-	if err := d.setupAuditSigning(ctx); err == nil {
+	fresh := auditTestDaemon(t, dir, host)
+	fresh.db = d.db
+	if err := fresh.setupAuditSigning(ctx); err == nil {
 		t.Fatal("setupAuditSigning reported success with an unloadable key")
 	}
+	d = fresh
 
 	if n := auditCount(t, d.db, `SELECT count(*) AS n FROM audit_signing_keys WHERE host_name = ?`, host); n != 1 {
 		t.Fatalf("no certificate was published for a host that is configured to sign (%d rows)\n"+
@@ -304,6 +330,7 @@ func TestRollback_SigningItselfOffIsRecordedNotReportedAsTampering(t *testing.T)
 	if err := d.setupAuditSigning(ctx); err != nil {
 		t.Fatalf("setupAuditSigning: %v", err)
 	}
+	adoptNow(t, d)
 	keyID := d.db.AuditKeyringOf().KeyID()
 	for _, id := range []string{"r1", "r2"} {
 		if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
@@ -362,7 +389,11 @@ func TestRollback_WithoutTheKeyTheContractStaysInForce(t *testing.T) {
 	if err := d.setupAuditSigning(ctx); err != nil {
 		t.Fatalf("setupAuditSigning: %v", err)
 	}
+	adoptNow(t, d)
 	keyID := d.db.AuditKeyringOf().KeyID()
+
+	// A contract is on the record before anything goes wrong.
+	adoptNow(t, d)
 
 	// The key is taken away, then the flag goes off.
 	if err := os.WriteFile(filepath.Join(dir, "host.key"), []byte("not a key\n"), 0o600); err != nil {
@@ -427,6 +458,7 @@ func TestVerifier_ANonSigningNodeCanStillVerify(t *testing.T) {
 	if err := signer.setupAuditSigning(ctx); err != nil {
 		t.Fatalf("peer setupAuditSigning: %v", err)
 	}
+	adoptNow(t, signer)
 	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
 		ID: "p1", Username: "admin", HostName: "peer-1",
 		Action: "vm.create", Target: "vm1", Result: "success",
@@ -461,5 +493,119 @@ func TestVerifier_ANonSigningNodeCanStillVerify(t *testing.T) {
 		t.Fatalf("a non-signing node reports a peer's rolled-back host as tampered: %+v\n"+
 			"it could not verify the retirement, so it treated the rollback as if it had "+
 			"never happened — and disagreed with every signing node about the same rows", res)
+	}
+}
+
+// TestRollback_ReEnablingDoesNotSignWithARetiredKey.
+//
+// enforcement.audit_signature is documented as a reversible kill switch, and
+// turning it off retires the host's key. Turning it back on used to load the same
+// key files and start signing again — and since a retirement is append-only and
+// the earliest one stands, every row that key signed from then on was above its
+// boundary. `lv audit verify` reported RetiredKeyUse on every node, permanently,
+// for toggling a flag the docs invite you to toggle.
+//
+// A key's contract is ONE adopted..retired interval. Once closed, resuming means
+// a new key — and until the operator rotates, the rows are unsigned and correctly
+// NOT treated as evidence, because the retirement closed the contract.
+func TestRollback_ReEnablingDoesNotSignWithARetiredKey(t *testing.T) {
+	ctx := context.Background()
+	const host = "node-0"
+	dir := auditPKIDir(t, host)
+	d := auditTestDaemon(t, dir, host)
+
+	if err := d.setupAuditSigning(ctx); err != nil {
+		t.Fatalf("setupAuditSigning: %v", err)
+	}
+	adoptNow(t, d)
+	keyID := d.db.AuditKeyringOf().KeyID()
+	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
+		ID: "r1", Username: "admin", HostName: host, Action: "vm.create",
+		Target: "vm1", Result: "success", Timestamp: "2026-07-29T10:00:01Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog: %v", err)
+	}
+
+	// Flag off: the daemon retires its own key.
+	d.retireOwnAuditKeyOnRollback(ctx)
+
+	// Flag back on, same key files, fresh daemon — the restart an operator does.
+	back := auditTestDaemon(t, dir, host)
+	back.db = d.db
+	if err := back.setupAuditSigning(ctx); err != nil {
+		t.Fatalf("setupAuditSigning after re-enable: %v", err)
+	}
+	if kr := back.db.AuditKeyringOf(); kr.CanSign() && kr.KeyID() == keyID {
+		t.Fatal("the daemon resumed signing with a key that has already been retired\n" +
+			"every row it writes is past that key's boundary, so the log reads as tampered " +
+			"on every node — permanently, because the retirement is append-only")
+	}
+
+	if err := corrosion.InsertAuditLog(ctx, back.db, corrosion.AuditRecord{
+		ID: "r2", Username: "admin", HostName: host, Action: "vm.start",
+		Target: "vm1", Result: "success", Timestamp: "2026-07-29T10:00:02Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog after re-enable: %v", err)
+	}
+	res, err := corrosion.VerifyAuditChain(ctx, back.db)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if res.Tampered() {
+		t.Fatalf("re-enabling after a rollback reads as tampering: %+v\n"+
+			"the retirement closed the contract, so the unsigned rows after it are expected",
+			res)
+	}
+}
+
+// TestRotation_WithTheFlagOffDoesNotRetireWhatItJustAdopted.
+//
+// completeAuditKeyRotation and retireOwnAuditKeyOnRollback both ran on the
+// flag-off path, in that order — so rotating a default-configured host adopted the
+// new key and then immediately retired it. Both the leaked key and its
+// replacement ended up retired, the host had no live contract at all, and a later
+// `lv host retire-audit-key` refused with "nothing to retire".
+func TestRotation_WithTheFlagOffDoesNotRetireWhatItJustAdopted(t *testing.T) {
+	ctx := context.Background()
+	const host = "node-0"
+	dir := auditPKIDir(t, host)
+	d := auditTestDaemon(t, dir, host)
+
+	// A host that has been signing with its TLS identity.
+	if err := d.setupAuditSigning(ctx); err != nil {
+		t.Fatalf("setupAuditSigning: %v", err)
+	}
+	adoptNow(t, d)
+	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
+		ID: "r1", Username: "admin", HostName: host, Action: "vm.create",
+		Target: "vm1", Result: "success", Timestamp: "2026-07-29T10:00:01Z",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog: %v", err)
+	}
+
+	// The operator rotates; the flag stays off.
+	if err := pki.GenerateAuditSigningCert(
+		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
+		filepath.Join(dir, pki.AuditSigningCertName),
+		filepath.Join(dir, pki.AuditSigningKeyName), host); err != nil {
+		t.Fatalf("GenerateAuditSigningCert: %v", err)
+	}
+	fresh := auditTestDaemon(t, dir, host)
+	fresh.db = d.db
+	fresh.finishAuditKeyLifecycleNow(ctx)
+
+	newKR, err := corrosion.LoadAuditKeyring(dir, host)
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring: %v", err)
+	}
+	if n := auditCount(t, d.db,
+		`SELECT count(*) AS n FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = ?`,
+		newKR.KeyID()); n != 0 {
+		t.Fatalf("the rotation retired the key it had just adopted\n" +
+			"both the leaked key and its replacement are now retired, the host has no live " +
+			"contract, and retire-audit-key will refuse with \"nothing to retire\"")
+	}
+	if _, ok, err := corrosion.ActiveAuditKeyID(ctx, d.db, newKR, host); err != nil || !ok {
+		t.Fatalf("the host has no live signing key after a rotation (err=%v)", err)
 	}
 }

@@ -508,6 +508,62 @@ func (k *AuditKeyring) certFor(ctx context.Context, c *Client, keyID string) (*x
 	return cert, nil
 }
 
+// KeyBelongsToHost reports whether keyID is a signing key published FOR host,
+// proved through the cluster CA rather than taken from the row that claims it.
+//
+// This is the binding that was missing, and its absence was the worst defect in
+// the v47 lifecycle table. auditLifecycleDigest signs host_name and
+// VerifyLifecycle checks the SIGNER's certificate names that host — but nothing
+// checked that the key being acted on belongs there. So a node holding a valid
+// key for its own host A could sign a perfectly verifiable record saying
+// "host A retires <host B's key>", and every reader applied it to B: one
+// compromised node permanently invalidating any other host's entire signed
+// history, with no forgery required.
+//
+// certFor does the CA chain check and re-derives the key id from the certificate,
+// so a fabricated audit_signing_keys row cannot answer for a key it does not
+// hold. The CN comparison is what ties that key to a host.
+func (k *AuditKeyring) KeyBelongsToHost(ctx context.Context, c *Client, keyID, host string) bool {
+	if k == nil || keyID == "" || host == "" {
+		return false
+	}
+	cert, err := k.certFor(ctx, c, keyID)
+	if err != nil {
+		return false
+	}
+	return cert.Subject.CommonName == host
+}
+
+// trustSubmittedCert admits a certificate the caller supplied directly, after
+// holding it to exactly the checks certFor applies to a published one: it must
+// chain to the cluster CA, and its key id must derive from the certificate
+// rather than be asserted alongside it.
+//
+// It exists so a signature can be verified BEFORE the certificate is published.
+// Publishing first, to give certFor something to resolve, meant a failed
+// verification left an orphan certificate in the table permanently.
+func (k *AuditKeyring) trustSubmittedCert(cert *x509.Certificate, keyID string) error {
+	if k == nil {
+		return fmt.Errorf("no audit keyring loaded")
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{
+		Roots: k.roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}); err != nil {
+		return fmt.Errorf("does not chain to the cluster CA: %w", err)
+	}
+	got, err := AuditKeyID(cert)
+	if err != nil {
+		return err
+	}
+	if got != keyID {
+		return fmt.Errorf("submitted under key %s but actually has id %s", keyID, got)
+	}
+	k.mu.Lock()
+	k.verify[keyID] = cert
+	k.mu.Unlock()
+	return nil
+}
+
 func parseCertPEM(data []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(data)
 	if block == nil {

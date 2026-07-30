@@ -47,8 +47,11 @@ func signNode(t *testing.T, n *Node) *corrosion.AuditKeyring {
 		t.Fatalf("LoadAuditKeyring(%s): %v", n.Name, err)
 	}
 	n.DB.SetAuditKeyring(kr)
-	if err := kr.PublishSigningKey(context.Background(), n.DB); err != nil {
-		t.Fatalf("PublishSigningKey(%s): %v", n.Name, err)
+	// AdoptAuditKey, not PublishSigningKey alone: a certificate is not a signing
+	// contract until a SIGNED adoption record says when it began, and a daemon
+	// always writes both. Publishing without one is a state no node produces.
+	if _, err := corrosion.AdoptAuditKey(context.Background(), n.DB, kr, n.Name); err != nil {
+		t.Fatalf("AdoptAuditKey(%s): %v", n.Name, err)
 	}
 	return kr
 }

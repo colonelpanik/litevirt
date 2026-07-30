@@ -2,10 +2,14 @@ package corrosion
 
 import (
 	"context"
+	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/hlc"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // The tamper-evidence a signature produces is only worth what the REPLICATION
@@ -617,5 +621,216 @@ func TestRetirement_CannotBeRecordedWithoutAKey(t *testing.T) {
 	if n := countRows(t, c,
 		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+kr.KeyID()+`'`); n != 0 {
 		t.Fatalf("an unsigned retirement row was written anyway (%d rows)", n)
+	}
+}
+
+// ─────────────────── who may speak for whose key ───────────────────
+
+// TestRetirement_OneHostCannotRetireAnothersKey was the worst defect in the v47
+// lifecycle table, and it passed every test that existed.
+//
+// auditLifecycleDigest signs host_name and VerifyLifecycle checks the SIGNER's
+// certificate names that host — so a node holding a perfectly valid key for its
+// own host A could sign a perfectly verifiable record reading "host A retires
+// <host B's key>". Nothing checked that the key belonged to the host, and the
+// reducer then keyed by key_id alone, discarding the host entirely. Every reader
+// applied it to B: one compromised node permanently invalidating any other host's
+// whole signed history, no forgery required.
+func TestRetirement_OneHostCannotRetireAnothersKey(t *testing.T) {
+	ctx := context.Background()
+	// Two hosts under one cluster CA, as a real cluster has.
+	victim, victimKR, dir := signedClient(t, "node-victim")
+	ins(t, victim, "v1", "node-victim", "2026-07-29T10:00:01Z")
+	ins(t, victim, "v2", "node-victim", "2026-07-29T10:00:02Z")
+
+	attackerKR := peerKeyring(t, dir, "node-attacker", victim)
+
+	// The attacker signs, correctly and verifiably, for its OWN host — while
+	// naming the victim's key.
+	sig, err := attackerKR.SignLifecycle("node-attacker", victimKR.KeyID(), "retired", 0)
+	if err != nil {
+		t.Fatalf("SignLifecycle: %v", err)
+	}
+	if err := victim.Execute(ctx,
+		`INSERT INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-attacker', ?, 'retired', 0, ?, ?, ?, ?, NULL)`,
+		victimKR.KeyID(), attackerKR.KeyID(), sig,
+		"2026-07-29T10:00:00Z", "2026-07-29T10:00:00Z"); err != nil {
+		t.Fatalf("insert the cross-host retirement: %v", err)
+	}
+
+	res := verify(t, victim)
+	if len(res.RetiredKeyUse) > 0 {
+		t.Fatalf("a record signed by node-attacker retired node-victim's key: %v\n"+
+			"a signature proves who is speaking, not what they may speak about — the key "+
+			"has to belong to the host the record names", res.RetiredKeyUse)
+	}
+	if res.Tampered() {
+		t.Fatalf("a cross-host forgery made the victim's log read as tampered: %+v", res)
+	}
+}
+
+// TestRetirement_ASquatterCannotBlockTheRealRecord.
+//
+// The lifecycle table is append-only and written with INSERT OR IGNORE, so with
+// (host, key, event) as the primary key the FIRST writer owned the slot — and
+// anyone can write the table. An unverifiable row placed there was ignored by the
+// reader AND blocked the host from ever recording its real adoption, so every
+// pre-enforcement row that host had written became evidence, permanently.
+//
+// by_key_id is part of the key now, so a row signed by someone else lands
+// somewhere else.
+func TestRetirement_ASquatterCannotBlockTheRealRecord(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+	dir := testPKI(t, "node-0")
+	kr, err := LoadAuditKeyring(dir, "node-0")
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring: %v", err)
+	}
+
+	// Pre-enforcement history, then a squatter claims the adoption slot before the
+	// host ever gets to record its own.
+	c.SetAuditKeyring(nil)
+	for _, id := range []string{"r1", "r2"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-0', ?, 'adopted', 0, 'squatter', 'garbage', ?, ?, NULL)`,
+		kr.KeyID(), "2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("squat the adoption slot: %v", err)
+	}
+
+	// The host now starts signing for real.
+	c.SetAuditKeyring(kr)
+	if _, err := AdoptAuditKey(ctx, c, kr, "node-0"); err != nil {
+		t.Fatalf("AdoptAuditKey: %v", err)
+	}
+	ins(t, c, "r3", "node-0", "2026-07-29T10:00:03Z")
+
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'adopted' AND by_key_id = '`+kr.KeyID()+`'`); n != 1 {
+		t.Fatalf("the host could not record its own adoption; a squatter owned the slot (%d rows)", n)
+	}
+	res := verify(t, c)
+	if len(res.UnsignedAfterSigned) > 0 {
+		t.Fatalf("pre-enforcement rows were claimed by a squatted contract start: %v\n"+
+			"first-write-wins on a table anyone can write is not a defence, it is a lever",
+			res.UnsignedAfterSigned)
+	}
+	if res.Tampered() {
+		t.Fatalf("a squatted lifecycle row made the log read as tampered: %+v", res)
+	}
+}
+
+// peerKeyring mints a second host's signing identity under the SAME cluster CA
+// and publishes it, the way a real peer appears in the table.
+func peerKeyring(t *testing.T, caDir, hostName string, c *Client) *AuditKeyring {
+	t.Helper()
+	dir := t.TempDir()
+	for _, f := range []string{"ca.crt", "ca.key"} {
+		b, err := os.ReadFile(filepath.Join(caDir, f))
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, f), b, 0o600); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+	if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
+		filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"),
+		hostName, net.IPv4(127, 0, 0, 1)); err != nil {
+		t.Fatalf("GenerateHostCert(%s): %v", hostName, err)
+	}
+	kr, err := LoadAuditKeyring(dir, hostName)
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring(%s): %v", hostName, err)
+	}
+	if err := kr.PublishSigningKey(context.Background(), c); err != nil {
+		t.Fatalf("PublishSigningKey(%s): %v", hostName, err)
+	}
+	return kr
+}
+
+// TestContract_AFabricatedCertificateCannotEnrolAHost is what KeyBelongsToHost
+// actually guards.
+//
+// The contract pre-pass used to read audit_signing_keys directly — host_name and
+// key_id straight off the row, no CA validation — even though the table is
+// replicated and the whole threat model says anyone can write it. One fabricated
+// row naming a victim host put that host under a signing contract it never
+// entered, and every unsigned row it had ever written became evidence on every
+// node.
+//
+// audit_signing_keys is deliberately outside auditEvidenceGuards precisely
+// because certFor re-validates on every use. This is the reader that was
+// bypassing it.
+func TestContract_AFabricatedCertificateCannotEnrolAHost(t *testing.T) {
+	ctx := context.Background()
+	c, _, _ := signedClient(t, "node-0")
+
+	// A victim host with ordinary pre-enforcement history and no contract.
+	c2 := c
+	for _, id := range []string{"v1", "v2"} {
+		if err := c2.Execute(ctx,
+			`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+			                        result, prev_hash, content_hash, key_id, signature, seq)
+			 VALUES (?, ?, 'u', 'node-victim', 'vm.start', 'x', '', 'ok', '', ?, '', '', ?)`,
+			id, "2026-07-29T09:00:0"+id[1:]+"Z", "hash-"+id, id[1:]); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	// The forgery: a certificate row naming the victim, with a PEM that is not a
+	// certificate at all.
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_signing_keys (key_id, host_name, cert_pem, created_at, updated_at, deleted_at)
+		 VALUES ('fabricated-key', 'node-victim', 'not a certificate', ?, ?, NULL)`,
+		"2026-07-29T10:00:00Z", "2026-07-29T10:00:00Z"); err != nil {
+		t.Fatalf("insert the fabricated certificate: %v", err)
+	}
+
+	if res := verify(t, c); len(res.UnsignedAfterSigned) > 0 {
+		t.Fatalf("a fabricated certificate row enrolled node-victim into a contract: %v\n"+
+			"the row's own host_name column is not evidence of anything; ownership has to be "+
+			"proved through the cluster CA", res.UnsignedAfterSigned)
+	}
+}
+
+// TestAuditHeads_ANodeWithNoKeyringAccusesNobody.
+//
+// A node whose LoadAuditVerifier failed — missing or unreadable ca.crt — has
+// verified nothing about any head: not its signature, not its timestamp. Treating
+// that as "settled" made it report every peer as truncated during ordinary
+// replication lag, while every node that COULD verify called the same log clean.
+//
+// Two nodes disagreeing about identical replicated rows is the one outcome this
+// design cannot tolerate: cross-node agreement is the entire reason to believe
+// any node's verdict. A node that can check nothing must say nothing.
+func TestAuditHeads_ANodeWithNoKeyringAccusesNobody(t *testing.T) {
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	// A head attesting far beyond what this node holds, old enough that a node
+	// which COULD verify it would report a truncation.
+	old := time.Now().Add(-2 * headSettleWindow).UTC().Format(time.RFC3339)
+	insertSignedHead(t, c, kr, 0, 9, "aabb", old)
+	if res := verify(t, c); len(res.TruncatedHosts) == 0 {
+		t.Fatalf("a node WITH a keyring should report this shortfall; the test is not set up")
+	}
+
+	// The same database, read by a node that cannot verify anything.
+	c.SetAuditKeyring(nil)
+	res := verify(t, c)
+	if len(res.TruncatedHosts) > 0 {
+		t.Fatalf("a node with no keyring accused a peer of truncation: %v\n"+
+			"it verified nothing — not the signature, not the timestamp — so it has no "+
+			"basis to disagree with every node that can", res.TruncatedHosts)
+	}
+	if res.Tampered() {
+		t.Fatalf("a node that can verify nothing reported tampering: %+v", res)
 	}
 }

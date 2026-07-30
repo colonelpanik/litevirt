@@ -304,6 +304,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Minting a separate one would need the CA private key, which lives only on
 	// whichever node ran `lv host init`, so a fresh node could not sign its own
 	// log at all.
+	// Wire the keyring NOW — rows get written during startup and must be signed —
+	// but do NOT record any lifecycle fact yet. Adoption boundaries and retirement
+	// boundaries are sequence numbers, and this runs long before the replicator
+	// starts, so a node restored from a snapshot would read a local tail far
+	// behind its real replicated history and pin a boundary there permanently.
+	// See finishAuditKeyLifecycle, called once replication is up.
 	if d.cfg.Enforcement.AuditSignature {
 		if err := d.setupAuditSigning(ctx); err != nil {
 			// Non-fatal: refusing to start would turn a PKI problem into an
@@ -313,21 +319,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 				"error", err)
 		}
 	} else {
-		if shouldCompleteAuditKeyRotation(d.cfg) {
-			if err := d.completeAuditKeyRotation(ctx); err != nil {
-				slog.Error("a dedicated audit signing key is installed but could not be adopted; "+
-					"the key it replaced has NOT been retired and the history it wrote is NOT sealed",
-					"error", err)
-			}
-		}
-		// The flag is off. If this host still has a live signing contract, record
-		// a signed retirement so the rollback is an explicit, dated fact rather
-		// than a permanent tamper verdict on every node.
-		d.retireOwnAuditKeyOnRollback(ctx)
-		// And it still needs the cluster CA: a keyring is what verifies a
-		// lifecycle record, so a node without one ignores every adoption and
-		// retirement in the cluster and reports peers' rolled-back hosts as
-		// tampering.
+		// A non-signing node still needs the cluster CA: a keyring is what
+		// verifies a lifecycle record, so a node without one ignores every
+		// adoption and retirement in the cluster and reports peers' rolled-back
+		// hosts as tampering while every signing node calls the same log clean.
 		d.installAuditVerifier()
 	}
 
@@ -529,6 +524,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
 	})
 	repl.Start(ctx)
+
+	// Audit key lifecycle, deferred until replication is running.
+	//
+	// Adoption and retirement both record a SEQUENCE, and both are permanent:
+	// records are append-only and the strictest verified value wins, so a boundary
+	// taken from a local tail that is behind the cluster can never be corrected.
+	// Running this before the replicator meant a rebuilt or snapshot-restored node
+	// pinned its contract start — or its predecessor's retirement — below its own
+	// real history, and every row in the gap became a permanent finding on every
+	// node the moment anti-entropy delivered it.
+	go d.finishAuditKeyLifecycle(ctx)
+
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
 	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s

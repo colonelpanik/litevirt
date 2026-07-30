@@ -154,11 +154,19 @@ Three properties matter, and each closes a specific hole:
 
 - **It is per host**, so a gradual rollout cannot false-fire. A host that has not
   published yet is simply not signing yet.
-- **It has a start.** A certificate says a host commits, not *when* — and without
-  the when, publishing one retroactively claims every row the host ever wrote, so
-  the first `verify` after enabling signing reports a cluster's whole history as
-  tampering. A signed `adopted` record carries the sequence the chain had reached
-  when the key took effect; rows at or below it predate the commitment.
+- **It has a start, and no start means no contract.** A certificate says a host
+  commits, not *when* — and without the when, publishing one retroactively claims
+  every row the host ever wrote. A signed `adopted` record carries the sequence
+  the chain had reached when the key took effect; rows at or below it predate the
+  commitment. A certificate with **no** verified adoption record is not a
+  contract at all, because guessing "from row 0" is exactly the retroactive claim
+  that made an ordinary upgrade report a cluster's whole history as tampering.
+- **It is bound to the host that owns the key.** A signature proves who is
+  speaking, not what they may speak about. Every lifecycle record is checked both
+  ways: the signer's certificate must name the host in the record, *and* the key
+  the record acts on must belong to that host, proved through the cluster CA.
+  Without the second check a node could sign a perfectly valid record about
+  somebody else's key.
 - **It is not derived from the host's own config or its own log.** A node-local
   flag would let a compromised node declare itself exempt and report clean, and
   two nodes disagreeing about the same replicated rows would destroy the only
@@ -264,6 +272,12 @@ never deleted, so `lv audit verify` can still resolve it — deleting it would m
 every row it signed unverifiable, and a rotation performed to improve integrity
 would destroy the history it was protecting. What retirement adds is a boundary:
 use of the old key past the sequence it was retired at is itself a finding.
+
+A key's contract is one `adopted`..`retired` interval. Once retired, that key is
+finished: re-enabling `enforcement.audit_signature` will not resume signing with
+it — the daemon says so and points at `lv host rotate-audit-key`. Rows written
+meanwhile are unsigned and are not evidence, because the retirement closed the
+contract.
 
 A retirement is itself **signed**, and stored append-only in
 `audit_key_lifecycle`. That is not decoration. It began as two ordinary columns on

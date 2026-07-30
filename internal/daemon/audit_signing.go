@@ -54,11 +54,92 @@ func (d *Daemon) setupAuditSigning(ctx context.Context) error {
 		}
 		return err
 	}
+	// A key that has already been retired must never sign again. Re-enabling
+	// enforcement.audit_signature after a rollback used to load the same key and
+	// start signing with it, and since a retirement is append-only and the
+	// earliest one stands, every row it wrote from then on was above its boundary:
+	// `lv audit verify` reported RetiredKeyUse on every node, permanently, for
+	// toggling a flag the docs call a reversible kill switch.
+	//
+	// A key's contract is ONE adopted..retired interval. Once closed, resuming
+	// means a new key.
+	if retired, rerr := corrosion.KeyIsRetired(ctx, d.db, keyring, d.cfg.HostName, keyring.KeyID()); rerr == nil && retired {
+		slog.Error("this host's audit signing key has already been RETIRED; it will not be used "+
+			"to sign. Every row it signed past its boundary is reported as evidence on every "+
+			"node, so resuming means a new key: run `lv host rotate-audit-key` for this host. "+
+			"Rows written meanwhile are unsigned and are NOT treated as evidence, because the "+
+			"retirement closed the contract",
+			"host", d.cfg.HostName, "key_id", keyring.KeyID())
+		d.installAuditVerifier()
+		if verifier, verr := corrosion.LoadAuditVerifier(d.cfg.PKIDir); verr == nil {
+			d.db.SetAuditKeyring(verifier)
+		}
+		return nil
+	}
 	d.db.SetAuditKeyring(keyring)
-	adoptAuditKey(ctx, d, keyring)
+	if err := keyring.PublishSigningKey(ctx, d.db); err != nil {
+		slog.Error("audit signing certificate could not be published; peers cannot verify this "+
+			"host's chain until it is", "error", err)
+	}
 	slog.Info("audit signing enabled", "host", d.cfg.HostName, "key_id", keyring.KeyID(),
 		"dedicated_key", corrosion.UsesDedicatedAuditKey(d.cfg.PKIDir))
 	return nil
+}
+
+// auditLifecycleSettle is how long finishAuditKeyLifecycle waits for replication
+// to deliver this host's own rows before it records a sequence boundary.
+//
+// It only has to be long enough that a node which has just rejoined sees its own
+// history. A boundary recorded too low is permanent; one recorded a few seconds
+// late costs nothing.
+const auditLifecycleSettle = 45 * time.Second
+
+// finishAuditKeyLifecycle records the adoption, retirement and sealing facts that
+// a rotation or a rollback implies — AFTER replication has had a chance to deliver
+// this host's real history.
+//
+// Every one of those facts is a sequence number, and every one is permanent:
+// lifecycle records are append-only and the strictest verified value wins. Taken
+// from a local tail that is behind the cluster they condemn rows that were
+// legitimately signed, or claim history written before the host ever committed,
+// and neither can be corrected afterwards. That is why this does not run at the
+// same point in startup as the keyring.
+func (d *Daemon) finishAuditKeyLifecycle(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(auditLifecycleSettle):
+	}
+
+	if d.cfg.Enforcement.AuditSignature {
+		keyring := d.db.AuditKeyringOf()
+		if !keyring.CanSign() {
+			return // no key to attribute anything to; setupAuditSigning already said so
+		}
+		adoptAuditKey(ctx, d, keyring)
+		return
+	}
+	// Flag off. A dedicated pair on disk means an operator ran
+	// `lv host rotate-audit-key`, and completing that rotation must not depend on
+	// a flag the command never mentions.
+	rotated := false
+	if shouldCompleteAuditKeyRotation(d.cfg) {
+		if err := d.completeAuditKeyRotation(ctx); err != nil {
+			slog.Error("a dedicated audit signing key is installed but could not be adopted; "+
+				"the key it replaced has NOT been retired and the history it wrote is NOT sealed",
+				"error", err)
+		} else {
+			rotated = true
+		}
+	}
+	// Only when we did NOT just adopt. Running both retired the key the rotation
+	// had adopted seconds earlier, so rotating a default-configured host left BOTH
+	// the leaked key and its replacement retired — after which the host had no
+	// live contract at all and `lv host retire-audit-key` refused with "nothing to
+	// retire".
+	if !rotated {
+		d.retireOwnAuditKeyOnRollback(ctx)
+	}
 }
 
 // retireOwnAuditKeyOnRollback records a SIGNED retirement when this host is no
@@ -77,6 +158,7 @@ func (d *Daemon) setupAuditSigning(ctx context.Context) error {
 // signature explaining it — which is also why an attacker cannot use this to go
 // quiet, since producing the retirement means holding the key and publishing a
 // permanent, replicated statement of when they stopped.
+
 // installAuditVerifier gives a NON-SIGNING node the cluster CA, so it can still
 // check everyone else's chain.
 //
@@ -102,6 +184,7 @@ func (d *Daemon) installAuditVerifier() {
 	d.db.SetAuditKeyring(verifier)
 }
 
+// retireOwnAuditKeyOnRollback records the signed retirement described above.
 func (d *Daemon) retireOwnAuditKeyOnRollback(ctx context.Context) {
 	keyring, err := corrosion.LoadAuditKeyring(d.cfg.PKIDir, d.cfg.HostName)
 	if err != nil {
@@ -121,7 +204,11 @@ func (d *Daemon) retireOwnAuditKeyOnRollback(ctx context.Context) {
 	if !ok || active != keyring.KeyID() {
 		return // no live contract for the key we hold; nothing to retire
 	}
-	seq, err := corrosion.HostTailSeq(ctx, d.db, d.cfg.HostName)
+	// Floored, and excluding the key being retired: the local tail can be behind
+	// the cluster, and the earliest verified retirement is the one that stands, so
+	// a boundary recorded from a stale replica condemns rows this key legitimately
+	// signed and can never be raised again.
+	seq, err := corrosion.FlooredHostTailSeq(ctx, d.db, keyring, d.cfg.HostName, keyring.KeyID())
 	if err != nil {
 		slog.Warn("could not read this host's audit tail", "error", err)
 		return
@@ -320,4 +407,26 @@ func boolCount(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// finishAuditKeyLifecycleNow runs the deferred lifecycle step without its settle
+// wait. Test-only: the wait exists so a restarted node sees its own replicated
+// history before it records a boundary, which is not a thing a single-process
+// test can be behind on.
+func (d *Daemon) finishAuditKeyLifecycleNow(ctx context.Context) {
+	if d.cfg.Enforcement.AuditSignature {
+		if keyring := d.db.AuditKeyringOf(); keyring.CanSign() {
+			adoptAuditKey(ctx, d, keyring)
+		}
+		return
+	}
+	rotated := false
+	if shouldCompleteAuditKeyRotation(d.cfg) {
+		if err := d.completeAuditKeyRotation(ctx); err == nil {
+			rotated = true
+		}
+	}
+	if !rotated {
+		d.retireOwnAuditKeyOnRollback(ctx)
+	}
 }

@@ -137,9 +137,21 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "load cluster CA: %v", err)
 	}
-	active, ok, err := corrosion.ActiveAuditKeyID(ctx, s.db, verifier, host)
+	live, err := corrosion.LiveAuditKeyIDs(ctx, s.db, verifier, host)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	// Every live key, not just the newest. A host is under contract while ANY of
+	// its keys is unretired, so closing one and reporting success left the
+	// contract standing and every node still reporting TAMPERED.
+	if len(live) > 1 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"host %q has %d live signing certificates (%v); retire them one at a time and "+
+				"re-run until none remain, or the contract stays open", host, len(live), live)
+	}
+	active, ok := "", len(live) == 1
+	if ok {
+		active = live[0]
 	}
 	if !ok {
 		return nil, status.Errorf(codes.FailedPrecondition,
@@ -149,7 +161,11 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	// The boundary is the sequence the host's chain has REACHED, read from
 	// replicated state. Everything up to there was legitimately written under the
 	// key; anything above it is the finding this retirement raises.
-	seq, err := corrosion.HostTailSeq(ctx, s.db, host)
+	// Floored, and excluding the key being retired. This RPC is usually served by
+	// a node that is NOT the one being retired, so its replica of that host's log
+	// can lag badly — recording the boundary from it would put every row between
+	// the two past the boundary the moment anti-entropy caught up, permanently.
+	seq, err := corrosion.FlooredHostTailSeq(ctx, s.db, verifier, host, active)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}

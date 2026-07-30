@@ -351,75 +351,43 @@ func TestRotation_StillRetiresAGenuinelySupersededKey(t *testing.T) {
 	}
 }
 
-// TestRotation_AStaleTailCannotPinTheBoundaryLow.
+// TestRotation_ARetiringKeyCannotRaiseItsOwnBoundary.
 //
-// AdoptAuditKey runs early in daemon startup — before the replicator and
-// anti-entropy come up — so it reads whatever the LOCAL audit_log happens to
-// hold. A node restored from an older snapshot sees a shorter chain than the
-// cluster does, and retiring at that number puts every row in between under a
-// boundary the key legitimately signed.
+// The floor that keeps a stale replica from pinning a boundary too low must not
+// become a lever for the party the retirement is aimed at.
 //
-// That is not self-correcting: the earliest verified retirement is the one that
-// stands, so a routine restore-then-rotate would leave the whole cluster's audit
-// verdict red with no way to raise it back.
+// Someone holding a leaked key publishes a head for that host at an absurd
+// sequence. It verifies — the key's certificate is still resolvable and names the
+// host, which is exactly the situation rotation exists for. If that head counted
+// toward the floor, the rotation would retire the leaked key at 10^9 instead of
+// the real tail, and every row it forged afterwards would fall below the boundary
+// with the RetiredKeyUse detection silently switched off.
 //
-// A signed chain head is the cluster's own record of how far the chain has been,
-// and a stale replica cannot talk it down.
-func TestRotation_AStaleTailCannotPinTheBoundaryLow(t *testing.T) {
+// The floor therefore ignores heads signed by the keys being retired. What
+// protects the honest stale-replica case instead is timing: the daemon defers
+// every lifecycle record until replication is running (finishAuditKeyLifecycle),
+// so the local tail is real by the time a boundary is taken from it.
+func TestRotation_ARetiringKeyCannotRaiseItsOwnBoundary(t *testing.T) {
 	ctx := context.Background()
 	c, oldKR, dir := signedClient(t, "node-0")
-	for _, id := range []string{"r1", "r2", "r3", "r4"} {
-		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
-	}
-	// The cluster has a head attesting to seq 4.
-	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
-		t.Fatalf("PublishAuditChainHead: %v", err)
-	}
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
 
-	// This replica is behind: it holds only the first two rows. Keep what it is
-	// missing, because anti-entropy will hand it back — and the half of this that
-	// only shows up AFTER it does is the half that shipped broken.
-	missing := rowsByID(t, c, "r3", "r4")
-	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('r3','r4')`); err != nil {
-		t.Fatalf("simulate a stale replica: %v", err)
+	// The leaked key asserts a wildly high position for its own host.
+	tail := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r2'`)
+	if err := insertAuditChainHead(ctx, c, oldKR, "node-0", 7, 1_000_000_000, tail); err != nil {
+		t.Fatalf("publish the inflated head: %v", err)
 	}
-	c.ResetAuditChainForTests()
 
 	rotateTo(t, c, dir, "node-0")
 
-	// The peers catch this node up.
-	restoreRows(t, c, missing)
-
 	got := oneCol(t, c,
 		`SELECT at_seq FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`)
-	if got != "4" {
-		t.Fatalf("retirement boundary is %q, want 4 — the sequence this host's own signed head "+
-			"attests to\na node restored from a snapshot would otherwise put rows 3-4, which "+
-			"its key legitimately signed, permanently past the boundary", got)
-	}
-
-	// And the SEALING HEAD must still describe one real row. Raising the boundary
-	// to the attested sequence while leaving the hash at the stale local tail
-	// publishes "at seq 4 the chain hashed to <row 2's hash>" — false by
-	// construction, permanent because heads are append-only, and reported as a
-	// chain head mismatch on every node forever. The lab produced exactly that.
-	for _, h := range headsFor(t, c, "node-0") {
-		if h.KeyID != newKeyID(t, c, "node-0") {
-			continue
-		}
-		actual, err := chainHashAt(ctx, c, "node-0", h.Seq)
-		if err != nil {
-			t.Fatalf("chainHashAt: %v", err)
-		}
-		if actual != "" && !strings.EqualFold(actual, h.HeadHash) {
-			t.Fatalf("the sealing head claims seq %d hashed to %s, but that row hashes to %s\n"+
-				"a head quotes ONE row's position and hash; taking the seq from the cluster "+
-				"and the hash from a stale local tail is a permanent false finding",
-				h.Seq, h.HeadHash, actual)
-		}
-	}
-	if res := verify(t, c); res.Tampered() {
-		t.Fatalf("rotating on a stale tail left the log reported as tampered: %+v", res)
+	if got != "2" {
+		t.Fatalf("retirement boundary is %q, want 2 — the real tail\n"+
+			"a head signed by the key being retired is an assertion by the very party the "+
+			"retirement is aimed at; counting it lets a leaked key set its own boundary and "+
+			"switch off the detection rotation exists to provide", got)
 	}
 }
 

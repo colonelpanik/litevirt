@@ -40,8 +40,12 @@ func signedClient(t *testing.T, hostName string) (*Client, *AuditKeyring, string
 		t.Fatalf("LoadAuditKeyring: %v", err)
 	}
 	c.SetAuditKeyring(kr)
-	if err := kr.PublishSigningKey(context.Background(), c); err != nil {
-		t.Fatalf("PublishSigningKey: %v", err)
+	// AdoptAuditKey, not PublishSigningKey: a certificate on its own is not a
+	// signing contract, because it says nothing about WHEN the host committed.
+	// A real daemon always records the adoption alongside it, and a test that
+	// publishes without one is exercising a state no daemon produces.
+	if _, err := AdoptAuditKey(context.Background(), c, kr, hostName); err != nil {
+		t.Fatalf("AdoptAuditKey: %v", err)
 	}
 	return c, kr, dir
 }

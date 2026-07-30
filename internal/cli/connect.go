@@ -62,7 +62,16 @@ func LoadClusterConfig() (*ClusterConfig, error) {
 	// Check for local daemon config.
 	if data, err := os.ReadFile(daemonConfigPath); err == nil {
 		var dc localDaemonConfig
-		if err := yaml.Unmarshal(data, &dc); err == nil {
+		// A config that is PRESENT but unparseable is its own answer, and used to
+		// fall through to "LV_HOST not set" — which says the file is absent. A
+		// duplicate key (easy to produce by editing join_peers) then had every lv
+		// command on a healthy node claim it could not find a cluster, sending the
+		// operator after an env var instead of the one broken line.
+		if err := yaml.Unmarshal(data, &dc); err != nil {
+			return nil, fmt.Errorf("daemon config %s is present but could not be parsed: %w",
+				daemonConfigPath, err)
+		}
+		{
 			port := dc.GRPCPort
 			if port == 0 {
 				port = 7443

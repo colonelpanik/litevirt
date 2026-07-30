@@ -144,6 +144,20 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 
 // HostAdd adds a new host to an existing cluster.
 func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers []string) error {
+	// Before anything is generated or pushed, because a failure here must leave the
+	// target untouched.
+	//
+	// The peer list is gathered best-effort by the caller: it asks the local daemon
+	// for the current hosts and carries on if that fails. Carrying on means writing
+	// `join_peers: []` onto the new node — certificates, binary and a running daemon,
+	// and no way to find the cluster — and then reporting success. `add` always has
+	// at least one host to join by definition; if it did not, this would be `init`.
+	if len(joinPeers) == 0 {
+		return fmt.Errorf("no gossip peers to join: could not read the existing cluster's "+
+			"hosts, so %s would be provisioned with an empty join_peers and never reach the "+
+			"cluster. Check that a daemon is reachable from here (lv host ls), or that this "+
+			"is not the first host — the first one is `lv host init`", hostName)
+	}
 	pkiDir := PKIDir()
 
 	// Verify CA exists
@@ -333,6 +347,60 @@ func findDaemonBinary() (string, error) {
 
 // HostInitLocal bootstraps litevirt on the local machine (no SSH).
 // Intended for single-node standalone setups.
+// localAdvertiseAddr is the address `lv host init --local` puts in the host
+// certificate, set from --address. Empty means auto-detect.
+var localAdvertiseAddr string
+
+// SetLocalAdvertiseAddr is how the command layer passes --address through.
+func SetLocalAdvertiseAddr(addr string) { localAdvertiseAddr = addr }
+
+// mintLocalHostCert issues the first host's certificate, covering the address
+// PEERS will dial as well as loopback.
+//
+// It used to pass 127.0.0.1 alone, which is the one address guaranteed to mean a
+// different machine to whoever dials it — so no peer could ever complete a
+// handshake with the first node, and the documented advice ("use the remote form")
+// is circular, because a node cannot init itself remotely. The only way through
+// was copying the CA to a second node and re-issuing the first node's certificate
+// from there.
+//
+// addr empty falls back to the default-route source IP. That is the wrong answer
+// on a multi-homed host, which is exactly why --address exists: on a box whose
+// cluster network is not the default route, the operator has to say so, and the
+// same value belongs in advertise_address.
+func mintLocalHostCert(pkiDir, hostName, addr string) error {
+	caPath := filepath.Join(pkiDir, "ca.crt")
+	caKeyPath := filepath.Join(pkiDir, "ca.key")
+	if addr == "" {
+		addr = outboundIP()
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		// Not an IP (a name, or nothing detectable). GenerateHostCert always adds
+		// loopback and the DNS name, so this stays usable for a single-node install
+		// while still being honest in the log about what peers will and will not
+		// be able to verify.
+		slog.Warn("no usable IP address for this host's certificate; peers dialling it by "+
+			"address will fail TLS verification. Pass --address <ip>", "host", hostName, "addr", addr)
+	}
+	slog.Info("generating host certificate", "host", hostName, "address", addr)
+	return pki.GenerateHostCert(caPath, caKeyPath,
+		filepath.Join(pkiDir, hostName+".crt"), filepath.Join(pkiDir, hostName+".key"),
+		hostName, ip)
+}
+
+// outboundIP is the source address toward the default route. Correct on a
+// single-homed box and wrong on any host whose cluster network is not the default
+// one — which is what --address is for.
+func outboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
 func HostInitLocal(ctx context.Context, hostName string) error {
 	pkiDir := PKIDir()
 	if err := os.MkdirAll(pkiDir, 0700); err != nil {
@@ -359,13 +427,11 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 		}
 	}
 
-	// 3. Generate host certificate with 127.0.0.1 + outbound IP as SANs
-	slog.Info("generating host certificate", "host", hostName)
+	// 3. Generate the host certificate.
 	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
 	hostKeyPath := filepath.Join(pkiDir, hostName+".key")
-
-	if err := pki.GenerateHostCert(caPath, caKeyPath, hostCertPath, hostKeyPath, hostName, net.ParseIP("127.0.0.1")); err != nil {
-		return fmt.Errorf("generate host cert: %w", err)
+	if err := mintLocalHostCert(pkiDir, hostName, localAdvertiseAddr); err != nil {
+		return err
 	}
 
 	// 4. Copy daemon certs to system PKI dir. The daemon host key stays

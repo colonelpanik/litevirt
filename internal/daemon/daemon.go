@@ -415,6 +415,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.registerHost(ctx); err != nil {
 		slog.Warn("failed to register host", "error", err)
 	}
+	// And correct the address if it has changed since the row was created —
+	// registerHost is an INSERT, so it cannot.
+	if err := d.reconcileHostAddress(ctx); err != nil {
+		slog.Warn("could not reconcile this host's recorded address", "error", err)
+	}
 	// Write boot state in ONE batched mutation: state + version (+ resources if the
 	// probe succeeded) share a single updated_at. Doing these as separate writes in
 	// the same wall-clock second produced equal updated_at values, and on a peer the
@@ -1360,6 +1365,40 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 		FenceStrategy: "best-effort",
 		Version:       d.cfg.Version,
 	})
+}
+
+// reconcileHostAddress rewrites this host's address when the row disagrees with
+// what the daemon now believes its address to be.
+//
+// registerHost cannot do it: InsertHost is a plain INSERT, so on every start
+// after the first it is a no-op and the address recorded at bootstrap is
+// permanent. That address comes from getOutboundIP() when advertise_address is
+// unset — the source IP toward the DEFAULT route, which on a multi-homed host is
+// the wrong interface. Setting advertise_address afterwards is the documented fix
+// for exactly that, and without this it changed nothing.
+//
+// It matters beyond this node. Peers dial hosts.address, and `lv host add` seeds
+// the new node's join_peers from ListHosts, so one wrong row is copied into the
+// gossip configuration of every host added after it. In the lab that produced four
+// nodes advertising the same NAT address, each dialling itself.
+//
+// Only on a real change, so an unchanged address cannot restamp updated_at on
+// every restart and win LWW against a genuine concurrent write from another node.
+func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
+	want := d.hostAddress()
+	if want == "" {
+		return nil
+	}
+	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
+	if err != nil || h == nil || h.Address == want {
+		return err
+	}
+	slog.Warn("correcting this host's recorded address; peers dial this value and it is "+
+		"copied into the gossip configuration of hosts added later",
+		"host", d.cfg.HostName, "was", h.Address, "now", want)
+	return d.db.Execute(ctx,
+		`UPDATE hosts SET address = ?, updated_at = ? WHERE name = ?`,
+		want, d.db.NowTS(), d.cfg.HostName)
 }
 
 // localDiskTotalGiB returns the total disk capacity in GiB for the filesystem

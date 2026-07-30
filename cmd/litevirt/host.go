@@ -47,16 +47,24 @@ func newHostCmd() *cobra.Command {
 func newHostInitCmd() *cobra.Command {
 	var name string
 	var local bool
+	var address string
 	cmd := &cobra.Command{
 		Use:   "init [user@host]",
 		Short: "Bootstrap first cluster host",
 		Long: `Bootstrap the first host in a litevirt cluster.
 
 For remote hosts:   lv host init root@10.0.50.10 --name host-a
-For localhost:      lv host init --local --name node-1`,
+For localhost:      lv host init --local --name node-1 --address 10.77.0.11
+
+With --local, --address is what peers will dial. It goes into the host certificate,
+so leaving it wrong means every peer handshake fails with "certificate is valid for
+127.0.0.1, not <addr>". It defaults to the default-route source IP, which is the
+wrong interface on a multi-homed host — pass the same value you will put in
+advertise_address.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if local {
+				cli.SetLocalAdvertiseAddr(address)
 				return cli.HostInitLocal(cmd.Context(), name)
 			}
 			if len(args) == 0 {
@@ -67,6 +75,10 @@ For localhost:      lv host init --local --name node-1`,
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Host name (required)")
 	cmd.Flags().BoolVar(&local, "local", false, "Initialize on localhost (no SSH)")
+	cmd.Flags().StringVar(&address, "address", "",
+		"with --local, the IP peers will dial this host on; it goes in the host "+
+			"certificate. Defaults to the default-route source IP, which is wrong on a "+
+			"multi-homed host — use the same value you will set as advertise_address")
 	cmd.MarkFlagRequired("name")
 	return cmd
 }
@@ -78,20 +90,27 @@ func newHostAddCmd() *cobra.Command {
 		Short: "Add host to existing cluster",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Query existing cluster hosts to get gossip peer addresses.
-			// Best-effort: if we can't reach a daemon, proceed with no peers.
+			// Query existing cluster hosts to get gossip peer addresses. This was
+			// best-effort and silent, which meant an unreachable daemon produced an
+			// empty peer list and a node provisioned with nowhere to join. HostAdd
+			// refuses an empty list now, so the only job here is to say WHY it is
+			// empty rather than leaving the operator to guess.
 			var peerAddrs []string
 			c, closer, err := cli.Connect(cmd.Context())
-			if err == nil {
-				resp, err := c.ListHosts(cmd.Context(), nil)
-				if err == nil {
-					for _, h := range resp.Hosts {
-						if h.Address != "" {
-							peerAddrs = append(peerAddrs, fmt.Sprintf("%s:7946", h.Address))
-						}
-					}
+			if err != nil {
+				return fmt.Errorf("cannot reach a cluster daemon to read the existing hosts, "+
+					"whose addresses become %s's gossip peers: %w", name, err)
+			}
+			resp, lerr := c.ListHosts(cmd.Context(), nil)
+			closer()
+			if lerr != nil {
+				return fmt.Errorf("cannot list the existing cluster hosts, whose addresses "+
+					"become %s's gossip peers: %w", name, lerr)
+			}
+			for _, h := range resp.Hosts {
+				if h.Address != "" {
+					peerAddrs = append(peerAddrs, fmt.Sprintf("%s:7946", h.Address))
 				}
-				closer()
 			}
 			return cli.HostAdd(cmd.Context(), args[0], name, peerAddrs)
 		},

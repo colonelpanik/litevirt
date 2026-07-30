@@ -129,6 +129,13 @@ grouped by what it means:
 
 Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`.
 
+There is a **third outcome** between intact and tampered, currently holding one
+finding — `never adopted`, below. It exits non-zero and prints `PART OF THIS LOG
+COULD NOT BE VERIFIED`, but it does not say tampered, because it is inferred from
+a row any peer can write rather than from something only a key holder could
+produce. The distinction is not pedantry: a verdict anyone can manufacture, and
+that an operator cannot clear, is what teaches people to stop reading the output.
+
 **Unsigned rows on their own are not tampering.** Rows written before signing was
 switched on carry no signature; they are chain-checked, reported as a count on the
 clean line, and exit 0. Flagging them would put a permanent tamper verdict on
@@ -251,7 +258,8 @@ requires one. So it fell between the two rules: certificate published, no contra
 unsigned rows, and `lv audit verify` reporting the cluster intact.
 
 `never adopted` closes that. A published certificate with no adoption record, older
-than the window a starting daemon needs, is a finding in its own right:
+than the window a starting daemon needs, is a finding in its own right — reported
+under `PART OF THIS LOG COULD NOT BE VERIFIED`, and exiting non-zero:
 
 ```
 never adopted (a host declares its rows are signed but cannot sign):
@@ -270,6 +278,26 @@ has not reached its deferred adoption yet; a certificate minted by
 `lv host retire-audit-key`, which self-retires and never adopts; and a host that
 adopted before its key broke — that one is already covered by `unsigned after
 signed`, which can name the individual rows because a contract start exists.
+
+**It is not tamper evidence, and the reason matters.** `audit_signing_keys` is
+replicated and a certificate is public — every host presents its own in every TLS
+handshake — so any peer can insert a row naming any host, and this finding is
+inferred from such a row plus the *absence* of an adoption. Both directions are
+therefore peer-controlled: planting the row forges the finding, and nothing the
+verifier can check distinguishes that from a host whose key really is unreadable.
+Treating it as proof of interference meant anyone who could reach the cluster
+could pin a permanent `TAMPERED` verdict on a host that had done nothing.
+
+**Clearing it takes the CA.** Retire the key —
+
+```
+lv host retire-audit-key <host>
+```
+
+— and the finding closes out, because a retired key is skipped before adoption is
+ever considered. That is deliberately the *only* way: making the certificate row
+deletable would hand the same peer who planted it a way to suppress a genuine
+finding instead, so the remedy is one only the CA holder can perform.
 
 ## Turning signing back off
 

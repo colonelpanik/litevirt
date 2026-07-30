@@ -85,14 +85,29 @@ func newAuditVerifyCmd() *cobra.Command {
 }
 
 // reportAuditVerify prints the verify result and returns an error — which
-// main.go turns into exit 1 — only when the log shows interference.
+// main.go turns into exit 1 — when the log shows interference OR when part of it
+// could not be checked at all.
 //
-// The two outcomes are kept visually separate on purpose. An unsigned row is
-// what every cluster looks like before signing was switched on, and an operator
-// who reads "3 rows unsigned" as "you have been hacked" learns to ignore this
-// command; by the time it reports a real forgery they will scroll past it.
-// So the clean paths are one line each, and a finding gets a headline plus
-// every affected row spelled out rather than a count they would have to chase.
+// THREE outcomes, kept visually separate on purpose, because collapsing them is
+// how this command stops being read. An unsigned row is what every cluster looks
+// like before signing was switched on, and an operator who reads "3 rows
+// unsigned" as "you have been hacked" learns to ignore the output; by the time it
+// reports a real forgery they will scroll past it. So the clean path is one line,
+// and a finding gets a headline plus every affected row spelled out rather than a
+// count they would have to chase.
+//
+// The middle outcome — "could not verify" — exists because its one finding is
+// forgeable. Any peer can plant a certificate row naming any host and manufacture
+// a `never adopted`, so reporting that as TAMPERED handed anyone who could reach
+// the cluster a permanent false accusation against a host that had done nothing.
+// It still fails the command: a key nobody can read is precisely the state an
+// attacker arranges, and it must not read as a pass. It just does not claim to
+// know that anyone interfered, because the row it read cannot tell it that.
+//
+// The two other uncheckable things stay NOTES on the clean path, and the reason
+// is the same one this whole split exists for: unverifiable rows are the ordinary
+// state of a node mid-rollout, and unattributed rows are legacy data nothing can
+// fix. Failing on either would page somebody on a healthy cluster.
 func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 	if !resp.Tampered {
 		switch {
@@ -102,16 +117,32 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		default:
 			fmt.Fprintf(w, "audit chain intact: %d rows verified, all signed\n", resp.RowsChecked)
 		}
-		// Neither of these says a row is wrong — one is a missing keyring, the
-		// other a row that never carried a host — but both mean part of the log
-		// went unchecked, so they are never swallowed into a clean line.
-		if resp.UnverifiableRows > 0 {
-			fmt.Fprintf(w, "  note: %d signed rows could not be checked (no keyring available to this daemon)\n", resp.UnverifiableRows)
-		}
+		// A row that never carried a host belongs to no sub-chain and cannot be
+		// checked — but nothing writes one any more and every cluster with history
+		// has some, so it is a note rather than a failure.
 		if resp.UnattributedRows > 0 {
 			fmt.Fprintf(w, "  note: %d rows carry no host name and belong to no sub-chain\n", resp.UnattributedRows)
 		}
-		return nil
+		if resp.UnverifiableRows > 0 {
+			fmt.Fprintf(w, "  note: %d signed rows could not be checked (no keyring available to this daemon)\n",
+				resp.UnverifiableRows)
+		}
+		if len(resp.NeverAdopted) == 0 {
+			return nil
+		}
+
+		fmt.Fprintf(w, "\nPART OF THIS LOG COULD NOT BE VERIFIED — this is not a clean result\n")
+		fmt.Fprintf(w, "\nhosts declaring signed rows that cannot sign:\n")
+		for _, h := range resp.NeverAdopted {
+			fmt.Fprintf(w, "  %s\n", h)
+		}
+		fmt.Fprintf(w, "\nEither the host cannot read its signing key — fix it and restart, or run\n"+
+			"`lv host rotate-audit-key <host>` — or the certificate was published by\n"+
+			"someone else, since any peer can write that row. A certificate naming a host\n"+
+			"is not proof the host published it, which is why this is NOT reported as\n"+
+			"tampering. Retire the key from the CA holder (`lv host retire-audit-key\n"+
+			"<host>`) to close it out; only the CA can.\n")
+		return fmt.Errorf("audit chain verification incomplete: a host declares signed rows it cannot sign")
 	}
 
 	fmt.Fprintf(w, "AUDIT CHAIN TAMPERED — %d rows checked\n", resp.RowsChecked)
@@ -129,7 +160,6 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		{"retired key used (signed after the key was rotated out):", resp.RetiredKeyUse},
 		{"chain head mismatch (a row covered by a signed head was rewritten):", resp.HeadMismatch},
 		{"unsigned after signed (a host that had begun signing produced an unsigned row):", resp.UnsignedAfterSigned},
-		{"never adopted (a host declares its rows are signed but cannot sign):", resp.NeverAdopted},
 	} {
 		if len(g.rows) == 0 {
 			continue
@@ -147,9 +177,13 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 	}
 	// Printed last and only here, so they read as context for the findings
 	// above rather than as findings of their own.
-	if resp.UnsignedRows > 0 || resp.UnverifiableRows > 0 || resp.UnattributedRows > 0 {
+	if resp.UnsignedRows > 0 || resp.UnverifiableRows > 0 || resp.UnattributedRows > 0 ||
+		len(resp.NeverAdopted) > 0 {
 		fmt.Fprintf(w, "\nnot tampering, for context: %d unsigned (predate tamper-evidence), %d unverifiable (no keyring), %d unattributed (no host)\n",
 			resp.UnsignedRows, resp.UnverifiableRows, resp.UnattributedRows)
+		for _, h := range resp.NeverAdopted {
+			fmt.Fprintf(w, "  could not be verified either way (any peer can publish this row): %s\n", h)
+		}
 	}
 	return fmt.Errorf("audit chain verification failed: the log shows evidence of tampering")
 }

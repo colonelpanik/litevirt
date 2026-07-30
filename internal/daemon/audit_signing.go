@@ -375,7 +375,10 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			slog.Warn("audit chain verification failed to run", "error", err)
 			return
 		}
-		metrics.AuditChainVerified(d.cfg.HostName, !res.Tampered(), map[string]int{
+		// "ok" means verified clean, so an unverifiable log is not ok — a host that
+		// cannot read its signing key must not report a green gauge. Kept separate
+		// from the Error branch below, which is reserved for actual evidence.
+		metrics.AuditChainVerified(d.cfg.HostName, !res.Tampered() && !res.Unverified(), map[string]int{
 			"broken_hash":   boolCount(res.BrokenAt != ""),
 			"bad_signature": len(res.BadSignature),
 			"unknown_key":   len(res.UnknownKeyID),
@@ -392,7 +395,9 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			"unsigned_after_signed": len(res.UnsignedAfterSigned),
 			// A host that declares it signs and demonstrably cannot. Its own
 			// node cannot raise this — it has no keyring to verify with — so the
-			// alert has to come from the peers that can.
+			// alert has to come from the peers that can. Counted, and worth
+			// alerting on, but NOT a tamper finding: the certificate row it reads
+			// is unauthenticated, so any peer can manufacture one.
 			"never_adopted": len(res.NeverAdopted),
 		})
 		if res.Tampered() {
@@ -403,8 +408,16 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 				"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
 				"seq_gaps", len(res.SeqGaps), "laundered", len(res.Laundered),
 				"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
-				"never_adopted", res.NeverAdopted,
 				"truncated_hosts", res.TruncatedHosts)
+		}
+		if res.Unverified() {
+			// Warn, not Error: part of the log went unchecked, which is serious but
+			// is not a claim that anyone interfered — and one of these findings can
+			// be produced by any peer, so an Error here would be a remotely
+			// triggerable page.
+			slog.Warn("audit chain verification could not check part of the log",
+				"rows", res.RowsChecked, "unverifiable", res.Unverifiable,
+				"never_adopted", res.NeverAdopted)
 		}
 	}
 

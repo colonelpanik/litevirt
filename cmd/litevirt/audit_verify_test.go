@@ -105,3 +105,34 @@ func TestAuditVerifyPrintsEveryCategory(t *testing.T) {
 		t.Errorf("unsigned rows not separated from the findings:\n%s", got)
 	}
 }
+
+// The third outcome. `never adopted` is the one finding derived from a row any
+// peer can write, so it must fail the command WITHOUT using the word an operator
+// scans for — otherwise anyone who can reach the cluster can make `lv audit
+// verify` cry tampering about a host that did nothing.
+func TestAuditVerifyNeverAdoptedFailsWithoutClaimingTampering(t *testing.T) {
+	var out strings.Builder
+	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
+		RowsChecked:  12,
+		UnsignedRows: 12,
+		NeverAdopted: []string{"node-4: published signing certificate abc but never recorded an adoption"},
+	})
+	if err == nil {
+		t.Fatal("a host declaring signed rows it cannot sign exited 0")
+	}
+	got := out.String()
+	if strings.Contains(got, "TAMPERED") {
+		t.Errorf("a forgeable finding is reported as tampering: %q", got)
+	}
+	if !strings.Contains(got, "COULD NOT BE VERIFIED") {
+		t.Errorf("output does not name the outcome: %q", got)
+	}
+	if !strings.Contains(got, "node-4") {
+		t.Errorf("the affected host is not named: %q", got)
+	}
+	// The operator has to be told the remedy is an authenticated one, or they will
+	// go looking for a way to delete the row — which is deliberately not there.
+	if !strings.Contains(got, "retire-audit-key") {
+		t.Errorf("output does not say how to clear it: %q", got)
+	}
+}

@@ -341,6 +341,12 @@ type AuditVerifyResult struct {
 	// there is nothing to say about which individual rows are anomalous — and that
 	// is the point: claiming a start would condemn the host's whole pre-enforcement
 	// history, which is the false alarm that made the contract need a start at all.
+	//
+	// NOT tamper evidence, deliberately — see Tampered. Every OTHER finding here is
+	// derived from something only a key holder could have produced. This one is
+	// derived from the ABSENCE of such a thing, next to a certificate row that any
+	// peer can write, so it is exactly as trustworthy as its weakest input and that
+	// input is not trustworthy at all.
 	NeverAdopted []string
 	// Unverifiable counts signed rows this verifier had no keyring to check.
 	Unverifiable int
@@ -395,11 +401,57 @@ type AuditVerifyResult struct {
 // The rule deliberately does not read the host's own log. An earlier version
 // asked "has this host signed before?", which is walked in an order the attacker
 // chooses and is blind to a host that never managed to sign at all.
+// NeverAdopted is deliberately absent, and it is the one finding that had to be
+// taken back OUT of this verdict. Every other entry is derived from something
+// only a key holder could have produced — a signature that verifies, a signature
+// that does not, a chain head, a contract opened by a signed adoption.
+// NeverAdopted is derived from a certificate row with no adoption beside it, and
+// a certificate row is unauthenticated replicated data: any peer can insert one
+// naming any host, using a certificate it merely OBSERVED (every host presents
+// its own in every TLS handshake). That made a permanent, unclearable "TAMPERED"
+// verdict available to anyone who could reach the cluster, against a host that
+// had done nothing — and an operator who cannot clear a false accusation stops
+// reading the ones that are true.
+//
+// The absence is peer-controlled in both directions, which is why no amount of
+// tightening rescues it as EVIDENCE: planting the row forges the finding,
+// tombstoning it suppresses a real one. So it moved to Unverified below, where it
+// still fails the command and still gets printed — a host that cannot sign is
+// never reported as clean — without claiming to know that anyone interfered.
 func (r AuditVerifyResult) Tampered() bool {
 	return r.BrokenAt != "" || len(r.BadSignature) > 0 || len(r.UnknownKeyID) > 0 ||
 		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0 ||
 		len(r.RetiredKeyUse) > 0 || len(r.HeadMismatch) > 0 ||
-		len(r.UnsignedAfterSigned) > 0 || len(r.NeverAdopted) > 0
+		len(r.UnsignedAfterSigned) > 0
+}
+
+// Unverified reports a host that declares its rows are signed and demonstrably
+// cannot sign them.
+//
+// A third outcome between "intact" and "tampered", and currently NeverAdopted is
+// the only thing in it. It still fails `lv audit verify` — a key nobody can read
+// is not a clean result, and it is exactly the state an attacker arranges — it
+// just does not claim to know that anyone interfered, because the row it reads
+// cannot tell it that.
+//
+// The other two uncheckable things are deliberately NOT here, and both for the
+// same reason: they are facts about the ASKING node or about legacy data, not
+// about the log. Unverifiable counts signed rows this daemon has no keyring to
+// check, which is the ordinary state of every node in the middle of a signing
+// rollout. Unattributed counts rows written before host_name existed, which every
+// cluster with history has and nothing can fix. Failing on either would page
+// somebody on a healthy cluster, and an alert that fires on healthy clusters is
+// how this command stops being read. Both stay printed notes.
+//
+// A NeverAdopted entry is cleared the way it was raised — through the CA. A
+// CA-signed retirement of that key closes it out (signingContracts skips a
+// retired key before it ever asks about adoption), and only the CA holder can
+// produce one. That matters: the remedy for a certificate someone else planted
+// must not be an action that someone else can also take, which is why the row is
+// not simply made deletable — that would hand the same attacker a way to suppress
+// a GENUINE finding.
+func (r AuditVerifyResult) Unverified() bool {
+	return len(r.NeverAdopted) > 0
 }
 
 // VerifyAuditChain walks every host's sub-chain and reports what it finds.

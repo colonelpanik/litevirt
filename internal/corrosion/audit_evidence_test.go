@@ -942,8 +942,16 @@ func TestNeverAdopted_AHostThatCannotSignIsReported(t *testing.T) {
 			"evidence off silently, which is the one outcome the cert-only publish exists to "+
 			"prevent", res.Unsigned, res)
 	}
-	if !res.Tampered() {
-		t.Errorf("NeverAdopted is not part of the verdict, so `lv audit verify` still exits 0")
+	// NOT Tampered — see AuditVerifyResult.Tampered. The certificate row this reads
+	// is unauthenticated, so calling it evidence of interference handed any peer a
+	// permanent false accusation. It must still FAIL the command, which is what
+	// Unverified is for: a key nobody can read is not a clean result.
+	if res.Tampered() {
+		t.Errorf("a finding derived from an unauthenticated row is reported as tampering")
+	}
+	if !res.Unverified() {
+		t.Errorf("NeverAdopted is in neither verdict, so `lv audit verify` exits 0 for a host "+
+			"that declares signed rows and cannot sign: %+v", res)
 	}
 }
 
@@ -1047,5 +1055,125 @@ func TestNeverAdopted_TheCertificateStampIsAWallTime(t *testing.T) {
 		t.Fatalf("created_at was stamped as %q, which cannot be parsed as a wall time: %v\n"+
 			"a certificate that cannot be aged can never be reported as never-adopted, so a "+
 			"host whose key is unreadable stays silent on every node", stamped, err)
+	}
+}
+
+// TestNeverAdopted_APlantedCertificateIsNotTamperEvidence.
+//
+// The one HIGH finding of the security review that survived triage, reproduced
+// before it was fixed. `NeverAdopted` used to feed Tampered(), and it is derived
+// from a certificate row plus the ABSENCE of an adoption — where the certificate
+// row is unauthenticated replicated data. So any peer could take a certificate it
+// merely OBSERVED (every host presents its own in every TLS handshake), insert it
+// naming that host, and pin a permanent `TAMPERED` verdict on a host that had
+// done nothing. Tombstoning the row did not clear it either.
+//
+// It is still reported and still fails the command — a host that declares signed
+// rows and cannot sign is never called clean — but it no longer claims that
+// somebody interfered, because nothing here can know that.
+func TestNeverAdopted_APlantedCertificateIsNotTamperEvidence(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+
+	// A genuine CA-issued certificate for a host that never enabled signing.
+	// Public by construction: this is what the victim presents in a handshake.
+	victimDir := t.TempDir()
+	if err := pki.GenerateHostCert(
+		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
+		filepath.Join(victimDir, "host.crt"), filepath.Join(victimDir, "host.key"),
+		"victim", net.IPv4(127, 0, 0, 1)); err != nil {
+		t.Fatalf("mint the victim's certificate: %v", err)
+	}
+	certPEM, err := os.ReadFile(filepath.Join(victimDir, "host.crt"))
+	if err != nil {
+		t.Fatalf("read the victim's certificate: %v", err)
+	}
+	parsed, err := parseCertPEM(certPEM)
+	if err != nil {
+		t.Fatalf("parse the victim's certificate: %v", err)
+	}
+	keyID, err := AuditKeyID(parsed)
+	if err != nil {
+		t.Fatalf("derive the key id: %v", err)
+	}
+
+	// What a hostile peer writes. Nothing here is signed by the victim, and the
+	// attacker never holds its private key.
+	aged := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_signing_keys (key_id, host_name, cert_pem, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, NULL)`,
+		keyID, "victim", string(certPEM), aged, c.NowTS()); err != nil {
+		t.Fatalf("plant the certificate row: %v", err)
+	}
+
+	kr, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	res := verify(t, c)
+
+	if res.Tampered() {
+		t.Fatalf("a peer holding only a PUBLIC certificate marked victim as TAMPERED: %+v\n"+
+			"an accusation anyone can manufacture, and that no operator can clear, is worse "+
+			"than no accusation — it is what teaches people to stop reading this command", res)
+	}
+	if len(res.NeverAdopted) == 0 {
+		t.Fatalf("the planted certificate was not reported at all: %+v\n"+
+			"it must stay visible — a genuine unreadable key produces the same shape", res)
+	}
+	if !res.Unverified() {
+		t.Errorf("`lv audit verify` exits 0 on a host declaring signed rows it cannot sign")
+	}
+}
+
+// TestNeverAdopted_ACASignedRetirementClearsIt.
+//
+// The remedy has to be an authenticated one. Making the certificate row simply
+// deletable would let the same attacker who planted it ALSO suppress a genuine
+// finding, so the way out is the way in: a retirement signed by the cluster CA,
+// which only the CA holder can produce.
+func TestNeverAdopted_ACASignedRetirementClearsIt(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+	publishCertOnlyAged(t, c, dir, "node-0")
+
+	kr, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	before := verify(t, c)
+	if len(before.NeverAdopted) == 0 {
+		t.Fatalf("nothing to clear — the finding did not fire: %+v", before)
+	}
+
+	rows, err := c.Query(ctx, `SELECT key_id FROM audit_signing_keys WHERE host_name = ?`, "node-0")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("read the published key id: %v (rows=%d)", err, len(rows))
+	}
+	keyID := rows[0].String("key_id")
+
+	sig, err := SignLifecycleWithCA(dir, "node-0", keyID, auditLifecycleRetired, 0)
+	if err != nil {
+		t.Fatalf("SignLifecycleWithCA: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`INSERT OR IGNORE INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		"node-0", keyID, auditLifecycleRetired, int64(0), auditCASigner, sig,
+		c.NowWall(), c.NowTS()); err != nil {
+		t.Fatalf("record the CA retirement: %v", err)
+	}
+
+	after := verify(t, c)
+	if len(after.NeverAdopted) > 0 {
+		t.Fatalf("a CA-signed retirement did not clear the finding: %+v\n"+
+			"with no authenticated way out, an operator is stuck with it forever", after)
+	}
+	if after.Unverified() {
+		t.Errorf("still reported as unverified after the key was retired: %+v", after)
 	}
 }

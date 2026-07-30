@@ -1334,7 +1334,8 @@ var schemaDDL = []string{
 	// Signed audit key retirements (v46). "Host H's key K signed nothing valid
 	// past sequence N, and here is a signature saying so."
 	//
-	// v46 kept this as two mutable columns on audit_signing_keys, which was the
+	// An earlier revision of this branch kept this as two mutable columns on
+	// audit_signing_keys, which was the
 	// wrong shape twice over. They were plain replicated data, so any peer could
 	// write a retirement for anyone — forging one put every row a host signed
 	// past a boundary, cluster-wide, with no way back — and clearing a genuine

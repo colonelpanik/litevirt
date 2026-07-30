@@ -71,24 +71,22 @@ func LoadClusterConfig() (*ClusterConfig, error) {
 			return nil, fmt.Errorf("daemon config %s is present but could not be parsed: %w",
 				daemonConfigPath, err)
 		}
-		{
-			port := dc.GRPCPort
-			if port == 0 {
-				port = 7443
-			}
-			pkiDir := dc.PKIDir
-			if pkiDir == "" {
-				pkiDir = "/etc/litevirt/pki"
-			}
-			if cliPKIBundleExists(PKIDir()) {
-				pkiDir = PKIDir()
-			}
-			return &ClusterConfig{
-				GRPCPort: port,
-				PKIDir:   pkiDir,
-				Local:    true,
-			}, nil
+		port := dc.GRPCPort
+		if port == 0 {
+			port = 7443
 		}
+		pkiDir := dc.PKIDir
+		if pkiDir == "" {
+			pkiDir = "/etc/litevirt/pki"
+		}
+		if cliPKIBundleExists(PKIDir()) {
+			pkiDir = PKIDir()
+		}
+		return &ClusterConfig{
+			GRPCPort: port,
+			PKIDir:   pkiDir,
+			Local:    true,
+		}, nil
 	}
 
 	return nil, fmt.Errorf("LV_HOST not set (set to host[:port] of any cluster node, or run on a litevirtd node)")

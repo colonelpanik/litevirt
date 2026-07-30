@@ -113,7 +113,10 @@ func (d *Daemon) finishAuditKeyLifecycle(ctx context.Context) {
 	d.recordAuditKeyLifecycle(ctx)
 }
 
-// recordAuditKeyLifecycle is finishAuditKeyLifecycle without the settle wait.
+// recordAuditKeyLifecycle is finishAuditKeyLifecycle without the settle wait, and
+// is what tests call: the wait is all they skip, because a single-process test
+// cannot be behind on its own replicated history, which is the only thing the wait
+// is for.
 //
 // Split so tests drive the REAL branching instead of a copy of it. They used to
 // call a test-only reimplementation, and a mutation proved what that costs:

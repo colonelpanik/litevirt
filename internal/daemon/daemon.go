@@ -1386,9 +1386,6 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 // every restart and win LWW against a genuine concurrent write from another node.
 func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
 	want := d.hostAddress()
-	if want == "" {
-		return nil
-	}
 	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
 	if err != nil || h == nil || h.Address == want {
 		return err

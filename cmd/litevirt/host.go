@@ -64,8 +64,7 @@ advertise_address.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if local {
-				cli.SetLocalAdvertiseAddr(address)
-				return cli.HostInitLocal(cmd.Context(), name)
+				return cli.HostInitLocal(cmd.Context(), name, address)
 			}
 			if len(args) == 0 {
 				return fmt.Errorf("SSH target required (or use --local for standalone setup)")

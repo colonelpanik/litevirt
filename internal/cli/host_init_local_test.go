@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"net"
@@ -87,5 +86,3 @@ func mustCA(t *testing.T, dir string) {
 		t.Fatalf("GenerateCA: %v", err)
 	}
 }
-
-var _ = context.Background

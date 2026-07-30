@@ -188,7 +188,7 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	// node, and both signatures cover this exact sequence, so a substituted value
 	// cannot be replayed. Phase 1 is reachable by any admin caller, but it writes
 	// nothing.
-	derivedSeq, overridden := seq, false
+	derivedSeq := seq
 	if req.AtSeq != nil {
 		override := req.GetAtSeq()
 		// Presence, not a zero sentinel, so 0 stays expressible — "this key signed
@@ -224,7 +224,7 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 			"the boundary will be reported as retired-key use on every node, permanently",
 			"host", host, "key_id", active, "at_seq", override, "derived_seq", derivedSeq,
 			"forced", req.GetForce())
-		seq, overridden = override, true
+		seq = override
 	} else if attested, behind, berr := corrosion.AuditReplicaIsBehind(ctx, s.db, verifier, host); berr != nil {
 		return nil, status.Errorf(codes.Internal, "%v", berr)
 	} else if behind {
@@ -261,7 +261,7 @@ func (s *Server) RetireAuditKey(ctx context.Context, req *pb.RetireAuditKeyReque
 	// bypassed the lagging-replica protection must not read the same as one that did
 	// not, or the only record of it is a slog line on whichever node served the RPC.
 	detail := fmt.Sprintf("retired key %s at seq %d (derived)", active, seq)
-	if overridden {
+	if req.AtSeq != nil {
 		detail = fmt.Sprintf("retired key %s at seq %d (operator-supplied; this node derived %d; "+
 			"lagging-replica check bypassed; force=%t)", active, seq, derivedSeq, req.GetForce())
 	}

@@ -110,8 +110,11 @@ func (s *Server) migrateSourceFromPeer(ctx context.Context) string {
 			"peer_cn", cn, "claimed_source", claimed)
 		return ""
 	}
-	if h, _ := corrosion.GetHost(ctx, s.db, claimed); h == nil {
-		slog.Warn("restore: ignoring migrate-from marker — claimed source is not a known cluster host",
+	// The one peer classifier — see hotplug_disk.go. A bare GetHost rejects a host
+	// whose row has not replicated here yet, which on a fresh cluster silently sent
+	// this down the re-reserve-IPs path instead of the migrate path.
+	if !s.isTrustedHostCN(ctx, claimed) {
+		slog.Warn("restore: ignoring migrate-from marker — claimed source is not a cluster host",
 			"claimed_source", claimed)
 		return ""
 	}

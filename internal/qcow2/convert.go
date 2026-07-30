@@ -37,11 +37,7 @@ func doConvert(ctx context.Context, src, dst string, opts *Options) error {
 	if err != nil {
 		return fmt.Errorf("open backing chain: %w", err)
 	}
-	defer func() {
-		for _, img := range chain {
-			img.f.Close()
-		}
-	}()
+	defer func() { closeChain(chain) }()
 
 	top := chain[0]
 	virtualSize := top.h.Size
@@ -315,9 +311,7 @@ func openChain(src string) ([]*chainImage, error) {
 		// Read backing file path.
 		buf := make([]byte, h.BackingFileSize)
 		if _, err := f.ReadAt(buf, int64(h.BackingFileOffset)); err != nil {
-			for _, img := range chain {
-				img.f.Close()
-			}
+			closeChain(chain)
 			return nil, fmt.Errorf("read backing path from %s: %w", path, err)
 		}
 		backingPath := string(buf)

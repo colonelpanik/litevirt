@@ -300,7 +300,6 @@ func auditHeadDigest(hostName string, epoch, seq int64, headHash, keyID, created
 	return h.Sum(nil)
 }
 
-
 // auditLifecycleDigest is what a lifecycle signature covers: which host's key,
 // which event, at what sequence, and who says so.
 //
@@ -604,8 +603,8 @@ type auditEvidenceGuard func(tx *sql.Tx, table syncTable, row []interface{}, pkC
 // arrives — and the retirement that used to live on it, the part that genuinely
 // needed protecting, is now its own signed table.
 var auditEvidenceGuards = map[string]auditEvidenceGuard{
-	"audit_log":             signedAuditRowIsImmutable,
-	"audit_chain_heads":     auditEvidenceIsImmutable,
+	"audit_log":           signedAuditRowIsImmutable,
+	"audit_chain_heads":   auditEvidenceIsImmutable,
 	"audit_key_lifecycle": auditEvidenceIsImmutable,
 }
 
@@ -662,7 +661,6 @@ func auditEvidenceIsImmutable(tx *sql.Tx, table syncTable, row []interface{}, pk
 	}
 	return false, "", nil
 }
-
 
 // columnIndexMap builds the name→offset map cellStr needs.
 func columnIndexMap(cols []string) map[string]int {

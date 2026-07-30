@@ -66,7 +66,7 @@ func ActiveAuditKeyID(ctx context.Context, c *Client, keyring *AuditKeyring, hos
 // LiveAuditKeyIDs returns EVERY key of hostName that still has an open signing
 // contract, newest first.
 //
-// The plural matters. hostsUnderSigningContract puts a host under contract if ANY
+// The plural matters. signingContracts puts a host under contract if ANY
 // of its keys is unretired, while retirement used to close only the first one —
 // so `lv host retire-audit-key` reported the incident closed and exited 0 while
 // the contract survived and every node kept reporting TAMPERED. A host ends up
@@ -110,33 +110,6 @@ type signingContract struct {
 	startSeq int64
 }
 
-// hostsUnderSigningContract returns each host whose rows must be signed, and the
-// sequence its commitment began at.
-//
-// Publishing a signing certificate IS the contract: a replicated, CA-signed,
-// per-host declaration that this host's rows carry a signature from here on.
-// Nothing but a signed retirement takes it back.
-//
-// The START matters as much as the fact. A certificate says a host commits, not
-// WHEN — and without the when, publishing one retroactively claims every row the
-// host ever wrote, so the first verify after enabling signing reports a
-// cluster's entire history as tampering. That is the fastest possible way to
-// teach an operator to ignore this command. The signed 'adopted' record supplies
-// it, and a certificate WITHOUT one is not a contract at all — see the comment on
-// the !adopted branch below, which is where that rule lives.
-//
-// This is deliberately a fact about replicated state rather than about a node's
-// own config or its own log:
-//
-//   - A node-local flag would let a compromised node declare itself exempt and
-//     report its log clean, and peers disagreeing about the same rows destroys
-//     the only mechanism that makes cross-node verification worth anything.
-//   - The host's own history — "has it signed before?" — is walked in an order
-//     the attacker chooses, and says nothing at all about a host that has never
-//     managed to sign, which is precisely the interesting case.
-//
-// It is per host, so a gradual rollout cannot false-fire: a host that has not
-// published yet is simply pre-enforcement.
 // unadoptedCert is a published certificate that never recorded an adoption: the
 // host declared it signs, and then could not say from when.
 type unadoptedCert struct {
@@ -153,13 +126,33 @@ type unadoptedCert struct {
 // adopt, and there is nothing to gain by calling it five minutes sooner.
 const adoptionSettleWindow = 10 * time.Minute
 
-func hostsUnderSigningContract(ctx context.Context, c *Client, keyring *AuditKeyring) (map[string]signingContract, error) {
-	contracts, _, err := signingContracts(ctx, c, keyring)
-	return contracts, err
-}
-
-// signingContracts returns the hosts whose rows must be signed, and separately the
-// published certificates that never recorded an adoption.
+// signingContracts returns the hosts whose rows must be signed and the sequence
+// each commitment began at, plus separately the published certificates that never
+// recorded an adoption.
+//
+// Publishing a signing certificate IS the contract: a replicated, CA-signed,
+// per-host declaration that this host's rows carry a signature from here on.
+// Nothing but a signed retirement takes it back.
+//
+// The START matters as much as the fact. A certificate says a host commits, not
+// WHEN — and without the when, publishing one retroactively claims every row the
+// host ever wrote, so the first verify after enabling signing reports a cluster's
+// entire history as tampering. That is the fastest possible way to teach an
+// operator to ignore this command. The signed 'adopted' record supplies it, and a
+// certificate WITHOUT one is not a contract at all — see the !adopted branch below.
+//
+// This is deliberately a fact about replicated state rather than about a node's
+// own config or its own log:
+//
+//   - A node-local flag would let a compromised node declare itself exempt and
+//     report its log clean, and peers disagreeing about the same rows destroys
+//     the only mechanism that makes cross-node verification worth anything.
+//   - The host's own history — "has it signed before?" — is walked in an order
+//     the attacker chooses, and says nothing at all about a host that has never
+//     managed to sign, which is precisely the interesting case.
+//
+// It is per host, so a gradual rollout cannot false-fire: a host that has not
+// published yet is simply pre-enforcement.
 //
 // The second return value is the one that closes a false NEGATIVE, and it is the
 // half a rule keyed only on adoption cannot express. setupAuditSigning publishes a

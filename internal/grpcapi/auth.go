@@ -259,51 +259,53 @@ func (s *Server) classifyBearerlessMTLS(ctx context.Context) (kind, cn string) {
 	return principalKindClient, cn
 }
 
-// isTrustedHostCN reports whether cn names a live (non-removed) cluster host.
-// GetHost filters deleted_at IS NULL, and host removal/decommission sets
-// deleted_at (DeleteHost), so a removed node's cert is excluded by
-// construction. Transient operational states (active/draining/fenced/offline/
-// upgrading/maintenance) all stay trusted — a recovering node must remain a
-// trusted peer so its own anti-entropy/rejoin RPCs are accepted while its state
-// clears; the removal boundary is deleted_at, not operational state.
+// isTrustedHostCN reports whether cn may act as a cluster PEER.
+//
+// Three outcomes from one row, and the order matters:
+//
+//   - a TOMBSTONED row (deleted_at set) is refused outright. Removal is the one
+//     thing this check exists to enforce, and DeleteHost tombstones rather than
+//     deleting, so a decommissioned node's certificate stops working even though
+//     it still holds the key.
+//   - a LIVE row is trusted. Transient operational states — draining, fenced,
+//     offline, upgrading, maintenance — all stay trusted, because a recovering
+//     node must remain a peer for its own rejoin and anti-entropy RPCs to be
+//     accepted. The removal boundary is deleted_at, not operational state.
+//   - NO row falls through to the certificate, and that is what lets a cluster
+//     form at all. Requiring a live row deadlocked bootstrap: hosts learn about
+//     each other by replication, replication is what this gates, and a freshly
+//     provisioned cluster has each node holding exactly its own row. Every peer
+//     RPC was refused with "replication RPC requires peer mTLS" and nothing could
+//     ever make it untrue. Found rebuilding the lab, where four nodes sat in that
+//     state until all four rows were seeded onto all four nodes by hand.
+//
+// ServerAuth is the discriminator for that last case, and it is CA-attested rather
+// than a naming convention: GenerateHostCert issues ServerAuth+ClientAuth,
+// GenerateClientCert issues ClientAuth alone. That distinction is load-bearing —
+// the lv-cli certificate is DISTRIBUTABLE, handed to every operator, so accepting
+// it as a peer would let any operator's CLI replicate into the cluster. An earlier
+// version of this trusted any CA-signed CN and did exactly that; three existing
+// tests caught it.
+//
+// One query, not two. This runs in the auth interceptor for every RPC without a
+// bearer token — every inbound peer replication push and every on-node CLI call —
+// and each Query takes the client read lock that the mutation apply loop contends
+// for exclusively.
 func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 	if cn == "" {
 		return false
 	}
-	// A removed host is refused whatever it presents. Removal TOMBSTONES the row
-	// (DeleteHost sets deleted_at) rather than deleting it, so "decommissioned" stays
-	// distinguishable from "never seen" — which is the whole reason the rest of this
-	// can be permissive.
-	deleted, err := hostIsTombstoned(ctx, s.db, cn)
+	rows, err := s.db.Query(ctx, `SELECT deleted_at FROM hosts WHERE name = ?`, cn)
 	if err != nil {
 		// Unreadable state is not evidence of removal, and failing closed here would
-		// let one transient DB error partition this node from every peer at once.
-		slog.Warn("could not check whether a peer has been removed; treating it as live",
+		// let one transient DB error partition this node from every peer at once. The
+		// certificate has already been verified against the cluster CA by the
+		// handshake, so falling through is not the same as trusting anyone.
+		slog.Warn("could not read the host row for a peer; deciding on its certificate alone",
 			"cn", cn, "error", err)
-	} else if deleted {
-		return false
+	} else if len(rows) > 0 {
+		return rows[0].String("deleted_at") == ""
 	}
-
-	// A live host row is the ordinary answer.
-	if h, _ := corrosion.GetHost(ctx, s.db, cn); h != nil {
-		return true
-	}
-
-	// Otherwise fall back to what the CERTIFICATE says, which is what lets a cluster
-	// form at all. Requiring a live row deadlocked bootstrap: hosts learn about each
-	// other by replication, replication is what this gates, and a freshly provisioned
-	// cluster has each node holding exactly its own row. Every peer RPC was refused
-	// with "replication RPC requires peer mTLS" and nothing could ever make it untrue.
-	// Found rebuilding the lab, where four nodes sat in that state until all four rows
-	// were seeded onto all four nodes by hand.
-	//
-	// ServerAuth is the discriminator, and it is CA-attested rather than a naming
-	// convention: GenerateHostCert issues ServerAuth+ClientAuth, GenerateClientCert
-	// issues ClientAuth alone. That distinction is load-bearing — the lv-cli
-	// certificate is DISTRIBUTABLE, handed to every operator, so accepting it as a
-	// peer would let any operator's CLI replicate into the cluster. An earlier
-	// version of this fix trusted any CA-signed CN and did exactly that; three
-	// existing tests caught it.
 	return callerCertHasServerAuth(ctx)
 }
 
@@ -311,19 +313,15 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 // certificate rather than a client one.
 //
 // Only GenerateHostCert sets ServerAuth, and the certificate has already been
-// verified against the cluster CA by the TLS handshake, so this cannot be asserted
-// by the caller — issuing one requires the CA private key, which lives in the
+// verified against the cluster CA by the handshake, so this cannot be asserted by
+// the caller — issuing one requires the CA private key, which lives in the
 // operator's config directory and on no node.
 func callerCertHasServerAuth(ctx context.Context) bool {
-	p, ok := peer.FromContext(ctx)
-	if !ok || p.AuthInfo == nil {
+	cert := peerLeafCert(ctx)
+	if cert == nil {
 		return false
 	}
-	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
-	if !ok || len(tlsInfo.State.PeerCertificates) == 0 {
-		return false
-	}
-	for _, u := range tlsInfo.State.PeerCertificates[0].ExtKeyUsage {
+	for _, u := range cert.ExtKeyUsage {
 		if u == x509.ExtKeyUsageServerAuth {
 			return true
 		}
@@ -331,17 +329,17 @@ func callerCertHasServerAuth(ctx context.Context) bool {
 	return false
 }
 
-// hostIsTombstoned reports whether cn names a host row carrying deleted_at.
-//
-// GetHost filters deleted_at IS NULL and so cannot tell "removed" from "never
-// seen" — the distinction this whole check now rests on.
-func hostIsTombstoned(ctx context.Context, db *corrosion.Client, cn string) (bool, error) {
-	rows, err := db.Query(ctx,
-		`SELECT deleted_at FROM hosts WHERE name = ? AND deleted_at IS NOT NULL AND deleted_at <> ''`, cn)
-	if err != nil {
-		return false, err
+// peerLeafCert returns the certificate the caller presented, or nil.
+func peerLeafCert(ctx context.Context) *x509.Certificate {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.AuthInfo == nil {
+		return nil
 	}
-	return len(rows) > 0, nil
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok || len(tlsInfo.State.PeerCertificates) == 0 {
+		return nil
+	}
+	return tlsInfo.State.PeerCertificates[0]
 }
 
 // isLoopbackPeer reports whether the RPC arrived over a loopback transport
@@ -588,15 +586,10 @@ func callerMTLSCommonName(ctx context.Context) string {
 }
 
 func peerCommonName(ctx context.Context) string {
-	p, ok := peer.FromContext(ctx)
-	if !ok || p.AuthInfo == nil {
-		return ""
+	if cert := peerLeafCert(ctx); cert != nil {
+		return cert.Subject.CommonName
 	}
-	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
-	if !ok || len(tlsInfo.State.PeerCertificates) == 0 {
-		return ""
-	}
-	return tlsInfo.State.PeerCertificates[0].Subject.CommonName
+	return ""
 }
 
 // RequireRole returns an error if the caller's role is insufficient.

@@ -10,6 +10,7 @@ import (
 	osuser "os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -268,8 +269,8 @@ func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers [
 	// advertise. Leaving the daemon to auto-detect meant it registered with its
 	// default-route source IP — a different interface on a multi-homed host — and
 	// that value was then copied into the join_peers of every host added after it.
-	if err := sc.Run(fmt.Sprintf("HOST_NAME=%s JOIN_PEERS='%s' ADVERTISE_ADDRESS=%s bash /tmp/litevirt-setup.sh",
-		hostName, peersYAML, hostAddr)); err != nil {
+	if err := sc.Run(fmt.Sprintf("%s bash /tmp/litevirt-setup.sh",
+		strings.Join(setupScriptEnv(hostName, hostAddr, peersYAML), " "))); err != nil {
 		return fmt.Errorf("run setup script: %w", err)
 	}
 
@@ -353,13 +354,6 @@ func findDaemonBinary() (string, error) {
 
 // HostInitLocal bootstraps litevirt on the local machine (no SSH).
 // Intended for single-node standalone setups.
-// localAdvertiseAddr is the address `lv host init --local` puts in the host
-// certificate, set from --address. Empty means auto-detect.
-var localAdvertiseAddr string
-
-// SetLocalAdvertiseAddr is how the command layer passes --address through.
-func SetLocalAdvertiseAddr(addr string) { localAdvertiseAddr = addr }
-
 // mintLocalHostCert issues the first host's certificate, covering the address
 // PEERS will dial as well as loopback.
 //
@@ -407,7 +401,7 @@ func outboundIP() string {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
-func HostInitLocal(ctx context.Context, hostName string) error {
+func HostInitLocal(ctx context.Context, hostName, advertiseAddr string) error {
 	pkiDir := PKIDir()
 	if err := os.MkdirAll(pkiDir, 0700); err != nil {
 		return fmt.Errorf("create PKI dir: %w", err)
@@ -436,7 +430,7 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 	// 3. Generate the host certificate.
 	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
 	hostKeyPath := filepath.Join(pkiDir, hostName+".key")
-	if err := mintLocalHostCert(pkiDir, hostName, localAdvertiseAddr); err != nil {
+	if err := mintLocalHostCert(pkiDir, hostName, advertiseAddr); err != nil {
 		return err
 	}
 
@@ -483,7 +477,7 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 	}
 
 	cmd := execCommand("bash", scriptPath)
-	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, localAdvertiseAddr, "[]")...)
+	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, "[]")...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -650,18 +644,6 @@ func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
 		"SRIOV_MANAGED=false",
 		"SRIOV_MAX_VFS=8",
 	}
-}
-
-// renderAdvertiseLine is the ADVERTISE_ADDRESS value handed to the setup script.
-//
-// Empty when there is nothing to say, because the script omits the key entirely in
-// that case and lets the daemon auto-detect. Writing an empty advertise_address
-// would be worse than writing none: it overrides auto-detection with nothing.
-func renderAdvertiseLine(addr string) string {
-	if addr == "" {
-		return ""
-	}
-	return fmt.Sprintf("advertise_address: %q", addr)
 }
 
 func getSetupScript() (string, error) {

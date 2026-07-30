@@ -163,7 +163,9 @@ func validateHeaderRanges(h *Header, fileSize int64) error {
 	}
 	checkRange := func(name string, off, size uint64) error {
 		end := off + size
-		if end < off || off > uint64(fileSize) || end > uint64(fileSize) {
+		// end >= off is guaranteed by the overflow check, so end > fileSize subsumes
+		// off > fileSize.
+		if end < off || end > uint64(fileSize) {
 			return fmt.Errorf("%s range [%d,%d) exceeds file size %d", name, off, end, fileSize)
 		}
 		return nil

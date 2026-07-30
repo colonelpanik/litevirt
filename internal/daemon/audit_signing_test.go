@@ -592,7 +592,7 @@ func TestRotation_WithTheFlagOffDoesNotRetireWhatItJustAdopted(t *testing.T) {
 	}
 	fresh := auditTestDaemon(t, dir, host)
 	fresh.db = d.db
-	fresh.finishAuditKeyLifecycleNow(ctx)
+	fresh.recordAuditKeyLifecycle(ctx)
 
 	newKR, err := corrosion.LoadAuditKeyring(dir, host)
 	if err != nil {

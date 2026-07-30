@@ -34,17 +34,22 @@ func TestSetupScript_WritesAdvertiseAddress(t *testing.T) {
 	}
 }
 
-// TestSetupScript_OmitsAdvertiseAddressWhenUnknown guards the fallback: with no
-// address to give, the config must not contain an empty advertise_address, which
-// would suppress auto-detection instead of deferring to it.
+// TestSetupScript_OmitsAdvertiseAddressWhenUnknown guards the fallback, and it
+// asserts the SCRIPT rather than a Go mirror of it.
+//
+// An earlier version of this test called a renderAdvertiseLine helper that nothing
+// in production used — the omission is done by the script's ${VAR:+...} expansion.
+// Deleting that expansion left the test green, which is the vacuous shape the
+// mutation-verify rule exists to catch.
 func TestSetupScript_OmitsAdvertiseAddressWhenUnknown(t *testing.T) {
-	got := renderAdvertiseLine("")
-	if got != "" {
-		t.Fatalf("with no address the config line is %q, want it omitted entirely\n"+
-			"an empty advertise_address overrides auto-detection with nothing", got)
+	script, err := getSetupScript()
+	if err != nil {
+		t.Fatalf("getSetupScript: %v", err)
 	}
-	if line := renderAdvertiseLine("10.77.0.11"); !strings.Contains(line, "10.77.0.11") {
-		t.Fatalf("a supplied address is not rendered into the config: %q", line)
+	if !strings.Contains(script, `${ADVERTISE_ADDRESS:+advertise_address: "${ADVERTISE_ADDRESS}"}`) {
+		t.Fatal("the script writes advertise_address unconditionally\n" +
+			"with no address to give, an empty advertise_address overrides the daemon's " +
+			"auto-detection with nothing, which is worse than omitting the key")
 	}
 }
 

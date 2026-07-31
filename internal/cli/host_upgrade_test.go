@@ -309,16 +309,21 @@ func writeVersionStub(t *testing.T, path, version string) {
 // not the connected daemon's — which previously matched every host and printed
 // "All hosts are up-to-date", deploying nothing.
 func TestHostUpgrade_NoArgRollsNewerBinaryToUniformCluster(t *testing.T) {
+	const (
+		clusterVersion   = "v1.0.0"
+		candidateVersion = "v1.0.1"
+	)
 	binaryPath := filepath.Join(t.TempDir(), "litevirtd")
-	writeVersionStub(t, binaryPath, "v2.0.0") // newer than the cluster
+	writeVersionStub(t, binaryPath, candidateVersion)
 
-	stream := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: "v2.0.0"}}
+	stream := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: candidateVersion}}
 	client := &mockUpgradeClient{
 		stream: stream,
-		// Whole cluster uniformly on v1.0.0 — same as the connected daemon (Ping → v1.0.0).
+		// Whole cluster is uniformly on the old version. The candidate is declared
+		// above rather than inferred from the local developer build.
 		hosts: []*pb.Host{
-			{Name: "node1", Address: "10.0.0.1", Version: "v1.0.0"},
-			{Name: "node2", Address: "10.0.0.2", Version: "v1.0.0"},
+			{Name: "node1", Address: "10.0.0.1", Version: clusterVersion},
+			{Name: "node2", Address: "10.0.0.2", Version: clusterVersion},
 		},
 	}
 

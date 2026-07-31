@@ -21,7 +21,10 @@ import (
 // not to the connected daemon's running version, which would no-op on a
 // version-uniform cluster.
 func binaryVersion(ctx context.Context, path string) string {
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// A probe runs once before an upgrade, and treating scheduler delay as
+	// "unprobeable" silently turns a real rollout into "already up-to-date".
+	// Leave enough headroom for a busy virtualization host.
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(cctx, path, "--version").Output()
 	if err != nil {

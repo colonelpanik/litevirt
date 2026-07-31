@@ -989,6 +989,14 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 
 	// Step 5: Reschedule VMs using placement engine for proper resource-aware scheduling.
 	fallbackIdx := 0
+	type failoverPlan struct {
+		vm             corrosion.VMRecord
+		targetName     string
+		needsPlacement bool
+	}
+	plans := make([]failoverPlan, 0, len(vms))
+	placementReqs := make([]placement.Request, 0, len(vms))
+
 	for _, vm := range vms {
 		// A Secure-Boot/vTPM VM's firmware state (UEFI NVRAM + swtpm) is host-local,
 		// so it died with the fenced host — neither a reschedule (would boot a fresh
@@ -1091,25 +1099,66 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			}
 		}
 
-		// Use placement engine to find the best host (respects CPU, memory,
-		// anti-affinity, labels, device requirements).
 		if targetName == "" {
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity)
-			selected, err := placement.Select(ctx, c.db, req)
-			if err != nil {
-				// Fallback to round-robin if placement fails (degraded mode).
-				slog.Warn("failover: placement failed, using round-robin fallback",
-					"vm", vm.Name, "error", err)
-				c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
-				targetName = candidates[fallbackIdx%len(candidates)].Name
-				fallbackIdx++
-			} else {
-				targetName = selected
-			}
+			placementReqs = append(placementReqs, req)
+			plans = append(plans, failoverPlan{vm: vm, needsPlacement: true})
+			continue
 		}
 
+		plans = append(plans, failoverPlan{vm: vm, targetName: targetName, needsPlacement: false})
+	}
+
+	placements := map[string]placement.BatchResult{}
+	if len(placementReqs) > 0 {
+		allVMs, err := corrosion.ListVMs(ctx, c.db, "", "")
+		if err != nil {
+			slog.Error("failover: list VMs for batch placement", "host", h.Name, "error", err)
+			c.mAttempt(PhaseFence, ResultError, ErrDBError)
+			return
+		}
+		ctMem, err := corrosion.SumContainerMemoryByHost(ctx, c.db)
+		if err != nil {
+			ctMem = nil
+		}
+		if selected, err := placement.SelectBatch(candidates, allVMs, nil, ctMem, placementReqs); err != nil {
+			// A batch placement failure must not block recovery. Fall back to
+			// round-robin on a per-VM basis exactly as before.
+			slog.Warn("failover: batch placement failed, using round-robin fallback",
+				"error", err)
+			for i := range plans {
+				if plans[i].needsPlacement {
+					plans[i].targetName = candidates[fallbackIdx%len(candidates)].Name
+					plans[i].needsPlacement = false
+					fallbackIdx++
+					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
+				}
+			}
+		} else {
+			placements = selected
+		}
+	}
+
+	for _, p := range plans {
+		vm := p.vm
+		if p.needsPlacement {
+			result, ok := placements[vm.Name]
+			if !ok || result.Host == "" {
+				slog.Warn("failover: batch placement missed host, using round-robin fallback",
+					"vm", vm.Name)
+				c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
+				p.targetName = candidates[fallbackIdx%len(candidates)].Name
+				fallbackIdx++
+			} else {
+				p.targetName = result.Host
+			}
+			p.needsPlacement = false
+		}
+
+		targetName := p.targetName
+
 		slog.Info("failover: rescheduling VM",
-			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", policy)
+			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", vmFailurePolicy(vm))
 
 		if c.gateEnforced(ctx) {
 			// Enforcement active: re-check DecisionGate (quorum + coordinator-eligible;

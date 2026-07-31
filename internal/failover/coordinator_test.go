@@ -698,11 +698,11 @@ func TestCoordinator_MultipleVMsPlacement(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 
-	// 3 hosts: "bad" (failing), "node-a" and "node-b" (healthy, large).
+	// 3 hosts: "bad" (failing), "node-a" and "node-b" (healthy, limited).
 	for _, h := range []corrosion.HostRecord{
 		{Name: "bad", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual"},
-		{Name: "node-a", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 16, MemTotal: 65536},
-		{Name: "node-b", Address: "10.0.0.3", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 16, MemTotal: 65536},
+		{Name: "node-a", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 4, MemTotal: 8192},
+		{Name: "node-b", Address: "10.0.0.3", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 4, MemTotal: 8192},
 	} {
 		if err := corrosion.InsertHost(ctx, db, h); err != nil {
 			t.Fatalf("InsertHost %s: %v", h.Name, err)
@@ -757,16 +757,17 @@ func TestCoordinator_MultipleVMsPlacement(t *testing.T) {
 		hostCounts[vm.HostName]++
 	}
 
-	// All VMs must have been placed on healthy hosts. The placement engine
-	// uses bin-packing by default (preferring hosts with more used resources),
-	// so all VMs may land on the same host. Verify at least one healthy host
-	// received VMs and total count is correct.
+	// With constrained host capacity, no single host can hold all 3 VMs.
+	// Enforce true spread across at least two healthy hosts.
 	total := 0
 	for host, cnt := range hostCounts {
 		if host != "node-a" && host != "node-b" {
 			t.Errorf("unexpected host %q in distribution", host)
 		}
 		total += cnt
+	}
+	if len(hostCounts) != 2 {
+		t.Errorf("expected rescheduled VMs to span both healthy hosts, got distribution: %v", hostCounts)
 	}
 	if total != 3 {
 		t.Errorf("expected 3 VMs rescheduled, got %d (distribution: %v)", total, hostCounts)

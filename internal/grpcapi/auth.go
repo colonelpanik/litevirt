@@ -295,7 +295,7 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 	if cn == "" {
 		return false
 	}
-	rows, err := s.db.Query(ctx, `SELECT deleted_at FROM hosts WHERE name = ?`, cn)
+	rows, err := s.db.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, cn)
 	if err != nil {
 		// ABSENT may fall through to the certificate; UNREADABLE may not. An error
 		// cannot rule out a removal, and removal is enforced by the tombstone and
@@ -309,7 +309,17 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 		return false
 	}
 	if len(rows) > 0 {
-		return rows[0].String("deleted_at") == ""
+		if rows[0].String("deleted_at") != "" {
+			return false
+		}
+		// Real peer calls carry the leaf certificate. Bind an active name to the
+		// exact CA-issued identity recorded at admission, so re-admitting a name
+		// cannot reopen a lagging peer to that name's old certificate.
+		if cert := peerLeafCert(ctx); cert != nil && cert.SerialNumber != nil &&
+			rows[0].String("cert_serial") != "" {
+			return strings.EqualFold(rows[0].String("cert_serial"), cert.SerialNumber.Text(16))
+		}
+		return true
 	}
 	return callerCertHasServerAuth(ctx)
 }

@@ -29,6 +29,7 @@ const (
 	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
 	LiteVirt_GetHostHealth_FullMethodName              = "/litevirt.v1.LiteVirt/GetHostHealth"
 	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
+	LiteVirt_AdmitHost_FullMethodName                  = "/litevirt.v1.LiteVirt/AdmitHost"
 	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
 	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
 	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
@@ -263,6 +264,7 @@ type LiteVirtClient interface {
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
 	GetHostHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HostHealthMatrix, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
 	// replication then carries to every node. `lv host rm` calls it after revoking
 	// the removed host's certificate — revocation needs the CA private key, which
@@ -730,6 +732,16 @@ func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_RemoveHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_AdmitHost_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3158,6 +3170,7 @@ type LiteVirtServer interface {
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
 	GetHostHealth(context.Context, *emptypb.Empty) (*HostHealthMatrix, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
+	AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error)
 	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
 	// replication then carries to every node. `lv host rm` calls it after revoking
 	// the removed host's certificate — revocation needs the CA private key, which
@@ -3549,6 +3562,9 @@ func (UnimplementedLiteVirtServer) GetHostHealth(context.Context, *emptypb.Empty
 }
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
+}
+func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method AdmitHost not implemented")
 }
 func (UnimplementedLiteVirtServer) PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishCRL not implemented")
@@ -4369,6 +4385,24 @@ func _LiteVirt_RemoveHost_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RemoveHost(ctx, req.(*RemoveHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_AdmitHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AdmitHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AdmitHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AdmitHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AdmitHost(ctx, req.(*AdmitHostRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8067,6 +8101,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveHost",
 			Handler:    _LiteVirt_RemoveHost_Handler,
+		},
+		{
+			MethodName: "AdmitHost",
+			Handler:    _LiteVirt_AdmitHost_Handler,
 		},
 		{
 			MethodName: "PublishCRL",

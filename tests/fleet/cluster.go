@@ -327,13 +327,17 @@ func (c *Cluster) crossRegisterHosts() {
 	ctx := context.Background()
 	for _, target := range c.Nodes {
 		for _, hostNode := range c.Nodes {
+			serial, err := pki.CertSerial(filepath.Join(hostNode.PKIDir, "host.crt"))
+			if err != nil {
+				c.t.Fatalf("read certificate serial for %s: %v", hostNode.Name, err)
+			}
 			rec := corrosion.HostRecord{
 				Name:          hostNode.Name,
 				Address:       hostNode.Address,
 				GRPCPort:      hostNode.Port,
 				SSHUser:       "root",
 				SSHPort:       22,
-				CertSerial:    "fleet",
+				CertSerial:    serial,
 				State:         "active",
 				FenceStrategy: "best-effort",
 				// Real capacity. Host admission now runs on CREATE as well as resize,

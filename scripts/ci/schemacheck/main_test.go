@@ -10,13 +10,13 @@ func TestNonAdditiveAlter(t *testing.T) {
 		alter   string
 		wantBad bool
 	}{
-		{`ALTER TABLE vms ADD COLUMN project TEXT`, false},                          // nullable add — fine
-		{`ALTER TABLE vms ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'`, false},   // NOT NULL + DEFAULT — fine
-		{`ALTER TABLE vms ADD COLUMN x INTEGER NOT NULL`, true},                     // NOT NULL, no DEFAULT — bad
-		{`ALTER TABLE vms DROP COLUMN project`, true},                               // drop — bad
-		{`ALTER TABLE vms RENAME COLUMN project TO proj`, true},                     // rename col — bad
-		{`ALTER TABLE vms RENAME TO virtual_machines`, true},                        // rename table — bad
-		{`ALTER TABLE vms ALTER COLUMN project SET DEFAULT 'x'`, true},              // alter col — bad
+		{`ALTER TABLE vms ADD COLUMN project TEXT`, false},                        // nullable add — fine
+		{`ALTER TABLE vms ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'`, false}, // NOT NULL + DEFAULT — fine
+		{`ALTER TABLE vms ADD COLUMN x INTEGER NOT NULL`, true},                   // NOT NULL, no DEFAULT — bad
+		{`ALTER TABLE vms DROP COLUMN project`, true},                             // drop — bad
+		{`ALTER TABLE vms RENAME COLUMN project TO proj`, true},                   // rename col — bad
+		{`ALTER TABLE vms RENAME TO virtual_machines`, true},                      // rename table — bad
+		{`ALTER TABLE vms ALTER COLUMN project SET DEFAULT 'x'`, true},            // alter col — bad
 	}
 	for _, c := range cases {
 		got := nonAdditiveAlter(c.alter)
@@ -28,6 +28,10 @@ func TestNonAdditiveAlter(t *testing.T) {
 
 func facts(ddl, mig []string) schemaFacts {
 	return schemaFacts{ddlStmts: ddl, migStmts: mig}
+}
+
+func versionedFacts(version int, ddl []string) schemaFacts {
+	return schemaFacts{version: version, ddlStmts: ddl}
 }
 
 func TestNonAdditiveViolations_TableDiff(t *testing.T) {
@@ -61,6 +65,33 @@ func TestNonAdditiveViolations_TableDiff(t *testing.T) {
 		if (len(v) > 0) != c.wantBad {
 			t.Errorf("%s: violations=%v, wantBad=%v", c.name, v, c.wantBad)
 		}
+	}
+}
+
+func TestNonAdditiveViolations_UnreleasedV47CRLReshapeIsExact(t *testing.T) {
+	base := []string{`CREATE TABLE IF NOT EXISTS cluster_crl (
+		id TEXT PRIMARY KEY, crl_pem TEXT NOT NULL, created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL, deleted_at TEXT
+	)`}
+	head := []string{`CREATE TABLE IF NOT EXISTS cluster_crl (
+		id TEXT NOT NULL, crl_pem TEXT NOT NULL, created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL, deleted_at TEXT, PRIMARY KEY (id, crl_pem)
+	)`}
+	if v := nonAdditiveViolations(versionedFacts(47, base), versionedFacts(47, head)); len(v) != 0 {
+		t.Fatalf("exact unreleased v47 reshape flagged: %v", v)
+	}
+
+	wrongVersion := nonAdditiveViolations(versionedFacts(47, base), versionedFacts(48, head))
+	if len(wrongVersion) == 0 {
+		t.Fatal("v47 exception leaked into a later schema version")
+	}
+
+	extraDrop := []string{`CREATE TABLE IF NOT EXISTS cluster_crl (
+		id TEXT NOT NULL, crl_pem TEXT NOT NULL, created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL, PRIMARY KEY (id, crl_pem)
+	)`}
+	if v := nonAdditiveViolations(versionedFacts(47, base), versionedFacts(47, extraDrop)); len(v) == 0 {
+		t.Fatal("v47 exception allowed a column change")
 	}
 }
 

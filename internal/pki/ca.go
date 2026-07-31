@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,8 @@ import (
 	"path/filepath"
 	"time"
 )
+
+var auditSigningGenerationOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 61117, 1, 1}
 
 // GenerateCA creates a self-signed ECDSA P-256 CA certificate and key.
 func GenerateCA(certPath, keyPath string) error {
@@ -286,6 +289,10 @@ func GenerateAuditSigningCert(caCertPath, caKeyPath, certPath, keyPath, hostName
 		NotBefore: time.Now().Add(-5 * time.Minute),
 		NotAfter:  time.Now().Add(5 * 365 * 24 * time.Hour),
 		KeyUsage:  x509.KeyUsageDigitalSignature,
+		ExtraExtensions: []pkix.Extension{{
+			Id:    auditSigningGenerationOID,
+			Value: mustMarshalAuditSigningGeneration(time.Now().UnixNano()),
+		}},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
@@ -300,6 +307,34 @@ func GenerateAuditSigningCert(caCertPath, caKeyPath, certPath, keyPath, hostName
 		return fmt.Errorf("marshal audit signing key: %w", err)
 	}
 	return writePEM(keyPath, "EC PRIVATE KEY", keyDER)
+}
+
+func mustMarshalAuditSigningGeneration(n int64) []byte {
+	body, err := asn1.Marshal(n)
+	if err != nil {
+		panic(err)
+	}
+	return body
+}
+
+// AuditSigningGeneration returns the CA-signed generation carried by a
+// dedicated audit signing certificate. The bootstrap host certificate has no
+// such extension and is generation zero.
+func AuditSigningGeneration(cert *x509.Certificate) int64 {
+	if cert == nil {
+		return 0
+	}
+	for _, ext := range cert.Extensions {
+		if !ext.Id.Equal(auditSigningGenerationOID) {
+			continue
+		}
+		var generation int64
+		if rest, err := asn1.Unmarshal(ext.Value, &generation); err == nil && len(rest) == 0 {
+			return generation
+		}
+		return 0
+	}
+	return 0
 }
 
 // TightenPrivateKeys repairs the mode of every private key in pkiDir, making

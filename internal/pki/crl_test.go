@@ -49,6 +49,22 @@ func TestLoadCRL_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestGenerateCRL_PreservesExistingRevocations(t *testing.T) {
+	caPath, keyPath, dir := setupCA(t)
+	crlPath := filepath.Join(dir, "crl.pem")
+	if err := GenerateCRL(caPath, keyPath, crlPath, []string{"aaaa", "bbbb"}); err != nil {
+		t.Fatalf("initial GenerateCRL: %v", err)
+	}
+	if err := GenerateCRL(caPath, keyPath, crlPath, []string{"cccc"}); err != nil {
+		t.Fatalf("second GenerateCRL: %v", err)
+	}
+	for _, serial := range []int64{0xaaaa, 0xbbbb, 0xcccc} {
+		if !IsCertRevoked(dir, big.NewInt(serial)) {
+			t.Fatalf("GenerateCRL dropped serial %x from the existing CRL", serial)
+		}
+	}
+}
+
 func TestLoadCRL_FileNotFound(t *testing.T) {
 	_, err := LoadCRL("/nonexistent/crl.pem")
 	if err == nil {

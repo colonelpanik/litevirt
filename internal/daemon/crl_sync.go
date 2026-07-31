@@ -14,7 +14,7 @@ import (
 // host keeps working on a node that was down when the removal happened.
 const crlSyncInterval = 30 * time.Second
 
-// runCRLSync installs the newest cluster CRL this node can verify. The choosing
+// runCRLSync installs the union of cluster CRLs this node can verify. The choosing
 // and the verifying live in corrosion.SyncClusterCRL, which is also what a fleet
 // test drives — a distribution mechanism tested through a reimplementation of
 // itself proves nothing about the one that ships.

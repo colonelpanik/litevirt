@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // Audit signing key rotation.
@@ -497,8 +499,15 @@ func auditKeyLifecycle(ctx context.Context, c *Client, keyring *AuditKeyring) (m
 				"host", host, "key", keyID, "event", event)
 			continue
 		}
+		subjectCert, subjectErr := keyring.certFor(ctx, c, keyID)
+		signerCert, signerErr := keyring.certFor(ctx, c, r.String("by_key_id"))
+		if subjectErr != nil || signerErr != nil {
+			continue
+		}
 		verified = append(verified, lifecycleRow{
 			host: host, keyID: keyID, event: event, seq: seq, byKeyID: r.String("by_key_id"),
+			subjectGeneration: pki.AuditSigningGeneration(subjectCert),
+			signerGeneration:  pki.AuditSigningGeneration(signerCert),
 		})
 	}
 	return reduceLifecycle(verified), nil
@@ -508,8 +517,9 @@ func auditKeyLifecycle(ctx context.Context, c *Client, keyring *AuditKeyring) (m
 // whether its SIGNER was entitled to say it — is decided afterwards, because that
 // needs every adoption in hand.
 type lifecycleRow struct {
-	host, keyID, event, byKeyID string
-	seq                         int64
+	host, keyID, event, byKeyID         string
+	seq                                 int64
+	subjectGeneration, signerGeneration int64
 }
 
 // reduceLifecycle applies the signer-standing rule and folds the survivors.
@@ -565,18 +575,17 @@ func reduceLifecycle(rows []lifecycleRow) map[lifecycleKey]map[string]int64 {
 			// adoption, which is strictly increasing per host (AdoptAuditKey refuses to
 			// tie), so a predecessor can never turn around and retire its successor.
 			//
-			// The SUBJECT's adoption has to be looked up, not indexed. Reading
-			// firstAdopted[lk] directly gave 0 for a key that never adopted, and the
-			// test then reduced to signerAdopted <= 0 — true for nothing, so any adopted
-			// key of the host could retire a never-adopted one. That is precisely the
-			// key `never adopted` exists to report, and a leaked predecessor could make
-			// the report disappear: a retired key is skipped before adoption is ever
-			// considered, so the host went back to reading clean. Succession is a
-			// relation between two ADOPTED keys; a key with no adoption has no
-			// predecessor, and only itself or the CA may speak for it.
+			// A subject that never adopted is the ordinary repair case: its certificate
+			// was published but its private key was unreadable, then a newly generated
+			// successor was installed to retire it. Adoption sequences cannot order a
+			// key that never adopted, so dedicated audit certificates carry a
+			// CA-signed generation. That lets the successor retire the older orphan
+			// without letting a leaked predecessor erase a newer orphan's finding.
 			signerAdopted, ok := firstAdopted[lifecycleKey{host: r.host, keyID: r.byKeyID}]
 			subjectAdopted, subjectOK := firstAdopted[lk]
-			if r.event != auditLifecycleRetired || !ok || !subjectOK || signerAdopted <= subjectAdopted {
+			adoptedSuccessor := subjectOK && signerAdopted > subjectAdopted
+			orphanSuccessor := !subjectOK && r.signerGeneration > r.subjectGeneration
+			if r.event != auditLifecycleRetired || !ok || (!adoptedSuccessor && !orphanSuccessor) {
 				slog.Warn("ignoring an audit key lifecycle record whose signer has no standing "+
 					"over the key it names; only the key itself, a later-adopted key of the same "+
 					"host, or the cluster CA may speak for it",

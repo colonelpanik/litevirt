@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"math/big"
 	"net"
 	"testing"
 
@@ -38,15 +39,40 @@ func trustFixture(t *testing.T) *Server {
 // key usages. ServerAuth is what GenerateHostCert sets and GenerateClientCert does
 // not, so it is how a host certificate is told from a distributable client one.
 func certCtx(cn string, usages ...x509.ExtKeyUsage) context.Context {
+	return certSerialCtx(cn, nil, usages...)
+}
+
+func certSerialCtx(cn string, serial *big.Int, usages ...x509.ExtKeyUsage) context.Context {
 	return peer.NewContext(context.Background(), &peer.Peer{
 		Addr: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 1234},
 		AuthInfo: credentials.TLSInfo{State: tls.ConnectionState{
 			PeerCertificates: []*x509.Certificate{{
-				Subject:     pkix.Name{CommonName: cn},
-				ExtKeyUsage: usages,
+				Subject:      pkix.Name{CommonName: cn},
+				SerialNumber: serial,
+				ExtKeyUsage:  usages,
 			}},
 		}},
 	})
+}
+
+func TestPeerTrust_ReAdmittedNameAcceptsOnlyTheFreshCertificate(t *testing.T) {
+	ctx := context.Background()
+	s := trustFixture(t)
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "node-4", Address: "10.0.0.4", State: "active", CertSerial: "bb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oldCert := certSerialCtx("node-4", big.NewInt(0xaa),
+		x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth)
+	if s.isTrustedHostCN(oldCert, "node-4") {
+		t.Fatal("an active name admitted with a fresh serial accepted its old certificate")
+	}
+	freshCert := certSerialCtx("node-4", big.NewInt(0xbb),
+		x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth)
+	if !s.isTrustedHostCN(freshCert, "node-4") {
+		t.Fatal("the certificate recorded by admission was refused")
+	}
 }
 
 // TestPeerTrust_AnUnknownHostIsTrusted is the bootstrap case: a peer whose row has

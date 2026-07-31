@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"github.com/litevirt/litevirt/internal/netutil"
 	"log/slog"
 	"net"
 	"os"
@@ -13,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/netutil"
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/pki"
@@ -145,7 +146,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 }
 
 // HostAdd adds a new host to an existing cluster.
-func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers []string) error {
+func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostName string, joinPeers []string) error {
 	// Before anything is generated or pushed, because a failure here must leave the
 	// target untouched.
 	//
@@ -270,9 +271,22 @@ func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers [
 	// advertise. Leaving the daemon to auto-detect meant it registered with its
 	// default-route source IP — a different interface on a multi-homed host — and
 	// that value was then copied into the join_peers of every host added after it.
+	serial, err := pki.CertSerial(hostCertPath)
+	if err != nil {
+		return fmt.Errorf("read generated host certificate serial: %w", err)
+	}
+	if _, err := c.AdmitHost(ctx, &pb.AdmitHostRequest{
+		Name: hostName, Address: hostAddr, CertSerial: serial,
+	}); err != nil {
+		return fmt.Errorf("admit host identity to the cluster: %w", err)
+	}
+	// Admission must replicate before setup starts the daemon. A re-added node's
+	// local database still contains its tombstone; starting it first lets its boot
+	// state update put a fresh timestamp on that tombstone and race the admission
+	// back out to the cluster.
 	if err := sc.Run(fmt.Sprintf("%s bash /tmp/litevirt-setup.sh",
 		strings.Join(setupScriptEnv(hostName, hostAddr, peersYAML), " "))); err != nil {
-		return fmt.Errorf("run setup script: %w", err)
+		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
 	// Ensure the new host is listed as a gossip peer in the local daemon config.

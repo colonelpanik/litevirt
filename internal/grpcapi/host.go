@@ -834,6 +834,32 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 	return &emptypb.Empty{}, nil
 }
 
+// AdmitHost records the CA-authorized identity produced by `lv host add`.
+// Running it on an existing member breaks the tombstone/authentication deadlock
+// when a removed machine is deliberately re-added with a fresh certificate.
+func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*emptypb.Empty, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
+		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
+	}
+	err := corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
+		Name:       req.Name,
+		Address:    req.Address,
+		SSHUser:    "root",
+		SSHPort:    22,
+		GRPCPort:   7443,
+		State:      "active",
+		CertSerial: req.CertSerial,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+	}
+	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
+	return &emptypb.Empty{}, nil
+}
+
 func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (cpuUsed, memUsed int32, diskUsedGiB int64) {
 	vms, _ := corrosion.ListVMs(ctx, s.db, "", hostName)
 	for _, vm := range vms {

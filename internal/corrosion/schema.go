@@ -3,9 +3,12 @@ package corrosion
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"slices"
+	"sort"
 	"time"
 )
 
@@ -367,11 +370,18 @@ func InitSchema(ctx context.Context, c *Client) error {
 		if m.SQL == "" {
 			return fmt.Errorf("schema ledger: %q (%s) reported missing but has no heal SQL", m.ID, m.Target)
 		}
-		if err := c.execBatchLocal(ctx, []Statement{
-			{SQL: m.SQL},
-			{SQL: `INSERT INTO applied_migrations (id, applied_at, checksum) VALUES (?, ?, ?)`,
-				Params: []interface{}{m.ID, now, sum}},
-		}); err != nil {
+		stmts := []Statement{{SQL: m.SQL}}
+		if m.Kind == kindRebuildClusterCRL {
+			stmts = []Statement{
+				{SQL: `DROP TABLE IF EXISTS cluster_crl`},
+				{SQL: clusterCRLDDL},
+			}
+		}
+		stmts = append(stmts, Statement{
+			SQL:    `INSERT INTO applied_migrations (id, applied_at, checksum) VALUES (?, ?, ?)`,
+			Params: []interface{}{m.ID, now, sum},
+		})
+		if err := c.execBatchLocal(ctx, stmts); err != nil {
 			return fmt.Errorf("schema migration %q: %w", m.ID, err)
 		}
 		slog.Warn("schema ledger: healed a missing migration (silent gap from a prior daemon)",
@@ -577,6 +587,39 @@ func tableExists(ctx context.Context, c *Client, name string) (bool, error) {
 	return rows.Next(), nil
 }
 
+func primaryKeyColumns(ctx context.Context, db *sql.DB, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type keyed struct {
+		order int
+		name  string
+	}
+	var found []keyed
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		if pk > 0 {
+			found = append(found, keyed{order: pk, name: name})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].order < found[j].order })
+	out := make([]string, len(found))
+	for i := range found {
+		out[i] = found[i].name
+	}
+	return out, nil
+}
+
 // containsFold is a tiny case-insensitive substring helper — kept local so
 // schema.go doesn't grow a strings dependency.
 func containsFold(s, sub string) bool {
@@ -604,6 +647,15 @@ func containsFold(s, sub string) bool {
 	}
 	return false
 }
+
+const clusterCRLDDL = `CREATE TABLE IF NOT EXISTS cluster_crl (
+	id           TEXT NOT NULL,
+	crl_pem      TEXT NOT NULL,
+	created_at   TEXT NOT NULL,
+	updated_at   TEXT NOT NULL,
+	deleted_at   TEXT,
+	PRIMARY KEY (id, crl_pem)
+)`
 
 var schemaDDL = []string{
 	// ═══════════ CLUSTER ═══════════
@@ -711,28 +763,30 @@ var schemaDDL = []string{
 	// cluster CA, and every reader checks the signature before installing it. That is
 	// the same reason audit signing certificates are replicated in the clear.
 	//
-	// APPEND-ONLY, and keyed by the SHA-256 of the CRL itself.
+	// APPEND-ONLY, with a composite key of the SHA-256 and the CRL itself.
 	//
 	// Every other choice of key was tried and each one handed a hostile peer a way
 	// to stop a revocation. A singleton row is overwritable. A row keyed by CRL
 	// NUMBER is squattable, because the number is a wall-clock second and therefore
 	// predictable: insert rows for the next hour's worth of numbers and the genuine
-	// INSERT loses to INSERT OR IGNORE on every peer. Keying on the content hash
-	// removes the choice from the writer entirely — occupying the genuine row's key
-	// means producing its exact bytes, signature included.
+	// INSERT loses to INSERT OR IGNORE on every peer. A hash alone is still
+	// squattable after publication: the hash becomes public with the CRL, and a
+	// peer can race (hash, garbage) to a partitioned node before the genuine
+	// mutation arrives. Including the signed bytes in the key makes those two
+	// rows distinct, so the garbage row cannot veto the genuine one.
 	//
 	// There is deliberately NO version column. The number that orders one CRL
 	// against another lives inside the signed PEM, where the CA covers it; a column
 	// beside it is written by whoever inserted the row and covered by nothing, and a
 	// reader that trusts it can be pinned to an old CRL forever. Readers parse and
-	// verify every row and take the highest number they can VERIFY, so a hostile row
-	// costs one signature check and nothing else.
+	// verify every row and enforce the union of signed revocations.
 	`CREATE TABLE IF NOT EXISTS cluster_crl (
-		id           TEXT PRIMARY KEY,
+		id           TEXT NOT NULL,
 		crl_pem      TEXT NOT NULL,
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
-		deleted_at   TEXT
+		deleted_at   TEXT,
+		PRIMARY KEY (id, crl_pem)
 	)`,
 
 	// Local schema version pin. NOT CRDT-replicated — each host's row
@@ -1946,7 +2000,7 @@ var tablePrimaryKeys = map[string][]string{
 	"host_runtime_usage":       {"host_name"},
 	"clock_skew":               {"observer", "target"},
 	"crl_versions":             {"host"},
-	"cluster_crl":              {"id"},
+	"cluster_crl":              {"id", "crl_pem"},
 	"leader_election":          {"key"},
 	"vm_locks":                 {"vm_name"},
 	"runtime_action_proofs":    {"id"},
@@ -2237,8 +2291,9 @@ var schemaMigrations = []string{
 type migKind int
 
 const (
-	kindAddColumn   migKind = iota // ALTER TABLE … ADD COLUMN; presence = column exists
-	kindCreateTable                // new table; presence = table exists (created by schemaDDL)
+	kindAddColumn         migKind = iota // ALTER TABLE … ADD COLUMN; presence = column exists
+	kindCreateTable                      // new table; presence = table exists (created by schemaDDL)
+	kindRebuildClusterCRL                // v47 final shape; presence = composite primary key
 )
 
 // migration is one ledgered schema unit.
@@ -2261,6 +2316,9 @@ func (m migration) present(ctx context.Context, c *Client) (bool, error) {
 		return columnExists(ctx, c.db, table, col)
 	case kindCreateTable:
 		return tableExists(ctx, c, m.Target)
+	case kindRebuildClusterCRL:
+		cols, err := primaryKeyColumns(ctx, c.db, m.Target)
+		return err == nil && slices.Equal(cols, []string{"id", "crl_pem"}), err
 	default:
 		return false, fmt.Errorf("migration %q: unknown kind %d", m.ID, m.Kind)
 	}
@@ -2365,4 +2423,11 @@ func init() {
 			Target:  ct.table,
 		})
 	}
+	schemaMigrationLedger = append(schemaMigrationLedger, migration{
+		ID:      "r_cluster_crl_composite_pk",
+		Version: 47,
+		Kind:    kindRebuildClusterCRL,
+		Target:  "cluster_crl",
+		SQL:     "DROP TABLE IF EXISTS cluster_crl;\n" + clusterCRLDDL,
+	})
 }

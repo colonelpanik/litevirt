@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -110,6 +111,60 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 		h.CapacityPolicyHash,
 		now, c.NowTS(),
 	)
+}
+
+// AdmitHost creates a host row or replaces a tombstone after an operator has
+// issued a different certificate for the same name. A daemon cannot use its old
+// certificate to resurrect itself: the old serial is retained in the tombstone
+// and an equal serial is refused.
+func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
+	if h.Name == "" || h.Address == "" || h.CertSerial == "" || h.CertSerial == "unknown" {
+		return fmt.Errorf("host admission requires name, address, and certificate serial")
+	}
+	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, h.Name)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return InsertHost(ctx, c, h)
+	}
+	if rows[0].String("deleted_at") == "" {
+		if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+			return nil
+		}
+		return fmt.Errorf("host %q is already active", h.Name)
+	}
+	if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+		return fmt.Errorf("host %q cannot be re-admitted with its removed certificate", h.Name)
+	}
+	return c.Execute(ctx,
+		`UPDATE hosts SET address = ?, ssh_user = ?, ssh_port = ?, grpc_port = ?,
+			state = ?, cert_serial = ?, deleted_at = NULL, updated_at = ?
+		 WHERE name = ? AND deleted_at IS NOT NULL AND lower(cert_serial) <> lower(?)`,
+		h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial, c.NowTS(),
+		h.Name, h.CertSerial)
+}
+
+// RegisterHost is the daemon startup form of host admission. Ordinary restarts
+// are idempotent. A re-added machine may clear its local tombstone only when the
+// certificate actually installed on disk has a different serial; peers still
+// require the operator's AdmitHost mutation and the matching certificate.
+func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
+	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, h.Name)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return InsertHost(ctx, c, h)
+	}
+	if rows[0].String("deleted_at") == "" {
+		if rows[0].String("cert_serial") == "" ||
+			strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+			return nil
+		}
+		return fmt.Errorf("active host %q has a different certificate serial", h.Name)
+	}
+	return AdmitHost(ctx, c, h)
 }
 
 // ListHosts returns all active hosts.

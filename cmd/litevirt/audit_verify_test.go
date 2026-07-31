@@ -115,6 +115,7 @@ func TestAuditVerifyNeverAdoptedFailsWithoutClaimingTampering(t *testing.T) {
 	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
 		RowsChecked:  12,
 		UnsignedRows: 12,
+		Unverified:   true,
 		NeverAdopted: []string{"node-4: published signing certificate abc but never recorded an adoption"},
 	})
 	if err == nil {
@@ -146,6 +147,7 @@ func TestAuditVerifyUnverifiedHeadlineDoesNotSayIntact(t *testing.T) {
 	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
 		RowsChecked:  12,
 		UnsignedRows: 12,
+		Unverified:   true,
 		NeverAdopted: []string{"node-4: published a signing certificate but never adopted"},
 	})
 	if err == nil {
@@ -161,5 +163,19 @@ func TestAuditVerifyUnverifiedHeadlineDoesNotSayIntact(t *testing.T) {
 	// The unsigned count still has to be visible — it is the context for the rest.
 	if !strings.Contains(out.String(), "12 predate tamper-evidence") {
 		t.Errorf("the unsigned count was dropped from the unverified path: %q", out.String())
+	}
+}
+
+func TestAuditVerifyConsumesTheDaemonUnverifiedVerdict(t *testing.T) {
+	var out strings.Builder
+	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
+		RowsChecked: 77,
+		Unverified:  true,
+	})
+	if err == nil {
+		t.Fatal("daemon Unverified=true was re-derived as a clean CLI verdict")
+	}
+	if !strings.Contains(out.String(), "NOT FULLY VERIFIED") {
+		t.Fatalf("CLI did not report the daemon's verdict: %q", out.String())
 	}
 }

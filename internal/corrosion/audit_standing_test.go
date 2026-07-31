@@ -134,11 +134,13 @@ func TestLifecycle_AForgedCASignatureIsRejected(t *testing.T) {
 func TestLifecycle_APredecessorCannotRetireANeverAdoptedKey(t *testing.T) {
 	rows := []lifecycleRow{
 		// The host's real key, adopted normally, later leaked.
-		{host: "node-1", keyID: "old", event: auditLifecycleAdopted, seq: 100, byKeyID: "old"},
+		{host: "node-1", keyID: "old", event: auditLifecycleAdopted, seq: 100, byKeyID: "old",
+			subjectGeneration: 100, signerGeneration: 100},
 		// A certificate published with no adoption — the never-adopted case.
 		// (No adopted row for "new" at all.)
 		// What the holder of the leaked key tries.
-		{host: "node-1", keyID: "new", event: auditLifecycleRetired, seq: 0, byKeyID: "old"},
+		{host: "node-1", keyID: "new", event: auditLifecycleRetired, seq: 200, byKeyID: "old",
+			subjectGeneration: 200, signerGeneration: 100},
 	}
 	got := reduceLifecycle(rows)
 	if events := got[lifecycleKey{host: "node-1", keyID: "new"}]; len(events) > 0 {
@@ -146,6 +148,23 @@ func TestLifecycle_APredecessorCannotRetireANeverAdoptedKey(t *testing.T) {
 			"succession is a relation between two ADOPTED keys — a key with no adoption has no "+
 			"predecessor, and letting one exist erases the `never adopted` finding that this "+
 			"state is supposed to raise", events)
+	}
+}
+
+// A published certificate whose private key was unreadable has no adoption
+// record. Rotating it installs a CA-signed, later-generation successor; that
+// successor must be able to close the orphan contract or the documented repair
+// leaves NeverAdopted permanent.
+func TestLifecycle_ASuccessorRetiresAnOlderNeverAdoptedKey(t *testing.T) {
+	rows := []lifecycleRow{
+		{host: "node-1", keyID: "new", event: auditLifecycleAdopted, seq: 200, byKeyID: "new",
+			subjectGeneration: 200, signerGeneration: 200},
+		{host: "node-1", keyID: "old-orphan", event: auditLifecycleRetired, seq: 200, byKeyID: "new",
+			subjectGeneration: 100, signerGeneration: 200},
+	}
+	got := reduceLifecycle(rows)
+	if _, retired := got[lifecycleKey{host: "node-1", keyID: "old-orphan"}][auditLifecycleRetired]; !retired {
+		t.Fatalf("a later CA-generated successor could not retire the older orphan: %+v", got)
 	}
 }
 

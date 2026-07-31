@@ -665,12 +665,6 @@ var auditEvidenceGuards = map[string]mergeFloor{
 	"audit_log":           {signedAuditRowIsImmutable, auditDivergenceAdvice},
 	"audit_chain_heads":   {auditEvidenceIsImmutable, auditDivergenceAdvice},
 	"audit_key_lifecycle": {auditEvidenceIsImmutable, auditDivergenceAdvice},
-	// The cluster CRL gets the same floor for the same reason. Its rows are keyed
-	// by CRL number and every one of them is CA-signed, so a differing body for a
-	// number this node already holds is a forgery attempt — and taking it would
-	// replace a genuine revocation with whatever the sender preferred.
-	"cluster_crl": {auditEvidenceIsImmutable,
-		"A revocation cannot be rewritten — one of the two nodes is presenting a CRL it was not given"},
 }
 
 // mergeFloor pairs the refusal rule for one table with what an operator should do

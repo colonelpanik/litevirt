@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"slices"
 	"testing"
 )
 
@@ -104,6 +105,33 @@ func TestInitSchema_FreshDB(t *testing.T) {
 	}
 	if v := storedVersion(t, c); v != CurrentSchemaVersion {
 		t.Errorf("schema_state.version=%d, want %d", v, CurrentSchemaVersion)
+	}
+}
+
+func TestInitSchema_RebuildsTheEarlierV47ClusterCRLShape(t *testing.T) {
+	c, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	ctx := context.Background()
+	if err := c.execLocal(ctx, `CREATE TABLE cluster_crl (
+		id TEXT PRIMARY KEY,
+		crl_pem TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`); err != nil {
+		t.Fatalf("create earlier v47 shape: %v", err)
+	}
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	got, err := primaryKeyColumns(ctx, c.db, "cluster_crl")
+	if err != nil {
+		t.Fatalf("read rebuilt primary key: %v", err)
+	}
+	if !slices.Equal(got, []string{"id", "crl_pem"}) {
+		t.Fatalf("cluster_crl primary key = %v, want [id crl_pem]", got)
 	}
 }
 

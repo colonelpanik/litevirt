@@ -1,10 +1,13 @@
 package pki
 
 import (
+	"crypto/sha256"
+	"crypto/x509"
 	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -85,9 +88,9 @@ func TestInstallCRL_RefusesACRLFromAnotherCA(t *testing.T) {
 	}
 }
 
-// The un-revocation move: publish an OLD CRL — genuinely CA-signed, from before
-// the removal — and every node that takes it stops revoking the serial.
-func TestInstallCRL_RefusesToGoBackwards(t *testing.T) {
+// An old, genuinely signed CRL may be replayed, but adding it to the bundle
+// cannot remove a revocation already enforced from another member.
+func TestInstallCRL_AnOldCRLCannotRemoveANewerRevocation(t *testing.T) {
 	caCert, caKey, dir := setupCA(t)
 	stale := crlFor(t, caCert, caKey)
 
@@ -96,12 +99,9 @@ func TestInstallCRL_RefusesToGoBackwards(t *testing.T) {
 		t.Fatalf("install current: %v", err)
 	}
 
-	_, installed, err := InstallCRL(dir, stale)
+	_, _, err := InstallCRL(dir, stale)
 	if err != nil {
 		t.Fatalf("InstallCRL(stale): %v", err)
-	}
-	if installed {
-		t.Fatal("an older CRL replaced a newer one")
 	}
 	if !IsCertRevoked(dir, big.NewInt(0x1a2b)) {
 		t.Fatal("the revocation was lost to an older CRL")
@@ -141,7 +141,7 @@ func TestAppendToCRL_NumbersAreStrictlyIncreasing(t *testing.T) {
 	}
 }
 
-// TestInstallCRL_RefusesANewerCRLThatRevokesLess.
+// TestInstallCRL_UnionsANewerCRLThatRevokesADifferentSet.
 //
 // This one needs no attacker. A CRL is minted by appending one serial to whatever
 // crl.pem the CA machine holds, and AppendToCRL treated an unreadable file as an
@@ -150,7 +150,7 @@ func TestAppendToCRL_NumbersAreStrictlyIncreasing(t *testing.T) {
 // and therefore higher than the cluster's. Before distribution was replicated that
 // damaged one machine. Now it would un-revoke every previously revoked host on
 // every node, with the command reporting success.
-func TestInstallCRL_RefusesANewerCRLThatRevokesLess(t *testing.T) {
+func TestInstallCRL_UnionsANewerCRLThatRevokesADifferentSet(t *testing.T) {
 	caCert, caKey, dir := setupCA(t)
 
 	if _, _, err := InstallCRL(dir, crlFor(t, caCert, caKey, "aaaa", "bbbb")); err != nil {
@@ -161,18 +161,15 @@ func TestInstallCRL_RefusesANewerCRLThatRevokesLess(t *testing.T) {
 	forgetful := crlFor(t, caCert, caKey, "cccc")
 
 	_, installed, err := InstallCRL(dir, forgetful)
-	if err == nil {
-		t.Fatal("installed a newer CRL that dropped two existing revocations")
+	if err != nil {
+		t.Fatalf("install the incomparable CRL into the bundle: %v", err)
 	}
-	if installed {
-		t.Fatal("reported the CRL as installed while also failing")
+	if !installed {
+		t.Fatal("the new bundle member was not installed")
 	}
-	if !strings.Contains(err.Error(), "aaaa") && !strings.Contains(err.Error(), "bbbb") {
-		t.Errorf("the refusal does not name the revocations that would be lost: %v", err)
-	}
-	for _, serial := range []int64{0xaaaa, 0xbbbb} {
+	for _, serial := range []int64{0xaaaa, 0xbbbb, 0xcccc} {
 		if !IsCertRevoked(dir, big.NewInt(serial)) {
-			t.Fatalf("serial %x is no longer revoked after a refused CRL", serial)
+			t.Fatalf("serial %x is not revoked by the bundle union", serial)
 		}
 	}
 }
@@ -193,6 +190,107 @@ func TestInstallCRL_AcceptsANewerCRLThatRevokesMore(t *testing.T) {
 	}
 	if !IsCertRevoked(dir, big.NewInt(0xbbbb)) {
 		t.Fatal("the newly revoked serial is not enforced")
+	}
+}
+
+func TestInstallCRLs_CorruptLocalFileDoesNotVetoTheReplicatedUnion(t *testing.T) {
+	caCert, caKey, dir := setupCA(t)
+	if err := os.WriteFile(filepath.Join(dir, "crl.pem"), []byte("corrupt backup"), 0o600); err != nil {
+		t.Fatalf("write corrupt local CRL: %v", err)
+	}
+	first := crlFor(t, caCert, caKey, "aaaa")
+	second := crlFor(t, caCert, caKey, "bbbb")
+	if _, installed, err := InstallCRLs(dir, [][]byte{first, second}); err != nil || !installed {
+		t.Fatalf("InstallCRLs = installed %v, err %v", installed, err)
+	}
+	for _, serial := range []int64{0xaaaa, 0xbbbb} {
+		if !IsCertRevoked(dir, big.NewInt(serial)) {
+			t.Fatalf("replicated union omitted serial %x after corrupt local state", serial)
+		}
+	}
+}
+
+func TestInstallCRLs_ConcurrentWritersCannotLoseARevocation(t *testing.T) {
+	caCert, caKey, dir := setupCA(t)
+	first := crlFor(t, caCert, caKey, "aaaa")
+	second := crlFor(t, caCert, caKey, "bbbb")
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, body := range [][]byte{first, second} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, err := InstallCRL(dir, body)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent install: %v", err)
+		}
+	}
+	for _, serial := range []int64{0xaaaa, 0xbbbb} {
+		if !IsCertRevoked(dir, big.NewInt(serial)) {
+			t.Fatalf("concurrent install lost serial %x", serial)
+		}
+	}
+}
+
+func TestInstallCRLs_PrunesCoveredHistoricalSnapshots(t *testing.T) {
+	caCert, caKey, dir := setupCA(t)
+	first := crlFor(t, caCert, caKey, "aaaa")
+	second := crlFor(t, caCert, caKey, "aaaa", "bbbb")
+	third := crlFor(t, caCert, caKey, "aaaa", "bbbb", "cccc")
+	if _, _, err := InstallCRLs(dir, [][]byte{first, second, third}); err != nil {
+		t.Fatalf("InstallCRLs: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "crl.pem"))
+	if err != nil {
+		t.Fatalf("read installed bundle: %v", err)
+	}
+	crls, err := parseCRLs(body)
+	if err != nil {
+		t.Fatalf("parse installed bundle: %v", err)
+	}
+	if len(crls) != 1 {
+		t.Fatalf("installed %d cumulative snapshots, want only the covering newest one", len(crls))
+	}
+	for _, serial := range []int64{0xaaaa, 0xbbbb, 0xcccc} {
+		if !IsCertRevoked(dir, big.NewInt(serial)) {
+			t.Fatalf("pruning lost serial %x", serial)
+		}
+	}
+}
+
+func TestVerifiedCRLNumber_CachesSuccessfulSignatureVerification(t *testing.T) {
+	caCert, caKey, dir := setupCA(t)
+	body := crlFor(t, caCert, caKey, "aaaa")
+	original := checkCRLSignature
+	crlVerifyMu.Lock()
+	originalCache := verifiedCRLs
+	verifiedCRLs = make(map[[sha256.Size]byte]struct{})
+	crlVerifyMu.Unlock()
+	checks := 0
+	checkCRLSignature = func(crl *x509.RevocationList, ca *x509.Certificate) error {
+		checks++
+		return original(crl, ca)
+	}
+	t.Cleanup(func() {
+		checkCRLSignature = original
+		crlVerifyMu.Lock()
+		verifiedCRLs = originalCache
+		crlVerifyMu.Unlock()
+	})
+
+	for i := 0; i < 3; i++ {
+		if _, err := VerifiedCRLNumber(dir, body); err != nil {
+			t.Fatalf("VerifiedCRLNumber #%d: %v", i, err)
+		}
+	}
+	if checks != 1 {
+		t.Fatalf("signature checks = %d, want 1 for one immutable CRL", checks)
 	}
 }
 

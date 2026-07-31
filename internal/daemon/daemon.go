@@ -1357,7 +1357,7 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 
 	addr := d.hostAddress()
 
-	return corrosion.InsertHost(ctx, d.db, corrosion.HostRecord{
+	return corrosion.RegisterHost(ctx, d.db, corrosion.HostRecord{
 		Name:          d.cfg.HostName,
 		Address:       addr,
 		SSHUser:       "root",

@@ -19,7 +19,7 @@ import (
 // never a valid outcome for `add` — by definition there is at least one existing
 // host to join, or you would be running `init`.
 func TestHostAdd_RefusesToProvisionAHostWithNoGossipPeers(t *testing.T) {
-	err := HostAdd(context.Background(), "root@10.0.0.9", "node-9", nil)
+	err := HostAdd(context.Background(), nil, "root@10.0.0.9", "node-9", nil)
 	if err == nil {
 		t.Fatal("provisioning a host with no gossip peers was allowed\n" +
 			"the node gets certificates, a binary and a daemon, and no way to reach the " +

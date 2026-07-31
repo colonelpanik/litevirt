@@ -15,6 +15,7 @@ package fleet
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -231,14 +232,31 @@ func TestFleet_SquattedRowsCannotBlockAGenuineRevocation(t *testing.T) {
 	a, b, victim := c.Node("node-0"), c.Node("node-1"), c.Node("node-2")
 	serial := hostSerial(t, victim)
 
-	// The squatter, writing before the operator acts.
-	for i := 0; i < 32; i++ {
-		if err := corrosion.PublishCRL(ctx, a.DB, fmt.Sprintf("not a CRL at all #%d", i)); err != nil {
-			t.Fatalf("squat row %d: %v", i, err)
-		}
+	// Mint the future genuine bytes without publishing them, calculate the exact
+	// slot they will use, and occupy that hash with garbage first.
+	crlPath := filepath.Join(a.PKIDir, "crl.pem")
+	if err := pki.AppendToCRL(filepath.Join(a.PKIDir, "ca.crt"),
+		filepath.Join(a.PKIDir, "ca.key"), crlPath, serial.Text(16)); err != nil {
+		t.Fatalf("mint genuine CRL: %v", err)
+	}
+	genuine, err := os.ReadFile(crlPath)
+	if err != nil {
+		t.Fatalf("read genuine CRL: %v", err)
+	}
+	sum := sha256.Sum256(genuine)
+	id := fmt.Sprintf("%x", sum[:])
+	now := a.DB.NowTS()
+	if err := a.DB.Execute(ctx,
+		`INSERT INTO cluster_crl (id, crl_pem, created_at, updated_at, deleted_at)
+		 VALUES (?, 'attacker-controlled garbage', ?, ?, NULL)`,
+		id, now, now); err != nil {
+		t.Fatalf("occupy the genuine CRL hash: %v", err)
 	}
 
-	revokeOn(t, c, a, serial) // must still publish
+	if _, err := c.SelfClient(a).PublishCRL(ctx,
+		&pb.PublishCRLRequest{CrlPem: string(genuine)}); err != nil {
+		t.Fatalf("publish genuine CRL after its hash was occupied: %v", err)
+	}
 	b.DB.MergeStateBytesLWW(pullDump(t, c, a))
 
 	if _, err := corrosion.SyncClusterCRL(ctx, b.DB, b.PKIDir); err != nil {
@@ -247,6 +265,49 @@ func TestFleet_SquattedRowsCannotBlockAGenuineRevocation(t *testing.T) {
 	if !pki.IsCertRevoked(b.PKIDir, serial) {
 		t.Fatalf("%s never installed the revocation of %s after the table was squatted",
 			b.Name, victim.Name)
+	}
+}
+
+func TestFleet_EqualNumberCRLsAreUnioned(t *testing.T) {
+	c := New(t, Options{Nodes: 3})
+	ctx := context.Background()
+	a, b, victim := c.Node("node-0"), c.Node("node-1"), c.Node("node-2")
+
+	mint := func(serial string) []byte {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "crl.pem")
+		if err := pki.GenerateCRL(filepath.Join(a.PKIDir, "ca.crt"),
+			filepath.Join(a.PKIDir, "ca.key"), path, []string{serial}); err != nil {
+			t.Fatalf("mint CRL for %s: %v", serial, err)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read CRL for %s: %v", serial, err)
+		}
+		return body
+	}
+	first := mint(hostSerial(t, b).Text(16))
+	second := mint(hostSerial(t, victim).Text(16))
+	firstNum, _ := pki.VerifiedCRLNumber(a.PKIDir, first)
+	secondNum, _ := pki.VerifiedCRLNumber(a.PKIDir, second)
+	if firstNum != secondNum {
+		t.Skipf("wall clock crossed a second while minting equal-number CRLs (%d != %d)",
+			firstNum, secondNum)
+	}
+	for _, body := range [][]byte{first, second} {
+		if _, err := c.SelfClient(a).PublishCRL(ctx,
+			&pb.PublishCRLRequest{CrlPem: string(body)}); err != nil {
+			t.Fatalf("publish equal-number CRL: %v", err)
+		}
+	}
+	b.DB.MergeStateBytesLWW(pullDump(t, c, a))
+	if _, err := corrosion.SyncClusterCRL(ctx, b.DB, b.PKIDir); err != nil {
+		t.Fatalf("sync equal-number CRLs: %v", err)
+	}
+	for _, serial := range []*big.Int{hostSerial(t, b), hostSerial(t, victim)} {
+		if !pki.IsCertRevoked(b.PKIDir, serial) {
+			t.Fatalf("equal-number CRL union omitted serial %s", serial.Text(16))
+		}
 	}
 }
 
@@ -266,6 +327,43 @@ func TestFleet_RepublishingTheSameCRLIsANoOp(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		if err := corrosion.PublishCRL(ctx, a.DB, string(crlPEM)); err != nil {
 			t.Fatalf("republish #%d reported failure for a CRL already published: %v", i, err)
+		}
+	}
+}
+
+func TestFleet_TwoNodesPublishingTheSameCRLConvergeWithoutARewriteFault(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	ctx := context.Background()
+	a, b := c.Node("node-0"), c.Node("node-1")
+
+	crlPath := filepath.Join(a.PKIDir, "crl.pem")
+	if err := pki.AppendToCRL(filepath.Join(a.PKIDir, "ca.crt"),
+		filepath.Join(a.PKIDir, "ca.key"), crlPath, hostSerial(t, b).Text(16)); err != nil {
+		t.Fatalf("mint CRL: %v", err)
+	}
+	body, err := os.ReadFile(crlPath)
+	if err != nil {
+		t.Fatalf("read CRL: %v", err)
+	}
+	for _, n := range []*Node{a, b} {
+		if _, err := c.SelfClient(n).PublishCRL(ctx,
+			&pb.PublishCRLRequest{CrlPem: string(body)}); err != nil {
+			t.Fatalf("publish on %s: %v", n.Name, err)
+		}
+	}
+	if err := a.DB.MergeStateBytesLWW(pullDump(t, c, b)); err != nil {
+		t.Fatalf("merge B into A: %v", err)
+	}
+	if err := b.DB.MergeStateBytesLWW(pullDump(t, c, a)); err != nil {
+		t.Fatalf("merge A into B: %v", err)
+	}
+	for _, n := range []*Node{a, b} {
+		rows, err := corrosion.ClusterCRLs(ctx, n.DB)
+		if err != nil {
+			t.Fatalf("ClusterCRLs on %s: %v", n.Name, err)
+		}
+		if len(rows) != 1 || rows[0].PEM != string(body) {
+			t.Fatalf("%s converged to %+v, want the one genuine CRL", n.Name, rows)
 		}
 	}
 }

@@ -312,21 +312,22 @@ machine that ran `lv host init`; if it cannot, the command says so rather than
 skipping revocation silently.
 
 The CRL is then **replicated**, not copied around by hand. `lv host rm` publishes
-it to the cluster, every node installs it within about half a minute, and each
+the revocation before tombstoning the host, every node installs it within about
+half a minute, and each
 daemon reloads `crl.pem` when the file changes. Two things make that safe to send
 over a channel any peer can write to: a CRL is signed by the cluster CA, and every
 node verifies that signature against its own `ca.crt` before the file is touched —
 so a host publishing a CRL that omits its own serial is refused rather than
-believed. Nodes install only a CRL numbered above the one they hold, and the table
-is append-only and keyed by that number, so an unsignable row cannot displace or
-bury a genuine one. `lv health` warns for as long as any peer's CRL version
-is behind another's.
+believed. Nodes enforce the union of every verified CRL they know, so equal-number
+lists or a later list minted from stale state cannot un-revoke either branch. The
+table is append-only and keyed by both the CRL hash and its signed bytes, so a
+garbage row occupying a public hash cannot displace or bury the genuine row.
+`lv health` warns for as long as any peer's CRL version is behind another's.
 
-If publishing fails — the cluster was unreachable, the daemon was restarting — the
-certificate is still revoked locally and only locally. Run `lv host publish-crl`
-from that machine once the cluster is back. Re-running `lv host rm` does **not**
-work: the host row is already tombstoned, so the command has no serial to look up
-and stops before the publish step.
+If minting or publishing fails — the cluster was unreachable, the daemon was
+restarting — `lv host rm` refuses to tombstone the host, preserving the serial and
+making the whole operation safe to retry. When a CRL was minted but publication
+failed, `lv host publish-crl` can publish it directly; then rerun `lv host rm`.
 
 Distribution deliberately does **not** go over SSH. SSH is the bootstrap channel —
 `host init`, `host add`, `rotate-audit-key` — for reaching a machine that is not

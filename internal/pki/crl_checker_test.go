@@ -58,8 +58,16 @@ func TestCRLChecker_FailSafe(t *testing.T) {
 	if err := GenerateCA(otherCA, otherKey); err != nil {
 		t.Fatalf("GenerateCA (foreign): %v", err)
 	}
-	if err := GenerateCRL(otherCA, otherKey, crlPath, []string{serialHex}); err != nil {
+	foreignPath := filepath.Join(otherDir, "crl.pem")
+	if err := GenerateCRL(otherCA, otherKey, foreignPath, []string{serialHex}); err != nil {
 		t.Fatalf("GenerateCRL (foreign): %v", err)
+	}
+	foreign, err := os.ReadFile(foreignPath)
+	if err != nil {
+		t.Fatalf("read foreign CRL: %v", err)
+	}
+	if err := os.WriteFile(crlPath, foreign, 0o600); err != nil {
+		t.Fatalf("install forged CRL for fail-safe test: %v", err)
 	}
 	if newCRLChecker(dir, caCert).isRevoked(serial) {
 		t.Error("a CRL not signed by our CA must be IGNORED, not enforced")
@@ -71,6 +79,25 @@ func TestCRLChecker_FailSafe(t *testing.T) {
 	}
 	if newCRLChecker(dir, caCert).isRevoked(serial) {
 		t.Error("a garbage CRL must be ignored")
+	}
+}
+
+func TestCRLChecker_EnforcesEverySignedBundleMember(t *testing.T) {
+	caPath, caKey, dir := setupCA(t)
+	first := crlFor(t, caPath, caKey, "aaaa")
+	second := crlFor(t, caPath, caKey, "bbbb")
+	if _, _, err := InstallCRLs(dir, [][]byte{first, second}); err != nil {
+		t.Fatalf("InstallCRLs: %v", err)
+	}
+	caPEM, err := os.ReadFile(caPath)
+	if err != nil {
+		t.Fatalf("read CA: %v", err)
+	}
+	checker := newCRLChecker(dir, parseCACert(caPEM))
+	for _, serial := range []int64{0xaaaa, 0xbbbb} {
+		if !checker.isRevoked(big.NewInt(serial)) {
+			t.Fatalf("mTLS checker omitted serial %x from a signed bundle member", serial)
+		}
 	}
 }
 

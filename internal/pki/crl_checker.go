@@ -19,11 +19,11 @@ import (
 // Fail-safe policy (deliberate, for cluster availability):
 //   - no CRL file              → nothing revoked (allow);
 //   - CRL present, bad/forged signature, or unparseable
-//                              → IGNORE it (log loudly, allow). We never enforce
-//                                revocation from a CRL not signed by our CA, and
-//                                a corrupt CRL must never partition the cluster.
+//     → IGNORE it (log loudly, allow). We never enforce
+//     revocation from a CRL not signed by our CA, and
+//     a corrupt CRL must never partition the cluster.
 //   - CRL present, valid CA signature
-//                              → enforce its revoked-serial set.
+//     → enforce its revoked-serial set.
 //
 // An attacker who could write a forged CRL into pkiDir already has root there
 // (game over); the verification's real job is to make sure a corrupt/garbage
@@ -78,26 +78,23 @@ func (c *crlChecker) refreshLocked() {
 		slog.Error("CRL unreadable — not enforcing revocation", "path", c.crlPath, "error", err)
 		return
 	}
-	block, _ := pem.Decode(data)
-	if block == nil {
-		slog.Error("CRL has no PEM block — not enforcing revocation", "path", c.crlPath)
-		return
-	}
-	crl, err := x509.ParseRevocationList(block.Bytes)
+	crls, err := parseCRLs(data)
 	if err != nil {
 		slog.Error("CRL parse failed — not enforcing revocation", "path", c.crlPath, "error", err)
 		return
 	}
-	if c.caCert != nil {
-		if err := crl.CheckSignatureFrom(c.caCert); err != nil {
-			slog.Error("CRL signature does NOT verify against the cluster CA — IGNORING this CRL (revocations not enforced)",
-				"path", c.crlPath, "error", err)
-			return
+	m := make(map[string]bool)
+	for _, crl := range crls {
+		if c.caCert != nil {
+			if err := crl.CheckSignatureFrom(c.caCert); err != nil {
+				slog.Error("CRL signature does NOT verify against the cluster CA — IGNORING this CRL bundle (revocations not enforced)",
+					"path", c.crlPath, "error", err)
+				return
+			}
 		}
-	}
-	m := make(map[string]bool, len(crl.RevokedCertificateEntries))
-	for _, e := range crl.RevokedCertificateEntries {
-		m[e.SerialNumber.Text(16)] = true
+		for _, e := range crl.RevokedCertificateEntries {
+			m[e.SerialNumber.Text(16)] = true
+		}
 	}
 	c.revoked = m
 	// Debug, not Info. A checker is built per TLS config and a peer dial builds one

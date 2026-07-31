@@ -116,7 +116,7 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		// whole output and wrong for the far more common cases — an operator scanning
 		// the first line, or a CI job grepping for "intact".
 		switch {
-		case len(resp.NeverAdopted) > 0:
+		case resp.Unverified:
 			fmt.Fprintf(w, "audit chain NOT FULLY VERIFIED: %d rows checked", resp.RowsChecked)
 			if resp.UnsignedRows > 0 {
 				fmt.Fprintf(w, " (%d predate tamper-evidence and are chain-checked only)", resp.UnsignedRows)
@@ -138,11 +138,15 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 			fmt.Fprintf(w, "  note: %d signed rows could not be checked (no keyring available to this daemon)\n",
 				resp.UnverifiableRows)
 		}
-		if len(resp.NeverAdopted) == 0 {
+		if !resp.Unverified {
 			return nil
 		}
 
 		fmt.Fprintf(w, "\nPART OF THIS LOG COULD NOT BE VERIFIED\n")
+		if len(resp.NeverAdopted) == 0 {
+			fmt.Fprintln(w, "\nthe daemon reported an unverified audit condition; inspect its logs and health findings")
+			return fmt.Errorf("audit chain verification incomplete")
+		}
 		fmt.Fprintf(w, "\nhosts declaring signed rows that cannot sign:\n")
 		for _, h := range resp.NeverAdopted {
 			fmt.Fprintf(w, "  %s\n", h)

@@ -1,13 +1,41 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+type hostRemoveTestClient struct {
+	pb.LiteVirtClient
+	publishErr error
+	calls      []string
+}
+
+func (c *hostRemoveTestClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
+	return &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-9", CertSerial: "a1b2c3"}}}, nil
+}
+
+func (c *hostRemoveTestClient) PublishCRL(context.Context, *pb.PublishCRLRequest, ...grpc.CallOption) (*pb.PublishCRLResponse, error) {
+	c.calls = append(c.calls, "publish")
+	if c.publishErr != nil {
+		return nil, c.publishErr
+	}
+	return &pb.PublishCRLResponse{Version: 47}, nil
+}
+
+func (c *hostRemoveTestClient) RemoveHost(context.Context, *pb.RemoveHostRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
+	c.calls = append(c.calls, "remove")
+	return &emptypb.Empty{}, nil
+}
 
 // Removing a host tombstones its row and nothing else. The certificate it holds
 // still chains to the cluster CA, so peer trust — which now falls back to the
@@ -54,6 +82,44 @@ func TestRevokeHostCert_AddsTheSerialToTheCRL(t *testing.T) {
 	}
 }
 
+func TestHostRemove_DoesNotTombstoneBeforeRevocationPublishes(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("LV_CONFIG_DIR", configDir)
+	pkiDir := filepath.Join(configDir, "pki")
+	if err := os.MkdirAll(pkiDir, 0o700); err != nil {
+		t.Fatalf("mkdir pki: %v", err)
+	}
+	if err := pki.GenerateCA(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")); err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	client := &hostRemoveTestClient{publishErr: errors.New("cluster unavailable")}
+	if err := HostRemove(context.Background(), client, "node-9", false); err == nil {
+		t.Fatal("publish failure reported a successful removal")
+	}
+	if got := strings.Join(client.calls, ","); got != "publish" {
+		t.Fatalf("calls = %q, want publish only; RemoveHost ran before revocation was durable", got)
+	}
+}
+
+func TestHostRemove_PublishesBeforeTombstoning(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("LV_CONFIG_DIR", configDir)
+	pkiDir := filepath.Join(configDir, "pki")
+	if err := os.MkdirAll(pkiDir, 0o700); err != nil {
+		t.Fatalf("mkdir pki: %v", err)
+	}
+	if err := pki.GenerateCA(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")); err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	client := &hostRemoveTestClient{}
+	if err := HostRemove(context.Background(), client, "node-9", false); err != nil {
+		t.Fatalf("HostRemove: %v", err)
+	}
+	if got := strings.Join(client.calls, ","); got != "publish,remove" {
+		t.Fatalf("calls = %q, want publish,remove", got)
+	}
+}
+
 // TestRevokeHostCert_WithoutTheCAKeySaysSo — `lv host rm` may be run from a node
 // that holds no CA private key. That cannot silently skip revocation.
 func TestRevokeHostCert_WithoutTheCAKeySaysSo(t *testing.T) {
@@ -76,16 +142,14 @@ func TestRevokeHostCert_WithoutTheCAKeySaysSo(t *testing.T) {
 	}
 }
 
-// TestRevokeHostCert_NoSerialIsNotAnError — a host record with no cert serial
-// (pre-v45 rows carry "unknown") must not turn a successful removal into a failure.
-func TestRevokeHostCert_NoSerialIsNotAnError(t *testing.T) {
+func TestRevokeHostCert_NoSerialRefusesAnUnrevokableRemoval(t *testing.T) {
 	dir := t.TempDir()
 	if err := pki.GenerateCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")); err != nil {
 		t.Fatalf("GenerateCA: %v", err)
 	}
 	for _, serial := range []string{"", "unknown"} {
-		if err := revokeHostCert(dir, "node-9", serial); err != nil {
-			t.Errorf("serial %q should be skipped, not fail the removal: %v", serial, err)
+		if err := revokeHostCert(dir, "node-9", serial); err == nil {
+			t.Errorf("serial %q allowed a removal whose certificate cannot be revoked", serial)
 		}
 	}
 }

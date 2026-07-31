@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,45 +35,30 @@ import (
 // the cluster CA's private key, which lives with the operator and never on a
 // daemon. So this command produces the CRL and PublishCRL hands it to the cluster.
 func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force bool) error {
-	// Read the serial BEFORE the removal: afterwards the row is tombstoned and
-	// ListHosts no longer returns it.
-	serial := hostCertSerial(ctx, c, hostName)
-
-	if _, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Force: force}); err != nil {
-		return fmt.Errorf("remove host: %w", err)
+	// Read and revoke BEFORE the tombstone. Once RemoveHost succeeds, ListHosts
+	// deliberately hides the row and there is no supported way to recover its
+	// certificate serial. A mint or publish failure must therefore leave the row
+	// intact so the operator can repair the cause and retry this command.
+	serial, err := hostCertSerial(ctx, c, hostName)
+	if err != nil {
+		return fmt.Errorf("read %s's certificate serial before removal: %w", hostName, err)
 	}
-	fmt.Printf("Host %s removed from cluster.\n", hostName)
 
-	// Revocation is reported, never silently skipped. It needs the CA private key,
-	// which lives in the operator's config directory — so running `lv host rm` from
-	// a node that does not hold it leaves the tombstone as the only mechanism, and
-	// the operator has to know that.
 	if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
-		fmt.Printf("  WARNING: %s's certificate was NOT revoked: %v\n", hostName, err)
-		fmt.Println("  its certificate still chains to the cluster CA, so removal now rests")
-		fmt.Println("  entirely on the tombstone reaching every node. Re-run this from the")
-		fmt.Println("  machine holding ca.key, or distribute an updated crl.pem by hand")
-		return nil
+		return fmt.Errorf("refusing to remove %s before its certificate is revoked: %w", hostName, err)
 	}
-	if serial == "" || serial == "unknown" {
-		return nil
-	}
-	fmt.Printf("  revoked certificate %s\n", serial)
 
-	// Publishing is reported separately from revoking. They fail for unrelated
-	// reasons — one needs the CA key, the other needs the cluster — and an operator
-	// who is told "revoked" when only half of that happened will not go looking.
 	version, err := publishClusterCRL(ctx, c, PKIDir())
 	if err != nil {
-		fmt.Printf("  WARNING: the revocation was NOT published to the cluster: %v\n", err)
-		fmt.Printf("  %s is correct on this machine and nowhere else.\n",
-			filepath.Join(PKIDir(), "crl.pem"))
-		fmt.Println("  Run `lv host publish-crl` from here once the cluster is reachable.")
-		fmt.Println("  Re-running `lv host rm` will NOT do it — the host row is gone by now, so")
-		fmt.Println("  the command has no serial to look up and stops before this step")
-		return nil
+		return fmt.Errorf("refusing to remove %s before its certificate revocation is published: %w",
+			hostName, err)
 	}
-	fmt.Printf("  published CRL %d to the cluster; each daemon installs it within a minute\n", version)
+
+	if _, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Force: force}); err != nil {
+		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
+	}
+	fmt.Printf("Host %s removed from cluster.\n", hostName)
+	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
 	fmt.Println("  `lv health` warns for as long as any peer's CRL version is behind another's")
 	return nil
 }
@@ -106,30 +90,26 @@ func publishClusterCRL(ctx context.Context, c pb.LiteVirtClient, pkiDir string) 
 
 // hostCertSerial reads a host's certificate serial, best-effort: a removal must not
 // be blocked by a lookup, and a missing serial only costs the revocation.
-func hostCertSerial(ctx context.Context, c pb.LiteVirtClient, hostName string) string {
+func hostCertSerial(ctx context.Context, c pb.LiteVirtClient, hostName string) (string, error) {
 	resp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
 	if err != nil {
-		slog.Warn("could not read the host's certificate serial; it cannot be revoked",
-			"host", hostName, "error", err)
-		return ""
+		return "", err
 	}
 	for _, h := range resp.Hosts {
 		if h.Name == hostName {
-			return h.CertSerial
+			if h.CertSerial == "" || strings.EqualFold(h.CertSerial, "unknown") {
+				return "", fmt.Errorf("host has no recorded certificate serial")
+			}
+			return h.CertSerial, nil
 		}
 	}
-	return ""
+	return "", fmt.Errorf("host is not present")
 }
 
 // revokeHostCert appends a removed host's certificate serial to the cluster CRL.
-//
-// An empty or "unknown" serial is skipped rather than treated as an error — a host
-// record written before certificate serials were recorded carries "unknown", and
-// that must not turn a successful removal into a failure.
 func revokeHostCert(pkiDir, hostName, serial string) error {
 	if serial == "" || strings.EqualFold(serial, "unknown") {
-		slog.Warn("host has no recorded certificate serial; nothing to revoke", "host", hostName)
-		return nil
+		return fmt.Errorf("host %s has no recorded certificate serial", hostName)
 	}
 	caCert := filepath.Join(pkiDir, "ca.crt")
 	caKey := filepath.Join(pkiDir, "ca.key")

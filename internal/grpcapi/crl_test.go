@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -83,5 +84,20 @@ func TestPublishCRL_RejectsAnEmptySubmission(t *testing.T) {
 	}
 	if n := publishedCRLCount(t, s); n != 0 {
 		t.Fatalf("an empty submission produced %d rows in cluster_crl", n)
+	}
+}
+
+func TestPublishCRL_RepairsACorruptLocalCRLFromPublishedState(t *testing.T) {
+	s := testServer(t)
+	s.pkiDir = t.TempDir()
+	crlPEM := mintCRL(t, s.pkiDir, "1a2b")
+	if err := os.WriteFile(filepath.Join(s.pkiDir, "crl.pem"), []byte("corrupt"), 0o600); err != nil {
+		t.Fatalf("write corrupt local CRL: %v", err)
+	}
+	if _, err := s.PublishCRL(adminCtx(), &pb.PublishCRLRequest{CrlPem: crlPEM}); err != nil {
+		t.Fatalf("PublishCRL recovery: %v", err)
+	}
+	if !pki.IsCertRevoked(s.pkiDir, big.NewInt(0x1a2b)) {
+		t.Fatal("published CRL did not repair and replace corrupt local state")
 	}
 }

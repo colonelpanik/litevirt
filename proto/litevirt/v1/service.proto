@@ -1771,6 +1771,12 @@ message ExecuteCreateVMRequest {
 
 // ═══════════ Service ═══════════
 
+message AdmitHostRequest {
+    string name = 1;
+    string address = 2;
+    string cert_serial = 3;
+}
+
 service LiteVirt {
     // ── Hosts ──
     rpc ListHosts(ListHostsRequest)           returns (ListHostsResponse);
@@ -1782,6 +1788,7 @@ service LiteVirt {
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetHostHealth(google.protobuf.Empty)   returns (HostHealthMatrix);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
+    rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
     // PublishCRL hands the cluster a CA-signed certificate revocation list, which
     // replication then carries to every node. `lv host rm` calls it after revoking
     // the removed host's certificate — revocation needs the CA private key, which

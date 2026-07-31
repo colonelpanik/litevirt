@@ -29,7 +29,7 @@ func (s *Server) PublishCRL(ctx context.Context, req *pb.PublishCRLRequest) (*pb
 	if req.CrlPem == "" {
 		return nil, status.Error(codes.InvalidArgument, "no CRL supplied")
 	}
-	version, installed, err := pki.InstallCRL(s.pkiDir, []byte(req.CrlPem))
+	version, err := pki.VerifiedCRLNumber(s.pkiDir, []byte(req.CrlPem))
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "refusing this CRL: %v", err)
 	}
@@ -39,6 +39,13 @@ func (s *Server) PublishCRL(ctx context.Context, req *pb.PublishCRLRequest) (*pb
 	if err := corrosion.PublishCRL(ctx, s.db, req.CrlPem); err != nil {
 		return nil, status.Errorf(codes.Internal, "publish CRL to the cluster: %v", err)
 	}
+	installedVersion, err := corrosion.SyncClusterCRL(ctx, s.db, s.pkiDir)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"CRL was published but could not be installed locally; retry after repairing the PKI directory: %v",
+			err)
+	}
+	installed := installedVersion != 0
 	slog.Warn("cluster CRL published", "version", version, "installed_locally", installed)
 	s.publish("cluster.crl.published", "", fmt.Sprintf("version=%d", version))
 	return &pb.PublishCRLResponse{Version: version}, nil

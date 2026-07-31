@@ -61,7 +61,8 @@ lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host>                    # Return host to scheduling
-lv host rm <host> [--force]               # Remove host (--force with running VMs)
+lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
+lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host fence <host> --confirmed          # Manually fence a host (real fence)
 lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence host
 lv host rescan [host]                     # Rescan PCI devices

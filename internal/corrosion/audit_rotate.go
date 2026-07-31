@@ -564,8 +564,19 @@ func reduceLifecycle(rows []lifecycleRow) map[lifecycleKey]map[string]int64 {
 			// the daemon performing it has no access to the CA. Ordered by first
 			// adoption, which is strictly increasing per host (AdoptAuditKey refuses to
 			// tie), so a predecessor can never turn around and retire its successor.
+			//
+			// The SUBJECT's adoption has to be looked up, not indexed. Reading
+			// firstAdopted[lk] directly gave 0 for a key that never adopted, and the
+			// test then reduced to signerAdopted <= 0 — true for nothing, so any adopted
+			// key of the host could retire a never-adopted one. That is precisely the
+			// key `never adopted` exists to report, and a leaked predecessor could make
+			// the report disappear: a retired key is skipped before adoption is ever
+			// considered, so the host went back to reading clean. Succession is a
+			// relation between two ADOPTED keys; a key with no adoption has no
+			// predecessor, and only itself or the CA may speak for it.
 			signerAdopted, ok := firstAdopted[lifecycleKey{host: r.host, keyID: r.byKeyID}]
-			if r.event != auditLifecycleRetired || !ok || signerAdopted <= firstAdopted[lk] {
+			subjectAdopted, subjectOK := firstAdopted[lk]
+			if r.event != auditLifecycleRetired || !ok || !subjectOK || signerAdopted <= subjectAdopted {
 				slog.Warn("ignoring an audit key lifecycle record whose signer has no standing "+
 					"over the key it names; only the key itself, a later-adopted key of the same "+
 					"host, or the cluster CA may speak for it",

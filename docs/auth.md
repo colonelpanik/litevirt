@@ -322,6 +322,12 @@ is append-only and keyed by that number, so an unsignable row cannot displace or
 bury a genuine one. `lv health` warns for as long as any peer's CRL version
 is behind another's.
 
+If publishing fails — the cluster was unreachable, the daemon was restarting — the
+certificate is still revoked locally and only locally. Run `lv host publish-crl`
+from that machine once the cluster is back. Re-running `lv host rm` does **not**
+work: the host row is already tombstoned, so the command has no serial to look up
+and stops before the publish step.
+
 Distribution deliberately does **not** go over SSH. SSH is the bootstrap channel —
 `host init`, `host add`, `rotate-audit-key` — for reaching a machine that is not
 yet a cluster member. A revocation goes to nodes that are already mutually

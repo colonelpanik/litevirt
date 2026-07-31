@@ -136,3 +136,30 @@ func TestAuditVerifyNeverAdoptedFailsWithoutClaimingTampering(t *testing.T) {
 		t.Errorf("output does not say how to clear it: %q", got)
 	}
 }
+
+// The headline must state the outcome. The unverified path used to print
+// "audit chain intact ... all signed" first and contradict itself four lines
+// later, so the first line of a run that exits 1 read as a pass — which is what
+// an operator scanning output and a CI job grepping for "intact" both see.
+func TestAuditVerifyUnverifiedHeadlineDoesNotSayIntact(t *testing.T) {
+	var out strings.Builder
+	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
+		RowsChecked:  12,
+		UnsignedRows: 12,
+		NeverAdopted: []string{"node-4: published a signing certificate but never adopted"},
+	})
+	if err == nil {
+		t.Fatal("the unverified outcome exited 0")
+	}
+	first, _, _ := strings.Cut(out.String(), "\n")
+	if strings.Contains(first, "intact") {
+		t.Errorf("the first line of a failing run reads as a pass: %q", first)
+	}
+	if !strings.Contains(first, "NOT FULLY VERIFIED") {
+		t.Errorf("the headline does not state the outcome: %q", first)
+	}
+	// The unsigned count still has to be visible — it is the context for the rest.
+	if !strings.Contains(out.String(), "12 predate tamper-evidence") {
+		t.Errorf("the unsigned count was dropped from the unverified path: %q", out.String())
+	}
+}

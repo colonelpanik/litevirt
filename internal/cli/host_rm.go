@@ -67,13 +67,27 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	version, err := publishClusterCRL(ctx, c, PKIDir())
 	if err != nil {
 		fmt.Printf("  WARNING: the revocation was NOT published to the cluster: %v\n", err)
-		fmt.Printf("  %s is correct on this machine and nowhere else. Re-run `lv host rm %s`\n",
-			filepath.Join(PKIDir(), "crl.pem"), hostName)
-		fmt.Println("  once the cluster is reachable — revoking an already-revoked serial is a no-op")
+		fmt.Printf("  %s is correct on this machine and nowhere else.\n",
+			filepath.Join(PKIDir(), "crl.pem"))
+		fmt.Println("  Run `lv host publish-crl` from here once the cluster is reachable.")
+		fmt.Println("  Re-running `lv host rm` will NOT do it — the host row is gone by now, so")
+		fmt.Println("  the command has no serial to look up and stops before this step")
 		return nil
 	}
 	fmt.Printf("  published CRL %d to the cluster; each daemon installs it within a minute\n", version)
 	fmt.Println("  `lv health` warns for as long as any peer's CRL version is behind another's")
+	return nil
+}
+
+// PublishClusterCRL hands this machine's CRL to the cluster, for `lv host
+// publish-crl` — the recovery path when the publish inside `lv host rm` failed.
+func PublishClusterCRL(ctx context.Context, c pb.LiteVirtClient) error {
+	version, err := publishClusterCRL(ctx, c, PKIDir())
+	if err != nil {
+		return fmt.Errorf("publish %s to the cluster: %w", filepath.Join(PKIDir(), "crl.pem"), err)
+	}
+	fmt.Printf("Published CRL %d to the cluster; each daemon installs it within a minute.\n", version)
+	fmt.Println("`lv health` warns for as long as any peer's CRL version is behind another's")
 	return nil
 }
 

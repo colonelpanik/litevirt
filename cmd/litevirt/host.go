@@ -39,6 +39,7 @@ func newHostCmd() *cobra.Command {
 		newHostCephCmd(),
 		newHostRotateAuditKeyCmd(),
 		newHostRetireAuditKeyCmd(),
+		newHostPublishCRLCmd(),
 	)
 
 	return cmd
@@ -263,6 +264,34 @@ func newHostUndrainCmd() *cobra.Command {
 				}
 				fmt.Printf("Host %s is now %s.\n", h.Name, h.State)
 				return nil
+			})
+		},
+	}
+}
+
+// newHostPublishCRLCmd exists because `lv host rm` can revoke a certificate and
+// then fail to publish it — the cluster is unreachable, the daemon is restarting —
+// and the recovery it printed ("re-run lv host rm") could never work: by then the
+// host row is tombstoned, the serial lookup returns nothing, and the command
+// returns before it reaches the publish step. The revocation sat on one machine
+// with no supported way into the cluster.
+func newHostPublishCRLCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "publish-crl",
+		Short: "Publish this machine's certificate revocation list to the cluster",
+		Long: `Hand the local crl.pem to the cluster, which replicates it to every node.
+
+` + "`lv host rm`" + ` does this automatically. Run it by hand when that step failed —
+the removal and the revocation have already happened locally, and this is the part
+that did not reach the other nodes.
+
+Safe to repeat: a CRL the cluster already holds is stored under its own contents,
+so republishing it changes nothing. The daemon verifies it against the cluster CA
+before storing it, and refuses one that revokes less than the CRL already in force.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				return cli.PublishClusterCRL(ctx, c)
 			})
 		},
 	}

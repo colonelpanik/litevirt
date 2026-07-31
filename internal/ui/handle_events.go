@@ -124,6 +124,15 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	case resp.Tampered:
 		sendToast(w, "Audit chain TAMPERED: "+auditTamperSummary(resp)+
 			fmt.Sprintf(" (%d rows checked) — run `lv audit verify` for the affected rows", resp.RowsChecked), "error")
+	case resp.Unverified:
+		// The third outcome, and a warning rather than an error: part of the log
+		// could not be checked, which is not a pass and is not an accusation. It
+		// was briefly neither — when `never adopted` stopped counting as tampering
+		// this branch did not exist, so a host that had published a signing
+		// certificate and could not sign produced a GREEN "intact, all signed"
+		// toast here while `lv audit verify` exited 1 on the same result.
+		sendToast(w, fmt.Sprintf("Audit chain PARTLY UNVERIFIED (%d rows checked): %s — "+
+			"run `lv audit verify` for the detail", resp.RowsChecked, auditUnverifiedSummary(resp)), "warning")
 	case resp.UnsignedRows > 0:
 		// Deliberately "success", not a warning: unsigned rows are what every
 		// cluster looks like before signing was switched on, and colouring that
@@ -168,6 +177,24 @@ func auditTamperSummary(resp *pb.VerifyAuditChainResponse) string {
 	}
 	if len(parts) == 0 {
 		return "unspecified finding"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// auditUnverifiedSummary names what went unchecked. Kept separate from
+// auditTamperSummary rather than folded into it, because the two answer different
+// questions and merging them is how `never adopted` ended up being reported as
+// evidence of interference in the first place.
+func auditUnverifiedSummary(resp *pb.VerifyAuditChainResponse) string {
+	var parts []string
+	if n := len(resp.NeverAdopted); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d host(s) declaring signed rows they cannot sign", n))
+	}
+	if resp.UnverifiableRows > 0 {
+		parts = append(parts, fmt.Sprintf("%d signed row(s) this daemon has no keyring to check", resp.UnverifiableRows))
+	}
+	if len(parts) == 0 {
+		return "part of the log went unchecked"
 	}
 	return strings.Join(parts, "; ")
 }

@@ -110,7 +110,18 @@ func newAuditVerifyCmd() *cobra.Command {
 // fix. Failing on either would page somebody on a healthy cluster.
 func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 	if !resp.Tampered {
+		// The headline states the OUTCOME, so it must not say "intact" on a run that
+		// exits 1. It did: the unverified path printed the clean line first and
+		// contradicted itself four lines later, which is fine for someone reading the
+		// whole output and wrong for the far more common cases — an operator scanning
+		// the first line, or a CI job grepping for "intact".
 		switch {
+		case len(resp.NeverAdopted) > 0:
+			fmt.Fprintf(w, "audit chain NOT FULLY VERIFIED: %d rows checked", resp.RowsChecked)
+			if resp.UnsignedRows > 0 {
+				fmt.Fprintf(w, " (%d predate tamper-evidence and are chain-checked only)", resp.UnsignedRows)
+			}
+			fmt.Fprintln(w)
 		case resp.UnsignedRows > 0:
 			fmt.Fprintf(w, "audit chain intact: %d rows verified (%d predate tamper-evidence and are chain-checked only)\n",
 				resp.RowsChecked, resp.UnsignedRows)
@@ -131,7 +142,7 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 			return nil
 		}
 
-		fmt.Fprintf(w, "\nPART OF THIS LOG COULD NOT BE VERIFIED — this is not a clean result\n")
+		fmt.Fprintf(w, "\nPART OF THIS LOG COULD NOT BE VERIFIED\n")
 		fmt.Fprintf(w, "\nhosts declaring signed rows that cannot sign:\n")
 		for _, h := range resp.NeverAdopted {
 			fmt.Fprintf(w, "  %s\n", h)

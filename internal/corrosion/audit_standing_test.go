@@ -117,3 +117,50 @@ func TestLifecycle_AForgedCASignatureIsRejected(t *testing.T) {
 			"the reserved id must be checked against the CA certificate, not trusted")
 	}
 }
+
+// TestLifecycle_APredecessorCannotRetireANeverAdoptedKey.
+//
+// The standing rule compared the signer's adoption against firstAdopted[subject],
+// read straight out of the map — which yields 0 for a key that never adopted. The
+// test then reduced to "signerAdopted <= 0", true for nothing, so ANY adopted key
+// of the host could retire a never-adopted one.
+//
+// That is exactly the key `never adopted` exists to report: a certificate
+// published by a host that cannot sign. signingContracts skips a retired key
+// before it ever asks about adoption, so the holder of a leaked predecessor could
+// retire it and the finding would vanish — the host back to reading clean, which
+// is the outcome the whole verdict is arranged against. Clearing it is supposed to
+// take the CA and nothing else.
+func TestLifecycle_APredecessorCannotRetireANeverAdoptedKey(t *testing.T) {
+	rows := []lifecycleRow{
+		// The host's real key, adopted normally, later leaked.
+		{host: "node-1", keyID: "old", event: auditLifecycleAdopted, seq: 100, byKeyID: "old"},
+		// A certificate published with no adoption — the never-adopted case.
+		// (No adopted row for "new" at all.)
+		// What the holder of the leaked key tries.
+		{host: "node-1", keyID: "new", event: auditLifecycleRetired, seq: 0, byKeyID: "old"},
+	}
+	got := reduceLifecycle(rows)
+	if events := got[lifecycleKey{host: "node-1", keyID: "new"}]; len(events) > 0 {
+		t.Fatalf("a key that never adopted was retired by another key of the same host: %+v\n"+
+			"succession is a relation between two ADOPTED keys — a key with no adoption has no "+
+			"predecessor, and letting one exist erases the `never adopted` finding that this "+
+			"state is supposed to raise", events)
+	}
+}
+
+// The legitimate case must keep working: a successor retiring a predecessor that
+// DID adopt is an ordinary rotation.
+func TestLifecycle_ASuccessorStillRetiresAnAdoptedPredecessor(t *testing.T) {
+	rows := []lifecycleRow{
+		{host: "node-1", keyID: "old", event: auditLifecycleAdopted, seq: 100, byKeyID: "old"},
+		{host: "node-1", keyID: "new", event: auditLifecycleAdopted, seq: 200, byKeyID: "new"},
+		{host: "node-1", keyID: "old", event: auditLifecycleRetired, seq: 150, byKeyID: "new"},
+	}
+	got := reduceLifecycle(rows)
+	events := got[lifecycleKey{host: "node-1", keyID: "old"}]
+	if _, retired := events[auditLifecycleRetired]; !retired {
+		t.Fatalf("an ordinary rotation was refused: a successor could not retire its "+
+			"predecessor: %+v", events)
+	}
+}

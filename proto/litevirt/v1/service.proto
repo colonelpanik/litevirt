@@ -2446,6 +2446,17 @@ message VerifyAuditChainResponse {
     // were reported clean everywhere. A key that cannot be read is the state an
     // attacker arranges, which is why it must not be the quiet one.
     repeated string never_adopted = 16;
+    // True when part of the log could not be checked — the THIRD outcome,
+    // between intact and tampered.
+    //
+    // Every consumer needs this and none of them should re-derive it. When
+    // never_adopted stopped feeding `tampered` — it is inferred from a row any
+    // peer can write, so it cannot be evidence of interference — the CLI learned
+    // the new outcome and the web UI and the REST poller did not, and both went
+    // straight back to reporting a host that cannot sign as a clean chain. A
+    // verdict field that means "not a pass" has to travel with the verdict field
+    // that means "not tampering".
+    bool unverified = 17;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.

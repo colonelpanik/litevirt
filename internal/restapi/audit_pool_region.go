@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -33,6 +34,14 @@ func (s *Server) registerAuditPoolRegionRoutes() {
 
 // ── Audit chain ───────────────────────────────────────────────────────────────
 
+// handleAuditVerify returns the full verify result — hash break, signature
+// findings, sequence gaps and the `tampered` verdict alike.
+//
+// Unlike every other route it emits unpopulated fields. The shared marshaller
+// drops zero values, which for a monitoring poller means a clean chain and a
+// daemon too old to know about `tampered` produce byte-identical JSON: the
+// field is simply absent in both. For a tamper alarm that is the one ambiguity
+// that must not exist, so every field is always on the wire.
 func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, http.StatusMethodNotAllowed, "POST only")
@@ -43,7 +52,12 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
-	jsonProto(w, resp)
+	b, mErr := protojson.MarshalOptions{EmitUnpopulated: true, UseProtoNames: true}.Marshal(resp)
+	if mErr != nil {
+		jsonError(w, http.StatusInternalServerError, "marshal: "+mErr.Error())
+		return
+	}
+	_, _ = w.Write(b)
 }
 
 func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {

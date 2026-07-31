@@ -40,10 +40,10 @@ var assignRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 // knownAbsentIdentifiers lists litevirt_* identifiers that docs reference on
 // purpose even though they don't exist in code yet. Each must say why; remove
 // the entry when the identifier ships.
-var knownAbsentIdentifiers = map[string]string{
-	// docs/audit-log.md explicitly labels this metric "on the roadmap".
-	"litevirt_audit_chain_last_verified_ok": "roadmap — see docs/audit-log.md",
-}
+// Empty is the goal state: an allowlisted identifier is a doc promising
+// something the code does not do. litevirt_audit_chain_last_verified_ok was the
+// last entry and shipped with v45 audit signing.
+var knownAbsentIdentifiers = map[string]string{}
 
 // TestDocsReferenceRealCLICommands fails if README/docs show an `lv` or
 // `litevirt` command whose path doesn't resolve in the real cobra tree.
@@ -548,7 +548,9 @@ func TestCheckIdentifier(t *testing.T) {
 		{"litevirt_bar", false},
 		{"litevirt_foo_*", true},                        // glob prefix in prose
 		{"litevirt_label_", true},                       // trailing-underscore prefix
-		{"litevirt_audit_chain_last_verified_ok", true}, // allowlisted roadmap metric
+		// The allowlist is empty by design, so a name that is neither in the code
+		// nor a prefix form must be rejected — that is the whole point of the guard.
+		{"litevirt_audit_chain_last_verified_ok", false},
 	}
 	for _, tc := range cases {
 		got := checkIdentifier(tc.tok, code)

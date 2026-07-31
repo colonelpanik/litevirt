@@ -244,6 +244,31 @@ enforcement:
                               # fleet-wide — a peer still deciding locally would bypass the
                               # single decider entirely. Enable fleet-uniformly; the flag is the
                               # reversible kill switch.
+  audit_signature: false      # sign every audit row this host writes with its cluster key
+                              # (the same host.key that identifies it on the wire, under a
+                              # separate signing domain). The pre-v45 chain is an UNKEYED
+                              # hash: anyone who can write the database can edit a row,
+                              # recompute the hashes after it, and `lv audit verify` comes
+                              # back clean. A signature makes that require the host's private
+                              # key instead of just the algorithm, and any OTHER node can
+                              # check it — a compromised host can no longer certify its own
+                              # rewritten history. Setting this flag turns SIGNING on by
+                              # itself (signed rows are backward-compatible; old peers
+                              # replicate the new columns untouched). The token is advertised
+                              # only while the flag is on, and once it latches fleet-wide a
+                              # write this node cannot sign is logged as an error and still
+                              # RECORDED — dropping the row would lose the record of an
+                              # operation that happened, which is the outcome an attacker
+                              # would pick. It is caught instead by the verifier: while a
+                              # host's published signing certificate stands, an unsigned row
+                              # from it is reported as tampering on every node.
+                              # Turning the flag back OFF is a real rollback, not a silent
+                              # one: on the next start the daemon signs a retirement of its
+                              # own key at the sequence its chain had reached, so rows after
+                              # it are unsigned and expected. A host that cannot sign that
+                              # retirement keeps its contract — that is the case it exists
+                              # for — and `lv host retire-audit-key` closes it out from the
+                              # machine holding the cluster CA. Enable fleet-uniformly.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and
@@ -450,9 +475,23 @@ past a retention floor (`tombstone_gc_retention_hours` /
 `tombstone_gc_orphan_retention_hours` in the reference above); the count is exported
 as `litevirt_gc_rows_deleted_total` (labeled by `table`).
 
+The same hourly sweep retires admission authority still held by projects that no
+longer exist, and expires capacity leases abandoned by a crash between reserve and
+release. Both are reported in the journal when they find anything.
+
 The sweep is local-only and deterministic (each node prunes its own copy; it
 never touches a current-active-set or current-generation row), so it is safe on a
 live cluster.
+
+### Signals the daemon ignores
+
+The daemon deliberately does not terminate on `SIGHUP` or `SIGPIPE`, and does not
+treat `SIGHUP` as a config reload. systemd counts death by either as a *clean*
+exit, so a `SIGHUP` from `needrestart` or `unattended-upgrades` would leave the
+node down with the unit reporting success. Each ignored signal is logged and
+counted as `litevirt_signal_ignored_total` (labeled by `signal`) — a rising count
+means something on the host keeps trying to bounce the orchestrator, which is
+worth chasing even though the daemon now survives it.
 
 ## Capacity and overcommit
 
@@ -550,6 +589,7 @@ and the bypass is audited.
 | `LV_HOST` | CLI: default remote gRPC/mTLS target (`host` or `host:port`; a legacy `user@host` prefix is ignored) |
 | `LV_TOKEN` | CLI: bearer token to authenticate gRPC calls. Overrides the credential stored by `lv login`. |
 | `LITEVIRT_UNSAFE_NO_KILLMODE_CHECK` | Skip startup `KillMode=process` self-check (development / non-systemd hosts only). Default check protects against unit-file regressions that would kill child QEMU processes on daemon stop. |
+| `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK` | Skip the startup capability-rollback self-check. That check looks for durable activation markers naming tokens this binary has never heard of — proof a newer binary ran here — and puts the node under WAL quarantine: it stays up and reachable but emits no replicated writes and advertises no capabilities, so peers see it degraded and nothing new latches across it. Set this only after reseeding the node's state, or to start a rolled-back binary deliberately. |
 | `LITEVIRT_OTEL_ENDPOINT` | Telemetry: OTLP endpoint; turns logs+traces export on. Overrides `telemetry.otlp_endpoint`. |
 | `LITEVIRT_OTEL_HEADERS` | Telemetry: OTLP headers, e.g. `Authorization=Basic <b64>` (collector auth — keep in env, not the config file). |
 | `LITEVIRT_LOG_LEVEL` | Telemetry: log level `TRACE`\|`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`\|`CRITICAL`. |

@@ -1279,7 +1279,10 @@ func (m *mockGRPC) VerifyAuditChain(context.Context, *emptypb.Empty, ...grpc.Cal
 	if m.verifyAuditResp != nil {
 		return m.verifyAuditResp, nil
 	}
-	return &pb.VerifyAuditChainResponse{}, nil
+	// Default is a clean, fully-signed chain; a test wanting a finding sets
+	// verifyAuditResp — and must set Tampered, which is the field the toast
+	// branches on, not BrokenAtId.
+	return &pb.VerifyAuditChainResponse{RowsChecked: 3, Tampered: false}, nil
 }
 func (m *mockGRPC) ExportAuditChain(_ context.Context, in *pb.ExportAuditChainRequest, _ ...grpc.CallOption) (*pb.ExportAuditChainResponse, error) {
 	m.lastExportReq = in

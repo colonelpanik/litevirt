@@ -101,6 +101,31 @@ func (s *Server) autoDefineRestoredVM(
 			"domain %q already defined; pass --name to restore alongside it", targetName)
 	}
 
+	// Capacity + quota admission. A live-restore reconstructs a full-sized VM from
+	// a manifest and BOOTS it, so it consumes exactly what CreateVM of the same
+	// spec would — and nothing admitted it. Backup data is the one input an
+	// operator can replay at will, which made this the cheapest way to overfill a
+	// host or walk a project past its quota while every other create path refused
+	// correctly.
+	//
+	// FULL admission (quota included, unlike a migrate or a start): this is a NEW
+	// allocation the project does not yet carry — the row written below is a VM
+	// that did not exist a moment ago, even when it restores alongside a still-
+	// running original. resourceID names it so a DELEGATED quota holder can tell
+	// the admission it granted has landed, instead of guessing from a clock.
+	//
+	// Placed after the name-collision guard and before materializeFirmwareBundle /
+	// DefineDomain, so a refusal costs no disk I/O and defines nothing. The lease
+	// is released when this function returns — i.e. after InsertVMWithHardware
+	// below, so the provisional reservation is only dropped once the VM's own row
+	// accounts for the same capacity.
+	lease, aerr := s.admitWithReservation(
+		ctx, "RestoreLive", s.hostName, project, "vm:"+targetName, int(spec.Cpu), int(spec.MemoryMib))
+	if aerr != nil {
+		return "", "", aerr
+	}
+	defer lease.release(ctx)
+
 	renamed := targetName != originalName
 	spec.Name = targetName
 	// Force the restored VM into the authorized restore project — never let it

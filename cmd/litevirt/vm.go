@@ -22,6 +22,7 @@ func newRunCmd() *cobra.Command {
 		image        string
 		disk         string
 		host         string
+		project      string
 		onboot       bool
 		startupOrder int32
 		startDelay   int32
@@ -42,6 +43,7 @@ func newRunCmd() *cobra.Command {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				spec := &pb.VMSpec{
 					Name:          name,
+					Project:       project,
 					Image:         image,
 					Cpu:           cpu,
 					MemoryMib:     memory,
@@ -90,6 +92,7 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&image, "image", "", "Base image name")
 	cmd.Flags().StringVar(&disk, "disk", "20G", "Root disk size")
 	cmd.Flags().StringVar(&host, "host", "", "Target host")
+	cmd.Flags().StringVar(&project, "project", "", "Tenancy project to create the VM in (default: _default); its quota is charged")
 	cmd.Flags().BoolVar(&onboot, "onboot", false, "Start this VM automatically when its host boots")
 	cmd.Flags().Int32Var(&startupOrder, "startup-order", 0, "Autostart order (lower starts first)")
 	cmd.Flags().Int32Var(&startDelay, "start-delay", 0, "Seconds to wait after starting this VM before the next")

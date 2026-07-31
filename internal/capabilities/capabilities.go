@@ -213,6 +213,28 @@ const (
 	// A holder that cannot be reached fails the admission CLOSED (the repo-wide partition
 	// rule). Default-off, and the flag is the reversible kill switch.
 	ProjectAuthorityV1 = "project_authority_v1"
+	// AuditSignatureV1 gates the REFUSAL half of tamper-evident audit logging (v45:
+	// audit_log.key_id/signature/seq, signed with the host's existing cluster key).
+	// It does NOT gate signing: a signed row is backward-compatible — an old peer
+	// ignores the new columns and replicates them intact, and a nil keyring reads as
+	// "unsigned" rather than "broken" — so a node signs whenever
+	// enforcement.audit_signature is on, latch or no latch.
+	//
+	// What needs a latch is the failure mode on the other side: a node that cannot
+	// sign (no host key, keyring load failure) writing the audit row anyway. That row
+	// is indistinguishable from one an attacker with database write access appended
+	// after stripping key_id/signature — and if unsigned rows are a normal, expected
+	// outcome, `lv audit verify` cannot call them a forgery. Once this token is
+	// enforced the unsignable write REFUSES instead, so "unsigned" stops being a
+	// legitimate state and starts being evidence.
+	//
+	// Advertised CONDITIONALLY on the local config flag, like OperationProtocolV1: a
+	// node with the flag off still emits unsigned rows into the same cluster-wide
+	// table, and a chain containing them proves nothing about the hosts that DID
+	// sign. So the latch must require CONFIG uniformity, not just a uniform build —
+	// enabling on one node changes nothing until every node has opted in. Default-off,
+	// and the flag is the reversible kill switch (off → sign nothing, refuse nothing).
+	AuditSignatureV1 = "audit_signature_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -302,12 +324,13 @@ var supported = []string{
 	CanonicalRegistryV1,
 	HardwareV2,
 	ProjectAuthorityV1,
+	AuditSignatureV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

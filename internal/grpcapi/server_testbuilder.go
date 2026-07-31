@@ -1,8 +1,12 @@
 package grpcapi
 
 import (
+	"context"
 	"sync"
 
+	"google.golang.org/grpc"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/image"
@@ -34,6 +38,13 @@ func (s *Server) ImagePathForTests(imageName string) string {
 		return ""
 	}
 	return s.images.ImagePath(imageName)
+}
+
+// PeerClientForTests exposes peerClient so the fleet harness can assert on peer
+// DIALLING, not just on peer acceptance. The two halves were fixed at different
+// times and only the inbound one had coverage.
+func (s *Server) PeerClientForTests(ctx context.Context, hostName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
+	return s.peerClient(ctx, hostName)
 }
 
 // NewServerForTests is the in-process-fleet construction entry point.

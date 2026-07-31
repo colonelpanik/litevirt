@@ -123,6 +123,14 @@ type Server struct {
 	// its own replica would bypass the single decider entirely, so serializing against
 	// one is worthless until every node has opted in.
 	enfProjectAuthority bool
+	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
+	// It alone turns SIGNING on (a signed row is backward-compatible, so nothing has
+	// to wait); combined with the AuditSignatureV1 latch it also makes an UNSIGNABLE
+	// audit write refuse rather than land unsigned. Advertised CONDITIONALLY on the
+	// flag (like operation_protocol): a peer with it off keeps writing unsigned rows,
+	// which are exactly what a forgery looks like, so the latch must require config
+	// uniformity.
+	enfAuditSignature bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -356,6 +364,8 @@ type Server struct {
 	// advertisedCapabilities before the daemon wires this in, so the read must not race the
 	// write. Unset (nil) → never fenced.
 	watchdogFenced atomic.Pointer[func() bool]
+	// walQuarantined reports a rollback below an already-latched capability token.
+	walQuarantined atomic.Pointer[func() bool]
 
 	// hwV2Ready is the CONTRACT h advertise-readiness flag: set at the END of a
 	// successful BackfillHardwareTables, once the audit pass has classified every
@@ -376,6 +386,20 @@ func (s *Server) SetDemotionUnfenced(on bool) { s.demotionUnfenced.Store(on) }
 // SetWatchdogFenced injects the self-fenced predicate (Phase 2 defense-in-depth).
 func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced.Store(&fn) }
 
+// SetWALQuarantined injects the predicate reporting that this node is under WAL
+// quarantine — it is running a binary rolled back below a capability token it had
+// already latched, so it emits no replicated writes. Nil-safe: unset ⇒ not
+// quarantined, which is every healthy node.
+func (s *Server) SetWALQuarantined(fn func() bool) { s.walQuarantined.Store(&fn) }
+
+// walQuarantinedNow reports whether this node is currently WAL-quarantined.
+func (s *Server) walQuarantinedNow() bool {
+	if fn := s.walQuarantined.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return false
+}
+
 // advertisedCapabilities is Supported() as-is — vip_demote_v1 is a SOFTWARE capability
 // advertised by every new-binary node regardless of any hardware watchdog (the decouple:
 // self-demotion runs without one; the watchdog is only an optional self-fence backstop).
@@ -395,6 +419,15 @@ func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced.Store(&fn)
 // fence proof, never on the token, and peers already latched keep enforcing regardless.
 func (s *Server) advertisedCapabilities() []string {
 	if s.selfFenced() {
+		return []string{}
+	}
+	// A WAL-quarantined node is a rollback below something this cluster already
+	// latched. It advertises NOTHING, for the same reason a self-fenced node does:
+	// presenting as a healthy participant would let the cluster latch further
+	// tokens across a member that cannot honour them. Peers see the gap and raise
+	// ha_degraded; every peer already latched keeps enforcing, because the latch is
+	// monotone. That is exactly the bounded state this is meant to produce.
+	if s.walQuarantinedNow() {
 		return []string{}
 	}
 	caps := capabilities.Supported()
@@ -426,6 +459,14 @@ func (s *Server) advertisedCapabilities() []string {
 	// the latch must require CONFIG uniformity, not just a uniform build.
 	if !s.enfProjectAuthority {
 		caps = withoutCapability(caps, capabilities.ProjectAuthorityV1)
+	}
+	// audit_signature_v1 is likewise advertised CONDITIONALLY on its config flag. A
+	// node with the flag off writes unsigned audit rows into the same replicated
+	// table, and an unsigned row is precisely the shape a forgery takes — so no node
+	// may start REFUSING unsignable writes (and treating "unsigned" as evidence)
+	// until every node has opted in. Config uniformity, not just a uniform build.
+	if !s.enfAuditSignature {
+		caps = withoutCapability(caps, capabilities.AuditSignatureV1)
 	}
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
@@ -565,12 +606,23 @@ func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry =
 // ProjectAuthorityV1 cluster-wide latch; advertisement is withheld while it is off.
 func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = on }
 
+// SetAuditSignatureEnforce sets this node's kill-switch for tamper-evident audit
+// logging (enforcement.audit_signature). This flag alone enables SIGNING; refusing
+// an unsignable audit write additionally requires the AuditSignatureV1 latch, and
+// advertisement is withheld while the flag is off.
+func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
+
 // projectAuthorityActive reports whether this node routes project-quota admissions
 // through the project's authority holder: the config flag AND the cluster-wide latch.
 // Same `flag && Enforced` model as the rest of the family.
 func (s *Server) projectAuthorityActive(ctx context.Context) bool {
 	return s.enfProjectAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectAuthorityV1)
 }
+
+// The audit-signature latch is consulted on the corrosion client (see
+// SetAuditSignatureRequired in daemon.go), not here. It used to have a mirror
+// predicate on the server that nothing ever called — a gate for a refusal that
+// the write path had already stopped performing.
 
 // liveResizeActive reports whether this node may originate live-resize behavior
 // (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
@@ -619,6 +671,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfCanonicalRegistry
 	case capabilities.ProjectAuthorityV1:
 		return s.enfProjectAuthority
+	case capabilities.AuditSignatureV1:
+		return s.enfAuditSignature
 	default:
 		return false
 	}
@@ -1205,21 +1259,26 @@ func (s *Server) dialPeerAddr(target string) (*grpc.ClientConn, error) {
 // peerClient creates a gRPC client connection to a remote host's daemon.
 // The caller must close the returned connection when done.
 func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
-	host, err := corrosion.GetHost(ctx, s.db, hostName)
+	// corrosion.ResolvePeerTarget, not a GetHost here: it falls back to the gossip
+	// membership address for a peer whose hosts row has not replicated yet, and this
+	// used to fail closed on exactly that. Peer TRUST was taught to accept such a
+	// peer without peer DIALLING being taught to reach one, so on a freshly
+	// provisioned cluster every outbound grpcapi peer RPC failed with "not found in
+	// cluster state" — self-upgrade pings, cluster-state digest fanout, anti-entropy
+	// triggers, backup sink pushes, console forwarding. The replicator was never
+	// affected because it already used this resolver.
+	//
+	// It still errors for a name in neither cluster state nor gossip: the fallback is
+	// to membership, not to guesswork, and grpc.NewClient would otherwise not reject
+	// an empty address until the first RPC — console and VNC forwarders need the
+	// reason now, not later.
+	target, err := corrosion.ResolvePeerTarget(ctx, s.db, hostName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("look up host %q: %w", hostName, err)
-	}
-	if host == nil {
-		return nil, nil, fmt.Errorf("host %q not found in cluster state", hostName)
-	}
-	if host.Address == "" {
-		// grpc.NewClient won't reject this until first RPC; fail fast with a
-		// clear reason so console/VNC forwarders can report it to the user.
-		return nil, nil, fmt.Errorf("host %q has no address in cluster state", hostName)
+		return nil, nil, err
 	}
 	// dialPeer always attaches obs trace-context options (injects W3C trace context
 	// on the outbound peer RPC when tracing is active; nil otherwise).
-	conn, err := s.dialPeerAddr(peerTarget(host.Address, host.GRPCPort))
+	conn, err := s.dialPeerAddr(target)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial host %s: %w", hostName, err)
 	}

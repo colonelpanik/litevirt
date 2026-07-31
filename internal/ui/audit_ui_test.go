@@ -32,13 +32,50 @@ func TestAuditVerify_Intact(t *testing.T) {
 
 func TestAuditVerify_Broken(t *testing.T) {
 	mock := newDefaultMock()
-	mock.verifyAuditResp = &pb.VerifyAuditChainResponse{RowsChecked: 10, BrokenAtId: "row-77"}
+	// Tampered is what the server sets alongside a break; the toast branches on
+	// it rather than re-deriving the rule from the individual findings.
+	mock.verifyAuditResp = &pb.VerifyAuditChainResponse{
+		RowsChecked: 10, BrokenAtId: "row-77", Tampered: true,
+	}
 	s := newTestUIServer(t, mock)
 	w := serveRequest(s, withAuth(mustReq(t, "POST", "/ui/audit/verify")))
 	assertStatus(t, w, http.StatusOK)
-	assertToast(t, w, "broken")
+	assertToast(t, w, "TAMPERED")
 	assertToast(t, w, "row-77")
 	assertToast(t, w, "error")
+}
+
+// A signature finding must name itself in the toast. Reporting only "chain
+// broken" would send an operator hunting for a hash mismatch that isn't there,
+// when what actually happened is a row edited by someone without the host key.
+func TestAuditVerify_BadSignatureNamedInToast(t *testing.T) {
+	mock := newDefaultMock()
+	mock.verifyAuditResp = &pb.VerifyAuditChainResponse{
+		RowsChecked:  10,
+		BadSignature: []string{"row-9: signature does not verify"},
+		SeqGaps:      []string{"node-b: row row-9 has seq 14 after 11"},
+		Tampered:     true,
+	}
+	s := newTestUIServer(t, mock)
+	w := serveRequest(s, withAuth(mustReq(t, "POST", "/ui/audit/verify")))
+	assertStatus(t, w, http.StatusOK)
+	assertToast(t, w, "bad signature")
+	assertToast(t, w, "sequence gap")
+	assertToast(t, w, "error")
+}
+
+// Unsigned rows are every cluster's state before signing was switched on. A red
+// toast here would teach operators that a red audit toast means nothing, so the
+// count is reported on the success path.
+func TestAuditVerify_UnsignedIsNotTampering(t *testing.T) {
+	mock := newDefaultMock()
+	mock.verifyAuditResp = &pb.VerifyAuditChainResponse{RowsChecked: 40, UnsignedRows: 12}
+	s := newTestUIServer(t, mock)
+	w := serveRequest(s, withAuth(mustReq(t, "POST", "/ui/audit/verify")))
+	assertStatus(t, w, http.StatusOK)
+	assertToast(t, w, "intact")
+	assertToast(t, w, "12")
+	assertToast(t, w, "success")
 }
 
 func TestAuditVerify_ResponseErrorField(t *testing.T) {

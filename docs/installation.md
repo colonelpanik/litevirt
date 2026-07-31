@@ -179,7 +179,7 @@ Upgrading litevirt is safe and non-disruptive:
 - **Schema migrations** are applied automatically on daemon startup via `InitSchema()`. Each host creates its own tables/columns/indexes locally — DDL is not replicated across the cluster. The daemon refuses to start if the local DB has been forward-migrated by a newer binary (downgrade refusal via `schema_state.version`).
 - **Pre-flight gate**: `lv host upgrade` runs `PreflightUpgrade` first and refuses on blocking conditions (in-flight migrations or backups, leader-lease holdings with pending fences, replication backlog, clock skew, witness-host risk). Pass `--force` to override.
 - **`upgrading` host state**: the host marks itself `upgrading` in the cluster state before the binary swap. Failover coordinators on peer hosts skip fence candidacy for `upgrading` hosts, so the restart window can't trigger a destructive false-positive failover.
-- **Automatic rollback**: if the new binary panic-loops past `StartLimitBurst=3` within 10 minutes (systemd's threshold), the `litevirt-rollback.service` companion unit fires, restores the previous binary from `litevirt.old`, and restarts. Operator sees a `litevirt-rollback` tagged entry in `journalctl`.
+- **Automatic rollback**: if the new binary panic-loops past `StartLimitBurst=10` within 5 minutes (systemd's threshold), the `litevirt-rollback.service` companion unit fires, restores the previous binary from `litevirt.old`, and restarts. It fires only while an upgrade is in progress (gated on the `.upgrade-pending` sentinel), so a restart storm against a healthy binary cannot downgrade it. Operator sees a `litevirt-rollback` tagged entry in `journalctl`.
 - **Cluster version-skew check**: each `PushMutations` push carries the sender's DB-applied schema version. A receiver refuses the push whenever the sender's schema is strictly ahead of its own (any gap ≥ 1), so a node missing migrations can't be corrupted by a newer peer. The check is one-directional — a sender that is *behind* the receiver is still accepted.
 
 No drain is needed for typical upgrades. The upgrade flow per host is:
@@ -336,8 +336,9 @@ The `lv host upgrade` command always backs up the old binary to
 `/usr/local/bin/litevirt.old` before swapping. There are two rollback paths:
 
 **Automatic:** If the new daemon panics on startup and systemd
-restarts it past `StartLimitBurst` (3 restarts within 10 minutes), the
-`litevirt-rollback.service` oneshot fires automatically:
+restarts it past `StartLimitBurst` (10 restarts within 5 minutes) while an
+upgrade is in progress, the `litevirt-rollback.service` oneshot fires
+automatically:
 
 1. Restores `litevirt.old` over `litevirt`.
 2. Runs `systemctl reset-failed litevirt.service`.

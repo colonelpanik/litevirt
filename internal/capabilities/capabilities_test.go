@@ -20,6 +20,23 @@ func TestHardwareV2Registered(t *testing.T) {
 	}
 }
 
+// TestAuditSignatureV1Registered pins the audit_signature_v1 token in both sets.
+// Supported() is what peers see via Ping, so the cluster can never latch a token
+// missing from it; All() is what health.SetActivationMarker walks to preload the
+// durable latch markers and what daemon rollback detection diffs against, so a
+// token absent there loses its latch across a restart.
+func TestAuditSignatureV1Registered(t *testing.T) {
+	if AuditSignatureV1 != "audit_signature_v1" {
+		t.Fatalf("AuditSignatureV1 = %q, want %q", AuditSignatureV1, "audit_signature_v1")
+	}
+	if !slices.Contains(Supported(), AuditSignatureV1) {
+		t.Fatalf("Supported() = %v, want it to contain %q", Supported(), AuditSignatureV1)
+	}
+	if !slices.Contains(All(), AuditSignatureV1) {
+		t.Fatalf("All() = %v, want it to contain %q", All(), AuditSignatureV1)
+	}
+}
+
 func TestCapacityAdmissionV1Registered(t *testing.T) {
 	if CapacityAdmissionV1 != "capacity_admission_v1" {
 		t.Fatalf("CapacityAdmissionV1 = %q, want %q", CapacityAdmissionV1, "capacity_admission_v1")

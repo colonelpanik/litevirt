@@ -35,9 +35,13 @@ func Check(path string) error {
 	fileSize := uint64(fi.Size())
 	clusterSize := h.ClusterSize()
 
-	// Validate basic header fields.
-	if h.ClusterBits < 9 || h.ClusterBits > 21 {
-		return fmt.Errorf("invalid cluster_bits %d", h.ClusterBits)
+	// readHeader has already bounded cluster_bits and every header-controlled
+	// offset/length against the file; validateHeaderRanges is the one copy of those
+	// rules. This used to repeat them, and the copies drifted — the duplicate L1
+	// bound here computed offset+length without an overflow check, so it accepted
+	// exactly the wrapped range the shared version rejects.
+	if err := validateHeaderRanges(h, fi.Size()); err != nil {
+		return err
 	}
 	if h.Size == 0 {
 		return fmt.Errorf("virtual size is 0")
@@ -46,24 +50,12 @@ func Check(path string) error {
 		return fmt.Errorf("invalid refcount_order %d", h.RefcountOrder)
 	}
 
-	// Validate L1 table is within file bounds.
 	l1Bytes := uint64(h.L1Size) * 8
-	if h.L1TableOffset+l1Bytes > fileSize {
-		return fmt.Errorf("L1 table extends beyond file (offset %d + %d > %d)",
-			h.L1TableOffset, l1Bytes, fileSize)
-	}
 
 	// Validate refcount table is within file bounds.
 	rcTableBytes := uint64(h.RefcountTableClusters) * clusterSize
 	if h.RefcountTableOffset+rcTableBytes > fileSize {
 		return fmt.Errorf("refcount table extends beyond file")
-	}
-
-	// Validate backing file metadata.
-	if h.BackingFileOffset > 0 {
-		if h.BackingFileOffset+uint64(h.BackingFileSize) > clusterSize {
-			return fmt.Errorf("backing file path extends beyond cluster 0")
-		}
 	}
 
 	refcountBits := uint32(1) << h.RefcountOrder

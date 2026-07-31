@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/litevirt/litevirt/internal/daemon"
+	"github.com/litevirt/litevirt/internal/systemdunit"
 )
 
 // newDaemonCmd runs the litevirt daemon (server). systemd's ExecStart is
@@ -65,6 +66,12 @@ func runDaemon() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// SIGHUP and SIGPIPE must not reach the runtime's die-from-signal path.
+	// systemd classes death by either as a CLEAN exit, so Restart=on-failure
+	// would not restart us and the node would sit down indefinitely. Installed
+	// after the shutdown context so it stops with it. See drainIgnoredSignals.
+	drainIgnoredSignals(ctx)
+
 	d, err := daemon.New(cfg)
 	if err != nil {
 		return fmt.Errorf("initializing daemon: %w", err)
@@ -76,6 +83,15 @@ func runDaemon() error {
 			if execErr := reExecSelf(pristineEnv); execErr != nil {
 				return fmt.Errorf("re-exec failed: %w", execErr)
 			}
+		}
+		// An uninstall has already deleted the unit files and this binary.
+		// Returning an error here would exit 1 — a FAILURE — and under
+		// Restart=always systemd would try to restart a unit with nothing left
+		// to run. Exit with the status the unit's RestartPreventExitStatus
+		// names instead, which tells systemd this ending was intended.
+		if err == daemon.ErrUninstalled {
+			slog.Info("uninstalled; exiting without restart")
+			os.Exit(systemdunit.UninstallExitCode)
 		}
 		return fmt.Errorf("daemon error: %w", err)
 	}

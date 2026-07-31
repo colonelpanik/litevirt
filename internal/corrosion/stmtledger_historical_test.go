@@ -29,7 +29,33 @@ import (
 // fenced workload writers also retain their immediately preceding VM insert and
 // VM/container delete shapes for rolling upgrades and retained WAL, including
 // the strict live-container tombstone emitted by DeleteContainerStrict.
-const compatibilityDigest = "b9e5e9477d362f4f373b2ede27852cfca0e8c1800d09870a0b8e2b10380b5598"
+//
+// Updated again when ClaimInitialProjectAuthority stopped minting the literal
+// epoch 1 (it now binds the epoch so it can mint above a project's retired
+// epochs). The schema-v41 literal shape was ADDED as claim_project_authority_v41,
+// not dropped, so a peer on the older shape still applies. No existing historical
+// identity was removed or changed.
+//
+// Updated again for v45 (audit tamper-evidence). The audit_log INSERT gained
+// key_id/signature/seq, and the hash-chain reseal UPDATE gained a
+// `signature IS NULL OR signature = ''` guard so it can never rewrite a signed
+// row — the guard lives in the SQL because that statement applies verbatim by
+// primary key on every peer, and without it a tampering node's reseal would
+// replicate over everyone else's good copies. Both pre-v45 shapes were ADDED as
+// audit_log_insert_v44 / audit_reseal_v44 rather than dropped. No existing
+// historical identity was removed or changed.
+//
+// Updated once more to move audit_reseal_v44 from DispFullPKUpdateNoClock to
+// DispAuditReseal. The v45 reasoning above was wrong on one point, and it is the
+// point that mattered: the retained pre-v45 reseal has NO signature predicate,
+// and DispFullPKUpdateNoClock applies a statement verbatim by primary key. A
+// node that rewrote its own signed rows could therefore emit the legacy shape
+// and have every peer overwrite its good content_hash — the guard that was added
+// to the v45 shape was bypassable by simply sending the older one. The shape
+// stays accepted, and its identity is otherwise unchanged; DispAuditReseal makes
+// the receiver execute the GUARDED form regardless of which shape arrived, so a
+// legacy sender still works and a signed row is unreachable by any reseal.
+const compatibilityDigest = "abe10ef483dd134ab022f98210ca576b27847f1ca9e9950cc6ecf62401745226"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -85,6 +111,9 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"delete_container_pre_authority":        1,   // container tombstone before authority guard columns
 	"delete_container_strict_pre_authority": 1,   // strict live-container tombstone before authority guard columns
 	"pci_release_by_vm_v130":                1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
+	"claim_project_authority_v41":           1,   // initial authority claim when the epoch was the literal 1
+	"audit_log_insert_v44":                  1,   // audit insert before key_id/signature/seq
+	"audit_reseal_v44":                      1,   // audit reseal before it refused to touch a signed row
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

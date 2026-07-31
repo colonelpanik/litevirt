@@ -74,8 +74,12 @@ func (s *Server) deviceOpFromPeer(ctx context.Context) (opID, reqHash string, ok
 		return "", "", false
 	}
 	cn := callerMTLSCommonName(ctx)
-	if h, _ := corrosion.GetHost(ctx, s.db, cn); h == nil {
-		slog.Warn("device op: ignoring peer op-identity markers — peer cert CN is not a known cluster host", "peer_cn", cn)
+	// The one peer classifier, not a second definition of "peer". It accepts a host
+	// whose row has not replicated here yet, which a bare GetHost does not — leaving
+	// this on the old rule meant device ops quietly fell back to own-entry-node
+	// identity on exactly the fresh cluster where replication already works.
+	if !s.isTrustedHostCN(ctx, cn) {
+		slog.Warn("device op: ignoring peer op-identity markers — peer cert CN is not a cluster host", "peer_cn", cn)
 		return "", "", false
 	}
 	return ids[0], hashes[0], true

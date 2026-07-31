@@ -43,3 +43,42 @@ func TestResolvePeerTarget(t *testing.T) {
 		t.Error("expected error for unknown host with no gossip address")
 	}
 }
+
+// TestResolvePeerTarget_FallsBackToGossip.
+//
+// The branch the whole bootstrap fix rests on, and it had no coverage: a peer whose
+// hosts row has not replicated here yet is dialled at its gossip membership address
+// instead of being refused. Without it a freshly provisioned cluster cannot make the
+// outbound peer RPCs it needs in order to converge — which is exactly the state four
+// lab nodes sat in.
+func TestResolvePeerTarget_FallsBackToGossip(t *testing.T) {
+	c := mustTestClient(t)
+	ctx := context.Background()
+	c.SetMembersForTests(func() []PeerInfo {
+		return []PeerInfo{{Name: "unreplicated", Addr: "10.0.0.9:7946"}}
+	})
+
+	// No hosts row for this peer at all — only gossip knows it.
+	got, err := resolvePeerTarget(ctx, c, "unreplicated")
+	if err != nil {
+		t.Fatalf("a peer known only to gossip could not be resolved: %v\n"+
+			"its hosts row has not replicated yet, which is every peer on a cluster that "+
+			"has just been provisioned", err)
+	}
+	// The gossip address carries the GOSSIP port; the target must use the gRPC one.
+	if got != "10.0.0.9:7443" {
+		t.Fatalf("resolved to %q, want 10.0.0.9:7443 — the gossip port must not be "+
+			"carried into the gRPC target", got)
+	}
+
+	// A replicated row still wins over gossip.
+	if err := c.Execute(ctx,
+		`INSERT INTO hosts (name, address, ssh_user, grpc_port, state, cert_serial, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"unreplicated", "10.0.0.9", "root", 9443, "active", "s", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if got, err := resolvePeerTarget(ctx, c, "unreplicated"); err != nil || got != "10.0.0.9:9443" {
+		t.Fatalf("once the row replicates it must win: got %q, %v", got, err)
+	}
+}

@@ -492,6 +492,11 @@ message Host {
     string                         ipmi_address   = 18;
     string                         watchdog_dev   = 19;
     string                         region         = 20;  // federation: failure-domain label
+    // Serial of the host's mTLS certificate. Not secret — it is the public
+    // identifier of a public certificate — and `lv host rm` needs it to revoke that
+    // certificate at the moment of removal, after which the row is tombstoned and
+    // the serial is no longer readable.
+    string                         cert_serial    = 21;
 }
 
 message Image {

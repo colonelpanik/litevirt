@@ -35,7 +35,7 @@ func preflightUnitCheck() error {
 	}
 
 	out, err := exec.Command("systemctl", "show", "litevirt.service",
-		"-p", "KillMode", "-p", "Delegate").CombinedOutput()
+		"-p", "KillMode", "-p", "Delegate", "-p", "Restart").CombinedOutput()
 	if err != nil {
 		// systemctl reachable but the unit doesn't exist (e.g., development
 		// install). Don't block; just log.
@@ -58,6 +58,16 @@ func preflightUnitCheck() error {
 		// control-group would then nuke QEMU. We refuse to be subtle: warn
 		// loudly so an operator notices.
 		slog.Warn("preflight: systemd unit has Delegate=yes; consider Delegate=no for safer KillMode interaction")
+	}
+	if r := props["Restart"]; r != "" && r != "always" {
+		// Warn, never fatal. A stale unit is exactly what a node in the middle
+		// of a rolling upgrade has, and refusing to start would turn a warning
+		// into the outage it is meant to prevent.
+		slog.Warn("preflight: systemd unit has a Restart policy that cannot recover a "+
+			"SIGHUP'd daemon; systemd counts death by SIGHUP/SIGINT/SIGTERM/SIGPIPE as a "+
+			"CLEAN exit, so this node would stay down after one. `lv host upgrade` rewrites "+
+			"the unit; then run `systemctl daemon-reload`.",
+			"restart", r, "want", "always")
 	}
 	return nil
 }

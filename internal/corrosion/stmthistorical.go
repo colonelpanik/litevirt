@@ -123,6 +123,23 @@ func HistoricalShapes() []HistoricalShape {
 	add(`INSERT OR REPLACE INTO notification_routes (id, event_pattern, target_id, min_severity, enabled, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`, "notification_routes_insert_v130")
 
+	// Pre-v45 audit_log writes, from before rows carried a signature.
+	//
+	// Both shapes stay accepted for the upgrade horizon. The INSERT is
+	// append-only (INSERT OR IGNORE, never overwrites).
+	//
+	// The reseal UPDATE has NO signature predicate — that is the whole
+	// difference from the v45 shape — so it is safe only because its ledger
+	// entry carries DispAuditReseal, which makes the receiver execute the
+	// guarded form instead of this one. Applied verbatim it would reach signed
+	// rows by primary key with no clock compare, which is a cluster-wide eraser
+	// for exactly the evidence signing exists to produce. Do not "simplify" that
+	// entry back to DispFullPKUpdateNoClock.
+	add(`INSERT OR IGNORE INTO audit_log
+		   (id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "audit_log_insert_v44")
+	add(`UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, "audit_reseal_v44")
+
 	// DeleteStackFirewall (v1.3.0): one bulk tombstone per firewall table by stack_name.
 	for _, tbl := range []string{"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
 		add("UPDATE "+tbl+" SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL", "stack_firewall_teardown_v130")
@@ -153,6 +170,16 @@ func HistoricalShapes() []HistoricalShape {
 	// Supported peers still emit the cluster-wide shape, so it stays historical-only for the
 	// rolling-upgrade horizon.
 	add("UPDATE host_pci_devices SET vm_name = NULL, updated_at = ? WHERE vm_name = ?", "pci_release_by_vm_v130")
+
+	// ClaimInitialProjectAuthority (schema v41): the epoch was the literal 1.
+	// It is now bound, so a claim can mint above a project's retired epochs
+	// instead of colliding with a tombstone that still owns (project, 1). A peer
+	// on the older shape still emits the literal form, and this table's merge is
+	// custom either way, so the narrow shape must stay accepted for the
+	// rolling-upgrade horizon.
+	add(`INSERT OR IGNORE INTO project_authority_epochs
+		      (project, authority_epoch, holder, transfer_kind, fence_proof_ref, created_at, updated_at, deleted_at)
+		      VALUES (?, 1, ?, 'initial', '', ?, ?, NULL)`, "claim_project_authority_v41")
 
 	return out
 }

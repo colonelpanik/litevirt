@@ -36,6 +36,13 @@ message FenceHostRequest   {
     bool confirm_manual_only = 3;
 }
 message RemoveHostRequest  { string name = 1; bool force = 2; }
+message PublishCRLRequest  { string crl_pem = 1; }
+// version is the published CRL's number, echoed back because the daemon has
+// verified it by then and the caller has not. Whether the answering node had to
+// install it is deliberately absent: `lv host rm` usually runs on a box that
+// shares a pki directory with its daemon, so that answer would be "no" in the
+// ordinary case and mean nothing about the cluster.
+message PublishCRLResponse { int64 version = 1; }
 message FenceResult        { string host_name = 1; string method = 2;
     string result = 3; string detail = 4; }
 message HostHealthMatrix   { repeated HostHealthEntry entries = 1; }
@@ -1775,6 +1782,16 @@ service LiteVirt {
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetHostHealth(google.protobuf.Empty)   returns (HostHealthMatrix);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
+    // PublishCRL hands the cluster a CA-signed certificate revocation list, which
+    // replication then carries to every node. `lv host rm` calls it after revoking
+    // the removed host's certificate — revocation needs the CA private key, which
+    // lives with the operator, so the CRL is minted there and published here.
+    //
+    // The daemon verifies it against the cluster CA before storing it. That check
+    // is not a formality: the list is what decides whether a certificate still
+    // opens a peer connection, and an unverified one would let a caller un-revoke
+    // themselves by publishing a CRL that simply omits their serial.
+    rpc PublishCRL(PublishCRLRequest)          returns (PublishCRLResponse);
     rpc RescanHost(RescanHostRequest)          returns (RescanHostResponse);
     rpc ListHostDevices(ListHostDevicesRequest) returns (ListHostDevicesResponse);
     rpc UpgradeHost(stream UpgradeHostRequest) returns (UpgradeHostResponse);
@@ -2104,15 +2121,31 @@ service LiteVirt {
     rpc PromoteReplica(PromoteReplicaRequest) returns (stream PromoteReplicaProgress);
 
     // ── tamper-evident audit log ──
-    // VerifyAuditChain walks every audit_log row from the oldest
-    // forward and confirms each content_hash matches the
-    // SHA-256(prev_hash || canonical(row)) recomputation. Returns
-    // the first ID that fails (or "" for a clean run).
+    // VerifyAuditChain walks each host's audit sub-chain (a row's
+    // prev_hash links to the previous row from the SAME host, because
+    // N daemons appending concurrently can never form one linear
+    // chain) and confirms each content_hash matches the
+    // SHA-256(prev_hash || canonical(row)) recomputation.
+    //
+    // It also checks what a hash alone cannot: the ECDSA signature
+    // over each row, its host sequence number, and the signed chain
+    // heads. A hash break is corruption or a crude edit; a bad
+    // signature is an edit by someone without the host's key and
+    // survives a reseal; a seq gap is a deleted run of rows; a
+    // truncated host is a tail that was cut off entirely.
+    //
+    // It does not stop at the first problem — one id says nothing
+    // about whether the rest of the log was rewritten too — so every
+    // finding is reported and `tampered` summarises whether any of
+    // them is evidence of interference. Unsigned rows are NOT: every
+    // cluster upgrading to signing has a log full of them.
+    //
     // ExportAuditChain emits a JSON blob containing the rows in a
     // time-range — suitable for WORM offload to S3 Object Lock /
     // an immutable tape vault.
     rpc VerifyAuditChain(google.protobuf.Empty)         returns (VerifyAuditChainResponse);
     rpc ExportAuditChain(ExportAuditChainRequest)       returns (ExportAuditChainResponse);
+    rpc RetireAuditKey(RetireAuditKeyRequest)           returns (RetireAuditKeyResponse);
 
     // ── tenancy ──
     // Projects are hierarchical buckets for VMs / volumes / etc.
@@ -2351,6 +2384,167 @@ message VerifyAuditChainResponse {
     int32  rows_checked = 1;
     string broken_at_id = 2;   // empty if chain intact
     string error        = 3;   // non-empty if the verify itself failed
+
+    // Signature-level findings, appended so a pre-v45 client still reads
+    // fields 1-3 and still reports a hash break — it just cannot see these.
+    // The list entries are "rowid: reason", one per affected row.
+
+    // Rows carrying no signature: written before signing existed, or while
+    // enforcement.audit_signature was off. Chain-checked only, and NOT
+    // tampering — reporting them as such on every upgraded cluster would
+    // train operators to ignore this command.
+    int32 unsigned_rows = 4;
+    // Signed rows this verifier had no keyring to check. Not a finding
+    // about the rows, a gap in what the verifier could see.
+    int32 unverifiable_rows = 5;
+    // Signatures that failed against the published certificate for their
+    // key. The signal that survives a reseal: rewriting a row's hash
+    // cannot produce a matching signature.
+    repeated string bad_signature = 6;
+    // Rows whose key has no trustworthy published certificate — never
+    // published, or one that does not chain to the cluster CA.
+    repeated string unknown_key_id = 7;
+    // Breaks in a host's sequence numbering, which is how the deletion of
+    // a whole run of rows shows up.
+    repeated string seq_gaps = 8;
+    // Rows that blanked their own content_hash to pose as a pre-chain
+    // reset point, which used to silently re-base everything after them.
+    repeated string laundered = 9;
+    // Rows with no host name. They belong to no sub-chain and so cannot
+    // be chain-verified at all.
+    int32 unattributed_rows = 10;
+    // Hosts whose signed chain head attests to more rows than the log
+    // holds — the tail was cut off.
+    repeated string truncated_hosts = 11;
+    // True when any finding is evidence of deliberate interference, so a
+    // client does not have to re-derive that rule and get it wrong.
+    bool tampered = 12;
+    // Rows signed by a key past the sequence at which it was retired.
+    // Rotation happens precisely when a key may be in someone else's hands,
+    // so a signature from it after that boundary is either an attacker or a
+    // node still running with the superseded key installed.
+    repeated string retired_key_use = 13;
+    // Hosts whose chain does not hash to what their own signed head says.
+    // This is what catches a row rewritten and re-signed by someone holding
+    // a key that has since been rotated out: the signature verifies and the
+    // sequence numbers are untouched, and only the head — signed by the
+    // successor key they do not have — disagrees.
+    repeated string head_mismatch = 14;
+    // Unsigned rows appearing AFTER the authoring host's first signed row.
+    // Distinct from unsigned_rows, which is ordinary pre-enforcement history:
+    // a host cannot un-adopt a key, so a row here was either inserted straight
+    // into the table — the cheapest forgery, since the content hash is unkeyed
+    // — or written by a node that lost its key and kept going.
+    repeated string unsigned_after_signed = 15;
+    // Hosts holding a published signing certificate that never recorded an
+    // adoption, long enough ago that a starting daemon would have.
+    //
+    // This is what reports a host that cannot read its own signing key. Such a
+    // host publishes its CERTIFICATE on purpose, so its unsigned rows read as
+    // evidence rather than as ordinary history — but it cannot SIGN the adoption
+    // record a contract requires, so it fell between the two rules and its rows
+    // were reported clean everywhere. A key that cannot be read is the state an
+    // attacker arranges, which is why it must not be the quiet one.
+    repeated string never_adopted = 16;
+    // True when part of the log could not be checked — the THIRD outcome,
+    // between intact and tampered.
+    //
+    // Every consumer needs this and none of them should re-derive it. When
+    // never_adopted stopped feeding `tampered` — it is inferred from a row any
+    // peer can write, so it cannot be evidence of interference — the CLI learned
+    // the new outcome and the web UI and the REST poller did not, and both went
+    // straight back to reporting a host that cannot sign as a clean chain. A
+    // verdict field that means "not a pass" has to travel with the verdict field
+    // that means "not tampering".
+    bool unverified = 17;
+}
+
+// RetireAuditKey retires a host's audit signing key ON ITS BEHALF.
+//
+// The daemon signs its own retirement whenever an operator turns
+// enforcement.audit_signature off, so the routine rollback needs no RPC. This is
+// for a host that cannot speak for itself: its key is lost or unreadable, the
+// machine is gone, or it is being decommissioned. Left alone, such a host keeps
+// a published certificate declaring its rows are signed, and every unsigned row
+// it wrote is reported as evidence on every node with no way to close it out.
+//
+// Must be sent to the node holding the cluster CA private key: signing on
+// another host's behalf means minting a certificate with that host's CN, which
+// is precisely what holding the CA authorises.
+// Two-phase, because the cluster CA private key lives in the OPERATOR's config
+// directory (~/.config/litevirt/pki), not in a daemon's PKI directory. A daemon
+// therefore cannot mint a certificate to sign with, and — more to the point —
+// should not have to: the CA never needs to be on a node at all.
+//
+// Phase 1 sends host_name alone. The daemon answers with the key that would be
+// retired and the sequence to retire it at, and writes nothing.
+// Phase 2 sends the certificate the operator minted for that host plus two
+// signatures over exactly those values. The daemon verifies them against the
+// cluster CA and records the result; it never sees a private key.
+message RetireAuditKeyRequest {
+    string host_name = 1;
+    // PEM of a certificate minted by the CA holder with this host's CN.
+    string cert_pem = 2;
+    // Signature retiring the host's key at the sequence phase 1 reported.
+    string signature = 3;
+    // Signature retiring the minted certificate itself, at the same sequence.
+    // Without it the certificate created to END a signing contract would stand
+    // as a new one, claiming the host signs with a key nobody holds.
+    string self_signature = 4;
+    // Which of the host's live signing keys to retire.
+    //
+    // Required only when it has more than one, which happens whenever a rotation
+    // could not complete — and that is exactly when an operator needs this
+    // command. Without a selector the server refused ("retire them one at a
+    // time") while offering no way to name one, so the only documented remedy
+    // for a stuck host was unreachable.
+    string key_id = 8;
+    // Operator-chosen retirement boundary, overriding the one the server derives.
+    //
+    // The escape hatch for a poisoned chain head. The server refuses to retire from
+    // a replica that a signed head says is behind, and it counts heads signed by the
+    // key being retired on purpose — a host's heads are signed by its own keys, so
+    // excluding them is what let a stale replica pin a boundary below rows that were
+    // legitimately signed. The cost is that whoever holds a leaked key can publish
+    // one head at any sequence and make retirement refuse on every node forever:
+    // heads are append-only, tombstones are inert, and the anti-entropy guard
+    // refuses rewrites, so the claim cannot be withdrawn.
+    //
+    // Completing a retirement still requires a certificate minted with the cluster
+    // CA private key, and both phase-2 signatures must cover this exact value, so
+    // setting it grants nobody a capability they did not already have.
+    //
+    // optional, for presence rather than a zero sentinel: 0 is a meaningful boundary
+    // — "this key signed nothing valid", the right answer for a key believed leaked
+    // from the moment it was minted — and a plain int64 could not tell that apart
+    // from "not supplied".
+    optional int64 at_seq = 5;
+    // The retirement, signed with the cluster CA PRIVATE KEY.
+    //
+    // This is what carries standing. A lifecycle record is honoured only from the key
+    // itself or from the cluster CA — anything else is a signer speaking about a key
+    // that is not its own, which is how a leaked, already-retired key could retire its
+    // own successor and silently switch a host's tamper-evidence off. Retiring a host
+    // that cannot sign for itself is exactly what holding ca.key authorises, so the CA
+    // says so directly rather than through a minted leaf that has to be argued into
+    // standing.
+    string ca_signature = 7;
+    // Permit an at_seq BELOW the boundary the server derives.
+    //
+    // Lowering a boundary is the unrecoverable direction: lifecycle records are
+    // append-only and the earliest verified retirement stands, so every row between
+    // the supplied sequence and the real extent of the chain becomes a permanent
+    // retired-key finding on every node. Raising one cannot condemn anything. The
+    // two are not the same operation and are not confirmed the same way — a
+    // mistyped sequence is otherwise indistinguishable from a deliberate one.
+    bool force = 6;
+}
+message RetireAuditKeyResponse {
+    // The key that was retired, and the sequence it was retired at. Rows the key
+    // signed up to there stay verifiable — retirement is a validity window, never
+    // a deletion.
+    string retired_key_id = 1;
+    int64  retired_at_seq = 2;
 }
 
 message ExportAuditChainRequest {

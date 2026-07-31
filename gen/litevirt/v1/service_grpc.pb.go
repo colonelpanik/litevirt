@@ -29,6 +29,7 @@ const (
 	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
 	LiteVirt_GetHostHealth_FullMethodName              = "/litevirt.v1.LiteVirt/GetHostHealth"
 	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
+	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
 	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
 	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
 	LiteVirt_UpgradeHost_FullMethodName                = "/litevirt.v1.LiteVirt/UpgradeHost"
@@ -235,6 +236,7 @@ const (
 	LiteVirt_PromoteReplica_FullMethodName             = "/litevirt.v1.LiteVirt/PromoteReplica"
 	LiteVirt_VerifyAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/VerifyAuditChain"
 	LiteVirt_ExportAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/ExportAuditChain"
+	LiteVirt_RetireAuditKey_FullMethodName             = "/litevirt.v1.LiteVirt/RetireAuditKey"
 	LiteVirt_CreateProject_FullMethodName              = "/litevirt.v1.LiteVirt/CreateProject"
 	LiteVirt_ListProjects_FullMethodName               = "/litevirt.v1.LiteVirt/ListProjects"
 	LiteVirt_GetProject_FullMethodName                 = "/litevirt.v1.LiteVirt/GetProject"
@@ -261,6 +263,16 @@ type LiteVirtClient interface {
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
 	GetHostHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HostHealthMatrix, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
+	// replication then carries to every node. `lv host rm` calls it after revoking
+	// the removed host's certificate — revocation needs the CA private key, which
+	// lives with the operator, so the CRL is minted there and published here.
+	//
+	// The daemon verifies it against the cluster CA before storing it. That check
+	// is not a formality: the list is what decides whether a certificate still
+	// opens a peer connection, and an unverified one would let a caller un-revoke
+	// themselves by publishing a CRL that simply omits their serial.
+	PublishCRL(ctx context.Context, in *PublishCRLRequest, opts ...grpc.CallOption) (*PublishCRLResponse, error)
 	RescanHost(ctx context.Context, in *RescanHostRequest, opts ...grpc.CallOption) (*RescanHostResponse, error)
 	ListHostDevices(ctx context.Context, in *ListHostDevicesRequest, opts ...grpc.CallOption) (*ListHostDevicesResponse, error)
 	UpgradeHost(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpgradeHostRequest, UpgradeHostResponse], error)
@@ -555,15 +567,31 @@ type LiteVirtClient interface {
 	// it, then localizes via blockpull. Disaster recovery after host loss.
 	PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error)
 	// ── tamper-evident audit log ──
-	// VerifyAuditChain walks every audit_log row from the oldest
-	// forward and confirms each content_hash matches the
-	// SHA-256(prev_hash || canonical(row)) recomputation. Returns
-	// the first ID that fails (or "" for a clean run).
+	// VerifyAuditChain walks each host's audit sub-chain (a row's
+	// prev_hash links to the previous row from the SAME host, because
+	// N daemons appending concurrently can never form one linear
+	// chain) and confirms each content_hash matches the
+	// SHA-256(prev_hash || canonical(row)) recomputation.
+	//
+	// It also checks what a hash alone cannot: the ECDSA signature
+	// over each row, its host sequence number, and the signed chain
+	// heads. A hash break is corruption or a crude edit; a bad
+	// signature is an edit by someone without the host's key and
+	// survives a reseal; a seq gap is a deleted run of rows; a
+	// truncated host is a tail that was cut off entirely.
+	//
+	// It does not stop at the first problem — one id says nothing
+	// about whether the rest of the log was rewritten too — so every
+	// finding is reported and `tampered` summarises whether any of
+	// them is evidence of interference. Unsigned rows are NOT: every
+	// cluster upgrading to signing has a log full of them.
+	//
 	// ExportAuditChain emits a JSON blob containing the rows in a
 	// time-range — suitable for WORM offload to S3 Object Lock /
 	// an immutable tape vault.
 	VerifyAuditChain(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VerifyAuditChainResponse, error)
 	ExportAuditChain(ctx context.Context, in *ExportAuditChainRequest, opts ...grpc.CallOption) (*ExportAuditChainResponse, error)
+	RetireAuditKey(ctx context.Context, in *RetireAuditKeyRequest, opts ...grpc.CallOption) (*RetireAuditKeyResponse, error)
 	// ── tenancy ──
 	// Projects are hierarchical buckets for VMs / volumes / etc.
 	// Quotas gate VM admission against (vcpu, mem, disk, nics).
@@ -702,6 +730,16 @@ func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_RemoveHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PublishCRL(ctx context.Context, in *PublishCRLRequest, opts ...grpc.CallOption) (*PublishCRLResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishCRLResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PublishCRL_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2996,6 +3034,16 @@ func (c *liteVirtClient) ExportAuditChain(ctx context.Context, in *ExportAuditCh
 	return out, nil
 }
 
+func (c *liteVirtClient) RetireAuditKey(ctx context.Context, in *RetireAuditKeyRequest, opts ...grpc.CallOption) (*RetireAuditKeyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RetireAuditKeyResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RetireAuditKey_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CreateProject(ctx context.Context, in *CreateProjectRequest, opts ...grpc.CallOption) (*Project, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Project)
@@ -3110,6 +3158,16 @@ type LiteVirtServer interface {
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
 	GetHostHealth(context.Context, *emptypb.Empty) (*HostHealthMatrix, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
+	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
+	// replication then carries to every node. `lv host rm` calls it after revoking
+	// the removed host's certificate — revocation needs the CA private key, which
+	// lives with the operator, so the CRL is minted there and published here.
+	//
+	// The daemon verifies it against the cluster CA before storing it. That check
+	// is not a formality: the list is what decides whether a certificate still
+	// opens a peer connection, and an unverified one would let a caller un-revoke
+	// themselves by publishing a CRL that simply omits their serial.
+	PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error)
 	RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error)
 	ListHostDevices(context.Context, *ListHostDevicesRequest) (*ListHostDevicesResponse, error)
 	UpgradeHost(grpc.ClientStreamingServer[UpgradeHostRequest, UpgradeHostResponse]) error
@@ -3404,15 +3462,31 @@ type LiteVirtServer interface {
 	// it, then localizes via blockpull. Disaster recovery after host loss.
 	PromoteReplica(*PromoteReplicaRequest, grpc.ServerStreamingServer[PromoteReplicaProgress]) error
 	// ── tamper-evident audit log ──
-	// VerifyAuditChain walks every audit_log row from the oldest
-	// forward and confirms each content_hash matches the
-	// SHA-256(prev_hash || canonical(row)) recomputation. Returns
-	// the first ID that fails (or "" for a clean run).
+	// VerifyAuditChain walks each host's audit sub-chain (a row's
+	// prev_hash links to the previous row from the SAME host, because
+	// N daemons appending concurrently can never form one linear
+	// chain) and confirms each content_hash matches the
+	// SHA-256(prev_hash || canonical(row)) recomputation.
+	//
+	// It also checks what a hash alone cannot: the ECDSA signature
+	// over each row, its host sequence number, and the signed chain
+	// heads. A hash break is corruption or a crude edit; a bad
+	// signature is an edit by someone without the host's key and
+	// survives a reseal; a seq gap is a deleted run of rows; a
+	// truncated host is a tail that was cut off entirely.
+	//
+	// It does not stop at the first problem — one id says nothing
+	// about whether the rest of the log was rewritten too — so every
+	// finding is reported and `tampered` summarises whether any of
+	// them is evidence of interference. Unsigned rows are NOT: every
+	// cluster upgrading to signing has a log full of them.
+	//
 	// ExportAuditChain emits a JSON blob containing the rows in a
 	// time-range — suitable for WORM offload to S3 Object Lock /
 	// an immutable tape vault.
 	VerifyAuditChain(context.Context, *emptypb.Empty) (*VerifyAuditChainResponse, error)
 	ExportAuditChain(context.Context, *ExportAuditChainRequest) (*ExportAuditChainResponse, error)
+	RetireAuditKey(context.Context, *RetireAuditKeyRequest) (*RetireAuditKeyResponse, error)
 	// ── tenancy ──
 	// Projects are hierarchical buckets for VMs / volumes / etc.
 	// Quotas gate VM admission against (vcpu, mem, disk, nics).
@@ -3475,6 +3549,9 @@ func (UnimplementedLiteVirtServer) GetHostHealth(context.Context, *emptypb.Empty
 }
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
+}
+func (UnimplementedLiteVirtServer) PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishCRL not implemented")
 }
 func (UnimplementedLiteVirtServer) RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RescanHost not implemented")
@@ -4094,6 +4171,9 @@ func (UnimplementedLiteVirtServer) VerifyAuditChain(context.Context, *emptypb.Em
 func (UnimplementedLiteVirtServer) ExportAuditChain(context.Context, *ExportAuditChainRequest) (*ExportAuditChainResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExportAuditChain not implemented")
 }
+func (UnimplementedLiteVirtServer) RetireAuditKey(context.Context, *RetireAuditKeyRequest) (*RetireAuditKeyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetireAuditKey not implemented")
+}
 func (UnimplementedLiteVirtServer) CreateProject(context.Context, *CreateProjectRequest) (*Project, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateProject not implemented")
 }
@@ -4289,6 +4369,24 @@ func _LiteVirt_RemoveHost_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RemoveHost(ctx, req.(*RemoveHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PublishCRL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PublishCRLRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PublishCRL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PublishCRL_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PublishCRL(ctx, req.(*PublishCRLRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7737,6 +7835,24 @@ func _LiteVirt_ExportAuditChain_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_RetireAuditKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RetireAuditKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RetireAuditKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RetireAuditKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RetireAuditKey(ctx, req.(*RetireAuditKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_CreateProject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateProjectRequest)
 	if err := dec(in); err != nil {
@@ -7951,6 +8067,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveHost",
 			Handler:    _LiteVirt_RemoveHost_Handler,
+		},
+		{
+			MethodName: "PublishCRL",
+			Handler:    _LiteVirt_PublishCRL_Handler,
 		},
 		{
 			MethodName: "RescanHost",
@@ -8647,6 +8767,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ExportAuditChain",
 			Handler:    _LiteVirt_ExportAuditChain_Handler,
+		},
+		{
+			MethodName: "RetireAuditKey",
+			Handler:    _LiteVirt_RetireAuditKey_Handler,
 		},
 		{
 			MethodName: "CreateProject",

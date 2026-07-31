@@ -9,6 +9,21 @@ var appendOnlyTables = map[string]bool{
 	"audit_log":    true,
 	"mutation_log": true,
 	"vm_events":    true,
+	// A chain head is a signed assertion about a fixed (host, epoch, seq); it
+	// has no later revision. Append-only is what stops a replayed older head
+	// from displacing a newer one on a peer, which is exactly the move that
+	// would hide a truncation.
+	"audit_chain_heads": true,
+	// A retirement is a signed assertion about a fixed (host, key). It has no
+	// later revision, and append-only is what makes it self-repairing: a row
+	// deleted locally has nothing to conflict with, so anti-entropy re-inserts
+	// it from a peer without any bespoke merge rule.
+	"audit_key_lifecycle": true,
+	// A CRL is a CA-signed assertion about a fixed revision number, so the row for
+	// a given number has no later revision either. Append-only is what makes the
+	// table safe to let any peer write to: a hostile row can only ever be a NEW
+	// number, never a rewrite of the one carrying the revocation a reader wants.
+	"cluster_crl": true,
 }
 
 // deriveDisposition classifies a parsed replicated statement into the disposition the apply
@@ -152,8 +167,21 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	{SQL: legacyVMDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	{SQL: legacyContainerDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	{SQL: legacyContainerStrictDeleteSQL, Disposition: DispLegacyWorkloadDelete},
-	// audit_log hash-chain reseal: idempotent (recomputes the same hashes) → verbatim.
-	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock},
+	// audit_log hash-chain reseal: idempotent (recomputes the same hashes), and
+	// applied through the signature-guarded form on the receiver.
+	//
+	// BOTH shapes carry DispAuditReseal, which is what makes the pre-v45 one
+	// safe. That shape has no signature predicate; applied verbatim it would let
+	// a node that rewrote its own signed rows emit the old form and have every
+	// peer overwrite its good content_hash by primary key, with no clock compare
+	// and no recovery — reseal refuses to touch signed rows, so the correct hash
+	// could never be restored. The disposition rewrites it to the guarded form
+	// on arrival, so a legacy sender keeps working (its rows carry no signature,
+	// which is everything the guard could ever exclude) while a signed row is
+	// unreachable by any reseal, local or replicated.
+	{SQL: auditResealGuardedSQL, Disposition: DispAuditReseal},
+	// Pre-v45 shape, retained for the upgrade horizon (stmthistorical.go).
+	{SQL: `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`, Disposition: DispAuditReseal},
 	// session revoke: a guarded one-shot terminal transition (WHERE revoked_at IS NULL) → verbatim.
 	{SQL: `UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, Disposition: DispFullPKUpdateNoClock},
 	// session touch: last_used_at must only advance (align with AE's timestamp-max merge).

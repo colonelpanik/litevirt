@@ -61,7 +61,8 @@ lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host>                    # Return host to scheduling
-lv host rm <host> [--force]               # Remove host (--force with running VMs)
+lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
+lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host fence <host> --confirmed          # Manually fence a host (real fence)
 lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence host
 lv host rescan [host]                     # Rescan PCI devices
@@ -97,6 +98,7 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
   --host <name>         # Target host (auto-placed if omitted)
+  --project <name>      # Tenancy project to create in (default _default); charges its quota
   --secure-boot         # UEFI Secure Boot (MS keys; q35 + UEFI). Windows 11 ready
   --tpm                 # Attach a TPM 2.0 emulator (vTPM) — required for Win11/BitLocker
 

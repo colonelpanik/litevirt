@@ -37,6 +37,9 @@ func newHostCmd() *cobra.Command {
 		newHostPreflightUpgradeCmd(),
 		newHostStatsCmd(),
 		newHostCephCmd(),
+		newHostRotateAuditKeyCmd(),
+		newHostRetireAuditKeyCmd(),
+		newHostPublishCRLCmd(),
 	)
 
 	return cmd
@@ -45,17 +48,24 @@ func newHostCmd() *cobra.Command {
 func newHostInitCmd() *cobra.Command {
 	var name string
 	var local bool
+	var address string
 	cmd := &cobra.Command{
 		Use:   "init [user@host]",
 		Short: "Bootstrap first cluster host",
 		Long: `Bootstrap the first host in a litevirt cluster.
 
 For remote hosts:   lv host init root@10.0.50.10 --name host-a
-For localhost:      lv host init --local --name node-1`,
+For localhost:      lv host init --local --name node-1 --address 10.77.0.11
+
+With --local, --address is what peers will dial. It goes into the host certificate,
+so leaving it wrong means every peer handshake fails with "certificate is valid for
+127.0.0.1, not <addr>". It defaults to the default-route source IP, which is the
+wrong interface on a multi-homed host — pass the same value you will put in
+advertise_address.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if local {
-				return cli.HostInitLocal(cmd.Context(), name)
+				return cli.HostInitLocal(cmd.Context(), name, address)
 			}
 			if len(args) == 0 {
 				return fmt.Errorf("SSH target required (or use --local for standalone setup)")
@@ -65,6 +75,10 @@ For localhost:      lv host init --local --name node-1`,
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Host name (required)")
 	cmd.Flags().BoolVar(&local, "local", false, "Initialize on localhost (no SSH)")
+	cmd.Flags().StringVar(&address, "address", "",
+		"with --local, the IP peers will dial this host on; it goes in the host "+
+			"certificate. Defaults to the default-route source IP, which is wrong on a "+
+			"multi-homed host — use the same value you will set as advertise_address")
 	cmd.MarkFlagRequired("name")
 	return cmd
 }
@@ -76,20 +90,27 @@ func newHostAddCmd() *cobra.Command {
 		Short: "Add host to existing cluster",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Query existing cluster hosts to get gossip peer addresses.
-			// Best-effort: if we can't reach a daemon, proceed with no peers.
+			// Query existing cluster hosts to get gossip peer addresses. This was
+			// best-effort and silent, which meant an unreachable daemon produced an
+			// empty peer list and a node provisioned with nowhere to join. HostAdd
+			// refuses an empty list now, so the only job here is to say WHY it is
+			// empty rather than leaving the operator to guess.
 			var peerAddrs []string
 			c, closer, err := cli.Connect(cmd.Context())
-			if err == nil {
-				resp, err := c.ListHosts(cmd.Context(), nil)
-				if err == nil {
-					for _, h := range resp.Hosts {
-						if h.Address != "" {
-							peerAddrs = append(peerAddrs, fmt.Sprintf("%s:7946", h.Address))
-						}
-					}
+			if err != nil {
+				return fmt.Errorf("cannot reach a cluster daemon to read the existing hosts, "+
+					"whose addresses become %s's gossip peers: %w", name, err)
+			}
+			resp, lerr := c.ListHosts(cmd.Context(), nil)
+			closer()
+			if lerr != nil {
+				return fmt.Errorf("cannot list the existing cluster hosts, whose addresses "+
+					"become %s's gossip peers: %w", name, lerr)
+			}
+			for _, h := range resp.Hosts {
+				if h.Address != "" {
+					peerAddrs = append(peerAddrs, fmt.Sprintf("%s:7946", h.Address))
 				}
-				closer()
 			}
 			return cli.HostAdd(cmd.Context(), args[0], name, peerAddrs)
 		},
@@ -248,6 +269,34 @@ func newHostUndrainCmd() *cobra.Command {
 	}
 }
 
+// newHostPublishCRLCmd exists because `lv host rm` can revoke a certificate and
+// then fail to publish it — the cluster is unreachable, the daemon is restarting —
+// and the recovery it printed ("re-run lv host rm") could never work: by then the
+// host row is tombstoned, the serial lookup returns nothing, and the command
+// returns before it reaches the publish step. The revocation sat on one machine
+// with no supported way into the cluster.
+func newHostPublishCRLCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "publish-crl",
+		Short: "Publish this machine's certificate revocation list to the cluster",
+		Long: `Hand the local crl.pem to the cluster, which replicates it to every node.
+
+` + "`lv host rm`" + ` does this automatically. Run it by hand when that step failed —
+the removal and the revocation have already happened locally, and this is the part
+that did not reach the other nodes.
+
+Safe to repeat: a CRL the cluster already holds is stored under its own contents,
+so republishing it changes nothing. The daemon verifies it against the cluster CA
+before storing it, and refuses one that revokes less than the CRL already in force.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				return cli.PublishClusterCRL(ctx, c)
+			})
+		},
+	}
+}
+
 func newHostRmCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
@@ -256,15 +305,7 @@ func newHostRmCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{
-					Name:  args[0],
-					Force: force,
-				})
-				if err != nil {
-					return fmt.Errorf("remove host: %w", err)
-				}
-				fmt.Printf("Host %s removed from cluster.\n", args[0])
-				return nil
+				return cli.HostRemove(ctx, c, args[0], force)
 			})
 		},
 	}
@@ -613,6 +654,116 @@ func countBlockingCLI(findings []*pb.PreflightFinding) int {
 		}
 	}
 	return n
+}
+
+// newHostRotateAuditKeyCmd replaces the key a host signs audit rows with. It
+// is SSH + a restart, not an RPC: only the host holds its new private key, so
+// only the host can sign the chain head that seals what the old key wrote.
+func newHostRotateAuditKeyCmd() *cobra.Command {
+	var sshTarget string
+	cmd := &cobra.Command{
+		Use:   "rotate-audit-key <host>",
+		Short: "Replace a host's audit signing key",
+		Long: `Mint a new audit signing certificate for a host and install it.
+
+Run this when the host's signing key may have been exposed — notably on any node
+provisioned before the fix that pushed /etc/litevirt/pki/host.key mode 0644.
+Tightening the mode does not undo a copy someone already took.
+
+Must run from the node that holds the cluster CA private key (the one that ran
+'lv host init'): there is no CSR flow, so nowhere else can sign a certificate.
+
+The host's TLS identity (host.crt / host.key) is NOT touched — peer mTLS and
+qemu+tls:// live migration are unaffected. The target's daemon is restarted,
+because the signing keyring is loaded once at boot.
+
+  lv host rotate-audit-key host-b
+  lv host rotate-audit-key host-b --ssh root@10.0.50.11`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cli.HostRotateAuditKey(cmd.Context(), args[0], sshTarget)
+		},
+	}
+	cmd.Flags().StringVar(&sshTarget, "ssh", "",
+		"SSH target for the host (default root@<host>) — needed when the litevirt host name is not the address you reach it on")
+	return cmd
+}
+
+// newHostRetireAuditKeyCmd ends a host's audit signing contract when the host
+// cannot end it itself.
+//
+// The daemon signs its own retirement whenever enforcement.audit_signature is
+// turned off, so an ordinary rollback needs no command at all. This is for a
+// host that has lost its key, is gone, or is being decommissioned.
+func newHostRetireAuditKeyCmd() *cobra.Command {
+	var atSeq int64
+	var force bool
+	var keyID string
+	cmd := &cobra.Command{
+		Use:   "retire-audit-key <host>",
+		Short: "Retire a host's audit signing key on its behalf",
+		Long: `End a host's audit signing contract when the host cannot end it itself.
+
+Publishing a signing certificate declares that a host's audit rows are signed
+from that point on. A host that stops signing while that declaration stands has
+every unsigned row reported as tampering on every node — which is correct when
+someone took its key away, and wrong when the machine is simply gone.
+
+You do not need this for a normal rollback: turning enforcement.audit_signature
+off makes the daemon sign its own retirement on the next start. Use it when the
+host cannot sign one — key lost or unreadable, machine destroyed, decommission.
+
+Run it where the cluster CA private key is (the machine that ran 'lv host init'):
+signing on another host's behalf means minting a certificate carrying that host's
+name, which is exactly what holding the CA authorises. The signing happens
+locally — the CA key is never sent to a node, and the daemon only verifies.
+
+Rows the retired key signed stay verifiable forever — retirement is a validity
+window, never a deletion.
+
+The boundary is derived from replicated state, and the command refuses to run from
+a node whose copy of the host's log a signed chain head says is behind: pinning a
+boundary below rows the key legitimately signed cannot be undone. Use --at-seq only
+when that refusal cannot be satisfied, because a head signed by the key you are
+retiring can claim any sequence at all and cannot be withdrawn — a leaked key can
+block this command indefinitely.
+
+An --at-seq at or above what this node can already see is accepted; a lower one is
+refused unless you add --force, because lowering the boundary is the direction that
+cannot be walked back and a typo looks exactly like a decision.
+
+A host with more than one live key — what a rotation that never completed leaves
+behind — needs --key-id, because each key has its own boundary. The refusal lists
+the live key ids; retire them one at a time until none remain.
+
+  lv host retire-audit-key host-b
+  lv host retire-audit-key host-b --key-id 96a1bc89...     # one of several live keys
+  lv host retire-audit-key host-b --at-seq 4210
+  lv host retire-audit-key host-b --at-seq 100 --force   # key known to have leaked at row 100`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Changed(), not a zero check: 0 is a meaningful boundary — "this key
+			// signed nothing valid" — and must not be indistinguishable from the flag
+			// being absent.
+			var at *int64
+			if cmd.Flags().Changed("at-seq") {
+				at = &atSeq
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				return cli.HostRetireAuditKey(ctx, c, args[0], keyID, at, force)
+			})
+		},
+	}
+	cmd.Flags().Int64Var(&atSeq, "at-seq", 0,
+		"retire at this sequence instead of the one the cluster derives (bypasses the "+
+			"lagging-replica refusal; a value below what the host really signed is permanent)")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"with --at-seq, permit a boundary BELOW the one the cluster derives — the "+
+			"unrecoverable direction, since rows above it become permanent findings")
+	cmd.Flags().StringVar(&keyID, "key-id", "",
+		"which live signing key to retire; required when the host has more than one, "+
+			"since each carries its own boundary")
+	return cmd
 }
 
 func newHostDevicesCmd() *cobra.Command {

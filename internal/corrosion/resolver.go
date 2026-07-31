@@ -436,6 +436,16 @@ var capabilityMap = map[string]tableResolver{
 	"vm_backups":              {category: "content", chain: contentDefaultChain()},
 	"container_backups":       {category: "content", chain: contentDefaultChain()},
 	"container_snapshots":     {category: "content", chain: contentDefaultChain()},
+	// v45 audit tamper-evidence. Both are append-only and their rows never
+	// legitimately differ for one primary key, so a tie here already means
+	// something is wrong; the default chain settles it deterministically
+	// rather than leaving the cluster divergent.
+	"audit_signing_keys":  {category: "content", chain: contentDefaultChain()},
+	"audit_chain_heads":   {category: "content", chain: contentDefaultChain()},
+	"audit_key_lifecycle": {category: "content", chain: contentDefaultChain()},
+	// v47 cluster CRL. Same shape: append-only, keyed by a number the CA signed
+	// over, so two rows for one number can only disagree if one is forged.
+	"cluster_crl": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

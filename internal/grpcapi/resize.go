@@ -111,12 +111,6 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 		}
 	}
 
-	// Admission (F2): the grow must fit host free capacity + project quota. Only
-	// positive deltas consume capacity (a balloon-down / shrink frees it).
-	if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta)); err != nil {
-		return err
-	}
-
 	target := proto.Clone(stored).(*pb.VMSpec)
 	target.Cpu = wantCPU
 	target.MemoryMib = wantMem
@@ -134,6 +128,13 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 
 	if s.operationProtocolActive(ctx) {
 		return s.resizeVMLiveCoordinated(ctx, vm, stored, target, obsCPU, obsMem, idemKey)
+	}
+
+	// Pre-latch path keeps its direct resource check. The coordinated path moves
+	// admission into a provisional, race-safe reservation and only then claims the
+	// mutation barrier.
+	if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta)); err != nil {
+		return err
 	}
 
 	// Pre-latch direct path: apply persistent-then-live (per the fixed primitives),
@@ -178,11 +179,23 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 
 	cpuDelta := posOnly(int(target.Cpu) - int(stored.Cpu))
 	memDelta := posOnly(int(target.MemoryMib) - int(stored.MemoryMib))
-	rv := corrosion.ReservationVector{
+	if idemKey == "" {
+		// No client key: mint a per-attempt id so distinct resizes never collide on
+		// one deterministic operation id (each deploy attempt is its own operation).
+		idemKey = uuid.NewString()
+	}
+	opID := corrosion.DeterministicOperationID("ResizeVMLive", principal, vm.Project, vm.Name, idemKey)
+
+	lease, aerr := s.admitResizeReservation(
+		ctx, opID, "ResizeVMLive", principal, vm, cpuDelta, memDelta)
+	if aerr != nil {
+		return aerr
+	}
+
+	resJSON, err := (corrosion.ReservationVector{
 		Project: vm.Project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
 		TargetHost: vm.HostName, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
-	}
-	resJSON, err := rv.Encode()
+	}).Encode()
 	if err != nil {
 		return status.Errorf(codes.Internal, "encode reservation: %v", err)
 	}
@@ -190,14 +203,9 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	if err != nil {
 		return status.Errorf(codes.Internal, "marshal spec: %v", err)
 	}
-	if idemKey == "" {
-		// No client key: mint a per-attempt id so distinct resizes never collide on
-		// one deterministic operation id (each deploy attempt is its own operation).
-		idemKey = uuid.NewString()
-	}
 
 	op := corrosion.OperationRecord{
-		ID:              corrosion.DeterministicOperationID("ResizeVMLive", principal, vm.Project, vm.Name, idemKey),
+		ID:              opID,
 		Method:          "ResizeVMLive",
 		Principal:       principal,
 		Project:         vm.Project,
@@ -210,23 +218,87 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	}
 	applied, err := s.db.BeginVMOperation(ctx, op, string(targetJSON), vm.OwnerEpoch, vm.SpecGeneration)
 	if err != nil {
+		lease.release(ctx)
 		if errors.Is(err, corrosion.ErrOperationHashConflict) {
 			return status.Errorf(codes.AlreadyExists, "idempotency key reused with a different resize for %q", vm.Name)
 		}
 		return status.Errorf(codes.Internal, "begin operation: %v", err)
 	}
 	if !applied {
+		lease.release(ctx)
 		return status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress or the VM changed underneath", vm.Name)
-	}
-	// Attribute the reservation to the authority established above. Without this the
-	// resize holds NO capacity: aggregation will not count a reservation it cannot
-	// attribute once the project has an epoch — and this path mints one two dozen
-	// lines earlier, so it was fencing out its own claim.
-	if err := s.stampReservationAuthority(ctx, op.ID, vm.Project); err != nil {
-		return err
 	}
 	newGen := vm.SpecGeneration + 1
 	return s.driveResourceUpdate(ctx, vm, op.ID, vm.OwnerEpoch, newGen, target, stored, obsCPU, obsMem)
+}
+
+// admitResizeReservation performs reserve-then-verify for a resize operation
+// using the same deterministic operation id that will eventually own the mutation
+// barrier.
+//
+// Using the workload operation id for the reservation is intentional: once
+// BeginVMOperation claims the VM, the same id becomes the authoritative
+// persistence record and drives recovery. Marking the operation as a transient
+// CAPACITY lease would let stale-lease expiry free real in-flight reservations.
+func (s *Server) admitResizeReservation(
+	ctx context.Context, opID, method, principal string, vm *corrosion.VMRecord, cpuDelta, memDelta int,
+) (*reservationLease, error) {
+	if cpuDelta <= 0 && memDelta <= 0 {
+		return &reservationLease{}, nil
+	}
+
+	delegated := s.projectAuthorityActive(ctx)
+	rv := corrosion.ReservationVector{
+		Project:    vm.Project,
+		TargetHost: vm.HostName, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
+	}
+	if !delegated {
+		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
+	}
+	resJSON, err := rv.Encode()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
+	}
+
+	op := corrosion.OperationRecord{
+		ID:              opID,
+		Method:          method,
+		Principal:       principal,
+		Project:         vm.Project,
+		ResourceKind:    "vm",
+		ResourceID:      vm.Name,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		ReservationJSON: resJSON,
+	}
+	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+		return nil, status.Errorf(codes.Internal, "reserve capacity: %v", err)
+	}
+	lease := &reservationLease{s: s, id: op.ID}
+	if err := s.stampReservationAuthority(ctx, op.ID, vm.Project); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+
+	if err := s.checkHostCapacityBefore(ctx, vm.HostName, cpuDelta, memDelta, op.ID); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+
+	if !delegated {
+		if err := s.checkProjectQuotaBefore(ctx, vm.Project, cpuDelta, memDelta, op.ID); err != nil {
+			lease.release(ctx)
+			return nil, err
+		}
+		return lease, nil
+	}
+
+	holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, vm.Project, vm.Name, cpuDelta, memDelta)
+	if qerr != nil {
+		lease.release(ctx)
+		return nil, qerr
+	}
+	lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, vm.Project, quotaLease
+	return lease, nil
 }
 
 // driveResourceUpdate applies target cpu+mem to a VM whose mutation barrier is

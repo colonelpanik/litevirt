@@ -120,7 +120,18 @@ func (l *reservationLease) release(ctx context.Context) {
 func (s *Server) admitWithReservation(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, method, host, project, resourceID, cpuDelta, memDelta, true)
+	return s.admitReserved(ctx, "", method, host, project, resourceID, cpuDelta, memDelta, true)
+}
+
+// admitWithReservationID is admitWithReservation with an explicit operation ID.
+//
+// This exists for paths where the operation identity is already known (for
+// example, ResizeVMLive derives a deterministic ID from an idempotency key and
+// then needs admission/verification to participate in the same winner election).
+func (s *Server) admitWithReservationID(
+	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int,
+) (*reservationLease, error) {
+	return s.admitReserved(ctx, opID, method, host, project, resourceID, cpuDelta, memDelta, true)
 }
 
 // admitHostWithReservation is admitWithReservation for paths that must NOT charge
@@ -130,11 +141,11 @@ func (s *Server) admitWithReservation(
 func (s *Server) admitHostWithReservation(
 	ctx context.Context, method, host, project string, cpuDelta, memDelta int,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, method, host, project, "", cpuDelta, memDelta, false)
+	return s.admitReserved(ctx, "", method, host, project, "", cpuDelta, memDelta, false)
 }
 
 func (s *Server) admitReserved(
-	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, withQuota bool,
+	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, withQuota bool,
 ) (*reservationLease, error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
@@ -163,9 +174,12 @@ func (s *Server) admitReserved(
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
 	}
+	if opID == "" {
+		opID = newID()
+	}
 
 	op := corrosion.OperationRecord{
-		ID:              newID(),
+		ID:              opID,
 		Method:          method,
 		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
 		Project:         project,

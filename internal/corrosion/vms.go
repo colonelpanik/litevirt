@@ -763,6 +763,44 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 	)
 }
 
+// TransferVMOwner is the Phase 4 ownership-transition primitive: one guarded
+// transaction that CASes on the expected owner epoch, increments it, and moves
+// host/state together. A writer holding a stale expected epoch — a rejoined
+// node still believing it owns the VM, a coordinator whose decision was
+// superseded — changes nothing and gets ErrNoRowsAffected, instead of fighting
+// the real owner with equal-timestamp LWW writes the resolver can only surface
+// as an unresolved tie. Every genuine transfer (reschedule, promote, migrate,
+// repair, owner-assert re-key, drain) routes through here; UpdateVMHost remains
+// for same-host state changes only.
+func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64) error {
+	now := c.NowTS()
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var epoch int64
+		if err := tx.QueryRow(
+			`SELECT vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name,
+		).Scan(&epoch); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		return epoch == expectedEpoch, nil
+	}, []Statement{{
+		SQL: `UPDATE vms
+		      SET host_name = ?, state = ?, state_detail = '',
+		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		Params: []interface{}{hostName, state, now, name, expectedEpoch},
+	}})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // DeleteVM tombstones a VM and its interfaces/disks, plus the v42 hardware
 // tables (vm_nics, vm_pci_intent, vm_pci_realizations) — mirroring the
 // vm_interfaces/vm_disks bulk tombstone: vm_name is not the whole PK on any of

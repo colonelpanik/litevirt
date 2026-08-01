@@ -468,7 +468,19 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			}
 			slog.Warn("reconciler: VM stopped out-of-band — syncing cluster state",
 				"vm", vm.Name, "reason", st.Reason, "to", newState)
-			if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail); err != nil {
+			// Phase 4: carry the generation this decision was made against, so
+			// the statement cannot stomp a peer whose row has moved on. A
+			// rejoined host's stale sync was doing exactly that on every rejoin
+			// (observed live 2026-08-01) — it now lands locally and stops there.
+			// Pre-epoch rows (0) and un-latched clusters keep the plain write.
+			syncErr := error(nil)
+			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); r.ownerEpochEnforced(ctx) &&
+				gerr == nil && fresh != nil && fresh.OwnerEpoch > 0 {
+				syncErr = corrosion.UpdateVMStateAtEpoch(ctx, r.db, vm.Name, newState, detail, fresh.OwnerEpoch)
+			} else {
+				syncErr = corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail)
+			}
+			if err := syncErr; err != nil {
 				slog.Error("reconciler: out-of-band stop sync write failed", "vm", vm.Name, "error", err)
 				r.noteStateWriteFail(corrosion.OpVMState, err)
 			}

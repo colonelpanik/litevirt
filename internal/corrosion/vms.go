@@ -735,6 +735,25 @@ func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) e
 	)
 }
 
+// UpdateVMStateAtEpoch is UpdateVMState carrying the ownership generation the
+// caller decided against. The epoch is part of the WHERE clause, so the
+// statement REPLICATES with its own precondition: a peer whose row has moved
+// to a newer generation matches nothing and keeps its state.
+//
+// This is what stops the rejoin fight observed live on 2026-08-01. A host that
+// was down comes back with a stale replica, its reconciler syncs "this VM I own
+// is not running" — and the name-only UPDATE that write used to be stomped the
+// real owner's row on every node, flapping state until a manual repair-owner.
+// The write still lands LOCALLY on the stale node (it is true of that node's
+// own view, and its row is at the old generation); it simply cannot travel.
+func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail string, expectedEpoch int64) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
+		state, detail, now, name, expectedEpoch,
+	)
+}
+
 // UpdateVMStateStrict is UpdateVMState that reports a zero-row update as
 // ErrNoRowsAffected instead of a silent success. Use it where the write's success
 // GATES a subsequent action (an event, audit, LB refresh, hook, or ownership
@@ -1148,17 +1167,37 @@ func SoftDeleteInterfaceByMAC(ctx context.Context, c *Client, vmName, mac string
 // matching runtime marker, which only the owner can), and tombstones stay
 // pre-epoch forever. Idempotent by predicate (epoch = 0).
 func BackfillOwnerEpochs(ctx context.Context, c *Client, hostName string) error {
-	now := c.NowTS()
-	if err := c.Execute(ctx,
-		`UPDATE vms SET vm_owner_epoch = 1, updated_at = ?
-		 WHERE host_name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
-		now, hostName); err != nil {
+	// Per-row full-PK updates, not one bulk UPDATE: a bulk statement replicates
+	// through the receiver's per-row LWW expansion, while these carry exact row
+	// identity (vms.name / containers.(host_name,name)) and the epoch=0
+	// predicate keeps each one idempotent on its own.
+	vms, err := c.Query(ctx,
+		`SELECT name FROM vms WHERE host_name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+		hostName)
+	if err != nil {
 		return err
 	}
-	return c.Execute(ctx,
-		`UPDATE containers SET owner_epoch = 1, updated_at = ?
-		 WHERE host_name = ? AND deleted_at IS NULL AND owner_epoch = 0`,
-		c.NowTS(), hostName)
+	for _, r := range vms {
+		if err := c.Execute(ctx,
+			`UPDATE vms SET vm_owner_epoch = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+			int64(1), c.NowTS(), r.String("name")); err != nil {
+			return err
+		}
+	}
+	cts, err := c.Query(ctx,
+		`SELECT name FROM containers WHERE host_name = ? AND deleted_at IS NULL AND owner_epoch = 0`,
+		hostName)
+	if err != nil {
+		return err
+	}
+	for _, r := range cts {
+		if err := c.Execute(ctx,
+			`UPDATE containers SET owner_epoch = ?, updated_at = ? WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND owner_epoch = 0`,
+			int64(1), c.NowTS(), hostName, r.String("name")); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // OwnerEpochBackfillComplete reports whether no workload owned by this host

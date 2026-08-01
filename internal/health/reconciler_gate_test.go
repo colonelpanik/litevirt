@@ -188,6 +188,12 @@ func TestStartPendingVM_CurrentOwnerEpochProofStarts(t *testing.T) {
 	if !ok || pr.Status != corrosion.ProofCompleted {
 		t.Fatalf("matching proof status=%q (ok=%v); want completed", pr.Status, ok)
 	}
+	// Phase 4 write-through: the completion minted 7→8, and the runtime marker
+	// must carry the POST-mint generation so a rejoined stale node comparing
+	// its replica against the runtime sees the divergence.
+	if e, ok, _ := fake.GetDomainOwnerEpoch("vm1"); !ok || e != 8 {
+		t.Fatalf("domain owner-epoch marker = (%d,%v), want (8,true)", e, ok)
+	}
 }
 
 // A pending VM carrying a proof MARKER must run the ExecutionGate even when local

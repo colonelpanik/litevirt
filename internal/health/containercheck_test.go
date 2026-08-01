@@ -442,6 +442,7 @@ func TestContainerCheck_RelocateRecreate_CurrentOwnerEpochProofStarts(t *testing
 	}
 
 	c := NewContainerChecker("node1", db, rt)
+	c.SetContainersRoot(t.TempDir())
 	c.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
 	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
 
@@ -458,6 +459,10 @@ func TestContainerCheck_RelocateRecreate_CurrentOwnerEpochProofStarts(t *testing
 	after := mustGetCt(t, db, "ct1")
 	if after.State != "running" || after.OwnerEpoch != 8 {
 		t.Fatalf("after completion: state=%q epoch=%d, want running epoch 8", after.State, after.OwnerEpoch)
+	}
+	// Write-through: the host-local marker carries the POST-mint generation.
+	if e, ok, err := ReadContainerOwnerEpochMarker(c.containersRoot, "ct1"); err != nil || !ok || e != 8 {
+		t.Fatalf("container owner-epoch marker = (%d,%v,%v), want (8,true,nil)", e, ok, err)
 	}
 }
 

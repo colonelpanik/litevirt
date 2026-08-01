@@ -69,6 +69,11 @@ type ContainerChecker struct {
 	// container was first seen running-locally-but-owned-elsewhere.
 	ownerMu            sync.Mutex
 	ownershipFirstSeen map[string]time.Time
+
+	// containersRoot is where Phase 4 owner-epoch markers live
+	// (<root>/<name>/owner_epoch). Empty disables marker writes (fixture
+	// checkers that predate markers); the daemon wires the real path.
+	containersRoot string
 }
 
 // NewContainerChecker creates a container reconciler/restart engine for the
@@ -79,6 +84,9 @@ func NewContainerChecker(hostName string, db *corrosion.Client, runtime lxc.Runt
 
 // SetEventBus sets the event bus for publishing container lifecycle events.
 func (c *ContainerChecker) SetEventBus(bus *events.Bus) { c.bus = bus }
+
+// SetContainersRoot wires the directory Phase 4 owner-epoch markers live under.
+func (c *ContainerChecker) SetContainersRoot(root string) { c.containersRoot = root }
 
 // SetGuardedContainerRekeyActive injects the cheap configured+latch decision
 // used to select modern guarded re-key WAL shapes.
@@ -288,6 +296,15 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	var err error
 	if ct.OwnerEpoch != 0 {
 		err = corrosion.CompleteContainerRelocation(ctx, c.db, c.hostName, ct.Name, ct.RelocateToken)
+		if err == nil && c.containersRoot != "" {
+			// Phase 4 write-through: mirror the just-minted generation into the
+			// host-local marker. Best-effort — the container is already running
+			// and the convergence pass repairs a missed write.
+			if merr := WriteContainerOwnerEpochMarker(c.containersRoot, ct.Name, ct.OwnerEpoch+1); merr != nil {
+				slog.Warn("containercheck: owner-epoch marker write failed (convergence will repair)",
+					"container", ct.Name, "epoch", ct.OwnerEpoch+1, "error", merr)
+			}
+		}
 	} else {
 		err = corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", "")
 	}

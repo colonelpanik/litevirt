@@ -22,4 +22,9 @@ type LibvirtBackend interface {
 	DestroyDomain(name string) error
 	UndefineDomain(name string, removeStorage bool) error
 	UndefineDomainPreservingState(name string) error
+	// Phase 4 runtime markers: the owner epoch mirrored into domain metadata.
+	// Get returns (0,false,nil) for a domain carrying none; corrupt content is
+	// an error, never epoch 0.
+	SetDomainOwnerEpoch(name string, epoch int64, running bool) error
+	GetDomainOwnerEpoch(name string) (int64, bool, error)
 }

@@ -1077,6 +1077,19 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		if err := corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName); err != nil {
 			slog.Error("reconciler: complete start proof did not apply after start — leaving 'starting' for the reconcile starting-case to retry",
 				"vm", vm.Name, "proof", proofID, "error", err)
+		} else {
+			// Phase 4 write-through: the completion just minted the next
+			// ownership generation; mirror it into the domain metadata so the
+			// RUNTIME carries the generation a rejoined stale replica can be
+			// checked against. Best-effort — the VM is already running, and the
+			// convergence pass repairs a missed write; failing the start over a
+			// marker would be strictly worse than a temporarily absent marker.
+			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); gerr == nil && fresh != nil {
+				if merr := r.virt.SetDomainOwnerEpoch(vm.Name, fresh.OwnerEpoch, true); merr != nil {
+					slog.Warn("reconciler: owner-epoch marker write failed (convergence will repair)",
+						"vm", vm.Name, "epoch", fresh.OwnerEpoch, "error", merr)
+				}
+			}
 		}
 	} else if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover"); err != nil {
 		slog.Error("reconciler: post-failover running-state write failed", "vm", vm.Name, "error", err)

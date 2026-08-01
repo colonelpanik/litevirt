@@ -1043,6 +1043,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// that stopped unexpectedly per its restart policy. Shares the runtime wired
 	// above; operator-stopped containers are left alone (state_detail).
 	ctChecker := health.NewContainerChecker(d.cfg.HostName, d.db, lxcRunner)
+	ctChecker.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 	ctChecker.SetEventBus(svc.EventBus())
 	// Runtime container re-key (Phase 4): corroborate a locally-running container
 	// whose only live DB row points elsewhere against every workload-capable peer

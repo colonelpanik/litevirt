@@ -763,6 +763,42 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	)
 }
 
+// CompleteContainerRelocation flips a relocated container's target row
+// pending→running AND mints the next ownership generation in the same write —
+// the container half of Phase 4's read-old → prove → move → mint-new ordering
+// (the proof was claimed against the carried source epoch; after this lands, a
+// replay of that proof is stale by construction). Guarded on the pending state
+// and the exact relocate token, so a retry cannot double-mint and an unrelated
+// same-name row cannot be touched. ErrNoRowsAffected when the row is not in
+// exactly that state.
+func CompleteContainerRelocation(ctx context.Context, c *Client, hostName, name, token string) error {
+	now := c.NowTS()
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var n int
+		if err := tx.QueryRow(
+			`SELECT COUNT(1) FROM containers
+			 WHERE host_name = ? AND name = ? AND deleted_at IS NULL
+			   AND state = 'pending' AND relocate_token = ?`,
+			hostName, name, token).Scan(&n); err != nil {
+			return false, err
+		}
+		return n == 1, nil
+	}, []Statement{{
+		SQL: `UPDATE containers SET state = 'running', state_detail = '',
+		        owner_epoch = owner_epoch + 1, updated_at = ?
+		      WHERE host_name = ? AND name = ? AND deleted_at IS NULL
+		        AND state = 'pending' AND relocate_token = ?`,
+		Params: []interface{}{now, hostName, name, token},
+	}})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // DeleteContainer soft-deletes the row. We don't physically delete so
 // "container vanished from gossip" can be distinguished from "host
 // crashed and we just haven't heard yet" in audit views.

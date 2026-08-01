@@ -280,7 +280,18 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		}
 		return
 	}
-	if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", ""); err != nil {
+	// Phase 4 duality (mirrors the corrosion relocation writers): a target row
+	// carrying a real ownership generation completes through the minting write
+	// — running + owner_epoch+1 in one guarded statement, so the claimed
+	// proof's epoch is stale from this moment on. A pre-epoch row (epoch 0)
+	// keeps the legacy completion so older receivers never see the new shape.
+	var err error
+	if ct.OwnerEpoch != 0 {
+		err = corrosion.CompleteContainerRelocation(ctx, c.db, c.hostName, ct.Name, ct.RelocateToken)
+	} else {
+		err = corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", "")
+	}
+	if err != nil {
 		slog.Error("containercheck: relocate-recreate state write failed — NOT publishing relocated event",
 			"container", ct.Name, "error", err)
 		c.noteStateWriteFail(corrosion.OpContainerState, err)

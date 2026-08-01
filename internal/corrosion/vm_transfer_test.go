@@ -102,3 +102,52 @@ func TestTransferVMOwnerFresh_IncrementsFromCurrentRow(t *testing.T) {
 		t.Fatalf("missing VM: err = %v, want ErrNoRowsAffected", err)
 	}
 }
+
+// Phase 4 step 3b: relocation completion mints the container's next ownership
+// generation in the same guarded write that flips pending→running — the
+// container half of read-old → prove → move → mint-new. Guarded on the pending
+// state + exact token so a retry can't double-mint and an unrelated row can't
+// be touched.
+func TestCompleteContainerRelocation_MintsOnce(t *testing.T) {
+	db, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	ctx := context.Background()
+	if err := InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "host-b", Name: "ct1", State: "pending",
+		StateDetail: ContainerRelocateRecreateDetail, Image: "alpine",
+		RelocateToken: "tok-1",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	if err := db.Execute(ctx,
+		`UPDATE containers SET owner_epoch = 5 WHERE host_name = ? AND name = ?`,
+		"host-b", "ct1"); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+
+	// Wrong token: nothing happens.
+	if err := CompleteContainerRelocation(ctx, db, "host-b", "ct1", "tok-WRONG"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("wrong token: err = %v, want ErrNoRowsAffected", err)
+	}
+	// Right token: running + minted exactly once.
+	if err := CompleteContainerRelocation(ctx, db, "host-b", "ct1", "tok-1"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	ct, _ := GetContainer(ctx, db, "host-b", "ct1")
+	if ct == nil || ct.State != "running" || ct.OwnerEpoch != 6 {
+		t.Fatalf("after completion: %+v, want running epoch 6", ct)
+	}
+	// Re-run is a no-op (no longer pending) — never a double mint.
+	if err := CompleteContainerRelocation(ctx, db, "host-b", "ct1", "tok-1"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("re-complete: err = %v, want ErrNoRowsAffected", err)
+	}
+	ct, _ = GetContainer(ctx, db, "host-b", "ct1")
+	if ct.OwnerEpoch != 6 {
+		t.Fatalf("double mint: epoch %d, want 6", ct.OwnerEpoch)
+	}
+}

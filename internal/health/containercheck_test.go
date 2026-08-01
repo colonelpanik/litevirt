@@ -452,6 +452,13 @@ func TestContainerCheck_RelocateRecreate_CurrentOwnerEpochProofStarts(t *testing
 	if !ok || pr.Status != corrosion.ProofCompleted {
 		t.Fatalf("matching proof status=%q (ok=%v); want completed", pr.Status, ok)
 	}
+	// Phase 4: the completion MINTS the next generation in the same write that
+	// flips pending to running, so the just-claimed proof (epoch 7) is stale
+	// from this moment on — a replay can never authorize a second recreate.
+	after := mustGetCt(t, db, "ct1")
+	if after.State != "running" || after.OwnerEpoch != 8 {
+		t.Fatalf("after completion: state=%q epoch=%d, want running epoch 8", after.State, after.OwnerEpoch)
+	}
 }
 
 var errFakeStart = &fakeStartError{}

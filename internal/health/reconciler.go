@@ -414,6 +414,22 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// After daemon restart or libvirt reconnect, verify VMs that
 			// corrosion says are "running" are actually alive in libvirt (#43/#53).
 			if !r.virt.DomainExists(vm.Name) {
+				// Phase 4 enforcement (the dual-run killer): this self-heal
+				// restart is decided purely from THIS NODE'S replica, and a
+				// just-rejoined node's replica is exactly the untrustworthy
+				// input — on 2026-08-01 a rejoined host restarted a VM that had
+				// already been rescheduled away, running a second live copy.
+				// The runtime marker is the host's own attestation of which
+				// generation its runtime belongs to; when the DB knows a NEWER
+				// one, this host's runtime is superseded and must not be
+				// resurrected from local state. Absent marker = pre-epoch, and
+				// the gate below still applies.
+				if r.ownerEpochEnforced(ctx) && r.runtimeSuperseded(ctx, vm.Name) {
+					slog.Warn("reconciler: refusing self-heal restart — this host's runtime belongs to a superseded ownership generation",
+						"vm", vm.Name)
+					r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleEpoch)
+					break
+				}
 				slog.Warn("reconciler: VM marked running but not in libvirt — attempting restart",
 					"vm", vm.Name)
 				r.startPendingVM(ctx, vm)
@@ -1254,4 +1270,28 @@ func (r *Reconciler) convergeOwnerEpochMarker(ctx context.Context, name string) 
 		slog.Warn("reconciler: owner-epoch marker convergence failed (will retry next sweep)",
 			"vm", name, "epoch", row.OwnerEpoch, "error", serr)
 	}
+}
+
+// ownerEpochEnforced reports whether owner_epoch_v1 enforcement is live here
+// (latched fleet-wide; partition fails closed via the gate's own semantics).
+func (r *Reconciler) ownerEpochEnforced(ctx context.Context) bool {
+	return r.gate != nil && r.gate.Enforced(ctx, capabilities.OwnerEpochV1)
+}
+
+// runtimeSuperseded reports whether this host's runtime marker for a workload
+// names an ownership generation the DB has already moved past. An absent or
+// unreadable marker is NOT superseded: pre-epoch workloads and hosts whose
+// marker is missing must keep their existing self-heal behavior (the backfill
+// and convergence passes are what graduate them), and failing closed on an
+// unreadable marker would strand a legitimately-owned VM.
+func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
+	marker, ok, err := r.virt.GetDomainOwnerEpoch(name)
+	if err != nil || !ok {
+		return false
+	}
+	row, gerr := corrosion.GetVM(ctx, r.db, name)
+	if gerr != nil || row == nil {
+		return false
+	}
+	return row.OwnerEpoch > marker
 }

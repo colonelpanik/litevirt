@@ -768,3 +768,98 @@ func TestReconcile_ConvergesOwnerEpochMarker(t *testing.T) {
 		t.Fatalf("pre-epoch row overwrote a marker: %d, want untouched 9", e)
 	}
 }
+
+// Phase 4 enforcement (the dual-run killer). The self-heal restart of a VM
+// whose row says "running here" but which libvirt doesn't have is taken purely
+// on THIS NODE'S replica — and a just-rejoined node's replica is exactly the
+// untrustworthy input: on 2026-08-01 a rejoined host restarted a VM that had
+// already been rescheduled away, producing a second live copy for ~9s. Under
+// owner_epoch_v1 that restart requires quorum (the ExecutionGate), and it
+// refuses outright when the runtime marker shows this host's runtime belongs to
+// a superseded generation.
+func TestSelfHealRestart_RefusedWithoutQuorumUnderOwnerEpoch(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 5 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	fake := libvirtfake.New() // domain absent — the self-heal trigger
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	// Latched enforcement, but this node has NO quorum (a rejoining node).
+	r.SetGate(fakeGate{exec: GateResult{OK: false, Reason: "no_quorum"}, active: true})
+	r.reconcile(ctx)
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a quorum-less node must not self-heal-restart a VM under owner_epoch_v1 — that is the dual-run")
+	}
+
+	// Positive control: with quorum, the same sweep proceeds.
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	r.reconcile(ctx)
+	if !startedOrDefined(fake, "vm1") {
+		t.Fatal("with quorum the self-heal restart must still happen (refusal is not blanket)")
+	}
+}
+
+func TestSelfHealRestart_RefusedOnSupersededMarker(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// The DB knows generation 9; this host's runtime marker is still at 5, so
+	// its local runtime state belongs to a generation that has been superseded.
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	// The domain is ABSENT (this host rebooted) but its marker survives — the
+	// rejoined-host shape: runtime gone, attestation of generation 5 retained.
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, &supersededMarkerFake{Fake: fake, epoch: 5})
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	r.reconcile(ctx)
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a superseded runtime marker must refuse the self-heal restart")
+	}
+}
+
+// Positive control for the superseded check: a marker that AGREES with the DB
+// generation must not block the self-heal restart. Without this, "refuse
+// whenever a marker exists" would pass the refusal test while breaking every
+// legitimate restart of a marked VM.
+func TestSelfHealRestart_CurrentMarkerStillRestarts(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 5 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, &supersededMarkerFake{Fake: fake, epoch: 5})
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	r.reconcile(ctx)
+	if !startedOrDefined(fake, "vm1") {
+		t.Fatal("a marker matching the DB generation must NOT block the self-heal restart")
+	}
+}
+
+// supersededMarkerFake reports a marker for a domain libvirt no longer has —
+// the rejoined-host shape (runtime gone, attestation retained).
+type supersededMarkerFake struct {
+	*libvirtfake.Fake
+	epoch int64
+}
+
+func (f *supersededMarkerFake) GetDomainOwnerEpoch(string) (int64, bool, error) {
+	return f.epoch, true, nil
+}

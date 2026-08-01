@@ -620,6 +620,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// confirm capability.
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	reconciler.SetGate(d.checker)
+	reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
@@ -776,6 +777,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
 	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)       // drives the latch + conditional advertisement
+	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
+	// this node.s owned workloads have all graduated out of the pre-epoch 0, so
+	// the fleet can never latch across a node whose generations do not exist yet.
+	svc.SetOwnerEpochEnforce(d.cfg.Enforcement.OwnerEpoch)
+	svc.SetOwnerEpochReady(func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ok, err := corrosion.OwnerEpochBackfillComplete(ctx, d.db, d.cfg.HostName)
+		return err == nil && ok
+	})
 	// Once the whole cluster has latched audit_signature_v1, a write this node
 	// cannot sign is an error-level event rather than a normal one.
 	//

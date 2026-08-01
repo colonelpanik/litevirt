@@ -388,6 +388,16 @@ type EnforcementConfig struct {
 	// keeps emitting unsigned rows, so the token is advertised only while it is on).
 	// Default false; reversible kill switch.
 	AuditSignature bool `yaml:"audit_signature,omitempty"`
+	// OwnerEpoch: activate the Phase 4 ownership-generation regime on this host
+	// (capabilities.OwnerEpochV1). With the flag on, the health sweeps backfill
+	// every workload this host owns from the pre-epoch 0 to a real generation
+	// (stamping its runtime marker in the same pass), and the token is advertised
+	// only once this node is READY — flag on AND no owned workload left at epoch
+	// 0 — so the fleet can never latch across a node whose workloads are still
+	// ungraduated ("never bless an already-diverged cluster"). Marker/epoch
+	// ENFORCEMENT (refusing stale-row self-heal restarts) activates only after
+	// the fleet-wide latch. Enable fleet-uniformly; reversible kill switch.
+	OwnerEpoch bool `yaml:"owner_epoch,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

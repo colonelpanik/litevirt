@@ -1140,3 +1140,43 @@ func SoftDeleteInterfaceByMAC(ctx context.Context, c *Client, vmName, mac string
 		`UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND mac = ?`,
 		nowRFC3339(), now, vmName, mac)
 }
+
+// BackfillOwnerEpochs graduates every workload THIS host owns out of the
+// pre-epoch 0 (0→1) — the Phase 4 one-time backfill, run by the health sweeps
+// while enforcement.owner_epoch is on. Only owned, live rows are touched:
+// another host's workloads are its own to graduate (each owner also writes the
+// matching runtime marker, which only the owner can), and tombstones stay
+// pre-epoch forever. Idempotent by predicate (epoch = 0).
+func BackfillOwnerEpochs(ctx context.Context, c *Client, hostName string) error {
+	now := c.NowTS()
+	if err := c.Execute(ctx,
+		`UPDATE vms SET vm_owner_epoch = 1, updated_at = ?
+		 WHERE host_name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+		now, hostName); err != nil {
+		return err
+	}
+	return c.Execute(ctx,
+		`UPDATE containers SET owner_epoch = 1, updated_at = ?
+		 WHERE host_name = ? AND deleted_at IS NULL AND owner_epoch = 0`,
+		c.NowTS(), hostName)
+}
+
+// OwnerEpochBackfillComplete reports whether no workload owned by this host
+// remains at the pre-epoch 0 — the readiness half of the owner_epoch_v1
+// advertisement gate ("never bless an already-diverged cluster": a fleet must
+// not latch across a node whose workloads are ungraduated).
+func OwnerEpochBackfillComplete(ctx context.Context, c *Client, hostName string) (bool, error) {
+	for _, q := range []string{
+		`SELECT COUNT(1) AS n FROM vms WHERE host_name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+		`SELECT COUNT(1) AS n FROM containers WHERE host_name = ? AND deleted_at IS NULL AND owner_epoch = 0`,
+	} {
+		rows, err := c.Query(ctx, q, hostName)
+		if err != nil {
+			return false, err
+		}
+		if len(rows) != 1 || rows[0].Int64("n") > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}

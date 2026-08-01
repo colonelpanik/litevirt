@@ -61,6 +61,10 @@ type Reconciler struct {
 	ownerMu            sync.Mutex
 	ownershipFirstSeen map[string]time.Time
 
+	// ownerEpochBackfill enables the Phase 4 per-sweep backfill
+	// (enforcement.owner_epoch).
+	ownerEpochBackfill bool
+
 	// gate is the split-brain safety gate (Phase 1). When a pending VM carries a
 	// proof marker (vms.pending_action_id), the reconciler enforces ExecutionGate
 	// and validates/claims the linked runtime_action_proofs row before starting.
@@ -137,6 +141,10 @@ func selfFenceHardGate(g runtimeGate) bool { return g != nil && g.SelfFenced() }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
+
+// SetOwnerEpochBackfill enables the Phase 4 backfill pass in each sweep
+// (enforcement.owner_epoch; the daemon wires it).
+func (r *Reconciler) SetOwnerEpochBackfill(on bool) { r.ownerEpochBackfill = on }
 
 // SetSharedStorageFenceEnforce sets the config kill-switch for the shared-disk
 // ownership-transfer fence gate (enforcement.shared_storage_fence).
@@ -367,6 +375,15 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context) {
 }
 
 func (r *Reconciler) reconcile(ctx context.Context) {
+	if r.ownerEpochBackfill {
+		// Phase 4 backfill: graduate every workload this host owns out of the
+		// pre-epoch 0. Idempotent by predicate; the convergence pass below then
+		// writes the runtime markers for whatever just graduated. Readiness
+		// (advertising owner_epoch_v1) keys off no owned row remaining at 0.
+		if err := corrosion.BackfillOwnerEpochs(ctx, r.db, r.hostName); err != nil {
+			slog.Warn("reconciler: owner-epoch backfill pass failed (will retry)", "error", err)
+		}
+	}
 	vms, err := corrosion.ListVMs(ctx, r.db, "", r.hostName)
 	if err != nil {
 		slog.Error("reconciler: list VMs", "error", err)

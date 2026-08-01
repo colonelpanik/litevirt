@@ -151,3 +151,90 @@ func TestCompleteContainerRelocation_MintsOnce(t *testing.T) {
 		t.Fatalf("double mint: epoch %d, want 6", ct.OwnerEpoch)
 	}
 }
+
+// Phase 4 backfill: with enforcement.owner_epoch on, each host graduates the
+// workloads IT OWNS out of the pre-epoch 0 (0→1), and readiness — the gate on
+// advertising owner_epoch_v1 — is "no owned workload left at 0". Only owned,
+// live rows are touched: another host's workloads are its own to graduate,
+// and tombstones stay pre-epoch forever.
+func TestBackfillOwnerEpochs(t *testing.T) {
+	db, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	ctx := context.Background()
+	if err := InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	for _, vm := range []VMRecord{
+		{Name: "mine-0", HostName: "host-a", State: "running", Spec: "{}"},
+		{Name: "theirs-0", HostName: "host-b", State: "running", Spec: "{}"},
+		{Name: "mine-7", HostName: "host-a", State: "running", Spec: "{}"},
+	} {
+		if err := InsertVM(ctx, db, vm, nil, nil); err != nil {
+			t.Fatalf("InsertVM: %v", err)
+		}
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 7 WHERE name = 'mine-7'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "host-a", Name: "ct-0", State: "running", Image: "alpine",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ready, err := OwnerEpochBackfillComplete(ctx, db, "host-a")
+	if err != nil || ready {
+		t.Fatalf("pre-backfill readiness = (%v,%v), want (false,nil)", ready, err)
+	}
+
+	if err := BackfillOwnerEpochs(ctx, db, "host-a"); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	vm0, _ := GetVM(ctx, db, "mine-0")
+	if vm0.OwnerEpoch != 1 {
+		t.Fatalf("owned pre-epoch VM = %d, want 1", vm0.OwnerEpoch)
+	}
+	vm7, _ := GetVM(ctx, db, "mine-7")
+	if vm7.OwnerEpoch != 7 {
+		t.Fatalf("already-graduated VM must be untouched: %d, want 7", vm7.OwnerEpoch)
+	}
+	other, _ := GetVM(ctx, db, "theirs-0")
+	if other.OwnerEpoch != 0 {
+		t.Fatalf("another host's VM must be untouched: %d, want 0", other.OwnerEpoch)
+	}
+	ct, _ := GetContainer(ctx, db, "host-a", "ct-0")
+	if ct.OwnerEpoch != 1 {
+		t.Fatalf("owned pre-epoch container = %d, want 1", ct.OwnerEpoch)
+	}
+
+	ready, err = OwnerEpochBackfillComplete(ctx, db, "host-a")
+	if err != nil || !ready {
+		t.Fatalf("post-backfill readiness = (%v,%v), want (true,nil)", ready, err)
+	}
+	// Readiness must consider BOTH workload kinds independently: with every VM
+	// graduated, a single ungraduated CONTAINER still blocks advertisement —
+	// otherwise a node could latch owner_epoch_v1 with pre-epoch containers it
+	// would then be expected to enforce marker/epoch agreement for.
+	if err := db.Execute(ctx,
+		`UPDATE containers SET owner_epoch = 0 WHERE host_name = ? AND name = ?`,
+		"host-a", "ct-0"); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := OwnerEpochBackfillComplete(ctx, db, "host-a"); err != nil || ready {
+		t.Fatalf("an ungraduated container must block readiness: (%v,%v), want (false,nil)", ready, err)
+	}
+	if err := db.Execute(ctx,
+		`UPDATE containers SET owner_epoch = 1 WHERE host_name = ? AND name = ?`,
+		"host-a", "ct-0"); err != nil {
+		t.Fatal(err)
+	}
+	// Idempotent: a second pass changes nothing.
+	if err := BackfillOwnerEpochs(ctx, db, "host-a"); err != nil {
+		t.Fatalf("re-backfill: %v", err)
+	}
+	if vm0b, _ := GetVM(ctx, db, "mine-0"); vm0b.OwnerEpoch != 1 {
+		t.Fatalf("re-backfill double-stamped: %d, want 1", vm0b.OwnerEpoch)
+	}
+}

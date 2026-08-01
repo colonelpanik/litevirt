@@ -269,6 +269,18 @@ enforcement:
                               # retirement keeps its contract — that is the case it exists
                               # for — and `lv host retire-audit-key` closes it out from the
                               # machine holding the cluster CA. Enable fleet-uniformly.
+  owner_epoch: false          # activate the ownership-generation regime on this host
+                              # (owner_epoch_v1). With the flag on, the health sweeps
+                              # backfill every workload this host owns from the pre-epoch 0
+                              # to a real generation, stamping its runtime marker (libvirt
+                              # domain metadata / the container marker file) in the same
+                              # pass. The token is advertised only once this node is READY —
+                              # flag on and no owned workload left at epoch 0 — so the fleet
+                              # can never latch across a node whose workloads are still
+                              # ungraduated. Enforcement (refusing a stale rejoined replica's
+                              # self-heal restarts on a marker/epoch mismatch) activates only
+                              # after the fleet-wide latch. Enable fleet-uniformly; the flag
+                              # is the reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

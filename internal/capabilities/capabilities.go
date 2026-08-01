@@ -325,6 +325,10 @@ var supported = []string{
 	HardwareV2,
 	ProjectAuthorityV1,
 	AuditSignatureV1,
+	// OwnerEpochV1 is advertised CONDITIONALLY: enforcement.owner_epoch on AND
+	// the node.s backfill readiness (no owned workload at epoch 0) — see the
+	// grpcapi advertisement filter.
+	OwnerEpochV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless

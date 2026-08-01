@@ -131,6 +131,12 @@ type Server struct {
 	// which are exactly what a forgery looks like, so the latch must require config
 	// uniformity.
 	enfAuditSignature bool
+	// enfOwnerEpoch + ownerEpochReady gate owner_epoch_v1 advertisement: the flag
+	// is the operator opt-in, readiness is "no owned workload left at epoch 0"
+	// (the health backfill reports it). Both required — the fleet must never
+	// latch across a node whose workloads are ungraduated.
+	enfOwnerEpoch   bool
+	ownerEpochReady func() bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -478,6 +484,14 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.hardwareV2Ready() {
 		caps = withoutCapability(caps, capabilities.HardwareV2)
 	}
+	// owner_epoch_v1 (Phase 4) follows the hardware_v2 model: advertised only
+	// when the operator opted in (config uniformity, like every enforcement
+	// token) AND this node is READY — its owned workloads have all graduated
+	// out of the pre-epoch 0. Advertising earlier could latch the fleet across
+	// a node whose runtime markers and generations don.t exist yet.
+	if !s.enfOwnerEpoch || s.ownerEpochReady == nil || !s.ownerEpochReady() {
+		caps = withoutCapability(caps, capabilities.OwnerEpochV1)
+	}
 	return caps
 }
 
@@ -611,6 +625,13 @@ func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = o
 // an unsignable audit write additionally requires the AuditSignatureV1 latch, and
 // advertisement is withheld while the flag is off.
 func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
+
+// SetOwnerEpochEnforce wires the Phase 4 config flag (enforcement.owner_epoch).
+func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch = on }
+
+// SetOwnerEpochReady wires the readiness probe consulted before advertising
+// owner_epoch_v1 (nil = never ready).
+func (s *Server) SetOwnerEpochReady(fn func() bool) { s.ownerEpochReady = fn }
 
 // projectAuthorityActive reports whether this node routes project-quota admissions
 // through the project's authority holder: the config flag AND the cluster-wide latch.

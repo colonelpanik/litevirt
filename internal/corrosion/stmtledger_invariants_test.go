@@ -9,7 +9,7 @@ import "testing"
 // (which would let that builder's shape back-pressure a peer) is caught; update it deliberately when
 // a replicated bulk-update builder is added or removed.
 func TestCurrentLedgerCategories(t *testing.T) {
-	const wantBulk = 33
+	const wantBulk = 35 // +2: the Phase 4 owner-epoch backfill pair (vms, containers)
 	bulk := 0
 	for fp, e := range stmtLedger {
 		if e.Disposition == DispBulkUpdate {

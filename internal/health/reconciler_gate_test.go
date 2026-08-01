@@ -715,3 +715,56 @@ func TestStartPendingVM_ProofUnreadableRefuses(t *testing.T) {
 		t.Fatalf("vm must not be marked running; state=%q", vm.State)
 	}
 }
+
+// Phase 4 convergence: the sweep repairs a missing or stale owner-epoch
+// marker toward the DB row for a VM that is confirmed running here — closing
+// the crash window between the completion mint and its write-through, and
+// stamping pre-marker domains. Pre-epoch rows (epoch 0) are left alone; the
+// backfill, not the sweep, decides when they graduate.
+func TestReconcile_ConvergesOwnerEpochMarker(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	fake := libvirtfake.New()
+	if err := fake.DefineDomain(`<domain><name>vm1</name></domain>`); err != nil {
+		t.Fatalf("define: %v", err)
+	}
+	if err := fake.StartDomain("vm1"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+
+	// Missing marker → stamped with the DB generation.
+	r.reconcile(ctx)
+	if e, ok, _ := fake.GetDomainOwnerEpoch("vm1"); !ok || e != 9 {
+		t.Fatalf("missing marker not converged: (%d,%v), want (9,true)", e, ok)
+	}
+
+	// Stale marker → repaired.
+	if err := fake.SetDomainOwnerEpoch("vm1", 3, true); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcile(ctx)
+	if e, _, _ := fake.GetDomainOwnerEpoch("vm1"); e != 9 {
+		t.Fatalf("stale marker not repaired: %d, want 9", e)
+	}
+
+	// Pre-epoch row: the sweep must NOT stamp epoch 0 markers.
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 0 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetDomainOwnerEpoch("vm1", 9, true); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcile(ctx)
+	if e, _, _ := fake.GetDomainOwnerEpoch("vm1"); e != 9 {
+		t.Fatalf("pre-epoch row overwrote a marker: %d, want untouched 9", e)
+	}
+}

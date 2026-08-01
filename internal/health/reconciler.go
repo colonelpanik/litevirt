@@ -415,6 +415,15 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// stop. classifyStop decides whether the VM is genuinely down.
 			st, err := r.virt.DomainStateReason(vm.Name)
 			if err != nil || st.State == "running" {
+				if err == nil && st.State == "running" {
+					// Phase 4 convergence: with the domain CONFIRMED running
+					// here, repair a missing/stale owner-epoch marker toward
+					// the DB row — the crash window between a completion mint
+					// and its write-through, and pre-marker domains. ListVMs
+					// omits the epoch, so read the full row; pre-epoch rows
+					// (epoch 0) are the backfill's to graduate, never stamped.
+					r.convergeOwnerEpochMarker(ctx, vm.Name)
+				}
 				break
 			}
 			if vm.StateDetail == operatorStopDetail {
@@ -1205,5 +1214,27 @@ func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
 		`DELETE FROM vm_locks WHERE vm_name = ? AND holder = ?`,
 		vmName, r.hostName); err != nil {
 		slog.Debug("reconciler: vm_lock release failed", "vm", vmName, "error", err)
+	}
+}
+
+// convergeOwnerEpochMarker repairs the domain's owner-epoch metadata toward
+// the DB row for a VM confirmed running on this host. Absent or stale →
+// stamped with the row's generation; corrupt (Get errors) → overwritten the
+// same way, because a marker that can't be read protects nothing. A row still
+// at epoch 0 is pre-epoch: the sweep never stamps it — deciding when a
+// workload graduates into the marker regime is the backfill's job, and a
+// sweep-stamped zero would be indistinguishable from a real generation.
+func (r *Reconciler) convergeOwnerEpochMarker(ctx context.Context, name string) {
+	row, err := corrosion.GetVM(ctx, r.db, name)
+	if err != nil || row == nil || row.OwnerEpoch == 0 {
+		return
+	}
+	cur, ok, gerr := r.virt.GetDomainOwnerEpoch(name)
+	if gerr == nil && ok && cur == row.OwnerEpoch {
+		return
+	}
+	if serr := r.virt.SetDomainOwnerEpoch(name, row.OwnerEpoch, true); serr != nil {
+		slog.Warn("reconciler: owner-epoch marker convergence failed (will retry next sweep)",
+			"vm", name, "epoch", row.OwnerEpoch, "error", serr)
 	}
 }

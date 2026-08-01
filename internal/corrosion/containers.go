@@ -53,6 +53,14 @@ const (
 	containerRekeyInsertSQL = `INSERT OR REPLACE INTO containers
 		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, owner_epoch, spec_generation, active_operation_id, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+	// containerRelocatePendingInsertSQL is the guarded-era relocation target row:
+	// state 'pending' + relocate-recreate detail, CARRYING the source's lifecycle
+	// columns (Phase 4: the row must exist at the source's owner epoch — the
+	// relocation proof binds to it). Emitted only for sources with nonzero
+	// lifecycle state, mirroring the rekey duality above.
+	containerRelocatePendingInsertSQL = `INSERT OR REPLACE INTO containers
+		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, owner_epoch, spec_generation, active_operation_id, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
 	containerRekeyInterfaceCleanupSQL = `UPDATE container_interfaces SET deleted_at = ?, updated_at = ?
 		      WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`
 	containerRekeyLeaseSQL = `UPDATE ip_allocations SET owner_host = ?, allocated_at = ?, updated_at = ?
@@ -726,7 +734,33 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	rec.StateDetail = ContainerRelocateRecreateDetail
 	rec.RelocateToken = token
 	rec.CreatedAt = "" // fresh row on the target
-	return UpsertContainer(ctx, c, rec)
+	// Mirror the RekeyContainerOwner duality: a pre-epoch source (all lifecycle
+	// fields zero) keeps the retained wire-compatible upsert, so older receivers
+	// in a rolling upgrade never see a shape they don't know. A source carrying
+	// real lifecycle state — which only v44+ writers produce — takes the guarded
+	// shape that carries it, because Phase 4's ordering (lab-proven 2026-08-01)
+	// requires the target row to exist AT the source's owner epoch: the
+	// relocation proof carries that epoch and the executor compares it before
+	// recreating, so a target row at 0 (or an eager +1) wedges a legitimate
+	// relocation forever. The +1 mints only at completion.
+	if old.OwnerEpoch == 0 && old.SpecGeneration == 0 && old.ActiveOperationID == "" {
+		return UpsertContainer(ctx, c, rec)
+	}
+	labelsJSON := ""
+	if len(rec.Labels) > 0 {
+		b, jerr := json.Marshal(rec.Labels)
+		if jerr != nil {
+			return jerr
+		}
+		labelsJSON = string(b)
+	}
+	return c.Execute(ctx, containerRelocatePendingInsertSQL,
+		rec.HostName, rec.Name, rec.Image, rec.CPULimit, rec.MemMiB, labelsJSON,
+		rec.RestartPolicy, rec.StateDetail, rec.Project, boolToInt(rec.IsTemplate),
+		rec.OnHostFailure, rec.CreateSpec, rec.RelocateToken,
+		old.OwnerEpoch, old.SpecGeneration, old.ActiveOperationID,
+		nowRFC3339(), c.NowTS(),
+	)
 }
 
 // DeleteContainer soft-deletes the row. We don't physically delete so

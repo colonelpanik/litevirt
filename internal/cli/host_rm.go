@@ -54,6 +54,17 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 			hostName, err)
 	}
 
+	// Close the host's audit signing contract while removal still has the CA
+	// key in hand — this command already runs on the only machine that can
+	// sign a retirement. Left open, the published certificate keeps declaring
+	// "this host's rows are signed": every unsigned row it ever wrote reads as
+	// tampering on every node, and a later re-admission under the same name
+	// starts life permanently TAMPERED (its fresh key can't resume the old
+	// contract). Best-effort by design: the CRL above is the security
+	// boundary, and a retirement that cannot complete right now stays
+	// available as `lv host retire-audit-key`.
+	closeRemovedHostAuditContract(ctx, c, hostName)
+
 	if _, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Force: force}); err != nil {
 		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
 	}
@@ -104,6 +115,32 @@ func hostCertSerial(ctx context.Context, c pb.LiteVirtClient, hostName string) (
 		}
 	}
 	return "", fmt.Errorf("host is not present")
+}
+
+// closeRemovedHostAuditContract retires the removed host's live audit signing
+// key so its published certificate stops standing as an open contract. A host
+// that never signed answers "nothing to retire" — the quiet common case. A
+// half-finished rotation leaves several live keys, each with its own boundary,
+// which retirement refuses to collapse into one call — surfaced with per-key
+// instructions. Any other failure warns and lets removal proceed.
+func closeRemovedHostAuditContract(ctx context.Context, c pb.LiteVirtClient, hostName string) {
+	err := HostRetireAuditKey(ctx, c, hostName, "", nil, false)
+	switch {
+	case err == nil:
+		// Retired; HostRetireAuditKey already printed the boundary.
+	case strings.Contains(err.Error(), "no live audit signing certificate"):
+		// Never signed, or already closed — nothing standing.
+	case strings.Contains(err.Error(), "live signing certificates"):
+		fmt.Printf("  WARNING: %s has multiple live audit signing keys (a rotation that never "+
+			"finished); its contract is still open. Retire each with:\n"+
+			"    lv host retire-audit-key %s --key-id <id>\n  detail: %v\n",
+			hostName, hostName, err)
+	default:
+		fmt.Printf("  WARNING: could not retire %s's audit signing key; until it is retired, "+
+			"every unsigned row it wrote is reported as tampering and a re-admitted %s "+
+			"cannot sign cleanly. Retry with: lv host retire-audit-key %s\n  detail: %v\n",
+			hostName, hostName, hostName, err)
+	}
 }
 
 // revokeHostCert appends a removed host's certificate serial to the cluster CRL.

@@ -32,6 +32,11 @@ func (c *hostRemoveTestClient) PublishCRL(context.Context, *pb.PublishCRLRequest
 	return &pb.PublishCRLResponse{Version: 47}, nil
 }
 
+func (c *hostRemoveTestClient) RetireAuditKey(context.Context, *pb.RetireAuditKeyRequest, ...grpc.CallOption) (*pb.RetireAuditKeyResponse, error) {
+	c.calls = append(c.calls, "retire")
+	return nil, errors.New(`rpc error: code = FailedPrecondition desc = host "node-9" has no live audit signing certificate: it either never published one or its key is already retired, so there is nothing to retire`)
+}
+
 func (c *hostRemoveTestClient) RemoveHost(context.Context, *pb.RemoveHostRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	c.calls = append(c.calls, "remove")
 	return &emptypb.Empty{}, nil
@@ -115,8 +120,8 @@ func TestHostRemove_PublishesBeforeTombstoning(t *testing.T) {
 	if err := HostRemove(context.Background(), client, "node-9", false); err != nil {
 		t.Fatalf("HostRemove: %v", err)
 	}
-	if got := strings.Join(client.calls, ","); got != "publish,remove" {
-		t.Fatalf("calls = %q, want publish,remove", got)
+	if got := strings.Join(client.calls, ","); got != "publish,retire,remove" {
+		t.Fatalf("calls = %q, want publish,retire,remove", got)
 	}
 }
 
@@ -151,5 +156,87 @@ func TestRevokeHostCert_NoSerialRefusesAnUnrevokableRemoval(t *testing.T) {
 		if err := revokeHostCert(dir, "node-9", serial); err == nil {
 			t.Errorf("serial %q allowed a removal whose certificate cannot be revoked", serial)
 		}
+	}
+}
+
+// ── audit signing contract on removal ───────────────────────────────────────
+//
+// The 2026-08-01 lab found node-4 re-admitted with its OLD audit signing
+// certificate still published and unretired: its fresh daemon would not sign
+// (new key, closed-out world) and every row it wrote was reported as
+// tampering on every node. `lv host rm` runs where the cluster CA lives — the
+// only place a retirement can be signed — so removal must close the contract.
+
+type hostRemoveAuditTestClient struct {
+	hostRemoveTestClient
+	retireErr error
+}
+
+func (c *hostRemoveAuditTestClient) RetireAuditKey(context.Context, *pb.RetireAuditKeyRequest, ...grpc.CallOption) (*pb.RetireAuditKeyResponse, error) {
+	c.calls = append(c.calls, "retire")
+	return nil, c.retireErr
+}
+
+func TestHostRemove_ClosesAuditContractBeforeRemoval(t *testing.T) {
+	dir := t.TempDir()
+	if err := pki.GenerateCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")); err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	t.Setenv("LV_CONFIG_DIR", filepath.Dir(dir))
+	if err := os.Rename(dir, filepath.Join(filepath.Dir(dir), "pki")); err != nil {
+		t.Fatalf("stage pki dir: %v", err)
+	}
+
+	// The common case for a host that never signed: retirement reports there
+	// is nothing to retire. Removal must attempt it and then proceed.
+	c := &hostRemoveAuditTestClient{retireErr: errors.New(
+		`rpc error: code = FailedPrecondition desc = host "node-9" has no live audit signing certificate: it either never published one or its key is already retired, so there is nothing to retire`)}
+	if err := HostRemove(context.Background(), c, "node-9", false); err != nil {
+		t.Fatalf("HostRemove with nothing to retire must succeed: %v", err)
+	}
+	retireIdx, removeIdx := -1, -1
+	for i, call := range c.calls {
+		switch call {
+		case "retire":
+			if retireIdx < 0 {
+				retireIdx = i
+			}
+		case "remove":
+			removeIdx = i
+		}
+	}
+	if retireIdx < 0 {
+		t.Fatal("HostRemove never attempted to close the audit signing contract")
+	}
+	if removeIdx < retireIdx {
+		t.Fatal("audit contract must be probed before the host row is removed")
+	}
+}
+
+func TestHostRemove_AuditRetirementFailureDoesNotBlockRemoval(t *testing.T) {
+	dir := t.TempDir()
+	if err := pki.GenerateCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")); err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	t.Setenv("LV_CONFIG_DIR", filepath.Dir(dir))
+	if err := os.Rename(dir, filepath.Join(filepath.Dir(dir), "pki")); err != nil {
+		t.Fatalf("stage pki dir: %v", err)
+	}
+
+	// A lagging replica (or any transient fault) must not wedge removal: the
+	// CRL revocation above is the security boundary; the contract can still be
+	// closed afterwards with `lv host retire-audit-key`.
+	c := &hostRemoveAuditTestClient{retireErr: errors.New("rpc error: code = Unavailable desc = replica lags")}
+	if err := HostRemove(context.Background(), c, "node-9", false); err != nil {
+		t.Fatalf("HostRemove must warn, not fail, when retirement errs: %v", err)
+	}
+	found := false
+	for _, call := range c.calls {
+		if call == "remove" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("removal did not proceed after a retirement failure")
 	}
 }

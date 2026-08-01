@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -162,6 +163,14 @@ func (m *mockClient) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ .
 }
 func (m *mockClient) PublishCRL(_ context.Context, _ *pb.PublishCRLRequest, _ ...grpc.CallOption) (*pb.PublishCRLResponse, error) {
 	return &pb.PublishCRLResponse{Version: 47}, nil
+}
+func (m *mockClient) RetireAuditKey(_ context.Context, in *pb.RetireAuditKeyRequest, _ ...grpc.CallOption) (*pb.RetireAuditKeyResponse, error) {
+	// The removal flow probes the audit contract; a host that never signed
+	// answers that there is nothing to retire.
+	return nil, fmt.Errorf(
+		"rpc error: code = FailedPrecondition desc = host %q has no live audit signing "+
+			"certificate: it either never published one or its key is already retired, "+
+			"so there is nothing to retire", in.GetHostName())
 }
 func (m *mockClient) RescanHost(_ context.Context, in *pb.RescanHostRequest, _ ...grpc.CallOption) (*pb.RescanHostResponse, error) {
 	m.rescannedHost = in.Name

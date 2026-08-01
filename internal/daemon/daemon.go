@@ -666,6 +666,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP
 	// self-demotion trip a self-fence when a demotion can't be confirmed.
 	watchdogCtrl := watchdog.NewController()
+	// Clean-shutdown disarm hole (§B Phase 5): only a host that owns nothing may
+	// disarm on SIGTERM. A restart re-pets inside the timeout; a stop that
+	// abandons running workloads lets the watchdog reboot the host into a safely
+	// fenced state. Probe errors count as NOT owned — the probe runs through the
+	// same clients the daemon manages workloads with, so a host that cannot
+	// answer is overwhelmingly one with no runtime at all (containers-only or
+	// fresh hosts must not reboot on every daemon stop). VIP ownership is not
+	// yet probed here — Phase 5 adds it with the quorum-gated handoff.
+	watchdogCtrl.SetOwnershipCheck(func() bool {
+		if names, err := d.virt.ListRunningDomains(); err == nil && len(names) > 0 {
+			slog.Warn("watchdog: refusing shutdown disarm — running VMs owned", "count", len(names))
+			return true
+		}
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer probeCancel()
+		if names, err := lxcRunner.ListRunning(probeCtx); err == nil && len(names) > 0 {
+			slog.Warn("watchdog: refusing shutdown disarm — running containers owned", "count", len(names))
+			return true
+		}
+		return false
+	})
 	go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl)
 	// Central self-fence hard gate: once this node self-fences, the checker's Execution/
 	// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,

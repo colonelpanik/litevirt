@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -153,5 +154,83 @@ func TestFenced(t *testing.T) {
 	ctrl.SelfFence() // idempotent
 	if !ctrl.Fenced() {
 		t.Fatal("Fenced() stays true after a repeat SelfFence")
+	}
+}
+
+// ── ownership-aware disarm ──────────────────────────────────────────────────
+//
+// The clean-shutdown disarm hole (§B Phase 5, highest severity): a SIGTERM
+// disarmed the watchdog unconditionally, so a host still running VMs,
+// containers, or a VIP lost its self-fence guarantee the moment its daemon
+// exited — precisely when nothing manages those workloads. Shutdown may only
+// disarm when this host owns nothing; otherwise the device stays armed and a
+// successor daemon must resume petting (a restart) or the host reboots into a
+// safely fenced state (a stop with workloads left behind).
+
+func TestHeartbeat_OwnershipHeld_RefusesDisarm(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "fake-watchdog-owned")
+	if err := os.WriteFile(tmp, nil, 0600); err != nil {
+		t.Fatalf("create fake watchdog: %v", err)
+	}
+
+	ctrl := NewController()
+	ctrl.SetOwnershipCheck(func() bool { return true })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	Heartbeat(ctx, tmp, 30*time.Millisecond, ctrl)
+
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read fake watchdog: %v", err)
+	}
+	if strings.ContainsRune(string(data), 'V') {
+		t.Fatal("graceful shutdown DISARMED the watchdog while the host still owned workloads")
+	}
+}
+
+func TestHeartbeat_OwnershipClear_DisarmsAsBefore(t *testing.T) {
+	// Positive control: with nothing owned the old graceful disarm must
+	// still happen, or every restart of an empty host leaves a live timer.
+	tmp := filepath.Join(t.TempDir(), "fake-watchdog-empty")
+	if err := os.WriteFile(tmp, nil, 0600); err != nil {
+		t.Fatalf("create fake watchdog: %v", err)
+	}
+
+	ctrl := NewController()
+	ctrl.SetOwnershipCheck(func() bool { return false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	Heartbeat(ctx, tmp, 30*time.Millisecond, ctrl)
+
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read fake watchdog: %v", err)
+	}
+	if !strings.ContainsRune(string(data), 'V') {
+		t.Fatal("graceful shutdown with zero ownership must disarm exactly as before")
+	}
+}
+
+func TestHeartbeat_NoOwnershipCheck_DisarmsAsBefore(t *testing.T) {
+	// A controller with no check wired (or none at all) keeps the historical
+	// behavior — the callback is opt-in for the daemon, never a silent trap
+	// for other Heartbeat users.
+	tmp := filepath.Join(t.TempDir(), "fake-watchdog-nocheck")
+	if err := os.WriteFile(tmp, nil, 0600); err != nil {
+		t.Fatalf("create fake watchdog: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	Heartbeat(ctx, tmp, 30*time.Millisecond, NewController())
+
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatalf("read fake watchdog: %v", err)
+	}
+	if !strings.ContainsRune(string(data), 'V') {
+		t.Fatal("no ownership check wired: disarm behavior must be unchanged")
 	}
 }

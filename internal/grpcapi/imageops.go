@@ -257,9 +257,22 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 	// here whenever a VM's overlay disk is missing; the backing image being
 	// present locally is common (post-failover recreate on a host that
 	// pulled it earlier) and must not depend on any peer being alive.
+	//
+	// Existence is NOT integrity: a host killed mid-transfer can reboot with
+	// a zero-byte or truncated file at the final path, and short-circuiting
+	// on it blocks the very re-pull that would heal it (observed live: qemu
+	// "Image is not in qcow2 format" retrying forever). Require a nonzero
+	// size, and when the replicated images row records the expected size,
+	// require an exact match — a mismatch falls through to a fresh pull,
+	// which overwrites the damaged copy.
 	if s.images != nil {
-		if _, err := os.Stat(s.images.ImagePath(imageName)); err == nil {
-			return nil
+		if fi, err := os.Stat(s.images.ImagePath(imageName)); err == nil && fi.Size() > 0 {
+			img, ierr := corrosion.GetImage(ctx, s.db, imageName)
+			if ierr != nil || img == nil || img.SizeBytes <= 0 || img.SizeBytes == fi.Size() {
+				return nil
+			}
+			slog.Warn("auto-pull: local image size mismatch, re-pulling",
+				"image", imageName, "local_bytes", fi.Size(), "expected_bytes", img.SizeBytes)
 		}
 	}
 

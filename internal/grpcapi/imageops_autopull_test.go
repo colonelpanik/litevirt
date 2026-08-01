@@ -111,3 +111,59 @@ func TestAutoPullImage_PrefersLiveSourceOverDead(t *testing.T) {
 }
 
 var _ = filepath.Join // keep import if unused on some build tags
+
+func TestAutoPullImage_CorruptLocalFileDoesNotShortCircuit(t *testing.T) {
+	// 2026-08-01 lab: a node killed mid-image-transfer rebooted with a
+	// zero-byte cirros.qcow2 at the final path. The local short-circuit
+	// trusted bare existence and blocked the re-pull that would have healed
+	// it, wedging the failover start forever. Existence is not integrity.
+	s := autopullServer(t)
+	ctx := adminCtx()
+
+	// Zero-byte local file + a live ready holder: the pull must proceed
+	// (and here fail on the dial, naming the holder — proving no short-circuit).
+	if err := os.WriteFile(s.images.ImagePath("ubuntu"), nil, 0o644); err != nil {
+		t.Fatalf("stage empty image: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "live-holder", Address: "127.0.0.1", State: "active",
+	}); err != nil {
+		t.Fatalf("insert host: %v", err)
+	}
+	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+		ImageName: "ubuntu", HostName: "live-holder",
+		Path: "/images/ubuntu.qcow2", Status: "ready", PulledAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("insert image host: %v", err)
+	}
+	err := s.AutoPullImage(ctx, "ubuntu")
+	if err == nil {
+		t.Fatal("zero-byte local file short-circuited the pull")
+	}
+	if !contains(err.Error(), "live-holder") {
+		t.Errorf("pull was not attempted against the live holder: %v", err)
+	}
+
+	// Truncated file (nonzero but wrong size vs the replicated images row):
+	// also no short-circuit.
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+		Name: "ubuntu", Format: "qcow2", Checksum: "sha256:aa", SizeBytes: 4096,
+	}); err != nil {
+		t.Fatalf("insert image row: %v", err)
+	}
+	if err := os.WriteFile(s.images.ImagePath("ubuntu"), []byte("torn"), 0o644); err != nil {
+		t.Fatalf("stage truncated image: %v", err)
+	}
+	err = s.AutoPullImage(ctx, "ubuntu")
+	if err == nil {
+		t.Fatal("size-mismatched local file short-circuited the pull")
+	}
+
+	// Full-size file: short-circuits (positive control for the validation).
+	if err := os.WriteFile(s.images.ImagePath("ubuntu"), make([]byte, 4096), 0o644); err != nil {
+		t.Fatalf("stage full image: %v", err)
+	}
+	if err := s.AutoPullImage(ctx, "ubuntu"); err != nil {
+		t.Fatalf("intact local file must short-circuit: %v", err)
+	}
+}

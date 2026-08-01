@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -107,6 +108,7 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch stri
 		req.Proof = &pb.RuntimeActionProof{
 			Id: newID(), Action: corrosion.ActionPromote, TargetKind: "vm",
 			TargetName: vmName, Coordinator: s.hostName, LeaseHolder: s.hostName,
+			OwnerEpoch: strconv.FormatInt(vm.OwnerEpoch, 10),
 			FenceEpoch: fenceEpoch,
 		}
 	}

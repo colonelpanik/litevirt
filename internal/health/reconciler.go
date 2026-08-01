@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -746,6 +747,17 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			slog.Warn("reconciler: pending proof does not match this VM/host, refusing start",
 				"vm", vm.Name, "proof", proofID, "proof_target", pr.TargetName, "proof_dest", pr.DestHost)
 			r.noteGateRefused(corrosion.ActionReschedule, ReasonProofConflict)
+			return
+		}
+		// Bind the proof to the exact ownership generation the coordinator
+		// observed. A proof left prepared across owner A→B→A must not authorize a
+		// start after the row's owner epoch advances (ABA). Empty is the pre-epoch
+		// form and remains inert until owner_epoch_v1 enforcement is activated.
+		if pr.OwnerEpoch != "" && pr.OwnerEpoch != strconv.FormatInt(fresh.OwnerEpoch, 10) {
+			slog.Warn("reconciler: pending proof owner epoch is stale, refusing start",
+				"vm", vm.Name, "proof", proofID, "proof_epoch", pr.OwnerEpoch,
+				"current_epoch", fresh.OwnerEpoch)
+			r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleEpoch)
 			return
 		}
 		proofFenceEpoch = pr.FenceEpoch

@@ -378,6 +378,82 @@ func TestContainerCheck_RelocateRecreate_EnforcedMarkerlessRefused(t *testing.T)
 	}
 }
 
+// A relocation token is not enough by itself: its proof is bound to the source
+// container's exact ownership generation. Advancing the target row while the
+// proof is in flight must make the old proof unusable (the ABA case).
+func TestContainerCheck_RelocateRecreate_StaleOwnerEpochProofRefuses(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "alpine:3.19", RelocateToken: "tok-1", OwnerEpoch: 7,
+	})
+	if err := db.Execute(ctx, `UPDATE containers SET owner_epoch = 7 WHERE host_name = 'node1' AND name = 'ct1'`); err != nil {
+		t.Fatalf("seed owner epoch: %v", err)
+	}
+	if err := corrosion.WriteActionProof(ctx, db, corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+		TargetName: "ct1", DestHost: "node1", Coordinator: "coord",
+		RelocationToken: "tok-1", OwnerEpoch: "6",
+	}); err != nil {
+		t.Fatalf("WriteActionProof: %v", err)
+	}
+
+	var refused []string
+	c := NewContainerChecker("node1", db, rt)
+	c.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	c.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if rt.startCount("ct1") != 0 {
+		t.Fatal("a proof for owner epoch 6 must not recreate owner epoch 7")
+	}
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofPrepared {
+		t.Fatalf("stale proof status=%q (ok=%v); want prepared/unclaimed", pr.Status, ok)
+	}
+	if len(refused) != 1 || refused[0] != ReasonStaleEpoch {
+		t.Fatalf("refusal=%v; want [stale_epoch]", refused)
+	}
+}
+
+// Matching owner epochs remain a valid relocation authorization; this catches
+// an over-correction that rejects every non-empty owner-epoch proof.
+func TestContainerCheck_RelocateRecreate_CurrentOwnerEpochProofStarts(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "alpine:3.19", RelocateToken: "tok-1", OwnerEpoch: 7,
+	})
+	if err := db.Execute(ctx, `UPDATE containers SET owner_epoch = 7 WHERE host_name = 'node1' AND name = 'ct1'`); err != nil {
+		t.Fatalf("seed owner epoch: %v", err)
+	}
+	if err := corrosion.WriteActionProof(ctx, db, corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+		TargetName: "ct1", DestHost: "node1", Coordinator: "coord",
+		RelocationToken: "tok-1", OwnerEpoch: "7",
+	}); err != nil {
+		t.Fatalf("WriteActionProof: %v", err)
+	}
+
+	c := NewContainerChecker("node1", db, rt)
+	c.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if rt.startCount("ct1") != 1 {
+		t.Fatalf("a proof matching current owner epoch 7 must recreate once; starts=%d", rt.startCount("ct1"))
+	}
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofCompleted {
+		t.Fatalf("matching proof status=%q (ok=%v); want completed", pr.Status, ok)
+	}
+}
+
 var errFakeStart = &fakeStartError{}
 
 type fakeStartError struct{}

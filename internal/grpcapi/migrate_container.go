@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -278,7 +279,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	}
 
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_RESTORING, Status: "restoring on target"})
-	outcome, rerr := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning)
+	outcome, rerr := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning, rec.OwnerEpoch)
 	switch outcome {
 	case corrosion.RestoreLanded:
 		// The target recorded its row (authoritative). Even if its start then failed,
@@ -333,7 +334,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 // restore (whose later start may have failed) from a genuine pre-row failure and
 // only roll back the source in the latter case. The test seam replaces the whole
 // drive so the path is unit-testable without a second daemon.
-func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error) {
+func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool, ownerEpoch int64) (corrosion.RestoreOutcome, error) {
 	// Tell the target this is a migrate FROM us (peer-verified on the far side), so it keeps
 	// the imported NIC IPs — we handed it the IPAM leases before this call — rather than
 	// re-reserving and blanking them. The transport (PR-4 push to the target's staging repo
@@ -348,7 +349,7 @@ func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, tim
 	// claims it. Fail-open until the gate is cluster-wide (pre-flip / mixed roll).
 	var proof *pb.RuntimeActionProof
 	if s.gateActive(ctx) {
-		proof = s.mintRelocationProof(ctx, name, target)
+		proof = s.mintRelocationProof(ctx, name, target, ownerEpoch)
 		if proof == nil {
 			return corrosion.RestoreNotAttempted, fmt.Errorf(
 				"migrate refused: could not mint a relocation proof for %q (target may not advertise the split-brain gate)", target)
@@ -363,7 +364,7 @@ func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, tim
 // the analog of mintLBProof/the failover coordinator's mint. Fresh-Pings the target so a proof
 // is never handed to a host that doesn't advertise the gate. nil on an ungated target / write
 // failure (the caller refuses the migrate under enforcement).
-func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHost string) *pb.RuntimeActionProof {
+func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHost string, ownerEpoch int64) *pb.RuntimeActionProof {
 	if !s.destSupportsGate(ctx, destHost) {
 		slog.Error("mintRelocationProof: destination does not advertise the split-brain gate; refusing proof-bearing migrate",
 			"container", containerName, "dest", destHost)
@@ -374,6 +375,7 @@ func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHos
 		ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
 		TargetName: containerName, DestHost: destHost, Coordinator: s.hostName,
 		LeaseHolder: s.hostName, RelocationToken: newID(),
+		OwnerEpoch: strconv.FormatInt(ownerEpoch, 10),
 	}
 	if err := corrosion.WriteActionProof(ctx, s.db, pr); err != nil {
 		slog.Warn("mintRelocationProof: write proof failed", "container", containerName, "dest", destHost, "error", err)
@@ -382,5 +384,6 @@ func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHos
 	return &pb.RuntimeActionProof{
 		Id: pr.ID, Action: pr.Action, TargetKind: pr.TargetKind, TargetName: pr.TargetName,
 		DestHost: pr.DestHost, Coordinator: pr.Coordinator, RelocationToken: pr.RelocationToken,
+		OwnerEpoch: pr.OwnerEpoch,
 	}
 }

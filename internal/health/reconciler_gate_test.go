@@ -107,6 +107,89 @@ func TestStartPendingVM_ProofHappyPath(t *testing.T) {
 	}
 }
 
+// A reschedule proof is authorization for one exact ownership generation. If the
+// VM row advances before the target claims it, the old proof must stay unclaimed
+// and nothing may reach libvirt. Removing the owner-epoch comparison makes this
+// test start vm1 and is therefore a real ABA regression check.
+func TestStartPendingVM_StaleOwnerEpochProofRefuses(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running", OwnerEpoch: 6,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 6 WHERE name = 'vm1'`); err != nil {
+		t.Fatalf("seed owner epoch: %v", err)
+	}
+	proof := corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "node-a", Coordinator: "node-a", OwnerEpoch: "6",
+	}
+	if err := corrosion.WriteVMRescheduleProof(ctx, db, proof, "vm1", "node-a"); err != nil {
+		t.Fatalf("WriteVMRescheduleProof: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 7 WHERE name = 'vm1'`); err != nil {
+		t.Fatalf("advance owner epoch: %v", err)
+	}
+
+	var refused []string
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	r.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
+
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	r.startPendingVM(ctx, *fresh)
+
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a proof for owner epoch 6 must not start owner epoch 7")
+	}
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofPrepared {
+		t.Fatalf("stale proof status=%q (ok=%v); want prepared/unclaimed", pr.Status, ok)
+	}
+	if len(refused) != 1 || refused[0] != ReasonStaleEpoch {
+		t.Fatalf("refusal=%v; want [stale_epoch]", refused)
+	}
+}
+
+// The matching control prevents the stale-epoch guard from degenerating into a
+// blanket refusal of every proof that carries an owner epoch.
+func TestStartPendingVM_CurrentOwnerEpochProofStarts(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running", OwnerEpoch: 7,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 7 WHERE name = 'vm1'`); err != nil {
+		t.Fatalf("seed owner epoch: %v", err)
+	}
+	proof := corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "node-a", Coordinator: "node-a", OwnerEpoch: "7",
+	}
+	if err := corrosion.WriteVMRescheduleProof(ctx, db, proof, "vm1", "node-a"); err != nil {
+		t.Fatalf("WriteVMRescheduleProof: %v", err)
+	}
+
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	r.startPendingVM(ctx, *fresh)
+
+	if !startedOrDefined(fake, "vm1") {
+		t.Fatal("a proof matching current owner epoch 7 must authorize the start")
+	}
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofCompleted {
+		t.Fatalf("matching proof status=%q (ok=%v); want completed", pr.Status, ok)
+	}
+}
+
 // A pending VM carrying a proof MARKER must run the ExecutionGate even when local
 // enforcement is NOT latched (active=false): an asymmetric partition can deliver a
 // valid marker to a target that itself lacks quorum, and it must not start. The

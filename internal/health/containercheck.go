@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -320,6 +321,17 @@ func (c *ContainerChecker) claimRelocationProof(ctx context.Context, ct corrosio
 		slog.Warn("containercheck: relocation proof does not match this container/host, refusing",
 			"container", ct.Name, "proof", pr.ID)
 		c.noteGateRefused(corrosion.ActionRelocate, ReasonProofConflict)
+		return "", false
+	}
+	// A token identifies the attempt; owner_epoch identifies the ownership
+	// generation that attempt was authorized against. Reject a prepared proof
+	// that survived an intervening ownership change (ABA) before claiming it.
+	// Empty is the pre-epoch form and remains inert until owner_epoch_v1 flips.
+	if pr.OwnerEpoch != "" && pr.OwnerEpoch != strconv.FormatInt(ct.OwnerEpoch, 10) {
+		slog.Warn("containercheck: relocation proof owner epoch is stale, refusing",
+			"container", ct.Name, "proof", pr.ID, "proof_epoch", pr.OwnerEpoch,
+			"current_epoch", ct.OwnerEpoch)
+		c.noteGateRefused(corrosion.ActionRelocate, ReasonStaleEpoch)
 		return "", false
 	}
 	if err := corrosion.ClaimActionProof(ctx, c.db, pr.ID, c.hostName); err != nil {

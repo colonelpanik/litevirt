@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 )
 
@@ -94,12 +95,21 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 	// leave an orphan proof for a vanished VM or (astronomically) point a VM at a
 	// pre-existing proof on an id collision. applied=false → ErrNoRowsAffected.
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-		var n int
-		if err := tx.QueryRow(`SELECT COUNT(1) FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).Scan(&n); err != nil {
+		var currentOwnerEpoch int64
+		if err := tx.QueryRow(`SELECT vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).Scan(&currentOwnerEpoch); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
 			return false, err
 		}
-		if n == 0 {
-			return false, nil
+		if p.OwnerEpoch != "" {
+			expectedOwnerEpoch, err := strconv.ParseInt(p.OwnerEpoch, 10, 64)
+			if err != nil {
+				return false, err
+			}
+			if currentOwnerEpoch != expectedOwnerEpoch {
+				return false, nil
+			}
 		}
 		var existing int
 		if err := tx.QueryRow(`SELECT COUNT(1) FROM runtime_action_proofs WHERE id = ?`, p.ID).Scan(&existing); err != nil {

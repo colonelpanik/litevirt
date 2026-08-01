@@ -158,6 +158,30 @@ func TestWriteVMRescheduleProof_MissingVMRefuses(t *testing.T) {
 	}
 }
 
+// The proof row and pending transition are one decision. If ownership advances
+// after the coordinator's read but before this transaction, neither half may be
+// written under the stale generation.
+func TestWriteVMRescheduleProof_StaleOwnerEpochWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	apInsertVM(t, c, "vm1", "host-a", "running")
+	if err := c.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 7 WHERE name = 'vm1'`); err != nil {
+		t.Fatalf("seed owner epoch: %v", err)
+	}
+	p := apProof("p1", "vm1", "host-b")
+	p.OwnerEpoch = "6"
+	if err := WriteVMRescheduleProof(ctx, c, p, "vm1", "host-b"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("stale owner epoch: err=%v; want ErrNoRowsAffected", err)
+	}
+	if _, ok, _ := GetActionProof(ctx, c, "p1"); ok {
+		t.Fatal("stale decision must not leave an orphan proof")
+	}
+	vm, _ := GetVM(ctx, c, "vm1")
+	if vm == nil || vm.HostName != "host-a" || vm.State != "running" || vm.PendingActionID != "" {
+		t.Fatalf("stale decision mutated VM: %+v", vm)
+	}
+}
+
 // CompleteVMStartProof is atomic in BOTH preconditions: if the VM no longer
 // points at the proof, neither the proof nor the VM is mutated (no half-write
 // where the proof completes but the VM is untouched).

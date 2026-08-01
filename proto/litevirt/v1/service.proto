@@ -1438,6 +1438,12 @@ message RuntimeActionProof {
     // a proof minted by a pre-fence_epoch node ⇒ a new executor fails a shared-disk
     // transfer closed. Additive/wire-compatible.
     string fence_epoch      = 12;
+    // owner_epoch is the ownership-generation binding for the owning resource
+    // (vm/container) where applicable. It is an ABA-breaker: a proof bound to one
+    // owner epoch cannot authorize actions after the resource ownership has
+    // advanced. Empty on a proof minted by a pre-owner_epoch node ⇒ the executor
+    // skips the comparison until owner_epoch_v1 enforcement. Additive/wire-compatible.
+    string owner_epoch      = 13;
 }
 
 message PromoteReplicaRequest {

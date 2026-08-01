@@ -16906,7 +16906,13 @@ type RuntimeActionProof struct {
 	// Format: "host=<old-owner>;fence_id=<fencing_log id>;ts=<rfc3339>". Empty on
 	// a proof minted by a pre-fence_epoch node ⇒ a new executor fails a shared-disk
 	// transfer closed. Additive/wire-compatible.
-	FenceEpoch    string `protobuf:"bytes,12,opt,name=fence_epoch,json=fenceEpoch,proto3" json:"fence_epoch,omitempty"`
+	FenceEpoch string `protobuf:"bytes,12,opt,name=fence_epoch,json=fenceEpoch,proto3" json:"fence_epoch,omitempty"`
+	// owner_epoch is the ownership-generation binding for the owning resource
+	// (vm/container) where applicable. It is an ABA-breaker: a proof bound to one
+	// owner epoch cannot authorize actions after the resource ownership has
+	// advanced. Empty on a proof minted by a pre-owner_epoch node ⇒ the executor
+	// skips the comparison until owner_epoch_v1 enforcement. Additive/wire-compatible.
+	OwnerEpoch    string `protobuf:"bytes,13,opt,name=owner_epoch,json=ownerEpoch,proto3" json:"owner_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -17021,6 +17027,13 @@ func (x *RuntimeActionProof) GetRelocationToken() string {
 func (x *RuntimeActionProof) GetFenceEpoch() string {
 	if x != nil {
 		return x.FenceEpoch
+	}
+	return ""
+}
+
+func (x *RuntimeActionProof) GetOwnerEpoch() string {
+	if x != nil {
+		return x.OwnerEpoch
 	}
 	return ""
 }
@@ -24643,7 +24656,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04data\x18\a \x01(\fR\x04data\"W\n" +
 	"\x1cPushReplicaIncrementResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12#\n" +
-	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\x9c\x03\n" +
+	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\xbd\x03\n" +
 	"\x12RuntimeActionProof\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06action\x18\x02 \x01(\tR\x06action\x12\x1f\n" +
@@ -24661,7 +24674,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" \x01(\x05R\fquorumNeeded\x12)\n" +
 	"\x10relocation_token\x18\v \x01(\tR\x0frelocationToken\x12\x1f\n" +
 	"\vfence_epoch\x18\f \x01(\tR\n" +
-	"fenceEpoch\"\x95\x02\n" +
+	"fenceEpoch\x12\x1f\n" +
+	"\vowner_epoch\x18\r \x01(\tR\n" +
+	"ownerEpoch\"\x95\x02\n" +
 	"\x15PromoteReplicaRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_pool\x18\x02 \x01(\tR\n" +

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -268,6 +269,10 @@ func (c *Coordinator) now() time.Time {
 		return c.Now()
 	}
 	return time.Now()
+}
+
+func ownerEpochString(epoch int64) string {
+	return strconv.FormatInt(epoch, 10)
 }
 
 // Start runs the coordinator loop. Blocks until ctx is cancelled.
@@ -1161,6 +1166,18 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", vmFailurePolicy(vm))
 
 		if c.gateEnforced(ctx) {
+			// ListVMs deliberately omits operation-control columns, including
+			// vm_owner_epoch. Re-read the full authoritative row at the decision
+			// boundary so the proof binds the real ownership generation; the
+			// transactional writer checks the same epoch again to close the race.
+			freshVM, ferr := corrosion.GetVM(ctx, c.db, vm.Name)
+			if ferr != nil || freshVM == nil || freshVM.HostName != h.Name {
+				slog.Warn("failover: VM ownership changed before proof mint; deferring",
+					"vm", vm.Name, "expected_host", h.Name, "error", ferr)
+				c.mVM(ActionReschedule, ResultError, ErrDBError)
+				continue
+			}
+			vm = *freshVM
 			// Enforcement active: re-check DecisionGate (quorum + coordinator-eligible;
 			// the lease is already held in this failover path) as close to the write as
 			// possible, then write a durable proof linked to the pending transition so
@@ -1188,6 +1205,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
+				OwnerEpoch: ownerEpochString(vm.OwnerEpoch),
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -1300,6 +1318,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
 				TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 				LeaseHolder: c.hostName, RelocationToken: token,
+				OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
 			}
 			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
@@ -1439,6 +1458,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
 			TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 			LeaseHolder: c.hostName, RelocationToken: relocToken,
+			OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
 		}
 		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)

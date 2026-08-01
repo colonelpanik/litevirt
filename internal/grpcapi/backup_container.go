@@ -430,6 +430,7 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 			proof = &pb.RuntimeActionProof{
 				Id: pr.ID, Action: pr.Action, TargetKind: pr.TargetKind, TargetName: pr.TargetName,
 				DestHost: pr.DestHost, Coordinator: pr.Coordinator, RelocationToken: pr.RelocationToken,
+				OwnerEpoch: pr.OwnerEpoch,
 			}
 		} else if s.gateActive(ctx) {
 			// Under enforcement the coordinator minted a proof for this token; a miss

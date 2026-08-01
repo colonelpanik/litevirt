@@ -405,6 +405,13 @@ type VMSpec struct {
 	Tpm           bool   `protobuf:"varint,38,opt,name=tpm,proto3" json:"tpm,omitempty"`                                 // emulated TPM 2.0 device (Windows 11 / BitLocker)
 	Uuid          string `protobuf:"bytes,39,opt,name=uuid,proto3" json:"uuid,omitempty"`                                // stable domain identity; makes the libvirt swtpm path deterministic
 	MaxCpu        int32  `protobuf:"varint,40,opt,name=max_cpu,json=maxCpu,proto3" json:"max_cpu,omitempty"`             // vCPU hotplug ceiling; >cpu emits <vcpu current=cpu>max_cpu</vcpu> for live CPU add (live_resize)
+	// on_host_failure is the host-loss policy as a plain string ("restart-any" |
+	// "restart-same" | "none"; "" = legacy/none). It exists because the failover
+	// coordinator reads the PERSISTED spec JSON's top-level "on_host_failure" key,
+	// and MigrationPolicy.on_host_failure cannot express that: RESTART_ANY is enum
+	// value 0, which encoding/json omitempty drops entirely on store, making
+	// restart-any indistinguishable from unset. The string field round-trips.
+	OnHostFailure string `protobuf:"bytes,41,opt,name=on_host_failure,json=onHostFailure,proto3" json:"on_host_failure,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -717,6 +724,13 @@ func (x *VMSpec) GetMaxCpu() int32 {
 		return x.MaxCpu
 	}
 	return 0
+}
+
+func (x *VMSpec) GetOnHostFailure() string {
+	if x != nil {
+		return x.OnHostFailure
+	}
+	return ""
 }
 
 type DiskSpec struct {
@@ -5499,7 +5513,7 @@ var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x94\f\n" +
+	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xbc\f\n" +
 	"\x06VMSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -5547,7 +5561,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"secureBoot\x12\x10\n" +
 	"\x03tpm\x18& \x01(\bR\x03tpm\x12\x12\n" +
 	"\x04uuid\x18' \x01(\tR\x04uuid\x12\x17\n" +
-	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x1a9\n" +
+	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x12&\n" +
+	"\x0fon_host_failure\x18) \x01(\tR\ronHostFailure\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb5\x01\n" +

@@ -111,6 +111,13 @@ message VMSpec {
     bool  tpm             = 38;  // emulated TPM 2.0 device (Windows 11 / BitLocker)
     string uuid           = 39;  // stable domain identity; makes the libvirt swtpm path deterministic
     int32  max_cpu        = 40;  // vCPU hotplug ceiling; >cpu emits <vcpu current=cpu>max_cpu</vcpu> for live CPU add (live_resize)
+    // on_host_failure is the host-loss policy as a plain string ("restart-any" |
+    // "restart-same" | "none"; "" = legacy/none). It exists because the failover
+    // coordinator reads the PERSISTED spec JSON's top-level "on_host_failure" key,
+    // and MigrationPolicy.on_host_failure cannot express that: RESTART_ANY is enum
+    // value 0, which encoding/json omitempty drops entirely on store, making
+    // restart-any indistinguishable from unset. The string field round-trips.
+    string on_host_failure = 41;
 }
 
 message DiskSpec {

@@ -271,6 +271,17 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 		case "none":
 			onFailure = pb.HostFailurePolicy_FAILURE_NONE
 		}
+		// Mirror the policy into the top-level string field: the failover
+		// coordinator resolves it from the persisted spec JSON, where the enum
+		// is unusable (RESTART_ANY = 0 is omitempty-dropped on store).
+		switch onFailure {
+		case pb.HostFailurePolicy_RESTART_SAME:
+			spec.OnHostFailure = "restart-same"
+		case pb.HostFailurePolicy_FAILURE_NONE:
+			spec.OnHostFailure = "none"
+		default:
+			spec.OnHostFailure = "restart-any"
+		}
 		spec.Migrate = &pb.MigrationPolicy{
 			Strategy:        strategy,
 			MaxDowntime:     vm.Migrate.MaxDowntime,

@@ -1197,3 +1197,38 @@ func diskNames(spec *pb.VMSpec) []string {
 	}
 	return names
 }
+
+// TestBuildVMSpec_OnHostFailureString pins the persisted-spec contract the
+// failover coordinator depends on: vmFailurePolicy reads the stored spec
+// JSON's top-level "on_host_failure" string, and MigrationPolicy's enum
+// cannot round-trip it (RESTART_ANY is value 0, dropped by omitempty). The
+// conversion must therefore mirror the yaml policy into VMSpec.OnHostFailure.
+func TestBuildVMSpec_OnHostFailureString(t *testing.T) {
+	f := baseFile("stack", nil)
+	cases := []struct {
+		yaml string
+		want string
+	}{
+		{"", "restart-any"}, // migrate stanza present → compose default is restart-any
+		{"restart-any", "restart-any"},
+		{"restart-same", "restart-same"},
+		{"none", "none"},
+	}
+	for _, tc := range cases {
+		vm := &VMDef{
+			Image: "ubuntu", CPU: 1, Memory: 512,
+			Migrate: &MigrateDef{OnHostFailure: tc.yaml},
+		}
+		spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
+		if spec.OnHostFailure != tc.want {
+			t.Errorf("yaml %q: spec.OnHostFailure = %q, want %q", tc.yaml, spec.OnHostFailure, tc.want)
+		}
+	}
+
+	// No migrate stanza → no policy: preserves today's coordinator behavior
+	// (empty ⇒ skip on host failure) for VMs that never asked for HA.
+	plain := &VMDef{Image: "ubuntu", CPU: 1, Memory: 512}
+	if spec := mustBuildVMSpec(t, "vm1", "vm1", plain, f); spec.OnHostFailure != "" {
+		t.Errorf("no migrate stanza: spec.OnHostFailure = %q, want empty", spec.OnHostFailure)
+	}
+}

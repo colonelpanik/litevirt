@@ -297,7 +297,13 @@ func CompleteVMStartProof(ctx context.Context, c *Client, id, vmName, executor s
 	}, []Statement{
 		{SQL: `UPDATE runtime_action_proofs SET status = 'completed', executor_host = ?, completed_at = ?, updated_at = ?
 		        WHERE id = ?`, Params: []interface{}{executor, now, now, id}},
-		{SQL: `UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?
+		// Phase 4: completion mints the new ownership generation in the SAME
+		// mutation that clears pending — the reschedule's read-old → prove →
+		// move → mint-new ordering. The executor claimed the proof against the
+		// old epoch; after this lands, a replay of that proof is stale by
+		// construction.
+		{SQL: `UPDATE vms SET state = 'running', pending_action_id = '',
+		        vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
 		        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`, Params: []interface{}{now, vmName, id}},
 	})
 	if err != nil {

@@ -20,6 +20,14 @@ increment → increment test red.
 
 ## Step 2 — route the eight call sites
 
+Ordering refinement (spec: mint AFTER the move lands): the six
+completion-style sites below transfer-and-complete in one write and route
+through incrementing TransferVMOwner directly. The reschedule pair is split:
+the coordinator's pending write (coordinator.go:1215) moves host_name at the
+SAME epoch under a CAS guard (non-incrementing variant), and the executor's
+completion mutation — the one that clears pending and sets running — carries
+the +1. That is the read-old → prove → move → mint-new ordering.
+
 Genuine transfers → TransferVMOwner with a freshly-read expected epoch:
 - internal/failover/coordinator.go:1215 (reschedule pending commit — the
   coordinator already re-reads the row under the gate since da6b63a; reuse

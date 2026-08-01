@@ -801,6 +801,21 @@ func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state strin
 	return nil
 }
 
+// TransferVMOwnerFresh is TransferVMOwner for completion-style sites that do
+// not carry a decision-time epoch: it reads the row and CASes on what it just
+// read. The CAS still matters — between the read and the write a concurrent
+// transition can land, and this loses cleanly instead of overwriting it.
+func TransferVMOwnerFresh(ctx context.Context, c *Client, name, hostName, state string) error {
+	vm, err := GetVM(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	if vm == nil {
+		return ErrNoRowsAffected
+	}
+	return TransferVMOwner(ctx, c, name, hostName, state, vm.OwnerEpoch)
+}
+
 // DeleteVM tombstones a VM and its interfaces/disks, plus the v42 hardware
 // tables (vm_nics, vm_pci_intent, vm_pci_realizations) — mirroring the
 // vm_interfaces/vm_disks bulk tombstone: vm_name is not the whole PK on any of

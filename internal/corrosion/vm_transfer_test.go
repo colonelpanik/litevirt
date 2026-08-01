@@ -87,3 +87,18 @@ func TestTransferVMOwner_DeletedOrMissingVMWritesNothing(t *testing.T) {
 		t.Fatalf("tombstoned VM: err = %v, want ErrNoRowsAffected", err)
 	}
 }
+
+func TestTransferVMOwnerFresh_IncrementsFromCurrentRow(t *testing.T) {
+	db, ctx := transferFixture(t)
+
+	if err := TransferVMOwnerFresh(ctx, db, "vm1", "host-b", "running"); err != nil {
+		t.Fatalf("TransferVMOwnerFresh: %v", err)
+	}
+	vm, _ := GetVM(ctx, db, "vm1")
+	if vm == nil || vm.HostName != "host-b" || vm.OwnerEpoch != 7 {
+		t.Fatalf("fresh transfer: got %+v, want host-b epoch 7", vm)
+	}
+	if err := TransferVMOwnerFresh(ctx, db, "absent", "host-b", "running"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("missing VM: err = %v, want ErrNoRowsAffected", err)
+	}
+}

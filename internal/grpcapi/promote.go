@@ -795,7 +795,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 	} else {
-		if err := corrosion.UpdateVMHost(ctx, s.db, targetName, s.hostName, "running"); err != nil {
+		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
+		if err := corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running"); err != nil {
 			return status.Errorf(codes.Internal, "re-home vm record: %v", err)
 		}
 		if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, targetName, src.DiskName, s.hostName, livePath); err != nil {

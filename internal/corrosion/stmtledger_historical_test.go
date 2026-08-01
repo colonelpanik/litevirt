@@ -55,7 +55,7 @@ import (
 // stays accepted, and its identity is otherwise unchanged; DispAuditReseal makes
 // the receiver execute the GUARDED form regardless of which shape arrived, so a
 // legacy sender still works and a signed row is unreachable by any reseal.
-const compatibilityDigest = "abe10ef483dd134ab022f98210ca576b27847f1ca9e9950cc6ecf62401745226"
+const compatibilityDigest = "07c9c609d450bb1f5dc8536ee1f1d6c642b9fbfeffaf48978fb1080bd1b8d5e8"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -114,6 +114,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"claim_project_authority_v41":           1,   // initial authority claim when the epoch was the literal 1
 	"audit_log_insert_v44":                  1,   // audit insert before key_id/signature/seq
 	"audit_reseal_v44":                      1,   // audit reseal before it refused to touch a signed row
+	"complete_vm_start_pre_epoch_v47":       1,   // reschedule completion before the Phase 4 owner-epoch mint
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

@@ -1044,7 +1044,8 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 
 	// Hand the VM to the target, PRESERVING its (stopped) state. On failure, roll
 	// the disks AND target back and abort (source still owns it + is intact).
-	if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
+	// Phase 4: migration commit is an ownership transition (fresh-read CAS + increment).
+	if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
 		rollbackDisks()
 		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
 		return status.Errorf(codes.Internal, "reassign VM %q to %s: %v", vm.Name, targetHost.Name, err)

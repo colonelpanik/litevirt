@@ -181,5 +181,14 @@ func HistoricalShapes() []HistoricalShape {
 		      (project, authority_epoch, holder, transfer_kind, fence_proof_ref, created_at, updated_at, deleted_at)
 		      VALUES (?, 1, ?, 'initial', '', ?, ?, NULL)`, "claim_project_authority_v41")
 
+	// CompleteVMStartProof before Phase 4: the completion mutation cleared the
+	// pending pointer without minting the owner epoch. A peer on the older
+	// build still emits this shape during a rolling upgrade; accepting it keeps
+	// the stream flowing (the epoch mint simply doesn't happen for transitions
+	// completed by old executors — the Phase 4 backfill/readiness pass accounts
+	// for that before owner_epoch_v1 can latch).
+	add(`UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?
+		        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`, "complete_vm_start_pre_epoch_v47")
+
 	return out
 }

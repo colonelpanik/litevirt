@@ -208,8 +208,18 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 		// Decision-complete: every workload-capable peer answered ABSENT and the VM
 		// runs here → reclaim ownership with a fresh timestamp (wins by ordinary
 		// LWW everywhere). Non-destructive: a DB row write only.
-		if err := corrosion.UpdateVMHost(ctx, r.db, name, r.hostName, RuntimeRunning); err != nil {
-			slog.Warn("owner-assert: UpdateVMHost failed", "vm", name, "error", err)
+		//
+		// Phase 4: the re-key is an ownership transition — CAS on the epoch the
+		// decision was made against and advance it. A lost CAS means the row moved
+		// while probes ran; refuse and let the next assert pass re-decide.
+		fresh, gerr := corrosion.GetVM(ctx, r.db, name)
+		if gerr != nil || fresh == nil {
+			slog.Warn("owner-assert: re-read before re-key failed", "vm", name, "error", gerr)
+			r.observeOwnerAssert(name, "error")
+			return
+		}
+		if err := corrosion.TransferVMOwner(ctx, r.db, name, r.hostName, RuntimeRunning, fresh.OwnerEpoch); err != nil {
+			slog.Warn("owner-assert: epoch-guarded re-key refused or failed", "vm", name, "error", err)
 			r.observeOwnerAssert(name, "error")
 			return
 		}

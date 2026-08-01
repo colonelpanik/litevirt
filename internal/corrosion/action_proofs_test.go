@@ -88,6 +88,13 @@ func TestActionProof_LifecycleSingleUse(t *testing.T) {
 	if vm.State != "running" || vm.PendingActionID != "" {
 		t.Fatalf("after complete: state=%q pending_action_id=%q; want running/empty", vm.State, vm.PendingActionID)
 	}
+	// Phase 4: completion is where the reschedule mints the new ownership
+	// generation — claim happened at the old epoch, the increment lands in the
+	// SAME mutation that clears pending, so a replayed proof is stale by
+	// construction (read-old → prove → move → mint-new).
+	if vm.OwnerEpoch != 1 {
+		t.Fatalf("completion must mint the new owner epoch, got %d want 1", vm.OwnerEpoch)
+	}
 
 	// A completed proof can't be re-claimed → single use.
 	if err := ClaimActionProof(ctx, c, "p1", "host-b"); !errors.Is(err, ErrProofSpent) {

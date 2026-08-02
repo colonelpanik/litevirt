@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -179,7 +178,12 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: plan.specNets,
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	// CreatedAt is left empty ON PURPOSE: the corrosion writer stamps it with
+	// nanosecond precision, and that stamp is the row's INCARNATION identity —
+	// anti-entropy uses it to tell a genuine recreate from a stale pre-delete
+	// copy. Pre-filling a bare-second stamp here (as this site used to) would
+	// make a same-second delete+recreate indistinguishable from the incarnation
+	// the delete killed.
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: info.Name,
 		State: info.State, Image: chooseImage(req.Image, info.Image),
@@ -188,7 +192,6 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Project:       req.Project, // UpsertContainer normalizes "" → "_default"
 		OnHostFailure: req.OnHostFailure,
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
-		CreatedAt:     now,
 	}
 	// Write the container row + managed interface rows in ONE atomic batch. Fail
 	// closed: the runtime container exists but the DB write failed → delete the

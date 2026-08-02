@@ -1279,17 +1279,20 @@ func (r *Reconciler) convergeOwnerEpochMarker(ctx context.Context, name string) 
 	if err != nil || row == nil || row.OwnerEpoch == 0 {
 		return
 	}
-	cur, ok, gerr := r.virt.GetDomainOwnerEpoch(name)
-	if gerr == nil && ok && cur == row.OwnerEpoch {
-		return
+	// Each marker converges INDEPENDENTLY. A single early-return keyed on the
+	// metadata copy meant that once metadata matched, the durable file was never
+	// created — so the check that reads the file stayed blind (lab, 2026-08-02).
+	if cur, ok, gerr := r.virt.GetDomainOwnerEpoch(name); gerr != nil || !ok || cur != row.OwnerEpoch {
+		if serr := r.virt.SetDomainOwnerEpoch(name, row.OwnerEpoch, true); serr != nil {
+			slog.Warn("reconciler: owner-epoch marker convergence failed (will retry next sweep)",
+				"vm", name, "epoch", row.OwnerEpoch, "error", serr)
+		}
 	}
-	if serr := r.virt.SetDomainOwnerEpoch(name, row.OwnerEpoch, true); serr != nil {
-		slog.Warn("reconciler: owner-epoch marker convergence failed (will retry next sweep)",
-			"vm", name, "epoch", row.OwnerEpoch, "error", serr)
-	}
-	if ferr := WriteVMOwnerEpochMarker(r.dataDir, name, row.OwnerEpoch); ferr != nil {
-		slog.Warn("reconciler: owner-epoch file marker convergence failed (will retry next sweep)",
-			"vm", name, "epoch", row.OwnerEpoch, "error", ferr)
+	if cur, ok, ferr := ReadVMOwnerEpochMarker(r.dataDir, name); ferr != nil || !ok || cur != row.OwnerEpoch {
+		if werr := WriteVMOwnerEpochMarker(r.dataDir, name, row.OwnerEpoch); werr != nil {
+			slog.Warn("reconciler: owner-epoch file marker convergence failed (will retry next sweep)",
+				"vm", name, "epoch", row.OwnerEpoch, "error", werr)
+		}
 	}
 }
 

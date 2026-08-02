@@ -2,6 +2,8 @@ package health
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -745,6 +747,24 @@ func TestReconcile_ConvergesOwnerEpochMarker(t *testing.T) {
 	r.reconcile(ctx)
 	if e, ok, _ := fake.GetDomainOwnerEpoch("vm1"); !ok || e != 9 {
 		t.Fatalf("missing marker not converged: (%d,%v), want (9,true)", e, ok)
+	}
+
+	// The DURABLE file marker converges too.
+	if e, ok, err := ReadVMOwnerEpochMarker(r.dataDir, "vm1"); err != nil || !ok || e != 9 {
+		t.Fatalf("file marker = (%d,%v,%v), want (9,true,nil)", e, ok, err)
+	}
+
+	// …and INDEPENDENTLY of the metadata copy. This is the exact lab state: the
+	// metadata marker already matches the row (a running VM the sweep has seen
+	// before) while the durable file is absent. A single early-return keyed on
+	// metadata left the file uncreated forever, which is what blinded the
+	// superseded check on real libvirt.
+	if err := os.Remove(filepath.Join(r.dataDir, "vms", "vm1", "owner_epoch")); err != nil {
+		t.Fatalf("remove file marker: %v", err)
+	}
+	r.reconcile(ctx)
+	if e, ok, err := ReadVMOwnerEpochMarker(r.dataDir, "vm1"); err != nil || !ok || e != 9 {
+		t.Fatalf("file marker not recreated while metadata already matched: (%d,%v,%v), want (9,true,nil)", e, ok, err)
 	}
 
 	// Stale marker → repaired.

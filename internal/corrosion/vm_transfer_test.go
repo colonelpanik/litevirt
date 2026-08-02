@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 )
@@ -236,5 +237,72 @@ func TestBackfillOwnerEpochs(t *testing.T) {
 	}
 	if vm0b, _ := GetVM(ctx, db, "mine-0"); vm0b.OwnerEpoch != 1 {
 		t.Fatalf("re-backfill double-stamped: %d, want 1", vm0b.OwnerEpoch)
+	}
+}
+
+// The container twin of UpdateVMStateAtEpoch. A rejoined node that missed a
+// relocation still holds its own container row LIVE (it never received the
+// tombstone), so its drift-heal write matched locally and then beat the
+// tombstone on ordinary LWW — resurrecting a row the relocation had retired
+// (lab, 2026-08-02: source row back at 08:59:24 vs tombstone 08:56:13).
+// Carrying the epoch in the WHERE clause makes the statement replicate with its
+// own precondition.
+func TestSetContainerStateAtEpoch(t *testing.T) {
+	db, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	ctx := context.Background()
+	if err := InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running", Image: "alpine",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE containers SET owner_epoch = 4 WHERE host_name = ? AND name = ?`,
+		"host-a", "ct1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale epoch: nothing changes.
+	if err := SetContainerStateAtEpoch(ctx, db, "host-a", "ct1", "stopped", 3); err != nil {
+		t.Fatalf("stale write returned an error: %v", err)
+	}
+	if ct, _ := GetContainer(ctx, db, "host-a", "ct1"); ct == nil || ct.State != "running" {
+		t.Fatalf("a stale-epoch write changed the row: %+v", ct)
+	}
+
+	// Matching epoch: applies, and does NOT disturb the generation.
+	if err := SetContainerStateAtEpoch(ctx, db, "host-a", "ct1", "stopped", 4); err != nil {
+		t.Fatalf("matching write: %v", err)
+	}
+	ct, _ := GetContainer(ctx, db, "host-a", "ct1")
+	if ct == nil || ct.State != "stopped" || ct.OwnerEpoch != 4 {
+		t.Fatalf("after matching write: %+v, want stopped at epoch 4", ct)
+	}
+
+	// A tombstoned row is never revived, whatever the epoch.
+	if err := DeleteContainer(ctx, db, "host-a", "ct1"); err != nil {
+		t.Fatalf("DeleteContainer: %v", err)
+	}
+	if err := SetContainerStateAtEpoch(ctx, db, "host-a", "ct1", "running", 4); err != nil {
+		t.Fatalf("post-tombstone write: %v", err)
+	}
+	// Read the raw row: GetContainer hides soft-deleted rows, so asserting it
+	// returns nil would pass even if the write had flipped the state underneath.
+	var state string
+	var deletedAt sql.NullString
+	if err := db.DB().QueryRowContext(ctx,
+		`SELECT state, deleted_at FROM containers WHERE host_name = ? AND name = ?`,
+		"host-a", "ct1").Scan(&state, &deletedAt); err != nil {
+		t.Fatalf("raw read: %v", err)
+	}
+	if !deletedAt.Valid || deletedAt.String == "" {
+		t.Fatalf("tombstone was cleared: deleted_at=%v", deletedAt)
+	}
+	if state != "stopped" {
+		t.Fatalf("a tombstoned container's state was written: %q, want it untouched at \"stopped\"", state)
 	}
 }

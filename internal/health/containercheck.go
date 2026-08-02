@@ -102,6 +102,29 @@ func (c *ContainerChecker) SetGateRefusedObserver(fn func(action, reason string)
 	c.onGateRefused = fn
 }
 
+// stateWriteGated reports whether this node may assert container cluster state
+// from its own local runtime observation right now. It must not while it lacks
+// quorum: a node that was down through a relocation still holds a LIVE copy of
+// the source row, its drift heal matches that copy locally, and the resulting
+// newer updated_at then DEFEATS the relocation's tombstone on ordinary LWW when
+// the tombstone finally arrives (shouldSkipLWW keeps the strictly-newer local
+// row; ruleTombstone only arbitrates exact-instant ties). The row is then live
+// on the rejoining node forever — the duplicate_live_container the lab produced
+// on 2026-08-02. Withholding the write until quorum means convergence delivers
+// the tombstone first and there is nothing left to heal.
+//
+// Gated on split_brain_gate_v1, matching the reconciler's self-heal site: no
+// latch, no behavior change. Returns the refusal reason for the metric.
+func (c *ContainerChecker) stateWriteGated(ctx context.Context) (bool, string) {
+	if c.gate == nil || !c.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+		return false, ""
+	}
+	if g := c.gate.ExecutionGate(ctx); !g.OK {
+		return true, g.Reason
+	}
+	return false, ""
+}
+
 func (c *ContainerChecker) noteGateRefused(action, reason string) {
 	if c.onGateRefused != nil {
 		c.onGateRefused(action, reason)
@@ -463,6 +486,12 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 		// Reality: up (FROZEN maps to running). Heal cluster drift and clear any
 		// stale stop cause so a later unexpected stop is judged fresh.
 		if ct.State != "running" {
+			if refused, reason := c.stateWriteGated(ctx); refused {
+				slog.Warn("containercheck: withholding drift heal — no quorum",
+					"container", ct.Name, "reason", reason, "runtime", "running")
+				c.noteGateRefused(corrosion.OpContainerState, reason)
+				return
+			}
 			if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", ""); err != nil {
 				if errors.Is(err, corrosion.ErrNoRowsAffected) {
 					// Row vanished between the sweep list and here (concurrent
@@ -492,6 +521,12 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	// Operator intent always wins (the container analogue of vms.state_detail).
 	if ct.StateDetail == operatorStopDetail {
 		if ct.State != "stopped" {
+			if refused, reason := c.stateWriteGated(ctx); refused {
+				slog.Warn("containercheck: withholding operator-stop heal — no quorum",
+					"container", ct.Name, "reason", reason)
+				c.noteGateRefused(corrosion.OpContainerState, reason)
+				return
+			}
 			if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", operatorStopDetail); err != nil {
 				slog.Warn("containercheck: operator-stop heal write failed", "container", ct.Name, "error", err)
 				c.noteStateWriteFail(corrosion.OpContainerState, err)
@@ -504,7 +539,16 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	if rp == nil {
 		// No policy: heal state drift only — don't fabricate a stop cause or act.
 		if ct.State != "stopped" {
-			if err := corrosion.SetContainerState(ctx, c.db, c.hostName, ct.Name, "stopped"); err != nil {
+			if refused, reason := c.stateWriteGated(ctx); refused {
+				slog.Warn("containercheck: withholding no-policy state heal — no quorum",
+					"container", ct.Name, "reason", reason)
+				c.noteGateRefused(corrosion.OpContainerState, reason)
+				return
+			}
+			// Carries the generation this decision was made against, so the
+			// statement replicates with its own precondition and a peer whose
+			// row has moved to a new owner generation matches nothing.
+			if err := corrosion.SetContainerStateAtEpoch(ctx, c.db, c.hostName, ct.Name, "stopped", ct.OwnerEpoch); err != nil {
 				slog.Warn("containercheck: no-policy state heal write failed", "container", ct.Name, "error", err)
 				c.noteStateWriteFail(corrosion.OpContainerState, err)
 			}
@@ -517,6 +561,12 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	// restartDecision reads (containers have no libvirt-style cause, so we pass
 	// cause="" and let the detail drive the decision).
 	if ct.State != "stopped" || ct.StateDetail != outOfBandDestroyDetail {
+		if refused, reason := c.stateWriteGated(ctx); refused {
+			slog.Warn("containercheck: withholding out-of-band stop record — no quorum",
+				"container", ct.Name, "reason", reason)
+			c.noteGateRefused(corrosion.OpContainerState, reason)
+			return
+		}
 		if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", outOfBandDestroyDetail); err != nil {
 			slog.Warn("containercheck: out-of-band stop record write failed", "container", ct.Name, "error", err)
 			c.noteStateWriteFail(corrosion.OpContainerState, err)

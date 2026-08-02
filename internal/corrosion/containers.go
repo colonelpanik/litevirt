@@ -270,6 +270,24 @@ func SetContainerState(ctx context.Context, c *Client, hostName, name, state str
 		state, now, hostName, name)
 }
 
+// SetContainerStateAtEpoch is SetContainerState carrying the ownership
+// generation the caller decided against, so the statement REPLICATES with its
+// own precondition — a peer whose row has moved on matches nothing.
+//
+// This is the container twin of UpdateVMStateAtEpoch, and it exists for a
+// failure the lab produced on 2026-08-02: a node that was down during a
+// relocation never received the source-row tombstone, so on rejoin its own copy
+// was still live, its drift-heal write matched locally, and that write then beat
+// the tombstone on ordinary LWW (08:59:24 vs 08:56:13) — resurrecting a row the
+// relocation had retired. The deleted_at predicate is kept as well: a tombstoned
+// row is never revived, whatever the epoch.
+func SetContainerStateAtEpoch(ctx context.Context, c *Client, hostName, name, state string, expectedEpoch int64) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`UPDATE containers SET state = ?, updated_at = ? WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND owner_epoch = ?`,
+		state, now, hostName, name, expectedEpoch)
+}
+
 // SetContainerStateStrict is SetContainerState (no state_detail) that reports a
 // zero-row UPDATE as ErrNoRowsAffected instead of a silent success — the no-detail
 // twin of SetContainerStateDetailStrict, for must-exist writes that intentionally

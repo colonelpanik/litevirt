@@ -565,3 +565,38 @@ func TestContainerCheck_RelocateRecreate_OCIFallsBackToImage(t *testing.T) {
 		t.Errorf("recreate used template %q, want the image reference", got)
 	}
 }
+
+// A rejoining node must not write container state drift from its own stale
+// replica before it has quorum. On the lab (2026-08-02) node-3 came back after
+// a relocation it never saw, its no-policy drift heal matched its own still-live
+// row, and that write beat the relocation's tombstone on LWW — resurrecting a
+// retired row cluster-wide. The write is gated the same way the VM self-heal is.
+func TestContainerCheck_QuorumlessNodeDoesNotHealStateDrift(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "running", Image: "alpine:3.19",
+	})
+	if err := db.Execute(ctx, `UPDATE containers SET owner_epoch = 3 WHERE host_name='node1' AND name='ct1'`); err != nil {
+		t.Fatal(err)
+	}
+	// Local runtime says stopped, the row says running: drift the checker would
+	// normally heal.
+	rt.states["ct1"] = lxc.StateStopped
+
+	c := NewContainerChecker("node1", db, rt)
+	c.SetGate(fakeGate{exec: GateResult{OK: false, Reason: ReasonNoQuorum}, active: true})
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if got := mustGetCt(t, db, "ct1"); got.State != "running" {
+		t.Fatalf("a quorumless node healed state drift: state=%q, want the row untouched", got.State)
+	}
+
+	// Control: with quorum the same drift IS healed — the gate is not a freeze.
+	c.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+	if got := mustGetCt(t, db, "ct1"); got.State != "stopped" {
+		t.Fatalf("with quorum the drift must be healed: state=%q, want stopped", got.State)
+	}
+}

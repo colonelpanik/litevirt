@@ -69,6 +69,18 @@ lv ls
 Add more hosts with `lv host init root@<ip> --name node-2` — they auto-join and start replicating.
 Full walkthrough in [docs/installation.md](docs/installation.md).
 
+### macOS (client only)
+
+The daemon (`litevirt daemon`) hosts VMs and needs **Linux + KVM/QEMU**. The same binary is also
+the CLI/UI client, and that half runs anywhere — so a Mac can drive a remote Linux cluster over
+gRPC/mTLS. macOS builds ship in every release, and via the Homebrew tap:
+
+```bash
+brew install colonelpanik/litevirt/litevirt
+export LV_HOST=<host>          # remote node; gRPC/mTLS on :7443 (creds in ~/.config/litevirt/pki)
+lv host ls
+```
+
 ## Features
 
 | | |

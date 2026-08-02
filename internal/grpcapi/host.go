@@ -436,7 +436,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	if fresh.State == "running" && !hasLocalOnly {
 		// Live migrate — disks are on shared storage. (Ownership confirmed above.)
 		progress.Strategy = pb.MigrateStrategy_MIGRATE_LIVE
-		dconnuri := fmt.Sprintf("qemu+tls://%s/system", target.Address)
+		dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
 		if err := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true}); err != nil {
 			slog.Warn("live migration failed during drain, falling back to cold",
 				"vm", vm.Name, "error", err)

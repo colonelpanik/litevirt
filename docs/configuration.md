@@ -44,6 +44,31 @@ anti_entropy_interval_sec: 0
 # Cluster membership port (used for peer discovery).
 gossip_port: 7946
 
+# Address peers reach this host on. Sets BOTH the gossip advertise address and
+# the host record this daemon self-registers — they must agree, or peers dial an
+# address the host certificate does not cover and every replication push fails
+# the TLS hostname check.
+#
+# Empty (default) auto-detects, which is only safe on an unambiguously
+# single-homed host: the host record takes the source IP toward the DEFAULT
+# ROUTE, while gossip takes the first private IP by INTERFACE ENUMERATION ORDER.
+# Those are different heuristics and can pick different interfaces.
+#
+# SET THIS on any host with more than one network — a separate management NIC, a
+# NAT'd or container fabric, a storage network. The failure is quiet and
+# confusing when the auto-detected address is identical on every node (e.g. a
+# NAT'd 10.0.2.15): gossip membership looks healthy and every node lists its
+# peers by name, but each one dials ITSELF, so the cluster never converges and
+# the logs show "certificate is valid for <real ip>, not <wrong ip>".
+#
+# MUST be a bare IPv4 literal — no port, no brackets, no hostname. The daemon
+# refuses to start otherwise. IPv6 is rejected because cluster transport is
+# IPv4-only today: gossip and gRPC both bind 0.0.0.0. Nothing downstream would
+# catch a v6 value — memberlist accepts it and gossips it over the v4-only mesh,
+# so the node boots looking healthy, no peer can reach it, and the failure
+# detector marks it suspect and fences a host that was never down.
+advertise_address: ""
+
 # Path to TLS certificates (CA, host cert/key).
 pki_dir: "/etc/litevirt/pki"
 
@@ -159,6 +184,18 @@ enforcement:
                               # cluster-wide latch only forms once EVERY node has it enabled — the
                               # barrier is never relied upon until the whole fleet has opted in. Enable
                               # fleet-uniformly; the flag is the reversible kill switch.
+                              #
+                              # REQUIRED FOR HOTPLUG. Device attach/detach — disk, NIC, and
+                              # concrete-address PCI — refuse while this is off, because each
+                              # is journaled and at-most-once and has no un-journaled path:
+                              #   Error: attach disk: disk attach requires the
+                              #   operation_protocol_v1 capability to be active
+                              # A cluster left at the default therefore has no working
+                              # `lv attach-disk` / `lv detach-disk` / `lv attach-nic` /
+                              # `lv detach-nic`. That is deliberate, but the error names only
+                              # the capability, so see this flag. Note the capability activates
+                              # only once EVERY node has the flag on AND the token has latched
+                              # cluster-wide: enabling it on one node changes nothing.
   live_resize: false          # allow TRUE live CPU hot-add + balloon-memory resize. Setting a VM's
                               # max_cpu vCPU-hotplug ceiling is refused until this latches cluster-wide
                               # (an old peer could drop max_cpu from a spec it rewrites), after which

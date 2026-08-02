@@ -45,10 +45,25 @@ func (c *Client) AttachNIC(domainName, bridge, model, mac string) error {
 }
 
 // DetachNIC hot-detaches a network interface by MAC address.
+//
+// The device element must carry the interface's REAL type and source. libvirt
+// parses and validates it, and a MAC alone marshals to `type="bridge"` with an
+// EMPTY <source>, which fails validation with "Missing required attribute
+// 'bridge' in element 'source'" — an error that describes the XML we sent, not
+// anything the operator did. Reading the live domain and reusing the
+// interface's own type/source keeps the element valid (and correct for a
+// non-bridge source). Falls back to the MAC-only shape when the interface
+// cannot be found, where the detach is a no-op anyway.
 func (c *Client) DetachNIC(domainName, mac string) error {
 	iface := interfaceDevice{
 		Type: "bridge",
 		MAC:  ifaceMAC{Address: mac},
+	}
+	if xmlText, err := c.DumpXML(domainName); err == nil {
+		if typ, src, ok := InterfaceSourceByMAC(xmlText, mac); ok {
+			iface.Type = typ
+			iface.Source = src
+		}
 	}
 	return c.detachDeviceXML(domainName, iface)
 }

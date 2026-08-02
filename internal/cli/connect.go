@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -185,8 +186,10 @@ func connectRemote(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {
 	if idx := strings.Index(addr, "@"); idx >= 0 {
 		addr = addr[idx+1:]
 	}
+	// JoinHostPort, not Sprintf: SplitHostPort fails on a bare IPv6 literal
+	// (LV_HOST=fd00::1), and "%s:%d" would then mangle it into fd00::1:7443.
 	if _, _, err := net.SplitHostPort(addr); err != nil {
-		addr = fmt.Sprintf("%s:%d", addr, cfg.GRPCPort)
+		addr = net.JoinHostPort(addr, strconv.Itoa(cfg.GRPCPort))
 	}
 
 	tlsCfg, err := pki.ClientTLSConfig(cfg.PKIDir)

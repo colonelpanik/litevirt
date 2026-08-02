@@ -12,9 +12,9 @@ import (
 
 func TestSafeProvision_DirectSkipsSafeguard(t *testing.T) {
 	execCommand = func(name string, args ...string) ([]byte, error) {
-		// "ip link show dev lo" for the interface check
+		// Direct provisioning does not need safeguard commands.
 		if name == "ip" && len(args) > 0 && args[0] == "link" {
-			return []byte("1: lo: <LOOPBACK,UP,LOWER_UP>"), nil
+			return []byte("1: loopback: <LOOPBACK,UP,LOWER_UP>"), nil
 		}
 		return nil, nil
 	}
@@ -29,17 +29,18 @@ func TestSafeProvision_DirectSkipsSafeguard(t *testing.T) {
 		t.Fatalf("InitSchema: %v", err)
 	}
 
+	loopback := testLoopbackInterface(t)
 	def := compose.NetworkDef{
 		Type:      "direct",
-		Interface: "lo",
+		Interface: loopback,
 	}
 
 	result, err := SafeProvision(ctx, db, "test-direct", def, "127.0.0.1", "test-host")
 	if err != nil {
 		t.Fatalf("SafeProvision direct: %v", err)
 	}
-	if result != "direct:lo" {
-		t.Fatalf("expected direct:lo, got %s", result)
+	if want := "direct:" + loopback; result != want {
+		t.Fatalf("expected %s, got %s", want, result)
 	}
 }
 

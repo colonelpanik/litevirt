@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"text/tabwriter"
 
@@ -85,7 +86,9 @@ func newHostAddCmd() *cobra.Command {
 				if err == nil {
 					for _, h := range resp.Hosts {
 						if h.Address != "" {
-							peerAddrs = append(peerAddrs, fmt.Sprintf("%s:7946", h.Address))
+							// JoinHostPort: h.Address is a bare host from the
+							// hosts table and lands in the new node's join_peers.
+							peerAddrs = append(peerAddrs, net.JoinHostPort(h.Address, "7946"))
 						}
 					}
 				}

@@ -5,11 +5,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/litevirt/litevirt/internal/daemon"
 )
 
 // This file is the claim-vs-code triangulation guard: it makes CI fail when the
@@ -121,6 +125,175 @@ func TestDocsReferenceRealMetrics(t *testing.T) {
 			"Fix the doc, add the identifier in code, allowlist it in knownAbsentIdentifiers (with a reason), or add `ci:skip-metric` to the line.",
 			len(problems), strings.Join(problems, "\n  "))
 	}
+}
+
+// TestDocsDocumentEveryCLICommand is the REVERSE direction of
+// TestDocsReferenceRealCLICommands: that one catches a doc referencing a command
+// that no longer exists; this one catches a command that ships with no doc at
+// all. Both directions are needed — a brand-new command group is invisible to
+// the forward check, which is exactly how `lv operation` shipped undocumented.
+//
+// Only user-facing runnable commands count. Hidden and deprecated commands are
+// exempt (they are deliberately not advertised), as are cobra's built-ins.
+// Intentional omissions go in undocumentedCommands with a reason.
+func TestDocsDocumentEveryCLICommand(t *testing.T) {
+	root := newRootCmd()
+	rootDir := repoRoot(t)
+
+	documented := map[string]bool{}
+	for _, f := range docFiles(t, rootDir) {
+		content, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, args := range extractInvocations(string(content)) {
+			if cmd := resolveInvocation(root, args); cmd != nil {
+				// A reference to `lv operation show` documents the leaf AND
+				// establishes that the `operation` group exists.
+				for c := cmd; c != nil && c != root; c = c.Parent() {
+					documented[commandPath(c)] = true
+				}
+			}
+		}
+	}
+
+	var missing []string
+	walkCommands(root, func(c *cobra.Command) {
+		path := commandPath(c)
+		if path == "" || !c.Runnable() || c.Hidden || c.Deprecated != "" {
+			return
+		}
+		if _, ok := undocumentedCommands[path]; ok {
+			return
+		}
+		if !documented[path] {
+			missing = append(missing, path)
+		}
+	})
+
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Errorf("%d CLI command(s) are not referenced anywhere in README.md or docs/*.md:\n  lv %s\n\n"+
+			"Document the command, mark it Hidden if it is not user-facing, or add it to undocumentedCommands (with a reason).",
+			len(missing), strings.Join(missing, "\n  lv "))
+	}
+}
+
+// undocumentedCommands lists command paths intentionally absent from the docs.
+// Each must say why; remove the entry when the command is documented.
+var undocumentedCommands = map[string]string{}
+
+// TestDocsDocumentEveryConfigKey is the config-file analogue of the CLI checks:
+// every yaml key an operator can set must appear somewhere in README.md or
+// docs/*.md. The CLI guards walk the cobra tree and so cannot see config keys —
+// which is exactly how advertise_address shipped undocumented, a key whose
+// absence silently prevents a multi-homed cluster from ever converging.
+//
+// Membership, not prose quality: a key that appears anywhere in the docs passes.
+// That is enough to catch the real failure — adding a knob and never mentioning it.
+func TestDocsDocumentEveryConfigKey(t *testing.T) {
+	rootDir := repoRoot(t)
+	var docs strings.Builder
+	for _, f := range docFiles(t, rootDir) {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		docs.Write(b)
+	}
+	text := docs.String()
+
+	keys := configYAMLKeys(reflect.TypeOf(daemon.Config{}), map[reflect.Type]bool{})
+	if len(keys) == 0 {
+		t.Fatal("found no yaml keys on daemon.Config — reflection path wrong?")
+	}
+
+	var missing []string
+	for _, k := range keys {
+		if _, ok := undocumentedConfigKeys[k]; ok {
+			continue
+		}
+		if !strings.Contains(text, k) {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Errorf("%d config key(s) are not mentioned anywhere in README.md or docs/*.md:\n  %s\n\n"+
+			"Document the key (docs/configuration.md is the reference), or add it to "+
+			"undocumentedConfigKeys (with a reason).",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
+// undocumentedConfigKeys lists yaml keys intentionally absent from the docs.
+// Each must say why; remove the entry when the key is documented.
+var undocumentedConfigKeys = map[string]string{}
+
+// configYAMLKeys collects every yaml tag reachable from a config struct,
+// descending through nested structs, pointers, slices, and maps so keys inside
+// blocks like `auth:` and `enforcement:` are covered too. seen guards against a
+// recursive type looping forever.
+func configYAMLKeys(rt reflect.Type, seen map[reflect.Type]bool) []string {
+	for rt.Kind() == reflect.Pointer || rt.Kind() == reflect.Slice || rt.Kind() == reflect.Map {
+		rt = rt.Elem()
+	}
+	if rt.Kind() != reflect.Struct || seen[rt] {
+		return nil
+	}
+	seen[rt] = true
+
+	var keys []string
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if tag := strings.Split(f.Tag.Get("yaml"), ",")[0]; tag != "" && tag != "-" {
+			keys = append(keys, tag)
+		}
+		keys = append(keys, configYAMLKeys(f.Type, seen)...)
+	}
+	return keys
+}
+
+// commandPath is a command's full path with the binary name stripped —
+// "host upgrade" for `lv host upgrade`, "" for the root itself.
+func commandPath(c *cobra.Command) string {
+	parts := strings.Fields(c.CommandPath())
+	if len(parts) <= 1 {
+		return ""
+	}
+	return strings.Join(parts[1:], " ")
+}
+
+// walkCommands invokes fn for every command in the tree, root included.
+func walkCommands(c *cobra.Command, fn func(*cobra.Command)) {
+	fn(c)
+	for _, child := range c.Commands() {
+		walkCommands(child, fn)
+	}
+}
+
+// resolveInvocation walks doc-extracted args down the cobra tree and returns the
+// DEEPEST command they resolve to, or nil if the first token isn't a command.
+// It is the read-side counterpart to validateInvocation, which reports the first
+// token that fails to resolve.
+func resolveInvocation(root *cobra.Command, args []string) *cobra.Command {
+	cur := root
+	for _, tok := range args {
+		if tok == "" || tok == "help" || tok == "completion" ||
+			strings.HasPrefix(tok, "-") ||
+			strings.ContainsAny(tok, "<>[]{}|&;$`\"'=()") || assignRE.MatchString(tok) {
+			break
+		}
+		child := findChild(cur, tok)
+		if child == nil {
+			break
+		}
+		cur = child
+	}
+	if cur == root {
+		return nil
+	}
+	return cur
 }
 
 // checkIdentifier returns an error message if tok isn't backed by code, or "".
@@ -320,17 +493,47 @@ func TestValidateInvocation(t *testing.T) {
 	}{
 		{[]string{"ls"}, ""},
 		{[]string{"run", "--name", "web", "--image", "ubuntu"}, ""},
-		{[]string{"start", "<vm>"}, ""},      // placeholder arg to a leaf
-		{[]string{"host", "upgrade"}, ""},    // real nested subcommand
+		{[]string{"start", "<vm>"}, ""},   // placeholder arg to a leaf
+		{[]string{"host", "upgrade"}, ""}, // real nested subcommand
 		{[]string{"compose", "up", "-f", "x.yml"}, ""},
-		{[]string{"help"}, ""},               // cobra built-in
-		{[]string{"host", "help"}, ""},       // cobra built-in under a group
-		{[]string{"frobnicate"}, "frobnicate"},          // bogus top-level command
-		{[]string{"host", "frobnicate"}, "frobnicate"},  // bogus subcommand of a group
+		{[]string{"help"}, ""},                         // cobra built-in
+		{[]string{"host", "help"}, ""},                 // cobra built-in under a group
+		{[]string{"frobnicate"}, "frobnicate"},         // bogus top-level command
+		{[]string{"host", "frobnicate"}, "frobnicate"}, // bogus subcommand of a group
 	}
 	for _, tc := range cases {
 		if got := validateInvocation(root, tc.args); got != tc.bad {
 			t.Errorf("validateInvocation(%v) = %q, want %q", tc.args, got, tc.bad)
+		}
+	}
+}
+
+// TestResolveInvocation pins the read-side resolver the reverse guard depends
+// on: it must return the DEEPEST command a doc reference reaches, so a mention
+// of `lv host upgrade` credits the leaf and not just the group, and must return
+// nil for anything that isn't a command at all.
+func TestResolveInvocation(t *testing.T) {
+	root := newRootCmd()
+	cases := []struct {
+		args []string
+		want string // expected resolved command path, "" for nil
+	}{
+		{[]string{"ls"}, "ls"},
+		{[]string{"host", "upgrade"}, "host upgrade"},          // deepest, not "host"
+		{[]string{"host", "upgrade", "node1"}, "host upgrade"}, // positional arg ends the path
+		{[]string{"start", "<vm>"}, "start"},                   // placeholder ends the path
+		{[]string{"compose", "up", "-f", "x.yml"}, "compose up"},
+		{[]string{"frobnicate"}, ""}, // not a command
+		{[]string{"--help"}, ""},     // flag first
+		{[]string{"help"}, ""},       // cobra built-in
+	}
+	for _, tc := range cases {
+		var got string
+		if cmd := resolveInvocation(root, tc.args); cmd != nil {
+			got = commandPath(cmd)
+		}
+		if got != tc.want {
+			t.Errorf("resolveInvocation(%v) = %q, want %q", tc.args, got, tc.want)
 		}
 	}
 }
@@ -343,8 +546,8 @@ func TestCheckIdentifier(t *testing.T) {
 	}{
 		{"litevirt_foo_total", true},
 		{"litevirt_bar", false},
-		{"litevirt_foo_*", true}, // glob prefix in prose
-		{"litevirt_label_", true}, // trailing-underscore prefix
+		{"litevirt_foo_*", true},                        // glob prefix in prose
+		{"litevirt_label_", true},                       // trailing-underscore prefix
 		{"litevirt_audit_chain_last_verified_ok", true}, // allowlisted roadmap metric
 	}
 	for _, tc := range cases {

@@ -2,8 +2,51 @@ package corrosion
 
 import (
 	"context"
+	"net"
 	"testing"
 )
+
+func TestPeerTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		addr string
+		port int
+		want string
+	}{
+		{"ipv4 explicit port", "10.0.0.5", 9443, "10.0.0.5:9443"},
+		{"ipv4 default port", "10.0.0.5", 0, "10.0.0.5:7443"},
+		{"ipv6 bracketed", "fd00::1", 9443, "[fd00::1]:9443"},
+		{"ipv6 default port", "::1", 0, "[::1]:7443"},
+		{"hostname", "node-b.example", 7443, "node-b.example:7443"},
+	} {
+		got := PeerTarget(tc.addr, tc.port)
+		if got != tc.want {
+			t.Errorf("%s: PeerTarget(%q,%d) = %q, want %q", tc.name, tc.addr, tc.port, got, tc.want)
+		}
+		// Every target must round-trip through SplitHostPort — that is the
+		// property a raw Sprintf("%s:%d") silently violates for IPv6.
+		if _, _, err := net.SplitHostPort(got); err != nil {
+			t.Errorf("%s: PeerTarget(%q,%d) = %q is not a parseable target: %v",
+				tc.name, tc.addr, tc.port, got, err)
+		}
+	}
+}
+
+func TestURIHost(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"ipv4 untouched", "10.0.0.5", "10.0.0.5"},
+		{"hostname untouched", "node-b.example", "node-b.example"},
+		{"ipv6 bracketed", "fd00::1", "[fd00::1]"},
+		{"ipv6 loopback", "::1", "[::1]"},
+		{"already bracketed is not double-bracketed", "[fd00::1]", "[fd00::1]"},
+		{"v4-mapped v6 is an IPv4 address", "::ffff:10.0.0.5", "::ffff:10.0.0.5"},
+		{"empty untouched", "", ""},
+	} {
+		if got := URIHost(tc.in); got != tc.want {
+			t.Errorf("%s: URIHost(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
 
 func TestResolvePeerTarget(t *testing.T) {
 	c := mustTestClient(t)

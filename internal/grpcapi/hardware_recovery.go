@@ -619,7 +619,7 @@ func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, v
 
 	if running {
 		if live, e := s.virt.DumpXML(vm.Name); e == nil && nicMacInXML(live, mac) {
-			if e := s.virt.DetachNIC(vm.Name, mac); e != nil {
+			if e := s.detachNICIfPresent(vm.Name, mac); e != nil {
 				slog.Error("hardware op recovery: nic detach live-detach failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
 				return
 			}

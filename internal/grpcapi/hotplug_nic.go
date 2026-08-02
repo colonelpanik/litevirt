@@ -451,7 +451,7 @@ func (s *Server) failNICAttach(ctx context.Context, rb *nicAttachRollback, code 
 	rolledBack := true
 
 	if rb.attached {
-		if err := s.virt.DetachNIC(rb.vm.Name, rb.mac); err != nil {
+		if err := s.detachNICIfPresent(rb.vm.Name, rb.mac); err != nil {
 			slog.Error("nic attach rollback: inverse-detach failed", "vm", rb.vm.Name, "mac", rb.mac, "error", err)
 			rolledBack = false
 		}
@@ -698,7 +698,7 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, m
 	}
 
 	if running {
-		if err := s.virt.DetachNIC(vm.Name, mac); err != nil {
+		if err := s.detachNICIfPresent(vm.Name, mac); err != nil {
 			// The irreversible step failed and nothing changed → clean terminal fail.
 			return s.failNICDetachClean(ctx, vm, opID, epoch, newGen, mac,
 				codes.Internal, fmt.Errorf("detach nic: %w", err))

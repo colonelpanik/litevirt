@@ -256,4 +256,3 @@ func cleanTelemetryEnv(t *testing.T) {
 		_ = os.Unsetenv(k)
 	}
 }
-

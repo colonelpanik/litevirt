@@ -75,5 +75,8 @@ tmp/
 .claude/
 CLAUDE.local.md
 
+# Isolated local feature worktrees.
+.worktrees/
+
 # Local planning artifacts (superpowers specs/plans) — not part of the repo
 docs/superpowers/

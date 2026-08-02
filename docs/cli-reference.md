@@ -558,6 +558,18 @@ lv lb enable <lb> --backend <vm>                  # Re-enable
 
 ## Hot-plug (attach/detach)
 
+**Requires `enforcement.operation_protocol`.** These commands are journaled and
+at-most-once, and refuse while the `operation_protocol_v1` capability is
+inactive — which is the default:
+
+```
+Error: attach disk: disk attach requires the operation_protocol_v1 capability to be active
+```
+
+The capability activates only once **every** node has `enforcement.operation_protocol: true`
+and the token has latched cluster-wide, so enabling it on one host changes nothing.
+See docs/configuration.md.
+
 ```bash
 lv hardware-ls <vm>                               # List a VM's disks/NICs/PCI devices
 lv attach-disk <vm> <disk> --size 50G [--bus virtio]
@@ -618,6 +630,7 @@ lv sg rm <id>
 lv sg rule-add <sg-id> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
 lv sg rule-ls <sg-id>
+lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
   # --network matches the compose network name on the NIC; --sg is repeatable
   # (an empty --sg list clears the bindings).

@@ -124,10 +124,11 @@ func New(cfg *Config) (*Daemon, error) {
 
 	// Open embedded state store and join gossip cluster
 	db, err := corrosion.NewClient(corrosion.Config{
-		HostName:  cfg.HostName,
-		DataDir:   cfg.DataDir,
-		BindPort:  cfg.GossipPort,
-		JoinPeers: cfg.JoinPeers,
+		HostName:      cfg.HostName,
+		DataDir:       cfg.DataDir,
+		BindPort:      cfg.GossipPort,
+		AdvertiseAddr: cfg.AdvertiseAddress,
+		JoinPeers:     cfg.JoinPeers,
 	}, clock)
 	if err != nil {
 		return nil, fmt.Errorf("state store: %w", err)
@@ -1181,8 +1182,7 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 		serial = "unknown"
 	}
 
-	// Get host address
-	addr := getOutboundIP()
+	addr := d.hostAddress()
 
 	return corrosion.InsertHost(ctx, d.db, corrosion.HostRecord{
 		Name:          d.cfg.HostName,
@@ -1340,6 +1340,19 @@ func fileBasedPoolDriver(driver string) bool {
 		return true
 	}
 	return false
+}
+
+// hostAddress is the address this daemon registers itself at — the address peers
+// will dial. The configured advertise address wins when set: it is the SAME
+// value handed to gossip, and the two must agree or peers dial an address the
+// host certificate does not cover. Falling back to getOutboundIP only reports
+// the source IP toward the default route, which is the wrong answer on a
+// multi-homed host whose cluster network is not the default one.
+func (d *Daemon) hostAddress() string {
+	if d.cfg.AdvertiseAddress != "" {
+		return d.cfg.AdvertiseAddress
+	}
+	return getOutboundIP()
 }
 
 func getOutboundIP() string {

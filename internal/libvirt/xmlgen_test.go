@@ -954,3 +954,43 @@ func TestGenerateDomainXML_HostdevNoAlias(t *testing.T) {
 		t.Errorf("expected no <alias> element when Alias is unset; got:\n%s", xmlOut)
 	}
 }
+
+// TestInterfaceSourceByMAC pins the lookup DetachNIC depends on. Without it the
+// detach element is `type="bridge"` with an EMPTY <source>, which libvirt
+// rejects — "Missing required attribute 'bridge' in element 'source'" —
+// describing the XML we sent rather than anything the operator did. Reproduced
+// on a live cluster detaching a NIC from an isolated-network bridge.
+func TestInterfaceSourceByMAC(t *testing.T) {
+	const dom = `<domain type='kvm'><devices>
+	  <interface type='bridge'>
+	    <mac address='52:54:00:AA:BB:CC'/>
+	    <source bridge='br-iso-net'/>
+	  </interface>
+	  <interface type='network'>
+	    <mac address='52:54:00:11:22:33'/>
+	    <source network='default'/>
+	  </interface>
+	</devices></domain>`
+
+	// Matched case-insensitively — domain XML casing varies by source.
+	typ, src, ok := InterfaceSourceByMAC(dom, "52:54:00:aa:bb:cc")
+	if !ok {
+		t.Fatal("bridge NIC not found by MAC")
+	}
+	if typ != "bridge" || src.Bridge != "br-iso-net" {
+		t.Fatalf("got type=%q bridge=%q, want bridge/br-iso-net", typ, src.Bridge)
+	}
+
+	// A non-bridge interface must report its OWN type: describing it as a bridge
+	// would send an element that does not match the device.
+	if typ, _, ok := InterfaceSourceByMAC(dom, "52:54:00:11:22:33"); !ok || typ != "network" {
+		t.Fatalf("got type=%q ok=%v, want network/true", typ, ok)
+	}
+
+	if _, _, ok := InterfaceSourceByMAC(dom, "52:54:00:de:ad:00"); ok {
+		t.Fatal("absent MAC reported as found")
+	}
+	if _, _, ok := InterfaceSourceByMAC("not xml", "52:54:00:aa:bb:cc"); ok {
+		t.Fatal("unparseable document reported as found")
+	}
+}

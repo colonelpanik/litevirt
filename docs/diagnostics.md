@@ -22,6 +22,54 @@ clears the barrier only via the exact owner-epoch + spec-generation
 compare-and-swap — so it can never clear a newer operation's barrier, and an
 ordinary mutation's `--force` never bypasses the barrier.
 
+## `hardware_v2` — typed hardware and the one capability with no kill switch
+
+`hardware_v2` makes the typed hardware tables (disks, NICs, PCI intents) the
+source of truth instead of the free-form VM spec, and unlocks hardware mutation
+on a **stopped** VM. Until it activates, attaching a PCI device to a VM that
+isn't running is refused outright:
+
+```
+Error: stopped-VM PCI attach for "web" is not available until hardware_v2 is active
+```
+
+Every other token in the split-brain/hardening family is gated on an
+`enforcement.*` flag you set fleet-uniformly (see docs/configuration.md).
+`hardware_v2` is the exception: it has **no flag of its own** and activates on
+its own once both conditions hold on every voting-eligible host —
+
+1. **`operation_protocol_v1` is latched.** Hardware mutations need the crash-safe
+   operation journal, so it is a hard prerequisite. That token *does* have a
+   flag — `enforcement.operation_protocol` — which is where an operator controls
+   `hardware_v2` indirectly.
+2. **The node's startup hardware audit has finished.** Each daemon populates the
+   typed tables from every VM's persistent domain definition at boot, and
+   withholds `hardware_v2` from the capabilities it advertises until that pass
+   completes. A node that advertised earlier could let the fleet latch — and stop
+   maintaining the legacy spec mirror — while its own tables were still empty, so
+   a peer would read hardware that isn't there.
+
+One node still working through its backfill therefore holds the entire cluster
+at pre-latch behavior. That is intended. Like the rest of the family the latch is
+monotone and durable: once formed it survives a restart and does not re-open if a
+peer later becomes unreachable.
+
+Use `lv hardware-ls <vm>` to see a VM's typed hardware.
+
+### Adoption state and blocked VMs
+
+The audit classifies each VM as it goes. A VM whose hardware it cannot reconcile
+— no readable persistent definition, or a PCI device set it cannot attribute
+unambiguously — is recorded **blocked** with a reason rather than adopted.
+
+Before the latch that verdict is informational and gates nothing. Once
+`hardware_v2` is latched, a blocked VM refuses hardware mutation **and refuses to
+start** until it is repaired and re-audited, failing with the recorded reason.
+
+To clear it: fix the underlying definition or device problem, then restart the
+daemon on the VM's host. The audit pass runs at startup, and a VM that now
+reconciles is adopted on that pass.
+
 ## `lv doctor divergence`
 
 Read-only.

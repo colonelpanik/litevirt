@@ -4,6 +4,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -362,5 +364,124 @@ func TestNormalizeTelemetry_SampleRate(t *testing.T) {
 				t.Errorf("SampleRate = %v; want %v", *tc.SampleRate, c.wantVal)
 			}
 		})
+	}
+}
+
+// TestLoadConfig_AdvertiseAddress: the key parses, and its absence leaves the
+// field empty so the daemon falls back to auto-detection (the pre-existing
+// single-homed behaviour).
+func TestLoadConfig_AdvertiseAddress(t *testing.T) {
+	write := func(t *testing.T, yaml string) Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", path)
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		return *cfg
+	}
+
+	cfg := write(t, "host_name: \"h\"\nadvertise_address: \"10.77.0.11\"\n")
+	if cfg.AdvertiseAddress != "10.77.0.11" {
+		t.Errorf("AdvertiseAddress = %q, want 10.77.0.11", cfg.AdvertiseAddress)
+	}
+
+	// Omitted ⇒ empty ⇒ auto-detect. A non-empty default would silently pin
+	// every existing single-homed deployment to one heuristic.
+	cfg = write(t, "host_name: \"h\"\n")
+	if cfg.AdvertiseAddress != "" {
+		t.Errorf("AdvertiseAddress = %q with the key omitted, want empty (auto-detect)", cfg.AdvertiseAddress)
+	}
+}
+
+// TestLoadConfig_AdvertiseAddressRejectsUndialable: advertise_address is the
+// address peers dial AND the address gossip announces, so a value the transport
+// cannot carry does not degrade gracefully — it makes every peer probe fail and
+// the failure detector fences a host that was never down. Refuse to boot instead.
+//
+// IPv6 is the specific trap: memberlist ACCEPTS a v6 advertise address while
+// gossip and gRPC stay bound to 0.0.0.0, so the daemon comes up looking fine and
+// then gets fenced. It must be rejected here, not discovered in production.
+func TestLoadConfig_AdvertiseAddressRejectsUndialable(t *testing.T) {
+	load := func(t *testing.T, value string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		body := "host_name: \"h\"\nadvertise_address: " + strconv.Quote(value) + "\n"
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", path)
+		return LoadConfig()
+	}
+
+	for _, c := range []struct {
+		name, value, wantErrSubstr string
+	}{
+		{"ipv6 global", "2001:db8::1", "IPv6 is not supported"},
+		{"ipv6 ula", "fd00::1", "IPv6 is not supported"},
+		{"ipv6 loopback", "::1", "IPv6 is not supported"},
+		{"ipv6 link-local with zone", "fe80::1%eth0", "IPv6 is not supported"},
+		{"bracketed ipv6", "[2001:db8::1]", "bare IPv4 literal"},
+		{"ipv4 with port", "10.77.0.11:7443", "bare IPv4 literal"},
+		{"hostname", "node-b.example.com", "bare IPv4 literal"},
+		{"cidr", "10.77.0.11/24", "bare IPv4 literal"},
+		{"garbage", "not-an-address", "bare IPv4 literal"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := load(t, c.value)
+			if err == nil {
+				t.Fatalf("LoadConfig accepted advertise_address %q; want a load error — "+
+					"an undialable advertise address fences healthy hosts", c.value)
+			}
+			if !strings.Contains(err.Error(), c.wantErrSubstr) {
+				t.Errorf("error = %q, want it to contain %q so the operator knows what to write",
+					err, c.wantErrSubstr)
+			}
+		})
+	}
+
+	for _, c := range []struct{ name, value, want string }{
+		{"plain ipv4", "10.77.0.11", "10.77.0.11"},
+		// Canonicalized: hosts.address, the gossip advertise address and the cert
+		// SAN must all agree on one spelling or every dial fails SAN verification.
+		{"v4-mapped v6 is canonicalized to dotted quad", "::ffff:10.77.0.11", "10.77.0.11"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := load(t, c.value)
+			if err != nil {
+				t.Fatalf("LoadConfig(%q): %v", c.value, err)
+			}
+			if cfg.AdvertiseAddress != c.want {
+				t.Errorf("AdvertiseAddress = %q, want %q", cfg.AdvertiseAddress, c.want)
+			}
+		})
+	}
+}
+
+// TestHostAddress_PrefersAdvertiseAddress: the host record a daemon
+// self-registers must use the configured advertise address, because that is the
+// address peers dial AND the same value gossip advertises. If this fell back to
+// getOutboundIP while gossip used the configured value (or vice versa), peers
+// would dial an address the host certificate does not cover.
+func TestHostAddress_PrefersAdvertiseAddress(t *testing.T) {
+	d := &Daemon{cfg: &Config{AdvertiseAddress: "10.77.0.11"}}
+	if got := d.hostAddress(); got != "10.77.0.11" {
+		t.Fatalf("hostAddress() = %q, want the configured advertise address 10.77.0.11", got)
+	}
+
+	// Unset ⇒ fall back to auto-detection. Assert only that it does NOT return
+	// the configured-address sentinel and is non-empty: the detected value
+	// depends on the host's routing table.
+	d = &Daemon{cfg: &Config{}}
+	got := d.hostAddress()
+	if got == "" {
+		t.Fatal("hostAddress() is empty with no advertise address; auto-detect must still yield something")
+	}
+	if got == "10.77.0.11" {
+		t.Fatalf("hostAddress() = %q with no advertise address configured — value leaked from config", got)
 	}
 }

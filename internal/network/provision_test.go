@@ -2,11 +2,27 @@ package network
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+func testLoopbackInterface(t *testing.T) string {
+	t.Helper()
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("list network interfaces: %v", err)
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			return iface.Name
+		}
+	}
+	t.Fatal("no loopback network interface found")
+	return ""
+}
 
 func TestProvision_Bridge(t *testing.T) {
 	var calls [][]string
@@ -75,11 +91,12 @@ func TestProvision_Bridge_PreExistingNAT_NoDHCP(t *testing.T) {
 		t.Fatalf("InitSchema: %v", err)
 	}
 
-	// "lo" always exists, so BridgeExists(lo) is true → bridgePreExisted, exactly
+	// Use the host loopback so BridgeExists is true → bridgePreExisted, exactly
 	// like a litevirt bridge on a re-provision. NAT default (nil→true), DHCP off.
+	loopback := testLoopbackInterface(t)
 	def := compose.NetworkDef{
 		Type:      "bridge",
-		Interface: "lo",
+		Interface: loopback,
 		Subnet:    "10.77.0.0/24",
 		DHCP:      false,
 	}
@@ -239,17 +256,17 @@ func TestProvision_Direct(t *testing.T) {
 		t.Fatalf("InitSchema: %v", err)
 	}
 
-	// Use "lo" which exists on all Linux systems.
+	loopback := testLoopbackInterface(t)
 	def := compose.NetworkDef{
 		Type:      "direct",
-		Interface: "lo",
+		Interface: loopback,
 	}
 	result, err := Provision(ctx, db, "test-direct", def, "10.0.0.1", "host1")
 	if err != nil {
 		t.Fatalf("Provision direct: %v", err)
 	}
-	if result != "direct:lo" {
-		t.Errorf("expected direct:lo, got %s", result)
+	if want := "direct:" + loopback; result != want {
+		t.Errorf("expected %s, got %s", want, result)
 	}
 }
 

@@ -12,9 +12,23 @@ Comprehensive tests that run against a live litevirt cluster. These exercise the
 
 ## Quick start
 
+Two variables are **required** and the suite silently skips without them:
+`LITEVIRT_E2E=1` opts in to touching a live cluster, and `LV_BIN` must point at
+the binary under test so a stale system-wide `lv` is never exercised by mistake.
+Miss either and the run prints one line and exits 0, which reads like a pass:
+
+```
+E2E: set LITEVIRT_E2E=1 to run live e2e tests; skipping
+E2E: LITEVIRT_E2E=1 but LV_BIN is not set — point LV_BIN at the binary under test
+```
+
 ```bash
 # Build fresh binaries
-make build-cli
+make build
+
+# Opt in, and pin the binary under test
+export LITEVIRT_E2E=1
+export LV_BIN=$PWD/bin/litevirt
 
 # Set target
 export LV_HOST=root@10.0.50.10
@@ -35,8 +49,9 @@ go test ./tests/e2e/ -v -timeout 10m -run TestError
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LV_HOST` | (required) | SSH target for CLI, e.g. `root@10.0.50.10` |
-| `LV_BIN` | `lv` | Path to lv binary |
+| `LITEVIRT_E2E` | (required) | Must be `1`. Without it the suite skips without running anything. |
+| `LV_BIN` | (required) | Path to the litevirt/lv binary under test. Enforced so a run can never silently exercise a stale system-wide `lv`. |
+| `LV_HOST` | (required for remote mode) | SSH target for CLI, e.g. `root@10.0.50.10`. Omit when running ON a cluster node. |
 | `E2E_IMAGE` | `ubuntu` | Base image name for test VMs |
 | `E2E_HOSTS` | (auto-detected) | Comma-separated host names |
 | `E2E_REST_URL` | `http://<first-host>:7446` | REST API base URL |

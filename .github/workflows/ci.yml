@@ -38,13 +38,24 @@ jobs:
       - name: Test
         run: go test ./internal/... ./cmd/... ./tests/fleet/
 
-  # Schema-versioning guard: a CREATE TABLE / ALTER / index added to
-  # internal/corrosion/schema.go must come with a CurrentSchemaVersion bump, or
-  # the mixed-version replication skew check can't tell a peer is out of date.
-  # The History↔version lockstep and the claim-vs-code (docs↔CLI/metrics)
-  # triangulation are enforced by `go test` above; this job adds the part that
-  # needs the diff — detecting array growth between the base and head revisions.
-  schema-guard:
+  # CI guardrails (see docs/upgrades.md → CI guardrails). Runs the `ci-guards`
+  # make target rather than re-listing its steps here: this job previously
+  # inlined a subset, so a guardrail added to the Makefile (stmtshapecheck) ran
+  # locally and silently never ran in CI. Delegating keeps the two in lockstep —
+  # a new guard is picked up here the moment it joins the target.
+  #
+  # The heart of it is the schema-versioning guard: a CREATE TABLE / ALTER /
+  # index added to internal/corrosion/schema.go must come with a
+  # CurrentSchemaVersion bump, or the mixed-version replication skew check can't
+  # tell a peer is out of date. That check needs the diff between base and head,
+  # which is why this job checks out full history.
+  ci-guards:
+    # The display name is pinned: branch protection on main requires a status
+    # check with this exact name, and a rename here means the required check
+    # never reports and every PR is blocked with green CI. Rename only together
+    # with the branch-protection setting (repo admin), after in-flight PRs
+    # carrying the old name have merged or rebased. The job now runs all of
+    # `make ci-guards`, of which the schema guard is one part.
     name: Schema version guard
     runs-on: ubuntu-latest
     steps:
@@ -57,13 +68,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Schema growth requires a version bump
+      - name: Guardrails (schema bump, writecheck, stmtshapecheck, docs truth)
         env:
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-        run: ./scripts/ci/check-schema-bump.sh
-
-      - name: No fail-open authoritative state writes
-        run: go run ./scripts/ci/writecheck -root .
+        run: make ci-guards
 
   release:
     name: Release
@@ -87,24 +95,14 @@ jobs:
       - name: Vendor UI assets
         run: make vendor-js
 
+      # Cross-compile the linux + darwin (client-only) binaries, tar them, and
+      # write a checksums file. Logic lives in the script (workflow-script policy).
       - name: Build release binaries
         env:
           COMMIT: ${{ github.sha }}
-        run: |
-          echo "Release version: ${VERSION}"
-          mkdir -p dist
-          for arch in amd64 arm64; do
-            echo "building linux/${arch}..."
-            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build \
-              -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
-              -o dist/litevirt ./cmd/litevirt
-            ( cd dist && ln -sf litevirt lv \
-              && tar -czf "litevirt-${VERSION}-linux-${arch}.tar.gz" litevirt lv \
-              && rm -f litevirt lv )
-          done
-          ( cd dist && sha256sum *.tar.gz > "litevirt-${VERSION}-checksums.txt" )
-          ls -l dist
+        run: ./scripts/ci/build-release.sh
 
+      # Publish the tarballs + checksums as a GitHub release.
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,3 +111,13 @@ jobs:
             --title "${VERSION}" \
             --generate-notes \
             dist/*.tar.gz dist/*checksums.txt
+
+      # Regenerate the Homebrew formula and push it to the tap. No-ops until the
+      # HOMEBREW_TAP_REPO variable + HOMEBREW_TAP_TOKEN secret are configured.
+      - name: Publish Homebrew formula
+        if: ${{ vars.HOMEBREW_TAP_REPO != '' }}
+        env:
+          REPO: ${{ github.repository }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: ./scripts/ci/brew-formula.sh

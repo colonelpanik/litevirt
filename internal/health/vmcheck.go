@@ -571,7 +571,7 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 		v.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 
-	dconnuri := fmt.Sprintf("qemu+tls://%s/system", target.Address)
+	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
 	if err := v.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{Live: true}); err != nil {
 		slog.Error("vmcheck: migration failed", "vm", vm.Name, "target", target.Name, "error", err)
 		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", fmt.Sprintf("migration to %s failed: %v", target.Name, err)); werr != nil {

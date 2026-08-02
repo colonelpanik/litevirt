@@ -262,7 +262,9 @@ func ensureLocalPeer(addr string, gossipPort int) error {
 		return err
 	}
 
-	peerAddr := fmt.Sprintf("%s:%d", addr, gossipPort)
+	// JoinHostPort: this string is written into the remote node's config.yaml as
+	// a join_peers entry, so a mangled IPv6 address becomes a permanent bad seed.
+	peerAddr := net.JoinHostPort(addr, strconv.Itoa(gossipPort))
 
 	// Get existing peers.
 	var peers []string

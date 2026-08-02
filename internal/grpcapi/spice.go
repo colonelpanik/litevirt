@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -65,7 +67,10 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 		return nil, status.Errorf(codes.Internal, "lookup host %q: %v", vm.HostName, err)
 	}
 
-	uri := fmt.Sprintf("spice://%s:%d", host.Address, port)
+	// JoinHostPort (not corrosion.PeerTarget, whose port-0 default is a gRPC
+	// concern) so the URI handed to a client stays parseable for an IPv6 host.
+	// Host/Port are still returned unbracketed for callers that build their own.
+	uri := fmt.Sprintf("spice://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
 	return &pb.GetSpiceInfoResponse{
 		Host: host.Address,
 		Port: int32(port),

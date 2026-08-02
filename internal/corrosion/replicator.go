@@ -1233,8 +1233,22 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 
 	case DispLegacyWorkloadDelete:
 		safe, err := legacyWorkloadDeleteMatchesPreAuthority(ctx, tx, s, sh)
-		if err != nil || !safe {
+		if err != nil {
 			return err
+		}
+		if !safe {
+			// A pre-authority tombstone from a peer whose row we hold at nonzero
+			// authority. Refusing is correct — the shape carries no authority to
+			// compare — but it must never again be SILENT: this returned a bare
+			// nil for a week while a relocation's source row stayed live on every
+			// peer (lab, 2026-08-02). Nothing back-pressures and the deleter still
+			// hides the row, so this counter is the only local evidence.
+			r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", "pre_authority_delete")
+			slog.Warn("replicator: refused a pre-authority workload delete (row kept live here)",
+				"table", tableName,
+				"reason", "local row carries an ownership generation; the sender must emit the authority-bearing tombstone",
+				"sender_upgrade_required", true)
+			return nil
 		}
 		return r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 

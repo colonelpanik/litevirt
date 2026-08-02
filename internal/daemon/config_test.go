@@ -4,6 +4,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -393,6 +395,70 @@ func TestLoadConfig_AdvertiseAddress(t *testing.T) {
 	cfg = write(t, "host_name: \"h\"\n")
 	if cfg.AdvertiseAddress != "" {
 		t.Errorf("AdvertiseAddress = %q with the key omitted, want empty (auto-detect)", cfg.AdvertiseAddress)
+	}
+}
+
+// TestLoadConfig_AdvertiseAddressRejectsUndialable: advertise_address is the
+// address peers dial AND the address gossip announces, so a value the transport
+// cannot carry does not degrade gracefully — it makes every peer probe fail and
+// the failure detector fences a host that was never down. Refuse to boot instead.
+//
+// IPv6 is the specific trap: memberlist ACCEPTS a v6 advertise address while
+// gossip and gRPC stay bound to 0.0.0.0, so the daemon comes up looking fine and
+// then gets fenced. It must be rejected here, not discovered in production.
+func TestLoadConfig_AdvertiseAddressRejectsUndialable(t *testing.T) {
+	load := func(t *testing.T, value string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		body := "host_name: \"h\"\nadvertise_address: " + strconv.Quote(value) + "\n"
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", path)
+		return LoadConfig()
+	}
+
+	for _, c := range []struct {
+		name, value, wantErrSubstr string
+	}{
+		{"ipv6 global", "2001:db8::1", "IPv6 is not supported"},
+		{"ipv6 ula", "fd00::1", "IPv6 is not supported"},
+		{"ipv6 loopback", "::1", "IPv6 is not supported"},
+		{"ipv6 link-local with zone", "fe80::1%eth0", "IPv6 is not supported"},
+		{"bracketed ipv6", "[2001:db8::1]", "bare IPv4 literal"},
+		{"ipv4 with port", "10.77.0.11:7443", "bare IPv4 literal"},
+		{"hostname", "node-b.example.com", "bare IPv4 literal"},
+		{"cidr", "10.77.0.11/24", "bare IPv4 literal"},
+		{"garbage", "not-an-address", "bare IPv4 literal"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := load(t, c.value)
+			if err == nil {
+				t.Fatalf("LoadConfig accepted advertise_address %q; want a load error — "+
+					"an undialable advertise address fences healthy hosts", c.value)
+			}
+			if !strings.Contains(err.Error(), c.wantErrSubstr) {
+				t.Errorf("error = %q, want it to contain %q so the operator knows what to write",
+					err, c.wantErrSubstr)
+			}
+		})
+	}
+
+	for _, c := range []struct{ name, value, want string }{
+		{"plain ipv4", "10.77.0.11", "10.77.0.11"},
+		// Canonicalized: hosts.address, the gossip advertise address and the cert
+		// SAN must all agree on one spelling or every dial fails SAN verification.
+		{"v4-mapped v6 is canonicalized to dotted quad", "::ffff:10.77.0.11", "10.77.0.11"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := load(t, c.value)
+			if err != nil {
+				t.Fatalf("LoadConfig(%q): %v", c.value, err)
+			}
+			if cfg.AdvertiseAddress != c.want {
+				t.Errorf("AdvertiseAddress = %q, want %q", cfg.AdvertiseAddress, c.want)
+			}
+		})
 	}
 }
 

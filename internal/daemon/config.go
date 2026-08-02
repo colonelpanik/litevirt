@@ -446,6 +446,10 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("host_name is required in config")
 	}
 
+	if err := normalizeAdvertiseAddress(cfg); err != nil {
+		return nil, err
+	}
+
 	// (No demote-vs-takeover timing invariant: majority reclaim is proof-gated, not
 	// timer-gated — see the QuorumLossDemoteAfterSec/KeepalivedStopTimeoutSec doc above.)
 	if cfg.QuorumLossDemoteAfterSec <= 0 || cfg.KeepalivedStopTimeoutSec <= 0 {
@@ -480,6 +484,50 @@ func LoadConfig() (*Config, error) {
 	normalizeTelemetry(&cfg.Telemetry)
 
 	return cfg, nil
+}
+
+// normalizeAdvertiseAddress validates and canonicalizes advertise_address.
+//
+// Unlike telemetry (fail-open by contract), this one MUST fail load. The value
+// feeds BOTH the gossip advertise address and the hosts.address record every
+// peer dials, so a value the cluster transport cannot carry is not cosmetic:
+// peers dial an address that does not answer, every health probe fails, and the
+// failure detector fences a host that was never down. Refusing to boot is the
+// mild outcome; the alternative is a fencing storm nobody can trace back to one
+// line of YAML.
+//
+// A hostname is rejected because memberlist rejects it too — FinalAdvertiseAddr
+// (net_transport.go) requires an IP literal — so this only moves an existing
+// startup failure earlier, with a message that says what to write instead.
+//
+// IPv6 is rejected because cluster transport is IPv4-only today: gossip binds
+// 0.0.0.0 (corrosion.NewClient defaults BindAddr, and the daemon never sets it)
+// and the gRPC listener is a hardcoded 0.0.0.0 bind. memberlist would happily
+// gossip a v6 advertise address over that v4-only mesh, which is exactly the
+// half-working state that produces the phantom failures above. Supporting IPv6
+// means a gossip bind key, dual-stack listeners and bracketed URIs throughout —
+// until that lands, say no here rather than half-yes at runtime.
+func normalizeAdvertiseAddress(cfg *Config) error {
+	if cfg.AdvertiseAddress == "" {
+		return nil // auto-detect; see the field doc for when that is safe
+	}
+	addr, err := netip.ParseAddr(cfg.AdvertiseAddress)
+	if err != nil {
+		return fmt.Errorf("invalid advertise_address %q: must be a bare IPv4 literal — "+
+			"no port, no brackets, no hostname (e.g. advertise_address: \"10.0.0.11\")",
+			cfg.AdvertiseAddress)
+	}
+	if !addr.Unmap().Is4() {
+		return fmt.Errorf("invalid advertise_address %q: IPv6 is not supported for cluster "+
+			"transport — gossip and gRPC both bind 0.0.0.0, so peers could not reach this "+
+			"host and every peer health probe would fail, marking it suspect. Use the "+
+			"host's IPv4 address on the cluster network", cfg.AdvertiseAddress)
+	}
+	// Canonicalize so hosts.address, the gossip advertise address and the cert
+	// SAN all agree on one spelling (notably ::ffff:10.0.0.11 → 10.0.0.11); a
+	// mismatch shows up as "certificate is valid for X, not Y" on every dial.
+	cfg.AdvertiseAddress = addr.Unmap().String()
+	return nil
 }
 
 // normalizeTelemetry canonicalizes the telemetry block and neutralizes invalid

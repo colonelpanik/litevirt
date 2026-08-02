@@ -694,6 +694,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfProjectAuthority
 	case capabilities.AuditSignatureV1:
 		return s.enfAuditSignature
+	case capabilities.OwnerEpochV1:
+		return s.enfOwnerEpoch
 	default:
 		return false
 	}

@@ -202,3 +202,68 @@ func TestFleet_OwnerEpoch_CurrentSyncStillApplies(t *testing.T) {
 		t.Fatalf("the sync must not disturb the generation: %+v", vm)
 	}
 }
+
+// TestFleet_OwnerEpoch_QuorumlessRejoinDoesNotDualRun covers the OTHER live
+// failure of 2026-08-01: the ~9s dual-run. A host that was down comes back
+// while a VM it believes it owns is already running elsewhere, its local domain
+// is gone (it rebooted), and its reconciler's "marked running but not in
+// libvirt" branch restarts it — a second live copy.
+//
+// The pre-convergence window is the hard case: the rejoined node's row AND its
+// runtime marker both still say the old generation, so nothing local
+// contradicts. What holds that window is the quorum requirement — a node that
+// has just rejoined and cannot reach a quorum must not take a runtime-ownership
+// action from its own replica. This scenario pins that, and its control proves
+// the refusal is not blanket.
+func TestFleet_OwnerEpoch_QuorumlessRejoinDoesNotDualRun(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	owner, rejoined := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+
+	// The rejoined node's stale replica: "vm1 is mine and running."
+	if err := corrosion.InsertVM(ctx, rejoined.DB, corrosion.VMRecord{
+		Name: "vm1", HostName: rejoined.Name, State: "running",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.BackfillOwnerEpochs(ctx, rejoined.DB, rejoined.Name); err != nil {
+		t.Fatal(err)
+	}
+	// Reality elsewhere: the owner runs it. (Not replicated to the rejoined
+	// node — that is precisely the pre-convergence window.)
+	owner.Virt.SetState("vm1", libvirtfake.StateRunning)
+
+	// Its own libvirt has nothing (it rebooted): the self-heal trigger.
+	r := health.NewReconciler(rejoined.Name, t.TempDir(), rejoined.DB, rejoined.Virt)
+	r.SetGate(noQuorumGate{})
+	r.ReconcileOnce(ctx)
+
+	for _, e := range rejoined.Virt.EventLog() {
+		if e.Domain == "vm1" && (e.Op == "define" || e.Op == "start") {
+			t.Fatalf("a quorumless rejoined node started a second copy of vm1 (%s) — this is the dual-run", e.Op)
+		}
+	}
+
+	// Control: with quorum restored, the same sweep proceeds — the refusal is
+	// the quorum gate doing its job, not a blanket freeze.
+	r.SetGate(epochGate{})
+	r.ReconcileOnce(ctx)
+	started := false
+	for _, e := range rejoined.Virt.EventLog() {
+		if e.Domain == "vm1" && (e.Op == "define" || e.Op == "start") {
+			started = true
+		}
+	}
+	if !started {
+		t.Fatal("with quorum the self-heal restart must proceed (the refusal must not be blanket)")
+	}
+}
+
+// noQuorumGate models a just-rejoined node: split-brain machinery latched, but
+// this node cannot reach a quorum yet.
+type noQuorumGate struct{ epochGate }
+
+func (noQuorumGate) ExecutionGate(context.Context) health.GateResult {
+	return health.GateResult{OK: false, Reason: health.ReasonNoQuorum}
+}

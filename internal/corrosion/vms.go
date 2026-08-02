@@ -842,17 +842,28 @@ func TransferVMOwnerFresh(ctx context.Context, c *Client, name, hostName, state 
 // expansion on apply (safe because each statement binds updated_at). This does
 // NOT release any host_pci_devices ownership/vfio-unbind lease — that is the
 // grpcapi DeleteVM handler's releaseDevices call, out of scope here.
+// It emits the AUTHORITY-BEARING tombstone (vmDeleteSQL) — the only VM delete
+// shape litevirt emits. See DeleteContainer for why the pre-authority shape is
+// receive-only: a peer admits it only while its own row has zero authority, so
+// after the owner-epoch backfill it is silently dropped everywhere.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
-	now := c.NowTS()
-	wall := nowRFC3339()
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: legacyVMDeleteSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmInterfacesCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmDisksCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmNICsCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmPCIIntentCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmPCIRealCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-	})
+	applied, err := deleteVMGuarded(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		// Absent/already-tombstoned is the idempotent success callers expect; a
+		// row still live means its authority moved under the CAS and the caller
+		// must not be told the delete landed.
+		vm, gerr := GetVM(ctx, c, name)
+		if gerr != nil {
+			return gerr
+		}
+		if vm != nil {
+			return ErrNoRowsAffected
+		}
+	}
+	return nil
 }
 
 // deleteVMGuarded is reserved for capability-gated authority-aware callers.

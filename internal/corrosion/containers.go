@@ -820,9 +820,40 @@ func CompleteContainerRelocation(ctx context.Context, c *Client, hostName, name,
 // DeleteContainer soft-deletes the row. We don't physically delete so
 // "container vanished from gossip" can be distinguished from "host
 // crashed and we just haven't heard yet" in audit views.
+//
+// It emits the AUTHORITY-BEARING tombstone (containerDeleteSQL, carrying the
+// row's owner epoch and spec generation) — the only delete shape litevirt emits.
+// The pre-authority shape is still ACCEPTED from peers inside the supported
+// horizon; nothing here produces it. That distinction is the whole point: a
+// pre-authority tombstone is admitted by the receiver only when the PEER's row
+// has zero authority (legacyWorkloadDeleteMatchesPreAuthority), so once epochs
+// exist it is SILENTLY dropped — no error, no metric. Emitting it was how a
+// relocation's source row survived on every peer (lab, 2026-08-02).
 func DeleteContainer(ctx context.Context, c *Client, hostName, name string) error {
-	now := c.NowTS()
-	return c.Execute(ctx, legacyContainerDeleteSQL, nowRFC3339(), now, hostName, name)
+	applied, err := deleteContainerGuarded(ctx, c, hostName, name)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return containerDeleteMissOutcome(ctx, c, hostName, name)
+	}
+	return nil
+}
+
+// containerDeleteMissOutcome distinguishes the two ways a guarded delete can
+// match nothing. An absent or already-tombstoned row is the idempotent success
+// every caller expects. A row still LIVE means its authority moved between the
+// read and the CAS — the caller must hear about that rather than believe a
+// delete landed, which is the failure mode this whole path exists to kill.
+func containerDeleteMissOutcome(ctx context.Context, c *Client, hostName, name string) error {
+	ct, err := GetContainer(ctx, c, hostName, name)
+	if err != nil {
+		return err
+	}
+	if ct != nil {
+		return ErrNoRowsAffected
+	}
+	return nil
 }
 
 func deleteContainerGuarded(ctx context.Context, c *Client, hostName, name string) (bool, error) {
@@ -855,13 +886,11 @@ func deleteContainerGuarded(ctx context.Context, c *Client, hostName, name strin
 // caller can treat as success. (Plain DeleteContainer lacks the deleted_at guard,
 // so it would "affect one row" re-deleting a tombstone and hide that case.)
 func DeleteContainerStrict(ctx context.Context, c *Client, hostName, name string) error {
-	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx, legacyContainerStrictDeleteSQL,
-		nowRFC3339(), now, hostName, name)
+	applied, err := deleteContainerGuarded(ctx, c, hostName, name)
 	if err != nil {
 		return err
 	}
-	if n == 0 {
+	if !applied {
 		return ErrNoRowsAffected
 	}
 	return nil

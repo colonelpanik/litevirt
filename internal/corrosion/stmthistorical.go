@@ -96,6 +96,12 @@ func HistoricalShapes() []HistoricalShape {
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "insert_vm_pre_authority")
 	// Workload deletes became owner/generation guarded. Older retained WAL
 	// entries remain valid ordinary LWW tombstones during the support horizon.
+	// These three became RECEIVE-ONLY on 2026-08-02: the ordinary delete writers
+	// now emit the authority-bearing tombstone, because a receiver admits a
+	// pre-authority delete only while its OWN row has zero authority — after the
+	// owner-epoch backfill that is never true, so the tombstone was silently
+	// discarded on every peer. A supported peer still EMITS these, so they must
+	// stay recognised here.
 	add(legacyVMDeleteSQL, "delete_vm_pre_authority")
 	add(legacyContainerDeleteSQL, "delete_container_pre_authority")
 	add(legacyContainerStrictDeleteSQL, "delete_container_strict_pre_authority")

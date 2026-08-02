@@ -2,11 +2,30 @@ package fleet
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// ctRow reads a container row INCLUDING soft-deleted ones — the CLI and
+// GetContainer both hide tombstoned rows, which is part of why a non-terminal
+// delete stayed invisible.
+func ctRow(t *testing.T, n *Node, host, name string) (state string, deleted bool, exists bool) {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(),
+		`SELECT state, COALESCE(deleted_at, '') AS del FROM containers WHERE host_name = ? AND name = ?`,
+		host, name)
+	if err != nil {
+		t.Fatalf("read %s containers: %v", n.Name, err)
+	}
+	if len(rows) == 0 {
+		return "", false, false
+	}
+	return rows[0].String("state"), rows[0].String("del") != "", true
+}
 
 // TestFleet_WorkloadDeleteMustReplicate is the multi-node property behind the
 // duplicate_live_container the lab produced on 2026-08-02 (sb-ct1 live on both
@@ -263,5 +282,96 @@ func TestFleet_PingReportsAWallClock(t *testing.T) {
 	}
 	if skew := time.Since(peerWall).Abs(); skew > time.Minute {
 		t.Fatalf("peer wall clock is %v away from ours — it is not a real wall clock", skew)
+	}
+}
+
+// recordingSyncMetrics captures the merge-rejection calls a receiver makes, so a
+// test can assert that a refusal was REPORTED and not merely correct-and-silent.
+type recordingSyncMetrics struct {
+	mu       sync.Mutex
+	rejected []string // "table/path/reason"
+}
+
+func (m *recordingSyncMetrics) ObserveMergeRejected(table, path, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rejected = append(m.rejected, table+"/"+path+"/"+reason)
+}
+func (m *recordingSyncMetrics) reasons() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.rejected...)
+}
+
+func (m *recordingSyncMetrics) ObserveDump(time.Duration, int)              {}
+func (m *recordingSyncMetrics) ObserveDigest(time.Duration)                 {}
+func (m *recordingSyncMetrics) ObserveMerge(time.Duration, int, int)        {}
+func (m *recordingSyncMetrics) ObserveLegacyTransformed(string)             {}
+func (m *recordingSyncMetrics) ObserveTieBreak(string, string, string)      {}
+func (m *recordingSyncMetrics) ObserveTieUnresolved(string, string, string) {}
+func (m *recordingSyncMetrics) ObserveTombstoneTie(string)                  {}
+func (m *recordingSyncMetrics) ObserveUnresolvedTieCurrent(int)             {}
+func (m *recordingSyncMetrics) ObserveIdentityCollapseOrphan(string)        {}
+func (m *recordingSyncMetrics) ObserveSkewQuarantined()                     {}
+
+// TestFleet_RefusedPreAuthorityDeleteIsReported covers the MIXED-VERSION path: a
+// peer still running a pre-fix build emits the pre-authority delete shape, and an
+// upgraded receiver whose row carries authority must refuse it — loudly.
+//
+// The refusal itself is correct and load-bearing (that shape cannot prove the
+// local row is the same workload the sender deleted). What is NOT acceptable is
+// doing it silently: the entry is ACKNOWLEDGED, so nothing back-pressures and the
+// sender believes it replicated, which is exactly how a dropped tombstone stayed
+// invisible for a week.
+//
+// This pins the ENTRY-level skip, which is the site that actually fires for a
+// complete legacy batch — the per-statement branch is bypassed by its `continue`.
+// The lab found that the hard way on 2026-08-02: the first instrumentation went
+// on the per-statement path and never fired in a real mixed cluster.
+func TestFleet_RefusedPreAuthorityDeleteIsReported(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	sender, receiver := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+
+	metrics := &recordingSyncMetrics{}
+	receiver.DB.SetSyncMetrics(metrics)
+
+	if err := corrosion.UpsertContainer(ctx, sender.DB, corrosion.ContainerRecord{
+		HostName: "wl", Name: "ct1", State: "running", Image: "alpine:3.19",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	if err := corrosion.BackfillOwnerEpochs(ctx, sender.DB, "wl"); err != nil {
+		t.Fatalf("BackfillOwnerEpochs: %v", err)
+	}
+	pumpMutations(t, c, sender, receiver)
+
+	// Emit the PRE-AUTHORITY shape by hand: nothing in this tree produces it any
+	// more, but a supported peer still does, and that is the case under test.
+	if err := sender.DB.Execute(ctx,
+		`UPDATE containers SET deleted_at = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		"2026-08-02T00:00:00Z", sender.DB.NowTS(), "wl", "ct1"); err != nil {
+		t.Fatalf("emit pre-authority delete: %v", err)
+	}
+	pumpMutations(t, c, sender, receiver)
+
+	// Refused: the receiver's row carries authority the shape cannot speak to.
+	state, deleted, exists := ctRow(t, receiver, "wl", "ct1")
+	if !exists || deleted {
+		t.Fatalf("precondition: the receiver must refuse the pre-authority delete "+
+			"(state=%q deleted=%v exists=%v)", state, deleted, exists)
+	}
+
+	// And REPORTED. A correct-but-silent refusal is the actual defect.
+	var found bool
+	for _, r := range metrics.reasons() {
+		if strings.Contains(r, "pre_authority_delete") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the refusal must be reported, got %v — a silently dropped tombstone is "+
+			"invisible to the operator and the sender believes it replicated", metrics.reasons())
 	}
 }

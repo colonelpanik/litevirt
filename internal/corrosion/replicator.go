@@ -966,6 +966,18 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 			// The retained pre-authority wire shape cannot identify a v44
 			// recreate. Skip its entire historical batch—including child
 			// tombstones—while still acknowledging the entry below.
+			//
+			// This is the site that actually fires for a complete pre-authority
+			// delete batch (the per-statement DispLegacyWorkloadDelete branch is
+			// bypassed by this continue). It was silent, which is how a dropped
+			// tombstone stayed invisible: the entry is ACKNOWLEDGED, so nothing
+			// back-pressures and the sender believes it replicated. Naming the
+			// sender is the point — the fix is to upgrade it.
+			r.client.observeMergeRejected("unknown", "wal", "pre_authority_delete")
+			slog.Warn("replicator: skipped a pre-authority workload delete batch (rows kept live here)",
+				"sender", entry.Origin, "seq", entry.Seq,
+				"reason", "the pre-authority shape cannot prove the local row is the same workload it deleted",
+				"fix", "upgrade "+entry.Origin+" so it emits the authority-bearing tombstone")
 			continue
 		}
 

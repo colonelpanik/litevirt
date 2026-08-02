@@ -863,3 +863,49 @@ type supersededMarkerFake struct {
 func (f *supersededMarkerFake) GetDomainOwnerEpoch(string) (int64, bool, error) {
 	return f.epoch, true, nil
 }
+
+// The lab found this on 2026-08-02: the superseded check guards the branch that
+// fires when libvirt has NO domain, but read its marker from the DOMAIN's
+// metadata — which is destroyed together with the domain. With the row at
+// generation 7 and the metadata marker at 6, undefining the domain made the
+// marker unreadable and the VM was restarted anyway. The check could never fire
+// in production, and the unit test only passed because its fake returned a
+// marker for a domain that did not exist — something real libvirt cannot do.
+//
+// The host-local file survives the domain, so this asserts the real shape: no
+// domain at all, marker on disk behind the row.
+func TestSelfHealRestart_RefusedOnSupersededFileMarker(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	// This host last ran generation 5; the domain itself is gone.
+	if err := WriteVMOwnerEpochMarker(dataDir, "vm1", 5); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	fake := libvirtfake.New() // no domain — exactly the rebooted-host shape
+	r := NewReconciler("node-a", dataDir, db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	r.reconcile(ctx)
+
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a superseded host-local marker must refuse the self-heal restart")
+	}
+
+	// Positive control: marker caught up to the row → the restart proceeds.
+	if err := WriteVMOwnerEpochMarker(dataDir, "vm1", 9); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcile(ctx)
+	if !startedOrDefined(fake, "vm1") {
+		t.Fatal("a marker matching the row must NOT block the restart")
+	}
+}

@@ -1143,6 +1143,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 					slog.Warn("reconciler: owner-epoch marker write failed (convergence will repair)",
 						"vm", vm.Name, "epoch", fresh.OwnerEpoch, "error", merr)
 				}
+				// The durable twin, which survives the domain being undefined.
+				if merr := WriteVMOwnerEpochMarker(r.dataDir, vm.Name, fresh.OwnerEpoch); merr != nil {
+					slog.Warn("reconciler: owner-epoch file marker write failed (convergence will repair)",
+						"vm", vm.Name, "epoch", fresh.OwnerEpoch, "error", merr)
+				}
 			}
 		}
 	} else if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover"); err != nil {
@@ -1282,6 +1287,10 @@ func (r *Reconciler) convergeOwnerEpochMarker(ctx context.Context, name string) 
 		slog.Warn("reconciler: owner-epoch marker convergence failed (will retry next sweep)",
 			"vm", name, "epoch", row.OwnerEpoch, "error", serr)
 	}
+	if ferr := WriteVMOwnerEpochMarker(r.dataDir, name, row.OwnerEpoch); ferr != nil {
+		slog.Warn("reconciler: owner-epoch file marker convergence failed (will retry next sweep)",
+			"vm", name, "epoch", row.OwnerEpoch, "error", ferr)
+	}
 }
 
 // ownerEpochEnforced reports whether owner_epoch_v1 enforcement is live here
@@ -1297,7 +1306,14 @@ func (r *Reconciler) ownerEpochEnforced(ctx context.Context) bool {
 // and convergence passes are what graduate them), and failing closed on an
 // unreadable marker would strand a legitimately-owned VM.
 func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
-	marker, ok, err := r.virt.GetDomainOwnerEpoch(name)
+	// Prefer the HOST-LOCAL marker: this check runs when libvirt has no domain,
+	// and undefining a domain destroys its metadata, so a metadata-only read is
+	// unreadable exactly when it matters (lab-proven 2026-08-02). Fall back to
+	// the domain metadata for a VM whose file marker has not been written yet.
+	marker, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name)
+	if err != nil || !ok {
+		marker, ok, err = r.virt.GetDomainOwnerEpoch(name)
+	}
 	if err != nil || !ok {
 		return false
 	}

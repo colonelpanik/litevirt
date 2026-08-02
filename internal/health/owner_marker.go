@@ -23,14 +23,38 @@ import (
 // ownerEpochMarkerFile is the per-container marker filename.
 const ownerEpochMarkerFile = "owner_epoch"
 
+// WriteVMOwnerEpochMarker is the VM twin of the container marker, stored under
+// <dataDir>/vms/<name>/owner_epoch.
+//
+// It exists because the domain-metadata marker CANNOT serve the case that
+// matters most. The self-heal branch fires precisely when libvirt has no
+// domain — a rebooted or rebuilt host — and undefining a domain destroys its
+// metadata with it, so a metadata-only marker is unreadable exactly when it is
+// needed. Proven on the lab 2026-08-02: with the DB row at generation 7 and the
+// domain's metadata marker at 6, undefining the domain made the marker
+// unreadable and the reconciler restarted the VM. The host-local file survives
+// the domain, so the check can actually fire.
+func WriteVMOwnerEpochMarker(dataDir, name string, epoch int64) error {
+	return writeOwnerEpochMarker(filepath.Join(dataDir, "vms"), name, epoch)
+}
+
+// ReadVMOwnerEpochMarker reads the host-local VM marker.
+func ReadVMOwnerEpochMarker(dataDir, name string) (int64, bool, error) {
+	return readOwnerEpochMarker(filepath.Join(dataDir, "vms"), name)
+}
+
 // WriteContainerOwnerEpochMarker records the container's current ownership
 // generation on this host. Written through a temp file + rename so a crash
 // mid-write can never leave a half-written marker that reads as garbage.
 func WriteContainerOwnerEpochMarker(containersRoot, name string, epoch int64) error {
+	return writeOwnerEpochMarker(containersRoot, name, epoch)
+}
+
+func writeOwnerEpochMarker(root, name string, epoch int64) error {
 	if err := safename.ValidateContainerName(name); err != nil {
 		return err
 	}
-	dir := filepath.Join(containersRoot, name)
+	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create marker dir: %w", err)
 	}
@@ -59,10 +83,14 @@ func WriteContainerOwnerEpochMarker(containersRoot, name string, epoch int64) er
 // read as the zero generation would authorize exactly the stale actions the
 // marker exists to refuse.
 func ReadContainerOwnerEpochMarker(containersRoot, name string) (int64, bool, error) {
+	return readOwnerEpochMarker(containersRoot, name)
+}
+
+func readOwnerEpochMarker(root, name string) (int64, bool, error) {
 	if err := safename.ValidateContainerName(name); err != nil {
 		return 0, false, err
 	}
-	raw, err := os.ReadFile(filepath.Join(containersRoot, name, ownerEpochMarkerFile))
+	raw, err := os.ReadFile(filepath.Join(root, name, ownerEpochMarkerFile))
 	if os.IsNotExist(err) {
 		return 0, false, nil
 	}

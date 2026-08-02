@@ -492,11 +492,15 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 				c.noteGateRefused(corrosion.OpContainerState, reason)
 				return
 			}
-			if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", ""); err != nil {
+			// Epoch-carried like the other heal writes: the statement replicates
+			// with its own precondition, so a peer whose row moved to a new
+			// owner generation matches nothing instead of inheriting stale state.
+			if err := corrosion.SetContainerStateDetailStrictAtEpoch(ctx, c.db, c.hostName, ct.Name, "running", "", ct.OwnerEpoch); err != nil {
 				if errors.Is(err, corrosion.ErrNoRowsAffected) {
-					// Row vanished between the sweep list and here (concurrent
-					// delete) — nothing to reconcile, not a write fault.
-					slog.Debug("containercheck: reconcile target row gone; skipping", "container", ct.Name)
+					// Row vanished (concurrent delete) or its ownership
+					// generation moved past this sweep's read — nothing this
+					// decision may safely reconcile; the next sweep re-reads.
+					slog.Debug("containercheck: reconcile target row gone or re-owned; skipping", "container", ct.Name)
 					return
 				}
 				slog.Error("containercheck: reconcile write failed — NOT publishing reconciled event",
@@ -527,7 +531,7 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 				c.noteGateRefused(corrosion.OpContainerState, reason)
 				return
 			}
-			if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", operatorStopDetail); err != nil {
+			if err := corrosion.SetContainerStateDetailAtEpoch(ctx, c.db, c.hostName, ct.Name, "stopped", operatorStopDetail, ct.OwnerEpoch); err != nil {
 				slog.Warn("containercheck: operator-stop heal write failed", "container", ct.Name, "error", err)
 				c.noteStateWriteFail(corrosion.OpContainerState, err)
 			}
@@ -567,7 +571,7 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 			c.noteGateRefused(corrosion.OpContainerState, reason)
 			return
 		}
-		if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", outOfBandDestroyDetail); err != nil {
+		if err := corrosion.SetContainerStateDetailAtEpoch(ctx, c.db, c.hostName, ct.Name, "stopped", outOfBandDestroyDetail, ct.OwnerEpoch); err != nil {
 			slog.Warn("containercheck: out-of-band stop record write failed", "container", ct.Name, "error", err)
 			c.noteStateWriteFail(corrosion.OpContainerState, err)
 		}

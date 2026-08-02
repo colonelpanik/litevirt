@@ -307,6 +307,16 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		return parkSource(fmt.Errorf("target landed but source runtime cleanup failed: %v (source left tracked+stopped on %s)", err, source))
 	}
 	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
+		// DeleteContainer already retried with a fresh guard, so this is a real
+		// DB failure or persistent contention (the source row's authority kept
+		// moving — e.g. a concurrent failover claiming it). Either way the
+		// migration ITSELF succeeded: the target landed and owns the leases.
+		// Park the source so the duplicate row is visible for cleanup rather
+		// than silently serving two live copies.
+		if errors.Is(err, corrosion.ErrDeleteContended) {
+			return parkSource(fmt.Errorf("migration landed on %s, but the source row on %s kept changing under the delete guard "+
+				"(a concurrent writer holds it — check for a racing failover, then remove the source row)", req.TargetHost, source))
+		}
 		return parkSource(fmt.Errorf("target landed but source row tombstone failed: %v (remove the source row on %s)", err, source))
 	}
 	// Best-effort now (a stale source interface row is hidden once the source

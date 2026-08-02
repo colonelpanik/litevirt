@@ -141,7 +141,8 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 	beginGuard.OperationClaimHash = claimHash
 	claimedGuard := *provisionalGuard
 	claimedGuard.RequireOperation = true
-	now, wall := c.NowTS(), nowRFC3339()
+	// wall stamps this begin's created_at — a fresh incarnation (see nowRFC3339Nano).
+	now, wall := c.NowTS(), nowRFC3339Nano()
 	guard := func(tx *sql.Tx) (bool, error) {
 		existing, err := operationInTx(ctx, tx, op.ID)
 		if err != nil {
@@ -312,7 +313,8 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 	beginGuard.OperationClaimHash = claimHash
 	claimedGuard := *provisionalGuard
 	claimedGuard.RequireOperation = true
-	now, wall := c.NowTS(), nowRFC3339()
+	// wall stamps this begin's created_at — a fresh incarnation (see nowRFC3339Nano).
+	now, wall := c.NowTS(), nowRFC3339Nano()
 	guard := func(tx *sql.Tx) (bool, error) {
 		existing, err := operationInTx(ctx, tx, op.ID)
 		if err != nil {

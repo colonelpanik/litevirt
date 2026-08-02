@@ -16,6 +16,15 @@ import (
 // not a success). Mirrors the zero-row-consume-guard used for single-use tokens.
 var ErrNoRowsAffected = errors.New("no rows affected")
 
+// ErrDeleteContended is returned by the workload delete writers when the row is
+// still LIVE but the guarded CAS matched nothing: its authority or identity
+// moved between the guard read and the write (an owner-epoch backfill, a spec
+// update, a relocation stamping its token). The writers already retry with a
+// fresh guard before surfacing this, so a caller seeing it is looking at
+// persistent contention — it must NOT be treated as "already absent": the row
+// is live on every node and the delete did not land.
+var ErrDeleteContended = errors.New("delete contended: the row's authority moved under the guard")
+
 // ErrGuardedContainerRekeyRequired prevents a pre-authority re-key envelope from
 // silently dropping modern workload authority. Callers holding a container with
 // any v44 lifecycle axis must use RekeyContainerOwnerGuarded.
@@ -184,7 +193,9 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 	now := c.NowTS()
 	if r.CreatedAt == "" {
-		r.CreatedAt = nowRFC3339() // created_at is wall/display, never the HLC key
+		// created_at is wall/display, never the HLC key. Nano precision so a
+		// same-second recreate is a distinguishable incarnation (see nowRFC3339Nano).
+		r.CreatedAt = nowRFC3339Nano()
 	}
 	if r.Project == "" {
 		r.Project = "_default"
@@ -234,7 +245,21 @@ func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 // conditional, tombstone/race-safe write that a plain batch can't express; the
 // caller reserves them before this and rolls them back on failure).
 func CreateContainerAtomic(ctx context.Context, c *Client, rec ContainerRecord, ifaces []ContainerInterfaceRecord) error {
-	stmts := make([]Statement, 0, 1+len(ifaces))
+	stmts := make([]Statement, 0, 2+len(ifaces))
+	// Purge a soft-deleted same-name row FIRST, mirroring the VM recreate path
+	// (InsertVMWithHardware). Without it the UPSERT's conflict arm would revive
+	// the tombstone in place, PRESERVING its created_at — and created_at is the
+	// incarnation identity anti-entropy uses to tell a genuine recreate from a
+	// stale pre-delete copy. A recreate-over-tombstone must therefore be a fresh
+	// INSERT with a fresh stamp, or a peer that missed the delete+recreate can
+	// never revive its tombstone by AE.
+	// full-state-delete-ok: this only drops an ALREADY-tombstoned row right
+	// before re-inserting a fresh one — the new row's newer updated_at wins LWW,
+	// so there is no cross-node resurrection window.
+	stmts = append(stmts, Statement{
+		SQL:    `DELETE FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NOT NULL`, // full-state-delete-ok
+		Params: []interface{}{rec.HostName, rec.Name},
+	})
 	cs, err := upsertContainerStmt(c, rec)
 	if err != nil {
 		return err
@@ -298,6 +323,39 @@ func SetContainerStateStrict(ctx context.Context, c *Client, hostName, name, sta
 		`UPDATE containers SET state = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		state, now, hostName, name)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
+// SetContainerStateDetailAtEpoch is SetContainerStateDetail carrying the
+// ownership generation the writer decided against, for the health checker's
+// heal writes — the same reasoning as SetContainerStateAtEpoch: the statement
+// replicates with its own precondition, so on a peer whose row has moved to a
+// new owner generation (a completed relocation, a recreate) it matches nothing
+// instead of stamping stale state onto the new incarnation.
+func SetContainerStateDetailAtEpoch(ctx context.Context, c *Client, hostName, name, state, detail string, expectedEpoch int64) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND owner_epoch = ?`,
+		state, detail, now, hostName, name, expectedEpoch)
+}
+
+// SetContainerStateDetailStrictAtEpoch is SetContainerStateDetailAtEpoch that
+// reports a zero-row UPDATE as ErrNoRowsAffected — the row is missing,
+// tombstoned, or its ownership generation moved past the writer's decision;
+// either way the heal must not be believed to have landed.
+func SetContainerStateDetailStrictAtEpoch(ctx context.Context, c *Client, hostName, name, state, detail string, expectedEpoch int64) error {
+	now := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND owner_epoch = ?`,
+		state, detail, now, hostName, name, expectedEpoch)
 	if err != nil {
 		return err
 	}
@@ -830,70 +888,123 @@ func CompleteContainerRelocation(ctx context.Context, c *Client, hostName, name,
 // exist it is SILENTLY dropped — no error, no metric. Emitting it was how a
 // relocation's source row survived on every peer (lab, 2026-08-02).
 func DeleteContainer(ctx context.Context, c *Client, hostName, name string) error {
-	applied, err := deleteContainerGuarded(ctx, c, hostName, name)
+	outcome, err := retriedDelete(func() (deleteOutcome, error) {
+		return deleteContainerGuarded(ctx, c, hostName, name)
+	})
 	if err != nil {
 		return err
 	}
-	if !applied {
-		return containerDeleteMissOutcome(ctx, c, hostName, name)
+	return deleteOutcomeError(outcome, false)
+}
+
+// deleteOutcome is the tri-state result of one guarded delete attempt. The
+// guarded writers report it in ONE pass — the guard read already knows whether
+// a live row exists, so conflating absent with CAS-miss (and re-probing after
+// the fact) would both double the reads and open a window where a row created
+// between the two reads is misreported.
+type deleteOutcome uint8
+
+const (
+	deleteApplied   deleteOutcome = iota
+	deleteAbsent                  // no live row: missing or already tombstoned
+	deleteContended               // a live row exists but the guard/CAS matched nothing
+)
+
+// deleteGuardAttempts bounds the fresh-guard retries a delete makes when its
+// CAS misses on a still-live row. One retry absorbs each benign concurrent
+// writer (the owner-epoch backfill after a restart, a racing spec update); a
+// row that keeps moving across three fresh reads is genuinely contended and
+// the caller must hear ErrDeleteContended rather than a fabricated success.
+const deleteGuardAttempts = 3
+
+// retriedDelete drives one guarded-delete attempt to a settled outcome:
+// contended attempts re-run with a fresh guard (the attempt func re-reads the
+// row itself) up to deleteGuardAttempts, everything else returns immediately.
+func retriedDelete(attempt func() (deleteOutcome, error)) (deleteOutcome, error) {
+	var outcome deleteOutcome
+	var err error
+	for i := 0; i < deleteGuardAttempts; i++ {
+		outcome, err = attempt()
+		if err != nil || outcome != deleteContended {
+			return outcome, err
+		}
+	}
+	return deleteContended, nil
+}
+
+// deleteOutcomeError is the single mapping from a settled delete outcome to
+// the caller-visible error contract: contended is ALWAYS an error (the row is
+// live and the delete did not land); absent is the idempotent nil for the
+// plain writers and ErrNoRowsAffected for the strict ones.
+func deleteOutcomeError(outcome deleteOutcome, strict bool) error {
+	switch outcome {
+	case deleteContended:
+		return ErrDeleteContended
+	case deleteAbsent:
+		if strict {
+			return ErrNoRowsAffected
+		}
 	}
 	return nil
 }
 
-// containerDeleteMissOutcome distinguishes the two ways a guarded delete can
-// match nothing. An absent or already-tombstoned row is the idempotent success
-// every caller expects. A row still LIVE means its authority moved between the
-// read and the CAS — the caller must hear about that rather than believe a
-// delete landed, which is the failure mode this whole path exists to kill.
-func containerDeleteMissOutcome(ctx context.Context, c *Client, hostName, name string) error {
+func deleteContainerGuarded(ctx context.Context, c *Client, hostName, name string) (deleteOutcome, error) {
 	ct, err := GetContainer(ctx, c, hostName, name)
 	if err != nil {
-		return err
+		return deleteContended, err
 	}
-	if ct != nil {
-		return ErrNoRowsAffected
+	if ct == nil {
+		return deleteAbsent, nil
 	}
-	return nil
+	return deleteContainerGuardedFrom(ctx, c, *ct)
 }
 
-func deleteContainerGuarded(ctx context.Context, c *Client, hostName, name string) (bool, error) {
-	ct, err := GetContainer(ctx, c, hostName, name)
-	if err != nil || ct == nil {
-		return false, err
-	}
-	guard, err := containerDeleteMutationGuard(*ct)
+// deleteContainerGuardedFrom runs the guarded CAS against the caller's row
+// snapshot. Split from the read so the contended path — the snapshot moved
+// before the CAS — is deterministically testable.
+func deleteContainerGuardedFrom(ctx context.Context, c *Client, ct ContainerRecord) (deleteOutcome, error) {
+	guard, err := containerDeleteMutationGuard(ct)
 	if err != nil {
-		return false, err
+		return deleteContended, err
 	}
 	now := c.NowTS()
 	wall := nowRFC3339()
-	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		return c.mutationGuardMatches(ctx, tx, guard)
 	}, []Statement{
 		// Fence managed interfaces while the matching parent is still live,
 		// then tombstone the parent last as the semantic barrier.
-		{SQL: containerCreateCleanupSQL, Params: []interface{}{wall, now, hostName, name}, Guard: guard},
+		{SQL: containerCreateCleanupSQL, Params: []interface{}{wall, now, ct.HostName, ct.Name}, Guard: guard},
 		{SQL: containerDeleteSQL, Params: []interface{}{
-			wall, now, hostName, name, ct.OwnerEpoch, ct.SpecGeneration,
+			wall, now, ct.HostName, ct.Name, ct.OwnerEpoch, ct.SpecGeneration,
 		}, Guard: guard},
 	})
+	if err != nil {
+		return deleteContended, err
+	}
+	if !applied {
+		// The row was live a moment ago and the guard missed — it moved (or was
+		// tombstoned) underneath us. The retry loop re-reads and re-classifies.
+		return deleteContended, nil
+	}
+	return deleteApplied, nil
 }
 
-// DeleteContainerStrict soft-deletes a LIVE row (WHERE deleted_at IS NULL) and
-// reports ErrNoRowsAffected when nothing matched — i.e. the row was already gone.
-// The fail-closed DeleteContainer handler uses it so a real DB failure surfaces
-// (codes.Internal) while an already-tombstoned row is the idempotent no-op the
-// caller can treat as success. (Plain DeleteContainer lacks the deleted_at guard,
-// so it would "affect one row" re-deleting a tombstone and hide that case.)
+// DeleteContainerStrict is DeleteContainer for callers that must distinguish
+// the idempotent no-op: an already-absent/tombstoned row reports
+// ErrNoRowsAffected (the caller may treat it as "already gone" — audited, not
+// silent), while a live row whose guarded CAS keeps missing reports
+// ErrDeleteContended, which the caller MUST surface as a failure: the row is
+// still live cluster-wide and claiming success here is exactly the stale-live
+// ghost this path exists to kill.
 func DeleteContainerStrict(ctx context.Context, c *Client, hostName, name string) error {
-	applied, err := deleteContainerGuarded(ctx, c, hostName, name)
+	outcome, err := retriedDelete(func() (deleteOutcome, error) {
+		return deleteContainerGuarded(ctx, c, hostName, name)
+	})
 	if err != nil {
 		return err
 	}
-	if !applied {
-		return ErrNoRowsAffected
-	}
-	return nil
+	return deleteOutcomeError(outcome, true)
 }
 
 // GetContainer returns one container row (including soft-deleted, so

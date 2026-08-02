@@ -1490,7 +1490,9 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, err
 		}
 		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
-			slog.Error("failed to clean up stale VM record", "vm", req.Name, "error", err)
+			// A declined delete means the stale row is still live cluster-wide;
+			// claiming OK here would hide it. Idempotent — retry.
+			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
 		s.clearDeviceLease(req.Name)
 		return &emptypb.Empty{}, nil
@@ -1616,9 +1618,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Broadcast FDB removal for VXLAN networks so peers remove stale entries.
 	s.CleanupFDBForVM(ctx, req.Name)
 
-	// Tombstone in corrosion
+	// Tombstone in corrosion — MANDATORY. Returning OK with the row still live
+	// (the guarded delete declines when the row's authority moved under it, and
+	// only reports that after retrying with a fresh guard) would leave a ghost
+	// row every node keeps serving, scheduling around and failing over — the
+	// exact stale-live state the mandatory tombstone exists to kill. The domain
+	// teardown above is idempotent, so the caller can simply retry.
 	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
-		slog.Error("failed to delete VM from corrosion", "error", err)
+		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
+		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)
 	}
 
 	slog.Info("VM deleted", "name", req.Name)
@@ -2326,8 +2334,15 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
 	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 
-	// Tombstone old records (they'll be replaced by CreateVM).
-	corrosion.DeleteVM(ctx, s.db, req.Name)
+	// Tombstone old records (they'll be replaced by CreateVM). This must not be
+	// best-effort: the disks and firmware state are already gone above, and if
+	// the guarded delete declines (authority moved under it) the still-live row
+	// makes the CreateVM below fail AlreadyExists — surfacing the real cause
+	// here beats erroring one step later with a misleading message. The rebuild
+	// is retryable: everything before this point is idempotent teardown.
+	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
+		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
+	}
 
 	// Recreate the VM using the stored spec.
 	slog.Info("rebuilding VM", "name", req.Name)
@@ -2412,7 +2427,13 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 		s.images.DeleteVMDisks(req.VmName)
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.VmName))
-		corrosion.DeleteVM(ctx, s.db, req.VmName)
+		// A declined tombstone must abort BEFORE the rename below: proceeding
+		// would leave the replaced VM's row live (a duplicate identity) while
+		// its disks and firmware are already gone. Everything up to here is
+		// idempotent teardown, so the cutover can simply be retried.
+		if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
+			return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
+		}
 	}
 
 	// Rename the -next VM to the original name.

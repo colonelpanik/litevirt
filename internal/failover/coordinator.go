@@ -1395,7 +1395,19 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 // (logical, idempotent) handoff — the source host is fenced and won't write again.
 func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string) {
 	if err := corrosion.DeleteContainer(ctx, c.db, h.Name, ct.Name); err != nil {
-		slog.Warn("failover: tombstone source row after restore", "container", ct.Name, "error", err)
+		// The restore itself landed, but the handoff is INCOMPLETE: the dead
+		// host's source row is still live next to the target's — a duplicate
+		// the scheduler and quota both count. Recording success here would
+		// declare the relocation clean while that duplicate exists. Report a
+		// partial result instead and DON'T mark the host relocated: the next
+		// sweep re-enters this path (the marker and token-matched target row
+		// are still in place) and retries the tombstone until it lands.
+		slog.Warn("failover: source row tombstone failed after restore — will retry next sweep",
+			"container", ct.Name, "from", h.Name, "to", target, "error", err)
+		c.mCt(ActionRelocate, ResultPartial, ErrDBError)
+		c.auditRelocate(ctx, "ct.relocate.restored", ct.Name,
+			"restored to "+target+" but the source row on "+h.Name+" is still live (tombstone failed; retrying)", "error")
+		return
 	}
 	c.fenceRelocated[h.Name] = true
 	c.mCt(ActionRelocate, ResultSuccess, errClassNone)

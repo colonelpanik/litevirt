@@ -341,7 +341,10 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// governs start/stop): retry-safety matters for the failover/relocation paths
 	// that re-issue deletes. So an already-gone row (ErrNoRowsAffected) is a
 	// success — but audited distinctly (not a silent "ok") so an operator typo
-	// isn't invisible; only a REAL DB error surfaces as Internal.
+	// isn't invisible. A REAL DB error — or ErrDeleteContended, a row still LIVE
+	// after the guarded CAS retried (its authority kept moving) — surfaces as
+	// Internal: the runtime container is gone by this point, and OK-with-a-live-
+	// row would be exactly the ghost this tombstone is mandatory to prevent.
 	derr := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name)
 	if derr != nil && !errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")

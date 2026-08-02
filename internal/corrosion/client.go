@@ -416,6 +416,15 @@ const nowTSLayout = "2006-01-02T15:04:05.000000000Z07:00"
 // mis-order mixed old/new rows. Only updated_at (the LWW key) uses NowTS.
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// nowRFC3339Nano stamps a FRESH workload incarnation (created_at on create /
+// recreate paths). Nanosecond precision is load-bearing there: anti-entropy
+// treats created_at as the incarnation identity, so a delete + recreate inside
+// one wall-clock second must still produce two distinguishable stamps — at
+// bare-second precision the recreate would equal the tombstone's stamp and be
+// misread as the incarnation the delete killed. RFC3339 readers parse the
+// fractional second transparently (Go's time.Parse accepts it for any layout).
+func nowRFC3339Nano() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
 // NowWall returns a bare-second RFC3339 UTC wall-clock timestamp for NON-LWW columns
 // (created_at, deleted_at, last_seen, and other *_at display/expiry/age markers). It is
 // the Client-method form of nowRFC3339 for callers outside this package (e.g. the

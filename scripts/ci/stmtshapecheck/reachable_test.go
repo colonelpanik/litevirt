@@ -15,15 +15,15 @@ var testExempt = map[string]string{"checkClockSkew": "test fixture"}
 
 func TestUnreachableEmitters(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		fn      string
-		uses    int
-		wantGap bool
+		name       string
+		fn         string
+		referenced bool
+		wantGap    bool
 	}{
-		{name: "unexported builder with a caller", fn: "deleteContainerGuarded", uses: 2, wantGap: false},
-		{name: "unexported builder with no caller", fn: "deleteContainerGuarded", uses: 1, wantGap: true},
-		{name: "exported builder is never flagged", fn: "DeleteContainer", uses: 1, wantGap: false},
-		{name: "allowlisted builder with no caller", fn: "checkClockSkew", uses: 1, wantGap: false},
+		{name: "unexported builder with a caller", fn: "deleteContainerGuarded", referenced: true, wantGap: false},
+		{name: "unexported builder with no caller", fn: "deleteContainerGuarded", referenced: false, wantGap: true},
+		{name: "exported builder is never flagged", fn: "DeleteContainer", referenced: false, wantGap: false},
+		{name: "allowlisted builder with no caller", fn: "checkClockSkew", referenced: false, wantGap: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			builders := map[string]token.Position{tc.fn: {Filename: "x.go", Line: 1}}
@@ -32,7 +32,7 @@ func TestUnreachableEmitters(t *testing.T) {
 				// be in any package, which this guard deliberately doesn't chase.
 				builders = map[string]token.Position{}
 			}
-			gaps := unreachableFrom(builders, map[string]int{tc.fn: tc.uses}, testExempt)
+			gaps := unreachableFrom(builders, map[string]bool{tc.fn: tc.referenced}, testExempt)
 			// The allowlist-rot check fires whenever checkClockSkew is absent from
 			// the builder set; ignore it here so each case asserts its own subject.
 			gaps = withoutRotWarnings(gaps, tc.fn)
@@ -46,7 +46,7 @@ func TestUnreachableEmitters(t *testing.T) {
 // An allowlist entry that no longer names a builder must fail, so the list
 // cannot outlive the finding it documents.
 func TestUnreachableEmitters_AllowlistCannotRot(t *testing.T) {
-	gaps := unreachableFrom(map[string]token.Position{}, map[string]int{}, testExempt)
+	gaps := unreachableFrom(map[string]token.Position{}, map[string]bool{}, testExempt)
 	found := false
 	for _, g := range gaps {
 		if strings.Contains(g, "checkClockSkew") && strings.Contains(g, "remove the exemption") {

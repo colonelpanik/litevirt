@@ -191,16 +191,65 @@ func TestFleet_AntiEntropyMustCarryATombstone(t *testing.T) {
 // the coordinator's tombstone. All four nodes agreed on a resurrected row —
 // which is why it never looked like divergence.
 //
-// A delete is terminal AT ITS AUTHORITY. Resurrection is legitimate only at a
-// HIGHER generation (a genuine recreate), which the control below pins.
+// A delete is terminal FOR ITS INCARNATION (created_at names the incarnation).
+// Neither a newer timestamp nor an ownership-epoch mint may resurrect it — an
+// epoch is WHO OWNS the incarnation, not WHICH incarnation it is, and
+// TransferVMOwner/relocation completion mint epoch+1 with created_at untouched.
+// Resurrection is legitimate only for a genuinely NEW incarnation: a recreate,
+// which purges the local tombstone and inserts a fresh row with a fresh
+// created_at. The recreate control below pins that revival path so the
+// terminality cases can't pass by AE simply refusing everything.
 func TestFleet_AntiEntropyMustNotResurrectAtEqualAuthority(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		bumpAuthority bool
-		wantLive      bool
+		name     string
+		diverged func(t *testing.T, ctx context.Context, db *corrosion.Client)
+		wantLive bool
 	}{
-		{name: "equal authority: the tombstone is terminal", bumpAuthority: false, wantLive: false},
-		{name: "higher authority: a real recreate wins (control)", bumpAuthority: true, wantLive: true},
+		{
+			name:     "equal authority: the tombstone is terminal",
+			diverged: func(*testing.T, context.Context, *corrosion.Client) {},
+			wantLive: false,
+		},
+		{
+			// This was previously the "higher authority resurrects" control —
+			// which is exactly the delete-vs-transfer race that resurrects a
+			// deleted workload with no disks behind it. An epoch mint of the
+			// SAME incarnation must now lose to its tombstone.
+			name: "ownership-epoch mint of the same incarnation: still terminal",
+			diverged: func(t *testing.T, ctx context.Context, db *corrosion.Client) {
+				if err := db.Execute(ctx,
+					`UPDATE containers SET state = 'pending', relocate_token = ?, updated_at = ?
+					 WHERE host_name = ? AND name = ?`,
+					"tok1", db.NowTS(), "wl", "ct1"); err != nil {
+					t.Fatalf("stage relocation: %v", err)
+				}
+				if err := corrosion.CompleteContainerRelocation(ctx, db, "wl", "ct1", "tok1"); err != nil {
+					t.Fatalf("mint an ownership epoch: %v", err)
+				}
+			},
+			wantLive: false,
+		},
+		{
+			// The revival control: a genuine recreate — a FRESH incarnation with
+			// its own created_at, landing at authority 0/0 like every
+			// default-config create — must win over the old tombstone even
+			// though its authority axes restart BELOW the tombstone's backfilled
+			// epoch. Before the incarnation rules this wedged forever: the
+			// equal/crossed-authority arms kept the tombstone and an AE-only
+			// peer could never see a delete-then-recreate again.
+			name: "a recreate is a new incarnation and wins (control)",
+			diverged: func(t *testing.T, ctx context.Context, db *corrosion.Client) {
+				if err := corrosion.DeleteContainer(ctx, db, "wl", "ct1"); err != nil {
+					t.Fatalf("diverged delete before recreate: %v", err)
+				}
+				if err := corrosion.CreateContainerAtomic(ctx, db, corrosion.ContainerRecord{
+					HostName: "wl", Name: "ct1", State: "running", Image: "alpine:3.20",
+				}, nil); err != nil {
+					t.Fatalf("recreate: %v", err)
+				}
+			},
+			wantLive: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := New(t, Options{Nodes: 2})
@@ -223,22 +272,8 @@ func TestFleet_AntiEntropyMustNotResurrectAtEqualAuthority(t *testing.T) {
 				t.Fatalf("DeleteContainer: %v", err)
 			}
 
-			// The diverged node, which still holds a live copy, writes to it —
-			// strictly newer than the tombstone.
-			if tc.bumpAuthority {
-				// A genuine recreate mints a NEW generation, and that must win.
-				// Drive it through the real minting writer (relocation completion),
-				// not an ad-hoc UPDATE the receiver's apply guard would refuse.
-				if err := diverged.DB.Execute(ctx,
-					`UPDATE containers SET state = 'pending', relocate_token = ?, updated_at = ?
-					 WHERE host_name = ? AND name = ?`,
-					"tok1", diverged.DB.NowTS(), "wl", "ct1"); err != nil {
-					t.Fatalf("stage relocation: %v", err)
-				}
-				if err := corrosion.CompleteContainerRelocation(ctx, diverged.DB, "wl", "ct1", "tok1"); err != nil {
-					t.Fatalf("mint a higher generation: %v", err)
-				}
-			}
+			// The diverged node, which never saw the tombstone, keeps going.
+			tc.diverged(t, ctx, diverged.DB)
 			if err := corrosion.SetContainerState(ctx, diverged.DB, "wl", "ct1", "stopped"); err != nil {
 				t.Fatalf("diverged state write: %v", err)
 			}
@@ -255,12 +290,112 @@ func TestFleet_AntiEntropyMustNotResurrectAtEqualAuthority(t *testing.T) {
 			}
 			live := rows[0].String("d") == ""
 			if live != tc.wantLive {
-				t.Errorf("after anti-entropy the coordinator's row live=%v, want %v (incoming generation=%d). "+
-					"A delete is terminal at its own authority; only a higher generation may resurrect.",
+				t.Errorf("after anti-entropy the coordinator's row live=%v, want %v (incoming epoch=%d). "+
+					"A delete is terminal for its incarnation; only a NEW incarnation may resurrect.",
 					live, tc.wantLive, rows[0].Int64("e"))
 			}
 		})
 	}
+}
+
+// TestFleet_DeleteVsTransferConvergesToTheTombstone pins BOTH directions of the
+// delete-vs-ownership-transfer race for VMs and containers. A coordinator
+// deletes the workload (disks/rootfs already destroyed by its handler) while a
+// peer that never received the tombstone completes a migration/failover
+// transfer, minting epoch+1 on the SAME incarnation. Whichever side anti-
+// entropy runs from, the cluster must converge on the tombstone: converging on
+// the live row resurrects a workload with no storage behind it, and refusing
+// both directions pins a permanent divergence.
+func TestFleet_DeleteVsTransferConvergesToTheTombstone(t *testing.T) {
+	t.Run("vm", func(t *testing.T) {
+		c := New(t, Options{Nodes: 2})
+		deleter, transferer := c.Nodes[0], c.Nodes[1]
+		ctx := context.Background()
+
+		if err := corrosion.InsertVM(ctx, deleter.DB, corrosion.VMRecord{
+			Name: "vm1", HostName: deleter.Name, State: "running",
+		}, nil, nil); err != nil {
+			t.Fatalf("InsertVM: %v", err)
+		}
+		if err := corrosion.BackfillOwnerEpochs(ctx, deleter.DB, deleter.Name); err != nil {
+			t.Fatalf("BackfillOwnerEpochs: %v", err)
+		}
+		pumpMutations(t, c, deleter, transferer)
+
+		if err := corrosion.DeleteVM(ctx, deleter.DB, "vm1"); err != nil {
+			t.Fatalf("DeleteVM: %v", err)
+		}
+		// The peer, unaware of the delete, completes a failover transfer.
+		if err := corrosion.TransferVMOwner(ctx, transferer.DB, "vm1", transferer.Name, "running", 1); err != nil {
+			t.Fatalf("TransferVMOwner: %v", err)
+		}
+
+		// Deleter pulls the transferer: the epoch+1 live row must NOT revive.
+		if err := deleter.DB.MergeStateBytesLWW(pullDump(t, c, transferer)); err != nil {
+			t.Fatalf("merge into deleter: %v", err)
+		}
+		// Transferer pulls the deleter: the tombstone must land despite its
+		// LOWER epoch — same incarnation, and the delete is terminal for it.
+		if err := transferer.DB.MergeStateBytesLWW(pullDump(t, c, deleter)); err != nil {
+			t.Fatalf("merge into transferer: %v", err)
+		}
+
+		for _, n := range []*Node{deleter, transferer} {
+			rows, err := n.DB.Query(ctx,
+				`SELECT COALESCE(deleted_at,'') d, vm_owner_epoch e FROM vms WHERE name='vm1'`)
+			if err != nil || len(rows) == 0 {
+				t.Fatalf("read %s row: %v", n.Name, err)
+			}
+			if rows[0].String("d") == "" {
+				t.Errorf("%s: the deleted VM is LIVE (epoch=%d) — the transfer resurrected a "+
+					"workload whose disks the delete already destroyed", n.Name, rows[0].Int64("e"))
+			}
+		}
+	})
+
+	t.Run("container", func(t *testing.T) {
+		c := New(t, Options{Nodes: 2})
+		deleter, transferer := c.Nodes[0], c.Nodes[1]
+		ctx := context.Background()
+
+		if err := corrosion.UpsertContainer(ctx, deleter.DB, corrosion.ContainerRecord{
+			HostName: "wl", Name: "ct1", State: "running", Image: "alpine:3.19",
+		}); err != nil {
+			t.Fatalf("UpsertContainer: %v", err)
+		}
+		if err := corrosion.BackfillOwnerEpochs(ctx, deleter.DB, "wl"); err != nil {
+			t.Fatalf("BackfillOwnerEpochs: %v", err)
+		}
+		pumpMutations(t, c, deleter, transferer)
+
+		if err := corrosion.DeleteContainer(ctx, deleter.DB, "wl", "ct1"); err != nil {
+			t.Fatalf("DeleteContainer: %v", err)
+		}
+		if err := transferer.DB.Execute(ctx,
+			`UPDATE containers SET state = 'pending', relocate_token = ?, updated_at = ?
+			 WHERE host_name = ? AND name = ?`,
+			"tok1", transferer.DB.NowTS(), "wl", "ct1"); err != nil {
+			t.Fatalf("stage relocation: %v", err)
+		}
+		if err := corrosion.CompleteContainerRelocation(ctx, transferer.DB, "wl", "ct1", "tok1"); err != nil {
+			t.Fatalf("CompleteContainerRelocation: %v", err)
+		}
+
+		if err := deleter.DB.MergeStateBytesLWW(pullDump(t, c, transferer)); err != nil {
+			t.Fatalf("merge into deleter: %v", err)
+		}
+		if err := transferer.DB.MergeStateBytesLWW(pullDump(t, c, deleter)); err != nil {
+			t.Fatalf("merge into transferer: %v", err)
+		}
+
+		for _, n := range []*Node{deleter, transferer} {
+			_, deleted, exists := ctRow(t, n, "wl", "ct1")
+			if !exists || !deleted {
+				t.Errorf("%s: the deleted container is LIVE — the relocation mint resurrected it "+
+					"(deleted=%v exists=%v)", n.Name, deleted, exists)
+			}
+		}
+	})
 }
 
 // TestFleet_PingReportsAWallClock covers the server half of clock-skew
@@ -363,11 +498,17 @@ func TestFleet_RefusedPreAuthorityDeleteIsReported(t *testing.T) {
 			"(state=%q deleted=%v exists=%v)", state, deleted, exists)
 	}
 
-	// And REPORTED. A correct-but-silent refusal is the actual defect.
+	// And REPORTED — with the REAL table label. An operator's natural query
+	// after this incident filters on table="containers"; the entry-level skip
+	// initially reported table="unknown", which that filter silently misses.
 	var found bool
 	for _, r := range metrics.reasons() {
 		if strings.Contains(r, "pre_authority_delete") {
 			found = true
+			if !strings.HasPrefix(r, "containers/") {
+				t.Fatalf("the refusal must carry its table label, got %q — table=\"unknown\" is "+
+					"invisible to a dashboard filtered on the workload table", r)
+			}
 		}
 	}
 	if !found {

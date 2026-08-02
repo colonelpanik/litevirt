@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"time"
 )
 
 // mergeAuthorityManifest binds legacy child rows (which have no owner columns)
@@ -22,7 +23,14 @@ type workloadMergeAuthority struct {
 	kind, name, host, project, state, activeOperationID string
 	ownerEpoch, generation                              int64
 	identityHash                                        string
-	deleted, valid                                      bool
+	// createdAt is the incarnation identity (see workloadParentAuthorityDecision):
+	// every path that mutates a row — ownership transfer, spec update, drift heal,
+	// relocation completion — PRESERVES created_at, and every path that brings a
+	// (host,name)/name back to life writes a fresh one. Two rows with equal
+	// created_at are therefore the same incarnation; a delete of an incarnation is
+	// terminal for it at ANY authority.
+	createdAt      string
+	deleted, valid bool
 }
 
 type operationMergeAuthority struct {
@@ -123,7 +131,7 @@ func vmAuthorityFromDump(cols []string, row []interface{}) (workloadMergeAuthori
 	required := []string{
 		"name", "stack_name", "host_name", "spec", "state", "project",
 		"is_template", "vm_owner_epoch", "spec_generation",
-		"active_operation_id", "deleted_at",
+		"active_operation_id", "deleted_at", "created_at",
 	}
 	idx, ok := requiredColumnIndexes(cols, required)
 	if !ok {
@@ -147,6 +155,7 @@ func vmAuthorityFromDump(cols []string, row []interface{}) (workloadMergeAuthori
 		ownerEpoch:        ownerEpoch,
 		generation:        generation,
 		identityHash:      vmCreateIdentityHash(vm),
+		createdAt:         coerceString(row[idx["created_at"]]),
 		deleted:           cellNonEmpty(row[idx["deleted_at"]]),
 		valid:             vm.Name != "" && vm.HostName != "" && ownerOK && generationOK,
 	}, true
@@ -157,7 +166,7 @@ func containerAuthorityFromDump(cols []string, row []interface{}) (workloadMerge
 		"host_name", "name", "image", "cpu_limit", "memory_mib", "labels",
 		"restart_policy", "state", "project", "is_template", "on_host_failure",
 		"create_spec", "relocate_token", "owner_epoch", "spec_generation",
-		"active_operation_id", "deleted_at",
+		"active_operation_id", "deleted_at", "created_at",
 	}
 	idx, ok := requiredColumnIndexes(cols, required)
 	if !ok {
@@ -187,6 +196,7 @@ func containerAuthorityFromDump(cols []string, row []interface{}) (workloadMerge
 		ownerEpoch:        ownerEpoch,
 		generation:        generation,
 		identityHash:      containerCreateIdentityHash(ct, labels),
+		createdAt:         coerceString(row[idx["created_at"]]),
 		deleted:           cellNonEmpty(row[idx["deleted_at"]]),
 		valid:             ct.Name != "" && ct.HostName != "" && ownerOK && generationOK,
 	}, true
@@ -343,16 +353,21 @@ func mergeRowIsDeleted(table syncTable, row []interface{}) bool {
 
 func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMergeAuthority) (mergeAuthorityDecision, error) {
 	var localOwner, localGeneration int64
-	var localDeleted sql.NullString
+	var localDeleted, localCreated sql.NullString
+	var localState, localActiveOp string
 	var err error
 	switch incoming.kind {
 	case "vm":
-		err = tx.QueryRow(`SELECT vm_owner_epoch, spec_generation, deleted_at FROM vms WHERE name = ?`,
-			incoming.name).Scan(&localOwner, &localGeneration, &localDeleted)
+		err = tx.QueryRow(`SELECT vm_owner_epoch, spec_generation, deleted_at, created_at,
+			state, active_operation_id FROM vms WHERE name = ?`,
+			incoming.name).Scan(&localOwner, &localGeneration, &localDeleted, &localCreated,
+			&localState, &localActiveOp)
 	case "container":
-		err = tx.QueryRow(`SELECT owner_epoch, spec_generation, deleted_at FROM containers
+		err = tx.QueryRow(`SELECT owner_epoch, spec_generation, deleted_at, created_at,
+			state, active_operation_id FROM containers
 			WHERE host_name = ? AND name = ?`, incoming.host, incoming.name).
-			Scan(&localOwner, &localGeneration, &localDeleted)
+			Scan(&localOwner, &localGeneration, &localDeleted, &localCreated,
+				&localState, &localActiveOp)
 	default:
 		return mergeAuthorityKeepLocal, nil
 	}
@@ -366,15 +381,48 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 		return mergeAuthorityKeepLocal, err
 	}
 	localIsDeleted := localDeleted.Valid && localDeleted.String != ""
+
+	// A delete is TERMINAL FOR ITS INCARNATION, and created_at names the
+	// incarnation: every mutation of a row — ownership transfer, spec update,
+	// drift heal, relocation completion — preserves created_at, while every path
+	// that brings the name back to life writes a fresh one (VM recreate purges
+	// the tombstone and re-inserts; container recreate does the same; the
+	// guarded create-begin UPSERT sets excluded.created_at).
+	//
+	// Authority axes CANNOT decide the live-vs-tombstone cases on their own:
+	//  - equal authority says nothing (a 0/0 recreate on the default-config path
+	//    restarts at the tombstone's exact authority, and a stale pre-delete
+	//    copy also sits at it — timestamp LWW deciding between them is what
+	//    resurrected a tombstone cluster-wide on the lab, 2026-08-02);
+	//  - a higher owner epoch is an ownership MOVE of the same incarnation
+	//    (TransferVMOwner / relocation completion mint epoch+1 with the
+	//    generation untouched) — a transfer racing the delete must not revive
+	//    a row whose disks the delete already destroyed.
+	// When both sides carry an incarnation stamp, decide from it; rows without
+	// one (malformed dump) fall through to the conservative authority rules.
+	//
+	// PROVISIONAL rows are excluded: a create claim executed independently on
+	// two sides of a partition (same operation, same identity) legitimately
+	// mints two different created_at stamps for what is ONE logical create —
+	// the create-operation machinery (equal-authority identity matching below)
+	// owns converging those, and the incarnation rules would misread the pair
+	// as distinct incarnations.
+	localProvisional := localState == "creating" && localActiveOp != ""
+	if !localIsDeleted && !incoming.deleted {
+		// Both live: same or different incarnation, ordinary authority rules below.
+	} else if !localProvisional && !provisionalWorkloadBarrier(incoming) {
+		if decision, decided := incarnationTombstoneDecision(
+			localIsDeleted, coalesceNull(localCreated), incoming,
+		); decided {
+			return decision, nil
+		}
+	}
+
 	switch {
 	case localOwner == incoming.ownerEpoch && localGeneration == incoming.generation:
-		// A delete is TERMINAL AT ITS AUTHORITY. An incoming live row at the SAME
-		// owner epoch and spec generation is a stale pre-delete copy, however new
-		// its updated_at: falling through to timestamp LWW here is what let a
-		// diverged node's drift-heal write resurrect a tombstone cluster-wide on
-		// the lab (2026-08-02). Legitimate resurrection is a RECREATE, which mints
-		// a higher generation and is handled by the case below.
 		if localIsDeleted && !incoming.deleted {
+			// No incarnation evidence on one side; fail closed — the tombstone
+			// stands rather than letting a timestamp resurrect it.
 			return mergeAuthorityKeepLocal, nil
 		}
 		if incoming.deleted {
@@ -410,6 +458,69 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 		// allowing a timestamp to choose an ABA-sensitive workload identity.
 		return mergeAuthorityKeepLocal, nil
 	}
+}
+
+// incarnationTombstoneDecision decides the live-vs-tombstone merge cases from
+// incarnation identity (created_at). It reports decided=false when either side
+// lacks a stamp — the caller's authority rules then apply — and for the
+// both-deleted case unless the incoming tombstone is a strictly newer
+// incarnation (converging two tombstones of the same incarnation is the
+// existing equal-authority identity path's job).
+func incarnationTombstoneDecision(
+	localIsDeleted bool, localCreated string, incoming workloadMergeAuthority,
+) (mergeAuthorityDecision, bool) {
+	if localCreated == "" || incoming.createdAt == "" {
+		return mergeAuthorityKeepLocal, false
+	}
+	same := localCreated == incoming.createdAt
+	incomingNewer := !same && incarnationAfter(incoming.createdAt, localCreated)
+	switch {
+	case localIsDeleted && !incoming.deleted:
+		if incomingNewer {
+			// A strictly newer incarnation is a genuine recreate — it revives
+			// the name even where its authority axes restarted BELOW the
+			// tombstone's (a default-config recreate starts over at 0/0 while
+			// the backfilled tombstone sits at epoch 1).
+			return mergeAuthorityApplyIncoming, true
+		}
+		// Same incarnation — a stale pre-delete copy, or a transfer's epoch
+		// bump of the row the delete already killed — or an older stray:
+		// the tombstone is terminal.
+		return mergeAuthorityKeepLocal, true
+	case !localIsDeleted && incoming.deleted:
+		if same || incomingNewer {
+			// Same incarnation: the delete kills our copy no matter how far an
+			// ownership transfer moved its epoch since (the delete-vs-transfer
+			// race converges to the delete, not to a disk-less resurrection).
+			// Newer incarnation deleted: our live copy is an older stray that
+			// was already superseded — retire it with the same sweep.
+			return mergeAuthorityApplyIncomingAndSweep, true
+		}
+		// The tombstone names an OLDER incarnation: it cannot kill a recreate.
+		return mergeAuthorityKeepLocal, true
+	case localIsDeleted && incoming.deleted && incomingNewer:
+		return mergeAuthorityApplyIncomingAndSweep, true
+	default:
+		return mergeAuthorityKeepLocal, false
+	}
+}
+
+// incarnationAfter orders two created_at stamps. Unparseable input is never
+// evidence of a newer incarnation (fail closed to keep-local).
+func incarnationAfter(a, b string) bool {
+	ta, errA := time.Parse(time.RFC3339Nano, a)
+	tb, errB := time.Parse(time.RFC3339Nano, b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return ta.After(tb)
+}
+
+func coalesceNull(s sql.NullString) string {
+	if s.Valid {
+		return s.String
+	}
+	return ""
 }
 
 func localWorkloadIdentityHash(tx *sql.Tx, want workloadMergeAuthority) (string, bool, error) {

@@ -151,8 +151,8 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 // reuses SetHardwareAdoptionState's exact UPDATE shape — no new replicated
 // statement shape is introduced.
 func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, pciIntents []PCIIntentRecord, adopt bool) error {
-	now := nowRFC3339() // created_at (bare)
-	uts := c.NowTS()    // updated_at (monotonic LWW key)
+	now := nowRFC3339Nano() // created_at — fresh incarnation stamp (see nowRFC3339Nano)
+	uts := c.NowTS()        // updated_at (monotonic LWW key)
 
 	stmts := []Statement{
 		// Purge any soft-deleted record with the same name so the INSERT succeeds.
@@ -847,36 +847,40 @@ func TransferVMOwnerFresh(ctx context.Context, c *Client, name, hostName, state 
 // receive-only: a peer admits it only while its own row has zero authority, so
 // after the owner-epoch backfill it is silently dropped everywhere.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
-	applied, err := deleteVMGuarded(ctx, c, name)
+	// Absent/already-tombstoned is the idempotent success callers expect; a row
+	// still live after every fresh-guard retry means its authority keeps moving
+	// under the CAS and the caller must not be told the delete landed.
+	outcome, err := retriedDelete(func() (deleteOutcome, error) {
+		return deleteVMGuarded(ctx, c, name)
+	})
 	if err != nil {
 		return err
 	}
-	if !applied {
-		// Absent/already-tombstoned is the idempotent success callers expect; a
-		// row still live means its authority moved under the CAS and the caller
-		// must not be told the delete landed.
-		vm, gerr := GetVM(ctx, c, name)
-		if gerr != nil {
-			return gerr
-		}
-		if vm != nil {
-			return ErrNoRowsAffected
-		}
-	}
-	return nil
+	return deleteOutcomeError(outcome, false)
 }
 
-// deleteVMGuarded is reserved for capability-gated authority-aware callers.
-// Ordinary DeleteVM retains the v43 wire contract during rolling upgrades.
-func deleteVMGuarded(ctx context.Context, c *Client, name string) (bool, error) {
+// deleteVMGuarded is the single VM delete emitter; every caller routes through
+// DeleteVM's retry loop. It reports the tri-state outcome from its own guard
+// read — see deleteOutcome for why absent and CAS-miss must not be conflated.
+func deleteVMGuarded(ctx context.Context, c *Client, name string) (deleteOutcome, error) {
 	vm, err := GetVM(ctx, c, name)
-	if err != nil || vm == nil {
-		return false, err
+	if err != nil {
+		return deleteContended, err
 	}
-	guard := vmDeleteMutationGuard(*vm)
+	if vm == nil {
+		return deleteAbsent, nil
+	}
+	return deleteVMGuardedFrom(ctx, c, *vm)
+}
+
+// deleteVMGuardedFrom runs the guarded CAS against the caller's row snapshot —
+// split from the read for the same testability reason as its container twin.
+func deleteVMGuardedFrom(ctx context.Context, c *Client, vm VMRecord) (deleteOutcome, error) {
+	name := vm.Name
+	guard := vmDeleteMutationGuard(vm)
 	now := c.NowTS()     // LWW key (updated_at)
 	wall := nowRFC3339() // deleted_at is a wall/display column, never the HLC key
-	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		return c.mutationGuardMatches(ctx, tx, guard)
 	}, []Statement{
 		// Children are fenced while the parent is still live; the parent
@@ -890,6 +894,13 @@ func deleteVMGuarded(ctx context.Context, c *Client, name string) (bool, error) 
 			wall, now, name, vm.OwnerEpoch, vm.SpecGeneration,
 		}, Guard: guard},
 	})
+	if err != nil {
+		return deleteContended, err
+	}
+	if !applied {
+		return deleteContended, nil
+	}
+	return deleteApplied, nil
 }
 
 // RenameVM changes a VM's name across all tables, including the name embedded in

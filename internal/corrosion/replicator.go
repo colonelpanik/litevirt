@@ -973,7 +973,10 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 			// tombstone stayed invisible: the entry is ACKNOWLEDGED, so nothing
 			// back-pressures and the sender believes it replicated. Naming the
 			// sender is the point — the fix is to upgrade it.
-			r.client.observeMergeRejected("unknown", "wal", "pre_authority_delete")
+			// stmts[0] is the parent tombstone (the entry decision enforces
+			// legacyIndex == 0), so the metric can carry the real table — an
+			// operator filtering on table="containers" must see these.
+			r.client.observeMergeRejected(structuralTableLabel(stmts[0].SQL), "wal", "pre_authority_delete")
 			slog.Warn("replicator: skipped a pre-authority workload delete batch (rows kept live here)",
 				"sender", entry.Origin, "seq", entry.Seq,
 				"reason", "the pre-authority shape cannot prove the local row is the same workload it deleted",

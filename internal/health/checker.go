@@ -360,14 +360,21 @@ func (c *Checker) probe(addr string) bool {
 // UNKNOWN, not skew: measuring it against time.Since would read as ~2000 years
 // of drift and bury the real signal.
 //
-// The measurement includes the Ping's round trip, so a peer reads as skewed by
-// its true offset plus RTT. On a cluster LAN that is microseconds against a
-// one-second threshold; it is only worth noting if this ever runs over a WAN.
-func (c *Checker) checkClockSkew(ctx context.Context, peerName string, peerTimestamp time.Time) {
+// reqStart/reqEnd bracket the Ping RPC that carried the timestamp. The peer
+// stamps its clock while BUILDING the response — somewhere inside that
+// interval — so the NTP-style estimate compares it against the interval's
+// midpoint, canceling the response-path latency to first order. Naively using
+// time.Since(peerTimestamp) counts the whole response leg (bounded only by the
+// 4s capActivationTimeout) as skew, so any Ping slower than the 1s threshold
+// records a perfectly synced peer as skewed — worst during a capability
+// fan-out under load, exactly when every voting member is pinged at once, and
+// enough to spuriously trip the 5s upgrade-preflight ceiling.
+func (c *Checker) checkClockSkew(ctx context.Context, peerName string, peerTimestamp, reqStart, reqEnd time.Time) {
 	if peerTimestamp.IsZero() {
 		return
 	}
-	skew := time.Since(peerTimestamp).Abs()
+	mid := reqStart.Add(reqEnd.Sub(reqStart) / 2)
+	skew := peerTimestamp.Sub(mid).Abs()
 	if skew > time.Second {
 		slog.Warn("clock skew detected — LWW conflict resolution may be unreliable",
 			"peer", peerName, "skew", skew, "fix", "Check NTP on "+peerName)

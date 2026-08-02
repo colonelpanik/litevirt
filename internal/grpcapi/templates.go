@@ -279,6 +279,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "define clone domain: %v", err)
 	}
+	// specJSON above was marshalled BEFORE the define, so it carries whatever
+	// the source spec had — an alias if the source was never pinned. The define
+	// just resolved it against this host's qemu; persist that concrete value
+	// instead, or the clone starts life with the ABI hazard its source had.
+	// Re-marshal, since the pre-pin JSON is what would otherwise be stored.
+	if before := srcSpec.Machine; true {
+		s.pinMachineFromDomain(&srcSpec)
+		if srcSpec.Machine != before {
+			specJSON, _ = json.Marshal(&srcSpec)
+		}
+	}
 
 	// Roll back everything the clone built until the DB row lands — including the
 	// fresh UUID-keyed swtpm + name-keyed NVRAM, so a failed clone strands nothing (G1).

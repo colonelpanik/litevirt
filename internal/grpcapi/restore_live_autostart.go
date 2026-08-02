@@ -297,6 +297,12 @@ func (s *Server) autoDefineRestoredVM(
 
 	// Persist the VM so lifecycle / migration / UI treat it like any
 	// other. Best-effort: the VM is already running.
+	//
+	// The define above resolved any machine alias against this host's qemu.
+	// Persist that concrete value, or a VM restored from a backup taken on a
+	// different qemu carries an alias whose meaning changes the next time it
+	// moves — the same guest-ABI hazard create/import/promote/clone pin against.
+	s.pinMachineFromDomain(spec)
 	specJSON, _ := json.Marshal(spec)
 	vmRecord := corrosion.VMRecord{
 		Name: targetName, HostName: s.hostName, Spec: string(specJSON),

@@ -780,6 +780,26 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	return s.vmToProto(ctx, spec.Name)
 }
 
+// pinMachineFromDomain upgrades a spec's machine ALIAS to the concrete
+// versioned type libvirt bound the (already-defined) domain to. Every path that
+// defines a domain and then persists its spec must call this before marshalling:
+// libvirt resolves an alias against the LOCAL qemu at define time, so persisting
+// the alias lets a later migration or failover re-resolve it on a host with a
+// different qemu and silently shift the guest ABI.
+//
+// Best-effort and strictly non-destructive: an already-concrete value is left
+// alone (it is the contract the VM was created under), and an unreadable domain
+// or an alias-only answer leaves the spec exactly as it was rather than blanking
+// it. Nil-safe, because the callers are best-effort paths.
+func (s *Server) pinMachineFromDomain(spec *pb.VMSpec) {
+	if spec == nil || lv.IsPinnedMachineType(spec.Machine) {
+		return
+	}
+	if pinned := s.resolveMachineType(spec.Name); lv.IsPinnedMachineType(pinned) {
+		spec.Machine = pinned
+	}
+}
+
 // resolveMachineType reads the concrete, versioned machine type libvirt bound a
 // domain to (e.g. "pc-q35-9.0") from its persistent XML. Returns "" if the
 // domain is absent, unreadable, or carries no machine attribute. Used to pin

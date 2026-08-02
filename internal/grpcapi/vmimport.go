@@ -207,6 +207,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 
+	// The define above resolved any machine alias against this host's qemu;
+	// persist the concrete value so the imported VM's guest ABI travels with it.
+	s.pinMachineFromDomain(spec)
 	specJSON, _ := json.Marshal(spec)
 	diskRecords, ifaceRecords, nicRecords := importRecords(fv, name, s.hostName)
 	// pciIntents: the mapped spec's Devices, if the source format ever declares

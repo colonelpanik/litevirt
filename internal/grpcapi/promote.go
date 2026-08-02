@@ -779,6 +779,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	// Persist. Takeover (same name) re-homes the existing record; a renamed
 	// promotion writes a fresh VM alongside the original.
+	// Same as create/import: the define above resolved any alias on THIS host,
+	// so persist the concrete type rather than letting the promoted VM carry an
+	// alias that a later move would re-resolve elsewhere.
+	s.pinMachineFromDomain(&spec)
 	specJSON, _ := json.Marshal(&spec)
 	if renamed {
 		rec := corrosion.VMRecord{

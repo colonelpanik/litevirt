@@ -1489,6 +1489,11 @@ message PingResponse {
   // empty list and is treated as unsupported. Enforcement of a fail-closed check
   // activates only once every enforcement-relevant member advertises its token.
   repeated string capabilities = 4;
+  // wall_clock is the responder's WALL clock (RFC3339 nanos) at the moment it
+  // answered — never the HLC. The caller compares it with its own to detect NTP
+  // drift, which corrupts LWW conflict resolution. Empty from a peer that
+  // predates this field; a caller must read that as "unknown", never as skew.
+  string wall_clock = 5;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.

@@ -355,7 +355,18 @@ func (c *Checker) probe(addr string) bool {
 // checkClockSkew compares the local clock with the peer's reported timestamp
 // and logs a warning if skew exceeds 1 second. This mitigates LWW resolution
 // corruption from NTP misconfiguration (#41).
+// A zero peerTimestamp means the peer reported no clock — an older build whose
+// PingResponse predates wall_clock, or this node pinging itself. That is
+// UNKNOWN, not skew: measuring it against time.Since would read as ~2000 years
+// of drift and bury the real signal.
+//
+// The measurement includes the Ping's round trip, so a peer reads as skewed by
+// its true offset plus RTT. On a cluster LAN that is microseconds against a
+// one-second threshold; it is only worth noting if this ever runs over a WAN.
 func (c *Checker) checkClockSkew(ctx context.Context, peerName string, peerTimestamp time.Time) {
+	if peerTimestamp.IsZero() {
+		return
+	}
 	skew := time.Since(peerTimestamp).Abs()
 	if skew > time.Second {
 		slog.Warn("clock skew detected — LWW conflict resolution may be unreliable",

@@ -60,18 +60,18 @@ func unreachableEmitters(pkgs []*packages.Package, findings []finding) []string 
 		}
 	}
 
-	return unreachableFrom(builders, uses)
+	return unreachableFrom(builders, uses, knownUnwiredEmitters)
 }
 
 // unreachableFrom is the guard's decision, split from the package scan so it is
 // unit-testable (mirroring computeGaps).
-func unreachableFrom(builders map[string]token.Position, uses map[string]int) []string {
+func unreachableFrom(builders map[string]token.Position, uses map[string]int, exempt map[string]string) []string {
 	var gaps []string
 
 	// Known unwired emitters, each needing its own slice rather than a silent
 	// weakening of the guard. An entry that is no longer a builder — wired up, or
 	// deleted — becomes a failure of its own, so this list cannot quietly rot.
-	for name, why := range knownUnwiredEmitters {
+	for name, why := range exempt {
 		if _, isBuilder := builders[name]; !isBuilder {
 			gaps = append(gaps, fmt.Sprintf(
 				"knownUnwiredEmitters lists %s (%s) but it no longer builds a replicated "+
@@ -83,7 +83,7 @@ func unreachableFrom(builders map[string]token.Position, uses map[string]int) []
 		if uses[name] > 1 {
 			continue
 		}
-		if _, known := knownUnwiredEmitters[name]; known {
+		if _, known := exempt[name]; known {
 			continue
 		}
 		gaps = append(gaps, fmt.Sprintf(
@@ -106,11 +106,8 @@ func isExportedName(s string) bool {
 // caller that are NOT being fixed in the change that introduced this guard.
 // Each is a real finding; the value maps the name to what wiring it needs.
 var knownUnwiredEmitters = map[string]string{
-	// Found by this guard on 2026-08-02. Clock-skew detection is implemented,
-	// unit-tested, and never invoked: the health checker's probe is a bare TLS
-	// dial that never learns a peer's timestamp, so no clock_skew row is ever
-	// written and the skew warning cannot fire. Wiring it means carrying a
-	// timestamp on the Ping response — a behavior change in a different
-	// subsystem, so it gets its own slice.
-	"checkClockSkew": "needs a peer-reported timestamp (Ping response) to call it from",
+	// Empty. checkClockSkew — the finding this guard produced on 2026-08-02 —
+	// is wired; it rides the capability path's fresh Ping. Add an entry only for
+	// a builder whose wiring genuinely belongs in a different change, and expect
+	// to justify it: an unemitted shape is a feature that silently does nothing.
 }

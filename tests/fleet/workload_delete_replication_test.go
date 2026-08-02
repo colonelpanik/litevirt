@@ -3,6 +3,7 @@ package fleet
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -240,5 +241,27 @@ func TestFleet_AntiEntropyMustNotResurrectAtEqualAuthority(t *testing.T) {
 					live, tc.wantLive, rows[0].Int64("e"))
 			}
 		})
+	}
+}
+
+// TestFleet_PingReportsAWallClock covers the server half of clock-skew
+// detection over real gRPC. Without it the field can silently go unset — the
+// health checker then sees the zero time from every peer, reads it as "unknown"
+// (correctly), and skew detection is dark again, which is exactly the state this
+// whole area was in until 2026-08-02.
+func TestFleet_PingReportsAWallClock(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	a, b := c.Nodes[0], c.Nodes[1]
+
+	caps, peerWall, err := a.Server.PeerCapabilities(context.Background(), b.Name)
+	if err != nil {
+		t.Fatalf("PeerCapabilities: %v", err)
+	}
+	_ = caps
+	if peerWall.IsZero() {
+		t.Fatal("a peer must report its wall clock, else skew detection is silently dark")
+	}
+	if skew := time.Since(peerWall).Abs(); skew > time.Minute {
+		t.Fatalf("peer wall clock is %v away from ours — it is not a real wall clock", skew)
 	}
 }

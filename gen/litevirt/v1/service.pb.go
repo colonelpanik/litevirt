@@ -17273,7 +17273,12 @@ type PingResponse struct {
 	// Read via a FRESH Ping (never stale replicated rows); an old peer returns an
 	// empty list and is treated as unsupported. Enforcement of a fail-closed check
 	// activates only once every enforcement-relevant member advertises its token.
-	Capabilities  []string `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	Capabilities []string `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	// wall_clock is the responder's WALL clock (RFC3339 nanos) at the moment it
+	// answered — never the HLC. The caller compares it with its own to detect NTP
+	// drift, which corrupts LWW conflict resolution. Empty from a peer that
+	// predates this field; a caller must read that as "unknown", never as skew.
+	WallClock     string `protobuf:"bytes,5,opt,name=wall_clock,json=wallClock,proto3" json:"wall_clock,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -17334,6 +17339,13 @@ func (x *PingResponse) GetCapabilities() []string {
 		return x.Capabilities
 	}
 	return nil
+}
+
+func (x *PingResponse) GetWallClock() string {
+	if x != nil {
+		return x.WallClock
+	}
+	return ""
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
@@ -24704,12 +24716,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"LOCALIZING\x10\x04\x12\b\n" +
 	"\x04DONE\x10\x05\"\r\n" +
-	"\vPingRequest\"\x90\x01\n" +
+	"\vPingRequest\"\xaf\x01\n" +
 	"\fPingResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
 	"\x0eschema_version\x18\x03 \x01(\x05R\rschemaVersion\x12\"\n" +
-	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\"\x14\n" +
+	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12\x1d\n" +
+	"\n" +
+	"wall_clock\x18\x05 \x01(\tR\twallClock\"\x14\n" +
 	"\x12FetchBinaryRequest\"\x85\x01\n" +
 	"\x10FetchBinaryChunk\x12\x14\n" +
 	"\x05chunk\x18\x01 \x01(\fR\x05chunk\x12\x1a\n" +

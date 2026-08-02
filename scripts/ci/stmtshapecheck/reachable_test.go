@@ -8,6 +8,11 @@ import (
 
 // The guard's decision is "an unexported builder nothing references", so these
 // cases drive it through fakeUses rather than a real package load.
+// testExempt stands in for the production allowlist so these cases pin the
+// guard's LOGIC, not whatever happens to be exempted today (it is empty now that
+// checkClockSkew is wired).
+var testExempt = map[string]string{"checkClockSkew": "test fixture"}
+
 func TestUnreachableEmitters(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -27,7 +32,7 @@ func TestUnreachableEmitters(t *testing.T) {
 				// be in any package, which this guard deliberately doesn't chase.
 				builders = map[string]token.Position{}
 			}
-			gaps := unreachableFrom(builders, map[string]int{tc.fn: tc.uses})
+			gaps := unreachableFrom(builders, map[string]int{tc.fn: tc.uses}, testExempt)
 			// The allowlist-rot check fires whenever checkClockSkew is absent from
 			// the builder set; ignore it here so each case asserts its own subject.
 			gaps = withoutRotWarnings(gaps, tc.fn)
@@ -41,7 +46,7 @@ func TestUnreachableEmitters(t *testing.T) {
 // An allowlist entry that no longer names a builder must fail, so the list
 // cannot outlive the finding it documents.
 func TestUnreachableEmitters_AllowlistCannotRot(t *testing.T) {
-	gaps := unreachableFrom(map[string]token.Position{}, map[string]int{})
+	gaps := unreachableFrom(map[string]token.Position{}, map[string]int{}, testExempt)
 	found := false
 	for _, g := range gaps {
 		if strings.Contains(g, "checkClockSkew") && strings.Contains(g, "remove the exemption") {

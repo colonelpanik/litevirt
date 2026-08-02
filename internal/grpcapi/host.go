@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -143,6 +144,9 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// Split-brain-hardening feature tokens this build supports. Read via a
 		// fresh Ping to compute cluster-wide activation of fail-closed checks.
 		Capabilities: s.advertisedCapabilities(),
+		// WALL clock, not the HLC: the caller uses it to detect NTP drift, and an
+		// HLC value would compare against its own wall clock as nonsense skew.
+		WallClock: time.Now().UTC().Format(time.RFC3339Nano),
 	}, nil
 }
 
@@ -151,20 +155,30 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 // the health checker (SetPeerPinger) so cluster-wide activation is computed from
 // live reachability, never from stale replicated rows. An unreachable peer
 // returns an error so the caller can fail closed.
-func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, error) {
+// It also returns the peer's WALL clock so the health checker can detect NTP
+// drift without a second RPC. A peer that predates the field reports the zero
+// time, which the caller must read as "unknown", never as skew. Self returns the
+// zero time too: a node cannot be skewed against itself.
+func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, time.Time, error) {
 	if host == s.hostName {
-		return s.advertisedCapabilities(), nil
+		return s.advertisedCapabilities(), time.Time{}, nil
 	}
 	c, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	defer closeConn()
 	resp, err := c.Ping(ctx, &pb.PingRequest{})
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	return resp.GetCapabilities(), nil
+	peerWall := time.Time{}
+	if s := resp.GetWallClock(); s != "" {
+		if parsed, perr := time.Parse(time.RFC3339Nano, s); perr == nil {
+			peerWall = parsed
+		}
+	}
+	return resp.GetCapabilities(), peerWall, nil
 }
 
 // DrainHost marks the host as draining and migrates all its VMs to healthy hosts.

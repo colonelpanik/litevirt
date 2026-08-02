@@ -25,7 +25,12 @@ import (
 // PeerPinger fresh-Pings a host and returns its advertised capability tokens.
 // Injected from the daemon (grpcapi.Server.PeerCapabilities). An unreachable host
 // returns an error so activation fails closed.
-type PeerPinger func(ctx context.Context, host string) ([]string, error)
+// PeerPinger fresh-Pings a peer and returns its advertised capability tokens
+// plus its WALL clock. The clock rides along so clock-skew detection costs no
+// extra RPC: every fresh Ping the capability path already makes is also a skew
+// observation. A peer that reports no clock (an older build) yields the zero
+// time, which means "unknown" and is never treated as skew.
+type PeerPinger func(ctx context.Context, host string) ([]string, time.Time, error)
 
 // capActivationTimeout bounds the fan-out of fresh Pings for one activation check.
 const capActivationTimeout = 4 * time.Second
@@ -216,10 +221,11 @@ func (c *Checker) PeerSupportsFresh(ctx context.Context, peer, token string) boo
 	}
 	pctx, cancel := context.WithTimeout(ctx, capActivationTimeout)
 	defer cancel()
-	caps, err := pinger(pctx, peer)
+	caps, peerWall, err := pinger(pctx, peer)
 	if err != nil {
 		return false // fail-closed; don't cache a failure
 	}
+	c.checkClockSkew(ctx, peer, peerWall)
 	c.mu.Lock()
 	c.peerCaps[peer] = peerCapEntry{caps: caps, fetchedAt: time.Now()}
 	c.mu.Unlock()
@@ -255,11 +261,14 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 		if !votingEligible(h.State) {
 			continue // decommissioned/offline/maintenance/fenced don't gate enforcement
 		}
-		caps, err := pinger(pctx, h.Name)
+		caps, peerWall, err := pinger(pctx, h.Name)
 		if err != nil {
 			// Unreachable enforcement-relevant member — can't confirm support.
 			return c.cacheNeg(token, ReasonActivationUnconfirm)
 		}
+		// This sweep already holds a fresh Ping from every voting member, so it
+		// is the cheapest place in the daemon to observe cluster-wide drift.
+		c.checkClockSkew(ctx, h.Name, peerWall)
 		if !capabilities.Has(caps, token) {
 			return c.cacheNeg(token, ReasonUnsupportedCapability)
 		}

@@ -343,15 +343,16 @@ func mergeRowIsDeleted(table syncTable, row []interface{}) bool {
 
 func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMergeAuthority) (mergeAuthorityDecision, error) {
 	var localOwner, localGeneration int64
+	var localDeleted sql.NullString
 	var err error
 	switch incoming.kind {
 	case "vm":
-		err = tx.QueryRow(`SELECT vm_owner_epoch, spec_generation FROM vms WHERE name = ?`,
-			incoming.name).Scan(&localOwner, &localGeneration)
+		err = tx.QueryRow(`SELECT vm_owner_epoch, spec_generation, deleted_at FROM vms WHERE name = ?`,
+			incoming.name).Scan(&localOwner, &localGeneration, &localDeleted)
 	case "container":
-		err = tx.QueryRow(`SELECT owner_epoch, spec_generation FROM containers
+		err = tx.QueryRow(`SELECT owner_epoch, spec_generation, deleted_at FROM containers
 			WHERE host_name = ? AND name = ?`, incoming.host, incoming.name).
-			Scan(&localOwner, &localGeneration)
+			Scan(&localOwner, &localGeneration, &localDeleted)
 	default:
 		return mergeAuthorityKeepLocal, nil
 	}
@@ -364,8 +365,18 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 	if err != nil {
 		return mergeAuthorityKeepLocal, err
 	}
+	localIsDeleted := localDeleted.Valid && localDeleted.String != ""
 	switch {
 	case localOwner == incoming.ownerEpoch && localGeneration == incoming.generation:
+		// A delete is TERMINAL AT ITS AUTHORITY. An incoming live row at the SAME
+		// owner epoch and spec generation is a stale pre-delete copy, however new
+		// its updated_at: falling through to timestamp LWW here is what let a
+		// diverged node's drift-heal write resurrect a tombstone cluster-wide on
+		// the lab (2026-08-02). Legitimate resurrection is a RECREATE, which mints
+		// a higher generation and is handled by the case below.
+		if localIsDeleted && !incoming.deleted {
+			return mergeAuthorityKeepLocal, nil
+		}
 		if incoming.deleted {
 			localHash, ok, hashErr := localWorkloadIdentityHash(tx, incoming)
 			if hashErr != nil {

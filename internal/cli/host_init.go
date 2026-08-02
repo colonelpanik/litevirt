@@ -534,16 +534,42 @@ func parseSSHTarget(target string) (host string, user string, err error) {
 	return host, user, nil
 }
 
+// lookupHost is a seam so resolveHost's address-family preference can be tested
+// without depending on what the machine's resolver happens to return.
+var lookupHost = net.LookupHost
+
 // resolveHost resolves a hostname to an IP address for use in cert SANs.
+//
+// It prefers IPv4 and refuses an AAAA-only name. The resolved address does not
+// stay in the certificate: it also becomes hosts.address (the address every peer
+// dials) and an entry in the gossip seed list, and cluster transport is IPv4-only
+// today — gossip and gRPC both bind 0.0.0.0, and advertise_address rejects IPv6
+// for the same reason (see internal/daemon/config.go). Returning addrs[0] meant a
+// dual-stack name could plant an IPv6 address into the cluster through this path
+// even with advertise_address unset, and LookupHost order is not stable, so the
+// same command could succeed on one run and produce an unreachable host on the
+// next. Fail here, where the operator is watching, rather than at the first peer
+// health probe.
 func resolveHost(host string) (string, error) {
-	if net.ParseIP(host) != nil {
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() == nil {
+			return "", fmt.Errorf("resolve host %q: IPv6 is not supported for cluster "+
+				"transport (gossip and gRPC bind 0.0.0.0); use the host's IPv4 address", host)
+		}
 		return host, nil
 	}
-	addrs, err := net.LookupHost(host)
+	addrs, err := lookupHost(host)
 	if err != nil || len(addrs) == 0 {
 		return "", fmt.Errorf("resolve host %q: %v", host, err)
 	}
-	return addrs[0], nil
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+			return ip.To4().String(), nil
+		}
+	}
+	return "", fmt.Errorf("resolve host %q: only IPv6 addresses found (%v) and cluster "+
+		"transport is IPv4-only; give the host an A record or pass its IPv4 address directly",
+		host, addrs)
 }
 
 func getSetupScript() (string, error) {

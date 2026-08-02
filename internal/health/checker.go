@@ -3,7 +3,6 @@ package health
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -273,7 +272,11 @@ func boundedFanout[T any](items []T, concurrency int, work func(T)) {
 }
 
 func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
-	addr := fmt.Sprintf("%s:%d", host.Address, host.GRPCPort)
+	// net.JoinHostPort (not Sprintf): host.Address is a bare host and may be an
+	// IPv6 literal, which "%s:%d" would mangle into an unparseable target. Every
+	// probe would then fail and this healthy peer would be marked suspect and
+	// fenced — a config value silently becoming a fencing event.
+	addr := corrosion.PeerTarget(host.Address, host.GRPCPort)
 	healthy := c.probe(addr)
 
 	c.mu.Lock()

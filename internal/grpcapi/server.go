@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/netip"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1140,12 +1138,11 @@ func (s *Server) vmLogDir() string {
 }
 
 // peerTarget builds a dialable "host:port" target, defaulting the port to 7443
-// and bracketing IPv6 addresses via net.JoinHostPort.
+// and bracketing IPv6 addresses. One implementation, in corrosion, next to the
+// hosts table the address comes from — a second copy is a second chance to
+// regress back to Sprintf("%s:%d").
 func peerTarget(addr string, port int) string {
-	if port == 0 {
-		port = 7443
-	}
-	return net.JoinHostPort(addr, strconv.Itoa(port))
+	return corrosion.PeerTarget(addr, port)
 }
 
 // dialPeerAddr opens an mTLS gRPC connection to a peer daemon at an already-known

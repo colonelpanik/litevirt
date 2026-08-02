@@ -60,6 +60,13 @@ gossip_port: 7946
 # NAT'd 10.0.2.15): gossip membership looks healthy and every node lists its
 # peers by name, but each one dials ITSELF, so the cluster never converges and
 # the logs show "certificate is valid for <real ip>, not <wrong ip>".
+#
+# MUST be a bare IPv4 literal — no port, no brackets, no hostname. The daemon
+# refuses to start otherwise. IPv6 is rejected because cluster transport is
+# IPv4-only today: gossip and gRPC both bind 0.0.0.0. Nothing downstream would
+# catch a v6 value — memberlist accepts it and gossips it over the v4-only mesh,
+# so the node boots looking healthy, no peer can reach it, and the failure
+# detector marks it suspect and fences a host that was never down.
 advertise_address: ""
 
 # Path to TLS certificates (CA, host cert/key).

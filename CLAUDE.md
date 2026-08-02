@@ -93,7 +93,14 @@ fallback.
   private IP by interface enumeration order for gossip — which can disagree with
   each other and with reality. When the wrong address is identical on every node
   (a NAT'd lab), each node dials itself, gossip looks healthy, and the cluster
-  never converges.
+  never converges. It must be a bare IPv4 literal — the daemon refuses to start
+  on a hostname, a host:port, or IPv6.
+- **Cluster transport is IPv4-only.** Gossip and gRPC both bind `0.0.0.0`, so an
+  IPv6 address anywhere in the peer path is a trap, not a feature: nothing fails
+  at startup, every peer probe just fails forever and the failure detector fences
+  a live host. `advertise_address` and `resolveHost` reject IPv6 at the two entry
+  points; `corrosion.PeerTarget` / `corrosion.URIHost` (never `Sprintf("%s:%d")`)
+  keep the dial paths correct if one gets in anyway.
 - **`internal/pki` is not importable across modules.** External consumers build
   their own peer TLS config from `ca.crt` / `host.crt` / `host.key`.
 - **Docs are guarded in both directions.** `cmd/litevirt/docs_triangulation_test.go`

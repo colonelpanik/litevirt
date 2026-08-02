@@ -112,6 +112,8 @@ func main() {
 	}
 
 	gaps := computeGaps(findings)
+	// A registered shape with no caller never reaches a peer — see reachable.go.
+	gaps = append(gaps, unreachableEmitters(pkgs, findings)...)
 	if len(gaps) == 0 {
 		fmt.Printf("stmtshapecheck: %d replicated builder statement(s) all registered; OK\n", len(findings))
 		return

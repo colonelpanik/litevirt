@@ -50,7 +50,13 @@ jobs:
   # tell a peer is out of date. That check needs the diff between base and head,
   # which is why this job checks out full history.
   ci-guards:
-    name: CI guardrails
+    # The display name is pinned: branch protection on main requires a status
+    # check with this exact name, and a rename here means the required check
+    # never reports and every PR is blocked with green CI. Rename only together
+    # with the branch-protection setting (repo admin), after in-flight PRs
+    # carrying the old name have merged or rebased. The job now runs all of
+    # `make ci-guards`, of which the schema guard is one part.
+    name: Schema version guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

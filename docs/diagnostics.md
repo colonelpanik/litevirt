@@ -357,6 +357,30 @@ Human-readable table by default; `--json` for the full structured report (node
 lists incl. `sensitive_unreachable`, per-row per-node `updated_at`/hash, `stable`,
 and violations). `--table` restricts the scan to specific tables.
 
+## `lv doctor machine-types`
+
+Read-only. Lists VMs whose **persisted spec** carries an unversioned machine
+alias (`q35`, `pc-q35`, or empty) rather than a concrete versioned type such as
+`pc-q35-9.0`.
+
+```
+lv doctor machine-types
+```
+
+An alias is resolved by libvirt against the **local** qemu, so a VM carrying one
+can have its guest ABI shift underneath it when it migrates or fails over to a
+host running a different qemu version. Two paths already pin the concrete type
+at define time — `lv run` (create) and the stopped-VM redefine — and the
+reconciler backfills the pin for any VM it sweeps on its current host. A VM
+listed here therefore came from another path (clone, import, restore, promote)
+and has not yet been swept where it now lives.
+
+To pin one: start it (the reconciler pins on its next sweep) or, while it is
+stopped, run `lv update <vm> --machine <concrete-type>`. Neither is urgent on a
+homogeneous cluster — every host resolving the alias identically is why this is
+a warning and not an error — but it should be cleared before introducing a host
+with a different qemu version.
+
 ## Persisted LWW clock & backward-clock protection
 
 The `updated_at` conflict key is minted from a **monotonic** clock whose high-water

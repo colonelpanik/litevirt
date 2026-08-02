@@ -447,3 +447,84 @@ func TestCollect_NoHost(t *testing.T) {
 		t.Errorf("expected at least 1 metric even with no host, got %d", count)
 	}
 }
+
+// litevirt_replication_min_watermark_seq must report the floor over LIVE peers
+// only. Replication is PUSH over the relay topology, so a node holds a
+// permanently-stale watermark for any peer it does not itself serve (at N=5 the
+// sole leaf is assigned to the first two relays, so the other two never push to
+// it). Including that row made the gauge report the slowest-EVER-seen peer
+// instead of the current floor, pinning it far below the real compaction point.
+//
+// The prune is already correct — pruneMutationLog filters to live watermarks —
+// so this is cosmetic, but a metric that disagrees with the behavior it claims
+// to describe is how an operator gets sent chasing a backlog that isn't there.
+func TestCollect_ReplicationMinWatermark_IgnoresStalePeers(t *testing.T) {
+	db := initTestDB(t)
+	ctx := context.Background()
+
+	insertLogRows(t, db, 10)
+	now := time.Now().UTC()
+	// A peer this node does not serve: last seen long ago, far behind.
+	if err := db.Execute(ctx,
+		`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)`,
+		"unserved-leaf", 1, now.Add(-2*corrosion.LiveWatermarkWindow).Format(time.RFC3339)); err != nil {
+		t.Fatalf("insert stale watermark: %v", err)
+	}
+	// Two live peers, both well ahead.
+	for _, p := range []struct {
+		name string
+		seq  int
+	}{{"live-a", 900}, {"live-b", 950}} {
+		if err := db.Execute(ctx,
+			`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)`,
+			p.name, p.seq, now.Format(time.RFC3339)); err != nil {
+			t.Fatalf("insert live watermark %s: %v", p.name, err)
+		}
+	}
+
+	c := newCollector(db, nil, nil, "host-a")
+	ch := make(chan prometheus.Metric, 100)
+	c.Collect(ch)
+	close(ch)
+
+	got, found := gaugeValue(t, ch, "litevirt_replication_min_watermark_seq")
+	if !found {
+		t.Fatal("missing litevirt_replication_min_watermark_seq metric")
+	}
+	if got != 900 {
+		t.Fatalf("min watermark = %v, want 900 (the live floor; the stale unserved-leaf row at 1 must be ignored)", got)
+	}
+}
+
+// Positive control: a genuinely lagging LIVE peer must still pin the gauge —
+// the filter drops stale rows, it does not drop low ones.
+func TestCollect_ReplicationMinWatermark_LiveLaggardStillCounts(t *testing.T) {
+	db := initTestDB(t)
+	ctx := context.Background()
+
+	insertLogRows(t, db, 10)
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, p := range []struct {
+		name string
+		seq  int
+	}{{"live-slow", 5}, {"live-fast", 900}} {
+		if err := db.Execute(ctx,
+			`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)`,
+			p.name, p.seq, now); err != nil {
+			t.Fatalf("insert watermark %s: %v", p.name, err)
+		}
+	}
+
+	c := newCollector(db, nil, nil, "host-a")
+	ch := make(chan prometheus.Metric, 100)
+	c.Collect(ch)
+	close(ch)
+
+	got, found := gaugeValue(t, ch, "litevirt_replication_min_watermark_seq")
+	if !found {
+		t.Fatal("missing litevirt_replication_min_watermark_seq metric")
+	}
+	if got != 5 {
+		t.Fatalf("min watermark = %v, want 5 (a live laggard must still pin the floor)", got)
+	}
+}

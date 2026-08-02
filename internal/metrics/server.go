@@ -478,9 +478,17 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue, float64(rows[0].Int("cnt")))
 	}
 
-	// Replication watermark floor. Lowest peer seq pins compaction.
+	// Replication watermark floor over LIVE peers. Replication is PUSH over the
+	// relay topology, so this node holds a permanently-stale watermark for any
+	// peer it does not itself serve — and an unfiltered MIN reported the
+	// slowest-EVER-seen peer instead of the current compaction floor, pinning
+	// the gauge far below reality. The prune has always filtered to live
+	// watermarks (pruneMutationLog); this now matches it, using the same cutoff
+	// the pending_entries query below computes.
+	liveCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
 	if rows, rerr := c.db.Query(ctx,
-		`SELECT COALESCE(MIN(last_seq), 0) AS m FROM replication_watermarks`); rerr == nil && len(rows) > 0 {
+		`SELECT COALESCE(MIN(last_seq), 0) AS m FROM replication_watermarks WHERE updated_at > ?`,
+		liveCutoff); rerr == nil && len(rows) > 0 {
 		ch <- prometheus.MustNewConstMetric(c.replicationMinSeq,
 			prometheus.GaugeValue, float64(rows[0].Int("m")))
 	}
@@ -491,7 +499,6 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// replication_min_watermark_seq. Reported as 0 when there are no live peers
 	// so a single node (or a fully-partitioned one) doesn't report its whole
 	// log as "pending". The live cutoff matches the replicator's prune logic.
-	liveCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
 	pending := 0.0
 	if wm, werr := c.db.Query(ctx,
 		`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq

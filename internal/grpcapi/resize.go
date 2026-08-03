@@ -36,7 +36,7 @@ const (
 // resize never clobbers server-owned fields (UUID / resolved MACs / addresses /
 // unknown fields). Callers must NOT hold the VM lock. Returns nil when there is
 // nothing to do.
-func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSpec, idemKey string) error {
+func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSpec, idemKey string) (retErr error) {
 	unlock := s.lockVM(name)
 	defer unlock()
 
@@ -121,7 +121,7 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	// already subtracted from free capacity. Charging another would refuse a legal
 	// grow, and refuse it again on every subsequent resize.
 	release, aerr := s.admitResources(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta), false)
-	defer release()
+	defer func() { release(retErr == nil) }()
 	if aerr != nil {
 		return aerr
 	}

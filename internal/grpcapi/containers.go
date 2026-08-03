@@ -152,7 +152,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		// video, page tables) and containers are accounted through their own
 		// per-host memory sum, so a container never pays a qemu overhead.
 		release, err := s.admitResources(ctx, s.hostName, req.Project, 0, int(req.MemoryMib), false)
-		defer release()
+		defer func() { release(retErr == nil) }()
 		if err != nil {
 			return nil, err
 		}

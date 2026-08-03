@@ -249,7 +249,7 @@ type Server struct {
 	// project name. Only meaningful on the project's authority holder — see
 	// admitProjectQuota.
 	projectAdmitMu sync.Mutex
-	projectAdmit   map[string]*hostAdmitState
+	projectAdmit   map[string]*projectAdmitState
 
 	// quotaLeases holds project-quota reservations this node granted to peers as
 	// the project's authority holder, keyed by reservation id. Per-Server (not a
@@ -901,7 +901,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		events:         events.NewBus(),
 		vmLocks:        make(map[string]*sync.Mutex),
 		hostAdmit:      make(map[string]*hostAdmitState),
-		projectAdmit:   make(map[string]*hostAdmitState),
+		projectAdmit:   make(map[string]*projectAdmitState),
 		loginThrottle:  newLoginThrottle(),
 		ReExecCh:       make(chan struct{}, 1),
 		ShutdownCh:     make(chan struct{}, 1),

@@ -25,6 +25,10 @@ type hostAdmitState struct {
 // noopRelease is the release func for an admission that reserved nothing.
 func noopRelease() {}
 
+// noopReleaseCommitted is the committed-aware form, for a quota admission that
+// reserved nothing.
+func noopReleaseCommitted(bool) {}
+
 func (s *Server) hostAdmitStateFor(host string) *hostAdmitState {
 	s.hostAdmitMu.Lock()
 	defer s.hostAdmitMu.Unlock()
@@ -178,21 +182,50 @@ func (s *Server) reserveHostCapacity(host string, cpuDelta, memMiBDelta int) fun
 // The host lock is released before the quota step, which may make a peer RPC to
 // the project's authority holder. That ordering is load-bearing: never hold the
 // host lock across a peer call.
-func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, newVMOnHost bool) (func(), error) {
+// The returned release takes `committed`: whether the caller actually wrote the
+// workload. It matters only for the QUOTA half, and only because the workload is
+// committed by the target HOST while quota is serialized by the project's authority
+// — possibly a third node. On a commit the authority must keep the charge until its
+// own replica shows the workload, or a concurrent request is handed the same quota
+// in the replication gap. The HOST half always just releases: the node that reserved
+// is the node that committed, so its own usage query sees the write immediately.
+//
+// Pass `committed` honestly. Passing true for a failed operation holds quota until
+// the grace TTL; passing false for a successful one reopens the very window this
+// closes.
+func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, newVMOnHost bool) (func(bool), error) {
 	hostMem := memMiBDelta
 	if newVMOnHost {
 		hostMem = s.capacity.MemChargeFor(memMiBDelta)
 	}
 	release, err := s.admitHostCapacity(ctx, host, cpuDelta, hostMem)
 	if err != nil {
-		return noopRelease, err
+		return noopReleaseCommitted, err
 	}
 	qRelease, err := s.admitProjectQuota(ctx, project, cpuDelta, memMiBDelta)
 	if err != nil {
 		release()
-		return noopRelease, err
+		return noopReleaseCommitted, err
 	}
-	return func() { qRelease(); release() }, nil
+	return func(committed bool) { qRelease(committed); release() }, nil
+}
+
+// projectUsageForAdmission returns the project's currently-OBSERVED vCPU/memory
+// usage on this node, and whether the project is bounded at all. bounded=false means
+// no quota row: nothing to enforce, so nothing to serialize.
+func (s *Server) projectUsageForAdmission(ctx context.Context, project string) (usedCPU, usedMem int, bounded bool, err error) {
+	q, err := corrosion.GetProjectQuota(ctx, s.db, project)
+	if err != nil {
+		return 0, 0, false, status.Errorf(codes.Internal, "get project quota: %v", err)
+	}
+	if q == nil {
+		return 0, 0, false, nil
+	}
+	u, err := corrosion.SumProjectUsage(ctx, s.db, project)
+	if err != nil {
+		return 0, 0, false, status.Errorf(codes.Internal, "sum project usage: %v", err)
+	}
+	return u.VCPUUsed, u.MemMiBUsed, true, nil
 }
 
 func maxInt(a, b int) int {

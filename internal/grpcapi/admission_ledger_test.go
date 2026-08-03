@@ -290,7 +290,7 @@ func TestAdmitResources_RunningVMGrowIsNotChargedOverheadAgain(t *testing.T) {
 		t.Fatalf("growing a RUNNING VM by exactly the free memory was refused (%v) — its "+
 			"overhead is already subtracted and must not be charged twice", err)
 	}
-	release()
+	release(false)
 
 	// The same grow treated as a NEW VM on the host is refused, which is the
 	// asymmetry the flag encodes.

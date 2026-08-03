@@ -22703,6 +22703,12 @@ type ReleaseProjectQuotaReservationRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Sender        string                 `protobuf:"bytes,1,opt,name=sender,proto3" json:"sender,omitempty"`
 	ReservationId string                 `protobuf:"bytes,2,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
+	// committed=true means the workload was actually written. The holder then KEEPS
+	// the charge instead of dropping it, until its own replica shows the workload —
+	// the row was written by the target host, so between that write and CRDT
+	// delivery the holder would otherwise see neither the reservation nor the usage
+	// and hand the same quota to a concurrent request.
+	Committed     bool `protobuf:"varint,3,opt,name=committed,proto3" json:"committed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22749,6 +22755,13 @@ func (x *ReleaseProjectQuotaReservationRequest) GetReservationId() string {
 		return x.ReservationId
 	}
 	return ""
+}
+
+func (x *ReleaseProjectQuotaReservationRequest) GetCommitted() bool {
+	if x != nil {
+		return x.Committed
+	}
+	return false
 }
 
 var File_litevirt_v1_service_proto protoreflect.FileDescriptor
@@ -24504,10 +24517,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0ereservation_id\x18\x02 \x01(\tR\rreservationId\x12\x16\n" +
 	"\x06detail\x18\x03 \x01(\tR\x06detail\x12%\n" +
 	"\x0ecurrent_holder\x18\x04 \x01(\tR\rcurrentHolder\x12#\n" +
-	"\rcurrent_epoch\x18\x05 \x01(\x03R\fcurrentEpoch\"f\n" +
+	"\rcurrent_epoch\x18\x05 \x01(\x03R\fcurrentEpoch\"\x84\x01\n" +
 	"%ReleaseProjectQuotaReservationRequest\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12%\n" +
-	"\x0ereservation_id\x18\x02 \x01(\tR\rreservationId*V\n" +
+	"\x0ereservation_id\x18\x02 \x01(\tR\rreservationId\x12\x1c\n" +
+	"\tcommitted\x18\x03 \x01(\bR\tcommitted*V\n" +
 	"\x0eRelayVIPResult\x12\x15\n" +
 	"\x11RELAY_VIP_UNKNOWN\x10\x00\x12\x14\n" +
 	"\x10RELAY_VIP_CLAIMS\x10\x01\x12\x17\n" +

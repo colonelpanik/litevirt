@@ -2415,4 +2415,10 @@ message AdmitProjectQuotaResponse {
 message ReleaseProjectQuotaReservationRequest {
     string sender = 1;
     string reservation_id = 2;
+    // committed=true means the workload was actually written. The holder then KEEPS
+    // the charge instead of dropping it, until its own replica shows the workload —
+    // the row was written by the target host, so between that write and CRDT
+    // delivery the holder would otherwise see neither the reservation nor the usage
+    // and hand the same quota to a concurrent request.
+    bool committed = 3;
 }

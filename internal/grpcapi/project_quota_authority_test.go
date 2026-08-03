@@ -67,13 +67,13 @@ func TestAdmitProjectQuota_LocalHolderReservationBlocksSecond(t *testing.T) {
 		t.Fatalf("third admit with the quota fully reserved: got %v, want ResourceExhausted — "+
 			"in-flight admissions must count against the limit", err)
 	}
-	r1()
+	r1(false)
 	if r3, err := s.admitProjectQuota(ctx, "/acme", 1, 512); err != nil {
 		t.Errorf("admit after releasing a reservation: %v", err)
 	} else {
-		r3()
+		r3(false)
 	}
-	r2()
+	r2(false)
 
 	st := s.projectAdmitStateFor("/acme")
 	st.mu.Lock()
@@ -94,14 +94,14 @@ func TestAdmitProjectQuota_InactiveFeatureIsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
-	defer r1()
+	defer r1(false)
 	// Nothing is reserved, so a second identical admit still passes against
 	// committed usage — the pre-existing (racy) behaviour, deliberately preserved.
 	r2, err := s.admitProjectQuota(ctx, "/acme", 2, 2048)
 	if err != nil {
 		t.Fatalf("second admit with the feature off should behave as before: %v", err)
 	}
-	defer r2()
+	defer r2(false)
 
 	st := s.projectAdmitStateFor("/acme")
 	st.mu.Lock()
@@ -147,7 +147,7 @@ func TestAdmitProjectQuota_UnreachableHolderFailsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admit with an unreachable holder must FAIL OPEN, got: %v", err)
 	}
-	release()
+	release(false)
 
 	// And it must still enforce the limit locally while degraded.
 	if _, err := s.admitProjectQuota(ctx, "/acme", 99, 99999); status.Code(err) != codes.ResourceExhausted {
@@ -184,6 +184,147 @@ func TestAdmitProjectQuota_NonHolderRPCIsRefused(t *testing.T) {
 // retrying after a timeout never wedges on an error it cannot act on.
 func TestReleaseQuotaLease_UnknownIDIsHarmless(t *testing.T) {
 	s, _ := quotaServer(t, 4, 4096)
-	s.dropQuotaLease("no-such-reservation")
-	s.dropQuotaLease("")
+	s.dropQuotaLease("no-such-reservation", false)
+	s.dropQuotaLease("", false)
+}
+
+// TestAdmitProjectQuota_CommittedChargeSurvivesReplicationGap is the regression test
+// for the second finding: a released reservation must not free quota before the
+// authority can SEE the committed workload.
+//
+// A routed admission is committed by the target HOST. The authority may be a third
+// node. So after the caller's deferred release, and until CRDT replication delivers
+// the workload row here, the authority sees neither the reservation (released) nor
+// the committed usage (not yet replicated) — and hands the same quota to the next
+// request. Releasing with committed=true converts the reservation into a
+// committed-but-unobserved charge that spans exactly that gap.
+//
+// Quota is 4 vCPU. One 4-vCPU admission is committed but its workload is NOT written
+// to this node's DB (simulating replication in flight). A second 4-vCPU admission
+// must still be refused.
+func TestAdmitProjectQuota_CommittedChargeSurvivesReplicationGap(t *testing.T) {
+	s, ctx := quotaServer(t, 4, 4096)
+
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil {
+		t.Fatalf("projectQuotaHolder: %v", err)
+	}
+	if holder != s.hostName {
+		t.Skipf("deterministic candidate is %q, not this node", holder)
+	}
+
+	release, err := s.admitProjectQuota(ctx, "/acme", 4, 2048)
+	if err != nil {
+		t.Fatalf("first admit: %v", err)
+	}
+	// The caller committed on the target host. Nothing has replicated here yet, so
+	// local usage is still 0.
+	release(true)
+
+	if _, err := s.admitProjectQuota(ctx, "/acme", 4, 2048); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("second 4-vCPU admit against a 4-vCPU quota, with the first committed but not "+
+			"yet replicated here: got %v, want ResourceExhausted — releasing on commit must not "+
+			"free the quota before the authority can observe the workload", err)
+	}
+
+	// Now replication delivers the workload. The unobserved charge must retire
+	// itself — otherwise the project would be double-charged forever.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "replicated", HostName: "other-host", State: "running", Project: "/acme",
+		CPUActual: 4, MemActual: 2048,
+		Spec: `{"name":"replicated","cpu":4,"memory_mib":2048}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Committed usage is now 4 vCPU of a 4 vCPU quota, so a further grow is still
+	// refused — but for the RIGHT reason (real usage), and the ledger must have
+	// dropped its duplicate charge.
+	if _, err := s.admitProjectQuota(ctx, "/acme", 1, 128); status.Code(err) != codes.ResourceExhausted {
+		t.Errorf("admit once the workload is visible: got %v, want ResourceExhausted (real usage)", err)
+	}
+	st := s.projectAdmitStateFor("/acme")
+	st.mu.Lock()
+	unobsCPU, unobsMem := st.unobsCPU, st.unobsMem
+	st.mu.Unlock()
+	if unobsCPU != 0 || unobsMem != 0 {
+		t.Errorf("unobserved charge = %d vCPU/%d MiB after the workload became visible, want 0/0 — "+
+			"the charge must retire itself or the project stays double-charged", unobsCPU, unobsMem)
+	}
+}
+
+// TestAdmitProjectQuota_FailedOperationReleasesImmediately: the conversion is only
+// for commits. A FAILED operation must give its quota straight back, or a project
+// would be starved by requests that never created anything.
+func TestAdmitProjectQuota_FailedOperationReleasesImmediately(t *testing.T) {
+	s, ctx := quotaServer(t, 4, 4096)
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	release, err := s.admitProjectQuota(ctx, "/acme", 4, 2048)
+	if err != nil {
+		t.Fatalf("first admit: %v", err)
+	}
+	release(false) // the create failed; nothing was written
+
+	if r2, err := s.admitProjectQuota(ctx, "/acme", 4, 2048); err != nil {
+		t.Errorf("admit after a FAILED operation released its reservation: %v — a failure must "+
+			"return the quota, not hold it", err)
+	} else {
+		r2(false)
+	}
+
+	st := s.projectAdmitStateFor("/acme")
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.unobsCPU != 0 || st.unobsMem != 0 {
+		t.Errorf("unobserved charge = %d/%d after a failed operation, want 0/0", st.unobsCPU, st.unobsMem)
+	}
+}
+
+// TestAdmitProjectQuota_UnobservedChargeAggregatesCorrectly: two overlapping commits
+// against ONE usage baseline. A per-entry baseline would credit the same visible
+// increase to both and undercharge; the aggregate form must not.
+func TestAdmitProjectQuota_UnobservedChargeAggregatesCorrectly(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	r1, err := s.admitProjectQuota(ctx, "/acme", 2, 1024)
+	if err != nil {
+		t.Fatalf("admit 1: %v", err)
+	}
+	r2, err := s.admitProjectQuota(ctx, "/acme", 2, 1024)
+	if err != nil {
+		t.Fatalf("admit 2: %v", err)
+	}
+	r1(true)
+	r2(true) // 4 vCPU committed, 0 visible
+
+	// Only the FIRST workload replicates in.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "first", HostName: "other-host", State: "running", Project: "/acme",
+		CPUActual: 2, MemActual: 1024,
+		Spec: `{"name":"first","cpu":2,"memory_mib":1024}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// 8 vCPU quota; 2 visible + 2 still unobserved = 4 spoken for. A 5-vCPU request
+	// must be refused. If the visible 2 were credited against BOTH charges the
+	// ledger would think only 2 were spoken for and let this through.
+	if _, err := s.admitProjectQuota(ctx, "/acme", 5, 512); status.Code(err) != codes.ResourceExhausted {
+		t.Errorf("5 vCPU with 2 visible + 2 committed-unobserved against an 8 vCPU quota: got %v, "+
+			"want ResourceExhausted — one visible increase must not be credited twice", err)
+	}
+	// 4 fits exactly (8 − 2 visible − 2 unobserved).
+	if r3, err := s.admitProjectQuota(ctx, "/acme", 4, 512); err != nil {
+		t.Errorf("4 vCPU should fit exactly: %v", err)
+	} else {
+		r3(false)
+	}
 }

@@ -268,7 +268,10 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		// newVMOnHost: this VM is appearing on the target, so it must also be
 		// charged its own qemu overhead against HOST capacity (not against quota).
 		release, err := s.admitResources(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib), true)
-		defer release()
+		// retErr == nil means the VM row was written. The project's quota authority
+		// may be a THIRD node that has not replicated that row yet, so it has to keep
+		// the charge until it can see it — see admitResources.
+		defer func() { release(retErr == nil) }()
 		if err != nil {
 			return nil, err
 		}
@@ -2735,7 +2738,7 @@ func (s *Server) liveGrowVCPU(ctx context.Context, req *pb.UpdateVMRequest) (*pb
 	return s.vmToProto(ctx, req.Name)
 }
 
-func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM, error) {
+func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *pb.VM, retErr error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -2886,7 +2889,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// newVMOnHost=false: the VM is running and already counted, overhead
 				// included, so the delta must not be charged another one.
 				release, aerr := s.admitResources(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow, false)
-				defer release()
+				defer func() { release(retErr == nil) }()
 				if aerr != nil {
 					return nil, aerr
 				}

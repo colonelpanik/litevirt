@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -50,20 +51,20 @@ type quotaLease struct {
 // Only vCPU and memory are serialized. The other quota dimensions (disk, NIC,
 // public IPs, backup GiB) are still admitted by tenancy.Engine.Admit with no
 // reservation and remain racy; that is a known gap, not something this closes.
-func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta, memMiBDelta int) (func(), error) {
+func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta, memMiBDelta int) (func(bool), error) {
 	if cpuDelta <= 0 && memMiBDelta <= 0 {
-		return noopRelease, nil
+		return noopReleaseCommitted, nil
 	}
 	project = tenancy.NormalizeProject(project)
 	if !s.projectQuotaAuthorityActive(ctx) {
-		return noopRelease, s.checkProjectQuota(ctx, project, cpuDelta, memMiBDelta)
+		return noopReleaseCommitted, s.checkProjectQuota(ctx, project, cpuDelta, memMiBDelta)
 	}
 
 	holder, epoch, err := s.projectQuotaHolder(ctx, project)
 	if err != nil || holder == "" {
 		// No authority resolvable (no eligible hosts, or a state read failed).
 		// Degrade to the local check rather than refusing a create.
-		return noopRelease, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta, "authority unresolved", err)
+		return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta, "authority unresolved", err)
 	}
 	if holder == s.hostName {
 		return s.admitProjectQuotaLocal(ctx, project, cpuDelta, memMiBDelta)
@@ -89,51 +90,158 @@ func (s *Server) projectQuotaHolder(ctx context.Context, project string) (string
 	return cur.Holder, cur.Epoch, nil
 }
 
-func (s *Server) projectAdmitStateFor(project string) *hostAdmitState {
+// projectAdmitState is the authority holder's per-project ledger. Two distinct
+// charges live here, and they cover two different windows:
+//
+//   - pending*: admitted, caller still working. Dropped when the caller releases.
+//   - unobserved*: the caller COMMITTED, but this node has not yet SEEN the
+//     workload. Dropped only once the commit shows up in local usage.
+//
+// The second one is the subtle half. A routed admission is committed by the target
+// HOST, not by the authority — so between that commit and CRDT replication
+// delivering the row here, the holder sees neither the reservation (the caller
+// released it) nor the committed usage. Another concurrent request would then be
+// handed the very same quota. Converting the reservation into an unobserved charge,
+// instead of just dropping it, keeps the quota spoken for across exactly that gap.
+//
+// The unobserved charge is AGGREGATE per project, not per workload, with a usage
+// baseline captured when the first one lands. The effective charge is
+// max(0, unobserved − (currentUsage − baseline)) per dimension, so as replication
+// delivers workloads the charge shrinks to zero on its own and needs no per-workload
+// bookkeeping. Per-entry baselines would double-credit the same visible increase
+// when two commits overlap; one aggregate baseline cannot.
+//
+// A commit that never becomes visible (the create failed after committing, or the
+// workload was deleted straight away) would hold the charge forever, so a short
+// grace TTL is the backstop. It errs toward over-charging, which refuses a request
+// that might have fit — never the reverse.
+type projectAdmitState struct {
+	mu         sync.Mutex
+	pendingCPU int
+	pendingMem int
+
+	unobsCPU int
+	unobsMem int
+	baseCPU  int
+	baseMem  int
+	unobsAt  time.Time
+}
+
+// unobservedGraceTTL bounds how long a committed-but-unseen charge is held. It only
+// needs to exceed normal replication delivery; the self-healing baseline comparison
+// does the real work.
+const unobservedGraceTTL = 2 * time.Minute
+
+func (s *Server) projectAdmitStateFor(project string) *projectAdmitState {
 	s.projectAdmitMu.Lock()
 	defer s.projectAdmitMu.Unlock()
 	if s.projectAdmit == nil {
-		s.projectAdmit = map[string]*hostAdmitState{}
+		s.projectAdmit = map[string]*projectAdmitState{}
 	}
 	st, ok := s.projectAdmit[project]
 	if !ok {
-		st = &hostAdmitState{}
+		st = &projectAdmitState{}
 		s.projectAdmit[project] = st
 	}
 	return st
 }
 
-// admitProjectQuotaLocal is the holder-side admit: check quota against committed
-// usage + replicated reservations + this node's in-flight ledger, then reserve.
-func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpuDelta, memMiBDelta int) (func(), error) {
+// releaseFor returns the idempotent release for one admission. committed=true
+// converts the reservation into an unobserved-commit charge (see the type doc);
+// committed=false just gives the quota back.
+//
+// usedCPU/usedMem are the usage this node observed at admit time, and become the
+// baseline the unobserved charge is measured against.
+func (st *projectAdmitState) releaseFor(cpu, mem, usedCPU, usedMem int) func(bool) {
+	var once sync.Once
+	return func(committed bool) {
+		once.Do(func() {
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			st.pendingCPU = maxInt(st.pendingCPU-cpu, 0)
+			st.pendingMem = maxInt(st.pendingMem-mem, 0)
+			if !committed {
+				return
+			}
+			if st.unobsCPU == 0 && st.unobsMem == 0 {
+				// First unobserved charge: anchor the baseline to what we could see
+				// when this admission was granted.
+				st.baseCPU, st.baseMem = usedCPU, usedMem
+			}
+			st.unobsCPU += cpu
+			st.unobsMem += mem
+			st.unobsAt = time.Now()
+		})
+	}
+}
+
+// unobservedChargeLocked returns the part of the committed-but-unseen total that
+// local usage does not yet account for. Caller holds st.mu.
+func (st *projectAdmitState) unobservedChargeLocked(usedCPU, usedMem int) (int, int) {
+	if st.unobsCPU == 0 && st.unobsMem == 0 {
+		return 0, 0
+	}
+	if time.Since(st.unobsAt) > unobservedGraceTTL {
+		// Backstop: a commit that never became visible. Stop holding its quota.
+		slog.Warn("project quota: a committed reservation never became visible locally; dropping it",
+			"cpu", st.unobsCPU, "mem_mib", st.unobsMem, "held_for", time.Since(st.unobsAt))
+		st.unobsCPU, st.unobsMem, st.baseCPU, st.baseMem = 0, 0, 0, 0
+		return 0, 0
+	}
+	cpu := maxInt(st.unobsCPU-maxInt(usedCPU-st.baseCPU, 0), 0)
+	mem := maxInt(st.unobsMem-maxInt(usedMem-st.baseMem, 0), 0)
+	if cpu == 0 && mem == 0 {
+		// Everything we were holding has now landed in usage.
+		st.unobsCPU, st.unobsMem, st.baseCPU, st.baseMem = 0, 0, 0, 0
+	}
+	return cpu, mem
+}
+
+// admitProjectQuotaLocal is the holder-side admit. It charges, in one pass under the
+// project lock: committed usage, replicated operation reservations, this node's
+// in-flight admissions, AND the committed-but-not-yet-visible total (see
+// projectAdmitState) — then reserves.
+//
+// The observed usage is carried into the release func so a commit can anchor its
+// unobserved charge to the usage that was visible when it was admitted.
+func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpuDelta, memMiBDelta int) (func(bool), error) {
 	st := s.projectAdmitStateFor(project)
 	st.mu.Lock()
-	if err := s.checkProjectQuotaWithPending(ctx, project, cpuDelta, memMiBDelta, st.pendingCPU, st.pendingMem); err != nil {
-		st.mu.Unlock()
-		return noopRelease, err
+	defer st.mu.Unlock()
+
+	usedCPU, usedMem, bounded, err := s.projectUsageForAdmission(ctx, project)
+	if err != nil {
+		return noopReleaseCommitted, err
+	}
+	if !bounded {
+		return noopReleaseCommitted, nil // unbounded project: nothing to serialize
+	}
+	unobsCPU, unobsMem := st.unobservedChargeLocked(usedCPU, usedMem)
+	if err := s.checkProjectQuotaWithPending(ctx, project, cpuDelta, memMiBDelta,
+		st.pendingCPU+unobsCPU, st.pendingMem+unobsMem); err != nil {
+		return noopReleaseCommitted, err
 	}
 	cpu, mem := maxInt(cpuDelta, 0), maxInt(memMiBDelta, 0)
 	st.pendingCPU += cpu
 	st.pendingMem += mem
-	st.mu.Unlock()
-	return st.releaseFor(cpu, mem), nil
+	return st.releaseFor(cpu, mem, usedCPU, usedMem), nil
 }
 
 // admitProjectQuotaRemote routes to the holder. On an epoch mismatch it retries
 // ONCE against the holder the remote reports, so a stale local view self-corrects
 // without looping.
-func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epoch int64, project string, cpuDelta, memMiBDelta int) (func(), error) {
+func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epoch int64, project string, cpuDelta, memMiBDelta int) (func(bool), error) {
 	// Never send a request a peer would answer Unimplemented: a mixed-version or
 	// flag-off holder must degrade, not error.
 	if s.gate == nil || !s.gate.PeerSupportsFresh(ctx, holder, capabilities.ProjectQuotaAuthorityV1) {
-		return noopRelease, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+		return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 			"holder does not advertise "+capabilities.ProjectQuotaAuthorityV1, nil)
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
 		client, conn, err := s.peerClient(ctx, holder)
 		if err != nil {
-			return noopRelease, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+			return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 				"holder "+holder+" unreachable", err)
 		}
 		resp, err := client.AdmitProjectQuota(ctx, &pb.AdmitProjectQuotaRequest{
@@ -152,21 +260,24 @@ func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epo
 					continue
 				}
 			}
-			return noopRelease, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+			return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 				"holder "+holder+" refused to answer", err)
 		}
 		if !resp.Admitted {
-			return noopRelease, status.Errorf(codes.ResourceExhausted,
+			return noopReleaseCommitted, status.Errorf(codes.ResourceExhausted,
 				"project %q quota exceeded: %s", project, resp.Detail)
 		}
 		id := resp.ReservationId
-		return func() { s.releaseRemoteQuota(holder, id) }, nil
+		// The committed flag has to reach the holder: on a commit it must KEEP the
+		// charge until it can see the workload, since the target host wrote the row
+		// and replication has not delivered it here yet.
+		return func(committed bool) { s.releaseRemoteQuota(holder, id, committed) }, nil
 	}
-	return noopRelease, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+	return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 		"authority epoch kept moving", nil)
 }
 
-func (s *Server) releaseRemoteQuota(holder, id string) {
+func (s *Server) releaseRemoteQuota(holder, id string, committed bool) {
 	if id == "" {
 		return
 	}
@@ -183,7 +294,7 @@ func (s *Server) releaseRemoteQuota(holder, id string) {
 	}
 	defer conn.Close()
 	if _, err := client.ReleaseProjectQuotaReservation(ctx, &pb.ReleaseProjectQuotaReservationRequest{
-		Sender: s.hostName, ReservationId: id,
+		Sender: s.hostName, ReservationId: id, Committed: committed,
 	}); err != nil {
 		slog.Warn("project quota: releasing routed reservation failed; it will expire on TTL",
 			"holder", holder, "reservation", id, "error", err)
@@ -265,7 +376,7 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 
 	id, err := newReservationID()
 	if err != nil {
-		release()
+		release(false) // never handed out, so nothing committed against it
 		return nil, status.Errorf(codes.Internal, "mint reservation id: %v", err)
 	}
 	s.putQuotaLease(id, release, project, int(req.CpuDelta), int(req.MemMibDelta))
@@ -281,7 +392,7 @@ func (s *Server) ReleaseProjectQuotaReservation(ctx context.Context, req *pb.Rel
 	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
 		return nil, err
 	}
-	s.dropQuotaLease(req.ReservationId)
+	s.dropQuotaLease(req.ReservationId, req.Committed)
 	return &emptypb.Empty{}, nil
 }
 
@@ -298,10 +409,10 @@ func (s *Server) ReleaseProjectQuotaReservation(ctx context.Context, req *pb.Rel
 // makes.
 type quotaLeaseEntry struct {
 	lease   quotaLease
-	release func()
+	release func(bool)
 }
 
-func (s *Server) putQuotaLease(id string, release func(), project string, cpu, mem int) {
+func (s *Server) putQuotaLease(id string, release func(bool), project string, cpu, mem int) {
 	s.quotaLeaseMu.Lock()
 	defer s.quotaLeaseMu.Unlock()
 	if s.quotaLeases == nil {
@@ -314,7 +425,7 @@ func (s *Server) putQuotaLease(id string, release func(), project string, cpu, m
 	}
 }
 
-func (s *Server) dropQuotaLease(id string) {
+func (s *Server) dropQuotaLease(id string, committed bool) {
 	s.quotaLeaseMu.Lock()
 	e, ok := s.quotaLeases[id]
 	if ok {
@@ -323,7 +434,7 @@ func (s *Server) dropQuotaLease(id string) {
 	s.reapQuotaLeasesLocked()
 	s.quotaLeaseMu.Unlock()
 	if ok {
-		e.release()
+		e.release(committed)
 	}
 }
 
@@ -338,7 +449,9 @@ func (s *Server) reapQuotaLeasesLocked() {
 				"project", e.lease.project, "reservation", id,
 				"cpu", e.lease.cpu, "mem_mib", e.lease.mem)
 			delete(s.quotaLeases, id)
-			e.release()
+			// Unconfirmed: the caller never told us it committed, so give the
+			// quota back rather than holding it as an unobserved commit.
+			e.release(false)
 		}
 	}
 }

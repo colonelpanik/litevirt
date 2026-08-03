@@ -153,9 +153,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// 2 vCPU / 4096 MiB — repeatable, and it bypassed BOTH project quota and host
 	// capacity. Normalize first so every check sees what the VM will actually cost.
 	//
-	// spec aliases req.Spec, so this also normalizes the copy forwarded to the
-	// owning host (which re-runs admission with the real numbers).
+	// Both copies. spec is a CLONE of req.Spec (normalizeCreateVMSpec clones so the
+	// server-owned UUID mint can't be steered by the caller), so normalizing only
+	// spec would leave the request forwarded to the owning host still carrying
+	// zeros. It re-runs admission from that copy, so the defaults have to be on it.
 	compose.NormalizeVMSpecResources(spec)
+	compose.NormalizeVMSpecResources(req.Spec)
 
 	// admission: prefer the tenancy engine (live billing +
 	// public-IP/backup-GiB checks); fall back to the corrosion-direct

@@ -307,19 +307,28 @@ func quotaWouldExceed(limit, used, reserved, delta int) bool {
 }
 
 // ensureProjectAuthority makes sure the project has a D1 admission-authority epoch,
-// minting the initial one if none exists. Best-effort establishment; the returned
-// authority is the current one (for recording in an operation's reserved step).
+// minting the initial one if none exists. The returned authority is the current one
+// (for recording in an operation's reserved step, and for routing quota admission).
 //
-// The initial holder is DERIVED from the project name over the cluster's hosts, not
-// set to this node. Claiming for self is the obvious move and it defeats the purpose:
-// every node serves its own creates, so every node would become the holder of its own
-// replica, every admission would stay local, and delegation would never fire. It also
-// mints conflicting rows — one epoch, two holders. Deriving instead means two nodes
-// racing the claim write the SAME row, so the race stops being a conflict.
+// Only the DETERMINISTIC candidate mints. The previous version had every node claim
+// with holder = s.hostName and treated a concurrent claim as harmless — "exactly one
+// wins the guarded initial claim". That is not what happens.
+// ClaimInitialProjectAuthority's guard runs inside ExecuteBatchGuarded, which is a
+// LOCAL transaction, so on two nodes both guards see COUNT(*) = 0 before either has
+// replicated and both insert epoch 1. project_authority_epochs then merges via
+// immutableMergeKeepLocalRow, which does NOT coin-flip an immutable row: differing
+// facts for one primary key are kept-local on both sides and flagged
+// immutable_conflict, permanently. The project ends up with two holders and an
+// operator has to repair it. (And since immutableFactsEqual compares created_at,
+// per-node wall time, even two claims naming the same holder conflict — so making
+// the holder agree is not enough; only one node may write.)
 //
-// With no host list to derive from, this node claims for itself: a cluster whose hosts
-// cannot be read has bigger problems, and refusing to establish authority at all would
-// block admission entirely.
+// Reachable before this change: the resize path calls this best-effort on whichever
+// owner resizes, so two owners resizing VMs in one project were enough.
+//
+// A non-candidate returns whatever authority currently exists (ok=false → zero
+// value) rather than minting. It converges as soon as the candidate handles a
+// request for the project.
 func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (corrosion.ProjectAuthority, error) {
 	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
 	if err != nil {
@@ -328,11 +337,15 @@ func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (co
 	if ok {
 		return cur, nil
 	}
-	holder := s.derivedProjectHolder(ctx, project)
-	if holder == "" {
-		holder = s.hostName
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return corrosion.ProjectAuthority{}, err
 	}
-	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, holder); err != nil {
+	candidate, hasCandidate := corrosion.DeterministicAuthorityCandidate(hosts, project)
+	if !hasCandidate || candidate != s.hostName {
+		return corrosion.ProjectAuthority{}, nil
+	}
+	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, s.hostName); err != nil {
 		return corrosion.ProjectAuthority{}, err
 	}
 	cur, _, err = corrosion.CurrentProjectAuthority(ctx, s.db, project)
@@ -346,16 +359,21 @@ func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (co
 // bootstrap work: the claim is written on the CALLER's replica, so the holder does not
 // yet have the row naming it. Rather than wait for replication — during which the
 // admission would fail — the holder re-derives and confirms the answer for itself.
+// It MUST agree with corrosion.DeterministicAuthorityCandidate, which is why it
+// simply calls it: that function decides who may MINT, and this one decides who may
+// CONFIRM a not-yet-replicated mint. Two derivations here would let a node confirm
+// authority no node was allowed to mint — and they did diverge, on both the hash
+// and the host filter, until they were collapsed onto one.
 func (s *Server) derivedProjectHolder(ctx context.Context, project string) string {
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil || len(hosts) == 0 {
 		return ""
 	}
-	names := make([]string, 0, len(hosts))
-	for _, h := range hosts {
-		names = append(names, h.Name)
+	candidate, ok := corrosion.DeterministicAuthorityCandidate(hosts, project)
+	if !ok {
+		return ""
 	}
-	return corrosion.DeriveProjectAuthorityHolder(project, names)
+	return candidate
 }
 
 // stampReservationAuthority records which authority epoch admitted a reservation.

@@ -2,11 +2,14 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strings"
 )
 
 // D1 — project-admission authority. Project quota is a HARD admission guarantee, so
@@ -151,4 +154,46 @@ func ValidateProjectAuthority(ctx context.Context, c *Client, project string, ep
 		return false, err
 	}
 	return cur.Epoch == epoch && cur.Holder == holder, nil
+}
+
+// DeterministicAuthorityCandidate picks the single node that may MINT a project's
+// initial authority, by rendezvous hash over the eligible hosts.
+//
+// This is not a load-balancing nicety — it is required for correctness.
+// project_authority_epochs uses immutableMergeKeepLocalRow (see customMergeTables),
+// so two nodes each minting epoch 1 is not resolved by last-writer-wins: it is
+// flagged as an immutable_conflict and kept-local on BOTH sides, permanently, so
+// the project has two holders until an operator repairs it. And because
+// immutableFactsEqual compares created_at (per-node wall time), even two claims
+// naming the SAME holder conflict. "Have every node write the same holder" is
+// therefore not sufficient; exactly one node may write at all.
+//
+// ClaimInitialProjectAuthority's guard cannot prevent this on its own —
+// ExecuteBatchGuarded is a LOCAL transaction, so both nodes see COUNT(*) = 0 before
+// either has replicated.
+//
+// Eligible = state "active", not a witness (witnesses never carry workloads, so
+// they must not carry admission authority either). Returns ok=false when no host
+// qualifies, in which case the caller must not claim.
+func DeterministicAuthorityCandidate(hosts []HostRecord, project string) (host string, ok bool) {
+	project = projectOrDefault(project)
+	var best string
+	var bestScore uint64
+	for _, h := range hosts {
+		if h.State != "active" || strings.EqualFold(h.Role, "witness") {
+			continue
+		}
+		// Rendezvous ("highest random weight") hashing: every node computes the
+		// same winner from the same host set without any coordination, and losing
+		// one host reassigns only the projects it held.
+		sum := sha256.Sum256([]byte(project + "\x00" + h.Name))
+		score := binary.BigEndian.Uint64(sum[:8])
+		if best == "" || score > bestScore || (score == bestScore && h.Name < best) {
+			best, bestScore = h.Name, score
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return best, true
 }

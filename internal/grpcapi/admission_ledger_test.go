@@ -233,3 +233,68 @@ func TestStartVM_AlreadyRunningReservesNothing(t *testing.T) {
 			"starve the host of admissions)", st.pendingCPU, st.pendingMem)
 	}
 }
+
+// TestAdmitHostCapacity_IncomingVMPaysItsOwnOverhead is the P2.
+//
+// Free capacity is computed net of one qemu overhead per VM ALREADY on the host,
+// but the incoming request was compared as bare guest memory. The two sides
+// disagreed by exactly one overhead, so a VM that exactly filled the reported free
+// memory was admitted although it draws that plus 128 MiB.
+//
+// 4096 total → 3072 allocatable. A 3072 MiB VM reports as "fitting exactly" and
+// must now be refused; 2944 (3072 − 128) is the largest that genuinely fits.
+func TestAdmitHostCapacity_IncomingVMPaysItsOwnOverhead(t *testing.T) {
+	s, ctx := admitServer(t, 4096)
+
+	free := s.capacity.MemChargeFor(0) // sanity: 0 stays 0
+	if free != 0 {
+		t.Fatalf("MemChargeFor(0) = %d, want 0", free)
+	}
+	if got := s.capacity.MemChargeFor(1024); got != 1024+128 {
+		t.Fatalf("MemChargeFor(1024) = %d, want 1152 (default 128 MiB overhead)", got)
+	}
+
+	// Exactly-fits-on-paper must be refused once the VM's own overhead counts.
+	if _, err := s.admitHostCapacity(ctx, "test-host", 1, s.capacity.MemChargeFor(3072)); status.Code(err) != codes.ResourceExhausted {
+		t.Errorf("a VM sized to the reported free memory: got %v, want ResourceExhausted — "+
+			"it also needs one qemu overhead, which the host does not have", err)
+	}
+	// And the largest that genuinely fits still does.
+	release, err := s.admitHostCapacity(ctx, "test-host", 1, s.capacity.MemChargeFor(2944))
+	if err != nil {
+		t.Errorf("2944 MiB + 128 overhead = 3072 = allocatable, must still fit: %v", err)
+	} else {
+		release()
+	}
+}
+
+// TestAdmitResources_RunningVMGrowIsNotChargedOverheadAgain: a delta on an
+// already-running VM must NOT pay another overhead — its own is already subtracted
+// from free capacity. Charging again would refuse a legal grow, and would refuse it
+// on every subsequent resize.
+func TestAdmitResources_RunningVMGrowIsNotChargedOverheadAgain(t *testing.T) {
+	s, ctx := admitServer(t, 4096) // 3072 allocatable
+
+	// A running VM at 1024 → free = 3072 − 1024 − 128 = 1920.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "grow", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 1024,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "grow", Cpu: 1, MemoryMib: 1024}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Growing by exactly the free 1920 MiB must be allowed: the VM is already
+	// counted, overhead included.
+	release, err := s.admitResources(ctx, "test-host", "_default", 0, 1920, false)
+	if err != nil {
+		t.Fatalf("growing a RUNNING VM by exactly the free memory was refused (%v) — its "+
+			"overhead is already subtracted and must not be charged twice", err)
+	}
+	release()
+
+	// The same grow treated as a NEW VM on the host is refused, which is the
+	// asymmetry the flag encodes.
+	if _, err := s.admitResources(ctx, "test-host", "_default", 0, 1920, true); status.Code(err) != codes.ResourceExhausted {
+		t.Errorf("a NEW 1920 MiB VM with only 1920 free: got %v, want ResourceExhausted", err)
+	}
+}

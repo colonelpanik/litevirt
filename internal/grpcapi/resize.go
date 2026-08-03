@@ -117,7 +117,10 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	// Reserved for the rest of this call so the grow stays accounted for until the
 	// spec/actuals write lands — otherwise a concurrent grow of a DIFFERENT VM on
 	// this host sees the same free capacity and both pass.
-	release, aerr := s.admitResources(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta))
+	// newVMOnHost=false: a live resize acts on a RUNNING VM whose overhead is
+	// already subtracted from free capacity. Charging another would refuse a legal
+	// grow, and refuse it again on every subsequent resize.
+	release, aerr := s.admitResources(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta), false)
 	defer release()
 	if aerr != nil {
 		return aerr

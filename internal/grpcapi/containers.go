@@ -148,7 +148,10 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// CreateContainerAtomic — otherwise a concurrent create for a different name
 	// sees the same free memory and both pass.
 	if req.MemoryMib > 0 {
-		lease, aerr := s.admitWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib))
+		// newVMOnHost=false: VMMemOverheadMiB is qemu-specific (device models,
+		// video, page tables) and containers are accounted through their own
+		// per-host memory sum, so a container never pays a qemu overhead.
+		lease, aerr := s.admitWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib), false)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -259,7 +262,7 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// Reserved, not just checked, so the memory stays accounted for across the
 	// runtime start and the "running" state write below.
 	if rec.State != "running" && rec.MemMiB > 0 {
-		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, 0, rec.MemMiB)
+		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, 0, rec.MemMiB, false)
 		if aerr != nil {
 			return nil, aerr
 		}

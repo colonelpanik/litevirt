@@ -238,12 +238,19 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.audit(ctx, "vm.create", spec.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-		// KNOWN GAP (carried from #126 ab8cbfd, which reserved here under its
-		// in-process ledger): bypassing the CHECK does not mean hiding the DRAW.
-		// An overcommit create currently reserves nothing, so a concurrent
-		// non-overcommit admission does not see its memory. Closing it needs a
-		// reserve-without-check variant of admitWithReservation — a behaviour
-		// change with its own fleet test, not something to smuggle into a merge.
+		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
+		// that reserved nothing would be invisible to the very next admission, so a
+		// normal create could be admitted against memory this one is already using.
+		// Reserved on the OWNING node only, for the same double-count reason the
+		// checked path reserves there.
+		if targetHost == s.hostName {
+			lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
+				"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+			if aerr != nil {
+				return nil, aerr
+			}
+			defer lease.release(ctx)
+		}
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
 		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
 		// rejects the hopeless case before we forward. The authoritative
@@ -291,7 +298,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// bug was intermittent (it depended on which operation id sorted first) and was
 	// caught by the per-host-override fleet test, not by reasoning.
 	if !req.AllowOvercommit {
-		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib), true)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -1036,11 +1043,20 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+			lease, aerr := s.reserveWithoutCheck(ctx, "StartVM", vm.HostName, vm.Project, "", int(spec.Cpu), int(spec.MemoryMib))
+			if aerr != nil {
+				return nil, aerr
+			}
+			defer lease.release(ctx)
 		} else {
 			// Reserve-then-verify (F2): publish this start's demand before deciding,
 			// so a concurrent start on another node sees it instead of both reading a
 			// view containing neither.
-			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib))
+			//
+			// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
+			// per-VM overhead subtraction, so starting it adds both its guest memory
+			// and a new qemu overhead.
+			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib), true)
 			if aerr != nil {
 				return nil, aerr
 			}
@@ -2866,7 +2882,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// visibility signal would free the delegated lease immediately while
 				// the holder's usage still reflects the OLD size — under-counting
 				// exactly the amount being added. A grow leans on the settle grace.
-				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow)
+				// newVMOnHost=false: the VM is running and already counted, overhead
+				// included, so the delta must not be charged another one.
+				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow, false)
 				if aerr != nil {
 					return nil, aerr
 				}

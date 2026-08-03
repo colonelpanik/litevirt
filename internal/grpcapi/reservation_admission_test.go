@@ -65,7 +65,7 @@ func TestAdmitWithReservation_YieldsToAnEarlierClaimant(t *testing.T) {
 	// "0000…" sorts before any minted id.
 	plantReservation(t, s, "00000000-earlier", "test-host", "_default", 1, 1024)
 
-	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024)
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, false)
 	if status.Code(err) != codes.ResourceExhausted {
 		if lease != nil {
 			lease.release(ctx)
@@ -85,7 +85,7 @@ func TestAdmitWithReservation_IgnoresALaterClaimant(t *testing.T) {
 	// "zzzz…" sorts after any minted id.
 	plantReservation(t, s, "zzzzzzzz-later", "test-host", "_default", 1, 1024)
 
-	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024)
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, false)
 	if err != nil {
 		t.Fatalf("admission against a LATER claimant was refused: %v — later racers yield, or both sides deadlock and nobody is admitted", err)
 	}
@@ -110,7 +110,7 @@ func TestAdmitWithReservation_ReleaseFreesTheCapacity(t *testing.T) {
 		t.Fatalf("HostReserved: %v", err)
 	}
 
-	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024)
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, false)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestAdmitHostWithReservation_DoesNotChargeProjectQuota(t *testing.T) {
 		t.Fatalf("ProjectReserved: %v", err)
 	}
 
-	lease, err := s.admitHostWithReservation(ctx, "StartVM", "test-host", "_default", 1, 1024)
+	lease, err := s.admitHostWithReservation(ctx, "StartVM", "test-host", "_default", 1, 1024, false)
 	if err != nil {
 		t.Fatalf("host-only admission: %v", err)
 	}

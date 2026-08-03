@@ -239,11 +239,15 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// thrashed until sshd stopped answering. A too-large single VM reached qemu and
 	// came back as a raw "cannot set up guest memory" error.
 	//
-	// This is the same check the resize path has used all along (resize.go:116), so
-	// growing a VM into a host was refused while creating one there was not. The
-	// spec (and therefore the pin) travels with a forwarded request, so this runs on
-	// the entry node to fail fast AND again on the owning host, where it is
-	// serialized against concurrent creates.
+	// This is the same check the resize path has used all along, so growing a VM
+	// into a host was refused while creating one there was not. The spec (and
+	// therefore the pin) travels with a forwarded request, so this runs on the entry
+	// node as an UNSERIALIZED fail-fast that reserves nothing (it will not commit
+	// the VM) and again on the owning host, where it is serialized: the owner admits
+	// and RESERVES under a per-host admission lock, so two concurrent creates onto
+	// one host cannot both pass. The reservation is held until this RPC returns,
+	// which is what covers the long gap to InsertVMWithHardware below (image pull,
+	// disk creation, DefineDomain) — see admitHostCapacity.
 	if req.AllowOvercommit {
 		// Deliberate density on a host the operator judges can take it. Project
 		// quota still applies (that is a tenancy limit, not a physical one); only
@@ -256,8 +260,16 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		s.audit(ctx, "vm.create", spec.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
-		return nil, err
+		// Bypassing the CHECK does not mean hiding the DRAW: reserve anyway so the
+		// next concurrent (non-overcommit) admission sees this VM's memory. (Quota
+		// was already admitted above — this branch only skips the HOST check.)
+		defer s.reserveHostCapacity(targetHost, int(spec.Cpu), int(spec.MemoryMib))()
+	} else {
+		release, err := s.admitResources(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib))
+		defer release()
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Project isolation (storage): pools are HOST-scoped, so admit each disk's pool
 	// against the SELECTED target host — not the entry host (which may hold a
@@ -1022,6 +1034,12 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// Skipped when the VM is already running: `lv start` on a running VM is a
 	// no-op that adds nothing, and must not be refused for capacity it already
 	// occupies.
+	//
+	// The reservation must outlive startVMLocked's state write, so release is
+	// declared out here and deferred through a closure — `defer release()` would
+	// capture the no-op value instead of whatever the admission assigns below.
+	release := noopRelease
+	defer func() { release() }()
 	if vm.State != "running" {
 		spec := &pb.VMSpec{}
 		if vm.Spec != "" {
@@ -1036,8 +1054,13 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-		} else if err := s.checkHostCapacity(ctx, vm.HostName, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
-			return nil, err
+			release = s.reserveHostCapacity(vm.HostName, int(spec.Cpu), int(spec.MemoryMib))
+		} else {
+			var err error
+			release, err = s.admitHostCapacity(ctx, vm.HostName, int(spec.Cpu), int(spec.MemoryMib))
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -2851,8 +2874,15 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",
 							fresh.HostName, cpuGrow, memGrow), "allow-overcommit")
 				}
-			} else if err := s.checkResourceAdmission(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow); err != nil {
-				return nil, err
+				defer s.reserveHostCapacity(fresh.HostName, cpuGrow, memGrow)()
+			} else {
+				// Reserved across the stop → redefine → start below, so a
+				// concurrent grow on this host can't claim the same headroom.
+				release, aerr := s.admitResources(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow)
+				defer release()
+				if aerr != nil {
+					return nil, aerr
+				}
 			}
 
 			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {

@@ -113,8 +113,14 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 
 	// Admission (F2): the grow must fit host free capacity + project quota. Only
 	// positive deltas consume capacity (a balloon-down / shrink frees it).
-	if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta)); err != nil {
-		return err
+	//
+	// Reserved for the rest of this call so the grow stays accounted for until the
+	// spec/actuals write lands — otherwise a concurrent grow of a DIFFERENT VM on
+	// this host sees the same free capacity and both pass.
+	release, aerr := s.admitResources(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta))
+	defer release()
+	if aerr != nil {
+		return aerr
 	}
 
 	target := proto.Clone(stored).(*pb.VMSpec)

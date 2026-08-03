@@ -142,8 +142,15 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	//
 	// Placed after tenancy and before any runtime or IPAM work, so a refusal
 	// leaves no partial state to unwind.
+	//
+	// admitResources (not checkResourceAdmission): this host is the owner and will
+	// commit the container below, so the memory must be RESERVED across the gap to
+	// CreateContainerAtomic — otherwise a concurrent create for a different name
+	// sees the same free memory and both pass.
 	if req.MemoryMib > 0 {
-		if err := s.checkResourceAdmission(ctx, s.hostName, req.Project, 0, int(req.MemoryMib)); err != nil {
+		release, err := s.admitResources(ctx, s.hostName, req.Project, 0, int(req.MemoryMib))
+		defer release()
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -222,6 +229,13 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// Serialize with a concurrent start/create of the SAME container before reading
+	// the row. Without this, two starts both read state != "running", both admit
+	// and both reserve its memory — so the second is refused for capacity the first
+	// is already accounting for. The row read has to be under the lock for the
+	// admission below to be based on a state that can't change underneath it.
+	unlock := s.lockVM("ct/" + req.Name)
+	defer unlock()
 	// Preflight the cluster row BEFORE touching the runtime: a missing/soft-deleted
 	// row means we'd start an UNTRACKED container, so refuse. (Also folds in the
 	// template check — a frozen clone source can't be started.)
@@ -242,8 +256,12 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// checking only at create would be sidestepped by creating several that each fit
 	// and starting them all. Skipped when already running (adds nothing) and when
 	// uncapped (nothing to admit).
+	// Reserved, not just checked, so the memory stays accounted for across the
+	// runtime start and the "running" state write below.
 	if rec.State != "running" && rec.MemMiB > 0 {
-		if err := s.checkHostCapacity(ctx, s.hostName, 0, rec.MemMiB); err != nil {
+		release, err := s.admitHostCapacity(ctx, s.hostName, 0, rec.MemMiB)
+		defer release()
+		if err != nil {
 			return nil, err
 		}
 	}

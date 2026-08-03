@@ -628,6 +628,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cfg.Enforcement.SharedStorageFence,
 	)
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
+	svc.SetProjectQuotaAuthority(d.cfg.Enforcement.ProjectQuotaAuthority) // drives the latch + conditional advertisement
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
 	// overrides live on the host record and win where set.

@@ -9,10 +9,13 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -243,5 +246,104 @@ func TestFleet_TenancyQuota_UpdateAllowOvercommitStillEnforcesQuota(t *testing.T
 	}
 	if !strings.Contains(err.Error(), "quota exceeded") {
 		t.Errorf("want quota-exceeded error, got %v", err)
+	}
+}
+
+// TestFleet_ProjectQuota_ConcurrentCreatesAcrossNodes is the cross-daemon half of
+// the admission race, and the reason project quota needed routing rather than just
+// a lock.
+//
+// Host capacity is owner-local, so a per-host lock on the owning daemon serializes
+// it. Project quota is not: two creates in one project can target DIFFERENT hosts,
+// so they are admitted by two different daemons, each reading its own CRDT
+// snapshot. Neither sees the other's in-flight grow and both pass — no per-node
+// lock can fix that. Routing every admission for a project to its single authority
+// holder is what makes the holder's mutex + ledger cluster-wide.
+//
+// Here two VMs, each 4 vCPU / 2048 MiB, are created concurrently through two
+// different entry nodes against a quota of 4 vCPU / 4096 MiB. Only one fits on
+// vCPU. Without routing, both are admitted and /acme ends up at 8 vCPU against a
+// 4 vCPU limit.
+func TestFleet_ProjectQuota_ConcurrentCreatesAcrossNodes(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	node, _ := seedQuotaProject(t, c, 4, 4096)
+	_ = node
+
+	// Opt every node into routing and drive the real cluster latch, using the same
+	// production wiring the hardware_v2 latch scenario uses (a real health.Checker
+	// gate pinging peers over the harness's loopback mTLS). Without an ACTIVE token
+	// admission stays on the legacy local path and this test would silently assert
+	// nothing.
+	gates := gateAll(t, c)
+	for _, n := range c.Nodes {
+		n.Server.SetProjectQuotaAuthority(true)
+	}
+	for _, n := range c.Nodes {
+		if !gates[n.Name].Enforced(ctx, capabilities.ProjectQuotaAuthorityV1) {
+			t.Fatalf("%s: project_quota_authority_v1 failed to latch with the flag on everywhere", n.Name)
+		}
+	}
+
+	clients := make([]pb.LiteVirtClient, len(c.Nodes))
+	for i, n := range c.Nodes {
+		clients[i] = c.SelfClient(n) // dial on the test goroutine
+	}
+	// The image and project were seeded on node 0's DB; with SharedCRDT every node
+	// sees them, but the image FILE is per-node, so pin creates to node 0's host.
+	target := c.Nodes[0].Name
+
+	type result struct {
+		name string
+		err  error
+	}
+	results := make(chan result, len(clients))
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i, cl := range clients {
+		wg.Add(1)
+		go func(i int, cl pb.LiteVirtClient) {
+			defer wg.Done()
+			name := fmt.Sprintf("q-racer-%d", i)
+			<-start
+			_, err := cl.CreateVM(context.Background(), &pb.CreateVMRequest{
+				Spec: &pb.VMSpec{
+					Name: name, Project: "/acme", Image: "test",
+					Cpu: 4, MemoryMib: 2048,
+					Placement: &pb.PlacementSpec{Host: target},
+				},
+			})
+			results <- result{name: name, err: err}
+		}(i, cl)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var admitted int
+	for r := range results {
+		if r.err == nil {
+			admitted++
+			continue
+		}
+		if rec, _ := corrosion.GetVM(ctx, c.Nodes[0].DB, r.name); rec != nil {
+			admitted++
+		}
+	}
+
+	// The quota allows 4 vCPU; each VM wants 4. Admitting both would put /acme at
+	// double its limit.
+	if admitted > 1 {
+		t.Errorf("admitted %d concurrent 4-vCPU creates against a 4-vCPU project quota — "+
+			"quota admission is not serialized across daemons", admitted)
+	}
+
+	usage, err := corrosion.SumProjectUsage(ctx, c.Nodes[0].DB, "/acme")
+	if err != nil {
+		t.Fatalf("SumProjectUsage: %v", err)
+	}
+	if usage.VCPUUsed > 4 {
+		t.Errorf("/acme committed usage = %d vCPU against a limit of 4 — the project is over quota",
+			usage.VCPUUsed)
 	}
 }

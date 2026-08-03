@@ -335,6 +335,16 @@ type EnforcementConfig struct {
 	// sessions (reseed-on-rejoin). The per-host PCI observation/ownership fixes are
 	// unaffected. Default false; the flag is the reversible kill switch.
 	OperationProtocol bool `yaml:"operation_protocol,omitempty"`
+	// ProjectQuotaAuthority: route PROJECT-QUOTA admission to the project's
+	// deterministic authority holder so one node serializes it, instead of every
+	// node checking its own CRDT snapshot (two daemons admitting for one project
+	// against different hosts could both pass and take the project over its limit).
+	// When the holder is unreachable this FAILS OPEN — falling back to the old local
+	// check, loudly — because quota is a tenancy limit, not a safety invariant, and
+	// failing closed would let one dead node block every create in the projects it
+	// holds. Default false; the flag is the reversible kill switch AND gates
+	// advertisement of project_quota_authority_v1.
+	ProjectQuotaAuthority bool `yaml:"project_quota_authority,omitempty"`
 	// LiveResize: allow TRUE live CPU hot-add + balloon-memory resize (setting a
 	// max_cpu vCPU-hotplug ceiling). Refused until the live_resize_v1 capability is
 	// latched cluster-wide (every peer must support it, else the field could be

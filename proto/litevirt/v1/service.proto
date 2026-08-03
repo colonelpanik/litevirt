@@ -1789,6 +1789,9 @@ service LiteVirt {
     rpc CheckVMRuntime(CheckVMRuntimeRequest) returns (CheckVMRuntimeResponse);
     rpc CheckContainerRuntime(CheckContainerRuntimeRequest) returns (CheckContainerRuntimeResponse);
     rpc ReportRuntime(ReportRuntimeRequest) returns (ReportRuntimeResponse);
+    // Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
+    rpc AdmitProjectQuota(AdmitProjectQuotaRequest) returns (AdmitProjectQuotaResponse);
+    rpc ReleaseProjectQuotaReservation(ReleaseProjectQuotaReservationRequest) returns (google.protobuf.Empty);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);
@@ -2378,3 +2381,38 @@ message ProjectUsage {
     int32  backup_gib_used = 8; // summed manifest size across the project's VMs
 }
 message GetProjectUsageRequest { string project_name = 1; }
+
+// AdmitProjectQuota asks the project's ADMISSION AUTHORITY HOLDER to admit and
+// reserve a vCPU/memory grow against the project's quota.
+//
+// Project quota is a cluster-wide limit, but usage lives in a CRDT store: two
+// daemons admitting requests for one project against different hosts each read
+// their own snapshot, both pass, and the project ends up over its limit. Routing
+// every admission for a project to ONE holder collapses that back into a
+// process-local problem the holder can serialize with a mutex and an in-flight
+// ledger.
+//
+// PEER-ONLY. Authenticated by peer mTLS with CN == sender (the same check the
+// replication RPCs use); there is no RBAC verb for it, so no user token can reach
+// it. Inert unless enforcement.project_quota_authority is set AND the
+// project_quota_authority_v1 capability has latched cluster-wide.
+message AdmitProjectQuotaRequest {
+    string sender = 1;            // calling host; must equal the peer cert CN
+    string project = 2;           // normalized project name
+    int32 cpu_delta = 3;          // positive vCPU grow; <= 0 means nothing to admit
+    int32 mem_mib_delta = 4;      // positive MiB grow; <= 0 means nothing to admit
+    int64 authority_epoch = 5;    // epoch the caller believes is current
+}
+message AdmitProjectQuotaResponse {
+    bool admitted = 1;
+    string reservation_id = 2;    // pass to ReleaseProjectQuotaReservation when done
+    string detail = 3;            // why not admitted, for the caller's error
+    // On an epoch mismatch the holder reports the authority it sees, so a stale
+    // router re-resolves once instead of retrying blindly.
+    string current_holder = 4;
+    int64 current_epoch = 5;
+}
+message ReleaseProjectQuotaReservationRequest {
+    string sender = 1;
+    string reservation_id = 2;
+}

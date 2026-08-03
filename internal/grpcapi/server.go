@@ -98,6 +98,10 @@ type Server struct {
 	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
 	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
 	enfOperationProtocol bool
+	// enfProjectQuotaAuthority is this node's kill-switch for routing project-quota
+	// admission to the project's authority holder; gated by this flag AND the
+	// ProjectQuotaAuthorityV1 latch. Advertised CONDITIONALLY on the flag.
+	enfProjectQuotaAuthority bool
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
@@ -246,6 +250,12 @@ type Server struct {
 	// admitProjectQuota.
 	projectAdmitMu sync.Mutex
 	projectAdmit   map[string]*hostAdmitState
+
+	// quotaLeases holds project-quota reservations this node granted to peers as
+	// the project's authority holder, keyed by reservation id. Per-Server (not a
+	// package global) because the fleet harness runs several daemons in one process.
+	quotaLeaseMu sync.Mutex
+	quotaLeases  map[string]*quotaLeaseEntry
 
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets
@@ -417,6 +427,12 @@ func (s *Server) advertisedCapabilities() []string {
 	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
 	// require CONFIG uniformity, not just a uniform build. Withholding advertisement while the
 	// flag is off keeps the cluster from latching until every node has opted in.
+	// project_quota_authority_v1: same reasoning as operation_protocol_v1 above. A
+	// flag-off node keeps admitting quota locally and unserialized, so relying on
+	// the routing requires CONFIG uniformity, not just a uniform build.
+	if !s.enfProjectQuotaAuthority {
+		caps = withoutCapability(caps, capabilities.ProjectQuotaAuthorityV1)
+	}
 	if !s.enfCanonicalIdentity {
 		caps = withoutCapability(caps, capabilities.CanonicalIdentityV1)
 	}
@@ -500,6 +516,19 @@ func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
 // operation protocol. The flag is the reversible kill switch; enforcement is this
 // flag AND the OperationProtocolV1 latch (see operationProtocolActive).
 func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+
+// SetProjectQuotaAuthority is this node's kill switch for routing project-quota
+// admission to the project's authority holder. It also gates ADVERTISEMENT of
+// project_quota_authority_v1, so the token can only latch once every node opts in.
+func (s *Server) SetProjectQuotaAuthority(on bool) { s.enfProjectQuotaAuthority = on }
+
+// projectQuotaAuthorityActive reports whether this node routes project-quota
+// admission to the holder: the config flag AND the cluster-wide latch. Same
+// `flag && Enforced` model as the rest of the family. False ⇒ the old local
+// unserialized check, unchanged.
+func (s *Server) projectQuotaAuthorityActive(ctx context.Context) bool {
+	return s.enfProjectQuotaAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectQuotaAuthorityV1)
+}
 
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same

@@ -172,11 +172,12 @@ func (s *Server) admitResources(ctx context.Context, host, project string, cpuDe
 	if err != nil {
 		return noopRelease, err
 	}
-	if err := s.checkProjectQuota(ctx, project, cpuDelta, memMiBDelta); err != nil {
+	qRelease, err := s.admitProjectQuota(ctx, project, cpuDelta, memMiBDelta)
+	if err != nil {
 		release()
 		return noopRelease, err
 	}
-	return release, nil
+	return func() { qRelease(); release() }, nil
 }
 
 func maxInt(a, b int) int {
@@ -254,6 +255,14 @@ func (s *Server) checkResourceAdmission(ctx context.Context, host, project strin
 // quota alone. Split out so --allow-overcommit paths can skip the HOST check
 // (a physical judgment call) while still enforcing quota (a tenancy limit).
 func (s *Server) checkProjectQuota(ctx context.Context, project string, cpuDelta, memMiBDelta int) error {
+	return s.checkProjectQuotaWithPending(ctx, project, cpuDelta, memMiBDelta, 0, 0)
+}
+
+// checkProjectQuotaWithPending is checkProjectQuota plus this node's own
+// admitted-but-uncommitted grows for the project. Only the authority holder passes
+// non-zero pending values — everywhere else the ledger is meaningless, because
+// admissions for the project may be happening on another node.
+func (s *Server) checkProjectQuotaWithPending(ctx context.Context, project string, cpuDelta, memMiBDelta, pendingCPU, pendingMem int) error {
 	if cpuDelta <= 0 && memMiBDelta <= 0 {
 		return nil
 	}
@@ -273,15 +282,15 @@ func (s *Server) checkProjectQuota(ctx context.Context, project string, cpuDelta
 	if err != nil {
 		return status.Errorf(codes.Internal, "sum project reservations: %v", err)
 	}
-	if q.VCPULimit > 0 && u.VCPUUsed+rCPU+cpuDelta > q.VCPULimit {
+	if q.VCPULimit > 0 && u.VCPUUsed+rCPU+pendingCPU+cpuDelta > q.VCPULimit {
 		return status.Errorf(codes.ResourceExhausted,
-			"project %q vCPU quota exceeded (used %d + reserved %d + new %d > limit %d)",
-			project, u.VCPUUsed, rCPU, cpuDelta, q.VCPULimit)
+			"project %q vCPU quota exceeded (used %d + reserved %d + in-flight %d + new %d > limit %d)",
+			project, u.VCPUUsed, rCPU, pendingCPU, cpuDelta, q.VCPULimit)
 	}
-	if q.MemMiBLimit > 0 && u.MemMiBUsed+rMem+memMiBDelta > q.MemMiBLimit {
+	if q.MemMiBLimit > 0 && u.MemMiBUsed+rMem+pendingMem+memMiBDelta > q.MemMiBLimit {
 		return status.Errorf(codes.ResourceExhausted,
-			"project %q memory quota exceeded (used %d + reserved %d + new %d > limit %d)",
-			project, u.MemMiBUsed, rMem, memMiBDelta, q.MemMiBLimit)
+			"project %q memory quota exceeded (used %d + reserved %d + in-flight %d + new %d > limit %d)",
+			project, u.MemMiBUsed, rMem, pendingMem, memMiBDelta, q.MemMiBLimit)
 	}
 	return nil
 }

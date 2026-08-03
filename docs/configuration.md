@@ -178,6 +178,31 @@ enforcement:
                               # best-effort SSH fence is rejected. Local-disk transfers keep
                               # today's gate. Enable fleet-uniformly (changes failover behavior).
                               # See docs/migration-failover.md → "Shared-disk fence gating".
+  project_quota_authority: false
+                              # route PROJECT-QUOTA admission to the project's deterministic
+                              # authority holder, so ONE node serializes it. Project quota is a
+                              # cluster-wide limit but usage lives in a CRDT store, so without this
+                              # two daemons admitting requests for the same project against
+                              # DIFFERENT hosts each read their own snapshot, both pass, and the
+                              # project ends up over its limit. Routing collapses that into a
+                              # process-local problem the holder serializes with a mutex plus an
+                              # in-flight ledger.
+                              #
+                              # Advertised CONDITIONALLY on this flag (like operation_protocol), so
+                              # the cluster-wide latch only forms once EVERY node has opted in — a
+                              # flag-off node would keep admitting locally and unserialized. Until
+                              # then behaviour is exactly the previous local check.
+                              #
+                              # FAILS OPEN. If the holder is unreachable, admission falls back to
+                              # the unserialized local check and emits a `quota.unserialized`
+                              # notification plus an audit entry. Quota is a tenancy limit, not a
+                              # safety invariant: failing closed would let one dead node block every
+                              # VM create in every project it holds, which is worse than the
+                              # over-admission it would prevent. Authority is never reassigned on
+                              # mere unreachability — an unplanned takeover needs a fence proof.
+                              #
+                              # Serializes vCPU and memory only. The disk / NIC / public-IP /
+                              # backup-GiB dimensions are still admitted without reservations.
   operation_protocol: false   # rely on the v41 F1 operation protocol (operations journal, per-VM
                               # epoch/generation, active_operation_id mutation barrier, durable
                               # device-lease recovery). Advertised CONDITIONALLY on this flag, so the

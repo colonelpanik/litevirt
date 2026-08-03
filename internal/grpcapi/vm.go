@@ -133,6 +133,19 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
 	}
 
+	// Resource defaults BEFORE admission. Everything below — quota, placement,
+	// host capacity — reads spec.Cpu/spec.MemoryMib, and every one of those checks
+	// is a no-op at zero: the admission helpers early-return on non-positive
+	// deltas, placement skips its fit filter behind `if req.CPUNeeded > 0`, and a
+	// quota check can't be violated by adding 0. So a client sending 0 (documented
+	// as "use defaults") was admitted as a zero-sized VM and then persisted at
+	// 2 vCPU / 4096 MiB — repeatable, and it bypassed BOTH project quota and host
+	// capacity. Normalize first so every check sees what the VM will actually cost.
+	//
+	// spec aliases req.Spec, so this also normalizes the copy forwarded to the
+	// owning host (which re-runs admission with the real numbers).
+	compose.NormalizeVMSpecResources(spec)
+
 	// admission: prefer the tenancy engine (live billing +
 	// public-IP/backup-GiB checks); fall back to the corrosion-direct
 	// path for harnesses that haven't wired an Engine.
@@ -297,12 +310,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// supplied value, so a client can't bind a new VM to existing swtpm state.
 	// Restore/migrate set the preserved UUID via their own record-building paths.
 	spec.Uuid = uuid.NewString()
-	if spec.Cpu == 0 {
-		spec.Cpu = 2
-	}
-	if spec.MemoryMib == 0 {
-		spec.MemoryMib = 4096
-	}
+	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
 
 	// Prepare disks — track created paths for cleanup on failure.
 	var diskConfigs []lv.DiskConfig

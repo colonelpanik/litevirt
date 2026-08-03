@@ -310,48 +310,13 @@ func (s *Server) checkProjectQuotaWithPending(ctx context.Context, project strin
 	return nil
 }
 
-// ensureProjectAuthority makes sure the project has a D1 admission-authority epoch,
-// minting the initial one if none exists. The returned authority is the current one
-// (for recording in an operation's reserved step, and for routing quota admission).
+// resolveProjectAuthority reports who serializes this project's quota admission.
 //
-// Only the DETERMINISTIC candidate mints. The previous version had every node claim
-// with holder = s.hostName and treated a concurrent claim as harmless — "exactly one
-// wins the guarded initial claim". That is not what happens.
-// ClaimInitialProjectAuthority's guard runs inside ExecuteBatchGuarded, which is a
-// LOCAL transaction, so on two nodes both guards see COUNT(*) = 0 before either has
-// replicated and both insert epoch 1. project_authority_epochs then merges via
-// immutableMergeKeepLocalRow, which does NOT coin-flip an immutable row: differing
-// facts for one primary key are kept-local on both sides and flagged
-// immutable_conflict, permanently. The project ends up with two holders and an
-// operator has to repair it. (And since immutableFactsEqual compares created_at,
-// per-node wall time, even two claims naming the same holder conflict — so making
-// the holder agree is not enough; only one node may write.)
-//
-// Reachable before this change: the resize path calls this best-effort on whichever
-// owner resizes, so two owners resizing VMs in one project were enough.
-//
-// A non-candidate returns whatever authority currently exists (ok=false → zero
-// value) rather than minting. It converges as soon as the candidate handles a
-// request for the project.
-func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (corrosion.ProjectAuthority, error) {
-	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
-	if err != nil {
-		return corrosion.ProjectAuthority{}, err
-	}
-	if ok {
-		return cur, nil
-	}
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return corrosion.ProjectAuthority{}, err
-	}
-	candidate, hasCandidate := corrosion.DeterministicAuthorityCandidate(hosts, project)
-	if !hasCandidate || candidate != s.hostName {
-		return corrosion.ProjectAuthority{}, nil
-	}
-	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, s.hostName); err != nil {
-		return corrosion.ProjectAuthority{}, err
-	}
-	cur, _, err = corrosion.CurrentProjectAuthority(ctx, s.db, project)
-	return cur, err
+// Read-only: it NEVER writes an initial authority row. See
+// corrosion.ResolveProjectAuthority for why minting one cannot be made safe — the
+// deterministic candidate is computed from the asynchronously-replicated host set,
+// so two nodes with different views both mint epoch 1, and the PK collision becomes
+// a permanent immutable_conflict with two holders.
+func (s *Server) resolveProjectAuthority(ctx context.Context, project string) (corrosion.ProjectAuthority, bool, error) {
+	return corrosion.ResolveProjectAuthority(ctx, s.db, project)
 }

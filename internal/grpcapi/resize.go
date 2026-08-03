@@ -183,7 +183,10 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 // durability discipline. Caller holds the VM lock.
 func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRecord, stored, target *pb.VMSpec, obsCPU, obsMem int, idemKey string) error {
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
-	_, _ = s.ensureProjectAuthority(ctx, vm.Project) // best-effort D1 authority establishment
+	// (No authority "establishment" here. The initial authority is DERIVED, never
+	// written — see corrosion.ResolveProjectAuthority. This call used to mint epoch 1
+	// on whichever owner happened to resize, which is exactly how two owners in one
+	// project produced a permanently divergent authority row.)
 
 	cpuDelta := posOnly(int(target.Cpu) - int(stored.Cpu))
 	memDelta := posOnly(int(target.MemoryMib) - int(stored.MemoryMib))

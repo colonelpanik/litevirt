@@ -47,9 +47,6 @@ func TestAdmitProjectQuota_LocalHolderReservationBlocksSecond(t *testing.T) {
 	s, ctx := quotaServer(t, 4, 4096)
 
 	// This node must be the holder for the local path to be under test.
-	if _, err := s.ensureProjectAuthority(ctx, "/acme"); err != nil {
-		t.Fatalf("ensureProjectAuthority: %v", err)
-	}
 	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
 	if err != nil {
 		t.Fatalf("projectQuotaHolder: %v", err)
@@ -119,9 +116,6 @@ func TestAdmitProjectQuota_InactiveFeatureIsUnchanged(t *testing.T) {
 // limit itself being enforced.
 func TestAdmitProjectQuota_OverQuotaIsStillRefused(t *testing.T) {
 	s, ctx := quotaServer(t, 2, 1024)
-	if _, err := s.ensureProjectAuthority(ctx, "/acme"); err != nil {
-		t.Fatalf("ensureProjectAuthority: %v", err)
-	}
 	if _, err := s.admitProjectQuota(ctx, "/acme", 8, 8192); status.Code(err) != codes.ResourceExhausted {
 		t.Errorf("admit far beyond the quota: got %v, want ResourceExhausted", err)
 	}

@@ -14,7 +14,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
-	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -72,36 +71,22 @@ func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta
 	return s.admitProjectQuotaRemote(ctx, holder, epoch, project, cpuDelta, memMiBDelta)
 }
 
-// projectQuotaHolder resolves who serializes this project's quota. A recorded
-// authority always wins — it is STICKY by design and only moves via an explicit,
-// proof-carrying transfer — so an unreachable holder is NOT reassigned here (see
-// quotaFailOpen). With no record yet, the deterministic candidate is the answer, and
-// ensureProjectAuthority mints it when the request reaches that node.
+// projectQuotaHolder resolves who serializes this project's quota, WITHOUT writing
+// anything. A recorded authority wins (sticky, CAS-guarded, only moved by an
+// explicit transfer); otherwise it is derived from the current host set at epoch 0.
+//
+// Nothing is minted here. Minting an initial authority cannot be made safe with a
+// local guard — the deterministic candidate is computed from the asynchronously
+// replicated host set, so two nodes with different views both pass their local
+// COUNT(*)=0 guard, both insert epoch 1, and the PK collision becomes a permanent
+// immutable_conflict leaving the project with two holders. See
+// corrosion.ResolveProjectAuthority.
 func (s *Server) projectQuotaHolder(ctx context.Context, project string) (string, int64, error) {
-	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
-	if err != nil {
+	cur, ok, err := s.resolveProjectAuthority(ctx, project)
+	if err != nil || !ok {
 		return "", 0, err
 	}
-	if ok {
-		return cur.Holder, cur.Epoch, nil
-	}
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return "", 0, err
-	}
-	candidate, hasCandidate := corrosion.DeterministicAuthorityCandidate(hosts, project)
-	if !hasCandidate {
-		return "", 0, nil
-	}
-	if candidate == s.hostName {
-		// Mint it now so peers routing here find a recorded holder. Best-effort:
-		// a failure just means we serialize locally this time and mint later.
-		if _, err := s.ensureProjectAuthority(ctx, project); err != nil {
-			slog.Warn("project quota: minting authority failed; serializing locally anyway",
-				"project", project, "error", err)
-		}
-	}
-	return candidate, 0, nil
+	return cur.Holder, cur.Epoch, nil
 }
 
 func (s *Server) projectAdmitStateFor(project string) *hostAdmitState {
@@ -246,7 +231,9 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 	// Refuse if we are not the current authority: accepting would defeat the whole
 	// point (two nodes reserving for one project). Report what we see so the caller
 	// re-resolves instead of retrying blindly.
-	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
+	// Resolve, not CurrentProjectAuthority: the common case is a DERIVED authority
+	// with no row at all, and rejecting that would refuse every routed admission.
+	cur, ok, err := s.resolveProjectAuthority(ctx, project)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read project authority: %v", err)
 	}
@@ -262,10 +249,10 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 	}
 	if req.AuthorityEpoch != 0 && req.AuthorityEpoch != cur.Epoch {
 		return &pb.AdmitProjectQuotaResponse{
-			Admitted: false, Detail: "stale authority epoch",
-			CurrentHolder: cur.Holder, CurrentEpoch: cur.Epoch,
-		}, status.Errorf(codes.FailedPrecondition,
-			"stale authority epoch %d for project %q (current %d)", req.AuthorityEpoch, project, cur.Epoch)
+				Admitted: false, Detail: "stale authority epoch",
+				CurrentHolder: cur.Holder, CurrentEpoch: cur.Epoch,
+			}, status.Errorf(codes.FailedPrecondition,
+				"stale authority epoch %d for project %q (current %d)", req.AuthorityEpoch, project, cur.Epoch)
 	}
 
 	release, err := s.admitProjectQuotaLocal(ctx, project, int(req.CpuDelta), int(req.MemMibDelta))

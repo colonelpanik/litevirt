@@ -624,9 +624,15 @@ func TestSelectBatch_MemoryTracking(t *testing.T) {
 		{"node1", 32, 4096},
 		{"node2", 32, 4096},
 	})
+	// 2800, not 3000. Allocatable is 3072 (4096 − the 1024 default reserve), and a
+	// VM now costs its guest memory PLUS one 128 MiB qemu overhead — the same
+	// overhead already subtracted for VMs on the host. At 3000 the first VM would
+	// need 3128 and fit nowhere, which tests nothing. At 2800 it needs 2928 and
+	// fits, leaving 144 MiB, so the second must go to the other host — which is the
+	// property this test is for.
 	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
-		{VMName: "vm1", MemMiBNeeded: 3000},
-		{VMName: "vm2", MemMiBNeeded: 3000}, // node1 only has ~1096 left
+		{VMName: "vm1", MemMiBNeeded: 2800},
+		{VMName: "vm2", MemMiBNeeded: 2800},
 	})
 	if err != nil {
 		t.Fatalf("SelectBatch: %v", err)

@@ -212,7 +212,16 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		if req.CPUNeeded > 0 && freeCPU < req.CPUNeeded {
 			continue
 		}
-		if req.MemMiBNeeded > 0 && freeMem < req.MemMiBNeeded {
+		// MemChargeFor: the INCOMING VM costs its guest memory plus one qemu
+		// overhead, exactly like the VMs already counted in freeMem above. Comparing
+		// bare guest memory made the two sides disagree by one overhead, so with
+		// 1024 MiB free a 1024 MiB VM was accepted although it draws 1024+128.
+		//
+		// Charged at the COMPARISON, not folded into req.MemMiBNeeded: that field is
+		// guest memory, and CommitPlacement (batch placement) adds it to MemUsed AND
+		// increments VMCount — which re-applies MemOverheadFor. Folding it in would
+		// double-count every batch member.
+		if req.MemMiBNeeded > 0 && freeMem < req.Capacity.MemChargeFor(req.MemMiBNeeded) {
 			continue
 		}
 

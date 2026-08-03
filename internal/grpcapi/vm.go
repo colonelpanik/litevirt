@@ -263,9 +263,11 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		// Bypassing the CHECK does not mean hiding the DRAW: reserve anyway so the
 		// next concurrent (non-overcommit) admission sees this VM's memory. (Quota
 		// was already admitted above — this branch only skips the HOST check.)
-		defer s.reserveHostCapacity(targetHost, int(spec.Cpu), int(spec.MemoryMib))()
+		defer s.reserveHostCapacity(targetHost, int(spec.Cpu), s.capacity.MemChargeFor(int(spec.MemoryMib)))()
 	} else {
-		release, err := s.admitResources(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib))
+		// newVMOnHost: this VM is appearing on the target, so it must also be
+		// charged its own qemu overhead against HOST capacity (not against quota).
+		release, err := s.admitResources(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib), true)
 		defer release()
 		if err != nil {
 			return nil, err
@@ -1054,10 +1056,13 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-			release = s.reserveHostCapacity(vm.HostName, int(spec.Cpu), int(spec.MemoryMib))
+			release = s.reserveHostCapacity(vm.HostName, int(spec.Cpu), s.capacity.MemChargeFor(int(spec.MemoryMib)))
 		} else {
 			var err error
-			release, err = s.admitHostCapacity(ctx, vm.HostName, int(spec.Cpu), int(spec.MemoryMib))
+			// A stopped VM contributes nothing to usage OR to the per-VM overhead
+			// subtraction, so starting it adds both its guest memory and a new
+			// qemu overhead.
+			release, err = s.admitHostCapacity(ctx, vm.HostName, int(spec.Cpu), s.capacity.MemChargeFor(int(spec.MemoryMib)))
 			if err != nil {
 				return nil, err
 			}
@@ -2878,7 +2883,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			} else {
 				// Reserved across the stop → redefine → start below, so a
 				// concurrent grow on this host can't claim the same headroom.
-				release, aerr := s.admitResources(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow)
+				// newVMOnHost=false: the VM is running and already counted, overhead
+				// included, so the delta must not be charged another one.
+				release, aerr := s.admitResources(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow, false)
 				defer release()
 				if aerr != nil {
 					return nil, aerr

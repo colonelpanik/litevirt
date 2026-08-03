@@ -148,7 +148,10 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// CreateContainerAtomic — otherwise a concurrent create for a different name
 	// sees the same free memory and both pass.
 	if req.MemoryMib > 0 {
-		release, err := s.admitResources(ctx, s.hostName, req.Project, 0, int(req.MemoryMib))
+		// newVMOnHost=false: VMMemOverheadMiB is qemu-specific (device models,
+		// video, page tables) and containers are accounted through their own
+		// per-host memory sum, so a container never pays a qemu overhead.
+		release, err := s.admitResources(ctx, s.hostName, req.Project, 0, int(req.MemoryMib), false)
 		defer release()
 		if err != nil {
 			return nil, err

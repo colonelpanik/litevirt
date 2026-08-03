@@ -164,11 +164,26 @@ func (s *Server) reserveHostCapacity(host string, cpuDelta, memMiBDelta int) fun
 // func is never nil and must be deferred by the caller so the reservation
 // outlives the commit.
 //
+// newVMOnHost says whether a VM is APPEARING on this host (a create, or a start of
+// a stopped VM) as opposed to a delta on one already running. When true the HOST
+// side is charged one extra qemu overhead, because free capacity is computed net of
+// one overhead per VM already there and the incoming one is not counted yet. A
+// delta on a running VM must NOT be charged again — its overhead is already
+// subtracted, so re-adding it would refuse a legal grow, every time.
+//
+// The overhead is charged to the HOST only, never to project quota: it is a
+// physical cost of running qemu, not tenant-consumed memory, and folding it into
+// quota would quietly shrink every project's effective limit.
+//
 // The host lock is released before the quota step, which may make a peer RPC to
 // the project's authority holder. That ordering is load-bearing: never hold the
 // host lock across a peer call.
-func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int) (func(), error) {
-	release, err := s.admitHostCapacity(ctx, host, cpuDelta, memMiBDelta)
+func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, newVMOnHost bool) (func(), error) {
+	hostMem := memMiBDelta
+	if newVMOnHost {
+		hostMem = s.capacity.MemChargeFor(memMiBDelta)
+	}
+	release, err := s.admitHostCapacity(ctx, host, cpuDelta, hostMem)
 	if err != nil {
 		return noopRelease, err
 	}

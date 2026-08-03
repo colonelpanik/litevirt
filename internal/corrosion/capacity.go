@@ -148,6 +148,27 @@ func (p CapacityPolicy) MemOverheadFor(n int) int {
 	return p.normalize().VMMemOverheadMiB * n
 }
 
+// MemChargeFor returns what a NEW VM of guestMiB actually costs a host: its guest
+// memory PLUS one qemu overhead.
+//
+// Free capacity is computed net of one overhead per VM already counted on the host
+// (MemOverheadFor), but the incoming request used to be compared as bare guest
+// memory. The two sides disagreed by exactly one overhead, so with 1024 MiB free a
+// 1024 MiB VM was admitted even though it draws 1024+128 — and on a batch placement
+// every member paid for its predecessors but never for itself.
+//
+// Use this ONLY where a VM is APPEARING on the host (create, start, failover
+// destination, drain destination, rebalance destination). Do NOT use it for a
+// delta on an already-running VM: its overhead is already subtracted, so charging
+// again would refuse a legal grow, and refuse it repeatedly. Containers never use
+// it — the overhead is qemu-specific and containers are accounted separately.
+func (p CapacityPolicy) MemChargeFor(guestMiB int) int {
+	if guestMiB <= 0 {
+		return guestMiB
+	}
+	return guestMiB + p.normalize().VMMemOverheadMiB
+}
+
 // SumContainerMemoryByHost returns per-host memory (MiB) committed to RUNNING
 // containers.
 //

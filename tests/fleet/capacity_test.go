@@ -22,6 +22,8 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -324,5 +326,179 @@ func TestFleet_Capacity_ConcurrentSameProjectAdmissions(t *testing.T) {
 	}
 	if usage.MemMibUsed > 6144 {
 		t.Errorf("project memory used = %d MiB, over the 6144 quota", usage.MemMibUsed)
+	}
+}
+
+// TestFleet_Capacity_ConcurrentPinnedCreatesExactlyOneRefusal is the scenario the
+// rest of this file could not reach: admission racing itself.
+//
+// Every other capacity test is sequential, so all of them pass against a plain
+// read-then-check with no reservation. The bug that hid behind them: two creates
+// for DIFFERENT VMs pinned to one host both read the same free capacity, both
+// passed, and both committed. The per-VM lock did not help — different names,
+// different mutexes — and a lock held only across the CHECK would not help either,
+// because the commit happens after the image pull, disk creation and DefineDomain.
+// What closes it is the reservation spanning that gap.
+//
+// Sizing: allocatable 3072 MiB (4096 total − 1024 default reserve), three
+// concurrent 1536 MiB creates. Exactly two fit. All three enter the SAME node and
+// forward to the same owner, so the owner's ledger is the thing under test.
+//
+// Mutation-checked, with the caveat this file already makes elsewhere. Removing
+// the reservation (leaving the lock and the check) makes this test FLAKY, not
+// reliably red: it failed with admitted=3/exhausted=0 on one run and passed on the
+// next two, because whether the plain check catches the third create depends on
+// whether an earlier create's commit happened to land first. With the reservation
+// it is deterministic — 20 consecutive runs, and clean under -race.
+//
+// So the guard against a reservation regression is the UNIT test
+// (TestAdmitHostCapacity_ReservationBlocksSecondAdmit), which holds the release
+// func and is deterministic. What this test adds is the end-to-end multi-node
+// property: concurrent creates entering one daemon and forwarding to another never
+// oversubscribe the owner.
+func TestFleet_Capacity_ConcurrentPinnedCreatesExactlyOneRefusal(t *testing.T) {
+	const (
+		concurrent = 3
+		vmMemMiB   = 1536
+		wantFit    = 2 // 3072 allocatable / 1536
+	)
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	entry, target := c.Nodes[0], c.Nodes[1]
+
+	setHostCapacity(t, c, entry.Name, 64, 65536, nil) // entry: irrelevant, huge
+	setHostCapacity(t, c, target.Name, 64, 4096, nil) // target: fits exactly two
+
+	// Dial BEFORE the goroutines: SelfClient lazily builds the connection and calls
+	// t.Fatalf, neither of which is legal off the test goroutine. A ClientConn is
+	// safe to share once built.
+	client := c.SelfClient(entry)
+
+	type result struct {
+		name string
+		err  error
+	}
+	results := make(chan result, concurrent)
+	var wg sync.WaitGroup
+	start := make(chan struct{}) // release all goroutines at once to widen the race
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("racer-%d", i)
+			<-start
+			_, err := client.CreateVM(context.Background(), &pb.CreateVMRequest{
+				Spec: &pb.VMSpec{
+					Name: name, Cpu: 1, MemoryMib: vmMemMiB,
+					Placement: &pb.PlacementSpec{Host: target.Name},
+				},
+			})
+			results <- result{name: name, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var admitted, exhausted int
+	var other []error
+	for r := range results {
+		switch {
+		case r.err == nil:
+			admitted++
+		case status.Code(r.err) == codes.ResourceExhausted:
+			exhausted++
+		default:
+			// A create can fail for unrelated reasons in the harness (no image, no
+			// real qemu). Those are not admission decisions — but if the VM row
+			// exists the request WAS admitted, so count it as such.
+			if rec, _ := corrosion.GetVM(ctx, target.DB, r.name); rec != nil {
+				admitted++
+			} else {
+				other = append(other, r.err)
+			}
+		}
+	}
+
+	if exhausted == 0 {
+		t.Fatalf("%d concurrent %d MiB creates pinned to a host with room for %d: none refused "+
+			"(admitted=%d, other=%v) — concurrent admission is not serialized, so the host is "+
+			"oversubscribed", concurrent, vmMemMiB, wantFit, admitted, other)
+	}
+	if admitted > wantFit {
+		t.Errorf("admitted %d of %d concurrent creates onto a host with room for %d — "+
+			"over-admission", admitted, concurrent, wantFit)
+	}
+	if got := admitted + exhausted + len(other); got != concurrent {
+		t.Errorf("accounted for %d of %d results", got, concurrent)
+	}
+}
+
+// TestFleet_Capacity_ConcurrentStartsExactlyOneRefusal is the same race on the
+// START path, which is where memory is actually consumed: create several VMs that
+// each fit while stopped (stopped VMs are accounted as nothing), then start them
+// at once. StartVM holds only a per-VM-NAME lock, so before the fix the starts did
+// not serialize against each other at all.
+func TestFleet_Capacity_ConcurrentStartsExactlyOneRefusal(t *testing.T) {
+	const (
+		concurrent = 3
+		vmMemMiB   = 1536
+	)
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	entry, target := c.Nodes[0], c.Nodes[1]
+
+	setHostCapacity(t, c, entry.Name, 64, 65536, nil)
+	setHostCapacity(t, c, target.Name, 64, 4096, nil) // allocatable 3072 → two fit
+
+	names := make([]string, concurrent)
+	for i := range names {
+		names[i] = fmt.Sprintf("stopped-%d", i)
+		spec, err := json.Marshal(&pb.VMSpec{Name: names[i], Cpu: 1, MemoryMib: vmMemMiB})
+		if err != nil {
+			t.Fatalf("marshal spec: %v", err)
+		}
+		if err := corrosion.InsertVM(ctx, target.DB, corrosion.VMRecord{
+			Name: names[i], HostName: target.Name, State: "stopped", Spec: string(spec),
+			CPUActual: 1, MemActual: vmMemMiB,
+		}, nil, nil); err != nil {
+			t.Fatalf("InsertVM %s: %v", names[i], err)
+		}
+		// Define the domain on the OWNER's fake. Without this every start fails
+		// immediately at the runtime step — after admission — so each reservation is
+		// released before the next goroutine admits and the race never materializes.
+		if err := target.Virt.DefineDomain(fmt.Sprintf(
+			`<domain type='kvm'><name>%s</name><devices></devices></domain>`, names[i])); err != nil {
+			t.Fatalf("DefineDomain %s: %v", names[i], err)
+		}
+	}
+
+	client := c.SelfClient(entry)
+	errs := make(chan error, concurrent)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for _, name := range names {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			<-start
+			_, err := client.StartVM(context.Background(), &pb.StartVMRequest{Name: name})
+			errs <- err
+		}(name)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	var exhausted int
+	for err := range errs {
+		if status.Code(err) == codes.ResourceExhausted {
+			exhausted++
+		}
+	}
+	if exhausted == 0 {
+		t.Errorf("%d concurrent starts of %d MiB VMs on a host with room for 2: none refused for "+
+			"capacity — starts must serialize against each other, not just against the same VM name",
+			concurrent, vmMemMiB)
 	}
 }

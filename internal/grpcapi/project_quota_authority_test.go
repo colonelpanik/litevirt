@@ -2,7 +2,10 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -175,10 +178,17 @@ func TestAdmitProjectQuota_NonHolderRPCIsRefused(t *testing.T) {
 		t.Fatalf("test setup: authority should be held by someone-else, got %q", cur.Holder)
 	}
 
-	// Called directly (bypassing the peer-mTLS check, which has its own coverage)
-	// to assert the authority guard itself.
-	if _, err := s.admitProjectQuotaLocal(ctx, "/acme", 1, 1024); err != nil {
-		t.Fatalf("admitProjectQuotaLocal is the mechanism, not the guard: %v", err)
+	// The serving path itself refuses now: admitProjectQuotaLocal re-validates the
+	// lease before touching the ledger, so a node that is not the authority cannot
+	// serialize locally even if something routed a request to it by mistake.
+	_, err = s.admitProjectQuotaLocal(ctx, "/acme", 1, 1024)
+	var moved errQuotaAuthorityMoved
+	if !errors.As(err, &moved) {
+		t.Fatalf("admitProjectQuotaLocal on a non-holder: got %v, want errQuotaAuthorityMoved — "+
+			"the serving path must re-validate the lease, not trust the caller's routing", err)
+	}
+	if moved.holder != cur.Holder {
+		t.Errorf("moved.holder = %q, want %q so the caller can re-route", moved.holder, cur.Holder)
 	}
 }
 
@@ -439,7 +449,7 @@ func TestAdmitProjectQuota_UnrelatedUsageDoesNotRetireACharge(t *testing.T) {
 		t.Fatalf("admit: %v", err)
 	}
 	// Committed as "mine", not yet replicated here.
-	release(CommitFact{Committed: true, Workload: "mine", CPU: 4, MemMiB: 2048})
+	release(CommitFact{Committed: true, Workload: "mine", Kind: corrosion.WorkloadVM, CPU: 4, MemMiB: 2048})
 
 	// An UNRELATED workload now becomes visible — one that was never charged here
 	// (created before this charge, or admitted while the authority was unreachable).
@@ -462,7 +472,7 @@ func TestAdmitProjectQuota_UnrelatedUsageDoesNotRetireACharge(t *testing.T) {
 
 	st := s.projectAdmitStateFor("/acme")
 	st.mu.Lock()
-	_, stillHeld := st.unobserved["mine"]
+	_, stillHeld := st.unobserved[workloadKey(CommitFact{Workload: "mine", Kind: corrosion.WorkloadVM})]
 	st.mu.Unlock()
 	if !stillHeld {
 		t.Error(`the charge for "mine" was retired by an unrelated workload's arrival`)
@@ -507,5 +517,250 @@ func TestCreateVM_OvercommitStillUsesSerializedQuota(t *testing.T) {
 			"got %v, want ResourceExhausted — overcommit bypasses HOST capacity only, and quota "+
 			"admission must be the serialized one (the unserialized check cannot see a "+
 			"reservation, so concurrent overcommit creates would all pass)", err)
+	}
+}
+
+// TestQuotaLease_RenewedWhileChargesOutstanding is the regression test for the lease
+// expiring under its own reservations.
+//
+// The lease is 30s; a charge can last far longer (a create waiting on an image pull, a
+// routed reservation). Nothing renewed it, so the lease lapsed mid-create and the next
+// node acquired it with an EMPTY ledger and re-handed quota that was still owed — the
+// TTL turned a rare handoff into a routine one.
+func TestQuotaLease_RenewedWhileChargesOutstanding(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	hold, err := s.admitProjectQuota(ctx, "/acme", 4, 2048)
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	defer hold(CommitFact{})
+
+	// Age the lease to the brink, as a long create would.
+	if err := s.db.Execute(ctx,
+		`UPDATE leader_election SET expires_at = ? WHERE key = ?`,
+		time.Now().UTC().Add(time.Second).Format(time.RFC3339), corrosion.QuotaLeaseKey("/acme")); err != nil {
+		t.Fatalf("age lease: %v", err)
+	}
+
+	// The renewer must push it back out, because a charge is outstanding.
+	s.renewHeldQuotaLeases(ctx)
+
+	h, ok, err := corrosion.ProjectQuotaLeaseHolder(ctx, s.db, "/acme")
+	if err != nil || !ok || h != s.hostName {
+		t.Fatalf("lease after renewal: holder=%q ok=%v err=%v; want it still held by %s — an "+
+			"un-renewed lease lapses under its own outstanding reservation", h, ok, err, s.hostName)
+	}
+	rows, err := s.db.Query(ctx, `SELECT expires_at FROM leader_election WHERE key = ?`,
+		corrosion.QuotaLeaseKey("/acme"))
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("read lease: %v", err)
+	}
+	exp, perr := time.Parse(time.RFC3339, rows[0].String("expires_at"))
+	if perr != nil {
+		t.Fatalf("parse expiry: %v", perr)
+	}
+	if until := time.Until(exp); until < 5*time.Second {
+		t.Errorf("lease expires in %v after renewal; want it pushed well out so a long-running "+
+			"charge cannot outlive its own authority", until)
+	}
+}
+
+// TestQuotaLease_LosingTheLeaseDropsTheLedger: if the lease is genuinely lost, holding
+// on is worse than letting go. The successor is the authority now, and our charges
+// describe reservations it knows nothing about — keeping them would only refuse our own
+// future requests while the successor admits anyway.
+func TestQuotaLease_LosingTheLeaseDropsTheLedger(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+	hold, err := s.admitProjectQuota(ctx, "/acme", 4, 2048)
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	defer hold(CommitFact{})
+
+	// Someone else takes the lease (ours expired and they won it).
+	if err := s.db.Execute(ctx,
+		`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
+		"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
+		corrosion.QuotaLeaseKey("/acme")); err != nil {
+		t.Fatalf("hand lease to successor: %v", err)
+	}
+
+	s.renewHeldQuotaLeases(ctx)
+
+	st := s.projectAdmitStateFor("/acme")
+	st.mu.Lock()
+	pending, unobs := st.pendingCPU, len(st.unobserved)
+	st.mu.Unlock()
+	if pending != 0 || unobs != 0 {
+		t.Errorf("ledger after losing the lease = %d pending vCPU / %d unobserved; want 0/0 — "+
+			"charges for an authority we no longer hold only refuse our own requests", pending, unobs)
+	}
+}
+
+// TestAdmitProjectQuota_ConsecutiveResizesSumTheirCharges is the regression test for
+// max() vs sum(). Two +2 vCPU resizes that both commit before either is visible owe
+// FOUR unseen vCPU; max() held only two and silently released half.
+func TestAdmitProjectQuota_ConsecutiveResizesSumTheirCharges(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	// The VM already exists at 2 vCPU and is visible here.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "grower", HostName: "other-host", State: "running", Project: "/acme",
+		CPUActual: 2, MemActual: 512,
+		Spec: `{"name":"grower","cpu":2,"memory_mib":512}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// Resize 2→4 commits (delta 2, absolute 4), not yet replicated here.
+	r1, err := s.admitProjectQuota(ctx, "/acme", 2, 0)
+	if err != nil {
+		t.Fatalf("resize 1: %v", err)
+	}
+	r1(CommitFact{Committed: true, Workload: "grower", Kind: corrosion.WorkloadVM, CPU: 4, MemMiB: 512})
+	// Resize 4→6 commits too (delta 2, absolute 6), also not replicated.
+	r2, err := s.admitProjectQuota(ctx, "/acme", 2, 0)
+	if err != nil {
+		t.Fatalf("resize 2: %v", err)
+	}
+	r2(CommitFact{Committed: true, Workload: "grower", Kind: corrosion.WorkloadVM, CPU: 6, MemMiB: 512})
+
+	// Quota 8. Visible 2 + unseen 4 = 6 spoken for, so 3 must not fit; 2 must.
+	if _, err := s.admitProjectQuota(ctx, "/acme", 3, 0); status.Code(err) != codes.ResourceExhausted {
+		t.Errorf("3 vCPU with 2 visible + FOUR unseen against an 8 vCPU quota: got %v, want "+
+			"ResourceExhausted — two consecutive +2 resizes owe 4, not max(2,2)", err)
+	}
+	if r3, err := s.admitProjectQuota(ctx, "/acme", 2, 0); err != nil {
+		t.Errorf("2 vCPU should fit exactly (8 - 2 visible - 4 unseen): %v", err)
+	} else {
+		r3(CommitFact{})
+	}
+}
+
+// TestWorkloadQuotaContribution_IdentityIsKindAndHost: a name alone is not an identity.
+// A VM must not satisfy a container's charge, and a same-named container on another
+// host must not either — both would retire a charge that is still owed.
+func TestWorkloadQuotaContribution_IdentityIsKindAndHost(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "twin", HostName: "h1", State: "running", Project: "/acme",
+		CPUActual: 4, MemActual: 4096,
+		Spec: `{"name":"twin","cpu":4,"memory_mib":4096}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	// A CONTAINER charge named "twin" on host h2 must not be satisfied by the VM.
+	if _, _, found, err := corrosion.WorkloadQuotaContribution(ctx, s.db, "/acme",
+		corrosion.WorkloadContainer, "h2", "twin"); err != nil {
+		t.Fatalf("lookup: %v", err)
+	} else if found {
+		t.Error("a VM satisfied a CONTAINER's identity — kind must disambiguate, or the wrong " +
+			"charge retires")
+	}
+	// The VM itself is found under its own kind.
+	if cpu, _, found, err := corrosion.WorkloadQuotaContribution(ctx, s.db, "/acme",
+		corrosion.WorkloadVM, "", "twin"); err != nil || !found || cpu != 4 {
+		t.Errorf("VM lookup: cpu=%d found=%v err=%v; want 4/true/nil", cpu, found, err)
+	}
+}
+
+// TestCreateContainer_CPUIsSerializedAgainstProjectQuota is the regression test for
+// container CPU quota being unserialized.
+//
+// SumProjectUsage counts a container's cpu_limit against the project's vCPU budget, but
+// admission passed 0 for CPU and ran only when memory was non-zero. So concurrent
+// containers could exceed the project vCPU limit, and a CPU-limited container with
+// UNLIMITED memory skipped serialized admission entirely.
+//
+// The probe: hold an in-flight reservation consuming the whole vCPU quota, then create a
+// container with cpu set and memory ZERO — the case that used to bypass admission
+// altogether.
+func TestCreateContainer_CPUIsSerializedAgainstProjectQuota(t *testing.T) {
+	s, ctx := quotaServer(t, 4, 4096)
+	// A runtime must be wired for the request to reach admission at all; the test
+	// asserts we are refused BEFORE it is ever used.
+	s.containerRuntime = &fakeCT{}
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	hold, err := s.admitProjectQuota(ctx, "/acme", 4, 0)
+	if err != nil {
+		t.Fatalf("seed reservation: %v", err)
+	}
+	defer hold(CommitFact{})
+
+	_, err = s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "cpuhog", Project: "/acme", Cpu: 4, MemoryMib: 0, // uncapped memory
+	})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Errorf("container with cpu=4, memory=0 against a fully-reserved 4 vCPU project quota: "+
+			"got %v, want ResourceExhausted — container CPU counts toward project quota, and an "+
+			"uncapped-memory container must not skip serialized admission", err)
+	}
+}
+
+// TestUpdateVM_StoppedVMGrowIsAdmitted is the regression test for a stopped VM growing
+// without project-quota admission.
+//
+// The admission lived inside the `vm.State != "stopped"` branch (the restart path), so an
+// already-stopped VM fell straight through and persisted a larger spec unadmitted — and a
+// stopped VM's spec DOES count toward SumProjectUsage, so the project silently went over.
+func TestUpdateVM_StoppedVMGrowIsAdmitted(t *testing.T) {
+	s, ctx := quotaServer(t, 4, 4096)
+	s.virt = libvirtfake.New()
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	// A STOPPED VM at 2 vCPU / 1024 MiB, owned here.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "parked", HostName: s.hostName, State: "stopped", Project: "/acme",
+		CPUActual: 2, MemActual: 1024,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "parked", Project: "/acme", Cpu: 2, MemoryMib: 1024}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>parked</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	// Quota is 4 vCPU and the VM already uses 2, so growing to 8 must be refused.
+	_, err = s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "parked", Cpu: 8})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("growing a STOPPED VM from 2 to 8 vCPU against a 4 vCPU project quota: got %v, "+
+			"want ResourceExhausted — a stopped VM's spec counts toward project usage, so the "+
+			"grow must be admitted", err)
+	}
+
+	// And nothing was persisted.
+	rec, gerr := corrosion.GetVM(ctx, s.db, "parked")
+	if gerr != nil || rec == nil {
+		t.Fatalf("GetVM: %v", gerr)
+	}
+	spec := &pb.VMSpec{}
+	if uerr := json.Unmarshal([]byte(rec.Spec), spec); uerr != nil {
+		t.Fatalf("parse spec: %v", uerr)
+	}
+	if spec.Cpu != 2 {
+		t.Errorf("spec cpu = %d after a REFUSED grow, want the original 2 — a refused admission "+
+			"must not persist the larger size", spec.Cpu)
 	}
 }

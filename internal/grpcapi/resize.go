@@ -127,7 +127,7 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	specCommitted := false
 	defer func() {
 		release(CommitFact{
-			Committed: specCommitted, Workload: name,
+			Committed: specCommitted, Workload: name, Kind: corrosion.WorkloadVM,
 			CPU: int(wantCPU), MemMiB: int(wantMem),
 		})
 	}()

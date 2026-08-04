@@ -41,8 +41,15 @@ func noopRelease() {}
 type CommitFact struct {
 	Committed bool
 	Workload  string // VM or container name
-	CPU       int
-	MemMiB    int
+	// Kind and Host complete the identity. A name alone is ambiguous: a VM and a
+	// container can share one, and container names are unique only per host — so
+	// without these, an unrelated row could retire a charge that is still owed.
+	// Kind is corrosion.WorkloadVM or corrosion.WorkloadContainer; Host matters only
+	// for containers.
+	Kind   string
+	Host   string
+	CPU    int
+	MemMiB int
 }
 
 // noopReleaseCommitted is the release for a quota admission that reserved nothing.

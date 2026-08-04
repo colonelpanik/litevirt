@@ -692,6 +692,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.RecoverResourceOperations(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
 
+	// Keep the project-quota admission lease alive for every project this node still
+	// holds charges for. Without it the lease (30s) would lapse under a charge that
+	// outlives it — a create waiting on an image pull, a routed reservation — and the
+	// next node would acquire the lease with an EMPTY ledger and re-hand quota that is
+	// still owed. Renewing only while charged also lets an idle node's leases expire,
+	// so authority follows load instead of sticking to whoever went first.
+	go svc.RunQuotaLeaseRenewer(ctx)
+
 	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
 	// nonterminal device_attach/device_detach operation (a hot-plug that crashed
 	// with the mutation barrier held) — roll an incomplete attach BACK and a detach

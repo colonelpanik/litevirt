@@ -135,36 +135,43 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 	}
 
-	// Host capacity admission — MEMORY only.
+	// Admission. Two different scopes, deliberately split:
 	//
-	// A container's cpu_limit is CPU *shares* (a relative cgroup weight), not a
-	// vCPU reservation, so it cannot be added to a host's vCPU total; only its
-	// memory cap is comparable to a VM's. An UNCAPPED container (memory 0)
-	// reserves nothing here, matching how it is accounted.
+	//   HOST capacity — MEMORY only. A container's cpu_limit is CPU *shares* (a
+	//   relative cgroup weight), not a vCPU reservation, so it cannot be added to a
+	//   host's vCPU total; only its memory cap is comparable to a VM's. An UNCAPPED
+	//   container (memory 0) reserves nothing, matching how it is accounted.
 	//
-	// Placed after tenancy and before any runtime or IPAM work, so a refusal
-	// leaves no partial state to unwind.
+	//   PROJECT quota — CPU **and** memory. SumProjectUsage counts a container's
+	//   cpu_limit against the project's vCPU budget, so admission has to charge it or
+	//   the limit is unenforceable. It previously passed 0 for CPU and ran only when
+	//   memory was non-zero, so concurrent containers could exceed the project vCPU
+	//   limit, and a CPU-limited container with unlimited memory skipped serialized
+	//   admission entirely.
 	//
-	// admitResources (not checkResourceAdmission): this host is the owner and will
-	// commit the container below, so the memory must be RESERVED across the gap to
-	// CreateContainerAtomic — otherwise a concurrent create for a different name
-	// sees the same free memory and both pass.
+	// Reserved (not just checked) because this host commits the container below, and
+	// routed through admitProjectQuota so the project's authority serializes it.
+	// Placed after tenancy and before any runtime or IPAM work, so a refusal leaves
+	// no partial state to unwind.
+	ctCommitFact := func() CommitFact {
+		return CommitFact{
+			Committed: ctCommitted, Workload: req.Name,
+			Kind: corrosion.WorkloadContainer, Host: s.hostName,
+			CPU: int(req.Cpu), MemMiB: int(req.MemoryMib),
+		}
+	}
 	if req.MemoryMib > 0 {
-		// newVMOnHost=false: VMMemOverheadMiB is qemu-specific (device models,
-		// video, page tables) and containers are accounted through their own
-		// per-host memory sum, so a container never pays a qemu overhead.
-		release, err := s.admitResources(ctx, s.hostName, req.Project, 0, int(req.MemoryMib), false)
-		// ctCommitted is set at CreateContainerAtomic below, not from retErr: the RPC
-		// can fail after the row exists, and calling that "not committed" would free
-		// the authority's charge while the container is real.
-		defer func() {
-			release(CommitFact{
-				Committed: ctCommitted, Workload: req.Name,
-				CPU: int(req.Cpu), MemMiB: int(req.MemoryMib),
-			})
-		}()
-		if err != nil {
-			return nil, err
+		hostRelease, herr := s.admitHostCapacity(ctx, s.hostName, 0, int(req.MemoryMib))
+		defer hostRelease()
+		if herr != nil {
+			return nil, herr
+		}
+	}
+	if req.Cpu > 0 || req.MemoryMib > 0 {
+		qRelease, qerr := s.admitProjectQuota(ctx, req.Project, int(req.Cpu), int(req.MemoryMib))
+		defer func() { qRelease(ctCommitFact()) }()
+		if qerr != nil {
+			return nil, qerr
 		}
 	}
 

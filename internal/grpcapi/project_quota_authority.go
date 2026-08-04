@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +21,95 @@ import (
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
+
+// errQuotaAuthorityMoved says this node is no longer the project's authority, and
+// names the successor when one is recorded.
+type errQuotaAuthorityMoved struct{ holder string }
+
+func (e errQuotaAuthorityMoved) Error() string {
+	return "project quota authority moved to " + e.holder
+}
+
+// RunQuotaLeaseRenewer keeps the admission lease alive for every project this node
+// still holds CHARGES for, and drops a project's ledger the moment the lease is lost.
+//
+// This is what makes a short lease TTL safe. A charge can outlive the TTL (a create
+// waiting on an image pull, a routed reservation), and an unrenewed lease would lapse
+// underneath it — the next node would acquire with an empty ledger and re-hand quota
+// that is still owed. Renewing only while charges exist also means an idle node lets
+// its leases expire, so authority naturally follows load instead of being pinned to
+// whoever happened to go first.
+//
+// Losing the lease is not recoverable by holding on: the successor is now the
+// authority, and our ledger describes reservations it knows nothing about. Keeping
+// them would only refuse our own future requests. Drop them and say so loudly — any
+// in-flight commits are covered by the successor's own observation of the workloads
+// once they replicate.
+func (s *Server) RunQuotaLeaseRenewer(ctx context.Context) {
+	t := time.NewTicker(corrosion.QuotaLeaseRenewInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.renewHeldQuotaLeases(ctx)
+		}
+	}
+}
+
+func (s *Server) renewHeldQuotaLeases(ctx context.Context) {
+	s.projectAdmitMu.Lock()
+	projects := make([]string, 0, len(s.projectAdmit))
+	for p, st := range s.projectAdmit {
+		st.mu.Lock()
+		charged := st.pendingCPU > 0 || st.pendingMem > 0 || len(st.unobserved) > 0
+		st.mu.Unlock()
+		if charged {
+			projects = append(projects, p)
+		}
+	}
+	s.projectAdmitMu.Unlock()
+
+	for _, project := range projects {
+		held, currentHolder, err := s.holdsQuotaLease(ctx, project)
+		if err != nil {
+			slog.Warn("project quota: lease renewal failed; will retry",
+				"project", project, "error", err)
+			continue
+		}
+		if held {
+			continue
+		}
+		slog.Error("project quota: LOST the admission lease while charges were outstanding; "+
+			"dropping them — the new authority accounts for these workloads once they replicate",
+			"project", project, "new_holder", currentHolder)
+		s.notify(ctx, notify.Notification{
+			Kind: "quota.authority_lost", Severity: notify.SevWarn, Subject: project,
+			Detail: "lost the project-quota admission lease to " + currentHolder +
+				" while admissions were in flight",
+		})
+		st := s.projectAdmitStateFor(project)
+		st.mu.Lock()
+		st.pendingCPU, st.pendingMem = 0, 0
+		st.unobserved = nil
+		st.mu.Unlock()
+	}
+}
+
+// workloadKey is the ledger key: identity is (kind, host, name), never name alone.
+func workloadKey(f CommitFact) string {
+	kind := f.Kind
+	if kind == "" {
+		kind = corrosion.WorkloadVM
+	}
+	return kind + "\x00" + f.Host + "\x00" + f.Workload
+}
+
+func workloadNameFromKey(key string) string {
+	parts := strings.Split(key, "\x00")
+	return parts[len(parts)-1]
+}
 
 // quotaReservationTTL bounds how long a routed reservation survives without an
 // explicit release. A caller always releases via defer, so the TTL only matters
@@ -68,7 +159,16 @@ func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta
 		return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta, "authority unresolved", err)
 	}
 	if holder == s.hostName {
-		return s.admitProjectQuotaLocal(ctx, project, cpuDelta, memMiBDelta)
+		release, err := s.admitProjectQuotaLocal(ctx, project, cpuDelta, memMiBDelta)
+		var moved errQuotaAuthorityMoved
+		if errors.As(err, &moved) {
+			if moved.holder != "" && moved.holder != s.hostName {
+				return s.admitProjectQuotaRemote(ctx, moved.holder, 0, project, cpuDelta, memMiBDelta)
+			}
+			return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+				"lost the admission lease and no successor is recorded", nil)
+		}
+		return release, err
 	}
 	return s.admitProjectQuotaRemote(ctx, holder, epoch, project, cpuDelta, memMiBDelta)
 }
@@ -205,6 +305,7 @@ type projectAdmitState struct {
 // chargeCPU/chargeMem are what to hold meanwhile: the delta that was admitted, not
 // the absolute size, so a resize holds only its growth.
 type unobservedCommit struct {
+	kind, host           string
 	wantCPU, wantMem     int
 	chargeCPU, chargeMem int
 	at                   time.Time
@@ -249,18 +350,22 @@ func (st *projectAdmitState) releaseFor(cpu, mem int) func(CommitFact) {
 			if st.unobserved == nil {
 				st.unobserved = map[string]*unobservedCommit{}
 			}
-			// Same workload releasing twice (a retried release, or a resize
-			// following a create): keep the LARGER expectation and the larger
-			// charge, so nothing is under-held.
-			e, ok := st.unobserved[f.Workload]
+			key := workloadKey(f)
+			e, ok := st.unobserved[key]
 			if !ok {
-				e = &unobservedCommit{}
-				st.unobserved[f.Workload] = e
+				e = &unobservedCommit{kind: f.Kind, host: f.Host}
+				st.unobserved[key] = e
 			}
+			// SUM the charges; do not take the larger. Two consecutive +2 vCPU
+			// resizes that both commit before either is visible here owe FOUR unseen
+			// vCPU, not two — max() silently released half of it.
+			e.chargeCPU += cpu
+			e.chargeMem += mem
+			// want is the LATEST absolute target, which is monotone across resizes.
+			// Observing the workload at or above it means every summed delta has
+			// landed, so the whole entry retires at once.
 			e.wantCPU = maxInt(e.wantCPU, f.CPU)
 			e.wantMem = maxInt(e.wantMem, f.MemMiB)
-			e.chargeCPU = maxInt(e.chargeCPU, cpu)
-			e.chargeMem = maxInt(e.chargeMem, mem)
 			e.at = time.Now()
 		})
 	}
@@ -273,30 +378,31 @@ func (st *projectAdmitState) releaseFor(cpu, mem int) func(CommitFact) {
 // project; found=false means the row has not arrived (or was deleted).
 func (st *projectAdmitState) unobservedChargeLocked(
 	project string,
-	observe func(workload string) (cpu, mem int, found bool, err error),
+	observe func(kind, host, workload string) (cpu, mem int, found bool, err error),
 ) (int, int, error) {
 	if len(st.unobserved) == 0 {
 		return 0, 0, nil
 	}
 	var totalCPU, totalMem int
-	for name, e := range st.unobserved {
-		cpu, mem, found, err := observe(name)
+	for key, e := range st.unobserved {
+		name := workloadNameFromKey(key)
+		cpu, mem, found, err := observe(e.kind, e.host, name)
 		if err != nil {
 			return 0, 0, err
 		}
 		// Retire on DIRECT observation of this workload, at or above the size it
 		// was admitted for. A resize is covered by the >= comparison.
 		if found && cpu >= e.wantCPU && mem >= e.wantMem {
-			delete(st.unobserved, name)
+			delete(st.unobserved, key)
 			continue
 		}
 		if time.Since(e.at) > unobservedGraceTTL {
 			// Backstop: the commit never became visible (it failed after the
 			// durable write, or the workload was deleted straight away).
 			slog.Warn("project quota: a committed workload never became visible locally; dropping its charge",
-				"project", project, "workload", name,
+				"project", project, "workload", name, "kind", e.kind, "host", e.host,
 				"cpu", e.chargeCPU, "mem_mib", e.chargeMem, "held_for", time.Since(e.at))
-			delete(st.unobserved, name)
+			delete(st.unobserved, key)
 			continue
 		}
 		totalCPU += e.chargeCPU
@@ -313,6 +419,19 @@ func (st *projectAdmitState) unobservedChargeLocked(
 // The observed usage is carried into the release func so a commit can anchor its
 // unobserved charge to the usage that was visible when it was admitted.
 func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpuDelta, memMiBDelta int) (func(CommitFact), error) {
+	// RENEW the lease, do not merely read it. Admitting extends the life of a charge,
+	// so it must also extend the authority that owns that charge — otherwise the lease
+	// lapses mid-create and another node acquires it with an empty ledger.
+	held, currentHolder, err := s.holdsQuotaLease(ctx, project)
+	if err != nil {
+		return noopReleaseCommitted, status.Errorf(codes.Internal, "renew project authority lease: %v", err)
+	}
+	if !held {
+		// Lost it between resolving and serving. Do not admit locally against a ledger
+		// we no longer own; let the caller route or degrade.
+		return noopReleaseCommitted, errQuotaAuthorityMoved{holder: currentHolder}
+	}
+
 	st := s.projectAdmitStateFor(project)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -324,8 +443,8 @@ func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpu
 	if !bounded {
 		return noopReleaseCommitted, nil // unbounded project: nothing to serialize
 	}
-	unobsCPU, unobsMem, err := st.unobservedChargeLocked(project, func(w string) (int, int, bool, error) {
-		return corrosion.WorkloadQuotaContribution(ctx, s.db, project, w)
+	unobsCPU, unobsMem, err := st.unobservedChargeLocked(project, func(kind, host, w string) (int, int, bool, error) {
+		return corrosion.WorkloadQuotaContribution(ctx, s.db, project, kind, host, w)
 	})
 	if err != nil {
 		return noopReleaseCommitted, status.Errorf(codes.Internal, "observe committed workloads: %v", err)
@@ -412,7 +531,8 @@ func (s *Server) releaseRemoteQuota(holder, id string, f CommitFact) {
 	defer conn.Close()
 	if _, err := client.ReleaseProjectQuotaReservation(ctx, &pb.ReleaseProjectQuotaReservationRequest{
 		Sender: s.hostName, ReservationId: id, Committed: f.Committed,
-		Workload: f.Workload, CommittedCpu: int32(f.CPU), CommittedMemMib: int32(f.MemMiB),
+		Workload: f.Workload, Kind: f.Kind, WorkloadHost: f.Host,
+		CommittedCpu: int32(f.CPU), CommittedMemMib: int32(f.MemMiB),
 	}); err != nil {
 		slog.Warn("project quota: releasing routed reservation failed; it will expire on TTL",
 			"holder", holder, "reservation", id, "error", err)
@@ -505,6 +625,7 @@ func (s *Server) ReleaseProjectQuotaReservation(ctx context.Context, req *pb.Rel
 	}
 	s.dropQuotaLease(req.ReservationId, CommitFact{
 		Committed: req.Committed, Workload: req.Workload,
+		Kind: req.Kind, Host: req.WorkloadHost,
 		CPU: int(req.CommittedCpu), MemMiB: int(req.CommittedMemMib),
 	})
 	return &emptypb.Empty{}, nil

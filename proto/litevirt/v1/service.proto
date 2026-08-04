@@ -2431,4 +2431,10 @@ message ReleaseProjectQuotaReservationRequest {
     string workload = 4;
     int32 committed_cpu = 5;
     int32 committed_mem_mib = 6;
+    // kind ("vm"|"container") and workload_host complete the identity: a name alone
+    // is ambiguous (a VM and a container may share one, and container names are
+    // unique only per host), and an ambiguous match could retire a charge that is
+    // still owed.
+    string kind = 7;
+    string workload_host = 8;
 }

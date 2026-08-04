@@ -22726,8 +22726,14 @@ type ReleaseProjectQuotaReservationRequest struct {
 	Workload        string `protobuf:"bytes,4,opt,name=workload,proto3" json:"workload,omitempty"`
 	CommittedCpu    int32  `protobuf:"varint,5,opt,name=committed_cpu,json=committedCpu,proto3" json:"committed_cpu,omitempty"`
 	CommittedMemMib int32  `protobuf:"varint,6,opt,name=committed_mem_mib,json=committedMemMib,proto3" json:"committed_mem_mib,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// kind ("vm"|"container") and workload_host complete the identity: a name alone
+	// is ambiguous (a VM and a container may share one, and container names are
+	// unique only per host), and an ambiguous match could retire a charge that is
+	// still owed.
+	Kind          string `protobuf:"bytes,7,opt,name=kind,proto3" json:"kind,omitempty"`
+	WorkloadHost  string `protobuf:"bytes,8,opt,name=workload_host,json=workloadHost,proto3" json:"workload_host,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReleaseProjectQuotaReservationRequest) Reset() {
@@ -22800,6 +22806,20 @@ func (x *ReleaseProjectQuotaReservationRequest) GetCommittedMemMib() int32 {
 		return x.CommittedMemMib
 	}
 	return 0
+}
+
+func (x *ReleaseProjectQuotaReservationRequest) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *ReleaseProjectQuotaReservationRequest) GetWorkloadHost() string {
+	if x != nil {
+		return x.WorkloadHost
+	}
+	return ""
 }
 
 var File_litevirt_v1_service_proto protoreflect.FileDescriptor
@@ -24556,14 +24576,16 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06detail\x18\x03 \x01(\tR\x06detail\x12\x1a\n" +
 	"\bredirect\x18\x06 \x01(\bR\bredirect\x12%\n" +
 	"\x0ecurrent_holder\x18\x04 \x01(\tR\rcurrentHolder\x12#\n" +
-	"\rcurrent_epoch\x18\x05 \x01(\x03R\fcurrentEpoch\"\xf1\x01\n" +
+	"\rcurrent_epoch\x18\x05 \x01(\x03R\fcurrentEpoch\"\xaa\x02\n" +
 	"%ReleaseProjectQuotaReservationRequest\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12%\n" +
 	"\x0ereservation_id\x18\x02 \x01(\tR\rreservationId\x12\x1c\n" +
 	"\tcommitted\x18\x03 \x01(\bR\tcommitted\x12\x1a\n" +
 	"\bworkload\x18\x04 \x01(\tR\bworkload\x12#\n" +
 	"\rcommitted_cpu\x18\x05 \x01(\x05R\fcommittedCpu\x12*\n" +
-	"\x11committed_mem_mib\x18\x06 \x01(\x05R\x0fcommittedMemMib*V\n" +
+	"\x11committed_mem_mib\x18\x06 \x01(\x05R\x0fcommittedMemMib\x12\x12\n" +
+	"\x04kind\x18\a \x01(\tR\x04kind\x12#\n" +
+	"\rworkload_host\x18\b \x01(\tR\fworkloadHost*V\n" +
 	"\x0eRelayVIPResult\x12\x15\n" +
 	"\x11RELAY_VIP_UNKNOWN\x10\x00\x12\x14\n" +
 	"\x10RELAY_VIP_CLAIMS\x10\x01\x12\x17\n" +

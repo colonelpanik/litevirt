@@ -32,10 +32,19 @@ import (
 // already holds its most safety-critical operation (fencing) to; quota is a soft
 // tenancy limit, so it is proportionate here.
 
-// quotaLeaseTTL is how long an acquired admission lease stays valid without renewal.
-// Long enough that a steady stream of admissions never re-acquires mid-request, short
-// enough that a dead holder's projects become servable again promptly.
-const quotaLeaseTTL = 30 * time.Second
+// quotaLeaseTTL is how long an acquired admission lease stays valid without renewal;
+// QuotaLeaseRenewInterval is how often a holder with outstanding charges refreshes it.
+//
+// The TTL is SHORTER than the lifetime of the charges it protects, which is only safe
+// because the holder actively renews. Without renewal the lease would lapse under a
+// long-running create while its reservation was still outstanding, and the next node
+// would acquire it with an EMPTY ledger and hand out quota that is still owed — the
+// TTL would turn a rare handoff into a routine one. So: renew while anything is
+// charged, and stop serving the moment renewal fails.
+const (
+	quotaLeaseTTL           = 30 * time.Second
+	QuotaLeaseRenewInterval = 10 * time.Second
+)
 
 // QuotaLeaseKey is the leader_election key namespace for project-quota authority.
 func QuotaLeaseKey(project string) string {

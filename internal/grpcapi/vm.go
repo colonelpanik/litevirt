@@ -274,7 +274,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		qRelease, qErr := s.admitProjectQuota(ctx, project, int(spec.Cpu), int(spec.MemoryMib))
 		defer func() {
 			qRelease(CommitFact{
-				Committed: vmCommitted, Workload: spec.Name,
+				Committed: vmCommitted, Workload: spec.Name, Kind: corrosion.WorkloadVM,
 				CPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib),
 			})
 		}()
@@ -291,7 +291,7 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		// authority's charge while the VM is running on the target.
 		defer func() {
 			release(CommitFact{
-				Committed: vmCommitted, Workload: spec.Name,
+				Committed: vmCommitted, Workload: spec.Name, Kind: corrosion.WorkloadVM,
 				CPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib),
 			})
 		}()
@@ -2910,7 +2910,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 				qRelease, qErr := s.admitProjectQuota(ctx, fresh.Project, cpuGrow, memGrow)
 				defer func() {
 					qRelease(CommitFact{
-						Committed: specCommitted, Workload: req.Name,
+						Committed: specCommitted, Workload: req.Name, Kind: corrosion.WorkloadVM,
 						CPU: int(wantCPU), MemMiB: int(wantMem),
 					})
 				}()
@@ -2931,7 +2931,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 				release, aerr := s.admitResources(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow, false)
 				defer func() {
 					release(CommitFact{
-						Committed: specCommitted, Workload: req.Name,
+						Committed: specCommitted, Workload: req.Name, Kind: corrosion.WorkloadVM,
 						CPU: int(wantCPU), MemMiB: int(wantMem),
 					})
 				}()
@@ -2947,6 +2947,41 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 			vm = fresh
 			vm.State = "stopped"
 			restartAfter = true
+		}
+		if !restartAfter {
+			// The VM is ALREADY stopped, so the branch above (which admits) was
+			// skipped — and a stopped VM's spec still counts toward SumProjectUsage,
+			// so growing it here used to persist a larger size with no project-quota
+			// admission at all. Charge the grow.
+			//
+			// QUOTA ONLY, deliberately: a stopped VM contributes nothing to
+			// SumVMResourcesByHost (that counts running VMs), so this consumes no host
+			// capacity now — StartVM admits the whole size when it starts.
+			wantCPU, wantMem := spec.Cpu, spec.MemoryMib
+			if req.Cpu > 0 {
+				wantCPU = req.Cpu
+			}
+			if req.MemoryMib > 0 {
+				wantMem = req.MemoryMib
+			}
+			cpuGrow, memGrow := posOnly(int(wantCPU-spec.Cpu)), posOnly(int(wantMem-spec.MemoryMib))
+			if cpuGrow > 0 || memGrow > 0 {
+				if req.AllowOvercommit {
+					if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
+						return nil, err
+					}
+				}
+				qRelease, qerr := s.admitProjectQuota(ctx, vm.Project, cpuGrow, memGrow)
+				defer func() {
+					qRelease(CommitFact{
+						Committed: specCommitted, Workload: req.Name, Kind: corrosion.WorkloadVM,
+						CPU: int(wantCPU), MemMiB: int(wantMem),
+					})
+				}()
+				if qerr != nil {
+					return nil, qerr
+				}
+			}
 		}
 		if req.Cpu > 0 {
 			spec.Cpu = req.Cpu

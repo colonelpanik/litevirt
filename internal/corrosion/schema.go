@@ -308,7 +308,19 @@ import (
 //	     cannot refuse what they cannot see, and a node that cannot be trusted
 //	     to replicate cannot be trusted to record its own quarantine. Monotone
 //	     and peer-written; 0 = not isolated. Two additive columns.
-const CurrentSchemaVersion = 49
+//	v50: the durable cluster-health model. health_conditions (one row per
+//	     detected condition with its observed→confirmed→resolved lifecycle and
+//	     canonical evidence), health_evaluator_status (each evaluator's latest
+//	     scan time and COVERAGE — absence of a condition only means something
+//	     under complete coverage), and host_capacity_observations (per-host
+//	     effective capacity over the union of database and runtime workloads,
+//	     so a rogue runtime still consumes headroom in placement). Replaces
+//	     the in-memory dual-run debounce, log-only findings, the connectivity
+//	     matrix RPC, and the never-populated ClusterStatus.alerts: health is
+//	     cluster STATE — it must survive detector leadership changes and
+//	     daemon restarts, and every node must converge on one view of it.
+//	     Three new tables.
+const CurrentSchemaVersion = 50
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1973,6 +1985,90 @@ var schemaDDL = []string{
 		updated_at  TEXT NOT NULL,
 		deleted_at  TEXT
 	)`,
+
+	// health_conditions — the durable cluster-health model (v50). One row per
+	// (evaluator, code, subject): the CURRENT state of a detected condition,
+	// with its full lifecycle (observed → confirmed → resolved) and canonical
+	// evidence. This replaces in-memory dual-run debounce state, log-only
+	// findings, and the unused alert plumbing: health is cluster STATE, so it
+	// must survive detector leadership changes and daemon restarts, and every
+	// node must converge on the same view of it.
+	//
+	// Written by the detecting evaluator (normally the detector lease holder;
+	// positive evidence may be recorded without quorum — refusing to record
+	// CORRUPTION because the cluster is degraded would hide exactly the state
+	// an operator needs). Resolution is stricter than observation: only the
+	// lease holder with a valid decision gate and two consecutive COMPLETE
+	// clean scans may resolve — see the health evaluator. Default LWW merge:
+	// rows are keyed per evaluator, and one evaluator instance writes at a
+	// time, so last-writer-wins converges to the newest scan.
+	`CREATE TABLE IF NOT EXISTS health_conditions (
+		evaluator     TEXT NOT NULL,               -- producing evaluator: dual_run | connectivity | owner_epoch | capacity | …
+		code          TEXT NOT NULL,               -- condition code, e.g. vm_dual_run, runtime_owner_mismatch
+		subject_kind  TEXT NOT NULL,               -- vm | container | vip | host | cluster
+		subject_id    TEXT NOT NULL,
+		lifecycle     TEXT NOT NULL DEFAULT 'observed',  -- observed | confirmed | resolved
+		severity      TEXT NOT NULL DEFAULT 'warning',   -- info | warning | critical
+		hosts         TEXT NOT NULL DEFAULT '',    -- JSON array of involved host names
+		evidence      TEXT NOT NULL DEFAULT '',    -- canonical structured evidence (JSON)
+		observe_count INTEGER NOT NULL DEFAULT 0,  -- consecutive positive scans
+		clean_count   INTEGER NOT NULL DEFAULT 0,  -- consecutive complete clean scans
+		first_seen    TEXT NOT NULL DEFAULT '',
+		last_seen     TEXT NOT NULL DEFAULT '',
+		confirmed_at  TEXT,
+		resolved_at   TEXT,
+		reporter      TEXT NOT NULL DEFAULT '',    -- host that wrote the latest transition
+		created_at    TEXT NOT NULL,
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT,
+		PRIMARY KEY (evaluator, code, subject_kind, subject_id)
+	)`,
+
+	// health_evaluator_status — each evaluator's latest scan: when it ran, what
+	// it could see, and who ran it (v50). Coverage is a first-class fact
+	// because ABSENCE of a condition is only meaningful under COMPLETE
+	// coverage: a scan that could not reach every peer cannot prove a dual-run
+	// is gone, and consumers (GetClusterHealth, admission) must be able to
+	// tell "clean" from "blind". One row per evaluator; LWW.
+	`CREATE TABLE IF NOT EXISTS health_evaluator_status (
+		evaluator     TEXT NOT NULL,
+		last_scan     TEXT NOT NULL DEFAULT '',    -- RFC3339 of the latest completed scan
+		coverage      TEXT NOT NULL DEFAULT '',    -- complete | partial | unreachable | unsupported
+		reporter      TEXT NOT NULL DEFAULT '',    -- host that ran the scan
+		detail        TEXT NOT NULL DEFAULT '',    -- human-readable coverage detail (which peers missed, why)
+		created_at    TEXT NOT NULL,
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT,
+		PRIMARY KEY (evaluator)
+	)`,
+
+	// host_capacity_observations — one replicated row per host: what the host's
+	// own runtime inventory says it is actually using, versus what the database
+	// has allocated to it (v50). effective_* is computed over the UNION of
+	// database and runtime workloads (matching workload: the greater
+	// allocation; database-only running workload: the database charge;
+	// runtime-only workload: added on top), so a rogue runtime the database
+	// does not know about still consumes capacity in every placement decision.
+	// complete=0 marks an observation that could not account for everything
+	// (an uncapped container, a failed resource probe) — placement REFUSES
+	// stale or incomplete observations rather than treating them as headroom.
+	// Written only by the observed host (host_name is the ownership); LWW.
+	`CREATE TABLE IF NOT EXISTS host_capacity_observations (
+		host_name          TEXT NOT NULL,
+		db_cpu             INTEGER NOT NULL DEFAULT 0,  -- database-allocated vCPU
+		db_mem_mib         INTEGER NOT NULL DEFAULT 0,
+		extra_cpu          INTEGER NOT NULL DEFAULT 0,  -- runtime-only workloads' vCPU on top
+		extra_mem_mib      INTEGER NOT NULL DEFAULT 0,
+		effective_cpu      INTEGER NOT NULL DEFAULT 0,  -- union accounting (see table doc)
+		effective_mem_mib  INTEGER NOT NULL DEFAULT 0,
+		complete           INTEGER NOT NULL DEFAULT 0,  -- 1 = every runtime workload accounted
+		detail             TEXT NOT NULL DEFAULT '',    -- why incomplete / notable contributors
+		sampled_at         TEXT NOT NULL DEFAULT '',    -- RFC3339 of the local inventory scan
+		created_at         TEXT NOT NULL,
+		updated_at         TEXT NOT NULL,
+		deleted_at         TEXT,
+		PRIMARY KEY (host_name)
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -1982,6 +2078,10 @@ var schemaIndexes = []string{
 	// cross-host live-stream poll (ts cursor).
 	`CREATE INDEX IF NOT EXISTS idx_vm_events_vm_ts ON vm_events(vm_name, ts)`,
 	`CREATE INDEX IF NOT EXISTS idx_vm_events_ts ON vm_events(ts)`,
+	// health: the hot path is "every non-resolved condition" (admission and
+	// GetClusterHealth), and GC scans resolved rows by resolution time.
+	`CREATE INDEX IF NOT EXISTS idx_health_conditions_lifecycle ON health_conditions(lifecycle) WHERE deleted_at IS NULL`,
+	`CREATE INDEX IF NOT EXISTS idx_health_conditions_resolved ON health_conditions(resolved_at) WHERE resolved_at IS NOT NULL AND deleted_at IS NULL`,
 
 	// VMs: filtered by host_name and stack_name in nearly every list/count query.
 	`CREATE INDEX IF NOT EXISTS idx_vms_host ON vms(host_name) WHERE deleted_at IS NULL`,
@@ -2046,6 +2146,9 @@ var tablePrimaryKeys = map[string][]string{
 	"host_labels":              {"host_name", "key"},
 	"host_health":              {"observer", "target"},
 	"host_runtime_usage":       {"host_name"},
+	"health_conditions":        {"evaluator", "code", "subject_kind", "subject_id"},
+	"health_evaluator_status":  {"evaluator"},
+	"host_capacity_observations": {"host_name"},
 	"clock_skew":               {"observer", "target"},
 	"crl_versions":             {"host"},
 	"cluster_crl":              {"id", "crl_pem"},
@@ -2448,6 +2551,8 @@ var createTableUnits = []struct {
 	{46, "audit_key_lifecycle"},
 	{47, "cluster_crl"},
 	{48, "host_networks"},
+	{50, "health_conditions"}, {50, "health_evaluator_status"},
+	{50, "host_capacity_observations"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

@@ -230,6 +230,7 @@ type syncTable struct {
 // GetStateDump/StreamStateDump are operator-callable.
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
+	"health_conditions", "health_evaluator_status", "host_capacity_observations",
 	"images", "image_hosts", "networks", "volumes", "stacks",
 	"vms", "vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent", "vm_pci_realizations", "snapshots",
 	"lb_configs", "lb_backends", "users", "tokens", "dns_records",

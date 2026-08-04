@@ -405,6 +405,14 @@ var capabilityMap = map[string]tableResolver{
 	}},
 	"host_labels":   {category: "content", chain: contentDefaultChain()},
 	"host_health":   {category: "content", chain: contentDefaultChain()},
+	// v50 durable health: condition/status rows are written by one evaluator
+	// instance at a time (the detector lease holder), and capacity observations
+	// only by the host they describe — single-writer per row, so an exact-instant
+	// tie already means something is wrong; the default chain settles it
+	// deterministically, and the next scan overwrites whatever won.
+	"health_conditions":         {category: "content", chain: contentDefaultChain()},
+	"health_evaluator_status":   {category: "content", chain: contentDefaultChain()},
+	"host_capacity_observations": {category: "content", chain: contentDefaultChain()},
 	// v48 host network intent: single-writer per row (the owning host), so an
 	// exact-instant tie already means something is wrong; the default chain
 	// settles it deterministically rather than leaving the cluster divergent,

@@ -120,13 +120,13 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	// newVMOnHost=false: a live resize acts on a RUNNING VM whose overhead is
 	// already subtracted from free capacity. Charging another would refuse a legal
 	// grow, and refuse it again on every subsequent resize.
-	release, aerr := s.admitResources(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta), false)
+	adm, aerr := s.admitResources(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta), false)
 	// specCommitted is set at the durable desired-spec write (either path below), not
 	// from retErr: the RPC can fail after the spec is persisted, and calling that
 	// "not committed" would free the authority's charge while the larger size is real.
 	specCommitted := false
 	defer func() {
-		release(CommitFact{
+		adm.Release(CommitFact{
 			Committed: specCommitted, Workload: name, Kind: corrosion.WorkloadVM,
 			CPU: int(wantCPU), MemMiB: int(wantMem),
 		})
@@ -150,6 +150,10 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 		obsMem = int(wantMem)
 	}
 
+	// FENCE before either durable path writes the new desired spec; see CreateVM.
+	if ferr := adm.AllowCommit(ctx); ferr != nil {
+		return ferr
+	}
 	if s.operationProtocolActive(ctx) {
 		return s.resizeVMLiveCoordinated(ctx, vm, stored, target, obsCPU, obsMem, idemKey, &specCommitted)
 	}

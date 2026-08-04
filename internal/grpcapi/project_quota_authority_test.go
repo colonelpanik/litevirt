@@ -72,13 +72,13 @@ func TestAdmitProjectQuota_LocalHolderReservationBlocksSecond(t *testing.T) {
 		t.Fatalf("third admit with the quota fully reserved: got %v, want ResourceExhausted — "+
 			"in-flight admissions must count against the limit", err)
 	}
-	r1(CommitFact{})
+	r1.Release(CommitFact{})
 	if r3, err := s.admitProjectQuota(ctx, "/acme", 1, 512); err != nil {
 		t.Errorf("admit after releasing a reservation: %v", err)
 	} else {
-		r3(CommitFact{})
+		r3.Release(CommitFact{})
 	}
-	r2(CommitFact{})
+	r2.Release(CommitFact{})
 
 	st := s.projectAdmitStateFor("/acme")
 	st.mu.Lock()
@@ -99,14 +99,14 @@ func TestAdmitProjectQuota_InactiveFeatureIsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
-	defer r1(CommitFact{})
+	defer r1.Release(CommitFact{})
 	// Nothing is reserved, so a second identical admit still passes against
 	// committed usage — the pre-existing (racy) behaviour, deliberately preserved.
 	r2, err := s.admitProjectQuota(ctx, "/acme", 2, 2048)
 	if err != nil {
 		t.Fatalf("second admit with the feature off should behave as before: %v", err)
 	}
-	defer r2(CommitFact{})
+	defer r2.Release(CommitFact{})
 
 	st := s.projectAdmitStateFor("/acme")
 	st.mu.Lock()
@@ -152,7 +152,7 @@ func TestAdmitProjectQuota_UnreachableHolderFailsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admit with an unreachable holder must FAIL OPEN, got: %v", err)
 	}
-	release(CommitFact{})
+	release.Release(CommitFact{})
 
 	// And it must still enforce the limit locally while degraded.
 	if _, err := s.admitProjectQuota(ctx, "/acme", 99, 99999); status.Code(err) != codes.ResourceExhausted {
@@ -231,7 +231,7 @@ func TestAdmitProjectQuota_CommittedChargeSurvivesReplicationGap(t *testing.T) {
 	}
 	// The caller committed on the target host. Nothing has replicated here yet, so
 	// local usage is still 0.
-	release(CommitFact{Committed: true, Workload: "replicated", CPU: 4, MemMiB: 2048})
+	release.Release(CommitFact{Committed: true, Workload: "replicated", CPU: 4, MemMiB: 2048})
 
 	if _, err := s.admitProjectQuota(ctx, "/acme", 4, 2048); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("second 4-vCPU admit against a 4-vCPU quota, with the first committed but not "+
@@ -280,13 +280,13 @@ func TestAdmitProjectQuota_FailedOperationReleasesImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
-	release(CommitFact{}) // the create failed; nothing was written
+	release.Release(CommitFact{}) // the create failed; nothing was written
 
 	if r2, err := s.admitProjectQuota(ctx, "/acme", 4, 2048); err != nil {
 		t.Errorf("admit after a FAILED operation released its reservation: %v — a failure must "+
 			"return the quota, not hold it", err)
 	} else {
-		r2(CommitFact{})
+		r2.Release(CommitFact{})
 	}
 
 	st := s.projectAdmitStateFor("/acme")
@@ -315,8 +315,8 @@ func TestAdmitProjectQuota_UnobservedChargeAggregatesCorrectly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admit 2: %v", err)
 	}
-	r1(CommitFact{Committed: true, Workload: "first", CPU: 2, MemMiB: 1024})
-	r2(CommitFact{Committed: true, Workload: "second", CPU: 2, MemMiB: 1024}) // 4 vCPU committed, 0 visible
+	r1.Release(CommitFact{Committed: true, Workload: "first", CPU: 2, MemMiB: 1024})
+	r2.Release(CommitFact{Committed: true, Workload: "second", CPU: 2, MemMiB: 1024}) // 4 vCPU committed, 0 visible
 
 	// Only the FIRST workload replicates in.
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
@@ -338,7 +338,7 @@ func TestAdmitProjectQuota_UnobservedChargeAggregatesCorrectly(t *testing.T) {
 	if r3, err := s.admitProjectQuota(ctx, "/acme", 4, 512); err != nil {
 		t.Errorf("4 vCPU should fit exactly: %v", err)
 	} else {
-		r3(CommitFact{})
+		r3.Release(CommitFact{})
 	}
 }
 
@@ -449,7 +449,7 @@ func TestAdmitProjectQuota_UnrelatedUsageDoesNotRetireACharge(t *testing.T) {
 		t.Fatalf("admit: %v", err)
 	}
 	// Committed as "mine", not yet replicated here.
-	release(CommitFact{Committed: true, Workload: "mine", Kind: corrosion.WorkloadVM, CPU: 4, MemMiB: 2048})
+	release.Release(CommitFact{Committed: true, Workload: "mine", Kind: corrosion.WorkloadVM, CPU: 4, MemMiB: 2048})
 
 	// An UNRELATED workload now becomes visible — one that was never charged here
 	// (created before this charge, or admitted while the authority was unreachable).
@@ -503,7 +503,7 @@ func TestCreateVM_OvercommitStillUsesSerializedQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed reservation: %v", err)
 	}
-	defer hold(CommitFact{})
+	defer hold.Release(CommitFact{})
 
 	_, err = s.CreateVM(ctx, &pb.CreateVMRequest{
 		Spec: &pb.VMSpec{
@@ -538,7 +538,7 @@ func TestQuotaLease_RenewedWhileChargesOutstanding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
-	defer hold(CommitFact{})
+	defer hold.Release(CommitFact{})
 
 	// Age the lease to the brink, as a long create would.
 	if err := s.db.Execute(ctx,
@@ -584,7 +584,7 @@ func TestQuotaLease_LosingTheLeaseDropsTheLedger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
-	defer hold(CommitFact{})
+	defer hold.Release(CommitFact{})
 
 	// Someone else takes the lease (ours expired and they won it).
 	if err := s.db.Execute(ctx,
@@ -630,13 +630,13 @@ func TestAdmitProjectQuota_ConsecutiveResizesSumTheirCharges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resize 1: %v", err)
 	}
-	r1(CommitFact{Committed: true, Workload: "grower", Kind: corrosion.WorkloadVM, CPU: 4, MemMiB: 512})
+	r1.Release(CommitFact{Committed: true, Workload: "grower", Kind: corrosion.WorkloadVM, CPU: 4, MemMiB: 512})
 	// Resize 4→6 commits too (delta 2, absolute 6), also not replicated.
 	r2, err := s.admitProjectQuota(ctx, "/acme", 2, 0)
 	if err != nil {
 		t.Fatalf("resize 2: %v", err)
 	}
-	r2(CommitFact{Committed: true, Workload: "grower", Kind: corrosion.WorkloadVM, CPU: 6, MemMiB: 512})
+	r2.Release(CommitFact{Committed: true, Workload: "grower", Kind: corrosion.WorkloadVM, CPU: 6, MemMiB: 512})
 
 	// Quota 8. Visible 2 + unseen 4 = 6 spoken for, so 3 must not fit; 2 must.
 	if _, err := s.admitProjectQuota(ctx, "/acme", 3, 0); status.Code(err) != codes.ResourceExhausted {
@@ -646,7 +646,7 @@ func TestAdmitProjectQuota_ConsecutiveResizesSumTheirCharges(t *testing.T) {
 	if r3, err := s.admitProjectQuota(ctx, "/acme", 2, 0); err != nil {
 		t.Errorf("2 vCPU should fit exactly (8 - 2 visible - 4 unseen): %v", err)
 	} else {
-		r3(CommitFact{})
+		r3.Release(CommitFact{})
 	}
 }
 
@@ -704,7 +704,7 @@ func TestCreateContainer_CPUIsSerializedAgainstProjectQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed reservation: %v", err)
 	}
-	defer hold(CommitFact{})
+	defer hold.Release(CommitFact{})
 
 	_, err = s.CreateContainer(ctx, &pb.CreateContainerRequest{
 		Name: "cpuhog", Project: "/acme", Cpu: 4, MemoryMib: 0, // uncapped memory
@@ -763,4 +763,93 @@ func TestUpdateVM_StoppedVMGrowIsAdmitted(t *testing.T) {
 		t.Errorf("spec cpu = %d after a REFUSED grow, want the original 2 — a refused admission "+
 			"must not persist the larger size", spec.Cpu)
 	}
+}
+
+// TestQuotaLease_RenewalRequiresQuorum is the regression test for a minority-side
+// holder renewing forever.
+//
+// Quorum was checked only on initial acquisition, so a partitioned-away holder kept
+// extending its LOCAL lease row indefinitely. The majority never saw those renewals,
+// observed the lease expire, and elected a successor — two active authorities, each
+// admitting against its own ledger.
+func TestQuotaLease_RenewalRequiresQuorum(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+
+	// Acquire with quorum.
+	held, _, err := s.holdsQuotaLease(ctx, "/acme")
+	if err != nil || !held {
+		t.Fatalf("acquire with quorum: held=%v err=%v", held, err)
+	}
+
+	// Quorum is lost (this node is now on the minority side). SplitBrainGateV1 must be
+	// enforced for decideGateRefused to consult the DECIDE gate at all — see the note
+	// on holdsQuotaLease about that dependency.
+	s.SetGate(fakeServerGate{
+		execOK: true, decideOK: false, // DECIDE gate refuses
+		enforcedTok: map[string]bool{
+			capabilities.ProjectQuotaAuthorityV1: true,
+			capabilities.SplitBrainGateV1:        true,
+		},
+	})
+
+	held, _, err = s.holdsQuotaLease(ctx, "/acme")
+	if err != nil {
+		t.Fatalf("renewal attempt without quorum: %v", err)
+	}
+	if held {
+		t.Error("renewed the admission lease WITHOUT quorum — a minority-side holder must stand " +
+			"down, or it keeps extending a lease the majority has already reassigned")
+	}
+}
+
+// TestAdmission_CommitIsFencedWhenAuthorityMoves is the regression test for charges
+// being discarded before the successor could account for them.
+//
+// The renewer zeroes the ledger on lease loss. That is only sound if the in-flight
+// request cannot still commit: otherwise the successor admits the same quota (it sees
+// neither the pending reservation nor the unreplicated workload) and the original
+// request finishes on top of it. The fence is what makes the drop safe — a grant must
+// refuse to commit once authority has moved.
+func TestAdmission_CommitIsFencedWhenAuthorityMoves(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	adm, err := s.admitResources(ctx, "test-host", "/acme", 4, 2048, true)
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	defer adm.Release(CommitFact{})
+
+	// While this request is in flight, it is still allowed to commit.
+	if ferr := adm.AllowCommit(ctx); ferr != nil {
+		t.Fatalf("AllowCommit while we still hold authority: %v", ferr)
+	}
+
+	// Authority moves: our lease is gone and a successor holds it.
+	if err := s.db.Execute(ctx,
+		`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
+		"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
+		corrosion.QuotaLeaseKey("/acme")); err != nil {
+		t.Fatalf("hand lease to successor: %v", err)
+	}
+
+	ferr := adm.AllowCommit(ctx)
+	if status.Code(ferr) != codes.Aborted {
+		t.Fatalf("AllowCommit after authority moved: got %v, want Aborted — an in-flight request "+
+			"must NOT commit once a successor may already have admitted the same quota", ferr)
+	}
+}
+
+// TestAdmission_ZeroValueAllowsCommit: an admission that reserved no quota (unbounded
+// project, feature inactive, host-only) has no authority to lose, so the fence must not
+// refuse it. Getting this wrong would block every create on a project with no quota.
+func TestAdmission_ZeroValueAllowsCommit(t *testing.T) {
+	var zero Admission
+	if err := zero.AllowCommit(context.Background()); err != nil {
+		t.Errorf("zero-value Admission.AllowCommit = %v, want nil", err)
+	}
+	zero.Release(CommitFact{Committed: true, Workload: "x"}) // must not panic
 }

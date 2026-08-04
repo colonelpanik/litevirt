@@ -70,6 +70,10 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	// vmCommitted is flipped at the durable VM write and read by the deferred
 	// quota release. See the release site for why retErr is the wrong signal.
 	vmCommitted := false
+	// vmAdmission carries the commit FENCE: authority can move while this create is
+	// in flight (image pull, disk work), and committing then would land a charge the
+	// new authority knows nothing about. Checked immediately before the durable write.
+	var vmAdmission Admission
 	spec := req.Spec
 	if spec == nil {
 		return nil, status.Error(codes.InvalidArgument, "spec required")
@@ -271,9 +275,10 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		// admission like any other create. The earlier tenancy.Admit is an
 		// unserialized fail-fast: relying on it here let concurrent overcommit
 		// creates all observe the same quota headroom and all pass.
-		qRelease, qErr := s.admitProjectQuota(ctx, project, int(spec.Cpu), int(spec.MemoryMib))
+		qAdm, qErr := s.admitProjectQuota(ctx, project, int(spec.Cpu), int(spec.MemoryMib))
+		vmAdmission = qAdm
 		defer func() {
-			qRelease(CommitFact{
+			qAdm.Release(CommitFact{
 				Committed: vmCommitted, Workload: spec.Name, Kind: corrosion.WorkloadVM,
 				CPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib),
 			})
@@ -284,13 +289,14 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	} else {
 		// newVMOnHost: this VM is appearing on the target, so it must also be
 		// charged its own qemu overhead against HOST capacity (not against quota).
-		release, err := s.admitResources(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib), true)
+		adm, err := s.admitResources(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib), true)
+		vmAdmission = adm
 		// vmCommitted is set at the DURABLE WRITE below, not from retErr. The RPC can
 		// fail after the row exists (a cancelled context, a read failure while
 		// building the response), and reporting that as "not committed" would free the
 		// authority's charge while the VM is running on the target.
 		defer func() {
-			release(CommitFact{
+			adm.Release(CommitFact{
 				Committed: vmCommitted, Workload: spec.Name, Kind: corrosion.WorkloadVM,
 				CPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib),
 			})
@@ -832,6 +838,13 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		Project:   project, // tenancy label
 	}
 
+	// FENCE, immediately before the durable write: if project-quota authority moved
+	// while this create was in flight, the successor may already have admitted the same
+	// quota, so this VM must not be recorded. Nothing is committed yet, so a refusal
+	// here costs only a retry.
+	if err := vmAdmission.AllowCommit(ctx); err != nil {
+		return nil, err
+	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
@@ -2770,6 +2783,8 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 	// specCommitted is flipped at the durable desired-spec write and read by the
 	// deferred quota release (retErr is the wrong signal — see CreateVM).
 	specCommitted := false
+	// updAdmission carries the commit fence; see CreateVM.
+	var updAdmission Admission
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -2907,9 +2922,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 				// Only the HOST check is bypassed; quota is a tenancy limit — and it
 				// must be the SERIALIZED admission, not the unserialized local check,
 				// or concurrent overcommit grows all see the same headroom.
-				qRelease, qErr := s.admitProjectQuota(ctx, fresh.Project, cpuGrow, memGrow)
+				qAdm, qErr := s.admitProjectQuota(ctx, fresh.Project, cpuGrow, memGrow)
+				updAdmission = qAdm
 				defer func() {
-					qRelease(CommitFact{
+					qAdm.Release(CommitFact{
 						Committed: specCommitted, Workload: req.Name, Kind: corrosion.WorkloadVM,
 						CPU: int(wantCPU), MemMiB: int(wantMem),
 					})
@@ -2928,9 +2944,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 				// concurrent grow on this host can't claim the same headroom.
 				// newVMOnHost=false: the VM is running and already counted, overhead
 				// included, so the delta must not be charged another one.
-				release, aerr := s.admitResources(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow, false)
+				adm, aerr := s.admitResources(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow, false)
+				updAdmission = adm
 				defer func() {
-					release(CommitFact{
+					adm.Release(CommitFact{
 						Committed: specCommitted, Workload: req.Name, Kind: corrosion.WorkloadVM,
 						CPU: int(wantCPU), MemMiB: int(wantMem),
 					})
@@ -2971,9 +2988,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 						return nil, err
 					}
 				}
-				qRelease, qerr := s.admitProjectQuota(ctx, vm.Project, cpuGrow, memGrow)
+				qAdm, qerr := s.admitProjectQuota(ctx, vm.Project, cpuGrow, memGrow)
+				updAdmission = qAdm
 				defer func() {
-					qRelease(CommitFact{
+					qAdm.Release(CommitFact{
 						Committed: specCommitted, Workload: req.Name, Kind: corrosion.WorkloadVM,
 						CPU: int(wantCPU), MemMiB: int(wantMem),
 					})
@@ -3267,6 +3285,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 	// half-applied firmware update). MutateDesiredSpec persists the desired spec and
 	// bumps spec_generation; UpdateObservedActuals then records the stopped VM's new
 	// cpu/mem actuals against that generation so a later start boots the right size.
+	if ferr := updAdmission.AllowCommit(ctx); ferr != nil {
+		if oldXML != "" {
+			_ = s.virt.UndefineDomainPreservingState(req.Name)
+			_ = s.virt.DefineDomain(oldXML)
+		}
+		return nil, ferr
+	}
 	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
 		return string(specJSON), nil
 	})

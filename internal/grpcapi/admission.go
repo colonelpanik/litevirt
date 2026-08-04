@@ -55,6 +55,44 @@ type CommitFact struct {
 // noopReleaseCommitted is the release for a quota admission that reserved nothing.
 func noopReleaseCommitted(CommitFact) {}
 
+// Admission is a granted admission: how to give it back, and — for the quota half —
+// whether it is still allowed to COMMIT.
+//
+// The fence exists because a lease handoff cannot be made safe by bookkeeping alone.
+// If the authority loses its lease while a 4-vCPU create is in flight, the successor
+// sees neither the pending reservation nor the workload (it has not replicated), so it
+// admits another 4 — and the original create then finishes and puts the project over
+// quota. Keeping the old holder's charges does not help either: the successor never
+// learns of them. The only sound options are durable/transferred reservations or
+// ABORTING the outstanding operation, and this is the abort.
+//
+// AllowCommit is called immediately before the durable write. Past that point the
+// write has happened and the charge is real; before it, refusing costs only a retry.
+type Admission struct {
+	release func(CommitFact)
+	fence   func(context.Context) error
+}
+
+// Release returns the admission. Safe on a zero value.
+func (a Admission) Release(f CommitFact) {
+	if a.release != nil {
+		a.release(f)
+	}
+}
+
+// AllowCommit reports whether this admission may still be committed. Call it
+// IMMEDIATELY before the durable write — the narrower the gap, the smaller the window
+// in which authority can move between the check and the write.
+//
+// A zero value allows: an admission that reserved no quota (unbounded project, feature
+// inactive, host-only) has no authority to lose.
+func (a Admission) AllowCommit(ctx context.Context) error {
+	if a.fence == nil {
+		return nil
+	}
+	return a.fence(ctx)
+}
+
 func (s *Server) hostAdmitStateFor(host string) *hostAdmitState {
 	s.hostAdmitMu.Lock()
 	defer s.hostAdmitMu.Unlock()
@@ -222,21 +260,24 @@ func (s *Server) reserveHostCapacity(host string, cpuDelta, memMiBDelta int) fun
 // the authority's charge while the workload exists on the target. Passing true for a
 // failed operation instead holds quota until the grace TTL, which is the safe
 // direction but still wrong.
-func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, newVMOnHost bool) (func(CommitFact), error) {
+func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, newVMOnHost bool) (Admission, error) {
 	hostMem := memMiBDelta
 	if newVMOnHost {
 		hostMem = s.capacity.MemChargeFor(memMiBDelta)
 	}
 	release, err := s.admitHostCapacity(ctx, host, cpuDelta, hostMem)
 	if err != nil {
-		return noopReleaseCommitted, err
+		return Admission{}, err
 	}
-	qRelease, err := s.admitProjectQuota(ctx, project, cpuDelta, memMiBDelta)
+	q, err := s.admitProjectQuota(ctx, project, cpuDelta, memMiBDelta)
 	if err != nil {
 		release()
-		return noopReleaseCommitted, err
+		return Admission{}, err
 	}
-	return func(f CommitFact) { qRelease(f); release() }, nil
+	return Admission{
+		release: func(f CommitFact) { q.Release(f); release() },
+		fence:   q.fence,
+	}, nil
 }
 
 // projectIsBounded reports whether the project has a quota row at all.

@@ -81,13 +81,19 @@ func (s *Server) renewHeldQuotaLeases(ctx context.Context) {
 		if held {
 			continue
 		}
+		// Dropping the charges is only safe because of the COMMIT FENCE: every
+		// outstanding grant re-checks the lease (local) or its deadline (routed)
+		// immediately before its durable write, so an in-flight create cannot land
+		// against a ledger the successor knows nothing about. Without that fence this
+		// drop was a hole — the successor would admit the same quota and the original
+		// request would still complete.
 		slog.Error("project quota: LOST the admission lease while charges were outstanding; "+
-			"dropping them — the new authority accounts for these workloads once they replicate",
+			"in-flight commits will be ABORTED by the fence and their charges dropped",
 			"project", project, "new_holder", currentHolder)
 		s.notify(ctx, notify.Notification{
 			Kind: "quota.authority_lost", Severity: notify.SevWarn, Subject: project,
 			Detail: "lost the project-quota admission lease to " + currentHolder +
-				" while admissions were in flight",
+				" while admissions were in flight; those requests are aborted before committing",
 		})
 		st := s.projectAdmitStateFor(project)
 		st.mu.Lock()
@@ -143,20 +149,20 @@ type quotaLease struct {
 // Only vCPU and memory are serialized. The other quota dimensions (disk, NIC,
 // public IPs, backup GiB) are still admitted by tenancy.Engine.Admit with no
 // reservation and remain racy; that is a known gap, not something this closes.
-func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta, memMiBDelta int) (func(CommitFact), error) {
+func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta, memMiBDelta int) (Admission, error) {
 	if cpuDelta <= 0 && memMiBDelta <= 0 {
-		return noopReleaseCommitted, nil
+		return Admission{}, nil
 	}
 	project = tenancy.NormalizeProject(project)
 	if !s.projectQuotaAuthorityActive(ctx) {
-		return noopReleaseCommitted, s.checkProjectQuota(ctx, project, cpuDelta, memMiBDelta)
+		return Admission{}, s.checkProjectQuota(ctx, project, cpuDelta, memMiBDelta)
 	}
 
 	holder, epoch, err := s.projectQuotaHolder(ctx, project)
 	if err != nil || holder == "" {
 		// No authority resolvable (no eligible hosts, or a state read failed).
 		// Degrade to the local check rather than refusing a create.
-		return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta, "authority unresolved", err)
+		return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta, "authority unresolved", err)
 	}
 	if holder == s.hostName {
 		release, err := s.admitProjectQuotaLocal(ctx, project, cpuDelta, memMiBDelta)
@@ -165,7 +171,7 @@ func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta
 			if moved.holder != "" && moved.holder != s.hostName {
 				return s.admitProjectQuotaRemote(ctx, moved.holder, 0, project, cpuDelta, memMiBDelta)
 			}
-			return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+			return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 				"lost the admission lease and no successor is recorded", nil)
 		}
 		return release, err
@@ -249,6 +255,23 @@ func (s *Server) holdsQuotaLease(ctx context.Context, project string) (bool, str
 		return false, "", err
 	} else if ok {
 		return cur.Holder == s.hostName, cur.Holder, nil
+	}
+	// QUORUM ON EVERY RENEWAL, not just on first acquisition. Gating only acquisition
+	// let a partitioned-away holder keep extending its LOCAL lease row forever: the
+	// majority never sees those renewals, observes the lease expire, elects a
+	// successor — and now two nodes are both admitting. A minority-side holder must
+	// stop being the authority, which means it must stop renewing.
+	//
+	// NOTE, because it bounds the guarantee: decideGateRefused only consults the
+	// DECIDE gate once split_brain_gate_v1 is enforced cluster-wide. Until that token
+	// latches there is no quorum gate here OR on acquisition, and the lease degrades
+	// to "first writer wins, LWW resolves" — better than a derived holder, but not
+	// partition-safe. Same dependency as every other quorum-gated decision in this
+	// codebase.
+	if reason, refused := s.decideGateRefused(ctx); refused {
+		slog.Warn("project quota: refusing to renew the admission lease without quorum; "+
+			"standing down as authority", "project", project, "reason", reason)
+		return false, "", nil
 	}
 	// Renew-or-confirm. The conditional upsert only wins on an expired lease or a
 	// renewal by us, so this cannot steal a live peer's lease.
@@ -418,18 +441,18 @@ func (st *projectAdmitState) unobservedChargeLocked(
 //
 // The observed usage is carried into the release func so a commit can anchor its
 // unobserved charge to the usage that was visible when it was admitted.
-func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpuDelta, memMiBDelta int) (func(CommitFact), error) {
+func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpuDelta, memMiBDelta int) (Admission, error) {
 	// RENEW the lease, do not merely read it. Admitting extends the life of a charge,
 	// so it must also extend the authority that owns that charge — otherwise the lease
 	// lapses mid-create and another node acquires it with an empty ledger.
 	held, currentHolder, err := s.holdsQuotaLease(ctx, project)
 	if err != nil {
-		return noopReleaseCommitted, status.Errorf(codes.Internal, "renew project authority lease: %v", err)
+		return Admission{}, status.Errorf(codes.Internal, "renew project authority lease: %v", err)
 	}
 	if !held {
 		// Lost it between resolving and serving. Do not admit locally against a ledger
 		// we no longer own; let the caller route or degrade.
-		return noopReleaseCommitted, errQuotaAuthorityMoved{holder: currentHolder}
+		return Admission{}, errQuotaAuthorityMoved{holder: currentHolder}
 	}
 
 	st := s.projectAdmitStateFor(project)
@@ -438,42 +461,61 @@ func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpu
 
 	bounded, err := s.projectIsBounded(ctx, project)
 	if err != nil {
-		return noopReleaseCommitted, err
+		return Admission{}, err
 	}
 	if !bounded {
-		return noopReleaseCommitted, nil // unbounded project: nothing to serialize
+		return Admission{}, nil // unbounded project: nothing to serialize
 	}
 	unobsCPU, unobsMem, err := st.unobservedChargeLocked(project, func(kind, host, w string) (int, int, bool, error) {
 		return corrosion.WorkloadQuotaContribution(ctx, s.db, project, kind, host, w)
 	})
 	if err != nil {
-		return noopReleaseCommitted, status.Errorf(codes.Internal, "observe committed workloads: %v", err)
+		return Admission{}, status.Errorf(codes.Internal, "observe committed workloads: %v", err)
 	}
 	if err := s.checkProjectQuotaWithPending(ctx, project, cpuDelta, memMiBDelta,
 		st.pendingCPU+unobsCPU, st.pendingMem+unobsMem); err != nil {
-		return noopReleaseCommitted, err
+		return Admission{}, err
 	}
 	cpu, mem := maxInt(cpuDelta, 0), maxInt(memMiBDelta, 0)
 	st.pendingCPU += cpu
 	st.pendingMem += mem
-	return st.releaseFor(cpu, mem), nil
+	return Admission{
+		release: st.releaseFor(cpu, mem),
+		// A LOCAL grant is fenced by a live re-check: we must still hold the lease,
+		// with quorum, at commit time. If we lost it, a successor may already have
+		// admitted against a ledger that knows nothing about this charge, so this
+		// commit must not happen.
+		fence: func(fctx context.Context) error {
+			ok, holder, ferr := s.holdsQuotaLease(fctx, project)
+			if ferr != nil {
+				return status.Errorf(codes.Unavailable,
+					"cannot confirm project-quota authority for %q before committing: %v", project, ferr)
+			}
+			if !ok {
+				return status.Errorf(codes.Aborted,
+					"project-quota authority for %q moved to %q while this request was in flight; "+
+						"nothing was committed — retry", project, holder)
+			}
+			return nil
+		},
+	}, nil
 }
 
 // admitProjectQuotaRemote routes to the holder. On an epoch mismatch it retries
 // ONCE against the holder the remote reports, so a stale local view self-corrects
 // without looping.
-func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epoch int64, project string, cpuDelta, memMiBDelta int) (func(CommitFact), error) {
+func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epoch int64, project string, cpuDelta, memMiBDelta int) (Admission, error) {
 	// Never send a request a peer would answer Unimplemented: a mixed-version or
 	// flag-off holder must degrade, not error.
 	if s.gate == nil || !s.gate.PeerSupportsFresh(ctx, holder, capabilities.ProjectQuotaAuthorityV1) {
-		return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+		return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 			"holder does not advertise "+capabilities.ProjectQuotaAuthorityV1, nil)
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
 		client, conn, err := s.peerClient(ctx, holder)
 		if err != nil {
-			return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+			return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 				"holder "+holder+" unreachable", err)
 		}
 		resp, err := client.AdmitProjectQuota(ctx, &pb.AdmitProjectQuotaRequest{
@@ -485,7 +527,7 @@ func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epo
 		})
 		conn.Close()
 		if err != nil {
-			return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+			return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 				"holder "+holder+" refused to answer", err)
 		}
 		// Redirect: the peer is not the authority and has told us who is. Follow THAT,
@@ -496,20 +538,43 @@ func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epo
 				holder, epoch = resp.CurrentHolder, resp.CurrentEpoch
 				continue
 			}
-			return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+			return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 				"authority moved to "+resp.CurrentHolder+" and could not be followed", nil)
 		}
 		if !resp.Admitted {
-			return noopReleaseCommitted, status.Errorf(codes.ResourceExhausted,
+			return Admission{}, status.Errorf(codes.ResourceExhausted,
 				"project %q quota exceeded: %s", project, resp.Detail)
 		}
 		id := resp.ReservationId
-		// The committed flag has to reach the holder: on a commit it must KEEP the
-		// charge until it can see the workload, since the target host wrote the row
-		// and replication has not delivered it here yet.
-		return func(f CommitFact) { s.releaseRemoteQuota(holder, id, f) }, nil
+		// The holder's lease deadline is our fence. A successor cannot acquire until
+		// that lease EXPIRES, so any commit strictly before it is still covered by the
+		// holder's ledger. After it, we cannot know whether authority moved, so we
+		// abort rather than commit against a ledger nobody is holding.
+		validUntil := time.Time{}
+		if resp.LeaseValidUntil != "" {
+			if t, perr := time.Parse(time.RFC3339, resp.LeaseValidUntil); perr == nil {
+				validUntil = t
+			}
+		}
+		return Admission{
+			// The committed flag has to reach the holder: on a commit it must KEEP the
+			// charge until it can see the workload, since the target host wrote the row
+			// and replication has not delivered it here yet.
+			release: func(f CommitFact) { s.releaseRemoteQuota(holder, id, f) },
+			fence: func(context.Context) error {
+				if validUntil.IsZero() {
+					return nil // holder predates the fence; nothing to enforce
+				}
+				if !time.Now().UTC().Before(validUntil) {
+					return status.Errorf(codes.Aborted,
+						"project-quota reservation for %q expired with its holder's lease before "+
+							"this request could commit; nothing was committed — retry", project)
+				}
+				return nil
+			},
+		}, nil
 	}
-	return noopReleaseCommitted, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
+	return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 		"authority epoch kept moving", nil)
 }
 
@@ -597,7 +662,7 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 		}, nil
 	}
 
-	release, err := s.admitProjectQuotaLocal(ctx, project, int(req.CpuDelta), int(req.MemMibDelta))
+	grant, err := s.admitProjectQuotaLocal(ctx, project, int(req.CpuDelta), int(req.MemMibDelta))
 	if err != nil {
 		if status.Code(err) == codes.ResourceExhausted {
 			return &pb.AdmitProjectQuotaResponse{Admitted: false, Detail: status.Convert(err).Message()}, nil
@@ -607,12 +672,17 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 
 	id, err := newReservationID()
 	if err != nil {
-		release(CommitFact{}) // never handed out, so nothing committed against it
+		grant.Release(CommitFact{}) // never handed out, so nothing committed against it
 		return nil, status.Errorf(codes.Internal, "mint reservation id: %v", err)
 	}
-	s.putQuotaLease(id, release, project, int(req.CpuDelta), int(req.MemMibDelta))
+	s.putQuotaLease(id, grant.Release, project, int(req.CpuDelta), int(req.MemMibDelta))
+	validUntil := ""
+	if until, ok, lerr := corrosion.ProjectQuotaLeaseValidUntil(ctx, s.db, project); lerr == nil && ok {
+		validUntil = until.Format(time.RFC3339)
+	}
 	return &pb.AdmitProjectQuotaResponse{
 		Admitted: true, ReservationId: id, CurrentHolder: s.hostName,
+		LeaseValidUntil: validUntil,
 	}, nil
 }
 

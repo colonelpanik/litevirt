@@ -22630,11 +22630,16 @@ type AdmitProjectQuotaResponse struct {
 	// a SUCCESSFUL response, never alongside an error — gRPC drops the message when
 	// an error is set, which would leave the caller unable to follow the redirect and
 	// re-resolving from the same stale view that misrouted it.
-	Redirect      bool   `protobuf:"varint,6,opt,name=redirect,proto3" json:"redirect,omitempty"`
-	CurrentHolder string `protobuf:"bytes,4,opt,name=current_holder,json=currentHolder,proto3" json:"current_holder,omitempty"`
-	CurrentEpoch  int64  `protobuf:"varint,5,opt,name=current_epoch,json=currentEpoch,proto3" json:"current_epoch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Redirect bool `protobuf:"varint,6,opt,name=redirect,proto3" json:"redirect,omitempty"`
+	// The holder's lease expiry, RFC3339. The caller treats it as a FENCING DEADLINE:
+	// a successor cannot acquire the lease until it expires, so a durable write
+	// strictly before this instant is still covered by this holder's ledger. After it,
+	// the caller must abort rather than commit against a ledger nobody holds.
+	LeaseValidUntil string `protobuf:"bytes,9,opt,name=lease_valid_until,json=leaseValidUntil,proto3" json:"lease_valid_until,omitempty"`
+	CurrentHolder   string `protobuf:"bytes,4,opt,name=current_holder,json=currentHolder,proto3" json:"current_holder,omitempty"`
+	CurrentEpoch    int64  `protobuf:"varint,5,opt,name=current_epoch,json=currentEpoch,proto3" json:"current_epoch,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AdmitProjectQuotaResponse) Reset() {
@@ -22693,6 +22698,13 @@ func (x *AdmitProjectQuotaResponse) GetRedirect() bool {
 		return x.Redirect
 	}
 	return false
+}
+
+func (x *AdmitProjectQuotaResponse) GetLeaseValidUntil() string {
+	if x != nil {
+		return x.LeaseValidUntil
+	}
+	return ""
 }
 
 func (x *AdmitProjectQuotaResponse) GetCurrentHolder() string {
@@ -24569,12 +24581,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\aproject\x18\x02 \x01(\tR\aproject\x12\x1b\n" +
 	"\tcpu_delta\x18\x03 \x01(\x05R\bcpuDelta\x12\"\n" +
 	"\rmem_mib_delta\x18\x04 \x01(\x05R\vmemMibDelta\x12'\n" +
-	"\x0fauthority_epoch\x18\x05 \x01(\x03R\x0eauthorityEpoch\"\xde\x01\n" +
+	"\x0fauthority_epoch\x18\x05 \x01(\x03R\x0eauthorityEpoch\"\x8a\x02\n" +
 	"\x19AdmitProjectQuotaResponse\x12\x1a\n" +
 	"\badmitted\x18\x01 \x01(\bR\badmitted\x12%\n" +
 	"\x0ereservation_id\x18\x02 \x01(\tR\rreservationId\x12\x16\n" +
 	"\x06detail\x18\x03 \x01(\tR\x06detail\x12\x1a\n" +
-	"\bredirect\x18\x06 \x01(\bR\bredirect\x12%\n" +
+	"\bredirect\x18\x06 \x01(\bR\bredirect\x12*\n" +
+	"\x11lease_valid_until\x18\t \x01(\tR\x0fleaseValidUntil\x12%\n" +
 	"\x0ecurrent_holder\x18\x04 \x01(\tR\rcurrentHolder\x12#\n" +
 	"\rcurrent_epoch\x18\x05 \x01(\x03R\fcurrentEpoch\"\xaa\x02\n" +
 	"%ReleaseProjectQuotaReservationRequest\x12\x16\n" +

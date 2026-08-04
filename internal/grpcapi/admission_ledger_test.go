@@ -285,12 +285,12 @@ func TestAdmitResources_RunningVMGrowIsNotChargedOverheadAgain(t *testing.T) {
 
 	// Growing by exactly the free 1920 MiB must be allowed: the VM is already
 	// counted, overhead included.
-	release, err := s.admitResources(ctx, "test-host", "_default", 0, 1920, false)
+	adm, err := s.admitResources(ctx, "test-host", "_default", 0, 1920, false)
 	if err != nil {
 		t.Fatalf("growing a RUNNING VM by exactly the free memory was refused (%v) — its "+
 			"overhead is already subtracted and must not be charged twice", err)
 	}
-	release(CommitFact{})
+	adm.Release(CommitFact{})
 
 	// The same grow treated as a NEW VM on the host is refused, which is the
 	// asymmetry the flag encodes.

@@ -167,9 +167,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 			return nil, herr
 		}
 	}
+	var ctAdmission Admission
 	if req.Cpu > 0 || req.MemoryMib > 0 {
-		qRelease, qerr := s.admitProjectQuota(ctx, req.Project, int(req.Cpu), int(req.MemoryMib))
-		defer func() { qRelease(ctCommitFact()) }()
+		qAdm, qerr := s.admitProjectQuota(ctx, req.Project, int(req.Cpu), int(req.MemoryMib))
+		ctAdmission = qAdm
+		defer func() { qAdm.Release(ctCommitFact()) }()
 		if qerr != nil {
 			return nil, qerr
 		}
@@ -219,6 +221,15 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// closed: the runtime container exists but the DB write failed → delete the
 	// just-created container and release its leases, so no partial tracked state
 	// and no leaked lease.
+	// FENCE before the durable write; see CreateVM.
+	if ferr := ctAdmission.AllowCommit(ctx); ferr != nil {
+		_ = s.releaseContainerNICs(ctx, info.Name)
+		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
+			slog.Warn("container create: cleanup after an aborted admission also failed",
+				"name", info.Name, "error", delErr)
+		}
+		return nil, ferr
+	}
 	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces); err != nil {
 		_ = s.releaseContainerNICs(ctx, info.Name)
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {

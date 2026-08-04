@@ -2412,6 +2412,11 @@ message AdmitProjectQuotaResponse {
     // an error is set, which would leave the caller unable to follow the redirect and
     // re-resolving from the same stale view that misrouted it.
     bool redirect = 6;
+    // The holder's lease expiry, RFC3339. The caller treats it as a FENCING DEADLINE:
+    // a successor cannot acquire the lease until it expires, so a durable write
+    // strictly before this instant is still covered by this holder's ledger. After it,
+    // the caller must abort rather than commit against a ledger nobody holds.
+    string lease_valid_until = 9;
     string current_holder = 4;
     int64 current_epoch = 5;
 }

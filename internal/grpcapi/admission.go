@@ -25,9 +25,28 @@ type hostAdmitState struct {
 // noopRelease is the release func for an admission that reserved nothing.
 func noopRelease() {}
 
-// noopReleaseCommitted is the committed-aware form, for a quota admission that
-// reserved nothing.
-func noopReleaseCommitted(bool) {}
+// CommitFact is what a caller tells the quota authority when it releases: whether
+// the workload was durably written, and if so its IDENTITY and post-commit counted
+// size.
+//
+// Identity is not optional bookkeeping. The authority holds a charge until it can
+// SEE the commit, and "see" has to mean "see THIS workload" — an aggregate
+// usage-growth heuristic is fooled by any unrelated increase (a workload created
+// before the charge that replicates late, or one admitted through the fail-open
+// path), which would retire this charge early and let the next request over-admit.
+//
+// CPU/MemMiB are the workload's ABSOLUTE post-commit counted values, not the delta,
+// so a resize is observable the same way a create is: the authority compares what
+// its own replica says the workload contributes against what it should contribute.
+type CommitFact struct {
+	Committed bool
+	Workload  string // VM or container name
+	CPU       int
+	MemMiB    int
+}
+
+// noopReleaseCommitted is the release for a quota admission that reserved nothing.
+func noopReleaseCommitted(CommitFact) {}
 
 func (s *Server) hostAdmitStateFor(host string) *hostAdmitState {
 	s.hostAdmitMu.Lock()
@@ -190,10 +209,13 @@ func (s *Server) reserveHostCapacity(host string, cpuDelta, memMiBDelta int) fun
 // in the replication gap. The HOST half always just releases: the node that reserved
 // is the node that committed, so its own usage query sees the write immediately.
 //
-// Pass `committed` honestly. Passing true for a failed operation holds quota until
-// the grace TTL; passing false for a successful one reopens the very window this
-// closes.
-func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, newVMOnHost bool) (func(bool), error) {
+// Set CommitFact.Committed at the DURABLE WRITE, never from the handler's error
+// return. An RPC can fail after the row is written — a cancelled context, a read
+// failure while building the response — and reporting that as "not committed" frees
+// the authority's charge while the workload exists on the target. Passing true for a
+// failed operation instead holds quota until the grace TTL, which is the safe
+// direction but still wrong.
+func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, newVMOnHost bool) (func(CommitFact), error) {
 	hostMem := memMiBDelta
 	if newVMOnHost {
 		hostMem = s.capacity.MemChargeFor(memMiBDelta)
@@ -207,25 +229,17 @@ func (s *Server) admitResources(ctx context.Context, host, project string, cpuDe
 		release()
 		return noopReleaseCommitted, err
 	}
-	return func(committed bool) { qRelease(committed); release() }, nil
+	return func(f CommitFact) { qRelease(f); release() }, nil
 }
 
-// projectUsageForAdmission returns the project's currently-OBSERVED vCPU/memory
-// usage on this node, and whether the project is bounded at all. bounded=false means
-// no quota row: nothing to enforce, so nothing to serialize.
-func (s *Server) projectUsageForAdmission(ctx context.Context, project string) (usedCPU, usedMem int, bounded bool, err error) {
+// projectIsBounded reports whether the project has a quota row at all.
+// false means unbounded: nothing to enforce, so nothing to serialize.
+func (s *Server) projectIsBounded(ctx context.Context, project string) (bool, error) {
 	q, err := corrosion.GetProjectQuota(ctx, s.db, project)
 	if err != nil {
-		return 0, 0, false, status.Errorf(codes.Internal, "get project quota: %v", err)
+		return false, status.Errorf(codes.Internal, "get project quota: %v", err)
 	}
-	if q == nil {
-		return 0, 0, false, nil
-	}
-	u, err := corrosion.SumProjectUsage(ctx, s.db, project)
-	if err != nil {
-		return 0, 0, false, status.Errorf(codes.Internal, "sum project usage: %v", err)
-	}
-	return u.VCPUUsed, u.MemMiBUsed, true, nil
+	return q != nil, nil
 }
 
 func maxInt(a, b int) int {
@@ -341,15 +355,4 @@ func (s *Server) checkProjectQuotaWithPending(ctx context.Context, project strin
 			project, u.MemMiBUsed, rMem, pendingMem, memMiBDelta, q.MemMiBLimit)
 	}
 	return nil
-}
-
-// resolveProjectAuthority reports who serializes this project's quota admission.
-//
-// Read-only: it NEVER writes an initial authority row. See
-// corrosion.ResolveProjectAuthority for why minting one cannot be made safe — the
-// deterministic candidate is computed from the asynchronously-replicated host set,
-// so two nodes with different views both mint epoch 1, and the PK collision becomes
-// a permanent immutable_conflict with two holders.
-func (s *Server) resolveProjectAuthority(ctx context.Context, project string) (corrosion.ProjectAuthority, bool, error) {
-	return corrosion.ResolveProjectAuthority(ctx, s.db, project)
 }

@@ -67,6 +67,9 @@ func validateSpecNames(spec *pb.VMSpec) error {
 }
 
 func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *pb.VM, retErr error) {
+	// vmCommitted is flipped at the durable VM write and read by the deferred
+	// quota release. See the release site for why retErr is the wrong signal.
+	vmCommitted := false
 	spec := req.Spec
 	if spec == nil {
 		return nil, status.Error(codes.InvalidArgument, "spec required")
@@ -261,17 +264,37 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
 		// Bypassing the CHECK does not mean hiding the DRAW: reserve anyway so the
-		// next concurrent (non-overcommit) admission sees this VM's memory. (Quota
-		// was already admitted above — this branch only skips the HOST check.)
+		// next concurrent (non-overcommit) admission sees this VM's memory.
 		defer s.reserveHostCapacity(targetHost, int(spec.Cpu), s.capacity.MemChargeFor(int(spec.MemoryMib)))()
+		// --allow-overcommit bypasses HOST capacity only. Project quota is a tenancy
+		// limit, not a physical judgment call, so it must go through the SERIALIZED
+		// admission like any other create. The earlier tenancy.Admit is an
+		// unserialized fail-fast: relying on it here let concurrent overcommit
+		// creates all observe the same quota headroom and all pass.
+		qRelease, qErr := s.admitProjectQuota(ctx, project, int(spec.Cpu), int(spec.MemoryMib))
+		defer func() {
+			qRelease(CommitFact{
+				Committed: vmCommitted, Workload: spec.Name,
+				CPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib),
+			})
+		}()
+		if qErr != nil {
+			return nil, qErr
+		}
 	} else {
 		// newVMOnHost: this VM is appearing on the target, so it must also be
 		// charged its own qemu overhead against HOST capacity (not against quota).
 		release, err := s.admitResources(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib), true)
-		// retErr == nil means the VM row was written. The project's quota authority
-		// may be a THIRD node that has not replicated that row yet, so it has to keep
-		// the charge until it can see it — see admitResources.
-		defer func() { release(retErr == nil) }()
+		// vmCommitted is set at the DURABLE WRITE below, not from retErr. The RPC can
+		// fail after the row exists (a cancelled context, a read failure while
+		// building the response), and reporting that as "not committed" would free the
+		// authority's charge while the VM is running on the target.
+		defer func() {
+			release(CommitFact{
+				Committed: vmCommitted, Workload: spec.Name,
+				CPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib),
+			})
+		}()
 		if err != nil {
 			return nil, err
 		}
@@ -812,6 +835,11 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
+	} else {
+		// The durable write landed: from here the VM counts against project quota
+		// even if this RPC later fails, so the authority must keep its charge until
+		// it can see this row.
+		vmCommitted = true
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)
@@ -2739,6 +2767,9 @@ func (s *Server) liveGrowVCPU(ctx context.Context, req *pb.UpdateVMRequest) (*pb
 }
 
 func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *pb.VM, retErr error) {
+	// specCommitted is flipped at the durable desired-spec write and read by the
+	// deferred quota release (retErr is the wrong signal — see CreateVM).
+	specCommitted := false
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -2873,9 +2904,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 				if err := s.requireOvercommit(ctx, vmRBACPath(fresh)); err != nil {
 					return nil, err
 				}
-				// Only the HOST check is bypassed; quota is a tenancy limit.
-				if err := s.checkProjectQuota(ctx, fresh.Project, cpuGrow, memGrow); err != nil {
-					return nil, err
+				// Only the HOST check is bypassed; quota is a tenancy limit — and it
+				// must be the SERIALIZED admission, not the unserialized local check,
+				// or concurrent overcommit grows all see the same headroom.
+				qRelease, qErr := s.admitProjectQuota(ctx, fresh.Project, cpuGrow, memGrow)
+				defer func() {
+					qRelease(CommitFact{
+						Committed: specCommitted, Workload: req.Name,
+						CPU: int(wantCPU), MemMiB: int(wantMem),
+					})
+				}()
+				if qErr != nil {
+					return nil, qErr
 				}
 				if cpuGrow > 0 || memGrow > 0 {
 					s.audit(ctx, "vm.update", req.Name,
@@ -2889,7 +2929,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 				// newVMOnHost=false: the VM is running and already counted, overhead
 				// included, so the delta must not be charged another one.
 				release, aerr := s.admitResources(ctx, fresh.HostName, fresh.Project, cpuGrow, memGrow, false)
-				defer func() { release(retErr == nil) }()
+				defer func() {
+					release(CommitFact{
+						Committed: specCommitted, Workload: req.Name,
+						CPU: int(wantCPU), MemMiB: int(wantMem),
+					})
+				}()
 				if aerr != nil {
 					return nil, aerr
 				}
@@ -3190,6 +3235,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
 		return string(specJSON), nil
 	})
+	if err == nil && applied {
+		// The new size is durable: it counts against quota from here even if this
+		// RPC later fails, so the authority keeps its charge until it sees it.
+		specCommitted = true
+	}
 	if err != nil || !applied {
 		if oldXML != "" {
 			_ = s.virt.UndefineDomainPreservingState(req.Name)

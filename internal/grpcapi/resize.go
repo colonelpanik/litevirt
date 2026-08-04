@@ -121,7 +121,16 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	// already subtracted from free capacity. Charging another would refuse a legal
 	// grow, and refuse it again on every subsequent resize.
 	release, aerr := s.admitResources(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta), false)
-	defer func() { release(retErr == nil) }()
+	// specCommitted is set at the durable desired-spec write (either path below), not
+	// from retErr: the RPC can fail after the spec is persisted, and calling that
+	// "not committed" would free the authority's charge while the larger size is real.
+	specCommitted := false
+	defer func() {
+		release(CommitFact{
+			Committed: specCommitted, Workload: name,
+			CPU: int(wantCPU), MemMiB: int(wantMem),
+		})
+	}()
 	if aerr != nil {
 		return aerr
 	}
@@ -142,7 +151,7 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	}
 
 	if s.operationProtocolActive(ctx) {
-		return s.resizeVMLiveCoordinated(ctx, vm, stored, target, obsCPU, obsMem, idemKey)
+		return s.resizeVMLiveCoordinated(ctx, vm, stored, target, obsCPU, obsMem, idemKey, &specCommitted)
 	}
 
 	// Pre-latch direct path: apply persistent-then-live (per the fixed primitives),
@@ -151,7 +160,9 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	if err := s.applyLiveResize(ctx, name, target, stored); err != nil {
 		return status.Errorf(codes.Internal, "live resize: %v", err)
 	}
-	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
+	var applied bool
+	var newGen int64
+	applied, newGen, err = corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
 		fresh := &pb.VMSpec{}
 		if old != "" {
 			if uerr := json.Unmarshal([]byte(old), fresh); uerr != nil {
@@ -169,6 +180,7 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	if !applied {
 		return status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress", name)
 	}
+	specCommitted = true // the new size is durable from here
 	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, name, obsCPU, obsMem, vm.OwnerEpoch, newGen); err != nil {
 		slog.Error("resizeVMLive: persisting actuals failed — accounting will lag until reconciled", "vm", name, "error", err)
 	}
@@ -181,7 +193,7 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 // BeginVMOperation atomically commits the full desired spec (cpu+mem), bumps the
 // generation, and claims the mutation barrier; the apply then runs under the F1
 // durability discipline. Caller holds the VM lock.
-func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRecord, stored, target *pb.VMSpec, obsCPU, obsMem int, idemKey string) error {
+func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRecord, stored, target *pb.VMSpec, obsCPU, obsMem int, idemKey string, specCommitted *bool) error {
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
 	// (No authority "establishment" here. The initial authority is DERIVED, never
 	// written — see corrosion.ResolveProjectAuthority. This call used to mint epoch 1
@@ -221,6 +233,11 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 		ReservationJSON: resJSON,
 	}
 	applied, err := s.db.BeginVMOperation(ctx, op, string(targetJSON), vm.OwnerEpoch, vm.SpecGeneration)
+	if err == nil && applied && specCommitted != nil {
+		// BeginVMOperation atomically committed the desired spec, so the new size is
+		// durable and counts against quota even if the apply below fails.
+		*specCommitted = true
+	}
 	if err != nil {
 		if errors.Is(err, corrosion.ErrOperationHashConflict) {
 			return status.Errorf(codes.AlreadyExists, "idempotency key reused with a different resize for %q", vm.Name)

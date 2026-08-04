@@ -2407,8 +2407,11 @@ message AdmitProjectQuotaResponse {
     bool admitted = 1;
     string reservation_id = 2;    // pass to ReleaseProjectQuotaReservation when done
     string detail = 3;            // why not admitted, for the caller's error
-    // On an epoch mismatch the holder reports the authority it sees, so a stale
-    // router re-resolves once instead of retrying blindly.
+    // redirect=true means "I am not the authority; current_holder is". It travels on
+    // a SUCCESSFUL response, never alongside an error — gRPC drops the message when
+    // an error is set, which would leave the caller unable to follow the redirect and
+    // re-resolving from the same stale view that misrouted it.
+    bool redirect = 6;
     string current_holder = 4;
     int64 current_epoch = 5;
 }
@@ -2421,4 +2424,11 @@ message ReleaseProjectQuotaReservationRequest {
     // delivery the holder would otherwise see neither the reservation nor the usage
     // and hand the same quota to a concurrent request.
     bool committed = 3;
+    // Identity of the committed workload and its post-commit counted size. The
+    // holder retires the charge only when its OWN replica shows THIS workload at (or
+    // above) that size — aggregate usage growth is not a sound signal, since any
+    // unrelated increase would clear the charge early.
+    string workload = 4;
+    int32 committed_cpu = 5;
+    int32 committed_mem_mib = 6;
 }

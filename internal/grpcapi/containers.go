@@ -52,6 +52,8 @@ func (s *Server) containerProject(ctx context.Context, host, name string) string
 }
 
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
+	// ctCommitted is flipped at the durable container write; see the release site.
+	ctCommitted := false
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
@@ -152,7 +154,15 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		// video, page tables) and containers are accounted through their own
 		// per-host memory sum, so a container never pays a qemu overhead.
 		release, err := s.admitResources(ctx, s.hostName, req.Project, 0, int(req.MemoryMib), false)
-		defer func() { release(retErr == nil) }()
+		// ctCommitted is set at CreateContainerAtomic below, not from retErr: the RPC
+		// can fail after the row exists, and calling that "not committed" would free
+		// the authority's charge while the container is real.
+		defer func() {
+			release(CommitFact{
+				Committed: ctCommitted, Workload: req.Name,
+				CPU: int(req.Cpu), MemMiB: int(req.MemoryMib),
+			})
+		}()
 		if err != nil {
 			return nil, err
 		}
@@ -211,6 +221,10 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
+	// The durable write landed: the container counts against project quota from here
+	// even if this RPC later fails, so the authority keeps its charge until it can
+	// see the row.
+	ctCommitted = true
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
 	return toPbContainer(rec), nil

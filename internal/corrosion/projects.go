@@ -408,3 +408,45 @@ func CheckProjectQuota(ctx context.Context, c *Client, projectName string, req Q
 	}
 	return nil
 }
+
+// WorkloadQuotaContribution reports what a single named workload contributes to a
+// project's quota usage on THIS node's replica, and whether its row is visible here
+// at all.
+//
+// This is the observation primitive the quota authority needs: a charge held for a
+// committed-but-unreplicated workload may only be retired by seeing THAT workload.
+// Aggregate usage growth is not a sound substitute — any unrelated increase (a
+// workload that replicated late, or one admitted through a fail-open path) would
+// clear the charge early and let the next request over-admit.
+//
+// The accounting mirrors SumProjectUsage exactly, so "contributes at least what it
+// was admitted for" is comparable against the same numbers the quota check uses: VMs
+// count their spec cpu/memory_mib, containers their declared limits, and a
+// soft-deleted row counts as absent.
+func WorkloadQuotaContribution(ctx context.Context, c *Client, project, workload string) (cpu, memMiB int, found bool, err error) {
+	project = projectOrDefault(project)
+	rows, err := c.Query(ctx,
+		`SELECT COALESCE(json_extract(spec,'$.cpu'),0)        AS cpu,
+		        COALESCE(json_extract(spec,'$.memory_mib'),0) AS mem
+		 FROM vms WHERE name = ? AND project = ? AND deleted_at IS NULL`, workload, project)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(rows) > 0 {
+		return rows[0].Int("cpu"), rows[0].Int("mem"), true, nil
+	}
+	// Containers share the project's budget and are keyed (host, name); a name is
+	// unique per host, and any host's row proves the commit replicated here.
+	ctRows, err := c.Query(ctx,
+		`SELECT COALESCE(SUM(cpu_limit),0)  AS cpu,
+		        COALESCE(SUM(memory_mib),0) AS mem,
+		        COUNT(*)                    AS n
+		 FROM containers WHERE name = ? AND project = ? AND deleted_at IS NULL`, workload, project)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(ctRows) > 0 && ctRows[0].Int("n") > 0 {
+		return ctRows[0].Int("cpu"), ctRows[0].Int("mem"), true, nil
+	}
+	return 0, 0, false, nil
+}

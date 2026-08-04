@@ -22626,8 +22626,11 @@ type AdmitProjectQuotaResponse struct {
 	Admitted      bool                   `protobuf:"varint,1,opt,name=admitted,proto3" json:"admitted,omitempty"`
 	ReservationId string                 `protobuf:"bytes,2,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"` // pass to ReleaseProjectQuotaReservation when done
 	Detail        string                 `protobuf:"bytes,3,opt,name=detail,proto3" json:"detail,omitempty"`                                    // why not admitted, for the caller's error
-	// On an epoch mismatch the holder reports the authority it sees, so a stale
-	// router re-resolves once instead of retrying blindly.
+	// redirect=true means "I am not the authority; current_holder is". It travels on
+	// a SUCCESSFUL response, never alongside an error — gRPC drops the message when
+	// an error is set, which would leave the caller unable to follow the redirect and
+	// re-resolving from the same stale view that misrouted it.
+	Redirect      bool   `protobuf:"varint,6,opt,name=redirect,proto3" json:"redirect,omitempty"`
 	CurrentHolder string `protobuf:"bytes,4,opt,name=current_holder,json=currentHolder,proto3" json:"current_holder,omitempty"`
 	CurrentEpoch  int64  `protobuf:"varint,5,opt,name=current_epoch,json=currentEpoch,proto3" json:"current_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -22685,6 +22688,13 @@ func (x *AdmitProjectQuotaResponse) GetDetail() string {
 	return ""
 }
 
+func (x *AdmitProjectQuotaResponse) GetRedirect() bool {
+	if x != nil {
+		return x.Redirect
+	}
+	return false
+}
+
 func (x *AdmitProjectQuotaResponse) GetCurrentHolder() string {
 	if x != nil {
 		return x.CurrentHolder
@@ -22708,9 +22718,16 @@ type ReleaseProjectQuotaReservationRequest struct {
 	// the row was written by the target host, so between that write and CRDT
 	// delivery the holder would otherwise see neither the reservation nor the usage
 	// and hand the same quota to a concurrent request.
-	Committed     bool `protobuf:"varint,3,opt,name=committed,proto3" json:"committed,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Committed bool `protobuf:"varint,3,opt,name=committed,proto3" json:"committed,omitempty"`
+	// Identity of the committed workload and its post-commit counted size. The
+	// holder retires the charge only when its OWN replica shows THIS workload at (or
+	// above) that size — aggregate usage growth is not a sound signal, since any
+	// unrelated increase would clear the charge early.
+	Workload        string `protobuf:"bytes,4,opt,name=workload,proto3" json:"workload,omitempty"`
+	CommittedCpu    int32  `protobuf:"varint,5,opt,name=committed_cpu,json=committedCpu,proto3" json:"committed_cpu,omitempty"`
+	CommittedMemMib int32  `protobuf:"varint,6,opt,name=committed_mem_mib,json=committedMemMib,proto3" json:"committed_mem_mib,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ReleaseProjectQuotaReservationRequest) Reset() {
@@ -22762,6 +22779,27 @@ func (x *ReleaseProjectQuotaReservationRequest) GetCommitted() bool {
 		return x.Committed
 	}
 	return false
+}
+
+func (x *ReleaseProjectQuotaReservationRequest) GetWorkload() string {
+	if x != nil {
+		return x.Workload
+	}
+	return ""
+}
+
+func (x *ReleaseProjectQuotaReservationRequest) GetCommittedCpu() int32 {
+	if x != nil {
+		return x.CommittedCpu
+	}
+	return 0
+}
+
+func (x *ReleaseProjectQuotaReservationRequest) GetCommittedMemMib() int32 {
+	if x != nil {
+		return x.CommittedMemMib
+	}
+	return 0
 }
 
 var File_litevirt_v1_service_proto protoreflect.FileDescriptor
@@ -24511,17 +24549,21 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\aproject\x18\x02 \x01(\tR\aproject\x12\x1b\n" +
 	"\tcpu_delta\x18\x03 \x01(\x05R\bcpuDelta\x12\"\n" +
 	"\rmem_mib_delta\x18\x04 \x01(\x05R\vmemMibDelta\x12'\n" +
-	"\x0fauthority_epoch\x18\x05 \x01(\x03R\x0eauthorityEpoch\"\xc2\x01\n" +
+	"\x0fauthority_epoch\x18\x05 \x01(\x03R\x0eauthorityEpoch\"\xde\x01\n" +
 	"\x19AdmitProjectQuotaResponse\x12\x1a\n" +
 	"\badmitted\x18\x01 \x01(\bR\badmitted\x12%\n" +
 	"\x0ereservation_id\x18\x02 \x01(\tR\rreservationId\x12\x16\n" +
-	"\x06detail\x18\x03 \x01(\tR\x06detail\x12%\n" +
+	"\x06detail\x18\x03 \x01(\tR\x06detail\x12\x1a\n" +
+	"\bredirect\x18\x06 \x01(\bR\bredirect\x12%\n" +
 	"\x0ecurrent_holder\x18\x04 \x01(\tR\rcurrentHolder\x12#\n" +
-	"\rcurrent_epoch\x18\x05 \x01(\x03R\fcurrentEpoch\"\x84\x01\n" +
+	"\rcurrent_epoch\x18\x05 \x01(\x03R\fcurrentEpoch\"\xf1\x01\n" +
 	"%ReleaseProjectQuotaReservationRequest\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12%\n" +
 	"\x0ereservation_id\x18\x02 \x01(\tR\rreservationId\x12\x1c\n" +
-	"\tcommitted\x18\x03 \x01(\bR\tcommitted*V\n" +
+	"\tcommitted\x18\x03 \x01(\bR\tcommitted\x12\x1a\n" +
+	"\bworkload\x18\x04 \x01(\tR\bworkload\x12#\n" +
+	"\rcommitted_cpu\x18\x05 \x01(\x05R\fcommittedCpu\x12*\n" +
+	"\x11committed_mem_mib\x18\x06 \x01(\x05R\x0fcommittedMemMib*V\n" +
 	"\x0eRelayVIPResult\x12\x15\n" +
 	"\x11RELAY_VIP_UNKNOWN\x10\x00\x12\x14\n" +
 	"\x10RELAY_VIP_CLAIMS\x10\x01\x12\x17\n" +

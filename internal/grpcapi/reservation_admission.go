@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -10,6 +11,33 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// quotaSubject is the workload a project-quota admission is FOR: its identity
+// (kind, host, name) and the ABSOLUTE size the admission grows it to. The settle
+// rule retires a released lease only when this workload contributes at least the
+// want — see corrosion.WorkloadQuotaContribution for why identity and size, not
+// presence or aggregate growth, are the sound retire signals. A zero subject means
+// the admission carries no retire-by-observation hint and settles on presence of
+// its resource_id (correct for host-only reservations).
+type quotaSubject struct {
+	Kind, Host, Name    string
+	WantCPU, WantMemMiB int
+}
+
+// subjectForCreate derives the subject from a create's "vm:<name>" / "ct:<name>"
+// resource id. A create's absolute size IS its delta: the workload does not exist
+// yet, so what it will contribute equals what is being admitted.
+func subjectForCreate(resourceID, host string, cpuDelta, memDelta int) quotaSubject {
+	kindTag, name, ok := strings.Cut(resourceID, ":")
+	if !ok || name == "" {
+		return quotaSubject{}
+	}
+	kind := corrosion.WorkloadVM
+	if kindTag == "ct" {
+		kind = corrosion.WorkloadContainer
+	}
+	return quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: cpuDelta, WantMemMiB: memDelta}
+}
 
 // Reserve-then-verify admission (F2).
 //
@@ -115,7 +143,23 @@ func (l *reservationLease) release(ctx context.Context) {
 func (s *Server) admitWithReservation(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, newVMOnHost bool,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, "", method, host, project, resourceID, cpuDelta, memDelta, true, newVMOnHost)
+	return s.admitReserved(ctx, "", method, host, project, resourceID,
+		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, newVMOnHost)
+}
+
+// admitGrowWithReservation is admitWithReservation for a GROW of an existing
+// workload, which must carry the absolute target size: the workload's row is
+// already visible at its old size, so without the want the released lease would
+// settle instantly while usage still counted the smaller spec.
+func (s *Server) admitGrowWithReservation(
+	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int,
+) (*reservationLease, error) {
+	tag := "vm"
+	if kind == corrosion.WorkloadContainer {
+		tag = "ct"
+	}
+	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
+	return s.admitReserved(ctx, "", method, host, project, tag+":"+name, subject, cpuDelta, memDelta, true, false)
 }
 
 // admitWithReservationID is admitWithReservation with an explicit operation ID.
@@ -126,7 +170,8 @@ func (s *Server) admitWithReservation(
 func (s *Server) admitWithReservationID(
 	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, newVMOnHost bool,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, opID, method, host, project, resourceID, cpuDelta, memDelta, true, newVMOnHost)
+	return s.admitReserved(ctx, opID, method, host, project, resourceID,
+		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, newVMOnHost)
 }
 
 // admitHostWithReservation is admitWithReservation for paths that must NOT charge
@@ -136,7 +181,7 @@ func (s *Server) admitWithReservationID(
 func (s *Server) admitHostWithReservation(
 	ctx context.Context, method, host, project string, cpuDelta, memDelta int, newVMOnHost bool,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, "", method, host, project, "", cpuDelta, memDelta, false, newVMOnHost)
+	return s.admitReserved(ctx, "", method, host, project, "", quotaSubject{}, cpuDelta, memDelta, false, newVMOnHost)
 }
 
 // reserveWithoutCheck publishes a HOST reservation without verifying it fits —
@@ -191,7 +236,7 @@ func (s *Server) reserveWithoutCheck(
 }
 
 func (s *Server) admitReserved(
-	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, withQuota, newVMOnHost bool,
+	ctx context.Context, opID, method, host, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int, withQuota, newVMOnHost bool,
 ) (*reservationLease, error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
@@ -221,6 +266,8 @@ func (s *Server) admitReserved(
 		// so publishing a project reservation too would make concurrent starts
 		// appear to double-consume a quota neither of them is growing.
 		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
+		rv.Workload, rv.WorkloadKind, rv.WorkloadHost = subject.Name, subject.Kind, subject.Host
+		rv.WantCPU, rv.WantMemMiB = subject.WantCPU, subject.WantMemMiB
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -269,7 +316,7 @@ func (s *Server) admitReserved(
 		}
 		// Host capacity is settled first because it is the cheap, local half: an
 		// admission that cannot fit the host never needs to bother the holder.
-		holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, project, resourceID, cpuDelta, memDelta)
+		holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, cpuDelta, memDelta)
 		if qerr != nil {
 			lease.release(ctx)
 			return nil, qerr

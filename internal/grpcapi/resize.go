@@ -187,7 +187,8 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	opID := corrosion.DeterministicOperationID("ResizeVMLive", principal, vm.Project, vm.Name, idemKey)
 
 	lease, aerr := s.admitResizeReservation(
-		ctx, opID, "ResizeVMLive", principal, vm, cpuDelta, memDelta)
+		ctx, opID, "ResizeVMLive", principal, vm, cpuDelta, memDelta,
+		int(target.Cpu), int(target.MemoryMib))
 	if aerr != nil {
 		return aerr
 	}
@@ -241,19 +242,29 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 // persistence record and drives recovery. Marking the operation as a transient
 // CAPACITY lease would let stale-lease expiry free real in-flight reservations.
 func (s *Server) admitResizeReservation(
-	ctx context.Context, opID, method, principal string, vm *corrosion.VMRecord, cpuDelta, memDelta int,
+	ctx context.Context, opID, method, principal string, vm *corrosion.VMRecord, cpuDelta, memDelta, wantCPU, wantMem int,
 ) (*reservationLease, error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
 	}
 
 	delegated := s.projectAuthorityActive(ctx)
+	// The subject carries the ABSOLUTE resize target: the VM's row is already
+	// visible at its old size, so a released lease may only settle once the row
+	// contributes the grown size — presence alone would free it instantly while
+	// the holder's usage still counted the smaller spec.
+	subject := quotaSubject{
+		Kind: corrosion.WorkloadVM, Host: vm.HostName, Name: vm.Name,
+		WantCPU: wantCPU, WantMemMiB: wantMem,
+	}
 	rv := corrosion.ReservationVector{
 		Project:    vm.Project,
 		TargetHost: vm.HostName, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
 	}
 	if !delegated {
 		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
+		rv.Workload, rv.WorkloadKind, rv.WorkloadHost = subject.Name, subject.Kind, subject.Host
+		rv.WantCPU, rv.WantMemMiB = subject.WantCPU, subject.WantMemMiB
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -292,7 +303,7 @@ func (s *Server) admitResizeReservation(
 		return lease, nil
 	}
 
-	holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, vm.Project, vm.Name, cpuDelta, memDelta)
+	holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, vm.Project, "vm:"+vm.Name, subject, cpuDelta, memDelta)
 	if qerr != nil {
 		lease.release(ctx)
 		return nil, qerr

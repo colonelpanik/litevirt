@@ -23984,7 +23984,17 @@ type ReserveProjectCapacityRequest struct {
 	// holder keeps a RELEASED lease counted until this resource is visible in its
 	// own replica — the winner commits on its own node, so without that the holder
 	// under-counts until replication catches up and hands the same quota out twice.
-	ResourceId    string `protobuf:"bytes,7,opt,name=resource_id,json=resourceId,proto3" json:"resource_id,omitempty"`
+	ResourceId string `protobuf:"bytes,7,opt,name=resource_id,json=resourceId,proto3" json:"resource_id,omitempty"`
+	// workload_host completes the identity: container names are unique only per
+	// HOST, so without it a same-named container elsewhere could retire a charge
+	// that is still owed. Ignored for VMs (cluster-unique names).
+	WorkloadHost string `protobuf:"bytes,8,opt,name=workload_host,json=workloadHost,proto3" json:"workload_host,omitempty"`
+	// The ABSOLUTE post-commit counted size, not the delta. A grow's row is
+	// already visible at its old size, so the holder retires the released lease
+	// only once the workload CONTRIBUTES this much — presence alone would free
+	// the lease instantly while usage still counted the smaller spec.
+	WantCpu       int32 `protobuf:"varint,9,opt,name=want_cpu,json=wantCpu,proto3" json:"want_cpu,omitempty"`
+	WantMemMib    int32 `protobuf:"varint,10,opt,name=want_mem_mib,json=wantMemMib,proto3" json:"want_mem_mib,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24066,6 +24076,27 @@ func (x *ReserveProjectCapacityRequest) GetResourceId() string {
 		return x.ResourceId
 	}
 	return ""
+}
+
+func (x *ReserveProjectCapacityRequest) GetWorkloadHost() string {
+	if x != nil {
+		return x.WorkloadHost
+	}
+	return ""
+}
+
+func (x *ReserveProjectCapacityRequest) GetWantCpu() int32 {
+	if x != nil {
+		return x.WantCpu
+	}
+	return 0
+}
+
+func (x *ReserveProjectCapacityRequest) GetWantMemMib() int32 {
+	if x != nil {
+		return x.WantMemMib
+	}
+	return 0
 }
 
 type ReserveProjectCapacityResponse struct {
@@ -26028,7 +26059,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fpublic_ips_used\x18\a \x01(\x05R\rpublicIpsUsed\x12&\n" +
 	"\x0fbackup_gib_used\x18\b \x01(\x05R\rbackupGibUsed\";\n" +
 	"\x16GetProjectUsageRequest\x12!\n" +
-	"\fproject_name\x18\x01 \x01(\tR\vprojectName\"\xfa\x01\n" +
+	"\fproject_name\x18\x01 \x01(\tR\vprojectName\"\xdc\x02\n" +
 	"\x1dReserveProjectCapacityRequest\x12\x18\n" +
 	"\aproject\x18\x01 \x01(\tR\aproject\x12\x16\n" +
 	"\x06method\x18\x02 \x01(\tR\x06method\x12\x1b\n" +
@@ -26037,7 +26068,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fauthority_epoch\x18\x05 \x01(\x03R\x0eauthorityEpoch\x12\x1c\n" +
 	"\tprincipal\x18\x06 \x01(\tR\tprincipal\x12\x1f\n" +
 	"\vresource_id\x18\a \x01(\tR\n" +
-	"resourceId\"d\n" +
+	"resourceId\x12#\n" +
+	"\rworkload_host\x18\b \x01(\tR\fworkloadHost\x12\x19\n" +
+	"\bwant_cpu\x18\t \x01(\x05R\awantCpu\x12 \n" +
+	"\fwant_mem_mib\x18\n" +
+	" \x01(\x05R\n" +
+	"wantMemMib\"d\n" +
 	"\x1eReserveProjectCapacityResponse\x12\x19\n" +
 	"\blease_id\x18\x01 \x01(\tR\aleaseId\x12'\n" +
 	"\x0fauthority_epoch\x18\x02 \x01(\x03R\x0eauthorityEpoch\"T\n" +

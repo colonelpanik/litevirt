@@ -2725,6 +2725,16 @@ message ReserveProjectCapacityRequest {
     // own replica — the winner commits on its own node, so without that the holder
     // under-counts until replication catches up and hands the same quota out twice.
     string resource_id     = 7;
+    // workload_host completes the identity: container names are unique only per
+    // HOST, so without it a same-named container elsewhere could retire a charge
+    // that is still owed. Ignored for VMs (cluster-unique names).
+    string workload_host   = 8;
+    // The ABSOLUTE post-commit counted size, not the delta. A grow's row is
+    // already visible at its old size, so the holder retires the released lease
+    // only once the workload CONTRIBUTES this much — presence alone would free
+    // the lease instantly while usage still counted the smaller spec.
+    int32  want_cpu        = 9;
+    int32  want_mem_mib    = 10;
 }
 message ReserveProjectCapacityResponse {
     string lease_id        = 1;  // holder-local operation id, passed back to release

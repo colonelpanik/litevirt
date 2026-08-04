@@ -176,3 +176,78 @@ func TestAdmitHostWithReservation_DoesNotChargeProjectQuota(t *testing.T) {
 			afterCPU, afterMem, beforeCPU, beforeMem)
 	}
 }
+
+// readReservationVector decodes the reservation an operation row is holding.
+func readReservationVector(t *testing.T, s *Server, opID string) corrosion.ReservationVector {
+	t.Helper()
+	rows, err := s.db.Query(context.Background(),
+		`SELECT reservation_json FROM operations WHERE id = ?`, opID)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("read operation %s: err=%v rows=%d", opID, err, len(rows))
+	}
+	rv, err := corrosion.DecodeReservation(rows[0].String("reservation_json"))
+	if err != nil {
+		t.Fatalf("decode reservation: %v", err)
+	}
+	return rv
+}
+
+// TestAdmitGrowWithReservation_RecordsIdentityAndAbsoluteTarget: a grow's
+// reservation must name the workload it grows and the ABSOLUTE size it grows it
+// to. Without those the settle rule sees the (already-present) row and frees the
+// lease instantly, while the quota check still counts the old size — the
+// under-count that let concurrent resizes over-admit.
+func TestAdmitGrowWithReservation_RecordsIdentityAndAbsoluteTarget(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+
+	lease, err := s.admitGrowWithReservation(context.Background(), "UpdateVM", "test-host", "proj",
+		corrosion.WorkloadVM, "vm-g", 2, 512, 6, 4608)
+	if err != nil {
+		t.Fatalf("admitGrowWithReservation: %v", err)
+	}
+	defer lease.release(context.Background())
+	if lease.id == "" {
+		t.Fatal("grow admission produced no reservation operation")
+	}
+
+	rv := readReservationVector(t, s, lease.id)
+	if rv.Workload != "vm-g" || rv.WorkloadKind != corrosion.WorkloadVM || rv.WorkloadHost != "test-host" {
+		t.Errorf("grow reservation identity = (%q,%q,%q), want (vm-g,%s,test-host)",
+			rv.Workload, rv.WorkloadKind, rv.WorkloadHost, corrosion.WorkloadVM)
+	}
+	if rv.WantCPU != 6 || rv.WantMemMiB != 4608 {
+		t.Errorf("grow reservation want = %d vCPU/%d MiB, want the ABSOLUTE target 6/4608 — "+
+			"the delta alone cannot tell the settle when the grow has landed", rv.WantCPU, rv.WantMemMiB)
+	}
+	if rv.ProjectCPU != 2 || rv.ProjectMemMiB != 512 {
+		t.Errorf("grow reservation charges %d vCPU/%d MiB, want the DELTA 2/512 — "+
+			"charging the absolute size would double-count the part already in usage", rv.ProjectCPU, rv.ProjectMemMiB)
+	}
+}
+
+// TestAdmitWithReservation_ACreateRecordsItsOwnSizeAsTheTarget: for a create the
+// workload does not exist yet, so its absolute target IS its delta, and the
+// identity must still be recorded — a created-but-unreplicated workload may only
+// retire its own charge.
+func TestAdmitWithReservation_ACreateRecordsItsOwnSizeAsTheTarget(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+
+	lease, err := s.admitWithReservation(context.Background(), "CreateContainer", "test-host", "proj",
+		"ct:web", 2, 1024, false)
+	if err != nil {
+		t.Fatalf("admitWithReservation: %v", err)
+	}
+	defer lease.release(context.Background())
+
+	rv := readReservationVector(t, s, lease.id)
+	if rv.Workload != "web" || rv.WorkloadKind != corrosion.WorkloadContainer || rv.WorkloadHost != "test-host" {
+		t.Errorf("create reservation identity = (%q,%q,%q), want (web,%s,test-host)",
+			rv.Workload, rv.WorkloadKind, rv.WorkloadHost, corrosion.WorkloadContainer)
+	}
+	if rv.WantCPU != 2 || rv.WantMemMiB != 1024 {
+		t.Errorf("create reservation want = %d/%d, want 2/1024 (a create's target is its own size)",
+			rv.WantCPU, rv.WantMemMiB)
+	}
+}

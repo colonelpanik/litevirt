@@ -2922,13 +2922,16 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// Reserved across the stop → redefine → start below, so a concurrent
 				// grow on this host can't claim the same headroom.
 				//
-				// No resource id: a GROW's row is already visible everywhere, so a
-				// visibility signal would free the delegated lease immediately while
-				// the holder's usage still reflects the OLD size — under-counting
-				// exactly the amount being added. A grow leans on the settle grace.
+				// The subject carries the ABSOLUTE target size: a grow's row is
+				// already visible everywhere at its OLD size, so a presence signal
+				// would free the delegated lease immediately while the holder's usage
+				// still reflected the smaller spec — under-counting exactly the
+				// amount being added. The lease now settles only once the grown size
+				// is what usage counts, instead of leaning on the settle grace.
 				// newVMOnHost=false: the VM is running and already counted, overhead
 				// included, so the delta must not be charged another one.
-				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow, false)
+				lease, aerr := s.admitGrowWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project,
+					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem))
 				if aerr != nil {
 					return nil, aerr
 				}

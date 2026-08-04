@@ -1995,6 +1995,14 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 		} else if retired > 0 {
 			slog.Info("retired authority held by deleted projects", "count", retired)
 		}
+		// Resolved health conditions past their 30-day retention. Tombstoned, not
+		// hard-deleted, so replicas that have not yet seen the resolution converge
+		// to the tombstone instead of resurrecting the row.
+		if removed, perr := corrosion.TombstoneResolvedHealthConditions(ctx, d.db, time.Now()); perr != nil {
+			slog.Warn("resolved health-condition retention", "error", perr)
+		} else if removed > 0 {
+			slog.Info("tombstoned resolved health conditions past retention", "count", removed)
+		}
 		// Orphaned admission leases (F2). A reserve-then-verify lease lives for one
 		// RPC, so anything this old is a crash between reserve and release — which
 		// the terminal reaper above can never collect, because an abandoned lease

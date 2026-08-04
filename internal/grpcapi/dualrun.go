@@ -14,7 +14,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
@@ -152,51 +151,34 @@ type finding struct {
 	target string
 }
 
-// dualRunState is the detector's per-leader debounce state, held across passes.
-type dualRunState struct {
-	seen      map[finding]int  // consecutive passes each current finding has been present
-	confirmed map[finding]bool // findings currently past the debounce threshold (paged)
-}
-
-func newDualRunState() *dualRunState {
-	return &dualRunState{seen: map[finding]int{}, confirmed: map[finding]bool{}}
-}
-
 // stepDownDualRun is called when this node is NOT the dual-run leader: it clears this
-// node's process gauges (so a former leader leaves no stale series) and returns fresh
-// debounce state (so a future leadership acquisition starts clean). Both gauges are
-// cleared UNCONDITIONALLY — the probe_failed gauge can be set by unsupported-only
-// (older-binary) peers that populate neither seen nor confirmed, so gating the clear on
-// those maps would strand a stale probe_failed series after a handoff. Reset on an
-// already-empty vector is a no-op.
-func (s *Server) stepDownDualRun() *dualRunState {
+// node's process gauges so a former leader leaves no stale series. The condition
+// LIFECYCLE needs nothing here — it lives in health_conditions rows, so the new
+// leader's first pass continues the counts exactly where this one left them.
+func (s *Server) stepDownDualRun() {
 	s.dualRunMetrics.SetDetected(nil)
 	s.dualRunMetrics.SetProbeFailed(nil)
-	return newDualRunState()
 }
 
 // RunDualRunDetector runs the leader-gated dual-run detector on a fixed interval. Only
 // the node holding the dual_run_detector lease does work; the rest hold no state and
 // keep their local gauges clear, so the fleet pages once (from the leader).
 //
-// Debounce state is per-leader and in-memory (not replicated), so a leadership handover
-// re-arms the debounce on the new leader: a still-active finding is re-paged once after
-// the new leader's own two-pass debounce, and the old leader emits no `.cleared` for it
-// (emitting a clear would falsely imply the condition resolved). This is an accepted
-// trade for an alert-only detector — the alternative (replicated debounce state) is not
-// worth the complexity. The per-peer timeout keeps a pass well under the lease TTL, so
-// leadership only moves on a genuine failover, not on a slow pass.
+// Lifecycle state is DURABLE (health_conditions rows), so a leadership handover
+// preserves observation counts and confirmed state: the new leader's first pass picks
+// up exactly where the old one stopped — no re-arm, no false `.cleared`, no re-page.
+// The per-peer timeout keeps a pass well under the lease TTL, so leadership only moves
+// on a genuine failover, not on a slow pass.
 func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
-	st := newDualRunState()
 	eval := func() {
 		if !s.acquireDualRunLease(ctx, interval) {
-			st = s.stepDownDualRun()
+			s.stepDownDualRun()
 			return
 		}
-		s.detectDualRunPass(ctx, st)
+		s.detectDualRunPass(ctx)
 	}
 	eval()
 	t := time.NewTicker(interval)
@@ -240,7 +222,7 @@ func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration
 // detectDualRunPass runs one detector pass: gather runtime across workload-capable hosts,
 // cross-reference against the DB, debounce, and emit metrics + set-transition
 // notifications. It NEVER destroys or reconciles anything — alert-only.
-func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
+func (s *Server) detectDualRunPass(ctx context.Context) {
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil {
 		slog.Warn("dual-run detector: list hosts", "error", err)
@@ -285,10 +267,12 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 
 	current := map[finding]bool{}
 	details := map[finding]string{}
-	add := func(kind, target, detail string) {
+	evidenceHosts := map[finding][]string{}
+	add := func(kind, target, detail string, hosts ...string) {
 		f := finding{kind: kind, target: target}
 		current[f] = true
 		details[f] = detail
+		evidenceHosts[f] = hosts
 	}
 
 	// 1. Same VM an ACTIVE DISK-HOLDER on >1 host. This does NOT exempt DB "migrating"
@@ -301,7 +285,7 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 		if len(hs) > 1 {
 			add(kindDualRunVM, vm, fmt.Sprintf(
 				"VM %q is an active disk-holder on %d hosts (%s) — possible split-brain; the disk can corrupt if both write.",
-				vm, len(hs), strings.Join(hs, ", ")))
+				vm, len(hs), strings.Join(hs, ", ")), hs...)
 		}
 	}
 	// 2. Same container running on >1 host. Same reasoning as VMs: a cold CT migration
@@ -311,7 +295,7 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 		if len(hs) > 1 {
 			add(kindDualRunCT, ct, fmt.Sprintf(
 				"container %q is running on %d hosts (%s) — possible split-brain.",
-				ct, len(hs), strings.Join(hs, ", ")))
+				ct, len(hs), strings.Join(hs, ", ")), hs...)
 		}
 	}
 	// 3. Same VIP kernel-assigned on >1 host.
@@ -319,7 +303,7 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 		if len(hs) > 1 {
 			add(kindDualRunVIP, vip, fmt.Sprintf(
 				"VIP %s is kernel-assigned on %d hosts (%s) — dual VIP holder; traffic will split.",
-				vip, len(hs), strings.Join(hs, ", ")))
+				vip, len(hs), strings.Join(hs, ", ")), hs...)
 		}
 	}
 	// 4. DB owner != the sole runtime holder (VM-only), COVERAGE-GATED: flag ONLY when the
@@ -341,12 +325,12 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 		}
 		add(kindOwnerMismatch, vm, fmt.Sprintf(
 			"VM %q DB owner is %q but the sole runtime holder is %q — ownership drift; the DB and runtime disagree.",
-			vm, owner, hs[0]))
+			vm, owner, hs[0]), owner, hs[0])
 	}
 	// 5. Any host tracking unresolved LWW ties.
 	for h, n := range tieHosts {
 		add(kindLWWUnresolved, h, fmt.Sprintf(
-			"host %q reports %d unresolved LWW tie(s) — an equal-timestamp merge conflict was not resolved.", h, n))
+			"host %q reports %d unresolved LWW tie(s) — an equal-timestamp merge conflict was not resolved.", h, n), h)
 	}
 	// 6. Coverage: a host whose runtime the leader could not fully establish this pass —
 	//    either UNREACHABLE (no data) or PARTIAL (a local probe errored, so its absence is
@@ -355,78 +339,27 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 	//    during a rolling upgrade; it still shows in the probe_failed gauge below.
 	for _, h := range unreachable {
 		add(kindDualRunCoverage, h, fmt.Sprintf(
-			"host %q could not be probed this pass — dual-run coverage gap; a segmented or down host cannot be checked for split-brain.", h))
+			"host %q could not be probed this pass — dual-run coverage gap; a segmented or down host cannot be checked for split-brain.", h), h)
 	}
 	for _, h := range partialHosts {
 		add(kindDualRunCoverage, h, fmt.Sprintf(
-			"host %q returned a PARTIAL runtime (a local libvirt/container/ip probe errored) — its workload absence is unreliable, so split-brain cannot be ruled out there.", h))
+			"host %q returned a PARTIAL runtime (a local libvirt/container/ip probe errored) — its workload absence is unreliable, so split-brain cannot be ruled out there.", h), h)
 	}
 
 	// The probe_failed gauge shows every host we could not fully gather from — unreachable,
 	// partial, OR on an older binary — so the gap is visible immediately even though only
 	// unreachable/partial hosts page.
 	probeFailed := append(append(append([]string(nil), unreachable...), unsupported...), partialHosts...)
-	s.applyDualRunDebounce(ctx, st, current, details, probeFailed)
-}
 
-// applyDualRunDebounce advances the debounce counters, emits set-transition
-// notifications + events for findings crossing (or leaving) the confirmed threshold, and
-// rebuilds both gauges. The probe-failed gauge reflects the CURRENT pass immediately (a
-// coverage gap must be visible at once); the detected gauge reflects only DEBOUNCED
-// findings (a real dual-run persists).
-func (s *Server) applyDualRunDebounce(ctx context.Context, st *dualRunState, current map[finding]bool, details map[finding]string, probeFailed []string) {
-	// Advance counters: present this pass -> prevCount+1; absent -> dropped (resets to 0).
-	seen := make(map[finding]int, len(current))
-	for f := range current {
-		seen[f] = st.seen[f] + 1
+	// Coverage this pass: COMPLETE only when every probe target answered fully.
+	// Unsupported (older-binary) peers block resolution too — a peer that cannot
+	// report its runtime cannot prove a workload is absent from it.
+	coverageComplete := len(unreachable) == 0 && len(partialHosts) == 0 && len(unsupported) == 0
+	coverageDetail := ""
+	if !coverageComplete {
+		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v", unreachable, partialHosts, unsupported)
 	}
-	st.seen = seen
-
-	confirmedNow := map[finding]bool{}
-	for f, n := range seen {
-		if n >= dualRunDebounce {
-			confirmedNow[f] = true
-		}
-	}
-	// Set transitions (newly confirmed) — page + event.
-	for f := range confirmedNow {
-		if !st.confirmed[f] {
-			s.publish("ha.dualrun", f.kind+":"+f.target, details[f])
-			s.notify(ctx, notify.Notification{
-				Kind:     f.kind,
-				Severity: dualRunSeverity(f.kind),
-				Subject:  f.target,
-				Detail:   details[f],
-			})
-			slog.Warn("dual-run detector: finding confirmed", "kind", f.kind, "target", f.target, "detail", details[f])
-		}
-	}
-	// Clear transitions (was confirmed, no longer) — recovery event.
-	for f := range st.confirmed {
-		if !confirmedNow[f] {
-			s.publish("ha.dualrun.cleared", f.kind+":"+f.target, "")
-		}
-	}
-	st.confirmed = confirmedNow
-
-	// Rebuild gauges. detected = confirmed dual-run conditions (coverage has its own gauge).
-	// probe_failed = the current unprobed set (immediate, not debounced).
-	s.dualRunMetrics.SetDetected(detectedLabels(confirmedNow))
-	sort.Strings(probeFailed)
-	s.dualRunMetrics.SetProbeFailed(probeFailed)
-}
-
-// detectedLabels maps the confirmed findings to the litevirt_dual_run_detected gauge
-// labels, EXCLUDING coverage findings (those have their own probe_failed gauge).
-func detectedLabels(confirmed map[finding]bool) []metrics.DualRunLabel {
-	var labels []metrics.DualRunLabel
-	for f := range confirmed {
-		if f.kind == kindDualRunCoverage {
-			continue
-		}
-		labels = append(labels, metrics.DualRunLabel{Kind: dualRunKindLabel(f.kind), Target: f.target})
-	}
-	return labels
+	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, coverageComplete, coverageDetail, probeFailed)
 }
 
 // dbVMIndex returns per-VM DB state and owner (host_name) maps for all non-deleted VMs.

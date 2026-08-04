@@ -409,3 +409,78 @@ func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, cp
 	}
 	return nil
 }
+
+// admitQuotaWithReservation admits a grow against PROJECT QUOTA ONLY — no host
+// figures. Three callers need exactly this shape:
+//
+//   - container creates: host capacity charges memory only (cpu_limit is cgroup
+//     shares, not a vCPU reservation), but quota charges BOTH — SumProjectUsage
+//     counts a container's cpu_limit against the project vCPU budget, so admission
+//     must too or the limit is unenforceable;
+//   - --allow-overcommit: the operator is bypassing a PHYSICAL judgment, not a
+//     tenancy limit, so quota still goes through serialized admission — the
+//     unserialized fail-fast cannot see in-flight reservations, and concurrent
+//     overcommit requests all observed the same headroom;
+//   - a grow of an already-STOPPED VM: its spec counts toward SumProjectUsage but
+//     it contributes nothing to host usage until StartVM admits the full size.
+//
+// The returned lease carries the commit fence like any other quota grant.
+func (s *Server) admitQuotaWithReservation(
+	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int,
+) (*reservationLease, error) {
+	if cpuDelta <= 0 && memDelta <= 0 {
+		return &reservationLease{}, nil
+	}
+	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
+	tag := "vm"
+	if kind == corrosion.WorkloadContainer {
+		tag = "ct"
+	}
+	resourceID := tag + ":" + name
+
+	if s.projectAuthorityActive(ctx) {
+		lease := &reservationLease{s: s}
+		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, cpuDelta, memDelta)
+		if qerr != nil {
+			return nil, qerr
+		}
+		lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, project, quotaLease
+		lease.quotaEpoch = epoch
+		return lease, nil
+	}
+
+	// Pre-delegation: a local reservation carrying quota figures only, verified
+	// reserve-then-verify like every other admission.
+	rv := corrosion.ReservationVector{
+		Project: project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
+		Workload: name, WorkloadKind: kind, WorkloadHost: host,
+		WantCPU: wantCPU, WantMemMiB: wantMem,
+	}
+	resJSON, err := rv.Encode()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
+	}
+	op := corrosion.OperationRecord{
+		ID:              newID(),
+		Method:          method,
+		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
+		Project:         project,
+		ResourceID:      resourceID,
+		ResourceKind:    corrosion.CapacityResourceKind,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		ReservationJSON: resJSON,
+	}
+	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+		return nil, status.Errorf(codes.Internal, "reserve project quota: %v", err)
+	}
+	lease := &reservationLease{s: s, id: op.ID}
+	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+	if err := s.checkProjectQuotaBefore(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+	return lease, nil
+}

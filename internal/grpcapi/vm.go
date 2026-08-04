@@ -231,6 +231,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// that bit us was cross-node: two same-project creates entering on different
 	// hosts both passed against a view containing neither, which no amount of
 	// in-process serialization can see.
+	// createLease carries the commit FENCE for whichever branch charges quota;
+	// checked immediately before the durable write.
+	var createLease *reservationLease
 	if req.AllowOvercommit {
 		// Deliberate density on a host the operator judges can take it. Project
 		// quota still applies (that is a tenancy limit, not a physical one); only
@@ -255,6 +258,18 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				return nil, aerr
 			}
 			defer lease.release(ctx)
+			// --allow-overcommit bypasses HOST capacity only. Project quota is a
+			// tenancy limit, not a physical judgment call, so it goes through the
+			// SERIALIZED admission like any other create — the earlier tenancy
+			// fail-fast cannot see in-flight reservations, so relying on it here
+			// let concurrent overcommit creates all observe the same headroom.
+			qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
+				corrosion.WorkloadVM, spec.Name, int(spec.Cpu), int(spec.MemoryMib), int(spec.Cpu), int(spec.MemoryMib))
+			if qerr != nil {
+				return nil, qerr
+			}
+			defer qLease.release(ctx)
+			createLease = qLease
 		}
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
 		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
@@ -302,7 +317,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// the same create twice, and the forwarded half would then refuse itself. That
 	// bug was intermittent (it depended on which operation id sorted first) and was
 	// caught by the per-host-override fleet test, not by reasoning.
-	var createLease *reservationLease
 	if !req.AllowOvercommit {
 		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib), true)
 		if aerr != nil {
@@ -2930,10 +2944,16 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				if err := s.requireOvercommit(ctx, vmRBACPath(fresh)); err != nil {
 					return nil, err
 				}
-				// Only the HOST check is bypassed; quota is a tenancy limit.
-				if err := s.checkProjectQuota(ctx, fresh.Project, cpuGrow, memGrow); err != nil {
-					return nil, err
+				// Only the HOST check is bypassed; quota is a tenancy limit — and
+				// it must be the SERIALIZED admission, not the unserialized local
+				// check, or concurrent overcommit grows all see the same headroom.
+				qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project,
+					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem))
+				if qerr != nil {
+					return nil, qerr
 				}
+				defer qLease.release(ctx)
+				updLease = qLease
 				if cpuGrow > 0 || memGrow > 0 {
 					s.audit(ctx, "vm.update", req.Name,
 						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",
@@ -2967,6 +2987,38 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			vm = fresh
 			vm.State = "stopped"
 			restartAfter = true
+		}
+		if !restartAfter {
+			// The VM is ALREADY stopped, so the branch above (which admits) was
+			// skipped — and a stopped VM's spec still counts toward
+			// SumProjectUsage, so growing it here used to persist a larger size
+			// with no project-quota admission at all. Charge the grow.
+			//
+			// QUOTA ONLY, deliberately: a stopped VM contributes nothing to the
+			// host's running usage, so this consumes no host capacity now —
+			// StartVM admits the whole size when it starts.
+			wantCPU, wantMem := spec.Cpu, spec.MemoryMib
+			if req.Cpu > 0 {
+				wantCPU = req.Cpu
+			}
+			if req.MemoryMib > 0 {
+				wantMem = req.MemoryMib
+			}
+			cpuGrow, memGrow := posOnly(int(wantCPU-spec.Cpu)), posOnly(int(wantMem-spec.MemoryMib))
+			if cpuGrow > 0 || memGrow > 0 {
+				if req.AllowOvercommit {
+					if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
+						return nil, err
+					}
+				}
+				qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", vm.HostName, vm.Project,
+					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem))
+				if qerr != nil {
+					return nil, qerr
+				}
+				defer qLease.release(ctx)
+				updLease = qLease
+			}
 		}
 		if req.Cpu > 0 {
 			spec.Cpu = req.Cpu

@@ -91,6 +91,43 @@ type reservationLease struct {
 	quotaHolder  string
 	quotaProject string
 	quotaLease   string
+	// quotaEpoch is the authority epoch the quota grant was made under; 0 means no
+	// epoch-bearing authority was involved (no quota reserved, or the pre-epoch
+	// fallback), in which case the fence allows. See allowCommit.
+	quotaEpoch int64
+}
+
+// allowCommit reports whether this admission may still be COMMITTED, and must be
+// called immediately before the durable write — the narrower the gap, the smaller
+// the window in which authority can move between the check and the write.
+//
+// The fence exists because an authority handoff cannot be made safe by bookkeeping
+// alone. The grant lives in the OLD holder's replica; a takeover mints a new epoch
+// on evidence that does not include un-replicated leases, so the successor can
+// admit the same quota while this request is still in flight — and this request
+// then completes and puts the project over. Keeping the old lease counted does not
+// help: the successor never learns of it in time. The only sound options are
+// durable transferred reservations or ABORTING the outstanding operation, and this
+// is the abort. Refusing here costs a retry and writes nothing.
+//
+// A zero epoch allows: an admission that reserved no quota (unbounded project,
+// delegation inactive, host-only) has no authority to lose, and blocking it would
+// fail every create on a quota-less project.
+func (l *reservationLease) allowCommit(ctx context.Context) error {
+	if l == nil || l.s == nil || l.quotaEpoch == 0 {
+		return nil
+	}
+	ok, err := corrosion.ValidateProjectAuthority(ctx, l.s.db, l.quotaProject, l.quotaEpoch, l.quotaHolder)
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"cannot confirm project-quota authority for %q before committing: %v", l.quotaProject, err)
+	}
+	if !ok {
+		return status.Errorf(codes.Aborted,
+			"project-quota authority for %q moved past epoch %d while this request was in flight; "+
+				"nothing was committed — retry", l.quotaProject, l.quotaEpoch)
+	}
+	return nil
 }
 
 // release marks the reservation's operation terminal, freeing the capacity.
@@ -316,12 +353,13 @@ func (s *Server) admitReserved(
 		}
 		// Host capacity is settled first because it is the cheap, local half: an
 		// admission that cannot fit the host never needs to bother the holder.
-		holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, cpuDelta, memDelta)
+		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, cpuDelta, memDelta)
 		if qerr != nil {
 			lease.release(ctx)
 			return nil, qerr
 		}
 		lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, project, quotaLease
+		lease.quotaEpoch = epoch
 	}
 	return lease, nil
 }

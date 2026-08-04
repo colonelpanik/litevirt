@@ -221,9 +221,9 @@ func (s *Server) releaseLocalLease(ctx context.Context, id string) {
 // the authority holder when delegation is active and this node is not the holder.
 // It returns the holder it decided on and the lease held there ("" for a local or
 // no-op decision).
-func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int) (holder, leaseID string, err error) {
+func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int) (holder, leaseID string, epoch int64, err error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
-		return "", "", nil
+		return "", "", 0, nil
 	}
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
 
@@ -232,17 +232,18 @@ func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourc
 		// No authority could be established — fall back to the local check rather
 		// than refusing outright. This is the pre-delegation behavior, and an
 		// authority record that cannot be read is a state problem, not evidence that
-		// a competing admission is in flight.
-		return "", "", s.checkProjectQuotaSettling(ctx, project, cpuDelta, memDelta, "")
+		// a competing admission is in flight. epoch 0: no authority backed this
+		// grant, so there is nothing for the commit fence to re-validate.
+		return "", "", 0, s.checkProjectQuotaSettling(ctx, project, cpuDelta, memDelta, "")
 	}
 	if auth.Holder == s.hostName {
 		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, cpuDelta, memDelta)
-		return s.hostName, id, derr
+		return s.hostName, id, auth.Epoch, derr
 	}
 
 	client, conn, cerr := s.peerClient(ctx, auth.Holder)
 	if cerr != nil {
-		return "", "", status.Errorf(codes.Unavailable,
+		return "", "", 0, status.Errorf(codes.Unavailable,
 			"project %q admission authority %s is unreachable, refusing to admit from a stale local view: %v",
 			project, auth.Holder, cerr)
 	}
@@ -268,27 +269,29 @@ func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourc
 		if status.Code(rerr) == codes.FailedPrecondition {
 			return s.retryProjectQuotaOnce(ctx, method, project, principal, resourceID, subject, cpuDelta, memDelta, auth.Epoch)
 		}
-		return "", "", rerr
+		return "", "", 0, rerr
 	}
-	return auth.Holder, resp.LeaseId, nil
+	// The epoch the grant was ACTUALLY made under, from the holder — not our own
+	// read. The commit fence re-validates this epoch before the durable write.
+	return auth.Holder, resp.LeaseId, resp.AuthorityEpoch, nil
 }
 
 // retryProjectQuotaOnce re-reads the authority and makes exactly one more attempt,
 // used when the first attempt raced a handoff. prevEpoch guards against retrying
 // into the same stale answer.
-func (s *Server) retryProjectQuotaOnce(ctx context.Context, method, project, principal, resourceID string, subject quotaSubject, cpuDelta, memDelta int, prevEpoch int64) (holder, leaseID string, err error) {
+func (s *Server) retryProjectQuotaOnce(ctx context.Context, method, project, principal, resourceID string, subject quotaSubject, cpuDelta, memDelta int, prevEpoch int64) (holder, leaseID string, epoch int64, err error) {
 	cur, ok, cerr := corrosion.CurrentProjectAuthority(ctx, s.db, project)
 	if cerr != nil || !ok || cur.Epoch == prevEpoch {
-		return "", "", status.Errorf(codes.Unavailable,
+		return "", "", 0, status.Errorf(codes.Unavailable,
 			"project %q admission authority moved while admitting; retry", project)
 	}
 	if cur.Holder == s.hostName {
 		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, cpuDelta, memDelta)
-		return s.hostName, id, derr
+		return s.hostName, id, cur.Epoch, derr
 	}
 	client, conn, derr := s.peerClient(ctx, cur.Holder)
 	if derr != nil {
-		return "", "", status.Errorf(codes.Unavailable,
+		return "", "", 0, status.Errorf(codes.Unavailable,
 			"project %q admission authority %s is unreachable: %v", project, cur.Holder, derr)
 	}
 	defer conn.Close()
@@ -305,9 +308,9 @@ func (s *Server) retryProjectQuotaOnce(ctx context.Context, method, project, pri
 		WantMemMib:     int32(subject.WantMemMiB),
 	})
 	if rerr != nil {
-		return "", "", rerr
+		return "", "", 0, rerr
 	}
-	return cur.Holder, resp.LeaseId, nil
+	return cur.Holder, resp.LeaseId, resp.AuthorityEpoch, nil
 }
 
 // releaseProjectQuota frees a lease taken by admitProjectQuota, wherever it lives.

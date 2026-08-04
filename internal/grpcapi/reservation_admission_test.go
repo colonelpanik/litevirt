@@ -251,3 +251,53 @@ func TestAdmitWithReservation_ACreateRecordsItsOwnSizeAsTheTarget(t *testing.T) 
 			rv.WantCPU, rv.WantMemMiB)
 	}
 }
+
+// TestReservationLease_FenceAbortsWhenAuthorityMoves: a grant made under epoch N
+// must not commit once the authority has moved to N+1. The successor's view cannot
+// contain this (possibly un-replicated) lease, so it may already have admitted the
+// same quota — the only sound resolution is aborting before the durable write.
+func TestReservationLease_FenceAbortsWhenAuthorityMoves(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+
+	applied, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, "proj", "test-host")
+	if err != nil || !applied {
+		t.Fatalf("ClaimInitialProjectAuthority: applied=%v err=%v", applied, err)
+	}
+	lease := &reservationLease{s: s, quotaProject: "proj", quotaHolder: "test-host", quotaEpoch: 1}
+
+	// Authority unchanged: the grant may commit.
+	if err := lease.allowCommit(ctx); err != nil {
+		t.Fatalf("fence refused while the granting authority is still current: %v", err)
+	}
+
+	// A planned takeover mints epoch 2. The epoch-1 grant is now uncovered.
+	if _, ok, terr := corrosion.TakeoverProjectAuthority(ctx, s.db, "proj", "other-host", "planned", "", 1); terr != nil || !ok {
+		t.Fatalf("TakeoverProjectAuthority: ok=%v err=%v", ok, terr)
+	}
+	err = lease.allowCommit(ctx)
+	if err == nil {
+		t.Fatal("fence allowed a commit under a superseded authority epoch — the successor may have admitted the same quota")
+	}
+	if status.Code(err) != codes.Aborted {
+		t.Errorf("fence refusal code = %v, want Aborted (a retry-able, nothing-committed refusal)", status.Code(err))
+	}
+}
+
+// TestReservationLease_FenceZeroValueAllows: an admission that reserved no quota
+// (unbounded project, delegation inactive, host-only) has no authority to lose.
+// Blocking it would fail every create on a quota-less project.
+func TestReservationLease_FenceZeroValueAllows(t *testing.T) {
+	ctx := context.Background()
+	var nilLease *reservationLease
+	if err := nilLease.allowCommit(ctx); err != nil {
+		t.Errorf("nil lease fence refused: %v", err)
+	}
+	if err := (&reservationLease{}).allowCommit(ctx); err != nil {
+		t.Errorf("zero lease fence refused: %v", err)
+	}
+	s := testServer(t)
+	if err := (&reservationLease{s: s, quotaProject: "proj"}).allowCommit(ctx); err != nil {
+		t.Errorf("epoch-0 lease fence refused: %v — no epoch-bearing authority backed this grant", err)
+	}
+}

@@ -302,12 +302,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// the same create twice, and the forwarded half would then refuse itself. That
 	// bug was intermittent (it depended on which operation id sorted first) and was
 	// caught by the per-host-override fleet test, not by reasoning.
+	var createLease *reservationLease
 	if !req.AllowOvercommit {
 		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib), true)
 		if aerr != nil {
 			return nil, aerr
 		}
 		defer lease.release(ctx)
+		createLease = lease
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
@@ -798,6 +800,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		Project:   project, // tenancy label
 	}
 
+	// FENCE, immediately before the durable write: if project-quota authority moved
+	// while this create was in flight (image pull, disk work), the successor may
+	// already have admitted the same quota against a view that cannot contain this
+	// grant, so this VM must not be recorded. Nothing durable exists yet, so a
+	// refusal here costs only a retry — the running domain is torn down like any
+	// other post-start failure.
+	if ferr := createLease.allowCommit(ctx); ferr != nil {
+		if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
+			slog.Warn("vm create: teardown after an aborted admission also failed",
+				"name", spec.Name, "error", derr)
+		}
+		_ = s.virt.UndefineDomainPreservingState(spec.Name)
+		return nil, ferr
+	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
@@ -2781,6 +2797,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
+	// updLease carries the commit FENCE for a quota-admitted grow: authority can
+	// move while the stop → redefine below is in flight, and committing then would
+	// land a charge the new authority knows nothing about. Nil (no grow admitted)
+	// allows. Checked immediately before the durable spec write.
+	var updLease *reservationLease
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -2936,6 +2957,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 					return nil, aerr
 				}
 				defer lease.release(ctx)
+				updLease = lease
 			}
 
 			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
@@ -3224,6 +3246,15 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		specJSON, _ = json.Marshal(spec)
 	}
 
+	// FENCE before the durable write; see CreateVM. On a refusal the domain is
+	// rolled back to its previous definition, exactly as a failed write below is.
+	if ferr := updLease.allowCommit(ctx); ferr != nil {
+		if oldXML != "" {
+			_ = s.virt.UndefineDomainPreservingState(req.Name)
+			_ = s.virt.DefineDomain(oldXML)
+		}
+		return nil, ferr
+	}
 	// The durable spec MUST match the live domain. If the write fails or is deferred
 	// by the mutation barrier, roll the domain back to its old XML rather than return
 	// success with libvirt and the stored spec desynced (fatal — never report a

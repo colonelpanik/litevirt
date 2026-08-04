@@ -146,6 +146,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// commit the container below, so the memory must be RESERVED across the gap to
 	// CreateContainerAtomic — otherwise a concurrent create for a different name
 	// sees the same free memory and both pass.
+	var ctLease *reservationLease
 	if req.MemoryMib > 0 {
 		// newVMOnHost=false: VMMemOverheadMiB is qemu-specific (device models,
 		// video, page tables) and containers are accounted through their own
@@ -155,6 +156,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 			return nil, aerr
 		}
 		defer lease.release(ctx)
+		ctLease = lease
 	}
 
 	// Resolve the requested NICs into runtime attachments + managed-interface rows
@@ -200,6 +202,17 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Project:       req.Project, // UpsertContainer normalizes "" → "_default"
 		OnHostFailure: req.OnHostFailure,
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
+	}
+	// FENCE before the durable write; see CreateVM. The cleanup mirrors the
+	// failed-write path below: the runtime container exists but must not be
+	// recorded under an authority that no longer covers its admission.
+	if ferr := ctLease.allowCommit(ctx); ferr != nil {
+		_ = s.releaseContainerNICs(ctx, info.Name)
+		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
+			slog.Warn("container create: cleanup after an aborted admission also failed",
+				"name", info.Name, "error", delErr)
+		}
+		return nil, ferr
 	}
 	// Write the container row + managed interface rows in ONE atomic batch. Fail
 	// closed: the runtime container exists but the DB write failed → delete the

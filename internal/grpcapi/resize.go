@@ -217,6 +217,11 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 		IdempotencyKey:  idemKey,
 		ReservationJSON: resJSON,
 	}
+	// FENCE before BeginVMOperation commits the desired spec; see CreateVM.
+	if ferr := lease.allowCommit(ctx); ferr != nil {
+		lease.release(ctx)
+		return ferr
+	}
 	applied, err := s.db.BeginVMOperation(ctx, op, string(targetJSON), vm.OwnerEpoch, vm.SpecGeneration)
 	if err != nil {
 		lease.release(ctx)
@@ -303,12 +308,13 @@ func (s *Server) admitResizeReservation(
 		return lease, nil
 	}
 
-	holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, vm.Project, "vm:"+vm.Name, subject, cpuDelta, memDelta)
+	holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, vm.Project, "vm:"+vm.Name, subject, cpuDelta, memDelta)
 	if qerr != nil {
 		lease.release(ctx)
 		return nil, qerr
 	}
 	lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, vm.Project, quotaLease
+	lease.quotaEpoch = epoch
 	return lease, nil
 }
 

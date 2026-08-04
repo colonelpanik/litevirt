@@ -26,6 +26,24 @@ type ReservationVector struct {
 	TargetCPU     int    `json:"target_cpu,omitempty"`
 	TargetMemMiB  int    `json:"target_mem_mib,omitempty"`
 	SourceHost    string `json:"source_host,omitempty"`
+
+	// Workload identity plus the ABSOLUTE size the admission is growing it to.
+	//
+	// The settle rule holds a released project lease until the thing it admitted is
+	// visible here — and for a GROW, "visible" cannot mean mere presence: the row
+	// already exists at its old size, so a presence check frees the lease instantly
+	// while the holder's usage still reflects the smaller workload, under-counting
+	// exactly the amount being added. Recording the post-commit target lets the
+	// settle retire the lease only once the workload CONTRIBUTES that much.
+	//
+	// Identity is (kind, host, name), never name alone: a VM and a container may
+	// share a name, and container names are unique only per host, so an ambiguous
+	// match could retire a charge that is still owed.
+	Workload     string `json:"workload,omitempty"`
+	WorkloadKind string `json:"workload_kind,omitempty"` // WorkloadVM | WorkloadContainer
+	WorkloadHost string `json:"workload_host,omitempty"` // disambiguates containers
+	WantCPU      int    `json:"want_cpu,omitempty"`
+	WantMemMiB   int    `json:"want_mem_mib,omitempty"`
 }
 
 // ReservationFacts is persisted on the reserved operation step. It is kept
@@ -49,6 +67,8 @@ func (r ReservationVector) Validate() error {
 		{field: "project_mem_mib", value: r.ProjectMemMiB},
 		{field: "target_cpu", value: r.TargetCPU},
 		{field: "target_mem_mib", value: r.TargetMemMiB},
+		{field: "want_cpu", value: r.WantCPU},
+		{field: "want_mem_mib", value: r.WantMemMiB},
 	}
 	for _, value := range values {
 		if value.value < 0 {

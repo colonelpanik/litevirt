@@ -117,16 +117,46 @@ func ProjectReservedSettling(ctx context.Context, c *Client, project, opID strin
 		// The whole point of the settle term: count it only while the thing it
 		// admitted is still invisible here. Once the row lands, committed usage
 		// counts it and counting the lease too would charge the project twice.
-		visible, verr := resourceVisible(ctx, c, r.String("resource_id"))
+		settled, verr := admittedResourceSettled(ctx, c, rv, r.String("resource_id"))
 		if verr != nil {
 			return 0, 0, verr
 		}
-		if !visible {
+		if !settled {
 			cpu += rv.ProjectCPU
 			memMiB += rv.ProjectMemMiB
 		}
 	}
 	return cpu, memMiB, nil
+}
+
+// admittedResourceSettled reports whether the workload a lease admitted has become
+// visible here — and, when the lease recorded the size it was admitting to, visible
+// AT that size.
+//
+// The size half is what makes a GROW settle correctly. A resize's row is already
+// present at its OLD size, so a bare presence check frees the lease the instant it
+// is released while the holder's committed usage still reflects the smaller
+// workload — under-counting exactly the amount being added. Comparing the
+// workload's CONTRIBUTION against the recorded want closes that: the lease stands
+// in for the grow until the grown size is what usage actually counts. Two summed
+// grows settle independently, each against its own absolute target, so neither can
+// retire the other's charge (the monotone-target property the identity-keyed
+// ledger fix pinned).
+//
+// A lease that recorded no workload identity falls back to the presence of the
+// resource named by resource_id — the pre-identity behavior, correct for creates.
+func admittedResourceSettled(ctx context.Context, c *Client, rv ReservationVector, resourceID string) (bool, error) {
+	if rv.Workload == "" {
+		return resourceVisible(ctx, c, resourceID)
+	}
+	cpu, mem, found, err := WorkloadQuotaContribution(ctx, c, rv.Project, rv.WorkloadKind, rv.WorkloadHost, rv.Workload)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	return cpu >= rv.WantCPU && mem >= rv.WantMemMiB, nil
 }
 
 // resourceVisible reports whether the resource a lease admitted ("vm:<name>" or

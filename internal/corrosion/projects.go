@@ -414,3 +414,61 @@ func CheckProjectQuota(ctx context.Context, c *Client, projectName string, req Q
 	}
 	return nil
 }
+
+// Workload kinds for quota observation. A name alone is NOT a unique identity: a VM
+// and a container may share a name, and container names are unique only per HOST.
+// Retiring a charge on the wrong row would free quota that is still owed.
+const (
+	WorkloadVM        = "vm"
+	WorkloadContainer = "container"
+)
+
+// WorkloadQuotaContribution reports what one specific workload contributes to a
+// project's quota usage on THIS node's replica, and whether its row is visible here.
+//
+// This is the observation primitive the settle rule needs: a lease held for a
+// committed-but-unreplicated workload may only be retired by seeing THAT workload,
+// at (or above) the size it was admitted for. Aggregate usage growth is not a sound
+// substitute — any unrelated increase (a workload that replicated late, or one
+// admitted through a fail-open path) would clear the charge early and let the next
+// request over-admit.
+//
+// Identity is (kind, host, name), not name alone. kind separates a VM from a
+// same-named container; host disambiguates containers, whose names are unique only
+// per host, so a container of the same name elsewhere cannot retire this charge.
+//
+// The accounting mirrors SumProjectUsage exactly, so "contributes at least what it
+// was admitted for" is comparable against the same numbers the quota check uses: VMs
+// count their spec cpu/memory_mib, containers their declared limits, and a
+// soft-deleted row counts as absent.
+func WorkloadQuotaContribution(ctx context.Context, c *Client, project, kind, host, workload string) (cpu, memMiB int, found bool, err error) {
+	project = projectOrDefault(project)
+	switch kind {
+	case WorkloadContainer:
+		rows, err := c.Query(ctx,
+			`SELECT COALESCE(cpu_limit,0)  AS cpu,
+			        COALESCE(memory_mib,0) AS mem
+			 FROM containers
+			 WHERE name = ? AND host_name = ? AND project = ? AND deleted_at IS NULL`,
+			workload, host, project)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		if len(rows) == 0 {
+			return 0, 0, false, nil
+		}
+		return rows[0].Int("cpu"), rows[0].Int("mem"), true, nil
+	default: // WorkloadVM
+		rows, err := c.Query(ctx,
+			`SELECT COALESCE(json_extract(spec,'$.cpu'),0)        AS cpu,
+			        COALESCE(json_extract(spec,'$.memory_mib'),0) AS mem
+			 FROM vms WHERE name = ? AND project = ? AND deleted_at IS NULL`, workload, project)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		if len(rows) == 0 {
+			return 0, 0, false, nil
+		}
+		return rows[0].Int("cpu"), rows[0].Int("mem"), true, nil
+	}
+}

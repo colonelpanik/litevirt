@@ -208,3 +208,191 @@ func TestProjectReservedSettling_IgnoresOtherProjects(t *testing.T) {
 		t.Errorf("cross-project leakage: %d vCPU/%d MiB, want 2/2048", cpu, mem)
 	}
 }
+
+// insertIdentityLease is insertProjectLeaseFor carrying the full workload identity
+// and the ABSOLUTE size the admission grows it to — the settle inputs for a grow.
+func insertIdentityLease(t *testing.T, db *Client, id, project, kind, host, name string, deltaCPU, deltaMem, wantCPU, wantMem int) {
+	t.Helper()
+	rv := ReservationVector{
+		Project: project, ProjectCPU: deltaCPU, ProjectMemMiB: deltaMem,
+		Workload: name, WorkloadKind: kind, WorkloadHost: host,
+		WantCPU: wantCPU, WantMemMiB: wantMem,
+	}
+	enc, err := rv.Encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if err := InsertOperation(context.Background(), db, OperationRecord{
+		ID: id, Method: "UpdateVM", Project: project, ResourceKind: CapacityResourceKind,
+		ResourceID:    kind + ":" + name,
+		OperationKind: string(OpResourceUpdateRunning), ReservationJSON: enc,
+	}); err != nil {
+		t.Fatalf("InsertOperation %s: %v", id, err)
+	}
+}
+
+// TestProjectReservedSettling_HoldsAGrowUntilTheGrownSizeIsVisible is the regression
+// the identity-keyed want exists for. A grow's row is ALREADY present at its old
+// size, so a presence-only settle freed the lease the instant it was released — while
+// the holder's committed usage still counted the smaller spec, under-counting exactly
+// the growth and handing it to the next request.
+func TestProjectReservedSettling_HoldsAGrowUntilTheGrownSizeIsVisible(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := InsertVM(ctx, db, VMRecord{
+		Name: "vm-g", HostName: "h1", Project: "proj",
+		Spec: `{"cpu":4,"memory_mib":4096}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	insertIdentityLease(t, db, "op-grow", "proj", WorkloadVM, "h1", "vm-g", 2, 2048, 6, 6144)
+	settleLease(t, db, "op-grow", time.Second)
+
+	// The VM is visible — but only at its OLD size, so the lease must keep counting.
+	cpu, mem, err := ProjectReservedSettling(ctx, db, "proj", "op-zzz", 5*time.Second, time.Now())
+	if err != nil {
+		t.Fatalf("ProjectReservedSettling: %v", err)
+	}
+	if cpu != 2 || mem != 2048 {
+		t.Fatalf("grow lease counts %d vCPU/%d MiB while the row still shows the old size, want 2/2048 — "+
+			"presence alone must not settle a grow", cpu, mem)
+	}
+
+	// The grown spec lands. Usage now counts the larger size, so the lease must stop.
+	if err := db.Execute(ctx,
+		`UPDATE vms SET spec = ? WHERE name = ?`, `{"cpu":6,"memory_mib":6144}`, "vm-g"); err != nil {
+		t.Fatalf("update spec: %v", err)
+	}
+	cpu, mem, err = ProjectReservedSettling(ctx, db, "proj", "op-zzz", 5*time.Second, time.Now())
+	if err != nil {
+		t.Fatalf("ProjectReservedSettling: %v", err)
+	}
+	if cpu != 0 || mem != 0 {
+		t.Errorf("grow lease still counts %d vCPU/%d MiB after the grown size became visible, want 0/0", cpu, mem)
+	}
+}
+
+// TestProjectReservedSettling_SumsConcurrentGrows: two grows that both committed
+// before either replicated owe BOTH deltas. Each lease settles against its own
+// absolute target, so the intermediate size retires only the smaller one — a max()
+// or shared-target scheme would silently release half the owed quota.
+func TestProjectReservedSettling_SumsConcurrentGrows(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := InsertVM(ctx, db, VMRecord{
+		Name: "vm-s", HostName: "h1", Project: "proj",
+		Spec: `{"cpu":4,"memory_mib":4096}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	insertIdentityLease(t, db, "op-g1", "proj", WorkloadVM, "h1", "vm-s", 2, 0, 6, 4096)
+	insertIdentityLease(t, db, "op-g2", "proj", WorkloadVM, "h1", "vm-s", 2, 0, 8, 4096)
+	settleLease(t, db, "op-g1", time.Second)
+	settleLease(t, db, "op-g2", time.Second)
+
+	cpu, _, err := ProjectReservedSettling(ctx, db, "proj", "op-zzz", 5*time.Second, time.Now())
+	if err != nil {
+		t.Fatalf("ProjectReservedSettling: %v", err)
+	}
+	if cpu != 4 {
+		t.Fatalf("two settling +2 grows count %d vCPU, want 4 — both deltas are owed until seen", cpu)
+	}
+
+	// The first grow's size lands; only its lease retires.
+	if err := db.Execute(ctx,
+		`UPDATE vms SET spec = ? WHERE name = ?`, `{"cpu":6,"memory_mib":4096}`, "vm-s"); err != nil {
+		t.Fatalf("update spec: %v", err)
+	}
+	cpu, _, err = ProjectReservedSettling(ctx, db, "proj", "op-zzz", 5*time.Second, time.Now())
+	if err != nil {
+		t.Fatalf("ProjectReservedSettling: %v", err)
+	}
+	if cpu != 2 {
+		t.Errorf("after the intermediate size lands, %d vCPU still settling, want 2 (the second grow only)", cpu)
+	}
+}
+
+// TestProjectReservedSettling_AnUnrelatedWorkloadCannotRetireACharge pins the
+// identity property itself: only the workload a charge was taken FOR may retire it.
+// An aggregate usage-growth heuristic is fooled by any unrelated increase — a
+// workload that replicated late, or one admitted through a fail-open path.
+func TestProjectReservedSettling_AnUnrelatedWorkloadCannotRetireACharge(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	insertIdentityLease(t, db, "op-create", "proj", WorkloadVM, "h1", "vm-mine", 4, 4096, 4, 4096)
+	settleLease(t, db, "op-create", time.Second)
+
+	// A DIFFERENT, larger VM appears. Aggregate usage grew past the want — but not
+	// because of this admission, so the charge must stand.
+	if err := InsertVM(ctx, db, VMRecord{
+		Name: "vm-other", HostName: "h1", Project: "proj",
+		Spec: `{"cpu":8,"memory_mib":8192}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	cpu, _, err := ProjectReservedSettling(ctx, db, "proj", "op-zzz", 5*time.Second, time.Now())
+	if err != nil {
+		t.Fatalf("ProjectReservedSettling: %v", err)
+	}
+	if cpu != 4 {
+		t.Fatalf("an unrelated VM retired the charge (%d vCPU counted, want 4)", cpu)
+	}
+
+	// The right workload arrives at its admitted size: now it retires.
+	if err := InsertVM(ctx, db, VMRecord{
+		Name: "vm-mine", HostName: "h1", Project: "proj",
+		Spec: `{"cpu":4,"memory_mib":4096}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	cpu, _, err = ProjectReservedSettling(ctx, db, "proj", "op-zzz", 5*time.Second, time.Now())
+	if err != nil {
+		t.Fatalf("ProjectReservedSettling: %v", err)
+	}
+	if cpu != 0 {
+		t.Errorf("charge still counted (%d vCPU) after its own workload became visible, want 0", cpu)
+	}
+}
+
+// TestProjectReservedSettling_ContainerChargeIsHostKeyed: container names are unique
+// only per HOST, so a same-named container elsewhere must not retire the charge.
+func TestProjectReservedSettling_ContainerChargeIsHostKeyed(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	insertIdentityLease(t, db, "op-ct", "proj", WorkloadContainer, "h1", "web", 2, 1024, 2, 1024)
+	settleLease(t, db, "op-ct", time.Second)
+
+	// Same name, same size — WRONG host.
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "h2", Name: "web", Project: "proj", State: "running",
+		CPULimit: 2, MemMiB: 1024,
+	}); err != nil {
+		t.Fatalf("UpsertContainer h2: %v", err)
+	}
+	cpu, _, err := ProjectReservedSettling(ctx, db, "proj", "op-zzz", 5*time.Second, time.Now())
+	if err != nil {
+		t.Fatalf("ProjectReservedSettling: %v", err)
+	}
+	if cpu != 2 {
+		t.Fatalf("a same-named container on another host retired the charge (%d vCPU counted, want 2)", cpu)
+	}
+
+	// The container the charge was taken for lands on ITS host: retire.
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "h1", Name: "web", Project: "proj", State: "running",
+		CPULimit: 2, MemMiB: 1024,
+	}); err != nil {
+		t.Fatalf("UpsertContainer h1: %v", err)
+	}
+	cpu, _, err = ProjectReservedSettling(ctx, db, "proj", "op-zzz", 5*time.Second, time.Now())
+	if err != nil {
+		t.Fatalf("ProjectReservedSettling: %v", err)
+	}
+	if cpu != 0 {
+		t.Errorf("charge still counted (%d vCPU) after its container became visible on its host, want 0", cpu)
+	}
+}

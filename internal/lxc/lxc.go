@@ -1078,3 +1078,20 @@ func looksLikeRootfs(dir string) bool {
 type stringWriter struct{ b *strings.Builder }
 
 func (w stringWriter) Write(p []byte) (int, error) { return w.b.Write(p) }
+
+// ListRunning enumerates only the containers currently running on this host
+// (lxc-ls --quiet --running). Used by the watchdog ownership probe at
+// shutdown, where stopped containers must not block a disarm.
+func (r *LxcRunner) ListRunning(ctx context.Context) ([]string, error) {
+	out, _, err := r.run(ctx, "lxc-ls", "--quiet", "--running")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			names = append(names, t)
+		}
+	}
+	return names, nil
+}

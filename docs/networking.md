@@ -287,3 +287,53 @@ vms:
       - name: "lan"
         security-groups: [web-sg]
 ```
+
+## Host network configuration
+
+`lv host network` manages the **host's own wiring** — bridges, bonds (including
+LACP), VLAN interfaces, and physical-NIC addressing — the layer underneath the
+managed VM networks above. Intent is recorded per host and rendered by that
+host into a single litevirt-owned netplan file (`/etc/netplan/90-litevirt.yaml`);
+litevirt never edits any other netplan file, and refuses to manage an interface
+another file already defines.
+
+The flow is deliberately two-step — record, then apply behind a rollback:
+
+```bash
+# Record intent: a bridge over eth1 with a static address.
+lv host network set vmbr0 --host node-2 --kind bridge --member eth1 \
+    --address 10.0.10.2/24 --gateway 10.0.10.1 --nameserver 10.0.10.1
+
+# An LACP bond and a VLAN on top of it.
+lv host network set bond0 --host node-2 --kind bond --member eth2 --member eth3 \
+    --bond-mode 802.3ad --lacp-rate fast --hash-policy layer3+4 --mtu 9000
+lv host network set vlan40 --host node-2 --kind vlan --vlan-link bond0 --vlan-id 40 --dhcp4
+
+# See exactly what would change on the host (writes nothing).
+lv host network plan --host node-2
+
+# Apply behind the timed rollback.
+lv host network apply --host node-2
+
+lv host network ls --host node-2
+lv host network rm vlan40 --host node-2   # takes effect on the next apply
+```
+
+`apply` runs `netplan try`: the change is reverted — kernel-side, even if the
+daemon dies mid-window — unless the host confirms its own connectivity
+(advertise address still assigned, its own gRPC listener answering, and the
+prior default gateway still reachable). A failed confirm restores the previous
+file and records the intent as `rolled_back` with the cause, visible
+cluster-wide in `lv host network ls`.
+
+A plan that would touch the interface carrying the **cluster LAN** —
+reconfiguring it, enslaving it into a bridge/bond, or moving the advertise
+address — is refused unless you name that interface with
+`--force-interface <iface>` (the name is shown by `plan`). Naming it is the
+confirmation that you understand you may be disconnecting the node.
+
+Removal is two-step as well: `rm` tombstones the intent, and the next `apply`
+renders the file without it. Note netplan does not delete an existing virtual
+device when its definition disappears: the interface stays up (unconfigured)
+until the next reboot, or until the operator removes it with `ip link del`.
+The persistent config is gone either way — it will not return after a reboot.

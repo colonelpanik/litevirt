@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -19,7 +19,6 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -109,6 +108,7 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch stri
 		req.Proof = &pb.RuntimeActionProof{
 			Id: newID(), Action: corrosion.ActionPromote, TargetKind: "vm",
 			TargetName: vmName, Coordinator: s.hostName, LeaseHolder: s.hostName,
+			OwnerEpoch: strconv.FormatInt(vm.OwnerEpoch, 10),
 			FenceEpoch: fenceEpoch,
 		}
 	}
@@ -708,11 +708,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			mac = lv.GenerateMAC()
 		}
 		bridge := n.Name
-		if _, err := net.InterfaceByName(bridge); err != nil {
-			if err := network.EnsureBridge(bridge); err != nil {
-				os.Remove(livePath)
-				return status.Errorf(codes.FailedPrecondition, "network bridge %q unavailable on %q: %v", bridge, s.hostName, err)
-			}
+		if err := s.ensureBridge(bridge); err != nil {
+			os.Remove(livePath)
+			return status.Errorf(codes.FailedPrecondition, "network bridge %q unavailable on %q: %v", bridge, s.hostName, err)
 		}
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -781,6 +779,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	// Persist. Takeover (same name) re-homes the existing record; a renamed
 	// promotion writes a fresh VM alongside the original.
+	// Same as create/import: the define above resolved any alias on THIS host,
+	// so persist the concrete type rather than letting the promoted VM carry an
+	// alias that a later move would re-resolve elsewhere.
+	s.pinMachineFromDomain(&spec)
 	specJSON, _ := json.Marshal(&spec)
 	if renamed {
 		rec := corrosion.VMRecord{
@@ -797,7 +799,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 	} else {
-		if err := corrosion.UpdateVMHost(ctx, s.db, targetName, s.hostName, "running"); err != nil {
+		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
+		if err := corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running"); err != nil {
 			return status.Errorf(codes.Internal, "re-home vm record: %v", err)
 		}
 		if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, targetName, src.DiskName, s.hostName, livePath); err != nil {

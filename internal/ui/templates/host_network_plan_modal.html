@@ -1,0 +1,52 @@
+<div class="modal-overlay" id="host-network-plan-modal">
+  <div class="modal form-modal" style="max-width:760px">
+    <form hx-post="/ui/hosts/{{.Host}}/network-apply" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('host-network-plan-modal').remove()}">
+      <div class="fm-head"><h3>Plan: host network on {{.Host}}</h3>
+        <button type="button" class="fm-x" aria-label="Close" onclick="document.getElementById('host-network-plan-modal').remove()">&times;</button></div>
+      <div class="fm-body">
+        {{if .Plan.Conflicts}}
+        <div class="alert alert-error" style="margin-bottom:12px">
+          <strong>Conflicts — apply will refuse:</strong>
+          <ul style="margin:6px 0 0 18px">
+            {{range $iface, $file := .Plan.Conflicts}}<li><code>{{$iface}}</code> is already defined by <code>{{$file}}</code></li>{{end}}
+          </ul>
+          litevirt owns only its own netplan file and never edits another.
+        </div>
+        {{end}}
+        {{if .Plan.CutoffReason}}
+        <div class="alert alert-warn" style="margin-bottom:12px">
+          <strong>Cutoff risk:</strong> {{.Plan.CutoffReason}}<br>
+          To proceed anyway, type the cluster interface name
+          (<code>{{.Plan.ClusterInterface}}</code>) below — writing it down is the confirmation.
+        </div>
+        {{end}}
+        {{if .Plan.NoOp}}
+        <div class="alert alert-info" style="margin-bottom:12px">No changes: the rendered configuration matches the file on the host.
+          Applying only reconciles the intent rows' recorded state.</div>
+        {{else}}
+        <div class="field-grid">
+          <div>
+            <div class="card-title">Current file</div>
+            <pre style="max-height:260px;overflow:auto;font-size:11px;background:var(--bg-alt);padding:8px;border-radius:4px">{{if .Plan.Current}}{{.Plan.Current}}{{else}}(no litevirt-managed netplan file yet){{end}}</pre>
+          </div>
+          <div>
+            <div class="card-title">Rendered (what apply writes)</div>
+            <pre style="max-height:260px;overflow:auto;font-size:11px;background:var(--bg-alt);padding:8px;border-radius:4px">{{.Plan.Rendered}}</pre>
+          </div>
+        </div>
+        {{end}}
+        {{if .Plan.CutoffReason}}
+        <div class="form-row" style="margin-top:12px"><label>Force interface (type <code>{{.Plan.ClusterInterface}}</code> to confirm)</label>
+          <input type="text" name="force_interface" placeholder="{{.Plan.ClusterInterface}}" autocomplete="off"></div>
+        {{end}}
+      </div>
+      <div class="fm-foot">
+        <span class="hint">Applied via netplan try: reverted automatically unless the host confirms its own connectivity.</span>
+        <div class="fm-actions">
+          <button type="button" class="btn" onclick="document.getElementById('host-network-plan-modal').remove()">Cancel</button>
+          {{if not .Plan.Conflicts}}<button type="submit" class="btn btn-primary">Apply</button>{{end}}
+        </div></div>
+    </form>
+  </div>
+</div>

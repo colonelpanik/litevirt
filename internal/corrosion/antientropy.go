@@ -120,6 +120,21 @@ func (ae *AntiEntropy) checkPeers(ctx context.Context) {
 }
 
 func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap, sensitiveMap map[string]TableDigest) {
+	// The pull half of the isolation regime (§A). PushMutations refuses an
+	// isolated node's INJECTION server-side, but anti-entropy is a PULL: we
+	// would otherwise merge a quarantined node's state into ours voluntarily,
+	// which is the same corruption arriving through the other door. Skipping
+	// here needs no capability gate — an isolation is only ever recorded while
+	// the regime is active, so a pre-latch cluster has no nonzero epochs to
+	// skip on.
+	if epoch, reason, err := HostIsolation(ctx, ae.client, peerName); err != nil {
+		slog.Warn("anti-entropy: could not read peer isolation — proceeding", "peer", peerName, "error", err)
+	} else if epoch > 0 {
+		slog.Warn("anti-entropy: NOT merging from an isolated peer",
+			"peer", peerName, "isolation_epoch", epoch, "reason", reason,
+			"fix", "reseed "+peerName+" to bring it back into the compatibility regime")
+		return
+	}
 	client, conn, err := ae.peerClient(ctx, peerName)
 	if err != nil {
 		slog.Debug("anti-entropy: cannot reach peer", "peer", peerName, "error", err)

@@ -3,9 +3,12 @@ package corrosion
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"slices"
+	"sort"
 	"time"
 )
 
@@ -244,7 +247,68 @@ import (
 //	v42: hardware foundation — vm_nics, vm_pci_intent, vm_pci_realizations;
 //	     vm_disks.{bus,device_kind,delete_with_vm,controller_model};
 //	     vms.{hardware_adoption_state,hardware_adoption_error}.
-const CurrentSchemaVersion = 42
+//	v43: per-host capacity policy — hosts.{cpu_overcommit,mem_overcommit,
+//	     cpu_reserve,mem_reserve_mib}. Overrides the cluster-wide default so a
+//	     host with swap/KSM can overcommit memory while its peers do not. Ratio 0
+//	     and reserve -1 mean "inherit the cluster default"; 0 is a MEANINGFUL
+//	     reserve (hand guests everything), so absence had to be a distinct value.
+//	     Four ADD COLUMN.
+//	v44: workload lifecycle + scoped notification routing — containers gains
+//	     owner_epoch/spec_generation/active_operation_id, hosts gains the
+//	     capacity-policy fingerprint used by admission compatibility checks, and
+//	     notification_routes gains subject_pattern/project selectors. Six
+//	     additive columns with legacy-compatible defaults.
+//	v45: audit tamper-evidence — audit_log gains key_id/signature/seq so a row
+//	     carries an ECDSA signature over its content hash, chain position and
+//	     sequence number, plus audit_signing_keys (the per-host verification
+//	     certificate, replicated so any node can check any host's chain) and
+//	     audit_chain_heads (append-only signed heads, which is the only way to
+//	     detect truncation — a hash chain links backward and cannot notice that
+//	     its own tail was removed). Three additive columns, two new tables.
+//	v46: audit signing key rotation — audit_key_lifecycle, an append-only table
+//	     of SIGNED 'adopted' and 'retired' events bounding each key's signing
+//	     contract. Retirement is a validity WINDOW, never a deletion: the
+//	     certificate has to stay resolvable for as long as any row it signed
+//	     exists, or rotating a key would make the history it signed
+//	     unverifiable. It carries a signature because the detector for "somebody
+//	     else has this key" cannot itself be something somebody else can write —
+//	     a retirement is an assertion by the retired key itself (a voluntary
+//	     stop), by a successor key of the same host (a rotation), or by the
+//	     cluster CA (a host that can no longer speak for itself). Append-only
+//	     means deleting one locally is repaired by ordinary anti-entropy rather
+//	     than needing a bespoke merge rule. Adoption is recorded the same way,
+//	     because the certificate alone cannot say WHEN a host committed —
+//	     without that, publishing one retroactively puts a cluster's entire
+//	     history under the contract. One new table.
+//
+//	v47: cluster_crl — the CA-signed certificate revocation list, replicated so a
+//	     revocation reaches every node the way every other cluster fact does.
+//	     Previously nothing wrote a CRL at all, and removing a host was enforced
+//	     solely by the tombstone on its `hosts` row; a node that never received
+//	     that tombstone went on accepting the removed host's certificate. Safe to
+//	     replicate in the clear because a CRL is signed by the cluster CA — a peer
+//	     can write the row but cannot forge one that verifies, and every reader
+//	     checks the signature before installing it. One new table.
+//	v48: host_networks — declarative host network intent (§O Tier 1: bridges,
+//	     bonds, VLAN interfaces, physical-NIC addressing). One row per named
+//	     interface per host; ONLY the owning host renders its rows into
+//	     /etc/netplan/90-litevirt.yaml behind the journaled apply-with-rollback
+//	     protocol. Replicated (unlike host_fw_intent) because the intent is the
+//	     operator-facing object: the UI/CLI list every host's interfaces from
+//	     any node, and a host that lost its DB re-learns its own wiring intent
+//	     from peers. Deliberately NOT part of the Phase 4 workload-ownership
+//	     regime — host_name in the PK is the ownership, and only that host
+//	     writes state transitions. One new table.
+//	v49: hosts.isolation_epoch / isolation_reason — the §A isolation epoch. A
+//	     node whose local state was produced outside the cluster's current
+//	     compatibility regime (rolled back below a latched token, or isolated
+//	     by an operator) is recorded as isolated BY A HEALTHY PEER, and every
+//	     peer then refuses its replication until a verified reseed clears it.
+//	     Deliberately cluster state rather than a host-local marker: peers
+//	     cannot refuse what they cannot see, and a node that cannot be trusted
+//	     to replicate cannot be trusted to record its own quarantine. Monotone
+//	     and peer-written; 0 = not isolated. Two additive columns.
+const CurrentSchemaVersion = 49
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -325,11 +389,18 @@ func InitSchema(ctx context.Context, c *Client) error {
 		if m.SQL == "" {
 			return fmt.Errorf("schema ledger: %q (%s) reported missing but has no heal SQL", m.ID, m.Target)
 		}
-		if err := c.execBatchLocal(ctx, []Statement{
-			{SQL: m.SQL},
-			{SQL: `INSERT INTO applied_migrations (id, applied_at, checksum) VALUES (?, ?, ?)`,
-				Params: []interface{}{m.ID, now, sum}},
-		}); err != nil {
+		stmts := []Statement{{SQL: m.SQL}}
+		if m.Kind == kindRebuildClusterCRL {
+			stmts = []Statement{
+				{SQL: `DROP TABLE IF EXISTS cluster_crl`},
+				{SQL: clusterCRLDDL},
+			}
+		}
+		stmts = append(stmts, Statement{
+			SQL:    `INSERT INTO applied_migrations (id, applied_at, checksum) VALUES (?, ?, ?)`,
+			Params: []interface{}{m.ID, now, sum},
+		})
+		if err := c.execBatchLocal(ctx, stmts); err != nil {
 			return fmt.Errorf("schema migration %q: %w", m.ID, err)
 		}
 		slog.Warn("schema ledger: healed a missing migration (silent gap from a prior daemon)",
@@ -535,6 +606,39 @@ func tableExists(ctx context.Context, c *Client, name string) (bool, error) {
 	return rows.Next(), nil
 }
 
+func primaryKeyColumns(ctx context.Context, db *sql.DB, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type keyed struct {
+		order int
+		name  string
+	}
+	var found []keyed
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		if pk > 0 {
+			found = append(found, keyed{order: pk, name: name})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].order < found[j].order })
+	out := make([]string, len(found))
+	for i := range found {
+		out[i] = found[i].name
+	}
+	return out, nil
+}
+
 // containsFold is a tiny case-insensitive substring helper — kept local so
 // schema.go doesn't grow a strings dependency.
 func containsFold(s, sub string) bool {
@@ -562,6 +666,15 @@ func containsFold(s, sub string) bool {
 	}
 	return false
 }
+
+const clusterCRLDDL = `CREATE TABLE IF NOT EXISTS cluster_crl (
+	id           TEXT NOT NULL,
+	crl_pem      TEXT NOT NULL,
+	created_at   TEXT NOT NULL,
+	updated_at   TEXT NOT NULL,
+	deleted_at   TEXT,
+	PRIMARY KEY (id, crl_pem)
+)`
 
 var schemaDDL = []string{
 	// ═══════════ CLUSTER ═══════════
@@ -594,9 +707,18 @@ var schemaDDL = []string{
 		labels       TEXT,
 		role         TEXT NOT NULL DEFAULT 'worker',
 		schema_version INTEGER NOT NULL DEFAULT 0,
+		cpu_overcommit  REAL NOT NULL DEFAULT 0,
+		mem_overcommit  REAL NOT NULL DEFAULT 0,
+		cpu_reserve     INTEGER NOT NULL DEFAULT -1,
+		mem_reserve_mib INTEGER NOT NULL DEFAULT -1,
+		isolation_epoch INTEGER NOT NULL DEFAULT 0,
+		isolation_reason TEXT NOT NULL DEFAULT '',
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
-		deleted_at   TEXT
+		deleted_at   TEXT,
+		version      TEXT DEFAULT '',
+		region       TEXT NOT NULL DEFAULT 'default',
+		capacity_policy_hash TEXT NOT NULL DEFAULT ''
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS host_labels (
@@ -642,6 +764,50 @@ var schemaDDL = []string{
 		host         TEXT PRIMARY KEY,
 		version      INTEGER NOT NULL,
 		updated_at   TEXT NOT NULL
+	)`,
+
+	// The cluster CRL itself (v47), replicated so a revocation reaches every node
+	// the way every other cluster fact does. crl_versions above only REPORTS what
+	// each host has; this is the thing it was reporting on, and until now nothing
+	// carried it — an operator copied crl.pem between machines by hand.
+	//
+	// Distribution over SSH was considered and rejected. SSH is the BOOTSTRAP
+	// channel — host init, host add, rotate-audit-key — used when a node is not yet
+	// a cluster member and there is no authenticated path to it. A revocation goes
+	// to nodes that are already mutually authenticated peers with a replicated store
+	// built for exactly this, and an SSH fan-out is best-effort with a list of hosts
+	// it failed to reach, where replication converges and crl_versions already
+	// reports whether it has.
+	//
+	// Safe to replicate because the CRL is CA-SIGNED and therefore self-authenticating:
+	// a peer can write this row, but cannot produce a CRL that verifies against the
+	// cluster CA, and every reader checks the signature before installing it. That is
+	// the same reason audit signing certificates are replicated in the clear.
+	//
+	// APPEND-ONLY, with a composite key of the SHA-256 and the CRL itself.
+	//
+	// Every other choice of key was tried and each one handed a hostile peer a way
+	// to stop a revocation. A singleton row is overwritable. A row keyed by CRL
+	// NUMBER is squattable, because the number is a wall-clock second and therefore
+	// predictable: insert rows for the next hour's worth of numbers and the genuine
+	// INSERT loses to INSERT OR IGNORE on every peer. A hash alone is still
+	// squattable after publication: the hash becomes public with the CRL, and a
+	// peer can race (hash, garbage) to a partitioned node before the genuine
+	// mutation arrives. Including the signed bytes in the key makes those two
+	// rows distinct, so the garbage row cannot veto the genuine one.
+	//
+	// There is deliberately NO version column. The number that orders one CRL
+	// against another lives inside the signed PEM, where the CA covers it; a column
+	// beside it is written by whoever inserted the row and covered by nothing, and a
+	// reader that trusts it can be pinned to an old CRL forever. Readers parse and
+	// verify every row and enforce the union of signed revocations.
+	`CREATE TABLE IF NOT EXISTS cluster_crl (
+		id           TEXT NOT NULL,
+		crl_pem      TEXT NOT NULL,
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT,
+		PRIMARY KEY (id, crl_pem)
 	)`,
 
 	// Local schema version pin. NOT CRDT-replicated — each host's row
@@ -1039,7 +1205,9 @@ var schemaDDL = []string{
 		enabled       INTEGER NOT NULL DEFAULT 1,
 		created_at    TEXT NOT NULL,
 		updated_at    TEXT NOT NULL,
-		deleted_at    TEXT
+		deleted_at    TEXT,
+		subject_pattern TEXT NOT NULL DEFAULT '*',
+		project       TEXT NOT NULL DEFAULT ''
 	)`,
 
 	// ═══════════ LOAD BALANCERS ═══════════
@@ -1235,7 +1403,116 @@ var schemaDDL = []string{
 		-- pre-3.4 rows; the verifier treats absent values as a
 		-- chain reset point.
 		prev_hash    TEXT,
-		content_hash TEXT
+		content_hash TEXT,
+		-- v45 tamper-evidence: content_hash alone is an UNKEYED digest, so
+		-- anyone able to write the table can edit a row and recompute the
+		-- chain. key_id/signature bind the row to the private key of the host
+		-- that authored it; seq is that host's position counter, signed
+		-- alongside, so rows cannot be renumbered or silently dropped.
+		-- Nullable/zero for rows written before v45: those are chain-verified
+		-- but NOT tamper-evident, and the verifier reports them as such.
+		key_id       TEXT,
+		signature    TEXT,
+		seq          INTEGER NOT NULL DEFAULT 0
+	)`,
+
+	// Per-host audit verification certificates. Public material by definition —
+	// a certificate is meant to be handed out — so this replicates on the
+	// ordinary lane rather than the sensitive one. It exists so ANY node can
+	// verify ANY host's sub-chain: peers hold the cluster CA but do not store
+	// each other's leaf certificates, and cross-node verification is the whole
+	// point (a host that tampers with its own log is caught by its neighbours).
+	`CREATE TABLE IF NOT EXISTS audit_signing_keys (
+		key_id     TEXT PRIMARY KEY,
+		host_name  TEXT NOT NULL,
+		cert_pem   TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
+
+	// Signed audit chain heads. A hash chain links each row backward to its
+	// predecessor, which catches edits and mid-chain deletions but is blind to
+	// truncation: cut the last N rows and every surviving link still verifies,
+	// because nothing points forward. A periodically published head — signed,
+	// carrying the host's last seq and tail hash — is what makes the missing
+	// rows visible.
+	//
+	// APPEND-ONLY, with seq in the primary key. A head that could be updated in
+	// place would let an attacker replay an older legitimately-signed head to
+	// match a truncated log; with every head retained, the highest one still
+	// exists on every peer and the truncation shows up as a seq shortfall.
+	// epoch increments on reseal, so a reseal is a visible event in the record
+	// instead of an invisible rewrite.
+	`CREATE TABLE IF NOT EXISTS audit_chain_heads (
+		host_name  TEXT NOT NULL,
+		epoch      INTEGER NOT NULL DEFAULT 0,
+		seq        INTEGER NOT NULL DEFAULT 0,
+		head_hash  TEXT NOT NULL DEFAULT '',
+		key_id     TEXT NOT NULL DEFAULT '',
+		signature  TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
+		PRIMARY KEY (host_name, epoch, seq)
+	)`,
+
+	// Signed audit key retirements (v46). "Host H's key K signed nothing valid
+	// past sequence N, and here is a signature saying so."
+	//
+	// An earlier revision of this branch kept this as two mutable columns on
+	// audit_signing_keys, which was the
+	// wrong shape twice over. They were plain replicated data, so any peer could
+	// write a retirement for anyone — forging one put every row a host signed
+	// past a boundary, cluster-wide, with no way back — and clearing a genuine
+	// one locally cost nothing. Neither move required a key.
+	//
+	// retired_by_key_id names who is asserting it, and the signature is checked
+	// against that key's published certificate. Only three parties can produce
+	// one: the retired key itself (a host voluntarily stopping), a successor key
+	// of the same host (a rotation), or the cluster CA (a host that has lost its
+	// key or is being decommissioned). Someone who merely broke into a node
+	// cannot.
+	//
+	// APPEND-ONLY, and that is what makes it self-repairing: a row deleted
+	// locally has no local copy to conflict with, so ordinary anti-entropy
+	// re-inserts it from any peer. No bespoke merge rule, and no force-apply.
+	`CREATE TABLE IF NOT EXISTS audit_key_lifecycle (
+		host_name  TEXT NOT NULL,
+		key_id     TEXT NOT NULL,
+		-- 'adopted' or 'retired'. A key's signing contract runs between them.
+		--
+		-- Adoption is signed for the same reason retirement is, and it answers a
+		-- question the certificate alone cannot: WHEN the host committed. Without
+		-- it, publishing a certificate retroactively puts every row the host ever
+		-- wrote under the contract, so the first verify after enabling signing
+		-- reports a cluster's entire history as tampering.
+		event      TEXT NOT NULL,
+		-- For 'adopted', the sequence the chain had reached when the key took
+		-- effect: rows at or below it predate the commitment. For 'retired', the
+		-- last sequence the key was entitled to sign; a row from it above this is
+		-- a finding.
+		at_seq     INTEGER NOT NULL DEFAULT 0,
+		-- Who asserted it. The signature is checked against this key's published
+		-- certificate, which must chain to the cluster CA and name the host.
+		by_key_id  TEXT NOT NULL DEFAULT '',
+		signature  TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
+		-- by_key_id is IN the primary key, and that is what makes the slot
+		-- unsquattable. With (host, key, event) alone the table was first-write-
+		-- wins on data any peer can write: an attacker inserting an unverifiable
+		-- 'adopted' row got it ignored by the reader AND blocked the host from
+		-- ever recording its real one, so every pre-enforcement row that host
+		-- wrote became evidence, permanently. Keying by the signer puts a forged
+		-- row in a different slot from the genuine one; squatting would require
+		-- forging under the host's own key.
+		--
+		-- Several VERIFIED records per (host, key, event) are expected and
+		-- correct: a rotation and an operator retire-audit-key run both retire
+		-- the same key with different signers. The reader keeps the strictest.
+		PRIMARY KEY (host_name, key_id, event, by_key_id)
 	)`,
 
 	// Per-VM operational event store (v13). Durable, CRDT-replicated,
@@ -1399,6 +1676,33 @@ var schemaDDL = []string{
 		PRIMARY KEY (host_name, scope_key)
 	)`,
 
+	// host_networks (v48): declarative host network intent — bridges, bonds,
+	// VLAN interfaces, physical-NIC addressing (§O Tier 1). The owning host is
+	// the ONLY renderer/applier of its rows (state: desired → applying →
+	// applied | rolled_back, generation bumped per confirmed apply); other
+	// nodes read them for the UI/CLI and carry them for repair. members and
+	// addressing are JSON blobs owned by the netplan renderer.
+	`CREATE TABLE IF NOT EXISTS host_networks (
+		host_name    TEXT NOT NULL,
+		name         TEXT NOT NULL,
+		kind         TEXT NOT NULL,
+		members      TEXT NOT NULL DEFAULT '',
+		vlan_id      INTEGER NOT NULL DEFAULT 0,
+		vlan_link    TEXT NOT NULL DEFAULT '',
+		addressing   TEXT NOT NULL DEFAULT '',
+		mtu          INTEGER NOT NULL DEFAULT 0,
+		bond_mode    TEXT NOT NULL DEFAULT '',
+		lacp_rate    TEXT NOT NULL DEFAULT '',
+		hash_policy  TEXT NOT NULL DEFAULT '',
+		state        TEXT NOT NULL DEFAULT 'desired',
+		generation   INTEGER NOT NULL DEFAULT 0,
+		last_error   TEXT NOT NULL DEFAULT '',
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT,
+		PRIMARY KEY (host_name, name)
+	)`,
+
 	// containers cluster state. One row per LXC/OCI
 	// container; aggregated by `lv ct ls` cluster-wide. Lifecycle
 	// transitions are written by the daemon owning the container.
@@ -1420,6 +1724,9 @@ var schemaDDL = []string{
 		created_at     TEXT NOT NULL,
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT,
+		owner_epoch        INTEGER NOT NULL DEFAULT 0,     -- ownership incarnation for ABA-proof recovery (v44)
+		spec_generation    INTEGER NOT NULL DEFAULT 0,     -- monotonic desired-spec generation (v44)
+		active_operation_id TEXT NOT NULL DEFAULT '',      -- workload-wide mutation barrier (v44)
 		PRIMARY KEY (host_name, name)
 	)`,
 
@@ -1741,6 +2048,8 @@ var tablePrimaryKeys = map[string][]string{
 	"host_runtime_usage":       {"host_name"},
 	"clock_skew":               {"observer", "target"},
 	"crl_versions":             {"host"},
+	"cluster_crl":              {"id", "crl_pem"},
+	"host_networks":            {"host_name", "name"},
 	"leader_election":          {"key"},
 	"vm_locks":                 {"vm_name"},
 	"runtime_action_proofs":    {"id"},
@@ -1808,6 +2117,9 @@ var tablePrimaryKeys = map[string][]string{
 	"vm_nics":                 {"vm_name", "id"},
 	"vm_pci_intent":           {"vm_name", "device_id"},
 	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
+	"audit_signing_keys":      {"key_id"},
+	"audit_chain_heads":       {"host_name", "epoch", "seq"},
+	"audit_key_lifecycle":     {"host_name", "key_id", "event", "by_key_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -1996,6 +2308,33 @@ var schemaMigrations = []string{
 	`ALTER TABLE vm_disks ADD COLUMN controller_model TEXT`,
 	`ALTER TABLE vms ADD COLUMN hardware_adoption_state TEXT NOT NULL DEFAULT 'pending'`,
 	`ALTER TABLE vms ADD COLUMN hardware_adoption_error TEXT`,
+	// v43: per-host capacity policy. 0 / -1 mean "inherit the cluster default"
+	// (a real 0 reserve is meaningful, so absence is -1, not 0).
+	`ALTER TABLE hosts ADD COLUMN cpu_overcommit REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN mem_overcommit REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN cpu_reserve INTEGER NOT NULL DEFAULT -1`,
+	`ALTER TABLE hosts ADD COLUMN mem_reserve_mib INTEGER NOT NULL DEFAULT -1`,
+	// v44: container lifecycle fencing, per-host admission policy fingerprint,
+	// and scoped notification routes (see History v44).
+	`ALTER TABLE containers ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE containers ADD COLUMN spec_generation INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE containers ADD COLUMN active_operation_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE hosts ADD COLUMN capacity_policy_hash TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE notification_routes ADD COLUMN subject_pattern TEXT NOT NULL DEFAULT '*'`,
+	`ALTER TABLE notification_routes ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+	// v45: audit tamper-evidence (see History v45). key_id/signature stay
+	// nullable — absent means "written before signing", which the verifier
+	// reports rather than treats as a break.
+	`ALTER TABLE audit_log ADD COLUMN key_id TEXT`,
+	`ALTER TABLE audit_log ADD COLUMN signature TEXT`,
+	`ALTER TABLE audit_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
+	// v49: isolation epoch (§A). CLUSTER state about a host, not host-local
+	// state — replicated so every peer independently refuses a quarantined
+	// node's replication, and so a node cannot clear its own quarantine.
+	// Monotone: only ever increases, only through the peer-written guarded
+	// writer. 0 = not isolated (the legacy-compatible default).
+	`ALTER TABLE hosts ADD COLUMN isolation_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN isolation_reason TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2008,8 +2347,9 @@ var schemaMigrations = []string{
 type migKind int
 
 const (
-	kindAddColumn   migKind = iota // ALTER TABLE … ADD COLUMN; presence = column exists
-	kindCreateTable                // new table; presence = table exists (created by schemaDDL)
+	kindAddColumn         migKind = iota // ALTER TABLE … ADD COLUMN; presence = column exists
+	kindCreateTable                      // new table; presence = table exists (created by schemaDDL)
+	kindRebuildClusterCRL                // v47 final shape; presence = composite primary key
 )
 
 // migration is one ledgered schema unit.
@@ -2032,6 +2372,9 @@ func (m migration) present(ctx context.Context, c *Client) (bool, error) {
 		return columnExists(ctx, c.db, table, col)
 	case kindCreateTable:
 		return tableExists(ctx, c, m.Target)
+	case kindRebuildClusterCRL:
+		cols, err := primaryKeyColumns(ctx, c.db, m.Target)
+		return err == nil && slices.Equal(cols, []string{"id", "crl_pem"}), err
 	default:
 		return false, fmt.Errorf("migration %q: unknown kind %d", m.ID, m.Kind)
 	}
@@ -2073,6 +2416,12 @@ var alterVersions = []int{
 	41, 41, 41, // vms.vm_owner_epoch, vms.spec_generation, vms.active_operation_id
 	42, 42, 42, 42, // vm_disks.bus/device_kind/delete_with_vm/controller_model
 	42, 42, // vms.hardware_adoption_state/hardware_adoption_error
+	43, 43, 43, 43, // hosts.cpu_overcommit/mem_overcommit/cpu_reserve/mem_reserve_mib
+	44, 44, 44, // containers.owner_epoch/spec_generation/active_operation_id
+	44,     // hosts.capacity_policy_hash
+	44, 44, // notification_routes.subject_pattern/project
+	45, 45, 45, // audit_log.key_id/signature/seq
+	49, 49, // hosts.isolation_epoch/isolation_reason
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2095,6 +2444,10 @@ var createTableUnits = []struct {
 	{40, "host_fw_intent"},
 	{41, "operations"}, {41, "operation_steps"}, {41, "project_authority_epochs"},
 	{42, "vm_nics"}, {42, "vm_pci_intent"}, {42, "vm_pci_realizations"},
+	{45, "audit_signing_keys"}, {45, "audit_chain_heads"},
+	{46, "audit_key_lifecycle"},
+	{47, "cluster_crl"},
+	{48, "host_networks"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn
@@ -2128,4 +2481,11 @@ func init() {
 			Target:  ct.table,
 		})
 	}
+	schemaMigrationLedger = append(schemaMigrationLedger, migration{
+		ID:      "r_cluster_crl_composite_pk",
+		Version: 47,
+		Kind:    kindRebuildClusterCRL,
+		Target:  "cluster_crl",
+		SQL:     "DROP TABLE IF EXISTS cluster_crl;\n" + clusterCRLDDL,
+	})
 }

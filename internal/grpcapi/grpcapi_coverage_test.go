@@ -3929,16 +3929,17 @@ func TestMigrateRestore_MintsRelocationProofUnderEnforcement(t *testing.T) {
 	}
 	// Enforced + gated target → mint succeeds, a relocation proof row is written.
 	s := newS(true)
-	if _, err := s.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true); err != nil {
+	if _, err := s.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true, 7); err != nil {
 		t.Fatalf("migrate to a gated target under enforcement must succeed (mint proof); got %v", err)
 	}
-	rows, _ := s.db.Query(ctx, `SELECT action, dest_host FROM runtime_action_proofs WHERE target_name = 'ct1'`)
-	if len(rows) != 1 || rows[0].String("action") != corrosion.ActionRelocate || rows[0].String("dest_host") != "tgt" {
+	rows, _ := s.db.Query(ctx, `SELECT action, dest_host, owner_epoch FROM runtime_action_proofs WHERE target_name = 'ct1'`)
+	if len(rows) != 1 || rows[0].String("action") != corrosion.ActionRelocate ||
+		rows[0].String("dest_host") != "tgt" || rows[0].String("owner_epoch") != "7" {
 		t.Fatalf("expected one relocation proof for ct1→tgt; got %d rows", len(rows))
 	}
 	// Enforced + UNGATED target → refused (fail closed), no proofless migrate.
 	s2 := newS(false)
-	if _, err := s2.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true); err == nil {
+	if _, err := s2.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true, 7); err == nil {
 		t.Fatal("migrate under enforcement to a target that doesn't advertise the gate must be refused")
 	}
 }

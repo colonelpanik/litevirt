@@ -3,6 +3,8 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 )
 
 // ReservationVector is the capacity an in-flight operation has reserved, persisted
@@ -26,9 +28,45 @@ type ReservationVector struct {
 	SourceHost    string `json:"source_host,omitempty"`
 }
 
+// ReservationFacts is persisted on the reserved operation step. It is kept
+// separate from the requested capacity vector because it proves who authorized
+// that request, and therefore participates in authority-epoch validation.
+type ReservationFacts struct {
+	Project        string `json:"project"`
+	AuthorityEpoch int64  `json:"authority_epoch"`
+	AuthorityHost  string `json:"authority_host"`
+}
+
+// Validate rejects reservation vectors that could reduce capacity accounting or
+// cannot be attributed to a host. Empty project names remain the canonical
+// default-project representation for compatibility with legacy reservations.
+func (r ReservationVector) Validate() error {
+	values := []struct {
+		field string
+		value int
+	}{
+		{field: "project_cpu", value: r.ProjectCPU},
+		{field: "project_mem_mib", value: r.ProjectMemMiB},
+		{field: "target_cpu", value: r.TargetCPU},
+		{field: "target_mem_mib", value: r.TargetMemMiB},
+	}
+	for _, value := range values {
+		if value.value < 0 {
+			return fmt.Errorf("reservation %s must be non-negative", value.field)
+		}
+	}
+	if r.TargetHost == "" && (r.TargetCPU != 0 || r.TargetMemMiB != 0) {
+		return fmt.Errorf("reservation target_host is required for target capacity")
+	}
+	return nil
+}
+
 // Encode serializes the vector for the operations.reservation_json column. A zero
 // vector encodes to "" (no reservation).
 func (r ReservationVector) Encode() (string, error) {
+	if err := r.Validate(); err != nil {
+		return "", err
+	}
 	if r == (ReservationVector{}) {
 		return "", nil
 	}
@@ -43,16 +81,93 @@ func DecodeReservation(s string) (ReservationVector, error) {
 	if s == "" {
 		return r, nil
 	}
-	err := json.Unmarshal([]byte(s), &r)
-	return r, err
+	var decoded *ReservationVector
+	if err := json.Unmarshal([]byte(s), &decoded); err != nil {
+		return ReservationVector{}, err
+	}
+	if decoded == nil {
+		return ReservationVector{}, fmt.Errorf("reservation must be a JSON object")
+	}
+	r = *decoded
+	if err := r.Validate(); err != nil {
+		return ReservationVector{}, err
+	}
+	return r, nil
+}
+
+func checkedReservationAdd(total, delta int) (int, error) {
+	if total < 0 || delta < 0 {
+		return 0, fmt.Errorf("reservation total cannot be negative")
+	}
+	if delta > math.MaxInt-total {
+		return 0, fmt.Errorf("reservation total overflow")
+	}
+	return total + delta, nil
+}
+
+func remainingCapacity(allocatable int, consumed ...int) (int, error) {
+	if allocatable < 0 {
+		return 0, fmt.Errorf("allocatable capacity cannot be negative")
+	}
+	remaining := allocatable
+	for _, amount := range consumed {
+		if amount < 0 {
+			return 0, fmt.Errorf("consumed capacity cannot be negative")
+		}
+		if amount >= remaining {
+			return 0, nil
+		}
+		remaining -= amount
+	}
+	return remaining, nil
+}
+
+func reservationStepFacts(facts *ReservationFacts, project string) (string, error) {
+	if facts == nil {
+		return "", nil // backward-compatible pre-authority reservation
+	}
+	if facts.AuthorityEpoch <= 0 || facts.AuthorityHost == "" {
+		return "", fmt.Errorf("invalid reservation authority facts")
+	}
+	if projectOrDefault(facts.Project) != projectOrDefault(project) {
+		return "", fmt.Errorf("reservation project does not match operation project")
+	}
+	normalized := ReservationFacts{
+		Project:        projectOrDefault(project),
+		AuthorityEpoch: facts.AuthorityEpoch,
+		AuthorityHost:  facts.AuthorityHost,
+	}
+	b, err := json.Marshal(normalized)
+	return string(b), err
 }
 
 // nonterminalReservations returns the reservation vector of every operation whose
 // reduced state is NOT terminal — the in-flight capacity claims admission must
 // count on top of committed running-VM actuals.
 func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVector, error) {
+	byID, err := nonterminalReservationsByID(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ReservationVector, 0, len(byID))
+	for _, rv := range byID {
+		out = append(out, rv)
+	}
+	return out, nil
+}
+
+// nonterminalReservationsByID is the single validated scan behind every capacity
+// aggregate, keyed by operation id for the orderings reserve-then-verify needs.
+//
+// Keeping ONE scan matters more than it looks: an unvalidated id-keyed duplicate
+// used to sit beside this, so ReservedBefore counted claims that HostReserved had
+// already fenced as stale, and admission could disagree with itself about the same
+// reservation depending on which aggregate asked.
+func nonterminalReservationsByID(ctx context.Context, c *Client) (map[string]ReservationVector, error) {
 	orows, err := c.Query(ctx,
-		`SELECT id, operation_kind, reservation_json FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
+		`SELECT id, project, resource_kind, resource_id, operation_kind,
+		        reservation_json, desired_ref, vm_owner_epoch
+		 FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
 	if err != nil {
 		return nil, err
 	}
@@ -60,23 +175,46 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 		return nil, nil
 	}
 
-	// Bulk-load steps once, grouped by operation id (arbitrary owner epoch — the
-	// reducer only needs the set of step names to decide terminality).
-	srows, err := c.Query(ctx, `SELECT operation_id, step_name FROM operation_steps WHERE deleted_at IS NULL`)
+	// Bulk-load steps once, grouped by operation id + the immutable header's
+	// owner epoch. A terminal written by a stale owner must not release the
+	// current owner's reservation.
+	srows, err := c.Query(ctx,
+		`SELECT operation_id, owner_epoch, step_name, facts
+		 FROM operation_steps WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
-	stepsByOp := make(map[string][]string, len(orows))
+	stepsByOpEpoch := make(map[string][]string, len(orows))
+	reservationFactsByOpEpoch := make(map[string]string, len(orows))
 	for _, r := range srows {
 		id := r.String("operation_id")
-		stepsByOp[id] = append(stepsByOp[id], r.String("step_name"))
+		key := fmt.Sprintf("%s\x00%d", id, r.Int64("owner_epoch"))
+		stepsByOpEpoch[key] = append(stepsByOpEpoch[key], r.String("step_name"))
+		if r.String("step_name") == OpStepReserved {
+			reservationFactsByOpEpoch[key] = r.String("facts")
+		}
 	}
 
-	var out []ReservationVector
+	out := make(map[string]ReservationVector, len(orows))
 	for _, r := range orows {
 		id := r.String("id")
 		kind := OperationKind(r.String("operation_kind"))
-		state, _ := ReduceOperationState(kind, stepsByOp[id])
+		if kind == OpWorkloadCreate && r.Int64("vm_owner_epoch") != 0 {
+			current, err := operationOwnsCurrentWorkload(ctx, c,
+				id, r.String("resource_kind"), r.String("resource_id"),
+				r.String("desired_ref"), r.Int64("vm_owner_epoch"))
+			if err != nil {
+				return nil, err
+			}
+			if !current {
+				// The immutable header remains journal-visible, but a superseded
+				// v44 workload owner must not make it an authoritative capacity
+				// claim. Epoch-zero legacy journals retain their old behavior.
+				continue
+			}
+		}
+		key := fmt.Sprintf("%s\x00%d", id, r.Int64("vm_owner_epoch"))
+		state, _ := ReduceOperationState(kind, stepsByOpEpoch[key])
 		if IsOperationTerminal(state) {
 			continue
 		}
@@ -84,9 +222,109 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, rv)
+		if operationProject := r.String("project"); operationProject != "" && rv != (ReservationVector{}) {
+			if rv.Project != operationProject {
+				return nil, fmt.Errorf(
+					"reservation %s project %q does not match operation project %q",
+					id, rv.Project, operationProject)
+			}
+			if err := validateReservationProject(r.String("reservation_json"), operationProject); err != nil {
+				return nil, fmt.Errorf("reservation %s has invalid project binding: %w", id, err)
+			}
+		}
+		authority, ok, err := CurrentProjectAuthority(ctx, c, r.String("project"))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			rawFacts := reservationFactsByOpEpoch[key]
+			if rawFacts == "" {
+				// A pre-authority reservation cannot be attributed to the
+				// current authority. It remains journal-visible but does not
+				// consume capacity after an authority epoch is established.
+				continue
+			}
+			var facts ReservationFacts
+			if err := json.Unmarshal([]byte(rawFacts), &facts); err != nil {
+				return nil, fmt.Errorf("reservation %s has malformed authority facts: %w", id, err)
+			}
+			if facts.Project == "" || facts.AuthorityEpoch <= 0 || facts.AuthorityHost == "" {
+				return nil, fmt.Errorf("reservation %s has malformed authority facts", id)
+			}
+			if facts.AuthorityEpoch != authority.Epoch {
+				continue // reservation minted by a fenced/stale authority
+			}
+			if projectOrDefault(facts.Project) != authority.Project ||
+				facts.AuthorityHost != authority.Holder {
+				return nil, fmt.Errorf("reservation %s has invalid current-authority facts", id)
+			}
+		}
+		out[id] = rv
 	}
 	return out, nil
+}
+
+func operationOwnsCurrentWorkload(ctx context.Context, c *Client, operationID, resourceKind, resourceID, desiredRef string, ownerEpoch int64) (bool, error) {
+	var rows []Row
+	var err error
+	switch resourceKind {
+	case "vm":
+		rows, err = c.Query(ctx,
+			`SELECT 1 FROM vms
+			 WHERE name = ? AND vm_owner_epoch = ? AND active_operation_id = ?
+			   AND deleted_at IS NULL`,
+			resourceID, ownerEpoch, operationID)
+	case "container":
+		host, name, ok := parseContainerCreateDesiredRef(desiredRef)
+		if !ok || name != resourceID {
+			return false, nil
+		}
+		rows, err = c.Query(ctx,
+			`SELECT 1 FROM containers
+			 WHERE host_name = ? AND name = ? AND owner_epoch = ?
+			   AND active_operation_id = ? AND deleted_at IS NULL`,
+			host, name, ownerEpoch, operationID)
+	default:
+		// Reservations are currently defined only for workload operations.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(rows) != 0, nil
+}
+
+// ReservedBefore sums the NONTERMINAL reservation deltas of operations whose id
+// sorts strictly BEFORE opID — the claimants this admission must yield to.
+//
+// Operation ids are globally unique, so ordering them lexically is a TOTAL order
+// every node computes identically. Reserve-then-verify counts only these: our own
+// reservation must not be subtracted from the headroom we are about to compare our
+// own request against (that double-counts), and later claimants yield to us, which
+// is what makes exactly one racer win instead of both refusing.
+//
+// Counting earlier-only rather than crediting back is deliberate. Headroom clamps
+// at zero, so "subtract everything then add ours back" silently over-credits once
+// the host is oversubscribed — a bug this shape had until a test caught it.
+func ReservedBefore(ctx context.Context, c *Client, host, project, opID string) (hostCPU, hostMem, projCPU, projMem int, err error) {
+	rvs, err := nonterminalReservationsByID(ctx, c)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	for id, rv := range rvs {
+		if id >= opID {
+			continue // ourselves, or a LATER claimant that yields to us
+		}
+		if host != "" && rv.TargetHost == host {
+			hostCPU += rv.TargetCPU
+			hostMem += rv.TargetMemMiB
+		}
+		if project != "" && rv.Project == project {
+			projCPU += rv.ProjectCPU
+			projMem += rv.ProjectMemMiB
+		}
+	}
+	return hostCPU, hostMem, projCPU, projMem, nil
 }
 
 // HostReserved sums the target-host reservation deltas of all NONTERMINAL operations
@@ -98,8 +336,14 @@ func HostReserved(ctx context.Context, c *Client, host string) (cpu, memMiB int,
 	}
 	for _, rv := range rvs {
 		if rv.TargetHost == host {
-			cpu += rv.TargetCPU
-			memMiB += rv.TargetMemMiB
+			cpu, err = checkedReservationAdd(cpu, rv.TargetCPU)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sum host %q CPU reservations: %w", host, err)
+			}
+			memMiB, err = checkedReservationAdd(memMiB, rv.TargetMemMiB)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sum host %q memory reservations: %w", host, err)
+			}
 		}
 	}
 	return cpu, memMiB, nil
@@ -115,41 +359,110 @@ func ProjectReserved(ctx context.Context, c *Client, project string) (cpu, memMi
 	}
 	for _, rv := range rvs {
 		if projectOrDefault(rv.Project) == project {
-			cpu += rv.ProjectCPU
-			memMiB += rv.ProjectMemMiB
+			cpu, err = checkedReservationAdd(cpu, rv.ProjectCPU)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sum project %q CPU reservations: %w", project, err)
+			}
+			memMiB, err = checkedReservationAdd(memMiB, rv.ProjectMemMiB)
+			if err != nil {
+				return 0, 0, fmt.Errorf("sum project %q memory reservations: %w", project, err)
+			}
 		}
 	}
 	return cpu, memMiB, nil
 }
 
-// HostFreeCapacity reports a host's free CPU and memory (MiB): total minus committed
-// running-VM actuals minus in-flight nonterminal reservations. Negative values are
-// clamped to 0 (an overcommitted host has no free capacity). Returns ok=false when
-// the host is unknown.
+// HostFreeCapacity reports a host's free CPU and memory (MiB): ALLOCATABLE (see
+// HostAllocatable — physical, adjusted by overcommit ratios and host reserves)
+// minus committed running-VM actuals, running-container memory, per-VM qemu
+// overhead, and in-flight nonterminal reservations. Negative values are
+// clamped to 0 (an overcommitted
+// host has no free capacity). Returns ok=false when the host is unknown.
+//
+// Uses the DEFAULT cluster policy. Callers that carry a configured one should use
+// HostFreeCapacityWithPolicy so a cluster's configuration is actually honoured.
 func HostFreeCapacity(ctx context.Context, c *Client, host string) (freeCPU, freeMemMiB int, ok bool, err error) {
-	h, err := GetHost(ctx, c, host)
+	return HostFreeCapacityWithPolicy(ctx, c, host, DefaultCapacityPolicy())
+}
+
+// HostFreeCapacityBefore is HostFreeCapacityWithPolicy counting only reservations
+// from operations that sort BEFORE opID. Used by reserve-then-verify so an
+// admission compares its request against headroom that excludes its own
+// provisional reservation.
+func HostFreeCapacityBefore(ctx context.Context, c *Client, host string, policy CapacityPolicy, opID string) (freeCPU, freeMemMiB int, ok bool, err error) {
+	resCPU, resMem, _, _, err := ReservedBefore(ctx, c, host, "", opID)
 	if err != nil {
 		return 0, 0, false, err
 	}
-	if h == nil {
-		return 0, 0, false, nil
+	return hostFreeWithReserved(ctx, c, host, policy, resCPU, resMem)
+}
+
+// HostFreeCapacityWithPolicy is HostFreeCapacity under an explicit cluster policy.
+func HostFreeCapacityWithPolicy(ctx context.Context, c *Client, host string, policy CapacityPolicy) (freeCPU, freeMemMiB int, ok bool, err error) {
+	resCPU, resMem, err := HostReserved(ctx, c, host)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return hostFreeWithReserved(ctx, c, host, policy, resCPU, resMem)
+}
+
+// hostFreeWithReserved is the shared tail of the host-headroom calculation, taking
+// the reservation totals to subtract. Split out so reserve-then-verify can supply a
+// FILTERED total (earlier claimants only) instead of re-deriving the arithmetic —
+// and so the clamp below lives in exactly one place.
+func hostFreeWithReserved(ctx context.Context, c *Client, host string, policy CapacityPolicy, resCPU, resMem int) (freeCPU, freeMemMiB int, ok bool, err error) {
+	h, err := GetHost(ctx, c, host)
+	if err != nil || h == nil {
+		return 0, 0, false, err
 	}
 	usage, err := SumVMResourcesByHost(ctx, c)
 	if err != nil {
 		return 0, 0, false, err
 	}
-	resCPU, resMem, err := HostReserved(ctx, c, host)
+	// Containers consume host memory too, and were absent from this sum entirely.
+	ctMem, err := SumContainerMemoryByHost(ctx, c)
 	if err != nil {
 		return 0, 0, false, err
 	}
+	allocCPU, allocMem := HostAllocatable(*h, policy)
 	u := usage[host]
-	freeCPU = h.CPUTotal - u.CpuUsed - resCPU
-	freeMemMiB = h.MemTotal - u.MemUsedMiB - resMem
-	if freeCPU < 0 {
-		freeCPU = 0
+	freeCPU, err = remainingCapacity(allocCPU, u.CpuUsed, resCPU)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("calculate host %q free CPU: %w", host, err)
 	}
-	if freeMemMiB < 0 {
-		freeMemMiB = 0
+	freeMemMiB, err = remainingCapacity(
+		allocMem, u.MemUsedMiB, ctMem[host], resMem, policy.MemOverheadFor(u.VMCount))
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("calculate host %q free memory: %w", host, err)
 	}
 	return freeCPU, freeMemMiB, true, nil
+}
+
+// AppendReservationFacts records the `reserved` step proving WHICH authority epoch
+// admitted a reservation.
+//
+// This is not optional bookkeeping. Once a project has an authority epoch, the
+// aggregation above refuses to count a reservation that cannot be attributed to the
+// CURRENT one — so a mint that skips this step silently stops consuming capacity and
+// the same headroom gets handed out twice. Every live reservation writer must call it.
+//
+// facts==nil is the genuine pre-authority case (no epoch exists yet): the step is
+// written empty, and aggregation keeps counting the claim as a legacy one.
+func AppendReservationFacts(ctx context.Context, c *Client, opID string, ownerEpoch int64, project string, facts *ReservationFacts) error {
+	encoded, err := reservationStepFacts(facts, project)
+	if err != nil {
+		return err
+	}
+	return AppendOperationStep(ctx, c, OperationStepRecord{
+		OperationID: opID, OwnerEpoch: ownerEpoch, StepName: OpStepReserved, Facts: encoded,
+	})
+}
+
+// ReservationFactsFor builds the authority facts for a reservation minted under the
+// project's current authority, or nil when the project has none yet.
+func ReservationFactsFor(project string, epoch int64, holder string) *ReservationFacts {
+	if epoch <= 0 || holder == "" {
+		return nil
+	}
+	return &ReservationFacts{Project: projectOrDefault(project), AuthorityEpoch: epoch, AuthorityHost: holder}
 }

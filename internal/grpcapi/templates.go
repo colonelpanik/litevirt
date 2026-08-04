@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +17,6 @@ import (
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -86,6 +84,27 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if src.Spec != "" {
 		_ = json.Unmarshal([]byte(src.Spec), &srcSpec)
 	}
+
+	// Capacity + quota admission. A clone is a full-sized VM — same vCPU, same
+	// memory, its own disks — so it consumes exactly what CreateVM would, and
+	// skipping this let a clone walk past both the host's capacity and the
+	// project's quota. Cloning a template in a loop was an unbounded way to
+	// overfill a host with every other create path refusing correctly.
+	//
+	// It runs HERE, after the forward to the source's host, for the same reason
+	// CreateVM admits only on the owning node: reserving on both nodes counts one
+	// clone twice and the forwarded half then refuses itself. It is also before
+	// any disk is written, so a refusal costs no I/O.
+	//
+	// The figures come from srcSpec, which is what the clone's VM record will
+	// report as its usage — admitting a different number than the row we go on to
+	// write would leave the accounting permanently off by the difference.
+	lease, aerr := s.admitWithReservation(
+		ctx, "CloneVM", s.hostName, project, "vm:"+req.Target, int(srcSpec.Cpu), int(srcSpec.MemoryMib), true)
+	if aerr != nil {
+		return nil, aerr
+	}
+	defer lease.release(ctx)
 
 	mode := cloneMode(req.Mode, allDisksShared(srcDisks))
 
@@ -168,11 +187,9 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: strings.TrimPrefix(bridge, "direct:"), Model: n.Model, MAC: mac})
 		} else {
-			if _, e := net.InterfaceByName(bridge); e != nil {
-				if e := network.EnsureBridge(bridge); e != nil {
-					cleanup()
-					return nil, status.Errorf(codes.FailedPrecondition, "bridge %q unavailable: %v", bridge, e)
-				}
+			if e := s.ensureBridge(bridge); e != nil {
+				cleanup()
+				return nil, status.Errorf(codes.FailedPrecondition, "bridge %q unavailable: %v", bridge, e)
 			}
 			netConfigs = append(netConfigs, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		}
@@ -261,6 +278,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "define clone domain: %v", err)
+	}
+	// specJSON above was marshalled BEFORE the define, so it carries whatever
+	// the source spec had — an alias if the source was never pinned. The define
+	// just resolved it against this host's qemu; persist that concrete value
+	// instead, or the clone starts life with the ABI hazard its source had.
+	// Re-marshal, since the pre-pin JSON is what would otherwise be stored.
+	if before := srcSpec.Machine; true {
+		s.pinMachineFromDomain(&srcSpec)
+		if srcSpec.Machine != before {
+			specJSON, _ = json.Marshal(&srcSpec)
+		}
 	}
 
 	// Roll back everything the clone built until the DB row lands — including the

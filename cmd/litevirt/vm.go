@@ -22,6 +22,7 @@ func newRunCmd() *cobra.Command {
 		image        string
 		disk         string
 		host         string
+		project      string
 		onboot       bool
 		startupOrder int32
 		startDelay   int32
@@ -32,6 +33,8 @@ func newRunCmd() *cobra.Command {
 		restartWin   string
 		secureBoot   bool
 		tpm          bool
+
+		allowOvercommit bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -40,6 +43,7 @@ func newRunCmd() *cobra.Command {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				spec := &pb.VMSpec{
 					Name:          name,
+					Project:       project,
 					Image:         image,
 					Cpu:           cpu,
 					MemoryMib:     memory,
@@ -70,7 +74,7 @@ func newRunCmd() *cobra.Command {
 					}
 				}
 
-				vm, err := c.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+				vm, err := c.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec, AllowOvercommit: allowOvercommit})
 				if err != nil {
 					return fmt.Errorf("create VM: %w", err)
 				}
@@ -88,6 +92,7 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&image, "image", "", "Base image name")
 	cmd.Flags().StringVar(&disk, "disk", "20G", "Root disk size")
 	cmd.Flags().StringVar(&host, "host", "", "Target host")
+	cmd.Flags().StringVar(&project, "project", "", "Tenancy project to create the VM in (default: _default); its quota is charged")
 	cmd.Flags().BoolVar(&onboot, "onboot", false, "Start this VM automatically when its host boots")
 	cmd.Flags().Int32Var(&startupOrder, "startup-order", 0, "Autostart order (lower starts first)")
 	cmd.Flags().Int32Var(&startDelay, "start-delay", 0, "Seconds to wait after starting this VM before the next")
@@ -98,6 +103,8 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&restartWin, "restart-window", "", "Attempt-count window (e.g. 1h; default 1h)")
 	cmd.Flags().BoolVar(&secureBoot, "secure-boot", false, "Enable UEFI Secure Boot (q35; Windows 11 / signed-boot guests)")
 	cmd.Flags().BoolVar(&tpm, "tpm", false, "Attach an emulated TPM 2.0 device (Windows 11 / BitLocker)")
+	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
+		"Skip the host capacity check for this VM (project quota still applies). For deliberate density on a host you know can take it; the bypass is audited.")
 	cmd.MarkFlagRequired("name")
 	return cmd
 }
@@ -160,13 +167,16 @@ func newInspectCmd() *cobra.Command {
 }
 
 func newStartCmd() *cobra.Command {
-	return &cobra.Command{
+	var allowOvercommit bool
+	cmd := &cobra.Command{
 		Use:   "start <vm>",
 		Short: "Start a stopped VM",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				vm, err := c.StartVM(ctx, &pb.StartVMRequest{Name: args[0]})
+				vm, err := c.StartVM(ctx, &pb.StartVMRequest{
+					Name: args[0], AllowOvercommit: allowOvercommit,
+				})
 				if err != nil {
 					return fmt.Errorf("start VM: %w", err)
 				}
@@ -175,6 +185,9 @@ func newStartCmd() *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
+		"Skip the host capacity check for this start. Requires the vm.overcommit verb; the bypass is audited. (Start never charges project quota — the allocation already counts whether running or stopped.)")
+	return cmd
 }
 
 func newStopCmd() *cobra.Command {

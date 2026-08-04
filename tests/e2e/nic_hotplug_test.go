@@ -127,10 +127,18 @@ func TestVM_DetachNIC_ActuallyRemovesItFromTheDomain(t *testing.T) {
 
 	// ── detach ─────────────────────────────────────────────────────────────
 	// PCI hot-unplug is COOPERATIVE: libvirt asks the guest to eject the device
-	// over ACPI, and a guest still booting never answers. litevirt then refuses to
-	// claim success ("still present in the live domain") and leaves the NIC
-	// recoverable — correct behaviour, and safe to retry. So retry across a window
-	// instead of racing the guest's boot.
+	// over ACPI, and a guest that has not yet enumerated a just-hot-added device
+	// never answers — the request is DROPPED, not queued, so waiting alone never
+	// clears it. DetachNIC now polls AND periodically re-requests the unplug
+	// (hotplug_unplug_wait.go), which is what makes it converge.
+	//
+	// This used to SKIP when the guest never acknowledged, because before that fix
+	// it genuinely never did — the same VM here failed to detach across a full
+	// five-minute retry window. It now succeeds under those same conditions, so
+	// the skip is gone: a detach that does not complete is a failure.
+	//
+	// The outer retry is kept as margin on top of the detach's own 30s wait; it
+	// should normally succeed on the first attempt.
 	//
 	// The regression is checked on EVERY attempt, not just the last: the old code
 	// sent malformed detach XML, which libvirt rejected with a complaint about a
@@ -153,10 +161,8 @@ func TestVM_DetachNIC_ActuallyRemovesItFromTheDomain(t *testing.T) {
 		time.Sleep(15 * time.Second)
 	}
 	if !detached {
-		// Never succeeded, but never produced the malformed-XML error either. That
-		// is a guest that never processed the eject, not a detach defect — and the
-		// NIC is left recoverable by design, so nothing is broken.
-		t.Skipf("guest never acknowledged the ACPI eject within the window (last: %v\n%s)", lastErr, lastOut)
+		t.Fatalf("detach never completed within the window — the unplug wait re-requests the eject, so a cooperative guest must eventually release the device (last: %v\n%s)",
+			lastErr, lastOut)
 	}
 
 	// Succeeded — libvirt must no longer report it.

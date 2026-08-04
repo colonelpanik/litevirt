@@ -34,6 +34,11 @@ type mockGRPC struct {
 	mu sync.Mutex
 	// Response fields
 	listHostsResp        *pb.ListHostsResponse
+	listHostNetworksResp *pb.ListHostNetworksResponse
+	lastUpsertHostNetwork *pb.UpsertHostNetworkRequest
+	lastApplyHostNetwork  *pb.ApplyHostNetworkRequest
+	lastDeleteHostNetwork *pb.DeleteHostNetworkRequest
+	planHostNetworkResp   *pb.PlanHostNetworkResponse
 	inspectHostResp      *pb.Host
 	inspectHostErr       error
 	listVMsResp          *pb.ListVMsResponse
@@ -1279,7 +1284,10 @@ func (m *mockGRPC) VerifyAuditChain(context.Context, *emptypb.Empty, ...grpc.Cal
 	if m.verifyAuditResp != nil {
 		return m.verifyAuditResp, nil
 	}
-	return &pb.VerifyAuditChainResponse{}, nil
+	// Default is a clean, fully-signed chain; a test wanting a finding sets
+	// verifyAuditResp — and must set Tampered, which is the field the toast
+	// branches on, not BrokenAtId.
+	return &pb.VerifyAuditChainResponse{RowsChecked: 3, Tampered: false}, nil
 }
 func (m *mockGRPC) ExportAuditChain(_ context.Context, in *pb.ExportAuditChainRequest, _ ...grpc.CallOption) (*pb.ExportAuditChainResponse, error) {
 	m.lastExportReq = in
@@ -1373,5 +1381,44 @@ func (m *mockGRPC) ListNotificationRoutes(_ context.Context, _ *pb.ListNotificat
 	return &pb.ListNotificationRoutesResponse{}, nil
 }
 func (m *mockGRPC) DeleteNotificationRoute(_ context.Context, _ *pb.DeleteNotificationRouteRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+
+func (m *mockGRPC) ListHostNetworks(ctx context.Context, in *pb.ListHostNetworksRequest, opts ...grpc.CallOption) (*pb.ListHostNetworksResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listHostNetworksResp != nil {
+		return m.listHostNetworksResp, nil
+	}
+	return &pb.ListHostNetworksResponse{}, nil
+}
+
+func (m *mockGRPC) UpsertHostNetwork(ctx context.Context, in *pb.UpsertHostNetworkRequest, opts ...grpc.CallOption) (*pb.HostNetwork, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastUpsertHostNetwork = in
+	return in.GetNetwork(), nil
+}
+
+func (m *mockGRPC) PlanHostNetwork(ctx context.Context, in *pb.PlanHostNetworkRequest, opts ...grpc.CallOption) (*pb.PlanHostNetworkResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.planHostNetworkResp != nil {
+		return m.planHostNetworkResp, nil
+	}
+	return &pb.PlanHostNetworkResponse{Rendered: "network:\n  version: 2\n"}, nil
+}
+
+func (m *mockGRPC) ApplyHostNetwork(ctx context.Context, in *pb.ApplyHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastApplyHostNetwork = in
+	return &emptypb.Empty{}, nil
+}
+
+func (m *mockGRPC) DeleteHostNetwork(ctx context.Context, in *pb.DeleteHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastDeleteHostNetwork = in
 	return &emptypb.Empty{}, nil
 }

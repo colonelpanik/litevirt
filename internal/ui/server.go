@@ -122,6 +122,7 @@ func NewServer(client pb.LiteVirtClient, clusterName string) (*Server, error) {
 		"pct":         pctHelper,
 		"dict":        dictHelper,
 		"hasPrefix":   strings.HasPrefix,
+		"join":        strings.Join,
 	}
 
 	// Parse base.html and shared partials (but NOT page templates — those are
@@ -382,6 +383,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /ui/vms/{name}/logs/stream", s.requireAuthFunc(s.handleVMLogsStream))
 	mux.HandleFunc("GET /ui/restore-modal", s.requireAuthFunc(s.handleRestoreModal))
 	mux.HandleFunc("GET /ui/hosts/{name}/upgrade-modal", s.requireAuthFunc(s.handleUpgradeModal))
+	// Host network configuration (v48): intent CRUD + plan-then-confirm apply.
+	mux.HandleFunc("GET /ui/hosts/{name}/network-modal", s.requireAuthFunc(s.handleHostNetworkModal))
+	mux.HandleFunc("POST /ui/hosts/{name}/network", s.requireAuthFunc(s.handleHostNetworkSave))
+	mux.HandleFunc("DELETE /ui/hosts/{name}/network/{iface}", s.requireAuthFunc(s.handleHostNetworkDelete))
+	mux.HandleFunc("GET /ui/hosts/{name}/network-plan-modal", s.requireAuthFunc(s.handleHostNetworkPlanModal))
+	mux.HandleFunc("POST /ui/hosts/{name}/network-apply", s.requireAuthFunc(s.handleHostNetworkApply))
 
 	// Actions (require auth)
 	mux.HandleFunc("POST /ui/vms", s.requireAuthFunc(s.handleCreateVM))

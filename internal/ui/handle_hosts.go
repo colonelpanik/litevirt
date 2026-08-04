@@ -70,6 +70,7 @@ func (s *Server) handleHostDetail(w http.ResponseWriter, r *http.Request) {
 	vms, _ := s.grpc.ListVMs(ctx, &pb.ListVMsRequest{HostName: name})
 	devices, _ := s.grpc.ListHostDevices(ctx, &pb.ListHostDevicesRequest{Name: name})
 	allNets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	hostNetIntents, _ := s.grpc.ListHostNetworks(ctx, &pb.ListHostNetworksRequest{HostName: name})
 
 	// Filter networks to those used by VMs on this host.
 	usedNets := map[string]bool{}
@@ -107,6 +108,7 @@ func (s *Server) handleHostDetail(w http.ResponseWriter, r *http.Request) {
 	data["VMs"] = vms.GetVms()
 	data["Devices"] = devices.GetDevices()
 	data["Networks"] = hostNets
+	data["HostNetworks"] = hostNetIntents.GetNetworks()
 	data["CPUPct"] = cpuPct
 	data["MemPct"] = memPct
 	data["DiskActualUsed"] = diskActualUsed

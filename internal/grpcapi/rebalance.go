@@ -84,6 +84,7 @@ func (s *Server) RunRebalance(ctx context.Context, req *pb.RunRebalanceRequest) 
 		return nil, err
 	}
 	r := scheduler.NewRebalancer(s.hostName, s.db)
+	r.SetCapacityPolicy(s.capacity)
 	before := s.countProposals(ctx)
 	if err := r.RunOnce(ctx); err != nil {
 		return nil, status.Errorf(codes.Internal, "run rebalance: %v", err)

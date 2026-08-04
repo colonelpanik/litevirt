@@ -585,7 +585,10 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 	// briefly to absorb a transient error before giving up to the reconciler.
 	var werr error
 	for attempt := 0; attempt < 4; attempt++ {
-		if werr = corrosion.UpdateVMHost(ctx, v.db, vm.Name, target.Name, "running"); werr == nil {
+		// Phase 4: the post-migration re-home is an ownership transition —
+		// fresh-read CAS + epoch increment. Re-reading inside the retry loop
+		// keeps a transient CAS loss (a concurrent transition) retryable.
+		if werr = corrosion.TransferVMOwnerFresh(ctx, v.db, vm.Name, target.Name, "running"); werr == nil {
 			break
 		}
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)

@@ -9,6 +9,42 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
+// Resource defaults for a CREATE whose caller left cpu/memory unset. On create,
+// 0 means "use the default" — NOT "keep current", which is the separate
+// resize/reconfigure semantic.
+const (
+	DefaultVMCPU       = 2
+	DefaultVMMemoryMiB = 4096
+)
+
+// NormalizeVMSpecResources fills in the create-time cpu/memory defaults.
+//
+// This MUST run before anything reads spec.Cpu/spec.MemoryMib for ADMISSION —
+// project quota, placement, host capacity. Every one of those checks is a no-op
+// at zero (the admission helpers early-return on non-positive deltas, placement
+// skips its fit filter behind `if req.CPUNeeded > 0`, and a quota check cannot be
+// violated by adding 0), so defaulting afterwards admitted a free VM and then ran
+// a 2 vCPU / 4096 MiB one — repeatable, bypassing both quota and host capacity.
+//
+// It lives here rather than in grpcapi because BOTH the CreateVM handler and the
+// compose planner's placement request need it, and compose is the package they
+// share. Idempotent, so calling it again on a forwarded or replanned spec is free.
+//
+// Deliberately narrow: it touches ONLY the two admission inputs. Other create
+// defaults (machine, firmware, the server-owned UUID mint) stay with the handler
+// that owns them.
+func NormalizeVMSpecResources(spec *pb.VMSpec) {
+	if spec == nil {
+		return
+	}
+	if spec.Cpu == 0 {
+		spec.Cpu = DefaultVMCPU
+	}
+	if spec.MemoryMib == 0 {
+		spec.MemoryMib = DefaultVMMemoryMiB
+	}
+}
+
 // BuildVMSpec converts a compose VMDef into a gRPC VMSpec.
 // Used by both the CLI (lv compose up) and the server-side DeployStack handler.
 func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec, error) {
@@ -270,6 +306,17 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			onFailure = pb.HostFailurePolicy_RESTART_SAME
 		case "none":
 			onFailure = pb.HostFailurePolicy_FAILURE_NONE
+		}
+		// Mirror the policy into the top-level string field: the failover
+		// coordinator resolves it from the persisted spec JSON, where the enum
+		// is unusable (RESTART_ANY = 0 is omitempty-dropped on store).
+		switch onFailure {
+		case pb.HostFailurePolicy_RESTART_SAME:
+			spec.OnHostFailure = "restart-same"
+		case pb.HostFailurePolicy_FAILURE_NONE:
+			spec.OnHostFailure = "none"
+		default:
+			spec.OnHostFailure = "restart-any"
 		}
 		spec.Migrate = &pb.MigrationPolicy{
 			Strategy:        strategy,

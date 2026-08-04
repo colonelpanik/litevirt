@@ -1,8 +1,12 @@
 package grpcapi
 
 import (
+	"context"
 	"sync"
 
+	"google.golang.org/grpc"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/image"
@@ -36,6 +40,13 @@ func (s *Server) ImagePathForTests(imageName string) string {
 	return s.images.ImagePath(imageName)
 }
 
+// PeerClientForTests exposes peerClient so the fleet harness can assert on peer
+// DIALLING, not just on peer acceptance. The two halves were fixed at different
+// times and only the inbound one had coverage.
+func (s *Server) PeerClientForTests(ctx context.Context, hostName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
+	return s.peerClient(ctx, hostName)
+}
+
 // NewServerForTests is the in-process-fleet construction entry point.
 // Identical to NewServer except virt and images stay nil — VM
 // lifecycle RPCs will NPE if called, which is intentional: scenarios
@@ -66,4 +77,18 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
+}
+
+// RecordSelfReportedIsolationForTest drives one §A self-reported-quarantine
+// check synchronously, so a fleet scenario can assert the observation without
+// waiting on the HA monitor's timer.
+func (s *Server) RecordSelfReportedIsolationForTest(ctx context.Context) {
+	s.observeOneSelfReportedQuarantine(ctx)
+}
+
+// SetWALQuarantinedForTest makes this server report itself WAL-quarantined, the
+// state the shipped rollback detector produces on a binary below a latched token.
+func (s *Server) SetWALQuarantinedForTest(on bool) {
+	fn := func() bool { return on }
+	s.walQuarantined.Store(&fn)
 }

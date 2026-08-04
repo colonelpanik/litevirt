@@ -151,8 +151,8 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 // reuses SetHardwareAdoptionState's exact UPDATE shape — no new replicated
 // statement shape is introduced.
 func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, pciIntents []PCIIntentRecord, adopt bool) error {
-	now := nowRFC3339() // created_at (bare)
-	uts := c.NowTS()    // updated_at (monotonic LWW key)
+	now := nowRFC3339Nano() // created_at — fresh incarnation stamp (see nowRFC3339Nano)
+	uts := c.NowTS()        // updated_at (monotonic LWW key)
 
 	stmts := []Statement{
 		// Purge any soft-deleted record with the same name so the INSERT succeeds.
@@ -169,7 +169,8 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			Params: []interface{}{
 				vm.Name, vm.StackName, vm.HostName, vm.Spec, vm.State, vm.StateDetail,
-				vm.CPUActual, vm.MemActual, projectOrDefault(vm.Project), boolToInt(vm.IsTemplate), now, uts,
+				vm.CPUActual, vm.MemActual, projectOrDefault(vm.Project), boolToInt(vm.IsTemplate),
+				now, uts,
 			},
 		},
 	}
@@ -608,12 +609,17 @@ type HostResourceUsage struct {
 	CpuUsed     int
 	MemUsedMiB  int
 	DiskUsedGiB int
+	// VMCount is how many RUNNING VMs the host carries. Capacity policy charges
+	// a per-VM qemu overhead on top of configured guest memory, so the count is
+	// part of usage, not a display detail.
+	VMCount int
 }
 
 // SumVMResourcesByHost returns per-host CPU, memory, and disk totals for running VMs.
 func SumVMResourcesByHost(ctx context.Context, c *Client) (map[string]HostResourceUsage, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, COALESCE(SUM(cpu_actual),0) as cpu, COALESCE(SUM(mem_actual),0) as mem
+		`SELECT host_name, COALESCE(SUM(cpu_actual),0) as cpu, COALESCE(SUM(mem_actual),0) as mem,
+		        COUNT(*) as vm_count
 		 FROM vms WHERE deleted_at IS NULL AND state = 'running' GROUP BY host_name`)
 	if err != nil {
 		return nil, err
@@ -623,6 +629,7 @@ func SumVMResourcesByHost(ctx context.Context, c *Client) (map[string]HostResour
 		m[r.String("host_name")] = HostResourceUsage{
 			CpuUsed:    r.Int("cpu"),
 			MemUsedMiB: r.Int("mem"),
+			VMCount:    r.Int("vm_count"),
 		}
 	}
 
@@ -728,6 +735,25 @@ func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) e
 	)
 }
 
+// UpdateVMStateAtEpoch is UpdateVMState carrying the ownership generation the
+// caller decided against. The epoch is part of the WHERE clause, so the
+// statement REPLICATES with its own precondition: a peer whose row has moved
+// to a newer generation matches nothing and keeps its state.
+//
+// This is what stops the rejoin fight observed live on 2026-08-01. A host that
+// was down comes back with a stale replica, its reconciler syncs "this VM I own
+// is not running" — and the name-only UPDATE that write used to be stomped the
+// real owner's row on every node, flapping state until a manual repair-owner.
+// The write still lands LOCALLY on the stale node (it is true of that node's
+// own view, and its row is at the old generation); it simply cannot travel.
+func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail string, expectedEpoch int64) error {
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
+		state, detail, now, name, expectedEpoch,
+	)
+}
+
 // UpdateVMStateStrict is UpdateVMState that reports a zero-row update as
 // ErrNoRowsAffected instead of a silent success. Use it where the write's success
 // GATES a subsequent action (an event, audit, LB refresh, hook, or ownership
@@ -756,6 +782,59 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 	)
 }
 
+// TransferVMOwner is the Phase 4 ownership-transition primitive: one guarded
+// transaction that CASes on the expected owner epoch, increments it, and moves
+// host/state together. A writer holding a stale expected epoch — a rejoined
+// node still believing it owns the VM, a coordinator whose decision was
+// superseded — changes nothing and gets ErrNoRowsAffected, instead of fighting
+// the real owner with equal-timestamp LWW writes the resolver can only surface
+// as an unresolved tie. Every genuine transfer (reschedule, promote, migrate,
+// repair, owner-assert re-key, drain) routes through here; UpdateVMHost remains
+// for same-host state changes only.
+func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64) error {
+	now := c.NowTS()
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var epoch int64
+		if err := tx.QueryRow(
+			`SELECT vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name,
+		).Scan(&epoch); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		return epoch == expectedEpoch, nil
+	}, []Statement{{
+		SQL: `UPDATE vms
+		      SET host_name = ?, state = ?, state_detail = '',
+		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		Params: []interface{}{hostName, state, now, name, expectedEpoch},
+	}})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
+// TransferVMOwnerFresh is TransferVMOwner for completion-style sites that do
+// not carry a decision-time epoch: it reads the row and CASes on what it just
+// read. The CAS still matters — between the read and the write a concurrent
+// transition can land, and this loses cleanly instead of overwriting it.
+func TransferVMOwnerFresh(ctx context.Context, c *Client, name, hostName, state string) error {
+	vm, err := GetVM(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	if vm == nil {
+		return ErrNoRowsAffected
+	}
+	return TransferVMOwner(ctx, c, name, hostName, state, vm.OwnerEpoch)
+}
+
 // DeleteVM tombstones a VM and its interfaces/disks, plus the v42 hardware
 // tables (vm_nics, vm_pci_intent, vm_pci_realizations) — mirroring the
 // vm_interfaces/vm_disks bulk tombstone: vm_name is not the whole PK on any of
@@ -763,17 +842,65 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 // expansion on apply (safe because each statement binds updated_at). This does
 // NOT release any host_pci_devices ownership/vfio-unbind lease — that is the
 // grpcapi DeleteVM handler's releaseDevices call, out of scope here.
+// It emits the AUTHORITY-BEARING tombstone (vmDeleteSQL) — the only VM delete
+// shape litevirt emits. See DeleteContainer for why the pre-authority shape is
+// receive-only: a peer admits it only while its own row has zero authority, so
+// after the owner-epoch backfill it is silently dropped everywhere.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
+	// Absent/already-tombstoned is the idempotent success callers expect; a row
+	// still live after every fresh-guard retry means its authority keeps moving
+	// under the CAS and the caller must not be told the delete landed.
+	outcome, err := retriedDelete(func() (deleteOutcome, error) {
+		return deleteVMGuarded(ctx, c, name)
+	})
+	if err != nil {
+		return err
+	}
+	return deleteOutcomeError(outcome, false)
+}
+
+// deleteVMGuarded is the single VM delete emitter; every caller routes through
+// DeleteVM's retry loop. It reports the tri-state outcome from its own guard
+// read — see deleteOutcome for why absent and CAS-miss must not be conflated.
+func deleteVMGuarded(ctx context.Context, c *Client, name string) (deleteOutcome, error) {
+	vm, err := GetVM(ctx, c, name)
+	if err != nil {
+		return deleteContended, err
+	}
+	if vm == nil {
+		return deleteAbsent, nil
+	}
+	return deleteVMGuardedFrom(ctx, c, *vm)
+}
+
+// deleteVMGuardedFrom runs the guarded CAS against the caller's row snapshot —
+// split from the read for the same testability reason as its container twin.
+func deleteVMGuardedFrom(ctx context.Context, c *Client, vm VMRecord) (deleteOutcome, error) {
+	name := vm.Name
+	guard := vmDeleteMutationGuard(vm)
 	now := c.NowTS()     // LWW key (updated_at)
 	wall := nowRFC3339() // deleted_at is a wall/display column, never the HLC key
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_nics SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_pci_intent SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
-		{SQL: `UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ?`, Params: []interface{}{wall, now, name}},
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		return c.mutationGuardMatches(ctx, tx, guard)
+	}, []Statement{
+		// Children are fenced while the parent is still live; the parent
+		// tombstone is the final semantic commit barrier.
+		{SQL: vmInterfacesCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmDisksCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmNICsCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmPCIIntentCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmPCIRealCreateCleanupSQL, Params: []interface{}{wall, now, name}, Guard: guard},
+		{SQL: vmDeleteSQL, Params: []interface{}{
+			wall, now, name, vm.OwnerEpoch, vm.SpecGeneration,
+		}, Guard: guard},
 	})
+	if err != nil {
+		return deleteContended, err
+	}
+	if !applied {
+		return deleteContended, nil
+	}
+	return deleteApplied, nil
 }
 
 // RenameVM changes a VM's name across all tables, including the name embedded in
@@ -1053,4 +1180,64 @@ func SoftDeleteInterfaceByMAC(ctx context.Context, c *Client, vmName, mac string
 	return c.Execute(ctx,
 		`UPDATE vm_interfaces SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND mac = ?`,
 		nowRFC3339(), now, vmName, mac)
+}
+
+// BackfillOwnerEpochs graduates every workload THIS host owns out of the
+// pre-epoch 0 (0→1) — the Phase 4 one-time backfill, run by the health sweeps
+// while enforcement.owner_epoch is on. Only owned, live rows are touched:
+// another host's workloads are its own to graduate (each owner also writes the
+// matching runtime marker, which only the owner can), and tombstones stay
+// pre-epoch forever. Idempotent by predicate (epoch = 0).
+func BackfillOwnerEpochs(ctx context.Context, c *Client, hostName string) error {
+	// Per-row full-PK updates, not one bulk UPDATE: a bulk statement replicates
+	// through the receiver's per-row LWW expansion, while these carry exact row
+	// identity (vms.name / containers.(host_name,name)) and the epoch=0
+	// predicate keeps each one idempotent on its own.
+	vms, err := c.Query(ctx,
+		`SELECT name FROM vms WHERE host_name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+		hostName)
+	if err != nil {
+		return err
+	}
+	for _, r := range vms {
+		if err := c.Execute(ctx,
+			`UPDATE vms SET vm_owner_epoch = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+			int64(1), c.NowTS(), r.String("name")); err != nil {
+			return err
+		}
+	}
+	cts, err := c.Query(ctx,
+		`SELECT name FROM containers WHERE host_name = ? AND deleted_at IS NULL AND owner_epoch = 0`,
+		hostName)
+	if err != nil {
+		return err
+	}
+	for _, r := range cts {
+		if err := c.Execute(ctx,
+			`UPDATE containers SET owner_epoch = ?, updated_at = ? WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND owner_epoch = 0`,
+			int64(1), c.NowTS(), hostName, r.String("name")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// OwnerEpochBackfillComplete reports whether no workload owned by this host
+// remains at the pre-epoch 0 — the readiness half of the owner_epoch_v1
+// advertisement gate ("never bless an already-diverged cluster": a fleet must
+// not latch across a node whose workloads are ungraduated).
+func OwnerEpochBackfillComplete(ctx context.Context, c *Client, hostName string) (bool, error) {
+	for _, q := range []string{
+		`SELECT COUNT(1) AS n FROM vms WHERE host_name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+		`SELECT COUNT(1) AS n FROM containers WHERE host_name = ? AND deleted_at IS NULL AND owner_epoch = 0`,
+	} {
+		rows, err := c.Query(ctx, q, hostName)
+		if err != nil {
+			return false, err
+		}
+		if len(rows) != 1 || rows[0].Int64("n") > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }

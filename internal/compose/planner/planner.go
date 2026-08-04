@@ -158,7 +158,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		}
 		specByVM[op.VMName] = spec
 
-		req := buildPlacementRequest(spec)
+		req := buildPlacementRequest(spec, state.Capacity)
 		// Resolve anti-affinity names: expand compose definition keys to instance names.
 		req.AntiAffinity = expandAntiAffinity(req.AntiAffinity, req.VMName, composeInstances)
 		// Container workloads can only run where the LXC runtime exists, so
@@ -189,7 +189,8 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		placementVMNames = append(placementVMNames, op.VMName)
 	}
 
-	placements, err := placement.SelectBatch(state.Hosts, state.VMs, state.Devices, placementReqs)
+	ctMem := corrosion.ContainerMemoryByHost(state.Containers)
+	placements, err := placement.SelectBatch(state.Hosts, state.VMs, state.Devices, ctMem, placementReqs)
 	if err != nil {
 		return nil, fmt.Errorf("batch placement failed: %w", err)
 	}
@@ -686,11 +687,19 @@ func collectWarnings(plan *ResolvedPlan, f *compose.File) {
 }
 
 // buildPlacementRequest converts a VMSpec into a placement.Request.
-func buildPlacementRequest(spec *pb.VMSpec) placement.Request {
+//
+// Normalizes cpu/memory first: compose merges those fields but never defaults
+// them (parse.go only copies non-zero child values), so a service with no `cpu:`
+// or `memory:` planned at 0/0 — and placement skips its fit filter entirely for a
+// 0/0 request, so a full host looked like a valid candidate. The VM then
+// materialized at the create defaults via CreateVM. Plan against what it costs.
+func buildPlacementRequest(spec *pb.VMSpec, capacity corrosion.CapacityPolicy) placement.Request {
+	compose.NormalizeVMSpecResources(spec)
 	req := placement.Request{
 		VMName:       spec.Name,
 		CPUNeeded:    int(spec.Cpu),
 		MemMiBNeeded: int(spec.MemoryMib),
+		Capacity:     capacity,
 	}
 	if p := spec.Placement; p != nil {
 		req.PinHost = p.Host

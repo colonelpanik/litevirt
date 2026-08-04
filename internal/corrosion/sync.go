@@ -39,9 +39,12 @@ var customMergeTables = map[string]customMergeFn{
 	// idempotently, a genuine facts-conflict for one PK is left unresolved + flagged
 	// (never coin-flipped), and a tombstone (GC of a terminal op past its horizon)
 	// dominates a delayed live copy. See immutableMergeKeepLocalRow.
-	"operations":               (*Client).immutableMergeKeepLocalRow,
-	"operation_steps":          (*Client).immutableMergeKeepLocalRow,
-	"project_authority_epochs": (*Client).immutableMergeKeepLocalRow,
+	"operations":      (*Client).immutableMergeKeepLocalRow,
+	"operation_steps": (*Client).immutableMergeKeepLocalRow,
+	// project_authority_epochs is immutable too, but its PK is one several nodes
+	// legitimately mint at once, so it converges deterministically instead of
+	// freezing a conflict. See authorityMergeRow.
+	"project_authority_epochs": (*Client).authorityMergeRow,
 }
 
 // proofRank orders the runtime_action_proofs lifecycle so a terminal state can
@@ -217,6 +220,9 @@ type syncTable struct {
 	Name    string          `json:"name"`
 	Columns []string        `json:"cols"`
 	Rows    [][]interface{} `json:"rows"`
+	// authority is receiver-local merge metadata derived from the complete
+	// payload. It is never serialized.
+	authority *mergeAuthorityManifest
 }
 
 // tableNames are the operator-safe tables carried by the public full-state
@@ -244,6 +250,19 @@ var tableNames = []string{
 	// v41 F1 operation journal — control-plane metadata (no plaintext secrets); the
 	// non-LWW immutable merge runs regardless of lane (customMergeTables).
 	"operations", "operation_steps", "project_authority_epochs",
+	// v45 audit tamper-evidence. Both are public by design: a verification
+	// certificate is meant to be handed out, and a chain head is a signed
+	// assertion about a log an operator can already read. They belong in the
+	// operator-visible dump precisely so a peer — or a human with a state
+	// dump — can check a host's chain without that host's cooperation.
+	"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
+	// v47 cluster CRL — a revocation list is published to be read, and a node that
+	// missed the replicated write is exactly the node that must repair from a peer.
+	"cluster_crl",
+	// v48 host network intent — operator-facing wiring config, read cluster-wide
+	// by the UI/CLI and repaired from peers if a host loses its DB. LWW-safe
+	// (PK + updated_at); the owning host is the only writer of its rows.
+	"host_networks",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS
@@ -455,7 +474,8 @@ func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowed
 	start := time.Now()
 	merged, skipped := 0, 0
 	var firstErr error
-	for _, table := range payload.Tables {
+	tables := authorityOrderedMergeTables(payload)
+	for _, table := range tables {
 		m, s, err := c.mergeTable(table, allowedTables)
 		merged += m
 		skipped += s
@@ -697,6 +717,54 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			skipped++
 			continue
 		}
+		// Workload create commits carry child rows whose schemas predate owner
+		// epochs. Fence them against the source workload identity captured from
+		// this payload and the authority that actually landed locally. This runs
+		// before both first-seen insertion and every conflict resolver.
+		authorityDecision, guardErr := c.antiEntropyAuthorityDecision(tx, table, row)
+		if guardErr != nil {
+			_ = tx.Rollback()
+			return merged, skipped, guardErr
+		}
+		if authorityDecision == mergeAuthorityKeepLocal {
+			skipped++
+			continue
+		}
+		if authorityDecision == mergeAuthorityApplyIncoming ||
+			authorityDecision == mergeAuthorityApplyIncomingAndSweep {
+			// Workload owner/generation is the semantic ABA order. A higher
+			// authority applies even when an unrelated local wall/HLC clock is
+			// larger; children later in the payload are fenced against the
+			// authority that actually landed.
+			rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+			if execErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, execErr
+			}
+			if rejected {
+				skipped++
+			} else {
+				merged++
+				if authorityDecision == mergeAuthorityApplyIncomingAndSweep {
+					deletedIdx, updatedIdx := indexOf(table.Columns, "deleted_at"), indexOf(table.Columns, "updated_at")
+					if deletedIdx < 0 || updatedIdx < 0 {
+						_ = tx.Rollback()
+						return merged, skipped, fmt.Errorf("authority sweep parent is missing timestamps")
+					}
+					if sweepErr := antiEntropySweepDeletedWorkloadChildren(
+						tx, table, row, coerceString(row[deletedIdx]), coerceString(row[updatedIdx]),
+					); sweepErr != nil {
+						_ = tx.Rollback()
+						return merged, skipped, sweepErr
+					}
+				}
+				if c.anyUnresolved() {
+					pk := pkKeyAt(row, pkIdx)
+					c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
+				}
+			}
+			continue
+		}
 		// Custom monotone merge (runtime_action_proofs): decide by lifecycle rank,
 		// not LWW, so anti-entropy repairs the proof row without a newer non-terminal
 		// copy resurrecting a spent proof. Handled entirely here (bypasses lwwOrder /
@@ -722,6 +790,59 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				merged++
 			}
 			continue
+		}
+		// A SIGNED audit row is immutable, and anti-entropy must not overwrite it.
+		//
+		// audit_log carries no updated_at, so the LWW-and-tie block below never
+		// runs for it: `existing` is only prefetched when updatedAtIdx >= 0, and
+		// with nothing to compare, every incoming row fell straight through to
+		// the upsert. The last peer to sync won unconditionally — the
+		// capabilityMap chain for the table was never consulted at all.
+		//
+		// For an append-only log that is wrong however the conflict arose. Two
+		// nodes only hold different content for one row id if something is
+		// wrong, and the possibilities are corruption and tampering. Taking the
+		// incoming copy destroys the good version of the record AND spreads the
+		// bad one: a node that edits its own history would have anti-entropy
+		// carry the edit to every peer, which is precisely the outcome signing
+		// exists to prevent.
+		//
+		// Scoped to rows that actually carry a signature. Pre-v45 rows were
+		// never tamper-evident and their hashes legitimately change when a node
+		// re-bases a legacy chain, so refusing those would strand them in
+		// permanent disagreement — protection that only produces noise gets
+		// turned off.
+		//
+		// The evidence tables the verifier derives its authority from get the same
+		// treatment: a published chain head and a signed retirement are fixed
+		// assertions, and a differing body for the same key is corruption or
+		// forgery either way.
+		//
+		// The guard only ever REFUSES. An earlier version could also force-apply a
+		// peer's row past LWW, to repair a node that had deleted its own evidence
+		// — and that was a hole, not a repair: the decision was made on one field
+		// while buildMergeUpsertSQL writes every column, so a corrupt cert_pem
+		// could ride along on a row that merely looked stricter. Repair now comes
+		// from the shape of the data instead. Both tables are append-only, so a
+		// row deleted locally has nothing to conflict with and anti-entropy simply
+		// re-inserts it; and a tombstone is inert because the verifier does not
+		// filter on deleted_at at all.
+		if floor, ok := auditEvidenceGuards[table.Name]; ok {
+			keepLocal, reason, kErr := floor.refuse(tx, table, row, pkCols, pkIdx)
+			if kErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, kErr
+			}
+			if keepLocal {
+				skipped++
+				pk, tbl, advice := pkKeyAt(row, pkIdx), table.Name, floor.advice
+				c.deferAfterCommit(tx, func() {
+					c.observeMergeRejected(boundedTableLabel(tbl), "ae", reason)
+					slog.Warn("anti-entropy: refused a peer's copy of an immutable signed row; keeping "+
+						"local. "+advice, "table", tbl, "pk", pk, "reason", reason)
+				})
+				continue
+			}
 		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
 		// natural key (deterministic winner over the group), not the minted random id, so two
@@ -1113,29 +1234,53 @@ func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []i
 		return false, nil
 	}
 	delIdx := indexOf(table.Columns, "deleted_at")
-	localDeleted := delIdx >= 0 && cellNonEmpty(localRow[delIdx])
-	incomingDeleted := delIdx >= 0 && cellNonEmpty(row[delIdx])
-	if localDeleted != incomingDeleted {
-		return localDeleted, nil // tombstone dominates: keep whichever side is tombstoned
+	if keepLocal, decided := tombstoneDominates(localRow, row, delIdx); decided {
+		return keepLocal, nil
 	}
-	if immutableFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
+	if rowFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
 		return true, nil // idempotent re-delivery
 	}
 	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "immutable_conflict")
 	return true, nil
 }
 
-// immutableFactsEqual reports whether two rows agree on every column except
-// updated_at and deleted_at (the only mutable metadata on an immutable row). It
-// reuses the byte-frozen row encoder for a canonical, type-normalized compare.
-func immutableFactsEqual(cols []string, a, b []interface{}, updatedAtIdx, deletedAtIdx int) bool {
+// tombstoneDominates is the shared first question every immutable-row merge asks:
+// when exactly one side is tombstoned, that side wins regardless of timestamps (a
+// terminal/GC'd row must beat a delayed live copy). decided is false when both
+// sides agree on liveness, leaving the decision to the caller's own rule.
+func tombstoneDominates(localRow, row []interface{}, deletedAtIdx int) (keepLocal, decided bool) {
+	localDeleted := deletedAtIdx >= 0 && cellNonEmpty(localRow[deletedAtIdx])
+	incomingDeleted := deletedAtIdx >= 0 && cellNonEmpty(row[deletedAtIdx])
+	if localDeleted == incomingDeleted {
+		return false, false
+	}
+	return localDeleted, true
+}
+
+// rowFactsEqual reports whether two rows agree on every column except the skipped
+// indexes — the metadata a given table does not count as one of the row's facts.
+// It reuses the byte-frozen row encoder for a canonical, type-normalized compare.
+//
+// Which columns are metadata is per-table, which is why the skip set is a
+// parameter: an operation journal treats only updated_at/deleted_at as mutable,
+// while a row two nodes can legitimately mint concurrently must also discount the
+// per-node wall clock in created_at (see authorityMergeRow).
+func rowFactsEqual(cols []string, a, b []interface{}, skip ...int) bool {
 	if len(a) != len(cols) || len(b) != len(cols) {
+		return false
+	}
+	skipped := func(i int) bool {
+		for _, s := range skip {
+			if i == s {
+				return true
+			}
+		}
 		return false
 	}
 	fa := make([]interface{}, 0, len(cols))
 	fb := make([]interface{}, 0, len(cols))
 	for i := range cols {
-		if i == updatedAtIdx || i == deletedAtIdx {
+		if skipped(i) {
 			continue
 		}
 		fa = append(fa, a[i])

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 func TestLoadConfig_ImagePullDenyPolicy(t *testing.T) {
@@ -483,5 +485,23 @@ func TestHostAddress_PrefersAdvertiseAddress(t *testing.T) {
 	}
 	if got == "10.77.0.11" {
 		t.Fatalf("hostAddress() = %q with no advertise address configured — value leaked from config", got)
+	}
+}
+
+// A partially set capacity block must inherit built-in defaults for every
+// unset field — not silently zero the host reserves (which would offer guests
+// 100% of RAM, the exact outage the capacity subsystem exists to prevent).
+func TestCapacityConfigPolicy_PartialBlockKeepsReserveDefaults(t *testing.T) {
+	want := corrosion.DefaultCapacityPolicy()
+	want.CPUOvercommit = 5.0
+	if got := (CapacityConfig{CPUOvercommitRatio: 5.0}).Policy(); got != want {
+		t.Errorf("Policy() = %+v, want %+v (defaults for every unset field)", got, want)
+	}
+}
+
+// A fully unset capacity block yields exactly the built-in defaults.
+func TestCapacityConfigPolicy_EmptyBlockIsDefaults(t *testing.T) {
+	if got, want := (CapacityConfig{}).Policy(), corrosion.DefaultCapacityPolicy(); got != want {
+		t.Errorf("Policy() = %+v, want %+v", got, want)
 	}
 }

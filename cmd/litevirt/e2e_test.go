@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // fakeStream is a server-stream that yields io.EOF immediately, so commands
@@ -73,8 +76,9 @@ func newMockClient() *mockClient {
 			},
 			{
 				Name: "host-b", Address: "10.0.50.11",
-				State:   pb.HostState_HOST_ACTIVE,
-				CpuUsed: 2, CpuTotal: 16,
+				State:      pb.HostState_HOST_ACTIVE,
+				CertSerial: "a1b2c3",
+				CpuUsed:    2, CpuTotal: 16,
 				MemUsedMib: 4096, MemTotalMib: 65536,
 				VmCount: 1,
 			},
@@ -156,6 +160,17 @@ func (m *mockClient) GetHostHealth(_ context.Context, _ *emptypb.Empty, _ ...grp
 func (m *mockClient) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	m.removedHost = in.Name
 	return &emptypb.Empty{}, nil
+}
+func (m *mockClient) PublishCRL(_ context.Context, _ *pb.PublishCRLRequest, _ ...grpc.CallOption) (*pb.PublishCRLResponse, error) {
+	return &pb.PublishCRLResponse{Version: 47}, nil
+}
+func (m *mockClient) RetireAuditKey(_ context.Context, in *pb.RetireAuditKeyRequest, _ ...grpc.CallOption) (*pb.RetireAuditKeyResponse, error) {
+	// The removal flow probes the audit contract; a host that never signed
+	// answers that there is nothing to retire.
+	return nil, fmt.Errorf(
+		"rpc error: code = FailedPrecondition desc = host %q has no live audit signing "+
+			"certificate: it either never published one or its key is already retired, "+
+			"so there is nothing to retire", in.GetHostName())
 }
 func (m *mockClient) RescanHost(_ context.Context, in *pb.RescanHostRequest, _ ...grpc.CallOption) (*pb.RescanHostResponse, error) {
 	m.rescannedHost = in.Name
@@ -688,8 +703,11 @@ func (m *mockClient) GetProjectUsage(_ context.Context, _ *pb.GetProjectUsageReq
 }
 
 // audit chain mocks.
+// A clean, fully-signed chain. Stated explicitly rather than left at the zero
+// value so the "all signed" branch of `lv audit verify` is the one exercised —
+// a bare response also has UnsignedRows 0, which would pass either way.
 func (m *mockClient) VerifyAuditChain(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (*pb.VerifyAuditChainResponse, error) {
-	return &pb.VerifyAuditChainResponse{}, nil
+	return &pb.VerifyAuditChainResponse{RowsChecked: 3, Tampered: false}, nil
 }
 func (m *mockClient) ExportAuditChain(_ context.Context, _ *pb.ExportAuditChainRequest, _ ...grpc.CallOption) (*pb.ExportAuditChainResponse, error) {
 	return &pb.ExportAuditChainResponse{Json: `{"rows":[]}`}, nil
@@ -896,6 +914,15 @@ func TestE2E_VMLifecycle(t *testing.T) {
 }
 
 func TestE2E_HostOperations(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("LV_CONFIG_DIR", configDir)
+	pkiDir := filepath.Join(configDir, "pki")
+	if err := os.MkdirAll(pkiDir, 0o700); err != nil {
+		t.Fatalf("mkdir test PKI: %v", err)
+	}
+	if err := pki.GenerateCA(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")); err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
 	mock := newMockClient()
 
 	// List hosts

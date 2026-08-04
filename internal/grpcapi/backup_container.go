@@ -110,8 +110,11 @@ func (s *Server) migrateSourceFromPeer(ctx context.Context) string {
 			"peer_cn", cn, "claimed_source", claimed)
 		return ""
 	}
-	if h, _ := corrosion.GetHost(ctx, s.db, claimed); h == nil {
-		slog.Warn("restore: ignoring migrate-from marker — claimed source is not a known cluster host",
+	// The one peer classifier — see hotplug_disk.go. A bare GetHost rejects a host
+	// whose row has not replicated here yet, which on a fresh cluster silently sent
+	// this down the re-reserve-IPs path instead of the migrate path.
+	if !s.isTrustedHostCN(ctx, claimed) {
+		slog.Warn("restore: ignoring migrate-from marker — claimed source is not a cluster host",
 			"claimed_source", claimed)
 		return ""
 	}
@@ -427,6 +430,7 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 			proof = &pb.RuntimeActionProof{
 				Id: pr.ID, Action: pr.Action, TargetKind: pr.TargetKind, TargetName: pr.TargetName,
 				DestHost: pr.DestHost, Coordinator: pr.Coordinator, RelocationToken: pr.RelocationToken,
+				OwnerEpoch: pr.OwnerEpoch,
 			}
 		} else if s.gateActive(ctx) {
 			// Under enforcement the coordinator minted a proof for this token; a miss
@@ -484,9 +488,14 @@ func drainRestoreStream(rs grpc.ServerStreamingClient[pb.RestoreContainerProgres
 // claim our restore landed there (that would tombstone the source over an
 // unrelated container), so it's a pre-row failure; the coordinator's
 // collision-aware fallback then declines to clobber it.
+// ResourceExhausted is conclusive too: the target's capacity/quota admission runs
+// before any import or row write, so a refusal means nothing of ours landed there.
+// Classifying it as indeterminate instead would make a coordinator DEFER on a full
+// target forever rather than falling back, and would leave a cold migrate parked
+// instead of rolling its source back.
 func classifyRestoreError(err error) corrosion.RestoreOutcome {
 	switch status.Code(err) {
-	case codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied, codes.Unimplemented, codes.AlreadyExists:
+	case codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied, codes.Unimplemented, codes.AlreadyExists, codes.ResourceExhausted:
 		return corrosion.RestoreFailedBeforeRow
 	default:
 		return corrosion.RestoreUnknown
@@ -682,6 +691,59 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			req.Name, s.hostName)
 	}
 
+	// The embedded spec is UNTRUSTED manifest data and supplies only descriptive
+	// fields (image/cpu/mem/labels/restart) — never the project; the row built from
+	// it further down uses the project the permission check was made against. It is
+	// decoded HERE, ahead of any I/O, because admission needs the memory cap.
+	spec := containerBackupSpec{Name: req.Name, Project: project}
+	if manifest.ContainerSpecJSON != "" {
+		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
+	}
+
+	// Capacity + quota admission, MEMORY only — a container's cpu_limit is CPU
+	// *shares* (a relative cgroup weight), not a vCPU reservation, so only its
+	// memory cap is comparable to a VM's, and an uncapped container reserves
+	// nothing (mirrors CreateContainer). Restore admitted NOTHING, so a full-sized
+	// container could be materialised on any host, at any size, past both that
+	// host's capacity and its project's quota — while CreateContainer refused the
+	// identical shape.
+	//
+	// WHICH admission depends on the caller, because one handler serves three with
+	// different accounting:
+	//
+	//   - operator restore → a NEW allocation (the source container, if it still
+	//     exists, is still counted), so quota is charged, exactly like a create.
+	//   - failover relocation (coordinator-driven: carries a relocation proof, or
+	//     its attempt token before enforcement is latched) → the container already
+	//     exists and its project is already charged for it; the host that held it
+	//     died. Charging quota again would refuse to re-home any container over
+	//     half its project's ceiling, turning a tenancy limit into an availability
+	//     limit at the moment availability is the whole point. HOST capacity only.
+	//   - cold migrate (a peer-VERIFIED migrate-from) → the source already admitted
+	//     this move against THIS host and holds the lease for the whole transfer
+	//     (migrate_container.go), so re-admitting here would demand twice the
+	//     container's memory and refuse migrations that fit.
+	//
+	// It runs before the import, so a refusal costs no I/O; the lease is released
+	// when this handler returns, i.e. after the container's own row lands and
+	// accounts for the same memory.
+	if mem := spec.MemMiB; mem > 0 && s.migrateSourceFromPeer(ctx) == "" {
+		var (
+			lease *reservationLease
+			aerr  error
+		)
+		if req.Proof != nil || relocateTokenFromMD(ctx) != "" {
+			lease, aerr = s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, 0, mem, false)
+		} else {
+			lease, aerr = s.admitWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, mem, false)
+		}
+		if aerr != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+			return aerr
+		}
+		defer lease.release(ctx)
+	}
+
 	send := func(p *pb.RestoreContainerProgress) error { return stream.Send(p) }
 
 	// Crash-idempotent resume (proof-gated coordinator restores). A crash between
@@ -786,16 +848,13 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		}
 	}
 
-	// Recreate the cluster row from the embedded spec. The spec is UNTRUSTED
-	// manifest data, so it supplies only descriptive fields (image/cpu/mem/
-	// labels/restart) — never the project: a tampered manifest must not move the
-	// restored container into a project the caller wasn't authorized for. The
-	// row uses the project the permission check was made against; a cross-project
-	// restore is a separate, explicitly-authorized operation.
-	spec := containerBackupSpec{Name: req.Name, Project: project}
-	if manifest.ContainerSpecJSON != "" {
-		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
-	}
+	// Recreate the cluster row from the (already decoded, above) embedded spec. That
+	// spec is UNTRUSTED manifest data, so it supplies only descriptive fields
+	// (image/cpu/mem/labels/restart) — never the project: a tampered manifest must
+	// not move the restored container into a project the caller wasn't authorized
+	// for. The row uses the project the permission check was made against; a
+	// cross-project restore is a separate, explicitly-authorized operation.
+	//
 	// Preserve the source's stop intent ONLY when we are NOT going to start the
 	// container (req.Start == false — e.g. cold-migrating an already-stopped CT).
 	// Otherwise the row lands as stopped with an empty detail and the reconciler

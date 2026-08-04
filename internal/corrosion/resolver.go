@@ -323,10 +323,20 @@ var capabilityMap = map[string]tableResolver{
 		ruleContentMax(),
 	}},
 	// containers: host_name is part of the PK (an ownership split is two distinct
-	// rows the per-PK resolver can't see — Phase 4 runtime re-key handles it), so
-	// only the tenancy column needs a carve-out here. create_spec is the
-	// relocation-critical definition blob → opaque.
-	"containers": {category: "tenancy-content", chain: tenancyOpaqueChain("project", "create_spec")},
+	// rows the per-PK resolver can't see — Phase 4 runtime re-key handles it).
+	// Within one PK, v44 lifecycle counters/pointers mirror the VM rules:
+	// monotonic counters take max, while conflicting active-operation pointers
+	// are a surfaced runtime-ownership fault. The tenancy and opaque create-spec
+	// carve-outs remain ahead of benign content convergence.
+	"containers": {category: "runtime-owned", chain: []tieRule{
+		ruleColUnresolved("project", "tenancy"),
+		ruleNumericMax("owner_epoch"),
+		ruleNumericMax("spec_generation"),
+		ruleColUnresolved("active_operation_id", "runtime_owned"),
+		ruleTombstone(),
+		ruleAnyColUnresolved([]string{"create_spec"}, "opaque"),
+		ruleContentMax(),
+	}},
 
 	// Tenancy-bearing, otherwise content-default. config is the resource
 	// definition blob → opaque (storage_pools has only scalar columns).
@@ -389,12 +399,17 @@ var capabilityMap = map[string]tableResolver{
 		ruleAnyColUnresolved([]string{
 			"state", "address", "ssh_user", "ssh_port", "grpc_port", "cert_serial",
 			"ipmi_address", "ipmi_user", "ipmi_pass", "watchdog_dev", "fence_strategy",
-			"role", "schema_version",
+			"role", "schema_version", "capacity_policy_hash",
 		}, "control_plane"),
 		ruleContentMax(),
 	}},
 	"host_labels":   {category: "content", chain: contentDefaultChain()},
 	"host_health":   {category: "content", chain: contentDefaultChain()},
+	// v48 host network intent: single-writer per row (the owning host), so an
+	// exact-instant tie already means something is wrong; the default chain
+	// settles it deterministically rather than leaving the cluster divergent,
+	// and the owning host's next render works from whatever won.
+	"host_networks": {category: "content", chain: contentDefaultChain()},
 	"images":        {category: "content", chain: contentDefaultChain()},
 	"image_hosts":   {category: "content", chain: contentDefaultChain()},
 	"stacks":        {category: "content", chain: contentOpaqueChain("spec", "compose_yaml")},
@@ -426,6 +441,16 @@ var capabilityMap = map[string]tableResolver{
 	"vm_backups":              {category: "content", chain: contentDefaultChain()},
 	"container_backups":       {category: "content", chain: contentDefaultChain()},
 	"container_snapshots":     {category: "content", chain: contentDefaultChain()},
+	// v45 audit tamper-evidence. Both are append-only and their rows never
+	// legitimately differ for one primary key, so a tie here already means
+	// something is wrong; the default chain settles it deterministically
+	// rather than leaving the cluster divergent.
+	"audit_signing_keys":  {category: "content", chain: contentDefaultChain()},
+	"audit_chain_heads":   {category: "content", chain: contentDefaultChain()},
+	"audit_key_lifecycle": {category: "content", chain: contentDefaultChain()},
+	// v47 cluster CRL. Append-only; the composite key includes the signed PEM, so
+	// a hash-squatting row cannot conflict with the genuine row.
+	"cluster_crl": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

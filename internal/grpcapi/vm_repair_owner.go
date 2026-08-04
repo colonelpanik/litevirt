@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"google.golang.org/grpc/codes"
@@ -52,7 +53,7 @@ func (s *Server) repairActor(ctx context.Context) string {
 //     positively confirms via its own libvirt that the VM is running locally —
 //     so ownership can never be pointed at a host that doesn't run the VM;
 //   - it writes only the VM's DB row (UpdateVMHost): host_name + state="running"
-//     + cleared state_detail + fresh updated_at. It never touches the running
+//   - cleared state_detail + fresh updated_at. It never touches the running
 //     domain, so even a misdirected call can't destroy or move a workload, and
 //     is recoverable by re-running against the correct host. Clearing
 //     state_detail is intentional: the host has just proven the VM is running,
@@ -108,7 +109,16 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 	}
 
 	prev := vm.HostName
-	if err := corrosion.UpdateVMHost(ctx, s.db, req.GetName(), s.hostName, "running"); err != nil {
+	// Phase 4: repair is an ownership transition, so it advances the owner
+	// epoch through the CAS primitive — closing the "repair-owner writes
+	// ownership without a generation bump" gap. The expected epoch is the row
+	// just read; a concurrent transition loses the CAS and the operator
+	// re-runs against fresh state instead of silently overwriting it.
+	if err := corrosion.TransferVMOwner(ctx, s.db, req.GetName(), s.hostName, "running", vm.OwnerEpoch); err != nil {
+		if errors.Is(err, corrosion.ErrNoRowsAffected) {
+			return nil, status.Errorf(codes.Aborted,
+				"vm %q changed owner epoch during repair (concurrent transition); re-run against fresh state", req.GetName())
+		}
 		return nil, status.Errorf(codes.Internal, "update owner: %v", err)
 	}
 	s.auditAs(ctx, actor, "vm.repair-owner", req.GetName(),

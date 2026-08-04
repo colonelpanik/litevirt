@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,8 +33,8 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 
 	// Single query for all VM counts instead of per-host N+1.
 	vmCounts, _ := corrosion.CountVMsByHost(ctx, s.db)
-	// Aggregate CPU/memory allocated to running VMs per host.
-	resUsage, _ := corrosion.SumVMResourcesByHost(ctx, s.db)
+	// Aggregate CPU/memory allocated per host, containers included.
+	resUsage := s.hostUsageWithContainers(ctx)
 
 	resp := &pb.ListHostsResponse{}
 	for _, h := range hosts {
@@ -53,6 +54,7 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 			Version:      h.Version,
 			StoragePools: pools,
 			Region:       h.Region,
+			CertSerial:   h.CertSerial,
 			CreatedAt:    parseTimestamp(h.CreatedAt),
 			UpdatedAt:    parseTimestamp(h.UpdatedAt),
 		}
@@ -97,6 +99,7 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 		IpmiAddress:   h.IPMIAddress,
 		WatchdogDev:   h.WatchdogDev,
 		Region:        h.Region,
+		CertSerial:    h.CertSerial,
 		CreatedAt:     parseTimestamp(h.CreatedAt),
 		UpdatedAt:     parseTimestamp(h.UpdatedAt),
 	}, nil
@@ -141,6 +144,13 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// Split-brain-hardening feature tokens this build supports. Read via a
 		// fresh Ping to compute cluster-wide activation of fail-closed checks.
 		Capabilities: s.advertisedCapabilities(),
+		// WALL clock, not the HLC: the caller uses it to detect NTP drift, and an
+		// HLC value would compare against its own wall clock as nonsense skew.
+		WallClock: time.Now().UTC().Format(time.RFC3339Nano),
+		// Self-report of degradation: see PingResponse.wal_quarantined. A peer
+		// records our isolation on the strength of this, because we cannot
+		// record it ourselves.
+		WalQuarantined: s.walQuarantinedNow(),
 	}, nil
 }
 
@@ -149,20 +159,30 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 // the health checker (SetPeerPinger) so cluster-wide activation is computed from
 // live reachability, never from stale replicated rows. An unreachable peer
 // returns an error so the caller can fail closed.
-func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, error) {
+// It also returns the peer's WALL clock so the health checker can detect NTP
+// drift without a second RPC. A peer that predates the field reports the zero
+// time, which the caller must read as "unknown", never as skew. Self returns the
+// zero time too: a node cannot be skewed against itself.
+func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, time.Time, error) {
 	if host == s.hostName {
-		return s.advertisedCapabilities(), nil
+		return s.advertisedCapabilities(), time.Time{}, nil
 	}
 	c, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	defer closeConn()
 	resp, err := c.Ping(ctx, &pb.PingRequest{})
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	return resp.GetCapabilities(), nil
+	peerWall := time.Time{}
+	if s := resp.GetWallClock(); s != "" {
+		if parsed, perr := time.Parse(time.RFC3339Nano, s); perr == nil {
+			peerWall = parsed
+		}
+	}
+	return resp.GetCapabilities(), peerWall, nil
 }
 
 // DrainHost marks the host as draining and migrates all its VMs to healthy hosts.
@@ -244,38 +264,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 	var drainJobs []drainJob
 	for _, vm := range toMigrate {
-		placementReq := placement.Request{
-			VMName:       vm.Name,
-			CPUNeeded:    vm.CPUActual,
-			MemMiBNeeded: vm.MemActual,
-		}
-
-		// Extract placement constraints from stored VM spec.
-		if vm.Spec != "" {
-			spec := &pb.VMSpec{}
-			if err := json.Unmarshal([]byte(vm.Spec), spec); err == nil {
-				if p := spec.Placement; p != nil {
-					// Override PinHost — cannot pin to the host being drained.
-					if p.Host != "" && p.Host != req.Name {
-						placementReq.PinHost = p.Host
-					}
-					placementReq.AntiAffinity = p.AntiAffinity
-					placementReq.Affinity = p.Affinity
-					placementReq.RequireLabels = p.Require
-					placementReq.PreferLabels = p.Prefer
-					placementReq.Spread = p.Spread
-				}
-				for _, dev := range spec.Devices {
-					placementReq.Devices = append(placementReq.Devices, placement.DeviceRequest{
-						Type:   dev.Type,
-						Count:  int(dev.Count),
-						Vendor: dev.Vendor,
-					})
-				}
-				// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
-				addCapabilityLabels(&placementReq, spec)
-			}
-		}
+		placementReq := buildDrainPlacementRequest(vm, req.Name, s.capacity)
 
 		// Ensure the drained host is excluded via anti-affinity on itself.
 		// placement.Select() excludes non-active hosts, and we already set the host to "draining".
@@ -357,6 +346,46 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 
 	return nil
+}
+
+// buildDrainPlacementRequest constructs a placement request for a VM leaving
+// drainHost, honoring the constraints in its stored spec. A spec pin to the
+// draining host itself is dropped — the VM has to leave.
+func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacity corrosion.CapacityPolicy) placement.Request {
+	placementReq := placement.Request{
+		VMName:       vm.Name,
+		CPUNeeded:    vm.CPUActual,
+		MemMiBNeeded: vm.MemActual,
+		Capacity:     capacity,
+	}
+	if vm.Spec == "" {
+		return placementReq
+	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+		return placementReq
+	}
+	if p := spec.Placement; p != nil {
+		// Override PinHost — cannot pin to the host being drained.
+		if p.Host != "" && p.Host != drainHost {
+			placementReq.PinHost = p.Host
+		}
+		placementReq.AntiAffinity = p.AntiAffinity
+		placementReq.Affinity = p.Affinity
+		placementReq.RequireLabels = p.Require
+		placementReq.PreferLabels = p.Prefer
+		placementReq.Spread = p.Spread
+	}
+	for _, dev := range spec.Devices {
+		placementReq.Devices = append(placementReq.Devices, placement.DeviceRequest{
+			Type:   dev.Type,
+			Count:  int(dev.Count),
+			Vendor: dev.Vendor,
+		})
+	}
+	// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
+	addCapabilityLabels(&placementReq, spec)
+	return placementReq
 }
 
 // drainOneVM migrates a single VM to the target host. Returns progress message.
@@ -442,7 +471,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 				"vm", vm.Name, "error", err)
 			// Fall through to cold migration.
 		} else {
-			if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, target.Name, "running"); err != nil {
+			// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
+			if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, target.Name, "running"); err != nil {
 				slog.Error("drain: post-migration ownership write failed", "vm", vm.Name, "to", target.Name, "error", err)
 				s.noteStateWriteFail(corrosion.OpVMHost, err)
 				progress.Status = "error"
@@ -483,7 +513,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// Reassign VM to target host. Target daemon will pick it up and start it.
 	// Ownership was confirmed above (fresh.HostName == s.hostName), so this never
 	// yanks a VM running elsewhere.
-	if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, target.Name, "stopped"); err != nil {
+	// Phase 4: cold drain move is an ownership transition (fresh-read CAS + increment).
+	if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, target.Name, "stopped"); err != nil {
 		progress.Status = "error"
 		progress.Error = err.Error()
 		return progress
@@ -596,11 +627,26 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		s.publish("host.fence-confirmed", req.Name, "manual")
 		s.audit(ctx, "host.fence-confirm", req.Name,
 			"operator confirmed manual fence", "manual-confirmed")
+		// Deliberately narrow wording. This unblocks the flow where the COORDINATOR
+		// fenced (manual / best-effort strategy) and is waiting on confirmation
+		// before it reschedules. It does NOT make an operator-initiated fence
+		// reschedule anything: FenceHost never enumerates workloads, and the
+		// coordinator skips hosts already in offline/fenced/maintenance
+		// (failover/coordinator.go, the offline/maintenance/fenced filter in
+		// Coordinator.run's fence loop) — so
+		// promising a reschedule here would be
+		// false in exactly the case an operator is most likely to be in.
+		//
+		// A genuinely failed host does not need this: peers observe it by health
+		// quorum and the coordinator runs the whole fence-and-relocate sequence
+		// itself. For PLANNED removal, `lv host drain` is the tool — it migrates
+		// workloads off before the host goes away.
 		return &pb.FenceResult{
 			HostName: req.Name,
 			Method:   "manual",
 			Result:   "manual-confirmed",
-			Detail:   "operator confirmation recorded; coordinator may now reschedule",
+			Detail: "operator confirmation recorded; a coordinator waiting on this confirmation may now reschedule. " +
+				"This does not itself move workloads — for planned removal use `lv host drain " + req.Name + "` first",
 		}, nil
 	}
 
@@ -663,11 +709,20 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	}
 
 	// Validate fence strategy if provided.
+	//
+	// The set must match what internal/fence actually implements. It did not:
+	// "manual" and "best-effort" are both real strategies (fence.Execute
+	// dispatches them, and the failover coordinator has explicit handling for
+	// each), but ConfigureHost rejected them — so the ONE strategy whose whole
+	// purpose is operator-confirmed rescheduling could not be configured through
+	// the CLI at all, and "best-effort" (the default for hosts created before this
+	// field existed) could not be restored once changed away from.
 	if req.FenceStrategy != "" {
 		switch req.FenceStrategy {
-		case "ssh", "ipmi", "watchdog":
+		case "ssh", "ipmi", "watchdog", "manual", "best-effort":
 		default:
-			return nil, status.Errorf(codes.InvalidArgument, "invalid fence strategy %q (valid: ssh, ipmi, watchdog)", req.FenceStrategy)
+			return nil, status.Errorf(codes.InvalidArgument,
+				"invalid fence strategy %q (valid: ssh, ipmi, watchdog, manual, best-effort)", req.FenceStrategy)
 		}
 	}
 
@@ -711,6 +766,32 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		args = append(args, f)
 		provided++
 	}
+	// Capacity overrides are numeric, so "" cannot mean unset — they are proto
+	// `optional` and a nil pointer is what leaves the column alone. A ratio of 0
+	// and a NEGATIVE reserve both mean "clear back to the cluster default"; a
+	// reserve of exactly 0 is a real setting (hand guests everything), which is
+	// why it could not double as the unset sentinel.
+	if v := req.CpuOvercommit; v != nil {
+		args, provided = append(args, *v), provided+1
+	} else {
+		args = append(args, nil)
+	}
+	if v := req.MemOvercommit; v != nil {
+		args, provided = append(args, *v), provided+1
+	} else {
+		args = append(args, nil)
+	}
+	if v := req.CpuReserve; v != nil {
+		args, provided = append(args, int(*v)), provided+1
+	} else {
+		args = append(args, nil)
+	}
+	if v := req.MemReserveMib; v != nil {
+		args, provided = append(args, int(*v)), provided+1
+	} else {
+		args = append(args, nil)
+	}
+
 	if provided == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no fields to update")
 	}
@@ -737,6 +818,10 @@ const configureHostSQL = `UPDATE hosts SET ` +
 	`watchdog_dev = COALESCE(?, watchdog_dev), ` +
 	`role = COALESCE(?, role), ` +
 	`region = COALESCE(?, region), ` +
+	`cpu_overcommit = COALESCE(?, cpu_overcommit), ` +
+	`mem_overcommit = COALESCE(?, mem_overcommit), ` +
+	`cpu_reserve = COALESCE(?, cpu_reserve), ` +
+	`mem_reserve_mib = COALESCE(?, mem_reserve_mib), ` +
 	`updated_at = ? ` +
 	`WHERE name = ?`
 
@@ -766,6 +851,32 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 	slog.Warn("host removed from cluster", "host", req.Name, "cert_serial", h.CertSerial)
 	s.publish("host.removed", req.Name, "cert_serial="+h.CertSerial)
 
+	return &emptypb.Empty{}, nil
+}
+
+// AdmitHost records the CA-authorized identity produced by `lv host add`.
+// Running it on an existing member breaks the tombstone/authentication deadlock
+// when a removed machine is deliberately re-added with a fresh certificate.
+func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*emptypb.Empty, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
+		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
+	}
+	err := corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
+		Name:       req.Name,
+		Address:    req.Address,
+		SSHUser:    "root",
+		SSHPort:    22,
+		GRPCPort:   7443,
+		State:      "active",
+		CertSerial: req.CertSerial,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+	}
+	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
 	return &emptypb.Empty{}, nil
 }
 

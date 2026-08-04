@@ -2105,7 +2105,7 @@ func (s *Server) mintLBProof(ctx context.Context, lbName, destHost string) *pb.R
 	}
 	return &pb.RuntimeActionProof{
 		Id: p.ID, Action: p.Action, TargetKind: p.TargetKind, TargetName: p.TargetName,
-		DestHost: p.DestHost, Coordinator: p.Coordinator,
+		DestHost: p.DestHost, Coordinator: p.Coordinator, OwnerEpoch: p.OwnerEpoch,
 	}
 }
 

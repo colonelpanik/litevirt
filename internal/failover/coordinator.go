@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -90,6 +92,8 @@ type Coordinator struct {
 	hostName string
 	db       *corrosion.Client
 	fencer   Fencer
+	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
+	capacity corrosion.CapacityPolicy
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
 	// Restorer, when set, lets host-loss relocation restore a container from its
@@ -223,6 +227,41 @@ func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 // should not use this.
 func (c *Coordinator) SetFencer(f Fencer) { c.fencer = f }
 
+// SetCapacityPolicy wires the cluster-wide capacity policy.
+func (c *Coordinator) SetCapacityPolicy(p corrosion.CapacityPolicy) { c.capacity = p }
+
+// buildFailoverPlacementRequest constructs a placement request for a VM being
+// rescheduled off failedHost, honoring the constraints in its stored spec.
+// A spec pin to the failed host itself is dropped — the whole point is to leave.
+func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, capacity corrosion.CapacityPolicy) placement.Request {
+	req := placement.Request{
+		VMName:       vm.Name,
+		CPUNeeded:    vm.CPUActual,
+		MemMiBNeeded: vm.MemActual,
+		Capacity:     capacity,
+	}
+	if vm.Spec == "" {
+		return req
+	}
+	spec := &pb.VMSpec{}
+	if json.Unmarshal([]byte(vm.Spec), spec) != nil || spec.Placement == nil {
+		return req
+	}
+	p := spec.Placement
+	if p.Host != "" && p.Host != failedHost {
+		req.PinHost = p.Host
+	}
+	req.AntiAffinity = p.AntiAffinity
+	req.Affinity = p.Affinity
+	req.RequireLabels = p.Require
+	req.PreferLabels = p.Prefer
+	req.Spread = p.Spread
+	if p.MaxPerNode > 0 {
+		req.MaxPerNode = int(p.MaxPerNode)
+	}
+	return req
+}
+
 // now is the coordinator's clock — defaults to time.Now, overridable
 // for virtual-time scenarios via the exported Now field.
 func (c *Coordinator) now() time.Time {
@@ -230,6 +269,10 @@ func (c *Coordinator) now() time.Time {
 		return c.Now()
 	}
 	return time.Now()
+}
+
+func ownerEpochString(epoch int64) string {
+	return strconv.FormatInt(epoch, 10)
 }
 
 // Start runs the coordinator loop. Blocks until ctx is cancelled.
@@ -951,6 +994,14 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 
 	// Step 5: Reschedule VMs using placement engine for proper resource-aware scheduling.
 	fallbackIdx := 0
+	type failoverPlan struct {
+		vm             corrosion.VMRecord
+		targetName     string
+		needsPlacement bool
+	}
+	plans := make([]failoverPlan, 0, len(vms))
+	placementReqs := make([]placement.Request, 0, len(vms))
+
 	for _, vm := range vms {
 		// A Secure-Boot/vTPM VM's firmware state (UEFI NVRAM + swtpm) is host-local,
 		// so it died with the fenced host — neither a reschedule (would boot a fresh
@@ -1053,61 +1104,80 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			}
 		}
 
-		// Use placement engine to find the best host (respects CPU, memory,
-		// anti-affinity, labels, device requirements).
 		if targetName == "" {
-			req := placement.Request{
-				VMName:       vm.Name,
-				CPUNeeded:    vm.CPUActual,
-				MemMiBNeeded: vm.MemActual,
-			}
-			// Parse placement constraints from stored spec if available.
-			if vm.Spec != "" {
-				var spec struct {
-					Placement *struct {
-						Host         string            `json:"host"`
-						AntiAffinity []string          `json:"anti_affinity"`
-						Affinity     []string          `json:"affinity"`
-						Require      map[string]string `json:"require"`
-						Prefer       map[string]string `json:"prefer"`
-						Spread       bool              `json:"spread"`
-						MaxPerNode   int32             `json:"max_per_node"`
-					} `json:"placement"`
-				}
-				if json.Unmarshal([]byte(vm.Spec), &spec) == nil && spec.Placement != nil {
-					p := spec.Placement
-					// Don't pin to the failed host during failover.
-					if p.Host != "" && p.Host != h.Name {
-						req.PinHost = p.Host
-					}
-					req.AntiAffinity = p.AntiAffinity
-					req.Affinity = p.Affinity
-					req.RequireLabels = p.Require
-					req.PreferLabels = p.Prefer
-					req.Spread = p.Spread
-					if p.MaxPerNode > 0 {
-						req.MaxPerNode = int(p.MaxPerNode)
-					}
-				}
-			}
-
-			selected, err := placement.Select(ctx, c.db, req)
-			if err != nil {
-				// Fallback to round-robin if placement fails (degraded mode).
-				slog.Warn("failover: placement failed, using round-robin fallback",
-					"vm", vm.Name, "error", err)
-				c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
-				targetName = candidates[fallbackIdx%len(candidates)].Name
-				fallbackIdx++
-			} else {
-				targetName = selected
-			}
+			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity)
+			placementReqs = append(placementReqs, req)
+			plans = append(plans, failoverPlan{vm: vm, needsPlacement: true})
+			continue
 		}
 
+		plans = append(plans, failoverPlan{vm: vm, targetName: targetName, needsPlacement: false})
+	}
+
+	placements := map[string]placement.BatchResult{}
+	if len(placementReqs) > 0 {
+		allVMs, err := corrosion.ListVMs(ctx, c.db, "", "")
+		if err != nil {
+			slog.Error("failover: list VMs for batch placement", "host", h.Name, "error", err)
+			c.mAttempt(PhaseFence, ResultError, ErrDBError)
+			return
+		}
+		ctMem, err := corrosion.SumContainerMemoryByHost(ctx, c.db)
+		if err != nil {
+			ctMem = nil
+		}
+		if selected, err := placement.SelectBatch(candidates, allVMs, nil, ctMem, placementReqs); err != nil {
+			// A batch placement failure must not block recovery. Fall back to
+			// round-robin on a per-VM basis exactly as before.
+			slog.Warn("failover: batch placement failed, using round-robin fallback",
+				"error", err)
+			for i := range plans {
+				if plans[i].needsPlacement {
+					plans[i].targetName = candidates[fallbackIdx%len(candidates)].Name
+					plans[i].needsPlacement = false
+					fallbackIdx++
+					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
+				}
+			}
+		} else {
+			placements = selected
+		}
+	}
+
+	for _, p := range plans {
+		vm := p.vm
+		if p.needsPlacement {
+			result, ok := placements[vm.Name]
+			if !ok || result.Host == "" {
+				slog.Warn("failover: batch placement missed host, using round-robin fallback",
+					"vm", vm.Name)
+				c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
+				p.targetName = candidates[fallbackIdx%len(candidates)].Name
+				fallbackIdx++
+			} else {
+				p.targetName = result.Host
+			}
+			p.needsPlacement = false
+		}
+
+		targetName := p.targetName
+
 		slog.Info("failover: rescheduling VM",
-			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", policy)
+			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", vmFailurePolicy(vm))
 
 		if c.gateEnforced(ctx) {
+			// ListVMs deliberately omits operation-control columns, including
+			// vm_owner_epoch. Re-read the full authoritative row at the decision
+			// boundary so the proof binds the real ownership generation; the
+			// transactional writer checks the same epoch again to close the race.
+			freshVM, ferr := corrosion.GetVM(ctx, c.db, vm.Name)
+			if ferr != nil || freshVM == nil || freshVM.HostName != h.Name {
+				slog.Warn("failover: VM ownership changed before proof mint; deferring",
+					"vm", vm.Name, "expected_host", h.Name, "error", ferr)
+				c.mVM(ActionReschedule, ResultError, ErrDBError)
+				continue
+			}
+			vm = *freshVM
 			// Enforcement active: re-check DecisionGate (quorum + coordinator-eligible;
 			// the lease is already held in this failover path) as close to the write as
 			// possible, then write a durable proof linked to the pending transition so
@@ -1135,6 +1205,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
+				OwnerEpoch: ownerEpochString(vm.OwnerEpoch),
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -1247,6 +1318,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
 				TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 				LeaseHolder: c.hostName, RelocationToken: token,
+				OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
 			}
 			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
@@ -1323,7 +1395,19 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 // (logical, idempotent) handoff — the source host is fenced and won't write again.
 func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string) {
 	if err := corrosion.DeleteContainer(ctx, c.db, h.Name, ct.Name); err != nil {
-		slog.Warn("failover: tombstone source row after restore", "container", ct.Name, "error", err)
+		// The restore itself landed, but the handoff is INCOMPLETE: the dead
+		// host's source row is still live next to the target's — a duplicate
+		// the scheduler and quota both count. Recording success here would
+		// declare the relocation clean while that duplicate exists. Report a
+		// partial result instead and DON'T mark the host relocated: the next
+		// sweep re-enters this path (the marker and token-matched target row
+		// are still in place) and retries the tombstone until it lands.
+		slog.Warn("failover: source row tombstone failed after restore — will retry next sweep",
+			"container", ct.Name, "from", h.Name, "to", target, "error", err)
+		c.mCt(ActionRelocate, ResultPartial, ErrDBError)
+		c.auditRelocate(ctx, "ct.relocate.restored", ct.Name,
+			"restored to "+target+" but the source row on "+h.Name+" is still live (tombstone failed; retrying)", "error")
+		return
 	}
 	c.fenceRelocated[h.Name] = true
 	c.mCt(ActionRelocate, ResultSuccess, errClassNone)
@@ -1386,6 +1470,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
 			TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 			LeaseHolder: c.hostName, RelocationToken: relocToken,
+			OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
 		}
 		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)
@@ -1415,6 +1500,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) string {
 	if target, err := placement.Select(ctx, c.db, placement.Request{
 		VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
+		Capacity: c.capacity,
 	}); err == nil && !c.targetHasLiveContainer(ctx, target, ct.Name) {
 		return target
 	}

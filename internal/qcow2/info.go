@@ -28,6 +28,13 @@ func Info(path string) (*ImageInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	st, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat qcow2 image: %w", err)
+	}
+	if err := validateHeaderRanges(h, st.Size()); err != nil {
+		return nil, err
+	}
 
 	info := &ImageInfo{
 		VirtualSize: h.Size,
@@ -48,9 +55,7 @@ func Info(path string) (*ImageInfo, error) {
 	info.BackingFormat = readBackingFormat(f, h)
 
 	// Actual size on disk.
-	if st, err := f.Stat(); err == nil {
-		info.ActualSize = st.Size()
-	}
+	info.ActualSize = st.Size()
 
 	return info, nil
 }

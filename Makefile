@@ -102,6 +102,7 @@ test-fuzz-telemetry:
 # BASE_REF overrides what the schema-growth check diffs against (default origin/main).
 ci-guards:
 	./scripts/ci/check-schema-bump.sh
+	./scripts/ci/check-ledger-drift.sh
 	go run ./scripts/ci/writecheck -root .
 	go test ./scripts/ci/writecheck/
 	go run ./scripts/ci/stmtshapecheck -root .

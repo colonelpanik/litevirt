@@ -2,14 +2,20 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
+)
+
+const (
+	defaultNFSCommandTimeout = 30 * time.Second
+	maxNFSCommandOutput      = 4 << 10
 )
 
 // nfsDriver mounts an NFS export and stores qcow2/raw files inside the
@@ -22,7 +28,7 @@ type nfsDriver struct {
 	targetOverride string            // explicit mount point from pool config
 	opts           map[string]string // mount options et al.
 	mountDir       string            // resolved by Prepare()
-	run            cmdRunner         // mountpoint/umount seam (Teardown); tests inject a fake
+	run            cmdRunner         // mountpoint, mount, and umount seam; tests inject a fake
 }
 
 func (d *nfsDriver) String() string { return "nfs" }
@@ -38,23 +44,43 @@ func (d *nfsDriver) Teardown(ctx context.Context) error {
 		slog.Info("NFS teardown skipped: operator-managed mount", "source", d.source, "target", d.targetOverride)
 		return nil
 	}
+	commandCtx, cancel, err := d.commandContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 	run := d.run
 	if run == nil {
 		run = realCmd
 	}
 	safe := strings.NewReplacer("/", "_", ":", "_").Replace(d.source)
 	mountDir := filepath.Join(d.mountBase, safe)
-	if _, err := run(ctx, "mountpoint", "-q", mountDir); err != nil {
-		return nil // not mounted → nothing to undo
+	if out, err := run(commandCtx, "mountpoint", "-q", mountDir); err != nil {
+		if commandCtx.Err() != nil {
+			return nfsCommandError("check nfs mountpoint", d.source, commandCtx.Err(), out)
+		}
+		if mountpointNotMounted(err) {
+			return nil
+		}
+		return nfsCommandError("check nfs mountpoint", mountDir, err, out)
 	}
-	if out, err := run(ctx, "umount", mountDir); err != nil {
-		return fmt.Errorf("umount nfs %s: %w: %s", mountDir, err, out)
+	if out, err := run(commandCtx, "umount", mountDir); err != nil {
+		if commandCtx.Err() != nil {
+			return nfsCommandError("umount nfs", mountDir, commandCtx.Err(), out)
+		}
+		return nfsCommandError("umount nfs", mountDir, err, out)
 	}
 	slog.Info("NFS unmounted", "source", d.source, "mountpoint", mountDir)
 	return nil
 }
 
 func (d *nfsDriver) Prepare(ctx context.Context) error {
+	commandCtx, cancel, err := d.commandContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
 	if d.targetOverride != "" {
 		d.mountDir = d.targetOverride
 	} else {
@@ -66,24 +92,74 @@ func (d *nfsDriver) Prepare(ctx context.Context) error {
 		return fmt.Errorf("create mount dir: %w", err)
 	}
 
+	run := d.run
+	if run == nil {
+		run = realCmd
+	}
+
 	// `mountpoint -q` reports the result ONLY via exit code (0 = already a
 	// mountpoint) — it prints nothing — so the old `string(out) == ""` test was
 	// always true and re-ran `mount` on every Prepare (every CreateVM / restart),
 	// which fails on already-mounted configs or stacks mounts (bug-sweep #8).
 	// Skip the mount when it's already mounted, keyed on the exit code.
-	alreadyMounted := exec.CommandContext(ctx, "mountpoint", "-q", d.mountDir).Run() == nil
+	mountpointOut, err := run(commandCtx, "mountpoint", "-q", d.mountDir)
+	if err != nil && commandCtx.Err() != nil {
+		return nfsCommandError("check nfs mountpoint", d.mountDir, commandCtx.Err(), mountpointOut)
+	}
+	alreadyMounted := err == nil
 	if !alreadyMounted {
 		mountOpts := "vers=4,hard,intr"
 		if extra, ok := d.opts["options"]; ok {
 			mountOpts = extra
 		}
-		cmd := exec.CommandContext(ctx, "mount", "-t", "nfs", "-o", mountOpts, d.source, d.mountDir)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("mount nfs %s: %w: %s", d.source, err, out)
+		if out, err := run(commandCtx, "mount", "-t", "nfs", "-o", mountOpts, d.source, d.mountDir); err != nil {
+			if commandCtx.Err() != nil {
+				return nfsCommandError("mount nfs", d.source, commandCtx.Err(), out)
+			}
+			return nfsCommandError("mount nfs", d.source, err, out)
 		}
 		slog.Info("NFS mounted", "source", d.source, "mountpoint", d.mountDir)
 	}
 	return nil
+}
+
+func (d *nfsDriver) commandContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	timeout := defaultNFSCommandTimeout
+	if configured, ok := d.opts["command_timeout"]; ok {
+		configured = strings.TrimSpace(configured)
+		if configured != "" {
+			parsed, err := time.ParseDuration(configured)
+			if err != nil || parsed <= 0 {
+				return nil, nil, fmt.Errorf("invalid NFS command_timeout %q: must be a positive duration", configured)
+			}
+			timeout = parsed
+		}
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, timeout)
+	return commandCtx, cancel, nil
+}
+
+// mountpoint -q exits 32 when its target is not a mountpoint. Other failures
+// (including a missing binary or permission error) are probe failures and must
+// not be treated as an idempotent teardown success.
+func mountpointNotMounted(err error) bool {
+	var exitCode interface{ ExitCode() int }
+	return errors.As(err, &exitCode) && exitCode.ExitCode() == 32
+}
+
+func nfsCommandError(operation, target string, err error, out []byte) error {
+	if output := trimmedNFSCommandOutput(out); output != "" {
+		return fmt.Errorf("%s %s: %w: %s", operation, target, err, output)
+	}
+	return fmt.Errorf("%s %s: %w", operation, target, err)
+}
+
+func trimmedNFSCommandOutput(out []byte) string {
+	output := strings.TrimSpace(string(out))
+	if len(output) > maxNFSCommandOutput {
+		return output[:maxNFSCommandOutput] + "…"
+	}
+	return output
 }
 
 func (d *nfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, error) {

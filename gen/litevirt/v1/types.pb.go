@@ -405,6 +405,13 @@ type VMSpec struct {
 	Tpm           bool   `protobuf:"varint,38,opt,name=tpm,proto3" json:"tpm,omitempty"`                                 // emulated TPM 2.0 device (Windows 11 / BitLocker)
 	Uuid          string `protobuf:"bytes,39,opt,name=uuid,proto3" json:"uuid,omitempty"`                                // stable domain identity; makes the libvirt swtpm path deterministic
 	MaxCpu        int32  `protobuf:"varint,40,opt,name=max_cpu,json=maxCpu,proto3" json:"max_cpu,omitempty"`             // vCPU hotplug ceiling; >cpu emits <vcpu current=cpu>max_cpu</vcpu> for live CPU add (live_resize)
+	// on_host_failure is the host-loss policy as a plain string ("restart-any" |
+	// "restart-same" | "none"; "" = legacy/none). It exists because the failover
+	// coordinator reads the PERSISTED spec JSON's top-level "on_host_failure" key,
+	// and MigrationPolicy.on_host_failure cannot express that: RESTART_ANY is enum
+	// value 0, which encoding/json omitempty drops entirely on store, making
+	// restart-any indistinguishable from unset. The string field round-trips.
+	OnHostFailure string `protobuf:"bytes,41,opt,name=on_host_failure,json=onHostFailure,proto3" json:"on_host_failure,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -719,6 +726,13 @@ func (x *VMSpec) GetMaxCpu() int32 {
 	return 0
 }
 
+func (x *VMSpec) GetOnHostFailure() string {
+	if x != nil {
+		return x.OnHostFailure
+	}
+	return ""
+}
+
 type DiskSpec struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Name    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -983,17 +997,19 @@ func (x *CloudInitSpec) GetNetworkconfig() string {
 }
 
 type PlacementSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
-	AntiAffinity  []string               `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
-	Affinity      []string               `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
-	Require       map[string]string      `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Prefer        map[string]string      `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Spread        bool                   `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
-	MaxPerNode    int32                  `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
-	Policy        string                 `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
-	Rebalance     *RebalanceSpec         `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
-	NoMigrate     bool                   `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A host pin restricts candidate selection but never bypasses hard
+	// constraints (capacity, labels, devices, anti-affinity, or replica caps).
+	Host          string            `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
+	AntiAffinity  []string          `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
+	Affinity      []string          `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
+	Require       map[string]string `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Prefer        map[string]string `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Spread        bool              `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
+	MaxPerNode    int32             `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
+	Policy        string            `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
+	Rebalance     *RebalanceSpec    `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
+	NoMigrate     bool              `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3849,6 +3865,11 @@ type Host struct {
 	IpmiAddress   string                 `protobuf:"bytes,18,opt,name=ipmi_address,json=ipmiAddress,proto3" json:"ipmi_address,omitempty"`
 	WatchdogDev   string                 `protobuf:"bytes,19,opt,name=watchdog_dev,json=watchdogDev,proto3" json:"watchdog_dev,omitempty"`
 	Region        string                 `protobuf:"bytes,20,opt,name=region,proto3" json:"region,omitempty"` // federation: failure-domain label
+	// Serial of the host's mTLS certificate. Not secret — it is the public
+	// identifier of a public certificate — and `lv host rm` needs it to revoke that
+	// certificate at the moment of removal, after which the row is tombstoned and
+	// the serial is no longer readable.
+	CertSerial    string `protobuf:"bytes,21,opt,name=cert_serial,json=certSerial,proto3" json:"cert_serial,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4019,6 +4040,13 @@ func (x *Host) GetWatchdogDev() string {
 func (x *Host) GetRegion() string {
 	if x != nil {
 		return x.Region
+	}
+	return ""
+}
+
+func (x *Host) GetCertSerial() string {
+	if x != nil {
+		return x.CertSerial
 	}
 	return ""
 }
@@ -5485,7 +5513,7 @@ var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x94\f\n" +
+	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xbc\f\n" +
 	"\x06VMSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -5533,7 +5561,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"secureBoot\x12\x10\n" +
 	"\x03tpm\x18& \x01(\bR\x03tpm\x12\x12\n" +
 	"\x04uuid\x18' \x01(\tR\x04uuid\x12\x17\n" +
-	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x1a9\n" +
+	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x12&\n" +
+	"\x0fon_host_failure\x18) \x01(\tR\ronHostFailure\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb5\x01\n" +
@@ -5840,7 +5869,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rselector_kind\x18\x02 \x01(\tR\fselectorKind\x121\n" +
 	"\adesired\x18\x03 \x01(\v2\x17.litevirt.v1.DeviceSpecR\adesired\x128\n" +
 	"\amembers\x18\x04 \x03(\v2\x1e.litevirt.v1.HardwarePCIMemberR\amembers\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\xc4\x06\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\xe5\x06\n" +
 	"\x04Host\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12,\n" +
@@ -5866,7 +5895,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x0efence_strategy\x18\x11 \x01(\tR\rfenceStrategy\x12!\n" +
 	"\fipmi_address\x18\x12 \x01(\tR\vipmiAddress\x12!\n" +
 	"\fwatchdog_dev\x18\x13 \x01(\tR\vwatchdogDev\x12\x16\n" +
-	"\x06region\x18\x14 \x01(\tR\x06region\x1a9\n" +
+	"\x06region\x18\x14 \x01(\tR\x06region\x12\x1f\n" +
+	"\vcert_serial\x18\x15 \x01(\tR\n" +
+	"certSerial\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x99\x02\n" +

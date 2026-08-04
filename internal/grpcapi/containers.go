@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -133,6 +132,31 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 	}
 
+	// Host capacity admission — MEMORY only.
+	//
+	// A container's cpu_limit is CPU *shares* (a relative cgroup weight), not a
+	// vCPU reservation, so it cannot be added to a host's vCPU total; only its
+	// memory cap is comparable to a VM's. An UNCAPPED container (memory 0)
+	// reserves nothing here, matching how it is accounted.
+	//
+	// Placed after tenancy and before any runtime or IPAM work, so a refusal
+	// leaves no partial state to unwind.
+	//
+	// admitResources (not checkResourceAdmission): this host is the owner and will
+	// commit the container below, so the memory must be RESERVED across the gap to
+	// CreateContainerAtomic — otherwise a concurrent create for a different name
+	// sees the same free memory and both pass.
+	if req.MemoryMib > 0 {
+		// newVMOnHost=false: VMMemOverheadMiB is qemu-specific (device models,
+		// video, page tables) and containers are accounted through their own
+		// per-host memory sum, so a container never pays a qemu overhead.
+		lease, aerr := s.admitWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib), false)
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+	}
+
 	// Resolve the requested NICs into runtime attachments + managed-interface rows
 	// + create-spec intent, ALLOCATING each managed NIC's IPAM lease as it goes
 	// (managed network vs legacy raw bridge). On any later failure we release this
@@ -162,7 +186,12 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: plan.specNets,
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	// CreatedAt is left empty ON PURPOSE: the corrosion writer stamps it with
+	// nanosecond precision, and that stamp is the row's INCARNATION identity —
+	// anti-entropy uses it to tell a genuine recreate from a stale pre-delete
+	// copy. Pre-filling a bare-second stamp here (as this site used to) would
+	// make a same-second delete+recreate indistinguishable from the incarnation
+	// the delete killed.
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: info.Name,
 		State: info.State, Image: chooseImage(req.Image, info.Image),
@@ -171,7 +200,6 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Project:       req.Project, // UpsertContainer normalizes "" → "_default"
 		OnHostFailure: req.OnHostFailure,
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
-		CreatedAt:     now,
 	}
 	// Write the container row + managed interface rows in ONE atomic batch. Fail
 	// closed: the runtime container exists but the DB write failed → delete the
@@ -207,6 +235,13 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// Serialize with a concurrent start/create of the SAME container before reading
+	// the row. Without this, two starts both read state != "running", both admit
+	// and both reserve its memory — so the second is refused for capacity the first
+	// is already accounting for. The row read has to be under the lock for the
+	// admission below to be based on a state that can't change underneath it.
+	unlock := s.lockVM("ct/" + req.Name)
+	defer unlock()
 	// Preflight the cluster row BEFORE touching the runtime: a missing/soft-deleted
 	// row means we'd start an UNTRACKED container, so refuse. (Also folds in the
 	// template check — a frozen clone source can't be started.)
@@ -221,6 +256,20 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	}
 	if rec.IsTemplate {
 		return nil, status.Errorf(codes.FailedPrecondition, "%q is a template and cannot be started; clone it instead", req.Name)
+	}
+	// Host capacity admission — memory only (see CreateContainer). Starting is when
+	// the memory is actually taken: a stopped container is accounted as nothing, so
+	// checking only at create would be sidestepped by creating several that each fit
+	// and starting them all. Skipped when already running (adds nothing) and when
+	// uncapped (nothing to admit).
+	// Reserved, not just checked, so the memory stays accounted for across the
+	// runtime start and the "running" state write below.
+	if rec.State != "running" && rec.MemMiB > 0 {
+		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, 0, rec.MemMiB, false)
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
@@ -312,7 +361,10 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// governs start/stop): retry-safety matters for the failover/relocation paths
 	// that re-issue deletes. So an already-gone row (ErrNoRowsAffected) is a
 	// success — but audited distinctly (not a silent "ok") so an operator typo
-	// isn't invisible; only a REAL DB error surfaces as Internal.
+	// isn't invisible. A REAL DB error — or ErrDeleteContended, a row still LIVE
+	// after the guarded CAS retried (its authority kept moving) — surfaces as
+	// Internal: the runtime container is gone by this point, and OK-with-a-live-
+	// row would be exactly the ghost this tombstone is mandatory to prevent.
 	derr := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name)
 	if derr != nil && !errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")

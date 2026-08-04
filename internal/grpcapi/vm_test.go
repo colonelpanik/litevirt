@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -35,6 +36,9 @@ func testServerWithLocks(t *testing.T) *Server {
 		db:       db,
 		events:   events.NewBus(),
 		vmLocks:  make(map[string]*sync.Mutex),
+		bridgeEnsure: func(string) error {
+			return nil
+		},
 	}
 }
 
@@ -62,6 +66,150 @@ func TestCreateVM_NilSpec(t *testing.T) {
 	}
 	if c := status.Code(err); c != codes.InvalidArgument {
 		t.Errorf("code = %v, want InvalidArgument", c)
+	}
+}
+
+func TestCreateVM_NilRequest(t *testing.T) {
+	s := testServer(t)
+
+	_, err := s.CreateVM(adminCtx(), nil)
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("status code = %v, want InvalidArgument (err = %v)", got, err)
+	}
+}
+
+func TestCreateVM_DoesNotMutateCallerRequest(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	req := &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name:  "caller-request",
+		Uuid:  "caller-supplied-uuid",
+		Disks: []*pb.DiskSpec{{Name: "root", Size: "1M"}},
+	}}
+	want := proto.Clone(req).(*pb.CreateVMRequest)
+
+	if _, err := s.CreateVM(ctx, req); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	record, err := corrosion.GetVM(ctx, s.db, "caller-request")
+	if err != nil || record == nil {
+		t.Fatalf("GetVM(caller-request) = %v, %v", record, err)
+	}
+	stored := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(record.Spec), stored); err != nil {
+		t.Fatalf("unmarshal stored spec: %v", err)
+	}
+	if stored.Uuid == "" || stored.Uuid == req.Spec.Uuid ||
+		stored.Cpu != 2 || stored.MemoryMib != 4096 ||
+		stored.Machine != "q35" || stored.Firmware != "uefi" ||
+		len(stored.Disks) != 1 || stored.Disks[0].Bus != "virtio" {
+		t.Fatalf("locally executed spec was not fully mutated: %+v", stored)
+	}
+	if !proto.Equal(req, want) {
+		t.Fatalf("caller request mutated: got %+v, want %+v", req, want)
+	}
+}
+
+func TestCreateVM_IdempotencyTreatsImplicitAndExplicitDefaultsAsEquivalent(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	first, err := s.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec:           &pb.VMSpec{Name: "idempotent-defaults"},
+		IdempotencyKey: "implicit-defaults-key",
+	})
+	if err != nil {
+		t.Fatalf("first CreateVM: %v", err)
+	}
+	retry, err := s.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "idempotent-defaults", Cpu: 2, MemoryMib: 4096, Machine: "q35", Firmware: "uefi",
+		},
+		IdempotencyKey: "implicit-defaults-key",
+	})
+	if err != nil {
+		t.Fatalf("retry CreateVM: %v", err)
+	}
+	if !proto.Equal(retry, first) {
+		t.Fatalf("retry response = %+v, want replay %+v", retry, first)
+	}
+}
+
+func TestCreateVM_OmittedResourcesPersistNormalizedDefaults(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	resp, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "defaults"}})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if resp.CpuActual != 2 || resp.MemActualMib != 4096 {
+		t.Fatalf("CreateVM response resources = cpu=%d memory_mib=%d, want 2/4096", resp.CpuActual, resp.MemActualMib)
+	}
+
+	rec, err := corrosion.GetVM(ctx, s.db, "defaults")
+	if err != nil || rec == nil {
+		t.Fatalf("GetVM(defaults) = %v, %v", rec, err)
+	}
+	if rec.CPUActual != 2 || rec.MemActual != 4096 {
+		t.Fatalf("persisted resources = cpu=%d memory_mib=%d, want 2/4096", rec.CPUActual, rec.MemActual)
+	}
+	stored := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(rec.Spec), stored); err != nil {
+		t.Fatalf("unmarshal stored spec: %v", err)
+	}
+	if stored.Cpu != 2 || stored.MemoryMib != 4096 || stored.Machine != "q35" || stored.Firmware != "uefi" {
+		t.Fatalf("stored spec = %+v, want normalized defaults", stored)
+	}
+}
+
+func TestCreateVM_OmittedResourcesUseDefaultsForAdmission(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "/acme", Display: "Acme"}); err != nil {
+		t.Fatalf("InsertProject: %v", err)
+	}
+	if err := corrosion.UpsertProjectQuota(ctx, s.db, corrosion.ProjectQuotaRecord{
+		ProjectName: "/acme", VCPULimit: 1, MemMiBLimit: 4095,
+	}); err != nil {
+		t.Fatalf("UpsertProjectQuota: %v", err)
+	}
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "over-quota-defaults", Project: "/acme"}})
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Fatalf("status code = %v, want ResourceExhausted (err = %v)", got, err)
+	}
+	if s.virt.DomainExists("over-quota-defaults") {
+		t.Fatal("runtime was called for a request rejected by admission")
+	}
+}
+
+func TestCreateVM_RejectsNegativeResourcesBeforeRuntime(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "negative-resources", Cpu: -1, MemoryMib: 512,
+	}})
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("status code = %v, want InvalidArgument (err = %v)", got, err)
+	}
+	if s.virt.DomainExists("negative-resources") {
+		t.Fatal("runtime was called for an invalid request")
 	}
 }
 
@@ -1168,4 +1316,365 @@ func TestLockVM_Concurrent(t *testing.T) {
 	// Verify the same VM can be locked again after unlock.
 	unlock2 := s.lockVM("test-vm")
 	unlock2()
+}
+
+// TestCreateVM_PinnedHostRespectsCapacity: pinning a host must not bypass host
+// capacity admission.
+//
+// placement.Select only scores capacity when it CHOOSES a host; a pin makes it
+// validate the host is active and return it, so a pinned create previously had no
+// capacity check at all. Demonstrated on a real 4-node cluster: three 1 GiB VMs
+// pinned to a ~3 GiB host were all accepted, the cluster reported 3072/2971 MiB,
+// and the node thrashed until sshd stopped answering. Meanwhile RESIZING a VM
+// into the same host was correctly refused — the two paths disagreed.
+func TestCreateVM_PinnedHostRespectsCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable is 4096 - 1024 (default host reserve) = 3072 MiB; 2560 of it is
+	// already in use by a running VM, leaving 512 free.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "sitting", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 2560,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "too-big", Cpu: 1, MemoryMib: 1024, // 1024 > 512 free
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("pinned create exceeding host memory: got %v, want ResourceExhausted", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, s.db, "too-big"); rec != nil {
+		t.Errorf("VM refused for capacity must not be persisted: %+v", rec)
+	}
+
+	// A VM that DOES fit must still be accepted — the check must not simply
+	// refuse every pinned create.
+	if _, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "fits", Cpu: 1, MemoryMib: 256,
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}}); err != nil {
+		t.Fatalf("pinned create that fits was refused: %v", err)
+	}
+}
+
+// TestStartVM_RespectsHostCapacity: starting is where memory is actually
+// consumed — usage counts running VMs only — so create-time admission alone is
+// trivially sidestepped by creating VMs that each fit and then starting them all.
+func TestStartVM_RespectsHostCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable 4096-1024 = 3072; 2560 in use leaves 512 free.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "sitting", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 2560,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM sitting: %v", err)
+	}
+	// A stopped VM contributes nothing to usage until it starts — which is exactly
+	// the hole this closes.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "waiting", HostName: "test-host", State: "stopped",
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "waiting", Cpu: 1, MemoryMib: 1024}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM waiting: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>waiting</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "waiting"}); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("start exceeding host memory: got %v, want ResourceExhausted", err)
+	}
+
+	// The audited escape hatch still lets an operator through.
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "waiting", AllowOvercommit: true}); err != nil {
+		t.Fatalf("start with --allow-overcommit: %v", err)
+	}
+}
+
+// TestStartVM_AlreadyRunningIsNotRefusedForCapacity: `lv start` on a running VM
+// adds nothing, so it must not be refused for capacity the VM already occupies.
+func TestStartVM_AlreadyRunningIsNotRefusedForCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 2048,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Already running and larger than the host's remaining headroom.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "big", HostName: "test-host", State: "running", CPUActual: 2, MemActual: 4096,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "big", Cpu: 2, MemoryMib: 4096}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>big</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "big"}); status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("start of an already-running VM was refused for capacity it already holds: %v", err)
+	}
+}
+
+// TestUpdateVM_RestartIfNeededRespectsHostCapacity: a reconfigure that GROWS the
+// VM past the host's headroom is refused — and, critically, refused BEFORE the
+// stop, so the VM is left running on its old spec.
+//
+// Admitting later would mean refusing after the redefine already succeeded,
+// leaving the VM stopped, resized, and unable to come back: worse than the
+// overcommit it was trying to prevent.
+func TestUpdateVM_RestartIfNeededRespectsHostCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable 4096-1024 = 3072. Running VM holds 1024 (+128 qemu overhead),
+	// so growing it to 4096 cannot fit.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "grow", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 1024,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "grow", Cpu: 1, MemoryMib: 1024}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>grow</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	yes := true
+	_, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "grow", MemoryMib: 4096, AllowRestart: &yes,
+	})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("reconfigure growing past host capacity: got %v, want ResourceExhausted", err)
+	}
+
+	// Untouched: still running, still its old size. A refusal after the stop would
+	// show up here as state=stopped.
+	rec, gerr := corrosion.GetVM(ctx, s.db, "grow")
+	if gerr != nil || rec == nil {
+		t.Fatalf("GetVM: %v", gerr)
+	}
+	if rec.State != "running" {
+		t.Errorf("VM state = %q after a REFUSED reconfigure, want running — it was stopped and then refused", rec.State)
+	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(rec.Spec), spec); err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	if spec.MemoryMib != 1024 {
+		t.Errorf("spec memory = %d after a refused reconfigure, want the original 1024", spec.MemoryMib)
+	}
+}
+
+// TestUpdateVM_RestartIfNeededShrinkIsNotRefused: only GROWTH consumes capacity.
+// A shrink on a host with no headroom must still be allowed — refusing it would
+// block the very operation that frees memory.
+func TestUpdateVM_RestartIfNeededShrinkIsNotRefused(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Deliberately over its allocatable headroom already.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "shrink", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 3000,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "shrink", Cpu: 1, MemoryMib: 3000}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>shrink</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	yes := true
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "shrink", MemoryMib: 1024, AllowRestart: &yes,
+	}); status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("a SHRINK was refused for capacity: %v — only growth consumes anything", err)
+	}
+}
+
+// TestStartVMLocked_RecoveryPathIsNotAdmitted pins the load-bearing design
+// decision behind start-time capacity admission: it lives on the StartVM RPC,
+// NOT in the shared start primitive.
+//
+// The automated failover / reconciler / health-restart paths reach a VM through
+// startVMLocked (via PrepareHardwareForStart), never through the RPC. They must
+// stay unadmitted: after a host reboot every VM starts at once, and admitting
+// there would let the first few through and strand the rest — a clean recovery
+// turned into a partial one, which is worse than the overcommit it prevents.
+//
+// This was verified on real hardware (a restart=always VM destroyed behind
+// litevirt's back came back while the host had less free memory than the VM's own
+// size) but had no test. Moving the check into startVMLocked would break nothing
+// otherwise.
+func TestStartVMLocked_RecoveryPathIsNotAdmitted(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 2048,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// The host is already over its allocatable headroom (2048 - 1024 reserve =
+	// 1024, with 2000 MiB of running VM on it), so the RPC would refuse this.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "ballast", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 2000,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM ballast: %v", err)
+	}
+	vmRec := corrosion.VMRecord{
+		Name: "recovered", HostName: "test-host", State: "stopped",
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "recovered", Cpu: 1, MemoryMib: 1024}),
+	}
+	if err := corrosion.InsertVM(ctx, s.db, vmRec, nil, nil); err != nil {
+		t.Fatalf("InsertVM recovered: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>recovered</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	// Sanity: the operator RPC DOES refuse it, so the host really is over capacity
+	// and the recovery assertion below is not passing for a trivial reason.
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "recovered"}); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("precondition: operator StartVM should be refused here, got %v", err)
+	}
+
+	// The recovery primitive must start it regardless.
+	fresh, err := corrosion.GetVM(ctx, s.db, "recovered")
+	if err != nil || fresh == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if _, err := s.startVMLocked(ctx, fresh); err != nil {
+		t.Fatalf("startVMLocked refused a recovery start: %v — the automated restart paths must not be admitted, or a host reboot strands every VM after the first few", err)
+	}
+}
+
+// TestCreateVM_RefusesADiskThatWillNotFitItsPool: disk was tracked and displayed
+// but never admitted. A full pool is worse than a full host — qcow2 images cannot
+// grow, so guests take I/O errors rather than merely thrashing.
+func TestCreateVM_RefusesADiskThatWillNotFitItsPool(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 65536,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// 10 GiB pool, 9 GiB actually used → ~0.5 GiB free after the 5% reserve.
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "tank", Driver: "dir", Target: "/tank",
+		TotalBytes: 10 << 30, UsedBytes: 9 << 30, State: "active",
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+
+	// 100 GiB declared → ~33 GiB after the thin ratio, far beyond what is free.
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "toobig", Cpu: 1, MemoryMib: 1024,
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "100G", Storage: "tank"}},
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("disk exceeding its pool: got %v, want ResourceExhausted", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, s.db, "toobig"); rec != nil {
+		t.Errorf("refused VM was persisted anyway: %+v", rec)
+	}
+}
+
+// TestCreateVM_UnsampledPoolDoesNotBlockCreates: a pool with no statfs sample is
+// UNKNOWN, not full. Refusing there would break every cluster whose pools have
+// not been sampled yet — the opposite of safe.
+func TestCreateVM_UnsampledPoolDoesNotBlockCreates(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 65536,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "fresh", Driver: "dir", Target: "/fresh",
+		TotalBytes: 0, UsedBytes: 0, State: "active", // never sampled
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+
+	if _, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "ok", Cpu: 1, MemoryMib: 1024,
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "500G", Storage: "fresh"}},
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}}); status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("an unsampled pool refused a create: %v — missing telemetry means unknown, not full", err)
+	}
+}
+
+// TestCreateVM_UnnamedDiskIsAdmittedAgainstTheDefaultPool: an unnamed disk is the
+// PRIMARY path (`lv run --disk 20G` sets no storage), and skipping it made pool
+// admission dead for every ordinary create.
+//
+// Caught on real hardware, not here: a 200 GiB disk was accepted onto a 38 GiB
+// filesystem, because qcow2 is sparse so nothing objects until the guest hits
+// ENOSPC. The original unit test passed Storage explicitly and sailed past it.
+func TestCreateVM_UnnamedDiskIsAdmittedAgainstTheDefaultPool(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 65536,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "default", Driver: "dir", Target: "/var/lib/litevirt/disks",
+		TotalBytes: 10 << 30, UsedBytes: 9 << 30, State: "active",
+	}); err != nil {
+		t.Fatalf("UpsertStoragePool: %v", err)
+	}
+
+	// No Storage field — exactly what `lv run --disk` produces.
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "unnamed", Cpu: 1, MemoryMib: 1024,
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "200G", Bus: "virtio"}},
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("unnamed 200G disk on a nearly-full default pool: got %v, want ResourceExhausted", err)
+	}
 }

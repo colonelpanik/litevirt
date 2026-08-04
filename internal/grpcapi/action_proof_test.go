@@ -85,6 +85,69 @@ func TestClaimCarriedProof(t *testing.T) {
 		}
 	})
 
+	t.Run("divergent owner_epoch on same-id persisted row refuses", func(t *testing.T) {
+		s := apServer(t)
+		if err := corrosion.WriteActionProof(ctx, s.db, corrosion.ActionProof{
+			ID: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+			TargetName: "ct1", DestHost: "host-a", Coordinator: "coord",
+			RelocationToken: "tokenA", OwnerEpoch: "6",
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		p := &pb.RuntimeActionProof{
+			Id: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+			TargetName: "ct1", DestHost: "host-a", Coordinator: "coord",
+			RelocationToken: "tokenA", OwnerEpoch: "7",
+		}
+		if _, err := s.claimCarriedProof(ctx, p, corrosion.ActionRelocate, "container", "ct1"); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("divergent owner_epoch must refuse; got %v", status.Code(err))
+		}
+		if pr, ok, _ := corrosion.GetActionProof(ctx, s.db, "p1"); !ok || pr.Status != corrosion.ProofPrepared {
+			t.Fatalf("epoch-6 row must remain unclaimed under epoch-7 carried proof: %+v", pr)
+		}
+	})
+
+	t.Run("stale VM owner_epoch refuses before claim", func(t *testing.T) {
+		s := apServer(t)
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+			Name: "vm1", HostName: "old-owner", Spec: "{}", State: "running",
+		}, nil, nil); err != nil {
+			t.Fatalf("InsertVM: %v", err)
+		}
+		if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 7 WHERE name = 'vm1'`); err != nil {
+			t.Fatalf("seed owner epoch: %v", err)
+		}
+		p := &pb.RuntimeActionProof{
+			Id: "p1", Action: corrosion.ActionPromote, TargetKind: "vm",
+			TargetName: "vm1", DestHost: "host-a", Coordinator: "coord", OwnerEpoch: "6",
+		}
+		if _, err := s.claimCarriedProof(ctx, p, corrosion.ActionPromote, "vm", "vm1"); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("proof for owner epoch 6 must not authorize epoch 7; got %v", status.Code(err))
+		}
+		if pr, ok, _ := corrosion.GetActionProof(ctx, s.db, "p1"); !ok || pr.Status != corrosion.ProofPrepared {
+			t.Fatalf("stale proof must remain prepared/unclaimed: %+v", pr)
+		}
+	})
+
+	t.Run("current VM owner_epoch claims", func(t *testing.T) {
+		s := apServer(t)
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+			Name: "vm1", HostName: "old-owner", Spec: "{}", State: "running",
+		}, nil, nil); err != nil {
+			t.Fatalf("InsertVM: %v", err)
+		}
+		if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 7 WHERE name = 'vm1'`); err != nil {
+			t.Fatalf("seed owner epoch: %v", err)
+		}
+		p := &pb.RuntimeActionProof{
+			Id: "p1", Action: corrosion.ActionPromote, TargetKind: "vm",
+			TargetName: "vm1", DestHost: "host-a", Coordinator: "coord", OwnerEpoch: "7",
+		}
+		if id, err := s.claimCarriedProof(ctx, p, corrosion.ActionPromote, "vm", "vm1"); err != nil || id != "p1" {
+			t.Fatalf("matching epoch claim: id=%q err=%v; want p1/nil", id, err)
+		}
+	})
+
 	t.Run("wrong dest_host refuses", func(t *testing.T) {
 		s := apServer(t)
 		p := &pb.RuntimeActionProof{

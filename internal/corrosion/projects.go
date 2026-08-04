@@ -140,6 +140,12 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	if len(ctRows) > 0 {
 		return fmt.Errorf("project %q still owns containers; reassign or delete them first", name)
 	}
+	// Retire the project's admission authority BEFORE tombstoning the project
+	// itself. Done in the other order, a delete that failed halfway would leave a
+	// gone project still holding live authority — the orphan state this prevents.
+	if err := RetireProjectAuthority(ctx, c, name); err != nil {
+		return fmt.Errorf("retire project authority: %w", err)
+	}
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,

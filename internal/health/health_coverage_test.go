@@ -484,7 +484,8 @@ func TestCheckClockSkew_ExactlyOneSecond(t *testing.T) {
 
 	// Exactly 1 second is on the boundary — skew > 1s triggers, so 1s should NOT trigger.
 	// However, time.Since introduces slight drift, so use a value slightly under.
-	c.checkClockSkew(context.Background(), "host-b", time.Now().Add(-999*time.Millisecond))
+	now := time.Now()
+	c.checkClockSkew(context.Background(), "host-b", now.Add(-999*time.Millisecond), now, now)
 
 	rows, err := db.Query(context.Background(),
 		`SELECT target FROM clock_skew WHERE observer = ?`, "host-a")

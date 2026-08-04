@@ -74,8 +74,12 @@ func (s *Server) deviceOpFromPeer(ctx context.Context) (opID, reqHash string, ok
 		return "", "", false
 	}
 	cn := callerMTLSCommonName(ctx)
-	if h, _ := corrosion.GetHost(ctx, s.db, cn); h == nil {
-		slog.Warn("device op: ignoring peer op-identity markers — peer cert CN is not a known cluster host", "peer_cn", cn)
+	// The one peer classifier, not a second definition of "peer". It accepts a host
+	// whose row has not replicated here yet, which a bare GetHost does not — leaving
+	// this on the old rule meant device ops quietly fell back to own-entry-node
+	// identity on exactly the fresh cluster where replication already works.
+	if !s.isTrustedHostCN(ctx, cn) {
+		slog.Warn("device op: ignoring peer op-identity markers — peer cert CN is not a cluster host", "peer_cn", cn)
 		return "", "", false
 	}
 	return ids[0], hashes[0], true
@@ -983,7 +987,7 @@ func (s *Server) executeDiskDetach(ctx context.Context, vm *corrosion.VMRecord, 
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepAttached)
 
-	if err := s.verifyDiskDetached(vm.Name, targetDev, running); err != nil {
+	if err := s.verifyDiskDetached(ctx, vm.Name, targetDev, running); err != nil {
 		slog.Error("disk detach: absence unverifiable — left recoverable", "vm", vm.Name, "op", opID, "error", err)
 		return nil, status.Errorf(codes.Internal, "disk detach for %q could not be verified; left recoverable: %v", vm.Name, err)
 	}
@@ -1040,14 +1044,28 @@ func (s *Server) failDeviceDetachClean(ctx context.Context, vm *corrosion.VMReco
 // in the persistent config would silently reappear on the next VM start. On the STOPPED
 // path there is only the inactive definition. Any failure routes to the detach path's
 // forward compensation (leave NON-TERMINAL for recovery; never re-attach).
-func (s *Server) verifyDiskDetached(vmName, targetDev string, running bool) error {
+func (s *Server) verifyDiskDetached(ctx context.Context, vmName, targetDev string, running bool) error {
 	if running {
-		srcs, err := s.virt.DomainDiskSources(vmName)
-		if err != nil {
-			return fmt.Errorf("read live disks: %w", err)
-		}
-		if _, ok := srcs[targetDev]; ok {
+		// The live read WAITS, and re-requests the detach while it waits: a
+		// successful DetachDisk only requested the unplug, and a guest that had not
+		// yet enumerated the device never answers the first request at all (see
+		// hotplug_unplug_wait.go).
+		st, err := waitDeviceGone(ctx, func() (bool, error) {
+			srcs, rerr := s.virt.DomainDiskSources(vmName)
+			if rerr != nil {
+				return false, fmt.Errorf("read live disks: %w", rerr)
+			}
+			_, present := srcs[targetDev]
+			return !present, nil
+		}, func() error {
+			return s.virt.DetachDisk(vmName, targetDev)
+		})
+		logUnplugWait("disk", vmName, targetDev, st, err)
+		switch {
+		case errors.Is(err, errUnplugTimeout):
 			return fmt.Errorf("disk %s still present in the live domain after detach", targetDev)
+		case err != nil:
+			return err
 		}
 		xml, err := s.virt.DumpXMLInactive(vmName)
 		if err != nil {

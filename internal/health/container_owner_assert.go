@@ -170,9 +170,35 @@ func (c *ContainerChecker) tryRekey(ctx context.Context, name string, remote cor
 		// Decision-complete: runs here, exactly one remote owner row, no other
 		// host runs it. Re-key ownership to us (guarded atomic PK change across the
 		// row, its interface rows, and its IPAM leases).
-		applied, err := corrosion.RekeyContainerOwner(ctx, c.db, remote, c.hostName)
+		var (
+			applied bool
+			err     error
+		)
+		switch {
+		case remote.State == "creating" || remote.State == "provisional" ||
+			remote.ActiveOperationID != "":
+			slog.Info("ct-rekey: source has an active/provisional operation — deferring",
+				"container", name, "db_host", remote.HostName,
+				"state", remote.State, "operation_id", remote.ActiveOperationID)
+			c.observeRekey(name, "inconclusive")
+			return
+		case remote.OwnerEpoch == 0 && remote.SpecGeneration == 0:
+			// Exact v1.3 envelope for rolling compatibility.
+			applied, err = corrosion.RekeyContainerOwner(ctx, c.db, remote, c.hostName)
+		case c.guardedContainerRekeyActive != nil && c.guardedContainerRekeyActive():
+			applied, err = corrosion.RekeyContainerOwnerGuarded(
+				ctx, c.db, remote, c.hostName,
+			)
+		default:
+			slog.Info("ct-rekey: modern authority present before operation protocol latch — deferring",
+				"container", name, "db_host", remote.HostName,
+				"owner_epoch", remote.OwnerEpoch,
+				"spec_generation", remote.SpecGeneration)
+			c.observeRekey(name, "inconclusive")
+			return
+		}
 		if err != nil {
-			slog.Warn("ct-rekey: RekeyContainerOwner failed", "container", name, "error", err)
+			slog.Warn("ct-rekey: ownership mutation failed", "container", name, "error", err)
 			c.observeRekey(name, "error")
 			return
 		}

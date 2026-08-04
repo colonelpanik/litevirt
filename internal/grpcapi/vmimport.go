@@ -207,6 +207,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 
+	// The define above resolved any machine alias against this host's qemu;
+	// persist the concrete value so the imported VM's guest ABI travels with it.
+	s.pinMachineFromDomain(spec)
 	specJSON, _ := json.Marshal(spec)
 	diskRecords, ifaceRecords, nicRecords := importRecords(fv, name, s.hostName)
 	// pciIntents: the mapped spec's Devices, if the source format ever declares
@@ -238,8 +241,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	stateMsg := "imported (stopped)"
 	if first.Start {
 		if err := s.virt.StartDomain(name); err != nil {
-			// Roll back fully: remove DB row, undefine, delete disks.
-			_ = corrosion.DeleteVM(ctx, s.db, name)
+			// Roll back fully: remove DB row, undefine, delete disks. The
+			// tombstone is best-effort inside a rollback that already fails the
+			// RPC — but a decline must at least be visible, since it leaves a
+			// live row for a VM whose disks the lines below delete.
+			if derr := corrosion.DeleteVM(ctx, s.db, name); derr != nil {
+				slog.Warn("import rollback: could not tombstone the just-created row — it stays live until a retry or delete",
+					"vm", name, "error", derr)
+			}
 			_ = s.virt.UndefineDomain(name, false)
 			if fwImport {
 				lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)

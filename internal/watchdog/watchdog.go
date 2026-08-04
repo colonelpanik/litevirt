@@ -37,6 +37,49 @@ type Controller struct {
 	once    sync.Once
 	armed   atomic.Bool
 	tripped atomic.Bool
+
+	// ownershipHeld reports whether this host still owns running workloads
+	// (VMs, containers, a VIP). Consulted exactly once, at graceful shutdown,
+	// to decide whether disarming is safe. Nil = not wired = disarm as always.
+	ownershipMu   sync.RWMutex
+	ownershipHeld func() bool
+}
+
+// SetOwnershipCheck wires the local-ownership probe consulted at graceful
+// shutdown. While it reports true, Heartbeat refuses to disarm the watchdog on
+// context cancellation: a daemon restart re-opens the device and resumes
+// petting well inside the timeout, and a daemon STOP that abandons running
+// workloads lets the watchdog fire — rebooting the host into a safely fenced
+// state instead of leaving unmanaged workloads behind an unprotected node.
+// Drain (or shutdown-workloads) first for planned maintenance.
+func (c *Controller) SetOwnershipCheck(fn func() bool) {
+	if c == nil {
+		return
+	}
+	c.ownershipMu.Lock()
+	c.ownershipHeld = fn
+	c.ownershipMu.Unlock()
+}
+
+// holdsOwnership reports the wired probe's answer, false when none is wired.
+// A probe that panics must not turn a graceful shutdown into a crash loop —
+// it is treated as "held" (fail closed: refuse the disarm, keep the guarantee).
+func (c *Controller) holdsOwnership() (held bool) {
+	if c == nil {
+		return false
+	}
+	c.ownershipMu.RLock()
+	fn := c.ownershipHeld
+	c.ownershipMu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			held = true
+		}
+	}()
+	return fn()
 }
 
 // NewController creates a watchdog controller. Pass it to Heartbeat.
@@ -183,6 +226,20 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 		// won the select race before the fence case ran, `fenced` is still false — disarming
 		// here would defeat a self-fence the node already committed to. Leave it armed.
 		if !fenced && !ctrl.Fenced() {
+			// The clean-shutdown disarm hole (§B Phase 5): disarming while this
+			// host still owns running workloads removes the self-fence guarantee
+			// at the exact moment nothing manages those workloads. Refuse: leave
+			// the device armed and counting. A restarting daemon re-opens and
+			// pets it well inside the timeout; a daemon stopping for good with
+			// workloads abandoned lets the watchdog reboot the host into a
+			// safely fenced state. Operators drain before planned maintenance.
+			if ctrl.holdsOwnership() {
+				f.Close()
+				slog.Error("watchdog left ARMED on shutdown: this host still owns running workloads; "+
+					"a successor daemon must resume petting before the timeout or the host reboots "+
+					"(drain or stop workloads first for maintenance)", "dev", devPath)
+				return
+			}
 			// Graceful shutdown: disable + write 'V' to disarm so the watchdog doesn't fire.
 			if ctrl != nil {
 				ctrl.armed.Store(false)

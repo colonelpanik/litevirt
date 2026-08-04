@@ -2,8 +2,10 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lb"
@@ -16,9 +18,10 @@ const (
 	haDemotionUnfenced  = "demotion_unfenced"       // a minority node's VIP demote FAILED and it has no verified self-fence — the majority holds in the safe gap (VIP outage until repaired / a fence is provided)
 	haVIPNoHolder       = "vip_no_holder"           // a configured VIP is served by nobody
 	haStrandedPending   = "legacy_pending_stranded" // a markerless pending VM refused proof_missing forever
+	haRolledBackLatch   = "rolled_back_latch"       // this binary is below a capability token this node already latched — WAL-quarantined, needs an operator reseed
 )
 
-var haReasons = []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending}
+var haReasons = []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch}
 
 // capabilityDegradedReason maps a configured-to-enforce token's latch state (ok = latched)
 // to an HA-degraded reason, or "" if it's fine. vip_demote_v1 is a software capability (no
@@ -79,6 +82,9 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 		if !s.driveCapabilityActivation(ctx) {
 			s.checkOneCapabilityHealth(ctx)
 		}
+		// §A: act on a peer's SELF-REPORTED quarantine by recording its
+		// isolation. One peer per cycle, so this adds no fan-out.
+		s.recordSelfReportedIsolation(ctx)
 		// Rollout observability: per-feature config intent + latch state.
 		if s.gate != nil {
 			for _, tok := range capabilities.Supported() {
@@ -244,6 +250,14 @@ func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 	if s.gate != nil && s.gate.Enforced(ctx, capabilities.SplitBrainGateV1) && s.anyStrandedPending(ctx) {
 		out[haStrandedPending] = true
 	}
+	// This binary is a rollback below a token this node already latched, so it is
+	// WAL-quarantined: up and reachable, but emitting no replicated writes and
+	// advertising nothing. Peers raise haUnsupportedMember about it; this is the
+	// node's own report, which is what tells an operator that the fix is a reseed
+	// (or an upgrade back) rather than a network problem at the other end.
+	if s.walQuarantinedNow() {
+		out[haRolledBackLatch] = true
+	}
 	return out
 }
 
@@ -320,4 +334,81 @@ func (s *Server) hostClaimsVIP(ctx context.Context, host, vip string) bool {
 		return s.probeHolder(ctx, host, vip).assigned
 	}
 	return s.peerVIPClaims(ctx, host, vip)
+}
+
+// recordSelfReportedIsolation closes the §A loop: the shipped detector makes a
+// rolled-back node WAL-quarantine ITSELF, but nothing else refused it, and a
+// self-muting node cannot record its own quarantine (the epoch is peer-written
+// by design). Here a HEALTHY peer pings one voting-eligible host per cycle and,
+// if that host reports itself quarantined, records the isolation — after which
+// every peer refuses its replication until a verified reseed.
+//
+// Acting on a SELF-REPORT rather than inferring from "advertises nothing" is
+// deliberate. Inference cannot distinguish a rollback from a self-fence or a
+// pre-latch old build, and a false isolation stops a healthy node's replication
+// until an operator reseeds it — an expensive mistake. A node claiming to be
+// quarantined is self-incriminating, which is the one direction worth trusting:
+// a node lying about its state claims health, not degradation.
+func (s *Server) recordSelfReportedIsolation(ctx context.Context) {
+	if !s.tokenEnabled(capabilities.IsolationEpochV1) || s.gate == nil {
+		return
+	}
+	// Quorum-gated: a partitioned minority must not be able to quarantine the
+	// majority it simply cannot see.
+	if r := s.gate.DecisionGate(ctx); !r.OK {
+		return
+	}
+	s.observeOneSelfReportedQuarantine(ctx)
+}
+
+// observeOneSelfReportedQuarantine is the observation itself, split from the
+// quorum gate above so a fleet scenario can drive it directly — the harness's
+// checker never probes peers, so DecisionGate can't be satisfied there. The
+// gate is therefore NOT fleet-covered; it is one call at the single entry point.
+func (s *Server) observeOneSelfReportedQuarantine(ctx context.Context) {
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return
+	}
+	var peers []string
+	for _, h := range hosts {
+		// Deliberately NOT filtered to active hosts. Draining/maintenance is
+		// exactly the state an operator puts a node into BEFORE downgrading it,
+		// so an active-only filter would miss the most common way a rollback
+		// actually happens (the lab caught precisely that: a rolled-back node
+		// sat HOST_DRAINING and was never observed). Isolation is about whether
+		// a node's STATE is valid, not whether it is eligible for workloads.
+		// An unreachable or decommissioned host simply fails the ping below.
+		if h.Name != s.hostName && h.State != "decommissioned" {
+			peers = append(peers, h.Name)
+		}
+	}
+	if len(peers) == 0 {
+		return
+	}
+	s.capHealthMu.Lock()
+	peer := peers[s.isolationCursor%len(peers)]
+	s.isolationCursor++
+	s.capHealthMu.Unlock()
+
+	if epoch, _, err := corrosion.HostIsolation(ctx, s.db, peer); err != nil || epoch > 0 {
+		return // already recorded (or unreadable) — IsolateHost is idempotent anyway
+	}
+	c, conn, err := s.peerClient(ctx, peer)
+	if err != nil {
+		return // unreachable is NOT isolated: that is a peer being down, not out-of-regime
+	}
+	defer conn.Close()
+	resp, err := c.Ping(ctx, &pb.PingRequest{})
+	if err != nil || !resp.GetWalQuarantined() {
+		return
+	}
+	if err := corrosion.IsolateHost(ctx, s.db, s.hostName, peer, corrosion.IsolationRolledBackLatch); err != nil {
+		slog.Warn("could not record a self-reported quarantine as an isolation",
+			"peer", peer, "error", err)
+		return
+	}
+	s.audit(ctx, "host.isolate", peer, "reason=rolled_back_latch (self-reported quarantine)", "ok")
+	slog.Warn("recorded a peer's self-reported quarantine as an isolation — its replication is now refused",
+		"peer", peer, "observer", s.hostName, "fix", "lv host reseed "+peer)
 }

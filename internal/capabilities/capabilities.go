@@ -46,6 +46,14 @@ const (
 	FenceEpochV1 = "fence_epoch_v1"
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
 	OwnerEpochV1 = "owner_epoch_v1"
+	// IsolationEpochV1 gates the §A isolation regime: a host recorded with a
+	// nonzero hosts.isolation_epoch has its replication REFUSED by every peer
+	// until a verified reseed clears it. Gated because it can refuse a peer
+	// outright — a pre-latch cluster behaves exactly as before, so the regime
+	// rolls out incrementally, and a partition fails closed (no latch, no new
+	// refusals). Deliberately NOT a version-skew check: mixed-version rolling
+	// upgrades must keep working, so it gates on the recorded isolation fact.
+	IsolationEpochV1 = "isolation_epoch_v1"
 	// SafeFenceDefaultV1 gates the safe-fencing-default policy: once enforced
 	// cluster-wide, an UNCONFIRMED best-effort fence is no longer treated as proof
 	// of power-off — the coordinator requires an operator fence-confirm before
@@ -140,6 +148,11 @@ const (
 	// enforcing the "require fleet uniformity before latching" rule. Enforcement is
 	// default-off and the flag is the reversible kill switch.
 	OperationProtocolV1 = "operation_protocol_v1"
+	// CapacityAdmissionV1 gates the durable, operation-backed capacity admission
+	// protocol. It has no standalone config flag: advertisement, latch driving,
+	// and enforcement readiness follow enforcement.operation_protocol because a
+	// capacity reservation is only safe when every mutator honors that journal.
+	CapacityAdmissionV1 = "capacity_admission_v1"
 	// LiveResizeV1 gates TRUE live CPU hot-add and balloon-memory resize (the
 	// max_cpu vCPU-hotplug ceiling and the <vcpu current=N>MAX</vcpu> XML it needs).
 	// Setting max_cpu is refused until this latches, because an old peer could drop
@@ -191,6 +204,45 @@ const (
 	// latch/enforcement machinery itself. Additive: changes no existing token's
 	// value or behavior.
 	HardwareV2 = "hardware_v2"
+	// ProjectAuthorityV1 gates DELEGATED project-quota admission: a node that does not
+	// hold a project's D1 admission authority asks the holder to decide, instead of
+	// deciding from its own replica. Reserve-then-verify alone makes two racers agree
+	// only once both reservations are VISIBLE to both; corrosion is eventually
+	// consistent, so two nodes that have not yet exchanged operation rows can still
+	// both admit. One decider per project closes that window.
+	//
+	// Advertised CONDITIONALLY on the local config flag (enforcement.project_authority),
+	// like OperationProtocolV1 — a peer that is not delegating still admits from its own
+	// replica, so a delegating node would be serializing against a decider its peers
+	// bypass, which is no serialization at all. Withholding advertisement makes the latch
+	// require CONFIG uniformity, so nobody starts trusting the single decider until every
+	// node routes through it.
+	//
+	// A holder that cannot be reached fails the admission CLOSED (the repo-wide partition
+	// rule). Default-off, and the flag is the reversible kill switch.
+	ProjectAuthorityV1 = "project_authority_v1"
+	// AuditSignatureV1 gates the REFUSAL half of tamper-evident audit logging (v45:
+	// audit_log.key_id/signature/seq, signed with the host's existing cluster key).
+	// It does NOT gate signing: a signed row is backward-compatible — an old peer
+	// ignores the new columns and replicates them intact, and a nil keyring reads as
+	// "unsigned" rather than "broken" — so a node signs whenever
+	// enforcement.audit_signature is on, latch or no latch.
+	//
+	// What needs a latch is the failure mode on the other side: a node that cannot
+	// sign (no host key, keyring load failure) writing the audit row anyway. That row
+	// is indistinguishable from one an attacker with database write access appended
+	// after stripping key_id/signature — and if unsigned rows are a normal, expected
+	// outcome, `lv audit verify` cannot call them a forgery. Once this token is
+	// enforced the unsignable write REFUSES instead, so "unsigned" stops being a
+	// legitimate state and starts being evidence.
+	//
+	// Advertised CONDITIONALLY on the local config flag, like OperationProtocolV1: a
+	// node with the flag off still emits unsigned rows into the same cluster-wide
+	// table, and a chain containing them proves nothing about the hosts that DID
+	// sign. So the latch must require CONFIG uniformity, not just a uniform build —
+	// enabling on one node changes nothing until every node has opted in. Default-off,
+	// and the flag is the reversible kill switch (off → sign nothing, refuse nothing).
+	AuditSignatureV1 = "audit_signature_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -274,16 +326,30 @@ var supported = []string{
 	SharedStorageFenceV1,
 	RBACRealmV1,
 	OperationProtocolV1,
+	CapacityAdmissionV1,
 	LiveResizeV1,
 	CanonicalIdentityV1,
 	CanonicalRegistryV1,
 	HardwareV2,
+	ProjectAuthorityV1,
+	AuditSignatureV1,
+	// OwnerEpochV1 is advertised CONDITIONALLY: enforcement.owner_epoch on AND
+	// the node.s backfill readiness (no owned workload at epoch 0) — see the
+	// grpcapi advertisement filter.
+	OwnerEpochV1,
+	// IsolationEpochV1 is advertised CONDITIONALLY on enforcement.isolation_epoch,
+	// like OperationProtocolV1: the regime REFUSES a peer's replication, so the
+	// fleet-wide latch must require CONFIG uniformity — a node that isn't
+	// enforcing would keep accepting the isolated node's state and re-inject it,
+	// defeating the quarantine. Withholding advertisement while the flag is off
+	// keeps the cluster from latching until every node has opted in.
+	IsolationEpochV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

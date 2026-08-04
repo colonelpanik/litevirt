@@ -24,7 +24,7 @@ Most subcommands are read-only (e.g. 'divergence'). A few mutate cluster state
 to remediate a diagnosed problem (e.g. 'repair-owner') — those are admin-gated
 and audited; check each subcommand's help before running it.`,
 	}
-	cmd.AddCommand(newDoctorDivergenceCmd(), newDoctorRepairOwnerCmd())
+	cmd.AddCommand(newDoctorDivergenceCmd(), newDoctorRepairOwnerCmd(), newDoctorMachineTypesCmd())
 	return cmd
 }
 

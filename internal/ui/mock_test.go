@@ -538,8 +538,8 @@ func (m *mockGRPC) ConfigureHost(_ context.Context, in *pb.ConfigureHostRequest,
 	return &pb.Host{Name: in.Name}, nil
 }
 
-func (m *mockGRPC) GetHostHealth(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.HostHealthMatrix, error) {
-	return &pb.HostHealthMatrix{}, nil
+func (m *mockGRPC) GetClusterHealth(context.Context, *pb.GetClusterHealthRequest, ...grpc.CallOption) (*pb.ClusterHealth, error) {
+	return &pb.ClusterHealth{Overall: "HEALTHY"}, nil
 }
 
 func (m *mockGRPC) ListHostDevices(_ context.Context, in *pb.ListHostDevicesRequest, _ ...grpc.CallOption) (*pb.ListHostDevicesResponse, error) {

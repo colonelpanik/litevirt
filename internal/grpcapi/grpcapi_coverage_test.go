@@ -2026,11 +2026,11 @@ func TestExecVM_EmptyCommand(t *testing.T) {
 
 // ─── Host health with data ──────────────────────────────────────────────────
 
-func TestGetHostHealth_WithEntries(t *testing.T) {
+func TestGetClusterHealth_ConnectivityEdges(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
-	// Insert health entries directly via the DB.
+	// Insert connectivity rows directly via the DB (what the checker writes).
 	s.db.Execute(ctx,
 		`INSERT INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 		 VALUES ('node-1', 'node-2', 'healthy', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')`)
@@ -2038,12 +2038,12 @@ func TestGetHostHealth_WithEntries(t *testing.T) {
 		`INSERT INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 		 VALUES ('node-1', 'node-3', 'suspect', 3, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')`)
 
-	resp, err := s.GetHostHealth(ctx, &emptypb.Empty{})
+	resp, err := s.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
 	if err != nil {
-		t.Fatalf("GetHostHealth: %v", err)
+		t.Fatalf("GetClusterHealth: %v", err)
 	}
-	if len(resp.Entries) != 2 {
-		t.Errorf("expected 2 entries, got %d", len(resp.Entries))
+	if len(resp.GetConnectivity()) != 2 {
+		t.Errorf("expected 2 connectivity edges, got %d", len(resp.GetConnectivity()))
 	}
 }
 

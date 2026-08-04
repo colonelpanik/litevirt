@@ -45,10 +45,71 @@ message PublishCRLRequest  { string crl_pem = 1; }
 message PublishCRLResponse { int64 version = 1; }
 message FenceResult        { string host_name = 1; string method = 2;
     string result = 3; string detail = 4; }
-message HostHealthMatrix   { repeated HostHealthEntry entries = 1; }
-message HostHealthEntry    { string observer = 1; string target = 2;
-    string status = 3; int32 consecutive_failures = 4;
-    google.protobuf.Timestamp last_seen = 5; }
+// GetClusterHealth is THE health read: the durable condition set, evaluator
+// coverage, observer→target connectivity, and per-host capacity assessments,
+// rolled up into one overall state. Every consumer (CLI, REST, MCP, UI,
+// dashboard) reads this; there is no per-signal health RPC.
+message GetClusterHealthRequest {
+    // include_resolved adds recently-resolved conditions (kept 30 days) to the
+    // response — the operator's "what happened last week" view.
+    bool include_resolved = 1;
+}
+message HealthCondition {
+    string evaluator    = 1;
+    string code         = 2;   // e.g. vm_dual_run, runtime_owner_mismatch
+    string subject_kind = 3;   // vm | container | vip | host | cluster
+    string subject_id   = 4;
+    string lifecycle    = 5;   // observed | confirmed | resolved
+    string severity     = 6;   // info | warning | critical
+    repeated string hosts = 7; // involved hosts
+    string evidence     = 8;   // canonical structured evidence (JSON)
+    int32  observe_count = 9;
+    int32  clean_count   = 10;
+    string first_seen    = 11; // RFC3339
+    string last_seen     = 12;
+    string confirmed_at  = 13; // "" until confirmed
+    string resolved_at   = 14; // "" until resolved
+    string reporter      = 15;
+}
+message HealthEvaluatorStatus {
+    string evaluator = 1;
+    string last_scan = 2;      // RFC3339
+    string coverage  = 3;      // complete | partial | unreachable | unsupported
+    string reporter  = 4;
+    string detail    = 5;
+}
+// One observer→target connectivity edge (the peer mTLS probe mesh).
+message ConnectivityEdge {
+    string observer = 1;
+    string target   = 2;
+    string status   = 3;       // healthy | suspect | failing
+    int32  consecutive_failures = 4;
+    string last_seen = 5;      // RFC3339
+}
+message HostCapacityAssessment {
+    string host_name = 1;
+    int32  db_cpu = 2;         // database-allocated
+    int32  db_mem_mib = 3;
+    int32  extra_cpu = 4;      // runtime-only workloads on top
+    int32  extra_mem_mib = 5;
+    int32  effective_cpu = 6;  // union accounting
+    int32  effective_mem_mib = 7;
+    bool   complete = 8;       // false = placement must treat as unknown
+    string detail = 9;
+    string sampled_at = 10;    // RFC3339
+}
+message ClusterHealth {
+    // HEALTHY: no active conditions, complete fresh coverage.
+    // DEGRADED: warning-level conditions, or coverage/staleness gaps.
+    // CRITICAL: any active critical condition.
+    // UNKNOWN: no evaluator has ever completed a scan.
+    string overall = 1;
+    repeated HealthCondition conditions = 2;
+    repeated HealthEvaluatorStatus evaluators = 3;
+    repeated ConnectivityEdge connectivity = 4;
+    repeated HostCapacityAssessment capacity = 5;
+    string generated_at = 6;   // RFC3339
+}
 message RescanHostRequest  { string name = 1; }
 message RescanHostResponse { int32 added = 1; int32 removed = 2;
     int32 total = 3; repeated PCIDevice devices = 4; }
@@ -1243,7 +1304,10 @@ message GetHostStatsRequest  { string name = 1; }
 // ── Monitoring ──
 message ClusterStatus { string cluster_name = 1; int32 hosts_total = 2;
     int32 hosts_active = 3; int32 vms_total = 4; int32 vms_running = 5;
-    int32 vms_error = 6; repeated Host hosts = 7; repeated Alert alerts = 8;
+    int32 vms_error = 6; repeated Host hosts = 7;
+    // 8 was `repeated Alert alerts` — never populated by any release; health
+    // now lives exclusively in GetClusterHealth.
+    reserved 8;
     repeated ClusterEvent recent_events = 9; }
 message StreamEventsRequest { repeated string event_types = 1; }
 
@@ -1905,7 +1969,7 @@ service LiteVirt {
     rpc UndrainHost(UndrainHostRequest)        returns (Host);
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
-    rpc GetHostHealth(google.protobuf.Empty)   returns (HostHealthMatrix);
+    rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
     rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
     // Host network configuration (v48): intent CRUD runs anywhere (replicated

@@ -12,7 +12,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 type fakeLiteVirtClient struct {
@@ -23,7 +22,7 @@ type fakeLiteVirtClient struct {
 	stopVMBlock bool
 	stopVMCtx   context.Context
 
-	hostHealth *pb.HostHealthMatrix
+	clusterHealth *pb.ClusterHealth
 	network    *pb.NetworkInfo
 	pool       *pb.StoragePool
 	lb         *pb.LoadBalancer
@@ -43,11 +42,11 @@ func (f *fakeLiteVirtClient) StopVM(ctx context.Context, _ *pb.StopVMRequest, _ 
 	return &pb.VM{Name: "vm1", HostName: "host1", State: pb.VMState_VM_STOPPED}, nil
 }
 
-func (f *fakeLiteVirtClient) GetHostHealth(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.HostHealthMatrix, error) {
-	if f.hostHealth != nil {
-		return f.hostHealth, nil
+func (f *fakeLiteVirtClient) GetClusterHealth(context.Context, *pb.GetClusterHealthRequest, ...grpc.CallOption) (*pb.ClusterHealth, error) {
+	if f.clusterHealth != nil {
+		return f.clusterHealth, nil
 	}
-	return &pb.HostHealthMatrix{}, nil
+	return &pb.ClusterHealth{Overall: "HEALTHY"}, nil
 }
 
 func (f *fakeLiteVirtClient) GetNetwork(context.Context, *pb.GetNetworkRequest, ...grpc.CallOption) (*pb.NetworkInfo, error) {
@@ -190,7 +189,7 @@ func TestRegisteredToolsReadOnlyByDefaultAndWritesOnlyWhenAllowed(t *testing.T) 
 
 	readTools := []string{
 		"litevirt_ping", "litevirt_whoami", "litevirt_cluster_status", "litevirt_list_hosts", "litevirt_inspect_host",
-		"litevirt_host_stats", "litevirt_host_health", "litevirt_list_vms", "litevirt_inspect_vm", "litevirt_vm_stats",
+		"litevirt_host_stats", "litevirt_cluster_health", "litevirt_list_vms", "litevirt_inspect_vm", "litevirt_vm_stats",
 		"litevirt_list_vm_events", "litevirt_list_containers", "litevirt_list_networks", "litevirt_get_network",
 		"litevirt_list_storage_pools", "litevirt_get_storage_pool", "litevirt_list_load_balancers", "litevirt_inspect_lb",
 		"litevirt_lb_stats", "litevirt_list_audit_log", "litevirt_list_rebalance_proposals", "litevirt_list_projects",
@@ -209,36 +208,50 @@ func TestRegisteredToolsReadOnlyByDefaultAndWritesOnlyWhenAllowed(t *testing.T) 
 	}
 }
 
-func TestHostHealthDTO(t *testing.T) {
-	matrix := &pb.HostHealthMatrix{Entries: []*pb.HostHealthEntry{{
-		Observer:            "h1",
-		Target:              "h2",
-		Status:              "unhealthy",
-		ConsecutiveFailures: 3,
-	}}}
-	dto := hostHealthDTO(matrix)
-	if len(dto.Entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(dto.Entries))
+func TestClusterHealthDTO(t *testing.T) {
+	h := &pb.ClusterHealth{
+		Overall: "CRITICAL",
+		Conditions: []*pb.HealthCondition{{
+			Evaluator: "dual_run", Code: "vm_dual_run",
+			SubjectKind: "vm", SubjectId: "web-1",
+			Lifecycle: "confirmed", Severity: "critical",
+			Hosts: []string{"h1", "h2"},
+		}},
+		Connectivity: []*pb.ConnectivityEdge{{
+			Observer: "h1", Target: "h2", Status: "unhealthy", ConsecutiveFailures: 3,
+		}},
 	}
-	if got := dto.Entries[0]; got.Observer != "h1" || got.Target != "h2" || got.Status != "unhealthy" || got.ConsecutiveFailures != 3 {
-		t.Fatalf("entry = %#v", got)
+	dto := clusterHealthDTO(h)
+	if dto["overall"] != "CRITICAL" {
+		t.Fatalf("overall = %v", dto["overall"])
+	}
+	conds := dto["conditions"].([]map[string]any)
+	if len(conds) != 1 || conds[0]["code"] != "vm_dual_run" || conds[0]["severity"] != "critical" {
+		t.Fatalf("conditions = %#v", conds)
+	}
+	if _, leaked := conds[0]["evidence"]; leaked {
+		t.Fatal("raw evidence JSON must not ride the MCP DTO (safe fields only)")
+	}
+	edges := dto["connectivity"].([]map[string]any)
+	if len(edges) != 1 || edges[0]["status"] != "unhealthy" {
+		t.Fatalf("connectivity = %#v", edges)
 	}
 }
 
-func TestHostHealthHandlerUsesDTO(t *testing.T) {
-	fake := &fakeLiteVirtClient{hostHealth: &pb.HostHealthMatrix{Entries: []*pb.HostHealthEntry{{
-		Observer: "h1",
-		Target:   "h2",
-		Status:   "healthy",
-	}}}}
+func TestClusterHealthHandlerUsesDTO(t *testing.T) {
+	fake := &fakeLiteVirtClient{clusterHealth: &pb.ClusterHealth{Overall: "DEGRADED"}}
 	s := testServer(fake, false)
-	res := s.handleHostHealth(context.Background(), nil)
+	res := s.handleClusterHealth(context.Background(), nil)
 	if res.IsError {
-		t.Fatalf("host health failed: %#v", resultEnvelope(t, res).Error)
+		t.Fatalf("cluster health failed: %#v", resultEnvelope(t, res).Error)
 	}
 	env := resultEnvelope(t, res)
-	if _, ok := env.Data.(hostHealthOut); !ok {
-		t.Fatalf("host health data type = %T, want hostHealthOut", env.Data)
+	data, ok := env.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("cluster health data type = %T, want map DTO", env.Data)
+	}
+	if data["overall"] != "DEGRADED" {
+		t.Fatalf("overall = %v, want DEGRADED", data["overall"])
 	}
 }
 

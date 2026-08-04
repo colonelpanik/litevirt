@@ -4,69 +4,55 @@ import (
 	"net/http"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-func (s *Server) handleHealthTimeline(w http.ResponseWriter, r *http.Request) {
-	ctx := s.uiBearerCtx(r)
-	health, _ := s.grpc.GetHostHealth(ctx, &emptypb.Empty{})
-	cs, _ := s.grpc.GetClusterStatus(ctx, &emptypb.Empty{})
-	audit, _ := s.grpc.ListAuditLog(ctx, &pb.ListAuditLogRequest{Limit: 50})
-
-	// Build host list for matrix
+// healthView derives the template inputs from the one health read: the
+// connectivity matrix (observer→target status) and the host list it spans.
+func healthView(h *pb.ClusterHealth) (hostNames []string, matrix map[string]map[string]string) {
 	hostSet := map[string]bool{}
-	for _, e := range health.GetEntries() {
+	for _, e := range h.GetConnectivity() {
 		hostSet[e.Observer] = true
 		hostSet[e.Target] = true
 	}
-	var hostNames []string
-	for h := range hostSet {
-		hostNames = append(hostNames, h)
+	for name := range hostSet {
+		hostNames = append(hostNames, name)
 	}
-
-	// Build matrix map: observer→target→status
-	matrix := map[string]map[string]string{}
-	for _, e := range health.GetEntries() {
+	matrix = map[string]map[string]string{}
+	for _, e := range h.GetConnectivity() {
 		if matrix[e.Observer] == nil {
 			matrix[e.Observer] = map[string]string{}
 		}
 		matrix[e.Observer][e.Target] = e.Status
 	}
+	return hostNames, matrix
+}
 
+func (s *Server) handleHealthTimeline(w http.ResponseWriter, r *http.Request) {
+	ctx := s.uiBearerCtx(r)
+	health, _ := s.grpc.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
+	audit, _ := s.grpc.ListAuditLog(ctx, &pb.ListAuditLogRequest{Limit: 50})
+
+	hostNames, matrix := healthView(health)
 	data := s.pageData("Health", "health")
 	data["HostNames"] = hostNames
 	data["Matrix"] = matrix
-	data["Alerts"] = cs.GetAlerts()
+	data["Overall"] = health.GetOverall()
+	data["Conditions"] = health.GetConditions()
+	data["Evaluators"] = health.GetEvaluators()
 	data["Events"] = audit.GetEntries()
 	s.renderPage(w, "health_timeline.html", data)
 }
 
 func (s *Server) handleHealthTimelinePartial(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
-	health, _ := s.grpc.GetHostHealth(ctx, &emptypb.Empty{})
-	cs, _ := s.grpc.GetClusterStatus(ctx, &emptypb.Empty{})
+	health, _ := s.grpc.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
 
-	hostSet := map[string]bool{}
-	for _, e := range health.GetEntries() {
-		hostSet[e.Observer] = true
-		hostSet[e.Target] = true
-	}
-	var hostNames []string
-	for h := range hostSet {
-		hostNames = append(hostNames, h)
-	}
-	matrix := map[string]map[string]string{}
-	for _, e := range health.GetEntries() {
-		if matrix[e.Observer] == nil {
-			matrix[e.Observer] = map[string]string{}
-		}
-		matrix[e.Observer][e.Target] = e.Status
-	}
-
+	hostNames, matrix := healthView(health)
 	s.renderPartial(w, "health_timeline.html", "health-matrix", map[string]any{
 		"HostNames":   hostNames,
 		"Matrix":      matrix,
-		"Alerts":      cs.GetAlerts(),
+		"Overall":     health.GetOverall(),
+		"Conditions":  health.GetConditions(),
 		"ClusterName": s.cluster,
 	})
 }

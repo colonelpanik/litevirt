@@ -640,12 +640,6 @@ message HostResourceStats {
     repeated VMStats vm_stats       = 7;  // per-VM breakdown
 }
 
-message Alert {
-    string                         level     = 1;
-    string                         message   = 2;
-    google.protobuf.Timestamp      timestamp = 3;
-}
-
 message ClusterEvent {
     string                         action    = 1;
     string                         target    = 2;

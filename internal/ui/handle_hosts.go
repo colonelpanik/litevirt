@@ -210,14 +210,14 @@ func (s *Server) handleHostLabelsUpdate(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleHostHealthMatrix(w http.ResponseWriter, r *http.Request) {
-	matrix, err := s.grpc.GetHostHealth(s.uiBearerCtx(r), &emptypb.Empty{})
+	health, err := s.grpc.GetClusterHealth(s.uiBearerCtx(r), &pb.GetClusterHealthRequest{})
 	if err != nil {
 		sendToast(w, "Health check failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(matrix.Entries)
+	_ = json.NewEncoder(w).Encode(health.GetConnectivity())
 }
 
 func (s *Server) handleConfigureHost(w http.ResponseWriter, r *http.Request) {

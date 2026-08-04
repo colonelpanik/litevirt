@@ -320,7 +320,12 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request) {
 		jsonProto(w, resp)
 
 	case action == "health" && r.Method == http.MethodGet:
-		resp, err := s.grpc.GetHostHealth(ctx, &emptypb.Empty{})
+		// Health is a CLUSTER property (conditions, coverage, connectivity,
+		// capacity); the response is the same GetClusterHealth every other
+		// consumer reads. ?resolved=1 includes the 30-day resolved history.
+		resp, err := s.grpc.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{
+			IncludeResolved: r.URL.Query().Get("resolved") == "1",
+		})
 		if err != nil {
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return

@@ -154,8 +154,8 @@ func (m *mockClient) FenceHost(_ context.Context, in *pb.FenceHostRequest, _ ...
 	m.fencedHost = in.Name
 	return &pb.FenceResult{HostName: in.Name, Method: "ipmi", Result: "success", Detail: "power cycled"}, nil
 }
-func (m *mockClient) GetHostHealth(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (*pb.HostHealthMatrix, error) {
-	return &pb.HostHealthMatrix{}, nil
+func (m *mockClient) GetClusterHealth(_ context.Context, _ *pb.GetClusterHealthRequest, _ ...grpc.CallOption) (*pb.ClusterHealth, error) {
+	return &pb.ClusterHealth{Overall: "HEALTHY"}, nil
 }
 func (m *mockClient) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	m.removedHost = in.Name

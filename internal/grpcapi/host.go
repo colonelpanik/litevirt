@@ -105,31 +105,6 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 	}, nil
 }
 
-func (s *Server) GetHostHealth(ctx context.Context, _ *emptypb.Empty) (*pb.HostHealthMatrix, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
-		return nil, err
-	}
-	rows, err := s.db.Query(ctx,
-		`SELECT observer, target, status, consecutive_failures, last_seen
-		 FROM host_health`)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "query health: %v", err)
-	}
-
-	resp := &pb.HostHealthMatrix{}
-	for _, r := range rows {
-		resp.Entries = append(resp.Entries, &pb.HostHealthEntry{
-			Observer:            r.String("observer"),
-			Target:              r.String("target"),
-			Status:              r.String("status"),
-			ConsecutiveFailures: int32(r.Int("consecutive_failures")),
-			LastSeen:            parseTimestamp(r.String("last_seen")),
-		})
-	}
-
-	return resp, nil
-}
-
 func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
 	// SchemaVersion here is the BINARY const, deliberately — self-upgrade reads
 	// it to decide "which binary to adopt" (a binary question), not "do my

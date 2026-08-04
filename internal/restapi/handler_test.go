@@ -258,8 +258,8 @@ func (m *mockGRPC) FenceHost(_ context.Context, in *pb.FenceHostRequest, _ ...gr
 	m.lastFenceHostReq = in
 	return m.fenceHostResp, nil
 }
-func (m *mockGRPC) GetHostHealth(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.HostHealthMatrix, error) {
-	return &pb.HostHealthMatrix{}, nil
+func (m *mockGRPC) GetClusterHealth(context.Context, *pb.GetClusterHealthRequest, ...grpc.CallOption) (*pb.ClusterHealth, error) {
+	return &pb.ClusterHealth{Overall: "HEALTHY"}, nil
 }
 func (m *mockGRPC) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	m.lastRemoveHostName = in.Name

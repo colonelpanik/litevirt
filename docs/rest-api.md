@@ -64,7 +64,7 @@ POST   /api/v1/hosts/{name}/fence          # Manually fence a host
 DELETE /api/v1/hosts/{name}                # Remove host from cluster (?force=true)
 GET    /api/v1/hosts/{name}/devices        # List PCI devices (?type=gpu)
 POST   /api/v1/hosts/{name}/rescan         # Rescan PCI devices
-GET    /api/v1/hosts/{name}/health         # Host health matrix
+GET    /api/v1/hosts/{name}/health         # Cluster health (conditions, coverage, connectivity, capacity); ?resolved=1 adds 30-day history
 GET    /api/v1/hosts/{name}/stats          # Host resource statistics
 PUT    /api/v1/hosts/{name}/config         # Configure host settings
 ```

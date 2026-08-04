@@ -118,6 +118,12 @@ type Runtime interface {
 	IP(ctx context.Context, name string) (string, error)
 	// List enumerates every container known to LXC on this host.
 	List(ctx context.Context) ([]string, error)
+	// Limits reads the container's configured cgroup limits back from its
+	// on-disk config — the runtime's own truth, not the cluster DB's opinion.
+	// 0 means unlimited for that dimension. The runtime-inventory collector
+	// reports these so capacity accounting can charge runtime-only containers
+	// and flag uncapped ones.
+	Limits(ctx context.Context, name string) (cpuLimit, memMiB int, err error)
 	// Freeze suspends every process in a running container (lxc-freeze) so its
 	// rootfs can be read consistently (backup/snapshot quiesce). Pair with
 	// Unfreeze; a no-op-ish error on an already-frozen/stopped container is fine.
@@ -1094,4 +1100,44 @@ func (r *LxcRunner) ListRunning(ctx context.Context) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// Limits parses the container's config for the cgroup limits ResourceConfig
+// wrote — the exact inverse of what Create emitted. A key that is absent means
+// unlimited (0), matching how the limits are accounted everywhere else.
+func (r *LxcRunner) Limits(_ context.Context, name string) (int, int, error) {
+	raw, err := os.ReadFile(filepath.Join(r.lxcpath(), name, "config"))
+	if err != nil {
+		return 0, 0, fmt.Errorf("read lxc config for %q: %w", name, err)
+	}
+	return parseResourceConfig(string(raw))
+}
+
+// parseResourceConfig inverts ResourceConfig: cpu from the cgroup-v2
+// "lxc.cgroup2.cpu.max = <quota> <period>" line (quota/1000 = the CPULimit that
+// was configured), memory from "lxc.cgroup2.memory.max = <MiB>M".
+func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
+	for _, line := range strings.Split(cfg, "\n") {
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		switch key {
+		case "lxc.cgroup2.cpu.max":
+			quota, _, _ := strings.Cut(val, " ")
+			n, perr := strconv.Atoi(strings.TrimSpace(quota))
+			if perr != nil {
+				return 0, 0, fmt.Errorf("unparseable cpu.max %q: %w", val, perr)
+			}
+			cpuLimit = n / 1000
+		case "lxc.cgroup2.memory.max":
+			n, perr := strconv.Atoi(strings.TrimSuffix(val, "M"))
+			if perr != nil {
+				return 0, 0, fmt.Errorf("unparseable memory.max %q: %w", val, perr)
+			}
+			memMiB = n
+		}
+	}
+	return cpuLimit, memMiB, nil
 }

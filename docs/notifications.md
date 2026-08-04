@@ -55,7 +55,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 > `ha.*` broadly). Expect standing `ha.dualrun.coverage` alerts for any host that is
 > genuinely down or network-segmented from the current leader — that is a real coverage
 > gap, deduped to one page; do not mute the kind or a true split-brain on that host goes
-> unseen. A host on an *older binary* (no `ReportRuntime` handler) during a rolling
+> unseen. A host on an *older binary* (no `GetRuntimeInventory` handler) during a rolling
 > upgrade is deliberately **not** paged as a coverage gap — it still appears in the
 > `litevirt_dual_run_probe_failed{host}` gauge, but the transient version skew of an
 > upgrade window does not raise a page. The gauges

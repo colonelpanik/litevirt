@@ -154,6 +154,20 @@ func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []str
 	}{name, argv})
 	return ContainerExecResult{Stdout: []byte("ok"), ExitCode: 0}, nil
 }
+// ContainerLimits reports the limits from the container's create call; a
+// container only present via listNames (no create) is uncapped — matching a
+// runtime-only rogue with no configured limits.
+func (f *fakeCTRuntime) ContainerLimits(_ context.Context, name string) (int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.createCalls) - 1; i >= 0; i-- {
+		if f.createCalls[i].Name == name {
+			return f.createCalls[i].CPULimit, f.createCalls[i].MemoryMiB, nil
+		}
+	}
+	return 0, 0, nil
+}
+
 func (f *fakeCTRuntime) StateContainer(_ context.Context, name string) (string, error) {
 	if f.stateErrByName != nil {
 		if err, ok := f.stateErrByName[name]; ok {

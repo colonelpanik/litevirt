@@ -35,6 +35,11 @@ type Server struct {
 
 	hostName   string
 	dataDir    string
+	// containersRoot is where per-container state (and the owner-epoch marker)
+	// lives — <dataDir>/containers in production, injected by the daemon so the
+	// runtime-inventory collector can read markers. Empty disables marker reads
+	// (they report missing).
+	containersRoot string
 	pkiDir     string
 	db         *corrosion.Client
 	virt       LibvirtBackend
@@ -242,10 +247,10 @@ type Server struct {
 	dualRunMetrics   *metrics.DualRunMetrics
 
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
-	// gather (self-local + peer ReportRuntime): when non-nil it replaces the real probes,
+	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,
 	// returning the snapshot per successfully-gathered host, the hosts that could not be
 	// reached this pass (a coverage gap), and the hosts on an older binary that does not
-	// implement ReportRuntime (surfaced but NOT paged as a coverage gap — expected during
+	// implement GetRuntimeInventory (surfaced but NOT paged as a coverage gap — expected during
 	// a rolling upgrade).
 	gatherRuntimeOverride func(ctx context.Context, hosts []string) (snaps map[string]runtimeSnapshot, unreachable, unsupported []string)
 
@@ -929,6 +934,11 @@ type ContainerRuntime interface {
 	DeleteContainer(ctx context.Context, name string) error
 	ExecContainer(ctx context.Context, name string, argv []string) (ContainerExecResult, error)
 	StateContainer(ctx context.Context, name string) (string, error)
+	// ContainerLimits reads the container's configured cgroup limits back from
+	// the runtime's own on-disk config (0 = unlimited). The runtime-inventory
+	// collector reports these so capacity accounting can charge runtime-only
+	// containers and flag uncapped ones.
+	ContainerLimits(ctx context.Context, name string) (cpuLimit, memMiB int, err error)
 	IPContainer(ctx context.Context, name string) (string, error)
 	ListContainers(ctx context.Context) ([]string, error)
 	// ContainerExists reports whether the on-disk container artifact (dir) exists —
@@ -1351,3 +1361,7 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
+
+// SetContainersRoot tells the runtime-inventory collector where per-container
+// owner-epoch markers live (the same root the container checker converges).
+func (s *Server) SetContainersRoot(root string) { s.containersRoot = root }

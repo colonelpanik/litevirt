@@ -106,3 +106,7 @@ func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, 
 		Image: image, Dest: dest, Tag: tag, Username: username, Password: password,
 	})
 }
+
+func (a *LXCRuntimeAdapter) ContainerLimits(ctx context.Context, name string) (int, int, error) {
+	return a.Inner.Limits(ctx, name)
+}

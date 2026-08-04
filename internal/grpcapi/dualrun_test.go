@@ -38,6 +38,11 @@ func (r *recordingVirt) ListDomains() ([]string, error) {
 	return names, nil
 }
 
+func (r *recordingVirt) DumpXML(name string) (string, error) {
+	// Minimal well-formed domain XML so the inventory collector can read a size.
+	return `<domain type='kvm'><name>` + name + `</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu></domain>`, nil
+}
+
 func (r *recordingVirt) DomainState(name string) (string, error) {
 	if r.stateErrOn[name] {
 		return "", fmt.Errorf("injected state error for %q", name)
@@ -384,23 +389,35 @@ func TestDualRun_NeverDestroys(t *testing.T) {
 	}
 }
 
-// TestReportRuntime_PeerOnly: the RPC rejects a non-peer caller and, for a peer, returns
-// this host's local runtime snapshot.
-func TestReportRuntime_PeerOnly(t *testing.T) {
+// TestGetRuntimeInventory_PeerOnly: the RPC rejects a non-peer caller and, for a
+// peer, returns this host's local runtime inventory with running domains marked
+// as disk-holders.
+func TestGetRuntimeInventory_PeerOnly(t *testing.T) {
 	s := testServer(t)
 	s.virt = &recordingVirt{domains: map[string]string{"run": "running", "stop": "stopped"}}
 
-	if _, err := s.ReportRuntime(adminCtx(), &pb.ReportRuntimeRequest{}); err == nil {
-		t.Fatal("ReportRuntime must reject a non-peer (admin) caller")
+	if _, err := s.GetRuntimeInventory(adminCtx(), &pb.GetRuntimeInventoryRequest{}); err == nil {
+		t.Fatal("GetRuntimeInventory must reject a non-peer (admin) caller")
 	}
 
 	ctx := peerCtxFor(t, s, "peer-1")
-	resp, err := s.ReportRuntime(ctx, &pb.ReportRuntimeRequest{})
+	resp, err := s.GetRuntimeInventory(ctx, &pb.GetRuntimeInventoryRequest{})
 	if err != nil {
-		t.Fatalf("ReportRuntime(peer): %v", err)
+		t.Fatalf("GetRuntimeInventory(peer): %v", err)
 	}
-	if len(resp.GetDiskHolderVms()) != 1 || resp.GetDiskHolderVms()[0] != "run" {
-		t.Fatalf("disk_holder_vms = %v, want [run]", resp.GetDiskHolderVms())
+	var holders []string
+	for _, w := range resp.GetWorkloads() {
+		if w.GetDiskHolder() {
+			holders = append(holders, w.GetName())
+		}
+	}
+	if len(holders) != 1 || holders[0] != "run" {
+		t.Fatalf("disk holders = %v, want [run]", holders)
+	}
+	// The stopped-but-defined domain is still LISTED — runtime state the DB
+	// comparison needs — just not a holder.
+	if len(resp.GetWorkloads()) != 2 {
+		t.Fatalf("workloads = %d entries, want 2 (run + stop)", len(resp.GetWorkloads()))
 	}
 }
 
@@ -409,7 +426,7 @@ func TestReportRuntime_PeerOnly(t *testing.T) {
 func TestLocalRuntimeSnapshot_OnlyRunningVMsAreDiskHolders(t *testing.T) {
 	s := testServer(t)
 	s.virt = &recordingVirt{domains: map[string]string{"run": "running", "stop": "stopped"}}
-	snap := s.localRuntimeSnapshot(context.Background())
+	snap := snapshotFromInventory(s.collectRuntimeInventory(context.Background()))
 	if len(snap.diskHolderVMs) != 1 || snap.diskHolderVMs[0] != "run" {
 		t.Fatalf("disk-holders = %v, want [run] only", snap.diskHolderVMs)
 	}
@@ -613,7 +630,7 @@ func TestLocalRuntimeSnapshot_PartialOnProbeError(t *testing.T) {
 	// Enumeration failure → partial, no VMs.
 	s := testServer(t)
 	s.virt = &recordingVirt{listErr: fmt.Errorf("libvirt down")}
-	snap := s.localRuntimeSnapshot(context.Background())
+	snap := snapshotFromInventory(s.collectRuntimeInventory(context.Background()))
 	if !snap.partial {
 		t.Fatal("ListDomains error must mark the snapshot partial")
 	}
@@ -624,7 +641,7 @@ func TestLocalRuntimeSnapshot_PartialOnProbeError(t *testing.T) {
 		domains:    map[string]string{"ok": "running", "wedged": "running"},
 		stateErrOn: map[string]bool{"wedged": true},
 	}
-	snap2 := s2.localRuntimeSnapshot(context.Background())
+	snap2 := snapshotFromInventory(s2.collectRuntimeInventory(context.Background()))
 	if !snap2.partial {
 		t.Fatal("a per-item DomainState error must mark the snapshot partial")
 	}
@@ -635,21 +652,26 @@ func TestLocalRuntimeSnapshot_PartialOnProbeError(t *testing.T) {
 	// Clean host → not partial.
 	s3 := testServer(t)
 	s3.virt = &recordingVirt{domains: map[string]string{"ok": "running"}}
-	if s3.localRuntimeSnapshot(context.Background()).partial {
+	if snapshotFromInventory(s3.collectRuntimeInventory(context.Background())).partial {
 		t.Fatal("a clean host must not be marked partial")
 	}
 }
 
-// TestReportRuntime_CarriesPartial: the partial flag rides the RPC response.
-func TestReportRuntime_CarriesPartial(t *testing.T) {
+// TestGetRuntimeInventory_CarriesIncomplete: the completeness flag rides the RPC
+// response — complete=false when a local probe errored, so a caller can never
+// mistake a blind host for an empty one.
+func TestGetRuntimeInventory_CarriesIncomplete(t *testing.T) {
 	s := testServer(t)
 	s.virt = &recordingVirt{listErr: fmt.Errorf("libvirt down")}
-	resp, err := s.ReportRuntime(peerCtxFor(t, s, "peer-1"), &pb.ReportRuntimeRequest{})
+	resp, err := s.GetRuntimeInventory(peerCtxFor(t, s, "peer-1"), &pb.GetRuntimeInventoryRequest{})
 	if err != nil {
-		t.Fatalf("ReportRuntime: %v", err)
+		t.Fatalf("GetRuntimeInventory: %v", err)
 	}
-	if !resp.GetPartial() {
-		t.Fatal("ReportRuntime must report partial=true when a local probe errored")
+	if resp.GetComplete() {
+		t.Fatal("GetRuntimeInventory must report complete=false when a local probe errored")
+	}
+	if len(resp.GetErrors()) == 0 {
+		t.Fatal("an incomplete inventory must say why")
 	}
 }
 
@@ -746,6 +768,7 @@ func (f *fakeCT) ListContainers(context.Context) ([]string, error) { return f.na
 func (f *fakeCT) StateContainer(_ context.Context, n string) (string, error) {
 	return f.states[n], nil
 }
+func (f *fakeCT) ContainerLimits(context.Context, string) (int, int, error) { return 0, 0, nil }
 
 // TestLocalRuntimeSnapshot_NonLXCHost_NotPartial: on a host without lxc-* tooling the CT
 // probe is skipped entirely — a "lxc-ls not found" error must NOT mark the snapshot partial
@@ -759,7 +782,7 @@ func TestLocalRuntimeSnapshot_NonLXCHost_NotPartial(t *testing.T) {
 	s := testServer(t)
 	// The runtime is wired (as the daemon does) but would error — must be ignored.
 	s.containerRuntime = &fakeCT{listErr: fmt.Errorf("exec: \"lxc-ls\": executable file not found in $PATH")}
-	snap := s.localRuntimeSnapshot(context.Background())
+	snap := snapshotFromInventory(s.collectRuntimeInventory(context.Background()))
 	if snap.partial {
 		t.Fatal("a non-LXC host must not be marked partial by a skipped CT probe")
 	}
@@ -777,14 +800,14 @@ func TestLocalRuntimeSnapshot_LXCCapable_ProbeErrorPartial(t *testing.T) {
 
 	s := testServer(t)
 	s.containerRuntime = &fakeCT{listErr: fmt.Errorf("lxc-ls: permission denied")}
-	if !s.localRuntimeSnapshot(context.Background()).partial {
+	if !snapshotFromInventory(s.collectRuntimeInventory(context.Background())).partial {
 		t.Fatal("a container-list error on an LXC-capable host must mark the snapshot partial")
 	}
 
 	// And a healthy capable host reports its running containers, not partial.
 	s2 := testServer(t)
 	s2.containerRuntime = &fakeCT{names: []string{"ctA", "ctB"}, states: map[string]string{"ctA": "running", "ctB": "stopped"}}
-	snap := s2.localRuntimeSnapshot(context.Background())
+	snap := snapshotFromInventory(s2.collectRuntimeInventory(context.Background()))
 	if snap.partial {
 		t.Fatal("a healthy LXC host must not be partial")
 	}

@@ -13,9 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -39,7 +37,7 @@ const dualRunLeaseKey = "dual_run_detector"
 // pages: a real dual-run holds for >=1 interval; a migration/cutover clears within one.
 const dualRunDebounce = 2
 
-// dualRunPeerTimeout bounds each peer ReportRuntime call so one hung/segmented peer can't
+// dualRunPeerTimeout bounds each peer GetRuntimeInventory call so one hung/segmented peer can't
 // stall a whole pass (which, if it exceeded the lease TTL, would let a second node also
 // take leadership). Mirrors the 5s bound other periodic peer probes use.
 const dualRunPeerTimeout = 5 * time.Second
@@ -69,8 +67,9 @@ var migrationStates = map[string]bool{
 
 // runtimeSnapshot is one host's local ground-truth runtime view: which VMs are active
 // disk-holders, which containers are running, which VIPs are assigned on its kernel, and
-// how many unresolved LWW ties it is tracking. Built locally for self, or fetched from a
-// peer via ReportRuntime.
+// how many unresolved LWW ties it is tracking. Derived from the unified runtime
+// inventory (see runtime_inventory.go) — locally for self, via GetRuntimeInventory
+// for a peer.
 type runtimeSnapshot struct {
 	diskHolderVMs  []string
 	runningCTs     []string
@@ -83,133 +82,22 @@ type runtimeSnapshot struct {
 	partial bool
 }
 
-// ReportRuntime returns THIS host's local runtime ground truth for the leader-gated
-// dual-run detector. Peer-only (host-cert mTLS); never consults the cluster DB — the
-// leader cross-references the DB itself.
-func (s *Server) ReportRuntime(ctx context.Context, _ *pb.ReportRuntimeRequest) (*pb.ReportRuntimeResponse, error) {
-	if err := s.requirePeerCert(ctx); err != nil {
-		return nil, err
-	}
-	snap := s.localRuntimeSnapshot(ctx)
-	return &pb.ReportRuntimeResponse{
-		DiskHolderVms:      snap.diskHolderVMs,
-		RunningContainers:  snap.runningCTs,
-		KernelAssignedVips: snap.kernelVIPs,
-		UnresolvedTieCount: int32(snap.unresolvedTies),
-		Partial:            snap.partial,
-	}, nil
-}
-
-// localRuntimeSnapshot builds this host's runtime snapshot from libvirt + LXC + the
-// kernel VIP state. It never consults the DB except to enumerate the CONFIGURED LBs
-// whose VIPs to kernel-check.
-//
-// Any probe error sets snap.partial rather than being swallowed into a false-empty
-// result: a reachable host with broken libvirt/`ip` must NOT read as "positively probed
-// and absent" (which would both mask a dual-run and forge owner-mismatch evidence). The
-// positive holders gathered before an error are still valid; only ABSENCE becomes
-// unreliable. A per-item state error marks partial but does not blind the whole host, so
-// one wedged domain can't hide the rest.
-func (s *Server) localRuntimeSnapshot(ctx context.Context) runtimeSnapshot {
-	var snap runtimeSnapshot
-
-	// VMs that are ACTIVE DISK-HOLDERS. DomainState=="running" is precisely RUNNING|BLOCKED
-	// (coarseDomainState collapses both to "running"); a PAUSED incoming-migration target
-	// reads as not-running and is correctly excluded — two hosts must never both be
-	// writing the same disk.
-	if s.virt != nil {
-		names, err := s.virt.ListDomains()
-		if err != nil {
-			snap.partial = true // can't enumerate → this host's VM absence is unreliable
-		}
-		for _, n := range names {
-			st, err := s.virt.DomainState(n)
-			if err != nil {
-				snap.partial = true // one domain's state is unknown → don't assert it's absent
-				continue
-			}
-			if st == "running" {
-				snap.diskHolderVMs = append(snap.diskHolderVMs, n)
-			}
-		}
-	}
-
-	// Running containers — only on an LXC-capable host (see lxcCapable). A non-LXC host has
-	// no local containers to miss, so it is neither probed nor marked partial. On a capable
-	// host a probe error IS a real gap → partial.
-	if s.containerRuntime != nil && lxcCapable() {
-		names, err := s.containerRuntime.ListContainers(ctx)
-		if err != nil {
-			snap.partial = true
-		}
-		for _, n := range names {
-			st, err := s.containerRuntime.StateContainer(ctx, n)
-			if err != nil {
-				snap.partial = true
-				continue
-			}
-			if st == "running" {
-				snap.runningCTs = append(snap.runningCTs, n)
-			}
-		}
-	}
-
-	// VIP addresses assigned on THIS host's KERNEL. The kernel check is authoritative — a
-	// VRRP backup renders the config but holds no address, so a participant-claims signal
-	// would falsely count it. Collect every enabled LB's VIP and check them against a
-	// SINGLE `ip addr` dump; a config-less orphan keepalived on a deleted LB's VIP is out
-	// of scope here (the Phase-2 orphan sweep covers that).
-	cfgs, err := corrosion.ListLBConfigs(ctx, s.db)
-	if err != nil {
-		snap.partial = true // can't read the LB set → VIP absence is unreliable
-	} else {
-		var vips []string
-		for _, cfg := range cfgs {
-			if cfg.Enabled && cfg.VIP != "" {
-				vips = append(vips, cfg.VIP)
-			}
-		}
-		if assigned, err := lb.NewManager().AssignedVIPs(vips); err != nil {
-			snap.partial = true // `ip` failed → kernel VIP state unknown on this host
-		} else {
-			for v := range assigned {
-				snap.kernelVIPs = append(snap.kernelVIPs, v)
-			}
-		}
-	}
-
-	if s.db != nil {
-		snap.unresolvedTies = s.db.UnresolvedTieCount()
-	}
-	return snap
-}
-
-// reportPeerRuntime dials a peer for its local runtime snapshot.
+// reportPeerRuntime fetches a peer's full runtime inventory and derives the
+// detector's grouping snapshot from it.
 func (s *Server) reportPeerRuntime(ctx context.Context, host string) (runtimeSnapshot, error) {
-	client, conn, err := s.peerClient(ctx, host)
+	inv, err := s.getPeerRuntimeInventory(ctx, host, "", "")
 	if err != nil {
 		return runtimeSnapshot{}, err
 	}
-	defer conn.Close()
-	resp, err := client.ReportRuntime(ctx, &pb.ReportRuntimeRequest{})
-	if err != nil {
-		return runtimeSnapshot{}, err
-	}
-	return runtimeSnapshot{
-		diskHolderVMs:  resp.GetDiskHolderVms(),
-		runningCTs:     resp.GetRunningContainers(),
-		kernelVIPs:     resp.GetKernelAssignedVips(),
-		unresolvedTies: int(resp.GetUnresolvedTieCount()),
-		partial:        resp.GetPartial(),
-	}, nil
+	return snapshotFromInventory(inv), nil
 }
 
 // gatherRuntime collects a runtime snapshot from every host in the probe set: self is
-// built locally, peers are probed via ReportRuntime IN PARALLEL, each under a bounded
+// built locally, peers are probed via GetRuntimeInventory IN PARALLEL, each under a bounded
 // timeout so one hung/segmented peer can't stall the pass. It returns the snapshot per
 // successfully-gathered host, the hosts that could not be REACHED (a coverage gap — a
 // probe_failed gauge + a debounced coverage page), and the hosts on an OLDER binary that
-// does not implement ReportRuntime (surfaced in the gauge but NOT paged as a coverage gap
+// does not implement GetRuntimeInventory (surfaced in the gauge but NOT paged as a coverage gap
 // — that is expected version skew during a rolling upgrade, not a segmentation).
 func (s *Server) gatherRuntime(ctx context.Context, hosts []string) (snaps map[string]runtimeSnapshot, unreachable, unsupported []string) {
 	if s.gatherRuntimeOverride != nil {
@@ -225,7 +113,7 @@ func (s *Server) gatherRuntime(ctx context.Context, hosts []string) (snaps map[s
 	var wg sync.WaitGroup
 	for i, h := range hosts {
 		if h == s.hostName {
-			results[i] = result{host: h, snap: s.localRuntimeSnapshot(ctx)}
+			results[i] = result{host: h, snap: snapshotFromInventory(s.collectRuntimeInventory(ctx))}
 			continue
 		}
 		wg.Add(1)
@@ -245,7 +133,7 @@ func (s *Server) gatherRuntime(ctx context.Context, hosts []string) (snaps map[s
 		case r.err == nil:
 			snaps[r.host] = r.snap
 		case r.unsupported:
-			// An older peer without the ReportRuntime handler — expected mid-upgrade.
+			// An older peer without the GetRuntimeInventory handler — expected mid-upgrade.
 			unsupported = append(unsupported, r.host)
 		default:
 			// docker->kvm gRPC is permanently segmented on some clusters, so whenever the
@@ -463,7 +351,7 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 	// 6. Coverage: a host whose runtime the leader could not fully establish this pass —
 	//    either UNREACHABLE (no data) or PARTIAL (a local probe errored, so its absence is
 	//    unreliable). Both are real coverage gaps and page (debounced). An older binary
-	//    without the ReportRuntime handler is NOT paged — that is expected version skew
+	//    without the GetRuntimeInventory handler is NOT paged — that is expected version skew
 	//    during a rolling upgrade; it still shows in the probe_failed gauge below.
 	for _, h := range unreachable {
 		add(kindDualRunCoverage, h, fmt.Sprintf(

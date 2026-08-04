@@ -419,7 +419,7 @@ it to impersonate a user.
 > user-facing RPCs entirely): the replication/anti-entropy lane
 > (`PushMutations`/`AckMutations`/state digest+dump/sensitive dumps), backup/
 > restore transfer (`HasChunks`/`PushBackup`), failover probes
-> (`CheckVMRuntime`/`CheckContainerRuntime`/`CheckVIPParticipant`/`CheckLBPresent`),
+> (`GetRuntimeInventory`/`CheckVIPParticipant`/`CheckLBPresent`),
 > `FetchBinary`, `GetVMIPRemote`, proof-bearing `PromoteReplica`/`ApplyLB`, and the
 > peer-gated `ProvisionNetwork`/`SyncVTEP`/`UpdateFDB`/`RefreshLB`/
 > `PushReplicaIncrement`. Not enforced today.

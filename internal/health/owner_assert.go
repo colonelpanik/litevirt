@@ -11,7 +11,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// VM runtime states reported by CheckVMRuntime — the single vocabulary the
+// VM runtime states reported by the runtime inventory — the single vocabulary the
 // owner-assert reconciler interprets and the gRPC handler produces.
 const (
 	RuntimeAbsent         = "absent"
@@ -20,7 +20,7 @@ const (
 	RuntimeUnknown        = "unknown"
 )
 
-// peerRuntimeProbeTimeout bounds each peer CheckVMRuntime probe. PeerDial is lazy
+// peerRuntimeProbeTimeout bounds each peer runtime-inventory probe. PeerDial is lazy
 // (it doesn't connect at construction), so an unreachable/segmented peer would
 // otherwise hang on the reconciler's long-lived daemon context and wedge the
 // whole tick (including normal reconcile + selfFence). A timed-out probe is
@@ -69,7 +69,8 @@ func localHostIsActiveWorker(hosts []corrosion.HostRecord, self string) bool {
 	return false
 }
 
-// SetPeerRuntimeChecker injects the peer CheckVMRuntime client. Without it,
+// SetPeerRuntimeChecker injects the peer runtime checker (answered from the
+// peer's GetRuntimeInventory). Without it,
 // runtime owner-assert is disabled (no peer corroboration possible).
 func (r *Reconciler) SetPeerRuntimeChecker(fn func(ctx context.Context, host, name string) (string, error)) {
 	r.checkPeerRuntime = fn
@@ -173,7 +174,7 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 		cancel()
 		if err != nil {
 			// Unreachable / segmented / timed-out / old build with no
-			// CheckVMRuntime → we cannot confirm absence, so we must not assert.
+			// the runtime probe → we cannot confirm absence, so we must not assert.
 			allAbsent = false
 			slog.Info("owner-assert: peer unreachable, deferring", "vm", name, "peer", h, "error", err)
 			continue

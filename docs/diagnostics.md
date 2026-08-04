@@ -121,7 +121,7 @@ illegal:
 > **Not yet covered (deferred to a later phase):** *duplicate runtime ownership*
 > and *runtime-vs-DB owner mismatch* — i.e. the DB rows have converged but disagree
 > with which host actually runs the workload. Detecting those requires per-host
-> runtime introspection (`CheckVMRuntime`/`CheckContainerRuntime`), which lands with
+> runtime introspection (the peer-only `GetRuntimeInventory`), which lands with
 > the runtime-repair phases; until then `lv doctor divergence` checks only the
 > DB-level invariants above. A clean report does **not** yet prove the DB agrees
 > with runtime truth.
@@ -518,7 +518,7 @@ local (never picks an owner by value) and defers to runtime repair.
 - **Automatic (runtime owner-assert).** Each host's reconciler watches for a VM
   that runs **locally** but whose DB row points at another host. Before
   reclaiming it, it queries **every workload-capable peer's local libvirt** (the
-  peer-only `CheckVMRuntime` RPC) and re-stamps ownership to itself **only when
+  peer-only `GetRuntimeInventory` RPC) and re-stamps ownership to itself **only when
   all of them answer `absent`**, no migration/lease marker is present, and the
   condition has persisted past a short debounce. If any host reports `running`
   it's a true split-brain → it refuses to act and logs an alert (destruction
@@ -540,7 +540,7 @@ ownership split is **two distinct rows**, not a single-row tie — the row resol
 can't see it (it's surfaced as `duplicate_live_container` above). The container
 reconciler repairs it directly: when a container runs **locally** but its only
 live DB row points at another host (and no live local row exists), it queries
-**every workload-capable peer's local LXC** (the peer-only `CheckContainerRuntime`
+**every workload-capable peer's local LXC** (the peer-only `GetRuntimeInventory`
 RPC) and, only if none reports it running (a peer's stale *stopped* leftover does
 not block; an unreachable/unknown peer does), performs an atomic **PK re-key** of
 the container's whole ownership footprint: in one transaction it tombstones the

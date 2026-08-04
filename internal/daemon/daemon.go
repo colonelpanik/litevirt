@@ -1022,6 +1022,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// is more useful than a blanket "container runtime not wired".
 	// lxcRunner was created above (shared with the metrics collector).
 	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
+	// The runtime-inventory collector reads owner-epoch markers from the same
+	// root the container checker converges them into.
+	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 
 	// Advertise LXC capability as a host label so the compose planner places
 	// container (kind=lxc/oci) workloads only on hosts that can actually run

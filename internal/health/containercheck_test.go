@@ -26,6 +26,8 @@ func newFakeCtRuntime() *fakeCtRuntime {
 	return &fakeCtRuntime{states: map[string]lxc.State{}, startErr: map[string]error{}}
 }
 
+func (f *fakeCtRuntime) Limits(context.Context, string) (int, int, error) { return 0, 0, nil }
+
 func (f *fakeCtRuntime) Create(ctx context.Context, opts lxc.CreateOpts) (*lxc.Container, error) {
 	f.lastCreate = opts
 	return &lxc.Container{Name: opts.Name, State: lxc.StateStopped}, nil

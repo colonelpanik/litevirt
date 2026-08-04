@@ -47,7 +47,7 @@ type Reconciler struct {
 
 	// checkPeerRuntime asks a peer for its LOCAL libvirt view of a VM
 	// (absent/defined_stopped/running/unknown) — injected by the daemon (it wires
-	// the gRPC CheckVMRuntime client). nil disables runtime owner-assert (e.g. in
+	// the gRPC runtime-inventory client). nil disables runtime owner-assert (e.g. in
 	// tests that don't exercise it). See SetPeerRuntimeChecker.
 	checkPeerRuntime func(ctx context.Context, host, name string) (string, error)
 	// onOwnerAssert observes each owner-assert decision (result ∈ asserted /

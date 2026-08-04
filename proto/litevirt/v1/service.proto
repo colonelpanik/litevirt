@@ -141,8 +141,6 @@ message RepairVMOwnerResponse { string host = 1; string previous_host = 2; }
 // unknown}. The runtime owner-assert reconciler queries this on every
 // workload-capable peer (worker hosts that aren't fenced) before reclaiming a
 // VM it runs locally.
-message CheckVMRuntimeRequest  { string name = 1; }
-message CheckVMRuntimeResponse { string state = 1; }
 
 // CheckVIPParticipant asks a peer whether it could HOLD or BECOME MASTER of a VIP: it
 // renders a keepalived config whose virtual_ipaddress includes vip (a VRRP participant —
@@ -181,26 +179,62 @@ message CheckLBPresentResponse { bool present = 1; }
 // re-key reconciler queries it on every workload-capable peer before reclaiming a
 // container it runs locally (a PK re-key, since container ownership is part of
 // the primary key).
-message CheckContainerRuntimeRequest  { string name = 1; }
-message CheckContainerRuntimeResponse { string state = 1; }
 
-// ReportRuntime returns the responding host's LOCAL ground-truth runtime snapshot for
-// the leader-gated dual-run detector: VMs that are active DISK-HOLDERS (a domain in a
-// disk-writing state — RUNNING or BLOCKED), running containers, VIP addresses assigned
-// on this host's KERNEL (not a keepalived-pid signal), and the count of unresolved LWW
-// ties this node is currently tracking. Peer-only (host-cert mTLS); never consults the
-// cluster DB — the detector cross-references the DB itself.
-message ReportRuntimeRequest {}
-message ReportRuntimeResponse {
-    repeated string disk_holder_vms      = 1;
-    repeated string running_containers   = 2;
+// GetRuntimeInventory returns the responding host's LOCAL ground-truth runtime view —
+// the ONE runtime source every consumer reads: the dual-run detector, owner assertion,
+// owner-epoch readiness, capacity sampling, and health evidence. It never consults the
+// cluster DB (the DB is exactly the disputed value its callers corroborate against);
+// database comparison is the caller's job. Peer-only (host-cert mTLS).
+//
+// An empty filter returns the full inventory. A (kind, name) filter returns just that
+// workload's entry — the targeted form owner assertion uses, cheap enough to call per
+// workload on every peer.
+message GetRuntimeInventoryRequest {
+    // Optional workload filter: kind "vm" | "container" plus the workload name.
+    // Both empty = full inventory.
+    string kind = 1;
+    string name = 2;
+}
+// One workload as the local runtime actually sees it.
+message RuntimeWorkload {
+    string kind  = 1;               // "vm" | "container"
+    string name  = 2;
+    string state = 3;               // running | defined_stopped | absent | unknown
+    // A VM domain in a disk-writing state (RUNNING or BLOCKED) — the signal the
+    // dual-run detector groups on. Two hosts must never both be writing one disk.
+    bool disk_holder = 4;
+    // The runtime's own configured size — libvirt's current vcpu/memory for a VM,
+    // cgroup limits for a container. NOT the database's opinion.
+    int32 cpu        = 5;
+    int32 memory_mib = 6;
+    // The host-local owner-epoch marker: its value, and whether it could be read.
+    // marker_status: valid | missing | corrupt | unreadable. A marker that cannot
+    // be read is never epoch 0 — garbage read as the zero generation would
+    // authorize exactly the stale actions the marker exists to refuse.
+    int64  owner_epoch_marker = 7;
+    string marker_status      = 8;
+    // A container with no cpu AND no memory limit: it consumes unbounded host
+    // resources that capacity accounting cannot attribute, so its presence makes
+    // the host's capacity observation INCOMPLETE.
+    bool uncapped = 9;
+    // Per-item probe failure (state read failed, config unreadable). The item is
+    // still listed — presence is real — but its details are unreliable.
+    string probe_error = 10;
+}
+message RuntimeInventory {
+    string host = 1;
+    repeated RuntimeWorkload workloads = 2;
+    // VIP addresses assigned on this host's KERNEL (bare IPs; not a keepalived-pid
+    // signal — a VRRP backup renders config but holds no address).
     repeated string kernel_assigned_vips = 3;
-    int32           unresolved_tie_count = 4;
-    // partial is true when ANY local runtime probe errored (libvirt list/state, container
-    // list/state, LB-config read, or the kernel `ip` dump). The positive holders reported
-    // are still real, but the ABSENCE of a workload is NOT reliable — the leader must not
-    // use a partial snapshot as "probed and absent" proof, and raises a coverage gap for it.
-    bool            partial              = 5;
+    int32 unresolved_tie_count = 4;
+    // complete is false when ANY local probe errored (libvirt list/state, container
+    // list/state, LB-config read, the kernel `ip` dump, or a marker read). Positive
+    // entries are still real, but ABSENCE is unreliable: a caller must never treat
+    // an incomplete inventory as proof a workload is gone.
+    bool complete = 5;
+    repeated string errors = 6;
+    string sampled_at = 7;          // RFC3339
 }
 
 // CloneVM creates a new VM from a template or an existing VM (optionally a
@@ -1923,9 +1957,7 @@ service LiteVirt {
     rpc RestartVM(RestartVMRequest)   returns (VM);
     rpc DeleteVM(DeleteVMRequest)        returns (google.protobuf.Empty);
     rpc RepairVMOwner(RepairVMOwnerRequest) returns (RepairVMOwnerResponse);
-    rpc CheckVMRuntime(CheckVMRuntimeRequest) returns (CheckVMRuntimeResponse);
-    rpc CheckContainerRuntime(CheckContainerRuntimeRequest) returns (CheckContainerRuntimeResponse);
-    rpc ReportRuntime(ReportRuntimeRequest) returns (ReportRuntimeResponse);
+    rpc GetRuntimeInventory(GetRuntimeInventoryRequest) returns (RuntimeInventory);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);

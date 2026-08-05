@@ -269,7 +269,7 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	}
 
 	// DB view for the owner-mismatch cutover-lag exclusion.
-	vmState, vmOwner, vmEpoch := s.dbVMIndex(ctx)
+	vmState, vmOwner, vmEpoch, dbIndexOK := s.dbVMIndex(ctx)
 
 	current := map[finding]bool{}
 	details := map[finding]string{}
@@ -386,31 +386,42 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	// unreachable/partial hosts page.
 	probeFailed := append(append(append([]string(nil), unreachable...), unsupported...), partialHosts...)
 
-	// Coverage this pass: COMPLETE only when every probe target answered fully.
-	// Unsupported (older-binary) peers block resolution too — a peer that cannot
-	// report its runtime cannot prove a workload is absent from it.
-	coverageComplete := len(unreachable) == 0 && len(partialHosts) == 0 && len(unsupported) == 0
+	// Coverage this pass: COMPLETE only when every probe target answered fully
+	// AND the DB index was readable. Unsupported (older-binary) peers block
+	// resolution too — a peer that cannot report its runtime cannot prove a
+	// workload is absent from it. And a failed DB read blinds the owner- and
+	// epoch-mismatch checks entirely (they iterate the index), so it must gate
+	// resolution exactly like an unreachable host: the pass proved nothing.
+	coverageComplete := len(unreachable) == 0 && len(partialHosts) == 0 && len(unsupported) == 0 && dbIndexOK
 	coverageDetail := ""
 	if !coverageComplete {
-		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v", unreachable, partialHosts, unsupported)
+		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v db_index_ok=%v",
+			unreachable, partialHosts, unsupported, dbIndexOK)
 	}
 	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, coverageComplete, coverageDetail, probeFailed)
 }
 
 // dbVMIndex returns per-VM DB state and owner (host_name) maps for all non-deleted VMs.
-func (s *Server) dbVMIndex(ctx context.Context) (state, owner map[string]string, epoch map[string]int64) {
+//
+// ok=false means the read FAILED: the maps are then empty because nothing could
+// be read, not because no VMs exist, and the caller must treat this pass's
+// coverage as PARTIAL. The owner-mismatch and epoch-mismatch checks iterate
+// these maps, so an unreadable index silently detects nothing — and two such
+// passes counted as "clean" would auto-resolve a confirmed ownership condition
+// the detector simply could not see.
+func (s *Server) dbVMIndex(ctx context.Context) (state, owner map[string]string, epoch map[string]int64, ok bool) {
 	state, owner, epoch = map[string]string{}, map[string]string{}, map[string]int64{}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
 		slog.Warn("dual-run detector: list VMs", "error", err)
-		return
+		return state, owner, epoch, false
 	}
 	for _, vm := range vms {
 		state[vm.Name] = vm.State
 		owner[vm.Name] = vm.HostName
 		epoch[vm.Name] = vm.OwnerEpoch
 	}
-	return
+	return state, owner, epoch, true
 }
 
 // dualRunProbeTargets returns the hosts the detector must probe for a hidden runtime copy

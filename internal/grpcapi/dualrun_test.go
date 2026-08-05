@@ -1038,3 +1038,62 @@ func TestEpochMismatch_ValidEqualMarkerDoesNotFire(t *testing.T) {
 		t.Fatal("an unequal marker on the DB owner must confirm owner_epoch_mismatch")
 	}
 }
+
+// TestConditionLifecycle_DBIndexFailureCannotResolve: the owner- and
+// epoch-mismatch checks iterate the DB VM index, so a failed ListVMs makes the
+// detector silently blind to ownership drift — while runtime peer coverage can
+// still be complete. Two such passes must NOT count as clean scans and resolve
+// a confirmed condition; a pass whose index read failed proved nothing.
+func TestConditionLifecycle_DBIndexFailureCannotResolve(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+	// DB owner h1, sole runtime holder h2 → owner mismatch, confirmed on pass 2.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {}, "h2": {diskHolderVMs: []string{"vmA"}},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindOwnerMismatch, "vmA"); got != corrosion.ConditionConfirmed {
+		t.Fatalf("setup: lifecycle = %q, want confirmed", got)
+	}
+
+	// Break ONLY the VM index. Runtime gather stays complete, so without the
+	// db_index gate these passes read as clean and resolve the condition.
+	if err := s.db.Execute(ctx, `ALTER TABLE vms RENAME TO vms_broken`); err != nil {
+		t.Fatalf("hide vms table: %v", err)
+	}
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	h := readCond(t, s, kindOwnerMismatch, "vmA")
+	if h.Lifecycle != corrosion.ConditionConfirmed {
+		t.Fatalf("lifecycle = %q after passes with a failed DB index, want confirmed retained — "+
+			"an unreadable index is blindness, not absence", h.Lifecycle)
+	}
+	if h.CleanCount != 0 {
+		t.Errorf("clean streak advanced to %d with a failed DB index, want 0", h.CleanCount)
+	}
+	// The evaluator status must say PARTIAL, not complete, so cluster health
+	// shows the detector as degraded rather than green-and-blind.
+	sts, err := corrosion.ListHealthEvaluatorStatus(ctx, s.db)
+	if err != nil || len(sts) != 1 {
+		t.Fatalf("evaluator status rows = %d err=%v, want 1", len(sts), err)
+	}
+	if sts[0].Coverage != corrosion.CoveragePartial {
+		t.Fatalf("evaluator coverage = %q with a failed DB index, want partial", sts[0].Coverage)
+	}
+
+	// Index repaired and the drift healed: the same clean evidence now resolves.
+	if err := s.db.Execute(ctx, `ALTER TABLE vms_broken RENAME TO vms`); err != nil {
+		t.Fatalf("restore vms table: %v", err)
+	}
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}}, "h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindOwnerMismatch, "vmA"); got != corrosion.ConditionResolved {
+		t.Fatalf("after repair and two clean scans: %q, want resolved", got)
+	}
+}

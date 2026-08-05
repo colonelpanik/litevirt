@@ -591,3 +591,48 @@ converged-wrong `host_name` could drive a node to destroy a live workload.
 > write or an audited `lv doctor` command) so it replicates and is auditable. A
 > direct SQLite edit isn't replicated, isn't audited, and re-creates the very
 > divergence you're fixing.
+
+## Cluster health: durable conditions and the admission gate (v50)
+
+Health is durable cluster state, not a per-leader memory. Detector findings
+(dual-run, owner mismatch, owner-epoch mismatch, coverage gaps, unresolved
+ties) live in replicated `health_conditions` rows with an
+observed → confirmed → resolved lifecycle:
+
+- first positive scan → **observed** (warning); second consecutive scan →
+  **confirmed** (critical for the corruption-class codes);
+- resolution needs **two consecutive clean scans with complete coverage** by
+  the detector lease holder under a valid decision gate — an unreachable,
+  partial, or older-binary peer blocks resolution (blind is not clean);
+- leadership changes and restarts preserve counts and confirmed state;
+- resolved conditions stay readable for 30 days (`lv health --resolved`),
+  then are tombstoned;
+- there is **no force-clear**: remove the cause, and the evaluator proves
+  the resolution.
+
+`lv health` prints the overall state (HEALTHY / DEGRADED / CRITICAL /
+UNKNOWN), every active condition with its involved hosts, evaluator
+coverage, peer connectivity, and per-host effective capacity — and exits
+0 / 1 / 2 so scripts can gate on it.
+
+**The same rows drive admission.** An active ownership condition blocks
+capacity-growing admission to every involved host and runtime-changing
+actions on the affected workload; an incomplete local runtime inventory
+blocks new workloads on that host; a VIP dual-holder freezes that VIP's LB
+changes (and only those). `--allow-overcommit` bypasses numeric headroom
+only. Automated recovery (self-heal restarts, owner assertion, container
+re-key) refuses any workload with an active ownership condition, and owner
+assertion additionally demands the host-local owner-epoch marker be valid
+and exactly equal to the DB epoch being superseded — missing, corrupt,
+unreadable, or unequal evidence refuses with a distinct reason.
+
+Effective capacity: every host samples the union of its database and
+runtime workloads each minute into `host_capacity_observations` — a rogue
+runtime the database does not know about still consumes headroom in
+placement, and an uncapped rogue container makes the host's capacity
+explicitly *incomplete*, which disqualifies it as a placement target until
+resolved.
+
+See `docs/superpowers/specs/2026-08-04-unified-cluster-health-design.md`
+for the full design and the (documentation-only) future containment
+contract.

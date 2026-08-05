@@ -282,6 +282,12 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		if h.IsWitness() {
 			continue
 		}
+		// Hard: the host's effective-capacity observation is neither incomplete
+		// nor stale. A host that cannot account for its own runtime consumption
+		// must be treated as unknown, never as headroom.
+		if snap.CapacityUnknown[h.Name] {
+			continue
+		}
 
 		// Hard: resources fit. ALLOCATABLE (physical adjusted by the cluster's
 		// overcommit ratios and host reserves), not raw physical — the same

@@ -430,6 +430,19 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 					r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleEpoch)
 					break
 				}
+				// Automated recovery must never act on a workload whose OWNERSHIP
+				// is in dispute: restarting one side of a dual-run is exactly how
+				// a transient condition becomes a corrupted disk. The condition is
+				// durable state, so this refusal holds across restarts and leader
+				// changes; recovery resumes when the evaluator proves resolution.
+				if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, r.db, "vm", vm.Name); cerr != nil {
+					slog.Warn("reconciler: cannot read health conditions; deferring self-heal restart", "vm", vm.Name, "error", cerr)
+					break
+				} else if disputed {
+					slog.Warn("reconciler: refusing self-heal restart — active ownership condition",
+						"vm", vm.Name, "condition", code)
+					break
+				}
 				slog.Warn("reconciler: VM marked running but not in libvirt — attempting restart",
 					"vm", vm.Name)
 				r.startPendingVM(ctx, vm)

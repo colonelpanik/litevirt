@@ -339,3 +339,25 @@ func scanCapacityObservation(r Row) HostCapacityObservation {
 		SampledAt:       r.String("sampled_at"),
 	}
 }
+
+// WorkloadHasActiveOwnershipCondition reports whether an ACTIVE (observed or
+// confirmed) ownership-class condition names this workload. Automated recovery
+// consults it before restoring anything: recovery may restore an
+// already-database-accounted workload, but it must never act on a workload
+// whose ownership is in dispute — restarting one side of a dual-run is exactly
+// how a transient condition becomes a corrupted disk.
+func WorkloadHasActiveOwnershipCondition(ctx context.Context, c *Client, subjectKind, name string) (bool, string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT code FROM health_conditions
+		 WHERE subject_kind = ? AND subject_id = ? AND lifecycle != 'resolved'
+		   AND deleted_at IS NULL
+		   AND code IN ('vm_dual_run', 'ct_dual_run', 'runtime_owner_mismatch', 'owner_epoch_mismatch')
+		 LIMIT 1`, subjectKind, name)
+	if err != nil {
+		return false, "", err
+	}
+	if len(rows) == 0 {
+		return false, "", nil
+	}
+	return true, rows[0].String("code"), nil
+}

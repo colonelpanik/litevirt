@@ -488,6 +488,14 @@ func (f *Fake) DumpXML(name string) (string, error) {
 	if x, ok := f.xml[name]; ok {
 		return x, nil
 	}
+	// A domain seeded via SetState alone has no explicit XML — synthesize a
+	// minimal definition, because REAL libvirt cannot have a domain without
+	// one. Erroring here made every SetState-only rig read as an incomplete
+	// runtime inventory, which is a fake artifact, not a modeled failure
+	// (tests that want a broken DumpXML use FailDumpXML).
+	if _, ok := f.domains[name]; ok {
+		return `<domain type='kvm'><name>` + name + `</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu></domain>`, nil
+	}
 	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
 }
 

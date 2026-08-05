@@ -1420,6 +1420,14 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	}
 	r := rows[0]
 
+	// A VIP with an ACTIVE dual-holder condition freezes: reconfiguring the LB
+	// that owns it changes who renders/claims the address, which is exactly the
+	// ownership transition a dual-run makes unsafe. (Unrelated VM placement is
+	// deliberately not blocked by a VIP condition — see checkVIPSafety.)
+	if err := s.checkVIPSafety(ctx, r.String("vip")); err != nil {
+		return nil, err
+	}
+
 	// Merge changes.
 	oldVip := r.String("vip")
 	vip := oldVip

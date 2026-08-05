@@ -161,7 +161,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	if req.Cpu > 0 || req.MemoryMib > 0 {
 		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, req.Project,
-			corrosion.WorkloadContainer, req.Name, int(req.Cpu), int(req.MemoryMib), int(req.Cpu), int(req.MemoryMib))
+			corrosion.WorkloadContainer, req.Name, int(req.Cpu), int(req.MemoryMib), int(req.Cpu), int(req.MemoryMib), true)
 		if aerr != nil {
 			return nil, aerr
 		}

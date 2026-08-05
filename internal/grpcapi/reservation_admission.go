@@ -241,6 +241,13 @@ func (s *Server) reserveWithoutCheck(
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
 	}
+	// --allow-overcommit bypasses the numeric headroom CHECK only. Host safety
+	// — active ownership conditions, incomplete local inventory — binds the
+	// overcommit path exactly as it binds everything else.
+	sub := subjectForCreate(resourceID, host, cpuDelta, memDelta)
+	if err := s.checkHostSafety(ctx, host, sub.Kind, sub.Name, true); err != nil {
+		return nil, err
+	}
 	rv := corrosion.ReservationVector{
 		Project:    project,
 		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: s.capacity.MemChargeFor(memDelta),
@@ -277,6 +284,12 @@ func (s *Server) admitReserved(
 ) (*reservationLease, error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
+	}
+	// Host safety BEFORE any reservation: an active ownership condition on this
+	// host or workload, or an incomplete local inventory for a newly-resident
+	// workload, refuses outright — no lease to leak, nothing to unwind.
+	if err := s.checkHostSafety(ctx, host, subject.Kind, subject.Name, newVMOnHost); err != nil {
+		return nil, err
 	}
 
 	// Host figures carry the per-domain overhead; quota figures never do.
@@ -426,10 +439,13 @@ func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, cp
 //
 // The returned lease carries the commit fence like any other quota grant.
 func (s *Server) admitQuotaWithReservation(
-	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int,
+	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int, newWorkload bool,
 ) (*reservationLease, error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
+	}
+	if err := s.checkHostSafety(ctx, host, kind, name, newWorkload); err != nil {
+		return nil, err
 	}
 	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
 	tag := "vm"

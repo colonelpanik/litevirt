@@ -40,6 +40,11 @@ type Server struct {
 	// runtime-inventory collector can read markers. Empty disables marker reads
 	// (they report missing).
 	containersRoot string
+
+	// Admission-gate local-inventory cache (see localInventoryCached).
+	invCacheMu sync.Mutex
+	invCache   runtimeInventory
+	invCacheAt time.Time
 	pkiDir     string
 	db         *corrosion.Client
 	virt       LibvirtBackend

@@ -264,7 +264,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// fail-fast cannot see in-flight reservations, so relying on it here
 			// let concurrent overcommit creates all observe the same headroom.
 			qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
-				corrosion.WorkloadVM, spec.Name, int(spec.Cpu), int(spec.MemoryMib), int(spec.Cpu), int(spec.MemoryMib))
+				corrosion.WorkloadVM, spec.Name, int(spec.Cpu), int(spec.MemoryMib), int(spec.Cpu), int(spec.MemoryMib), true)
 			if qerr != nil {
 				return nil, qerr
 			}
@@ -2948,7 +2948,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// it must be the SERIALIZED admission, not the unserialized local
 				// check, or concurrent overcommit grows all see the same headroom.
 				qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project,
-					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem))
+					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem), false)
 				if qerr != nil {
 					return nil, qerr
 				}
@@ -3012,7 +3012,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 					}
 				}
 				qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", vm.HostName, vm.Project,
-					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem))
+					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem), false)
 				if qerr != nil {
 					return nil, qerr
 				}

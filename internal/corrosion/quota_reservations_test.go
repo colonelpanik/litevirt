@@ -202,3 +202,102 @@ func (r *recordingBarrier) ReplicateNowTo(_ context.Context, peer string, throug
 	r.sawSeq[peer] = throughSeq
 	return nil
 }
+
+// TestReconcileProjectQuotaReservations_ReadQuorumNotUnanimity is the regression test for
+// takeover demanding every voter.
+//
+// Every reservation was written to a majority, so reading a majority — counting the
+// successor's own replica — necessarily intersects the write set of every reservation that
+// exists. Requiring ALL voters made takeover impossible in exactly the configuration meant
+// to tolerate a failure: three nodes with one down still hold quorum and can win the lease,
+// but could never finish the drain.
+func TestReconcileProjectQuotaReservations_ReadQuorumNotUnanimity(t *testing.T) {
+	ctx := context.Background()
+	c := mustTestClient(t)
+	for _, h := range []string{"node-a", "node-b", "node-c"} {
+		if err := InsertHost(ctx, c, HostRecord{
+			Name: h, Address: "10.0.0.1", SSHUser: "root", GRPCPort: 7443,
+			State: "active", Role: "worker", CertSerial: "s-" + h,
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+
+	// node-c is down. self (node-a) + node-b = 2 of 3 = a read quorum.
+	complete, err := ReconcileProjectQuotaReservations(ctx, c,
+		srcFailing{peers: []string{"node-c"}}, "node-a", "/acme")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !complete {
+		t.Error("takeover refused with a READ QUORUM available (self + 1 of 3) — every " +
+			"reservation was written to a majority, so a majority read intersects it; demanding " +
+			"unanimity makes takeover impossible with one node down")
+	}
+
+	// Both peers down: self alone is a minority of three, so the view cannot be trusted.
+	complete, err = ReconcileProjectQuotaReservations(ctx, c,
+		srcFailing{peers: []string{"node-b", "node-c"}}, "node-a", "/acme")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if complete {
+		t.Error("takeover accepted a MINORITY read — a reservation may exist that this node " +
+			"cannot see, so it cannot bound what it would over-admit")
+	}
+}
+
+// TestReconcileProjectQuotaReservations_AdoptsPeerRows: the drain must actually copy the
+// rows in, or the successor still admits blind.
+func TestReconcileProjectQuotaReservations_AdoptsPeerRows(t *testing.T) {
+	ctx := context.Background()
+	c := mustTestClient(t)
+	for _, h := range []string{"node-a", "node-b"} {
+		if err := InsertHost(ctx, c, HostRecord{
+			Name: h, Address: "10.0.0.1", SSHUser: "root", GRPCPort: 7443,
+			State: "active", Role: "worker", CertSerial: "s-" + h,
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatalf("InsertProject: %v", err)
+	}
+	if err := UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: "/acme", VCPULimit: 8}); err != nil {
+		t.Fatalf("quota: %v", err)
+	}
+
+	src := srcRows{rows: []QuotaReservation{{
+		ID: "peer-res", Project: "/acme", Holder: "node-b", CPU: 6,
+		State: QuotaReservationPending,
+	}}}
+	if complete, err := ReconcileProjectQuotaReservations(ctx, c, src, "node-a", "/acme"); err != nil || !complete {
+		t.Fatalf("reconcile: complete=%v err=%v", complete, err)
+	}
+
+	cpu, _, err := SumLiveQuotaReservations(ctx, c, "/acme")
+	if err != nil {
+		t.Fatalf("sum: %v", err)
+	}
+	if cpu != 6 {
+		t.Errorf("adopted charge = %d vCPU, want 6 — a successor that does not copy the rows in "+
+			"still admits blind", cpu)
+	}
+}
+
+type srcFailing struct{ peers []string }
+
+func (s srcFailing) FetchProjectQuotaReservations(_ context.Context, peer, _ string) ([]QuotaReservation, error) {
+	for _, p := range s.peers {
+		if p == peer {
+			return nil, errors.New("unreachable")
+		}
+	}
+	return nil, nil
+}
+
+type srcRows struct{ rows []QuotaReservation }
+
+func (s srcRows) FetchProjectQuotaReservations(context.Context, string, string) ([]QuotaReservation, error) {
+	return s.rows, nil
+}

@@ -1079,3 +1079,63 @@ func TestReservationBarrier_NilReplicatorIsNotABoxedNil(t *testing.T) {
 		t.Error("reservationSource() returned a boxed nil")
 	}
 }
+
+// TestAdmitProjectQuota_RefusesUntilTheTermIsReconciled is the regression test for a
+// successor serving before, or entirely without, reconciliation.
+//
+// The lease becomes visible the moment it is acquired, so a concurrent request took the
+// "live lease" branch and skipped the drain; a free lease could be acquired and admitted
+// against in the same call; and an explicit authority transfer never went near it. Gating
+// on the authority TERM means every admission path refuses until the drain for its own term
+// has completed.
+func TestAdmitProjectQuota_RefusesUntilTheTermIsReconciled(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	if holder, _, err := s.projectQuotaHolder(ctx, "/acme"); err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	// A term exists (we hold the lease) and it HAS been reconciled — nothing to drain in
+	// a single-node harness — so admission works.
+	if adm, err := s.admitProjectQuota(ctx, "/acme", 1, 128); err != nil {
+		t.Fatalf("admit with a reconciled term: %v", err)
+	} else {
+		adm.Release(CommitFact{})
+	}
+
+	// Give the cluster PEERS, so a failed drain is a minority read rather than trivially
+	// complete (one host is its own quorum).
+	for _, h := range []string{"peer-b", "peer-c"} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+			Name: h, Address: "10.0.0.2", SSHUser: "root", GRPCPort: 7443,
+			State: "active", Role: "worker", CertSerial: "s-" + h,
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	// Both peers unreachable: self alone is 1 of 3, a minority, so the view cannot be
+	// trusted and the term can never reconcile.
+	s.reservationSourceOverride = failingReservationSource{}
+	st := s.projectAdmitStateFor("/acme")
+	st.mu.Lock()
+	st.reconciledTerm = "" // a NEW authority term: nothing reconciled for it yet
+	st.mu.Unlock()
+
+	_, err := s.admitProjectQuotaLocal(ctx, "/acme", 1, 128, s.hostName)
+	var recon errQuotaReconcileIncomplete
+	if !errors.As(err, &recon) {
+		t.Fatalf("admit under an unreconciled term: got %v, want errQuotaReconcileIncomplete — "+
+			"an authority that cannot see outstanding charges must not admit", err)
+	}
+
+	// And it must NOT be degraded into a fail-open admission by the outer path.
+	if _, err := s.admitProjectQuota(ctx, "/acme", 1, 128); status.Code(err) != codes.Unavailable {
+		t.Errorf("outer admitProjectQuota returned %v, want Unavailable — quotaFailOpen would "+
+			"permit exactly the unreserved admission the drain exists to prevent", err)
+	}
+}
+
+type failingReservationSource struct{}
+
+func (failingReservationSource) FetchProjectQuotaReservations(context.Context, string, string) ([]corrosion.QuotaReservation, error) {
+	return nil, errors.New("unreachable")
+}

@@ -258,6 +258,9 @@ type Server struct {
 	projectAdmitMu sync.Mutex
 	projectAdmit   map[string]*projectAdmitState
 
+	// reservationSourceOverride is a test seam for the takeover drain (nil in production).
+	reservationSourceOverride corrosion.ReservationSource
+
 	// (Reservations are no longer held in memory. They are rows in the replicated
 	// quota_reservations table, because a charge must survive this node ceasing to be
 	// the project's authority — see corrosion.ReserveProjectQuota.)

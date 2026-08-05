@@ -25,6 +25,11 @@ import (
 // leaves, while leaf nodes push only to their assigned relays. This replaces
 // the previous O(n²) full-mesh with an O(n) relay-quorum topology.
 type Replicator struct {
+	// Test seams for delivery confirmation; nil in production. See
+	// SetDeliverySeamsForTests.
+	pushOnceFn  func(ctx context.Context, peer string) (int, error)
+	watermarkFn func(ctx context.Context, peer string) (int64, error)
+
 	client   *Client
 	pkiDir   string
 	relayCfg RelayConfig
@@ -2000,23 +2005,49 @@ func insertRowFromShape(sh StmtShape, s Statement) (cols []string, vals []interf
 // Pushing the whole pending log rather than one row is deliberate: replication is
 // watermark-ordered, so a peer cannot receive a later entry without the earlier ones.
 // Idempotent, so calling it out-of-band costs at most duplicate work.
+// pushOnceFn / watermarkFn are TEST SEAMS. Production leaves them nil and the real
+// implementations are used. They exist because the loop below is the load-bearing part of
+// delivery confirmation and cannot otherwise be exercised: replicateOnce does real gRPC,
+// so there is no way to stall a peer's watermark deterministically. A mutation that
+// reverted the loop to a single push previously ran no test at all.
+func (r *Replicator) SetDeliverySeamsForTests(
+	pushOnce func(ctx context.Context, peer string) (int, error),
+	watermark func(ctx context.Context, peer string) (int64, error),
+) {
+	r.pushOnceFn, r.watermarkFn = pushOnce, watermark
+}
+
+func (r *Replicator) pushOnce(ctx context.Context, peer string) (int, error) {
+	if r.pushOnceFn != nil {
+		return r.pushOnceFn(ctx, peer)
+	}
+	return r.replicateOnce(ctx, peer)
+}
+
+func (r *Replicator) watermarkFor(ctx context.Context, peer string) (int64, error) {
+	if r.watermarkFn != nil {
+		return r.watermarkFn(ctx, peer)
+	}
+	return r.getWatermark(ctx, peer)
+}
+
 func (r *Replicator) ReplicateNowTo(ctx context.Context, peerName string, throughSeq int64) error {
 	for {
-		wm, err := r.getWatermark(ctx, peerName)
+		wm, err := r.watermarkFor(ctx, peerName)
 		if err != nil {
 			return fmt.Errorf("read watermark for %s: %w", peerName, err)
 		}
 		if wm >= throughSeq {
 			return nil
 		}
-		sent, err := r.replicateOnce(ctx, peerName)
+		sent, err := r.pushOnce(ctx, peerName)
 		if err != nil {
 			return err
 		}
 		if sent == 0 {
 			// Nothing moved and the watermark still does not cover the entry: pushing
 			// again cannot help, so report the truth rather than spinning.
-			wm, werr := r.getWatermark(ctx, peerName)
+			wm, werr := r.watermarkFor(ctx, peerName)
 			if werr == nil && wm >= throughSeq {
 				return nil
 			}

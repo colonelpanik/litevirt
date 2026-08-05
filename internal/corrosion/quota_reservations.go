@@ -404,19 +404,26 @@ type ReservationSource interface {
 	FetchProjectQuotaReservations(ctx context.Context, peer, project string) ([]QuotaReservation, error)
 }
 
-// ReconcileProjectQuotaReservations pulls a project's live reservations from every voter
-// into the local replica, and reports whether the local view can be TRUSTED to be
-// complete.
+// ReconcileProjectQuotaReservations pulls a project's live reservations from voters into
+// the local replica, and reports whether the local view can be TRUSTED to be complete.
 //
-// This is the successor-side half of the handoff argument, and without it the barrier
-// alone proves nothing about the node that actually admits. A newly-elected authority
-// admits from its OWN database; lease acquisition only established that peers were live,
-// not that this node had drained their reservation state. So C could win a quorum with B,
-// which holds a reservation C has never seen, and start admitting against it.
+// This is the successor-side half of the handoff argument, and without it the barrier alone
+// proves nothing about the node that actually admits. A newly-elected authority admits from
+// its OWN database; lease acquisition established that peers were live, not that this node
+// had drained their reservation state. So C could win a quorum with B, which holds a
+// reservation C has never seen, and admit against it.
 //
-// Called once per lease acquisition, not per admission. complete=false means at least one
-// voter could not be consulted, so a reservation may exist that this node cannot see —
-// the caller must NOT admit, because it cannot bound what it would be over-admitting.
+// A READ QUORUM is required, not unanimity. Every reservation was written to a majority, so
+// reading a majority — counting this node's own replica — necessarily intersects the write
+// set of every reservation that exists. Demanding every voter would make takeover
+// impossible in exactly the configuration that is supposed to tolerate a failure: three
+// nodes with one down still hold quorum and can win the lease, but could never complete
+// the drain.
+//
+// complete=false means fewer than a majority answered, so a reservation may exist that this
+// node cannot see and it cannot bound what it would over-admit. The caller must NOT admit.
+//
+// Called once per authority term, not per admission.
 func ReconcileProjectQuotaReservations(ctx context.Context, c *Client, src ReservationSource, self, project string) (complete bool, err error) {
 	if src == nil {
 		return true, nil // no peers to reconcile against
@@ -426,25 +433,43 @@ func ReconcileProjectQuotaReservations(ctx context.Context, c *Client, src Reser
 	if err != nil {
 		return false, err
 	}
-	complete = true
-	for _, peer := range QuotaVoters(hosts) {
+	voters := QuotaVoters(hosts)
+	total := len(voters)
+	if total == 0 {
+		return true, nil
+	}
+	need := total/2 + 1
+
+	read := 0
+	for _, v := range voters {
+		if v == self {
+			read++ // our own replica is a read, and it is always available
+		}
+	}
+	for _, peer := range voters {
 		if peer == self {
 			continue
 		}
 		rows, ferr := src.FetchProjectQuotaReservations(ctx, peer, project)
 		if ferr != nil {
-			slog.Warn("project quota: could not fetch a voter's reservations while taking over "+
-				"authority; the local view is incomplete", "project", project, "peer", peer, "error", ferr)
-			complete = false
+			slog.Warn("project quota: could not read a voter's reservations while taking over "+
+				"authority", "project", project, "peer", peer, "error", ferr)
 			continue
 		}
+		read++
 		for _, r := range rows {
 			if uerr := UpsertQuotaReservation(ctx, c, r); uerr != nil {
 				return false, uerr
 			}
 		}
 	}
-	return complete, nil
+	if read < need {
+		slog.Warn("project quota: takeover read only a minority of voters; refusing to admit "+
+			"until a read quorum is reachable",
+			"project", project, "read", read, "need", need, "voters", total)
+		return false, nil
+	}
+	return true, nil
 }
 
 // ListLiveProjectQuotaReservations returns a project's live reservation rows, for a peer

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,17 @@ type errQuotaBarrierFailed struct{ detail string }
 
 func (e errQuotaBarrierFailed) Error() string {
 	return "project-quota reservation could not be replicated: " + e.detail
+}
+
+// errQuotaReconcileIncomplete says this node holds authority but has not drained its
+// voters' reservations for the current term, so it cannot know what it would be
+// over-admitting. Distinct from a generic error because the caller's error path degrades
+// to an unserialized local check — which permits exactly the unreserved admission the
+// drain exists to prevent. Must propagate FAIL CLOSED.
+type errQuotaReconcileIncomplete struct{ project, detail string }
+
+func (e errQuotaReconcileIncomplete) Error() string {
+	return "project-quota authority for " + e.project + " has not reconciled: " + e.detail
 }
 
 // errQuotaAuthorityMoved says this node is no longer the project's authority, and
@@ -145,6 +157,15 @@ func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta
 		// Admitting for ourselves: the row is already local, so only the quorum half of
 		// the barrier applies.
 		release, err := s.admitProjectQuotaLocal(ctx, project, cpuDelta, memMiBDelta, s.hostName)
+		var recon errQuotaReconcileIncomplete
+		if errors.As(err, &recon) {
+			// FAIL CLOSED. quotaFailOpen would degrade to an unserialized local check —
+			// permitting exactly the unreserved admission the drain exists to prevent.
+			return Admission{}, status.Errorf(codes.Unavailable,
+				"project %q: this node holds admission authority but has not read a quorum of "+
+					"voters' reservations, so the request is refused rather than admitted against "+
+					"charges it cannot see: %s", project, recon.detail)
+		}
 		var barrier errQuotaBarrierFailed
 		if errors.As(err, &barrier) {
 			return Admission{}, status.Errorf(codes.Unavailable,
@@ -225,26 +246,9 @@ func (s *Server) projectQuotaHolder(ctx context.Context, project string) (string
 		return "", 0, err
 	}
 	if held {
-		// We just TOOK OVER. Before admitting anything, drain the voters' reservation
-		// state into our replica.
-		//
-		// The barrier only guarantees that a QUORUM held each reservation — not that WE
-		// do, and we admit from our own database. Quorum intersection says some voter in
-		// our quorum has the row; it does not put it here. Without this step we could
-		// win a quorum with a voter holding a reservation we have never seen and admit
-		// against it. Lease acquisition proves liveness, not state.
-		complete, rerr := corrosion.ReconcileProjectQuotaReservations(ctx, s.db, s.reservationSource(), s.hostName, project)
-		if rerr != nil {
-			return "", 0, rerr
-		}
-		if !complete {
-			// A voter could not be consulted, so a reservation may exist that we cannot
-			// see and we cannot bound what we would over-admit. Refuse to act as the
-			// authority for now; the next attempt retries.
-			slog.Warn("project quota: took the lease but could not drain every voter's "+
-				"reservations; not admitting until the view is complete", "project", project)
-			return "", 0, nil
-		}
+		// Reconciliation is NOT done here. Acquisition is only one of several ways to
+		// start serving, so the drain is enforced per authority TERM on the admission
+		// path itself — see ensureReconciledForTerm.
 		return s.hostName, 0, nil
 	}
 	// Lost the race (or a concurrent writer won). currentHolder may be empty, in
@@ -259,6 +263,11 @@ func (s *Server) holdsQuotaLease(ctx context.Context, project string) (bool, str
 	if cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project); err != nil {
 		return false, "", err
 	} else if ok {
+		if cur.Holder == s.hostName {
+			// An explicit TRANSFER is also a new authority term, and it previously
+			// bypassed reconciliation entirely. The epoch names the term.
+			s.noteAuthorityTerm(project, fmt.Sprintf("epoch:%d", cur.Epoch))
+		}
 		return cur.Holder == s.hostName, cur.Holder, nil
 	}
 	// QUORUM ON EVERY RENEWAL, not just on first acquisition. Gating only acquisition
@@ -284,7 +293,69 @@ func (s *Server) holdsQuotaLease(ctx context.Context, project string) (bool, str
 	if err != nil {
 		return false, "", err
 	}
+	if held {
+		// Stamp a term. A RENEWAL keeps the existing one (we never stopped being the
+		// authority); a fresh acquisition mints a new one, which invalidates any earlier
+		// reconciliation and forces a drain before we admit again.
+		s.noteAuthorityTerm(project, "lease:"+currentHolder)
+	}
 	return held, currentHolder, nil
+}
+
+// noteAuthorityTerm records the authority term, minting a new one when this node was not
+// already serving under it. Renewals are idempotent; a gap is not.
+func (s *Server) noteAuthorityTerm(project, base string) {
+	st := s.projectAdmitStateFor(project)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.term != "" && strings.HasPrefix(st.term, base+"|") {
+		return // same authority, continuing — renewal
+	}
+	id, err := newReservationID()
+	if err != nil {
+		id = base
+	}
+	st.term = base + "|" + id
+	// A new term has NOT been reconciled, whatever an earlier one had done.
+	st.reconciledTerm = ""
+}
+
+// ensureReconciledForTerm drains the voters' reservation state once per authority term,
+// and reports whether this node may admit.
+//
+// Gated on the term rather than run at acquisition, because acquisition is not the only way
+// to start serving: the lease is visible to concurrent requests immediately, a free lease
+// can be taken inside an admission, and an explicit transfer never touched the acquisition
+// path at all. Checking here covers every one of them.
+//
+// Caller must NOT hold st.mu.
+func (s *Server) ensureReconciledForTerm(ctx context.Context, project string) error {
+	st := s.projectAdmitStateFor(project)
+	st.mu.Lock()
+	term, done := st.term, st.reconciledTerm
+	st.mu.Unlock()
+	if term == "" {
+		return errQuotaReconcileIncomplete{project: project, detail: "no authority term recorded"}
+	}
+	if done == term {
+		return nil
+	}
+	complete, err := corrosion.ReconcileProjectQuotaReservations(ctx, s.db, s.reservationSource(), s.hostName, project)
+	if err != nil {
+		return errQuotaReconcileIncomplete{project: project, detail: err.Error()}
+	}
+	if !complete {
+		return errQuotaReconcileIncomplete{project: project,
+			detail: "could not read a quorum of voters' reservations"}
+	}
+	st.mu.Lock()
+	// Only mark the term we actually reconciled: if authority changed underneath us the
+	// term moved on and this drain does not count for it.
+	if st.term == term {
+		st.reconciledTerm = term
+	}
+	st.mu.Unlock()
+	return nil
 }
 
 // projectAdmitState is now only a per-project MUTEX.
@@ -298,6 +369,18 @@ func (s *Server) holdsQuotaLease(ctx context.Context, project string) (bool, str
 // interleaving between the reservation guard's read and its write.
 type projectAdmitState struct {
 	mu sync.Mutex
+	// term identifies the current AUTHORITY TERM: it changes whenever this node newly
+	// acquires authority (a fresh lease, or a different transfer epoch) and stays put
+	// across renewals. reconciledTerm records the term whose voter drain COMPLETED.
+	//
+	// Both are required because reconciliation is not something a single code path can
+	// own. The lease row becomes visible the moment it is acquired, so a concurrent
+	// request took the "live lease" branch and skipped the drain entirely; a free lease
+	// could be acquired and admitted against in the same call; and an explicit authority
+	// transfer never went near it. Gating on the term instead means EVERY admission path
+	// — local, peer RPC, self-admit — refuses until the drain for its own term is done.
+	term           string
+	reconciledTerm string
 }
 
 func (s *Server) projectAdmitStateFor(project string) *projectAdmitState {
@@ -323,6 +406,13 @@ func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpu
 	}
 	if !held {
 		return Admission{}, errQuotaAuthorityMoved{holder: currentHolder}
+	}
+
+	// Drain the voters' reservations for THIS authority term before admitting anything.
+	// Fails closed: an authority that cannot see the outstanding charges cannot bound
+	// what it would over-admit.
+	if rerr := s.ensureReconciledForTerm(ctx, project); rerr != nil {
+		return Admission{}, rerr
 	}
 
 	// Serialize same-project admissions within this process so two of them cannot
@@ -598,6 +688,16 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 		if status.Code(err) == codes.ResourceExhausted {
 			return &pb.AdmitProjectQuotaResponse{Admitted: false, Detail: status.Convert(err).Message()}, nil
 		}
+		var recon errQuotaReconcileIncomplete
+		if errors.As(err, &recon) {
+			// Reuse barrier_failed: from the caller's side both mean "the authority could
+			// not establish the state it needs", and both must fail closed rather than
+			// land in the generic error path that degrades.
+			return &pb.AdmitProjectQuotaResponse{
+				Admitted: false, BarrierFailed: true,
+				Detail: "authority has not reconciled voter reservations: " + recon.detail,
+			}, nil
+		}
 		var barrier errQuotaBarrierFailed
 		if errors.As(err, &barrier) {
 			// A SUCCESSFUL response carrying barrier_failed. Returned as an error it
@@ -674,6 +774,9 @@ func (s *Server) reservationBarrier() corrosion.ReservationBarrier {
 // when there is no replicator wired (single node / shared-store harness), which
 // ReconcileProjectQuotaReservations reads as "no peers to reconcile against".
 func (s *Server) reservationSource() corrosion.ReservationSource {
+	if s.reservationSourceOverride != nil {
+		return s.reservationSourceOverride // test seam
+	}
 	if s.replicator == nil {
 		return nil
 	}

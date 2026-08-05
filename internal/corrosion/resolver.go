@@ -408,20 +408,27 @@ var capabilityMap = map[string]tableResolver{
 	// content-max it. vm_pci_realizations is the RESOLVED/computed outcome of an
 	// intent (concrete address/alias), like vm_disks/host_pci_devices — plain
 	// content-default.
-	"vm_pci_intent":           {category: "content", chain: contentOpaqueChain("selector_payload")},
-	"vm_pci_realizations":     {category: "content", chain: contentDefaultChain()},
-	"snapshots":               {category: "content", chain: contentDefaultChain()},
-	"dns_records":             {category: "content", chain: contentDefaultChain()},
-	"fencing_log":             {category: "content", chain: contentDefaultChain()},
-	"audit_log":               {category: "content", chain: contentDefaultChain()},
-	"network_vteps":           {category: "content", chain: contentDefaultChain()},
-	"bgp_peers":               {category: "content", chain: contentDefaultChain()},
-	"ip_allocations":          {category: "content", chain: contentDefaultChain()},
-	"container_interfaces":    {category: "content", chain: contentDefaultChain()},
-	"host_pci_devices":        {category: "content", chain: contentDefaultChain()},
-	"resource_mappings":       {category: "content", chain: contentDefaultChain()},
-	"service_endpoints":       {category: "content", chain: contentDefaultChain()},
-	"backup_repos":            {category: "content", chain: contentDefaultChain()},
+	"vm_pci_intent":        {category: "content", chain: contentOpaqueChain("selector_payload")},
+	"vm_pci_realizations":  {category: "content", chain: contentDefaultChain()},
+	"snapshots":            {category: "content", chain: contentDefaultChain()},
+	"dns_records":          {category: "content", chain: contentDefaultChain()},
+	"fencing_log":          {category: "content", chain: contentDefaultChain()},
+	"audit_log":            {category: "content", chain: contentDefaultChain()},
+	"network_vteps":        {category: "content", chain: contentDefaultChain()},
+	"bgp_peers":            {category: "content", chain: contentDefaultChain()},
+	"ip_allocations":       {category: "content", chain: contentDefaultChain()},
+	"container_interfaces": {category: "content", chain: contentDefaultChain()},
+	"host_pci_devices":     {category: "content", chain: contentDefaultChain()},
+	"resource_mappings":    {category: "content", chain: contentDefaultChain()},
+	"service_endpoints":    {category: "content", chain: contentDefaultChain()},
+	"backup_repos":         {category: "content", chain: contentDefaultChain()},
+	// quota_reservations (v44): a durable project-quota charge. holder is informational
+	// (who granted it), so it is NOT an ownership column worth flagging — a successor
+	// authority counting the row is the entire point. state is monotone
+	// pending → committed, and a tombstone means "retired", so the tombstone rule ahead
+	// of content-max gives the right answer on an exact-ts tie: never resurrect a
+	// retired charge, and otherwise prefer the row carrying the committed identity.
+	"quota_reservations":      {category: "content", chain: contentDefaultChain()},
 	"replication_checkpoints": {category: "content", chain: contentDefaultChain()},
 	"vm_backups":              {category: "content", chain: contentDefaultChain()},
 	"container_backups":       {category: "content", chain: contentDefaultChain()},

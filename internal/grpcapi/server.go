@@ -258,11 +258,9 @@ type Server struct {
 	projectAdmitMu sync.Mutex
 	projectAdmit   map[string]*projectAdmitState
 
-	// quotaLeases holds project-quota reservations this node granted to peers as
-	// the project's authority holder, keyed by reservation id. Per-Server (not a
-	// package global) because the fleet harness runs several daemons in one process.
-	quotaLeaseMu sync.Mutex
-	quotaLeases  map[string]*quotaLeaseEntry
+	// (Reservations are no longer held in memory. They are rows in the replicated
+	// quota_reservations table, because a charge must survive this node ceasing to be
+	// the project's authority — see corrosion.ReserveProjectQuota.)
 
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets

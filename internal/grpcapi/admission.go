@@ -71,6 +71,10 @@ func noopReleaseCommitted(CommitFact) {}
 type Admission struct {
 	release func(CommitFact)
 	fence   func(context.Context) error
+	// reservationID names the durable quota_reservations row, when there is one. The
+	// holder-side RPC returns it so a routed caller can fence on a LOCAL read of that
+	// replicated row instead of asking over the network.
+	reservationID string
 }
 
 // Release returns the admission. Safe on a zero value.

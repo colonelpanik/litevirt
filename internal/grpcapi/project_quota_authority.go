@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -59,18 +58,21 @@ func (s *Server) RunQuotaLeaseRenewer(ctx context.Context) {
 }
 
 func (s *Server) renewHeldQuotaLeases(ctx context.Context) {
-	s.projectAdmitMu.Lock()
-	projects := make([]string, 0, len(s.projectAdmit))
-	for p, st := range s.projectAdmit {
-		st.mu.Lock()
-		charged := st.pendingCPU > 0 || st.pendingMem > 0 || len(st.unobserved) > 0
-		st.mu.Unlock()
-		if charged {
-			projects = append(projects, p)
-		}
+	// Sweep first: retire reservations whose workloads are now visible, and expire
+	// stragglers. Any node may sweep — it only tombstones rows that are no longer
+	// charged — so this does not depend on being the authority.
+	if err := corrosion.SweepQuotaReservations(ctx, s.db); err != nil {
+		slog.Warn("project quota: sweeping reservations failed; will retry", "error", err)
 	}
-	s.projectAdmitMu.Unlock()
 
+	// Renew for every project we still hold a live reservation for. The charges are
+	// ROWS now, so this is a query rather than a walk of in-memory state — which also
+	// means a restarted holder keeps renewing for charges it granted before the restart.
+	projects, err := corrosion.ProjectsWithLiveQuotaReservations(ctx, s.db, s.hostName)
+	if err != nil {
+		slog.Warn("project quota: listing live reservations failed; will retry", "error", err)
+		return
+	}
 	for _, project := range projects {
 		held, currentHolder, err := s.holdsQuotaLease(ctx, project)
 		if err != nil {
@@ -81,54 +83,19 @@ func (s *Server) renewHeldQuotaLeases(ctx context.Context) {
 		if held {
 			continue
 		}
-		// Dropping the charges is only safe because of the COMMIT FENCE: every
-		// outstanding grant re-checks the lease (local) or its deadline (routed)
-		// immediately before its durable write, so an in-flight create cannot land
-		// against a ledger the successor knows nothing about. Without that fence this
-		// drop was a hole — the successor would admit the same quota and the original
-		// request would still complete.
-		slog.Error("project quota: LOST the admission lease while charges were outstanding; "+
-			"in-flight commits will be ABORTED by the fence and their charges dropped",
+		// We are no longer the authority. The charges are NOT dropped: they are
+		// durable rows, the successor already counts them, and our in-flight requests
+		// can still commit safely against them. That is the point of durability —
+		// there is nothing to discard and nothing to fence.
+		slog.Warn("project quota: lost the admission lease; the successor accounts for our "+
+			"outstanding reservations from the replicated rows",
 			"project", project, "new_holder", currentHolder)
 		s.notify(ctx, notify.Notification{
 			Kind: "quota.authority_lost", Severity: notify.SevWarn, Subject: project,
 			Detail: "lost the project-quota admission lease to " + currentHolder +
-				" while admissions were in flight; those requests are aborted before committing",
+				"; outstanding reservations remain charged and are visible to the new authority",
 		})
-		st := s.projectAdmitStateFor(project)
-		st.mu.Lock()
-		st.pendingCPU, st.pendingMem = 0, 0
-		st.unobserved = nil
-		st.mu.Unlock()
 	}
-}
-
-// workloadKey is the ledger key: identity is (kind, host, name), never name alone.
-func workloadKey(f CommitFact) string {
-	kind := f.Kind
-	if kind == "" {
-		kind = corrosion.WorkloadVM
-	}
-	return kind + "\x00" + f.Host + "\x00" + f.Workload
-}
-
-func workloadNameFromKey(key string) string {
-	parts := strings.Split(key, "\x00")
-	return parts[len(parts)-1]
-}
-
-// quotaReservationTTL bounds how long a routed reservation survives without an
-// explicit release. A caller always releases via defer, so the TTL only matters
-// when the CALLER dies mid-request — without it that project would leak quota until
-// this daemon restarted.
-const quotaReservationTTL = 15 * time.Minute
-
-// quotaLease is a reservation held on behalf of a remote caller.
-type quotaLease struct {
-	project string
-	cpu     int
-	mem     int
-	expires time.Time
 }
 
 // admitProjectQuota admits a vCPU/memory GROW against the project's quota and
@@ -282,62 +249,18 @@ func (s *Server) holdsQuotaLease(ctx context.Context, project string) (bool, str
 	return held, currentHolder, nil
 }
 
-// projectAdmitState is the authority holder's per-project ledger. Two distinct
-// charges live here, and they cover two different windows:
+// projectAdmitState is now only a per-project MUTEX.
 //
-//   - pending*: admitted, caller still working. Dropped when the caller releases.
-//   - unobserved*: the caller COMMITTED, but this node has not yet SEEN the
-//     workload. Dropped only once the commit shows up in local usage.
+// The charges themselves are rows in the replicated quota_reservations table, because a
+// charge must survive this node ceasing to be the project's authority. An in-memory
+// ledger did not: a lease handoff left the successor with nothing, so it re-admitted the
+// same quota while the previous holder's in-flight request still committed on top.
 //
-// The second one is the subtle half. A routed admission is committed by the target
-// HOST, not by the authority — so between that commit and CRDT replication
-// delivering the row here, the holder sees neither the reservation (the caller
-// released it) nor the committed usage. Another concurrent request would then be
-// handed the very same quota. Converting the reservation into an unobserved charge,
-// instead of just dropping it, keeps the quota spoken for across exactly that gap.
-//
-// The charge is keyed by WORKLOAD IDENTITY. An aggregate "usage grew since a
-// baseline" heuristic looked simpler but is unsound: any unrelated increase — a
-// workload created before the charge that replicates late, or one admitted through
-// the fail-open path — would satisfy it and retire someone else's charge early, and
-// the next request would over-admit. A charge may only be retired by observing the
-// workload it was taken for.
-//
-// A commit that never becomes visible (the create failed after the durable write, or
-// the workload was deleted immediately) would otherwise hold quota forever, so a
-// short grace TTL is the backstop. It errs toward over-charging, which refuses a
-// request that might have fit — never the reverse.
+// The mutex still earns its place: it keeps two same-project admissions on this node from
+// interleaving between the reservation guard's read and its write.
 type projectAdmitState struct {
-	mu         sync.Mutex
-	pendingCPU int
-	pendingMem int
-
-	// unobserved is keyed by WORKLOAD name: charges the caller says it committed but
-	// this node cannot see yet. Keyed by identity, not aggregated, so one workload's
-	// arrival can only ever retire ITS OWN charge.
-	unobserved map[string]*unobservedCommit
+	mu sync.Mutex
 }
-
-// unobservedCommit is one committed-but-unseen workload.
-//
-// wantCPU/wantMem are what the workload should contribute to project usage once its
-// row lands here. The charge retires when this node's own replica says the workload
-// contributes at least that — which is a direct observation of THIS commit, not an
-// inference from aggregate movement.
-//
-// chargeCPU/chargeMem are what to hold meanwhile: the delta that was admitted, not
-// the absolute size, so a resize holds only its growth.
-type unobservedCommit struct {
-	kind, host           string
-	wantCPU, wantMem     int
-	chargeCPU, chargeMem int
-	at                   time.Time
-}
-
-// unobservedGraceTTL bounds how long a committed-but-unseen charge is held. It only
-// needs to exceed normal replication delivery; the self-healing baseline comparison
-// does the real work.
-const unobservedGraceTTL = 2 * time.Minute
 
 func (s *Server) projectAdmitStateFor(project string) *projectAdmitState {
 	s.projectAdmitMu.Lock()
@@ -353,152 +276,93 @@ func (s *Server) projectAdmitStateFor(project string) *projectAdmitState {
 	return st
 }
 
-// releaseFor returns the idempotent release for one admission. committed=true
-// converts the reservation into an unobserved-commit charge (see the type doc);
-// committed=false just gives the quota back.
-//
-// usedCPU/usedMem are the usage this node observed at admit time, and become the
-// baseline the unobserved charge is measured against.
-func (st *projectAdmitState) releaseFor(cpu, mem int) func(CommitFact) {
-	var once sync.Once
-	return func(f CommitFact) {
-		once.Do(func() {
-			st.mu.Lock()
-			defer st.mu.Unlock()
-			st.pendingCPU = maxInt(st.pendingCPU-cpu, 0)
-			st.pendingMem = maxInt(st.pendingMem-mem, 0)
-			if !f.Committed || f.Workload == "" {
-				return
-			}
-			if st.unobserved == nil {
-				st.unobserved = map[string]*unobservedCommit{}
-			}
-			key := workloadKey(f)
-			e, ok := st.unobserved[key]
-			if !ok {
-				e = &unobservedCommit{kind: f.Kind, host: f.Host}
-				st.unobserved[key] = e
-			}
-			// SUM the charges; do not take the larger. Two consecutive +2 vCPU
-			// resizes that both commit before either is visible here owe FOUR unseen
-			// vCPU, not two — max() silently released half of it.
-			e.chargeCPU += cpu
-			e.chargeMem += mem
-			// want is the LATEST absolute target, which is monotone across resizes.
-			// Observing the workload at or above it means every summed delta has
-			// landed, so the whole entry retires at once.
-			e.wantCPU = maxInt(e.wantCPU, f.CPU)
-			e.wantMem = maxInt(e.wantMem, f.MemMiB)
-			e.at = time.Now()
-		})
-	}
-}
-
-// unobservedChargeLocked sums the charges whose workloads this node still cannot
-// see, retiring each one that HAS arrived. Caller holds st.mu.
-//
-// observe reports what the local replica says a named workload contributes to the
-// project; found=false means the row has not arrived (or was deleted).
-func (st *projectAdmitState) unobservedChargeLocked(
-	project string,
-	observe func(kind, host, workload string) (cpu, mem int, found bool, err error),
-) (int, int, error) {
-	if len(st.unobserved) == 0 {
-		return 0, 0, nil
-	}
-	var totalCPU, totalMem int
-	for key, e := range st.unobserved {
-		name := workloadNameFromKey(key)
-		cpu, mem, found, err := observe(e.kind, e.host, name)
-		if err != nil {
-			return 0, 0, err
-		}
-		// Retire on DIRECT observation of this workload, at or above the size it
-		// was admitted for. A resize is covered by the >= comparison.
-		if found && cpu >= e.wantCPU && mem >= e.wantMem {
-			delete(st.unobserved, key)
-			continue
-		}
-		if time.Since(e.at) > unobservedGraceTTL {
-			// Backstop: the commit never became visible (it failed after the
-			// durable write, or the workload was deleted straight away).
-			slog.Warn("project quota: a committed workload never became visible locally; dropping its charge",
-				"project", project, "workload", name, "kind", e.kind, "host", e.host,
-				"cpu", e.chargeCPU, "mem_mib", e.chargeMem, "held_for", time.Since(e.at))
-			delete(st.unobserved, key)
-			continue
-		}
-		totalCPU += e.chargeCPU
-		totalMem += e.chargeMem
-	}
-	return totalCPU, totalMem, nil
-}
-
-// admitProjectQuotaLocal is the holder-side admit. It charges, in one pass under the
-// project lock: committed usage, replicated operation reservations, this node's
-// in-flight admissions, AND the committed-but-not-yet-visible total (see
-// projectAdmitState) — then reserves.
-//
-// The observed usage is carried into the release func so a commit can anchor its
-// unobserved charge to the usage that was visible when it was admitted.
 func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpuDelta, memMiBDelta int) (Admission, error) {
-	// RENEW the lease, do not merely read it. Admitting extends the life of a charge,
-	// so it must also extend the authority that owns that charge — otherwise the lease
-	// lapses mid-create and another node acquires it with an empty ledger.
+	// Still renew here: the lease is what keeps admissions for this project arriving at
+	// ONE node, which is what makes the local guard meaningful.
 	held, currentHolder, err := s.holdsQuotaLease(ctx, project)
 	if err != nil {
 		return Admission{}, status.Errorf(codes.Internal, "renew project authority lease: %v", err)
 	}
 	if !held {
-		// Lost it between resolving and serving. Do not admit locally against a ledger
-		// we no longer own; let the caller route or degrade.
 		return Admission{}, errQuotaAuthorityMoved{holder: currentHolder}
 	}
 
+	// Serialize same-project admissions within this process so two of them cannot
+	// interleave between the guard's read and its write.
 	st := s.projectAdmitStateFor(project)
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	bounded, err := s.projectIsBounded(ctx, project)
+	id, err := newReservationID()
 	if err != nil {
-		return Admission{}, err
-	}
-	if !bounded {
-		return Admission{}, nil // unbounded project: nothing to serialize
-	}
-	unobsCPU, unobsMem, err := st.unobservedChargeLocked(project, func(kind, host, w string) (int, int, bool, error) {
-		return corrosion.WorkloadQuotaContribution(ctx, s.db, project, kind, host, w)
-	})
-	if err != nil {
-		return Admission{}, status.Errorf(codes.Internal, "observe committed workloads: %v", err)
-	}
-	if err := s.checkProjectQuotaWithPending(ctx, project, cpuDelta, memMiBDelta,
-		st.pendingCPU+unobsCPU, st.pendingMem+unobsMem); err != nil {
-		return Admission{}, err
+		return Admission{}, status.Errorf(codes.Internal, "mint reservation id: %v", err)
 	}
 	cpu, mem := maxInt(cpuDelta, 0), maxInt(memMiBDelta, 0)
-	st.pendingCPU += cpu
-	st.pendingMem += mem
+	applied, detail, err := corrosion.ReserveProjectQuota(ctx, s.db, id, project, s.hostName, cpu, mem)
+	if err != nil {
+		return Admission{}, status.Errorf(codes.Internal, "reserve project quota: %v", err)
+	}
+	if detail == "" && !applied {
+		return Admission{}, nil // unbounded project: nothing to enforce or reserve
+	}
+	if !applied {
+		return Admission{}, status.Errorf(codes.ResourceExhausted, "project %q %s", project, detail)
+	}
+	return s.durableAdmission(project, id), nil
+}
+
+// durableAdmission wraps a durable reservation row.
+//
+// Release tombstones an UNCOMMITTED reservation and converts a committed one in place —
+// the row keeps the charge until the workload is observed, so a successor holds it too.
+//
+// AllowCommit is a LOCAL read of the reservation row, and it fails CLOSED. That is the
+// whole benefit of durability: the previous fence had to ask the authority over the
+// network and fell open when it could not, which is precisely the case it existed for.
+// Here there is no RPC, so a partition cannot defeat it, and nothing to fall open to.
+func (s *Server) durableAdmission(project, id string) Admission {
 	return Admission{
-		release: st.releaseFor(cpu, mem),
-		// A LOCAL grant is fenced by a live re-check: we must still hold the lease,
-		// with quorum, at commit time. If we lost it, a successor may already have
-		// admitted against a ledger that knows nothing about this charge, so this
-		// commit must not happen.
-		fence: func(fctx context.Context) error {
-			ok, holder, ferr := s.holdsQuotaLease(fctx, project)
-			if ferr != nil {
-				return status.Errorf(codes.Unavailable,
-					"cannot confirm project-quota authority for %q before committing: %v", project, ferr)
+		reservationID: id,
+		release: func(f CommitFact) {
+			rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if !f.Committed {
+				if err := corrosion.ReleaseProjectQuotaReservationRow(rctx, s.db, id); err != nil {
+					slog.Warn("project quota: releasing a reservation failed; it expires on TTL",
+						"project", project, "reservation", id, "error", err)
+				}
+				return
 			}
-			if !ok {
+			kind := f.Kind
+			if kind == "" {
+				kind = corrosion.WorkloadVM
+			}
+			if err := corrosion.CommitProjectQuotaReservation(rctx, s.db, id,
+				f.Workload, kind, f.Host, f.CPU, f.MemMiB); err != nil {
+				// The charge stays 'pending' and expires on TTL — conservative, and it
+				// never releases quota the project actually owes.
+				slog.Error("project quota: marking a reservation committed failed; it stays "+
+					"charged until its TTL", "project", project, "reservation", id,
+					"workload", f.Workload, "error", err)
+			}
+		},
+		fence: func(fctx context.Context) error {
+			live, err := corrosion.QuotaReservationLive(fctx, s.db, id)
+			if err != nil {
+				// FAIL CLOSED. A local read failing is not a licence to commit against
+				// a charge we cannot confirm.
+				return status.Errorf(codes.Unavailable,
+					"cannot confirm the project-quota reservation for %q before committing: %v",
+					project, err)
+			}
+			if !live {
 				return status.Errorf(codes.Aborted,
-					"project-quota authority for %q moved to %q while this request was in flight; "+
-						"nothing was committed — retry", project, holder)
+					"the project-quota reservation for %q is gone (expired or swept) before this "+
+						"request could commit; nothing was committed — retry", project)
 			}
 			return nil
 		},
-	}, nil
+	}
 }
 
 // admitProjectQuotaRemote routes to the holder. On an epoch mismatch it retries
@@ -547,88 +411,37 @@ func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epo
 		}
 		id := resp.ReservationId
 		return Admission{
-			// The committed flag has to reach the holder: on a commit it must KEEP the
-			// charge until it can see the workload, since the target host wrote the row
-			// and replication has not delivered it here yet.
+			// Tell the holder whether the workload was written, so its DURABLE row is
+			// either tombstoned or converted to a committed charge it keeps until the
+			// workload is observed.
 			release: func(f CommitFact) { s.releaseRemoteQuota(holder, id, f) },
-			// ASK the holder at commit time; never compare a copied expiry against our
-			// own clock. A copied deadline was wrong in both directions: it did not
-			// follow the holder's renewals, so a healthy create slower than one lease
-			// period (an image pull) aborted for nothing; and being wall-clock, skew or
-			// a pause after the check could let a write land after the lease had really
-			// expired. Only the holder knows whether it still holds the lease AND still
-			// has the reservation.
+			// A LOCAL read of the holder's replicated reservation row, failing CLOSED.
+			//
+			// No RPC. The previous fence asked the authority over the network and fell
+			// open when it could not answer — which is exactly when authority is being
+			// lost, so it was defeated in the only case it mattered. And even a good
+			// answer left a gap: the holder could lose its lease and discard the
+			// reservation between responding and this write. A durable row has neither
+			// problem: it is visible here through replication, a successor counts it,
+			// and losing the lease does not erase it.
 			fence: func(fctx context.Context) error {
-				return s.validateRemoteQuotaReservation(fctx, holder, project, id)
+				live, ferr := corrosion.QuotaReservationLive(fctx, s.db, id)
+				if ferr != nil {
+					return status.Errorf(codes.Unavailable,
+						"cannot confirm the project-quota reservation for %q before committing: %v",
+						project, ferr)
+				}
+				if !live {
+					return status.Errorf(codes.Aborted,
+						"the project-quota reservation for %q is gone before this request could "+
+							"commit; nothing was committed — retry", project)
+				}
+				return nil
 			},
 		}, nil
 	}
 	return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
-		"authority epoch kept moving", nil)
-}
-
-// validateRemoteQuotaReservation is the routed commit fence: one RPC to the authority
-// immediately before the durable write.
-//
-// A failure to REACH the holder is not treated as "invalid". Quota is a tenancy limit,
-// and refusing a create that is otherwise complete because of a transient RPC error
-// would be a worse outage than the over-admission it prevents — the same fail-open
-// reasoning as admission itself. It is logged and audited so it is never silent.
-func (s *Server) validateRemoteQuotaReservation(ctx context.Context, holder, project, id string) error {
-	if id == "" {
-		return nil
-	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	client, conn, err := s.peerClient(cctx, holder)
-	if err != nil {
-		slog.Warn("project quota: could not reach the authority to validate a reservation before "+
-			"committing; proceeding", "project", project, "holder", holder, "error", err)
-		return nil
-	}
-	defer conn.Close()
-	resp, err := client.ValidateProjectQuotaReservation(cctx, &pb.ValidateProjectQuotaReservationRequest{
-		Sender: s.hostName, Project: project, ReservationId: id,
-	})
-	if err != nil {
-		slog.Warn("project quota: reservation validation call failed; proceeding",
-			"project", project, "holder", holder, "error", err)
-		return nil
-	}
-	if resp.Valid {
-		return nil
-	}
-	return status.Errorf(codes.Aborted,
-		"project-quota reservation for %q is no longer valid at %s (%s); nothing was committed — retry",
-		project, holder, resp.Detail)
-}
-
-// ValidateProjectQuotaReservation answers whether a reservation is still good. Peer-only.
-func (s *Server) ValidateProjectQuotaReservation(ctx context.Context, req *pb.ValidateProjectQuotaReservationRequest) (*pb.ValidateProjectQuotaReservationResponse, error) {
-	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
-		return nil, err
-	}
-	project := tenancy.NormalizeProject(req.Project)
-
-	held, currentHolder, err := s.holdsQuotaLease(ctx, project)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "read project authority: %v", err)
-	}
-	if !held {
-		return &pb.ValidateProjectQuotaReservationResponse{
-			Valid: false, Detail: "no longer the admission authority for this project",
-			CurrentHolder: currentHolder,
-		}, nil
-	}
-	s.quotaLeaseMu.Lock()
-	_, ok := s.quotaLeases[req.ReservationId]
-	s.quotaLeaseMu.Unlock()
-	if !ok {
-		return &pb.ValidateProjectQuotaReservationResponse{
-			Valid: false, Detail: "reservation expired or already released", CurrentHolder: s.hostName,
-		}, nil
-	}
-	return &pb.ValidateProjectQuotaReservationResponse{Valid: true, CurrentHolder: s.hostName}, nil
+		"authority kept moving", nil)
 }
 
 func (s *Server) releaseRemoteQuota(holder, id string, f CommitFact) {
@@ -722,91 +535,43 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 		}
 		return nil, err
 	}
-
-	id, err := newReservationID()
-	if err != nil {
-		grant.Release(CommitFact{}) // never handed out, so nothing committed against it
-		return nil, status.Errorf(codes.Internal, "mint reservation id: %v", err)
-	}
-	s.putQuotaLease(id, grant.Release, project, int(req.CpuDelta), int(req.MemMibDelta))
+	// The id names a REPLICATED row, so the caller's fence is a local read and a
+	// successor authority already accounts for the charge.
 	return &pb.AdmitProjectQuotaResponse{
-		Admitted: true, ReservationId: id, CurrentHolder: s.hostName,
+		Admitted: true, ReservationId: grant.reservationID, CurrentHolder: s.hostName,
 	}, nil
 }
 
-// ReleaseProjectQuotaReservation drops a routed reservation. Peer-only. Idempotent:
-// an unknown id (already released, or expired) is a success, so a caller retrying a
-// release never gets an error it cannot act on.
+// ReleaseProjectQuotaReservation finalizes a routed reservation. Peer-only.
+//
+// committed=false tombstones the row. committed=true CONVERTS it: the row keeps the
+// charge, now carrying the workload identity it is retired against, until some node
+// observes that workload. A successor authority counts it either way, which is the
+// whole point of the row being durable.
+//
+// Idempotent: an unknown id is a success, so a caller retrying a release never wedges.
 func (s *Server) ReleaseProjectQuotaReservation(ctx context.Context, req *pb.ReleaseProjectQuotaReservationRequest) (*emptypb.Empty, error) {
 	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
 		return nil, err
 	}
-	s.dropQuotaLease(req.ReservationId, CommitFact{
-		Committed: req.Committed, Workload: req.Workload,
-		Kind: req.Kind, Host: req.WorkloadHost,
-		CPU: int(req.CommittedCpu), MemMiB: int(req.CommittedMemMib),
-	})
-	return &emptypb.Empty{}, nil
-}
-
-// quotaLeaseEntry is one routed reservation held for a remote caller.
-//
-// The table lives on the Server, NOT in a package global: the fleet harness runs
-// several daemons in one process, and a shared table would let one node release
-// another's reservations.
-//
-// In-memory on purpose. A durable table would need an operations row per admission
-// plus crash recovery, and a crashed create would wedge the project's quota until an
-// operator noticed. The cost is that a holder restart forgets in-flight
-// reservations — a bounded over-admission window, the same trade the host ledger
-// makes.
-type quotaLeaseEntry struct {
-	lease   quotaLease
-	release func(CommitFact)
-}
-
-func (s *Server) putQuotaLease(id string, release func(CommitFact), project string, cpu, mem int) {
-	s.quotaLeaseMu.Lock()
-	defer s.quotaLeaseMu.Unlock()
-	if s.quotaLeases == nil {
-		s.quotaLeases = map[string]*quotaLeaseEntry{}
+	if req.ReservationId == "" {
+		return &emptypb.Empty{}, nil
 	}
-	s.reapQuotaLeasesLocked()
-	s.quotaLeases[id] = &quotaLeaseEntry{
-		lease:   quotaLease{project: project, cpu: cpu, mem: mem, expires: time.Now().Add(quotaReservationTTL)},
-		release: release,
-	}
-}
-
-func (s *Server) dropQuotaLease(id string, f CommitFact) {
-	s.quotaLeaseMu.Lock()
-	e, ok := s.quotaLeases[id]
-	if ok {
-		delete(s.quotaLeases, id)
-	}
-	s.reapQuotaLeasesLocked()
-	s.quotaLeaseMu.Unlock()
-	if ok {
-		e.release(f)
-	}
-}
-
-// reapQuotaLeasesLocked releases leases whose caller never came back. Caller holds
-// quotaLeaseMu. Without this a caller that died mid-request would hold the
-// project's quota until this daemon restarted.
-func (s *Server) reapQuotaLeasesLocked() {
-	now := time.Now()
-	for id, e := range s.quotaLeases {
-		if now.After(e.lease.expires) {
-			slog.Warn("project quota: reservation expired without a release",
-				"project", e.lease.project, "reservation", id,
-				"cpu", e.lease.cpu, "mem_mib", e.lease.mem)
-			delete(s.quotaLeases, id)
-			// Unconfirmed: the caller never told us it committed, so give the
-			// quota back rather than holding it as an unobserved commit.
-			e.release(CommitFact{})
+	if !req.Committed {
+		if err := corrosion.ReleaseProjectQuotaReservationRow(ctx, s.db, req.ReservationId); err != nil {
+			return nil, status.Errorf(codes.Internal, "release reservation: %v", err)
 		}
+		return &emptypb.Empty{}, nil
 	}
+	kind := req.Kind
+	if kind == "" {
+		kind = corrosion.WorkloadVM
+	}
+	if err := corrosion.CommitProjectQuotaReservation(ctx, s.db, req.ReservationId,
+		req.Workload, kind, req.WorkloadHost, int(req.CommittedCpu), int(req.CommittedMemMib)); err != nil {
+		return nil, status.Errorf(codes.Internal, "commit reservation: %v", err)
+	}
+	return &emptypb.Empty{}, nil
 }
 
 func newReservationID() (string, error) {

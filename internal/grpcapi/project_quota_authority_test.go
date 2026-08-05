@@ -82,11 +82,8 @@ func TestAdmitProjectQuota_LocalHolderReservationBlocksSecond(t *testing.T) {
 	}
 	r2.Release(CommitFact{})
 
-	st := s.projectAdmitStateFor("/acme")
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.pendingCPU != 0 || st.pendingMem != 0 {
-		t.Errorf("project ledger after releasing everything = %d/%d, want 0/0", st.pendingCPU, st.pendingMem)
+	if cpu, mem := liveReservationCharge(t, s, ctx, "/acme"); cpu != 0 || mem != 0 {
+		t.Errorf("durable reservations after releasing everything = %d/%d, want 0/0", cpu, mem)
 	}
 }
 
@@ -110,12 +107,9 @@ func TestAdmitProjectQuota_InactiveFeatureIsUnchanged(t *testing.T) {
 	}
 	defer r2.Release(CommitFact{})
 
-	st := s.projectAdmitStateFor("/acme")
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.pendingCPU != 0 || st.pendingMem != 0 {
-		t.Errorf("ledger = %d/%d with the feature off, want 0/0 — the inactive path must not reserve",
-			st.pendingCPU, st.pendingMem)
+	if cpu, mem := liveReservationCharge(t, s, ctx, "/acme"); cpu != 0 || mem != 0 {
+		t.Errorf("durable reservations = %d/%d with the feature off, want 0/0 — the inactive path "+
+			"must not reserve", cpu, mem)
 	}
 }
 
@@ -198,8 +192,11 @@ func TestAdmitProjectQuota_NonHolderRPCIsRefused(t *testing.T) {
 // retrying after a timeout never wedges on an error it cannot act on.
 func TestReleaseQuotaLease_UnknownIDIsHarmless(t *testing.T) {
 	s, _ := quotaServer(t, 4, 4096)
-	s.dropQuotaLease("no-such-reservation", CommitFact{})
-	s.dropQuotaLease("", CommitFact{})
+	// Releasing an unknown / empty reservation must be harmless, so a caller retrying a
+	// release after a timeout never wedges.
+	if err := corrosion.ReleaseProjectQuotaReservationRow(context.Background(), s.db, "no-such-reservation"); err != nil {
+		t.Errorf("releasing an unknown reservation: %v", err)
+	}
 }
 
 // TestAdmitProjectQuota_CommittedChargeSurvivesReplicationGap is the regression test
@@ -257,14 +254,11 @@ func TestAdmitProjectQuota_CommittedChargeSurvivesReplicationGap(t *testing.T) {
 	if _, err := s.admitProjectQuota(ctx, "/acme", 1, 128); status.Code(err) != codes.ResourceExhausted {
 		t.Errorf("admit once the workload is visible: got %v, want ResourceExhausted (real usage)", err)
 	}
-	st := s.projectAdmitStateFor("/acme")
-	st.mu.Lock()
-	remaining := len(st.unobserved)
-	st.mu.Unlock()
-	if remaining != 0 {
-		t.Errorf("%d unobserved charge(s) left after the workload became visible, want 0 — "+
-			"the charge must retire on observing ITS OWN workload or the project stays "+
-			"double-charged", remaining)
+	// The committed charge must retire once its own workload is visible, or the project
+	// stays double-charged. SumLiveQuotaReservations applies that rule directly.
+	if cpu, mem := liveReservationCharge(t, s, ctx, "/acme"); cpu != 0 || mem != 0 {
+		t.Errorf("durable charge = %d/%d after the workload became visible, want 0/0 — a "+
+			"committed reservation must retire on observing ITS OWN workload", cpu, mem)
 	}
 }
 
@@ -291,11 +285,8 @@ func TestAdmitProjectQuota_FailedOperationReleasesImmediately(t *testing.T) {
 		r2.Release(CommitFact{})
 	}
 
-	st := s.projectAdmitStateFor("/acme")
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if len(st.unobserved) != 0 {
-		t.Errorf("%d unobserved charge(s) after a failed operation, want 0", len(st.unobserved))
+	if cpu, mem := liveReservationCharge(t, s, ctx, "/acme"); cpu != 0 || mem != 0 {
+		t.Errorf("durable charge = %d/%d after a FAILED operation, want 0/0", cpu, mem)
 	}
 }
 
@@ -472,11 +463,7 @@ func TestAdmitProjectQuota_UnrelatedUsageDoesNotRetireACharge(t *testing.T) {
 			"retire another workload's charge", err)
 	}
 
-	st := s.projectAdmitStateFor("/acme")
-	st.mu.Lock()
-	_, stillHeld := st.unobserved[workloadKey(CommitFact{Workload: "mine", Kind: corrosion.WorkloadVM})]
-	st.mu.Unlock()
-	if !stillHeld {
+	if cpu, _ := liveReservationCharge(t, s, ctx, "/acme"); cpu == 0 {
 		t.Error(`the charge for "mine" was retired by an unrelated workload's arrival`)
 	}
 }
@@ -598,13 +585,13 @@ func TestQuotaLease_LosingTheLeaseDropsTheLedger(t *testing.T) {
 
 	s.renewHeldQuotaLeases(ctx)
 
-	st := s.projectAdmitStateFor("/acme")
-	st.mu.Lock()
-	pending, unobs := st.pendingCPU, len(st.unobserved)
-	st.mu.Unlock()
-	if pending != 0 || unobs != 0 {
-		t.Errorf("ledger after losing the lease = %d pending vCPU / %d unobserved; want 0/0 — "+
-			"charges for an authority we no longer hold only refuse our own requests", pending, unobs)
+	// The charges must SURVIVE. That is the whole point of the row being durable: the
+	// successor counts our outstanding reservations from replicated state, so the
+	// in-flight request can still commit safely. Dropping them here is what previously
+	// let the successor re-admit the same quota.
+	if cpu, _ := liveReservationCharge(t, s, ctx, "/acme"); cpu == 0 {
+		t.Error("outstanding reservations were discarded on losing the lease — a successor " +
+			"would then re-admit the same quota while the original request still commits")
 	}
 }
 
@@ -804,15 +791,16 @@ func TestQuotaLease_RenewalRequiresQuorum(t *testing.T) {
 	}
 }
 
-// TestAdmission_CommitIsFencedWhenAuthorityMoves is the regression test for charges
-// being discarded before the successor could account for them.
+// TestAdmission_HandoffDoesNotAbortButALostReservationDoes pins the fence contract as
+// it now stands, and it is deliberately the INVERSE of what it used to assert.
 //
-// The renewer zeroes the ledger on lease loss. That is only sound if the in-flight
-// request cannot still commit: otherwise the successor admits the same quota (it sees
-// neither the pending reservation nor the unreplicated workload) and the original
-// request finishes on top of it. The fence is what makes the drop safe — a grant must
-// refuse to commit once authority has moved.
-func TestAdmission_CommitIsFencedWhenAuthorityMoves(t *testing.T) {
+// Once reservations are durable rows, an authority handoff is no longer a reason to
+// abort: the successor counts our outstanding reservation from replicated state, so the
+// in-flight request may commit safely. Aborting there would refuse work for no gain.
+//
+// What must still abort is the case where the CHARGE ITSELF is gone — expired or swept —
+// because then nothing is accounting for the quota this request is about to consume.
+func TestAdmission_HandoffDoesNotAbortButALostReservationDoes(t *testing.T) {
 	s, ctx := quotaServer(t, 8, 8192)
 	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
 	if err != nil || holder != s.hostName {
@@ -823,25 +811,57 @@ func TestAdmission_CommitIsFencedWhenAuthorityMoves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
-	defer adm.Release(CommitFact{})
-
-	// While this request is in flight, it is still allowed to commit.
 	if ferr := adm.AllowCommit(ctx); ferr != nil {
-		t.Fatalf("AllowCommit while we still hold authority: %v", ferr)
+		t.Fatalf("AllowCommit while holding authority: %v", ferr)
 	}
 
-	// Authority moves: our lease is gone and a successor holds it.
+	// Authority moves. The reservation row is untouched, so the successor already
+	// accounts for it — this request must still be allowed to finish.
 	if err := s.db.Execute(ctx,
 		`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
 		"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
 		corrosion.QuotaLeaseKey("/acme")); err != nil {
-		t.Fatalf("hand lease to successor: %v", err)
+		t.Fatalf("hand lease over: %v", err)
+	}
+	if ferr := adm.AllowCommit(ctx); ferr != nil {
+		t.Errorf("AllowCommit after a handoff = %v, want nil — the reservation is durable and the "+
+			"successor counts it, so aborting refuses work for nothing", ferr)
 	}
 
+	// Now the charge really is gone (expired, then swept). Committing would consume
+	// quota nothing is accounting for, so this must abort.
+	if err := s.db.Execute(ctx,
+		`UPDATE quota_reservations SET expires_at = ? WHERE project = ?`,
+		"2000-01-01T00:00:00Z", "/acme"); err != nil {
+		t.Fatalf("expire reservation: %v", err)
+	}
 	ferr := adm.AllowCommit(ctx)
 	if status.Code(ferr) != codes.Aborted {
-		t.Fatalf("AllowCommit after authority moved: got %v, want Aborted — an in-flight request "+
-			"must NOT commit once a successor may already have admitted the same quota", ferr)
+		t.Errorf("AllowCommit with the reservation gone: got %v, want Aborted", ferr)
+	}
+	adm.Release(CommitFact{})
+}
+
+// TestAdmission_FenceFailsClosedOnReadError: the fence is a LOCAL read, and a read it
+// cannot complete is not a licence to commit. The previous fence asked the authority over
+// the network and fell OPEN when it could not answer — defeated in exactly the case it
+// existed for.
+func TestAdmission_FenceFailsClosedOnReadError(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	if holder, _, err := s.projectQuotaHolder(ctx, "/acme"); err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+	adm, err := s.admitResources(ctx, "test-host", "/acme", 4, 2048, true)
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	defer adm.Release(CommitFact{})
+
+	// Close the store so the fence's read fails.
+	s.db.Close()
+	if ferr := adm.AllowCommit(ctx); ferr == nil {
+		t.Error("fence allowed the commit when its read FAILED; it must fail closed — an " +
+			"unconfirmable charge is not a confirmed one")
 	}
 }
 
@@ -854,84 +874,6 @@ func TestAdmission_ZeroValueAllowsCommit(t *testing.T) {
 		t.Errorf("zero-value Admission.AllowCommit = %v, want nil", err)
 	}
 	zero.Release(CommitFact{Committed: true, Workload: "x"}) // must not panic
-}
-
-// TestValidateProjectQuotaReservation_AsksTheHolderNotTheClock is the regression test
-// for the routed fence being a copied wall-clock deadline.
-//
-// The caller received the lease's ORIGINAL 30s expiry and never refreshed it, so a
-// healthy create slower than one lease period — an image pull — aborted for nothing,
-// while the holder had been renewing all along. And being wall-clock, skew or a pause
-// after the check could let a write land after the lease really expired. The answer has
-// to come from the holder at commit time.
-func TestValidateProjectQuotaReservation_AsksTheHolderNotTheClock(t *testing.T) {
-	s, ctx := quotaServer(t, 8, 8192)
-	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
-	if err != nil || holder != s.hostName {
-		t.Skipf("not the holder (%q)", holder)
-	}
-
-	// Grant a reservation the way a routed admission does.
-	grant, err := s.admitProjectQuotaLocal(ctx, "/acme", 2, 1024)
-	if err != nil {
-		t.Fatalf("admit: %v", err)
-	}
-	id, err := newReservationID()
-	if err != nil {
-		t.Fatalf("id: %v", err)
-	}
-	s.putQuotaLease(id, grant.Release, "/acme", 2, 1024)
-
-	peer := peerCtxFor(t, s, "caller-node")
-	req := &pb.ValidateProjectQuotaReservationRequest{
-		Sender: "caller-node", Project: "/acme", ReservationId: id,
-	}
-
-	// Still the authority, reservation still held → valid, regardless of how much
-	// wall-clock time a real create would have burned by now.
-	resp, err := s.ValidateProjectQuotaReservation(peer, req)
-	if err != nil || !resp.Valid {
-		t.Fatalf("validate while holding the lease and the reservation: valid=%v err=%v", resp.GetValid(), err)
-	}
-
-	// Authority moves → invalid, and it says where it went.
-	if err := s.db.Execute(ctx,
-		`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
-		"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
-		corrosion.QuotaLeaseKey("/acme")); err != nil {
-		t.Fatalf("hand lease over: %v", err)
-	}
-	resp, err = s.ValidateProjectQuotaReservation(peer, req)
-	if err != nil {
-		t.Fatalf("validate after handoff: %v", err)
-	}
-	if resp.Valid {
-		t.Error("still valid after authority moved — the holder must refuse, or the caller " +
-			"commits against a ledger nobody holds")
-	}
-	if resp.CurrentHolder != "successor" {
-		t.Errorf("CurrentHolder = %q, want successor", resp.CurrentHolder)
-	}
-}
-
-// TestValidateProjectQuotaReservation_UnknownReservationIsInvalid: a reservation that
-// was reaped (its caller died) or already released must not validate — otherwise a
-// straggler could commit against a charge that is no longer held.
-func TestValidateProjectQuotaReservation_UnknownReservationIsInvalid(t *testing.T) {
-	s, ctx := quotaServer(t, 8, 8192)
-	if holder, _, err := s.projectQuotaHolder(ctx, "/acme"); err != nil || holder != s.hostName {
-		t.Skipf("not the holder (%q)", holder)
-	}
-	resp, err := s.ValidateProjectQuotaReservation(peerCtxFor(t, s, "caller-node"),
-		&pb.ValidateProjectQuotaReservationRequest{
-			Sender: "caller-node", Project: "/acme", ReservationId: "never-existed",
-		})
-	if err != nil {
-		t.Fatalf("validate: %v", err)
-	}
-	if resp.Valid {
-		t.Error("an unknown reservation validated; a reaped or already-released charge must not")
-	}
 }
 
 // TestCreateVM_FencedCreateLeavesNothingRunning is the regression test for the fence
@@ -951,16 +893,15 @@ func TestCreateVM_FencedCreateLeavesNothingRunning(t *testing.T) {
 		t.Skipf("not the holder (%q)", holder)
 	}
 
-	// Move authority MID-CREATE, after the domain is defined and started. Pre-moving it
-	// does not exercise the fence at all: the admission would find a remote holder it
-	// cannot consult and fail OPEN, so there would be no grant to fence and the create
-	// would simply succeed (it did, until the mutation check caught it).
+	// Expire the RESERVATION mid-create, after the domain is defined and started. Moving
+	// the lease would no longer abort — durable charges survive a handoff by design — so
+	// the fence is driven by the charge itself going away, which is the case that must
+	// still refuse.
 	s.testHookBeforeSpecCommit = func() {
 		if err := s.db.Execute(ctx,
-			`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
-			"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
-			corrosion.QuotaLeaseKey("/acme")); err != nil {
-			t.Errorf("hand lease over mid-create: %v", err)
+			`UPDATE quota_reservations SET expires_at = ? WHERE project = ?`,
+			"2000-01-01T00:00:00Z", "/acme"); err != nil {
+			t.Errorf("expire reservation mid-create: %v", err)
 		}
 	}
 
@@ -975,7 +916,7 @@ func TestCreateVM_FencedCreateLeavesNothingRunning(t *testing.T) {
 		},
 	})
 	if err == nil {
-		t.Fatal("create succeeded with the quota authority moved away; want a refusal")
+		t.Fatal("create succeeded with its quota reservation gone; want a refusal")
 	}
 
 	// The invariant: no domain, running or defined, and no VM row.
@@ -1023,22 +964,22 @@ func TestUpdateVM_AbortedReconfigureRestartsTheVM(t *testing.T) {
 		t.Fatalf("StartDomain: %v", err)
 	}
 
-	// Move authority AFTER the VM has been stopped, which is the only ordering that
-	// exercises the fence's rollback. The mutation barrier cannot do it — that is
-	// checked before the stop, so the abort lands early and the VM never goes down.
+	// Expire the RESERVATION after the VM has been stopped — the only ordering that
+	// exercises the fence's rollback. The mutation barrier cannot do it (checked before
+	// the stop, so the abort lands early and the VM never goes down), and moving the
+	// lease no longer aborts at all now that charges are durable.
 	s.testHookBeforeSpecCommit = func() {
 		if err := s.db.Execute(ctx,
-			`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
-			"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
-			corrosion.QuotaLeaseKey("/acme")); err != nil {
-			t.Errorf("hand lease over mid-request: %v", err)
+			`UPDATE quota_reservations SET expires_at = ? WHERE project = ?`,
+			"2000-01-01T00:00:00Z", "/acme"); err != nil {
+			t.Errorf("expire reservation mid-request: %v", err)
 		}
 	}
 
 	yes := true
 	_, err = s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "busy", Cpu: 4, AllowRestart: &yes})
 	if err == nil {
-		t.Fatal("reconfigure succeeded with the quota authority moved away mid-request; want a refusal")
+		t.Fatal("reconfigure succeeded with its quota reservation gone mid-request; want a refusal")
 	}
 
 	// THE invariant: the operator asked for reconfigure-with-restart, not a shutdown.
@@ -1073,4 +1014,16 @@ func seedUsableImage(t *testing.T, s *Server, ctx context.Context, name string) 
 		t.Fatalf("stage image file: %v", err)
 	}
 	f.Close()
+}
+
+// liveReservationCharge totals what the DURABLE quota_reservations rows still charge a
+// project. Replaces the old in-memory-ledger assertions: the charge lives in a
+// replicated row now, precisely so it survives an authority handoff.
+func liveReservationCharge(t *testing.T, s *Server, ctx context.Context, project string) (int, int) {
+	t.Helper()
+	cpu, mem, err := corrosion.SumLiveQuotaReservations(ctx, s.db, project)
+	if err != nil {
+		t.Fatalf("SumLiveQuotaReservations: %v", err)
+	}
+	return cpu, mem
 }

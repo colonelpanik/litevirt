@@ -1792,7 +1792,6 @@ service LiteVirt {
     // Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
     rpc AdmitProjectQuota(AdmitProjectQuotaRequest) returns (AdmitProjectQuotaResponse);
     rpc ReleaseProjectQuotaReservation(ReleaseProjectQuotaReservationRequest) returns (google.protobuf.Empty);
-    rpc ValidateProjectQuotaReservation(ValidateProjectQuotaReservationRequest) returns (ValidateProjectQuotaReservationResponse);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);
@@ -2446,22 +2445,7 @@ message ReleaseProjectQuotaReservationRequest {
     string workload_host = 8;
 }
 
-// ValidateProjectQuotaReservation asks the authority, at COMMIT TIME, whether a
-// reservation is still good.
-//
-// This replaces the caller comparing a copied lease expiry against its own clock. Only
-// the holder can answer: it knows whether it still holds the lease (with quorum) and
-// whether the reservation is still in its ledger. No timestamp is exchanged, so
-// renewals are followed automatically and clock skew cannot produce a wrong answer.
-message ValidateProjectQuotaReservationRequest {
-    string sender = 1;
-    string project = 2;
-    string reservation_id = 3;
-}
-message ValidateProjectQuotaReservationResponse {
-    bool valid = 1;
-    string detail = 2;
-    // Set when this node is no longer the authority, so the caller can report where it
-    // went rather than just failing.
-    string current_holder = 3;
-}
+// (ValidateProjectQuotaReservation was removed: reservations are durable rows, so the
+// commit fence is a LOCAL read of replicated state. Asking the authority over the network
+// fell open exactly when authority was being lost, and even a good answer left a gap
+// before the caller's durable write.)

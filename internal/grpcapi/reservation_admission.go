@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -403,16 +404,25 @@ func (s *Server) admitReserved(
 }
 
 // checkHostCapacityBefore is checkHostCapacity against headroom that counts only
-// reservations from operations sorting before opID.
+// reservations from operations sorting before opID — MINUS the host's finite
+// runtime-only load. The DB-derived free figure knows recorded workloads and
+// reservations; it knows nothing about a bounded rogue the runtime inventory can
+// see, so without the subtraction the authoritative host admits against memory
+// something it has already observed is using (see runtimeExtras).
 func (s *Server) checkHostCapacityBefore(ctx context.Context, host string, cpuDelta, memDelta int, opID string) error {
 	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityBefore(ctx, s.db, host, s.capacity, opID)
 	if err != nil {
 		return status.Errorf(codes.Internal, "check host capacity: %v", err)
 	}
-	if ok && (cpuDelta > freeCPU || memDelta > freeMem) {
+	extraCPU, extraMem := s.runtimeExtras(ctx, host)
+	if ok && (cpuDelta > freeCPU-extraCPU || memDelta > freeMem-extraMem) {
+		suffix := ""
+		if extraCPU > 0 || extraMem > 0 {
+			suffix = fmt.Sprintf(", of which %d vCPU/%d MiB is runtime-only load the database does not record", extraCPU, extraMem)
+		}
 		return status.Errorf(codes.ResourceExhausted,
-			"host %s has insufficient free capacity for +%d vCPU/+%d MiB (free: %d vCPU/%d MiB after earlier reservations)",
-			host, cpuDelta, memDelta, freeCPU, freeMem)
+			"host %s has insufficient free capacity for +%d vCPU/+%d MiB (free: %d vCPU/%d MiB after earlier reservations%s)",
+			host, cpuDelta, memDelta, freeCPU-extraCPU, freeMem-extraMem, suffix)
 	}
 	return nil
 }

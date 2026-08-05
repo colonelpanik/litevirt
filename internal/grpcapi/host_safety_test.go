@@ -209,17 +209,67 @@ func TestHostSafety_MemoryUnlimitedRogueBlocksNewResidency(t *testing.T) {
 			"a memory cap of 0 is unbounded in the one dimension host capacity reserves", err)
 	}
 
-	// A finite rogue does not trip the UNCAPPED gate.
+	// A finite rogue does not trip the UNCAPPED gate. (Sized small enough that
+	// its runtime-only CHARGE — which final admission now subtracts from
+	// headroom — leaves room for the control admission below.)
 	s.SetContainerRuntime(&fakeCT{
 		names:  []string{"finite"},
 		states: map[string]string{"finite": "running"},
-		limits: map[string][2]int{"finite": {2, 1024}},
+		limits: map[string][2]int{"finite": {2, 256}},
 	})
 	s.invalidateInventoryCache()
 	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
 		"vm:new-vm", 1, 512, true)
 	if err != nil {
 		t.Fatalf("finite rogue tripped the uncapped gate: %v — bounded consumption is attributable", err)
+	}
+	lease.release(context.Background())
+}
+
+// TestAdmission_FiniteRogueConsumesHeadroom: a BOUNDED runtime-only workload
+// passes the uncapped gate (it is attributable), but its consumption must still
+// come out of the headroom final admission computes. The DB-derived free figure
+// knows nothing about it, so before the subtraction the authoritative host
+// could observe a rogue eating most of its memory — placement correctly
+// avoiding the host — while a pinned create was still admitted against full
+// database headroom.
+func TestAdmission_FiniteRogueConsumesHeadroom(t *testing.T) {
+	origCap := lxcCapable
+	lxcCapable = func() bool { return true }
+	defer func() { lxcCapable = origCap }()
+
+	s := testServer(t)
+	admissionHost(t, s) // allocatable 1536 MiB
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"finite-rogue"},
+		states: map[string]string{"finite-rogue": "running"},
+		limits: map[string][2]int{"finite-rogue": {2, 1024}},
+	})
+	s.invalidateInventoryCache()
+
+	// 512 MiB guest (+overhead) fits 1536 MiB of DB headroom easily — but not
+	// the 512 MiB left once the rogue's 1024 are charged.
+	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:squeezed", 1, 512, true)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("pinned create beside a finite 1024 MiB rogue on a 1536 MiB host: got %v, "+
+			"want ResourceExhausted — runtime-only load must come out of admission headroom", err)
+	}
+
+	// Account the rogue in the DB (at its real size): no longer runtime-only,
+	// so no extra charge — but its DB row itself now consumes, so the same
+	// admission still refuses. Shrink the rogue instead to prove the charge
+	// followed the accounting.
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"finite-rogue"},
+		states: map[string]string{"finite-rogue": "running"},
+		limits: map[string][2]int{"finite-rogue": {2, 256}},
+	})
+	s.invalidateInventoryCache()
+	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:squeezed", 1, 512, true)
+	if err != nil {
+		t.Fatalf("create beside a small finite rogue refused: %v — the charge must scale with the rogue, not blanket-refuse", err)
 	}
 	lease.release(context.Background())
 }

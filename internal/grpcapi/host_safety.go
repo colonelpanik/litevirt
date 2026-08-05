@@ -118,6 +118,54 @@ func (s *Server) checkHostSafety(ctx context.Context, host, workloadKind, worklo
 	return nil
 }
 
+// remoteObservationMaxAge bounds how old a REPLICATED capacity observation may
+// be before runtimeExtras stops trusting its figures. Generous next to the 60s
+// sampler period; a host that has not published for this long is a staleness
+// problem placement's own filter already surfaces.
+const remoteObservationMaxAge = 5 * time.Minute
+
+// runtimeExtras returns host's FINITE runtime-only load — consumption the
+// database does not account for (rogue-but-bounded workloads, a runtime grown
+// past its recorded spec) — so the final admission arithmetic can subtract it
+// from DB-derived headroom. Without this, the authoritative host can OBSERVE a
+// rogue eating half its memory (placement correctly avoids it) and still admit
+// a pinned create against full database headroom.
+//
+// For the local host the figures come from the same freshly-probed inventory
+// the safety gate uses — the replicated observation is never the input to a
+// local decision. For a REMOTE host (the migrate path admits for its target on
+// the source) the replicated observation is the only view there is; a missing
+// or stale one degrades to zero, which is exactly the DB-only arithmetic this
+// function improves on. Errors also degrade to zero rather than refusing: the
+// UNCAPPED/incomplete cases — where degrading would be unsafe — are already
+// refused outright by checkHostSafety before any arithmetic runs.
+func (s *Server) runtimeExtras(ctx context.Context, host string) (cpu, memMiB int) {
+	pos := func(v int) int {
+		if v < 0 {
+			return 0
+		}
+		return v
+	}
+	if host == s.hostName {
+		inv := s.localInventoryCached(ctx)
+		vms, verr := corrosion.ListVMs(ctx, s.db, "", host)
+		cts, cerr := corrosion.ListContainers(ctx, s.db, host)
+		if verr != nil || cerr != nil {
+			return 0, 0
+		}
+		obs := computeCapacityObservation(host, inv, vms, cts)
+		return pos(obs.ExtraCPU), pos(obs.ExtraMemMiB)
+	}
+	obs, ok, err := corrosion.GetHostCapacityObservation(ctx, s.db, host)
+	if err != nil || !ok {
+		return 0, 0
+	}
+	if at, perr := time.Parse(time.RFC3339, obs.SampledAt); perr != nil || time.Since(at) > remoteObservationMaxAge {
+		return 0, 0
+	}
+	return pos(obs.ExtraCPU), pos(obs.ExtraMemMiB)
+}
+
 // workloadDBKnown reports whether a runtime workload has a live DB row on this
 // host — the line between "accounted" and "rogue".
 func (s *Server) workloadDBKnown(ctx context.Context, kind, name string) (bool, error) {

@@ -1792,6 +1792,7 @@ service LiteVirt {
     // Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
     rpc AdmitProjectQuota(AdmitProjectQuotaRequest) returns (AdmitProjectQuotaResponse);
     rpc ReleaseProjectQuotaReservation(ReleaseProjectQuotaReservationRequest) returns (google.protobuf.Empty);
+    rpc ListProjectQuotaReservations(ListProjectQuotaReservationsRequest) returns (ListProjectQuotaReservationsResponse);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);
@@ -2412,6 +2413,12 @@ message AdmitProjectQuotaResponse {
     // an error is set, which would leave the caller unable to follow the redirect and
     // re-resolving from the same stale view that misrouted it.
     bool redirect = 6;
+    // barrier_failed=true means the authority could not make the reservation durable
+    // across the cluster. It is a DISTINCT signal, not just an error: the caller's
+    // generic RPC-error path degrades to an unserialized local check (fail open), which
+    // would admit against a charge no peer can see. This flag makes the refusal
+    // fail CLOSED instead.
+    bool barrier_failed = 10;
     // 9 was lease_valid_until: a copied expiry the caller used as its fence. Wrong in
     // both directions — it did not follow the holder's renewals, so a healthy create
     // slower than one lease period aborted for nothing; and being wall-clock, skew or a
@@ -2449,3 +2456,30 @@ message ReleaseProjectQuotaReservationRequest {
 // commit fence is a LOCAL read of replicated state. Asking the authority over the network
 // fell open exactly when authority was being lost, and even a good answer left a gap
 // before the caller's durable write.)
+
+// ListProjectQuotaReservations lets a node TAKING OVER a project's admission authority
+// drain its voters' reservation state before it admits anything.
+//
+// Copying a reservation into a quorum does not put it in a future authority's local
+// database, and an authority admits from its own replica — so quorum intersection alone
+// only proves SOME voter holds the row. This is how the successor actually gets it.
+message ListProjectQuotaReservationsRequest {
+    string sender = 1;
+    string project = 2;
+}
+message ListProjectQuotaReservationsResponse {
+    repeated ProjectQuotaReservation reservations = 1;
+}
+message ProjectQuotaReservation {
+    string id = 1;
+    string project = 2;
+    string holder = 3;
+    int32 cpu = 4;
+    int32 mem_mib = 5;
+    string state = 6;
+    string workload = 7;
+    string kind = 8;
+    string host = 9;
+    int32 want_cpu = 10;
+    int32 want_mem = 11;
+}

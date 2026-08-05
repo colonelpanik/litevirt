@@ -106,15 +106,99 @@ func TestReplicateReservationBarrier_RequiresQuorumAndRequester(t *testing.T) {
 
 type okBarrier struct{}
 
-func (okBarrier) ReplicateNowTo(context.Context, string) error { return nil }
+func (okBarrier) ReplicateNowTo(context.Context, string, int64) error { return nil }
+func (okBarrier) LatestMutationSeq(context.Context) (int64, error)    { return 7, nil }
 
+// failFor rejects delivery to the named peers, standing in for an unreachable node.
 type failFor []string
 
-func (f failFor) ReplicateNowTo(_ context.Context, peer string) error {
+func (f failFor) ReplicateNowTo(_ context.Context, peer string, _ int64) error {
 	for _, p := range f {
 		if p == peer {
 			return errors.New("unreachable")
 		}
 	}
+	return nil
+}
+func (failFor) LatestMutationSeq(context.Context) (int64, error) { return 7, nil }
+
+// TestReplicateReservationBarrier_PassesARealSequence: the barrier must obtain the local
+// mutation sequence and pass it to every delivery, because that sequence is the ONLY thing
+// that distinguishes "the peer accepted a batch" from "the peer has my reservation".
+// replicateOnce ships a bounded batch, so a peer with a backlog can ack while the entry
+// sits in a later one.
+func TestReplicateReservationBarrier_PassesARealSequence(t *testing.T) {
+	ctx := context.Background()
+	c := mustTestClient(t)
+	for _, h := range []string{"node-a", "node-b"} {
+		if err := InsertHost(ctx, c, HostRecord{
+			Name: h, Address: "10.0.0.1", SSHUser: "root", GRPCPort: 7443,
+			State: "active", Role: "worker", CertSerial: "s-" + h,
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	rec := &recordingBarrier{seq: 42}
+	if err := ReplicateReservationBarrier(ctx, c, rec, "node-a", "node-a"); err != nil {
+		t.Fatalf("barrier: %v", err)
+	}
+	if !rec.askedSeq {
+		t.Error("barrier never asked for the local mutation sequence, so it cannot know what " +
+			"delivery it is waiting for")
+	}
+	for peer, got := range rec.sawSeq {
+		if got != 42 {
+			t.Errorf("delivery to %s carried throughSeq=%d, want 42 — a bounded batch ack is not "+
+				"proof the reservation arrived", peer, got)
+		}
+	}
+	if len(rec.sawSeq) == 0 {
+		t.Error("barrier delivered to no peers")
+	}
+}
+
+// TestHostVotes_MatchesTheQuorumDenominator: the barrier's population and the quorum that
+// elects an authority must be the SAME set. When the barrier counted only "active" hosts,
+// "a quorum holds the row" implied nothing about who could become the authority.
+func TestHostVotes_MatchesTheQuorumDenominator(t *testing.T) {
+	for _, c := range []struct {
+		state string
+		votes bool
+	}{
+		{"active", true},
+		{"draining", true},  // votes but hosts nothing — still in the denominator
+		{"upgrading", true}, // ditto
+		{"offline", false},
+		{"maintenance", false},
+		{"fenced", false},
+	} {
+		if got := HostVotes(HostRecord{State: c.state}); got != c.votes {
+			t.Errorf("HostVotes(state=%q) = %v, want %v — this must mirror "+
+				"health.votingEligible exactly or the barrier and the quorum disagree",
+				c.state, got, c.votes)
+		}
+	}
+	// A witness votes: it can be part of the quorum that elects an authority.
+	if !HostVotes(HostRecord{State: "active", Role: "witness"}) {
+		t.Error("a witness must count as a voter")
+	}
+}
+
+type recordingBarrier struct {
+	seq      int64
+	askedSeq bool
+	sawSeq   map[string]int64
+}
+
+func (r *recordingBarrier) LatestMutationSeq(context.Context) (int64, error) {
+	r.askedSeq = true
+	return r.seq, nil
+}
+
+func (r *recordingBarrier) ReplicateNowTo(_ context.Context, peer string, throughSeq int64) error {
+	if r.sawSeq == nil {
+		r.sawSeq = map[string]int64{}
+	}
+	r.sawSeq[peer] = throughSeq
 	return nil
 }

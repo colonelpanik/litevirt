@@ -311,52 +311,75 @@ func ProjectsWithLiveQuotaReservations(ctx context.Context, c *Client, holder st
 // ReservationBarrier is what a reservation must clear before admission may succeed.
 // Implemented by the replicator; injected so corrosion does not depend on it directly.
 type ReservationBarrier interface {
-	ReplicateNowTo(ctx context.Context, peerName string) error
+	// ReplicateNowTo must not return nil until the peer's watermark covers throughSeq.
+	ReplicateNowTo(ctx context.Context, peerName string, throughSeq int64) error
+	LatestMutationSeq(ctx context.Context) (int64, error)
+}
+
+// QuotaVoters lists the hosts that count for BOTH the reservation barrier and authority
+// quorum. One definition on purpose: when the barrier counted only "active" hosts while
+// the quorum admitted other voting states, the two populations differed and "a quorum has
+// the row" stopped implying anything about who could become the authority.
+//
+// Witnesses are included: they vote, so they can be part of the quorum that elects an
+// authority, and they can hold the row.
+func QuotaVoters(hosts []HostRecord) []string {
+	var out []string
+	for _, h := range hosts {
+		if !HostVotes(h) {
+			continue
+		}
+		out = append(out, h.Name)
+	}
+	return out
 }
 
 // ReplicateReservationBarrier makes a freshly-written reservation VISIBLE before its
 // admission is allowed to succeed.
 //
-// requester is the node that asked for the reservation (empty when the holder is
-// admitting for itself). It must receive the row so its own commit fence reads a present
-// reservation instead of racing replication and aborting a valid request.
+// requester is the node that asked for it (itself when the holder admits for itself). It
+// must receive the row so its own commit fence reads a present reservation instead of
+// racing replication and aborting a valid request.
 //
-// A QUORUM of voting peers must also receive it. That is the property that makes
-// handoff safe rather than hopeful: acquiring the lease requires quorum, so any node that
-// can later become the authority is necessarily in some quorum that has this row. Without
-// it a reservation could live only on the granting node, and a successor on the far side
-// of a partition would admit the same quota.
+// A QUORUM of voters must also receive it. That is necessary but NOT sufficient on its
+// own: copying the row into a quorum does not put it in the local database of a future
+// authority, and a successor admits from its own replica. Quorum intersection only
+// guarantees that SOME voter in the successor's quorum holds it. The other half of the
+// argument is ReconcileProjectQuotaReservations, which a successor runs against its
+// voters before it admits anything — together, "a quorum has it" plus "the successor
+// drains its voters" does give successor visibility.
 //
-// Returns an error when either obligation is unmet. The caller MUST then tombstone the
+// Returns an error when either obligation is unmet. The caller MUST tombstone the
 // reservation and refuse the admission — an un-replicated charge is indistinguishable
 // from no charge.
 func ReplicateReservationBarrier(ctx context.Context, c *Client, b ReservationBarrier, self, requester string) error {
 	if b == nil {
-		// No replicator wired (single-node, or a test harness sharing one store): there
-		// are no peers to be invisible to.
+		// No replicator wired (single-node, or a harness sharing one store): there are no
+		// peers for the row to be invisible to.
 		return nil
+	}
+	throughSeq, err := b.LatestMutationSeq(ctx)
+	if err != nil {
+		return fmt.Errorf("read the local mutation sequence: %w", err)
 	}
 	hosts, err := ListHosts(ctx, c)
 	if err != nil {
 		return fmt.Errorf("list hosts for the reservation barrier: %w", err)
 	}
-	// Voting peers = everything active except ourselves. Witnesses vote, so they count
-	// toward a quorum that could later elect an authority, and they can hold the row.
-	var voters []string
-	for _, h := range hosts {
-		if h.State != "active" || h.Name == self {
-			continue
+	var peers []string
+	for _, name := range QuotaVoters(hosts) {
+		if name != self {
+			peers = append(peers, name)
 		}
-		voters = append(voters, h.Name)
 	}
-	total := len(voters) + 1 // including ourselves, who already has the row
+	total := len(peers) + 1 // including ourselves, who already has the row
 	need := total/2 + 1
 
 	acked := 1 // self
 	var lastErr error
 	requesterOK := requester == "" || requester == self
-	for _, peer := range voters {
-		if perr := b.ReplicateNowTo(ctx, peer); perr != nil {
+	for _, peer := range peers {
+		if perr := b.ReplicateNowTo(ctx, peer, throughSeq); perr != nil {
 			lastErr = perr
 			continue
 		}
@@ -369,8 +392,94 @@ func ReplicateReservationBarrier(ctx context.Context, c *Client, b ReservationBa
 		return fmt.Errorf("reservation not delivered to the requesting node %q: %v", requester, lastErr)
 	}
 	if acked < need {
-		return fmt.Errorf("reservation reached %d/%d nodes, need %d for quorum: %v",
+		return fmt.Errorf("reservation reached %d/%d voters, need %d for quorum: %v",
 			acked, total, need, lastErr)
 	}
 	return nil
+}
+
+// ReservationSource fetches one peer's live reservations for a project. Implemented in
+// grpcapi over a peer RPC; injected to keep the dependency direction intact.
+type ReservationSource interface {
+	FetchProjectQuotaReservations(ctx context.Context, peer, project string) ([]QuotaReservation, error)
+}
+
+// ReconcileProjectQuotaReservations pulls a project's live reservations from every voter
+// into the local replica, and reports whether the local view can be TRUSTED to be
+// complete.
+//
+// This is the successor-side half of the handoff argument, and without it the barrier
+// alone proves nothing about the node that actually admits. A newly-elected authority
+// admits from its OWN database; lease acquisition only established that peers were live,
+// not that this node had drained their reservation state. So C could win a quorum with B,
+// which holds a reservation C has never seen, and start admitting against it.
+//
+// Called once per lease acquisition, not per admission. complete=false means at least one
+// voter could not be consulted, so a reservation may exist that this node cannot see —
+// the caller must NOT admit, because it cannot bound what it would be over-admitting.
+func ReconcileProjectQuotaReservations(ctx context.Context, c *Client, src ReservationSource, self, project string) (complete bool, err error) {
+	if src == nil {
+		return true, nil // no peers to reconcile against
+	}
+	project = projectOrDefault(project)
+	hosts, err := ListHosts(ctx, c)
+	if err != nil {
+		return false, err
+	}
+	complete = true
+	for _, peer := range QuotaVoters(hosts) {
+		if peer == self {
+			continue
+		}
+		rows, ferr := src.FetchProjectQuotaReservations(ctx, peer, project)
+		if ferr != nil {
+			slog.Warn("project quota: could not fetch a voter's reservations while taking over "+
+				"authority; the local view is incomplete", "project", project, "peer", peer, "error", ferr)
+			complete = false
+			continue
+		}
+		for _, r := range rows {
+			if uerr := UpsertQuotaReservation(ctx, c, r); uerr != nil {
+				return false, uerr
+			}
+		}
+	}
+	return complete, nil
+}
+
+// ListLiveProjectQuotaReservations returns a project's live reservation rows, for a peer
+// taking over authority.
+func ListLiveProjectQuotaReservations(ctx context.Context, c *Client, project string) ([]QuotaReservation, error) {
+	project = projectOrDefault(project)
+	rows, err := c.Query(ctx,
+		`SELECT id, project, holder, cpu, mem_mib, state, workload, kind, host, want_cpu, want_mem
+		   FROM quota_reservations
+		  WHERE project = ? AND deleted_at IS NULL AND expires_at > ?`, project, nowRFC3339())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]QuotaReservation, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, QuotaReservation{
+			ID: r.String("id"), Project: r.String("project"), Holder: r.String("holder"),
+			CPU: r.Int("cpu"), MemMiB: r.Int("mem_mib"), State: r.String("state"),
+			Workload: r.String("workload"), Kind: r.String("kind"), Host: r.String("host"),
+			WantCPU: r.Int("want_cpu"), WantMem: r.Int("want_mem"),
+		})
+	}
+	return out, nil
+}
+
+// UpsertQuotaReservation adopts a reservation learned from a peer. INSERT OR IGNORE: a row
+// we already hold is authoritative locally (it may be further along — committed, or
+// tombstoned — and adopting a peer's older copy would resurrect a retired charge).
+func UpsertQuotaReservation(ctx context.Context, c *Client, r QuotaReservation) error {
+	return c.Execute(ctx,
+		`INSERT OR IGNORE INTO quota_reservations
+		 (id, project, holder, cpu, mem_mib, state, workload, kind, host,
+		  want_cpu, want_mem, expires_at, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		r.ID, projectOrDefault(r.Project), r.Holder, r.CPU, r.MemMiB, r.State,
+		r.Workload, r.Kind, r.Host, r.WantCPU, r.WantMem,
+		time.Now().UTC().Add(QuotaReservationTTL).Format(time.RFC3339), nowRFC3339(), c.NowTS())
 }

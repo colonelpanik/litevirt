@@ -21,6 +21,16 @@ import (
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
+// errQuotaBarrierFailed says the reservation could not be made durable across the
+// cluster. It is distinct from a generic error on purpose: the caller's RPC-error path
+// degrades to an unserialized local check, and degrading here would admit against a
+// charge no peer can see. It must propagate FAIL CLOSED.
+type errQuotaBarrierFailed struct{ detail string }
+
+func (e errQuotaBarrierFailed) Error() string {
+	return "project-quota reservation could not be replicated: " + e.detail
+}
+
 // errQuotaAuthorityMoved says this node is no longer the project's authority, and
 // names the successor when one is recorded.
 type errQuotaAuthorityMoved struct{ holder string }
@@ -135,6 +145,12 @@ func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta
 		// Admitting for ourselves: the row is already local, so only the quorum half of
 		// the barrier applies.
 		release, err := s.admitProjectQuotaLocal(ctx, project, cpuDelta, memMiBDelta, s.hostName)
+		var barrier errQuotaBarrierFailed
+		if errors.As(err, &barrier) {
+			return Admission{}, status.Errorf(codes.Unavailable,
+				"project %q: could not replicate the quota reservation, so the request is refused "+
+					"rather than admitted against a charge peers cannot see: %s", project, barrier.detail)
+		}
 		var moved errQuotaAuthorityMoved
 		if errors.As(err, &moved) {
 			if moved.holder != "" && moved.holder != s.hostName {
@@ -209,6 +225,26 @@ func (s *Server) projectQuotaHolder(ctx context.Context, project string) (string
 		return "", 0, err
 	}
 	if held {
+		// We just TOOK OVER. Before admitting anything, drain the voters' reservation
+		// state into our replica.
+		//
+		// The barrier only guarantees that a QUORUM held each reservation — not that WE
+		// do, and we admit from our own database. Quorum intersection says some voter in
+		// our quorum has the row; it does not put it here. Without this step we could
+		// win a quorum with a voter holding a reservation we have never seen and admit
+		// against it. Lease acquisition proves liveness, not state.
+		complete, rerr := corrosion.ReconcileProjectQuotaReservations(ctx, s.db, s.reservationSource(), s.hostName, project)
+		if rerr != nil {
+			return "", 0, rerr
+		}
+		if !complete {
+			// A voter could not be consulted, so a reservation may exist that we cannot
+			// see and we cannot bound what we would over-admit. Refuse to act as the
+			// authority for now; the next attempt retries.
+			slog.Warn("project quota: took the lease but could not drain every voter's "+
+				"reservations; not admitting until the view is complete", "project", project)
+			return "", 0, nil
+		}
 		return s.hostName, 0, nil
 	}
 	// Lost the race (or a concurrent writer won). currentHolder may be empty, in
@@ -316,7 +352,7 @@ func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpu
 	// quota after our lease expires) and to the requesting node's own commit fence
 	// (which would abort a perfectly valid request). Neither is acceptable, so the
 	// admission is not complete until the barrier clears.
-	if berr := corrosion.ReplicateReservationBarrier(ctx, s.db, s.replicator, s.hostName, requester); berr != nil {
+	if berr := corrosion.ReplicateReservationBarrier(ctx, s.db, s.reservationBarrier(), s.hostName, requester); berr != nil {
 		// FAIL CLOSED, and undo: an un-replicated charge is indistinguishable from no
 		// charge, so leaving it behind would refuse future requests for a reservation
 		// nobody can see.
@@ -324,10 +360,7 @@ func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpu
 			slog.Error("project quota: could not roll back an unreplicated reservation; it "+
 				"expires on TTL", "project", project, "reservation", id, "error", rerr)
 		}
-		return Admission{}, status.Errorf(codes.Unavailable,
-			"project %q: could not make the quota reservation durable across the cluster, so the "+
-				"request is refused rather than admitted against a charge peers cannot see: %v",
-			project, berr)
+		return Admission{}, errQuotaBarrierFailed{detail: berr.Error()}
 	}
 	return s.durableAdmission(project, id), nil
 }
@@ -425,6 +458,15 @@ func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epo
 			}
 			return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 				"authority moved to "+resp.CurrentHolder+" and could not be followed", nil)
+		}
+		if resp.BarrierFailed {
+			// FAIL CLOSED. The authority could not make the charge visible to the
+			// cluster, so proceeding would consume quota nothing is accounting for.
+			// Deliberately NOT routed through quotaFailOpen.
+			return Admission{}, status.Errorf(codes.Unavailable,
+				"project %q: the admission authority could not replicate the quota reservation, so "+
+					"the request is refused rather than admitted against a charge peers cannot "+
+					"see: %s", project, resp.Detail)
 		}
 		if !resp.Admitted {
 			return Admission{}, status.Errorf(codes.ResourceExhausted,
@@ -556,6 +598,16 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 		if status.Code(err) == codes.ResourceExhausted {
 			return &pb.AdmitProjectQuotaResponse{Admitted: false, Detail: status.Convert(err).Message()}, nil
 		}
+		var barrier errQuotaBarrierFailed
+		if errors.As(err, &barrier) {
+			// A SUCCESSFUL response carrying barrier_failed. Returned as an error it
+			// would land in the caller's generic RPC-error path, which degrades to an
+			// unserialized local check — admitting against a charge no peer can see,
+			// which is the opposite of what the barrier is for.
+			return &pb.AdmitProjectQuotaResponse{
+				Admitted: false, BarrierFailed: true, Detail: barrier.detail,
+			}, nil
+		}
 		return nil, err
 	}
 	// The id names a REPLICATED row, so the caller's fence is a local read and a
@@ -603,4 +655,93 @@ func newReservationID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// reservationBarrier returns the replication barrier, or a nil INTERFACE when no
+// replicator is wired.
+//
+// Returning s.replicator directly would box a nil *Replicator into a non-nil interface,
+// so the callee's `b == nil` check would miss and the first method call would panic. This
+// is the standard Go trap and it cost a test panic to notice.
+func (s *Server) reservationBarrier() corrosion.ReservationBarrier {
+	if s.replicator == nil {
+		return nil
+	}
+	return s.replicator
+}
+
+// reservationSource lets a taking-over authority pull peers' reservations. Returns nil
+// when there is no replicator wired (single node / shared-store harness), which
+// ReconcileProjectQuotaReservations reads as "no peers to reconcile against".
+func (s *Server) reservationSource() corrosion.ReservationSource {
+	if s.replicator == nil {
+		return nil
+	}
+	return peerReservationSource{s: s}
+}
+
+type peerReservationSource struct{ s *Server }
+
+func (p peerReservationSource) FetchProjectQuotaReservations(ctx context.Context, peer, project string) ([]corrosion.QuotaReservation, error) {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	client, conn, err := p.s.peerClient(cctx, peer)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	resp, err := client.ListProjectQuotaReservations(cctx, &pb.ListProjectQuotaReservationsRequest{
+		Sender: p.s.hostName, Project: project,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]corrosion.QuotaReservation, 0, len(resp.Reservations))
+	for _, r := range resp.Reservations {
+		out = append(out, corrosion.QuotaReservation{
+			ID: r.Id, Project: r.Project, Holder: r.Holder,
+			CPU: int(r.Cpu), MemMiB: int(r.MemMib), State: r.State,
+			Workload: r.Workload, Kind: r.Kind, Host: r.Host,
+			WantCPU: int(r.WantCpu), WantMem: int(r.WantMem),
+		})
+	}
+	return out, nil
+}
+
+// ListProjectQuotaReservations serves this node's live reservations for a project to a
+// peer taking over its admission authority. Peer-only.
+func (s *Server) ListProjectQuotaReservations(ctx context.Context, req *pb.ListProjectQuotaReservationsRequest) (*pb.ListProjectQuotaReservationsResponse, error) {
+	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
+		return nil, err
+	}
+	rows, err := corrosion.ListLiveProjectQuotaReservations(ctx, s.db, tenancy.NormalizeProject(req.Project))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list reservations: %v", err)
+	}
+	out := &pb.ListProjectQuotaReservationsResponse{}
+	for _, r := range rows {
+		out.Reservations = append(out.Reservations, &pb.ProjectQuotaReservation{
+			Id: r.ID, Project: r.Project, Holder: r.Holder,
+			Cpu: int32(r.CPU), MemMib: int32(r.MemMiB), State: r.State,
+			Workload: r.Workload, Kind: r.Kind, Host: r.Host,
+			WantCpu: int32(r.WantCPU), WantMem: int32(r.WantMem),
+		})
+	}
+	return out, nil
+}
+
+// admitProjectQuotaRemoteForTest exposes the response-handling half of the routed path so
+// a test can pin that a barrier refusal is NOT degraded into a fail-open admission.
+func (s *Server) admitProjectQuotaRemoteForTest(ctx context.Context, resp *pb.AdmitProjectQuotaResponse, project string) (Admission, error) {
+	if resp.BarrierFailed {
+		return Admission{}, status.Errorf(codes.Unavailable,
+			"project %q: the admission authority could not replicate the quota reservation, so the "+
+				"request is refused rather than admitted against a charge peers cannot see: %s",
+			project, resp.Detail)
+	}
+	if !resp.Admitted {
+		return Admission{}, status.Errorf(codes.ResourceExhausted,
+			"project %q quota exceeded: %s", project, resp.Detail)
+	}
+	return s.durableAdmission(project, resp.ReservationId), nil
 }

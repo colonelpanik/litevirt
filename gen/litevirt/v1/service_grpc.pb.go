@@ -50,6 +50,7 @@ const (
 	LiteVirt_ReportRuntime_FullMethodName                  = "/litevirt.v1.LiteVirt/ReportRuntime"
 	LiteVirt_AdmitProjectQuota_FullMethodName              = "/litevirt.v1.LiteVirt/AdmitProjectQuota"
 	LiteVirt_ReleaseProjectQuotaReservation_FullMethodName = "/litevirt.v1.LiteVirt/ReleaseProjectQuotaReservation"
+	LiteVirt_ListProjectQuotaReservations_FullMethodName   = "/litevirt.v1.LiteVirt/ListProjectQuotaReservations"
 	LiteVirt_CheckVIPParticipant_FullMethodName            = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
 	LiteVirt_RelayCheckVIPParticipant_FullMethodName       = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
 	LiteVirt_CheckLBPresent_FullMethodName                 = "/litevirt.v1.LiteVirt/CheckLBPresent"
@@ -291,6 +292,7 @@ type LiteVirtClient interface {
 	// Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
 	AdmitProjectQuota(ctx context.Context, in *AdmitProjectQuotaRequest, opts ...grpc.CallOption) (*AdmitProjectQuotaResponse, error)
 	ReleaseProjectQuotaReservation(ctx context.Context, in *ReleaseProjectQuotaReservationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ListProjectQuotaReservations(ctx context.Context, in *ListProjectQuotaReservationsRequest, opts ...grpc.CallOption) (*ListProjectQuotaReservationsResponse, error)
 	CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error)
@@ -915,6 +917,16 @@ func (c *liteVirtClient) ReleaseProjectQuotaReservation(ctx context.Context, in 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_ReleaseProjectQuotaReservation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListProjectQuotaReservations(ctx context.Context, in *ListProjectQuotaReservationsRequest, opts ...grpc.CallOption) (*ListProjectQuotaReservationsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListProjectQuotaReservationsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListProjectQuotaReservations_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3119,6 +3131,7 @@ type LiteVirtServer interface {
 	// Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
 	AdmitProjectQuota(context.Context, *AdmitProjectQuotaRequest) (*AdmitProjectQuotaResponse, error)
 	ReleaseProjectQuotaReservation(context.Context, *ReleaseProjectQuotaReservationRequest) (*emptypb.Empty, error)
+	ListProjectQuotaReservations(context.Context, *ListProjectQuotaReservationsRequest) (*ListProjectQuotaReservationsResponse, error)
 	CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error)
@@ -3505,6 +3518,9 @@ func (UnimplementedLiteVirtServer) AdmitProjectQuota(context.Context, *AdmitProj
 }
 func (UnimplementedLiteVirtServer) ReleaseProjectQuotaReservation(context.Context, *ReleaseProjectQuotaReservationRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseProjectQuotaReservation not implemented")
+}
+func (UnimplementedLiteVirtServer) ListProjectQuotaReservations(context.Context, *ListProjectQuotaReservationsRequest) (*ListProjectQuotaReservationsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListProjectQuotaReservations not implemented")
 }
 func (UnimplementedLiteVirtServer) CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckVIPParticipant not implemented")
@@ -4602,6 +4618,24 @@ func _LiteVirt_ReleaseProjectQuotaReservation_Handler(srv interface{}, ctx conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ReleaseProjectQuotaReservation(ctx, req.(*ReleaseProjectQuotaReservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListProjectQuotaReservations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListProjectQuotaReservationsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListProjectQuotaReservations(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListProjectQuotaReservations_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListProjectQuotaReservations(ctx, req.(*ListProjectQuotaReservationsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7969,6 +8003,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseProjectQuotaReservation",
 			Handler:    _LiteVirt_ReleaseProjectQuotaReservation_Handler,
+		},
+		{
+			MethodName: "ListProjectQuotaReservations",
+			Handler:    _LiteVirt_ListProjectQuotaReservations_Handler,
 		},
 		{
 			MethodName: "CheckVIPParticipant",

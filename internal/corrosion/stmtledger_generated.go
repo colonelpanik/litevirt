@@ -8,6 +8,7 @@ package corrosion
 var stmtLedger = map[string]LedgerEntry{
 	"stmtshape/v1:004d45c86f1d3a7f376ee96f374688ea068f826323f4456a45ccf43de8573224": {Fingerprint: "stmtshape/v1:004d45c86f1d3a7f376ee96f374688ea068f826323f4456a45ccf43de8573224", Kind: "delete", Table: "container_restarts", Disposition: DispDeleteRetention},
 	"stmtshape/v1:00b397c858b8d1e855d761456564ff4bb839b8e8d48dfba5ebee5922a1d195a2": {Fingerprint: "stmtshape/v1:00b397c858b8d1e855d761456564ff4bb839b8e8d48dfba5ebee5922a1d195a2", Kind: "update", Table: "quota_reservations", Disposition: DispFullPKUpdate},
+	"stmtshape/v1:0185d3fcb32258f18c31a116dfe8a3bab5c730cb9471ced9900d4253c46cc47c": {Fingerprint: "stmtshape/v1:0185d3fcb32258f18c31a116dfe8a3bab5c730cb9471ced9900d4253c46cc47c", Kind: "insert", Table: "quota_reservations", Disposition: DispPlainInsert},
 	"stmtshape/v1:019510689058975c142c0e51c95ffd8d70fce1a6d24af3277505b7e892c4434b": {Fingerprint: "stmtshape/v1:019510689058975c142c0e51c95ffd8d70fce1a6d24af3277505b7e892c4434b", Kind: "update", Table: "vm_nics", Disposition: DispFullPKUpdate},
 	"stmtshape/v1:01b7a6f0df0d2405f27fd8aebf11ce5fd3b5230396842a0c1c5738fc7969716b": {Fingerprint: "stmtshape/v1:01b7a6f0df0d2405f27fd8aebf11ce5fd3b5230396842a0c1c5738fc7969716b", Kind: "update", Table: "operation_steps", Disposition: DispCustomMerge},
 	"stmtshape/v1:025e0ef4943d9c34fc711fc349de23185d0e58add227ba8618cbd50e890580ae": {Fingerprint: "stmtshape/v1:025e0ef4943d9c34fc711fc349de23185d0e58add227ba8618cbd50e890580ae", Kind: "insert", Table: "tokens", Disposition: DispPlainInsert},

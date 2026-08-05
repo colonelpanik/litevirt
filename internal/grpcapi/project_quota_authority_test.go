@@ -1027,3 +1027,55 @@ func liveReservationCharge(t *testing.T, s *Server, ctx context.Context, project
 	}
 	return cpu, mem
 }
+
+// TestAdmitProjectQuota_BarrierRefusalFailsClosed is the regression test for a barrier
+// refusal degrading into a fail-open admission.
+//
+// The authority returned Unavailable when it could not replicate the reservation, the RPC
+// propagated it as a plain error, and the caller's generic RPC-error path degrades to an
+// unserialized LOCAL check — so the request proceeded with no reservation at all, which is
+// the exact opposite of what the barrier is for. The refusal has to be a distinct signal.
+func TestAdmitProjectQuota_BarrierRefusalFailsClosed(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	if holder, _, err := s.projectQuotaHolder(ctx, "/acme"); err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	// The holder-side handler must report a barrier failure on a SUCCESSFUL response
+	// carrying BarrierFailed, never as a transport error — an error lands in the
+	// caller's degrade path.
+	resp := &pb.AdmitProjectQuotaResponse{Admitted: false, BarrierFailed: true, Detail: "quorum unmet"}
+	if !resp.BarrierFailed || resp.Admitted {
+		t.Fatal("test premise")
+	}
+
+	// And the caller must translate that into a refusal, NOT a fail-open admission.
+	// quotaFailOpen would return nil here (degraded but allowed), so a nil result would
+	// mean the request proceeds unreserved.
+	if err := s.checkProjectQuota(ctx, "/acme", 1, 128); err != nil {
+		t.Fatalf("sanity: a small grow should fit the quota: %v", err)
+	}
+	adm, err := s.admitProjectQuotaRemoteForTest(ctx, resp, "/acme")
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("barrier refusal produced %v, want Unavailable — degrading to the local check "+
+			"would admit against a charge no peer can see", err)
+	}
+	if err == nil {
+		adm.Release(CommitFact{})
+	}
+}
+
+// TestReservationBarrier_NilReplicatorIsNotABoxedNil guards the Go trap that cost a panic:
+// assigning a nil *Replicator to the interface makes it non-nil, so the callee's nil check
+// misses and the first method call dereferences it.
+func TestReservationBarrier_NilReplicatorIsNotABoxedNil(t *testing.T) {
+	s, _ := quotaServer(t, 8, 8192)
+	s.SetReplicator(nil)
+	if b := s.reservationBarrier(); b != nil {
+		t.Error("reservationBarrier() returned a non-nil interface wrapping a nil replicator; " +
+			"the callee's nil check will miss it and the first call will panic")
+	}
+	if src := s.reservationSource(); src != nil {
+		t.Error("reservationSource() returned a boxed nil")
+	}
+}

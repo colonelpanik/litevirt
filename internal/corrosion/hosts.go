@@ -322,3 +322,19 @@ func UpdateHostResources(ctx context.Context, c *Client, name string, cpu, mem, 
 		cpu, mem, disk, c.NowTS(), name,
 	)
 }
+
+// HostVotes reports whether a host counts as a live voting member.
+//
+// It MIRRORS the quorum denominator used by failover.countLiveHosts and
+// health.votingEligible: everything except offline/maintenance/fenced, witnesses
+// INCLUDED. Keeping one predicate matters — the quota reservation barrier previously
+// counted only "active" hosts while the quorum that elects an authority admitted other
+// voting states, so "a quorum holds the row" said nothing about who could become the
+// authority. The populations must be the same set or the intersection argument is empty.
+func HostVotes(h HostRecord) bool {
+	switch h.State {
+	case "offline", "maintenance", "fenced":
+		return false
+	}
+	return true
+}

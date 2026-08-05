@@ -1984,19 +1984,57 @@ func insertRowFromShape(sh StmtShape, s Statement) (cols []string, vals []interf
 }
 
 // ReplicateNowTo pushes this node's pending mutation log to one peer SYNCHRONOUSLY and
-// reports whether the peer accepted it.
+// does not return success until the peer's watermark COVERS throughSeq.
 //
 // The background replicator is asynchronous and only notified, which is fine for
-// convergence but not for a write whose VISIBILITY is a precondition — a durable
-// quota reservation is useless to a successor, or to the requesting node's own commit
-// fence, until it has actually arrived. This is the primitive those barriers need.
+// convergence but not for a write whose VISIBILITY is a precondition — a durable quota
+// reservation is useless to a successor, or to the requesting node's own commit fence,
+// until it has actually arrived.
 //
-// Pushing the whole pending log rather than one row is deliberate: replication here is
-// watermark-ordered, so a peer cannot receive a later entry without the earlier ones. It
-// is idempotent, so calling it out-of-band costs at most duplicate work.
-func (r *Replicator) ReplicateNowTo(ctx context.Context, peerName string) error {
-	if _, err := r.replicateOnce(ctx, peerName); err != nil {
-		return err
+// The loop is the point. replicateOnce ships at most replicateBatchSize entries, so on a
+// peer with a backlog the entry we care about can sit in a LATER batch while the call
+// returns cleanly — reporting delivery of something that has not been delivered. Only the
+// watermark answers the actual question, so we push until it passes throughSeq or the
+// context deadline expires.
+//
+// Pushing the whole pending log rather than one row is deliberate: replication is
+// watermark-ordered, so a peer cannot receive a later entry without the earlier ones.
+// Idempotent, so calling it out-of-band costs at most duplicate work.
+func (r *Replicator) ReplicateNowTo(ctx context.Context, peerName string, throughSeq int64) error {
+	for {
+		wm, err := r.getWatermark(ctx, peerName)
+		if err != nil {
+			return fmt.Errorf("read watermark for %s: %w", peerName, err)
+		}
+		if wm >= throughSeq {
+			return nil
+		}
+		sent, err := r.replicateOnce(ctx, peerName)
+		if err != nil {
+			return err
+		}
+		if sent == 0 {
+			// Nothing moved and the watermark still does not cover the entry: pushing
+			// again cannot help, so report the truth rather than spinning.
+			wm, werr := r.getWatermark(ctx, peerName)
+			if werr == nil && wm >= throughSeq {
+				return nil
+			}
+			return fmt.Errorf("peer %s stalled at watermark %d, need %d", peerName, wm, throughSeq)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("delivering to %s: %w", peerName, err)
+		}
 	}
-	return nil
+}
+
+// LatestMutationSeq is the sequence of the most recent local mutation-log entry. A caller
+// that has just written takes this as the point its write must be replicated THROUGH.
+func (r *Replicator) LatestMutationSeq(ctx context.Context) (int64, error) {
+	r.client.mu.RLock()
+	defer r.client.mu.RUnlock()
+	var seq int64
+	err := r.client.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(seq), 0) FROM mutation_log`).Scan(&seq)
+	return seq, err
 }

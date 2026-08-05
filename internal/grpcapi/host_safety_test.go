@@ -181,6 +181,49 @@ func TestVIPSafety_DualRunFreezesLBChange_NotPlacement(t *testing.T) {
 	lease.release(context.Background())
 }
 
+// TestHostSafety_MemoryUnlimitedRogueBlocksNewResidency: unboundedness is per
+// the dimension that matters. A runtime-only container with a CPU limit but NO
+// memory cap is memory-unlimited — the old cpu==0 && mem==0 classification
+// called it bounded, charged it 0 MiB, and let a pinned create through beside
+// consumption that capacity accounting cannot bound. A FINITE rogue (both
+// limits set) is attributable and must NOT trip this gate (its charging is the
+// effective-capacity model's job, not the uncapped gate's).
+func TestHostSafety_MemoryUnlimitedRogueBlocksNewResidency(t *testing.T) {
+	origCap := lxcCapable
+	lxcCapable = func() bool { return true }
+	defer func() { lxcCapable = origCap }()
+
+	s := testServer(t)
+	admissionHost(t, s)
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"memless"},
+		states: map[string]string{"memless": "running"},
+		limits: map[string][2]int{"memless": {2, 0}}, // CPU-limited, memory-unlimited
+	})
+	s.invalidateInventoryCache()
+
+	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, true)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("new workload beside a memory-unlimited rogue: got %v, want FailedPrecondition — "+
+			"a memory cap of 0 is unbounded in the one dimension host capacity reserves", err)
+	}
+
+	// A finite rogue does not trip the UNCAPPED gate.
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"finite"},
+		states: map[string]string{"finite": "running"},
+		limits: map[string][2]int{"finite": {2, 1024}},
+	})
+	s.invalidateInventoryCache()
+	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, true)
+	if err != nil {
+		t.Fatalf("finite rogue tripped the uncapped gate: %v — bounded consumption is attributable", err)
+	}
+	lease.release(context.Background())
+}
+
 // TestPlacement_RefusesUnknownCapacity: an incomplete or stale capacity
 // observation disqualifies the host as a placement target; a missing one does
 // not (bootstrap), and extra runtime-only usage counts against headroom.

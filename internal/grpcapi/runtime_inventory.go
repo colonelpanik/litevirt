@@ -163,7 +163,16 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 				fail("container %s limits: %v", n, err)
 			} else {
 				w.CPU, w.MemoryMiB = cpu, mem
-				w.Uncapped = cpu == 0 && mem == 0
+				// Uncapped is per the dimension that matters. MEMORY is the only
+				// host-reservable container dimension (cpu_limit is cgroup shares,
+				// not a vCPU reservation — host capacity never counts it), so a
+				// container with no memory cap is unbounded in the dimension
+				// capacity accounting cares about, whatever its CPU shares say.
+				// The old cpu==0 && mem==0 form classified a cpu-limited,
+				// memory-unlimited container as bounded: it was charged 0 MiB,
+				// left the observation Complete, and slid past the rogue gate —
+				// unbounded consumption counted as zero.
+				w.Uncapped = mem == 0
 			}
 			w.OwnerEpochMarker, w.MarkerStatus = s.readContainerMarker(n)
 			if w.MarkerStatus == MarkerUnreadable {

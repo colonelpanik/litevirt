@@ -763,13 +763,18 @@ type fakeCT struct {
 	names   []string
 	listErr error
 	states  map[string]string
+	// limits maps name → {cpu, memMiB}; absent means 0/0 (fully unlimited).
+	limits map[string][2]int
 }
 
 func (f *fakeCT) ListContainers(context.Context) ([]string, error) { return f.names, f.listErr }
 func (f *fakeCT) StateContainer(_ context.Context, n string) (string, error) {
 	return f.states[n], nil
 }
-func (f *fakeCT) ContainerLimits(context.Context, string) (int, int, error) { return 0, 0, nil }
+func (f *fakeCT) ContainerLimits(_ context.Context, n string) (int, int, error) {
+	l := f.limits[n]
+	return l[0], l[1], nil
+}
 
 // TestLocalRuntimeSnapshot_NonLXCHost_NotPartial: on a host without lxc-* tooling the CT
 // probe is skipped entirely — a "lxc-ls not found" error must NOT mark the snapshot partial

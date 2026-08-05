@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
@@ -174,5 +175,52 @@ func TestFleet_RestoreContainer_FenceAbortsOnMidFlightAuthorityMove(t *testing.T
 
 	if err := restoreContainerAt(t, c, dst, repo, "ct-backed", ts); err != nil {
 		t.Fatalf("container restore with a stable authority: %v", err)
+	}
+}
+
+// TestFleet_UpdateVM_FenceAbortRestartsTheVM: --restart-if-needed stops a
+// RUNNING VM to redefine it, so a commit-fence refusal (or any post-stop
+// failure) must bring the VM back up on its previous definition. The old abort
+// path rolled back the domain XML and returned — a VM the operator explicitly
+// asked to keep running stayed down because a quota authority moved.
+func TestFleet_UpdateVM_FenceAbortRestartsTheVM(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	owner, other := c.Nodes[0], c.Nodes[1]
+	moveAuthority := fenceSetup(t, c, "tenant", owner, other)
+
+	if _, err := runProjectVM(t, c, owner, "vm-upd", owner.Name, 1, 512, "tenant"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if st, err := owner.Virt.DomainState("vm-upd"); err != nil || st != "running" {
+		t.Fatalf("setup: vm-upd state=%q err=%v, want running", st, err)
+	}
+
+	allow := true
+	owner.Server.SetCommitFenceHook(moveAuthority)
+	_, err := c.SelfClient(owner).UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "vm-upd", Cpu: 2, AllowRestart: &allow,
+	})
+	owner.Server.SetCommitFenceHook(nil)
+	if status.Code(err) != codes.Aborted {
+		t.Fatalf("reconfigure whose quota authority moved mid-flight: got %v, want Aborted", err)
+	}
+	// The obligation: the VM is RUNNING again, on its previous definition.
+	if st, serr := owner.Virt.DomainState("vm-upd"); serr != nil || st != "running" {
+		t.Fatalf("after the aborted reconfigure vm-upd state=%q err=%v, want running — "+
+			"a VM the operator asked to keep running must not stay down because the reconfigure refused", st, serr)
+	}
+	if vm, _ := corrosion.GetVM(ctx, owner.DB, "vm-upd"); vm == nil || vm.CPUActual != 1 {
+		t.Fatalf("aborted reconfigure changed the stored size: %+v", vm)
+	}
+
+	// Control: the same reconfigure commits and restarts once nothing moves.
+	if _, err := c.SelfClient(owner).UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "vm-upd", Cpu: 2, AllowRestart: &allow,
+	}); err != nil {
+		t.Fatalf("reconfigure with a stable authority: %v", err)
+	}
+	if st, serr := owner.Virt.DomainState("vm-upd"); serr != nil || st != "running" {
+		t.Fatalf("after the successful reconfigure vm-upd state=%q err=%v, want running", st, serr)
 	}
 }

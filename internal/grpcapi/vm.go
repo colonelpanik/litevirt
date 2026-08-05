@@ -819,13 +819,18 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// already have admitted the same quota against a view that cannot contain this
 	// grant, so this VM must not be recorded. Nothing durable exists yet, so a
 	// refusal here costs only a retry — the running domain is torn down like any
-	// other post-start failure.
+	// other post-start failure, INCLUDING its disks, cloud-init ISO, and firmware
+	// state: UndefineDomainPreservingState deliberately keeps nvram/swtpm, so
+	// without the explicit wipe (and cleanupDisks) an aborted create strands
+	// exactly the orphans the start-failure path above already cleans.
 	if ferr := createLease.allowCommit(ctx); ferr != nil {
 		if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
 			slog.Warn("vm create: teardown after an aborted admission also failed",
 				"name", spec.Name, "error", derr)
 		}
-		_ = s.virt.UndefineDomainPreservingState(spec.Name)
+		_ = s.virt.UndefineDomain(spec.Name, false)
+		cleanupDisks()
+		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr
 	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
@@ -2987,6 +2992,27 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			vm = fresh
 			vm.State = "stopped"
 			restartAfter = true
+			// The stop creates an OBLIGATION, not just a step: the operator asked
+			// --restart-if-needed for a RUNNING VM, so every failure return between
+			// here and the success-path restart (capability checks, XML generation,
+			// redefine, the commit fence, the spec persist) must bring the VM back
+			// up on whatever definition it was rolled back to — a VM the operator
+			// asked to keep running must not stay down because a reconfigure step
+			// (or a quota authority handoff) refused. The success path clears the
+			// flag before its own restart, so this fires only on the abort routes;
+			// if the restart itself also fails, say so plainly.
+			defer func() {
+				if !restartAfter {
+					return
+				}
+				if _, serr := s.startVMLocked(ctx, vm); serr != nil {
+					slog.Error("reconfigure aborted and the restart after it ALSO failed — VM left stopped, manual start needed",
+						"vm", req.Name, "error", serr)
+					s.recordVMEvent(ctx, req.Name, "vm.restart", "error", "reconfigure aborted; restart failed: "+serr.Error())
+					return
+				}
+				s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "reconfigure aborted; VM restarted on its previous definition")
+			}()
 		}
 		if !restartAfter {
 			// The VM is ALREADY stopped, so the branch above (which admits) was
@@ -3299,7 +3325,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 
 	// FENCE before the durable write; see CreateVM. On a refusal the domain is
-	// rolled back to its previous definition, exactly as a failed write below is.
+	// rolled back to its previous definition, exactly as a failed write below is
+	// — and the deferred --restart-if-needed recovery restarts the VM on it.
+	s.fireCommitFenceHook("UpdateVM")
 	if ferr := updLease.allowCommit(ctx); ferr != nil {
 		if oldXML != "" {
 			_ = s.virt.UndefineDomainPreservingState(req.Name)
@@ -3339,7 +3367,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 
 	// --restart-if-needed: bring the VM back up through the shared start primitive
 	// (still holding the VM lock taken above), completing the stop → redefine → start.
+	// The flag is cleared FIRST so the deferred abort-recovery above cannot
+	// double-start (or retry a start that just failed with the reason attached).
 	if restartAfter {
+		restartAfter = false
 		if _, serr := s.startVMLocked(ctx, vm); serr != nil {
 			return nil, status.Errorf(codes.Internal, "reconfigured %q but restart failed (VM left stopped): %v", req.Name, serr)
 		}

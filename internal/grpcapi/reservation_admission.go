@@ -148,6 +148,26 @@ func (l *reservationLease) allowCommit(ctx context.Context) error {
 	return nil
 }
 
+// releaseQuota frees ONLY the delegated project-quota half, leaving the local
+// operation row alone. For the one path where the local reservation's op id IS
+// the workload operation (resize): the workload op goes terminal via
+// CompleteVMOperation (or stays nonterminal for recovery), but the quota lease
+// on the holder is a SEPARATE row there that nothing else ever terminates — a
+// full release() would wrongly terminate the workload op, and no release at
+// all leaves the holder counting a lease forever, permanently shrinking the
+// project's usable quota. Idempotent, like release.
+func (l *reservationLease) releaseQuota(ctx context.Context) {
+	if l == nil || l.s == nil {
+		return
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	if id := l.quotaLease; id != "" {
+		l.quotaLease = ""
+		l.s.releaseProjectQuota(rctx, l.quotaHolder, l.quotaProject, id)
+	}
+}
+
 // release marks the reservation's operation terminal, freeing the capacity.
 // Idempotent, and safe on the empty lease returned for a no-op admission.
 func (l *reservationLease) release(ctx context.Context) {

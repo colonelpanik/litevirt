@@ -192,6 +192,24 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	if aerr != nil {
 		return aerr
 	}
+	// One cleanup discipline for every return. Before BeginVMOperation commits,
+	// the WHOLE lease is freed — including the two early error returns below,
+	// which previously leaked it. After the commit, only the delegated QUOTA
+	// half: the local op row is the workload operation itself (terminated by
+	// CompleteVMOperation, or left nonterminal for recovery), but the holder's
+	// quota lease is a separate row nothing else terminates — the success path
+	// previously never released it, so every delegated resize permanently
+	// consumed project quota as an eternal earlier claimant. Releasing it
+	// post-commit is sound: the desired spec is durably committed at the new
+	// size, and the settle rule holds the charge until usage reflects it.
+	committed := false
+	defer func() {
+		if committed {
+			lease.releaseQuota(ctx)
+			return
+		}
+		lease.release(ctx)
+	}()
 
 	resJSON, err := (corrosion.ReservationVector{
 		Project: vm.Project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
@@ -219,21 +237,19 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	}
 	// FENCE before BeginVMOperation commits the desired spec; see CreateVM.
 	if ferr := lease.allowCommit(ctx); ferr != nil {
-		lease.release(ctx)
 		return ferr
 	}
 	applied, err := s.db.BeginVMOperation(ctx, op, string(targetJSON), vm.OwnerEpoch, vm.SpecGeneration)
 	if err != nil {
-		lease.release(ctx)
 		if errors.Is(err, corrosion.ErrOperationHashConflict) {
 			return status.Errorf(codes.AlreadyExists, "idempotency key reused with a different resize for %q", vm.Name)
 		}
 		return status.Errorf(codes.Internal, "begin operation: %v", err)
 	}
 	if !applied {
-		lease.release(ctx)
 		return status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress or the VM changed underneath", vm.Name)
 	}
+	committed = true
 	newGen := vm.SpecGeneration + 1
 	return s.driveResourceUpdate(ctx, vm, op.ID, vm.OwnerEpoch, newGen, target, stored, obsCPU, obsMem)
 }

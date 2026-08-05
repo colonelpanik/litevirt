@@ -175,3 +175,41 @@ func TestPlacement_RefusesUnknownCapacity(t *testing.T) {
 			snap.CPUUsed["h-fresh"], snap.MemUsed["h-fresh"])
 	}
 }
+
+// TestHostSafety_UncappedRogueBlocksNewResidency: an uncapped RUNTIME-ONLY
+// container makes the host's consumption unattributable, so a pinned create
+// must refuse exactly like the placement filter does — while a DB-known
+// uncapped container (deliberately unlimited, accounted) does not block.
+func TestHostSafety_UncappedRogueBlocksNewResidency(t *testing.T) {
+	origCap := lxcCapable
+	lxcCapable = func() bool { return true }
+	defer func() { lxcCapable = origCap }()
+
+	s := testServer(t)
+	admissionHost(t, s)
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"rogue"},
+		states: map[string]string{"rogue": "running"},
+	})
+	s.invalidateInventoryCache()
+
+	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, true)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("new workload beside an uncapped rogue: got %v, want FailedPrecondition", err)
+	}
+
+	// Account the container in the DB: no longer a rogue, admission opens.
+	if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
+		HostName: "test-host", Name: "rogue", State: "running",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	s.invalidateInventoryCache()
+	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, true)
+	if err != nil {
+		t.Fatalf("DB-accounted uncapped container still blocks: %v", err)
+	}
+	lease.release(context.Background())
+}

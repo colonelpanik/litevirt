@@ -84,8 +84,12 @@ func (s *Server) checkHostSafety(ctx context.Context, host, workloadKind, worklo
 	}
 
 	// A NEW workload may only land on a host whose own runtime inventory is
-	// COMPLETE right now. Local truth, freshly probed — placement filters on
-	// the replicated observation, but the final admission never trusts it.
+	// COMPLETE right now — and whose consumption is fully ATTRIBUTABLE. Local
+	// truth, freshly probed: placement filters on the replicated observation,
+	// but the final admission never trusts it. An UNCAPPED runtime-only
+	// container is the attributability hole: it consumes unbounded resources
+	// capacity accounting cannot charge, so the host's headroom is unknowable
+	// and a pinned create must not slip past the placement filter.
 	if newWorkload && host == s.hostName {
 		inv := s.localInventoryCached(ctx)
 		if !inv.Complete {
@@ -94,8 +98,35 @@ func (s *Server) checkHostSafety(ctx context.Context, host, workloadKind, worklo
 					"a host that cannot account for what it runs cannot accept more",
 				host, strings.Join(inv.Errors, "; "))
 		}
+		for _, w := range inv.Workloads {
+			if !w.Uncapped {
+				continue
+			}
+			known, kerr := s.workloadDBKnown(ctx, w.Kind, w.Name)
+			if kerr != nil {
+				return status.Errorf(codes.Unavailable,
+					"cannot verify runtime workload %q before admitting: %v", w.Name, kerr)
+			}
+			if !known {
+				return status.Errorf(codes.FailedPrecondition,
+					"refusing new workload on host %q: uncapped runtime-only container %q makes its "+
+						"capacity unattributable — remove or limit it first; see `lv health`",
+					host, w.Name)
+			}
+		}
 	}
 	return nil
+}
+
+// workloadDBKnown reports whether a runtime workload has a live DB row on this
+// host — the line between "accounted" and "rogue".
+func (s *Server) workloadDBKnown(ctx context.Context, kind, name string) (bool, error) {
+	if kind == corrosion.WorkloadContainer {
+		ct, err := corrosion.GetContainer(ctx, s.db, s.hostName, name)
+		return ct != nil, err
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, name)
+	return vm != nil, err
 }
 
 // checkVIPSafety gates VIP/LB OWNERSHIP changes on active VIP dual-run

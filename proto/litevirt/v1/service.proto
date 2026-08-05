@@ -1792,6 +1792,7 @@ service LiteVirt {
     // Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
     rpc AdmitProjectQuota(AdmitProjectQuotaRequest) returns (AdmitProjectQuotaResponse);
     rpc ReleaseProjectQuotaReservation(ReleaseProjectQuotaReservationRequest) returns (google.protobuf.Empty);
+    rpc ValidateProjectQuotaReservation(ValidateProjectQuotaReservationRequest) returns (ValidateProjectQuotaReservationResponse);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);
@@ -2412,11 +2413,12 @@ message AdmitProjectQuotaResponse {
     // an error is set, which would leave the caller unable to follow the redirect and
     // re-resolving from the same stale view that misrouted it.
     bool redirect = 6;
-    // The holder's lease expiry, RFC3339. The caller treats it as a FENCING DEADLINE:
-    // a successor cannot acquire the lease until it expires, so a durable write
-    // strictly before this instant is still covered by this holder's ledger. After it,
-    // the caller must abort rather than commit against a ledger nobody holds.
-    string lease_valid_until = 9;
+    // 9 was lease_valid_until: a copied expiry the caller used as its fence. Wrong in
+    // both directions — it did not follow the holder's renewals, so a healthy create
+    // slower than one lease period aborted for nothing; and being wall-clock, skew or a
+    // pause after the check could let a write land after the lease really expired.
+    // Replaced by ValidateProjectQuotaReservation, asked at commit time.
+    reserved 9;
     string current_holder = 4;
     int64 current_epoch = 5;
 }
@@ -2442,4 +2444,24 @@ message ReleaseProjectQuotaReservationRequest {
     // still owed.
     string kind = 7;
     string workload_host = 8;
+}
+
+// ValidateProjectQuotaReservation asks the authority, at COMMIT TIME, whether a
+// reservation is still good.
+//
+// This replaces the caller comparing a copied lease expiry against its own clock. Only
+// the holder can answer: it knows whether it still holds the lease (with quorum) and
+// whether the reservation is still in its ledger. No timestamp is exchanged, so
+// renewals are followed automatically and clock skew cannot produce a wrong answer.
+message ValidateProjectQuotaReservationRequest {
+    string sender = 1;
+    string project = 2;
+    string reservation_id = 3;
+}
+message ValidateProjectQuotaReservationResponse {
+    bool valid = 1;
+    string detail = 2;
+    // Set when this node is no longer the authority, so the caller can report where it
+    // went rather than just failing.
+    string current_holder = 3;
 }

@@ -760,6 +760,16 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
 
+	// FENCE #1, before the domain exists. This is the last point where abandoning is
+	// FREE — only disks and firmware state to undo, exactly as a define failure does.
+	// It matters because the expensive part of a create (the image pull) is behind us,
+	// and that is where a lease handoff is actually likely.
+	if ferr := vmAdmission.AllowCommit(ctx); ferr != nil {
+		cleanupDisks()
+		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+		return nil, ferr
+	}
+
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanupDisks()
@@ -838,11 +848,29 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *p
 		Project:   project, // tenancy label
 	}
 
-	// FENCE, immediately before the durable write: if project-quota authority moved
-	// while this create was in flight, the successor may already have admitted the same
-	// quota, so this VM must not be recorded. Nothing is committed yet, so a refusal
-	// here costs only a retry.
+	if s.testHookBeforeSpecCommit != nil {
+		s.testHookBeforeSpecCommit()
+	}
+	// FENCE #2, immediately before the durable write, catching a handoff during
+	// define+start. A refusal here is NOT free: the domain is defined and RUNNING, so
+	// returning an error without tearing it down would strand a live VM with no
+	// cluster-state row — untracked, unmanaged, and worse than the quota overrun the
+	// fence exists to prevent. Tear it down exactly as the start-failure path does.
 	if err := vmAdmission.AllowCommit(ctx); err != nil {
+		slog.Error("project-quota authority moved while creating; destroying the started VM "+
+			"rather than leaving it untracked", "vm", spec.Name, "error", err)
+		if state, _ := s.virt.DomainState(spec.Name); state == "running" {
+			if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
+				slog.Error("aborted create: destroying the domain FAILED — a running VM is now "+
+					"untracked and needs manual cleanup", "vm", spec.Name, "error", derr)
+			}
+		}
+		if uerr := s.virt.UndefineDomain(spec.Name, false); uerr != nil {
+			slog.Warn("aborted create: undefining the domain failed", "vm", spec.Name, "error", uerr)
+		}
+		cleanupDisks()
+		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+		s.audit(ctx, "vm.create", spec.Name, "aborted: project-quota authority moved mid-create", "error")
 		return nil, err
 	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
@@ -3285,10 +3313,25 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 	// half-applied firmware update). MutateDesiredSpec persists the desired spec and
 	// bumps spec_generation; UpdateObservedActuals then records the stopped VM's new
 	// cpu/mem actuals against that generation so a later start boots the right size.
+	if s.testHookBeforeSpecCommit != nil {
+		s.testHookBeforeSpecCommit()
+	}
 	if ferr := updAdmission.AllowCommit(ctx); ferr != nil {
 		if oldXML != "" {
 			_ = s.virt.UndefineDomainPreservingState(req.Name)
 			_ = s.virt.DefineDomain(oldXML)
+		}
+		// --restart-if-needed STOPPED the VM to get here. Restoring the old definition
+		// is not enough: returning now would leave a VM the operator asked to keep
+		// running in a stopped state, purely because a quota authority moved. Put it
+		// back up, and say so plainly if that also fails.
+		if restartAfter {
+			if _, serr := s.startVMLocked(ctx, vm); serr != nil {
+				return nil, status.Errorf(codes.Internal,
+					"update aborted (%v) and the restart also failed, so %q is LEFT STOPPED at its "+
+						"previous configuration: %v", ferr, req.Name, serr)
+			}
+			s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "restored after an aborted reconfigure")
 		}
 		return nil, ferr
 	}
@@ -3305,12 +3348,26 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (resp *p
 			_ = s.virt.UndefineDomainPreservingState(req.Name)
 			_ = s.virt.DefineDomain(oldXML)
 		}
+		// Pre-existing gap, same class as the fence rollback above: --restart-if-needed
+		// stopped the VM to get here, and rolling the DEFINITION back left it stopped.
+		// The operator asked for a reconfigure-with-restart, not a shutdown, so a failed
+		// persist must still bring it back at its previous configuration.
+		restartNote := ""
+		if restartAfter {
+			if _, serr := s.startVMLocked(ctx, vm); serr != nil {
+				restartNote = fmt.Sprintf("; the restart also failed so %q is LEFT STOPPED: %v", req.Name, serr)
+			} else {
+				s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "restored after a failed reconfigure")
+			}
+		}
 		if err != nil {
 			return nil, status.Errorf(codes.Internal,
-				"persist updated spec for %q failed; rolled the domain back to its previous definition: %v", req.Name, err)
+				"persist updated spec for %q failed; rolled the domain back to its previous definition%s: %v",
+				req.Name, restartNote, err)
 		}
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"cannot update VM %q: an operation is in progress; rolled the domain back to its previous definition", req.Name)
+			"cannot update VM %q: an operation is in progress; rolled the domain back to its previous definition%s",
+			req.Name, restartNote)
 	}
 	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, req.Name, int(spec.Cpu), int(spec.MemoryMib), -1, newGen); err != nil {
 		// Spec is authoritative and already persisted; a stale stopped-VM actual is a

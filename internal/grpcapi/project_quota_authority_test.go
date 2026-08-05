@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -852,4 +854,223 @@ func TestAdmission_ZeroValueAllowsCommit(t *testing.T) {
 		t.Errorf("zero-value Admission.AllowCommit = %v, want nil", err)
 	}
 	zero.Release(CommitFact{Committed: true, Workload: "x"}) // must not panic
+}
+
+// TestValidateProjectQuotaReservation_AsksTheHolderNotTheClock is the regression test
+// for the routed fence being a copied wall-clock deadline.
+//
+// The caller received the lease's ORIGINAL 30s expiry and never refreshed it, so a
+// healthy create slower than one lease period — an image pull — aborted for nothing,
+// while the holder had been renewing all along. And being wall-clock, skew or a pause
+// after the check could let a write land after the lease really expired. The answer has
+// to come from the holder at commit time.
+func TestValidateProjectQuotaReservation_AsksTheHolderNotTheClock(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	// Grant a reservation the way a routed admission does.
+	grant, err := s.admitProjectQuotaLocal(ctx, "/acme", 2, 1024)
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	id, err := newReservationID()
+	if err != nil {
+		t.Fatalf("id: %v", err)
+	}
+	s.putQuotaLease(id, grant.Release, "/acme", 2, 1024)
+
+	peer := peerCtxFor(t, s, "caller-node")
+	req := &pb.ValidateProjectQuotaReservationRequest{
+		Sender: "caller-node", Project: "/acme", ReservationId: id,
+	}
+
+	// Still the authority, reservation still held → valid, regardless of how much
+	// wall-clock time a real create would have burned by now.
+	resp, err := s.ValidateProjectQuotaReservation(peer, req)
+	if err != nil || !resp.Valid {
+		t.Fatalf("validate while holding the lease and the reservation: valid=%v err=%v", resp.GetValid(), err)
+	}
+
+	// Authority moves → invalid, and it says where it went.
+	if err := s.db.Execute(ctx,
+		`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
+		"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
+		corrosion.QuotaLeaseKey("/acme")); err != nil {
+		t.Fatalf("hand lease over: %v", err)
+	}
+	resp, err = s.ValidateProjectQuotaReservation(peer, req)
+	if err != nil {
+		t.Fatalf("validate after handoff: %v", err)
+	}
+	if resp.Valid {
+		t.Error("still valid after authority moved — the holder must refuse, or the caller " +
+			"commits against a ledger nobody holds")
+	}
+	if resp.CurrentHolder != "successor" {
+		t.Errorf("CurrentHolder = %q, want successor", resp.CurrentHolder)
+	}
+}
+
+// TestValidateProjectQuotaReservation_UnknownReservationIsInvalid: a reservation that
+// was reaped (its caller died) or already released must not validate — otherwise a
+// straggler could commit against a charge that is no longer held.
+func TestValidateProjectQuotaReservation_UnknownReservationIsInvalid(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	if holder, _, err := s.projectQuotaHolder(ctx, "/acme"); err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+	resp, err := s.ValidateProjectQuotaReservation(peerCtxFor(t, s, "caller-node"),
+		&pb.ValidateProjectQuotaReservationRequest{
+			Sender: "caller-node", Project: "/acme", ReservationId: "never-existed",
+		})
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if resp.Valid {
+		t.Error("an unknown reservation validated; a reaped or already-released charge must not")
+	}
+}
+
+// TestCreateVM_FencedCreateLeavesNothingRunning is the regression test for the fence
+// stranding a live VM.
+//
+// The fence originally sat AFTER DefineDomain+StartDomain and returned a bare error, so
+// a refusal left a running VM with no cluster-state row: untracked, unmanaged, and worse
+// than the quota overrun the fence exists to prevent.
+//
+// Here the project's authority moves before the create can commit, so the fence must
+// refuse — and must leave no domain behind.
+func TestCreateVM_FencedCreateLeavesNothingRunning(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	s.virt = libvirtfake.New()
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	// Move authority MID-CREATE, after the domain is defined and started. Pre-moving it
+	// does not exercise the fence at all: the admission would find a remote holder it
+	// cannot consult and fail OPEN, so there would be no grant to fence and the create
+	// would simply succeed (it did, until the mutation check caught it).
+	s.testHookBeforeSpecCommit = func() {
+		if err := s.db.Execute(ctx,
+			`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
+			"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
+			corrosion.QuotaLeaseKey("/acme")); err != nil {
+			t.Errorf("hand lease over mid-create: %v", err)
+		}
+	}
+
+	// A USABLE image, or the create dies at the image pull long before the fence and
+	// this test silently asserts nothing (it did, until the mutation check caught it).
+	seedUsableImage(t, s, ctx, "img")
+
+	_, err = s.CreateVM(ctx, &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "fenced", Project: "/acme", Image: "img", Cpu: 2, MemoryMib: 1024,
+			Placement: &pb.PlacementSpec{Host: "test-host"},
+		},
+	})
+	if err == nil {
+		t.Fatal("create succeeded with the quota authority moved away; want a refusal")
+	}
+
+	// The invariant: no domain, running or defined, and no VM row.
+	if s.virt.DomainExists("fenced") {
+		state, _ := s.virt.DomainState("fenced")
+		t.Errorf("a domain for %q still exists (state=%q) after an aborted create — an untracked "+
+			"VM is worse than the over-admission the fence prevents", "fenced", state)
+	}
+	if rec, _ := corrosion.GetVM(ctx, s.db, "fenced"); rec != nil {
+		t.Errorf("VM row exists after an aborted create: %+v", rec)
+	}
+}
+
+// TestUpdateVM_AbortedReconfigureRestartsTheVM is the regression test for a
+// --restart-if-needed update leaving the VM stopped.
+//
+// That path STOPS the running VM, redefines it, then persists. Both abort routes —
+// the quota fence and a failed/deferred spec persist — rolled the domain DEFINITION back
+// and returned, leaving a VM the operator asked to keep running in a stopped state. The
+// restart only happened on the success path.
+//
+// Driven through the mutation barrier (active_operation_id set ⇒ the persist is deferred,
+// applied=false), which is deterministic. The fence route uses the identical restart
+// block immediately above it — the obligation is shared, so pinning one pins the
+// contract for both.
+func TestUpdateVM_AbortedReconfigureRestartsTheVM(t *testing.T) {
+	s, ctx := quotaServer(t, 64, 65536)
+	s.virt = libvirtfake.New()
+	holder, _, err := s.projectQuotaHolder(ctx, "/acme")
+	if err != nil || holder != s.hostName {
+		t.Skipf("not the holder (%q)", holder)
+	}
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "busy", HostName: s.hostName, State: "running", Project: "/acme",
+		CPUActual: 2, MemActual: 1024,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "busy", Project: "/acme", Cpu: 2, MemoryMib: 1024}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>busy</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+	if err := s.virt.StartDomain("busy"); err != nil {
+		t.Fatalf("StartDomain: %v", err)
+	}
+
+	// Move authority AFTER the VM has been stopped, which is the only ordering that
+	// exercises the fence's rollback. The mutation barrier cannot do it — that is
+	// checked before the stop, so the abort lands early and the VM never goes down.
+	s.testHookBeforeSpecCommit = func() {
+		if err := s.db.Execute(ctx,
+			`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
+			"successor", time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
+			corrosion.QuotaLeaseKey("/acme")); err != nil {
+			t.Errorf("hand lease over mid-request: %v", err)
+		}
+	}
+
+	yes := true
+	_, err = s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "busy", Cpu: 4, AllowRestart: &yes})
+	if err == nil {
+		t.Fatal("reconfigure succeeded with the quota authority moved away mid-request; want a refusal")
+	}
+
+	// THE invariant: the operator asked for reconfigure-with-restart, not a shutdown.
+	// An aborted update must not leave the VM down.
+	state, serr := s.virt.DomainState("busy")
+	if serr != nil {
+		t.Fatalf("DomainState: %v", serr)
+	}
+	if state != "running" {
+		t.Errorf("VM state = %q after an ABORTED --restart-if-needed reconfigure, want running — "+
+			"the path stopped it to redefine, so every abort route owes it a restart (got error: %v)",
+			state, err)
+	}
+}
+
+// seedUsableImage registers an image and stages its file so CreateVM gets past the
+// image-pull step.
+func seedUsableImage(t *testing.T, s *Server, ctx context.Context, name string) {
+	t.Helper()
+	if err := s.db.Execute(ctx,
+		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+		 VALUES (?, 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`,
+		name); err != nil {
+		t.Fatalf("seed image row: %v", err)
+	}
+	path := s.ImagePathForTests(name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir image dir: %v", err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("stage image file: %v", err)
+	}
+	f.Close()
 }

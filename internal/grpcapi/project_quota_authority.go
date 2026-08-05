@@ -546,36 +546,89 @@ func (s *Server) admitProjectQuotaRemote(ctx context.Context, holder string, epo
 				"project %q quota exceeded: %s", project, resp.Detail)
 		}
 		id := resp.ReservationId
-		// The holder's lease deadline is our fence. A successor cannot acquire until
-		// that lease EXPIRES, so any commit strictly before it is still covered by the
-		// holder's ledger. After it, we cannot know whether authority moved, so we
-		// abort rather than commit against a ledger nobody is holding.
-		validUntil := time.Time{}
-		if resp.LeaseValidUntil != "" {
-			if t, perr := time.Parse(time.RFC3339, resp.LeaseValidUntil); perr == nil {
-				validUntil = t
-			}
-		}
 		return Admission{
 			// The committed flag has to reach the holder: on a commit it must KEEP the
 			// charge until it can see the workload, since the target host wrote the row
 			// and replication has not delivered it here yet.
 			release: func(f CommitFact) { s.releaseRemoteQuota(holder, id, f) },
-			fence: func(context.Context) error {
-				if validUntil.IsZero() {
-					return nil // holder predates the fence; nothing to enforce
-				}
-				if !time.Now().UTC().Before(validUntil) {
-					return status.Errorf(codes.Aborted,
-						"project-quota reservation for %q expired with its holder's lease before "+
-							"this request could commit; nothing was committed — retry", project)
-				}
-				return nil
+			// ASK the holder at commit time; never compare a copied expiry against our
+			// own clock. A copied deadline was wrong in both directions: it did not
+			// follow the holder's renewals, so a healthy create slower than one lease
+			// period (an image pull) aborted for nothing; and being wall-clock, skew or
+			// a pause after the check could let a write land after the lease had really
+			// expired. Only the holder knows whether it still holds the lease AND still
+			// has the reservation.
+			fence: func(fctx context.Context) error {
+				return s.validateRemoteQuotaReservation(fctx, holder, project, id)
 			},
 		}, nil
 	}
 	return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta,
 		"authority epoch kept moving", nil)
+}
+
+// validateRemoteQuotaReservation is the routed commit fence: one RPC to the authority
+// immediately before the durable write.
+//
+// A failure to REACH the holder is not treated as "invalid". Quota is a tenancy limit,
+// and refusing a create that is otherwise complete because of a transient RPC error
+// would be a worse outage than the over-admission it prevents — the same fail-open
+// reasoning as admission itself. It is logged and audited so it is never silent.
+func (s *Server) validateRemoteQuotaReservation(ctx context.Context, holder, project, id string) error {
+	if id == "" {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	client, conn, err := s.peerClient(cctx, holder)
+	if err != nil {
+		slog.Warn("project quota: could not reach the authority to validate a reservation before "+
+			"committing; proceeding", "project", project, "holder", holder, "error", err)
+		return nil
+	}
+	defer conn.Close()
+	resp, err := client.ValidateProjectQuotaReservation(cctx, &pb.ValidateProjectQuotaReservationRequest{
+		Sender: s.hostName, Project: project, ReservationId: id,
+	})
+	if err != nil {
+		slog.Warn("project quota: reservation validation call failed; proceeding",
+			"project", project, "holder", holder, "error", err)
+		return nil
+	}
+	if resp.Valid {
+		return nil
+	}
+	return status.Errorf(codes.Aborted,
+		"project-quota reservation for %q is no longer valid at %s (%s); nothing was committed — retry",
+		project, holder, resp.Detail)
+}
+
+// ValidateProjectQuotaReservation answers whether a reservation is still good. Peer-only.
+func (s *Server) ValidateProjectQuotaReservation(ctx context.Context, req *pb.ValidateProjectQuotaReservationRequest) (*pb.ValidateProjectQuotaReservationResponse, error) {
+	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
+		return nil, err
+	}
+	project := tenancy.NormalizeProject(req.Project)
+
+	held, currentHolder, err := s.holdsQuotaLease(ctx, project)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read project authority: %v", err)
+	}
+	if !held {
+		return &pb.ValidateProjectQuotaReservationResponse{
+			Valid: false, Detail: "no longer the admission authority for this project",
+			CurrentHolder: currentHolder,
+		}, nil
+	}
+	s.quotaLeaseMu.Lock()
+	_, ok := s.quotaLeases[req.ReservationId]
+	s.quotaLeaseMu.Unlock()
+	if !ok {
+		return &pb.ValidateProjectQuotaReservationResponse{
+			Valid: false, Detail: "reservation expired or already released", CurrentHolder: s.hostName,
+		}, nil
+	}
+	return &pb.ValidateProjectQuotaReservationResponse{Valid: true, CurrentHolder: s.hostName}, nil
 }
 
 func (s *Server) releaseRemoteQuota(holder, id string, f CommitFact) {
@@ -676,13 +729,8 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 		return nil, status.Errorf(codes.Internal, "mint reservation id: %v", err)
 	}
 	s.putQuotaLease(id, grant.Release, project, int(req.CpuDelta), int(req.MemMibDelta))
-	validUntil := ""
-	if until, ok, lerr := corrosion.ProjectQuotaLeaseValidUntil(ctx, s.db, project); lerr == nil && ok {
-		validUntil = until.Format(time.RFC3339)
-	}
 	return &pb.AdmitProjectQuotaResponse{
 		Admitted: true, ReservationId: id, CurrentHolder: s.hostName,
-		LeaseValidUntil: validUntil,
 	}, nil
 }
 

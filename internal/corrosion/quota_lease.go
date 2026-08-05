@@ -129,23 +129,3 @@ func ProjectQuotaLeaseHolder(ctx context.Context, c *Client, project string) (ho
 	}
 	return h, true, nil
 }
-
-// ProjectQuotaLeaseValidUntil returns the current lease's expiry, if it is live. The
-// holder hands this to a routed caller as a FENCING DEADLINE: a successor cannot
-// acquire until the lease expires, so a commit strictly before it is still covered by
-// this holder's ledger, and a commit after it must not proceed unchecked.
-func ProjectQuotaLeaseValidUntil(ctx context.Context, c *Client, project string) (time.Time, bool, error) {
-	rows, err := c.Query(ctx,
-		`SELECT expires_at FROM leader_election WHERE key = ?`, QuotaLeaseKey(project))
-	if err != nil {
-		return time.Time{}, false, err
-	}
-	if len(rows) == 0 {
-		return time.Time{}, false, nil
-	}
-	t, perr := time.Parse(time.RFC3339, rows[0].String("expires_at"))
-	if perr != nil || !time.Now().UTC().Before(t) {
-		return time.Time{}, false, nil
-	}
-	return t, true, nil
-}

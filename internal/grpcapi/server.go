@@ -151,6 +151,13 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// testHookBeforeSpecCommit is a test seam: when non-nil it runs immediately before
+	// the reconfigure path's commit fence. Production leaves it nil. It exists because
+	// the fence's whole point is a handoff that happens AFTER the VM has been stopped,
+	// and there is no other way to move authority mid-request from a test — without it
+	// the abort lands before the stop and the test silently asserts nothing.
+	testHookBeforeSpecCommit func()
+
 	// probeHolder is a test seam for the Phase-2 VIP takeover check: when non-nil it
 	// replaces the real fresh-probe of a peer holder's (reachable, supports, assigned)
 	// state. Production leaves it nil.

@@ -247,7 +247,8 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRecord, error) {
 	sql := `SELECT name, stack_name, host_name, spec, state, state_detail,
 		cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
-		COALESCE(is_template, 0) AS is_template, created_at, updated_at
+		COALESCE(is_template, 0) AS is_template,
+		COALESCE(vm_owner_epoch, 0) AS vm_owner_epoch, created_at, updated_at
 		FROM vms WHERE deleted_at IS NULL`
 	var params []interface{}
 
@@ -285,6 +286,12 @@ func scanVMRow(r Row) VMRecord {
 		MemActual:   r.Int("mem_actual"),
 		Project:     r.String("project"),
 		IsTemplate:  r.Int("is_template") == 1,
+		// OwnerEpoch rides the list read because the dual-run detector's DB
+		// index is built from ListVMs. Omitting it made every epoched running
+		// VM read as marker-vs-0 and page a false owner_epoch_mismatch — a bug
+		// the LAB caught, not the unit tests: the fixture VMs happened to be
+		// epoch 0, so marker 0 == "missing epoch" 0 and nothing fired.
+		OwnerEpoch:  r.Int64("vm_owner_epoch"),
 		CreatedAt:   r.String("created_at"),
 		UpdatedAt:   r.String("updated_at"),
 	}

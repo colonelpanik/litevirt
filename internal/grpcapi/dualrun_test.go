@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/metrics"
@@ -993,5 +994,42 @@ func TestConditionLifecycle_EvaluatorStatusRecordsCoverage(t *testing.T) {
 	sts, _ = corrosion.ListHealthEvaluatorStatus(ctx, s.db)
 	if sts[0].Coverage != corrosion.CoverageComplete {
 		t.Fatalf("coverage = %q after a full gather, want complete", sts[0].Coverage)
+	}
+}
+
+// TestEpochMismatch_ValidEqualMarkerDoesNotFire is the false-positive
+// regression the LAB caught: with owner_epoch_v1 latched, a VM running on its
+// DB owner with a VALID marker EQUAL to the row's epoch must raise nothing.
+// The detector's DB index is built from ListVMs, which did not select
+// vm_owner_epoch — so every epoched VM compared marker N against 0 and paged.
+func TestEpochMismatch_ValidEqualMarkerDoesNotFire(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.OwnerEpochV1: true}})
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+	if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vmA'`); err != nil {
+		t.Fatalf("stamp epoch: %v", err)
+	}
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 9, status: MarkerValid}}},
+		"h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if lc := condLifecycle(s, kindEpochMismatch, "vmA"); lc != "" {
+		t.Fatalf("valid equal marker raised owner_epoch_mismatch (lifecycle %q) — the ListVMs epoch column regression", lc)
+	}
+
+	// Control: an UNEQUAL marker on the owner does fire and confirms.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 4, status: MarkerValid}}},
+		"h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindEpochMismatch, "vmA") {
+		t.Fatal("an unequal marker on the DB owner must confirm owner_epoch_mismatch")
 	}
 }

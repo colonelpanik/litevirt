@@ -366,14 +366,24 @@ func snapshotFromInventory(inv runtimeInventory) runtimeSnapshot {
 		kernelVIPs:     inv.KernelVIPs,
 		unresolvedTies: inv.UnresolvedTies,
 		partial:        !inv.Complete,
+		vmMarkers:      map[string]markerInfo{},
+		ctMarkers:      map[string]markerInfo{},
 	}
 	for _, w := range inv.Workloads {
 		switch {
 		case w.Kind == corrosion.WorkloadVM && w.DiskHolder:
 			snap.diskHolderVMs = append(snap.diskHolderVMs, w.Name)
+			snap.vmMarkers[w.Name] = markerInfo{epoch: w.OwnerEpochMarker, status: w.MarkerStatus}
 		case w.Kind == corrosion.WorkloadContainer && w.State == health.RuntimeRunning:
 			snap.runningCTs = append(snap.runningCTs, w.Name)
+			snap.ctMarkers[w.Name] = markerInfo{epoch: w.OwnerEpochMarker, status: w.MarkerStatus}
 		}
 	}
 	return snap
+}
+
+// markerInfo is one running workload's owner-epoch marker as its host reported it.
+type markerInfo struct {
+	epoch  int64
+	status string
 }

@@ -784,10 +784,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetOwnerEpochEnforce(d.cfg.Enforcement.OwnerEpoch)
 	svc.SetIsolationEpochEnforce(d.cfg.Enforcement.IsolationEpoch)
 	svc.SetOwnerEpochReady(func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		ok, err := corrosion.OwnerEpochBackfillComplete(ctx, d.db, d.cfg.HostName)
-		return err == nil && ok
+		ready, reason := svc.OwnerEpochReadiness(ctx)
+		if !ready {
+			slog.Debug("owner_epoch_v1 readiness withheld", "reason", reason)
+		}
+		return ready
 	})
 	// Once the whole cluster has latched audit_signature_v1, a write this node
 	// cannot sign is an error-level event rather than a normal one.

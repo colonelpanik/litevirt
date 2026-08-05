@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -26,6 +27,7 @@ const (
 	kindOwnerMismatch   = "ha.owner.mismatch"   // the DB owner is not the sole runtime holder
 	kindLWWUnresolved   = "ha.lww.unresolved"   // a node is tracking unresolved LWW ties
 	kindDualRunCoverage = "ha.dualrun.coverage" // a workload-capable host could not be probed
+	kindEpochMismatch   = "ha.owner.epoch_mismatch" // the owner's runtime marker disagrees with its DB epoch
 )
 
 // dualRunLeaseKey elects the single node that runs the detector, so a fleet-wide
@@ -74,6 +76,10 @@ type runtimeSnapshot struct {
 	runningCTs     []string
 	kernelVIPs     []string // bare IPs (prefix stripped) so cross-host grouping is consistent
 	unresolvedTies int
+	// Owner-epoch markers for RUNNING workloads (nil in fixtures that predate
+	// them — the epoch check simply cannot evaluate those hosts).
+	vmMarkers map[string]markerInfo
+	ctMarkers map[string]markerInfo
 	// partial is true when ANY local probe errored (libvirt list/state, container
 	// list/state, LB-config read, or the `ip` dump). Positive holders are still real, but
 	// ABSENCE is unreliable: the leader must not treat a partial snapshot as absence proof
@@ -263,7 +269,7 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	}
 
 	// DB view for the owner-mismatch cutover-lag exclusion.
-	vmState, vmOwner := s.dbVMIndex(ctx)
+	vmState, vmOwner, vmEpoch := s.dbVMIndex(ctx)
 
 	current := map[finding]bool{}
 	details := map[finding]string{}
@@ -346,6 +352,35 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 			"host %q returned a PARTIAL runtime (a local libvirt/container/ip probe errored) — its workload absence is unreliable, so split-brain cannot be ruled out there.", h), h)
 	}
 
+	// 7. OWNER-EPOCH MISMATCH, active only once owner_epoch_v1 is latched (before
+	//    that, markers legitimately do not exist). Judged on the DB OWNER's runtime
+	//    only — a non-owner running the workload is already conditions 1/2/4. A
+	//    marker that is missing, corrupt, unreadable, or unequal to the DB epoch is
+	//    a violation of the regime: this host's runtime cannot prove it belongs to
+	//    the generation the cluster believes is running there.
+	if s.gate != nil && s.gate.Enforced(ctx, capabilities.OwnerEpochV1) {
+		for vm, owner := range vmOwner {
+			if migrationStates[vmState[vm]] {
+				continue
+			}
+			snap, probed := snaps[owner]
+			if !probed || snap.vmMarkers == nil {
+				continue // owner unprobed (coverage covers it) or a fixture without markers
+			}
+			mi, running := snap.vmMarkers[vm]
+			if !running {
+				continue // not running on its owner — conditions 1/4 territory
+			}
+			if mi.status == MarkerValid && mi.epoch == vmEpoch[vm] {
+				continue
+			}
+			add(kindEpochMismatch, vm, fmt.Sprintf(
+				"VM %q on its DB owner %q carries an owner-epoch marker that is %s (marker %d, DB epoch %d) — "+
+					"the runtime cannot prove it belongs to the current ownership generation.",
+				vm, owner, mi.status, mi.epoch, vmEpoch[vm]), owner)
+		}
+	}
+
 	// The probe_failed gauge shows every host we could not fully gather from — unreachable,
 	// partial, OR on an older binary — so the gap is visible immediately even though only
 	// unreachable/partial hosts page.
@@ -363,8 +398,8 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 }
 
 // dbVMIndex returns per-VM DB state and owner (host_name) maps for all non-deleted VMs.
-func (s *Server) dbVMIndex(ctx context.Context) (state map[string]string, owner map[string]string) {
-	state, owner = map[string]string{}, map[string]string{}
+func (s *Server) dbVMIndex(ctx context.Context) (state, owner map[string]string, epoch map[string]int64) {
+	state, owner, epoch = map[string]string{}, map[string]string{}, map[string]int64{}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
 		slog.Warn("dual-run detector: list VMs", "error", err)
@@ -373,6 +408,7 @@ func (s *Server) dbVMIndex(ctx context.Context) (state map[string]string, owner 
 	for _, vm := range vms {
 		state[vm.Name] = vm.State
 		owner[vm.Name] = vm.HostName
+		epoch[vm.Name] = vm.OwnerEpoch
 	}
 	return
 }
@@ -403,7 +439,7 @@ func dualRunProbeTargets(hosts []corrosion.HostRecord) []string {
 // conditions page as errors; coverage gaps and unresolved ties are advisory warnings.
 func dualRunSeverity(kind string) notify.Severity {
 	switch kind {
-	case kindDualRunVM, kindDualRunCT, kindDualRunVIP, kindOwnerMismatch:
+	case kindDualRunVM, kindDualRunCT, kindDualRunVIP, kindOwnerMismatch, kindEpochMismatch:
 		return notify.SevError
 	default:
 		return notify.SevWarn
@@ -423,6 +459,8 @@ func dualRunKindLabel(kind string) string {
 		return "owner_mismatch"
 	case kindLWWUnresolved:
 		return "lww_unresolved"
+	case kindEpochMismatch:
+		return "epoch_mismatch"
 	default:
 		return kind
 	}

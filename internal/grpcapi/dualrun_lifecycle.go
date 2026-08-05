@@ -65,6 +65,8 @@ func conditionIdentity(kind string) (code, subjectKind string) {
 		return "lww_unresolved", "host"
 	case kindDualRunCoverage:
 		return "coverage_gap", "host"
+	case kindEpochMismatch:
+		return "owner_epoch_mismatch", "vm"
 	default:
 		return kind, "cluster"
 	}
@@ -86,6 +88,8 @@ func notifyKindForCondition(code string) string {
 		return kindLWWUnresolved
 	case "coverage_gap":
 		return kindDualRunCoverage
+	case "owner_epoch_mismatch":
+		return kindEpochMismatch
 	default:
 		return code
 	}
@@ -97,7 +101,7 @@ func notifyKindForCondition(code string) string {
 // (which then has its own critical condition row).
 func confirmedSeverity(kind string) string {
 	switch kind {
-	case kindDualRunVM, kindDualRunCT, kindDualRunVIP, kindOwnerMismatch:
+	case kindDualRunVM, kindDualRunCT, kindDualRunVIP, kindOwnerMismatch, kindEpochMismatch:
 		return corrosion.SeverityCritical
 	default:
 		return corrosion.SeverityWarning

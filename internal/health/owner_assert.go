@@ -219,6 +219,47 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 			r.observeOwnerAssert(name, "error")
 			return
 		}
+		// EXACT-MARKER PROOF. The re-key supersedes fresh.OwnerEpoch, so this
+		// host's own marker must say its runtime BELONGS to exactly that epoch:
+		//
+		//   - unreadable/corrupt evidence NEVER authorizes (garbage read as any
+		//     epoch is how stale actions get authorized);
+		//   - an UNEQUAL marker means this runtime is from another generation —
+		//     older (superseded, must not resurrect) or newer (the DB row is the
+		//     stale one and will catch up) — either way not ours to re-key;
+		//   - a MISSING marker refuses once owner_epoch_v1 is enforced; before
+		//     the latch, pre-epoch runtimes legitimately have none and the
+		//     unanimous-absence rule above remains the (weaker) standard.
+		markerEpoch, found, merr := ReadVMOwnerEpochMarker(r.dataDir, name)
+		switch {
+		case merr != nil:
+			slog.Warn("owner-assert: refusing re-key — owner-epoch marker unreadable or corrupt",
+				"vm", name, "error", merr)
+			r.observeOwnerAssert(name, "marker_unreadable")
+			return
+		case found && markerEpoch != fresh.OwnerEpoch:
+			slog.Warn("owner-assert: refusing re-key — marker epoch does not equal the DB epoch being superseded",
+				"vm", name, "marker_epoch", markerEpoch, "db_epoch", fresh.OwnerEpoch)
+			r.observeOwnerAssert(name, "marker_epoch_mismatch")
+			return
+		case !found && r.ownerEpochEnforced(ctx):
+			slog.Warn("owner-assert: refusing re-key — owner-epoch marker missing under owner_epoch_v1",
+				"vm", name)
+			r.observeOwnerAssert(name, "marker_missing")
+			return
+		}
+		// An ACTIVE ownership condition on this workload freezes automated
+		// repair outright: the evaluator has standing evidence of a dispute,
+		// and repairing under a dispute is how the dispute becomes damage.
+		if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, r.db, "vm", name); cerr != nil {
+			slog.Warn("owner-assert: cannot read health conditions; deferring", "vm", name, "error", cerr)
+			r.observeOwnerAssert(name, "inconclusive")
+			return
+		} else if disputed {
+			slog.Warn("owner-assert: refusing re-key — active ownership condition", "vm", name, "condition", code)
+			r.observeOwnerAssert(name, "disputed")
+			return
+		}
 		if err := corrosion.TransferVMOwner(ctx, r.db, name, r.hostName, RuntimeRunning, fresh.OwnerEpoch); err != nil {
 			slog.Warn("owner-assert: epoch-guarded re-key refused or failed", "vm", name, "error", err)
 			r.observeOwnerAssert(name, "error")

@@ -21,10 +21,22 @@ import (
 // That also removes the need for a commit fence in the first place: an in-flight
 // request may commit safely, because its charge was never lost.
 //
-// The lease TTL exceeds normal replication delivery, so a successor sees its
-// predecessor's rows before it can serve. Not a proof — a partition can delay
-// delivery — but the failure mode degrades to over-admission bounded by what was in
-// flight, instead of losing the charges outright.
+// Durability alone is NOT sufficient, and the earlier version of this comment hand-waved
+// that away. A reservation that exists only on the granting node is invisible to a
+// successor: once the lease expires, a successor whose replica lacks the row admits the
+// same quota while the original request can still commit. "The lease TTL exceeds normal
+// replication delivery" is a timing hope, not an argument.
+//
+// So admission does not succeed until the row has been REPLICATED — see
+// Client.ReplicateReservationBarrier. Two obligations, both required:
+//
+//   - a QUORUM of voting peers must have it, so any node that can later win the lease
+//     (winning requires quorum) necessarily has it too;
+//   - the REQUESTING node must have it, so its local commit fence can see it instead of
+//     racing replication and aborting a valid request.
+//
+// If either cannot be met the reservation is tombstoned and admission is REFUSED. Fail
+// closed: an un-replicated charge is indistinguishable from no charge at all.
 
 const (
 	// QuotaReservationTTL bounds a caller that dies mid-request. Same bound the
@@ -143,16 +155,21 @@ func ReserveProjectQuota(ctx context.Context, c *Client, id, project, holder str
 			  WHERE r.project = ? AND r.deleted_at IS NULL AND r.expires_at > ?
 			    AND NOT (
 			      r.state = 'committed' AND (
-			        EXISTS (SELECT 1 FROM vms v
+			        -- r.kind is REQUIRED on each branch. Without it a VM named "web"
+			        -- retires a still-owed CONTAINER reservation for "web" (and vice
+			        -- versa), releasing quota before the container row replicates. This
+			        -- mirrors WorkloadQuotaContribution, which keys on (kind, host, name)
+			        -- for the same reason.
+			        (r.kind = 'vm' AND EXISTS (SELECT 1 FROM vms v
 			                 WHERE v.name = r.workload AND v.project = r.project
 			                   AND v.deleted_at IS NULL
 			                   AND COALESCE(json_extract(v.spec,'$.cpu'),0)        >= r.want_cpu
-			                   AND COALESCE(json_extract(v.spec,'$.memory_mib'),0) >= r.want_mem)
-			        OR EXISTS (SELECT 1 FROM containers ct
+			                   AND COALESCE(json_extract(v.spec,'$.memory_mib'),0) >= r.want_mem))
+			        OR (r.kind = 'container' AND EXISTS (SELECT 1 FROM containers ct
 			                 WHERE ct.name = r.workload AND ct.host_name = r.host
 			                   AND ct.project = r.project AND ct.deleted_at IS NULL
 			                   AND COALESCE(ct.cpu_limit,0)  >= r.want_cpu
-			                   AND COALESCE(ct.memory_mib,0) >= r.want_mem)
+			                   AND COALESCE(ct.memory_mib,0) >= r.want_mem))
 			      )
 			    )`, project, wall).Scan(&resCPU, &resMem); qerr != nil {
 			return false, qerr
@@ -289,4 +306,71 @@ func ProjectsWithLiveQuotaReservations(ctx context.Context, c *Client, holder st
 		out = append(out, r.String("project"))
 	}
 	return out, nil
+}
+
+// ReservationBarrier is what a reservation must clear before admission may succeed.
+// Implemented by the replicator; injected so corrosion does not depend on it directly.
+type ReservationBarrier interface {
+	ReplicateNowTo(ctx context.Context, peerName string) error
+}
+
+// ReplicateReservationBarrier makes a freshly-written reservation VISIBLE before its
+// admission is allowed to succeed.
+//
+// requester is the node that asked for the reservation (empty when the holder is
+// admitting for itself). It must receive the row so its own commit fence reads a present
+// reservation instead of racing replication and aborting a valid request.
+//
+// A QUORUM of voting peers must also receive it. That is the property that makes
+// handoff safe rather than hopeful: acquiring the lease requires quorum, so any node that
+// can later become the authority is necessarily in some quorum that has this row. Without
+// it a reservation could live only on the granting node, and a successor on the far side
+// of a partition would admit the same quota.
+//
+// Returns an error when either obligation is unmet. The caller MUST then tombstone the
+// reservation and refuse the admission — an un-replicated charge is indistinguishable
+// from no charge.
+func ReplicateReservationBarrier(ctx context.Context, c *Client, b ReservationBarrier, self, requester string) error {
+	if b == nil {
+		// No replicator wired (single-node, or a test harness sharing one store): there
+		// are no peers to be invisible to.
+		return nil
+	}
+	hosts, err := ListHosts(ctx, c)
+	if err != nil {
+		return fmt.Errorf("list hosts for the reservation barrier: %w", err)
+	}
+	// Voting peers = everything active except ourselves. Witnesses vote, so they count
+	// toward a quorum that could later elect an authority, and they can hold the row.
+	var voters []string
+	for _, h := range hosts {
+		if h.State != "active" || h.Name == self {
+			continue
+		}
+		voters = append(voters, h.Name)
+	}
+	total := len(voters) + 1 // including ourselves, who already has the row
+	need := total/2 + 1
+
+	acked := 1 // self
+	var lastErr error
+	requesterOK := requester == "" || requester == self
+	for _, peer := range voters {
+		if perr := b.ReplicateNowTo(ctx, peer); perr != nil {
+			lastErr = perr
+			continue
+		}
+		acked++
+		if peer == requester {
+			requesterOK = true
+		}
+	}
+	if !requesterOK {
+		return fmt.Errorf("reservation not delivered to the requesting node %q: %v", requester, lastErr)
+	}
+	if acked < need {
+		return fmt.Errorf("reservation reached %d/%d nodes, need %d for quorum: %v",
+			acked, total, need, lastErr)
+	}
+	return nil
 }

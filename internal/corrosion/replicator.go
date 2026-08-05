@@ -1982,3 +1982,21 @@ func insertRowFromShape(sh StmtShape, s Statement) (cols []string, vals []interf
 	}
 	return sh.InsertCols, vals, true
 }
+
+// ReplicateNowTo pushes this node's pending mutation log to one peer SYNCHRONOUSLY and
+// reports whether the peer accepted it.
+//
+// The background replicator is asynchronous and only notified, which is fine for
+// convergence but not for a write whose VISIBILITY is a precondition — a durable
+// quota reservation is useless to a successor, or to the requesting node's own commit
+// fence, until it has actually arrived. This is the primitive those barriers need.
+//
+// Pushing the whole pending log rather than one row is deliberate: replication here is
+// watermark-ordered, so a peer cannot receive a later entry without the earlier ones. It
+// is idempotent, so calling it out-of-band costs at most duplicate work.
+func (r *Replicator) ReplicateNowTo(ctx context.Context, peerName string) error {
+	if _, err := r.replicateOnce(ctx, peerName); err != nil {
+		return err
+	}
+	return nil
+}

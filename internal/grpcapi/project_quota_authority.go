@@ -132,7 +132,9 @@ func (s *Server) admitProjectQuota(ctx context.Context, project string, cpuDelta
 		return Admission{}, s.quotaFailOpen(ctx, project, cpuDelta, memMiBDelta, "authority unresolved", err)
 	}
 	if holder == s.hostName {
-		release, err := s.admitProjectQuotaLocal(ctx, project, cpuDelta, memMiBDelta)
+		// Admitting for ourselves: the row is already local, so only the quorum half of
+		// the barrier applies.
+		release, err := s.admitProjectQuotaLocal(ctx, project, cpuDelta, memMiBDelta, s.hostName)
 		var moved errQuotaAuthorityMoved
 		if errors.As(err, &moved) {
 			if moved.holder != "" && moved.holder != s.hostName {
@@ -276,7 +278,7 @@ func (s *Server) projectAdmitStateFor(project string) *projectAdmitState {
 	return st
 }
 
-func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpuDelta, memMiBDelta int) (Admission, error) {
+func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpuDelta, memMiBDelta int, requester string) (Admission, error) {
 	// Still renew here: the lease is what keeps admissions for this project arriving at
 	// ONE node, which is what makes the local guard meaningful.
 	held, currentHolder, err := s.holdsQuotaLease(ctx, project)
@@ -307,6 +309,25 @@ func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpu
 	}
 	if !applied {
 		return Admission{}, status.Errorf(codes.ResourceExhausted, "project %q %s", project, detail)
+	}
+
+	// The row exists locally, which is not the same as existing. Until it has been
+	// REPLICATED it is invisible to a successor authority (which would admit the same
+	// quota after our lease expires) and to the requesting node's own commit fence
+	// (which would abort a perfectly valid request). Neither is acceptable, so the
+	// admission is not complete until the barrier clears.
+	if berr := corrosion.ReplicateReservationBarrier(ctx, s.db, s.replicator, s.hostName, requester); berr != nil {
+		// FAIL CLOSED, and undo: an un-replicated charge is indistinguishable from no
+		// charge, so leaving it behind would refuse future requests for a reservation
+		// nobody can see.
+		if rerr := corrosion.ReleaseProjectQuotaReservationRow(ctx, s.db, id); rerr != nil {
+			slog.Error("project quota: could not roll back an unreplicated reservation; it "+
+				"expires on TTL", "project", project, "reservation", id, "error", rerr)
+		}
+		return Admission{}, status.Errorf(codes.Unavailable,
+			"project %q: could not make the quota reservation durable across the cluster, so the "+
+				"request is refused rather than admitted against a charge peers cannot see: %v",
+			project, berr)
 	}
 	return s.durableAdmission(project, id), nil
 }
@@ -528,7 +549,9 @@ func (s *Server) AdmitProjectQuota(ctx context.Context, req *pb.AdmitProjectQuot
 		}, nil
 	}
 
-	grant, err := s.admitProjectQuotaLocal(ctx, project, int(req.CpuDelta), int(req.MemMibDelta))
+	// req.Sender is the requesting node: the barrier must deliver the row to it, or its
+	// local commit fence would race replication and abort a valid request.
+	grant, err := s.admitProjectQuotaLocal(ctx, project, int(req.CpuDelta), int(req.MemMibDelta), req.Sender)
 	if err != nil {
 		if status.Code(err) == codes.ResourceExhausted {
 			return &pb.AdmitProjectQuotaResponse{Admitted: false, Detail: status.Convert(err).Message()}, nil

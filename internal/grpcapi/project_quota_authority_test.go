@@ -177,7 +177,7 @@ func TestAdmitProjectQuota_NonHolderRPCIsRefused(t *testing.T) {
 	// The serving path itself refuses now: admitProjectQuotaLocal re-validates the
 	// lease before touching the ledger, so a node that is not the authority cannot
 	// serialize locally even if something routed a request to it by mistake.
-	_, err = s.admitProjectQuotaLocal(ctx, "/acme", 1, 1024)
+	_, err = s.admitProjectQuotaLocal(ctx, "/acme", 1, 1024, s.hostName)
 	var moved errQuotaAuthorityMoved
 	if !errors.As(err, &moved) {
 		t.Fatalf("admitProjectQuotaLocal on a non-holder: got %v, want errQuotaAuthorityMoved — "+

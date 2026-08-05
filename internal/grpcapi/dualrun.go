@@ -270,6 +270,8 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 
 	// DB view for the owner-mismatch cutover-lag exclusion.
 	vmState, vmOwner, vmEpoch, dbIndexOK := s.dbVMIndex(ctx)
+	// DB view for container-holder legitimacy (names are not cluster-unique).
+	ctBacked, ctIndexOK := s.dbCTIndex(ctx)
 
 	current := map[finding]bool{}
 	details := map[finding]string{}
@@ -297,12 +299,38 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	// 2. Same container running on >1 host. Same reasoning as VMs: a cold CT migration
 	//    stops the source before starting the target (never two running at once beyond a
 	//    debounce window), so a sustained two-holder state is a real dual-run, not a migration.
+	//    BUT: container names are NOT cluster-unique — the schema keys rows by
+	//    (host_name, name), and two unrelated containers named "web" on two hosts
+	//    are a legitimate steady state. Multiple runtime holders alone therefore
+	//    prove nothing, and paging them critical would freeze admission on BOTH
+	//    hosts (ct_dual_run is admission-gating, with no operator force-clear).
+	//    A holder is LEGITIMATE when its own host's DB row backs it — present and
+	//    not marked as relocating away. The dual-run signal is a same-named copy
+	//    running where NO row claims it while the name also runs elsewhere:
+	//    exactly the split a crashed relocation, a failover of a
+	//    still-live-but-fenced host, or a re-key leaves behind.
 	for ct, hs := range ctHolders {
-		if len(hs) > 1 {
-			add(kindDualRunCT, ct, fmt.Sprintf(
-				"container %q is running on %d hosts (%s) — possible split-brain.",
-				ct, len(hs), strings.Join(hs, ", ")), hs...)
+		if len(hs) <= 1 {
+			continue
 		}
+		// With an unreadable container index, legitimacy cannot be judged —
+		// raise nothing new from this heuristic (coverage is gated below, so
+		// nothing resolves either).
+		if !ctIndexOK {
+			continue
+		}
+		var unbacked []string
+		for _, h := range hs {
+			if !ctBacked[ctHostName{host: h, name: ct}] {
+				unbacked = append(unbacked, h)
+			}
+		}
+		if len(unbacked) == 0 {
+			continue // distinct DB-backed containers sharing a name
+		}
+		add(kindDualRunCT, ct, fmt.Sprintf(
+			"container %q is running on %d hosts (%s) but no DB row backs it on %s — possible split-brain.",
+			ct, len(hs), strings.Join(hs, ", "), strings.Join(unbacked, ", ")), hs...)
 	}
 	// 3. Same VIP kernel-assigned on >1 host.
 	for vip, hs := range vipHolders {
@@ -392,13 +420,39 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	// workload is absent from it. And a failed DB read blinds the owner- and
 	// epoch-mismatch checks entirely (they iterate the index), so it must gate
 	// resolution exactly like an unreachable host: the pass proved nothing.
-	coverageComplete := len(unreachable) == 0 && len(partialHosts) == 0 && len(unsupported) == 0 && dbIndexOK
+	coverageComplete := len(unreachable) == 0 && len(partialHosts) == 0 && len(unsupported) == 0 &&
+		dbIndexOK && ctIndexOK
 	coverageDetail := ""
 	if !coverageComplete {
-		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v db_index_ok=%v",
-			unreachable, partialHosts, unsupported, dbIndexOK)
+		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v db_index_ok=%v ct_index_ok=%v",
+			unreachable, partialHosts, unsupported, dbIndexOK, ctIndexOK)
 	}
 	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, coverageComplete, coverageDetail, probeFailed)
+}
+
+// ctHostName keys a container by the pair the schema keys it by.
+type ctHostName struct{ host, name string }
+
+// dbCTIndex returns the set of (host, name) pairs whose live DB container row
+// LEGITIMATELY backs a runtime copy on that host — present, and not marked as
+// relocating away (a mid-relocation source row describes the copy being MOVED,
+// so a runtime still holding it is exactly the split a crashed relocation
+// leaves, and must not be legitimized by it). ok=false means the read failed
+// and the caller must gate coverage, exactly like dbVMIndex.
+func (s *Server) dbCTIndex(ctx context.Context) (backed map[ctHostName]bool, ok bool) {
+	backed = map[ctHostName]bool{}
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		slog.Warn("dual-run detector: list containers", "error", err)
+		return backed, false
+	}
+	for _, ct := range cts {
+		if _, _, relocating := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); relocating {
+			continue
+		}
+		backed[ctHostName{host: ct.HostName, name: ct.Name}] = true
+	}
+	return backed, true
 }
 
 // dbVMIndex returns per-VM DB state and owner (host_name) maps for all non-deleted VMs.

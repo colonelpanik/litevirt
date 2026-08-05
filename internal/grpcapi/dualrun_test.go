@@ -1097,3 +1097,67 @@ func TestConditionLifecycle_DBIndexFailureCannotResolve(t *testing.T) {
 		t.Fatalf("after repair and two clean scans: %q, want resolved", got)
 	}
 }
+
+// TestDualRun_SameNameDistinctContainers_NoFalsePositive: container names are
+// NOT cluster-unique — the schema keys rows by (host_name, name) — so two
+// unrelated containers named "web" on two hosts, each backed by its own DB row
+// and running on its own host, are a legitimate steady state. Grouping runtime
+// holders by bare name flagged them as a critical ct_dual_run, which is
+// admission-gating with no operator force-clear: a naming coincidence froze
+// capacity-growing admission on both hosts.
+func TestDualRun_SameNameDistinctContainers_NoFalsePositive(t *testing.T) {
+	ctx := context.Background()
+	s := dualRunTestServer(t, 2)
+	seedContainer(t, s, "web", "h1", "running")
+	seedContainer(t, s, "web", "h2", "running")
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {runningCTs: []string{"web"}},
+		"h2": {runningCTs: []string{"web"}},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunCT, "web"); got != "" && got != corrosion.ConditionResolved {
+		t.Fatalf("two DISTINCT DB-backed containers sharing a name raised %q — names are per-host, not cluster-unique", got)
+	}
+
+	// The same shape with the second copy UNBACKED is the real thing: a copy
+	// running where no row claims it, while the name is claimed elsewhere.
+	s2 := dualRunTestServer(t, 2)
+	seedContainer(t, s2, "web", "h1", "running")
+	s2.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {runningCTs: []string{"web"}},
+		"h2": {runningCTs: []string{"web"}},
+	})
+	s2.detectDualRunPass(ctx)
+	s2.detectDualRunPass(ctx)
+	if !confirmedCond(s2, kindDualRunCT, "web") {
+		t.Fatal("a same-named copy with no backing DB row must still page — that is the split a crashed relocation leaves")
+	}
+}
+
+// TestDualRun_RelocatingSourceDoesNotLegitimizeHolder: mid-relocation, the
+// source row (state=relocating + restore marker) describes the copy being MOVED
+// AWAY. If the fenced-but-alive source still runs the container while the
+// restored target does too, BOTH rows exist — and the source's row must not
+// count as backing, or the canonical crashed-relocation dual-run reads as two
+// legitimate containers.
+func TestDualRun_RelocatingSourceDoesNotLegitimizeHolder(t *testing.T) {
+	ctx := context.Background()
+	s := dualRunTestServer(t, 2)
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		Name: "web", HostName: "h1", State: "relocating",
+		StateDetail: corrosion.RelocateRestoreDetail("h2", "attempt-1"),
+	}); err != nil {
+		t.Fatalf("UpsertContainer source: %v", err)
+	}
+	seedContainer(t, s, "web", "h2", "running") // the landed restore
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {runningCTs: []string{"web"}}, // fenced host's runtime is still live
+		"h2": {runningCTs: []string{"web"}},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunCT, "web") {
+		t.Fatal("a still-running relocation source beside its landed target must page — the source row is not backing, it is the move itself")
+	}
+}

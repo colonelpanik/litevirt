@@ -3,10 +3,15 @@ package grpcapi
 import (
 	"context"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// freshScan is a LastScan inside evaluatorScanTTL — the staleness bound means
+// a fixed literal date would read as a stopped detector.
+func freshScan() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // TestGetClusterHealth_OverallStates pins the roll-up contract the CLI exit
 // codes (0/1/2) and admission policy hang off:
@@ -35,7 +40,7 @@ func TestGetClusterHealth_OverallStates(t *testing.T) {
 
 	// A completed clean scan.
 	if err := corrosion.UpsertHealthEvaluatorStatus(context.Background(), s.db, corrosion.HealthEvaluatorStatus{
-		Evaluator: "dual_run", LastScan: "2026-08-04T10:00:00Z", Coverage: corrosion.CoverageComplete, Reporter: "h1",
+		Evaluator: "dual_run", LastScan: freshScan(), Coverage: corrosion.CoverageComplete, Reporter: "h1",
 	}); err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -45,7 +50,7 @@ func TestGetClusterHealth_OverallStates(t *testing.T) {
 
 	// Partial coverage degrades.
 	if err := corrosion.UpsertHealthEvaluatorStatus(context.Background(), s.db, corrosion.HealthEvaluatorStatus{
-		Evaluator: "dual_run", LastScan: "2026-08-04T10:01:00Z", Coverage: corrosion.CoveragePartial, Reporter: "h1",
+		Evaluator: "dual_run", LastScan: freshScan(), Coverage: corrosion.CoveragePartial, Reporter: "h1",
 	}); err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -53,7 +58,7 @@ func TestGetClusterHealth_OverallStates(t *testing.T) {
 		t.Fatalf("partial-coverage overall = %q, want DEGRADED — blind is not clean", got)
 	}
 	if err := corrosion.UpsertHealthEvaluatorStatus(context.Background(), s.db, corrosion.HealthEvaluatorStatus{
-		Evaluator: "dual_run", LastScan: "2026-08-04T10:02:00Z", Coverage: corrosion.CoverageComplete, Reporter: "h1",
+		Evaluator: "dual_run", LastScan: freshScan(), Coverage: corrosion.CoverageComplete, Reporter: "h1",
 	}); err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -129,7 +134,7 @@ func TestGetClusterHealth_IncompleteCapacityDegrades(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
-		Evaluator: "dual_run", LastScan: "2026-08-04T10:00:00Z", Coverage: corrosion.CoverageComplete, Reporter: "h1",
+		Evaluator: "dual_run", LastScan: freshScan(), Coverage: corrosion.CoverageComplete, Reporter: "h1",
 	}); err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -148,5 +153,61 @@ func TestGetClusterHealth_IncompleteCapacityDegrades(t *testing.T) {
 	}
 	if len(h.GetCapacity()) != 1 || h.GetCapacity()[0].GetComplete() {
 		t.Fatalf("capacity assessment = %+v, want the incomplete sample surfaced", h.GetCapacity())
+	}
+}
+
+// TestGetClusterHealth_StaleEvaluatorIsNotGreen: the evaluator status row is
+// LWW state with no expiry, so a stopped or wedged detector leaves its last
+// "coverage=complete" row standing forever. Health must bound the age of the
+// evidence: a scan past evaluatorScanTTL means nothing is watching NOW, which
+// is UNKNOWN when it is the only evaluator — never HEALTHY. A critical
+// condition still dominates: stale watching does not un-know known facts.
+func TestGetClusterHealth_StaleEvaluatorIsNotGreen(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+
+	stale := time.Now().UTC().Add(-2 * evaluatorScanTTL).Format(time.RFC3339)
+	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
+		Evaluator: "dual_run", LastScan: stale, Coverage: corrosion.CoverageComplete, Reporter: "h1",
+	}); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	h, err := s.GetClusterHealth(adminCtx(), &pb.GetClusterHealthRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterHealth: %v", err)
+	}
+	if h.GetOverall() != HealthUnknown {
+		t.Fatalf("sole evaluator %s stale, overall = %q, want UNKNOWN — a green light older than the TTL is no light at all",
+			evaluatorScanTTL, h.GetOverall())
+	}
+
+	// A known critical condition dominates staleness.
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "web-1",
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical,
+		Hosts: []string{"h1", "h2"}, FirstSeen: stale, LastSeen: stale,
+	}); err != nil {
+		t.Fatalf("condition: %v", err)
+	}
+	if h, _ = s.GetClusterHealth(adminCtx(), &pb.GetClusterHealthRequest{}); h.GetOverall() != HealthCritical {
+		t.Fatalf("stale evaluator + critical condition = %q, want CRITICAL", h.GetOverall())
+	}
+
+	// A fresh scan beside the stale one: watching again, but degraded — one
+	// evaluator's evidence is out of date.
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "web-1",
+		Lifecycle: corrosion.ConditionResolved, Severity: corrosion.SeverityCritical,
+		Hosts: []string{"h1", "h2"}, FirstSeen: stale, LastSeen: stale, ResolvedAt: freshScan(),
+	}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
+		Evaluator: "other_eval", LastScan: freshScan(), Coverage: corrosion.CoverageComplete, Reporter: "h1",
+	}); err != nil {
+		t.Fatalf("second evaluator: %v", err)
+	}
+	if h, _ = s.GetClusterHealth(adminCtx(), &pb.GetClusterHealthRequest{}); h.GetOverall() != HealthDegraded {
+		t.Fatalf("one stale + one fresh evaluator = %q, want DEGRADED", h.GetOverall())
 	}
 }

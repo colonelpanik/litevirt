@@ -42,7 +42,7 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 	}
 
 	resp := &pb.ClusterHealth{
-		Overall:     overallHealth(conditions, evaluators, capacity),
+		Overall:     overallHealth(conditions, evaluators, capacity, time.Now().UTC()),
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	for _, h := range conditions {
@@ -91,16 +91,38 @@ const (
 	HealthUnknown  = "UNKNOWN"
 )
 
+// evaluatorScanTTL is how old an evaluator's last scan may be before its
+// evaluation is STALE. The detector runs every 60s and its leader lease fails
+// over within ~2 intervals, so five intervals of silence is a wedged or
+// fleet-wide-stopped detector, not scheduling jitter. The evaluator status row
+// is LWW state with no expiry — without this bound, the last row ever written
+// keeps saying coverage=complete forever and a stopped detector leaves the
+// cluster green-and-blind indefinitely. (Compare localInventoryTTL: the OTHER
+// input admission trusts is already freshness-bounded; this closes the same
+// hole for the roll-up.)
+const evaluatorScanTTL = 5 * time.Minute
+
 // overallHealth rolls the pieces into one state:
 //
 //	CRITICAL — any ACTIVE critical condition (an observed one included: the
 //	           operator should be looking before the confirm lands);
 //	DEGRADED — active warning conditions, an evaluator without complete
-//	           coverage, or an incomplete capacity observation;
-//	UNKNOWN  — no evaluator has ever completed a scan (nothing is watching,
-//	           which is not the same as nothing being wrong);
+//	           coverage, a STALE evaluator (last scan past evaluatorScanTTL),
+//	           or an incomplete capacity observation;
+//	UNKNOWN  — no evaluator has ever completed a scan, or every evaluator's
+//	           last scan is stale (nothing is watching NOW, which is not the
+//	           same as nothing being wrong);
 //	HEALTHY  — none of the above.
-func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation) string {
+//
+// Deliberately, staleness does NOT gate admission. The ownership admission
+// gate acts on durable condition rows plus a freshly-probed LOCAL inventory,
+// both of which stay sound when the detector stops — what is lost is the
+// discovery of NEW cross-host conditions, which this roll-up now surfaces
+// instead of hiding. Coupling every admission to a single detector's liveness
+// would make that detector a cluster-wide availability SPOF, which is a worse
+// trade than a loudly-degraded health state; an operator who wants a hard stop
+// on a blind cluster has the DEGRADED/UNKNOWN exit codes to wire it from.
+func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation, now time.Time) string {
 	if len(evaluators) == 0 {
 		return HealthUnknown
 	}
@@ -114,10 +136,19 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 		}
 		degraded = true
 	}
+	allStale := true
 	for _, e := range evaluators {
-		if e.Coverage != corrosion.CoverageComplete {
+		stale := true
+		if at, err := time.Parse(time.RFC3339, e.LastScan); err == nil && now.Sub(at) <= evaluatorScanTTL {
+			stale = false
+			allStale = false
+		}
+		if stale || e.Coverage != corrosion.CoverageComplete {
 			degraded = true
 		}
+	}
+	if allStale {
+		return HealthUnknown
 	}
 	for _, c := range capacity {
 		if !c.Complete {

@@ -488,9 +488,9 @@ func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
 		if err != nil || src == nil {
 			continue
 		}
-		// candidates/fallbackIdx are only consulted if the marker carries no target
+		// candidates are only consulted if the marker carries no target
 		// (it always does), so an empty candidate set is fine here.
-		c.resumeRestoreRelocation(ctx, src, ct, target, token, nil, new(int))
+		c.resumeRestoreRelocation(ctx, src, ct, target, token, nil)
 	}
 }
 
@@ -993,7 +993,6 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	}
 
 	// Step 5: Reschedule VMs using placement engine for proper resource-aware scheduling.
-	fallbackIdx := 0
 	type failoverPlan struct {
 		vm             corrosion.VMRecord
 		targetName     string
@@ -1151,19 +1150,36 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		if err != nil {
 			ctMem = nil
 		}
-		if selected, err := placement.SelectBatch(candidates, allVMs, nil, ctMem, placementReqs); err != nil {
-			// A batch placement failure must not block recovery. Fall back to
-			// round-robin on a per-VM basis exactly as before.
-			slog.Warn("failover: batch placement failed, using round-robin fallback",
-				"error", err)
+		// Effective-capacity observations, best-effort: absent, the batch
+		// degrades to DB-only arithmetic; present, runtime-only usage counts
+		// against headroom and an incomplete/stale host is excluded.
+		observations, oerr := corrosion.ListHostCapacityObservations(ctx, c.db)
+		if oerr != nil {
+			observations = nil
+		}
+		// There is deliberately NO fallback on a batch error. The old code
+		// round-robined the fenced host's VMs across whatever candidates were
+		// healthy — blind to capacity, labels, affinity, spread, max-per-node,
+		// and incomplete-inventory exclusions — and the target reconciler
+		// re-checks none of those before starting, so an infeasible placement
+		// simply landed. Refusing leaves the rows on the fenced host, loudly,
+		// and the operator (or the next placement input change) recovers them;
+		// hard constraints that no surviving host satisfies must strand the
+		// workload, not relocate it somewhere it was never allowed to run.
+		if selected, err := placement.SelectBatch(candidates, allVMs, nil, ctMem,
+			observations, c.now(), placementReqs); err != nil {
+			slog.Error("failover: batch placement failed — affected VMs are left for operator recovery, NOT round-robined",
+				"host", h.Name, "error", err)
 			for i := range plans {
 				if plans[i].needsPlacement {
-					plans[i].targetName = candidates[fallbackIdx%len(candidates)].Name
-					plans[i].needsPlacement = false
-					fallbackIdx++
 					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
+					_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+						ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+						Target: plans[i].vm.Name, Detail: "batch placement failed after fencing " + h.Name + ": " + err.Error(), Result: "error",
+					})
 				}
 			}
+			plans = plans[:0]
 		} else {
 			placements = selected
 		}
@@ -1174,14 +1190,18 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		if p.needsPlacement {
 			result, ok := placements[vm.Name]
 			if !ok || result.Host == "" {
-				slog.Warn("failover: batch placement missed host, using round-robin fallback",
-					"vm", vm.Name)
-				c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
-				p.targetName = candidates[fallbackIdx%len(candidates)].Name
-				fallbackIdx++
-			} else {
-				p.targetName = result.Host
+				// No eligible host under the VM's hard constraints. Same
+				// reasoning as the batch-error path above: skip loudly.
+				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
+					"vm", vm.Name, "from", h.Name)
+				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
+				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+					ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+					Target: vm.Name, Detail: "no eligible host satisfies its placement constraints after fencing " + h.Name, Result: "skipped",
+				})
+				continue
 			}
+			p.targetName = result.Host
 			p.needsPlacement = false
 		}
 
@@ -1264,15 +1284,14 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// container reconciler does the actual recreate. Stateful / non-re-pullable
 	// containers are skipped and loudly audited (their data can't be recovered
 	// without a backup — the backup-restore tier is a follow-up).
-	c.relocateContainers(ctx, h, candidates, &fallbackIdx)
+	c.relocateContainers(ctx, h, candidates)
 }
 
 // relocateContainers re-homes the fenced host's relocatable containers onto
 // healthy hosts. For each, it prefers a faithful restore-from-backup (tier-2),
 // falls back to image-recreate (tier-1), else skips — and re-derives the outcome
 // of any in-flight restore-relocation (crash recovery). Shares the round-robin
-// fallbackIdx with the VM loop so placement-failure fallbacks stay spread.
-func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostRecord, candidates []corrosion.HostRecord, fallbackIdx *int) {
+func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostRecord, candidates []corrosion.HostRecord) {
 	// Split-brain gate (Phase 1, decide site): once enforced, re-check DecisionGate
 	// (quorum + coordinator-eligible; lease already held in the failover path)
 	// before relocating any container off the fenced host — an isolated minority
@@ -1318,17 +1337,17 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 		// Crash recovery: a prior tick already began a restore-relocation (marker on
 		// the source row, carrying the target + attempt token). Re-derive.
 		if target, token, restoring := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); restoring {
-			c.resumeRestoreRelocation(ctx, h, ct, target, token, candidates, fallbackIdx)
+			c.resumeRestoreRelocation(ctx, h, ct, target, token, candidates)
 			continue
 		}
-		c.startRelocation(ctx, h, ct, candidates, fallbackIdx)
+		c.startRelocation(ctx, h, ct, candidates)
 	}
 }
 
 // startRelocation relocates one not-yet-marked container: restore-from-backup if
 // possible, else image-recreate, else skip.
-func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) {
-	target := c.pickContainerTarget(ctx, ct, candidates, fallbackIdx)
+func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) {
+	target := c.pickContainerTarget(ctx, ct, candidates)
 	if target == "" {
 		slog.Warn("failover: no target for container relocation", "container", ct.Name)
 		return
@@ -1404,7 +1423,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 
 // resumeRestoreRelocation re-derives a relocate-restore marker on a re-tick
 // (typically after a coordinator restart mid-restore).
-func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target, token string, candidates []corrosion.HostRecord, fallbackIdx *int) {
+func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target, token string, candidates []corrosion.HostRecord) {
 	// Restore already landed? (crashed after the target row was created but before
 	// the source was tombstoned). Require PROVENANCE: the (target,name) row must
 	// carry OUR attempt token (the target stamps relocate_token from the marker's
@@ -1425,7 +1444,7 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 	slog.Warn("failover: stale relocate-restore marker — falling back to image-recreate",
 		"container", ct.Name, "target", target)
 	if target == "" {
-		target = c.pickContainerTarget(ctx, ct, candidates, fallbackIdx)
+		target = c.pickContainerTarget(ctx, ct, candidates)
 	}
 	c.imageRecreateOrSkip(ctx, h, ct, target)
 }
@@ -1537,22 +1556,31 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 // LIVE container of the same name (names aren't cluster-unique), so relocation
 // never collides with / clobbers an unrelated container. Returns "" if no
 // collision-free target exists.
-func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) string {
-	if target, err := placement.Select(ctx, c.db, placement.Request{
+func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) string {
+	// The single-VM Select path carries the full capacity model (observations,
+	// reserves, incomplete-host exclusion). There is deliberately NO
+	// round-robin fallback on its failure: the old one walked the raw healthy
+	// candidate list — blind to capacity and to incomplete-inventory exclusions
+	// — so a container that genuinely fit nowhere was relocated somewhere it
+	// did not fit. "" tells the caller to skip loudly and leave the row for
+	// operator recovery instead.
+	target, err := placement.Select(ctx, c.db, placement.Request{
 		VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
 		Capacity: c.capacity,
-	}); err == nil && !c.targetHasLiveContainer(ctx, target, ct.Name) {
-		return target
+	})
+	if err != nil {
+		slog.Warn("failover: container placement failed — left for operator recovery, NOT round-robined",
+			"container", ct.Name, "error", err)
+		return ""
 	}
-	// Placement failed or its pick collides — round-robin a collision-free candidate.
-	for i := 0; i < len(candidates); i++ {
-		cand := candidates[*fallbackIdx%len(candidates)].Name
-		*fallbackIdx++
-		if !c.targetHasLiveContainer(ctx, cand, ct.Name) {
-			return cand
-		}
+	if c.targetHasLiveContainer(ctx, target, ct.Name) {
+		// The chosen host already runs an unrelated container of this name
+		// (names are per-host). Rare; skip rather than blind-pick elsewhere.
+		slog.Warn("failover: container relocation target holds a same-name container — left for operator recovery",
+			"container", ct.Name, "target", target)
+		return ""
 	}
-	return ""
+	return target
 }
 
 // targetHasLiveContainer reports whether host already runs a live (non-deleted)

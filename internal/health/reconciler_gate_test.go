@@ -929,3 +929,63 @@ func TestSelfHealRestart_RefusedOnSupersededFileMarker(t *testing.T) {
 		t.Fatal("a marker matching the row must NOT block the restart")
 	}
 }
+
+// An active ownership condition on the VM refuses the automated start OUTRIGHT
+// — before the proof is even claimed, so recovery can resume once the evaluator
+// proves resolution. This is the execute-side half of the failover dispute gate:
+// the coordinator refuses to plan recovery for a disputed workload, but a
+// pending row minted before the condition was raised (or a local autostart that
+// never saw a coordinator) still reaches this reconciler, which must not add a
+// holder to a contested disk.
+func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	proof := corrosion.ActionProof{ID: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "node-a", Coordinator: "node-a"}
+	if err := corrosion.WriteVMRescheduleProof(ctx, db, proof, "vm1", "node-a"); err != nil {
+		t.Fatalf("WriteVMRescheduleProof: %v", err)
+	}
+	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical,
+		Hosts: []string{"node-b", "node-c"},
+		FirstSeen: "2026-08-05T00:00:00Z", LastSeen: "2026-08-05T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("seed condition: %v", err)
+	}
+
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	r.startPendingVM(ctx, *fresh)
+
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a disputed VM must never reach libvirt")
+	}
+	// The proof must stay unclaimed: the refusal is a deferral, not a consume.
+	if pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1"); !ok || pr.Status == corrosion.ProofCompleted {
+		t.Fatalf("proof status = %q (ok=%v); a dispute refusal must not spend the proof", pr.Status, ok)
+	}
+
+	// Resolution re-opens recovery: the SAME pending row starts once the
+	// evaluator marks the condition resolved.
+	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
+		Lifecycle: corrosion.ConditionResolved, Severity: corrosion.SeverityCritical,
+		Hosts: []string{"node-b", "node-c"},
+		FirstSeen: "2026-08-05T00:00:00Z", LastSeen: "2026-08-05T01:00:00Z",
+	}); err != nil {
+		t.Fatalf("resolve condition: %v", err)
+	}
+	fresh, _ = corrosion.GetVM(ctx, db, "vm1")
+	r.startPendingVM(ctx, *fresh)
+	if !startedOrDefined(fake, "vm1") {
+		t.Fatal("vm1 should start once the condition is resolved")
+	}
+}

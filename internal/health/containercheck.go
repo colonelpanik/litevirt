@@ -218,6 +218,21 @@ const orphanLeaseMinAge = 5 * time.Minute
 // from the original aren't preserved — the faithful path is restore-from-backup,
 // a follow-up). On failure it leaves the row pending so the next sweep retries.
 func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.ContainerRecord) {
+	// Ownership-dispute gate, EXECUTE side (mirrors startPendingVM): a pending
+	// relocation minted before the condition was raised must not materialize
+	// another instance while ownership is contested. The row stays pending;
+	// recovery resumes when the evaluator proves resolution. Fail closed on a
+	// read error.
+	if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "container", ct.Name); cerr != nil {
+		slog.Warn("containercheck: cannot read health conditions; deferring relocated recreate (fail closed)",
+			"container", ct.Name, "error", cerr)
+		return
+	} else if disputed {
+		slog.Warn("containercheck: refusing relocated recreate — active ownership condition",
+			"container", ct.Name, "condition", code)
+		return
+	}
+
 	spec := corrosion.DecodeCreateSpec(ct.CreateSpec)
 
 	// Already materialized by a prior tick (runtime container exists)? A prior tick

@@ -768,6 +768,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 	}
 
+	// Ownership-dispute gate, EXECUTE side. The coordinator refuses to plan
+	// recovery for a disputed workload, but this reconciler is the node that
+	// actually starts things — and it also serves pending rows minted before
+	// the condition was raised, and local starts (onboot autostart, domain-died
+	// recovery) that never passed through the coordinator at all. Starting any
+	// of them while ownership is contested adds a holder. Fail closed on a read
+	// error; the row stays pending and the next tick retries.
+	if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, r.db, "vm", vm.Name); cerr != nil {
+		slog.Warn("reconciler: cannot read health conditions; deferring start (fail closed)",
+			"vm", vm.Name, "error", cerr)
+		return
+	} else if disputed {
+		slog.Warn("reconciler: refusing automated start — active ownership condition",
+			"vm", vm.Name, "condition", code)
+		r.noteGateRefused(corrosion.ActionReschedule, ReasonOwnershipDispute)
+		return
+	}
+
 	// Post-activation, a coordinator OWNERSHIP TRANSFER writes state=pending AND a
 	// proof marker (pending_action_id) atomically. A PENDING row with NO marker under
 	// enforcement is therefore stale / pre-activation / hand-mutated — refuse it

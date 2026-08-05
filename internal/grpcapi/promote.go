@@ -95,6 +95,19 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch stri
 	if err != nil || vm == nil {
 		return fmt.Errorf("vm %q not found", vmName)
 	}
+	// Automated promotion must never act on a disputed workload: the fenced host
+	// is only one of the condition's holders, and defining + starting the replica
+	// while the other side may still be live adds a writer. The coordinator also
+	// refuses at plan time; this guards the direct callers and races where the
+	// condition lands between plan and execute. An OPERATOR PromoteReplica stays
+	// available as the deliberate manual override. Fail closed on a read error.
+	if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, s.db, "vm", vmName); cerr != nil {
+		return status.Errorf(codes.Unavailable,
+			"cannot read health conditions before auto-promote of %q (fail closed): %v", vmName, cerr)
+	} else if disputed {
+		return status.Errorf(codes.FailedPrecondition,
+			"vm %q has an active ownership condition (%s); automated promotion refused — resolve the dispute first", vmName, code)
+	}
 	req := &pb.PromoteReplicaRequest{VmName: vmName, Force: true}
 	// Split-brain hardening (Phase 1): once enforced, mint a durable single-use
 	// proof so the executing (possibly relayed) host validates + claims it before

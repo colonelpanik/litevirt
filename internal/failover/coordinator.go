@@ -1019,6 +1019,31 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			continue
 		}
 
+		// Automated recovery must never act on a workload whose OWNERSHIP is in
+		// dispute. The fenced host is only ONE of the condition's holders: the
+		// other side may still be live and unfenced, and rescheduling (or
+		// promoting) this VM onto a third host manufactures exactly the
+		// dual-writer the condition was raised to prevent. The owner-assert and
+		// self-heal paths already refuse on this; failover is the remaining
+		// automated writer. Fail closed on a read error — a coordinator that
+		// cannot see the conditions must not assume there are none.
+		if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "vm", vm.Name); cerr != nil {
+			slog.Warn("failover: cannot read health conditions; deferring VM recovery (fail closed)",
+				"vm", vm.Name, "error", cerr)
+			c.mVM(ActionReschedule, ResultError, ErrDBError)
+			continue
+		} else if disputed {
+			slog.Warn("failover: refusing VM recovery — active ownership condition; resolve the dispute first",
+				"vm", vm.Name, "condition", code)
+			c.noteGateRefused(corrosion.ActionReschedule, health.ReasonOwnershipDispute)
+			c.mVM(ActionReschedule, ResultRefused, ErrOwnershipDispute)
+			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+				ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+				Target: vm.Name, Detail: "active ownership condition " + code + " — automated recovery refused", Result: "refused",
+			})
+			continue
+		}
+
 		// Shared-disk split-brain gate (decide site): if this coordinator enforces
 		// the shared-storage fence and the VM has a writable shared disk, a cross-host
 		// transfer needs a PROOF-GRADE fence of the old owner. fenceEpoch is non-empty
@@ -1273,6 +1298,21 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 		// Already triaged to skipped in a prior pass — left visible for operator
 		// recovery; don't re-process (and don't loop on it).
 		if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail {
+			continue
+		}
+		// Same ownership-dispute refusal as the VM loop: the other holder of the
+		// dispute may be live on an unfenced host, and recreating this container
+		// elsewhere adds a writer. Fail closed on a read error.
+		if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "container", ct.Name); cerr != nil {
+			slog.Warn("failover: cannot read health conditions; deferring container relocation (fail closed)",
+				"container", ct.Name, "error", cerr)
+			c.mCt(ActionRelocate, ResultError, ErrDBError)
+			continue
+		} else if disputed {
+			slog.Warn("failover: refusing container relocation — active ownership condition; resolve the dispute first",
+				"container", ct.Name, "condition", code)
+			c.noteGateRefused(corrosion.ActionRelocate, health.ReasonOwnershipDispute)
+			c.mCt(ActionRelocate, ResultRefused, ErrOwnershipDispute)
 			continue
 		}
 		// Crash recovery: a prior tick already began a restore-relocation (marker on

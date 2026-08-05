@@ -132,6 +132,8 @@ type Server struct {
 	// its own replica would bypass the single decider entirely, so serializing against
 	// one is worthless until every node has opted in.
 	enfProjectAuthority bool
+	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
+	commitFenceHook func(op string)
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
 	// It alone turns SIGNING on (a signed row is backward-compatible, so nothing has
 	// to wait); combined with the AuditSignatureV1 latch it also makes an UNSIGNABLE
@@ -665,6 +667,23 @@ func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry =
 // admission (enforcement.project_authority). Enforcement is this flag AND the
 // ProjectAuthorityV1 cluster-wide latch; advertisement is withheld while it is off.
 func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = on }
+
+// SetCommitFenceHook installs a TEST-ONLY hook run immediately before a commit
+// fence (reservationLease.allowCommit) is evaluated on a long-running operation
+// (clone, live restore, container restore). Moving a project's authority AFTER
+// admission but BEFORE the durable write inside one handler invocation is
+// otherwise impossible to arrange, and a fence test that cannot arrange it
+// cannot fail. Production never calls this; the hook must be set before the
+// operation starts and cleared after.
+func (s *Server) SetCommitFenceHook(h func(op string)) { s.commitFenceHook = h }
+
+// fireCommitFenceHook runs the test hook, if any, naming the operation about to
+// evaluate its commit fence.
+func (s *Server) fireCommitFenceHook(op string) {
+	if h := s.commitFenceHook; h != nil {
+		h(op)
+	}
+}
 
 // SetAuditSignatureEnforce sets this node's kill-switch for tamper-evident audit
 // logging (enforcement.audit_signature). This flag alone enables SIGNING; refusing

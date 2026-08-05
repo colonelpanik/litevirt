@@ -735,6 +735,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// It runs before the import, so a refusal costs no I/O; the leases are
 	// released when this handler returns, i.e. after the container's own row lands
 	// and accounts for the same figures.
+	var restoreQuotaLease *reservationLease
 	if s.migrateSourceFromPeer(ctx) == "" {
 		relocation := req.Proof != nil || relocateTokenFromMD(ctx) != ""
 		if spec.MemMiB > 0 {
@@ -753,6 +754,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 				return aerr
 			}
 			defer lease.release(ctx)
+			// Held for the commit fence before CreateContainerAtomic: the whole
+			// archive import runs between this grant and that write.
+			restoreQuotaLease = lease
 		}
 	}
 
@@ -892,6 +896,23 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		// restore-relocation) so it can prove this row is its restore.
 		RelocateToken: relocateTokenFromMD(ctx),
 	}
+	// FENCE, immediately before the durable write (see allowCommit): the whole
+	// archive import sat between the quota grant and here, so the project's
+	// authority can genuinely move mid-restore. A refusal tears down the
+	// imported runtime container exactly like the cluster-state-write failure
+	// below — nothing durable exists yet, so it costs a retry. A nil lease
+	// (relocation, migrate, or an unquota'd restore) allows.
+	s.fireCommitFenceHook("RestoreContainer")
+	if ferr := restoreQuotaLease.allowCommit(ctx); ferr != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+			slog.Warn("container restore: failed to clean up imported container after a fence refusal",
+				"name", req.Name, "error", delErr)
+		}
+		s.removeRestoreMarker(req.Name)
+		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+		return ferr
+	}
+
 	// The cluster-state write is MANDATORY and atomic: the container row AND its
 	// managed interface rows go in ONE batch, so a restore can't land a tracked
 	// container with missing NIC state (failover relies on "row exists ⇒ restore

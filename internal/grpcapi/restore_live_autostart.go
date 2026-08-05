@@ -295,6 +295,26 @@ func (s *Server) autoDefineRestoredVM(
 		TargetPath: overlayPath, Status: "VM started off overlay",
 	})
 
+	// FENCE, immediately before the durable write (see allowCommit). Firmware
+	// materialisation, define, hardware prepare, and the start off the overlay
+	// all sit between admission and here, so the project's quota authority can
+	// move mid-restore. The VM is already running, so a refusal must tear it
+	// down like a start failure would — a running domain with no cluster row is
+	// strictly worse than the retry this costs. The overlay + NBD are kept, as
+	// on a start failure, so a retry restores against the still-valid source;
+	// for a firmware VM the deferred rollback (restoreOK=false) also wipes the
+	// materialized NVRAM/swtpm.
+	s.fireCommitFenceHook("RestoreLive")
+	if ferr := lease.allowCommit(ctx); ferr != nil {
+		if derr := s.virt.DestroyDomain(targetName); derr != nil {
+			slog.Error("live-restore: fence refused the commit but the running domain could not be destroyed — manual cleanup needed",
+				"vm", targetName, "error", derr)
+		}
+		releaseHW()
+		_ = s.virt.UndefineDomain(targetName, false)
+		return "", "", ferr
+	}
+
 	// Persist the VM so lifecycle / migration / UI treat it like any
 	// other. Best-effort: the VM is already running.
 	//

@@ -542,7 +542,7 @@ func clusterDTO(c *pb.ClusterStatus, limit int) map[string]any {
 		"vms_total":    c.GetVmsTotal(),
 		"vms_running":  c.GetVmsRunning(),
 		"vms_error":    c.GetVmsError(),
-		
+
 		"events_count": len(c.GetRecentEvents()),
 		"hosts":        mapHosts(truncate(c.GetHosts(), limit)),
 	}

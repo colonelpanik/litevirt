@@ -227,14 +227,36 @@ func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourc
 	}
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
 
+	// This function is only reachable while delegated enforcement is LATCHED
+	// (projectAuthorityActive gated every caller), so there is no local fallback
+	// below — a downgrade to an unfenced, unreserved local check is precisely the
+	// unserialized double-admission the latch promises is gone. The earlier
+	// version fell back "rather than refusing outright"; concurrent first
+	// admissions of a new project on two nodes then both took it (a non-candidate
+	// legitimately reads an empty authority until the candidate mints), each
+	// checked a view containing neither, and the project exceeded quota with an
+	// epoch-0 grant the commit fence treats as unfenced. Refuse or route; never
+	// downgrade.
 	auth, aerr := s.ensureProjectAuthority(ctx, project)
-	if aerr != nil || auth.Holder == "" {
-		// No authority could be established — fall back to the local check rather
-		// than refusing outright. This is the pre-delegation behavior, and an
-		// authority record that cannot be read is a state problem, not evidence that
-		// a competing admission is in flight. epoch 0: no authority backed this
-		// grant, so there is nothing for the commit fence to re-validate.
-		return "", "", 0, s.checkProjectQuotaSettling(ctx, project, cpuDelta, memDelta, "")
+	if aerr != nil {
+		return "", "", 0, status.Errorf(codes.Unavailable,
+			"cannot establish project %q admission authority: %v — refusing to admit unserialized while delegation is latched", project, aerr)
+	}
+	if auth.Holder == "" {
+		// A brand-new project and this node is not its deterministic candidate
+		// (the candidate would have minted in ensureProjectAuthority). Route the
+		// bootstrap admission to the candidate at epoch 1: ReserveProjectCapacity
+		// re-derives the holder from its own membership view and mints before
+		// admitting, so we are not taking our own stale view's word for anything.
+		candidate := s.derivedProjectHolder(ctx, project)
+		if candidate == "" || candidate == s.hostName {
+			// No candidate derivable (hosts unreadable), or derivation names us
+			// while the mint above did not stick — both are transient state
+			// problems, and the caller retries.
+			return "", "", 0, status.Errorf(codes.Unavailable,
+				"project %q has no admission authority and no reachable candidate; retry", project)
+		}
+		auth = corrosion.ProjectAuthority{Holder: candidate, Epoch: 1}
 	}
 	if auth.Holder == s.hostName {
 		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, cpuDelta, memDelta)

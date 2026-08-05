@@ -117,12 +117,29 @@ func (l *reservationLease) allowCommit(ctx context.Context) error {
 	if l == nil || l.s == nil || l.quotaEpoch == 0 {
 		return nil
 	}
-	ok, err := corrosion.ValidateProjectAuthority(ctx, l.s.db, l.quotaProject, l.quotaEpoch, l.quotaHolder)
+	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, l.s.db, l.quotaProject)
 	if err != nil {
 		return status.Errorf(codes.Unavailable,
 			"cannot confirm project-quota authority for %q before committing: %v", l.quotaProject, err)
 	}
 	if !ok {
+		// OUR replica has no authority row at all. At the bootstrap epoch that is
+		// the expected state everywhere but the holder: the grant was routed to the
+		// derived candidate, which minted on ITS replica, and this fence runs before
+		// that mint can possibly have replicated back — failing here would abort
+		// every routed first admission of every project. Absence tells us nothing
+		// about movement (a fence read is only ever as fresh as this replica, its
+		// documented limit), so the bootstrap grant commits. A LATER epoch is
+		// different: we read that row locally when admitting, and epoch rows are
+		// never deleted, so its disappearance is a state problem — fail closed.
+		if l.quotaEpoch == 1 {
+			return nil
+		}
+		return status.Errorf(codes.Unavailable,
+			"project-quota authority for %q (granted at epoch %d) is no longer readable in the local replica; "+
+				"nothing was committed — retry", l.quotaProject, l.quotaEpoch)
+	}
+	if cur.Epoch != l.quotaEpoch || cur.Holder != l.quotaHolder {
 		return status.Errorf(codes.Aborted,
 			"project-quota authority for %q moved past epoch %d while this request was in flight; "+
 				"nothing was committed — retry", l.quotaProject, l.quotaEpoch)

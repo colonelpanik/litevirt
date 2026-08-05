@@ -215,10 +215,18 @@ func (s *Server) admitWithReservationID(
 // project quota — the start paths, where the allocation is already counted in
 // project usage whether the workload is running or stopped, so charging it again
 // would refuse a plain stop/start of any workload over half its quota.
+//
+// resourceID ("vm:<name>" / "ct:<name>") names the workload for the SAFETY gate
+// only. A host-only admission still concerns a specific workload, and the
+// ownership-dispute check keys on that identity: with an empty subject a disputed
+// workload could be started or migrated onto a host the dispute does not involve,
+// quietly adding another holder. The quota figures stay zero regardless — identity
+// here never charges anything.
 func (s *Server) admitHostWithReservation(
-	ctx context.Context, method, host, project string, cpuDelta, memDelta int, newVMOnHost bool,
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, newVMOnHost bool,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, "", method, host, project, "", quotaSubject{}, cpuDelta, memDelta, false, newVMOnHost)
+	return s.admitReserved(ctx, "", method, host, project, resourceID,
+		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, false, newVMOnHost)
 }
 
 // reserveWithoutCheck publishes a HOST reservation without verifying it fits —

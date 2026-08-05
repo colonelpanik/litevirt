@@ -1098,7 +1098,7 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-			lease, aerr := s.reserveWithoutCheck(ctx, "StartVM", vm.HostName, vm.Project, "", int(spec.Cpu), int(spec.MemoryMib))
+			lease, aerr := s.reserveWithoutCheck(ctx, "StartVM", vm.HostName, vm.Project, "vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib))
 			if aerr != nil {
 				return nil, aerr
 			}
@@ -1111,7 +1111,7 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
 			// per-VM overhead subtraction, so starting it adds both its guest memory
 			// and a new qemu overhead.
-			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib), true)
+			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, "vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), true)
 			if aerr != nil {
 				return nil, aerr
 			}

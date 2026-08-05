@@ -32,7 +32,7 @@ func TestReservationLease_ReleasesUnderACancelledContext(t *testing.T) {
 
 	admissionHost(t, s)
 
-	lease, err := s.admitHostWithReservation(ctx, "MigrateVM", "test-host", "_default", 1, 1024, false)
+	lease, err := s.admitHostWithReservation(ctx, "MigrateVM", "test-host", "_default", "vm:release-test", 1, 1024, false)
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}

@@ -87,7 +87,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	// peer-migrate and does NOT admit again (backup_container.go), so one move
 	// reserves exactly once instead of demanding twice the container's memory.
 	if rec.MemMiB > 0 {
-		lease, aerr := s.admitHostWithReservation(ctx, "MigrateContainer", req.TargetHost, project, 0, rec.MemMiB, false)
+		lease, aerr := s.admitHostWithReservation(ctx, "MigrateContainer", req.TargetHost, project, "ct:"+req.Name, 0, rec.MemMiB, false)
 		if aerr != nil {
 			return aerr
 		}

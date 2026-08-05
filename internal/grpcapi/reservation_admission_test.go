@@ -151,7 +151,7 @@ func TestAdmitHostWithReservation_DoesNotChargeProjectQuota(t *testing.T) {
 		t.Fatalf("ProjectReserved: %v", err)
 	}
 
-	lease, err := s.admitHostWithReservation(ctx, "StartVM", "test-host", "_default", 1, 1024, false)
+	lease, err := s.admitHostWithReservation(ctx, "StartVM", "test-host", "_default", "vm:res-test", 1, 1024, false)
 	if err != nil {
 		t.Fatalf("host-only admission: %v", err)
 	}

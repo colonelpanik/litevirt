@@ -68,7 +68,7 @@ func TestAdmitHostWithReservation_HoldsHostCapacityWithoutChargingQuota(t *testi
 	ctx := context.Background()
 	authorityHost(t, s, "_default")
 
-	lease, err := s.admitHostWithReservation(ctx, "StartVM", s.hostName, "_default", 2, 2048, false)
+	lease, err := s.admitHostWithReservation(ctx, "StartVM", s.hostName, "_default", "vm:facts-test", 2, 2048, false)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}

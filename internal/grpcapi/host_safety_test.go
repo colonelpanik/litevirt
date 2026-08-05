@@ -71,6 +71,47 @@ func TestHostSafety_AffectedWorkloadBlockedEverywhere(t *testing.T) {
 	}
 }
 
+// TestHostSafety_DisputedWorkloadBlockedOnUninvolvedHost: the HOST-ONLY
+// admissions (start, migrate, restore) carry the workload's identity, so a
+// disputed workload refuses even on a host the dispute does not involve.
+// Without the identity the gate can only match on host involvement, and
+// starting or migrating the workload onto a clean third host would quietly
+// add another holder to a disk the cluster already knows is contested.
+func TestHostSafety_DisputedWorkloadBlockedOnUninvolvedHost(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+	seedOwnershipCondition(t, s, "vm_dual_run", "vm", "split", "h1", "h2")
+	seedOwnershipCondition(t, s, "ct_dual_run", "container", "webct", "h1", "h2")
+
+	// test-host is uninvolved in either condition; identity alone must refuse.
+	_, err := s.admitHostWithReservation(context.Background(), "MigrateVM", "test-host", "proj",
+		"vm:split", 2, 2048, true)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("migrating a disputed VM onto an uninvolved host: got %v, want FailedPrecondition", err)
+	}
+	_, err = s.admitHostWithReservation(context.Background(), "StartContainer", "test-host", "proj",
+		"ct:webct", 0, 512, false)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("starting a disputed container on an uninvolved host: got %v, want FailedPrecondition", err)
+	}
+	// The overcommit draw carries identity too — bypassing the numeric check
+	// must not also bypass the dispute.
+	_, err = s.reserveWithoutCheck(context.Background(), "StartVM", "test-host", "proj",
+		"vm:split", 2, 2048)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("overcommit start of a disputed VM on an uninvolved host: got %v, want FailedPrecondition", err)
+	}
+
+	// An UNRELATED workload on the same clean host still admits — the refusal
+	// above is the identity, not the host.
+	lease, err := s.admitHostWithReservation(context.Background(), "StartVM", "test-host", "proj",
+		"vm:unrelated", 1, 512, true)
+	if err != nil {
+		t.Fatalf("unrelated workload refused on a clean host: %v", err)
+	}
+	lease.release(context.Background())
+}
+
 // TestHostSafety_OvercommitCannotBypass: --allow-overcommit bypasses numeric
 // headroom only. The overcommit draw path consults the same gate.
 func TestHostSafety_OvercommitCannotBypass(t *testing.T) {

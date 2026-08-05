@@ -188,7 +188,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// setup (PCI preflight, network provisioning, cloud-init, disk stubs) so a
 	// refusal wastes no work. The figures are the VM's ACTUAL allocation, which is
 	// what the target's usage will report once the VM lands there.
-	migLease, err := s.admitHostWithReservation(ctx, "MigrateVM", targetHost.Name, vm.Project, vm.CPUActual, vm.MemActual, true)
+	migLease, err := s.admitHostWithReservation(ctx, "MigrateVM", targetHost.Name, vm.Project, "vm:"+vm.Name, vm.CPUActual, vm.MemActual, true)
 	if err != nil {
 		return err
 	}

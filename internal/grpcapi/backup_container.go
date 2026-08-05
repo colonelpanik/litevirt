@@ -700,16 +700,24 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
 	}
 
-	// Capacity + quota admission, MEMORY only — a container's cpu_limit is CPU
-	// *shares* (a relative cgroup weight), not a vCPU reservation, so only its
-	// memory cap is comparable to a VM's, and an uncapped container reserves
-	// nothing (mirrors CreateContainer). Restore admitted NOTHING, so a full-sized
-	// container could be materialised on any host, at any size, past both that
-	// host's capacity and its project's quota — while CreateContainer refused the
-	// identical shape.
+	// Capacity + quota admission, the SAME two-scope split as CreateContainer.
 	//
-	// WHICH admission depends on the caller, because one handler serves three with
-	// different accounting:
+	//   HOST capacity — memory only. A container's cpu_limit is CPU *shares* (a
+	//   relative cgroup weight), not a vCPU reservation, so it must not be added
+	//   to a host's vCPU total; an uncapped container reserves nothing, matching
+	//   how it is accounted.
+	//
+	//   PROJECT quota — CPU **and** memory. SumProjectUsage counts the restored
+	//   row's cpu_limit against the project vCPU budget the moment it lands, so
+	//   admission has to charge it or the limit is unenforceable — and it must run
+	//   whenever EITHER dimension is set: this path previously passed 0 for CPU
+	//   and ran only when memory was non-zero, so a CPU-limited container with
+	//   unlimited memory was restored past every gate this handler has (no host
+	//   check, no quota check, no host-safety check) while CreateContainer refused
+	//   the identical shape.
+	//
+	// WHICH halves run depends on the caller, because one handler serves three
+	// with different accounting:
 	//
 	//   - operator restore → a NEW allocation (the source container, if it still
 	//     exists, is still counted), so quota is charged, exactly like a create.
@@ -724,24 +732,28 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	//     (migrate_container.go), so re-admitting here would demand twice the
 	//     container's memory and refuse migrations that fit.
 	//
-	// It runs before the import, so a refusal costs no I/O; the lease is released
-	// when this handler returns, i.e. after the container's own row lands and
-	// accounts for the same memory.
-	if mem := spec.MemMiB; mem > 0 && s.migrateSourceFromPeer(ctx) == "" {
-		var (
-			lease *reservationLease
-			aerr  error
-		)
-		if req.Proof != nil || relocateTokenFromMD(ctx) != "" {
-			lease, aerr = s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, mem, false)
-		} else {
-			lease, aerr = s.admitWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, mem, false)
+	// It runs before the import, so a refusal costs no I/O; the leases are
+	// released when this handler returns, i.e. after the container's own row lands
+	// and accounts for the same figures.
+	if s.migrateSourceFromPeer(ctx) == "" {
+		relocation := req.Proof != nil || relocateTokenFromMD(ctx) != ""
+		if spec.MemMiB > 0 {
+			lease, aerr := s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, spec.MemMiB, false)
+			if aerr != nil {
+				s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+				return aerr
+			}
+			defer lease.release(ctx)
 		}
-		if aerr != nil {
-			s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
-			return aerr
+		if !relocation && (spec.CPULimit > 0 || spec.MemMiB > 0) {
+			lease, aerr := s.admitQuotaWithReservation(ctx, "RestoreContainer", s.hostName, project,
+				corrosion.WorkloadContainer, req.Name, spec.CPULimit, spec.MemMiB, spec.CPULimit, spec.MemMiB, true)
+			if aerr != nil {
+				s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+				return aerr
+			}
+			defer lease.release(ctx)
 		}
-		defer lease.release(ctx)
 	}
 
 	send := func(p *pb.RestoreContainerProgress) error { return stream.Send(p) }

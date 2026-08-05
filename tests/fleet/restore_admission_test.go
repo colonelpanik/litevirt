@@ -350,6 +350,60 @@ func TestFleet_RestoreContainer_ChargesTheProjectsQuota(t *testing.T) {
 	}
 }
 
+// TestFleet_RestoreContainer_CPUOnlyRestoreIsStillAdmitted: a CPU-limited,
+// memory-UNLIMITED container must draw on the project's vCPU budget when
+// restored. The old gate keyed the whole admission on memory being non-zero and
+// passed 0 for CPU, so this exact shape was materialised past every check the
+// handler has — no host check, no quota check, no host-safety check — and then
+// its cpu_limit was persisted and counted by SumProjectUsage anyway. Restore
+// must use the same host-memory / project-CPU+memory split as CreateContainer.
+func TestFleet_RestoreContainer_CPUOnlyRestoreIsStillAdmitted(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	src, dst := c.Nodes[0], c.Nodes[1]
+
+	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	if err := corrosion.InsertProject(ctx, src.DB, corrosion.ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatalf("InsertProject: %v", err)
+	}
+	// The live source (3 vCPU) already occupies 3 of the 4 vCPU ceiling, so
+	// restoring a second instance (another 3) must refuse.
+	if err := corrosion.UpsertProjectQuota(ctx, src.DB, corrosion.ProjectQuotaRecord{
+		ProjectName: "/acme", VCPULimit: 4,
+	}); err != nil {
+		t.Fatalf("UpsertProjectQuota: %v", err)
+	}
+	createSizedContainer(t, c, src, "ct-cpu", "/acme", 3, 0)
+	repo, ts := backupContainer(t, c, src, "ct-cpu")
+
+	err := restoreContainerAt(t, c, dst, repo, "ct-cpu", ts)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("restoring a 3 vCPU (memory-unlimited) container into a project 3 vCPU into its 4 vCPU ceiling: "+
+			"got %v, want ResourceExhausted — memory==0 must not skip the CPU quota charge", err)
+	}
+	if got := len(dst.CT.ImportCalls()); got != 0 {
+		t.Errorf("target imported the rootfs %d times despite refusing; want 0", got)
+	}
+
+	// Control: within a raised ceiling the same restore lands, with its CPU limit.
+	if err := corrosion.UpsertProjectQuota(ctx, src.DB, corrosion.ProjectQuotaRecord{
+		ProjectName: "/acme", VCPULimit: 8,
+	}); err != nil {
+		t.Fatalf("raise quota: %v", err)
+	}
+	if err := restoreContainerAt(t, c, dst, repo, "ct-cpu", ts); err != nil {
+		t.Fatalf("restore within an 8 vCPU ceiling: %v", err)
+	}
+	rec, gerr := corrosion.GetContainer(ctx, dst.DB, dst.Name, "ct-cpu")
+	if gerr != nil || rec == nil {
+		t.Fatalf("restored row: rec=%v err=%v", rec, gerr)
+	}
+	if rec.CPULimit != 3 || rec.MemMiB != 0 {
+		t.Errorf("restored limits cpu=%d mem=%d, want 3/0", rec.CPULimit, rec.MemMiB)
+	}
+}
+
 // TestFleet_RestoreContainer_FailoverRelocationIsNotBlockedByQuota is the
 // regression the quota charge above must NOT cause.
 //

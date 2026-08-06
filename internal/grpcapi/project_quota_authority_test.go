@@ -342,14 +342,14 @@ func TestAdmitProjectQuota_UnobservedChargeAggregatesCorrectly(t *testing.T) {
 func TestQuotaLease_OnlyOneNodeCanHold(t *testing.T) {
 	s, ctx := quotaServer(t, 8, 8192)
 
-	held, holder, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "node-a")
+	held, holder, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "node-a")
 	if err != nil || !held || holder != "node-a" {
 		t.Fatalf("first acquire: held=%v holder=%q err=%v", held, holder, err)
 	}
 
 	// A second node attempting while the lease is LIVE must lose, and must be told
 	// who actually holds it so it can route there.
-	held2, holder2, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "node-b")
+	held2, holder2, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "node-b")
 	if err != nil {
 		t.Fatalf("second acquire: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestQuotaLease_OnlyOneNodeCanHold(t *testing.T) {
 	}
 
 	// The holder can renew.
-	if held3, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "node-a"); err != nil || !held3 {
+	if held3, _, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "node-a"); err != nil || !held3 {
 		t.Errorf("holder renewal: held=%v err=%v", held3, err)
 	}
 }
@@ -372,7 +372,7 @@ func TestQuotaLease_OnlyOneNodeCanHold(t *testing.T) {
 func TestQuotaLease_ExpiredLeaseIsNotServable(t *testing.T) {
 	s, ctx := quotaServer(t, 8, 8192)
 
-	if _, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "dead-node"); err != nil {
+	if _, _, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "dead-node"); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	// Expire it by hand — the lease is just a row.
@@ -387,7 +387,7 @@ func TestQuotaLease_ExpiredLeaseIsNotServable(t *testing.T) {
 			"keep the project's authority", ok, err)
 	}
 	// And another node can now take it.
-	if held, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "live-node"); err != nil || !held {
+	if held, _, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "live-node"); err != nil || !held {
 		t.Errorf("acquire after expiry: held=%v err=%v", held, err)
 	}
 }
@@ -401,7 +401,7 @@ func TestAdmitProjectQuota_NonHolderRedirectsInsteadOfErroring(t *testing.T) {
 	s, ctx := quotaServer(t, 8, 8192)
 
 	// Someone else holds a live lease, so this node is not the authority.
-	if _, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "other-node"); err != nil {
+	if _, _, _, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, "/acme", "other-node"); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
@@ -1138,4 +1138,131 @@ type failingReservationSource struct{}
 
 func (failingReservationSource) FetchProjectQuotaReservations(context.Context, string, string) ([]corrosion.QuotaReservation, error) {
 	return nil, errors.New("unreachable")
+}
+
+// TestAuthorityTerm_ReacquisitionAfterLosingItRequiresANewDrain is the regression test for
+// a same-host reacquisition inheriting an old reconciled term.
+//
+// Terms were identified by a "lease:<holder>" prefix, so if A reconciled, lost authority to
+// B, and later reacquired, the prefix still matched and noteAuthorityTerm read the takeover
+// as a renewal — skipping the drain and missing every reservation B granted. Nothing
+// cleared the term on loss either.
+func TestAuthorityTerm_ReacquisitionAfterLosingItRequiresANewDrain(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+
+	// A holds and reconciles.
+	if held, _, err := s.holdsQuotaLease(ctx, "/acme"); err != nil || !held {
+		t.Fatalf("initial acquire: held=%v err=%v", held, err)
+	}
+	if err := s.ensureReconciledForTerm(ctx, "/acme"); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	st := s.projectAdmitStateFor("/acme")
+	st.mu.Lock()
+	firstTerm := st.term
+	reconciled := st.reconciledTerm == st.term && st.term != ""
+	st.mu.Unlock()
+	if !reconciled {
+		t.Fatal("test premise: the first term should be reconciled")
+	}
+
+	// Authority goes to B and comes back to us — B's tenure sits in between.
+	if err := s.db.Execute(ctx,
+		`UPDATE leader_election SET holder = ?, expires_at = ? WHERE key = ?`,
+		"node-b", "2000-01-01T00:00:00Z", corrosion.QuotaLeaseKey("/acme")); err != nil {
+		t.Fatalf("hand lease to B: %v", err)
+	}
+	if held, _, err := s.holdsQuotaLease(ctx, "/acme"); err != nil || !held {
+		t.Fatalf("reacquire: held=%v err=%v", held, err)
+	}
+
+	st.mu.Lock()
+	newTerm, newReconciled := st.term, st.reconciledTerm
+	st.mu.Unlock()
+	if newTerm == firstTerm {
+		t.Error("reacquisition after another node's tenure reused the old term — the drain is " +
+			"skipped and every reservation the other node granted is invisible")
+	}
+	if newReconciled == newTerm && newTerm != "" {
+		t.Error("the new term was already marked reconciled; a takeover must require a fresh drain")
+	}
+}
+
+// TestAuthorityTerm_RenewalDoesNotForceARedrain: the converse. An unbroken renewal must keep
+// its term, or every renewal tick would re-drain every voter.
+func TestAuthorityTerm_RenewalDoesNotForceARedrain(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	if held, _, err := s.holdsQuotaLease(ctx, "/acme"); err != nil || !held {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := s.ensureReconciledForTerm(ctx, "/acme"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	st := s.projectAdmitStateFor("/acme")
+	st.mu.Lock()
+	before := st.term
+	st.mu.Unlock()
+
+	// Renew twice; the tenure is unbroken, so the term must not move.
+	for i := 0; i < 2; i++ {
+		if held, _, err := s.holdsQuotaLease(ctx, "/acme"); err != nil || !held {
+			t.Fatalf("renew %d: held=%v err=%v", i, held, err)
+		}
+	}
+	st.mu.Lock()
+	after, rec := st.term, st.reconciledTerm
+	st.mu.Unlock()
+	if after != before {
+		t.Errorf("renewal minted a new term (%q → %q); every tick would then re-drain the fleet",
+			before, after)
+	}
+	if rec != after {
+		t.Error("renewal cleared the reconciliation for an unbroken tenure")
+	}
+}
+
+// TestEnsureReconciledForTerm_TermChangeDuringTheDrainIsAnError is the regression test for
+// reporting success after the tenure turned over mid-drain.
+//
+// Declining to mark the OLD term was right; returning nil was not. The caller then took the
+// mutex and wrote a reservation under a term nothing had reconciled.
+func TestEnsureReconciledForTerm_TermChangeDuringTheDrainIsAnError(t *testing.T) {
+	s, ctx := quotaServer(t, 8, 8192)
+	if held, _, err := s.holdsQuotaLease(ctx, "/acme"); err != nil || !held {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Peers are required for the drain to call the source at all (with one host it has
+	// nothing to fetch).
+	for _, h := range []string{"peer-b", "peer-c"} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+			Name: h, Address: "10.0.0.2", SSHUser: "root", GRPCPort: 7443,
+			State: "active", Role: "worker", CertSerial: "s-" + h,
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	// Move the term while the drain is in flight, the way a real handoff would.
+	s.reservationSourceOverride = termShiftingSource{s: s, project: "/acme"}
+	st := s.projectAdmitStateFor("/acme")
+	st.mu.Lock()
+	st.reconciledTerm = ""
+	st.mu.Unlock()
+
+	err := s.ensureReconciledForTerm(ctx, "/acme")
+	var recon errQuotaReconcileIncomplete
+	if !errors.As(err, &recon) {
+		t.Fatalf("drain during which the term changed: got %v, want errQuotaReconcileIncomplete — "+
+			"returning nil lets the caller write a reservation under an unreconciled term", err)
+	}
+}
+
+// termShiftingSource simulates the tenure turning over during the network drain.
+type termShiftingSource struct {
+	s       *Server
+	project string
+}
+
+func (t termShiftingSource) FetchProjectQuotaReservations(context.Context, string, string) ([]corrosion.QuotaReservation, error) {
+	t.s.noteAuthorityTerm(t.project, true) // a takeover lands mid-drain
+	return nil, nil
 }

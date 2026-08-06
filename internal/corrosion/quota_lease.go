@@ -69,8 +69,25 @@ func ProjectFromQuotaLeaseKey(key string) (string, bool) {
 //
 // currentHolder is who the lease says holds it after the attempt, so a loser can
 // route there instead of guessing.
-func AcquireProjectQuotaLease(ctx context.Context, c *Client, project, holder string) (held bool, currentHolder string, err error) {
+// AcquireProjectQuotaLease also reports prevHolder: whoever the lease row named
+// IMMEDIATELY BEFORE this write.
+//
+// That is what distinguishes a fresh acquisition from a renewal, and a prefix on the
+// holder name is not: if A reconciles, loses authority to B, and later reacquires, the
+// name is still A, so a name-based check reads the takeover as a renewal and skips the
+// drain — missing every reservation B granted. prevHolder != self means someone else (or
+// nobody) held it in between, which is exactly the condition that invalidates a previous
+// reconciliation.
+//
+// prevHolder == self across a LAPSE is safe to treat as continuation: another node could
+// only have granted reservations by holding the lease, and holding it would have left its
+// name here.
+func AcquireProjectQuotaLease(ctx context.Context, c *Client, project, holder string) (held bool, currentHolder, prevHolder string, err error) {
 	key := QuotaLeaseKey(project)
+	// Read BEFORE the upsert. A missing row reports "" — also a takeover.
+	if prev, perr := c.Query(ctx, `SELECT holder FROM leader_election WHERE key = ?`, key); perr == nil && len(prev) > 0 {
+		prevHolder = prev[0].String("holder")
+	}
 	now := time.Now().UTC()
 	nowRFC := now.Format(time.RFC3339)
 	expiresAt := now.Add(quotaLeaseTTL).Format(time.RFC3339)
@@ -89,17 +106,17 @@ func AcquireProjectQuotaLease(ctx context.Context, c *Client, project, holder st
 		   WHERE leader_election.expires_at < ?
 		      OR leader_election.holder = excluded.holder`,
 		key, holder, expiresAt, nowRFC, nowRFC); err != nil {
-		return false, "", err
+		return false, "", prevHolder, err
 	}
 
 	cur, ok, err := ProjectQuotaLeaseHolder(ctx, c, project)
 	if err != nil {
-		return false, "", err
+		return false, "", prevHolder, err
 	}
 	if !ok {
-		return false, "", nil
+		return false, "", prevHolder, nil
 	}
-	return cur == holder, cur, nil
+	return cur == holder, cur, prevHolder, nil
 }
 
 // ProjectQuotaLeaseHolder returns the current UNEXPIRED lease holder, if any. An

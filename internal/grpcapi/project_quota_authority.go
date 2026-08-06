@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -241,11 +240,12 @@ func (s *Server) projectQuotaHolder(ctx context.Context, project string) (string
 			"project", project, "reason", reason)
 		return "", 0, nil
 	}
-	held, currentHolder, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, project, s.hostName)
+	held, currentHolder, prevHolder, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, project, s.hostName)
 	if err != nil {
 		return "", 0, err
 	}
 	if held {
+		s.noteAuthorityTerm(project, prevHolder != s.hostName)
 		// Reconciliation is NOT done here. Acquisition is only one of several ways to
 		// start serving, so the drain is enforced per authority TERM on the admission
 		// path itself — see ensureReconciledForTerm.
@@ -264,9 +264,11 @@ func (s *Server) holdsQuotaLease(ctx context.Context, project string) (bool, str
 		return false, "", err
 	} else if ok {
 		if cur.Holder == s.hostName {
-			// An explicit TRANSFER is also a new authority term, and it previously
-			// bypassed reconciliation entirely. The epoch names the term.
-			s.noteAuthorityTerm(project, fmt.Sprintf("epoch:%d", cur.Epoch))
+			// An explicit TRANSFER is a new authority term too, and it previously bypassed
+			// reconciliation entirely. A different epoch means a different tenure.
+			s.noteEpochTerm(project, cur.Epoch)
+		} else {
+			s.clearAuthorityTerm(project)
 		}
 		return cur.Holder == s.hostName, cur.Holder, nil
 	}
@@ -289,35 +291,62 @@ func (s *Server) holdsQuotaLease(ctx context.Context, project string) (bool, str
 	}
 	// Renew-or-confirm. The conditional upsert only wins on an expired lease or a
 	// renewal by us, so this cannot steal a live peer's lease.
-	held, currentHolder, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, project, s.hostName)
+	held, currentHolder, prevHolder, err := corrosion.AcquireProjectQuotaLease(ctx, s.db, project, s.hostName)
 	if err != nil {
 		return false, "", err
 	}
 	if held {
-		// Stamp a term. A RENEWAL keeps the existing one (we never stopped being the
-		// authority); a fresh acquisition mints a new one, which invalidates any earlier
-		// reconciliation and forces a drain before we admit again.
-		s.noteAuthorityTerm(project, "lease:"+currentHolder)
+		// prevHolder, not a name prefix, decides whether this is a TAKEOVER. If we
+		// reconciled, lost authority to another node, and later reacquired, our name is
+		// unchanged — so a name-based check read that as a renewal and skipped the drain,
+		// missing every reservation the other node granted.
+		s.noteAuthorityTerm(project, prevHolder != s.hostName)
+	} else {
+		// Not the authority: drop the term so a later reacquisition cannot inherit a
+		// reconciliation that predates someone else's tenure.
+		s.clearAuthorityTerm(project)
 	}
 	return held, currentHolder, nil
 }
 
-// noteAuthorityTerm records the authority term, minting a new one when this node was not
-// already serving under it. Renewals are idempotent; a gap is not.
-func (s *Server) noteAuthorityTerm(project, base string) {
+// noteAuthorityTerm records the current authority tenure. takeover=true mints a NEW term,
+// which invalidates any previous reconciliation; a renewal keeps the existing one.
+func (s *Server) noteAuthorityTerm(project string, takeover bool) {
 	st := s.projectAdmitStateFor(project)
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.term != "" && strings.HasPrefix(st.term, base+"|") {
-		return // same authority, continuing — renewal
+	if !takeover && st.term != "" {
+		return // our own unbroken renewal
 	}
 	id, err := newReservationID()
 	if err != nil {
-		id = base
+		id = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	st.term = base + "|" + id
-	// A new term has NOT been reconciled, whatever an earlier one had done.
+	st.term = "lease:" + id
+	st.reconciledTerm = "" // a new tenure has reconciled nothing
+}
+
+// noteEpochTerm records a tenure established by an explicit authority transfer. The epoch
+// identifies it, so re-reading the same epoch is a continuation.
+func (s *Server) noteEpochTerm(project string, epoch int64) {
+	st := s.projectAdmitStateFor(project)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	term := fmt.Sprintf("epoch:%d", epoch)
+	if st.term == term {
+		return
+	}
+	st.term = term
 	st.reconciledTerm = ""
+}
+
+// clearAuthorityTerm forgets the tenure when this node is not the authority, so a later
+// reacquisition cannot inherit a reconciliation that predates another node's tenure.
+func (s *Server) clearAuthorityTerm(project string) {
+	st := s.projectAdmitStateFor(project)
+	st.mu.Lock()
+	st.term, st.reconciledTerm = "", ""
+	st.mu.Unlock()
 }
 
 // ensureReconciledForTerm drains the voters' reservation state once per authority term,
@@ -349,12 +378,19 @@ func (s *Server) ensureReconciledForTerm(ctx context.Context, project string) er
 			detail: "could not read a quorum of voters' reservations"}
 	}
 	st.mu.Lock()
-	// Only mark the term we actually reconciled: if authority changed underneath us the
-	// term moved on and this drain does not count for it.
-	if st.term == term {
+	moved := st.term != term
+	if !moved {
 		st.reconciledTerm = term
 	}
 	st.mu.Unlock()
+	if moved {
+		// Authority changed while we were draining over the network. Declining to mark the
+		// old term was right but returning nil was not: the caller would go on to take the
+		// mutex and write a reservation under a term nothing has reconciled. Refuse and let
+		// it retry, which re-drains for the new term.
+		return errQuotaReconcileIncomplete{project: project,
+			detail: "authority term changed during reconciliation; retry"}
+	}
 	return nil
 }
 
@@ -420,6 +456,15 @@ func (s *Server) admitProjectQuotaLocal(ctx context.Context, project string, cpu
 	st := s.projectAdmitStateFor(project)
 	st.mu.Lock()
 	defer st.mu.Unlock()
+
+	// Re-validate UNDER THE MUTEX, immediately before writing. ensureReconciledForTerm ran
+	// outside it and did network I/O, so the tenure can have turned over in between — and a
+	// reservation written under an unreconciled term is one the authority cannot account
+	// for.
+	if st.term == "" || st.reconciledTerm != st.term {
+		return Admission{}, errQuotaReconcileIncomplete{project: project,
+			detail: "authority term is not reconciled at reservation time; retry"}
+	}
 
 	id, err := newReservationID()
 	if err != nil {

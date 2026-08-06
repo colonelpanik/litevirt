@@ -265,6 +265,16 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 func (s *Server) admitResizeReservation(
 	ctx context.Context, opID, method, principal string, vm *corrosion.VMRecord, cpuDelta, memDelta, wantCPU, wantMem int,
 ) (*reservationLease, error) {
+	// The same host-safety gate as the equivalent UpdateVM grow
+	// (admitGrowWithReservation → admitReserved → checkHostSafety): a resize is
+	// not new residency, but a grow of a DISPUTED workload — or onto a host
+	// involved in an active ownership condition — must refuse here exactly as
+	// it does on every other admission path. Before the zero-delta fast path,
+	// same as everywhere else.
+	if err := s.checkHostSafety(ctx, vm.HostName, corrosion.WorkloadVM, vm.Name, false,
+		cpuDelta > 0 || memDelta > 0); err != nil {
+		return nil, err
+	}
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
 	}

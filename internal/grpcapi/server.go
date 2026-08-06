@@ -274,22 +274,6 @@ type Server struct {
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
 
-	// hostAdmit serializes host-capacity ADMISSION on this node and records the
-	// grows this node has admitted but not yet committed. See admitHostCapacity
-	// for why the ledger — not the lock — is what makes admission safe.
-	//
-	// A SEPARATE map from vmLocks, not a namespaced key in it: vmLocks is keyed by
-	// bare VM name, so a host and a VM sharing a name would collide on one
-	// non-reentrant mutex and StartVM would self-deadlock. It also carries the
-	// counters, which vmLocks' signature cannot.
-	hostAdmitMu sync.Mutex
-	hostAdmit   map[string]*hostAdmitState
-
-	// projectAdmit does the same for project-quota admission, keyed by normalized
-	// project name. Only meaningful on the project's authority holder — see
-	// admitProjectQuota.
-	projectAdmitMu sync.Mutex
-	projectAdmit   map[string]*hostAdmitState
 
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets
@@ -1045,8 +1029,6 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		images:         images,
 		events:         events.NewBus(),
 		vmLocks:        make(map[string]*sync.Mutex),
-		hostAdmit:      make(map[string]*hostAdmitState),
-		projectAdmit:   make(map[string]*hostAdmitState),
 		loginThrottle:  newLoginThrottle(),
 		ReExecCh:       make(chan struct{}, 1),
 		ShutdownCh:     make(chan struct{}, 1),

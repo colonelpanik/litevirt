@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -10,191 +9,21 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// hostAdmitState is the per-host (or per-project) admission ledger: a leaf mutex
-// plus the resources this node has admitted but not yet committed.
+// ADMISSION CONTRACT — who may be admitted at all.
 //
-// mu is a LEAF lock. Only local DB READS happen under it — no writes (those take
-// the corrosion client mutex), no lockVM, and never a peer RPC. That is what makes
-// it impossible for it to participate in a lock cycle.
-type hostAdmitState struct {
-	mu         sync.Mutex
-	pendingCPU int // admitted-but-uncommitted vCPU
-	pendingMem int // admitted-but-uncommitted MiB
-}
+// Capacity admission is for OPERATOR-INITIATED requests only (create, start,
+// restart-of-stopped, clone, import, restore, migrate, promote, resize). The
+// automated recovery paths (startVMLocked's reconciler/failover callers,
+// PrepareHardwareForStart, operation recovery) must never be admitted: after a
+// host reboot every VM restarts at once, and admitting there would start the
+// first few and strand the rest, turning a clean recovery into a partial one.
+// Do not push admission down into a shared primitive those paths also call.
+// (This doctrine predates reserve-then-verify — it used to live on the
+// in-process admission ledger that replicated reservations replaced — and it
+// binds the admitReserved family in reservation_admission.go exactly the same.)
 
 // noopRelease is the release func for an admission that reserved nothing.
 func noopRelease() {}
-
-func (s *Server) hostAdmitStateFor(host string) *hostAdmitState {
-	s.hostAdmitMu.Lock()
-	defer s.hostAdmitMu.Unlock()
-	if s.hostAdmit == nil {
-		s.hostAdmit = map[string]*hostAdmitState{}
-	}
-	st, ok := s.hostAdmit[host]
-	if !ok {
-		st = &hostAdmitState{}
-		s.hostAdmit[host] = st
-	}
-	return st
-}
-
-// releaseFor returns an idempotent release func that gives the reservation back.
-// Idempotent because a caller may both `defer release()` and release early; a
-// double release must never drive the ledger negative and hand out capacity twice.
-func (st *hostAdmitState) releaseFor(cpu, mem int) func() {
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			st.mu.Lock()
-			st.pendingCPU -= cpu
-			st.pendingMem -= mem
-			if st.pendingCPU < 0 {
-				st.pendingCPU = 0
-			}
-			if st.pendingMem < 0 {
-				st.pendingMem = 0
-			}
-			st.mu.Unlock()
-		})
-	}
-}
-
-// freeHostCapacityLocked reports free capacity net of this node's in-flight
-// admissions. Caller must hold st.mu when st != nil.
-func (s *Server) freeHostCapacityLocked(ctx context.Context, host string, st *hostAdmitState) (freeCPU, freeMem int, ok bool, err error) {
-	freeCPU, freeMem, ok, err = corrosion.HostFreeCapacityWithPolicy(ctx, s.db, host, s.capacity)
-	if err != nil || !ok {
-		return 0, 0, ok, err
-	}
-	if st != nil {
-		freeCPU -= st.pendingCPU
-		freeMem -= st.pendingMem
-	}
-	if freeCPU < 0 {
-		freeCPU = 0
-	}
-	if freeMem < 0 {
-		freeMem = 0
-	}
-	return freeCPU, freeMem, true, nil
-}
-
-// admitHostCapacity checks a proposed CPU/memory GROW (positive deltas, MiB)
-// against the target host's free capacity and, when the host is THIS node,
-// RESERVES it. The returned release func is never nil and must be deferred.
-//
-// Why a ledger and not just a lock. Between admission and the commit that makes
-// the workload visible to HostFreeCapacityWithPolicy, CreateVM does an image pull
-// (a blocking peer stream, potentially minutes), disk creation, cloud-init ISO
-// generation, DefineDomain/StartDomain and root PreStart hooks. A lock held across
-// that would serialize image transfers and would hold a process lock across a peer
-// RPC, which this codebase forbids (see StartVM). But a lock released before the
-// commit is useless on its own: two creates would both check, both see the same
-// free capacity, both pass, and both commit. So the lock's only job is making
-// check-then-reserve atomic, and the RESERVATION is what spans the commit.
-//
-// Scope, deliberately stated so nothing here overclaims:
-//   - The ledger is PER PROCESS. Two daemons admitting for the same host are kept
-//     apart only by the single-owner invariant, not by this lock.
-//   - It is LOST ON RESTART. In-flight admissions are forgotten, which is a bounded
-//     over-admission window, not a durable guarantee.
-//   - It covers vCPU and memory only.
-//
-// For a host that is NOT this node this is a lock-free, reservation-free fail-fast:
-// we will not commit there, so we must not reserve there either, and the owner
-// re-admits authoritatively when the request is forwarded.
-//
-// CONTRACT: this is for OPERATOR-initiated requests only. The automated recovery
-// paths (startVMLocked, PrepareHardwareForStart, the failover/reconciler restarts,
-// operation recovery) must never be admitted — after a host reboot every VM
-// restarts at once, and admitting there would start the first few and strand the
-// rest, turning a clean recovery into a partial one. Do not push admission down
-// into a shared primitive those paths also call.
-func (s *Server) admitHostCapacity(ctx context.Context, host string, cpuDelta, memMiBDelta int) (func(), error) {
-	if cpuDelta <= 0 && memMiBDelta <= 0 {
-		return noopRelease, nil // a shrink or no-op never needs capacity
-	}
-	if host != s.hostName {
-		return noopRelease, s.checkHostCapacity(ctx, host, cpuDelta, memMiBDelta)
-	}
-
-	st := s.hostAdmitStateFor(host)
-	st.mu.Lock()
-	freeCPU, freeMem, ok, err := s.freeHostCapacityLocked(ctx, host, st)
-	if err != nil {
-		st.mu.Unlock()
-		return noopRelease, status.Errorf(codes.Internal, "check host capacity: %v", err)
-	}
-	if ok && (cpuDelta > freeCPU || memMiBDelta > freeMem) {
-		st.mu.Unlock()
-		// "filled up" rather than "is full": the shortfall may be another
-		// in-flight request on this node, so the caller should retry.
-		return noopRelease, status.Errorf(codes.ResourceExhausted,
-			"host %s has insufficient free capacity for +%d vCPU/+%d MiB (free: %d vCPU/%d MiB, "+
-				"including admitted-but-uncommitted requests) — retry",
-			host, cpuDelta, memMiBDelta, freeCPU, freeMem)
-	}
-	cpu, mem := maxInt(cpuDelta, 0), maxInt(memMiBDelta, 0)
-	st.pendingCPU += cpu
-	st.pendingMem += mem
-	st.mu.Unlock()
-	return st.releaseFor(cpu, mem), nil
-}
-
-// reserveHostCapacity reserves a grow WITHOUT checking it — for
-// --allow-overcommit, which deliberately bypasses the host check but must still
-// make its own draw visible to a concurrent normal admission. Otherwise an
-// overcommit create would hide its memory from the very next request.
-func (s *Server) reserveHostCapacity(host string, cpuDelta, memMiBDelta int) func() {
-	if host != s.hostName || (cpuDelta <= 0 && memMiBDelta <= 0) {
-		return noopRelease
-	}
-	cpu, mem := maxInt(cpuDelta, 0), maxInt(memMiBDelta, 0)
-	st := s.hostAdmitStateFor(host)
-	st.mu.Lock()
-	st.pendingCPU += cpu
-	st.pendingMem += mem
-	st.mu.Unlock()
-	return st.releaseFor(cpu, mem)
-}
-
-// admitResources is the OWNER-SIDE admission: host capacity (serialized and
-// reserved when the host is this node) plus project quota. The returned release
-// func is never nil and must be deferred by the caller so the reservation
-// outlives the commit.
-//
-// intent.vmOverhead says whether a qemu domain is APPEARING on this host (a
-// create, or a start of a stopped VM) as opposed to a delta on one already
-// running. When set the HOST side is charged one extra qemu overhead, because
-// free capacity is computed net of one overhead per VM already there and the
-// incoming one is not counted yet. A delta on a running VM must NOT be charged
-// again — its overhead is already subtracted, so re-adding it would refuse a
-// legal grow, every time. (See admissionIntent for why overhead and residency
-// are separate facts.)
-//
-// The overhead is charged to the HOST only, never to project quota: it is a
-// physical cost of running qemu, not tenant-consumed memory, and folding it into
-// quota would quietly shrink every project's effective limit.
-//
-// The host lock is released before the quota step, which may make a peer RPC to
-// the project's authority holder. That ordering is load-bearing: never hold the
-// host lock across a peer call.
-func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, intent admissionIntent) (func(), error) {
-	hostMem := memMiBDelta
-	if intent.vmOverhead {
-		hostMem = s.capacity.MemChargeFor(memMiBDelta)
-	}
-	release, err := s.admitHostCapacity(ctx, host, cpuDelta, hostMem)
-	if err != nil {
-		return noopRelease, err
-	}
-	if err := s.checkProjectQuota(ctx, project, cpuDelta, memMiBDelta); err != nil {
-		release()
-		return noopRelease, err
-	}
-	return release, nil
-}
 
 func maxInt(a, b int) int {
 	if a > b {
@@ -219,23 +48,18 @@ func (s *Server) requireOvercommit(ctx context.Context, path string) error {
 //
 // This function only READS. It is NOT serialized against a concurrent admission:
 // two callers can both pass it and both proceed. Use it as a REMOTE fail-fast
-// only. A caller that will actually commit the workload must use
-// admitHostCapacity, which makes check-then-reserve atomic and holds the
-// reservation across the commit.
+// only. A caller that will actually commit the workload must use the
+// admitReserved family (reservation_admission.go), whose replicated
+// reservation spans the commit.
 func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, memMiBDelta int) error {
 	if cpuDelta <= 0 && memMiBDelta <= 0 {
 		return nil
 	}
 	// HostFreeCapacity nets out committed running-VM/container actuals and
-	// in-flight nonterminal operation reservations. For this host, also net out
-	// admissions this node has granted but not yet committed.
-	var st *hostAdmitState
-	if host == s.hostName {
-		st = s.hostAdmitStateFor(host)
-		st.mu.Lock()
-		defer st.mu.Unlock()
-	}
-	freeCPU, freeMem, ok, err := s.freeHostCapacityLocked(ctx, host, st)
+	// in-flight nonterminal operation reservations (reserve-then-verify made
+	// the replicated reservation the ONLY in-flight ledger; the old in-process
+	// one had no writers left and is gone).
+	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityWithPolicy(ctx, s.db, host, s.capacity)
 	if err != nil {
 		return status.Errorf(codes.Internal, "check host capacity: %v", err)
 	}
@@ -253,9 +77,9 @@ func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, m
 // from nonterminal operations as well as committed usage.
 //
 // Two concurrent callers CAN both pass it. It remains correct as a remote
-// fail-fast; a caller that will commit the workload must use admitResources, which
-// makes check-then-reserve atomic per host and routes project quota to the
-// project's authority holder.
+// fail-fast; a caller that will commit the workload must use the admitReserved
+// family, which reserves-then-verifies per host and routes project quota to
+// the project's authority holder.
 //
 // It returns codes.ResourceExhausted when a dimension would be exceeded, and nil for
 // a shrink/no-op (deltas ≤ 0 never need capacity). An unbounded project (no quota

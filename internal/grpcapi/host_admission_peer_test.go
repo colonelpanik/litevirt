@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // fakeDestPeer stands in for a migration DESTINATION daemon in single-server
@@ -294,5 +295,78 @@ func TestMigrateContainer_OldDestinationFailsClosed_BeforeStoppingAnything(t *te
 	}
 	if n := len(rt.stopCalls); n != 0 {
 		t.Fatalf("source container was stopped %d times for a migration the destination could not admit; want 0", n)
+	}
+}
+
+// TestDrainOneVM_TargetAdmissionRefusal_LeavesVMUntouched: drain is an
+// operator-initiated move and passes the same destination-owned admission as
+// an explicit migrate. A target that refuses (capacity, safety, or an old
+// daemon without the RPC) must leave the VM running on the source — no
+// shutdown, no ownership transfer.
+func TestDrainOneVM_TargetAdmissionRefusal_LeavesVMUntouched(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	fake := &fakeDestPeer{reserveErr: status.Error(codes.ResourceExhausted, "host drain-dst has insufficient free capacity")}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return fake, func() {}, nil
+	}
+	virt := libvirtfake.New()
+	s.virt = virt
+	virt.SetState("drained-vm", "running")
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "drained-vm", HostName: "test-host", State: "running",
+		CPUActual: 2, MemActual: 2048, Project: "proj", Spec: `{"name":"drained-vm","cpu":2,"memory_mib":2048}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	prog := s.drainOneVM(ctx, corrosion.VMRecord{Name: "drained-vm"}, corrosion.HostRecord{
+		Name: "drain-dst", Address: "10.0.0.77", State: "active",
+	})
+	if prog.Status == "done" {
+		t.Fatalf("drain onto a target that refused admission reported %q — the move must not happen", prog.Status)
+	}
+	rec, _ := corrosion.GetVM(ctx, s.db, "drained-vm")
+	if rec == nil || rec.HostName != "test-host" || rec.State != "running" {
+		t.Fatalf("refused drain disturbed the VM: %+v, want running on test-host", rec)
+	}
+	if st, _ := virt.DomainState("drained-vm"); st != "running" {
+		t.Fatalf("refused drain left the source domain %q, want running", st)
+	}
+}
+
+// TestDrainOneVM_AdmitsOnTargetAndReleases: the happy path asks the target
+// once with the VM's full residency intent, and the lease is handed back after
+// the move lands.
+func TestDrainOneVM_AdmitsOnTargetAndReleases(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	fake := fakeDestinationAdmission(s)
+	virt := libvirtfake.New()
+	s.virt = virt
+	virt.SetState("mover", "running")
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "mover", HostName: "test-host", State: "running",
+		CPUActual: 2, MemActual: 2048, Project: "proj", Spec: `{"name":"mover","cpu":2,"memory_mib":2048}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	prog := s.drainOneVM(ctx, corrosion.VMRecord{Name: "mover"}, corrosion.HostRecord{
+		Name: "drain-dst", Address: "10.0.0.77", State: "active",
+	})
+	if prog.Status != "done" {
+		t.Fatalf("drain = %+v, want done", prog)
+	}
+	if n := len(fake.reserveCalls); n != 1 {
+		t.Fatalf("destination admission asked %d times, want 1", n)
+	}
+	got := fake.reserveCalls[0]
+	if got.Host != "drain-dst" || got.ResourceId != "vm:mover" || got.CpuDelta != 2 || got.MemMibDelta != 2048 ||
+		!got.NewResidency || !got.VmOverhead {
+		t.Errorf("reserve request = %+v, want drain-dst/vm:mover 2cpu/2048MiB with full VM residency intent", got)
+	}
+	if rel := fake.released(); len(rel) != 1 {
+		t.Errorf("destination lease releases = %v, want exactly one", rel)
 	}
 }

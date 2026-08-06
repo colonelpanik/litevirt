@@ -437,6 +437,25 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		}
 	}
 
+	// Destination admission for a RUNNING VM, before anything irreversible: a
+	// drain is an OPERATOR-initiated move and lands the same full-sized VM on
+	// the target an explicit migrate would — placement.Select is a read-only
+	// filter over replicated data, not an admission. The decision belongs to
+	// the DESTINATION daemon (fresh local inventory, ownership conditions,
+	// serialized reserve-then-verify), exactly like MigrateVM; the lease is
+	// held across the move and released when this VM's drain step returns. A
+	// STOPPED VM's reassign moves only the row — it consumes nothing on the
+	// target until StartVM admits it there — so it takes no lease.
+	if fresh.State == "running" {
+		migLease, aerr := s.acquireDestinationHostLease(ctx, "DrainHost", target.Name, fresh.Project,
+			"vm:"+vm.Name, fresh.CPUActual, fresh.MemActual, intentVMResident)
+		if aerr != nil {
+			return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+				Error: "target admission refused: " + aerr.Error()}
+		}
+		defer migLease.release(ctx)
+	}
+
 	if fresh.State == "running" && !hasLocalOnly {
 		// Live migrate — disks are on shared storage. (Ownership confirmed above.)
 		progress.Strategy = pb.MigrateStrategy_MIGRATE_LIVE

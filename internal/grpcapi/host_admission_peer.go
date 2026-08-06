@@ -132,13 +132,13 @@ func (s *Server) acquireDestinationHostLease(
 	}
 	defer closer()
 	resp, rerr := client.ReserveHostCapacity(ctx, &pb.ReserveHostCapacityRequest{
-		Host:        host,
-		Project:     project,
-		Method:      method,
-		Principal:   callerUsername(ctx) + "@" + callerRealm(ctx),
-		ResourceId:  resourceID,
-		CpuDelta:    int32(cpuDelta),
-		MemMibDelta: int32(memDelta),
+		Host:         host,
+		Project:      project,
+		Method:       method,
+		Principal:    callerUsername(ctx) + "@" + callerRealm(ctx),
+		ResourceId:   resourceID,
+		CpuDelta:     int32(cpuDelta),
+		MemMibDelta:  int32(memDelta),
 		NewResidency: intent.newResidency,
 		VmOverhead:   intent.vmOverhead,
 	})

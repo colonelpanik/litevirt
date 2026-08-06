@@ -237,6 +237,7 @@ var tableNames = []string{
 	// notification_targets) and per-node/coordination state are intentionally
 	// excluded — see antiEntropyExcluded in tablenames_coverage_test.go.
 	"storage_pools", "backup_schedules", "backup_repos", "replication_checkpoints",
+	"quota_reservations",
 	"host_pci_devices", "roles", "role_bindings", "projects", "project_quotas",
 	"resource_mappings", "service_endpoints",
 	"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults",

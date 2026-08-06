@@ -140,6 +140,20 @@ const (
 	// enforcing the "require fleet uniformity before latching" rule. Enforcement is
 	// default-off and the flag is the reversible kill switch.
 	OperationProtocolV1 = "operation_protocol_v1"
+	// ProjectQuotaAuthorityV1 gates routing PROJECT-QUOTA admission to the project's
+	// deterministic authority holder, so one node serializes it.
+	//
+	// Project quota is a cluster-wide limit but usage lives in a CRDT store: two
+	// daemons admitting for one project against different hosts each read their own
+	// snapshot, both pass, and the project goes over. Routing every admission for a
+	// project to one holder makes it a process-local problem that holder can
+	// serialize.
+	//
+	// Advertised CONDITIONALLY on the local config flag (like OperationProtocolV1),
+	// because a node that isn't routing would keep admitting locally and unserialized
+	// — so the latch must require CONFIG uniformity, not just a uniform build.
+	// Pre-latch behaviour is byte-for-behaviour the old local check.
+	ProjectQuotaAuthorityV1 = "project_quota_authority_v1"
 	// LiveResizeV1 gates TRUE live CPU hot-add and balloon-memory resize (the
 	// max_cpu vCPU-hotplug ceiling and the <vcpu current=N>MAX</vcpu> XML it needs).
 	// Setting max_cpu is refused until this latches, because an old peer could drop
@@ -274,6 +288,7 @@ var supported = []string{
 	SharedStorageFenceV1,
 	RBACRealmV1,
 	OperationProtocolV1,
+	ProjectQuotaAuthorityV1,
 	LiveResizeV1,
 	CanonicalIdentityV1,
 	CanonicalRegistryV1,
@@ -283,7 +298,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, ProjectQuotaAuthorityV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

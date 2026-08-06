@@ -76,7 +76,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 
 	// ── Plan phase: snapshot cluster state and resolve everything up front ──
 
-	state, err := planner.LoadClusterState(ctx, s.db)
+	state, err := planner.LoadClusterState(ctx, s.db, s.capacity)
 	if err != nil {
 		return status.Errorf(codes.Internal, "load cluster state: %v", err)
 	}
@@ -1004,7 +1004,7 @@ func (s *Server) DiffStack(ctx context.Context, req *pb.DiffStackRequest) (*pb.D
 		return nil, status.Errorf(codes.InvalidArgument, "parse compose: %v", err)
 	}
 
-	state, err := planner.LoadClusterState(ctx, s.db)
+	state, err := planner.LoadClusterState(ctx, s.db, s.capacity)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "load cluster state: %v", err)
 	}

@@ -18,7 +18,15 @@ import (
 // shape (even one that keeps the family size) changes this digest, so the no-delete rule can't
 // silently swap out an old compatibility shape for an equal-sized replacement. Update it only
 // with a deliberate, reviewed compatibility change (e.g. a release ages out of the horizon).
-const compatibilityDigest = "419231f91af91686a2f8395a47f99b46276aebca60e55e93e5c545add8a8d56c"
+//
+// Updated for v43 (per-host capacity policy): InsertHost AND the fixed-shape
+// ConfigureHost UPDATE each gained four capacity columns, so the tree stopped
+// emitting the prior release's narrower shapes. Both old shapes were ADDED to the
+// historical families (insert_host_v130, configure_host_fixed_v130) rather than
+// dropped — a prior-release peer still emits them, and an upgraded receiver that no
+// longer recognised them would back-pressure valid statements and stall that peer's
+// stream. This digest change is those additions; no existing shape's identity changed.
+const compatibilityDigest = "ca716aa29983ccb82fe3beb7175398319218d48af082ccfc38952bfef02860a1"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -63,6 +71,8 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"vm_rename_v130":               3,   // vm_interfaces / vm_disks / ip_allocations
 	"network_rename_v130":          3,   // network_vteps / ip_allocations / vm_interfaces
 	"vm_disks_insert_v130":         1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
+	"insert_host_v130":             1,   // pre-capacity-policy hosts insert (narrower column list)
+	"configure_host_fixed_v130":    1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
 	"pci_release_by_vm_v130":       1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
 }
 
@@ -263,4 +273,26 @@ func TestHistoricalFamiliesApply(t *testing.T) {
 			t.Errorf("network_vteps not rekeyed to new-net, got %d rows", len(rows))
 		}
 	})
+}
+
+// v43 widened configureHostSQL (4 new capacity COALESCE columns), so the
+// current tree stopped emitting the v1.3.0-fixed 7-column UPDATE shape. A
+// prior-release peer still emits it; the historical ledger must keep
+// recognising it or ConfigureHost from that peer back-pressures and stalls
+// its replication stream during a rolling upgrade.
+func TestHistoricalLedgerKeepsFixedConfigureHostShape(t *testing.T) {
+	oldSQL := `UPDATE hosts SET ` +
+		`fence_strategy = COALESCE(?, fence_strategy), ` +
+		`ipmi_address = COALESCE(?, ipmi_address), ` +
+		`ipmi_user = COALESCE(?, ipmi_user), ` +
+		`ipmi_pass = COALESCE(?, ipmi_pass), ` +
+		`watchdog_dev = COALESCE(?, watchdog_dev), ` +
+		`role = COALESCE(?, role), ` +
+		`region = COALESCE(?, region), ` +
+		`updated_at = ? ` +
+		`WHERE name = ?`
+	// SQL intentionally restated verbatim (not dereferenced from HistoricalShapes)
+	// so a typo in the registered entry cannot self-certify — the package's
+	// established shape-retention pattern (see release_corpus_test.go).
+	mustResolve(t, "pre-v43 fixed ConfigureHost", oldSQL)
 }

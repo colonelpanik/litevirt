@@ -457,13 +457,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start the host health checker (created above, before the replicator).
 	go d.checker.Start(ctx)
 
+	// One capacity policy shared by admission (svc below), failover, and the
+	// rebalancer, so placement and admission can never disagree.
+	capacity := d.cfg.Capacity.Policy()
+
 	// Create the failover coordinator; started after the gRPC server is built
 	// so its replica-promoter (auto_promote recovery) can be wired first.
 	fc := failover.NewCoordinator(d.cfg.HostName, d.db)
+	fc.SetCapacityPolicy(capacity)
 
 	// Start rebalance coordinator. Leader-gated; safe to start on
 	// every host. Defaults to dry-run on every VM unless compose says otherwise.
 	rc := scheduler.NewRebalancer(d.cfg.HostName, d.db)
+	rc.SetCapacityPolicy(capacity)
 	go rc.Start(ctx)
 
 	// Start snapshot scheduler. Leader-gated like the
@@ -622,7 +628,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cfg.Enforcement.SharedStorageFence,
 	)
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
+	svc.SetProjectQuotaAuthority(d.cfg.Enforcement.ProjectQuotaAuthority) // drives the latch + conditional advertisement
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
+	// overrides live on the host record and win where set.
+	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
@@ -681,6 +691,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// retries stragglers.
 	svc.RecoverResourceOperations(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
+
+	// Keep the project-quota admission lease alive for every project this node still
+	// holds charges for. Without it the lease (30s) would lapse under a charge that
+	// outlives it — a create waiting on an image pull, a routed reservation — and the
+	// next node would acquire the lease with an EMPTY ledger and re-hand quota that is
+	// still owed. Renewing only while charged also lets an idle node's leases expire,
+	// so authority follows load instead of sticking to whoever went first.
+	go svc.RunQuotaLeaseRenewer(ctx)
 
 	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
 	// nonterminal device_attach/device_detach operation (a hot-plug that crashed

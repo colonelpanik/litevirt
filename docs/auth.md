@@ -102,6 +102,12 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 | NetworkAdmin | `network.*`, `lb.*`, `sg.*` |
 | NoAccess | (none) |
 
+`--allow-overcommit` (CreateVM/StartVM/UpdateVM) additionally requires
+`vm.overcommit`: bypassing the host capacity check is an operator-level
+judgment call, so a binding granting only lifecycle verbs (e.g. VMOperator)
+cannot invoke it. Wildcard grants (`vm.*`, `*`) carry it; clusters on the
+legacy role model (no bindings) are unchanged — any operator may pass it.
+
 A *binding* attaches a role to a principal at a path. With
 `--propagate` the binding applies to that path and all descendants —
 this is how the `Admin` role on `/` grants cluster-wide superuser

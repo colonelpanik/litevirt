@@ -61,6 +61,17 @@ message ConfigureHostRequest {
     // Region: failure-domain label (DC/rack/AZ). federation.
     // Default "default"; explicitly setting to "" is normalized to default.
     string region = 8;
+    // Per-host capacity policy overrides. All optional: unset leaves the host's
+    // current value alone, and clears back to the cluster default via a negative
+    // reserve / zero ratio.
+    //
+    // A ratio of 0 means "inherit the cluster default" (a 0 ratio is never
+    // meaningful). Reserves are optional because 0 IS meaningful — "hand guests
+    // every last MiB" — and must stay distinguishable from "not configured".
+    optional double cpu_overcommit = 9;
+    optional double mem_overcommit = 10;
+    optional int32 cpu_reserve = 11;
+    optional int32 mem_reserve_mib = 12;
 }
 
 // ── VMs ──
@@ -72,7 +83,11 @@ message CreateVMRequest  { VMSpec spec = 1;
     // on a different node relies on resource-name uniqueness as a best-effort
     // backstop, which is not linearizable in this masterless design. Reusing a key
     // with a different request is a client bug (→ 409).
-    string idempotency_key = 2; }
+    string idempotency_key = 2;
+    // allow_overcommit skips HOST capacity admission for this create (project
+    // quota still applies). For deliberate density on a host the operator knows
+    // can take it; the bypass is audited so it is never silent.
+    bool allow_overcommit = 3; }
 message ListVMsRequest   { string stack_name = 1; string host_name = 2;
     map<string, string> label_filter = 3;
     // Keyset pagination (additive; mixed-version safe — an old server ignores these
@@ -88,7 +103,10 @@ message ListVMHardwareResponse {
     string hardware_adoption_state = 2;  // pending | adopted | blocked
     string hardware_adoption_error = 3;  // reason when blocked
 }
-message StartVMRequest   { string name = 1; }
+message StartVMRequest   { string name = 1;
+    // allow_overcommit skips HOST capacity admission for this start (project quota
+    // still applies). Same escape hatch as CreateVMRequest; the bypass is audited.
+    bool allow_overcommit = 2; }
 message StopVMRequest    { string name = 1; bool force = 2; int32 timeout = 3; }
 message RestartVMRequest { string name = 1; }
 message DeleteVMRequest    { string name = 1; bool keep_disks = 2; }
@@ -225,6 +243,10 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     string         idempotency_key = 19;  // cross-entry-node dedup of a retried update (D4 semantics)
     optional int32 max_cpu         = 20;  // set the vCPU hotplug ceiling (live_resize; latched)
     optional bool  allow_restart   = 21;  // permit a stop→redefine→start for a change that can't apply live
+
+    // allow_overcommit skips HOST capacity admission for a --restart-if-needed
+    // reconfigure that GROWS the VM (project quota still applies). Audited.
+    bool allow_overcommit = 22;
 }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
@@ -1767,6 +1789,10 @@ service LiteVirt {
     rpc CheckVMRuntime(CheckVMRuntimeRequest) returns (CheckVMRuntimeResponse);
     rpc CheckContainerRuntime(CheckContainerRuntimeRequest) returns (CheckContainerRuntimeResponse);
     rpc ReportRuntime(ReportRuntimeRequest) returns (ReportRuntimeResponse);
+    // Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
+    rpc AdmitProjectQuota(AdmitProjectQuotaRequest) returns (AdmitProjectQuotaResponse);
+    rpc ReleaseProjectQuotaReservation(ReleaseProjectQuotaReservationRequest) returns (google.protobuf.Empty);
+    rpc ListProjectQuotaReservations(ListProjectQuotaReservationsRequest) returns (ListProjectQuotaReservationsResponse);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);
@@ -2356,3 +2382,104 @@ message ProjectUsage {
     int32  backup_gib_used = 8; // summed manifest size across the project's VMs
 }
 message GetProjectUsageRequest { string project_name = 1; }
+
+// AdmitProjectQuota asks the project's ADMISSION AUTHORITY HOLDER to admit and
+// reserve a vCPU/memory grow against the project's quota.
+//
+// Project quota is a cluster-wide limit, but usage lives in a CRDT store: two
+// daemons admitting requests for one project against different hosts each read
+// their own snapshot, both pass, and the project ends up over its limit. Routing
+// every admission for a project to ONE holder collapses that back into a
+// process-local problem the holder can serialize with a mutex and an in-flight
+// ledger.
+//
+// PEER-ONLY. Authenticated by peer mTLS with CN == sender (the same check the
+// replication RPCs use); there is no RBAC verb for it, so no user token can reach
+// it. Inert unless enforcement.project_quota_authority is set AND the
+// project_quota_authority_v1 capability has latched cluster-wide.
+message AdmitProjectQuotaRequest {
+    string sender = 1;            // calling host; must equal the peer cert CN
+    string project = 2;           // normalized project name
+    int32 cpu_delta = 3;          // positive vCPU grow; <= 0 means nothing to admit
+    int32 mem_mib_delta = 4;      // positive MiB grow; <= 0 means nothing to admit
+    int64 authority_epoch = 5;    // epoch the caller believes is current
+}
+message AdmitProjectQuotaResponse {
+    bool admitted = 1;
+    string reservation_id = 2;    // pass to ReleaseProjectQuotaReservation when done
+    string detail = 3;            // why not admitted, for the caller's error
+    // redirect=true means "I am not the authority; current_holder is". It travels on
+    // a SUCCESSFUL response, never alongside an error — gRPC drops the message when
+    // an error is set, which would leave the caller unable to follow the redirect and
+    // re-resolving from the same stale view that misrouted it.
+    bool redirect = 6;
+    // barrier_failed=true means the authority could not make the reservation durable
+    // across the cluster. It is a DISTINCT signal, not just an error: the caller's
+    // generic RPC-error path degrades to an unserialized local check (fail open), which
+    // would admit against a charge no peer can see. This flag makes the refusal
+    // fail CLOSED instead.
+    bool barrier_failed = 10;
+    // 9 was lease_valid_until: a copied expiry the caller used as its fence. Wrong in
+    // both directions — it did not follow the holder's renewals, so a healthy create
+    // slower than one lease period aborted for nothing; and being wall-clock, skew or a
+    // pause after the check could let a write land after the lease really expired.
+    // Replaced by ValidateProjectQuotaReservation, asked at commit time.
+    reserved 9;
+    string current_holder = 4;
+    int64 current_epoch = 5;
+}
+message ReleaseProjectQuotaReservationRequest {
+    string sender = 1;
+    string reservation_id = 2;
+    // committed=true means the workload was actually written. The holder then KEEPS
+    // the charge instead of dropping it, until its own replica shows the workload —
+    // the row was written by the target host, so between that write and CRDT
+    // delivery the holder would otherwise see neither the reservation nor the usage
+    // and hand the same quota to a concurrent request.
+    bool committed = 3;
+    // Identity of the committed workload and its post-commit counted size. The
+    // holder retires the charge only when its OWN replica shows THIS workload at (or
+    // above) that size — aggregate usage growth is not a sound signal, since any
+    // unrelated increase would clear the charge early.
+    string workload = 4;
+    int32 committed_cpu = 5;
+    int32 committed_mem_mib = 6;
+    // kind ("vm"|"container") and workload_host complete the identity: a name alone
+    // is ambiguous (a VM and a container may share one, and container names are
+    // unique only per host), and an ambiguous match could retire a charge that is
+    // still owed.
+    string kind = 7;
+    string workload_host = 8;
+}
+
+// (ValidateProjectQuotaReservation was removed: reservations are durable rows, so the
+// commit fence is a LOCAL read of replicated state. Asking the authority over the network
+// fell open exactly when authority was being lost, and even a good answer left a gap
+// before the caller's durable write.)
+
+// ListProjectQuotaReservations lets a node TAKING OVER a project's admission authority
+// drain its voters' reservation state before it admits anything.
+//
+// Copying a reservation into a quorum does not put it in a future authority's local
+// database, and an authority admits from its own replica — so quorum intersection alone
+// only proves SOME voter holds the row. This is how the successor actually gets it.
+message ListProjectQuotaReservationsRequest {
+    string sender = 1;
+    string project = 2;
+}
+message ListProjectQuotaReservationsResponse {
+    repeated ProjectQuotaReservation reservations = 1;
+}
+message ProjectQuotaReservation {
+    string id = 1;
+    string project = 2;
+    string holder = 3;
+    int32 cpu = 4;
+    int32 mem_mib = 5;
+    string state = 6;
+    string workload = 7;
+    string kind = 8;
+    string host = 9;
+    int32 want_cpu = 10;
+    int32 want_mem = 11;
+}

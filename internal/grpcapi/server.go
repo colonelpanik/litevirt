@@ -98,6 +98,10 @@ type Server struct {
 	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
 	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
 	enfOperationProtocol bool
+	// enfProjectQuotaAuthority is this node's kill-switch for routing project-quota
+	// admission to the project's authority holder; gated by this flag AND the
+	// ProjectQuotaAuthorityV1 latch. Advertised CONDITIONALLY on the flag.
+	enfProjectQuotaAuthority bool
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
@@ -146,6 +150,13 @@ type Server struct {
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
+
+	// testHookBeforeSpecCommit is a test seam: when non-nil it runs immediately before
+	// the reconfigure path's commit fence. Production leaves it nil. It exists because
+	// the fence's whole point is a handoff that happens AFTER the VM has been stopped,
+	// and there is no other way to move authority mid-request from a test — without it
+	// the abort lands before the stop and the test silently asserts nothing.
+	testHookBeforeSpecCommit func()
 
 	// probeHolder is a test seam for the Phase-2 VIP takeover check: when non-nil it
 	// replaces the real fresh-probe of a peer holder's (reachable, supports, assigned)
@@ -230,6 +241,30 @@ type Server struct {
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
 
+	// hostAdmit serializes host-capacity ADMISSION on this node and records the
+	// grows this node has admitted but not yet committed. See admitHostCapacity
+	// for why the ledger — not the lock — is what makes admission safe.
+	//
+	// A SEPARATE map from vmLocks, not a namespaced key in it: vmLocks is keyed by
+	// bare VM name, so a host and a VM sharing a name would collide on one
+	// non-reentrant mutex and StartVM would self-deadlock. It also carries the
+	// counters, which vmLocks' signature cannot.
+	hostAdmitMu sync.Mutex
+	hostAdmit   map[string]*hostAdmitState
+
+	// projectAdmit does the same for project-quota admission, keyed by normalized
+	// project name. Only meaningful on the project's authority holder — see
+	// admitProjectQuota.
+	projectAdmitMu sync.Mutex
+	projectAdmit   map[string]*projectAdmitState
+
+	// reservationSourceOverride is a test seam for the takeover drain (nil in production).
+	reservationSourceOverride corrosion.ReservationSource
+
+	// (Reservations are no longer held in memory. They are rows in the replicated
+	// quota_reservations table, because a charge must survive this node ceasing to be
+	// the project's authority — see corrosion.ReserveProjectQuota.)
+
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets
 	// the reconciler tell a genuinely-in-flight backup apart from a
@@ -282,6 +317,10 @@ type Server struct {
 	// and emits metered billing events. Optional — nil means
 	// unbounded admission + no billing.
 	tenancy *tenancy.Engine
+
+	// capacity is the cluster-wide capacity policy (overcommit ratios + host
+	// reserves). Zero value normalizes to the built-in defaults.
+	capacity corrosion.CapacityPolicy
 
 	// containerRuntime executes LXC ops on this host.
 	// nil = container RPCs return Unavailable. Tests inject a fake.
@@ -396,6 +435,12 @@ func (s *Server) advertisedCapabilities() []string {
 	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
 	// require CONFIG uniformity, not just a uniform build. Withholding advertisement while the
 	// flag is off keeps the cluster from latching until every node has opted in.
+	// project_quota_authority_v1: same reasoning as operation_protocol_v1 above. A
+	// flag-off node keeps admitting quota locally and unserialized, so relying on
+	// the routing requires CONFIG uniformity, not just a uniform build.
+	if !s.enfProjectQuotaAuthority {
+		caps = withoutCapability(caps, capabilities.ProjectQuotaAuthorityV1)
+	}
 	if !s.enfCanonicalIdentity {
 		caps = withoutCapability(caps, capabilities.CanonicalIdentityV1)
 	}
@@ -479,6 +524,19 @@ func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
 // operation protocol. The flag is the reversible kill switch; enforcement is this
 // flag AND the OperationProtocolV1 latch (see operationProtocolActive).
 func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+
+// SetProjectQuotaAuthority is this node's kill switch for routing project-quota
+// admission to the project's authority holder. It also gates ADVERTISEMENT of
+// project_quota_authority_v1, so the token can only latch once every node opts in.
+func (s *Server) SetProjectQuotaAuthority(on bool) { s.enfProjectQuotaAuthority = on }
+
+// projectQuotaAuthorityActive reports whether this node routes project-quota
+// admission to the holder: the config flag AND the cluster-wide latch. Same
+// `flag && Enforced` model as the rest of the family. False ⇒ the old local
+// unserialized check, unchanged.
+func (s *Server) projectQuotaAuthorityActive(ctx context.Context) bool {
+	return s.enfProjectQuotaAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectQuotaAuthorityV1)
+}
 
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same
@@ -850,6 +908,8 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		images:         images,
 		events:         events.NewBus(),
 		vmLocks:        make(map[string]*sync.Mutex),
+		hostAdmit:      make(map[string]*hostAdmitState),
+		projectAdmit:   make(map[string]*projectAdmitState),
 		loginThrottle:  newLoginThrottle(),
 		ReExecCh:       make(chan struct{}, 1),
 		ShutdownCh:     make(chan struct{}, 1),
@@ -930,6 +990,10 @@ func (s *Server) SetTenancyEngine(t *tenancy.Engine) { s.tenancy = t }
 // SetContainerRuntime wires the LXC/OCI runtime so the Containers
 // RPCs can act on this host. nil = container RPCs return Unavailable.
 func (s *Server) SetContainerRuntime(r ContainerRuntime) { s.containerRuntime = r }
+
+// SetCapacityPolicy wires the cluster-wide capacity policy (overcommit ratios and
+// host reserves) used by admission and placement.
+func (s *Server) SetCapacityPolicy(p corrosion.CapacityPolicy) { s.capacity = p }
 
 // SetLiveMover wires the libvirt blockdev-mirror driver. Daemon
 // constructs a real one from internal/libvirt; tests inject a fake.

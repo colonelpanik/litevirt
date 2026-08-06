@@ -178,6 +178,31 @@ enforcement:
                               # best-effort SSH fence is rejected. Local-disk transfers keep
                               # today's gate. Enable fleet-uniformly (changes failover behavior).
                               # See docs/migration-failover.md → "Shared-disk fence gating".
+  project_quota_authority: false
+                              # route PROJECT-QUOTA admission to the project's deterministic
+                              # authority holder, so ONE node serializes it. Project quota is a
+                              # cluster-wide limit but usage lives in a CRDT store, so without this
+                              # two daemons admitting requests for the same project against
+                              # DIFFERENT hosts each read their own snapshot, both pass, and the
+                              # project ends up over its limit. Routing collapses that into a
+                              # process-local problem the holder serializes with a mutex plus an
+                              # in-flight ledger.
+                              #
+                              # Advertised CONDITIONALLY on this flag (like operation_protocol), so
+                              # the cluster-wide latch only forms once EVERY node has opted in — a
+                              # flag-off node would keep admitting locally and unserialized. Until
+                              # then behaviour is exactly the previous local check.
+                              #
+                              # FAILS OPEN. If the holder is unreachable, admission falls back to
+                              # the unserialized local check and emits a `quota.unserialized`
+                              # notification plus an audit entry. Quota is a tenancy limit, not a
+                              # safety invariant: failing closed would let one dead node block every
+                              # VM create in every project it holds, which is worse than the
+                              # over-admission it would prevent. Authority is never reassigned on
+                              # mere unreachability — an unplanned takeover needs a fence proof.
+                              #
+                              # Serializes vCPU and memory only. The disk / NIC / public-IP /
+                              # backup-GiB dimensions are still admitted without reservations.
   operation_protocol: false   # rely on the v41 F1 operation protocol (operations journal, per-VM
                               # epoch/generation, active_operation_id mutation barrier, durable
                               # device-lease recovery). Advertised CONDITIONALLY on this flag, so the
@@ -443,6 +468,64 @@ as `litevirt_gc_rows_deleted_total` (labeled by `table`).
 The sweep is local-only and deterministic (each node prunes its own copy; it
 never touches a current-active-set or current-generation row), so it is safe on a
 live cluster.
+
+## Capacity and overcommit
+
+How much of a host litevirt is willing to hand to workloads. Cluster-wide
+defaults live here; per-host overrides (`lv host config --cpu-overcommit …`) win
+where set.
+
+```yaml
+capacity:
+  cpu_overcommit_ratio: 4.0        # default 4.0
+  mem_overcommit_ratio: 1.0        # default 1.0
+  host_cpu_reserve: 1              # default 1
+  host_memory_reserve_mib: 1024    # default 1024
+  host_memory_reserve_pct: 5       # default 5
+  vm_memory_overhead_mib: 128      # default 128
+```
+
+**CPU and memory are deliberately different.** vCPU is time-sliced: running more
+vCPUs than cores is normal and the guests simply share, so the default
+oversubscribes 4×. Memory is not — without ballooning, KSM or swap a guest's RAM
+is either backed or the kernel starts reclaiming — so `mem_overcommit_ratio`
+defaults to exactly `1.0`. Raise it only where something makes the promise real.
+
+**The reserve matters more than either ratio.** At ratio 1.0 with no reserve,
+guests are offered 100% of RAM and nothing is left for the kernel, page cache,
+qemu's per-VM overhead or litevirtd itself — the host thrashes and, in the case
+that prompted this, stops answering SSH. The effective memory reserve is the
+**larger** of `host_memory_reserve_mib` and `host_memory_reserve_pct`, so the
+fixed floor protects small nodes while the percentage scales with large ones.
+
+`vm_memory_overhead_mib` is charged per running VM on top of its configured
+memory, covering qemu's own footprint (device models, video, page tables).
+Ignoring it under-counts usage, and by more the denser the host.
+
+**Containers count too, for memory.** A running container's memory cap is
+subtracted from host capacity exactly like a VM's, and `lv ct create` / `lv ct
+start` are admitted against it. Container CPU is *not* counted: `--cpu` on a
+container is cgroup **shares** — a relative weight, not a vCPU reservation — so
+adding it to a vCPU total would be meaningless. An **uncapped** container
+(`--memory 0`) is not accounted at all: litevirt knows the cap, not the
+footprint. Cap your containers if you want them to count.
+
+These apply to **both** placement and admission — VM create (including a pinned
+`--host`) and live resize all consult the same numbers, so the scheduler and the
+admission check cannot disagree.
+
+Admission runs wherever a host's usage can GROW: VM **create**, **start**, live
+**resize**, and a `--restart-if-needed` **reconfigure** that grows the VM. Usage
+counts running VMs, so a stopped VM consumes nothing until it starts — checking
+only at create time would be sidestepped by creating VMs that each fit and then
+starting them all. A shrink never consumes anything and is never refused.
+Automated recovery is deliberately exempt: the failover/reconciler restart paths
+are not admitted, because after a host reboot every VM starts at once and
+refusing there would strand the ones that lost the race.
+
+To exceed the policy deliberately for one VM, pass `--allow-overcommit` to
+`lv run` or `lv start`; the host check is skipped (project quota still applies)
+and the bypass is audited.
 
 ## Ports summary
 

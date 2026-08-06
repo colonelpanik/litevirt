@@ -391,3 +391,39 @@ func TestLiveHostStats_WithRunningVMs(t *testing.T) {
 		t.Errorf("mem = %d, want 2048", mem)
 	}
 }
+
+// TestConfigureHost_AcceptsEveryImplementedFenceStrategy: the accepted set must
+// match what internal/fence dispatches.
+//
+// It did not. fence.Execute implements "manual" and "best-effort" and the
+// failover coordinator has explicit handling for both, but ConfigureHost rejected
+// them — so the one strategy built for operator-confirmed rescheduling could not
+// be set through the API, and a host could never be returned to "best-effort".
+func TestConfigureHost_AcceptsEveryImplementedFenceStrategy(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "h", Address: "10.0.0.1", State: "active",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+
+	// Every strategy fence.ResolveStrategy recognises, plus best-effort.
+	for _, strategy := range []string{"ssh", "ipmi", "watchdog", "manual", "best-effort"} {
+		if _, err := s.ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: "h", FenceStrategy: strategy}); err != nil {
+			t.Errorf("ConfigureHost(fence_strategy=%q): %v — fence.Execute implements it, so it must be configurable", strategy, err)
+			continue
+		}
+		h, err := corrosion.GetHost(ctx, s.db, "h")
+		if err != nil || h == nil {
+			t.Fatalf("GetHost: %v", err)
+		}
+		if h.FenceStrategy != strategy {
+			t.Errorf("persisted fence_strategy = %q, want %q", h.FenceStrategy, strategy)
+		}
+	}
+
+	if _, err := s.ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: "h", FenceStrategy: "nonsense"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("unknown strategy: got %v, want InvalidArgument", err)
+	}
+}

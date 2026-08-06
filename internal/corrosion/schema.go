@@ -244,7 +244,20 @@ import (
 //	v42: hardware foundation — vm_nics, vm_pci_intent, vm_pci_realizations;
 //	     vm_disks.{bus,device_kind,delete_with_vm,controller_model};
 //	     vms.{hardware_adoption_state,hardware_adoption_error}.
-const CurrentSchemaVersion = 42
+//	v43: per-host capacity policy — hosts.{cpu_overcommit,mem_overcommit,
+//	     cpu_reserve,mem_reserve_mib}. Overrides the cluster-wide default so a
+//	     host with swap/KSM can overcommit memory while its peers do not. Ratio 0
+//	     and reserve -1 mean "inherit the cluster default"; 0 is a MEANINGFUL
+//	     reserve (hand guests everything), so absence had to be a distinct value.
+//	     Four ADD COLUMN.
+//	v44: quota_reservations — DURABLE project-quota reservations, replicated so a
+//	     successor authority accounts for admissions the previous holder granted.
+//	     An in-memory ledger cannot survive a lease handoff: the successor started
+//	     empty, re-admitted the same quota, and the original request still committed.
+//	     No point-in-time validation closes that (the RPC fails exactly when
+//	     authority is lost, and even a good answer has a check→write gap), so the
+//	     reservation itself has to outlive the holder. One CREATE TABLE.
+const CurrentSchemaVersion = 44
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -594,6 +607,10 @@ var schemaDDL = []string{
 		labels       TEXT,
 		role         TEXT NOT NULL DEFAULT 'worker',
 		schema_version INTEGER NOT NULL DEFAULT 0,
+		cpu_overcommit  REAL NOT NULL DEFAULT 0,
+		mem_overcommit  REAL NOT NULL DEFAULT 0,
+		cpu_reserve     INTEGER NOT NULL DEFAULT -1,
+		mem_reserve_mib INTEGER NOT NULL DEFAULT -1,
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT
@@ -778,6 +795,48 @@ var schemaDDL = []string{
 		updated_at      TEXT NOT NULL,
 		deleted_at      TEXT,
 		PRIMARY KEY (project, authority_epoch)
+	)`,
+
+	// quota_reservations (v44): DURABLE project-quota reservations.
+	//
+	// Why durable. Project quota is serialized by one leased authority, and the
+	// authority's charges used to live only in its memory. A lease handoff therefore
+	// LOST them: the successor started with an empty ledger, admitted the same quota,
+	// and the original in-flight request still committed on top. No commit-time check
+	// fixes that — the validating RPC fails precisely when authority is being lost, and
+	// even a successful answer leaves a gap between the answer and the caller's durable
+	// write. The reservation must outlive the holder, so it is a replicated row.
+	//
+	// Every node's quota arithmetic adds live reservations to committed usage, so a
+	// successor accounts for its predecessor's grants automatically — and the lease TTL
+	// exceeds normal replication delivery, so the rows are visible before a successor
+	// can serve.
+	//
+	// state: 'pending'   — admitted, the caller has not written its workload yet.
+	//        'committed' — the durable write landed; hold the charge until this node
+	//                      can SEE the workload (it may not have replicated here yet).
+	// workload/kind/host + want_cpu/want_mem carry the identity and post-commit size a
+	// committed row is retired against; a name alone is ambiguous (a VM and a container
+	// may share one, and container names are unique only per host).
+	//
+	// expires_at bounds a caller that dies mid-request. It is the same bound the
+	// in-memory version already had, so durability costs nothing here.
+	`CREATE TABLE IF NOT EXISTS quota_reservations (
+		id          TEXT PRIMARY KEY,
+		project     TEXT NOT NULL,
+		holder      TEXT NOT NULL,
+		cpu         INTEGER NOT NULL DEFAULT 0,
+		mem_mib     INTEGER NOT NULL DEFAULT 0,
+		state       TEXT NOT NULL DEFAULT 'pending',
+		workload    TEXT NOT NULL DEFAULT '',
+		kind        TEXT NOT NULL DEFAULT '',
+		host        TEXT NOT NULL DEFAULT '',
+		want_cpu    INTEGER NOT NULL DEFAULT 0,
+		want_mem    INTEGER NOT NULL DEFAULT 0,
+		expires_at  TEXT NOT NULL,
+		created_at  TEXT NOT NULL,
+		updated_at  TEXT NOT NULL,
+		deleted_at  TEXT
 	)`,
 
 	// Rebalancer proposals. One row per (vm, generation). Pending
@@ -1805,6 +1864,7 @@ var tablePrimaryKeys = map[string][]string{
 	"firewall_defaults":       {"scope"},
 	"backup_repos":            {"name"},
 	"replication_checkpoints": {"vm_name", "repo"},
+	"quota_reservations":      {"id"},
 	"vm_nics":                 {"vm_name", "id"},
 	"vm_pci_intent":           {"vm_name", "device_id"},
 	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
@@ -1996,6 +2056,12 @@ var schemaMigrations = []string{
 	`ALTER TABLE vm_disks ADD COLUMN controller_model TEXT`,
 	`ALTER TABLE vms ADD COLUMN hardware_adoption_state TEXT NOT NULL DEFAULT 'pending'`,
 	`ALTER TABLE vms ADD COLUMN hardware_adoption_error TEXT`,
+	// v43: per-host capacity policy. 0 / -1 mean "inherit the cluster default"
+	// (a real 0 reserve is meaningful, so absence is -1, not 0).
+	`ALTER TABLE hosts ADD COLUMN cpu_overcommit REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN mem_overcommit REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN cpu_reserve INTEGER NOT NULL DEFAULT -1`,
+	`ALTER TABLE hosts ADD COLUMN mem_reserve_mib INTEGER NOT NULL DEFAULT -1`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2073,6 +2139,7 @@ var alterVersions = []int{
 	41, 41, 41, // vms.vm_owner_epoch, vms.spec_generation, vms.active_operation_id
 	42, 42, 42, 42, // vm_disks.bus/device_kind/delete_with_vm/controller_model
 	42, 42, // vms.hardware_adoption_state/hardware_adoption_error
+	43, 43, 43, 43, // hosts.cpu_overcommit/mem_overcommit/cpu_reserve/mem_reserve_mib
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2093,6 +2160,7 @@ var createTableUnits = []struct {
 	{38, "runtime_action_proofs"},
 	{39, "idempotency_keys"},
 	{40, "host_fw_intent"},
+	{44, "quota_reservations"},
 	{41, "operations"}, {41, "operation_steps"}, {41, "project_authority_epochs"},
 	{42, "vm_nics"}, {42, "vm_pci_intent"}, {42, "vm_pci_realizations"},
 }

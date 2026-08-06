@@ -52,6 +52,8 @@ func (s *Server) containerProject(ctx context.Context, host, name string) string
 }
 
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
+	// ctCommitted is flipped at the durable container write; see the release site.
+	ctCommitted := false
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
@@ -133,6 +135,48 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 	}
 
+	// Admission. Two different scopes, deliberately split:
+	//
+	//   HOST capacity — MEMORY only. A container's cpu_limit is CPU *shares* (a
+	//   relative cgroup weight), not a vCPU reservation, so it cannot be added to a
+	//   host's vCPU total; only its memory cap is comparable to a VM's. An UNCAPPED
+	//   container (memory 0) reserves nothing, matching how it is accounted.
+	//
+	//   PROJECT quota — CPU **and** memory. SumProjectUsage counts a container's
+	//   cpu_limit against the project's vCPU budget, so admission has to charge it or
+	//   the limit is unenforceable. It previously passed 0 for CPU and ran only when
+	//   memory was non-zero, so concurrent containers could exceed the project vCPU
+	//   limit, and a CPU-limited container with unlimited memory skipped serialized
+	//   admission entirely.
+	//
+	// Reserved (not just checked) because this host commits the container below, and
+	// routed through admitProjectQuota so the project's authority serializes it.
+	// Placed after tenancy and before any runtime or IPAM work, so a refusal leaves
+	// no partial state to unwind.
+	ctCommitFact := func() CommitFact {
+		return CommitFact{
+			Committed: ctCommitted, Workload: req.Name,
+			Kind: corrosion.WorkloadContainer, Host: s.hostName,
+			CPU: int(req.Cpu), MemMiB: int(req.MemoryMib),
+		}
+	}
+	if req.MemoryMib > 0 {
+		hostRelease, herr := s.admitHostCapacity(ctx, s.hostName, 0, int(req.MemoryMib))
+		defer hostRelease()
+		if herr != nil {
+			return nil, herr
+		}
+	}
+	var ctAdmission Admission
+	if req.Cpu > 0 || req.MemoryMib > 0 {
+		qAdm, qerr := s.admitProjectQuota(ctx, req.Project, int(req.Cpu), int(req.MemoryMib))
+		ctAdmission = qAdm
+		defer func() { qAdm.Release(ctCommitFact()) }()
+		if qerr != nil {
+			return nil, qerr
+		}
+	}
+
 	// Resolve the requested NICs into runtime attachments + managed-interface rows
 	// + create-spec intent, ALLOCATING each managed NIC's IPAM lease as it goes
 	// (managed network vs legacy raw bridge). On any later failure we release this
@@ -177,6 +221,15 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// closed: the runtime container exists but the DB write failed → delete the
 	// just-created container and release its leases, so no partial tracked state
 	// and no leaked lease.
+	// FENCE before the durable write; see CreateVM.
+	if ferr := ctAdmission.AllowCommit(ctx); ferr != nil {
+		_ = s.releaseContainerNICs(ctx, info.Name)
+		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
+			slog.Warn("container create: cleanup after an aborted admission also failed",
+				"name", info.Name, "error", delErr)
+		}
+		return nil, ferr
+	}
 	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces); err != nil {
 		_ = s.releaseContainerNICs(ctx, info.Name)
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
@@ -186,6 +239,10 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
+	// The durable write landed: the container counts against project quota from here
+	// even if this RPC later fails, so the authority keeps its charge until it can
+	// see the row.
+	ctCommitted = true
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
 	return toPbContainer(rec), nil
@@ -207,6 +264,13 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// Serialize with a concurrent start/create of the SAME container before reading
+	// the row. Without this, two starts both read state != "running", both admit
+	// and both reserve its memory — so the second is refused for capacity the first
+	// is already accounting for. The row read has to be under the lock for the
+	// admission below to be based on a state that can't change underneath it.
+	unlock := s.lockVM("ct/" + req.Name)
+	defer unlock()
 	// Preflight the cluster row BEFORE touching the runtime: a missing/soft-deleted
 	// row means we'd start an UNTRACKED container, so refuse. (Also folds in the
 	// template check — a frozen clone source can't be started.)
@@ -221,6 +285,20 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	}
 	if rec.IsTemplate {
 		return nil, status.Errorf(codes.FailedPrecondition, "%q is a template and cannot be started; clone it instead", req.Name)
+	}
+	// Host capacity admission — memory only (see CreateContainer). Starting is when
+	// the memory is actually taken: a stopped container is accounted as nothing, so
+	// checking only at create would be sidestepped by creating several that each fit
+	// and starting them all. Skipped when already running (adds nothing) and when
+	// uncapped (nothing to admit).
+	// Reserved, not just checked, so the memory stays accounted for across the
+	// runtime start and the "running" state write below.
+	if rec.State != "running" && rec.MemMiB > 0 {
+		release, err := s.admitHostCapacity(ctx, s.hostName, 0, rec.MemMiB)
+		defer release()
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")

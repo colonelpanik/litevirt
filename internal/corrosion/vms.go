@@ -608,12 +608,17 @@ type HostResourceUsage struct {
 	CpuUsed     int
 	MemUsedMiB  int
 	DiskUsedGiB int
+	// VMCount is how many RUNNING VMs the host carries. Capacity policy charges
+	// a per-VM qemu overhead on top of configured guest memory, so the count is
+	// part of usage, not a display detail.
+	VMCount int
 }
 
 // SumVMResourcesByHost returns per-host CPU, memory, and disk totals for running VMs.
 func SumVMResourcesByHost(ctx context.Context, c *Client) (map[string]HostResourceUsage, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, COALESCE(SUM(cpu_actual),0) as cpu, COALESCE(SUM(mem_actual),0) as mem
+		`SELECT host_name, COALESCE(SUM(cpu_actual),0) as cpu, COALESCE(SUM(mem_actual),0) as mem,
+		        COUNT(*) as vm_count
 		 FROM vms WHERE deleted_at IS NULL AND state = 'running' GROUP BY host_name`)
 	if err != nil {
 		return nil, err
@@ -623,6 +628,7 @@ func SumVMResourcesByHost(ctx context.Context, c *Client) (map[string]HostResour
 		m[r.String("host_name")] = HostResourceUsage{
 			CpuUsed:    r.Int("cpu"),
 			MemUsedMiB: r.Int("mem"),
+			VMCount:    r.Int("vm_count"),
 		}
 	}
 

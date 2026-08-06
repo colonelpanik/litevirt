@@ -46,7 +46,11 @@ func TestHostFreeCapacity(t *testing.T) {
 	encDone, _ := rvDone.Encode()
 	mustOp(t, db, "done-op", string(OpResourceUpdateRunning), encDone, true)
 
-	freeCPU, freeMem, ok, err := HostFreeCapacity(ctx, db, "h1")
+	// Neutral policy (ratio 1, no reserve, no per-VM overhead) isolates the
+	// subtraction this test is about from capacity POLICY, which has its own
+	// tests. Under it the arithmetic is the original raw one.
+	neutral := CapacityPolicy{CPUOvercommit: 1, MemOvercommit: 1, VMMemOverheadMiB: 0}
+	freeCPU, freeMem, ok, err := HostFreeCapacityWithPolicy(ctx, db, "h1", neutral)
 	if err != nil || !ok {
 		t.Fatalf("HostFreeCapacity: ok=%v err=%v", ok, err)
 	}
@@ -56,6 +60,20 @@ func TestHostFreeCapacity(t *testing.T) {
 	}
 	if freeMem != 40960 {
 		t.Errorf("freeMem = %d, want 40960", freeMem)
+	}
+
+	// And with the DEFAULT policy the same host reports MORE cpu (4x ratio, less
+	// 1 reserved) and LESS memory (5% reserve + one VM's qemu overhead) — proving
+	// the policy is actually applied rather than silently ignored.
+	defCPU, defMem, ok, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil || !ok {
+		t.Fatalf("HostFreeCapacity (default policy): ok=%v err=%v", ok, err)
+	}
+	if defCPU <= freeCPU {
+		t.Errorf("default-policy freeCPU = %d, want more than the neutral %d (4x overcommit)", defCPU, freeCPU)
+	}
+	if defMem >= freeMem {
+		t.Errorf("default-policy freeMem = %d, want less than the neutral %d (host reserve + qemu overhead)", defMem, freeMem)
 	}
 }
 

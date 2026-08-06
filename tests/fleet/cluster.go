@@ -336,6 +336,12 @@ func (c *Cluster) crossRegisterHosts() {
 				CertSerial:    "fleet",
 				State:         "active",
 				FenceStrategy: "best-effort",
+				// Real capacity. Host admission now runs on CREATE as well as resize,
+				// and a host record with zero CPU/memory reads as "full" — every
+				// scenario that places a workload would be refused. Generous on
+				// purpose: capacity is not what these scenarios are testing.
+				CPUTotal: 64,
+				MemTotal: 262144,
 			}
 			if err := corrosion.InsertHost(ctx, target.DB, rec); err != nil {
 				// "UNIQUE constraint" is fine — already registered.

@@ -594,7 +594,7 @@ func (s *Server) recoverDiskDetach(ctx context.Context, vm *corrosion.VMRecord, 
 			return
 		}
 	}
-	if err := s.verifyDiskDetached(vm.Name, targetDev, running); err != nil {
+	if err := s.verifyDiskDetached(ctx, vm.Name, targetDev, running); err != nil {
 		slog.Error("hardware op recovery: disk detach absence unverifiable — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 		return
 	}
@@ -644,7 +644,7 @@ func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, v
 			return
 		}
 	}
-	if err := s.verifyNICDetached(vm.Name, mac, running); err != nil {
+	if err := s.verifyNICDetached(ctx, vm.Name, mac, running); err != nil {
 		slog.Error("hardware op recovery: nic detach absence unverifiable — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 		return
 	}
@@ -786,7 +786,7 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 			return
 		}
 	}
-	if err := s.verifyPCIDetached(vm.Name, memberAliases, running); err != nil {
+	if err := s.verifyPCIDetached(ctx, vm.Name, memberAliases, memberAddrs, running); err != nil {
 		slog.Error("hardware op recovery: pci detach absence unverifiable — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 		return
 	}

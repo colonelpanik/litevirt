@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -90,6 +91,8 @@ type Coordinator struct {
 	hostName string
 	db       *corrosion.Client
 	fencer   Fencer
+	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
+	capacity corrosion.CapacityPolicy
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
 	// Restorer, when set, lets host-loss relocation restore a container from its
@@ -222,6 +225,41 @@ func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 // SetFencer replaces the fence implementation. Test-only; production code
 // should not use this.
 func (c *Coordinator) SetFencer(f Fencer) { c.fencer = f }
+
+// SetCapacityPolicy wires the cluster-wide capacity policy.
+func (c *Coordinator) SetCapacityPolicy(p corrosion.CapacityPolicy) { c.capacity = p }
+
+// buildFailoverPlacementRequest constructs a placement request for a VM being
+// rescheduled off failedHost, honoring the constraints in its stored spec.
+// A spec pin to the failed host itself is dropped — the whole point is to leave.
+func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, capacity corrosion.CapacityPolicy) placement.Request {
+	req := placement.Request{
+		VMName:       vm.Name,
+		CPUNeeded:    vm.CPUActual,
+		MemMiBNeeded: vm.MemActual,
+		Capacity:     capacity,
+	}
+	if vm.Spec == "" {
+		return req
+	}
+	spec := &pb.VMSpec{}
+	if json.Unmarshal([]byte(vm.Spec), spec) != nil || spec.Placement == nil {
+		return req
+	}
+	p := spec.Placement
+	if p.Host != "" && p.Host != failedHost {
+		req.PinHost = p.Host
+	}
+	req.AntiAffinity = p.AntiAffinity
+	req.Affinity = p.Affinity
+	req.RequireLabels = p.Require
+	req.PreferLabels = p.Prefer
+	req.Spread = p.Spread
+	if p.MaxPerNode > 0 {
+		req.MaxPerNode = int(p.MaxPerNode)
+	}
+	return req
+}
 
 // now is the coordinator's clock — defaults to time.Now, overridable
 // for virtual-time scenarios via the exported Now field.
@@ -1056,41 +1094,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		// Use placement engine to find the best host (respects CPU, memory,
 		// anti-affinity, labels, device requirements).
 		if targetName == "" {
-			req := placement.Request{
-				VMName:       vm.Name,
-				CPUNeeded:    vm.CPUActual,
-				MemMiBNeeded: vm.MemActual,
-			}
-			// Parse placement constraints from stored spec if available.
-			if vm.Spec != "" {
-				var spec struct {
-					Placement *struct {
-						Host         string            `json:"host"`
-						AntiAffinity []string          `json:"anti_affinity"`
-						Affinity     []string          `json:"affinity"`
-						Require      map[string]string `json:"require"`
-						Prefer       map[string]string `json:"prefer"`
-						Spread       bool              `json:"spread"`
-						MaxPerNode   int32             `json:"max_per_node"`
-					} `json:"placement"`
-				}
-				if json.Unmarshal([]byte(vm.Spec), &spec) == nil && spec.Placement != nil {
-					p := spec.Placement
-					// Don't pin to the failed host during failover.
-					if p.Host != "" && p.Host != h.Name {
-						req.PinHost = p.Host
-					}
-					req.AntiAffinity = p.AntiAffinity
-					req.Affinity = p.Affinity
-					req.RequireLabels = p.Require
-					req.PreferLabels = p.Prefer
-					req.Spread = p.Spread
-					if p.MaxPerNode > 0 {
-						req.MaxPerNode = int(p.MaxPerNode)
-					}
-				}
-			}
-
+			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity)
 			selected, err := placement.Select(ctx, c.db, req)
 			if err != nil {
 				// Fallback to round-robin if placement fails (degraded mode).
@@ -1415,6 +1419,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) string {
 	if target, err := placement.Select(ctx, c.db, placement.Request{
 		VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
+		Capacity: c.capacity,
 	}); err == nil && !c.targetHasLiveContainer(ctx, target, ct.Name) {
 		return target
 	}

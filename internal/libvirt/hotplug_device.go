@@ -21,11 +21,28 @@ func (c *Client) AttachDisk(domainName string, path, targetDev, bus string) erro
 }
 
 // DetachDisk hot-detaches a disk from a running domain by target device name.
+//
+// The device element carries the disk's REAL type and source, read from the live
+// domain, for the reason libvirt gives: the supplied description "should be as
+// specific as its definition in the domain XML", and a partial one "may lead to
+// unexpected results" — the same trap DetachNIC fell into. Falls back to the
+// target-only shape when the disk cannot be found, where the detach is a no-op
+// anyway.
+//
+// Note this only makes the REQUEST specific. The unplug itself is asynchronous and
+// needs the guest's cooperation, so a nil return means "requested", not "gone";
+// callers verify absence by waiting (see grpcapi's verifyDiskDetached).
 func (c *Client) DetachDisk(domainName, targetDev string) error {
 	disk := diskDevice{
 		Type:   "file",
 		Device: "disk",
 		Target: diskTarget{Dev: targetDev},
+	}
+	if xmlText, err := c.DumpXML(domainName); err == nil {
+		if typ, src, ok := DiskSourceByTarget(xmlText, targetDev); ok {
+			disk.Type = typ
+			disk.Source = src
+		}
 	}
 	return c.detachDeviceXML(domainName, disk)
 }
@@ -53,7 +70,9 @@ func (c *Client) AttachNIC(domainName, bridge, model, mac string) error {
 // anything the operator did. Reading the live domain and reusing the
 // interface's own type/source keeps the element valid (and correct for a
 // non-bridge source). Falls back to the MAC-only shape when the interface
-// cannot be found, where the detach is a no-op anyway.
+// cannot be found in the live domain — callers guard against that case first
+// (see detachNICIfPresent), so the fallback exists only for callers that skip
+// the guard, and libvirt's validation error is the honest outcome there.
 func (c *Client) DetachNIC(domainName, mac string) error {
 	iface := interfaceDevice{
 		Type: "bridge",

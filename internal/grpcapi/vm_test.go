@@ -1169,3 +1169,207 @@ func TestLockVM_Concurrent(t *testing.T) {
 	unlock2 := s.lockVM("test-vm")
 	unlock2()
 }
+
+// TestCreateVM_PinnedHostRespectsCapacity: pinning a host must not bypass host
+// capacity admission.
+//
+// placement.Select only scores capacity when it CHOOSES a host; a pin makes it
+// validate the host is active and return it, so a pinned create previously had no
+// capacity check at all. Demonstrated on a real 4-node cluster: three 1 GiB VMs
+// pinned to a ~3 GiB host were all accepted, the cluster reported 3072/2971 MiB,
+// and the node thrashed until sshd stopped answering. Meanwhile RESIZING a VM
+// into the same host was correctly refused — the two paths disagreed.
+func TestCreateVM_PinnedHostRespectsCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable is 4096 - 1024 (default host reserve) = 3072 MiB; 2560 of it is
+	// already in use by a running VM, leaving 512 free.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "sitting", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 2560,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "too-big", Cpu: 1, MemoryMib: 1024, // 1024 > 512 free
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("pinned create exceeding host memory: got %v, want ResourceExhausted", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, s.db, "too-big"); rec != nil {
+		t.Errorf("VM refused for capacity must not be persisted: %+v", rec)
+	}
+
+	// A VM that DOES fit must still be accepted — the check must not simply
+	// refuse every pinned create.
+	if _, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "fits", Cpu: 1, MemoryMib: 256,
+		Placement: &pb.PlacementSpec{Host: "test-host"},
+	}}); err != nil {
+		t.Fatalf("pinned create that fits was refused: %v", err)
+	}
+}
+
+// TestStartVM_RespectsHostCapacity: starting is where memory is actually
+// consumed — usage counts running VMs only — so create-time admission alone is
+// trivially sidestepped by creating VMs that each fit and then starting them all.
+func TestStartVM_RespectsHostCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable 4096-1024 = 3072; 2560 in use leaves 512 free.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "sitting", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 2560,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM sitting: %v", err)
+	}
+	// A stopped VM contributes nothing to usage until it starts — which is exactly
+	// the hole this closes.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "waiting", HostName: "test-host", State: "stopped",
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "waiting", Cpu: 1, MemoryMib: 1024}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM waiting: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>waiting</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "waiting"}); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("start exceeding host memory: got %v, want ResourceExhausted", err)
+	}
+
+	// The audited escape hatch still lets an operator through.
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "waiting", AllowOvercommit: true}); err != nil {
+		t.Fatalf("start with --allow-overcommit: %v", err)
+	}
+}
+
+// TestStartVM_AlreadyRunningIsNotRefusedForCapacity: `lv start` on a running VM
+// adds nothing, so it must not be refused for capacity the VM already occupies.
+func TestStartVM_AlreadyRunningIsNotRefusedForCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 4, MemTotal: 2048,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Already running and larger than the host's remaining headroom.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "big", HostName: "test-host", State: "running", CPUActual: 2, MemActual: 4096,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "big", Cpu: 2, MemoryMib: 4096}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>big</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "big"}); status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("start of an already-running VM was refused for capacity it already holds: %v", err)
+	}
+}
+
+// TestUpdateVM_RestartIfNeededRespectsHostCapacity: a reconfigure that GROWS the
+// VM past the host's headroom is refused — and, critically, refused BEFORE the
+// stop, so the VM is left running on its old spec.
+//
+// Admitting later would mean refusing after the redefine already succeeded,
+// leaving the VM stopped, resized, and unable to come back: worse than the
+// overcommit it was trying to prevent.
+func TestUpdateVM_RestartIfNeededRespectsHostCapacity(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Allocatable 4096-1024 = 3072. Running VM holds 1024 (+128 qemu overhead),
+	// so growing it to 4096 cannot fit.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "grow", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 1024,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "grow", Cpu: 1, MemoryMib: 1024}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>grow</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	yes := true
+	_, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "grow", MemoryMib: 4096, AllowRestart: &yes,
+	})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("reconfigure growing past host capacity: got %v, want ResourceExhausted", err)
+	}
+
+	// Untouched: still running, still its old size. A refusal after the stop would
+	// show up here as state=stopped.
+	rec, gerr := corrosion.GetVM(ctx, s.db, "grow")
+	if gerr != nil || rec == nil {
+		t.Fatalf("GetVM: %v", gerr)
+	}
+	if rec.State != "running" {
+		t.Errorf("VM state = %q after a REFUSED reconfigure, want running — it was stopped and then refused", rec.State)
+	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(rec.Spec), spec); err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	if spec.MemoryMib != 1024 {
+		t.Errorf("spec memory = %d after a refused reconfigure, want the original 1024", spec.MemoryMib)
+	}
+}
+
+// TestUpdateVM_RestartIfNeededShrinkIsNotRefused: only GROWTH consumes capacity.
+// A shrink on a host with no headroom must still be allowed — refusing it would
+// block the very operation that frees memory.
+func TestUpdateVM_RestartIfNeededShrinkIsNotRefused(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 4096,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// Deliberately over its allocatable headroom already.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "shrink", HostName: "test-host", State: "running", CPUActual: 1, MemActual: 3000,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "shrink", Cpu: 1, MemoryMib: 3000}),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := s.virt.DefineDomain(`<domain type='kvm'><name>shrink</name><devices></devices></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+
+	yes := true
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "shrink", MemoryMib: 1024, AllowRestart: &yes,
+	}); status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("a SHRINK was refused for capacity: %v — only growth consumes anything", err)
+	}
+}

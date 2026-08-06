@@ -364,8 +364,24 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}
-	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.DeleteContainer(ctx, req)
+	// Resolve the OWNER when no host was named. Without this a host-less delete
+	// executed "locally" on whichever node the client happened to dial, where
+	// the runtime not-found AND the zero-row tombstone are both idempotent
+	// successes — rc=0, nothing deleted anywhere, an operator typo
+	// indistinguishable from a clean delete. Resolution is scoped to the
+	// name-only form: an EXPLICIT-host delete keeps its full retry idempotency
+	// (failover/relocation re-issue those), and a name that exists nowhere now
+	// surfaces as NotFound instead of a silent ok.
+	targetHost := req.HostName
+	if targetHost == "" {
+		h, _, rerr := s.resolveContainerHost(ctx, "", req.Name)
+		if rerr != nil {
+			return nil, rerr
+		}
+		targetHost = h
+	}
+	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
+		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost})
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -611,11 +627,11 @@ func (s *Server) forwardSimpleCT(
 	if hostName == "" || hostName == s.hostName {
 		return nil, nil
 	}
-	c, conn, err := s.peerClient(ctx, hostName)
+	c, closer, err := s.dialPeer(ctx, hostName)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "forward: %v", err)
 	}
-	defer conn.Close()
+	defer closer()
 	return dial(c)
 }
 

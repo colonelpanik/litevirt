@@ -161,6 +161,38 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
+	// Reserve-then-verify admission for cpu/mem, with residency safety and the
+	// commit fence — the same contract every other path that lands a VM
+	// carries. admitImport above stays as the read-only fail-fast (and the only
+	// check covering disk/NIC quota), but a glance cannot see in-flight
+	// reservations, holds nothing across the commit below, and never consulted
+	// host capacity or host safety at all.
+	//
+	// Quota is charged for stopped AND started imports alike — the row written
+	// below counts toward project usage the moment it lands. HOST capacity and
+	// residency safety apply only to --start: a stopped import is a durable
+	// record, not runtime residency, and its host charge is StartVM's job.
+	importIntent := intentResourceGrow
+	if first.Start {
+		importIntent = intentVMResident
+	}
+	importQuotaLease, qerr := s.admitQuotaWithReservation(ctx, "ImportVM", s.hostName, project,
+		corrosion.WorkloadVM, name, fv.CPUs, fv.MemoryMiB, fv.CPUs, fv.MemoryMiB, importIntent)
+	if qerr != nil {
+		cleanupDisks()
+		return qerr
+	}
+	defer importQuotaLease.release(ctx)
+	if first.Start {
+		hostLease, herr := s.admitHostWithReservation(ctx, "ImportVM", s.hostName, project,
+			"vm:"+name, fv.CPUs, fv.MemoryMiB, intentVMResident)
+		if herr != nil {
+			cleanupDisks()
+			return herr
+		}
+		defer hostLease.release(ctx)
+	}
+
 	// ── Define → persist stopped → optional start, with full rollback ──
 	cfg := fv.ToVMConfig()
 	spec := fv.ToVMSpec(project)
@@ -217,6 +249,17 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	// import on the same canonicalized-BDF path as every other producer with a
 	// spec.Devices list, per the shared buildPCIIntents helper).
 	pciIntents := s.buildPCIIntents(name, spec.Devices)
+
+	// The quota-authority commit fence, immediately before the durable write.
+	// Unwind mirrors the insert-failure rollback below: nothing was persisted.
+	if err := importQuotaLease.allowCommit(ctx); err != nil {
+		_ = s.virt.UndefineDomain(name, false)
+		if fwImport {
+			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+		}
+		cleanupDisks()
+		return err
+	}
 
 	// adopt=false: best-effort-populate vm_nics/vm_pci_intent, but don't
 	// self-certify adoption — the Phase-6 backfill audit confirms/reconciles

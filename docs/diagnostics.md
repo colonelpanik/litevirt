@@ -633,6 +633,9 @@ placement, and an uncapped rogue container makes the host's capacity
 explicitly *incomplete*, which disqualifies it as a placement target until
 resolved.
 
-See `docs/superpowers/specs/2026-08-04-unified-cluster-health-design.md`
-for the full design and the (documentation-only) future containment
-contract.
+Automatic containment is intentionally not implemented: no path destroys a
+disputed runtime. Any future containment mechanism must first prove complete
+fleet runtime coverage, a current-epoch authoritative holder, a strictly older
+conflicting holder, no in-flight migration/operation/lock/failover, and quorum
+or explicit fencing authorization. The evidence and decision must be durable
+before any stop is issued.

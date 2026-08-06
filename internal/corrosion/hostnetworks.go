@@ -50,9 +50,9 @@ type HostNetworkAddressing struct {
 	Nameservers []string `json:"nameservers,omitempty"`
 }
 
-// Host network states. The apply protocol owns the transitions; see the design
-// (docs/superpowers/specs/2026-08-02… §O) — desired is "edited, not yet
-// applied", applying is journal-held, applied/rolled_back are outcomes.
+// Host network states. The apply protocol owns the transitions; see the host
+// network configuration section in docs/networking.md. Desired is "edited, not
+// yet applied", applying is journal-held, and applied/rolled_back are outcomes.
 const (
 	HostNetworkDesired    = "desired"
 	HostNetworkApplying   = "applying"
